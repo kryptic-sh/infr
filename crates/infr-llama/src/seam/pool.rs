@@ -419,7 +419,14 @@ impl PagedSlot {
 
     /// Push the current mapping to the device. Called after every change to `map`.
     pub(crate) fn upload_table(&self, be: &dyn Backend) -> AResult<()> {
-        be.upload(self.table.as_ref(), &self.map.table_bytes())
+        let bytes = self.map.table_bytes();
+        tracing::debug!(
+            block = self.map.block(),
+            row_base = self.map.row_base(),
+            first = ?&bytes[..bytes.len().min(24)],
+            "kv.paged: uploading a slot's page table"
+        );
+        be.upload(self.table.as_ref(), &bytes)
             .map_err(|e| anyhow!("{e}"))
     }
 

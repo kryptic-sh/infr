@@ -8052,6 +8052,12 @@ impl<'a> Recorder<'a> {
         };
         let gqa = fast.and_then(|_| self.gqa_pass1(hd, nh, nkv, window, true));
         let (p1name, p1spv) = gqa.or(fast).unwrap_or((p1name, p1spv));
+        tracing::debug!(
+            kernel = p1name,
+            gqa = gqa.is_some(),
+            page_rows,
+            "decode replay: split attention kernel"
+        );
         // attn_partial.comp's `layout(push_constant) uniform PC {...}` block is declared
         // UNCONDITIONALLY (11 x 4-byte members = 44 bytes) — `pos`/`rows` (offsets 36..44) are
         // dead code under `-DUSE_PARAMS` (never read in the compiled SPIR-V for this variant, see

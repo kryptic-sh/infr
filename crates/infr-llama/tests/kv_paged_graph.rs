@@ -11,13 +11,13 @@ use infr_core::tensor::{PageMap, TensorDesc};
 use infr_core::{DType, TensorId};
 use infr_vulkan::paged::PAGE_ROWS;
 
-const NH: usize = 4;
+const NH: usize = 8;
 const NKV: usize = 2;
-const HD: usize = 64;
+const HD: usize = 512;
 /// One prefill chunk, well inside the slot's first logical page.
 const ROWS: usize = 256;
 /// The slot under test lives in pool block 1, so a store that forgets the row base is visible.
-const ROW_BASE: usize = PAGE_ROWS;
+const ROW_BASE: usize = PAGE_ROWS * 16;
 
 struct Rng(u64);
 impl Rng {
@@ -219,7 +219,7 @@ fn a_paged_cache_attends_the_same_bits_as_a_contiguous_one() {
     let pool_rows = 2 * pps * PAGE_ROWS;
     let pool_elems = pool_rows * row;
     let pg = attention_graph(pool_elems, Some((ROW_BASE, pps + 1)));
-    let table = table_bytes(pps, 1);
+    let table = table_bytes(pps, (ROW_BASE / PAGE_ROWS) as u32);
     let got = run(
         &be,
         &pg,
@@ -351,7 +351,7 @@ fn a_paged_decode_over_a_written_span_matches_a_contiguous_one() {
     let pps = ROW_BASE.div_ceil(PAGE_ROWS);
     let pool_elems = 2 * pps * PAGE_ROWS * row;
     let (pg, _) = decode_graph(pool_elems, Some((ROW_BASE, pps + 1)));
-    let table = table_bytes(pps, 1);
+    let table = table_bytes(pps, (ROW_BASE / PAGE_ROWS) as u32);
     let got = run(
         &be,
         &pg,

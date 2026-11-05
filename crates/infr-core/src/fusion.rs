@@ -106,9 +106,10 @@ pub struct FusionPlan {
     pub rmsnorm_linear: HashMap<usize, (TensorId, TensorId, f32)>,
     /// `MoeFfn` op idx → (residual operand, final `Add` dst). The absorbed `Add` is at `idx + 1`.
     pub moe_add: HashMap<usize, (TensorId, TensorId)>,
-    /// `Rope`/`QkNormRope` op idx → (KV cache tensor, write row). The absorbed `WriteKv` is at
-    /// `idx + 1`.
-    pub kv_write: HashMap<usize, (TensorId, usize)>,
+    /// `Rope`/`QkNormRope` op idx → (KV cache tensor, write row, cache row elements). The absorbed
+    /// `WriteKv` is at `idx + 1`; the row elements are the cache's stride, which a GQA K cache
+    /// (`n_kv * head_dim`) does NOT equal the rope's own row (`n_head * head_dim`).
+    pub kv_write: HashMap<usize, (TensorId, usize, usize)>,
     /// Op indices the executor elides (absorbed `Add`s, absorbed `WriteKv`s, elided `RmsNorm`s).
     pub skip: HashSet<usize>,
 }
@@ -385,7 +386,8 @@ fn plan_kv_write(graph: &Graph, plan: &mut FusionPlan) {
                 *pos as usize
             };
             if cap_rows == 0 || pos_r + *rows as usize <= cap_rows {
-                plan.kv_write.insert(i, (*cache, pos_r));
+                plan.kv_write
+                    .insert(i, (*cache, pos_r, *row_stride as usize));
                 plan.skip.insert(i + 1);
             }
         }

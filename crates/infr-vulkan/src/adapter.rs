@@ -334,7 +334,7 @@ fn resolve<'a>(
 
 /// What a paged decode needs from the graph: the page table's `(device address, rows per page)` and
 /// the slot's `row_base`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct PageInfo {
     addr: u64,
     page_rows: u32,
@@ -1120,7 +1120,7 @@ fn lower_op(
     rec: &Recorder<'_>,
     scratch: &[Option<Box<dyn Buffer>>],
     bindings: &Bindings,
-    fused_kv_write: &HashMap<usize, (TensorId, usize)>,
+    fused_kv_write: &HashMap<usize, (TensorId, usize, usize)>,
     fused_add: &HashMap<usize, (TensorId, TensorId)>,
     mode: &RopeMode,
     transient: &mut Vec<Box<dyn Buffer>>,
@@ -2516,20 +2516,26 @@ fn lower_op(
             // see `kv_write_peephole`); `kcap` is the fused cache's row capacity for the DYNAMIC
             // path, where the row must be derived from the live params pos in-kernel (the ring
             // modulo rides the same params channel as the pos itself — never a baked constant).
-            let (out_buf, fused, kcap) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
-                let row = (*n_head as usize) * (*head_dim as usize);
-                (r(cache)?, Some(pos), graph.desc(cache).numel() / row.max(1))
-            } else {
-                (r(*dst)?, None, 0)
-            };
+            let (out_buf, fused, kcap) =
+                if let Some(&(cache, pos, row)) = fused_kv_write.get(&op_idx) {
+                    (r(cache)?, Some(pos), graph.desc(cache).numel() / row.max(1))
+                } else {
+                    (r(*dst)?, None, 0)
+                };
             // #74: fork to the BDA path ONLY when the fused K write lands in the KV cache (which
             // exposes a device address); the un-fused Q-scratch write (Activations, no address) stays
             // on the bound build. `out_buf` stays bound at its write slot in the `_at` method for the
             // store→read barrier. Bit-identical to the bound dispatch.
-            let k_row = (*n_head as usize) * (*head_dim as usize);
-            let k_bias = fused_kv_write.get(&op_idx).map_or(0, |&(cache, _)| {
-                kv_row_base(graph, cache) * graph.desc(cache).dtype.dense_bytes(k_row).unwrap_or(0)
+            let k_bias = fused_kv_write.get(&op_idx).map_or(0, |&(cache, _, row)| {
+                kv_row_base(graph, cache) * graph.desc(cache).dtype.dense_bytes(row).unwrap_or(0)
             });
+            tracing::debug!(
+                op = op_idx,
+                k_bias,
+                fused = fused.is_some(),
+                addr = out_buf.device_addr().is_some(),
+                "fused K write"
+            );
             let y_addr = out_buf.device_addr().map(|a| a + k_bias as u64);
             match mode {
                 RopeMode::Static(rope_pos) => {
@@ -2733,8 +2739,8 @@ fn lower_op(
             }
             let ff = freq_factors.map(r).transpose()?;
             let (out_buf, fused, fused_cache) =
-                if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
-                    (r(cache)?, Some(pos), Some(cache))
+                if let Some(&(cache, pos, row)) = fused_kv_write.get(&op_idx) {
+                    (r(cache)?, Some(pos), Some((cache, row)))
                 } else {
                     (r(*dst)?, None, None)
                 };
@@ -2743,9 +2749,8 @@ fn lower_op(
             // slot in the `_at` method for the store→read barrier. A pooled cache's rows start at
             // its block, so the fused write's row is biased by `row_base` through the address (the
             // push's fused row is a bare `pos`, or `pos` from the params stream).
-            let k_bias = fused_cache.map_or(0, |cache| {
-                let k_row = (*n_head as usize) * (*head_dim as usize);
-                kv_row_base(graph, cache) * graph.desc(cache).dtype.dense_bytes(k_row).unwrap_or(0)
+            let k_bias = fused_cache.map_or(0, |(cache, row)| {
+                kv_row_base(graph, cache) * graph.desc(cache).dtype.dense_bytes(row).unwrap_or(0)
             });
             let y_addr = out_buf.device_addr().map(|a| a + k_bias as u64);
             match mode {
@@ -2991,6 +2996,13 @@ fn lower_op(
                     infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_DECODE_MIN_CHUNK);
                 let n_chunks = infr_core::tier::n_chunks(cap_rows, chunk);
                 let paged_dyn = graph.desc(*k_cache).pages.is_some_and(|p| p.page_rows > 0);
+                tracing::debug!(
+                    paged = paged_dyn,
+                    n_chunks,
+                    chunk,
+                    cap_rows,
+                    "decode replay: attention dispatch"
+                );
                 if hd % 4 == 0 && hd <= 512 && (n_chunks > 1 || paged_dyn) {
                     // ONE prologue + ONE scratch set per (nh, hd, chunk, n_chunks, window) key:
                     // the first Dynamic attention op of a shape records/allocates; every later
@@ -5292,6 +5304,11 @@ fn record_decode_replay(
     // 0-1, so they survive the whole replay.
     let params = be_.alloc(24, BufferUsage::Staging)?;
     let page_table = replay_page_table(graph, &scratch, bindings)?;
+    tracing::debug!(
+        table = ?page_table,
+        ops = graph.ops.len(),
+        "decode replay: record-once tape"
+    );
     let positions = graph
         .ops
         .iter()

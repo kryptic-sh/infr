@@ -44,6 +44,7 @@ layout(push_constant) uniform PC {
     uint cap;
     uint pos; uint rows;
     uint k_lo; uint k_hi; uint v_lo; uint v_hi;
+    uint page_lo; uint page_hi; uint page_rows;
 } pc;
 #include "kv_addr.glsl"
 
@@ -51,7 +52,10 @@ layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };
 layout(binding = 1) readonly buffer KB { uint ku_inert[]; };
 layout(binding = 2) readonly buffer VB { uint vu_inert[]; };
 #ifdef USE_PARAMS
-layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
+// `p_pagelo`/`p_pagehi`: device address of this slot's logical-to-physical page ids. The tape is
+// recorded once, so a slot's table cannot ride the push constant; params_advance never touches
+// words 2-3, and `p_page_rows` (the gate) lives in the push.
+layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; uint p_pagelo; uint p_pagehi; };
 layout(binding = 4) buffer PM { float pm[]; };
 layout(binding = 5) buffer PL { float pl[]; };
 layout(binding = 6) buffer PACC { float pacc[]; };
@@ -120,7 +124,22 @@ void main() {
     uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
 #define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
 #else
-#define RROW(j) (j)
+    // A paged cache reads through the slot's table: a chunk of at most CHMAX rows touches at most
+    // two pages, so one shift per page covers every row of it (identity on a linear cache).
+    uint page_rows = pc.page_rows;
+    uint pg0 = 0u, pg1 = 0u, pgcut = 0u;
+    if (page_rows > 0u) {
+#ifdef USE_PARAMS
+        uint64_t pt = kv_base(p_pagelo, p_pagehi);
+#else
+        uint64_t pt = kv_base(pc.page_lo, pc.page_hi);
+#endif
+        uint p0 = j0 / page_rows;
+        pg0 = (kv_word(pt, p0) - p0) * page_rows;
+        pg1 = (kv_word(pt, p0 + 1u) - (p0 + 1u)) * page_rows;
+        pgcut = (p0 + 1u) * page_rows;
+    }
+#define RROW(j) ((page_rows > 0u) ? (((j) < pgcut) ? ((j) + pg0) : ((j) + pg1)) : (j))
 #endif
 
     uint kl = t % LPK;

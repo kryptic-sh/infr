@@ -159,6 +159,7 @@ knobs! {
     "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   migrated;
     "INFR_DRAM_CACHE"           => "paging.dram",                      Size,     Ignored, "8g",  migrated;
     "INFR_DRAM_BYPASS"          => "paging.dram_bypass",               Flag,     Ignored, "1",   migrated;
+    "INFR_RELEASE_UPLOADED_PAGES" => "paging.release_uploaded_pages",  Flag,     Ignored, "1",   migrated;
     "INFR_LAYER_MAJOR"          => "paging.layer_major",               TriState, Ignored, "1",   migrated;
 
     // ── kernels.vulkan — coopmat / capability masking ────────────────────────

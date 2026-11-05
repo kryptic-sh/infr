@@ -145,6 +145,24 @@ impl TensorBytes {
     pub fn file_range(&self) -> (u64, usize) {
         (self.file_base + self.off as u64, self.len)
     }
+
+    /// Drop this view's pages from the process's mapping (`MADV_DONTNEED`), for bytes already
+    /// copied elsewhere (e.g. uploaded to VRAM). Best-effort and no-op off Unix; a later read
+    /// faults the pages back in from the file, so the view stays valid.
+    pub fn release_pages(&self) {
+        #[cfg(unix)]
+        {
+            // SAFETY: the mapping is read-only and file-backed (`MAP_SHARED`), so DONTNEED only
+            // unmaps pages; any later access re-reads identical bytes from the file.
+            let _ = unsafe {
+                self.mmap.unchecked_advise_range(
+                    memmap2::UncheckedAdvice::DontNeed,
+                    self.off,
+                    self.len,
+                )
+            };
+        }
+    }
 }
 
 // ─── byte-cursor ──────────────────────────────────────────────────────────────

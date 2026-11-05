@@ -118,7 +118,7 @@ when the cause is a global config file you forgot about.
 
 ## `--set`
 
-Most of the 155 knobs have no dedicated flag. `--set <config.path>=<value>`
+Most of the 156 knobs have no dedicated flag. `--set <config.path>=<value>`
 reaches all of them, using the same path grammar as the TOML file:
 
 ```bash
@@ -199,14 +199,19 @@ spills KV to system RAM when VRAM runs out.
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),
 `ring` overrides the upload staging ring, `stats` prints per-pool
-hit/miss/eviction counts.
+hit/miss/eviction counts. `release_uploaded_pages`
+(`INFR_RELEASE_UPLOADED_PAGES=1`) drops a mapped weight's host pages once it is
+copied into VRAM. That lowers the RSS of a long-running `infr serve`. The pages
+are clean file-backed cache the kernel could reclaim anyway, so this mostly
+changes what `top` shows. Host-side tables like Gemma's per-layer embeddings stay
+mapped and fault back in as they are read.
 
 **`[kernels]`** — two backend-independent graph-shape gates (`qkv_fuse`,
 `gated_rmsnorm`) plus one sub-section per backend. Everything under them is a
 kernel **tier** override: the engine picks the best tier the device supports,
 and these exist to force one off when bisecting a correctness or perf problem.
 
-- **`[kernels.vulkan]`** (the biggest section — 62 of the 155 keys): capability
+- **`[kernels.vulkan]`** (the biggest section — 62 of the 156 keys): capability
   masks (`coopmat`, `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), GEMM/GEMV
   tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, `kq_fma_tier` — the
   K-quant/Q4_0 FMA tier for older Vulkan GPUs without fast int8 dot, auto-on — the

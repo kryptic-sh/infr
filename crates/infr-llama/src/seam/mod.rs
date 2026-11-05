@@ -2589,6 +2589,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
     }
 
+    let release_pages = ec.paging.release_uploaded_pages;
     Ok(Box::new(move |name, tb, dt, numel| {
         // Raw upload for EVERY dtype — the file's bytes go straight to VRAM (u32-padded) and the
         // kernel reads/dequants the native dtype in-shader. F16 → f16 coopmat GEMM / f16 GEMV;
@@ -2771,6 +2772,11 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .map_err(|e| anyhow!("{e}"))?;
         vk.upload(buf.as_ref(), &padded)
             .map_err(|e| anyhow!("{e}"))?;
+        drop(padded);
+        drop(bytes);
+        if release_pages {
+            tb.release_pages();
+        }
         Ok((buf, dt))
     }))
 }
@@ -3741,6 +3747,16 @@ impl WBytes {
             WBytes::Mmap(tb) => Some(vec![tb.file_range()]),
             WBytes::Concat(parts) => Some(parts.iter().map(|p| p.file_range()).collect()),
             WBytes::Owned(_) => None,
+        }
+    }
+
+    /// Drop the mapped components' host pages (see `TensorBytes::release_pages`); owned bytes are
+    /// untouched.
+    pub(crate) fn release_pages(&self) {
+        match self {
+            WBytes::Mmap(tb) => tb.release_pages(),
+            WBytes::Concat(parts) => parts.iter().for_each(|p| p.release_pages()),
+            WBytes::Owned(_) => {}
         }
     }
 

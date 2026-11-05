@@ -1318,6 +1318,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     const POST_MIGRATION: &[&str] = &[
         "INFR_DRAM_CACHE",
         "INFR_DRAM_BYPASS",
+        "INFR_RELEASE_UPLOADED_PAGES",
         "INFR_LAYER_MAJOR",
         "INFR_PULL_JOBS",
         "INFR_NO_MLA_SG",

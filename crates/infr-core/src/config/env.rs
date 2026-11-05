@@ -195,6 +195,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.paging.ring = opt_size(get, "INFR_PAGER_RING");
     p.paging.dram = opt_size(get, "INFR_DRAM_CACHE");
     p.paging.dram_bypass = presence(get, "INFR_DRAM_BYPASS");
+    p.paging.release_uploaded_pages = flag(get, "INFR_RELEASE_UPLOADED_PAGES");
     p.paging.stats = presence(get, "INFR_PAGER_STATS");
     // Tri-state: "0" ⇒ force chunk-major, any other value ⇒ force layer-major, unset ⇒ decide
     // from the placement (see `PagingCfg::layer_major`).

@@ -189,6 +189,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.overflow = flag(get, "INFR_KV_OVERFLOW");
     p.kv.overflow_vram_mb = opt_mib(get, "INFR_KV_OVERFLOW_VRAM_MB");
     p.kv.overflow_reserve_mb = opt_mib(get, "INFR_KV_OVERFLOW_RESERVE_MB");
+    p.kv.store_mb = opt_mib(get, "INFR_KV_STORE_MB");
 
     // ── paging ───────────────────────────────────────────────────────────────
     p.paging.cache = opt_size(get, "INFR_CACHE");

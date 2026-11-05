@@ -19,12 +19,14 @@ use infr_gguf::TensorBytes;
 
 mod dsv4_emit;
 mod dsv4_plan;
+mod kv_store;
 pub mod model;
 mod runner;
 mod sc;
 mod weights;
 mod wshape;
 
+pub(crate) use kv_store::KvPrefixStore;
 pub(crate) use runner::generate_dense_backend;
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};

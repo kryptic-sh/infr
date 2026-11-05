@@ -44,22 +44,64 @@ GPUs that have it.
 ## Measured (RX 580 8 GB, RADV)
 
 `infr compare --sweep` against llama.cpp `785322d` (its Vulkan backend), same GGUF,
-same card, both re-run back to back on 2026-11-05. Tokens/s, `-r 3`.
+same card, re-run back to back on 2026-11-06. Tokens/s, `-r 3`, F16 KV; the existing
+power cap and undervolt were left unchanged. The server was stopped during all GPU
+work. Ratios use the tool's unrounded averages.
 
 | Model | metric | infr | llama.cpp | ratio |
 |---|---|---|---|---|
-| Qwen2.5-Coder-3B Q4_K_M | pp512 | 535 | 476 | 1.13x |
-| | tg128 | 80 | 71 | 1.14x |
+| Qwen2.5-Coder-3B Q4_K_M | pp512 | 540 | 478 | 1.13x |
+| | tg128 | 81 | 71 | 1.13x |
 | | tg64 @ d4096 | 64 | 62 | 1.02x |
-| | pp4 @ d4096 | 75 | 136 | **0.55x** |
-| Gemma 4 E4B QAT UD-Q4_K_XL | pp512 | 382 | 367 | 1.04x |
-| | tg128 | 49 | 49 | 1.00x |
-| | tg64 @ d4096 | 45 | 44 | 1.02x |
-| | pp4 @ d4096 | 69 | 113 | **0.61x** |
+| | pp4 @ d4096 | 87 | 136 | **0.64x** |
+| Gemma 4 E4B QAT UD-Q4_K_XL | pp512 | 380 | 364 | 1.04x |
+| | tg128 | 48 | 48 | 0.99x |
+| | tg64 @ d4096 | 44 | 44 | 1.02x |
+| | pp4 @ d4096 | 67–69 | 114 | **0.58–0.60x** |
 
-Every metric is at parity or ahead except one: `pp4@d4096`, a four-token turn at 4k
-depth — the follow-up-message case. llama.cpp is 1.6-1.8x faster there, and that is
-the one measured deficit against the reference implementation.
+The Gemma range is two separate three-repetition run averages, not a confidence
+interval: the first measured 67, the repeat 69. A repeat using general attention
+measured 68 against 115. Its small-turn throughput is effectively unchanged.
+
+### Four-token turns at 4k depth
+
+This path had two routing gaps. Ordinary small prefill could use scalar-dequant
+multi-row matmuls even though the fp32 K-quant multi-row kernel existed for MTP
+verification. It now uses that kernel where the scalar fallback applied, while
+keeping the eligible int8 prefill tier. Fixed-head split-K attention was restricted
+to one query row; static batches of two to eight rows now use the same kernel
+family with separate query offsets, causal ends and sliding-window floors. Replay
+and one-row selection stay unchanged.
+
+A controlled comparison disabling both paths with
+`--set kernels.vulkan.kq_fma_gemv=false --set kernels.vulkan.attn_decode=false`
+measured Qwen's `pp4@d4096` at 71 against 136. New defaults measured 87 against
+136: about 22% more tokens/s, or 56 → 46 ms for the four-token suffix. Those switches
+also affect decode, so their decode results are not an old-default baseline.
+
+One controlled Qwen device profile measured scalar small projections at
+8.4 → 4.0 ms, attention at 13.4 → 10.0 ms, and total GPU time at 46.4 → 38.0 ms.
+Build and compile time were below the printed 0.1 ms precision. Large up/down
+matmuls still account for about 54% of the new GPU time; attention another 26%.
+Emulated int8 is not universally slower: direct microbenchmarks still favour it
+on several eligible shapes, which is why that tier remains enabled.
+
+The service's Gemma file stores all 168 Q/O/up/down projection tensors as Q4_0.
+The new fp32 multi-row path supports Q4_K/Q6_K, not Q4_0. Its device profile still
+spends about 45% on the large up/down matmuls and 22% on two scalar-dequant
+projection shapes; attention is about 11%. Improving Q4_0 small-row matmuls is a
+separate remaining task, not a page-table fix.
+
+`pp4@d4096` remains behind llama.cpp. These are benchmark compute times, not
+end-to-end TTFT: both exclude depth preparation, but infr omits its output head
+and llama.cpp evaluates last-row logits and crops the last-layer FFN. Matched
+models/settings therefore do not imply identical total work or an engine-wide
+ranking. Bench uses one session, so the multi-slot page pool and host prefix store
+are not providing a prefix-reuse speedup here.
+
+`compare` now forwards explicit `--config` and ordered `--set` values to its infr
+subprocesses. Earlier attempts to toggle these paths through `compare` silently
+lost those arguments; only the default-run results from those attempts were valid.
 
 Earlier campaign (same card, before the `kq_fma` tier and the seam work; no date was
 recorded at the time, so read the llama.cpp columns as historical):

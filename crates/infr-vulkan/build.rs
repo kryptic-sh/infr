@@ -280,6 +280,33 @@ fn main() {
                 "-DSELF_CHUNK",
             ],
         ),
+        // Static small-row variants retain literal head dimensions without changing replay builds.
+        ("attn_decode", "attn_small_m_hd128", &["-DMULTI_ROWS"]),
+        (
+            "attn_decode",
+            "attn_small_m_hd128_swa",
+            &["-DMULTI_ROWS", "-DSWA", "-DRING"],
+        ),
+        (
+            "attn_decode",
+            "attn_small_m_hd256",
+            &["-DMULTI_ROWS", "-DDHD4=64"],
+        ),
+        (
+            "attn_decode",
+            "attn_small_m_hd256_swa",
+            &["-DMULTI_ROWS", "-DDHD4=64", "-DSWA", "-DRING"],
+        ),
+        (
+            "attn_decode",
+            "attn_small_m_hd512",
+            &["-DMULTI_ROWS", "-DDHD4=128"],
+        ),
+        (
+            "attn_decode",
+            "attn_small_m_hd512_swa",
+            &["-DMULTI_ROWS", "-DDHD4=128", "-DSWA", "-DRING"],
+        ),
         // Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV decode reads the compact GGUF
         // block format INLINE (native_decode `dq()` on the cache via `dq_addr`=k_addr/v_addr), so
         // Q4/Q5 decode moves ¼ the traffic vs the dequant→f16 prepass + f16-scratch read. K and V

@@ -1174,10 +1174,7 @@ pub(crate) fn native_gemv_kq_fma_spv(
         _ => return None,
     })
 }
-/// SPIR-V (kernel-cache name + words) for the multi-row K-quant verify GEMV
-/// (`native_gemv_kq_fma_mrow.comp`), MR=4 input rows per workgroup sharing each superblock's
-/// weight-word load, at `nr` (4 or 8) output columns per workgroup; `None` for dtypes without
-/// a build.
+/// Multi-row fp32 K-quant GEMV SPIR-V at 4 or 8 output columns per workgroup.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemv_kq_fma_mrow_spv(
     dtype: infr_core::DType,
@@ -3578,9 +3575,7 @@ dyn_spv!(
     attn_decode_hd512_swa_dynac_spv,
     "attn_decode_hd512_swa_dynac"
 );
-/// `INFR_NO_ATTN_DECODE=1` (`kernels.vulkan.attn_decode` = false) — keep the general
-/// `attn_partial` builds on the decode fast path so the specialization can be A/B'd against the
-/// kernel it replaces with one env var and one binary.
+/// Disable fixed-head split-K pass 1 for decode and small static batches.
 pub(crate) fn attn_decode_disabled(vk: &infr_core::config::VulkanCfg) -> bool {
     !vk.attn_decode
 }
@@ -3618,6 +3613,26 @@ pub(crate) fn attn_decode_kernel(
         _ => return None,
     })
 }
+/// Fixed-head split-K pass 1 for static small-row batches, including sliding-window rings.
+pub(crate) fn attn_small_m_kernel(hd: usize, swa: bool) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    Some(match (hd, swa) {
+        (128, false) => spv!("attn_small_m_hd128"),
+        (128, true) => spv!("attn_small_m_hd128_swa"),
+        (256, false) => spv!("attn_small_m_hd256"),
+        (256, true) => spv!("attn_small_m_hd256_swa"),
+        (512, false) => spv!("attn_small_m_hd512"),
+        (512, true) => spv!("attn_small_m_hd512_swa"),
+        _ => return None,
+    })
+}
+
 /// The GQA-batched decode pass-1 build (`attn_decode_gqa.comp`) for `(hd, g, swa, dynac)`, where
 /// `g` is query heads per kv head, or `None` when no build covers the shape.
 pub(crate) fn attn_decode_gqa_kernel(

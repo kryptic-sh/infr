@@ -274,8 +274,7 @@ cfg_struct! {
         /// int8 dot is emulated).
         kq_fma_tier: Option<bool> = None,
         kq_fma_splitk: Option<usize> = None,
-        /// `INFR_KQ_FMA_GEMV`, TRI-state: the fp32 K-quant decode GEMV (`native_gemv_kq_fma`) in
-        /// place of quant_q8 + the dp4a GEMV. `None` = auto (on when int8 dot is emulated).
+        /// `INFR_KQ_FMA_GEMV`: fp32 K-quant decode/small-row GEMV; auto-on without fast int8 dot.
         kq_fma_gemv: Option<bool> = None,
         /// `INFR_WAVE64_NATIVE`, `=0|1`: on wave64-only devices (GCN), run the subgroup
         /// decode GEMV family at its native 64-lane width (`-DSG=64` twins, plain full-wave
@@ -348,9 +347,7 @@ cfg_struct! {
         /// `INFR_NO_ATTN_HD`: a `presence` knob despite the `NO_` spelling — sanctioned negative
         /// field.
         no_attn_hd_spec: bool = false,
-        /// `INFR_NO_ATTN_DECODE` (inverted) — the decode-only split-K pass-1 specialization
-        /// (`attn_decode.comp`). Setting the env var keeps the general `attn_partial` builds on
-        /// the decode fast path; the output is bit-identical either way, so this is an A/B knob.
+        /// `INFR_NO_ATTN_DECODE` (inverted): fixed-head split-K pass 1 for decode and small batches.
         attn_decode: bool = true,
         /// `INFR_ATTN_DECODE_GQA`, TRI-state: the GQA-batched decode pass 1
         /// (`attn_decode_gqa.comp`), which reads each K/V row once for all query heads sharing a

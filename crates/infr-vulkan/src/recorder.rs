@@ -3369,12 +3369,7 @@ impl<'a> Recorder<'a> {
         self.dispatch_wide(kern, &binds, 1, &push, out_f.div_ceil(nr) as u32);
     }
 
-    /// Multi-row K-quant GEMV on f32 activations (`native_gemv_kq_fma_mrow.comp`): `y = x·Wᵀ`
-    /// for `rows` input rows, MR=4 rows per workgroup sharing each superblock's weight-word
-    /// load — the MTP-verify shape on the emulated-dot tier, where decode runs
-    /// [`Self::linear_kq_fma`]. Per-row float op order matches the m=1 kernel exactly
-    /// (bit-identical row-for-row — see the shader header). No fused-residual build: nothing
-    /// fuses above m=1. Q4_K/Q6_K, `in_f % 256 == 0`, `w_base % 256 == 0`.
+    /// Multi-row fp32 K-quant GEMV sharing weights with decode-identical per-row reductions.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_kq_fma_mrow(
         &self,
@@ -7197,49 +7192,31 @@ impl<'a> Recorder<'a> {
         } else {
             (p1name, p1spv)
         };
-        // B7 slice 3a — DECODE-ONLY pass 1 (`attn_decode.comp`). Same grid, same chunk policy, same
-        // pm/pl/pacc layout, same 60-byte BDA push, same 6 bindings, so this is a pure kernel swap;
-        // pass 2 below is untouched. It is `attn_partial_bda`'s hd=128 f16 inner loop with every
-        // other arm deleted, which is worth 120 → 96 VGPRs and 4.75 → 2.75 KB LDS (occupancy 12 →
-        // 16 waves/SIMD). The reduction is the same plain `subgroupAdd`, so the output is
-        // BIT-identical — `tests/attn_decode_parity.rs` asserts that on raw bits.
-        //
-        // Every condition below is an arm no member of the specialized family has. Two axes ARE
-        // covered (slice 3b): the head dim, via the `hd` argument to `attn_decode_kernel` (128 /
-        // 256 / 512 have their own builds, anything else falls back), and sliding-window, via the
-        // `-DSWA -DRING` builds.
-        //
-        // The ring-cache condition is the subtle one: `attn_partial` maps position j to cache row
-        // `j % (cap/(nkv*hd))` whenever `cap` is nonzero, and the NON-`SWA` builds assume the
-        // identity. `window == 0` already implies a full-context (non-ring) cache — only
-        // sliding-window layers are allocated as rings (`seam::mod`'s `window + ubatch` sizing) —
-        // but the row bound is checked rather than inferred, since a wrong answer here is silent
-        // garbage rather than a crash. `window > 0` needs no such check: those builds carry the
-        // modulo, which is the identity when the cache happens to be full-context.
-        let ring_safe = window > 0 || cap == 0 || pos < cap / (nkv * hd);
+        // Full-context builds require every query row in bounds; SWA builds carry the ring map.
+        let ring_safe = window > 0 || cap == 0 || pos.saturating_add(rows) <= cap / (nkv * hd);
         let fast = if !batched
             && !crate::gemm::attn_decode_disabled(self.vk())
             && bda
             && kv_ml.is_none()
             && !k_q8
             && !v_q8
-            && rows == 1
+            && (1..=8).contains(&rows)
             && canvas_lo.is_none()
             && chunk <= 512
             && ring_safe
-            // INFR_NO_ATTN_HD=1 exists to A/B the hd 256/512 specialization against the general
-            // runtime-hd4 loops; the family's hd256/hd512 builds ARE that specialization, so honor
-            // the knob by falling back to `attn_partial_nohd_bda` for those dims. hd == 128 is
-            // unaffected by NO_HD_SPEC either way.
             && (hd == 128 || !crate::gemm::attn_hd_spec_disabled(self.vk()))
         {
-            crate::gemm::attn_decode_kernel(hd, window > 0, false)
+            if rows == 1 {
+                crate::gemm::attn_decode_kernel(hd, window > 0, false)
+            } else {
+                crate::gemm::attn_small_m_kernel(hd, window > 0)
+            }
         } else {
             None
         };
-        // `fast` being Some already proves every gate the GQA-batched build shares (BDA f16 KV,
-        // one row, no canvas, chunk <= 512, ring-safe).
-        let gqa = fast.and_then(|_| self.gqa_pass1(hd, nh, nkv, window, false));
+        let gqa = fast
+            .filter(|_| rows == 1)
+            .and_then(|_| self.gqa_pass1(hd, nh, nkv, window, false));
         let (p1name, p1spv) = gqa.or(fast).unwrap_or((p1name, p1spv));
         // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes, plus the three
         // paging words `attn_decode.comp` declares (page_lo/page_hi/page_rows) → 72; the bound push

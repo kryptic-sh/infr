@@ -717,8 +717,7 @@ fn unified_mmv_row1(_caps: &infr_core::backend::Capabilities) -> bool {
     true
 }
 
-/// Does an m=1 Linear take the fp32 K-quant decode GEMV (`Recorder::linear_kq_fma`) instead of
-/// quant_q8 + the dp4a GEMV? Auto-on where int8 dot is emulated (`kernels.vulkan.kq_fma_gemv`).
+/// Whether fp32 K-quant GEMV is enabled and addressable for this weight.
 fn kq_fma_gemv_ok(
     be_: &VulkanBackend,
     dt: infr_core::DType,
@@ -1528,19 +1527,8 @@ fn lower_op(
                 && crate::gemm::native_mrow_kernel_name(dt).is_some()
                 && be_.cfg().kernels.vulkan.mrow
             {
-                // fp32 K-quant multi-row GEMV for an MTP-VERIFY batch on the emulated-dot tier
-                // (GCN4): decode runs fp32 here (`linear_kq_fma`), and the arms below would both
-                // be wrong for verify — the int8 `mrow` runs ALU-bound on emulated dp4a AND its
-                // int8-quantized activations flip near-tie greedy tokens vs the fp32 decode
-                // stream (the Gemma4 MTP verify failure mode), while the dequant `mrow` is 2-3x
-                // slower than this kernel at the same exactness (RX580: kq/deq +68..+250%).
-                // Same per-row math as decode, bit-identical row-for-row (see
-                // `native_gemv_kq_fma_mrow.comp`'s header) — the verify stream agrees with decode
-                // exactly. Keyed off the DECODE knob (`kq_fma_gemv_ok`), not the GEMM tier knob:
-                // if decode isn't fp32, verify must not be either. Verify-scoped
-                // (`graph.mtp_verify`) — ordinary prefill keeps the int8/dequant arms below
-                // bit-for-bit: nothing about the prefill path changes on any device.
-                if graph.mtp_verify
+                // Preserve the int8 prefill tier; use decode-exact fp32 instead of scalar dequant.
+                if (graph.mtp_verify || m < 3 || !mmv_gate)
                     && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off)
                     && crate::gemm::native_gemv_kq_fma_mrow_spv(dt, 8).is_some()
                 {

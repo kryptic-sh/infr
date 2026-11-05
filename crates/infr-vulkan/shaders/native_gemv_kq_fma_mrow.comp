@@ -1,18 +1,5 @@
 #version 460
-// Multi-row (verify) K-quant GEMV y[r] = x[r]·Wᵀ on f32 activations (no quant_q8 pass), for GPUs
-// without fast int8 dot — the verify-batch twin of native_gemv_kq_fma.comp (the m=1 decode GEMV).
-// One 64-thread workgroup covers MR=4 input rows × NR output columns. Each lane loads its
-// superblock slice's weight words ONCE per iteration and dots them against all MR rows'
-// activations (reloading per row would re-traffic VRAM — the weight no longer fits L2 past a few
-// MB — while the int8 `mrow` this replaces streams it once). The m=1 grid re-streams the weight
-// per row (m× bandwidth), and the int8 `mrow` is ALU-bound where dp4a is emulated — while its
-// int8-quantized activations flip near-tie greedy tokens vs the fp32 decode stream (the Gemma4
-// MTP verify failure mode).
-// Per-row float op ORDER is identical to the m=1 kernel (same strided superblock traversal per
-// lane, same subgroup reduction), so row r here is bit-identical to the m=1 kernel's output for that
-// row — the MTP-verify-vs-decode identity contract holds by construction, the same argument as
-// the unified `linear_mmv_mrow(rows=1)` decode.
-// -DFMT_Q4K | -DFMT_Q6K. Requires in_f % 256 == 0. MR is fixed at 4; any `rows` runs grouped.
+// Multi-row fp32 K-quant GEMV sharing weights with decode-identical per-row reductions.
 #extension GL_EXT_control_flow_attributes : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require

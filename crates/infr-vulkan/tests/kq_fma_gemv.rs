@@ -313,13 +313,17 @@ fn kq_fma_mrow_bw() {
     let be = VulkanBackend::new().unwrap();
     const N_W: usize = 4;
     const REPS: usize = 32;
-    // Verify-shaped (m = drafts+1): the MTP draft window is <= 7 (spec.k default 6); 13/16 probe
-    // the second mrow band.
+    // Small-prefill and verify row counts cover both multi-row bands.
     for (label, dt, in_f, out_f) in [
         ("down q4", DType::Q4K, 10240, 2560),
         ("down q6", DType::Q6K, 10240, 2560),
         ("q", DType::Q4K, 2560, 2048),
         ("o", DType::Q4K, 2048, 2560),
+        ("qwen up", DType::Q4K, 2048, 22016),
+        ("qwen down q4", DType::Q4K, 11008, 2048),
+        ("qwen down q6", DType::Q6K, 11008, 2048),
+        ("qwen q4", DType::Q4K, 2048, 2048),
+        ("qwen q6", DType::Q6K, 2048, 2048),
         ("lm_head", DType::Q4K, 2560, 262144),
     ] {
         let bank = synth(dt, in_f * out_f, 3);
@@ -406,6 +410,135 @@ fn kq_fma_mrow_bw() {
             );
         }
     }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kq_fma_small_prefill_matches_decode() {
+    use infr_core::graph::{Graph, Op};
+    use infr_core::tensor::TensorDesc;
+
+    let mut cfg = infr_core::config::Config::default();
+    cfg.kernels.vulkan.kq_fma_gemv = Some(true);
+    let cfg = std::sync::Arc::new(cfg);
+    for dt in [DType::Q4K, DType::Q6K] {
+        for (rows, in_f, out_f, w_base) in [
+            (2usize, 2048usize, 4096usize, 0usize),
+            (4, 2048, 2048, 0),
+            (7, 768, 4101, 768 * 3),
+        ] {
+            let be = VulkanBackend::new_with(cfg.clone()).unwrap();
+            let case = infr_testkit::LinearCase::new(dt, rows, in_f, out_f).with_seed(0x9e7);
+            let (_, x) = infr_testkit::case_inputs(case);
+            let bank = synth(dt, w_base + in_f * out_f, 0x6e);
+            let graph = |m: usize| {
+                let mut g = Graph::new();
+                let xid = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+                let wid = g.weight(TensorDesc::new(vec![w_base + in_f * out_f], dt));
+                let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+                g.push(Op::Linear {
+                    x: xid,
+                    weight: wid,
+                    dst,
+                    m: m as u32,
+                    in_f: in_f as u32,
+                    out_f: out_f as u32,
+                    w_off: w_base as u32,
+                });
+                (g, xid, wid, dst)
+            };
+            let (g, xid, wid, dst) = graph(rows);
+            assert!(!g.mtp_verify);
+            let got = infr_testkit::run_graph(
+                &be,
+                &g,
+                &[
+                    (xid, infr_testkit::f32_bytes(&x)),
+                    (wid, pad_to_u32_align(&bank).into_owned()),
+                ],
+                dst,
+                rows * out_f,
+            );
+            let tag = if dt == DType::Q4K { "q4k" } else { "q6k" };
+            let prefix = format!("native_gemv_kq_fma_mrow_{tag}");
+            assert!(
+                be.built_kernel_names()
+                    .iter()
+                    .any(|n| n.starts_with(&prefix)),
+                "{dt:?} rows={rows}: fp32 multi-row kernel was not selected"
+            );
+            let (g1, x1, w1, y1) = graph(1);
+            for r in 0..rows {
+                let want = infr_testkit::run_graph(
+                    &be,
+                    &g1,
+                    &[
+                        (x1, infr_testkit::f32_bytes(&x[r * in_f..(r + 1) * in_f])),
+                        (w1, pad_to_u32_align(&bank).into_owned()),
+                    ],
+                    y1,
+                    out_f,
+                );
+                for o in 0..out_f {
+                    assert_eq!(
+                        got[r * out_f + o].to_bits(),
+                        want[o].to_bits(),
+                        "{dt:?} rows={rows} {in_f}x{out_f} w_base={w_base} ({r},{o})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kq_fma_small_prefill_keeps_eligible_int8() {
+    use infr_core::graph::{Graph, Op};
+    use infr_core::tensor::TensorDesc;
+
+    let mut cfg = infr_core::config::Config::default();
+    cfg.kernels.vulkan.kq_fma_gemv = Some(true);
+    let be = VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap();
+    if !be.capabilities().i8_dot {
+        return;
+    }
+    let (rows, in_f, out_f) = (4usize, 2048usize, 8192usize);
+    let case = infr_testkit::LinearCase::new(DType::Q4K, rows, in_f, out_f).with_seed(0x19f);
+    let (w, x) = infr_testkit::case_inputs(case);
+    let mut g = Graph::new();
+    let xid = g.input(TensorDesc::new(vec![rows, in_f], DType::F32));
+    let wid = g.weight(TensorDesc::new(vec![out_f, in_f], DType::Q4K));
+    let dst = g.output(TensorDesc::new(vec![rows, out_f], DType::F32));
+    g.push(Op::Linear {
+        x: xid,
+        weight: wid,
+        dst,
+        m: rows as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    });
+    let got = infr_testkit::run_graph(
+        &be,
+        &g,
+        &[
+            (xid, infr_testkit::f32_bytes(&x)),
+            (wid, pad_to_u32_align(&w).into_owned()),
+        ],
+        dst,
+        rows * out_f,
+    );
+    assert!(got.iter().all(|v| v.is_finite()));
+    let names = be.built_kernel_names();
+    assert!(names.iter().any(|n| n.contains("mmv")), "{names:?}");
+    assert!(names.iter().any(|n| n.starts_with("quant_q8")), "{names:?}");
+    assert!(
+        names
+            .iter()
+            .all(|n| !n.starts_with("native_gemv_kq_fma_mrow")),
+        "{names:?}"
+    );
 }
 
 /// End-to-end through the adapter: an MTP-verify-flagged graph (`Graph::mtp_verify`, the

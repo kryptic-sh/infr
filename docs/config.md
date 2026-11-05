@@ -202,11 +202,11 @@ spills KV to system RAM when VRAM runs out.
 the paged VRAM budget (and forces paging even when the weights would have fit),
 `ring` overrides the upload staging ring, `stats` prints per-pool
 hit/miss/eviction counts, and `trace` (`INFR_PAGER_TRACE`, a file path) records
-every pool's pager calls to that file, one file for the whole run, in the format
+one pool's pager calls to that file, one file for the whole run, in the format
 `infr_core::pager::trace` documents. A trace replays to exactly the counts
-`stats` prints; `infr-core`'s `pager_bench` test replays it, times it and
-compares today's eviction policy with Belady's (a lower bound for that request
-sequence when the trace has no probes). Unset, tracing costs nothing measurable.
+`stats` prints. `release_uploaded` (`INFR_RELEASE_UPLOADED`, on by default)
+drops a mapped weight's host pages once its bytes are in VRAM, so a long-running
+`infr serve` does not hold a second copy of the model.
 
 **`[kernels]`** — two backend-independent graph-shape gates (`qkv_fuse`,
 `gated_rmsnorm`) plus one sub-section per backend. Everything under them is a
@@ -216,7 +216,9 @@ and these exist to force one off when bisecting a correctness or perf problem.
 - **`[kernels.vulkan]`** (the biggest section): capability masks (`coopmat`,
   `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), the `force_wave64` testing knob
   (runs the wave64 path that AMD GCN takes on a device that can pin 32),
-  GEMM/GEMV tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, the
+  GEMM/GEMV tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`,
+  `kq_fma_tier` — the K-quant/Q4_0 FMA tier for GPUs without fast int8 dot,
+  auto-on), the
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
   `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,

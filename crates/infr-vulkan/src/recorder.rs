@@ -3490,6 +3490,22 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Probe-only: stream `n_vec4` vec4 words with `groups` workgroups of 256 threads and write one
+    /// partial per thread. Measures the sequential-read ceiling of the device; the only caller is
+    /// `tests/bw_scan.rs`.
+    pub fn bw_scan_at(&self, src: &dyn Buffer, dst: &dyn Buffer, n_vec4: usize, groups: usize) {
+        let kern = self.be.kernel("bw_scan", crate::gemm::bw_scan_spv(), 2, 4);
+        let mut push = [0u8; 4];
+        push[0..4].copy_from_slice(&(n_vec4 as u32).to_ne_bytes());
+        self.dispatch(
+            kern,
+            &[Self::vkb(src), Self::vkb(dst)],
+            1,
+            &push,
+            groups as u32,
+        );
+    }
+
     /// Split-K twin of [`Self::matmul_kq_fma_at`]: [`Self::kq_fma_slices_at`] over `splits` k
     /// slices into `partials`, then one `splitk_reduce` pass summing the planes. All slices ride
     /// one dispatch (the slice index is the top of the workgroup id), so they stay co-resident and

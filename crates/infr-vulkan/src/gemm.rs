@@ -1840,6 +1840,13 @@ pub(crate) fn native_gemm_warp_sk_kernel_name(dtype: infr_core::DType) -> Option
 
 /// SPIR-V for the split-K reduce (sum the partials planes).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
+/// SPIR-V for the probe-only sequential-read kernel (`bw_scan.comp`); see
+/// `tests/bw_scan.rs`. Nothing in production dispatches it.
+pub fn bw_scan_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/bw_scan.spv"))))
+}
+
 pub(crate) fn splitk_reduce_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| {

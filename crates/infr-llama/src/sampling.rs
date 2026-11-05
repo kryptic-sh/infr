@@ -123,8 +123,7 @@ impl Default for RequestSampling {
 
 impl RequestSampling {
     /// Any penalty actually active? One half of [`patches_logits`](Self::patches_logits), which
-    /// drives the decode loop's host-sampling fallback (penalties must mutate the logits row, which
-    /// the GPU-resident argmax/sample paths never download).
+    /// drives the decode loop's host-sampling fallback.
     pub fn penalties_active(&self) -> bool {
         self.presence_penalty != 0.0
             || self.frequency_penalty != 0.0
@@ -310,6 +309,13 @@ impl RequestCtx {
 /// multi-millisecond forward.
 pub(crate) fn abort_requested(req: Option<&RequestCtx>) -> bool {
     infr_core::shutdown::shutdown_requested() || req.is_some_and(RequestCtx::aborted)
+}
+
+/// Does this request rewrite the logits row before sampling? A `logit_bias` or a penalty needs the
+/// row on the host, so the MTP draft-verify loop (whose draft head samples the same row) must not
+/// take over a request that asks for either.
+pub(crate) fn adjusts_logits(req: Option<&RequestCtx>) -> bool {
+    req.is_some_and(|r| r.sampling().patches_logits())
 }
 
 // ---------------------------------------------------------------------------

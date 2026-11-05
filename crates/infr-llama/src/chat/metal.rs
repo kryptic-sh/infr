@@ -101,7 +101,7 @@ impl ChatModel for MetalSeamChat {
         // Metal trunk + head, instead of the plain session decode. The committed stream is the
         // target's greedy stream (the same invariant Vulkan MTP holds), so the two are
         // token-identical — pinned by the greedy-equivalence check in the CLI validation.
-        if self.wants_mtp()? {
+        if !crate::sampling::adjusts_logits(req) && self.wants_mtp()? {
             let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");
             return crate::mtp::generate_mtp_spec_metal(&self.model, head, prompt, max_new, |p| {
                 on_piece(p)

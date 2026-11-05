@@ -451,3 +451,94 @@ fn a_write_at_a_page_offset_reads_back_through_the_table() {
     assert_eq!(got.bits, want.bits);
     assert!(walk_nonzero(&want.bits) > 0);
 }
+
+/// A replayed store writes at `p_pos + p_rb`, so a slot whose block starts at row 512 must land
+/// its rows there and leave block 0 alone — the store half of the row base the attention read
+/// never needed (its table already points at the right pages).
+#[test]
+fn a_store_row_base_puts_the_row_in_that_block() {
+    let be = match VulkanBackend::new_with(Arc::new(Config::default())) {
+        Ok(be) => be,
+        Err(e) => {
+            eprintln!("skipping: no Vulkan device ({e})");
+            return;
+        }
+    };
+    let n = NKV * HD; // one KV row, block-aligned for Q8
+    let block_rows = PAGE_ROWS;
+    let pool_rows = 2 * block_rows;
+    let pool_elems = pool_rows * n;
+    let src = gen_f32(n, 555);
+    let rb = block_rows as u32;
+
+    let store = |q8: bool, rb: u32| -> (Vec<u8>, usize) {
+        let bytes = if q8 {
+            pool_elems + pool_elems / 16
+        } else {
+            pool_elems * 2
+        };
+        let dst = be.alloc(bytes, BufferUsage::KvCache).unwrap();
+        let sb = be.alloc(n * 4, BufferUsage::Activations).unwrap();
+        be.upload(sb.as_ref(), bytemuck::cast_slice(&src)).unwrap();
+        let params = be.alloc(24, BufferUsage::Activations).unwrap();
+        let mut pb = [0u8; 24];
+        pb[4..8].copy_from_slice(&1u32.to_le_bytes());
+        pb[16..20].copy_from_slice(&rb.to_le_bytes());
+        be.upload(params.as_ref(), &pb).unwrap();
+        let rec = be.recorder().unwrap();
+        if q8 {
+            rec.store_q8_dyn(
+                sb.as_ref(),
+                params.as_ref(),
+                dst.as_ref(),
+                n,
+                pool_elems,
+                false,
+            );
+        } else {
+            rec.store_f16_dyn_at(
+                sb.as_ref(),
+                params.as_ref(),
+                dst.as_ref(),
+                dst.device_addr().unwrap(),
+                n,
+                pool_rows,
+            );
+        }
+        rec.finish().unwrap();
+        let mut out = vec![0u8; bytes];
+        be.download(dst.as_ref(), &mut out).unwrap();
+        (out, bytes)
+    };
+    let row_bytes = |q8: bool, out: &[u8], rb: u32| -> Vec<u8> {
+        let r = rb as usize;
+        if q8 {
+            let mut row = out[r * n..r * n + n].to_vec();
+            let scales = pool_elems + r * n / 32 * 2;
+            row.extend_from_slice(&out[scales..scales + n / 32 * 2]);
+            row
+        } else {
+            out[r * n * 2..r * n * 2 + n * 2].to_vec()
+        }
+    };
+
+    for q8 in [false, true] {
+        let (lo, _) = store(q8, 0);
+        let (hi, _) = store(q8, rb);
+        assert_eq!(
+            row_bytes(q8, &hi, rb),
+            row_bytes(q8, &lo, 0),
+            "q8={q8}: the row must quantize identically at the block row base"
+        );
+        assert_eq!(
+            row_bytes(q8, &hi, 0),
+            vec![0u8; row_bytes(q8, &hi, 0).len()],
+            "q8={q8}: block 0 must stay untouched when the row base is 512"
+        );
+    }
+}
+
+fn gen_f32(n: usize, seed: u64) -> Vec<f32> {
+    let mut r = Rng(seed | 1);
+    (0..n).map(|_| r.next_f32()).collect()
+}

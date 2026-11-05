@@ -16,6 +16,7 @@ parity = []
 
 [build-dependencies]
 infr-core.workspace = true
+spv-hoard.workspace = true
 
 [dependencies]
 infr-prof.workspace = true

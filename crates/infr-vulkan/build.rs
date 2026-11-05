@@ -1,6 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Compile GLSL compute shaders (which need features WGSL/naga can't express, e.g.
 /// cooperative matrix) to SPIR-V via `glslc` at build time. Output to OUT_DIR.
@@ -3850,45 +3848,32 @@ fn gen_grids(out: &str) {
     std::fs::write(format!("{out}/native_grids.glsl"), s).expect("write native_grids.glsl");
 }
 
-/// Compile every `(source stem, output stem, defines)` build to `{out}/{output stem}.spv`, spread
-/// over the build script's job allowance (`NUM_JOBS`, which cargo sets from `-j`).
-///
-/// One `glslc` process per variant, one after another, made every shader edit a multi-minute
-/// rebuild — worst on Windows, where starting a process costs several times what it does on Linux.
-/// The builds are independent (each writes only its own `.spv`), and everything downstream reads
-/// the outputs back in list order, so completion order is irrelevant. A failed compile panics its
-/// worker, and `thread::scope` re-raises that panic here once the other workers finish.
+/// Compile every build to `{out}/{output stem}.spv`, reusing cached outputs keyed by content.
 fn compile_shaders(glslc: &Path, out: &str, builds: &[(String, String, Vec<String>)]) {
     for (src_stem, _, _) in builds {
         println!("cargo:rerun-if-changed=shaders/{src_stem}.comp");
     }
-    let jobs = std::env::var("NUM_JOBS")
+    let out_dir = Path::new(out);
+    let jobs: Vec<spv_hoard::Job> = builds
+        .iter()
+        .map(|(src_stem, dst_stem, defines)| spv_hoard::Job {
+            src: PathBuf::from(format!("shaders/{src_stem}.comp")),
+            defines: defines.clone(),
+            out: out_dir.join(format!("{dst_stem}.spv")),
+        })
+        .collect();
+    let cache = spv_hoard::Cache::new(glslc, spv_hoard::default_cache_dir(out_dir))
+        .expect("failed to run glslc — install shaderc (provides glslc)")
+        .flags(["-fshader-stage=comp", "--target-env=vulkan1.3", "-O"].map(String::from))
+        .include(out_dir);
+    let jobs_limit = std::env::var("NUM_JOBS")
         .ok()
         .and_then(|n| n.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(1);
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|scope| {
-        for _ in 0..jobs.min(builds.len()) {
-            scope.spawn(|| {
-                while let Some((src_stem, dst_stem, defines)) =
-                    builds.get(next.fetch_add(1, Ordering::Relaxed))
-                {
-                    let src = format!("shaders/{src_stem}.comp");
-                    let status = Command::new(glslc)
-                        .args(["-fshader-stage=comp", "--target-env=vulkan1.3", "-O"])
-                        .arg(format!("-I{out}"))
-                        .args(defines)
-                        .arg(&src)
-                        .arg("-o")
-                        .arg(format!("{out}/{dst_stem}.spv"))
-                        .status()
-                        .expect("failed to run glslc — install shaderc (provides glslc)");
-                    assert!(status.success(), "glslc failed for {src}");
-                }
-            });
-        }
-    });
+    cache
+        .compile_all(&jobs, jobs_limit)
+        .unwrap_or_else(|err| panic!("{err}"));
 }
 
 /// The `glslc` to run: the one on `PATH`, else the Vulkan SDK's (`$VULKAN_SDK/Bin`).

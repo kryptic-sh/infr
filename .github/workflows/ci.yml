@@ -555,7 +555,7 @@ jobs:
           # Dependency order: each crate after every infr crate it needs, and
           # the `infr-cli` binary (the `infr` name on crates.io is someone
           # else's) last because it depends on most of them.
-          ORDER="infr-plat infr-prof infr-prof-rt infr-core infr-gguf infr-hub infr-chat infr-cpu infr-vulkan infr-metal infr-engine infr-server infr-llama infr-cli"
+          ORDER="infr-plat infr-prof infr-prof-rt spv-hoard infr-core infr-gguf infr-hub infr-chat infr-cpu infr-vulkan infr-metal infr-engine infr-server infr-llama infr-cli"
           # A crate missing from ORDER fails the release *before* anything is
           # uploaded, rather than half-publishing and stranding the binary: a new
           # library that ships without being added here cannot be published, and

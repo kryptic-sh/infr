@@ -17,6 +17,7 @@ members = [
     "crates/infr-prof",
     "crates/infr-prof-rt",
     "crates/infr-testkit",
+    "crates/spv-hoard",
 ]
 
 [workspace.package]
@@ -46,6 +47,8 @@ infr-prof = { path = "crates/infr-prof", version = "0.2.0" }
 infr-prof-rt = { path = "crates/infr-prof-rt", version = "0.2.0" }
 # Test-support only — a `[dev-dependencies]` entry in the backends, never a production dep.
 infr-testkit = { path = "crates/infr-testkit" }
+# Build-script helper: caches glslc output by content so a shader edit only recompiles what changed.
+spv-hoard = { path = "crates/spv-hoard", version = "0.2.0" }
 
 # shared third-party
 thiserror = "2"

@@ -3506,7 +3506,7 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Split-K twin of [`Self::matmul_kq_fma_at`]: [`Self::kq_fma_slices_at`] over `splits` k
+    /// Split-K twin of [`Self::matmul_kq_fma_at`]: `kq_fma_slices_at` over `splits` k
     /// slices into `partials`, then one `splitk_reduce` pass summing the planes. All slices ride
     /// one dispatch (the slice index is the top of the workgroup id), so they stay co-resident and
     /// overlap; a grid that underfills the device therefore still fills it.

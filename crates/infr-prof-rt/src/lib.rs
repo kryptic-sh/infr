@@ -30,6 +30,8 @@
 //! their own totals and appeared nowhere in the exit report or the JSON — so "correlate the host
 //! function table against device op time" was accidentally a vulkan-only capability.
 
+mod timeline;
+
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -136,6 +138,11 @@ struct ThreadProf {
     stack: Vec<Frame>,
     /// Per-site recursion depth on this thread (inclusive total only counts the outermost).
     depth: Vec<u32>,
+    /// Timeline slices not yet handed to `timeline::flush`; a thread's completed spans, dropped
+    /// together at the next outer close so per-thread memory stays bounded.
+    events: Vec<timeline::Event>,
+    /// Stable per-thread ordinal used as the trace `tid` (assigned on first use).
+    tid: u32,
 }
 
 impl ThreadProf {
@@ -152,11 +159,14 @@ impl ThreadProf {
         // `Weak<AccumTable>` and prune upgrades that fail in `collect` — accepting that a
         // transient thread's data is lost once it fully exits.
         let table = Arc::new(AccumTable::new());
-        global().tables.lock().unwrap().push(table.clone());
+        let g = global();
+        g.tables.lock().unwrap().push(table.clone());
         ThreadProf {
             table,
             stack: Vec::with_capacity(64),
             depth: Vec::new(),
+            events: Vec::new(),
+            tid: g.next_tid.fetch_add(1, Relaxed),
         }
     }
 }
@@ -169,6 +179,8 @@ struct Global {
     names: Mutex<Vec<(&'static str, &'static str)>>,
     tables: Mutex<Vec<Arc<AccumTable>>>,
     start: Instant,
+    /// Next timeline thread ordinal (`tid`), wrapped after 2^32 threads.
+    next_tid: AtomicU32,
 }
 
 static GLOBAL: OnceLock<Global> = OnceLock::new();
@@ -188,6 +200,7 @@ fn global() -> &'static Global {
             names: Mutex::new(Vec::new()),
             tables: Mutex::new(Vec::new()),
             start: Instant::now(),
+            next_tid: AtomicU32::new(1),
         }
     })
 }
@@ -260,6 +273,19 @@ pub fn set_profile_out(path: Option<&str>) {
     *PROFILE_OUT.lock().unwrap() = path.map(str::to_owned);
 }
 
+/// Where [`report`] writes the span TIMELINE — the resolved `prof.trace` (`INFR_PROF_TRACE`),
+/// same grammar as [`set_profile_out`]: an empty path means off.
+///
+/// This is what turns the aggregate into a sequence: one `"ph":"X"` slice per completed span,
+/// on one track per thread, timestamped from the profiling epoch. Load the file in
+/// `ui.perfetto.dev` (or `chrome://tracing`); the JSON report cannot show gaps or ordering.
+pub fn set_trace_out(path: Option<&str>) {
+    // Install the atexit reporter even for a build whose spans never ran (a run that only wants
+    // the trace still has to flush it), and so `report` is registered before recording starts.
+    let _ = global();
+    timeline::set_out(path);
+}
+
 /// The installed [`PROFILE_OUT`], cloned out from under the lock (the reporter must not hold it
 /// while it writes a file).
 fn profile_out() -> Option<String> {
@@ -324,6 +350,28 @@ impl Drop for Guard {
                 // Over the site cap: no slot exists to time this into. Count it so the exit
                 // report can surface a single `[dropped]` aggregate instead of losing it.
                 DROPPED.fetch_add(1, Relaxed);
+            }
+            if timeline::enabled() && elapsed >= timeline::MIN_NS {
+                if tp.events.len() >= timeline::FLUSH_EVENTS {
+                    timeline::flush(std::mem::take(&mut tp.events));
+                }
+                let ts_ns = frame
+                    .start
+                    .saturating_duration_since(global().start)
+                    .as_nanos() as u64;
+                let tid = tp.tid;
+                tp.events.push(timeline::Event {
+                    tid,
+                    site: frame.id,
+                    ts_ns,
+                    dur_ns: elapsed,
+                });
+                // Outermost span closed: this thread has nothing in flight, so hand the buffer
+                // over now. That bounds per-thread memory AND is what makes the tail visible at
+                // exit, where only the exiting thread's TLS can still be reached.
+                if tp.stack.is_empty() {
+                    timeline::flush(std::mem::take(&mut tp.events));
+                }
             }
         });
     }
@@ -406,13 +454,21 @@ pub fn report() {
     if GLOBAL.get().is_none() {
         return;
     }
+    // Hand over the exiting thread's partial timeline buffer before collecting: the fence and
+    // the last outermost span flushed themselves, but a thread that exits mid-span leaves its
+    // children behind. Live threads' TLS cannot be reached from here (see timeline.rs); their
+    // buffers flush at the next outermost span or at FLUSH_EVENTS.
+    let _ = TP.try_with(|tp| {
+        let buf = std::mem::take(&mut tp.borrow_mut().events);
+        timeline::flush(buf);
+    });
     let (rows, n_threads, wall_ns) = collect();
     let mut gpu: Vec<(String, f64, u64)> = GPU.lock().unwrap().clone();
     // total_cmp, not partial_cmp().unwrap(): a bad timestamp delta can yield a NaN `us`, and
     // panicking here would abort the whole process from inside the atexit reporter. total_cmp
     // is a total order (NaN sorts deterministically) so the report always prints.
     gpu.sort_by(|a, b| b.1.total_cmp(&a.1));
-    if rows.is_empty() && gpu.is_empty() {
+    if rows.is_empty() && gpu.is_empty() && !timeline::has_events() {
         return;
     }
     if !rows.is_empty() {
@@ -493,6 +549,11 @@ pub fn report() {
                 Err(e) => eprintln!("failed to write INFR_PROF_OUT={path}: {e}"),
             }
         }
+    }
+    // Site names for the trace come from the same registry the table was built from; the trace
+    // itself is independent of INFR_PROF_OUT (both, either, or neither may be requested).
+    if let Some(g) = GLOBAL.get() {
+        timeline::write(&g.names.lock().unwrap().clone());
     }
 }
 

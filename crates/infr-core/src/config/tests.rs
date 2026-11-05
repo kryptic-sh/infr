@@ -1291,6 +1291,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_MAX_TOKENS_CAP",
         "INFR_NO_THINK",
         "INFR_PROF_OUT",
+        "INFR_PROF_TRACE",
         "INFR_REQUEST_TIMEOUT_SECS",
         "INFR_SERVE_STATS_SECS",
     ];

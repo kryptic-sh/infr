@@ -373,6 +373,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.prof.vram = presence(get, "INFR_PROF_VRAM");
     p.prof.diffusion_trace = presence(get, "INFR_PROF_DIFFUSION_TRACE");
     p.prof.out = opt_path(get, "INFR_PROF_OUT");
+    p.prof.trace = opt_path(get, "INFR_PROF_TRACE");
     // Unlike its predecessor's exact-literal `"2"`/`"3"` compare, an unrecognized mode here falls
     // back to the default rather than silently meaning "on, level unrecognized".
     p.prof.metal_device_time = opt_text(get, "INFR_PROF_METAL_DEVICE_TIME")

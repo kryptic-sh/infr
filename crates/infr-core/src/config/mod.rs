@@ -632,6 +632,12 @@ cfg_struct! {
         /// (`INFR_PROFILE` — the BUILD-time host-instrumentation input read by `build.rs` — is
         /// deliberately NOT config; see [`manifest::NOT_MIGRATED`].)
         out: Option<PathBuf> = None,
+        /// `INFR_PROF_TRACE`: write the span TIMELINE as Chrome Trace Event JSON to this path —
+        /// one `"ph":"X"` slice per instrumented span on per-thread tracks, loadable in
+        /// `ui.perfetto.dev`. When a span is costlier than the slice you want, this is the answer
+        /// where [`out`](Self::out) is a process-wide aggregate. Host spans exist only in an
+        /// `INFR_PROFILE=1` build; an empty path means off.
+        trace: Option<PathBuf> = None,
         /// `INFR_PROF_METAL_DEVICE_TIME`: how Metal obtains per-op DEVICE time. See
         /// [`MetalDeviceTime`].
         metal_device_time: MetalDeviceTime = MetalDeviceTime::Off,

@@ -844,16 +844,17 @@ fn default_thread_count() -> Option<usize> {
     infr_plat::cpu::physical_cores().filter(|&cores| cores < logical)
 }
 
-/// `prof.out` → the profiler runtime's report destination.
+/// `prof.out` and `prof.trace` → the profiler runtime's report and timeline destinations.
 ///
 /// PERMANENT, like [`publish_thread_count`] and unlike the deleted transitional env bridge:
-/// `infr-prof-rt` writes its JSON from a C `atexit` hook that has no receiver and no config to
+/// `infr-prof-rt` writes from a C `atexit` hook that has no receiver and no config to
 /// borrow, and it cannot depend on `infr-core` to fetch one (the dependency runs the other way).
-/// So the resolved value is PUSHED into the reporter here, once, in `main` — a value handed
+/// So the resolved values are PUSHED into the reporter here, once, in `main` — a value handed
 /// across an API boundary, not laundered through the environment. `None` leaves the reporter on
-/// stderr only, exactly as an unset `INFR_PROF_OUT` did.
+/// stderr only, exactly as unset `INFR_PROF_OUT` / `INFR_PROF_TRACE` did.
 fn publish_profile_out(cfg: &Config) {
     infr_prof_rt::set_profile_out(cfg.prof.out.as_deref().and_then(|p| p.to_str()));
+    infr_prof_rt::set_trace_out(cfg.prof.trace.as_deref().and_then(|p| p.to_str()));
 }
 
 /// Is `path` a usable LOCAL model: an existing regular FILE whose extension is `.gguf`

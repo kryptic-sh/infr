@@ -84,6 +84,8 @@ pub struct RequestSampling {
     /// for tokens seen in the last [`repeat_last_n`](Self::repeat_last_n) generated tokens.
     pub repeat_penalty: f32,
     pub repeat_last_n: usize,
+    /// OpenAI `logit_bias`: `(token id, bias)` added to the raw logit; `-inf` bans the token.
+    pub logit_bias: Vec<(u32, f32)>,
 }
 
 impl Default for RequestSampling {
@@ -100,15 +102,17 @@ impl Default for RequestSampling {
             frequency_penalty: 0.0,
             repeat_penalty: 1.0,
             repeat_last_n: 64,
+            logit_bias: Vec::new(),
         }
     }
 }
 
 impl RequestSampling {
-    /// Any penalty actually active? Drives the decode loop's host-sampling fallback (penalties must
+    /// Any penalty or logit bias active? Drives the decode loop's host-sampling fallback (both
     /// mutate the logits row, which the GPU-resident argmax/sample paths never download).
     pub fn penalties_active(&self) -> bool {
-        self.presence_penalty != 0.0
+        !self.logit_bias.is_empty()
+            || self.presence_penalty != 0.0
             || self.frequency_penalty != 0.0
             || (self.repeat_penalty != 1.0 && self.repeat_last_n > 0)
     }
@@ -222,6 +226,11 @@ impl RequestCtx {
 ///
 /// Cost is one relaxed atomic load (plus, for `serve`, a second) per token — nothing against a
 /// multi-millisecond forward.
+/// True when the request patches logits; the MTP decoders ignore that, so callers must skip them.
+pub(crate) fn adjusts_logits(req: Option<&RequestCtx>) -> bool {
+    req.is_some_and(|r| r.sampling().penalties_active())
+}
+
 pub(crate) fn abort_requested(req: Option<&RequestCtx>) -> bool {
     infr_core::shutdown::shutdown_requested() || req.is_some_and(RequestCtx::aborted)
 }
@@ -342,6 +351,7 @@ pub(crate) struct Penalties {
     frequency: f32,
     repeat: f32,
     last_n: usize,
+    logit_bias: Vec<(u32, f32)>,
     /// token id -> times generated so far (presence/frequency).
     counts: std::collections::HashMap<u32, u32>,
     /// The last `last_n` generated ids, in order (llama.cpp's `repeat_penalty` window).
@@ -359,13 +369,14 @@ impl Penalties {
             frequency: r.frequency_penalty,
             repeat: r.repeat_penalty,
             last_n: r.repeat_last_n,
+            logit_bias: r.logit_bias.clone(),
             counts: std::collections::HashMap::new(),
             recent: std::collections::VecDeque::new(),
         })
     }
 
-    /// Patch `logits` in place for the tokens generated so far. Order matches llama.cpp's
-    /// `penalties` sampler: repeat (multiplicative, sign-aware) then presence/frequency (additive).
+    /// Patch `logits` in place: logit bias first, then llama.cpp's `penalties` sampler order of
+    /// repeat (multiplicative, sign-aware) then presence/frequency (additive).
     ///
     /// Every logits access is CHECKED (`get_mut`), and an id at or past `logits.len()` is skipped.
     /// The row is full-vocab on the trunk decode path, so today no id can be out of range — but the
@@ -376,6 +387,11 @@ impl Penalties {
     /// correctness constraint: an id outside the row cannot be sampled from that row at all, so
     /// dropping its nudge changes nothing about the outcome, while panicking kills a live request.
     pub(crate) fn apply(&self, logits: &mut [f32]) {
+        for &(t, b) in &self.logit_bias {
+            if let Some(l) = logits.get_mut(t as usize) {
+                *l += b;
+            }
+        }
         if self.repeat != 1.0 && self.last_n > 0 {
             // llama.cpp's `penalties` sampler scales each DISTINCT id in the window ONCE — a token
             // repeated K times must be divided by `repeat`, not `repeat^K`. The raw `recent` deque
@@ -935,6 +951,31 @@ mod tests {
         assert_eq!(logits[1], 2.5, "in-range id must still be penalized");
         assert_eq!(logits[0], 0.0, "untouched ids stay untouched");
         assert_eq!(logits.len(), 4, "the row is not resized");
+    }
+
+    #[test]
+    fn logit_bias_shifts_bans_and_precedes_penalties() {
+        let ctx = RequestCtx::new(RequestSampling {
+            logit_bias: vec![(0, 3.0), (1, f32::NEG_INFINITY), (2, 4.0), (99, 1.0)],
+            repeat_penalty: 2.0,
+            ..Default::default()
+        });
+        assert!(ctx.sampling().penalties_active());
+        let mut p = Penalties::resolve(Some(&ctx)).expect("bias active");
+        p.observe(2);
+        let mut logits = vec![1.0f32, 5.0, -2.0, 0.5];
+        p.apply(&mut logits);
+        assert_eq!(logits[0], 4.0);
+        assert_eq!(logits[1], f32::NEG_INFINITY);
+        // Bias before repeat: (-2 + 4) / 2, not -2 * 2 + 4.
+        assert_eq!(logits[2], 1.0);
+        assert_eq!(logits[3], 0.5);
+        let greedy = Sampler {
+            temp: 0.0,
+            ..Sampler::default()
+        };
+        let mut rng = 1;
+        assert_eq!(sample_logits(&logits, greedy, &mut rng), 0);
     }
 
     /// An empty support is "can't happen" (a real vocab is never empty), so the two draw entry

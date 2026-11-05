@@ -197,6 +197,9 @@ pub struct ChatRequest {
     /// llama.cpp extension (1.0 = off).
     #[serde(default)]
     pub repeat_penalty: Option<f32>,
+    /// OpenAI `{"<token id>": bias}`, or llama.cpp `[[id, bias], ...]`; `false` as a bias bans the id.
+    #[serde(default)]
+    pub logit_bias: Option<serde_json::Value>,
     /// OpenAI: `"none"` turns thinking off; `"minimal"`/`"low"`/`"medium"`/`"high"` turn it on.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
@@ -221,6 +224,8 @@ pub struct GenParams {
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub repeat_penalty: Option<f32>,
+    /// `(token id, bias)` pairs, in request order; a banned id carries `-inf`.
+    pub logit_bias: Vec<(u32, f32)>,
     /// Already normalised: empty strings dropped (an empty stop would fire on the first token).
     pub stop: Vec<String>,
     /// The request's thinking switch; `None` keeps the server default (`--no-think`/`--think`).
@@ -313,6 +318,7 @@ impl GenParams {
         }
 
         let think = request_think(req)?;
+        let logit_bias = parse_logit_bias(req.logit_bias.as_ref())?;
 
         Ok(Self {
             // OpenAI renamed `max_tokens` -> `max_completion_tokens`; the new name wins.
@@ -324,11 +330,71 @@ impl GenParams {
             presence_penalty: rng("presence_penalty", req.presence_penalty, -2.0, 2.0)?,
             frequency_penalty: rng("frequency_penalty", req.frequency_penalty, -2.0, 2.0)?,
             repeat_penalty: req.repeat_penalty,
+            logit_bias,
             stop,
             think,
             images: Vec::new(),
         })
     }
+}
+
+/// Validate `logit_bias`: ids are non-negative integers, biases lie in OpenAI's -100..=100.
+fn parse_logit_bias(v: Option<&serde_json::Value>) -> Result<Vec<(u32, f32)>, ParamError> {
+    use serde_json::Value;
+    let err = |message: String| ParamError {
+        param: "logit_bias",
+        message,
+    };
+    let id_of = |v: &Value| -> Result<u32, ParamError> {
+        let id = match v {
+            Value::String(s) => s.trim().parse::<u32>().ok(),
+            Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
+            _ => None,
+        };
+        id.ok_or_else(|| err(format!("logit_bias key {v} is not a token id")))
+    };
+    let bias_of = |id: u32, v: &Value| -> Result<f32, ParamError> {
+        match v {
+            Value::Bool(false) => Ok(f32::NEG_INFINITY),
+            Value::Number(n) => match n.as_f64() {
+                Some(b) if (-100.0..=100.0).contains(&b) => Ok(b as f32),
+                _ => Err(err(format!(
+                    "logit_bias for token {id} must be between -100 and 100, got {n}"
+                ))),
+            },
+            _ => Err(err(format!(
+                "logit_bias for token {id} must be a number or false, got {v}"
+            ))),
+        }
+    };
+    let mut out = Vec::new();
+    match v {
+        None | Some(Value::Null) => {}
+        Some(Value::Object(m)) => {
+            for (k, b) in m {
+                let id = id_of(&Value::String(k.clone()))?;
+                out.push((id, bias_of(id, b)?));
+            }
+        }
+        Some(Value::Array(a)) => {
+            for pair in a {
+                match pair.as_array().map(Vec::as_slice) {
+                    Some([k, b]) => {
+                        let id = id_of(k)?;
+                        out.push((id, bias_of(id, b)?));
+                    }
+                    _ => return Err(err("logit_bias array entries must be [id, bias]".into())),
+                }
+            }
+        }
+        Some(_) => {
+            return Err(err(
+                "logit_bias must be an object of token id to bias, or an array of [id, bias]"
+                    .into(),
+            ))
+        }
+    }
+    Ok(out)
 }
 
 /// The request's thinking switch. Precedence: `chat_template_kwargs.enable_thinking`, then
@@ -2913,6 +2979,23 @@ mod tests {
     }
 
     #[test]
+    fn logit_bias_accepts_openai_and_llama_cpp_forms() {
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"logit_bias":{"15":-100,"42":2.5}}"#,
+        ))
+        .unwrap();
+        let mut b = p.logit_bias;
+        b.sort_by_key(|&(t, _)| t);
+        assert_eq!(b, vec![(15, -100.0), (42, 2.5)]);
+
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"logit_bias":[[7,1.5],["8",false]]}"#,
+        ))
+        .unwrap();
+        assert_eq!(p.logit_bias, vec![(7, 1.5), (8, f32::NEG_INFINITY)]);
+    }
+
+    #[test]
     fn unknown_fields_are_ignored_not_rejected() {
         let p = GenParams::from_request(&req(
             r#"{"model":"m","messages":[],"n":1,"user":"bob","logit_bias":{},"logprobs":true}"#,
@@ -3024,6 +3107,30 @@ mod tests {
             (
                 r#"{"model":"m","messages":[],"repeat_penalty":0}"#,
                 "repeat_penalty",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"5":101}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"hello":1}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"-1":1}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":[[1]]}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"1":true}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":3}"#,
+                "logit_bias",
             ),
             (r#"{"model":"m","messages":[],"stop":[1,2]}"#, "stop"),
             (

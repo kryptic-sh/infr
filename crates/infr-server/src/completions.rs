@@ -36,6 +36,8 @@ pub(crate) struct CompletionRequest {
     frequency_penalty: Option<f32>,
     #[serde(default)]
     repeat_penalty: Option<f32>,
+    #[serde(default)]
+    logit_bias: Option<serde_json::Value>,
 }
 
 impl CompletionRequest {
@@ -57,6 +59,7 @@ impl CompletionRequest {
             presence_penalty: self.presence_penalty,
             frequency_penalty: self.frequency_penalty,
             repeat_penalty: self.repeat_penalty,
+            logit_bias: self.logit_bias.clone(),
             reasoning_effort: None,
             chat_template_kwargs: None,
             think: None,

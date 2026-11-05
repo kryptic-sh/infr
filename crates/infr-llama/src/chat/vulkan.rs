@@ -190,7 +190,8 @@ impl ChatModel for DenseSeamChat {
         req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
-        if self.wants_gemma4_mtp()? {
+        let mtp_ok = !crate::sampling::adjusts_logits(req);
+        if mtp_ok && self.wants_gemma4_mtp()? {
             self.ensure_mtp_backend()?;
             let asst = self
                 .gemma4_asst
@@ -208,7 +209,7 @@ impl ChatModel for DenseSeamChat {
             )
             .map(|(stats, _)| stats);
         }
-        if self.wants_mtp()? {
+        if mtp_ok && self.wants_mtp()? {
             self.ensure_mtp_backend()?;
             let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");
             let vk = self.mtp_vk.as_ref().expect("ensure_mtp_backend set it");

@@ -205,8 +205,9 @@ share one page pool, a fork points at its parent's complete pages, and only a
 page a slot writes is copied first. It costs the same device bytes as the slots
 it replaces (one block per slot), is built at the first fork, and helps a
 full-attention model the most — ring, recurrent, MLA and diffusion layers stay
-compact. The two knobs are independent, and a paged slot sits out the host
-store because the pool already shares its prefix.
+compact. Only the Vulkan backend walks a page table; elsewhere the knob warns
+and the slots stay linear. The two knobs are independent, and a paged slot sits
+out the host store because the pool already shares its prefix.
 
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),

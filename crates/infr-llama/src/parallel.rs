@@ -491,9 +491,10 @@ impl ParallelSeam {
                     kv,
                     prompt_tokens.len(),
                 )
+                .map(|kept| (kept, s.stats()))
             }) {
-                Ok(Ok(kept)) if kept > 0 => {
-                    tracing::debug!(tokens = kept, "kv store: captured a prefix");
+                Ok(Ok((kept, (blocks, bytes)))) if kept > 0 => {
+                    tracing::debug!(tokens = kept, blocks, bytes, "kv store: captured a prefix");
                 }
                 Ok(Err(e)) => tracing::warn!(error = %e, "kv store: capture failed"),
                 _ => {}

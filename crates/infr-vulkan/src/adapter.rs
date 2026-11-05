@@ -117,6 +117,11 @@ fn is_kv_prepass(dt: infr_core::DType) -> bool {
     is_kv_quant(dt) || is_kv_dense_alt(dt) || is_turbo(dt)
 }
 
+/// Row offset of a cache's private block inside a shared page pool; 0 for a linear cache.
+fn kv_row_base(graph: &Graph, id: TensorId) -> usize {
+    graph.desc(id).pages.map_or(0, |p| p.row_base)
+}
+
 /// Lever 1 (kv-decode-perf-levers #1): mainline low-bit block quants the DECODE split-K kernel can
 /// dequant INLINE via a coalesced block-amortized decoder (`attn_partial`'s `dqv4`,
 /// `attn_partial_ml_kernel`) — so decode reads the compact cache directly instead of a dequant→f16
@@ -2350,6 +2355,8 @@ fn lower_op(
             let src_f16 = matches!(graph.desc(*src).dtype, infr_core::DType::F16);
             // Planar scales region begins at byte `cap` = total cache elements.
             let cap = graph.desc(*cache).numel();
+            // A pooled cache owns one contiguous block of rows; every store is biased into it.
+            let rb = kv_row_base(graph, *cache);
             // SWA ring cache: the write for position p lands at row p % cap_rows — the ring only
             // recycles rows whose positions the window mask already excludes (see the runner's
             // ring sizing). A batched prefill write crossing the wrap splits into two contiguous
@@ -2375,7 +2382,7 @@ fn lower_op(
             match mode {
                 RopeMode::Static(_) if cache_q8 => {
                     for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
-                        rec.store_q8(s, c, nr * rs, dr * rs, cap, src_f16, sr * rs);
+                        rec.store_q8(s, c, nr * rs, (dr + rb) * rs, cap, src_f16, sr * rs);
                     }
                 }
                 RopeMode::Dynamic(params) if cache_q8 => {
@@ -2384,27 +2391,29 @@ fn lower_op(
                 // Mainline low-bit KV quants: quantize into standard GGUF blocks (static only — a
                 // quantized KV cache forces static decode, so a Dynamic WriteKv never reaches here).
                 RopeMode::Static(_) if is_kv_quant(cache_dt) => {
-                    rec.quant_kv(cache_dt, s, c, n, pos * rs, src_f16)
+                    rec.quant_kv(cache_dt, s, c, n, (pos + rb) * rs, src_f16)
                 }
                 // Dense f32/bf16 cache: cast-store the row (also static-only).
                 RopeMode::Static(_) if is_kv_dense_alt(cache_dt) => {
-                    rec.store_kv_dense(cache_dt, s, c, n, pos * rs, src_f16)
+                    rec.store_kv_dense(cache_dt, s, c, n, (pos + rb) * rs, src_f16)
                 }
                 // TurboQuant cache: WHT-quantize the row (static-only). NOT BDA-migrated (#74 slice 3
                 // deferred turbo — its dequant read is byte-granular, outside the u32-word/f16 read
                 // family; experimental, not in the gate suite).
                 RopeMode::Static(_) if is_turbo(cache_dt) => {
-                    rec.quant_turbo(cache_dt, s, c, n, pos * rs, src_f16)
+                    rec.quant_turbo(cache_dt, s, c, n, (pos + rb) * rs, src_f16)
                 }
                 RopeMode::Static(_) => {
                     for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
                         match graph.desc(*src).dtype {
                             infr_core::DType::F16 => {
-                                rec.copy(s, sr * rs * 2, c, dr * rs * 2, nr * rs * 2)
+                                rec.copy(s, sr * rs * 2, c, (dr + rb) * rs * 2, nr * rs * 2)
                             }
                             _ => match c_addr {
-                                Some(a) => rec.store_f16_off_at(s, c, a, nr * rs, dr * rs, sr * rs),
-                                None => rec.store_f16_off(s, c, nr * rs, dr * rs, sr * rs),
+                                Some(a) => {
+                                    rec.store_f16_off_at(s, c, a, nr * rs, (dr + rb) * rs, sr * rs)
+                                }
+                                None => rec.store_f16_off(s, c, nr * rs, (dr + rb) * rs, sr * rs),
                             },
                         }
                     }
@@ -2455,7 +2464,11 @@ fn lower_op(
             // exposes a device address); the un-fused Q-scratch write (Activations, no address) stays
             // on the bound build. `out_buf` stays bound at its write slot in the `_at` method for the
             // store→read barrier. Bit-identical to the bound dispatch.
-            let y_addr = out_buf.device_addr();
+            let k_row = (*n_head as usize) * (*head_dim as usize);
+            let k_bias = fused_kv_write.get(&op_idx).map_or(0, |&(cache, _)| {
+                kv_row_base(graph, cache) * graph.desc(cache).dtype.dense_bytes(k_row).unwrap_or(0)
+            });
+            let y_addr = out_buf.device_addr().map(|a| a + k_bias as u64);
             match mode {
                 RopeMode::Static(rope_pos) => {
                     let ff = match freq_factors {
@@ -3537,19 +3550,34 @@ fn lower_op(
                     // Paged cache: the read side maps logical pages through the table on the cache
                     // tensor's descriptor. Linear caches (the only kind anything allocates today)
                     // resolve to None, which is the identity in the kernel.
-                    let pages = match graph.desc(*k_cache).pages {
-                        Some(pm) if pm.page_rows > 0 => {
-                            r(pm.table)?.device_addr().map(|a| (a, pm.page_rows))
+                    let pmap = graph.desc(*k_cache).pages;
+                    let row_base = pmap.map_or(0, |p| p.row_base);
+                    let pages = match pmap {
+                        Some(p) if p.page_rows > 0 => {
+                            r(p.table)?.device_addr().map(|a| (a, p.page_rows))
                         }
                         _ => None,
+                    };
+                    // A pooled cache that keeps its own pages (the SWA rings) reads linearly from its
+                    // block; a shared prefix reads through the table from the pool base.
+                    let bias = match pages {
+                        Some(_) => 0,
+                        None => {
+                            (row_base
+                                * graph
+                                    .desc(*k_cache)
+                                    .dtype
+                                    .dense_bytes(nkv * hd)
+                                    .unwrap_or(0)) as u64
+                        }
                     };
                     match (kcb.device_addr(), vcb.device_addr()) {
                         (Some(ka), Some(va)) => rec.attention_kv_split_at(
                             r(*q)?,
                             kcb,
                             vcb,
-                            ka,
-                            va,
+                            ka + bias,
+                            va + bias,
                             r(*dst)?,
                             pool[&pm].as_ref(),
                             pool[&pl].as_ref(),

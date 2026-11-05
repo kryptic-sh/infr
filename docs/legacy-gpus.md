@@ -43,15 +43,34 @@ GPUs that have it.
 
 ## Measured (RX 580 8 GB, RADV)
 
-Q4_K_M, tokens/s. llama.cpp numbers are its Vulkan backend on the same card.
+`infr compare --sweep` against llama.cpp `785322d` (its Vulkan backend), same GGUF,
+same card, both re-run back to back on 2026-11-05. Tokens/s, `-r 3`.
 
-| Model | pp512 before | pp512 now | llama.cpp pp512 | tg128 now | llama.cpp tg128 |
+| Model | metric | infr | llama.cpp | ratio |
+|---|---|---|---|---|
+| Qwen2.5-Coder-3B Q4_K_M | pp512 | 535 | 476 | 1.13x |
+| | tg128 | 80 | 71 | 1.14x |
+| | tg64 @ d4096 | 64 | 62 | 1.02x |
+| | pp4 @ d4096 | 75 | 136 | **0.55x** |
+| Gemma 4 E4B QAT UD-Q4_K_XL | pp512 | 382 | 367 | 1.04x |
+| | tg128 | 49 | 49 | 1.00x |
+| | tg64 @ d4096 | 45 | 44 | 1.02x |
+| | pp4 @ d4096 | 69 | 113 | **0.61x** |
+
+Every metric is at parity or ahead except one: `pp4@d4096`, a four-token turn at 4k
+depth — the follow-up-message case. llama.cpp is 1.6-1.8x faster there, and that is
+the one measured deficit against the reference implementation.
+
+Earlier campaign (same card, before the `kq_fma` tier and the seam work; no date was
+recorded at the time, so read the llama.cpp columns as historical):
+
+| Model | pp512 before | pp512 after | llama.cpp pp512 | tg128 after | llama.cpp tg128 |
 |---|---|---|---|---|---|
 | Qwen2.5-Coder-3B | 206 | 499 | 421 | 63.6 | 63.8 |
 | Gemma 4 E2B | 285 | 616 | 602 | — | 65.7 |
 | Gemma 4 E4B QAT Q4_0 | 146 | 340 | 343 | 37.2 | 42.6 |
 
-Gemma 4 E4B decode at 4k context: 29.6 → 36.5 t/s.
+Gemma 4 E4B decode at 4k context went 29.6 → 44.4 t/s across both campaigns.
 
 MTP-verify shapes (RX 580, effective weight-stream GB/s, m = drafts+1): the verify
 kernel ties the int8 `mrow` it replaces on big weights (down-proj Q4_K m=7: 39 vs 49)

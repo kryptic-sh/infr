@@ -1570,9 +1570,10 @@ impl VulkanBackend {
             None => Self::pick_default_device(&instance, &pdevices, cfg.device.dev.as_deref())?,
         };
 
+        let dev_props = unsafe { instance.get_physical_device_properties(physical_device) };
         // Selection log: which of the enumerated devices this backend actually bound.
         {
-            let p = unsafe { instance.get_physical_device_properties(physical_device) };
+            let p = &dev_props;
             let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }.to_string_lossy();
             let idx = pdevices.iter().position(|&pd| pd == physical_device);
             tracing::info!(
@@ -1583,20 +1584,44 @@ impl VulkanBackend {
         }
 
         // ── compute queue family ───────────────────────────────────────────────
-        // The first COMPUTE-capable family. On amdgpu this is the universal (graphics) family, so
-        // the work lands on the `gfx` ring. Moving it to a compute-ONLY family (the `comp` rings)
-        // was tried and is strictly WORSE on the surveyed integrated part: the same ~2 s forward
-        // that is an intermittent device-lost on `gfx` is a DETERMINISTIC one on `comp` (measured
-        // 4/4 runs), i.e. the compute ring's effective hang budget there is TIGHTER, not the 60 s
-        // its module-parameter default advertises. The submit splitter is what actually bounds the
-        // job (see `VulkanShared::submit_dispatch_cap`); the ring choice is not a lever.
+        // A COMPUTE-only family runs on the `comp` rings, a separate engine from the `gfx` ring
+        // the compositor submits on, so a multi-second prefill delays KWin's frame instead of
+        // blocking it. Falls back to the universal family, which is the only one NVIDIA-class
+        // drivers offer. llama.cpp picks the same way (its `GGML_VK_ALLOW_GRAPHICS_QUEUE` is the
+        // escape hatch). Integrated parts keep the universal family: there the `comp` ring's hang
+        // budget measured tighter than `gfx`, and the submit splitter already bounds the job.
         let qf_props =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-        let queue_family_index = qf_props
-            .iter()
-            .position(|p| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
-            .map(|i| i as u32)
-            .ok_or_else(|| be("no compute queue family found"))?;
+        let is_compute =
+            |p: &vk::QueueFamilyProperties| p.queue_flags.contains(vk::QueueFlags::COMPUTE);
+        let compute_only = |p: &vk::QueueFamilyProperties| {
+            is_compute(p) && !p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        };
+        let want_compute_ring =
+            dev_props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU && !vkcfg.gfx_queue;
+        let queue_family_index = want_compute_ring
+            .then(|| qf_props.iter().position(compute_only))
+            .flatten()
+            .or_else(|| qf_props.iter().position(is_compute))
+            .ok_or_else(|| be("no compute queue family found"))?
+            as u32;
+        let on_graphics_ring = qf_props[queue_family_index as usize]
+            .queue_flags
+            .contains(vk::QueueFlags::GRAPHICS);
+        if on_graphics_ring {
+            tracing::warn!(
+                "[infr] vulkan: queue family {queue_family_index} shares the graphics ring with \
+                 the compositor; a long forward stalls the desktop's frames"
+            );
+        }
+        tracing::info!(
+            "[infr] vulkan: queue family {queue_family_index} ({})",
+            if on_graphics_ring {
+                "graphics ring, shared with the compositor"
+            } else {
+                "compute-only ring"
+            }
+        );
 
         // ── probe device extensions ────────────────────────────────────────────
         let avail_exts = unsafe { instance.enumerate_device_extension_properties(physical_device) }

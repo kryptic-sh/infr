@@ -105,8 +105,9 @@ unchanged** (pp512 3562.7→3547.1, tg128 143.5→143.1 = noise), gpu_seam 25/25
 **Null results — disproved with evidence, do NOT re-open:** wave64 codegen
 (`RADV_PERFTEST=cswave32` still hangs 3/3); VRAM overcommit/eviction (only 0.48
 MiB `amdgpu_bo_move` across a run); clock throttling (SCLK pinned 2200 MHz
-through the hang); a compute-only queue family (makes it DETERMINISTIC — the
-`comp` ring budget is TIGHTER). `RADV_DEBUG=hang` is a **red herring**:
+through the hang); a compute-only queue family (on this part it makes the hang
+DETERMINISTIC — the `comp` ring budget is TIGHTER; discrete parts prefer that
+family on purpose now, see `gfx_queue`). `RADV_DEBUG=hang` is a **red herring**:
 syncshaders serializes the IB so the job itself blows the budget, "naming"
 whatever shader ran at the 2 s mark.
 

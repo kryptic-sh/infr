@@ -1194,6 +1194,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_GEMV_SG_MINOUT",
         "INFR_GEMV_SG_NR",
         "INFR_GEMV_VARIANT",
+        "INFR_GFX_QUEUE",
         "INFR_I8_COOPMAT",
         "INFR_I8_ROW_SCALE",
         "INFR_KV_COOPMAT_BDA",

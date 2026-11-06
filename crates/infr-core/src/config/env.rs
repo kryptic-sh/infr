@@ -276,6 +276,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.dn_split = presence_inv(get, "INFR_NO_DN_SPLIT");
     v.delta_strided = presence(get, "INFR_DELTA_STRIDED");
     v.push_desc = presence_inv(get, "INFR_NO_PUSH_DESC");
+    v.gfx_queue = presence(get, "INFR_GFX_QUEUE");
     v.pipeline_cache_disk = presence_inv(get, "INFR_NO_PIPELINE_CACHE");
     v.no_vram_guard = presence(get, "INFR_NO_VRAM_GUARD");
     v.no_moe_sm_pool = presence(get, "INFR_NO_MOE_SM_POOL");

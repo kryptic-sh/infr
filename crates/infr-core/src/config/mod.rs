@@ -377,6 +377,10 @@ cfg_struct! {
         delta_strided: bool = false,
         /// `INFR_NO_PUSH_DESC` (inverted).
         push_desc: bool = true,
+        /// `INFR_GFX_QUEUE` — submit on the universal (graphics) family instead of a COMPUTE-only
+        /// one. The compositor renders on that same ring, so inference then competes with the
+        /// desktop's frames; kept for devices whose compute ring is unusable.
+        gfx_queue: bool = false,
         /// `INFR_NO_PIPELINE_CACHE` (inverted).
         pipeline_cache_disk: bool = true,
         /// `INFR_NO_VRAM_GUARD` — sanctioned negative field.

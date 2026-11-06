@@ -224,14 +224,15 @@ mapped and fault back in as they are read.
 kernel **tier** override: the engine picks the best tier the device supports,
 and these exist to force one off when bisecting a correctness or perf problem.
 
-- **`[kernels.vulkan]`** (the biggest section — 62 of the 156 keys): capability
+- **`[kernels.vulkan]`** (the biggest section): capability
   masks (`coopmat`, `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), GEMM/GEMV
   tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, `kq_fma_tier`, `kq_fma_splitk` — the
   K-quant/Q4_0 FMA tier for older Vulkan GPUs without fast int8 dot, auto-on — the
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
   `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
-  `no_replay`, `no_vram_guard`, the BDA chunk caps). Note `f16 = false` also
+  `no_replay`, `no_vram_guard`, `gfx_queue` — stay on the compositor's graphics
+  ring instead of a compute-only one — the BDA chunk caps). Note `f16 = false` also
   disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
   today.
 

@@ -341,7 +341,7 @@ mod tests {
     fn unsloth_model_tag_is_copyable() {
         let (_t, s) = hub(&[("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", 10)]);
         let repo = "unsloth/gemma-4-E4B-it-qat-GGUF";
-        fs::rename(s.repo_dir("org/repo"), s.repo_dir(repo)).unwrap();
+        fs::rename(s.repo_dir("org/repo").unwrap(), s.repo_dir(repo).unwrap()).unwrap();
         let model = s.list().pop().unwrap();
         let tag = s.model_tag(&model);
         assert_eq!(tag, "unsloth/gemma-4-E4B-it-qat-GGUF:UD-Q4_K_XL");

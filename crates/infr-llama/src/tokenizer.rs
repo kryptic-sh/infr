@@ -2,7 +2,7 @@
 //! picks between it and a `tokenizer.json` sidecar ([`load_tokenizer`]).
 use crate::{
     DEEPSEEK_CODER_PRE_RES, DEEPSEEK_LLM_PRE_RES, DEEPSEEK_V3_PRE_RES, LLAMA3_PRE_RE,
-    LLAMA4_PRE_RE, QWEN2_PRE_RE, QWEN35_PRE_RE,
+    LLAMA4_PRE_RE, QWEN2_PRE_RE, QWEN35_PRE_RE, SEED_CODER_PRE_RE,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::loader::{MetaValue, Metadata};
@@ -310,12 +310,14 @@ pub(crate) fn tokenizer_from_metadata(md: &Metadata) -> Result<Tokenizer> {
         }
         // Grouped by the regex llama.cpp's `llm_tokenizer_bpe` gives each pre-type. QWEN2's arm
         // also serves its `STABLELM2`, `HUNYUAN` and `SOLAR_OPEN`; GPT-4o's (= `LLAMA4_PRE_RE`) its
-        // `MINIMAX_M2`.
+        // `MINIMAX_M2`; Seed-Coder's splits digits one at a time.
         "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "megrez" | "stablelm2" | "hunyuan"
-        | "solar-open" | "qwen35" | "llama4" | "gpt-4o" | "kanana2" | "talkie" | "minimax-m2" => {
+        | "solar-open" | "qwen35" | "llama4" | "gpt-4o" | "kanana2" | "talkie" | "minimax-m2"
+        | "seed-coder" => {
             let re = match pre {
                 "qwen35" => QWEN35_PRE_RE,
                 "llama4" | "gpt-4o" | "kanana2" | "talkie" | "minimax-m2" => LLAMA4_PRE_RE,
+                "seed-coder" => SEED_CODER_PRE_RE,
                 _ => QWEN2_PRE_RE,
             };
             single_split_byte_level(&mut tok, re)?;
@@ -654,6 +656,32 @@ mod tokenizer_tests {
                 ),
             ],
         );
+    }
+
+    /// `seed-coder` chunks digits one at a time and keeps a leading `_` with the next word; the
+    /// GPT-2 fallback does neither, and every Seed-Coder/Zeta prompt tokenizes through this split.
+    #[test]
+    fn seed_coder_pre_split_boundaries_match_the_reference_regex() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "let x = 1234;",
+                &["let", " x", " =", " ", "1", "2", "3", "4", ";"],
+            ),
+            (
+                "fn foo_bar() -> u32 {",
+                &["fn", " foo", "_bar", "()", " ->", " u", "3", "2", " {"],
+            ),
+            ("100 000\n\n", &["1", "0", "0", " ", "0", "0", "0", "\n\n"]),
+            ("don't", &["don", "'t"]),
+            ("a  \u{00A0}. b", &["a", "  ", "\u{00A0}", ".", " b"]),
+        ];
+        for (text, want) in cases {
+            let got = pre_chunks(&[SEED_CODER_PRE_RE], text);
+            assert_eq!(
+                got, *want,
+                "seed-coder chunk boundaries moved for {text:?}\n  got  {got:?}\n  want {want:?}"
+            );
+        }
     }
 
     /// The SPM merge ranking, pinned in both halves and made NaN-proof.

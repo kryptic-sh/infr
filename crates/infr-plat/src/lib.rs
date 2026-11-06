@@ -37,4 +37,5 @@ pub mod paths;
 pub mod persist;
 pub mod proc;
 pub mod signal;
+pub mod socket;
 pub mod stdin;

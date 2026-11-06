@@ -256,14 +256,15 @@ the middle, so any FIM or next-edit model on a supported backbone works — the
 client builds the prompt. `suffix` returns an explicit error instead of being
 ignored; pass the model's own FIM tokens in `prompt`.
 
-Zeta 2.1, Zed's edit-prediction model on an 8B Seed-Coder backbone, runs at
-5.1 GB Q4_K_M: resident at `--ctx 8k` on an 8 GB card, 24–34 tok/s decode.
+Mellum-4b is the model for a plain FIM setup: JetBrains' completion model,
+2.6 GB at Q4_K_M, 249 tok/s prefill and 50 tok/s decode on an RX 580 while the
+desktop keeps rendering at 126–131 fps. It uses ASCII sentinels
+(`<fim_prefix>`, `<fim_suffix>`, `<fim_middle>`), which is Zed's `star_coder`
+layout.
 
 ```bash
-infr serve mradermacher/zeta-2.1-GGUF:Q4_K_M --addr 127.0.0.1:8899 --ctx 8k --temp 0
+infr serve mradermacher/Mellum-4b-base-GGUF:Q4_K_M --addr 127.0.0.1:8899 --ctx 8k --temp 0
 ```
-
-Greedy, not sampled: at `--temp 0.2` this quant can loop on `<|marker_1|>`.
 
 Zed — `settings.json`, provider: OpenAI-compatible:
 
@@ -273,21 +274,28 @@ Zed — `settings.json`, provider: OpenAI-compatible:
     "provider": "open_ai_compatible_api",
     "open_ai_compatible_api": {
       "api_url": "http://127.0.0.1:8899/v1/completions",
-      "model": "zeta-2.1.Q4_K_M",
-      "prompt_format": "zeta2_1",
+      "model": "Mellum-4b-base.Q4_K_M",
+      "prompt_format": "star_coder",
       "max_output_tokens": 512
     }
   }
 }
 ```
 
-Zed formats the context itself: related files and edit history as
-`<[fim-suffix]>`/`<[fim-prefix]>` blocks, the editable region marked with
-`<|marker_N|>`, and `<[end▁of▁sentence]>` as the stop. The model's reply is the
-marker-tagged replacement span, which Zed splices into the buffer. The prompt
-budget is 4k tokens and generation is capped at `max_output_tokens * 4`, so
-`--ctx 8k` leaves headroom. Requests are non-streaming, one per typing pause,
-and the prefix cache absorbs the context that repeats between them.
+Zed puts the file's prefix after `<fim_prefix>`, the suffix after
+`<fim_suffix>`, and closes the prompt with `<fim_middle>`; the reply is plain
+text plugged into the gap. Requests are non-streaming, one per typing pause, and
+the prefix cache absorbs the context that repeats between them.
+
+Zeta 2.1 is the alternative for rewrite-style edits: an 8B Seed-Coder backbone,
+5.1 GB Q4_K_M, 166 tok/s prefill and 26–34 tok/s decode, `prompt_format`
+`zeta2_1`. Greedy, not sampled: at `--temp 0.2` this quant can loop on
+`<|marker_1|>`. Zed formats the context itself here — related files and edit
+history as `<[fim-suffix]>`/`<[fim-prefix]>` blocks, the editable region marked
+with `<|marker_N|>`, and `<[end▁of▁sentence]>` as the stop. The model's reply is
+the marker-tagged replacement span, which Zed splices into the buffer. The
+prompt budget is 4k tokens and generation is capped at `max_output_tokens * 4`,
+so `--ctx 8k` leaves headroom.
 
 `prompt_format` selects the layout: `zeta2_1` for Zeta 2/2.1, `zeta` for Zeta 1,
 `qwen` for Qwen2.5-Coder, or `code_llama` / `star_coder` / `deepseek_coder` /

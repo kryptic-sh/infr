@@ -2,6 +2,7 @@
 //! Mechanically split out of `lib.rs` (no logic change).
 use crate::{
     DEEPSEEK_CODER_PRE_RES, DEEPSEEK_LLM_PRE_RES, DEEPSEEK_V3_PRE_RES, LLAMA4_PRE_RE, QWEN2_PRE_RE,
+    SEED_CODER_PRE_RE,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::loader::{MetaValue, Metadata};
@@ -149,11 +150,11 @@ pub(crate) fn build_tokenizer(g: &dyn WeightSource) -> Result<Tokenizer> {
             let seq = build_multi_split_seq(DEEPSEEK_V3_PRE_RES.as_slice())?;
             tok.with_pre_tokenizer(Some(seq));
         }
-        "qwen2" | "llama4" => {
-            let re = if pre == "qwen2" {
-                QWEN2_PRE_RE
-            } else {
-                LLAMA4_PRE_RE
+        "qwen2" | "llama4" | "seed-coder" => {
+            let re = match pre {
+                "qwen2" => QWEN2_PRE_RE,
+                "seed-coder" => SEED_CODER_PRE_RE,
+                _ => LLAMA4_PRE_RE,
             };
             // Sequence[ Split(pre regex, Isolated), ByteLevel(use_regex=false) ] — matches HF.
             let split = Split::new(
@@ -448,6 +449,32 @@ mod tokenizer_tests {
                 ),
             ],
         );
+    }
+
+    /// `seed-coder` chunks digits one at a time and keeps a leading `_` with the next word; the
+    /// GPT-2 fallback does neither, and every Seed-Coder/Zeta prompt tokenizes through this split.
+    #[test]
+    fn seed_coder_pre_split_boundaries_match_the_reference_regex() {
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "let x = 1234;",
+                &["let", " x", " =", " ", "1", "2", "3", "4", ";"],
+            ),
+            (
+                "fn foo_bar() -> u32 {",
+                &["fn", " foo", "_bar", "()", " ->", " u", "3", "2", " {"],
+            ),
+            ("100 000\n\n", &["1", "0", "0", " ", "0", "0", "0", "\n\n"]),
+            ("don't", &["don", "'t"]),
+            ("a  \u{00A0}. b", &["a", "  ", "\u{00A0}", ".", " b"]),
+        ];
+        for (text, want) in cases {
+            let got = pre_chunks(&[SEED_CODER_PRE_RE], text);
+            assert_eq!(
+                got, *want,
+                "seed-coder chunk boundaries moved for {text:?}\n  got  {got:?}\n  want {want:?}"
+            );
+        }
     }
 
     /// The SPM merge ranking, pinned in both halves and made NaN-proof.

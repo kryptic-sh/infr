@@ -10,6 +10,9 @@ use tokenizers::Tokenizer;
 /// which is what made a naive ByteLevel produce different token ids.
 pub(crate) const QWEN2_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// Seed-Coder split (llama.cpp's `seed-coder` pre-type, used by Seed-Coder 8B and Zeta 2/2.1): digits split one at a time, unlike the GPT-2 default's `\p{N}{1,3}`.
+pub(crate) const SEED_CODER_PRE_RE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1}| ?[^\s\p{L}\p{N}\r\n]+|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// DeepSeek-LLM (V1) pre-tokenizer patterns — 6 successive splits applied in order
 /// (llama.cpp's `DEEPSEEK_LLM` pre-type, `src/llama-vocab.cpp`). See docs/deepseek.md §0.2.
 pub(crate) const DEEPSEEK_LLM_PRE_RES: [&str; 6] = [

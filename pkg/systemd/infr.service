@@ -1,0 +1,12 @@
+[Unit]
+Description=infr inference server
+Requires=infr.socket
+After=infr.socket
+
+[Service]
+Type=exec
+ExecStart=%h/.local/bin/infr serve REPLACE_WITH_MODEL_ID
+Environment=INFR_SERVE_IDLE_SECS=300
+NonBlocking=yes
+Restart=on-failure
+RestartSec=5s

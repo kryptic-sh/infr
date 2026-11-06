@@ -259,6 +259,9 @@ max_tokens_cap = 131072
 # — a deadline truncates a legitimate slow reply, so it is opt-in.
 request_timeout_secs = 0
 
+# Exit after this many seconds without requests or unfinished work; 0 disables idle exit.
+idle_timeout_secs = 0
+
 # How often the server logs its throughput line, in seconds. 0 switches the line
 # off. The line is ACTIVITY-ONLY: an interval in which nothing happened emits
 # nothing, so an idle server leaves a clean log.

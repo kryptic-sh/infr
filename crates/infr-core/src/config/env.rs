@@ -404,6 +404,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // deadline"), not a bad one. Dropping it would make `INFR_REQUEST_TIMEOUT_SECS=0` mean "the
     // layer said nothing", so it could not turn a deadline back OFF over a config file that set one.
     p.serve.request_timeout_secs = num::<u64>(get, "INFR_REQUEST_TIMEOUT_SECS");
+    p.serve.idle_timeout_secs = num::<u64>(get, "INFR_SERVE_IDLE_SECS");
     // Ditto: `0` means "no periodic throughput line", a value the operator may need to set OVER a
     // config file that enabled it, so it must survive this layer rather than be filtered as junk.
     p.serve.stats_interval_secs = num::<u64>(get, "INFR_SERVE_STATS_SECS");

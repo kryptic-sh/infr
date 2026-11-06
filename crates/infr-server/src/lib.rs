@@ -38,7 +38,7 @@ use axum::{
         IntoResponse, Response,
     },
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use infr_core::config::Config;
 use infr_engine::{ChatMessage, Delta, ToolCall};
@@ -47,6 +47,9 @@ use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
 mod completions;
+mod idle;
+#[cfg(test)]
+mod idle_tests;
 mod metrics;
 mod status;
 
@@ -1259,6 +1262,7 @@ pub struct AppState {
     /// [`stats_reporter`] that `serve_state` spawns; a state built for tests simply has no reporter
     /// draining it.
     stats: Arc<ServeStats>,
+    activity: Arc<idle::Activity>,
     /// When this state was built, for `/status`'s uptime.
     started: Instant,
 }
@@ -1281,6 +1285,7 @@ impl AppState {
             )]),
             cfg,
             stats: Arc::default(),
+            activity: Arc::default(),
             started: Instant::now(),
         }
     }
@@ -1305,6 +1310,7 @@ impl AppState {
             models: Arc::new(models),
             cfg,
             stats: Arc::default(),
+            activity: Arc::default(),
             started: Instant::now(),
         }
     }
@@ -1317,6 +1323,7 @@ impl AppState {
             models: Arc::new(vec![ModelEntry::new(&model_id.into(), None, 1)]),
             cfg,
             stats: Arc::default(),
+            activity: Arc::default(),
             started: Instant::now(),
         }
     }
@@ -1359,6 +1366,8 @@ pub fn build_router(state: AppState) -> Router {
         // Images arrive inline as base64 data URIs, so a chat request can be megabytes; axum's
         // default 2 MB cap would turn one phone photo into a 413.
         .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(axum::middleware::from_fn(idle::track))
+        .layer(Extension(state.activity.clone()))
         .with_state(state)
 }
 
@@ -1393,26 +1402,52 @@ pub async fn serve_multi(
     serve_state(AppState::multi(entries, cfg), addr).await
 }
 
-/// Bind + run the axum server over a fully-built [`AppState`] (single- or multi-model). The one
-/// place the listener, the graceful-shutdown latch, and `axum::serve` live.
+/// Serve an inherited TCP listener or bind `addr`, draining requests on shutdown.
 async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
+    let listener = match infr_plat::socket::activated_tcp_listener()? {
+        Some(listener) => {
+            tracing::info!(addr = %listener.local_addr()?, "using systemd socket");
+            tokio::net::TcpListener::from_std(listener)?
+        }
+        None => tokio::net::TcpListener::bind(addr).await?,
+    };
+    serve_listener(state, listener).await
+}
+
+async fn serve_listener(state: AppState, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+    let addr = listener.local_addr()?;
     let n_models = state.models.len();
+    let activity = state.activity.clone();
+    let idle_secs = state.cfg.serve.idle_timeout_secs;
+    activity.start_serving();
     // The periodic throughput reporter (B10), unless `serve.stats_interval_secs` is 0. It reads the
     // SAME shutdown latch the drain path does, and it is aborted here as well: whichever way the
     // server ends, no task is left ticking.
     let reporter = stats_interval(&state.cfg)
         .map(|period| tokio::spawn(stats_reporter(state.clone(), period)));
     let router = build_router(state);
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!(%addr, %n_models, "infr-server listening");
+    tracing::info!(%addr, %n_models, %idle_secs, "infr-server listening");
     let served = axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_latched())
+        .with_graceful_shutdown(server_shutdown(activity, idle_secs))
         .await;
     if let Some(h) = reporter {
         h.abort();
     }
     served?;
     Ok(())
+}
+
+async fn server_shutdown(activity: Arc<idle::Activity>, idle_secs: u64) {
+    if idle_secs == 0 {
+        shutdown_latched().await;
+    } else {
+        tokio::select! {
+            _ = shutdown_latched() => {}
+            _ = activity.wait_idle(Duration::from_secs(idle_secs)) => {
+                tracing::info!(idle_secs, "idle timeout reached — shutting down");
+            }
+        }
+    }
 }
 
 /// Resolves once the process-wide shutdown latch is set (SIGINT/SIGTERM — see
@@ -1479,6 +1514,7 @@ async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
 
 async fn chat_completions_handler(
     State(state): State<AppState>,
+    Extension(activity): Extension<idle::Guard>,
     headers: HeaderMap,
     body: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -1552,7 +1588,9 @@ async fn chat_completions_handler(
             );
         };
         let images = params.images.clone();
+        let preflight_activity = activity.clone();
         match tokio::task::spawn_blocking(move || {
+            let _activity = preflight_activity;
             let _permit = permit;
             engine.validate_images(&images)
         })
@@ -1579,6 +1617,7 @@ async fn chat_completions_handler(
         deadline: request_timeout(&state.cfg),
         stream: req.stream,
         stats: state.stats.clone(),
+        activity,
     };
     log_request_start(
         ctx.id,
@@ -1614,6 +1653,7 @@ struct ReqCtx {
     deadline: Option<Duration>,
     stream: bool,
     stats: Arc<ServeStats>,
+    activity: idle::Guard,
 }
 
 // ---------------------------------------------------------------------------
@@ -1636,6 +1676,7 @@ async fn non_streaming(
         deadline,
         stream,
         stats,
+        activity,
     } = ctx;
     // Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
     // this model queues HERE — in the async runtime, holding no thread — and is admitted FIFO as
@@ -1670,6 +1711,7 @@ async fn non_streaming(
         // `active` gauge rides along with it, so the two can never disagree.
         let _permit = permit;
         let _active = active;
+        let _activity = activity;
         let Some(engine) = engine_arc else {
             anyhow::bail!("no engine loaded");
         };
@@ -1834,6 +1876,7 @@ async fn streaming(
         deadline,
         stream,
         stats,
+        activity,
     } = ctx;
     // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
     // loop — which, under `--parallel N`, is holding the GPU baton. A bounded channel would make a
@@ -1888,6 +1931,7 @@ async fn streaming(
         // `active` gauge is released by the same return (or unwind).
         let _permit = permit;
         let _active = active;
+        let _activity = activity;
         // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
         // deadline was configured, in which case there is no watchdog to disarm.
         let _done_tx = done_tx;
@@ -3841,6 +3885,7 @@ mod tests {
             deadline,
             stream,
             stats: Arc::default(),
+            activity: Arc::new(idle::Activity::default()).enter().unwrap(),
         }
     }
 

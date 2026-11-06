@@ -138,6 +138,7 @@ fn text_event(cid: &str, model: &str, created: i64, text: &str, finish: Option<&
 
 pub(crate) async fn completions_handler(
     State(state): State<AppState>,
+    Extension(activity): Extension<idle::Guard>,
     headers: HeaderMap,
     body: Result<Json<CompletionRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
@@ -167,6 +168,7 @@ pub(crate) async fn completions_handler(
         deadline: request_timeout(&state.cfg),
         stream: req.stream,
         stats: state.stats.clone(),
+        activity,
     };
     log_request_start(
         ctx.id,
@@ -200,6 +202,7 @@ async fn non_streaming(
         deadline,
         stream,
         stats,
+        activity,
     } = ctx;
     let queued = QueuedGuard::new(stats.clone());
     let Ok(permit) = entry.slots.clone().acquire_owned().await else {
@@ -219,6 +222,7 @@ async fn non_streaming(
     let mut handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let _permit = permit;
         let _active = active;
+        let _activity = activity;
         let Some(engine) = engine_arc else {
             anyhow::bail!("no engine loaded");
         };
@@ -303,6 +307,7 @@ async fn streaming(
         deadline,
         stream,
         stats,
+        activity,
     } = ctx;
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<Event, Infallible>>();
 
@@ -331,6 +336,7 @@ async fn streaming(
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let _active = active;
+        let _activity = activity;
         let _done_tx = done_tx;
         let mut done = DoneGuard {
             tx: tx.clone(),

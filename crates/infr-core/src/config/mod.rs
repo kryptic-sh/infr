@@ -751,6 +751,8 @@ cfg_struct! {
         /// decision, made once they know their model's token rate and what a `--parallel` slot is
         /// worth to them.
         request_timeout_secs: u64 = 0,
+        /// `INFR_SERVE_IDLE_SECS`: exit after this many idle seconds; `0` disables idle exit.
+        idle_timeout_secs: u64 = 0,
         /// `INFR_SERVE_STATS_SECS`: how often `infr serve` logs its throughput line, in seconds.
         /// `0` switches the line off entirely.
         ///

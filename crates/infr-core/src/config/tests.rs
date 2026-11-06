@@ -111,6 +111,7 @@ fn default_config_matches_documented_defaults() {
     // A per-request wall-clock deadline is OFF unless the operator asks for one: it truncates a
     // legitimate slow reply, so it cannot be a shipped default.
     assert_eq!(d.serve.request_timeout_secs, 0);
+    assert_eq!(d.serve.idle_timeout_secs, 0);
     // The periodic throughput line is ON by default (it is a log line, not a policy) and reports
     // every 5 s — but only for intervals in which something happened.
     assert_eq!(d.serve.stats_interval_secs, 5);
@@ -532,6 +533,28 @@ fn non_presence_grammars_are_preserved() {
         0,
         "an explicit 0 in the environment must switch off a stats line the file turned on"
     );
+}
+
+#[test]
+fn serve_idle_timeout_layers_and_zero_disables() {
+    for (value, want) in [("0", 0u64), ("300", 300)] {
+        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_SERVE_IDLE_SECS", value)])]);
+        assert_eq!(cfg.serve.idle_timeout_secs, want);
+    }
+    let cfg = Config::load_from_layers(&[
+        file_layer("[serve]\nidle_timeout_secs = 120\n"),
+        env_layer(&[("INFR_SERVE_IDLE_SECS", "0")]),
+    ]);
+    assert_eq!(cfg.serve.idle_timeout_secs, 0);
+    let cfg = Config::load_from_layers(&[file_layer("[serve]\nidle_timeout_secs = 120\n")]);
+    assert_eq!(cfg.serve.idle_timeout_secs, 120);
+    for value in ["-1", "bad", "18446744073709551616"] {
+        let cfg = Config::load_from_layers(&[
+            file_layer("[serve]\nidle_timeout_secs = 120\n"),
+            env_layer(&[("INFR_SERVE_IDLE_SECS", value)]),
+        ]);
+        assert_eq!(cfg.serve.idle_timeout_secs, 120);
+    }
 }
 
 /// The asymmetric mrows-attn pair: `INFR_NO_MROWS_ATTN` WINS when both are set.
@@ -1298,6 +1321,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_PROF_TRACE",
         "INFR_REQUEST_TIMEOUT_SECS",
         "INFR_SERVE_STATS_SECS",
+        "INFR_SERVE_IDLE_SECS",
     ];
 
     /// S8 — the CLI's own transitional bridge, and with it the LAST unmigrated knob. The six

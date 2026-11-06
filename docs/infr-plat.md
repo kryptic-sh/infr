@@ -30,6 +30,7 @@ it that way.
 | `paths`  | config / cache / home directory resolution    |
 | `proc`   | process liveness                              |
 | `signal` | `SIGINT` / `SIGTERM`, or the local equivalent |
+| `socket` | Linux systemd TCP listener inheritance        |
 | `stdin`  | an interruptible byte read from fd 0          |
 
 ## What must not be sanded off

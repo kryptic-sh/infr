@@ -293,10 +293,18 @@ all `stages`. Old spellings were dropped cleanly and are simply no longer read.
 gates `/v1/chat/completions`, `/v1/models`, `/metrics` and `/status`, never
 `/health`), `max_tokens_cap`, `request_timeout_secs` (per-request wall-clock
 deadline in seconds; `0`, the default, means no deadline — a deadline truncates
-a legitimate slow reply, so it is opt-in), and `stats_interval_secs`
+a legitimate slow reply, so it is opt-in), `idle_timeout_secs`
+(`INFR_SERVE_IDLE_SECS` — exit after this many seconds with no requests or
+unfinished work; default `0` disables idle exit), and `stats_interval_secs`
 (`INFR_SERVE_STATS_SECS` — how often the server logs its throughput line,
 default `5`; `0` switches the line off). Per-request sampling is not here — it
 stays on the request.
+
+Idle exit waits for queued requests, image validation, generation, and response
+streams to finish. Every HTTP request resets the timer, including health and
+metrics probes; periodic polling can keep the server awake. With no socket
+supervisor, idle exit stops the server until you start it again. See
+[systemd socket activation](systemd.md) for automatic wake-up on Linux.
 
 The throughput line is **activity-only**: an interval in which nothing happened
 emits nothing, so an idle server leaves a clean log and there is no heartbeat to

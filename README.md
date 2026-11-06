@@ -235,6 +235,11 @@ CLI, etc.). Tool calling renders the model's own `tokenizer.chat_template`
 as JSON — each model's backend, device, context per slot, slots and device
 memory. Both sit behind the API key when one is set.
 
+On Linux, [systemd socket activation](docs/systemd.md) can start the server on
+request and release its model memory after an idle timeout. Set
+`serve.idle_timeout_secs` / `INFR_SERVE_IDLE_SECS` to enable idle exit; the default
+is `0` (disabled).
+
 **Images (Gemma 4).** OpenAI `image_url` parts with a base64 `data:` URI (PNG/JPEG/GIF/WebP/BMP)
 are accepted on the Vulkan backend when a Gemma 4 vision projector is available — the first
 `mmproj*.gguf` beside the model (`infr pull unsloth/gemma-4-E4B-it-GGUF:mmproj-F16.gguf` puts it

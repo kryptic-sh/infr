@@ -36,4 +36,5 @@ pub mod mem;
 pub mod paths;
 pub mod proc;
 pub mod signal;
+pub mod socket;
 pub mod stdin;

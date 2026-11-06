@@ -266,6 +266,13 @@ enum Match {
 /// an `mmproj*` sidecar (a vision projector, not the LM weights) and prefers a real quant over an
 /// `F16`/`F32`/`BF16` master when both are present.
 pub(crate) fn pick_gguf(names: &[String], sel: Option<&str>) -> Option<String> {
+    if let Some(name) = sel.and_then(|sel| {
+        names
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(sel) && n.to_ascii_lowercase().ends_with(".gguf"))
+    }) {
+        return Some(name.clone());
+    }
     let want = sel.unwrap_or(DEFAULT_QUANT);
     let mut loose: Option<&String> = None;
     let mut fallback_quant: Option<&String> = None; // a non-mmproj, non-float-master gguf
@@ -321,15 +328,11 @@ fn is_float_master(name: &str) -> bool {
 /// and must never satisfy a `Q2_0` selector. A token starts after `-`/`_`/`.` (or the name start) and
 /// ends before `-`/`.` (or the stem end) — `_` does not end it, since quant names embed it (`Q4_K_M`).
 ///
-/// An explicit `*.gguf` selector matches either the full `rfilename` OR its final path component, so
-/// `org/repo:Qwen3-30B-UD-Q4_K_XL.gguf` still selects the API's
-/// `UD-Q4_K_XL/Qwen3-30B-UD-Q4_K_XL.gguf` — a user reading the repo's file list types the name they
-/// see, not the directory it lives in, and before this an explicit filename could never match a
-/// subdirectory GGUF at all.
+/// An explicit `*.gguf` selector matches a full path, or a basename if no directory is specified.
 fn gguf_match(fname: &str, sel: &str) -> Match {
     if sel.to_lowercase().ends_with(".gguf") {
         return if fname.eq_ignore_ascii_case(sel)
-            || base_name(fname).eq_ignore_ascii_case(base_name(sel))
+            || (!sel.contains('/') && base_name(fname).eq_ignore_ascii_case(sel))
         {
             Match::Exact
         } else {
@@ -639,6 +642,24 @@ mod tests {
         assert_eq!(fs::read_to_string(&got).unwrap(), "fake gguf bytes");
         assert_eq!(store.snapshot_file("u/r", "m-Q4_K_M.gguf"), None);
         assert_eq!(store.snapshot_file("nope/missing", "m-Q8_0.gguf"), None);
+    }
+
+    #[test]
+    fn explicit_filename_prefers_the_full_path_over_a_basename_match() {
+        let names = vec!["nested/model.gguf".to_owned(), "model.gguf".to_owned()];
+        assert_eq!(
+            pick_gguf(&names, Some("model.gguf")),
+            Some("model.gguf".into())
+        );
+        assert_eq!(
+            pick_gguf(&names, Some("nested/model.gguf")),
+            Some("nested/model.gguf".into())
+        );
+        assert_eq!(pick_gguf(&names, Some("other/model.gguf")), None);
+        assert_eq!(
+            pick_gguf(&names[..1], Some("model.gguf")),
+            Some("nested/model.gguf".into())
+        );
     }
 
     #[test]

@@ -1001,10 +1001,7 @@ fn human_size(bytes: u64) -> String {
 fn cmd_ls() -> anyhow::Result<()> {
     let store = infr_hub::Store::discover().map_err(|e| anyhow!("{e}"))?;
     let models = store.list();
-    let names: Vec<String> = models
-        .iter()
-        .map(|m| format!("{}:{}", m.repo, m.file))
-        .collect();
+    let names: Vec<String> = models.iter().map(|m| store.model_tag(m)).collect();
     let w = names.iter().map(String::len).max().unwrap_or(0).max(5);
     // print-ok: program OUTPUT — the `infr ls` table users read and pipe.
     println!("{:<w$}  {:<10} {:>6}", "MODEL", "SIZE", "SHARDS");

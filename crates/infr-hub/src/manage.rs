@@ -75,6 +75,14 @@ impl Store {
         out
     }
 
+    /// A copyable `org/repo:quant` reference, or an explicit filename when the quant is ambiguous.
+    pub fn model_tag(&self, model: &CachedModel) -> String {
+        let sel = quant_selector(&model.file)
+            .filter(|sel| self.resolve_repo(&model.repo, Some(sel)).as_ref() == Some(&model.path))
+            .unwrap_or_else(|| model.file.clone());
+        format!("{}:{sel}", model.repo)
+    }
+
     /// Remove cached models. `sel = None` deletes the whole repo directory; otherwise only the GGUF
     /// `sel` picks (a quant or filename) is unlinked from every snapshot and blobs nothing else
     /// references are deleted. Errors when nothing matches.
@@ -135,6 +143,49 @@ impl Store {
         }
         Ok(out)
     }
+}
+
+fn quant_selector(file: &str) -> Option<String> {
+    let name = file.rsplit('/').next()?;
+    let upper = name.to_ascii_uppercase();
+    if upper.starts_with("MMPROJ")
+        || upper.starts_with("MTP")
+        || file.split('/').any(|part| part.eq_ignore_ascii_case("mtp"))
+    {
+        return None;
+    }
+    let stem = infr_core::gguf_split::parse_shard(name)
+        .map(|shard| shard.base.to_ascii_uppercase())
+        .or_else(|| upper.strip_suffix(".GGUF").map(str::to_owned))?;
+    for (i, _) in stem.char_indices().rev() {
+        if i != 0 && !matches!(stem.as_bytes()[i - 1], b'-' | b'_' | b'.') {
+            continue;
+        }
+        let token = stem[i..].split(['-', '.']).next()?;
+        let is_quant = ["IQ", "TQ", "PQ", "Q"].iter().any(|prefix| {
+            token.strip_prefix(prefix).is_some_and(|rest| {
+                let (bits, variant) = rest.split_once('_').unwrap_or(("", ""));
+                !bits.is_empty()
+                    && bits.bytes().all(|b| b.is_ascii_digit())
+                    && !variant.is_empty()
+                    && variant
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            })
+        });
+        if !is_quant && !matches!(token, "F16" | "F32" | "BF16" | "MXFP4" | "NVFP4") {
+            continue;
+        }
+        let start = if stem[..i].ends_with("UD-")
+            && (i == 3 || matches!(stem.as_bytes()[i - 4], b'-' | b'_' | b'.'))
+        {
+            i - 3
+        } else {
+            i
+        };
+        return Some(stem[start..i + token.len()].to_owned());
+    }
+    None
 }
 
 /// The `blobs/<sha>` file a snapshot symlink resolves to.
@@ -228,6 +279,125 @@ mod tests {
                 ("m-Q4_K_M.gguf".to_string(), 1, 10),
             ]
         );
+    }
+
+    #[test]
+    fn quant_selectors_preserve_variants_and_strip_shards() {
+        for (file, sel) in [
+            ("qwen2.5-0.5b-instruct-q4_k_m.gguf", "Q4_K_M"),
+            ("gemma-4-E4B_q4_0-it.gguf", "Q4_0"),
+            ("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", "UD-Q4_K_XL"),
+            ("UD-Q4_K_XL/m-UD-Q4_K_XL-00001-of-00002.gguf", "UD-Q4_K_XL"),
+            ("model-iq4_xs.GGUF", "IQ4_XS"),
+            ("model-PQ2_0.gguf", "PQ2_0"),
+            ("model-TQ2_0.gguf", "TQ2_0"),
+            ("model-Q2_0_g64.gguf", "Q2_0_G64"),
+            ("model-bf16.gguf", "BF16"),
+        ] {
+            assert_eq!(quant_selector(file).as_deref(), Some(sel), "{file}");
+        }
+        for file in ["model.gguf", "mmproj-model-F16.gguf", "MTP/model-Q8_0.gguf"] {
+            assert_eq!(quant_selector(file), None, "{file}");
+        }
+    }
+
+    #[test]
+    fn model_tags_resolve_to_the_listed_files() {
+        let (_t, s) = hub(&[
+            ("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", 10),
+            ("m-Q4_K_M.gguf", 20),
+            ("m-IQ4_XS-00001-of-00002.gguf", 3),
+            ("m-IQ4_XS-00002-of-00002.gguf", 4),
+            ("gemma-4-E4B_q4_0-it.gguf", 5),
+            ("model.gguf", 6),
+            ("mmproj-model-F16.gguf", 7),
+            ("MTP/model-Q8_0.gguf", 8),
+        ]);
+        let models = s.list();
+        let tags: Vec<_> = models.iter().map(|m| s.model_tag(m)).collect();
+        assert_eq!(
+            tags,
+            [
+                "org/repo:MTP/model-Q8_0.gguf",
+                "org/repo:UD-Q4_K_XL",
+                "org/repo:Q4_0",
+                "org/repo:IQ4_XS",
+                "org/repo:Q4_K_M",
+                "org/repo:mmproj-model-F16.gguf",
+                "org/repo:model.gguf",
+            ]
+        );
+        for (model, tag) in models.iter().zip(tags) {
+            let reference = crate::ModelRef::parse(&tag).unwrap();
+            assert_eq!(
+                s.resolve(&reference).unwrap(),
+                Some(model.path.clone()),
+                "{tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsloth_model_tag_is_copyable() {
+        let (_t, s) = hub(&[("gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf", 10)]);
+        let repo = "unsloth/gemma-4-E4B-it-qat-GGUF";
+        fs::rename(s.repo_dir("org/repo"), s.repo_dir(repo)).unwrap();
+        let model = s.list().pop().unwrap();
+        let tag = s.model_tag(&model);
+        assert_eq!(tag, "unsloth/gemma-4-E4B-it-qat-GGUF:UD-Q4_K_XL");
+        assert_eq!(
+            s.resolve(&crate::ModelRef::parse(&tag).unwrap()).unwrap(),
+            Some(model.path)
+        );
+    }
+
+    #[test]
+    fn model_tags_use_filenames_when_a_quant_selects_another_file() {
+        let (_t, s) = hub(&[
+            ("a-Q4_K_M.gguf", 10),
+            ("b-Q4_K_M.gguf", 20),
+            ("m-UD-Q4_K_XL.gguf", 30),
+            ("m-Q4_K_XL.gguf", 40),
+        ]);
+        for model in s.list() {
+            let tag = s.model_tag(&model);
+            assert_eq!(
+                s.resolve(&crate::ModelRef::parse(&tag).unwrap()).unwrap(),
+                Some(model.path)
+            );
+        }
+    }
+
+    #[test]
+    fn model_tags_keep_directory_only_quants_and_duplicate_basenames_explicit() {
+        let (_t, s) = hub(&[
+            ("Q4_K_M/model.gguf", 10),
+            ("Q8_0/model.gguf", 20),
+            ("model.gguf", 30),
+        ]);
+        for model in s.list() {
+            let tag = s.model_tag(&model);
+            assert_eq!(tag, format!("org/repo:{}", model.file));
+            assert_eq!(
+                s.resolve(&crate::ModelRef::parse(&tag).unwrap()).unwrap(),
+                Some(model.path)
+            );
+        }
+    }
+
+    #[test]
+    fn model_tags_keep_projectors_explicit_alongside_same_quant_weights() {
+        let (_t, s) = hub(&[("mmproj-F16.gguf", 10), ("model-F16.gguf", 20)]);
+        for model in s.list() {
+            let tag = s.model_tag(&model);
+            if model.file.starts_with("mmproj") {
+                assert_eq!(tag, "org/repo:mmproj-F16.gguf");
+            }
+            assert_eq!(
+                s.resolve(&crate::ModelRef::parse(&tag).unwrap()).unwrap(),
+                Some(model.path)
+            );
+        }
     }
 
     #[test]

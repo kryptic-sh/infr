@@ -206,8 +206,8 @@ page a slot writes is copied first. It costs the same device bytes as the slots
 it replaces (one block per slot), is built at the first fork, and helps a
 full-attention model the most — ring, recurrent, MLA and diffusion layers stay
 compact. Only the Vulkan backend walks a page table; elsewhere the knob warns
-and the slots stay linear. The two knobs are independent, and a paged slot sits
-out the host store because the pool already shares its prefix.
+and the slots stay linear. The two knobs are independent and compose: the pool
+shares pages between live slots, and the store survives slot recycling.
 
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),

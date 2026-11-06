@@ -17,6 +17,53 @@ GPU.
 > Early WIP. The only non-Rust parts are the GPU driver calls (Vulkan via `ash`)
 > and the compute shaders (SPIR-V).
 
+## What this fork adds
+
+Upstream `main` is merged in; this list is what it does not have yet. Work here
+that is not specific to older GPUs is meant to go upstream.
+
+**Both directions of KV paging**, neither of which upstream has:
+
+- **`kv.store_mb` (`INFR_KV_STORE_MB`) — reverse PagedAttention.** A prompt's
+  K/V rows are captured in 128-token blocks, chained by a hash of
+  `(parent id, tokens)`, and kept in host RAM under an LRU byte budget. The next
+  request walks the chain from token 0 as far as its prompt agrees, then uploads
+  the matched run in one contiguous copy instead of re-prefilling it. Gemma 4 E4B
+  on the RX 580: a 1068-token prompt took 3677 ms cold, 319 ms on a repeat,
+  705 ms for a different 1090-token tail — the shared 1053 tokens stored once,
+  111.8 MB for both conversations.
+- **`kv.paged` (`INFR_KV_PAGED`) — forward PagedAttention.** A session's slots
+  share one pool of 512-row pages; a fork points at its parent's complete pages
+  and copies a page before writing it. It costs the device bytes the linear slots
+  already cost (one block per slot the session may fork) and is built at the
+  first fork. Ring, recurrent, MLA and diffusion layers stay compact, so a
+  full-attention model gains most. Memory, not speed: reads pay one table lookup
+  per KV tile.
+
+The two compose — the pool shares pages between live slots, the store survives
+slot recycling. The DRAM KV spillover (`kv.overflow`, `kv.overflow_vram_mb`,
+`kv.overflow_reserve_mb`) is upstream's. Mechanism, limits and measurements:
+[`docs/perf/kv-prefix.md`](docs/perf/kv-prefix.md).
+
+**Older GPUs** ([`docs/legacy-gpus.md`](docs/legacy-gpus.md)) — wave64-only GCN
+support, an fp32 `kq_fma` prefill GEMM and decode/verify GEMV for devices without
+hardware int8 dot, the first prefill split on slow discrete parts, a compute-only
+queue family so a long forward does not hold up the compositor. RX 580 against
+llama.cpp: 1.13× at `pp512` and `tg128` on Qwen2.5-Coder-3B, level on Gemma 4
+E4B, 0.58–0.64× at `pp4@d4096` — the four-token turn where this fork is still
+behind.
+
+**Models and formats** — Gemma 4 image input (`serve.mmproj`,
+`serve.image_max_tokens`), EXL3 safetensors checkpoints (Qwen2, Qwen3.5 text,
+Gemma 4 dense; [`docs/exl3.md`](docs/exl3.md)), the Seed-Coder pre-tokenizer
+(`tokenizer.ggml.pre = seed-coder`) that Zeta 2/2.1 and Seed-Coder GGUFs need,
+and a dense Qwen4 reference path used for experiments
+([`docs/qwen4-exp.md`](docs/qwen4-exp.md)).
+
+**HTTP and CLI** — `/v1/completions` (see
+[FIM and edit prediction](#fim-and-edit-prediction)), `infr ls`, `infr rm`,
+`infr perplexity`, and a Chrome-trace timeline behind `INFR_PROF_TRACE`.
+
 ## Goal
 
 A from-the-metal inference server that works across AMD / NVIDIA / Intel

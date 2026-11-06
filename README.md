@@ -260,8 +260,10 @@ Zeta 2.1, Zed's edit-prediction model on an 8B Seed-Coder backbone, runs at
 5.1 GB Q4_K_M: resident at `--ctx 8k` on an 8 GB card, 24–34 tok/s decode.
 
 ```bash
-infr serve mradermacher/zeta-2.1-GGUF:Q4_K_M --ctx 8k --temp 0.2
+infr serve mradermacher/zeta-2.1-GGUF:Q4_K_M --addr 127.0.0.1:8899 --ctx 8k --temp 0
 ```
+
+Greedy, not sampled: at `--temp 0.2` this quant can loop on `<|marker_1|>`.
 
 Zed — `settings.json`, provider: OpenAI-compatible:
 
@@ -270,7 +272,7 @@ Zed — `settings.json`, provider: OpenAI-compatible:
   "edit_predictions": {
     "provider": "open_ai_compatible_api",
     "open_ai_compatible_api": {
-      "api_url": "http://127.0.0.1:8080/v1/completions",
+      "api_url": "http://127.0.0.1:8899/v1/completions",
       "model": "zeta-2.1.Q4_K_M",
       "prompt_format": "zeta2_1",
       "max_output_tokens": 512

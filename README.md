@@ -69,6 +69,7 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode  |
 | BitNet b1.58      | `bitnet`          | llama skeleton + SubLN, ternary TQ2_0 weights           |
 | BitNet b1.58 (MS) | `bitnet-b1.58`    | same, for the `microsoft/bitnet-b1.58-*` GGUFs (i2_s)   |
+| Zeta 2 / 2.1      | `llama`           | Zed edit prediction; Seed-Coder-8B, FIM/rewrite         |
 
 Fine-tunes on any of these backbones run unchanged. **Ornith-1.0**
 (DeepReinforce.AI agentic-coding) validated 2026-07-09 — the 9B rides `qwen35`
@@ -199,6 +200,50 @@ URLs are not fetched.
 a per-request OpenAI `temperature`/`top_p` still overrides them. See
 [Configuration](#configuration).
 
+### FIM and edit prediction
+
+`/v1/completions` tokenizes the prompt verbatim, with no chat template. FIM
+tokens in it (`<|fim_prefix|>`, `<|fim_suffix|>`, `<|fim_middle|>`, Seed-Coder's
+`<[fim-prefix]>` …) encode as their single special ids and the model continues
+the middle, so any FIM or next-edit model on a supported backbone works — the
+client builds the prompt. `suffix` returns an explicit error instead of being
+ignored; pass the model's own FIM tokens in `prompt`.
+
+Zeta 2.1, Zed's edit-prediction model on an 8B Seed-Coder backbone, runs at
+5.1 GB Q4_K_M: resident at `--ctx 8k` on an 8 GB card, 24–34 tok/s decode.
+
+```bash
+infr serve mradermacher/zeta-2.1-GGUF:Q4_K_M --ctx 8k --temp 0.2
+```
+
+Zed — `settings.json`, provider: OpenAI-compatible:
+
+```json
+{
+  "edit_predictions": {
+    "provider": "open_ai_compatible_api",
+    "open_ai_compatible_api": {
+      "api_url": "http://127.0.0.1:8080/v1/completions",
+      "model": "zeta-2.1.Q4_K_M",
+      "prompt_format": "zeta2_1",
+      "max_output_tokens": 512
+    }
+  }
+}
+```
+
+Zed formats the context itself: related files and edit history as
+`<[fim-suffix]>`/`<[fim-prefix]>` blocks, the editable region marked with
+`<|marker_N|>`, and `<[end▁of▁sentence]>` as the stop. The model's reply is the
+marker-tagged replacement span, which Zed splices into the buffer. The prompt
+budget is 4k tokens and generation is capped at `max_output_tokens * 4`, so
+`--ctx 8k` leaves headroom. Requests are non-streaming, one per typing pause,
+and the prefix cache absorbs the context that repeats between them.
+
+`prompt_format` selects the layout: `zeta2_1` for Zeta 2/2.1, `zeta` for Zeta 1,
+`qwen` for Qwen2.5-Coder, or `code_llama` / `star_coder` / `deepseek_coder` /
+`codestral` / `glm` / `sweep` / `infer`.
+
 ## Performance
 
 Measured against llama.cpp on an **AMD Radeon RX 7900 XTX** (RDNA3, Vulkan /
@@ -251,7 +296,7 @@ is indexed at [`docs/perf/`](docs/perf/README.md).
   `infr pull` fetches from `huggingface.co` over resumable HTTP Range with a
   progress bar; gated repos authenticate with `HF_TOKEN`.
 - **API:** OpenAI-compatible HTTP (streaming) — works with opencode / Claude
-  Code CLI
+  Code CLI / Zed edit prediction
 
 ## Architecture
 

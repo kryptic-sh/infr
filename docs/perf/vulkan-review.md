@@ -222,9 +222,9 @@ of the nc_fa kernel. **Cost:** one new shader variant, one new `build.rs` entry,
 
 **What happens:** Every tiled GEMM (coopmat, nc*mmq, nc_fma) that writes to a
 non-Internal tensor (e.g., the lm_head `logits` Output) allocates a temporary
-`ceil(m/64)*64`-row buffer via `be\*.alloc_uninit`, fills it, then copies the
-`m` real rows back. This allocation happens ONCE per forward on the lm_head path
-— intermediate layers produce Internal tensors and skip the copy.
+`ceil(m/64)*64`-row buffer via `be\*.alloc_uninit`, fills it, then copies the `m`
+real rows back. This allocation happens ONCE per forward on the lm_head path —
+intermediate layers produce Internal tensors and skip the copy.
 
 **Impact:** Low. The lm_head is one op near the end of the forward, allocating a
 buffer sized `vocab_size * n_embd * dtype_bytes`. For Qwen3-8B (vocab 152064,
@@ -341,8 +341,9 @@ All four are overrideable via `INFR_SG`, `INFR_MMV_MW`, `INFR_MMV_MW_WARPS`.
   this pass — the perf.md campaign log already covers the batched-MoE
   dispatch-collapse win (class 4, pp512 0.59→0.91×).
 
-- **Dense layer streaming** (`streamed_prefill_gemm`): The adapter's
-  `INFR_DENSE_PAGE` path for models too large to fit in VRAM. Not traced.
+- **Dense layer streaming** (`streamed_prefill_gemm`): the adapter's path for
+  models too large to fit in VRAM, sized by `paging.cache` / `paging.dram`
+  (there is no `INFR_DENSE_PAGE`). Not traced.
 
 - **Canvas/DiffusionGemma**: The `AttnMask::Canvas` path in attention routing.
   Not traced — perf.md notes it's benchmarked differently (dg-step vs pp/tg).

@@ -56,10 +56,12 @@ at that index. It holds:
   unified seam: block text-diffusion, the canvas denoise graph, and
   self-conditioning.
 - [mtp.md](mtp.md) — multi-token prediction (MTP) speculative decoding for
-  qwen35's single NextN head (issue #33).
+  qwen35's single NextN head (issue #33). Built, then **parked**: `INFR_MTP=1`
+  is ignored; the doc says why and keeps the design record.
 - [deepseek.md](deepseek.md) — the DeepSeek family port plan (V1 → V2/V3 → V3.2
   → V4), staged around the fact that only the first two stages have a model
-  small enough to develop against. Nothing implemented yet.
+  small enough to develop against. V2/V3 (`deepseek2`) and V3.2 (`deepseek32`)
+  generate; V4 (`deepseek4`) loads, but its compressed-KV tiers are unbuilt.
 
 ## Roadmaps & history
 
@@ -67,6 +69,9 @@ at that index. It holds:
   the original MVP, the crate layout and backend seam, the step-by-step recipe
   for **adding a model architecture**, the ranked candidate families, and the
   original milestones as history.
+- [disk-streaming-plan.md](disk-streaming-plan.md) — tiered weight paging (VRAM
+  → DRAM → disk): phases 0–3 landed and engage automatically when a model does
+  not fit; phase 4 (Metal) unbuilt; open items in `backlog.md` B35/B36.
 - [train.md](train.md) — LLM training support plan (not yet built).
 
 ## Testing & CI

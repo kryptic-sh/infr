@@ -55,7 +55,9 @@ different:
 
 `llama`, `llama4`, `qwen2`, `qwen3`, `qwen3moe`, `gemma3`, `gemma4` (dense / E2B
 / 26B-A4B MoE on the one string), `qwen35`, `qwen35moe`, `diffusion-gemma`,
-`bitnet`, `bitnet-b1.58`.
+`bitnet`, `bitnet-b1.58`, and the DeepSeek line — `deepseek`, `deepseek2`,
+`deepseek32`, `deepseek4` (status per stage in [`deepseek.md`](deepseek.md):
+`deepseek4` loads but refuses any layer with a non-zero `compress_ratio`).
 
 Fine-tunes on those backbones run with no code change (Ornith-1.0 and
 Ternary-Bonsai are the validated examples — see the root
@@ -84,6 +86,8 @@ Bottom-up. Each named trait is the seam where future variants plug in.
 ├──────────────────────────────────────────────────────────────────────┤
 │ backends      infr-cpu (reference) / infr-vulkan / infr-metal         │  the ONLY GPU-aware layer
 ├──────────────────────────────────────────────────────────────────────┤
+│ infr-plat     the OS seam (leaf): locks, memory probe, signals, paths │  the ONLY OS-specific code
+├──────────────────────────────────────────────────────────────────────┤
 │ shaders       GLSL -> SPIR-V (Vulkan), MSL (Metal)                    │  not Rust
 └──────────────────────────────────────────────────────────────────────┘
 ```
@@ -111,6 +115,7 @@ The workspace members, from the root `Cargo.toml`:
 infr/
 ├── crates/
 │   ├── infr-core       # Tensor, dtypes/quant, Graph, Op, Backend trait, config, pagers, errors
+│   ├── infr-plat       # the platform seam: every OS-specific call (leaf crate — docs/infr-plat.md)
 │   ├── infr-cpu        # Backend impl: the reference backend (also the correctness oracle)
 │   ├── infr-vulkan     # Backend impl: ash + gpu-allocator + SPIR-V dispatch, VRAM/expert pagers
 │   ├── infr-metal      # Backend impl: native MSL (Apple GPUs)
@@ -309,14 +314,12 @@ Ranked by ROI against the architecture above. Step 0 of the recipe is the same
 for all of them and costs minutes; do that before believing any effort estimate
 here.
 
-1. **DeepSeek** (`deepseek` → `deepseek2` → `deepseek32` → `deepseek4`).
-   **Highest strategic value**, and the only candidate with a written plan:
-   [`deepseek.md`](deepseek.md). Adds **MLA (Multi-head Latent Attention)**, the
-   missing attention family behind the whole V2/V3/V4 line. Staged around the
-   constraint that only the first two stages have a model small enough to
-   develop against, so stages 1–2 must leave MLA and MoE-routing pieces behind
-   that are independently tested. Depends on the streaming work tracked as B36
-   in [`backlog.md`](backlog.md).
+1. **DeepSeek V4** (`deepseek4`) — the rest of the DeepSeek line has landed (MLA
+   for `deepseek2`, the lightning indexer for `deepseek32`; see
+   [`deepseek.md`](deepseek.md)). What V4 still needs is the compressed-KV tiers
+   (`compress_ratio` 4 and 128), tracked as B-DSV4-WIRING and B-DSV4-REAL in
+   [`backlog.md`](backlog.md); until they land the shipped V4-Flash file is
+   refused at layer 2.
 2. **GLM-4.7-Flash** (~30B MoE) or **Ernie 4.5 21B-A3B** (MoE). Mostly standard
    MoE FFN — infr's batched-expert path covers it — plus minor arch quirks (GLM
    post-norm / partial RoPE). Expect recipe steps 3–4 only. Some GLM variants

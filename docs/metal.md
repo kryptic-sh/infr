@@ -285,6 +285,10 @@ contexts).
 
 ## MTP (multi-token prediction, `INFR_MTP=1`)
 
+> **Parked.** MTP is disabled on every backend (`mtp_enabled()` returns `false`,
+> `INFR_MTP=1` is ignored); see [`mtp.md`](mtp.md#mtp-is-parked-2026-07-31).
+> This section records what the Metal path measured before that.
+
 A qwen35 GGUF that ships a trained MTP head (`nextn.*` at `blk.{n_layer}`,
 `Config::n_layer_nextn`) can draft with the head instead of a separate draft
 model: `MtpHeadSession` runs the head's one-layer forward per draft step, the

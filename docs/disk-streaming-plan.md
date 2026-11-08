@@ -538,7 +538,9 @@ testable without a machine that happens to have the right amount of RAM free.
   `/proc/meminfo` is host-wide, and measured on this box an 8 GiB `systemd-run`
   scope still reports 54.6 GB available — sizing an anonymous arena from that is
   an OOM kill in every container. Verified at 53.57 GB unconstrained, 8.59 GB
-  under an 8 GiB cap, 2.15 GB under 2 GiB. Other platforms answer `None`, which
+  under an 8 GiB cap, 2.15 GB under 2 GiB. The probe itself is
+  `infr_plat::mem::available`, which also answers on macOS (host-wide) and
+  Windows (Job-Object-clamped); a platform with no probe answers `None`, which
   callers treat as "do not auto-size" and never as "assume plenty".
 - **`auto_arena_bytes`** — leaves the larger of 1 GiB and an eighth of what is
   available, never budgets past the pageable bytes (more would buy nothing), and
@@ -741,32 +743,21 @@ where concurrency could plausibly HURT.
 
 ## 7. Decisions
 
-Made here, changeable by the user:
+Superseded, kept so they are not re-argued:
 
-1. **The dense disk tier is opt-in, not an automatic ladder rung.** At the §2
-   ceiling, silently choosing it for an interactive decode turns a clean "does
-   not fit" into a session that looks hung. `paging.disk` (or an explicit
-   `paging.dram`) engages it; the auto ladder stops where it does today unless
-   asked. MoE is different — skewed routing makes it genuinely fast — so MoE may
-   take the tier automatically.
-2. **Sharded GGUF is out of scope for v1.** `Gguf::open` maps one file; the
-   `-NNNNN-of-MMMMM` set is understood only by `infr-hub`'s downloader. A paged
-   sharded model is rejected at load with that reason, and `BlockExtent` carries
-   no file id until a second file exists to point at.
+1. ~~The dense disk tier is opt-in.~~ Reversed: `paging.disk` was never built
+   (§4), and the tier engages whenever placement rejects residency, sized by
+   §4.1's probe.
+2. ~~Sharded GGUF is out of scope for v1.~~ Shipped:
+   `infr_core::blockio::FileBlockIo::open_shards` serves a `gguf-split` set, and
+   `cpu_paged_store` / `vulkan_host_tier` in `infr-llama/src/seam/mod.rs` open
+   it from `Gguf::shards()`.
+3. ~~Windows host-memory probe.~~ Shipped: `infr_core::hostmem` delegates to
+   `infr_plat::mem::available`, which has Linux (cgroup-clamped), macOS
+   (`host_statistics64`) and Windows (Job-Object-clamped) arms; CI runs all
+   three platforms.
 
 Needing the user's call:
-
-3. **Windows host-memory probe.** `libc` covers Linux and macOS; Windows needs
-   `GlobalMemoryStatusEx`, i.e. a new dependency (`sysinfo` or `windows-sys`).
-   Recommendation: neither — Windows requires an explicit `paging.dram` and says
-   so. CI builds only ubuntu and macos today.
-
-   Note this is not yet load-bearing: nothing probes host memory on ANY
-   platform. `paging.dram` is explicit-only everywhere today (both
-   `cpu_paged_store` and `dense_host_tier` return "no tier" when it is unset),
-   which is the safe default B30 argues for — an anonymous arena sized from a
-   guess is the expensive kind of wrong. The question only becomes live if the
-   tier should ever engage automatically.
 
 4. **Phase 4 (Metal) cannot be verified on this machine.** There is no Apple
    hardware here and `infr-metal` does not compile on this box, so the only

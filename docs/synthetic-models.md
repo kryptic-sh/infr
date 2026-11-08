@@ -120,11 +120,10 @@ independent of disk space.
 
 ## What already exists — this is a generalization, not a new build
 
-`crates/infr-llama/tests/synthetic_deepseek2.rs` (~3400 lines, 36 runnable
-tests) already does exactly this for `deepseek2`, `deepseek32` and `deepseek4`:
-it builds a GGUF in memory, writes it to a temp file, and drives it through the
-real `Config::from_gguf` and the real seam. Its module doc has an explicit
-"Adding an architecture" section.
+`crates/infr-llama/tests/synthetic_deepseek2.rs` already does exactly this for
+`deepseek2`, `deepseek32` and `deepseek4`: it builds a GGUF in memory, writes it
+to a temp file, and drives it through the real `Config::from_gguf` and the real
+seam. Its module doc has an explicit "Adding an architecture" section.
 
 **Reusable as-is** (everything above `mla_model`): `Meta` (the metadata value
 writer), `TensorSpec` + `Fill` (name, ggml-order shape, deterministic values),

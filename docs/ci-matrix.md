@@ -48,7 +48,7 @@ surface minutes later as a `build.rs` panic on whichever job reached
 
 ## Things worth knowing before editing it
 
-- **`target-cpu=native` is keyed on the Linux host triple** in
+- **`target-cpu=native` is keyed on the Linux and Windows-MSVC triples** in
   `.cargo/config.toml`, not set under `[build]`. A `[build] rustflags` reaches
   cross-target builds, where it names the host's CPU and the cross compiler
   rejects it — `cargo check --target aarch64-apple-darwin` then buries real

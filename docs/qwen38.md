@@ -131,7 +131,7 @@ skips where it does not.
 
 ## Stage B — Qwen3.8-2.4T-A95B (`qwen35moe`)
 
-**One real code defect; otherwise blocked on hardware, not on infr.**
+**Blocked on hardware, not on infr** (its one code defect is fixed — below).
 
 `Qwen3_5MoeForCausalLM` maps to `qwen35moe` (`conversion/qwen.py:636`), which
 infr already parses — `config.rs:624-625` widens `qwen35_moe` into the `qwen35`
@@ -141,50 +141,25 @@ experts with 10 active, `moe_intermediate_size` 2048, a shared expert, and a
 128:16 value:key head ratio. It is text-only — no mrope sections, no vision —
 and the sectioned-RoPE parse falls back cleanly when the key is absent.
 
-### The defect: `moe_topk.comp` breaks above 256 experts
+### The 256-expert defect — fixed, but never exercised
 
-`crates/infr-vulkan/shaders/moe_topk.comp:57`:
-
-```glsl
-// 256 experts → 1 KB shared — well within limits.
-shared float ssel_adj[256];
-```
-
-but the selection scan directly below it is sized for far more
-(`#define MAX_CHUNKS 8u`, commented "128 lanes \* 8 chunks = 1024 experts"). The
-no-extension branch — the one every qwen35moe layer takes — writes the array
-unconditionally across the full expert count:
-
-```glsl
-} else {
-    // No extensions: ssel_adj stays zero — the lane-level arithmetic below is unchanged.
-    for (uint e = 0u; e < pc.n_expert; e++) { ssel_adj[e] = 0.0; }
-}
-```
-
-and reads `ssel_adj[e]` for `e < pc.n_expert` in the selection loop. At
-`n_expert = 512` that is an out-of-bounds shared-memory write and read:
-undefined behaviour, so corrupted routing weights or a driver-dependent hang,
-**not** a clean refusal. There is no Rust-side guard — `recorder.rs` passes
-`n_expert` into the push constants unchecked.
-
-Nothing currently supported exceeds 256 experts, which is why this has never
-fired. **Both** Qwen3.8 MoE models have 512, so this blocks Stage B and Stage C
-alike on the GPU path. The CPU MoE router is `Vec`-based and unaffected.
-
-Fix: size the array to the same 1024 the selection scan already assumes (4 KB
-shared, still comfortable), or index it in chunks like `taken[]`. Then add the
-missing bound as a loud `bail!` rather than leaving the shader to decide.
-Tracked as its own backlog entry because it is not Qwen3.8-specific.
+This section used to record an out-of-bounds `ssel_adj` write in `moe_topk.comp`
+above 256 experts, with no host-side guard. Both halves are fixed: the shader
+sizes `ssel_adj` from its own scan headroom, and `recorder.rs` refuses
+`n_expert` above `MOE_TOPK_MAX_EXPERTS` loudly
+(`moe_topk_shader_ceiling_matches_host` keeps the two in step). What is still
+open is that no model above 256 experts has ever been RUN, so routing at 512
+experts is unverified — see `backlog.md` § B70. Both Qwen3.8 MoE models are the
+first that would exercise it.
 
 ### Otherwise: hardware, not code
 
 The smallest published conversion is `unsloth/Qwen3.8-2.4T-A95B-GGUF:UD-Q1_0` at
 **397.3 GB across 10 shards**; Q8_0 is 2.6 TB and BF16 is 4.9 TB. That exceeds
 local disk, so this model is **not developable here** — the same shape of
-constraint [`deepseek.md`](deepseek.md) is staged around. Treat Stage B as: fix
-the shader bug, confirm the config parses, and stop. Do not claim support for a
-model that has never been loaded.
+constraint [`deepseek.md`](deepseek.md) is staged around. Treat Stage B as:
+confirm the config parses, and stop. Do not claim support for a model that has
+never been loaded.
 
 ---
 
@@ -308,11 +283,12 @@ part of it into reuse. Doing it before means building that machinery twice.
 `unsloth/Qwen3.8-Flash-Next-GGUF` smallest quant is **UD-IQ1_S at 72.5 GB across
 3 shards** (BF16 is 354.0 GB across 8). That fits local disk with room to spare
 but not the 25.75 GB card, so Stage C needs the expert pager plus host residency
-for the PLE table from the outset — and it inherits the `moe_topk` 512-expert
-bug from Stage B. There is no small `qwen4exp` model to develop against, which
-is exactly the situation [`deepseek.md`](deepseek.md) is staged around: build
-and test each op against the CPU reference on synthetic shapes first, and treat
-the full-model run as the last step rather than the development loop.
+for the PLE table from the outset — and it is, with Stage B, the first run of
+`moe_topk` at 512 experts (B70). There is no small `qwen4exp` model to develop
+against, which is exactly the situation [`deepseek.md`](deepseek.md) is staged
+around: build and test each op against the CPU reference on synthetic shapes
+first, and treat the full-model run as the last step rather than the development
+loop.
 
 ---
 
@@ -320,10 +296,10 @@ the full-model run as the last step rather than the development loop.
 
 1. **Stage A** — pull, verify, bench, add a golden. Independent of everything
    else and probably the cheapest supported-model row infr has ever added.
-2. **`moe_topk.comp` 512-expert fix** — small, self-contained, and unblocks both
-   MoE models. Worth doing even if Stage C never happens.
-3. **Stage B config confirmation** — parse-only; do not claim support.
-4. **Stage C** — after the DeepSeek V4 compressed-KV slice, to reuse rather than
+2. **Stage B config confirmation** — parse-only; do not claim support. The
+   `moe_topk.comp` 512-expert fix it once waited on has landed (B70 holds what
+   is still unverified).
+3. **Stage C** — after the DeepSeek V4 compressed-KV slice, to reuse rather than
    duplicate the indexer and compress-ratio machinery.
 
 ## Open questions

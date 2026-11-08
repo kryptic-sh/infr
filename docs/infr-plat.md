@@ -23,6 +23,7 @@ it that way.
 
 | module   | capability                                    |
 | -------- | --------------------------------------------- |
+| `cpu`    | physical core count                           |
 | `fileio` | positioned reads and writes                   |
 | `link`   | the content-addressed store's link step       |
 | `lock`   | an exclusive, crash-safe file lock            |
@@ -39,9 +40,11 @@ that "not supported on this platform" arrives at a caller as "passed". Three
 cases are live, and each is documented at its definition rather than smoothed
 over:
 
-- **`mem::available`** is clamped by the cgroup limit on Linux, unclamped on
-  Windows, and **absent on macOS**. `Available::source` carries which, because
-  sizing an arena from an unclamped figure inside a container is an OOM kill.
+- **`mem::available`** is clamped by the cgroup limit on Linux and by the
+  process's Job Object limit on Windows, and is **host-wide on macOS**
+  (`host_statistics64`; macOS has no per-process commit limit to clamp by).
+  `Available::source` carries which, because sizing an arena from an unclamped
+  figure inside a container is an OOM kill.
 - **`lock::FileLock`** is advisory on Unix (`flock`) and mandatory on Windows
   (`LockFileEx`). It promises the weaker of the two; a caller written against
   the stronger one would work on Windows and quietly do nothing on Linux.

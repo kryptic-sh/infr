@@ -118,8 +118,8 @@ when the cause is a global config file you forgot about.
 
 ## `--set`
 
-Most of the 155 knobs have no dedicated flag. `--set <config.path>=<value>`
-reaches all of them, using the same path grammar as the TOML file:
+Most knobs have no dedicated flag. `--set <config.path>=<value>` reaches all of
+them, using the same path grammar as the TOML file:
 
 ```bash
 infr bench "$M" -p 512 -n 0 --set kernels.vulkan.flash_splits=2
@@ -206,15 +206,14 @@ hit/miss/eviction counts.
 kernel **tier** override: the engine picks the best tier the device supports,
 and these exist to force one off when bisecting a correctness or perf problem.
 
-- **`[kernels.vulkan]`** (the biggest section — 62 of the 155 keys): capability
-  masks (`coopmat`, `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), GEMM/GEMV
-  tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, the
-  `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
-  `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
-  `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
-  `no_replay`, `no_vram_guard`, the BDA chunk caps). Note `f16 = false` also
-  disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
-  today.
+- **`[kernels.vulkan]`** (the biggest section): capability masks (`coopmat`,
+  `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), GEMM/GEMV tiers (`gemm_warp`,
+  `mmq`, `mmv`, `mrow`, `moe_small_m`, the `[kernels.vulkan.gemv]` sub-table),
+  attention (`flash_warp`, `flash_splits`, `flash_min_rows`, `pv_splits`),
+  DeltaNet (`dn_chunk_scan`, `dn_chunk`, `dn_split`), and the plumbing switches
+  (`push_desc`, `pipeline_cache_disk`, `no_replay`, `no_vram_guard`, the BDA
+  chunk caps). Note `f16 = false` also disables coopmat regardless of `coopmat`,
+  matching `INFR_NO_F16`'s effect today.
 - **`[kernels.metal]`** — the Apple backend's native/CMM/RT kernel families per
   dtype, plus `deltanet`, `moe` and `pipeline_cache` (persist the compiled
   `MTLComputePipelineState`s as an `MTLBinaryArchive` under `~/.cache/infr`, so

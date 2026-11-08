@@ -13,7 +13,10 @@ CPU-vs-Vulkan, matching greedy output vs llama.cpp c629da5); the YaRN ramp is
 verified numerically against llama.cpp at short AND long context (see the
 checklist).
 
-Stage 1 (`deepseek`) was skipped — V2-Lite is the development model.
+Stage 1 (`deepseek`) is accepted and CPU-tested only: `cpu_deepseek_config` and
+`cpu_deepseek_prefill_paris` pass on DeepSeek-MoE-16B (dense DeepSeek-LLM-7B
+GGUFs declare `llama`, so they cannot test this arch). There is no CPU-vs-Vulkan
+seam test for it. V2-Lite is the development model for the rest.
 
 The reference implementation is llama.cpp, checked out locally at
 `~/Projects/mxaddict/llama.cpp`, now at `b10356-2-g030ebb5`
@@ -312,6 +315,9 @@ experts → add shared expert. All of this exists.
   behind a GPU. Use the **strict** form for the 7B dense model and the **loose**
   form (top-5 overlap + `cosine > 0.5`) for MoE-16B, for the same reason
   `gpu_seam_matches_cpu_qwen35moe` does: routing near-ties legitimately flip.
+  **Not written.** The first two exist and run against
+  `mradermacher/deepseek-moe-16b-chat-GGUF` (the dense 7B declares `llama`, so
+  the "strict form for the 7B" half no longer applies); this one is still owed.
 
 **No CI golden.** The `cpu-goldens` job downloads two ~1B GGUFs; the smallest
 DeepSeek is 7B. Commit `273f8d4` already removed qwen35 from that job because an

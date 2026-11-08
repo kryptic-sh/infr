@@ -22,13 +22,8 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
 
 - **Original audit:** 157 findings across 24 module slices (1 🔴 critical, 33 🟠
   major, 123 🟡 minor).
-- **Remaining: 5 — and all actionable fixes are DONE.** 0 🔴, 2 🟠, 3 🟡, every
-  one either a documented **deferral** or requiring hardware not on this box:
-  - 🟠 a Mac-only latent metal wrong-kernel dispatch (iq4xs/iq4nl) — needs an
-    Apple GPU to verify + re-point (tracked in
-    [#80](https://github.com/kryptic-sh/infr/issues/80); the slice-23 metal
-    fixes themselves are GPU-verified in
-    [#81](https://github.com/kryptic-sh/infr/issues/81));
+- **Remaining: 4 — and all actionable fixes are DONE.** 0 🔴, 1 🟠, 3 🟡, every
+  one a documented **deferral**:
   - 🟠 `make_compute_kernel` OOM→`Result` — deferred (a 155-call-site
     `()`→`Result` migration disproportionate to a rare OOM path; panic messages
     improved);
@@ -36,7 +31,7 @@ reproduce/confirm are dropped (not listed) to keep this a verified-only ledger.
     compiled SPV / recorded push-constant+descriptor stream the byte-identity
     goldens gate).
 
-  **152 of 157 findings fixed** across 25 module slices (every crate cleared;
+  **153 of 157 findings fixed** across 25 module slices (every crate cleared;
   the gated multi-GPU and parked MTP verified on real hardware), plus the
   `INFR_DEV`-unification feature. Every GPU-touching slice was byte-identity
   verified against the goldens on the RX 7900 XTX; every fix was TDD.
@@ -65,8 +60,8 @@ and fixed (`n_past+1`→`n_past`), with the acceptance-rate test passing.
   honors the `Sampler` (greedy at temp==0, stays inside the grammar mask);
   `seed|1` no longer collapses adjacent seeds; the `top_k==0` path uses a heap
   instead of a ~150K full sort; `truncated_dist`/`sample_logits` share one
-  `truncated_softmax` helper. _Follow-up noted:_ `seed_rng()` (INFR_SEED path)
-  has the same latent `|1` — deferred to avoid perturbing INFR_SEED determinism.
+  `truncated_softmax` helper. The `seed_rng()` (INFR_SEED) follow-up is also
+  fixed: it goes through `legal_xorshift_state`.
 - **`infr-gguf` (all 5 findings)** — TDD, +9 tests. Corrupt/truncated GGUFs now
   return `Error::Loader` instead of panicking (`checked_add`/`checked_mul` in
   `ensure`/shape/offsets; `with_capacity` clamped to remaining bytes;
@@ -386,7 +381,8 @@ wrong-kernel dispatch (needs an Apple GPU) and the deferred
   parse, `Op::Sample` `top_k==0`) — should return `Err`.
 - **Name-table vs SPV-table drift guarded only at runtime by `.expect()`** —
   FIXED in vulkan `gemm.rs`/`linear.rs` (name gates now delegate to the SPV
-  source); still open in Metal `exec.rs`.
+  source), and in Metal `exec.rs` (`qui_linear_kerns` is the single registry,
+  pinned by `qui_linear_kerns_are_format_matched`).
 - **Per-render / per-warm-call recomputation** (jinja env rebuild,
   session-stable seam derivations, capabilities clone, GGUF re-parse ×5 in the
   CLI).
@@ -451,15 +447,8 @@ _6 of 7 findings fixed (see Resolved log); the one below is **DEFERRED**._
 
 ## infr-metal/src/exec.rs (Metal backend — not runnable on this Linux box)
 
-_All 6 original findings fixed (see Resolved log). The one below is a **new,
-pre-existing** latent bug surfaced while unifying the kernel tables — preserved
-byte-for-byte in the fix and flagged for a Mac to verify+fix._
-
-1. **🟠 (Mac-verify) iq4xs/iq4nl reach the `cmm_ks` default that dispatches
-   `linear_quik8_cmm_ks`, though their own `linear_iq4xs_cmm_ks`/
-   `linear_iq4nl_cmm_ks` kernels exist** — so at m≥2/m≥5 with deep-k and
-   `out_f%64==0` the wrong (quik8) kernel decodes their codes. Latent +
-   Metal-only; preserved (not a regression). **Tracked in
-   [#80](https://github.com/kryptic-sh/infr/issues/80)** (cc @digitaloten) — an
-   Apple GPU re-points the two registry cells. The slice-23 metal fixes are
-   GPU-verified in [#81](https://github.com/kryptic-sh/infr/issues/81).
+_All findings fixed._ The iq4xs/iq4nl `cmm_ks` wrong-kernel dispatch surfaced
+here is fixed — `qui_linear_kerns` maps every base to its own `{base}_cmm_ks`
+(`moe.metal` defines `linear_iq4xs_cmm_ks` / `linear_iq4nl_cmm_ks`), and
+[#80](https://github.com/kryptic-sh/infr/issues/80) is closed. Not run on an
+Apple GPU from this box.

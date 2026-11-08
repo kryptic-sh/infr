@@ -87,9 +87,13 @@ kind, `shard_bytes`' divisibility guard, and the
 `shard_bytes(len_bytes()) == per-rank` round trip — but the real path is still
 unrun.
 
-**To do:** a two-GPU smoke run of `--tensor-parallel` with MTP enabled (which is
-what exercises the checkpoint path) would close it. Worth doing once by hand
-even without CI.
+**To do:** a two-GPU smoke run with tensor parallelism on — there is no
+`--tensor-parallel` flag; it is `multi.tensor_parallel` (`INFR_TENSOR_PARALLEL`,
+or `--set multi.tensor_parallel=…`). The KV-checkpoint path was exercised by
+MTP, which is parked (`mtp_enabled()` returns `false`), so while MTP stays
+parked a smoke run proves the sharded forward pass but NOT the checkpoint bytes;
+that half needs another caller of the checkpoint path, or MTP revived. Worth
+doing once by hand even without CI.
 
 ### B5 — `infr serve` has no rate limiting
 
@@ -701,25 +705,27 @@ What it does not, and will not:
   miri cannot execute. The `hostpager::` filter added later runs in seconds, so
   the crate-wide cost was never the obstacle for the part that matters.
 
-### B33 — the `wildcards` gate in `deny.toml` is off, for a fixable reason
+### B33 — the `wildcards` gate in `deny.toml` is off, and is now a two-line fix
 
-**Tag:** cron slice 2026-08-04 · **Blocked on:** a decision about whether the
-workspace crates are ever published
+**Tag:** cron slice 2026-08-04 · **Blocked on:** nothing (re-verified
+2026-11-08)
 
 `cargo-deny`'s `wildcards = "deny"` catches a `*` version requirement on a
 registry crate — non-reproducible builds, and a semver-major landing with no
-diff. It is set to `allow` because this workspace's own members are declared
-`{ path = ... }` with no version, which cargo-deny also reads as a wildcard.
-`allow-wildcard-paths = true` is the intended escape and does not help: it
-applies only to crates marked `publish = false`, and only `infr-testkit` is.
+diff. It was left at `allow` because the workspace members were declared
+`{ path = ... }` with no version, which cargo-deny reads as a wildcard, and
+marking them `publish = false` was a decision about publishing nobody had made.
 
-Marking the remaining members `publish = false` turns the gate back on and is
-accurate today — nothing is on crates.io. It is also a statement that these
-crates will not be published, which is a call to make on purpose rather than in
-passing, and `infr-cli` is the one where the answer might reasonably be
-"eventually". No registry wildcard exists in the tree right now
-(`grep '= "\*"' crates/*/Cargo.toml`), so what is currently missing is a guard
-against a future mistake, not cover for a present one.
+That premise is gone: publishing was decided on 2026-10-29 (B78), every internal
+dependency in `[workspace.dependencies]` now carries `version = "0.2.0"`, and
+the only unversioned path dependency left is `infr-testkit`, the dev-only crate
+that is already `publish = false`. Measured 2026-11-08 with
+`cargo deny check bans` against a copy of `deny.toml`: `wildcards = "deny"`
+alone FAILS (`found 2 wildcard dependencies` for `infr-cpu`, `infr-metal`,
+`infr-vulkan` — the `infr-testkit` dev-deps), and `wildcards = "deny"` plus
+`allow-wildcard-paths = true` PASSES (`bans ok`). So the fix is those two lines,
+plus deleting the stale comment above `wildcards` in `deny.toml` that still says
+nothing is published. Not applied in the 2026-11-08 pass, which was docs-only.
 
 ### B34 — no fuzz targets, and there is an obvious first one
 
@@ -1230,7 +1236,7 @@ Replace each with a cosine over softmax probabilities, re-measured on the model
 it guards, and show a broken backend fails it. Needs Qwen3.5-MoE and
 DiffusionGemma-26B, plus a GPU the user allows them on.
 
-### B65 — 29 elementwise dispatchers use the UNSPLIT grid and can exceed `maxComputeWorkGroupCount[0]` (2026-08-13)
+### B65 — elementwise dispatchers still use the UNSPLIT grid and can exceed `maxComputeWorkGroupCount[0]` (2026-08-13)
 
 **Tag:** vulkan · **Blocked on:** nothing; found in review, scoped out because
 sweeping it needs a shader edit per kernel
@@ -1247,22 +1253,24 @@ cannot be switched over without editing its shader too.
 `Op::CompressPool` was switched to `dispatch_wide` when it landed — one thread
 per output element makes its grid `ceil(blocks*n_embd / 64)`, and a CSA layer at
 a 128k context is `ceil(n_ctx/4)` blocks, which clears the limit on a real
-model. The sweep is what was NOT done: **29 call sites in
+model. The sweep is what was NOT done: **call sites in
 `crates/infr-vulkan/src/recorder.rs` still call plain `dispatch` with a flat
-`div_ceil` grid**, and the elementwise ones scale with `rows * n_embd`, which is
-the same shape. `Recorder::hyper_post` is the clearest sibling — its grid is
-`ceil(rows*hc*n_embd / 64)`, which at rows=512, hc=4, n_embd=7168 is 229,376
-workgroups against the guaranteed 65,535. It is LATENT rather than live: the
-emit is gated on `lw.hc`, which only deepseek4 carries, and no real V4 file
-reaches a forward pass yet (§ B-DSV4-REAL), while every V4 graph the tests build
-is `batch == 1`. So it becomes reachable exactly when slice B lands — which is
-the moment to fix it, not before.
+`div_ceil` grid** (the original count of 29 is stale — `dispatch_wide` has
+gained callers since, so recount before starting), and the elementwise ones
+scale with `rows * n_embd`, which is the same shape. `Recorder::hyper_post` is
+the clearest sibling — its grid is `ceil(rows*hc*n_embd / 64)`, which at
+rows=512, hc=4, n_embd=7168 is 229,376 workgroups against the guaranteed 65,535.
+It is LATENT rather than live: the emit is gated on `lw.hc`, which only
+deepseek4 carries, and no real V4 file reaches a forward pass yet (§
+B-DSV4-REAL), while every V4 graph the tests build is `batch == 1`. So it
+becomes reachable exactly when slice B lands — which is the moment to fix it,
+not before.
 
 What is established: the pairing works, and the recovery is load-bearing. Both
 were shown by pinning `MAX_GROUP_COUNT_X` to `2`, re-running
 `compress_pool_parity` (green, so the split path computes the right answer),
 then reverting the shader to bare `gl_GlobalInvocationID.x` under the same pin
-and watching it go RED. What is NOT established: which of the 29 are actually
+and watching it go RED. What is NOT established: which of them are actually
 reachable past the limit on a real model — that is per-call-site arithmetic
 nobody has done. The failure mode is not a clean error; it is a dispatch the
 driver may reject or silently truncate, which is why this is worth doing before
@@ -1292,10 +1300,10 @@ sizes are 32/64/256 and therefore already divide any legal `k` — so unlike the
 GEMV path there is no dtype (BF16/F16/F32) that can even express an off-grid
 row. Reaching it needs a hand-built synthetic tensor, which is precisely the
 hazard B39 was about, so this is a real gap and not a non-issue. The reason to
-stop was scope: each `matmul*\*` entry carries its own tiling constraints
-(`gemm.rs`'s `matmul_f16`already asserts`m,n %64 && k %32`) and several take `k`
-with different meanings, so a uniform guard needs its own read of the family
-rather than a mechanical sweep.
+stop was scope: each
+`matmul*\*` entry carries its own tiling constraints (`gemm.rs`'s `matmul_f16`already asserts`m,n
+%64 && k %32`) and several take `k` with different meanings, so a uniform guard
+needs its own read of the family rather than a mechanical sweep.
 
 **Not the same defect, checked while here:** `native_gemm.comp` (the coopmat
 prefill GEMM, the one path that DOES take BF16) steps
@@ -1897,9 +1905,12 @@ int8 "rescale tax". **It has never been run** — RADV does not expose the
 extension and there is no NVIDIA part here. So the question it was built to
 answer is still open.
 
-The direct motivation is B-HWDET-I8CM-FRAGLAYOUT: coopmat2's per-element
-callback addresses `(row, col)` **portably**, which would retire the empirically
-derived fragment mapping entirely on hardware that has it.
+The direct motivation was the int8-coopmat fragment-layout question (formerly
+B-HWDET-I8CM-FRAGLAYOUT, closed by `95fa3ce`, which verifies the empirically
+derived mapping with an init-time probe rather than trusting it): coopmat2's
+per-element callback addresses `(row, col)` **portably**, which would retire
+that probe and the empirically derived fragment mapping entirely on hardware
+that has it.
 
 **The GATE now exists** (`caps::check_coopmat2_support` over `Coopmat2Probe`,
 probed by `probe_coopmat2` in `lib.rs` and reported as `cm2:` in the device
@@ -2635,9 +2646,10 @@ Coverage gaps, stated plainly:
 
 A structural problem noticed, not addressed (out of scope for the session):
 `crates/infr-vulkan/build.rs` (3,708 lines, most of it one shader build list)
-and `crates/infr-vulkan/src/lib.rs` (5,157 lines) are monoliths. The build list
-would split naturally by kernel family into data files or per-family modules;
-`lib.rs` along its existing sections (device creation, probes, allocation).
+and `crates/infr-vulkan/src/lib.rs` are monoliths, and `lib.rs` is still
+growing. The build list would split naturally by kernel family into data files
+or per-family modules; `lib.rs` along its existing sections (device creation,
+probes, allocation).
 
 ### B70 — no MoE model above 256 experts has ever been run (2026-09-03)
 
@@ -2668,9 +2680,9 @@ a feature-gating question, not a platform-plumbing one, and moving the gates
 into a crate would relocate them rather than remove them. The platform seam has
 landed without touching it, so the analysis is recorded here.
 
-About 55 `#[cfg(target_os = "macos")]` sites — most of the remaining ones in the
-tree — do not mean "spell this differently here". They mean "the Metal backend
-exists here": conditional re-exports in `infr-llama/src/chat/mod.rs`, a
+The `#[cfg(target_os = "macos")]` sites — most of the remaining ones in the tree
+— do not mean "spell this differently here". They mean "the Metal backend exists
+here": conditional re-exports in `infr-llama/src/chat/mod.rs`, a
 `metal_chat_model` constructor, and errors like `chat/cpu.rs`'s _"the Metal
 backend is only available on macOS"_. The consequence is that on a Mac the
 "Metal unavailable" path cannot be compiled at all, and everywhere else the
@@ -2887,3 +2899,317 @@ these templates with Python's Jinja2; not verified against a real template that
 prints a bool) and change the test's expectation, or pin `~2.21` in
 `[workspace.dependencies]` until someone checks what HF and llama.cpp's minja
 actually emit.
+
+## Whole-codebase review 2026-11-08
+
+Three read-only review passes over `main` @ `f2f89cb` (correctness, performance,
+docs/backlog drift). Nothing below is fixed; nothing below was measured. Each
+entry says what was traced in the code versus what is inferred. Baseline at the
+time: `cargo clippy --workspace --all-targets -- -D warnings` and
+`cargo test --workspace` both green on Linux.
+
+### B82 — `finish_reason` says `stop` when the context window cut the reply (2026-11-08)
+
+**Tag:** serve correctness · **Verified:** by reading
+
+`run_chat` in `crates/infr-cli/src/main.rs` picks `Finish::Length` only when
+`stats.n_gen >= max_new`, where `max_new` is the request's `max_tokens` (or
+`sampling.max_new`). The engines then clamp that budget to the room left in the
+KV cache — `ParallelSeam::generate` (`crates/infr-llama/src/parallel.rs`) does
+`max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1))`, and the
+Vulkan session path in `seam/model.rs` does the same — so a reply cut off by the
+context comes back as `n_gen < max_new` and is reported as `"stop"`.
+
+Scenario: per-slot ctx 4096, prompt 4000 tokens, `max_tokens` unset (default
+2048). Generation stops at ~95 tokens, the response says `finish_reason: stop`,
+and a client treats a truncated answer as complete.
+
+Fix: have the engine report the EFFECTIVE cap (or a "budget exhausted" flag) in
+`GenStats`, and compare against that in `run_chat`.
+
+### B83 — `usage.prompt_tokens` reports only the un-cached suffix (2026-11-08)
+
+**Tag:** serve correctness · **Verified:** by reading · **Extends:** B80
+
+`GenStats::n_prompt` is set in `generate_dense_backend`
+(`crates/infr-llama/src/seam/runner.rs`) to `prompt.len() - start` — the tokens
+actually prefilled after a KV prefix-cache hit. `run_chat` passes it straight
+into `ChatOutcome::prompt_tokens`, which `infr-server`'s handlers return as the
+OpenAI `usage.prompt_tokens`. B80 records the same value skewing `/metrics`; in
+`usage` it is a client-visible wrong number: an agent loop re-sending a 20k
+token conversation sees `prompt_tokens: 1` on a cache hit, and any client that
+budgets context or cost from `usage` is wrong.
+
+Fix: carry both counts in `GenStats` — the full prompt length for `usage`
+(llama.cpp's server reports the full length) and the prefilled count for TTFT /
+prefill-rate stats and `/metrics`.
+
+### B84 — one panic in a CPU / Metal / diffusion generation kills the server (2026-11-08)
+
+**Tag:** serve robustness · **Verified:** by reading
+
+`SeamGenerator`'s `GenBackend::generate` in `crates/infr-cli/src/main.rs` takes
+`self.model.lock().expect("serve generator poisoned")`. A panic anywhere while
+the lock is held poisons the mutex; `spawn_blocking`'s `JoinError` turns that
+one request into a 500, and every later request then panics on the `expect` —
+the process stays up and answers 500 forever. The Vulkan multi-slot path
+(`ParallelSeam`) is not this code.
+
+Fix: recover with `unwrap_or_else(PoisonError::into_inner)` and reset the KV
+state (`reset_kv`) before reuse, since a half-finished step leaves it suspect.
+
+### B85 — a client that hangs up does not cancel its generation (2026-11-08)
+
+**Tag:** serve · **Verified:** PLAUSIBLE — needs a test against hyper's drop
+behaviour
+
+- **Non-streaming** (`non_streaming` in `crates/infr-server/src/lib.rs`): the
+  comment says a hung-up client "cannot be noticed", but hyper drops the handler
+  future when the connection closes. The `cancel` latch is never set on that
+  drop, so the blocking task runs to `max_tokens` holding its `--parallel` slot.
+  Retrying clients pile abandoned generations up in front of themselves. Fix: a
+  `CancelOnDrop(Arc<AtomicBool>)` guard in the handler future, disarmed when the
+  join completes.
+- **Streaming** (`streaming`): the cancel is set only when `tx.send` fails
+  inside `on_delta`, i.e. on the next delta. A disconnect during a long prefill
+  — the most expensive moment — or while the stop matcher / reasoning splitter
+  is holding output back is not seen. Fix: a task awaiting `tx.closed()` that
+  sets `cancel`.
+
+### B86 — over-long prompts and oversized bodies get the wrong HTTP status (2026-11-08)
+
+**Tag:** serve · **Verified:** by reading
+
+- A prompt longer than the slot context fails in the runner with an `anyhow!`
+  ("prompt N + gen M exceeds the session KV capacity"), which
+  `chat_completions_handler` maps to `500 server_error`. OpenAI clients retry
+  5xx; they treat `400` with `code: "context_length_exceeded"` as final and
+  compact instead. Fix: check the token count against `ctx_per_slot` in
+  `run_chat` and surface a typed error the server maps to 400.
+- Body rejections: `chat_completions_handler` answers every `JsonRejection` with
+  `param_error(None, e.body_text())`, i.e. 400, discarding `e.status()` — a body
+  over axum's default 2 MiB limit should be 413, a wrong content type 415.
+  `build_router` sets no `DefaultBodyLimit`, so long agent contexts can hit an
+  undocumented, unconfigurable 2 MiB cap. Fix: use `e.status()`, and add a
+  `serve.*` config key for the body limit.
+
+Related open decision: the 504-vs-500 question for a deadline during prefill (§
+"Decision — a deadline that fires during prefill returns HTTP 500" below).
+
+### B87 — the Metal chat path does not clamp `max_new` to the context (2026-11-08)
+
+**Tag:** metal · **Verified:** PLAUSIBLE — macOS only, inferred from the missing
+clamp
+
+`generate_metal_session_constrained` (`crates/infr-llama/src/seam/model.rs`)
+hands `max_new` to `generate_dense_backend` unclamped, unlike the Vulkan session
+path and `ParallelSeam::generate`. The runner then rejects
+`prompt + max_new + 1 > max_ctx`, so a request with a large `max_tokens` on a
+Metal server with a small `--ctx` fails with a 500 even when a short reply would
+fit. Fix: do the clamp once in `run_chat` (which also serves B82) rather than in
+each backend path.
+
+### B88 — special-token text in user messages tokenizes as control tokens (2026-11-08)
+
+**Tag:** chat / security · **Needs:** a decision
+
+`SeamModel::encode` and `ParallelSeam::generate` tokenize the whole rendered
+prompt with `tokenizer.encode(text, false)`; nothing outside the test
+`user_text_special_tokens_are_literal` in `tokenizer.rs` calls
+`set_encode_special_tokens(true)` (which makes specials literal). A user message
+containing `<|im_end|>\n<|im_start|>system\n…` becomes the real control ids, so
+a role boundary can be forged through the API.
+
+llama.cpp's server behaves the same (it parses specials in the rendered prompt),
+so this matches the reference. Options: (a) render with placeholders and
+tokenize user-content segments with specials disabled — the test's intent
+suggests this was wanted; (b) keep parity with llama.cpp and document it in the
+serve docs. Needs the user's call.
+
+### B89 — hub: an empty `HF_TOKEN` is sent, and a failed HEAD drops the sha256 gate (2026-11-08)
+
+**Tag:** hub · **Verified:** by reading
+
+- `token()` in `crates/infr-hub/src/http.rs` is `std::env::var("HF_TOKEN").ok()`
+  with no empty filter, so `HF_TOKEN=` (common in Docker / CI env files) sends
+  `Authorization: Bearer ` and can draw a 401 on a public repo. Fix:
+  `.ok().filter(|t| !t.trim().is_empty())`, as `configured_api_key` already does
+  in the server.
+- `fetch_and_link` and `fetch_companions` (`crates/infr-hub/src/pull.rs`) call
+  `head_lfs_sha(...).ok().flatten()`: a timeout or error on the HEAD is
+  indistinguishable from "not an LFS file", so a multi-GB GGUF downloads with
+  `expected_sha = None` — no integrity check — and the relink fast path is
+  skipped. Fix: retry the HEAD, and fail (or warn loudly) on a HEAD error for a
+  `.gguf`; only a successful response without `X-Linked-Etag` means non-LFS.
+
+### B90 — tool-call parsing at `finish` scans the channel-format reasoning (2026-11-08)
+
+**Tag:** chat · **Verified:** PLAUSIBLE — no model run
+
+`ChatStream::finish` (`crates/infr-chat/src/stream.rs`) runs
+`parse_any_tool_calls` over the output of `split_think`, which does not strip
+the `<|channel>thought…<channel|>` reasoning block. The streaming path (`emit`)
+only looks for tools after `<channel|>`, so the two disagree: a tool call quoted
+inside the reasoning of a channel-format model is emitted as a real
+`Delta::ToolCall` at the end. Fix: parse from the post-`<channel|>` region
+(`split_reasoning`).
+
+Also in `stream.rs`, latency only: with `tools` supplied, a reply whose content
+starts with `{` (`bare_json_open`) is withheld until `finish`, so a plain JSON
+answer streams as one chunk. Fix: detect a complete first JSON object
+incrementally.
+
+### B91 — streaming detokenization is quadratic in output length (2026-11-08)
+
+**Tag:** perf · decode / serve · **Verified:** code read; cost NOT measured
+
+`stream_token` → `emit_decoded_suffix` (`crates/infr-llama/src/util.rs`) calls
+`tokenizer.decode(acc, true)` on the WHOLE accumulated output for every token,
+allocating the full string each time, then slices off `printed`. Every streaming
+decode path uses it (`seam/model.rs`, `parallel.rs`, `mtp/`); only diffusion
+uses the span variant. In chained decode it runs up to `chain_n` times per chain
+while the GPU is idle, and on the serve path it runs inside the GPU baton (B93),
+so the cost is paid by every slot.
+
+Estimate (assumed ~0.1–0.25 µs per id per decode — the tokenizer's cost was not
+read or measured): ~0.4 ms/token at 2k output tokens, ~0.4–1.6 s summed over a
+2k–4k token reply; a visible share on small fast models with thinking-length
+outputs. `infr bench` tg128 cannot see it (N = 128).
+
+Fix: incremental decode with `prefix_offset` / `read_offset` (the vLLM / HF
+`TextStreamer` scheme), holding back a trailing U+FFFD; keep the full decode as
+the oracle in a long-sequence equivalence test, and check SPM/metaspace
+leading-space handling at offset 0. Measure: a micro-bench of `stream_token`
+over a 4000-token transcript, then `INFR_PROFILE=1 infr run -n 4000` on a 0.6B.
+
+### B92 — `top_k == 0` and penalised requests fall off GPU sampling and chaining (2026-11-08)
+
+**Tag:** perf · decode · **Verified:** gate read; cost from the in-code
+measurement, not re-measured
+
+The `gpu_sample` gate in `generate_dense_backend` requires
+`(2..=Recorder::SAMPLE_KMAX).contains(&top_k)` and `!penalize`; `can_chain`
+needs `gpu_argmax || gpu_sample`. So Llama-3's shipped defaults (temp 0.6, top_p
+0.9, `top_k = 0`) and any request with repeat/presence/frequency penalties take
+the per-token host path: a submit + wait, a full-vocab logits download and
+`truncated_softmax` on the host (~0.5 ms at n = 128256 per the doc comment in
+`sampling.rs`), no chaining. Estimated 5–10 % of tg on 8B-class, more on small
+models.
+
+Options: extend `Op::Sample` to full-vocab top-p (stage 1 emits per-workgroup
+max / rescaled sum-exp partials so the denominator is full-vocab; fall back to
+the host for the rare token whose top-`SAMPLE_KMAX` set does not reach `top_p`);
+a device penalty kernel over a history buffer is a separate, larger slice.
+Smaller host-side items in the same file: `Penalties::apply` rebuilds a
+`HashSet` of the whole `recent` window per token (O(window) with SipHash); the
+`top_k > SAMPLE_KMAX` arm of `truncated_softmax` allocates a vocab-sized
+`Vec<usize>` per token for `select_nth_unstable_by`. Measure: `infr bench` with
+`--temp 0.6 --top-p 0.9 --top-k 0` vs `--top-k 40`, 0.6B and 8B.
+
+### B93 — serve callbacks run while holding the GPU baton (2026-11-08)
+
+**Tag:** perf · serve `--parallel N` · **Verified:** scope read; cost NOT
+measured
+
+In `generate_dense_backend`'s chained-decode loop, `_gp = req.gate_pass()` lives
+to the end of the iteration, and the `on_token` calls (detokenize — B91 —
+`ChatStream::push`, `StopMatcher`, SSE JSON, channel send) run inside it after
+`execute_chain` has already returned. Every other slot waits on that host work.
+The per-token path has the same shape. Fix: drop the pass once the GPU calls
+return, before the callbacks; teardown takes its own pass. Check first that no
+callback touches the queue or a command pool (the pass's invariant). Measure:
+serve load test with `--parallel 4`, aggregate t/s and inter-token latency.
+
+### B94 — chain k+1 is not submitted until the host has processed chain k (2026-11-08)
+
+**Tag:** perf · decode · **Verified:** PLAUSIBLE design lead
+
+`RecordedCmd::replay_n` (`crates/infr-vulkan/src/recorder.rs`) does
+`queue_submit` then `queue_wait_idle`; the runner then reads the id ring, runs
+the callbacks and uploads before the next submit, so the GPU idles for that
+window every chain (estimated 100–300 µs; 1–3 % of tg). The sampled id and
+position already live on the device, so chain k+1 does not depend on the host
+reading chain k. Lead: submit k+1 behind a fence before draining k, accept an
+overshoot of at most `chain_n` tokens on EOS/stop (rows past `last_written` are
+already ignored), and mind the iGPU submit splitter, abort polling and the
+baton. Measure with `INFR_PROF_STAGES=1` on a 0.6B tg128.
+
+### B95 — CPU spin-pool atomics share a cache line (2026-11-08)
+
+**Tag:** perf · CPU backend · **Verified:** layout read; effect NOT measured
+
+`Shared` in `crates/infr-cpu/src/pool.rs` packs `seq` (spun on by idle workers),
+`cursor` and `done` (hit with `fetch_add` on every task claim / check-in),
+`n_tasks`, `panicked` and `shutdown` next to each other with no alignment, so
+every claim invalidates every spinner's copy of the line. Fix: put `seq` and the
+write-hot counters on separate `#[repr(align(128))]` wrappers — scheduling is
+unchanged, outputs stay bit-identical. Estimate 1–3 % of CPU decode on a
+many-core box; measure with `samply` / `perf c2c` on `infr bench --ngl 0`.
+
+Same backend, smaller: on the m = 1 path of CPU `Op::Linear`
+(`crates/infr-cpu/src/lib.rs`), `quantize_q8` of the activation row runs
+serially per projection, so Q/K/V/gate/up re-quantize the same normed input.
+Estimated well under 1 %.
+
+### B96 — `arch.rs` doc comments contradict the DeepSeek status (2026-11-08)
+
+**Tag:** docs-in-code
+
+The doc comments on `DEEPSEEK32` and `DEEPSEEK4` in
+`crates/infr-llama/src/arch.rs` say nothing emits those archs and "a graph build
+refuses" them. `docs/deepseek.md` records Stage 3 (`deepseek32`) as generating
+on CPU and Vulkan, and Stage 4 slice A (`deepseek4` with all-zero
+`compress_ratios`) as generating; the refusal that remains is the compressed
+tiers (B-DSV4-WIRING). Left alone in this docs-only pass; rewrite both comments
+in the next change that touches `arch.rs`.
+
+### Review coverage gaps (2026-11-08)
+
+Not reviewed by any of the three passes: the Vulkan GLSL shaders beyond
+`sample_topk.comp`; `infr-vulkan` beyond the replay path (`execute_static`,
+prefill build, descriptor churn, the pagers); `infr-metal` entirely; the SIMD
+kernels in `infr-cpu` (`kernels.rs`, `repack.rs`, `moe.rs`, `quant.rs`,
+`turbo.rs`, `kvquant.rs`); `seam/runner.rs` outside the prefix-cache, clamp and
+decode-loop slices; `grammar.rs`, `mtp/`, `diffusion.rs`, `config.rs`;
+`infr-chat`'s `tools.rs` scanner; `infr-hub`'s `ranged.rs`, `parts.rs` and
+`store.rs` selection; most of `infr-cli`'s argument layer; and `infr-core`'s
+config/env layer. Cleared by the correctness pass (do not re-open without new
+evidence): GGUF header parsing bounds, hub path validation and resume, server
+bearer comparison / auth gating / `StopMatcher` / `[DONE]` guard, sampling seed
+and penalty indexing, KV prefix-reuse rules, the template fuel bound, and the
+`unsafe` in `infr-plat` lock/signal, `infr-core` `hostpager.rs`, and `infr-cpu`
+`pool.rs`. Cleared by the perf pass: compiled-template caching, `ChatStream` /
+`StopMatcher` cursors (not quadratic), mapped host-visible `upload`/`download`,
+lazy `token_embd` dequant.
+
+### B97 — docs that should be condensed or restructured (2026-11-08)
+
+**Tag:** docs · **Needs:** a decision on the plan layout
+
+The 2026-11-08 docs pass corrected factual drift in place (DeepSeek status in
+the README table / `docs/README.md` / `plan.md`, MTP marked parked in `mtp.md`
+and `metal.md`, `infr-plat` macOS + Windows memory probes and the `cpu` module,
+the CI `target-cpu=native` triples, `disk-streaming-plan.md` §4.1 / §7, the
+`qwen38.md` 512-expert fix, `audit.md`'s closed Metal and `seed_rng` items, and
+counts that had drifted in `config.md` / `synthetic-models.md`). What it did NOT
+do, because each is a rewrite rather than a correction:
+
+- **`docs/mtp.md`** — the Phase 1–3 build plan is history and MTP is parked;
+  condense to "parked, why, how to revive" and drop the build plan.
+- **`docs/disk-streaming-plan.md`** — phases 0–3 and auto-sizing shipped and
+  B35/B36 hold the residue; collapse §5's phase history to a short record and
+  keep phase 4 (Metal) and the §7 phase-4 question.
+- **Plan layout.** The global working rules put plans in `docs/plan/` with a
+  `00-index.md` and one `NN-name.md` per phase; this repo instead has
+  `docs/plan.md` (whole-system shape + forward work) plus free-standing plan
+  docs (`deepseek.md`, `qwen38.md`, `train.md`, `synthetic-models.md`,
+  `disk-streaming-plan.md`). Options: migrate to `docs/plan/` (one index line
+  per campaign, the campaign docs moved under it), or keep the current layout
+  and say so in `docs/README.md`. Needs the user's call — it moves files every
+  other doc links to.
+- **`docs/plan.md`'s "As built (2026-08-05)" table** is dated and was only
+  patched for the DeepSeek line; re-date it when it is next reviewed whole.
+- **Code comments not swept:** stale references in code comments (e.g. the
+  `arch.rs` DeepSeek comments, B96; `deny.toml`'s wildcard comment, B33) were
+  out of scope for a docs-only pass, and no systematic sweep of comments citing
+  env vars or docs was done.

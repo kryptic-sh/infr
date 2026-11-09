@@ -3182,34 +3182,151 @@ and penalty indexing, KV prefix-reuse rules, the template fuel bound, and the
 `StopMatcher` cursors (not quadratic), mapped host-visible `upload`/`download`,
 lazy `token_embd` dequant.
 
-### B97 — docs that should be condensed or restructured (2026-11-08)
+### B97 — docs still to condense or restructure (2026-11-08, updated 2026-11-10)
 
 **Tag:** docs · **Needs:** a decision on the plan layout
 
-The 2026-11-08 docs pass corrected factual drift in place (DeepSeek status in
-the README table / `docs/README.md` / `plan.md`, MTP marked parked in `mtp.md`
-and `metal.md`, `infr-plat` macOS + Windows memory probes and the `cpu` module,
-the CI `target-cpu=native` triples, `disk-streaming-plan.md` §4.1 / §7, the
-`qwen38.md` 512-expert fix, `audit.md`'s closed Metal and `seed_rng` items, and
-counts that had drifted in `config.md` / `synthetic-models.md`). What it did NOT
-do, because each is a rewrite rather than a correction:
+The 2026-11-10 cleanup retired the shipped parts of the plan docs: `audit.md`
+was deleted (its deferrals are B98), and the finished plan / status sections of
+`diffusion-gemma.md`, `qwen35.md`, `igpu.md`, `perf/cpu.md`,
+`disk-streaming-plan.md` §5 and `plan.md`'s milestone table were cut, their open
+items moved to B35/B36 and B99–B101. Still open:
 
-- **`docs/mtp.md`** — the Phase 1–3 build plan is history and MTP is parked;
-  condense to "parked, why, how to revive" and drop the build plan.
-- **`docs/disk-streaming-plan.md`** — phases 0–3 and auto-sizing shipped and
-  B35/B36 hold the residue; collapse §5's phase history to a short record and
-  keep phase 4 (Metal) and the §7 phase-4 question.
+- **`docs/mtp.md`** — MTP is parked and the Phase 1–3 build plan is history, but
+  code comments in `crates/infr-llama/src/mtp/` cite "mtp.md Phase 1/2/3" by
+  name. Condensing it means rewording those comments in the same change.
 - **Plan layout.** The global working rules put plans in `docs/plan/` with a
-  `00-index.md` and one `NN-name.md` per phase; this repo instead has
-  `docs/plan.md` (whole-system shape + forward work) plus free-standing plan
-  docs (`deepseek.md`, `qwen38.md`, `train.md`, `synthetic-models.md`,
-  `disk-streaming-plan.md`). Options: migrate to `docs/plan/` (one index line
-  per campaign, the campaign docs moved under it), or keep the current layout
-  and say so in `docs/README.md`. Needs the user's call — it moves files every
-  other doc links to.
+  `00-index.md` and one `NN-name.md` per phase; this repo has `docs/plan.md`
+  plus free-standing plan docs (`deepseek.md`, `qwen38.md`, `train.md`,
+  `synthetic-models.md`, `disk-streaming-plan.md`). Options: migrate to
+  `docs/plan/` (one index line per campaign, campaign docs moved under it), or
+  keep the current layout and say so in `docs/README.md`. Needs the user's call
+  — it moves files that code comments and every other doc link to.
 - **`docs/plan.md`'s "As built (2026-08-05)" table** is dated and was only
   patched for the DeepSeek line; re-date it when it is next reviewed whole.
-- **Code comments not swept:** stale references in code comments (e.g. the
-  `arch.rs` DeepSeek comments, B96; `deny.toml`'s wildcard comment, B33) were
-  out of scope for a docs-only pass, and no systematic sweep of comments citing
-  env vars or docs was done.
+- **Code comments not swept:** stale references in code comments (the `arch.rs`
+  DeepSeek comments, B96; `deny.toml`'s wildcard comment, B33) and any comment
+  citing an env var or doc section that has moved.
+
+### B98 — the codebase audit's four deferred findings (2026-07-21, moved 2026-11-10)
+
+**Tag:** audit · **Blocked on:** each is a deliberate deferral, not a blocker
+
+The 2026-07-21 module-by-module audit (`docs/audit.md`, deleted 2026-11-10 —
+`git log -- docs/audit.md` has it) closed 153 of 157 findings. These four were
+deferred, each because the fix risks the byte-identity goldens or is a mass
+migration out of proportion to the defect:
+
+- **`make_compute_kernel` panics on recoverable driver / OOM errors**
+  (`crates/infr-vulkan/src/ops.rs`). `kernel` / `kernel_sg` return a bare
+  `ComputeKernel`, so a late `OUT_OF_DEVICE_MEMORY` during a kernel compile
+  aborts the process. Threading `Result` reaches every recorder dispatch helper
+  that returns `()` (ops / gemm / recorder); the panic message names the kernel
+  and points here. A full `Result`-ification of the recorder dispatch surface is
+  its own effort.
+- **`attn_combine.comp` and the flash kernels (perf / DRY).** `attn_combine`
+  recomputes `mm` / `l` over all `nch` in every lane; the causal-mask +
+  online-softmax rescale block is copy-pasted across the flash kernels; ring
+  `RROW` / `rcap` and the Q8 / f16 vec4 readers are duplicated. Deferred because
+  `attn_combine` is dispatched without a pinned subgroup size (a subgroup reduce
+  would be wrong on a 16-lane device without `requiredSubgroupSize = 32`), the
+  `l` reduce is only within-tolerance rather than byte-identical, and an
+  include-refactor of the flash mask / rescale would perturb their numerics.
+- **The int8 dp4a decode helpers** (`rb` / `ru16` / `f16tof32` / `k4` and the
+  per-format `dpsub` / `wdec`) are copy-pasted across the `native_mmv*` and
+  `native_gemm_mmq_*` shaders, and the `KV_IQ4NL_W` table is duplicated. A
+  shared include has to reconcile per-file conditional helper sets and add
+  `build.rs` include wiring; textual drift risks the compiled SPV on the
+  byte-identity GEMM / MoE goldens.
+- **`qk_norm_rope` vs `_interleaved`, `sample_topk` vs `moe_sample`** look
+  duplicated but differ in push-constant and binding layouts (`kcap` + the SWA
+  ring modulo; two-stage `PASS1` / `PASS2` / `CHAIN` with a buffer-sourced `u`
+  vs single-stage with `u` in the push constant). Folding them means reconciling
+  those structs and the `build.rs` compile list, for a DRY gain.
+
+The audit's cross-cutting `partial_cmp(..).unwrap()` theme (a NaN panics the
+sort) is mostly cleared — the CLI sweep and `infr-prof-rt` use `total_cmp`, and
+the hits in `infr-vulkan/src/adapter.rs` are inside its `#[cfg(test)]` module —
+but **two production sites remain** in `crates/infr-cpu/src/lib.rs`, the CPU
+`MoeFfn` arm's group-limited routing (DeepSeek): the group-score sort and the
+expert sort both `partial_cmp(..).unwrap()`. A NaN router score panics the CPU
+backend there instead of producing a (garbage) selection. Fix: `total_cmp`,
+which keeps the same order for finite values.
+
+### B99 — iGPU perf: beat llama.cpp's Vulkan backend on the iGPU (moved 2026-11-10)
+
+**Tag:** iGPU · **Blocked on:** nothing but priority
+
+Correctness on the iGPU is complete (`docs/igpu.md`); perf was never started. In
+the order the iGPU campaign left them (not re-measured since):
+
+1. **The no-coopmat prefill tier is the whole gap** — pp 11–200 tok/s against
+   thousands on the dGPU. RDNA2 has no cooperative matrix, so prefill falls to
+   the scalar / f16-warp ladder. The dominant lever.
+2. **Re-audit the UMA placement for headroom.** The UMA slice (`4771cda`) made
+   `unified_memory` real in the Vulkan caps, skipped the pointless host →
+   staging → device copy, and let the VRAM guard treat GTT as system RAM; the
+   campaign asked for a re-audit of the headroom it leaves, which was not done.
+3. **Revisit `INFR_UBATCH` on the iGPU.** Rows barely affect submit time now
+   that submits are duration-bounded, so the 128-row prefill cap is likely
+   costing throughput — do a FLOP-aware budget (llama.cpp's shape) before
+   raising it.
+4. **The default-ctx clamp collapsing to 1024** on many models — recorded as a
+   wart during the survey; not re-checked against the current fit ladder (B12).
+
+Operational rule from `docs/igpu.md` applies to every item: never let a timeout
+kill `infr` mid-submit on the iGPU, and run GPU work serially.
+
+### B100 — DiffusionGemma on Metal: unvalidated on hardware, MoE on the host path (moved 2026-11-10)
+
+**Tag:** metal · DiffusionGemma · **Blocked on:** Apple hardware with a DG model
+
+Phase D (Metal denoise) is built and its kernel-level checks run in the macOS CI
+job (`cargo test -p infr-metal -- --include-ignored`: MSL compile, the
+`attention_canvas_split*` parity tests against the CPU reference,
+`kernel_names`). What has never happened is a real DG model on an Apple GPU:
+
+- `infr run --dev metal <dg-gguf>` producing coherent text, including across
+  several self-conditioned steps — the first dispatch of `softmax_wide_f32` and
+  `sc_embT`'s dequant-to-f32 `Linear` at the real `[canvas, vocab]` shape.
+- `infr bench --dev metal <dg-gguf> -p 128 -n 256` giving a sane rate, ideally
+  beside the Vulkan figure on the same machine.
+- On a memory-constrained device, telling the `weight_buf` "would exceed the GPU
+  working set" error (`sc_embT` cached as f32, ~2x its f16 size) apart from a
+  correctness bug.
+
+Separately, **DG's MoE runs on Metal's host path**: the device MoE arm in
+`exec.rs` (`device_ok`) requires separate gate / up banks and no per-expert down
+scale, and DG has a fused `gate_up_exps` plus `ffn_down_exps.scale`. A device
+path for that layout was judged too large to write blind. Metal's canvas
+attention also always takes the split-KV canvas kernel, never the flash / vec
+tiers, so its denoise rate is a conservative lower bound until profiled.
+
+### B101 — CPU backend perf: what the CPU worklist left open (moved 2026-11-10)
+
+**Tag:** perf · CPU backend · **Blocked on:** measurement for item 2
+
+From `docs/perf/cpu.md`'s worklist, whose quant-coverage slices all landed:
+
+1. **Native AVX-512-FP16 / BF16 dots** for f16 / bf16 weights. They already read
+   native 2-byte (bandwidth minimal) but accumulate in f32 after widening; a
+   native dot is a compute-only, prefill-leaning win. Changes accumulation
+   precision → tolerance parity and a re-bless if the f16 / bf16 goldens move.
+2. **Prefill tile tuning to the X3D topology** — size the prefill GEMM tile so
+   the activation tile stays in L1 / L2 while weights stream; the current 8-row
+   tile is a fixed heuristic. Bit-identical. Gated on `perf stat` (LLC / dTLB /
+   backend-stall) showing cache-miss slack; `perf` is not installed on the dev
+   box.
+3. **Op fusion** beyond `GatedActFused` / `RmsNormAdd`: norm → linear and
+   residual chains, so intermediate activations never round-trip to DRAM.
+   Bit-identical if each fused op keeps the same values and order; verify per
+   fusion.
+4. **A VNNI tier for IQ4_XS.** `vec_dot_iq4xs` and `vec_dot_iq4xs_batch` in
+   `crates/infr-cpu/src/kernels.rs` stop at AVX-512BW / AVX2; the other int8
+   formats have VNNI. (VNNI cannot be exercised on any dev or CI box — B3.)
+
+Declined, kept so it is not re-proposed: **DeltaNet input-clone elimination**.
+The DeltaNet arm clones `q/k/v` to split borrows; measured ~216 MB of memcpy per
+512-token prefill on the 9B, about 0.1% of a ~4.7 s prefill, with no RSS cost
+and nothing to clone at decode. Revisit only if a profile flags DeltaNet
+allocation.

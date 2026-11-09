@@ -6,16 +6,12 @@ class generally). Consolidated from the working notes; kept for the durable
 findings and the root-cause trail. Point-in-time operational state (box-wedged
 alarms, per-reboot recipes) has been dropped.
 
-## Status — Phase 1 (correctness) COMPLETE
+## Status
 
-Every README-table model that fits loads and generates coherent text on the
-iGPU; the seam suite is **25/25 on the non-coopmat tier**. UMA support landed
-(`4771cda`). Remaining iGPU work is **Phase 2 (perf) only** — see the end.
-
-- **Phase 1 — correctness first.** Every model in the README perf table runs on
-  the iGPU: loads, generates coherent output, passes the tests. Done.
-- **Phase 2 — perf.** Beat llama.cpp Vulkan on the iGPU. Not started; blocked on
-  nothing but priority.
+Correctness is done: every README-table model that fits loads and generates
+coherent text on the iGPU, the seam suite passes on the non-coopmat tier, and
+UMA support landed (`4771cda`). The remaining work is perf (beat llama.cpp's
+Vulkan backend on the iGPU) and lives in `backlog.md` § B99.
 
 ## The hardware (this box)
 
@@ -177,17 +173,3 @@ RADV then drops the iGPU from enumeration until reboot
 slower than the dGPU — a long prompt + decode is minutes) and never wrap them in
 a tool call that can time out first. GPU runs are **serial**; on UMA, two big
 models concurrently = GTT exhaustion = wedge.
-
-## Phase 2 (perf) — remaining, order
-
-1. **No-coopmat prefill tier is the whole gap** (pp 11-200 tok/s vs thousands on
-   the dGPU). RDNA2 has no cooperative matrix; prefill falls to the
-   scalar/f16-warp ladder. This is the dominant Phase-2 lever.
-2. **UMA placement follow-ups:** `unified_memory` was hardcoded `false` in the
-   Vulkan caps; the host→staging-ring→device copy is a pointless DDR→DDR pass on
-   an APU; the VRAM guard should treat GTT as evictable system RAM. (Landed in
-   the UMA slice; re-audit for headroom.)
-3. **Revisit `INFR_UBATCH` on the iGPU.** Rows barely affect submit time now
-   that submits are duration-bounded, so the 128-row prefill cap is costing
-   throughput — do the FLOP-aware budget (llama.cpp's shape) before raising it.
-4. Class-3 wart: default-ctx clamp collapsing to 1024 on many models.

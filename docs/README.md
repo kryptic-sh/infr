@@ -31,7 +31,7 @@ at that index. It holds:
   recorded dead ends. Read before starting a perf slice.
 - [perf/kernels.md](perf/kernels.md) — cross-backend fast-kernel coverage (24/24
   quant formats on CPU / Vulkan / Metal) and each backend's decode strategy.
-- [perf/cpu.md](perf/cpu.md) — the CPU backend's own roadmap.
+- [perf/cpu.md](perf/cpu.md) — the CPU backend's perf notes and results.
 - [perf/vulkan-review.md](perf/vulkan-review.md) — multi-vendor review: what is
   RDNA3-tuned versus portable, and the per-vendor gaps.
 
@@ -42,7 +42,8 @@ at that index. It holds:
   KV, MTP, and the replay-tape correctness fix.
 - [igpu.md](igpu.md) — integrated-GPU correctness campaign (AMD APU / Intel iGPU
   / Strix Halo class): the UMA heap-table insight, the per-submit watchdog
-  root-cause + submit-splitter fix, and the model survey. Phase 1 complete.
+  root-cause + submit-splitter fix, and the model survey. Correctness done; iGPU
+  perf is `backlog.md` B99.
 
 ## Models & architectures
 
@@ -67,8 +68,7 @@ at that index. It holds:
 
 - [plan.md](plan.md) — the whole-system shape in one place: what shipped against
   the original MVP, the crate layout and backend seam, the step-by-step recipe
-  for **adding a model architecture**, the ranked candidate families, and the
-  original milestones as history.
+  for **adding a model architecture**, and the ranked candidate families.
 - [disk-streaming-plan.md](disk-streaming-plan.md) — tiered weight paging (VRAM
   → DRAM → disk): phases 0–3 landed and engage automatically when a model does
   not fit; phase 4 (Metal) unbuilt; open items in `backlog.md` B35/B36.
@@ -92,11 +92,11 @@ at that index. It holds:
 
 ## Audit
 
-- [audit.md](audit.md) — module-by-module codebase audit for bugs, correctness,
-  perf, DRY, and YAGNI.
 - [backlog.md](backlog.md) — triaged work that is deliberately not done, with
   why (blocked on hardware, scoped out, or declined), plus withdrawn findings
   recorded so they are not rediscovered. The whole-tree correctness reviews that
   used to live in `code-review.md` were folded into it on 2026-08-03 and that
   file deleted: the re-verified findings are B19–B26, and the reviews' cleared /
-  hardening / coverage lists are B27–B29.
+  hardening / coverage lists are B27–B29. The 2026-07-21 module audit
+  (`audit.md`) was retired the same way on 2026-11-10: its four deferred
+  findings are B98.

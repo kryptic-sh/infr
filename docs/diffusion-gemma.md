@@ -2,78 +2,21 @@
 
 ## Status
 
-- **UNIFIED-seam DiffusionGemma, phases 1–4 landed (2026-07-05)**: design (phase
-  0, `0785fcf`), config + weights + causal prefill (phase 1, `ca2575a`), canvas
-  denoise + `AttnMask::Canvas` + self-conditioning (phase 2, `2452786`),
-  entropy-bound block decode + `infr run` wiring (phase 3, `c9983c1`),
-  serve/bench/compare + pre-seam scaffolding removal (phase 4, this doc's
-  update). Built on the SAME transformer runner every other arch uses
-  (`SeamModel` + the per-backend `ChatModel` impls) from day one — no bespoke
-  "engine" seam.
-- **Phase D: Metal denoise, code-complete but hardware-unvalidated.** Written
-  BLIND on a Linux box (same precedent as the KV-quant Metal work — shipped
-  blind, CI-green): a dedicated split-KV canvas kernel
-  (`attention_canvas_f16kv`/`attention_canvas32_f16kv` + their f32 siblings in
-  `crates/infr-metal/shaders/attention.metal`) gives Metal's attention the
-  bidirectional `[lo, kv_len)`-for-every-row reach `AttnMask::Canvas` needs (see
-  "Metal implementation notes" below); `DiffusionGemmaMetalSession`
-  (`crates/infr-llama/src/seam_model.rs`) is the Vulkan session's twin;
-  `infr run`/`serve`/`bench` now route `--dev metal` (`INFR_DEV=metal`) there
-  instead of falling back to CPU. In-graph self-conditioning (`gpu_sc`, Phase B)
-  widened to cover Metal too — its `Op::Softmax`/`Op::Linear` already handled
-  the shape/dtype. Metal hardware validation is deferred to the M3 collaborator
-  (see the checklist at the end of this section); CPU and Vulkan remain the
-  validated backends until then. **Not done in Phase D**: a Metal batched-MoE
-  pipeline — DG's fused MoE shape still runs Metal's per-token host-loop
-  fallback (too large to build blind; same gap as Vulkan, see "Known gaps"
-  below).
-- **What works**: `infr run` (CPU + Vulkan, entropy-bound block-diffusion
-  decode, multi-turn REPL — see the oracle-equivalent captured runs below);
-  `infr serve` (OpenAI `/v1/chat/completions`, streaming + non-streaming,
-  `reasoning_content` split via the shared channel splitter — the exact same
-  `<|channel>thought…<channel|>` markers as the oracle); `infr bench` (DG-aware:
-  reports the block-diffusion shape — pp tok/s, end-to-end generated tok/s, EB
-  steps run, and the "in-step parallel" rate the oracle itself reports — since
-  `llama-bench` has no diffusion mode to compare against); `infr compare` /
-  `infr compare --sweep` (the mainline `llama-bench` route still has nothing to
-  compare against, but the reference fork at `~/Projects/mxaddict/llama.cpp-dg`
-  builds `llama-diffusion-cli` — a real, usable oracle for this arch — so the
-  compare arm shells that out instead of bailing; see "Comparing against the
-  fork oracle" below). CPU==Vulkan cross-backend parity validated per the
-  validation ladder below.
-- **Known gaps** (perf follow-ups, not correctness bugs):
-  - Metal denoise is code-complete (Phase D, see the status bullet above) but
-    **hardware-unvalidated** — nobody has run it on a real Metal device yet. CPU
-    and Vulkan are the only backends whose DG output is confirmed correct.
-  - Metal's canvas attention kernel is a NEW split-KV variant forced on for
-    EVERY row regardless of row count (mirrors the Vulkan `attn_partial` canvas
-    branch's own "perf pass deferred" — see attention.metal) — it never takes
-    Metal's faster flash/flash2/vec tiers, so denoise throughput on Metal is a
-    probably-conservative lower bound until it's profiled.
-  - `sc_embT` (the in-graph self-conditioning soft-embedding weight,
-    `[n_embd, n_vocab]`, `DType::F16`) has no native Metal GEMV — it flows
-    through Metal's generic non-quant `Linear` path, which dequant-caches the
-    WHOLE weight to f32 once per session (~2x the f16 footprint, one host
-    round-trip dequant). Correct, just not the efficient path a quantized weight
-    would get; see `weight_buf`'s VRAM-budget guard for the failure mode if it
-    doesn't fit.
-  - Host-side self-conditioning cost dominates Vulkan decode: the per-step
-    self-conditioning MLP (`self_cond_pre_norm`/gate/up/down) runs on the CPU
-    host, ~190 GFLOP/step, and end-to-end Vulkan decode lands around ~0.9 tok/s
-    as a result.
-  - The denoise graph is rebuilt (recompiled) on every `denoise()` call rather
-    than cached/reused across steps.
-  - The single-dispatch-per-stage batched-MoE Vulkan path doesn't cover DG's
-    fused `ffn_gate_up_exps`/`ffn_down_exps` expert layout — DG's MoE FFN still
-    runs the per-token expert loop on GPU (and, more severely, on CPU: a 256-row
-    canvas × 30 layers × top-8-of-128 experts per-token loop is why the CPU
-    reference denoise is impractically slow for this model size, not just
-    "slower than Vulkan"). Metal shares this gap — Phase D did NOT build a Metal
-    batched-MoE pipeline (too large to write blind); DG's MoE FFN on Metal also
-    falls to the per-token host loop.
-- **Removed in phase 4**: the pre-seam scaffolding (`infr-model`, `infr-decode`,
-  the `infr-engine::Engine` stub) — dead code superseded by the unified runner
-  since phase 1.
+Shipped on CPU and Vulkan, on the same unified transformer runner every other
+arch uses (`SeamModel` + the per-backend `ChatModel` impls): `infr run`
+(entropy-bound block-diffusion decode, multi-turn REPL), `infr serve` (streaming
+and non-streaming, `reasoning_content` split on the
+`<|channel>thought…<channel|>` markers), `infr bench` (DG-aware: pp tok/s,
+generated tok/s, EB steps, in-step-parallel rate) and `infr compare` against the
+reference fork's `llama-diffusion-cli` (see "Comparing against the fork
+oracle"). The canvas-denoise graph is compiled once per shape and reused
+(`DenoiseCache` in `seam/sc.rs`), self-conditioning runs in-graph (`gpu_sc`),
+and `dg-step` beats the fork — current figure in `perf/results.md`.
+
+Metal (Phase D) is built and its kernels are exercised by the macOS CI job's
+`infr-metal` parity suite, but no real DG model has run on an Apple GPU, and
+DG's fused MoE shape still takes Metal's host path. Both are open in
+`backlog.md` § B100.
 
 Block text-diffusion MoE on a **Gemma-4 backbone**. Reference implementation:
 llama.cpp PR #24423 (checked out at `~/Projects/mxaddict/llama.cpp-dg`,
@@ -84,7 +27,7 @@ llama.cpp PR #24423 (checked out at `~/Projects/mxaddict/llama.cpp-dg`,
 This REPLACED the pre-seam scaffolding (`infr-model`/`infr-decode`/the
 `infr-engine::Engine` stub, all dead code) — DiffusionGemma is built on the
 unified transformer runner like every other arch; the scaffolding was deleted in
-phase 4 (see Status above).
+the unified runner's phase 4.
 
 ## Confirmed metadata (real GGUF dump, 2026-07-05)
 
@@ -348,42 +291,17 @@ shipped this way and landed CI-green.
   shape restriction (handles the `[256, vocab]` shape unmodified), and
   `sc_embT`'s `DType::F16` weight already flows through Metal's existing
   non-quant `Linear` path (`weight_buf` + `linear_f32`) — functionally correct,
-  though not a native f16 GEMV (see "Known gaps" above for the perf/memory
-  caveat).
-- **Batched MoE**: NOT built this phase — too large to write blind. DG's fused
-  MoE shape already falls to Metal's per-token host loop (same as Vulkan's own
-  gap for this shape), unchanged by Phase D.
+  though not a native f16 GEMV: `weight_buf` dequant-caches the whole
+  `[n_embd, n_vocab]` weight to f32 once per session (~2x the f16 footprint).
+- **Batched MoE**: NOT built — too large to write blind. Metal's device MoE path
+  requires separate gate/up banks and no down scale (`device_ok` in `exec.rs`'s
+  `MoeFfn` arm), so DG's fused `gate_up_exps` + `ffn_down_exps.scale` falls to
+  the host path (B100).
 
-**Hardware-validation checklist for the M3 collaborator** (each item currently
-unverified):
-
-- [ ] `cargo test --release -p infr-metal -- --include-ignored` on real hardware
-      — confirms the canvas kernels compile+run at all (a syntax slip that
-      Linux's empty-crate `cargo check` can't catch would surface here as an MSL
-      compile error or a GPU validation failure).
-- [ ] `attention_canvas_split32_matches_reference` /
-      `attention_canvas_split8_hd256_matches_reference` (new in
-      `tests/parity.rs`) pass within their `5e-3` relative-error tolerance
-      against the CPU reference — the actual numeric proof the
-      `[lo, kv_len)`-for-every-row math is right, not just that it dispatches.
-- [ ] `cargo test -p infr-metal --test kernel_names -- --include-ignored` —
-      confirms `attention_canvas*` resolve in the compiled MSL library (the
-      tripwire test).
-- [ ] A real DG denoise run (`infr run --dev metal <dg-gguf>`) produces
-      coherent, non-garbage text — the end-to-end smoke test no unit test can
-      substitute for.
-- [ ] `infr bench --dev metal <dg-gguf> -p 128 -n 256` reports a sane
-      (non-crashing, non-degenerate) pp/decode rate, ideally compared against
-      the Vulkan number on the same machine if available.
-- [ ] With self-conditioning on (the default after a step 0), confirm output
-      stays coherent across multiple steps — this exercises `sc_embT`'s
-      dequant-to-f32 Linear path AND the `softmax_wide_f32` kernel at the real
-      `[C, vocab]` shape, neither of which any existing Metal test dispatches at
-      this size.
-- [ ] If any of the above fails on a memory-constrained device, check for the
-      `weight_buf` "would exceed the GPU working set" error specifically
-      (`sc_embT` dequant-caches to f32, ~2x its f16 size) before assuming a
-      correctness bug.
+The kernel-level checks (MSL compile, the `attention_canvas_split*` parity
+tests, `kernel_names`) run in the macOS CI job
+(`cargo test -p infr-metal -- --include-ignored`). The checks that need a real
+DG model on an Apple GPU are in `backlog.md` § B100.
 
 ## Oracle reference outputs (CPU, greedy `-s 42 --temp 0`, captured 2026-07-05)
 

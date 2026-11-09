@@ -70,8 +70,8 @@ pub(crate) fn make_compute_kernel(
     )
     .unwrap_or_else(|e| {
         panic!(
-            "{e} — kernel build does not yet thread Result to this call site (see docs/audit.md \
-             ops.rs finding 2)"
+            "{e} — kernel build does not yet thread Result to this call site (see docs/backlog.md \
+             B98)"
         )
     })
 }

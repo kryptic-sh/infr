@@ -67,7 +67,7 @@ folded into the row so the mismatch is visible). Details in
 
 Useful knobs: `--temp` / `--top-k` / `--top-p` (sampling; `--temp 0` → greedy),
 `--max-new`, `--ctx` — or the `sampling.*` / `device.*` config paths, or their
-`INFR_*` twins. See [Configuration](#configuration).
+`INFR_*` twins. See [`config.md`](../config.md).
 
 **MoE expert placement**: resident when the expert banks fit VRAM (zero config,
 zero change); otherwise every layer pages through a VRAM-resident LRU expert

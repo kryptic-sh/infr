@@ -20,9 +20,9 @@ headline.
 - **[kernels.md](kernels.md)** — cross-backend fast-kernel coverage: which
   weight-quant formats have a native kernel on CPU / Vulkan / Metal, and each
   backend's decode strategy.
-- **[cpu.md](cpu.md)** — the CPU backend's own roadmap: the two-regime model
-  (decode DRAM-bound, prefill cache-bound), the native int8-quant landing
-  history, and what is left.
+- **[cpu.md](cpu.md)** — the CPU backend's perf notes: the two-regime model
+  (decode DRAM-bound, prefill cache-bound) and the native int8-quant landing
+  history. Open items are in `backlog.md` § B101.
 - **[vulkan-review.md](vulkan-review.md)** — multi-vendor review of the Vulkan
   backend: what is RDNA3-tuned versus genuinely portable, and the per-vendor
   gaps (Intel Arc, NVIDIA) that follow from it.

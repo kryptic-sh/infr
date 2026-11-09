@@ -7,8 +7,8 @@
 > whole-system shape in one place. Everything from
 > [Adding a model architecture](#adding-a-model-architecture-the-recipe) on is
 > **forward-looking work**, written to be executable without re-deriving the
-> codebase. The [historical record](#historical-the-original-milestones) of the
-> original DiffusionGemma-era milestones is at the bottom.
+> codebase. The original MVP milestones all shipped; their table is in `git log`
+> (`git log -S'Historical: the original milestones' -- docs/plan.md`).
 >
 > Current state of anything performance-related is NOT here — it is
 > [`docs/perf/`](perf/README.md). The doc index is
@@ -389,30 +389,3 @@ defaults, the `<|turn>` / `<|channel>` / `<|tool_call>` wire format) is **not
 duplicated here** — it is in [`diffusion-gemma.md`](diffusion-gemma.md),
 alongside the denoise-graph design. Read those values from GGUF metadata at
 runtime; do not hardcode them.
-
----
-
-## Historical: the original milestones
-
-The MVP shipped against **autoregressive** decoders (Llama / Qwen2 / Qwen3 /
-Qwen3-MoE / Gemma 3 / Gemma 4) before DiffusionGemma. Kept for the record — the
-acceptance criteria are what each milestone was actually held to.
-
-| #   | Milestone        | Done when                                                            | Status |
-| --- | ---------------- | -------------------------------------------------------------------- | ------ |
-| 1   | compute smoke    | f16 coop-matrix matmul on the GPU matches CPU within tolerance       | ✅     |
-| 2   | core trait       | `Tensor`/`Graph`/`Op`/`Backend` compile; a 2-op graph runs on Vulkan | ✅     |
-| 3   | `infr pull`      | resolve + resumable download into the shared HF cache                | ✅     |
-| 4   | Vulkan backend   | matmul/dequant/rmsnorm/rope/softmax each validated vs CPU            | ✅     |
-| 5   | GGUF loader      | weights upload; tokenizer + embedded chat template exposed           | ✅     |
-| 6   | forward pass     | final logits match llama.cpp top-k on a fixed prompt                 | ✅     |
-| 7   | attention + MoE  | multi-layer forward matches reference (SWA + full + MoE)             | ✅     |
-| 8   | diffusion decode | fixed-seed generation matches the llama.cpp fork's text              | ✅     |
-| 9   | `infr run`       | interactive terminal chat streams a coherent answer                  | ✅     |
-| 10  | `infr serve`     | opencode / Claude Code CLI complete an agentic tool turn             | ✅     |
-| 11  | perf pass        | ongoing — [`perf/playbook.md`](perf/playbook.md)                     | 🔄     |
-| 12  | second backend   | the op-list seam runs on CPU, Vulkan **and** Metal                   | ✅     |
-
-The Metal backend and the CPU reference both arrived through milestone 12, which
-is the load-bearing evidence that the seam holds: neither required a change
-above `compute`.

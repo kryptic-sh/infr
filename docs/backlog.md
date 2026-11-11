@@ -4196,6 +4196,22 @@ test would fail. All six answers were no:
 These are the reviewer's answers from reading the tests, not re-checked. Each is
 the test to write first when the corresponding entry is picked up.
 
+### B143 — the Linux `glslc` install has no retry, and one mirror outage fails the whole run (2026-11-11)
+
+`.github/actions/install-glslc` runs
+`sudo apt-get update && sudo apt-get install -y glslc` once on Linux. On
+2026-11-11 the runners could not resolve `security.ubuntu.com` /
+`archive.ubuntu.com` ("Temporary failure resolving"), and every Linux job of a
+docs-only push failed at that step, twice in a row including a re-run of the
+failed jobs. The Windows branch of the same action already retries its SDK
+install three times for the same reason. Because the publish jobs depend on the
+build jobs, an outage like this during a tag run would skip the release.
+
+Options: the same retry loop on the apt step; or cache the two `.deb` files
+(`glslc`, `libshaderc1`) with `actions/cache` so a warm run needs no mirror at
+all. A retry does not help with an outage that lasts minutes, which this one
+did; the cache does.
+
 ### Review coverage (2026-11-11, remaining areas)
 
 Six read-only reviews, one per area, none of which built or ran anything.

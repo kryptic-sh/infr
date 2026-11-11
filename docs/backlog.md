@@ -3622,16 +3622,9 @@ was then re-read at its call site before being recorded, and B103 was checked
 against the released binaries and a CI job log; "plausible" entries say what was
 not established.
 
-Still not reviewed by this or any earlier pass: `infr-vulkan` apart from
-`pcache.rs` and the replay path (`recorder.rs`, `adapter.rs`, `gemm.rs`, the
-pager, the multi-GPU modules, every GLSL shader — no buffer or address
-arithmetic has been audited); `infr-metal`'s `exec.rs`, pipeline cache and
-shaders, and Metal/Vulkan parity as such; `infr-cpu`'s kernels beyond the Q4_K
-family, `repack.rs`, `moe.rs`, `paged.rs`, `quant.rs` and most op arms;
-`infr-llama`'s `mtp/`, most of `seam/`, `config.rs` and the per-backend chat
-drivers; `infr-gguf`'s `dequant.rs`; `infr-core`'s graph, fusion, host pager and
-budget modules; `infr-engine`, `infr-prof`, `infr-testkit`; and the test suites
-themselves. `infr-server` was not re-read in this pass.
+The areas this pass left unreviewed were taken up the same day; see "Review
+coverage (2026-11-11, remaining areas)" at the end of the next section for what
+is still unread.
 
 ## Remaining-area review 2026-11-11
 
@@ -3921,3 +3914,333 @@ Reported by the reviewer; only the items marked confirmed were re-read.
 - **`x_stride` is ignored by CPU `Op::QkNorm` / `Op::Rope`** and hard-coded in
   `Op::QkNormRope`, where Metal asserts or uses it. They agree for the one
   emitter that passes a non-zero stride.
+
+### B129 — qwen35: DeltaNet state is not zeroed when the slot's token list is empty (2026-11-11)
+
+In `generate_dense_backend` (infr-llama `seam/runner.rs`) the `c.qwen35` arm of
+the `start` computation reuses the recurrent state when
+`pfx == cached.len() && pfx < prompt.len()`, and otherwise zeroes every DeltaNet
+layer's conv and S buffers. With `cached` empty, `pfx` is 0 and equals
+`cached.len()`, so the reuse arm is taken and the zeroing never runs. The
+comment on the `else` arm says it must "ALWAYS zero" precisely because a warmup
+generation dirties these buffers while leaving `cached` empty — but that is the
+one case that cannot reach the `else`.
+
+`SeamKv::reset` (`seam/weights.rs`) only clears `cached`; the buffers keep what
+the last generation left. So the first prompt after a warmup, and the first
+prompt after any KV reset, runs with the DeltaNet state of the previous
+generation. Output stays plausible, which is why it would not have been noticed.
+A freshly forked slot is not affected (`SeamKv::fork` allocates zeroed state),
+and CPU warmup is a no-op.
+
+Confirmed by reading the branch and `reset`. As reported, not re-read: the
+callers of `reset` (the reviewer lists `ParallelSeam::init_slots`,
+`SlotPool::reset_cache`, `chat::reset_session` and the bench `one_rep`). No run
+was made; a test that generates, resets, and compares the next generation
+against a fresh slot would show it. Fix: zero whenever `cached` is empty, or
+have `reset` zero the state.
+
+The same reasoning covers an error return after `cached.truncate(start)`: the
+prefill loop bails on a cancelled request after earlier chunks have already
+advanced the recurrent state, leaving it ahead of `cached`, and a retry that
+extends `cached` reuses it.
+
+### B130 — Vulkan Q8_0 KV: seeding a slot from another copies codes without scales (2026-11-11)
+
+`SeamKv::seed_from` (`seam/weights.rs`) copies `kv_fmt_bytes(fmt, p * row)`
+bytes from offset 0 of each layer's K and V buffer. For Q8_0 that is the
+interleaved size, 34 bytes per 32 elements (`kv_fmt_bytes` in infr-core
+`budget.rs`). The Vulkan Q8 cache is planar — all codes in `[0, cap)`, then all
+f16 scales from `cap` (header of `store_q8.comp`) — so a prefix copy from offset
+0 moves the first `p` rows' codes plus a few rows more, and none of the scales.
+The seeded rows then decode with whatever scales the destination already held:
+zero on a fresh fork, another conversation's on a recycled slot. `cached` is set
+to claim the prefix regardless.
+
+It needs a Q8_0 KV side on Vulkan and a new conversation seeded from a slot
+sharing a prefix, which is the ordinary `serve --parallel` shared-system-prompt
+case. Confirmed by reading `seed_from`, `kv_fmt_bytes` and the shader header.
+Not checked: the CPU and Metal Q8 layouts (if they interleave, the copy is right
+there), and no run was made. Fix: a format-aware copy, or skip seeding for
+planar Q8.
+
+### B131 — chained decode runs qwen35's recurrent state past the stop point (2026-11-11)
+
+Reported by the reviewer; not re-read. `execute_chain` replays all `n` steps of
+a chain on the device, and the host then stops at the first EOS, `max_new` or
+abort and records `last_written`. For a per-position KV cache the extra steps
+are harmless because rows past `last_written` are ignored (B94 leans on the same
+fact). That does not hold for qwen35, whose `Conv1dSilu` / `DeltaNet` ops update
+one persistent state in place: after a stop mid-chain the state has also
+consumed the stop token and whatever was sampled after it, and a next prompt
+that exactly extends `cached` reuses it.
+
+Not established: that the DeltaNet kernel mutates state on every replayed step
+(taken from the comment in `decode_eligible`, kernel not read), and the size of
+the effect. Worth settling together with B129, which shares the test.
+
+### B132 — the sliding-window ring's rewind guard trusts `cached.len()` as the high-water mark (2026-11-11)
+
+The guard after the `start` computation in `generate_dense_backend` computes
+`live_from = cached.len() - rows_l` to decide whether a rewind would read
+recycled ring rows, and is skipped entirely when `start == cached.len()`. But
+positions written can exceed `cached.len()`: an aborted prefill has already
+truncated `cached` to `start` and then written chunks past it, and a turn that
+rewinds and ends shorter than an earlier turn leaves the earlier turn's rows in
+the ring. In both cases the guard passes while rows inside the window belong to
+other positions.
+
+The guard itself is confirmed by reading. The scenarios are the reviewer's
+reasoning and rest on the ring writing at `pos % rows`; no backend kernel was
+read for this and no run was made. It affects only sliding-window layers (Gemma)
+with the ring enabled. Fix: track the highest position written per slot rather
+than inferring it from `cached`.
+
+### B133 — malformed-GGUF panics in the loader (2026-11-11)
+
+As reported; the dequant sites were looked at, the rest not re-read.
+
+- `dequant_block`'s F32 arm (infr-gguf `dequant.rs`) uses a `bytemuck` slice
+  cast, which panics on a slice that is not 4-aligned, and the parser does not
+  check a tensor's data offset against `general.alignment`.
+- The I2S arm of `dequant_codebook` assumes the element count is a multiple of
+  128 (its comment says so) while the loader enforces only a multiple of 4, so a
+  tail group indexes past the packed codes.
+- `Config::from_gguf` accepts `ssm.conv_kernel = 0` and a Gemma 4
+  `shared_kv_layers` at or above `n_layer - 1`; `ssm_d_conv - 1` and
+  `Config::kv_src_layer` then underflow.
+- `expert_weights_scale` defaults to 0.0 for `deepseek` / `deepseek2`
+  (confirmed: `unwrap_or(0.0)` in `from_gguf`), which zeroes the routed experts
+  if the key is absent. `docs/deepseek.md` documents the default; requiring the
+  key, as the V4 block already does, would turn a silent wrong answer into an
+  error.
+
+### B134 — the host weight tier never promotes on a hit, so its LRU is insertion order (2026-11-11)
+
+`HostPager::pin` (infr-core `hostpager.rs`) serves a resident block through
+`Pager::pin_if_resident`, which bumps the epoch, the hit counter and the pin
+count but does not call `mark_mru`. The promoting path is the `Hit` arm of
+`Pager::resolve_and_pin`, which `HostPager::pin` only reaches for a block that
+is not yet resident. So the `Insert::Mru` argument decides where a miss is
+placed and nothing else: the DRAM tier evicts in admission order, and an expert
+admitted early and used constantly is evicted before a cold one admitted later.
+`docs/disk-streaming-plan.md` intends both tiers to share one notion of which
+experts are hot.
+
+Confirmed by reading both `Pager` functions and `HostPager::pin`. This affects
+hit rate, not output. Not measured, and the reviewer notes no host-pager test
+asserts recency order. `Insert::Cold` callers are unaffected by design.
+
+### B135 — a panic inside a block read strands the block as `Loading` (2026-11-11)
+
+Reported, not re-read. `HostPager::pin` and `HostPager::fill` mark a slot
+`SlotState::Loading` under the lock, read with the lock released, and restore
+the state only when the read returns `Err`; there is no drop guard. A panic in
+the read — `read_pieces` in `blockio.rs` spawns scoped threads and `expect`s
+their joins, so thread-creation failure is enough — leaves the slot unevictable
+and every later `pin` or `fill` of that block waiting on the `ready` condvar
+with no timeout. In `serve` that is a request hung while holding its slot.
+
+### B136 — the pipeline-cache tripwire judges a crashed run by pid alone (2026-11-11)
+
+`KernelCache::discard_if_a_seeded_run_died` (infr-core `kernel_cache.rs`) treats
+a marker `<stem>.seeded.<pid>-<nonce>` as "a concurrent infr" whenever
+`pid_alive(pid)` holds, with no boot id or process start time. Two cases defeat
+it: a container in which infr always gets the same pid (the crashed run's marker
+names the pid of the run now checking it, so the poisoned blob is kept and
+re-seeded every launch), and a reboot after a hung GPU, when the old pid belongs
+to an unrelated process. The second can also discard a good cache later, once
+that process exits.
+
+The pid-only liveness test is confirmed by reading; the marker naming and the
+container case are as reported. How often either happens is unknown. See the
+poisoned-pipeline-cache incident this module was written for.
+
+### B137 — `infr serve`: findings from the re-read (2026-11-11)
+
+- **Streaming usage and `response_format` are accepted and ignored.**
+  `ChatRequest` (infr-server `lib.rs`) has no `stream_options` or
+  `response_format` field and ignores unknown fields, so a streaming client that
+  asks for usage gets none, and a client that asks for JSON output gets
+  unconstrained text with a 200. Confirmed: neither name occurs in the server
+  source. The OpenAI behaviour (a final chunk carrying `usage` before `[DONE]`)
+  is from memory of the API. The second is the more serious one — either
+  implement it over the existing grammar path or reject it.
+- **The bearer check runs after the body is parsed.** `chat_completions_handler`
+  takes the JSON body as an extractor argument, and the comment on its first
+  statement says auth is "checked before any work". The signature and comment
+  are confirmed; that axum resolves extractors before the handler body runs is
+  from memory of axum. An unauthenticated client can make the server buffer and
+  deserialize a body up to the default limit. Moving the check into a middleware
+  layer fixes it.
+- **No `Host` / `Origin` validation on the default keyless loopback server.** A
+  web page that rebinds its hostname to `127.0.0.1` becomes same-origin and
+  could drive completions and read `/status` and `/metrics`. Reported from
+  reading `build_router`; the attack was not tried. Needs a decision: validate
+  `Host` when bound to loopback, or document it. Distinct from B5.
+- **Smaller:** `seed` and `max_tokens` are unsigned (confirmed), so the `-1`
+  sentinels some llama.cpp-style clients send are a 400; the SSE response sets
+  no keep-alive, so nothing is sent during a long prefill or a forced tool call
+  and an idle-timeout proxy may cut the stream; a 401 body carries
+  `type: "server_error"`.
+
+### B138 — smaller infr-core findings (2026-11-11)
+
+- **`cpu_arena_plan` (`hostmem.rs`) has no headroom in its fit test.** It
+  returns `Skip::Fits` when `pageable <= available` (confirmed, and a unit test
+  pins "exactly fitting still counts"), while the arena it would otherwise size
+  keeps headroom free. A model that just fits stays on mmap and competes with
+  KV, activations and the repack cache for the same RAM. Not measured.
+- **Fusion patterns no backend plans.** Reported: `plan_rmsnorm_linear` and
+  `plan_moe_add` in `fusion.rs` are reachable only from tests, and
+  `plan_rmsnorm_linear` does not check that the norm's raw input is unwritten
+  before its last consumer, which would matter if it were ever enabled.
+  `dst_only_read_by_next`'s doc says a backend post-filters with it; nothing
+  outside `fusion.rs` calls it. Candidates for deletion rather than repair.
+
+### B139 — the shared parity harness passes an all-NaN result (2026-11-11)
+
+`check_linear` in `infr-testkit` computes the error as
+`.map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)`. `f32::max` returns the
+non-NaN operand, so a backend that outputs NaN for every element yields
+`abs = 0`, and `CaseReport::ok` (`ref_mag > 1e-3 && rel < tol`) is true because
+`ref_mag` comes from the finite oracle. Every sweep built on the harness
+inherits this: `infr-cpu/tests/decode_parity.rs` and the Vulkan and Metal
+`shared_decode_parity.rs`. The harness guards against a vacuous all-zero oracle
+but not against this.
+
+Confirmed by reading `check_linear` and `ok`. The reviewer reports the same fold
+in `cpu_production_matches_the_reference_backend`, in `check` (infr-vulkan
+`gemm.rs` tests), in `maxerr` (infr-vulkan `lib.rs` tests) and in `max_abs_diff`
+(`synthetic_deepseek2.rs`); those were not re-read. This is the same defect
+already recorded for `maxerr` / `maxerr64` in `seam_op_parity.rs`, in more
+places. Fix: fail on any non-finite `got`, or fold with a NaN-propagating max.
+It matters more now that B116 describes a path that can produce NaN.
+
+### B140 — tests that CI reports as passed without running them (2026-11-11)
+
+- **Model-gated unit tests in infr-llama.** The `cpu-goldens` job downloads
+  Qwen3-0.6B but runs only
+  `cargo test --release -p infr-llama --test cpu_backend` (confirmed in
+  `ci.yml`); the library test binary runs only in the model-less matrix, where
+  these return early. Reported as affected: the three grammar tests
+  (`constrained_step_honours_sampler_and_stays_in_grammar`,
+  `a_forced_run_is_cut_to_the_budget`, `forced_grammar_constrains_first_token`),
+  two tokenizer tests, and `loads_and_dims` in `qwen35.rs`. So forced-tool-call
+  grammar masking has no executed test in CI. Adding `--lib` to that job would
+  run the first group.
+- **Metal model-level tests.** The `metal_*` tests in `cpu_backend.rs` are
+  macOS-only and model-gated, and `test-macos` runs only `-p infr-metal` and
+  downloads nothing (confirmed in `ci.yml`). Metal's runner, session, slot pool
+  and sampling integration therefore never executes anywhere — no one on the
+  project has a Metal device. `docs/ci-matrix.md` was corrected on this point.
+- **Vulkan tests that return silently without a device.** Reported: a set of
+  non-ignored Vulkan tests (the six in `kv_q8_roundtrip.rs`,
+  `attn_decode_is_bit_identical_to_attn_partial`, the `mrow` / `mmv_mrow` parity
+  tests, `attention_small_m_split_matches_host`, and others in
+  `infr-vulkan/src/lib.rs`) self-skip when no device is found, and the Linux and
+  Windows runners have none. Not re-read. Either `#[ignore]` them like the rest
+  of the GPU suite or print a skip the log can be grepped for.
+- **Windows golden hashes** (`per_os(windows, …)` in `QWEN3_GOLDEN` and
+  `GEMMA3_GOLDEN`) are never asserted: `cpu-goldens` is Ubuntu-only.
+
+### B141 — assertions weaker than the tests' names (2026-11-11)
+
+- **The KV-format "coherent" tests assert only `!is_degenerate(out)`**, which is
+  "at least 8 characters with at most 2 distinct ones" (confirmed). Empty output
+  and arbitrary garbage pass, and so does an implementation that ignores the KV
+  dtype entirely. These are `cpu_kv_q8_coherent`, `cpu_kv_turbo_coherent`,
+  `cpu_kv_mainline_quants_coherent` and the Vulkan twins. Per the reviewer, CPU
+  `Op::WriteKv` and quantised-KV `Op::Attention` have no numeric assertion in
+  any Linux CI test; only the quantisers have unit round-trips.
+- **`q5_1_saturates_to_31` (infr-cpu `kvquant.rs`) does not test the clamp.**
+  Its ramp input never produces a code above 31 with or without the `.min(31)`
+  (the first half confirmed), and its second half asserts an expression local to
+  the test. Removing the clamp from `q5_1_block` leaves it green.
+- **Reported, not re-read:** the Vulkan attention-vs-host tests in `adapter.rs`
+  use an absolute tolerance of `2e-2` against outputs that span about ±0.04, so
+  scaling the scores by 0.5 or dropping a causal key still passes (the reviewer
+  recomputed the tests' own data); `metal_kv_scratch_paths_are_coherent` pins
+  one hash for eight KV formats with no f16 control;
+  `mtp_head_trunk_acceptance_rate` prints the rate and asserts nothing about it;
+  `warp_ag_isa_probe` compares a kernel with itself at two offsets; `mla_parity`
+  uses identical K rows, so its output is independent of the attention weights;
+  no Metal parity test names `Op::CopyStrided`, `MulVec`, `Softmax`, `TopkMask`
+  or `RmsNormAdd`.
+- **Hygiene, reported:** `test_serial_lock` and `gpu_serial_lock` are in-process
+  mutexes, which do nothing under nextest's process-per-test model if the
+  ignored GPU tests are ever run that way; the SIMD tier tests cover only the
+  tiers the runner's CPU has; and B3 says no dev or CI machine has `avx512vnni`
+  while a comment in `kernels.rs` says the dev box does — one of the two is
+  stale.
+
+### B142 — none of this review's bugs has a test that would catch it (2026-11-11)
+
+The test reviewer was asked, for six of the findings above, whether an existing
+test would fail. All six answers were no:
+
+- B129 (qwen35 after a reset): no test calls `SeamKv::reset`, `reset_cache` or
+  `reset_session`; `unified_qwen35_session_no_rewind` diverges with a non-empty
+  `cached`, which takes the zeroing arm.
+- B130 (Q8 KV seeded from another slot): `gpu_seam_multi_slot_prefix_sharing`
+  uses f16 KV; the Q8 tests run one conversation.
+- B116 (quantised-KV prefill off a tile boundary): the tests that probably reach
+  it assert only non-degenerate output.
+- B122 (262144-row head): no GEMV test is that tall, and a token comparison
+  cannot see an out-of-bounds read.
+- B123 (`in_f % 64 == 32`): every native GEMM shape tested uses a width of 64,
+  256, 512 or 2048.
+- B125 (Metal sampling on a llama-family model): the sampling test uses Qwen3
+  and compares Metal with Metal; the Llama test is greedy; neither runs in CI.
+
+These are the reviewer's answers from reading the tests, not re-checked. Each is
+the test to write first when the corresponding entry is picked up.
+
+### Review coverage (2026-11-11, remaining areas)
+
+Six read-only reviews, one per area, none of which built or ran anything.
+Findings were re-read at their sites as stated per entry; where an entry says
+"reported", it was not.
+
+What these passes read, in the reviewers' own accounting:
+
+- **infr-vulkan Rust:** `ops.rs`, `pager.rs`, `spirv.rs`, `vkext.rs` in full;
+  large parts of `lib.rs`, `recorder.rs` and `adapter.rs`. Not opened:
+  `build.rs`, `caps.rs`, `tp.rs`, `tp_allreduce.rs`, `ep.rs`, `pipeline.rs`,
+  `linear.rs`, `matmul.rs`. Most op-recording methods in `recorder.rs` and most
+  of `lower_op` outside attention and MoE were not read.
+- **Shaders:** the GEMV / mmv family, `native_gemm`, `native_gemm_warp`,
+  `native_gemm_mmq_q4k`, the attention and KV kernels, and the shared decode
+  includes in full, with push-constant layouts cross-checked against the Rust
+  fill sites. The other mmq variants, the fused flash kernels, `mla`,
+  `lightning_indexer`, the `moe_*`, `deltanet*`, `hyper_*` and elementwise
+  kernels were checked for push-block size and bindings only. The turbo tables,
+  the dp4a decoders in the unread mmq files and all DeltaNet math were not
+  compared against a reference.
+- **infr-metal:** `lib.rs`, `shaders.rs` and the non-test code of `exec.rs` in
+  full; the `.metal` sources only in part. Not opened: `pcache_blob.rs`,
+  `profile.rs`, `common.metal`, the tests.
+- **infr-cpu:** `quant.rs`, `moe.rs`, `repack.rs`, `paged.rs`, `kvquant.rs` in
+  full; most of `lib.rs`. In `kernels.rs` the Q4_K, Q2_K and Q6_K families and
+  the 32-block VNNI tile were read; the Q3_K, Q5_K, IQ4_XS and Q8_0 single-row
+  kernels, most batch kernels and the other 32-block families were not. Not
+  opened: `turbo.rs`, `pool.rs`.
+- **infr-llama:** `config.rs`, `kv.rs`, `quant.rs`, `weights.rs`, `arch.rs` in
+  full; about half of `seam/runner.rs` (the generation loop and the common
+  attention emission); little of `seam/mod.rs`, `seam/model.rs`. Not read: the
+  DeltaNet, MLA, DeepSeek V4 and MoE emitters, the denoise and verify paths,
+  `seam/sc.rs`, `seam/dsv4_plan.rs`, almost all of `mtp/` (only that it is
+  parked was confirmed), `qwen35.rs`.
+- **infr-gguf:** `lib.rs` and `dequant.rs` in full. NVFP4, Q2_0 and the I2S
+  layout could not be checked against a reference.
+- **infr-core, infr-server, infr-engine, infr-prof, infr-prof-rt:** non-test
+  code in full, except `iquant_grids.rs` and `config/manifest.rs`.
+  `infr-testkit` in full.
+- **Tests:** the harness, the three `shared_decode_parity` files and
+  `warp_gemm_parity.rs` in full; about half of `cpu_backend.rs`; the rest by
+  outline. Most Vulkan and Metal integration test files and most `cfg(test)`
+  modules were not opened.
+
+Not reviewed by any pass: `infr-cli`, `infr-hub`, `infr-chat` and `infr-plat`
+were outside these six areas (parts of each were read on 2026-11-08 and earlier
+on 2026-11-11).

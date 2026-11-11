@@ -37,8 +37,11 @@ surface minutes later as a `build.rs` panic on whichever job reached
   the blob link, and a GGUF open, on an actual Windows filesystem. It is the
   only place `link_blob`'s hard-link fallback runs — a GitHub runner's account
   has no `SeCreateSymbolicLinkPrivilege`, so `symlink_file` is refused there.
-  Windows-only because the Linux and macOS legs already reach this path through
-  `cpu-goldens` and `test-macos`.
+  Windows-only, though the other legs cover less of this path than that
+  suggests: `cpu-goldens` fetches its models with `hf download` and then opens
+  them from the cache, so on Linux only the cache layout and the GGUF open are
+  exercised, not infr's own downloader; and `test-macos` downloads no model at
+  all (backlog B140).
 - **`metal-check`** cross-lints for `aarch64-apple-darwin` from the Linux
   runner. It covers the nine crates that cross-build; `ring` (via rustls →
   reqwest → infr-hub) and `esaxx-rs` (via tokenizers → infr-chat/infr-llama) are

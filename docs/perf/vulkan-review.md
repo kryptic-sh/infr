@@ -222,9 +222,9 @@ of the nc_fa kernel. **Cost:** one new shader variant, one new `build.rs` entry,
 
 **What happens:** Every tiled GEMM (coopmat, nc*mmq, nc_fma) that writes to a
 non-Internal tensor (e.g., the lm_head `logits` Output) allocates a temporary
-`ceil(m/64)*64`-row buffer via `be\*.alloc_uninit`, fills it, then copies the `m`
-real rows back. This allocation happens ONCE per forward on the lm_head path —
-intermediate layers produce Internal tensors and skip the copy.
+`ceil(m/64)*64`-row buffer via `be\*.alloc_uninit`, fills it, then copies the
+`m` real rows back. This allocation happens ONCE per forward on the lm_head path
+— intermediate layers produce Internal tensors and skip the copy.
 
 **Impact:** Low. The lm_head is one op near the end of the forward, allocating a
 buffer sized `vocab_size * n_embd * dtype_bytes`. For Qwen3-8B (vocab 152064,

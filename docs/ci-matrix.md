@@ -56,6 +56,12 @@ surface minutes later as a `build.rs` panic on whichever job reached
   not add an arm for a triple that is also a cross target, for the same reason:
   a `[target.<triple>]` table applies whenever that triple is the build target,
   whatever the host.
+- **Those tables do not apply on the runners.** The
+  `actions-rust-lang/setup-rust-toolchain` step exports `RUSTFLAGS=-D warnings`
+  by default, and an environment `RUSTFLAGS` replaces `[target.*] rustflags`
+  wholesale. So CI builds, tests and packages a baseline-CPU binary, and
+  `target-cpu=native` is a local-build setting only. The release archives rely
+  on this without saying so — `backlog.md` B103.
 - **The Windows leg builds `msvc`,** while a local cross-lint from Linux must
   use `x86_64-pc-windows-gnu` (`msvc` wants `lib.exe`). Different ABI, so a
   local cross-lint is a fast pre-check and not a substitute for the runner.

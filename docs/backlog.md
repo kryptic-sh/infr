@@ -3378,3 +3378,251 @@ What that leaves unverified:
   comparison that was only possible for `deepseek-llm` can now be run for it.
 - **Stage 1's `gpu_seam_matches_cpu_deepseek` is still not written** — recorded
   in `deepseek.md` § Stage 1, repeated here so it is not only in a plan.
+
+### B103 — the released binaries' CPU baseline is an accident of a CI action (2026-11-11)
+
+**Tag:** release / CI · **Kind:** fragile, not currently broken
+
+`.cargo/config.toml` sets `-C target-cpu=native` for `x86_64-unknown-linux-gnu`
+and `x86_64-pc-windows-msvc`, and the `dist` job in `.github/workflows/ci.yml`
+builds exactly those triples with no flags of its own. Read alone, that says the
+release archives are compiled for whatever CPU the runner had, and would
+`SIGILL` on an older one.
+
+They are not. Disassembling the v0.2.0 release assets shows a baseline build:
+legacy-SSE moves outnumber VEX ones 168838 to 4877 in the Linux binary and
+193129 to 6653 in the Windows one, which a `native` build on an AVX2 runner
+would invert. The AVX2/AVX-512 code present is the runtime-dispatched kernels.
+
+The reason is in the job log, not the repo:
+`actions-rust-lang/setup-rust-toolchain` exports `RUSTFLAGS=-D warnings` by
+default, and an environment `RUSTFLAGS` replaces `[target.*] rustflags`
+wholesale. So:
+
+- **The shipped baseline depends on a default of a third-party action.** Pass
+  `rustflags: ""` to it, or pin its version differently, and the next release
+  silently becomes runner-specific. Nothing in the workflow states the intended
+  baseline. Fix: set it explicitly in `dist` (for example
+  `RUSTFLAGS: -C target-cpu=x86-64-v2`, or whatever floor the runtime dispatch
+  assumes) and add an artifact check — a VEX/legacy ratio or a `zmm` count
+  outside the kernel modules.
+- **Every CI job that uses that action tests the baseline build, not the
+  `native` one developers run.** The comment in `.cargo/config.toml` says the
+  CPU backend leans on host-CPU autovectorisation; that code path as compiled
+  locally is therefore never what CI's `cargo test` or the CPU goldens execute.
+  `docs/ci-matrix.md` now says so.
+- **Not checked:** the macOS x86_64 asset, which has no rustflags table at all
+  and so compiles every `f32::mul_add` in the CPU backend without FMA; whether
+  that is a libm call per element there was reported by the review and not
+  measured.
+
+### B104 — the embedded SentencePiece tokenizer cannot produce multi-space tokens (2026-11-11)
+
+**Tag:** tokenizer · **Kind:** correctness, mechanism confirmed, ids not
+compared
+
+`build_spm_tokenizer` in `crates/infr-llama/src/tokenizer.rs` installs
+`Metaspace::new('▁', scheme, true)`. The third argument is `split`, and in the
+resolved `tokenizers` crate `Metaspace::pre_tokenize` then splits on every `▁`
+with `MergedWithNext`. Four leading spaces become four separate pre-tokens
+before BPE runs, so any vocabulary piece with a `▁` after its first character
+(`▁▁`, `▁▁▁▁`, Gemma's whitespace-run tokens) is unreachable. llama.cpp's SPM
+tokenizer runs over the whole escaped text. Indented code in a prompt would
+therefore get different ids from the reference on every GGUF whose
+`tokenizer.ggml.model` is `llama` or `gemma4` and that has no `tokenizer.json`
+beside it.
+
+Verified: the call site and the crate's `split` branch. NOT verified: an actual
+id mismatch against `llama-tokenize`. Do that first — indentation-heavy text on
+a Gemma GGUF — then pass `split = false` and pin the comparison as a test.
+
+### B105 — a tool-call marker inside reasoning hides the real call from the stream (2026-11-11)
+
+**Tag:** serve / tool calling · **Kind:** correctness, confirmed by reading
+
+`ChatStream::tool_open_at` in `crates/infr-chat/src/stream.rs` looks for
+`<tool_call>` with `self.cur_tool.find(..).filter(|&p| p >= cs)`. `Cursor::find`
+scans from the start of `raw` and LATCHES the first hit in `off`, returning it
+forever after. If the model mentions `<tool_call>` inside its think block, that
+position is below the content start `cs`, the filter rejects it, and the cursor
+never searches again. The real call in the content region then streams out as
+`Delta::Content` — raw `<tool_call>{…}</tool_call>` text — and `finish`
+additionally emits the parsed `Delta::ToolCall`. `cur_pipe` has the same shape
+for the channel format.
+
+Fix: do not latch a hit below `cs` (search from `cs`), and add a test with a
+marker inside reasoning — none exists. Related and lower: the review also
+reported that content before a `<think>` opener at an offset above zero is never
+streamed although `split_think` keeps it on the non-streaming path; not
+re-verified here.
+
+### B106 — an unmapped `tokenizer.ggml.pre` silently gets the GPT-2 regex (2026-11-11)
+
+**Tag:** tokenizer · **Kind:** correctness, plausible
+
+`build_tokenizer`'s `match pre` in `crates/infr-llama/src/tokenizer.rs` maps the
+three `deepseek-*` pre-types, `qwen2` and `llama4`. Everything else falls to the
+`_` arm: `ByteLevel::new(add_prefix, true, true)`, the GPT-2 regex, with no
+warning. A BPE GGUF whose pre-type has a different regex in llama.cpp (Llama-3's
+`llama-bpe` is the reported case: digit grouping in threes, different
+newline-run and punctuation rules) would tokenize differently from the
+reference, silently.
+
+Verified: the fallback arm. NOT verified: which pre-type any supported GGUF
+actually declares — no Llama-3 file was dumped — so this may or may not bite a
+model in the README table. Check with `infr-gguf`'s `dump` example, then either
+add the regex or make an unmapped pre-type a loud warning.
+
+### B107 — end-of-turn detection is a fixed three-name list (2026-11-11)
+
+**Tag:** generation · **Kind:** correctness, plausible
+
+Stop ids are the GGUF's `tokenizer.ggml.eos_token_id` plus whichever of
+`<|im_end|>`, `<|endoftext|>`, `<|eot_id|>` the vocabulary has (`add_chat_eos`
+in `crates/infr-llama/src/util.rs`). `tokenizer.ggml.eot_token_id` and
+`eom_token_id` are read nowhere under `crates/`, and neither `<end_of_turn>`,
+`<|eom_id|>` nor `<|end|>` is in the list. A file whose declared EOS is not its
+turn terminator runs past the end of its turn until `max_tokens`; because the
+marker is a special token and decoding skips those, the visible symptom is the
+model continuing into an invented next turn.
+
+`plan.md`'s recipe step 6 already warns about this list. What is new is that the
+two metadata keys exist and are unused. NOT verified: that any supported model
+is affected — the Gemma goldens pass, which suggests those files declare
+`<end_of_turn>` as EOS. Fix: read both keys, and extend the name list to
+llama.cpp's end-of-generation set.
+
+### B108 — CPU attention converts the whole KV prefix per layer per token (2026-11-11)
+
+**Tag:** CPU perf · **Kind:** perf, confirmed by reading, not measured
+
+In the `Op::Attention` arm of `crates/infr-cpu/src/lib.rs`, the `deq` closure
+builds a fresh `Vec<f32>` of the K cache and another of the V cache —
+`min(kv_len, cap_rows) * n_kv * head_dim` elements each — before the per-head
+loop, on one thread, on every call. For the default F16 KV that is a scalar
+`f16 -> f32` per element; for F32 KV it is a `.to_vec()` of data that could be
+borrowed; for a sliding-window layer on a non-ring cache it converts the whole
+prefix when only the window is read. The cost grows linearly with context depth
+and is paid once per layer per decoded token.
+
+Belongs with B101. Options: borrow F32 directly; convert only the rows the mask
+admits; do the conversion per head inside the pool; or keep an incrementally
+extended f32 shadow. Measure first (`samply`, deep context) — the review's
+estimate of the cost was arithmetic, not a profile.
+
+### B109 — Metal `alloc` never checks for a nil buffer (2026-11-11)
+
+**Tag:** Metal · **Kind:** soundness, plausible, not run on hardware
+
+`MetalBackend::alloc` in `crates/infr-metal/src/lib.rs` calls
+`new_buffer(len, StorageModeShared)` and immediately
+`ptr::write_bytes(raw.contents(), 0, len)`. Metal returns nil when the length
+exceeds the device's maximum buffer length or memory is exhausted; `contents()`
+on nil is null, so this is a null write — a segfault where Vulkan reports a
+clean "does not fit". `alloc_uninit` and `upload` were reported to have the same
+shape and were not re-read here. Fix: check for null (and against the device's
+max buffer length) and return `Err`.
+
+### B110 — hub selection: cached-quant fallback and the mmproj ordering (2026-11-11)
+
+**Tag:** hub · **Kind:** one decision, one bug
+
+`infr_hub::ensure` asks the local store before the network, and `pick_gguf` in
+`crates/infr-hub/src/store.rs`, given no explicit quant and no cached
+`DEFAULT_QUANT`, returns `fallback_quant`: the first non-float GGUF in the order
+`snapshot_ggufs` got from `read_dir`, which is not sorted.
+
+- **Decision needed.** After `infr pull org/repo:Q8_0`, a bare
+  `infr run org/repo` runs the cached Q8_0 rather than fetching the default
+  quant. That is defensible (do not download gigabytes unasked) or surprising
+  (the same command means different models on different machines). If kept, it
+  should be deterministic — sort — and say which file it chose.
+- **Bug.** `Match::Exact` returns before the `is_mmproj` exclusion, so
+  `org/repo:F16` or `:Q8_0` can select an `mmproj-…-f16.gguf` projector as the
+  weights when it comes first. Skip mmproj files before matching. `is_mmproj`
+  also only recognises a leading `mmproj`, not a `name.mmproj-Q8_0.gguf` form.
+
+### B111 — DiffusionGemma's RNG maps every even seed onto the next odd one (2026-11-11)
+
+**Tag:** diffusion · **Kind:** correctness, confirmed by reading
+
+`Rng::new` in `crates/infr-llama/src/diffusion.rs` is `Self(seed | 1)`, so
+`--seed 2` and `--seed 3` produce identical output. Its comment says the `| 1`
+only guards a zero seed. The autoregressive path fixed the same collapse in
+`sampling::legal_xorshift_state`, whose doc records that the two copies of the
+policy had drifted once already; this is a third copy. Fix: call
+`legal_xorshift_state`.
+
+### B112 — a `tokenizer.json` beside the GGUF is trusted without a check (2026-11-11)
+
+**Tag:** tokenizer / serve · **Kind:** correctness, confirmed by reading
+
+`resolve` in `crates/infr-cli/src/main.rs` adopts any `tokenizer.json` in the
+GGUF's directory. Nothing compares it with the GGUF's own vocabulary, so a flat
+folder of several local models with one stray sidecar makes every model in it
+encode with the wrong vocabulary — garbage output, no error. Separately,
+`OaiRenderer::open` in `crates/infr-llama/src/chat/mod.rs` always calls
+`build_tokenizer(&gguf)`, so under `infr serve` the template renderer and the
+forced-tool grammar use the EMBEDDED tokenizer while generation uses the
+sidecar. Fix: validate the sidecar against `tokenizer.ggml.tokens` (size plus a
+sample) and fall back with a warning; hand the model's tokenizer to
+`OaiRenderer`.
+
+### B113 — cgroup memory headroom counts reclaimable page cache as used (2026-11-11)
+
+**Tag:** platform · **Kind:** correctness, plausible, not run in a container
+
+`cgroup_headroom` in `crates/infr-plat/src/mem.rs` is `memory.max` minus
+`memory.current`. `memory.current` includes file cache — including infr's own
+mmapped model pages — so inside a memory-limited container, touching a large
+GGUF makes `available()` shrink by roughly the file's size. That figure sizes
+the host arena tiers in `infr_core::hostmem`. The non-cgroup branch uses
+`MemAvailable`, which does discount reclaimable cache, so the two disagree. Fix:
+subtract `inactive_file` (arguably `active_file` too) from `memory.stat`.
+
+### B114 — forced tool choice rebuilds the grammar tokenizer on every request (2026-11-11)
+
+**Tag:** serve perf · **Kind:** perf, confirmed by reading, not measured
+
+`tool_constraint_for` in `crates/infr-llama/src/grammar.rs` calls
+`build_tok_env` per request, which serialises the whole tokenizer to JSON,
+re-parses it, and builds the token trie and a parser factory — all before
+prefill, for every `tool_choice: "required"` or named-tool request. Build the
+environment and factory once (in `OaiRenderer::open`) and only the parser per
+request.
+
+### B115 — smaller findings from the 2026-11-11 review
+
+- **`truncated_softmax`'s bounded top-k arm uses `partial_cmp`** with an `Equal`
+  fallback (`crates/infr-llama/src/sampling.rs`), which is not a total order
+  once a NaN logit is present; `select_nth_unstable_by` may then panic, and on
+  the CPU / Metal serve path a panic is B84. The full-vocabulary arm already
+  uses `total_cmp`. A third site beside the two in B98.
+- **Malformed `INFR_*` numbers are dropped silently** — `num`, `num_pos`,
+  `opt_size`, `opt_mib` in `crates/infr-core/src/config/env.rs`. `config.md`
+  already documents this as frozen behaviour, so it is not a new finding; what
+  the review adds is the consequence for the serve safety limits: a typo in a
+  request-timeout or max-tokens-cap variable leaves the server with no limit and
+  no message. Worth un-freezing for those keys at least.
+- **Addendum to B89, reported and not re-verified:** `reconcile` in
+  `crates/infr-hub/src/ranged.rs` — when the resume sidecar has an oid but this
+  run's HEAD failed, neither the oid nor the validator is compared, so a resumed
+  ranged download has neither guard.
+
+### Review coverage gaps (2026-11-11)
+
+One reviewer, reading only — nothing was built or run by it. Each finding above
+was then re-read at its call site before being recorded, and B103 was checked
+against the released binaries and a CI job log; "plausible" entries say what was
+not established.
+
+Still not reviewed by this or any earlier pass: `infr-vulkan` apart from
+`pcache.rs` and the replay path (`recorder.rs`, `adapter.rs`, `gemm.rs`, the
+pager, the multi-GPU modules, every GLSL shader — no buffer or address
+arithmetic has been audited); `infr-metal`'s `exec.rs`, pipeline cache and
+shaders, and Metal/Vulkan parity as such; `infr-cpu`'s kernels beyond the Q4_K
+family, `repack.rs`, `moe.rs`, `paged.rs`, `quant.rs` and most op arms;
+`infr-llama`'s `mtp/`, most of `seam/`, `config.rs` and the per-backend chat
+drivers; `infr-gguf`'s `dequant.rs`; `infr-core`'s graph, fusion, host pager and
+budget modules; `infr-engine`, `infr-prof`, `infr-testkit`; and the test suites
+themselves. `infr-server` was not re-read in this pass.

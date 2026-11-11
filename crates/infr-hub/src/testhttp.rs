@@ -357,6 +357,20 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Decrements `counter` unless it is already zero, and says whether it did. A compare-exchange
+/// loop rather than the std helper, whose name differs between the toolchains CI and a
+/// developer may have.
+fn take_one(counter: &AtomicUsize) -> bool {
+    let mut n = counter.load(Ordering::SeqCst);
+    while n > 0 {
+        match counter.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(seen) => n = seen,
+        }
+    }
+    false
+}
+
 /// One request/response, then close (`Connection: close`) — keep-alive would add nothing here.
 fn serve(state: &State, stream: TcpStream) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone test hub stream"));
@@ -406,11 +420,7 @@ fn serve(state: &State, stream: TcpStream) {
     if method == "HEAD" {
         state.heads.fetch_add(1, Ordering::SeqCst);
     }
-    let head_fails = method == "HEAD"
-        && state
-            .failing_heads
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok();
+    let head_fails = method == "HEAD" && take_one(&state.failing_heads);
     if head_fails {
         let _ = write!(
             &stream,

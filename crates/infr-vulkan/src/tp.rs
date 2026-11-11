@@ -803,6 +803,47 @@ impl Backend for TensorParallelBackend {
         Ok(())
     }
 
+    /// Each rank seeds its own buffer through its own [`VulkanBackend::copy_kv_prefix`], so the
+    /// planar Q8_0 layout is handled where it lives. A KV shard holds its heads' `1/W` of every
+    /// row, so its prefix and its capacity are both `1/W` of the logical ones.
+    fn copy_kv_prefix(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dtype: DType,
+        elems: usize,
+        cap: usize,
+    ) -> Result<()> {
+        let (s, d) = (as_tp(src)?, as_tp(dst)?);
+        if s.bufs.len() != d.bufs.len() || s.kind != d.kind {
+            return Err(be(format!(
+                "tp: copy_kv_prefix between mismatched TpBuffers ({:?} → {:?})",
+                s.kind, d.kind
+            )));
+        }
+        let (elems, cap) = match s.kind {
+            TpKind::Replica => (elems, cap),
+            TpKind::Kv => {
+                let w = self.world();
+                if !elems.is_multiple_of(w) || !cap.is_multiple_of(w) {
+                    return Err(be(format!(
+                        "tp: KV prefix of {elems} of {cap} elements not divisible by world {w}"
+                    )));
+                }
+                (elems / w, cap / w)
+            }
+            TpKind::Weight(role) => {
+                return Err(be(format!(
+                    "tp: copy_kv_prefix of a {role:?}-parallel weight shard — weights are not KV"
+                )))
+            }
+        };
+        for (i, b) in self.ranks.iter().enumerate() {
+            b.copy_kv_prefix(s.on(i)?, d.on(i)?, dtype, elems, cap)?;
+        }
+        Ok(())
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
         Ok(Box::new(TpPlan {
             graph: graph.clone(),

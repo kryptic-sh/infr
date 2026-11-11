@@ -556,6 +556,22 @@ pub trait Backend: Send + Sync {
         self.download(src, &mut tmp)?;
         self.upload(dst, &tmp)
     }
+    /// Copy the first `elems` elements of one KV cache side, a cache of `_cap` elements stored as
+    /// `dtype`, from `src` into `dst` (same geometry), so they decode in `dst` as they do in `src`
+    /// — the KV prefix-sharing seed. The default is the byte prefix [`copy_buffer`](Self::copy_buffer)
+    /// of [`kv_fmt_bytes`](crate::budget::kv_fmt_bytes), right for every layout that stores the
+    /// elements (or their GGUF blocks) in order. A backend whose cache layout puts part of a row
+    /// elsewhere overrides this; `_cap` is what locates that part.
+    fn copy_kv_prefix(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dtype: crate::tensor::DType,
+        elems: usize,
+        _cap: usize,
+    ) -> Result<()> {
+        self.copy_buffer(src, dst, crate::budget::kv_fmt_bytes(dtype, elems))
+    }
 
     // ---- execution (compile once per shape, execute per token/step) ----
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>>;

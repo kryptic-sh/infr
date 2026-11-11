@@ -6,6 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Qwen3.5 / Qwen3.6: the first prompt after a reset no longer inherits the
+  previous generation's state.** The gated-DeltaNet recurrent state was only
+  zeroed when the slot's token list was non-empty, so the prompt after a KV
+  reset, or after the GPU warmup generation, ran on top of stale state. A
+  prefill that fails or is cancelled part-way now also forces the state to be
+  rebuilt on the next request.
+- **Vulkan with a Q8_0 KV cache: a conversation seeded from another slot's
+  shared prefix decoded that prefix wrongly.** The seed copied the int8 codes
+  but not their scales, which Vulkan stores separately. This is the shared
+  system prompt case under `infr serve --parallel` with `Q8_0` KV. The backend
+  trait gains `Backend::copy_kv_prefix`, with a default that out-of-tree
+  backends inherit.
+
 ## [0.2.0] - 2026-10-29
 
 ### Breaking

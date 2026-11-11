@@ -1,7 +1,7 @@
 //! Per-layer weight handles + the persistent seam session state ([`SeamKv`]/[`SeamWeights`]).
 //! Pure-move split of `seam.rs` — see `super` for the module overview.
+use super::common_prefix_len;
 use super::sc::{DenoiseCache, SelfCondWeights};
-use super::{common_prefix_len, kv_fmt_bytes};
 use crate::Config;
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Buffer, BufferUsage};
@@ -654,25 +654,267 @@ impl SeamKv {
             // One prefix position is `k_row`/`v_row` elements per side — MLA's compressed row is
             // three times `n_kv * head_dim` wide and has no V side at all, so both widths come
             // from the shared `crate::seam::kv_row_elems` (docs/backlog.md B41).
+            // The backend owns its cache layout (Vulkan's Q8_0 is planar — its scales do not sit
+            // in a byte prefix), so it does the copy; `rows_l * row` is the side's capacity.
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            be.copy_buffer(
+            let rows_l = crate::seam::kv_rows(cfg, l, self.max_ctx, self.kv_ring, ec);
+            be.copy_kv_prefix(
                 src.kbufs[l].as_ref(),
                 self.kbufs[l].as_ref(),
-                kv_fmt_bytes(self.k_fmt, p * k_row),
+                self.k_fmt,
+                p * k_row,
+                rows_l * k_row,
             )
             .map_err(|e| anyhow!("{e}"))?;
             // `v_row == 0`: this arch caches no V (MLA) and `vbufs[l]` is the placeholder — there
             // is nothing to seed.
             if v_row > 0 {
-                be.copy_buffer(
+                be.copy_kv_prefix(
                     src.vbufs[l].as_ref(),
                     self.vbufs[l].as_ref(),
-                    kv_fmt_bytes(self.v_fmt, p * v_row),
+                    self.v_fmt,
+                    p * v_row,
+                    rows_l * v_row,
                 )
                 .map_err(|e| anyhow!("{e}"))?;
             }
         }
         self.cached = src.cached[..p].to_vec();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::seam::{kv_fmt_bytes, kv_side_bytes};
+    use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
+    use infr_core::graph::{AttnMask, Graph, Op};
+    use infr_core::tensor::{DType, TensorDesc};
+
+    const N_HEAD: usize = 2;
+    const N_KV: usize = 2;
+    const HEAD_DIM: usize = 64;
+    /// One cache row: `N_KV * HEAD_DIM`, a whole 128-element turbo block.
+    const ROW: usize = N_KV * HEAD_DIM;
+    /// Rows the cache is sized for, and the shared prefix seeded out of it.
+    const CAP_ROWS: usize = 8;
+    const PREFIX: usize = 3;
+
+    /// Every KV cache format a session can run with.
+    const KV_FORMATS: [DType; 12] = [
+        DType::F32,
+        DType::F16,
+        DType::Bf16,
+        DType::Q8_0,
+        DType::Q4_0,
+        DType::Q4_1,
+        DType::Q5_0,
+        DType::Q5_1,
+        DType::Iq4Nl,
+        DType::Turbo2,
+        DType::Turbo3,
+        DType::Turbo4,
+    ];
+
+    fn values(n: usize, salt: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| (((i * 7 + salt * 13) % 23) as f32 - 11.0) * 0.1 * (1.0 + salt as f32))
+            .collect()
+    }
+
+    fn cache(be: &dyn Backend, fmt: DType) -> Box<dyn Buffer> {
+        be.alloc(kv_side_bytes(fmt, CAP_ROWS * ROW), BufferUsage::KvCache)
+            .expect("alloc KV side")
+    }
+
+    /// Write `rows` rows of `src` into `cache` from row 0 with the backend's own `WriteKv`.
+    fn write_rows(be: &dyn Backend, fmt: DType, cache: &dyn Buffer, src: &[f32], rows: usize) {
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![rows * ROW], DType::F32));
+        let c = g.input(TensorDesc::new(vec![CAP_ROWS * ROW], fmt));
+        g.push(Op::WriteKv {
+            src: x,
+            cache: c,
+            rows: rows as u32,
+            row_stride: ROW as u32,
+            pos: 0,
+        });
+        let plan = be.compile(&g).expect("compile WriteKv");
+        let xb = be
+            .alloc(src.len() * 4, BufferUsage::Activations)
+            .expect("alloc src");
+        be.upload(xb.as_ref(), bytemuck::cast_slice(src))
+            .expect("upload src");
+        let mut b = Bindings::new();
+        b.bind(x, xb.as_ref()).bind(c, cache);
+        be.execute(plan.as_ref(), &b).expect("execute WriteKv");
+    }
+
+    /// One decode row of attention over the first `PREFIX` rows of `k`/`v`, as the backend
+    /// decodes them.
+    fn attend(be: &dyn Backend, fmt: DType, k: &dyn Buffer, v: &dyn Buffer) -> Vec<f32> {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![N_HEAD * HEAD_DIM], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![CAP_ROWS * ROW], fmt));
+        let vc = g.input(TensorDesc::new(vec![CAP_ROWS * ROW], fmt));
+        let dst = g.output(TensorDesc::new(vec![N_HEAD * HEAD_DIM], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: 1,
+            kv_len: PREFIX as u32,
+            n_head: N_HEAD as u32,
+            n_kv: N_KV as u32,
+            head_dim: HEAD_DIM as u32,
+            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+            mask: AttnMask::Causal,
+            pos: (PREFIX - 1) as u32,
+            sinks: None,
+            key_bias: None,
+        });
+        let plan = be.compile(&g).expect("compile Attention");
+        let qb = be
+            .alloc(N_HEAD * HEAD_DIM * 4, BufferUsage::Activations)
+            .expect("alloc q");
+        be.upload(
+            qb.as_ref(),
+            bytemuck::cast_slice(&values(N_HEAD * HEAD_DIM, 5)),
+        )
+        .expect("upload q");
+        let ob = be
+            .alloc(N_HEAD * HEAD_DIM * 4, BufferUsage::Readback)
+            .expect("alloc out");
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref())
+            .bind(kc, k)
+            .bind(vc, v)
+            .bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).expect("execute Attention");
+        let mut out = vec![0f32; N_HEAD * HEAD_DIM];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut out))
+            .expect("download out");
+        out
+    }
+
+    /// For every KV format: seed a slot that holds another conversation's rows (different values,
+    /// so different block scales) from a source slot's `PREFIX` rows, and check attention over the
+    /// prefix reads the same thing from both. Returns the formats that differ.
+    fn seeded_prefix_mismatches(be: &dyn Backend) -> Vec<String> {
+        let mut bad = Vec::new();
+        for fmt in KV_FORMATS {
+            let (src_k, src_v, dst_k, dst_v) = (
+                cache(be, fmt),
+                cache(be, fmt),
+                cache(be, fmt),
+                cache(be, fmt),
+            );
+            write_rows(be, fmt, src_k.as_ref(), &values(PREFIX * ROW, 1), PREFIX);
+            write_rows(be, fmt, src_v.as_ref(), &values(PREFIX * ROW, 2), PREFIX);
+            write_rows(
+                be,
+                fmt,
+                dst_k.as_ref(),
+                &values(CAP_ROWS * ROW, 3),
+                CAP_ROWS,
+            );
+            write_rows(
+                be,
+                fmt,
+                dst_v.as_ref(),
+                &values(CAP_ROWS * ROW, 4),
+                CAP_ROWS,
+            );
+            let before = attend(be, fmt, dst_k.as_ref(), dst_v.as_ref());
+            for (src, dst) in [(&src_k, &dst_k), (&src_v, &dst_v)] {
+                be.copy_kv_prefix(
+                    src.as_ref(),
+                    dst.as_ref(),
+                    fmt,
+                    PREFIX * ROW,
+                    CAP_ROWS * ROW,
+                )
+                .expect("seed KV side");
+            }
+            let want = attend(be, fmt, src_k.as_ref(), src_v.as_ref());
+            let got = attend(be, fmt, dst_k.as_ref(), dst_v.as_ref());
+            assert_ne!(
+                want, before,
+                "{fmt:?}: the two conversations attend alike, so a missed copy would not show"
+            );
+            if got != want {
+                let err = want
+                    .iter()
+                    .zip(&got)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                bad.push(format!("{fmt:?} (max abs diff {err})"));
+            }
+        }
+        bad
+    }
+
+    /// The CPU cache stores every format in element order, so a seed moves the byte prefix
+    /// [`kv_fmt_bytes`] covers and not one byte more.
+    #[test]
+    fn cpu_kv_seed_copies_only_the_byte_prefix() {
+        let be = infr_cpu::CpuBackend::new();
+        for fmt in KV_FORMATS {
+            let (src, dst) = (cache(&be, fmt), cache(&be, fmt));
+            write_rows(&be, fmt, src.as_ref(), &values(CAP_ROWS * ROW, 1), CAP_ROWS);
+            write_rows(&be, fmt, dst.as_ref(), &values(CAP_ROWS * ROW, 2), CAP_ROWS);
+            let read = |b: &dyn Buffer| {
+                let mut v = vec![0u8; b.len_bytes()];
+                be.download(b, &mut v).expect("download KV side");
+                v
+            };
+            let (src_bytes, dst_before) = (read(src.as_ref()), read(dst.as_ref()));
+            be.copy_kv_prefix(
+                src.as_ref(),
+                dst.as_ref(),
+                fmt,
+                PREFIX * ROW,
+                CAP_ROWS * ROW,
+            )
+            .expect("seed KV side");
+            let dst_after = read(dst.as_ref());
+            let n = kv_fmt_bytes(fmt, PREFIX * ROW);
+            assert_eq!(dst_after[..n], src_bytes[..n], "{fmt:?}: prefix not copied");
+            assert_ne!(
+                dst_before[n..],
+                src_bytes[n..],
+                "{fmt:?}: the two caches agree past the prefix, so an over-copy would not show"
+            );
+            assert_eq!(
+                dst_after[n..],
+                dst_before[n..],
+                "{fmt:?}: the seed copied past the {n}-byte prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn seeded_kv_prefix_decodes_like_its_source_cpu() {
+        let bad = seeded_prefix_mismatches(&infr_cpu::CpuBackend::new());
+        assert!(
+            bad.is_empty(),
+            "seeded prefix differs from the source: {bad:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn seeded_kv_prefix_decodes_like_its_source_vulkan() {
+        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        eprintln!("vulkan device: {}", vk.capabilities().name);
+        let bad = seeded_prefix_mismatches(&vk);
+        assert!(
+            bad.is_empty(),
+            "seeded prefix differs from the source: {bad:?}"
+        );
     }
 }

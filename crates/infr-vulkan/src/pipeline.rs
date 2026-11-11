@@ -51,7 +51,7 @@ use std::sync::Mutex;
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, Plan};
 use infr_core::error::Result;
 use infr_core::graph::Graph;
-use infr_core::tensor::TensorId;
+use infr_core::tensor::{DType, TensorId};
 
 use crate::{be, P2pHandleType, VulkanBackend};
 
@@ -588,6 +588,37 @@ impl Backend for PipelineBackend {
             }
             _ => Err(be(
                 "pipeline: copy_buffer across devices is not supported (cross-device KV copy)",
+            )),
+        }
+    }
+
+    /// [`copy_buffer`](Backend::copy_buffer)'s device routing, seeding through each device's own
+    /// [`VulkanBackend::copy_kv_prefix`] so the planar Q8_0 layout is handled where it lives.
+    fn copy_kv_prefix(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dtype: DType,
+        elems: usize,
+        cap: usize,
+    ) -> Result<()> {
+        let (s, d) = (as_pipe(src)?, as_pipe(dst)?);
+        match (s.single_device(), d.single_device()) {
+            (Some(sd), Some(dd)) if sd == dd => self.backends[sd].copy_kv_prefix(
+                s.bufs[0].as_ref(),
+                d.bufs[0].as_ref(),
+                dtype,
+                elems,
+                cap,
+            ),
+            (None, None) => {
+                for (i, b) in self.backends.iter().enumerate() {
+                    b.copy_kv_prefix(s.on(i)?, d.on(i)?, dtype, elems, cap)?;
+                }
+                Ok(())
+            }
+            _ => Err(be(
+                "pipeline: copy_kv_prefix across devices is not supported (cross-device KV copy)",
             )),
         }
     }

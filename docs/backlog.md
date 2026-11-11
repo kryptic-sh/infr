@@ -3915,54 +3915,31 @@ Reported by the reviewer; only the items marked confirmed were re-read.
   `Op::QkNormRope`, where Metal asserts or uses it. They agree for the one
   emitter that passes a non-zero stride.
 
-### B129 — qwen35: DeltaNet state is not zeroed when the slot's token list is empty (2026-11-11)
+### B129 — what the qwen35 state-reset and Q8 KV seed fixes left untested (2026-11-12)
 
-In `generate_dense_backend` (infr-llama `seam/runner.rs`) the `c.qwen35` arm of
-the `start` computation reuses the recurrent state when
-`pfx == cached.len() && pfx < prompt.len()`, and otherwise zeroes every DeltaNet
-layer's conv and S buffers. With `cached` empty, `pfx` is 0 and equals
-`cached.len()`, so the reuse arm is taken and the zeroing never runs. The
-comment on the `else` arm says it must "ALWAYS zero" precisely because a warmup
-generation dirties these buffers while leaving `cached` empty — but that is the
-one case that cannot reach the `else`.
+Both bugs are fixed: `generate_dense_backend` zeroes the DeltaNet state whenever
+`cached` is empty and keeps `cached` empty across a qwen35 prefill, and KV
+prefix seeding goes through `Backend::copy_kv_prefix`, which Vulkan overrides
+for its planar Q8_0 layout. What is left:
 
-`SeamKv::reset` (`seam/weights.rs`) only clears `cached`; the buffers keep what
-the last generation left. So the first prompt after a warmup, and the first
-prompt after any KV reset, runs with the DeltaNet state of the previous
-generation. Output stays plausible, which is why it would not have been noticed.
-A freshly forked slot is not affected (`SeamKv::fork` allocates zeroed state),
-and CPU warmup is a no-op.
-
-Confirmed by reading the branch and `reset`. As reported, not re-read: the
-callers of `reset` (the reviewer lists `ParallelSeam::init_slots`,
-`SlotPool::reset_cache`, `chat::reset_session` and the bench `one_rep`). No run
-was made; a test that generates, resets, and compares the next generation
-against a fresh slot would show it. Fix: zero whenever `cached` is empty, or
-have `reset` zero the state.
-
-The same reasoning covers an error return after `cached.truncate(start)`: the
-prefill loop bails on a cancelled request after earlier chunks have already
-advanced the recurrent state, leaving it ahead of `cached`, and a retry that
-extends `cached` reuses it.
-
-### B130 — Vulkan Q8_0 KV: seeding a slot from another copies codes without scales (2026-11-11)
-
-`SeamKv::seed_from` (`seam/weights.rs`) copies `kv_fmt_bytes(fmt, p * row)`
-bytes from offset 0 of each layer's K and V buffer. For Q8_0 that is the
-interleaved size, 34 bytes per 32 elements (`kv_fmt_bytes` in infr-core
-`budget.rs`). The Vulkan Q8 cache is planar — all codes in `[0, cap)`, then all
-f16 scales from `cap` (header of `store_q8.comp`) — so a prefix copy from offset
-0 moves the first `p` rows' codes plus a few rows more, and none of the scales.
-The seeded rows then decode with whatever scales the destination already held:
-zero on a fresh fork, another conversation's on a recycled slot. `cached` is set
-to claim the prefix regardless.
-
-It needs a Q8_0 KV side on Vulkan and a new conversation seeded from a slot
-sharing a prefix, which is the ordinary `serve --parallel` shared-system-prompt
-case. Confirmed by reading `seed_from`, `kv_fmt_bytes` and the shader header.
-Not checked: the CPU and Metal Q8 layouts (if they interleave, the copy is right
-there), and no run was made. Fix: a format-aware copy, or skip seeding for
-planar Q8.
+- The cancelled-prefill half has no test. The `cached.clear()` after
+  `cached.truncate(start)` is what makes an error mid-prefill zero the state on
+  the next call; deleting it leaves every test green. Landing a cancel between
+  two prefill chunks needs a hook into `sampling.rs` (`StepGate` is private).
+- The Vulkan Q8_0 seed is covered only by
+  `seeded_kv_prefix_decodes_like_its_source_vulkan`, which is `#[ignore]` and
+  returns early without a device, so CI never runs it (see B140). It was run red
+  and green on the iGPU.
+- The `copy_kv_prefix` overrides in `tp.rs`, `ep.rs` and `pipeline.rs` compile
+  and were read, but were never run: they need a multi-GPU session.
+- `qwen35_reset_slot_matches_a_fresh_slot` writes its GGUF with a third
+  hand-rolled writer, next to the one in `config.rs`'s tests and
+  `SyntheticModel` / `TempGguf` in `tests/synthetic_deepseek2.rs`. A unit test
+  cannot import an integration test's helper; the fix is to move
+  `SyntheticModel` / `TempGguf` into `infr-testkit` and use it from all three.
+- The Vulkan attention read locates V's Q8 scales with the K cache's element
+  count ("K and V caches share numel"). Not checked whether any Q8-capable model
+  has K and V rows of different width.
 
 ### B131 — chained decode runs qwen35's recurrent state past the stop point (2026-11-11)
 
@@ -4177,13 +4154,9 @@ It matters more now that B116 describes a path that can produce NaN.
 ### B142 — none of this review's bugs has a test that would catch it (2026-11-11)
 
 The test reviewer was asked, for six of the findings above, whether an existing
-test would fail. All six answers were no:
+test would fail. All six answers were no; B129 and B130 have since been fixed
+with tests, and the remaining four are:
 
-- B129 (qwen35 after a reset): no test calls `SeamKv::reset`, `reset_cache` or
-  `reset_session`; `unified_qwen35_session_no_rewind` diverges with a non-empty
-  `cached`, which takes the zeroing arm.
-- B130 (Q8 KV seeded from another slot): `gpu_seam_multi_slot_prefix_sharing`
-  uses f16 KV; the Q8 tests run one conversation.
 - B116 (quantised-KV prefill off a tile boundary): the tests that probably reach
   it assert only non-degenerate output.
 - B122 (262144-row head): no GEMV test is that tall, and a token comparison

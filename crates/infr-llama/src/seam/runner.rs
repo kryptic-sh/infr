@@ -1322,15 +1322,19 @@ pub(crate) fn generate_dense_backend(
         cached.len()
     } else if c.qwen35 {
         let pfx = common_prefix_len(cached, prompt);
-        if pfx == cached.len() && pfx < prompt.len() {
+        // An EMPTY `cached` never reuses: the buffers can still hold a warmup generation's or a
+        // pre-`SeamKv::reset` conversation's state, which `cached` no longer describes.
+        if !cached.is_empty() && pfx == cached.len() && pfx < prompt.len() {
             pfx
         } else {
-            // Non-extending prompt (divergent / identical resend / first-ever call): the append-only
-            // recurrent state can't rewind to an arbitrary prefix, so zero every DeltaNet layer's
-            // conv/S state and re-prefill from scratch. ALWAYS zero — a stateful backend's warmup
-            // generation (CPU is a no-op, but Vulkan/Metal run a throwaway "Hi") dirties these
-            // persistent buffers while leaving `cached` empty, so an `is_empty` guard here would
-            // wrongly skip the reset and the first real prompt would inherit the warmup's state.
+            // Non-extending prompt (divergent / identical resend / first-ever call / empty
+            // `cached`): the append-only recurrent state can't rewind to an arbitrary prefix, so
+            // zero every DeltaNet layer's conv/S state and re-prefill from scratch. ALWAYS zero — a
+            // stateful backend's warmup generation (CPU is a no-op, but Vulkan/Metal run a
+            // throwaway "Hi") and `SeamKv::reset` both leave `cached` empty over dirty buffers.
+            // `cached` is cleared first so a failed upload below cannot leave it claiming a
+            // half-zeroed state.
+            cached.clear();
             let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
             let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
             for l in 0..c.n_layer {
@@ -1347,7 +1351,6 @@ pub(crate) fn generate_dense_backend(
                     .map_err(|e| anyhow!("{e}"))?;
                 }
             }
-            cached.clear();
             0
         }
     } else {
@@ -1381,6 +1384,13 @@ pub(crate) fn generate_dense_backend(
         start
     };
     cached.truncate(start);
+    // qwen35: every prefill step advances the DeltaNet state past `start`, and that cannot be
+    // undone. Keep `cached` empty until this call records what it fed (the verify return and the
+    // teardown below), so an error return in between (a cancelled prefill, a failed submit) makes
+    // the next call zero the state instead of reusing one that is ahead of `cached`.
+    if c.qwen35 && denoise_req.is_none() {
+        cached.clear();
+    }
 
     // Build a forward graph for `batch` tokens starting at absolute position `start_pos`.
     // `batch = 1` is the normal decode path; `batch > 1` is the batched-prefill path.
@@ -5077,7 +5087,10 @@ pub(crate) fn generate_dense_backend(
                 (vbuild_secs + vcompile_secs + vexec_secs + vdl_secs) * 1e3,
             );
         }
-        cached.extend_from_slice(&prompt[start..]);
+        // `cached` held `prompt[..start]` (or nothing, for qwen35 — see the clear after the
+        // truncate above); either way it now holds the whole prompt.
+        cached.clear();
+        cached.extend_from_slice(prompt);
         return Ok((
             Vec::new(),
             GenStats {
@@ -6049,7 +6062,8 @@ pub(crate) fn generate_dense_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::{resident_after_gen, validate_token_ids};
+    use super::{resident_after_gen, validate_token_ids, Config, EngineConfig, Gguf, SeamKv};
+    use crate::seam::TokenEmbd;
 
     // ── resident_after_gen: which tokens' KV rows are recorded as materialized ────────────────
     //
@@ -6133,5 +6147,207 @@ mod tests {
     #[test]
     fn validate_token_ids_rejects_far_out_of_vocab() {
         assert!(validate_token_ids(&[u32::MAX], 100).is_err());
+    }
+
+    // ── qwen35 recurrent state across `SeamKv::reset` ─────────────────────────────────────────
+    //
+    // A one-layer, DeltaNet-only qwen35 GGUF (layer 0 is linear attention at the default
+    // `full_attention_interval`), every tensor f32 with deterministic values, written to a temp
+    // file and run through the real loader and runner on the CPU backend.
+
+    const Q35_NE: usize = 32;
+    const Q35_VOCAB: usize = 16;
+    const Q35_NFF: usize = 32;
+    const Q35_D_CONV: usize = 4;
+    const Q35_D_STATE: usize = 8;
+    const Q35_N_GROUP: usize = 2;
+    const Q35_DT_RANK: usize = 2;
+    const Q35_D_INNER: usize = 16;
+
+    fn push_u32(b: &mut Vec<u8>, v: u32) {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn push_u64(b: &mut Vec<u8>, v: u64) {
+        b.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn push_str(b: &mut Vec<u8>, s: &str) {
+        push_u64(b, s.len() as u64);
+        b.extend_from_slice(s.as_bytes());
+    }
+
+    /// `n` values in `[base - 0.5, base + 0.5)` from a 64-bit LCG seeded by `seed`.
+    fn q35_values(n: usize, seed: u64, base: f32) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                base + ((x >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// GGUF v3 bytes of the synthetic qwen35 model. Shapes are ggml order (innermost first).
+    fn qwen35_gguf() -> Vec<u8> {
+        let cc = Q35_D_INNER + 2 * Q35_N_GROUP * Q35_D_STATE;
+        let head_v = Q35_D_INNER / Q35_DT_RANK;
+        // (name, shape, centre value): norms sit near 1, `ssm_a` is negative (a decay).
+        let tensors: Vec<(&str, Vec<usize>, f32)> = vec![
+            ("token_embd.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+            ("output_norm.weight", vec![Q35_NE], 1.0),
+            ("output.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+            ("blk.0.attn_norm.weight", vec![Q35_NE], 1.0),
+            ("blk.0.attn_qkv.weight", vec![Q35_NE, cc], 0.0),
+            ("blk.0.attn_gate.weight", vec![Q35_NE, Q35_D_INNER], 0.0),
+            ("blk.0.ssm_conv1d.weight", vec![Q35_D_CONV, cc], 0.0),
+            ("blk.0.ssm_alpha.weight", vec![Q35_NE, Q35_DT_RANK], 0.0),
+            ("blk.0.ssm_beta.weight", vec![Q35_NE, Q35_DT_RANK], 0.0),
+            ("blk.0.ssm_a", vec![Q35_DT_RANK], -1.0),
+            ("blk.0.ssm_dt.bias", vec![Q35_DT_RANK], 0.0),
+            ("blk.0.ssm_norm.weight", vec![head_v], 1.0),
+            ("blk.0.ssm_out.weight", vec![Q35_D_INNER, Q35_NE], 0.0),
+            ("blk.0.post_attention_norm.weight", vec![Q35_NE], 1.0),
+            ("blk.0.ffn_gate.weight", vec![Q35_NE, Q35_NFF], 0.0),
+            ("blk.0.ffn_up.weight", vec![Q35_NE, Q35_NFF], 0.0),
+            ("blk.0.ffn_down.weight", vec![Q35_NFF, Q35_NE], 0.0),
+        ];
+        let u32_keys = [
+            ("qwen35.block_count", 1),
+            ("qwen35.context_length", 64),
+            ("qwen35.embedding_length", Q35_NE),
+            ("qwen35.feed_forward_length", Q35_NFF),
+            ("qwen35.attention.head_count", 2),
+            ("qwen35.attention.head_count_kv", 2),
+            ("qwen35.ssm.conv_kernel", Q35_D_CONV),
+            ("qwen35.ssm.state_size", Q35_D_STATE),
+            ("qwen35.ssm.inner_size", Q35_D_INNER),
+            ("qwen35.ssm.group_count", Q35_N_GROUP),
+            ("qwen35.ssm.time_step_rank", Q35_DT_RANK),
+            ("tokenizer.ggml.eos_token_id", Q35_VOCAB - 1),
+        ];
+        const ALIGN: usize = 32;
+        let mut b = Vec::new();
+        push_u32(&mut b, 0x4655_4747); // "GGUF"
+        push_u32(&mut b, 3);
+        push_u64(&mut b, tensors.len() as u64);
+        push_u64(&mut b, (u32_keys.len() + 1) as u64);
+        push_str(&mut b, "general.architecture");
+        push_u32(&mut b, 8); // STRING
+        push_str(&mut b, "qwen35");
+        for (k, v) in u32_keys {
+            push_str(&mut b, k);
+            push_u32(&mut b, 4); // UINT32
+            push_u32(&mut b, v as u32);
+        }
+        let mut data = Vec::new();
+        for (i, (name, shape, base)) in tensors.iter().enumerate() {
+            let n: usize = shape.iter().product();
+            push_str(&mut b, name);
+            push_u32(&mut b, shape.len() as u32);
+            for &d in shape {
+                push_u64(&mut b, d as u64);
+            }
+            push_u32(&mut b, 0); // F32
+            push_u64(&mut b, data.len() as u64);
+            for v in q35_values(n, i as u64 + 1, *base) {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
+            data.resize(data.len().next_multiple_of(ALIGN), 0);
+        }
+        b.resize(b.len().next_multiple_of(ALIGN), 0);
+        b.extend_from_slice(&data);
+        b
+    }
+
+    /// The last prompt token's logits for `prompt`, run on `state` (`None` = a fresh slot).
+    fn q35_logits(
+        g: &Gguf,
+        cfg: &Config,
+        embd: &std::sync::OnceLock<Vec<f32>>,
+        prompt: &[u32],
+        state: &mut Option<SeamKv>,
+    ) -> Vec<f32> {
+        let ec = EngineConfig::default();
+        let be = infr_cpu::CpuBackend::new();
+        let mut logits = Vec::new();
+        super::generate_dense_backend(
+            &be,
+            &crate::seam::cpu_upload_bind(&be),
+            g,
+            cfg,
+            &ec,
+            TokenEmbd::new(embd, g),
+            None,
+            prompt,
+            1,
+            |_| {},
+            state,
+            32,
+            None,
+            None,
+            None,
+            Some(&mut logits),
+            None,
+            None,
+            None,
+        )
+        .expect("qwen35 synthetic generation");
+        logits
+    }
+
+    /// After `SeamKv::reset`, the next prompt must run from a zeroed DeltaNet state: its logits
+    /// equal a fresh slot's, not those of a state still carrying the first prompt.
+    #[test]
+    fn qwen35_reset_slot_matches_a_fresh_slot() {
+        let path = std::env::temp_dir().join(format!(
+            "infr-runner-qwen35-reset-{}.gguf",
+            std::process::id()
+        ));
+        std::fs::write(&path, qwen35_gguf()).expect("write synthetic qwen35 GGUF");
+        let g = Gguf::open(&path).expect("open synthetic qwen35 GGUF");
+        std::fs::remove_file(&path).expect("remove synthetic qwen35 GGUF");
+        let cfg = Config::from_gguf(&g).expect("synthetic qwen35 config");
+        assert!(cfg.qwen35 && !cfg.is_qwen35_attn_layer(0));
+        let embd = std::sync::OnceLock::new();
+
+        let (first, second) = ([3u32, 1, 4, 1, 5, 9, 2, 6], [7u32, 2, 8, 1, 8, 2]);
+        let fresh = q35_logits(&g, &cfg, &embd, &second, &mut None);
+
+        let mut slot = None;
+        q35_logits(&g, &cfg, &embd, &first, &mut slot);
+        slot.as_mut().expect("slot initialized").reset();
+        let after_reset = q35_logits(&g, &cfg, &embd, &second, &mut slot);
+
+        let diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        assert_eq!(fresh.len(), Q35_VOCAB);
+        // What `second` reads off a state that skipped the zeroing: the first call fed all of
+        // `first` (its one sampled token is never fed), and this model has no positions, so that
+        // is the recurrence of `first ++ second` from zero. It must differ from `fresh`, or the
+        // equality below could not catch a reused state.
+        let dirty = q35_logits(
+            &g,
+            &cfg,
+            &embd,
+            &[&first[..], &second[..]].concat(),
+            &mut None,
+        );
+        assert!(
+            diff(&dirty, &fresh) > 1e-2,
+            "a carried-over state moves the logits by only {}: the fixture cannot tell states apart",
+            diff(&dirty, &fresh)
+        );
+        assert!(
+            diff(&fresh, &after_reset) == 0.0,
+            "logits after reset differ from a fresh slot by {}: the DeltaNet state was reused",
+            diff(&fresh, &after_reset)
+        );
     }
 }

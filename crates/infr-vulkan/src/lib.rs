@@ -3796,6 +3796,52 @@ impl VulkanBackend {
         unsafe { device.free_command_buffers(pool, &cmds) };
         Ok(())
     }
+
+    /// Device-side copy of byte ranges `(src_off, dst_off, bytes)` from `src` into `dst`, in one
+    /// `vkCmdCopyBuffer` — no host bounce. Every range is bounds-checked against both buffers;
+    /// empty ranges are dropped (Vulkan rejects a zero-size region).
+    fn copy_ranges(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        ranges: &[(usize, usize, usize)],
+    ) -> Result<()> {
+        let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+        // BOTH sides, unlike `upload`/`download` which each have only one device buffer to police.
+        // An oversize range here is a `vkCmdCopyBuffer` region that runs off the end of the source
+        // and/or the destination — a VUID violation the driver is free to turn into a GPU fault or a
+        // silent clobber of whatever sub-tensor happens to sit next in the arena block.
+        for &(src_off, dst_off, bytes) in ranges {
+            check_extent(
+                "copy_buffer",
+                "out of",
+                src_off.saturating_add(bytes),
+                s.size,
+            )?;
+            check_extent("copy_buffer", "into", dst_off.saturating_add(bytes), d.size)?;
+        }
+        // `sub_offset` — 0 for every ordinary buffer (all of today's callers pass KV/state
+        // Activations buffers, whose handle IS the tensor), but a resident-BDA sub-tensor shares
+        // its block's `vk::Buffer` and lives at its offset within it (see `Backing::BdaSub`), so
+        // fold each side's `sub_offset` in the same way `upload`/`download`/`fill_buf` do.
+        let regions: Vec<vk::BufferCopy> = ranges
+            .iter()
+            .filter(|&&(_, _, bytes)| bytes > 0)
+            .map(|&(src_off, dst_off, bytes)| vk::BufferCopy {
+                src_offset: (s.sub_offset + src_off) as u64,
+                dst_offset: (d.sub_offset + dst_off) as u64,
+                size: bytes as u64,
+            })
+            .collect();
+        if regions.is_empty() {
+            return Ok(());
+        }
+        let (sb, db) = (s.buffer, d.buffer);
+        // one_shot's queue_wait_idle provides the ordering fence vs prior/following work.
+        self.one_shot(move |cmd| unsafe {
+            self.shared.device.cmd_copy_buffer(cmd, sb, db, &regions);
+        })
+    }
 }
 
 // ── Backend impl ──────────────────────────────────────────────────────────────
@@ -3853,28 +3899,28 @@ impl Backend for VulkanBackend {
     /// If `dst` is host-visible (`CpuToGpu`), writes directly through the
     /// Device-side prefix copy (`vkCmdCopyBuffer` region `[0, bytes)`) — no host bounce.
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
-        let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
-        // BOTH sides, unlike `upload`/`download` which each have only one device buffer to police.
-        // An oversize `bytes` here is a `vkCmdCopyBuffer` region that runs off the end of the source
-        // and/or the destination — a VUID violation the driver is free to turn into a GPU fault or a
-        // silent clobber of whatever sub-tensor happens to sit next in the arena block.
-        check_extent("copy_buffer", "out of", bytes, s.size)?;
-        check_extent("copy_buffer", "into", bytes, d.size)?;
-        let (sb, db) = (s.buffer, d.buffer);
-        // `sub_offset` — 0 for every ordinary buffer (all of today's callers pass KV/state
-        // Activations buffers, whose handle IS the tensor), but a resident-BDA sub-tensor shares
-        // its block's `vk::Buffer` and lives at its offset within it (see `Backing::BdaSub`), so
-        // fold each side's `sub_offset` in the same way `upload`/`download`/`fill_buf` do.
-        let (src_off, dst_off) = (s.sub_offset as u64, d.sub_offset as u64);
-        // one_shot's queue_wait_idle provides the ordering fence vs prior/following work.
-        self.one_shot(move |cmd| unsafe {
-            let region = vk::BufferCopy {
-                src_offset: src_off,
-                dst_offset: dst_off,
-                size: bytes as u64,
-            };
-            self.shared.device.cmd_copy_buffer(cmd, sb, db, &[region]);
-        })
+        self.copy_ranges(src, dst, &[(0, 0, bytes)])
+    }
+
+    /// The Q8_0 KV cache is PLANAR here (`store_q8.comp`): element `i`'s int8 code at byte `i`, its
+    /// block's f16 scale at byte `cap + (i / 32) * 2`. A prefix is therefore two ranges — the
+    /// codes and the scales — copied in one submit. Every other KV format is in element (or GGUF
+    /// block) order, where the default byte prefix is right.
+    fn copy_kv_prefix(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dtype: infr_core::DType,
+        elems: usize,
+        cap: usize,
+    ) -> Result<()> {
+        if dtype != infr_core::DType::Q8_0 {
+            return self.copy_buffer(src, dst, infr_core::budget::kv_fmt_bytes(dtype, elems));
+        }
+        // Past `cap` the codes would land on the scales, and the two regions would overlap.
+        check_extent("copy_kv_prefix", "past the codes of", elems, cap)?;
+        let scales = elems.div_ceil(32) * 2;
+        self.copy_ranges(src, dst, &[(0, 0, elems), (cap, cap, scales)])
     }
 
     /// persistent mapped pointer.  Otherwise, creates a temporary staging buffer,

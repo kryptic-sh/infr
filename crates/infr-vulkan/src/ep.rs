@@ -58,7 +58,7 @@ use std::sync::Mutex;
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, Plan};
 use infr_core::error::Result;
 use infr_core::graph::{Graph, Op, TensorKind};
-use infr_core::tensor::{TensorDesc, TensorId};
+use infr_core::tensor::{DType, TensorDesc, TensorId};
 
 use crate::tp_allreduce::AllReduce;
 use crate::{be, VulkanBackend};
@@ -439,6 +439,26 @@ impl Backend for ExpertParallelBackend {
         // Same-layout copy on every rank (KV fork/seed within a rank, replica→replica).
         for (i, b) in self.ranks.iter().enumerate() {
             b.copy_buffer(s.on(i)?, d.on(i)?, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// Same-layout seed on every rank, each through its own [`VulkanBackend::copy_kv_prefix`] so
+    /// the planar Q8_0 layout is handled where it lives.
+    fn copy_kv_prefix(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dtype: DType,
+        elems: usize,
+        cap: usize,
+    ) -> Result<()> {
+        let (s, d) = (as_ep(src)?, as_ep(dst)?);
+        if s.bufs.len() != d.bufs.len() {
+            return Err(be("ep: copy_kv_prefix between mismatched EpBuffers"));
+        }
+        for (i, b) in self.ranks.iter().enumerate() {
+            b.copy_kv_prefix(s.on(i)?, d.on(i)?, dtype, elems, cap)?;
         }
         Ok(())
     }

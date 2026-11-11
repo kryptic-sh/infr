@@ -3848,6 +3848,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU with cooperative matrix"]
     fn coopmat_gemm_tiled_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if !crate::test_has_f16_coopmat(&be, "coopmat_gemm_tiled_matches_cpu") {
+            return;
+        }
         let (m, k, n) = (128usize, 96usize, 64usize); // m,n %64, k %32
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
@@ -3859,6 +3862,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn warp_gemm_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if !crate::test_has_f16_coopmat(&be, "warp_gemm_matches_cpu") {
+            return;
+        }
         for &(m, k, n) in &[
             (128usize, 16usize, 128usize),
             (256, 128, 256),
@@ -3875,6 +3881,9 @@ mod tests {
     #[ignore = "benchmark, requires GPU"]
     fn coopmat_gemm_bench() {
         let be = VulkanBackend::new().unwrap();
+        if !crate::test_has_f16_coopmat(&be, "coopmat_gemm_bench") {
+            return;
+        }
         for s in [1024usize, 2048, 4096] {
             let dt = be.bench_tiled_gemm(s, s, s, 20);
             let flops = 2.0 * (s as f64).powi(3);

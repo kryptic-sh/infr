@@ -1051,6 +1051,8 @@ pub struct VulkanBackend {
     /// whole device for a paged-MoE session before `moe_pager` was moved off it — see
     /// `backend_drop_frees_device_after_moe_pager`.
     bda_weight_arena: Mutex<Option<BdaWeightArena>>,
+    /// Placeholder for kernel bindings an op leaves unused — see [`Self::unused_binding`].
+    unused_binding: OnceLock<Box<dyn Buffer>>,
     /// The engine configuration this backend reads its knobs from — one value, held for the
     /// backend's whole life, borrowed (never cloned) at every read site.
     ///
@@ -1191,6 +1193,17 @@ impl VulkanBackend {
     /// copies the `name: String`) — safe to call per-op inside the adapter's hot lowering loop.
     pub(crate) fn caps(&self) -> &Capabilities {
         &self.shared.caps
+    }
+
+    /// A small zeroed buffer to bind where a kernel ignores the binding (`moe_topk`'s bias and
+    /// hash-ids slots when the model has neither). One per backend, so it outlives every
+    /// recording that binds it — replay tapes included — and costs no allocation per lowering.
+    pub(crate) fn unused_binding(&self) -> Result<&dyn Buffer> {
+        if let Some(b) = self.unused_binding.get() {
+            return Ok(b.as_ref());
+        }
+        let b = self.alloc(4, BufferUsage::Activations)?;
+        Ok(self.unused_binding.get_or_init(|| b).as_ref())
     }
 
     /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
@@ -2495,6 +2508,7 @@ impl VulkanBackend {
             moe_pager: Mutex::new(None),
             dense_pager: Mutex::new(None),
             bda_weight_arena: Mutex::new(None),
+            unused_binding: OnceLock::new(),
             cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -3438,12 +3452,23 @@ impl VulkanBackend {
                 })?
         };
 
-        unsafe {
+        let bound = unsafe {
             self.shared
                 .device
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
+        };
+        if let Err(e) = bound {
+            // Nothing owns the buffer or its memory yet, so release both here, as the allocation
+            // failure above does for the buffer.
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            let freed = self.shared.allocator.lock().unwrap().free(allocation);
+            return Err(be(match freed {
+                Ok(()) => format!("bind_buffer_memory: {e}"),
+                Err(fe) => {
+                    format!("bind_buffer_memory: {e} (freeing its allocation also failed: {fe})")
+                }
+            }));
         }
-        .map_err(|e| be(format!("bind_buffer_memory: {e}")))?;
 
         // Charge the budget guard's fallback accounting (balanced by `VkBuffer::drop`).
         if location == MemoryLocation::GpuOnly {
@@ -4419,6 +4444,19 @@ fn probe_device_facts(
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
+
+/// Gate for unit tests that dispatch a cooperative-matrix kernel directly, bypassing the tiering
+/// in `adapter.rs` that would never pick one here: false (with a visible skip line) when `be` lacks
+/// the f16 coopmat tier. Without it such a test compiles the kernel anyway, and RADV on an RDNA2
+/// iGPU aborts inside ACO on the unsupported WMMA opcode, taking the whole test binary down.
+#[cfg(test)]
+pub(crate) fn test_has_f16_coopmat(be: &VulkanBackend, test: &str) -> bool {
+    let ok = be.caps().f16_coopmat();
+    if !ok {
+        eprintln!("skip: {test} needs the 16x16x16 f16 cooperative matrix tier");
+    }
+    ok
+}
 
 #[cfg(test)]
 mod tests {

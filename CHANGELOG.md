@@ -32,6 +32,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **A panic while reading a paged weight block no longer hangs later requests
   for that block.** The block was left marked as loading for good; it is now
   released, and only the request that hit the panic fails.
+- **Vulkan with a quantised KV cache: prefill attention read past its scratch
+  buffer** when the context length was not a multiple of the kernel's tile. The
+  scratch now covers the rows the selected kernel reads.
+- **Vulkan MoE models without an expert bias no longer grow the weight arena on
+  every graph lowering**, and no longer bind a buffer that is destroyed before
+  the command buffer runs.
+- **Vulkan weight paging: a request that fails part-way no longer leaves the
+  pager believing weights were uploaded.** The next request used whatever the
+  slot held before; it now re-uploads them.
 
 ### Changed
 

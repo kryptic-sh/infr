@@ -106,6 +106,12 @@ pub struct GpuPager {
     lut_host: Vec<u32>,
     lut_dev: Box<dyn Buffer>,
     lut_dirty: bool,
+    /// Misses whose ring→arena copy went into the recording `staged_serial` names (a
+    /// `Recorder::serial`), which may not have been submitted yet. Their placement is already in
+    /// the pager and the LUT mirror, so if that recording is discarded instead,
+    /// [`Self::forget_unsubmitted`] must take them back out.
+    staged: Vec<BlockId>,
+    staged_serial: Option<u64>,
 }
 
 impl GpuPager {
@@ -145,6 +151,8 @@ impl GpuPager {
             lut_host,
             lut_dev,
             lut_dirty: false,
+            staged: Vec::new(),
+            staged_serial: None,
         })
     }
 
@@ -215,6 +223,7 @@ impl GpuPager {
         match resolution {
             Resolution::Hit { .. } => Ok(0),
             Resolution::Miss { slot, evicted } => {
+                self.record_staged_placement(rec, id, slot, evicted);
                 let base = as_vk_buf(ring)?
                     .mapped_ptr()
                     .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
@@ -226,7 +235,6 @@ impl GpuPager {
                     slot as usize * self.slot_bytes,
                     self.slot_bytes,
                 );
-                self.record_placement(id, slot, evicted);
                 Ok(self.slot_bytes)
             }
         }
@@ -258,6 +266,7 @@ impl GpuPager {
         match resolution {
             Resolution::Hit { .. } => Ok(0),
             Resolution::Miss { slot, evicted } => {
+                self.record_staged_placement(rec, id, slot, evicted);
                 let n = host.block_bytes(id).ok_or_else(|| {
                     be(format!("moe pager: block {id} is unknown to the host tier"))
                 })?;
@@ -282,7 +291,6 @@ impl GpuPager {
                     slot as usize * self.slot_bytes,
                     self.slot_bytes,
                 );
-                self.record_placement(id, slot, evicted);
                 Ok(self.slot_bytes)
             }
         }
@@ -302,6 +310,43 @@ impl GpuPager {
     fn record_placement(&mut self, id: BlockId, slot: u32, evicted: Option<u32>) {
         apply_placement(&mut self.lut_host, id, slot, evicted);
         self.lut_dirty = true;
+    }
+
+    /// [`Self::record_placement`] for a miss whose copy goes into `rec` rather than an immediate
+    /// submit, noted so [`Self::forget_unsubmitted`] can undo it. Called before anything on the
+    /// miss can fail, so an error part-way through still leaves the block on the list.
+    fn record_staged_placement(
+        &mut self,
+        rec: &crate::recorder::Recorder<'_>,
+        id: BlockId,
+        slot: u32,
+        evicted: Option<u32>,
+    ) {
+        self.record_placement(id, slot, evicted);
+        // Recording is sequential and a recording is only replaced by submitting or discarding
+        // it, so a miss for a newer one means the older one's copies were submitted.
+        if self.staged_serial != Some(rec.serial()) {
+            self.staged.clear();
+            self.staged_serial = Some(rec.serial());
+        }
+        self.staged.push(id);
+    }
+
+    /// The recording `serial` is being discarded: its ring→arena copies will never run, so every
+    /// block it placed goes back to absent (pager and LUT mirror) instead of being served from a
+    /// slot that still holds its previous occupant. A block a later miss in the same recording
+    /// already displaced is gone from the pager and is skipped.
+    pub fn forget_unsubmitted(&mut self, serial: u64) {
+        if self.staged_serial != Some(serial) {
+            return;
+        }
+        for id in self.staged.drain(..) {
+            if self.pager.evict(id).is_some() {
+                apply_placement(&mut self.lut_host, id, NOT_RESIDENT, None);
+                self.lut_dirty = true;
+            }
+        }
+        self.staged_serial = None;
     }
 
     /// [`Self::touch_staged`]'s DENSE-STREAMING twin: residency via the exact cyclic-sweep policy
@@ -336,6 +381,7 @@ impl GpuPager {
         match self.pager.schedule(id) {
             Resolution::Hit { slot } => Ok((slot, 0)),
             Resolution::Miss { slot, evicted } => {
+                self.record_staged_placement(rec, id, slot, evicted);
                 let slot_bytes = self.slot_bytes;
                 let fits = |total: usize| {
                     debug_assert!(
@@ -395,7 +441,6 @@ impl GpuPager {
                     slot as usize * self.slot_bytes,
                     total.next_multiple_of(4),
                 );
-                self.record_placement(id, slot, evicted);
                 Ok((slot, self.slot_bytes))
             }
         }
@@ -710,6 +755,13 @@ pub struct MoePagerLayout {
 pub use infr_core::pager::ring_bytes;
 
 impl MoePagerSession {
+    /// [`GpuPager::forget_unsubmitted`] over every pool: recording `serial` is being discarded.
+    pub fn forget_unsubmitted(&mut self, serial: u64) {
+        for p in &mut self.pools {
+            p.pager.forget_unsubmitted(serial);
+        }
+    }
+
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
         let mut pools = Vec::with_capacity(layout.pools.len());
         let mut staging_bytes = 4usize;
@@ -1257,6 +1309,13 @@ pub struct DensePagerSession {
 }
 
 impl DensePagerSession {
+    /// [`GpuPager::forget_unsubmitted`] over every pool: recording `serial` is being discarded.
+    pub fn forget_unsubmitted(&mut self, serial: u64) {
+        for p in &mut self.pools {
+            p.pager.forget_unsubmitted(serial);
+        }
+    }
+
     pub fn new(vk: &VulkanBackend, layout: DensePagerLayout) -> Result<Self> {
         // The streamed kernels read the arena by 64-bit device address (native_weight_addr.glsl), so
         // BDA is required. It is probed and hard-errored globally at init (lib.rs, `caps()

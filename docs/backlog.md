@@ -3634,94 +3634,42 @@ re-read at its site before being recorded. What was confirmed by that re-read
 and what is still the reviewer's inference is stated per entry. Coverage is at
 the end of the section.
 
-### B116 — prefill attention reads past the dequantised KV scratch (2026-11-11)
+### B116 — what the Vulkan lowering fixes left untested (2026-11-12)
 
-`lower_op`'s static `Op::Attention` arm (infr-vulkan `adapter.rs`) sizes the
-`kvdeq_k` / `kvdeq_v` f16 scratch to exactly
-`kv_len.min(att_cap_rows) * nkv * hd` elements. The flash and nonfa prefill
-kernels read K and V in whole tiles, so they read up to
-`kv_len.div_ceil(64) * 64` (flash) or `kv_len.div_ceil(256) * 256` (nonfa) rows.
-The gates `flash_geom` and `nonfa_ok` bound that padded read against
-`att_cap_rows`, the capacity of the persistent cache — not against the scratch,
-which is what the kernel is handed whenever the KV side is dequantised first
-(`deq_k` / `deq_v`: Q8_0 at rows > 1, the prepass formats, and the Q4/Q5 set
-when `kernels.vulkan.flash_dequant` is off).
+The prefill over-read of the dequantised KV scratch, both MoE placeholder
+buffers, the pager claiming blocks from a discarded segment, and the two
+error-path leaks are fixed. What is left is all test coverage:
 
-So a quantised-KV prefill chunk whose `kv_len` is not a tile multiple reads up
-to 63 or 255 rows past the end of an `alloc_uninit` buffer. For K the extra
-columns are masked to `-1e30`. For V the comment in `attn_flash_warp.comp` says
-the rows "carry a 0 P weight", which is only harmless for finite values:
-`0 × NaN` and `0 × Inf` are NaN and would land in that output tile.
-
-Confirmed by reading: the sizing, both gates, and the two shader comments that
-state the over-read is safe because it stays inside the row-capacity allocation.
-The shader review confirmed the nonfa side too: `attn_pv.comp` and
-`attn_pv_warp.comp` carry no real-length field and stage V for every row up to
-`kv_pad`. Only the direct `coopMatLoad` arms of `attn_flash_warp.comp`
-over-read; its `-DSTAGE` / `-DDEQUANT` builds guard with
-`kv0 + kvl < pc.kv_len`. The same finite-V assumption also covers a query row
-with no valid key in a split, whose partial is a full ΣV that
-`attn_flash_combine` discards with a zero weight. Not established: what sits
-after the scratch in practice (it is a pooled sub-allocation), so whether a NaN
-has ever been produced; no test was run. Fix: size the scratch to the padded row
-count and zero the pad, or route to the split-K path when the padded read
-exceeds the scratch.
-
-### B117 — MoE dummy buffers: one is destroyed while bound, one leaks (2026-11-11)
-
-`lower_op`'s `Op::MoeFfn` arm and `execute_paged_moe` (infr-vulkan `adapter.rs`)
-bind placeholder buffers when a model has no `exp_probs_b` and no hash routing,
-each made on the spot with `&*be_.alloc_uninit(4, …)?`:
-
-- **`hash_buf`** (`BufferUsage::Activations`) is a temporary that lives to the
-  end of the match arm / function. It is bound into the recording by
-  `Recorder::moe_topk`, and `VkBuffer::drop` calls `destroy_buffer` on it before
-  that command buffer is submitted. Destroying a buffer a recorded command
-  buffer references invalidates the command buffer. `decode_eligible` accepts
-  `MoeFfn`, so on the replay path the persistent tape keeps the dead handle for
-  the whole generation. This affects every MoE model that is not hash-routed. It
-  has not been seen to fail: the shader does not read the binding when
-  `hash == 0`, and RADV evidently tolerates it. Behaviour on other drivers, and
-  whether the validation layer reports it, is not checked.
-- **`bias_buf`** (`BufferUsage::Weights`) goes through `make_alloc` to
-  `bda_weight_alloc`, which bumps a block cursor by `BDA_WEIGHT_ALIGN`; a
-  `Backing::BdaSub` drop frees nothing and the cursor never rewinds. So every
-  lowering of a `MoeFfn` without `exp_probs_b` consumes a slot of the weight
-  arena for good: once per prefill chunk, once per replay recording, and once
-  per token on the paged or static decode path. A long-lived `serve` eventually
-  opens new `BDA_BLOCK_MIN` blocks for these.
-
-Both confirmed by reading the allocation and drop paths. Fix for both: one
-backend-lifetime dummy of each kind, or hold them in the plan.
-
-### B118 — a discarded segment leaves the weight pager claiming blocks it never copied (2026-11-11)
-
-`GpuPager::touch_staged` (and `touch_staged_read` / `schedule_staged`, in
-infr-vulkan `pager.rs`) handle a miss by recording the ring→arena copy into the
-ambient `Recorder` and calling `record_placement` straight away, which updates
-the LRU and the lookup table. If the segment is then abandoned — `abort_segment`
-in `adapter.rs` only calls `Recorder::discard` — the copy never executes but the
-pager still reports the block resident, so later forwards read the slot's
-previous occupant as if it were the requested weights.
-
-The ordering and the discard path are confirmed by reading. What is inferred:
-that a backend survives such an error and is used again. That needs a failure
-after a staged miss (host-tier read error, refused scratch allocation, LUT tape
-overflow) in a process that keeps going, which in practice means `serve`
-returning an error for one request. Related: B48 notes these abort paths have
-never been fired by a test.
-
-### B119 — Vulkan error-path leaks not covered by B48 (2026-11-11)
-
-- `record_decode_replay` (`adapter.rs`) holds its `Recorder` as a plain binding,
-  and `Recorder` has no `Drop`. Every `?` exit after it is created leaks the
-  command buffer, its descriptor pool and any segments already closed. B48
-  covers `execute_static` only.
-- `make_buf_ex` (`lib.rs`): the `bind_buffer_memory(..)?` exit neither frees the
-  gpu-allocator `Allocation` nor destroys the `vk::Buffer`. The allocation-error
-  arm just above it and `alloc_vram_mapped` both clean up.
-
-Both confirmed by reading. Neither is reachable without a device error.
+- **The over-read test only bites in a debug build.**
+  `attention_q8_kv_prefill_off_tile_matches_host` fails before the fix because
+  of the `debug_assert!`s in `Recorder::attention_prefill_flash` /
+  `attention_prefill_nonfa`. In release the old read is out of bounds with
+  undefined contents; on RADV it returned zeros and the test stayed green. It
+  also needs the f16 cooperative-matrix tier, so it skips on the iGPU.
+- **"Destroyed while bound" has no test.** The validation layer reported no
+  error for the old `hash_buf` even before the fix, presumably because the
+  binding goes through push descriptors. A test needs a recorder hook that
+  checks every bound buffer outlives the recording. The arena-growth assertion
+  in `moe_ffn_graph_matches_host` covers the leak half, and not the replay-tape
+  path.
+- **Failed submits and failed `end_command_buffer` are fixed by reading only.**
+  `submit_nowait` / `submit_wait` undo a recording's staged placements when its
+  submit fails, and `Recorder::end_segment` / `discard` free their command
+  buffer and pools on an error. Nothing in the repo can make a submit, an
+  `end_command_buffer` or a memory bind fail (same blocker as B48), so none of
+  these, nor the `make_buf_ex` bind-failure cleanup, has a test. A temporary
+  test showed the `record_decode_replay` leak under the validation layer
+  (`VUID-vkDestroyDevice-device-05137`, one `VkDescriptorPool`) and none after
+  the fix; it was not kept because a leak is invisible from inside a test
+  without a debug-utils messenger that fails the test on a validation error.
+- **The pager's staged-placement journal assumes one recording at a time per
+  backend.** Under `serve --parallel N` that holds: every GPU step in
+  `generate_dense_backend`, each prefill chunk included, takes the `StepGate`
+  (read, not run). The diffusion-gemma denoise, MTP verify and the `mtp/`
+  forwards execute without it; the parallel server cannot reach them today, and
+  wiring any of them in would break the assumption.
+- The dense-streaming `forget_unsubmitted` and the host-read-failure ordering
+  have no direct test.
 
 ### B120 — device features assumed rather than checked (2026-11-11)
 
@@ -4071,18 +4019,15 @@ way is not covered. `infr-llama` does not depend on `infr-testkit`, so
 reset test in `seam/runner.rs` carry local copies. The Metal sites compile for
 the Apple target but were not run.
 
-### B144 — infr-vulkan unit tests build coopmat kernels without checking the device (2026-11-12)
+### B144 — recorder tests built with `be_with` ignore `INFR_DEV` (2026-11-12)
 
-On the iGPU (RADV RAPHAEL_MENDOCINO, no WMMA)
-`cargo test -p infr-vulkan --lib -- --include-ignored` dies inside Mesa with
-"ACO ERROR … Unsupported opcode v_wmma_f32_16x16x16_f16": SIGSEGV in
-`gemm::tests::coopmat_gemm_tiled_matches_cpu`, and with `gemm::tests` skipped,
-SIGABRT in `recorder::tests::matmul_native_splitk_f16_matches_cpu`. The same set
-passes on the RX 7900 XTX. Those tests should skip when the device lacks the
-cooperative matrix feature, the way the product's kernel tiering does. Observed
-during the 2026-11-12 slice with no run of the previous commit for comparison,
-so "old behaviour" is inferred from the tests not having changed. `AGENTS.md`
-asks for GPU testing on the iGPU, which this blocks for the lib tests.
+The recorder unit tests that build their backend through `be_with` use
+`Config::default()`, so they run on the default device (the RX 7900 XTX here)
+whatever `INFR_DEV` says. An "iGPU" run of `cargo test -p infr-vulkan --lib`
+therefore still exercises the discrete GPU for those tests, which is how the
+flash tests appeared to pass on a device without the cooperative-matrix tier.
+Tests that dispatch cooperative-matrix kernels directly now skip without that
+tier, and the full `--include-ignored` run completes on the iGPU.
 
 ### B140 — tests that CI reports as passed without running them (2026-11-11)
 
@@ -4140,11 +4085,9 @@ asks for GPU testing on the iGPU, which this blocks for the lib tests.
 ### B142 — none of this review's bugs has a test that would catch it (2026-11-11)
 
 The test reviewer was asked, for six of the findings above, whether an existing
-test would fail. All six answers were no; B129 and B130 have since been fixed
-with tests, and the remaining four are:
+test would fail. All six answers were no; B116, B129 and B130 have since been
+fixed with tests, and the remaining three are:
 
-- B116 (quantised-KV prefill off a tile boundary): the tests that probably reach
-  it assert only non-degenerate output.
 - B122 (262144-row head): no GEMV test is that tall, and a token comparison
   cannot see an out-of-bounds read.
 - B123 (`in_f % 64 == 32`): every native GEMM shape tested uses a width of 64,

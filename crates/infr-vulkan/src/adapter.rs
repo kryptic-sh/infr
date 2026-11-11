@@ -4,7 +4,7 @@
 //! `Graph` runs on either backend. Built incrementally; ops not yet mapped return an error.
 
 use crate::linear::native_dense_supported;
-use crate::recorder::Recorder;
+use crate::recorder::{Recorder, FLASH_KV_TILE, NONFA_KV_TILE};
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
@@ -2922,6 +2922,10 @@ fn lower_op(
                 // Read ONCE and share: `flash_geom` (below) and `nc_fa_ok` (further down) both floor
                 // on this row count and MUST agree — two reads risked a divergence trap.
                 let flash_min_rows: usize = be_.cfg().kernels.vulkan.flash_min_rows;
+                // How far past kv_len each coopmat prefill tier reads K/V: shared by its gate below
+                // and by the dequant scratch sizing, so the two cannot disagree.
+                let flash_read_rows = kv_len.div_ceil(FLASH_KV_TILE) * FLASH_KV_TILE;
+                let nonfa_read_rows = kv_len.div_ceil(NONFA_KV_TILE) * NONFA_KV_TILE;
                 let flash_geom = (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && hd == 128
                     // The flash kernels read K/V in BN=64 column tiles, so the last tile over-reads up
@@ -2932,7 +2936,7 @@ fn lower_op(
                     // is 64-aligned / has >=64 slack (the golden ctx sizes); only a tightly-sized,
                     // non-64-aligned cache (e.g. MTP whole-prompt verify) reroutes to the safe split-K
                     // path instead of over-reading past the allocation.
-                    && kv_len.div_ceil(64) * 64 <= att_cap_rows
+                    && flash_read_rows <= att_cap_rows
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
                     && be_.caps().f16_coopmat()
@@ -2960,51 +2964,6 @@ fn lower_op(
                     && ((k_q8 && rows > 1) || (is_kv_prepass(kdt) && !decode_inline));
                 let deq_v = flash_deq_fmt.is_none()
                     && ((v_q8 && rows > 1) || (is_kv_prepass(vdt) && !decode_inline));
-                // Ring cache: only att_cap_rows rows exist — dequant the WHOLE ring (element i →
-                // element i keeps the ring layout, so the f16 scratch is read with the same
-                // row-modulo mapping as the cache itself). Identity on full-context caches.
-                let ne = kv_len.min(att_cap_rows) * nkv * hd;
-                // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
-                // else the shared quant/bf16 dequant (dequant_kv_f16).
-                // #74: the dequant READERS read the SOURCE cache (`r(*k_cache)?`/`r(*v_cache)?`, always
-                // a KvCache with a device address) by pointer. dequant_q8_f16/dequant_kv_f16 are BDA-only
-                // (slice 5) — they read `src.device_addr()` internally; `src` still stays bound at the
-                // read slot so the store→dequant-read barrier survives. The f32 cast (store_f16) writes
-                // the f16 SCRATCH `sc` (Activations, no address) → bound; turbo dequant is deferred/bound.
-                let kc_key = if deq_k {
-                    let k = pooled(pool, be_, "kvdeq_k", ne * 2)?;
-                    let sc = pool[&k].as_ref();
-                    let src = r(*k_cache)?;
-                    if k_q8 {
-                        rec.dequant_q8_f16(src, sc, ne, cap);
-                    } else if matches!(kdt, infr_core::DType::F32) {
-                        rec.store_f16(src, sc, ne, 0);
-                    } else if is_turbo(kdt) {
-                        rec.dequant_turbo_f16(kdt, src, sc, ne);
-                    } else {
-                        rec.dequant_kv_f16(kdt, src, sc, ne);
-                    }
-                    Some(k)
-                } else {
-                    None
-                };
-                let vc_key = if deq_v {
-                    let k = pooled(pool, be_, "kvdeq_v", ne * 2)?;
-                    let sc = pool[&k].as_ref();
-                    let src = r(*v_cache)?;
-                    if v_q8 {
-                        rec.dequant_q8_f16(src, sc, ne, cap);
-                    } else if matches!(vdt, infr_core::DType::F32) {
-                        rec.store_f16(src, sc, ne, 0);
-                    } else if is_turbo(vdt) {
-                        rec.dequant_turbo_f16(vdt, src, sc, ne);
-                    } else {
-                        rec.dequant_kv_f16(vdt, src, sc, ne);
-                    }
-                    Some(k)
-                } else {
-                    None
-                };
                 // A dequanted side reads the f16 scratch; native Q8 read only when not dequanted.
                 // Dequant-in-flash reads the quant cache DIRECTLY (neither f16 scratch nor native-Q8
                 // planar read), so force q8-eff off — flash_ok then reduces to `flash_geom`.
@@ -3068,13 +3027,70 @@ fn lower_op(
                     // row mapping the tile loads could use, so fall to the split path (which has
                     // the row-modulo mapping). Full-context caches only hit this within 256 rows
                     // of their very end, where the split path is equally correct.
-                    && kv_len.div_ceil(256) * 256 <= att_cap_rows
+                    && nonfa_read_rows <= att_cap_rows
                     && hd % 64 == 0
                     && hd <= 512
                     && !(k_q8_eff || v_q8_eff)
                     && be_.caps().f16_coopmat()
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
+                // Ring cache: only att_cap_rows rows exist — dequant the WHOLE ring (element i →
+                // element i keeps the ring layout, so the f16 scratch is read with the same
+                // row-modulo mapping as the cache itself). Identity on full-context caches.
+                // The coopmat tier picked above reads K/V in whole tiles past kv_len (its gate
+                // bounds that padded read by att_cap_rows), and a non-finite pad row of V turns its
+                // zero softmax weight into a NaN output. So the scratch covers exactly that padded
+                // read, filled from the cache's own rows past kv_len (zero from allocation, or
+                // stale store output). Every other tier reads only up to kv_len.
+                let deq_rows = if flash_ok {
+                    flash_read_rows
+                } else if nonfa_ok {
+                    nonfa_read_rows
+                } else {
+                    kv_len
+                };
+                let ne = deq_rows.min(att_cap_rows) * nkv * hd;
+                // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
+                // else the shared quant/bf16 dequant (dequant_kv_f16).
+                // #74: the dequant READERS read the SOURCE cache (`r(*k_cache)?`/`r(*v_cache)?`, always
+                // a KvCache with a device address) by pointer. dequant_q8_f16/dequant_kv_f16 are BDA-only
+                // (slice 5) — they read `src.device_addr()` internally; `src` still stays bound at the
+                // read slot so the store→dequant-read barrier survives. The f32 cast (store_f16) writes
+                // the f16 SCRATCH `sc` (Activations, no address) → bound; turbo dequant is deferred/bound.
+                let kc_key = if deq_k {
+                    let k = pooled(pool, be_, "kvdeq_k", ne * 2)?;
+                    let sc = pool[&k].as_ref();
+                    let src = r(*k_cache)?;
+                    if k_q8 {
+                        rec.dequant_q8_f16(src, sc, ne, cap);
+                    } else if matches!(kdt, infr_core::DType::F32) {
+                        rec.store_f16(src, sc, ne, 0);
+                    } else if is_turbo(kdt) {
+                        rec.dequant_turbo_f16(kdt, src, sc, ne);
+                    } else {
+                        rec.dequant_kv_f16(kdt, src, sc, ne);
+                    }
+                    Some(k)
+                } else {
+                    None
+                };
+                let vc_key = if deq_v {
+                    let k = pooled(pool, be_, "kvdeq_v", ne * 2)?;
+                    let sc = pool[&k].as_ref();
+                    let src = r(*v_cache)?;
+                    if v_q8 {
+                        rec.dequant_q8_f16(src, sc, ne, cap);
+                    } else if matches!(vdt, infr_core::DType::F32) {
+                        rec.store_f16(src, sc, ne, 0);
+                    } else if is_turbo(vdt) {
+                        rec.dequant_turbo_f16(vdt, src, sc, ne);
+                    } else {
+                        rec.dequant_kv_f16(vdt, src, sc, ne);
+                    }
+                    Some(k)
+                } else {
+                    None
+                };
                 // NON-COOPMAT flash tier (`attn_nc_fa.comp`, the attention companion of the
                 // `nc_mmq`/`nc_fma` GEMM tier): flash/nonfa above are coopmat SPIR-V, so a device
                 // without the feature (Intel Arc/ANV) previously ran ALL prefill attention on the
@@ -3188,7 +3204,7 @@ fn lower_op(
                 // when this fell through to the scalar `attention_kv` fallback below). Route it to
                 // the split-K path instead: `attn_partial`'s `cap` push constant already carries a
                 // correct (identity, since kv_len < att_cap_rows always holds) row mapping.
-                let cap_short = kv_len.div_ceil(256) * 256 > att_cap_rows;
+                let cap_short = nonfa_read_rows > att_cap_rows;
                 let chunk = if canvas_lo.is_some() && kv_len >= 2 {
                     let n = CANVAS_CHUNK_N.clamped(be_.cfg().kernels.vulkan.canvas_chunk_n);
                     kv_len.div_ceil(n).min(kv_len - 1).max(1)
@@ -3904,13 +3920,13 @@ fn lower_op(
                 infr_core::graph::MoeGating::Sigmoid => 1u32,
                 infr_core::graph::MoeGating::SqrtSoftplus => 2u32,
             };
-            // exp_probs_b: resolve if present, else bind a dummy zero buffer (the shader ignores
-            // it when `has_bias == 0`). One float is enough — the shader reads only indices
-            // < n_expert, which push constants clamp before the bias buffer is touched.
+            // exp_probs_b: resolve if present, else bind the backend's placeholder (the shader
+            // ignores it when `has_bias == 0`). One float is enough — the shader reads only
+            // indices < n_expert, which push constants clamp before the bias buffer is touched.
             let bias_buf: &dyn Buffer = if let Some(epb) = exp_probs_b {
                 r(*epb)?
             } else {
-                &*be_.alloc_uninit(4, BufferUsage::Weights)?
+                be_.unused_binding()?
             };
             let has_bias = exp_probs_b.is_some();
             // DeepSeek V4 hash routing: the selection arrives pre-gathered, so `moe_topk` copies
@@ -3920,7 +3936,7 @@ fn lower_op(
             let hash_buf: &dyn Buffer = if let Some(hid) = expert_ids {
                 r(*hid)?
             } else {
-                &*be_.alloc_uninit(4, BufferUsage::Activations)?
+                be_.unused_binding()?
             };
             let hash = expert_ids.is_some();
             if hash && (has_bias || *n_expert_groups > 1) {
@@ -5000,138 +5016,156 @@ fn record_decode_replay(
     // (no dyn kernel reads the `positions` buffer; they all read params). INFR_NO_GPU_POS=1
     // keeps the per-replay host read_pos0 + params upload instead (A/B).
     let self_advancing = be_.cfg().kernels.vulkan.gpu_pos;
-    if self_advancing {
-        let pos0 = read_pos0(be_, resolve(&scratch, bindings, positions)?)?;
-        let mut pbytes = [0u8; 8];
-        pbytes[0..4].copy_from_slice(&pos0.wrapping_sub(1).to_le_bytes());
-        pbytes[4..8].copy_from_slice(&pos0.to_le_bytes());
-        be_.upload(params.as_ref(), &pbytes)?;
-        // Cross-iteration fence for the chained decode (replay_n submits this recording n times
-        // back-to-back): orders iteration i's tail writes (sampled id, id_log) before iteration
-        // i+1's head reads (params_advance, EmbedGather). One extra barrier per token — noise.
-        rec.global_barrier();
-        rec.params_advance(params.as_ref());
-    }
-    let mode = RopeMode::Dynamic(params.as_ref());
-    let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
-    for (op_idx, op) in graph.ops.iter().enumerate() {
-        if skip_op.contains(&op_idx) {
-            continue;
+    // `Recorder` has no `Drop`, and a closed segment is only freed once it is inside a
+    // `RecordedCmd`, so every error from here on must tear both down (see `abort_segment`) rather
+    // than leak a command buffer and its descriptor pools. Hence one fallible block.
+    let recorded_ops = (|| -> Result<Option<Box<dyn Buffer>>> {
+        if self_advancing {
+            let pos0 = read_pos0(be_, resolve(&scratch, bindings, positions)?)?;
+            let mut pbytes = [0u8; 8];
+            pbytes[0..4].copy_from_slice(&pos0.wrapping_sub(1).to_le_bytes());
+            pbytes[4..8].copy_from_slice(&pos0.to_le_bytes());
+            be_.upload(params.as_ref(), &pbytes)?;
+            // Cross-iteration fence for the chained decode (replay_n submits this recording n times
+            // back-to-back): orders iteration i's tail writes (sampled id, id_log) before iteration
+            // i+1's head reads (params_advance, EmbedGather). One extra barrier per token — noise.
+            rec.global_barrier();
+            rec.params_advance(params.as_ref());
         }
-        // Split BETWEEN ops, never inside one (a single op can lower to several dispatches sharing
-        // transient scratch whose ordering is per-recorder): once the current segment reaches the
-        // cap, close it and open a fresh persistent recorder. Its leading `seed_barrier` seeds the
-        // cross-segment RAW/WAR ordering that per-recorder hazard tracking (which starts empty)
-        // can't otherwise see — every layer reads the residual stream a prior segment wrote. cap ==
-        // 0 (discrete) never trips this — ONE segment, byte-identical to the record-once fast path.
-        if cap > 0 && rec.dispatches() >= cap {
-            let fresh = be_.recorder_persistent()?;
-            fresh.seed_barrier();
-            segments.push(
-                std::mem::replace(&mut rec, fresh)
-                    .end_segment()
-                    .map_err(|e| be(e.to_string()))?,
-            );
-        }
-        // Peephole: fuse Op::Linear (f32, m<=4) + Op::GatedAct (Gelu, strided up) into one
-        // e2b_gate dispatch for E2B per-layer inp_gate projections.
-        if let Op::Linear {
-            x,
-            weight,
-            dst,
-            m,
-            in_f,
-            out_f,
-            ..
-        } = op
-        {
-            if graph.desc(*weight).dtype == infr_core::DType::F32
-                && *m <= 4
-                && op_idx + 1 < graph.ops.len()
+        let mode = RopeMode::Dynamic(params.as_ref());
+        let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
+        for (op_idx, op) in graph.ops.iter().enumerate() {
+            if skip_op.contains(&op_idx) {
+                continue;
+            }
+            // Split BETWEEN ops, never inside one (a single op can lower to several dispatches sharing
+            // transient scratch whose ordering is per-recorder): once the current segment reaches the
+            // cap, close it and open a fresh persistent recorder. Its leading `seed_barrier` seeds the
+            // cross-segment RAW/WAR ordering that per-recorder hazard tracking (which starts empty)
+            // can't otherwise see — every layer reads the residual stream a prior segment wrote. cap ==
+            // 0 (discrete) never trips this — ONE segment, byte-identical to the record-once fast path.
+            if cap > 0 && rec.dispatches() >= cap {
+                let fresh = be_.recorder_persistent()?;
+                fresh.seed_barrier();
+                segments.push(
+                    std::mem::replace(&mut rec, fresh)
+                        .end_segment()
+                        .map_err(|e| be(e.to_string()))?,
+                );
+            }
+            // Peephole: fuse Op::Linear (f32, m<=4) + Op::GatedAct (Gelu, strided up) into one
+            // e2b_gate dispatch for E2B per-layer inp_gate projections.
+            if let Op::Linear {
+                x,
+                weight,
+                dst,
+                m,
+                in_f,
+                out_f,
+                ..
+            } = op
             {
-                if let Op::GatedAct {
-                    gate: g_gate,
-                    up: g_up,
-                    dst: g_dst,
-                    act: Activation::Gelu,
-                    up_off: g_off,
-                    up_stride: g_stride,
-                    ..
-                } = &graph.ops[op_idx + 1]
+                if graph.desc(*weight).dtype == infr_core::DType::F32
+                    && *m <= 4
+                    && op_idx + 1 < graph.ops.len()
                 {
-                    if *g_gate == *dst && *g_dst == *dst && *g_stride > 0 {
-                        let (w_, x_, up_, y_) = (
-                            resolve(&scratch, bindings, *weight)?,
-                            resolve(&scratch, bindings, *x)?,
-                            resolve(&scratch, bindings, *g_up)?,
-                            resolve(&scratch, bindings, *dst)?,
-                        );
-                        rec.e2b_gate(
-                            w_,
-                            x_,
-                            up_,
-                            *g_off as usize,
-                            *g_stride as usize,
-                            y_,
-                            *m as usize,
-                            *in_f as usize,
-                            *out_f as usize,
-                        );
-                        skip_op.insert(op_idx + 1);
-                        continue;
+                    if let Op::GatedAct {
+                        gate: g_gate,
+                        up: g_up,
+                        dst: g_dst,
+                        act: Activation::Gelu,
+                        up_off: g_off,
+                        up_stride: g_stride,
+                        ..
+                    } = &graph.ops[op_idx + 1]
+                    {
+                        if *g_gate == *dst && *g_dst == *dst && *g_stride > 0 {
+                            let (w_, x_, up_, y_) = (
+                                resolve(&scratch, bindings, *weight)?,
+                                resolve(&scratch, bindings, *x)?,
+                                resolve(&scratch, bindings, *g_up)?,
+                                resolve(&scratch, bindings, *dst)?,
+                            );
+                            rec.e2b_gate(
+                                w_,
+                                x_,
+                                up_,
+                                *g_off as usize,
+                                *g_stride as usize,
+                                y_,
+                                *m as usize,
+                                *in_f as usize,
+                                *out_f as usize,
+                            );
+                            skip_op.insert(op_idx + 1);
+                            continue;
+                        }
                     }
                 }
             }
+            lower_op(
+                be_,
+                graph,
+                op_idx,
+                op,
+                &rec,
+                &scratch,
+                bindings,
+                &fused_kv_write,
+                &fused_add,
+                &mode,
+                &mut transient,
+                &mut dyn_args,
+                &mut pool,
+                &mut mmv_memo,
+                None,
+            )?;
         }
-        lower_op(
-            be_,
-            graph,
-            op_idx,
-            op,
-            &rec,
-            &scratch,
-            bindings,
-            &fused_kv_write,
-            &fused_add,
-            &mode,
-            &mut transient,
-            &mut dyn_args,
-            &mut pool,
-            &mut mmv_memo,
-            None,
-        )?;
-    }
-    for c in dyn_args.drain(..) {
-        transient.extend([c.args, c.pm, c.pl, c.pacc]);
-    }
-    transient.extend(pool.into_values());
-    // Chained decode: when the graph ends in a device-side sampler (Argmax/Sample), log each
-    // iteration's id into a host-visible ring so `execute_chain` reads the whole chunk in one go.
-    let ring = if self_advancing {
-        graph
-            .ops
-            .iter()
-            .find_map(|op| match op {
-                Op::Argmax { dst, .. } | Op::Sample { dst, .. } => Some(*dst),
-                _ => None,
-            })
-            .map(|dst| -> Result<Box<dyn Buffer>> {
-                let rb = be_.alloc(64 * 4, BufferUsage::Readback)?;
-                rec.id_log(
-                    params.as_ref(),
-                    resolve(&scratch, bindings, dst)?,
-                    rb.as_ref(),
-                );
-                Ok(rb)
-            })
-            .transpose()?
-    } else {
-        None
+        for c in dyn_args.drain(..) {
+            transient.extend([c.args, c.pm, c.pl, c.pacc]);
+        }
+        transient.extend(pool.into_values());
+        // Chained decode: when the graph ends in a device-side sampler (Argmax/Sample), log each
+        // iteration's id into a host-visible ring so `execute_chain` reads the whole chunk in one go.
+        Ok(if self_advancing {
+            graph
+                .ops
+                .iter()
+                .find_map(|op| match op {
+                    Op::Argmax { dst, .. } | Op::Sample { dst, .. } => Some(*dst),
+                    _ => None,
+                })
+                .map(|dst| -> Result<Box<dyn Buffer>> {
+                    let rb = be_.alloc(64 * 4, BufferUsage::Readback)?;
+                    rec.id_log(
+                        params.as_ref(),
+                        resolve(&scratch, bindings, dst)?,
+                        rb.as_ref(),
+                    );
+                    Ok(rb)
+                })
+                .transpose()?
+        } else {
+            None
+        })
+    })();
+    let ring = match recorded_ops {
+        Ok(ring) => ring,
+        Err(e) => {
+            drop(crate::recorder::RecordedCmd::from_segments(be_, segments));
+            return Err(abort_segment(be_, Some(rec), e));
+        }
     };
     // Close the final segment (holds the trailing `id_log`) and assemble the recording. A discrete
     // GPU (cap == 0) never split, so `segments` is exactly this one — a single-segment `RecordedCmd`
     // that replays in one submit, unchanged.
-    segments.push(rec.end_segment().map_err(|e| be(e.to_string()))?);
+    match rec.end_segment() {
+        Ok(seg) => segments.push(seg),
+        Err(e) => {
+            drop(crate::recorder::RecordedCmd::from_segments(be_, segments));
+            return Err(be(e.to_string()));
+        }
+    }
     let recorded = crate::recorder::RecordedCmd::from_segments(be_, segments);
     Ok(DecodeReplay {
         scratch,
@@ -5156,11 +5190,53 @@ fn record_decode_replay(
 ///
 /// A teardown failure is folded into the message instead of replacing it — the original error is
 /// why the forward stopped, and it is the one worth reading.
-fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
-    match rec.map(|partial| partial.discard()) {
+fn abort_segment(be_: &VulkanBackend, rec: Option<Recorder<'_>>, e: Error) -> Error {
+    match rec.map(|partial| discard_segment(be_, partial)) {
         Some(Err(de)) => be(format!("{e} (partial segment teardown also failed: {de})")),
         _ => e,
     }
+}
+
+/// Discard an unsubmitted segment. A weight pager has already recorded the blocks whose ring→arena
+/// copies went into it as resident; those copies will now never run, so take the placements back
+/// first, or a later forward would read each slot's previous occupant as the requested weights.
+fn discard_segment(be_: &VulkanBackend, rec: Recorder<'_>) -> Result<()> {
+    forget_staged(be_, rec.serial());
+    rec.discard()
+}
+
+/// Take back every weight-pager placement whose copy went into recording `serial`, which will
+/// never run: it is being discarded, or its submit failed after consuming it.
+fn forget_staged(be_: &VulkanBackend, serial: u64) {
+    if let Some(s) = be_.moe_pager().lock().unwrap().as_mut() {
+        s.forget_unsubmitted(serial);
+    }
+    if let Some(s) = be_.dense_pager().lock().unwrap().as_mut() {
+        s.forget_unsubmitted(serial);
+    }
+}
+
+/// [`Recorder::finish`] (blocking), undoing the recording's staged placements if it fails — see
+/// [`submit_nowait`].
+fn submit_wait(be_: &VulkanBackend, rec: Recorder<'_>) -> Result<()> {
+    let serial = rec.serial();
+    rec.finish().map_err(|e| {
+        forget_staged(be_, serial);
+        be(e.to_string())
+    })
+}
+
+/// [`Recorder::finish_nowait`], undoing the recording's staged placements if the submit fails —
+/// the recorder is consumed either way, so `abort_segment` never sees it.
+fn submit_nowait(
+    be_: &VulkanBackend,
+    rec: Recorder<'_>,
+) -> Result<crate::recorder::PendingSegment> {
+    let serial = rec.serial();
+    rec.finish_nowait().map_err(|e| {
+        forget_staged(be_, serial);
+        be(e.to_string())
+    })
 }
 
 /// Per-execute static recording: allocate `Internal` scratch fresh, record every op via `lower_op`
@@ -5280,7 +5356,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         //     (`MAX_INFLIGHT`) is the real latency bound.
         if shutdown_requested() {
             let partial = rec.take().expect("segment always Some between ops");
-            partial.discard().map_err(|e| be(e.to_string()))?;
+            discard_segment(be_, partial).map_err(|e| be(e.to_string()))?;
             for seg in segments {
                 seg.wait().map_err(|e| be(e.to_string()))?;
             }
@@ -5293,11 +5369,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // share transient scratch, and the hazard tracking that orders them is per-recorder.
         // Crossing the cap therefore closes the segment at the next op boundary.
         if cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap) {
-            let seg = rec
-                .take()
-                .expect("segment always Some between ops")
-                .finish_nowait()
-                .map_err(|e| be(e.to_string()))?;
+            let seg = submit_nowait(be_, rec.take().expect("segment always Some between ops"))?;
             submitted_dispatches += seg.dispatches();
             segments.push_back(seg);
             // Retire the oldest in-flight segment once the window is full. Queue execution is
@@ -5321,7 +5393,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         if let Op::MoeFfn { gate_exps, .. } = op {
             let gbuf = match resolve(&scratch, bindings, *gate_exps) {
                 Ok(b) => b,
-                Err(e) => return Err(abort_segment(rec.take(), e)),
+                Err(e) => return Err(abort_segment(be_, rec.take(), e)),
             };
             let paged = be_.moe_pager().lock().unwrap().as_ref().is_some_and(|s| {
                 s.is_paged(
@@ -5340,7 +5412,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     &mut rec,
                     &mut pstream,
                 ) {
-                    return Err(abort_segment(rec.take(), e));
+                    return Err(abort_segment(be_, rec.take(), e));
                 }
                 continue;
             }
@@ -5356,7 +5428,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             if let Op::Linear { weight, .. } = op {
                 let wid = match resolve(&scratch, bindings, *weight) {
                     Ok(w) => crate::pager::buffer_identity(w),
-                    Err(e) => return Err(abort_segment(rec.take(), e)),
+                    Err(e) => return Err(abort_segment(be_, rec.take(), e)),
                 };
                 let streamed = be_
                     .dense_pager()
@@ -5367,7 +5439,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 if streamed {
                     let arena_addr = match stage_dense_linear(be_, &mut rec, &mut pstream, wid) {
                         Ok(a) => a,
-                        Err(e) => return Err(abort_segment(rec.take(), e)),
+                        Err(e) => return Err(abort_segment(be_, rec.take(), e)),
                     };
                     if let Err(e) = lower_op(
                         be_,
@@ -5386,7 +5458,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                         &mut mmv_memo,
                         Some(arena_addr),
                     ) {
-                        return Err(abort_segment(rec.take(), e));
+                        return Err(abort_segment(be_, rec.take(), e));
                     }
                     continue;
                 }
@@ -5409,7 +5481,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &mut mmv_memo,
             None,
         ) {
-            return Err(abort_segment(rec.take(), e));
+            return Err(abort_segment(be_, rec.take(), e));
         }
     }
     for c in dyn_args.drain(..) {
@@ -5418,7 +5490,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     transient.extend(pool.into_values());
     let last = rec.take().expect("segment always Some at loop end");
     submitted_dispatches += last.dispatches();
-    last.finish().map_err(|e| be(e.to_string()))?;
+    submit_wait(be_, last)?;
     // The blocking finish above already waited the queue idle — draining just releases the
     // pipelined segments' command buffers/fences (every buffer they referenced outlives this
     // call: pooled scratch in `transient`, ring/tape/arenas on the session).
@@ -5492,11 +5564,7 @@ fn rotate_stream<'a>(
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
 ) -> Result<()> {
-    let seg = rec
-        .take()
-        .expect("segment always Some between ops")
-        .finish_nowait()
-        .map_err(|e| be(e.to_string()))?;
+    let seg = submit_nowait(be_, rec.take().expect("segment always Some between ops"))?;
     ps.pending[ps.half] = Some(seg);
     ps.half ^= 1;
     ps.cursor = 0;
@@ -5518,10 +5586,8 @@ fn sync_stream<'a>(
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
 ) -> Result<()> {
-    rec.take()
-        .expect("segment always Some between ops")
-        .finish()
-        .map_err(|e| be(e.to_string()))?;
+    let last = rec.take().expect("segment always Some between ops");
+    submit_wait(be_, last)?;
     ps.drain()?; // fences already signaled (queue idle) — releases their transient objects
     ps.cursor = 0;
     ps.tape_cursor = 0;
@@ -5799,18 +5865,18 @@ fn execute_paged_moe<'a>(
     let n_slots = rows * n_used;
     let r = |id: TensorId| resolve(scratch, bindings, id);
 
-    // Dummy bias buffer when exp_probs_b is absent (the shader ignores it when has_bias==0).
+    // Placeholder bias binding when exp_probs_b is absent (the shader ignores it when has_bias==0).
     let bias_buf: &dyn Buffer = if let Some(epb) = exp_probs_b {
         r(*epb)?
     } else {
-        &*be_.alloc_uninit(4, BufferUsage::Weights)?
+        be_.unused_binding()?
     };
     let has_bias = exp_probs_b.is_some();
     // Hash routing through the PAGER is unreached: the pager serves an expert bank too big for
     // VRAM (Llama-4-Scout), and DeepSeek V4's hash layers are not that model. Rather than carry a
     // second untested hash path here, bind the dummy and refuse — the resident arms above are
     // where hash routing is implemented and tested.
-    let hash_buf: &dyn Buffer = &*be_.alloc_uninit(4, BufferUsage::Activations)?;
+    let hash_buf: &dyn Buffer = be_.unused_binding()?;
     if expert_ids.is_some() {
         return Err(be(
             "vulkan adapter: paged MoeFfn does not implement hash routing (expert_ids)",
@@ -8020,6 +8086,151 @@ mod tests {
         }
     }
 
+    /// Prefill attention over a planar Q8_0 KV cache runs on the dequantised f16 scratch, and the
+    /// coopmat tiers read it in whole K/V tiles past `kv_len` (hd=128 takes the flash tier, hd=64
+    /// the non-FA tier). With `kv_len` off every tile boundary, a scratch sized to `kv_len` alone
+    /// is read past its end; the recorder's debug assertions on the K/V extent are what fail
+    /// here. A scratch that covers the tiles but leaves the pad unwritten fails on the output: a
+    /// debug build fills `alloc_uninit` buffers with NaN, and a NaN V row times its zero softmax
+    /// weight is NaN. Both checks need a debug build: in release the out-of-bounds read returns
+    /// whatever the device gives, so the output comparison alone cannot be relied on.
+    #[test]
+    #[ignore = "requires a Vulkan GPU with cooperative matrix"]
+    fn attention_q8_kv_prefill_off_tile_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        if !crate::test_has_f16_coopmat(&be_, "attention_q8_kv_prefill_off_tile_matches_host") {
+            return;
+        }
+        let (rows, kv_len, nh, nkv) = (64usize, 300usize, 4usize, 2usize);
+        // Room for the non-FA tier's 256-row padded read, so its gate (and flash's) holds.
+        let cap_rows = kv_len.div_ceil(256) * 256;
+        let pos = kv_len - rows;
+        let group = nh / nkv;
+        for hd in [128usize, 64] {
+            let scale = 1.0 / (hd as f32).sqrt();
+            let q: Vec<f32> = (0..rows * nh * hd)
+                .map(|i| half::f16::from_f32((i as f32 * 0.03).sin()).to_f32())
+                .collect();
+            let qf: Vec<u8> = q
+                .iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect();
+            // Rows past kv_len stay zero, like a freshly allocated cache.
+            let mut k = vec![0f32; cap_rows * nkv * hd];
+            let mut v = vec![0f32; cap_rows * nkv * hd];
+            for i in 0..kv_len * nkv * hd {
+                k[i] = (i as f32 * 0.011).cos();
+                v[i] = ((i % 173) as f32) * 0.011 - 0.9;
+            }
+            // Planar Q8_0 (store_q8.comp): int8 codes for all `cap` elements, then one f16 scale
+            // per 32-element block.
+            let planar = |x: &[f32]| -> (Vec<u8>, Vec<f32>) {
+                let blocks = q8_0(x);
+                let cap = x.len();
+                let mut out = vec![0u8; cap + cap / 32 * 2];
+                for (b, blk) in blocks.chunks(34).enumerate() {
+                    out[cap + b * 2..cap + b * 2 + 2].copy_from_slice(&blk[..2]);
+                    out[b * 32..b * 32 + 32].copy_from_slice(&blk[2..]);
+                }
+                (out, deq_q8(&blocks))
+            };
+            let (kq, kd) = planar(&k);
+            let (vq, vd) = planar(&v);
+            let mut want = vec![0f32; rows * nh * hd];
+            for r0 in 0..rows {
+                let end = pos + r0 + 1;
+                for h in 0..nh {
+                    let kvh = h / group;
+                    let sc: Vec<f32> = (0..end)
+                        .map(|j| {
+                            (0..hd)
+                                .map(|x| q[(r0 * nh + h) * hd + x] * kd[(j * nkv + kvh) * hd + x])
+                                .sum::<f32>()
+                                * scale
+                        })
+                        .collect();
+                    let mx = sc.iter().fold(f32::NEG_INFINITY, |m, &s| m.max(s));
+                    let l: f32 = sc.iter().map(|s| (s - mx).exp()).sum();
+                    for (j, &s) in sc.iter().enumerate() {
+                        let p = (s - mx).exp() / l;
+                        for x in 0..hd {
+                            want[(r0 * nh + h) * hd + x] += p * vd[(j * nkv + kvh) * hd + x];
+                        }
+                    }
+                }
+            }
+            // The coopmat tiers need row-padded (Internal) q and dst, so route through copies.
+            let n = rows * nh * hd;
+            let mut g = Graph::new();
+            let qin = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F16));
+            let qi = g.internal(TensorDesc::new(vec![rows, nh, hd], DType::F16));
+            let ki = g.input(TensorDesc::new(vec![cap_rows, nkv, hd], DType::Q8_0));
+            let vi = g.input(TensorDesc::new(vec![cap_rows, nkv, hd], DType::Q8_0));
+            let di = g.internal(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+            let yi = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+            g.push(Op::Copy {
+                src: qin,
+                src_off: 0,
+                dst: qi,
+                dst_off: 0,
+                n: n as u32,
+            });
+            g.push(Op::Attention {
+                q: qi,
+                k_cache: ki,
+                v_cache: vi,
+                dst: di,
+                rows: rows as u32,
+                kv_len: kv_len as u32,
+                n_head: nh as u32,
+                n_kv: nkv as u32,
+                head_dim: hd as u32,
+                scale,
+                mask: AttnMask::Causal,
+                pos: pos as u32,
+                sinks: None,
+                key_bias: None,
+            });
+            g.push(Op::Copy {
+                src: di,
+                src_off: 0,
+                dst: yi,
+                dst_off: 0,
+                n: n as u32,
+            });
+            let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
+            let kb = be_.alloc(kq.len(), BufferUsage::KvCache).unwrap();
+            let vb = be_.alloc(vq.len(), BufferUsage::KvCache).unwrap();
+            let yb = be_.alloc(n * 4, BufferUsage::Activations).unwrap();
+            be_.upload(qb.as_ref(), &qf).unwrap();
+            be_.upload(kb.as_ref(), &kq).unwrap();
+            be_.upload(vb.as_ref(), &vq).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(qin, qb.as_ref());
+            bind.bind(ki, kb.as_ref());
+            bind.bind(vi, vb.as_ref());
+            bind.bind(yi, yb.as_ref());
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; n];
+            be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            for i in 0..n {
+                assert!(
+                    (got[i] - want[i]).abs() < 5e-3,
+                    "q8 KV prefill attention hd={hd} mismatch at {i} (row {} head {}): got {} \
+                     want {}",
+                    i / (nh * hd),
+                    (i / hd) % nh,
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
     // ---- Q8_0 helpers (block=32: f16 scale + 32×int8 = 34 bytes) so a MoE test can bind id-native
     // expert banks and the host reference dequants the SAME rounded values the GPU shader does. ----
     fn q8_0(x: &[f32]) -> Vec<u8> {
@@ -8283,7 +8494,85 @@ mod tests {
                     want[i]
                 );
             }
+            // Every execute lowers the MoeFfn again, binding a placeholder in the absent
+            // `exp_probs_b` slot. The weight arena never rewinds, so a placeholder taken from it
+            // would grow it on every pass.
+            let arena_bytes = || -> u64 {
+                be_.bda_weight_arena
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map_or(0, |a| a.blocks.iter().map(|b| b.cursor).sum())
+            };
+            let before = arena_bytes();
+            for _ in 0..3 {
+                be_.execute(plan.as_ref(), &bind).unwrap();
+            }
+            assert_eq!(
+                arena_bytes(),
+                before,
+                "re-executing a MoeFfn plan grew the weight arena (rows={rows})"
+            );
         }
+    }
+
+    /// A staged expert miss records its ring→arena copy into the ambient segment. When a later
+    /// failure discards that segment, the copy never runs, so the expert must be a miss again on
+    /// the next staging — a hit would serve the slot's previous contents as its weights. Ring
+    /// bytes consumed are the observable: a miss stages a full slot, a hit stages nothing.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn discarded_segment_forgets_staged_expert() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (slot_bytes, n_expert, buf_id) = (256usize, 2usize, 1usize);
+        be_.init_moe_pager(crate::pager::MoePagerLayout {
+            n_blocks: n_expert,
+            pools: vec![crate::pager::MoePoolSpec {
+                role: crate::pager::Role::Gate,
+                slot_bytes,
+                n_slots: 1,
+                host: None,
+            }],
+            ring_bytes: 0,
+        })
+        .unwrap();
+        let bank: Vec<u8> = (0..n_expert * slot_bytes).map(|i| i as u8).collect();
+        be_.register_paged_expert(
+            crate::pager::Role::Gate,
+            buf_id,
+            crate::pager::ExpertSource {
+                bytes: crate::pager::ExpertBytes::Mmap(std::sync::Arc::new(bank)),
+                stride_bytes: slot_bytes,
+                layer_base: 0,
+            },
+            n_expert,
+        )
+        .unwrap();
+        // Ring bytes `stage_role` consumes staging expert 0 into `rec`.
+        let stage = |rec: &Recorder<'_>| -> usize {
+            let mut guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_mut().unwrap();
+            sess.begin_batch(buf_id).unwrap();
+            let mut cursor = 0usize;
+            assert_eq!(
+                sess.stage_role(rec, 0, &mut cursor, buf_id, &[0], false)
+                    .unwrap(),
+                1
+            );
+            cursor
+        };
+        let rec = be_.recorder().unwrap();
+        assert_eq!(stage(&rec), slot_bytes, "first staging must be a miss");
+        discard_segment(&be_, rec).unwrap();
+        let rec = be_.recorder().unwrap();
+        assert_eq!(
+            stage(&rec),
+            slot_bytes,
+            "expert staged into a discarded segment was still treated as resident"
+        );
+        rec.finish().unwrap();
     }
 
     /// Expert parallelism (`crate::ep::ExpertParallelBackend`): a 2-device EXPERT split of the SAME

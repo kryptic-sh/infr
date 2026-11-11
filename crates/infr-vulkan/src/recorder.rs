@@ -884,6 +884,8 @@ pub struct Recorder<'a> {
     /// [`Self::chunk_caps`].
     bda_chunk_elem_cap: u64,
     bda_chunk_byte_cap: u64,
+    /// Process-unique id of this recording (see [`Self::serial`]).
+    serial: u64,
 }
 
 /// Intern a profiling shape label, leaking each DISTINCT string at most ONCE and handing back the
@@ -918,6 +920,15 @@ fn intern_label(s: String) -> &'static str {
     set.insert(leaked);
     leaked
 }
+
+/// K/V rows per tile the flash prefill kernels load (their BN): they read up to `kv_len` rounded
+/// up to this.
+pub(crate) const FLASH_KV_TILE: usize = 64;
+/// K/V rows the non-FA prefill pads `kv_len` to (the 8-warp `attn_qk`'s BN).
+pub(crate) const NONFA_KV_TILE: usize = 256;
+
+/// Source of [`Recorder::serial`].
+static NEXT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl<'a> Recorder<'a> {
@@ -1017,7 +1028,15 @@ impl<'a> Recorder<'a> {
             dispatches: std::cell::Cell::new(0),
             bda_chunk_elem_cap,
             bda_chunk_byte_cap,
+            serial: NEXT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
+    }
+
+    /// Process-unique id of this recording. Unlike the command buffer handle, never reused, so
+    /// state noted against a recording (the weight pagers' staged placements) can be matched to
+    /// the one that is later discarded rather than to an earlier, submitted one.
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// The Vulkan kernel-tier config this recorder steers on — BORROWED off the backend that
@@ -5066,9 +5085,19 @@ impl<'a> Recorder<'a> {
         scale: f32,
     ) {
         let mpad = (n.div_ceil(64) * 64) as u32;
-        // kv padded to 256 (the 8-warp attn_qk's BN); extra cols are masked in softmax. Still %64 so
-        // the 4-warp fallback + softmax + attn_pv are unaffected.
-        let kv_pad = (kv_len.div_ceil(256) * 256) as u32;
+        // kv padded to NONFA_KV_TILE; extra cols are masked in softmax. Still %64 so the 4-warp
+        // fallback + softmax + attn_pv are unaffected.
+        let kv_pad = (kv_len.div_ceil(NONFA_KV_TILE) * NONFA_KV_TILE) as u32;
+        // attn_qk and attn_pv load every K/V row up to kv_pad unguarded. Past the buffer that is
+        // undefined, and inside it a non-finite V row still poisons the PV product (0 × NaN).
+        let kv_bytes = kv_pad as usize * nkv * hd * 2;
+        debug_assert!(
+            kc.len_bytes() >= kv_bytes && vc.len_bytes() >= kv_bytes,
+            "attention_prefill_nonfa: K/V ({} / {} B) must cover the {kv_pad}-row padded read \
+             ({kv_bytes} B)",
+            kc.len_bytes(),
+            vc.len_bytes()
+        );
         let hdu = hd as u32;
         // scale override: >0 uses the caller's value (gemma4 = 1.0, QK-norm controls magnitude);
         // 0 keeps the default 1/√hd (qwen3, gemma3).
@@ -5233,6 +5262,18 @@ impl<'a> Recorder<'a> {
         kv_addr: Option<(u64, u64)>,
     ) {
         let mpad = (n.div_ceil(64) * 64) as u32;
+        // The `Off` builds load whole K/V tiles straight from the bound buffers with no kv_len
+        // guard (the staged builds guard theirs), so those buffers must cover the padded rows.
+        if matches!(stage, FlashStage::Off) {
+            let kv_bytes = kv_len.div_ceil(FLASH_KV_TILE) * FLASH_KV_TILE * nkv * hd * 2;
+            debug_assert!(
+                kc.len_bytes() >= kv_bytes && vc.len_bytes() >= kv_bytes,
+                "attention_prefill_flash: K/V ({} / {} B) must cover the tile-padded read \
+                 ({kv_bytes} B)",
+                kc.len_bytes(),
+                vc.len_bytes()
+            );
+        }
         let base_wg = (mpad / 64) * nh as u32;
         let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
             Some(v) => v,
@@ -9912,9 +9953,10 @@ impl<'a> Recorder<'a> {
     /// Free the recorder's transient Vulkan objects — the query pool (if any), the command buffer,
     /// and every descriptor-pool tranche. `Recorder` has no `Drop` (by design — the arena pools
     /// would otherwise be reported live at `vkDestroyDevice`), so `finish`/`finish_nowait` must
-    /// call this on BOTH their success AND their `?`-error exits; a bare early return would leak
-    /// these — and it leaks precisely on device-lost, exactly when those live pools then trip
-    /// `vkDestroyDevice`. Call once per recorder. Mirrors `discard`'s cleanup block.
+    /// call this on BOTH their success AND their `?`-error exits (as `discard` and a failed
+    /// `end_segment` do); a bare early return would leak these — and it leaks precisely on
+    /// device-lost, exactly when those live pools then trip `vkDestroyDevice`. Call once per
+    /// recorder.
     fn free_transient(&self) {
         let device = &self.be.shared.device;
         unsafe {
@@ -10001,21 +10043,10 @@ impl<'a> Recorder<'a> {
     /// Only the NOT-yet-submitted buffer is abandoned. Anything already on the queue is still
     /// drained by the caller — a submitted command buffer cannot be cancelled, only waited on.
     pub fn discard(self) -> Result<()> {
-        let device = &self.be.shared.device;
-        unsafe {
-            device
-                .end_command_buffer(self.cmd)
-                .map_err(|e| be(format!("end cmd: {e}")))?;
-            if self.prof_ops {
-                device.destroy_query_pool(self.query_pool, None);
-            }
-            let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
-            device.free_command_buffers(cmd_pool, &[self.cmd]);
-            for p in self.pools.borrow().iter() {
-                device.destroy_descriptor_pool(*p, None);
-            }
-        }
-        Ok(())
+        // Freed even when ending fails: an early return would leak the command buffer and pools.
+        let ended = unsafe { self.be.shared.device.end_command_buffer(self.cmd) };
+        self.free_transient();
+        ended.map_err(|e| be(format!("end cmd: {e}")))
     }
 
     /// [`Self::finish`]'s pipelined twin: end recording and submit WITHOUT waiting, returning a
@@ -10120,8 +10151,10 @@ impl<'a> Recorder<'a> {
         if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
-        unsafe { self.be.shared.device.end_command_buffer(self.cmd) }
-            .map_err(|e| be(format!("end cmd: {e}")))?;
+        if let Err(e) = unsafe { self.be.shared.device.end_command_buffer(self.cmd) } {
+            self.free_transient();
+            return Err(be(format!("end cmd: {e}")));
+        }
         Ok(RecordedSegment {
             cmd: self.cmd,
             pools: self.pools.borrow().clone(),
@@ -11236,6 +11269,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_nonfa_matches_cpu() {
         let be = be_with(|_| {});
+        if !crate::test_has_f16_coopmat(&be, "attention_prefill_nonfa_matches_cpu") {
+            return;
+        }
         // hd=128 (qwen3), full causal, default scale — the pre-existing regression cases.
         run_attn_prefill_nonfa(&be, 64, 64, 2, 1, 128, 0, 0.0);
         run_attn_prefill_nonfa(&be, 128, 200, 4, 2, 128, 0, 0.0);
@@ -11331,6 +11367,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_flash_matches_cpu() {
         let be = be_with(|_| {});
+        if !crate::test_has_f16_coopmat(&be, "attention_prefill_flash_matches_cpu") {
+            return;
+        }
         for &(q, kv, nh, nkv, hd) in &[
             (64usize, 64usize, 2usize, 1usize, 128usize),
             (128, 200, 4, 2, 128),
@@ -11510,6 +11549,9 @@ mod tests {
             v.flash_warp = false;
             v.flash_splits = Some(2);
         });
+        if !crate::test_has_f16_coopmat(&be, "attn_flash_stage_dequant_parity") {
+            return;
+        }
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
@@ -11672,6 +11714,9 @@ mod tests {
         // reduce is covered in addition to the n_splits==1 warp path. Its own backend, so the knob
         // cannot collide with `attn_flash_stage_dequant_parity` running in parallel.
         let be = be_with(|v| v.flash_splits = Some(2));
+        if !crate::test_has_f16_coopmat(&be, "attn_flash_warp_dequant_parity") {
+            return;
+        }
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
@@ -11879,6 +11924,9 @@ mod tests {
                 "bm=32 tile",
             ),
         ];
+        if !crate::test_has_f16_coopmat(&cases[0].0, "attn_flash_coopmat_bda_parity") {
+            return;
+        }
         for &(q_len, kv_len, nh, nkv) in &[
             (128usize, 512usize, 8usize, 2usize),
             (64, 256, 4, 4),
@@ -12139,6 +12187,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_flash_reg_matches_cpu() {
         let be = be_with(|_| {});
+        if !crate::test_has_f16_coopmat(&be, "attention_prefill_flash_reg_matches_cpu") {
+            return;
+        }
         for &(q, kv, nh, nkv) in &[
             (128usize, 128usize, 4usize, 2usize),
             (128, 300, 2, 1),
@@ -12332,6 +12383,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn matmul_proj_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if !crate::test_has_f16_coopmat(&be, "matmul_proj_matches_cpu") {
+            return;
+        }
         let (m, k, n) = (800usize, 64usize, 256usize); // m≥768 & not %64 → warp path + padding; n%256
         let mpad = m.div_ceil(64) * 64;
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
@@ -12380,6 +12434,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn matmul_native_splitk_f16_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if !crate::test_has_f16_coopmat(&be, "matmul_native_splitk_f16_matches_cpu") {
+            return;
+        }
         let (m, k, n, splits) = (70usize, 2048usize, 256usize, 4usize);
         let mpad = m.div_ceil(64) * 64;
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
@@ -12439,6 +12496,9 @@ mod tests {
         ];
         let be = VulkanBackend::new().unwrap();
         let (m, k, n_max) = (70usize, 1024usize, 16384usize);
+        if !crate::test_has_f16_coopmat(&be, "native_gemm_warp_iq4nl_matches_cpu") {
+            return;
+        }
         let mpad = m.div_ceil(64) * 64;
         let a: Vec<f32> = (0..m * k)
             .map(|i| half::f16::from_f32(((i % 23) as f32 - 11.0) * 0.04).to_f32())

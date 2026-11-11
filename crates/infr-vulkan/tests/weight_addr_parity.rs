@@ -1687,6 +1687,10 @@ fn gemm_proj_matches_resident() {
         eprintln!("skip: no Vulkan device");
         return;
     };
+    if !be.capabilities().f16_coopmat() {
+        eprintln!("skip: no 16x16x16 f16 coopmat on this device");
+        return;
+    }
     // n%64==0, k%32==0; m=8 < 768 keeps BOTH legs on the non-warp gemm_proj kernel (matmul_proj /
     // matmul_proj_at share the same `warp = m>=768 && n%256==0` gate).
     let (m, k, n) = (8usize, 256usize, 64usize);

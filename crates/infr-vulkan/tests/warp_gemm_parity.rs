@@ -23,6 +23,10 @@ fn warp_ag_isa_probe() {
         eprintln!("skip: no Vulkan device");
         return;
     };
+    if !be.capabilities().f16_coopmat() {
+        eprintln!("skip: no 16x16x16 f16 coopmat on this device");
+        return;
+    }
     let dtype = DType::Q4K;
     let (m, k, n, splits) = (64usize, 512usize, 256usize, 2usize);
     let mpad = 64usize;

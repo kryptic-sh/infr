@@ -96,7 +96,7 @@ pub struct GenStats {
     pub n_cached: usize,
     /// The reply ran out of context, not out of the caller's budget: the engine lowered `max_new`
     /// to the room the context had left, and the generation used all of that lowered budget. The
-    /// caller's own `n_gen >= max_new` test cannot see this case. See [`ran_out_of_context`].
+    /// caller's own `n_gen >= max_new` test cannot see this case.
     pub ctx_full: bool,
     /// The generation ended itself — it sampled EOS, or a grammar-constrained span completed — so
     /// it did not run out of budget even when `n_gen` reached it (the EOS token is counted).

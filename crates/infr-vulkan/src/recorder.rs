@@ -10892,7 +10892,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!("attention_kv q_len={q_len} kv_len={kv_len} max_err={err:e}");
         assert!(err < 5e-3, "attention_kv mismatch: {err}");
     }
@@ -10957,7 +10957,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!("attn_kv_split kv_len={kv_len} n_chunks={n_chunks} win={win} max_err={err:e}");
         assert!(err < 5e-3, "split mismatch: {err}");
     }
@@ -11035,7 +11035,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!(
             "attn_kv_split_dynac kv={kv_len} cap={cap} n_chunks={n_chunks} win={win} max_err={err:e}"
         );
@@ -11209,7 +11209,7 @@ mod tests {
             for h in 0..nheads {
                 for i in 0..hd {
                     let idx = ((out_base + r) * nheads + h) * hd + i;
-                    err = err.max((got[idx] - want[idx]).abs());
+                    err = infr_testkit::nan_max(err, (got[idx] - want[idx]).abs());
                 }
             }
         }
@@ -11322,7 +11322,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!("attn_prefill_nonfa q_len={q_len} kv_len={kv_len} max_err={err:e}");
         assert!(err < 5e-3, "attn_prefill_nonfa mismatch: {err}");
     }
@@ -11424,7 +11424,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!("attn_prefill_flash q_len={q_len} kv_len={kv_len} max_err={err:e}");
         assert!(err < 5e-3, "attn_prefill_flash mismatch: {err}");
     }
@@ -12127,7 +12127,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!(
             "attn_nc_fa q={q_len} kv={kv_len} nh={nh}/{nkv} hd={hd} win={window} \
              ring={ring_rows:?} max_err={err:e}"
@@ -12216,7 +12216,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!("attn_flash_reg q_len={q_len} kv_len={kv_len} nh={nh} max_err={err:e}");
         assert!(err < 5e-3, "attn_flash_reg mismatch: {err}");
     }
@@ -12321,7 +12321,7 @@ mod tests {
         for r in 0..m {
             for col in 0..n {
                 let want: f32 = (0..k).map(|x| a[r * k + x] * dq(col * k + x)).sum();
-                e = e.max((got[r * n + col] - want).abs());
+                e = infr_testkit::nan_max(e, (got[r * n + col] - want).abs());
             }
         }
         println!("native_gemm_mmq_q6k max_err={e:e}");
@@ -12351,7 +12351,7 @@ mod tests {
             for r in 0..m {
                 for col in 0..n {
                     let want: f32 = (0..k).map(|x| a[r * k + x] * w[col * k + x]).sum();
-                    e = e.max((c[r * n + col] - want).abs());
+                    e = infr_testkit::nan_max(e, (c[r * n + col] - want).abs());
                 }
             }
             println!("matmul_proj {label} max_err={e:e}");
@@ -12419,7 +12419,7 @@ mod tests {
         for r in 0..m {
             for col in 0..n {
                 let want: f32 = (0..k).map(|x| a[r * k + x] * w[col * k + x]).sum();
-                e = e.max((got[r * n + col] - want).abs());
+                e = infr_testkit::nan_max(e, (got[r * n + col] - want).abs());
             }
         }
         println!("matmul_native_splitk f16 max_err={e:e}");
@@ -12477,7 +12477,7 @@ mod tests {
             for r in 0..m {
                 for col in 0..n {
                     let want: f32 = (0..k).map(|x| a[r * k + x] * dq(col * k + x)).sum();
-                    e = e.max((got[r * n + col] - want).abs());
+                    e = infr_testkit::nan_max(e, (got[r * n + col] - want).abs());
                 }
             }
             println!("native_gemm_warp_iq4nl {label} max_err={e:e}");
@@ -13020,7 +13020,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         let tier = if sg { "mla_sg" } else { "mla" };
         println!("mla vulkan {tier} max_err={err:e}");
         assert!(err < 1e-3, "MLA vulkan {tier} diverges: max_err={err:e}");
@@ -13322,7 +13322,7 @@ mod tests {
                 .iter()
                 .zip(&want)
                 .map(|(a, b)| (a - b).abs())
-                .fold(0f32, f32::max);
+                .fold(0f32, infr_testkit::nan_max);
             let tier = if sg { "mla_sg" } else { "mla" };
             println!(
                 "mla vulkan {tier} {}: max_err={err:e}\n  got ={got:?}\n  want={want:?}",

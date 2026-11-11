@@ -3838,7 +3838,7 @@ mod tests {
     fn check(got: &[f32], want: &[f32], label: &str) {
         let mut max_rel = 0f32;
         for (g, w) in got.iter().zip(want.iter()) {
-            max_rel = max_rel.max((g - w).abs() / w.abs().max(1.0));
+            max_rel = infr_testkit::nan_max(max_rel, (g - w).abs() / w.abs().max(1.0));
         }
         println!("{label} max_rel_err = {max_rel:.4e}");
         assert!(max_rel < 2e-2, "{label} rel err {max_rel} too high");

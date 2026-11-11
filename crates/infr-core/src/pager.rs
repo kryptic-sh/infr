@@ -21,7 +21,7 @@
 //! demand/LRU. The PREFETCH side (staging layer `l+1`'s bytes while `l` executes) is the
 //! backend's job — `infr-vulkan`'s `DensePagerSession` records uploads ahead of GPU execution
 //! through its pipelined ring; this module stays pure residency/eviction bookkeeping.
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 
 /// Opaque identifier for one pageable block. The pager never interprets this — callers pack
 /// whatever key space they need (an expert id, a `(layer, role, expert)` tuple, a layer index for
@@ -84,11 +84,16 @@ pub struct Pager {
     n_slots: usize,
     /// block_id -> slot index for every currently-resident block.
     resident: HashMap<BlockId, u32>,
-    /// LRU order, oldest (least-recently-used) at the front. A block appears at most once;
-    /// `touch` on an existing entry removes-then-repushes it (O(n_slots), fine at the slot counts
-    /// this cache runs at — tens to low hundreds; an intrusive doubly-linked list is the upgrade
-    /// path if that ever isn't true, per the module doc's SLRU note).
-    lru: VecDeque<BlockId>,
+    /// block_id -> recency stamp for every resident block: the LRU order is ascending stamp, and
+    /// the eviction victim is the lowest stamp among the unprotected blocks. A promotion takes a
+    /// stamp above every other ([`Self::hot`]) and a cold-end insert one below every other
+    /// ([`Self::cold`]), so a hit or an insert is one map write; the O(n_slots) scan is paid only
+    /// when choosing a victim, which already costs a fill.
+    recency: HashMap<BlockId, i64>,
+    /// The last stamp handed out at the most-recently-used end.
+    hot: i64,
+    /// The last stamp handed out at the cold end.
+    cold: i64,
     /// Slot indices never yet handed out (drained before any eviction kicks in).
     free: Vec<u32>,
     /// block_id -> the [`Self::begin_batch`] epoch of its last touch. Eviction skips blocks
@@ -126,9 +131,9 @@ impl Pager {
     ///
     /// # Panics
     /// If `n_slots == 0`. A zero-slot pager cannot satisfy even a one-block batch, so there is no
-    /// correct behaviour to fall back to: the first `touch` would find `free` empty, scan an empty
-    /// `lru` for a victim, and die inside `Self::take_slot` on an `expect` about a `position()`
-    /// index — a panic that describes the wrong thing entirely, several frames away from the
+    /// correct behaviour to fall back to: the first `touch` would find `free` empty, find no
+    /// resident block to evict, and die inside `Self::take_slot` on an `expect` about that —
+    /// a panic that describes the wrong thing entirely, several frames away from the
     /// mistake. Clamping to 1 instead would be worse than either: it manufactures a pager that
     /// silently misses on EVERY touch and evicts the block the caller resolved a moment ago,
     /// violating the within-batch safety invariant above for any batch wider than one block —
@@ -149,7 +154,9 @@ impl Pager {
         Self {
             n_slots,
             resident: HashMap::with_capacity(n_slots),
-            lru: VecDeque::with_capacity(n_slots),
+            recency: HashMap::with_capacity(n_slots),
+            hot: 0,
+            cold: 0,
             free: (0..n_slots as u32).rev().collect(), // pop() hands out slot 0 first
             epoch: HashMap::with_capacity(n_slots),
             cur_epoch: 0,
@@ -193,10 +200,23 @@ impl Pager {
     /// Move `id` to the most-recently-used end without changing residency (internal to `touch`,
     /// exposed for the doubly-recorded case: a batch that touches the same id twice).
     fn mark_mru(&mut self, id: BlockId) {
-        if let Some(pos) = self.lru.iter().position(|&x| x == id) {
-            self.lru.remove(pos);
-        }
-        self.lru.push_back(id);
+        self.hot += 1;
+        self.recency.insert(id, self.hot);
+    }
+
+    /// Place `id` at the cold end — the next victim unless something colder arrives.
+    fn mark_cold(&mut self, id: BlockId) {
+        self.cold -= 1;
+        self.recency.insert(id, self.cold);
+    }
+
+    /// The least-recently-used resident block that `eligible` accepts.
+    fn coldest(&self, eligible: impl Fn(BlockId) -> bool) -> Option<BlockId> {
+        self.recency
+            .iter()
+            .filter(|&(&b, _)| eligible(b))
+            .min_by_key(|&(_, &stamp)| stamp)
+            .map(|(&b, _)| b)
     }
 
     /// Ensure `id` is resident, evicting the least-recently-used unprotected block if the cache
@@ -213,7 +233,7 @@ impl Pager {
         self.stats.misses += 1;
         let (slot, evicted) = self.take_slot();
         self.resident.insert(id, slot);
-        self.lru.push_back(id);
+        self.mark_mru(id);
         Resolution::Miss { slot, evicted }
     }
 
@@ -247,8 +267,8 @@ impl Pager {
         self.stats.misses += 1;
         self.resident.insert(id, slot);
         match insert {
-            Insert::Mru => self.lru.push_back(id),
-            Insert::Cold => self.lru.push_front(id),
+            Insert::Mru => self.mark_mru(id),
+            Insert::Cold => self.mark_cold(id),
         }
         *self.pinned.entry(id).or_insert(0) += 1;
         Some(Resolution::Miss { slot, evicted })
@@ -317,9 +337,7 @@ impl Pager {
             "pager: evict of pinned block {id}"
         );
         let slot = self.resident.remove(&id)?;
-        if let Some(pos) = self.lru.iter().position(|&x| x == id) {
-            self.lru.remove(pos);
-        }
+        self.recency.remove(&id);
         self.epoch.remove(&id);
         self.free.push(slot);
         Some(slot)
@@ -364,7 +382,7 @@ impl Pager {
         self.stats.misses += 1;
         let (slot, evicted) = self.take_slot();
         self.resident.insert(id, slot);
-        self.lru.push_front(id);
+        self.mark_cold(id);
         Resolution::Miss { slot, evicted }
     }
 
@@ -381,14 +399,15 @@ impl Pager {
         // find no victim at all. (The infallible `take_slot` expresses the same exemption as its
         // `cur_epoch == 0` assert.)
         let batches = self.cur_epoch != 0;
-        let idx = self.lru.iter().position(|b| {
-            !(batches && self.epoch.get(b) == Some(&self.cur_epoch)) && !self.pinned.contains_key(b)
+        let victim = self.coldest(|b| {
+            !(batches && self.epoch.get(&b) == Some(&self.cur_epoch))
+                && !self.pinned.contains_key(&b)
         })?;
-        let victim = self.lru.remove(idx).expect("index from position()");
+        self.recency.remove(&victim);
         let vslot = self
             .resident
             .remove(&victim)
-            .expect("every lru entry has a resident mapping");
+            .expect("every ranked block has a resident mapping");
         // Drop the victim's epoch entry too — otherwise `epoch` is the one pager structure not
         // bounded by `n_slots`, accumulating a stale entry per distinct BlockId ever touched. A
         // stale entry could also mask an id as "current batch" across a `cur_epoch` wraparound.
@@ -399,7 +418,7 @@ impl Pager {
 
     /// A free slot, evicting if none remain. The victim is the coldest block NOT touched in the
     /// current batch (epoch guard — see [`Self::begin_batch`]); legacy callers that never open a
-    /// batch share epoch 0 everywhere, for which the guard degrades to plain LRU `pop_front`.
+    /// batch share epoch 0 everywhere, for which the guard degrades to plain LRU.
     fn take_slot(&mut self) -> (u32, Option<BlockId>) {
         if self.free.is_empty() {
             // Only reachable through the infallible entry points, whose callers hold no pins.
@@ -411,13 +430,11 @@ impl Pager {
         if let Some(s) = self.free.pop() {
             return (s, None);
         }
-        let idx = self
-            .lru
-            .iter()
-            .position(|b| self.epoch.get(b) != Some(&self.cur_epoch))
+        let victim = self
+            .coldest(|b| self.epoch.get(&b) != Some(&self.cur_epoch))
             // Every resident block touched by the CURRENT batch means the batch exceeded
             // n_slots — the sizing floor (`Pager::new`'s doc) was violated upstream. Falling
-            // back to pop_front would silently evict a batch sibling mid-flight (the
+            // back to plain LRU would silently evict a batch sibling mid-flight (the
             // coherent-but-wrong class); fail loudly instead when batches are in use.
             .unwrap_or_else(|| {
                 // Actionable in the voice of the Vulkan VRAM guard (`check_vram_budget`): say what
@@ -442,13 +459,15 @@ impl Pager {
                      take the auto budget, which is sized to that floor.",
                     self.n_slots
                 );
-                0 // epoch never used (legacy caller): plain LRU
+                // Epoch never used (legacy caller): plain LRU.
+                self.coldest(|_| true)
+                    .expect("pager: a full cache with no resident block to evict")
             });
-        let victim = self.lru.remove(idx).expect("index from position()");
+        self.recency.remove(&victim);
         let vslot = self
             .resident
             .remove(&victim)
-            .expect("every lru entry has a resident mapping");
+            .expect("every ranked block has a resident mapping");
         // Drop the victim's epoch entry too — otherwise `epoch` is the one pager structure not
         // bounded by `n_slots`, accumulating a stale entry per distinct BlockId ever touched. A
         // stale entry could also mask an id as "current batch" across a `cur_epoch` wraparound.

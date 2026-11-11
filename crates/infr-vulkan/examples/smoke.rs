@@ -60,8 +60,11 @@ fn main() -> infr_core::Result<()> {
         .iter()
         .zip(c_ref.iter())
         .map(|(g, r)| (*g - r).abs())
-        .fold(0.0f32, f32::max);
-    let max_ref = c_ref.iter().map(|r| r.abs()).fold(0.0f32, f32::max);
+        .fold(0.0f32, infr_testkit::nan_max);
+    let max_ref = c_ref
+        .iter()
+        .map(|r| r.abs())
+        .fold(0.0f32, infr_testkit::nan_max);
     let max_rel_err = if max_ref > 1e-9 {
         max_abs_err / max_ref
     } else {

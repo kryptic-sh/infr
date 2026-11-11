@@ -800,12 +800,20 @@ fn vulkan_logits(tag: &str, model: &SyntheticModel) -> Vec<f32> {
         .expect("vulkan prefill")
 }
 
+/// Max |a - b|, NaN if any difference is NaN: `f32::max` returns its non-NaN operand, so folding
+/// it would score an all-NaN output as an exact match.
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "logit vector lengths");
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
-        .fold(0.0f32, f32::max)
+        .fold(0.0, |m, d| {
+            if m.is_nan() || d.is_nan() {
+                f32::NAN
+            } else {
+                m.max(d)
+            }
+        })
 }
 
 fn rms(v: &[f32]) -> f32 {
@@ -2746,7 +2754,7 @@ fn synthetic_deepseek4_requires_sqrt_softplus_gating() {
 /// The keys `deepseek4.cpp::load_arch_hparams` reads with a plain `get_key`. Every one of them is
 /// either a tensor dimension or a routing input whose absence the shared parses below would paper
 /// over with a default that is wrong in a way nothing downstream can detect — `expert_weights_scale`
-/// defaults to 0, which zeroes every routed expert.
+/// would default to unscaled.
 #[test]
 fn synthetic_deepseek4_mandatory_keys_are_required() {
     for key in [

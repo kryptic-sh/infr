@@ -444,18 +444,33 @@ impl CpuBackend {
 /// integer position tensors). The universal "read a tensor's value on the host".
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
+    // Decoded per element, never cast: a weight slice of the GGUF mapping is only as aligned as the
+    // file's `general.alignment`, which may be below 4.
     match dtype {
-        DType::F32 => bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
-        DType::I32 => bytemuck::cast_slice::<u8, i32>(bytes)
+        DType::I32 => bytes
+            .as_chunks::<4>()
+            .0
             .iter()
-            .map(|&v| v as f32)
+            .map(|&c| i32::from_le_bytes(c) as f32)
             .collect(),
-        DType::U32 => bytemuck::cast_slice::<u8, u32>(bytes)
+        DType::U32 => bytes
+            .as_chunks::<4>()
+            .0
             .iter()
-            .map(|&v| v as f32)
+            .map(|&c| u32::from_le_bytes(c) as f32)
             .collect(),
-        // F16 / Bf16 / all quant + codebook types go through the shared host dequant.
+        // F32 / F16 / Bf16 / all quant + codebook types go through the shared host dequant.
         other => dequant_block(other, bytes).expect("cpu backend: host dequant"),
+    }
+}
+
+/// An F32 weight row as `f32`s: borrowed in place when it is 4-aligned (the hot path — every
+/// real GGUF's alignment is a multiple of 4), copied through [`bytes_to_f32`] when the file's
+/// `general.alignment` left it misaligned, where a cast would panic.
+pub(crate) fn f32_row(row: &[u8]) -> std::borrow::Cow<'_, [f32]> {
+    match bytemuck::try_cast_slice(row) {
+        Ok(w) => std::borrow::Cow::Borrowed(w),
+        Err(_) => std::borrow::Cow::Owned(bytes_to_f32(row, DType::F32)),
     }
 }
 
@@ -1159,7 +1174,7 @@ impl Backend for CpuBackend {
                                     vec_dot_nvfp4_batch(row, q8_32.as_ref().unwrap(), in_f, dst_o);
                                     return;
                                 }
-                                DType::F32 => dot(bytemuck::cast_slice(row), xrow),
+                                DType::F32 => dot(&f32_row(row), xrow),
                                 DType::F16 => dot_f16(row, xrow),
                                 DType::Bf16 => dot_bf16(row, xrow),
                                 _ => dot(&bytes_to_f32(row, dt), xrow),
@@ -1453,9 +1468,9 @@ impl Backend for CpuBackend {
                                     DType::Tq2_0 => vec_dot_tq2_0_batch(row, &q8s, in_f, chunk),
                                     DType::Tq1_0 => vec_dot_tq1_0_batch(row, &q8s, in_f, chunk),
                                     DType::F32 => {
-                                        let w32: &[f32] = bytemuck::cast_slice(row);
+                                        let w32 = f32_row(row);
                                         for r in 0..m {
-                                            chunk[r] = dot(w32, &xs[r * in_f..r * in_f + in_f]);
+                                            chunk[r] = dot(&w32, &xs[r * in_f..r * in_f + in_f]);
                                         }
                                     }
                                     DType::F16 => {
@@ -3794,6 +3809,27 @@ fn deltanet_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// B133: with `general.alignment` below 4 an F32 or I32 tensor can start at an address that is
+    /// not 4-aligned; reading it must decode, not panic in a cast.
+    #[test]
+    fn misaligned_tensor_bytes_decode() {
+        let want = [1.5f32, -2.0, 3.25];
+        let mut buf = vec![0u8; size_of_val(&want) + 4];
+        let start = (1..4)
+            .find(|&o| !(buf.as_ptr() as usize + o).is_multiple_of(4))
+            .unwrap();
+        let end = start + size_of_val(&want);
+        for (i, v) in want.iter().enumerate() {
+            buf[start + 4 * i..start + 4 * (i + 1)].copy_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(bytes_to_f32(&buf[start..end], DType::F32), want);
+        assert_eq!(&*f32_row(&buf[start..end]), &want[..]);
+        for (i, v) in [7i32, -1, 3].iter().enumerate() {
+            buf[start + 4 * i..start + 4 * (i + 1)].copy_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(bytes_to_f32(&buf[start..end], DType::I32), [7.0, -1.0, 3.0]);
+    }
 
     // Naive serial reference: a byte-for-byte copy of the ORIGINAL shift-register conv loop. The
     // parallel `conv1d_silu` reformulation must reproduce both `out` and the rebuilt `state` exactly.

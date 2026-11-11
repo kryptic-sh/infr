@@ -1372,16 +1372,22 @@ fn dyn_attnvec_kern(dt: DType, hd: usize) -> &'static str {
 /// Reinterpret raw buffer bytes as `f32` per `dtype` (dequantizing quant/f16/bf16, widening integer
 /// tensors). The host-side "read a tensor's value", matching `infr-cpu`'s `bytes_to_f32`.
 fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
+    // Decoded per element, never cast: a weight slice of the GGUF mapping is only as aligned as the
+    // file's `general.alignment`, which may be below 4.
     match dtype {
-        DType::F32 => bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
-        DType::I32 => bytemuck::cast_slice::<u8, i32>(bytes)
+        DType::I32 => bytes
+            .as_chunks::<4>()
+            .0
             .iter()
-            .map(|&v| v as f32)
+            .map(|&c| i32::from_le_bytes(c) as f32)
             .collect(),
-        DType::U32 => bytemuck::cast_slice::<u8, u32>(bytes)
+        DType::U32 => bytes
+            .as_chunks::<4>()
+            .0
             .iter()
-            .map(|&v| v as f32)
+            .map(|&c| u32::from_le_bytes(c) as f32)
             .collect(),
+        // F32 / F16 / Bf16 / quants: the shared host dequant.
         other => dequant_block(other, bytes).expect("metal backend: host dequant"),
     }
 }

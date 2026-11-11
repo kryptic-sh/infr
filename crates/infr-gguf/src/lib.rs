@@ -823,6 +823,16 @@ impl Gguf {
             let mut tensors: Vec<TensorInfo> = Vec::with_capacity(raw.len());
             for (name, shape, ggml_type, offset) in raw {
                 let dtype = ggml_type_to_dtype(ggml_type)?;
+                // GGUF places every tensor on an `alignment` boundary, and llama.cpp refuses a file
+                // that does not. That is all this guarantees: `general.alignment` may be any power
+                // of two, 1 and 2 included, so a reader still cannot assume a tensor's bytes are
+                // aligned for its element type.
+                if !offset.is_multiple_of(alignment as u64) {
+                    return Err(Error::Loader(format!(
+                        "GGUF: tensor '{name}' offset {offset} is not a multiple of the \
+                         {alignment}-byte alignment"
+                    )));
+                }
                 // `checked_mul`: a crafted shape must error, not overflow the product.
                 let numel: usize = shape
                     .iter()
@@ -843,13 +853,14 @@ impl Gguf {
                 // as an unexplained out-of-range panic (or worse, plausible-looking garbage) deep
                 // in a backend.
                 if dtype == DType::I2S {
-                    // i2_s packs 4 ternary codes per byte and carries a single trailing f32 scale;
-                    // a numel that isn't a multiple of 4 has no whole-byte code layout at all
-                    // (numel = 3 would size to 4 bytes: all scale, no codes).
-                    if !numel.is_multiple_of(4) {
+                    // i2_s interleaves its 2-bit codes across whole groups (see
+                    // `dequant::I2S_GROUP_ELEMS`) and carries a single trailing f32 scale; a tail
+                    // group would address codes past the packed bytes.
+                    if !numel.is_multiple_of(dequant::I2S_GROUP_ELEMS) {
                         return Err(Error::Loader(format!(
                             "GGUF: tensor '{name}' shape {shape:?} has {numel} elements, not a \
-                             multiple of 4 (i2_s packs 4 2-bit codes per byte)"
+                             multiple of {} (i2_s packs codes in interleaved groups)",
+                            dequant::I2S_GROUP_ELEMS
                         )));
                     }
                 } else {
@@ -1343,7 +1354,7 @@ mod tests {
         push_u32(&mut b, 3);
         push_u64(&mut b, 2); // tensor_count = 2
         push_u64(&mut b, 0); // kv_count = 0
-        for offset in [0u64, 16] {
+        for offset in [0u64, 32] {
             push_gguf_str(&mut b, "tensor0"); // same name twice
             push_u32(&mut b, 1); // n_dims
             push_u64(&mut b, 4); // dim[0]
@@ -1353,7 +1364,7 @@ mod tests {
         while !b.len().is_multiple_of(32) {
             b.push(0);
         }
-        b.extend_from_slice(&[0u8; 32]);
+        b.extend_from_slice(&[0u8; 64]);
         let tmp = write_temp_gguf(&b);
         let err = Gguf::open(tmp.path()).map(|_| ());
         let Err(Error::Loader(msg)) = err else {
@@ -1480,6 +1491,11 @@ mod tests {
     /// it structurally cannot express a misaligned element count — this builder takes the ggml type
     /// so a quantised one can.
     fn build_typed_fixture(ggml_type: u32, dim0: u64, data_len: usize) -> Vec<u8> {
+        build_typed_fixture_at(ggml_type, dim0, 0, data_len)
+    }
+
+    /// [`build_typed_fixture`] with the tensor at data offset `offset`.
+    fn build_typed_fixture_at(ggml_type: u32, dim0: u64, offset: u64, data_len: usize) -> Vec<u8> {
         let mut b: Vec<u8> = Vec::new();
         push_u32(&mut b, GGUF_MAGIC);
         push_u32(&mut b, 3); // version
@@ -1489,7 +1505,7 @@ mod tests {
         push_u32(&mut b, 1); // n_dims
         push_u64(&mut b, dim0);
         push_u32(&mut b, ggml_type);
-        push_u64(&mut b, 0); // offset = 0
+        push_u64(&mut b, offset);
         while !b.len().is_multiple_of(32) {
             b.push(0);
         }
@@ -1546,6 +1562,52 @@ mod tests {
                 "error should name the tensor and the i2_s packing: {msg}"
             ),
             other => panic!("misaligned i2_s numel should be Error::Loader, got {other:?}"),
+        }
+    }
+
+    /// B133: the I2S dequant addresses whole interleaved code groups, so `Gguf::open` rejects a
+    /// numel that packs into whole bytes but leaves a partial group — the decoder would index past
+    /// the packed codes and panic.
+    #[test]
+    fn partial_group_i2s_numel_errors() {
+        let numel = dequant::I2S_GROUP_ELEMS / 2;
+        let b = build_typed_fixture(36, numel as u64, 64);
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        match err {
+            Err(Error::Loader(msg)) => assert!(
+                msg.contains("tensor0") && msg.contains("i2_s"),
+                "error should name the tensor and the i2_s packing: {msg}"
+            ),
+            other => panic!("partial-group i2_s numel should be Error::Loader, got {other:?}"),
+        }
+
+        // One whole group still opens and dequantises to its full length.
+        let numel = dequant::I2S_GROUP_ELEMS;
+        let b = build_typed_fixture(36, numel as u64, 64);
+        let tmp = write_temp_gguf(&b);
+        let gguf = Gguf::open(tmp.path()).expect("one whole i2_s group must open");
+        let bytes = gguf.tensor_bytes("tensor0").expect("bytes");
+        assert_eq!(
+            dequant::dequant_block(DType::I2S, bytes).unwrap().len(),
+            numel
+        );
+    }
+
+    /// B133: a tensor offset off the file's alignment would hand readers a misaligned slice,
+    /// and a typed cast of one panics.
+    #[test]
+    fn misaligned_tensor_offset_errors() {
+        // ggml type 0 = F32; offset 2 is not 4-aligned, let alone 32-aligned.
+        let b = build_typed_fixture_at(0, 4, 2, 64);
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        match err {
+            Err(Error::Loader(msg)) => assert!(
+                msg.contains("tensor0") && msg.contains("offset 2"),
+                "error should name the tensor and its offset: {msg}"
+            ),
+            other => panic!("misaligned tensor offset should be Error::Loader, got {other:?}"),
         }
     }
 

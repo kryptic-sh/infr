@@ -126,11 +126,43 @@ fn state_persists_across_executes() {
     );
 }
 
+/// The larger of `a` and `b`, or NaN if either is NaN — `f32::max` returns its non-NaN operand,
+/// so folding it over the errors of an all-NaN backend output scores it as exact. This crate does
+/// not depend on `infr-testkit`, whose `nan_max` this mirrors.
+fn nan_max(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else {
+        a.max(b)
+    }
+}
+
+/// [`nan_max`] for `f64`.
+fn nan_max64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
+    }
+}
+
+/// Max |a - b|, NaN if any difference is NaN.
 fn maxerr(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f32::max)
+        .fold(0.0, nan_max)
+}
+
+/// The comparison helpers must fail a NaN output, not score it as exact.
+#[test]
+fn maxerr_helpers_propagate_nan() {
+    assert!(maxerr(&[1.0, 2.0], &[f32::NAN, f32::NAN]).is_nan());
+    assert!(maxerr(&[1.0, 2.0], &[f32::NAN, 2.0]).is_nan());
+    assert!(maxerr64(&[f32::NAN, 2.0], &[1.0, 2.0]).is_nan());
+    assert!(maxdiff64(&[1.0, 2.0], &[1.0, f64::NAN]).is_nan());
+    assert!(nan_max64(nan_max64(0.0, f64::NAN), 1.0).is_nan());
+    assert_eq!(maxerr(&[1.0, 2.0], &[1.5, 2.0]), 0.5);
 }
 
 fn gen(n: usize, salt: usize) -> Vec<f32> {
@@ -806,23 +838,18 @@ fn mla_parity() {
         key_bias: None,
     });
 
-    // Synthetic inputs — small integers for traceability.
-    // Q: row 0 head 0 = [1,2,3,4] (nope=[1,2], pe_raw=[3,4]), head 1 = [5,6,7,8]
-    //    row 1 head 0 = [9,10,11,12], head 1 = [13,14,15,16]
+    // Synthetic inputs — small tenths, so the scores stay within a few units of each other and
+    // the softmax weights every key: a one-hot softmax would hide a wrong scale.
+    // Q: row 0 head 0 = [.1,.2,.3,.4] (nope=[.1,.2], pe_raw=[.3,.4]), head 1 = [.5,.6,.7,.8]
+    //    row 1 head 0 = [.9,1.0,1.1,1.2], head 1 = [1.3,1.4,1.5,1.6]
     let qi: Vec<f32> = (1..=((rows * nh * q_head_dim) as i32))
-        .map(|x| x as f32)
+        .map(|x| x as f32 * 0.1)
         .collect();
-    // K cache: each row = [10,11,12, 1,2] (latent=[10,11,12], k_pe_raw=[1,2])
-    let ki: Vec<f32> = (0..rows * key_len)
-        .map(|i| {
-            let col = i % key_len;
-            if col < kv_lora {
-                (10 + col) as f32
-            } else {
-                (1 + (col - kv_lora)) as f32
-            }
-        })
-        .collect();
+    // K cache rows DIFFER, so the output depends on the attention weights (identical rows make
+    // V the same for every key, and any weights at all average to it):
+    //   row 0 = [1.0,1.1,1.2, 0.1,0.2] (latent, k_pe_raw), row 1 = [-0.5,0.3,0.9, -0.4,0.6]
+    let ki: Vec<f32> = vec![1.0, 1.1, 1.2, 0.1, 0.2, -0.5, 0.3, 0.9, -0.4, 0.6];
+    assert_eq!(ki.len(), rows * key_len);
     // wk_b[h][a_idx][nope_idx]: lay out as [nh][kv_lora][qk_nope] row-major within each head.
     // wk_b[h=0] = [[1,0], [0,1], [0,0]]  — maps nope[0]→latent[0], nope[1]→latent[1]
     // wk_b[h=1] = [[0,0], [1,0], [0,1]]  — maps nope[0]→latent[1], nope[1]→latent[2]
@@ -2228,7 +2255,7 @@ fn rope_neox_and_norm_parity() {
         for h in 0..n_head {
             let b = (r * n_head + h) * head_dim;
             for i in 0..rope_dim {
-                worst = worst.max((got[0][b + i] - got[1][b + i]).abs());
+                worst = nan_max(worst, (got[0][b + i] - got[1][b + i]).abs());
             }
             for i in rope_dim..head_dim {
                 assert_eq!(
@@ -4126,19 +4153,20 @@ fn hc_ref_post(x: &[f32], residual: &[f32], post: &[f32], comb: &[f32], d: HcDim
     out
 }
 
+/// [`maxerr`] against an f64 reference, with the same NaN propagation.
 fn maxerr64(a: &[f32], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len(), "reference/backend length mismatch");
     a.iter()
         .zip(b)
         .map(|(x, y)| (*x as f64 - y).abs())
-        .fold(0.0, f64::max)
+        .fold(0.0, nan_max64)
 }
 
 fn maxdiff64(a: &[f64], b: &[f64]) -> f64 {
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f64::max)
+        .fold(0.0, nan_max64)
 }
 
 /// `mixes` values for a case: mixed-sign, no symmetry between the `dst`/`src` axes of the `comb`
@@ -4470,11 +4498,11 @@ fn hyper_connect_comb_is_doubly_stochastic() {
                 let b = t * hc * hc;
                 for dst in 0..hc {
                     let s: f64 = (0..hc).map(|src| m[b + dst + hc * src]).sum();
-                    esrc = esrc.max((s - 1.0).abs());
+                    esrc = nan_max64(esrc, (s - 1.0).abs());
                 }
                 for src in 0..hc {
                     let s: f64 = (0..hc).map(|dst| m[b + dst + hc * src]).sum();
-                    edst = edst.max((s - 1.0).abs());
+                    edst = nan_max64(edst, (s - 1.0).abs());
                 }
             }
             (esrc, edst)
@@ -4560,9 +4588,13 @@ fn hyper_connect_details_are_load_bearing() {
         // How far this variant moves the faithful answer, over all three outputs.
         let moved = |what: &str, v: HcVariant| -> f64 {
             let (pre, post, comb) = hc_ref_mix(&mixes, &scale, &base, d, v);
-            let e = maxdiff64(&pre0, &pre)
-                .max(maxdiff64(&post0, &post))
-                .max(maxdiff64(&comb0, &comb));
+            let e = [
+                maxdiff64(&pre0, &pre),
+                maxdiff64(&post0, &post),
+                maxdiff64(&comb0, &comb),
+            ]
+            .into_iter()
+            .fold(0.0, nan_max64);
             println!("HyperConnect {name}: {what} moves the answer by {e:e}");
             e
         };
@@ -5154,11 +5186,11 @@ fn swiglu_clamp_orders_are_distinguishable() {
             for &uz in CLAMP_UPS.iter() {
                 let (gz, uz) = (gz as f64, uz as f64);
                 let want = swiglu_clamp_ref(gz, uz, Some(limit));
-                d_post = d_post.max((want - post(gz, uz)).abs());
-                d_sym = d_sym.max((want - sym(gz, uz)).abs());
-                d_up = d_up.max((want - one_up(gz, uz)).abs());
+                d_post = nan_max64(d_post, (want - post(gz, uz)).abs());
+                d_sym = nan_max64(d_sym, (want - sym(gz, uz)).abs());
+                d_up = nan_max64(d_up, (want - one_up(gz, uz)).abs());
                 if gz < 0.0 {
-                    neg_lobe = neg_lobe.max((want - post(gz, uz)).abs());
+                    neg_lobe = nan_max64(neg_lobe, (want - post(gz, uz)).abs());
                 }
             }
         }

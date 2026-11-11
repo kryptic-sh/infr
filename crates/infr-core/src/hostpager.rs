@@ -27,7 +27,7 @@ use crate::error::{Error, Result};
 use crate::pager::{BlockId, Insert, Pager, PagerStats, Resolution};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 /// Split an arena budget across uniform size classes, in slots per class.
 ///
@@ -369,18 +369,20 @@ impl HostPager {
                     "host pager: block {id} was never registered"
                 )));
             }
-            // Resident and readable? Take the pin and go.
-            if inner.state.get(&id) == Some(&SlotState::Ready) {
-                if let Some(slot) = inner.pager.pin_if_resident(id) {
-                    return Ok(self.pinned(id, slot, &inner));
-                }
-            }
             // Being filled by someone else: wait for them rather than read a half-written slot.
             if inner.state.get(&id) == Some(&SlotState::Loading) {
                 let _unused = self.ready.wait(inner).unwrap();
                 continue;
             }
+            // A hit goes through `resolve_and_pin` too, not the hit-only probe: it is what applies
+            // `insert` to a hit, and without it the LRU order is admission order.
             match inner.pager.resolve_and_pin(id, insert) {
+                // Resident and readable: take the pin and go.
+                Some(Resolution::Hit { slot })
+                    if inner.state.get(&id) == Some(&SlotState::Ready) =>
+                {
+                    return Ok(self.pinned(id, slot, &inner));
+                }
                 Some(Resolution::Hit { slot }) => {
                     // Resident with no state entry cannot happen: state and residency are set
                     // together under this lock. Treat it as a fill to re-establish the invariant
@@ -407,6 +409,9 @@ impl HostPager {
             }
         };
 
+        // Taken first, so nothing between here and `Ready` — the slot arithmetic included — can
+        // unwind past a `Loading` block.
+        let claim = Claim { pager: self, id };
         // Fill outside the lock: this is disk I/O, and holding the residency lock across it would
         // stall every other block's hit. The claim on `slot` is exclusive per the module doc (the
         // block is `Loading` and pinned by this thread), which is what makes the write sound.
@@ -417,30 +422,16 @@ impl HostPager {
         // reading. That makes this `&mut` the only reference to these bytes for its whole life,
         // which ends before the state flips to `Ready` below. `len <= slot_bytes` per `register`.
         let dst = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, len), len) };
-        let read = self.io.read_block(&desc, dst);
+        self.io.read_block(&desc, dst)?;
+        std::mem::forget(claim);
         let mut inner = self.inner.lock().unwrap();
-        match read {
-            Ok(()) => {
-                inner.state.insert(id, SlotState::Ready);
-                self.reads.fetch_add(1, Ordering::Relaxed);
-                self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
-                let pin = self.pinned(id, slot, &inner);
-                drop(inner);
-                self.ready.notify_all();
-                Ok(pin)
-            }
-            Err(e) => {
-                // Drop the failed block entirely: leaving it resident would serve a partly-written
-                // slot to the next caller, and leaving it `Loading` would park every waiter for
-                // good. The pin taken by `resolve_and_pin` goes with it.
-                inner.state.remove(&id);
-                inner.pager.unpin(id);
-                inner.pager.evict(id);
-                drop(inner);
-                self.ready.notify_all();
-                Err(e)
-            }
-        }
+        inner.state.insert(id, SlotState::Ready);
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
+        let pin = self.pinned(id, slot, &inner);
+        drop(inner);
+        self.ready.notify_all();
+        Ok(pin)
     }
 
     /// Deliver `id`'s bytes into `dst`, admitting the block only while the arena has room.
@@ -520,37 +511,28 @@ impl HostPager {
             self.streamed.fetch_add(1, Ordering::Relaxed);
             return Ok(Fill::Streamed);
         };
+        // See `pin`: claimed before anything that can unwind.
+        let claim = Claim { pager: self, id };
 
         // Admitting: fill the slot outside the lock, exactly as `pin` does and under the same
         // exclusivity argument (this thread set `Loading` and holds the pin).
         let n = desc.nbytes();
         // SAFETY: see `pin`'s fill — identical claim, identical proof.
         let arena = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, n), n) };
-        let read = self.io.read_block(&desc, arena);
+        self.io.read_block(&desc, arena)?;
+        std::mem::forget(claim);
         let mut inner = self.inner.lock().unwrap();
-        match read {
-            Ok(()) => {
-                inner.state.insert(id, SlotState::Ready);
-                self.reads.fetch_add(1, Ordering::Relaxed);
-                self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
-                // The guard adopts the pin `resolve_and_pin` took and releases it on drop, so the
-                // copy below runs with the slot un-evictable and nothing is released twice.
-                let pin = self.pinned(id, slot, &inner);
-                drop(inner);
-                dst[..n].copy_from_slice(&pin);
-                drop(pin);
-                self.ready.notify_all();
-                Ok(Fill::Admitted)
-            }
-            Err(e) => {
-                inner.state.remove(&id);
-                inner.pager.unpin(id);
-                inner.pager.evict(id);
-                drop(inner);
-                self.ready.notify_all();
-                Err(e)
-            }
-        }
+        inner.state.insert(id, SlotState::Ready);
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+        // The guard adopts the pin `resolve_and_pin` took and releases it on drop, so the copy
+        // below runs with the slot un-evictable and nothing is released twice.
+        let pin = self.pinned(id, slot, &inner);
+        drop(inner);
+        dst[..n].copy_from_slice(&pin);
+        drop(pin);
+        self.ready.notify_all();
+        Ok(Fill::Admitted)
     }
 
     /// Pin `id` only if it is already resident and readable — never reads from the tier below.
@@ -587,6 +569,32 @@ impl HostPager {
 
     fn unpin(&self, id: BlockId) {
         self.inner.lock().unwrap().pager.unpin(id);
+    }
+}
+
+/// A `Loading` claim on a slot whose fill has not completed. Forgotten once the read succeeds;
+/// dropped — on an `Err` from the read or a panic out of it alike — it drops the block entirely:
+/// leaving it resident would serve a partly-written slot to the next caller, and leaving it
+/// `Loading` would park every waiter on `ready` for good. The pin `resolve_and_pin` took goes with
+/// it.
+struct Claim<'a> {
+    pager: &'a HostPager,
+    id: BlockId,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        // Poison-tolerant: this also runs while unwinding, where a second panic would abort.
+        let mut inner = self
+            .pager
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        inner.state.remove(&self.id);
+        inner.pager.unpin(self.id);
+        inner.pager.evict(self.id);
+        drop(inner);
+        self.pager.ready.notify_all();
     }
 }
 
@@ -814,6 +822,107 @@ mod tests {
             before + 1,
             "a failed block must be re-read, not served from its slot"
         );
+    }
+
+    /// B134: a hit pinned with `Insert::Mru` must promote the block, so the eviction victim is
+    /// the least RECENTLY used block, not the earliest admitted one.
+    #[test]
+    fn an_mru_hit_protects_the_block_from_the_next_eviction() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(2, 16, io, &[1, 2, 3]);
+        drop(p.pin(1, Insert::Mru).expect("pin"));
+        drop(p.pin(2, Insert::Mru).expect("pin"));
+        drop(p.pin(1, Insert::Mru).expect("pin")); // hit: 1 is now the most recent
+        drop(p.pin(3, Insert::Mru).expect("pin")); // evicts the least recent
+        assert!(p.try_pin(1).is_some(), "the block just hit was evicted");
+        assert!(
+            p.try_pin(2).is_none(),
+            "the least recently used block survived"
+        );
+    }
+
+    /// B134: across several hits, eviction follows LAST use, not admission: each eviction takes
+    /// the block whose most recent pin is oldest.
+    #[test]
+    fn eviction_follows_the_order_of_last_use() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(3, 16, io, &[1, 2, 3, 4, 5, 6]);
+        for id in [1u32, 2, 3, 1, 3] {
+            drop(p.pin(id, Insert::Mru).expect("pin"));
+        }
+        // Last use, oldest first: 2, 1, 3. Each new block must evict exactly the next of those.
+        for (new, victim, kept) in [(4u32, 2u32, [1u32, 3]), (5, 1, [3, 4]), (6, 3, [4, 5])] {
+            drop(p.pin(new, Insert::Mru).expect("pin"));
+            assert!(
+                p.try_pin(victim).is_none(),
+                "pinning {new} should have evicted {victim}"
+            );
+            for id in kept {
+                assert!(
+                    p.try_pin(id).is_some(),
+                    "pinning {new} evicted {id} out of order"
+                );
+            }
+        }
+    }
+
+    /// A block read that panics once each time it is armed, and otherwise reads like [`FakeIo`].
+    struct PanicOnceIo {
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl BlockIo for PanicOnceIo {
+        fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                panic!("injected panic reading block {}", desc.id);
+            }
+            dst[..desc.nbytes()].fill(desc.id as u8);
+            Ok(())
+        }
+    }
+
+    /// B135: a panic out of a block read must release the slot exactly as an `Err` does. Left
+    /// `Loading`, the block would park every later `pin` or `fill` of it on the condvar forever,
+    /// so the retry runs on its own thread and a timeout is the failure.
+    #[test]
+    fn a_panicking_read_strands_nothing() {
+        let retry = |p: Arc<HostPager>, use_fill: bool| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut dst = [0u8; 16];
+                if use_fill {
+                    p.fill(1, &mut dst).expect("fill");
+                } else {
+                    dst.copy_from_slice(&p.pin(1, Insert::Mru).expect("pin"));
+                }
+                tx.send(dst).unwrap();
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the block was stranded by the panicking read")
+        };
+
+        for use_fill in [false, true] {
+            let io = Arc::new(PanicOnceIo {
+                armed: std::sync::atomic::AtomicBool::new(false),
+            });
+            let p = Arc::new(HostPager::new(2, 16, io.clone()).expect("host pager"));
+            p.register(desc(1, 16)).expect("register");
+            if use_fill {
+                // `fill` claims a slot only from a block's second miss on; the first streams.
+                assert_eq!(p.fill(1, &mut [0u8; 16]).unwrap(), Fill::Streamed);
+            }
+            io.armed.store(true, Ordering::SeqCst);
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut dst = [0u8; 16];
+                if use_fill {
+                    p.fill(1, &mut dst).map(|_| ())
+                } else {
+                    p.pin(1, Insert::Mru).map(|_| ())
+                }
+            }));
+            assert!(caught.is_err(), "the injected read did not panic");
+            assert_eq!(retry(Arc::clone(&p), use_fill), [1u8; 16]);
+        }
     }
 
     /// `try_pin` never reads and never admits.

@@ -12,7 +12,6 @@ infr-prof-rt.workspace = true
 infr-core.workspace = true
 memmap2.workspace = true
 half.workspace = true
-bytemuck.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

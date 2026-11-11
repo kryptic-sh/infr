@@ -245,13 +245,13 @@ indexer. Plain MHA plus DeepSeek-style MoE.
 
 ### Hyperparameters (`{arch}.` prefixed)
 
-| key                                | maps to                    |
-| ---------------------------------- | -------------------------- |
-| `attention.layer_norm_rms_epsilon` | RMS eps                    |
-| `leading_dense_block_count`        | `n_layer_dense_lead`       |
-| `expert_feed_forward_length`       | `n_ff_exp`                 |
-| `expert_shared_count`              | `n_expert_shared`          |
-| `expert_weights_scale`             | routed scaling (default 0) |
+| key                                | maps to                              |
+| ---------------------------------- | ------------------------------------ |
+| `attention.layer_norm_rms_epsilon` | RMS eps                              |
+| `leading_dense_block_count`        | `n_layer_dense_lead`                 |
+| `expert_feed_forward_length`       | `n_ff_exp`                           |
+| `expert_shared_count`              | `n_expert_shared`                    |
+| `expert_weights_scale`             | routed scaling (absent/0 = unscaled) |
 
 V1 has **no** `expert_gating_func` and **no** `expert_weights_norm` — it
 hardcodes softmax scoring and no normalisation.

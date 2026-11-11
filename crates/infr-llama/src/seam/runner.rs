@@ -6321,11 +6321,18 @@ mod tests {
         slot.as_mut().expect("slot initialized").reset();
         let after_reset = q35_logits(&g, &cfg, &embd, &second, &mut slot);
 
+        // NaN-propagating: `f32::max` drops a NaN operand, and the reset check below is `== 0.0`.
         let diff = |a: &[f32], b: &[f32]| {
             a.iter()
                 .zip(b)
                 .map(|(x, y)| (x - y).abs())
-                .fold(0f32, f32::max)
+                .fold(0f32, |m, d| {
+                    if m.is_nan() || d.is_nan() {
+                        f32::NAN
+                    } else {
+                        m.max(d)
+                    }
+                })
         };
         assert_eq!(fresh.len(), Q35_VOCAB);
         // What `second` reads off a state that skipped the zeroing: the first call fed all of

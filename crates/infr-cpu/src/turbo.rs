@@ -364,7 +364,7 @@ mod tests {
                 num += (got[i] - src[i]).powi(2);
                 den += src[i].powi(2);
             }
-            worst = worst.max((num / den).sqrt());
+            worst = infr_testkit::nan_max(worst, (num / den).sqrt());
         }
         assert!(
             worst < 0.25,

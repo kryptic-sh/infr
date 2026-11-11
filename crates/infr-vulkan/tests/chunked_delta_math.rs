@@ -226,7 +226,7 @@ fn run_case(rows: usize, nv: usize, nk: usize, kd: usize, vd: usize, chunk: usiz
         x.iter()
             .zip(y)
             .map(|(p, q)| (p - q).abs())
-            .fold(0f32, f32::max)
+            .fold(0f32, infr_testkit::nan_max)
     };
     let (eo, es) = (err(&got, &want), err(&s_chn, &s_seq));
     println!("chunked-delta rows={rows} nv={nv} nk={nk} kd={kd} vd={vd} C={chunk}: out_err={eo:e} state_err={es:e}");

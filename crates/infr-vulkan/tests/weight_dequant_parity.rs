@@ -419,12 +419,15 @@ fn rmsnorm_matches_f64_reference_on_deepseek_v2_lite_layer0() {
         let (mut max_abs, mut max_rel) = (0f32, 0f32);
         for i in 0..n {
             let abs = (gpu[i] - want[i]).abs();
-            max_abs = max_abs.max(abs);
-            max_rel = max_rel.max(if want[i] == 0.0 {
-                0.0
-            } else {
-                abs / want[i].abs()
-            });
+            max_abs = infr_testkit::nan_max(max_abs, abs);
+            max_rel = infr_testkit::nan_max(
+                max_rel,
+                if want[i] == 0.0 {
+                    0.0
+                } else {
+                    abs / want[i].abs()
+                },
+            );
         }
         let build = if rows == 1 { "WIDE (decode)" } else { "base" };
         println!("rmsnorm {build} rows={rows}: max_abs {max_abs:.3e}, max_rel {max_rel:.3e}");
@@ -449,7 +452,7 @@ fn err_stats(got: &[f32], want: &[f32]) -> (f64, f64) {
         num += (g - w) * (g - w);
         den += w * w;
         if w.abs() > 0.01 * scale {
-            worst = worst.max(((g - w) / w).abs());
+            worst = infr_testkit::nan_max64(worst, ((g - w) / w).abs());
         }
     }
     ((num / den).sqrt(), worst)

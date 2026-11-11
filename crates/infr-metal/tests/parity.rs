@@ -4818,7 +4818,7 @@ fn attention_sinks_parity() {
         .iter()
         .zip(&without)
         .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+        .fold(0.0f32, infr_testkit::nan_max);
     assert!(
         gap > 0.05,
         "metal: a sink 18 above every score changed nothing (gap={gap:e}) — it never reached the \
@@ -4907,7 +4907,7 @@ fn attention_key_bias_parity() {
         .iter()
         .zip(&without_bias)
         .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+        .fold(0.0f32, infr_testkit::nan_max);
     assert!(
         gap > 0.05,
         "metal: key_bias changed nothing (gap={gap:e}) — it never reached the score"
@@ -5014,7 +5014,7 @@ fn attention_key_bias_removes_the_masked_keys_parity() {
             .iter()
             .zip(&unmasked)
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, infr_testkit::nan_max);
         assert!(
             gap > 0.05,
             "metal: masking key {masked_j} changed nothing — key_bias is not reaching the kernel \

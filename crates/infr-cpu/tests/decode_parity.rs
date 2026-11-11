@@ -136,7 +136,10 @@ fn cpu_production_matches_the_reference_backend() {
         for case in weight_quant_cases(m, 256, 8) {
             let got = infr_testkit::run_linear(&prod, case);
             let want = infr_testkit::run_linear(&refb, case);
-            let mag = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let mag = want
+                .iter()
+                .map(|v| v.abs())
+                .fold(0f32, infr_testkit::nan_max);
             assert!(
                 mag > 1e-3,
                 "{:?} m={m}: reference output is all-zero",
@@ -145,7 +148,7 @@ fn cpu_production_matches_the_reference_backend() {
             let rel = got
                 .iter()
                 .zip(&want)
-                .fold(0f32, |a, (g, w)| a.max((g - w).abs()))
+                .fold(0f32, |a, (g, w)| infr_testkit::nan_max(a, (g - w).abs()))
                 / mag;
             assert!(
                 rel < CPU_INT8_ACT_TOL,

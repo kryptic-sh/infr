@@ -368,13 +368,24 @@ pub fn check_linear(be: &dyn Backend, case: LinearCase, tol: f32) -> CaseReport 
         dst,
         m * out_f,
     );
+    score(case, &want, &got, tol)
+}
 
+/// Score a backend's `got` against the oracle's `want` for `case`.
+fn score(case: LinearCase, want: &[f32], got: &[f32], tol: f32) -> CaseReport {
+    let LinearCase {
+        dtype,
+        m,
+        in_f,
+        out_f,
+        ..
+    } = case;
     let abs = want
         .iter()
-        .zip(&got)
+        .zip(got)
         .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    let ref_mag = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        .fold(0.0, nan_max);
+    let ref_mag = want.iter().map(|v| v.abs()).fold(0.0, nan_max);
     CaseReport {
         dtype,
         m,
@@ -384,6 +395,27 @@ pub fn check_linear(be: &dyn Backend, case: LinearCase, tol: f32) -> CaseReport 
         rel: abs / ref_mag.max(1e-3),
         ref_mag,
         tol,
+    }
+}
+
+/// The larger of `a` and `b`, or NaN if either is NaN — the drop-in for `f32::max` wherever a
+/// maximum decides a verdict (`.fold(0.0, nan_max)`, `err = nan_max(err, d)`). `f32::max` returns
+/// its non-NaN operand, so folding it over the errors of an all-NaN output gives 0: a perfect
+/// score.
+pub fn nan_max(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else {
+        a.max(b)
+    }
+}
+
+/// [`nan_max`] for `f64`.
+pub fn nan_max64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
     }
 }
 
@@ -539,8 +571,8 @@ mod tests {
             }
             let a = dequant_oracle(dt, &base);
             let b = dequant_oracle(dt, &scaled);
-            let ma = a.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-            let mb = b.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let ma = a.iter().map(|v| v.abs()).fold(0.0, nan_max);
+            let mb = b.iter().map(|v| v.abs()).fold(0.0, nan_max);
             assert!(
                 ma > 1e-9,
                 "{dt:?}: synthesized block decodes to all-zero — synth_scales is degenerate"
@@ -594,5 +626,31 @@ mod tests {
             tol: 1e-2,
         };
         assert!(!r.ok(), "an all-zero oracle must not count as agreement");
+    }
+
+    /// B139: a backend whose output is NaN — everywhere or in one element — must FAIL. The error
+    /// used to be folded with `f32::max`, which drops NaN operands and scored all-NaN as exact.
+    #[test]
+    fn a_nan_output_is_not_a_pass() {
+        let case = LinearCase::new(DType::Q4K, 1, 256, 4);
+        let want = [1.0f32, -2.0, 0.5, 3.0];
+        assert!(
+            score(case, &want, &want, 1e-2).ok(),
+            "exact output must pass"
+        );
+        let all_nan = score(case, &want, &[f32::NAN; 4], 1e-2);
+        assert!(!all_nan.ok(), "all-NaN output passed: {}", all_nan.line());
+        let one_nan = score(case, &want, &[1.0, f32::NAN, 0.5, 3.0], 1e-2);
+        assert!(!one_nan.ok(), "one-NaN output passed: {}", one_nan.line());
+    }
+
+    /// Either operand NaN gives NaN, in both argument orders, so a fold cannot shed one.
+    #[test]
+    fn nan_max_propagates_nan() {
+        assert!(nan_max(f32::NAN, 1.0).is_nan() && nan_max(1.0, f32::NAN).is_nan());
+        assert!(nan_max64(f64::NAN, 1.0).is_nan() && nan_max64(1.0, f64::NAN).is_nan());
+        assert!([1.0, f32::NAN, 2.0].into_iter().fold(0.0, nan_max).is_nan());
+        assert_eq!(nan_max(1.0, 2.0), 2.0);
+        assert_eq!(nan_max64(3.0, -1.0), 3.0);
     }
 }

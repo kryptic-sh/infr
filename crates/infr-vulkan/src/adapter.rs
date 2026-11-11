@@ -7404,6 +7404,12 @@ mod tests {
         }
     }
 
+    /// Absolute tolerance for the f16-input `Attention` graphs against their host oracles. Both
+    /// sides read the SAME f16-rounded q/k/v and accumulate in f32, so only reassociation separates
+    /// them. A bound near the outputs' own magnitude passes a halved score scale or a dropped
+    /// causal key; this one fails both on every case these tests run.
+    const ATTN_VS_HOST_TOL: f32 = 1e-4;
+
     /// A one-op `Attention` graph (GQA, causal, f16 q + f16 KV) must match a host softmax-attention.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
@@ -7497,7 +7503,7 @@ mod tests {
             .unwrap();
         for i in 0..nh * hd {
             assert!(
-                (got[i] - want[i]).abs() < 2e-2,
+                (got[i] - want[i]).abs() < ATTN_VS_HOST_TOL,
                 "attention mismatch at {i}: got {} want {}",
                 got[i],
                 want[i]
@@ -8002,7 +8008,7 @@ mod tests {
                 .unwrap();
             for i in 0..rows * nh * hd {
                 assert!(
-                    (got[i] - want[i]).abs() < 2e-2,
+                    (got[i] - want[i]).abs() < ATTN_VS_HOST_TOL,
                     "small-m attention mismatch rows={rows} window={window} at {i} \
                      (row {} head {}): got {} want {}",
                     i / (nh * hd),

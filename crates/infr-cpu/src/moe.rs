@@ -1,7 +1,6 @@
 //! MoE expert-bank GEMM dispatch: activation-representation selection (`ActsKind` /
 //! `expert_acts_kind`) and the per-o-range GEMM (`expert_gemm_range`) that fans out to the
 //! quant-specific batch kernels.
-use crate::bytes_to_f32;
 use crate::kernels::{
     dot, dot_bf16, dot_f16, vec_dot_q32_batch8, vec_dot_q4k_batch, vec_dot_q4k_batch8,
     vec_dot_q5_0_32_batch, vec_dot_q5k_batch, vec_dot_q6k_batch, vec_dot_q8_0_32_batch,
@@ -11,6 +10,7 @@ use crate::quant::{Q8x32, Q8};
 #[cfg(target_arch = "x86_64")]
 use crate::repack::q4k_gemm_group;
 use crate::repack::Q4kPack;
+use crate::{bytes_to_f32, f32_row};
 use infr_core::tensor::DType;
 
 /// Activation batch for [`expert_gemm_range`] — the representation the weight dtype dictates
@@ -147,9 +147,9 @@ pub(crate) fn expert_gemm_range(
                 let col = &mut out_t[(o - o0) * count..(o - o0 + 1) * count];
                 match dt {
                     DType::F32 => {
-                        let w32: &[f32] = bytemuck::cast_slice(row);
+                        let w32 = f32_row(row);
                         for (r, dst) in col.iter_mut().enumerate() {
-                            *dst = dot(w32, &xin[r * in_f..r * in_f + in_f]);
+                            *dst = dot(&w32, &xin[r * in_f..r * in_f + in_f]);
                         }
                     }
                     DType::F16 => {

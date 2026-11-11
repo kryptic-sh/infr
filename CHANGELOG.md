@@ -20,6 +20,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   system prompt case under `infr serve --parallel` with `Q8_0` KV. The backend
   trait gains `Backend::copy_kv_prefix`, with a default that out-of-tree
   backends inherit.
+- **Malformed GGUF files now fail with an error instead of a panic**: a tensor
+  offset that is not a multiple of `general.alignment`, an F32 tensor that is
+  not 4-byte aligned (legal with an alignment of 1 or 2, and now read
+  correctly), an i2_s tensor with a partial code group, a zero
+  `qwen35.ssm.conv_kernel`, and a Gemma 4 `shared_kv_layers` that leaves fewer
+  than two layers with their own KV.
+- **DeepSeek and Llama 4 files with `expert_weights_scale` absent or 0 no longer
+  lose their routed experts.** infr multiplied by the raw value; llama.cpp
+  treats 0 as "unscaled", and infr now does the same.
+- **A panic while reading a paged weight block no longer hangs later requests
+  for that block.** The block was left marked as loading for good; it is now
+  released, and only the request that hit the panic fails.
+
+### Changed
+
+- **The host (DRAM) weight tier evicts by last use.** A hit did not refresh a
+  block's position, so eviction followed load order. Output is unchanged; MoE
+  models paged from disk should re-read fewer blocks.
 
 ## [0.2.0] - 2026-10-29
 

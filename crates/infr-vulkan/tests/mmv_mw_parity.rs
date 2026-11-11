@@ -122,8 +122,9 @@ fn mmv_mw_matches_native_mmv() {
             let mut mr = 0f32;
             let (mut wa, mut wb) = (0f32, 0f32);
             for (a, b) in r.iter().zip(&g) {
-                let e = ((a - b).abs() - 1e-4).max(0.0) / (a.abs().max(b.abs()) + 1e-6);
-                if e > mr {
+                let e = infr_testkit::nan_max((a - b).abs() - 1e-4, 0.0)
+                    / (a.abs().max(b.abs()) + 1e-6);
+                if e > mr || e.is_nan() {
                     mr = e;
                     wa = *a;
                     wb = *b;
@@ -334,7 +335,7 @@ fn mmv_mw_q2k_q3k_match_host_reference() {
                         _ => unreachable!(),
                     };
                 }
-                mr = mr.max((g - acc).abs() / (g.abs().max(acc.abs()) + 1e-6));
+                mr = infr_testkit::nan_max(mr, (g - acc).abs() / (g.abs().max(acc.abs()) + 1e-6));
             }
             worst = worst.max(mr);
             println!("  {dt:?} in{in_f} out{out_f} W{warps}: max rel err vs host {mr:.2e}");
@@ -512,8 +513,9 @@ fn mmv_mw_q5k_match_host_reference() {
                     acc += dpsub_q5k(&src, gelem, &qa_h, s * 32, da, sa) as f64;
                 }
                 let acc = acc as f32;
-                let e = ((g - acc).abs() - 5e-4).max(0.0) / (g.abs().max(acc.abs()) + 1e-6);
-                if e > mr {
+                let e = infr_testkit::nan_max((g - acc).abs() - 5e-4, 0.0)
+                    / (g.abs().max(acc.abs()) + 1e-6);
+                if e > mr || e.is_nan() {
                     mr = e;
                 }
             }

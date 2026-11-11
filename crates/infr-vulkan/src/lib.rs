@@ -4997,8 +4997,11 @@ mod tests {
             .iter()
             .zip(c_ref.iter())
             .map(|(g, r)| (*g - r).abs())
-            .fold(0.0f32, f32::max);
-        let max_ref = c_ref.iter().map(|r| r.abs()).fold(0.0f32, f32::max);
+            .fold(0.0f32, infr_testkit::nan_max);
+        let max_ref = c_ref
+            .iter()
+            .map(|r| r.abs())
+            .fold(0.0f32, infr_testkit::nan_max);
         let rel_err = if max_ref > 1e-6 {
             max_abs / max_ref
         } else {
@@ -5082,7 +5085,7 @@ mod ssm_tests {
         a.iter()
             .zip(b)
             .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max)
+            .fold(0.0, infr_testkit::nan_max)
     }
 
     #[test]

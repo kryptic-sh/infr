@@ -1258,7 +1258,6 @@ name = "infr-gguf"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "bytemuck",
  "half",
  "infr-core",
  "infr-prof",

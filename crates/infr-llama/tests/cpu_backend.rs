@@ -1583,7 +1583,15 @@ fn h_tap_matches_lm_head() {
     let max_abs = logits
         .iter()
         .zip(&host_logits)
-        .fold(0f32, |m, (&a, &b)| m.max((a - b).abs()));
+        // NaN-propagating: `f32::max` would drop a NaN logit and report agreement.
+        .fold(0f32, |m, (&a, &b)| {
+            let d = (a - b).abs();
+            if m.is_nan() || d.is_nan() {
+                f32::NAN
+            } else {
+                m.max(d)
+            }
+        });
     let max_val = logits.iter().fold(1e-6f32, |m, &v| m.max(v.abs()));
     let rel = max_abs / max_val;
     // token_embd here is Q6_K: the graph's `Op::Linear` runs a quantized-activation integer dot

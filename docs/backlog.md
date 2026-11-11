@@ -3973,50 +3973,35 @@ read for this and no run was made. It affects only sliding-window layers (Gemma)
 with the ring enabled. Fix: track the highest position written per slot rather
 than inferring it from `cached`.
 
-### B133 — malformed-GGUF panics in the loader (2026-11-11)
+### B133 — what the loader, host-pager and LRU fixes left open (2026-11-12)
 
-As reported; the dequant sites were looked at, the rest not re-read.
+The malformed-GGUF panics, the host tier's insertion-order LRU and the block
+stranded as `Loading` by a panicking read are fixed, each with a test run red
+first. What is left:
 
-- `dequant_block`'s F32 arm (infr-gguf `dequant.rs`) uses a `bytemuck` slice
-  cast, which panics on a slice that is not 4-aligned, and the parser does not
-  check a tensor's data offset against `general.alignment`.
-- The I2S arm of `dequant_codebook` assumes the element count is a multiple of
-  128 (its comment says so) while the loader enforces only a multiple of 4, so a
-  tail group indexes past the packed codes.
-- `Config::from_gguf` accepts `ssm.conv_kernel = 0` and a Gemma 4
-  `shared_kv_layers` at or above `n_layer - 1`; `ssm_d_conv - 1` and
-  `Config::kv_src_layer` then underflow.
-- `expert_weights_scale` defaults to 0.0 for `deepseek` / `deepseek2`
-  (confirmed: `unwrap_or(0.0)` in `from_gguf`), which zeroes the routed experts
-  if the key is absent. `docs/deepseek.md` documents the default; requiring the
-  key, as the V4 block already does, would turn a silent wrong answer into an
-  error.
-
-### B134 — the host weight tier never promotes on a hit, so its LRU is insertion order (2026-11-11)
-
-`HostPager::pin` (infr-core `hostpager.rs`) serves a resident block through
-`Pager::pin_if_resident`, which bumps the epoch, the hit counter and the pin
-count but does not call `mark_mru`. The promoting path is the `Hit` arm of
-`Pager::resolve_and_pin`, which `HostPager::pin` only reaches for a block that
-is not yet resident. So the `Insert::Mru` argument decides where a miss is
-placed and nothing else: the DRAM tier evicts in admission order, and an expert
-admitted early and used constantly is evicted before a cold one admitted later.
-`docs/disk-streaming-plan.md` intends both tiers to share one notion of which
-experts are hot.
-
-Confirmed by reading both `Pager` functions and `HostPager::pin`. This affects
-hit rate, not output. Not measured, and the reviewer notes no host-pager test
-asserts recency order. `Insert::Cold` callers are unaffected by design.
-
-### B135 — a panic inside a block read strands the block as `Loading` (2026-11-11)
-
-Reported, not re-read. `HostPager::pin` and `HostPager::fill` mark a slot
-`SlotState::Loading` under the lock, read with the lock released, and restore
-the state only when the read returns `Err`; there is no drop guard. A panic in
-the read — `read_pieces` in `blockio.rs` spawns scoped threads and `expect`s
-their joins, so thread-creation failure is enough — leaves the slot unevictable
-and every later `pin` or `fill` of that block waiting on the `ready` condvar
-with no timeout. In `serve` that is a request hung while holding its slot.
+- **I2S on ARM-quantised files, suspected.** `Gguf::open` now requires an i2_s
+  element count to be a multiple of `I2S_GROUP_ELEMS`, which the decoder always
+  assumed. The reviewer recalls bitnet.cpp using a group of 64 on ARM builds;
+  there is no reference checkout here to check. Such a file would have decoded
+  wrongly before and is refused now if its count is not also a multiple of the
+  x86 group.
+- **Eviction now scans every resident block.** `Pager` ranks blocks by a recency
+  stamp in a map, so a hit is one map write (it was a deque scan) and choosing a
+  victim is a full scan (it was the first eligible entry, usually the front).
+  The order is unchanged. Not measured: the reviewer estimates a few
+  microseconds per miss at today's slot counts, next to an upload of a megabyte
+  or more, but a miss-heavy sweep at DeepSeek V4 slot counts would be the place
+  it shows (`deepseek.md` §0.3 names the LRU cost).
+- **`Claim` in `hostpager.rs` cannot be tested for a panic in the slot
+  arithmetic** without fault injection into `Arena`; it is built before that
+  code, and only the panicking-read case has a test. A poisoned `HostPager`
+  mutex after a successful read still panics the next caller, as before.
+- **`bytes_to_f32`'s integer arms drop a trailing partial word** where the old
+  cast panicked. The loader never produces a byte length that is not a multiple
+  of 4.
+- The KV-cache `cast_slice` calls in infr-cpu (`dequant_cache_prefix`, the
+  attention `deq` closure) were left: they read buffers the backend allocates,
+  not the GGUF mapping.
 
 ### B136 — the pipeline-cache tripwire judges a crashed run by pid alone (2026-11-11)
 
@@ -4075,24 +4060,29 @@ poisoned-pipeline-cache incident this module was written for.
   `dst_only_read_by_next`'s doc says a backend post-filters with it; nothing
   outside `fusion.rs` calls it. Candidates for deletion rather than repair.
 
-### B139 — the shared parity harness passes an all-NaN result (2026-11-11)
+### B139 — NaN-aware comparisons: what the sweep could have missed (2026-11-12)
 
-`check_linear` in `infr-testkit` computes the error as
-`.map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)`. `f32::max` returns the
-non-NaN operand, so a backend that outputs NaN for every element yields
-`abs = 0`, and `CaseReport::ok` (`ref_mag > 1e-3 && rel < tol`) is true because
-`ref_mag` comes from the finite oracle. Every sweep built on the harness
-inherits this: `infr-cpu/tests/decode_parity.rs` and the Vulkan and Metal
-`shared_decode_parity.rs`. The harness guards against a vacuous all-zero oracle
-but not against this.
+`infr-testkit` exports `nan_max` / `nan_max64`, and every pass/fail maximum
+found in the test suites now propagates NaN (an `f32::max` fold scores an
+all-NaN output as error 0). The sites were found by grepping for `f32::max` /
+`f64::max`, `fold(0…max`, `x = x.max(` and `if e > m`; a gate written another
+way is not covered. `infr-llama` does not depend on `infr-testkit`, so
+`seam_op_parity.rs`, `synthetic_deepseek2.rs`, `cpu_backend.rs` and the qwen35
+reset test in `seam/runner.rs` carry local copies. The Metal sites compile for
+the Apple target but were not run.
 
-Confirmed by reading `check_linear` and `ok`. The reviewer reports the same fold
-in `cpu_production_matches_the_reference_backend`, in `check` (infr-vulkan
-`gemm.rs` tests), in `maxerr` (infr-vulkan `lib.rs` tests) and in `max_abs_diff`
-(`synthetic_deepseek2.rs`); those were not re-read. This is the same defect
-already recorded for `maxerr` / `maxerr64` in `seam_op_parity.rs`, in more
-places. Fix: fail on any non-finite `got`, or fold with a NaN-propagating max.
-It matters more now that B116 describes a path that can produce NaN.
+### B144 — infr-vulkan unit tests build coopmat kernels without checking the device (2026-11-12)
+
+On the iGPU (RADV RAPHAEL_MENDOCINO, no WMMA)
+`cargo test -p infr-vulkan --lib -- --include-ignored` dies inside Mesa with
+"ACO ERROR … Unsupported opcode v_wmma_f32_16x16x16_f16": SIGSEGV in
+`gemm::tests::coopmat_gemm_tiled_matches_cpu`, and with `gemm::tests` skipped,
+SIGABRT in `recorder::tests::matmul_native_splitk_f16_matches_cpu`. The same set
+passes on the RX 7900 XTX. Those tests should skip when the device lacks the
+cooperative matrix feature, the way the product's kernel tiering does. Observed
+during the 2026-11-12 slice with no run of the previous commit for comparison,
+so "old behaviour" is inferred from the tests not having changed. `AGENTS.md`
+asks for GPU testing on the iGPU, which this blocks for the lib tests.
 
 ### B140 — tests that CI reports as passed without running them (2026-11-11)
 
@@ -4130,20 +4120,16 @@ It matters more now that B116 describes a path that can produce NaN.
   `cpu_kv_mainline_quants_coherent` and the Vulkan twins. Per the reviewer, CPU
   `Op::WriteKv` and quantised-KV `Op::Attention` have no numeric assertion in
   any Linux CI test; only the quantisers have unit round-trips.
-- **`q5_1_saturates_to_31` (infr-cpu `kvquant.rs`) does not test the clamp.**
-  Its ramp input never produces a code above 31 with or without the `.min(31)`
-  (the first half confirmed), and its second half asserts an expression local to
-  the test. Removing the clamp from `q5_1_block` leaves it green.
-- **Reported, not re-read:** the Vulkan attention-vs-host tests in `adapter.rs`
-  use an absolute tolerance of `2e-2` against outputs that span about ±0.04, so
-  scaling the scores by 0.5 or dropping a causal key still passes (the reviewer
-  recomputed the tests' own data); `metal_kv_scratch_paths_are_coherent` pins
-  one hash for eight KV formats with no f16 control;
-  `mtp_head_trunk_acceptance_rate` prints the rate and asserts nothing about it;
-  `warp_ag_isa_probe` compares a kernel with itself at two offsets; `mla_parity`
-  uses identical K rows, so its output is independent of the attention weights;
-  no Metal parity test names `Op::CopyStrided`, `MulVec`, `Softmax`, `TopkMask`
-  or `RmsNormAdd`.
+- **Reported, not re-read:** `metal_kv_scratch_paths_are_coherent` pins one hash
+  for eight KV formats with no f16 control; `mtp_head_trunk_acceptance_rate`
+  prints the rate and asserts nothing about it; `warp_ag_isa_probe` compares a
+  kernel with itself at two offsets (confirmed 2026-11-12; its comment says so,
+  and the fix is a host reference); no Metal parity test names
+  `Op::CopyStrided`, `MulVec`, `Softmax`, `TopkMask` or `RmsNormAdd`. Metal's
+  own `mla_parity` was not checked for the identical-K-rows weakness the
+  infr-llama one had.
+- The KV "coherent" tests above need a real model to tighten, and none is on the
+  dev machine as of 2026-11-12.
 - **Hygiene, reported:** `test_serial_lock` and `gpu_serial_lock` are in-process
   mutexes, which do nothing under nextest's process-per-test model if the
   ignored GPU tests are ever run that way; the SIMD tier tests cover only the

@@ -964,9 +964,9 @@ impl Config {
             }
             // Keys the reference requires that the SHARED parses further down would otherwise
             // default silently — and each default is wrong in a way nothing downstream can detect:
-            // `expert_weights_scale` falls back to 0, which zeroes every routed expert's
-            // contribution, `expert_feed_forward_length` falls back to `n_ff / n_used`, and
-            // `attention.layer_norm_rms_epsilon` falls back to the generic 1e-5.
+            // `expert_weights_scale` falls back to unscaled, `expert_feed_forward_length` falls
+            // back to `n_ff / n_used`, and `attention.layer_norm_rms_epsilon` falls back to the
+            // generic 1e-5.
             for key in [
                 "attention.layer_norm_rms_epsilon",
                 "expert_feed_forward_length",
@@ -1075,17 +1075,25 @@ impl Config {
             // llama4 hardcodes SIGMOID gating, NO top-k renormalization, and weight-before-FFN
             // (`models/llama4.cpp::build_arch_graph` → `build_moe_ffn(.., norm_w=false, ..,
             // LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID)` with `weight_before_ffn = arch == LLAMA4`).
-            // Its routed-weight scale is `expert_weights_scale` (absent on Scout → 1.0).
+            // Its routed-weight scale is `expert_weights_scale` (absent on Scout → unscaled).
             // DeepSeek V1 hardcodes SOFTMAX gating, NO top-k renormalization, weight-after-FFN,
-            // and scale from `expert_weights_scale` (default 0) — matching the reference's
+            // and scale from `expert_weights_scale` — matching the reference's
             // `build_deepseek` (`src/models/deepseek.cpp`). Every other MoE arch here is softmax
             // + renormalized top-k, output-weighted, scale 1.0.
+            // llama4's and DeepSeek's scale both reach llama.cpp's `build_moe_ffn`, which applies
+            // it only when it is neither 0 nor 1, so an absent or zero key means "unscaled".
+            // Multiplying by the raw 0 instead silently zeroes every routed expert.
+            let routed_weights_scale = || {
+                meta_f64(g, &mk("expert_weights_scale"))
+                    .filter(|&s| s != 0.0)
+                    .unwrap_or(1.0) as f32
+            };
             let (gating, norm_w, weight_before, scale) = if llama4 {
                 (
                     infr_core::graph::MoeGating::Sigmoid,
                     false,
                     true,
-                    meta_f64(g, &mk("expert_weights_scale")).unwrap_or(1.0) as f32,
+                    routed_weights_scale(),
                 )
             } else if deepseek2 || deepseek4 {
                 let gating = match expert_gating_func {
@@ -1104,14 +1112,14 @@ impl Config {
                     gating,
                     expert_weights_norm,
                     false, // weight-before-FFN: always false for deepseek2
-                    meta_f64(g, &mk("expert_weights_scale")).unwrap_or(0.0) as f32,
+                    routed_weights_scale(),
                 )
             } else if deepseek {
                 (
                     infr_core::graph::MoeGating::Softmax,
                     false,
                     false,
-                    meta_f64(g, &mk("expert_weights_scale")).unwrap_or(0.0) as f32,
+                    routed_weights_scale(),
                 )
             } else {
                 (infr_core::graph::MoeGating::Softmax, true, false, 1.0)
@@ -1241,8 +1249,15 @@ impl Config {
             0
         };
         let n_layer_kv_from_start = if gemma4 {
-            let shared = meta_u64(g, &mk("attention.shared_kv_layers")).unwrap_or(0) as usize;
-            n_layer.saturating_sub(shared)
+            let key = mk("attention.shared_kv_layers");
+            let shared = meta_u64(g, &key).unwrap_or(0) as usize;
+            let own = n_layer.saturating_sub(shared);
+            // `kv_src_layer` points an SWA shared layer at the own-KV layer BEFORE the last one,
+            // so any sharing needs at least that many own-KV layers or the index underflows.
+            if shared > 0 && own < 2 {
+                bail!("{key} = {shared} leaves {own} of {n_layer} layers with their own KV");
+            }
+            own
         } else {
             n_layer
         };
@@ -1264,7 +1279,11 @@ impl Config {
         };
         let (ssm_d_conv, ssm_d_state, ssm_d_inner, ssm_n_group, ssm_dt_rank) = if qwen35 {
             (
-                meta_u64(g, &mk("ssm.conv_kernel")).context("qwen35 ssm.conv_kernel")? as usize,
+                // Positive: the conv state keeps `ssm_d_conv - 1` past steps.
+                positive_model_dimension(
+                    &mk("ssm.conv_kernel"),
+                    meta_u64(g, &mk("ssm.conv_kernel")).context("qwen35 ssm.conv_kernel")?,
+                )?,
                 meta_u64(g, &mk("ssm.state_size")).context("qwen35 ssm.state_size")? as usize,
                 meta_u64(g, &mk("ssm.inner_size")).context("qwen35 ssm.inner_size")? as usize,
                 meta_u64(g, &mk("ssm.group_count")).context("qwen35 ssm.group_count")? as usize,
@@ -1496,6 +1515,12 @@ mod tests {
     /// Minimal `deepseek2` GGUF carrying exactly `keys` (each prefixed with `deepseek2.`) plus a
     /// single dummy tensor — enough for `Config::from_gguf` to reach the MLA and MoE parses.
     fn deepseek2_fixture(keys: &[(&str, u32)]) -> Vec<u8> {
+        arch_fixture("deepseek2", keys)
+    }
+
+    /// Minimal `arch` GGUF carrying exactly `keys` (each prefixed with `{arch}.`) plus a single
+    /// dummy tensor.
+    fn arch_fixture(arch: &str, keys: &[(&str, u32)]) -> Vec<u8> {
         let mut bytes = Vec::new();
         push_u32(&mut bytes, 0x4655_4747); // GGUF magic
         push_u32(&mut bytes, 3);
@@ -1504,9 +1529,9 @@ mod tests {
 
         push_str(&mut bytes, "general.architecture");
         push_u32(&mut bytes, 8); // GGUF_TYPE_STRING
-        push_str(&mut bytes, "deepseek2");
+        push_str(&mut bytes, arch);
         for (key, value) in keys {
-            push_u32_metadata(&mut bytes, &format!("deepseek2.{key}"), *value);
+            push_u32_metadata(&mut bytes, &format!("{arch}.{key}"), *value);
         }
 
         push_str(&mut bytes, "token_embd.weight");
@@ -1729,5 +1754,115 @@ mod tests {
         assert_eq!(cfg.rope_yarn_beta_fast, 16.0);
         assert_eq!(cfg.rope_yarn_beta_slow, 2.0);
         assert_eq!(cfg.rope_attn_factor, 3.0);
+    }
+
+    /// llama4 shares DeepSeek's reading of `expert_weights_scale`: an explicit 0 is unscaled.
+    #[test]
+    fn llama4_zero_expert_weights_scale_is_unscaled() {
+        let keys = |scale: u32| {
+            [
+                ("block_count", 1),
+                ("embedding_length", 8),
+                ("attention.head_count", 2),
+                ("feed_forward_length", 16),
+                ("expert_count", 4),
+                ("expert_used_count", 1),
+                ("expert_weights_scale", scale),
+            ]
+        };
+        let scale = |name: &str, s: u32| {
+            config_from_fixture(name, &arch_fixture("llama4", &keys(s)))
+                .expect("llama4 fixture must parse")
+                .moe
+                .expect("llama4 fixture has experts")
+                .scale
+        };
+        assert_eq!(scale("l4-scale-zero", 0), 1.0);
+        assert_eq!(scale("l4-scale-two", 2), 2.0);
+    }
+
+    /// B133: llama.cpp defaults `expert_weights_scale` to 0 and skips the multiply for 0, so an
+    /// absent or zero key routes UNSCALED. Taking the raw 0 zeroed every routed expert.
+    #[test]
+    fn deepseek_absent_or_zero_expert_weights_scale_is_unscaled() {
+        let scale = |name: &str, keys: &[(&str, u32)]| {
+            config_from_fixture(name, &deepseek2_fixture(keys))
+                .expect("deepseek2 fixture must parse")
+                .moe
+                .expect("deepseek2 fixture has experts")
+                .scale
+        };
+        assert_eq!(scale("ds2-scale-absent", DEEPSEEK2_BASE_KEYS), 1.0);
+        let mut keys = DEEPSEEK2_BASE_KEYS.to_vec();
+        keys.push(("expert_weights_scale", 0));
+        assert_eq!(scale("ds2-scale-zero", &keys), 1.0);
+        keys.last_mut().unwrap().1 = 2;
+        assert_eq!(scale("ds2-scale-two", &keys), 2.0);
+    }
+
+    /// The smallest dense qwen35 geometry `Config::from_gguf` accepts, minus `ssm.conv_kernel`.
+    const QWEN35_BASE_KEYS: &[(&str, u32)] = &[
+        ("block_count", 1),
+        ("embedding_length", 8),
+        ("attention.head_count", 2),
+        ("feed_forward_length", 16),
+        ("ssm.state_size", 4),
+        ("ssm.inner_size", 8),
+        ("ssm.group_count", 1),
+        ("ssm.time_step_rank", 2),
+    ];
+
+    /// B133: the conv state keeps `ssm_d_conv - 1` past steps, so a zero kernel underflowed in
+    /// the seam instead of failing here.
+    #[test]
+    fn qwen35_zero_conv_kernel_is_refused() {
+        let mut keys = QWEN35_BASE_KEYS.to_vec();
+        keys.push(("ssm.conv_kernel", 4));
+        let cfg = config_from_fixture("q35-conv4", &arch_fixture("qwen35", &keys))
+            .expect("qwen35 fixture must parse");
+        assert_eq!(cfg.ssm_d_conv, 4);
+
+        keys.last_mut().unwrap().1 = 0;
+        let Err(err) = config_from_fixture("q35-conv0", &arch_fixture("qwen35", &keys)) else {
+            panic!("ssm.conv_kernel = 0 must fail");
+        };
+        assert_eq!(err.to_string(), "qwen35.ssm.conv_kernel must be positive");
+    }
+
+    /// B133: a shared gemma4 layer reads its K/V from an earlier own-KV layer
+    /// (`kv_src_layer`), so `shared_kv_layers` must leave enough own-KV layers to point at.
+    #[test]
+    fn gemma4_shared_kv_layers_must_leave_own_kv_layers() {
+        let keys = |shared: u32| {
+            [
+                ("block_count", 4),
+                ("embedding_length", 8),
+                ("attention.head_count", 2),
+                ("attention.head_count_kv", 1),
+                ("feed_forward_length", 16),
+                ("attention.sliding_window", 4),
+                ("attention.shared_kv_layers", shared),
+            ]
+        };
+        let cfg = config_from_fixture("g4-shared2", &arch_fixture("gemma4", &keys(2)))
+            .expect("two own-KV layers must parse");
+        assert_eq!(cfg.n_layer_kv_from_start, 2);
+        for il in 0..cfg.n_layer {
+            assert!(cfg.kv_src_layer(il) < cfg.n_layer_kv_from_start);
+        }
+
+        for shared in [3, 4, 5] {
+            let name = format!("g4-shared{shared}");
+            let Err(err) = config_from_fixture(&name, &arch_fixture("gemma4", &keys(shared)))
+            else {
+                panic!("shared_kv_layers = {shared} of 4 must fail");
+            };
+            assert!(
+                err.to_string().starts_with(&format!(
+                    "gemma4.attention.shared_kv_layers = {shared} leaves"
+                )),
+                "{err}"
+            );
+        }
     }
 }

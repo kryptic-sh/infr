@@ -11,7 +11,14 @@ use anyhow::{bail, Result};
 pub fn dequant_block(dtype: infr_core::DType, bytes: &[u8]) -> Result<Vec<f32>> {
     use infr_core::DType::*;
     Ok(match dtype {
-        F32 => bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
+        // Decoded per element rather than cast: a tensor slice of the mapping is only as aligned
+        // as the file's offsets, and a cast panics on anything not 4-aligned.
+        F32 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| f32::from_le_bytes(c))
+            .collect(),
         F16 => bytes
             .as_chunks::<2>()
             .0
@@ -486,6 +493,10 @@ fn apply_signs(out: &mut [f32], grid: u64, signs: u8, sign_off: usize, n: usize,
         out[j] = db * gv * sign;
     }
 }
+
+/// Elements per interleaved i2_s code group. [`dequant_codebook`]'s I2S arm addresses whole
+/// groups only, so the loader rejects an i2_s tensor whose element count is not a multiple.
+pub const I2S_GROUP_ELEMS: usize = 128;
 
 /// Dequantize a codebook (non-affine) quant to f32. Ported from llama.cpp `ggml-quants.c`.
 /// Returns a `Vec<f32>` of length `numel` in natural tensor order.
@@ -1074,11 +1085,12 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
         }
         // ── I2S (BitNet i2_s): ternary {-1,0,+1}, 2 bits/elem + ONE per-tensor f32 scale ────────
         // Layout (microsoft/BitNet, quantize_i2_s / ggml_vec_dot_i2_i8_s, x86 build): `numel/4`
-        // packed bytes, then a trailing f32 `scale`. Codes are packed INTERLEAVED in 128-element
-        // groups: element `e = i*128 + j` (natural row-major order) → byte `i*32 + (j%32)`, in the
-        // 2-bit field at shift `6 - 2*(j/32)`. Code `q ∈ {0,1,2}` maps to `q-1 ∈ {-1,0,+1}` and
-        // `y = (q-1) * scale`. (Rows never split a 128-group: every ne0 in these GGUFs is a
-        // multiple of 128.) Verified against the real 2B-4T model: scale ≈ absmax, ~50% zeros.
+        // packed bytes, then a trailing f32 `scale`. Codes are packed INTERLEAVED in groups of
+        // `G = I2S_GROUP_ELEMS`: element `e = i*G + j` (natural row-major order) → byte
+        // `i*G/4 + j%(G/4)`, in the 2-bit field at shift `6 - 2*(j/(G/4))`. Code `q ∈ {0,1,2}` maps
+        // to `q-1 ∈ {-1,0,+1}` and `y = (q-1) * scale`. (Rows never split a group: `Gguf::open`
+        // rejects a numel that is not a multiple of G.) Verified against the real 2B-4T model:
+        // scale ≈ absmax, ~50% zeros.
         I2S => {
             // The slice is `numel/4` packed bytes + a 4-byte f32 scale at the tail (see
             // `tensor_nbytes`). Recover numel from the packed-code length.
@@ -1092,10 +1104,11 @@ pub fn dequant_codebook(dtype: infr_core::DType, bytes: &[u8]) -> Vec<f32> {
             ]);
             let mut out = vec![0.0f32; numel];
             for e in 0..numel {
-                let i = e / 128;
-                let j = e % 128;
-                let byte = bytes[i * 32 + (j % 32)];
-                let shift = 6 - 2 * (j / 32);
+                let i = e / I2S_GROUP_ELEMS;
+                let j = e % I2S_GROUP_ELEMS;
+                let lane = I2S_GROUP_ELEMS / 4;
+                let byte = bytes[i * lane + (j % lane)];
+                let shift = 6 - 2 * (j / lane);
                 let code = (byte >> shift) & 3;
                 out[e] = (code as f32 - 1.0) * scale;
             }
@@ -1481,6 +1494,25 @@ mod dequant_tests {
         assert_eq!(y2.len(), 128);
         assert!(y2.iter().all(|v| v.is_finite()));
         assert_eq!(y, y2);
+    }
+
+    /// B133: a tensor slice of the mapping is only as aligned as its offset, so the F32 arm must
+    /// decode a misaligned slice instead of panicking in a cast.
+    #[test]
+    fn f32_decodes_a_misaligned_slice() {
+        let want = [1.5f32, -2.0, 3.25];
+        let mut buf = vec![0u8; size_of_val(&want) + 4];
+        let start = (1..4)
+            .find(|&o| !(buf.as_ptr() as usize + o).is_multiple_of(4))
+            .unwrap();
+        for (i, v) in want.iter().enumerate() {
+            buf[start + 4 * i..start + 4 * (i + 1)].copy_from_slice(&v.to_le_bytes());
+        }
+        let y = dequant_block(
+            infr_core::DType::F32,
+            &buf[start..start + size_of_val(&want)],
+        );
+        assert_eq!(y.unwrap(), want);
     }
 
     // ── IQ2_XXS ─────────────────────────────────────────────────────────────────

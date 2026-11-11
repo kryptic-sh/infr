@@ -153,15 +153,31 @@ jobs:
       # set + quant, so it only re-downloads when that list changes (bump the
       # `-v1` suffix if you change the models below).
       - name: Cache golden model GGUFs
+        id: models
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
           key: hf-cpu-goldens-gemma3-1b_qwen3-06b-q4km-v2
+      # Skipped on a cache hit: the cache is only saved by a job that passed,
+      # so a hit holds both files, and `hf download` would still ask the hub
+      # about them — which turns a hub outage into a failed run for nothing.
       - name: Download golden GGUFs (single file per repo)
+        if: steps.models.outputs.cache-hit != 'true'
         run: |
-          pipx install huggingface_hub
-          hf download unsloth/gemma-3-1b-it-GGUF gemma-3-1b-it-Q4_K_M.gguf
-          hf download unsloth/Qwen3-0.6B-GGUF   Qwen3-0.6B-Q4_K_M.gguf
+          fetch() {
+            local attempt
+            for attempt in 1 2 3; do
+              if "$@"; then return 0; fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::'$*' failed (attempt $attempt); retrying in 30s"
+                sleep 30
+              fi
+            done
+            return 1
+          }
+          fetch pipx install huggingface_hub
+          fetch hf download unsloth/gemma-3-1b-it-GGUF gemma-3-1b-it-Q4_K_M.gguf
+          fetch hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-Q4_K_M.gguf
       # Release build: these run real CPU inference (the f32 reference backend),
       # which is far too slow to time out in debug. Single-threaded because the
       # goldens mutate process-global generation env under a shared lock.

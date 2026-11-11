@@ -4,45 +4,182 @@ description: >
   shader, with no prebuilt-SPIR-V fallback, so it is a hard build requirement on
   every platform — not a Vulkan-runtime concern.
 
+# Every job of a run starts here, and the publish jobs depend on the build jobs,
+# so one package-feed outage fails the whole run and skips a release. Each
+# platform therefore retries its install, and Linux and Windows also keep what
+# they installed in the Actions cache:
+#
+#   - an exact cache hit (same runner image) installs with no network at all;
+#   - a miss installs from the feed and saves the result;
+#   - a miss with the feed down falls back to the newest older cache entry.
+#
+# The key carries the runner image version, so the cached copy is refreshed
+# whenever the image is, and never pins glslc for longer than that.
+
 runs:
   using: composite
   steps:
+    - name: Identify the runner image
+      id: image
+      shell: bash
+      run: echo "id=${ImageOS:-unknown}-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore cached glslc
+      id: restore
+      if: runner.os != 'macOS'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/glslc-cache
+        key: glslc-${{ runner.os }}-${{ runner.arch }}-${{ steps.image.outputs.id }}
+        restore-keys: glslc-${{ runner.os }}-${{ runner.arch }}-
+
     # Ubuntu 24.04 ships shaderc 2023.8, which predates GL_EXT_integer_dot_product
     # and cannot compile the dp4a shaders; ubuntu-26.04 carries shaderc 2025+.
+    #
+    # The cache holds the `.deb` files apt downloaded for glslc and whatever it
+    # pulled in with it. On 2026-11-11 the runners could not resolve the Ubuntu
+    # mirrors for long enough to fail three runs in a row, which a retry alone
+    # does not survive.
     - name: Install glslc (apt)
+      id: linux
       if: runner.os == 'Linux'
       shell: bash
-      run: sudo apt-get update && sudo apt-get install -y glslc
+      env:
+        CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
+      run: |
+        cache="$RUNNER_TEMP/glslc-cache"
+        install_cached() {
+          compgen -G "$cache/*.deb" > /dev/null && sudo dpkg -i "$cache"/*.deb
+        }
+        install_apt() {
+          local attempt
+          for attempt in 1 2 3; do
+            if sudo apt-get update &&
+              sudo apt-get install -y -o APT::Keep-Downloaded-Packages=true glslc; then
+              return 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              echo "::warning::apt install of glslc failed (attempt $attempt); retrying in 30s"
+              sleep 30
+            fi
+          done
+          return 1
+        }
 
+        fresh=false
+        if [ "$CACHE_HIT" = true ] && install_cached; then
+          echo "installed glslc from the cached packages"
+        else
+          # Empty the archive directory first, so what is in it afterwards is
+          # exactly what this install downloaded.
+          sudo apt-get clean
+          if install_apt; then
+            if compgen -G "/var/cache/apt/archives/*.deb" > /dev/null; then
+              rm -rf "$cache"
+              mkdir -p "$cache"
+              cp /var/cache/apt/archives/*.deb "$cache"/
+              fresh=true
+            else
+              echo "::warning::apt kept no packages to cache"
+            fi
+          elif install_cached; then
+            echo "::warning::apt is unreachable; installed glslc from an older cache entry"
+          else
+            echo "::error::apt install of glslc failed 3 times and no cached packages exist"
+            exit 1
+          fi
+        fi
+        echo "fresh=$fresh" >> "$GITHUB_OUTPUT"
+
+    # Not cached: the bottle alone is not enough for an offline install (brew
+    # still fetches its formula index), and a cached copy of the keg has not
+    # been shown to work. Retried only.
     - name: Install glslc (Homebrew)
       if: runner.os == 'macOS'
       shell: bash
-      run: brew install shaderc
+      run: |
+        for attempt in 1 2 3; do
+          if brew install shaderc; then
+            exit 0
+          fi
+          if [ "$attempt" -lt 3 ]; then
+            echo "::warning::brew install shaderc failed (attempt $attempt); retrying in 30s"
+            sleep 30
+          fi
+        done
+        echo "::error::brew install shaderc failed 3 times"
+        exit 1
 
     # No standalone shaderc package on Windows; glslc ships inside the Vulkan SDK,
     # whose installer does not add its Bin directory to PATH.
+    #
+    # Only `glslc.exe` is needed, so that one file is what gets cached, and PATH
+    # points at the cached copy on a fresh install too — every run then proves
+    # the copy works outside the SDK directory, not only the runs that hit the
+    # cache.
     - name: Install glslc (Vulkan SDK)
+      id: windows
       if: runner.os == 'Windows'
       shell: pwsh
+      env:
+        CACHE_HIT: ${{ steps.restore.outputs.cache-hit }}
       # Retried because the community feed times out now and then (a 504 on 2026-10-27 failed
       # every Windows job of a run), and one flake here skips the whole release.
       run: |
         # A failed attempt must reach the retry below, not end the step.
         $PSNativeCommandUseErrorActionPreference = $false
-        for ($attempt = 1; $attempt -le 3; $attempt++) {
-          choco install vulkan-sdk --no-progress -y
-          if ($LASTEXITCODE -eq 0) { break }
-          if ($attempt -eq 3) { throw "choco install vulkan-sdk failed $attempt times" }
-          Write-Warning "choco install vulkan-sdk failed (exit $LASTEXITCODE); retrying in 30s"
-          Start-Sleep -Seconds 30
+        $cache = Join-Path $env:RUNNER_TEMP 'glslc-cache'
+        $exe = Join-Path $cache 'glslc.exe'
+        function Test-CachedGlslc {
+          if (-not (Test-Path $exe)) { return $false }
+          & $exe --version | Out-Null
+          return $LASTEXITCODE -eq 0
         }
-        $bin = Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue |
-          Sort-Object Name -Descending |
-          ForEach-Object { Join-Path $_.FullName 'Bin' } |
-          Where-Object { Test-Path (Join-Path $_ 'glslc.exe') } |
-          Select-Object -First 1
-        if (-not $bin) { throw 'glslc.exe not found under C:\VulkanSDK' }
-        Add-Content -Path $env:GITHUB_PATH -Value $bin
+
+        $fresh = $false
+        if ($env:CACHE_HIT -eq 'true' -and (Test-CachedGlslc)) {
+          Write-Host 'using the cached glslc.exe'
+        } else {
+          $installed = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install vulkan-sdk --no-progress -y
+            if ($LASTEXITCODE -eq 0) { $installed = $true; break }
+            if ($attempt -lt 3) {
+              Write-Warning "choco install vulkan-sdk failed (exit $LASTEXITCODE); retrying in 30s"
+              Start-Sleep -Seconds 30
+            }
+          }
+          if ($installed) {
+            $bin = Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending |
+              ForEach-Object { Join-Path $_.FullName 'Bin' } |
+              Where-Object { Test-Path (Join-Path $_ 'glslc.exe') } |
+              Select-Object -First 1
+            if (-not $bin) { throw 'glslc.exe not found under C:\VulkanSDK' }
+            New-Item -ItemType Directory -Force -Path $cache | Out-Null
+            Copy-Item -LiteralPath (Join-Path $bin 'glslc.exe') -Destination $exe -Force
+            if (-not (Test-CachedGlslc)) {
+              throw 'glslc.exe does not run when copied out of the Vulkan SDK'
+            }
+            $fresh = $true
+          } elseif (Test-CachedGlslc) {
+            Write-Warning 'choco is unreachable; using glslc.exe from an older cache entry'
+          } else {
+            throw 'choco install vulkan-sdk failed 3 times and no cached glslc.exe exists'
+          }
+        }
+        Add-Content -Path $env:GITHUB_PATH -Value $cache
+        Add-Content -Path $env:GITHUB_OUTPUT -Value "fresh=$("$fresh".ToLower())"
+
+    # Saved here rather than in a post-job step, and only after a real install:
+    # a run that fell back to an older entry must not store it under the new
+    # image's key.
+    - name: Save glslc to the cache
+      if: steps.linux.outputs.fresh == 'true' || steps.windows.outputs.fresh == 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/glslc-cache
+        key: ${{ steps.restore.outputs.cache-primary-key }}
 
     # An install step that quietly no-ops would surface as an inscrutable build.rs
     # panic several minutes later, on whichever job happened to build infr-vulkan

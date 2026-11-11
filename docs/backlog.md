@@ -4196,21 +4196,24 @@ test would fail. All six answers were no:
 These are the reviewer's answers from reading the tests, not re-checked. Each is
 the test to write first when the corresponding entry is picked up.
 
-### B143 — the Linux `glslc` install has no retry, and one mirror outage fails the whole run (2026-11-11)
+### B143 — the macOS `glslc` install is retried but not cached (2026-11-12)
 
-`.github/actions/install-glslc` runs
-`sudo apt-get update && sudo apt-get install -y glslc` once on Linux. On
-2026-11-11 the runners could not resolve `security.ubuntu.com` /
-`archive.ubuntu.com` ("Temporary failure resolving"), and every Linux job of a
-docs-only push failed at that step, twice in a row including a re-run of the
-failed jobs. The Windows branch of the same action already retries its SDK
-install three times for the same reason. Because the publish jobs depend on the
-build jobs, an outage like this during a tag run would skip the release.
+`.github/actions/install-glslc` now retries its install on every platform, and
+on Linux and Windows it also keeps what it installed in the Actions cache (the
+`.deb` files; `glslc.exe` copied out of the Vulkan SDK), keyed on the runner
+image version, so a warm run needs no package feed. That followed the 2026-11-11
+Ubuntu mirror outage, which failed every Linux job of three runs in a row.
 
-Options: the same retry loop on the apt step; or cache the two `.deb` files
-(`glslc`, `libshaderc1`) with `actions/cache` so a warm run needs no mirror at
-all. A retry does not help with an outage that lasts minutes, which this one
-did; the cache does.
+macOS has the retry only. `brew install shaderc` still fetches Homebrew's
+formula index even when the bottle is on disk, so caching the bottle does not
+make the install offline, and caching the installed keg (`shaderc` plus the
+`glslang` and `spirv-tools` it depends on) and relinking it was not tried. A
+Homebrew or GitHub Packages outage longer than the retry window still fails the
+macOS jobs, and through them a release.
+
+Not verified: the two fallback paths (feed down with an older cache entry
+present; exact hit whose cached copy fails to install). Nothing in CI can take a
+feed down, so they have only been read, not run.
 
 ### Review coverage (2026-11-11, remaining areas)
 

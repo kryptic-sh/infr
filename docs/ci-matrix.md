@@ -17,6 +17,13 @@ running `glslc --version` — an install step that silently no-ops would otherwi
 surface minutes later as a `build.rs` panic on whichever job reached
 `infr-vulkan` first.
 
+The action retries each install, and on Linux and Windows it caches the result
+under a key that carries the runner image version: a warm run installs with no
+package feed at all, and a cold run with the feed down falls back to the newest
+older entry. A package-feed outage otherwise fails every job of a run, and
+through the build jobs skips a release. macOS is retried but not cached
+(`backlog.md` B143).
+
 ## Single-platform jobs, and why
 
 - **`cpu-goldens`** asserts exact-token FNV hashes against real models. Commit

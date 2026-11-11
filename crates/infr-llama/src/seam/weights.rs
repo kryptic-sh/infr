@@ -315,6 +315,13 @@ pub(crate) struct SeamKv {
     pub(super) kv_ring: bool,
     /// Token ids whose KV rows are materialized (prompt + generated of the last turn).
     pub(super) cached: Vec<u32>,
+    /// One past the highest position any execute on this slot may have written since it last
+    /// started from position 0 — at or past `cached.len()`, because an aborted prefill, a chained
+    /// decode that stopped early and an earlier longer turn all wrote positions `cached` does not
+    /// record. Two readers need it where `cached` would mislead: an SWA ring row holds position
+    /// `p` only while nothing at or past `p + rows` has been written, and qwen35's recurrent state
+    /// has consumed exactly this many tokens, so it matches `cached` only when the two are equal.
+    pub(super) written_end: usize,
     /// Phase-A perf: DiffusionGemma canvas-denoise plan + staging buffers, `None` for every
     /// non-diffusion-gemma caller (never populated). Reset to `None` whenever the (cc, p) key
     /// changes (see `DenoiseCache`).
@@ -346,25 +353,137 @@ pub(crate) struct SeamKv {
     /// dynamic-scale softmax (`Op::Softmax::scale_buf`) instead of a per-step host premultiply of
     /// the whole `[cc, vocab]` logits buffer. Lazily allocated alongside `sc_ping`.
     pub(super) sc_temp_inv_buf: Option<Box<dyn Buffer>>,
-    /// MTP spec-decode rollback checkpoint (`mtp_snapshot_delta`/`mtp_restore_delta`): a device-
-    /// resident copy of every qwen35 DeltaNet layer's recurrent state at the last CLEAN committed
-    /// boundary, plus the cached-token length there. Lets a partial-accept cycle roll the trunk's
-    /// draft-polluted state back to a committed prefix and re-prefill only the short accepted suffix,
-    /// instead of qwen35's default full re-prefill-from-zero (its append-only DeltaNet state can't
-    /// rewind by cache truncation the way a per-position KV cache can — see the `c.qwen35` branch in
-    /// `generate_dense_backend`'s `start` computation). `None` for every non-MTP caller.
+    /// qwen35 rollback checkpoint (`mtp_snapshot_delta`/`mtp_restore_delta`, and the
+    /// `snapshot_delta`/`restore_delta` they wrap): a device-resident copy of every DeltaNet
+    /// layer's recurrent state at the last CLEAN committed boundary, plus the cached-token length
+    /// there. Its append-only state can't rewind by cache truncation the way a per-position KV
+    /// cache can (see the `c.qwen35` branch in `generate_dense_backend`'s `start` computation), so
+    /// this is what lets a turn resume from that boundary instead of re-prefilling from zero. Two
+    /// writers: MTP spec decode (a partial-accept cycle rolls back to the committed prefix) and
+    /// the decode loop, which snapshots the prefill boundary before a chained decode that may run
+    /// past its stop. `None` until one of them first needs it.
     pub(super) mtp_delta_ckpt: Option<MtpDeltaCkpt>,
+    /// The decode loop's prefill-boundary snapshot failed once on this slot (no room for a second
+    /// copy of the state), so it is not attempted again.
+    pub(super) delta_snapshot_refused: bool,
 }
 
-/// The device-resident DeltaNet-state snapshot backing [`SeamKv::mtp_snapshot_delta`] — one
-/// conv-state + one S-state buffer per qwen35 DeltaNet layer (parallel to `layers`), plus the
-/// cached-token length the snapshot corresponds to. Allocated once (lazily) and reused every cycle.
+/// The device-resident DeltaNet-state snapshot backing [`snapshot_delta`] — one conv-state + one
+/// S-state buffer per qwen35 DeltaNet layer (parallel to `layers`), plus the cached-token length
+/// the snapshot corresponds to. Allocated once (lazily) and reused every cycle. Its size is the
+/// live recurrent state's: per DeltaNet layer, `4 * ((ssm_d_conv - 1) * q35_conv_channels +
+/// q35_num_v_heads * q35_head_k_dim * q35_head_v_dim)` bytes.
 pub(super) struct MtpDeltaCkpt {
     kbufs: Vec<Box<dyn Buffer>>,
     vbufs: Vec<Box<dyn Buffer>>,
     /// The layer indices (into `SeamKv::kbufs`/`vbufs`) that are DeltaNet mixers.
     layers: Vec<usize>,
     cached_len: usize,
+    /// False once the slot's tokens no longer start with the ones the snapshot consumed (a reset
+    /// or a zeroed state): restoring it then would resume from a prefix that is not there.
+    valid: bool,
+}
+
+/// Snapshot the qwen35 DeltaNet recurrent state in `kbufs`/`vbufs` into `ckpt` (allocated on first
+/// use, through the same `KvCache` allocation as the state itself), recording that it has
+/// consumed `cached_len` tokens: one `Backend::copy_buffer` per state buffer. A no-op on a
+/// model with no DeltaNet layers.
+pub(super) fn snapshot_delta(
+    be: &dyn Backend,
+    cfg: &Config,
+    kbufs: &[Box<dyn Buffer>],
+    vbufs: &[Box<dyn Buffer>],
+    ckpt: &mut Option<MtpDeltaCkpt>,
+    cached_len: usize,
+) -> AResult<()> {
+    if ckpt.is_none() {
+        let layers: Vec<usize> = (0..cfg.n_layer)
+            .filter(|&l| cfg.qwen35 && !cfg.is_qwen35_attn_layer(l))
+            .collect();
+        if layers.is_empty() {
+            return Ok(());
+        }
+        let mut ck_k = Vec::with_capacity(layers.len());
+        let mut ck_v = Vec::with_capacity(layers.len());
+        for &l in &layers {
+            ck_k.push(
+                be.alloc(kbufs[l].len_bytes().max(1), BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            ck_v.push(
+                be.alloc(vbufs[l].len_bytes().max(1), BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+        *ckpt = Some(MtpDeltaCkpt {
+            kbufs: ck_k,
+            vbufs: ck_v,
+            layers,
+            cached_len: 0,
+            valid: false,
+        });
+    }
+    let ck = ckpt.as_mut().expect("just ensured Some");
+    // Invalid until every copy has landed, so a failed copy cannot leave a half-written snapshot
+    // that claims to be restorable.
+    ck.valid = false;
+    for (i, &l) in ck.layers.iter().enumerate() {
+        be.copy_buffer(
+            kbufs[l].as_ref(),
+            ck.kbufs[i].as_ref(),
+            kbufs[l].len_bytes(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        be.copy_buffer(
+            vbufs[l].as_ref(),
+            ck.vbufs[i].as_ref(),
+            vbufs[l].len_bytes(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+    }
+    ck.cached_len = cached_len;
+    ck.valid = true;
+    Ok(())
+}
+
+/// Copy a valid `ckpt` back over the live DeltaNet state and return the token count it consumed,
+/// or `None` (nothing copied) when there is no valid snapshot.
+pub(super) fn restore_delta(
+    be: &dyn Backend,
+    kbufs: &[Box<dyn Buffer>],
+    vbufs: &[Box<dyn Buffer>],
+    ckpt: &Option<MtpDeltaCkpt>,
+) -> AResult<Option<usize>> {
+    let Some(ck) = ckpt.as_ref().filter(|ck| ck.valid) else {
+        return Ok(None);
+    };
+    for (i, &l) in ck.layers.iter().enumerate() {
+        be.copy_buffer(
+            ck.kbufs[i].as_ref(),
+            kbufs[l].as_ref(),
+            ck.kbufs[i].len_bytes(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        be.copy_buffer(
+            ck.vbufs[i].as_ref(),
+            vbufs[l].as_ref(),
+            ck.vbufs[i].len_bytes(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+    }
+    Ok(Some(ck.cached_len))
+}
+
+/// The token count a valid `ckpt` has consumed, or `None` when there is nothing to restore.
+pub(super) fn delta_snapshot_len(ckpt: &Option<MtpDeltaCkpt>) -> Option<usize> {
+    ckpt.as_ref().filter(|ck| ck.valid).map(|ck| ck.cached_len)
+}
+
+/// Mark `ckpt` unusable: the tokens it consumed are no longer the slot's prefix.
+pub(super) fn invalidate_delta(ckpt: &mut Option<MtpDeltaCkpt>) {
+    if let Some(ck) = ckpt.as_mut() {
+        ck.valid = false;
+    }
 }
 
 /// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
@@ -403,6 +522,7 @@ impl SeamKv {
     #[cfg(target_os = "macos")]
     pub(crate) fn reset_tokens(&mut self) {
         self.cached.clear();
+        invalidate_delta(&mut self.mtp_delta_ckpt);
     }
 
     /// Number of token ids materialized in this slot's KV cache.
@@ -414,6 +534,7 @@ impl SeamKv {
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
+        invalidate_delta(&mut self.mtp_delta_ckpt);
     }
 
     /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
@@ -424,78 +545,28 @@ impl SeamKv {
     /// back to it via [`mtp_restore_delta`]. A no-op on a non-qwen35 model (no DeltaNet layers). The
     /// snapshot is a pure device→device buffer copy (`Backend::copy_buffer`), never a host bounce.
     pub(crate) fn mtp_snapshot_delta(&mut self, be: &dyn Backend, cfg: &Config) -> AResult<()> {
-        if self.mtp_delta_ckpt.is_none() {
-            let layers: Vec<usize> = (0..cfg.n_layer)
-                .filter(|&l| cfg.qwen35 && !cfg.is_qwen35_attn_layer(l))
-                .collect();
-            if layers.is_empty() {
-                return Ok(());
-            }
-            let mut kbufs = Vec::with_capacity(layers.len());
-            let mut vbufs = Vec::with_capacity(layers.len());
-            for &l in &layers {
-                kbufs.push(
-                    be.alloc(self.kbufs[l].len_bytes().max(1), BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                vbufs.push(
-                    be.alloc(self.vbufs[l].len_bytes().max(1), BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-            }
-            self.mtp_delta_ckpt = Some(MtpDeltaCkpt {
-                kbufs,
-                vbufs,
-                layers,
-                cached_len: 0,
-            });
-        }
-        let cached_len = self.cached.len();
-        let ck = self.mtp_delta_ckpt.as_ref().expect("just ensured Some");
-        for (i, &l) in ck.layers.iter().enumerate() {
-            be.copy_buffer(
-                self.kbufs[l].as_ref(),
-                ck.kbufs[i].as_ref(),
-                self.kbufs[l].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(
-                self.vbufs[l].as_ref(),
-                ck.vbufs[i].as_ref(),
-                self.vbufs[l].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-        }
-        self.mtp_delta_ckpt
-            .as_mut()
-            .expect("just ensured Some")
-            .cached_len = cached_len;
-        Ok(())
+        snapshot_delta(
+            be,
+            cfg,
+            &self.kbufs,
+            &self.vbufs,
+            &mut self.mtp_delta_ckpt,
+            self.cached.len(),
+        )
     }
 
     /// Restore the DeltaNet state captured by the last [`mtp_snapshot_delta`] and truncate `cached`
     /// back to the snapshot's token length — the MTP loop's rollback after a partial-accept cycle
     /// (drops the rejected drafts the verify forward absorbed into the recurrent state). A no-op
-    /// when no snapshot has been taken yet.
+    /// when there is no valid snapshot.
     pub(crate) fn mtp_restore_delta(&mut self, be: &dyn Backend) -> AResult<()> {
-        let Some(ck) = self.mtp_delta_ckpt.as_ref() else {
+        let Some(len) = restore_delta(be, &self.kbufs, &self.vbufs, &self.mtp_delta_ckpt)? else {
             return Ok(());
         };
-        for (i, &l) in ck.layers.iter().enumerate() {
-            be.copy_buffer(
-                ck.kbufs[i].as_ref(),
-                self.kbufs[l].as_ref(),
-                ck.kbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(
-                ck.vbufs[i].as_ref(),
-                self.vbufs[l].as_ref(),
-                ck.vbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-        }
-        self.cached.truncate(ck.cached_len);
+        self.cached.truncate(len);
+        // The restored state has consumed exactly the snapshot's tokens. qwen35 has no SWA ring,
+        // so no row past them is ever read.
+        self.written_end = len;
         Ok(())
     }
 
@@ -591,6 +662,7 @@ impl SeamKv {
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
             cached: Vec::new(),
+            written_end: 0,
             // The forked slot's KV/weight buffers are new objects, so a cached plan's bindings
             // (which point at the OLD slot's buffers) don't carry over — rebuild lazily on this
             // slot's first denoise call. `self_cond_w`/`sc_embt` are model-derived (not
@@ -606,6 +678,7 @@ impl SeamKv {
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
+            delta_snapshot_refused: false,
         })
     }
 
@@ -635,7 +708,7 @@ impl SeamKv {
             return Ok(());
         }
         // SWA ring caches: positions [0, p) sit at rows [0, p) ONLY while the source hasn't
-        // wrapped (cached_len <= ring rows) — a wrapped ring recycled exactly those early rows,
+        // wrapped (written_end <= ring rows) — a wrapped ring recycled exactly those early rows,
         // so the plain prefix copy below would seed stale data. Skipping the seed is the CORRECT
         // fallback (the slot just re-prefills the shared prefix); only cross-conversation KV
         // reuse on long conversations is lost. (Seeding a wrapped source's window TAIL would be
@@ -645,7 +718,7 @@ impl SeamKv {
             let wrapped = (0..cfg.n_layer)
                 .filter(|&l| cfg.is_swa_layer(l))
                 .map(|l| crate::seam::kv_rows(cfg, l, self.max_ctx, true, ec))
-                .any(|rows_l| src.cached.len() > rows_l);
+                .any(|rows_l| src.written_end > rows_l);
             if wrapped {
                 return Ok(());
             }
@@ -680,6 +753,9 @@ impl SeamKv {
             }
         }
         self.cached = src.cached[..p].to_vec();
+        // Rows [0, p) now hold positions [0, p); any older rows hold positions past `p` that
+        // nothing reads before they are rewritten.
+        self.written_end = p;
         Ok(())
     }
 }

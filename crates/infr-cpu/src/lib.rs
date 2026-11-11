@@ -618,11 +618,11 @@ pub(crate) fn sample_token(logits: &[f32], uu: f32, top_k: usize, temp: f32, top
     } else {
         top_k.min(logits.len())
     };
-    let cmp = |a: &usize, b: &usize| {
-        logits[*b]
-            .partial_cmp(&logits[*a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    };
+    // `total_cmp`, not `partial_cmp` with an `Equal` fallback: that is not a total order once a
+    // NaN is present, and `select_nth_unstable_by` / `sort_unstable_by` panic on one. On NaN-free
+    // logits the two agree on every pair but `-0.0` / `+0.0`, which `total_cmp` orders. A NaN
+    // logit no longer panics but ranks first, so the probabilities come out NaN as before.
+    let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]);
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     if k < logits.len() {
         idx.select_nth_unstable_by(k - 1, cmp);
@@ -2530,7 +2530,10 @@ impl Backend for CpuBackend {
                                 }
                                 // Top ng_used groups by score.
                                 let mut gidx: Vec<usize> = (0..ng).collect();
-                                gidx.sort_by(|&a, &b| gscores[b].partial_cmp(&gscores[a]).unwrap());
+                                // `total_cmp`: a NaN score must not panic the backend. Without
+                                // a NaN it orders as `partial_cmp` did except -0.0 / +0.0; a NaN
+                                // score ranks first and the routing output is garbage.
+                                gidx.sort_by(|&a, &b| gscores[b].total_cmp(&gscores[a]));
                                 gidx.truncate(ng_used);
                                 // Mask non-chosen groups to -inf.
                                 let mut chosen = vec![false; ng];
@@ -2549,7 +2552,7 @@ impl Backend for CpuBackend {
                                 }
                             }
                             let mut idx: Vec<usize> = (0..n_expert).collect();
-                            idx.sort_by(|&a, &b| sel_probs[b].partial_cmp(&sel_probs[a]).unwrap());
+                            idx.sort_by(|&a, &b| sel_probs[b].total_cmp(&sel_probs[a]));
                             idx.truncate(n_used);
                             idx
                         };
@@ -4089,6 +4092,106 @@ mod tests {
         // u≈1 walks the CDF to the last (sorted) entry — still a valid index.
         let tok_hi = sample_token(&logits, 0.999_999, 0, 1.0, 1.0);
         assert!((tok_hi as usize) < logits.len());
+    }
+
+    /// A NaN router score must not panic the group-limited (DeepSeek) routing: both of its sorts
+    /// compared with `partial_cmp(..).unwrap()`, which panics on the first NaN pair. A NaN router
+    /// score reaches the expert sort; a group score skips NaN members and turns NaN only as
+    /// `+inf + -inf`, which the second case builds from the selection bias.
+    #[test]
+    fn moe_group_routing_survives_a_nan_router_score() {
+        use infr_core::tensor::TensorDesc;
+        let (ne, n_expert, n_used, nff) = (32usize, 8usize, 2usize, 16usize);
+        let be = CpuBackend::new();
+        let upload = |v: &[f32], usage| {
+            let b = be.alloc(v.len() * 4, usage).unwrap();
+            be.upload(b.as_ref(), bytemuck::cast_slice(v)).unwrap();
+            b
+        };
+        let fill = |n: usize, s: f32| (0..n).map(|i| (i as f32 * s).sin()).collect::<Vec<f32>>();
+        let mut nan_router = fill(n_expert * ne, 0.37);
+        // Expert 1's score is NaN.
+        nan_router[ne] = f32::NAN;
+        // Group 0 is experts 0 and 1: best `+inf`, and the NaN never fills the second slot.
+        let mut bias = vec![0f32; n_expert];
+        bias[0] = f32::INFINITY;
+        bias[1] = f32::NAN;
+        for (router, bias) in [(nan_router, None), (fill(n_expert * ne, 0.37), Some(bias))] {
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![1, ne], DType::F32));
+            let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::F32));
+            let gui = g.weight(TensorDesc::new(vec![n_expert, 2 * nff, ne], DType::F32));
+            let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::F32));
+            let bi = g.weight(TensorDesc::new(vec![n_expert], DType::F32));
+            let yi = g.output(TensorDesc::new(vec![1, ne], DType::F32));
+            g.push(Op::MoeFfn {
+                x: xi,
+                router_x: xi,
+                router: ri,
+                gate_exps: gui,
+                up_exps: gui,
+                down_exps: di,
+                down_scale: None,
+                fused_gate_up: true,
+                dst: yi,
+                ne: ne as u32,
+                n_expert: n_expert as u32,
+                n_used: n_used as u32,
+                n_ff_exp: nff as u32,
+                scale: 1.0,
+                act: Activation::Silu,
+                gating: MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
+                ep_band: None,
+                exp_probs_b: bias.is_some().then_some(bi),
+                n_expert_groups: 4,
+                n_expert_groups_used: 2,
+                swiglu_clamp: None,
+                expert_ids: None,
+            });
+            let xb = upload(&fill(ne, 0.11), BufferUsage::Activations);
+            let rb = upload(&router, BufferUsage::Weights);
+            let gub = upload(&fill(n_expert * 2 * nff * ne, 0.017), BufferUsage::Weights);
+            let db = upload(&fill(n_expert * ne * nff, 0.029), BufferUsage::Weights);
+            let bb = upload(bias.as_deref().unwrap_or(&[0.0; 8]), BufferUsage::Weights);
+            let yb = be.alloc(ne * 4, BufferUsage::Activations).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(xi, xb.as_ref());
+            bind.bind(ri, rb.as_ref());
+            bind.bind(gui, gub.as_ref());
+            bind.bind(di, db.as_ref());
+            bind.bind(bi, bb.as_ref());
+            bind.bind(yi, yb.as_ref());
+            let plan = be.compile(&g).unwrap();
+            be.execute(plan.as_ref(), &bind).unwrap();
+        }
+    }
+
+    /// A NaN logit must not panic the sampler: its comparator once called NaN "equal" to
+    /// everything, which is not a total order, and the selection then panicked.
+    #[test]
+    fn sample_token_survives_nan_logits() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for n in [600usize, 1590, 3000] {
+            for every in [2usize, 3, 5] {
+                let logits: Vec<f32> = (0..n)
+                    .map(|i| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        if i % every == 0 {
+                            f32::NAN
+                        } else {
+                            (state >> 40) as f32 / (1u64 << 24) as f32 * 10.0
+                        }
+                    })
+                    .collect();
+                for k in [0usize, 1, 24, 40, 64] {
+                    assert!((sample_token(&logits, 0.5, k, 0.8, 0.95) as usize) < n);
+                }
+            }
+        }
     }
 
     // #1: top_k == 0 (no truncation) and top_k == len must agree — both consider every logit.

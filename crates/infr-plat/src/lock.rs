@@ -43,7 +43,25 @@ impl FileLock {
     /// Distinguishes "held by another" (`Ok(None)`) from "could not be attempted" (`Err`) — a
     /// caller that collapsed the two would report a permissions failure as healthy contention.
     pub fn try_acquire(path: &Path) -> io::Result<Option<Self>> {
-        let file = Self::open(path)?;
+        Self::try_lock(Self::open(path)?)
+    }
+
+    /// [`try_acquire`](Self::try_acquire) for a file that must already exist: a missing one is an
+    /// `Err` of kind `NotFound` rather than a new file. For a caller probing a file another
+    /// process may delete — recreating it would leave an empty file the other process never made.
+    pub fn try_acquire_existing(path: &Path) -> io::Result<Option<Self>> {
+        let file = OpenOptions::new().write(true).open(path)?;
+        Self::try_lock(file)
+    }
+
+    /// Does `path` still name the file this lock is held on? A file locked through one name can
+    /// be unlinked and a new file created under that name, and acting on the name afterwards would
+    /// act on the new file. An `Err` (the path is gone, or this platform cannot tell) is not a yes.
+    pub fn is_at(&self, path: &Path) -> io::Result<bool> {
+        same_file(&self.file, path)
+    }
+
+    fn try_lock(file: File) -> io::Result<Option<Self>> {
         match lock(&file, Blocking::Fail) {
             Ok(()) => Ok(Some(FileLock { file })),
             Err(e) if would_block(&e) => Ok(None),
@@ -88,6 +106,47 @@ const WOULD_BLOCK_OS_ERROR: i32 = libc::EWOULDBLOCK;
 const WOULD_BLOCK_OS_ERROR: i32 = 33; // ERROR_LOCK_VIOLATION
 #[cfg(not(any(unix, windows)))]
 const WOULD_BLOCK_OS_ERROR: i32 = 0;
+
+#[cfg(unix)]
+fn same_file(file: &File, path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let (held, named) = (file.metadata()?, std::fs::metadata(path)?);
+    Ok(held.dev() == named.dev() && held.ino() == named.ino())
+}
+
+#[cfg(windows)]
+fn same_file(file: &File, path: &Path) -> io::Result<bool> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    fn identity(file: &File) -> io::Result<(u32, u32, u32)> {
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: the handle is valid for the call and `info` is a live out-parameter.
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+            .map_err(|_| io::Error::last_os_error())?;
+        Ok((
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ))
+    }
+    // No access rights: only the handle's identity is read, and a locked range refuses reads.
+    let named = OpenOptions::new().access_mode(0).open(path)?;
+    Ok(identity(file)? == identity(&named)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(_file: &File, _path: &Path) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no file-identity probe on this platform",
+    ))
+}
 
 #[cfg(unix)]
 fn lock(file: &File, blocking: Blocking) -> io::Result<()> {
@@ -209,6 +268,40 @@ mod tests {
             FileLock::try_acquire(&path).expect("re-acquire").is_some(),
             "the lock must be grantable once the holder drops"
         );
+    }
+
+    /// The probe for an existing file never creates one, and otherwise answers like
+    /// `try_acquire`.
+    #[test]
+    fn try_acquire_existing_does_not_create() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("marker");
+
+        let err = FileLock::try_acquire_existing(&path).expect_err("no file to lock");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(!path.exists(), "the probe must not create the file");
+
+        let held = FileLock::acquire(&path).expect("create and lock");
+        assert!(FileLock::try_acquire_existing(&path)
+            .expect("contention is not an error")
+            .is_none());
+        drop(held);
+        assert!(FileLock::try_acquire_existing(&path)
+            .expect("free once released")
+            .is_some());
+    }
+
+    /// A lock knows which file it holds: its own path says yes, another file's says no, and so
+    /// does a path that no longer exists.
+    #[test]
+    fn is_at_names_the_held_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (path, other) = (dir.path().join("marker"), dir.path().join("other"));
+        std::fs::write(&other, b"").unwrap();
+        let held = FileLock::acquire(&path).expect("create and lock");
+        assert!(held.is_at(&path).expect("probe own path"));
+        assert!(!held.is_at(&other).expect("probe another file"));
+        assert!(held.is_at(&dir.path().join("missing")).is_err());
     }
 
     /// A blocking `acquire` must actually wait for the holder rather than sailing through — the

@@ -72,16 +72,34 @@
 //! mistaken for a crashed one — and one instance's clean `disarm` (`KernelCache::disarm`) only
 //! removes ITS OWN marker, never a live sibling's.
 //!
+//! "Gone" is judged by a file lock the arming instance holds on its marker, not by the pid in the
+//! name: the OS releases the lock however the process dies, while a pid outlives it — a container
+//! hands every launch the same pid, and after a reboot the pid belongs to an unrelated process.
+//! The pid is consulted only where no lock can be taken. A sweep also skips every marker this
+//! process armed itself (an in-process registry), because a filesystem that emulates `flock`
+//! with per-process `fcntl` locks (Linux NFS) grants the lock to another handle in the same
+//! process, which would read a live sibling as a corpse.
+//!
+//! The name is `<pid>-<process token>-<nonce>`: the token is random per process, so two
+//! processes with the same pid in different PID namespaces sharing one cache volume do not
+//! collide.
+//!
+//! One accepted limit: an `infr` from before the lock existed leaves its marker unlocked, so a
+//! newer run sweeping while the old one still runs reads it as a corpse and discards the cache
+//! once. That costs one recompile and only happens across an upgrade.
+//!
 //! # Disabled
 //!
 //! A cache opened with `enabled = false` (`kernels.vulkan.pipeline_cache_disk = false`)
 //! is a TOTAL no-op: it never creates the cache directory,
 //! never reads, never writes, never sweeps. Every method returns the miss/OK answer immediately.
 
+use infr_plat::lock::FileLock;
 use infr_plat::proc::pid_alive;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// Monotonic per-process sequence for save temp files (`<path>.tmp.<pid>.<seq>`). Two threads
 /// saving concurrently (a `serve` compiling different kernels) must never write+rename the SAME
@@ -95,6 +113,25 @@ static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// then left a poisoned blob uncaught — the exact case the tripwire exists for.
 static INSTANCE_NONCE: AtomicU64 = AtomicU64::new(0);
 
+/// Every marker and arming file this process currently has armed. A sweep never touches these:
+/// whether another handle in this process can take their lock depends on the filesystem.
+static ARMED_HERE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+fn armed_here() -> std::sync::MutexGuard<'static, Vec<PathBuf>> {
+    ARMED_HERE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A random value fixed for this process, folded into marker names so they stay unique across
+/// PID namespaces. Drawn from std's per-process randomly keyed hasher, the one random source
+/// the standard library exposes.
+fn process_token() -> u64 {
+    static TOKEN: OnceLock<u64> = OnceLock::new();
+    *TOKEN.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        std::hash::RandomState::new().build_hasher().finish()
+    })
+}
+
 /// Envelope layout version, INSIDE the producer's `magic`. A producer that changes its payload
 /// meaning bumps its own magic (`INFRVPC2` → `INFRVPC3`); this bumps only if the header itself
 /// changes shape, which would invalidate every producer at once.
@@ -104,8 +141,12 @@ const FORMAT_VERSION: u16 = 1;
 /// the key bytes and then the payload.
 const HEADER_LEN: usize = 28;
 
-/// Suffix for a tripwire marker: `<path stem>.seeded.<pid>-<nonce>`. See the module doc.
+/// Suffix for a tripwire marker: `<path stem>.seeded.<pid>-<token>-<nonce>`. See the module doc.
 const MARKER_EXT: &str = "seeded";
+
+/// Suffix a marker is locked under before it is renamed to its [`MARKER_EXT`] name, so a sweep
+/// never sees a marker that exists but is not yet locked.
+const ARMING_EXT: &str = "arming";
 
 /// FNV-1a over the blob — the same hash `infr-vulkan/build.rs` uses for `SHADER_SET_FINGERPRINT`
 /// (which it must recompute standalone: a build script cannot depend on the crate graph it builds).
@@ -145,6 +186,9 @@ pub struct KernelCache {
     /// Per-instance nonce (from [`INSTANCE_NONCE`]) folded into this instance's marker name so
     /// sibling caches in one process own DISTINCT markers.
     nonce: u64,
+    /// The lock on this instance's armed marker, held from `load` until `disarm` — or until the
+    /// process dies, which is what a later sweep reads as a corpse.
+    armed: Mutex<Option<FileLock>>,
 }
 
 impl KernelCache {
@@ -173,6 +217,7 @@ impl KernelCache {
             magic,
             key,
             nonce: INSTANCE_NONCE.fetch_add(1, Ordering::Relaxed),
+            armed: Mutex::new(None),
         }
     }
 
@@ -194,8 +239,58 @@ impl KernelCache {
         let payload = self.load_validated()?;
         // Armed BEFORE the payload reaches the driver — if THAT call is what hangs the GPU, the
         // marker has to already be on disk for the next launch to find.
-        let _ = std::fs::File::create(self.marker(path));
+        self.arm(path);
         Some(payload)
+    }
+
+    /// TRIPWIRE step 1: create this instance's marker and hold a lock on it. The lock is taken
+    /// under the arming name and renamed into place, so the marker never exists unlocked. An
+    /// instance already armed keeps the marker and lock it has.
+    fn arm(&self, path: &Path) {
+        self.arm_with(path, |from, to| std::fs::rename(from, to));
+    }
+
+    /// [`arm`](Self::arm) with the rename supplied, so a test can make it fail.
+    fn arm_with(&self, path: &Path, rename: impl Fn(&Path, &Path) -> std::io::Result<()>) {
+        let mut armed = self.armed.lock().unwrap_or_else(PoisonError::into_inner);
+        if armed.is_some() {
+            return;
+        }
+        let marker = self.marker(path);
+        let arming = self.instance_file(path, ARMING_EXT);
+        armed_here().extend([marker.clone(), arming.clone()]);
+        let lock = match FileLock::acquire(&arming) {
+            Ok(lock) if rename(&arming, &marker).is_ok() => Some(lock),
+            Ok(lock) => {
+                drop(lock);
+                let _ = std::fs::remove_file(&arming);
+                // Locked under the final name instead, which opens the marker before locking it.
+                // Another process sweeping in that instant reads it as a corpse: it discards the
+                // cache once, and it unlinks the marker, so this run then holds a lock on a file
+                // no name points at and a hang in it is not caught. The marker is never left
+                // unlocked otherwise.
+                match FileLock::acquire(&marker) {
+                    Ok(lock) => Some(lock),
+                    Err(e) => {
+                        armed_here().retain(|p| p != &marker);
+                        tracing::warn!(
+                            "[infr] could not arm the GPU kernel cache tripwire at {} ({e}); \
+                             a hang in this run will not discard the cache",
+                            marker.display()
+                        );
+                        None
+                    }
+                }
+            }
+            Err(_) => {
+                // No lock primitive on this filesystem: an unlocked marker, which every sweep here
+                // (none of which can lock either) judges by pid.
+                let _ = std::fs::File::create(&marker);
+                None
+            }
+        };
+        armed_here().retain(|p| p != &arming);
+        *armed = lock;
     }
 
     /// Write `payload` atomically AND durably: temp file → `fsync` → `rename` → `fsync` the
@@ -247,6 +342,17 @@ impl KernelCache {
         if let Some(path) = self.path.as_ref() {
             let _ = std::fs::remove_file(self.marker(path));
         }
+        // Released only after the unlink, so a sweep that finds the lock free finds no file.
+        drop(
+            self.armed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+        if let Some(path) = self.path.as_ref() {
+            let marker = self.marker(path);
+            armed_here().retain(|p| p != &marker);
+        }
     }
 
     /// The driver REJECTED this artifact (`vkCreatePipelineCache` refused it, `hipModuleLoadData`
@@ -260,11 +366,17 @@ impl KernelCache {
         self.disarm();
     }
 
-    /// This instance's tripwire marker: `<path stem>.seeded.<pid>-<nonce>`.
+    /// This instance's tripwire marker: `<path stem>.seeded.<pid>-<token>-<nonce>`.
     fn marker(&self, path: &Path) -> PathBuf {
+        self.instance_file(path, MARKER_EXT)
+    }
+
+    /// `<path stem>.<ext>.<pid>-<token>-<nonce>`.
+    fn instance_file(&self, path: &Path, ext: &str) -> PathBuf {
         path.with_extension(format!(
-            "{MARKER_EXT}.{}-{}",
+            "{ext}.{}-{:016x}-{}",
             std::process::id(),
+            process_token(),
             self.nonce
         ))
     }
@@ -273,9 +385,10 @@ impl KernelCache {
     /// that run seeded from this blob and then died without a clean exit — a hung GPU is exactly
     /// how that happens, and the blob is the prime suspect. Discard it and recompile.
     ///
-    /// Markers whose process is still ALIVE belong to a concurrently-running `infr` (or a sibling
-    /// backend here) and are left alone. Returns true when the blob was discarded (for the tests;
-    /// the caller does not care — a discarded blob simply reads as a miss).
+    /// Markers whose lock is still HELD belong to a concurrently-running `infr` (or a sibling
+    /// backend here) and are left alone. A marker that cannot be locked at all (no lock primitive
+    /// on this filesystem) falls back to `pid_alive`. Returns true when the blob was discarded
+    /// (for the tests; the caller does not care — a discarded blob simply reads as a miss).
     fn discard_if_a_seeded_run_died(&self) -> bool {
         let Some(path) = self.path.as_ref() else {
             return false;
@@ -284,8 +397,10 @@ impl KernelCache {
         else {
             return false;
         };
-        // `foo.bin` → markers are `foo.seeded.<pid>-<nonce>` (`with_extension` replaced `.bin`).
-        let prefix = format!("{stem}.{MARKER_EXT}.");
+        // `foo.bin` → markers are `foo.seeded.<pid>-<token>-<nonce>` (`with_extension` replaced
+        // `.bin`), and a marker being armed is `foo.arming.<...>`.
+        let marker_prefix = format!("{stem}.{MARKER_EXT}.");
+        let arming_prefix = format!("{stem}.{ARMING_EXT}.");
         let Ok(entries) = std::fs::read_dir(dir) else {
             return false;
         };
@@ -293,19 +408,44 @@ impl KernelCache {
         for e in entries.flatten() {
             let name = e.file_name();
             let Some(name) = name.to_str() else { continue };
-            let Some(tag) = name.strip_prefix(&prefix) else {
+            let (tag, is_marker) = if let Some(tag) = name.strip_prefix(&marker_prefix) {
+                (tag, true)
+            } else if let Some(tag) = name.strip_prefix(&arming_prefix) {
+                (tag, false)
+            } else {
                 continue;
             };
-            // `<pid>-<nonce>`: the pid is what determines liveness; the nonce only distinguishes
-            // sibling instances of the same pid. (`split` also accepts a legacy bare `<pid>`.)
+            let at = e.path();
+            if armed_here().contains(&at) {
+                continue; // armed by this process: alive, whatever its lock says
+            }
+            // The leading `<pid>` is the fallback liveness test (a legacy name is a bare `<pid>`
+            // or `<pid>-<nonce>`); the rest only makes the name unique.
             let Ok(pid) = tag.split('-').next().unwrap_or(tag).parse::<i32>() else {
                 continue;
             };
-            if pid_alive(pid) {
-                continue; // a concurrent infr, not a corpse
+            match FileLock::try_acquire_existing(&at) {
+                // Nobody holds it: its run died without disarming (or, for an arming file, before
+                // renaming it). Removed only while the path still names the file locked here — a
+                // marker unlinked by its owner and re-armed under the same name since is not this
+                // file — and counted only if this sweep is the one that removes it.
+                Ok(Some(held)) => {
+                    if held.is_at(&at).unwrap_or(false)
+                        && std::fs::remove_file(&at).is_ok()
+                        && is_marker
+                    {
+                        dirty = true;
+                    }
+                }
+                Ok(None) => {} // held: a concurrent infr, not a corpse
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {} // disarmed meanwhile
+                Err(_) => {
+                    if is_marker && !pid_alive(pid) {
+                        let _ = std::fs::remove_file(&at);
+                        dirty = true;
+                    }
+                }
             }
-            let _ = std::fs::remove_file(e.path());
-            dirty = true;
         }
         if dirty {
             tracing::warn!(
@@ -394,6 +534,7 @@ mod tests {
             magic: MAGIC,
             key: key.to_vec(),
             nonce: INSTANCE_NONCE.fetch_add(1, Ordering::Relaxed),
+            armed: Mutex::new(None),
         }
     }
 
@@ -533,10 +674,11 @@ mod tests {
         assert!(!marker_for(dead).exists(), "the corpse's marker is swept");
 
         // 3. A marker from a LIVE process (a concurrent `infr` — a serve alongside a CLI run) is
-        //    NOT a corpse. It must not cost the other process its cache.
+        //    NOT a corpse. It must not cost the other process its cache. Live means its lock is
+        //    held, as an armed run holds it.
         c.store(&payload).unwrap();
         let live = marker_for(std::process::id());
-        std::fs::write(&live, b"").unwrap();
+        let live_lock = FileLock::acquire(&live).unwrap();
         assert_eq!(
             c.load().as_deref(),
             Some(&payload[..]),
@@ -544,6 +686,7 @@ mod tests {
         );
         assert!(path.exists(), "the blob survives a live marker");
         std::fs::remove_file(&live).unwrap();
+        drop(live_lock);
 
         // 4. The driver rejected the artifact (or the device was lost): the blob goes, and so does
         //    this instance's marker — it accuses a file that no longer exists.
@@ -574,8 +717,8 @@ mod tests {
 
         // Arm both, then disarm ONLY c1: c2's marker must survive (the bug was c1's disarm
         // deleting the shared marker out from under a live c2).
-        std::fs::File::create(c1.marker(&path)).unwrap();
-        std::fs::File::create(c2.marker(&path)).unwrap();
+        c1.arm(&path);
+        c2.arm(&path);
         c1.disarm();
         assert!(!c1.marker(&path).exists(), "c1 disarms its OWN marker");
         assert!(
@@ -595,6 +738,104 @@ mod tests {
             "the live sibling's marker is left alone by the sweep"
         );
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A marker whose run died is a corpse even when its pid is alive again: a container gives
+    /// every launch the same pid, so the crashed run's marker names the pid now checking it, and a
+    /// reboot hands the old pid to an unrelated process. Only a held lock means a live run.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn tripwire_sees_a_corpse_whose_pid_is_alive_again() {
+        let dir = tmp_dir("pidreuse");
+        let c = cache_in(&dir, b"k");
+        let path = c.path().unwrap().to_path_buf();
+        c.store(&[5u8; 256]).unwrap();
+        // The crashed run had this process's pid, and its lock died with it.
+        let corpse = path.with_extension(format!("{MARKER_EXT}.{}-0", std::process::id()));
+        std::fs::write(&corpse, b"").unwrap();
+        assert!(
+            c.load().is_none(),
+            "a blob whose seeded run died must be discarded even though its pid is alive"
+        );
+        assert!(!corpse.exists(), "the corpse's marker is swept");
+        assert!(!path.exists(), "the suspect blob is deleted");
+
+        // This instance's own armed marker, by contrast, survives a sweep.
+        c.store(&[5u8; 256]).unwrap();
+        assert!(c.load().is_some());
+        assert!(!c.discard_if_a_seeded_run_died(), "a held marker is alive");
+        assert!(c.marker(&path).exists());
+        c.disarm();
+        assert!(!c.marker(&path).exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A sibling instance in this process never deletes a marker this process armed, even where
+    /// the filesystem lets a second handle in the same process take its lock (per-process `fcntl`
+    /// emulation of `flock`, as on Linux NFS). Emulated here by releasing the owner's lock while
+    /// it stays armed.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_sibling_never_sweeps_a_marker_armed_in_this_process() {
+        let dir = tmp_dir("same-process");
+        let (c1, c2) = (cache_in(&dir, b"k"), cache_in(&dir, b"k"));
+        let path = c1.path().unwrap().to_path_buf();
+        c1.store(&[3u8; 128]).unwrap();
+        assert!(c1.load().is_some(), "c1 armed");
+        drop(c1.armed.lock().unwrap().take());
+        assert!(
+            !c2.discard_if_a_seeded_run_died(),
+            "a live sibling's marker read as a corpse"
+        );
+        assert!(c1.marker(&path).exists() && path.exists());
+        c1.disarm();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// When the rename into place fails, the marker is still locked — an unlocked one would be
+    /// read as a corpse by any other run's sweep while its owner is alive.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_failed_rename_still_arms_a_locked_marker() {
+        let dir = tmp_dir("rename-fails");
+        let c = cache_in(&dir, b"k");
+        let path = c.path().unwrap().to_path_buf();
+        c.store(&[4u8; 128]).unwrap();
+        c.arm_with(&path, |_, _| Err(std::io::Error::other("rename refused")));
+        let marker = c.marker(&path);
+        assert!(marker.exists(), "armed");
+        // What another process's sweep sees: whether anything holds the marker's lock.
+        assert!(
+            FileLock::try_acquire_existing(&marker)
+                .expect("probe the marker")
+                .is_none(),
+            "the marker was left unlocked"
+        );
+        let arming = c.instance_file(&path, ARMING_EXT);
+        assert!(!arming.exists(), "the arming file was left behind");
+        c.disarm();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An arming file nobody holds (a run that died between locking and renaming it) is swept;
+    /// it accuses nothing, so the blob stays.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn a_stale_arming_file_is_swept_without_discarding() {
+        let dir = tmp_dir("stale-arming");
+        let c = cache_in(&dir, b"k");
+        let path = c.path().unwrap().to_path_buf();
+        c.store(&[5u8; 128]).unwrap();
+        let stale = path.with_extension(format!("{ARMING_EXT}.{}-0-0", std::process::id()));
+        std::fs::write(&stale, b"").unwrap();
+        assert!(
+            !c.discard_if_a_seeded_run_died(),
+            "an arming file is no corpse"
+        );
+        assert!(!stale.exists(), "the stale arming file is swept");
+        assert!(path.exists(), "the blob stays");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -244,7 +244,8 @@ fn macos_available_bytes(
 /// of the ancestors and not necessarily the leaf's — a container's leaf is often unlimited while
 /// the pod slice above it is capped. Both hierarchy versions are read: v2's `memory.max` /
 /// `memory.current`, and v1's `memory.limit_in_bytes` / `memory.usage_in_bytes`, whose "no limit"
-/// is a sentinel near `u64::MAX` rather than a word.
+/// is a sentinel near `u64::MAX` rather than a word. Each level's usage is the working set
+/// [`cgroup_level_headroom`] computes, not the raw usage file.
 #[cfg(target_os = "linux")]
 fn cgroup_headroom() -> Option<u64> {
     let own = std::fs::read_to_string("/proc/self/cgroup").ok()?;
@@ -255,14 +256,10 @@ fn cgroup_headroom() -> Option<u64> {
         let hier = parts.next()?;
         let ctrl = parts.next()?;
         let path = parts.next()?;
-        let (root, max_file, cur_file) = if hier == "0" && ctrl.is_empty() {
-            ("/sys/fs/cgroup", "memory.max", "memory.current")
+        let (root, files) = if hier == "0" && ctrl.is_empty() {
+            ("/sys/fs/cgroup", CGROUP_V2)
         } else if ctrl.split(',').any(|c| c == "memory") {
-            (
-                "/sys/fs/cgroup/memory",
-                "memory.limit_in_bytes",
-                "memory.usage_in_bytes",
-            )
+            ("/sys/fs/cgroup/memory", CGROUP_V1)
         } else {
             continue;
         };
@@ -270,15 +267,8 @@ fn cgroup_headroom() -> Option<u64> {
         let mut at = std::path::PathBuf::from(root);
         at.push(path.trim_start_matches('/'));
         loop {
-            let max = read_u64(&at.join(max_file));
-            let cur = read_u64(&at.join(cur_file));
-            if let (Some(max), Some(cur)) = (max, cur) {
-                // v1 spells "unlimited" as a huge number; treat anything past the host's plausible
-                // range as no limit rather than as headroom nobody has.
-                if max < u64::MAX / 2 {
-                    let free = max.saturating_sub(cur);
-                    tightest = Some(tightest.map_or(free, |t: u64| t.min(free)));
-                }
+            if let Some(free) = cgroup_level_headroom(&at, &files) {
+                tightest = Some(tightest.map_or(free, |t: u64| t.min(free)));
             }
             if at.as_os_str().len() <= root.len() || !at.pop() {
                 break;
@@ -288,8 +278,64 @@ fn cgroup_headroom() -> Option<u64> {
     tightest
 }
 
-/// One cgroup value file: a decimal, or `None` for the `max` sentinel, a missing file, or junk.
+/// The files one cgroup hierarchy version keeps its memory accounting in.
+#[cfg(any(target_os = "linux", test))]
+struct CgroupFiles {
+    max: &'static str,
+    usage: &'static str,
+    /// The `memory.stat` key for this level's inactive file cache, counted hierarchically like
+    /// `usage` (v1's plain `inactive_file` covers only the level's own tasks).
+    inactive_file: &'static str,
+}
+
+#[cfg(any(target_os = "linux", test))]
+const CGROUP_V2: CgroupFiles = CgroupFiles {
+    max: "memory.max",
+    usage: "memory.current",
+    inactive_file: "inactive_file",
+};
+
 #[cfg(target_os = "linux")]
+const CGROUP_V1: CgroupFiles = CgroupFiles {
+    max: "memory.limit_in_bytes",
+    usage: "memory.usage_in_bytes",
+    inactive_file: "total_inactive_file",
+};
+
+/// Headroom under one cgroup directory's limit, or `None` when it sets none.
+///
+/// The usage file counts page cache, including this process's own mmapped model pages, so the
+/// raw `max - usage` shrinks by a file's size just for reading it. Inactive file cache is the
+/// part the kernel reclaims before it OOM-kills anything, so it is subtracted from usage first —
+/// the working-set figure kubelet and cAdvisor use, and the cgroup counterpart of the host-wide
+/// `MemAvailable` discounting reclaimable cache. A missing `memory.stat` subtracts nothing.
+#[cfg(any(target_os = "linux", test))]
+fn cgroup_level_headroom(dir: &std::path::Path, files: &CgroupFiles) -> Option<u64> {
+    let max = read_u64(&dir.join(files.max))?;
+    let usage = read_u64(&dir.join(files.usage))?;
+    // v1 spells "unlimited" as a huge number; treat anything past the host's plausible range as no
+    // limit rather than as headroom nobody has.
+    if max >= u64::MAX / 2 {
+        return None;
+    }
+    let inactive_file = std::fs::read_to_string(dir.join("memory.stat"))
+        .ok()
+        .and_then(|text| parse_stat_value(&text, files.inactive_file))
+        .unwrap_or(0);
+    Some(max.saturating_sub(usage.saturating_sub(inactive_file)))
+}
+
+/// One `key value` line of a cgroup `memory.stat`, in bytes.
+#[cfg(any(target_os = "linux", test))]
+fn parse_stat_value(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let (k, v) = line.split_once(' ')?;
+        (k == key).then(|| v.trim().parse().ok()).flatten()
+    })
+}
+
+/// One cgroup value file: a decimal, or `None` for the `max` sentinel, a missing file, or junk.
+#[cfg(any(target_os = "linux", test))]
 fn read_u64(path: &std::path::Path) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
@@ -323,6 +369,34 @@ mod tests {
     fn a_file_without_the_field_is_unknown() {
         let text = "MemTotal:       65780000 kB\nMemFree:         2000000 kB\n";
         assert_eq!(parse_mem_available(text), None);
+    }
+
+    /// Page cache the kernel can reclaim is not committed memory: a cgroup at 6 GiB usage of an
+    /// 8 GiB limit, 4 GiB of it inactive file cache, still has 6 GiB to give.
+    #[test]
+    fn cgroup_headroom_discounts_inactive_file_cache() {
+        const GIB: u64 = 1 << 30;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let write = |name: &str, text: String| std::fs::write(dir.path().join(name), text).unwrap();
+        write("memory.max", format!("{}\n", 8 * GIB));
+        write("memory.current", format!("{}\n", 6 * GIB));
+        write(
+            "memory.stat",
+            format!(
+                "anon {}\nfile {}\ninactive_file {}\n",
+                GIB,
+                5 * GIB,
+                4 * GIB
+            ),
+        );
+        assert_eq!(cgroup_level_headroom(dir.path(), &CGROUP_V2), Some(6 * GIB));
+
+        // No stat file: nothing is known to be reclaimable, so the raw difference stands.
+        std::fs::remove_file(dir.path().join("memory.stat")).unwrap();
+        assert_eq!(cgroup_level_headroom(dir.path(), &CGROUP_V2), Some(2 * GIB));
+
+        write("memory.max", "max\n".into());
+        assert_eq!(cgroup_level_headroom(dir.path(), &CGROUP_V2), None);
     }
 
     #[test]

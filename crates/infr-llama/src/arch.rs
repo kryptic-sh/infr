@@ -78,8 +78,8 @@ pub const DEEPSEEK2: &str = "deepseek2";
 /// `attention.q_lora_rank` is mandatory (there is no lite variant), so `Config::deepseek2` — the
 /// MLA/KV-geometry/MoE-shape gate — is TRUE for this string too and `Config::deepseek32` gates only
 /// what is new. llama.cpp keeps it in its own model class (`src/models/deepseek32.cpp`). The
-/// indexer's five per-layer tensors LOAD; nothing emits them yet, so a graph build refuses this
-/// arch. See docs/deepseek.md § Stage 3.
+/// indexer's five per-layer tensors load and the seam emits the indexer, so this arch generates on
+/// the CPU and Vulkan backends. See docs/deepseek.md § Stage 3.
 pub const DEEPSEEK32: &str = "deepseek32";
 /// DeepSeek V4 (V4-Flash / V4-Pro): a genuinely different architecture, NOT an increment on
 /// [`DEEPSEEK2`]. There is no MLA here — no `kv_lora_rank`, no `wk_b`/`wv_b` — so `Config::deepseek2`
@@ -93,8 +93,10 @@ pub const DEEPSEEK32: &str = "deepseek32";
 /// Every layer is sliding-window (`set_swa_pattern(0)`), and there are no dense-lead layers and no
 /// NextN. llama.cpp keeps it in its own model class (`src/models/deepseek4.cpp`).
 ///
-/// The LOAD path is complete — config, every tensor — and nothing emits it yet, so a graph build
-/// refuses this arch. See docs/deepseek.md § Stage 4.
+/// The load path is complete — config, every tensor. A file whose `attention.compress_ratios` are
+/// all 0 (every layer the pure sliding-window tier) generates; a layer with ratio 4 or 128 is
+/// refused by name in `generate_dense_backend`, since the compressed tiers are not implemented.
+/// See docs/deepseek.md § Stage 4.
 pub const DEEPSEEK4: &str = "deepseek4";
 /// Microsoft's official BitNet-b1.58 GGUFs (`microsoft/bitnet-b1.58-2B-4T-gguf`) declare
 /// `general.architecture = "bitnet-b1.58"` and prefix EVERY metadata key with it

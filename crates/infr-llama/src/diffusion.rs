@@ -188,8 +188,9 @@ struct Rng(u64);
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Rng {
     fn new(seed: u64) -> Self {
-        Self(seed | 1) // xorshift64 never leaves the zero state, but also never enters it from a
-                       // nonzero seed — the |1 just guards a literal seed=0
+        // The sampler's zero-seed policy, not `seed | 1`: that collapsed every even seed onto the
+        // odd one above it, so `--seed 2` and `--seed 3` produced the same output.
+        Self(crate::sampling::legal_xorshift_state(seed))
     }
     fn next_u64(&mut self) -> u64 {
         let mut x = self.0;
@@ -679,7 +680,23 @@ pub fn is_diffusion_gemma(path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{accept_by_entropy_bound, budget_take, entropy_order, trim_canvas};
+    use super::{accept_by_entropy_bound, budget_take, entropy_order, trim_canvas, Rng};
+
+    /// Adjacent seeds must give different streams (`seed | 1` mapped `2k` and `2k + 1` onto one
+    /// state), and seed 0 must not seed the xorshift fixed point.
+    #[test]
+    fn adjacent_seeds_give_distinct_streams() {
+        let first = |seed| Rng::new(seed).next_u64();
+        assert_ne!(first(2), first(3));
+        assert_ne!(first(42), first(43));
+        assert_ne!(first(0), first(1));
+        let mut zero = Rng::new(0);
+        assert_ne!(
+            zero.next_u64(),
+            zero.next_u64(),
+            "seed 0 must not stick at a fixed point"
+        );
+    }
 
     #[test]
     fn entropy_order_is_ascending_and_nan_safe() {

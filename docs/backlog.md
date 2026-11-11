@@ -26,25 +26,17 @@ Provenance tags point at the finding that opened the item:
 
 ## Open
 
-### B1 — `INFR_DN_CHUNK_SCAN` has inverted polarity
+### B1 — `dn_chunk_scan` (the config field) reads opposite to its name
 
-**Tag:** CR-N10 · **Blocked on:** a breaking-change sweep
+**Tag:** CR-N10 · re-read 2026-11-12
 
-`crates/infr-core/src/config/env.rs`:
-
-```rust
-v.dn_chunk_scan = presence_inv(get, "INFR_DN_CHUNK_SCAN");
-```
-
-The key is spelled positively but its presence _disables_ the chunked scan — the
-only key in that file whose name means the opposite of what it does. It is
-R1-frozen (the config campaign pinned existing spellings), so renaming it is a
-breaking change for anyone who has it set.
-
-**When the next breaking sweep happens:** rename to `INFR_NO_DN_CHUNK_SCAN`,
-which makes it match the `presence_inv` grammar every other `INFR_NO_*` key
-uses. No alias — the project's env policy is to drop old spellings cleanly
-rather than carry them.
+The env key is right: setting `INFR_DN_CHUNK_SCAN` forces the chunked scan, as
+its name says. What is inverted is the internal field it fills —
+`dn_chunk_scan == true` selects the SEQUENTIAL path — and the field's doc
+comment in `config/mod.rs`. The earlier form of this entry proposed renaming the
+key to `INFR_NO_DN_CHUNK_SCAN`, which would have made the key wrong. The fix is
+to rename the field (or flip it and its readers) and correct the comment; no
+user-visible spelling changes.
 
 ### B3 — the VNNI kernel family's bounds assertions are unexercised
 
@@ -704,28 +696,6 @@ What it does not, and will not:
   `infr-core`'s uses outside `hostpager` are three, one being a `libc::kill`
   miri cannot execute. The `hostpager::` filter added later runs in seconds, so
   the crate-wide cost was never the obstacle for the part that matters.
-
-### B33 — the `wildcards` gate in `deny.toml` is off, and is now a two-line fix
-
-**Tag:** cron slice 2026-08-04 · **Blocked on:** nothing (re-verified
-2026-11-08)
-
-`cargo-deny`'s `wildcards = "deny"` catches a `*` version requirement on a
-registry crate — non-reproducible builds, and a semver-major landing with no
-diff. It was left at `allow` because the workspace members were declared
-`{ path = ... }` with no version, which cargo-deny reads as a wildcard, and
-marking them `publish = false` was a decision about publishing nobody had made.
-
-That premise is gone: publishing was decided on 2026-10-29 (B78), every internal
-dependency in `[workspace.dependencies]` now carries `version = "0.2.0"`, and
-the only unversioned path dependency left is `infr-testkit`, the dev-only crate
-that is already `publish = false`. Measured 2026-11-08 with
-`cargo deny check bans` against a copy of `deny.toml`: `wildcards = "deny"`
-alone FAILS (`found 2 wildcard dependencies` for `infr-cpu`, `infr-metal`,
-`infr-vulkan` — the `infr-testkit` dev-deps), and `wildcards = "deny"` plus
-`allow-wildcard-paths = true` PASSES (`bans ok`). So the fix is those two lines,
-plus deleting the stale comment above `wildcards` in `deny.toml` that still says
-nothing is published. Not applied in the 2026-11-08 pass, which was docs-only.
 
 ### B34 — no fuzz targets, and there is an obvious first one
 
@@ -2404,27 +2374,13 @@ only three commits in that range (a submission-batching fix,
 capability-probing findings elsewhere in this group are current; no other
 subsystem was diffed.
 
-### W1 — VRAM guard check-then-act race (CR-N7)
-
-**Claim:** `check_vram_budget` / `vram_budget_fits` read the budget then
-allocate with no lock, so two threads under `serve --parallel` could both pass a
-budget only one fits in.
-
-**Why it is wrong:** all large allocations happen at startup. Weights load
-serially and `ParallelSeam::init_slots` is a sequential loop. The only `alloc`
-reachable during serving is the MTP h-tap `Staging` buffer at `n_embd * 4` (~16
-KB), which is below the guard's 1 MiB `CHECK_MIN` and skipped by design. There
-is no concurrent large allocation to race.
-
 ### W2 — GGUF tensor lookup is O(n) per call (CR-N2, perf half)
 
-**Claim:** `Gguf::resolve`'s linear scan costs "a few million string compares"
-at load.
-
-**Why it is wrong:** there are 8 `tensor_bytes*` call sites, 5 of them per-layer
-— a few hundred thousand short comparisons once, i.e. microseconds. A `HashMap`
-index would be complexity for no measurable gain. The _other_ half of N2
-(duplicate tensor names silently accepted, first-wins) was real and is fixed.
+Re-read 2026-11-12 and declined as it stands: each lookup scans the tensor
+names, so a load costs about n² name comparisons — around 10⁶ at n ≈ 10³,
+milliseconds against seconds of load. Four more `tensors().iter().find` scans in
+infr-llama mean indexing `resolve` alone would not remove the cost. Worth doing
+only after measuring total name-lookup time on a model with about 2000 tensors.
 
 ### B62 — is host-RAM KV spill actually the LAST rung? (2026-08-12)
 
@@ -3068,18 +3024,6 @@ Same backend, smaller: on the m = 1 path of CPU `Op::Linear`
 serially per projection, so Q/K/V/gate/up re-quantize the same normed input.
 Estimated well under 1 %.
 
-### B96 — `arch.rs` doc comments contradict the DeepSeek status (2026-11-08)
-
-**Tag:** docs-in-code
-
-The doc comments on `DEEPSEEK32` and `DEEPSEEK4` in
-`crates/infr-llama/src/arch.rs` say nothing emits those archs and "a graph build
-refuses" them. `docs/deepseek.md` records Stage 3 (`deepseek32`) as generating
-on CPU and Vulkan, and Stage 4 slice A (`deepseek4` with all-zero
-`compress_ratios`) as generating; the refusal that remains is the compressed
-tiers (B-DSV4-WIRING). Left alone in this docs-only pass; rewrite both comments
-in the next change that touches `arch.rs`.
-
 ### Review coverage gaps (2026-11-08)
 
 Not reviewed by any of the three passes: the Vulkan GLSL shaders beyond
@@ -3121,9 +3065,9 @@ items moved to B35/B36 and B99–B101. Still open:
   — it moves files that code comments and every other doc link to.
 - **`docs/plan.md`'s "As built (2026-08-05)" table** is dated and was only
   patched for the DeepSeek line; re-date it when it is next reviewed whole.
-- **Code comments not swept:** stale references in code comments (the `arch.rs`
-  DeepSeek comments, B96; `deny.toml`'s wildcard comment, B33) and any comment
-  citing an env var or doc section that has moved.
+- **Code comments not swept:** any comment citing an env var or doc section that
+  has moved. (The `arch.rs` DeepSeek comments and `deny.toml`'s wildcard comment
+  were corrected on 2026-11-12.)
 
 ### B98 — the codebase audit's four deferred findings (2026-07-21, moved 2026-11-10)
 
@@ -3161,14 +3105,12 @@ migration out of proportion to the defect:
   vs single-stage with `u` in the push constant). Folding them means reconciling
   those structs and the `build.rs` compile list, for a DRY gain.
 
-The audit's cross-cutting `partial_cmp(..).unwrap()` theme (a NaN panics the
-sort) is mostly cleared — the CLI sweep and `infr-prof-rt` use `total_cmp`, and
-the hits in `infr-vulkan/src/adapter.rs` are inside its `#[cfg(test)]` module —
-but **two production sites remain** in `crates/infr-cpu/src/lib.rs`, the CPU
-`MoeFfn` arm's group-limited routing (DeepSeek): the group-score sort and the
-expert sort both `partial_cmp(..).unwrap()`. A NaN router score panics the CPU
-backend there instead of producing a (garbage) selection. Fix: `total_cmp`,
-which keeps the same order for finite values.
+Re-read 2026-11-12: all four are still true and none is a clear pure win; each
+needs GPU byte-identity runs. The audit's `partial_cmp(..).unwrap()` theme is
+closed — the last production sites (CPU MoE routing, `truncated_softmax`,
+`infr-cpu` `sample_token`) use `total_cmp`, so a NaN no longer panics the sort.
+It still ranks first and the output is still NaN: nothing downstream handles a
+NaN logit or router score.
 
 ### B99 — iGPU perf: beat llama.cpp's Vulkan backend on the iGPU (moved 2026-11-10)
 
@@ -3425,17 +3367,6 @@ max buffer length) and return `Err`.
   weights when it comes first. Skip mmproj files before matching. `is_mmproj`
   also only recognises a leading `mmproj`, not a `name.mmproj-Q8_0.gguf` form.
 
-### B111 — DiffusionGemma's RNG maps every even seed onto the next odd one (2026-11-11)
-
-**Tag:** diffusion · **Kind:** correctness, confirmed by reading
-
-`Rng::new` in `crates/infr-llama/src/diffusion.rs` is `Self(seed | 1)`, so
-`--seed 2` and `--seed 3` produce identical output. Its comment says the `| 1`
-only guards a zero seed. The autoregressive path fixed the same collapse in
-`sampling::legal_xorshift_state`, whose doc records that the two copies of the
-policy had drifted once already; this is a third copy. Fix: call
-`legal_xorshift_state`.
-
 ### B112 — a foreign `tokenizer.json` beside the GGUF is only warned about (2026-11-12)
 
 **Needs:** a decision. `load_tokenizer` now compares a sample of the sidecar's
@@ -3450,32 +3381,14 @@ load the same resolved tokenizer as generation; that wiring is compile-checked
 only, since a test needs a GGUF file. `DiffusionVisual` still opens its renderer
 with the embedded tokenizer, for display only.
 
-### B113 — cgroup memory headroom counts reclaimable page cache as used (2026-11-11)
+### B115 — malformed `INFR_*` numbers are dropped silently (2026-11-11)
 
-**Tag:** platform · **Kind:** correctness, plausible, not run in a container
-
-`cgroup_headroom` in `crates/infr-plat/src/mem.rs` is `memory.max` minus
-`memory.current`. `memory.current` includes file cache — including infr's own
-mmapped model pages — so inside a memory-limited container, touching a large
-GGUF makes `available()` shrink by roughly the file's size. That figure sizes
-the host arena tiers in `infr_core::hostmem`. The non-cgroup branch uses
-`MemAvailable`, which does discount reclaimable cache, so the two disagree. Fix:
-subtract `inactive_file` (arguably `active_file` too) from `memory.stat`.
-
-### B115 — smaller findings from the 2026-11-11 review
-
-- **`truncated_softmax`'s bounded top-k arm uses `partial_cmp`** with an `Equal`
-  fallback (`crates/infr-llama/src/sampling.rs`), which is not a total order
-  once a NaN logit is present; `select_nth_unstable_by` may then panic, and on
-  the CPU / Metal serve path a panic fails that one request (see B82). The
-  full-vocabulary arm already uses `total_cmp`. A third site beside the two in
-  B98.
-- **Malformed `INFR_*` numbers are dropped silently** — `num`, `num_pos`,
-  `opt_size`, `opt_mib` in `crates/infr-core/src/config/env.rs`. `config.md`
-  already documents this as frozen behaviour, so it is not a new finding; what
-  the review adds is the consequence for the serve safety limits: a typo in a
-  request-timeout or max-tokens-cap variable leaves the server with no limit and
-  no message. Worth un-freezing for those keys at least.
+**Needs:** a decision. `num`, `num_pos`, `opt_size`, `opt_mib` in
+`crates/infr-core/src/config/env.rs` ignore a value that does not parse, which
+`config.md` documents as frozen behaviour. The consequence for the serve safety
+limits: a typo in a request-timeout or max-tokens-cap variable leaves the server
+with no limit and no message. Options: warn for every key; error for the serve
+safety keys only; keep the documented behaviour.
 
 ### Review coverage gaps (2026-11-11)
 
@@ -3694,37 +3607,59 @@ for its planar Q8_0 layout. What is left:
   count ("K and V caches share numel"). Not checked whether any Q8-capable model
   has K and V rows of different width.
 
-### B131 — chained decode runs qwen35's recurrent state past the stop point (2026-11-11)
+### B131 — qwen35 resume and the ring guard: what is left (2026-11-12)
 
-Reported by the reviewer; not re-read. `execute_chain` replays all `n` steps of
-a chain on the device, and the host then stops at the first EOS, `max_new` or
-abort and records `last_written`. For a per-position KV cache the extra steps
-are harmless because rows past `last_written` are ignored (B94 leans on the same
-fact). That does not hold for qwen35, whose `Conv1dSilu` / `DeltaNet` ops update
-one persistent state in place: after a stop mid-chain the state has also
-consumed the stop token and whatever was sampled after it, and a next prompt
-that exactly extends `cached` reuses it.
+`SeamKv::written_end` records one past the highest position any execute may have
+written, and replaces `cached.len()` as the high-water mark: qwen35 reuses its
+recurrent state only when the two agree, and the sliding-window ring guard uses
+it. When a qwen35 chain stops early, the next turn restores a snapshot of the
+state taken at the previous turn's prefill boundary and prefills from there
+instead of from zero. Left:
 
-Not established: that the DeltaNet kernel mutates state on every replayed step
-(taken from the comment in `decode_eligible`, kernel not read), and the size of
-the effect. Worth settling together with B129, which shares the test.
+- **The snapshot is VRAM the fit ladder does not count.** It is a second copy of
+  every DeltaNet layer's state, per slot:
+  `4 × ((ssm_d_conv − 1) × q35_conv_channels + q35_num_v_heads × q35_head_k_dim × q35_head_v_dim)`
+  bytes per layer — about 19.3 MiB for Qwen3.5-0.8B from the dims in
+  `qwen35.md`, more for the larger models (not computed; their dims were not to
+  hand). `kv_layer_alloc_bytes` is also the size actually allocated, so the copy
+  needs its own term in every reader of the fit (`kv_floor_alloc_bytes`,
+  `kv_fit_ctx_in_budget`, the re-clamp, placement). Until then a context sized
+  to fill VRAM can have the snapshot refused; that is handled (one warning, no
+  snapshot on that slot, the next mid-chain turn re-prefills from zero) but it
+  is the slow path again.
+- **Temperature-0 output can depend on where a chain stopped.** A resumed turn
+  re-prefills the previous reply as a batch, where plain reuse had fed it token
+  by token; the batched DeltaNet kernels chunk from the dispatch's first row, so
+  logits differ at about 1e-5..1e-4 and a near-tie can sample differently.
+  Bit-identity across turn splits did not hold before either.
+- **Metal, suspected and not run:** `execute_graph_chain` can run one step and
+  then decline, after which the per-token path feeds that position again — a
+  qwen35 state would advance twice. Read only; Metal was not built.
+- **Untested:** the ring guard after an aborted prefill (needs the cancel hook
+  B129 also wants), the `seed_from` high-water change, and the snapshot under a
+  real VRAM refusal (the test injects one through a wrapping backend, because no
+  knob makes the guard refuse a chosen allocation). The qwen35 chain tests are
+  `#[ignore]` and need a device whose `max_decode_chain` is at least 2 — the
+  iGPU's watchdog caps it at 1, so they run only on the RX 7900 XTX.
+- B94 leans on rows past `last_written` being ignored. That is no longer true
+  for ring and qwen35 sessions, which now track them; re-read B94 with that in
+  mind before building it.
+- The DiffusionGemma "Paris" coherence tests in `tests/cpu_backend.rs` have not
+  been re-run since the seeded RNG changed (every even seed, the default 42
+  included, now draws a different stream); the model is not on the dev machine.
 
-### B132 — the sliding-window ring's rewind guard trusts `cached.len()` as the high-water mark (2026-11-11)
+### B136 — pipeline-cache tripwire: accepted limits (2026-11-12)
 
-The guard after the `start` computation in `generate_dense_backend` computes
-`live_from = cached.len() - rows_l` to decide whether a rewind would read
-recycled ring rows, and is skipped entirely when `start == cached.len()`. But
-positions written can exceed `cached.len()`: an aborted prefill has already
-truncated `cached` to `start` and then written chunks past it, and a turn that
-rewinds and ends shorter than an earlier turn leaves the earlier turn's rows in
-the ring. In both cases the guard passes while rows inside the window belong to
-other positions.
-
-The guard itself is confirmed by reading. The scenarios are the reviewer's
-reasoning and rest on the ring writing at `pos % rows`; no backend kernel was
-read for this and no run was made. It affects only sliding-window layers (Gemma)
-with the ring enabled. Fix: track the highest position written per slot rather
-than inferring it from `cached`.
+Liveness is now an advisory lock each instance holds on its marker, with the pid
+check kept where no lock can be taken. Accepted and documented in
+`kernel_cache.rs`: a still-running pre-lock `infr` loses the cache once across
+an upgrade; and when the rename into place fails, a sweep landing between
+opening and locking the fallback marker discards the cache once and leaves that
+run unprotected against its own hang. Not run: real NFS (where `flock` is
+emulated per process — the in-process registry is there for it), and Windows,
+which compiles but relies on share-delete opens that were not exercised. The
+cgroup headroom fix (`cgroup_level_headroom` subtracts inactive file cache) was
+likewise not run inside a real container, and does not subtract `active_file`.
 
 ### B133 — what the loader, host-pager and LRU fixes left open (2026-11-12)
 
@@ -3756,21 +3691,6 @@ first. What is left:
   attention `deq` closure) were left: they read buffers the backend allocates,
   not the GGUF mapping.
 
-### B136 — the pipeline-cache tripwire judges a crashed run by pid alone (2026-11-11)
-
-`KernelCache::discard_if_a_seeded_run_died` (infr-core `kernel_cache.rs`) treats
-a marker `<stem>.seeded.<pid>-<nonce>` as "a concurrent infr" whenever
-`pid_alive(pid)` holds, with no boot id or process start time. Two cases defeat
-it: a container in which infr always gets the same pid (the crashed run's marker
-names the pid of the run now checking it, so the poisoned blob is kept and
-re-seeded every launch), and a reboot after a hung GPU, when the old pid belongs
-to an unrelated process. The second can also discard a good cache later, once
-that process exits.
-
-The pid-only liveness test is confirmed by reading; the marker naming and the
-container case are as reported. How often either happens is unknown. See the
-poisoned-pipeline-cache incident this module was written for.
-
 ### B137 — `infr serve`: three decisions for the owner (2026-11-12)
 
 - **`response_format` is accepted and ignored.** A client that asks for JSON
@@ -3796,16 +3716,19 @@ poisoned-pipeline-cache incident this module was written for.
 ### B138 — smaller infr-core findings (2026-11-11)
 
 - **`cpu_arena_plan` (`hostmem.rs`) has no headroom in its fit test.** It
-  returns `Skip::Fits` when `pageable <= available` (confirmed, and a unit test
-  pins "exactly fitting still counts"), while the arena it would otherwise size
-  keeps headroom free. A model that just fits stays on mmap and competes with
-  KV, activations and the repack cache for the same RAM. Not measured.
-- **Fusion patterns no backend plans.** Reported: `plan_rmsnorm_linear` and
-  `plan_moe_add` in `fusion.rs` are reachable only from tests, and
-  `plan_rmsnorm_linear` does not check that the norm's raw input is unwritten
-  before its last consumer, which would matter if it were ever enabled.
-  `dst_only_read_by_next`'s doc says a backend post-filters with it; nothing
-  outside `fusion.rs` calls it. Candidates for deletion rather than repair.
+  returns `Skip::Fits` when `pageable <= available`, a deliberate choice with a
+  unit test pinning it, while the arena it would otherwise size keeps headroom
+  free. A model that just fits stays on mmap and competes with KV, activations
+  and the repack cache for the same RAM. Changing it needs a measurement (a
+  model that just fits, mmap against arena).
+- **Dead fusion patterns, confirmed 2026-11-12.** Both backends pass
+  `rmsnorm_linear: None` and `moe_add: None` and nothing reads the resulting
+  plans. Delete `plan_rmsnorm_linear`, `plan_moe_add`, both config structs and
+  both plan maps together — including the `FusionCfg` fields set in
+  `infr-metal/src/exec.rs`, which is why it was not done with the CPU slice.
+  `dst_only_read_by_next` is still used by `plan_linear_add`; its doc's claim
+  that a backend post-filters with it is false, and making it private is a
+  breaking change to the published crate.
 
 ### B139 — NaN-aware comparisons: what the sweep could have missed (2026-11-12)
 

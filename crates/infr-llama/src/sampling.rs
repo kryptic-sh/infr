@@ -319,11 +319,11 @@ pub(crate) fn resolve_seed(req: Option<&RequestCtx>, cfg: &infr_core::config::Sa
 /// So only `0` is remapped (to the golden-ratio constant, an arbitrary but well-mixed nonzero
 /// state); every other seed passes through untouched and distinct seeds stay distinct.
 ///
-/// Both seed entry points ([`resolve_seed`]'s per-request seed and [`seed_rng`]'s process-wide
-/// `sampling.seed`/wall-clock seed) MUST route through this one helper — when they each had their
-/// own copy of the policy they drifted, and the process-config path kept the `| 1` collapse long
-/// after the per-request path was fixed.
-fn legal_xorshift_state(seed: u64) -> u64 {
+/// Every seed entry point ([`resolve_seed`]'s per-request seed, [`seed_rng`]'s process-wide
+/// `sampling.seed`/wall-clock seed, and DiffusionGemma's per-block reseed) MUST route through this
+/// one helper — when they each had their own copy of the policy they drifted, and the
+/// process-config path kept the `| 1` collapse long after the per-request path was fixed.
+pub(crate) fn legal_xorshift_state(seed: u64) -> u64 {
     if seed == 0 {
         0x9E37_79B9_7F4A_7C15
     } else {
@@ -505,12 +505,12 @@ fn truncated_softmax(
     let temp = if temp > 0.0 { temp } else { 1.0 };
     let k = if top_k == 0 { n } else { top_k.min(n) };
     if k < n {
-        // Bounded top-k: partition to the top k, then sort only those k (cheap).
-        let cmp = |a: &usize, b: &usize| {
-            logits[*b]
-                .partial_cmp(&logits[*a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        };
+        // Bounded top-k: partition to the top k, then sort only those k (cheap). `total_cmp`, not
+        // `partial_cmp` with an `Equal` fallback: that is not a total order once a NaN is present,
+        // and `select_nth_unstable_by` / `sort_unstable_by` panic on one. On NaN-free logits the
+        // two agree on every pair but `-0.0` / `+0.0`, which `total_cmp` orders. A NaN logit no
+        // longer panics but ranks first, so the probabilities come out NaN as before.
+        let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]);
         let mut idx: Vec<usize> = (0..n).collect();
         idx.select_nth_unstable_by(k - 1, cmp); // top-k at the front (unordered)
         idx.truncate(k);
@@ -698,6 +698,30 @@ pub(crate) fn sample_from_dist(dist: &[(u32, f32)], rng: &mut u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    /// A NaN logit must not panic the bounded top-k arm: its comparator once called NaN "equal"
+    /// to everything, which is not a total order, and the selection then panicked.
+    #[test]
+    fn bounded_top_k_survives_nan_logits() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for n in [600usize, 1590, 3000] {
+            for every in [2usize, 3, 5] {
+                let logits: Vec<f32> = (0..n)
+                    .map(|i| {
+                        if i % every == 0 {
+                            f32::NAN
+                        } else {
+                            super::next_uniform(&mut state) * 10.0
+                        }
+                    })
+                    .collect();
+                for k in [1usize, 24, 40, 64] {
+                    let (idx, probs) = super::truncated_softmax(&logits, 0.8, k, 0.95);
+                    assert!(!idx.is_empty() && idx.len() == probs.len() && idx.len() <= k);
+                }
+            }
+        }
+    }
+
     use super::*;
 
     fn cfg(temp: f32, seed: u64) -> RequestSampling {

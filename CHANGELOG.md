@@ -48,6 +48,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **A `tokenizer.json` beside the GGUF that does not match the model's
   vocabulary now logs a warning.** It is still used.
 
+- **DiffusionGemma: even seeds no longer repeat the next odd seed.** The seeded
+  RNG forced its state odd, so `--seed 2` and `--seed 3` gave the same output.
+  Every even seed and seed 0 now draw a different stream — including the default
+  seed, 42, so default DiffusionGemma output changes. Odd seeds are unchanged.
+- **Memory headroom inside a cgroup no longer counts reclaimable file cache as
+  used.** A container that had read a lot of files looked nearly full, and infr
+  sized its host weight cache too small.
+
 ### Removed
 
 - **`infr_llama::grammar::tool_constraint_for`.** `ToolConstrainer`, which
@@ -60,6 +68,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   byte-identical; the work per token no longer grows with the reply's length.
 - **A tool call quoted inside a model's reasoning is no longer run as a call,
   and no longer hides the real call from the stream.**
+- **Qwen3.5 / Qwen3.6 on Vulkan: a multi-turn chat no longer continues from
+  recurrent state that ran ahead of the conversation.** Chained decode feeds
+  several tokens per submit, so a reply that ended part-way through a chain left
+  the state past the stop; the next turn reused it. The engine now tracks how
+  far the state was written and, when it is ahead, restores a snapshot taken at
+  the previous turn's prompt and prefills from there. The snapshot is one more
+  copy of the recurrent state per slot (about 19 MiB for Qwen3.5-0.8B).
+- **Sliding-window models (Gemma 3 / 4): a turn that rewinds after a longer
+  earlier one no longer reads window rows that have been recycled.**
+- **A NaN logit or router score no longer panics the sampler or the CPU MoE
+  routing.** The output is still NaN.
+- **The pipeline-cache crash tripwire no longer trusts a process id alone.** In
+  a container every run can be pid 1, so a crashed run looked alive and its
+  poisoned cache was kept. Each run now holds a file lock on its marker.
 - **`infr serve`: `usage.prompt_tokens` counts the whole prompt.** It reported
   only the tokens prefilled for this request, so a KV prefix cache hit made a
   long prompt look short. `/metrics` still counts prefilled tokens only.

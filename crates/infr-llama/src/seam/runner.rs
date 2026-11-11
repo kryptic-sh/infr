@@ -1240,6 +1240,8 @@ pub(crate) fn generate_dense_backend(
             max_ctx: want_ctx,
             kv_ring,
             cached: Vec::new(),
+            written_end: 0,
+            delta_snapshot_refused: false,
             denoise_cache: None,
             self_cond_w: None,
             sc_embt: None,
@@ -1264,13 +1266,15 @@ pub(crate) fn generate_dense_backend(
         logits_buf,
         max_ctx,
         cached,
+        written_end,
         denoise_cache,
         self_cond_w,
         sc_embt,
         sc_ping,
         sc_ping_write,
         sc_temp_inv_buf,
-        mtp_delta_ckpt: _,
+        mtp_delta_ckpt,
+        delta_snapshot_refused,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
         kv_ring: _,
@@ -1324,9 +1328,29 @@ pub(crate) fn generate_dense_backend(
     } else if c.qwen35 {
         let pfx = common_prefix_len(cached, prompt);
         // An EMPTY `cached` never reuses: the buffers can still hold a warmup generation's or a
-        // pre-`SeamKv::reset` conversation's state, which `cached` no longer describes.
-        if !cached.is_empty() && pfx == cached.len() && pfx < prompt.len() {
+        // pre-`SeamKv::reset` conversation's state, which `cached` no longer describes. Nor does
+        // a state that has consumed more tokens than `cached` records (`written_end`): a chained
+        // decode that stopped early ran its remaining steps on the device anyway.
+        // Whenever plain reuse is out — a state that ran past `cached`, an identical resend, or a
+        // prompt that diverges after the snapshot point — the snapshot the decode loop took at a
+        // prefill boundary, `resume` tokens in, still applies if the new prompt starts with those
+        // tokens: restore it and prefill from there. It describes `cached[..resume]` for as long
+        // as it stays valid, since every turn that keeps it either extends `cached` or resumes
+        // from it, and a zeroed state invalidates it.
+        let resume = super::weights::delta_snapshot_len(mtp_delta_ckpt)
+            .filter(|&p| p > 0 && p <= pfx && p < prompt.len());
+        if !cached.is_empty()
+            && pfx == cached.len()
+            && pfx < prompt.len()
+            && *written_end == cached.len()
+        {
             pfx
+        } else if let Some(p) = resume {
+            let _gp = req.and_then(|r| r.gate_pass());
+            super::weights::restore_delta(be, &kbufs[..], &vbufs[..], mtp_delta_ckpt)?;
+            cached.truncate(p);
+            *written_end = p;
+            p
         } else {
             // Non-extending prompt (divergent / identical resend / first-ever call / empty
             // `cached`): the append-only recurrent state can't rewind to an arbitrary prefix, so
@@ -1336,6 +1360,8 @@ pub(crate) fn generate_dense_backend(
             // `cached` is cleared first so a failed upload below cannot leave it claiming a
             // half-zeroed state.
             cached.clear();
+            *written_end = 0;
+            super::weights::invalidate_delta(mtp_delta_ckpt);
             let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
             let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
             for l in 0..c.n_layer {
@@ -1361,19 +1387,20 @@ pub(crate) fn generate_dense_backend(
         common_prefix_len(cached, prompt).min(prompt.len().saturating_sub(1))
     };
     // SWA ring rewind guard: a ring layer RETAINS only its last `rows_l` positions — rows for
-    // positions older than `cached.len() - rows_l` were recycled by newer writes. Re-prefilling
+    // positions older than `written_end - rows_l` were recycled by newer writes. Re-prefilling
     // from `start` attends positions `[start - window, start)` on window layers, so a rewind
     // deeper than the ring's retained tail would read recycled rows; fall back to a full
-    // re-prefill (start = 0 — correctness over reuse; the full cache never hits this). Extending
-    // turns (start == cached.len()) and the ≤1-token `.min(prompt.len()-1)` rewind stay safe:
-    // rows_l - window >= ubatch >= 1.
-    let start = if kv_ring && start > 0 && start < cached.len() {
+    // re-prefill (start = 0 — correctness over reuse; the full cache never hits this). The high-
+    // water mark is `written_end`, not `cached.len()`: an aborted prefill, a chained decode that
+    // stopped early, or an earlier longer turn wrote positions `cached` no longer records, so even
+    // a turn that extends `cached` is checked.
+    let start = if kv_ring && start > 0 {
         let safe = (0..c.n_layer)
             .filter(|&l| c.is_swa_layer(l))
             .map(|l| crate::seam::kv_rows(c, l, max_ctx, true, ec))
             .filter(|&rows_l| rows_l < max_ctx) // a never-wrapping layer can't lose positions
             .all(|rows_l| {
-                let live_from = cached.len().saturating_sub(rows_l);
+                let live_from = written_end.saturating_sub(rows_l);
                 start.saturating_sub(c.swa_window) >= live_from
             });
         if safe {
@@ -1385,6 +1412,10 @@ pub(crate) fn generate_dense_backend(
         start
     };
     cached.truncate(start);
+    // From position 0 every row is rewritten in order before anything reads it.
+    if start == 0 {
+        *written_end = 0;
+    }
     // qwen35: every prefill step advances the DeltaNet state past `start`, and that cannot be
     // undone. Keep `cached` empty until this call records what it fed (the verify return and the
     // teardown below), so an error return in between (a cancelled prefill, a failed submit) makes
@@ -4848,6 +4879,7 @@ pub(crate) fn generate_dense_backend(
             logits_out_buf,
         );
         let t_exec0 = std::time::Instant::now();
+        *written_end = (*written_end).max(p + cc);
         be.execute(dcache.plan.as_ref(), &db)
             .map_err(|e| anyhow!("{e}"))?;
         let exec_secs = t_exec0.elapsed().as_secs_f64();
@@ -5059,6 +5091,7 @@ pub(crate) fn generate_dense_backend(
             vb.bind(ho, hb.as_ref());
         }
         let t0 = std::time::Instant::now();
+        *written_end = (*written_end).max(start + m);
         be.execute(vplan.as_ref(), &vb)
             .map_err(|e| anyhow!("{e}"))?;
         let vexec_secs = t0.elapsed().as_secs_f64();
@@ -5457,6 +5490,7 @@ pub(crate) fn generate_dense_backend(
                     pf_h.logits.is_none(),
                     "headless prefill build has no logits"
                 );
+                *written_end = (*written_end).max(cstart + ch.m);
                 be.execute(pf_plan.as_ref(), &pf_b)
                     .map_err(|e| anyhow!("{e}"))?;
                 // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
@@ -5628,6 +5662,39 @@ pub(crate) fn generate_dense_backend(
         && chain_n >= 2
         && ipl_buf.is_none()
         && ec.kernels.vulkan.gpu_pos;
+    // qwen35: a chain runs every one of its steps on the device, so a turn that stops partway
+    // leaves the DeltaNet state past what `cached` will record. Snapshot it here, at the prefill
+    // boundary, where it has consumed exactly `decode_start` tokens, so the next turn can resume
+    // from this point instead of re-prefilling from zero (the `resume` arm of the `start`
+    // computation). One copy per generation, and only when a chain can run: the per-token path
+    // never runs past its stop. Best effort: the context fit does not count this second copy of
+    // the state, so a session sized to fill VRAM has no room for it. That must not fail a request
+    // whose prefill is already paid for; without the snapshot a turn after a mid-chain stop just
+    // re-prefills from zero. A refusal is remembered so it is neither retried nor logged per turn.
+    if c.qwen35
+        && !*delta_snapshot_refused
+        && can_chain
+        && decode_start > 0
+        && max_new >= 2
+        && be.max_decode_chain() >= 2
+    {
+        let _gp = req.and_then(|r| r.gate_pass());
+        if let Err(e) = super::weights::snapshot_delta(
+            be,
+            c,
+            &kbufs[..],
+            &vbufs[..],
+            mtp_delta_ckpt,
+            decode_start,
+        ) {
+            super::weights::invalidate_delta(mtp_delta_ckpt);
+            *delta_snapshot_refused = true;
+            tracing::warn!(
+                "[infr] qwen35: no snapshot of the recurrent state at the prefill boundary ({e}); \
+                 on this slot, a turn after a stop mid-chain re-prefills from zero"
+            );
+        }
+    }
     let end = prompt.len() + max_new;
     let mut pos = decode_start;
     // Highest absolute position whose KV row was actually WRITTEN by a kept token this call — the
@@ -5702,6 +5769,9 @@ pub(crate) fn generate_dense_backend(
                         .map_err(|e| anyhow!("{e}"))?;
                 }
                 let (plan, b) = ro.as_ref().expect("can_chain implies record-once");
+                // Every one of the `n` steps runs on the device, whatever the host keeps.
+                let written_before = *written_end;
+                *written_end = (*written_end).max(pos + n);
                 if let Some(ids) = be
                     .execute_chain(plan.as_ref(), b, n)
                     .map_err(|e| anyhow!("{e}"))?
@@ -5747,6 +5817,10 @@ pub(crate) fn generate_dense_backend(
                     continue;
                 }
                 // Backend declined (e.g. adapter fell back to static) — per-token path below.
+                // Vulkan declines before running a step. Metal's chain can run one step at `pos`
+                // and then decline; the per-token path re-runs that same position and raises the
+                // mark to `pos + 1` itself, so restoring it loses nothing for KV rows.
+                *written_end = written_before;
             }
         }
         let step_t0 = std::time::Instant::now();
@@ -5819,6 +5893,7 @@ pub(crate) fn generate_dense_backend(
         };
         let t_setup = std::time::Instant::now();
         let (setup_el, exec_el);
+        *written_end = (*written_end).max(pos + 1);
         if let Some((plan, b)) = &ro {
             // Record-once path: reuse the single compiled plan + bindings (no per-token rebuild).
             setup_el = t_setup.elapsed();
@@ -6173,17 +6248,17 @@ mod tests {
         assert!(validate_token_ids(&[u32::MAX], 100).is_err());
     }
 
-    // ── qwen35 recurrent state across `SeamKv::reset` ─────────────────────────────────────────
+    // ── what a slot reuses across turns ───────────────────────────────────────────────────────
     //
-    // A one-layer, DeltaNet-only qwen35 GGUF (layer 0 is linear attention at the default
-    // `full_attention_interval`), every tensor f32 with deterministic values, written to a temp
-    // file and run through the real loader and runner on the CPU backend.
+    // Tiny synthetic GGUFs with deterministic values, written to a temp file and run through the
+    // real loader and runner: a qwen35 whose layer 0 is DeltaNet (plus, for the Vulkan chain test,
+    // a full-attention layer 1), and a one-layer sliding-window gemma3 for the SWA ring.
 
     const Q35_NE: usize = 32;
     const Q35_VOCAB: usize = 16;
     const Q35_NFF: usize = 32;
     const Q35_D_CONV: usize = 4;
-    const Q35_D_STATE: usize = 8;
+    const Q35_D_STATE: usize = 16;
     const Q35_N_GROUP: usize = 2;
     const Q35_DT_RANK: usize = 2;
     const Q35_D_INNER: usize = 16;
@@ -6214,44 +6289,15 @@ mod tests {
             .collect()
     }
 
-    /// GGUF v3 bytes of the synthetic qwen35 model. Shapes are ggml order (innermost first).
-    fn qwen35_gguf() -> Vec<u8> {
-        let cc = Q35_D_INNER + 2 * Q35_N_GROUP * Q35_D_STATE;
-        let head_v = Q35_D_INNER / Q35_DT_RANK;
-        // (name, shape, centre value): norms sit near 1, `ssm_a` is negative (a decay).
-        let tensors: Vec<(&str, Vec<usize>, f32)> = vec![
-            ("token_embd.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
-            ("output_norm.weight", vec![Q35_NE], 1.0),
-            ("output.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
-            ("blk.0.attn_norm.weight", vec![Q35_NE], 1.0),
-            ("blk.0.attn_qkv.weight", vec![Q35_NE, cc], 0.0),
-            ("blk.0.attn_gate.weight", vec![Q35_NE, Q35_D_INNER], 0.0),
-            ("blk.0.ssm_conv1d.weight", vec![Q35_D_CONV, cc], 0.0),
-            ("blk.0.ssm_alpha.weight", vec![Q35_NE, Q35_DT_RANK], 0.0),
-            ("blk.0.ssm_beta.weight", vec![Q35_NE, Q35_DT_RANK], 0.0),
-            ("blk.0.ssm_a", vec![Q35_DT_RANK], -1.0),
-            ("blk.0.ssm_dt.bias", vec![Q35_DT_RANK], 0.0),
-            ("blk.0.ssm_norm.weight", vec![head_v], 1.0),
-            ("blk.0.ssm_out.weight", vec![Q35_D_INNER, Q35_NE], 0.0),
-            ("blk.0.post_attention_norm.weight", vec![Q35_NE], 1.0),
-            ("blk.0.ffn_gate.weight", vec![Q35_NE, Q35_NFF], 0.0),
-            ("blk.0.ffn_up.weight", vec![Q35_NE, Q35_NFF], 0.0),
-            ("blk.0.ffn_down.weight", vec![Q35_NFF, Q35_NE], 0.0),
-        ];
-        let u32_keys = [
-            ("qwen35.block_count", 1),
-            ("qwen35.context_length", 64),
-            ("qwen35.embedding_length", Q35_NE),
-            ("qwen35.feed_forward_length", Q35_NFF),
-            ("qwen35.attention.head_count", 2),
-            ("qwen35.attention.head_count_kv", 2),
-            ("qwen35.ssm.conv_kernel", Q35_D_CONV),
-            ("qwen35.ssm.state_size", Q35_D_STATE),
-            ("qwen35.ssm.inner_size", Q35_D_INNER),
-            ("qwen35.ssm.group_count", Q35_N_GROUP),
-            ("qwen35.ssm.time_step_rank", Q35_DT_RANK),
-            ("tokenizer.ggml.eos_token_id", Q35_VOCAB - 1),
-        ];
+    /// GGUF v3 bytes for a synthetic model: `u32_keys` under `general.architecture = arch`, and
+    /// every tensor f32 (f16 when named in `f16`) with deterministic values around its centre.
+    /// Shapes are ggml order (innermost first).
+    fn synthetic_gguf(
+        arch: &str,
+        u32_keys: &[(String, usize)],
+        tensors: &[(String, Vec<usize>, f32)],
+        f16: &[&str],
+    ) -> Vec<u8> {
         const ALIGN: usize = 32;
         let mut b = Vec::new();
         push_u32(&mut b, 0x4655_4747); // "GGUF"
@@ -6260,11 +6306,11 @@ mod tests {
         push_u64(&mut b, (u32_keys.len() + 1) as u64);
         push_str(&mut b, "general.architecture");
         push_u32(&mut b, 8); // STRING
-        push_str(&mut b, "qwen35");
+        push_str(&mut b, arch);
         for (k, v) in u32_keys {
             push_str(&mut b, k);
             push_u32(&mut b, 4); // UINT32
-            push_u32(&mut b, v as u32);
+            push_u32(&mut b, *v as u32);
         }
         let mut data = Vec::new();
         for (i, (name, shape, base)) in tensors.iter().enumerate() {
@@ -6274,16 +6320,105 @@ mod tests {
             for &d in shape {
                 push_u64(&mut b, d as u64);
             }
-            push_u32(&mut b, 0); // F32
+            let half = f16.contains(&name.as_str());
+            push_u32(&mut b, if half { 1 } else { 0 }); // F16 / F32
             push_u64(&mut b, data.len() as u64);
             for v in q35_values(n, i as u64 + 1, *base) {
-                data.extend_from_slice(&v.to_le_bytes());
+                if half {
+                    data.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+                } else {
+                    data.extend_from_slice(&v.to_le_bytes());
+                }
             }
             data.resize(data.len().next_multiple_of(ALIGN), 0);
         }
         b.resize(b.len().next_multiple_of(ALIGN), 0);
         b.extend_from_slice(&data);
         b
+    }
+
+    /// Write `bytes` to a temp GGUF, open it and parse its config.
+    fn open_synthetic(tag: &str, bytes: &[u8]) -> (Gguf, Config) {
+        let path =
+            std::env::temp_dir().join(format!("infr-runner-{tag}-{}.gguf", std::process::id()));
+        std::fs::write(&path, bytes).expect("write synthetic GGUF");
+        let g = Gguf::open(&path).expect("open synthetic GGUF");
+        std::fs::remove_file(&path).expect("remove synthetic GGUF");
+        let cfg = Config::from_gguf(&g).expect("synthetic config");
+        (g, cfg)
+    }
+
+    /// The synthetic qwen35 model: DeltaNet layers only, or with `attn` a second, full-attention
+    /// layer and an f16 embedding — what Vulkan's record-once (chained) decode needs: an attention
+    /// op, and an embedding its on-device gather reads.
+    fn qwen35_gguf(attn: bool) -> Vec<u8> {
+        let cc = Q35_D_INNER + 2 * Q35_N_GROUP * Q35_D_STATE;
+        let head_v = Q35_D_INNER / Q35_DT_RANK;
+        // `attn` adds layer 1 at `full_attention_interval = 2`: two heads of NE / 2, the query
+        // projection carrying the output gate beside the query.
+        let hd = Q35_NE / 2;
+        let t = |name: &str, shape: Vec<usize>, base: f32| (name.to_string(), shape, base);
+        // (name, shape, centre value): norms sit near 1, `ssm_a` is negative (a decay).
+        let mut tensors = vec![
+            t("token_embd.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+            t("output_norm.weight", vec![Q35_NE], 1.0),
+            t("output.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+            t("blk.0.attn_norm.weight", vec![Q35_NE], 1.0),
+            t("blk.0.attn_qkv.weight", vec![Q35_NE, cc], 0.0),
+            t("blk.0.attn_gate.weight", vec![Q35_NE, Q35_D_INNER], 0.0),
+            t("blk.0.ssm_conv1d.weight", vec![Q35_D_CONV, cc], 0.0),
+            t("blk.0.ssm_alpha.weight", vec![Q35_NE, Q35_DT_RANK], 0.0),
+            t("blk.0.ssm_beta.weight", vec![Q35_NE, Q35_DT_RANK], 0.0),
+            t("blk.0.ssm_a", vec![Q35_DT_RANK], -1.0),
+            t("blk.0.ssm_dt.bias", vec![Q35_DT_RANK], 0.0),
+            t("blk.0.ssm_norm.weight", vec![head_v], 1.0),
+            t("blk.0.ssm_out.weight", vec![Q35_D_INNER, Q35_NE], 0.0),
+        ];
+        let ffn = |tensors: &mut Vec<(String, Vec<usize>, f32)>, l: usize| {
+            for (name, shape, base) in [
+                ("post_attention_norm", vec![Q35_NE], 1.0),
+                ("ffn_gate", vec![Q35_NE, Q35_NFF], 0.0),
+                ("ffn_up", vec![Q35_NE, Q35_NFF], 0.0),
+                ("ffn_down", vec![Q35_NFF, Q35_NE], 0.0),
+            ] {
+                tensors.push((format!("blk.{l}.{name}.weight"), shape, base));
+            }
+        };
+        ffn(&mut tensors, 0);
+        if attn {
+            for (name, shape, base) in [
+                ("attn_norm", vec![Q35_NE], 1.0),
+                ("attn_q", vec![Q35_NE, 2 * 2 * hd], 0.0),
+                ("attn_k", vec![Q35_NE, 2 * hd], 0.0),
+                ("attn_v", vec![Q35_NE, 2 * hd], 0.0),
+                ("attn_q_norm", vec![hd], 1.0),
+                ("attn_k_norm", vec![hd], 1.0),
+                ("attn_output", vec![2 * hd, Q35_NE], 0.0),
+            ] {
+                tensors.push((format!("blk.1.{name}.weight"), shape, base));
+            }
+            ffn(&mut tensors, 1);
+        }
+        let k = |key: &str, v: usize| (format!("qwen35.{key}"), v);
+        let mut u32_keys = vec![
+            k("block_count", if attn { 2 } else { 1 }),
+            k("context_length", 64),
+            k("embedding_length", Q35_NE),
+            k("feed_forward_length", Q35_NFF),
+            k("attention.head_count", 2),
+            k("attention.head_count_kv", 2),
+            k("ssm.conv_kernel", Q35_D_CONV),
+            k("ssm.state_size", Q35_D_STATE),
+            k("ssm.inner_size", Q35_D_INNER),
+            k("ssm.group_count", Q35_N_GROUP),
+            k("ssm.time_step_rank", Q35_DT_RANK),
+            ("tokenizer.ggml.eos_token_id".to_string(), Q35_VOCAB - 1),
+        ];
+        if attn {
+            u32_keys.push(k("full_attention_interval", 2));
+        }
+        let f16: &[&str] = if attn { &["token_embd.weight"] } else { &[] };
+        synthetic_gguf("qwen35", &u32_keys, &tensors, f16)
     }
 
     /// The last prompt token's logits for `prompt`, run on `state` (`None` = a fresh slot).
@@ -6326,14 +6461,7 @@ mod tests {
     /// equal a fresh slot's, not those of a state still carrying the first prompt.
     #[test]
     fn qwen35_reset_slot_matches_a_fresh_slot() {
-        let path = std::env::temp_dir().join(format!(
-            "infr-runner-qwen35-reset-{}.gguf",
-            std::process::id()
-        ));
-        std::fs::write(&path, qwen35_gguf()).expect("write synthetic qwen35 GGUF");
-        let g = Gguf::open(&path).expect("open synthetic qwen35 GGUF");
-        std::fs::remove_file(&path).expect("remove synthetic qwen35 GGUF");
-        let cfg = Config::from_gguf(&g).expect("synthetic qwen35 config");
+        let (g, cfg) = open_synthetic("qwen35-reset", &qwen35_gguf(false));
         assert!(cfg.qwen35 && !cfg.is_qwen35_attn_layer(0));
         let embd = std::sync::OnceLock::new();
 
@@ -6379,6 +6507,420 @@ mod tests {
             diff(&fresh, &after_reset) == 0.0,
             "logits after reset differ from a fresh slot by {}: the DeltaNet state was reused",
             diff(&fresh, &after_reset)
+        );
+    }
+
+    /// One Vulkan generation on the synthetic qwen35 (with its attention layer) through `be`:
+    /// `req`, when given, is aborted on the first kept token, so a chained decode stops there.
+    type Q35Run<'a> = dyn Fn(
+            &dyn infr_core::backend::Backend,
+            &[u32],
+            usize,
+            &mut Option<SeamKv>,
+            Option<&crate::sampling::RequestCtx>,
+            Option<&mut Vec<f32>>,
+        ) -> crate::GenStats
+        + 'a;
+
+    /// Build the Vulkan fixture for the qwen35 chain tests and hand `body` the device and a runner,
+    /// or skip without a device.
+    fn with_q35_vulkan(body: impl FnOnce(&infr_vulkan::VulkanBackend, &Q35Run<'_>)) {
+        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        eprintln!(
+            "vulkan device: {}",
+            infr_core::backend::Backend::capabilities(&vk).name
+        );
+        let (g, cfg) = open_synthetic("qwen35-chain", &qwen35_gguf(true));
+        assert!(cfg.is_qwen35_attn_layer(1));
+        let embd = std::sync::OnceLock::new();
+        let ec = EngineConfig::default();
+        const CTX: usize = 32;
+        let bind = crate::seam::vulkan_moe_binder(&vk, &g, &cfg, &ec, true, CTX)
+            .expect("vulkan weight binder");
+        let run = |be: &dyn infr_core::backend::Backend,
+                   prompt: &[u32],
+                   max_new: usize,
+                   state: &mut Option<SeamKv>,
+                   req: Option<&crate::sampling::RequestCtx>,
+                   logits: Option<&mut Vec<f32>>| {
+            let (_, stats) = super::generate_dense_backend(
+                be,
+                &*bind,
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                max_new,
+                |_| {
+                    if let Some(r) = req {
+                        r.abort();
+                    }
+                },
+                state,
+                CTX,
+                None,
+                None,
+                None,
+                logits,
+                None,
+                None,
+                req,
+            )
+            .expect("qwen35 synthetic generation on Vulkan");
+            stats
+        };
+        body(&vk, &run);
+    }
+
+    /// The logits for `then` on a fresh slot that first prefilled `first` minus its last token
+    /// (`max_new = 0`): the same split a turn resuming from `first`'s prefill boundary takes —
+    /// those rows, then the rest of `then` — so the two agree bit for bit.
+    fn q35_boundary_reference(
+        vk: &infr_vulkan::VulkanBackend,
+        run: &Q35Run<'_>,
+        first: &[u32],
+        then: &[u32],
+    ) -> Vec<f32> {
+        let mut slot = None;
+        run(vk, first, 0, &mut slot, None, None);
+        let mut logits = Vec::new();
+        run(vk, then, 1, &mut slot, None, Some(&mut logits));
+        logits
+    }
+
+    const Q35_FIRST: [u32; 8] = [3, 1, 4, 1, 5, 9, 2, 6];
+
+    /// A chained decode runs every step of its chain on the device, so a stop partway through
+    /// leaves qwen35's recurrent state past the tokens `cached` records. A next prompt that
+    /// extends `cached` must not reuse that state, and must not pay for it with a prefill from
+    /// zero either: it resumes from the snapshot the decode loop took at the first turn's prefill
+    /// boundary, and its logits equal a slot that ran the same rows without the overrun.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn qwen35_chain_stopped_early_is_not_reused_vulkan() {
+        with_q35_vulkan(|vk, run| {
+            let first = Q35_FIRST;
+            let second = [&first[..], &[7, 2]].concat();
+            let reference = q35_boundary_reference(vk, run, &first, &second);
+
+            // Stop after the first kept token of a chain several steps long.
+            let mut slot = None;
+            let req = crate::sampling::RequestCtx::new(Default::default());
+            run(vk, &first, 6, &mut slot, Some(&req), None);
+            let kv = slot.as_ref().expect("slot initialized");
+            assert_eq!(kv.cached, first, "only the prompt was fed");
+            assert!(
+                kv.written_end > kv.cached.len(),
+                "the chain did not run past the stop (written to {}), so this test checks nothing",
+                kv.written_end
+            );
+
+            let mut after = Vec::new();
+            let stats = run(vk, &second, 1, &mut slot, None, Some(&mut after));
+            // The first turn's prefill boundary: every prompt token but the last, which the
+            // decode loop feeds.
+            assert_eq!(
+                stats.n_cached,
+                first.len() - 1,
+                "the next turn did not resume from the prefill-boundary snapshot"
+            );
+            assert_eq!(reference.len(), Q35_VOCAB);
+            assert_eq!(
+                after, reference,
+                "the next turn reused a recurrent state the chain had advanced past the stop"
+            );
+        });
+    }
+
+    /// A turn that ended cleanly and is then sent again unchanged cannot reuse its state (that
+    /// would sample from the state after the whole prompt and the reply), but it can resume from
+    /// the snapshot at the prefill boundary instead of re-prefilling from zero.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn qwen35_identical_resend_resumes_from_the_boundary_vulkan() {
+        with_q35_vulkan(|vk, run| {
+            let first = Q35_FIRST;
+            let reference = q35_boundary_reference(vk, run, &first, &first);
+
+            let mut slot = None;
+            run(vk, &first, 2, &mut slot, None, None);
+            let kv = slot.as_ref().expect("slot initialized");
+            assert_eq!(kv.written_end, kv.cached.len(), "the turn ended cleanly");
+
+            let mut again = Vec::new();
+            let stats = run(vk, &first, 1, &mut slot, None, Some(&mut again));
+            assert_eq!(
+                stats.n_cached,
+                first.len() - 1,
+                "the resend did not resume from the prefill-boundary snapshot"
+            );
+            assert_eq!(again, reference);
+        });
+    }
+
+    /// Delegates to the Vulkan backend, refusing every `KvCache` allocation once `refuse` is set —
+    /// the VRAM guard turning down the snapshot's second copy of the recurrent state. There is no
+    /// knob that makes the real guard refuse a chosen allocation.
+    struct RefuseKv<'a> {
+        vk: &'a infr_vulkan::VulkanBackend,
+        refuse: std::sync::atomic::AtomicBool,
+        refused: std::sync::atomic::AtomicUsize,
+    }
+
+    impl infr_core::backend::Backend for RefuseKv<'_> {
+        fn name(&self) -> &str {
+            self.vk.name()
+        }
+        fn capabilities(&self) -> infr_core::backend::Capabilities {
+            self.vk.capabilities()
+        }
+        fn alloc(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            use std::sync::atomic::Ordering::Relaxed;
+            if self.refuse.load(Relaxed) && usage == infr_core::backend::BufferUsage::KvCache {
+                self.refused.fetch_add(1, Relaxed);
+                return Err(infr_core::error::Error::Backend(
+                    "test: VRAM budget exceeded".into(),
+                ));
+            }
+            self.vk.alloc(bytes, usage)
+        }
+        fn alloc_uninit(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            self.vk.alloc_uninit(bytes, usage)
+        }
+        fn upload(
+            &self,
+            dst: &dyn infr_core::backend::Buffer,
+            src: &[u8],
+        ) -> infr_core::error::Result<()> {
+            self.vk.upload(dst, src)
+        }
+        fn download(
+            &self,
+            src: &dyn infr_core::backend::Buffer,
+            dst: &mut [u8],
+        ) -> infr_core::error::Result<()> {
+            self.vk.download(src, dst)
+        }
+        fn device_alloc_room(&self) -> Option<u64> {
+            self.vk.device_alloc_room()
+        }
+        fn activation_peak(&self) -> Option<u64> {
+            self.vk.activation_peak()
+        }
+        fn copy_buffer(
+            &self,
+            src: &dyn infr_core::backend::Buffer,
+            dst: &dyn infr_core::backend::Buffer,
+            bytes: usize,
+        ) -> infr_core::error::Result<()> {
+            self.vk.copy_buffer(src, dst, bytes)
+        }
+        fn compile(
+            &self,
+            graph: &infr_core::graph::Graph,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Plan>> {
+            self.vk.compile(graph)
+        }
+        fn execute(
+            &self,
+            plan: &dyn infr_core::backend::Plan,
+            bindings: &infr_core::backend::Bindings,
+        ) -> infr_core::error::Result<()> {
+            self.vk.execute(plan, bindings)
+        }
+        fn execute_chain(
+            &self,
+            plan: &dyn infr_core::backend::Plan,
+            bindings: &infr_core::backend::Bindings,
+            n: usize,
+        ) -> infr_core::error::Result<Option<Vec<u32>>> {
+            self.vk.execute_chain(plan, bindings, n)
+        }
+        fn max_decode_chain(&self) -> usize {
+            self.vk.max_decode_chain()
+        }
+        fn sync(&self) -> infr_core::error::Result<()> {
+            self.vk.sync()
+        }
+        fn moe_paged(&self) -> bool {
+            self.vk.moe_paged()
+        }
+        fn dense_paged(&self) -> bool {
+            self.vk.dense_paged()
+        }
+    }
+
+    /// The prefill-boundary snapshot is best effort: when its allocation is refused the turn
+    /// still succeeds, the refusal is remembered rather than retried every turn, and a turn after
+    /// a stop mid-chain re-prefills from zero and is still correct.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn qwen35_refused_snapshot_is_best_effort_vulkan() {
+        use std::sync::atomic::Ordering::Relaxed;
+        with_q35_vulkan(|vk, run| {
+            let first = Q35_FIRST;
+            let second = [&first[..], &[7, 2]].concat();
+            let mut fresh = Vec::new();
+            run(vk, &second, 1, &mut None, None, Some(&mut fresh));
+
+            let be = RefuseKv {
+                vk,
+                refuse: false.into(),
+                refused: 0.into(),
+            };
+            // Allocate the slot's own state and cache first; refuse only what comes after.
+            let mut slot = None;
+            run(&be, &first, 1, &mut slot, None, None);
+            be.refuse.store(true, Relaxed);
+            let req = crate::sampling::RequestCtx::new(Default::default());
+            run(
+                &be,
+                &[&first[..], &[5]].concat(),
+                6,
+                &mut slot,
+                Some(&req),
+                None,
+            );
+            assert_eq!(
+                be.refused.load(Relaxed),
+                1,
+                "the snapshot was attempted once"
+            );
+            assert!(slot.as_ref().expect("slot").delta_snapshot_refused);
+
+            let mut after = Vec::new();
+            let stats = run(&be, &second, 1, &mut slot, None, Some(&mut after));
+            assert_eq!(
+                stats.n_cached, 0,
+                "no snapshot, so the state restarts from zero"
+            );
+            assert_eq!(after, fresh);
+
+            run(&be, &first, 6, &mut slot, None, None);
+            assert_eq!(
+                be.refused.load(Relaxed),
+                1,
+                "a refused snapshot is not retried"
+            );
+        });
+    }
+
+    /// A one-layer gemma3 whose only layer is sliding-window (`window` 8), every tensor f32.
+    fn gemma3_gguf() -> Vec<u8> {
+        let hd = Q35_NE / 2;
+        let t = |name: &str, shape: Vec<usize>, base: f32| (name.to_string(), shape, base);
+        let mut tensors = vec![
+            t("token_embd.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+            t("output_norm.weight", vec![Q35_NE], 0.0),
+        ];
+        for (name, shape, base) in [
+            ("attn_norm", vec![Q35_NE], 0.0),
+            ("attn_q", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_k", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_v", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_q_norm", vec![hd], 0.0),
+            ("attn_k_norm", vec![hd], 0.0),
+            ("attn_output", vec![2 * hd, Q35_NE], 0.0),
+            ("post_attention_norm", vec![Q35_NE], 0.0),
+            ("ffn_norm", vec![Q35_NE], 0.0),
+            ("ffn_gate", vec![Q35_NE, Q35_NFF], 0.0),
+            ("ffn_up", vec![Q35_NE, Q35_NFF], 0.0),
+            ("ffn_down", vec![Q35_NFF, Q35_NE], 0.0),
+            ("post_ffw_norm", vec![Q35_NE], 0.0),
+        ] {
+            tensors.push((format!("blk.0.{name}.weight"), shape, base));
+        }
+        let k = |key: &str, v: usize| (format!("gemma3.{key}"), v);
+        let u32_keys = [
+            k("block_count", 1),
+            k("context_length", 256),
+            k("embedding_length", Q35_NE),
+            k("feed_forward_length", Q35_NFF),
+            k("attention.head_count", 2),
+            k("attention.head_count_kv", 2),
+            k("attention.sliding_window", 8),
+        ];
+        synthetic_gguf("gemma3", &u32_keys, &tensors, &[])
+    }
+
+    /// The SWA ring keeps a position's row only until a position one ring length later is
+    /// written. A turn that rewinds and ends shorter than an earlier one leaves that earlier
+    /// turn's rows in the ring, so a later rewind judged against `cached.len()` would attend
+    /// rows that now hold other positions: its logits must still equal a fresh slot's.
+    #[test]
+    fn ring_rewind_after_a_shorter_turn_matches_a_fresh_slot() {
+        let (g, cfg) = open_synthetic("gemma3-ring", &gemma3_gguf());
+        assert!(cfg.is_swa_layer(0) && cfg.swa_window == 8);
+        let embd = std::sync::OnceLock::new();
+        let mut ec = EngineConfig::default();
+        // A ring of round64(window + ubatch) = 64 rows on the window layer.
+        ec.device.ubatch = Some(8);
+        const CTX: usize = 256;
+        let be = infr_cpu::CpuBackend::new();
+        let logits = |prompt: &[u32], state: &mut Option<SeamKv>| {
+            let mut out = Vec::new();
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                1,
+                |_| {},
+                state,
+                CTX,
+                None,
+                None,
+                None,
+                Some(&mut out),
+                None,
+                None,
+                None,
+            )
+            .expect("gemma3 synthetic generation");
+            out
+        };
+        let ids = |n: usize, salt: u32| -> Vec<u32> {
+            (0..n as u32)
+                .map(|i| (i * 7 + salt) % Q35_VOCAB as u32)
+                .collect()
+        };
+
+        // A writes positions 0..100, so rows 0..36 of the ring now hold positions 64..100.
+        let a = ids(100, 3);
+        // B rewinds to 50 (whose window rows A left intact) and ends at 60, shorter than A.
+        let b = [&a[..50], &ids(10, 5)[..]].concat();
+        // C is 42 tokens that all match B, so it rewinds to 41 (the last prompt token is always
+        // re-fed), and that token's window reaches back to positions 34..36, whose rows A
+        // recycled. (One layer, so only that token's own window matters.)
+        let c = [&a[..40], &ids(2, 11)[..]].concat();
+
+        let fresh = logits(&c, &mut None);
+        let mut slot = None;
+        logits(&a, &mut slot);
+        assert!(slot.as_ref().expect("slot initialized").kv_ring);
+        logits(&b, &mut slot);
+        let after = logits(&c, &mut slot);
+        assert_eq!(fresh.len(), Q35_VOCAB);
+        assert_eq!(
+            after, fresh,
+            "the rewind read ring rows an earlier, longer turn had recycled"
         );
     }
 }

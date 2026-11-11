@@ -292,6 +292,8 @@ pub struct OaiRenderer {
     gguf: infr_gguf::Gguf,
     tokenizer: tokenizers::Tokenizer,
     eos: u32,
+    /// Forced tool-call constraints, sharing one tokenizer environment across requests.
+    tools: crate::grammar::ToolConstrainer,
     /// The engine configuration this renderer was opened with — `infr-chat`'s renderer reads
     /// `sampling.no_think` / `debug.chat` off it. Held as the `Arc` the caller resolved in
     /// `main()`, borrowed at the render site (R6).
@@ -301,8 +303,19 @@ pub struct OaiRenderer {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl OaiRenderer {
     pub fn open(path: &std::path::Path, ecfg: std::sync::Arc<crate::EngineConfig>) -> Result<Self> {
+        Self::open_with_tokenizer(path, None, ecfg)
+    }
+
+    /// [`OaiRenderer::open`] for a model whose tokenizer is the `tokenizer.json` at
+    /// `tokenizer_path` — pass the same path the model was loaded with, so the rendered prompt and
+    /// the tool-call grammar use the vocabulary generation uses.
+    pub fn open_with_tokenizer(
+        path: &std::path::Path,
+        tokenizer_path: Option<&std::path::Path>,
+        ecfg: std::sync::Arc<crate::EngineConfig>,
+    ) -> Result<Self> {
         let gguf = infr_gguf::Gguf::open(path).map_err(|e| anyhow::anyhow!("open gguf: {e}"))?;
-        let tokenizer = crate::build_tokenizer(&gguf)?;
+        let tokenizer = crate::tokenizer::load_tokenizer(&gguf, tokenizer_path)?;
         // Raw metadata (NOT Config::from_gguf — that parser is dense-only and rejects qwen35).
         use infr_core::WeightSource;
         let eos = gguf
@@ -313,6 +326,7 @@ impl OaiRenderer {
             gguf,
             tokenizer,
             eos,
+            tools: crate::grammar::ToolConstrainer::default(),
             ecfg,
         })
     }
@@ -347,14 +361,15 @@ impl OaiRenderer {
     }
 
     /// Build the FORCED tool-call grammar constraint for this model's tokenizer (see
-    /// [`crate::grammar::tool_constraint_for`]); `None` for auto/none/absent tool_choice.
+    /// [`crate::grammar::ToolConstrainer`]); `None` for auto/none/absent tool_choice.
     pub fn tool_constraint(
         &self,
         tools: Option<&serde_json::Value>,
         tool_choice: Option<&str>,
     ) -> Result<Option<crate::grammar::Constraint>> {
         let vocab = self.tokenizer.get_vocab_size(true);
-        crate::grammar::tool_constraint_for(&self.tokenizer, vocab, &[self.eos], tools, tool_choice)
+        self.tools
+            .constraint(&self.tokenizer, vocab, &[self.eos], tools, tool_choice)
     }
 
     /// Detokenize ids (markers preserved) — the serve-side parse of a constrained tool-call body.

@@ -423,7 +423,7 @@ impl ParallelSeam {
         // in the runner.
         let budget = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         // Resolve `ubatch_rows`/`kv_auto_q8` against THIS engine's pins for the decode (warm calls
         // must agree with the buffers placement sized). Concurrent requests share the one cell.
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());

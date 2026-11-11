@@ -54,11 +54,26 @@ struct Cursor {
 
 impl Cursor {
     fn find(&mut self, raw: &str, needle: &str) -> Option<usize> {
-        if self.off.is_some() {
-            return self.off;
+        self.find_from(raw, needle, 0)
+    }
+
+    /// [`Cursor::find`] for hits at or after `from` only. A cached hit below `from` is dropped and
+    /// the search resumes at `from`: latching it would answer "no hit" forever after, which is how a
+    /// `<tool_call>` quoted in the reasoning hid the real call in the content region.
+    fn find_from(&mut self, raw: &str, needle: &str, from: usize) -> Option<usize> {
+        match self.off {
+            Some(p) if p >= from => return Some(p),
+            Some(_) => {
+                self.off = None;
+                self.scanned = from;
+            }
+            None => {}
         }
-        let mut start = self.scanned.saturating_sub(needle.len().saturating_sub(1));
-        while start > 0 && !raw.is_char_boundary(start) {
+        let mut start = self
+            .scanned
+            .saturating_sub(needle.len().saturating_sub(1))
+            .max(from);
+        while start > from && !raw.is_char_boundary(start) {
             start -= 1;
         }
         if let Some(p) = raw[start..].find(needle) {
@@ -92,7 +107,15 @@ impl ChatStream {
     pub fn finish(&mut self, on_delta: &mut dyn FnMut(Delta)) {
         self.emit(true, on_delta); // flush the held-back tails (no marker can still be forming)
         if self.allow_tools {
-            let (_r, body) = crate::split_think(&self.raw);
+            // The format is decided by the rule streaming uses ([`channel_thought_head`]), so a
+            // call fires here only from the region streaming held back as one: after `<channel|>`
+            // for channel output — a call quoted in its thought block is reasoning — and outside
+            // `<think>` otherwise, even when that content merely mentions a channel marker.
+            let body = if channel_thought_head(&self.raw).is_some() {
+                crate::split_channels(&self.raw).1
+            } else {
+                crate::split_think(&self.raw).1
+            };
             // Dialect-aware: hermes JSON + qwen3.5/3.6 XML + gemma pipe-marker + llama3 bare JSON
             // (hermes-only here silently dropped every non-qwen3 model's calls over serve).
             let (_content, calls) = crate::parse_any_tool_calls(&body);
@@ -117,8 +140,8 @@ impl ChatStream {
         }
         const TL: &str = "<tool_call>";
         const PIPE: &str = "<|tool_call>";
-        let hermes = self.cur_tool.find(&self.raw, TL).filter(|&p| p >= cs);
-        let pipe = self.cur_pipe.find(&self.raw, PIPE).filter(|&p| p >= cs);
+        let hermes = self.cur_tool.find_from(&self.raw, TL, cs);
+        let pipe = self.cur_pipe.find_from(&self.raw, PIPE, cs);
         let bare = self.bare_json_open(cs, final_flush);
         [hermes, pipe, bare].into_iter().flatten().min()
     }
@@ -150,12 +173,8 @@ impl ChatStream {
         // Channel-format head (E2B/gpt-oss: `<|channel>thought…<channel|>answer`): reasoning runs
         // from after the thought marker to the final-answer marker, content after it. While the
         // head could still be a forming marker, hold everything back.
-        const CT: [&str; 2] = ["<|channel|>thought", "<|channel>thought"];
         const FINAL: &str = "<channel|>";
-        if let Some(hm) = CT
-            .iter()
-            .find_map(|m| self.raw.starts_with(m).then_some(m.len()))
-        {
+        if let Some(hm) = channel_thought_head(&self.raw) {
             let (r_end, hold, c_start) = match self.cur_final.find(&self.raw, FINAL) {
                 Some(f) => (f, false, Some(f + FINAL.len())),
                 None => (self.raw.len(), !final_flush, None),
@@ -180,11 +199,11 @@ impl ChatStream {
             return;
         }
         if !final_flush
-            && CT.iter().any(|m| {
+            && CHANNEL_THOUGHT.iter().any(|m| {
                 m.as_bytes()
                     .starts_with(&self.raw.as_bytes()[..self.raw.len().min(m.len())])
             })
-            && self.raw.len() < CT[0].len()
+            && self.raw.len() < CHANNEL_THOUGHT[0].len()
         {
             return; // head could still become a channel marker — hold
         }
@@ -223,6 +242,19 @@ impl ChatStream {
             );
         }
     }
+}
+
+/// The heads that put a reply in the channel format (E2B/gpt-oss): reasoning after the thought
+/// marker, the answer after `<channel|>`.
+const CHANNEL_THOUGHT: [&str; 2] = ["<|channel|>thought", "<|channel>thought"];
+
+/// The length of the channel-format head `raw` starts with, or `None` for any other reply. THE test
+/// for "this reply is in the channel format": streaming and [`ChatStream::finish`] both use it, so
+/// they cannot disagree about where the content — and so a tool call — can be.
+fn channel_thought_head(raw: &str) -> Option<usize> {
+    CHANNEL_THOUGHT
+        .iter()
+        .find_map(|m| raw.starts_with(m).then_some(m.len()))
 }
 
 /// Emit the not-yet-sent slice of `raw[region_start .. region_end]` (past `*sent` bytes), holding back
@@ -409,6 +441,65 @@ mod chat_stream_tests {
         assert!(t.is_empty(), "stray brace misparsed as tool call: {t:?}");
         assert!(c.contains("The config is"), "content lost: {c:?}");
         assert!(c.contains("whole story"), "content truncated: {c:?}");
+    }
+
+    /// A `<tool_call>` mentioned inside the reasoning must not hide the real call that follows in
+    /// the content: the real one is buffered (not streamed as raw markup) and fires exactly once.
+    #[test]
+    fn tool_marker_in_reasoning_does_not_hide_the_real_call() {
+        let call = "<tool_call>\n{\"name\": \"run_bash\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>";
+        for pipe in [false, true] {
+            let (mention, real) = if pipe {
+                (
+                    "I could emit <|tool_call> here",
+                    "<|tool_call>call:run_bash{command:<|\"|>ls<|\"|>}<tool_call|>",
+                )
+            } else {
+                ("I could emit <tool_call> here", call)
+            };
+            let pieces = ["<think>", mention, "</think>", "Sure. ", real];
+            let (_r, c, t) = run(&pieces, true);
+            assert!(
+                !c.contains("run_bash"),
+                "the call streamed as content: {c:?}"
+            );
+            assert_eq!(t.len(), 1, "expected exactly one tool call, got {t:?}");
+            assert_eq!(t[0].0, "run_bash");
+        }
+    }
+
+    /// A call quoted inside a channel-format thought block is reasoning, not a call: the stream
+    /// never treats it as one, and `finish` must not either.
+    #[test]
+    fn tool_call_in_channel_reasoning_is_not_a_call() {
+        let (r, c, t) = run(
+            &[
+                "<|channel>thought\nmaybe <|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}",
+                "<tool_call|> but no<channel|>It is sunny.",
+            ],
+            true,
+        );
+        assert!(r.contains("maybe"), "reasoning lost: {r:?}");
+        assert_eq!(c.trim(), "It is sunny.");
+        assert!(t.is_empty(), "a call quoted in the reasoning fired: {t:?}");
+    }
+
+    /// A `<think>`-format reply whose content merely mentions a channel marker is still a
+    /// `<think>`-format reply: the call streaming held back must fire at `finish`, not vanish into
+    /// an empty channel-format body.
+    #[test]
+    fn a_quoted_channel_marker_does_not_switch_formats() {
+        let (_r, c, t) = run(
+            &[
+                "<think>plan</think>",
+                "The <|channel> marker is how E2B splits. ",
+                "<tool_call>\n{\"name\": \"run_bash\", \"arguments\": {\"command\": \"ls\"}}\n</tool_call>",
+            ],
+            true,
+        );
+        assert!(c.contains("<|channel> marker"), "content lost: {c:?}");
+        assert_eq!(t.len(), 1, "expected exactly one tool call, got {t:?}");
+        assert_eq!(t[0].0, "run_bash");
     }
 
     #[test]

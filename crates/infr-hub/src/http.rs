@@ -76,7 +76,14 @@ fn shared(
 /// The HuggingFace access token, for gated/private repos. `HF_TOKEN` is HuggingFace's own spelling,
 /// shared with `huggingface_hub` and llama.cpp — not an `INFR_*` knob, so it is not configuration.
 pub(crate) fn token() -> Option<String> {
-    std::env::var("HF_TOKEN").ok()
+    usable_token(std::env::var("HF_TOKEN").ok())
+}
+
+/// An unset and an EMPTY `HF_TOKEN` both mean "no token". Docker and CI env files routinely carry
+/// `HF_TOKEN=`; sending that as `Authorization: Bearer ` can draw a 401 on a public repo. What is
+/// sent is the trimmed value, since a trailing newline or space from such a file is not part of it.
+fn usable_token(raw: Option<String>) -> Option<String> {
+    raw.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
 /// The pull's whole allowance of simultaneous body transfers, handed out one permit per connection.
@@ -172,6 +179,21 @@ mod tests {
         assert!(b.try_acquire().is_some());
         drop(held);
         assert_eq!(b.available(), 3, "permits must return when dropped");
+    }
+
+    /// `HF_TOKEN=` is no token at all, not an empty bearer credential, and surrounding whitespace
+    /// is not sent.
+    #[test]
+    fn an_empty_token_is_no_token() {
+        assert_eq!(usable_token(None), None);
+        assert_eq!(usable_token(Some(String::new())), None);
+        assert_eq!(usable_token(Some("  ".into())), None);
+        // The value sent is the trimmed one: a trailing newline from an env file is not part of
+        // the token.
+        assert_eq!(
+            usable_token(Some(" hf_x\n".into())).as_deref(),
+            Some("hf_x")
+        );
     }
 
     /// `hub.pull_jobs = 0`/`1` leave nothing over for range workers, which is what keeps those

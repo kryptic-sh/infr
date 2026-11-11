@@ -279,15 +279,18 @@ fn reconcile(
         (Some(had), Some(now)) if !had.eq_ignore_ascii_case(now) => {
             return Err(format!("the LFS sha256 changed ({had} → {now})"));
         }
-        // No oid on either side to compare: fall back to the opaque validator, which is weaker (an
-        // edge that reports a different one costs a restart) but is all a non-LFS object has.
-        (None, None) => match (plan.validator.as_deref(), probe.validator.as_deref()) {
+        (Some(_), Some(_)) => {}
+        // No oid on one side or both, so the oids cannot be compared: fall back to the opaque
+        // validator, which is weaker (an edge that reports a different one costs a restart) but is
+        // all there is. Skipping it when only ONE side lacks an oid — a partial planned while the
+        // HEAD worked, resumed in a run where it reports none — left the resume with no identity
+        // check, and that run's missing oid means no sha256 gate at the end either.
+        _ => match (plan.validator.as_deref(), probe.validator.as_deref()) {
             (Some(had), Some(now)) if had != now => {
                 return Err(format!("the validator changed ({had} → {now})"));
             }
             _ => {}
         },
-        _ => {}
     }
     if plan.oid.is_none() {
         plan.oid = expected_sha.map(str::to_string);
@@ -650,6 +653,23 @@ mod tests {
             Some("\"v2\""),
             "validator refreshed"
         );
+    }
+
+    /// An oid on only one side cannot be compared, so the validator decides there too. A partial
+    /// planned with an oid and resumed in a run that has none would otherwise continue with no
+    /// identity check at all, and that run has no digest left to verify the blob against.
+    #[test]
+    fn the_validator_decides_when_one_side_has_no_oid() {
+        let sha = "e".repeat(64);
+        let hashed = Plan::fresh(1000, 100, Some(sha.clone()), Some("\"v1\"".into()));
+        let err = reconcile(Some(hashed), &probe_of(1000, "\"v2\""), None)
+            .expect_err("a changed validator must not resume when this run has no oid");
+        assert!(err.contains("validator changed"), "{err}");
+
+        let unhashed = Plan::fresh(1000, 100, None, Some("\"v1\"".into()));
+        let err = reconcile(Some(unhashed), &probe_of(1000, "\"v2\""), Some(&sha))
+            .expect_err("a changed validator must not resume a partial planned without an oid");
+        assert!(err.contains("validator changed"), "{err}");
     }
 
     /// A fresh plan takes its whole shape from the probe.

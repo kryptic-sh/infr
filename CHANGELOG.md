@@ -26,8 +26,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   clients written against llama.cpp. `max_tokens: -1` therefore takes the
   server's default budget; it does not mean "until the context is full".
 
+### Changed
+
+- **Tokenization now follows llama.cpp for more models, so their prompt token
+  ids change.** Llama 3 (`llama-bpe` and its aliases) and Qwen3.5 / Qwen3.6
+  (`qwen35`) GGUFs were split with the GPT-2 regex; they now use their own, and
+  Llama 3 also ignores merges for whole-vocabulary words. Runs of spaces
+  (indented code) in a SentencePiece-style GGUF without a `tokenizer.json` now
+  reach the multi-space tokens. Several more `tokenizer.ggml.pre` names are
+  mapped, and an unknown one logs a warning instead of silently getting the
+  GPT-2 regex. Qwen3 and Gemma 3 prompts are unchanged.
+- **Generation stops on more end-of-turn tokens.** The stop set was the declared
+  EOS plus three fixed names; it now follows llama.cpp's list (`<end_of_turn>`,
+  `<|end|>`, `<|eom_id|>`, `<turn|>` and the rest) and the GGUF's `eot` / `eom`
+  ids. A listed name counts only where the vocabulary marks it as a control or
+  user-defined token, so a literal `</s>` in a Qwen reply still prints.
+- **`infr pull` refuses a model file it cannot verify.** If the request that
+  fetches a file's sha256 keeps failing, the pull stops instead of downloading
+  unchecked; a definitive answer (401, 403, 404) fails at once and says why. An
+  empty `HF_TOKEN=` is treated as unset.
+- **A `tokenizer.json` beside the GGUF that does not match the model's
+  vocabulary now logs a warning.** It is still used.
+
+### Removed
+
+- **`infr_llama::grammar::tool_constraint_for`.** `ToolConstrainer`, which
+  `OaiRenderer` holds, does the same and builds the grammar tokenizer once per
+  model instead of once per request.
+
 ### Fixed
 
+- **Streaming no longer re-decodes the whole reply for every token.** Output is
+  byte-identical; the work per token no longer grows with the reply's length.
+- **A tool call quoted inside a model's reasoning is no longer run as a call,
+  and no longer hides the real call from the stream.**
 - **`infr serve`: `usage.prompt_tokens` counts the whole prompt.** It reported
   only the tokens prefilled for this request, so a KV prefix cache hit made a
   long prompt look short. `/metrics` still counts prefilled tokens only.

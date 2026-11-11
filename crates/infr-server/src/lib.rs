@@ -495,17 +495,18 @@ const TOOL_CHOICE_POLICIES: [&str; 3] = ["auto", "none", "required"];
 /// [`tool_choice_str`] cannot do on its own — it never sees `tools`.
 ///
 /// Two holes this closes, both of which used to produce ordinary unconstrained assistant text
-/// (backlog B22). `tool_constraint_for` returns `Ok(None)` the moment `tools` is absent, without
-/// ever looking at `tool_choice`, and `run_chat` reads that `None` as "no constraint wanted":
+/// (backlog B22). `OaiRenderer::tool_constraint` returns `Ok(None)` the moment `tools` is absent,
+/// without ever looking at `tool_choice`, and `run_chat` reads that `None` as "no constraint
+/// wanted":
 ///
 /// - **A forced choice with no `tools`.** `"tool_choice":"required"` and no tools is a request the
 ///   server cannot honour — there is nothing to call — so it is a 400 rather than a silent
 ///   downgrade to free text. `"none"` is exempt: it asks for no tool call, which is satisfiable
 ///   with no tools, and `"auto"` means "your discretion".
 /// - **A name that is not in `tools`.** A misspelled function name reached the generator as a
-///   forced choice and then vanished. With `tools` present it is worse than nothing: the filter in
-///   `tool_constraint_for` yields an empty array and `forced_tool_call_grammar` builds
-///   `{"anyOf": []}`, a grammar that matches no output at all.
+///   forced choice and then vanished. With `tools` present it is worse than nothing: the name
+///   filter behind `OaiRenderer::tool_constraint` yields an empty array and
+///   `forced_tool_call_grammar` builds `{"anyOf": []}`, a grammar that matches no output at all.
 ///
 /// Same policy as the existing malformed-object 400s: a forced tool call the server cannot deliver
 /// is an error, never a quiet fallback to "auto" (audit finding 6).
@@ -3252,7 +3253,7 @@ mod tests {
 
     /// B22: a forced `tool_choice` the server cannot honour is a 400, not free text.
     ///
-    /// `tool_constraint_for` returns `None` as soon as `tools` is absent — without reading
+    /// `OaiRenderer::tool_constraint` returns `None` as soon as `tools` is absent — without reading
     /// `tool_choice` at all — and `run_chat` treats that as "generate normally". So every case
     /// below used to produce ordinary assistant text while the client believed it had forced a
     /// call.

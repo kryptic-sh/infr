@@ -392,11 +392,8 @@ impl SeamModel {
     ) -> Result<Self> {
         let g = Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?;
         let mut cfg = Config::from_gguf(&g)?;
-        let tokenizer = match tokenizer_path {
-            Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,
-            None => build_tokenizer(&g)?,
-        };
-        add_chat_eos(&mut cfg, &tokenizer);
+        let tokenizer = crate::tokenizer::load_tokenizer(&g, tokenizer_path)?;
+        add_chat_eos(&mut cfg, &tokenizer, infr_core::WeightSource::metadata(&g));
         // `token_embd.weight` is NOT dequantized here — see the field's doc. `Config::from_gguf`
         // above already read its shape, so a model missing the tensor still fails at load, not on
         // the lazy path below.
@@ -814,7 +811,7 @@ impl SeamModel {
     ) -> Result<crate::GenStats> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let slot = session
             .pool
             .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
@@ -1507,7 +1504,7 @@ impl SeamModel {
     ) -> Result<crate::GenStats> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let slot = session
             .pool
             .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
@@ -1545,7 +1542,7 @@ impl SeamModel {
         let mtl = infr_metal::MetalBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("metal init: {e}"))?;
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let (_generated, stats) = crate::seam::generate_dense_metal(
             &mtl,
             &self.gguf,
@@ -1623,7 +1620,7 @@ impl SeamModel {
         // verify forwards are only for the small k+1 suffixes.
         let t0 = std::time::Instant::now();
         let mut acc_buf: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let (first, _stats) = crate::seam::generate_dense_metal_session(
             &session.be,
             &self.gguf,
@@ -1868,7 +1865,7 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         // Stream each generated token: incrementally detokenize and emit the new suffix.
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
             infr_cpu::CpuBackend::new_with(self.ecfg.clone()),
             &self.gguf,
@@ -1900,7 +1897,7 @@ impl SeamModel {
     ) -> Result<crate::GenStats> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
             infr_cpu::CpuBackend::reference_with(self.ecfg.clone()),
             &self.gguf,

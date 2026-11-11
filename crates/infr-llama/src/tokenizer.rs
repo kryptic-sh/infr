@@ -1,7 +1,8 @@
-//! GGUF-embedded tokenizer construction (byte-level BPE + SentencePiece).
-//! Mechanically split out of `lib.rs` (no logic change).
+//! GGUF-embedded tokenizer construction (byte-level BPE + SentencePiece), and the one loader that
+//! picks between it and a `tokenizer.json` sidecar ([`load_tokenizer`]).
 use crate::{
-    DEEPSEEK_CODER_PRE_RES, DEEPSEEK_LLM_PRE_RES, DEEPSEEK_V3_PRE_RES, LLAMA4_PRE_RE, QWEN2_PRE_RE,
+    DEEPSEEK_CODER_PRE_RES, DEEPSEEK_LLM_PRE_RES, DEEPSEEK_V3_PRE_RES, LLAMA3_PRE_RE,
+    LLAMA4_PRE_RE, QWEN2_PRE_RE, QWEN35_PRE_RE,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use infr_core::loader::{MetaValue, Metadata};
@@ -88,13 +89,91 @@ fn register_token_types(md: &Metadata, toks: &[MetaValue], tok: &mut Tokenizer) 
 /// atomically. SentencePiece (`model == "llama"`) isn't built here — pass a `tokenizer.json`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
-    let md = g.metadata();
+    tokenizer_from_metadata(g.metadata())
+}
+
+/// About how many GGUF token ids [`sidecar_mismatches`] compares with a `tokenizer.json`.
+const SIDECAR_CHECK_SAMPLES: usize = 64;
+
+/// The model's tokenizer: the `tokenizer.json` at `sidecar` when the caller found one beside the
+/// GGUF, else the one embedded in the GGUF. Every consumer of one model — generation, the chat
+/// renderer, the tool-call grammar — loads through here, so they cannot disagree on the vocabulary.
+pub(crate) fn load_tokenizer(g: &Gguf, sidecar: Option<&std::path::Path>) -> Result<Tokenizer> {
+    let Some(path) = sidecar else {
+        return build_tokenizer(g);
+    };
+    let tok = Tokenizer::from_file(path).map_err(|e| anyhow!("load tokenizer: {e}"))?;
+    check_sidecar(g.metadata(), &tok, path);
+    Ok(tok)
+}
+
+/// Warn when a sidecar does not spell the GGUF's own vocabulary. A `tokenizer.json` is adopted
+/// from the GGUF's directory with nothing tying it to this model, so a stray one in a folder of
+/// several models encodes every prompt with the wrong ids and the output is garbage with no error.
+/// It is a warning, not a refusal: a sidecar is also how a model the embedded tokenizer gets wrong
+/// is made to work, and that must keep working.
+fn check_sidecar(md: &Metadata, sidecar: &Tokenizer, path: &std::path::Path) {
+    let (checked, bad) = sidecar_mismatches(md, sidecar);
+    if checked == 0 {
+        tracing::warn!(
+            "{}: cannot be checked against the GGUF's vocabulary (no token ids in common); \
+             using it unverified",
+            path.display()
+        );
+    } else if let Some((id, gguf, side)) = bad.first() {
+        tracing::warn!(
+            "{}: disagrees with the GGUF's vocabulary on {} of {checked} sampled token ids \
+             (id {id}: GGUF {gguf:?}, tokenizer.json {side:?}); it may belong to another model. \
+             Remove it to use the GGUF's embedded tokenizer.",
+            path.display(),
+            bad.len(),
+        );
+    }
+}
+
+/// Compare a sample of the GGUF's token ids, spread over the ids both vocabularies have, with the
+/// sidecar's spelling of the same ids. Returns how many were compared and the ones that differ
+/// as `(id, GGUF text, sidecar text)`.
+///
+/// What it does NOT detect: a different vocabulary that spells every sampled id the same — one
+/// that extends or truncates the model's own (the sizes are deliberately not compared, since a
+/// GGUF may pad its vocabulary), or one that differs only at ids between the samples. It also says
+/// nothing about the sidecar's pre-tokenizer or merges, which change ids without changing the
+/// vocabulary.
+fn sidecar_mismatches(md: &Metadata, sidecar: &Tokenizer) -> (usize, Vec<(u32, String, String)>) {
+    let toks = md
+        .get("tokenizer.ggml.tokens")
+        .and_then(MetaValue::as_arr)
+        .unwrap_or(&[]);
+    let n = toks.len().min(sidecar.get_vocab_size(true));
+    if n == 0 {
+        return (0, Vec::new());
+    }
+    let step = n.div_ceil(SIDECAR_CHECK_SAMPLES);
+    let mut bad = Vec::new();
+    let mut ids: Vec<usize> = (0..n).step_by(step).collect();
+    if ids.last() != Some(&(n - 1)) {
+        ids.push(n - 1);
+    }
+    for &i in &ids {
+        let gguf = toks[i].as_str().unwrap_or("");
+        let side = sidecar.id_to_token(i as u32).unwrap_or_default();
+        if gguf != side {
+            bad.push((i as u32, gguf.to_string(), side));
+        }
+    }
+    (ids.len(), bad)
+}
+
+/// [`build_tokenizer`] over the metadata alone, so a test can describe a vocabulary without
+/// writing a GGUF file.
+pub(crate) fn tokenizer_from_metadata(md: &Metadata) -> Result<Tokenizer> {
     let model = md.str("tokenizer.ggml.model").unwrap_or("");
     match model {
         "gpt2" => {}
         // SentencePiece (llama/gemma3/gemma4): a byte-fallback BPE with a Metaspace (▁) word-boundary
         // scheme. gemma4 ships explicit merges; llama/gemma3 reconstruct them from the token scores.
-        "llama" | "gemma4" => return build_spm_tokenizer(g),
+        "llama" | "gemma4" => return build_spm_tokenizer(md),
         other => bail!(
             "can't derive a tokenizer from tokenizer.ggml.model={other:?} \
              (only gpt2 BPE / llama SPM); pass a tokenizer.json sidecar instead"
@@ -114,8 +193,24 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
             .and_then(MetaValue::as_arr)
             .context("gguf missing tokenizer.ggml.merges")?,
     );
+    let pre = md.str("tokenizer.ggml.pre").unwrap_or("default");
+    // llama.cpp's `LLAMA3` pre-type names (`llama_vocab::impl::load`), which also turn on
+    // `ignore_merges`: a pre-token that is itself a vocabulary entry is emitted whole.
+    let llama3 = matches!(
+        pre,
+        "llama3"
+            | "llama-v3"
+            | "llama-bpe"
+            | "falcon3"
+            | "falcon-h1"
+            | "pixtral"
+            | "midm-2.0"
+            | "lfm2"
+            | "jina-v5-nano"
+    );
     let bpe = BPE::builder()
         .vocab_and_merges(vocab, merges)
+        .ignore_merges(llama3)
         .build()
         .map_err(|e| anyhow!("build bpe: {e}"))?;
     let mut tok = Tokenizer::new(bpe);
@@ -123,9 +218,8 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
         md.get("tokenizer.ggml.add_space_prefix"),
         Some(MetaValue::Bool(true))
     );
-    let pre = md.str("tokenizer.ggml.pre").unwrap_or("default");
-    // qwen2/llama4 both split on a SINGLE regex before ByteLevel (matching HF); only the pattern
-    // differs. DeepSeek pre-types apply a LIST of successive Split pre-tokenizers (see §0.2 of
+    // The qwen2/qwen35/llama3/llama4 families split on a SINGLE regex before ByteLevel (matching
+    // HF); only the pattern differs. DeepSeek pre-types apply a LIST of successive Split pre-tokenizers (see §0.2 of
     // docs/deepseek.md, and [`build_multi_split_seq`] for the token-id evidence that N successive
     // Isolated splits reproduce llama.cpp's sequential application).
     // The sequences below follow llama.cpp's `src/llama-vocab.cpp` verbatim.
@@ -150,26 +244,40 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
             let seq = build_multi_split_seq(DEEPSEEK_V3_PRE_RES.as_slice())?;
             tok.with_pre_tokenizer(Some(seq));
         }
-        "qwen2" | "llama4" => {
-            let re = if pre == "qwen2" {
-                QWEN2_PRE_RE
-            } else {
-                LLAMA4_PRE_RE
+        // Grouped by the regex llama.cpp's `llm_tokenizer_bpe` gives each pre-type. QWEN2's arm
+        // also serves its `STABLELM2`, `HUNYUAN` and `SOLAR_OPEN`; GPT-4o's (= `LLAMA4_PRE_RE`) its
+        // `MINIMAX_M2`.
+        "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "megrez" | "stablelm2" | "hunyuan"
+        | "solar-open" | "qwen35" | "llama4" | "gpt-4o" | "kanana2" | "talkie" | "minimax-m2" => {
+            let re = match pre {
+                "qwen35" => QWEN35_PRE_RE,
+                "llama4" | "gpt-4o" | "kanana2" | "talkie" | "minimax-m2" => LLAMA4_PRE_RE,
+                _ => QWEN2_PRE_RE,
             };
-            // Sequence[ Split(pre regex, Isolated), ByteLevel(use_regex=false) ] — matches HF.
-            let split = Split::new(
-                SplitPattern::Regex(re.to_string()),
-                SplitDelimiterBehavior::Isolated,
-                false,
-            )
-            .map_err(|e| anyhow!("split pretokenizer: {e}"))?;
-            let seq = PreSequence::new(vec![
-                PreTokenizerWrapper::Split(split),
-                PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
-            ]);
-            tok.with_pre_tokenizer(Some(seq));
+            single_split_byte_level(&mut tok, re)?;
         }
-        _ => {
+        // `DBRX`, `SMAUG` and `CHATGLM4` split with the Llama-3 regex but, unlike `LLAMA3`, keep
+        // the merges for every pre-token (no `ignore_merges`).
+        _ if llama3 => single_split_byte_level(&mut tok, LLAMA3_PRE_RE)?,
+        "dbrx" | "smaug-bpe" | "glm4" | "chatglm-bpe" => {
+            single_split_byte_level(&mut tok, LLAMA3_PRE_RE)?
+        }
+        // The pre-types llama.cpp splits with the GPT-2 regex itself (its `GPT2`, `MPT`, `OLMO`,
+        // `JAIS`, `TRILLION` and `GRANITE_DOCLING` pre-types), which is what ByteLevel applies.
+        "gpt-2" | "phi-2" | "jina-es" | "jina-de" | "gigachat" | "jina-v2-es" | "jina-v2-de"
+        | "a.x-4.0" | "mellum" | "modern-bert" | "jina-v1-en" | "jina-v2-code" | "roberta-bpe"
+        | "exaone4" | "mpt" | "olmo" | "jais" | "trillion" | "granite-docling" => {
+            tok.with_pre_tokenizer(Some(ByteLevel::new(add_prefix, true, true)));
+        }
+        // llama.cpp refuses a pre-type it does not know, and splits its `default` with a regex
+        // list of its own. Either way the GPT-2 regex is a guess that can give different ids from
+        // the reference, so say so instead of tokenizing differently in silence.
+        other => {
+            tracing::warn!(
+                "tokenizer.ggml.pre = {other:?} has no pre-tokenizer mapping here; using the \
+                 GPT-2 regex, so token ids may differ from llama.cpp's. Place the model's \
+                 tokenizer.json beside the GGUF to tokenize exactly."
+            );
             tok.with_pre_tokenizer(Some(ByteLevel::new(add_prefix, true, true)));
         }
     }
@@ -178,6 +286,23 @@ pub(crate) fn build_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     // added tokens — see [`register_token_types`].
     register_token_types(md, toks, &mut tok);
     Ok(tok)
+}
+
+/// Install `Sequence[ Split(re, Isolated), ByteLevel(use_regex=false) ]` — one pre-split regex
+/// ahead of the byte mapping, which is how HF's `tokenizer.json` spells it.
+fn single_split_byte_level(tok: &mut Tokenizer, re: &str) -> Result<()> {
+    let split = Split::new(
+        SplitPattern::Regex(re.to_string()),
+        SplitDelimiterBehavior::Isolated,
+        false,
+    )
+    .map_err(|e| anyhow!("split pretokenizer: {e}"))?;
+    let seq = PreSequence::new(vec![
+        PreTokenizerWrapper::Split(split),
+        PreTokenizerWrapper::ByteLevel(ByteLevel::new(false, false, false)),
+    ]);
+    tok.with_pre_tokenizer(Some(seq));
+    Ok(())
 }
 
 /// The global ordering of reconstructed SPM merge candidates, keyed by `(score, id_l, id_r)`:
@@ -236,8 +361,7 @@ fn build_multi_split_seq(patterns: &[&str]) -> Result<PreSequence> {
 /// (type 3, e.g. `<bos>`/`<start_of_turn>`) register as special so they encode atomically. The
 /// Metaspace replacement (▁) maps spaces; `add_space_prefix` controls the leading dummy space.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
-    let md = g.metadata();
+fn build_spm_tokenizer(md: &Metadata) -> Result<Tokenizer> {
     let toks = md
         .get("tokenizer.ggml.tokens")
         .and_then(MetaValue::as_arr)
@@ -298,7 +422,9 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
         .map_err(|e| anyhow!("build spm bpe: {e}"))?;
     let mut tok = Tokenizer::new(bpe);
     // SPM: spaces → ▁. add_space_prefix=true prepends a dummy ▁ (PrependScheme::First); gemma3
-    // sets it false. `split` keeps Metaspace's word splitting on the replacement char.
+    // sets it false. `split` stays OFF: llama.cpp merges over the whole escaped text
+    // (`llm_tokenizer_spm_session::tokenize`; gemma4 splits only at newline runs), and splitting at
+    // every ▁ would make whitespace-run pieces (`▁▁`, `▁▁▁▁`) unreachable.
     let add_prefix = matches!(
         md.get("tokenizer.ggml.add_space_prefix"),
         Some(MetaValue::Bool(true))
@@ -308,7 +434,7 @@ pub(crate) fn build_spm_tokenizer(g: &Gguf) -> Result<Tokenizer> {
     } else {
         PrependScheme::Never
     };
-    tok.with_pre_tokenizer(Some(Metaspace::new('▁', scheme, true)));
+    tok.with_pre_tokenizer(Some(Metaspace::new('▁', scheme, false)));
     // Decode: reassemble byte-fallback bytes, fuse, then map ▁→space (Metaspace decoder).
     let dec = DecoderSequence::new(vec![
         DecoderWrapper::ByteFallback(ByteFallback::default()),
@@ -511,6 +637,152 @@ mod tokenizer_tests {
             finite.windows(2).all(|w| w[0] >= w[1]),
             "finite scores must stay descending: {finite:?}"
         );
+    }
+
+    /// Tokenizer metadata for a synthetic vocabulary: `model`, `tokens`, and whatever else `extra`
+    /// adds — enough for [`tokenizer_from_metadata`] without a GGUF file.
+    fn vocab_md(model: &str, tokens: &[&str], extra: Vec<(&str, MetaValue)>) -> Metadata {
+        let mut md = Metadata::default();
+        md.kv
+            .insert("tokenizer.ggml.model".into(), MetaValue::Str(model.into()));
+        md.kv
+            .insert("tokenizer.ggml.tokens".into(), str_arr(tokens));
+        for (k, v) in extra {
+            md.kv.insert(k.into(), v);
+        }
+        md
+    }
+
+    fn str_arr(v: &[&str]) -> MetaValue {
+        MetaValue::Arr(v.iter().map(|t| MetaValue::Str(t.to_string())).collect())
+    }
+
+    /// A run of spaces reaches the vocabulary's whitespace-run pieces, as llama.cpp's SPM tokenizer
+    /// (`llm_tokenizer_spm_session::tokenize`, run over the whole escaped text) and its gemma4 BPE
+    /// path both do. With Metaspace's `split` on, every `▁` became its own pre-token first, so
+    /// `▁▁▁▁` could never be produced and indented text got one id per space. Checked against
+    /// llama.cpp's `ggml-vocab-gemma-4.gguf` / `ggml-vocab-llama-spm.gguf` fixtures, whose
+    /// multi-space rows went from mismatching to matching with this change.
+    #[test]
+    fn spm_space_runs_reach_multi_space_pieces() {
+        let tokens = ["<unk>", "▁", "▁▁", "▁▁▁▁", "a"];
+        // llama/gemma3 rebuild their merges from the scores; gemma4 ships them.
+        let scored = vocab_md(
+            "llama",
+            &tokens,
+            vec![(
+                "tokenizer.ggml.scores",
+                MetaValue::Arr([0.0, -1.0, -2.0, -3.0, -1.0].map(MetaValue::F64).to_vec()),
+            )],
+        );
+        let merged = vocab_md(
+            "gemma4",
+            &tokens,
+            vec![("tokenizer.ggml.merges", str_arr(&["▁ ▁", "▁▁ ▁▁"]))],
+        );
+        for md in [scored, merged] {
+            let tok = tokenizer_from_metadata(&md).expect("synthetic SPM vocab");
+            let ids = tok.encode("    a", false).unwrap().get_ids().to_vec();
+            assert_eq!(ids, [3, 4], "{:?}", md.str("tokenizer.ggml.model"));
+        }
+    }
+
+    /// The pre-split chunks `pre` produces for `text` on a byte-level BPE vocabulary, as slices of
+    /// the original text (see [`pre_chunks`] for why offsets rather than the chunk strings).
+    fn bpe_pre_chunks(pre: &str, text: &str) -> Vec<String> {
+        use tokenizers::{OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer};
+        let md = vocab_md(
+            "gpt2",
+            &["a"],
+            vec![
+                ("tokenizer.ggml.merges", str_arr(&[])),
+                ("tokenizer.ggml.pre", MetaValue::Str(pre.into())),
+            ],
+        );
+        let tok = tokenizer_from_metadata(&md).expect("synthetic BPE vocab");
+        let mut s = PreTokenizedString::from(text);
+        tok.get_pre_tokenizer()
+            .expect("a pre-tokenizer")
+            .pre_tokenize(&mut s)
+            .expect("pre-tokenize");
+        s.get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .into_iter()
+            .map(|(_, (a, b), _)| text[a..b].to_string())
+            .collect()
+    }
+
+    /// `llama-bpe` (Llama-3) and `qwen35` get llama.cpp's own regexes (`llm_tokenizer_bpe`'s
+    /// `LLAMA3` and `QWEN35` arms), not the GPT-2 one they used to fall through to: Llama-3
+    /// groups digits in threes, Qwen3.5 keeps a combining mark inside its letter run. Against
+    /// llama.cpp's `ggml-vocab-llama-bpe.gguf` and `ggml-vocab-qwen35.gguf` fixtures this took
+    /// the mismatching rows to none. `gpt-2` is the control: it IS the GPT-2 regex.
+    #[test]
+    fn mapped_pre_types_split_like_the_reference() {
+        assert_eq!(bpe_pre_chunks("llama-bpe", "3333 x"), ["333", "3", " x"]);
+        assert_eq!(bpe_pre_chunks("qwen35", "e\u{301}x"), ["e\u{301}x"]);
+        assert_eq!(bpe_pre_chunks("gpt-2", "3333 x"), ["3333", " x"]);
+        // The pre-types that share one of those regexes in llama.cpp's table.
+        for pre in ["dbrx", "smaug-bpe", "glm4", "chatglm-bpe"] {
+            assert_eq!(bpe_pre_chunks(pre, "3333 x"), ["333", "3", " x"], "{pre}");
+        }
+        for pre in ["stablelm2", "hunyuan", "solar-open"] {
+            assert_eq!(bpe_pre_chunks(pre, "33 x"), ["3", "3", " x"], "{pre}");
+        }
+        assert_eq!(bpe_pre_chunks("minimax-m2", "3333 x"), ["333", "3", " x"]);
+    }
+
+    /// A sidecar that spells the GGUF's vocabulary passes the check; one from another model is
+    /// caught, by the ids it spells differently.
+    #[test]
+    fn a_foreign_sidecar_is_detected() {
+        let tokens: Vec<String> = (0..300).map(|i| format!("t{i}")).collect();
+        let refs: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let md = vocab_md("gpt2", &refs, vec![]);
+        let sidecar = |names: &[String]| {
+            let v = names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| (n.clone(), i as u32))
+                .collect();
+            Tokenizer::new(BPE::builder().vocab_and_merges(v, vec![]).build().unwrap())
+        };
+        let (checked, bad) = sidecar_mismatches(&md, &sidecar(&tokens));
+        assert!(checked > 1, "nothing was compared");
+        assert!(
+            bad.is_empty(),
+            "the model's own vocabulary flagged: {bad:?}"
+        );
+
+        let foreign: Vec<String> = (0..300).map(|i| format!("u{i}")).collect();
+        let (checked, bad) = sidecar_mismatches(&md, &sidecar(&foreign));
+        assert_eq!(bad.len(), checked, "every sampled id differs");
+        assert_eq!(bad[0], (0, "t0".to_string(), "u0".to_string()));
+
+        // A vocabulary smaller than the sample compares each id once — its last one included.
+        let md = vocab_md("gpt2", &refs[..10], vec![]);
+        assert_eq!(sidecar_mismatches(&md, &sidecar(&tokens[..10])).0, 10);
+    }
+
+    /// `ignore_merges` follows llama.cpp: on for its `LLAMA3` names, off for the pre-types that
+    /// share the Llama-3 regex without it. Here `abc` is a vocabulary entry the merges cannot reach
+    /// (there is no `ab c` merge), so only `ignore_merges` emits it whole.
+    #[test]
+    fn ignore_merges_follows_the_llama3_pre_types() {
+        let ids = |pre: &str| {
+            let md = vocab_md(
+                "gpt2",
+                &["a", "b", "c", "ab", "abc"],
+                vec![
+                    ("tokenizer.ggml.merges", str_arr(&["a b"])),
+                    ("tokenizer.ggml.pre", MetaValue::Str(pre.into())),
+                ],
+            );
+            let tok = tokenizer_from_metadata(&md).expect("synthetic BPE vocab");
+            tok.encode("abc", false).unwrap().get_ids().to_vec()
+        };
+        assert_eq!(ids("llama-bpe"), [4]);
+        assert_eq!(ids("dbrx"), [3, 2]);
+        assert_eq!(ids("glm4"), [3, 2]);
     }
 
     // Validate the GGUF-derived tokenizer against the HF tokenizer.json sidecar (same model).

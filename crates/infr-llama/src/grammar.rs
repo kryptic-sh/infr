@@ -78,6 +78,45 @@ fn mask_padding_tail(logits: &mut [f32], vocab: usize) {
     }
 }
 
+/// The per-MODEL half of a [`Constraint`]: the llguidance parser factory over one tokenizer, with
+/// its token trie. Building it serialises and re-parses the whole tokenizer, so it is built once
+/// and shared; only the parser is per request ([`ConstraintEnv::constraint`]).
+pub struct ConstraintEnv {
+    factory: ParserFactory,
+    vocab: usize,
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl ConstraintEnv {
+    /// Build the environment for `tokenizer` (see [`build_tok_env`] for `vocab` and `eos_ids`).
+    pub fn new(tokenizer: &Tokenizer, vocab: usize, eos_ids: &[u32]) -> Result<Self> {
+        Self::from_tok_env(&build_tok_env(tokenizer, vocab, eos_ids)?)
+    }
+
+    fn from_tok_env(tok_env: &TokEnv) -> Result<Self> {
+        #[cfg(test)]
+        tests::ENV_BUILDS.with(|n| n.set(n.get() + 1));
+        let factory =
+            ParserFactory::new_simple(tok_env).map_err(|e| anyhow!("parser factory: {e}"))?;
+        Ok(Self {
+            factory,
+            vocab: tok_env.tok_trie().vocab_size(),
+        })
+    }
+
+    /// A fresh constraint for `grammar`.
+    pub fn constraint(&self, grammar: TopLevelGrammar) -> Result<Constraint> {
+        let parser = self
+            .factory
+            .create_parser(grammar)
+            .map_err(|e| anyhow!("create parser: {e}"))?;
+        Ok(Constraint {
+            matcher: Matcher::new(Ok(parser)),
+            vocab: self.vocab,
+        })
+    }
+}
+
 /// A live grammar constraint over a decode. Cheap-ish to construct (parser build); one per request.
 pub struct Constraint {
     matcher: Matcher,
@@ -88,15 +127,7 @@ pub struct Constraint {
 impl Constraint {
     /// Construct a constraint for `grammar` over `tok_env`.
     pub fn new(tok_env: TokEnv, grammar: TopLevelGrammar) -> Result<Self> {
-        let vocab = tok_env.tok_trie().vocab_size();
-        let factory =
-            ParserFactory::new_simple(&tok_env).map_err(|e| anyhow!("parser factory: {e}"))?;
-        let factory = Arc::new(factory);
-        let parser = factory
-            .create_parser(grammar)
-            .map_err(|e| anyhow!("create parser: {e}"))?;
-        let matcher = Matcher::new(Ok(parser));
-        Ok(Self { matcher, vocab })
+        ConstraintEnv::from_tok_env(&tok_env)?.constraint(grammar)
     }
 
     /// Mask `logits` in place to the grammar's allowed tokens (disallowed → -inf). Then the caller
@@ -215,17 +246,49 @@ pub fn constrained_step(
     }
 }
 
-/// Build the grammar [`Constraint`] that FORCES a valid, schema-conforming tool call, for
-/// `tool_choice` values that require one (`"required"`, or a named function). `None` for
-/// `"auto"`/`"none"`/absent. Tokenizer-based (no `Llama` needed) so the seam backends share it.
+/// Builds the grammar [`Constraint`] that FORCES a valid, schema-conforming tool call, for
+/// `tool_choice` values that require one (`"required"`, or a named function). Tokenizer-based (no
+/// `Llama` needed) so the seam backends share it. Built once per model: the [`ConstraintEnv`] is
+/// made on the first request that forces a call and reused after that.
+#[derive(Default)]
+pub struct ToolConstrainer {
+    env: std::sync::OnceLock<std::result::Result<ConstraintEnv, String>>,
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn tool_constraint_for(
-    tokenizer: &Tokenizer,
-    vocab: usize,
-    eos_ids: &[u32],
+impl ToolConstrainer {
+    /// The forced tool-call constraint for one request, or `None` for `"auto"`/`"none"`/absent
+    /// `tool_choice` — and when `tools` is absent, without reading `tool_choice` at all.
+    /// `tokenizer`, `vocab` and `eos_ids` must be the same on every call: they only shape the
+    /// environment the first forced request builds.
+    pub fn constraint(
+        &self,
+        tokenizer: &Tokenizer,
+        vocab: usize,
+        eos_ids: &[u32],
+        tools: Option<&Value>,
+        tool_choice: Option<&str>,
+    ) -> Result<Option<Constraint>> {
+        let Some(grammar) = forced_tool_grammar(tools, tool_choice)? else {
+            return Ok(None);
+        };
+        let env = self
+            .env
+            .get_or_init(|| {
+                ConstraintEnv::new(tokenizer, vocab, eos_ids).map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| anyhow!("{e}"))?;
+        env.constraint(grammar).map(Some)
+    }
+}
+
+/// The grammar a `tool_choice` forces over `tools`: `"required"` (any tool) or a named function
+/// (that one), `None` for `"auto"`/`"none"`/absent.
+fn forced_tool_grammar(
     tools: Option<&Value>,
     tool_choice: Option<&str>,
-) -> Result<Option<Constraint>> {
+) -> Result<Option<TopLevelGrammar>> {
     let Some(tools) = tools else {
         return Ok(None);
     };
@@ -254,9 +317,7 @@ pub fn tool_constraint_for(
     } else {
         tools
     };
-    let grammar = forced_tool_call_grammar(tools)?;
-    let env = build_tok_env(tokenizer, vocab, eos_ids)?;
-    Ok(Some(Constraint::new(env, grammar)?))
+    forced_tool_call_grammar(tools).map(Some)
 }
 
 /// Build a JSON-schema grammar constraining the tool-call BODY — a single JSON object
@@ -302,6 +363,70 @@ pub fn forced_tool_call_grammar(tools: &Value) -> Result<TopLevelGrammar> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    thread_local! {
+        /// [`ConstraintEnv`]s built on this thread — the per-model cost a forced request must not
+        /// pay again.
+        pub(super) static ENV_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A byte-level tokenizer of one token per byte: enough for llguidance to build a trie and a
+    /// JSON grammar over, with no model file.
+    fn byte_tokenizer() -> Tokenizer {
+        use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
+        use tokenizers::models::bpe::BPE;
+        use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+        let mut chars: Vec<char> = ByteLevel::alphabet().into_iter().collect();
+        chars.sort_unstable();
+        let vocab = chars
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.to_string(), i as u32))
+            .collect();
+        let mut tok = Tokenizer::new(
+            BPE::builder()
+                .vocab_and_merges(vocab, vec![])
+                .build()
+                .unwrap(),
+        );
+        tok.with_pre_tokenizer(Some(ByteLevel::default()));
+        tok.with_decoder(Some(ByteLevelDecoder::default()));
+        tok
+    }
+
+    /// Forced tool calls build the tokenizer environment once per model, not once per request:
+    /// three `tool_choice: "required"` requests on one [`ToolConstrainer`] build it once, and an
+    /// `auto` request builds nothing. Each request still gets a working constraint of its own.
+    #[test]
+    fn forced_tool_requests_share_one_constraint_env() {
+        let tok = byte_tokenizer();
+        let vocab = tok.get_vocab_size(true);
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {
+                "type": "object", "properties": {"city": {"type": "string"}}
+            }}
+        }]);
+        let constrainer = ToolConstrainer::default();
+        let before = ENV_BUILDS.with(|n| n.get());
+        for _ in 0..3 {
+            let mut c = constrainer
+                .constraint(&tok, vocab, &[0], Some(&tools), Some("required"))
+                .expect("constraint")
+                .expect("`required` forces a call");
+            let mut logits = vec![0.0f32; vocab];
+            c.apply_mask(&mut logits).expect("mask");
+            assert!(
+                logits.iter().any(|l| l.is_finite()),
+                "the grammar allows nothing"
+            );
+        }
+        let auto = constrainer
+            .constraint(&tok, vocab, &[0], Some(&tools), Some("auto"))
+            .expect("auto");
+        assert!(auto.is_none());
+        assert_eq!(ENV_BUILDS.with(|n| n.get()) - before, 1);
+    }
 
     fn qwen3_06b() -> Option<PathBuf> {
         crate::test_hub_gguf("unsloth/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_K_M.gguf")

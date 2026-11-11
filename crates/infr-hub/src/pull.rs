@@ -16,12 +16,14 @@ use infr_core::error::{Error, Result};
 use infr_core::progress;
 use infr_core::shutdown::shutdown_requested;
 use infr_plat::link::link_blob;
+use reqwest::StatusCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     fs,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -136,7 +138,9 @@ fn fetch_and_link(
 ) -> Result<PathBuf> {
     let filename = check_relative(filename)?;
     let url = resolve_url(origin, repo, filename);
-    let want = head_lfs_sha(origin, repo, filename).ok().flatten();
+    // A HEAD that fails is NOT "this file is not LFS": treating it so downloads a multi-GB blob
+    // with no sha256 gate at all. Retry it, and refuse the file if it never answers.
+    let want = head_lfs_sha_retrying(origin, repo, filename)?;
     let hex = match &want {
         Some(sha) if blobs.join(sha).exists() => {
             debug!("hf:{repo}:{filename} blob already present; linking → {sha}");
@@ -321,19 +325,51 @@ fn check_relative(name: &str) -> Result<&str> {
 /// HEAD the resolve URL to read the file's LFS sha256 (HF's `X-Linked-Etag`) WITHOUT downloading the
 /// body — so a commit bump that left the file unchanged can relink the cached blob, and so the
 /// download can verify the body against it. Returns `Ok(Some(sha))` for an LFS file, `Ok(None)` for a
-/// non-LFS file (no `X-Linked-Etag`), and `Err` only on a transport failure. The plain `ETag` is a
+/// non-LFS file (no `X-Linked-Etag` on a successful answer), and `Err` on a transport failure or an
+/// error status. The plain `ETag` is a
 /// quoted md5, NOT the content sha256, so it is deliberately never used here — treating it as a sha
 /// would defeat both the relink fast-path and integrity verification. Redirects are disabled because
 /// the sha header is on huggingface.co's 302, not the CDN's final 200.
-fn head_lfs_sha(origin: &str, repo: &str, filename: &str) -> Result<Option<String>> {
+fn head_lfs_sha(
+    origin: &str,
+    repo: &str,
+    filename: &str,
+) -> std::result::Result<Option<String>, HeadFailure> {
     let url = resolve_url(origin, repo, filename);
-    let mut req = head_client()?.head(&url);
+    let mut req = head_client()
+        .map_err(|e| HeadFailure::definitive(e.to_string()))?
+        .head(&url);
     if let Some(t) = token() {
         req = req.bearer_auth(t);
     }
-    let resp = req
-        .send()
-        .map_err(|e| Error::Other(format!("HEAD {url}: {e}")))?;
+    // A request that never got an answer — refused, reset, timed out — can go through on a fresh
+    // connection, as a chunk does in `crate::ranged`.
+    let resp = req.send().map_err(|e| HeadFailure {
+        msg: format!("HEAD {url}: {e}"),
+        transient: true,
+    })?;
+    // Only an answer about the file itself says whether it has a digest. An error status carries
+    // no `X-Linked-Etag` either, and reading that as "not LFS" is what dropped the sha256 gate.
+    // Redirects are not followed here, so a 3xx is that answer (HF's LFS 302 among them).
+    let status = resp.status();
+    if !(status.is_success() || status.is_redirection()) {
+        let transient = status.is_server_error()
+            || status == StatusCode::TOO_MANY_REQUESTS
+            || status == StatusCode::REQUEST_TIMEOUT;
+        let hint = match status {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                " — the repo is gated or private: set HF_TOKEN to a token that has access"
+            }
+            StatusCode::NOT_FOUND => {
+                " — no such repo or file (HF also answers 404 for a private repo without a token)"
+            }
+            _ => "",
+        };
+        return Err(HeadFailure {
+            msg: format!("HEAD {url}: HTTP {status}{hint}"),
+            transient,
+        });
+    }
     let sha = resp
         .headers()
         .get("x-linked-etag")
@@ -341,6 +377,66 @@ fn head_lfs_sha(origin: &str, repo: &str, filename: &str) -> Result<Option<Strin
         .map(|s| s.trim_matches('"').to_ascii_lowercase())
         .filter(|s| is_sha256(s));
     Ok(sha)
+}
+
+/// Why [`head_lfs_sha`] got no answer about the file, and whether asking again can change that.
+struct HeadFailure {
+    msg: String,
+    /// A transport failure, `408`, `429` or `5xx`. Anything else (an auth refusal, a `404`) is the
+    /// server's settled answer, and repeating the request only delays reporting it.
+    transient: bool,
+}
+
+impl HeadFailure {
+    fn definitive(msg: String) -> Self {
+        Self {
+            msg,
+            transient: false,
+        }
+    }
+}
+
+/// Tries [`head_lfs_sha`] gets for a model file before the file is refused. The HEAD is a few-KB
+/// request, so a transient failure (a dropped connection, a `5xx`) is cheap to repeat.
+const HEAD_ATTEMPTS: u32 = 3;
+
+/// Wait before retry `n` is `n` times this. Short under test, where the local origin is the only
+/// thing being waited on.
+const HEAD_RETRY_BACKOFF: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(1)
+};
+
+/// [`head_lfs_sha`] with a transient failure retried up to [`HEAD_ATTEMPTS`] times. A definitive
+/// one fails at once with its own status, so an auth or not-found answer is reported as what it
+/// is. Either way the caller gets an error rather than a file downloaded unverified.
+fn head_lfs_sha_retrying(origin: &str, repo: &str, filename: &str) -> Result<Option<String>> {
+    let mut attempt = 1;
+    loop {
+        match head_lfs_sha(origin, repo, filename) {
+            Ok(sha) => return Ok(sha),
+            Err(f) if !f.transient => {
+                return Err(Error::Other(format!("hf:{repo}:{filename}: {}", f.msg)));
+            }
+            Err(f) if attempt >= HEAD_ATTEMPTS || shutdown_requested() => {
+                return Err(Error::Other(format!(
+                    "hf:{repo}:{filename}: cannot read its LFS sha256, refusing to download it \
+                     unverified: {}",
+                    f.msg
+                )));
+            }
+            Err(f) => {
+                warn!(
+                    "{}; retrying (attempt {} of {HEAD_ATTEMPTS})",
+                    f.msg,
+                    attempt + 1
+                );
+                std::thread::sleep(HEAD_RETRY_BACKOFF * attempt);
+                attempt += 1;
+            }
+        }
+    }
 }
 
 /// True for a lowercase hex sha256 digest: exactly 64 hex digits.
@@ -501,9 +597,19 @@ fn fetch_companions(
         let url = resolve_url(origin, repo, name);
         // Same integrity path as the GGUF: HEAD for the LFS sha256 and hand it to the download so
         // the body is verified (and a present blob relinked without a transfer). `Ok(None)` = the
-        // file is not LFS, so no digest exists; a HEAD transport error degrades to the same
-        // unverified-but-capped path rather than skipping the companion.
-        let want = head_lfs_sha(origin, repo, name).ok().flatten();
+        // file is not LFS, so no digest exists; a HEAD error degrades to the same
+        // unverified-but-capped path rather than skipping the companion — a skipped companion is
+        // never fetched again once the model is cached — but says so where the user can see it.
+        let want = match head_lfs_sha(origin, repo, name) {
+            Ok(sha) => sha,
+            Err(f) => {
+                warn!(
+                    "hf:{repo}: companion {name} will not be integrity-checked ({})",
+                    f.msg
+                );
+                None
+            }
+        };
         // No connection budget: a companion is a sub-2-KB file and splitting it across ranges
         // would be more requests than bytes.
         let dl = download_to_blob(
@@ -901,6 +1007,73 @@ mod tests {
             "{fetched} of {} shards were fetched anyway",
             files.len()
         );
+    }
+
+    /// A HEAD that never answers is not "this file has no digest". The file must be refused
+    /// rather than downloaded with no sha256 gate — and refused before a byte of its body is asked
+    /// for, so nothing unverified is left on disk either.
+    #[test]
+    fn a_failed_head_refuses_the_file() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-nohead", 1, 20_000);
+        hub.fail_heads(usize::MAX);
+        let cache = TempRepo::new();
+
+        let err = pull_one(&hub, &cache, &files, 1)
+            .expect_err("a file whose digest cannot be read must not be fetched")
+            .to_string();
+        assert!(err.contains("unverified"), "{err}");
+        assert!(
+            hub.served_bodies(&files[0]).is_empty(),
+            "the body was fetched"
+        );
+        assert!(!cache.snapshot().join(&files[0]).exists());
+    }
+
+    /// A definitive refusal is not retried and is reported as itself: one HEAD, and an error that
+    /// names the status and what it usually means, not "refusing to download it unverified".
+    #[test]
+    fn a_definitive_head_status_fails_at_once() {
+        for (status, says) in [(401, "HF_TOKEN"), (404, "no such repo or file")] {
+            let hub = TestHub::start();
+            let files = hub.add_shards("m-denied", 1, 20_000);
+            hub.fail_heads_with(usize::MAX, status);
+            let cache = TempRepo::new();
+            let err = pull_one(&hub, &cache, &files, 1)
+                .expect_err("a refused HEAD must fail the pull")
+                .to_string();
+            assert!(
+                err.contains(&status.to_string()) && err.contains(says),
+                "{err}"
+            );
+            assert!(!err.contains("unverified"), "{err}");
+            assert_eq!(hub.heads_served(), 1, "a definitive status was retried");
+        }
+    }
+
+    /// One failed HEAD is retried, and the file then lands VERIFIED: the lie below is only caught
+    /// if the retried HEAD's digest reached the sha256 gate.
+    #[test]
+    fn a_transient_head_failure_is_retried() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-flaky-head", 1, 20_000);
+        hub.fail_heads(1);
+        let cache = TempRepo::new();
+        pull_one(&hub, &cache, &files, 1).expect("one failed HEAD is retried");
+        assert_eq!(
+            fs::read(cache.snapshot().join(&files[0])).unwrap(),
+            hub.body(&files[0])
+        );
+
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-flaky-lie", 1, 20_000);
+        hub.lie_about_sha(&files[0], SHA_A);
+        hub.fail_heads(1);
+        let cache = TempRepo::new();
+        let err = pull_one(&hub, &cache, &files, 1)
+            .expect_err("the retried HEAD's digest must gate the body")
+            .to_string();
+        assert!(err.contains("sha256 mismatch"), "{err}");
     }
 
     // -----------------------------------------------------------------------

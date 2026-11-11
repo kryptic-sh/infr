@@ -1669,8 +1669,11 @@ struct SeamGenerator {
 }
 
 impl SeamGenerator {
+    /// `tok` is the sidecar the model was loaded with, so the renderer encodes with the same
+    /// vocabulary.
     fn new(
         gguf_path: &Path,
+        tok: Option<&Path>,
         model: Box<dyn infr_llama::chat::ChatModel + Send>,
         backend: &'static str,
         cfg: Arc<Config>,
@@ -1678,7 +1681,7 @@ impl SeamGenerator {
         Ok(Self {
             backend,
             model: std::sync::Mutex::new(model),
-            renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
+            renderer: infr_llama::chat::OaiRenderer::open_with_tokenizer(gguf_path, tok, cfg)?,
             watch: infr_llama::WeightWatch::open_model(gguf_path)?,
         })
     }
@@ -1693,14 +1696,16 @@ struct ParallelGenerator {
 }
 
 impl ParallelGenerator {
+    /// `tok` is the sidecar the model was loaded with, as for [`SeamGenerator::new`].
     fn new(
         gguf_path: &Path,
+        tok: Option<&Path>,
         engine: infr_llama::parallel::ParallelSeam,
         cfg: Arc<Config>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             engine,
-            renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
+            renderer: infr_llama::chat::OaiRenderer::open_with_tokenizer(gguf_path, tok, cfg)?,
             watch: infr_llama::WeightWatch::open_model(gguf_path)?,
         })
     }
@@ -4062,8 +4067,9 @@ fn cmd_serve(
         );
         let n_slots = engine.n_slots();
         let max_ctx = engine.max_ctx();
-        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine, cfg.clone())?);
+        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> = std::sync::Arc::new(
+            ParallelGenerator::new(&gguf, tok.as_deref(), engine, cfg.clone())?,
+        );
         let rt = tokio::runtime::Runtime::new()?;
         // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!(
@@ -4113,8 +4119,9 @@ fn cmd_serve(
             "warmup: pipelines compiled in {:.1}s",
             t0.elapsed().as_secs_f32()
         );
-        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(SeamGenerator::new(&gguf, m, backend, cfg.clone())?);
+        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> = std::sync::Arc::new(
+            SeamGenerator::new(&gguf, tok.as_deref(), m, backend, cfg.clone())?,
+        );
         let rt = tokio::runtime::Runtime::new()?;
         // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
@@ -4260,8 +4267,9 @@ fn cmd_multi(
             infr_llama::parallel::ParallelSeam::new_on(Some(dev), loaded, parallel, want_ctx)?;
         let n_slots = engine.n_slots();
         let dev_name = engine.device_name();
-        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine, hosted_cfg.clone())?);
+        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> = std::sync::Arc::new(
+            ParallelGenerator::new(&gguf, tok.as_deref(), engine, hosted_cfg.clone())?,
+        );
         routing.push((model_id.clone(), dev, dev_name));
         entries.push((model_id, generator, n_slots));
     }

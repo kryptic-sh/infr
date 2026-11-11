@@ -80,6 +80,11 @@ struct State {
     unavailable_at: AtomicUsize,
     /// How an honoured range is misdescribed, if at all.
     range_fault: Mutex<RangeFault>,
+    /// HEADs still to be answered with `head_status` before they are served normally again.
+    failing_heads: AtomicUsize,
+    head_status: AtomicUsize,
+    /// HEAD requests received.
+    heads: AtomicUsize,
 }
 
 /// A `206` that does not describe the bytes that were asked for — what a broken proxy or mirror
@@ -247,6 +252,25 @@ impl TestHub {
         );
     }
 
+    /// Answer the next `n` HEADs `503 Service Unavailable`, then serve them normally — the
+    /// metadata request failing while the file itself is still there to be fetched.
+    pub(crate) fn fail_heads(&self, n: usize) {
+        self.fail_heads_with(n, 503);
+    }
+
+    /// Answer the next `n` HEADs with `status` (an empty body), then serve them normally.
+    pub(crate) fn fail_heads_with(&self, n: usize, status: u16) {
+        self.state
+            .head_status
+            .store(status as usize, Ordering::SeqCst);
+        self.state.failing_heads.store(n, Ordering::SeqCst);
+    }
+
+    /// HEAD requests this hub has received.
+    pub(crate) fn heads_served(&self) -> usize {
+        self.state.heads.load(Ordering::SeqCst)
+    }
+
     /// Misdescribe every honoured range from now on (see [`RangeFault`]).
     pub(crate) fn fault_ranges(&self, fault: RangeFault) {
         *self.state.range_fault.lock().unwrap() = fault;
@@ -379,6 +403,23 @@ fn serve(state: &State, stream: TcpStream) {
             _ => None,
         }
     };
+    if method == "HEAD" {
+        state.heads.fetch_add(1, Ordering::SeqCst);
+    }
+    let head_fails = method == "HEAD"
+        && state
+            .failing_heads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok();
+    if head_fails {
+        let _ = write!(
+            &stream,
+            "HTTP/1.1 {} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            state.head_status.load(Ordering::SeqCst)
+        );
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
     let Some((body, advertised_sha, etag)) = entry else {
         let _ = write!(
             &stream,

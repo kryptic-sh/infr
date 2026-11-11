@@ -302,7 +302,7 @@ impl DiffusionGemmaChat {
         // held back exactly like one split across two tokens of the same block.
         let tokenizer = self.model.tokenizer();
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let mut on_block = |committed: &[u32]| {
             // The whole block's ids are in hand, so decode the committed span in ONE pass through
             // the shared incremental UTF-8-safe detok — NOT once per id over the growing `acc`

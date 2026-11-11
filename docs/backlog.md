@@ -2906,6 +2906,15 @@ prints a bool) and change the test's expectation, or pin `~2.21` in
 `[workspace.dependencies]` until someone checks what HF and llama.cpp's minja
 actually emit.
 
+Checked 2026-11-12: llama.cpp's Jinja prints a bool as `True`
+(`value_bool_t::as_string` in `common/jinja/value.h`, the `tostring` builtin in
+`value.cpp`); `tojson` gives `true`. So 2.24 is the one that matches llama.cpp.
+A formatter override on 2.21 (`Environment::set_formatter`) covers only `{{ }}`,
+not a bool reaching text through `~` or `|string`, so it cannot fully match.
+Still the owner's call: take 2.24 and change the test's expectation (changes the
+prompt of any template that prints a bool), or pin `~2.21` to keep today's
+prompts.
+
 ## Whole-codebase review 2026-11-08
 
 Three read-only review passes over `main` @ `f2f89cb` (correctness, performance,
@@ -2968,76 +2977,27 @@ each backend path.
 
 ### B88 — special-token text in user messages tokenizes as control tokens (2026-11-08)
 
-**Tag:** chat / security · **Needs:** a decision
+**Needs:** a decision. A user message containing the text of a control token
+(`<|im_start|>`, `<|eot_id|>`, …) is tokenized as that control token, because
+the rendered prompt is encoded with special-token parsing on
+(`SeamModel::encode`). Checked 2026-11-12: llama.cpp's server does the same —
+`handle_completions_impl` tokenizes the rendered chat prompt with
+`parse_special=true` (`tokenize_input_prompts` → `tokenize_mixed`) — so infr
+already matches the reference, and a user can forge a turn boundary on both.
 
-`SeamModel::encode` and `ParallelSeam::generate` tokenize the whole rendered
-prompt with `tokenizer.encode(text, false)`; nothing outside the test
-`user_text_special_tokens_are_literal` in `tokenizer.rs` calls
-`set_encode_special_tokens(true)` (which makes specials literal). A user message
-containing `<|im_end|>\n<|im_start|>system\n…` becomes the real control ids, so
-a role boundary can be forged through the API.
+Options: (a) render with placeholders and tokenize the user segments with
+specials off, which diverges from llama.cpp and breaks templates that transform
+content (`.strip()`, splitting on `</think>`) by mangling the placeholders; (b)
+keep parity and document it as a property of the chat endpoint.
 
-llama.cpp's server behaves the same (it parses specials in the rendered prompt),
-so this matches the reference. Options: (a) render with placeholders and
-tokenize user-content segments with specials disabled — the test's intent
-suggests this was wanted; (b) keep parity with llama.cpp and document it in the
-serve docs. Needs the user's call.
+### B90 — chat stream: two leftovers (2026-11-12)
 
-### B89 — hub: an empty `HF_TOKEN` is sent, and a failed HEAD drops the sha256 gate (2026-11-08)
-
-**Tag:** hub · **Verified:** by reading
-
-- `token()` in `crates/infr-hub/src/http.rs` is `std::env::var("HF_TOKEN").ok()`
-  with no empty filter, so `HF_TOKEN=` (common in Docker / CI env files) sends
-  `Authorization: Bearer ` and can draw a 401 on a public repo. Fix:
-  `.ok().filter(|t| !t.trim().is_empty())`, as `configured_api_key` already does
-  in the server.
-- `fetch_and_link` and `fetch_companions` (`crates/infr-hub/src/pull.rs`) call
-  `head_lfs_sha(...).ok().flatten()`: a timeout or error on the HEAD is
-  indistinguishable from "not an LFS file", so a multi-GB GGUF downloads with
-  `expected_sha = None` — no integrity check — and the relink fast path is
-  skipped. Fix: retry the HEAD, and fail (or warn loudly) on a HEAD error for a
-  `.gguf`; only a successful response without `X-Linked-Etag` means non-LFS.
-
-### B90 — tool-call parsing at `finish` scans the channel-format reasoning (2026-11-08)
-
-**Tag:** chat · **Verified:** PLAUSIBLE — no model run
-
-`ChatStream::finish` (`crates/infr-chat/src/stream.rs`) runs
-`parse_any_tool_calls` over the output of `split_think`, which does not strip
-the `<|channel>thought…<channel|>` reasoning block. The streaming path (`emit`)
-only looks for tools after `<channel|>`, so the two disagree: a tool call quoted
-inside the reasoning of a channel-format model is emitted as a real
-`Delta::ToolCall` at the end. Fix: parse from the post-`<channel|>` region
-(`split_reasoning`).
-
-Also in `stream.rs`, latency only: with `tools` supplied, a reply whose content
-starts with `{` (`bare_json_open`) is withheld until `finish`, so a plain JSON
-answer streams as one chunk. Fix: detect a complete first JSON object
-incrementally.
-
-### B91 — streaming detokenization is quadratic in output length (2026-11-08)
-
-**Tag:** perf · decode / serve · **Verified:** code read; cost NOT measured
-
-`stream_token` → `emit_decoded_suffix` (`crates/infr-llama/src/util.rs`) calls
-`tokenizer.decode(acc, true)` on the WHOLE accumulated output for every token,
-allocating the full string each time, then slices off `printed`. Every streaming
-decode path uses it (`seam/model.rs`, `parallel.rs`, `mtp/`); only diffusion
-uses the span variant. In chained decode it runs up to `chain_n` times per chain
-while the GPU is idle, and on the serve path it runs inside the GPU baton (B93),
-so the cost is paid by every slot.
-
-Estimate (assumed ~0.1–0.25 µs per id per decode — the tokenizer's cost was not
-read or measured): ~0.4 ms/token at 2k output tokens, ~0.4–1.6 s summed over a
-2k–4k token reply; a visible share on small fast models with thinking-length
-outputs. `infr bench` tg128 cannot see it (N = 128).
-
-Fix: incremental decode with `prefix_offset` / `read_offset` (the vLLM / HF
-`TextStreamer` scheme), holding back a trailing U+FFFD; keep the full decode as
-the oracle in a long-sequence equivalence test, and check SPM/metaspace
-leading-space handling at offset 0. Measure: a micro-bench of `stream_token`
-over a 4000-token transcript, then `INFR_PROFILE=1 infr run -n 4000` on a 0.6B.
+- With `tools` supplied, a reply whose content starts with `{` (`bare_json_open`
+  in `infr-chat` `stream.rs`) is withheld until `finish`, so a plain JSON answer
+  streams as one chunk. A fix needs a small brace/string state machine that
+  detects a complete first JSON object incrementally.
+- Content before a `<think>` that is not at offset 0 is never streamed: `emit`'s
+  content region starts after `</think>`. Confirmed by reading, not fixed.
 
 ### B92 — `top_k == 0` and penalised requests fall off GPU sampling and chaining (2026-11-08)
 
@@ -3069,7 +3029,7 @@ Smaller host-side items in the same file: `Penalties::apply` rebuilds a
 measured
 
 In `generate_dense_backend`'s chained-decode loop, `_gp = req.gate_pass()` lives
-to the end of the iteration, and the `on_token` calls (detokenize — B91 —
+to the end of the iteration, and the `on_token` calls (detokenize,
 `ChatStream::push`, `StopMatcher`, SSE JSON, channel send) run inside it after
 `execute_chain` has already returned. Every other slot waits on that host work.
 The per-token path has the same shape. Fix: drop the pass once the GPU calls
@@ -3373,81 +3333,47 @@ wholesale. So:
   that is a libm call per element there was reported by the review and not
   measured.
 
-### B104 — the embedded SentencePiece tokenizer cannot produce multi-space tokens (2026-11-11)
+### B104 — tokenizer: where infr still differs from llama.cpp (2026-11-12)
 
-**Tag:** tokenizer · **Kind:** correctness, mechanism confirmed, ids not
-compared
+The 2026-11-12 slice made runs of spaces, the Llama-3 and Qwen3.5 pre-tokenizers
+(and the aliases that share a regex infr has) and the end-of-generation set
+follow `llama-vocab.cpp`, checked against the vocab fixtures in the llama.cpp
+checkout (`models/ggml-vocab-*.gguf.inp/.out`): gemma-4 46/46 rows, llama-bpe
+47/47, qwen35 51/51. What still differs:
 
-`build_spm_tokenizer` in `crates/infr-llama/src/tokenizer.rs` installs
-`Metaspace::new('▁', scheme, true)`. The third argument is `split`, and in the
-resolved `tokenizers` crate `Metaspace::pre_tokenize` then splits on every `▁`
-with `MergedWithNext`. Four leading spaces become four separate pre-tokens
-before BPE runs, so any vocabulary piece with a `▁` after its first character
-(`▁▁`, `▁▁▁▁`, Gemma's whitespace-run tokens) is unreachable. llama.cpp's SPM
-tokenizer runs over the whole escaped text. Indented code in a prompt would
-therefore get different ids from the reference on every GGUF whose
-`tokenizer.ggml.model` is `llama` or `gemma4` and that has no `tokenizer.json`
-beside it.
-
-Verified: the call site and the crate's `split` branch. NOT verified: an actual
-id mismatch against `llama-tokenize`. Do that first — indentation-heavy text on
-a Gemma GGUF — then pass `split = false` and pin the comparison as a test.
-
-### B105 — a tool-call marker inside reasoning hides the real call from the stream (2026-11-11)
-
-**Tag:** serve / tool calling · **Kind:** correctness, confirmed by reading
-
-`ChatStream::tool_open_at` in `crates/infr-chat/src/stream.rs` looks for
-`<tool_call>` with `self.cur_tool.find(..).filter(|&p| p >= cs)`. `Cursor::find`
-scans from the start of `raw` and LATCHES the first hit in `off`, returning it
-forever after. If the model mentions `<tool_call>` inside its think block, that
-position is below the content start `cs`, the filter rejects it, and the cursor
-never searches again. The real call in the content region then streams out as
-`Delta::Content` — raw `<tool_call>{…}</tool_call>` text — and `finish`
-additionally emits the parsed `Delta::ToolCall`. `cur_pipe` has the same shape
-for the channel format.
-
-Fix: do not latch a hit below `cs` (search from `cs`), and add a test with a
-marker inside reasoning — none exists. Related and lower: the review also
-reported that content before a `<think>` opener at an offset above zero is never
-streamed although `split_think` keeps it on the non-streaming path; not
-re-verified here.
-
-### B106 — an unmapped `tokenizer.ggml.pre` silently gets the GPT-2 regex (2026-11-11)
-
-**Tag:** tokenizer · **Kind:** correctness, plausible
-
-`build_tokenizer`'s `match pre` in `crates/infr-llama/src/tokenizer.rs` maps the
-three `deepseek-*` pre-types, `qwen2` and `llama4`. Everything else falls to the
-`_` arm: `ByteLevel::new(add_prefix, true, true)`, the GPT-2 regex, with no
-warning. A BPE GGUF whose pre-type has a different regex in llama.cpp (Llama-3's
-`llama-bpe` is the reported case: digit grouping in threes, different
-newline-run and punctuation rules) would tokenize differently from the
-reference, silently.
-
-Verified: the fallback arm. NOT verified: which pre-type any supported GGUF
-actually declares — no Llama-3 file was dumped — so this may or may not bite a
-model in the README table. Check with `infr-gguf`'s `dump` example, then either
-add the regex or make an unmapped pre-type a loud warning.
-
-### B107 — end-of-turn detection is a fixed three-name list (2026-11-11)
-
-**Tag:** generation · **Kind:** correctness, plausible
-
-Stop ids are the GGUF's `tokenizer.ggml.eos_token_id` plus whichever of
-`<|im_end|>`, `<|endoftext|>`, `<|eot_id|>` the vocabulary has (`add_chat_eos`
-in `crates/infr-llama/src/util.rs`). `tokenizer.ggml.eot_token_id` and
-`eom_token_id` are read nowhere under `crates/`, and neither `<end_of_turn>`,
-`<|eom_id|>` nor `<|end|>` is in the list. A file whose declared EOS is not its
-turn terminator runs past the end of its turn until `max_tokens`; because the
-marker is a special token and decoding skips those, the visible symptom is the
-model continuing into an invented next turn.
-
-`plan.md`'s recipe step 6 already warns about this list. What is new is that the
-two metadata keys exist and are unused. NOT verified: that any supported model
-is affected — the Gemma goldens pass, which suggests those files declare
-`<end_of_turn>` as EOS. Fix: read both keys, and extend the name list to
-llama.cpp's end-of-generation set.
+- **SPM `add_space_prefix` — wrong default, and a decode bug.** When the key is
+  absent llama.cpp defaults it to `true` for SPM and also prepends the space
+  after every special token; infr defaults to `false` and prepends only at the
+  start. The llama-spm and phi-3 fixtures match 2/47 rows as a result (45/47
+  with the prefix emulated). Separately, an SPM GGUF with
+  `add_space_prefix=true` DECODES with every space removed:
+  `build_spm_tokenizer`'s decoder runs `Fuse` before
+  `Metaspace(PrependScheme::First)`, so the whole text is "token 0" and every
+  `▁` in it is dropped. Repro: vocab
+  `["<unk>","<s>","▁","▁Hello","▁world","!", …bytes]`,
+  `tokenizer.ggml.model="llama"`, `add_space_prefix=true`, `decode([3,4,5])`
+  gives `"Helloworld!"`. Gemma 3 and 4 set the key to `false` and are
+  unaffected; the two bugs must be fixed together, since fixing the default
+  alone would expose the decode bug on Llama-2-style files.
+- **End of generation is narrower than llama.cpp's on purpose.** llama.cpp
+  matches its list by text and then forces the token to CONTROL, so it stops on
+  Qwen's `</s>` (a NORMAL token in the qwen2 / qwen35 vocabs). `eog_ids` counts
+  a text match only when `tokenizer.ggml.token_type` says CONTROL or
+  USER_DEFINED, so a literal `</s>` in a reply still prints; ids the GGUF
+  declares as eos / eot / eom always count. With no token-type array the set is
+  the old three names. llama.cpp's FIM pad / rep / sep ids are not in infr's
+  set. Not checked against vocabs outside the fixtures (gpt-oss, Kimi, MiniMax).
+- **Pre-types with a regex infr does not have** (tekken, minicpm5, youtu,
+  falcon, starcoder, refact, command-r and any unknown name) still get the GPT-2
+  regex, now with a warning; llama.cpp throws on an unknown one. Erroring was
+  not chosen because it would refuse files that load today.
+- gemma4's newline-run split and whole-token special case in llama.cpp are not
+  replicated; the fixture matches without them.
+- The forced-tool grammar still receives only the model's single EOS, not the
+  whole end-of-generation set (`OaiRenderer::tool_constraint`).
+- Local Qwen3.5 golden hashes may have moved, since `qwen35` changed regex; they
+  need the model to re-bless and it is not on the dev machine. The two CI
+  goldens (Qwen3-0.6B, gemma-3-1b) were run and did not move.
 
 ### B108 — CPU attention converts the whole KV prefix per layer per token (2026-11-11)
 
@@ -3510,20 +3436,19 @@ only guards a zero seed. The autoregressive path fixed the same collapse in
 policy had drifted once already; this is a third copy. Fix: call
 `legal_xorshift_state`.
 
-### B112 — a `tokenizer.json` beside the GGUF is trusted without a check (2026-11-11)
+### B112 — a foreign `tokenizer.json` beside the GGUF is only warned about (2026-11-12)
 
-**Tag:** tokenizer / serve · **Kind:** correctness, confirmed by reading
-
-`resolve` in `crates/infr-cli/src/main.rs` adopts any `tokenizer.json` in the
-GGUF's directory. Nothing compares it with the GGUF's own vocabulary, so a flat
-folder of several local models with one stray sidecar makes every model in it
-encode with the wrong vocabulary — garbage output, no error. Separately,
-`OaiRenderer::open` in `crates/infr-llama/src/chat/mod.rs` always calls
-`build_tokenizer(&gguf)`, so under `infr serve` the template renderer and the
-forced-tool grammar use the EMBEDDED tokenizer while generation uses the
-sidecar. Fix: validate the sidecar against `tokenizer.ggml.tokens` (size plus a
-sample) and fall back with a warning; hand the model's tokenizer to
-`OaiRenderer`.
+**Needs:** a decision. `load_tokenizer` now compares a sample of the sidecar's
+ids against `tokenizer.ggml.tokens` and warns loudly on a mismatch, but still
+uses the sidecar: falling back could break a model that only works because of
+it. Options: keep the warning; fall back to the embedded tokenizer on a
+mismatch; refuse to load. The check cannot see a vocabulary that spells every
+sampled id the same (one that extends or truncates the model's own, since sizes
+are not compared — padded GGUF vocabularies differ in size legitimately), or a
+change only in the pre-tokenizer or merges. The serve renderer and grammar now
+load the same resolved tokenizer as generation; that wiring is compile-checked
+only, since a test needs a GGUF file. `DiffusionVisual` still opens its renderer
+with the embedded tokenizer, for display only.
 
 ### B113 — cgroup memory headroom counts reclaimable page cache as used (2026-11-11)
 
@@ -3536,17 +3461,6 @@ GGUF makes `available()` shrink by roughly the file's size. That figure sizes
 the host arena tiers in `infr_core::hostmem`. The non-cgroup branch uses
 `MemAvailable`, which does discount reclaimable cache, so the two disagree. Fix:
 subtract `inactive_file` (arguably `active_file` too) from `memory.stat`.
-
-### B114 — forced tool choice rebuilds the grammar tokenizer on every request (2026-11-11)
-
-**Tag:** serve perf · **Kind:** perf, confirmed by reading, not measured
-
-`tool_constraint_for` in `crates/infr-llama/src/grammar.rs` calls
-`build_tok_env` per request, which serialises the whole tokenizer to JSON,
-re-parses it, and builds the token trie and a parser factory — all before
-prefill, for every `tool_choice: "required"` or named-tool request. Build the
-environment and factory once (in `OaiRenderer::open`) and only the parser per
-request.
 
 ### B115 — smaller findings from the 2026-11-11 review
 
@@ -3562,10 +3476,6 @@ request.
   the review adds is the consequence for the serve safety limits: a typo in a
   request-timeout or max-tokens-cap variable leaves the server with no limit and
   no message. Worth un-freezing for those keys at least.
-- **Addendum to B89, reported and not re-verified:** `reconcile` in
-  `crates/infr-hub/src/ranged.rs` — when the resume sidecar has an oid but this
-  run's HEAD failed, neither the oid nor the validator is compared, so a resumed
-  ranged download has neither guard.
 
 ### Review coverage gaps (2026-11-11)
 

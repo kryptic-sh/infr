@@ -2505,7 +2505,7 @@ fn generate_mtp_spec_core(
     });
 
     let mut acc: Vec<u32> = Vec::new();
-    let mut printed = 0usize;
+    let mut printed = crate::StreamOffsets::default();
     let mut out: Vec<u32> = Vec::new();
     let mut cycle = 0usize;
     let mut total_drafted = 0usize;

@@ -61,8 +61,8 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | BitNet b1.58      | `bitnet`          | llama skeleton + SubLN, ternary TQ2_0 weights                              |
 | BitNet b1.58 (MS) | `bitnet-b1.58`    | same, for the `microsoft/bitnet-b1.58-*` GGUFs (i2_s)                      |
 | DeepSeek V1       | `deepseek`        | softmax MoE + shared expert; CPU-tested on MoE-16B only                    |
-| DeepSeek V2 / V3  | `deepseek2`       | MLA + YaRN + group-limited MoE; validated on V2-Lite                       |
-| DeepSeek V3.2     | `deepseek32`      | + lightning indexer; generates, synthetic fixture only                     |
+| DeepSeek V2 / V3  | `deepseek2`       | MLA + YaRN + group-limited MoE; validated on V2-Lite; V3.2 files run here  |
+| DeepSeek V3.2     | `deepseek32`      | + lightning indexer; synthetic only, no published GGUF declares it         |
 | DeepSeek V4       | `deepseek4`       | loads; the shipped V4-Flash is still refused (compressed-KV tiers unbuilt) |
 
 DeepSeek status and what each stage is verified against:

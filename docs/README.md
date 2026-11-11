@@ -61,8 +61,10 @@ at that index. It holds:
   is ignored; the doc says why and keeps the design record.
 - [deepseek.md](deepseek.md) — the DeepSeek family port plan (V1 → V2/V3 → V3.2
   → V4), staged around the fact that only the first two stages have a model
-  small enough to develop against. V2/V3 (`deepseek2`) and V3.2 (`deepseek32`)
-  generate; V4 (`deepseek4`) loads, but its compressed-KV tiers are unbuilt.
+  small enough to develop against. V2/V3 (`deepseek2`, which is also what
+  published V3.2 files declare) and the V3.2 indexer path (`deepseek32`,
+  synthetic fixtures only) generate; V4 (`deepseek4`) loads, but its
+  compressed-KV tiers are unbuilt.
 
 ## Roadmaps & history
 

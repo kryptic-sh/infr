@@ -2,8 +2,13 @@
 
 Status: **Stage 3 done.** A `deepseek32` (V3.2) model loads, builds a graph with
 the lightning indexer wired in, and generates on CPU and Vulkan — see § Stage 3
-for what that is verified against and what cannot be verified without a real
-671B file.
+for what that is verified against. The `deepseek32` path is exercised by
+synthetic fixtures only, because **no public GGUF declares `deepseek32`**: every
+published V3.2 conversion declares `deepseek2` and drops the indexer tensors, so
+a real V3.2 file runs the stage-2 dense-MLA path instead
+(`cpu_deepseek_v32_config` and the `#[ignore]`d `cpu_deepseek_v32_golden`, on
+`unsloth/DeepSeek-V3.2-GGUF`). See `backlog.md` B102 for what that leaves
+unverified.
 
 Stage 2: CPU path works end-to-end on V2-Lite; Vulkan and Metal MLA kernels are
 implemented, wired, and executed on their real devices (Vulkan on the GPU box,
@@ -117,45 +122,28 @@ for the variant, not for a struct.
 - **All the weight quants** V4 ships — every IQ1/IQ2/IQ3/IQ4 and k-quant has a
   native Vulkan dense kernel.
 
-Missing, and these are the real cost:
+What this inventory once listed as missing — MLA attention, group-limited
+routing, the router selection bias, YaRN, an indexer, and a first-N-dense
+`is_moe_layer` — has all landed; the stage sections below say how, and what each
+is verified against. What is still missing:
 
-- **MLA attention.** `Op::Attention` carries a single `head_dim` shared by Q, K
-  and V, and both the CPU and Vulkan implementations index caches as
-  `rows × n_kv × head_dim`. MLA's absorbed form (K 576 wide, V 512 wide,
-  `n_kv = 1`) is **not expressible**. Confirmed by grep: `mla`, `latent`,
-  `kv_a`, `kv_b`, `lora_rank` appear nowhere under `crates/`.
-- **Group-limited routing** (`n_group` / `topk_group`) — no field anywhere; the
-  top-k shader is a flat global top-k.
-- **Router bias correction** (`e_score_correction_bias` / `exp_probs_b`) — not
-  loaded. This changes _which_ experts are selected, so ignoring it is wrong
-  output, not a quality nudge. It also breaks an invariant the Vulkan
-  `moe_topk.comp` documents: that both gating functions are monotone in the
-  logit, so top-k-by-logit picks the same set. With a selection bias the pick
-  must use the biased score and the weight must come from the unbiased one.
-- **YaRN.** Zero occurrences of `yarn`, `rope_scaling`, `beta_fast`,
-  `ext_factor` under `crates/`. (The hits in `ref/` are vendored llama.cpp
-  sources, read-only, not compiled.)
-- **Sparse attention / an indexer** — nothing analogous. `AttnMask` has only
-  causal, sliding-window and the diffusion canvas.
-- **`is_moe_layer` is periodic** (`(il+1) % step == 0`), but DeepSeek wants
-  "first N dense, rest MoE" — a threshold. New branch.
-- **Metal has no `MoeSharedExpertAdd` kernel** (`infr-metal/src/exec.rs` returns
-  `Unsupported`), so any path using the _gated_ shared expert is Vulkan+CPU
-  only. **Checked: this does not bite DeepSeek.** That op is only emitted for a
-  per-token-sigmoid-gated shared expert (qwen35moe); an ungated one is summed in
-  plain with `Op::Add`, which is the llama4 path and exists on all three
+- **The V4 compressed-KV tiers** (`compress_ratio` 4 and 128) — see § Stage 4
+  and `backlog.md` § B-DSV4-WIRING.
+- **Metal cannot run a DeepSeek MoE layer at all.** Its `Op::MoeFfn` arm
+  implements softmax gating + top-k renorm + output-weighting and asserts on
+  anything else, so V2-Lite (`norm_topk_prob = false`) fails that assert, and V3
+  (sigmoid) fails it too. It also reads neither `exp_probs_b` nor the
+  group-routing fields — softmax + renorm + `expert_group_count > 1` is a legal
+  `deepseek2` config that used to pass the assert and then route with neither
+  applied, silently; that combination now asserts as well. DeepSeek is CPU +
+  Vulkan for the MoE layers until a Metal router gains those inputs. MLA
+  attention itself IS implemented on Metal.
+- **Metal has no `MoeSharedExpertAdd` kernel** (`infr-metal/src/exec.rs` refuses
+  it by name), but **this does not bite DeepSeek**: that op is only emitted for
+  a per-token-sigmoid-gated shared expert (qwen35moe); an ungated one is summed
+  in plain with `Op::Add`, which is the llama4 path and exists on all three
   backends — see `FfnW::Moe`'s `shexp` doc in `seam/weights.rs` and
   `Config::shexp_gated`.
-- **Metal cannot run a DeepSeek MoE layer at all**, for a different reason than
-  the one above. Its `Op::MoeFfn` arm implements softmax gating + top-k renorm +
-  output-weighting and asserts on anything else, so V2-Lite
-  (`norm_topk_prob = false`) already fails that assert, and V3 (sigmoid) fails
-  it too. It also reads neither `exp_probs_b` nor the group-routing fields —
-  softmax + renorm + `expert_group_count > 1` is a legal `deepseek2` config that
-  used to pass the assert and then route with neither applied, silently; that
-  combination now asserts as well. DeepSeek is CPU + Vulkan for the MoE layers
-  until a Metal router gains those inputs. MLA attention itself IS implemented
-  on Metal.
 
 ### Places a new arch string must be registered
 
@@ -292,17 +280,17 @@ Nothing new is required in the IR.
 `softmax(logits)` → top-k → gather → **no** normalisation → `× scale` → SwiGLU
 experts → add shared expert. All of this exists.
 
-### New work
+### What stage 1 had to add (landed)
 
 - Arch registration (§ above).
-- `is_moe_layer` needs a **first-N-dense threshold** mode alongside the existing
-  periodic one.
+- `is_moe_layer` has a **first-N-dense threshold** mode alongside the periodic
+  one.
 - Shared-expert width: llama.cpp allocates `ffn_*_shexp` as
   `{n_embd, n_ff_exp * n_expert_shared}` — one fused branch of `n_expert_shared`
   experts' width. `infr` models exactly one branch of width `shexp_ff`, so
-  setting `shexp_ff = n_ff_exp * n_expert_shared` should line up. **Verify
-  against a real GGUF** — V2-Lite has `n_shared_experts = 2` and is the first
-  case where this matters.
+  `shexp_ff = n_ff_exp * n_expert_shared` lines up — confirmed on V2-Lite
+  (`n_shared_experts = 2`), whose next-token distribution matches llama.cpp (§
+  Stage 2's checklist).
 
 ### Done when
 
@@ -460,13 +448,13 @@ Order matters:
 10. add the shared expert; first `n_layer_dense_lead` layers instead run a plain
     dense SwiGLU with `n_ff` (not `n_ff_exp`) and no shared expert
 
-### New work
+### What stage 2 had to add (landed)
 
-- **MLA in the IR.** `Op::Attention` needs asymmetric K/V dims (or a new
-  `Op::Mla`). This touches KV-cache sizing (`seam/mod.rs`, `seam/weights.rs`,
-  `runner.rs` all compute `layer_n_kv * layer_head_dim`) and every attention
-  kernel on CPU, Vulkan and Metal. **This is the single biggest item in the
-  whole plan and it is worth prototyping on CPU alone first.**
+- **MLA in the IR**, as its own `Op::Mla` rather than asymmetric K/V dims on
+  `Op::Attention`. This touches KV-cache sizing (`seam/mod.rs`,
+  `seam/weights.rs`, `runner.rs` all compute `layer_n_kv * layer_head_dim`) and
+  every attention kernel on CPU, Vulkan and Metal. It was the single biggest
+  item in the plan, and was prototyped on CPU alone first.
 - `MoeFfn` gains an `exp_probs_b` input and group-routing fields; the Vulkan
   `moe_topk.comp` must select on the biased score and weight from the unbiased.
 - YaRN ramp precomputation at load.
@@ -565,11 +553,13 @@ already-tested `Op::LayerNorm` and `Op::LightningIndexer`:
 - **`Op::Mla` gained `key_bias`**, an optional additive `[rows, kv_len]` score
   mask, and **`Op::TopkMask`** expands the indexer's indices into it. `None` for
   `deepseek2`, where every backend takes exactly the code it took before.
-- **The indexer's second KV cache rides the V side**
-  `MLA leaves empty — see `seam::kv_row_elems`, which now answers `(kv_lora_rank +
-  qk_rope_dim,
-  indexer_head_size)`for`deepseek32`. All six geometry sites (allocation, graph declaration, `fork`, `seed_from`, both VRAM estimates) therefore size and copy it without any of them growing a private branch — under-reserving it is exactly backlog B41. The allocation asserts the cache does not ring, because `Op::LightningIndexer`
-  masks causally only.
+- **The indexer's second KV cache rides the V side MLA leaves empty** — see
+  `seam::kv_row_elems`, which answers
+  `(kv_lora_rank + qk_rope_dim, indexer_head_size)` for `deepseek32`. Every
+  geometry site (allocation, graph declaration, `fork`, `seed_from`, both VRAM
+  estimates) therefore sizes and copies it without any of them growing a private
+  branch. The allocation asserts the cache does not ring, because
+  `Op::LightningIndexer` masks causally only.
 - **The refusal is gone**, replaced by an assertion on `MlaW::indexer`: a
   `deepseek32` model whose indexer weights were not captured fails at the emit
   instead of degrading to the deepseek2 graph.
@@ -593,9 +583,11 @@ a gather remains a pure optimisation on top.
 
 ### What is verified, and what cannot be
 
-All verification is synthetic — `tests/synthetic_deepseek2.rs` builds a
-`deepseek32` GGUF from the same description as the `deepseek2` one plus an
-indexer, since V3.2 is 671B and no real file can be obtained.
+All verification of the indexer is synthetic — `tests/synthetic_deepseek2.rs`
+builds a `deepseek32` GGUF from the same description as the `deepseek2` one plus
+an indexer. A real V3.2 file exists locally, but like every public conversion it
+declares `deepseek2` and carries no indexer tensors, so it cannot exercise any
+of this.
 
 - `synthetic_deepseek32_cpu_prefill_is_finite` — the whole model runs.
 - `gpu_synthetic_deepseek32_matches_cpu` — CPU vs Vulkan: cosine
@@ -640,11 +632,11 @@ The third row is the important one: with the mask dropped, `top_k = 5` and
 the failure a suite without that case would have shipped.
 
 **Not verified, and not verifiable here:** anything against llama.cpp's own
-numbers. There is no V3.2 GGUF and no CPU oracle, so the indexer's absolute
-scores, the top-k it picks on a real model, and the resulting text are all
-unchecked. The synthetic harness proves the pieces agree with their own
-specifications and with each other across backends; it cannot prove the
-specification matches DeepSeek.
+numbers. There is no V3.2 GGUF that carries the indexer and no CPU oracle, so
+the indexer's absolute scores, the top-k it picks on a real model, and the
+resulting text are all unchecked. The synthetic harness proves the pieces agree
+with their own specifications and with each other across backends; it cannot
+prove the specification matches DeepSeek.
 
 **Metal has not executed any of this.**
 `cargo check -p infr-metal --target x86_64-apple-darwin` typechecks the new arms
@@ -706,8 +698,8 @@ Traps, each of which produces silent wrongness:
   (`layernorm.comp`) and Metal (`layernorm_f32`), with `layernorm_parity` in
   `seam_op_parity.rs` checking it against a from-definition f64 reference. The
   arithmetic follows `ggml_compute_forward_norm_f32`: the BIASED variance
-  estimator, `eps` INSIDE the sqrt, then `* weight` then `+ bias`. Nothing emits
-  it yet — the indexer is its first caller.
+  estimator, `eps` INSIDE the sqrt, then `* weight` then `+ bias`. The
+  `deepseek32` indexer emit is its only caller.
 - The indexer keeps a **second, independent KV cache**: one
   `index_head_dim`-wide row per token per layer, on top of the 576-wide MLA
   cache. **Done**: it rides the V side MLA leaves empty (`seam::kv_row_elems`),
@@ -1041,7 +1033,7 @@ added in three distinct places; and llama.cpp's own lambda names
 `norm_rows`/`norm_cols` are **inverted** relative to its header's `dst`/`src`
 vocabulary. Trust the index formula and the lambda bodies, not the names.
 
-#### ✓ LANDED at the op level (2026-08-10) — nothing emits them yet
+#### ✓ LANDED at the op level (2026-08-10), emitted by slice A
 
 Three ops on CPU + Vulkan + Metal, mirroring llama.cpp's three fused nodes:
 `Op::HyperConnectMix` (`ggml_dsv4_hc_comb` plus the `pre`/`post` gate arithmetic
@@ -1279,12 +1271,14 @@ Budget stage 4 accordingly, and do not start it until stages 2–3 are solid.
 
 Ordered by how much damage a wrong assumption does.
 
-1. **Head layouts and exact dims** — everything here about
-   `192 / 576 / 512 / 64 / 128` came from conversion-script formulas, not from a
-   GGUF. Dump a real file.
-2. **ggml type ids in V4 GGUFs** — if any weight type falls outside
-   `ggml_type_to_dtype`, the file fails at open and needs a new `DType`,
-   `block_spec` and `dequant_block` arm. The i2_s commit `dbc8431` is the
+1. **Head layouts and exact dims** — ✓ RESOLVED. The
+   `192 / 576 / 512 / 64 / 128` figures came from conversion-script formulas;
+   `cpu_deepseek_v32_config` now asserts the MLA dims off a real V3-scale GGUF,
+   and `cpu_deepseek2_config` does the same for V2-Lite.
+2. **ggml type ids in V4 GGUFs** — ✓ RESOLVED for the shipped V4-Flash file: it
+   opens and every tensor loads (`backlog.md` § B-DSV4-REAL). A new V4 quant
+   outside `ggml_type_to_dtype` would still fail at open and need a new `DType`,
+   `block_spec` and `dequant_block` arm; the i2_s commit `dbc8431` is the
    template.
 3. **Whether N successive splits reproduce llama.cpp's tokenizer** (§0.2) — ✓
    RESOLVED (2026-08-09), for `deepseek-llm` only. `infr`'s ids were compared
@@ -1310,7 +1304,8 @@ Ordered by how much damage a wrong assumption does.
    been checked against llama.cpp. Re-open this for either list if a matching
    GGUF appears.
 
-4. **Shared-expert width when `n_shared_experts > 1`** — V2-Lite has 2.
+4. **Shared-expert width when `n_shared_experts > 1`** — ✓ RESOLVED on V2-Lite
+   (2 shared experts): see § Stage 1.
 5. **`rope_off`** — ✓ RESOLVED (2026-08-06). `Op::Rope` only rotates standalone
    k_pe slices (extracted via `CopyStrided`, no nope prefix). The q_pe rope is
    done inside the MLA kernel at offset `qk_nope_dim` — the offset lives in the

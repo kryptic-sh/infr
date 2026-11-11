@@ -65,8 +65,8 @@ Qwen3.5-4B's, with exactly two differences:
 
 - the 4B has `blk.N.nextn.{eh_proj,enorm,hnorm,shared_head_norm}` — its MTP head
   is inline; the 27B ships MTP as a separate file (see below);
-- the 27B has `output.weight` — it does not tie its LM head, and
-  `seam/runner.rs:483` already detects and loads the untied case.
+- the 27B has `output.weight` — it does not tie its LM head, and the `untied_lm`
+  check in `seam/runner.rs` already detects and loads the untied case.
 
 The metadata-key sets differ only by `qwen35.nextn_predict_layers` and
 provenance/imatrix keys. So this classifies as **"only metadata differs"** under
@@ -134,7 +134,7 @@ skips where it does not.
 **Blocked on hardware, not on infr** (its one code defect is fixed — below).
 
 `Qwen3_5MoeForCausalLM` maps to `qwen35moe` (`conversion/qwen.py:636`), which
-infr already parses — `config.rs:624-625` widens `qwen35_moe` into the `qwen35`
+infr already parses — `Config::from_gguf` widens `qwen35_moe` into the `qwen35`
 bool so the whole DeltaNet/attention parse is shared and only the FFN shape
 differs. Config: 92 layers, hidden 8192, 64 heads / 4 KV, head_dim 256, 512
 experts with 10 active, `moe_intermediate_size` 2048, a shared expert, and a

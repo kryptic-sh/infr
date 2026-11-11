@@ -224,7 +224,8 @@ at the op level, **13 are never exercised through a model load at all** —
    straddle a chunked-prefill boundary, dispatch sizes near the 65535 group
    limit, non-unit V/K head ratios, mixed dtypes per tensor. **A synthetic
    512-expert model would have caught B67** — the `moe_topk.comp` out-of-bounds
-   shared-memory access — which no real fixture in the tree can reach today.
+   shared-memory access, since fixed — and it is still the only way to run
+   routing above 256 experts at all (`backlog.md` B70).
 6. **One fixture per architecture, sized to run in the fast job.** The budget is
    the current `cargo test` job's 3m38s, not the goldens job's half hour.
 

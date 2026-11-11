@@ -1300,10 +1300,10 @@ sizes are 32/64/256 and therefore already divide any legal `k` — so unlike the
 GEMV path there is no dtype (BF16/F16/F32) that can even express an off-grid
 row. Reaching it needs a hand-built synthetic tensor, which is precisely the
 hazard B39 was about, so this is a real gap and not a non-issue. The reason to
-stop was scope: each
-`matmul*\*` entry carries its own tiling constraints (`gemm.rs`'s `matmul_f16`already asserts`m,n
-%64 && k %32`) and several take `k` with different meanings, so a uniform guard
-needs its own read of the family rather than a mechanical sweep.
+stop was scope: each `matmul*\*` entry carries its own tiling constraints
+(`gemm.rs`'s `matmul_f16`already asserts`m,n %64 && k %32`) and several take `k`
+with different meanings, so a uniform guard needs its own read of the family
+rather than a mechanical sweep.
 
 **Not the same defect, checked while here:** `native_gemm.comp` (the coopmat
 prefill GEMM, the one path that DOES take BF16) steps
@@ -2318,9 +2318,9 @@ again — nothing needs to be built.
   gets the fix by construction, but nothing was RUN there.
 - Whether V3/V3.2/V4 were affected is **untested**. They share the `MixerW::Mla`
   arm, so they were, but the 671B V3.2 has no llama.cpp oracle on this box (it
-  cannot load there) and `cpu_deepseek_v32_golden` was NOT re-blessed by this
-  slice — it is `#[ignore]`d, costs minutes per token through the host pager,
-  and will be stale until someone runs it.
+  cannot load there). `cpu_deepseek_v32_golden` was re-blessed afterwards (its
+  comment records the 2026-08-12 re-bless and the text it now generates), but it
+  locks what infr does, not what is correct — see B102.
 
 ### B-DSHW-FUSED-REF — upstream's fused DeepSeek kernels exist on CUDA and SYCL only (2026-08-11)
 
@@ -3330,3 +3330,51 @@ The DeltaNet arm clones `q/k/v` to split borrows; measured ~216 MB of memcpy per
 512-token prefill on the 9B, about 0.1% of a ~4.7 s prefill, with no RSS cost
 and nothing to clone at decode. Revisit only if a profile flags DeltaNet
 allocation.
+
+## Plan and code review 2026-11-11
+
+Every plan doc (`plan.md`, `deepseek.md`, `qwen38.md`, `synthetic-models.md`,
+`train.md`, `mtp.md`) was read against the tree and corrected in place where it
+had drifted; the entries below are what that pass and the accompanying code
+review left open. `disk-streaming-plan.md` was not re-read in this pass (it was
+condensed on 2026-11-10).
+
+### B102 — a real DeepSeek V3.2 file runs without the lightning indexer (2026-11-11)
+
+**Tag:** deepseek · **Kind:** surprising, not a bug; plus the coverage it leaves
+open
+
+`deepseek.md` and the root `README.md` said no real V3.2 file could be obtained.
+One can, and the tree already tests it: `cpu_deepseek_v32_config` and the
+`#[ignore]`d `cpu_deepseek_v32_golden` in
+`crates/infr-llama/tests/cpu_backend.rs` run against
+`unsloth/DeepSeek-V3.2-GGUF`. But that file — like every published V3.2
+conversion, per the test module's own comment — declares
+`general.architecture = "deepseek2"` and carries no indexer tensors. So a real
+V3.2 runs the stage-2 dense-MLA path, and the `deepseek32` arch (MLA plus the
+indexer) is reachable only from the synthetic fixtures. Both docs now say so.
+
+What that leaves unverified:
+
+- **The original model attends sparsely; the GGUF attends densely.** V3.2's
+  indexer keeps `attention.indexer.top_k` keys per query. While the context is
+  no longer than that, dense and indexed attention are the same computation
+  (`synthetic_deepseek32_full_top_k_matches_no_indexer_at_all` pins exactly
+  this). Past it, a `deepseek2`-declared V3.2 file computes something the
+  original model does not. infr is faithful to the file, and llama.cpp reading
+  the same file does the same, so this is a converter property — but nobody has
+  measured what it does to output quality at long context.
+- **The golden is self-blessed.** `cpu_deepseek_v32_golden` cannot be compared
+  against llama.cpp (the 671B model does not load there on this box), costs
+  about 26 minutes per run, and is `#[ignore]`d. The correctness claim rests on
+  the V2-Lite oracle over the same shared MLA graph.
+- **Group-limited routing and the `exp_probs_b` bias have real-file coverage on
+  CPU only.** Both tests that open the V3.2 file are CPU tests; on Vulkan those
+  two mechanisms are covered by the synthetic fixture alone
+  (`gpu_synthetic_deepseek2_routing_paths_execute`).
+- **`deepseek-v3` pre-tokenizer ids are still unchecked** (`deepseek.md` open
+  question 3). Not looked at in this pass: whether the cached V3.2 GGUF declares
+  `tokenizer.ggml.pre = "deepseek-v3"`. If it does, the `llama-tokenize`
+  comparison that was only possible for `deepseek-llm` can now be run for it.
+- **Stage 1's `gpu_seam_matches_cpu_deepseek` is still not written** — recorded
+  in `deepseek.md` § Stage 1, repeated here so it is not only in a plan.

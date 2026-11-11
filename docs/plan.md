@@ -3,7 +3,7 @@
 > **How to read this.** Two halves. Everything under
 > [What shipped](#what-shipped) down to
 > [Product surface](#product-surface-the-infr-cli) is a **description of the
-> tree as it stands on 2026-08-05** — kept here because no other doc carries the
+> tree, last checked 2026-11-11** — kept here because no other doc carries the
 > whole-system shape in one place. Everything from
 > [Adding a model architecture](#adding-a-model-architecture-the-recipe) on is
 > **forward-looking work**, written to be executable without re-deriving the
@@ -37,7 +37,7 @@ one trait_, never refactoring the stack.
 The original MVP targeted DiffusionGemma over Vulkan. It shipped — but the
 autoregressive families landed first and are now the primary path.
 
-| Dimension    | Original MVP                       | As built (2026-08-05)                                                                                        |
+| Dimension    | Original MVP                       | As built (2026-11-11)                                                                                        |
 | ------------ | ---------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | Format       | GGUF                               | GGUF (safetensors still unbuilt)                                                                             |
 | Model source | HF + Ollama pull, or a local path  | **HF only** — `org/repo[:quant]`, or a local path. The Ollama registry client was dropped                    |
@@ -73,7 +73,7 @@ Bottom-up. Each named trait is the seam where future variants plug in.
 ┌──────────────────────────────────────────────────────────────────────┐
 │ infr-cli      pull / devices / run / serve / multi / bench / compare  │
 ├──────────────────────────────────────────────────────────────────────┤
-│ infr-server   axum + SSE -> OpenAI /v1/chat/completions, /v1/models   │  knows NOTHING about the GPU
+│ infr-server   axum + SSE: OpenAI /v1/*, /health, /status, /metrics    │  knows NOTHING about the GPU
 ├──────────────────────────────────────────────────────────────────────┤
 │ infr-chat     chat templating (the GGUF's own jinja), tool-call bridge│
 ├──────────────────────────────────────────────────────────────────────┤

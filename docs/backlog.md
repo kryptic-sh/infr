@@ -1827,10 +1827,16 @@ with `Recorder::vkb`'s bind check promoted from `debug_assert!` to a release
   split costs anything measurable has **never been profiled**, and that
   measurement is the actual blocker — not the code.
 - **`maxComputeWorkGroupInvocations` / `maxComputeWorkGroupSize`** → never
-  queried; every `local_size_x` is a compile-time constant at or under the
-  guaranteed 1024. Safe by spec, not by check. A guard would have to live in the
-  build (the sizes are baked into SPIR-V), which is why it was not added with
-  the push-constant one.
+  queried; every `local_size_x` is a compile-time constant at or under 1024.
+  That is **not** the guaranteed minimum, as this entry used to say: the Vulkan
+  required limits are 128 for `maxComputeWorkGroupInvocations` and for
+  `maxComputeWorkGroupSize[0]` (corrected 2026-11-11, from the spec's required
+  limits table as remembered, not re-read). Many kernels use 256, the wide
+  expert mmq tiles 512, and the `-DWIDE` build of `rmsnorm.comp` 1024, selected
+  in `Recorder::rmsnorm` with no limit check. Desktop drivers report 1024 or
+  more, so nothing fails today; it is safe by observation, not by spec. A guard
+  would have to live in the build (the sizes are baked into SPIR-V), which is
+  why it was not added with the push-constant one.
 - **`minStorageBufferOffsetAlignment`** → never queried; 256 (the spec's MAXIMUM
   for this limit, so it over-aligns on every device) is hardcoded in the range
   padding. Correct everywhere, wasteful nowhere that has been measured.
@@ -3626,3 +3632,292 @@ family, `repack.rs`, `moe.rs`, `paged.rs`, `quant.rs` and most op arms;
 drivers; `infr-gguf`'s `dequant.rs`; `infr-core`'s graph, fusion, host pager and
 budget modules; `infr-engine`, `infr-prof`, `infr-testkit`; and the test suites
 themselves. `infr-server` was not re-read in this pass.
+
+## Remaining-area review 2026-11-11
+
+The areas the earlier 2026-11-11 pass listed as unreviewed, taken one at a time.
+Same method: one reviewer reading only (nothing built or run), each finding then
+re-read at its site before being recorded. What was confirmed by that re-read
+and what is still the reviewer's inference is stated per entry. Coverage is at
+the end of the section.
+
+### B116 — prefill attention reads past the dequantised KV scratch (2026-11-11)
+
+`lower_op`'s static `Op::Attention` arm (infr-vulkan `adapter.rs`) sizes the
+`kvdeq_k` / `kvdeq_v` f16 scratch to exactly
+`kv_len.min(att_cap_rows) * nkv * hd` elements. The flash and nonfa prefill
+kernels read K and V in whole tiles, so they read up to
+`kv_len.div_ceil(64) * 64` (flash) or `kv_len.div_ceil(256) * 256` (nonfa) rows.
+The gates `flash_geom` and `nonfa_ok` bound that padded read against
+`att_cap_rows`, the capacity of the persistent cache — not against the scratch,
+which is what the kernel is handed whenever the KV side is dequantised first
+(`deq_k` / `deq_v`: Q8_0 at rows > 1, the prepass formats, and the Q4/Q5 set
+when `kernels.vulkan.flash_dequant` is off).
+
+So a quantised-KV prefill chunk whose `kv_len` is not a tile multiple reads up
+to 63 or 255 rows past the end of an `alloc_uninit` buffer. For K the extra
+columns are masked to `-1e30`. For V the comment in `attn_flash_warp.comp` says
+the rows "carry a 0 P weight", which is only harmless for finite values:
+`0 × NaN` and `0 × Inf` are NaN and would land in that output tile.
+
+Confirmed by reading: the sizing, both gates, and the two shader comments that
+state the over-read is safe because it stays inside the row-capacity allocation.
+The shader review confirmed the nonfa side too: `attn_pv.comp` and
+`attn_pv_warp.comp` carry no real-length field and stage V for every row up to
+`kv_pad`. Only the direct `coopMatLoad` arms of `attn_flash_warp.comp`
+over-read; its `-DSTAGE` / `-DDEQUANT` builds guard with
+`kv0 + kvl < pc.kv_len`. The same finite-V assumption also covers a query row
+with no valid key in a split, whose partial is a full ΣV that
+`attn_flash_combine` discards with a zero weight. Not established: what sits
+after the scratch in practice (it is a pooled sub-allocation), so whether a NaN
+has ever been produced; no test was run. Fix: size the scratch to the padded row
+count and zero the pad, or route to the split-K path when the padded read
+exceeds the scratch.
+
+### B117 — MoE dummy buffers: one is destroyed while bound, one leaks (2026-11-11)
+
+`lower_op`'s `Op::MoeFfn` arm and `execute_paged_moe` (infr-vulkan `adapter.rs`)
+bind placeholder buffers when a model has no `exp_probs_b` and no hash routing,
+each made on the spot with `&*be_.alloc_uninit(4, …)?`:
+
+- **`hash_buf`** (`BufferUsage::Activations`) is a temporary that lives to the
+  end of the match arm / function. It is bound into the recording by
+  `Recorder::moe_topk`, and `VkBuffer::drop` calls `destroy_buffer` on it before
+  that command buffer is submitted. Destroying a buffer a recorded command
+  buffer references invalidates the command buffer. `decode_eligible` accepts
+  `MoeFfn`, so on the replay path the persistent tape keeps the dead handle for
+  the whole generation. This affects every MoE model that is not hash-routed. It
+  has not been seen to fail: the shader does not read the binding when
+  `hash == 0`, and RADV evidently tolerates it. Behaviour on other drivers, and
+  whether the validation layer reports it, is not checked.
+- **`bias_buf`** (`BufferUsage::Weights`) goes through `make_alloc` to
+  `bda_weight_alloc`, which bumps a block cursor by `BDA_WEIGHT_ALIGN`; a
+  `Backing::BdaSub` drop frees nothing and the cursor never rewinds. So every
+  lowering of a `MoeFfn` without `exp_probs_b` consumes a slot of the weight
+  arena for good: once per prefill chunk, once per replay recording, and once
+  per token on the paged or static decode path. A long-lived `serve` eventually
+  opens new `BDA_BLOCK_MIN` blocks for these.
+
+Both confirmed by reading the allocation and drop paths. Fix for both: one
+backend-lifetime dummy of each kind, or hold them in the plan.
+
+### B118 — a discarded segment leaves the weight pager claiming blocks it never copied (2026-11-11)
+
+`GpuPager::touch_staged` (and `touch_staged_read` / `schedule_staged`, in
+infr-vulkan `pager.rs`) handle a miss by recording the ring→arena copy into the
+ambient `Recorder` and calling `record_placement` straight away, which updates
+the LRU and the lookup table. If the segment is then abandoned — `abort_segment`
+in `adapter.rs` only calls `Recorder::discard` — the copy never executes but the
+pager still reports the block resident, so later forwards read the slot's
+previous occupant as if it were the requested weights.
+
+The ordering and the discard path are confirmed by reading. What is inferred:
+that a backend survives such an error and is used again. That needs a failure
+after a staged miss (host-tier read error, refused scratch allocation, LUT tape
+overflow) in a process that keeps going, which in practice means `serve`
+returning an error for one request. Related: B48 notes these abort paths have
+never been fired by a test.
+
+### B119 — Vulkan error-path leaks not covered by B48 (2026-11-11)
+
+- `record_decode_replay` (`adapter.rs`) holds its `Recorder` as a plain binding,
+  and `Recorder` has no `Drop`. Every `?` exit after it is created leaks the
+  command buffer, its descriptor pool and any segments already closed. B48
+  covers `execute_static` only.
+- `make_buf_ex` (`lib.rs`): the `bind_buffer_memory(..)?` exit neither frees the
+  gpu-allocator `Allocation` nor destroys the `vk::Buffer`. The allocation-error
+  arm just above it and `alloc_vram_mapped` both clean up.
+
+Both confirmed by reading. Neither is reachable without a device error.
+
+### B120 — device features assumed rather than checked (2026-11-11)
+
+In `VulkanBackend::new_selected` (`lib.rs`):
+
+- `shader_int8(true)` is enabled unconditionally although `has_int8` is read a
+  few hundred lines earlier, so a device without it fails `create_device`
+  instead of producing the "falling back to another backend" message.
+- `try_make_compute_kernel` (`ops.rs`) sets `REQUIRE_FULL_SUBGROUPS` whenever a
+  subgroup size is pinned, but only `subgroup_size_control` is required;
+  `compute_full_subgroups` is read (`has_full_sg`) and passed through, never
+  required.
+- `Recorder::vkb` (`recorder.rs`) asserts `maxStorageBufferRange` for
+  resident-BDA sub-tensors only. Ordinary buffers are bound with `WHOLE_SIZE`
+  and no check, so an activation or scratch buffer larger than the device limit
+  is bound out of range. The nonfa attention scratch grows with context.
+
+The code is confirmed by reading. Which real devices lack these features or
+report a small enough limit is not known; every desktop driver checked so far
+exposes them. Not listed in `perf/vulkan-review.md`.
+
+### B121 — smaller Vulkan findings (2026-11-11)
+
+- **A zero split override divides by zero.** `kernels.vulkan.pv_splits` or
+  `flash_splits` set to 0 reaches `kv_pad.div_ceil(n_splits)` in
+  `Recorder::attention_prefill_nonfa` and the equivalent in the flash recorders.
+  Confirmed by reading; the config layer accepts any integer.
+- **`cmd_pool: Mutex<vk::CommandPool>` serialises nothing.** Every use is
+  `*cmd_pool.lock().unwrap()`, which copies the handle and drops the guard in
+  the same statement, while a doc comment in `lib.rs` says operations are
+  serialised through it. External synchronisation of the pool rests on the
+  seam's GPU baton (see B93). Confirmed by reading; fix the comment or hold the
+  guard.
+- **`tp_record_copies` (`tp_sem.rs`) has no extent check.** It builds
+  `vkCmdCopyBuffer` regions from caller-supplied byte counts without the
+  `check_extent` guard `Backend::copy_buffer` applies. Gated multi-GPU path.
+  Confirmed by reading.
+- **Reported, not re-verified:** on unified-memory devices without
+  `VK_EXT_memory_budget`, `vram_budget_fits` counts all heaps as the total but
+  never adds spilled allocations to `device_used`, so the guard stops seeing
+  spills (RADV and ANV expose the extension, so this is not reachable there).
+  The decode replay tape is recorded against the first `execute` call's bindings
+  and never compares later ones; the only caller today builds one `Bindings` per
+  generation. `Recorder::new_inner` creates a descriptor pool for every recorder
+  even on the push-descriptor path, where it is never used; the cost was not
+  measured.
+
+### B122 — the 4-output lm_head GEMV decodes weights past the tensor on padding workgroups (2026-11-11)
+
+`native_mmv_mrow.comp`'s `-DOUTS4` `main()` has no `o0 >= pc.out_f` early
+return. Its comment says the `live` guard covers padding workgroups, but `live`
+only gates the writes: the weight base is still computed as
+`pc.w_base + o0 * pc.in_f` and the whole `wdec` loop runs through the 64-bit
+weight pointer. The non-OUTS4 `main()` in the same file returns early.
+
+Padding workgroups exist whenever the group count exceeds
+`Recorder::MAX_GROUP_COUNT_X` (65535) and `dispatch_wide` splits into a 2-D
+grid. `Recorder::linear_mmv_mrow_at` picks the 4-output build when
+`in_f < 2048 && kernels.vulkan.mmv_o4` and dispatches `ceil(out_f / 4)` groups,
+so `out_f = 262144` gives 65536 groups, issued as 65535 × 2 — 65534 padding
+workgroups, each decoding a row up to one tensor-length past the end. That is
+both an out-of-bounds read and roughly double the head's work per token.
+
+Confirmed by reading the shader and the dispatcher. Inferred: that a real model
+takes this route (the small Gemma 3 files have a 262144 vocabulary and an
+embedding width under 2048, with a K-quant tied head), and what the driver does
+with the reads. Not measured. Fix: the same early return the sibling has.
+
+### B123 — the narrow warp GEMM is wrong when `in_f % 64 == 32` (2026-11-11)
+
+`Recorder::matmul_native_off` selects a warptile whenever
+`k.is_multiple_of(32)`, and the adapter's `gemm_ok` is `in_f % 32 == 0`. The
+narrow (`_n128`, `-DNARROW_N`) builds of `native_gemm_warp.comp` use `BK = 64`
+and loop `for (k0 = 0; k0 < pc.k; k0 += BK)` with no guard on `k0 + kb < pc.k`
+in the weight staging (`dqblk`), the activation staging or the direct
+`coopMatLoad`. With `in_f ≡ 32 (mod 64)` the last stage folds the first 32
+elements of the next row and column into each result, and reads past both
+buffers on the last row. The other `BK = 64` tiers in `adapter.rs` (`cm8_ok`,
+the f8 and bf16 narrow picks) already require `in_f % 64 == 0`.
+
+Only 32-element-block and float formats can reach it (Q4_0, Q5_0, Q5_1, Q8_0,
+IQ4_NL, BF16); K-quant rows are multiples of 256. It also needs
+`out_f % 128 == 0`, more than one row, and a cooperative-matrix device.
+
+Confirmed by reading the shader loop and both host gates. Not established: a
+real file with such a width — none of the validated models has one, so this is
+latent. No test was run. Fix: require `k % 64 == 0` for the narrow pick.
+
+### B124 — smaller shader findings (2026-11-11)
+
+- **`store_q8.comp` relies on a 32-lane subgroup but is not pinned to one.** It
+  takes the block scale from `subgroupMax` and stores it from lane 0, with
+  `local_size_x = 32`. `Recorder::store_q8` and `store_q8_dyn` create it with
+  `kernel(..)`, whereas the twin `quant_q8` uses `kernel_sg(.., 32)`. On a
+  device whose default subgroup is narrower than 32, lanes outside the first
+  subgroup would quantise with a different scale than the one stored. Confirmed
+  by reading; whether such a device gets through backend selection is not
+  checked.
+- **The mmq GEMMs read activation scratch past `m` rows.** The adapter pools
+  `mmq_qa` / `mmq_dact` at exactly `m` rows while the `native_gemm_mmq_*`
+  shaders stage whole row tiles. The results land in padded rows that are
+  ignored, so unlike B116 there is no NaN path — only an out-of-range read.
+  Scratch sizes confirmed by reading; the shader side is as reported.
+- **Reported, not re-verified:** `sample_topk.comp` claims output slots with
+  `atomicAdd`, so when more than k logits tie exactly at the threshold the
+  surviving set depends on scheduling and one seed can give different tokens.
+  The Q3_K `dqblk` in `native_decode.glsl` loads one word past the 110-byte
+  block on odd blocks; only an unused lane depends on it.
+
+### B125 — Metal: in-graph sampling can read a different uniform slot than the runner wrote (2026-11-11)
+
+The seam's decode loop (`generate_dense_backend` in infr-llama `seam/runner.rs`)
+writes each step's uniform draw to ring slot `pos & 63` when it holds a compiled
+replay plan (`ro.is_some()`, decided by `dyn_replay`) and to slot 0 otherwise.
+Metal's `Op::Sample` arm (`MetalBackend::run_op` in `exec.rs`) picks the `_dyn`
+kernel, which reads `u_buf[positions[0] & 63]`, only when `r.posbuf` is set —
+that is, only when Metal's own `replay_shape` decided to record — and otherwise
+uses `sample_f32`, which reads `u_buf[0]`.
+
+The two predicates are computed independently. `replay_shape` returns false for
+any graph with a plain `Op::Rope` (every llama-family model), so there the
+runner writes slot `pos & 63` while the kernel reads slot 0, which is refreshed
+only when `pos & 63 == 0`. In the other direction the runner goes static for
+cases `replay_shape` admits (`INFR_SEAM_NO_REPLAY=1`, a coupled Q4_0 or IQ4_NL
+KV per `kv_forces_static`). Either way a temperature > 0 run would sample most
+tokens with a stale or zero uniform — a zero uniform selects the top candidate,
+so it would look greedy — with no error.
+
+Confirmed by reading: the runner's slot expression, the arm's `posbuf` test,
+both shader slot expressions, the `Op::Rope` rejection in `replay_shape`, and
+that Metal reports `gpu_sample: true`. Not established: the runtime effect.
+Metal cannot be built or run on the Linux machine this was reviewed on, and no
+Mac run was done. A sampled-token distribution test on Metal for a llama-family
+model would settle it. Fix: have the runner ask the backend which slot geometry
+the compiled plan uses, or make the static kernel take the position too.
+
+### B126 — Metal: the scratch pool never evicts and is keyed on a size that grows per token (2026-11-11)
+
+`MetalBackend::scratch_buf` (`exec.rs`) is a `HashMap` keyed by
+`(element count, tag)` whose only access is `entry().or_insert_with(..)`;
+nothing removes from it. The KV dequant prepass in the `Op::Attention` arm asks
+for `kv_len * n_kv * head_dim * 2` bytes under tags 18 and 19, so on static
+decode with a prepass KV format (Q4_1, Q5_0, Q5_1, BF16, the turbo formats, or a
+mixed pair) every token adds one new K and one new V buffer that are kept for
+the life of the backend. Retained bytes grow with the square of the generated
+length.
+
+Confirmed by reading the pool and the call site. Not measured. The reviewer also
+reports the same pattern, at smaller scale, for the lightning-indexer and
+prefill-row-dependent tags; those were not re-read. Fix: key the prepass scratch
+on capacity (grow-only, one buffer per tag) rather than on the exact size.
+
+### B127 — Metal: DeltaNet picks the 8-lane kernel for head widths it does not fit (2026-11-11)
+
+The `Op::DeltaNet` arm (`exec.rs`) admits `kd <= 256 && kd % 32 == 0` and then
+selects a kernel by `kd / 32`, with arms for 1, 2 and 4 and a catch-all that
+picks the `_k8` instantiation. `KPL` is a compile-time lane width in
+`deltanet.metal`, so a `head_k` of 96, 160, 192 or 224 runs the 8-per-lane
+kernel over 256 key indices and, per the reviewer, reads and writes other heads'
+state. The same catch-all is in the `deltanet_norm_*` pick.
+
+The gate and both matches are confirmed by reading; the shader indexing is as
+reported. Latent, per the reviewer: the validated DeltaNet models use a `head_k`
+of 128 (not re-checked against a file). Fix: admit only `kd / 32 ∈ {1, 2, 4, 8}`
+in the arm and in `replay_shape`.
+
+### B128 — Metal and CPU: smaller findings (2026-11-11)
+
+Reported by the reviewer; only the items marked confirmed were re-read.
+
+- **Metal replay admission is looser than the arms it admits.** `replay_shape`
+  whitelists `Op::RmsNormAdd`, whose arm is host-only, and its `MoeFfn` and
+  `DeltaNet` checks omit terms the arms themselves use to fall back to the host.
+  A host fallback during recording produces a tape that silently omits the op.
+  Each case is currently masked by another op in the same graph that blocks
+  replay (for example `Softcap` on Gemma 4), so nothing is wrong today.
+  `Graph::no_decode_replay` is read by Vulkan only.
+- **Unchecked nil buffers beyond B109:** `f32_buf`, `zeros_buf`, `bytes_buf`,
+  the result buffer in `execute_graph_chain`, and `alloc_uninit` in release.
+- **`replay_fp` fingerprints wrapper addresses** rather than `MetalBuffer::uid`,
+  the recycled-address hazard `idcache.rs` exists to avoid.
+- **CPU single-row MoE dequantises every expert row to f32.** `int8_ok` in the
+  `Op::MoeFfn` arm is `rows >= 2 && !reference` (confirmed), so decode takes the
+  `ExpertActs::Raw` path with a `Vec<f32>` per output row. `moe.rs` documents
+  this as deliberate for exact Metal parity; changing it is a precision flip
+  that needs re-blessed goldens. Not measured.
+- **CPU Q5_0 `Op::Linear` at one row** falls to the generic dequant arm, while
+  the multi-row path uses `vec_dot_q5_0_32_batch` (the multi-row arm confirmed),
+  so decode and prefill run at different activation precision for Q5_0.
+- **`x_stride` is ignored by CPU `Op::QkNorm` / `Op::Rope`** and hard-coded in
+  `Op::QkNormRope`, where Metal asserts or uses it. They agree for the one
+  emitter that passes a non-zero stride.

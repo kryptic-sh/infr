@@ -3671,113 +3671,56 @@ error-path leaks are fixed. What is left is all test coverage:
 - The dense-streaming `forget_unsubmitted` and the host-read-failure ordering
   have no direct test.
 
-### B120 — device features assumed rather than checked (2026-11-11)
+### B120 — Vulkan findings confirmed by reading and not fixed (2026-11-12)
 
-In `VulkanBackend::new_selected` (`lib.rs`):
+The 2026-11-12 slice fixed the tall lm_head over-read, the narrow warp GEMM at
+`in_f % 64 == 32` (every BK=64 route, not only `matmul_native_off`), the mmq
+scratch rows, the `store_q8` subgroup pin, the unchecked device features, the
+zero split override, the `tp_record_copies` extents and the unused descriptor
+pool. These were confirmed and left:
 
-- `shader_int8(true)` is enabled unconditionally although `has_int8` is read a
-  few hundred lines earlier, so a device without it fails `create_device`
-  instead of producing the "falling back to another backend" message.
-- `try_make_compute_kernel` (`ops.rs`) sets `REQUIRE_FULL_SUBGROUPS` whenever a
-  subgroup size is pinned, but only `subgroup_size_control` is required;
-  `compute_full_subgroups` is read (`has_full_sg`) and passed through, never
-  required.
-- `Recorder::vkb` (`recorder.rs`) asserts `maxStorageBufferRange` for
-  resident-BDA sub-tensors only. Ordinary buffers are bound with `WHOLE_SIZE`
-  and no check, so an activation or scratch buffer larger than the device limit
-  is bound out of range. The nonfa attention scratch grows with context.
+- **`sample_topk` exact ties are resolved by scheduling.** When more than k
+  logits tie exactly at the threshold, Phase B's `atomicAdd` slot claim decides
+  which survive. Needs a decision: a deterministic tie-break has to match the
+  host sampler, and the decode sampler needs a perf check afterwards.
+- **UMA budget drift.** On a unified-memory device without
+  `VK_EXT_memory_budget`, spilled bytes are never added to `device_used` while
+  the total counts every heap (`vram_budget_fits`). Both GPUs here expose the
+  extension, so no test can fail here.
+- **The replay tape ignores later bindings.** `execute` / `execute_chain` never
+  compare bindings after the first record. Not reachable today: the runner
+  compiles a new plan per generation (`be.compile(&g)`). A hard guard was not
+  added because it could not be run against a real decode loop without a model.
+- **The Q3_K decoders read one word past an odd last block** in source, into the
+  unused `.w` lane. Not observable: a 610304-row tensor exactly filling its
+  arena block ran under GPU-assisted validation with no report, the dead load
+  being removed by the compiler. Left as is.
+- **`cmd_pool`'s Mutex serialises nothing**; only its comments were corrected.
+  The pool's external synchronisation relies on one thread driving a backend at
+  a time (`StepGate` under `serve --parallel`).
 
-The code is confirmed by reading. Which real devices lack these features or
-report a small enough limit is not known; every desktop driver checked so far
-exposes them. Not listed in `perf/vulkan-review.md`.
+Not verified, because no device here can show it:
 
-### B121 — smaller Vulkan findings (2026-11-11)
+- `store_q8` / `store_q8_dyn` now pin a 32-wide subgroup. Both RADV devices
+  already have a minimum of 32, so no test fails without the pin; it needs a
+  device whose default subgroup is narrower (Intel ANV at SIMD16).
+- A device missing `shaderInt8` or `computeFullSubgroups` is refused at backend
+  creation with the feature named, after the wave32 check. The check itself has
+  a unit test; the call site has never run against a device that lacks either.
+- An `Activations` or `KvCache` buffer larger than `maxStorageBufferRange` is
+  refused at creation, since both are bound whole. On RADV no buffer can be
+  created that large. On a driver with a lower limit, an over-size KV cache
+  fails model load with a clear error and an over-size activation scratch fails
+  mid-generation, and nothing in the fit ladder reads the limit. Binding the
+  inert KV descriptor with an explicit capped range would remove the KV half.
+- The B122 and mmq-scratch tests (`mmv_mrow_tall_head`, `mmq_scratch_rows`) can
+  only fail through GPU-assisted validation: the over-read changes no output.
+  Without the Khronos validation layer they check the numeric result only and
+  print a warning saying so. They are `#[ignore]`, so CI never runs them.
 
-- **A zero split override divides by zero.** `kernels.vulkan.pv_splits` or
-  `flash_splits` set to 0 reaches `kv_pad.div_ceil(n_splits)` in
-  `Recorder::attention_prefill_nonfa` and the equivalent in the flash recorders.
-  Confirmed by reading; the config layer accepts any integer.
-- **`cmd_pool: Mutex<vk::CommandPool>` serialises nothing.** Every use is
-  `*cmd_pool.lock().unwrap()`, which copies the handle and drops the guard in
-  the same statement, while a doc comment in `lib.rs` says operations are
-  serialised through it. External synchronisation of the pool rests on the
-  seam's GPU baton (see B93). Confirmed by reading; fix the comment or hold the
-  guard.
-- **`tp_record_copies` (`tp_sem.rs`) has no extent check.** It builds
-  `vkCmdCopyBuffer` regions from caller-supplied byte counts without the
-  `check_extent` guard `Backend::copy_buffer` applies. Gated multi-GPU path.
-  Confirmed by reading.
-- **Reported, not re-verified:** on unified-memory devices without
-  `VK_EXT_memory_budget`, `vram_budget_fits` counts all heaps as the total but
-  never adds spilled allocations to `device_used`, so the guard stops seeing
-  spills (RADV and ANV expose the extension, so this is not reachable there).
-  The decode replay tape is recorded against the first `execute` call's bindings
-  and never compares later ones; the only caller today builds one `Bindings` per
-  generation. `Recorder::new_inner` creates a descriptor pool for every recorder
-  even on the push-descriptor path, where it is never used; the cost was not
-  measured.
-
-### B122 — the 4-output lm_head GEMV decodes weights past the tensor on padding workgroups (2026-11-11)
-
-`native_mmv_mrow.comp`'s `-DOUTS4` `main()` has no `o0 >= pc.out_f` early
-return. Its comment says the `live` guard covers padding workgroups, but `live`
-only gates the writes: the weight base is still computed as
-`pc.w_base + o0 * pc.in_f` and the whole `wdec` loop runs through the 64-bit
-weight pointer. The non-OUTS4 `main()` in the same file returns early.
-
-Padding workgroups exist whenever the group count exceeds
-`Recorder::MAX_GROUP_COUNT_X` (65535) and `dispatch_wide` splits into a 2-D
-grid. `Recorder::linear_mmv_mrow_at` picks the 4-output build when
-`in_f < 2048 && kernels.vulkan.mmv_o4` and dispatches `ceil(out_f / 4)` groups,
-so `out_f = 262144` gives 65536 groups, issued as 65535 × 2 — 65534 padding
-workgroups, each decoding a row up to one tensor-length past the end. That is
-both an out-of-bounds read and roughly double the head's work per token.
-
-Confirmed by reading the shader and the dispatcher. Inferred: that a real model
-takes this route (the small Gemma 3 files have a 262144 vocabulary and an
-embedding width under 2048, with a K-quant tied head), and what the driver does
-with the reads. Not measured. Fix: the same early return the sibling has.
-
-### B123 — the narrow warp GEMM is wrong when `in_f % 64 == 32` (2026-11-11)
-
-`Recorder::matmul_native_off` selects a warptile whenever
-`k.is_multiple_of(32)`, and the adapter's `gemm_ok` is `in_f % 32 == 0`. The
-narrow (`_n128`, `-DNARROW_N`) builds of `native_gemm_warp.comp` use `BK = 64`
-and loop `for (k0 = 0; k0 < pc.k; k0 += BK)` with no guard on `k0 + kb < pc.k`
-in the weight staging (`dqblk`), the activation staging or the direct
-`coopMatLoad`. With `in_f ≡ 32 (mod 64)` the last stage folds the first 32
-elements of the next row and column into each result, and reads past both
-buffers on the last row. The other `BK = 64` tiers in `adapter.rs` (`cm8_ok`,
-the f8 and bf16 narrow picks) already require `in_f % 64 == 0`.
-
-Only 32-element-block and float formats can reach it (Q4_0, Q5_0, Q5_1, Q8_0,
-IQ4_NL, BF16); K-quant rows are multiples of 256. It also needs
-`out_f % 128 == 0`, more than one row, and a cooperative-matrix device.
-
-Confirmed by reading the shader loop and both host gates. Not established: a
-real file with such a width — none of the validated models has one, so this is
-latent. No test was run. Fix: require `k % 64 == 0` for the narrow pick.
-
-### B124 — smaller shader findings (2026-11-11)
-
-- **`store_q8.comp` relies on a 32-lane subgroup but is not pinned to one.** It
-  takes the block scale from `subgroupMax` and stores it from lane 0, with
-  `local_size_x = 32`. `Recorder::store_q8` and `store_q8_dyn` create it with
-  `kernel(..)`, whereas the twin `quant_q8` uses `kernel_sg(.., 32)`. On a
-  device whose default subgroup is narrower than 32, lanes outside the first
-  subgroup would quantise with a different scale than the one stored. Confirmed
-  by reading; whether such a device gets through backend selection is not
-  checked.
-- **The mmq GEMMs read activation scratch past `m` rows.** The adapter pools
-  `mmq_qa` / `mmq_dact` at exactly `m` rows while the `native_gemm_mmq_*`
-  shaders stage whole row tiles. The results land in padded rows that are
-  ignored, so unlike B116 there is no NaN path — only an out-of-range read.
-  Scratch sizes confirmed by reading; the shader side is as reported.
-- **Reported, not re-verified:** `sample_topk.comp` claims output slots with
-  `atomicAdd`, so when more than k logits tie exactly at the threshold the
-  surviving set depends on scheduling and one seed can give different tokens.
-  The Q3_K `dqblk` in `native_decode.glsl` loads one word past the 110-byte
-  block on odd blocks; only an unused lane depends on it.
+Worth measuring in a quiet window: decode on a 262144-token head with a narrow
+embedding (padding workgroups now exit at once, so it should be faster), and the
+KV-store kernel on RADV after the subgroup pin.
 
 ### B125 — Metal: in-graph sampling can read a different uniform slot than the runner wrote (2026-11-11)
 
@@ -4086,17 +4029,13 @@ tier, and the full `--include-ignored` run completes on the iGPU.
 
 The test reviewer was asked, for six of the findings above, whether an existing
 test would fail. All six answers were no; B116, B129 and B130 have since been
-fixed with tests, and the remaining three are:
+fixed with tests, as have B122 and B123, and the remaining one is:
 
-- B122 (262144-row head): no GEMV test is that tall, and a token comparison
-  cannot see an out-of-bounds read.
-- B123 (`in_f % 64 == 32`): every native GEMM shape tested uses a width of 64,
-  256, 512 or 2048.
 - B125 (Metal sampling on a llama-family model): the sampling test uses Qwen3
   and compares Metal with Metal; the Llama test is greedy; neither runs in CI.
 
-These are the reviewer's answers from reading the tests, not re-checked. Each is
-the test to write first when the corresponding entry is picked up.
+This is the reviewer's answer from reading the tests, not re-checked. It is the
+test to write first when the entry is picked up.
 
 ### B143 — the macOS `glslc` install is retried but not cached (2026-11-12)
 

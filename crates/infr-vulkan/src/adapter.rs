@@ -884,14 +884,18 @@ fn native_warp_gemm(
     // INFR_GEMM_DIRECT_A=1: skip the store_f16 pass — the _direct kernel variants read f32
     // activations directly and cast to f16 in As staging (saves one dispatch + barrier per GEMM
     // at the cost of reintroducing As shared memory).
+    // The narrow (BN=128) tiles behind the direct, A_GLOBAL and split-K routes stage k 64 at a
+    // time with no tail guard, so an `in_f` that is only a multiple of 32 must take
+    // `matmul_native_off`, which falls back to a BK=32 tile.
+    let k64 = in_f.is_multiple_of(64);
     let direct_a = be_.cfg().kernels.vulkan.gemm_direct_a;
     let use_direct = direct_a
         && out_f.is_multiple_of(128)
-        && in_f.is_multiple_of(32)
+        && k64
         && crate::gemm::native_gemm_warp_n128_direct_kernel_name(dt).is_some();
     let use_ag = !use_direct
         && out_f.is_multiple_of(128)
-        && in_f.is_multiple_of(32)
+        && k64
         && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
         && be_.cfg().kernels.vulkan.gemm_warp;
     let a16 = if use_ag {
@@ -903,7 +907,7 @@ fn native_warp_gemm(
         None
     };
     let splits = split_k_plan(m, in_f, out_f);
-    if splits > 1 && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some() {
+    if splits > 1 && k64 && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some() {
         let mpad = m.div_ceil(64) * 64;
         let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
         let a: &dyn Buffer = match &a16 {
@@ -1671,10 +1675,13 @@ fn lower_op(
                     {
                         // mmq (dp4a int8): quantize activations once, integer matmul on raw blocks.
                         // Scratch is pooled — every same-shape Linear in the graph reuses one set.
+                        // Sized to whole 64-row tiles: the mmq shaders stage every row of the last
+                        // tile, and only the `m` real rows are quantized.
                         let nblk = in_f / 32;
-                        let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
-                        let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
-                        let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
+                        let mpad = m.div_ceil(64) * 64;
+                        let qa = pooled(pool, be_, "mmq_qa", mpad * in_f)?;
+                        let dact = pooled(pool, be_, "mmq_dact", mpad * nblk * 2)?;
+                        let sact = pooled(pool, be_, "mmq_sact", mpad * nblk * 2)?;
                         rec.quant_q8(
                             xb,
                             pool[&qa].as_ref(),
@@ -1724,6 +1731,7 @@ fn lower_op(
                         let splits = split_k_plan(m, in_f, out_f);
                         if matches!(dt, infr_core::DType::F16)
                             && splits > 1
+                            && in_f.is_multiple_of(64)
                             && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some()
                             && be_.cfg().kernels.vulkan.gemm_warp
                         {
@@ -1761,9 +1769,10 @@ fn lower_op(
                         // Same pooled scratch tags/sizes as the coopmat tier's Q4_K-mmq arm — the
                         // two arms are mutually exclusive per device, so the tags never collide.
                         let nblk = in_f / 32;
-                        let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
-                        let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
-                        let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
+                        let mpad = m.div_ceil(64) * 64;
+                        let qa = pooled(pool, be_, "mmq_qa", mpad * in_f)?;
+                        let dact = pooled(pool, be_, "mmq_dact", mpad * nblk * 2)?;
+                        let sact = pooled(pool, be_, "mmq_sact", mpad * nblk * 2)?;
                         rec.quant_q8(
                             xb,
                             pool[&qa].as_ref(),
@@ -7215,6 +7224,86 @@ mod tests {
                 want[o]
             );
         }
+    }
+
+    /// Prefill GEMMs whose `in_f` is a multiple of 32 but not of 64 must match a host reference.
+    /// The narrow warptiles stage k in 64-wide steps with no tail guard, so on such a width the
+    /// last step folds the next row's first 32 elements into every dot. Each shape reaches one of
+    /// the routes that picked such a tile: the A_GLOBAL tile (Q8_0), split-K (`in_f >= 1024`,
+    /// Q8_0 and the F16 arm), and `matmul_native_off`'s narrow pick (Q5_0, BF16 — no A_GLOBAL
+    /// build).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn linear_gemm_k_odd_32_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        if !crate::test_has_f16_coopmat(&be_, "linear_gemm_k_odd_32_matches_host") {
+            return;
+        }
+        let (m, out_f) = (64usize, 128usize);
+        let mut bad = Vec::new();
+        for (dt, in_f) in [
+            (DType::Q8_0, 480usize),
+            (DType::Q8_0, 1056),
+            (DType::Q5_0, 480),
+            (DType::Bf16, 480),
+            (DType::F16, 1056),
+        ] {
+            let (blk_elems, blk_bytes) = infr_gguf::block_layout(dt);
+            // 0x00..=0x3F keeps every f16/bf16 scale or value finite and small.
+            let wb: Vec<u8> = (0..out_f * in_f / blk_elems * blk_bytes)
+                .map(|i| ((i.wrapping_mul(2654435761) >> 7) % 0x40) as u8)
+                .collect();
+            let x: Vec<f32> = (0..m * in_f)
+                .map(|i| ((i % 97) as f32 - 48.0) * 0.021)
+                .collect();
+            let want = infr_testkit::ref_linear(
+                &x,
+                &infr_testkit::dequant_oracle(dt, &wb),
+                m,
+                in_f,
+                out_f,
+            );
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+            let wi = g.weight(TensorDesc::new(vec![out_f, in_f], dt));
+            let yi = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+            g.push(Op::Linear {
+                x: xi,
+                weight: wi,
+                dst: yi,
+                m: m as u32,
+                in_f: in_f as u32,
+                out_f: out_f as u32,
+                w_off: 0,
+            });
+            let got = infr_testkit::run_graph(
+                &be_,
+                &g,
+                &[(xi, infr_testkit::f32_bytes(&x)), (wi, wb)],
+                yi,
+                m * out_f,
+            );
+            // Worst deviation against the reference RMS: f16 operands land near 1e-3, a folded
+            // 32-element tail near 1.
+            let rms =
+                (want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
+            let worst = got.iter().zip(&want).fold(0f64, |a, (g, w)| {
+                infr_testkit::nan_max64(a, (*g as f64 - *w as f64).abs())
+            });
+            println!(
+                "{dt:?} m={m} in_f={in_f} out_f={out_f}: {:.2e} of the output RMS",
+                worst / rms
+            );
+            if worst / rms >= 1e-2 {
+                bad.push(format!("{dt:?} in_f={in_f}"));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "GEMMs diverge from the host reference: {bad:?}"
+        );
     }
 
     /// A one-op `GatedAct` (SwiGLU: silu(gate)·up) graph through the seam must match a host loop.

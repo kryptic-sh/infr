@@ -41,6 +41,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Vulkan weight paging: a request that fails part-way no longer leaves the
   pager believing weights were uploaded.** The next request used whatever the
   slot held before; it now re-uploads them.
+- **Vulkan: models with a very large vocabulary and a narrow embedding (the
+  small Gemma 3 files) no longer read past the output weight on every decoded
+  token**, which also roughly doubled the work of the final projection.
+- **Vulkan: a weight whose input width is an odd multiple of 32 gave wrong
+  prefill results** on GPUs with the f16 cooperative-matrix tier, for the
+  32-element-block quants (Q4_0, Q5_0, Q5_1, Q8_0, IQ4_NL) and BF16 / F16. Those
+  shapes now use a kernel that handles the width.
+- **Vulkan: a GPU missing `shaderInt8` or `computeFullSubgroups` is refused at
+  startup with the feature named**, instead of an unnamed device-creation error.
+- **`kernels.vulkan.pv_splits = 0` or `kernels.vulkan.flash_splits = 0` no
+  longer panics with a division by zero**; zero now means the adaptive default.
 
 ### Changed
 

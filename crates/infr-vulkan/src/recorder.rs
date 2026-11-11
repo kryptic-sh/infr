@@ -832,7 +832,8 @@ pub struct Recorder<'a> {
     cmd: vk::CommandBuffer,
     /// Descriptor pools, GROWN on exhaustion (a batched-MoE prefill chunk records ~50k dispatches
     /// — far beyond any fixed max_sets). The last entry is the active pool; `alloc_set` appends a
-    /// fresh one on ERROR_OUT_OF_POOL_MEMORY.
+    /// fresh one on ERROR_OUT_OF_POOL_MEMORY. Empty on the push-descriptor path, which never
+    /// allocates a set.
     pools: std::cell::RefCell<Vec<vk::DescriptorPool>>,
     /// Buffers written since the last barrier (for read-after-write / write-after-write detection).
     dirty_writes: RefCell<HashSet<vk::Buffer>>,
@@ -971,8 +972,13 @@ impl<'a> Recorder<'a> {
         }
         .map_err(|e| be(format!("begin cmd buffer: {e}")))?;
 
-        // Big pool: one descriptor set per recorded op.
-        let pool = Self::new_desc_pool(device)?;
+        // Big pool: one descriptor set per recorded op. Push descriptors record every binding into
+        // the command buffer and never allocate a set, so that path creates no pool at all.
+        let pools = if backend.shared.push_descriptor.is_some() {
+            Vec::new()
+        } else {
+            vec![Self::new_desc_pool(device)?]
+        };
 
         // Per-DISPATCH stamps (auto-labels): a batched prefill chunk can record tens of
         // thousands of dispatches; 64k × 8 B = 512 KiB of query pool, profiling runs only.
@@ -1007,7 +1013,7 @@ impl<'a> Recorder<'a> {
         Ok(Self {
             be: backend,
             cmd,
-            pools: std::cell::RefCell::new(vec![pool]),
+            pools: std::cell::RefCell::new(pools),
             dirty_writes: RefCell::new(HashSet::new()),
             dirty_reads: RefCell::new(HashSet::new()),
             dirty_transfer: std::cell::Cell::new(false),
@@ -2110,7 +2116,8 @@ impl<'a> Recorder<'a> {
         let warp = if k.is_multiple_of(32) && self.vk().gemm_warp {
             if use_wide {
                 crate::gemm::native_gemm_warp_kernel_name(dtype).map(|_| 256usize)
-            } else if n.is_multiple_of(128) {
+            } else if n.is_multiple_of(128) && k.is_multiple_of(64) {
+                // The narrow tile's k-stage is 64 wide with no tail guard.
                 crate::gemm::native_gemm_warp_n128_kernel_name(dtype).map(|_| 128usize)
             } else {
                 None
@@ -2218,7 +2225,8 @@ impl<'a> Recorder<'a> {
     /// [`matmul_native_off`](Self::matmul_native_off) with A already converted to f16 (padded to
     /// ceil(m/64)·64 rows) — the A_GLOBAL warptiles coopMatLoad A straight from global, dropping
     /// the As stage/LDS (occupancy 2→3 wgs/WGP: ~1.5x on the 8B shapes). Same tile pick as the
-    /// f32 path; caller guarantees k%32==0, n%128==0 and that the _ag SPIR-V exists for `dtype`
+    /// f32 path; caller guarantees k%64==0 for the narrow tile (k%32==0 for the wide one),
+    /// n%128==0 and that the _ag SPIR-V exists for `dtype`
     /// (`native_gemm_warp_ag_kernel_name(dtype).is_some()`). Numerics are bit-identical to the f32
     /// path: the staging loop rounded A to f16 anyway, and the MMA order is unchanged.
     #[allow(clippy::too_many_arguments)]
@@ -2274,6 +2282,10 @@ impl<'a> Recorder<'a> {
             .flatten();
         // Resident A_GLOBAL tile NAME the `_streamed` twin keys off — the weight is read by 64-bit
         // address, so nothing binds a resident SSBO; the getters report the tile name/availability.
+        assert!(
+            use_wide || k.is_multiple_of(64),
+            "matmul_native_f16a: the narrow tile stages k 64 at a time (got k={k})"
+        );
         let (name, bn, bm): (&str, usize, usize) = if use_wide {
             (
                 crate::gemm::native_gemm_warp_ag_kernel_name(dtype).expect("ag name"),
@@ -2317,7 +2329,7 @@ impl<'a> Recorder<'a> {
     /// [`matmul_native_f16a`](Self::matmul_native_f16a) with f32 activations read directly — no
     /// separate `store_f16` pass. The `_direct` kernel variants stage f32→f16 to As shared memory
     /// and coopMatLoad from there. Same tile shapes as the n128_ag family (BM=64/32/16, BN=128,
-    /// BK=64). Requires `n%128==0`, `k%32==0`, and that the `_direct` SPIR-V exists for `dtype`
+    /// BK=64). Requires `n%128==0`, `k%64==0`, and that the `_direct` SPIR-V exists for `dtype`
     /// (`native_gemm_warp_n128_direct_kernel_name(dtype).is_some()`). Numerics: the f32→f16 cast
     /// is the same rounding the old `store_f16` pass did, so the GEMM is bit-identical to the
     /// store_f16 + n128_ag path.
@@ -2346,6 +2358,10 @@ impl<'a> Recorder<'a> {
         let bm32 = small_bm
             .then(|| crate::gemm::native_gemm_warp_n128_direct_bm32_kernel_name(dtype))
             .flatten();
+        assert!(
+            k.is_multiple_of(64),
+            "matmul_native_f32a: the narrow tile stages k 64 at a time (got k={k})"
+        );
         let (name, bm): (&str, usize) = if let Some(name) = bm16 {
             (name, 16)
         } else if let Some(name) = bm32 {
@@ -2383,7 +2399,7 @@ impl<'a> Recorder<'a> {
     /// SPLIT-K narrow-warptile GEMM: `splits` k-partials into `partials` ([splits, mpad, n] f32),
     /// then the deterministic fixed-order reduce into `c`. The occupancy fix for narrow-n GEMMs
     /// with deep k (o/down projections: n = n_embd, k = 2-3·n_embd — 64 workgroups on a 96-wg
-    /// part with the plain tile). Requires n%128==0, k%32==0; caller sizes `partials` to
+    /// part with the plain tile). Requires n%128==0, k%64==0; caller sizes `partials` to
     /// `splits · ceil(m/64)·64 · n · 4` bytes. `a_is_f16`: A is the caller's f16 cast-copy
     /// (padded rows) and the A_GLOBAL tile is used — see [`matmul_native_f16a`](Self::matmul_native_f16a).
     #[allow(clippy::too_many_arguments)]
@@ -2412,6 +2428,10 @@ impl<'a> Recorder<'a> {
         // in `matmul_native_f16a` (the non-split-K n128_ag family), which had no such fill floor.
         // Resident split-K tile NAME the `_streamed` twin keys off — the weight is read by 64-bit
         // address, so nothing binds a resident SSBO; the getters report the tile name/availability.
+        assert!(
+            k.is_multiple_of(64),
+            "matmul_native_splitk: the narrow tile stages k 64 at a time (got k={k})"
+        );
         let name = if a_is_f16 {
             crate::gemm::native_gemm_warp_sk_ag_kernel_name(dtype).expect("split-k ag name")
         } else {
@@ -5153,8 +5173,13 @@ impl<'a> Recorder<'a> {
         let pv_base_wg = (mpad / 64) * (hdu / 64) * nh as u32;
         // `pv_splits` is `Option<usize>` in the config; the dispatch count is a u32, so an
         // out-of-range override falls back to the adaptive policy exactly as `.parse::<u32>().ok()`
-        // did at the old env read.
-        let n_splits = match self.vk().pv_splits.and_then(|v| u32::try_from(v).ok()) {
+        // did at the old env read. Zero is out of range too: it is the `ksplit` divisor below.
+        let n_splits = match self
+            .vk()
+            .pv_splits
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0)
+        {
             Some(v) => v,
             None => {
                 if pv_base_wg >= 1024 || kv_pad < 4096 {
@@ -5275,7 +5300,13 @@ impl<'a> Recorder<'a> {
             );
         }
         let base_wg = (mpad / 64) * nh as u32;
-        let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
+        // A zero override falls back like an out-of-range one (see `attention_prefill_nonfa`).
+        let n_splits = match self
+            .vk()
+            .flash_splits
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0)
+        {
             Some(v) => v,
             None => {
                 if base_wg >= 1024 || kv_len < 4096 {
@@ -5525,7 +5556,13 @@ impl<'a> Recorder<'a> {
             64
         };
         let base_wg = (mpad / br) * nh as u32;
-        let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
+        // A zero override falls back like an out-of-range one (see `attention_prefill_nonfa`).
+        let n_splits = match self
+            .vk()
+            .flash_splits
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0)
+        {
             Some(v) => v,
             None => {
                 if base_wg >= 1024 || kv_len < 4096 {
@@ -6047,7 +6084,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8", crate::gemm::store_q8_spv())
         };
-        let k = self.be.kernel(name, spv, 2, 24);
+        // Pinned like `quant_q8`: the block scale is one `subgroupMax` over the 32-lane workgroup.
+        let k = self.be.kernel_sg(name, spv, 2, 24, 32);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
@@ -6086,7 +6124,7 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8_dyn", crate::gemm::store_q8_dyn_spv())
         };
-        let k = self.be.kernel(name, spv, 3, 24);
+        let k = self.be.kernel_sg(name, spv, 3, 24, 32);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         // [4..8] off: unused (from params). [12..16] src_off: always 0 here (a single decode row
@@ -11291,6 +11329,45 @@ mod tests {
         run_attn_prefill_nonfa(&split, 128, 500, 2, 1, 128, 0, 0.0);
         run_attn_prefill_nonfa(&split, 128, 3000, 16, 8, 256, 200, 1.0); // SWA, long kv, split-K
         run_attn_prefill_nonfa(&split, 128, 3000, 16, 1, 512, 0, 1.0); // hd=512, long kv, split-K
+    }
+
+    /// A split override of zero falls back to the adaptive policy, like an out-of-range one,
+    /// instead of reaching the `ksplit` division.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_zero_split_override_falls_back() {
+        let zero = be_with(|v| {
+            v.pv_splits = Some(0);
+            v.flash_splits = Some(0);
+        });
+        if !crate::test_has_f16_coopmat(&zero, "attention_zero_split_override_falls_back") {
+            return;
+        }
+        run_attn_prefill_nonfa(&zero, 70, 300, 4, 2, 128, 0, 0.0);
+        run_attn_prefill_flash(&zero, 128, 500, 2, 1, 128);
+        run_attn_flash_reg(&zero, 200, 600, 2, 1, 128);
+    }
+
+    /// With push descriptors every binding goes into the command buffer, so a recorder there
+    /// creates no descriptor pool.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn push_descriptor_recorder_creates_no_pool() {
+        let be = be_with(|_| {});
+        if be.shared.push_descriptor.is_none() {
+            eprintln!(
+                "skip: push_descriptor_recorder_creates_no_pool needs VK_KHR_push_descriptor"
+            );
+            return;
+        }
+        let y = be.alloc(64 * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.scale(y.as_ref(), 2.0, 64);
+        assert!(
+            rec.pools.borrow().is_empty(),
+            "push-descriptor recorder created a pool"
+        );
+        rec.finish().unwrap();
     }
 
     #[allow(clippy::too_many_arguments)]

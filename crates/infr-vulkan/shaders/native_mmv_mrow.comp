@@ -600,10 +600,11 @@ void fuse_quant(uint row, uint s, out int aw[8], out float da, out float sa) {
 shared float part4[4u * MR * 16u];   // [out, row, lane]
 
 void main() {
-    // Flat-index recovery for a possibly-2-D dispatch grid — see native_gemv_rm.comp's main() for
-    // why no extra bounds check is needed here (the existing `live` guard below already covers a
-    // padding workgroup's out-of-range o0 for every lane).
+    // Flat-index recovery for a possibly-2-D dispatch grid. `live` below only gates the writes, and
+    // the weight row is still decoded through the 64-bit pointer, so a padding workgroup must return
+    // before it reads past the tensor. o0 is workgroup-uniform, so no barrier is skipped unevenly.
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 4u;
+    if (o0 >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint ot = t >> 4u;               // which of the 4 outputs this lane serves
@@ -710,9 +711,9 @@ void main() {
 }
 #else
 void main() {
-    // Flat-index recovery for a possibly-2-D dispatch grid — see native_mmv.comp's main() for why
-    // an explicit early return is needed here (the final `y_buf[t*pc.out_f + o0]` write below is
-    // unconditional on o0, unlike the OUTS4 variant above).
+    // Flat-index recovery for a possibly-2-D dispatch grid — see native_mmv.comp's main(). The
+    // early return keeps a padding workgroup from decoding a weight row past the tensor and from
+    // the final `y_buf[t*pc.out_f + o0]` write below, which is unconditional on o0.
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 2u;
     if (o0 >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;

@@ -211,6 +211,53 @@ pub(crate) fn max_storage_buffer_range() -> u32 {
     MAX_STORAGE_BUFFER_RANGE.load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread stand-in for [`max_storage_buffer_range`] at buffer creation, so a test can
+    /// reach [`check_bindable_size`] with buffers this machine can allocate without lowering the
+    /// process-wide limit under the tests running beside it.
+    static TEST_BIND_LIMIT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Activation and KV-cache buffers are bound `WHOLE_SIZE` (a KV cache as the store→read barrier's
+/// inert descriptor), and a whole binding's effective range is the buffer's size, which must fit
+/// `maxStorageBufferRange`. Refusing it here, where a `Result` exists, keeps the recorder's
+/// infallible bind helpers sound; arena sub-tensors check their own range in `Recorder::vkb`.
+/// Staging and readback buffers are not held to it: the large ones (the pager ring) are only ever
+/// copy sources.
+fn check_bindable_size(bytes: usize) -> Result<()> {
+    let limit = max_storage_buffer_range() as u64;
+    #[cfg(test)]
+    let limit = TEST_BIND_LIMIT.with(|l| l.get()).unwrap_or(limit);
+    let span = fill_span(bytes);
+    if span > limit {
+        return Err(be(format!(
+            "a {span}-byte buffer exceeds this device's maxStorageBufferRange ({limit} bytes), the \
+             most one descriptor binding may span"
+        )));
+    }
+    Ok(())
+}
+
+/// Device features the kernels rely on with no fallback: `shaderInt8` for the int8 arithmetic in
+/// the quantized kernels, and `computeFullSubgroups` for the `REQUIRE_FULL_SUBGROUPS` flag every
+/// subgroup-pinned pipeline is created with (`ops::try_make_compute_kernel`). A device without one
+/// is refused here, naming the feature, rather than failing `create_device` or pipeline creation.
+fn check_required_features(shader_int8: bool, compute_full_subgroups: bool) -> Result<()> {
+    for (have, name) in [
+        (shader_int8, "shaderInt8"),
+        (compute_full_subgroups, "computeFullSubgroups"),
+    ] {
+        if !have {
+            return Err(be(format!(
+                "infr's Vulkan backend requires the {name} device feature, which this device does \
+                 not report — falling back to another backend"
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ── shared GPU state ──────────────────────────────────────────────────────────
 
 /// Device memory snapshot from [`VulkanBackend::vram`]. `available` is live free bytes when
@@ -258,7 +305,11 @@ struct VulkanShared {
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
-    /// Serialises all one-shot command-buffer submissions.
+    /// The command pool every recorder and one-shot submission allocates from. Every use copies
+    /// the handle out and drops the guard in the same statement, so this lock serialises nothing:
+    /// Vulkan's external synchronisation of the pool (allocate, record, free) rests on callers not
+    /// driving one backend from two threads at once — under `infr serve` that is the per-step GPU
+    /// baton (`StepGate`).
     cmd_pool: Mutex<vk::CommandPool>,
     /// Must be dropped before the device is destroyed.
     allocator: ManuallyDrop<Mutex<Allocator>>,
@@ -2097,7 +2148,7 @@ impl VulkanBackend {
         //   (required by coopmat), cooperativeMatrix itself.
         let mut shader_f16_ci = vk::PhysicalDeviceShaderFloat16Int8Features::default()
             .shader_float16(has_f16)
-            .shader_int8(true);
+            .shader_int8(has_int8);
         let mut storage16_ci = vk::PhysicalDevice16BitStorageFeatures::default()
             .storage_buffer16_bit_access(has_16bit_storage);
         let mut storage8_ci = vk::PhysicalDevice8BitStorageFeatures::default()
@@ -2239,6 +2290,8 @@ impl VulkanBackend {
                  subgroup_size_control={has_sgsize} — falling back to another backend"
             )));
         }
+        // After the wave32 check, whose message says more about a device without subgroup control.
+        check_required_features(has_int8, has_full_sg)?;
 
         // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────
         // Capability-driven: any device whose smallest pinnable subgroup is ≤16 likely has
@@ -3571,6 +3624,9 @@ impl VulkanBackend {
         // Weights are addressed exclusively by 64-bit device address: every `BufferUsage::Weights`
         // alloc sub-allocates from the BDA arena (`bda_weight_alloc`), the ONE weight path. Every
         // other `BufferUsage` takes the gpu-allocator path in `make_buf` below.
+        if matches!(usage, BufferUsage::Activations | BufferUsage::KvCache) {
+            check_bindable_size(bytes)?;
+        }
         if usage == BufferUsage::Weights {
             let buf = self.bda_weight_alloc(bytes)?;
             if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
@@ -3780,8 +3836,8 @@ impl VulkanBackend {
     /// Record a single command into a one-shot command buffer, submit it to the
     /// compute queue, and block until idle.
     ///
-    /// The closure receives the command buffer handle to record into.
-    /// All operations are serialised through the `cmd_pool` mutex.
+    /// The closure receives the command buffer handle to record into. Not serialised against
+    /// other users of the pool — see `VulkanShared::cmd_pool`.
     fn one_shot(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
         let device = &self.shared.device;
         let pool = *self.shared.cmd_pool.lock().unwrap();
@@ -4552,6 +4608,81 @@ mod tests {
         }
     }
 
+    /// A device missing a feature the kernels need without fallback is refused with the feature
+    /// named, and a device with both is accepted.
+    #[test]
+    fn required_features_are_named_when_missing() {
+        assert!(check_required_features(true, true).is_ok());
+        for (int8, full_sg, name) in [
+            (false, true, "shaderInt8"),
+            (true, false, "computeFullSubgroups"),
+        ] {
+            let msg = check_required_features(int8, full_sg)
+                .expect_err("a missing required feature must refuse the device")
+                .to_string();
+            assert!(msg.contains(name), "error does not name {name}: {msg}");
+        }
+    }
+
+    /// A buffer the recorder binds whole must fit `maxStorageBufferRange`, so creation refuses a
+    /// bigger one with an error rather than leaving the bind to exceed the limit. Weights live in
+    /// the arena and are bound by sub-range, and a staging buffer may be a copy-only ring larger
+    /// than any binding, so neither is held to it. The limit is lowered on this test's thread
+    /// only, since no device here reports one a buffer can exceed.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn buffers_bound_whole_are_refused_past_the_storage_range() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        const LIMIT: usize = 1 << 20;
+        TEST_BIND_LIMIT.with(|l| l.set(Some(LIMIT as u64)));
+        assert!(be_.alloc(LIMIT, BufferUsage::Activations).is_ok());
+        for usage in [BufferUsage::Activations, BufferUsage::KvCache] {
+            let err = match be_.alloc(LIMIT + 4, usage) {
+                Ok(_) => panic!("{usage:?}: a buffer past maxStorageBufferRange must be refused"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("maxStorageBufferRange"), "{usage:?}: {err}");
+        }
+        for usage in [
+            BufferUsage::Weights,
+            BufferUsage::Staging,
+            BufferUsage::Readback,
+        ] {
+            assert!(be_.alloc(2 * LIMIT, usage).is_ok(), "{usage:?}");
+        }
+        TEST_BIND_LIMIT.with(|l| l.set(None));
+    }
+
+    /// `tp_record_copies` builds `vkCmdCopyBuffer` regions from caller byte counts; one that runs
+    /// past either buffer must be refused before anything is recorded or submitted.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn tp_copies_reject_out_of_bounds_extents() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let small = be_.alloc(256, BufferUsage::Activations).unwrap();
+        let big = be_.alloc(1024, BufferUsage::Activations).unwrap();
+        // Source too short first, so a missing check only over-reads on the red run.
+        let err = be_
+            .p2p_gather_copy(small.as_ref(), big.as_ref(), 512)
+            .expect_err("a copy reading past its source must be refused");
+        assert!(
+            err.to_string()
+                .contains("512 bytes out of a 256-byte buffer"),
+            "{err}"
+        );
+        let err = be_
+            .p2p_gather_copy(big.as_ref(), small.as_ref(), 512)
+            .expect_err("a copy writing past its destination must be refused");
+        assert!(
+            err.to_string().contains("512 bytes into a 256-byte buffer"),
+            "{err}"
+        );
+    }
+
     /// The transfer bounds guard shared by `upload`/`download`/`copy_buffer` (no GPU needed — this
     /// is why the check is a free function over two `usize`s instead of inline in each method).
     ///
@@ -5013,7 +5144,8 @@ mod tests {
 
         let (m, k, n) = (32usize, 32usize, 32usize);
         let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.01).collect();
+        // Different from `a`, so a kernel that read A in place of B cannot match the reference.
+        let b: Vec<f32> = (0..k * n).map(|i| 1.0 - (i % 37) as f32 * 0.03).collect();
 
         // CPU reference
         let mut c_ref = vec![0.0f32; m * n];

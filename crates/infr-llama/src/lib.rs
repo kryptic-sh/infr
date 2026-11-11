@@ -60,12 +60,76 @@ pub fn is_llama4(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The prompt plus the reply budget does not fit the KV context. Typed rather than a bare message
+/// so `infr serve` can answer it as an over-long REQUEST (the client's to fix) instead of a server
+/// fault the client would retry unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextOverflow {
+    pub prompt: usize,
+    pub gen: usize,
+    pub max_ctx: usize,
+}
+
+impl std::fmt::Display for ContextOverflow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "prompt {} + gen {} exceeds the session KV capacity {}",
+            self.prompt, self.gen, self.max_ctx
+        )
+    }
+}
+
+impl std::error::Error for ContextOverflow {}
+
 /// Per-turn generation timing — backend-agnostic (shared by the CPU runner and the GPU
 /// `ChatTurn` path). `prompt_secs` = prefill (time to first token), `decode_secs` = generation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct GenStats {
+    /// Prompt tokens PREFILLED by this call. On a KV prefix-cache hit that is only the un-cached
+    /// suffix; the whole prompt is `n_prompt + n_cached`.
     pub n_prompt: usize,
     pub prompt_secs: f64,
     pub n_gen: usize,
     pub decode_secs: f64,
+    /// Prompt tokens reused from the KV prefix cache instead of prefilled.
+    pub n_cached: usize,
+    /// The reply ran out of context, not out of the caller's budget: the engine lowered `max_new`
+    /// to the room the context had left, and the generation used all of that lowered budget. The
+    /// caller's own `n_gen >= max_new` test cannot see this case. See [`ran_out_of_context`].
+    pub ctx_full: bool,
+    /// The generation ended itself — it sampled EOS, or a grammar-constrained span completed — so
+    /// it did not run out of budget even when `n_gen` reached it (the EOS token is counted).
+    /// Reported by the dense seam runner; `false` from paths that do not track it.
+    pub natural_stop: bool,
+}
+
+/// Whether a generation that asked for `asked` tokens, was given only `budget` because the
+/// context had no more room, and ended with `stats`, was cut off by the context.
+pub(crate) fn ran_out_of_context(asked: usize, budget: usize, stats: &GenStats) -> bool {
+    budget < asked && stats.n_gen >= budget && !stats.natural_stop
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ran_out_of_context, GenStats};
+
+    fn stats(n_gen: usize, natural_stop: bool) -> GenStats {
+        GenStats {
+            n_gen,
+            natural_stop,
+            ..Default::default()
+        }
+    }
+
+    /// The reply used every token the context had left: cut off. The same count ending on EOS is
+    /// the model finishing (the EOS token is counted in `n_gen`), and a budget the context did not
+    /// lower is the caller's own `max_tokens`, not the context.
+    #[test]
+    fn only_a_lowered_budget_used_up_without_eos_is_a_context_cut() {
+        assert!(ran_out_of_context(2048, 95, &stats(95, false)));
+        assert!(!ran_out_of_context(2048, 95, &stats(95, true)));
+        assert!(!ran_out_of_context(2048, 95, &stats(40, false)));
+        assert!(!ran_out_of_context(2048, 2048, &stats(2048, false)));
+    }
 }

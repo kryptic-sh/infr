@@ -1769,12 +1769,34 @@ impl GenBackend for SeamGenerator {
         req: &infr_llama::sampling::RequestCtx,
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats> {
-        let mut model = self.model.lock().expect("serve generator poisoned");
+        let mut model = lock_recovered(&self.model);
         match constraint {
             Some(c) => model.generate_constrained(prompt, max_new, c, Some(req), on_piece),
             None => model.generate(prompt, max_new, Some(req), on_piece),
         }
     }
+}
+
+/// Take the serialised model even when a previous generation PANICKED while holding it.
+///
+/// The server survives a panicking generation (`spawn_blocking` turns it into a failed request),
+/// but the panic poisons this mutex, and an `expect` here would then fail every later request for
+/// the life of the process. A step that unwound half-way can leave the session's record of cached
+/// tokens describing work that never happened, so `reset_kv` drops that token/session state before
+/// reuse and the next request re-prefills from scratch. That is ALL it resets: state inside the
+/// backend that the panic broke (a lock it poisoned, a half-recorded submit) is not repaired, and
+/// requests that reach it will keep failing. Clearing the poison makes the reset happen once, not
+/// on every later request.
+fn lock_recovered(
+    m: &std::sync::Mutex<Box<dyn infr_llama::chat::ChatModel + Send>>,
+) -> std::sync::MutexGuard<'_, Box<dyn infr_llama::chat::ChatModel + Send>> {
+    m.lock().unwrap_or_else(|poisoned| {
+        let mut model = poisoned.into_inner();
+        tracing::warn!("a previous generation panicked; discarding its KV session");
+        model.reset_kv();
+        m.clear_poison();
+        model
+    })
 }
 
 impl GenBackend for ParallelGenerator {
@@ -1955,7 +1977,10 @@ fn run_chat(
                     &req,
                     &mut |p: &str| body.push_str(p),
                 )
-                .map_err(|e| anyhow::anyhow!("forced tool call failed: {e}"))?;
+                .map_err(|e| {
+                    context_length_exceeded(&e, params.max_tokens.is_some())
+                        .unwrap_or_else(|| anyhow::anyhow!("forced tool call failed: {e}"))
+                })?;
             let (name, arguments) = forced_tool_call(&body).ok_or_else(|| {
                 if gstats.n_gen >= max_new {
                     anyhow::anyhow!(
@@ -1966,11 +1991,7 @@ fn run_chat(
                 }
             })?;
             on_delta(infr_engine::Delta::ToolCall { name, arguments });
-            return Ok(infr_server::ChatOutcome {
-                finish: infr_server::Finish::ToolCalls,
-                prompt_tokens: gstats.n_prompt as u32,
-                completion_tokens: gstats.n_gen as u32,
-            });
+            return Ok(chat_outcome(infr_server::Finish::ToolCalls, &gstats));
         }
         let mut stream = infr_engine::ChatStream::new(tool_parsing_allowed(tools, tool_choice));
         // Stop sequences run on the RAW decoded text, BEFORE the reasoning/tool splitter — so a
@@ -1988,17 +2009,21 @@ fn run_chat(
             if infr_engine::prompt_prefills_think(&prompt) {
                 stream.push("<think>", &mut *od);
             }
-            let stats = be.generate(&prompt, max_new, None, &req, &mut |piece: &str| {
-                let safe = stops.push(piece);
-                if !safe.is_empty() {
-                    stream.push(&safe, &mut *od);
-                }
-                // A stop sequence hit aborts THIS sequence's decode at its next poll, freeing the
-                // GPU slot promptly (the server's `cancel` already reaches it through `req`).
-                if stops.hit() {
-                    req.abort();
-                }
-            })?;
+            let stats = be
+                .generate(&prompt, max_new, None, &req, &mut |piece: &str| {
+                    let safe = stops.push(piece);
+                    if !safe.is_empty() {
+                        stream.push(&safe, &mut *od);
+                    }
+                    // A stop sequence hit aborts THIS sequence's decode at its next poll, freeing
+                    // the GPU slot promptly (the server's `cancel` already reaches it through `req`).
+                    if stops.hit() {
+                        req.abort();
+                    }
+                })
+                .map_err(|e| {
+                    context_length_exceeded(&e, params.max_tokens.is_some()).unwrap_or(e)
+                })?;
             // No stop fired: whatever the matcher was holding back was never a stop prefix.
             let tail = stops.flush();
             if !tail.is_empty() {
@@ -2007,20 +2032,83 @@ fn run_chat(
             stats
         };
         stream.finish(on_delta);
-        let finish = if stops.hit() {
-            infr_server::Finish::Stop
-        } else if stats.n_gen >= max_new {
-            // The budget was exhausted (EOS would have broken the loop earlier).
-            infr_server::Finish::Length
-        } else {
-            infr_server::Finish::Stop
-        };
-        Ok(infr_server::ChatOutcome {
-            finish,
-            prompt_tokens: stats.n_prompt as u32,
-            completion_tokens: stats.n_gen as u32,
-        })
+        Ok(chat_outcome(
+            finish_reason(stops.hit(), &stats, max_new),
+            &stats,
+        ))
     }
+}
+
+/// Why an unforced reply ended. A stop sequence is `stop`; a reply that used its whole budget is
+/// `length` — whether that budget was the request's `max_new` or the smaller room the engine found
+/// left in the context (`ctx_full`). Reporting the second as `stop` tells the client a truncated
+/// answer is complete. A reply that ended on EOS is `stop` even when the EOS was its last allowed
+/// token (`natural_stop`; backends that do not report it fall back to the count).
+fn finish_reason(
+    stop_hit: bool,
+    stats: &infr_llama::GenStats,
+    max_new: usize,
+) -> infr_server::Finish {
+    if stop_hit {
+        infr_server::Finish::Stop
+    } else if !stats.natural_stop && (stats.n_gen >= max_new || stats.ctx_full) {
+        infr_server::Finish::Length
+    } else {
+        infr_server::Finish::Stop
+    }
+}
+
+/// The wire outcome of one generation. `prompt_tokens` is the WHOLE prompt (OpenAI's
+/// `usage.prompt_tokens`), not just the suffix a KV prefix-cache hit left to prefill.
+fn chat_outcome(
+    finish: infr_server::Finish,
+    stats: &infr_llama::GenStats,
+) -> infr_server::ChatOutcome {
+    infr_server::ChatOutcome {
+        finish,
+        prompt_tokens: (stats.n_prompt + stats.n_cached) as u32,
+        completion_tokens: stats.n_gen as u32,
+        cached_tokens: stats.n_cached as u32,
+    }
+}
+
+/// The engine's [`infr_llama::ContextOverflow`] as the server's typed
+/// [`infr_server::ContextLengthExceeded`], which it answers `400 context_length_exceeded` instead
+/// of `500`; `None` for any other error.
+///
+/// The message opens with OpenAI's own wording, because client-side error mappers match on it.
+/// Lowering `max_tokens` is suggested only when the client set it and it is part of the overflow:
+/// a reply budget the client never chose, or one of zero, is nothing it can lower. The length
+/// quoted is the usable one: the engine keeps a row of the context in reserve, so a request the
+/// size of the whole context is refused too, and quoting the full size would read as "fits".
+fn context_length_exceeded(
+    e: &anyhow::Error,
+    client_set_max_tokens: bool,
+) -> Option<anyhow::Error> {
+    let o = e.downcast_ref::<infr_llama::ContextOverflow>()?;
+    let usable = o.max_ctx.saturating_sub(1);
+    let message = if o.gen == 0 {
+        format!(
+            "This model's maximum context length is {} tokens. However, your messages resulted in \
+             {} tokens. Please reduce the length of the messages.",
+            usable, o.prompt
+        )
+    } else {
+        let advice = if client_set_max_tokens {
+            "Please reduce the length of the messages or completion."
+        } else {
+            "Please reduce the length of the messages."
+        };
+        format!(
+            "This model's maximum context length is {} tokens. However, you requested {} tokens \
+             ({} in the messages, {} in the completion). {advice}",
+            usable,
+            o.prompt + o.gen,
+            o.prompt,
+            o.gen
+        )
+    };
+    Some(infr_server::ContextLengthExceeded { message }.into())
 }
 
 /// Benchmark prefill (pp) or decode (tg) tok/s with the same -p/-n/-d/-r interface as
@@ -4805,5 +4893,157 @@ mod tests {
             " [ubatch 256 pinned, kv q8_0, submit split/112]"
         );
         assert_eq!(placement_note(None), "");
+    }
+
+    fn gen_stats(
+        n_prompt: usize,
+        n_cached: usize,
+        n_gen: usize,
+        ctx_full: bool,
+    ) -> infr_llama::GenStats {
+        infr_llama::GenStats {
+            n_prompt,
+            n_cached,
+            n_gen,
+            ctx_full,
+            ..Default::default()
+        }
+    }
+
+    /// B82: a reply the engine cut short because the context filled up is `length`, even though
+    /// it generated fewer tokens than the request's budget. EOS before the budget is still `stop`,
+    /// and a stop sequence wins over both.
+    #[test]
+    fn a_reply_cut_by_the_context_finishes_as_length() {
+        use infr_server::Finish;
+        assert_eq!(
+            finish_reason(false, &gen_stats(4000, 0, 95, true), 2048),
+            Finish::Length
+        );
+        assert_eq!(
+            finish_reason(false, &gen_stats(10, 0, 95, false), 2048),
+            Finish::Stop
+        );
+        assert_eq!(
+            finish_reason(false, &gen_stats(10, 0, 2048, false), 2048),
+            Finish::Length
+        );
+        assert_eq!(
+            finish_reason(true, &gen_stats(4000, 0, 95, true), 2048),
+            Finish::Stop
+        );
+        // EOS as the last allowed token: the model finished, it was not cut off.
+        let eos_at_budget = infr_llama::GenStats {
+            natural_stop: true,
+            ..gen_stats(10, 0, 2048, false)
+        };
+        assert_eq!(finish_reason(false, &eos_at_budget, 2048), Finish::Stop);
+    }
+
+    /// B83: `prompt_tokens` is the whole prompt — the prefilled suffix plus the cached prefix — and
+    /// the cached part is reported on its own.
+    #[test]
+    fn the_outcome_counts_the_whole_prompt() {
+        let o = chat_outcome(infr_server::Finish::Stop, &gen_stats(1, 19_999, 7, false));
+        assert_eq!(
+            (o.prompt_tokens, o.cached_tokens, o.completion_tokens),
+            (20_000, 19_999, 7)
+        );
+    }
+
+    /// B86: the engine's context overflow reaches the server as its typed error (which it answers
+    /// `400 context_length_exceeded`), also through added context; any other error is left alone.
+    #[test]
+    fn a_context_overflow_becomes_the_servers_typed_error() {
+        let message = |prompt, gen, client_set_max_tokens| {
+            let overflow = anyhow::Error::new(infr_llama::ContextOverflow {
+                prompt,
+                gen,
+                max_ctx: 4096,
+            })
+            .context("generating");
+            context_length_exceeded(&overflow, client_set_max_tokens)
+                .expect("an overflow must map")
+                .downcast_ref::<infr_server::ContextLengthExceeded>()
+                .expect("the server's type")
+                .message
+                .clone()
+        };
+        assert_eq!(
+            message(5000, 0, true),
+            "This model's maximum context length is 4095 tokens. However, your messages resulted \
+             in 5000 tokens. Please reduce the length of the messages."
+        );
+        assert_eq!(
+            message(3000, 2000, true),
+            "This model's maximum context length is 4095 tokens. However, you requested 5000 \
+             tokens (3000 in the messages, 2000 in the completion). Please reduce the length of \
+             the messages or completion."
+        );
+        // A reply budget the client did not choose is not advice it can follow.
+        assert!(message(3000, 2048, false).ends_with("Please reduce the length of the messages."));
+        // A request the size of the whole context is refused, and must not read as fitting.
+        assert!(message(4096, 0, true)
+            .contains("is 4095 tokens. However, your messages resulted in 4096"));
+        assert!(context_length_exceeded(&anyhow::anyhow!("boom"), true).is_none());
+    }
+
+    /// Panics on its first generation, then generates normally; counts its KV resets.
+    struct PanicOnceChat {
+        calls: usize,
+        resets: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl infr_llama::chat::ChatModel for PanicOnceChat {
+        fn render(&self, _messages: &[(&str, &str)]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn generate(
+            &mut self,
+            _prompt: &str,
+            _max_new: usize,
+            _req: Option<&infr_llama::sampling::RequestCtx>,
+            _on_piece: &mut dyn FnMut(&str),
+        ) -> anyhow::Result<infr_llama::GenStats> {
+            self.calls += 1;
+            if self.calls == 1 {
+                panic!("boom: generation panicked");
+            }
+            Ok(infr_llama::GenStats::default())
+        }
+
+        fn reset_kv(&mut self) {
+            self.resets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// B84: one panicking generation must not take every later request down with it. The next
+    /// lock recovers the model, drops its KV session once, and generation works again.
+    #[test]
+    fn a_panicked_generation_does_not_poison_the_served_model() {
+        let resets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model: std::sync::Mutex<Box<dyn infr_llama::chat::ChatModel + Send>> =
+            std::sync::Mutex::new(Box::new(PanicOnceChat {
+                calls: 0,
+                resets: resets.clone(),
+            }));
+        // The panic's message is expected in the captured output: no `set_hook` to hide it — it
+        // is process-global and would also swallow another test's genuine failure.
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = lock_recovered(&model).generate("", 1, None, &mut |_| {});
+        }));
+        assert!(first.is_err(), "the first generation panics");
+        for _ in 0..2 {
+            assert!(lock_recovered(&model)
+                .generate("", 1, None, &mut |_| {})
+                .is_ok());
+        }
+        assert_eq!(
+            resets.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the KV session is dropped once, after the panic, not on every request"
+        );
     }
 }

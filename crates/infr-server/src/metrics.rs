@@ -289,6 +289,7 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 100,
                 completion_tokens: 20,
+                cached_tokens: 0,
             },
             Finish::Stop,
         );

@@ -2825,6 +2825,9 @@ fn generate_mtp_spec_core(
             prompt_secs: prime_verify_secs,
             n_gen: out.len(),
             decode_secs: t_decode.elapsed().as_secs_f64(),
+            n_cached: 0,
+            ctx_full: false,
+            natural_stop: false,
         },
         timing,
     ))

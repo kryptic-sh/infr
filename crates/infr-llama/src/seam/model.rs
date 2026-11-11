@@ -825,11 +825,11 @@ impl SeamModel {
         // otherwise hard-error on `infr run`'s default max_new=2048 before generating a single
         // token. EOS ends almost every reply long before this cap; an over-long PROMPT still
         // errors cleanly in the runner (its `prompt + gen + 1 > max_ctx` guard stays).
-        let max_new = max_new.min(max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let budget = max_new.min(max_ctx.saturating_sub(prompt_tokens.len() + 1));
         // Resolve `ubatch_rows`/`kv_auto_q8` against THIS session's pins (warm calls must agree
         // with the buffers placement sized) — never a process-global cell shared across models.
         let _scope = crate::seam::PlacementScope::enter(session.pins().clone());
-        let (_generated, stats) = crate::seam::generate_dense_vulkan_session(
+        let (_generated, mut stats) = crate::seam::generate_dense_vulkan_session(
             &session.be,
             &self.gguf,
             &self.cfg,
@@ -837,7 +837,7 @@ impl SeamModel {
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
-            max_new,
+            budget,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
             &mut session.pool.slots[slot],
             max_ctx,
@@ -851,6 +851,7 @@ impl SeamModel {
         if let Some(kv) = session.pool.slots[slot].as_ref() {
             session.max_ctx = kv.max_ctx();
         }
+        stats.ctx_full = crate::ran_out_of_context(max_new, budget, &stats);
         Ok(stats)
     }
 
@@ -1766,6 +1767,9 @@ impl SeamModel {
             prompt_secs,
             n_gen: out.len(),
             decode_secs: t1.elapsed().as_secs_f64(),
+            n_cached: 0,
+            ctx_full: false,
+            natural_stop: false,
         })
     }
 

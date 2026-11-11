@@ -173,6 +173,14 @@ impl ChatModel for DiffusionGemmaChat {
         &self.model
     }
 
+    /// Drops the whole session — its cached prefix along with its buffers — because the DG
+    /// sessions have no token-only reset. The next turn reopens it lazily (`ensure_sess`)
+    /// and re-prefills from scratch, paying the session open again.
+    fn reset_kv(&mut self) {
+        self.sess = None;
+        self.max_ctx = 0;
+    }
+
     fn warmup(&mut self) -> Result<()> {
         use crate::diffusion::DiffusionSession;
         // A tiny PREFILL-only forward compiles the lazily-built pipelines (GEMM/attention/batched

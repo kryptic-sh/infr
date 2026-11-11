@@ -2914,93 +2914,44 @@ entry says what was traced in the code versus what is inferred. Baseline at the
 time: `cargo clippy --workspace --all-targets -- -D warnings` and
 `cargo test --workspace` both green on Linux.
 
-### B82 — `finish_reason` says `stop` when the context window cut the reply (2026-11-08)
+### B82 — `infr serve`: what the 2026-11-12 fixes left open
 
-**Tag:** serve correctness · **Verified:** by reading
+Fixed that day: `finish_reason: "length"` on a context-cut reply, whole-prompt
+`usage.prompt_tokens` with `prompt_tokens_details.cached_tokens`, the poisoned
+model lock after a panic, cancel on client hang-up,
+`400 context_length_exceeded` (and a typed SSE error frame on a stream), 413 /
+415 for body rejections, `stream_options.include_usage`, the bearer check before
+the body, `-1` for `seed` / `max_tokens`, and the 401 body. Left:
 
-`run_chat` in `crates/infr-cli/src/main.rs` picks `Finish::Length` only when
-`stats.n_gen >= max_new`, where `max_new` is the request's `max_tokens` (or
-`sampling.max_new`). The engines then clamp that budget to the room left in the
-KV cache — `ParallelSeam::generate` (`crates/infr-llama/src/parallel.rs`) does
-`max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1))`, and the
-Vulkan session path in `seam/model.rs` does the same — so a reply cut off by the
-context comes back as `n_gen < max_new` and is reported as `"stop"`.
-
-Scenario: per-slot ctx 4096, prompt 4000 tokens, `max_tokens` unset (default
-2048). Generation stops at ~95 tokens, the response says `finish_reason: stop`,
-and a client treats a truncated answer as complete.
-
-Fix: have the engine report the EFFECTIVE cap (or a "budget exhausted" flag) in
-`GenStats`, and compare against that in `run_chat`.
-
-### B83 — `usage.prompt_tokens` reports only the un-cached suffix (2026-11-08)
-
-**Tag:** serve correctness · **Verified:** by reading · **Extends:** B80
-
-`GenStats::n_prompt` is set in `generate_dense_backend`
-(`crates/infr-llama/src/seam/runner.rs`) to `prompt.len() - start` — the tokens
-actually prefilled after a KV prefix-cache hit. `run_chat` passes it straight
-into `ChatOutcome::prompt_tokens`, which `infr-server`'s handlers return as the
-OpenAI `usage.prompt_tokens`. B80 records the same value skewing `/metrics`; in
-`usage` it is a client-visible wrong number: an agent loop re-sending a 20k
-token conversation sees `prompt_tokens: 1` on a cache hit, and any client that
-budgets context or cost from `usage` is wrong.
-
-Fix: carry both counts in `GenStats` — the full prompt length for `usage`
-(llama.cpp's server reports the full length) and the prefilled count for TTFT /
-prefill-rate stats and `/metrics`.
-
-### B84 — one panic in a CPU / Metal / diffusion generation kills the server (2026-11-08)
-
-**Tag:** serve robustness · **Verified:** by reading
-
-`SeamGenerator`'s `GenBackend::generate` in `crates/infr-cli/src/main.rs` takes
-`self.model.lock().expect("serve generator poisoned")`. A panic anywhere while
-the lock is held poisons the mutex; `spawn_blocking`'s `JoinError` turns that
-one request into a 500, and every later request then panics on the `expect` —
-the process stays up and answers 500 forever. The Vulkan multi-slot path
-(`ParallelSeam`) is not this code.
-
-Fix: recover with `unwrap_or_else(PoisonError::into_inner)` and reset the KV
-state (`reset_kv`) before reuse, since a half-finished step leaves it suspect.
-
-### B85 — a client that hangs up does not cancel its generation (2026-11-08)
-
-**Tag:** serve · **Verified:** PLAUSIBLE — needs a test against hyper's drop
-behaviour
-
-- **Non-streaming** (`non_streaming` in `crates/infr-server/src/lib.rs`): the
-  comment says a hung-up client "cannot be noticed", but hyper drops the handler
-  future when the connection closes. The `cancel` latch is never set on that
-  drop, so the blocking task runs to `max_tokens` holding its `--parallel` slot.
-  Retrying clients pile abandoned generations up in front of themselves. Fix: a
-  `CancelOnDrop(Arc<AtomicBool>)` guard in the handler future, disarmed when the
-  join completes.
-- **Streaming** (`streaming`): the cancel is set only when `tx.send` fails
-  inside `on_delta`, i.e. on the next delta. A disconnect during a long prefill
-  — the most expensive moment — or while the stop matcher / reasoning splitter
-  is holding output back is not seen. Fix: a task awaiting `tx.closed()` that
-  sets `cancel`.
-
-### B86 — over-long prompts and oversized bodies get the wrong HTTP status (2026-11-08)
-
-**Tag:** serve · **Verified:** by reading
-
-- A prompt longer than the slot context fails in the runner with an `anyhow!`
-  ("prompt N + gen M exceeds the session KV capacity"), which
-  `chat_completions_handler` maps to `500 server_error`. OpenAI clients retry
-  5xx; they treat `400` with `code: "context_length_exceeded"` as final and
-  compact instead. Fix: check the token count against `ctx_per_slot` in
-  `run_chat` and surface a typed error the server maps to 400.
-- Body rejections: `chat_completions_handler` answers every `JsonRejection` with
-  `param_error(None, e.body_text())`, i.e. 400, discarding `e.status()` — a body
-  over axum's default 2 MiB limit should be 413, a wrong content type 415.
-  `build_router` sets no `DefaultBodyLimit`, so long agent contexts can hit an
-  undocumented, unconfigurable 2 MiB cap. Fix: use `e.status()`, and add a
-  `serve.*` config key for the body limit.
-
-Related open decision: the 504-vs-500 question for a deadline during prefill (§
-"Decision — a deadline that fires during prefill returns HTTP 500" below).
+- **A streamed over-long prompt still answers 200.** The headers and role chunk
+  go out before `engine.chat` runs, so the client gets a typed error frame, not
+  a 400. Returning 400 means tokenizing before the stream opens, as llama.cpp's
+  server does; that is the `count_prompt_tokens` method B10a describes, and it
+  would also let an over-long prompt be refused before it takes a slot.
+- **No body-size key.** The axum default (2 MiB) still applies, undocumented;
+  there is no `serve.*` setting for it.
+- **`ctx_full` and `natural_stop` are set only on the dense seam paths.** The
+  MTP, diffusion and Metal speculative paths report `false` for both, so a
+  context-cut reply there still says `stop` and an end token on the last allowed
+  position still says `length`. The runner setting `natural_stop` was read, not
+  run: it needs a model. `ran_out_of_context` and the CLI's `finish_reason` have
+  unit tests.
+- **Panic recovery resets session state only.** `lock_recovered` clears the
+  poison and calls `reset_kv`; state inside a backend that the panic broke (a
+  poisoned lock, a half-recorded submit) is not repaired, and requests reaching
+  it keep failing. `DiffusionGemmaChat::reset_kv` drops its whole session and
+  has no test (it needs a real GGUF). A non-streaming 500 body still includes
+  the panic message.
+- **`ParallelSeam::checkout`: a panic inside `seed_from` leaves both reserved
+  slots marked busy** with their KV taken, so later requests can block on
+  `freed.wait` for good. Vulkan path; reported by the coder from reading, not
+  re-read.
+- **The diffusion `denoise` overflow is still an untyped error**, so it is
+  a 500.
+- `streaming_panic_is_reported_as_a_failure` (infr-server) still sets a
+  process-wide panic hook, which the repo's convention forbids in tests.
+- The hang-up tests use real sockets with 2 s bounds; a loaded Windows or macOS
+  runner could fail them. A failure would be an assertion, not a hang.
 
 ### B87 — the Metal chat path does not clamp `max_new` to the context (2026-11-08)
 
@@ -3602,8 +3553,9 @@ request.
 - **`truncated_softmax`'s bounded top-k arm uses `partial_cmp`** with an `Equal`
   fallback (`crates/infr-llama/src/sampling.rs`), which is not a total order
   once a NaN logit is present; `select_nth_unstable_by` may then panic, and on
-  the CPU / Metal serve path a panic is B84. The full-vocabulary arm already
-  uses `total_cmp`. A third site beside the two in B98.
+  the CPU / Metal serve path a panic fails that one request (see B82). The
+  full-vocabulary arm already uses `total_cmp`. A third site beside the two in
+  B98.
 - **Malformed `INFR_*` numbers are dropped silently** — `num`, `num_pos`,
   `opt_size`, `opt_mib` in `crates/infr-core/src/config/env.rs`. `config.md`
   already documents this as frozen behaviour, so it is not a new finding; what
@@ -3909,33 +3861,27 @@ The pid-only liveness test is confirmed by reading; the marker naming and the
 container case are as reported. How often either happens is unknown. See the
 poisoned-pipeline-cache incident this module was written for.
 
-### B137 — `infr serve`: findings from the re-read (2026-11-11)
+### B137 — `infr serve`: three decisions for the owner (2026-11-12)
 
-- **Streaming usage and `response_format` are accepted and ignored.**
-  `ChatRequest` (infr-server `lib.rs`) has no `stream_options` or
-  `response_format` field and ignores unknown fields, so a streaming client that
-  asks for usage gets none, and a client that asks for JSON output gets
-  unconstrained text with a 200. Confirmed: neither name occurs in the server
-  source. The OpenAI behaviour (a final chunk carrying `usage` before `[DONE]`)
-  is from memory of the API. The second is the more serious one — either
-  implement it over the existing grammar path or reject it.
-- **The bearer check runs after the body is parsed.** `chat_completions_handler`
-  takes the JSON body as an extractor argument, and the comment on its first
-  statement says auth is "checked before any work". The signature and comment
-  are confirmed; that axum resolves extractors before the handler body runs is
-  from memory of axum. An unauthenticated client can make the server buffer and
-  deserialize a body up to the default limit. Moving the check into a middleware
-  layer fixes it.
+- **`response_format` is accepted and ignored.** A client that asks for JSON
+  output gets unconstrained text with a 200. Options: reject `json_object` /
+  `json_schema` with a 400 (safe, but clients that get 200 today break);
+  implement JSON mode on the existing llguidance grammar path (correct,
+  feature-sized); keep ignoring it (silently off-contract).
 - **No `Host` / `Origin` validation on the default keyless loopback server.** A
   web page that rebinds its hostname to `127.0.0.1` becomes same-origin and
   could drive completions and read `/status` and `/metrics`. Reported from
-  reading `build_router`; the attack was not tried. Needs a decision: validate
-  `Host` when bound to loopback, or document it. Distinct from B5.
-- **Smaller:** `seed` and `max_tokens` are unsigned (confirmed), so the `-1`
-  sentinels some llama.cpp-style clients send are a 400; the SSE response sets
-  no keep-alive, so nothing is sent during a long prefill or a forced tool call
-  and an idle-timeout proxy may cut the stream; a 401 body carries
-  `type: "server_error"`.
+  reading `build_router`; the attack was not tried. Options: validate `Host`
+  against a loopback allow-list (blocks rebinding, breaks custom hostnames and
+  reverse proxies); validate only when a browser `Origin` header is present;
+  document it and leave it. Distinct from B5.
+- **No SSE keep-alive.** Nothing is sent during a long prefill or a forced tool
+  call, so an idle-timeout proxy may cut the stream. axum's `KeepAlive` sends
+  comment lines at a 15 s default, which conforming SSE parsers ignore. Options:
+  add it at the default; make the interval a `serve.*` key; leave it out.
+- **`max_tokens: -1` means the server default (`sampling.max_new`)**, chosen on
+  2026-11-12; llama.cpp reads `n_predict: -1` as "until the context is full".
+  Recorded so the difference is a decision and not an accident.
 
 ### B138 — smaller infr-core findings (2026-11-11)
 

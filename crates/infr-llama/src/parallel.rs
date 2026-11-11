@@ -421,13 +421,13 @@ impl ParallelSeam {
         // the model's trained window under `-np N`), mirroring the sequential session path: a
         // generation ceiling is a default, not a demand. An over-long PROMPT still errors cleanly
         // in the runner.
-        let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let budget = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = 0usize;
         // Resolve `ubatch_rows`/`kv_auto_q8` against THIS engine's pins for the decode (warm calls
         // must agree with the buffers placement sized). Concurrent requests share the one cell.
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
-        let (_ids, stats) = crate::seam::generate_dense_vulkan_session(
+        let (_ids, mut stats) = crate::seam::generate_dense_vulkan_session(
             &self.vk,
             self.model.gguf(),
             self.model.config(),
@@ -435,7 +435,7 @@ impl ParallelSeam {
             self.model.embd(),
             self.model.per_layer_embd(),
             &prompt_tokens,
-            max_new,
+            budget,
             |id| {
                 crate::stream_token(
                     self.model.tokenizer(),
@@ -450,6 +450,7 @@ impl ParallelSeam {
             constraint,
             Some(req),
         )?;
+        stats.ctx_full = crate::ran_out_of_context(max_new, budget, &stats);
         Ok(stats)
     }
 }

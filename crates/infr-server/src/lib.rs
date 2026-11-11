@@ -30,8 +30,9 @@ use std::{
 };
 
 use axum::{
-    extract::State,
+    extract::{rejection::JsonRejection, Request, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
@@ -94,14 +95,18 @@ pub trait ChatGenerator: Send + Sync {
     /// * `tools` is the request's `tools` array as a borrowed [`serde_json::Value`] — passed by
     ///   reference so the generator parses the ONE it was already given instead of a
     ///   `Value`→string→`Value` round-trip (see audit finding 6).
-    /// * `cancel` is a PER-REQUEST abort latch. The server sets it when the client disconnects (an
-    ///   SSE `send` starts failing) or the request deadline fires; the generator must poll it in its
+    /// * `cancel` is a PER-REQUEST abort latch. The server sets it when the client hangs up
+    ///   (streaming or not) or the request deadline fires; the generator must poll it in its
     ///   prefill AND decode loops and stop promptly so the GPU slot is freed rather than held to
     ///   `max_tokens`. An `Arc` so the generator can keep it for the whole call — a deadline that
     ///   fires during prefill comes before any piece, so a copy made from a streaming callback is
     ///   too late. It is ORed with the process-wide shutdown latch, never a replacement for it.
     /// * Returns a [`ChatOutcome`] carrying the finish reason AND the real prompt/completion token
     ///   counts so the handler can populate `usage` truthfully.
+    /// * A request whose prompt does not fit the context should fail with a
+    ///   [`ContextLengthExceeded`] error. The server answers it as a `400` on a non-streaming
+    ///   request and as a terminal SSE error frame carrying the same typed error on a streaming one
+    ///   (the `200` is already sent by then), so the client can act on it rather than retry it.
     fn chat(
         &self,
         messages: &[ChatMessage],
@@ -125,9 +130,32 @@ pub trait ChatGenerator: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatOutcome {
     pub finish: Finish,
+    /// The WHOLE prompt, including any part served from a KV prefix cache — OpenAI's
+    /// `usage.prompt_tokens`, which clients budget context and cost from.
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// How many of `prompt_tokens` were reused from a KV prefix cache rather than prefilled
+    /// (`usage.prompt_tokens_details.cached_tokens`). `0` for a generator with no prefix cache.
+    pub cached_tokens: u32,
 }
+
+/// The request's prompt does not fit the model's context. A [`ChatGenerator`] returns it (as the
+/// `anyhow` error) so the server can answer `400` with OpenAI's `context_length_exceeded` code:
+/// OpenAI clients retry a `5xx` unchanged, but treat this code as final and shorten the
+/// conversation instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextLengthExceeded {
+    /// What the client is told: which counts did not fit.
+    pub message: String,
+}
+
+impl std::fmt::Display for ContextLengthExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ContextLengthExceeded {}
 
 // ---------------------------------------------------------------------------
 // Request DTOs
@@ -149,10 +177,13 @@ pub struct ChatRequest {
     /// {"name":..}}`. Normalised to a string (the function name for a named choice) by `tool_choice_str`.
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
-    #[serde(default)]
+    /// `-1` means "not set": the server's default reply budget (`sampling.max_new`), NOT
+    /// llama.cpp's `n_predict: -1` "until the context is full" — an unbounded reply is what the
+    /// default budget exists to prevent.
+    #[serde(default, deserialize_with = "minus_one_is_unset")]
     pub max_tokens: Option<u32>,
     /// OpenAI's rename of `max_tokens`. Preferred when both are present.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "minus_one_is_unset")]
     pub max_completion_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -161,7 +192,7 @@ pub struct ChatRequest {
     /// Not in the OpenAI schema; llama.cpp/vLLM/Ollama all accept it and so do we.
     #[serde(default)]
     pub top_k: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "minus_one_is_unset")]
     pub seed: Option<u64>,
     /// `"\n"` or `["\n", "END"]` (OpenAI: up to 4).
     #[serde(default)]
@@ -173,6 +204,36 @@ pub struct ChatRequest {
     /// llama.cpp extension (1.0 = off).
     #[serde(default)]
     pub repeat_penalty: Option<f32>,
+    /// OpenAI `stream_options`; only `include_usage` is read.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// OpenAI `stream_options`. With `include_usage`, a streamed reply ends with one extra chunk that
+/// carries `usage` and an empty `choices` array, just before `[DONE]`.
+#[derive(Debug, Default, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
+/// An optional integer field where `-1` means "not set". llama.cpp-style clients send `-1` for
+/// `seed` (random) and `max_tokens` (no explicit budget); refusing it as a negative number would
+/// turn those requests into a `400`. Any other negative value is still an error.
+fn minus_one_is_unset<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: TryFrom<u64>,
+{
+    use serde::de::Error;
+    match Option::<i128>::deserialize(d)? {
+        None | Some(-1) => Ok(None),
+        Some(v) => u64::try_from(v)
+            .ok()
+            .and_then(|v| T::try_from(v).ok())
+            .map(Some)
+            .ok_or_else(|| D::Error::custom(format!("{v} is out of range (use -1 for unset)"))),
+    }
 }
 
 /// The validated, per-request generation config handed to [`ChatGenerator::chat`]. `None` fields
@@ -572,6 +633,29 @@ pub struct UsageInfo {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
+impl UsageInfo {
+    /// The `usage` block for one finished generation — shared by the non-streaming body and the
+    /// streamed `include_usage` chunk, so the two cannot report different numbers.
+    pub fn from_outcome(outcome: &ChatOutcome) -> Self {
+        Self {
+            prompt_tokens: outcome.prompt_tokens,
+            completion_tokens: outcome.completion_tokens,
+            total_tokens: outcome
+                .prompt_tokens
+                .saturating_add(outcome.completion_tokens),
+            prompt_tokens_details: PromptTokensDetails {
+                cached_tokens: outcome.cached_tokens,
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -585,6 +669,9 @@ pub struct ChatCompletionChunk {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    /// Only on the final `stream_options.include_usage` chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -897,7 +984,9 @@ impl ReqTally {
             .first_delta
             .map_or(total, |t| t.saturating_duration_since(self.started));
         ReqRecord {
-            prompt_tokens: outcome.prompt_tokens,
+            // The tokens this request actually PREFILLED: what its prefill time was spent on, and
+            // what the throughput counters have always summed. A cached prefix cost nothing.
+            prompt_tokens: outcome.prompt_tokens.saturating_sub(outcome.cached_tokens),
             gen_tokens: outcome.completion_tokens,
             deltas: self.deltas,
             window: self.window,
@@ -1195,8 +1284,24 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/models", get(models_handler))
         .route("/metrics", get(metrics::metrics_handler))
         .route("/status", get(status::status_handler))
-        .route("/v1/chat/completions", post(chat_completions_handler))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions_handler)
+                .route_layer(middleware::from_fn_with_state(state.clone(), require_auth)),
+        )
         .with_state(state)
+}
+
+/// [`auth_gate`] as a layer, for the route that takes a body. A handler's extractors all run
+/// before its first statement, so a check inside the handler comes AFTER the JSON body has been
+/// buffered and parsed; an unauthenticated client could make the server do that work up to the
+/// body limit, or hold the request open by never finishing its body. As a layer it runs on the
+/// headers alone.
+async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if let Some(denied) = auth_gate(&state.cfg, req.headers()) {
+        return denied;
+    }
+    next.run(req).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,20 +1419,14 @@ async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
     .into_response()
 }
 
+/// Bearer auth for this route is [`require_auth`], layered in front of it by [`build_router`].
 async fn chat_completions_handler(
     State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
-    // Optional bearer auth, checked before any work, so an unauthenticated request cannot even
-    // reach model routing / slot admission.
-    if let Some(denied) = auth_gate(&state.cfg, &headers) {
-        return denied;
-    }
-    // Malformed JSON / wrong types: an OpenAI-shaped 400, not axum's default 422 text body.
     let Json(req) = match body {
         Ok(j) => j,
-        Err(e) => return param_error(None, e.body_text()),
+        Err(e) => return body_rejection(e),
     };
     let mut params = match GenParams::from_request(&req) {
         Ok(p) => p,
@@ -1368,6 +1467,7 @@ async fn chat_completions_handler(
         // from inside a blocking task. `None` (the default) = no deadline, exactly as before.
         deadline: request_timeout(&state.cfg),
         stream: req.stream,
+        include_usage: req.stream_options.as_ref().is_some_and(|o| o.include_usage),
         stats: state.stats.clone(),
     };
     log_request_start(
@@ -1403,6 +1503,8 @@ struct ReqCtx {
     created: i64,
     deadline: Option<Duration>,
     stream: bool,
+    /// `stream_options.include_usage`: end the stream with a `usage` chunk.
+    include_usage: bool,
     stats: Arc<ServeStats>,
 }
 
@@ -1425,6 +1527,7 @@ async fn non_streaming(
         created,
         deadline,
         stream,
+        include_usage: _,
         stats,
     } = ctx;
     // Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
@@ -1448,11 +1551,14 @@ async fn non_streaming(
 
     // Per-request abort latch. It lives OUT here, not inside the closure, so the deadline below can
     // reach it: the generator polls it in its decode loop, and that poll is the only way to stop a
-    // `spawn_blocking` task early. There is still no client-disconnect signal on this path (the
-    // whole reply is buffered, so no send can fail), which is precisely why the deadline matters
-    // most here — a client that hung up cannot be noticed, and burns its slot to completion.
+    // `spawn_blocking` task early.
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_blk = cancel.clone();
+    // A client that hangs up is noticed by hyper, which DROPS this handler future — and with it
+    // this guard, which latches the abort so the generation stops and frees its slot instead of
+    // running to `max_tokens` for nobody. On a normal return it latches a generation that has
+    // already ended, which nothing reads.
+    let _hangup = CancelOnDrop(cancel.clone());
 
     let mut handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         // The permit is MOVED into the blocking task and dropped when it ends: a slot is held for
@@ -1470,34 +1576,32 @@ async fn non_streaming(
         // Per-request tally: plain locals, folded into the shared counters once at the end.
         let mut tally = ReqTally::new();
 
-        let outcome = engine
-            .chat(
-                &messages,
-                tools.as_ref(),
-                tool_choice.as_deref(),
-                &params,
-                &cancel_blk,
-                &mut |delta| match delta {
-                    Delta::Reasoning(t) => {
-                        tally.on_text_delta(&stats_blk);
-                        reasoning.push_str(&t);
-                    }
-                    Delta::Content(t) => {
-                        tally.on_text_delta(&stats_blk);
-                        content.push_str(&t);
-                    }
-                    Delta::ToolCall { name, arguments } => {
-                        let idx = tool_calls.len();
-                        tool_calls.push(OAIToolCall {
-                            index: idx,
-                            id: format!("call_{cid_blk}_{idx}"),
-                            kind: "function",
-                            function: OAIFunction { name, arguments },
-                        });
-                    }
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let outcome = engine.chat(
+            &messages,
+            tools.as_ref(),
+            tool_choice.as_deref(),
+            &params,
+            &cancel_blk,
+            &mut |delta| match delta {
+                Delta::Reasoning(t) => {
+                    tally.on_text_delta(&stats_blk);
+                    reasoning.push_str(&t);
+                }
+                Delta::Content(t) => {
+                    tally.on_text_delta(&stats_blk);
+                    content.push_str(&t);
+                }
+                Delta::ToolCall { name, arguments } => {
+                    let idx = tool_calls.len();
+                    tool_calls.push(OAIToolCall {
+                        index: idx,
+                        id: format!("call_{cid_blk}_{idx}"),
+                        kind: "function",
+                        function: OAIFunction { name, arguments },
+                    });
+                }
+            },
+        )?;
 
         Ok((reasoning, content, tool_calls, outcome, tally))
     });
@@ -1539,7 +1643,10 @@ async fn non_streaming(
         Err(e) => {
             stats.fold_failure();
             tracing::warn!(req = req_id, error = %e, "request failed");
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            match e.downcast_ref::<ContextLengthExceeded>() {
+                Some(c) => (StatusCode::BAD_REQUEST, Json(context_length_body(c))).into_response(),
+                None => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            }
         }
         Ok((reasoning, content, tool_calls, outcome, tally)) => {
             // A deadline hit is a TRUNCATION, not a failure: the client keeps the partial reply
@@ -1591,13 +1698,7 @@ async fn non_streaming(
                     },
                     finish_reason: finish.as_str().into(),
                 }],
-                usage: UsageInfo {
-                    prompt_tokens: outcome.prompt_tokens,
-                    completion_tokens: outcome.completion_tokens,
-                    total_tokens: outcome
-                        .prompt_tokens
-                        .saturating_add(outcome.completion_tokens),
-                },
+                usage: UsageInfo::from_outcome(&outcome),
             })
             .into_response()
         }
@@ -1623,6 +1724,7 @@ async fn streaming(
         created,
         deadline,
         stream,
+        include_usage,
         stats,
     } = ctx;
     // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
@@ -1655,11 +1757,14 @@ async fn streaming(
     let model_cb = model_id.clone();
     let stats_cb = stats.clone();
 
-    // Per-request abort latch: set when the client disconnects (an SSE `send` starts failing) and
-    // polled by the generator's decode loop so it stops promptly and frees the GPU slot instead of
-    // running to `max_tokens` into a dead socket (audit finding 2).
+    // Per-request abort latch: set when the client disconnects and polled by the generator's
+    // decode loop so it stops promptly and frees the GPU slot instead of running to `max_tokens`
+    // into a dead socket (audit finding 2). A failed `send` below notices the hang-up only at the
+    // next delta; [`cancel_on_hangup`] notices it as it happens — during a long prefill, or while
+    // the stop matcher holds output back, no delta is being sent at all.
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_cb = cancel.clone();
+    let hangup_done = cancel_on_hangup(&tx, cancel.clone());
 
     // Wall-clock deadline. Unlike the non-streaming path, nothing here awaits the generation's join
     // — the SSE response is returned as soon as the stream exists — so the timer needs its own
@@ -1681,6 +1786,9 @@ async fn streaming(
         // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
         // deadline was configured, in which case there is no watchdog to disarm.
         let _done_tx = done_tx;
+        // Likewise ends the hang-up watcher, whose sender clone would otherwise hold the stream
+        // open.
+        let _hangup_done = hangup_done;
         // Closes the stream exactly once, however this closure ends. It emits `[DONE]` always, and
         // — unless `settled()` says a terminal frame already went out — reports the generation as a
         // failure. Both matter on an unwinding panic, which skips every arm below (B23).
@@ -1783,6 +1891,9 @@ async fn streaming(
                     DeltaPayload::default(),
                     Some(finish.as_str().into()),
                 )));
+                if include_usage {
+                    let _ = tx.send(Ok(sse_usage_chunk(&cid, &model_id, created, &outcome)));
+                }
                 // Fold the request's tallies in ONCE, here, and log its completion line. The finish
                 // chunk above IS this stream's terminal frame, so the guard must not also report a
                 // failure when it drops.
@@ -1794,8 +1905,12 @@ async fn streaming(
             Err(e) => {
                 // A mid-stream failure is NOT a clean `stop` — the error frame lets the client tell
                 // this apart from success (matching the non-streaming 500). `[DONE]` still follows,
-                // via `DoneGuard` (audit finding 1).
-                done.fail(&e.to_string());
+                // via `DoneGuard` (audit finding 1). An over-long prompt carries the same typed error
+                // the non-streaming path answers with a 400, so a client can tell it from a crash.
+                match e.downcast_ref::<ContextLengthExceeded>() {
+                    Some(c) => done.fail_with(context_length_body(c), &c.message),
+                    None => done.fail(&e.to_string()),
+                }
             }
         }
         // `DoneGuard` drops here (or on an unwinding panic). It sends `[DONE]`, and if nothing
@@ -1857,13 +1972,19 @@ impl DoneGuard {
     /// line cannot drift apart or be emitted twice. Called explicitly by the paths that know why
     /// they failed, and by [`Drop`] for the paths that never got the chance.
     fn fail(&mut self, msg: &str) {
+        self.fail_with(error_body(msg, "server_error"), msg);
+    }
+
+    /// [`Self::fail`] with an error body other than the generic `server_error` one; `msg` is what
+    /// the log line says.
+    fn fail_with(&mut self, body: serde_json::Value, msg: &str) {
         if self.settled {
             return;
         }
         self.settled = true;
         // A failed send just means the client is already gone; the accounting still has to be
         // right, so the fold and the log are NOT conditional on it.
-        let _ = self.tx.send(Ok(sse_error_event(msg)));
+        let _ = self.tx.send(Ok(sse_error_event(&body)));
         self.stats.fold_failure();
         tracing::warn!(req = self.req_id, error = msg, "request failed");
     }
@@ -1891,8 +2012,8 @@ fn error_body(msg: &str, ty: &str) -> serde_json::Value {
 /// A terminal SSE error frame: `data: {"error":{...}}`. Distinguishable from a normal
 /// `chat.completion.chunk` and from `[DONE]`, so a client can tell a mid-stream failure apart from a
 /// clean completion (audit finding 1).
-fn sse_error_event(msg: &str) -> Event {
-    Event::default().data(error_body(msg, "server_error").to_string())
+fn sse_error_event(body: &serde_json::Value) -> Event {
+    Event::default().data(body.to_string())
 }
 
 /// Serialize a delta payload into an SSE event carrying a `chat.completion.chunk`.
@@ -1913,6 +2034,23 @@ fn sse_chunk(
             delta,
             finish_reason,
         }],
+        usage: None,
+    };
+    Event::default()
+        .json_data(chunk)
+        .expect("ChatCompletionChunk always serializes")
+}
+
+/// The `stream_options.include_usage` chunk: the whole request's `usage`, and an empty `choices`
+/// array, sent after the finish chunk and before `[DONE]`.
+fn sse_usage_chunk(cid: &str, model: &str, created: i64, outcome: &ChatOutcome) -> Event {
+    let chunk = ChatCompletionChunk {
+        id: cid.to_owned(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_owned(),
+        choices: Vec::new(),
+        usage: Some(UsageInfo::from_outcome(outcome)),
     };
     Event::default()
         .json_data(chunk)
@@ -1923,20 +2061,57 @@ fn json_error(status: StatusCode, msg: String) -> Response {
     (status, Json(error_body(&msg, "server_error"))).into_response()
 }
 
-/// OpenAI-shaped 400 for a bad request parameter (`invalid_request_error`, with the offending
-/// `param` named). NOT a clamp and NOT a panic — see [`GenParams::from_request`].
+/// An `invalid_request_error` — the request is at fault and resending it unchanged will not help.
+/// `param` names the offending field and `code` is OpenAI's machine-readable reason, where there
+/// is one (`null` otherwise).
 ///
 /// Two fields on top of the shared [`error_body`], and they are deliberately absent from the
 /// server-error responses rather than emitted as nulls there: `param` only means something when a
-/// specific request field is at fault, and OpenAI's own 5xx bodies carry neither. `code` is always
-/// null — we mint no error codes — but it is present because SDKs read `error.code` on a 400.
-/// Appending them keeps the key order (`message`, `type`, `param`, `code`) the responses have
-/// always had; `serde_json`'s `preserve_order` makes that order observable on the wire.
-fn param_error(param: Option<&str>, msg: String) -> Response {
-    let mut body = error_body(&msg, "invalid_request_error");
+/// specific request field is at fault, and OpenAI's own 5xx bodies carry neither. `code` is
+/// present even when null because SDKs read `error.code` on a 4xx. Appending them keeps the key
+/// order (`message`, `type`, `param`, `code`) the responses have always had; `serde_json`'s
+/// `preserve_order` makes that order observable on the wire.
+fn invalid_request(
+    status: StatusCode,
+    param: Option<&str>,
+    code: Option<&str>,
+    msg: String,
+) -> Response {
+    (status, Json(invalid_request_body(param, code, &msg))).into_response()
+}
+
+/// The body of [`invalid_request`], for the SSE error frame as well as the HTTP response.
+fn invalid_request_body(param: Option<&str>, code: Option<&str>, msg: &str) -> serde_json::Value {
+    let mut body = error_body(msg, "invalid_request_error");
     body["error"]["param"] = serde_json::json!(param);
-    body["error"]["code"] = serde_json::Value::Null;
-    (StatusCode::BAD_REQUEST, Json(body)).into_response()
+    body["error"]["code"] = serde_json::json!(code);
+    body
+}
+
+/// The over-long-prompt error, identical on both paths: a `400` body, or a streamed error frame.
+fn context_length_body(c: &ContextLengthExceeded) -> serde_json::Value {
+    invalid_request_body(
+        Some("messages"),
+        Some("context_length_exceeded"),
+        &c.message,
+    )
+}
+
+/// A body the JSON extractor refused. Malformed JSON and wrong field types are a `400` (not axum's
+/// default `422`, which no OpenAI client expects); a body over the size limit keeps its `413` and a
+/// missing JSON content type its `415`, because those say something a client can fix differently.
+fn body_rejection(e: JsonRejection) -> Response {
+    let status = match e.status() {
+        s @ (StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNSUPPORTED_MEDIA_TYPE) => s,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    invalid_request(status, None, None, e.body_text())
+}
+
+/// OpenAI-shaped 400 for a bad request parameter (`invalid_request_error`, with the offending
+/// `param` named). NOT a clamp and NOT a panic — see [`GenParams::from_request`].
+fn param_error(param: Option<&str>, msg: String) -> Response {
+    invalid_request(StatusCode::BAD_REQUEST, param, None, msg)
 }
 
 /// Process-monotonic tie-breaker so two requests in the SAME millisecond (routine under
@@ -1989,10 +2164,9 @@ fn clamp_max_tokens(requested: Option<u32>, cap: u32) -> Option<u32> {
 /// environment (see the env layer's note on why this knob is NOT `.filter(|v| v > 0)`).
 ///
 /// Why a deadline exists at all: nothing else bounds how long one request may occupy a `--parallel`
-/// slot. `max_tokens_cap` bounds TOKENS, and its 128k default is many hours on a slow model; on the
-/// non-streaming path a client that has already gone away cannot even be detected (there is no send
-/// to fail), so it burns its slot to completion. Why it is OFF by default: firing mid-generation
-/// truncates a legitimate long reply, and only the operator knows their model's token rate.
+/// slot. `max_tokens_cap` bounds TOKENS, and its 128k default is many hours on a slow model. Why it
+/// is OFF by default: firing mid-generation truncates a legitimate long reply, and only the operator
+/// knows their model's token rate.
 fn request_timeout(cfg: &Config) -> Option<Duration> {
     let secs = cfg.serve.request_timeout_secs;
     (secs > 0).then(|| Duration::from_secs(secs))
@@ -2040,6 +2214,37 @@ fn arm_deadline(
         }
     });
     done_tx
+}
+
+/// Latch `cancel` the moment the streaming client hangs up, i.e. when the SSE receiver `tx` feeds
+/// is dropped — not at the next delta, which may be a whole prefill away.
+///
+/// Same teardown shape as [`arm_deadline`]: the returned sender is the "generation finished"
+/// signal, moved into the blocking task and dropped there (also on unwind). The watcher holds a
+/// clone of `tx`, and the SSE stream only ends once every sender is gone, so it MUST end with the
+/// generation or a finished stream would never close.
+fn cancel_on_hangup(
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
+    cancel: Arc<AtomicBool>,
+) -> tokio::sync::oneshot::Sender<()> {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tx.closed() => cancel.store(true, Ordering::Relaxed),
+            _ = done_rx => {}
+        }
+    });
+    done_tx
+}
+
+/// Latches its flag when dropped — the non-streaming handler's hang-up signal (see [`non_streaming`]).
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Optional bearer-token gate. `expected` is the configured API key (`INFR_API_KEY`), or `None`
@@ -2094,9 +2299,12 @@ fn authorize(expected: Option<&str>, auth_header: Option<&str>) -> bool {
 fn auth_gate(cfg: &Config, headers: &HeaderMap) -> Option<Response> {
     let key = configured_api_key(cfg)?;
     let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+    // OpenAI's own 401: the request is at fault (`invalid_request_error`), not the server.
     (!authorize(Some(key), auth)).then(|| {
-        json_error(
+        invalid_request(
             StatusCode::UNAUTHORIZED,
+            None,
+            Some("invalid_api_key"),
             "missing or invalid Authorization bearer token".into(),
         )
     })
@@ -2280,6 +2488,7 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 3,
                 completion_tokens: 2,
+                cached_tokens: 0,
             })
         }
     }
@@ -2438,6 +2647,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -2471,6 +2681,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -2510,6 +2721,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -2540,6 +2752,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["object"], "chat.completion.chunk");
@@ -2566,6 +2779,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["choices"][0]["delta"]["content"], "hello");
@@ -2587,6 +2801,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["choices"][0]["delta"]["reasoning_content"], "thinking...");
@@ -2616,6 +2831,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         let tc = &v["choices"][0]["delta"]["tool_calls"][0];
@@ -2636,6 +2852,7 @@ mod tests {
                 delta: DeltaPayload::default(), // empty delta {}
                 finish_reason: Some("stop".into()),
             }],
+            usage: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
@@ -2985,14 +3202,9 @@ mod tests {
             finish: Finish::Stop,
             prompt_tokens: 17,
             completion_tokens: 5,
+            cached_tokens: 0,
         };
-        let usage = UsageInfo {
-            prompt_tokens: outcome.prompt_tokens,
-            completion_tokens: outcome.completion_tokens,
-            total_tokens: outcome
-                .prompt_tokens
-                .saturating_add(outcome.completion_tokens),
-        };
+        let usage = UsageInfo::from_outcome(&outcome);
         assert_eq!(usage.total_tokens, 22);
         assert_eq!(
             usage.total_tokens,
@@ -3283,7 +3495,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "server_error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "invalid_api_key");
         assert_eq!(
             v["error"]["message"],
             "missing or invalid Authorization bearer token"
@@ -3368,6 +3581,7 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 3,
                 completion_tokens: 1,
+                cached_tokens: 0,
             })
         }
     }
@@ -3390,6 +3604,7 @@ mod tests {
             created: 0,
             deadline,
             stream,
+            include_usage: false,
             stats: Arc::default(),
         }
     }
@@ -3819,6 +4034,7 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 1,
                 completion_tokens: 1,
+                cached_tokens: 0,
             },
             Finish::Stop,
         ));
@@ -3845,6 +4061,7 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 1,
                 completion_tokens: 2,
+                cached_tokens: 0,
             },
             Finish::Stop,
         ));
@@ -3863,6 +4080,7 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 0,
                 completion_tokens: 0,
+                cached_tokens: 0,
             },
             Finish::Stop,
         );
@@ -4023,5 +4241,380 @@ mod tests {
             w.has_activity(),
             "an interval of failures is not an idle one"
         );
+    }
+
+    // --- wire contract: usage, context length, body rejections, hang-ups ----
+
+    /// POST `body` to the chat route of `router` with a JSON content type.
+    async fn post_chat(router: Router, body: &str) -> Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn router_for(generator: Arc<dyn ChatGenerator>) -> Router {
+        build_router(AppState::new(
+            generator,
+            "m",
+            1,
+            Arc::new(Config::default()),
+        ))
+    }
+
+    /// A generator whose prompt was mostly served from the KV prefix cache: 20 prompt tokens, 19
+    /// of them cached, so only 1 was prefilled.
+    struct CachedPrefixGen;
+    impl ChatGenerator for CachedPrefixGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_delta(Delta::Content("ok".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 20,
+                completion_tokens: 1,
+                cached_tokens: 19,
+            })
+        }
+    }
+
+    /// B83: `usage.prompt_tokens` is the whole prompt and the cached part is reported under
+    /// `prompt_tokens_details.cached_tokens` — while the throughput counters still count only the
+    /// one token that was actually prefilled.
+    #[tokio::test]
+    async fn usage_counts_the_whole_prompt_and_reports_the_cached_part() {
+        let g: Arc<dyn ChatGenerator> = Arc::new(CachedPrefixGen);
+        let state = AppState::new(g, "m", 1, Arc::new(Config::default()));
+        let stats = state.stats.clone();
+        let resp = post_chat(
+            build_router(state),
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        let v = body_json(resp).await;
+        assert_eq!(v["usage"]["prompt_tokens"], 20);
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 19);
+        assert_eq!(v["usage"]["total_tokens"], 21);
+        let w = stats.drain(Duration::from_secs(1));
+        assert_eq!(w.prompt_tokens, 1, "only the prefilled token is throughput");
+    }
+
+    /// The SSE frames of a streamed response, `data:` payloads in order.
+    async fn sse_frames(resp: Response) -> Vec<String> {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: ").map(str::to_owned))
+            .collect()
+    }
+
+    /// B137: `stream_options.include_usage` ends the stream with one chunk carrying `usage` and an
+    /// empty `choices` array, after the finish chunk and before `[DONE]`. Without the option, no
+    /// chunk carries `usage`.
+    #[tokio::test]
+    async fn include_usage_ends_the_stream_with_a_usage_chunk() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true,
+                       "stream_options":{"include_usage":true}}"#;
+        let frames = sse_frames(post_chat(router_for(Arc::new(CachedPrefixGen)), body).await).await;
+        let n = frames.len();
+        assert!(n >= 3, "{frames:?}");
+        assert_eq!(frames[n - 1], "[DONE]");
+        let usage: serde_json::Value = serde_json::from_str(&frames[n - 2]).unwrap();
+        assert_eq!(usage["choices"], serde_json::json!([]), "{frames:?}");
+        assert_eq!(usage["usage"]["prompt_tokens"], 20);
+        assert_eq!(usage["usage"]["completion_tokens"], 1);
+        assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 19);
+        let finish: serde_json::Value = serde_json::from_str(&frames[n - 3]).unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop", "{frames:?}");
+
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+        let frames = sse_frames(post_chat(router_for(Arc::new(CachedPrefixGen)), body).await).await;
+        assert!(
+            frames.iter().all(|f| !f.contains("\"usage\"")),
+            "usage was not asked for: {frames:?}"
+        );
+    }
+
+    /// A generator whose prompt does not fit the context.
+    struct OverflowGen;
+    impl ChatGenerator for OverflowGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            _on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            Err(ContextLengthExceeded {
+                message: "too long".into(),
+            }
+            .into())
+        }
+    }
+
+    /// B86: an over-long prompt is the client's to fix — `400 context_length_exceeded`, which
+    /// OpenAI clients act on, not the `500` they retry unchanged.
+    #[tokio::test]
+    async fn an_over_long_prompt_is_a_400_context_length_exceeded() {
+        let resp = post_chat(
+            router_for(Arc::new(OverflowGen)),
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "context_length_exceeded");
+        assert_eq!(v["error"]["param"], "messages");
+        assert_eq!(v["error"]["message"], "too long");
+    }
+
+    /// B86 on a stream: the `200` is already out, so the over-long prompt arrives as the terminal
+    /// error frame — carrying the same typed error as the non-streaming `400`, not a generic
+    /// `server_error` a client cannot tell from a crash — and `[DONE]` still closes the stream.
+    #[tokio::test]
+    async fn an_over_long_prompt_on_a_stream_is_a_typed_error_frame() {
+        let frames = sse_frames(
+            post_chat(
+                router_for(Arc::new(OverflowGen)),
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            frames.last().map(String::as_str),
+            Some("[DONE]"),
+            "{frames:?}"
+        );
+        let err: serde_json::Value = frames
+            .iter()
+            .filter_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+            .find(|v| v.get("error").is_some())
+            .expect("an error frame");
+        assert_eq!(err["error"]["type"], "invalid_request_error");
+        assert_eq!(err["error"]["code"], "context_length_exceeded");
+        assert_eq!(err["error"]["param"], "messages");
+        assert_eq!(err["error"]["message"], "too long");
+    }
+
+    /// B86: a body over the size limit is `413` and a body without a JSON content type `415` — not
+    /// the `400` a malformed body gets — still in the OpenAI error envelope.
+    #[tokio::test]
+    async fn oversized_and_untyped_bodies_keep_their_status() {
+        let huge = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(3 << 20)
+        );
+        let resp = post_chat(router_for(Arc::new(EchoGen("a"))), &huge).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            body_json(resp).await["error"]["type"],
+            "invalid_request_error"
+        );
+
+        let resp = router_for(Arc::new(EchoGen("a")))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .body(Body::from(
+                        r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            body_json(resp).await["error"]["type"],
+            "invalid_request_error"
+        );
+
+        // Malformed JSON stays a 400.
+        let resp = post_chat(router_for(Arc::new(EchoGen("a"))), "{not json").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// B137: the bearer check runs on the headers, before the body is read. A client without a
+    /// token whose body never finishes arriving still gets its 401 at once.
+    #[tokio::test]
+    async fn the_bearer_check_does_not_wait_for_the_body() {
+        let mut cfg = Config::default();
+        cfg.serve.api_key = Some("s3cret".into());
+        let g: Arc<dyn ChatGenerator> = Arc::new(EchoGen("a"));
+        let router = build_router(AppState::new(g, "m", 1, Arc::new(cfg)));
+        let never = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(2),
+            router.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from_stream(never))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("an unauthenticated request waited for its body")
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// B137: `-1` is the "unset" sentinel llama.cpp-style clients send for `seed` and `max_tokens`;
+    /// it is accepted as unset, and any other negative value is still refused.
+    #[tokio::test]
+    async fn minus_one_seed_and_max_tokens_mean_unset() {
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"seed":-1,"max_tokens":-1,"max_completion_tokens":-1}"#,
+        ))
+        .unwrap();
+        assert_eq!((p.seed, p.max_tokens), (None, None));
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"seed":18446744073709551615,"max_tokens":7}"#,
+        ))
+        .unwrap();
+        assert_eq!((p.seed, p.max_tokens), (Some(u64::MAX), Some(7)));
+        for bad in [
+            r#""seed":-2"#,
+            r#""max_tokens":-5"#,
+            r#""max_tokens":4294967296"#,
+        ] {
+            let raw = format!(r#"{{"model":"m","messages":[],{bad}}}"#);
+            assert!(serde_json::from_str::<ChatRequest>(&raw).is_err(), "{bad}");
+        }
+
+        let resp = post_chat(
+            router_for(Arc::new(EchoGen("a"))),
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"seed":-1,"max_tokens":-1}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Sits in a "prefill" that emits nothing, polling `cancel` the way a real prefill loop does,
+    /// and records whether the latch reached it. Bounded, so a broken hang-up path fails the test
+    /// instead of hanging it.
+    struct HangGen {
+        entered: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+    }
+    impl ChatGenerator for HangGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            cancel: &Arc<AtomicBool>,
+            _on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            self.entered.store(true, Ordering::Relaxed);
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5) {
+                if cancel.load(Ordering::Relaxed) {
+                    self.cancelled.store(true, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 0,
+                cached_tokens: 0,
+            })
+        }
+    }
+
+    /// Wait (bounded) for `flag` to be set.
+    async fn eventually(flag: &AtomicBool, within: Duration) -> bool {
+        let started = Instant::now();
+        while !flag.load(Ordering::Relaxed) {
+            if started.elapsed() > within {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        true
+    }
+
+    /// Serve a [`HangGen`] on a real socket, send one chat request, hang up once the generation
+    /// is running, and report whether the hang-up reached the generator's `cancel` latch.
+    async fn hang_up_reaches_the_generator(stream: bool) -> bool {
+        use tokio::io::AsyncWriteExt;
+        let entered = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let g: Arc<dyn ChatGenerator> = Arc::new(HangGen {
+            entered: entered.clone(),
+            cancelled: cancelled.clone(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = router_for(g);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#
+        );
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        sock.write_all(head.as_bytes()).await.unwrap();
+        sock.write_all(body.as_bytes()).await.unwrap();
+        assert!(
+            eventually(&entered, Duration::from_secs(2)).await,
+            "the generation never started"
+        );
+        drop(sock);
+        let reached = eventually(&cancelled, Duration::from_secs(2)).await;
+        server.abort();
+        reached
+    }
+
+    /// B85: a non-streaming client that hangs up mid-generation cancels it, so its slot is not
+    /// held to `max_tokens` for nobody.
+    #[tokio::test]
+    async fn a_non_streaming_hang_up_cancels_the_generation() {
+        assert!(hang_up_reaches_the_generator(false).await);
+    }
+
+    /// B85: a streaming client that hangs up while nothing is being sent — a long prefill — cancels
+    /// the generation at once, not at the next delta.
+    #[tokio::test]
+    async fn a_streaming_hang_up_during_prefill_cancels_the_generation() {
+        assert!(hang_up_reaches_the_generator(true).await);
     }
 }

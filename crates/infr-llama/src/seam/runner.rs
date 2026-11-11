@@ -1284,11 +1284,12 @@ pub(crate) fn generate_dense_backend(
     } = weights.as_ref();
     let max_ctx = *max_ctx;
     if prompt.len() + max_new + 1 > max_ctx {
-        return Err(anyhow!(
-            "prompt {} + gen {} exceeds the session KV capacity {max_ctx}",
-            prompt.len(),
-            max_new
-        ));
+        return Err(crate::ContextOverflow {
+            prompt: prompt.len(),
+            gen: max_new,
+            max_ctx,
+        }
+        .into());
     }
     // Ordinary (non-denoise) generation needs a non-empty prompt (the `.min(prompt.len()-1)`
     // prefix-diff below would underflow on empty, and there'd be nothing to sample the first
@@ -4937,6 +4938,9 @@ pub(crate) fn generate_dense_backend(
                 prompt_secs: sc_secs + build_secs + exec_secs + dl_secs,
                 n_gen: 0,
                 decode_secs: 0.0,
+                n_cached: 0,
+                ctx_full: false,
+                natural_stop: false,
             },
         ));
     }
@@ -5098,6 +5102,9 @@ pub(crate) fn generate_dense_backend(
                 prompt_secs: t0.elapsed().as_secs_f64(),
                 n_gen: 0,
                 decode_secs: 0.0,
+                n_cached: 0,
+                ctx_full: false,
+                natural_stop: false,
             },
         ));
     }
@@ -5172,6 +5179,9 @@ pub(crate) fn generate_dense_backend(
     let mut prompt_t = std::time::Duration::ZERO;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
+    // Set where the decode loop ends because the model finished (EOS, or a constrained span
+    // completing) rather than on the budget or an abort — see `GenStats::natural_stop`.
+    let mut natural_stop = false;
     // `prof.stages` (INFR_PROF_STAGES): split decode per-token wall time into host setup (build
     // graph + compile + bind) vs execute (record + submit + GPU + wait) to guide the
     // record-once-replay decision. Hoisted here, ABOVE the loop — the old read was a `getenv` on
@@ -5705,6 +5715,7 @@ pub(crate) fn generate_dense_backend(
                         let is_eos = !ignore_eos && (c.eos_ids.contains(&id) || id == c.eos);
                         if is_eos {
                             stop = true;
+                            natural_stop = true;
                             break;
                         }
                         on_token(id);
@@ -5907,6 +5918,7 @@ pub(crate) fn generate_dense_backend(
                 .map_err(|e| anyhow!("{e}"))?;
                 decode_t += step_t0.elapsed();
                 if step.is_empty() {
+                    natural_stop = true;
                     break;
                 }
                 for &t in &step {
@@ -5915,7 +5927,11 @@ pub(crate) fn generate_dense_backend(
                     cur.push(t);
                     decode_n += 1;
                 }
-                if done || out.len() >= max_new || crate::sampling::abort_requested(req) {
+                if done {
+                    natural_stop = true;
+                    break;
+                }
+                if out.len() >= max_new || crate::sampling::abort_requested(req) {
                     break;
                 }
             } else {
@@ -5945,7 +5961,11 @@ pub(crate) fn generate_dense_backend(
                 // `on_token` -> the server's stop-sequence matcher may have latched an abort (a stop
                 // string completed inside this token's text). One relaxed atomic load per token,
                 // and not even that when `req` is None.
-                if is_eos || out.len() >= max_new || crate::sampling::abort_requested(req) {
+                if is_eos {
+                    natural_stop = true;
+                    break;
+                }
+                if out.len() >= max_new || crate::sampling::abort_requested(req) {
                     break;
                 }
                 cur.push(next);
@@ -6056,6 +6076,10 @@ pub(crate) fn generate_dense_backend(
         prompt_secs: prompt_t.as_secs_f64(),
         n_gen: decode_n,
         decode_secs: decode_t.as_secs_f64(),
+        n_cached: start,
+        // Only the callers that lower `max_new` to the context left know it was lowered.
+        ctx_full: false,
+        natural_stop,
     };
     Ok((out, stats))
 }

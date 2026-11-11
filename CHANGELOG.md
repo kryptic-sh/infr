@@ -6,7 +6,45 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Breaking
+
+- **`infr_server::ChatOutcome` has a new field, `cached_tokens`.** An
+  out-of-tree `ChatGenerator` that builds it with a struct literal must set it
+  (0 when no KV prefix was reused). `UsageInfo`, `ChatCompletionChunk` and
+  `ChatRequest` also gained fields (`prompt_tokens_details`, `usage`,
+  `stream_options`), and `infr_llama::GenStats` gained `n_cached`, `ctx_full`
+  and `natural_stop`; `GenStats` has a `Default`, the others do not.
+
+### Added
+
+- **`stream_options.include_usage` on `infr serve`.** A streaming request that
+  sets it gets one more chunk before `[DONE]`, with an empty `choices` and the
+  request's `usage`.
+- **`usage.prompt_tokens_details.cached_tokens`**: the part of the prompt served
+  from the KV prefix cache.
+- **`seed: -1` and `max_tokens: -1` are accepted** and mean "not set", for
+  clients written against llama.cpp. `max_tokens: -1` therefore takes the
+  server's default budget; it does not mean "until the context is full".
+
 ### Fixed
+
+- **`infr serve`: `usage.prompt_tokens` counts the whole prompt.** It reported
+  only the tokens prefilled for this request, so a KV prefix cache hit made a
+  long prompt look short. `/metrics` still counts prefilled tokens only.
+- **`infr serve`: a reply cut off because the context window filled finishes
+  with `finish_reason: "length"`**, not `"stop"`; and a reply whose end token
+  lands exactly on the `max_tokens` limit now says `"stop"`, not `"length"`.
+- **`infr serve`: an over-long prompt is `400 context_length_exceeded`**, with
+  `type: "invalid_request_error"`, instead of a 500. On a streaming request the
+  same error arrives as a typed error frame. An oversized body is a 413 and a
+  missing JSON content type a 415; both were 400.
+- **`infr serve`: a client that disconnects stops its generation**, during
+  prefill too, and frees its `--parallel` slot. It used to run to completion.
+- **`infr serve` on CPU, Metal or DiffusionGemma: one panicking generation no
+  longer makes every later request fail.** The model lock stayed poisoned.
+- **`infr serve`: the API key is checked before the request body is read**, and
+  a 401 body now has `type: "invalid_request_error"` and
+  `code: "invalid_api_key"` (it said `server_error`).
 
 - **Qwen3.5 / Qwen3.6: the first prompt after a reset no longer inherits the
   previous generation's state.** The gated-DeltaNet recurrent state was only

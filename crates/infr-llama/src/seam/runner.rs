@@ -5734,7 +5734,10 @@ pub(crate) fn generate_dense_backend(
             // Clamped by the backend's watchdog budget too: a chain is one submit of `n` decode
             // steps, and on a slow device that submit has to stay short (see
             // `Backend::max_decode_chain`). Clamped HERE, before the per-step sampling uniforms
-            // below are drawn, so the RNG stream advances by exactly the steps we run.
+            // below are drawn, so the RNG stream advances by no more than the steps asked for. A
+            // backend may return fewer ids than that (see `Backend::execute_chain`); the draws for
+            // the steps it did not run are then spent, and later tokens sample further along the
+            // stream than a per-token run would.
             let n = chain_n
                 .min(max_new - out.len())
                 .min(64)
@@ -5817,9 +5820,8 @@ pub(crate) fn generate_dense_backend(
                     continue;
                 }
                 // Backend declined (e.g. adapter fell back to static) — per-token path below.
-                // Vulkan declines before running a step. Metal's chain can run one step at `pos`
-                // and then decline; the per-token path re-runs that same position and raises the
-                // mark to `pos + 1` itself, so restoring it loses nothing for KV rows.
+                // A decline means no step ran (`Backend::execute_chain`), so the mark goes back
+                // to where it was; the per-token path raises it for `pos` itself.
                 *written_end = written_before;
             }
         }
@@ -5861,17 +5863,14 @@ pub(crate) fn generate_dense_backend(
         // Only sample once we're past the prompt (decode position = last prompt token onward).
         let is_decode = pos + 1 >= prompt.len();
         // GPU stochastic sampling: draw this step's uniform from the SAME xorshift stream the
-        // host sampler would consume. Record-once (`ro.is_some()`, `RopeMode::Dynamic`) seeds the
-        // ring slot `pos & 63` — the in-graph `Op::Sample` reads `u_buf[params[0] & 63]`, matching
-        // the chained fast-path's geometry above, since this iteration's dispatch advances
-        // `params[0]` to `pos` whether it's replayed singly here or folded into an
-        // `execute_chain` chunk (see `Recorder::sample_topk_chain`). The classic per-execute
-        // rebuild (`ro` is `None`, `RopeMode::Static`) has no ring — its kernel always reads
-        // `u_buf[0]`, so pin the write there. Only frontier rows sample, matching the host path's
-        // rng consumption exactly.
+        // host sampler would consume, into both slots a sampler may read (`seed_step_uniform`).
+        // Only frontier rows sample, matching the host path's rng consumption exactly.
         if gpu_sample && is_decode && pos + 1 == cur.len() {
-            let slot = if ro.is_some() { pos & 63 } else { 0 };
-            u_ring_host[slot] = crate::sampling::next_uniform(&mut rng);
+            seed_step_uniform(
+                &mut u_ring_host,
+                pos,
+                crate::sampling::next_uniform(&mut rng),
+            );
             be.upload(u_buf.as_ref(), bytemuck::cast_slice(&u_ring_host))
                 .map_err(|e| anyhow!("{e}"))?;
         }
@@ -6159,10 +6158,39 @@ pub(crate) fn generate_dense_backend(
     Ok((out, stats))
 }
 
+/// Seed one per-token decode step's sampling uniform `u` into the host mirror of the `Op::Sample`
+/// uniform ring, for the step at `pos`. It goes to both slots a sampler may read: `pos & 63`, which
+/// a recorded replay indexes by the live position, and slot 0, which a static walk reads. Which of
+/// the two runs is the backend's own replay decision, not this loop's `dyn_replay`: Metal never
+/// records a graph with a plain `Rope`, so a llama-family plan built for replay still runs as a
+/// static walk, and a plan built static can still be recorded there.
+fn seed_step_uniform(ring: &mut [f32; 64], pos: usize, u: f32) {
+    ring[pos & 63] = u;
+    ring[0] = u;
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resident_after_gen, validate_token_ids, Config, EngineConfig, Gguf, SeamKv};
+    use super::{
+        resident_after_gen, seed_step_uniform, validate_token_ids, Config, EngineConfig, Gguf,
+        SeamKv,
+    };
     use crate::seam::TokenEmbd;
+
+    /// B125: the runner cannot tell whether the backend replays its plan (sampler reads slot
+    /// `pos & 63`) or walks it statically (slot 0) — Metal decides that per graph, and a llama
+    /// plan built for replay runs static there. Each step's draw must reach both, or a
+    /// temperature > 0 decode samples with a stale or zero uniform.
+    #[test]
+    fn a_step_uniform_reaches_both_sampler_slots() {
+        let mut ring = [0f32; 64];
+        for pos in [1usize, 5, 63, 64, 70, 130] {
+            let u = 0.25 + pos as f32 / 1000.0;
+            seed_step_uniform(&mut ring, pos, u);
+            assert_eq!(ring[pos & 63], u, "replayed sampler's slot at pos {pos}");
+            assert_eq!(ring[0], u, "static sampler's slot at pos {pos}");
+        }
+    }
 
     // ── resident_after_gen: which tokens' KV rows are recorded as materialized ────────────────
     //

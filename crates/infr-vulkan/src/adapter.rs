@@ -790,12 +790,6 @@ fn fusion_cfg(be_: &VulkanBackend) -> infr_core::fusion::FusionCfg<'static> {
             // of the env key — including `INFR_NO_FUSE_ADD=0` — turns the fold off.
             enabled: be_.cfg().kernels.vulkan.fuse_add,
         }),
-        rmsnorm_linear: None,
-        // F1c's `MoeFfn → Add` fold is un-planned on every live backend: this adapter's MoE lowering accumulates
-        // the experts through its own `moe_accumulate`, which has no residual epilogue, so the
-        // pattern stays un-planned here and Vulkan dispatches the standalone `Add` exactly as
-        // before.
-        moe_add: None,
         kv_write: true,
     }
 }

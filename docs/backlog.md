@@ -2918,19 +2918,6 @@ the body, `-1` for `seed` / `max_tokens`, and the 401 body. Left:
 - The hang-up tests use real sockets with 2 s bounds; a loaded Windows or macOS
   runner could fail them. A failure would be an assertion, not a hang.
 
-### B87 — the Metal chat path does not clamp `max_new` to the context (2026-11-08)
-
-**Tag:** metal · **Verified:** PLAUSIBLE — macOS only, inferred from the missing
-clamp
-
-`generate_metal_session_constrained` (`crates/infr-llama/src/seam/model.rs`)
-hands `max_new` to `generate_dense_backend` unclamped, unlike the Vulkan session
-path and `ParallelSeam::generate`. The runner then rejects
-`prompt + max_new + 1 > max_ctx`, so a request with a large `max_tokens` on a
-Metal server with a small `--ctx` fails with a 500 even when a short reply would
-fit. Fix: do the clamp once in `run_chat` (which also serves B82) rather than in
-each backend path.
-
 ### B88 — special-token text in user messages tokenizes as control tokens (2026-11-08)
 
 **Needs:** a decision. A user message containing the text of a control token
@@ -3335,19 +3322,6 @@ admits; do the conversion per head inside the pool; or keep an incrementally
 extended f32 shadow. Measure first (`samply`, deep context) — the review's
 estimate of the cost was arithmetic, not a profile.
 
-### B109 — Metal `alloc` never checks for a nil buffer (2026-11-11)
-
-**Tag:** Metal · **Kind:** soundness, plausible, not run on hardware
-
-`MetalBackend::alloc` in `crates/infr-metal/src/lib.rs` calls
-`new_buffer(len, StorageModeShared)` and immediately
-`ptr::write_bytes(raw.contents(), 0, len)`. Metal returns nil when the length
-exceeds the device's maximum buffer length or memory is exhausted; `contents()`
-on nil is null, so this is a null write — a segfault where Vulkan reports a
-clean "does not fit". `alloc_uninit` and `upload` were reported to have the same
-shape and were not re-read here. Fix: check for null (and against the device's
-max buffer length) and return `Err`.
-
 ### B110 — hub selection: cached-quant fallback and the mmproj ordering (2026-11-11)
 
 **Tag:** hub · **Kind:** one decision, one bug
@@ -3497,89 +3471,49 @@ Worth measuring in a quiet window: decode on a 262144-token head with a narrow
 embedding (padding workgroups now exit at once, so it should be faster), and the
 KV-store kernel on RADV after the subgroup pin.
 
-### B125 — Metal: in-graph sampling can read a different uniform slot than the runner wrote (2026-11-11)
+### B125 — Metal: fixed by reading, verified only by CI (2026-11-12)
 
-The seam's decode loop (`generate_dense_backend` in infr-llama `seam/runner.rs`)
-writes each step's uniform draw to ring slot `pos & 63` when it holds a compiled
-replay plan (`ro.is_some()`, decided by `dyn_replay`) and to slot 0 otherwise.
-Metal's `Op::Sample` arm (`MetalBackend::run_op` in `exec.rs`) picks the `_dyn`
-kernel, which reads `u_buf[positions[0] & 63]`, only when `r.posbuf` is set —
-that is, only when Metal's own `replay_shape` decided to record — and otherwise
-uses `sample_f32`, which reads `u_buf[0]`.
+The 2026-11-12 Metal slice was written on Linux: the code was cross-linted for
+`aarch64-apple-darwin` and first compiled and run by the macOS CI jobs. Fixed:
+the sampler's uniform slot (the runner now writes each draw to slot 0 and to
+`pos & 63`, so the Metal sampler reads a fresh draw whether or not it replays),
+the scratch pool (one buffer per tag, growing by at least doubling, clamped to
+the device maximum), DeltaNet key-head widths the kernel does not fit (host
+path), replay admission (`RmsNormAdd`, the fused / scaled MoE, and
+`no_decode_replay` are refused), the nil-buffer check (`new_shared_buffer`), the
+reply cap on the Metal chat path, and a chain that ran one step reporting it.
+Left:
 
-The two predicates are computed independently. `replay_shape` returns false for
-any graph with a plain `Op::Rope` (every llama-family model), so there the
-runner writes slot `pos & 63` while the kernel reads slot 0, which is refreshed
-only when `pos & 63 == 0`. In the other direction the runner goes static for
-cases `replay_shape` admits (`INFR_SEAM_NO_REPLAY=1`, a coupled Q4_0 or IQ4_NL
-KV per `kv_forces_static`). Either way a temperature > 0 run would sample most
-tokens with a stale or zero uniform — a zero uniform selects the top candidate,
-so it would look greedy — with no error.
-
-Confirmed by reading: the runner's slot expression, the arm's `posbuf` test,
-both shader slot expressions, the `Op::Rope` rejection in `replay_shape`, and
-that Metal reports `gpu_sample: true`. Not established: the runtime effect.
-Metal cannot be built or run on the Linux machine this was reviewed on, and no
-Mac run was done. A sampled-token distribution test on Metal for a llama-family
-model would settle it. Fix: have the runner ask the backend which slot geometry
-the compiled plan uses, or make the static kernel take the position too.
-
-### B126 — Metal: the scratch pool never evicts and is keyed on a size that grows per token (2026-11-11)
-
-`MetalBackend::scratch_buf` (`exec.rs`) is a `HashMap` keyed by
-`(element count, tag)` whose only access is `entry().or_insert_with(..)`;
-nothing removes from it. The KV dequant prepass in the `Op::Attention` arm asks
-for `kv_len * n_kv * head_dim * 2` bytes under tags 18 and 19, so on static
-decode with a prepass KV format (Q4_1, Q5_0, Q5_1, BF16, the turbo formats, or a
-mixed pair) every token adds one new K and one new V buffer that are kept for
-the life of the backend. Retained bytes grow with the square of the generated
-length.
-
-Confirmed by reading the pool and the call site. Not measured. The reviewer also
-reports the same pattern, at smaller scale, for the lightning-indexer and
-prefill-row-dependent tags; those were not re-read. Fix: key the prepass scratch
-on capacity (grow-only, one buffer per tag) rather than on the exact size.
-
-### B127 — Metal: DeltaNet picks the 8-lane kernel for head widths it does not fit (2026-11-11)
-
-The `Op::DeltaNet` arm (`exec.rs`) admits `kd <= 256 && kd % 32 == 0` and then
-selects a kernel by `kd / 32`, with arms for 1, 2 and 4 and a catch-all that
-picks the `_k8` instantiation. `KPL` is a compile-time lane width in
-`deltanet.metal`, so a `head_k` of 96, 160, 192 or 224 runs the 8-per-lane
-kernel over 256 key indices and, per the reviewer, reads and writes other heads'
-state. The same catch-all is in the `deltanet_norm_*` pick.
-
-The gate and both matches are confirmed by reading; the shader indexing is as
-reported. Latent, per the reviewer: the validated DeltaNet models use a `head_k`
-of 128 (not re-checked against a file). Fix: admit only `kd / 32 ∈ {1, 2, 4, 8}`
-in the arm and in `replay_shape`.
-
-### B128 — Metal and CPU: smaller findings (2026-11-11)
-
-Reported by the reviewer; only the items marked confirmed were re-read.
-
-- **Metal replay admission is looser than the arms it admits.** `replay_shape`
-  whitelists `Op::RmsNormAdd`, whose arm is host-only, and its `MoeFfn` and
-  `DeltaNet` checks omit terms the arms themselves use to fall back to the host.
-  A host fallback during recording produces a tape that silently omits the op.
-  Each case is currently masked by another op in the same graph that blocks
-  replay (for example `Softcap` on Gemma 4), so nothing is wrong today.
-  `Graph::no_decode_replay` is read by Vulkan only.
-- **Unchecked nil buffers beyond B109:** `f32_buf`, `zeros_buf`, `bytes_buf`,
-  the result buffer in `execute_graph_chain`, and `alloc_uninit` in release.
-- **`replay_fp` fingerprints wrapper addresses** rather than `MetalBuffer::uid`,
-  the recycled-address hazard `idcache.rs` exists to avoid.
-- **CPU single-row MoE dequantises every expert row to f32.** `int8_ok` in the
-  `Op::MoeFfn` arm is `rows >= 2 && !reference` (confirmed), so decode takes the
-  `ExpertActs::Raw` path with a `Vec<f32>` per output row. `moe.rs` documents
-  this as deliberate for exact Metal parity; changing it is a precision flip
-  that needs re-blessed goldens. Not measured.
-- **CPU Q5_0 `Op::Linear` at one row** falls to the generic dequant arm, while
-  the multi-row path uses `vec_dot_q5_0_32_batch` (the multi-row arm confirmed),
-  so decode and prefill run at different activation precision for Q5_0.
-- **`x_stride` is ignored by CPU `Op::QkNorm` / `Op::Rope`** and hard-coded in
-  `Op::QkNormRope`, where Metal asserts or uses it. They agree for the one
-  emitter that passes a non-zero stride.
+- **No test samples a llama-family model on Metal** (the B142 gap): it needs a
+  model file. `a_step_uniform_reaches_both_sampler_slots` covers the runner side
+  on any OS.
+- **Scratch buffers never shrink** while the backend lives; each tag keeps a
+  buffer under twice its largest request.
+- **A chain that returns fewer ids than asked** (reachable only when two threads
+  share one backend and the tape changes under it) leaves `written_end`
+  overstated, costing a qwen35 re-prefill, and has spent sampling draws for
+  steps it did not run, so a seeded run diverges from a per-token one. Also,
+  pre-existing: `execute_graph_chain` re-takes the tape lock and checks only
+  that a tape exists, not that its fingerprint still matches.
+- **`replay_fp` now hashes `MetalBuffer::uid`** instead of wrapper addresses; no
+  test, because address reuse cannot be forced.
+- **CPU single-row Q5_0 still takes the generic arm**, so a decode row and its
+  prefill row differ in the last bits. Routing it through
+  `vec_dot_q5_0_32_batch` fixes that and was tried, but it moves the
+  `cpu_golden_gemma3` hash; it needs the owner's go-ahead to re-bless.
+- **CPU single-row MoE dequantises to f32**
+  (`int8_ok = rows >= 2 && !reference`): deliberate, documented in `moe.rs`, and
+  changing it also means re-blessed goldens.
+- **`x_stride`:** CPU `QkNorm` and `Rope` now assert it is zero, like Metal.
+  Vulkan ignores it on those ops and when `freq_factors` is set; `QkNormRope`
+  uses a `2*hd` head offset on CPU and Vulkan and `x_stride/n_head` on Metal,
+  which agree for the only emitter.
+- Building docs for the Apple target fails on a public doc in `shaders.rs`
+  linking the private `crate::pcache`, and on an unresolved
+  ``[`MtlBuffer::contents`]`` in `lib.rs`. CI does not run that build.
+- B50 (a DeepSeek MoE layer on Metal) could be written blind, since a no-model
+  CPU parity test would check it in the macOS job, but it is a router-shader
+  feature and was not started.
 
 ### B129 — what the qwen35 state-reset and Q8 KV seed fixes left untested (2026-11-12)
 
@@ -3632,9 +3566,6 @@ instead of from zero. Left:
   by token; the batched DeltaNet kernels chunk from the dispatch's first row, so
   logits differ at about 1e-5..1e-4 and a near-tie can sample differently.
   Bit-identity across turn splits did not hold before either.
-- **Metal, suspected and not run:** `execute_graph_chain` can run one step and
-  then decline, after which the per-token path feeds that position again — a
-  qwen35 state would advance twice. Read only; Metal was not built.
 - **Untested:** the ring guard after an aborted prefill (needs the cancel hook
   B129 also wants), the `seed_from` high-water change, and the snapshot under a
   real VRAM refusal (the test injects one through a wrapping backend, because no
@@ -3721,14 +3652,9 @@ first. What is left:
   free. A model that just fits stays on mmap and competes with KV, activations
   and the repack cache for the same RAM. Changing it needs a measurement (a
   model that just fits, mmap against arena).
-- **Dead fusion patterns, confirmed 2026-11-12.** Both backends pass
-  `rmsnorm_linear: None` and `moe_add: None` and nothing reads the resulting
-  plans. Delete `plan_rmsnorm_linear`, `plan_moe_add`, both config structs and
-  both plan maps together — including the `FusionCfg` fields set in
-  `infr-metal/src/exec.rs`, which is why it was not done with the CPU slice.
-  `dst_only_read_by_next` is still used by `plan_linear_add`; its doc's claim
-  that a backend post-filters with it is false, and making it private is a
-  breaking change to the published crate.
+- `fusion::dst_only_read_by_next` is still used by `plan_linear_add`, but its
+  doc claims a backend post-filters with it and none does; making it private is
+  a breaking change to the published crate.
 
 ### B139 — NaN-aware comparisons: what the sweep could have missed (2026-11-12)
 

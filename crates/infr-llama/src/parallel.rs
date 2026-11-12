@@ -421,7 +421,7 @@ impl ParallelSeam {
         // the model's trained window under `-np N`), mirroring the sequential session path: a
         // generation ceiling is a default, not a demand. An over-long PROMPT still errors cleanly
         // in the runner.
-        let budget = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let budget = crate::seam::model::reply_budget(max_new, self.max_ctx, prompt_tokens.len());
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = crate::StreamOffsets::default();
         // Resolve `ubatch_rows`/`kv_auto_q8` against THIS engine's pins for the decode (warm calls

@@ -14,6 +14,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ChatRequest` also gained fields (`prompt_tokens_details`, `usage`,
   `stream_options`), and `infr_llama::GenStats` gained `n_cached`, `ctx_full`
   and `natural_stop`; `GenStats` has a `Default`, the others do not.
+- **`infr_core::fusion` loses two patterns no backend planned**:
+  `RmsNormLinearCfg`, `MoeAddCfg`, `ExpertsOk`, and the `rmsnorm_linear` /
+  `moe_add` fields of `FusionCfg` and `FusionPlan`.
 
 ### Added
 
@@ -82,6 +85,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **The pipeline-cache crash tripwire no longer trusts a process id alone.** In
   a container every run can be pid 1, so a crashed run looked alive and its
   poisoned cache was kept. Each run now holds a file lock on its marker.
+- **Metal: temperature sampling on llama-family models was close to greedy.**
+  The sampler read a random draw that was refreshed only once every 64 tokens
+  and started at zero.
+- **Metal: memory no longer grows with the square of the reply length** for
+  quantised KV formats. A scratch pool kept one buffer per size requested, and
+  the size grew every token.
+- **Metal: a failed buffer allocation is an error naming the size** instead of a
+  crash, and a large `max_tokens` on a small context truncates the reply (and
+  reports `finish_reason: "length"`) instead of failing the request.
+- **Metal: a DeltaNet key-head width other than 32, 64, 128 or 256 no longer
+  reads into the neighbouring head's state.**
 - **`infr serve`: `usage.prompt_tokens` counts the whole prompt.** It reported
   only the tokens prefilled for this request, so a KV prefix cache hit made a
   long prompt look short. `/metrics` still counts prefilled tokens only.

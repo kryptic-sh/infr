@@ -3618,17 +3618,28 @@ fn deltanet_parity() {
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn deltanet_multirow_parity_inline_norm() {
-    deltanet_multirow_case(5); // below the gate: inline normalization, no scratch
+    deltanet_multirow_case(5, 128); // below the gate: inline normalization, no scratch
 }
 
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn deltanet_multirow_parity_prepared_norm() {
-    deltanet_multirow_case(8); // at the gate: the hoisted q/k norm pass feeds the scan
+    deltanet_multirow_case(8, 128); // at the gate: the hoisted q/k norm pass feeds the scan
 }
 
-fn deltanet_multirow_case(rows: usize) {
-    let (nv, nk, kd, vd) = (4usize, 2usize, 128usize, 128usize);
+// B127: a key head 96 wide is a multiple of 32 with no kernel instantiation of its own. The
+// device kernels used to run it on the 8-per-lane instantiation, whose lanes index 256 keys and so
+// read and write the next head's state (and past the last head's); it must take the host path and
+// match the reference. Both sides of the norm-prep gate, since each picks its kernel separately.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn deltanet_unfitted_head_k_matches_reference() {
+    deltanet_multirow_case(1, 96);
+    deltanet_multirow_case(8, 96);
+}
+
+fn deltanet_multirow_case(rows: usize, kd: usize) {
+    let (nv, nk, vd) = (4usize, 2usize, 128usize);
     let mut g = Graph::new();
     let q = g.input(TensorDesc::new(vec![rows, nk * kd], DType::F32));
     let k = g.input(TensorDesc::new(vec![rows, nk * kd], DType::F32));
@@ -3674,13 +3685,13 @@ fn deltanet_multirow_case(rows: usize) {
         &cpu[0],
         &mtl[0],
         1e-4,
-        &format!("deltanet multirow dst (rows={rows})"),
+        &format!("deltanet multirow dst (rows={rows}, head_k={kd})"),
     );
     assert_close(
         &cpu[1],
         &mtl[1],
         1e-4,
-        &format!("deltanet multirow state (rows={rows})"),
+        &format!("deltanet multirow state (rows={rows}, head_k={kd})"),
     );
 }
 

@@ -816,13 +816,7 @@ impl SeamModel {
             .pool
             .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
         let max_ctx = session.max_ctx;
-        // Cap the reply to the context that's actually left ("a turn also caps to remaining
-        // context" — the CLI's generation ceiling is a default, not a demand): a VRAM-clamped
-        // default session (e.g. a 21.9 GB model on a 24 GB card clamps 262k -> ~1.7k) would
-        // otherwise hard-error on `infr run`'s default max_new=2048 before generating a single
-        // token. EOS ends almost every reply long before this cap; an over-long PROMPT still
-        // errors cleanly in the runner (its `prompt + gen + 1 > max_ctx` guard stays).
-        let budget = max_new.min(max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let budget = reply_budget(max_new, max_ctx, prompt_tokens.len());
         // Resolve `ubatch_rows`/`kv_auto_q8` against THIS session's pins (warm calls must agree
         // with the buffers placement sized) — never a process-global cell shared across models.
         let _scope = crate::seam::PlacementScope::enter(session.pins().clone());
@@ -1508,7 +1502,8 @@ impl SeamModel {
         let slot = session
             .pool
             .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
-        let (_generated, stats) = crate::seam::generate_dense_metal_session(
+        let budget = reply_budget(max_new, session.max_ctx, prompt_tokens.len());
+        let (_generated, mut stats) = crate::seam::generate_dense_metal_session(
             &session.be,
             &self.gguf,
             &self.cfg,
@@ -1516,13 +1511,14 @@ impl SeamModel {
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
-            max_new,
+            budget,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
             &mut session.pool.slots[slot],
             session.max_ctx,
             constraint,
             req,
         )?;
+        stats.ctx_full = crate::ran_out_of_context(max_new, budget, &stats);
         Ok(stats)
     }
 
@@ -2367,6 +2363,34 @@ pub(crate) fn spec_accept_stochastic(
     // Every candidate accepted: sample the bonus token from the target's own distribution.
     let bonus = crate::sampling::sample_from_dist(&p_dists[cand.len()], rng);
     (cand.len(), bonus)
+}
+
+/// Cap a reply of up to `max_new` tokens to the context a `prompt_len`-token prompt leaves in a
+/// `max_ctx` window ("a turn also caps to remaining context" — a generation ceiling is a default,
+/// not a demand): a VRAM-clamped default session (e.g. a 21.9 GB model on a 24 GB card clamps
+/// 262k -> ~1.7k) would otherwise hard-error on `infr run`'s default `max_new` before generating
+/// a single token. EOS ends almost every reply long before this cap; an over-long PROMPT still
+/// errors cleanly in the runner (its `prompt + gen + 1 > max_ctx` guard stays).
+pub(crate) fn reply_budget(max_new: usize, max_ctx: usize, prompt_len: usize) -> usize {
+    max_new.min(max_ctx.saturating_sub(prompt_len + 1))
+}
+
+#[cfg(test)]
+mod reply_budget_tests {
+    use super::reply_budget;
+
+    /// B87: the cap the session paths share — a reply that fits is untouched, one that does not
+    /// is cut to what the runner's `prompt + gen + 1 <= max_ctx` guard accepts, and a prompt that
+    /// fills the window leaves nothing (one past it is the runner's overflow error to report).
+    #[test]
+    fn a_reply_is_capped_to_the_context_left() {
+        assert_eq!(reply_budget(16, 4096, 100), 16);
+        let capped = reply_budget(2048, 512, 100);
+        assert_eq!(capped, 411);
+        assert!(100 + capped < 512);
+        assert_eq!(reply_budget(2048, 512, 511), 0);
+        assert_eq!(reply_budget(2048, 512, 600), 0);
+    }
 }
 
 #[cfg(test)]

@@ -26,3 +26,27 @@ fn backend_reports_metal_name() {
     assert_eq!(be.name(), "metal");
     assert!(!be.capabilities().name.is_empty(), "device name populated");
 }
+
+/// B109: a buffer Metal cannot make is an error naming its size. A request past the device's
+/// maximum buffer length used to come back as a nil `MTLBuffer` that `alloc` zero-filled
+/// through, crashing the process instead of failing the call.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn an_impossible_allocation_is_an_error_naming_its_size() {
+    let be = MetalBackend::new().expect("open metal backend");
+    // 1 PiB: past any device's maximum buffer length.
+    let bytes = 1usize << 50;
+    for (what, res) in [
+        ("alloc", be.alloc(bytes, BufferUsage::Activations)),
+        (
+            "alloc_uninit",
+            be.alloc_uninit(bytes, BufferUsage::Activations),
+        ),
+    ] {
+        let err = match res {
+            Ok(_) => panic!("{what} of {bytes} bytes succeeded"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains(&bytes.to_string()), "{what}: {err}");
+    }
+}

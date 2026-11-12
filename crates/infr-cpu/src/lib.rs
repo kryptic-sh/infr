@@ -932,8 +932,11 @@ impl Backend for CpuBackend {
                     n_head,
                     head_dim,
                     eps,
-                    ..
+                    x_stride,
                 } => {
+                    // Strided reads (qwen35's q+g interleave) are wired only into QkNormRope, and
+                    // no emitter strides this op; refuse rather than read the rows as packed.
+                    assert_eq!(x_stride, 0, "QkNorm: strided x is not supported");
                     let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
                     let xs = &vals[x.0 as usize];
                     // `None` = V4's weightless Q norm (bare `ggml_rms_norm` per head): the scale is
@@ -1517,8 +1520,10 @@ impl Backend for CpuBackend {
                     freq_factors,
                     neox,
                     backward,
-                    ..
+                    x_stride,
                 } => {
+                    // As for QkNorm: only QkNormRope reads strided rows.
+                    assert_eq!(x_stride, 0, "Rope: strided x is not supported");
                     let (rows, nh, hd, rd) = (
                         rows as usize,
                         n_head as usize,
@@ -3812,6 +3817,7 @@ fn deltanet_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infr_core::tensor::TensorDesc;
 
     /// B133: with `general.alignment` below 4 an F32 or I32 tensor can start at an address that is
     /// not 4-aligned; reading it must decode, not panic in a cast.
@@ -4316,5 +4322,85 @@ mod tests {
                 .reference
         );
         assert!(CpuBackend::reference().cfg.kernels.cpu.reference);
+    }
+
+    /// Bind `bound` (raw bytes per tensor) and a buffer for `out`, and run `g` once.
+    fn run_graph(g: &Graph, bound: &[(TensorId, Vec<u8>)], out: TensorId) {
+        let be = CpuBackend::new();
+        let mut bufs = Vec::new();
+        for (id, bytes) in bound {
+            let buf = be.alloc(bytes.len(), BufferUsage::Activations).unwrap();
+            be.upload(buf.as_ref(), bytes).unwrap();
+            bufs.push((*id, buf));
+        }
+        let ob = be
+            .alloc(g.desc(out).numel() * 4, BufferUsage::Activations)
+            .unwrap();
+        let mut b = Bindings::new();
+        for (id, buf) in &bufs {
+            b.bind(*id, buf.as_ref());
+        }
+        b.bind(out, ob.as_ref());
+        be.execute(be.compile(g).unwrap().as_ref(), &b).unwrap();
+    }
+
+    fn f32_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
+
+    /// A graph with one strided `QkNorm` or `Rope`; `rope` picks which.
+    fn strided_head_op(rope: bool) -> (Graph, Vec<(TensorId, Vec<u8>)>, TensorId) {
+        let (nh, hd) = (2usize, 4usize);
+        let stride = nh * 2 * hd;
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![stride], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![nh * hd], DType::F32));
+        let mut bound = vec![(x, f32_bytes(&vec![1.0; stride]))];
+        if rope {
+            let positions = g.input(TensorDesc::new(vec![1], DType::F32));
+            bound.push((positions, f32_bytes(&[3.0])));
+            g.push(Op::Rope {
+                x,
+                positions,
+                dst,
+                rows: 1,
+                n_head: nh as u32,
+                head_dim: hd as u32,
+                rope_dim: hd as u32,
+                theta: 1e4,
+                freq_factors: None,
+                x_stride: stride as u32,
+                neox: false,
+                backward: false,
+            });
+        } else {
+            g.push(Op::QkNorm {
+                x,
+                weight: None,
+                dst,
+                rows: 1,
+                n_head: nh as u32,
+                head_dim: hd as u32,
+                eps: 1e-6,
+                x_stride: stride as u32,
+            });
+        }
+        (g, bound, dst)
+    }
+
+    /// B128: `QkNorm` and `Rope` read packed rows only; a strided `x` used to be read as packed
+    /// without a word. Metal asserts the same.
+    #[test]
+    #[should_panic(expected = "strided x")]
+    fn strided_qk_norm_is_refused() {
+        let (g, bound, dst) = strided_head_op(false);
+        run_graph(&g, &bound, dst);
+    }
+
+    #[test]
+    #[should_panic(expected = "strided x")]
+    fn strided_rope_is_refused() {
+        let (g, bound, dst) = strided_head_op(true);
+        run_graph(&g, &bound, dst);
     }
 }

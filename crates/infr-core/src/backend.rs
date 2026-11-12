@@ -583,6 +583,10 @@ pub trait Backend: Send + Sync {
     /// the `n` sampled ids, or `None` when this backend/plan can't chain (the caller falls back
     /// to per-token `execute`). Positions/params self-advance (a chaining backend implies the
     /// device-side pos increment).
+    ///
+    /// `None` means no step ran: the caller feeds the same position again, which a step that did
+    /// run would make a second advance of any recurrent state. A backend that stops after running
+    /// some steps returns the ids of those it ran instead, fewer than `n`.
     fn execute_chain(
         &self,
         _plan: &dyn Plan,

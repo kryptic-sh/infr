@@ -3785,6 +3785,62 @@ the importer's size requirement. Refused or left:
 - `build.rs`'s list was checked by script (no duplicate output, no missing
   source, every referenced variant built), not read entry by entry.
 
+### B149 — CLI, hub, chat templates and platform crate, 2026-11-12: fixed and left (2026-11-12)
+
+`infr-cli`, `infr-hub`, `infr-chat` (outside `stream.rs` / `tools.rs`) and
+`infr-plat` were read in full (production code; not their tests). Fixed: a
+GGUF's chat template could panic the process (`strftime_now` with an unknown
+specifier) or request an unbounded allocation through a helper's width argument;
+tool-call ids never reached the template; a same-host redirect without a digest
+header skipped sha256 verification; a download was renamed into place without
+being synced, and an existing blob was trusted whatever its size; two concurrent
+pulls of one model failed at the link step; the cache did not work without
+symlinks; a backslash in a repo id escaped the cache on Windows;
+`generation_config.json` was never found for a GGUF in a subdirectory;
+`infr compare` did not pass its config to its children; `infr multi` ignored
+`INFR_CTX`. Left:
+
+- **A hostile chat template can still exhaust memory.** Widths passed to helpers
+  are bounded (`TEMPLATE_WIDTH_MAX`; one `format` call's total padding by
+  `FORMAT_NUMBER_MAX`), but string repetition (`"x" * n`), list repetition and
+  repeated `~` / `+` doubling are evaluated by minijinja's own operators
+  (`ops::mul`, `ops::string_concat`, `ops::add`), which have no size check, and
+  minijinja 2.21 offers no hook: no operator override, no size or memory limit,
+  and fuel charges one unit per instruction however much it allocates. A
+  template is input from a downloaded file. Closing this needs an upstream
+  feature or a different engine.
+- **Client-minted tool-call ids are passed through unchanged.** infr now mints
+  nine-character alphanumeric ids (the only shape Mistral's template accepts),
+  but an id a client made itself (`call_…` from another provider) still fails
+  that template; vLLM normalises those and infr does not.
+- **A copy is recognised as a blob only by size.** On a filesystem with neither
+  symlinks nor hard links the snapshot holds copies, which doubles disk use per
+  model (logged once) and means an up-to-date pull whose HEAD cannot be answered
+  fails rather than keeping the file.
+- **Repo ids:** `a--b/c` and `a/b--c` map to the same cache directory, since the
+  cache folds `/` to `--`. Whether Hugging Face forbids `--` in a name was not
+  checked (`huggingface_hub` is not installed on the dev machine).
+- Temp files left by OTHER processes that crashed between link and rename are
+  not swept; with the copy fallback one is model-sized.
+- A hostile hub that misreports a file's size can force a re-download on every
+  pull (the replacement only lands after its sha256 checks out).
+- **Not run:** the Windows arms (`MoveFileExW` write-through commit, the symlink
+  → hard link → copy fallback, file identity by volume serial and file index)
+  are lint-clean for a Windows target and were never executed; nor was a real
+  power loss, or a filesystem that refuses a directory sync.
+- **Tests that did not test.** Two dozen model-gated tests in
+  `tests/cpu_backend.rs` returned early and counted as passed in every CI job;
+  they are `#[ignore = "needs …"]` now, so that job runs the tests whose model
+  it has and reports the rest as ignored. The CPU `decode_parity` sweeps use the
+  decoder the kernels share, so they prove the GEMV path and cannot see a decode
+  bug: `infr-gguf` gained known-answer tests for Q8_0, Q3_K, Q4_K, Q5_K and Q6_K
+  transcribed from `ggml-quants.c`. `cpu_golden_qwen3_quants` runs only its
+  Q4_K_M row in CI. Still open from the test read: several Metal attention
+  parity tests use a tolerance about as wide as one key's contribution, so they
+  cannot catch an off-by-one mask; `pcache.rs`'s round-trip test returns before
+  any assertion on a device without binary archives; the Metal `*_probe` and
+  `*_wall` tests assert nothing and run in CI under `--include-ignored`.
+
 ### Review coverage (2026-11-11, remaining areas)
 
 Six read-only reviews, one per area, none of which built or ran anything.

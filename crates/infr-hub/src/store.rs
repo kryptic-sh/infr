@@ -114,9 +114,16 @@ impl Store {
     }
 
     /// `<hub>/models--<org>--<repo>` — the HF Hub repo dir (HF replaces `/` with `--`).
-    pub fn repo_dir(&self, repo: &str) -> PathBuf {
-        self.hub
-            .join(format!("models--{}", repo.replace('/', "--")))
+    ///
+    /// `repo` is validated first and refused unless it is a Hugging Face repo id (`name` or
+    /// `org/name`, of ASCII letters, digits, `-`, `_` and `.`): it names a directory inside the
+    /// cache, and only `/` is rewritten, so any other separator in it — `\` on Windows — would
+    /// otherwise carry `..` straight out of the cache.
+    pub fn repo_dir(&self, repo: &str) -> Result<PathBuf> {
+        let repo = check_repo_id(repo)?;
+        Ok(self
+            .hub
+            .join(format!("models--{}", repo.replace('/', "--"))))
     }
 
     /// Resolve a cached GGUF for `repo` selecting `sel` (a quant like `Q4_K_M`, or an explicit
@@ -156,7 +163,10 @@ impl Store {
     /// HF leaves stale snapshots in place across commits, so preferring `refs/main` avoids returning
     /// an arbitrary older snapshot for the current model.
     fn ordered_snapshots(&self, repo: &str) -> Vec<PathBuf> {
-        let dir = self.repo_dir(repo);
+        // An invalid repo id has no snapshots: nothing outside the cache is ever listed for it.
+        let Ok(dir) = self.repo_dir(repo) else {
+            return Vec::new();
+        };
         let snaps = dir.join("snapshots");
         let main = fs::read_to_string(dir.join("refs").join("main"))
             .ok()
@@ -191,6 +201,33 @@ impl Store {
             ModelRef::Path(p) => p.exists().then(|| p.clone()),
             ModelRef::Repo { repo, sel } => self.resolve_repo(repo, sel.as_deref()),
         })
+    }
+}
+
+/// Accept `repo` only as a Hugging Face repo id: `name` or `org/name`, each part non-empty, not `.`
+/// or `..`, and made of ASCII letters and digits, `-`, `_` and `.` — the characters the Hub
+/// allows in a repo id.
+///
+/// The same rule on every OS, so a `\`, a drive prefix (`C:`), or a rooted path is refused on Linux
+/// too: an id is not a path, and judging it with the host's path parser is how `org\..\..\x`
+/// passes on one platform and escapes the cache on another.
+pub(crate) fn check_repo_id(repo: &str) -> Result<&str> {
+    let parts: Vec<&str> = repo.split('/').collect();
+    let ok = (1..=2).contains(&parts.len())
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && *p != "."
+                && *p != ".."
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        });
+    if ok {
+        Ok(repo)
+    } else {
+        Err(Error::Other(format!(
+            "invalid Hugging Face repo id {repo:?}: expected `org/name` made of ASCII letters, \
+             digits, '-', '_' and '.'"
+        )))
     }
 }
 
@@ -368,6 +405,43 @@ fn gguf_match(fname: &str, sel: &str) -> Match {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Repo ids are judged component-wise and the same way on every OS: a backslash, a drive prefix
+    /// or a `..` part is refused here on Linux too, where it would not escape, because on Windows
+    /// it would.
+    #[test]
+    fn repo_ids_are_validated_component_wise() {
+        let store = Store {
+            hub: PathBuf::from("hub"),
+        };
+        for ok in ["org/repo", "unsloth/Qwen3-14B-GGUF", "gpt2", "a.b/c_d-1"] {
+            let dir = store.repo_dir(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            assert_eq!(dir.parent(), Some(Path::new("hub")), "{ok}");
+        }
+        assert_eq!(
+            store.repo_dir("org/repo").unwrap(),
+            Path::new("hub").join("models--org--repo")
+        );
+        for bad in [
+            "",
+            "org/",
+            "/repo",
+            "org/..",
+            "../repo",
+            "./repo",
+            "org/repo/extra",
+            "org\\..\\..\\evil",
+            "C:/evil",
+            "C:\\evil",
+            "org/re po",
+            "org/répo",
+            "org/модель",
+        ] {
+            assert!(store.repo_dir(bad).is_err(), "{bad:?} was accepted");
+        }
+        // An invalid id lists nothing rather than reaching outside the cache.
+        assert!(store.resolve_repo("org\\..\\..", None).is_none());
+    }
 
     /// Build a fake HF Hub repo dir: blobs/<sha> + snapshots/<commit>/<file> -> blob + refs/main.
     ///

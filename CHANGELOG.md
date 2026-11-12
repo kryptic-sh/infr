@@ -14,6 +14,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ChatRequest` also gained fields (`prompt_tokens_details`, `usage`,
   `stream_options`), and `infr_llama::GenStats` gained `n_cached`, `ctx_full`
   and `natural_stop`; `GenStats` has a `Default`, the others do not.
+- **`infr_chat::ToolCall` has a new field, `id`**; `infr_plat::link::link_blob`
+  returns the kind of link it made; `infr_hub::Store::repo_dir` returns a
+  `Result`.
 - **`infr_core::fusion` loses two patterns no backend planned**:
   `RmsNormLinearCfg`, `MoeAddCfg`, `ExpertsOk`, and the `rmsnorm_linear` /
   `moe_add` fields of `FusionCfg` and `FusionPlan`.
@@ -73,6 +76,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `<|end|>`, `<|eom_id|>`, `<turn|>` and the rest) and the GGUF's `eot` / `eom`
   ids. A listed name counts only where the vocabulary marks it as a control or
   user-defined token, so a literal `</s>` in a Qwen reply still prints.
+- **Tool-call ids on `infr serve` are nine alphanumeric characters** (they were
+  `call_…`), and an id the client sends back with a tool result now reaches the
+  chat template. Templates that pair calls with results by id, Mistral's among
+  them, need both.
+- **The model cache works on filesystems without symlinks**: a snapshot entry
+  falls back to a hard link, then a copy. A copy doubles the disk space that
+  model takes, and says so once.
 - **`infr pull` refuses a model file it cannot verify.** If the request that
   fetches a file's sha256 keeps failing, the pull stops instead of downloading
   unchecked; a definitive answer (401, 403, 404) fails at once and says why. An
@@ -179,6 +189,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   computed wrongly (the dense FFN branch was dropped at each cut). A mixed
   integrated + discrete world now sizes prefill for the integrated GPU, and any
   graph that would read a scratch tensor across a device cut is refused by name.
+- **A chat template inside a GGUF can no longer crash infr** through
+  `strftime_now` with a bad format, or ask for a multi-gigabyte pad through a
+  helper's width argument; both are template errors. (String repetition inside a
+  template is still unbounded.)
+- **`infr pull`: a moved or renamed repo is still verified**, a download is
+  flushed to disk before it is renamed into the cache, a cached file whose size
+  disagrees with the hub is fetched again, and two pulls of the same model at
+  once both succeed.
+- **A repo id with a backslash, `..` or a drive prefix is refused**; on Windows
+  it could write outside the cache.
+- **`generation_config.json` is found for a GGUF in a subdirectory** of its
+  repo, so those models get their recommended sampling again.
+- **`infr compare` passes `--config` and `--set` to the runs it starts**, and a
+  failing run reports its error; `infr multi` honours `INFR_CTX` and
+  `[device] ctx`.
 - **`infr serve`: `usage.prompt_tokens` counts the whole prompt.** It reported
   only the tokens prefilled for this request, so a KV prefix cache hit made a
   long prompt look short. `/metrics` still counts prefilled tokens only.

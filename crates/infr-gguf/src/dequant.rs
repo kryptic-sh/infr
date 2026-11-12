@@ -1876,4 +1876,250 @@ mod dequant_tests {
             y[16]
         );
     }
+
+    // ── Known answers for the formats above lacked: Q8_0, and K-quants with DISTINCT scales ─────
+    //
+    // Each `ref_*` below is a line-by-line transcription of `ggml-quants.c`'s
+    // `dequantize_row_*` for ONE block, written against the block layout rather than against
+    // anything in this file, so it is an independent decoder. The blocks are filled with varied
+    // bytes, so every sub-block gets its own scale and min: the `q2k`/`q3k` tests above use one
+    // repeated (or all-zero) scale byte and cannot tell a scale-unpacking slip from the right
+    // answer. A hand-computed element per format anchors the transcription itself.
+
+    /// Deterministic varied bytes (a 32-bit LCG's high byte), so a failure reproduces exactly.
+    fn varied(n: usize, seed: u32) -> Vec<u8> {
+        let mut x = seed;
+        (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect()
+    }
+
+    fn put_f16(block: &mut [u8], at: usize, v: f32) {
+        block[at..at + 2].copy_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+    }
+
+    fn assert_decodes_to(dt: infr_core::DType, block: &[u8], want: &[f32]) {
+        let got = dequant_block(dt, block).unwrap();
+        assert_eq!(got.len(), want.len(), "{dt:?} element count");
+        for (i, (g, w)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (g - w).abs() <= 1e-6 * w.abs().max(1.0),
+                "{dt:?} y[{i}]: got {g}, want {w}"
+            );
+        }
+    }
+
+    /// `get_scale_min_k4` (ggml-quants.c): the 6-bit scale and min of sub-block `j` from the
+    /// 12-byte packed table shared by Q4_K and Q5_K.
+    fn ref_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+        if j < 4 {
+            (q[j] & 63, q[j + 4] & 63)
+        } else {
+            (
+                (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+                (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+            )
+        }
+    }
+
+    // `dequantize_row_q8_0`: block {half d; int8 qs[32]}; y[j] = d * qs[j].
+    #[test]
+    fn q8_0_known_answer() {
+        let mut block = varied(34, 1);
+        put_f16(&mut block, 0, 0.5);
+        let want: Vec<f32> = block[2..34]
+            .iter()
+            .map(|&q| 0.5 * (q as i8) as f32)
+            .collect();
+        assert_decodes_to(infr_core::DType::Q8_0, &block, &want);
+        // Hand-computed anchor: code -128 at d = 0.5 is -64.
+        block[2] = 0x80;
+        assert_eq!(
+            dequant_block(infr_core::DType::Q8_0, &block).unwrap()[0],
+            -64.0
+        );
+    }
+
+    // `dequantize_row_q4_K`: block {half d; half dmin; u8 scales[12]; u8 qs[128]}.
+    fn ref_q4_k(b: &[u8]) -> Vec<f32> {
+        let d = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
+        let min = half::f16::from_le_bytes([b[2], b[3]]).to_f32();
+        let (scales, mut q) = (&b[4..16], &b[16..144]);
+        let mut y = Vec::with_capacity(256);
+        let mut is = 0;
+        for _ in (0..256).step_by(64) {
+            let (sc, m) = ref_scale_min_k4(is, scales);
+            let (d1, m1) = (d * sc as f32, min * m as f32);
+            let (sc, m) = ref_scale_min_k4(is + 1, scales);
+            let (d2, m2) = (d * sc as f32, min * m as f32);
+            y.extend(q[..32].iter().map(|&x| d1 * (x & 0xF) as f32 - m1));
+            y.extend(q[..32].iter().map(|&x| d2 * (x >> 4) as f32 - m2));
+            q = &q[32..];
+            is += 2;
+        }
+        y
+    }
+
+    #[test]
+    fn q4_k_known_answer() {
+        let mut block = varied(144, 2);
+        put_f16(&mut block, 0, 0.5);
+        put_f16(&mut block, 2, 0.25);
+        assert_decodes_to(infr_core::DType::Q4K, &block, &ref_q4_k(&block));
+        // Hand-computed anchor, sub-block 4 (the packed half of the table, `scales` = block[4..]):
+        // scale = (scales[8] & 0xF) | (scales[0] >> 6) << 4 = 0xA | 2 << 4 = 42, and
+        // min = (scales[8] >> 4) | (scales[4] >> 6) << 4 = 1 | 1 << 4 = 17. Its first element is
+        // the low nibble of qs[64], here 5: y[128] = 0.5 * 42 * 5 - 0.25 * 17.
+        block[4..16].fill(0);
+        block[4] = 0b1000_0000; // scales[0]
+        block[8] = 0b0100_0000; // scales[4]
+        block[12] = 0x1A; // scales[8]
+        block[16 + 64] = 0x05; // qs[64]
+        let y = dequant_block(infr_core::DType::Q4K, &block).unwrap();
+        assert_eq!(y[128], 0.5 * 42.0 * 5.0 - 0.25 * 17.0);
+    }
+
+    // `dequantize_row_q5_K`: block {half d; half dmin; u8 scales[12]; u8 qh[32]; u8 qs[128]}.
+    fn ref_q5_k(b: &[u8]) -> Vec<f32> {
+        let d = half::f16::from_le_bytes([b[0], b[1]]).to_f32();
+        let min = half::f16::from_le_bytes([b[2], b[3]]).to_f32();
+        let (scales, qh, mut ql) = (&b[4..16], &b[16..48], &b[48..176]);
+        let mut y = Vec::with_capacity(256);
+        let (mut is, mut u1, mut u2) = (0, 1u8, 2u8);
+        for _ in (0..256).step_by(64) {
+            let (sc, m) = ref_scale_min_k4(is, scales);
+            let (d1, m1) = (d * sc as f32, min * m as f32);
+            let (sc, m) = ref_scale_min_k4(is + 1, scales);
+            let (d2, m2) = (d * sc as f32, min * m as f32);
+            for l in 0..32 {
+                let hi = if qh[l] & u1 != 0 { 16 } else { 0 };
+                y.push(d1 * ((ql[l] & 0xF) + hi) as f32 - m1);
+            }
+            for l in 0..32 {
+                let hi = if qh[l] & u2 != 0 { 16 } else { 0 };
+                y.push(d2 * ((ql[l] >> 4) + hi) as f32 - m2);
+            }
+            ql = &ql[32..];
+            is += 2;
+            u1 <<= 2;
+            u2 <<= 2;
+        }
+        y
+    }
+
+    #[test]
+    fn q5_k_known_answer() {
+        let mut block = varied(176, 3);
+        put_f16(&mut block, 0, 0.5);
+        put_f16(&mut block, 2, 0.25);
+        assert_decodes_to(infr_core::DType::Q5K, &block, &ref_q5_k(&block));
+        // Hand-computed anchor: sub-block 0 scale 3, min 2; element 0 has low nibble 7 and its
+        // qh bit 0 set, so code 7 + 16 = 23: y[0] = 0.5 * 3 * 23 - 0.25 * 2.
+        block[4] = 3;
+        block[8] = 2;
+        block[16] = 0b01;
+        block[48] = 0x07;
+        let y = dequant_block(infr_core::DType::Q5K, &block).unwrap();
+        assert_eq!(y[0], 0.5 * 3.0 * 23.0 - 0.25 * 2.0);
+    }
+
+    // `dequantize_row_q6_K`: block {u8 ql[128]; u8 qh[64]; i8 scales[16]; half d}.
+    fn ref_q6_k(b: &[u8]) -> Vec<f32> {
+        let d = half::f16::from_le_bytes([b[208], b[209]]).to_f32();
+        let mut y = vec![0.0f32; 256];
+        for half_block in 0..2 {
+            let ql = &b[half_block * 64..];
+            let qh = &b[128 + half_block * 32..];
+            let sc = &b[192 + half_block * 8..];
+            let y = &mut y[half_block * 128..];
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[l] & 0xF) | ((qh[l] & 3) << 4)) as i8 - 32;
+                let q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
+                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
+                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
+                y[l] = d * (sc[is] as i8) as f32 * q1 as f32;
+                y[l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+                y[l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+                y[l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
+            }
+        }
+        y
+    }
+
+    #[test]
+    fn q6_k_known_answer() {
+        let mut block = varied(210, 4);
+        put_f16(&mut block, 208, 0.5);
+        assert_decodes_to(infr_core::DType::Q6K, &block, &ref_q6_k(&block));
+        // Hand-computed anchor: element 0 has low nibble 1 and high bits 2, so code 33 - 32 = 1;
+        // with a NEGATIVE scale -3, y[0] = 0.5 * -3 * 1.
+        block[0] = 0x01;
+        block[128] = 0b10;
+        block[192] = (-3i8) as u8;
+        let y = dequant_block(infr_core::DType::Q6K, &block).unwrap();
+        assert_eq!(y[0], 0.5 * -3.0 * 1.0);
+    }
+
+    // `dequantize_row_q3_K`: block {u8 hmask[32]; u8 qs[64]; u8 scales[12]; half d}.
+    fn ref_q3_k(b: &[u8]) -> Vec<f32> {
+        const KMASK1: u32 = 0x0303_0303;
+        const KMASK2: u32 = 0x0f0f_0f0f;
+        let d_all = half::f16::from_le_bytes([b[108], b[109]]).to_f32();
+        let hm = &b[0..32];
+        let mut q = &b[32..96];
+        let word = |i: usize| u32::from_le_bytes(b[96 + 4 * i..100 + 4 * i].try_into().unwrap());
+        let mut aux = [word(0), word(1), word(2), 0u32];
+        let tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+        aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
+        aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+        let scales: Vec<i8> = aux
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .map(|x| x as i8)
+            .collect();
+        let mut y = Vec::with_capacity(256);
+        let (mut is, mut m) = (0, 1u8);
+        for _ in (0..256).step_by(128) {
+            let mut shift = 0;
+            for _ in 0..4 {
+                for half in [0, 16] {
+                    let dl = d_all * (scales[is] as f32 - 32.0);
+                    is += 1;
+                    for l in half..half + 16 {
+                        let low = ((q[l] >> shift) & 3) as i8;
+                        let sub = if hm[l] & m != 0 { 0 } else { 4 };
+                        y.push(dl * (low - sub) as f32);
+                    }
+                }
+                shift += 2;
+                m <<= 1;
+            }
+            q = &q[32..];
+        }
+        y
+    }
+
+    #[test]
+    fn q3_k_known_answer_with_distinct_scales() {
+        let mut block = varied(110, 5);
+        put_f16(&mut block, 108, 0.5);
+        assert_decodes_to(infr_core::DType::Q3K, &block, &ref_q3_k(&block));
+        // Hand-computed anchor, from `dequantize_row_q3_K` with every other byte zero. Sub-block
+        // 0's 6-bit scale is the low nibble of scales[0] (block[96]) with bits 4..5 from the low
+        // two bits of scales[8] (block[104]): 0x05 | 0b10 << 4 = 37, so dl = 0.5 * (37 - 32).
+        // Element 0 takes bits 0..1 of qs[0] (block[32] = 0b11 → 3) and, because hmask[0] bit 0
+        // (block[0]) is clear, subtracts 4: y[0] = 0.5 * 5 * (3 - 4) = -2.5.
+        block[..108].fill(0);
+        block[96] = 0x05;
+        block[104] = 0b10;
+        block[32] = 0b11;
+        let y = dequant_block(infr_core::DType::Q3K, &block).unwrap();
+        assert_eq!(y[0], -2.5);
+    }
 }

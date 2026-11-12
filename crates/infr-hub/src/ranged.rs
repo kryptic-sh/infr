@@ -97,10 +97,37 @@ pub(crate) fn probe(obj: &Object) -> Result<Option<Probe>> {
         debug!("{label}: no length advertised; not splitting");
         return Ok(None);
     };
+    check_total(label, total, obj.size)?;
     Ok(Some(Probe {
         total,
         validator: validator_of(resp.headers()),
     }))
+}
+
+/// Largest object a ranged download will plan — orders of magnitude above the largest single file
+/// this repo has pulled (161 GB), and small enough that its plan is a modest table.
+///
+/// The total comes from a server's `Content-Length` and sizes the plan's per-cell table up front,
+/// so an unchecked one near `u64::MAX` is an allocation that aborts the process before a byte is
+/// fetched.
+const MAX_OBJECT_BYTES: u64 = 1 << 44;
+
+/// Refuse a probed size the plan must not be built from: past [`MAX_OBJECT_BYTES`], or different
+/// from the LFS size (`lfs_size`) the hub's own `HEAD` reported for the same object.
+fn check_total(label: &str, total: u64, lfs_size: Option<u64>) -> Result<()> {
+    if total > MAX_OBJECT_BYTES {
+        return Err(Error::Other(format!(
+            "{label}: the server reports {total} bytes, more than the {MAX_OBJECT_BYTES}-byte \
+             limit for one file; refusing to download it"
+        )));
+    }
+    match lfs_size {
+        Some(size) if size != total => Err(Error::Other(format!(
+            "{label}: the server reports {total} bytes but the hub's LFS size is {size}; \
+             refusing to download it"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// The `If-Range` validator a response offers: the `ETag` if present, else `Last-Modified`.
@@ -603,6 +630,42 @@ mod tests {
         for bad in ["bytes 0-99/100", "bytes */*", "*/100", "bytes */x", ""] {
             assert!(parse_unsatisfied_range(bad).is_none(), "accepted {bad:?}");
         }
+    }
+
+    /// A server's `Content-Length` sizes the plan's table before a byte is fetched, so an absurd
+    /// one — or one that disagrees with the hub's LFS size for the same object — is an error, not
+    /// an allocation that aborts the process.
+    #[test]
+    fn an_absurd_or_mismatched_length_is_refused() {
+        use crate::testhttp::TestHub;
+        let hub = TestHub::start();
+        let name = hub.add_shards("m-huge", 1, 4096).remove(0);
+        let url = format!("{}/org/repo/resolve/main/{name}", hub.origin());
+        let object = |size| Object {
+            url: &url,
+            label: &name,
+            oid: None,
+            size,
+        };
+
+        let honest = probe(&object(Some(4096)))
+            .unwrap()
+            .expect("ranges advertised");
+        assert_eq!(honest.total, 4096);
+
+        hub.lie_about_length(&name, u64::MAX);
+        let err = probe(&object(None))
+            .err()
+            .expect("u64::MAX must be refused");
+        assert!(err.to_string().contains("refusing"), "{err}");
+
+        hub.lie_about_length(&name, 8192);
+        let err = probe(&object(Some(4096)))
+            .err()
+            .expect("a size mismatch must be refused");
+        assert!(err.to_string().contains("LFS size"), "{err}");
+        // Without an LFS size to compare against, a plausible length is still accepted.
+        assert_eq!(probe(&object(None)).unwrap().unwrap().total, 8192);
     }
 
     fn probe_of(total: u64, validator: &str) -> Probe {

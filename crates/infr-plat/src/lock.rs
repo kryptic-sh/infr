@@ -38,6 +38,36 @@ impl FileLock {
         Ok(FileLock { file })
     }
 
+    /// Like [`acquire`](Self::acquire), but the wait can be called off: `give_up` is polled while
+    /// another holder keeps the lock, and once it answers `true` this returns an error of kind
+    /// [`io::ErrorKind::Interrupted`] instead of waiting on.
+    ///
+    /// A blocking `acquire` cannot be reached by a shutdown request. On unix a signal interrupts
+    /// `flock` only when it happens to be delivered to the waiting thread — any other thread takes
+    /// it and the wait goes on — and a Windows console control event runs on a thread of its own,
+    /// so `LockFileEx` is never interrupted at all. Polling a non-blocking attempt is the form that
+    /// behaves the same on both, at the cost of noticing a release up to one poll interval late.
+    pub fn acquire_unless(path: &Path, give_up: impl Fn() -> bool) -> io::Result<Self> {
+        const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+        let file = Self::open(path)?;
+        loop {
+            match lock(&file, Blocking::Fail) {
+                Ok(()) => return Ok(FileLock { file }),
+                // Held elsewhere, or the attempt itself was interrupted by a signal: either way
+                // nothing is held, so check whether to keep waiting and try again.
+                Err(e) if would_block(&e) || e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+            if give_up() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("gave up waiting for the lock on {}", path.display()),
+                ));
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
     /// Take the lock if it is free, or return `Ok(None)` immediately if someone else holds it.
     ///
     /// Distinguishes "held by another" (`Ok(None)`) from "could not be attempted" (`Err`) — a
@@ -107,8 +137,10 @@ const WOULD_BLOCK_OS_ERROR: i32 = 33; // ERROR_LOCK_VIOLATION
 #[cfg(not(any(unix, windows)))]
 const WOULD_BLOCK_OS_ERROR: i32 = 0;
 
+/// Do `file` and `path` name the same file (device + inode on unix, volume serial + file index
+/// on Windows)? Shared with [`crate::link::is_same_file`].
 #[cfg(unix)]
-fn same_file(file: &File, path: &Path) -> io::Result<bool> {
+pub(crate) fn same_file(file: &File, path: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
     let (held, named) = (file.metadata()?, std::fs::metadata(path)?);
@@ -116,7 +148,7 @@ fn same_file(file: &File, path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-fn same_file(file: &File, path: &Path) -> io::Result<bool> {
+pub(crate) fn same_file(file: &File, path: &Path) -> io::Result<bool> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
@@ -141,7 +173,7 @@ fn same_file(file: &File, path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn same_file(_file: &File, _path: &Path) -> io::Result<bool> {
+pub(crate) fn same_file(_file: &File, _path: &Path) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "no file-identity probe on this platform",
@@ -302,6 +334,43 @@ mod tests {
         assert!(held.is_at(&path).expect("probe own path"));
         assert!(!held.is_at(&other).expect("probe another file"));
         assert!(held.is_at(&dir.path().join("missing")).is_err());
+    }
+
+    /// A wait that is called off returns `Interrupted` while the holder still holds the lock, and
+    /// one that is not called off gets the lock once the holder lets go.
+    #[test]
+    fn an_abandoned_wait_returns_interrupted() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("blob.lock");
+        let held = FileLock::acquire(&path).expect("first acquire");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let waiter = std::thread::spawn({
+            let (path, stop) = (path.clone(), stop.clone());
+            move || {
+                let got = FileLock::acquire_unless(&path, || stop.load(Ordering::SeqCst));
+                tx.send(got.map(drop)).expect("report");
+            }
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the wait ended while the lock was held and nobody gave up"
+        );
+        stop.store(true, Ordering::SeqCst);
+        let err = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("giving up must end the wait")
+            .expect_err("no lock was taken");
+        assert_eq!(err.kind(), io::ErrorKind::Interrupted);
+        waiter.join().expect("waiter thread panicked");
+
+        drop(held);
+        FileLock::acquire_unless(&path, || false).expect("a free lock is taken at once");
     }
 
     /// A blocking `acquire` must actually wait for the holder rather than sailing through — the

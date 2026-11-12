@@ -34,6 +34,7 @@ pub mod link;
 pub mod lock;
 pub mod mem;
 pub mod paths;
+pub mod persist;
 pub mod proc;
 pub mod signal;
 pub mod stdin;

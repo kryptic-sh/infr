@@ -7407,13 +7407,29 @@ mod tests {
 
     #[test]
     fn int8_decode_and_mrow_tiers_agree_on_policy_dtypes() {
+        // The two vendors differ where the hardware does: wave64 RDNA3 against SIMD8/16 Arc, whose
+        // preferred decode subgroup is 16. Identical literals would make every "intel" assertion
+        // below a repeat of the "amd" one; distinct ones are what show the policy really is
+        // unified rather than keyed, somewhere, off the subgroup.
         let amd = infr_core::backend::Capabilities {
             i8_dot: true,
+            subgroup_min: 32,
+            subgroup_max: 64,
+            sg_pref: 64,
             ..Default::default()
         };
         let intel = infr_core::backend::Capabilities {
             i8_dot: true,
+            subgroup_min: 8,
+            subgroup_max: 32,
+            sg_pref: 16,
+            integrated: true,
             ..Default::default()
+        };
+        // A device without packed int8 dot: the one capability the mmv_mw tier does key off.
+        let no_dp4a = infr_core::backend::Capabilities {
+            i8_dot: false,
+            ..intel.clone()
         };
         // `kernels.vulkan.mmv_mw`, the tri-state: `None` = unset (the shipping default),
         // `Some(true)` = `INFR_MMV_MW=1` (any non-"0" value), `Some(false)` = `INFR_MMV_MW=0`.
@@ -7510,6 +7526,34 @@ mod tests {
         // Intel now takes the same unified rows=1 path (unconditional, part of the
         // capability-first architecture).
         assert!(unified_mmv_row1(&intel));
+        // The int8 mmv_mw tier itself, at a projection-sized GEMV: both vendors are offered the
+        // same build for every decode dtype, and the device without dp4a is offered none — the
+        // f32 path — even though the dtype is on the decode list.
+        let (in_f, out_f) = (4096, 4096);
+        let mut offered = 0;
+        for dt in POLICY_DTYPES {
+            let pick = mmv_mw_choice(&amd, &vk, dt, in_f, out_f, false);
+            assert_eq!(
+                pick,
+                mmv_mw_choice(&intel, &vk, dt, in_f, out_f, false),
+                "{dt:?}: the mmv_mw tier differs by vendor"
+            );
+            assert_eq!(
+                mmv_mw_choice(&no_dp4a, &vk, dt, in_f, out_f, false),
+                None,
+                "{dt:?}: an int8 GEMV offered to a device without packed int8 dot"
+            );
+            offered += usize::from(pick.is_some());
+        }
+        assert!(
+            offered > 0,
+            "no dtype reached the int8 tier — the comparison above proved nothing"
+        );
+        // Q4_K takes its single-subgroup shape on both vendors.
+        assert_eq!(
+            mmv_mw_choice(&intel, &vk, DType::Q4K, in_f, out_f, false),
+            Some(1)
+        );
     }
 
     /// The drift guard the SSOT lists promise (`infr_core::tensor::MOE_MMQ_DTYPES`'s doc): every

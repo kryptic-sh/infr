@@ -85,6 +85,11 @@ struct State {
     head_status: AtomicUsize,
     /// HEAD requests received.
     heads: AtomicUsize,
+    /// Repos that moved: a request under the key's `/<repo>/` is answered `307` to the value's
+    /// `Location` prefix, WITHOUT an `X-Linked-Etag` — what HF sends for a renamed repo.
+    moved: Mutex<HashMap<String, String>>,
+    /// Per file, a `Content-Length` HEAD advertises in place of the real one.
+    head_length: Mutex<HashMap<String, u64>>,
 }
 
 /// A `206` that does not describe the bytes that were asked for — what a broken proxy or mirror
@@ -266,6 +271,26 @@ impl TestHub {
         self.state.failing_heads.store(n, Ordering::SeqCst);
     }
 
+    /// Answer every request under `/<from>/` with a `307` to `location` + the rest of the path,
+    /// carrying no LFS headers — a renamed repo. `location` is either a path on this hub
+    /// (`/org/repo`) or a full URL elsewhere.
+    pub(crate) fn move_repo(&self, from: &str, location: &str) {
+        self.state
+            .moved
+            .lock()
+            .unwrap()
+            .insert(format!("/{from}/"), location.to_string());
+    }
+
+    /// Advertise `len` as `name`'s `Content-Length` on HEAD — a broken or hostile server's size.
+    pub(crate) fn lie_about_length(&self, name: &str, len: u64) {
+        self.state
+            .head_length
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), len);
+    }
+
     /// HEAD requests this hub has received.
     pub(crate) fn heads_served(&self) -> usize {
         self.state.heads.load(Ordering::SeqCst)
@@ -403,6 +428,22 @@ fn serve(state: &State, stream: TcpStream) {
         }
     }
 
+    let moved = state.moved.lock().unwrap().iter().find_map(|(from, to)| {
+        path.strip_prefix(from.as_str())
+            .map(|rest| format!("{to}/{rest}"))
+    });
+    if let Some(location) = moved {
+        if method == "HEAD" {
+            state.heads.fetch_add(1, Ordering::SeqCst);
+        }
+        let _ = write!(
+            &stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
     let file = path
         .rsplit("/resolve/main/")
         .next()
@@ -516,9 +557,14 @@ fn serve(state: &State, stream: TcpStream) {
             head.push_str(&format!("Content-Range: bytes {first}-{last}/{total}\r\n"));
         }
     }
-    head.push_str(&format!("Content-Length: {}\r\n", slice.len()));
+    let length = match state.head_length.lock().unwrap().get(&file) {
+        Some(lie) if method == "HEAD" => *lie,
+        _ => slice.len() as u64,
+    };
+    head.push_str(&format!("Content-Length: {length}\r\n"));
     head.push_str(&format!("ETag: {etag}\r\n"));
     head.push_str(&format!("X-Linked-Etag: \"{advertised_sha}\"\r\n"));
+    head.push_str(&format!("X-Linked-Size: {}\r\n", body.len()));
     if advertise {
         head.push_str("Accept-Ranges: bytes\r\n");
     }

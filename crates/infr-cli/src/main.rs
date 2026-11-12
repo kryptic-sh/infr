@@ -229,9 +229,7 @@ impl DeviceOpts {
         // `--ctx` shares the size grammar (`8192`, `256k`, `50%`) with INFR_CTX; a typo fails fast
         // here (the check `cmd_serve` used to own).
         if let Some(c) = &self.ctx {
-            let spec = infr_core::parse_size(c)
-                .ok_or_else(|| anyhow!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)"))?;
-            layer.device.ctx = Some(Some(spec));
+            layer.device.ctx = Some(Some(parse_ctx_flag(c)?));
         }
         // `-u 0` stays "adaptive": the value is carried verbatim and the seam's `ubatch_rows`
         // filters `v > 0`, exactly as it did when this was published as INFR_UBATCH=0. Likewise
@@ -611,7 +609,7 @@ fn main() -> anyhow::Result<()> {
     // SIGINT/SIGTERM into 130/143, and it does so in preference to the abort error the unwinding
     // produced (an aborted forward reports `aborted: shutdown requested`, which is noise once we
     // are already saying "interrupted" with the right status).
-    let res = dispatch(cmd, &cfg, &specified);
+    let res = dispatch(cmd, &cfg, &specified, &overrides);
     exit_if_signalled();
     res
 }
@@ -641,12 +639,31 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
             // override it wins over the file and the environment just as that overwrite did.
             layer.sampling.ignore_eos = Some(true);
         }
-        Cmd::Pull { .. } | Cmd::Devices | Cmd::Multi { .. } | Cmd::Compare { .. } => {}
+        // `multi --ctx` is the same knob as `serve --ctx`: it lands on `device.ctx`, so `INFR_CTX`
+        // and a config file's `[device] ctx` reach `infr multi` exactly as they reach `serve`.
+        Cmd::Multi { ctx, .. } => {
+            if let Some(c) = ctx {
+                layer.device.ctx = Some(Some(parse_ctx_flag(c)?));
+            }
+        }
+        Cmd::Pull { .. } | Cmd::Devices | Cmd::Compare { .. } => {}
     }
     Ok(layer)
 }
 
-fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::Result<()> {
+/// A `--ctx` value, in the size grammar (`8192`, `256k`, `50%`) `INFR_CTX` shares; a typo fails
+/// fast, before anything is downloaded or loaded.
+fn parse_ctx_flag(c: &str) -> anyhow::Result<infr_core::SizeSpec> {
+    infr_core::parse_size(c)
+        .ok_or_else(|| anyhow!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)"))
+}
+
+fn dispatch(
+    cmd: Cmd,
+    cfg: &Arc<Config>,
+    specified: &PartialConfig,
+    overrides: &ConfigOverrides,
+) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model, cfg),
         Cmd::Devices => cmd_devices(cfg),
@@ -672,8 +689,8 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
             models,
             addr,
             parallel,
-            ctx,
-        } => cmd_multi(&models, &addr, parallel, ctx.as_deref(), cfg, specified),
+            ..
+        } => cmd_multi(&models, &addr, parallel, cfg, specified),
         Cmd::Bench {
             model,
             n_prompt,
@@ -710,6 +727,7 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
                     ubatch,
                     &llama_bench,
                     cfg,
+                    &global_flag_args(overrides),
                 )
             } else {
                 if models.len() > 1 {
@@ -730,10 +748,31 @@ fn dispatch(cmd: Cmd, cfg: &Arc<Config>, specified: &PartialConfig) -> anyhow::R
                     &turns,
                     &llama_bench,
                     cfg,
+                    &global_flag_args(overrides),
                 )
             }
         }
     }
+}
+
+/// The global `--config` / `--set` flags this invocation was given, spelled for a child `infr`.
+///
+/// `infr compare` measures infr by running `infr bench` as a child process, which resolves its own
+/// configuration: without these it would be measured under defaults while the diffusion arm, run
+/// in-process, used the full configuration — rows of one comparison under different settings. The
+/// environment (`INFR_*`) and the discovered config file are inherited already; only the flags are
+/// not.
+fn global_flag_args(overrides: &ConfigOverrides) -> Vec<std::ffi::OsString> {
+    let mut args = Vec::new();
+    if let Some(path) = &overrides.config_path {
+        args.push("--config".into());
+        args.push(path.clone().into_os_string());
+    }
+    for set in &overrides.sets {
+        args.push("--set".into());
+        args.push(set.into());
+    }
+    args
 }
 
 use anyhow::{anyhow, Context};
@@ -2979,6 +3018,7 @@ fn cmd_compare_sweep(
     ubatch: usize,
     llama_bench: &str,
     cfg: &Arc<Config>,
+    globals: &[std::ffi::OsString],
 ) -> anyhow::Result<()> {
     const METRICS: [&str; 4] = ["pp512", "tg128", "tg64@d", "pp4@d"];
     // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
@@ -3007,6 +3047,7 @@ fn cmd_compare_sweep(
             ubatch,
             llama_bench,
             cfg.clone(),
+            globals,
         ) {
             Ok(mb) => mb,
             Err(e) => {
@@ -3132,6 +3173,10 @@ fn compare_infr_dev(dev: &str) -> &str {
     }
 }
 
+/// How much of a failed `infr bench` child's stderr its compare cell reports: the end, where the
+/// error is, rather than every log line before it.
+const BENCH_STDERR_LINES: usize = 5;
+
 /// One model's infr-vs-llama.cpp bench harness: resolves the shared model ref once and shells
 /// out to `infr bench --json` / `llama-bench -o json` with MATCHED flags. Both the deep
 /// coding-agent scenarios (`cmd_compare`) and the multi-model survey (`cmd_compare_sweep`) run
@@ -3164,6 +3209,9 @@ struct ModelBench {
     /// its own), and that function takes `sampling.ignore_eos` / `sampling.seed` from a
     /// `Config` rather than from the environment.
     cfg: Arc<Config>,
+    /// This invocation's `--config` / `--set` flags ([`global_flag_args`]), handed to every
+    /// `infr bench` child so it measures under the same configuration as the in-process arm.
+    globals: Vec<std::ffi::OsString>,
 }
 
 impl ModelBench {
@@ -3177,6 +3225,7 @@ impl ModelBench {
         ubatch: usize,
         llama_bench: &str,
         cfg: Arc<Config>,
+        globals: &[std::ffi::OsString],
     ) -> anyhow::Result<Self> {
         let exe = std::env::current_exe().context("locating the infr binary")?;
         // infr and llama.cpp share the HF Hub cache and the same `org/repo:quant` ref grammar, so
@@ -3220,6 +3269,7 @@ impl ModelBench {
             reps,
             ubatch,
             cfg,
+            globals: globals.to_vec(),
         })
     }
 
@@ -3234,8 +3284,39 @@ impl ModelBench {
     /// element) — shared by [`infr`](Self::infr) (`avg_ts`) and [`infr_mtp`](Self::infr_mtp)
     /// (`mtp_ts`), so both read one shelled-out call's worth of plumbing.
     fn infr_json(&self, args: &[&str]) -> anyhow::Result<serde_json::Value> {
-        use std::process::Command;
-        let mut c = Command::new(&self.exe);
+        let out = self
+            .bench_command(args)
+            .output()
+            .context("running `infr bench`")?;
+        // A failed child is that cell's error, with what it said: reading its (empty) stdout as
+        // JSON instead reported only "parsing infr bench output" and threw the cause away.
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let tail: Vec<&str> = stderr
+                .trim_end()
+                .lines()
+                .rev()
+                .take(BENCH_STDERR_LINES)
+                .collect();
+            anyhow::bail!(
+                "`infr bench` failed ({}): {}",
+                out.status,
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            );
+        }
+        serde_json::from_slice(&out.stdout).with_context(|| {
+            format!(
+                "parsing infr bench output: {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    /// The `infr bench --json` child [`infr_json`](Self::infr_json) runs: this invocation's global
+    /// flags, then the bench arguments matched to the llama.cpp arm.
+    fn bench_command(&self, args: &[&str]) -> std::process::Command {
+        let mut c = std::process::Command::new(&self.exe);
+        c.args(&self.globals);
         c.arg("bench")
             .arg(&self.model)
             .args(["-r", &self.reps.to_string()]);
@@ -3252,13 +3333,7 @@ impl ModelBench {
             c.args(["-u", &self.ubatch.to_string()]);
         }
         c.args(args).arg("--json");
-        let out = c.output().context("running `infr bench`")?;
-        serde_json::from_slice(&out.stdout).with_context(|| {
-            format!(
-                "parsing infr bench output: {}",
-                String::from_utf8_lossy(&out.stdout)
-            )
-        })
+        c
     }
 
     /// Run `infr bench` (this binary) and read its single-row [{"avg_ts":X}].
@@ -3734,6 +3809,7 @@ fn cmd_compare(
     turns: &[String],
     llama_bench: &str,
     cfg: &Arc<Config>,
+    globals: &[std::ffi::OsString],
 ) -> anyhow::Result<()> {
     let mb = ModelBench::new(
         model,
@@ -3744,6 +3820,7 @@ fn cmd_compare(
         ubatch,
         llama_bench,
         cfg.clone(),
+        globals,
     )?;
     let infr_b = |args: &[&str]| mb.infr(args);
     let llama_b = |np: usize, ng: usize, args: &[&str]| mb.llama(np, ng, args);
@@ -3927,12 +4004,13 @@ fn arch_sampling(arch: &str) -> (f32, usize, f32) {
     }
 }
 
-/// Per-field sampling override from a `generation_config.json` sitting BESIDE the model (the HF
-/// convention — the model's OWN recommended generation params). Present for full-repo checkouts,
-/// absent for the GGUF-only distributions `infr pull` fetches (then the [`arch_sampling`] table
-/// drives). Each field is independent — a config that sets only `temperature` overrides just that.
+/// Per-field sampling override from the model's `generation_config.json` (the HF convention — the
+/// model's OWN recommended generation params), found by [`generation_config_path`]. Present for
+/// full-repo checkouts and for repos `infr pull` fetched it from; absent otherwise (then the
+/// [`arch_sampling`] table drives). Each field is independent — a config that sets only
+/// `temperature` overrides just that.
 fn generation_config_sampling(gguf: &std::path::Path) -> (Option<f32>, Option<usize>, Option<f32>) {
-    let Some(path) = gguf.parent().map(|d| d.join("generation_config.json")) else {
+    let Some(path) = generation_config_path(gguf) else {
         return (None, None, None);
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -3951,6 +4029,27 @@ fn generation_config_sampling(gguf: &std::path::Path) -> (Option<f32>, Option<us
             .map(|x| usize::try_from(x).unwrap_or(0)),
         v.get("top_p").and_then(|x| x.as_f64()).map(|x| x as f32),
     )
+}
+
+/// The `generation_config.json` that belongs to `gguf`: the one beside it, else — for a GGUF inside
+/// a Hugging Face cache snapshot — the nearest one between it and the snapshot root.
+///
+/// `infr pull` caches the file at the snapshot ROOT, the repo's own top level, while unsloth-style
+/// repos keep their GGUFs a directory down (`snapshots/<commit>/UD-Q4_K_XL/<file>.gguf`), so
+/// looking only beside the model never found it there. The walk stops at the snapshot root (the
+/// directory directly inside `snapshots/`): above it is the cache, where nothing is this model's. A
+/// GGUF outside any snapshot gets only the file beside it.
+fn generation_config_path(gguf: &std::path::Path) -> Option<std::path::PathBuf> {
+    const NAME: &str = "generation_config.json";
+    let dir = gguf.parent()?;
+    let root = dir
+        .ancestors()
+        .find(|a| a.parent().and_then(|p| p.file_name()) == Some("snapshots".as_ref()))
+        .unwrap_or(dir);
+    dir.ancestors()
+        .take_while(|a| a.starts_with(root))
+        .map(|a| a.join(NAME))
+        .find(|p| p.is_file())
 }
 
 /// The model-aware sampling defaults for `gguf`: the [`arch_sampling`] family table, then any
@@ -4189,7 +4288,6 @@ fn cmd_multi(
     specs: &[String],
     addr: &str,
     parallel: usize,
-    ctx: Option<&str>,
     cfg: &Arc<Config>,
     specified: &PartialConfig,
 ) -> anyhow::Result<()> {
@@ -4206,15 +4304,9 @@ fn cmd_multi(
         );
     }
 
-    // `--ctx` shares the size grammar with the rest of the CLI; validate once, apply to every model.
-    let want_ctx = match ctx {
-        Some(c) => {
-            let spec = infr_core::parse_size(c)
-                .ok_or_else(|| anyhow!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)"))?;
-            Some(spec)
-        }
-        None => None,
-    };
+    // The per-slot context for every hosted model, from `device.ctx` exactly as `serve` reads it:
+    // `--ctx` (validated into that field by `cli_flag_layer`), else `INFR_CTX` or `[device] ctx`.
+    let want_ctx = cfg.device.ctx;
 
     // Enumerate the device pool once: for validation, round-robin assignment of specs that omit a
     // device, and the routing table's device names.
@@ -4567,6 +4659,31 @@ mod tests {
         assert_eq!(selected_backend(&cfg).unwrap(), Backend::Vulkan(None));
     }
 
+    /// `infr multi` reads its per-slot context from `device.ctx`, as `serve` does: its own `--ctx`
+    /// lands there (and wins over the environment), and without it `INFR_CTX` comes through.
+    /// It used to parse `--ctx` privately, so `INFR_CTX` and `[device] ctx` never reached it.
+    #[test]
+    fn multi_ctx_reaches_the_config_like_serve() {
+        let multi = |ctx: Option<&str>| Cmd::Multi {
+            models: vec!["org/repo".into()],
+            addr: "127.0.0.1:8080".into(),
+            parallel: 1,
+            ctx: ctx.map(str::to_string),
+        };
+        let flags = cli_flag_layer(&multi(Some("32k"))).unwrap();
+        let cfg = resolve_cfg(&[("INFR_CTX", "16k")], flags, &[]);
+        assert_eq!(cfg.device.ctx, Some(infr_core::SizeSpec::Bytes(32 * 1024)));
+
+        let flags = cli_flag_layer(&multi(None)).unwrap();
+        let cfg = resolve_cfg(&[("INFR_CTX", "16k")], flags, &[]);
+        assert_eq!(cfg.device.ctx, Some(infr_core::SizeSpec::Bytes(16 * 1024)));
+
+        assert!(
+            cli_flag_layer(&multi(Some("lots"))).is_err(),
+            "a bad --ctx fails fast"
+        );
+    }
+
     #[test]
     fn device_flags_land_on_the_config_layer() {
         let opts = DeviceOpts {
@@ -4890,6 +5007,116 @@ mod tests {
             (0.8, 0, table_p, format!("{DEEPSEEK4}+generation_config+gguf")),
             "the GGUF's temp must win over the sidecar's, and the sidecar's top_k -1 means keep all"
         );
+    }
+
+    /// A bench harness whose `infr` is `exe`, for the compare tests below. No model is resolved:
+    /// these exercise only how the child is spawned and how its outcome is read.
+    fn bench_harness(exe: std::path::PathBuf, globals: Vec<std::ffi::OsString>) -> ModelBench {
+        ModelBench {
+            exe,
+            model: "org/repo:Q4_K_M".into(),
+            gguf_path: "m.gguf".into(),
+            tok_path: None,
+            is_dg: false,
+            llama_model_args: Vec::new(),
+            llama_bench: "llama-bench".into(),
+            dev: "vulkan0".into(),
+            ngl: 99,
+            threads: 0,
+            reps: 1,
+            ubatch: 0,
+            cfg: Arc::new(Config::default()),
+            globals,
+        }
+    }
+
+    /// The `infr bench` child of `infr compare` gets the parent's `--config` and every `--set`, so
+    /// it is measured under the same configuration as the in-process diffusion arm.
+    #[test]
+    fn compare_children_inherit_the_global_flags() {
+        let overrides = ConfigOverrides {
+            config_path: Some("bench.toml".into()),
+            sets: vec![
+                "kernels.vulkan.flash_splits=2".into(),
+                "debug.chat=true".into(),
+            ],
+            flags: PartialConfig::default(),
+        };
+        let mb = bench_harness("infr".into(), global_flag_args(&overrides));
+        let cmd = mb.bench_command(&["-p", "512"]);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args[..7],
+            [
+                "--config",
+                "bench.toml",
+                "--set",
+                "kernels.vulkan.flash_splits=2",
+                "--set",
+                "debug.chat=true",
+                "bench"
+            ],
+            "{args:?}"
+        );
+        assert_eq!(args.last().map(String::as_str), Some("--json"));
+        // No global flags given: none forwarded.
+        assert!(global_flag_args(&ConfigOverrides::default()).is_empty());
+    }
+
+    /// A child that fails is that cell's error and carries its stderr. The child here is this test
+    /// binary, which rejects the bench flags and exits non-zero — a real failing process on every
+    /// platform.
+    #[test]
+    fn a_failed_bench_child_reports_its_stderr() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let err = bench_harness(exe, Vec::new())
+            .infr_json(&[])
+            .expect_err("the child exits non-zero")
+            .to_string();
+        assert!(err.contains("`infr bench` failed"), "{err}");
+        assert!(err.to_lowercase().contains("unrecognized option"), "{err}");
+    }
+
+    /// `infr pull` caches `generation_config.json` at the snapshot root, and an unsloth-style repo
+    /// keeps its GGUF a directory below that: the walk finds it there, prefers one beside the GGUF,
+    /// and never reaches past the snapshot root into the cache.
+    #[test]
+    fn generation_config_is_found_up_to_the_snapshot_root() {
+        let base = sampling_dir("gencfg");
+        let snap = base.join("models--org--repo/snapshots/c1");
+        let gguf = snap.join("UD-Q4_K_XL/m.gguf");
+        std::fs::create_dir_all(gguf.parent().unwrap()).expect("snapshot dirs");
+        std::fs::write(&gguf, b"").expect("gguf");
+        let write = |dir: &std::path::Path, t: f32| {
+            std::fs::write(
+                dir.join("generation_config.json"),
+                format!(r#"{{"temperature": {t}}}"#),
+            )
+            .expect("write config")
+        };
+
+        // Above the snapshot root is the cache, not the model: never read.
+        write(&base.join("models--org--repo"), 0.1);
+        let above_root = generation_config_sampling(&gguf).0;
+        write(&snap, 0.2);
+        let at_root = generation_config_sampling(&gguf).0;
+        write(gguf.parent().unwrap(), 0.3);
+        let beside = generation_config_sampling(&gguf).0;
+
+        // Outside any snapshot only the file beside the GGUF counts.
+        let plain = base.join("plain/sub/m.gguf");
+        std::fs::create_dir_all(plain.parent().unwrap()).expect("plain dirs");
+        write(&base.join("plain"), 0.4);
+        let plain_parent = generation_config_path(&plain);
+
+        std::fs::remove_dir_all(&base).expect("remove temp dir");
+        assert_eq!(above_root, None);
+        assert_eq!(at_root, Some(0.2));
+        assert_eq!(beside, Some(0.3));
+        assert_eq!(plain_parent, None);
     }
 
     /// The load-time warning names every `general.sampling.*` key infr does not apply, and nothing

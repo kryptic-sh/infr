@@ -4315,7 +4315,7 @@ mod tests {
     /// `kernels.cpu.reference` is a plain field on the config the backend was handed, and
     /// [`CpuBackend::reference`] is the shorthand that sets it. (The numeric consequence — an f32
     /// decode dot instead of the int8-activation kernels — is
-    /// `decode_parity::cpu_reference_mode_is_exact_for_every_weight_quant`.)
+    /// `decode_parity::cpu_reference_gemv_matches_the_shared_decoder_for_every_weight_quant`.)
     #[test]
     fn reference_mode_is_a_config_field() {
         assert!(!Config::default().kernels.cpu.reference);

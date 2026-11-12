@@ -21,14 +21,15 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Stream `url` into `blobs/<sha256>` (HF's content-addressed blob name), resuming a prior partial if
 /// present. Returns `(blob_path, hex_digest, total_bytes)`. On a transport error the partial temp file
 /// is KEPT so a later call resumes from where it stopped.
 ///
-/// When `expected_sha` is `Some`, it is HF's advertised LFS sha256 and is used two ways: the download
-/// is skipped entirely if that content-addressed blob is already on disk, and the downloaded bytes are
+/// When `expected` is `Some`, it is HF's advertised LFS sha256 (and size) and is used two ways: the
+/// download is skipped entirely if that content-addressed blob is already on disk at that size
+/// ([`present_blob`]), and the downloaded bytes are
 /// verified against it before the blob is committed — a mismatch discards the temp and errors (a
 /// corrupt/truncated body, or a resume of a stale partial from a since-changed file, must never be
 /// linked as the model). `None` (non-LFS file / no digest available) proceeds without verification.
@@ -37,7 +38,7 @@ use tracing::{debug, info};
 /// streaming loop, so an over-long body is aborted mid-transfer instead of after it has already
 /// landed on disk — the whole point of a cap on an unverified download. `None` means uncapped and
 /// is what the model-blob path passes: a GGUF is legitimately multi-GB, and its integrity comes
-/// from `expected_sha` instead. See [`crate::pull::MAX_COMPANION_BYTES`] for the only capped
+/// from `expected` instead. See [`crate::pull::MAX_COMPANION_BYTES`] for the only capped
 /// caller. The advertised `Content-Length` is checked first as a courtesy (fail before writing a
 /// byte) but is never trusted on its own — it is attacker-controlled and may be absent under
 /// chunked encoding, which is exactly why the loop counts for itself.
@@ -59,19 +60,30 @@ pub(crate) fn download_to_blob(
     url: &str,
     blobs: &Path,
     label: &str,
-    expected_sha: Option<&str>,
+    expected: Option<&LfsOid>,
     max_bytes: Option<u64>,
     budget: &ConnBudget,
     progress: &MultiProgress,
 ) -> Result<(PathBuf, String, u64)> {
     fs::create_dir_all(blobs).map_err(Error::from)?;
     // Content-addressed short-circuit: if we already know the sha and hold that blob, we're done.
-    if let Some(sha) = expected_sha {
-        let blob = blobs.join(sha);
-        if blob.exists() {
-            let size = fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
-            debug!("blob {sha} already present ({size} bytes); skipping download of {label}");
-            return Ok((blob, sha.to_string(), size));
+    if let Some(want) = expected {
+        if let Some((blob, size)) = present_blob(blobs, want) {
+            debug!(
+                "blob {} already present ({size} bytes); skipping download of {label}",
+                want.sha
+            );
+            return Ok((blob, want.sha.clone(), size));
+        }
+        // Said here, once per file: `present_blob` is asked again under the lock (and by the
+        // caller before this), and only this first look reports what it found.
+        if let Ok(meta) = fs::metadata(blobs.join(&want.sha)) {
+            warn!(
+                "blob {} holds {} bytes but the hub says the object is {}; downloading it again",
+                want.sha,
+                meta.len(),
+                want.size.unwrap_or_default()
+            );
         }
     } else {
         debug!("no expected sha256 for {label}; download will not be integrity-checked");
@@ -79,7 +91,8 @@ pub(crate) fn download_to_blob(
     let obj = Object {
         url,
         label,
-        oid: expected_sha,
+        oid: expected.map(|w| w.sha.as_str()),
+        size: expected.and_then(|w| w.size),
     };
     let partial = partial_name(label);
     let temps = Temps {
@@ -94,14 +107,23 @@ pub(crate) fn download_to_blob(
     // of each starting a fresh partial from byte 0. The lock releases when `_lock` drops. It is
     // named off the STREAM partial for both modes, so two processes that picked different modes for
     // the same blob still serialise.
-    let _lock = FileLock::acquire(&blobs.join(format!("{partial}.lock")))?;
+    //
+    // The wait is abandoned on a shutdown request, which a blocking `flock` would not notice (see
+    // `FileLock::acquire_unless`), and reported as the abort it is rather than as an I/O failure.
+    let _lock =
+        FileLock::acquire_unless(&blobs.join(format!("{partial}.lock")), shutdown_requested)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::Interrupted && shutdown_requested() {
+                    Error::Aborted
+                } else {
+                    Error::from(e)
+                }
+            })?;
     // Re-check the content-addressed short-circuit now that we hold the lock: a racing process may
     // have finished this exact blob while we waited.
-    if let Some(sha) = expected_sha {
-        let blob = blobs.join(sha);
-        if blob.exists() {
-            let size = fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
-            return Ok((blob, sha.to_string(), size));
+    if let Some(want) = expected {
+        if let Some((blob, size)) = present_blob(blobs, want) {
+            return Ok((blob, want.sha.clone(), size));
         }
     }
 
@@ -114,14 +136,41 @@ pub(crate) fn download_to_blob(
     commit(&obj, &temps, &tmp, blobs, &pb, progress)
 }
 
-/// The object being fetched: where it is, what to call it on screen, and the LFS sha256 HF says it
-/// hashes to. Passed as one value because every stage of a download needs all three — the request,
+/// What HF's LFS `HEAD` says one object is: its sha256 (`X-Linked-Etag`) and, when the header is
+/// sent, its size in bytes (`X-Linked-Size`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LfsOid {
+    pub(crate) sha: String,
+    pub(crate) size: Option<u64>,
+}
+
+/// The committed blob for `want` and its length, when one is on disk AND is the size HF says the
+/// object is.
+///
+/// A blob of any other size is treated as absent, so the download runs again and its commit
+/// replaces it. The name alone is not proof of content: a crash between a blob's rename and its
+/// bytes reaching the disk can leave the right name on a short or empty file, and nothing re-hashes
+/// a blob once it exists. Comparing the size catches that case for the price of one `stat`; a full
+/// re-hash on every run would cost minutes per model and is deliberately not done.
+pub(crate) fn present_blob(blobs: &Path, want: &LfsOid) -> Option<(PathBuf, u64)> {
+    let blob = blobs.join(&want.sha);
+    let len = fs::metadata(&blob).ok()?.len();
+    match want.size {
+        Some(size) if size != len => None,
+        _ => Some((blob, len)),
+    }
+}
+
+/// The object being fetched: where it is, what to call it on screen, and the LFS sha256 and size HF
+/// says it has. Passed as one value because every stage of a download needs them — the request,
 /// the progress line, the identity a partial is bound to and the gate at the end.
 pub(crate) struct Object<'a> {
     pub(crate) url: &'a str,
     pub(crate) label: &'a str,
     /// HF's advertised LFS sha256, or `None` for a non-LFS file (which is then unverifiable).
     pub(crate) oid: Option<&'a str>,
+    /// HF's advertised LFS size (`X-Linked-Size`), when it sent one.
+    pub(crate) size: Option<u64>,
 }
 
 /// The three on-disk names one download can leave behind, all derived from [`temp_stem`]: the
@@ -171,8 +220,12 @@ fn commit(
     }
     pb.finish_with_message(format!("✓ {label} ({} MiB)", size / (1024 * 1024)));
 
-    let blob = blobs.join(&hex); // HF blob name = bare sha256 hex
-    fs::rename(tmp, &blob).map_err(Error::from)?;
+    // HF blob name = bare sha256 hex.
+    let blob = blobs.join(&hex);
+    // Durably: the bytes are on disk before the blob's name is, so a crash cannot leave the name
+    // on unwritten blocks (the single-stream path never synced them; see `present_blob` for the
+    // check that catches a short blob anyway).
+    infr_plat::persist::commit_file(tmp, &blob).map_err(Error::from)?;
     let _ = fs::remove_file(&temps.meta); // partial committed; validator no longer needed
     let _ = fs::remove_file(parts::plan_path(&temps.ranged));
     progress.suspend(|| info!("Saved blob: {blob:?}"));
@@ -593,7 +646,7 @@ fn stream_into(
 /// subdirectory `rfilename`s are supported — collide on the same `.dl-` partial and the same
 /// `.lock`. The `flock` serialises them so there is no interleaved write, but the SECOND download
 /// then "resumes" onto the first file's partial bytes. That splice is caught by the final sha256
-/// only for an LFS file; a non-LFS file has no `expected_sha` and its verification is skipped
+/// only for an LFS file; a non-LFS file has no advertised sha256 and its verification is skipped
 /// entirely, so the corrupt splice would be committed as a blob. The readable prefix is kept so a
 /// leftover partial in `blobs/` is still identifiable by eye.
 fn temp_stem(label: &str) -> String {
@@ -729,6 +782,10 @@ mod tests {
         partial: &[u8],
         expected_sha: Option<&str>,
     ) -> (tempfile::TempDir, Result<(PathBuf, String, u64)>) {
+        let expected = expected_sha.map(|sha| LfsOid {
+            sha: sha.to_string(),
+            size: None,
+        });
         let dir = tempfile::tempdir().unwrap();
         let stem = partial_name(name);
         fs::write(dir.path().join(&stem), partial).unwrap();
@@ -738,7 +795,7 @@ mod tests {
             &url,
             dir.path(),
             name,
-            expected_sha,
+            expected.as_ref(),
             None,
             &ConnBudget::new(1),
             &progress::group(),

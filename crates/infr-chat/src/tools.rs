@@ -55,6 +55,11 @@ pub fn split_channels(full: &str) -> (String, String) {
 pub struct ToolCall {
     pub name: String,
     pub arguments: Value,
+    /// The OpenAI `tool_calls[].id` this call was replayed with, handed to the chat template so
+    /// templates that pair a call with its `tool` result by id (and Mistral's, which refuses a
+    /// call without one) render it. `None` for calls parsed out of fresh model output: the server
+    /// assigns those their wire id.
+    pub id: Option<String>,
 }
 
 // Regex-free: scan for literal open/close delimiters.
@@ -426,7 +431,11 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
                 Value::Object(m)
             }
         };
-        calls.push(ToolCall { name, arguments });
+        calls.push(ToolCall {
+            name,
+            arguments,
+            id: None,
+        });
         spans.push((open_abs, close_abs));
     }
 
@@ -495,7 +504,11 @@ fn parse_hermes_body(body: &str) -> Option<ToolCall> {
             Some(other) => other.clone(),
             None => Value::Object(serde_json::Map::new()),
         };
-        return Some(ToolCall { name, arguments });
+        return Some(ToolCall {
+            name,
+            arguments,
+            id: None,
+        });
     }
     parse_xml_function_body(body)
 }
@@ -534,6 +547,7 @@ fn parse_xml_function_body(body: &str) -> Option<ToolCall> {
     Some(ToolCall {
         name,
         arguments: Value::Object(args),
+        id: None,
     })
 }
 
@@ -591,7 +605,11 @@ pub(crate) fn parse_bare_json_call(text: &str) -> Option<ToolCall> {
         None => Value::Object(serde_json::Map::new()),
         Some(_) => return None,
     };
-    Some(ToolCall { name, arguments })
+    Some(ToolCall {
+        name,
+        arguments,
+        id: None,
+    })
 }
 
 // ---------------------------------------------------------------------------

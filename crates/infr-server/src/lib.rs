@@ -1596,7 +1596,7 @@ async fn non_streaming(
                     let idx = tool_calls.len();
                     tool_calls.push(OAIToolCall {
                         index: idx,
-                        id: format!("call_{cid_blk}_{idx}"),
+                        id: tool_call_id(&cid_blk, idx),
                         kind: "function",
                         function: OAIFunction { name, arguments },
                     });
@@ -1849,7 +1849,7 @@ async fn streaming(
                     Delta::ToolCall { name, arguments } => {
                         let tc = OAIToolCall {
                             index: tc_index,
-                            id: format!("call_{cid_cb}_{tc_index}"),
+                            id: tool_call_id(&cid_cb, tc_index),
                             kind: "function",
                             function: OAIFunction { name, arguments },
                         };
@@ -2116,8 +2116,8 @@ fn param_error(param: Option<&str>, msg: String) -> Response {
 }
 
 /// Process-monotonic tie-breaker so two requests in the SAME millisecond (routine under
-/// `--parallel N`) never mint the same completion `id` — which also keeps the derived
-/// `call_{cid}_{idx}` tool-call ids unique (audit finding 4).
+/// `--parallel N`) never mint the same completion `id` — which also keeps the tool-call ids
+/// [`tool_call_id`] derives from it distinct (audit finding 4).
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn make_id() -> String {
@@ -2127,6 +2127,32 @@ fn make_id() -> String {
         .as_millis();
     let seq = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("chatcmpl-{ms}-{seq}")
+}
+
+/// Length of a tool-call id, and its alphabet below: the shape Mistral's chat template demands of
+/// every replayed `tool_calls[].id` (it `raise_exception`s on anything else), which OpenAI clients
+/// treat as an opaque string. One shape for every model keeps a replayed id valid whichever
+/// template renders the next turn.
+const TOOL_CALL_ID_LEN: usize = 9;
+const TOOL_CALL_ID_ALPHABET: &[u8] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// The wire id of the `idx`-th tool call in completion `cid`: a hash of the pair, spelled in
+/// [`TOOL_CALL_ID_ALPHABET`]. Deterministic, so the streaming and non-streaming paths agree, and
+/// distinct across completions because `cid` is (see [`make_id`]).
+fn tool_call_id(cid: &str, idx: usize) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    (cid, idx).hash(&mut h);
+    let mut n = h.finish();
+    let base = TOOL_CALL_ID_ALPHABET.len() as u64;
+    (0..TOOL_CALL_ID_LEN)
+        .map(|_| {
+            let c = TOOL_CALL_ID_ALPHABET[(n % base) as usize] as char;
+            n /= base;
+            c
+        })
+        .collect()
 }
 
 /// Default ceiling for `max_tokens`/`max_completion_tokens` when `INFR_MAX_TOKENS_CAP` is unset —
@@ -2382,7 +2408,12 @@ fn parse_oai_tool_calls(v: &serde_json::Value) -> Option<Vec<ToolCall>> {
                 Some(other) => other.clone(),
                 None => serde_json::Value::Object(serde_json::Map::new()),
             };
-            Some(ToolCall { name, arguments })
+            let id = c.get("id").and_then(|v| v.as_str()).map(str::to_owned);
+            Some(ToolCall {
+                name,
+                arguments,
+                id,
+            })
         })
         .collect();
     (!calls.is_empty()).then_some(calls)
@@ -2613,8 +2644,18 @@ mod tests {
             "max_tokens":512
         }"#;
         let req: ChatRequest = serde_json::from_str(raw).unwrap();
-        assert!(req.tools.is_some());
+        // The whole array arrives as sent: it is handed to the chat template verbatim, so a field
+        // lost or reshaped here is a tool the model is never told about.
+        assert_eq!(
+            req.tools,
+            Some(serde_json::json!([
+                {"type": "function", "function": {"name": "bash", "description": "run bash"}}
+            ]))
+        );
         assert_eq!(req.max_tokens, Some(512));
+        assert_eq!(req.max_completion_tokens, None);
+        assert_eq!(req.tool_choice, None);
+        assert!(req.messages.is_empty());
     }
 
     #[test]
@@ -2623,6 +2664,39 @@ mod tests {
         let msg: ChatMessageDto = serde_json::from_str(raw).unwrap();
         assert_eq!(msg.tool_call_id.as_deref(), Some("tc_1"));
         assert_eq!(msg.name.as_deref(), Some("bash"));
+    }
+
+    /// A replayed assistant `tool_calls[].id` survives into the engine message, so the chat
+    /// template can pair it with the `tool` result's `tool_call_id`.
+    #[test]
+    fn replayed_tool_call_keeps_its_id() {
+        let raw = r#"{"role":"assistant","content":null,"tool_calls":[
+            {"id":"a1B2c3D4e","type":"function",
+             "function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}},
+            {"type":"function","function":{"name":"noid","arguments":"{}"}}]}"#;
+        let msg = dto_to_engine(&serde_json::from_str::<ChatMessageDto>(raw).unwrap());
+        let calls = msg.tool_calls.expect("two calls parse");
+        assert_eq!(calls[0].id.as_deref(), Some("a1B2c3D4e"));
+        assert_eq!(calls[0].arguments, serde_json::json!({"cmd": "ls"}));
+        assert_eq!(calls[1].id, None);
+    }
+
+    /// The ids `serve` hands out are ones every supported template accepts when the client replays
+    /// them: Mistral's requires exactly nine alphanumerics. They are distinct per call and per
+    /// completion, and the same (cid, index) always yields the same id.
+    #[test]
+    fn minted_tool_call_ids_are_template_safe_and_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let cid = make_id();
+            for idx in 0..4 {
+                let id = tool_call_id(&cid, idx);
+                assert_eq!(id.len(), TOOL_CALL_ID_LEN, "{id}");
+                assert!(id.bytes().all(|b| b.is_ascii_alphanumeric()), "{id}");
+                assert!(seen.insert(id.clone()), "duplicate tool-call id {id}");
+                assert_eq!(id, tool_call_id(&cid, idx));
+            }
+        }
     }
 
     // --- Non-streaming response serialization tests ------------------------

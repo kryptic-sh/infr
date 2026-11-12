@@ -3,10 +3,13 @@
 //! run the backend-agnostic compute Graph on the CPU reference backend (no GPU); the GPU goldens run
 //! the production Vulkan path. Both are captured with `INFR_BLESS=1` and read for coherence.
 //!
-//! These are NOT `#[ignore]`d — each self-skips at runtime when its GGUF isn't in the HF cache (and
-//! the GPU goldens additionally skip when no Vulkan device is present), so they RUN automatically
-//! wherever the models + hardware exist, and quietly no-op elsewhere:
-//!   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend -- --nocapture
+//! A test whose model the `cpu-goldens` CI job downloads runs by default and self-skips (printing a
+//! `skip:` line, via `need_model!`) where that GGUF is absent. Every other model-gated test is
+//! `#[ignore = "needs <model> …"]`: no CI job has its model, so running it by default would only
+//! ever count an early `return` as a pass. Run those with `--include-ignored` where the models are
+//! cached — each still self-skips if its own GGUF is missing:
+//!   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend -- \
+//!     --include-ignored --nocapture
 
 use infr_core::WeightSource;
 use std::path::PathBuf;
@@ -1485,6 +1488,7 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
 /// seam that lived in `qwen35.rs`; that seam was proven token-identical to this unified path
 /// during the cutover and has since been deleted — issue #30.)
 #[test]
+#[ignore = "needs Qwen3.5-0.8B in the HF cache"]
 fn cpu_golden_qwen35() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     let mut _tlk = test_serial_lock();
@@ -1597,6 +1601,7 @@ fn qwen35_4b_mtp() -> Option<PathBuf> {
 /// optional `nextn.*` fallback tensors ABSENT — this shipped GGUF's live path is 100% fallback to
 /// the main model's `token_embd`/`output`/`output_norm` (see `docs/mtp.md`'s confirmed dump).
 #[test]
+#[ignore = "needs Qwen3.5-4B-MTP in the HF cache"]
 fn mtp_gguf_loads() {
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
@@ -1659,6 +1664,7 @@ fn mtp_gguf_loads() {
 /// `timeout 600 cargo test --release -p infr-llama --test cpu_backend unified_qwen35 -- --nocapture`
 /// proves the TRUNK FORWARD itself (not just `Config` parsing) is byte-for-byte untouched.
 #[test]
+#[ignore = "needs Qwen3.5-0.8B in the HF cache"]
 fn qwen35_trunk_unaffected() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
@@ -1676,6 +1682,7 @@ fn qwen35_trunk_unaffected() {
 /// is 0 for every qwen35 model, unlike gemma). Host-recomputes the GEMV from the same dequantized
 /// weight the graph used, in the same f32 precision, so this should match near bit-exactly.
 #[test]
+#[ignore = "needs Qwen3.5-0.8B in the HF cache"]
 fn h_tap_matches_lm_head() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     let model = model_default(&path);
@@ -1802,6 +1809,7 @@ fn prime_head<'a>(
 /// finite (no NaN/Inf — the eh_proj concat layout is exactly the kind of bug that would show up as
 /// garbage here) and prints the drafted ids + top-1 probabilities.
 #[test]
+#[ignore = "needs Qwen3.5-4B-MTP in the HF cache"]
 fn mtp_head_forward_finite() {
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
@@ -1995,6 +2003,7 @@ fn mtp_draft_chain_matches_per_step() {
 /// a couple of short prompts to dilute single-prompt noise) against that ~0.5 reference rather than
 /// hard-gating on a specific number (still a coarse sanity check, not a benchmark).
 #[test]
+#[ignore = "needs Qwen3.5-4B-MTP in the HF cache"]
 fn mtp_head_trunk_acceptance_rate() {
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
@@ -2200,6 +2209,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 /// CPU-only: qwen3moe golden-hash lock (the Op::MoeFfn routed-expert path). 30B but only `n_used`
 /// experts run per token; still slow on CPU, so a single short case.
 #[test]
+#[ignore = "needs Qwen3-30B-A3B in the HF cache"]
 fn cpu_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
     let mut _tlk = test_serial_lock();
@@ -2635,6 +2645,7 @@ fn gpu_seam_dense_stream_prefill_layer_major_matches_chunk_major() {
 
 /// CPU-only: Gemma 4 E2B golden-hash lock.
 #[test]
+#[ignore = "needs gemma-4-E2B in the HF cache"]
 fn cpu_golden_gemma4_e2b() {
     let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
     let mut _tlk = test_serial_lock();
@@ -2667,6 +2678,7 @@ fn qwen35moe_35b_a3b() -> Option<PathBuf> {
 /// shared-expert width present, still gated through the `qwen35` DeltaNet/rope/attn-out-gate
 /// fields dense qwen35 uses).
 #[test]
+#[ignore = "needs Qwen3.6-35B-A3B in the HF cache"]
 fn cpu_qwen35moe_prefill_finite() {
     let path = need_model!(qwen35moe_35b_a3b(), "Qwen3.6-35B-A3B");
     let mut _tlk = test_serial_lock();
@@ -2748,6 +2760,7 @@ fn gpu_seam_matches_cpu_qwen35moe() {
 /// Dense qwen35 (no expert tensors) must still take the plain dense-FFN path — the `Config::moe`/
 /// `shexp_ff` additions for qwen35moe must NOT leak onto its dense sibling.
 #[test]
+#[ignore = "needs Qwen3.5-0.8B in the HF cache"]
 fn cpu_qwen35_dense_unaffected_by_moe_fields() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     let mut _tlk = test_serial_lock();
@@ -2778,6 +2791,7 @@ fn llama4_scout() -> Option<PathBuf> {
 
 /// llama4 config parses as expected (MoE present, top-1, plain shared expert, iRoPE + L2-norm on).
 #[test]
+#[ignore = "needs Llama-4-Scout in the HF cache"]
 fn cpu_llama4_config() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");
     let model = model_default(&path);
@@ -2825,6 +2839,7 @@ fn cpu_llama4_config() {
 /// sigmoid-top-1-weight-before-FFN MoE + plain shared expert on every step. `INFR_L4_PROMPT`/
 /// `INFR_L4_N`/`INFR_L4_NOBOS` override the defaults. Slow (109B on CPU) — few tokens.
 #[test]
+#[ignore = "needs Llama-4-Scout in the HF cache"]
 fn cpu_llama4_scout_greedy() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");
     let mut _tlk = test_serial_lock();
@@ -2939,6 +2954,7 @@ fn top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
 /// prompt. Prints the top-5 last-row (next-token) logits — no golden hash (Phase 1 doesn't claim
 /// coherent generation; that's the oracle-parity check in Phase 3).
 #[test]
+#[ignore = "needs diffusiongemma-26B-A4B in the HF cache"]
 fn cpu_diffusion_gemma_prefill_finite() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     let mut _tlk = test_serial_lock();
@@ -3051,6 +3067,7 @@ fn gpu_seam_matches_cpu_diffusion_gemma() {
 /// logits — the next denoise step re-overwrites the same KV rows) and a self-conditioning smoke
 /// test (feeding the first call's raw logits back in must differ from the no-SC call).
 #[test]
+#[ignore = "needs diffusiongemma-26B-A4B in the HF cache"]
 fn cpu_diffusion_gemma_denoise_step() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     let mut _tlk = test_serial_lock();
@@ -3826,6 +3843,7 @@ fn bitnet_b1_58_large() -> Option<PathBuf> {
 /// set the SubLN flag (`sub_norm`) and the NEOX row-permute (`permute_qk_neox`), and NOT enable any
 /// of the qk-norm / qkv-bias / gemma / moe / qwen35 gates. The FFN stays dense-gated (`moe` None).
 #[test]
+#[ignore = "needs bitnet_b1_58-large in the HF cache"]
 fn cpu_bitnet_config() {
     let path = need_model!(bitnet_b1_58_large(), "bitnet_b1_58-large");
     let g = infr_gguf::Gguf::open(&path).expect("open bitnet gguf");
@@ -3859,6 +3877,7 @@ fn cpu_bitnet_config() {
 /// is prepended (the GGUF sets `add_bos_token=true`; base-model completion needs it or the tiny 0.7B
 /// model degenerates). A real correctness gate on the two sub-norm placements + the NEOX permute.
 #[test]
+#[ignore = "needs bitnet_b1_58-large in the HF cache"]
 fn cpu_bitnet_prefill_paris() {
     let path = need_model!(bitnet_b1_58_large(), "bitnet_b1_58-large");
     let mut _tlk = test_serial_lock();
@@ -3947,6 +3966,7 @@ fn deepseek_v1_7b() -> Option<PathBuf> {
 /// Config-only: open the GGUF and assert every deepseek gate boolean, plus that
 /// other arches' gates are false. No model load needed.
 #[test]
+#[ignore = "needs DeepSeek-LLM-7B-Chat in the HF cache"]
 fn cpu_deepseek_config() {
     let path = need_model!(deepseek_v1_7b(), "DeepSeek-LLM-7B-Chat");
     let g = infr_gguf::Gguf::open(&path).expect("open GGUF");
@@ -3988,6 +4008,7 @@ fn cpu_deepseek_config() {
 /// Greedy top-1 token after "The capital of France is" — validates the full
 /// forward pass (attention + MoE + output) produces a non-empty response.
 #[test]
+#[ignore = "needs DeepSeek-LLM-7B-Chat in the HF cache"]
 fn cpu_deepseek_prefill_paris() {
     let path = need_model!(deepseek_v1_7b(), "DeepSeek-LLM-7B-Chat");
     let mut _tlk = test_serial_lock();
@@ -4022,6 +4043,7 @@ fn deepseek_v2_lite() -> Option<PathBuf> {
 /// Config-only: open the GGUF and assert every deepseek2 gate boolean, plus
 /// that other arches' gates are false. No model load needed.
 #[test]
+#[ignore = "needs DeepSeek-V2-Lite-Chat in the HF cache"]
 fn cpu_deepseek2_config() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
     let g = infr_gguf::Gguf::open(&path).expect("open GGUF");
@@ -4084,6 +4106,7 @@ fn cpu_deepseek2_config() {
 /// removed it prints `" Paris."` — llama.cpp's own greedy continuation of the
 /// same prompt at pin 030ebb5, token for token, EOS included.
 #[test]
+#[ignore = "needs DeepSeek-V2-Lite-Chat in the HF cache"]
 fn cpu_deepseek2_prefill_paris() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
     let mut _tlk = test_serial_lock();
@@ -4100,6 +4123,7 @@ fn cpu_deepseek2_prefill_paris() {
 /// qwen3moe precedent). Blessed from the coherent post-fix output — `INFR_BLESS=1` prints the
 /// text for a human coherence check before locking; the hash pins the exact generated stream.
 #[test]
+#[ignore = "needs DeepSeek-V2-Lite-Chat in the HF cache"]
 fn cpu_deepseek2_golden() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
     let mut _tlk = test_serial_lock();
@@ -4119,6 +4143,7 @@ fn cpu_deepseek2_golden() {
 /// Full CPU prefill on V2-Lite: all logits must be finite. Faster than a
 /// generation test and catches NaN/Inf in MLA attention or MoE routing.
 #[test]
+#[ignore = "needs DeepSeek-V2-Lite-Chat in the HF cache"]
 fn cpu_deepseek2_prefill_finite() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
     let mut _tlk = test_serial_lock();
@@ -4226,6 +4251,7 @@ fn deepseek_v32() -> Option<PathBuf> {
 /// gate, the router-bias normalisation and the 2.5 routed-weight scale are all V3-only, and until
 /// this file existed they were asserted only on a synthetic GGUF this repo wrote itself.
 #[test]
+#[ignore = "needs DeepSeek-V3.2 in the HF cache"]
 fn cpu_deepseek_v32_config() {
     let path = need_model!(deepseek_v32(), "DeepSeek-V3.2");
     let g = infr_gguf::Gguf::open(&path).expect("open GGUF");
@@ -4356,10 +4382,11 @@ fn read_llama_debug_dump(bin: &std::path::Path) -> (Vec<u32>, Vec<f32>) {
 /// token ids llama.cpp itself produced — the only check in this file that scores infr against
 /// another implementation instead of against its own past output.
 ///
-/// Self-skips unless BOTH `INFR_LLAMA_DUMP` (the `llamacpp-<model>.bin` from
-/// `llama-debug -m <gguf> -p <prompt> --save-logits`) and `INFR_LLAMA_DUMP_MODEL` (that same
-/// `<gguf>`) are set, so it is model-agnostic: it was exercised on Qwen3-0.6B, where the two
-/// engines agree to within f32 noise, before being pointed at DeepSeek-V3.2.
+/// Ignored by default, and self-skips even under `--include-ignored` unless BOTH
+/// `INFR_LLAMA_DUMP` (the `llamacpp-<model>.bin` from `llama-debug -m <gguf> -p <prompt>
+/// --save-logits`) and `INFR_LLAMA_DUMP_MODEL` (that same `<gguf>`) are set, so it is
+/// model-agnostic: it was exercised on Qwen3-0.6B, where the two engines agree to within f32
+/// noise, before being pointed at DeepSeek-V3.2.
 ///
 /// Scored on mutual top-5 containment plus a cosine over the SOFTMAX PROBABILITIES — not on token
 /// equality (a quantized near-tie flips the argmax), and above all not on the raw logits. The raw
@@ -4390,6 +4417,7 @@ fn read_llama_debug_dump(bin: &std::path::Path) -> (Vec<u32>, Vec<f32>) {
 /// can hold: it is the other engine's output, and it belongs in docs/deepseek.md next to the run
 /// that produced it.
 #[test]
+#[ignore = "needs INFR_LLAMA_DUMP and INFR_LLAMA_DUMP_MODEL (a llama.cpp logits dump and its GGUF)"]
 fn cpu_prefill_matches_llama_debug_dump() {
     prefill_matches_llama_debug_dump(false);
 }

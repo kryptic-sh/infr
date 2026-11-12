@@ -4,11 +4,21 @@
 //! `cargo test` and is the thing that proves the harness itself (synth → oracle → seam → score)
 //! before any GPU test relies on it.
 //!
-//! Why it is not redundant with the oracle it compares against: `infr-cpu`'s quant `Linear` does
-//! NOT call `dequant_block`. It quantizes the activation row to int8 and runs a per-format
-//! `vec_dot_*` kernel (`infr_cpu::kernels`) that decodes the weight bytes itself — an INDEPENDENT
-//! decoder from `infr_gguf::dequant`. So this sweep is a genuine two-implementation cross-check of
-//! all 24 weight formats, not a tautology.
+//! What it does and does not prove. `infr-cpu`'s production quant `Linear` does not call
+//! `dequant_block`: it quantizes the activation row to int8 and runs a per-format `vec_dot_*`
+//! kernel (`infr_cpu::kernels`) that walks the weight bytes itself. So the production sweeps check
+//! those kernels — their bit walking, their batched and single-row forms, their int8 dot — against
+//! the host decoder. They are NOT an independent check of the FORMAT: the kernels share
+//! `infr_gguf::dequant`'s helpers (the K-quant scale unpacking `k4`, the codebook tables), so a
+//! slip in a shared helper, or a misreading of the format both sides copied, moves the kernel and
+//! the oracle together and every sweep here stays green. The reference-mode sweep decodes through
+//! `dequant_block` itself and checks only the GEMV around it.
+//!
+//! Decoding against the FORMAT is pinned in `infr-gguf`'s `dequant_tests`: known-answer blocks
+//! for the legacy formats (`q4_0_single_block` … `q5_1_single_block`, `q8_0_known_answer`), the
+//! K-quants (`q2k_single_block`, `q3_k_known_answer_with_distinct_scales`, `q4_k_known_answer`,
+//! `q5_k_known_answer`, `q6_k_known_answer`) and the codebook formats (`iq*`, `tq*`, `mxfp4`,
+//! `nvfp4` `_single_block`), each scored against values transcribed from `ggml-quants.c`.
 //!
 //! Run: `cargo test -p infr-cpu --test decode_parity -- --nocapture`
 
@@ -57,7 +67,8 @@ fn reference_backend() -> infr_cpu::CpuBackend {
 const CPU_INT8_ACT_TOL: f32 = 2e-2;
 
 /// Every real GGUF weight quant (24) through a one-`Op::Linear` graph on `CpuBackend`, scored
-/// against `dequant_block` + a f64-accumulated reference GEMV.
+/// against `dequant_block` + a f64-accumulated reference GEMV: the production `vec_dot_*` kernels
+/// against the host decoder (see the module docs for what that cannot catch).
 #[test]
 fn cpu_linear_all_weight_quants_match_the_host_oracle() {
     let be = infr_cpu::CpuBackend::new();
@@ -77,11 +88,13 @@ fn cpu_linear_all_weight_quants_match_the_host_oracle_at_m1() {
     sweep_linear_on("cpu Linear m=1", &be, &cases, |_| CPU_INT8_ACT_TOL).assert_ok();
 }
 
-/// A backend with `kernels.cpu.reference` SET, on the SAME sweep: it decodes the weight to f32 and
-/// takes an f32 dot, so the int8-activation term above is gone entirely and only summation order is
-/// left. That is what makes it usable as the oracle a GPU-vs-CPU token comparison is scored against
-/// (`gpu_seam_matches_cpu_qwen3_q2k` failed for exactly this reason: the production CPU leg's ~4e-3
-/// moved a greedy token at Q2_K while the GPU sat at ~1e-7).
+/// A backend with `kernels.cpu.reference` SET, on the SAME sweep: it decodes the weight to f32
+/// through `dequant_block` — the very decoder the oracle uses — and takes an f32 dot, so the
+/// int8-activation term above is gone entirely and only summation order is left. What this pins is
+/// the reference GEMV and the mode selection, never the decode: a format bug in `dequant_block`
+/// lands on both sides and passes here. That is what makes it usable as the oracle a GPU-vs-CPU
+/// token comparison is scored against (`gpu_seam_matches_cpu_qwen3_q2k` failed for exactly this
+/// reason: the production CPU leg's ~4e-3 moved a greedy token at Q2_K while the GPU sat at ~1e-7).
 ///
 /// This is also the `kernels.cpu.reference` knob's behaviour test: the mode is selected purely by
 /// the `Config` handed to the backend, and the assertion is the numeric consequence of picking it.
@@ -89,7 +102,7 @@ fn cpu_linear_all_weight_quants_match_the_host_oracle_at_m1() {
 /// The `1e-5` bound is ~3 orders tighter than [`CPU_INT8_ACT_TOL`] — if reference mode ever silently
 /// falls back to an int8 kernel, this test fails while the production sweeps stay green.
 #[test]
-fn cpu_reference_mode_is_exact_for_every_weight_quant() {
+fn cpu_reference_gemv_matches_the_shared_decoder_for_every_weight_quant() {
     let be = reference_backend();
     for m in [1usize, 2] {
         let cases = weight_quant_cases(m, 256, 8);

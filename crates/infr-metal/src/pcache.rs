@@ -356,11 +356,26 @@ impl ArchiveCache {
         match std::fs::read(&out) {
             Ok(bytes) if !bytes.is_empty() => {
                 let names: Vec<String> = st.present.iter().cloned().collect();
-                // The seam owns the envelope, the checksum, and the atomic+durable rename.
-                let _ = self.disk.store(&pcache_blob::encode(&names, &bytes));
-                st.blob_bytes = bytes.len();
-                st.dirty = false;
-                st.last_save = Instant::now();
+                match pcache_blob::encode(&names, &bytes) {
+                    Some(payload) => {
+                        // The seam owns the envelope, the checksum, and the atomic+durable rename.
+                        let _ = self.disk.store(&payload);
+                        st.blob_bytes = bytes.len();
+                        st.dirty = false;
+                        st.last_save = Instant::now();
+                    }
+                    // A manifest past `pcache_blob`'s limits would be stored and then miss on
+                    // every launch; stop saving instead, and say why.
+                    None => {
+                        tracing::warn!(
+                            "[infr-metal] the pipeline archive's manifest ({} names) exceeds the \
+                             cache format's limits — this run keeps its pipelines, but the next \
+                             launch will compile them again.",
+                            names.len()
+                        );
+                        st.broken = true;
+                    }
+                }
             }
             // Metal said it wrote the archive and there is nothing there: do not store an empty
             // payload (which `pcache_blob::decode` would reject on the next launch anyway).

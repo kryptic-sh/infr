@@ -204,6 +204,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`infr compare` passes `--config` and `--set` to the runs it starts**, and a
   failing run reports its error; `infr multi` honours `INFR_CTX` and
   `[device] ctx`.
+- **Metal: out-of-bounds reads.** The flash attention kernels read whole blocks
+  of keys past the newest one with nothing guaranteeing those rows existed; the
+  two-row Q4_K / Q6_K kernels read a weight row past the end for an odd output
+  width; and the MoE router used an invalid expert index when no router logit
+  was finite. KV caches on Metal are now padded to the attention block, and a
+  kernel is chosen only when the rows it reads exist.
+- **Metal: ties.** `argmax` returns the lowest tied token id, and the Q4_0 /
+  Q5_0 KV cache picks its block scale the way the CPU does when two values tie
+  for largest.
 - **`infr serve`: `usage.prompt_tokens` counts the whole prompt.** It reported
   only the tokens prefilled for this request, so a KV prefix cache hit made a
   long prompt look short. `/metrics` still counts prefilled tokens only.

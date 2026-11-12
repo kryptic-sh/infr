@@ -422,8 +422,10 @@ ATTNSPLIT_CANVAS_KERNEL(attention_canvas32_f16kv, half, 32u, 128u)
 // choked occupancy on the 8 KB tiles. Scores and the output tile accumulate in f32; the online
 // softmax runs scalar in f32 on an 8x8 score tile per 8-position KV block, with the row-rescale
 // applied as a diagonal f32 MMA. P rounds to f16 (same trade as the half-fragment GEMM).
-// Tail KV blocks may read up to 7 rows past the causal limit — always inside the bound cache
-// buffer (sized for the full context) — and those columns are masked in the softmax.
+// KV loads come in 16-row blocks, so the last one reads up to 15 rows past the causal limit; those
+// columns are masked in the softmax (P = 0, but 0 x NaN is NaN, so the rows must exist and be
+// finite). The host only selects this kernel when the bound K/V buffers hold every row it reads
+// (`policy::flash_kv_reads_fit`).
 // A partial final query tile falls back to the serial per-query path.
 kernel void attnflash_f16kv(device const half*  q   [[buffer(0)]],
                             device const half*  k   [[buffer(1)]],
@@ -585,7 +587,7 @@ kernel void attnflash_f16kv(device const half*  q   [[buffer(0)]],
 // A partial final query tile zero-pads Q rows in shared memory and skips their output store
 // (the fallback serial path in attnflash_f16kv is not needed here). Score/O accumulation is f32;
 // P rounds through f32 shared and enters the V MMA as an f32 fragment against half V fragments.
-// Tail KV blocks read up to 7 rows past the causal limit (same in-buffer contract as above);
+// Tail KV blocks read up to 7 rows past the causal limit (same host-checked contract as above);
 // 8-row blocks entirely past it are skipped, so reads never go further.
 template<uint hd, uint NSG, uint C> // compile-time shape: fully unrolled, exact shared sizing
 kernel void attnflash2_f16kv_t(device const half*  q   [[buffer(0)]],

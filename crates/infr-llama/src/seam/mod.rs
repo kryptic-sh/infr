@@ -1216,18 +1216,26 @@ pub(crate) fn mla_kv_fmt(
 ///
 /// A live slot passes the height its rings were sized with (`SeamKv::ubatch`); placement passes
 /// [`ubatch_rows`] or the candidate height it is pricing.
+///
+/// `row_align` is the backend's `Backend::kv_row_align`: the capacity is rounded up to it, so a
+/// backend whose attention reads whole KV blocks finds every row it reads allocated. The extra
+/// rows are capacity only (the session's context stays `want_ctx`). Pre-load estimates, which have
+/// no backend yet, pass `1`: [`KV_SLOP_ROWS`] covers the padding in the fit estimate, and the
+/// floor stays a floor without it.
 pub(crate) fn kv_rows_at(
     cfg: &Config,
     l: usize,
     want_ctx: usize,
     ring: bool,
     ubatch: usize,
+    row_align: usize,
 ) -> usize {
-    if ring && cfg.is_swa_layer(l) {
+    let rows = if ring && cfg.is_swa_layer(l) {
         want_ctx.min((cfg.swa_window + ubatch).next_multiple_of(64))
     } else {
         want_ctx
-    }
+    };
+    rows.next_multiple_of(row_align)
 }
 
 /// KV-cache footprint ESTIMATE summed over all layers at chunk height `ubatch` and side format:
@@ -1269,7 +1277,7 @@ pub(crate) fn kv_bytes_estimate_fmt(
 ) -> u64 {
     (0..cfg.n_layer)
         .map(|l| {
-            let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch) + KV_SLOP_ROWS;
+            let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch, 1) + KV_SLOP_ROWS;
             // Per-side widths, NOT one shared width: MLA's K row is `kv_lora_rank + qk_rope_dim`
             // and it has no V side (see `kv_row_elems`).
             let (k_row, v_row) = kv_row_elems(cfg, l);
@@ -1707,6 +1715,7 @@ pub(crate) fn kv_layer_alloc_bytes(
     want_ctx: usize,
     ring: bool,
     ubatch: usize,
+    row_align: usize,
     k_fmt: DType,
     v_fmt: DType,
 ) -> (usize, usize) {
@@ -1723,7 +1732,7 @@ pub(crate) fn kv_layer_alloc_bytes(
     let (k_row, v_row) = kv_row_elems(cfg, l);
     // SWA ring: window layers hold only `window + ubatch` rows (the ring recycles rows the window
     // mask already excludes — `kv_rows_at` has the argument).
-    let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch);
+    let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch, row_align);
     // The indexer cache MUST hold the whole context: `Op::LightningIndexer` masks causally only, so
     // position 0 stays eligible for every query row and a ring that had wrapped would have
     // overwritten it — every backend refuses `cap_rows < kv_len` rather than score a row holding
@@ -1769,7 +1778,7 @@ pub(crate) fn kv_floor_alloc_bytes(
         .min()
         .expect("ubatch_candidates is never empty");
     let one: Vec<(usize, usize)> = (0..cfg.n_layer)
-        .map(|l| kv_layer_alloc_bytes(cfg, l, want_ctx, ring, ubatch, k_fmt, v_fmt))
+        .map(|l| kv_layer_alloc_bytes(cfg, l, want_ctx, ring, ubatch, 1, k_fmt, v_fmt))
         .collect();
     std::iter::repeat_n(one, n_slots.max(1)).flatten().collect()
 }
@@ -4854,6 +4863,52 @@ mod seam_helper_tests {
         call(&sizes, Some(1), &unguarded).expect("INFR_NO_VRAM_GUARD must not refuse");
     }
 
+    /// A backend's KV row alignment pads every layer's capacity up to it — the global layers and
+    /// the SWA rings alike — and an alignment of 1 (CPU, Vulkan) leaves every size as it was. The
+    /// padding stays inside the fit estimate's per-layer slop.
+    #[test]
+    fn kv_row_align_pads_capacity_and_one_changes_nothing() {
+        let cfg = gemma3_12b();
+        for want in [1usize, 17, 100, 4097] {
+            for ring in [false, true] {
+                for l in 0..cfg.n_layer {
+                    let plain = super::kv_rows_at(&cfg, l, want, ring, 512, 1);
+                    let padded = super::kv_rows_at(&cfg, l, want, ring, 512, 16);
+                    assert_eq!(padded, plain.next_multiple_of(16), "layer {l}, ctx {want}");
+                    assert!(
+                        padded - plain <= super::KV_SLOP_ROWS,
+                        "padding exceeds the slop"
+                    );
+                    assert_eq!(
+                        super::kv_layer_alloc_bytes(
+                            &cfg,
+                            l,
+                            want,
+                            ring,
+                            512,
+                            1,
+                            DType::F16,
+                            DType::F16
+                        ),
+                        (
+                            super::kv_side_bytes(
+                                DType::F16,
+                                plain * super::kv_row_elems(&cfg, l).0
+                            ),
+                            super::kv_side_bytes(
+                                DType::F16,
+                                plain * super::kv_row_elems(&cfg, l).1
+                            ),
+                        ),
+                        "align 1 must allocate exactly the unpadded rows"
+                    );
+                }
+            }
+        }
+        // A one-shot context of prompt + reply + 1 that ends inside a block gets the block's rows.
+        assert_eq!(super::kv_rows_at(&cfg, 0, 101, false, 512, 16), 112);
+    }
+
     /// The pre-load floor must never price more than any cache the runner can still settle on —
     /// that is what lets the refuse rung read it before a weight is loaded.
     #[test]
@@ -4866,7 +4921,7 @@ mod seam_helper_tests {
         let exact = |ring: bool, ub: usize, dt: DType| {
             total(
                 (0..cfg.n_layer)
-                    .map(|l| super::kv_layer_alloc_bytes(&cfg, l, want, ring, ub, dt, dt))
+                    .map(|l| super::kv_layer_alloc_bytes(&cfg, l, want, ring, ub, 1, dt, dt))
                     .collect(),
             )
         };

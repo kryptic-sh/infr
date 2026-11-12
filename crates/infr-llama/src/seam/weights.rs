@@ -604,7 +604,14 @@ impl SeamKv {
             // included), and SWA layers ring at window+ubatch rows when this session was
             // ring-sized (see `crate::seam::kv_rows_at`).
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            let rows_l = crate::seam::kv_rows_at(cfg, l, self.max_ctx, self.kv_ring, self.ubatch);
+            let rows_l = crate::seam::kv_rows_at(
+                cfg,
+                l,
+                self.max_ctx,
+                self.kv_ring,
+                self.ubatch,
+                be.kv_row_align(),
+            );
             kbufs.push(
                 be.alloc(
                     crate::seam::kv_side_bytes(self.k_fmt, rows_l * k_row),
@@ -720,7 +727,16 @@ impl SeamKv {
         if self.kv_ring {
             let wrapped = (0..cfg.n_layer)
                 .filter(|&l| cfg.is_swa_layer(l))
-                .map(|l| crate::seam::kv_rows_at(cfg, l, self.max_ctx, true, self.ubatch))
+                .map(|l| {
+                    crate::seam::kv_rows_at(
+                        cfg,
+                        l,
+                        self.max_ctx,
+                        true,
+                        self.ubatch,
+                        be.kv_row_align(),
+                    )
+                })
                 .any(|rows_l| src.written_end > rows_l);
             if wrapped {
                 return Ok(());
@@ -733,7 +749,14 @@ impl SeamKv {
             // The backend owns its cache layout (Vulkan's Q8_0 is planar — its scales do not sit
             // in a byte prefix), so it does the copy; `rows_l * row` is the side's capacity.
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            let rows_l = crate::seam::kv_rows_at(cfg, l, self.max_ctx, self.kv_ring, self.ubatch);
+            let rows_l = crate::seam::kv_rows_at(
+                cfg,
+                l,
+                self.max_ctx,
+                self.kv_ring,
+                self.ubatch,
+                be.kv_row_align(),
+            );
             be.copy_kv_prefix(
                 src.kbufs[l].as_ref(),
                 self.kbufs[l].as_ref(),

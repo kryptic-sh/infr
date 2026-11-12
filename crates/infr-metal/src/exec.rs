@@ -439,56 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn attention_flash128_policy_is_exact() {
-        assert_eq!(
-            select_attention_flash2_kern(
-                true,
-                4,
-                16,
-                4096,
-                128,
-                || true,
-                || Some("attnflash2_f16kv_hd128"),
-            ),
-            Some("attnflash2_c128_f16kv_hd128"),
-        );
-        assert_eq!(
-            select_attention_flash2_kern(
-                true,
-                4,
-                16,
-                4096,
-                128,
-                || false,
-                || Some("attnflash2_f16kv_hd128"),
-            ),
-            Some("attnflash2_f16kv_hd128"),
-        );
-        assert_eq!(
-            select_attention_flash2_kern(true, 4, 16, 4096, 128, || false, || None),
-            None,
-        );
-
-        let mut probed = false;
-        assert_eq!(
-            select_attention_flash2_kern(
-                true,
-                8,
-                16,
-                4096,
-                128,
-                || {
-                    probed = true;
-                    true
-                },
-                || Some("attnflash2_f16kv_hd128"),
-            ),
-            Some("attnflash2_f16kv_hd128"),
-        );
-        assert!(!probed, "non-four-row shapes must not build the C128 PSO");
-    }
-
-    #[test]
     fn q5k_row_tile_policy_is_limited_to_four_rows() {
         for m in [1usize, 2, 3, 5] {
             assert!(!prefer_q5k_rt("linear_q5k", m, true));
@@ -505,17 +455,6 @@ mod tests {
             Some("linear_q5k_cmm"),
         );
         assert_eq!(counter_linear_label(false, "linear_q5k_cmm"), None);
-    }
-
-    #[test]
-    fn attention_flash_policy_reuses_kv_at_four_rows() {
-        assert!(prefer_attention_flash(true, 4, 16, 4096, 128, true));
-        assert!(!prefer_attention_flash(true, 3, 16, 4096, 128, true));
-        assert!(!prefer_attention_flash(true, 1, 64, 4096, 128, true));
-        assert!(!prefer_attention_flash(true, 4, 16, 63, 128, true));
-        assert!(!prefer_attention_flash(false, 4, 16, 4096, 128, true));
-        assert!(!prefer_attention_flash(true, 4, 16, 4096, 128, false));
-        assert!(!prefer_attention_flash(true, 4, 16, 4096, 256, false));
     }
 
     /// The smallest graph `replay_shape` admits: a `QkNormRope` and a one-row f16 attention. Every
@@ -562,17 +501,22 @@ mod tests {
         g
     }
 
-    /// Append a single-row Q4_K `MoeFfn` the device arm runs, unless `fused_gate_up` or
-    /// `down_scale` send it to the host.
-    fn push_moe(g: &mut Graph, fused_gate_up: bool, down_scale: bool) {
+    /// Append a single-row Q4_K `MoeFfn` the device arm runs, unless `fused_gate_up`,
+    /// `down_scale` or a separate router input (`own_router_x`) send it to the host.
+    fn push_moe(g: &mut Graph, fused_gate_up: bool, down_scale: bool, own_router_x: bool) {
         let x = g.internal(TensorDesc::new(vec![1, 256], DType::F32));
+        let router_x = if own_router_x {
+            g.internal(TensorDesc::new(vec![1, 256], DType::F32))
+        } else {
+            x
+        };
         let router = g.weight(TensorDesc::new(vec![2, 256], DType::F32));
         let exps = g.weight(TensorDesc::new(vec![2, 256, 256], DType::Q4K));
         let scale = g.weight(TensorDesc::new(vec![2], DType::F32));
         let dst = g.internal(TensorDesc::new(vec![1, 256], DType::F32));
         g.push(Op::MoeFfn {
             x,
-            router_x: x,
+            router_x,
             router,
             gate_exps: exps,
             up_exps: exps,
@@ -613,7 +557,7 @@ mod tests {
             "the base graph replays"
         );
         let mut g = replay_base_graph();
-        push_moe(&mut g, false, false);
+        push_moe(&mut g, false, false, false);
         assert!(replay_shape(&g, &b, m), "a device-path MoE replays");
 
         let mut g = replay_base_graph();
@@ -630,12 +574,17 @@ mod tests {
         });
         assert!(!replay_shape(&g, &b, m), "RmsNormAdd runs on the host");
 
-        for (fused, scaled) in [(true, false), (false, true)] {
+        for (fused, scaled, own_router_x) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
             let mut g = replay_base_graph();
-            push_moe(&mut g, fused, scaled);
+            push_moe(&mut g, fused, scaled, own_router_x);
             assert!(
                 !replay_shape(&g, &b, m),
-                "MoeFfn fused_gate_up={fused} down_scale={scaled} runs on the host"
+                "MoeFfn fused_gate_up={fused} down_scale={scaled} router_x!=x={own_router_x} \
+                 runs on the host"
             );
         }
 
@@ -1318,38 +1267,6 @@ fn prefer_conv1d_parallel(rows: usize, kernel: usize) -> bool {
     rows >= kernel.saturating_sub(1).max(2)
 }
 
-fn prefer_attention_flash(
-    f16: bool,
-    rows: usize,
-    n_head: usize,
-    kv_len: usize,
-    head_dim: usize,
-    flash2_ok: bool,
-) -> bool {
-    let launch_wide = rows * n_head >= 128;
-    let launch_four = rows == 4 && rows * n_head >= 64 && flash2_ok;
-    f16 && (launch_wide || launch_four)
-        && kv_len >= 64
-        && head_dim.is_multiple_of(8)
-        && (head_dim <= 128 || flash2_ok)
-}
-
-fn select_attention_flash2_kern(
-    f16: bool,
-    rows: usize,
-    n_head: usize,
-    kv_len: usize,
-    head_dim: usize,
-    c128_pipeline_ok: impl FnOnce() -> bool,
-    standard_pipeline: impl FnOnce() -> Option<&'static str>,
-) -> Option<&'static str> {
-    if f16 && rows == 4 && n_head >= 16 && kv_len >= 64 && head_dim == 128 && c128_pipeline_ok() {
-        Some("attnflash2_c128_f16kv_hd128")
-    } else {
-        standard_pipeline()
-    }
-}
-
 fn counter_linear_label(enabled: bool, kern: &'static str) -> Option<&'static str> {
     enabled.then_some(kern)
 }
@@ -1382,9 +1299,12 @@ fn moe_expert_kerns(dt: DType) -> Option<(&'static str, &'static str)> {
 /// admitted for replay. The device path assumes SEPARATE full-width gate/up expert banks and no
 /// per-expert down scale (qwen3moe's shape); diffusion-gemma's fused `gate_up_exps` +
 /// `ffn_down_exps.scale` always falls to the host path instead of teaching the device kernels a
-/// layout they don't expect.
+/// layout they don't expect. The device router GEMV reads `x`, so a router fed from a different
+/// activation (`router_x != x`) takes the host path too.
 fn moe_ffn_on_device(op: &Op, g: &infr_core::graph::Graph, m: &MetalCfg) -> bool {
     let Op::MoeFfn {
+        x,
+        router_x,
         gate_exps,
         up_exps,
         down_exps,
@@ -1399,6 +1319,7 @@ fn moe_ffn_on_device(op: &Op, g: &infr_core::graph::Graph, m: &MetalCfg) -> bool
         return false;
     };
     n_used <= 16
+        && router_x == x
         && ne % 256 == 0
         && n_ff_exp % 256 == 0
         && !fused_gate_up
@@ -4425,18 +4346,24 @@ impl MetalBackend {
                 let ne = kv_len * nkv * hd;
                 // f16 dequant scratch, pooled per tag rather than freshly allocated per layer per
                 // token (one buffer serves every layer and, grown as `kv_len` does, every depth;
-                // the dequant fully overwrites `ne` elements, so zero-init is irrelevant). Distinct
-                // K/V tags so both sides stay live simultaneously. This static-decode path never
-                // tapes, and the serial walk's automatic hazard tracking serializes reuse.
+                // the dequant overwrites `ne` elements). Distinct K/V tags so both sides stay live
+                // simultaneously. This static-decode path never tapes, and the serial walk's
+                // automatic hazard tracking serializes reuse. Padded like the cache itself
+                // (`policy::KV_ROW_ALIGN`), so a prefill over the scratch keeps the flash path;
+                // the tail rows are zero or an earlier dequant, so finite.
+                let scratch_rows = kv_len
+                    .max(pos as usize + rows)
+                    .next_multiple_of(policy::KV_ROW_ALIGN);
+                let scratch_n = (scratch_rows * nkv * hd * 2).max(4).div_ceil(4);
                 let ks: Option<Arc<MtlBuffer>> = if prep(kdt) {
-                    let s = self.scratch_buf((ne * 2).max(4).div_ceil(4), 18)?;
+                    let s = self.scratch_buf(scratch_n, 18)?;
                     self.dequant_kv_f16(r, kdt, &kbuf.raw, &s, ne)?;
                     Some(s)
                 } else {
                     None
                 };
                 let vs: Option<Arc<MtlBuffer>> = if prep(vdt) {
-                    let s = self.scratch_buf((ne * 2).max(4).div_ceil(4), 19)?;
+                    let s = self.scratch_buf(scratch_n, 19)?;
                     self.dequant_kv_f16(r, vdt, &vbuf.raw, &s, ne)?;
                     Some(s)
                 } else {
@@ -4645,33 +4572,23 @@ impl MetalBackend {
                     256 => Some("attnflash2_f16kv_hd256"),
                     _ => None,
                 };
-                let flash2_kern = select_attention_flash2_kern(
-                    f16,
-                    rows,
-                    nh,
-                    kv_len,
-                    hd,
-                    || {
-                        self.pipelines
-                            .get("attnflash2_c128_f16kv_hd128")
-                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
-                            .unwrap_or(false)
-                    },
-                    || {
-                        standard_flash2_kern.filter(|kn| {
-                            self.pipelines
-                                .get(kn)
-                                .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
-                                .unwrap_or(false)
-                        })
-                    },
-                );
-                let flash2_ok = flash2_kern.is_some();
-                // hd > 128 has no single-simdgroup flash fallback (its register accumulator
-                // tops out at 128), so the wide gate only opens there when flash2 itself can run.
-                let flash = prefer_attention_flash(f16, rows, nh, kv_len, hd, flash2_ok);
-                let split = !flash && (rows * nh < 128 || kv_len >= 128);
-                let flash2 = flash && flash2_ok;
+                // The vector flash kernel (llama.cpp flash_attn_ext_vec structure) covers the
+                // long-context decode shape split32 serves, at 32 KV positions per simdgroup
+                // step instead of 1 — same head-size instantiations and cap gating as flash2.
+                let vec_kern = match hd {
+                    64 => Some("attnvec_f16kv_hd64"),
+                    128 => Some("attnvec_f16kv_hd128"),
+                    256 => Some("attnvec_f16kv_hd256"),
+                    _ => None,
+                };
+                // hd=256 instantiates at NSG=16 (threadgroup budget) — 512 threads.
+                let vec_nsg: usize = if hd == 256 { 16 } else { 32 };
+                let pipe_ok = |name: &'static str, threads: u64| {
+                    self.pipelines
+                        .get(name)
+                        .map(|pl| pl.max_total_threads_per_threadgroup() >= threads)
+                        .unwrap_or(false)
+                };
                 // The split kernels REQUIRE their full NSG*32-thread threadgroup: every simdgroup
                 // owns a strided KV slice, so a smaller launch would silently skip positions and
                 // merge uninitialized partials. maxTotalThreadsPerThreadgroup is per-PIPELINE
@@ -4685,60 +4602,61 @@ impl MetalBackend {
                         .max_total_threads_per_threadgroup()
                         >= threads)
                 };
-                // The vector flash kernel (llama.cpp flash_attn_ext_vec structure) covers the
-                // long-context decode shape split32 serves, at 32 KV positions per simdgroup
-                // step instead of 1 — same head-size instantiations and cap gating as flash2.
-                let vec_kern = match hd {
-                    64 => Some("attnvec_f16kv_hd64"),
-                    128 => Some("attnvec_f16kv_hd128"),
-                    256 => Some("attnvec_f16kv_hd256"),
-                    _ => None,
+                // The flash kernels load whole KV blocks, reading past the newest key to the next
+                // block boundary, so the rows the bound buffers (the cache, or the dequant scratch
+                // above) hold decide whether they may run; see `policy::select_attention`.
+                let shape = policy::AttnShape {
+                    f16,
+                    rows,
+                    n_head: nh,
+                    kv_len,
+                    head_dim: hd,
+                    pos: pos as usize,
+                    kv_cap_rows: (k_raw.length().min(v_raw.length()) / (nkv * hd * 2) as u64)
+                        as usize,
                 };
-                // hd=256 instantiates at NSG=16 (threadgroup budget) — 512 threads.
-                let vec_nsg: usize = if hd == 256 { 16 } else { 32 };
-                let vec = !flash
-                    && f16
-                    && split
-                    && kv_len >= 128
-                    && vec_kern.is_some_and(|kn| {
-                        self.pipelines
-                            .get(kn)
-                            .map(|pl| pl.max_total_threads_per_threadgroup() >= vec_nsg as u64 * 32)
-                            .unwrap_or(false)
-                    });
-                let split32 = split
-                    && !vec
-                    && kv_len >= 128
-                    && hd <= 128
-                    && fits(
-                        if f16 {
-                            "attnsplit32_f16kv"
-                        } else {
-                            "attnsplit32_f32"
-                        },
-                        1024,
-                    )?;
-                let split = split
-                    && (vec
-                        || split32
-                        || fits(
+                let choice = policy::select_attention(&shape, |pipe| -> Result<bool> {
+                    use policy::AttnPipe as P;
+                    Ok(match pipe {
+                        P::Flash2C128 => pipe_ok("attnflash2_c128_f16kv_hd128", 128),
+                        P::Flash2 => standard_flash2_kern.is_some_and(|kn| pipe_ok(kn, 128)),
+                        P::Vec => vec_kern.is_some_and(|kn| pipe_ok(kn, vec_nsg as u64 * 32)),
+                        P::Split32 => fits(
+                            if f16 {
+                                "attnsplit32_f16kv"
+                            } else {
+                                "attnsplit32_f32"
+                            },
+                            1024,
+                        )?,
+                        P::Split => fits(
                             if f16 {
                                 "attnsplit_f16kv"
                             } else {
                                 "attnsplit_f32"
                             },
                             256,
-                        )?);
-                let kern = match (flash, f16, split, split32) {
-                    (true, ..) if flash2 => flash2_kern.unwrap(),
-                    (true, ..) => "attnflash_f16kv",
-                    (_, true, true, _) if vec => vec_kern.unwrap(),
-                    (_, true, false, _) => "attention_f16kv",
-                    (_, true, _, true) => "attnsplit32_f16kv",
-                    (_, true, true, false) => "attnsplit_f16kv",
-                    (_, false, false, _) => "attention_f32",
-                    (_, false, _, true) => "attnsplit32_f32",
-                    (_, false, true, false) => "attnsplit_f32",
+                        )?,
+                    })
+                })?;
+                use policy::AttnKernel as K;
+                let flash = matches!(choice, K::Flash2C128 | K::Flash2 | K::Flash);
+                let flash2 = matches!(choice, K::Flash2C128 | K::Flash2);
+                let vec = choice == K::Vec;
+                let split32 = choice == K::Split32;
+                let split = choice == K::Split;
+                let kern = match (choice, f16) {
+                    (K::Flash2C128, _) => "attnflash2_c128_f16kv_hd128",
+                    // The selection only names these where the head size has an instantiation.
+                    (K::Flash2, _) => standard_flash2_kern.unwrap(),
+                    (K::Flash, _) => "attnflash_f16kv",
+                    (K::Vec, _) => vec_kern.unwrap(),
+                    (K::Split32, true) => "attnsplit32_f16kv",
+                    (K::Split, true) => "attnsplit_f16kv",
+                    (K::Plain, true) => "attention_f16kv",
+                    (K::Split32, false) => "attnsplit32_f32",
+                    (K::Split, false) => "attnsplit_f32",
+                    (K::Plain, false) => "attention_f32",
                 };
                 let pso = self.pipelines.get(kern)?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();

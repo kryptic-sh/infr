@@ -504,6 +504,13 @@ impl Backend for MetalBackend {
     fn sync(&self) -> Result<()> {
         Ok(())
     }
+
+    /// The f16 flash prefill kernels read whole KV blocks; a cache padded to their block holds
+    /// every row they read, so the read-fit gate in the attention arm admits them for an ordinary
+    /// prefill (see `policy::KV_ROW_ALIGN`).
+    fn kv_row_align(&self) -> usize {
+        policy::KV_ROW_ALIGN
+    }
 }
 
 /// A new shared-storage buffer of `len` bytes, or an error naming the size.

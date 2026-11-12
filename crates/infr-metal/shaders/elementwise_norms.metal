@@ -265,9 +265,11 @@ kernel void gated_rmsnorm_f32(device const float* x    [[buffer(0)]],
 }
 
 // Greedy argmax over `n` logits → token id (one 256-thread threadgroup, strided scan +
-// threadgroup tree-reduce). Strict > keeps the lowest index on ties, matching the host argmax
-// (same contract as the Vulkan argmax.comp). The id is written as a u32 bit-pattern into the
-// f32 output slot — greedy decode reads back 4 bytes instead of the [vocab] logits.
+// threadgroup tree-reduce). Strict > keeps each lane's lowest index on ties and the reduce
+// prefers the lower index on equal values, so the result is the lowest tied index, matching the
+// host argmax, the split stages below and the Vulkan argmax.comp. The id is written as a u32
+// bit-pattern into the f32 output slot — greedy decode reads back 4 bytes instead of the [vocab]
+// logits.
 struct ArgmaxParams { uint n; };
 kernel void argmax_f32(device const float* logits [[buffer(0)]],
                        device uint*        out_id [[buffer(1)]],
@@ -284,9 +286,13 @@ kernel void argmax_f32(device const float* logits [[buffer(0)]],
     sidx[t] = bi;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = 128u; s > 0u; s /= 2u) {
-        if (t < s && sval[t + s] > sval[t]) {
-            sval[t] = sval[t + s];
-            sidx[t] = sidx[t + s];
+        if (t < s) {
+            float v = sval[t + s];
+            uint i = sidx[t + s];
+            if (v > sval[t] || (v == sval[t] && i < sidx[t])) {
+                sval[t] = v;
+                sidx[t] = i;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }

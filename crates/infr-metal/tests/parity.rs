@@ -1912,36 +1912,42 @@ fn linear_q6k_matches_dequant_reference() {
     check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 27), m, in_f, out_f);
 }
 
-// m = 2..8 K-quants route to the MULTI-ROW mul_mv GEMV (weight registers reused across 4
-// token rows); m=5 exercises the partial token block, out_f=94 the partial row pair.
+// m = 2..8 K-quants route to the token-parallel multi-row GEMV (`linear_q4k_mrv` /
+// `linear_q6k_mrv`: one simdgroup per (row pair, token) running the single-row mul_mv body, so
+// the m tokens sharing a row pair read its weight blocks together). An odd out_f leaves the last
+// row pair with one live row, whose body re-reads that row rather than the one past the bank end.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_q4k_multirow_matches_dequant_reference() {
-    let (m, in_f, out_f) = (5usize, 512usize, 94usize);
-    check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 110), m, in_f, out_f);
+    for (m, in_f, out_f) in [(5usize, 512usize, 94usize), (5, 512, 95)] {
+        check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 110), m, in_f, out_f);
+    }
 }
 
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_q6k_multirow_matches_dequant_reference() {
-    let (m, in_f, out_f) = (3usize, 512usize, 96usize);
-    check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 111), m, in_f, out_f);
+    for (m, in_f, out_f) in [(3usize, 512usize, 96usize), (3, 512, 95)] {
+        check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 111), m, in_f, out_f);
+    }
 }
 
 // m=1 routes to the GEMV kernels — decode's path, distinct from the m=2 row-tiled and m>=16 GEMM
-// routes the tests above/below take.
+// routes the tests above/below take. The odd out_f covers the one-live-row tail pair.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_q4k_gemv_matches_dequant_reference() {
-    let (m, in_f, out_f) = (1usize, 256usize, 96usize);
-    check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 30), m, in_f, out_f);
+    for (m, in_f, out_f) in [(1usize, 256usize, 96usize), (1, 256, 95)] {
+        check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 30), m, in_f, out_f);
+    }
 }
 
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_q6k_gemv_matches_dequant_reference() {
-    let (m, in_f, out_f) = (1usize, 256usize, 96usize);
-    check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 31), m, in_f, out_f);
+    for (m, in_f, out_f) in [(1usize, 256usize, 96usize), (1, 256, 95)] {
+        check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 31), m, in_f, out_f);
+    }
 }
 
 // m >= 16 routes to the simdgroup_matrix GEMM kernels (`linear_quik*_mm`); m=18 also covers the
@@ -2552,37 +2558,46 @@ fn attention_q8_vec_hd256_parity() {
 /// already lost the Q8_0 arm).
 use infr_core::budget::kv_fmt_bytes as kv_bytes;
 
+/// Heads in the quant-KV attention cases: `KVQ_NKV` KV heads, each shared by a group of query heads.
+const KVQ_NH: usize = 8;
+const KVQ_NKV: usize = 2;
+
+/// A quant-KV attention graph over `q` (`[rows, KVQ_NH, hd]`) and `k`/`v` (`[cache_rows, KVQ_NKV,
+/// hd]` f32, quantized into the caches by `WriteKv`), attending the first `kv_len` cache rows.
+/// Returns the graph, its bound inputs and the output id.
 #[allow(clippy::too_many_arguments)]
-fn kvquant_attention_test(
+fn kvquant_attention_graph(
     kdt: DType,
     vdt: DType,
     rows: usize,
+    cache_rows: usize,
     kv_len: usize,
     hd: usize,
     pos: usize,
-    tol: f32,
-    seed: u64,
-) {
-    let (nh, nkv) = (8usize, 2usize);
+    q_data: &[f32],
+    k_data: &[f32],
+    v_data: &[f32],
+) -> (Graph, Vec<(TensorId, Vec<u8>)>, TensorId) {
+    let (nh, nkv) = (KVQ_NH, KVQ_NKV);
     let mut g = Graph::new();
     let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
-    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], kdt));
-    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], vdt));
-    let ksrc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
-    let vsrc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], kdt));
+    let vc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], vdt));
+    let ksrc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], DType::F32));
+    let vsrc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], DType::F32));
     let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
     let row = (nkv * hd) as u32;
     g.push(Op::WriteKv {
         src: ksrc,
         cache: kc,
-        rows: kv_len as u32,
+        rows: cache_rows as u32,
         row_stride: row,
         pos: 0,
     });
     g.push(Op::WriteKv {
         src: vsrc,
         cache: vc,
-        rows: kv_len as u32,
+        rows: cache_rows as u32,
         row_stride: row,
         pos: 0,
     });
@@ -2602,15 +2617,93 @@ fn kvquant_attention_test(
         sinks: None,
         key_bias: None,
     });
-    let nkv_elems = kv_len * nkv * hd;
+    let nkv_elems = cache_rows * nkv * hd;
     let bound = vec![
-        (q, f32_bytes(&rand_f32(rows * nh * hd, seed))),
+        (q, f32_bytes(q_data)),
         (kc, vec![0u8; kv_bytes(kdt, nkv_elems)]),
         (vc, vec![0u8; kv_bytes(vdt, nkv_elems)]),
-        (ksrc, f32_bytes(&rand_f32(nkv_elems, seed + 1))),
-        (vsrc, f32_bytes(&rand_f32(nkv_elems, seed + 2))),
+        (ksrc, f32_bytes(k_data)),
+        (vsrc, f32_bytes(v_data)),
     ];
-    assert_parity(&g, &bound, dst, rows * nh * hd, tol);
+    (g, bound, dst)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kvquant_attention_test(
+    kdt: DType,
+    vdt: DType,
+    rows: usize,
+    kv_len: usize,
+    hd: usize,
+    pos: usize,
+    tol: f32,
+    seed: u64,
+) {
+    let nkv_elems = kv_len * KVQ_NKV * hd;
+    let (g, bound, dst) = kvquant_attention_graph(
+        kdt,
+        vdt,
+        rows,
+        kv_len,
+        kv_len,
+        hd,
+        pos,
+        &rand_f32(rows * KVQ_NH * hd, seed),
+        &rand_f32(nkv_elems, seed + 1),
+        &rand_f32(nkv_elems, seed + 2),
+    );
+    assert_parity(&g, &bound, dst, rows * KVQ_NH * hd, tol);
+}
+
+/// V magnitude of the dominant newest key in [`kvquant_newest_key_is_attended`]; every other V
+/// lies in `rand_f32`'s [-1, 1].
+const DOMINANT_V: f32 = 4.0;
+
+/// Mask check for the rows == 1 decode shape that the parity cases above cannot make: at kv_len 200
+/// their output is a ~0.04 average over 200 random V rows, so one key more or less moves it by
+/// about 0.01, inside their quantization tolerances. Here the newest key (row `kv_len - 1`) is
+/// built to take almost all the softmax weight (K = a multiple of the shared query, V = random
+/// signs times `DOMINANT_V`, spread so the WHT-rotated turbo formats store it as well as any row),
+/// and the same cache is attended at `kv_len` and at `kv_len - 1`. Correct masking puts the first
+/// output near ±`DOMINANT_V` and the second inside [-1, 1], so their mean absolute difference is
+/// around `DOMINANT_V`. A kernel that drops the newest key leaves both near the random average,
+/// and one that reads a key past the newest puts the dominant key into both; either way that mean
+/// falls to about the 0.01 one ordinary key moves it, far below the `DOMINANT_V / 4` asserted,
+/// which leaves room for any quantization error without a measured tolerance.
+fn kvquant_newest_key_is_attended(kdt: DType, vdt: DType, kv_len: usize, hd: usize, seed: u64) {
+    let (nh, nkv) = (KVQ_NH, KVQ_NKV);
+    let u = rand_f32(hd, seed);
+    let q: Vec<f32> = u.iter().copied().cycle().take(nh * hd).collect();
+    let mut k = rand_f32(kv_len * nkv * hd, seed + 1);
+    let mut v = rand_f32(kv_len * nkv * hd, seed + 2);
+    let signs = rand_f32(hd, seed + 3);
+    let last = (kv_len - 1) * nkv * hd;
+    for h in 0..nkv {
+        for d in 0..hd {
+            k[last + h * hd + d] = 4.0 * u[d];
+            v[last + h * hd + d] = DOMINANT_V.copysign(signs[d]);
+        }
+    }
+    let be = MetalBackend::new().expect("metal backend");
+    let attend = |len: usize| {
+        let (g, bound, dst) =
+            kvquant_attention_graph(kdt, vdt, 1, kv_len, len, hd, len - 1, &q, &k, &v);
+        run(&be, &g, &bound, dst, nh * hd)
+    };
+    let full = attend(kv_len);
+    let short = attend(kv_len - 1);
+    let mean_diff = full
+        .iter()
+        .zip(&short)
+        .map(|(f, s)| (f - s).abs())
+        .sum::<f32>()
+        / full.len() as f32;
+    assert!(
+        mean_diff > DOMINANT_V / 4.0,
+        "{kdt:?}/{vdt:?}: attending kv_len {kv_len} vs {} moved the output by {mean_diff} on \
+         average — the newest key is not attended exactly once",
+        kv_len - 1
+    );
 }
 
 // Block quants, decoupled (K=f16 native, V=quant prepassed) at the rows==1 vector-flash decode
@@ -2619,6 +2712,7 @@ fn kvquant_attention_test(
 #[ignore = "requires a Metal GPU"]
 fn attention_kv_q4_0_parity() {
     kvquant_attention_test(DType::F16, DType::Q4_0, 1, 200, 128, 199, 6e-3, 300);
+    kvquant_newest_key_is_attended(DType::F16, DType::Q4_0, 200, 128, 301);
     kvquant_attention_test(DType::Q4_0, DType::Q4_0, 3, 6, 64, 3, 6e-3, 305);
 }
 
@@ -2633,6 +2727,7 @@ fn attention_kv_q4_1_parity() {
 #[ignore = "requires a Metal GPU"]
 fn attention_kv_q5_0_parity() {
     kvquant_attention_test(DType::F16, DType::Q5_0, 1, 200, 128, 199, 6e-3, 320);
+    kvquant_newest_key_is_attended(DType::F16, DType::Q5_0, 200, 128, 321);
     kvquant_attention_test(DType::Q5_0, DType::Q5_0, 3, 6, 64, 3, 6e-3, 325);
 }
 
@@ -2695,6 +2790,7 @@ fn attention_kv_f32_parity() {
 #[ignore = "requires a Metal GPU"]
 fn attention_kv_turbo2_parity() {
     kvquant_attention_test(DType::Turbo2, DType::Turbo2, 1, 200, 128, 199, 1.2e-2, 370);
+    kvquant_newest_key_is_attended(DType::Turbo2, DType::Turbo2, 200, 128, 371);
     kvquant_attention_test(DType::F16, DType::Turbo2, 3, 6, 128, 3, 1.2e-2, 375);
 }
 
@@ -2702,6 +2798,7 @@ fn attention_kv_turbo2_parity() {
 #[ignore = "requires a Metal GPU"]
 fn attention_kv_turbo3_parity() {
     kvquant_attention_test(DType::Turbo3, DType::Turbo3, 1, 200, 128, 199, 1.2e-2, 380);
+    kvquant_newest_key_is_attended(DType::Turbo3, DType::Turbo3, 200, 128, 381);
     kvquant_attention_test(DType::F16, DType::Turbo3, 3, 6, 128, 3, 1.2e-2, 385);
 }
 
@@ -2709,6 +2806,7 @@ fn attention_kv_turbo3_parity() {
 #[ignore = "requires a Metal GPU"]
 fn attention_kv_turbo4_parity() {
     kvquant_attention_test(DType::Turbo4, DType::Turbo4, 1, 200, 128, 199, 1.2e-2, 390);
+    kvquant_newest_key_is_attended(DType::Turbo4, DType::Turbo4, 200, 128, 391);
     kvquant_attention_test(DType::F16, DType::Turbo4, 3, 6, 128, 3, 1.2e-2, 395);
 }
 
@@ -2828,10 +2926,10 @@ fn attention_prefill_wide_parity() {
     assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
 }
 
-// Wide launch, long f16 context: routes to the half-fragment flash kernel (`attnflash_f16kv`).
+// Wide launch, long f16 context: routes to the cooperative flash kernel (`attnflash2_f16kv`).
 // Q and P round to f16 in that path (accumulation stays f32), hence the wider tolerance than the
-// exact-f32 attention kernels. kv_len is a multiple of 8 so the kernel's tail-block reads stay
-// inside these exact-sized test buffers (the runtime cache is sized for the full context).
+// exact-f32 attention kernels. kv_len is a multiple of its 8-row KV block, so its tail-block reads
+// stay inside these exact-sized test buffers and the host's read-fit gate lets it run.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_flash_matches_reference() {
@@ -2867,15 +2965,18 @@ fn attention_flash_matches_reference() {
 
 // Same flash shape at hd = 72 (% 8 but not % 32): routes to the single-simdgroup flash kernel
 // (`attnflash_f16kv`), which the hd % 32 == 0 tests above no longer reach (those take the
-// cooperative `attnflash2_f16kv`).
+// cooperative `attnflash2_f16kv`). That kernel loads 16-row KV blocks, so at kv_len 136 it reads
+// to row 143: the cache holds those rows (as a runtime cache sized for a longer context does),
+// or the host's read-fit gate would route this shape to a clamped kernel instead.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_flash_hd72_matches_reference() {
     let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 136usize, 8usize, 2usize, 72usize, 119usize);
+    let cache_rows = kv_len.next_multiple_of(16);
     let mut g = Graph::new();
     let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
-    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
-    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let kc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], DType::F16));
     let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
     g.push(Op::Attention {
         q,
@@ -2895,8 +2996,8 @@ fn attention_flash_hd72_matches_reference() {
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 171))),
-        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 172))),
-        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 173))),
+        (kc, f16_bytes(&rand_f32(cache_rows * nkv * hd, 172))),
+        (vc, f16_bytes(&rand_f32(cache_rows * nkv * hd, 173))),
     ];
     assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
 }
@@ -3928,6 +4029,35 @@ fn argmax_f32_matches_cpu() {
         1,
     );
     assert_eq!(got[0].to_bits(), 17, "argmax must keep the lowest tie");
+
+    // The same tie on the single-threadgroup kernel (n within one 256-lane scan): index 256 lands
+    // on lane 0 and index 1 on lane 1, so a reduce that breaks ties by lane rather than by index
+    // returns 256.
+    let small = 4099usize;
+    let mut gs = Graph::new();
+    let xs_id = gs.input(TensorDesc::new(vec![small], DType::F32));
+    let dst_s = gs.output(TensorDesc::new(vec![1], DType::F32));
+    gs.push(Op::Argmax {
+        x: xs_id,
+        dst: dst_s,
+        n: small as u32,
+        rows: 1,
+    });
+    let mut tied = vec![-1.0f32; small];
+    tied[256] = 10.0;
+    tied[1] = 10.0;
+    let got = run(
+        &MetalBackend::new().unwrap(),
+        &gs,
+        &[(xs_id, f32_bytes(&tied))],
+        dst_s,
+        1,
+    );
+    assert_eq!(
+        got[0].to_bits(),
+        1,
+        "argmax_f32 must keep the lowest tied index"
+    );
 
     xs.fill(f32::NEG_INFINITY);
     xs[90_210] = -1e35;

@@ -650,6 +650,15 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// The multiple a runner rounds every KV cache's row capacity up to. A backend whose prefill
+    /// attention loads KV in fixed-size row blocks reads past the newest key to the next block
+    /// boundary; padding the cache makes those rows exist (zeroed, as `alloc` guarantees) rather
+    /// than leaving the backend to send such launches to slower kernels. The padding is capacity
+    /// only — it never raises the context a session accepts. `1` unless a backend says otherwise.
+    fn kv_row_align(&self) -> usize {
+        1
+    }
+
     /// Perf (DiffusionGemma denoise, perf slice 3 — docs/diffusion-gemma.md): fused per-canvas-row
     /// entropy-bound sampler reduction over raw `[rows, dim]` logits, avoiding a full `[rows,
     /// dim]` host download. `u` is `rows` host-drawn uniform `[0,1)` floats (the seeded

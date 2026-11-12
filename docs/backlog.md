@@ -2836,22 +2836,16 @@ Estimated well under 1 %.
 
 ### Review coverage gaps (2026-11-08)
 
-Not reviewed by any of the three passes: the Vulkan GLSL shaders beyond
-`sample_topk.comp`; `infr-vulkan` beyond the replay path (`execute_static`,
-prefill build, descriptor churn, the pagers); `infr-metal` entirely; the SIMD
-kernels in `infr-cpu` (`kernels.rs`, `repack.rs`, `moe.rs`, `quant.rs`,
-`turbo.rs`, `kvquant.rs`); `seam/runner.rs` outside the prefix-cache, clamp and
-decode-loop slices; `grammar.rs`, `mtp/`, `diffusion.rs`, `config.rs`;
-`infr-chat`'s `tools.rs` scanner; `infr-hub`'s `ranged.rs`, `parts.rs` and
-`store.rs` selection; most of `infr-cli`'s argument layer; and `infr-core`'s
-config/env layer. Cleared by the correctness pass (do not re-open without new
-evidence): GGUF header parsing bounds, hub path validation and resume, server
-bearer comparison / auth gating / `StopMatcher` / `[DONE]` guard, sampling seed
-and penalty indexing, KV prefix-reuse rules, the template fuel bound, and the
-`unsafe` in `infr-plat` lock/signal, `infr-core` `hostpager.rs`, and `infr-cpu`
-`pool.rs`. Cleared by the perf pass: compiled-template caching, `ChatStream` /
-`StopMatcher` cursors (not quadratic), mapped host-visible `upload`/`download`,
-lazy `token_embd` dequant.
+What those three passes left unread has since been read or is listed under
+"Review coverage as of 2026-11-12" at the end of this file. Cleared by the
+correctness pass (do not re-open without new evidence): GGUF header parsing
+bounds, hub path validation and resume, server bearer comparison / auth gating /
+`StopMatcher` / `[DONE]` guard, sampling seed and penalty indexing, KV
+prefix-reuse rules, the template fuel bound, and the `unsafe` in `infr-plat`
+lock/signal, `infr-core` `hostpager.rs`, and `infr-cpu` `pool.rs`. Cleared by
+the perf pass: compiled-template caching, `ChatStream` / `StopMatcher` cursors
+(not quadratic), mapped host-visible `upload`/`download`, lazy `token_embd`
+dequant.
 
 ### B97 — docs still to condense or restructure (2026-11-08, updated 2026-11-10)
 
@@ -3197,9 +3191,8 @@ was then re-read at its call site before being recorded, and B103 was checked
 against the released binaries and a CI job log; "plausible" entries say what was
 not established.
 
-The areas this pass left unreviewed were taken up the same day; see "Review
-coverage (2026-11-11, remaining areas)" at the end of the next section for what
-is still unread.
+The areas this pass left unreviewed were taken up afterwards; see "Review
+coverage as of 2026-11-12" at the end of this file for what is still unread.
 
 ## Remaining-area review 2026-11-11
 
@@ -3841,51 +3834,141 @@ symlinks; a backslash in a repo id escaped the cache on Windows;
   any assertion on a device without binary archives; the Metal `*_probe` and
   `*_wall` tests assert nothing and run in CI under `--include-ignored`.
 
-### Review coverage (2026-11-11, remaining areas)
+### B150 — Metal shaders and tests, 2026-11-12: fixed on Linux, first run in CI (2026-11-12)
 
-Six read-only reviews, one per area, none of which built or ran anything.
-Findings were re-read at their sites as stated per entry; where an entry says
-"reported", it was not.
+The Metal `.metal` sources and tests were read against their Vulkan and CPU
+counterparts, and the fixes were written on Linux: cross-linted for
+`aarch64-apple-darwin`, with the decision logic in `src/policy.rs` unit-tested
+on any OS, and first compiled and run by the macOS CI jobs. Fixed: `moe_topk`
+used an unclamped winner index when no router logit was finite; the flash
+attention kernels read whole key blocks past the newest key with nothing
+guaranteeing those rows exist (the kernel is now chosen only when they do —
+`policy::select_attention` — and Metal KV caches are padded to
+`policy::KV_ROW_ALIGN` rows through `Backend::kv_row_align`, so an ordinary
+prefill still takes flash); the Q4_0 / Q5_0 KV writers chose the block scale
+differently from the CPU on a tie; `argmax_f32` broke ties by lane; the two-row
+Q4_K / Q6_K GEMV bodies read a weight row past the bank for an odd output width;
+`pcache_blob::encode` wrote blobs its own `decode` rejects. Left:
 
-What these passes read, in the reviewers' own accounting:
+- **Vulkan's `quant_kv.comp` still breaks a ±max tie toward `vmax`** for Q4_0
+  and Q5_0, where the CPU, Metal and ggml's `quantize_row_q4_0_ref` take the
+  first element of largest magnitude. Exact ties are rare in real activations.
+- **The MTP head's KV cache is not padded** (`mtp/mod.rs` allocates it
+  directly), so on Metal its multi-row attention near the cache end takes a
+  slower exact kernel. MTP is parked.
+- **No test observes which attention kernel a real device takes.** The decision
+  function is tested on Linux; the device's choice end to end is not.
+- `linear_q4k_mr` / `linear_q6k_mr` in `linear.metal` are dispatched by nothing
+  (multi-row K-quants use the `_mrv` kernels); delete them.
+- `device_token` is injective only up to ASCII case. Two device names differing
+  by case share a cache file and rebuild it for each other; they never load each
+  other's pipelines, because the stored key holds the name verbatim.
+- The mask-sensitivity check `kvquant_newest_key_is_attended` relies on a margin
+  that was estimated, not measured, for the lossiest format.
+- **In the macOS test job the bandwidth benches are most of the test time**
+  (`gemv_bw` about 48 s of about 81 s summed in run 43212953975). They assert
+  nothing and run because the job passes `--include-ignored`.
+- Not read by any pass: `kv_cache.metal`'s first f16 / f32 writers, the
+  `topk_mask` and lightning-indexer tail of `attention.metal`, the rest of
+  `elementwise_norms.metal`, most of `tests/parity.rs`, and
+  `tests/kernel_names.rs`.
 
-- **infr-vulkan Rust:** `ops.rs`, `pager.rs`, `spirv.rs`, `vkext.rs` in full;
-  large parts of `lib.rs`, `recorder.rs` and `adapter.rs`. Not opened:
-  `build.rs`, `caps.rs`, `tp.rs`, `tp_allreduce.rs`, `ep.rs`, `pipeline.rs`,
-  `linear.rs`, `matmul.rs`. Most op-recording methods in `recorder.rs` and most
-  of `lower_op` outside attention and MoE were not read.
-- **Shaders:** the GEMV / mmv family, `native_gemm`, `native_gemm_warp`,
-  `native_gemm_mmq_q4k`, the attention and KV kernels, and the shared decode
-  includes in full, with push-constant layouts cross-checked against the Rust
-  fill sites. The other mmq variants, the fused flash kernels, `mla`,
-  `lightning_indexer`, the `moe_*`, `deltanet*`, `hyper_*` and elementwise
-  kernels were checked for push-block size and bindings only. The turbo tables,
-  the dp4a decoders in the unread mmq files and all DeltaNet math were not
-  compared against a reference.
-- **infr-metal:** `lib.rs`, `shaders.rs` and the non-test code of `exec.rs` in
-  full; the `.metal` sources only in part. Not opened: `pcache_blob.rs`,
-  `profile.rs`, `common.metal`, the tests.
-- **infr-cpu:** `quant.rs`, `moe.rs`, `repack.rs`, `paged.rs`, `kvquant.rs` in
-  full; most of `lib.rs`. In `kernels.rs` the Q4_K, Q2_K and Q6_K families and
-  the 32-block VNNI tile were read; the Q3_K, Q5_K, IQ4_XS and Q8_0 single-row
-  kernels, most batch kernels and the other 32-block families were not. Not
-  opened: `turbo.rs`, `pool.rs`.
-- **infr-llama:** `config.rs`, `kv.rs`, `quant.rs`, `weights.rs`, `arch.rs` in
-  full; about half of `seam/runner.rs` (the generation loop and the common
-  attention emission); little of `seam/mod.rs`, `seam/model.rs`. Not read: the
-  DeltaNet, MLA, DeepSeek V4 and MoE emitters, the denoise and verify paths,
-  `seam/sc.rs`, `seam/dsv4_plan.rs`, almost all of `mtp/` (only that it is
-  parked was confirmed), `qwen35.rs`.
-- **infr-gguf:** `lib.rs` and `dequant.rs` in full. NVFP4, Q2_0 and the I2S
-  layout could not be checked against a reference.
-- **infr-core, infr-server, infr-engine, infr-prof, infr-prof-rt:** non-test
-  code in full, except `iquant_grids.rs` and `config/manifest.rs`.
-  `infr-testkit` in full.
-- **Tests:** the harness, the three `shared_decode_parity` files and
-  `warp_gemm_parity.rs` in full; about half of `cpu_backend.rs`; the rest by
-  outline. Most Vulkan and Metal integration test files and most `cfg(test)`
-  modules were not opened.
+### B151 — MTP as parked: what un-parking it would hit first (2026-11-12)
 
-Not reviewed by any pass: `infr-cli`, `infr-hub`, `infr-chat` and `infr-plat`
-were outside these six areas (parts of each were read on 2026-11-08 and earlier
-on 2026-11-11).
+`mtp_enabled()` returns `false` and every production entry point goes through it
+(read 2026-11-12); `tests/cpu_backend.rs` still calls the public API. Found by
+reading `mtp/`:
+
+- **The MTP branch drops the `RequestCtx`.** `chat/{cpu,vulkan,metal}.rs` call
+  the speculative generators without `req`, and `generate_mtp_spec_core` has no
+  parameter for it — so abort (the stop-sequence latch), cancel (deadline,
+  client hang-up), the `StepGate` baton and per-request sampling would all be
+  lost. First bug on re-enable.
+- **It cannot give output identical to plain decode** beyond the documented int8
+  noise: candidates are computed at `m > 1` where decode uses `m = 1`; a qwen35
+  rollback re-prefills committed rows at another batch size; and at `temp > 0`
+  `spec_accept_stochastic` preserves the distribution but consumes the RNG in
+  another order, so a seed gives different text.
+- It reports `natural_stop: false` always; a snapshot failure aborts the whole
+  generation where the decode loop degrades; its context is sized with no
+  `reply_budget` or trained-context clamp; and `mtp_restore_delta`'s callers
+  leave `cached` / `written_end` unchanged when a restore fails part-way
+  (harmless today: the state is a local dropped on the error).
+- Not read: `build_mtp_graph`, `build_mtp_draft_chain_graph`,
+  `upload_mtp_head_bufs`, `load_mtp_head`.
+
+### B152 — smaller findings from the 2026-11-12 CPU and seam reads (2026-11-12)
+
+- **Dense Q5_0 on the CPU computes decode and prefill differently** (`m == 1`
+  takes an f32 dot, `m > 1` the int8 `vec_dot_q5_0_32_batch`). Every other
+  32-block format uses one kernel for both. The fix is one arm, and it moves the
+  `cpu_golden_gemma3` hash: needs the owner's go-ahead to re-bless (same item as
+  B125's Q5_0 bullet).
+- **Suspected:** in `vulkan_moe_binder` a paged MoE layer whose expert bank does
+  not arrive as `WBytes::Mmap` falls through to a full resident upload after the
+  pager already budgeted for it. Not established whether any architecture hands
+  over a non-mmap bank.
+- **Suspected, low:** `turbo.rs` `quantize_block` stores `grp_norm / recon_norm`
+  as f16, which overflows to infinity for a group whose L2 norm exceeds the f16
+  range; and `dequant_prefix_orig` zero-fills when the length is not a multiple
+  of its group (only a `debug_assert` on the write side).
+- `pool.rs`: a panic payload whose own `Drop` panics would kill a worker and
+  leave `run` spinning; `seq`, `cursor`, `done` and `n_tasks` share a cache line
+  (B95).
+- CPU kernels not compared with a reference: `turbo.rs` (llama.cpp's checkout
+  has no counterpart).
+
+### Review coverage as of 2026-11-12
+
+Eight further read-only passes on 2026-11-12 went through what the earlier
+reviews had listed as unread. Each pass reported its own coverage; none built or
+ran anything. Their findings are B146–B152, each saying what was confirmed at
+its site and what is a reviewer's inference. What has now been read in full,
+beyond the 2026-11-11 list:
+
+- **infr-vulkan:** every `lower_op` arm with the recorder methods it calls;
+  `tp.rs`, `tp_allreduce.rs`, `tp_sem.rs`, `p2p.rs`, `ep.rs`, `pipeline.rs`,
+  `linear.rs`, `vkext.rs`, the non-test part of `caps.rs`; the logic of
+  `build.rs` (its several-hundred-entry build list was checked by script).
+- **Shaders:** every in-shader weight decoder against `ggml-quants.c`; the mmq,
+  i8cm / f8cm, MLA, lightning-indexer, MoE, DeltaNet, turbo, KV store / quant /
+  dequant, sampler, softmax and layernorm bodies; the flash, partial, decode,
+  nc_fa, ktile and `attention_kv` attention kernels.
+- **infr-llama:** every graph emitter in `seam/runner.rs` against its llama.cpp
+  builder; `seam/mod.rs`, `seam/model.rs`, `seam/sc.rs`, `seam/dsv4_plan.rs`,
+  `qwen35.rs`; most of `mtp/`.
+- **infr-cpu:** every kernel family in `kernels.rs` across its SIMD tiers
+  against `ggml-quants.c`; `turbo.rs`; `pool.rs`.
+- **infr-core:** `iquant_grids.rs` (compared with `ggml-common.h` by script,
+  element by element) and `config/manifest.rs`.
+- **infr-cli, infr-hub, infr-chat, infr-plat:** production code in full.
+- **infr-metal:** `pcache_blob.rs`, `profile.rs`, `common.metal`, the weight
+  decoders, the GEMV / GEMM bodies, the KV writers and dequant kernels, the
+  attention kernels, the sampler stages, `moe.metal`, `rope_ffn.metal`,
+  `embed_gather.metal`.
+
+Still not read by any pass, stated as a gap:
+
+- **Tests, mostly.** The test code was swept for specific patterns and partly
+  read. Not read end to end: most of `infr-metal/tests/parity.rs` and
+  `kernel_names.rs`; the non-ignored host tests in
+  `infr-vulkan/tests/ gemm_bench.rs` and `moe_id_gemv_real_dims.rs`; most of
+  `tests/synthetic_deepseek2.rs`; the bodies of the non-ignored `seam_op_parity`
+  tests; the `#[cfg(test)]` modules of `seam/runner.rs`, `seam/weights.rs` and
+  `recorder.rs`; `infr-hub/src/testhttp.rs`; `infr-plat`'s Windows-job native
+  tests; the infr-server tests beyond a grep.
+- **Vulkan:** the bodies of `streamed_prefill_gemm`, `native_sg_choice` and
+  `native_rm_choice`; the `native_gemm_fma` body beyond its weight readers; the
+  header blocks of several mmq variants.
+- **Metal:** the first f16 / f32 writers in `kv_cache.metal`, the `topk_mask`
+  and lightning-indexer tail of `attention.metal`, the rest of
+  `elementwise_norms.metal`, the DeltaNet recurrence in `deltanet.metal`.
+- **infr-llama:** the MTP graph builders and head loader; the DiffusionGemma
+  emitters against an actual reference (the fork checkout is not on the dev
+  machine).
+- **References that could not be checked:** NVFP4, Q2_0 and the I2S layout in
+  `infr-gguf` (no reference to hand); `turbo.rs` (llama.cpp has no counterpart);
+  the 331 llama.cpp commits between the pin the docs name and the checkout
+  (B-DSHW-PULL).
+- **Nothing was run on:** a Windows machine, an Intel or NVIDIA GPU, a multi-GPU
+  world beyond opening one, or a Metal device outside CI.

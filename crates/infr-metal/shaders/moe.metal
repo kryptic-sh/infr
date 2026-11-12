@@ -249,7 +249,9 @@ kernel void moe_topk(device const float* logits_all [[buffer(0)]],
                 if ((taken & (1u << j)) == 0u && logits[e] > bv) { bv = logits[e]; be = e; }
             }
             float m = simd_max(bv);
-            uint pick = simd_min(bv == m ? be : 0xFFFFFFFFu);
+            // No lane offers an expert when every untaken logit is NaN or -inf: clamp the
+            // sentinel so a broken router reads garbage in-bounds, not past the weight bank.
+            uint pick = min(simd_min(bv == m ? be : 0xFFFFFFFFu), p.n_expert - 1u);
             sel[u] = pick;
             if ((pick & 31u) == lane) taken |= 1u << (pick >> 5);
         }

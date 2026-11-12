@@ -1174,7 +1174,16 @@ pub(crate) fn generate_dense_backend(
         let ubatch = crate::seam::ubatch_rows(ec);
         let kv_sizes: Vec<(usize, usize)> = (0..c.n_layer)
             .map(|l| {
-                crate::seam::kv_layer_alloc_bytes(c, l, want_ctx, kv_ring, ubatch, k_fmt, v_fmt)
+                crate::seam::kv_layer_alloc_bytes(
+                    c,
+                    l,
+                    want_ctx,
+                    kv_ring,
+                    ubatch,
+                    be.kv_row_align(),
+                    k_fmt,
+                    v_fmt,
+                )
             })
             .collect();
         let room = be.device_alloc_room();
@@ -1451,7 +1460,7 @@ pub(crate) fn generate_dense_backend(
     let start = if kv_ring && start > 0 {
         let safe = (0..c.n_layer)
             .filter(|&l| c.is_swa_layer(l))
-            .map(|l| crate::seam::kv_rows_at(c, l, max_ctx, true, ring_ubatch))
+            .map(|l| crate::seam::kv_rows_at(c, l, max_ctx, true, ring_ubatch, be.kv_row_align()))
             .filter(|&rows_l| rows_l < max_ctx) // a never-wrapping layer can't lose positions
             .all(|rows_l| {
                 let live_from = written_end.saturating_sub(rows_l);
@@ -1812,7 +1821,8 @@ pub(crate) fn generate_dense_backend(
             // every backend derives the ring's row capacity from this declared element count
             // (row = pos % (numel / row_width)).
             let (k_row, v_row) = crate::seam::kv_row_elems(c, l);
-            let rows_l = crate::seam::kv_rows_at(c, l, max_ctx, kv_ring, ring_ubatch);
+            let rows_l =
+                crate::seam::kv_rows_at(c, l, max_ctx, kv_ring, ring_ubatch, be.kv_row_align());
             k_cache.push(g.input(kd(crate::seam::kv_side_elems(rows_l * k_row))));
             v_cache.push(g.input(vd(crate::seam::kv_side_elems(rows_l * v_row))));
         }
@@ -7820,7 +7830,14 @@ mod tests {
         let mut src = None;
         logits(&a, &mut src);
         let src = src.expect("slot initialized");
-        let ring_rows = crate::seam::kv_rows_at(&cfg, 0, CTX, true, PINNED);
+        let ring_rows = crate::seam::kv_rows_at(
+            &cfg,
+            0,
+            CTX,
+            true,
+            PINNED,
+            infr_core::backend::Backend::kv_row_align(&be),
+        );
         assert!(
             src.kv_ring && src.written_end > ring_rows,
             "the source must wrap its ring"

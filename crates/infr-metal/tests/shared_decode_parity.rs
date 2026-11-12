@@ -40,9 +40,8 @@ const METAL_TOL: f32 = 2e-2;
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn metal_linear_all_weight_quants_m1_match_the_host_oracle() {
-    let Ok(be) = MetalBackend::new() else {
-        return; // no Metal device — self-skip
-    };
+    // `#[ignore]`d: it runs only where a Metal device is expected, so a failed init is a failure.
+    let be = MetalBackend::new().expect("metal backend");
     // in_f=256 divides by every block size (32/64/256), so one shape covers all 24 formats.
     let cases = weight_quant_cases(1, 256, 8);
     sweep_linear_on("metal Linear m=1", &be, &cases, |_| METAL_TOL).assert_ok();
@@ -59,9 +58,7 @@ fn metal_linear_all_weight_quants_m1_match_the_host_oracle() {
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn metal_linear_all_weight_quants_m4_match_the_host_oracle() {
-    let Ok(be) = MetalBackend::new() else {
-        return;
-    };
+    let be = MetalBackend::new().expect("metal backend");
     let cases = weight_quant_cases(4, 256, 32);
     sweep_linear_on("metal Linear m=4", &be, &cases, |_| METAL_TOL).assert_ok();
 }
@@ -71,9 +68,7 @@ fn metal_linear_all_weight_quants_m4_match_the_host_oracle() {
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn metal_linear_dense_dtypes_match_the_host_oracle() {
-    let Ok(be) = MetalBackend::new() else {
-        return;
-    };
+    let be = MetalBackend::new().expect("metal backend");
     let cases = [
         LinearCase::new(DType::F32, 1, 256, 8).with_seed(0x501),
         LinearCase::new(DType::F16, 1, 256, 8).with_seed(0x502),

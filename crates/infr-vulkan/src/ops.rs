@@ -41,47 +41,13 @@ fn hash_spv(spv: &[u32]) -> u64 {
     h.finish()
 }
 
-/// Build a kernel, PANICKING on any failure — the surface every production dispatch path uses (see
-/// [`try_make_compute_kernel`] for the fallible one and for why the panics read the way they do).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn make_compute_kernel(
-    device: &ash::Device,
-    pcache: vk::PipelineCache,
-    name: &'static str,
-    spv: &[u32],
-    n_buf: usize,
-    push_size: u32,
-    required_sg: Option<u32>,
-    push_descriptor: bool,
-    max_push_constants: u32,
-    rte_f16: bool,
-) -> ComputeKernel {
-    try_make_compute_kernel(
-        device,
-        pcache,
-        name,
-        spv,
-        n_buf,
-        push_size,
-        required_sg,
-        push_descriptor,
-        max_push_constants,
-        rte_f16,
-    )
-    .unwrap_or_else(|e| {
-        panic!(
-            "{e} — kernel build does not yet thread Result to this call site (see docs/backlog.md \
-             B98)"
-        )
-    })
-}
-
 /// Build one kernel's Vulkan objects, returning an error instead of aborting the process.
 ///
-/// The fallible surface exists for capability PROBES: a probe dispatched to find out whether a
-/// device can honour a tier must be able to answer "no" (a driver that returns a null pipeline for
-/// an unsupported coopmat config is exactly the case being probed for), and a panic there would
-/// turn a refused tier into a crashed process.
+/// The kernel cache (`VulkanBackend::kernel_inner`) turns an error into a panic, after releasing
+/// its lock. The fallible surface exists for capability PROBES: a probe dispatched to find out
+/// whether a device can honour a tier must be able to answer "no" (a driver that returns a null
+/// pipeline for an unsupported coopmat config is exactly the case being probed for), and a panic
+/// there would turn a refused tier into a crashed process.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_make_compute_kernel(
@@ -93,13 +59,15 @@ pub(crate) fn try_make_compute_kernel(
     push_size: u32,
     required_sg: Option<u32>,
     push_descriptor: bool,
-    max_push_constants: u32,
+    limits: crate::caps::KernelLimits,
     rte_f16: bool,
 ) -> Result<ComputeKernel> {
     // The device's real `maxPushConstantsSize` — Vulkan only GUARANTEES 128 bytes, and every push
     // block here was sized against that floor by inspection. Checked before the layout is built so
     // an oversize block names itself instead of surfacing as a driver-side VUID.
-    crate::caps::check_push_constant_size(name, push_size, max_push_constants).map_err(be)?;
+    crate::caps::check_push_constant_size(name, push_size, limits.push_constants).map_err(be)?;
+    // Same for the workgroup size baked into the module.
+    crate::caps::check_kernel_workgroup(name, spv, &limits).map_err(be)?;
     // `spv` itself stays the kernel's identity (`spv_hash` below): the patch is a function of the
     // module and the device, so the same `spv` always builds the same pipeline here.
     let rte_patched = rte_f16.then(|| crate::spirv::with_rte_f16(spv)).flatten();
@@ -363,10 +331,15 @@ impl VulkanBackend {
     }
 
     /// Shared fetch-or-build for [`Self::kernel`]/[`Self::kernel_sg`]. The build runs UNDER the
-    /// cache lock (via the `entry` API) so exactly one thread compiles a given `name` on
-    /// concurrent first use — the old lock→get→unlock→compile→lock→insert had two racing threads
-    /// both build the full shader+pipeline+pool and the second `insert` overwrite (and leak for
-    /// process life) the first's Vulkan objects.
+    /// cache lock so exactly one thread compiles a given `name` on concurrent first use — the old
+    /// lock→get→unlock→compile→lock→insert had two racing threads both build the full
+    /// shader+pipeline+pool and the second `insert` overwrite (and leak for process life) the
+    /// first's Vulkan objects.
+    ///
+    /// A build that fails still panics (this surface is infallible until B98 threads a `Result`
+    /// through), but only after the lock is released: a panic while holding it would poison the
+    /// cache, and every later kernel request in the process would panic on the poison instead of
+    /// building.
     fn kernel_inner(
         &self,
         name: &'static str,
@@ -376,10 +349,11 @@ impl VulkanBackend {
         required_sg: Option<u32>,
     ) -> ComputeKernel {
         let mut map = self.shared.kernels.lock().unwrap();
-        let mut built = false;
-        let k = *map.entry(name).or_insert_with(|| {
-            built = true;
-            make_compute_kernel(
+        let cached = map.get(name).copied();
+        let built = cached.is_none();
+        let k = match cached {
+            Some(k) => k,
+            None => match try_make_compute_kernel(
                 &self.shared.device,
                 self.shared.pipeline_cache,
                 name,
@@ -388,12 +362,21 @@ impl VulkanBackend {
                 push_size,
                 required_sg,
                 self.shared.push_descriptor.is_some(),
-                self.shared.max_push_constants,
+                self.kernel_limits(),
                 self.shared
                     .rte_f16
                     .load(std::sync::atomic::Ordering::Relaxed),
-            )
-        });
+            ) {
+                Ok(k) => *map.entry(name).or_insert(k),
+                Err(e) => {
+                    drop(map);
+                    panic!(
+                        "{e} — kernel build does not yet thread Result to this call site (see \
+                         docs/backlog.md B98)"
+                    )
+                }
+            },
+        };
         drop(map);
         if built {
             self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save

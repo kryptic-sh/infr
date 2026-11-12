@@ -1562,6 +1562,12 @@ impl<'a> Recorder<'a> {
         // does with an out-of-range descriptor, and the old debug-only assert never ran in the
         // builds that ship. One compare on a path that already does two.
         let range_cap = crate::max_storage_buffer_range() as u64;
+        // This device's limit sits far above every tensor a test can allocate, so the unit tests
+        // lower it on their own thread to see the assert fire.
+        #[cfg(test)]
+        let range_cap = tests::VKB_RANGE_CAP
+            .with(std::cell::Cell::get)
+            .unwrap_or(range_cap);
         assert!(
             range <= range_cap,
             "resident-BDA sub-tensor range ({range} bytes) exceeds this device's \
@@ -4486,8 +4492,16 @@ impl<'a> Recorder<'a> {
         // second dispatch) but runs it 1024-wide with vec4 loads: 4x the waves x 4x the bytes per
         // request. Gate is exactly the decode hidden-norm shape — prefill (rows>1) already fills
         // the GPU with row-workgroups, and the per-head Q/K/V norms (rows=n_head, small dim) would
-        // just idle 3/4 of the lanes, so both keep the 256-thread build.
-        let wide = rows == 1 && dim >= 2048 && dim.is_multiple_of(4);
+        // just idle 3/4 of the lanes, so both keep the 256-thread build. A device whose compute
+        // limits cannot hold the 1024-wide workgroup decodes on the 256-thread build too: same
+        // bindings, same push block, same result.
+        let wide = rows == 1
+            && dim >= 2048
+            && dim.is_multiple_of(4)
+            && self
+                .be
+                .kernel_limits()
+                .admits(crate::gemm::rmsnorm_wide_spv());
         let k = if wide {
             self.be
                 .kernel_sg("rmsnorm_wide", crate::gemm::rmsnorm_wide_spv(), 3, 12, 32)
@@ -10671,6 +10685,9 @@ mod tests {
             const { std::cell::Cell::new(None) };
         /// How many `dispatch_wide` calls on this test thread took the 2-D split.
         pub(super) static WIDE_SPLITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// Overrides the `maxStorageBufferRange` `Recorder::vkb` holds a sub-tensor bind to.
+        pub(super) static VKB_RANGE_CAP: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
     }
 
     /// A backend built on an EXPLICIT Vulkan kernel-tier configuration.
@@ -10693,6 +10710,132 @@ mod tests {
     fn be_with_honours_infr_dev() {
         let want = VulkanBackend::new().unwrap().capabilities().name;
         assert_eq!(be_with(|_| {}).capabilities().name, want);
+    }
+
+    /// `Recorder::vkb` refuses to bind a resident-BDA sub-tensor whose range passes the device's
+    /// `maxStorageBufferRange` — a VUID violation whose consequence is whatever the driver does
+    /// with the descriptor — and binds the same tensor once the limit covers it.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn vkb_refuses_a_sub_tensor_past_the_storage_range() {
+        let be = be_with(|_| {});
+        let w = be.bda_weight_alloc_for_test(4096).unwrap();
+        let bind_at = |cap: u64| {
+            VKB_RANGE_CAP.with(|c| c.set(Some(cap)));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Recorder::vkb(w.as_ref()).range
+            }));
+            VKB_RANGE_CAP.with(|c| c.set(None));
+            r
+        };
+        assert_eq!(bind_at(4096).expect("a range within the limit binds"), 4096);
+        let err = bind_at(1024).expect_err("a range past the limit must be refused");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(msg.contains("maxStorageBufferRange (1024)"), "{msg}");
+    }
+
+    /// A device whose compute limits hold the 256-thread `rmsnorm` but not the 1024-wide
+    /// `rmsnorm_wide` decodes a wide hidden norm (`rows == 1`, `dim >= 2048`) on the narrow kernel
+    /// — the selection asks the same predicate the pipeline build enforces — and gets the right
+    /// answer, where choosing the wide kernel regardless would be refused at build.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn rmsnorm_falls_back_to_the_narrow_kernel_on_a_small_device() {
+        let be = be_with(|_| {});
+        let small = crate::caps::KernelLimits {
+            workgroup_invocations: 256,
+            workgroup_size: [256, 256, 64],
+            ..be.shared.kernel_limits
+        };
+        assert!(!small.admits(crate::gemm::rmsnorm_wide_spv()));
+        assert!(small.admits(crate::gemm::rmsnorm_spv()));
+        let (dim, eps) = (4096usize, 1e-6f32);
+        let x: Vec<f32> = (0..dim).map(|i| ((i % 23) as f32 - 11.0) * 0.07).collect();
+        let w: Vec<f32> = (0..dim).map(|i| 1.0 + (i % 7) as f32 * 0.01).collect();
+        let (bx, bw) = (upf32(&be, &x), upf32(&be, &w));
+        let by = be.alloc(dim * 4, BufferUsage::Readback).unwrap();
+        crate::TEST_KERNEL_LIMITS.with(|l| l.set(Some(small)));
+        let rec = be.recorder().unwrap();
+        rec.rmsnorm(bx.as_ref(), bw.as_ref(), by.as_ref(), 1, dim, eps);
+        rec.finish().unwrap();
+        crate::TEST_KERNEL_LIMITS.with(|l| l.set(None));
+        let mut got = vec![0f32; dim];
+        be.download(by.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        let ms = x.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / dim as f64;
+        let inv = 1.0 / (ms + f64::from(eps)).sqrt();
+        let err = got
+            .iter()
+            .zip(x.iter().zip(&w))
+            .map(|(g, (xv, wv))| (f64::from(*g) - f64::from(*xv) * inv * f64::from(*wv)).abs())
+            .fold(0f64, infr_testkit::nan_max64);
+        assert!(err < 1e-5, "narrow rmsnorm at dim {dim}: max_err={err:e}");
+    }
+
+    /// A kernel refused at build panics (the infallible `kernel` surface, B98) WITHOUT poisoning
+    /// the kernel cache: the next kernel request still builds. A panic under the cache lock would
+    /// have turned every later request in the process into a `PoisonError` panic.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn a_refused_kernel_does_not_poison_the_kernel_cache() {
+        let be = be_with(|_| {});
+        let floor = crate::caps::KernelLimits {
+            workgroup_invocations: 128,
+            workgroup_size: [128, 128, 64],
+            ..be.shared.kernel_limits
+        };
+        crate::TEST_KERNEL_LIMITS.with(|l| l.set(Some(floor)));
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            be.kernel_sg("rmsnorm_wide", crate::gemm::rmsnorm_wide_spv(), 3, 12, 32)
+        }));
+        crate::TEST_KERNEL_LIMITS.with(|l| l.set(None));
+        assert!(
+            refused.is_err(),
+            "a 1024-wide kernel on a 128-wide device must be refused"
+        );
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            be.kernel_sg("rmsnorm", crate::gemm::rmsnorm_spv(), 3, 12, 32)
+        }));
+        assert!(
+            built.is_ok(),
+            "the kernel cache was left poisoned by the refused build"
+        );
+    }
+
+    /// A device whose compute limits sit at Vulkan's floor cannot run `rmsnorm_wide`'s workgroup;
+    /// the pipeline build refuses it by name, before any Vulkan object exists, rather than handing
+    /// the driver a module the spec forbids on that device.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn a_workgroup_past_the_device_limit_is_refused_by_name() {
+        let be = be_with(|_| {});
+        let floor = crate::caps::KernelLimits {
+            workgroup_invocations: 128,
+            workgroup_size: [128, 128, 64],
+            ..be.shared.kernel_limits
+        };
+        let err = crate::ops::try_make_compute_kernel(
+            &be.shared.device,
+            be.shared.pipeline_cache,
+            "rmsnorm_wide",
+            crate::gemm::rmsnorm_wide_spv(),
+            3,
+            12,
+            Some(32),
+            be.shared.push_descriptor.is_some(),
+            floor,
+            false,
+        )
+        .err()
+        .expect("a 1024-wide workgroup on a 128-wide device must be refused")
+        .to_string();
+        assert!(
+            err.contains("rmsnorm_wide") && err.contains("maxComputeWorkGroupSize[x]"),
+            "{err}"
+        );
     }
 
     /// The prefill MMQ / int8-coopmat GEMMs floor K to whole 32-element blocks in the shader, so
@@ -13699,9 +13842,10 @@ mod tests {
     }
 
     /// MLA (DeepSeek V2/V3 absorbed form) on the REAL Vulkan path, vs a CPU reference — the
-    /// smallest possible dispatch of `recorder.mla` (no model, no seam). Mirrors `mla_parity`'s
-    /// synthetic inputs in infr-llama/tests/seam_op_parity.rs. This is the regression test for the
-    /// "logical device has been lost" hang the kernel caused on RDNA3 (see the .comp's header).
+    /// smallest possible dispatch of `recorder.mla` (no model, no seam), on the DeepSeek-sized
+    /// shape `mla_parity` in infr-llama/tests/seam_op_parity.rs uses. This is the regression test
+    /// for the "logical device has been lost" hang the kernel caused on RDNA3 (see the .comp's
+    /// header).
     ///
     /// Run against BOTH tiers. They are separate SPIR-V with separate reductions and separate
     /// softmax structure (`mla.comp`'s `-DMLA_SG`), and the shipped default only ever dispatches
@@ -13746,22 +13890,24 @@ mod tests {
                 wv[off + a * vhd + a] = 1.0;
             }
         }
-        // Same synthetic inputs as the CPU mla_parity test (see seam_op_parity.rs).
-        let qi: Vec<f32> = (1..=((rows * nh * q_head_dim) as i32))
-            .map(|x| x as f32)
+        // Small, signed inputs, so the two keys' scores land within a few units of each other and
+        // the softmax actually weighs them. With inputs in the thousands the scores sit orders of
+        // magnitude apart, the softmax is a hard argmax, and the output is the winner's V whatever
+        // the scores are — a kernel that mis-scaled every score then passed at an error of 0.
+        let qi: Vec<f32> = (0..rows * nh * q_head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) / 2.0)
             .collect();
-        // Random-but-deterministic K rows (xorshift, values < 2048 so the f16 cache cast is exact):
-        // a fixed column pattern (10+col) makes every key row a constant shift of the others, and
-        // with a near-one-hot softmax the output then collapses to the winner's V regardless of q —
-        // which accidentally made the output invariant to a transposed wk_b. Random rows make the
-        // scores, and hence the output, genuinely depend on the absorbed query.
+        // Random-but-deterministic K rows (xorshift, multiples of 1/1024 below 1 in magnitude, so
+        // the f16 cache cast is exact): a fixed column pattern makes every key row a constant
+        // shift of the others, which once made the output invariant to a transposed wk_b. Random
+        // rows make the scores, and hence the output, genuinely depend on the absorbed query.
         let mut state = 0x1234_5678u32;
         let mut ki = Vec::with_capacity(cap_rows * key_len);
         for _ in 0..cap_rows * key_len {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            ki.push((state % 1999) as f32);
+            ki.push(((state % 1999) as f32 - 999.0) / 1024.0);
         }
         let bq = upf32(&be, &qi);
         let bwk = upf32(&be, &wk);
@@ -13869,7 +14015,7 @@ mod tests {
             .fold(0f32, infr_testkit::nan_max);
         let tier = if sg { "mla_sg" } else { "mla" };
         println!("mla vulkan {tier} max_err={err:e}");
-        assert!(err < 1e-3, "MLA vulkan {tier} diverges: max_err={err:e}");
+        assert!(err < 1e-4, "MLA vulkan {tier} diverges: max_err={err:e}");
     }
 
     /// One `mla_ring_and_mask_matches_cpu_reference` case.

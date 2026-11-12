@@ -1348,12 +1348,14 @@ impl Op {
                 up_exps,
                 down_exps,
                 down_scale,
+                exp_probs_b,
                 expert_ids,
                 dst,
                 ..
             } => {
                 let mut r = vec![x, router_x, router, gate_exps, up_exps, down_exps];
                 r.extend(down_scale);
+                r.extend(exp_probs_b);
                 r.extend(expert_ids);
                 (r, vec![dst])
             }
@@ -1596,6 +1598,53 @@ mod tests {
             key_bias: None,
         };
         assert_eq!(attn.io(), (vec![t(7), t(6), t(8)], vec![t(9)]));
+    }
+
+    /// Every optional `Op::MoeFfn` operand is a read when present — `exp_probs_b` included. The CPU
+    /// interpreter pins paged weights from this list, and the multi-device executors use it to
+    /// decide which device runs an op and which tensors each segment binds, so a router bias
+    /// missing here is a weight none of them knows the op reads.
+    #[test]
+    fn op_io_moe_ffn_optional_reads() {
+        let t = |n: u32| TensorId(n);
+        let moe = |down_scale, exp_probs_b, expert_ids| Op::MoeFfn {
+            x: t(0),
+            router_x: t(1),
+            router: t(2),
+            gate_exps: t(3),
+            up_exps: t(4),
+            down_exps: t(5),
+            down_scale,
+            fused_gate_up: false,
+            dst: t(6),
+            ne: 8,
+            n_expert: 4,
+            n_used: 2,
+            n_ff_exp: 8,
+            scale: 1.0,
+            act: Activation::Silu,
+            swiglu_clamp: None,
+            gating: MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            expert_ids,
+        };
+        let base = vec![t(0), t(1), t(2), t(3), t(4), t(5)];
+        assert_eq!(moe(None, None, None).io(), (base.clone(), vec![t(6)]));
+        for (op, extra) in [
+            (moe(Some(t(7)), None, None), t(7)),
+            (moe(None, Some(t(8)), None), t(8)),
+            (moe(None, None, Some(t(9))), t(9)),
+        ] {
+            let (reads, writes) = op.io();
+            assert_eq!(writes, vec![t(6)]);
+            assert!(reads.contains(&extra), "{extra:?} missing from {reads:?}");
+            assert_eq!(reads.len(), base.len() + 1);
+        }
     }
 
     /// Optional read operands (rope `freq_factors`) appear only when present.

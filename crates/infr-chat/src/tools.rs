@@ -74,15 +74,44 @@ fn read_hex4(s: &[u8], i: usize) -> Option<u32> {
     Some(v)
 }
 
-/// Remove the given byte `spans` (non-overlapping, on char boundaries) from `text`. Sorted then
-/// excised back-to-front so earlier indices stay valid — the shared removal machinery both
-/// tool-call parsers use.
+/// Remove the given byte `spans` (non-overlapping, on char boundaries) from `text` — the shared
+/// removal machinery both tool-call parsers use. Where a removed span sat between whitespace on
+/// both sides, one gap survives, not two: the side holding a line break (the longer, if both do),
+/// so a call on its own line vanishes without joining the paragraphs around it, and otherwise a
+/// single space, so an inline call leaves one.
 fn remove_spans(text: &str, mut spans: Vec<(usize, usize)>) -> String {
     spans.sort_unstable_by_key(|&(start, _)| start);
-    let mut out = text.to_owned();
-    for (start, end) in spans.into_iter().rev() {
-        out.replace_range(start..end, "");
+    let mut out = String::with_capacity(text.len());
+    let mut from = 0;
+    for (start, end) in spans {
+        out.push_str(&text[from..start]);
+        from = end;
+        // Whitespace on one side only is the gap itself, and stays.
+        let after = &text[end..];
+        let right = &after[..after.len() - after.trim_start().len()];
+        let left_len = out.len() - out.trim_end().len();
+        if left_len == 0 || right.is_empty() {
+            continue;
+        }
+        let left_nl = out[out.len() - left_len..].contains('\n');
+        let right_nl = right.contains('\n');
+        let keep_left = match (left_nl, right_nl) {
+            (true, false) => true,
+            (false, true) => false,
+            (true, true) => left_len >= right.len(),
+            (false, false) => {
+                out.truncate(out.len() - left_len);
+                out.push(' ');
+                true
+            }
+        };
+        if keep_left {
+            from += right.len();
+        } else {
+            out.truncate(out.len() - left_len);
+        }
     }
+    out.push_str(&text[from..]);
     out
 }
 
@@ -348,7 +377,8 @@ fn parse_value(s: &[u8], mut i: usize, depth: usize) -> Option<(Value, usize)> {
 /// Find all `<|tool_call>…<tool_call|>` blocks, parse them, and return:
 /// - `clean`: the input text with every block that parsed removed, and the channel markers. A
 ///   block that does not parse (or has no closing marker) stays in `clean` verbatim, as in
-///   [`parse_hermes_tool_calls`]. Nothing is trimmed.
+///   [`parse_hermes_tool_calls`]. Whitespace is kept, except that where a removed block had
+///   whitespace on both sides only one gap survives (see [`parse_hermes_tool_calls`]).
 /// - the parsed [`ToolCall`] list.
 pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     let mut calls = Vec::new();
@@ -424,7 +454,10 @@ const HERMES_CLOSE: &str = "</tool_call>";
 /// neither dialect, and an unterminated `<tool_call>` (the turn hit the token budget mid-call).
 /// Every block is either a call or shown, so a call the model got wrong is visible rather than
 /// silently lost; the same rule [`parse_tool_calls`] applies to the pipe-marker dialect. Nothing is
-/// trimmed: the text either side of a removed block keeps its own whitespace.
+/// trimmed, and the text either side of a removed block keeps its own whitespace — except that
+/// whitespace on both sides of it leaves one gap, not two: the side holding a line break, so a
+/// call on its own line does not join the paragraphs around it, and otherwise one space, so
+/// `A <call> B` reads `A B`.
 pub fn parse_hermes_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     let mut calls = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -905,7 +938,8 @@ mod tests {
 
     /// A block whose body parses as NEITHER dialect makes no call — that half is
     /// `hermes_malformed_body_is_skipped` — and stays in `clean` verbatim, alone or beside a
-    /// block that did parse, which is removed with nothing else.
+    /// block that did parse, which is removed with nothing else but the second of the two gaps it
+    /// sat between.
     #[test]
     fn hermes_unparseable_block_is_kept() {
         let text = "Sure.<tool_call>not json</tool_call>Done.";
@@ -916,7 +950,7 @@ mod tests {
         let good = "<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>";
         let (clean, calls) = parse_hermes_tool_calls(&format!("A {good} B{}", &text[5..]));
         assert_eq!(calls.len(), 1);
-        assert_eq!(clean, "A  B<tool_call>not json</tool_call>Done.");
+        assert_eq!(clean, "A B<tool_call>not json</tool_call>Done.");
     }
 
     // --- split_think -----------------------------------------------------
@@ -1127,5 +1161,27 @@ mod tests {
         );
         assert_eq!(remove_spans("hello", vec![]), "hello");
         assert_eq!(remove_spans("xyz", vec![(0, 3)]), "");
+    }
+
+    /// A cut between two gaps leaves one — the one holding a line break, else a single space —
+    /// and a gap on one side only is kept, so removing a call never glues the words around it nor
+    /// merges a paragraph or list item into the line before.
+    #[test]
+    fn remove_spans_keeps_one_gap_per_cut() {
+        assert_eq!(remove_spans("A <c> B", vec![(2, 5)]), "A B");
+        assert_eq!(remove_spans("A <c>\n\nB", vec![(2, 5)]), "A\n\nB");
+        assert_eq!(
+            remove_spans("Running: <c>\n\n- item", vec![(9, 12)]),
+            "Running:\n\n- item"
+        );
+        assert_eq!(remove_spans("A\n<c>\n\nB", vec![(2, 5)]), "A\n\nB");
+        assert_eq!(remove_spans("A  <c>   B", vec![(3, 6)]), "A B");
+        assert_eq!(remove_spans("A<c> B", vec![(1, 4)]), "A B");
+        assert_eq!(remove_spans("A <c>B", vec![(2, 5)]), "A B");
+        assert_eq!(remove_spans("A<c>B", vec![(1, 4)]), "AB");
+        assert_eq!(
+            remove_spans("A <c> and <d> B", vec![(2, 5), (10, 13)]),
+            "A and B"
+        );
     }
 }

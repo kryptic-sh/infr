@@ -6471,8 +6471,9 @@ mod tests {
     use infr_core::tensor::TensorDesc;
     use infr_core::DType;
 
-    /// Read a `#define <name> <integer>` back out of GLSL source. Panics when the define is gone —
-    /// a shader that no longer states its bound is exactly the drift this guards.
+    /// Read a `#define <name> <integer>` back out of GLSL source, with or without GLSL's `u`
+    /// suffix. Panics when the define is gone — a shader that no longer states its bound is exactly
+    /// the drift this guards.
     fn glsl_define_u32(src: &str, name: &str) -> u32 {
         for line in src.lines() {
             let Some(rest) = line.trim_start().strip_prefix("#define ") else {
@@ -6484,6 +6485,8 @@ mod tests {
                     .next()
                     .unwrap_or_else(|| panic!("`#define {name}` has no value"));
                 return v
+                    .strip_suffix('u')
+                    .unwrap_or(v)
                     .parse()
                     .unwrap_or_else(|e| panic!("`#define {name} {v}` is not a u32: {e}"));
             }
@@ -6517,6 +6520,24 @@ mod tests {
         assert!(
             src.contains("shared float sv[MLA_MAX_KV_LORA_RANK];"),
             "mla.comp's sv[] is no longer sized by MLA_MAX_KV_LORA_RANK"
+        );
+    }
+
+    /// `hyper_mix.comp` holds a token's whole `hc x hc` Sinkhorn matrix in a private array of
+    /// `HC_MAX * HC_MAX` floats and cannot bounds-check it; `hyper_check_hc` admits every `hc` up to
+    /// `HYPER_CONNECT_MAX_MULT`. Raise the host bound without the shader's and the widest admitted
+    /// streams write past the array — undefined, not an error.
+    #[test]
+    fn hyper_mix_bound_matches_host() {
+        let src = include_str!("../shaders/hyper_mix.comp");
+        assert_eq!(
+            glsl_define_u32(src, "HC_MAX"),
+            infr_core::graph::HYPER_CONNECT_MAX_MULT,
+            "hyper_mix.comp's HC_MAX drifted from HYPER_CONNECT_MAX_MULT"
+        );
+        assert!(
+            src.contains("float m[HC_MAX*HC_MAX];"),
+            "hyper_mix.comp's matrix is no longer sized by HC_MAX"
         );
     }
 

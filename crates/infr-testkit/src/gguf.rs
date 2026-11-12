@@ -146,6 +146,9 @@ pub enum Fill {
     /// [`Fill::Exact`] written as `GGML_TYPE_F16` — for a test that needs a half-precision tensor,
     /// such as an f16 embedding a device-side gather reads.
     ExactF16(Vec<f32>),
+    /// [`Fill::Exact`] written as `GGML_TYPE_BF16` — the dtype of every `ffn_gate_inp` router in
+    /// the shipped DeepSeek V4 conversion. Values not representable in bf16 are rounded to nearest.
+    ExactBf16(Vec<f32>),
     /// Expert ids drawn from `0..n_expert`, written as a `GGML_TYPE_I32` tensor. The one fill in
     /// this harness that is not f32 on disk, because the one tensor that uses it —
     /// `deepseek4`'s `ffn_gate_tid2eid` hash-routing table — is i32 in the reference conversion
@@ -187,7 +190,7 @@ impl TensorSpec {
             Fill::Gain => (0..self.numel())
                 .map(|i| 1.0 + 0.1 * uniform(seed, i))
                 .collect(),
-            Fill::Exact(v) | Fill::ExactF16(v) => {
+            Fill::Exact(v) | Fill::ExactF16(v) | Fill::ExactBf16(v) => {
                 assert_eq!(v.len(), self.numel(), "{}: Exact fill length", self.name);
                 v.clone()
             }
@@ -203,11 +206,13 @@ impl TensorSpec {
     }
 
     /// The `ggml_type` this tensor is written as — `GGML_TYPE_I32` for the integer fills,
-    /// `GGML_TYPE_F16` for [`Fill::ExactF16`], `GGML_TYPE_F32` for every other.
+    /// `GGML_TYPE_F16` for [`Fill::ExactF16`], `GGML_TYPE_BF16` for [`Fill::ExactBf16`],
+    /// `GGML_TYPE_F32` for every other.
     pub fn ggml_type(&self) -> u32 {
         match self.fill {
             Fill::ExpertIds(_) | Fill::ExactIds(_) => 26,
             Fill::ExactF16(_) => 1,
+            Fill::ExactBf16(_) => 30,
             _ => 0,
         }
     }
@@ -215,7 +220,7 @@ impl TensorSpec {
     /// The length of [`Self::bytes`], without generating them.
     pub fn byte_len(&self) -> usize {
         match self.fill {
-            Fill::ExactF16(_) => self.numel() * 2,
+            Fill::ExactF16(_) | Fill::ExactBf16(_) => self.numel() * 2,
             _ => self.numel() * 4,
         }
     }
@@ -232,6 +237,10 @@ impl TensorSpec {
             Fill::ExactF16(_) => v
                 .iter()
                 .flat_map(|x| half::f16::from_f32(*x).to_le_bytes())
+                .collect(),
+            Fill::ExactBf16(_) => v
+                .iter()
+                .flat_map(|x| half::bf16::from_f32(*x).to_le_bytes())
                 .collect(),
             _ => v.iter().flat_map(|x| x.to_le_bytes()).collect(),
         }

@@ -24,11 +24,17 @@ GGUFs declare `llama`, so they cannot test this arch). There is no CPU-vs-Vulkan
 seam test for it. V2-Lite is the development model for the rest.
 
 The reference implementation is llama.cpp, checked out locally at
-`~/Projects/mxaddict/llama.cpp`, now at `b10356-2-g030ebb5`
-(`030ebb558a5820b444a8f836ed5cdd46c9b4bd7a`). Every claim about DeepSeek's maths
-in this document was read out of that tree, and every claim about what `infr`
+`~/Projects/mxaddict/llama.cpp`. Every claim about DeepSeek's maths in this
+document was read out of that tree at `b10356-2-g030ebb5`
+(`030ebb558a5820b444a8f836ed5cdd46c9b4bd7a`), and every claim about what `infr`
 already has was read out of this one. Where something was **not** verified it
 says so — those lines are the ones to check first, not to trust.
+
+**The checkout has since moved to `b10688-1-g57291f2`**
+(`57291f2644af8c9df0dd8d44395881c5bdcf0ecd`), 331 commits later, and those
+commits were **not** re-diffed against this document. Re-read at `57291f2` were
+only `deepseek4.cpp`'s `load_arch_tensors` shapes and the hyper-connection
+stream seed in its graph prologue; see `backlog.md` § B-DSHW-PULL.
 
 The document was originally written against `b10218-1-gc629da5`
 (`c629da565c80b0b17fac6262acdca4d772e745d8`). The 2026-08-11 pull advanced the
@@ -778,8 +784,9 @@ streams back into `hidden` for `output_norm`. Four resolved design points:
   `src` stream of `residual`. A layer wraps exactly two sublayers, so the parity
   returns to buffer 0 at every layer boundary and the pair is a fixed a→b→a.
 - **The widened stream is seeded by REPLICATING the embedding across the
-  `hc_mult` streams.** This is the one piece of the emit that is an assumption
-  rather than a transcription — see the caveat in `docs/backlog.md` § B-DSV4-HC.
+  `hc_mult` streams.** Read at llama.cpp `57291f2`: `deepseek4.cpp`'s graph
+  prologue does the same (`ggml_repeat_4d` of the token embedding to
+  `[n_embd, hc, n_tokens]`, named `hc_init`).
 - **The `[nope | rope]` tail is sliced with ONE `Op::CopyStrided` each way**, at
   `rows = batch * n_head`, `src_stride = head_dim`, `src_off = nope` — the
   packed result is then a plain `n_head`-head rope row. Three sites: q, kv, and

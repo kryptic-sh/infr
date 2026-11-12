@@ -726,21 +726,6 @@ is left:
   precondition is the `qui_cache` gate below. The options and their trade-off
   are written out in the plan's §7 as an open question for the user — do not
   re-derive them.
-- **Double-caching: CLOSED as a non-problem, and the premise was wrong in both
-  directions.** This entry used to say a buffered `pread` halves the tier's
-  effective budget, and that `posix_fadvise(DONTNEED)` **cannot** reclaim the
-  duplicate because it drops only clean UNMAPPED pages while `Gguf::open` maps
-  the whole file. A `mincore` probe refutes both halves. `DONTNEED` DOES reclaim
-  mapped-but-untouched pages (65 536 → 0 in the probe); a page is exempt only
-  once it is actually faulted into a page table, and this tier never touches
-  paged ranges through the mapping — it reads them with `pread`. Only the
-  touched case stayed pinned, which is the control. And the reclaim is not
-  needed anyway: an anonymous arena already wins page-cache reclaim under a
-  cgroup cap, demonstrated by a 7 GB arena under an 8 GB cap running with major
-  faults flat at ~1 700 and reading 110 GB against mmap's 232. No
-  `O_DIRECT`/`F_NOCACHE` rewrite and no alignment work (plan §3.5) is required.
-  **Do not reopen without new evidence** — what looked like a double-caching
-  cost was the budget being too small, which is the auto-sizing item in B36.
 - **Prefetch is deprioritized, and that reversal is the useful part.** It is
   still unbuilt on every backend (`HostPager::pin` reads synchronously, and on
   Vulkan under the dense/MoE session mutex). It was recorded here as "the
@@ -783,11 +768,14 @@ rediscovered:
   exposed than the CPU one — `DensePagerSession::stage` drops its pin before
   returning, so its floor is one slot per pool regardless of N — while the CPU
   interpreter holds a whole op's pins across the op.
-- **The per-pass file-change check is not wired.**
-  `FileBlockIo::verify_unchanged` exists and is tested; no caller runs it yet,
-  so a model rewritten mid-generation is read as whatever the new bytes are (the
-  same exposure as B30, now reachable through explicit reads rather than the
-  mapping).
+- **The per-pass file-change check is not wired — needs a decision.**
+  `FileBlockIo::verify_unchanged` exists and is tested; no caller runs it yet
+  (read), so a model rewritten mid-generation is read as whatever the new bytes
+  are (the same exposure as B30, now reachable through explicit reads rather
+  than the mapping). Options: check once per forward pass, once per request, or
+  at each `HostPager::pin`; and on a mismatch either fail the request or reload.
+  Each costs one `fstat` per check; which granularity is worth it is the
+  decision.
 
 ### B36 — paging optimizations found by review, measured but not built
 
@@ -810,18 +798,18 @@ residue worth tracking; what follows is that plus what was deliberately left.
   macOS and Windows arms are only checked for plausible figures (the
   `*_live_probe_is_plausible` tests, which pass on CI's macOS and Windows legs);
   neither has been benchmarked against a cap.
-- **The unified-memory path is unverified on unified hardware.** An iGPU/APU now
-  streams `DISK → GPU-accessible RAM` with no host cache
-  (`HostPager::stream_only`, selected by `DeviceCaps::unified_memory`). The
-  MECHANISM is covered on a discrete GPU by `INFR_DRAM_BYPASS` — the dense leg
-  in `dense_tier_parity` content-checks it and the MoE leg in
-  `gpu_seam_paged_moe_host_tier_matches_resident` is token-identical, both shown
-  to fail when the tier serves a neighbouring block. What is NOT covered is the
-  SELECTION and the sizing: that `unified_memory` is actually set on real iGPU
-  and APU parts, and that `paging.cache` (the arena above, which on those parts
-  comes out of shared RAM) ends up large enough to be worth having — nothing
-  currently sizes it against HOST memory the way `paging.dram` now is. Needs an
-  APU to answer. Metal is a separate question: it has no pager at all until
+- **The unified-memory path's sizing is unverified.** An iGPU/APU streams
+  `DISK → GPU-accessible RAM` with no host cache (`HostPager::stream_only`,
+  selected by `DeviceCaps::unified_memory`). The MECHANISM is covered on a
+  discrete GPU by `INFR_DRAM_BYPASS` — the dense leg in `dense_tier_parity`
+  content-checks it and the MoE leg in
+  `gpu_seam_paged_moe_host_tier_matches_resident` is token-identical. The
+  SELECTION is seen on the Ryzen 9950X3D's Raphael iGPU (RADV): `unified_memory`
+  is set there and the banner prints `UNIFIED MEMORY` (run). What is NOT covered
+  is the sizing: nothing sizes `paging.cache` (which on such parts comes out of
+  shared RAM) against HOST memory the way `paging.dram` is, and no streamed
+  model has been run on the iGPU. A feature (a host-memory term in the arena
+  sizing) plus a run of a streamed model on the iGPU. Metal has no pager until
   phase 4, so it inherits none of this yet.
 - **Layer-major prefill LANDED; what is left is where it does not reach.** The
   chunk loop now runs inside the layer loop for a streamed model
@@ -869,14 +857,13 @@ residue worth tracking; what follows is that plus what was deliberately left.
     layer-major path today (its backend hosts no dense pager), so the flag is
     inert there until something forces it on.
 
-- **`Pager`'s LRU is O(n_slots) per touch.** `mark_mru`, `evict` and
-  `take_slot`/`take_slot_opt` all do `lru.iter().position(...)` followed by
-  `VecDeque::remove`. The module doc scopes this to "tens to low hundreds" of
-  slots and names the intrusive doubly-linked list as the upgrade path, and at
-  today's model sizes it is genuinely not worth doing. It stops being true at
-  DeepSeek-V4-Flash scale: 256 experts x 43 layers is ~11k blocks per role, and
-  an MoE decode step touches ~6 experts x 43 layers x 3 roles per token. Fix it
-  before that model, not because of a measurement today.
+- **`Pager`'s eviction is O(n_slots) per miss.** A touch is O(1) now
+  (`infr_core::pager::Pager` keeps a `recency` stamp per block in a `HashMap`),
+  but choosing the victim (`Pager::coldest`) scans every resident block. That is
+  a scan per MISS, not per touch, and at today's model sizes it is not worth
+  changing. At DeepSeek-V4-Flash scale (256 experts × 43 layers per role) a
+  miss-heavy decode would pay it often; an ordered index on the stamp is the
+  fix. Not measured.
 - **The dense session mutex spans the disk read.** `stage_dense_linear`
   (`infr-vulkan/src/adapter.rs`) holds `be_.dense_pager().lock()` across
   `DensePagerSession::stage`, which reaches `HostPager::fill` and blocks on I/O.
@@ -884,12 +871,6 @@ residue worth tracking; what follows is that plus what was deliberately left.
   every sequence serializes on every other sequence's disk reads. Related to the
   `--parallel` sizing gap recorded in B35 but a distinct problem: that one is
   about arena capacity, this one is about lock hold time.
-- **Checked and CLEARED, so it is not re-investigated:** `plan_slots`'
-  proportional split cannot affect bytes read. Total cached bytes equal the
-  arena size no matter how slots divide across size classes, because a dense
-  pass touches every block exactly once — the split only decides WHICH blocks
-  are cached, not how many bytes. Any fully-spending split is equivalent on I/O
-  volume.
 
 ### B37 — a macOS break in `infr-llama` still costs a macOS runner (2026-09-02)
 
@@ -914,11 +895,6 @@ a macOS runner in about three minutes rather than a Linux one in about one.
 That is a small enough difference that paying for an SDK (osxcross or similar)
 on the cross-lint job is probably not worth it. Recorded so the question is not
 re-opened from scratch.
-
-Worth keeping either way: `rustup target list --installed` claimed
-`aarch64-apple-darwin` was present on this machine while
-`$(rustc --print sysroot)/lib/rustlib/` did not contain it, so a local
-cross-check has to be run against a target confirmed in the sysroot.
 
 ### B48 — the segment-abort error paths are wired but never fired (2026-08-10)
 
@@ -999,27 +975,26 @@ Apple hardware on the dev box, so this can only be verified on the macOS CI job.
 
 `seam/wshape.rs` derives each weight's expected dims from `Config` and `wload`
 refuses a mismatch by name with both shapes (trailing size-1 dims ignored, as in
-llama.cpp). Checked: the globals, attention and FFN norms, the standard q/k/v/o
-projections with their biases and q/k norms (per-layer head dim and KV-head
-count, the qwen35 doubled query), bitnet's sub-norms, the dense FFN, the MoE
-router / expert banks / `exp_probs_b` / shared experts, and DeepSeek MLA
-`attn_q_a` / `q_a_norm` / `q_b` / `q`, `kv_a_mqa`, `kv_a_norm` and
-`attn_output`. Not checked, because the expected shape could not be derived with
-confidence:
+llama.cpp). DeepSeek V4's mixer, compressor, indexer and hyper-connection
+tensors are checked too (`dsv4_weight_shape`, transcribed from
+`deepseek4.cpp::load_arch_tensors`; `attn_output_a` is compared with its dims
+past the first folded, so llama.cpp's 3-D form loads), and a V4 file whose
+tensors follow a different `attention.key_length_swa` is refused by name.
+`synthetic_deepseek2.rs` grows each V4 tensor by one row and expects that
+refusal. Not checked, because the expected shape could not be derived with
+confidence or the loader does not go through `wload`:
 
-- MLA `attn_k_b` / `attn_v_b` (the `Op::Mla` test declares `wv_b` in a different
-  order from llama.cpp), and the V3.2 lightning indexer.
-- Every DeepSeek V4 mixer, compressor and hyper-connection tensor. So the two V4
-  gaps found reading `src/models/deepseek4.cpp` are still open: the reference
-  sizes `wo_a` as `n_head * n_embd_head / o_groups` with integer division, and a
-  non-dividing `output_group_count` goes unnoticed here; and the reference
-  shapes V4 tensors with the SWA head width, which equals the full one only
-  because no V4 GGUF declares `attention.key_length_swa`.
+- MLA `attn_k_b` / `attn_v_b` (the `Op::Mla` kernels read them in their own
+  head-major layout), and the V3.2 lightning indexer.
 - qwen35 DeltaNet tensors, the dual-FFN router / banks / extra norms, E2B
   per-layer embedding tensors, DiffusionGemma's self-conditioning MLP.
-- A KV-sharing layer's `attn_k` / `attn_v` (loaded, never read), `token_embd`
-  when only the host embedding path reads it, and the MTP head, whose loader
-  does not go through `wload`.
+- A KV-sharing layer's `attn_k` / `attn_v` (loaded, never read).
+- `token_embd` when only the host embedding path reads it (CPU backend, untied
+  `output.weight`): that path does not call `check_weight_shape`, so a wrong
+  `ne0` is read at the wrong stride. Applies to every arch, not only V4.
+- The MTP head, whose loader does not go through `wload`.
+- V4's `ffn_gate_tid2eid` is checked, but by `generate_dense_backend`'s own
+  vocabulary check rather than by `wshape.rs`.
 - A LEADING size-1 dim is not ignored; no GGUF writer is known to emit one.
 
 ### B53 — V4's KV geometry duplicates the V side (2026-08-10)
@@ -1309,12 +1284,6 @@ iGPU when pointed at it.
   What is still NOT verified against a real file: any NUMBER the graph computes
   — the refusal fires before a single forward pass, so shapes and names are all
   this proves.
-- **The real file's dtype set is wider than the fixture's.** The fixture writes
-  f32 for everything but `ffn_gate_tid2eid` (now i32, matching); the real file
-  is `{Q2_K: 129, Q8_0: 660, F32: 492, BF16: 43, Q6_K: 1, I32: 3}`. The 43 BF16
-  tensors are the per-layer `ffn_gate_inp.weight` routers — a bf16 router has
-  never been exercised by any V4 test, and the fixture cannot express one
-  without a per-tensor dtype beyond the i32 arm added for the routing table.
 
 ### B-DSV4 — what the V4 attention primitives do NOT cover yet (2026-08-10)
 
@@ -1365,19 +1334,12 @@ a silent fallback.
   `linear_f16_noext`, plus a `w_off % 2 == 0` obligation on the two that read
   the weight as packed u32 words. Nothing produces an f16 `w_off` today.
 - **gemma4's V-norm and llama4's L2-norm still pass a ones-vector weight** to
-  `Op::QkNorm`. They could now pass `None` and drop a per-graph `head_dim`-float
+  `Op::QkNorm`. They could pass `None` and drop a per-graph `head_dim`-float
   allocation each; the numbers are bit-identical (`x * s * 1.0` is `x * s` in
   IEEE, which `qknorm_weightless_matches_a_ones_weight` asserts at
-  `max_err == 0`). Left alone because it is an edit to `crates/infr-llama/src`,
-  which the op-level slice did not own.
-- **Metal has never been executed.** No Apple hardware was available; the three
-  new kernels (`qknorm_nw_f32`, the `backward` arm of `rope_f32`, and the two
-  `ATTN_SINKS_KERNEL` instantiations) typecheck via
-  `cargo check -p infr-metal --all-targets --target x86_64-apple-darwin`, and
-  MSL is compiled on-device at runtime, so the macOS CI job is their first real
-  compile AND their first execution. The three `#[ignore]`d tests
-  (`qknorm_weightless_parity`, `rope_backward_parity`, `attention_sinks_parity`)
-  are what will report it.
+  `max_err == 0`). A cleanup, not a defect. Blocked for llama4 by the missing
+  f16-x weightless kernel above (its L2 norm reads f16); for gemma4, no gemma-4
+  model is cached here to confirm its goldens after the change.
 
 ### B-DSV4-HC — what the Sinkhorn hyper-connection ops do NOT cover yet (2026-08-10)
 
@@ -1387,16 +1349,6 @@ op-level slice, which was explicitly "add the ops, emit nothing"
 `Op::HyperConnectMix` / `HyperConnectPre` / `HyperConnectPost` are implemented
 and parity-tested on CPU + Vulkan (and typechecked on Metal). What is left:
 
-- **How the widened stream is SEEDED is an assumption, not a transcription.**
-  The ratio-0 emit replicates the token embedding across all `hc_mult` streams
-  (`Op::CopyStrided` per stream, in the prologue). Neither `docs/deepseek.md` §
-  Stage 4 nor this file records what `deepseek4.cpp` actually does there — the
-  read slice covered the compressed caches, the attention block and the HC math,
-  not the stream initialisation. Replication is what the hyper-connections
-  formulation calls for and what makes the head's collapse a partition of unity
-  at depth 0, but it has not been checked against the source. **Read
-  `deepseek4.cpp`'s `build_arch_graph` prologue and confirm it before trusting a
-  real V4 checkpoint's output.** A wrong seed produces plausible logits.
 - **The weightless RMSNorm over the flattened `hc*n_embd` row went the
   ones-vector way**, not the `Op::RmsNorm { weight: Option<_> }` way: one
   `hc_mult*n_embd`-wide vector of 1.0 is uploaded per V4 session, matching the
@@ -1412,35 +1364,25 @@ and parity-tested on CPU + Vulkan (and typechecked on Metal). What is left:
   `rows × 24` floats of work, so it is unlikely to matter; `hyper_post` writes
   `rows × hc × n_embd` and is the one to measure first. Nothing here is
   measured.
-- **`hc_mult` is capped at `HYPER_CONNECT_MAX_MULT` (8)** by a host check in
-  each backend. Raising it means raising `HC_MAX` in `hyper_mix.comp` and
-  `elementwise_norms.metal` together — the constant is duplicated in three
-  places (Rust, GLSL, MSL) with no compile-time link between them, only the host
-  refusal keeping the kernels in range.
-- **`Op::HyperConnectMix` writes three outputs.** Vulkan's `dispatch` treats the
-  trailing `n_out` bindings as writes and Metal takes an explicit write mask, so
-  the hazard tracking is right — but this is the first op in the codebase with
-  more than two `dst`s, and no fusion/scheduling pass has been looked at for it.
-- **Metal has never been executed.** No Apple hardware was available; the four
-  new kernels (`hyper_mix_f32`, `hyper_mix_gates_f32`, `hyper_pre_f32`,
-  `hyper_post_f32`) typecheck via
-  `cargo check -p infr-metal --all-targets --target x86_64-apple-darwin`, and
-  MSL is compiled on-device at runtime, so the macOS CI job is their first real
-  compile AND their first execution. The three `#[ignore]`d tests in
-  `crates/infr-metal/tests/parity.rs` (`hyper_connect_mix_parity`,
-  `hyper_connect_pre_parity`, `hyper_connect_post_parity`) are what will report
-  it.
+- **`hc_mult` is capped at `HYPER_CONNECT_MAX_MULT`** by a host check in each
+  backend, and the kernels size a private array by their own copy of it.
+  `adapter::tests::hyper_mix_bound_matches_host` fails if `hyper_mix.comp`'s
+  `HC_MAX` drifts from the Rust constant; the MSL copy in
+  `elementwise_norms.metal` has no such test (Metal is not built on the Linux
+  box, so the test would have to live in `infr-metal` and run on the macOS CI
+  job).
 - **`n_iter` is not exercised above 40, and `eps` only at 1e-6 / 1e-2.** The
   real V4 values come from `{arch}.hyper_connection.sinkhorn_iterations` and
-  `.epsilon`, neither of which has been read off a real GGUF (see § "Open
-  questions" 1 in `docs/deepseek.md` — no V4 file has been dumped).
+  `.epsilon`, neither of which has been recorded from a real GGUF (see § "Open
+  questions" 1 in `docs/deepseek.md`). Blocked on the real model
+  (`ggml-org/DeepSeek-V4-Flash-0731-GGUF`), which is not cached here.
 - **The four eps sites are not all pinned at production eps.** At `eps = 1e-6`
   the over-dst site moves the answer by ~3e-7, below the 1e-5 tolerance the
   backend comparisons run at; only the synthetic `eps = 1e-2` case pins it for
   an f32 kernel. Same for the asymmetric iteration COUNT (~1e-11 at 1e-6). Both
   are pinned in exact arithmetic by `hyper_connect_details_are_load_bearing`. If
   a real V4 GGUF turns out to use a small eps, a backend that dropped the
-  over-dst eps would pass every test here.
+  over-dst eps would pass every test here. Same blocker: the real file's eps.
 
 ### B-DSV4-POOL — what `Op::CompressPool` does NOT cover yet (2026-08-13)
 
@@ -1478,22 +1420,6 @@ fused, with the permutes folded into the indexing. What is left:
   justify it until there is a caller to profile. The CPU arm keeps two
   `n_embd`-wide scratch vectors per block, allocated inside the chunk closure —
   fine for a test, worth hoisting if it ever runs hot.
-- **Metal ran, and passed — so this is NOT a Metal gap.** No Apple hardware
-  here, but the `test-macos` CI job runs `cargo test -p infr-metal` with
-  `--include-ignored`, and run `33268167452` logged
-  `test compress_pool_parity ... ok` and
-  `test compress_pool_all_neg_inf_window_is_zero ... ok` on `macos-15`. That is
-  a real MSL compile and a real execution against CPU on a real device. Recorded
-  because the reflex on this arch has been to assume Metal is unverified; for
-  this op it is not.
-- **`maxerr`/`maxerr64` in `seam_op_parity.rs` silently swallow NaN** — they
-  fold with `f32::max`/`f64::max`, which return the non-NaN operand, so an
-  all-NaN output reduces to an error of `0.0` and reads as a perfect match. This
-  was found by injecting a dropped max-subtract into the CPU arm and watching
-  the wide-score case PASS. `compress_pool_parity` now calls its own
-  `cp_assert_finite` first; the other ~40 tests in that file still use the bare
-  helpers and would not notice a NaN-producing kernel. Fixing the helpers
-  themselves is a whole-file change this slice did not own.
 
 ### B-DSV4-HASH — what hash-routed MoE / the SwiGLU clamp do NOT cover yet (2026-08-13)
 
@@ -1549,13 +1475,6 @@ is left:
   means giving `PfChunk` an ids buffer that is separate from its host-embedded
   rows.
 
-- **`Op::io` still omits `exp_probs_b`.** Pre-existing (it lists `x`,
-  `router_x`, `router`, the three banks and `down_scale`); `expert_ids` was
-  added, `exp_probs_b` deliberately left alone as out of scope. It matters only
-  for the multi-device pipeline executor, which infers each op's device and cut
-  tensors from `Op::io` — an `exp_probs_b` on a pipeline boundary would not be
-  marked as read. No shipped pipeline config routes a deepseek2/3 MoE across a
-  cut, so this has never fired.
 - **The Vulkan PAGED MoE path refuses both features.** `execute_paged_moe`
   returns an error for `expert_ids` and for a clamp with
   Sigmoid/`weight_before`. The pager exists for an expert bank too large for
@@ -1570,15 +1489,6 @@ is left:
   `moe_ffn_hash_routing_parity` covers the softmax shape; the sqrt-softplus
   refusal is the real blocker for V4 on Metal and is untouched. Lifting it is
   what makes the refused `Op::GatherI32` above worth writing.
-- **Metal has never been executed.** No Apple hardware was available. The
-  changed kernels (`moe_topk`, `gatedact_f32`, `gatedactfused_f32`) typecheck
-  via `cargo check -p infr-metal --all-targets --target x86_64-apple-darwin`;
-  MSL compiles on-device, so the macOS CI job is their first real compile and
-  first execution. `gatedact_swiglu_clamp_parity` and
-  `moe_ffn_hash_routing_parity` in `crates/infr-metal/tests/parity.rs` are what
-  will report it. Note in particular that `GatedActParams` and `GatedParams`
-  both GREW by two words — every dispatch site had to be updated to push the
-  longer struct, and a missed one reads garbage into `do_clamp`.
 - **Vulkan's strided/sigmoid gated forms refuse the clamp.** `gelu_mul_off`
   (gemma4's per-layer-embd gate) and `mul_sigmoid` push the clamp words as zero
   and the adapter returns an error if a clamp reaches them. V4 is SiLU, so
@@ -1699,42 +1609,46 @@ layout enum, so there is no per-element assumption to falsify — a known-answer
 GEMM there would test the driver's arithmetic, not infr's assumption, and would
 cost init latency on every run.
 
-### B-HWDET-LIMITS — three device limits are still assumed at the spec minimum (2026-08-11)
+### B-HWDET-LIMITS — compute limits: what the workgroup-size guard does not cover (2026-08-11)
 
-**Tag:** vulkan · detection · **Blocked on:** nothing; the remaining items are
-perf-unmeasured or currently unreachable
+**Tag:** vulkan · detection · **Blocked on:** a perf measurement, and hardware
+with limits below desktop drivers'
 
-Two of the five items in the original audit entry are closed:
-`maxPushConstantsSize` is queried and every kernel's block is checked against it
-(`caps::check_push_constant_size`, called from `ops::try_make_compute_kernel`),
-and `maxStorageBufferRange` is queried into `crate::max_storage_buffer_range()`
-with `Recorder::vkb`'s bind check promoted from `debug_assert!` to a release
-`assert!` against the device's real number. What is left:
+Read from the device and enforced now: `maxPushConstantsSize` and the compute
+workgroup limits (`caps::KernelLimits`, checked per kernel by
+`caps::check_kernel_workgroup` in `ops::try_make_compute_kernel` and in
+`matmul_f32`, against the `LocalSize` `spirv::local_size` reads out of the
+module), and `maxStorageBufferRange` (`Recorder::vkb`'s release assert). A
+kernel the device cannot hold is refused by name, and the kernel cache releases
+its lock before that panic, so later requests still build. `Recorder::rmsnorm`
+asks the same predicate (`KernelLimits::admits`) before choosing the 1024-wide
+`rmsnorm_wide`, so a smaller device decodes on the 256-thread `rmsnorm`. All of
+this is tested through test-only overrides (see B144), not on a device that
+actually has such limits. What is left:
 
-- **`maxComputeWorkGroupCount[0]`** → `Recorder::MAX_GROUP_COUNT_X` is still
-  pinned at the guaranteed minimum, so every dispatch wider than that pays a 2-D
-  split RDNA3 does not need. Reading the real limit is a few lines; whether the
-  split costs anything measurable has **never been profiled**, and that
-  measurement is the actual blocker — not the code.
-- **`maxComputeWorkGroupInvocations` / `maxComputeWorkGroupSize`** → never
-  queried; every `local_size_x` is a compile-time constant at or under 1024.
-  That is **not** the guaranteed minimum, as this entry used to say: the Vulkan
-  required limits are 128 for `maxComputeWorkGroupInvocations` and for
-  `maxComputeWorkGroupSize[0]` (corrected 2026-11-11, from the spec's required
-  limits table as remembered, not re-read). Many kernels use 256, the wide
-  expert mmq tiles 512, and the `-DWIDE` build of `rmsnorm.comp` 1024, selected
-  in `Recorder::rmsnorm` with no limit check. Desktop drivers report 1024 or
-  more, so nothing fails today; it is safe by observation, not by spec. A guard
-  would have to live in the build (the sizes are baked into SPIR-V), which is
-  why it was not added with the push-constant one.
-- **`minStorageBufferOffsetAlignment`** → never queried; 256 (the spec's MAXIMUM
-  for this limit, so it over-aligns on every device) is hardcoded in the range
-  padding. Correct everywhere, wasteful nowhere that has been measured.
-
-**Not verified:** the new release `assert!` in `vkb` has never been seen to FIRE
-— no tensor in any model here comes near this device's 4 GiB
-`maxStorageBufferRange`, and the streamed/BDA path is what carries the big ones.
-It is a guard for a device that reports a smaller limit, which is not this one.
+- **The spec's subgroup-size rule (the VUID ending `-02756`): a pipeline built
+  with a pinned `requiredSubgroupSize` may have at most
+  `requiredSubgroupSize × maxComputeWorkgroupSubgroups` invocations.** Not
+  checked; `maxComputeWorkgroupSubgroups`
+  (`VkPhysicalDeviceSubgroupSizeControlProperties`) is not queried. Every kernel
+  builds and the `infr-vulkan` suite passes on the RX 7900 XTX and the Raphael
+  iGPU (run); whether either is near the limit was not checked, and a device
+  with a smaller one would build an invalid pipeline. A `caps::KernelLimits`
+  field plus a term in `check_workgroup_size`, testable through
+  `TEST_KERNEL_LIMITS`.
+- **A device under 256 invocations runs no rmsnorm at all.** The fallback is the
+  256-thread build, so such a device is refused at the first norm. Vulkan only
+  guarantees 128; desktop drivers report 1024 or more. A 128-thread twin would
+  close it if such a device ever matters.
+- **`maxComputeWorkGroupCount[0]`** is not read: `Recorder::MAX_GROUP_COUNT_X`
+  stays at the spec minimum, so every dispatch wider than that takes the 2-D
+  split (`dispatch_wide`) even on RDNA3, whose limit is far higher. Correct
+  everywhere; whether the split costs anything measurable has never been
+  profiled, and that measurement is the blocker. The flat grids that do not go
+  through `dispatch_wide` at all are B65.
+- **`minStorageBufferOffsetAlignment`** is not queried: 256, the spec's maximum
+  for it, is used everywhere (`BDA_WEIGHT_ALIGN`, `vkb`'s ranges). Correct on
+  every device; the over-alignment's cost is unmeasured.
 
 ### B-HWDET-FEATUREBITS — the bf16/f8 feature-bit code is written and cannot be exercised on this box (2026-08-11)
 
@@ -2045,36 +1959,6 @@ allows it.
   tape's whole ceiling is under a tenth of the step. Do the kernel tiers first;
   this is not the DeepSeek decode problem.
 
-**A third cost was found by measuring, and is FIXED** (`session_stable`'s
-`moe_batched_ok` in `seam/runner.rs`): the expert-bank dtype scan ran over EVERY
-layer, so DeepSeek's leading dense blocks (`Config::is_moe_layer` false, no
-`ffn_*_exps` tensor to look up) read `None`, failed the scan, and set
-`batched_prefill_ok` false for every DeepSeek model — the whole prompt was
-prefilled one token per submit. Measured before/after, alternating arms: V2-Lite
-pp512 39.1 → 975.5 (25×), pp2048 12.3 → 673.4 (54×); `deepseek` V1
-(`mradermacher/deepseek-moe-16b-chat-GGUF` Q4_K_M, same dense-lead shape, no
-MLA) pp512 229.0 → 4185.0, which is parity with llama.cpp Vulkan's 4320.07 ±
-358.49 on that model. Decode is untouched by it (tg64 111.0 → 111.2). The V1
-parity is the useful control: the batched MoE path itself is fine, so V2-Lite's
-remaining prefill gap is `mla.comp` too.
-
-**A coverage gap in the kernel's own parity test, found while landing the
-tier.** `recorder::tests::mla_matches_cpu_reference` is the DeepSeek-SIZED
-dispatch (`kv_lora_rank` 512, 16 heads) and it is SATURATED: its synthetic q and
-K make the two attended keys' scores differ by ~1e7, so the softmax is a hard
-argmax and the output is the winner's V regardless of the scores. Multiplying
-every score by 1.01 inside the kernel leaves its `max_err` at exactly 0 — the
-test cannot see a score-path defect at all, only a V/absorption/layout one. (It
-already carries a comment worrying about this shape for a different reason.)
-`mla_ring_and_mask_matches_cpu_reference` DOES catch it (the same perturbation
-takes it to `max_err` 1.97e-4 against a 1e-4 floor), so the pair is covered —
-but the big-shape test is not the guard its size suggests. Fix would be scaling
-its synthetic inputs so the scores land within a few units of each other.
-
-**Calibration, so this is not read as further behind than it is:** llama.cpp's
-**Vulkan** backend has no fused indexer either (see B-DSHW-FUSED-REF). `infr` is
-behind llama.cpp's CUDA backend here, not its Vulkan one.
-
 ### B-DSV2-ACTIVATION-PRECISION — int8 activations are not a DeepSeek defect, and landing f16 for `cfg.deepseek2` was declined (2026-08-11, closed 2026-08-12)
 
 **Tag:** deepseek · reference · **Blocked on:** nothing; this is a decision
@@ -2202,9 +2086,6 @@ again — nothing needs to be built.
 
 #### Coverage gaps, stated plainly
 
-- `weight_dequant_parity` covers Q4_K only. Every other format's `dqblk` arm in
-  `native_decode.glsl` is still compared only against another Vulkan build
-  (`weight_addr_parity`), never against the host.
 - The f32-activation row above also drops coopmat from the ATTENTION kernels
   (`INFR_NO_COOPMAT` disables the device feature wholesale), so it is not a pure
   activation-precision A/B. Its pp512 matching the earlier `exact_linear_acts`
@@ -2243,9 +2124,19 @@ the selected indices back into a `-inf` mask and runs dense attention,
 "realising none of the FLOP saving", whereas `infr` emits the `top_k` indices
 and leaves the gather open to the consumer. Nothing here suggests changing that.
 
-### B-DSHW-PULL — the llama.cpp reference moved 139 commits; what was re-verified and what was not (2026-08-11)
+### B-DSHW-PULL — the llama.cpp reference has moved past the pin the docs name (2026-08-11, updated 2026-11-12)
 
 **Tag:** deepseek · reference · **Blocked on:** nothing
+
+**The checkout is no longer at the pin below.** `~/Projects/mxaddict/llama.cpp`
+is now at `b10688-1-g57291f2` (`57291f2644af8c9df0dd8d44395881c5bdcf0ecd`), 331
+commits past `030ebb5`. Those commits were NOT re-diffed against
+`docs/deepseek.md`; re-read at `57291f2` (read, not diffed) were only
+`deepseek4.cpp`'s `load_arch_tensors` shapes — which still size V4 tensors with
+`n_embd_head_k()`, layer 0's and so the sliding-window head width (see B52) —
+and the hyper-connection stream seed in its graph prologue (`ggml_repeat_4d` of
+the token embedding across the `hc_mult` streams, which is what infr does).
+Everything below is the record of the earlier pull.
 
 `~/Projects/mxaddict/llama.cpp` was pulled from `b10218-1-gc629da5`
 (`c629da565c80b0b17fac6262acdca4d772e745d8`) to `b10356-2-g030ebb5`
@@ -2425,7 +2316,9 @@ a hot path
   answers coherently on both. So it reads as 2-bit V losing its precision margin
   on a 0.6B model under that driver's arithmetic rather than a Windows defect —
   unverified; the coopmat path the dGPU takes (the iGPU refuses coopmat) is the
-  first thing to rule in or out. Not run on Linux RADV in this session.
+  first thing to rule in or out. The same test passes on Linux RADV on the 7900
+  XTX (run, 2026-11-12), which points further at the proprietary driver;
+  confirming it needs the Windows box.
 - **Remaining iGPU benchmark exclusions.** `decode_gemv_bw` still needs
   device-selection preservation, scaled cache-busting allocations, bounded
   repetition submissions and asserted parity. `bandwidth_probe` needs a separate
@@ -2486,15 +2379,13 @@ Coverage gaps, stated plainly:
   the unit test's event-to-signal mapping. Closing a console window during a
   long generation, and checking the process exits 143, is the missing check.
 - **The f16 rounding probe off AMD's Windows driver.**
-  `VulkanBackend::arm_f16_rounding` was observed on two devices only: it armed
-  on the RDNA2 iGPU and stayed off on the RDNA3 7900 XTX. It was not run on Mesa
-  RADV, NVIDIA or Intel, so which of those default to truncation is unknown. The
-  probe decides for itself, so a wrong guess costs nothing, but no patched
-  module has ever been compiled by a non-AMD driver.
-- **Linux GPU behaviour after this session's Vulkan changes.** CI has no GPU.
-  The f16 probe, the misaligned-offset test fix and the `INFR_DEV` test knob
-  were run on Windows GPUs only; the Linux RADV box should rerun the ignored GPU
-  suites once.
+  `VulkanBackend::arm_f16_rounding` armed on the RDNA2 iGPU and stayed off on
+  the RDNA3 7900 XTX under Windows. On Linux RADV it stays off on the RDNA2 iGPU
+  (no arm line in an `infr run --dev vulkan1`, run 2026-11-12), matching the
+  function's doc. NVIDIA and Intel were not run, so which of those default to
+  truncation is unknown — hardware this project does not have. The probe decides
+  for itself, so a wrong guess costs nothing, but no patched module has ever
+  been compiled by a non-AMD driver.
 - **Broader Q4_K performance and portability coverage.** The packed-word
   `native_gemm_mmq_q4k.comp` optimization has only been measured on cached
   Qwen3-0.6B Q4_K_M with the Windows AMD RDNA2 iGPU. Other small models,
@@ -2842,17 +2733,34 @@ keep parity and document it as a property of the chat endpoint.
 
 ### B90 — chat stream: what the 2026-11-12 rework changed and left (2026-11-12)
 
-`ChatStream` now streams a plain JSON answer as soon as its first object closes
+`ChatStream` streams a plain JSON answer as soon as its first object closes
 (with tools on, a reply starting with `{` used to be held to the end), streams
-content that precedes a late `<think>`, and at the final flush settles every
-held stretch: calls fire, reasoning inside it goes out as reasoning, and the
-rest is content. Decided on the way, and worth knowing:
+content that precedes a late `<think>`, and settles every stretch it held at a
+tool-call opener: calls fire, reasoning inside the stretch goes out as reasoning
+where it sits, and the rest is content, in the order it was written. A lead-in
+held at an opener before `<think>` is settled when the `<think>` arrives (its
+end is known then), ahead of the reasoning; a stretch in the main content region
+is settled at `finish`. Decided on the way, and worth knowing:
 
 - **A tool-call block that does not parse is shown as content**, alone or beside
-  a valid call, in both the Hermes and the pipe dialect. The parsers used to
-  drop such a block; a block cut off by `max_tokens` now appears in the reply.
+  a valid call, in both the Hermes and the pipe dialect. A block cut off by
+  `max_tokens` appears in the reply. A reply with no parsed call is emitted byte
+  for byte (`a_reply_with_no_parsed_call_is_byte_identical`).
+- **Whitespace changes only at a removed call.** Where a removed call had
+  whitespace on both sides, one gap survives: the side holding a line break (the
+  longer if both do), else one space — so a call on its own line does not join
+  the paragraphs or list items around it, and `A <call> B` reads `A B`. This is
+  in `tools::remove_spans`, so the non-streaming parsers' `clean` text follows
+  it too. In the stream, a call that opens a text span is judged against the
+  content actually shown so far, and only the stretch's last text span loses a
+  trailing gap, at the end of the reply.
 - **Mixed dialects fire Hermes calls first, then pipe calls**, not in the order
-  they appear in the text.
+  they appear in the text; every call in a stretch fires after the stretch's
+  text.
+- **The cut detection is textual** (`cut_edges` compares the span with the
+  parser's output from both ends). A removed call whose neighbouring text
+  happens to repeat the characters it shares with the output can be misjudged;
+  only whitespace is affected. Not seen in a test.
 - The "lead-in first seen during the final flush" path was made consistent with
   streaming but has no test: every `push` runs a non-final pass first, so the
   case cannot be produced today.
@@ -3478,6 +3386,19 @@ instead of from zero. Left:
   makes auto-sized qwen35 contexts LARGER — a visible change. Separately, the
   MTP path's snapshot failure still fails the request (`?`) where the decode
   loop degrades.
+- **The MTP rollback can leave a half-restored state behind.**
+  `mtp_restore_delta` (in `seam/weights.rs`, called from the MTP loop in
+  `mtp/mod.rs` after a partial accept) copies the snapshot layer by layer and
+  only then truncates `cached` and sets `written_end`. If a copy fails partway,
+  the error propagates with `cached`/`written_end` unchanged and the snapshot
+  still valid, while the live state is part snapshot, part live; a later turn
+  that extends `cached` would take plain reuse on it. The decode loop's resume
+  arm had the same hazard and now clears `cached` and `written_end` before the
+  copy and invalidates the snapshot on failure
+  (`qwen35_failed_resume_is_not_reused_vulkan`). The MTP side was left because
+  its fix is the same reordering plus an invalidate inside `SeamKv`, not a
+  one-line change, and no test injects a failing copy into an MTP run (the
+  resume test's `RefuseKv` wrapper is the pattern to copy).
 - **Temperature-0 output can depend on where a chain stopped.** A resumed turn
   re-prefills the previous reply as a batch, where plain reuse had fed it token
   by token; the batched DeltaNet kernels chunk from the dispatch's first row, so
@@ -3485,9 +3406,10 @@ instead of from zero. Left:
   Bit-identity across turn splits did not hold before either.
 - **Untested:** the `seed_from` high-water change, and the snapshot under a real
   VRAM refusal (the test injects one through a wrapping backend, because no knob
-  makes the guard refuse a chosen allocation). The qwen35 chain tests are
-  `#[ignore]` and need a device whose `max_decode_chain` is at least 2 — the
-  iGPU's watchdog caps it at 1, so they run only on the RX 7900 XTX.
+  makes the guard refuse a chosen allocation). The qwen35 chain and snapshot
+  tests are `#[ignore]` and need a device whose `max_decode_chain` is at least
+  2; the iGPU's watchdog caps it at 1, so there they print a skip naming the
+  reason (`with_q35_vulkan`), and they run only on the RX 7900 XTX.
 - B94 leans on rows past `last_written` being ignored. That is no longer true
   for ring and qwen35 sessions, which now track them; re-read B94 with that in
   mind before building it.
@@ -3598,15 +3520,27 @@ the Apple target but were not run.
   project has a Metal device. `docs/ci-matrix.md` was corrected on this point.
 - **Windows golden hashes** (`per_os(windows, …)` in `QWEN3_GOLDEN` and
   `GEMMA3_GOLDEN`) are never asserted: `cpu-goldens` is Ubuntu-only.
+- **Tests that skip on an integrated GPU, and pass.** The qwen35 snapshot tests
+  in `seam/runner.rs` (`with_q35_vulkan`) skip where `max_decode_chain` is 1,
+  because no chain runs and no snapshot is taken. Four prefill-chunk helper
+  tests in `seam/mod.rs` (`default_chunk_is_discrete`) skip once the process has
+  opened an integrated GPU, because the default chunk they assert follows the
+  process-global device class (see B145). Both print the reason on stderr even
+  without `--nocapture`; a run on the iGPU alone therefore checks neither.
 
 ### B141 — assertions weaker than the tests' names (2026-11-11)
 
 - **The Vulkan KV-format "coherent" tests still assert only
   `!is_degenerate(out)`**, which empty output, garbage and an implementation
-  that ignores the KV dtype all pass. Their CPU twins now go through
-  `assert_kv_formats_track_the_f32_cache` (logits differ from the f16 cache's,
-  and greedy picks agree with the f32 cache on most rows of a short prompt). The
-  Vulkan ones have no all-rows logits API to score with.
+  that ignores the KV dtype all pass. Their CPU twins go through
+  `assert_kv_formats_track_the_f32_cache`: a format's logits must differ bit for
+  bit from both the f16 and the f32 cache's (so neither the default nor a silent
+  fall-back to f32 passes), and on most rows of a short repeated prompt the f32
+  cache's greedy token must be among the format's few best — a near-tie flip
+  counts as agreement, a broken quantizer does not (a q4_0 with its nibble
+  halves swapped agrees on no row, run). The floor sits above the share of rows
+  that are not copies of an earlier repetition, so a cache wrong on all of them
+  fails. The Vulkan ones have no all-rows logits API to score with.
 - **Reported, not re-read:** `metal_kv_scratch_paths_are_coherent` pins one hash
   for eight KV formats with no f16 control; `mtp_head_trunk_acceptance_rate`
   prints the rate and asserts nothing about it (its model is not cached); no
@@ -3652,6 +3586,42 @@ macOS jobs, and through them a release.
 Not verified: the two fallback paths (feed down with an older cache entry
 present; exact hit whose cached copy fails to install). Nothing in CI can take a
 feed down, so they have only been read, not run.
+
+### B144 — device-limit refusals are tested through overrides, not on such a device (2026-11-12)
+
+The Vulkan refusals for a device with smaller limits than this box's are tested
+by playing that device on one test thread: `TEST_KERNEL_LIMITS`
+(`VulkanBackend::kernel_limits`, read by the kernel build and by
+`Recorder::rmsnorm`'s wide-vs-narrow choice) and `VKB_RANGE_CAP` (the
+`maxStorageBufferRange` `Recorder::vkb` holds a sub-tensor bind to). The tests —
+`a_workgroup_past_the_device_limit_is_refused_by_name`,
+`rmsnorm_falls_back_to_the_narrow_kernel_on_a_small_device`,
+`a_refused_kernel_does_not_poison_the_kernel_cache`,
+`vkb_refuses_a_sub_tensor_past_the_storage_range` — run on both GPUs here. What
+they cannot show:
+
+- That a real driver reporting those limits fills them the way the overrides do.
+  No device with limits below desktop drivers' is available.
+- Anything the overrides do not reach: the process-global
+  `max_storage_buffer_range` used by `check_bindable_size` has its own
+  `TEST_BIND_LIMIT`, and the subgroup-size rule in B-HWDET-LIMITS is not
+  modelled at all.
+- A kernel refused at build still panics (the kernel cache is infallible until
+  B98 threads a `Result` through); only the lock is released first.
+
+### B145 — the device class is process-global, so tests see whichever GPU opened first (2026-11-12)
+
+`infr_vulkan::device_class()` is published once, by the first `VulkanBackend`
+the process opens, and `seam::default_ubatch_rows` reads it. In a test binary
+run with `--include-ignored` on `INFR_DEV=vulkan1`, the first GPU test opens the
+iGPU and every later test sees the integrated default chunk, including pure unit
+tests that never touch a GPU. Four of them asserted the discrete default and
+failed; they now skip instead (`default_chunk_is_discrete`, B140). The coupling
+itself is left: a test's outcome depends on which device the binary opened
+before it. Options: make the chunk default a parameter the tests pass, or scope
+the device class per backend instead of per process. A design decision about
+`device_class()`'s one production reader, `default_ubatch_rows` (read); not
+attempted.
 
 ### Review coverage (2026-11-11, remaining areas)
 

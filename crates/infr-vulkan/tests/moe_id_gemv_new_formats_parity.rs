@@ -13,8 +13,8 @@
 //! arm-for-arm from ggml-quants.c), which keeps this test honest against the SAME decode the CPU
 //! backend trusts rather than a re-implementation living next to the shader.
 //!
-//! The 12 previously covered affine/codebook formats keep their parity coverage in
-//! `pager_gemv_parity.rs` / `pager_gemv_multi_parity.rs` / adapter.rs's batched MoE tests.
+//! The affine and k-quant formats (`AFFINE_DTYPES`) run through the same kernels against the same
+//! host dequant, so no `dqblk` arm is compared only with another Vulkan build.
 //!
 //! Run: `cargo test -p infr-vulkan --test moe_id_gemv_new_formats_parity -- --ignored --nocapture`
 use infr_core::backend::{Backend, BufferUsage};
@@ -52,6 +52,7 @@ fn block_geom(dt: DType) -> (usize, usize) {
         DType::Iq1M => (256, 56),
         DType::Bf16 | DType::F16 => (1, 2),
         DType::F32 => (1, 4),
+        dt if AFFINE_DTYPES.contains(&dt) => infr_gguf::block_layout(dt),
         other => panic!("no geometry for {other:?}"),
     }
 }
@@ -108,6 +109,21 @@ fn synth_block(dt: DType, rng: &mut Rng) -> Vec<u8> {
             let v = ((rng.byte() as f32) - 127.5) * 0.004;
             b.copy_from_slice(&v.to_le_bytes());
         }
+        // The affine formats: f16 `d` (and `m`/`dmin` where the format has one) at the offsets
+        // `dequant_block` reads them from; every quant and sub-scale bit stays random.
+        DType::Q4_0 | DType::Q5_0 | DType::Q8_0 | DType::Iq4Nl | DType::Iq4Xs => {
+            b[0..2].copy_from_slice(&d16)
+        }
+        DType::Q4_1 | DType::Q5_1 | DType::Q4K | DType::Q5K => {
+            b[0..2].copy_from_slice(&d16);
+            b[2..4].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+        }
+        DType::Q2K => {
+            b[80..82].copy_from_slice(&d16);
+            b[82..84].copy_from_slice(&half::f16::from_f32(0.01).to_le_bytes());
+        }
+        DType::Q3K => b[108..110].copy_from_slice(&d16),
+        DType::Q6K => b[208..210].copy_from_slice(&d16),
         other => panic!("no synth for {other:?}"),
     }
     b
@@ -162,8 +178,26 @@ const NEW_DTYPES: &[DType] = &[
     DType::F32,
 ];
 
+/// The affine and k-quant formats. Run through the same kernels as [`NEW_DTYPES`], so every
+/// `dqblk` arm in `native_decode.glsl` is held to the host dequant, not only to another Vulkan
+/// build.
+const AFFINE_DTYPES: &[DType] = &[
+    DType::Q4_0,
+    DType::Q4_1,
+    DType::Q5_0,
+    DType::Q5_1,
+    DType::Q8_0,
+    DType::Q2K,
+    DType::Q3K,
+    DType::Q4K,
+    DType::Q5K,
+    DType::Q6K,
+    DType::Iq4Nl,
+    DType::Iq4Xs,
+];
+
 /// Resident-bank floor: `linear_native_id` (every slot) + `linear_native_id_multi` (all slots in
-/// one dispatch), per new dtype, vs the host dequant reference.
+/// one dispatch), per dtype, vs the host dequant reference.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn new_dtype_id_gemv_matches_host() {
@@ -175,7 +209,7 @@ fn new_dtype_id_gemv_matches_host() {
     let (in_f, out_f, n_expert) = (256usize, 4usize, 3usize);
     let stride = in_f * out_f;
 
-    for &dt in NEW_DTYPES {
+    for &dt in NEW_DTYPES.iter().chain(AFFINE_DTYPES) {
         let bank = synth_bank(dt, n_expert * stride, 0x5eed ^ dt as u64);
         let host_w = infr_gguf::dequant::dequant_block(dt, &bank).unwrap();
         assert_eq!(host_w.len(), n_expert * stride);
@@ -271,7 +305,7 @@ fn new_dtype_id_gemv_paged_matches_host_under_eviction_churn() {
     let (in_f, out_f, n_expert) = (256usize, 4usize, 4usize);
     let stride = in_f * out_f;
 
-    for &dt in NEW_DTYPES {
+    for &dt in NEW_DTYPES.iter().chain(AFFINE_DTYPES) {
         let (epb, bpb) = block_geom(dt);
         let stride_bytes = stride / epb * bpb;
         let banks: Vec<Vec<u8>> = (0..n_expert)

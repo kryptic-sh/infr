@@ -66,8 +66,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   vocabulary now logs a warning.** It is still used.
 - **A GGUF whose weight shapes disagree with its own metadata is refused at
   load**, with the tensor's name and both shapes. Such a file used to load and
-  then compute garbage or read out of bounds. Not every tensor is covered yet.
-
+  then compute garbage or read out of bounds. DeepSeek V4's tensors are covered;
+  not every tensor of every architecture is yet.
+- **Vulkan: a kernel whose workgroup is larger than the device allows is refused
+  by name**, and the wide RMS-norm kernel is chosen only on a device that can
+  run it; a smaller device uses the narrow one.
 - **DiffusionGemma: even seeds no longer repeat the next odd seed.** The seeded
   RNG forced its state odd, so `--seed 2` and `--seed 3` gave the same output.
   Every even seed and seed 0 now draw a different stream — including the default
@@ -92,7 +95,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (it was held until the end in case it was a tool call), text before a late
   `<think>` block is no longer dropped, and a tool call that follows such text
   now runs. A tool-call block that cannot be parsed, for instance one cut off by
-  `max_tokens`, is shown as content instead of disappearing.
+  `max_tokens`, is shown as content instead of disappearing. Text and reasoning
+  around a tool call arrive in the order the model wrote them, and removing a
+  call no longer leaves stray blank lines or joins the paragraphs on either side
+  of it.
 - **Forced tool calls on SentencePiece models (Llama 2, Mistral, Phi-3, Gemma
   3): the grammar now sees spaces.** It saw the `▁` marker instead, so it could
   not accept a space before or inside the JSON.
@@ -109,6 +115,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   earlier one no longer reads window rows that have been recycled.**
 - **A NaN logit or router score no longer panics the sampler or the CPU MoE
   routing.** The output is still NaN.
+- **Qwen3.5 / Qwen3.6: a snapshot restore that fails part-way can no longer be
+  followed by a turn that reuses the half-restored state.**
+- **DeepSeek on the CPU with paged weights, and on multi-GPU: the MoE router
+  bias is now pinned and bound like the other weights.** It was missing from the
+  list of tensors an MoE layer reads.
 - **The pipeline-cache crash tripwire no longer trusts a process id alone.** In
   a container every run can be pid 1, so a crashed run looked alive and its
   poisoned cache was kept. Each run now holds a file lock on its marker.

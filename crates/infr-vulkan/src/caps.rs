@@ -621,6 +621,80 @@ pub(crate) fn check_i8_coopmat_layout(out: &[i32]) -> Result<(), String> {
 
 // ── device limits ────────────────────────────────────────────────────────────────────────────────
 
+/// The device limits every kernel is checked against before its pipeline is built
+/// (`ops::try_make_compute_kernel`). Vulkan guarantees only a floor for each, so the number the
+/// device reports is the one that decides.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KernelLimits {
+    /// `maxPushConstantsSize`.
+    pub(crate) push_constants: u32,
+    /// `maxComputeWorkGroupInvocations`.
+    pub(crate) workgroup_invocations: u32,
+    /// `maxComputeWorkGroupSize`.
+    pub(crate) workgroup_size: [u32; 3],
+}
+
+impl KernelLimits {
+    pub(crate) fn of(limits: &ash::vk::PhysicalDeviceLimits) -> Self {
+        Self {
+            push_constants: limits.max_push_constants_size,
+            workgroup_invocations: limits.max_compute_work_group_invocations,
+            workgroup_size: limits.max_compute_work_group_size,
+        }
+    }
+
+    /// Whether a kernel built from `spv` passes [`check_kernel_workgroup`] on this device. A caller
+    /// choosing between a wide kernel and a narrower drop-in asks THIS, so the choice and the
+    /// pipeline-build refusal cannot disagree.
+    pub(crate) fn admits(&self, spv: &[u32]) -> bool {
+        check_kernel_workgroup("", spv, self).is_ok()
+    }
+}
+
+/// [`check_workgroup_size`] over the workgroup `spv` declares. A module with no literal `LocalSize`
+/// passes (no shader here lacks one — `spirv::tests` asserts it — so this skips nothing real).
+pub(crate) fn check_kernel_workgroup(
+    name: &str,
+    spv: &[u32],
+    limits: &KernelLimits,
+) -> Result<(), String> {
+    match crate::spirv::local_size(spv) {
+        Some(local) => check_workgroup_size(name, local, limits),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a kernel whose workgroup (its SPIR-V `LocalSize`) exceeds this device's
+/// `maxComputeWorkGroupSize` in any dimension or `maxComputeWorkGroupInvocations` in total. The
+/// sizes are baked into the SPIR-V at build time, so a device below them cannot run that kernel at
+/// all; this names the kernel and the limit instead of building a pipeline the spec forbids.
+pub(crate) fn check_workgroup_size(
+    name: &str,
+    local: [u32; 3],
+    limits: &KernelLimits,
+) -> Result<(), String> {
+    for (axis, (have, max)) in ["x", "y", "z"]
+        .iter()
+        .zip(local.iter().zip(limits.workgroup_size))
+    {
+        if *have > max {
+            return Err(format!(
+                "kernel {name:?} has local_size_{axis} = {have}, but this device's \
+                 maxComputeWorkGroupSize[{axis}] is {max}"
+            ));
+        }
+    }
+    let total: u64 = local.iter().map(|&d| u64::from(d)).product();
+    if total > u64::from(limits.workgroup_invocations) {
+        return Err(format!(
+            "kernel {name:?} has {total} invocations per workgroup, but this device's \
+             maxComputeWorkGroupInvocations is {}",
+            limits.workgroup_invocations
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse a kernel whose push-constant block does not fit this device's `maxPushConstantsSize`.
 ///
 /// Vulkan only guarantees 128 bytes and nothing here queried the real number before, so every
@@ -1262,6 +1336,33 @@ mod tests {
     }
 
     // ── limits ──────────────────────────────────────────────────────────────────────────────────
+
+    /// The Vulkan floors (128 invocations, 128 wide in x and y, 64 in z), against the widest
+    /// workgroup here: a device at the floor must refuse it by name, one with room must not.
+    #[test]
+    fn workgroup_size_is_checked_per_axis_and_in_total() {
+        let floor = KernelLimits {
+            push_constants: 128,
+            workgroup_invocations: 128,
+            workgroup_size: [128, 128, 64],
+        };
+        let desktop = KernelLimits {
+            workgroup_invocations: 1024,
+            workgroup_size: [1024, 1024, 1024],
+            ..floor
+        };
+        assert_eq!(check_workgroup_size("k", [128, 1, 1], &floor), Ok(()));
+        assert_eq!(check_workgroup_size("k", [1024, 1, 1], &desktop), Ok(()));
+        let err = check_workgroup_size("rmsnorm_wide", [1024, 1, 1], &floor).unwrap_err();
+        assert!(
+            err.contains("rmsnorm_wide") && err.contains("maxComputeWorkGroupSize[x]"),
+            "{err}"
+        );
+        let err = check_workgroup_size("k", [64, 4, 1], &floor).unwrap_err();
+        assert!(err.contains("maxComputeWorkGroupInvocations"), "{err}");
+        let err = check_workgroup_size("k", [1, 1, 128], &floor).unwrap_err();
+        assert!(err.contains("maxComputeWorkGroupSize[z]"), "{err}");
+    }
 
     #[test]
     fn push_constant_check_refuses_only_an_oversize_block() {

@@ -1352,8 +1352,20 @@ pub(crate) fn generate_dense_backend(
             pfx
         } else if let Some(p) = resume {
             let _gp = req.and_then(|r| r.gate_pass());
-            super::weights::restore_delta(be, &kbufs[..], &vbufs[..], mtp_delta_ckpt)?;
+            // The slot describes nothing while the copy runs: a copy that fails after some layers
+            // were restored leaves the state half snapshot, half live. With `cached` empty the next
+            // turn zeroes instead of reusing it, and the snapshot — which a failed copy may also
+            // have been read from mid-write — is dropped.
             cached.truncate(p);
+            let kept = std::mem::take(cached);
+            *written_end = 0;
+            if let Err(e) =
+                super::weights::restore_delta(be, &kbufs[..], &vbufs[..], mtp_delta_ckpt)
+            {
+                super::weights::invalidate_delta(mtp_delta_ckpt);
+                return Err(e);
+            }
+            *cached = kept;
             *written_end = p;
             p
         } else {
@@ -6623,16 +6635,27 @@ mod tests {
         + 'a;
 
     /// Build the Vulkan fixture for the qwen35 chain tests and hand `body` the device and a runner,
-    /// or skip without a device.
+    /// or skip without a device — or on one whose decode chain is a single step (an integrated GPU
+    /// caps it so), where no chain runs and the decode loop takes no prefill-boundary snapshot, so
+    /// these tests' mechanism cannot be reached. The skip names the reason on the harness's own
+    /// stderr, so it shows without `--nocapture`.
     fn with_q35_vulkan(body: impl FnOnce(&infr_vulkan::VulkanBackend, &Q35Run<'_>)) {
+        use std::io::Write;
         let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
             eprintln!("skip: no Vulkan device");
             return;
         };
-        eprintln!(
-            "vulkan device: {}",
-            infr_core::backend::Backend::capabilities(&vk).name
-        );
+        let name = infr_core::backend::Backend::capabilities(&vk).name;
+        let chain = infr_core::backend::Backend::max_decode_chain(&vk);
+        if chain < 2 {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "skip: {name} runs a decode chain of {chain}, so no chain or prefill-boundary \
+                 snapshot happens and the qwen35 snapshot tests cannot exercise it"
+            );
+            return;
+        }
+        eprintln!("vulkan device: {name}");
         let (g, cfg) = open_synthetic("qwen35-chain", &qwen35_gguf(true));
         assert!(cfg.is_qwen35_attn_layer(1));
         let embd = std::sync::OnceLock::new();
@@ -6766,10 +6789,15 @@ mod tests {
     /// Delegates to the Vulkan backend, refusing every `KvCache` allocation once `refuse` is set —
     /// the VRAM guard turning down the snapshot's second copy of the recurrent state. There is no
     /// knob that makes the real guard refuse a chosen allocation.
+    ///
+    /// It also fails the `fail_copy_at`-th `copy_buffer` (counted in `copies`, 0 = never), for a
+    /// device copy that dies partway through restoring a snapshot.
     struct RefuseKv<'a> {
         vk: &'a infr_vulkan::VulkanBackend,
         refuse: std::sync::atomic::AtomicBool,
         refused: std::sync::atomic::AtomicUsize,
+        fail_copy_at: std::sync::atomic::AtomicUsize,
+        copies: std::sync::atomic::AtomicUsize,
     }
 
     impl infr_core::backend::Backend for RefuseKv<'_> {
@@ -6826,6 +6854,13 @@ mod tests {
             dst: &dyn infr_core::backend::Buffer,
             bytes: usize,
         ) -> infr_core::error::Result<()> {
+            use std::sync::atomic::Ordering::Relaxed;
+            let n = self.copies.fetch_add(1, Relaxed) + 1;
+            if n == self.fail_copy_at.load(Relaxed) {
+                return Err(infr_core::error::Error::Backend(
+                    "test: device copy failed".into(),
+                ));
+            }
             self.vk.copy_buffer(src, dst, bytes)
         }
         fn compile(
@@ -6880,6 +6915,8 @@ mod tests {
                 vk,
                 refuse: false.into(),
                 refused: 0.into(),
+                fail_copy_at: 0.into(),
+                copies: 0.into(),
             };
             // Allocate the slot's own state and cache first; refuse only what comes after.
             let mut slot = None;
@@ -6915,6 +6952,55 @@ mod tests {
                 1,
                 "a refused snapshot is not retried"
             );
+        });
+    }
+
+    /// A resume whose snapshot copy fails partway leaves the live state half restored. The slot
+    /// must not go on claiming the old `cached`: a next prompt that extends it would take plain
+    /// reuse and decode on that state. Instead the next turn zeroes, and matches a fresh slot.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn qwen35_failed_resume_is_not_reused_vulkan() {
+        use std::sync::atomic::Ordering::Relaxed;
+        with_q35_vulkan(|vk, run| {
+            let first = Q35_FIRST;
+            let be = RefuseKv {
+                vk,
+                refuse: false.into(),
+                refused: 0.into(),
+                fail_copy_at: 0.into(),
+                copies: 0.into(),
+            };
+            let mut slot = None;
+            run(&be, &first, 2, &mut slot, None, None);
+            let kv = slot.as_ref().expect("slot initialized");
+            assert_eq!(kv.written_end, kv.cached.len(), "the turn ended cleanly");
+            let then = [&kv.cached[..], &[5]].concat();
+            let mut fresh = Vec::new();
+            run(vk, &then, 1, &mut None, None, Some(&mut fresh));
+
+            // An identical resend resumes from the boundary snapshot; fail its SECOND copy, so
+            // the first layer buffer is already restored when the error comes back.
+            be.copies.store(0, Relaxed);
+            be.fail_copy_at.store(2, Relaxed);
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(&be, &first, 1, &mut slot, None, None)
+            }));
+            be.fail_copy_at.store(0, Relaxed);
+            let msg = failed
+                .expect_err("the resume did not fail")
+                .downcast::<String>()
+                .map(|m| *m)
+                .unwrap_or_default();
+            assert!(msg.contains("test: device copy failed"), "{msg}");
+
+            let mut after = Vec::new();
+            let stats = run(&be, &then, 1, &mut slot, None, Some(&mut after));
+            assert_eq!(
+                stats.n_cached, 0,
+                "the state after a failed resume was reused"
+            );
+            assert_eq!(after, fresh);
         });
     }
 

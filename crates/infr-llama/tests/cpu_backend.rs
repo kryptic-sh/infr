@@ -309,20 +309,38 @@ fn kv_check_prompt() -> String {
     "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6)
 }
 
-/// Fewest rows of [`kv_check_prompt`] on which a quantized KV cache must pick the same greedy
-/// token as the f32 cache. Scored per row, so the vocabulary bias every row shares cannot carry it
-/// the way it carries a whole-vocab logit cosine: pairing rows with unrelated ones agrees almost
-/// never. The floor sits a few rows below the lossiest shipped format, so the CI build's
-/// different float rounding has room, and above the share of rows that are not copies — a cache
-/// wrong on the whole first repetition fails it.
+/// Fewest rows of [`kv_check_prompt`] on which the f32 cache's greedy token must be among a
+/// quantized cache's [`KV_TOP_K`] best. Scored per row, so the vocabulary bias every row shares
+/// cannot carry it the way it carries a whole-vocab logit cosine: pairing each row with the next
+/// one agrees almost never. Counting a pick anywhere in the top few, rather than only as the top
+/// one, absorbs the near-tie flips that move with a build's float rounding (an exact-pick count
+/// put the lossiest format a handful of rows above this floor), and leaves the floor above the
+/// share of rows that are not copies — a cache wrong on the whole first repetition fails it.
 const KV_ROW_AGREEMENT_MIN: f64 = 0.8;
 
+/// How many of a quantized cache's best tokens a row's f32 pick may be among (see
+/// [`KV_ROW_AGREEMENT_MIN`]).
+const KV_TOP_K: usize = 3;
+
 /// What every KV-format check compares against, computed once per test binary: the prompt's
-/// tokens, the f32 cache's greedy pick per row, and the f16 cache's logits.
+/// tokens, the f32 cache's greedy pick per row, and a digest of the f32 and f16 caches' logits.
+/// Digests rather than the logits themselves: a row is a whole vocabulary of floats, and the
+/// checks only ask whether two runs produced the same ones.
 struct KvReference {
     ids: Vec<u32>,
     picks: Vec<Option<usize>>,
-    f16: Vec<f32>,
+    f32: u64,
+    f16: u64,
+}
+
+/// A digest of `logits` over each value's bit pattern, so "equal" means bit-for-bit equal.
+fn logits_digest(logits: &[f32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for v in logits {
+        v.to_bits().hash(&mut h);
+    }
+    h.finish()
 }
 
 fn kv_rows(path: &std::path::Path, k: &str, v: &str, ids: &[u32]) -> Vec<f32> {
@@ -344,6 +362,19 @@ fn kv_picks(logits: &[f32], rows: usize) -> Vec<Option<usize>> {
         .collect()
 }
 
+/// Each row's [`KV_TOP_K`] highest-scoring token ids.
+fn kv_tops(logits: &[f32], rows: usize) -> Vec<Vec<usize>> {
+    logits
+        .chunks(logits.len() / rows)
+        .map(|row| {
+            let mut ids: Vec<usize> = (0..row.len()).collect();
+            ids.select_nth_unstable_by(KV_TOP_K - 1, |&a, &b| row[b].total_cmp(&row[a]));
+            ids.truncate(KV_TOP_K);
+            ids
+        })
+        .collect()
+}
+
 fn kv_reference(path: &std::path::Path) -> &'static KvReference {
     static REFERENCE: std::sync::OnceLock<KvReference> = std::sync::OnceLock::new();
     REFERENCE.get_or_init(|| {
@@ -351,29 +382,45 @@ fn kv_reference(path: &std::path::Path) -> &'static KvReference {
         let ids = model
             .encode(&model.render_chat(&kv_check_prompt()).expect("render chat"))
             .expect("encode");
-        let picks = kv_picks(&kv_rows(path, "f32", "f32", &ids), ids.len());
-        let f16 = kv_rows(path, "f16", "f16", &ids);
-        KvReference { ids, picks, f16 }
+        let f32 = kv_rows(path, "f32", "f32", &ids);
+        let picks = kv_picks(&f32, ids.len());
+        let f32 = logits_digest(&f32);
+        let f16 = logits_digest(&kv_rows(path, "f16", "f16", &ids));
+        KvReference {
+            ids,
+            picks,
+            f32,
+            f16,
+        }
     })
 }
 
-/// Every `(K, V)` cache format must (a) actually reach the cache — its logits differ from the f16
-/// cache's — and (b) pick the f32 cache's greedy token on at least [`KV_ROW_AGREEMENT_MIN`] of
-/// [`kv_check_prompt`]'s rows, every one of which writes the cache and then attends over it.
+/// Every `(K, V)` cache format must (a) actually reach the cache — its logits differ from both the
+/// f16 cache's and the f32 cache's, so neither default nor a silent fall-back to f32 passes — and
+/// (b) rank the f32 cache's greedy token in its top [`KV_TOP_K`] on at least
+/// [`KV_ROW_AGREEMENT_MIN`] of [`kv_check_prompt`]'s rows, every one of which writes the cache and
+/// then attends over it.
 fn assert_kv_formats_track_the_f32_cache(path: &std::path::Path, formats: &[(&str, &str)]) {
     let reference = kv_reference(path);
     let rows = reference.ids.len();
     for &(k, v) in formats {
         let got = kv_rows(path, k, v, &reference.ids);
+        let digest = logits_digest(&got);
         assert!(
-            got != reference.f16,
+            digest != reference.f16,
             "K={k} V={v} produced the f16 cache's logits bit for bit — the dtype never reached the cache"
         );
-        let agree = kv_picks(&got, rows)
+        assert!(
+            digest != reference.f32,
+            "K={k} V={v} produced the f32 cache's logits bit for bit — the dtype fell back to f32"
+        );
+        let tops = kv_tops(&got, rows);
+        let agree = tops
             .iter()
             .zip(&reference.picks)
-            .filter(|(a, b)| a == b)
+            .filter(|(top, pick)| pick.is_some_and(|p| top.contains(&p)))
             .count();
+        eprintln!("KV K={k} V={v}: {agree} of {rows} rows agree with the f32 cache");
         assert!(
             agree as f64 >= KV_ROW_AGREEMENT_MIN * rows as f64,
             "K={k} V={v} agrees with the f32 cache on {agree} of {rows} rows (floor {KV_ROW_AGREEMENT_MIN})"

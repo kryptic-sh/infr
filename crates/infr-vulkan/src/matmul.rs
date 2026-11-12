@@ -158,6 +158,9 @@ impl VulkanBackend {
 
         let device = &self.shared.device;
         let spv = matmul_spv();
+        // Built outside the kernel cache, so it takes the cache's workgroup check here.
+        crate::caps::check_kernel_workgroup("matmul_f32", spv, &self.kernel_limits())
+            .map_err(be)?;
 
         // Every transient handle below is registered here as it is created, so all of them are
         // destroyed however this function leaves — including the dozen `?` early returns and the

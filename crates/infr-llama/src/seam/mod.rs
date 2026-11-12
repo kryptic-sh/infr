@@ -3782,6 +3782,26 @@ mod bda_cap_tests {
 mod seam_helper_tests {
     use super::{kv_pair_bytes, Config, DType, EngineConfig, PlacementPins, PlacementScope};
 
+    /// Whether this process's default prefill chunk is the discrete one these tests assert. The
+    /// device class is process-global and published by the first Vulkan backend any test in this
+    /// binary opens, so a GPU run on an integrated device (`INFR_DEV` naming one) moves the
+    /// default for every test after it. Such a run skips them, saying why on the harness's own
+    /// stderr; a CPU-only or discrete run checks them.
+    fn default_chunk_is_discrete(test: &str) -> bool {
+        use std::io::Write;
+        match infr_vulkan::device_class() {
+            Some(d) if d.integrated => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "skip: {test} asserts the discrete default prefill chunk, and this process \
+                     opened an integrated GPU"
+                );
+                false
+            }
+            _ => true,
+        }
+    }
+
     // NB: `parse_device_spec`'s own cases moved to `infr_core::config::tests` with the function
     // (this crate's duplicate of that grammar was deleted).
 
@@ -3791,6 +3811,9 @@ mod seam_helper_tests {
     /// placement sweeps. Collapsing them onto `Option::is_some` would silently re-enable the sweep.
     #[test]
     fn ubatch_value_and_presence_are_separate_readers() {
+        if !default_chunk_is_discrete("ubatch_value_and_presence_are_separate_readers") {
+            return;
+        }
         // Own scope: the fallback pins are process-global, and this test asserts the UNPINNED
         // default. (That this is even possible per-scope is the point of `PlacementPins`.)
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
@@ -4219,6 +4242,9 @@ mod seam_helper_tests {
     /// 17.5 GiB of 24.0 GiB — GPU + 8 GiB of weights, so not something a unit test can host.)
     #[test]
     fn kv_fit_walks_the_placement_chunk_ladder_gemma3_12b() {
+        if !default_chunk_is_discrete("kv_fit_walks_the_placement_chunk_ladder_gemma3_12b") {
+            return;
+        }
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let ec = EngineConfig::default();
@@ -4301,6 +4327,9 @@ mod seam_helper_tests {
     /// `INFR_UBATCH` collapses the list to that one height.
     #[test]
     fn dense_ubatch_ladder_is_the_only_one() {
+        if !default_chunk_is_discrete("dense_ubatch_ladder_is_the_only_one") {
+            return;
+        }
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         assert_eq!(super::DENSE_UBATCH_LADDER, [512, 256, 128]);
         let unset = EngineConfig::default();
@@ -4433,6 +4462,9 @@ mod seam_helper_tests {
     /// reserve against `XTX_ROOM` — rather than from the function under test.
     #[test]
     fn fit_math_and_placement_pick_the_same_rung() {
+        if !default_chunk_is_discrete("fit_math_and_placement_pick_the_same_rung") {
+            return;
+        }
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let ec = EngineConfig::default();

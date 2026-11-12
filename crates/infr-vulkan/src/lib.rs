@@ -322,10 +322,11 @@ struct VulkanShared {
     /// single alloc of a whole multi-GiB model is impossible. Falls back to a conservative 1 GiB
     /// (the Vulkan-guaranteed floor) if the device reports 0.
     max_mem_alloc_size: u64,
-    /// `maxPushConstantsSize` — every kernel's push block is checked against THIS rather than
-    /// against the 128 bytes Vulkan merely guarantees (see `ops::try_make_compute_kernel`, which
-    /// refuses an oversize block by name instead of letting `vkCreatePipelineLayout` fail a VUID).
-    max_push_constants: u32,
+    /// `maxPushConstantsSize` and the compute workgroup limits — every kernel's push block and
+    /// `LocalSize` are checked against THESE rather than against the floors Vulkan merely
+    /// guarantees (see `ops::try_make_compute_kernel`, which refuses an oversize kernel by name
+    /// instead of building a pipeline the spec forbids).
+    kernel_limits: crate::caps::KernelLimits,
     /// Declare round-to-nearest-even for 16-bit floats on every kernel that has an f16 type (see
     /// [`spirv::with_rte_f16`]). Set once, during construction and before any such kernel is built,
     /// and only where the driver was OBSERVED to round an f32→f16 conversion some other way — see
@@ -1231,8 +1232,26 @@ impl Drop for WeightProgress {
 
 impl infr_core::backend::ProgressScope for WeightProgress {}
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread stand-in for the device's [`caps::KernelLimits`], so a test can play a
+    /// device with smaller compute limits than this one without changing it for the tests beside
+    /// it. Read only through [`VulkanBackend::kernel_limits`].
+    pub(crate) static TEST_KERNEL_LIMITS: std::cell::Cell<Option<caps::KernelLimits>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
+    /// The limits every kernel is built against and every wide-vs-narrow kernel choice consults.
+    pub(crate) fn kernel_limits(&self) -> caps::KernelLimits {
+        #[cfg(test)]
+        if let Some(l) = TEST_KERNEL_LIMITS.with(std::cell::Cell::get) {
+            return l;
+        }
+        self.shared.kernel_limits
+    }
+
     /// `maxComputeSharedMemorySize` for the active device — the per-workgroup shared-memory budget
     /// the flash-attention tile height is sized against (cheap accessor; avoids cloning caps).
     pub fn max_shared_memory_bytes(&self) -> u32 {
@@ -2575,7 +2594,7 @@ impl VulkanBackend {
                 caps,
                 has_mem_budget,
                 max_mem_alloc_size,
-                max_push_constants: props.limits.max_push_constants_size,
+                kernel_limits: crate::caps::KernelLimits::of(&props.limits),
                 rte_f16: AtomicBool::new(false),
                 i8cm_layout_ok: OnceLock::new(),
                 push_descriptor,
@@ -2655,7 +2674,7 @@ impl VulkanBackend {
             16,
             None,
             self.shared.push_descriptor.is_some(),
-            self.shared.max_push_constants,
+            self.kernel_limits(),
             false,
         )?;
         let run = || -> Result<bool> {
@@ -2767,7 +2786,7 @@ impl VulkanBackend {
             // arithmetic only holds there; pin the probe identically.
             Some(32),
             self.shared.push_descriptor.is_some(),
-            self.shared.max_push_constants,
+            self.kernel_limits(),
             self.shared.rte_f16.load(Ordering::Relaxed),
         )?;
         let run = || -> Result<Vec<i32>> {

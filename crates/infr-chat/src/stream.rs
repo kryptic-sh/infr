@@ -37,6 +37,9 @@ pub struct ChatStream {
     // been emitted.
     lead: Option<(usize, usize)>,
     sent_lead: usize,
+    // The whitespace the content emitted so far ends in (empty when it ends in a word), or `None`
+    // before any content: what a removed call's leading gap is judged against.
+    shown_gap: Option<String>,
     allow_tools: bool,
     // Per-marker cursors so `emit` doesn't re-`find` from offset 0 over the whole buffer on every
     // pushed piece (that was O(n²) across a response). Each caches the first hit once found and
@@ -189,6 +192,7 @@ impl ChatStream {
             sent_c: 0,
             lead: None,
             sent_lead: 0,
+            shown_gap: None,
             allow_tools,
             cur_think_open: Cursor::default(),
             cur_think_close: Cursor::default(),
@@ -292,6 +296,8 @@ impl ChatStream {
                 }
             });
         if let Some((stop, end)) = lead {
+            let unsent = self.sent_lead < end;
+            let from = self.sent_lead;
             emit_region(
                 &self.raw,
                 0,
@@ -301,8 +307,13 @@ impl ChatStream {
                 false,
                 on_delta,
             );
-            if final_flush && stop < end {
-                settle_held(&self.raw[stop..end], on_delta);
+            note_shown(&mut self.shown_gap, &self.raw[from..self.sent_lead]);
+            // The lead-in ends at `<think>`, so a stretch held at an opener in it is complete the
+            // moment the opener arrives: settle it now, ahead of the reasoning that follows it.
+            // Content follows after the reasoning, so its end is not the reply's.
+            if unsent && stop < end {
+                settle_held(&self.raw[stop..end], &mut self.shown_gap, false, on_delta);
+                self.sent_lead = end;
             }
         }
         // Reasoning region: between `<think>` and `</think>` (or end, while still thinking).
@@ -313,11 +324,6 @@ impl ChatStream {
                 None => (self.raw.len(), !final_flush),
             };
             emit_region(&self.raw, rs, r_end, hold, &mut self.sent_r, true, on_delta);
-        }
-        // A lead-in held at a tool-call opener is settled only at `finish`; content after the
-        // reasoning waits with it so the content arrives in order.
-        if !final_flush && self.lead.is_some_and(|(stop, end)| stop < end) {
-            return;
         }
         // Content region: after `</think>` (or from the start when there's no `<think>` at all), up to
         // a tool-call opener (whose block is buffered, not streamed) or the end.
@@ -339,6 +345,7 @@ impl ChatStream {
             Some(t) => (t, false),
             None => (self.raw.len(), !final_flush),
         };
+        let from = cs + self.sent_c;
         emit_region(
             &self.raw,
             cs,
@@ -348,31 +355,77 @@ impl ChatStream {
             false,
             on_delta,
         );
+        note_shown(&mut self.shown_gap, &self.raw[from..cs + self.sent_c]);
         if let (true, Some(t)) = (final_flush, tool_open) {
-            settle_held(&self.raw[t..], on_delta);
+            settle_held(&self.raw[t..], &mut self.shown_gap, true, on_delta);
         }
     }
 }
 
-/// Settle a stretch streaming held back from a tool-call opener. A `<think>` span in it is
-/// reasoning, not content, and goes out as such. Every call in the rest fires, and what is not a
-/// call is emitted as content verbatim: prose around the calls with its own whitespace, and any
-/// block that did not parse (see [`crate::parse_hermes_tool_calls`]) — nothing the model wrote is
-/// dropped. The one exception is a remainder that is only whitespace once the calls are out,
-/// which shows nothing.
-fn settle_held(held: &str, on_delta: &mut dyn FnMut(Delta)) {
-    let (body, reasoning) = split_reasoning_spans(held);
-    if !reasoning.is_empty() {
-        on_delta(Delta::Reasoning(reasoning));
+/// Settle a stretch streaming held back from a tool-call opener, in textual order. A `<think>`
+/// span in it is reasoning, not content, and goes out as such where it sits. Every call in the
+/// rest fires (after the stretch's text), and what is not a call is emitted as content verbatim:
+/// prose around the calls, and any block that did not parse (see
+/// [`crate::parse_hermes_tool_calls`]) — nothing the model wrote is dropped, and a stretch with no
+/// call is emitted byte for byte.
+///
+/// Whitespace is touched only at an edge a removed call left (between two calls the parser itself
+/// leaves one gap). A call that opens a text span leaves the gap after it judged against what the
+/// reader already has (`shown_gap`, kept up to date here): nothing shown yet, or a gap there
+/// already, and it goes — unless it holds a line break the shown gap lacks. A call that closes the
+/// stretch's last text span at the end of the reply (`at_end`) takes the whitespace after it too.
+fn settle_held(
+    held: &str,
+    shown_gap: &mut Option<String>,
+    at_end: bool,
+    on_delta: &mut dyn FnMut(Delta),
+) {
+    let mut fired = Vec::new();
+    let spans = reasoning_spans(held);
+    // Only the stretch's last text span can end the reply; an earlier one is followed by more.
+    let last_text = spans.iter().rposition(|s| matches!(s, Span::Text(_)));
+    for (i, span) in spans.into_iter().enumerate() {
+        let text = match span {
+            Span::Reasoning(r) => {
+                if !r.is_empty() {
+                    on_delta(Delta::Reasoning(r.to_owned()));
+                }
+                continue;
+            }
+            Span::Text(t) => t,
+        };
+        // Dialect-aware: hermes JSON + qwen3.5/3.6 XML + gemma pipe-marker + llama3 bare JSON
+        // (hermes-only here silently dropped every non-qwen3 model's calls over serve).
+        let (clean, calls) = crate::parse_any_tool_calls(text);
+        let content = if calls.is_empty() {
+            text
+        } else {
+            let (opens_with_cut, closes_with_cut) = cut_edges(text, &clean);
+            let mut c = clean.as_str();
+            if opens_with_cut {
+                let rest = c.trim_start();
+                let gap = &c[..c.len() - rest.len()];
+                let keep = match shown_gap.as_deref() {
+                    None => false,
+                    Some("") => true,
+                    Some(shown) => gap.contains('\n') && !shown.contains('\n'),
+                };
+                if !keep {
+                    c = rest;
+                }
+            }
+            if at_end && closes_with_cut && Some(i) == last_text {
+                c = c.trim_end();
+            }
+            c
+        };
+        if !content.is_empty() {
+            note_shown(shown_gap, content);
+            on_delta(Delta::Content(content.to_owned()));
+        }
+        fired.extend(calls);
     }
-    // Dialect-aware: hermes JSON + qwen3.5/3.6 XML + gemma pipe-marker + llama3 bare JSON
-    // (hermes-only here silently dropped every non-qwen3 model's calls over serve).
-    let (content, calls) = crate::parse_any_tool_calls(&body);
-    let content = if calls.is_empty() { body } else { content };
-    if !content.trim().is_empty() {
-        on_delta(Delta::Content(content));
-    }
-    for call in calls {
+    for call in fired {
         on_delta(Delta::ToolCall {
             name: call.name,
             arguments: serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string()),
@@ -380,25 +433,65 @@ fn settle_held(held: &str, on_delta: &mut dyn FnMut(Delta)) {
     }
 }
 
-/// `text` without its `<think>…</think>` spans (an unclosed one runs to the end), and the
-/// reasoning inside them.
-fn split_reasoning_spans(text: &str) -> (String, String) {
+/// Whether removing calls from `text` (leaving `clean`) cut at its very start and at its very end:
+/// all that precedes the first difference, or follows the last, is whitespace.
+fn cut_edges(text: &str, clean: &str) -> (bool, bool) {
+    let head = text
+        .char_indices()
+        .zip(clean.chars())
+        .find(|((_, a), b)| a != b)
+        .map_or(clean.len().min(text.len()), |((i, _), _)| i);
+    let tail = text
+        .char_indices()
+        .rev()
+        .zip(clean.chars().rev())
+        .find(|((_, a), b)| a != b)
+        .map_or(text.len() - clean.len().min(text.len()), |((i, a), _)| {
+            i + a.len_utf8()
+        });
+    (
+        text[..head].trim().is_empty(),
+        text[tail..].trim().is_empty(),
+    )
+}
+
+/// Record that `text` was emitted as content: the whitespace the shown content now ends in.
+fn note_shown(gap: &mut Option<String>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let word = text.trim_end();
+    if word.is_empty() {
+        gap.get_or_insert_with(String::new).push_str(text);
+    } else {
+        *gap = Some(text[word.len()..].to_owned());
+    }
+}
+
+/// One stretch of a held span: text, or the inside of a `<think>…</think>`.
+enum Span<'a> {
+    Text(&'a str),
+    Reasoning(&'a str),
+}
+
+/// `text` split at its `<think>…</think>` spans (an unclosed one runs to the end), in order.
+fn reasoning_spans(text: &str) -> Vec<Span<'_>> {
     const TO: &str = "<think>";
     const TC: &str = "</think>";
-    let (mut content, mut reasoning) = (String::new(), String::new());
+    let mut out = Vec::new();
     let mut rest = text;
     while let Some(o) = rest.find(TO) {
-        content.push_str(&rest[..o]);
+        out.push(Span::Text(&rest[..o]));
         let inner = &rest[o + TO.len()..];
         let Some(c) = inner.find(TC) else {
-            reasoning.push_str(inner);
-            return (content, reasoning);
+            out.push(Span::Reasoning(inner));
+            return out;
         };
-        reasoning.push_str(&inner[..c]);
+        out.push(Span::Reasoning(&inner[..c]));
         rest = &inner[c + TC.len()..];
     }
-    content.push_str(rest);
-    (content, reasoning)
+    out.push(Span::Text(rest));
+    out
 }
 
 /// The heads that put a reply in the channel format (E2B/gpt-oss): reasoning after the thought
@@ -827,6 +920,146 @@ mod chat_stream_tests {
         );
         assert_eq!(t.len(), 1, "{t:?}");
         assert_eq!(c, "Sure. More text after it.");
+    }
+
+    /// Every delta, in emission order (streaming + finish).
+    fn deltas(pieces: &[&str]) -> Vec<Delta> {
+        let mut out = Vec::new();
+        let mut s = ChatStream::new(true);
+        for p in pieces {
+            s.push(p, &mut |d| out.push(d));
+        }
+        s.finish(&mut |d| out.push(d));
+        out
+    }
+
+    fn first_at(out: &[Delta], pred: impl Fn(&Delta) -> bool) -> usize {
+        out.iter()
+            .position(pred)
+            .unwrap_or_else(|| panic!("no such delta in {out:?}"))
+    }
+
+    /// A held stretch is settled in the order it was written: the content before a `<think>` in
+    /// it, then that reasoning, then the content after it.
+    #[test]
+    fn a_held_stretch_settles_in_textual_order() {
+        let out = deltas(&[
+            "<think>plan</think>",
+            "<tool_call>{\"name\": \"run_bash\", \"arguments\": {}}</tool_call> Before.",
+            "<think>second</think>",
+            " After.",
+        ]);
+        let before = first_at(
+            &out,
+            |d| matches!(d, Delta::Content(x) if x.contains("Before")),
+        );
+        let mid = first_at(
+            &out,
+            |d| matches!(d, Delta::Reasoning(x) if x.contains("second")),
+        );
+        let after = first_at(
+            &out,
+            |d| matches!(d, Delta::Content(x) if x.contains("After")),
+        );
+        assert!(before < mid && mid < after, "{out:?}");
+    }
+
+    /// A lead-in held at an opener before `<think>` reaches the reader before the reasoning that
+    /// follows it, not at `finish` after it.
+    #[test]
+    fn a_held_lead_in_arrives_before_the_reasoning_after_it() {
+        let out = deltas(&["Hi <tool_call>oops ", "<think>", "plan", "</think>", "done"]);
+        let lead = first_at(
+            &out,
+            |d| matches!(d, Delta::Content(x) if x.contains("oops")),
+        );
+        let think = first_at(&out, |d| matches!(d, Delta::Reasoning(_)));
+        assert!(lead < think, "{out:?}");
+    }
+
+    /// Whitespace that only separated a removed call from its neighbours is not shown, and a gap
+    /// that keeps two words apart is.
+    #[test]
+    fn whitespace_left_by_a_removed_call_is_dropped() {
+        const CALL: &str = "<tool_call>{\"name\": \"run_bash\", \"arguments\": {}}</tool_call>";
+        for (pieces, want) in [
+            (vec![CALL, "\n\nI'll check."], "I'll check."),
+            (vec!["A ", CALL, " B"], "A B"),
+            (vec!["A ", CALL, " and ", CALL, " B"], "A and B"),
+            (vec!["I'll check.\n", CALL, "\n"], "I'll check.\n"),
+        ] {
+            let (_r, c, t) = run(&pieces, true);
+            assert!(!t.is_empty(), "{pieces:?}: no call fired");
+            assert_eq!(c, want, "{pieces:?}");
+        }
+    }
+
+    const GOOD_CALL: &str = "<tool_call>{\"name\": \"run_bash\", \"arguments\": {}}</tool_call>";
+
+    /// A removed call's gap is judged against what the reader was actually shown — `"Hi "` here,
+    /// not the held call markup that followed it in the raw text.
+    #[test]
+    fn a_cut_gap_is_judged_against_the_shown_text() {
+        let lead = format!("Hi {GOOD_CALL}");
+        let main = format!("{GOOD_CALL} Done.");
+        let (_r, c, t) = run(&[&lead, "<think>p</think>", &main], true);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert_eq!(c, "Hi Done.");
+    }
+
+    /// Whitespace is trimmed only where a call was cut out: a span after a `</think>` keeps its
+    /// leading line breaks, though a call later in it was removed.
+    #[test]
+    fn a_span_after_reasoning_keeps_its_line_breaks() {
+        let first = format!("{GOOD_CALL}Before.\n");
+        let last = format!("\n\nAfter {GOOD_CALL}");
+        let (_r, c, _t) = run(
+            &["<think>p</think>", &first, "<think>t</think>", &last],
+            true,
+        );
+        assert_eq!(c, "Before.\n\n\nAfter");
+    }
+
+    /// A lead-in's last words keep the space before the content after the reasoning: only a
+    /// call's own cut is trimmed, and the lead-in does not end the reply.
+    #[test]
+    fn a_lead_in_keeps_the_space_before_later_content() {
+        let lead = format!("Hi {GOOD_CALL} now ");
+        let (_r, c, _t) = run(&[&lead, "<think>p</think>", "Done."], true);
+        assert_eq!(c, "Hi now Done.");
+    }
+
+    /// Only the stretch's LAST text span ends the reply: a span that closes with a call before
+    /// reasoning keeps its trailing gap, so the text after the reasoning is not glued to it.
+    #[test]
+    fn only_the_last_span_of_a_stretch_loses_its_trailing_gap() {
+        let held = format!("{GOOD_CALL}X {GOOD_CALL}<think>r</think>Y");
+        let (r, c, t) = run(&["<think>p</think>", &held], true);
+        assert_eq!(t.len(), 2, "{t:?}");
+        assert_eq!(r, "pr");
+        assert_eq!(c, "X Y");
+    }
+
+    /// With tools allowed and no call parsed, the content is the reply's text byte for byte,
+    /// whitespace included.
+    #[test]
+    fn a_reply_with_no_parsed_call_is_byte_identical() {
+        for pieces in [
+            &["Here:  ", "<tool_call>not json</tool_call>", "\n\n  "][..],
+            &["{not a call}  \n", "<think>p</think>", "  ok  "][..],
+            &["Hi <tool_call>oops\n\n", "<think>p</think>", "\n done"][..],
+        ] {
+            let want: String = pieces
+                .iter()
+                .map(|p| {
+                    p.split("<think>").next().unwrap_or_default().to_owned()
+                        + p.split("</think>").nth(1).unwrap_or_default()
+                })
+                .collect();
+            let (_r, c, t) = run(pieces, true);
+            assert!(t.is_empty(), "{t:?}");
+            assert_eq!(c, want, "{pieces:?}");
+        }
     }
 
     /// A Hermes call followed by a pipe-format call: both fire and neither is shown.

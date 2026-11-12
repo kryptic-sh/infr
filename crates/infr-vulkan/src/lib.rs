@@ -5238,7 +5238,8 @@ mod tests {
 }
 
 // qwen35 (Qwen3.5) SSM kernels: the GPU conv1d+SiLU and gated-DeltaNet recurrence must match the CPU
-// reference. Self-skip without a GPU (so CI passes, runs locally with a device).
+// reference. `#[ignore]`d like the rest of the GPU suite: a self-skip without a device would be
+// reported as a pass by CI, whose runners have none.
 #[cfg(test)]
 mod ssm_tests {
     use super::*;
@@ -5273,6 +5274,7 @@ mod ssm_tests {
     }
 
     #[test]
+    #[ignore = "requires a Vulkan GPU"]
     fn softcap_matches_cpu() {
         let be = match VulkanBackend::new() {
             Ok(b) => b,
@@ -5295,6 +5297,7 @@ mod ssm_tests {
     }
 
     #[test]
+    #[ignore = "requires a Vulkan GPU"]
     fn deltanet_matches_cpu() {
         let be = match VulkanBackend::new() {
             Ok(b) => b,
@@ -5390,6 +5393,7 @@ mod ssm_tests {
     }
 
     #[test]
+    #[ignore = "requires a Vulkan GPU"]
     fn conv1d_silu_matches_cpu() {
         let be = match VulkanBackend::new() {
             Ok(b) => b,

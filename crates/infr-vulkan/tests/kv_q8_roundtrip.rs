@@ -5,6 +5,7 @@ use infr_core::backend::{Backend, BufferUsage};
 use infr_vulkan::VulkanBackend;
 
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_store_dequant_roundtrip() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
@@ -53,6 +54,7 @@ fn planar_q8_store_dequant_roundtrip() {
 /// The record-once dynamic write (store_q8_dyn: off = p_pos*n) must land the same planar bytes as the
 /// static store. Writes a row at pos=3 via store_q8_dyn, dequants the prefix, checks that row.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_store_dyn_roundtrip() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
@@ -116,6 +118,7 @@ fn to_f16_bytes(v: &[f32]) -> Vec<u8> {
 /// The planar-Q8 split-K decode kernel (attn_partial_q8) must match the f16 attn_partial on the same
 /// logical KV within Q8 tolerance. Isolates the decode read from the full model path.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_attn_partial_matches_f16() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
@@ -238,6 +241,7 @@ fn planar_q8_attn_partial_matches_f16() {
 /// DECOUPLED K/V: mixed caches (K=q8 V=f16, and K=f16 V=q8) via the per-side attn_partial variants
 /// must match the all-f16 split within Q8 tolerance. Proves KQ8 and VQ8 are independent.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_attn_partial_mixed_kv() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
@@ -333,6 +337,7 @@ fn planar_q8_attn_partial_mixed_kv() {
 
 /// The record-once self-chunking planar-Q8 decode (attn_partial_dynac_q8) must match the f16 dynac.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_dynac_matches_f16() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");
@@ -456,6 +461,7 @@ fn planar_q8_dynac_matches_f16() {
 /// ROW capacity as the planar scales base (`cap`); this test pins the write path itself so a real
 /// regression can't hide behind that story again.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_store_replay_tape_matches_static() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");

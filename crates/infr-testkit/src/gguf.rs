@@ -16,6 +16,8 @@ pub enum Meta {
     U32(u32),
     /// An array of UINT32s — e.g. a per-layer `head_count_kv`.
     U32Arr(Vec<u32>),
+    /// An INT32 — what `gguf-py`'s `add_int32` writes, e.g. `general.sampling.top_k`.
+    I32(i32),
     F32(f32),
     Bool(bool),
     Str(String),
@@ -57,6 +59,10 @@ impl Meta {
                 for v in a {
                     push_u32(b, *v);
                 }
+            }
+            Meta::I32(v) => {
+                push_u32(b, 5);
+                b.extend_from_slice(&v.to_le_bytes());
             }
             Meta::F32(v) => {
                 push_u32(b, 6);

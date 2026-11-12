@@ -302,6 +302,85 @@ fn is_degenerate(s: &str) -> bool {
     t.chars().count() >= 8 && t.chars().collect::<std::collections::HashSet<char>>().len() <= 2
 }
 
+/// The prompt the KV-format numeric check scores: short, because every format costs a full
+/// prefill of it, and repeated, so most rows after the first repetition are copies — an induction
+/// task, which is the one a broken quantizer, dequant or K/V mix-up fails first.
+fn kv_check_prompt() -> String {
+    "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6)
+}
+
+/// Fewest rows of [`kv_check_prompt`] on which a quantized KV cache must pick the same greedy
+/// token as the f32 cache. Scored per row, so the vocabulary bias every row shares cannot carry it
+/// the way it carries a whole-vocab logit cosine: pairing rows with unrelated ones agrees almost
+/// never. The floor sits a few rows below the lossiest shipped format, so the CI build's
+/// different float rounding has room, and above the share of rows that are not copies — a cache
+/// wrong on the whole first repetition fails it.
+const KV_ROW_AGREEMENT_MIN: f64 = 0.8;
+
+/// What every KV-format check compares against, computed once per test binary: the prompt's
+/// tokens, the f32 cache's greedy pick per row, and the f16 cache's logits.
+struct KvReference {
+    ids: Vec<u32>,
+    picks: Vec<Option<usize>>,
+    f16: Vec<f32>,
+}
+
+fn kv_rows(path: &std::path::Path, k: &str, v: &str, ids: &[u32]) -> Vec<f32> {
+    model_cfg(path, |c| kv_types(c, k, v))
+        .verify_logits_and_h_cpu(ids)
+        .expect("all-rows logits")
+        .0
+}
+
+fn kv_picks(logits: &[f32], rows: usize) -> Vec<Option<usize>> {
+    logits
+        .chunks(logits.len() / rows)
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+        })
+        .collect()
+}
+
+fn kv_reference(path: &std::path::Path) -> &'static KvReference {
+    static REFERENCE: std::sync::OnceLock<KvReference> = std::sync::OnceLock::new();
+    REFERENCE.get_or_init(|| {
+        let model = model_cfg(path, |c| kv_types(c, "f32", "f32"));
+        let ids = model
+            .encode(&model.render_chat(&kv_check_prompt()).expect("render chat"))
+            .expect("encode");
+        let picks = kv_picks(&kv_rows(path, "f32", "f32", &ids), ids.len());
+        let f16 = kv_rows(path, "f16", "f16", &ids);
+        KvReference { ids, picks, f16 }
+    })
+}
+
+/// Every `(K, V)` cache format must (a) actually reach the cache — its logits differ from the f16
+/// cache's — and (b) pick the f32 cache's greedy token on at least [`KV_ROW_AGREEMENT_MIN`] of
+/// [`kv_check_prompt`]'s rows, every one of which writes the cache and then attends over it.
+fn assert_kv_formats_track_the_f32_cache(path: &std::path::Path, formats: &[(&str, &str)]) {
+    let reference = kv_reference(path);
+    let rows = reference.ids.len();
+    for &(k, v) in formats {
+        let got = kv_rows(path, k, v, &reference.ids);
+        assert!(
+            got != reference.f16,
+            "K={k} V={v} produced the f16 cache's logits bit for bit — the dtype never reached the cache"
+        );
+        let agree = kv_picks(&got, rows)
+            .iter()
+            .zip(&reference.picks)
+            .filter(|(a, b)| a == b)
+            .count();
+        assert!(
+            agree as f64 >= KV_ROW_AGREEMENT_MIN * rows as f64,
+            "K={k} V={v} agrees with the f32 cache on {agree} of {rows} rows (floor {KV_ROW_AGREEMENT_MIN})"
+        );
+    }
+}
+
 /// REGRESSION (CPU reference backend): the same repeated-forward invariant on the no-GPU
 /// compute-graph path. The CPU backend uses host buffers (no recycled-VRAM hazard), so this guards
 /// CPU coherence + determinism across repeated big-prompt forwards.
@@ -339,7 +418,8 @@ fn cpu_kv_q8_coherent() {
     let prompt = repeat_prompt();
     // Each K/V quant mix on its own model: the KV dtype is read at graph build, off the config the
     // model was loaded with.
-    for (k, v) in [("q8_0", "q8_0"), ("q8_0", "f16"), ("f16", "q8_0")] {
+    let formats = [("q8_0", "q8_0"), ("q8_0", "f16"), ("f16", "q8_0")];
+    for (k, v) in formats {
         let model = model_cfg(&path, |c| kv_types(c, k, v));
         let out = cpu_gen(&model, &prompt, 24);
         assert!(
@@ -348,6 +428,7 @@ fn cpu_kv_q8_coherent() {
             out.chars().take(48).collect::<String>()
         );
     }
+    assert_kv_formats_track_the_f32_cache(&path, &formats);
 }
 
 /// TurboQuant KV cache (CPU reference): WHT-rotated 2/3/4-bit PolarQuant, 128-elem blocks. The
@@ -359,7 +440,8 @@ fn cpu_kv_q8_coherent() {
 fn cpu_kv_turbo_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let mut _tlk = test_serial_lock();
-    for v in ["turbo2", "turbo3", "turbo4"] {
+    let widths = ["turbo2", "turbo3", "turbo4"];
+    for v in widths {
         let model = model_cfg(&path, |c| kv_types(c, "f16", v));
         let out = cpu_gen(&model, &repeat_prompt(), 24);
         assert!(
@@ -368,6 +450,8 @@ fn cpu_kv_turbo_coherent() {
             out.chars().take(48).collect::<String>()
         );
     }
+    let formats = widths.map(|v| ("f16", v));
+    assert_kv_formats_track_the_f32_cache(&path, &formats);
 }
 
 /// Mainline llama.cpp KV cache types (CPU reference): f32/bf16 (dense) + the low-bit round quants
@@ -379,7 +463,7 @@ fn cpu_kv_mainline_quants_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let mut _tlk = test_serial_lock();
     let prompt = repeat_prompt();
-    for (k, v) in [
+    let formats = [
         ("f32", "f32"),
         ("bf16", "bf16"),
         ("f16", "q4_0"),
@@ -387,7 +471,8 @@ fn cpu_kv_mainline_quants_coherent() {
         ("f16", "q5_0"),
         ("f16", "q5_1"),
         ("f16", "iq4_nl"),
-    ] {
+    ];
+    for (k, v) in formats {
         let model = model_cfg(&path, |c| kv_types(c, k, v));
         let out = cpu_gen(&model, &prompt, 24);
         assert!(
@@ -396,6 +481,8 @@ fn cpu_kv_mainline_quants_coherent() {
             out.chars().take(48).collect::<String>()
         );
     }
+    // The f32 cache is the reference itself.
+    assert_kv_formats_track_the_f32_cache(&path, &formats[1..]);
 }
 
 // Captured + verified coherent on the Vulkan backend via the agnostic compute seam (the SAME dense

@@ -267,7 +267,8 @@ impl DeviceOpts {
 #[derive(clap::Args)]
 struct SamplingOpts {
     /// Sampling temperature (0 = greedy/argmax). Config `sampling.temp` / INFR_TEMP. Default: the
-    /// model's recommended value (arch-family table + any generation_config.json beside the model)
+    /// model's recommended value (arch-family table, then any generation_config.json beside the
+    /// model, then the GGUF's own `general.sampling.*` keys)
     /// — e.g. 0.6 for Qwen3, 1.0 for Gemma; 0.6 fallback. The startup banner prints the effective
     /// value.
     #[arg(long, value_name = "T")]
@@ -1193,7 +1194,8 @@ fn cmd_run(
     // the ONE shared `Chat` (infr_llama::model) that owns history + `<think>`-stripping and drives
     // the single REPL below. Every backend does history-based multi-turn; qwen35 (Qwen3.5) rides
     // the SAME standard `ChatModel` structs (issue #30). Model-aware chat sampling first (arch-family
-    // table + generation_config sibling; a user `--temp`/`--top-k`/`--top-p` already in the env wins).
+    // table, generation_config sibling, then the GGUF's `general.sampling.*` keys; a user
+    // `--temp`/`--top-k`/`--top-p` already in the env wins).
     let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
     let mut model = build_chat_model(&gguf, tok.as_deref(), is_dg, &cfg)?;
     // Compile the lazily-built pipelines NOW (like `serve` does before its first request) so the
@@ -3916,10 +3918,10 @@ fn arch_sampling(arch: &str) -> (f32, usize, f32) {
         GEMMA3 | GEMMA4 | DIFFUSION_GEMMA => (1.0, 64, 0.95),
         // Meta Llama 3.x / 4 default generation_config: temp 0.6, top_p 0.9, top_k off.
         LLAMA | LLAMA4 => (0.6, 0, 0.9),
-        // DeepSeek: neutral chat default. None of the DeepSeek GGUF distributions ships a
-        // `generation_config.json` sibling for `generation_config_sampling` to override with, and
-        // the family publishes no per-arch recommendation, so all four arch strings stay on the
-        // same neutral values rather than on invented ones.
+        // DeepSeek: neutral chat default. The family publishes no per-arch recommendation, so all
+        // four arch strings stay on the same neutral values rather than on invented ones; a file
+        // that declares its own (`general.sampling.*`, or a `generation_config.json` sibling)
+        // overrides them in `model_sampling_defaults`.
         DEEPSEEK | DEEPSEEK2 | DEEPSEEK32 | DEEPSEEK4 => (0.6, 20, 0.95),
         _ => (0.6, 20, 0.95),
     }
@@ -3943,14 +3945,21 @@ fn generation_config_sampling(gguf: &std::path::Path) -> (Option<f32>, Option<us
         v.get("temperature")
             .and_then(|x| x.as_f64())
             .map(|x| x as f32),
-        v.get("top_k").and_then(|x| x.as_u64()).map(|x| x as usize),
+        // A negative top_k is "keep all", as in the GGUF layer.
+        v.get("top_k")
+            .and_then(|x| x.as_i64())
+            .map(|x| usize::try_from(x).unwrap_or(0)),
         v.get("top_p").and_then(|x| x.as_f64()).map(|x| x as f32),
     )
 }
 
-/// The model-aware sampling defaults for `gguf`: the [`arch_sampling`] family table, with any
-/// [`generation_config_sampling`] sibling override applied per field. Returns `(temp, top_k, top_p,
-/// source_label)` — the label is for the CLI banner so the effective sampler is never a mystery.
+/// The model-aware sampling defaults for `gguf`: the [`arch_sampling`] family table, then any
+/// [`generation_config_sampling`] sibling, then the file's own `general.sampling.*` keys
+/// ([`infr_llama::arch::declared_sampling`]), each applied per field. The GGUF goes last because
+/// it is the artifact actually being run: the converter seeds the keys from the checkout's
+/// `generation_config.json`, but a `--metadata` override or a later edit can change them, and
+/// llama.cpp reads only the GGUF. Returns `(temp, top_k, top_p, source_label)` — the label is for
+/// the CLI banner so the effective sampler is never a mystery.
 fn model_sampling_defaults(gguf: &std::path::Path) -> (f32, usize, f32, String) {
     let arch = infr_llama::arch::arch_of(gguf);
     let (mut t, mut k, mut p) = arch
@@ -3958,18 +3967,22 @@ fn model_sampling_defaults(gguf: &std::path::Path) -> (f32, usize, f32, String) 
         .map(arch_sampling)
         .unwrap_or((0.6, 20, 0.95));
     let mut src = arch.clone().unwrap_or_else(|| "default".to_string());
-    let (gt, gk, gp) = generation_config_sampling(gguf);
-    if gt.is_some() || gk.is_some() || gp.is_some() {
-        src = format!("{}+generation_config", arch.as_deref().unwrap_or("default"));
-    }
-    if let Some(x) = gt {
-        t = x;
-    }
-    if let Some(x) = gk {
-        k = x;
-    }
-    if let Some(x) = gp {
-        p = x;
+    for (layer, (lt, lk, lp)) in [
+        ("generation_config", generation_config_sampling(gguf)),
+        ("gguf", infr_llama::arch::declared_sampling(gguf)),
+    ] {
+        if lt.is_some() || lk.is_some() || lp.is_some() {
+            src = format!("{src}+{layer}");
+        }
+        if let Some(x) = lt {
+            t = x;
+        }
+        if let Some(x) = lk {
+            k = x;
+        }
+        if let Some(x) = lp {
+            p = x;
+        }
     }
     (t, k, p, src)
 }
@@ -4002,6 +4015,14 @@ fn apply_model_sampling_defaults(
     gguf: &std::path::Path,
 ) -> Arc<Config> {
     let (t, k, p, src) = model_sampling_defaults(gguf);
+    let unapplied = infr_llama::arch::unapplied_sampling_keys(gguf);
+    if !unapplied.is_empty() {
+        tracing::warn!(
+            "the model declares sampling settings infr does not apply: {}; only {} are honoured",
+            unapplied.join(", "),
+            infr_llama::arch::APPLIED_SAMPLING_KEYS.join(", "),
+        );
+    }
     let mut out = (**cfg).clone();
     if !specified.is_path_set("sampling.temp") {
         out.sampling.temp = t;
@@ -4800,6 +4821,114 @@ mod tests {
         assert_eq!(arch_sampling(GEMMA4), (1.0, 64, 0.95));
         // Llama: top_k off (0 = keep all), top_p 0.9.
         assert_eq!(arch_sampling(LLAMA), (0.6, 0, 0.9));
+    }
+
+    /// A `deepseek4` GGUF carrying `extra` metadata, written to `dir/model.gguf` (a directory of
+    /// its own, so a `generation_config.json` sibling can sit beside it).
+    fn sampling_fixture(dir: &std::path::Path, extra: Vec<(&str, infr_testkit::gguf::Meta)>) {
+        use infr_testkit::gguf::{Meta, SyntheticModel};
+        let mut meta = vec![(
+            "general.architecture".to_string(),
+            Meta::Str(DEEPSEEK4.into()),
+        )];
+        meta.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v)));
+        let model = SyntheticModel {
+            meta,
+            tensors: Vec::new(),
+        };
+        std::fs::write(dir.join("model.gguf"), model.to_gguf_bytes()).expect("write gguf");
+    }
+
+    fn sampling_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("infr-cli-sampling-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// The model layers override the family table field by field, in the order sidecar
+    /// `generation_config.json`, then the GGUF's own `general.sampling.*` keys: the GGUF is what
+    /// actually runs. The first case is the shape of the real DeepSeek-V4 file: temp and top_p
+    /// declared, top_k left to the table.
+    #[test]
+    fn gguf_sampling_overrides_the_arch_table_and_the_sidecar() {
+        use infr_testkit::gguf::Meta;
+        let dir = sampling_dir("layers");
+        let gguf = dir.join("model.gguf");
+        let sidecar = dir.join("generation_config.json");
+        let (table_t, table_k, table_p) = arch_sampling(DEEPSEEK4);
+
+        sampling_fixture(&dir, Vec::new());
+        let bare = model_sampling_defaults(&gguf);
+
+        sampling_fixture(
+            &dir,
+            vec![
+                ("general.sampling.temp", Meta::F32(1.0)),
+                ("general.sampling.top_p", Meta::F32(1.0)),
+            ],
+        );
+        let v4 = model_sampling_defaults(&gguf);
+
+        // gguf-py writes top_k as an INT32, and llama.cpp reads a negative one as "keep all".
+        sampling_fixture(&dir, vec![("general.sampling.top_k", Meta::I32(-1))]);
+        let gguf_keep_all = model_sampling_defaults(&gguf).1;
+
+        sampling_fixture(&dir, vec![("general.sampling.temp", Meta::F32(0.8))]);
+        std::fs::write(&sidecar, r#"{"temperature": 0.3, "top_k": -1}"#).expect("write sidecar");
+        let both = model_sampling_defaults(&gguf);
+
+        std::fs::remove_file(&sidecar).expect("remove sidecar");
+        std::fs::remove_file(&gguf).expect("remove gguf");
+        std::fs::remove_dir(&dir).expect("remove temp dir");
+
+        assert_eq!(bare, (table_t, table_k, table_p, DEEPSEEK4.to_string()));
+        assert_eq!(v4, (1.0, table_k, 1.0, format!("{DEEPSEEK4}+gguf")));
+        assert_eq!(gguf_keep_all, 0);
+        assert_eq!(
+            both,
+            (0.8, 0, table_p, format!("{DEEPSEEK4}+generation_config+gguf")),
+            "the GGUF's temp must win over the sidecar's, and the sidecar's top_k -1 means keep all"
+        );
+    }
+
+    /// The load-time warning names every `general.sampling.*` key infr does not apply, and nothing
+    /// for a file that carries only the applied ones.
+    #[test]
+    fn unapplied_sampling_keys_are_the_ones_infr_ignores() {
+        use infr_testkit::gguf::Meta;
+        let dir = sampling_dir("unapplied");
+        let gguf = dir.join("model.gguf");
+
+        sampling_fixture(
+            &dir,
+            vec![
+                ("general.sampling.temp", Meta::F32(1.0)),
+                ("general.sampling.top_k", Meta::I32(40)),
+                ("general.sampling.top_p", Meta::F32(0.9)),
+            ],
+        );
+        let applied_only = infr_llama::arch::unapplied_sampling_keys(&gguf);
+
+        sampling_fixture(
+            &dir,
+            vec![
+                ("general.sampling.temp", Meta::F32(1.5)),
+                ("general.sampling.penalty_repeat", Meta::F32(1.1)),
+                ("general.sampling.min_p", Meta::F32(0.05)),
+                ("general.name", Meta::Str("not a sampling key".into())),
+            ],
+        );
+        let mixed = infr_llama::arch::unapplied_sampling_keys(&gguf);
+
+        std::fs::remove_file(&gguf).expect("remove gguf");
+        std::fs::remove_dir(&dir).expect("remove temp dir");
+
+        assert!(applied_only.is_empty(), "{applied_only:?}");
+        assert_eq!(
+            mixed,
+            ["general.sampling.min_p", "general.sampling.penalty_repeat"]
+        );
     }
 
     /// `infr bench --json` must emit PARSEABLE JSON whose first key is `avg_ts`, in every

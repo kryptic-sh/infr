@@ -25,6 +25,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   request's `usage`.
 - **`usage.prompt_tokens_details.cached_tokens`**: the part of the prompt served
   from the KV prefix cache.
+- **A GGUF's own sampling recommendation is honoured.** `infr run` and
+  `infr serve` take `general.sampling.temp`, `top_k` and `top_p` from the file
+  for any of those you did not set yourself, above the built-in per-family
+  defaults and a `generation_config.json`, as llama.cpp does. The startup banner
+  shows `+gguf` when they apply. Other `general.sampling.*` keys (`min_p`,
+  repeat penalties, mirostat) are not applied, and are named in a warning at
+  load. A `top_k` of `-1` in `generation_config.json` now means "keep all", as
+  it does in the GGUF.
 - **`seed: -1` and `max_tokens: -1` are accepted** and mean "not set", for
   clients written against llama.cpp. `max_tokens: -1` therefore takes the
   server's default budget; it does not mean "until the context is full".

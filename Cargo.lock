@@ -1200,6 +1200,7 @@ dependencies = [
  "infr-plat",
  "infr-prof-rt",
  "infr-server",
+ "infr-testkit",
  "infr-vulkan",
  "serde_json",
  "tokio",

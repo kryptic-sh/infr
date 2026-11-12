@@ -77,5 +77,9 @@ fn mmq_gemm_reads_no_activation_rows_past_m() {
     );
 
     drop(be);
-    gpuav_support::assert_clean(&log, "mmq_gemm_reads_no_activation_rows_past_m");
+    gpuav_support::assert_clean(
+        &log,
+        "mmq_gemm_reads_no_activation_rows_past_m",
+        "the out-of-bounds bound (only the numeric result was checked)",
+    );
 }

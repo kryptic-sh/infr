@@ -143,6 +143,60 @@ pub fn arch_of(path: &std::path::Path) -> Option<String> {
     })
 }
 
+/// The `general.sampling.*` keys [`declared_sampling`] applies. llama.cpp also applies the rest of
+/// the family (`min_p`, the penalties, `xtc_*`, `mirostat*`, `sequence`); see
+/// [`unapplied_sampling_keys`].
+pub const APPLIED_SAMPLING_KEYS: [&str; 3] = [
+    "general.sampling.temp",
+    "general.sampling.top_k",
+    "general.sampling.top_p",
+];
+
+/// Every `general.sampling.*` key the GGUF at `path` carries that infr does not apply, sorted;
+/// empty when there are none or the file cannot be opened. A file that pairs a hot temperature
+/// with `min_p` or a repeat penalty gets the temperature without its counterweight, so the caller
+/// warns with this list.
+pub fn unapplied_sampling_keys(path: &std::path::Path) -> Vec<String> {
+    use infr_core::WeightSource;
+    let Ok(g) = infr_gguf::Gguf::open(path) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = g
+        .metadata()
+        .kv
+        .keys()
+        .filter(|k| {
+            k.starts_with("general.sampling.") && !APPLIED_SAMPLING_KEYS.contains(&k.as_str())
+        })
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The sampler the GGUF itself declares: `general.sampling.temp` / `.top_k` / `.top_p`, which
+/// llama.cpp's converter seeds from the source checkout's `generation_config.json` (and which
+/// llama.cpp applies under any value the user set). Each field is independent; an absent or
+/// mistyped one is `None`. A negative `top_k` is llama.cpp's "keep all" and maps to infr's `0`.
+/// Cheap like [`arch_of`]: header only, no model load.
+pub fn declared_sampling(path: &std::path::Path) -> (Option<f32>, Option<usize>, Option<f32>) {
+    use infr_core::loader::MetaValue;
+    use infr_core::WeightSource;
+    let Ok(g) = infr_gguf::Gguf::open(path) else {
+        return (None, None, None);
+    };
+    let meta = g.metadata();
+    let [temp, top_k, top_p] = APPLIED_SAMPLING_KEYS;
+    let float = |key| meta.get(key).and_then(MetaValue::as_f64).map(|x| x as f32);
+    let top_k = match meta.get(top_k) {
+        Some(MetaValue::I64(k)) if *k < 0 => Some(0),
+        v => v
+            .and_then(MetaValue::as_u64)
+            .and_then(|k| usize::try_from(k).ok()),
+    };
+    (float(temp), top_k, float(top_p))
+}
+
 /// Every architecture infr runs, across both paths.
 pub const ALL: &[&str] = &[
     LLAMA,

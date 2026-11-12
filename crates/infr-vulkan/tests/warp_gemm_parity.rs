@@ -7,6 +7,11 @@ use infr_core::backend::{Backend, BufferUsage};
 use infr_core::DType;
 use infr_vulkan::VulkanBackend;
 
+/// Relative L2 bound for a warp GEMM against the f64 host GEMM over the same dequantized weight.
+/// The kernels round the weight to f16 and accumulate in a different order; a mis-decoded or
+/// misaddressed tile lands at order one.
+const HOST_REL_L2: f64 = 1e-3;
+
 fn synth_bytes(n: usize, seed: usize) -> Vec<u8> {
     (0..n)
         .map(|i| {
@@ -90,5 +95,43 @@ fn warp_ag_isa_probe() {
     }
     assert_eq!(outs[0], outs[1], "n128_ag @nonzero-offset != @0 (bitwise)");
     assert_eq!(outs[2], outs[3], "sk_ag @nonzero-offset != @0 (bitwise)");
+
+    // The legs above only compare the kernel with itself, so a kernel wrong the same way at every
+    // offset passes them. Hold each tile variant to a host GEMM over the dequantized weight: the
+    // kernels differ from it only by rounding the weight to f16 and the accumulation order.
+    let w_host = infr_gguf::dequant::dequant_block(dtype, &w).unwrap();
+    let a_host: Vec<f32> = a16
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| half::f16::from_le_bytes(*b).to_f32())
+        .collect();
+    let want: Vec<f64> = (0..m * n)
+        .map(|i| {
+            let (row, col) = (i / n, i % n);
+            (0..k)
+                .map(|j| f64::from(a_host[row * k + j]) * f64::from(w_host[col * k + j]))
+                .sum()
+        })
+        .collect();
+    for (name, out) in [("n128_ag", &outs[0]), ("sk_ag", &outs[2])] {
+        let got: Vec<f32> = out
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let (num, den) = got
+            .iter()
+            .zip(&want)
+            .fold((0f64, 0f64), |(err, mag), (&g, &r)| {
+                (err + (f64::from(g) - r).powi(2), mag + r * r)
+            });
+        let rel = (num / den).sqrt();
+        assert!(
+            rel < HOST_REL_L2,
+            "{name}: relative L2 error {rel:e} against the host GEMM"
+        );
+    }
     println!("ok: q4k n128_ag + sk_ag streamed offset-invariant (0 vs nonzero)");
 }

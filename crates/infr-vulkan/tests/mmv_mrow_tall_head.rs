@@ -126,5 +126,9 @@ fn mmv_mrow_o4_tall_head_matches_host_reference() {
     );
 
     drop(be);
-    gpuav_support::assert_clean(&log, "mmv_mrow_o4_tall_head_matches_host_reference");
+    gpuav_support::assert_clean(
+        &log,
+        "mmv_mrow_o4_tall_head_matches_host_reference",
+        "the out-of-bounds bound (only the numeric result was checked)",
+    );
 }

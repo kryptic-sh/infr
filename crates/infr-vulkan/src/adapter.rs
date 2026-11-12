@@ -8231,6 +8231,7 @@ mod tests {
     /// bound (row r attends keys 0..=pos+r), full-causal and sliding-window. rows=17 also covers
     /// the 9..63 band; kv_len=300 > chunk (=64) forces the split route, not the scalar fallback.
     #[test]
+    #[ignore = "requires a Vulkan GPU"]
     fn attention_small_m_split_matches_host() {
         let Ok(be_) = VulkanBackend::new() else {
             return; // no GPU — self-skip

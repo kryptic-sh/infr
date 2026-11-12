@@ -595,8 +595,10 @@ fn compare(want: &[u32], got: &[u32], hd: usize, what: &str) {
     }
 }
 
+/// The host-only half of [`attn_decode_is_bit_identical_to_attn_partial`], split out so it runs
+/// on runners with no device.
 #[test]
-fn attn_decode_is_bit_identical_to_attn_partial() {
+fn attn_decode_shape_table_exercises_wrapped_rings() {
     // Shape-table sanity, so a typo cannot make a case silently weaker than it reads: every ring
     // shape must actually have WRAPPED, and its row count must cover the window (a ring shorter
     // than its window would be recycling live positions, which is a broken configuration rather
@@ -630,7 +632,11 @@ fn attn_decode_is_bit_identical_to_attn_partial() {
             "no wrapped-ring shape at hd {hd} — that build's row map would go unverified"
         );
     }
+}
 
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn attn_decode_is_bit_identical_to_attn_partial() {
     // Reference FIRST, then drop its backend: each leg allocates a 32768-row f16 KV cache, and
     // holding two devices' worth at once is pure waste when the outputs are plain host Vecs.
     let Some((want, ref_kernels)) = run_all(false) else {

@@ -115,6 +115,7 @@ fn small_m_linear_bench() {
 /// chain. Same contract as the attention kernels ("reassociation-only vs the oracle") and Metal's
 /// spec-verify GEMMs.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn mrow_matches_single_row_gemv() {
     let Some(be) = bench_support::optional_backend() else {
         return;
@@ -208,6 +209,7 @@ fn mrow_matches_single_row_gemv() {
 /// MRV=16 tier — m>8 always takes the 2-output m16 variant regardless of in_f, so the k=1536
 /// OUTS4-shaped case covers that pairing too).
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn mmv_mrow_matches_single_row_mmv() {
     let Some(be) = bench_support::optional_backend() else {
         return;
@@ -314,6 +316,7 @@ fn mmv_mrow_matches_single_row_mmv() {
 /// rows=1 (scalar 1-row kernel) and an in_f % 4 != 0 shape (scalar mrow8 fallback) ride along
 /// to pin the whole dispatch table.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn linear_f32_v4_matches_host() {
     let Some(be) = bench_support::optional_backend() else {
         return;

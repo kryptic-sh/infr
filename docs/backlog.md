@@ -41,32 +41,18 @@ breaking rename); flip the polarity under the same key (silently changes the
 meaning of an existing config file); or fix only the comment and live with the
 name.
 
-### B3 — the VNNI kernel family's bounds assertions are unexercised
+### B3 — the VNNI kernels' bounds assertions run on the dev box, not in CI
 
 **Tag:** CR-U3 coverage gap · **Blocked on:** CI hardware
 
-69 of the 187 converted SIMD load sites are in the `*_vnni` kernels. They
-dispatch behind `is_x86_feature_detected!("avx512vnni")`, and no development or
-CI machine currently has it, so their `debug_assert!`s are compiled but never
-executed. The tests _call_ those kernels; the runtime gate skips them.
-
-The other tiers are covered: avx512bw runs natively, and the avx2 tier was
-verified by temporarily stubbing the 37 `avx512bw` gates to `false` and
-re-running the suite.
-
-The count grew from 63/171 when the 16 remaining `_mm_loadu_si128` sites were
-routed through a new `load128` helper: 6 of those 16 landed in this untested set
-— two in `vec_dot_q6k_batch_vnni` (the `scales_arr` per-block scale load), two
-in `vec_dot_q32_batch8_ilv_vnni` (the Q8_0 bias path's two halves of `blk`), and
-two in `vec_dot_nvfp4_batch_vnni` (`w_flat` and `q8.qs`). The other 10 run on
-this hardware through the avx2 and avx512bw tiers and are covered by the
-per-format parity tests; `load128`'s assertion was shown to fire by widening the
-offset at `iq4nl_expand_codes`' code load and watching the iq4nl parity tests
-panic.
-
-**To do:** either add a VNNI-capable CI runner, or install an emulator (Intel
-SDE) and add a job that runs `cargo test -p infr-cpu` under it. Until then,
-treat the VNNI kernels' bounds as argued-but-untested.
+Corrected 2026-11-12: the dev machine (Ryzen 9 9950X3D) has `avx512_vnni`, so
+`cargo test -p infr-cpu` there does run the `*_vnni` kernels and their
+`debug_assert!`s; the earlier form of this entry said no machine did. What is
+unknown is whether the GitHub runners have it — the SIMD tier tests cover only
+the tiers the runner's CPU reports, so in CI the VNNI tier may be compiled and
+skipped. To close it: log the detected tier in the test output and read one CI
+log, or add a job that runs `cargo test -p infr-cpu` under an emulator (Intel
+SDE).
 
 ### B4 — tensor-parallel has no automated coverage
 
@@ -1633,22 +1619,21 @@ config parses, `wload` resolves every tensor, and the refusal is reached. NOT
 re-run after the hash slice — the compressed-layer refusal is ordered first and
 fires at layer 2 regardless, so the observable would not have moved.
 
-### B-GGUF-META-IGNORED — keys the reference conversion carries that infr never reads (2026-08-12)
+### B-GGUF-META-IGNORED — GGUF keys infr still does not apply (2026-11-12)
 
-**Tag:** gguf · **Blocked on:** a decision on whether to honour them
+**Tag:** gguf
 
-Two metadata families the real DeepSeek-V4 file declares and infr has no reader
-for. Neither is a V4 problem — both are general — and neither is wrong today,
-but both are silent.
-
-- **`general.sampling.*`** (`llama-arch.h`'s `LLM_KV_GENERAL_SAMPLING_*`:
-  `temp`, `top_k`, `top_p`, `min_p`, `xtc_*`, `penalty_last_n`, `sequence`). The
-  V4 file sets `general.sampling.temp = 1.0` and `general.sampling.top_p = 1.0`;
-  infr applied its own per-arch defaults (`temp = 0.6, top_k = 20, top_p = 0.95`
-  for `deepseek4`) and never looked. `grep -rn "general.sampling" crates/` is
-  empty. The question is precedence: a model-declared sampler should presumably
-  sit between infr's arch defaults and the user's flags, but nothing implements
-  any of the three orderings today.
+- **`general.sampling.*` beyond temp / top_k / top_p.** Those three are now
+  applied (`arch::declared_sampling`), ordered arch table → sidecar
+  `generation_config.json` → GGUF keys → anything the user set; llama.cpp reads
+  only the GGUF. llama.cpp's `common_init_sampler_from_model` also applies
+  `min_p`, `penalty_repeat`, `penalty_last_n`, `xtc_*`, `mirostat*` and
+  `sequence`, and infr has no engine-wide setting for any of them, so a file
+  that pairs a hot temperature with `min_p` or a repeat penalty gets the
+  temperature without its counterweight. `unapplied_sampling_keys` names those
+  keys in one load-time warning. llama.cpp also keeps a built-in `min_p` under a
+  GGUF temperature; infr has no equivalent. Of the files to hand, only the
+  DeepSeek-V4 one declares these keys (temp 1.0, top_p 1.0).
 - **`{arch}.embedding_length_out`** = 16384 on V4 (= `hc_mult · n_embd`, the
   un-collapsed hyper-connection residual). In llama.cpp this feeds
   `llama_hparams::n_embd_out()`, which sizes the EMBEDDINGS output buffer only —
@@ -2317,31 +2302,20 @@ milliseconds against seconds of load. Four more `tensors().iter().find` scans in
 infr-llama mean indexing `resolve` alone would not remove the cost. Worth doing
 only after measuring total name-lookup time on a model with about 2000 tensors.
 
-### B62 — is host-RAM KV spill actually the LAST rung? (2026-08-12)
+### B62 — KV spill comes before the context clamp when overflow is on (2026-08-12, traced 2026-11-12)
 
-**Tag:** vram · kv · **Blocked on:** nothing; this is a trace someone has to do
+**Tag:** vram · kv · **Needs:** a decision
 
 User, 2026-08-12: _"Only spill K/V cache to system ram when absolutely
-necessary."_
-
-The surface exists — `crates/infr-core/src/config/manifest.rs` carries
-`INFR_KV_OVERFLOW` → `kv.overflow`, plus `kv.overflow_vram_mb` and
-`kv.overflow_reserve_mb` — and it is documented as VRAM-first. What has **never
-been established** is whether the rung ORDER is enforced in code: that q8_0 KV
-quantization and context clamping are both attempted, and exhausted, before a
-single KV row is placed in host memory.
-
-The intended ladder, from `vram-audit-2026-07-12`: SWA → q8 → clamp → stream →
-KV-overflow **last**.
-
-**The task is to trace it and then either prove the order with a test or fix
-it** — and to say plainly which of the two it turned out to be. A test is the
-point: an ordering that holds today because of how two independent branches
-happen to be arranged is one refactor away from silently spilling first, and
-spilling is invisible in output. It only shows up as throughput.
-
-Related: B12's DECIDED note makes q8_0 mandatory on the explicit `--ctx` path,
-which is the rung immediately above this one.
+necessary."_ The intended ladder is SWA → q8 → clamp → stream → KV-overflow
+last. Traced in `SeamModel::clamp_default_ctx`: auto-q8 is tried before the
+spill, as intended, but with `kv.overflow` on the default window is KEPT and
+spilled instead of clamped — so the clamp does not come before the spill.
+Options: (a) clamp the auto-sized window and spill only for an explicit `--ctx`,
+which matches the instruction; (b) keep today's spill-instead-of-clamp, on the
+reading that turning overflow on is asking for the full window; (c) a separate
+knob. Whichever is chosen wants a test of the order: spilling is invisible in
+output and only shows as throughput.
 
 ### B63 — deep-context performance is unmeasured across the whole model matrix (2026-08-12)
 
@@ -3350,11 +3324,10 @@ error-path leaks are fixed. What is left is all test coverage:
   submit fails, and `Recorder::end_segment` / `discard` free their command
   buffer and pools on an error. Nothing in the repo can make a submit, an
   `end_command_buffer` or a memory bind fail (same blocker as B48), so none of
-  these, nor the `make_buf_ex` bind-failure cleanup, has a test. A temporary
-  test showed the `record_decode_replay` leak under the validation layer
-  (`VUID-vkDestroyDevice-device-05137`, one `VkDescriptorPool`) and none after
-  the fix; it was not kept because a leak is invisible from inside a test
-  without a debug-utils messenger that fails the test on a validation error.
+  these, nor the `make_buf_ex` bind-failure cleanup, has a test. The
+  `record_decode_replay` leak does: `tests/replay_error_teardown.rs` makes the
+  recording fail and reads the validation layer's log, and skips visibly without
+  the layer.
 - **The pager's staged-placement journal assumes one recording at a time per
   backend.** Under `serve --parallel N` that holds: every GPU step in
   `generate_dense_backend`, each prefill chunk included, takes the `StepGate`
@@ -3480,9 +3453,6 @@ for its planar Q8_0 layout. What is left:
   and green on the iGPU.
 - The `copy_kv_prefix` overrides in `tp.rs`, `ep.rs` and `pipeline.rs` compile
   and were read, but were never run: they need a multi-GPU session.
-- The Vulkan attention read locates V's Q8 scales with the K cache's element
-  count ("K and V caches share numel"). Not checked whether any Q8-capable model
-  has K and V rows of different width.
 
 ### B131 — qwen35 resume and the ring guard: what is left (2026-11-12)
 
@@ -3620,49 +3590,37 @@ the Apple target but were not run.
   `user_text_special_tokens_are_literal` execute. Still skipping there:
   `embedded_tokenizer_matches_sidecar` (needs a `tokenizer.json` beside the
   GGUF, which an HF cache snapshot does not have) and `loads_and_dims` in
-  `qwen35.rs` (needs Qwen3.5-0.8B, which the job does not download). Noticed
-  while running them: `forced_grammar_constrains_first_token` passes but prints
-  a constrained prefix that is mostly whitespace.
+  `qwen35.rs` (needs Qwen3.5-0.8B, which the job does not download).
 - **Metal model-level tests.** The `metal_*` tests in `cpu_backend.rs` are
   macOS-only and model-gated, and `test-macos` runs only `-p infr-metal` and
   downloads nothing (confirmed in `ci.yml`). Metal's runner, session, slot pool
   and sampling integration therefore never executes anywhere — no one on the
   project has a Metal device. `docs/ci-matrix.md` was corrected on this point.
-- **Vulkan tests that return silently without a device.** Reported: a set of
-  non-ignored Vulkan tests (the six in `kv_q8_roundtrip.rs`,
-  `attn_decode_is_bit_identical_to_attn_partial`, the `mrow` / `mmv_mrow` parity
-  tests, `attention_small_m_split_matches_host`, and others in
-  `infr-vulkan/src/lib.rs`) self-skip when no device is found, and the Linux and
-  Windows runners have none. Not re-read. Either `#[ignore]` them like the rest
-  of the GPU suite or print a skip the log can be grepped for.
 - **Windows golden hashes** (`per_os(windows, …)` in `QWEN3_GOLDEN` and
   `GEMMA3_GOLDEN`) are never asserted: `cpu-goldens` is Ubuntu-only.
 
 ### B141 — assertions weaker than the tests' names (2026-11-11)
 
-- **The KV-format "coherent" tests assert only `!is_degenerate(out)`**, which is
-  "at least 8 characters with at most 2 distinct ones" (confirmed). Empty output
-  and arbitrary garbage pass, and so does an implementation that ignores the KV
-  dtype entirely. These are `cpu_kv_q8_coherent`, `cpu_kv_turbo_coherent`,
-  `cpu_kv_mainline_quants_coherent` and the Vulkan twins. Per the reviewer, CPU
-  `Op::WriteKv` and quantised-KV `Op::Attention` have no numeric assertion in
-  any Linux CI test; only the quantisers have unit round-trips.
+- **The Vulkan KV-format "coherent" tests still assert only
+  `!is_degenerate(out)`**, which empty output, garbage and an implementation
+  that ignores the KV dtype all pass. Their CPU twins now go through
+  `assert_kv_formats_track_the_f32_cache` (logits differ from the f16 cache's,
+  and greedy picks agree with the f32 cache on most rows of a short prompt). The
+  Vulkan ones have no all-rows logits API to score with.
 - **Reported, not re-read:** `metal_kv_scratch_paths_are_coherent` pins one hash
   for eight KV formats with no f16 control; `mtp_head_trunk_acceptance_rate`
-  prints the rate and asserts nothing about it; `warp_ag_isa_probe` compares a
-  kernel with itself at two offsets (confirmed 2026-11-12; its comment says so,
-  and the fix is a host reference); no Metal parity test names
-  `Op::CopyStrided`, `MulVec`, `Softmax`, `TopkMask` or `RmsNormAdd`. Metal's
-  own `mla_parity` was not checked for the identical-K-rows weakness the
-  infr-llama one had.
-- The KV "coherent" tests above need a real model to tighten, and none is on the
-  dev machine as of 2026-11-12.
+  prints the rate and asserts nothing about it (its model is not cached); no
+  Metal parity test names `Op::CopyStrided`, `MulVec`, `Softmax`, `TopkMask` or
+  `RmsNormAdd`. Metal's own `mla_parity` was not checked for the
+  identical-K-rows weakness the infr-llama one had.
 - **Hygiene, reported:** `test_serial_lock` and `gpu_serial_lock` are in-process
   mutexes, which do nothing under nextest's process-per-test model if the
   ignored GPU tests are ever run that way; the SIMD tier tests cover only the
-  tiers the runner's CPU has; and B3 says no dev or CI machine has `avx512vnni`
-  while a comment in `kernels.rs` says the dev box does — one of the two is
-  stale.
+  tiers the runner's CPU has (see B3).
+- The CPU KV check adds about a tenth to the `cpu_backend` golden run on the dev
+  machine (60 s against 55 s, the later figure taken at load average 10–16, the
+  earlier at 1.3 — not a clean comparison). Read the `cpu-goldens` job time
+  after it lands.
 
 ### B142 — none of this review's bugs has a test that would catch it (2026-11-11)
 

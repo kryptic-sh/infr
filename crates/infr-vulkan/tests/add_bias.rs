@@ -5,6 +5,7 @@ use infr_core::backend::{Backend, BufferUsage};
 use infr_vulkan::VulkanBackend;
 
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn add_bias_broadcast() {
     let Ok(be) = VulkanBackend::new() else {
         eprintln!("skip: no Vulkan device");

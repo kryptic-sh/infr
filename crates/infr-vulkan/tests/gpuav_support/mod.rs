@@ -18,20 +18,20 @@ pub fn enable(name: &str) -> PathBuf {
     log
 }
 
-/// Assert the layer logged no error to `log`. Call after the backend is dropped so every queued
-/// report has been written. GPU-AV always logs a settings warning at instance creation, so a missing
-/// file means the layer never loaded rather than no findings: the test then still passes on its
-/// numeric half, and says on stderr that it did not verify the bound. That notice is written to the
-/// stderr handle directly, which the test harness does not capture, so it shows without
-/// `--nocapture`.
-pub fn assert_clean(log: &Path, test: &str) {
+/// Assert the layer logged no error to `log`, and say whether it could. Call after the backend is
+/// dropped so every queued report has been written. GPU-AV always logs a settings warning at
+/// instance creation, so a missing file means the layer never loaded rather than no findings: then
+/// this returns `false` and writes `test` did NOT verify `unverified` (what the caller's check
+/// depends on the layer for) to stderr. That notice goes to the stderr handle directly, which the
+/// test harness does not capture, so it shows without `--nocapture`.
+pub fn assert_clean(log: &Path, test: &str, unverified: &str) -> bool {
     let Ok(text) = std::fs::read_to_string(log) else {
         let _ = writeln!(
             std::io::stderr().lock(),
-            "WARNING: {test} did NOT verify the out-of-bounds bound: the Khronos validation layer \
-             is not installed, so only the numeric result was checked"
+            "WARNING: {test} did NOT verify {unverified}: the Khronos validation layer is not \
+             installed"
         );
-        return;
+        return false;
     };
     let _ = std::fs::remove_file(log);
     let errors: Vec<&str> = text
@@ -44,4 +44,5 @@ pub fn assert_clean(log: &Path, test: &str) {
         errors.len(),
         errors[0]
     );
+    true
 }

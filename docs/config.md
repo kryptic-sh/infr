@@ -184,12 +184,13 @@ to force subgroup 16 or 32).
 **`[sampling]`** — `temp` (0 = greedy), `top_k`, `top_p`, `seed`, `max_new`,
 `ignore_eos`, `no_think`. **Provenance matters here**: `infr run` / `infr serve`
 fill `temp` / `top_k` / `top_p` / `max_new` from the model's own recommended
-sampling (an arch-family table plus any `generation_config.json` beside the
-model) only for knobs that **no layer specified**. Putting `temp` in your config
-file pins it and suppresses that fallback. The `Config` defaults, which library
-callers get, are greedy: `temp = 0.0`, `top_k = 20`, `top_p = 0.95`,
-`max_new = 2048`. On `serve` these are the server defaults — a per-request
-OpenAI `temperature`/`top_p` still overrides them.
+sampling (an arch-family table, then any `generation_config.json` beside the
+model, then the GGUF's own `general.sampling.*` keys, the last one winning) only
+for knobs that **no layer specified**. Putting `temp` in your config file pins
+it and suppresses that fallback. The `Config` defaults, which library callers
+get, are greedy: `temp = 0.0`, `top_k = 20`, `top_p = 0.95`, `max_new = 2048`.
+On `serve` these are the server defaults — a per-request OpenAI
+`temperature`/`top_p` still overrides them.
 
 **`[kv]`** — cache element format (`type_k` / `type_v`, plus the legacy
 `force_q8` alias), prefix-cache `slots`, the sliding-window `ring`, and the

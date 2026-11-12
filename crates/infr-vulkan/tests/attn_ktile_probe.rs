@@ -312,6 +312,7 @@ fn reference(
 }
 
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn ktile_matches_split_reference() {
     let Some(be) = bench_support::optional_backend() else {
         return;

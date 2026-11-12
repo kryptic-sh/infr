@@ -63,7 +63,11 @@ void main() {
     k_addr = kv_base(pc.d_lo, pc.d_hi);
 #endif
     uint t = gl_LocalInvocationID.x;
-    uint unit = gl_WorkGroupID.x;
+    // Flat workgroup index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_WorkGroupID.x` when unsplit. A padding
+    // workgroup returns whole, before any barrier or subgroup op, so control flow stays uniform.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.nheads) { return; }
     uint h = unit % pc.nheads;
     uint r = unit / pc.nheads;
     uint in_base = (r * pc.nheads + h) * pc.hd;

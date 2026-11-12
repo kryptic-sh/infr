@@ -53,7 +53,10 @@ int best_index(float x) {
 
 void main() {
     k_addr = kv_base(pc.d_lo, pc.d_hi);
-    uint blk = gl_GlobalInvocationID.x; // block index over the local src rows
+    // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
+    uint blk = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x; // block index over the local src rows
     if (blk * 32u >= pc.n) { return; }
 #ifdef USE_PARAMS
     uint off = p_pos * pc.n;

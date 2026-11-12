@@ -50,6 +50,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   empty `HF_TOKEN=` is treated as unset.
 - **A `tokenizer.json` beside the GGUF that does not match the model's
   vocabulary now logs a warning.** It is still used.
+- **A GGUF whose weight shapes disagree with its own metadata is refused at
+  load**, with the tensor's name and both shapes. Such a file used to load and
+  then compute garbage or read out of bounds. Not every tensor is covered yet.
 
 - **DiffusionGemma: even seeds no longer repeat the next odd seed.** The seeded
   RNG forced its state odd, so `--seed 2` and `--seed 3` gave the same output.
@@ -96,6 +99,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reports `finish_reason: "length"`) instead of failing the request.
 - **Metal: a DeltaNet key-head width other than 32, 64, 128 or 256 no longer
   reads into the neighbouring head's state.**
+- **Vulkan: compute grids no longer exceed the device's workgroup limit on wide
+  layers.** At the default 1024-row prefill chunk, an elementwise kernel over a
+  4096-wide layer needed one workgroup more than the 65,535 the spec guarantees,
+  which RADV tolerated and other drivers need not. The elementwise, KV-store,
+  rope and attention kernels now split such a grid in two dimensions.
 - **`infr serve`: `usage.prompt_tokens` counts the whole prompt.** It reported
   only the tokens prefilled for this request, so a KV prefix cache hit made a
   long prompt look short. `/metrics` still counts prefilled tokens only.

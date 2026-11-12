@@ -16,7 +16,10 @@ layout(binding = 2) readonly buffer IB { uint inv_pos[]; };  // [rows, n_used] a
 layout(binding = 3) writeonly buffer DB { float dst[]; };    // [rows, ne]
 
 void main() {
-    uint i = gl_GlobalInvocationID.x;
+    // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
+    uint i = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x;
     if (i >= pc.rows * pc.ne) { return; }
     uint t = i / pc.ne;
     uint c = i % pc.ne;

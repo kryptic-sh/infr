@@ -22,6 +22,7 @@ pub mod model;
 mod runner;
 mod sc;
 mod weights;
+mod wshape;
 
 pub(crate) use runner::generate_dense_backend;
 pub(crate) use sc::DenoiseReq;

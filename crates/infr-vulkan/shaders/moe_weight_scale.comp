@@ -20,7 +20,10 @@ layout(push_constant) uniform PC { uint n_rows; uint width; } pc;
 layout(binding = 0) readonly buffer WB { float w[]; };
 layout(binding = 1) buffer YB { float y[]; };
 void main() {
-    uint i = gl_GlobalInvocationID.x;
+    // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
+    uint i = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x;
     uint total = pc.n_rows * pc.width;
     if (i >= total) return;
     uint row = i / pc.width;

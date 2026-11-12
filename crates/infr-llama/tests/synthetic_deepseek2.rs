@@ -1469,6 +1469,63 @@ fn synthetic_deepseek32_misnamed_indexer_tensor_is_refused() {
     );
 }
 
+/// A weight whose dims disagree with the model's own metadata is refused at load, naming the
+/// tensor and both shapes — not uploaded under its file size and indexed out of bounds by the
+/// first forward pass. Each tensor below is one the loader derives a shape for (a dense-lead
+/// layer, a MoE layer, MLA and the globals); each is widened along its contiguous axis in turn,
+/// and the undamaged model must still run so the list cannot pass by refusing everything.
+#[test]
+fn synthetic_deepseek2_misshaped_weight_is_refused() {
+    let names = [
+        "output_norm.weight",
+        "output.weight",
+        "blk.0.attn_norm.weight",
+        "blk.0.attn_q_a.weight",
+        "blk.0.attn_q_a_norm.weight",
+        "blk.0.attn_q_b.weight",
+        "blk.0.attn_kv_a_mqa.weight",
+        "blk.0.attn_kv_a_norm.weight",
+        "blk.0.attn_output.weight",
+        "blk.0.ffn_norm.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.ffn_up.weight",
+        "blk.0.ffn_down.weight",
+        "blk.1.ffn_gate_inp.weight",
+        "blk.1.ffn_gate_exps.weight",
+        "blk.1.ffn_up_exps.weight",
+        "blk.1.ffn_down_exps.weight",
+        "blk.1.exp_probs_b.bias",
+        "blk.1.ffn_gate_shexp.weight",
+        "blk.1.ffn_up_shexp.weight",
+        "blk.1.ffn_down_shexp.weight",
+    ];
+    assert!(
+        cpu_logits("ds2-shape-ok", &flat_model())
+            .iter()
+            .all(|v| v.is_finite()),
+        "the undamaged model must load and run"
+    );
+    for name in names {
+        let mut m = flat_model();
+        let t = m
+            .tensors
+            .iter_mut()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("{name} is not in the fixture"));
+        let want = t.shape.clone();
+        t.shape[0] += 2;
+        t.fill = Fill::Rand(0.25);
+        let got = t.shape.clone();
+        let err = prefill_err(&format!("ds2-shape-{name}"), &m);
+        assert!(
+            err.contains(name)
+                && err.contains(&format!("{got:?}"))
+                && err.contains(&format!("{want:?}")),
+            "{name} widened to {got:?} must be refused naming it and {want:?}, got: {err}"
+        );
+    }
+}
+
 /// **MLA is mandatory.** `deepseek32.cpp::load_arch_tensors` opens with
 /// `if (!hparams.is_mla()) throw "DEEPSEEK32 architecture requires MLA"`, and `is_mla()` is exactly
 /// "both MLA head-length keys are non-zero". There is no unabsorbed fallback for V3.2 at all.

@@ -36,7 +36,10 @@ void main() {
 #ifdef KV_BDA
     k_addr = kv_base(pc.d_lo, pc.d_hi);
 #endif
-    uint i = gl_GlobalInvocationID.x;
+    // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
+    uint i = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x;
     if (i >= pc.n) { return; }
 #ifdef USE_PARAMS
     uint row = (pc.cap > 0u) ? (p_pos % pc.cap) : p_pos;

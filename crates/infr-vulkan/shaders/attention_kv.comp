@@ -125,7 +125,10 @@ void main() {
     k_addr = kv_base(pc.k_lo, pc.k_hi);
     v_addr = kv_base(pc.v_lo, pc.v_hi);
 #endif
-    uint unit = gl_WorkGroupID.x;
+    // Flat workgroup index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_WorkGroupID.x` when unsplit. A padding
+    // workgroup returns whole, before any barrier or subgroup op, so control flow stays uniform.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
     if (unit >= pc.q_len * pc.nh) { return; }
     uint ti = unit / pc.nh;
     uint h = unit % pc.nh;

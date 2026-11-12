@@ -279,7 +279,9 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
 /// overwrote a `-7.0` sentinel with zeros while the host reference was ~3.1. No driver error, no
 /// validation-layer message, no seam error, and no zero-init check can tell it from a real answer.
 /// (`embed_gather` differs in shape only — it writes inside the sub-block loop, so a short row
-/// leaves `dst` untouched instead — not in consequence.)
+/// leaves `dst` untouched instead — not in consequence.) The prefill MMQ GEMMs
+/// (`native_gemm_mmq_*`, `native_gemm_i8cm_q8_0`) floor K the same way (`nblk = k / BLK`, with
+/// every `BLK` dividing 32), so their `matmul_*` entry points assert it too.
 ///
 /// No GGUF reaches either case — quant block sizes are 32/64/256, and every float projection width
 /// in a real model is 32-aligned — so this guards the floor rather than lifting it with a masked
@@ -1303,10 +1305,12 @@ impl<'a> Recorder<'a> {
     /// (`MAX_GROUP_COUNT_X` × `ceil(n / MAX_GROUP_COUNT_X)`) whenever `n` would otherwise exceed
     /// the guaranteed limit. Every paired shader recovers the flat index as
     /// `gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x` (identical to `gl_WorkGroupID.x`
-    /// when `gy == 1`, i.e. a total no-op for every dispatch that already fit in one dimension —
-    /// which is every dispatch on hardware/models exercised so far) and bounds-checks it against
-    /// the true element count, since `gx * gy` can overshoot `n` when `n` isn't a multiple of
-    /// `gx` — those padding workgroups must return immediately without touching any buffer.
+    /// when `gy == 1`, i.e. a total no-op for every dispatch that already fit in one dimension) and
+    /// bounds-checks it against the true element count, since `gx * gy` can overshoot `n` when
+    /// `n` isn't a multiple of `gx` — those padding workgroups must return immediately without
+    /// touching any buffer. The split is taken on every device, not only those that enforce the
+    /// guaranteed minimum, and real shapes reach it: a dense 4096-wide model's default prefill
+    /// chunk already gives `quant_q8` a wider grid.
     fn dispatch_wide(
         &self,
         k: ComputeKernel,
@@ -1315,19 +1319,34 @@ impl<'a> Recorder<'a> {
         push: &[u8],
         n: u32,
     ) {
-        if n <= Self::MAX_GROUP_COUNT_X {
+        let max_x = Self::split_point_x();
+        if n <= max_x {
             self.dispatch3(k, buffers, n_out, push, n, 1, 1);
         } else {
-            let gy = n.div_ceil(Self::MAX_GROUP_COUNT_X);
+            let gy = n.div_ceil(max_x);
             if self.be.cfg().debug.wide_dispatch {
                 eprintln!(
-                    "[infr] dispatch_wide SPLIT kernel={:?} n={n} -> gx={} gy={gy}",
+                    "[infr] dispatch_wide SPLIT kernel={:?} n={n} -> gx={max_x} gy={gy}",
                     k.name,
-                    Self::MAX_GROUP_COUNT_X
                 );
             }
-            self.dispatch3(k, buffers, n_out, push, Self::MAX_GROUP_COUNT_X, gy, 1);
+            #[cfg(test)]
+            tests::WIDE_SPLITS.with(|c| c.set(c.get() + 1));
+            self.dispatch3(k, buffers, n_out, push, max_x, gy, 1);
         }
+    }
+
+    /// Where [`dispatch_wide`](Self::dispatch_wide) splits: always
+    /// [`MAX_GROUP_COUNT_X`](Self::MAX_GROUP_COUNT_X) outside this crate's unit tests. Those can
+    /// lower it, because a device whose real limit is far above the guaranteed minimum (RADV)
+    /// never splits a grid small enough to test, so neither the split nor the paired shader's
+    /// index recovery would otherwise run.
+    fn split_point_x() -> u32 {
+        #[cfg(test)]
+        if let Some(x) = tests::WIDE_SPLIT_AT.with(std::cell::Cell::get) {
+            return x;
+        }
+        Self::MAX_GROUP_COUNT_X
     }
 
     /// Bind `k`'s pipeline and all of `buffers` to descriptor set 0. `VK_KHR_push_descriptor`
@@ -1802,8 +1821,8 @@ impl<'a> Recorder<'a> {
 
     /// bf16-weight GEMV `y = x·Wᵀ` (`linear_bf16.comp`) — recorder-level twin of the eager
     /// `ops::linear_bf16` (which owns its host round-trip); exists so the streamed parity test can
-    /// drive the resident kernel in a recorded submit. Plain 1-D grid (the shader does no 2-D
-    /// index recovery).
+    /// drive the resident kernel in a recorded submit. One workgroup per `(row, output)`, split
+    /// into a 2-D grid past the guaranteed grid width.
     pub fn linear_bf16(
         &self,
         w: &dyn Buffer,
@@ -1839,9 +1858,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        // linear_bf16's grid is NOT dispatch_wide-recovered in the shader (plain gl_WorkGroupID.x)
-        // — mirror the resident call shape: rows*out_f 1-D groups.
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
             1,
@@ -2471,7 +2488,7 @@ impl<'a> Recorder<'a> {
         rp[0..4].copy_from_slice(&(n_elems as u32).to_ne_bytes());
         rp[4..8].copy_from_slice(&(splits as u32).to_ne_bytes());
         rp[8..12].copy_from_slice(&(n_elems as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             rk,
             &[Self::vkb(partials), Self::vkb(c)],
             1,
@@ -2496,6 +2513,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert_native_k("matmul_mmq_q4k", k);
         self.label_gemm("native_gemm_mmq_q4k", m, k, n);
         let kern = self.be.kernel(
             "native_gemm_mmq_q4k",
@@ -2546,6 +2564,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert_native_k("matmul_i8cm_q8_0", k);
         self.label_gemm("native_gemm_i8cm_q8_0", m, k, n);
         let kern = self.be.kernel_sg(
             "native_gemm_i8cm_q8_0",
@@ -2592,6 +2611,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert_native_k("matmul_i8cm_q8_0_at", k);
         self.label_gemm("native_gemm_i8cm_q8_0_streamed", m, k, n);
         let kern = self.be.kernel_sg(
             "native_gemm_i8cm_q8_0_streamed",
@@ -2634,6 +2654,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert_native_k("matmul_i8cm_q8_0_rowscale", k);
         self.label_gemm("native_gemm_i8cm_q8_0_rowscale", m, k, n);
         let kern = self.be.kernel_sg(
             "native_gemm_i8cm_q8_0_rowscale",
@@ -2967,6 +2988,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert_native_k("matmul_mmq_q6k", k);
         self.label_gemm("native_gemm_mmq_q6k", m, k, n);
         let kern = self.be.kernel(
             "native_gemm_mmq_q6k",
@@ -3038,6 +3060,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert_native_k("matmul_mmq_at", k);
         let (name, spv) = crate::gemm::native_gemm_mmq_dense_spv(dtype)
             .expect("matmul_mmq_at: dtype gated by native_gemm_mmq_dense_spv");
         let needs_sact = infr_core::tensor::moe_mmq_needs_sact(dtype);
@@ -3966,7 +3989,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&u32::try_from(n_rows).unwrap_or(u32::MAX).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(table), Self::vkb(ids), Self::vkb(dst)],
             1,
@@ -4310,7 +4333,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&hc.to_ne_bytes());
         push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
         push[8..12].copy_from_slice(&total.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(dst)],
             1,
@@ -4342,7 +4365,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&hc.to_ne_bytes());
         push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
         push[8..12].copy_from_slice(&total.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(x),
@@ -4685,7 +4708,7 @@ impl<'a> Recorder<'a> {
                 } else {
                     self.be.kernel("rope_ff", crate::gemm::rope_ff_spv(), 3, 28)
                 };
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     // ff BEFORE y: the trailing `n_out` bindings are the hazard-tracked writes,
                     // and `y` (index 2) must be that write — binding ff last would mark the
@@ -4706,7 +4729,7 @@ impl<'a> Recorder<'a> {
                 } else {
                     self.be.kernel("rope", crate::gemm::rope_spv(), 2, 28)
                 };
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
@@ -4744,7 +4767,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
         push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(y)],
             1,
@@ -4779,7 +4802,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
         // [20..24] pos_offset: unused (from params)
         push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
             1,
@@ -4832,7 +4855,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
         push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
             1,
@@ -4882,7 +4905,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
         push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             // `o` LAST: the trailing `n_out` bindings are the hazard-tracked writes, so the sinks
             // weight must bind before it (same rule as `rope_ff`'s divisors and `mla_bias`).
@@ -4937,7 +4960,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
         push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[
                 Self::vkb(q),
@@ -4991,7 +5014,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
         push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[
                 Self::vkb(q),
@@ -5073,7 +5096,7 @@ impl<'a> Recorder<'a> {
         push[40..44].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
         push[44..48].copy_from_slice(&(v_addr as u32).to_ne_bytes());
         push[48..52].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
             1,
@@ -5237,7 +5260,7 @@ impl<'a> Recorder<'a> {
             let mut pr = [0u8; 8];
             pr[0..4].copy_from_slice(&total.to_ne_bytes());
             pr[4..8].copy_from_slice(&n_splits.to_ne_bytes());
-            self.dispatch(
+            self.dispatch_wide(
                 kr,
                 &[Self::vkb(pv_part), Self::vkb(attn)],
                 1,
@@ -5665,7 +5688,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(src_off as u32).to_ne_bytes());
         // [12..16] cap: dyn-only (ring row modulo), zero here.
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -5707,7 +5730,7 @@ impl<'a> Recorder<'a> {
         // [12..16] cap: dyn-only, zero here.
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -5738,7 +5761,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(cap_rows as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
             1,
@@ -5776,7 +5799,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[32..36].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(y)],
             1,
@@ -5817,7 +5840,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[32..36].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
             1,
@@ -5865,7 +5888,7 @@ impl<'a> Recorder<'a> {
                     4,
                     44,
                 );
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(nw), Self::vkb(ff), Self::vkb(y)],
                     1,
@@ -5880,7 +5903,7 @@ impl<'a> Recorder<'a> {
                     3,
                     44,
                 );
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
                     1,
@@ -5928,7 +5951,7 @@ impl<'a> Recorder<'a> {
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
         push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
             1,
@@ -5984,7 +6007,7 @@ impl<'a> Recorder<'a> {
         push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
         match ff {
-            Some(f) => self.dispatch(
+            Some(f) => self.dispatch_wide(
                 k,
                 &[
                     Self::vkb(x),
@@ -5997,7 +6020,7 @@ impl<'a> Recorder<'a> {
                 &push,
                 (rows * nheads) as u32,
             ),
-            None => self.dispatch(
+            None => self.dispatch_wide(
                 k,
                 &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
                 1,
@@ -6044,7 +6067,7 @@ impl<'a> Recorder<'a> {
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
         push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(qg),
@@ -6094,7 +6117,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
         // One workgroup (32 lanes) per 32-element block.
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6132,7 +6155,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
             1,
@@ -6158,7 +6181,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(cap as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(src_addr as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&((src_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6190,7 +6213,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6215,7 +6238,7 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6237,7 +6260,7 @@ impl<'a> Recorder<'a> {
         let k = self.be.kernel(name, spv, 2, 4);
         let mut push = [0u8; 4];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6269,7 +6292,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6298,7 +6321,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(src_addr as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&((src_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6343,7 +6366,7 @@ impl<'a> Recorder<'a> {
                 let k =
                     self.be
                         .kernel("qk_norm_rope_ff", crate::gemm::qk_norm_rope_ff_spv(), 4, 36);
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(nw), Self::vkb(ff), Self::vkb(y)],
                     1,
@@ -6355,7 +6378,7 @@ impl<'a> Recorder<'a> {
                 let k = self
                     .be
                     .kernel("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 3, 36);
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
                     1,
@@ -6400,7 +6423,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&eps.to_ne_bytes());
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
             1,
@@ -6443,7 +6466,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&eps.to_ne_bytes());
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(qg),
@@ -7086,7 +7109,7 @@ impl<'a> Recorder<'a> {
         push[28..32].copy_from_slice(&eps.to_ne_bytes());
         push[32..36].copy_from_slice(&(kcap as u32).to_ne_bytes());
         match ff {
-            Some(f) => self.dispatch(
+            Some(f) => self.dispatch_wide(
                 k,
                 &[
                     Self::vkb(x),
@@ -7099,7 +7122,7 @@ impl<'a> Recorder<'a> {
                 &push,
                 (rows * nheads) as u32,
             ),
-            None => self.dispatch(
+            None => self.dispatch_wide(
                 k,
                 &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
                 1,
@@ -7127,7 +7150,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         // [4..8] off: unused (computed as (pos % cap)*n from params). [8..12] src_off: 0.
         push[12..16].copy_from_slice(&(cap_rows as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
             1,
@@ -7175,7 +7198,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
         push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[
                 Self::vkb(q),
@@ -7240,7 +7263,7 @@ impl<'a> Recorder<'a> {
         push[40..44].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
         push[44..48].copy_from_slice(&(v_addr as u32).to_ne_bytes());
         push[48..52].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[
                 Self::vkb(q),
@@ -7750,7 +7773,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[Self::vkb(q), Self::vkb(k), Self::vkb(v), Self::vkb(o)],
             1,
@@ -7778,7 +7801,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
         push[12..16].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
         // Thread-per-element kernel (local_size 64) — dispatch element-count/64 workgroups.
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(gu), Self::vkb(y)],
             1,
@@ -7806,7 +7829,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
         push[12..16].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
         // Thread-per-element kernel (local_size 64) — dispatch element-count/64 workgroups.
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(gu), Self::vkb(y)],
             1,
@@ -7832,7 +7855,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
         push[32..36].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
             1,
@@ -8219,7 +8242,7 @@ impl<'a> Recorder<'a> {
         let mut p2 = [0u8; 8];
         p2[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         p2[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kg,
             &[
                 Self::vkb(blog),
@@ -8371,7 +8394,7 @@ impl<'a> Recorder<'a> {
         let k1 = self
             .be
             .kernel("conv1d_silu_par", crate::gemm::conv1d_silu_par_spv(), 4, 20);
-        self.dispatch(
+        self.dispatch_wide(
             k1,
             &[
                 Self::vkb(qkv),
@@ -8390,7 +8413,7 @@ impl<'a> Recorder<'a> {
         let k2 = self
             .be
             .kernel("conv1d_shift", crate::gemm::conv1d_shift_spv(), 2, 12);
-        self.dispatch(
+        self.dispatch_wide(
             k2,
             &[Self::vkb(qkv), Self::vkb(state)],
             1, // state out
@@ -8425,7 +8448,7 @@ impl<'a> Recorder<'a> {
         {
             push[i * 4..i * 4 + 4].copy_from_slice(&(*v as u32).to_ne_bytes());
         }
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -8455,7 +8478,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(gate_stride_el as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(gate_row_width as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(gate_block_width as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[Self::vkb(a), Self::vkb(b), Self::vkb(y)],
             1,
@@ -8497,7 +8520,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&((gate_stride_bytes / 4) as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&(gate_row_width as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&((gate_block_width / 4) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
             1,
@@ -8624,7 +8647,7 @@ impl<'a> Recorder<'a> {
         // w first, y LAST: dispatch3 hazard-tracks the last n_out buffers as writes — y is the
         // read-modify-write target, so it must sit in the write slot or the downstream activation
         // kernel races the in-place scale (shader bindings match this order).
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(w), Self::vkb(y)],
             1,
@@ -8988,7 +9011,7 @@ impl<'a> Recorder<'a> {
             2,
             4,
         );
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(tok_ids), Self::vkb(counts)],
             1,
@@ -9056,7 +9079,7 @@ impl<'a> Recorder<'a> {
             Self::vkb(bucket_wts),
             Self::vkb(inv_pos),
         ]);
-        self.dispatch(k, &bufs, 4, &push, (n_pairs as u32).div_ceil(64));
+        self.dispatch_wide(k, &bufs, 4, &push, (n_pairs as u32).div_ceil(64));
     }
 
     /// Fused gather+quant for the batched MoE pipeline: quantize `n_slots` BUCKET rows (each
@@ -9084,7 +9107,7 @@ impl<'a> Recorder<'a> {
         p[0..4].copy_from_slice(&(n_slots as u32).to_ne_bytes());
         p[4..8].copy_from_slice(&(k_dim as u32).to_ne_bytes());
         p[8..12].copy_from_slice(&32u32.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kq,
             &[
                 Self::vkb(a),
@@ -9153,6 +9176,7 @@ impl<'a> Recorder<'a> {
         n_expert: usize,
         n_used: usize,
     ) {
+        assert_native_k("matmul_mmq_experts", k);
         // The stacked expert bank is read from its resident-BDA arena address, never a bound SSBO.
         // `pc.m` is REPURPOSED as the per-expert BYTE stride applied on the pointer
         // (`w_addr += uint64_t(ex) * uint64_t(pc.m)`, see the shaders' STREAMED EXPERT_GRID arm) —
@@ -9262,6 +9286,7 @@ impl<'a> Recorder<'a> {
         n_expert: usize,
         n_used: usize,
     ) {
+        assert_native_k("matmul_mmq_experts_paged", k);
         self.label_next(stage);
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
         let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
@@ -9337,7 +9362,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(prescaled as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(y_all),
@@ -9653,7 +9678,7 @@ impl<'a> Recorder<'a> {
         p[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         p[4..8].copy_from_slice(&(k as u32).to_ne_bytes());
         p[8..12].copy_from_slice(&32u32.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kq,
             &[
                 Self::vkb(a),
@@ -9803,7 +9828,7 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(slot as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(wts), Self::vkb(acc)],
             1,
@@ -9820,7 +9845,7 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&scale.to_ne_bytes());
-        self.dispatch(k, &[Self::vkb(y)], 1, &push, (n as u32).div_ceil(64));
+        self.dispatch_wide(k, &[Self::vkb(y)], 1, &push, (n as u32).div_ceil(64));
     }
 
     /// Elementwise softcap `y[i] = cap·tanh(x[i]/cap)` (gemma final-logit / attn softcap). In-place
@@ -9830,7 +9855,7 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&cap.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(y)],
             1,
@@ -9846,7 +9871,7 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&scale.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(acc)],
             1,
@@ -9858,7 +9883,7 @@ impl<'a> Recorder<'a> {
     /// Elementwise add; in place allowed (`a` may equal `y`).
     pub fn add(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
         let k = self.be.kernel("add", crate::gemm::add_spv(), 3, 4);
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(a), Self::vkb(b), Self::vkb(y)],
             1,
@@ -9882,7 +9907,7 @@ impl<'a> Recorder<'a> {
             .kernel("add_bias", crate::gemm::add_bias_spv(), 3, 8);
         let mut pc = (n as u32).to_ne_bytes().to_vec();
         pc.extend_from_slice(&total.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(bias), Self::vkb(y)],
             1,
@@ -9898,7 +9923,7 @@ impl<'a> Recorder<'a> {
         let k = self.be.kernel("mul_vec", crate::gemm::mul_vec_spv(), 3, 8);
         let mut pc = (n as u32).to_ne_bytes().to_vec();
         pc.extend_from_slice(&total.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(vec), Self::vkb(y)],
             1,
@@ -9930,7 +9955,7 @@ impl<'a> Recorder<'a> {
         );
         let mut pc = (n as u32).to_ne_bytes().to_vec();
         pc.extend_from_slice(&total.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(moe),
@@ -10640,16 +10665,700 @@ mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
 
+    thread_local! {
+        /// Overrides `Recorder::split_point_x` on this test thread.
+        pub(super) static WIDE_SPLIT_AT: std::cell::Cell<Option<u32>> =
+            const { std::cell::Cell::new(None) };
+        /// How many `dispatch_wide` calls on this test thread took the 2-D split.
+        pub(super) static WIDE_SPLITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+
     /// A backend built on an EXPLICIT Vulkan kernel-tier configuration.
     ///
     /// This is what replaced `EnvGuard::with([("INFR_FLASH_SPLITS", "4"), …])` in every test below:
     /// the tier knobs are a VALUE handed to `VulkanBackend::new_with`, so nothing is process-global,
     /// nothing has to be restored, and two backends with different tiers can be live at once (R7).
     /// The cost is one device per configuration — these tests already built one per case.
+    /// The device is still the one `INFR_DEV` names (see `crate::test_config`).
     fn be_with(f: impl FnOnce(&mut infr_core::config::VulkanCfg)) -> VulkanBackend {
-        let mut cfg = infr_core::config::Config::default();
+        let mut cfg = crate::test_config();
         f(&mut cfg.kernels.vulkan);
         VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap()
+    }
+
+    /// `be_with` must bind the device `INFR_DEV` names, as `VulkanBackend::new` does. Only
+    /// observable with `INFR_DEV` naming a device other than the discrete default.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn be_with_honours_infr_dev() {
+        let want = VulkanBackend::new().unwrap().capabilities().name;
+        assert_eq!(be_with(|_| {}).capabilities().name, want);
+    }
+
+    /// The prefill MMQ / int8-coopmat GEMMs floor K to whole 32-element blocks in the shader, so
+    /// an off-grid K must be refused at the entry point rather than silently dropping its tail
+    /// (or, below one block, producing zeros). Each entry is called with an off-grid `k` and must
+    /// panic with `assert_native_k`'s message before anything is dispatched.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn mmq_gemm_entries_reject_off_grid_k() {
+        use infr_core::DType;
+        let be = be_with(|_| {});
+        let buf = || be.alloc(1 << 16, BufferUsage::KvCache).unwrap();
+        let (qa, dact, sact, w, c, aux) = (buf(), buf(), buf(), buf(), buf(), buf());
+        let (qa, dact, sact, w, c, aux) = (
+            qa.as_ref(),
+            dact.as_ref(),
+            sact.as_ref(),
+            w.as_ref(),
+            c.as_ref(),
+            aux.as_ref(),
+        );
+        let addr = w.device_addr().unwrap();
+        let (m, k, n) = (1, 16usize, 64);
+        assert!(
+            !k.is_multiple_of(32),
+            "k must be off the 32-element block grid"
+        );
+        let rec = be.recorder().unwrap();
+        type Call<'a> = Box<dyn Fn() + 'a>;
+        let entries: Vec<(&str, Call)> = vec![
+            (
+                "matmul_mmq_q4k",
+                Box::new(|| rec.matmul_mmq_q4k(qa, dact, sact, w, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_mmq_q6k",
+                Box::new(|| rec.matmul_mmq_q6k(qa, dact, w, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_mmq_at",
+                Box::new(|| rec.matmul_mmq_at(DType::Q8_0, qa, dact, sact, addr, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_i8cm_q8_0",
+                Box::new(|| rec.matmul_i8cm_q8_0(qa, dact, w, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_i8cm_q8_0_at",
+                Box::new(|| rec.matmul_i8cm_q8_0_at(qa, dact, addr, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_i8cm_q8_0_rowscale",
+                Box::new(|| rec.matmul_i8cm_q8_0_rowscale(qa, dact, w, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_mmq_experts",
+                Box::new(|| {
+                    rec.matmul_mmq_experts(
+                        DType::Q8_0,
+                        "test",
+                        qa,
+                        dact,
+                        None,
+                        w,
+                        0,
+                        k * n,
+                        aux,
+                        aux,
+                        c,
+                        m,
+                        k,
+                        n,
+                        1,
+                        1,
+                    )
+                }),
+            ),
+            (
+                "matmul_mmq_experts_paged",
+                Box::new(|| {
+                    rec.matmul_mmq_experts_paged(
+                        DType::Q8_0,
+                        "test",
+                        qa,
+                        dact,
+                        None,
+                        addr,
+                        1 << 12,
+                        aux,
+                        0,
+                        aux,
+                        aux,
+                        c,
+                        m,
+                        k,
+                        n,
+                        1,
+                        1,
+                    )
+                }),
+            ),
+        ];
+        for (name, call) in &entries {
+            let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
+                .expect_err(&format!("{name}: K = {k} was dispatched"));
+            let msg = err
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert!(
+                msg.contains("native-block K must be a nonzero multiple of 32"),
+                "{name}: panicked for another reason: {msg}"
+            );
+        }
+        drop(entries);
+        rec.finish().unwrap();
+    }
+
+    /// Every flat elementwise dispatcher must go through `dispatch_wide`, and its shader must
+    /// recover the flat index from the 2-D grid: a grid past `maxComputeWorkGroupCount[0]` is
+    /// otherwise rejected or truncated by a driver that enforces the guaranteed minimum (ANV).
+    /// With the split point lowered so these small grids split, each op must take the split and
+    /// write exactly the bytes the unsplit grid writes. Every buffer carries `GUARD` sentinel bytes
+    /// past its declared size, which must come back unchanged from both runs: a padding workgroup
+    /// of the split grid that wrote past the logical end of an output sized to it lands there.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn elementwise_ops_split_wide_grids() {
+        use infr_core::DType;
+        use std::cell::Cell;
+        // Lowered split point. `n_split > 0` below proves each case's grid exceeded it.
+        const SPLIT_AT: u32 = 3;
+        // Not a multiple of the workgroup width or of `SPLIT_AT`, so the split grid has a ragged
+        // last workgroup and padding workgroups after it.
+        const N: usize = 64 * 10 + 5;
+        // Row-shaped cases.
+        const ROWS: usize = 5;
+        const W: usize = 129;
+        const _: () = assert!(ROWS * W == N);
+        // The 256-wide kernels need more elements for a grid of the same width.
+        const N256: usize = 256 * 10 + 5;
+        // Block-per-thread KV quantizers: one thread per 32- or 128-element block.
+        const NQ4: usize = 32 * N;
+        const NT: usize = 128 * N;
+        // One workgroup per 32-element block.
+        const NQ8: usize = 32 * 11;
+        // Workgroup-per-unit kernels (rope family, attention, qk_norm_rope, linear_bf16).
+        const HD: usize = 64;
+        const UNITS: usize = 5;
+        // `deltanet_gates_seq` runs one thread per (row, value head) in 256-wide workgroups.
+        const DN_ROWS: usize = 3 * 256 / 4 + 1;
+        // Sentinel bytes after every buffer's declared size.
+        const GUARD: usize = 1024;
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+
+        enum Fill {
+            Data,
+            Zero,
+            // `i` at word `i`: distinct expert ids and offsets for `moe_bucket_scatter`.
+            Iota,
+        }
+        use BufferUsage::{Activations as Act, KvCache as Kv};
+        type Op = Box<dyn Fn(&Recorder, &[&dyn Buffer])>;
+        type Bufs = Vec<(usize, Fill, BufferUsage)>;
+        let f = |n: usize| (n * 4, Fill::Data, Act);
+        let mut cases: Vec<(&str, Bufs, Op)> = vec![
+            (
+                "add",
+                vec![f(N), f(N), f(N)],
+                Box::new(|r, b| r.add(b[0], b[1], b[2], N)),
+            ),
+            (
+                "add_scaled",
+                vec![f(N), f(N)],
+                Box::new(|r, b| r.add_scaled(b[0], b[1], 0.5, N)),
+            ),
+            ("scale", vec![f(N)], Box::new(|r, b| r.scale(b[0], 1.5, N))),
+            (
+                "softcap",
+                vec![f(N), f(N)],
+                Box::new(|r, b| r.softcap(b[0], b[1], 2.0, N)),
+            ),
+            (
+                "add_bias",
+                vec![f(N), f(W), f(N)],
+                Box::new(|r, b| r.add_bias(b[0], b[1], b[2], ROWS, W)),
+            ),
+            (
+                "mul_vec",
+                vec![f(N), f(W), f(N)],
+                Box::new(|r, b| r.mul_vec(b[0], b[1], b[2], ROWS, W)),
+            ),
+            (
+                "moe_shared_expert_add",
+                vec![f(N), f(N), f(ROWS), f(N)],
+                Box::new(|r, b| r.moe_shared_expert_add(b[0], b[1], b[2], b[3], ROWS, W)),
+            ),
+            (
+                "add_scaled_id",
+                vec![f(N), f(4), f(N)],
+                Box::new(|r, b| r.add_scaled_id(b[0], b[1], 2, b[2], N)),
+            ),
+            (
+                "silu_mul",
+                vec![f(N), f(N), f(N)],
+                Box::new(|r, b| r.silu_mul(b[0], b[1], b[2], N, None)),
+            ),
+            (
+                "gelu_mul_off",
+                vec![f(N), f(N), f(N)],
+                Box::new(|r, b| r.gelu_mul_off(b[0], b[1], 0, 0, N, 0, 0, 0, b[2], N)),
+            ),
+            (
+                "silu_mul_fused",
+                vec![f(2 * N), f(N)],
+                Box::new(|r, b| r.silu_mul_fused(b[0], b[1], ROWS, W, None)),
+            ),
+            (
+                "gelu_mul_fused",
+                vec![f(2 * N), f(N)],
+                Box::new(|r, b| r.gelu_mul_fused(b[0], b[1], ROWS, W, None)),
+            ),
+            (
+                "mul_sigmoid",
+                vec![f(N), f(N), f(N)],
+                Box::new(|r, b| r.mul_sigmoid(b[0], b[1], b[2], N, 0, 0, 0)),
+            ),
+            (
+                "copy_strided",
+                vec![f(N256), f(N256)],
+                Box::new(|r, b| r.copy_strided(b[0], b[1], 5, 513, 0, 513, 0, 513)),
+            ),
+            (
+                "gather_i32",
+                vec![f(W), (ROWS * 4, Fill::Zero, Act), f(N)],
+                Box::new(|r, b| r.gather_i32(b[0], b[1], b[2], ROWS, W)),
+            ),
+            (
+                "hyper_pre",
+                vec![f(N * 2), f(ROWS * 2), f(N)],
+                Box::new(|r, b| r.hyper_pre(b[0], b[1], b[2], ROWS as u32, 2, W as u32)),
+            ),
+            (
+                "hyper_post",
+                vec![f(N), f(N * 2), f(ROWS * 2), f(ROWS * 4), f(N * 2)],
+                Box::new(|r, b| {
+                    r.hyper_post(b[0], b[1], b[2], b[3], b[4], ROWS as u32, 2, W as u32)
+                }),
+            ),
+            (
+                "moe_weight_scale",
+                vec![f(N), f(ROWS)],
+                Box::new(|r, b| r.moe_weight_scale(b[0], b[1], ROWS, W)),
+            ),
+            (
+                "moe_scatter_reduce",
+                vec![f(W), f(1), (ROWS * 2 * 4, Fill::Zero, Act), f(N)],
+                Box::new(|r, b| r.moe_scatter_reduce(b[0], b[1], b[2], b[3], ROWS, W, 2, false)),
+            ),
+            (
+                "moe_bucket_count",
+                vec![(N * 4, Fill::Zero, Act), (4, Fill::Zero, Act)],
+                Box::new(|r, b| r.moe_bucket_count(b[0], b[1], N)),
+            ),
+            (
+                "quant_q8",
+                vec![f(NQ8), f(NQ8), f(NQ8), f(NQ8)],
+                Box::new(|r, b| r.quant_q8(b[0], b[1], b[2], b[3], 1, NQ8)),
+            ),
+            (
+                "quant_q8_gather",
+                vec![f(NQ8), (4, Fill::Zero, Act), f(NQ8), f(NQ8), f(NQ8)],
+                Box::new(|r, b| r.quant_q8_gather(b[0], b[1], b[2], b[3], b[4], 1, NQ8)),
+            ),
+            (
+                "store_f16_off",
+                vec![f(N), f(N)],
+                Box::new(|r, b| r.store_f16_off(b[0], b[1], N, 0, 0)),
+            ),
+            (
+                "store_kv_dense",
+                vec![f(N), (N * 4, Fill::Data, Kv)],
+                Box::new(|r, b| r.store_kv_dense(DType::F32, b[0], b[1], N, 0, false)),
+            ),
+            (
+                "quant_kv",
+                vec![f(NQ4), (NQ4, Fill::Data, Kv)],
+                Box::new(|r, b| r.quant_kv(DType::Q4_0, b[0], b[1], NQ4, 0, false)),
+            ),
+            (
+                "dequant_kv_f16",
+                vec![(NQ4, Fill::Data, Kv), f(NQ4)],
+                Box::new(|r, b| r.dequant_kv_f16(DType::Q4_0, b[0], b[1], NQ4)),
+            ),
+            (
+                "dequant_q8_f16",
+                vec![(N * 8, Fill::Data, Kv), f(N)],
+                Box::new(|r, b| r.dequant_q8_f16(b[0], b[1], N, N * 4)),
+            ),
+            (
+                "quant_turbo",
+                vec![f(NT), (NT, Fill::Data, Kv)],
+                Box::new(|r, b| r.quant_turbo(DType::Turbo3, b[0], b[1], NT, 0, false)),
+            ),
+            (
+                "dequant_turbo_f16",
+                vec![(NT, Fill::Data, Kv), f(NT)],
+                Box::new(|r, b| r.dequant_turbo_f16(DType::Turbo3, b[0], b[1], NT)),
+            ),
+            (
+                "store_q8",
+                vec![f(NQ8), (NQ8 * 17 / 16, Fill::Data, Kv)],
+                Box::new(|r, b| r.store_q8(b[0], b[1], NQ8, 0, NQ8, false, 0)),
+            ),
+            (
+                "store_q8_dyn",
+                vec![
+                    f(NQ8),
+                    (8, Fill::Zero, Act),
+                    (NQ8 * 17 / 16, Fill::Data, Kv),
+                ],
+                Box::new(|r, b| r.store_q8_dyn(b[0], b[1], b[2], NQ8, NQ8, false)),
+            ),
+            (
+                "store_f16_off_at",
+                vec![f(N), (N * 2, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[1].device_addr().unwrap();
+                    r.store_f16_off_at(b[0], b[1], a, N, 0, 0)
+                }),
+            ),
+            (
+                "store_f16_dyn_at",
+                vec![f(N), (8, Fill::Zero, Act), (N * 2, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[2].device_addr().unwrap();
+                    r.store_f16_dyn_at(b[0], b[1], b[2], a, N, 1)
+                }),
+            ),
+            (
+                "store_f16_dyn",
+                vec![f(N), (8, Fill::Zero, Act), (N * 2, Fill::Data, Act)],
+                Box::new(|r, b| r.store_f16_dyn(b[0], b[1], b[2], N, 1)),
+            ),
+            (
+                "conv1d_silu_par+conv1d_shift",
+                // The batch form needs rows >= kconv - 1; both passes then span N256 channels.
+                vec![
+                    f(3 * N256),
+                    (4 * 4 * N256, Fill::Data, Kv),
+                    f(3 * N256),
+                    f(3 * N256),
+                ],
+                Box::new(|r, b| {
+                    let a = b[1].device_addr().unwrap();
+                    r.conv1d_silu_batch_at(b[0], a, b[2], b[3], 3, N256, 4)
+                }),
+            ),
+            (
+                "deltanet_gates_seq",
+                {
+                    // `deltanet_seq` needs kd = 128; the gates pass is the one under test.
+                    let (rows, nv, kd, vd) = (DN_ROWS, 4, 128, DN_SEQ_NCOL);
+                    let rn = rows * nv;
+                    vec![
+                        f(rows * kd),
+                        f(rows * kd),
+                        f(rn * vd),
+                        f(rn),
+                        f(rn),
+                        f(nv),
+                        f(nv),
+                        f(nv * kd * vd),
+                        f(rn * vd),
+                        f(rows * kd),
+                        f(rows * kd),
+                        f(rn),
+                        f(rn),
+                    ]
+                },
+                Box::new(|r, b| {
+                    r.deltanet_seq_split(
+                        b[0],
+                        b[1],
+                        b[2],
+                        b[3],
+                        b[4],
+                        b[5],
+                        b[6],
+                        b[7],
+                        b[8],
+                        b[9],
+                        b[10],
+                        b[11],
+                        b[12],
+                        DN_ROWS,
+                        4,
+                        1,
+                        128,
+                        DN_SEQ_NCOL,
+                        1e-6,
+                    )
+                }),
+            ),
+            (
+                "moe_bucket_scatter",
+                vec![
+                    (N * 4, Fill::Iota, Act),
+                    f(N),
+                    (N * 4, Fill::Iota, Act),
+                    (N * 4, Fill::Zero, Act),
+                    f(N),
+                    f(N),
+                    f(N),
+                ],
+                Box::new(|r, b| {
+                    r.moe_bucket_scatter(b[0], b[1], b[2], b[3], b[4], b[5], b[6], None, N, 1)
+                }),
+            ),
+            (
+                "moe_bucket_scatter_scaled",
+                vec![
+                    (N * 4, Fill::Iota, Act),
+                    f(N),
+                    (N * 4, Fill::Iota, Act),
+                    (N * 4, Fill::Zero, Act),
+                    f(N),
+                    f(N),
+                    f(N),
+                    f(N),
+                ],
+                Box::new(|r, b| {
+                    r.moe_bucket_scatter(b[0], b[1], b[2], b[3], b[4], b[5], b[6], Some(b[7]), N, 1)
+                }),
+            ),
+            (
+                "rope",
+                vec![f(N * 16), f(N * 16)],
+                Box::new(|r, b| r.rope(b[0], b[1], ROWS, W, 16, 16, 1e4, 0, None, false, false)),
+            ),
+            (
+                "rope_f16",
+                vec![f(N * 16), f(N * 8)],
+                Box::new(|r, b| r.rope_f16(b[0], b[1], ROWS, W, 16, 16, 1e4, 0, 0)),
+            ),
+            (
+                "rope_f16_dyn",
+                vec![f(N * 16), (8, Fill::Zero, Act), f(N * 8)],
+                Box::new(|r, b| r.rope_f16_dyn(b[0], b[1], b[2], ROWS, W, 16, 16, 1e4, 0)),
+            ),
+            (
+                "rope_f16_at",
+                vec![f(N * 16), (N * 32, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[1].device_addr().unwrap();
+                    r.rope_f16_at(b[0], b[1], a, ROWS, W, 16, 16, 1e4, 0, 0)
+                }),
+            ),
+            (
+                "rope_f16_dyn_at",
+                vec![f(N * 16), (8, Fill::Zero, Act), (N * 32, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[2].device_addr().unwrap();
+                    r.rope_f16_dyn_at(b[0], b[1], b[2], a, ROWS, W, 16, 16, 1e4, 0)
+                }),
+            ),
+            (
+                "attention",
+                vec![f(N * 16), f(N * 16), f(N * 16), f(N * 16)],
+                Box::new(|r, b| r.attention(b[0], b[1], b[2], b[3], ROWS, W, W, 16)),
+            ),
+            (
+                "qk_norm_rope",
+                vec![f(UNITS * HD), f(HD), (UNITS * HD * 2, Fill::Data, Act)],
+                Box::new(|r, b| {
+                    r.qk_norm_rope(b[0], b[1], b[2], UNITS, 1, HD, HD, 1e4, 0, 0, 1e-6, None)
+                }),
+            ),
+            (
+                "qk_norm_rope_interleaved",
+                vec![f(2 * UNITS * HD), f(HD), (UNITS * HD * 2, Fill::Data, Act)],
+                Box::new(|r, b| {
+                    r.qk_norm_rope_interleaved(
+                        b[0],
+                        b[1],
+                        b[2],
+                        UNITS,
+                        1,
+                        HD,
+                        HD,
+                        1e4,
+                        0,
+                        0,
+                        1e-6,
+                        2 * HD,
+                    )
+                }),
+            ),
+            (
+                "qk_norm_rope_dyn",
+                vec![
+                    f(UNITS * HD),
+                    f(HD),
+                    (8, Fill::Zero, Act),
+                    (UNITS * HD * 2, Fill::Data, Act),
+                ],
+                Box::new(|r, b| {
+                    r.qk_norm_rope_dyn(
+                        b[0], b[1], b[2], None, b[3], UNITS, 1, HD, HD, 1e4, 0, 1e-6, 0,
+                    )
+                }),
+            ),
+            (
+                "qk_norm_rope_at",
+                vec![f(UNITS * HD), f(HD), (UNITS * HD * 2, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[2].device_addr().unwrap();
+                    r.qk_norm_rope_at(b[0], b[1], b[2], a, UNITS, 1, HD, HD, 1e4, 0, 0, 1e-6, None)
+                }),
+            ),
+            (
+                "attention_kv",
+                vec![f(UNITS * HD), f(UNITS * HD), f(UNITS * HD), f(UNITS * HD)],
+                Box::new(|r, b| {
+                    r.attention_kv(
+                        b[0], b[1], b[2], b[3], UNITS, UNITS, 1, 1, HD, 0, 0, 0.0, false, false, 0,
+                    )
+                }),
+            ),
+            (
+                "attention_kv_at",
+                vec![
+                    f(UNITS * HD),
+                    (UNITS * HD * 2, Fill::Data, Kv),
+                    (UNITS * HD * 2, Fill::Data, Kv),
+                    f(UNITS * HD),
+                ],
+                Box::new(|r, b| {
+                    let (ka, va) = (b[1].device_addr().unwrap(), b[2].device_addr().unwrap());
+                    r.attention_kv_at(
+                        b[0], b[1], b[2], ka, va, b[3], UNITS, UNITS, 1, 1, HD, 0, 0, 0.0, false,
+                        false, 0,
+                    )
+                }),
+            ),
+            (
+                "linear_bf16_at",
+                vec![f(UNITS * HD), (HD * 2, Fill::Data, Kv), f(UNITS)],
+                Box::new(|r, b| {
+                    let a = b[1].device_addr().unwrap();
+                    r.linear_bf16_at(a, b[0], b[2], UNITS, HD, 1)
+                }),
+            ),
+        ];
+        // Pinned to two PV splits so the non-flash prefill attention reaches `attn_pv_reduce`.
+        let be = be_with(|v| v.pv_splits = Some(2));
+        // These two reach their reduce pass only through a GEMM tier the device may lack.
+        if be.caps().f16_coopmat() {
+            cases.extend::<Vec<(&str, Bufs, Op)>>(vec![
+                (
+                    "splitk_reduce",
+                    vec![
+                        f(64),
+                        (128 * 64 / 32 * 34, Fill::Data, Kv),
+                        f(2 * 64 * 128),
+                        f(64 * 128),
+                    ],
+                    Box::new(|r, b| {
+                        let a = b[1].device_addr().unwrap();
+                        r.matmul_native_splitk(
+                            DType::Q8_0,
+                            b[0],
+                            a,
+                            0,
+                            b[2],
+                            b[3],
+                            1,
+                            64,
+                            128,
+                            2,
+                            false,
+                        )
+                    }),
+                ),
+                (
+                    "attn_pv_reduce",
+                    {
+                        let (mpad, kv_rows) = (64, NONFA_KV_TILE + 64);
+                        vec![
+                            f(mpad * HD / 2),
+                            f(kv_rows * HD / 2),
+                            f(kv_rows * HD / 2),
+                            f(mpad * HD),
+                            f(mpad * NONFA_KV_TILE / 2),
+                            f(8 * mpad * HD),
+                        ]
+                    },
+                    Box::new(|r, b| {
+                        r.attention_prefill_nonfa(
+                            b[0], b[1], b[2], b[3], b[4], b[5], 64, 64, 1, 1, HD, 0, 0, 0.0,
+                        )
+                    }),
+                ),
+            ]);
+        } else {
+            eprintln!(
+                "skip: splitk_reduce and attn_pv_reduce need the f16 cooperative matrix tier"
+            );
+        }
+        let run = |bufs: &[(usize, Fill, BufferUsage)], op: &Op, split: Option<u32>| {
+            let live: Vec<_> = bufs
+                .iter()
+                .enumerate()
+                .map(|(j, (bytes, fill, usage))| {
+                    let b = be.alloc(bytes + GUARD, *usage).unwrap();
+                    let words: Vec<u32> = (0..bytes.div_ceil(4))
+                        .map(|i| match fill {
+                            Fill::Data => (((i * 37 + j * 11) % 97) as f32 * 0.02 - 0.9).to_bits(),
+                            Fill::Zero => 0,
+                            Fill::Iota => i as u32,
+                        })
+                        .collect();
+                    let mut init = bytemuck::cast_slice::<u32, u8>(&words)[..*bytes].to_vec();
+                    init.extend(SENTINEL.to_ne_bytes().iter().cycle().take(GUARD));
+                    be.upload(b.as_ref(), &init).unwrap();
+                    b
+                })
+                .collect();
+            WIDE_SPLIT_AT.with(|c| c.set(split));
+            WIDE_SPLITS.with(|c| c.set(0));
+            let rec = be.recorder().unwrap();
+            let refs: Vec<&dyn Buffer> = live.iter().map(|b| b.as_ref()).collect();
+            op(&rec, &refs);
+            rec.finish().unwrap();
+            WIDE_SPLIT_AT.with(|c| c.set(None));
+            let out: Vec<Vec<u8>> = live
+                .iter()
+                .zip(bufs)
+                .map(|(b, (bytes, ..))| {
+                    let mut v = vec![0u8; bytes + GUARD];
+                    be.download(b.as_ref(), &mut v).unwrap();
+                    v
+                })
+                .collect();
+            (out, WIDE_SPLITS.with(Cell::get))
+        };
+        let guard_intact = |name: &str, out: &[Vec<u8>], bufs: &Bufs| {
+            for (i, (v, (bytes, ..))) in out.iter().zip(bufs).enumerate() {
+                let (tail, _) = v[*bytes..].as_chunks::<4>();
+                assert!(
+                    tail.iter().all(|w| *w == SENTINEL.to_ne_bytes()),
+                    "{name}: buffer {i} was written past its declared size"
+                );
+            }
+        };
+        for (name, bufs, op) in &cases {
+            let (whole, _) = run(bufs, op, None);
+            let (split, n_split) = run(bufs, op, Some(SPLIT_AT));
+            assert!(n_split > 0, "{name}: the grid was never split");
+            guard_intact(name, &whole, bufs);
+            guard_intact(name, &split, bufs);
+            assert!(
+                whole == split,
+                "{name}: the split grid wrote different bytes"
+            );
+        }
     }
 
     /// #1 drift guard: `kernels.vulkan.gemv` must resolve, for any env state, EXACTLY what the

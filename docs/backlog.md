@@ -26,17 +26,20 @@ Provenance tags point at the finding that opened the item:
 
 ## Open
 
-### B1 — `dn_chunk_scan` (the config field) reads opposite to its name
+### B1 — `kernels.vulkan.dn_chunk_scan` reads opposite to its name
 
-**Tag:** CR-N10 · re-read 2026-11-12
+**Tag:** CR-N10 · **Needs:** a decision (re-read 2026-11-12)
 
-The env key is right: setting `INFR_DN_CHUNK_SCAN` forces the chunked scan, as
-its name says. What is inverted is the internal field it fills —
-`dn_chunk_scan == true` selects the SEQUENTIAL path — and the field's doc
-comment in `config/mod.rs`. The earlier form of this entry proposed renaming the
-key to `INFR_NO_DN_CHUNK_SCAN`, which would have made the key wrong. The fix is
-to rename the field (or flip it and its readers) and correct the comment; no
-user-visible spelling changes.
+The env key is right: setting `INFR_DN_CHUNK_SCAN` forces the chunked scan. The
+config field it fills is inverted — `dn_chunk_scan == true` selects the
+sequential path — and its doc comment in `config/mod.rs` is wrong the other way
+again (it says the key turns off the chunked path). The field cannot simply be
+renamed: `kernels.vulkan.dn_chunk_scan` is a user-visible TOML key and `--set`
+path, named in `docs/config.md`. Options: rename it and keep the old spelling as
+an alias (the project's env policy is to drop old spellings, so this would be a
+breaking rename); flip the polarity under the same key (silently changes the
+meaning of an existing config file); or fix only the comment and live with the
+name.
 
 ### B3 — the VNNI kernel family's bounds assertions are unexercised
 
@@ -1006,44 +1009,32 @@ unbiased probs, and mask all but the top `n_expert_groups_used` groups scored by
 their top-2 sum. `moe_topk.comp` is the working reference. Note there is no
 Apple hardware on the dev box, so this can only be verified on the macOS CI job.
 
-### B52 — the weight loader validates tensor NAMES, not shapes (2026-08-10)
+### B52 — weight shapes: which tensors the loader still does not check (2026-11-12)
 
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing; family-wide, surfaced
-by the deepseek4 load slice
+`seam/wshape.rs` derives each weight's expected dims from `Config` and `wload`
+refuses a mismatch by name with both shapes (trailing size-1 dims ignored, as in
+llama.cpp). Checked: the globals, attention and FFN norms, the standard q/k/v/o
+projections with their biases and q/k norms (per-layer head dim and KV-head
+count, the qwen35 doubled query), bitnet's sub-norms, the dense FFN, the MoE
+router / expert banks / `exp_probs_b` / shared experts, and DeepSeek MLA
+`attn_q_a` / `q_a_norm` / `q_b` / `q`, `kv_a_mqa`, `kv_a_norm` and
+`attn_output`. Not checked, because the expected shape could not be derived with
+confidence:
 
-`wload` asks the GGUF for a tensor by name and fails if it is absent, but never
-checks its dimensions against what the graph will index it as. Every "the loader
-consumes every tensor" test in `tests/synthetic_deepseek2.rs` therefore proves
-only that each name was requested — never that it was the right shape. A GGUF
-whose `attn_q_b` is the wrong width loads clean and produces garbage.
-
-Two V4-specific instances of the same gap, both found reading
-`src/models/deepseek4.cpp`:
-
-- **`output_group_count` divisibility is unchecked.** The reference sizes `wo_a`
-  as `n_head * n_embd_head / o_groups` with plain integer division
-  (`deepseek4.cpp:97`), so a non-dividing group count silently truncates.
-  llama.cpp catches it downstream as a `create_tensor` shape mismatch; `infr`
-  would not notice at all.
-- **The reference shapes every V4 tensor with `n_embd_head_k()` at the default
-  `il = 0`**, and `load_arch_hparams` has already called `set_swa_pattern(0)`,
-  so that call returns the SWA head width rather than the full one. They are
-  equal only because `llama-model.cpp` defaults `_swa` to `_full` and no V4 GGUF
-  declares `attention.key_length_swa`. `infr` reads `attention.key_length`
-  directly and so does not inherit this, but a file that declared the SWA key
-  would make the two implementations disagree.
-
-Fix is one shared "expected dims" check in `wload` rather than per-arch asserts;
-the tests that exist would then gain teeth for free.
-
-Re-checked 2026-10-27: there is no expected shape anywhere to check against.
-`generate_dense_backend`'s `build` declares every weight as a flat
-`TensorDesc::new(vec![n], dt)` whose `n` comes from `wspecs`, which `wload`
-fills from the GGUF itself, so a check at bind time would compare the file with
-itself. The "one shared check" still needs a per-architecture table mapping each
-tensor role to dims derived from `Config` (`n_embd`, `n_head * head_dim`,
-`n_ff`, the MLA ranks, …). That table is the work, and it is sized per arch, not
-per call site.
+- MLA `attn_k_b` / `attn_v_b` (the `Op::Mla` test declares `wv_b` in a different
+  order from llama.cpp), and the V3.2 lightning indexer.
+- Every DeepSeek V4 mixer, compressor and hyper-connection tensor. So the two V4
+  gaps found reading `src/models/deepseek4.cpp` are still open: the reference
+  sizes `wo_a` as `n_head * n_embd_head / o_groups` with integer division, and a
+  non-dividing `output_group_count` goes unnoticed here; and the reference
+  shapes V4 tensors with the SWA head width, which equals the full one only
+  because no V4 GGUF declares `attention.key_length_swa`.
+- qwen35 DeltaNet tensors, the dual-FFN router / banks / extra norms, E2B
+  per-layer embedding tensors, DiffusionGemma's self-conditioning MLP.
+- A KV-sharing layer's `attn_k` / `attn_v` (loaded, never read), `token_embd`
+  when only the host embedding path reads it, and the MTP head, whose loader
+  does not go through `wload`.
+- A LEADING size-1 dim is not ignored; no GGUF writer is known to emit one.
 
 ### B53 — V4's KV geometry duplicates the V side (2026-08-10)
 
@@ -1206,88 +1197,32 @@ Replace each with a cosine over softmax probabilities, re-measured on the model
 it guards, and show a broken backend fails it. Needs Qwen3.5-MoE and
 DiffusionGemma-26B, plus a GPU the user allows them on.
 
-### B65 — elementwise dispatchers still use the UNSPLIT grid and can exceed `maxComputeWorkGroupCount[0]` (2026-08-13)
+### B65 — compute grids that can still exceed `maxComputeWorkGroupCount[0]` (2026-11-12)
 
-**Tag:** vulkan · **Blocked on:** nothing; found in review, scoped out because
-sweeping it needs a shader edit per kernel
+The spec guarantees 65,535 workgroups per dimension. The elementwise kernels,
+the KV store / quantise / dequantise family, rope, `qk_norm_rope`,
+`attention_kv`, `attention` and `linear_bf16` now go through `dispatch_wide`,
+and their shaders rebuild the flat index from the 2-D grid; a grid at or below
+the limit is dispatched exactly as before. A default prefill already takes the
+split on every device (`quant_q8` at 512 rows and a 4096-wide layer is 65,536
+groups). `elementwise_ops_split_wide_grids` forces a split for each converted
+kernel and compares every byte, with sentinel bytes past each buffer's end.
+Still on a flat or tiled grid, each needing real shader rework:
 
-`Recorder::dispatch` puts every workgroup in dimension 0.
-`Recorder::dispatch_wide` exists precisely because that overflows
-`VkPhysicalDeviceLimits::maxComputeWorkGroupCount[0]`, whose spec-guaranteed
-minimum is `MAX_GROUP_COUNT_X` — a limit Mesa ANV on an Intel A770 enforces
-exactly, per that constant's own doc. Using it is a PAIR: the host splits the
-grid into `(gx, gy)` and the shader must recover the flat index as
-`gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x`, so a dispatcher
-cannot be switched over without editing its shader too.
+| Sites                                                                                                          | Grid                                                        | Overflows when                                                                 |
+| -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `matmul_proj_at`, native off / cm8 / f16a / f32a, split-K's main GEMM, mmq q4k / q6k / `mmq_at`, `fma_at`      | tiles: ⌈m/64⌉·(n/64), or n/128 for the warp tiles, × splits | m = 1,024 with n ≥ 262,144 (only if the vocab head ran over every prefill row) |
+| i8cm (three variants)                                                                                          | ⌈m/128⌉·(n/16)                                              | m = 1,024 with n > 131,070                                                     |
+| f8cm (two variants), bf16cm                                                                                    | tiles                                                       | not computed                                                                   |
+| `attention_kv_split_impl`                                                                                      | rows·nh·4, shared memory                                    | rows·nh > 16,383 (small-m decode path)                                         |
+| `attention_kv_split_dyn_inner`                                                                                 | nh·n_chunks, shared memory                                  | nh·n_chunks > 65,535; the adapter's bound on n_chunks was not checked          |
+| `attention_prefill_flash`, `flash_reg`, `nc_fa`                                                                | ⌈mpad/bm⌉·nh, shared memory                                 | (mpad/64)·nh > 65,535                                                          |
+| rmsnorm family, layernorm, softmax, `embed_gather`, `dg_eb_sample`, `moe_topk`, `quant_f8_row`, `quant_q8_row` | one workgroup per row                                       | rows > 65,535                                                                  |
+| DeltaNet norm and scan passes, `hyper_mix`, `conv1d_silu_at`, `moe_ep_band_remap`                              | per the dispatcher                                          | not computed                                                                   |
 
-`Op::CompressPool` was switched to `dispatch_wide` when it landed — one thread
-per output element makes its grid `ceil(blocks*n_embd / 64)`, and a CSA layer at
-a 128k context is `ceil(n_ctx/4)` blocks, which clears the limit on a real
-model. The sweep is what was NOT done: **call sites in
-`crates/infr-vulkan/src/recorder.rs` still call plain `dispatch` with a flat
-`div_ceil` grid** (the original count of 29 is stale — `dispatch_wide` has
-gained callers since, so recount before starting), and the elementwise ones
-scale with `rows * n_embd`, which is the same shape. `Recorder::hyper_post` is
-the clearest sibling — its grid is `ceil(rows*hc*n_embd / 64)`, which at
-rows=512, hc=4, n_embd=7168 is 229,376 workgroups against the guaranteed 65,535.
-It is LATENT rather than live: the emit is gated on `lw.hc`, which only
-deepseek4 carries, and no real V4 file reaches a forward pass yet (§
-B-DSV4-REAL), while every V4 graph the tests build is `batch == 1`. So it
-becomes reachable exactly when slice B lands — which is the moment to fix it,
-not before.
-
-What is established: the pairing works, and the recovery is load-bearing. Both
-were shown by pinning `MAX_GROUP_COUNT_X` to `2`, re-running
-`compress_pool_parity` (green, so the split path computes the right answer),
-then reverting the shader to bare `gl_GlobalInvocationID.x` under the same pin
-and watching it go RED. What is NOT established: which of them are actually
-reachable past the limit on a real model — that is per-call-site arithmetic
-nobody has done. The failure mode is not a clean error; it is a dispatch the
-driver may reject or silently truncate, which is why this is worth doing before
-someone meets it on an Arc.
-
-### B61 — the native-block GEMM/MMQ family keeps the unguarded `k/BLK` floor (2026-08-12)
-
-**Tag:** vulkan · **Blocked on:** nothing; a decision about how far the B39
-guard should reach, not a discovery
-
-B39 (Vulkan native-block GEMV silently returning zeros below the 32-element
-sub-block floor) was fixed by asserting the K invariant at dispatch —
-`assert_native_k` in `crates/infr-vulkan/src/recorder.rs`, called from every
-terminal native GEMV/gather dispatcher (the `linear_native*`, `linear_mmv*`,
-`linear_native_id*` and `embed_gather_at` entry points). The **prefill GEMM /
-batched-MoE MMQ** family was checked and deliberately left alone: every
-`shaders/native_gemm_mmq_*.comp` opens with `nblk = pc.k / BLK` (plus
-`kw = pc.k / 4`), and `native_gemm_i8cm_q8_0.comp` with `nblk = pc.k / BK`, all
-of which floor to zero exactly the same way. Their host entry points
-(`Recorder::matmul_mmq_at`, `matmul_mmq_experts`, `matmul_mmq_experts_paged`,
-`matmul_i8cm_q8_0_at`, …) assert nothing about `k`.
-
-Why it was not swept in with B39: those particular shaders are reachable only
-for quantized dtypes (the `native_gemm_mmq_*` kernel tables and
-`infr_core::tensor::MOE_MMQ_DTYPES`; `i8cm` is Q8*0 only), whose GGUF block
-sizes are 32/64/256 and therefore already divide any legal `k` — so unlike the
-GEMV path there is no dtype (BF16/F16/F32) that can even express an off-grid
-row. Reaching it needs a hand-built synthetic tensor, which is precisely the
-hazard B39 was about, so this is a real gap and not a non-issue. The reason to
-stop was scope: each `matmul*\*` entry carries its own tiling constraints
-(`gemm.rs`'s `matmul_f16`already asserts`m,n %64 && k %32`) and several take `k`
-with different meanings, so a uniform guard needs its own read of the family
-rather than a mechanical sweep.
-
-**Not the same defect, checked while here:** `native_gemm.comp` (the coopmat
-prefill GEMM, the one path that DOES take BF16) steps
-`for (k0 = 0; k0 < pc.k; k0 += BK)`, so it never runs zero iterations — an
-off-grid `k` makes its `dqblk` over-read past the row instead. Its tier is
-already gated on `in_f % 32 == 0` in `adapter.rs`'s `Op::Linear` arm
-(`gemm_ok`), so it is unreachable off-grid today; noted so a future reader does
-not mistake it for another instance of the floor-to-zero bug.
-
-To finish: audit the `matmul_*` dispatchers in `recorder.rs` for what each one's
-`k` actually indexes, then add `assert_native_k` (or a tile-aware equivalent) at
-each. Not verified: whether any existing test drives a `matmul_*` entry with an
-off-grid `k` — that is what would turn the sweep from mechanical into a real
-change.
+Only the GEMM tiles are near today's shapes. `decode_gemv_bw` (a bench) stays on
+the default device whatever `INFR_DEV` says: its single-submit loop reset the
+iGPU when pointed at it.
 
 ### B-DSV4-WIRING — what the V4 graph slice still owes (2026-08-10)
 
@@ -3436,10 +3371,13 @@ pool. These were confirmed and left:
   `VK_EXT_memory_budget`, spilled bytes are never added to `device_used` while
   the total counts every heap (`vram_budget_fits`). Both GPUs here expose the
   extension, so no test can fail here.
-- **The replay tape ignores later bindings.** `execute` / `execute_chain` never
-  compare bindings after the first record. Not reachable today: the runner
-  compiles a new plan per generation (`be.compile(&g)`). A hard guard was not
-  added because it could not be run against a real decode loop without a model.
+- **The replay guard is silent.** A replay whose bound buffers differ from the
+  recording now drops the tape and records again (`execute`) or declines
+  (`execute_chain`). No path in the tree rebinds a replay-eligible plan, but a
+  caller that alternated a binding would re-record every token with no log line;
+  a one-time debug message would make that visible. A non-`VkBuffer` wrapper
+  (multi-GPU) is identified by object address, so a freed address being reused
+  can hide a rebinding.
 - **The Q3_K decoders read one word past an odd last block** in source, into the
   unused `.w` lane. Not observable: a 610304-row tensor exactly filling its
   arena block ran under GPU-assisted validation with no report, the dead load
@@ -3550,17 +3488,21 @@ it. When a qwen35 chain stops early, the next turn restores a snapshot of the
 state taken at the previous turn's prefill boundary and prefills from there
 instead of from zero. Left:
 
-- **The snapshot is VRAM the fit ladder does not count.** It is a second copy of
-  every DeltaNet layer's state, per slot:
+- **The snapshot and the fit ladder — needs a decision.** The snapshot is a
+  second copy of every DeltaNet layer's state, per slot:
   `4 × ((ssm_d_conv − 1) × q35_conv_channels + q35_num_v_heads × q35_head_k_dim × q35_head_v_dim)`
-  bytes per layer — about 19.3 MiB for Qwen3.5-0.8B from the dims in
-  `qwen35.md`, more for the larger models (not computed; their dims were not to
-  hand). `kv_layer_alloc_bytes` is also the size actually allocated, so the copy
-  needs its own term in every reader of the fit (`kv_floor_alloc_bytes`,
-  `kv_fit_ctx_in_budget`, the re-clamp, placement). Until then a context sized
-  to fill VRAM can have the snapshot refused; that is handled (one warning, no
-  snapshot on that slot, the next mid-chain turn re-prefills from zero) but it
-  is the slow path again.
+  bytes per layer, about 19.3 MiB for Qwen3.5-0.8B. Re-read 2026-11-12: the fit
+  does not count it, but `kv_bytes_estimate_fmt` already prices every DeltaNet
+  layer as a full per-token KV cache, which exceeds live state plus snapshot
+  above roughly 1.1k tokens at f16 — so an auto-sized context leaves room, and
+  adding a snapshot term there would count it twice. The gap is an explicit
+  `--ctx` that fills the device: the snapshot can then be refused, which is
+  handled (one warning, no snapshot on that slot, the next mid-chain turn
+  re-prefills from zero). The real fix is to price DeltaNet layers by
+  `kv_layer_alloc_bytes` plus the snapshot (when a chain or MTP can run), which
+  makes auto-sized qwen35 contexts LARGER — a visible change. Separately, the
+  MTP path's snapshot failure still fails the request (`?`) where the decode
+  loop degrades.
 - **Temperature-0 output can depend on where a chain stopped.** A resumed turn
   re-prefills the previous reply as a batch, where plain reuse had fed it token
   by token; the batched DeltaNet kernels chunk from the dispatch's first row, so
@@ -3666,16 +3608,6 @@ way is not covered. `infr-llama` does not depend on `infr-testkit`, so
 `seam_op_parity.rs`, `synthetic_deepseek2.rs`, `cpu_backend.rs` and the qwen35
 reset test in `seam/runner.rs` carry local copies. The Metal sites compile for
 the Apple target but were not run.
-
-### B144 — recorder tests built with `be_with` ignore `INFR_DEV` (2026-11-12)
-
-The recorder unit tests that build their backend through `be_with` use
-`Config::default()`, so they run on the default device (the RX 7900 XTX here)
-whatever `INFR_DEV` says. An "iGPU" run of `cargo test -p infr-vulkan --lib`
-therefore still exercises the discrete GPU for those tests, which is how the
-flash tests appeared to pass on a device without the cooperative-matrix tier.
-Tests that dispatch cooperative-matrix kernels directly now skip without that
-tier, and the full `--include-ignored` run completes on the iGPU.
 
 ### B140 — tests that CI reports as passed without running them (2026-11-11)
 

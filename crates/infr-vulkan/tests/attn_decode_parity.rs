@@ -538,9 +538,12 @@ fn run_shape(be: &VulkanBackend, s: &Shape) -> Legs {
 }
 
 /// A backend whose config differs from the default in nothing but the fast-path knob, so the two
-/// legs go through the production selector rather than a test-only entry point.
+/// legs go through the production selector rather than a test-only entry point. The device is
+/// still the one `INFR_DEV` names.
 fn backend(attn_decode: bool) -> Option<VulkanBackend> {
     let mut cfg = Config::default();
+    let env = infr_core::config::ConfigLayer::env().expect("test environment config");
+    cfg.device.dev = Config::load_from_layers(&[env]).device.dev;
     cfg.kernels.vulkan.attn_decode = attn_decode;
     VulkanBackend::new_with(Arc::new(cfg)).ok()
 }

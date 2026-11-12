@@ -11,7 +11,10 @@ layout(binding = 0) readonly buffer XB { float qkv[]; };    // [rows, cc]
 layout(binding = 1) buffer SB { float cstate[]; };          // [(kconv-1)*cc] out
 
 void main() {
-    uint idx = gl_GlobalInvocationID.x;
+    // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
+    uint idx = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x;
     uint km1 = pc.kconv - 1u;
     if (idx >= km1 * pc.cc) {
         return;

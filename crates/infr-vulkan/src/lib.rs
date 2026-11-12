@@ -4514,6 +4514,20 @@ pub(crate) fn test_has_f16_coopmat(be: &VulkanBackend, test: &str) -> bool {
     ok
 }
 
+/// The default configuration on the device `INFR_DEV` names — and nothing else from the
+/// environment — for unit tests that build a backend from an explicit [`Config`]. Without the
+/// device, a run pinned to one GPU silently tests another.
+#[cfg(test)]
+pub(crate) fn test_config() -> Config {
+    let mut cfg = Config::default();
+    cfg.device.dev = VulkanBackend::cfg_from_env()
+        .expect("test environment config")
+        .device
+        .dev
+        .clone();
+    cfg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4804,7 +4818,7 @@ mod tests {
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_masks_the_capability_probe() {
         let build = |f: &dyn Fn(&mut Config)| {
-            let mut cfg = Config::default();
+            let mut cfg = test_config();
             f(&mut cfg);
             VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
         };
@@ -4853,7 +4867,7 @@ mod tests {
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_subgroup_pref_drives_sg_pref() {
         let build = |sg: Option<u32>| {
-            let mut cfg = Config::default();
+            let mut cfg = test_config();
             cfg.device.subgroup_pref = sg;
             VulkanBackend::new_with(Arc::new(cfg))
         };
@@ -4889,7 +4903,7 @@ mod tests {
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_push_desc_forces_the_pooled_fallback() {
         let build = |on: bool| {
-            let mut cfg = Config::default();
+            let mut cfg = test_config();
             cfg.kernels.vulkan.push_desc = on;
             VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
         };
@@ -4914,7 +4928,7 @@ mod tests {
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_no_vram_guard_disables_the_budget_check() {
         let build = |off: bool| {
-            let mut cfg = Config::default();
+            let mut cfg = test_config();
             cfg.kernels.vulkan.no_vram_guard = off;
             VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
         };
@@ -4942,7 +4956,7 @@ mod tests {
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_submit_dispatches_overrides_the_splitter_cap() {
         let build = |n: Option<usize>| {
-            let mut cfg = Config::default();
+            let mut cfg = test_config();
             cfg.device.submit_dispatches = n;
             VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
         };

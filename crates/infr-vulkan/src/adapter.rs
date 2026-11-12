@@ -71,6 +71,10 @@ struct DecodeReplay {
     /// The `positions` Input tensor — `execute` downloads element 0 to learn `pos` for `params`.
     positions: TensorId,
     recorded: RecordedCmd,
+    /// Every tensor the recording took from `bindings`, with the buffer it was bound to then. The
+    /// recorded descriptors still point at those buffers, so a replay with any of them rebound is
+    /// not replayed: the recording is dropped and rebuilt against the new bindings.
+    bound: Vec<(TensorId, BoundId)>,
     /// Transient GEMM/attention scratch the recording references. Empty for an eligible decode (all
     /// ops are GEMV/silu/dyn kernels with no transient), held anyway so a stray one can't dangle.
     _transient: Vec<Box<dyn Buffer>>,
@@ -303,6 +307,49 @@ fn read_pos0(be_: &VulkanBackend, buf: &dyn Buffer) -> Result<u32> {
     let mut b = [0u8; 4];
     be_.download(buf, &mut b)?;
     Ok(i32::from_le_bytes(b) as u32)
+}
+
+/// The identity of a bound buffer, as a recording sees it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoundId {
+    /// A plain backend buffer: the `vk::Buffer` handle and the byte offset of the bound range.
+    Vk(ash::vk::Buffer, usize),
+    /// Any other `Buffer` (a multi-GPU wrapper), by object address — no downcast error is built
+    /// per token. Address reuse after a free can hide a rebinding, never invent one.
+    Other(usize),
+}
+
+fn bound_id(b: &dyn Buffer) -> BoundId {
+    match b.as_any().downcast_ref::<crate::VkBuffer>() {
+        Some(v) => BoundId::Vk(v.buffer, v.sub_offset),
+        None => BoundId::Other(b as *const dyn Buffer as *const () as usize),
+    }
+}
+
+/// Every non-`Internal` tensor `bindings` supplies, with its buffer's identity: what a recording
+/// resolves from `bindings` and freezes into its descriptors. Taken once, at record time.
+fn recorded_bindings(
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+) -> Vec<(TensorId, BoundId)> {
+    scratch
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_none())
+        .filter_map(|(i, _)| {
+            let id = TensorId(i as u32);
+            bindings.get(id).map(|b| (id, bound_id(b)))
+        })
+        .collect()
+}
+
+/// Whether `bindings` still binds every tensor `replay` recorded to the same buffer. Allocates
+/// nothing: it runs before every replayed token.
+fn bindings_unchanged(replay: &DecodeReplay, bindings: &Bindings) -> bool {
+    replay
+        .bound
+        .iter()
+        .all(|&(id, want)| bindings.get(id).map(bound_id) == Some(want))
 }
 
 /// Resolve a graph tensor to its device buffer: `Internal` from the scratch, everything else
@@ -4900,6 +4947,13 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     // `params` from `positions[0]` and resubmit. The runner reuses the SAME bound buffers across the
     // whole decode loop, so the recorded descriptor sets stay valid.
     let mut guard = plan.replay.lock().unwrap();
+    // A rebound buffer makes the recording stale: rebuild it, exactly as a first execute would.
+    if guard
+        .as_ref()
+        .is_some_and(|replay| !bindings_unchanged(replay, bindings))
+    {
+        *guard = None;
+    }
     if guard.is_none() {
         *guard = Some(record_decode_replay(be_, &plan.graph, bindings)?);
     }
@@ -4937,6 +4991,15 @@ pub(crate) fn execute_chain(
         return Ok(None);
     }
     let mut guard = plan.replay.lock().unwrap();
+    // A rebound buffer makes the recording stale. Decline (no step runs) and drop it, so the
+    // caller's per-token `execute` rebuilds it against the new bindings.
+    if guard
+        .as_ref()
+        .is_some_and(|replay| !bindings_unchanged(replay, bindings))
+    {
+        *guard = None;
+        return Ok(None);
+    }
     if guard.is_none() {
         *guard = Some(record_decode_replay(be_, &plan.graph, bindings)?);
     }
@@ -5170,7 +5233,9 @@ fn record_decode_replay(
         }
     }
     let recorded = crate::recorder::RecordedCmd::from_segments(be_, segments);
+    let bound = recorded_bindings(&scratch, bindings);
     Ok(DecodeReplay {
+        bound,
         scratch,
         params,
         self_advancing,
@@ -6536,6 +6601,137 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A record-once decode replay freezes the caller's buffers into its descriptors. Executing the
+    /// plan with a different buffer bound must not replay onto the old one: `execute_chain`
+    /// declines without running a step, and `execute` rebuilds the recording, writing the result
+    /// a fresh plan computes into the newly bound buffer.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn replay_follows_rebound_buffers() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (nh, nkv, hd) = (2usize, 1usize, 128usize);
+        let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
+        let mut g = Graph::new();
+        let x = g.input(f32d(nh * hd));
+        let qw = g.weight(f32d(hd));
+        let pos = g.input(TensorDesc::new(vec![1], DType::I32));
+        let kc = g.input(TensorDesc::new(vec![nkv * hd], DType::F16));
+        let vc = g.input(TensorDesc::new(vec![nkv * hd], DType::F16));
+        let qa = g.internal(f32d(nh * hd));
+        let dst = g.output(f32d(nh * hd));
+        g.push(Op::QkNormRope {
+            x,
+            weight: qw,
+            positions: pos,
+            dst: qa,
+            rows: 1,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            rope_dim: hd as u32,
+            theta: 1e6,
+            eps: 1e-6,
+            freq_factors: None,
+            x_stride: 0,
+        });
+        g.push(Op::Attention {
+            q: qa,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: 1,
+            kv_len: 1,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale: 1.0 / (hd as f32).sqrt(),
+            mask: AttnMask::Causal,
+            pos: 0,
+            sinks: None,
+            key_bias: None,
+        });
+        let plan = be_.compile(&g).unwrap();
+        let vk_plan = plan.as_any().downcast_ref::<VkDecodePlan>().unwrap();
+        assert!(
+            vk_plan.eligible,
+            "the graph must take the record-once replay path"
+        );
+        // Rows the self-advancing replay reaches across the executes below.
+        const ROWS: usize = 4;
+        let buf = |bytes: usize, usage| be_.alloc(bytes, usage).unwrap();
+        let up = |b: &dyn Buffer, bytes: &[u8]| be_.upload(b, bytes).unwrap();
+        let data = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * 7 + salt) % 13) as f32 * 0.1 - 0.6)
+                .collect()
+        };
+        let f16s = |v: Vec<f32>| -> Vec<u8> {
+            v.iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect()
+        };
+        let xb = buf(nh * hd * 4, BufferUsage::Activations);
+        up(xb.as_ref(), bytemuck::cast_slice(&data(nh * hd, 1)));
+        let wb = buf(hd * 4, BufferUsage::Weights);
+        up(wb.as_ref(), bytemuck::cast_slice(&data(hd, 2)));
+        let pb = buf(4, BufferUsage::Staging);
+        let kb = buf(ROWS * nkv * hd * 2, BufferUsage::KvCache);
+        up(kb.as_ref(), &f16s(data(ROWS * nkv * hd, 3)));
+        let vb = buf(ROWS * nkv * hd * 2, BufferUsage::KvCache);
+        up(vb.as_ref(), &f16s(data(ROWS * nkv * hd, 4)));
+        let sentinel = vec![0xA5u8; nh * hd * 4];
+        let out = || {
+            let b = buf(nh * hd * 4, BufferUsage::Activations);
+            up(b.as_ref(), &sentinel);
+            b
+        };
+        let (ob, other, want) = (out(), out(), out());
+        let bind = |out| {
+            let mut b = Bindings::new();
+            b.bind(x, xb.as_ref())
+                .bind(qw, wb.as_ref())
+                .bind(pos, pb.as_ref())
+                .bind(kc, kb.as_ref())
+                .bind(vc, vb.as_ref())
+                .bind(dst, out);
+            b
+        };
+        let read = |b: &dyn Buffer| {
+            let mut v = vec![0u8; nh * hd * 4];
+            be_.download(b, &mut v).unwrap();
+            v
+        };
+        let at = |p: i32| up(pb.as_ref(), bytemuck::cast_slice(&[p]));
+        let (recorded, rebound) = (bind(ob.as_ref()), bind(other.as_ref()));
+        at(0);
+        be_.execute(plan.as_ref(), &recorded).unwrap();
+        assert_eq!(
+            be_.execute_chain(plan.as_ref(), &rebound, 1).unwrap(),
+            None,
+            "a chain over rebound buffers must decline"
+        );
+        assert_eq!(
+            read(other.as_ref()),
+            sentinel,
+            "a declined chain ran a step"
+        );
+        let p = (ROWS - 1) as i32;
+        at(p);
+        be_.execute(plan.as_ref(), &rebound).unwrap();
+        // The reference: a fresh plan's first execute at the same position.
+        let fresh = be_.compile(&g).unwrap();
+        at(p);
+        be_.execute(fresh.as_ref(), &bind(want.as_ref())).unwrap();
+        let got = read(other.as_ref());
+        assert_ne!(got, sentinel, "the rebound output was never written");
+        assert_eq!(
+            got,
+            read(want.as_ref()),
+            "the rebuilt replay disagrees with a fresh plan"
+        );
     }
 
     /// B45 guard: `mla.comp` keeps its whole working state in FIXED-size shared arrays, so an

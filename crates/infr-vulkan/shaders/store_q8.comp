@@ -38,7 +38,12 @@ layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
 
 void main() {
     k_addr = kv_base(pc.d_lo, pc.d_hi);
-    uint blk = gl_WorkGroupID.x;         // 0 .. n/32-1  (source block)
+    // Flat workgroup index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_WorkGroupID.x` when unsplit. A padding
+    // workgroup (one 32-element block) returns whole, before any subgroup op, so control flow
+    // stays uniform.
+    uint blk = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // 0 .. n/32-1 (source block)
+    if (blk >= pc.n / 32u) { return; }
     uint t = gl_LocalInvocationID.x;     // 0 .. 31      (element within block)
 #ifdef USE_PARAMS
     // SWA ring cache: row capacity = cap/n (total elements / row width; decode writes one row, so

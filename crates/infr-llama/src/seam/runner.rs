@@ -662,12 +662,17 @@ pub(crate) fn generate_dense_backend(
             out
         };
         let mut wload = |names: &[&str]| -> AResult<()> {
+            // Found AND the shape the graph will index it as: a mismatch is refused here, naming
+            // both shapes, rather than read out of bounds by the first forward pass.
             let info = |name: &str| {
-                g.tensors()
+                let t = g
+                    .tensors()
                     .iter()
                     .find(|t| t.name == name)
                     .cloned()
-                    .ok_or_else(|| anyhow!("tensor not found: {name}"))
+                    .ok_or_else(|| anyhow!("tensor not found: {name}"))?;
+                super::wshape::check_weight_shape(c, name, &t.shape)?;
+                Ok::<_, anyhow::Error>(t)
             };
             // Bytes-per-row for the permute: a weight row is `n_embd` elements of the tensor's
             // dtype (block-aligned); a bias "row" is one f32.
@@ -6447,6 +6452,43 @@ mod tests {
         }
         let f16: &[&str] = if attn { &["token_embd.weight"] } else { &[] };
         synthetic_gguf("qwen35", &u32_keys, &tensors, f16)
+    }
+
+    /// The weight-shape table accepts every tensor of a well-formed qwen35 model that has a rule,
+    /// the full-attention layer's projections, gated query and head norms among them, and refuses
+    /// each of those widened by one along its contiguous axis.
+    #[test]
+    fn qwen35_weight_shapes_are_checked() {
+        use crate::seam::wshape::{check_weight_shape, expected_weight_shape};
+        use infr_core::WeightSource;
+        let (g, cfg) = open_synthetic("q35-shapes", &qwen35_gguf(true));
+        for name in [
+            "blk.1.attn_q.weight",
+            "blk.1.attn_k.weight",
+            "blk.1.attn_v.weight",
+            "blk.1.attn_q_norm.weight",
+            "blk.1.attn_k_norm.weight",
+            "blk.1.attn_output.weight",
+            "blk.1.ffn_down.weight",
+        ] {
+            assert!(
+                expected_weight_shape(&cfg, name).is_some(),
+                "{name} has no rule"
+            );
+        }
+        for t in g.tensors() {
+            if expected_weight_shape(&cfg, &t.name).is_none() {
+                continue;
+            }
+            check_weight_shape(&cfg, &t.name, &t.shape).expect("a well-formed tensor");
+            let mut wide = t.shape.clone();
+            wide[0] += 1;
+            assert!(
+                check_weight_shape(&cfg, &t.name, &wide).is_err(),
+                "{} widened to {wide:?} was accepted",
+                t.name
+            );
+        }
     }
 
     /// The last prompt token's logits for `prompt`, run on `state` (`None` = a fresh slot).

@@ -36,7 +36,11 @@ layout(binding = SBI) writeonly buffer SBuf { float16_t sact[]; }; // [m, nblk]
 
 void main() {
     uint nblk = pc.k / pc.blk;
-    uint gid = gl_WorkGroupID.x;       // 0 .. m*nblk-1
+    // Flat (row, block) index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_WorkGroupID.x` when unsplit. A padding
+    // workgroup of the split grid returns whole, so the subgroup ops below stay uniform.
+    uint gid = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // 0 .. m*nblk-1
+    if (gid >= pc.m * nblk) { return; }
     uint row = gid / nblk;
     uint blk = gid % nblk;
     uint t = gl_LocalInvocationID.x;   // 0 .. blk-1

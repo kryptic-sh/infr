@@ -225,7 +225,10 @@ layout(binding = 4) buffer PL { float pl[]; };               // [nh, n_chunks]
 layout(binding = 5) buffer PACC { float pacc[]; };           // [nh, n_chunks, hd]
 #endif
 
-shared float sc[1024];
+// One chunk's scores, indexed by key offset within the chunk: the host caps every chunk it
+// dispatches here at this many keys (`ATTN_PARTIAL_MAX_CHUNK`), raising the chunk count instead.
+#define ATTN_PARTIAL_MAX_CHUNK 1024u
+shared float sc[ATTN_PARTIAL_MAX_CHUNK];
 shared float red[64];
 shared vec4 vsh[32];   // one subgroup's V partial, summed into the other (full-occupancy V pass)
 

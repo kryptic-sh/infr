@@ -11,10 +11,12 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 // `arena_lo`/`arena_hi` carry the table's arena base BYTE address. `row_bytes` is a MODE SELECTOR
 // (see main): 0 = the original element-offset gather (`base = ids*ne`) for a table that fits u32
 // — every current model; nonzero = this token's whole-block row byte stride, folded into `w_addr`
-// as a 64-bit offset for a `>= 2^32`-element table (256k-vocab frontier models, whose `ids*ne`
-// element base would wrap u32) so the within-row index (`s*32 < ne`) stays u32 — one 64-bit
-// multiply per gathered token, the pattern the paged expert pool uses; the host passes it only when
-// it is a multiple of 4 (so `w_addr` stays buffer_reference-aligned).
+// as a 64-bit offset for a table past the u32 addressing caps — its ELEMENT count (the `ids*ne`
+// base wraps) or its BYTE size (the byte/word offsets the decode derives from that base wrap
+// first for formats over a byte per element), see the host's `embed_gather_folds` — so the
+// within-row index (`s*32 < ne`) stays u32 — one 64-bit multiply per gathered token, the pattern
+// the paged expert pool uses; the host passes it only when it is a multiple of 4 (so `w_addr`
+// stays buffer_reference-aligned), and refuses the table otherwise.
 layout(push_constant) uniform PC {
     uint rows; uint ne; float scale; uint arena_lo; uint arena_hi; uint row_bytes;
     // Rows in the table: an id at or past it (a negative id included, as uint) gathers zeros
@@ -45,8 +47,8 @@ void main() {
     // quant tables whose row stride is NOT word-aligned, e.g. gemma) selects the original
     // element-offset path: `base = ids*ne`, decoded off the 256-aligned table base by
     // native_decode's byte-granular reads. BITWISE-identical to the pre-#77 kernel. A nonzero
-    // `row_bytes` (only a `>= 2^32`-element table, where `ids*ne` would wrap u32) folds the row into
-    // the 64-bit base instead — one u64 multiply per token, `row_bytes % 4 == 0` host-asserted so
+    // `row_bytes` (only a table past the u32 addressing caps, see the header) folds the row into
+    // the 64-bit base instead — one u64 multiply per token, `row_bytes % 4 == 0` host-checked so
     // `w_addr` stays buffer_reference-aligned. The branch is workgroup-uniform (a push constant).
     if (pc.row_bytes == 0u) {
         w_addr = arena_base(pc.arena_lo, pc.arena_hi);

@@ -191,8 +191,9 @@ struct Prepared {
     segments: Vec<Segment>,
     /// Boundary tensors promoted to bound Inputs: `tid -> per-rank persistent buffer`.
     boundary: HashMap<TensorId, Vec<Box<dyn Buffer>>>,
-    /// The cross-device all-reduce transport, set up over the (single) boundary tensor size.
-    allreduce: AllReduce,
+    /// The cross-device all-reduce transport, set up over the (single) boundary tensor size;
+    /// `None` when the graph has no row-parallel projection, hence no boundary.
+    allreduce: Option<AllReduce>,
 }
 
 /// A [`TensorParallelBackend`] plan: the full graph + its lazily-built lowering.
@@ -548,6 +549,7 @@ impl TensorParallelBackend {
         if bounds.last() != Some(&n_ops) {
             bounds.push(n_ops);
         }
+        crate::multi::refuse_scratch_across_cuts(&lowered, &bounds, "INFR_TENSOR_PARALLEL")?;
         let mut segments = Vec::with_capacity(bounds.len());
         let mut lo = 0usize;
         for (si, &hi) in bounds.iter().enumerate() {
@@ -609,8 +611,18 @@ impl TensorParallelBackend {
             }
             boundary_bufs.insert(tid, bufs);
         }
-        let reduce_bytes = crate::tp_allreduce::uniform_boundary_bytes(&sizes)?;
-        let allreduce = AllReduce::new(&self.ranks, reduce_bytes, reduce_dtype, self.use_p2p)?;
+        // A graph with no row-parallel projection (every op replicated) has nothing to reduce.
+        let allreduce = if sizes.is_empty() {
+            None
+        } else {
+            let reduce_bytes = crate::tp_allreduce::uniform_boundary_bytes(&sizes)?;
+            Some(AllReduce::new(
+                &self.ranks,
+                reduce_bytes,
+                reduce_dtype,
+                self.use_p2p,
+            )?)
+        };
 
         Ok(Prepared {
             lowered,
@@ -677,11 +689,12 @@ impl Backend for TensorParallelBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        // Rank 0's caps with every fast path the TP lowering does not model turned OFF: the runner
-        // then takes the classic host-embed + host-sample static path over SEPARATE q/k/v/gate/up
-        // projections (combined_gu=false forces fuse_qkv AND fuse_gu off — each projection is a
-        // cleanly sliceable weight + op), which is the only shape TP shards.
-        let mut c = self.ranks[0].capabilities();
+        // The ranks' most conservative caps (see `crate::multi::conservative_capabilities`) with
+        // every fast path the TP lowering does not model turned OFF: the runner then takes the
+        // classic host-embed + host-sample static path over SEPARATE q/k/v/gate/up projections
+        // (combined_gu=false forces fuse_qkv AND fuse_gu off — each projection is a cleanly
+        // sliceable weight + op), which is the only shape TP shards.
+        let mut c = crate::multi::conservative_capabilities(&self.ranks);
         c.decode_replay = false;
         c.embed_gather = false;
         c.gpu_sample = false;
@@ -885,7 +898,11 @@ impl Backend for TensorParallelBackend {
                     .get(&tid)
                     .ok_or_else(|| be("tp: reduce tensor has no boundary buffer"))?;
                 let elems = prep.lowered.desc(tid).numel();
-                prep.allreduce.reduce(&self.ranks, bufs, elems)?;
+                let allreduce = prep
+                    .allreduce
+                    .as_ref()
+                    .ok_or_else(|| be("tp: a reduce boundary without an all-reduce transport"))?;
+                allreduce.reduce(&self.ranks, bufs, elems)?;
             }
         }
         Ok(())
@@ -999,5 +1016,40 @@ mod tests {
             assert_eq!(kv.len_bytes(), per * w);
             assert_eq!(shard_kv_bytes(kv.len_bytes(), w).expect("divisible"), per);
         }
+    }
+
+    /// A graph with no row-parallel projection has nothing to all-reduce: every op is replicated,
+    /// and it runs as one segment. It used to fail building a zero-byte all-reduce transport.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn tp_runs_a_graph_without_a_row_parallel_projection() {
+        let tp =
+            TensorParallelBackend::new(vec![VulkanBackend::new().expect("vulkan")], 1, 1, 1, false)
+                .expect("1-rank TP world");
+        let n = 64usize;
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![n], DType::F32));
+        let y = g.output(TensorDesc::new(vec![n], DType::F32));
+        g.push(Op::Add {
+            a: x,
+            b: x,
+            dst: y,
+            n: n as u32,
+        });
+        let xs: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
+        let xb = tp.alloc(n * 4, BufferUsage::Activations).unwrap();
+        tp.upload(xb.as_ref(), bytemuck::cast_slice(&xs)).unwrap();
+        let yb = tp.alloc(n * 4, BufferUsage::Activations).unwrap();
+        let plan = tp.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(x, xb.as_ref());
+        bind.bind(y, yb.as_ref());
+        tp.execute(plan.as_ref(), &bind)
+            .expect("a replicated-only graph runs under TP");
+        let mut got = vec![0f32; n];
+        tp.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        let want: Vec<f32> = xs.iter().map(|v| v + v).collect();
+        assert_eq!(got, want);
     }
 }

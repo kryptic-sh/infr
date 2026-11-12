@@ -47,6 +47,8 @@ shared uint bucket[16];
 shared uint sh_sel;
 shared uint sh_krem;
 shared uint gcnt;
+shared uint geqcnt;
+shared uint tflag[BLOCK];
 shared float gval[KMAX];
 shared uint gidx[KMAX];
 
@@ -60,7 +62,34 @@ uint f2ui(float x) {
 #ifdef PASS2
 float val_at(uint i) { return cand[i]; }
 uint idx_at(uint i) { return floatBitsToUint(cand[pc.n + i]); }
+#define VAL(i) val_at(i)
+#define IDX(i) idx_at(i)
+#else
+#define VAL(i) logits[i]
+#define IDX(i) (i)
 #endif
+
+// Rank order for the sort: larger value first, and among equal values the lower token index —
+// what makes the pick among exact ties deterministic.
+bool before(float va, uint ia, float vb, uint ib) {
+    return va > vb || (va == vb && ia < ib);
+}
+
+// Insertion-sort the first `m` gathered candidates into rank order (single lane, m <= KMAX).
+void sort_gathered(uint m) {
+    for (uint a = 1u; a < m; a++) {
+        float vv = gval[a];
+        uint ii = gidx[a];
+        uint b = a;
+        while (b > 0u && before(vv, ii, gval[b - 1u], gidx[b - 1u])) {
+            gval[b] = gval[b - 1u];
+            gidx[b] = gidx[b - 1u];
+            b--;
+        }
+        gval[b] = vv;
+        gidx[b] = ii;
+    }
+}
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
@@ -112,44 +141,60 @@ void main() {
     }
     uint thresh = prefix; // key of the k-th largest value in the range
 
-    // Phase B: gather values with key ≥ threshold into shared (cap k).
-    if (tid == 0u) { gcnt = 0u; }
+    // Phase B: gather the TRUE top-k of the range. Keys STRICTLY above the threshold all fit
+    // (`ngt` of them, the threshold being the k-th largest key), and the remaining `need` slots
+    // take keys EQUAL to it — Phase A's last level counted those (`bucket[sh_sel]`) and how many
+    // are needed (`krem`). A single "gather >= threshold, cap at k" pass let more than k equal keys
+    // race for the slots in atomic order and evict a strictly greater value (moe_sample.comp
+    // reserves the slots the same way). When the ties fit, the gathered set is fixed whatever the
+    // atomic order, in the same one pass as before; only when they overflow does a second walk
+    // take the LOWEST indices, block by block in index order, so the kept set never depends on
+    // scheduling either. A range of at most k values keeps all of them.
+    bool all_fit = hi <= lo + k; // (a trailing stage-1 slice may start past `pc.n`: hi < lo)
+    uint need = krem;
+    uint ngt = k - need;
+    bool ties_fit = bucket[sh_sel] <= need;
+    if (tid == 0u) { gcnt = 0u; geqcnt = 0u; }
     barrier();
     for (uint i = lo + tid; i < hi; i += BLOCK) {
-#ifdef PASS2
-        float v = val_at(i);
-#else
-        float v = logits[i];
-#endif
-        if (f2ui(v) >= thresh) {
-            uint slot = atomicAdd(gcnt, 1u);
-#ifdef PASS2
-            if (slot < k) { gval[slot] = v; gidx[slot] = idx_at(i); }
-#else
-            if (slot < k) { gval[slot] = v; gidx[slot] = i; }
-#endif
+        uint key = f2ui(VAL(i));
+        uint slot = KMAX;
+        if (all_fit || key > thresh) {
+            slot = atomicAdd(gcnt, 1u);
+        } else if (key == thresh && ties_fit) {
+            slot = ngt + atomicAdd(geqcnt, 1u);
         }
+        if (slot < k) { gval[slot] = VAL(i); gidx[slot] = IDX(i); }
     }
     barrier();
+    if (!all_fit && !ties_fit) {
+        // Uniform: `all_fit`/`ties_fit` derive from push constants and shared values read after a
+        // barrier, and `geqcnt` is only written by lane 0 between the two barriers of an iteration.
+        for (uint base = lo; base < hi && geqcnt < need; base += BLOCK) {
+            uint i = base + tid;
+            tflag[tid] = (i < hi && f2ui(VAL(i)) == thresh) ? 1u : 0u;
+            barrier();
+            if (tid == 0u) {
+                for (uint j = 0u; j < BLOCK && geqcnt < need; j++) {
+                    if (tflag[j] != 0u) {
+                        gval[ngt + geqcnt] = VAL(base + j);
+                        gidx[ngt + geqcnt] = IDX(base + j);
+                        geqcnt++;
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+    uint m = all_fit ? min(gcnt, k) : ngt + geqcnt;
 
 #ifdef PASS2
     // Phase C (single lane): sort the ≤k candidates descending, softmax+temp, nucleus cutoff,
     // inverse-CDF sample with the buffered uniform — identical order of operations to the host
-    // `sample_logits`, so the same `u` picks the same token (modulo exact-tie order).
+    // `sample_logits`, so the same `u` picks the same token (exact ties rank lowest index first
+    // here; the host's unstable sort leaves their order open).
     if (tid == 0u) {
-        uint m = min(gcnt, k);
-        for (uint a = 1u; a < m; a++) {
-            float vv = gval[a];
-            uint ii = gidx[a];
-            uint b = a;
-            while (b > 0u && gval[b - 1u] < vv) {
-                gval[b] = gval[b - 1u];
-                gidx[b] = gidx[b - 1u];
-                b--;
-            }
-            gval[b] = vv;
-            gidx[b] = ii;
-        }
+        sort_gathered(m);
         float maxl = gval[0];
         float sum = 0.0;
         for (uint j = 0u; j < m; j++) {
@@ -181,10 +226,12 @@ void main() {
         out_id[0] = tok;
     }
 #else
-    // Stage-1 epilogue (single lane): write this slice's ≤k candidates, padding to exactly k so
-    // stage 2 reads a dense [256*k] grid. -1e30 pads rank below every real logit.
+    // Stage-1 epilogue (single lane): write this slice's ≤k candidates in rank order, padding to
+    // exactly k so stage 2 reads a dense [256*k] grid. -1e30 pads rank below every real logit.
+    // The order matters to stage 2's tie walk: slices are ascending index ranges, so with each
+    // slice's equal values in index order, candidate position order IS token index order.
     if (tid == 0u) {
-        uint m = min(gcnt, k);
+        sort_gathered(m);
         uint base = gl_WorkGroupID.x * k;
         uint ncand = 256u * k;
         for (uint j = 0u; j < k; j++) {

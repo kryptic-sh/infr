@@ -116,6 +116,12 @@ const DENSE_SMALL_TILE_MAX_M16: usize = 16;
 /// what keeps the two from drifting.
 const MOE_TOPK_MAX_EXPERTS: usize = 1024;
 
+/// Ceiling on `n_expert_groups` for the GPU router's group-limited routing: the host's copy of
+/// `moe_topk.comp`'s `MOE_TOPK_MAX_GROUPS`, the size of the private per-group arrays the shader
+/// indexes by group without a bound check. `moe_topk_group_bound_matches_host` keeps the two
+/// together.
+const MOE_TOPK_MAX_GROUPS: u32 = 64;
+
 /// Upper bound on the number of buffers any single recorded dispatch binds (the widest kernel
 /// binds ≤ ~9). Sizes the stack scratch arrays in `dispatch3`/`dispatch_indirect`/`bind_descriptors`
 /// so those hot recording paths never touch the heap; a `debug_assert` guards the bound.
@@ -705,6 +711,29 @@ pub(crate) fn mmv_mrow_fuseq_variant(
     let o4 = in_f < 2048 && vk.mmv_o4;
     crate::gemm::native_mmv_mrow_variant_fuseq_spv(dtype, o4, true, res)
         .map(|(n, s)| (n, s, if o4 { 4 } else { 2 }))
+}
+
+/// Whether [`Recorder::embed_gather`] must fold each row into the table's 64-bit base instead of
+/// addressing the table by a u32 element offset: when the table's ELEMENT count reaches
+/// `elem_cap` (the `ids*ne` element base wraps) or its BYTE size reaches `byte_cap` (the byte and
+/// word offsets the decode computes from that element base, e.g. `wi << 2` in `arena_word`, wrap
+/// first for any format of more than a byte per element: f16/bf16 at half the element cap, Q8_0
+/// a little sooner than the element cap). Driving this off the caps — not
+/// a hardcoded 2^32 — lets `INFR_BDA_CHUNK_ELEMS` / `INFR_BDA_CHUNK_BYTES` force the fold path on a
+/// normal model, so the forced-chunking proof exercises BOTH the lm_head GEMV split and this embed
+/// fold in one run.
+fn embed_gather_folds(vocab: usize, ne: usize, row_stride: usize, caps: (u64, u64)) -> bool {
+    let (elem_cap, byte_cap) = caps;
+    (vocab as u64) * (ne as u64) >= elem_cap || (vocab as u64) * (row_stride as u64) >= byte_cap
+}
+
+/// The flat workgroup grid of the non-coopmat prefill GEMMs ([`Recorder::matmul_mmq_at`],
+/// [`Recorder::matmul_fma_at`]): one workgroup per square output tile of the kernels' BM = BN,
+/// indexed by `gl_WorkGroupID.x` alone. The adapter's grid-limit guard reads the same count.
+pub(crate) fn nc_gemm_groups(m: usize, n: usize) -> usize {
+    /// The kernels' output tile edge (`native_gemm_mmq*` / `native_gemm_fma.comp`).
+    const TILE: usize = 64;
+    m.div_ceil(TILE) * (n / TILE)
 }
 
 /// `(elem_cap, byte_cap)` from a backend's Vulkan config. `None` (unset, or a value below 2, which
@@ -3119,7 +3148,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        let groups = nc_gemm_groups(m, n) as u32;
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if needs_sact {
             bufs.push(Self::vkb(sact));
@@ -3155,7 +3184,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        let groups = nc_gemm_groups(m, n) as u32;
         self.dispatch(
             kern,
             &[Self::vkb(a), Self::vkb(a), Self::vkb(c)],
@@ -3902,7 +3931,8 @@ impl<'a> Recorder<'a> {
 
     /// Gather + dequantize embedding rows (`Op::EmbedGather`): `dst[r,:] = table[ids[r],:] *
     /// scale`. One workgroup per row; per-format decode from native_decode.glsl. Caller gates on
-    /// `crate::gemm::embed_gather_kernel_name`.
+    /// `crate::gemm::embed_gather_kernel_name`. Refuses a table that needs the 64-bit row fold
+    /// (see `embed_gather_folds`) but whose row stride is not word-aligned.
     #[allow(clippy::too_many_arguments)]
     pub fn embed_gather(
         &self,
@@ -3913,16 +3943,17 @@ impl<'a> Recorder<'a> {
         rows: usize,
         ne: usize,
         scale: f32,
-    ) {
+    ) -> Result<()> {
         let arena_addr = table
             .device_addr()
             .expect("resident-BDA weight: embed_gather requires a u64 BDA embedding table address");
-        // A table whose element count `>= 2^32` (a 256k-vocab frontier model) would wrap the
-        // shader's u32 `ids*ne` row base — pass the row byte stride so it folds `ids` into the
-        // 64-bit table base instead (issue #77). Every current table fits u32 → `row_bytes = 0` →
-        // the shader keeps its original element-offset path, byte-identical (incl. gemma's
-        // non-word-aligned quant rows, which the 64-bit fold could not honor). The fold requires a
-        // word-aligned row stride, asserted loudly ONLY when it actually engages.
+        // A table past the u32 addressing caps (a 256k-vocab frontier model; see
+        // `embed_gather_folds`) would wrap the shader's u32 row base or its byte offsets — pass the
+        // row byte stride so it folds `ids` into the 64-bit table base instead (issue #77). Every
+        // current table fits u32 → `row_bytes = 0` → the shader keeps its original element-offset
+        // path, byte-identical (incl. gemma's non-word-aligned quant rows, which the 64-bit fold
+        // could not honor). The fold requires a word-aligned row stride; a table that needs the
+        // fold without one — or is forced onto it by lowered `INFR_BDA_CHUNK_*` caps — is refused.
         let (block_elems, block_bytes) = infr_gguf::block_layout(dtype);
         assert!(
             ne.is_multiple_of(block_elems),
@@ -3930,17 +3961,15 @@ impl<'a> Recorder<'a> {
         );
         let row_stride = (ne / block_elems) * block_bytes;
         let vocab = table.len_bytes() / row_stride.max(1);
-        // Fold when the table's element count reaches the addressing cap (the `ids*ne` u32 base
-        // would wrap). Driving this off `bda_chunk_elem_cap` — not a hardcoded 2^32 — lets
-        // `INFR_BDA_CHUNK_ELEMS` force the fold path on a normal model, so the forced-chunking proof
-        // exercises BOTH the lm_head GEMV split and this embed fold in one run.
-        let row_bytes = if (vocab as u64) * (ne as u64) >= self.chunk_caps().0 {
-            assert!(
-                row_stride.is_multiple_of(4),
-                "embed_gather: a >= 2^32-element {dtype:?} table (vocab={vocab}, ne={ne}) has a \
-                 non-word-aligned row stride ({row_stride} bytes) — the 64-bit-based gather it needs \
-                 would misalign the buffer_reference reads; this table is unsupported"
-            );
+        let row_bytes = if embed_gather_folds(vocab, ne, row_stride, self.chunk_caps()) {
+            if !row_stride.is_multiple_of(4) {
+                return Err(be(format!(
+                    "embed_gather: a {dtype:?} table past the u32 addressing caps (vocab={vocab}, \
+                     ne={ne}, or caps lowered by INFR_BDA_CHUNK_ELEMS / INFR_BDA_CHUNK_BYTES) has \
+                     a non-word-aligned row stride ({row_stride} bytes) — the 64-bit row fold it \
+                     needs would misalign the buffer_reference reads; this table is unsupported"
+                )));
+            }
             row_stride as u32
         } else {
             0 // fits u32: keep the original element-offset gather path
@@ -3954,6 +3983,7 @@ impl<'a> Recorder<'a> {
         self.embed_gather_at(
             dtype, arena_addr, ids, dst, rows, ne, scale, row_bytes, vocab,
         );
+        Ok(())
     }
 
     /// `-DSTREAMED` twin of [`Self::embed_gather`] (slice A5 build-variant: see
@@ -3961,7 +3991,8 @@ impl<'a> Recorder<'a> {
     /// resident `bufferDeviceAddress` arena instead of a bound SSBO — binding 0 (the resident
     /// build's weight SSBO) takes a harmless FILLER (`ids`) since the arena is never bound as a
     /// descriptor. `row_bytes` is the mode selector (0 = element-offset gather for a u32-fitting
-    /// table; nonzero = 64-bit row-base fold for a `>= 2^32`-element table — see the `.comp` PC doc).
+    /// table; nonzero = 64-bit row-base fold for a table past the u32 addressing caps — see the
+    /// `.comp` PC doc).
     /// `n_rows` is the table's row count: an id at or past it gathers a zero row instead of
     /// reading past the arena.
     #[allow(clippy::too_many_arguments)]
@@ -8691,6 +8722,23 @@ impl<'a> Recorder<'a> {
                  MOE_TOPK_MAX_EXPERTS ({MOE_TOPK_MAX_EXPERTS}) — moe_topk.comp's ssel_adj scratch \
                  is sized for this many experts and would corrupt routing above it"
             )));
+        }
+        // Group-limited routing engages at more than one group with at least one kept (the
+        // shader's own test). It splits the experts into equal runs of `n_expert / groups`, so a
+        // remainder would sit outside every group, and indexes per-group arrays of a fixed size.
+        if n_expert_groups > 1 && n_expert_groups_used > 0 {
+            if n_expert_groups > MOE_TOPK_MAX_GROUPS {
+                return Err(be(format!(
+                    "moe_topk: n_expert_groups ({n_expert_groups}) exceeds the GPU router's \
+                     ceiling of MOE_TOPK_MAX_GROUPS ({MOE_TOPK_MAX_GROUPS})"
+                )));
+            }
+            if !n_expert.is_multiple_of(n_expert_groups as usize) {
+                return Err(be(format!(
+                    "moe_topk: n_expert ({n_expert}) is not divisible by n_expert_groups \
+                     ({n_expert_groups}) — group-limited routing needs equal expert groups"
+                )));
+            }
         }
         let k = self
             .be
@@ -14008,6 +14056,138 @@ mod tests {
             .unwrap_or_else(|e| panic!("no u32 after `{marker}`: {e}"))
     }
 
+    /// The embed gather folds a table into its 64-bit base once either u32 addressing unit runs
+    /// out. A 16-bit table's BYTE offsets wrap at half its element cap (two bytes per element), so
+    /// the element count alone would keep a wrapping table on the u32 path.
+    #[test]
+    fn embed_gather_folds_on_either_addressing_cap() {
+        let caps = (BDA_CHUNK_UNIT_MAX, BDA_CHUNK_UNIT_MAX);
+        let ne = 4096usize;
+        let f16_rows = (BDA_CHUNK_UNIT_MAX / (ne as u64 * 2)) as usize;
+        assert!(
+            embed_gather_folds(f16_rows, ne, ne * 2, caps),
+            "f16 at the byte cap"
+        );
+        assert!(
+            !embed_gather_folds(f16_rows - 1, ne, ne * 2, caps),
+            "f16 under both caps"
+        );
+        // Q8_0 (34 bytes per 32 elements) reaches the byte cap first too.
+        let q8_stride = ne / 32 * 34;
+        let q8_rows = BDA_CHUNK_UNIT_MAX.div_ceil(q8_stride as u64) as usize;
+        assert!((q8_rows as u64) * (ne as u64) < BDA_CHUNK_UNIT_MAX);
+        assert!(embed_gather_folds(q8_rows, ne, q8_stride, caps), "Q8_0");
+        // A 4-bit table reaches the element cap long before the byte cap.
+        let q4_stride = ne / 32 * 18;
+        assert!(embed_gather_folds(
+            (BDA_CHUNK_UNIT_MAX / ne as u64) as usize,
+            ne,
+            q4_stride,
+            caps
+        ));
+        assert!(!embed_gather_folds(1000, ne, q4_stride, caps));
+    }
+
+    /// The 64-bit row fold an f16 table takes at the BYTE cap gathers the same rows as the u32
+    /// element path. The byte cap is lowered under the table's size (elements left at the real
+    /// cap), so the small table takes the fold `embed_gather_folds` now routes byte-capped tables
+    /// to.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn embed_gather_f16_byte_cap_fold_matches_the_element_path() {
+        use infr_core::backend::BufferUsage;
+        let be = be_with(|_| {});
+        let (n_rows, ne) = (16usize, 256usize);
+        let table: Vec<half::f16> = (0..n_rows * ne)
+            .map(|i| half::f16::from_f32((i as f32 * 0.37).sin()))
+            .collect();
+        let w = be.alloc(n_rows * ne * 2, BufferUsage::Weights).unwrap();
+        let bytes: Vec<u8> = table.iter().flat_map(|v| v.to_le_bytes()).collect();
+        be.upload(w.as_ref(), &bytes).unwrap();
+        let ids: [i32; 4] = [3, 0, 7, 12];
+        let id_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(id_buf.as_ref(), bytemuck::cast_slice(&ids))
+            .unwrap();
+        let byte_cap = (n_rows * ne * 2 / 2) as u64;
+        assert!(embed_gather_folds(
+            n_rows,
+            ne,
+            ne * 2,
+            (BDA_CHUNK_UNIT_MAX, byte_cap)
+        ));
+        let run = |fold: bool| -> Vec<f32> {
+            let y = be
+                .alloc(ids.len() * ne * 4, BufferUsage::Activations)
+                .unwrap();
+            let rec = be.recorder().unwrap();
+            let go = || {
+                rec.embed_gather(
+                    infr_core::DType::F16,
+                    w.as_ref(),
+                    id_buf.as_ref(),
+                    y.as_ref(),
+                    ids.len(),
+                    ne,
+                    1.0,
+                )
+                .unwrap()
+            };
+            if fold {
+                with_bda_chunk_caps(BDA_CHUNK_UNIT_MAX, byte_cap, go);
+            } else {
+                go();
+            }
+            rec.finish().unwrap();
+            let mut out = vec![0f32; ids.len() * ne];
+            be.download(y.as_ref(), bytemuck::cast_slice_mut(&mut out))
+                .unwrap();
+            out
+        };
+        let want: Vec<f32> = ids
+            .iter()
+            .flat_map(|&r| table[r as usize * ne..(r as usize + 1) * ne].iter())
+            .map(|v| v.to_f32())
+            .collect();
+        assert_eq!(run(false), want, "element-offset path");
+        assert_eq!(run(true), want, "64-bit row fold");
+    }
+
+    /// Lowered addressing caps (`INFR_BDA_CHUNK_BYTES`) can push any table onto the 64-bit row
+    /// fold; one whose row stride is not word-aligned (Q4_0 at ne=32: 18 bytes) is refused with an
+    /// error the caller can return, never a panic.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn embed_gather_refuses_a_forced_fold_on_an_unaligned_row() {
+        use infr_core::backend::BufferUsage;
+        let be = be_with(|_| {});
+        let (n_rows, ne) = (16usize, 32usize);
+        let (be_blk, bb) = infr_gguf::block_layout(infr_core::DType::Q4_0);
+        let stride = ne / be_blk * bb;
+        assert!(!stride.is_multiple_of(4));
+        let w = be.alloc(n_rows * stride, BufferUsage::Weights).unwrap();
+        be.upload(w.as_ref(), &vec![0u8; n_rows * stride]).unwrap();
+        let ids = be.alloc(4, BufferUsage::Activations).unwrap();
+        be.upload(ids.as_ref(), &0i32.to_le_bytes()).unwrap();
+        let y = be.alloc(ne * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        let err = with_bda_chunk_caps(BDA_CHUNK_UNIT_MAX, 64, || {
+            rec.embed_gather(
+                infr_core::DType::Q4_0,
+                w.as_ref(),
+                ids.as_ref(),
+                y.as_ref(),
+                1,
+                ne,
+                1.0,
+            )
+        })
+        .expect_err("a forced fold on an unaligned row must be refused");
+        assert!(
+            err.to_string().contains("non-word-aligned row stride"),
+            "{err}"
+        );
+    }
+
     /// `MOE_TOPK_MAX_EXPERTS` is the host's copy of `moe_topk.comp`'s `ssel_adj` capacity, and
     /// nothing in the toolchain ties the two together. Drift in the dangerous direction is exactly
     /// B67: the shared array was sized 256 while the selection scan indexed every expert up to the
@@ -14028,6 +14208,68 @@ mod tests {
             src.contains("shared float ssel_adj[gl_WorkGroupSize.x * MAX_CHUNKS];"),
             "moe_topk.comp's ssel_adj is no longer sized by the scan's own headroom"
         );
+    }
+
+    /// `MOE_TOPK_MAX_GROUPS` is the host's copy of the shader's per-group array size; read it back
+    /// out of the shader text, and check both arrays are still declared through it.
+    #[test]
+    fn moe_topk_group_bound_matches_host() {
+        let src = include_str!("../shaders/moe_topk.comp");
+        assert_eq!(
+            glsl_u32_after(src, "#define MOE_TOPK_MAX_GROUPS "),
+            MOE_TOPK_MAX_GROUPS as usize,
+            "moe_topk.comp's MOE_TOPK_MAX_GROUPS drifted from the host guard"
+        );
+        for decl in [
+            "float gscore[MOE_TOPK_MAX_GROUPS];",
+            "bool chosen[MOE_TOPK_MAX_GROUPS];",
+        ] {
+            assert!(
+                src.contains(decl),
+                "moe_topk.comp no longer declares `{decl}`"
+            );
+        }
+    }
+
+    /// Group-limited routing past the shader's group arrays, or with a group count that leaves
+    /// experts outside every group, is refused at record time; a count that fits and divides is
+    /// not.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn moe_topk_refuses_groups_it_cannot_route() {
+        let be = be_with(|_| {});
+        let dummy = be.alloc(4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        let call = |n_expert: usize, groups: u32| {
+            rec.moe_topk(
+                dummy.as_ref(),
+                dummy.as_ref(),
+                dummy.as_ref(),
+                dummy.as_ref(),
+                1,
+                n_expert,
+                1,
+                1.0,
+                0,
+                false,
+                false,
+                groups,
+                1,
+                dummy.as_ref(),
+                false,
+            )
+        };
+        let over = MOE_TOPK_MAX_GROUPS + 1;
+        let err = call(over as usize * 2, over).unwrap_err().to_string();
+        assert!(err.contains("MOE_TOPK_MAX_GROUPS"), "{err}");
+        let err = call(12, 5).unwrap_err().to_string();
+        assert!(err.contains("not divisible by n_expert_groups"), "{err}");
+        if let Err(e) = call(MOE_TOPK_MAX_GROUPS as usize * 4, MOE_TOPK_MAX_GROUPS) {
+            assert!(
+                !e.to_string().contains("n_expert_groups"),
+                "the ceiling itself must not be refused: {e}"
+            );
+        }
     }
 
     /// The host guard refuses above the ceiling rather than dispatching a shader that would run

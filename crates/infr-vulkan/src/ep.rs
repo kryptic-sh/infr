@@ -70,13 +70,26 @@ use crate::{be, VulkanBackend};
 /// sub-backend.
 pub struct EpBuffer {
     bufs: Vec<Box<dyn Buffer>>,
+    /// `bufs` are disjoint bands of one logical tensor (an expert bank), not copies of it.
+    sharded: bool,
 }
 
 impl EpBuffer {
-    /// Wrap one buffer per rank (a replica set, or an expert-bank shard set — the wrapper is the
-    /// same; only the bytes the binder uploaded differ).
+    /// Wrap one REPLICA per rank: every `bufs[r]` holds the whole tensor.
     pub fn wrap(bufs: Vec<Box<dyn Buffer>>) -> Box<dyn Buffer> {
-        Box::new(EpBuffer { bufs })
+        Box::new(EpBuffer {
+            bufs,
+            sharded: false,
+        })
+    }
+
+    /// Wrap one expert-bank BAND per rank: `bufs[r]` holds rank `r`'s experts, and together they
+    /// are the whole bank.
+    pub fn shard(bufs: Vec<Box<dyn Buffer>>) -> Box<dyn Buffer> {
+        Box::new(EpBuffer {
+            bufs,
+            sharded: true,
+        })
     }
 
     fn on(&self, r: usize) -> Result<&dyn Buffer> {
@@ -88,8 +101,14 @@ impl EpBuffer {
 }
 
 impl Buffer for EpBuffer {
+    /// The LOGICAL tensor size (see [`Buffer::len_bytes`]): a replica's per-rank buffer is the
+    /// whole tensor, while a sharded bank reports the sum of its bands.
     fn len_bytes(&self) -> usize {
-        self.bufs[0].len_bytes()
+        if self.sharded {
+            self.bufs.iter().map(|b| b.len_bytes()).sum()
+        } else {
+            self.bufs[0].len_bytes()
+        }
     }
     fn as_any(&self) -> &dyn std::any::Any {
         self
@@ -235,11 +254,22 @@ impl ExpertParallelBackend {
                 gate_exps,
                 up_exps,
                 down_exps,
+                down_scale,
                 n_expert,
                 ..
             } = op
             {
                 n_moe += 1;
+                // The per-expert down scale is indexed by the expert id AFTER the band remap has
+                // made it rank-local, while its table is replicated whole: every rank but rank 0
+                // would scale by another expert's entry.
+                if down_scale.is_some() {
+                    return Err(be(
+                        "INFR_EXPERT_PARALLEL does not support an Op::MoeFfn with a per-expert \
+                         down scale (gemma4 MoE / diffusion-gemma `ffn_down_exps.scale`): the \
+                         scale table is not split by expert band",
+                    ));
+                }
                 if (*n_expert as usize) != self.n_expert {
                     return Err(be(format!(
                         "ep: Op::MoeFfn n_expert={n_expert} disagrees with the backend's \
@@ -279,10 +309,16 @@ impl ExpertParallelBackend {
         let cuts: Vec<usize> = (0..n_ops)
             .filter(|&i| matches!(full.ops[i], Op::MoeFfn { .. }))
             .collect();
-        let mut bounds: Vec<usize> = cuts.iter().map(|&c| c + 1).collect();
-        if bounds.last() != Some(&n_ops) {
-            bounds.push(n_ops);
+        // A MoE layer's partial is all-reduced only when a later segment consumes it; as the
+        // graph's last op its output would leave each rank's band unsummed.
+        if cuts.last() == Some(&(n_ops - 1)) {
+            return Err(be(
+                "INFR_EXPERT_PARALLEL needs every Op::MoeFfn output consumed by a later op — this \
+                 graph ends with one, whose per-rank partial would never be all-reduced",
+            ));
         }
+        let mut bounds: Vec<usize> = cuts.iter().map(|&c| c + 1).collect();
+        bounds.push(n_ops);
 
         // ── promote the MoE `dst` boundaries (Internal → Input) so they persist across the cut ─────
         // Each MoeFfn `dst` is written at a segment's end and read by the next segment's residual
@@ -298,6 +334,7 @@ impl ExpertParallelBackend {
         for &tid in &boundary {
             lowered.tensors[tid.0 as usize].kind = TensorKind::Input;
         }
+        crate::multi::refuse_scratch_across_cuts(&lowered, &bounds, "INFR_EXPERT_PARALLEL")?;
 
         // ── per-rank sub-graphs (each MoeFfn's ep_band set to the rank's band) + compile ──────────
         let nl = self.n_expert / w; // experts per band
@@ -386,12 +423,13 @@ impl Backend for ExpertParallelBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        // Rank 0's caps with the GPU-resident fast paths the EP segment executor does not model
-        // turned OFF: the runner then takes the classic host-embed + host-sample static per-token
-        // `execute` path (keeps the residual `hidden` a bound Input the executor hands through). The
-        // attention qkv/dense fuses are LEFT ON — attention is replicated (not sharded) under EP, so
-        // fused projections run identically on every rank.
-        let mut c = self.ranks[0].capabilities();
+        // The ranks' most conservative caps (see `crate::multi::conservative_capabilities`) with
+        // the GPU-resident fast paths the EP segment executor does not model turned OFF: the
+        // runner then takes the classic host-embed + host-sample static per-token `execute` path
+        // (keeps the residual `hidden` a bound Input the executor hands through). The attention
+        // qkv/dense fuses are LEFT ON — attention is replicated (not sharded) under EP, so fused
+        // projections run identically on every rank.
+        let mut c = crate::multi::conservative_capabilities(&self.ranks);
         c.decode_replay = false;
         c.embed_gather = false;
         c.gpu_sample = false;
@@ -520,5 +558,117 @@ impl Backend for ExpertParallelBackend {
 
     fn kv_overflow_report(&self) {
         infr_core::backend::kv_overflow_report_each(&self.ranks);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use infr_core::graph::{Activation, MoeGating};
+
+    /// A host-only stand-in for a per-rank buffer: only its length matters here.
+    struct Len(usize);
+
+    impl Buffer for Len {
+        fn len_bytes(&self) -> usize {
+            self.0
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// [`Buffer::len_bytes`] is the LOGICAL size: a replica set is one whole tensor, a sharded
+    /// expert bank is the sum of its bands.
+    #[test]
+    fn ep_buffer_reports_the_logical_size() {
+        let bands = || -> Vec<Box<dyn Buffer>> { vec![Box::new(Len(96)), Box::new(Len(96))] };
+        assert_eq!(EpBuffer::wrap(bands()).len_bytes(), 96);
+        assert_eq!(EpBuffer::shard(bands()).len_bytes(), 192);
+    }
+
+    /// `x → MoeFfn → y`, with or without a per-expert down scale, optionally followed by a copy so
+    /// the MoE output is consumed by a later op.
+    fn moe_graph(down_scale: bool, consumed: bool) -> Graph {
+        let (ne, n_expert, nff, rows) = (32usize, 4usize, 32usize, 1usize);
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+        let router = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+        let gate = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+        let down = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q8_0));
+        let scale = g.weight(TensorDesc::new(vec![n_expert], DType::F32));
+        let moe = g.internal(TensorDesc::new(vec![rows, ne], DType::F32));
+        let y = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+        g.push(Op::MoeFfn {
+            x,
+            router_x: x,
+            router,
+            gate_exps: gate,
+            up_exps: gate,
+            down_exps: down,
+            down_scale: down_scale.then_some(scale),
+            fused_gate_up: false,
+            dst: if consumed { moe } else { y },
+            ne: ne as u32,
+            n_expert: n_expert as u32,
+            n_used: 1,
+            n_ff_exp: nff as u32,
+            scale: 1.0,
+            act: Activation::Silu,
+            gating: MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
+        });
+        if consumed {
+            g.push(Op::Copy {
+                src: moe,
+                src_off: 0,
+                dst: y,
+                dst_off: 0,
+                n: (rows * ne) as u32,
+            });
+        }
+        g
+    }
+
+    /// The lowering's refusals fire at the first execute, before any segment is compiled or any
+    /// buffer is read, so empty bindings are enough to reach them.
+    fn lowering_error(g: &Graph) -> String {
+        let ep = ExpertParallelBackend::new(vec![VulkanBackend::new().expect("vulkan")], 4, false)
+            .expect("1-device EP world");
+        let plan = ep.compile(g).expect("compile defers the lowering");
+        ep.execute(plan.as_ref(), &Bindings::new())
+            .expect_err("the lowering must refuse this graph")
+            .to_string()
+    }
+
+    /// The per-expert down scale is read with the band-local expert id while its table stays
+    /// whole on every rank, so every rank but rank 0 would scale by another expert's entry.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn ep_refuses_an_unsharded_down_scale() {
+        let msg = lowering_error(&moe_graph(true, true));
+        assert!(
+            msg.contains("INFR_EXPERT_PARALLEL does not support an Op::MoeFfn with a per-expert"),
+            "{msg}"
+        );
+    }
+
+    /// A MoeFfn that ends the graph has no later segment to hand its all-reduced output to; it is
+    /// refused by name rather than reported as a zero-byte all-reduce boundary.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn ep_refuses_a_trailing_moe() {
+        let msg = lowering_error(&moe_graph(false, false));
+        assert!(
+            msg.contains("INFR_EXPERT_PARALLEL needs every Op::MoeFfn output consumed"),
+            "{msg}"
+        );
     }
 }

@@ -15,6 +15,7 @@ pub mod ep;
 mod gemm;
 pub mod linear;
 mod matmul;
+mod multi;
 mod ops;
 pub mod p2p;
 pub mod pager;
@@ -188,8 +189,10 @@ static DEVICE_CLASS: std::sync::OnceLock<DeviceClass> = std::sync::OnceLock::new
 /// A PROCESS-GLOBAL because its one consumer, the seam's `ubatch_rows`, is itself a process-global
 /// funnel: the prefill loop, the activation reserve, and the SWA ring sizing must all agree on ONE
 /// chunk height, and they are reached from call sites that hold no backend handle. Same shape and
-/// lifetime as the seam's existing `PINNED_UBATCH`. A multi-GPU process mixing an iGPU and a dGPU
-/// would pin whichever opened first; infr opens exactly one device per process today.
+/// lifetime as the seam's existing `PINNED_UBATCH`. It is the FIRST device's class, so it speaks
+/// for a single-device process only: the multi-device wrappers ([`TensorParallelBackend`],
+/// [`ExpertParallelBackend`], [`PipelineBackend`]) report their ranks' most conservative class from
+/// `capabilities()`, and the seam sizes their prefill chunk from that instead of from here.
 pub fn device_class() -> Option<DeviceClass> {
     DEVICE_CLASS.get().copied()
 }
@@ -2466,6 +2469,20 @@ impl VulkanBackend {
             },
             caps.max_shared_memory_bytes / 1024,
         );
+        // The fp8 tier is opt-in and unvalidated (see `native_gemm_f8cm_q8_0.comp`): say so where
+        // the flag is read, so its output is never mistaken for a supported path's.
+        if cfg.kernels.vulkan.f8_coopmat {
+            tracing::warn!(
+                "[infr] INFR_F8_COOPMAT: EXPERIMENTAL, not validated on hardware — the fp8 Q8_0 \
+                 prefill GEMM casts weights to E4M3 without a scale, losing most of their \
+                 precision ({} on this device)",
+                if caps.f8_coopmat() {
+                    "ENGAGED"
+                } else {
+                    "inert: no fp8 cooperative matrix"
+                }
+            );
+        }
         // Submit splitter (see `VulkanShared::submit_dispatch_cap`): the initial, pre-measurement
         // cap. `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides it (`0` = never
         // split) — the kill switch if this ever misjudges a device. A non-numeric value is still

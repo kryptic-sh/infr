@@ -845,9 +845,40 @@ pub(crate) fn ubatch_candidates(ec: &EngineConfig) -> Vec<usize> {
 /// no tuned dGPU shape moves.
 fn default_ubatch_rows() -> usize {
     match infr_vulkan::device_class() {
-        Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
-        _ => 1024,
+        Some(d) => default_ubatch_rows_for(d.integrated, d.compute_units),
+        None => default_ubatch_rows_for(false, 0),
     }
+}
+
+/// [`default_ubatch_rows`] for a device of the given class (`compute_units` 0 = unknown).
+fn default_ubatch_rows_for(integrated: bool, compute_units: u32) -> usize {
+    if integrated {
+        infr_core::integrated_ubatch_rows(compute_units)
+    } else {
+        1024
+    }
+}
+
+/// Enter a placement scope whose default prefill chunk is the one for `caps`, the backend this
+/// one-shot actually runs on. The multi-device wrappers need it: [`default_ubatch_rows`] reads
+/// the class of whichever Vulkan device the PROCESS opened first, and a world that mixes a
+/// discrete card with an integrated GPU must size every chunk for the integrated one (each
+/// wrapper reports its ranks' most conservative class). An explicit `device.ubatch` still wins
+/// (see [`ubatch_rows`]); a chunk or auto-q8 KV the enclosing scope already pinned carries over,
+/// the chunk lowered to the backend's default when that is smaller.
+fn backend_chunk_scope(caps: &infr_core::backend::Capabilities) -> PlacementScope {
+    use std::sync::atomic::Ordering::Relaxed;
+    let rows = default_ubatch_rows_for(caps.integrated, caps.compute_units);
+    let pins = PlacementPins::default();
+    with_placement_pins(|cur| {
+        let pinned = cur.ubatch.load(Relaxed);
+        pins.ubatch
+            .store(if pinned == 0 { rows } else { pinned.min(rows) }, Relaxed);
+        if cur.kv_q8.get().is_some() {
+            let _ = pins.kv_q8.set(());
+        }
+    });
+    PlacementScope::enter(std::sync::Arc::new(pins))
 }
 
 /// Prefill chunk (rows) for a sequence SHARING the GPU with other in-flight sequences
@@ -2705,7 +2736,8 @@ fn dense_multi_gpu_guard(cfg: &Config, label: &str) -> AResult<()> {
 /// Drive `generate_dense_backend` as a ONE-SHOT (single conversation, no slot pool): fresh `None`
 /// state, `want_ctx = prompt + max_new + 1`, and the eight trailing hooks (constraint / verify /
 /// verify_ids / logits_out / h_out / denoise_req / req) all unused. The shared tail of the
-/// multi-GPU `generate_*` wrappers.
+/// multi-GPU `generate_*` wrappers, run inside [`backend_chunk_scope`] so the prefill chunk is
+/// sized for `be`'s devices.
 fn run_dense_oneshot(
     be: &dyn Backend,
     bind: &BindWeight<'_>,
@@ -2718,6 +2750,7 @@ fn run_dense_oneshot(
     max_new: usize,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
+    let _chunk = backend_chunk_scope(&be.capabilities());
     generate_dense_backend(
         be,
         bind,
@@ -3145,7 +3178,7 @@ fn expert_parallel_binder<'a>(
                     .map_err(|e| anyhow!("{e}"))?;
                 bufs.push(buf);
             }
-            Ok((infr_vulkan::EpBuffer::wrap(bufs), dt))
+            Ok((infr_vulkan::EpBuffer::shard(bufs), dt))
         } else {
             // Replicated: the full padded tensor on every rank. Mirror the resident binder's
             // per-expert-slice / chunk-covered / whole-tensor element-cap policy for non-bank
@@ -3173,24 +3206,9 @@ fn expert_parallel_binder<'a>(
     })
 }
 
-/// Multi-GPU EXPERT-PARALLEL (MoE) generation — the model's experts are split across the `devices`
-/// (rank `r` owns experts `[r·E/W, (r+1)·E/W)`), the router + attention + norms run replicated on
-/// every rank, each rank computes only its band's experts, and one P2P all-reduce per MoE layer
-/// combines the partial expert outputs. The output equals the single-device MoE to reduction-order
-/// tolerance (token-identical greedy). qwen3moe (split gate/up, softmax, no shared expert) in v1.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_moe_vulkan_ep(
-    devices: &[usize],
-    g: &Gguf,
-    cfg: &Config,
-    ec: &EngineConfig,
-    token_embd: TokenEmbd<'_>,
-    ple: Option<&PerLayerEmbd>,
-    prompt: &[u32],
-    max_new: usize,
-    on_token: impl FnMut(u32),
-) -> AResult<(Vec<u32>, GenStats)> {
+/// The architectures expert parallelism refuses, checked before any device is opened. Returns the
+/// model's routed-expert config, which EP requires.
+fn expert_parallel_guard(cfg: &Config) -> AResult<&crate::MoeConfig> {
     let Some(moe) = cfg.moe.as_ref() else {
         return Err(anyhow!(
             "INFR_EXPERT_PARALLEL needs a routed-expert (MoE) model — this is a dense model (use \
@@ -3220,6 +3238,37 @@ pub(crate) fn generate_moe_vulkan_ep(
             "INFR_EXPERT_PARALLEL does not support diffusion-gemma"
         ));
     }
+    // The dual dense ∥ MoE FFN (gemma4 26B-A4B): its dense branch is computed before the MoE op
+    // and summed after it, across the cut EP makes there, and its per-expert down scale is
+    // indexed by the band-local expert id. Neither is carried by the EP lowering.
+    if cfg.dual_moe() {
+        return Err(anyhow!(
+            "INFR_EXPERT_PARALLEL does not support gemma4 MoE (the dual dense + MoE FFN with a \
+             per-expert down scale) — run it on one device"
+        ));
+    }
+    Ok(moe)
+}
+
+/// Multi-GPU EXPERT-PARALLEL (MoE) generation — the model's experts are split across the `devices`
+/// (rank `r` owns experts `[r·E/W, (r+1)·E/W)`), the router + attention + norms run replicated on
+/// every rank, each rank computes only its band's experts, and one P2P all-reduce per MoE layer
+/// combines the partial expert outputs. The output equals the single-device MoE to reduction-order
+/// tolerance (token-identical greedy). qwen3moe (split gate/up, softmax, no shared expert) in v1.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_moe_vulkan_ep(
+    devices: &[usize],
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
+    let moe = expert_parallel_guard(cfg)?;
     let backends = open_vulkan_devices(devices, ec)?;
     let names = backends
         .iter()
@@ -3697,8 +3746,8 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 #[cfg(test)]
 mod bda_cap_tests {
     use super::{
-        check_bda_element_cap, chunk_covered_dense_tensor, tp_bias_guard, tp_weight_role, Config,
-        BDA_ELEMENT_UNIT_MAX,
+        check_bda_element_cap, chunk_covered_dense_tensor, expert_parallel_guard, tp_bias_guard,
+        tp_weight_role, Config, BDA_ELEMENT_UNIT_MAX,
     };
 
     #[test]
@@ -3813,6 +3862,40 @@ mod bda_cap_tests {
             ..cfg
         })
         .expect("a bias-free model is not refused");
+    }
+
+    /// gemma4 MoE's dense branch is computed before the MoE op and summed after it, across the cut
+    /// expert parallelism makes there, and its per-expert down scale is indexed by the band-local
+    /// expert id: both wrong under EP, so it is refused by name before any device is opened.
+    #[test]
+    fn expert_parallel_refuses_the_dual_moe_ffn() {
+        let moe = crate::MoeConfig {
+            n_expert: 4,
+            n_used: 1,
+            n_ff_exp: 16,
+            scale: 1.0,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+        };
+        let qwen3moe = Config {
+            n_layer: 1,
+            moe: Some(moe),
+            ..Default::default()
+        };
+        expert_parallel_guard(&qwen3moe).expect("routed-only MoE is EP's own case");
+        let gemma4_moe = Config {
+            gemma4_moe: true,
+            ..qwen3moe
+        };
+        let err = expert_parallel_guard(&gemma4_moe).expect_err("gemma4 MoE must be refused");
+        assert!(
+            err.to_string()
+                .starts_with("INFR_EXPERT_PARALLEL does not support gemma4 MoE"),
+            "{err}"
+        );
     }
 
     #[test]

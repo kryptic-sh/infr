@@ -568,8 +568,11 @@ void wdec2k(uint gelem, out uint qp[8], out float dl0, out float ml0, out float 
 
 #ifdef FUSE_QUANT
 // Inline per-32-block symmetric int8 activation quantization: read 32 f32 elements, compute amax,
-// quantize to int8, output packed words aw[8] and per-block da/sa. Same numerics as quant_q8.comp
-// (amax/127 scale, round-to-nearest, clamp [−127,127], sa = Σ(d·q)). Shared by OUTS4 and non-OUTS4.
+// quantize to int8, output packed words aw[8] and per-block da/sa. The quantization matches
+// quant_q8.comp (amax/127 scale, round-to-nearest, clamp [−127,127], sa = Σ(d·q)), but da/sa stay
+// f32 here where quant_q8 stores them as f16, and sa sums serially rather than by subgroupAdd —
+// so the fused path is close to, not bit-identical with, the separate quant_q8 + mmv route.
+// Shared by OUTS4 and non-OUTS4.
 void fuse_quant(uint row, uint s, out int aw[8], out float da, out float sa) {
     float amax = 0.0;
     float vals[32];

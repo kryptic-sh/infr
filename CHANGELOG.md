@@ -168,6 +168,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Sliding-window models under `serve --parallel`: a slot forked or seeded from
   another could size its KV ring from the wrong prefill chunk**, losing the
   extra slot or seeding stale rows.
+- **Vulkan sampling: an exact tie at the top-k boundary could drop a token that
+  belonged in the top-k**, and which tied tokens survived depended on thread
+  scheduling. The strictly greater values are taken first now and ties go to the
+  lowest token id. Output with no exact ties is unchanged.
+- **Vulkan: attention over a very long span no longer overruns a kernel's shared
+  memory** (a DiffusionGemma canvas past a few thousand keys; batched attention
+  past 262,144 keys).
+- **Multi-GPU: `INFR_EXPERT_PARALLEL` refuses gemma-4-26B-A4B**, which it
+  computed wrongly (the dense FFN branch was dropped at each cut). A mixed
+  integrated + discrete world now sizes prefill for the integrated GPU, and any
+  graph that would read a scratch tensor across a device cut is refused by name.
 - **`infr serve`: `usage.prompt_tokens` counts the whole prompt.** It reported
   only the tokens prefilled for this request, so a KV prefix cache hit made a
   long prompt look short. `/metrics` still counts prefilled tokens only.

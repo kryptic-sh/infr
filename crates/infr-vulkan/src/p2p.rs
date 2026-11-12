@@ -313,6 +313,11 @@ impl VulkanBackend {
             }
         };
         let req = unsafe { device.get_buffer_memory_requirements(buffer) };
+        if let Err(e) = import_fits(req.size, export.mem_size) {
+            unsafe { device.destroy_buffer(buffer, None) };
+            close_dup();
+            return Err(e);
+        }
 
         // Which memory types can this fd be imported into on device B?
         //   * dma-buf (and other "host-derived" handles): the DRIVER decides — query it with
@@ -402,5 +407,36 @@ impl VulkanBackend {
             own_addr: None,
             act_bytes: 0,
         }))
+    }
+}
+
+/// Whether an import of an exported allocation of `exported` bytes can back a buffer whose
+/// importing-device requirement is `required` bytes. The import binds the exporter's whole
+/// allocation at offset 0, which meets any alignment the importer asks for, but the importer sizes
+/// the buffer by its own rules, and a requirement past the allocation is an invalid bind
+/// (`vkBindBufferMemory`'s `size <= allocationSize - memoryOffset`). Refusing it here returns the
+/// error every transport already answers with its host-bounce fallback.
+fn import_fits(required: u64, exported: u64) -> Result<()> {
+    if required > exported {
+        return Err(be(format!(
+            "p2p_import: this device needs {required} bytes of memory for the buffer, but the \
+             exported allocation is {exported} bytes — the pair cannot share it"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::import_fits;
+
+    #[test]
+    fn an_import_smaller_than_the_importers_requirement_is_refused() {
+        import_fits(4096, 4096).expect("an exact fit binds");
+        import_fits(256, 4096).expect("a larger allocation binds");
+        let err = import_fits(8192, 4096)
+            .expect_err("too small to bind")
+            .to_string();
+        assert!(err.contains("8192") && err.contains("4096"), "{err}");
     }
 }

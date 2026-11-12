@@ -882,6 +882,17 @@ enum RopeMode<'a> {
 /// parameterized by.
 const ATTN_MAX_CHUNKS: usize = 1024;
 
+/// `attn_partial.comp` stages one chunk's scores in `shared float sc[ATTN_PARTIAL_MAX_CHUNK]`, so a
+/// chunk of more keys is an OOB shared-memory write. Every chunk size the adapter hands that kernel
+/// is capped here first (the count then rises to cover the span); a span past
+/// `ATTN_PARTIAL_MAX_CHUNK * ATTN_MAX_CHUNKS` keys fits neither cap and does not take the split-K
+/// kernel. `attn_partial_chunk_bound_matches_host` keeps the shader's copy in step.
+const ATTN_PARTIAL_MAX_CHUNK: usize = 1024;
+
+/// The rows-batched split-K tier (`attn_partial_mrows_c256`) stages its chunk scores in a shared
+/// array sized by its `-DSC_MAX` build define (`build.rs`): its fixed chunk, and its bound.
+const ATTN_MROWS_CHUNK: usize = 256;
+
 /// Flash-decoding split-K chunk policy: ~32 chunks/head, each 64..512 keys, floor-rounded (the
 /// measured Vulkan `attn_partial` shape — see [`infr_core::tier::ChunkRounding`] for why the
 /// rounding is config and not a shared constant).
@@ -901,6 +912,41 @@ const CANVAS_CHUNK_N: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
     min: 1,
     max: usize::MAX,
 };
+
+/// Whether static attention takes the rows-batched split-K tier (`attn_partial_mrows_c256`; see
+/// the adapter's `batched_attn`). `mrows_attn` is the `kernels.vulkan.mrows_attn` tri-state:
+/// `Some(false)` forces it off, `Some(true)` bypasses the rows/kv_len heuristic. The tier's fixed
+/// [`ATTN_MROWS_CHUNK`] covers at most [`ATTN_MAX_CHUNKS`] chunks, so a longer span is left to the
+/// per-row split-K grid, whose chunk grows to its own bound; past that bound too, every tier
+/// declines and the scalar kernel runs.
+fn batched_attn_ok(
+    rows: usize,
+    hd: usize,
+    kv_len: usize,
+    att_cap_rows: usize,
+    canvas: bool,
+    kv_q8: bool,
+    mrows_attn: Option<bool>,
+) -> bool {
+    rows >= 2
+        && hd <= 128
+        && kv_len <= att_cap_rows // the mrows kernel has no ring row mapping
+        && kv_len <= ATTN_MROWS_CHUNK * ATTN_MAX_CHUNKS
+        && !canvas
+        && !kv_q8
+        && mrows_attn != Some(false)
+        && ((rows >= 12 && kv_len >= 8192) || mrows_attn == Some(true))
+}
+
+/// The DiffusionGemma canvas split-K chunk: the canvas span cut into ~`n` chunks (see
+/// [`CANVAS_CHUNK_N`]), below `kv_len` so the split has at least two chunks, and never past the
+/// `attn_partial` bound — a longer canvas takes more chunks, not longer ones.
+fn canvas_chunk(kv_len: usize, n: usize) -> usize {
+    kv_len
+        .div_ceil(n)
+        .min(kv_len - 1)
+        .clamp(1, ATTN_PARTIAL_MAX_CHUNK)
+}
 
 /// Cap the static split-K attention chunk COUNT so `n_chunks = span.div_ceil(chunk) <= 1024` (see
 /// [`ATTN_MAX_CHUNKS`]). Raises the chunk floor to `span.div_ceil(1024)`; only bites when
@@ -1579,7 +1625,7 @@ fn lower_op(
             // spend `.y` on the expert id of the batched-MoE twin), so their flat tile grid cannot
             // take `dispatch_wide`'s 2-D split. A grid past the guaranteed x limit would be
             // rejected or truncated by a driver that enforces it (ANV), so refuse it by name.
-            let nc_groups = m.div_ceil(64) * (out_f / 64);
+            let nc_groups = crate::recorder::nc_gemm_groups(m, out_f);
             if (nc_mmq || nc_fma) && nc_groups > crate::recorder::Recorder::split_point_x() as usize
             {
                 return Err(be(format!(
@@ -2922,7 +2968,9 @@ fn lower_op(
                 let chunk =
                     infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_SPLIT.min_chunk);
                 let n_chunks = infr_core::tier::n_chunks(cap_rows, chunk);
-                if hd % 4 == 0 && hd <= 512 && n_chunks > 1 {
+                // A cache past `ATTN_PARTIAL_MAX_CHUNK * ATTN_MAX_CHUNKS` rows bakes a chunk the
+                // partial kernel cannot stage; it takes the scalar decode instead.
+                if hd % 4 == 0 && hd <= 512 && n_chunks > 1 && chunk <= ATTN_PARTIAL_MAX_CHUNK {
                     // ONE prologue + ONE scratch set per (nh, hd, chunk, n_chunks, window) key:
                     // the first Dynamic attention op of a shape records/allocates; every later
                     // same-shape layer reuses (kv_len is per-token, and the layers' attention ops
@@ -3322,13 +3370,15 @@ fn lower_op(
                 // opt-in, which bypasses the rows/kv_len heuristic; `None` = let the heuristic
                 // decide. Reproduces the old `is_err()`/`is_ok()` pair exactly.
                 let mrows_attn = be_.cfg().kernels.vulkan.mrows_attn;
-                let batched_attn = rows >= 2
-                    && hd <= 128
-                    && kv_len <= att_cap_rows // the mrows kernel has no ring row mapping
-                    && canvas_lo.is_none()
-                    && !(k_q8_eff || v_q8_eff)
-                    && mrows_attn != Some(false)
-                    && ((rows >= 12 && kv_len >= 8192) || mrows_attn == Some(true));
+                let batched_attn = batched_attn_ok(
+                    rows,
+                    hd,
+                    kv_len,
+                    att_cap_rows,
+                    canvas_lo.is_some(),
+                    k_q8_eff || v_q8_eff,
+                    mrows_attn,
+                );
                 // The batched kernel stages chunk scores in 4KB of LDS → chunk 256; the per-row
                 // grid keeps the adaptive ~32-chunks policy.
                 //
@@ -3392,10 +3442,12 @@ fn lower_op(
                 // correct (identity, since kv_len < att_cap_rows always holds) row mapping.
                 let cap_short = nonfa_read_rows > att_cap_rows;
                 let chunk = if canvas_lo.is_some() && kv_len >= 2 {
-                    let n = CANVAS_CHUNK_N.clamped(be_.cfg().kernels.vulkan.canvas_chunk_n);
-                    kv_len.div_ceil(n).min(kv_len - 1).max(1)
+                    canvas_chunk(
+                        kv_len,
+                        CANVAS_CHUNK_N.clamped(be_.cfg().kernels.vulkan.canvas_chunk_n),
+                    )
                 } else if batched_attn {
-                    256
+                    ATTN_MROWS_CHUNK
                 } else if (ring_past || cap_short) && rows >= 64 {
                     // Large-rows ring/capacity-limited prefill: the pm/pl/pacc partials are [rows,
                     // nh, n_chunks, hd] — the ordinary ~32-chunk policy would balloon them (1024
@@ -3414,9 +3466,17 @@ fn lower_op(
                 // span span.div_ceil(1024) <= the branch value above, so `chunk` — and the recorded
                 // dispatch — is byte-identical. (The Dynamic path caps count the same way, ~2531.)
                 let chunk = split_k_chunk_count_cap(span, chunk);
+                // ...and the chunk SIZE: a span past both caps (more than a million keys) would
+                // need a chunk the partial kernel cannot stage, so it does not take split-K.
+                let chunk_max = if batched_attn {
+                    ATTN_MROWS_CHUNK
+                } else {
+                    ATTN_PARTIAL_MAX_CHUNK
+                };
                 // Canvas forces the split-K tier regardless of row count (see `canvas_lo` above) —
                 // `attn_partial` carries the fixed `lo` override this mask needs; flash/nonfa don't.
                 let split_ok = (rows < 64 || canvas_lo.is_some() || ring_past || cap_short)
+                    && chunk <= chunk_max
                     && span > chunk
                     && hd % 4 == 0
                     && hd <= 512
@@ -3999,7 +4059,7 @@ fn lower_op(
                 *rows as usize,
                 *ne as usize,
                 *scale,
-            );
+            )?;
         }
         Op::GatherI32 {
             ids,
@@ -7064,6 +7124,77 @@ mod tests {
         }
     }
 
+    /// The partial kernels' score arrays are sized by a define the host copies; read both back
+    /// out of their sources (the rows-batched build's from its `build.rs` define).
+    #[test]
+    fn attn_partial_chunk_bound_matches_host() {
+        let src = include_str!("../shaders/attn_partial.comp");
+        assert_eq!(
+            glsl_define_u32(src, "ATTN_PARTIAL_MAX_CHUNK") as usize,
+            ATTN_PARTIAL_MAX_CHUNK,
+            "attn_partial.comp's ATTN_PARTIAL_MAX_CHUNK drifted from the host cap"
+        );
+        assert!(
+            src.contains("shared float sc[ATTN_PARTIAL_MAX_CHUNK];"),
+            "attn_partial.comp's sc[] is no longer sized by ATTN_PARTIAL_MAX_CHUNK"
+        );
+        assert!(
+            include_str!("../build.rs").contains(&format!("\"-DSC_MAX={ATTN_MROWS_CHUNK}u\"")),
+            "attn_partial_mrows_c256's SC_MAX drifted from ATTN_MROWS_CHUNK"
+        );
+    }
+
+    /// The rows-batched tier covers at most `ATTN_MROWS_CHUNK * ATTN_MAX_CHUNKS` keys; one key
+    /// more leaves it (to per-row split-K), with or without the opt-in, while every other
+    /// condition is held where it admits the tier.
+    #[test]
+    fn batched_attn_stops_at_its_chunk_count_bound() {
+        let bound = ATTN_MROWS_CHUNK * ATTN_MAX_CHUNKS;
+        for opt_in in [None, Some(true)] {
+            let ok = |kv_len| batched_attn_ok(16, 128, kv_len, usize::MAX, false, false, opt_in);
+            assert!(ok(bound), "{opt_in:?}: at the bound");
+            assert!(!ok(bound + 1), "{opt_in:?}: past the bound");
+        }
+        assert!(!batched_attn_ok(
+            16,
+            128,
+            8192,
+            usize::MAX,
+            false,
+            false,
+            Some(false)
+        ));
+    }
+
+    /// The canvas chunk never passes the partial kernel's score array, so a long canvas splits
+    /// into more chunks instead (the old `kv_len / 3` reached a 1025-key chunk at kv_len 3073 and
+    /// wrote past `sc[]`); below that point it is the old chunk exactly, and the count stays within
+    /// the combine's cap up to the span where both caps meet.
+    #[test]
+    fn canvas_chunk_stays_within_the_partial_kernel() {
+        let old = |kv_len: usize, n: usize| kv_len.div_ceil(n).min(kv_len - 1).max(1);
+        let n = CANVAS_CHUNK_N.default;
+        for kv_len in (2..=ATTN_PARTIAL_MAX_CHUNK * ATTN_MAX_CHUNKS).step_by(997) {
+            let chunk = canvas_chunk(kv_len, n);
+            assert!(
+                chunk <= ATTN_PARTIAL_MAX_CHUNK,
+                "kv_len {kv_len}: chunk {chunk}"
+            );
+            assert!(kv_len.div_ceil(chunk) <= ATTN_MAX_CHUNKS, "kv_len {kv_len}");
+            assert_eq!(
+                split_k_chunk_count_cap(kv_len, chunk),
+                chunk,
+                "kv_len {kv_len}: the count cap must not raise it back"
+            );
+            if old(kv_len, n) <= ATTN_PARTIAL_MAX_CHUNK {
+                assert_eq!(chunk, old(kv_len, n), "kv_len {kv_len} moved");
+            }
+        }
+        let first = ATTN_PARTIAL_MAX_CHUNK * n + 1;
+        assert!(old(first, n) > ATTN_PARTIAL_MAX_CHUNK);
+        assert_eq!(canvas_chunk(first, n), ATTN_PARTIAL_MAX_CHUNK);
+    }
+
     #[test]
     fn split_k_chunk_count_cap_bounds_huge_spans() {
         // Past the boundary the cap must engage: n_chunks stays <= 1024 for every static base
@@ -8561,6 +8692,116 @@ mod tests {
         }
     }
 
+    /// DiffusionGemma canvas attention (`AttnMask::Canvas`, every row attends `[lo, kv_len)`) at a
+    /// `kv_len` whose old `kv_len / CANVAS_CHUNK_N` chunk passed the partial kernel's score array,
+    /// against the host reference.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_canvas_long_span_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        let (nh, nkv, hd, rows) = (2usize, 1usize, 64usize, 4usize);
+        let kv_len = ATTN_PARTIAL_MAX_CHUNK * CANVAS_CHUNK_N.default + 128;
+        let lo = 40usize;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let to_f16 = |v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect()
+        };
+        let deq = |b: &[u8]| -> Vec<f32> {
+            b.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| half::f16::from_le_bytes(c).to_f32())
+                .collect()
+        };
+        let q: Vec<f32> = (0..rows * nh * hd)
+            .map(|i| (i as f32 * 0.03).sin())
+            .collect();
+        let k: Vec<f32> = (0..kv_len * nkv * hd)
+            .map(|i| (i as f32 * 0.011).cos())
+            .collect();
+        let v: Vec<f32> = (0..kv_len * nkv * hd)
+            .map(|i| ((i % 173) as f32) * 0.011 - 0.9)
+            .collect();
+        let (qf, kf, vf) = (to_f16(&q), to_f16(&k), to_f16(&v));
+        let (qd, kd, vd) = (deq(&qf), deq(&kf), deq(&vf));
+        let group = nh / nkv;
+        let mut want = vec![0f32; rows * nh * hd];
+        for r0 in 0..rows {
+            for h in 0..nh {
+                let kvh = h / group;
+                let sc: Vec<f32> = (lo..kv_len)
+                    .map(|j| {
+                        (0..hd)
+                            .map(|x| qd[(r0 * nh + h) * hd + x] * kd[(j * nkv + kvh) * hd + x])
+                            .sum::<f32>()
+                            * scale
+                    })
+                    .collect();
+                let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let l: f32 = sc.iter().map(|s| (s - mx).exp()).sum();
+                for (jj, &s) in sc.iter().enumerate() {
+                    let p = (s - mx).exp() / l;
+                    for x in 0..hd {
+                        want[(r0 * nh + h) * hd + x] += p * vd[((lo + jj) * nkv + kvh) * hd + x];
+                    }
+                }
+            }
+        }
+        let mut g = Graph::new();
+        let qi = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F16));
+        let ki = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+        let vi = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+        let yi = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        g.push(Op::Attention {
+            q: qi,
+            k_cache: ki,
+            v_cache: vi,
+            dst: yi,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::Canvas { lo },
+            pos: (kv_len - rows) as u32,
+            sinks: None,
+            key_bias: None,
+        });
+        let up = |b: &[u8]| {
+            let buf = be_.alloc(b.len(), BufferUsage::Activations).unwrap();
+            be_.upload(buf.as_ref(), b).unwrap();
+            buf
+        };
+        let (qb, kb, vb) = (up(&qf), up(&kf), up(&vf));
+        let yb = be_
+            .alloc(rows * nh * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(qi, qb.as_ref());
+        bind.bind(ki, kb.as_ref());
+        bind.bind(vi, vb.as_ref());
+        bind.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bind).unwrap();
+        let mut got = vec![0f32; rows * nh * hd];
+        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        for i in 0..rows * nh * hd {
+            assert!(
+                (got[i] - want[i]).abs() < ATTN_VS_HOST_TOL,
+                "canvas attention kv_len={kv_len} at {i}: got {} want {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
+
     /// Prefill attention over a planar Q8_0 KV cache runs on the dequantised f16 scratch, and the
     /// coopmat tiers read it in whole K/V tiles past `kv_len` (hd=128 takes the flash tier, hd=64
     /// the non-FA tier). With `kv_len` off every tile boundary, a scratch sized to `kv_len` alone
@@ -9119,7 +9360,7 @@ mod tests {
                         b
                     })
                     .collect();
-                crate::ep::EpBuffer::wrap(bufs)
+                crate::ep::EpBuffer::shard(bufs)
             };
             // Replicate a buffer (same bytes on every rank) through the EP backend's alloc.
             let repl = |bytes: &[u8], usage| {
@@ -9269,6 +9510,177 @@ mod tests {
             devs[0].name, devs[1].name,
             "the two devices must be distinct physical GPUs"
         );
+    }
+
+    /// The dual dense ∥ MoE FFN's shape (gemma4 MoE): a dense branch written BEFORE the MoeFfn and
+    /// summed with its output AFTER it. Expert parallelism cuts the graph right after each MoeFfn
+    /// and runs each side as its own plan, so the dense branch would read back as zero scratch on
+    /// the far side — a wrong sum with no error. A 1-device world reproduces the cut; the lowering
+    /// must refuse the graph by name rather than run it. A graph whose MoE output alone crosses the
+    /// cut still runs, and matches the plain single-device result.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn ep_refuses_scratch_live_across_the_moe_cut() {
+        let (ne, n_expert, n_used, nff, rows) = (32usize, 4usize, 2usize, 32usize, 2usize);
+        let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5;
+        let router: Vec<f32> = (0..n_expert * ne)
+            .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
+            .collect();
+        let bank = |s: f32| {
+            q8_0(
+                &(0..n_expert * nff * ne)
+                    .map(|i| f(i, s))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (rq, gq, uq, dq) = (q8_0(&router), bank(0.017), bank(0.023), bank(0.029));
+        let x: Vec<f32> = (0..rows * ne).map(|i| f(i, 0.11) + 0.05).collect();
+        // y = moe(x) + (dense ? 2x : 0); `dense` adds the branch that crosses the cut as scratch.
+        let graph = |dense: bool| {
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+            let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+            let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+            let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+            let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q8_0));
+            let d_out = g.internal(TensorDesc::new(vec![rows, ne], DType::F32));
+            let moe_out = g.internal(TensorDesc::new(vec![rows, ne], DType::F32));
+            let yi = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+            g.push(Op::Scale {
+                x: xi,
+                dst: d_out,
+                s: if dense { 2.0 } else { 0.0 },
+                n: (rows * ne) as u32,
+            });
+            g.push(Op::MoeFfn {
+                x: xi,
+                router_x: xi,
+                router: ri,
+                gate_exps: gi,
+                up_exps: ui,
+                down_exps: di,
+                down_scale: None,
+                fused_gate_up: false,
+                dst: moe_out,
+                ne: ne as u32,
+                n_expert: n_expert as u32,
+                n_used: n_used as u32,
+                n_ff_exp: nff as u32,
+                scale: 1.0,
+                act: Activation::Silu,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
+                ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
+            });
+            if dense {
+                g.push(Op::Add {
+                    a: d_out,
+                    b: moe_out,
+                    dst: yi,
+                    n: (rows * ne) as u32,
+                });
+            } else {
+                g.push(Op::Copy {
+                    src: moe_out,
+                    src_off: 0,
+                    dst: yi,
+                    dst_off: 0,
+                    n: (rows * ne) as u32,
+                });
+            }
+            (g, [xi, ri, gi, ui, di, yi])
+        };
+        // Run `g` on `be` with the same weights; the EP world shards the banks (one band here).
+        let run = |be: &dyn Backend,
+                   ep: Option<&crate::ep::ExpertParallelBackend>,
+                   g: &Graph,
+                   ids: [TensorId; 6]| {
+            let up = |bytes: &[u8], usage| {
+                let b = be.alloc(bytes.len(), usage).unwrap();
+                be.upload(b.as_ref(), bytes).unwrap();
+                b
+            };
+            let bank = |bytes: &[u8]| -> Box<dyn Buffer> {
+                if let Some(ep) = ep {
+                    let b = ep
+                        .rank(0)
+                        .alloc_uninit(bytes.len(), BufferUsage::Weights)
+                        .unwrap();
+                    ep.rank(0).upload(b.as_ref(), bytes).unwrap();
+                    crate::ep::EpBuffer::shard(vec![b])
+                } else {
+                    up(bytes, BufferUsage::Weights)
+                }
+            };
+            let bufs = [
+                up(bytemuck::cast_slice(&x), BufferUsage::Activations),
+                up(&rq, BufferUsage::Weights),
+                bank(&gq),
+                bank(&uq),
+                bank(&dq),
+                be.alloc(rows * ne * 4, BufferUsage::Activations).unwrap(),
+            ];
+            let plan = be.compile(g).unwrap();
+            let mut bind = Bindings::new();
+            for (t, b) in ids.iter().zip(&bufs) {
+                bind.bind(*t, b.as_ref());
+            }
+            be.execute(plan.as_ref(), &bind).map(|()| {
+                let mut y = vec![0f32; rows * ne];
+                be.download(bufs[5].as_ref(), bytemuck::cast_slice_mut(&mut y))
+                    .unwrap();
+                y
+            })
+        };
+        let Ok(single) = VulkanBackend::new() else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        let ep = crate::ep::ExpertParallelBackend::new(
+            vec![VulkanBackend::new().expect("vulkan")],
+            n_expert,
+            false,
+        )
+        .expect("1-device EP world");
+
+        let (g, ids) = graph(true);
+        match run(&ep, Some(&ep), &g, ids) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("INFR_EXPERT_PARALLEL: op 2 (Add) reads scratch tensor"),
+                    "{msg}"
+                );
+            }
+            Ok(got) => {
+                let want = run(&single, None, &g, ids).expect("single-device run");
+                let drift = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                panic!(
+                    "EP ran a graph whose dense branch crosses its MoE cut as scratch; max |EP - \
+                     single-device| = {drift}"
+                );
+            }
+        }
+
+        let (g, ids) = graph(false);
+        let got = run(&ep, Some(&ep), &g, ids).expect("only the MoE output crosses the cut");
+        let want = run(&single, None, &g, ids).expect("single-device run");
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "EP world=1 vs single at {i}: {a} vs {b}"
+            );
+        }
     }
 
     /// diffusion-gemma's `MoeFfn` shape: a SEPARATE `router_x` (not `x`), a FUSED `gate_up_exps`

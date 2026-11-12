@@ -3728,6 +3728,63 @@ Left, confirmed by reading and not changed:
 - Not read by that pass: the DiffusionGemma emitters against an actual reference
   (the fork checkout is absent).
 
+### B148 — multi-GPU wrappers and shader bodies, 2026-11-12: fixed, refused and left (2026-11-12)
+
+`tp.rs`, `tp_allreduce.rs`, `tp_sem.rs`, `p2p.rs`, `ep.rs`, `pipeline.rs`,
+`linear.rs`, `vkext.rs` and the non-test part of `caps.rs` were read in full for
+the first time, and every in-shader weight decoder was compared with
+`ggml-quants.c` (all match; the i-quant grids and sign tables were compared by
+script). Fixed: the in-graph sampler could evict a value above the threshold
+when keys tied at the k-th place (`sample_topk.comp` now takes the strictly
+greater keys first and breaks ties by lowest index); `attn_partial.comp`'s
+shared array overflowed for a DiffusionGemma canvas past a few thousand keys
+(the chunk is capped at `ATTN_PARTIAL_MAX_CHUNK`, and the rows-batched kernel at
+its own bound); `embed_gather` wrapped its u32 byte offsets before its element
+count on very large tables; `moe_topk.comp`'s group arrays had no host bound;
+the multi-GPU wrappers reported rank 0's capabilities, so an integrated GPU
+behind a discrete one got the discrete prefill chunk; `p2p_import` did not check
+the importer's size requirement. Refused or left:
+
+- **Expert-parallel refuses gemma4moe (the dual-FFN MoE).** Its dense-branch
+  output is written before the MoE cut and read after it as scratch, which each
+  segment zero-fills, so it read as zero (seen on one GPU: the result differed
+  from single-device by more than 1); and its per-expert down-scale table is
+  indexed by global expert id while the band remap makes ids rank-local, wrong
+  on every rank but the first (read, not run: a one-rank world has only rank 0).
+  To support it: carry `d_out` across the cut and split the scale table by band.
+  `multi::refuse_scratch_across_cuts` now refuses any such crossing in EP, TP
+  and pipeline by name; it treats a partial write (`dst_off`) as a full one, so
+  it can miss a refusal, never invent one. Not run against a real qwen3moe EP
+  graph (the model is not cached); read to pass.
+- **Expert-parallel refuses a graph ending in `MoeFfn`.** With several MoE
+  layers and a trailing one the last partial was never all-reduced.
+- **Needs a decision — a lost GPU hangs the semaphore all-reduce.**
+  `tp_queue_wait_idle` has no timeout. A timed wait is small, but on timeout the
+  healthy ranks' gather command buffers stay pending on a semaphore that will
+  never be signalled, and teardown hangs anyway. Options: host-signal the
+  imported timeline semaphores to release the waiters, or give up the
+  zero-host-stall property.
+- Pipeline refuses a second KV set (a `fork`, the MTP checkpoint) when the world
+  has more than one device: an allocation cannot say which layer it belongs to.
+- `INFR_F8_COOPMAT`'s GEMM casts dequantised weights to E4M3 unscaled, so most
+  weights land in the format's subnormal range. It is opt-in, never validated on
+  hardware, and now says so in a warning; a per-column scale undone in the
+  epilogue would fix it.
+- Eleven shader variants are built and never selected (`attn_partial_mrows`
+  base, several `native_mmv_mw_*_sg16`), so subgroup-16 devices fall back for
+  those shapes. Performance only.
+- Suspected, read only: `tp_record_copies` has no barrier between the previous
+  submit's compute write and the copy that reads it (it relies on the host-side
+  wait); TP's `Op::Add` marks its output replicated even when an input is split.
+- **Kernel families with no host-parity test:** the int8-activation arms of
+  `native_mmv.comp` / `native_mmv_mrow.comp` for Q4_K, Q6_K and IQ4_XS; the
+  `f8cm` GEMM; turbo quant / dequant on the GPU against `turbo.rs`; `quant_kv`
+  against a host quantiser; `lightning_indexer`; `moe_topk` grouping.
+- To measure in a quiet window: the sampler's added single-lane sort per stage-1
+  workgroup (estimated at microseconds per token, not measured).
+- `build.rs`'s list was checked by script (no duplicate output, no missing
+  source, every referenced variant built), not read entry by entry.
+
 ### Review coverage (2026-11-11, remaining areas)
 
 Six read-only reviews, one per area, none of which built or ran anything.

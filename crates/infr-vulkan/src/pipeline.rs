@@ -20,7 +20,8 @@
 //!   pinned to that device.
 //! * **KV** (`alloc(KvCache)`) is placed per-layer by the strictly-ordered `(k,v)`-pair alloc
 //!   counter — the runner allocs `kbufs[l]` then `vbufs[l]` for `l = 0..n_layer`, so alloc pair `l`
-//!   is layer `l`.
+//!   is layer `l`. Across several devices a KV allocation past the last layer (a second KV set)
+//!   is refused.
 //! * **IO** — the host-embedded `hidden` residual, `positions`, the rope table, the weightless
 //!   ones-vectors (`Staging`/`Weights`/`Activations`) — is REPLICATED to every device (each device
 //!   reads its own copy). The residual is the one replicated buffer the ops WRITE, so it is the
@@ -269,6 +270,25 @@ impl PipelineBackend {
         0
     }
 
+    /// The device of the next `KvCache` allocation, placed by layer order: the runner allocs
+    /// `kbufs[l]` then `vbufs[l]` for `l = 0..n_layer`, so the pair index IS the layer. An
+    /// allocation has no other way to say which layer it is for, so in a multi-device world a
+    /// second KV set (a slot fork, an MTP checkpoint, a resize) cannot be placed and is refused
+    /// here, instead of landing on the last device and failing later as a cross-device operand.
+    /// A one-device world has only one place to put it.
+    fn next_kv_device(&self) -> Result<usize> {
+        let pair = self.kv_alloc_pairs.fetch_add(1, Ordering::SeqCst) / 2;
+        if pair >= self.layer_device.len() && self.backends.len() > 1 {
+            return Err(be(format!(
+                "INFR_PIPELINE places KV by layer allocation order and has placed all {} layers' \
+                 caches; a further KV cache (a slot fork, an MTP checkpoint or a resized cache) \
+                 has no layer to follow and is not supported under INFR_PIPELINE",
+                self.layer_device.len()
+            )));
+        }
+        Ok(self.layer_device(pair))
+    }
+
     /// The real backend for device `d` — the binder allocs/uploads a per-layer weight through it.
     pub fn backend(&self, d: usize) -> &VulkanBackend {
         &self.backends[d]
@@ -335,6 +355,10 @@ impl PipelineBackend {
                  forward layer-split (an op on a later device feeds one on an earlier device)",
             ));
         }
+        let ends: Vec<usize> = (1..=n_ops)
+            .filter(|&i| i == n_ops || op_dev[i] != op_dev[i - 1])
+            .collect();
+        crate::multi::refuse_scratch_across_cuts(graph, &ends, "INFR_PIPELINE")?;
 
         // ── contiguous segments ──────────────────────────────────────────────────────────────
         let mut segments: Vec<Segment> = Vec::new();
@@ -488,11 +512,12 @@ impl Backend for PipelineBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        // Device 0's caps, with the GPU-resident fast paths turned OFF so the runner takes the
-        // classic host-embed + host-sample + static per-token execute path — the one the pipeline
-        // supports (keeps `hidden` a bound Input, every step a plain `execute`). This is the sole
-        // lever that keeps `generate_dense_backend` unmodified.
-        let mut c = self.backends[0].capabilities();
+        // The devices' most conservative caps (see `crate::multi::conservative_capabilities`), with
+        // the GPU-resident fast paths turned OFF so the runner takes the classic host-embed +
+        // host-sample + static per-token execute path — the one the pipeline supports (keeps
+        // `hidden` a bound Input, every step a plain `execute`). This is the sole lever that keeps
+        // `generate_dense_backend` unmodified.
+        let mut c = crate::multi::conservative_capabilities(&self.backends);
         c.decode_replay = false;
         c.embed_gather = false;
         c.gpu_sample = false;
@@ -507,10 +532,7 @@ impl Backend for PipelineBackend {
     fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
         match usage {
             BufferUsage::KvCache => {
-                // Placement by layer order: the runner allocs kbufs[l] then vbufs[l] for
-                // l = 0..n_layer, so the pair index IS the layer.
-                let pair = self.kv_alloc_pairs.fetch_add(1, Ordering::SeqCst) / 2;
-                let d = self.layer_device(pair);
+                let d = self.next_kv_device()?;
                 Ok(PipelineBuffer::single(
                     d,
                     self.backends[d].alloc(bytes, usage)?,
@@ -532,8 +554,7 @@ impl Backend for PipelineBackend {
     fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
         match usage {
             BufferUsage::KvCache => {
-                let pair = self.kv_alloc_pairs.fetch_add(1, Ordering::SeqCst) / 2;
-                let d = self.layer_device(pair);
+                let d = self.next_kv_device()?;
                 Ok(PipelineBuffer::single(
                     d,
                     self.backends[d].alloc_uninit(bytes, usage)?,
@@ -716,5 +737,52 @@ mod tests {
         ];
         let m = last_writer_devices(&op_writes);
         assert_eq!(m.get(&t(1)), Some(&0));
+    }
+
+    /// KV is placed by allocation order, one `(k, v)` pair per layer. Across two devices an
+    /// allocation past the last layer (a slot fork, an MTP checkpoint) has no layer to follow and is
+    /// refused rather than parked on the last device; in a one-device world it lands on that device
+    /// as before.
+    #[test]
+    #[ignore = "requires a Vulkan GPU (two for the multi-device leg)"]
+    fn kv_past_the_last_layer_is_refused_across_devices() {
+        let Ok(devs) = VulkanBackend::enumerate_devices_from_env() else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        let n_layer = 2;
+        let fill = |pb: &PipelineBackend| {
+            for _ in 0..2 * n_layer {
+                pb.alloc(256, BufferUsage::KvCache)
+                    .expect("one (k, v) pair per layer is placed");
+            }
+            pb.alloc_uninit(256, BufferUsage::KvCache)
+        };
+        let one = PipelineBackend::new(
+            vec![VulkanBackend::new().expect("vulkan")],
+            PipelineBackend::balanced_layer_map(n_layer, 1),
+            false,
+        )
+        .expect("1-device pipeline");
+        fill(&one).expect("a one-device world places a second KV set on its only device");
+
+        if devs.len() < 2 {
+            eprintln!("skip: the multi-device leg needs >=2 Vulkan devices");
+            return;
+        }
+        let two = PipelineBackend::new(
+            devs.iter()
+                .take(2)
+                .map(|d| VulkanBackend::new_on(d.index).expect("open device"))
+                .collect(),
+            PipelineBackend::balanced_layer_map(n_layer, 2),
+            false,
+        )
+        .expect("2-device pipeline");
+        let err = fill(&two)
+            .err()
+            .expect("a second KV set must be refused across devices")
+            .to_string();
+        assert!(err.contains("INFR_PIPELINE places KV by layer"), "{err}");
     }
 }

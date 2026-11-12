@@ -7280,6 +7280,122 @@ mod tests {
         }
     }
 
+    /// The CPU backend reporting another device class, counting its executes.
+    struct ClassedCpu {
+        cpu: infr_cpu::CpuBackend,
+        integrated: bool,
+        executes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl infr_core::backend::Backend for ClassedCpu {
+        fn name(&self) -> &str {
+            self.cpu.name()
+        }
+        fn capabilities(&self) -> infr_core::backend::Capabilities {
+            infr_core::backend::Capabilities {
+                integrated: self.integrated,
+                compute_units: 2,
+                ..self.cpu.capabilities()
+            }
+        }
+        fn alloc(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            self.cpu.alloc(bytes, usage)
+        }
+        fn alloc_uninit(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            self.cpu.alloc_uninit(bytes, usage)
+        }
+        fn upload(
+            &self,
+            dst: &dyn infr_core::backend::Buffer,
+            src: &[u8],
+        ) -> infr_core::error::Result<()> {
+            self.cpu.upload(dst, src)
+        }
+        fn download(
+            &self,
+            src: &dyn infr_core::backend::Buffer,
+            dst: &mut [u8],
+        ) -> infr_core::error::Result<()> {
+            self.cpu.download(src, dst)
+        }
+        fn copy_buffer(
+            &self,
+            src: &dyn infr_core::backend::Buffer,
+            dst: &dyn infr_core::backend::Buffer,
+            bytes: usize,
+        ) -> infr_core::error::Result<()> {
+            self.cpu.copy_buffer(src, dst, bytes)
+        }
+        fn compile(
+            &self,
+            graph: &infr_core::graph::Graph,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Plan>> {
+            self.cpu.compile(graph)
+        }
+        fn execute(
+            &self,
+            plan: &dyn infr_core::backend::Plan,
+            bindings: &infr_core::backend::Bindings,
+        ) -> infr_core::error::Result<()> {
+            self.executes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.cpu.execute(plan, bindings)
+        }
+        fn sync(&self) -> infr_core::error::Result<()> {
+            self.cpu.sync()
+        }
+    }
+
+    /// The multi-device one-shot sizes its prefill chunk from the backend it runs on, not from the
+    /// class of whichever device the process opened first: a backend reporting an integrated
+    /// device prefills a prompt longer than the integrated chunk in more steps than one reporting
+    /// a discrete device, on the same model and prompt.
+    #[test]
+    fn multi_device_oneshot_chunks_by_the_backends_class() {
+        let (g, cfg) = open_synthetic("llama-chunk-class", &llama_gguf("llama", None));
+        let rows = infr_core::integrated_ubatch_rows(2);
+        let prompt: Vec<u32> = (0..rows as u32 + 8)
+            .map(|i| (i * 5 + 3) % Q35_VOCAB as u32)
+            .collect();
+        let executes = |integrated: bool| {
+            let be = ClassedCpu {
+                cpu: infr_cpu::CpuBackend::new(),
+                integrated,
+                executes: 0.into(),
+            };
+            let embd = std::sync::OnceLock::new();
+            crate::seam::run_dense_oneshot(
+                &be,
+                &crate::seam::cpu_upload_bind(&be.cpu),
+                &g,
+                &cfg,
+                &EngineConfig::default(),
+                TokenEmbd::new(&embd, &g),
+                None,
+                &prompt,
+                1,
+                |_| {},
+            )
+            .expect("synthetic one-shot");
+            be.executes.into_inner()
+        };
+        let (discrete, igpu) = (executes(false), executes(true));
+        assert_eq!(
+            igpu,
+            discrete + 1,
+            "a {}-token prompt takes one more prefill step at the integrated chunk ({rows} rows)",
+            prompt.len()
+        );
+    }
+
     /// A context larger than `Config::faithful_ctx_limit` — even one the caller pinned — gets a KV
     /// cache of only the faithful length, so no position past it can be computed.
     #[test]

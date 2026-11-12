@@ -1270,7 +1270,8 @@ fn embed_gather_matches_resident() {
             rows,
             ne,
             scale,
-        );
+        )
+        .unwrap();
         rec.finish().unwrap();
         let mut out = vec![0u8; rows * ne * 4];
         be.download(y_buf.as_ref(), &mut out).unwrap();
@@ -1385,7 +1386,8 @@ fn embed_gather_zeroes_an_out_of_range_id() {
         rows,
         ne,
         1.0,
-    );
+    )
+    .unwrap();
     rec.finish().unwrap();
     let mut out = vec![0u8; rows * ne * 4];
     be.download(y_buf.as_ref(), &mut out).unwrap();
@@ -2332,7 +2334,8 @@ fn resident_bda_linear_route_dispatches() {
                 rows,
                 ne,
                 scale,
-            );
+            )
+            .unwrap();
             rec.finish().unwrap();
             let mut out = vec![0u8; rows * ne * 4];
             be.download(y_buf.as_ref(), &mut out).unwrap();
@@ -2357,7 +2360,8 @@ fn resident_bda_linear_route_dispatches() {
                 rows,
                 ne,
                 scale,
-            );
+            )
+            .unwrap();
             rec.finish().unwrap();
             let mut out = vec![0u8; rows * ne * 4];
             be.download(y_buf.as_ref(), &mut out).unwrap();

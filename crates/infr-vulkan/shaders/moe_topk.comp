@@ -56,6 +56,9 @@ shared uint sidx[128];
 // n_expert headroom: one chunk per lane per iteration, up to MAX_CHUNKS chunks total (see the
 // chunked load/scan below, which indexes `t + c * gl_WorkGroupSize.x` for `c < MAX_CHUNKS`).
 #define MAX_CHUNKS 8u
+// Group-limited routing's per-group arrays (`gscore`, `chosen`) are private and indexed by group up
+// to `pc.n_expert_groups`, unchecked: the host (`Recorder::moe_topk`) refuses more groups.
+#define MOE_TOPK_MAX_GROUPS 64u
 
 // Per-expert score adjustment: bias (if has_bias) + group mask. Thread 0 pre-fills.
 // Sized to the SAME n_expert headroom the chunked scan above assumes (`gl_WorkGroupSize.x` is a
@@ -161,7 +164,7 @@ void select_topk(uint t, uint lbase, uint obase) {
             if (ng > 1u && ng_used > 0u) {
                 uint n_per = pc.n_expert / ng;
                 // Compute per-group score: sum of top-2 within each group.
-                float gscore[64]; // 256 experts / min 4 per group = max 64 groups
+                float gscore[MOE_TOPK_MAX_GROUPS];
                 for (uint g = 0u; g < ng; g++) {
                     float b0 = -1e30, b1 = -1e30;
                     uint base = g * n_per;
@@ -172,8 +175,8 @@ void select_topk(uint t, uint lbase, uint obase) {
                     }
                     gscore[g] = b0 + b1;
                 }
-                // Select top ng_used groups (simple O(ng^2) selection — ng ≤ 64).
-                bool chosen[64];
+                // Select top ng_used groups (simple O(ng^2) selection — ng ≤ MOE_TOPK_MAX_GROUPS).
+                bool chosen[MOE_TOPK_MAX_GROUPS];
                 for (uint g = 0u; g < ng; g++) { chosen[g] = false; }
                 for (uint k = 0u; k < ng_used; k++) {
                     float best = -1e30;

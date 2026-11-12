@@ -1170,16 +1170,16 @@ groups). `elementwise_ops_split_wide_grids` forces a split for each converted
 kernel and compares every byte, with sentinel bytes past each buffer's end.
 Still on a flat or tiled grid, each needing real shader rework:
 
-| Sites                                                                                                          | Grid                                                        | Overflows when                                                                 |
-| -------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `matmul_proj_at`, native off / cm8 / f16a / f32a, split-K's main GEMM, mmq q4k / q6k / `mmq_at`, `fma_at`      | tiles: ⌈m/64⌉·(n/64), or n/128 for the warp tiles, × splits | m = 1,024 with n ≥ 262,144 (only if the vocab head ran over every prefill row) |
-| i8cm (three variants)                                                                                          | ⌈m/128⌉·(n/16)                                              | m = 1,024 with n > 131,070                                                     |
-| f8cm (two variants), bf16cm                                                                                    | tiles                                                       | not computed                                                                   |
-| `attention_kv_split_impl`                                                                                      | rows·nh·4, shared memory                                    | rows·nh > 16,383 (small-m decode path)                                         |
-| `attention_kv_split_dyn_inner`                                                                                 | nh·n_chunks, shared memory                                  | nh·n_chunks > 65,535; the adapter's bound on n_chunks was not checked          |
-| `attention_prefill_flash`, `flash_reg`, `nc_fa`                                                                | ⌈mpad/bm⌉·nh, shared memory                                 | (mpad/64)·nh > 65,535                                                          |
-| rmsnorm family, layernorm, softmax, `embed_gather`, `dg_eb_sample`, `moe_topk`, `quant_f8_row`, `quant_q8_row` | one workgroup per row                                       | rows > 65,535                                                                  |
-| DeltaNet norm and scan passes, `hyper_mix`, `conv1d_silu_at`, `moe_ep_band_remap`                              | per the dispatcher                                          | not computed                                                                   |
+| Sites                                                                                                                      | Grid                                                        | Overflows when                                                                 |
+| -------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `matmul_proj_at`, native off / cm8 / f16a / f32a, split-K's main GEMM, mmq q4k / q6k / `mmq_at`, `fma_at`                  | tiles: ⌈m/64⌉·(n/64), or n/128 for the warp tiles, × splits | m = 1,024 with n ≥ 262,144 (only if the vocab head ran over every prefill row) |
+| i8cm (three variants)                                                                                                      | ⌈m/128⌉·(n/16)                                              | m = 1,024 with n > 131,070                                                     |
+| f8cm (two variants), bf16cm                                                                                                | tiles                                                       | not computed                                                                   |
+| `attention_kv_split_impl`                                                                                                  | rows·nh·4, shared memory                                    | rows·nh > 16,383 (small-m decode path)                                         |
+| `attention_kv_split_dyn_inner`                                                                                             | nh·n_chunks, shared memory                                  | nh·n_chunks > 65,535; the adapter's bound on n_chunks was not checked          |
+| `attention_prefill_flash`, `flash_reg`, `nc_fa`                                                                            | ⌈mpad/bm⌉·nh, shared memory                                 | (mpad/64)·nh > 65,535                                                          |
+| layernorm, softmax, the eager `ops.rs` rmsnorm, `embed_gather`, `dg_eb_sample`, `moe_topk`, `quant_f8_row`, `quant_q8_row` | one workgroup per row                                       | rows > 65,535                                                                  |
+| DeltaNet norm and scan passes, `hyper_mix`, `conv1d_silu_at`, `moe_ep_band_remap`                                          | per the dispatcher                                          | not computed                                                                   |
 
 Only the GEMM tiles are near today's shapes. `decode_gemv_bw` (a bench) stays on
 the default device whatever `INFR_DEV` says: its single-submit loop reset the
@@ -3622,6 +3622,50 @@ before it. Options: make the chunk default a parameter the tests pass, or scope
 the device class per backend instead of per process. A design decision about
 `device_class()`'s one production reader, `default_ubatch_rows` (read); not
 attempted.
+
+### B146 — Vulkan lowering review, 2026-11-12: what was fixed, refused and left (2026-11-12)
+
+A read of every `lower_op` arm outside attention and MoE, with the recorder
+methods each calls and each shader's push block, bindings and indexing, found no
+push-constant layout mismatch, no binding or write-tracking error and no
+undersized scratch. Fixed from it: an F16 `Linear`+`Add` fused onto a float16
+shader on a device without `shaderFloat16` (or under `INFR_NO_F16`); a panic
+under `INFR_MMV_FUSE_QUANT=1` on any decode dtype but Q4_K / Q6_K and under
+`INFR_NO_MMV_M4` on a fused decode (selection now asks the same table the
+recorder dispatches from, `mmv_mrow_variant`); the rmsnorm family and
+`deltanet_norm` on an unsplit grid; and a set of limits that were only
+`debug_assert!`ed and are now errors from `lower_op` (DeltaNet key-head width,
+`QkNormRope` head dim, `Sample` top-k range, Q8_0 `WriteKv` row width, the `Mla`
+cache dtype). Left:
+
+- **The non-coopmat GEMM (`matmul_mmq_at`, `matmul_fma_at`) refuses a grid past
+  the limit instead of splitting it.** Its mmq builds already use the y
+  dimension for the expert id, so the flat-index trick does not apply. No
+  default shape reaches it (it needs an output width of 262,144 at a 1024-row
+  chunk, and the prefill head runs on the last row only); a user-set
+  `INFR_UBATCH` on a very wide FFN can, on a discrete GPU without cooperative
+  matrices. Options if it matters: fall back to the per-row GEMV tier, or split
+  by m-tile across several dispatches. The guard repeats the recorder's
+  `ceil(m/64) * (n/64)` with its own literals; it should read the tile size from
+  one place.
+- **Refusals for shapes nothing emits today:** `QkNormRope` with both `x_stride`
+  and `freq_factors`; a record-once `Rope` or interleaved `QkNormRope` writing K
+  into a cache a sliding-window attention reads (those two kernels have no ring
+  wrap); `Op::Copy` between dtypes other than identity and F32→F16. A same-dtype
+  `Op::Copy` of a block-quantised dtype still sizes its bytes from
+  `dense_bytes(1).unwrap_or(4)`, which is wrong; nothing emits it.
+- `linear_mmv_mw_at` is unreachable while `unified_mmv_row1` is hard-coded true;
+  if it is re-enabled, an `INFR_MMV_MW_WARPS` value with no build panics.
+- Two tests hold by construction and prove little:
+  `mmv_choice_offers_only_built_variants`' "offered ⇒ built" half, and the new
+  gate-vs-table asserts for `native_mrow` / `native_gemm_fma` in `linear.rs`.
+- **Not read by that pass:** the bodies of the native GEMV / mmv / GEMM kernels
+  (dequant and indexing), `streamed_prefill_gemm`, `native_sg_choice` /
+  `native_rm_choice`, the DeltaNet recurrence maths, the `mla.comp` body, and
+  the `argmax_prob`, `quant_kv`, `store_kv_dense`, `quant_turbo` and
+  `embed_gather` shader bodies.
+- To measure in a quiet window: per-op decode time for `rmsnorm` /
+  `rmsnorm_wide` and `deltanet_norm` after the added uniform branch.
 
 ### Review coverage (2026-11-11, remaining areas)
 

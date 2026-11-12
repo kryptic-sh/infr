@@ -701,6 +701,7 @@ fn mmv_mw_choice(
     dt: infr_core::DType,
     in_f: usize,
     out_f: usize,
+    res: bool,
 ) -> Option<u32> {
     if !caps.i8_dot || !mmv_int8_decode_dtypes(caps, vk).contains(&dt) {
         return None;
@@ -723,13 +724,10 @@ fn mmv_mw_choice(
         .mmv_mw_warps
         .and_then(|w| u32::try_from(w).ok())
         .unwrap_or(default_warps);
-    // SPIR-V existence gate: unified rows=1 path probes the mrow variant for every dtype. All
-    // dtypes in the unified decode set have an mrow build; the mmv_mw route is retired (Intel
-    // specific dtypes Q3_K/Q5_K that had only mmv_mw builds are no longer in the default set,
-    // and INFR_MMV_MW=1 still force-opt-in them — they just fall through here as None since
-    // they lack mrow builds).
-    let have_spv =
-        crate::gemm::native_mmv_mrow_variant_kernel_name(dt, in_f < 2048, true, false).is_some();
+    // SPIR-V existence gate: the unified rows=1 path dispatches exactly the build this lookup
+    // names (same knobs, same residual flag), so a `Some` here can never reach a variant the
+    // recorder lacks — the residual builds exist only under `mmv_m4`, and not for every dtype.
+    let have_spv = crate::recorder::mmv_mrow_variant(vk, dt, 1, in_f, res).is_some();
     have_spv.then_some(warps)
 }
 
@@ -826,13 +824,25 @@ fn linear_add_weight_ok(dt: infr_core::DType) -> bool {
 }
 static LINEAR_ADD_WEIGHT_OK: fn(infr_core::DType) -> bool = linear_add_weight_ok;
 
+/// [`linear_add_weight_ok`] on a device without `shaderFloat16`: the f16 fused-residual GEMV
+/// (`linear_res.comp`) does f16 arithmetic, so an f16 weight stays unfused there and its Linear
+/// takes the `linear_f16_noext` GEMV, followed by the standalone Add.
+fn linear_add_weight_ok_no_f16(dt: infr_core::DType) -> bool {
+    native_dense_supported(dt)
+}
+static LINEAR_ADD_WEIGHT_OK_NO_F16: fn(infr_core::DType) -> bool = linear_add_weight_ok_no_f16;
+
 /// This adapter's [`FusionCfg`](infr_core::fusion::FusionCfg): the `Linear→Add` residual fusion
 /// (`INFR_NO_FUSE_ADD` hatch) and the `Rope/QkNormRope→WriteKv` KV-write fusion. `plan_fusions`
 /// returns the same `(fused, skip)` the two former private peepholes did.
 fn fusion_cfg(be_: &VulkanBackend) -> infr_core::fusion::FusionCfg<'static> {
     infr_core::fusion::FusionCfg {
         linear_add: Some(infr_core::fusion::LinearAddCfg {
-            weight_ok: &LINEAR_ADD_WEIGHT_OK,
+            weight_ok: if be_.caps().f16 {
+                &LINEAR_ADD_WEIGHT_OK
+            } else {
+                &LINEAR_ADD_WEIGHT_OK_NO_F16
+            },
             // `INFR_NO_FUSE_ADD` (config `kernels.vulkan.fuse_add`, positive polarity): PRESENCE
             // of the env key — including `INFR_NO_FUSE_ADD=0` — turns the fold off.
             enabled: be_.cfg().kernels.vulkan.fuse_add,
@@ -1029,6 +1039,31 @@ pub(crate) const MLA_MAX_KEY_LEN: u32 = 576;
 /// Capacity of `mla.comp`'s `shared float sv[]` — the V accumulator, `kv_lora_rank` wide.
 /// MIRRORS `#define MLA_MAX_KV_LORA_RANK` in `shaders/mla.comp`; see [`MLA_MAX_KEY_LEN`].
 pub(crate) const MLA_MAX_KV_LORA_RANK: u32 = 512;
+
+/// Capacity of the `shared float xs[]` head buffer in `qk_norm_rope.comp` and
+/// `qk_norm_rope_interleaved.comp`. MIRRORS their `#define QK_NORM_ROPE_MAX_HD`; the
+/// `Op::QkNormRope` arm of [`lower_op`] refuses a wider head, and `qk_norm_rope_bound_matches_host`
+/// fails if the two drift.
+pub(crate) const QK_NORM_ROPE_MAX_HD: u32 = 512;
+
+/// Widest DeltaNet key head (`head_k`) the recurrence kernels' shared-memory state and row
+/// buffers hold. MIRRORS `#define DN_MAX_KD` in every `deltanet*.comp` that sizes such a buffer;
+/// `deltanet_bounds_match_host` fails if they drift.
+const DN_MAX_KD: usize = 128;
+
+/// The f16 coopmat fragment K extent `deltanet_prep.comp` steps the key head by — the chunked-
+/// split path needs `head_k` to be a whole number of them. MIRRORS its `#define DN_PREP_KSTEP`.
+const DN_PREP_KSTEP: usize = 16;
+
+/// Can `cache` be a sliding-window RING — fewer rows than positions, written at `pos % rows`? The
+/// runner ring-sizes only caches a sliding-window attention reads (`kv_ring_wanted`), so a cache
+/// no `AttnMask::SlidingWindow` `Op::Attention` reads is always full-context.
+fn may_be_ring_cache(graph: &Graph, cache: TensorId) -> bool {
+    graph.ops.iter().any(|op| {
+        matches!(op, Op::Attention { k_cache, v_cache, mask: AttnMask::SlidingWindow(_), .. }
+            if *k_cache == cache || *v_cache == cache)
+    })
+}
 
 /// Lower ONE graph op into the recorder. Shared by the static (`execute_static`) and record-once
 /// (`record_decode_replay`) paths — only the three pos-dependent ops branch on `mode`.
@@ -1268,11 +1303,19 @@ fn lower_op(
                     // Multi-warp dp4a decode GEMV (wave32-native GPUs) takes precedence — see
                     // `mmv_mw_choice`. AMD returns None here and falls to the scalar/old-mmv path.
                     if let Some(warps) =
-                        mmv_mw_choice(be_.caps(), &be_.cfg().kernels.vulkan, dt, in_f, out_f)
+                        mmv_mw_choice(be_.caps(), &be_.cfg().kernels.vulkan, dt, in_f, out_f, true)
                     {
                         // FUSE_QUANT opt-in: inline activation quantization, skip the
-                        // separate quant_q8 dispatch.
-                        if be_.cfg().kernels.vulkan.mmv_fuse_quant {
+                        // separate quant_q8 dispatch. Only some dtypes have that build.
+                        if be_.cfg().kernels.vulkan.mmv_fuse_quant
+                            && crate::recorder::mmv_mrow_fuseq_variant(
+                                &be_.cfg().kernels.vulkan,
+                                dt,
+                                in_f,
+                                true,
+                            )
+                            .is_some()
+                        {
                             rec.linear_mmv_mrow_fuseq(dt, w, 0, xb, Some(rr), yf, 1, in_f, out_f);
                             return Ok(());
                         }
@@ -1517,6 +1560,20 @@ fn lower_op(
             let nc_mmq = nc_tier && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
             let nc_fma =
                 nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_kernel_name(dt).is_some();
+            // The nc GEMMs index their tile by `gl_WorkGroupID.x` alone (the mmq builds already
+            // spend `.y` on the expert id of the batched-MoE twin), so their flat tile grid cannot
+            // take `dispatch_wide`'s 2-D split. A grid past the guaranteed x limit would be
+            // rejected or truncated by a driver that enforces it (ANV), so refuse it by name.
+            let nc_groups = m.div_ceil(64) * (out_f / 64);
+            if (nc_mmq || nc_fma) && nc_groups > crate::recorder::Recorder::split_point_x() as usize
+            {
+                return Err(be(format!(
+                    "vulkan adapter: non-coopmat prefill GEMM (m={m}, out_f={out_f}, {dt:?}) needs \
+                     {nc_groups} workgroups in one grid dimension, past the {} every Vulkan device \
+                     guarantees — run prefill in smaller batches",
+                    crate::recorder::Recorder::split_point_x()
+                )));
+            }
             // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
             // (decode m=1, or the per-input-row GEMV) — the tiled coopmat/nc GEMMs below decode a
             // 64-row weight tile that can't be split into single input rows, so a breach on this
@@ -1855,14 +1912,29 @@ fn lower_op(
                         out_f,
                         &be_.cfg().kernels.vulkan,
                     ) {
-                    mmv_mw_choice(be_.caps(), &be_.cfg().kernels.vulkan, dt, in_f, out_f)
+                    mmv_mw_choice(
+                        be_.caps(),
+                        &be_.cfg().kernels.vulkan,
+                        dt,
+                        in_f,
+                        out_f,
+                        false,
+                    )
                 } else {
                     None
                 };
                 if let Some(warps) = mw {
                     // FUSE_QUANT opt-in: inline activation quantization, skip the
-                    // separate quant_q8 dispatch.
-                    if be_.cfg().kernels.vulkan.mmv_fuse_quant {
+                    // separate quant_q8 dispatch. Only some dtypes have that build.
+                    if be_.cfg().kernels.vulkan.mmv_fuse_quant
+                        && crate::recorder::mmv_mrow_fuseq_variant(
+                            &be_.cfg().kernels.vulkan,
+                            dt,
+                            in_f,
+                            false,
+                        )
+                        .is_some()
+                    {
                         rec.linear_mmv_mrow_fuseq(dt, w, w_off, xb, None, y, 1, in_f, out_f);
                         return Ok(());
                     }
@@ -2046,6 +2118,13 @@ fn lower_op(
                     ));
                 }
                 rec.store_f16(r(*src)?, r(*dst)?, *n as usize, *dst_off as usize);
+            } else if sdt != ddt {
+                // A byte copy between different dtypes reinterprets bits (an f16 row would land
+                // in an f32 buffer at half width); only F32→F16 has a converting kernel.
+                return Err(be(format!(
+                    "vulkan adapter: Op::Copy {sdt:?}→{ddt:?} has no conversion kernel (only \
+                     F32→F16, or a same-dtype copy)"
+                )));
             } else {
                 // IR offsets/counts are in ELEMENTS; the recorder copy takes BYTES.
                 let eb = sdt.dense_bytes(1).unwrap_or(4);
@@ -2249,6 +2328,15 @@ fn lower_op(
             // store→(later attention)read barrier survives. store_f16 keeps its bound/BDA fork below
             // (it also has a non-KV scratch caller), so `c_addr` is still computed for it.
             let c_addr = c.device_addr();
+            // `store_q8` quantizes one Q8_0 block per workgroup from a block-aligned offset, so a
+            // row that is not a whole number of blocks would straddle them.
+            let q8_block = infr_core::decode_spec::block_layout(infr_core::DType::Q8_0).0;
+            if cache_q8 && !rs.is_multiple_of(q8_block) {
+                return Err(be(format!(
+                    "vulkan adapter: Op::WriteKv into a Q8_0 cache needs a row width that is a \
+                     multiple of the {q8_block}-element block, got {rs}"
+                )));
+            }
             match mode {
                 RopeMode::Static(_) if cache_q8 => {
                     for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
@@ -2322,6 +2410,22 @@ fn lower_op(
             // see `kv_write_peephole`); `kcap` is the fused cache's row capacity for the DYNAMIC
             // path, where the row must be derived from the live params pos in-kernel (the ring
             // modulo rides the same params channel as the pos itself — never a baked constant).
+            // The strided (interleaved q+gate) kernels have no frequency-factor build and the ff
+            // builds read `x` densely, so the pair has no kernel at all — refuse rather than read
+            // the wrong rows.
+            if *x_stride > 0 && freq_factors.is_some() {
+                return Err(be(
+                    "vulkan adapter: Op::QkNormRope with both x_stride and freq_factors has no \
+                     kernel — the strided builds take no frequency factors",
+                ));
+            }
+            // `qk_norm_rope.comp` stages one head in `shared float xs[QK_NORM_ROPE_MAX_HD]`.
+            if *head_dim > QK_NORM_ROPE_MAX_HD {
+                return Err(be(format!(
+                    "vulkan adapter: Op::QkNormRope head_dim {head_dim} exceeds the kernel's \
+                     {QK_NORM_ROPE_MAX_HD}-element shared head buffer"
+                )));
+            }
             let (out_buf, fused, kcap) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
                 let row = (*n_head as usize) * (*head_dim as usize);
                 (r(cache)?, Some(pos), graph.desc(cache).numel() / row.max(1))
@@ -2417,6 +2521,18 @@ fn lower_op(
                     // by nheads*hd): 1 → write cache row pos, 0 → write row 0 of the Q scratch.
                     let out_base_mul = usize::from(fused.is_some());
                     if *x_stride > 0 && ff.is_none() {
+                        // The interleaved `_dyn` build writes row `pos` with no ring modulo (the
+                        // plain build takes `kcap`), so a replayed fused K write into a ring cache
+                        // would land past the ring once pos outran its rows.
+                        if let Some(&(cache, _)) = fused_kv_write.get(&op_idx) {
+                            if may_be_ring_cache(graph, cache) {
+                                return Err(be(
+                                    "vulkan adapter: record-once Op::QkNormRope with x_stride \
+                                     cannot write a sliding-window ring KV cache — the \
+                                     interleaved dyn kernel has no ring row mapping",
+                                ));
+                            }
+                        }
                         match y_addr {
                             Some(a) => rec.qk_norm_rope_interleaved_dyn_at(
                                 r(*x)?,
@@ -2592,6 +2708,15 @@ fn lower_op(
                         return Err(be(
                             "vulkan adapter: dynamic decode f32 in-place Rope unsupported",
                         ));
+                    }
+                    // `rope_f16_dyn` writes row `pos` with no ring modulo, so a replayed fused K
+                    // write into a ring cache would land past the ring once pos outran its rows.
+                    if let Some(&(cache, _)) = fused_kv_write.get(&op_idx) {
+                        if may_be_ring_cache(graph, cache) {
+                            return Err(be("vulkan adapter: record-once Op::Rope cannot write a \
+                                 sliding-window ring KV cache — rope_f16_dyn has no ring row \
+                                 mapping"));
+                        }
                     }
                     match y_addr {
                         Some(a) => rec.rope_f16_dyn_at(
@@ -3670,6 +3795,13 @@ fn lower_op(
                 *head_k as usize,
                 *head_v as usize,
             );
+            // Every DeltaNet kernel caches a key head in shared memory sized by `DN_MAX_KD`.
+            if kd_ > DN_MAX_KD {
+                return Err(be(format!(
+                    "vulkan adapter: Op::DeltaNet head_k {kd_} exceeds the kernels' \
+                     {DN_MAX_KD}-wide shared key-head buffers"
+                )));
+            }
             let chunked = rows_ >= 2 && be_.cfg().kernels.vulkan.dn_chunk;
             // DEFAULT prefill path: the token-serial scan with the state column register-resident
             // (norm + gates + seq). The chunked delta rule was believed to win by doing ⌈rows/32⌉
@@ -3732,6 +3864,12 @@ fn lower_op(
             // sequential one — chunked math doesn't require coopmat, only this particular prep
             // kernel's implementation does.
             if chunked && be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.dn_split {
+                if !kd_.is_multiple_of(DN_PREP_KSTEP) {
+                    return Err(be(format!(
+                        "vulkan adapter: Op::DeltaNet head_k {kd_} is not a multiple of the \
+                         chunked-split prep pass's {DN_PREP_KSTEP}-wide coopmat step"
+                    )));
+                }
                 let nchunk = rows_.div_ceil(32);
                 // alloc_uninit: every slot the scan reads is written by prep/gates first.
                 let kn =
@@ -3869,6 +4007,15 @@ fn lower_op(
             temp,
             top_p,
         } => {
+            // `sample_topk.comp` gathers candidates into `shared float gval[KMAX]`; a top_k of 1
+            // is greedy and belongs to `Op::Argmax`.
+            if !(2..=crate::gemm::SAMPLE_KMAX).contains(&(*top_k as usize)) {
+                return Err(be(format!(
+                    "vulkan adapter: Op::Sample top_k {top_k} is outside the GPU sampler's \
+                     2..={} range",
+                    crate::gemm::SAMPLE_KMAX
+                )));
+            }
             let cand = pooled(pool, be_, "sample_cand", 2 * 256 * *top_k as usize * 4)?;
             match mode {
                 // Record-once/self-advancing path (single-shot `execute` OR chained
@@ -4691,6 +4838,14 @@ fn lower_op(
                      {kv_lora_rank} + qk_rope_dim {qk_rope_dim} = key_len {} (max \
                      {MLA_MAX_KEY_LEN}), kv_lora_rank max {MLA_MAX_KV_LORA_RANK}",
                     *kv_lora_rank + *qk_rope_dim
+                )));
+            }
+            // `mla.comp` reads the latent cache as packed f16 pairs.
+            let kdt = graph.desc(*k_cache).dtype;
+            if kdt != infr_core::DType::F16 {
+                return Err(be(format!(
+                    "vulkan Op::Mla: the latent cache must be F16 (mla.comp reads packed f16 \
+                     pairs), got {kdt:?}"
                 )));
             }
             let key_len = (*kv_lora_rank + *qk_rope_dim) as usize;
@@ -10946,5 +11101,671 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `qk_norm_rope.comp` and `qk_norm_rope_interleaved.comp` stage a head in a shared array the
+    /// host bound `QK_NORM_ROPE_MAX_HD` must match; see `mla_shader_bounds_match_host`.
+    #[test]
+    fn qk_norm_rope_bound_matches_host() {
+        for (name, src) in [
+            (
+                "qk_norm_rope.comp",
+                include_str!("../shaders/qk_norm_rope.comp"),
+            ),
+            (
+                "qk_norm_rope_interleaved.comp",
+                include_str!("../shaders/qk_norm_rope_interleaved.comp"),
+            ),
+        ] {
+            assert_eq!(
+                glsl_define_u32(src, "QK_NORM_ROPE_MAX_HD"),
+                QK_NORM_ROPE_MAX_HD,
+                "{name}'s xs[] capacity drifted from the host guard"
+            );
+            assert!(
+                src.contains("shared float xs[QK_NORM_ROPE_MAX_HD];"),
+                "{name}'s xs[] is no longer sized by QK_NORM_ROPE_MAX_HD"
+            );
+        }
+    }
+
+    /// Every DeltaNet kernel that holds a key head in shared memory sizes it by `DN_MAX_KD`, and
+    /// the chunked-split prep pass steps the head by `DN_PREP_KSTEP`; the host refusals in the
+    /// `Op::DeltaNet` arm are only as good as these two mirrors.
+    #[test]
+    fn deltanet_bounds_match_host() {
+        for (name, src, decl) in [
+            (
+                "deltanet.comp",
+                include_str!("../shaders/deltanet.comp"),
+                "shared float ss[DN_MAX_KD * COL_BLOCK];",
+            ),
+            (
+                "deltanet_strided.comp",
+                include_str!("../shaders/deltanet_strided.comp"),
+                "shared float ss[DN_MAX_KD * COL_BLOCK];",
+            ),
+            (
+                "deltanet_scan.comp",
+                include_str!("../shaders/deltanet_scan.comp"),
+                "shared float ss[DN_MAX_KD * COLS];",
+            ),
+            (
+                "deltanet_chunked.comp",
+                include_str!("../shaders/deltanet_chunked.comp"),
+                "shared float kn[C * DN_MAX_KD];",
+            ),
+            (
+                "deltanet_prep.comp",
+                include_str!("../shaders/deltanet_prep.comp"),
+                "shared float kn[C * DN_MAX_KD];",
+            ),
+        ] {
+            assert_eq!(
+                glsl_define_u32(src, "DN_MAX_KD") as usize,
+                DN_MAX_KD,
+                "{name}'s key-head capacity drifted from the host guard"
+            );
+            assert!(
+                src.contains(decl),
+                "{name}'s shared key-head buffer is no longer sized by DN_MAX_KD"
+            );
+        }
+        let prep = include_str!("../shaders/deltanet_prep.comp");
+        assert_eq!(
+            glsl_define_u32(prep, "DN_PREP_KSTEP") as usize,
+            DN_PREP_KSTEP,
+            "deltanet_prep.comp's coopmat K step drifted from the host guard"
+        );
+        assert!(
+            prep.contains("kf += DN_PREP_KSTEP"),
+            "deltanet_prep.comp no longer steps the key head by DN_PREP_KSTEP"
+        );
+    }
+
+    /// `sample_topk.comp` gathers candidates into `shared float gval[KMAX]`; the `Op::Sample` guard
+    /// admits up to `gemm::SAMPLE_KMAX`.
+    #[test]
+    fn sample_kmax_matches_host() {
+        let src = include_str!("../shaders/sample_topk.comp");
+        assert_eq!(
+            glsl_define_u32(src, "KMAX") as usize,
+            crate::gemm::SAMPLE_KMAX,
+            "sample_topk.comp's KMAX drifted from SAMPLE_KMAX"
+        );
+        assert!(
+            src.contains("shared float gval[KMAX];"),
+            "sample_topk.comp's gval[] is no longer sized by KMAX"
+        );
+    }
+
+    /// The decode tier offers the int8 mrow kernel only when the EXACT build the recorder will
+    /// request exists: for every int8 decode dtype, layout knob and residual flag, a `Some` from
+    /// `mmv_mw_choice` must name a variant `mmv_mrow_variant` can load. The residual builds exist
+    /// only at `mmv_m4`, so with that knob off a fused decode must be declined, not offered.
+    #[test]
+    fn mmv_choice_offers_only_built_variants() {
+        let caps = infr_core::backend::Capabilities {
+            i8_dot: true,
+            ..Default::default()
+        };
+        let mut declined_res = 0;
+        for &dt in &POLICY_DTYPES {
+            for m4 in [false, true] {
+                for o4 in [false, true] {
+                    for res in [false, true] {
+                        for in_f in [1024usize, 4096] {
+                            let vk = infr_core::config::VulkanCfg {
+                                mmv_m4: m4,
+                                mmv_o4: o4,
+                                mmv_mw: Some(true),
+                                ..Default::default()
+                            };
+                            let out_f = 4096;
+                            let offered = mmv_mw_choice(&caps, &vk, dt, in_f, out_f, res);
+                            let built =
+                                crate::recorder::mmv_mrow_variant(&vk, dt, 1, in_f, res).is_some();
+                            if offered.is_some() {
+                                assert!(
+                                    built,
+                                    "{dt:?} m4={m4} o4={o4} res={res} in_f={in_f}: offered a \
+                                     variant the recorder has no build for"
+                                );
+                            } else if res && !m4 {
+                                declined_res += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            declined_res > 0,
+            "no fused decode was declined under mmv_m4=false — the check above never ran"
+        );
+    }
+
+    /// Compile and execute `g` once over zero-filled buffers, one per bound (non-Internal) tensor,
+    /// `usage` naming any that need something other than Weights/Activations (KV caches, the
+    /// positions staging buffer). The refusal tests below only need `lower_op` to run.
+    fn run_zeroed(be_: &VulkanBackend, g: &Graph, usage: &[(TensorId, BufferUsage)]) -> Result<()> {
+        let mut bufs = Vec::new();
+        for (i, t) in g.tensors.iter().enumerate() {
+            let id = TensorId(i as u32);
+            let u = match (usage.iter().find(|(u, _)| *u == id), &t.kind) {
+                (_, TensorKind::Internal) => continue,
+                (Some((_, u)), _) => *u,
+                (None, TensorKind::Weight) => BufferUsage::Weights,
+                (None, _) => BufferUsage::Activations,
+            };
+            let d = g.desc(id);
+            let (blk_elems, blk_bytes) = infr_core::decode_spec::block_layout(d.dtype);
+            bufs.push((
+                id,
+                be_.alloc((d.numel() / blk_elems * blk_bytes).max(4), u)?,
+            ));
+        }
+        let mut bind = Bindings::new();
+        for (id, b) in &bufs {
+            bind.bind(*id, b.as_ref());
+        }
+        let plan = be_.compile(g)?;
+        be_.execute(plan.as_ref(), &bind)
+    }
+
+    /// Assert `res` is an error whose text contains `want`.
+    fn refused(res: Result<()>, want: &str) {
+        let e = res
+            .err()
+            .unwrap_or_else(|| panic!("expected a refusal naming `{want}`, but it ran"))
+            .to_string();
+        assert!(e.contains(want), "refused for another reason: {e}");
+    }
+
+    /// Without `shaderFloat16` an f16-weight decode `Linear→Add` must stay unfused: the fused GEMV
+    /// (`linear_res.comp`) does f16 arithmetic the device was not created with. The pair must still
+    /// match the host, and the fused kernel must never have been built.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn f16_linear_add_stays_unfused_without_shader_float16() {
+        let mut cfg = crate::test_config();
+        cfg.kernels.vulkan.f16 = false;
+        let Ok(be_) = VulkanBackend::new_with(std::sync::Arc::new(cfg)) else {
+            return; // no GPU — self-skip
+        };
+        assert!(!be_.caps().f16, "`f16 = false` must clear caps.f16");
+        let (in_f, out_f) = (64usize, 32usize);
+        let x: Vec<f32> = (0..in_f).map(|i| i as f32 * 0.05 - 1.6).collect();
+        let w: Vec<f32> = (0..out_f * in_f).map(|i| (i as f32 * 0.03).sin()).collect();
+        let res: Vec<f32> = (0..out_f).map(|i| i as f32 * 0.25 - 4.0).collect();
+        let wf16 = infr_testkit::f16_bytes(&w);
+        let proj = infr_testkit::ref_linear(
+            &x,
+            &infr_testkit::dequant_oracle(DType::F16, &wf16),
+            1,
+            in_f,
+            out_f,
+        );
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+        let wi = g.weight(TensorDesc::new(vec![out_f, in_f], DType::F16));
+        let ri = g.input(TensorDesc::new(vec![1, out_f], DType::F32));
+        let yi = g.internal(TensorDesc::new(vec![1, out_f], DType::F32));
+        let oi = g.output(TensorDesc::new(vec![1, out_f], DType::F32));
+        g.push(Op::Linear {
+            x: xi,
+            weight: wi,
+            dst: yi,
+            m: 1,
+            in_f: in_f as u32,
+            out_f: out_f as u32,
+            w_off: 0,
+        });
+        g.push(Op::Add {
+            a: yi,
+            b: ri,
+            dst: oi,
+            n: out_f as u32,
+        });
+        let got = infr_testkit::run_graph(
+            &be_,
+            &g,
+            &[
+                (xi, infr_testkit::f32_bytes(&x)),
+                (wi, wf16),
+                (ri, infr_testkit::f32_bytes(&res)),
+            ],
+            oi,
+            out_f,
+        );
+        for o in 0..out_f {
+            let want = proj[o] + res[o];
+            assert!(
+                (got[o] - want).abs() < 1e-2,
+                "linear+add mismatch at {o}: got {} want {want}",
+                got[o]
+            );
+        }
+        assert!(
+            !be_.shared
+                .kernels
+                .lock()
+                .unwrap()
+                .contains_key("linear_res"),
+            "the f16 Linear+Add fused onto linear_res.comp on a device without shaderFloat16"
+        );
+    }
+
+    /// The int8 decode GEMV's opt-in knobs must never route a shape onto a build that does not
+    /// exist: `INFR_NO_MMV_M4` (no residual twin outside `m4`) on a fused decode `Linear→Add`, and
+    /// `INFR_MMV_FUSE_QUANT` (Q4_K/Q6_K builds only) on a default-set dtype outside that pair,
+    /// fused and plain. Each must run and match the host.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn int8_decode_knobs_never_request_a_missing_build() {
+        type Knob = fn(&mut infr_core::config::VulkanCfg);
+        let cases: [(&str, Knob, DType); 2] = [
+            ("mmv_m4 off", |v| v.mmv_m4 = false, DType::Q4K),
+            ("mmv_fuse_quant", |v| v.mmv_fuse_quant = true, DType::Q2K),
+        ];
+        // Above `mmv_mw_choice`'s size floor, so the int8 tier is the one taken.
+        let (in_f, out_f) = (2048usize, 1024usize);
+        for (name, knob, dt) in cases {
+            let mut cfg = crate::test_config();
+            knob(&mut cfg.kernels.vulkan);
+            let Ok(be_) = VulkanBackend::new_with(std::sync::Arc::new(cfg)) else {
+                return; // no GPU — self-skip
+            };
+            if !be_.caps().i8_dot {
+                eprintln!("skip {name}: the int8 decode tier needs packed int8 dot");
+                continue;
+            }
+            let (blk_elems, blk_bytes) = infr_core::decode_spec::block_layout(dt);
+            // 0x00..=0x3F keeps every f16 scale finite and small.
+            let wb: Vec<u8> = (0..out_f * in_f / blk_elems * blk_bytes)
+                .map(|i| ((i.wrapping_mul(2654435761) >> 7) % 0x40) as u8)
+                .collect();
+            let x: Vec<f32> = (0..in_f)
+                .map(|i| ((i % 97) as f32 - 48.0) * 0.021)
+                .collect();
+            let res: Vec<f32> = (0..out_f).map(|i| (i % 7) as f32 - 3.0).collect();
+            let proj = infr_testkit::ref_linear(
+                &x,
+                &infr_testkit::dequant_oracle(dt, &wb),
+                1,
+                in_f,
+                out_f,
+            );
+            for fused in [true, false] {
+                let mut g = Graph::new();
+                let xi = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+                let wi = g.weight(TensorDesc::new(vec![out_f, in_f], dt));
+                let ri = g.input(TensorDesc::new(vec![1, out_f], DType::F32));
+                let oi = g.output(TensorDesc::new(vec![1, out_f], DType::F32));
+                let yi = if fused {
+                    g.internal(TensorDesc::new(vec![1, out_f], DType::F32))
+                } else {
+                    oi
+                };
+                g.push(Op::Linear {
+                    x: xi,
+                    weight: wi,
+                    dst: yi,
+                    m: 1,
+                    in_f: in_f as u32,
+                    out_f: out_f as u32,
+                    w_off: 0,
+                });
+                if fused {
+                    g.push(Op::Add {
+                        a: yi,
+                        b: ri,
+                        dst: oi,
+                        n: out_f as u32,
+                    });
+                }
+                let got = infr_testkit::run_graph(
+                    &be_,
+                    &g,
+                    &[
+                        (xi, infr_testkit::f32_bytes(&x)),
+                        (wi, wb.clone()),
+                        (ri, infr_testkit::f32_bytes(&res)),
+                    ],
+                    oi,
+                    out_f,
+                );
+                let want: Vec<f32> = (0..out_f)
+                    .map(|o| proj[o] + if fused { res[o] } else { 0.0 })
+                    .collect();
+                let rms = (want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
+                    / want.len() as f64)
+                    .sqrt();
+                let worst = got.iter().zip(&want).fold(0f64, |a, (g, w)| {
+                    infr_testkit::nan_max64(a, (*g as f64 - *w as f64).abs())
+                });
+                assert!(
+                    worst / rms < 2e-2,
+                    "{name} {dt:?} fused={fused}: {:.2e} of the output RMS off the host",
+                    worst / rms
+                );
+            }
+        }
+    }
+
+    /// `Op::QkNormRope` shapes no kernel serves are refused by name: a strided `x` together with
+    /// frequency factors (the strided builds take none), and a head wider than the kernels'
+    /// shared head buffer. The neighbouring shapes — strided without factors, a head exactly at
+    /// the bound — still run.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn qk_norm_rope_unservable_shapes_are_refused() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let run = |hd: usize, strided: bool, ff: bool| {
+            let nh = 2usize;
+            let x_stride = if strided { 2 * nh * hd } else { 0 };
+            let mut g = Graph::new();
+            let x = g.input(TensorDesc::new(vec![2 * nh * hd], DType::F32));
+            let w = g.weight(TensorDesc::new(vec![hd], DType::F32));
+            let pos = g.input(TensorDesc::new(vec![1], DType::I32));
+            let f = ff.then(|| g.weight(TensorDesc::new(vec![hd / 2], DType::F32)));
+            let dst = g.output(TensorDesc::new(vec![nh * hd], DType::F16));
+            g.push(Op::QkNormRope {
+                x,
+                weight: w,
+                positions: pos,
+                dst,
+                rows: 1,
+                n_head: nh as u32,
+                head_dim: hd as u32,
+                rope_dim: hd as u32,
+                theta: 1e4,
+                eps: 1e-6,
+                freq_factors: f,
+                x_stride: x_stride as u32,
+            });
+            run_zeroed(&be_, &g, &[])
+        };
+        let max = QK_NORM_ROPE_MAX_HD as usize;
+        run(64, true, false).expect("strided x without factors must run");
+        run(64, false, true).expect("factors without a stride must run");
+        run(max, false, false).expect("a head at the bound must run");
+        refused(run(64, true, true), "both x_stride and freq_factors");
+        refused(run(max + 64, false, false), "exceeds the kernel's");
+    }
+
+    /// The record-once `_dyn` rope kernels without a ring row mapping (`rope_f16_dyn`, the
+    /// interleaved `qk_norm_rope`) must not take a fused K write into a cache a sliding-window
+    /// attention reads: once the position outran a ring's rows they would write past it. Refused
+    /// by name; the same graphs over a causal (full-context) cache still record and run.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn record_once_rope_into_a_ring_cache_is_refused() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (nh, nkv, hd, rows) = (2usize, 1usize, 64usize, 4usize);
+        let run = |interleaved: bool, mask: AttnMask| {
+            let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
+            let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+            let mut g = Graph::new();
+            let pos = g.input(TensorDesc::new(vec![1], DType::I32));
+            let kc = g.input(f16d(rows * nkv * hd));
+            let vc = g.input(f16d(rows * nkv * hd));
+            let q = g.input(f32d(nh * hd));
+            let q16 = g.internal(f16d(nh * hd));
+            let k16 = g.internal(f16d(nkv * hd));
+            let dst = g.output(f32d(nh * hd));
+            if interleaved {
+                let kx = g.input(f32d(2 * nkv * hd));
+                let kw = g.weight(f32d(hd));
+                g.push(Op::QkNormRope {
+                    x: kx,
+                    weight: kw,
+                    positions: pos,
+                    dst: k16,
+                    rows: 1,
+                    n_head: nkv as u32,
+                    head_dim: hd as u32,
+                    rope_dim: hd as u32,
+                    theta: 1e4,
+                    eps: 1e-6,
+                    freq_factors: None,
+                    x_stride: (2 * nkv * hd) as u32,
+                });
+            } else {
+                let kx = g.input(f32d(nkv * hd));
+                g.push(Op::Rope {
+                    x: kx,
+                    positions: pos,
+                    dst: k16,
+                    rows: 1,
+                    n_head: nkv as u32,
+                    head_dim: hd as u32,
+                    rope_dim: hd as u32,
+                    theta: 1e4,
+                    freq_factors: None,
+                    x_stride: 0,
+                    neox: false,
+                    backward: false,
+                });
+            }
+            g.push(Op::WriteKv {
+                src: k16,
+                cache: kc,
+                rows: 1,
+                row_stride: (nkv * hd) as u32,
+                pos: 0,
+            });
+            g.push(Op::Rope {
+                x: q,
+                positions: pos,
+                dst: q16,
+                rows: 1,
+                n_head: nh as u32,
+                head_dim: hd as u32,
+                rope_dim: hd as u32,
+                theta: 1e4,
+                freq_factors: None,
+                x_stride: 0,
+                neox: false,
+                backward: false,
+            });
+            g.push(Op::Attention {
+                q: q16,
+                k_cache: kc,
+                v_cache: vc,
+                dst,
+                rows: 1,
+                kv_len: 1,
+                n_head: nh as u32,
+                n_kv: nkv as u32,
+                head_dim: hd as u32,
+                scale: 1.0 / (hd as f32).sqrt(),
+                mask,
+                pos: 0,
+                sinks: None,
+                key_bias: None,
+            });
+            assert!(
+                decode_eligible(&be_, &g),
+                "the graph must take the record-once replay path"
+            );
+            run_zeroed(
+                &be_,
+                &g,
+                &[
+                    (pos, BufferUsage::Staging),
+                    (kc, BufferUsage::KvCache),
+                    (vc, BufferUsage::KvCache),
+                ],
+            )
+        };
+        for interleaved in [false, true] {
+            run(interleaved, AttnMask::Causal).unwrap_or_else(|e| {
+                panic!("interleaved={interleaved}: a full-context cache must still run: {e}")
+            });
+            refused(
+                run(interleaved, AttnMask::SlidingWindow(2)),
+                "sliding-window ring KV cache",
+            );
+        }
+    }
+
+    /// Kernel limits that used to be debug-only assertions are refused by name from `lower_op`,
+    /// in a release build too: the DeltaNet key head, the chunked-split prep step, the GPU
+    /// sampler's top-k range, a Q8_0 KV row that is not whole blocks, a non-f16 MLA latent cache,
+    /// and a byte copy between dtypes. Each limit's admissible neighbour still runs.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn op_limits_are_refused_by_name() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let f32d = |d: Vec<usize>| TensorDesc::new(d, DType::F32);
+
+        // DeltaNet: key head width.
+        let deltanet = |rows: usize, kd: usize| {
+            let (nv, nk, vd) = (1usize, 1usize, 32usize);
+            let mut g = Graph::new();
+            let q = g.input(f32d(vec![rows, nk * kd]));
+            let k = g.input(f32d(vec![rows, nk * kd]));
+            let v = g.input(f32d(vec![rows, nv * vd]));
+            let b = g.input(f32d(vec![rows, nv]));
+            let a = g.input(f32d(vec![rows, nv]));
+            let a_coef = g.weight(f32d(vec![nv]));
+            let dt_bias = g.weight(f32d(vec![nv]));
+            let state = g.input(f32d(vec![nv * kd * vd]));
+            let dst = g.output(f32d(vec![rows, nv * vd]));
+            g.push(Op::DeltaNet {
+                q,
+                k,
+                v,
+                b,
+                a,
+                a_coef,
+                dt_bias,
+                state,
+                dst,
+                rows: rows as u32,
+                n_vhead: nv as u32,
+                n_khead: nk as u32,
+                head_k: kd as u32,
+                head_v: vd as u32,
+                eps: 1e-6,
+                src_stride: 0,
+            });
+            run_zeroed(&be_, &g, &[])
+        };
+        deltanet(1, DN_MAX_KD).expect("a key head at the bound must run");
+        refused(deltanet(1, DN_MAX_KD + 1), "Op::DeltaNet head_k");
+        // A chunked batch on a key head that is not whole prep steps: the coopmat chunked-split
+        // path refuses it, the other chunked paths serve it.
+        let odd = DN_MAX_KD - DN_PREP_KSTEP / 2;
+        if be_.caps().f16_coopmat() {
+            refused(deltanet(2, odd), "chunked-split prep pass");
+        } else {
+            deltanet(2, odd).expect("no chunked-split path here: the monolithic kernel serves it");
+        }
+
+        // Sample: the GPU sampler's top-k range.
+        let sample = |top_k: u32| {
+            let n = 1024usize;
+            let mut g = Graph::new();
+            let x = g.input(f32d(vec![n]));
+            let u = g.input(f32d(vec![1]));
+            let dst = g.output(TensorDesc::new(vec![1], DType::I32));
+            g.push(Op::Sample {
+                x,
+                u,
+                dst,
+                n: n as u32,
+                top_k,
+                temp: 1.0,
+                top_p: 1.0,
+            });
+            run_zeroed(&be_, &g, &[])
+        };
+        let kmax = crate::gemm::SAMPLE_KMAX as u32;
+        sample(2).expect("top_k 2 must run");
+        sample(kmax).expect("top_k at the bound must run");
+        refused(sample(kmax + 1), "Op::Sample top_k");
+        refused(sample(1), "Op::Sample top_k");
+
+        // WriteKv into a Q8_0 cache: whole blocks per row.
+        let q8_block = infr_core::decode_spec::block_layout(DType::Q8_0).0;
+        let write_q8 = |rs: usize| {
+            let rows_cap = 4usize;
+            let mut g = Graph::new();
+            let src = g.input(f32d(vec![rs]));
+            let cache = g.input(TensorDesc::new(vec![rows_cap * rs], DType::Q8_0));
+            g.push(Op::WriteKv {
+                src,
+                cache,
+                rows: 1,
+                row_stride: rs as u32,
+                pos: 1,
+            });
+            run_zeroed(&be_, &g, &[(cache, BufferUsage::KvCache)])
+        };
+        write_q8(2 * q8_block).expect("a whole-block Q8_0 row must run");
+        refused(write_q8(q8_block + q8_block / 2), "multiple of the");
+
+        // Mla: the latent cache must be f16.
+        let mla = |cache_dt: DType| {
+            let (rows, n_head, kv_lora, rope, nope, vd) = (1usize, 1, 8usize, 4usize, 2usize, 2);
+            let key_len = kv_lora + rope;
+            let mut g = Graph::new();
+            let q = g.input(f32d(vec![rows, n_head, nope + rope]));
+            let k_cache = g.input(TensorDesc::new(vec![rows, key_len], cache_dt));
+            let wk_b = g.weight(f32d(vec![n_head, kv_lora, nope]));
+            let wv_b = g.weight(f32d(vec![n_head, kv_lora, vd]));
+            let dst = g.output(f32d(vec![rows, n_head, vd]));
+            g.push(Op::Mla {
+                q,
+                k_cache,
+                wk_b,
+                wv_b,
+                dst,
+                rows: rows as u32,
+                kv_len: rows as u32,
+                n_head: n_head as u32,
+                q_head_dim: (nope + rope) as u32,
+                kv_lora_rank: kv_lora as u32,
+                qk_nope_dim: nope as u32,
+                qk_rope_dim: rope as u32,
+                v_head_dim: vd as u32,
+                scale: 1.0,
+                mask: AttnMask::Causal,
+                pos: 0,
+                theta: 10000.0,
+                freq_factors: None,
+                key_bias: None,
+            });
+            run_zeroed(&be_, &g, &[])
+        };
+        mla(DType::F16).expect("an f16 latent cache must run");
+        refused(mla(DType::F32), "latent cache must be F16");
+
+        // Copy: only identity copies and F32→F16 convert.
+        let copy = |sdt: DType, ddt: DType| {
+            let mut g = Graph::new();
+            let src = g.input(TensorDesc::new(vec![8], sdt));
+            let dst = g.output(TensorDesc::new(vec![8], ddt));
+            g.push(Op::Copy {
+                src,
+                src_off: 0,
+                dst,
+                dst_off: 0,
+                n: 8,
+            });
+            run_zeroed(&be_, &g, &[])
+        };
+        copy(DType::F16, DType::F16).expect("an identity copy must run");
+        copy(DType::F32, DType::F16).expect("the F32→F16 conversion must run");
+        refused(copy(DType::F16, DType::F32), "Op::Copy F16→F32");
+        refused(copy(DType::I32, DType::F32), "Op::Copy I32→F32");
     }
 }

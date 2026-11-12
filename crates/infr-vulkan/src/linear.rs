@@ -454,17 +454,22 @@ mod tests {
                 gemm::native_mmv_mrow_m16_spv(d).map(|(n, _)| n),
                 "native_mmv_mrow_m16 gate vs spv disagree for {d:?}"
             );
-            for o4 in [false, true] {
-                for m4 in [false, true] {
-                    for res in [false, true] {
-                        assert_eq!(
-                            gemm::native_mmv_mrow_variant_kernel_name(d, o4, m4, res),
-                            gemm::native_mmv_mrow_variant_spv(d, o4, m4, res).map(|(n, _)| n),
-                            "native_mmv_mrow_variant gate vs spv disagree {d:?} o4={o4} m4={m4} res={res}"
-                        );
-                    }
-                }
-            }
+            assert_eq!(
+                gemm::native_mrow_kernel_name(d),
+                gemm::native_mrow_spv(d).map(|(n, _)| n),
+                "native_mrow gate vs spv disagree for {d:?}"
+            );
+            assert_eq!(
+                gemm::native_gemm_fma_kernel_name(d),
+                gemm::native_gemm_fma_spv(d).map(|(n, _)| n),
+                "native_gemm_fma gate vs spv disagree for {d:?}"
+            );
+            // The non-coopmat mmq tier gates on `moe_mmq_ok` and loads this table.
+            assert_eq!(
+                infr_core::tensor::moe_mmq_ok(d),
+                gemm::native_gemm_mmq_dense_spv(d).is_some(),
+                "nc_mmq gate vs native_gemm_mmq_dense_spv availability disagree for {d:?}"
+            );
             for &warps in &[1u32, 2, 4, 8, 16] {
                 for res in [false, true] {
                     for sg16 in [false, true] {
@@ -480,29 +485,26 @@ mod tests {
     }
 
     /// AUDIT #2: Iq4Xs is mrow-eligible (`native_mmv_mrow_kernel_name` = Some) but has NO fused-
-    /// residual build — the res-legality predicate must report that, and the variant table must
-    /// agree, so `linear_mmv_mrow_at`'s residual assert catches an illegal residual Iq4Xs decode at
-    /// the boundary instead of panicking in the SPV `expect()`.
+    /// residual build — the variant lookup the decode gate and the recorder share must report
+    /// that, so a residual Iq4Xs decode is never routed onto the int8 mrow kernel.
     #[test]
     fn iq4xs_reports_no_mrow_residual() {
         use crate::gemm;
         use infr_core::DType::{Iq4Xs, Q4K};
+        let vk = infr_core::config::VulkanCfg::default();
         assert!(
             gemm::native_mmv_mrow_kernel_name(Iq4Xs).is_some(),
             "Iq4Xs should still be plain-mrow eligible"
         );
-        assert!(
-            !gemm::native_mmv_mrow_res_supported(Iq4Xs),
-            "Iq4Xs has no _res mrow build — predicate must say so"
-        );
-        assert!(
-            gemm::native_mmv_mrow_variant_spv(Iq4Xs, false, true, true).is_none(),
-            "Iq4Xs _res variant must not exist"
-        );
-        // A dtype that DOES have the residual build reports true, so the predicate isn't vacuously
-        // false for everyone.
-        assert!(gemm::native_mmv_mrow_res_supported(Q4K));
-        assert!(gemm::native_mmv_mrow_variant_spv(Q4K, false, true, true).is_some());
+        for in_f in [1024, 4096] {
+            assert!(
+                crate::recorder::mmv_mrow_variant(&vk, Iq4Xs, 1, in_f, true).is_none(),
+                "Iq4Xs has no _res mrow build — the lookup must say so (in_f={in_f})"
+            );
+            // A dtype that DOES have the residual build reports it, so the lookup isn't vacuously
+            // empty for everyone.
+            assert!(crate::recorder::mmv_mrow_variant(&vk, Q4K, 1, in_f, true).is_some());
+        }
     }
 
     #[test]

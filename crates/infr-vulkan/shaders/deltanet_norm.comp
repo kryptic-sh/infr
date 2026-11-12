@@ -27,8 +27,13 @@ layout(binding = 3) writeonly buffer QN { float qng[]; }; // [rows, nk*kd] qÌ‚ Ã
 
 void main() {
     uint lane = gl_LocalInvocationID.x;
-    uint tok = gl_WorkGroupID.x / pc.nk;
-    uint kh = gl_WorkGroupID.x % pc.nk;
+    // Flat (token, k-head) index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_WorkGroupID.x` when unsplit. A padding
+    // workgroup returns whole, before any subgroup op, so control flow stays uniform.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.nk) { return; }
+    uint tok = unit / pc.nk;
+    uint kh = unit % pc.nk;
     uint base = tok * pc.nk * pc.kd + kh * pc.kd;
 
     float ks = 0.0, qs = 0.0;

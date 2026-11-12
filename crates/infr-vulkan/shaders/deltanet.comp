@@ -14,6 +14,9 @@
 layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
 
 #define COL_BLOCK 32u
+// Widest head_k_dim the shared-memory state/row buffers hold; the host refuses wider heads
+// (`DN_MAX_KD` in src/adapter.rs mirrors this value).
+#define DN_MAX_KD 128u
 
 layout(push_constant) uniform PC {
     uint rows;   // tokens to process in sequence (state carried across)
@@ -35,9 +38,9 @@ layout(binding = 6) readonly buffer DTB { float dtbias[]; };  // [nv]
 layout(binding = 7) buffer SB { float state[]; };             // [nv*kd*vd] in/out
 layout(binding = 8) writeonly buffer OB { float outp[]; };    // [nv*vd]
 
-shared float ss[128u * COL_BLOCK]; // state block [kd, COL_BLOCK] cached in LDS (kd ≤ 128)
-shared float qn[128];              // normalized q for the current token (kd ≤ 128)
-shared float kn[128];              // normalized k
+shared float ss[DN_MAX_KD * COL_BLOCK]; // state block [kd, COL_BLOCK] cached in LDS
+shared float qn[DN_MAX_KD];            // normalized q for the current token
+shared float kn[DN_MAX_KD];            // normalized k
 shared float red[32];
 
 void main() {

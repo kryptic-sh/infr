@@ -24,6 +24,12 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 #define C 32u
+// Widest head_k_dim the shared-memory state/row buffers hold; the host refuses wider heads
+// (`DN_MAX_KD` in src/adapter.rs mirrors this value).
+#define DN_MAX_KD 128u
+// K extent of one f16 coopmat fragment of the D/Dq contraction loop; the host refuses a
+// head_k_dim that is not a whole number of them (`DN_PREP_KSTEP` in src/adapter.rs).
+#define DN_PREP_KSTEP 16u
 
 layout(push_constant) uniform PC {
     uint rows;
@@ -40,10 +46,10 @@ layout(binding = 3) writeonly buffer QN { float qng[]; }; // [rows, nk*kd] norma
 layout(binding = 4) writeonly buffer DK { float dk[]; };  // [nchunk, nk, C, C], l<j
 layout(binding = 5) writeonly buffer DQ { float dq[]; };  // [nchunk, nk, C, C], j≤i
 
-shared float kn[C * 128u];
-shared float qn[C * 128u];
-shared float16_t knf[C * 128u]; // f16 mirror of kn, coopmat A/B operand (row j, col kk, stride 128)
-shared float16_t qnf[C * 128u]; // f16 mirror of qn
+shared float kn[C * DN_MAX_KD];
+shared float qn[C * DN_MAX_KD];
+shared float16_t knf[C * DN_MAX_KD]; // f16 mirror of kn, coopmat A/B operand (row j, col kk, stride DN_MAX_KD)
+shared float16_t qnf[C * DN_MAX_KD]; // f16 mirror of qn
 shared float red[256];
 shared float nrm[C];
 
@@ -60,8 +66,8 @@ void main() {
         uint j = p / kd;
         uint kk = p % kd;
         uint src = (base + j) * pc.nk * kd + kh * kd + kk;
-        kn[j * 128u + kk] = k[src];
-        qn[j * 128u + kk] = q[src];
+        kn[j * DN_MAX_KD + kk] = k[src];
+        qn[j * DN_MAX_KD + kk] = q[src];
     }
     barrier();
 
@@ -71,7 +77,7 @@ void main() {
         uint lane = t & 7u;
         float ks = 0.0;
         if (j < c) {
-            for (uint kk = lane; kk < kd; kk += 8u) { float x = kn[j * 128u + kk]; ks += x * x; }
+            for (uint kk = lane; kk < kd; kk += 8u) { float x = kn[j * DN_MAX_KD + kk]; ks += x * x; }
         }
         red[t] = ks;
         barrier();
@@ -85,7 +91,7 @@ void main() {
         barrier(); // nrm reused for q
         float qs = 0.0;
         if (j < c) {
-            for (uint kk = lane; kk < kd; kk += 8u) { float x = qn[j * 128u + kk]; qs += x * x; }
+            for (uint kk = lane; kk < kd; kk += 8u) { float x = qn[j * DN_MAX_KD + kk]; qs += x * x; }
         }
         red[t] = qs;
         barrier();
@@ -98,8 +104,8 @@ void main() {
         if (j < c) {
             float qinv = pc.qscale / nrm[j];
             for (uint kk = lane; kk < kd; kk += 8u) {
-                kn[j * 128u + kk] *= kinv;
-                qn[j * 128u + kk] *= qinv;
+                kn[j * DN_MAX_KD + kk] *= kinv;
+                qn[j * DN_MAX_KD + kk] *= qinv;
             }
         }
     }
@@ -110,8 +116,8 @@ void main() {
         uint j = p / kd;
         uint kk = p % kd;
         uint dst = (base + j) * pc.nk * kd + kh * kd + kk;
-        kng[dst] = kn[j * 128u + kk];
-        qng[dst] = qn[j * 128u + kk];
+        kng[dst] = kn[j * DN_MAX_KD + kk];
+        qng[dst] = qn[j * DN_MAX_KD + kk];
     }
 
     // f16 mirror for the coopmat contraction (f32 accumulate downstream keeps precision; matches
@@ -122,14 +128,14 @@ void main() {
     for (uint p = t; p < c * kd; p += 256u) {
         uint j = p / kd;
         uint kk = p % kd;
-        knf[j * 128u + kk] = float16_t(kn[j * 128u + kk]);
-        qnf[j * 128u + kk] = float16_t(qn[j * 128u + kk]);
+        knf[j * DN_MAX_KD + kk] = float16_t(kn[j * DN_MAX_KD + kk]);
+        qnf[j * DN_MAX_KD + kk] = float16_t(qn[j * DN_MAX_KD + kk]);
     }
     for (uint p = t + c * kd; p < C * kd; p += 256u) {
         uint j = p / kd;
         uint kk = p % kd;
-        knf[j * 128u + kk] = float16_t(0.0);
-        qnf[j * 128u + kk] = float16_t(0.0);
+        knf[j * DN_MAX_KD + kk] = float16_t(0.0);
+        qnf[j * DN_MAX_KD + kk] = float16_t(0.0);
     }
     barrier();
 
@@ -145,13 +151,13 @@ void main() {
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 = acc00;
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 = acc00;
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 = acc00;
-        for (uint kf = 0u; kf < kd; kf += 16u) {
+        for (uint kf = 0u; kf < kd; kf += DN_PREP_KSTEP) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a0, a1;
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0, b1;
-            coopMatLoad(a0, knf, 0u * 128u + kf, 128u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(a1, knf, 16u * 128u + kf, 128u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(b0, knf, 0u * 128u + kf, 128u, gl_CooperativeMatrixLayoutColumnMajor);
-            coopMatLoad(b1, knf, 16u * 128u + kf, 128u, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(a0, knf, 0u * DN_MAX_KD + kf, DN_MAX_KD, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, knf, 16u * DN_MAX_KD + kf, DN_MAX_KD, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, knf, 0u * DN_MAX_KD + kf, DN_MAX_KD, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, knf, 16u * DN_MAX_KD + kf, DN_MAX_KD, gl_CooperativeMatrixLayoutColumnMajor);
             acc00 = coopMatMulAdd(a0, b0, acc00);
             acc01 = coopMatMulAdd(a0, b1, acc01);
             acc10 = coopMatMulAdd(a1, b0, acc10);
@@ -167,13 +173,13 @@ void main() {
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc01 = acc00;
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc10 = acc00;
         coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc11 = acc00;
-        for (uint kf = 0u; kf < kd; kf += 16u) {
+        for (uint kf = 0u; kf < kd; kf += DN_PREP_KSTEP) {
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a0, a1;
             coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b0, b1;
-            coopMatLoad(a0, qnf, 0u * 128u + kf, 128u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(a1, qnf, 16u * 128u + kf, 128u, gl_CooperativeMatrixLayoutRowMajor);
-            coopMatLoad(b0, knf, 0u * 128u + kf, 128u, gl_CooperativeMatrixLayoutColumnMajor);
-            coopMatLoad(b1, knf, 16u * 128u + kf, 128u, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(a0, qnf, 0u * DN_MAX_KD + kf, DN_MAX_KD, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, qnf, 16u * DN_MAX_KD + kf, DN_MAX_KD, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(b0, knf, 0u * DN_MAX_KD + kf, DN_MAX_KD, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, knf, 16u * DN_MAX_KD + kf, DN_MAX_KD, gl_CooperativeMatrixLayoutColumnMajor);
             acc00 = coopMatMulAdd(a0, b0, acc00);
             acc01 = coopMatMulAdd(a0, b1, acc01);
             acc10 = coopMatMulAdd(a1, b0, acc10);

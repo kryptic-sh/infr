@@ -31,24 +31,8 @@ include!(concat!(env!("OUT_DIR"), "/native_gemm_map.rs"));
 /// build) is loaded via [`native_mrow_spv`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
-    use infr_core::DType::*;
-    Some(match dtype {
-        Q8_0 => "native_mrow_q8_0",
-        Bf16 => "native_mrow_bf16",
-        Q4_0 => "native_mrow_q4_0",
-        Q4_1 => "native_mrow_q4_1",
-        Q5_0 => "native_mrow_q5_0",
-        Q5_1 => "native_mrow_q5_1",
-        Q2K => "native_mrow_q2k",
-        Q3K => "native_mrow_q3k",
-        Q4K => "native_mrow_q4k",
-        Q5K => "native_mrow_q5k",
-        Q6K => "native_mrow_q6k",
-        Iq4Nl => "native_mrow_iq4nl",
-        Iq4Xs => "native_mrow_iq4xs",
-        Q2_0 => "native_mrow_q2_0",
-        _ => return None,
-    })
+    // Delegate to the SPIR-V table the recorder loads, so the gate cannot name a missing build.
+    native_mrow_spv(dtype).map(|(name, _)| name)
 }
 
 /// The dense layer-streaming decode GEMV (kernel-cache name + SPIR-V): reads the weight from a
@@ -575,30 +559,6 @@ pub(crate) fn native_mmv_mrow_kernel_name(dtype: infr_core::DType) -> Option<&'s
     // SPIR-V source of truth so the availability gate can never drift from the shader (AUDIT #1).
     native_mmv_mrow_variant_spv(dtype, false, false, false).map(|(name, _)| name)
 }
-/// Whether the multi-row int8 dp4a GEMV family has a fused-residual (`-DUSE_RES`) build for `dtype`.
-/// The residual arm is only ever declared at `m4 = true` (decode is always `rows == 1`), so this
-/// probes exactly that build. Iq4Xs is the sole mrow-eligible dtype WITHOUT a `_res` twin, which is
-/// why `linear_mmv_mrow_at` and the adapter must consult this predicate before dispatching a
-/// residual mrow decode (AUDIT #2) rather than assuming a plain build implies a res build.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_res_supported(dtype: infr_core::DType) -> bool {
-    native_mmv_mrow_variant_spv(dtype, false, true, true).is_some()
-}
-/// SPIR-V for a multi-row int8 dp4a GEMV layout variant: `o4` = the small-in_f 4-outputs ×
-/// 16-K-lanes workgroup split (-DOUTS4), `m4` = the rows<=4 MR specialization (-DMRV=4), `res` =
-/// the fused-residual decode build (-DUSE_RES, only ever paired with rows=1, hence requires
-/// `m4=true`; see `Recorder::linear_mmv_mrow`'s gates and its doc on the rows=1 decode/verify
-/// unification).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_variant_kernel_name(
-    dtype: infr_core::DType,
-    o4: bool,
-    m4: bool,
-    res: bool,
-) -> Option<&'static str> {
-    // Delegate to the SPIR-V source of truth so gate and shader can never drift (AUDIT #1).
-    native_mmv_mrow_variant_spv(dtype, o4, m4, res).map(|(name, _)| name)
-}
 /// Kernel-cache NAME for the rows 9..=16 multi-row int8 dp4a GEMV tier (`-DMRV=16`, 2-output layout
 /// — no OUTS4 twin: the tier is gated to >= 8M-element weights, whose in_f is comfortably >= 2048);
 /// the SPIR-V lives in [`native_mmv_mrow_m16_spv`]. `None` = format not covered (same coverage as
@@ -641,11 +601,13 @@ pub(crate) fn native_mmv_spv(
         _ => None,
     }
 }
-/// `-DSTREAMED` twin of [`native_mmv_mrow_variant_kernel_name`] (kernel-cache name + SPIR-V), covering the
-/// rows<=8 layout matrix (`o4`/`m4`/`res`). `res` mirrors [`native_mmv_mrow_variant_kernel_name`]'s residual
-/// arm — build-declared ONLY at `m4 = true` (the decode Linear+Add fusion always dispatches this
-/// shader at `rows = 1`, which forces `m4 = true`; see [`crate::recorder::Recorder::linear_mmv_mrow`]'s
-/// doc) and NEVER for `Iq4Xs` (no `-DUSE_RES` build exists for that dtype in this family). `res =
+/// SPIR-V (kernel-cache name + words) for a multi-row int8 dp4a GEMV layout variant, covering the
+/// rows<=8 layout matrix: `o4` = the small-in_f 4-outputs × 16-K-lanes workgroup split
+/// (-DOUTS4), `m4` = the rows<=4 MR specialization (-DMRV=4), `res` = the fused-residual decode
+/// build (-DUSE_RES) — build-declared ONLY at `m4 = true` (the decode Linear+Add fusion always
+/// dispatches this shader at `rows = 1`; see [`crate::recorder::Recorder::linear_mmv_mrow`]'s
+/// doc) and NEVER for `Iq4Xs` (no `-DUSE_RES` build exists for that dtype in this family). Callers
+/// select through [`crate::recorder::mmv_mrow_variant`], which applies the layout knobs. `res =
 /// true` is load-bearing for [`crate::recorder::Recorder::linear_mmv_mrow_at`]'s residual
 /// path, not just a parity-test convenience.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -740,28 +702,6 @@ pub(crate) fn native_mmv_mrow_variant_spv(
         (Iq4Nl, true, true, true) => v!("native_mmv_mrow_iq4nl_o4_m4_res"),
         _ => None,
     }
-}
-
-/// FUSE_QUANT twin of [`native_mmv_mrow_variant_kernel_name`] — inline activation quantization,
-/// opt-in behind INFR_MMV_FUSE_QUANT=1. Q4_K/Q6_K only, m4=true + res combos only (decode).
-pub(crate) fn native_mmv_mrow_variant_fuseq_kernel_name(
-    dtype: infr_core::DType,
-    o4: bool,
-    _m4: bool,
-    res: bool,
-) -> Option<&'static str> {
-    use infr_core::DType::*;
-    Some(match (dtype, o4, res) {
-        (Q4K, false, false) => "native_mmv_mrow_q4k_m4_fuseq",
-        (Q4K, true, false) => "native_mmv_mrow_q4k_o4_m4_fuseq",
-        (Q4K, false, true) => "native_mmv_mrow_q4k_m4_res_fuseq",
-        (Q4K, true, true) => "native_mmv_mrow_q4k_o4_m4_res_fuseq",
-        (Q6K, false, false) => "native_mmv_mrow_q6k_m4_fuseq",
-        (Q6K, true, false) => "native_mmv_mrow_q6k_o4_m4_fuseq",
-        (Q6K, false, true) => "native_mmv_mrow_q6k_m4_res_fuseq",
-        (Q6K, true, true) => "native_mmv_mrow_q6k_o4_m4_res_fuseq",
-        _ => return None,
-    })
 }
 
 /// FUSE_QUANT twin of [`native_mmv_mrow_variant_spv`] — kernel-cache name + SPIR-V for the
@@ -1050,13 +990,8 @@ pub(crate) fn native_gemm_fma_spv(
 /// `None` for any other dtype.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_fma_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
-    use infr_core::DType::*;
-    Some(match dtype {
-        F16 => "native_gemm_fma_f16",
-        Bf16 => "native_gemm_fma_bf16",
-        F32 => "native_gemm_fma_f32",
-        _ => return None,
-    })
+    // Delegate to the SPIR-V table the recorder loads, so the gate cannot name a missing build.
+    native_gemm_fma_spv(dtype).map(|(name, _)| name)
 }
 /// SPIR-V for the non-coopmat shared-memory fma flash-attention prefill (the "nc_fa" tier, see
 /// `attn_nc_fa.comp`): fused QK^T → online softmax → PV for devices without a usable f16 coopmat

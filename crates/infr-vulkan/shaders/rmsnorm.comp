@@ -74,7 +74,11 @@ layout(binding = 2) buffer YB { float y[]; };
 shared float part[NSGMAX];
 
 void main() {
-    uint r = gl_WorkGroupID.x;
+    // Flat row index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_WorkGroupID.x` when unsplit. A padding
+    // workgroup returns whole, before any barrier or subgroup op, so control flow stays uniform.
+    uint r = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (r >= pc.rows) { return; }
     uint t = gl_LocalInvocationIndex;
 
 #ifdef WIDE

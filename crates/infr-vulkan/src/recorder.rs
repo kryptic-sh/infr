@@ -668,6 +668,45 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
 /// reads the environment and nothing latches process-wide.
 const BDA_CHUNK_UNIT_MAX: u64 = 1 << 32;
 
+/// The int8 dp4a multi-row GEMV build [`Recorder::linear_mmv_mrow_at`] dispatches for `rows`
+/// activation rows of width `in_f`, under `vk`'s layout knobs (`mmv_o4`, `mmv_m4`), with or
+/// without the fused residual: `(kernel name, SPIR-V, outputs per workgroup)`. `None` when no
+/// such build exists, so a tier gate that asks this before choosing the kernel can never pick a
+/// variant the recorder would then fail to find — the variant tables are sparse (the residual
+/// builds exist only at `m4`, none at all for some dtypes, and rows past 8 have no residual twin).
+pub(crate) fn mmv_mrow_variant(
+    vk: &infr_core::config::VulkanCfg,
+    dtype: infr_core::DType,
+    rows: usize,
+    in_f: usize,
+    res: bool,
+) -> Option<(&'static str, &'static [u32], u32)> {
+    if rows > 8 {
+        if res {
+            return None;
+        }
+        return crate::gemm::native_mmv_mrow_m16_spv(dtype).map(|(n, s)| (n, s, 2));
+    }
+    let o4 = in_f < 2048 && vk.mmv_o4;
+    let m4 = rows <= 4 && vk.mmv_m4;
+    crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
+        .map(|(n, s)| (n, s, if o4 { 4 } else { 2 }))
+}
+
+/// The FUSE_QUANT (`INFR_MMV_FUSE_QUANT`) twin of [`mmv_mrow_variant`] for a single decode row —
+/// the build [`Recorder::linear_mmv_mrow_fuseq`] dispatches. Only a few dtypes have one; `None`
+/// sends the caller to the separate-`quant_q8` route.
+pub(crate) fn mmv_mrow_fuseq_variant(
+    vk: &infr_core::config::VulkanCfg,
+    dtype: infr_core::DType,
+    in_f: usize,
+    res: bool,
+) -> Option<(&'static str, &'static [u32], u32)> {
+    let o4 = in_f < 2048 && vk.mmv_o4;
+    crate::gemm::native_mmv_mrow_variant_fuseq_spv(dtype, o4, true, res)
+        .map(|(n, s)| (n, s, if o4 { 4 } else { 2 }))
+}
+
 /// `(elem_cap, byte_cap)` from a backend's Vulkan config. `None` (unset, or a value below 2, which
 /// can never fit even one row) = the real u32 cap — exactly what `cap_from_env`'s
 /// `.filter(|&n| n >= 2).unwrap_or(BDA_CHUNK_UNIT_MAX)` did.
@@ -1341,7 +1380,7 @@ impl<'a> Recorder<'a> {
     /// lower it, because a device whose real limit is far above the guaranteed minimum (RADV)
     /// never splits a grid small enough to test, so neither the split nor the paired shader's
     /// index recovery would otherwise run.
-    fn split_point_x() -> u32 {
+    pub(crate) fn split_point_x() -> u32 {
         #[cfg(test)]
         if let Some(x) = tests::WIDE_SPLIT_AT.with(std::cell::Cell::get) {
             return x;
@@ -3587,25 +3626,18 @@ impl<'a> Recorder<'a> {
             residual.is_none() || rows == 1,
             "fused residual is decode-only (rows=1)"
         );
-        // Explicit res-legality gate (AUDIT #2): not every mrow-eligible dtype has a fused-residual
-        // build (Iq4Xs has none). Assert on the predicate so an illegal residual decode is caught
-        // here with a clear message rather than in the SPV `expect()` below.
-        debug_assert!(
-            residual.is_none() || crate::gemm::native_mmv_mrow_res_supported(dtype),
-            "no fused-residual mrow build for {dtype:?} — dtype is decode-eligible but res-illegal"
-        );
         assert_native_k("linear_mmv_mrow_at", in_f);
         self.label_gemv("mmvr_streamed", rows, in_f, out_f);
-        let o4 = in_f < 2048 && self.vk().mmv_o4;
-        let m4 = rows <= 4 && self.vk().mmv_m4;
         let res = residual.is_some();
-        let (name, spv) = if rows > 8 {
-            crate::gemm::native_mmv_mrow_m16_spv(dtype).expect("native mmv mrow m16 streamed spv")
-        } else {
-            crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
-                .expect("native mmv mrow streamed spv")
-        };
-        let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
+        // Callers gate on this same lookup (`mmv_mrow_variant`), so a miss is a caller bug.
+        let (name, spv, outs) =
+            mmv_mrow_variant(self.vk(), dtype, rows, in_f, res).unwrap_or_else(|| {
+                panic!(
+                    "linear_mmv_mrow_at: no int8 mrow build for {dtype:?} rows={rows} \
+                     in_f={in_f} residual={res} under the mmv_o4/mmv_m4 knobs"
+                )
+            });
+        let groups = (out_f as u32).div_ceil(outs);
         let nbind = if res { 6 } else { 5 };
         let k = self.be.kernel(name, spv, nbind, 24);
         let mut push = [0u8; 24];
@@ -3746,11 +3778,12 @@ impl<'a> Recorder<'a> {
         let arena_addr = w
             .device_addr()
             .expect("resident-BDA weight: linear_mmv_mrow_fuseq requires a u64 BDA device address");
-        let o4 = in_f < 2048 && self.vk().mmv_o4;
-        let m4 = rows <= 4;
         let res = residual.is_some();
-        let (name, spv) = crate::gemm::native_mmv_mrow_variant_fuseq_spv(dtype, o4, m4, res)
-            .expect("FUSE_QUANT SPIR-V");
+        // Callers gate on this same lookup (`mmv_mrow_fuseq_variant`), so a miss is a caller bug.
+        let (name, spv, outs) =
+            mmv_mrow_fuseq_variant(self.vk(), dtype, in_f, res).unwrap_or_else(|| {
+                panic!("linear_mmv_mrow_fuseq: no FUSE_QUANT build for {dtype:?} residual={res}")
+            });
         let nbind: usize = if res { 3 } else { 2 };
         let k = self.be.kernel(name, spv, nbind, 24);
         let mut push = [0u8; 24];
@@ -3760,7 +3793,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
+        let groups = (out_f as u32).div_ceil(outs);
         let mut bufs = vec![Self::vkb(x)];
         if let Some(r) = residual {
             bufs.push(Self::vkb(r));
@@ -4158,7 +4191,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&eps.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(dst)],
             1,
@@ -4513,7 +4546,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&eps.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(y)],
             1,
@@ -4533,7 +4566,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&eps.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(y)],
             1,
@@ -4591,7 +4624,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&eps.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(y)],
             1,
@@ -4626,7 +4659,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&eps.to_ne_bytes());
         // Binding order MUST be x, w, z, y (matches the shader's -DGATE layout) — `y` last so the
         // hazard tracker's `n_out=1` marks only the true output as written (see the shader's doc).
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(z), Self::vkb(y)],
             1,
@@ -8239,7 +8272,7 @@ impl<'a> Recorder<'a> {
         p1[8..12].copy_from_slice(&(kd as u32).to_ne_bytes());
         p1[12..16].copy_from_slice(&eps.to_ne_bytes());
         p1[16..20].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kn_k,
             &[Self::vkb(q), Self::vkb(k), Self::vkb(kn), Self::vkb(qn)],
             2, // kn, qn
@@ -11195,9 +11228,10 @@ mod tests {
                 }),
             ),
             (
-                "deltanet_gates_seq",
+                "deltanet_norm+deltanet_gates_seq",
                 {
-                    // `deltanet_seq` needs kd = 128; the gates pass is the one under test.
+                    // `deltanet_seq` needs kd = 128; the norm (one workgroup per row and key
+                    // head) and gates passes are the ones under test.
                     let (rows, nv, kd, vd) = (DN_ROWS, 4, 128, DN_SEQ_NCOL);
                     let rn = rows * nv;
                     vec![
@@ -11389,6 +11423,32 @@ mod tests {
                     r.linear_bf16_at(a, b[0], b[2], UNITS, HD, 1)
                 }),
             ),
+            // One workgroup per row: the rmsnorm family.
+            (
+                "rmsnorm",
+                vec![f(N), f(W), f(N)],
+                Box::new(|r, b| r.rmsnorm(b[0], b[1], b[2], ROWS, W, 1e-6)),
+            ),
+            (
+                "rmsnorm_nw",
+                vec![f(N), f(N)],
+                Box::new(|r, b| r.rmsnorm_nw(b[0], b[1], ROWS, W, 1e-6)),
+            ),
+            (
+                "rmsnorm_f16",
+                vec![(N * 2, Fill::Data, Act), f(W), (N * 2, Fill::Data, Act)],
+                Box::new(|r, b| r.rmsnorm_f16(b[0], b[1], b[2], ROWS, W, 1e-6)),
+            ),
+            (
+                "rmsnorm_gate",
+                vec![f(N), f(W), f(N), f(N)],
+                Box::new(|r, b| r.rmsnorm_gate(b[0], b[1], b[2], b[3], ROWS, W, 1e-6)),
+            ),
+            (
+                "rmsnorm_add",
+                vec![f(N), f(W), f(N)],
+                Box::new(|r, b| r.rmsnorm_add(b[0], b[1], b[2], ROWS, W, 1e-6)),
+            ),
         ];
         // Pinned to two PV splits so the non-flash prefill attention reaches `attn_pv_reduce`.
         let be = be_with(|v| v.pv_splits = Some(2));
@@ -11500,6 +11560,71 @@ mod tests {
             assert!(
                 whole == split,
                 "{name}: the split grid wrote different bytes"
+            );
+        }
+    }
+
+    /// The non-coopmat prefill GEMMs (`matmul_mmq_at`, `matmul_fma_at`) index their tile grid by
+    /// `gl_WorkGroupID.x` alone, so a tile count past the guaranteed x limit must be refused by
+    /// name, not dispatched. With the split point lowered, each nc arm the device offers must run
+    /// a GEMM whose grid sits exactly at the limit and refuse one a single tile past it.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn nc_gemm_grid_past_the_x_limit_is_refused() {
+        use infr_core::backend::Bindings;
+        use infr_core::graph::{Graph, Op};
+        use infr_core::tensor::TensorDesc;
+        use infr_core::DType;
+        // Lowered split point; the GEMM tile is 64x64.
+        const SPLIT_AT: u32 = 3;
+        const IN_F: usize = 64;
+        let be = be_with(|v| v.coopmat = false);
+        assert!(!be.caps().f16_coopmat(), "the nc tier needs coopmat off");
+        let run = |dt: DType, m: usize, out_f: usize| -> infr_core::error::Result<()> {
+            let mut g = Graph::new();
+            let x = g.input(TensorDesc::new(vec![m, IN_F], DType::F32));
+            let w = g.weight(TensorDesc::new(vec![out_f, IN_F], dt));
+            let y = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+            g.push(Op::Linear {
+                x,
+                weight: w,
+                dst: y,
+                m: m as u32,
+                in_f: IN_F as u32,
+                out_f: out_f as u32,
+                w_off: 0,
+            });
+            let (blk_elems, blk_bytes) = infr_core::decode_spec::block_layout(dt);
+            let xb = be.alloc(m * IN_F * 4, BufferUsage::Activations)?;
+            let wb = be.alloc(out_f * IN_F / blk_elems * blk_bytes, BufferUsage::Weights)?;
+            let yb = be.alloc(m.div_ceil(64) * 64 * out_f * 4, BufferUsage::Activations)?;
+            let mut bind = Bindings::new();
+            bind.bind(x, xb.as_ref())
+                .bind(w, wb.as_ref())
+                .bind(y, yb.as_ref());
+            WIDE_SPLIT_AT.with(|c| c.set(Some(SPLIT_AT)));
+            let res = be
+                .compile(&g)
+                .and_then(|plan| be.execute(plan.as_ref(), &bind));
+            WIDE_SPLIT_AT.with(|c| c.set(None));
+            res
+        };
+        let mut arms = vec![DType::F16];
+        if be.caps().i8_dot {
+            arms.push(DType::Q8_0);
+        } else {
+            eprintln!("skip: the dp4a mmq arm needs packed int8 dot");
+        }
+        for dt in arms {
+            let at_limit = SPLIT_AT as usize;
+            run(dt, 64 * at_limit, 64)
+                .unwrap_or_else(|e| panic!("{dt:?}: a grid at the limit must still run: {e}"));
+            let e = run(dt, 64 * (at_limit + 1), 64)
+                .expect_err(&format!("{dt:?}: a grid past the limit was dispatched"))
+                .to_string();
+            assert!(
+                e.contains("non-coopmat prefill GEMM") && e.contains("needs 4 workgroups"),
+                "{dt:?}: refused for another reason: {e}"
             );
         }
     }

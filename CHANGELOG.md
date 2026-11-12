@@ -139,6 +139,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   4096-wide layer needed one workgroup more than the 65,535 the spec guarantees,
   which RADV tolerated and other drivers need not. The elementwise, KV-store,
   rope and attention kernels now split such a grid in two dimensions.
+- **Vulkan: three crashes behind configuration.** An F16-weight model on a GPU
+  without `shaderFloat16` (or with `INFR_NO_F16`) ran a float16 shader for its
+  fused residual add; `INFR_MMV_FUSE_QUANT=1` panicked on any quant but Q4_K and
+  Q6_K; `INFR_NO_MMV_M4` panicked on decode. Each now takes a kernel that
+  exists.
+- **Vulkan: shapes a kernel cannot hold are refused by name** in release builds
+  too (DeltaNet head width, QK-norm head size, sampler top-k range, a Q8 KV row
+  that is not a whole number of blocks). They were debug-only assertions.
 - **`infr serve`: `usage.prompt_tokens` counts the whole prompt.** It reported
   only the tokens prefilled for this request, so a KV prefix cache hit made a
   long prompt look short. `/metrics` still counts prefilled tokens only.

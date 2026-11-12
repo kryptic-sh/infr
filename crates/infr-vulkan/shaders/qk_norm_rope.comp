@@ -55,7 +55,10 @@ layout(binding = 2) buffer YB { float16_t y[]; };
 #define KVW(idx, val) y[idx] = float16_t(val)
 #endif
 
-shared float xs[512]; // hd up to 512 (gemma4 full layers); 64 threads each handle hd/64 elements
+// Widest head this kernel stages; the host refuses wider heads (`QK_NORM_ROPE_MAX_HD` in
+// src/adapter.rs mirrors this value). 64 threads each handle hd/64 elements.
+#define QK_NORM_ROPE_MAX_HD 512
+shared float xs[QK_NORM_ROPE_MAX_HD];
 shared float red[64];
 
 void main() {

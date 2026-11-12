@@ -16,6 +16,9 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 #define C 32u
 #define COLS 8u
+// Widest head_k_dim the shared-memory state/row buffers hold; the host refuses wider heads
+// (`DN_MAX_KD` in src/adapter.rs mirrors this value).
+#define DN_MAX_KD 128u
 
 layout(push_constant) uniform PC {
     uint rows;
@@ -35,7 +38,7 @@ layout(binding = 6) readonly buffer GG { float gg[]; };      // [nchunk, nv, C]
 layout(binding = 7) buffer SB { float state[]; };            // [nv*kd*vd] in/out
 layout(binding = 8) buffer OB { float outp[]; };             // [rows, nv*vd]
 
-shared float ss[128u * COLS]; // this block's state columns [kd, COLS], LDS-resident across chunks
+shared float ss[DN_MAX_KD * COLS]; // this block's state columns [kd, COLS], LDS-resident across chunks
 shared float aa[C * C];      // A (solve), then Wq (output)
 shared float dl[C * COLS];   // R → Δ for this column block
 shared float bb[C];          // β

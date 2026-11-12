@@ -198,8 +198,27 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
     // NOT a single-token decode — replaying it would collapse every step onto the same KV row + RoPE
     // angle + kv_len. Force those onto the static per-op-position path.
     let mut attn_kv_len: Option<u32> = None;
-    for op in &graph.ops {
+    for (i, op) in graph.ops.iter().enumerate() {
         match op {
+            // An f16 K row reaches an f16 cache under replay only through the kv_write fusion
+            // (`infr_core::fusion`'s `plan_kv_write`: the rope op RIGHT BEFORE the WriteKv writes
+            // the cache itself); a standalone f16→f16 WriteKv has no dyn kernel. llama4 writes its
+            // K that way on both of its layer kinds — L2-normed after the rope, or the raw cast on
+            // a NoPE layer — so such a graph stays static.
+            Op::WriteKv { src, cache, .. }
+                if matches!(graph.desc(*src).dtype, infr_core::DType::F16)
+                    && matches!(graph.desc(*cache).dtype, infr_core::DType::F16) =>
+            {
+                let fused = i.checked_sub(1).is_some_and(|j| {
+                    matches!(&graph.ops[j],
+                        Op::Rope { dst, .. } | Op::QkNormRope { dst, .. }
+                            if dst == src
+                                && matches!(graph.tensors[src.0 as usize].kind, TensorKind::Internal))
+                });
+                if !fused {
+                    return false;
+                }
+            }
             // MLA attention (DeepSeek V2/V3) uses its own non-standard kernel — not eligible for
             // the split-K record-once replay pipeline. Nor is the V3.2 lightning indexer, which
             // bakes its causal bound from the `pos` push constant at record time (there is no
@@ -255,14 +274,10 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             }
             // freq_factors (gemma4 proportional RoPE) binds via qk_norm_rope_dyn_ff.
             Op::QkNormRope { .. } => has_rope = true,
-            // Standalone llama Rope replays via rope_f16_dyn — needs the f16-out builder shape
-            // (the f32 in-place form has no dyn kernel) and no freq_factors.
-            Op::Rope {
-                dst, freq_factors, ..
-            } => {
-                if freq_factors.is_some()
-                    || !matches!(graph.desc(*dst).dtype, infr_core::DType::F16)
-                {
+            // Standalone llama Rope replays via rope_f16_dyn (rope_f16_dyn_ff with freq_factors)
+            // — needs the f16-out builder shape (the f32 in-place form has no dyn kernel).
+            Op::Rope { dst, .. } => {
+                if !matches!(graph.desc(*dst).dtype, infr_core::DType::F16) {
                     return false;
                 }
                 has_rope = true;
@@ -2606,7 +2621,8 @@ fn lower_op(
         // Standalone RoPE (llama: no q/k-norm; INTERLEAVED pairs — llama.cpp's ROPE_TYPE_NORM).
         // An f16 dst takes the same fused shapes as QkNormRope: the kv_write peephole redirects
         // the K write into the cache, and Dynamic mode replays via `rope_f16_dyn` (pos from
-        // `params`). The legacy f32 in-place form stays static-only. No freq_factors kernel.
+        // `params`). The legacy f32 in-place form stays static-only. Every form has a
+        // freq_factors build (`rope_ff` / `rope_f16_ff` / `rope_f16_dyn_ff` and their BDA twins).
         Op::Rope {
             x,
             positions,
@@ -2622,16 +2638,7 @@ fn lower_op(
             ..
         } => {
             let f16_out = matches!(graph.desc(*dst).dtype, infr_core::DType::F16);
-            // YaRN freq_factors (deepseek2 k_pe) are only supported on the STATIC f32 in-place
-            // path (`rec.rope` → the `rope_ff` kernel build). The f16-out forms (`rope_f16`,
-            // fused KV write) and the record-once `_dyn` variants have no ff kernel — reject
-            // rather than silently drop the divisors.
-            if freq_factors.is_some() && (f16_out || !matches!(mode, RopeMode::Static(_))) {
-                return Err(be(
-                    "vulkan adapter: standalone Rope with freq_factors unsupported on this path",
-                ));
-            }
-            // Same for NEOX (deepseek32's indexer): only the static f32 builds carry `-DNEOX`.
+            // NEOX (deepseek32's indexer): only the static f32 builds carry `-DNEOX`.
             // Dropping it silently would rotate the wrong element pairs — fluent nonsense, no
             // error — so refuse instead.
             if *neox && (f16_out || !matches!(mode, RopeMode::Static(_))) {
@@ -2640,7 +2647,7 @@ fn lower_op(
                      record-once decode have no -DNEOX kernel build)",
                 ));
             }
-            // Same again for BACKWARD (deepseek4's attention-output de-rope, `Op::Rope::backward`):
+            // Same for BACKWARD (deepseek4's attention-output de-rope, `Op::Rope::backward`):
             // only the static f32 NORM builds carry `-DBACKWARD`. A dropped sign is the same class
             // of silent-wrong-numbers as a dropped pairing, so refuse.
             if *backward && (f16_out || *neox || !matches!(mode, RopeMode::Static(_))) {
@@ -2674,6 +2681,7 @@ fn lower_op(
                                 *theta,
                                 rope_pos[&positions.0],
                                 fused.unwrap_or(0),
+                                ff,
                             ),
                             None => rec.rope_f16(
                                 r(*x)?,
@@ -2685,6 +2693,7 @@ fn lower_op(
                                 *theta,
                                 rope_pos[&positions.0],
                                 fused.unwrap_or(0),
+                                ff,
                             ),
                         }
                     } else {
@@ -2730,6 +2739,7 @@ fn lower_op(
                             *rope_dim as usize,
                             *theta,
                             usize::from(fused.is_some()),
+                            ff,
                         ),
                         None => rec.rope_f16_dyn(
                             r(*x)?,
@@ -2741,6 +2751,7 @@ fn lower_op(
                             *rope_dim as usize,
                             *theta,
                             usize::from(fused.is_some()),
+                            ff,
                         ),
                     }
                 }
@@ -3764,7 +3775,7 @@ fn lower_op(
             head_k,
             head_v,
             eps,
-            ..
+            src_stride,
         } => {
             // Prefill AND multi-row batches (rows ≥ 2): the chunkwise delta rule processes up to 32
             // tokens per state traversal (matmuls + a triangular solve) instead of the token-serial
@@ -3803,6 +3814,14 @@ fn lower_op(
                 )));
             }
             let chunked = rows_ >= 2 && be_.cfg().kernels.vulkan.dn_chunk;
+            // Only the single-row kernel has a strided build; the chunked ones would read k and v
+            // from q's prefix.
+            if *src_stride > 0 && chunked {
+                return Err(be(
+                    "vulkan adapter: Op::DeltaNet src_stride on a multi-row batch has no strided \
+                     chunked kernel",
+                ));
+            }
             // DEFAULT prefill path: the token-serial scan with the state column register-resident
             // (norm + gates + seq). The chunked delta rule was believed to win by doing ⌈rows/32⌉
             // state sweeps instead of `rows`, but counted out it does NOT save arithmetic (~420M vs
@@ -3909,11 +3928,11 @@ fn lower_op(
                 );
                 transient.extend([kn, qn, dk, dq, bg, gg]);
             } else {
-                // Strided DeltaNet (env-gated): when q==k==v (all same source buffer), derive
-                // stride from dimensions: 2*nk*kd + nv*vd.
-                let strided = *q == *k && *k == *v && be_.cfg().kernels.vulkan.delta_strided;
-                if strided {
-                    let stride = 2 * nk_ * kd_ + nv_ * vd_;
+                // Strided DeltaNet: q/k/v are per-row slices of one buffer (`Op::DeltaNet`'s
+                // `src_stride`), which the runner emits only on a backend that reports
+                // `deltanet_strided`.
+                if *src_stride > 0 {
+                    let stride = *src_stride as usize;
                     rec.deltanet_strided(
                         r(*q)?,
                         r(*k)?,

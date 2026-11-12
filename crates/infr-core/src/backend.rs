@@ -642,6 +642,14 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Whether this backend honours [`crate::Op::DeltaNet`]'s `src_stride`: q/k/v read as
+    /// per-row slices of ONE buffer instead of three packed ones. A runner emits the strided form
+    /// only where this is true; a backend that ignored the stride would read k and v from q's
+    /// prefix. `false` unless a backend says otherwise.
+    fn deltanet_strided(&self) -> bool {
+        false
+    }
+
     /// Perf (DiffusionGemma denoise, perf slice 3 — docs/diffusion-gemma.md): fused per-canvas-row
     /// entropy-bound sampler reduction over raw `[rows, dim]` logits, avoiding a full `[rows,
     /// dim]` host download. `u` is `rows` host-drawn uniform `[0,1)` floats (the seeded

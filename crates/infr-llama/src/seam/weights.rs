@@ -275,7 +275,8 @@ pub(crate) struct SessionStable {
     pub(super) out_scale: Vec<Option<f32>>,
     /// diffusion-gemma DECODER per-layer output scalar (`layer_output_scale`), dequanted.
     pub(super) dec_out_scale: Vec<Option<f32>>,
-    /// gemma4 proportional-RoPE frequency divisors (`rope_freqs.weight`), dequanted.
+    /// Rope frequency divisors (`rope_freqs.weight`), dequanted — `Some` only on an arch that
+    /// applies them (`Config::rope_freq_factors`) and a file that carries the tensor.
     pub(super) rope_freqs: Option<Vec<f32>>,
     /// DeepSeek V2+ YaRN per-pair frequency divisors (`qk_rope_dim/2` floats), computed from
     /// `rope_scaling_factor`/`n_ctx_train`/`rope_theta` — see `runner::session_stable`.
@@ -310,9 +311,16 @@ pub(crate) struct SeamKv {
     /// their own read it back from here ([`SeamKv::max_ctx`]) once the first generation returns.
     pub(super) max_ctx: usize,
     /// Whether this session's SWA layers were allocated as window-sized RINGS (see
-    /// `crate::seam::kv_rows`): fork must size its buffers identically, and seed must respect
+    /// `crate::seam::kv_rows_at`): fork must size its buffers identically, and seed must respect
     /// that a wrapped ring no longer retains the early prefix rows a seed would copy.
     pub(super) kv_ring: bool,
+    /// The prefill chunk height the ring rows were sized with (`crate::seam::kv_rows_at`'s
+    /// `ubatch`). Recorded rather than re-read because `crate::seam::ubatch_rows` answers for
+    /// whatever placement scope is current, and the conversation-slot pickers fork and seed
+    /// before the session's scope is entered — with the process fallback, a session whose
+    /// placement pinned a shorter chunk would size a fork's rings, and judge a seed's wrap, on a
+    /// height its buffers never had.
+    pub(super) ubatch: usize,
     /// Token ids whose KV rows are materialized (prompt + generated of the last turn).
     pub(super) cached: Vec<u32>,
     /// One past the highest position any execute on this slot may have written since it last
@@ -339,9 +347,9 @@ pub(crate) struct SeamKv {
     /// Perf (Vulkan only — see docs/diffusion-gemma.md's Phase-B "sc round-trip" elimination):
     /// ping-pong pair of persistent `[cc*vocab]` device buffers backing the denoise loop's canvas
     /// logits, so the previous step's raw output is already GPU-resident for this step's
-    /// self-conditioning softmax input — no host download+reupload. Session-lifetime: `cc`/vocab
-    /// are fixed for the whole session, so this pair survives every `denoise_cache` rebuild
-    /// (block boundaries, the sc off→on plan-shape transition). `None` until the first Vulkan
+    /// self-conditioning softmax input — no host download+reupload. Kept across `denoise_cache`
+    /// rebuilds (block boundaries, the sc off→on plan-shape transition) and reallocated only when
+    /// the canvas length changes (`sc::ensure_sc_ping`). `None` until the first Vulkan
     /// denoise call; stays `None` forever on Metal/CPU (they keep the original per-plan-owned
     /// `DenoiseCache::logits_buf`/`sc_logits_buf`).
     pub(super) sc_ping: Option<[Box<dyn Buffer>; 2]>,
@@ -570,12 +578,7 @@ impl SeamKv {
         Ok(())
     }
 
-    pub(crate) fn fork(
-        &self,
-        be: &dyn Backend,
-        cfg: &Config,
-        ec: &crate::EngineConfig,
-    ) -> AResult<SeamKv> {
+    pub(crate) fn fork(&self, be: &dyn Backend, cfg: &Config) -> AResult<SeamKv> {
         let e2b = self.ipl_buf.is_some();
         let npl = cfg.n_embd_per_layer.max(1);
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
@@ -599,9 +602,9 @@ impl SeamKv {
             // Same per-layer geometry as the original allocation — same widths from the same
             // helper (`crate::seam::kv_row_elems`, MLA's compressed K row and placeholder V side
             // included), and SWA layers ring at window+ubatch rows when this session was
-            // ring-sized (see `crate::seam::kv_rows`).
+            // ring-sized (see `crate::seam::kv_rows_at`).
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            let rows_l = crate::seam::kv_rows(cfg, l, self.max_ctx, self.kv_ring, ec);
+            let rows_l = crate::seam::kv_rows_at(cfg, l, self.max_ctx, self.kv_ring, self.ubatch);
             kbufs.push(
                 be.alloc(
                     crate::seam::kv_side_bytes(self.k_fmt, rows_l * k_row),
@@ -661,6 +664,7 @@ impl SeamKv {
                 .map_err(|e| anyhow!("{e}"))?,
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
+            ubatch: self.ubatch,
             cached: Vec::new(),
             written_end: 0,
             // The forked slot's KV/weight buffers are new objects, so a cached plan's bindings
@@ -696,7 +700,6 @@ impl SeamKv {
         &mut self,
         be: &dyn Backend,
         cfg: &Config,
-        ec: &crate::EngineConfig,
         src: &SeamKv,
         p: usize,
     ) -> AResult<()> {
@@ -717,7 +720,7 @@ impl SeamKv {
         if self.kv_ring {
             let wrapped = (0..cfg.n_layer)
                 .filter(|&l| cfg.is_swa_layer(l))
-                .map(|l| crate::seam::kv_rows(cfg, l, self.max_ctx, true, ec))
+                .map(|l| crate::seam::kv_rows_at(cfg, l, self.max_ctx, true, self.ubatch))
                 .any(|rows_l| src.written_end > rows_l);
             if wrapped {
                 return Ok(());
@@ -730,7 +733,7 @@ impl SeamKv {
             // The backend owns its cache layout (Vulkan's Q8_0 is planar — its scales do not sit
             // in a byte prefix), so it does the copy; `rows_l * row` is the side's capacity.
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            let rows_l = crate::seam::kv_rows(cfg, l, self.max_ctx, self.kv_ring, ec);
+            let rows_l = crate::seam::kv_rows_at(cfg, l, self.max_ctx, self.kv_ring, self.ubatch);
             be.copy_kv_prefix(
                 src.kbufs[l].as_ref(),
                 self.kbufs[l].as_ref(),

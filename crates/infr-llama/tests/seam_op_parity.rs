@@ -2128,6 +2128,182 @@ fn lightning_indexer_scale_cannot_change_the_selection() {
     assert_eq!(normalised, select(64.0), "scale 64 changed the selection");
 }
 
+// ── Op::Rope with the llama3 `rope_freqs.weight` divisors (llama / llama4) ──────────────────
+
+/// llama.cpp's `ggml_compute_forward_rope_f32` for a NORM rope at `ext_factor = 0`,
+/// `freq_scale = 1`, `attn_factor = 1` (what `llama.cpp`'s llama/llama4 builders pass for a llama3
+/// checkpoint), transcribed in f64: `ggml_rope_cache_init` walks `theta` from the position and
+/// multiplies it by `theta_scale = base^(-2/n_dims)` after every pair; pair `i0/2` divides its
+/// `theta` by `freq_factors[i0/2]` (`theta_extrap = theta / ff`) before `rope_yarn` takes the
+/// cosine and sine; `rotate_pairs` with `n_offset = 1` rotates `(i0, i0 + 1)`.
+fn ggml_rope_norm_f64(
+    x: &[f32],
+    pos: i64,
+    n_head: usize,
+    head_dim: usize,
+    n_dims: usize,
+    freq_base: f64,
+    freq_factors: &[f32],
+) -> Vec<f64> {
+    let mut out: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+    let theta_scale = freq_base.powf(-2.0 / n_dims as f64);
+    for h in 0..n_head {
+        let b = h * head_dim;
+        let mut theta = pos as f64;
+        for i0 in (0..n_dims).step_by(2) {
+            let theta_extrap = theta / freq_factors[i0 / 2] as f64;
+            let (s, c) = theta_extrap.sin_cos();
+            let (x0, x1) = (x[b + i0] as f64, x[b + i0 + 1] as f64);
+            out[b + i0] = x0 * c - x1 * s;
+            out[b + i0 + 1] = x0 * s + x1 * c;
+            theta *= theta_scale;
+        }
+    }
+    out
+}
+
+/// The `rope_freqs.weight` a llama3 checkpoint carries: `conversion/llama.py`'s
+/// `generate_extra_tensors` at Llama 3.1's `rope_scaling` (factor 8, low/high frequency factors 1
+/// and 4, original context 8192).
+fn llama3_rope_freqs(n_dims: usize, base: f64) -> Vec<f32> {
+    let (factor, low, high, old_ctx) = (8.0f64, 1.0f64, 4.0f64, 8192.0f64);
+    let (low_wavelen, high_wavelen) = (old_ctx / low, old_ctx / high);
+    (0..n_dims / 2)
+        .map(|p| {
+            let freq = 1.0 / base.powf((2 * p) as f64 / n_dims as f64);
+            let wavelen = std::f64::consts::TAU / freq;
+            if wavelen < high_wavelen {
+                1.0
+            } else if wavelen > low_wavelen {
+                factor as f32
+            } else {
+                let smooth = (old_ctx / wavelen - low) / (high - low);
+                (1.0 / ((1.0 - smooth) / factor + smooth)) as f32
+            }
+        })
+        .collect()
+}
+
+/// `Op::Rope` with `freq_factors` writing the f16 q/k scratch — the shape the llama/llama4 seam
+/// emits — against the f64 transcription of ggml's rope above, at positions from 0 to past
+/// Llama 3.1's 128k window, on CPU and Vulkan.
+///
+/// The tolerance is the f32 angle's own rounding (an angle of `θ` radians is only known to
+/// `θ·ε`, which at the largest position here dwarfs every other error) plus the f16 store. The
+/// factors move the low-frequency pairs' angles by up to 7/8 of themselves, so the same rotation
+/// WITHOUT them must miss the reference by far more than that tolerance — asserted too, so the
+/// test cannot pass on a backend that drops the divisors.
+#[test]
+fn rope_freq_factors_match_ggml_at_long_positions() {
+    let (n_head, head_dim, rope_dim) = (2usize, 64usize, 64usize);
+    let base = 500000.0f64;
+    let ff = llama3_rope_freqs(rope_dim, base);
+    assert!(
+        ff.iter().any(|&f| f > 1.0) && ff.contains(&1.0),
+        "the factor profile must mix scaled and unscaled pairs: {ff:?}"
+    );
+    let rows = 2usize;
+    let row = n_head * head_dim;
+    let xi = gen(rows * row, 29);
+    let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(infr_cpu::CpuBackend::new())];
+    if let Some(vk) = gpu() {
+        backends.push(Box::new(vk));
+    }
+    for be in &backends {
+        let f16_store = be.name() != "cpu";
+        for p0 in [0i32, 1, 7, 4095, 8191, 65535, 131070] {
+            let positions = [p0, p0 + 1];
+            let run_one = |with_ff: bool| -> Vec<f32> {
+                let mut g = Graph::new();
+                let x = g.input(f32d(rows * row));
+                let pos = g.input(TensorDesc::new(vec![rows], DType::I32));
+                let ffid = g.input(f32d(ff.len()));
+                let dst = g.output(TensorDesc::new(vec![rows * row], DType::F16));
+                g.push(Op::Rope {
+                    x,
+                    positions: pos,
+                    dst,
+                    rows: rows as u32,
+                    n_head: n_head as u32,
+                    head_dim: head_dim as u32,
+                    rope_dim: rope_dim as u32,
+                    theta: base as f32,
+                    freq_factors: with_ff.then_some(ffid),
+                    x_stride: 0,
+                    neox: false,
+                    backward: false,
+                });
+                let plan = be.compile(&g).unwrap();
+                let up = |data: &[u8]| {
+                    let b = be.alloc(data.len(), BufferUsage::Activations).unwrap();
+                    be.upload(b.as_ref(), data).unwrap();
+                    b
+                };
+                let xb = up(bytemuck::cast_slice(&xi));
+                let pb = up(bytemuck::cast_slice(&positions));
+                let fb = up(bytemuck::cast_slice(&ff));
+                // The CPU reference keeps every buffer as f32; Vulkan stores the declared f16.
+                let elem = if f16_store { 2 } else { 4 };
+                let ob = be.alloc(rows * row * elem, BufferUsage::Readback).unwrap();
+                let mut b = Bindings::new();
+                b.bind(x, xb.as_ref());
+                b.bind(pos, pb.as_ref());
+                b.bind(ffid, fb.as_ref());
+                b.bind(dst, ob.as_ref());
+                be.execute(plan.as_ref(), &b).unwrap();
+                let mut bytes = vec![0u8; rows * row * elem];
+                be.download(ob.as_ref(), &mut bytes).unwrap();
+                if f16_store {
+                    bytemuck::cast_slice::<u8, u16>(&bytes)
+                        .iter()
+                        .map(|&h| half::f16::from_bits(h).to_f32())
+                        .collect()
+                } else {
+                    bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+                }
+            };
+            let (got, plain) = (run_one(true), run_one(false));
+            let (mut worst, mut plain_miss) = (0f64, 0f64);
+            for (r, &p) in positions.iter().enumerate() {
+                let xr = &xi[r * row..(r + 1) * row];
+                let want = ggml_rope_norm_f64(xr, p as i64, n_head, head_dim, rope_dim, base, &ff);
+                for h in 0..n_head {
+                    for i0 in (0..rope_dim).step_by(2) {
+                        let ang = p as f64 * base.powf(-(i0 as f64) / rope_dim as f64)
+                            / ff[i0 / 2] as f64;
+                        let b = h * head_dim + i0;
+                        let mag = (xr[b] as f64).abs() + (xr[b + 1] as f64).abs();
+                        let tol = mag * (16.0 * ang * f32::EPSILON as f64 + 1e-3) + 1e-6;
+                        for i in [b, b + 1] {
+                            let e = (got[r * row + i] as f64 - want[i]).abs();
+                            worst = nan_max64(worst, e / tol);
+                            let miss = (plain[r * row + i] as f64 - want[i]).abs();
+                            plain_miss = plain_miss.max(miss / tol);
+                        }
+                    }
+                }
+            }
+            println!(
+                "Rope+ff {} pos {p0}: worst err/tol {worst:.3}, without ff {plain_miss:.1}",
+                be.name()
+            );
+            assert!(
+                worst <= 1.0,
+                "{} rope with freq_factors at position {p0} misses ggml by {worst:.3}x tolerance",
+                be.name()
+            );
+            if p0 >= 4095 {
+                assert!(
+                    plain_miss > 10.0,
+                    "{} at position {p0}: dropping the factors stays within {plain_miss:.1}x \
+                     tolerance, so this comparison cannot see them",
+                    be.name()
+                );
+            }
+        }
+    }
+}
+
 // ── Op::Rope's NEOX pairing (deepseek32's lightning indexer) ─────────────────────────────────
 
 /// Hand-written reference for one `Op::Rope` dispatch, from the DEFINITION of the two rope types

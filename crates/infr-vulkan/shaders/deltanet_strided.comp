@@ -71,6 +71,9 @@ void main() {
         uint qbase = row_off + hqbase;
         uint kbase = row_off + pc.nk * pc.kd + hqbase; // k at offset nk*kd within row
         uint vbase = row_off + pc.nk * pc.kd * 2u + hvbase; // v at offset 2*nk*kd
+        // The output is packed [rows, nv*vd] like every other DeltaNet build's, NOT laid out
+        // like the strided source row v is read from.
+        uint obase = tk * pc.nv * pc.vd + hvbase;
         uint ga = tk * pc.nv + h;
 
         // ── L2-normalize q,k over kd into shared (all threads cooperate; 32 lanes) ──
@@ -126,7 +129,7 @@ void main() {
                 ss[kk * COL_BLOCK + t] = sval;
                 o += qn[kk] * sval;
             }
-            outp[vbase + d] = o;
+            outp[obase + d] = o;
         }
         barrier(); // finish reading qn/kn before the next token overwrites them
     }

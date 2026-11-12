@@ -4215,6 +4215,12 @@ impl Backend for VulkanBackend {
         self.dense_pager.lock().unwrap().is_some()
     }
 
+    /// Single-row DeltaNet has a strided build (`Recorder::deltanet_strided`); the adapter
+    /// refuses the stride on the multi-row paths, which the runner never strides.
+    fn deltanet_strided(&self) -> bool {
+        true
+    }
+
     /// DiffusionGemma perf slice 3 (docs/diffusion-gemma.md): one eager dispatch of
     /// `dg_eb_sample` + a synchronous wait (`Recorder::finish`) — this isn't part of a cached
     /// [`Plan`], it runs once per denoise step right after that step's forward `execute()`, on

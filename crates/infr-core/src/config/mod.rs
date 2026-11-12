@@ -332,7 +332,8 @@ cfg_struct! {
         dn_chunk: bool = true,
         /// `INFR_NO_DN_SPLIT` (inverted).
         dn_split: bool = true,
-        /// `INFR_DELTA_STRIDED`. Also read in `infr-llama`'s runner.
+        /// `INFR_DELTA_STRIDED`. Read by `infr-llama`'s runner, which emits the strided
+        /// `Op::DeltaNet` only on a backend reporting `Backend::deltanet_strided`.
         delta_strided: bool = false,
         /// `INFR_NO_PUSH_DESC` (inverted).
         push_desc: bool = true,

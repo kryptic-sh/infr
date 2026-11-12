@@ -667,6 +667,11 @@ impl Backend for CpuBackend {
         "cpu"
     }
 
+    /// The `Op::DeltaNet` arm slices q/k/v out of the shared row when `src_stride > 0`.
+    fn deltanet_strided(&self) -> bool {
+        true
+    }
+
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             name: "cpu-reference".into(),

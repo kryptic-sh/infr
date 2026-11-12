@@ -108,7 +108,7 @@ fn resident_after_gen(cur: &[u32], last_written: Option<usize>) -> Vec<u32> {
 }
 
 /// Bind the per-layer IO + weights shared by EVERY decode/prefill/verify/denoise execution: the
-/// gemma4 `rope_freqs` Input (when present), each layer's K/V cache pair, and the flat weight list
+/// `rope_freqs` Input (when present), each layer's K/V cache pair, and the flat weight list
 /// (declaration == upload order). Extracted so the four bind sites (denoise, verify, record-once,
 /// per-token) can never drift — a forgotten bind here (e.g. `rope_freqs`) is a live unbound-Input
 /// panic at execute. The caller still binds the per-site pieces (hidden/tok_ids, positions,
@@ -200,11 +200,26 @@ fn session_stable(
             }
         })
         .collect();
-    // gemma4 proportional-RoPE frequency divisors (`rope_freqs.weight`, `[rope_dim/2]`): applied on
-    // full-attention layers only (SWA layers use plain RoPE). Bound as a per-step f32 Input.
+    // Per-pair rope frequency divisors (`rope_freqs.weight`, `[rope_dim/2]`) on the archs whose
+    // reference applies them (`Config::rope_freq_factors`): gemma4's proportional RoPE on its
+    // full-attention layers, and llama/llama4's llama3 long-context factors on every rope layer.
+    // Bound as a per-step f32 Input.
     let rope_freqs: Option<Vec<f32>> =
-        if c.gemma4 && g.tensors().iter().any(|t| t.name == "rope_freqs.weight") {
-            Some(crate::load_tensor_dequant(g, "rope_freqs.weight").map(|(v, _)| v)?)
+        if c.rope_freq_factors && g.tensors().iter().any(|t| t.name == "rope_freqs.weight") {
+            let (v, _) = crate::load_tensor_dequant(g, "rope_freqs.weight")?;
+            // Every rope kernel reads `ff[p]` for each of the `rope_dim/2` pairs, so a shorter
+            // tensor would be read past its end; llama.cpp's loader pins the same `{n_rot/2}`
+            // shape. gemma4 sizes its tensor by the full-attention head instead, which the
+            // QkNormRope path indexes on its own terms.
+            if !c.gemma4 && v.len() != c.rope_dim / 2 {
+                return Err(anyhow!(
+                    "rope_freqs.weight has {} elements; rope.dimension_count {} needs {}",
+                    v.len(),
+                    c.rope_dim,
+                    c.rope_dim / 2
+                ));
+            }
+            Some(v)
         } else {
             None
         };
@@ -310,7 +325,7 @@ fn session_stable(
 pub(super) struct DecodeHandles {
     hidden: TensorId,
     positions: TensorId,
-    rope_freqs: Option<TensorId>, // gemma4 proportional-RoPE divisors (full-attention layers)
+    rope_freqs: Option<TensorId>, // rope frequency divisors (`Config::rope_freq_factors`)
     // DeepSeek V2+ YaRN per-pair frequency divisors (qk_rope_dim/2 floats): the graph Input the
     // driver binds `yff_buf` to (a per-step f32 Input like `rope_freqs`). `None` for non-yarn.
     yarn_ff: Option<TensorId>,
@@ -473,6 +488,9 @@ pub(crate) fn generate_dense_backend(
     // store). `kernels.gated_rmsnorm` (`INFR_NO_GATED_RMSNORM`, inverted) forces the split form
     // for A/B (default = fuse).
     let fuse_gated_rmsnorm = caps.gated_rmsnorm && ec.kernels.gated_rmsnorm;
+    // `INFR_DELTA_STRIDED` (an experimental Vulkan decode knob) only where the backend reads the
+    // strided q/k/v it asks for.
+    let delta_strided_ok = ec.kernels.vulkan.delta_strided && be.deltanet_strided();
 
     // GPU embed gather (Op::EmbedGather, task #28): the host feeds token IDS (4 bytes each) and
     // the device gathers+dequantizes the embedding rows from the resident quantized table —
@@ -585,7 +603,7 @@ pub(crate) fn generate_dense_backend(
     (k_fmt, v_fmt) = crate::seam::mla_kv_fmt(c, be.name(), ec, k_fmt, v_fmt)?;
 
     // SWA ring KV: window layers allocate `min(want_ctx, window + ubatch)` rows and the backend
-    // writes/reads position p at row `p % rows` (see `crate::seam::kv_rows` for the sizing and
+    // writes/reads position p at row `p % rows` (see `crate::seam::kv_rows_at` for the sizing and
     // the correctness argument, and `kv_ring_wanted` for the model/env gates). Requires the
     // backend's ring semantics (Vulkan + CPU; Metal indexes rows by position) and f16/q8 caches
     // on BOTH sides (the prepass formats keep full-context caches — documented scope gate).
@@ -1138,6 +1156,12 @@ pub(crate) fn generate_dense_backend(
         // is a MEASUREMENT where the clamp that sized `want_ctx` could only estimate. Shrinks only,
         // and never a context the user pinned. See `reclamp_ctx_to_live_room`.
         let want_ctx = crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt);
+        // A model infr only matches the reference over a bounded context gets no larger cache.
+        // Sessions arrive already capped (`SeamModel::session_ctx`); this is the one-shot paths'
+        // cap (they size `prompt + max_new + 1`). The load already warned.
+        let want_ctx = c
+            .faithful_ctx_limit()
+            .map_or(want_ctx, |limit| want_ctx.min(limit));
 
         // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and
         //    per-side (K and V pick their dtype independently) ────────────────────────────────
@@ -1244,6 +1268,7 @@ pub(crate) fn generate_dense_backend(
             logits_buf,
             max_ctx: want_ctx,
             kv_ring,
+            ubatch,
             cached: Vec::new(),
             written_end: 0,
             delta_snapshot_refused: false,
@@ -1283,7 +1308,11 @@ pub(crate) fn generate_dense_backend(
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
         kv_ring: _,
+        // The chunk height this slot's rings were sized with — the one source the cache
+        // declarations, the rewind guard and fork/seed all read.
+        ubatch: ring_ubatch,
     } = state.as_mut().expect("seam state just initialized");
+    let ring_ubatch = *ring_ubatch;
     let SeamWeights {
         wbufs,
         wspecs,
@@ -1292,6 +1321,14 @@ pub(crate) fn generate_dense_backend(
         layer_has_epb,
     } = weights.as_ref();
     let max_ctx = *max_ctx;
+    // At the context cap a reply is trimmed to the room left, exactly as a session's
+    // `reply_budget` trims it, rather than overflowing because a one-shot caller sized its
+    // context for the whole reply; a prompt that does not fit still overflows below.
+    let max_new = if c.faithful_ctx_limit() == Some(max_ctx) {
+        crate::seam::model::reply_budget(max_new, max_ctx, prompt.len())
+    } else {
+        max_new
+    };
     if prompt.len() + max_new + 1 > max_ctx {
         return Err(crate::ContextOverflow {
             prompt: prompt.len(),
@@ -1414,7 +1451,7 @@ pub(crate) fn generate_dense_backend(
     let start = if kv_ring && start > 0 {
         let safe = (0..c.n_layer)
             .filter(|&l| c.is_swa_layer(l))
-            .map(|l| crate::seam::kv_rows(c, l, max_ctx, true, ec))
+            .map(|l| crate::seam::kv_rows_at(c, l, max_ctx, true, ring_ubatch))
             .filter(|&rows_l| rows_l < max_ctx) // a never-wrapping layer can't lose positions
             .all(|rows_l| {
                 let live_from = written_end.saturating_sub(rows_l);
@@ -1775,7 +1812,7 @@ pub(crate) fn generate_dense_backend(
             // every backend derives the ring's row capacity from this declared element count
             // (row = pos % (numel / row_width)).
             let (k_row, v_row) = crate::seam::kv_row_elems(c, l);
-            let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring, ec);
+            let rows_l = crate::seam::kv_rows_at(c, l, max_ctx, kv_ring, ring_ubatch);
             k_cache.push(g.input(kd(crate::seam::kv_side_elems(rows_l * k_row))));
             v_cache.push(g.input(vd(crate::seam::kv_side_elems(rows_l * v_row))));
         }
@@ -2655,8 +2692,10 @@ pub(crate) fn generate_dense_backend(
             } else {
                 1.0 / (hd as f32).sqrt()
             };
-            // gemma4 proportional-RoPE applies only on full-attention layers.
-            let layer_ff = if gemma4 && !swa { rope_freqs } else { None };
+            // gemma4 proportional-RoPE applies only on full-attention layers; llama/llama4's
+            // factors on every layer that ropes (a llama4 NoPE layer emits no rope at all).
+            // `rope_freqs` is `None` for every other arch (see `session_stable`).
+            let layer_ff = if gemma4 && swa { None } else { rope_freqs };
             // DeepSeek V4's per-layer SwiGLU clamps: `swiglu_clamp_exp[il]` on the ROUTED experts
             // and `swiglu_clamp_shexp[il]` on the shared one — two different hparam arrays, so the
             // two can differ within a layer. `infr_core::graph::swiglu_clamp` owns the
@@ -2724,8 +2763,9 @@ pub(crate) fn generate_dense_backend(
                 });
                 // Strided DeltaNet: when INFR_DELTA_STRIDED=1 and batch==1 (decode only —
                 // the chunked prefill path doesn't support stride), q/k/v read from conv_out,
-                // skipping 3 CopyStrided dispatches per layer.
-                let delta_strided = batch == 1 && ec.kernels.vulkan.delta_strided;
+                // skipping 3 CopyStrided dispatches per layer. Only on a backend that honours
+                // the stride (`Backend::deltanet_strided`).
+                let delta_strided = batch == 1 && delta_strided_ok;
                 if !delta_strided {
                     g.push(Op::CopyStrided {
                         src: dn_convout,
@@ -2797,7 +2837,7 @@ pub(crate) fn generate_dense_backend(
                     head_k: q35_kd as u32,
                     head_v: q35_vd as u32,
                     eps: 1e-6,
-                    src_stride: 0,
+                    src_stride: if delta_strided { q35_cc as u32 } else { 0 },
                 });
                 // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z). Fused into
                 // ONE dispatch when the backend supports it (see `fuse_gated_rmsnorm`'s doc) — the
@@ -3389,11 +3429,13 @@ pub(crate) fn generate_dense_backend(
                 // `mscale²` where `mscale = attn_factor_org * (1 + 0.1*log_mul*ln(1/freq_scale))`
                 // and `attn_factor_org = yarn_attn_factor * (1 + 0.1*ln(1/freq_scale))` with
                 // `yarn_attn_factor = 1/(1 + 0.1*ln(1/freq_scale))` when log_mul != 0 (so
-                // attn_factor_org = 1.0 for the GGUF's log_mul = 0.707). The rope vector mscale
-                // is folded in here (both q_pe and k_pe get the same vector scale → a score-level
-                // square); the kernels only need the frequency divisors. The GGUF's
-                // `rope.scaling.attn_factor` multiplies `attn_factor` BEFORE `attn_factor_org` is
-                // recovered from it, matching llama-context.cpp's
+                // attn_factor_org = 1.0 for the GGUF's log_mul = 0.707). ggml's rope ALSO scales
+                // the q_pe/k_pe vectors themselves by `attn_factor_org` (`rope_yarn`'s `mscale`);
+                // that reaches only the rotary half of the score, so it cannot be folded into this
+                // whole-score scale — the loader refuses a file where it is not 1
+                // (`config::mla_rope_mscale`), and the kernels need only the frequency divisors.
+                // The GGUF's `rope.scaling.attn_factor` multiplies `attn_factor` BEFORE
+                // `attn_factor_org` is recovered from it, matching llama-context.cpp's
                 // `cparams.yarn_attn_factor *= hparams.rope_attn_factor`. Plain (non-yarn) MLA has
                 // `freq_scale = 1`, so the same expression collapses to `attn_factor²/sqrt(...)`.
                 let mla_scale = if c.rope_scaling_yarn {
@@ -3728,9 +3770,8 @@ pub(crate) fn generate_dense_backend(
                         // llama4 NoPE (global) layer: Q is UNROPED — cast the raw f32 projection
                         // into q16 the same way K does above (`Op::Copy`, value-preserving; see
                         // its doc there). The reference multiplies Q by an attention-temperature
-                        // scale here; that scale is EXACTLY 1.0 below the 8192-token chunk size,
-                        // so it is a no-op in infr's CPU-testable regime — see the `llama4` arch
-                        // note for the long-context follow-up.
+                        // scale here; it is exactly 1.0 only below `Config::faithful_ctx_limit`,
+                        // which is why the context is capped there.
                         g.push(Op::Copy {
                             src: q,
                             src_off: 0,
@@ -4610,18 +4651,27 @@ pub(crate) fn generate_dense_backend(
         // (unverified hardware, out of scope here); CPU never reaches `plan_sc` at all.
         let use_ping = be.name() == "vulkan";
         let dyn_sc = plan_sc && use_ping;
-        if use_ping && sc_ping.is_none() {
-            let bytes = cc * c.vocab * 4;
-            *sc_ping = Some([
-                be.alloc(bytes, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-                be.alloc(bytes, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-            ]);
-            *sc_temp_inv_buf = Some(
-                be.alloc(4, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-            );
+        let ping_bytes = cc * c.vocab * 4;
+        // A canvas whose length changed has no previous step to self-condition on: the pair
+        // holds the old canvas's logits, in the old canvas's layout.
+        if use_ping
+            && plan_sc
+            && sc_ping
+                .as_ref()
+                .is_some_and(|p| p[0].len_bytes() != ping_bytes)
+        {
+            return Err(anyhow!(
+                "denoise: the canvas length changed to {cc} while self-conditioning reads the \
+                 previous step's logits"
+            ));
+        }
+        if use_ping && super::sc::ensure_sc_ping(be, sc_ping, ping_bytes)? {
+            if sc_temp_inv_buf.is_none() {
+                *sc_temp_inv_buf = Some(
+                    be.alloc(4, BufferUsage::Staging)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+            }
             if plan_sc {
                 // Defensive seed: this is the FIRST denoise call ever on this slot and it ALREADY
                 // wants self-conditioning, so the ping slot we're about to read from is freshly
@@ -5294,7 +5344,7 @@ pub(crate) fn generate_dense_backend(
         // tripped the amdgpu ring watchdog → device lost) and bakes a multi-second unpreemptible
         // submit; fixed-size chunks bound both, exactly like the bespoke path's ubatches.
         // Shared reader (`crate::seam::ubatch_rows`): the SWA ring sizing must cover exactly
-        // this chunk height — see `kv_rows`' correctness bound.
+        // this chunk height — see `kv_rows_at`' correctness bound.
         // Prefill vs in-flight decodes (`infr serve --parallel N`): the chunk is the unit of GPU
         // ownership, so a chunk is exactly how long a newly-admitted request's prefill can stall
         // everyone else's decode. The default ubatch (INFR_UBATCH, 1024 rows) is ~100ms+ of
@@ -5323,7 +5373,7 @@ pub(crate) fn generate_dense_backend(
         // layer's KV rows for positions below its own, and chunks run in ASCENDING order inside
         // each layer, so every earlier position is already written when a chunk reaches it. The
         // SWA ring is untouched by the reorder — its bound is per layer and per dispatch
-        // ("window + one chunk", see `kv_rows`), and each layer's ring still sees exactly the same
+        // ("window + one chunk", see `kv_rows_at`), and each layer's ring still sees exactly the same
         // ascending sequence of writes it saw chunk-major.
         let layer_major = crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b);
         let spans: Vec<std::ops::Range<usize>> = if layer_major {
@@ -5559,8 +5609,8 @@ pub(crate) fn generate_dense_backend(
     // bakes pos=0/kv_len=1, which is only correct when the adapter replays it (dyn kernels read
     // the live pos/kv_len); an ineligible graph would silently run the static path with the baked
     // values. Hence the per-layer head-dim mirror of the adapter's Attention check.
-    // llama (no qk-norm) replays too — its f16-out Rope has a dyn kernel — but only without
-    // freq_factors (the standalone Rope kernel has no ff binding; gemma4's ff rides QkNormRope).
+    // llama (no qk-norm) replays too — its f16-out Rope has a dyn kernel, with and without the
+    // llama3 freq_factors (`rope_f16_dyn_ff`).
     // A paged MoE model (see `Backend::moe_paged`'s doc) forces the static per-execute path: the
     // adapter's own `execute`/`execute_chain` already refuse to replay one (belt-and-suspenders,
     // the actual correctness guarantee), but skipping `dyn_replay` here too avoids building the
@@ -5593,7 +5643,11 @@ pub(crate) fn generate_dense_backend(
         // `sliding_window = 1` model — where attending only your own row IS the right answer —
         // stayed exact and hid it.
         && !c.deepseek4
-        && (qk_norm || stable.rope_freqs.is_none())
+        // llama4: neither of its K writes is the rope→WriteKv pair the adapter's peephole fuses
+        // into the cache (a rope layer L2-norms the roped K first; a NoPE layer only casts the raw
+        // K), and a standalone f16 `WriteKv` has no dyn kernel, so the adapter's
+        // `decode_eligible` keeps the graph static. Mirrored here like the exclusions above.
+        && !c.llama4
         // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
         // `decode_eligible`: the low-bit block quants / bf16 / f32 / turbo ride a dequant→f16
         // prepass with a standalone WriteKv that has no dyn kernel) — EXCEPT coupled Q8_0
@@ -6510,6 +6564,80 @@ mod tests {
         logits
     }
 
+    /// `INFR_DELTA_STRIDED` makes the decode read DeltaNet's q/k/v as slices of the conv output.
+    /// On a backend that honours `Op::DeltaNet::src_stride` (the CPU reference does) the logits
+    /// must not move; the emitter used to leave the stride at 0, so a non-Vulkan backend read k
+    /// and v from q's prefix.
+    #[test]
+    fn qwen35_strided_deltanet_matches_packed_on_cpu() {
+        let (g, cfg) = open_synthetic("qwen35-strided", &qwen35_gguf(false));
+        let be = infr_cpu::CpuBackend::new();
+        assert!(infr_core::backend::Backend::deltanet_strided(&be));
+        let prompt = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let packed = fresh_logits(
+            &be,
+            &crate::seam::cpu_upload_bind(&be),
+            &g,
+            &cfg,
+            &EngineConfig::default(),
+            &prompt,
+        );
+        let mut ec = EngineConfig::default();
+        ec.kernels.vulkan.delta_strided = true;
+        let strided = fresh_logits(
+            &be,
+            &crate::seam::cpu_upload_bind(&be),
+            &g,
+            &cfg,
+            &ec,
+            &prompt,
+        );
+        assert_eq!(packed.len(), Q35_VOCAB);
+        assert_eq!(strided, packed);
+    }
+
+    /// The Vulkan half of `qwen35_strided_deltanet_matches_packed_on_cpu`: the strided decode
+    /// kernel, now keyed on the op's own `src_stride`, scores like the CPU reference.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn qwen35_strided_deltanet_vulkan_matches_cpu() {
+        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
+            return;
+        };
+        let (g, cfg) = open_synthetic("qwen35-strided-vk", &qwen35_gguf(true));
+        let cpu = infr_cpu::CpuBackend::new();
+        let prompt = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let want = fresh_logits(
+            &cpu,
+            &crate::seam::cpu_upload_bind(&cpu),
+            &g,
+            &cfg,
+            &EngineConfig::default(),
+            &prompt,
+        );
+        let mut ec = EngineConfig::default();
+        ec.kernels.vulkan.delta_strided = true;
+        let bind = crate::seam::vulkan_moe_binder(&vk, &g, &cfg, &ec, true, 64)
+            .expect("vulkan weight binder");
+        let got = fresh_logits(&vk, &*bind, &g, &cfg, &ec, &prompt);
+        let err = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, |m, d| {
+                if m.is_nan() || d.is_nan() {
+                    f32::NAN
+                } else {
+                    m.max(d)
+                }
+            });
+        println!("strided DeltaNet vulkan-vs-cpu max err {err:e}");
+        assert!(
+            err < 2e-2,
+            "strided DeltaNet on Vulkan misses the CPU by {err}"
+        );
+    }
+
     /// After `SeamKv::reset`, the next prompt must run from a zeroed DeltaNet state: its logits
     /// equal a fresh slot's, not those of a state still carrying the first prompt.
     #[test]
@@ -7004,6 +7132,407 @@ mod tests {
         });
     }
 
+    /// A one-layer `llama` (or `llama4`) model, every tensor f32, with `rope_freqs.weight` set to
+    /// `rope_freqs` when given. The llama4 variant routes four experts but interleaves them every
+    /// second layer, so its only layer is a dense ROPE layer (`no_rope_layer_step` 4 makes layer 3
+    /// the first NoPE one) and needs no expert banks.
+    fn llama_gguf(arch: &str, rope_freqs: Option<Vec<f32>>) -> SyntheticModel {
+        let hd = Q35_NE / 2;
+        let t = |name: &str, shape: Vec<usize>, base: f32| (name.to_string(), shape, base);
+        let mut tensors = vec![
+            t("token_embd.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+            t("output_norm.weight", vec![Q35_NE], 1.0),
+            t("output.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+        ];
+        for (name, shape, base) in [
+            ("attn_norm", vec![Q35_NE], 1.0),
+            ("attn_q", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_k", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_v", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_output", vec![2 * hd, Q35_NE], 0.0),
+            ("ffn_norm", vec![Q35_NE], 1.0),
+            ("ffn_gate", vec![Q35_NE, Q35_NFF], 0.0),
+            ("ffn_up", vec![Q35_NE, Q35_NFF], 0.0),
+            ("ffn_down", vec![Q35_NFF, Q35_NE], 0.0),
+        ] {
+            tensors.push((format!("blk.0.{name}.weight"), shape, base));
+        }
+        let k = |key: &str, v: usize| (format!("{arch}.{key}"), v);
+        let mut u32_keys = vec![
+            k("block_count", 1),
+            k("context_length", 256),
+            k("embedding_length", Q35_NE),
+            k("feed_forward_length", Q35_NFF),
+            k("attention.head_count", 2),
+            k("attention.head_count_kv", 2),
+            k("rope.dimension_count", hd),
+            ("tokenizer.ggml.eos_token_id".to_string(), Q35_VOCAB - 1),
+        ];
+        if arch == "llama4" {
+            u32_keys.extend([
+                k("expert_count", 4),
+                k("expert_used_count", 1),
+                k("expert_feed_forward_length", Q35_NFF),
+                k("interleave_moe_layer_step", 2),
+            ]);
+        }
+        let mut model = synthetic_gguf(arch, &u32_keys, &tensors, &[]);
+        if let Some(ff) = rope_freqs {
+            model.tensors.push(TensorSpec::new(
+                "rope_freqs.weight".to_string(),
+                vec![ff.len()],
+                Fill::Exact(ff),
+            ));
+        }
+        model
+    }
+
+    /// The last prompt token's logits for `prompt` on `be`, from a fresh slot.
+    fn fresh_logits(
+        be: &dyn infr_core::backend::Backend,
+        bind: &super::BindWeight<'_>,
+        g: &Gguf,
+        cfg: &Config,
+        ec: &EngineConfig,
+        prompt: &[u32],
+    ) -> Vec<f32> {
+        let embd = std::sync::OnceLock::new();
+        let mut logits = Vec::new();
+        super::generate_dense_backend(
+            be,
+            bind,
+            g,
+            cfg,
+            ec,
+            TokenEmbd::new(&embd, g),
+            None,
+            prompt,
+            1,
+            |_| {},
+            &mut None,
+            64,
+            None,
+            None,
+            None,
+            Some(&mut logits),
+            None,
+            None,
+            None,
+        )
+        .expect("synthetic generation");
+        logits
+    }
+
+    /// Llama 3.1's `rope_scaling.factor` — the divisor its converter gives the low-frequency pairs.
+    const LLAMA31_ROPE_FACTOR: f32 = 8.0;
+
+    /// One factor per rope pair of `llama_gguf`'s head: the high-frequency half unscaled, the
+    /// low-frequency half at [`LLAMA31_ROPE_FACTOR`] — llama3's profile in miniature.
+    fn llama3_style_rope_freqs() -> Vec<f32> {
+        let pairs = Q35_NE / 4;
+        (0..pairs)
+            .map(|p| {
+                if p < pairs / 2 {
+                    1.0
+                } else {
+                    LLAMA31_ROPE_FACTOR
+                }
+            })
+            .collect()
+    }
+
+    /// llama and llama4 divide their rope angles by `rope_freqs.weight` (llama.cpp's
+    /// `get_rope_factors` → `ggml_rope_ext`): a file carrying non-trivial factors must not score
+    /// like one without them, and all-ones factors must be the identity, bit for bit.
+    #[test]
+    fn llama_family_applies_rope_freqs() {
+        let prompt: Vec<u32> = (0..12u32).map(|i| (i * 5 + 3) % Q35_VOCAB as u32).collect();
+        let be = infr_cpu::CpuBackend::new();
+        let ec = EngineConfig::default();
+        for arch in ["llama", "llama4"] {
+            let run = |tag: &str, ff: Option<Vec<f32>>| {
+                let (g, cfg) = open_synthetic(&format!("{arch}-{tag}"), &llama_gguf(arch, ff));
+                assert!(cfg.rope_freq_factors, "{arch} must apply rope_freqs");
+                assert!(!cfg.is_nope_layer(0), "{arch}'s only layer must rope");
+                fresh_logits(
+                    &be,
+                    &crate::seam::cpu_upload_bind(&be),
+                    &g,
+                    &cfg,
+                    &ec,
+                    &prompt,
+                )
+            };
+            let none = run("none", None);
+            let ones = run("ones", Some(vec![1.0; Q35_NE / 4]));
+            let scaled = run("scaled", Some(llama3_style_rope_freqs()));
+            assert_eq!(none.len(), Q35_VOCAB);
+            assert_eq!(ones, none, "{arch}: all-ones rope_freqs moved the logits");
+            let moved = scaled
+                .iter()
+                .zip(&none)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                moved > 1e-3,
+                "{arch}: rope_freqs.weight was ignored (logits moved by {moved})"
+            );
+        }
+    }
+
+    /// A context larger than `Config::faithful_ctx_limit` — even one the caller pinned — gets a KV
+    /// cache of only the faithful length, so no position past it can be computed.
+    #[test]
+    fn llama4_context_is_capped_at_the_faithful_limit() {
+        let (g, cfg) = open_synthetic("llama4-ctx-cap", &llama_gguf("llama4", None));
+        let limit = cfg.faithful_ctx_limit().expect("chunked llama4 is capped");
+        let be = infr_cpu::CpuBackend::new();
+        let embd = std::sync::OnceLock::new();
+        let mut slot = None;
+        super::generate_dense_backend(
+            &be,
+            &crate::seam::cpu_upload_bind(&be),
+            &g,
+            &cfg,
+            &EngineConfig::default(),
+            TokenEmbd::new(&embd, &g),
+            None,
+            &[1, 2, 3],
+            1,
+            |_| {},
+            &mut slot,
+            limit + 1000,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("llama4 synthetic generation");
+        assert_eq!(slot.expect("slot initialized").max_ctx, limit);
+    }
+
+    /// A synthetic llama4 whose file claims a context far past the faithful cap, with a byte-level
+    /// vocabulary so `SeamModel::load_with` can build its tokenizer.
+    fn llama4_session_model() -> (TempGguf, crate::SeamModel) {
+        let mut m = llama_gguf("llama4", None);
+        for (k, v) in &mut m.meta {
+            if k == "llama4.context_length" {
+                *v = Meta::U32(1 << 20);
+            }
+        }
+        m.meta.extend([
+            ("tokenizer.ggml.model".to_string(), Meta::Str("gpt2".into())),
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                Meta::StrArr((0..Q35_VOCAB).map(|i| format!("t{i}")).collect()),
+            ),
+            (
+                "tokenizer.ggml.merges".to_string(),
+                Meta::StrArr(Vec::new()),
+            ),
+        ]);
+        let tmp = TempGguf::write("llama4-session-ctx", &m);
+        let model = crate::SeamModel::load_with(
+            tmp.path(),
+            None,
+            std::sync::Arc::new(EngineConfig::default()),
+        )
+        .expect("synthetic llama4 load");
+        (tmp, model)
+    }
+
+    /// Every way a session's context is asked for resolves through `SeamModel::session_ctx`, so
+    /// an explicit, a default (the file's trained context) and a huge fraction-of-VRAM request all
+    /// land on the cap; `n_ctx_train` itself stays the file's value.
+    #[test]
+    fn llama4_session_ctx_resolves_to_the_cap() {
+        let (_tmp, model) = llama4_session_model();
+        let limit = model
+            .config()
+            .faithful_ctx_limit()
+            .expect("chunked llama4 is capped");
+        assert_eq!(model.config().n_ctx_train, 1 << 20);
+        assert_eq!(model.session_ctx(1_000_000), limit, "explicit");
+        assert_eq!(
+            model.session_ctx(model.config().n_ctx_train),
+            limit,
+            "default"
+        );
+        assert_eq!(
+            model.session_ctx(limit - 1),
+            limit - 1,
+            "below the cap: untouched"
+        );
+    }
+
+    /// The Vulkan session constructors themselves — explicit (`--ctx`), default and fraction
+    /// (`INFR_CTX=N%`) — hand back the capped window, and `--ctx 1000000` on this tiny model is
+    /// neither refused nor pushed to a q8 cache (it is judged at the cap).
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn llama4_vulkan_sessions_open_at_the_cap() {
+        if infr_vulkan::VulkanBackend::new().is_err() {
+            return;
+        }
+        let (_tmp, model) = llama4_session_model();
+        let limit = model.config().faithful_ctx_limit().expect("capped");
+        let explicit = model
+            .vulkan_session(1_000_000)
+            .expect("explicit ctx session");
+        assert_eq!(explicit.max_ctx, limit, "explicit");
+        drop(explicit);
+        let default = model.vulkan_session_default().expect("default ctx session");
+        assert_eq!(default.max_ctx, limit, "default");
+        drop(default);
+        let frac = model
+            .vulkan_session_frac(0.5)
+            .expect("fraction ctx session");
+        assert_eq!(frac.max_ctx, limit, "fraction");
+    }
+
+    /// At the cap, a reply that would cross it is trimmed to the room left — the same budget a
+    /// session's `reply_budget` applies — instead of failing as a context overflow, while a
+    /// prompt that by itself fills the window still overflows.
+    #[test]
+    fn a_reply_at_the_context_cap_is_trimmed() {
+        let (g, mut cfg) = open_synthetic("llama-cap-trim", &llama_gguf("llama", None));
+        // A small cap stands in for llama4's, so the trim is reachable on a short prompt.
+        let cap = 24;
+        cfg.ctx_limit = Some(cap);
+        let be = infr_cpu::CpuBackend::new();
+        let embd = std::sync::OnceLock::new();
+        let run = |prompt: &[u32], max_new: usize| {
+            let mut n = 0usize;
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                &EngineConfig::default(),
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                max_new,
+                |_| n += 1,
+                &mut None,
+                prompt.len() + max_new + 1,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .map(|_| n)
+        };
+        let prompt: Vec<u32> = (0..10u32).map(|i| i % 4).collect();
+        let max_new = 3 * cap;
+        let n = run(&prompt, max_new).expect("a reply past the cap is trimmed, not refused");
+        assert!(n > 0, "the trimmed reply still generates");
+        assert!(
+            prompt.len() + n < cap,
+            "{n} tokens after a {}-token prompt overran the {cap}-token window",
+            prompt.len()
+        );
+        let long: Vec<u32> = (0..cap as u32).map(|i| i % 4).collect();
+        let err = run(&long, 1).expect_err("a prompt that fills the window must overflow");
+        assert!(
+            err.downcast_ref::<crate::ContextOverflow>().is_some(),
+            "{err}"
+        );
+    }
+
+    /// A `rope_freqs.weight` shorter than `rope.dimension_count / 2` would be read past its end
+    /// by every rope kernel; refuse it, as llama.cpp's loader does.
+    #[test]
+    fn llama_rope_freqs_of_the_wrong_length_are_refused() {
+        let (g, cfg) = open_synthetic("llama-short-ff", &llama_gguf("llama", Some(vec![1.0; 3])));
+        let be = infr_cpu::CpuBackend::new();
+        let embd = std::sync::OnceLock::new();
+        let err = super::generate_dense_backend(
+            &be,
+            &crate::seam::cpu_upload_bind(&be),
+            &g,
+            &cfg,
+            &EngineConfig::default(),
+            TokenEmbd::new(&embd, &g),
+            None,
+            &[1, 2, 3],
+            1,
+            |_| {},
+            &mut None,
+            64,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("a 3-element rope_freqs on a 16-wide rope must be refused");
+        assert_eq!(
+            err.to_string(),
+            "rope_freqs.weight has 3 elements; rope.dimension_count 16 needs 8"
+        );
+    }
+
+    /// The Vulkan forms of the llama rope with `rope_freqs.weight` — the f16 q/k write, the fused
+    /// K-cache write, and the record-once decode's `rope_f16_dyn_ff` — must score like the CPU
+    /// reference, at prompt lengths that put the last token through prefill and decode alike.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn llama_rope_freqs_vulkan_matches_cpu() {
+        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
+            return;
+        };
+        println!(
+            "vulkan device: {}",
+            infr_core::backend::Backend::capabilities(&vk).name
+        );
+        let cpu = infr_cpu::CpuBackend::new();
+        let ec = EngineConfig::default();
+        for arch in ["llama", "llama4"] {
+            let (g, cfg) = open_synthetic(
+                &format!("{arch}-vk-ff"),
+                &llama_gguf(arch, Some(llama3_style_rope_freqs())),
+            );
+            for n in [1usize, 2, 9, 30] {
+                let prompt: Vec<u32> = (0..n as u32)
+                    .map(|i| (i * 5 + 3) % Q35_VOCAB as u32)
+                    .collect();
+                let want = fresh_logits(
+                    &cpu,
+                    &crate::seam::cpu_upload_bind(&cpu),
+                    &g,
+                    &cfg,
+                    &ec,
+                    &prompt,
+                );
+                let bind = crate::seam::vulkan_moe_binder(&vk, &g, &cfg, &ec, true, 64)
+                    .expect("vulkan weight binder");
+                let got = fresh_logits(&vk, &*bind, &g, &cfg, &ec, &prompt);
+                let err = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, |m, d| {
+                        if m.is_nan() || d.is_nan() {
+                            f32::NAN
+                        } else {
+                            m.max(d)
+                        }
+                    });
+                println!("{arch} n={n}: vulkan-vs-cpu max err {err:e}");
+                assert!(err < 2e-2, "{arch} n={n}: Vulkan misses the CPU by {err}");
+            }
+        }
+    }
+
     /// A one-layer gemma3 whose only layer is sliding-window (`window` 8), every tensor f32.
     fn gemma3_gguf() -> SyntheticModel {
         let hd = Q35_NE / 2;
@@ -7108,6 +7637,94 @@ mod tests {
             after, fresh,
             "the rewind read ring rows an earlier, longer turn had recycled"
         );
+    }
+
+    /// A session's placement may pin a shorter prefill chunk, and its SWA rings are sized with
+    /// that height. The conversation-slot pickers fork and seed BEFORE entering the session's
+    /// placement scope, so both must take the height from the slot rather than from
+    /// `ubatch_rows`, which answers with the process fallback out there: the fork must have the
+    /// source's geometry, a wrapped source must not seed, and the fork must then score like a
+    /// fresh slot.
+    #[test]
+    fn fork_and_seed_outside_the_placement_scope_keep_the_ring_height() {
+        let (g, cfg) = open_synthetic("gemma3-ring-pinned", &gemma3_gguf());
+        assert!(cfg.is_swa_layer(0) && cfg.swa_window == 8);
+        let embd = std::sync::OnceLock::new();
+        // No user-pinned chunk: the height comes from the placement pins.
+        let ec = EngineConfig::default();
+        const PINNED: usize = 16;
+        // Long enough that the fallback height's ring is a different size from the pinned one's.
+        const CTX: usize = 4096;
+        assert_ne!(
+            crate::seam::ubatch_rows(&ec),
+            PINNED,
+            "the fallback height must differ from the pinned one, or this test checks nothing"
+        );
+        let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
+        {
+            let _scope = crate::seam::PlacementScope::enter(pins.clone());
+            crate::seam::pin_ubatch(PINNED);
+        }
+        let be = infr_cpu::CpuBackend::new();
+        let logits = |prompt: &[u32], state: &mut Option<SeamKv>| {
+            let _scope = crate::seam::PlacementScope::enter(pins.clone());
+            let mut out = Vec::new();
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                1,
+                |_| {},
+                state,
+                CTX,
+                None,
+                None,
+                None,
+                Some(&mut out),
+                None,
+                None,
+                None,
+            )
+            .expect("gemma3 synthetic generation");
+            out
+        };
+        let ids = |n: usize, salt: u32| -> Vec<u32> {
+            (0..n as u32)
+                .map(|i| (i * 7 + salt) % Q35_VOCAB as u32)
+                .collect()
+        };
+
+        // More positions than the pinned height's ring holds, so the source wraps.
+        let a = ids(100, 3);
+        let mut src = None;
+        logits(&a, &mut src);
+        let src = src.expect("slot initialized");
+        let ring_rows = crate::seam::kv_rows_at(&cfg, 0, CTX, true, PINNED);
+        assert!(
+            src.kv_ring && src.written_end > ring_rows,
+            "the source must wrap its ring"
+        );
+
+        let mut fork = src
+            .fork(&be, &cfg)
+            .expect("a fork must match its source's geometry");
+        fork.seed_from(&be, &cfg, &src, a.len() - 1)
+            .expect("seeding from a wrapped ring is skipped, not an error");
+        assert!(
+            fork.cached.is_empty(),
+            "a ring that wrapped seeded {} positions",
+            fork.cached.len()
+        );
+
+        let c = [&a[..40], &ids(2, 11)[..]].concat();
+        let fresh = logits(&c, &mut None);
+        let mut fork = Some(fork);
+        assert_eq!(logits(&c, &mut fork), fresh);
     }
 
     /// A prefill cancelled between two chunks has written ring rows for positions `cached` never

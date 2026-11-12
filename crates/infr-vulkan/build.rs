@@ -695,6 +695,14 @@ fn main() {
         ("rope", "rope_ff_back", &["-DFREQ_FACTORS", "-DBACKWARD"]),
         ("rope", "rope_f16", &["-DOUT_F16"]),
         ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),
+        // The llama/llama4 q/k rope with the llama3 `rope_freqs.weight` divisors: the f16-out
+        // and record-once forms above, each with the ff binding (see `Recorder::rope_f16`).
+        ("rope", "rope_f16_ff", &["-DOUT_F16", "-DFREQ_FACTORS"]),
+        (
+            "rope",
+            "rope_f16_dyn_ff",
+            &["-DOUT_F16", "-DUSE_PARAMS", "-DFREQ_FACTORS"],
+        ),
         ("linear_f16", "linear_f16", &[]),
         // !caps.f16 fallback (no shaderFloat16 ext): reads the f16 weight buffer as packed u32 +
         // unpackHalf2x16 (core GLSL) instead of a float16_t SSBO read.
@@ -828,6 +836,16 @@ fn main() {
             "rope",
             "rope_f16_dyn_bda",
             &["-DOUT_F16", "-DUSE_PARAMS", "-DKV_BDA"],
+        ),
+        (
+            "rope",
+            "rope_f16_ff_bda",
+            &["-DOUT_F16", "-DFREQ_FACTORS", "-DKV_BDA"],
+        ),
+        (
+            "rope",
+            "rope_f16_dyn_ff_bda",
+            &["-DOUT_F16", "-DUSE_PARAMS", "-DFREQ_FACTORS", "-DKV_BDA"],
         ),
         ("qk_norm_rope", "qk_norm_rope_bda", &["-DKV_BDA"]),
         (

@@ -47,6 +47,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reach the multi-space tokens. Several more `tokenizer.ggml.pre` names are
   mapped, and an unknown one logs a warning instead of silently getting the
   GPT-2 regex. Qwen3 and Gemma 3 prompts are unchanged.
+- **Llama 3.1, 3.2, 3.3 and Llama 4 output changes: their RoPE frequency factors
+  are now applied.** These files carry a `rope_freqs.weight` tensor that
+  llama.cpp divides each rotary angle by; infr applied it only for Gemma 4, so
+  many rotary pairs turned too fast and the error grew with position. Llama 3.0
+  has no such tensor and is unchanged.
+- **Llama 4's context is capped at 8191 tokens, and Mistral-Large-3's at its
+  temperature length.** Past those points the reference changes its attention
+  (chunking, and a position-dependent temperature) in ways infr does not
+  implement, so a longer context computed something else. A larger `--ctx` is
+  lowered with a warning.
+- **Models infr would compute wrongly are refused at load, by name**: a GGUF
+  with a per-tensor `.scale` that the reference applies (NVFP4 / ModelOpt
+  conversions); a DeepSeek-family file whose YaRN magnitude is not 1; a Qwen3.5
+  file with a non-periodic recurrent-layer layout. A `.scale` the reference
+  ignores still loads.
 - **SentencePiece GGUFs without a `tokenizer.ggml.add_space_prefix` key — Llama
   2-style, Mistral v0.x, Phi-3 — now get the leading-space prefix, as in
   llama.cpp**, before the text and after every special token, and Phi-3 drops
@@ -147,6 +162,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Vulkan: shapes a kernel cannot hold are refused by name** in release builds
   too (DeltaNet head width, QK-norm head size, sampler top-k range, a Q8 KV row
   that is not a whole number of blocks). They were debug-only assertions.
+- **`INFR_DELTA_STRIDED=1` computed garbage** on Vulkan (the kernel wrote its
+  output at the wrong offset) and on the CPU (which does not implement the mode
+  and was handed its input layout anyway).
+- **Sliding-window models under `serve --parallel`: a slot forked or seeded from
+  another could size its KV ring from the wrong prefill chunk**, losing the
+  extra slot or seeding stale rows.
 - **`infr serve`: `usage.prompt_tokens` counts the whole prompt.** It reported
   only the tokens prefilled for this request, so a KV prefix cache hit made a
   long prompt look short. `/metrics` still counts prefilled tokens only.

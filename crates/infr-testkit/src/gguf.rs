@@ -29,6 +29,8 @@ pub enum Meta {
     I32Arr(Vec<i32>),
     /// An array of FLOAT32s — `deepseek4.swiglu_clamp_exp` / `_shexp` in their per-layer form.
     F32Arr(Vec<f32>),
+    /// An array of BOOLs — a per-block flag such as `qwen35.attention.recurrent_layers`.
+    BoolArr(Vec<bool>),
 }
 
 fn push_u32(b: &mut Vec<u8>, v: u32) {
@@ -99,6 +101,12 @@ impl Meta {
                 for v in a {
                     b.extend_from_slice(&v.to_le_bytes());
                 }
+            }
+            Meta::BoolArr(a) => {
+                push_u32(b, 9);
+                push_u32(b, 7); // element type: BOOL
+                push_u64(b, a.len() as u64);
+                b.extend(a.iter().map(|&v| u8::from(v)));
             }
         }
     }

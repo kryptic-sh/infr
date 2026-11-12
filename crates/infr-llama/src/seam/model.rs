@@ -319,7 +319,7 @@ impl SlotPool {
                 .flatten()
                 .next()
                 .expect("pick_slot: no initialized slot to fork from");
-            match src.fork(be, cfg, ec) {
+            match src.fork(be, cfg) {
                 Ok(fresh) => {
                     self.slots.push(Some(fresh));
                     self.last_used.push(self.tick);
@@ -348,7 +348,7 @@ impl SlotPool {
             if best_s > score(&self.slots[target]) {
                 let src = self.slots[best_i].take().expect("scored slot is Some");
                 if let Some(dst) = self.slots[target].as_mut() {
-                    dst.seed_from(be, cfg, ec, &src, best_s)?;
+                    dst.seed_from(be, cfg, &src, best_s)?;
                 }
                 self.slots[best_i] = Some(src);
             }
@@ -398,6 +398,7 @@ impl SeamModel {
         // above already read its shape, so a model missing the tensor still fails at load, not on
         // the lazy path below.
         let per_layer_embd = build_per_layer_embd(&g, &cfg)?;
+        warn_ctx_cap(&cfg, &ecfg);
         Ok(Self {
             gguf: g,
             cfg,
@@ -414,6 +415,17 @@ impl SeamModel {
     /// the same values its buffers were placed with.
     pub fn engine_cfg(&self) -> &std::sync::Arc<crate::EngineConfig> {
         &self.ecfg
+    }
+
+    /// The context a session asked for `want` opens at: `want` capped at
+    /// [`Config::faithful_ctx_limit`]. Every session entry point resolves its context through
+    /// this BEFORE anything sizes, prices or admits against it, so the KV fit, the auto-q8 and
+    /// refusal rungs and every reply budget see the capped window. Silent: the load already said
+    /// so once (`warn_ctx_cap`).
+    pub(crate) fn session_ctx(&self, want: usize) -> usize {
+        self.cfg
+            .faithful_ctx_limit()
+            .map_or(want, |limit| want.min(limit))
     }
 
     /// The model's resident weight footprint, computed once and memoized (see the `footprint`
@@ -442,6 +454,7 @@ impl SeamModel {
         dev: Option<usize>,
         max_ctx: usize,
     ) -> Result<DenseVulkanSession> {
+        let max_ctx = self.session_ctx(max_ctx);
         let vk = open_backend(dev, self.ecfg.clone())?;
         // The auto-q8 rung may pin this session's KV format, so it runs under THIS session's
         // placement scope, as in `vulkan_session_default_on`.
@@ -481,7 +494,7 @@ impl SeamModel {
         // placement scope so the decision lands on its own pins, not a process-global cell.
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
-        let max_ctx = self.clamp_default_ctx(&vk, self.cfg.n_ctx_train);
+        let max_ctx = self.clamp_default_ctx(&vk, self.session_ctx(self.cfg.n_ctx_train));
         drop(scope);
         let max_ctx = max_ctx?;
         Ok(DenseVulkanSession {
@@ -517,7 +530,7 @@ impl SeamModel {
         // the trained context (same shape as the default path's `kv_per_tok == 0` escape).
         let fit = self.kv_fit_ctx(&vk).unwrap_or(self.cfg.n_ctx_train);
         drop(scope);
-        let max_ctx = ((fit as f64 * frac) as usize).max(1024);
+        let max_ctx = self.session_ctx(((fit as f64 * frac) as usize).max(1024));
         Ok(DenseVulkanSession {
             be: vk,
             pool: SlotPool::new(),
@@ -932,15 +945,15 @@ impl SeamModel {
         // An explicit token count is the user's demand — honour it verbatim, at any N, quantizing
         // the cache to q8_0 when that is what it takes to fit.
         if let Some(infr_core::SizeSpec::Bytes(c)) = want {
-            let ctx = (c as usize).max(1);
+            let ctx = self.session_ctx((c as usize).max(1));
             self.auto_q8_for_explicit_ctx(vk, ctx, n_slots);
             self.refuse_explicit_ctx(vk, ctx, n_slots)?;
             return Ok(ctx);
         }
+        let trained = self.session_ctx(self.cfg.n_ctx_train);
         if n_slots == 1 && want.is_none() {
-            return self.clamp_default_ctx(vk, self.cfg.n_ctx_train);
+            return self.clamp_default_ctx(vk, trained);
         }
-        let trained = self.cfg.n_ctx_train;
         let Some(fit) = self.kv_fit_ctx(vk) else {
             return Ok(trained); // pure recurrent-state arch: no per-token KV to divide.
         };
@@ -1463,7 +1476,7 @@ impl SeamModel {
         Ok(DenseMetalSession {
             be: mtl,
             pool: SlotPool::new(),
-            max_ctx,
+            max_ctx: self.session_ctx(max_ctx),
             cfg: self.ecfg.clone(),
             ext: (),
         })
@@ -2363,6 +2376,32 @@ pub(crate) fn spec_accept_stochastic(
     // Every candidate accepted: sample the bonus token from the target's own distribution.
     let bonus = crate::sampling::sample_from_dist(&p_dists[cand.len()], rng);
     (cand.len(), bonus)
+}
+
+/// Say once, at load, that [`Config::faithful_ctx_limit`] lowers the context this model would
+/// otherwise get: an explicit `--ctx`/`INFR_CTX` token count above the cap, or — with none — the
+/// file's trained context, which is what the default asks for before the VRAM fit. A percentage
+/// is sized against free VRAM at session open, so it is only named, not compared.
+fn warn_ctx_cap(cfg: &Config, ecfg: &crate::EngineConfig) {
+    let Some(limit) = cfg.faithful_ctx_limit() else {
+        return;
+    };
+    let asked = match crate::chat::cfg_ctx_spec(ecfg) {
+        Some(infr_core::SizeSpec::Bytes(c)) => Some((c as usize, "the requested context")),
+        Some(infr_core::SizeSpec::Percent(_)) => None,
+        None => Some((cfg.n_ctx_train, "the trained context")),
+    };
+    let lowered = asked.filter(|&(ctx, _)| ctx > limit);
+    if asked.is_none() || lowered.is_some() {
+        let what = lowered.map_or("a VRAM-fraction context".to_string(), |(ctx, w)| {
+            format!("{w} {ctx}")
+        });
+        tracing::warn!(
+            "ctx cap: {what} -> at most {limit} tokens: past that this model's reference changes \
+             its attention (a position-dependent temperature; on llama4 also chunking) in a way \
+             infr does not implement"
+        );
+    }
 }
 
 /// Cap a reply of up to `max_new` tokens to the context a `prompt_len`-token prompt leaves in a

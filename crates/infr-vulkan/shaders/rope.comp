@@ -12,6 +12,8 @@
 // this kernel with `sin_sign = -1` (see `Op::Rope::backward`); deepseek4 de-ropes its attention
 // OUTPUT before the grouped output projection. Same static-f32-only rule as NEOX (`rope_back`,
 // `rope_ff_back`).
+// -DFREQ_FACTORS composes with every build here: the f16-out and record-once forms carry the
+// llama3 long-context factors (`rope_freqs.weight`) on the llama/llama4 q/k write.
 #ifdef OUT_F16
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -28,28 +30,42 @@ layout(push_constant) uniform PC {
 #endif
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
-#ifdef FREQ_FACTORS
-// YaRN per-pair frequency divisors (`rope_dim/2` floats): the rotation angle is DIVIDED by
-// ff[pair] (deepseek2 k_pe — see `rope_ff` build in build.rs). Binds at 1; y shifts to 2 —
-// the hazard tracker treats the TRAILING binding as the write, and the recorder binds
-// [x, ff, y], so the output must come last for the store→read barrier. (FREQ_FACTORS is only
-// built WITHOUT OUT_F16/USE_PARAMS — the adapter rejects ff on the f16/dyn paths.)
-layout(binding = 1) readonly buffer FB { float ff[]; };
-#endif
+// Per-pair frequency divisors (`rope_dim/2` floats): the rotation angle is DIVIDED by ff[pair]
+// (deepseek2's YaRN k_pe ramp, the llama3 `rope_freqs.weight`). They bind right after the inputs
+// (x, then params under USE_PARAMS) and shift y one slot later — the hazard tracker treats the
+// TRAILING binding as the write, and the recorder binds [x, (params,) ff, y], so the output must
+// come last for the store→read barrier. Under KV_BDA y is never declared, but the recorder still
+// binds the cache inert in that last slot.
 #ifdef USE_PARAMS
 layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+#ifdef FREQ_FACTORS
+layout(binding = 2) readonly buffer FB { float ff[]; };
+#ifndef KV_BDA
+layout(binding = 3) buffer YB { float16_t y[]; };
+#endif
+#else
 #ifndef KV_BDA
 layout(binding = 2) buffer YB { float16_t y[]; };
 #endif
-#elif defined(OUT_F16)
+#endif
+#else
+#ifdef FREQ_FACTORS
+layout(binding = 1) readonly buffer FB { float ff[]; };
+#endif
+#ifdef OUT_F16
 #ifndef KV_BDA
+#ifdef FREQ_FACTORS
+layout(binding = 2) buffer YB { float16_t y[]; };
+#else
 layout(binding = 1) buffer YB { float16_t y[]; };
+#endif
 #endif
 #else
 #ifdef FREQ_FACTORS
 layout(binding = 2) buffer YB { float y[]; };
 #else
 layout(binding = 1) buffer YB { float y[]; };
+#endif
 #endif
 #endif
 #if defined(OUT_F16) && defined(KV_BDA)

@@ -3667,6 +3667,67 @@ cache dtype). Left:
 - To measure in a quiet window: per-op decode time for `rmsnorm` /
   `rmsnorm_wide` and `deltanet_norm` after the added uniform branch.
 
+### B147 — seam emitters against llama.cpp, 2026-11-12: fixed, capped, refused and left (2026-11-12)
+
+Every graph emitter in `seam/runner.rs` was compared op by op with its llama.cpp
+builder (checkout `57291f2`). DeltaNet, the DeepSeek MLA and V4 ratio-0 paths
+and MoE routing for every MoE arch match. Fixed from it: `rope_freqs.weight` is
+applied for the llama and llama4 archs on every rope path (it was gemma4-only,
+so Llama 3.1+ and Llama 4 rotated a large share of their rotary pairs too fast);
+the strided DeltaNet path (`deltanet_strided.comp` wrote its output at an input
+offset, and the emitter enabled the mode on backends that do not implement it);
+slot `fork` / `seed_from` reading the wrong prefill-chunk height;
+tensor-parallel classifying q/k/v biases as weights. Capped or refused instead
+of implemented:
+
+- **Llama 4 is capped at `Config::faithful_ctx_limit()`** (one token short of
+  its attention chunk). Past it the reference uses chunked attention
+  (`LLAMA_SWA_TYPE_CHUNKED`) and a position-dependent temperature on the NoPE
+  layers; the mask needs a new attention-mask kind in the CPU, Vulkan and Metal
+  kernels. Mistral-Large-3 (`deepseek2.attention.temperature_scale`) is capped
+  at its `temperature_length` the same way. Implementing either lifts the cap.
+- **A `.scale` tensor the reference applies and infr does not is refused at
+  load** (`applied_weight_scales`, one row per llama.cpp builder; scales the
+  builder ignores load as before). This is the NVFP4 / ModelOpt case. Applying
+  the scales would lift the refusal. The diffusion-gemma row copies gemma4's:
+  the checkout has no builder for it.
+- **An MLA model whose YaRN magnitude is not 1 is refused** (`mla_rope_mscale`):
+  infr's `Op::Mla` / `Op::Rope` take frequency divisors only. Every DeepSeek V2
+  / V3 / V3.2, Kimi K2 and Mistral-Large-3 file evaluates to exactly 1.
+- **Needs a decision — deepseek32 with an unusual YaRN multiplier.** llama.cpp
+  applies its `mscale_all_dims` special case to `deepseek2` only, so a
+  deepseek32 file with stretching and a multiplier that is neither 0 nor 1 gets
+  a different attention factor there than the deepseek2 rule infr uses. Real
+  V3.2 declares 1 and is unaffected. The synthetic deepseek32 fixture uses
+  V2-Lite's multiplier and IS in that case, so refusing it fails the fixture's
+  locked-logit tests. Today such a file loads with one warning
+  (`deepseek32_yarn_rules_agree`). Options: change the fixture to the real
+  file's multiplier, re-bless its logits and refuse the case; or keep the
+  warning.
+- A qwen35 file whose `attention.recurrent_layers` is not the periodic layout is
+  refused; no converter writes one.
+
+Left, confirmed by reading and not changed:
+
+- **qwen35 KV estimate.** `kv_bytes_estimate_fmt` prices every DeltaNet layer as
+  a full attention cache (`kv_row_elems` has no qwen35 branch) while
+  `kv_layer_alloc_bytes` allocates the fixed conv / S state — so the default
+  context clamps to a fraction of what fits and `moe_expert_budget`
+  over-reserves. Same decision as B131's snapshot bullet: fixing the estimate
+  makes qwen35 contexts much larger.
+- **`dsv4_plan.rs` is dead code and diverges from the reference** (no HCA dummy
+  block when none completes; `n_kv` not padded to a multiple of 256). Part of
+  the V4 compressed-tier feature.
+- The runner's prefill chunk height still reads the live `ubatch_rows(ec)` where
+  the ring uses the slot's recorded value; they agree on every entry found, and
+  `.min(recorded)` would make the bound hold regardless.
+- Numerically negligible differences: the DeltaNet L2 norm's epsilon form, and
+  the MoE renormalisation clamp.
+- For a llama4 file with `sliding_window == 0` llama.cpp makes the last layer
+  NoPE and then asserts; infr ropes every layer. No known file.
+- Not read by that pass: the DiffusionGemma emitters against an actual reference
+  (the fork checkout is absent).
+
 ### Review coverage (2026-11-11, remaining areas)
 
 Six read-only reviews, one per area, none of which built or ran anything.

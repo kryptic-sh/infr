@@ -20,8 +20,9 @@ pub const LLAMA: &str = "llama";
 /// Qwen2-MoE-style DENSE shared expert summed IN (no per-token gate, unlike qwen35moe), and iRoPE:
 /// every `no_rope_layer_step`-th layer is NoPE (rope skipped, global attention) while rope layers
 /// carry chunked local attention; rope layers also apply a WEIGHTLESS per-head L2-norm to Q/K
-/// AFTER rope (`Llama4TextL2Norm`). Chunked-attention masking + NoPE attention-temperature scaling
-/// (both no-ops below the 8192-token chunk size) are CPU follow-ups — see `Config::from_gguf`.
+/// AFTER rope (`Llama4TextL2Norm`). Chunked-attention masking and the NoPE attention temperature
+/// are not implemented; the context is capped where the first of them would change the output —
+/// see `Config::faithful_ctx_limit`.
 pub const LLAMA4: &str = "llama4";
 /// Qwen2/2.5 (incl. Qwen2.5-Coder, R1-Distill-Qwen). Llama path + q/k/v projection biases; ships
 /// HF rotate-half q/k order, so the loader permutes rows (`Config::permute_qk_neox`).

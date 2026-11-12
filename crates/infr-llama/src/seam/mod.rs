@@ -1035,8 +1035,8 @@ pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
 ///
 /// The indexer cache **must never ring**: `Op::LightningIndexer` masks causally only, so position 0
 /// stays eligible for every query row and every backend refuses a cache holding fewer rows than
-/// `kv_len`. That is why it is sized off [`kv_rows`] like any full-context side — V3.2 has no
-/// sliding-window layer, so `kv_rows` returns the whole context — and why the allocation asserts it
+/// `kv_len`. That is why it is sized off [`kv_rows_at`] like any full-context side — V3.2 has no
+/// sliding-window layer, so `kv_rows_at` returns the whole context — and why the allocation asserts it
 /// (see `generate_dense_backend`'s KV loop).
 ///
 /// Recurrent-state layers (qwen35 DeltaNet) have no per-token cache to size; their callers branch
@@ -1170,8 +1170,21 @@ pub(crate) fn mla_kv_fmt(
     Ok((DType::F16, DType::F16))
 }
 
-/// [`kv_rows`] at an EXPLICIT chunk height (the try-resident sweep prices candidate heights
-/// before pinning one; everyone else goes through `kv_rows`/`ubatch_rows`).
+/// Row capacity of layer `l`'s K/V cache at context `want_ctx`, for prefill chunk height
+/// `ubatch`. With `ring` (SWA ring sizing on for this session — see [`kv_ring_wanted`] + the
+/// backend's `Capabilities::kv_swa_ring`), a sliding-window layer allocates only
+/// `min(want_ctx, round64(window + ubatch))` rows and the backends write/read position `p` at row
+/// `p % rows` (WriteKv/Attention ring semantics).
+///
+/// Correctness bound: during one forward of `B <= ubatch` rows starting at position `p0`, the
+/// oldest position any query's window reaches is `p0 + 1 - window` and the newest written is
+/// `p0 + B - 1` — at most `window + B - 1 <= window + ubatch` distinct live positions, so a ring
+/// of `window + ubatch` rows never recycles a row the sliding-window mask hasn't ALREADY excluded
+/// (that mask discards everything older than `pos - window`); attention output is therefore
+/// identical to the full-context cache. Global (non-SWA) layers keep full `want_ctx` rows.
+///
+/// A live slot passes the height its rings were sized with (`SeamKv::ubatch`); placement passes
+/// [`ubatch_rows`] or the candidate height it is pricing.
 pub(crate) fn kv_rows_at(
     cfg: &Config,
     l: usize,
@@ -1184,27 +1197,6 @@ pub(crate) fn kv_rows_at(
     } else {
         want_ctx
     }
-}
-
-/// Row capacity of layer `l`'s K/V cache at context `want_ctx`. With `ring` (SWA ring sizing on
-/// for this session — see [`kv_ring_wanted`] + the backend's `Capabilities::kv_swa_ring`), a
-/// sliding-window layer allocates only `min(want_ctx, round64(window + ubatch))` rows and the
-/// backends write/read position `p` at row `p % rows` (WriteKv/Attention ring semantics).
-///
-/// Correctness bound: during one forward of `B <= ubatch` rows starting at position `p0`, the
-/// oldest position any query's window reaches is `p0 + 1 - window` and the newest written is
-/// `p0 + B - 1` — at most `window + B - 1 <= window + ubatch` distinct live positions, so a ring
-/// of `window + ubatch` rows never recycles a row the sliding-window mask hasn't ALREADY excluded
-/// (that mask discards everything older than `pos - window`); attention output is therefore
-/// identical to the full-context cache. Global (non-SWA) layers keep full `want_ctx` rows.
-pub(crate) fn kv_rows(
-    cfg: &Config,
-    l: usize,
-    want_ctx: usize,
-    ring: bool,
-    ec: &EngineConfig,
-) -> usize {
-    kv_rows_at(cfg, l, want_ctx, ring, ubatch_rows(ec))
 }
 
 /// KV-cache footprint ESTIMATE summed over all layers at chunk height `ubatch` and side format:
@@ -1226,7 +1218,7 @@ pub(crate) fn kv_bytes_estimate(
 
 /// Rows of headroom every KV footprint estimate adds PER LAYER on top of the context's own rows.
 ///
-/// The runner allocates exactly `kv_rows(..) * kv_row_elems(..)` elements per side (see
+/// The runner allocates exactly `kv_rows_at(..) * kv_row_elems(..)` elements per side (see
 /// `generate_dense_backend`'s KV loop and `SeamKv::fork`) — this is deliberate slop, not a
 /// pad the allocation actually contains, so every estimate that uses it is conservative by a
 /// bounded, layer-proportional amount rather than by an unexplained percentage.
@@ -1699,7 +1691,7 @@ pub(crate) fn kv_layer_alloc_bytes(
     // `indexer_head_size` and is reserved like any other side.
     let (k_row, v_row) = kv_row_elems(cfg, l);
     // SWA ring: window layers hold only `window + ubatch` rows (the ring recycles rows the window
-    // mask already excludes — `kv_rows` has the argument).
+    // mask already excludes — `kv_rows_at` has the argument).
     let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch);
     // The indexer cache MUST hold the whole context: `Op::LightningIndexer` masks causally only, so
     // position 0 stays eligible for every query row and a ring that had wrapped would have
@@ -1923,7 +1915,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             None => {
                 let fp = crate::weights::weight_footprint(g);
                 let vram = vk.vram();
-                // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a
+                // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows_at`), so a
                 // mostly-SWA model's KV prices far below n_layer * ctx. +64 rows/layer slop.
                 let ring = kv_ring_wanted(cfg, ec);
                 // Route through the shared q8-aware helper (the dense placement path already does),
@@ -2221,7 +2213,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let vram = vk.vram();
         // The per-side KV formats a chunk/format candidate prices: `q8` = BOTH sides Q8_0 (34
         // bytes / 32 elems), false = f16 (2 B/elem). Per-layer rows ring at window+ubatch rows
-        // (see `kv_rows`) — what lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its
+        // (see `kv_rows_at`) — what lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its
         // KV small enough to take the try-resident tier at real contexts instead of streaming.
         let kv_fmts = |q8: bool| {
             let side = if q8 { DType::Q8_0 } else { DType::F16 };
@@ -2871,7 +2863,10 @@ fn tp_weight_role(name: &str, cfg: &Config) -> Option<(infr_vulkan::TpRole, usiz
         .and_then(|r| r.split('.').next())
         .and_then(|s| s.parse::<usize>().ok());
     let l = layer?;
-    let after = name.rsplit('.').nth(1)?; // e.g. "attn_q" from "blk.3.attn_q.weight"
+    // Only a projection MATRIX is sharded. Its bias (qwen2's `attn_q.bias`) shares the projection
+    // name, but it is a 1-D vector the column slicer cannot cut by rows; biases are replicated.
+    // e.g. "attn_q" from "blk.3.attn_q.weight"
+    let after = name.strip_suffix(".weight")?.rsplit('.').next()?;
     let ne = cfg.n_embd;
     let qrow = cfg.n_head * cfg.layer_head_dim(l);
     let nff = cfg.layer_n_ff(l);
@@ -2882,6 +2877,21 @@ fn tp_weight_role(name: &str, cfg: &Config) -> Option<(infr_vulkan::TpRole, usiz
         "ffn_down" => Some((infr_vulkan::TpRole::Row, nff)),
         _ => None, // attn_norm/ffn_norm/q_norm/k_norm/biases → replicated
     }
+}
+
+/// Refuse a model with q/k/v projection biases under tensor parallelism. Each rank computes only
+/// its band of the column-sharded projection, and the TP lowering has no sharded `Op::AddBias`
+/// to add the matching band of a replicated bias (it refuses an elementwise op on a sharded
+/// tensor) — so say which model feature is missing rather than fail in the lowering.
+fn tp_bias_guard(cfg: &Config) -> AResult<()> {
+    if cfg.qkv_bias {
+        return Err(anyhow!(
+            "INFR_TENSOR_PARALLEL does not support attention q/k/v projection biases \
+             (attn_q/attn_k/attn_v.bias, e.g. qwen2): sharding their projections needs a sharded \
+             bias add — run this model on one device or with INFR_PIPELINE"
+        ));
+    }
+    Ok(())
 }
 
 /// Column slice: rank `r` of `world` takes the contiguous output-row band
@@ -3027,6 +3037,7 @@ pub(crate) fn generate_dense_vulkan_tp(
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
     dense_multi_gpu_guard(cfg, "INFR_TENSOR_PARALLEL")?;
+    tp_bias_guard(cfg)?;
     let backends = open_vulkan_devices(devices, ec)?;
     let names = backends
         .iter()
@@ -3685,7 +3696,10 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 
 #[cfg(test)]
 mod bda_cap_tests {
-    use super::{check_bda_element_cap, chunk_covered_dense_tensor, BDA_ELEMENT_UNIT_MAX};
+    use super::{
+        check_bda_element_cap, chunk_covered_dense_tensor, tp_bias_guard, tp_weight_role, Config,
+        BDA_ELEMENT_UNIT_MAX,
+    };
 
     #[test]
     fn chunk_covered_names_are_exactly_lm_head_and_embed() {
@@ -3752,6 +3766,53 @@ mod bda_cap_tests {
             whole / n_expert,
         )
         .expect("resident expert bank per-slice must pass");
+    }
+
+    /// Tensor parallelism shards projection MATRICES only. qwen2's q/k/v biases share their
+    /// projection's name but are 1-D, so classifying them as column-parallel sent them to the
+    /// row slicer and failed with a slice-geometry error; they are replicated, and a model that
+    /// has them is refused up front by name.
+    #[test]
+    fn tp_shards_projection_weights_and_refuses_qkv_biases() {
+        let cfg = Config {
+            n_layer: 1,
+            n_head: 2,
+            head_dim: 4,
+            n_embd: 8,
+            n_ff: 16,
+            qkv_bias: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            tp_weight_role("blk.0.attn_q.weight", &cfg),
+            Some((infr_vulkan::TpRole::Column, 8))
+        ));
+        assert!(matches!(
+            tp_weight_role("blk.0.attn_output.weight", &cfg),
+            Some((infr_vulkan::TpRole::Row, 8))
+        ));
+        for bias in [
+            "blk.0.attn_q.bias",
+            "blk.0.attn_k.bias",
+            "blk.0.attn_v.bias",
+        ] {
+            assert!(
+                tp_weight_role(bias, &cfg).is_none(),
+                "{bias} must be replicated"
+            );
+        }
+        let err = tp_bias_guard(&cfg).expect_err("q/k/v biases must be refused under TP");
+        assert!(
+            err.to_string().starts_with(
+                "INFR_TENSOR_PARALLEL does not support attention q/k/v projection biases"
+            ),
+            "{err}"
+        );
+        tp_bias_guard(&Config {
+            qkv_bias: false,
+            ..cfg
+        })
+        .expect("a bias-free model is not refused");
     }
 
     #[test]

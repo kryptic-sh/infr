@@ -51,6 +51,28 @@ pub(super) struct SelfCondWeights {
     pub(super) emb16: Vec<u16>,
 }
 
+/// Size `ping` — the denoise loop's ping-pong canvas-logits pair (`SeamKv::sc_ping`) — for a
+/// `bytes`-byte `[cc, vocab]` output, allocating it on first use and REallocating it when the
+/// canvas length changed: each step binds a buffer as the whole `[cc, vocab]` LM-head output, so a
+/// pair sized for a shorter canvas would be written past its end. `Ok(true)` when the pair is new
+/// (zeroed — it holds no previous step's logits).
+pub(super) fn ensure_sc_ping(
+    be: &dyn Backend,
+    ping: &mut Option<[Box<dyn Buffer>; 2]>,
+    bytes: usize,
+) -> AResult<bool> {
+    if ping.as_ref().is_some_and(|p| p[0].len_bytes() == bytes) {
+        return Ok(false);
+    }
+    *ping = Some([
+        be.alloc(bytes, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?,
+        be.alloc(bytes, BufferUsage::Staging)
+            .map_err(|e| anyhow!("{e}"))?,
+    ]);
+    Ok(true)
+}
+
 /// DiffusionGemma self-conditioning block (Phase 2 — see docs/diffusion-gemma.md's "Self-
 /// conditioning is ON by default" and the reference's `dg_canvas_embed`): given the PREVIOUS
 /// step's raw canvas logits `[cc, vocab]`, returns the additive signal `sc_sig` (`[cc, ne]`) the
@@ -289,4 +311,35 @@ pub struct EbReduced {
 pub enum DenoiseOutcome {
     Logits(Vec<f32>),
     Reduced(EbReduced),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_sc_ping;
+    use infr_core::backend::Buffer;
+
+    /// The pair follows the canvas: allocated on first use, kept while the size holds, and
+    /// regrown when a longer canvas arrives (each buffer is bound as the whole `[cc, vocab]`
+    /// output, so the old pair would be written past its end).
+    #[test]
+    fn sc_ping_follows_the_canvas_size() {
+        let be = infr_cpu::CpuBackend::new();
+        let mut ping: Option<[Box<dyn Buffer>; 2]> = None;
+        let (short, long) = (4 * 16 * 4, 8 * 16 * 4);
+        let len = |p: &Option<[Box<dyn Buffer>; 2]>| {
+            let p = p.as_ref().expect("allocated");
+            (p[0].len_bytes(), p[1].len_bytes())
+        };
+        assert!(ensure_sc_ping(&be, &mut ping, short).unwrap());
+        assert_eq!(len(&ping), (short, short));
+        assert!(
+            !ensure_sc_ping(&be, &mut ping, short).unwrap(),
+            "same size: kept"
+        );
+        assert!(
+            ensure_sc_ping(&be, &mut ping, long).unwrap(),
+            "longer canvas: regrown"
+        );
+        assert_eq!(len(&ping), (long, long));
+    }
 }

@@ -4789,7 +4789,9 @@ impl<'a> Recorder<'a> {
 
     /// Interleaved (llama NORM) RoPE writing f16 — the llama q/k analogue of `qk_norm_rope`'s
     /// f16 output: `out_base` shifts the output row (0 for the Q scratch; `pos` for the fused
-    /// K cache write via the kv_write peephole).
+    /// K cache write via the kv_write peephole). `freq_factors` (`rope_dim/2` per-pair angle
+    /// divisors — the llama3 `rope_freqs.weight`) selects the `rope_f16_ff` build and binds
+    /// before `y`.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_f16(
         &self,
@@ -4802,10 +4804,8 @@ impl<'a> Recorder<'a> {
         theta: f32,
         pos_offset: usize,
         out_base: usize,
+        freq_factors: Option<&dyn Buffer>,
     ) {
-        let k = self
-            .be
-            .kernel("rope_f16", crate::gemm::rope_f16_spv(), 2, 28);
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -4814,17 +4814,37 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
         push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
-        self.dispatch_wide(
-            k,
-            &[Self::vkb(x), Self::vkb(y)],
-            1,
-            &push,
-            (t * n_heads) as u32,
-        );
+        match freq_factors {
+            Some(ff) => {
+                let k = self
+                    .be
+                    .kernel("rope_f16_ff", crate::gemm::rope_f16_ff_spv(), 3, 28);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+            None => {
+                let k = self
+                    .be
+                    .kernel("rope_f16", crate::gemm::rope_f16_spv(), 2, 28);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+        }
     }
 
     /// Record-once variant of [`Self::rope_f16`]: pos from `params`; `out_base_mul` is the 0/1
     /// multiplier the shader scales by pos (1 -> write cache row pos, 0 -> row 0 of the Q scratch).
+    /// `freq_factors` binds after `params` (the `rope_f16_dyn_ff` build).
     #[allow(clippy::too_many_arguments)]
     pub fn rope_f16_dyn(
         &self,
@@ -4837,10 +4857,8 @@ impl<'a> Recorder<'a> {
         rope_dim: usize,
         theta: f32,
         out_base_mul: usize,
+        freq_factors: Option<&dyn Buffer>,
     ) {
-        let k = self
-            .be
-            .kernel("rope_f16_dyn", crate::gemm::rope_f16_dyn_spv(), 3, 28);
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -4849,13 +4867,32 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
         // [20..24] pos_offset: unused (from params)
         push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
-        self.dispatch_wide(
-            k,
-            &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
-            1,
-            &push,
-            (t * n_heads) as u32,
-        );
+        match freq_factors {
+            Some(ff) => {
+                let k =
+                    self.be
+                        .kernel("rope_f16_dyn_ff", crate::gemm::rope_f16_dyn_ff_spv(), 4, 28);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+            None => {
+                let k = self
+                    .be
+                    .kernel("rope_f16_dyn", crate::gemm::rope_f16_dyn_spv(), 3, 28);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+        }
     }
 
     /// Cached attention: q `[q_len,nh,hd]` (abs positions `pos_offset..`) over the K/V cache
@@ -5818,7 +5855,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DKV_BDA` twin of [`Self::rope_f16`]: writes the f16 K cache at `y_addr`. `y` stays bound
-    /// at slot 1 (inert) for the store→read barrier.
+    /// at its (last) slot (inert) for the store→read barrier.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_f16_at(
         &self,
@@ -5832,10 +5869,8 @@ impl<'a> Recorder<'a> {
         theta: f32,
         pos_offset: usize,
         out_base: usize,
+        freq_factors: Option<&dyn Buffer>,
     ) {
-        let k = self
-            .be
-            .kernel("rope_f16_bda", crate::gemm::rope_f16_bda_spv(), 2, 36);
         let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -5846,17 +5881,36 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[32..36].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch_wide(
-            k,
-            &[Self::vkb(x), Self::vkb(y)],
-            1,
-            &push,
-            (t * n_heads) as u32,
-        );
+        match freq_factors {
+            Some(ff) => {
+                let k =
+                    self.be
+                        .kernel("rope_f16_ff_bda", crate::gemm::rope_f16_ff_bda_spv(), 3, 36);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+            None => {
+                let k = self
+                    .be
+                    .kernel("rope_f16_bda", crate::gemm::rope_f16_bda_spv(), 2, 36);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+        }
     }
 
     /// `-DKV_BDA` twin of [`Self::rope_f16_dyn`]: writes the f16 K cache at `y_addr` (pos from
-    /// `params`). `y` stays bound at slot 2 (inert) for the store→read barrier.
+    /// `params`). `y` stays bound at its (last) slot (inert) for the store→read barrier.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_f16_dyn_at(
         &self,
@@ -5870,13 +5924,8 @@ impl<'a> Recorder<'a> {
         rope_dim: usize,
         theta: f32,
         out_base_mul: usize,
+        freq_factors: Option<&dyn Buffer>,
     ) {
-        let k = self.be.kernel(
-            "rope_f16_dyn_bda",
-            crate::gemm::rope_f16_dyn_bda_spv(),
-            3,
-            36,
-        );
         let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -5887,13 +5936,38 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[32..36].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch_wide(
-            k,
-            &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
-            1,
-            &push,
-            (t * n_heads) as u32,
-        );
+        match freq_factors {
+            Some(ff) => {
+                let k = self.be.kernel(
+                    "rope_f16_dyn_ff_bda",
+                    crate::gemm::rope_f16_dyn_ff_bda_spv(),
+                    4,
+                    36,
+                );
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+            None => {
+                let k = self.be.kernel(
+                    "rope_f16_dyn_bda",
+                    crate::gemm::rope_f16_dyn_bda_spv(),
+                    3,
+                    36,
+                );
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+        }
     }
 
     /// `-DKV_BDA` twin of [`Self::qk_norm_rope`]: writes the fused K cache at `y_addr`. `y` stays
@@ -11313,19 +11387,39 @@ mod tests {
             (
                 "rope_f16",
                 vec![f(N * 16), f(N * 8)],
-                Box::new(|r, b| r.rope_f16(b[0], b[1], ROWS, W, 16, 16, 1e4, 0, 0)),
+                Box::new(|r, b| r.rope_f16(b[0], b[1], ROWS, W, 16, 16, 1e4, 0, 0, None)),
+            ),
+            (
+                "rope_f16_ff",
+                vec![f(N * 16), f(8), f(N * 8)],
+                Box::new(|r, b| r.rope_f16(b[0], b[2], ROWS, W, 16, 16, 1e4, 0, 0, Some(b[1]))),
             ),
             (
                 "rope_f16_dyn",
                 vec![f(N * 16), (8, Fill::Zero, Act), f(N * 8)],
-                Box::new(|r, b| r.rope_f16_dyn(b[0], b[1], b[2], ROWS, W, 16, 16, 1e4, 0)),
+                Box::new(|r, b| r.rope_f16_dyn(b[0], b[1], b[2], ROWS, W, 16, 16, 1e4, 0, None)),
+            ),
+            (
+                "rope_f16_dyn_ff",
+                vec![f(N * 16), (8, Fill::Zero, Act), f(8), f(N * 8)],
+                Box::new(|r, b| {
+                    r.rope_f16_dyn(b[0], b[1], b[3], ROWS, W, 16, 16, 1e4, 0, Some(b[2]))
+                }),
             ),
             (
                 "rope_f16_at",
                 vec![f(N * 16), (N * 32, Fill::Data, Kv)],
                 Box::new(|r, b| {
                     let a = b[1].device_addr().unwrap();
-                    r.rope_f16_at(b[0], b[1], a, ROWS, W, 16, 16, 1e4, 0, 0)
+                    r.rope_f16_at(b[0], b[1], a, ROWS, W, 16, 16, 1e4, 0, 0, None)
+                }),
+            ),
+            (
+                "rope_f16_ff_at",
+                vec![f(N * 16), f(8), (N * 32, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[2].device_addr().unwrap();
+                    r.rope_f16_at(b[0], b[2], a, ROWS, W, 16, 16, 1e4, 0, 0, Some(b[1]))
                 }),
             ),
             (
@@ -11333,7 +11427,20 @@ mod tests {
                 vec![f(N * 16), (8, Fill::Zero, Act), (N * 32, Fill::Data, Kv)],
                 Box::new(|r, b| {
                     let a = b[2].device_addr().unwrap();
-                    r.rope_f16_dyn_at(b[0], b[1], b[2], a, ROWS, W, 16, 16, 1e4, 0)
+                    r.rope_f16_dyn_at(b[0], b[1], b[2], a, ROWS, W, 16, 16, 1e4, 0, None)
+                }),
+            ),
+            (
+                "rope_f16_dyn_ff_at",
+                vec![
+                    f(N * 16),
+                    (8, Fill::Zero, Act),
+                    f(8),
+                    (N * 32, Fill::Data, Kv),
+                ],
+                Box::new(|r, b| {
+                    let a = b[3].device_addr().unwrap();
+                    r.rope_f16_dyn_at(b[0], b[1], b[3], a, ROWS, W, 16, 16, 1e4, 0, Some(b[2]))
                 }),
             ),
             (

@@ -3140,15 +3140,15 @@ What that leaves unverified:
 - **Stage 1's `gpu_seam_matches_cpu_deepseek` is still not written** — recorded
   in `deepseek.md` § Stage 1, repeated here so it is not only in a plan.
 
-### B103 — the released binaries' CPU baseline is an accident of a CI action (2026-11-11)
+### B103 — the released binaries' CPU baseline: stated now, still unchecked (2026-11-11)
 
 **Tag:** release / CI · **Kind:** fragile, not currently broken
 
 `.cargo/config.toml` sets `-C target-cpu=native` for `x86_64-unknown-linux-gnu`
-and `x86_64-pc-windows-msvc`, and the `dist` job in `.github/workflows/ci.yml`
-builds exactly those triples with no flags of its own. Read alone, that says the
-release archives are compiled for whatever CPU the runner had, and would
-`SIGILL` on an older one.
+and `x86_64-pc-windows-msvc`, and until 2026-11-12 the `dist` job in
+`.github/workflows/ci.yml` built those triples with no flags of its own. Read
+alone, that said the release archives are compiled for whatever CPU the runner
+had, and would `SIGILL` on an older one.
 
 They are not. Disassembling the v0.2.0 release assets shows a baseline build:
 legacy-SSE moves outnumber VEX ones 168838 to 4877 in the Linux binary and
@@ -3160,13 +3160,13 @@ The reason is in the job log, not the repo:
 default, and an environment `RUSTFLAGS` replaces `[target.*] rustflags`
 wholesale. So:
 
-- **The shipped baseline depends on a default of a third-party action.** Pass
-  `rustflags: ""` to it, or pin its version differently, and the next release
-  silently becomes runner-specific. Nothing in the workflow states the intended
-  baseline. Fix: set it explicitly in `dist` (for example
-  `RUSTFLAGS: -C target-cpu=x86-64-v2`, or whatever floor the runtime dispatch
-  assumes) and add an artifact check — a VEX/legacy ratio or a `zmm` count
-  outside the kernel modules.
+- **The baseline is now stated, not inherited** (2026-11-12): the `dist` job
+  passes `-D warnings` as `rustflags` to the toolchain action and as `RUSTFLAGS`
+  on both build steps, with a comment saying the releases are baseline builds.
+  Still missing: an artifact check that would catch a release built for the
+  runner's CPU (a VEX / legacy-SSE ratio, or a `zmm` count outside the kernel
+  modules), and a decision on whether the floor should be raised (for example
+  `x86-64-v2`).
 - **Every CI job that uses that action tests the baseline build, not the
   `native` one developers run.** The comment in `.cargo/config.toml` says the
   CPU backend leans on host-CPU autovectorisation; that code path as compiled

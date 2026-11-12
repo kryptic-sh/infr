@@ -346,7 +346,9 @@ fn parse_value(s: &[u8], mut i: usize, depth: usize) -> Option<(Value, usize)> {
 }
 
 /// Find all `<|tool_call>…<tool_call|>` blocks, parse them, and return:
-/// - `clean`: the input text with all tool-call blocks (and stray markers) removed.
+/// - `clean`: the input text with every block that parsed removed, and the channel markers. A
+///   block that does not parse (or has no closing marker) stays in `clean` verbatim, as in
+///   [`parse_hermes_tool_calls`]. Nothing is trimmed.
 /// - the parsed [`ToolCall`] list.
 pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     let mut calls = Vec::new();
@@ -359,14 +361,11 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         let open_abs = search_from + open_pos;
         let body_start = open_abs + TC_OPEN.len();
         let Some(close_rel) = text[body_start..].find(TC_CLOSE) else {
-            // Unterminated opener: strip the dangling markup through end-of-text so it can't leak
-            // into `clean` as raw `<|tool_call>…`.
-            spans.push((open_abs, text.len()));
+            // Unterminated opener (the turn hit its budget mid-call): no call, so it stays.
             break;
         };
         let body = &text[body_start..body_start + close_rel];
         let close_abs = body_start + close_rel + TC_CLOSE.len();
-        spans.push((open_abs, close_abs));
         search_from = close_abs;
 
         // parse body: strip leading "call:"
@@ -385,8 +384,7 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         // `None` ⇒ the arguments nested past `MAX_VALUE_DEPTH`. Drop the call entirely rather
         // than reporting the truncated prefix as a successful `ToolCall`: the caller executes
         // what it is handed, and a call whose arguments we refused to finish parsing is not
-        // one we can vouch for. The block's span is already queued for removal above, so the
-        // markup still never leaks into `clean`.
+        // one we can vouch for. The block stays in `clean` like any other that did not parse.
         let Some((val, _)) = parse_value(argstr.as_bytes(), 0, 0) else {
             continue;
         };
@@ -399,9 +397,12 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
             }
         };
         calls.push(ToolCall { name, arguments });
+        spans.push((open_abs, close_abs));
     }
 
-    let clean = strip_markers(&remove_spans(text, spans));
+    let clean = MARKERS
+        .iter()
+        .fold(remove_spans(text, spans), |out, m| out.replace(m, ""));
     (clean, calls)
 }
 
@@ -414,21 +415,16 @@ const HERMES_CLOSE: &str = "</tool_call>";
 
 /// Parse the Hermes / Qwen tool-call format — `<tool_call>{"name":..,"arguments":{..}}</tool_call>`
 /// (the format Qwen3 and most OSS function-calling models emit, and what the GGUF chat templates
-/// render). Returns `(clean, calls)`: `clean` is the text with all tool-call blocks removed; `calls`
-/// the parsed invocations. The body is real JSON, so it's parsed with serde (no hand-rolled scanner);
-/// `arguments` is accepted as either an object or a JSON string and normalised to a `Value`.
+/// render). Returns `(clean, calls)`: `clean` is the text with every block that parsed removed;
+/// `calls` the parsed invocations. The body is real JSON, so it's parsed with serde (no hand-rolled
+/// scanner); `arguments` is accepted as either an object or a JSON string and normalised to a
+/// `Value`.
 ///
-/// A tool-call block's MARKUP never reaches `clean`, whether or not its body parsed — the same
-/// policy [`parse_tool_calls`] applies to the pipe-marker dialect. Two cases used to leak it, and
-/// both are model output the user then saw verbatim as if it were prose:
-/// - an unterminated `<tool_call>` (the turn hit the token budget mid-call) — the dangling opener
-///   and everything after it is dropped, exactly as the pipe-marker parser drops its own;
-/// - a body that failed to parse as either dialect — the span is removed even though no call is
-///   produced. Emitting nothing is the honest outcome for a call we could not read; emitting the
-///   raw `<tool_call>…</tool_call>` as assistant content is not.
-///
-/// Note the span is queued BEFORE the body is parsed, so the two cases share one rule instead of
-/// the removal being conditional on the parse succeeding.
+/// A block that does not become a call stays in `clean` verbatim — one whose body parses as
+/// neither dialect, and an unterminated `<tool_call>` (the turn hit the token budget mid-call).
+/// Every block is either a call or shown, so a call the model got wrong is visible rather than
+/// silently lost; the same rule [`parse_tool_calls`] applies to the pipe-marker dialect. Nothing is
+/// trimmed: the text either side of a removed block keeps its own whitespace.
 pub fn parse_hermes_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
     let mut calls = Vec::new();
     let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -437,20 +433,18 @@ pub fn parse_hermes_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
         let open_abs = from + open;
         let body_start = open_abs + HERMES_OPEN.len();
         let Some(close_rel) = text[body_start..].find(HERMES_CLOSE) else {
-            // Unterminated opener: strip the dangling markup through end-of-text.
-            spans.push((open_abs, text.len()));
+            // Unterminated opener: no call, so it stays.
             break;
         };
         let body = text[body_start..body_start + close_rel].trim();
         let close_abs = body_start + close_rel + HERMES_CLOSE.len();
         from = close_abs;
-        spans.push((open_abs, close_abs));
         if let Some(call) = parse_hermes_body(body) {
             calls.push(call);
+            spans.push((open_abs, close_abs));
         }
     }
-    let clean = remove_spans(text, spans);
-    (clean.trim().to_owned(), calls)
+    (remove_spans(text, spans), calls)
 }
 
 /// Parse one `<tool_call>` body into a [`ToolCall`]. Two body dialects exist in the wild:
@@ -520,15 +514,16 @@ fn parse_xml_function_body(body: &str) -> Option<ToolCall> {
 /// - Llama-3.x's bare-JSON form: the template instructs `{"name": .., "parameters": {..}}` as
 ///   the WHOLE response, no markers at all.
 ///
-/// Dialects are tried in that order; the bare-JSON form only counts when the entire (trimmed)
-/// body is a single such object, so ordinary prose mentioning JSON is never misparsed. Callers
+/// The two marked dialects are both parsed, the pipe form from what the Hermes pass left, so a
+/// reply mixing them fires every call (Hermes calls first) instead of showing the second dialect's
+/// markup. The bare-JSON form is tried only when neither found a call, and only counts when the
+/// entire (trimmed) body is a single such object, so ordinary prose mentioning JSON is never
+/// misparsed. Callers
 /// gate on tools-present (`allow_tools`) as before.
 pub fn parse_any_tool_calls(text: &str) -> (String, Vec<ToolCall>) {
-    let (clean, calls) = parse_hermes_tool_calls(text);
-    if !calls.is_empty() {
-        return (clean, calls);
-    }
-    let (clean, calls) = parse_tool_calls(text);
+    let (clean, mut calls) = parse_hermes_tool_calls(text);
+    let (clean, pipe) = parse_tool_calls(&clean);
+    calls.extend(pipe);
     if !calls.is_empty() {
         return (clean, calls);
     }
@@ -897,31 +892,31 @@ mod tests {
         assert!(calls.is_empty());
     }
 
-    /// An unterminated `<tool_call>` (the turn ran out of budget mid-call) must not leak its opener
-    /// into `clean` — the same guarantee `parse_tool_calls_dangling_opener_stripped` pins for the
-    /// pipe-marker dialect. The hermes parser used to just `break`, so the user was shown the raw
-    /// markup and the half-written JSON as if the model had said it.
+    /// An unterminated `<tool_call>` (the turn ran out of budget mid-call) makes no call, so it
+    /// stays in `clean`: what the model wrote is shown rather than silently lost — the same rule
+    /// `parse_tool_calls_dangling_opener_is_kept` pins for the pipe-marker dialect.
     #[test]
-    fn hermes_dangling_opener_stripped() {
+    fn hermes_dangling_opener_is_kept() {
         let text = "Answer text.<tool_call>{\"name\":\"foo\",\"argum";
         let (clean, calls) = parse_hermes_tool_calls(text);
         assert!(calls.is_empty());
-        assert!(!clean.contains("tool_call"), "dangling opener: {clean:?}");
-        assert_eq!(clean, "Answer text.");
+        assert_eq!(clean, text);
     }
 
-    /// A body that parses as NEITHER dialect still produces no call — that half is
-    /// `hermes_malformed_body_is_skipped` — but the block's markup is now removed as well. A call
-    /// we could not read is worth nothing; the raw `<tool_call>…</tool_call>` shown to the user as
-    /// assistant prose is worse than nothing.
+    /// A block whose body parses as NEITHER dialect makes no call — that half is
+    /// `hermes_malformed_body_is_skipped` — and stays in `clean` verbatim, alone or beside a
+    /// block that did parse, which is removed with nothing else.
     #[test]
-    fn hermes_unparseable_body_markup_is_stripped() {
+    fn hermes_unparseable_block_is_kept() {
         let text = "Sure.<tool_call>not json</tool_call>Done.";
         let (clean, calls) = parse_hermes_tool_calls(text);
         assert!(calls.is_empty());
-        assert!(!clean.contains("tool_call"), "markup leaked: {clean:?}");
-        assert!(!clean.contains("not json"), "body leaked: {clean:?}");
-        assert_eq!(clean, "Sure.Done.");
+        assert_eq!(clean, text);
+
+        let good = "<tool_call>{\"name\":\"f\",\"arguments\":{}}</tool_call>";
+        let (clean, calls) = parse_hermes_tool_calls(&format!("A {good} B{}", &text[5..]));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(clean, "A  B<tool_call>not json</tool_call>Done.");
     }
 
     // --- split_think -----------------------------------------------------
@@ -1026,16 +1021,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_tool_calls_dangling_opener_stripped() {
-        // Unterminated `<|tool_call>` (no close) must not leak opener markup into `clean`.
+    fn parse_tool_calls_dangling_opener_is_kept() {
+        // Unterminated `<|tool_call>` (no close) makes no call, so it stays in `clean`.
         let text = "Answer text.<|tool_call>call:foo{x:1}";
         let (clean, calls) = parse_tool_calls(text);
         assert!(calls.is_empty());
-        assert!(
-            !clean.contains("tool_call"),
-            "dangling opener leaked: {clean:?}"
-        );
-        assert!(clean.contains("Answer text"));
+        assert_eq!(clean, text);
     }
 
     // --- depth / scan-bound hardening ------------------------------------
@@ -1043,8 +1034,8 @@ mod tests {
     /// Deeply nested arguments must not recurse `parse_value` off the stack. In `infr serve`
     /// the model's output is steerable by the requesting client, so this body is one HTTP
     /// request away; without the ceiling it is a SIGSEGV that takes the whole process down.
-    /// The call is dropped rather than reported with truncated arguments, and the markup
-    /// still never leaks into `clean`.
+    /// The call is dropped rather than reported with truncated arguments; like any block that
+    /// does not parse, it stays in `clean`.
     #[test]
     fn parse_tool_calls_deeply_nested_object_is_rejected() {
         let depth = 50_000;
@@ -1060,10 +1051,7 @@ mod tests {
             calls.is_empty(),
             "over-deep arguments must not yield a ToolCall, got {calls:?}"
         );
-        assert!(
-            !clean.contains("tool_call"),
-            "tool-call markup leaked into clean: {clean:?}"
-        );
+        assert_eq!(clean, body);
     }
 
     /// Same for arrays — `[` recurses through the other container arm, and a value that

@@ -1492,104 +1492,55 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn push_u64(bytes: &mut Vec<u8>, value: u64) {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn push_str(bytes: &mut Vec<u8>, value: &str) {
-        push_u64(bytes, value.len() as u64);
-        bytes.extend_from_slice(value.as_bytes());
-    }
-
-    fn push_u32_metadata(bytes: &mut Vec<u8>, key: &str, value: u32) {
-        push_str(bytes, key);
-        push_u32(bytes, 4); // GGUF_TYPE_UINT32
-        push_u32(bytes, value);
-    }
+    use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
 
     /// Minimal `deepseek2` GGUF carrying exactly `keys` (each prefixed with `deepseek2.`) plus a
     /// single dummy tensor — enough for `Config::from_gguf` to reach the MLA and MoE parses.
-    fn deepseek2_fixture(keys: &[(&str, u32)]) -> Vec<u8> {
+    fn deepseek2_fixture(keys: &[(&str, u32)]) -> SyntheticModel {
         arch_fixture("deepseek2", keys)
     }
 
     /// Minimal `arch` GGUF carrying exactly `keys` (each prefixed with `{arch}.`) plus a single
     /// dummy tensor.
-    fn arch_fixture(arch: &str, keys: &[(&str, u32)]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        push_u32(&mut bytes, 0x4655_4747); // GGUF magic
-        push_u32(&mut bytes, 3);
-        push_u64(&mut bytes, 1); // tensor count
-        push_u64(&mut bytes, 1 + keys.len() as u64);
-
-        push_str(&mut bytes, "general.architecture");
-        push_u32(&mut bytes, 8); // GGUF_TYPE_STRING
-        push_str(&mut bytes, arch);
-        for (key, value) in keys {
-            push_u32_metadata(&mut bytes, &format!("{arch}.{key}"), *value);
+    fn arch_fixture(arch: &str, keys: &[(&str, u32)]) -> SyntheticModel {
+        let mut meta = vec![("general.architecture".to_string(), Meta::Str(arch.into()))];
+        meta.extend(
+            keys.iter()
+                .map(|(key, value)| (format!("{arch}.{key}"), Meta::U32(*value))),
+        );
+        SyntheticModel {
+            meta,
+            tensors: vec![dummy_embd()],
         }
+    }
 
-        push_str(&mut bytes, "token_embd.weight");
-        push_u32(&mut bytes, 2);
-        push_u64(&mut bytes, 8);
-        push_u64(&mut bytes, 1);
-        push_u32(&mut bytes, 0); // F32
-        push_u64(&mut bytes, 0);
-        while !bytes.len().is_multiple_of(32) {
-            bytes.push(0);
-        }
-        bytes.extend_from_slice(&[0; 32]);
-        bytes
+    /// The one tensor every fixture carries: a zero `token_embd.weight`.
+    fn dummy_embd() -> TensorSpec {
+        TensorSpec::new("token_embd.weight", vec![8, 1], Fill::Exact(vec![0.0; 8]))
     }
 
     /// Write a fixture to a uniquely-named temp file, parse it, and clean up.
-    fn config_from_fixture(name: &str, bytes: &[u8]) -> Result<Config> {
-        let path =
-            std::env::temp_dir().join(format!("infr-llama-{name}-{}.gguf", std::process::id()));
-        std::fs::write(&path, bytes).expect("write GGUF fixture");
-        let gguf = Gguf::open(&path).expect("open GGUF fixture");
-        let parsed = Config::from_gguf(&gguf);
-        std::fs::remove_file(path).expect("remove GGUF fixture");
-        parsed
+    fn config_from_fixture(name: &str, model: &SyntheticModel) -> Result<Config> {
+        let tmp = TempGguf::write(name, model);
+        let gguf = Gguf::open(tmp.path()).expect("open GGUF fixture");
+        Config::from_gguf(&gguf)
     }
 
-    fn gemma4_zero_kv_heads_fixture() -> Vec<u8> {
-        let mut bytes = Vec::new();
-        push_u32(&mut bytes, 0x4655_4747); // GGUF magic
-        push_u32(&mut bytes, 3);
-        push_u64(&mut bytes, 1); // tensor count
-        push_u64(&mut bytes, 6); // metadata count
-
-        push_str(&mut bytes, "general.architecture");
-        push_u32(&mut bytes, 8); // GGUF_TYPE_STRING
-        push_str(&mut bytes, "gemma4");
-        push_u32_metadata(&mut bytes, "gemma4.block_count", 1);
-        push_u32_metadata(&mut bytes, "gemma4.embedding_length", 8);
-        push_u32_metadata(&mut bytes, "gemma4.attention.head_count", 8);
-        push_u32_metadata(&mut bytes, "gemma4.feed_forward_length", 16);
-
-        push_str(&mut bytes, "gemma4.attention.head_count_kv");
-        push_u32(&mut bytes, 9); // GGUF_TYPE_ARRAY
-        push_u32(&mut bytes, 4); // GGUF_TYPE_UINT32
-        push_u64(&mut bytes, 1);
-        push_u32(&mut bytes, 0);
-
-        push_str(&mut bytes, "token_embd.weight");
-        push_u32(&mut bytes, 2);
-        push_u64(&mut bytes, 8);
-        push_u64(&mut bytes, 1);
-        push_u32(&mut bytes, 0); // F32
-        push_u64(&mut bytes, 0);
-        while !bytes.len().is_multiple_of(32) {
-            bytes.push(0);
-        }
-        bytes.extend_from_slice(&[0; 32]);
-        bytes
+    fn gemma4_zero_kv_heads_fixture() -> SyntheticModel {
+        let mut model = arch_fixture(
+            "gemma4",
+            &[
+                ("block_count", 1),
+                ("embedding_length", 8),
+                ("attention.head_count", 8),
+                ("feed_forward_length", 16),
+            ],
+        );
+        model.meta.push((
+            "gemma4.attention.head_count_kv".to_string(),
+            Meta::U32Arr(vec![0]),
+        ));
+        model
     }
 
     #[test]
@@ -1600,13 +1551,9 @@ mod tests {
 
     #[test]
     fn gemma4_array_kv_heads_must_be_positive() {
-        let path = std::env::temp_dir().join(format!(
-            "infr-llama-gemma4-zero-kv-heads-{}.gguf",
-            std::process::id()
-        ));
-        std::fs::write(&path, gemma4_zero_kv_heads_fixture()).expect("write GGUF fixture");
-        let gguf = Gguf::open(&path).expect("open GGUF fixture");
-        std::fs::remove_file(path).expect("remove GGUF fixture");
+        let tmp = TempGguf::write("gemma4-zero-kv-heads", &gemma4_zero_kv_heads_fixture());
+        let gguf = Gguf::open(tmp.path()).expect("open GGUF fixture");
+        drop(tmp);
 
         let Err(err) = Config::from_gguf(&gguf) else {
             panic!("zero KV heads must fail");

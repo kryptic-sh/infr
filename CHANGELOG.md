@@ -39,6 +39,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reach the multi-space tokens. Several more `tokenizer.ggml.pre` names are
   mapped, and an unknown one logs a warning instead of silently getting the
   GPT-2 regex. Qwen3 and Gemma 3 prompts are unchanged.
+- **SentencePiece GGUFs without a `tokenizer.ggml.add_space_prefix` key — Llama
+  2-style, Mistral v0.x, Phi-3 — now get the leading-space prefix, as in
+  llama.cpp**, before the text and after every special token, and Phi-3 drops
+  the whitespace that follows its special tokens. Their prompt token ids change.
+  A file that set the key to `true` used to decode with every space removed; it
+  now decodes correctly.
 - **Generation stops on more end-of-turn tokens.** The stop set was the declared
   EOS plus three fixed names; it now follows llama.cpp's list (`<end_of_turn>`,
   `<|end|>`, `<|eom_id|>`, `<turn|>` and the rest) and the GGUF's `eot` / `eom`
@@ -74,6 +80,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   byte-identical; the work per token no longer grows with the reply's length.
 - **A tool call quoted inside a model's reasoning is no longer run as a call,
   and no longer hides the real call from the stream.**
+- **`infr serve` with tools: a plain JSON answer streams as it is generated**
+  (it was held until the end in case it was a tool call), text before a late
+  `<think>` block is no longer dropped, and a tool call that follows such text
+  now runs. A tool-call block that cannot be parsed, for instance one cut off by
+  `max_tokens`, is shown as content instead of disappearing.
+- **Forced tool calls on SentencePiece models (Llama 2, Mistral, Phi-3, Gemma
+  3): the grammar now sees spaces.** It saw the `▁` marker instead, so it could
+  not accept a space before or inside the JSON.
+- **`infr serve --parallel`: a panic while seeding a slot from another no longer
+  leaves both slots busy forever.**
 - **Qwen3.5 / Qwen3.6 on Vulkan: a multi-turn chat no longer continues from
   recurrent state that ran ahead of the conversation.** Chained decode feeds
   several tokens per submit, so a reply that ended part-way through a chain left

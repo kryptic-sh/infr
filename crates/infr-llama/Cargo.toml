@@ -27,3 +27,4 @@ tokenizers = { workspace = true }
 
 [dev-dependencies]
 infr-hub.workspace = true
+infr-testkit.workspace = true

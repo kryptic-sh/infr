@@ -36,6 +36,8 @@
 //! Every device-side entry point takes `&dyn Backend`, so the harness needs no GPU-specific API
 //! and a backend gets coverage the moment it implements the seam.
 
+pub mod gguf;
+
 use infr_core::backend::{Backend, Bindings, BufferUsage};
 use infr_core::decode_spec::{block_spec, WEIGHT_QUANTS};
 use infr_core::graph::{Graph, Op};

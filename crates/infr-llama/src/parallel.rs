@@ -40,7 +40,7 @@ use crate::sampling::{RequestCtx, StepGate};
 use crate::seam::SeamKv;
 use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Result};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Pure continuation-slot selection (the "this conversation continuing" case of [`checkout`], and
 /// the twin of `seam::model::SlotPool::pick`'s first arm). Given `(slot_idx, prefix_score,
@@ -105,6 +105,75 @@ impl Drop for SlotGuard<'_> {
         drop(p);
         self.engine.freed.notify_one();
     }
+}
+
+/// Two slots reserved across a prefix seed that runs with the pool unlocked (see
+/// [`seed_unlocked`]): `best`'s KV is the source, `target`'s the destination. Dropped before the
+/// seed returned — an unwind out of it — it puts both KVs back and frees both slots, or they would
+/// stay busy with their KV gone and every later checkout could wait on `freed` forever.
+struct SeedReservation<'a> {
+    pool: &'a Mutex<Pool>,
+    freed: &'a Condvar,
+    best: usize,
+    target: usize,
+    src: Option<SeamKv>,
+    dst: Option<SeamKv>,
+    done: bool,
+}
+
+impl Drop for SeedReservation<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        // The copy may have stopped partway: `dst`'s rows no longer match the tokens it claims.
+        if let Some(dst) = self.dst.as_mut() {
+            dst.reset();
+        }
+        let mut p = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        p.slots[self.best].kv = self.src.take();
+        p.slots[self.best].busy = false;
+        p.slots[self.target].kv = self.dst.take();
+        p.slots[self.target].busy = false;
+        drop(p);
+        self.freed.notify_all();
+    }
+}
+
+/// Run `seed` on slot `target`'s KV from slot `best`'s with the pool lock released, as the module
+/// doc requires around a GPU submit. Both slots are reserved (busy, KV taken out) meanwhile so no
+/// concurrent checkout selects them. Returns the re-acquired lock with `best` released and
+/// `target` still reserved, and what `seed` returned.
+fn seed_unlocked<'a>(
+    pool: &'a Mutex<Pool>,
+    freed: &'a Condvar,
+    mut p: MutexGuard<'a, Pool>,
+    best: usize,
+    target: usize,
+    seed: impl FnOnce(&mut Option<SeamKv>, &Option<SeamKv>) -> Result<()>,
+) -> (MutexGuard<'a, Pool>, Result<()>) {
+    p.slots[best].busy = true;
+    p.slots[target].busy = true;
+    let mut res = SeedReservation {
+        pool,
+        freed,
+        best,
+        target,
+        src: p.slots[best].kv.take(),
+        dst: p.slots[target].kv.take(),
+        done: false,
+    };
+    drop(p);
+    let r = seed(&mut res.dst, &res.src);
+    let mut p = pool.lock().expect("pool poisoned");
+    p.slots[best].kv = res.src.take();
+    p.slots[best].busy = false;
+    p.slots[target].kv = res.dst.take();
+    res.done = true;
+    (p, r)
 }
 
 /// The concurrent seam engine. `Sync`: `&self` is all a request needs, so N of them run at once.
@@ -354,27 +423,19 @@ impl ParallelSeam {
                         // `seed_from` is a device-side KV copy — it RECORDS, so it takes a turn on
                         // the baton like any other GPU submit. The module doc forbids holding the
                         // pool `Mutex` across a submit (it would serialize every other request's
-                        // checkout/drop behind this copy). So: RESERVE both slots (mark them busy so
-                        // no concurrent checkout can select them), take their KV out, DROP the lock
-                        // across `seed_from`, then re-acquire to put them back.
-                        p.slots[best].busy = true;
-                        p.slots[target].busy = true;
-                        let src = p.slots[best].kv.take().expect("scored slot is Some");
-                        let mut dst = p.slots[target].kv.take();
-                        drop(p);
-                        let r = {
-                            let _gp = req.gate_pass();
-                            match dst.as_mut() {
-                                Some(dst) => dst.seed_from(&self.vk, cfg, ec, &src, best_s),
-                                None => Ok(()),
-                            }
-                        };
-                        p = self.pool.lock().expect("pool poisoned");
-                        // Return the source slot's KV and release its reservation; `target` stays
-                        // reserved (busy) — it is checked out just below.
-                        p.slots[best].kv = Some(src);
-                        p.slots[best].busy = false;
-                        p.slots[target].kv = dst;
+                        // checkout/drop behind this copy), so both slots are reserved and the
+                        // lock dropped across it. `target` comes back still reserved — it is
+                        // checked out just below.
+                        let r;
+                        (p, r) =
+                            seed_unlocked(&self.pool, &self.freed, p, best, target, |dst, src| {
+                                let src = src.as_ref().expect("scored slot is Some");
+                                let _gp = req.gate_pass();
+                                match dst.as_mut() {
+                                    Some(dst) => dst.seed_from(&self.vk, cfg, ec, src, best_s),
+                                    None => Ok(()),
+                                }
+                            });
                         // A failed seed costs only the prefix reuse — the slot re-prefills from
                         // scratch and the answer is identical. Never fail the request for it.
                         if let Err(e) = r {
@@ -457,7 +518,42 @@ impl ParallelSeam {
 
 #[cfg(test)]
 mod tests {
-    use super::pick_continuation;
+    use super::{pick_continuation, seed_unlocked, Pool, Slot};
+    use std::sync::{Condvar, Mutex};
+
+    /// A panic inside the unlocked prefix seed frees both reserved slots. It used to unwind past
+    /// the re-lock, leaving them busy with their KV gone, so once every other slot was taken a
+    /// checkout waited on `freed` forever.
+    #[test]
+    fn a_panicking_seed_releases_both_slots() {
+        let slot = || Slot {
+            kv: None,
+            busy: false,
+            tick: 0,
+        };
+        let pool = Mutex::new(Pool {
+            slots: vec![slot(), slot(), slot()],
+            tick: 0,
+        });
+        let freed = Condvar::new();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let p = pool.lock().unwrap();
+            seed_unlocked(&pool, &freed, p, 2, 0, |_, _| panic!("seed_from panicked"))
+        }));
+        assert!(r.is_err(), "the injected panic did not happen");
+        let p = pool
+            .lock()
+            .expect("the pool lock was not held across the seed");
+        let busy: Vec<bool> = p.slots.iter().map(|s| s.busy).collect();
+        assert_eq!(busy, [false, false, false]);
+
+        // The ordinary return: the source is released, the target stays reserved for checkout.
+        drop(p);
+        let (p, r) = seed_unlocked(&pool, &freed, pool.lock().unwrap(), 2, 0, |_, _| Ok(()));
+        assert!(r.is_ok());
+        let busy: Vec<bool> = p.slots.iter().map(|s| s.busy).collect();
+        assert_eq!(busy, [true, false, false]);
+    }
 
     #[test]
     fn continuation_picks_longest_prefix_not_first() {

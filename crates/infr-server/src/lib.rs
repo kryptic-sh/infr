@@ -3845,9 +3845,9 @@ mod tests {
         let state = AppState::new(g, "m", 1, Arc::new(Config::default()));
         let stats = state.stats.clone();
         let router = build_router(state);
-        // The panic itself is expected; keep the default hook from spraying the test log with it.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        // The panic is expected and its message lands in this test's captured output. No
+        // `set_hook` to hide it: the hook is process-global and would also swallow the backtrace
+        // of any test panicking on another thread meanwhile.
         let resp = router
             .oneshot(
                 Request::builder()
@@ -3862,7 +3862,6 @@ mod tests {
             .await
             .unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        std::panic::set_hook(prev);
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
         assert!(

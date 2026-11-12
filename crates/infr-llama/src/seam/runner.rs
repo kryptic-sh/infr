@@ -1422,9 +1422,12 @@ pub(crate) fn generate_dense_backend(
         *written_end = 0;
     }
     // qwen35: every prefill step advances the DeltaNet state past `start`, and that cannot be
-    // undone. Keep `cached` empty until this call records what it fed (the verify return and the
-    // teardown below), so an error return in between (a cancelled prefill, a failed submit) makes
-    // the next call zero the state instead of reusing one that is ahead of `cached`.
+    // undone. What keeps an error return in between (a cancelled prefill, a failed submit) from
+    // reusing that state is `written_end`: it is raised before each execute, so it ends up past
+    // `cached.len()` and the reuse arm above refuses. Emptying `cached` until this call records
+    // what it fed (the verify return and the teardown below) is a deliberate backstop to that.
+    // The one effect of its own: with `cached` empty, the next call cannot take the
+    // snapshot-resume arm either, so it re-prefills from zero rather than from the snapshot.
     if c.qwen35 && denoise_req.is_none() {
         cached.clear();
     }
@@ -6181,6 +6184,7 @@ mod tests {
         SeamKv,
     };
     use crate::seam::TokenEmbd;
+    use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
 
     /// B125: the runner cannot tell whether the backend replays its plan (sampler reads slot
     /// `pos & 63`) or walks it statically (slot 0) — Metal decides that per graph, and a llama
@@ -6296,19 +6300,6 @@ mod tests {
     const Q35_DT_RANK: usize = 2;
     const Q35_D_INNER: usize = 16;
 
-    fn push_u32(b: &mut Vec<u8>, v: u32) {
-        b.extend_from_slice(&v.to_le_bytes());
-    }
-
-    fn push_u64(b: &mut Vec<u8>, v: u64) {
-        b.extend_from_slice(&v.to_le_bytes());
-    }
-
-    fn push_str(b: &mut Vec<u8>, s: &str) {
-        push_u64(b, s.len() as u64);
-        b.extend_from_slice(s.as_bytes());
-    }
-
     /// `n` values in `[base - 0.5, base + 0.5)` from a 64-bit LCG seeded by `seed`.
     fn q35_values(n: usize, seed: u64, base: f32) -> Vec<f32> {
         let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
@@ -6322,61 +6313,41 @@ mod tests {
             .collect()
     }
 
-    /// GGUF v3 bytes for a synthetic model: `u32_keys` under `general.architecture = arch`, and
-    /// every tensor f32 (f16 when named in `f16`) with deterministic values around its centre.
-    /// Shapes are ggml order (innermost first).
+    /// A synthetic model: `u32_keys` under `general.architecture = arch`, and every tensor f32
+    /// (f16 when named in `f16`) with deterministic values around its centre. Shapes are ggml
+    /// order (innermost first).
     fn synthetic_gguf(
         arch: &str,
         u32_keys: &[(String, usize)],
         tensors: &[(String, Vec<usize>, f32)],
         f16: &[&str],
-    ) -> Vec<u8> {
-        const ALIGN: usize = 32;
-        let mut b = Vec::new();
-        push_u32(&mut b, 0x4655_4747); // "GGUF"
-        push_u32(&mut b, 3);
-        push_u64(&mut b, tensors.len() as u64);
-        push_u64(&mut b, (u32_keys.len() + 1) as u64);
-        push_str(&mut b, "general.architecture");
-        push_u32(&mut b, 8); // STRING
-        push_str(&mut b, arch);
-        for (k, v) in u32_keys {
-            push_str(&mut b, k);
-            push_u32(&mut b, 4); // UINT32
-            push_u32(&mut b, *v as u32);
-        }
-        let mut data = Vec::new();
-        for (i, (name, shape, base)) in tensors.iter().enumerate() {
-            let n: usize = shape.iter().product();
-            push_str(&mut b, name);
-            push_u32(&mut b, shape.len() as u32);
-            for &d in shape {
-                push_u64(&mut b, d as u64);
-            }
-            let half = f16.contains(&name.as_str());
-            push_u32(&mut b, if half { 1 } else { 0 }); // F16 / F32
-            push_u64(&mut b, data.len() as u64);
-            for v in q35_values(n, i as u64 + 1, *base) {
-                if half {
-                    data.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+    ) -> SyntheticModel {
+        let mut meta = vec![("general.architecture".to_string(), Meta::Str(arch.into()))];
+        meta.extend(
+            u32_keys
+                .iter()
+                .map(|(k, v)| (k.clone(), Meta::U32(*v as u32))),
+        );
+        let tensors = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, (name, shape, base))| {
+                let v = q35_values(shape.iter().product(), i as u64 + 1, *base);
+                let fill = if f16.contains(&name.as_str()) {
+                    Fill::ExactF16(v)
                 } else {
-                    data.extend_from_slice(&v.to_le_bytes());
-                }
-            }
-            data.resize(data.len().next_multiple_of(ALIGN), 0);
-        }
-        b.resize(b.len().next_multiple_of(ALIGN), 0);
-        b.extend_from_slice(&data);
-        b
+                    Fill::Exact(v)
+                };
+                TensorSpec::new(name.clone(), shape.clone(), fill)
+            })
+            .collect();
+        SyntheticModel { meta, tensors }
     }
 
-    /// Write `bytes` to a temp GGUF, open it and parse its config.
-    fn open_synthetic(tag: &str, bytes: &[u8]) -> (Gguf, Config) {
-        let path =
-            std::env::temp_dir().join(format!("infr-runner-{tag}-{}.gguf", std::process::id()));
-        std::fs::write(&path, bytes).expect("write synthetic GGUF");
-        let g = Gguf::open(&path).expect("open synthetic GGUF");
-        std::fs::remove_file(&path).expect("remove synthetic GGUF");
+    /// Write `model` to a temp GGUF, open it and parse its config.
+    fn open_synthetic(tag: &str, model: &SyntheticModel) -> (Gguf, Config) {
+        let tmp = TempGguf::write(tag, model);
+        let g = Gguf::open(tmp.path()).expect("open synthetic GGUF");
         let cfg = Config::from_gguf(&g).expect("synthetic config");
         (g, cfg)
     }
@@ -6384,7 +6355,7 @@ mod tests {
     /// The synthetic qwen35 model: DeltaNet layers only, or with `attn` a second, full-attention
     /// layer and an f16 embedding — what Vulkan's record-once (chained) decode needs: an attention
     /// op, and an embedding its on-device gather reads.
-    fn qwen35_gguf(attn: bool) -> Vec<u8> {
+    fn qwen35_gguf(attn: bool) -> SyntheticModel {
         let cc = Q35_D_INNER + 2 * Q35_N_GROUP * Q35_D_STATE;
         let head_v = Q35_D_INNER / Q35_DT_RANK;
         // `attn` adds layer 1 at `full_attention_interval = 2`: two heads of NE / 2, the query
@@ -6577,6 +6548,65 @@ mod tests {
             diff(&fresh, &after_reset) == 0.0,
             "logits after reset differ from a fresh slot by {}: the DeltaNet state was reused",
             diff(&fresh, &after_reset)
+        );
+    }
+
+    /// A prefill cancelled between two chunks has advanced qwen35's recurrent state past the
+    /// prefix `cached` keeps, so the next call must not reuse that state: its logits equal a
+    /// fresh slot's.
+    #[test]
+    fn qwen35_aborted_prefill_matches_a_fresh_slot() {
+        let (g, cfg) = open_synthetic("qwen35-abort", &qwen35_gguf(false));
+        let embd = std::sync::OnceLock::new();
+        let mut ec = EngineConfig::default();
+        ec.device.ubatch = Some(2);
+        let be = infr_cpu::CpuBackend::new();
+        let run = |prompt: &[u32],
+                   state: &mut Option<SeamKv>,
+                   req: Option<&crate::sampling::RequestCtx>| {
+            let mut logits = Vec::new();
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                1,
+                |_| {},
+                state,
+                32,
+                None,
+                None,
+                None,
+                Some(&mut logits),
+                None,
+                None,
+                req,
+            )
+            .map(|_| logits)
+        };
+        let first = Q35_FIRST;
+        // Extends `first`, so its prefill starts at `first.len()`; cancelled after one chunk.
+        let cut = [&first[..], &[7, 2, 8, 1, 8, 2]].concat();
+        let then = [&first[..], &[5, 5, 3]].concat();
+
+        let fresh = run(&then, &mut None, None).expect("fresh slot");
+        let mut slot = None;
+        run(&first, &mut slot, None).expect("first turn");
+        let req = crate::sampling::RequestCtx::new(Default::default()).abort_at_poll(1);
+        let err = run(&cut, &mut slot, Some(&req)).expect_err("the prefill was not cancelled");
+        assert!(
+            err.to_string().contains("cancelled during prompt prefill"),
+            "{err}"
+        );
+        let after = run(&then, &mut slot, None).expect("turn after the cancel");
+        assert_eq!(fresh.len(), Q35_VOCAB);
+        assert_eq!(
+            after, fresh,
+            "the next call reused a recurrent state the cancelled prefill had advanced"
         );
     }
 
@@ -6889,7 +6919,7 @@ mod tests {
     }
 
     /// A one-layer gemma3 whose only layer is sliding-window (`window` 8), every tensor f32.
-    fn gemma3_gguf() -> Vec<u8> {
+    fn gemma3_gguf() -> SyntheticModel {
         let hd = Q35_NE / 2;
         let t = |name: &str, shape: Vec<usize>, base: f32| (name.to_string(), shape, base);
         let mut tensors = vec![
@@ -6991,6 +7021,79 @@ mod tests {
         assert_eq!(
             after, fresh,
             "the rewind read ring rows an earlier, longer turn had recycled"
+        );
+    }
+
+    /// A prefill cancelled between two chunks has written ring rows for positions `cached` never
+    /// records. A later turn that rewinds into the recycled part of the ring must re-prefill: its
+    /// logits equal a fresh slot's.
+    #[test]
+    fn ring_after_an_aborted_prefill_matches_a_fresh_slot() {
+        let (g, cfg) = open_synthetic("gemma3-ring-abort", &gemma3_gguf());
+        assert!(cfg.is_swa_layer(0) && cfg.swa_window == 8);
+        let embd = std::sync::OnceLock::new();
+        let mut ec = EngineConfig::default();
+        // A ring of round64(window + ubatch) = 64 rows on the window layer.
+        ec.device.ubatch = Some(8);
+        const CTX: usize = 256;
+        let be = infr_cpu::CpuBackend::new();
+        let run = |prompt: &[u32],
+                   state: &mut Option<SeamKv>,
+                   req: Option<&crate::sampling::RequestCtx>| {
+            let mut out = Vec::new();
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                1,
+                |_| {},
+                state,
+                CTX,
+                None,
+                None,
+                None,
+                Some(&mut out),
+                None,
+                None,
+                req,
+            )
+            .map(|_| out)
+        };
+        let ids = |n: usize, salt: u32| -> Vec<u32> {
+            (0..n as u32)
+                .map(|i| (i * 7 + salt) % Q35_VOCAB as u32)
+                .collect()
+        };
+
+        let a = ids(20, 3);
+        // Extends A: its prefill runs from 20 in chunks of 8. Cancelled after nine of them, it
+        // has written positions up to 92, so rows 0..28 of the ring hold positions 64..92 while
+        // `cached` still ends at 20.
+        let b = [&a[..], &ids(80, 5)[..]].concat();
+        // Also extends A, so it would reuse `cached` from 20 on, attending positions 12..20 —
+        // rows the cancelled prefill recycled.
+        let c = [&a[..], &ids(5, 11)[..]].concat();
+
+        let fresh = run(&c, &mut None, None).expect("fresh slot");
+        let mut slot = None;
+        run(&a, &mut slot, None).expect("first turn");
+        let req = crate::sampling::RequestCtx::new(Default::default()).abort_at_poll(9);
+        let err = run(&b, &mut slot, Some(&req)).expect_err("the prefill was not cancelled");
+        assert!(
+            err.to_string().contains("cancelled during prompt prefill"),
+            "{err}"
+        );
+        assert_eq!(slot.as_ref().expect("slot").written_end, 92);
+        let after = run(&c, &mut slot, None).expect("turn after the cancel");
+        assert_eq!(fresh.len(), Q35_VOCAB);
+        assert_eq!(
+            after, fresh,
+            "the turn after a cancelled prefill read ring rows that prefill had recycled"
         );
     }
 }

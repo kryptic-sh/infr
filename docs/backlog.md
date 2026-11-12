@@ -2842,14 +2842,12 @@ the body, `-1` for `seed` / `max_tokens`, and the 401 body. Left:
   it keep failing. `DiffusionGemmaChat::reset_kv` drops its whole session and
   has no test (it needs a real GGUF). A non-streaming 500 body still includes
   the panic message.
-- **`ParallelSeam::checkout`: a panic inside `seed_from` leaves both reserved
-  slots marked busy** with their KV taken, so later requests can block on
-  `freed.wait` for good. Vulkan path; reported by the coder from reading, not
-  re-read.
-- **The diffusion `denoise` overflow is still an untyped error**, so it is
-  a 500.
-- `streaming_panic_is_reported_as_a_failure` (infr-server) still sets a
-  process-wide panic hook, which the repo's convention forbids in tests.
+- **DiffusionGemma under `serve` has no cap on the session it opens.** The
+  untyped overflow in `diffusion_generate` is reachable only from `bench`;
+  `DiffusionGemmaChat::ensure_sess` always sizes the session to at least
+  prompt + blocks × canvas + 64, so an over-long prompt opens an arbitrarily
+  large session instead of being refused. Needs a decision on the cap.
+- `infr-cpu/src/pool.rs` still sets a process-wide panic hook in two tests.
 - The hang-up tests use real sockets with 2 s bounds; a loaded Windows or macOS
   runner could fail them. A failure would be an assertion, not a hang.
 
@@ -2868,14 +2866,22 @@ specials off, which diverges from llama.cpp and breaks templates that transform
 content (`.strip()`, splitting on `</think>`) by mangling the placeholders; (b)
 keep parity and document it as a property of the chat endpoint.
 
-### B90 — chat stream: two leftovers (2026-11-12)
+### B90 — chat stream: what the 2026-11-12 rework changed and left (2026-11-12)
 
-- With `tools` supplied, a reply whose content starts with `{` (`bare_json_open`
-  in `infr-chat` `stream.rs`) is withheld until `finish`, so a plain JSON answer
-  streams as one chunk. A fix needs a small brace/string state machine that
-  detects a complete first JSON object incrementally.
-- Content before a `<think>` that is not at offset 0 is never streamed: `emit`'s
-  content region starts after `</think>`. Confirmed by reading, not fixed.
+`ChatStream` now streams a plain JSON answer as soon as its first object closes
+(with tools on, a reply starting with `{` used to be held to the end), streams
+content that precedes a late `<think>`, and at the final flush settles every
+held stretch: calls fire, reasoning inside it goes out as reasoning, and the
+rest is content. Decided on the way, and worth knowing:
+
+- **A tool-call block that does not parse is shown as content**, alone or beside
+  a valid call, in both the Hermes and the pipe dialect. The parsers used to
+  drop such a block; a block cut off by `max_tokens` now appears in the reply.
+- **Mixed dialects fire Hermes calls first, then pipe calls**, not in the order
+  they appear in the text.
+- The "lead-in first seen during the final flush" path was made consistent with
+  streaming but has no test: every `push` runs a non-final pass first, so the
+  case cannot be produced today.
 
 ### B92 — `top_k == 0` and penalised requests fall off GPU sampling and chaining (2026-11-08)
 
@@ -3205,20 +3211,23 @@ follow `llama-vocab.cpp`, checked against the vocab fixtures in the llama.cpp
 checkout (`models/ggml-vocab-*.gguf.inp/.out`): gemma-4 46/46 rows, llama-bpe
 47/47, qwen35 51/51. What still differs:
 
-- **SPM `add_space_prefix` — wrong default, and a decode bug.** When the key is
-  absent llama.cpp defaults it to `true` for SPM and also prepends the space
-  after every special token; infr defaults to `false` and prepends only at the
-  start. The llama-spm and phi-3 fixtures match 2/47 rows as a result (45/47
-  with the prefix emulated). Separately, an SPM GGUF with
-  `add_space_prefix=true` DECODES with every space removed:
-  `build_spm_tokenizer`'s decoder runs `Fuse` before
-  `Metaspace(PrependScheme::First)`, so the whole text is "token 0" and every
-  `▁` in it is dropped. Repro: vocab
-  `["<unk>","<s>","▁","▁Hello","▁world","!", …bytes]`,
-  `tokenizer.ggml.model="llama"`, `add_space_prefix=true`, `decode([3,4,5])`
-  gives `"Helloworld!"`. Gemma 3 and 4 set the key to `false` and are
-  unaffected; the two bugs must be fixed together, since fixing the default
-  alone would expose the decode bug on Llama-2-style files.
+- **SPM decode keeps a leading space llama.cpp's `detokenize` would drop.**
+  `add_space_prefix` now defaults as the reference does, the prefix is added
+  before every fragment that starts the text or follows a special token, and
+  Phi-3 / jina / modern-bert whitespace stripping around special tokens is
+  ported (`SpecialStrip`). The decoder never strips: every infr caller decodes
+  generated ids, and llama.cpp's server keeps the space on a reply. Decoding a
+  whole BOS-less sequence from position 0 therefore differs by one space; no
+  path does that. Fixture round-trips are 46/46 only when that one space is
+  allowed for.
+- **Phi-3's `</s>` is not stripped around**: llama.cpp forces that token to
+  CONTROL and infr does not (next bullet).
+- **UNKNOWN-typed tokens are now special**, as in `cache_special_tokens`, so a
+  literal `<unk>` in text becomes that token, and a generated one is dropped by
+  the reply paths that decode with `skip_special = true` (streaming and the
+  `generate_*` helpers) — llama.cpp's server does the same unless run with
+  `--special`. Gemma 3's vocab was not checked for other type-2 tokens; the
+  golden did not move.
 - **End of generation is narrower than llama.cpp's on purpose.** llama.cpp
   matches its list by text and then forces the token to CONTROL, so it stops on
   Qwen's `</s>` (a NORMAL token in the qwen2 / qwen35 vocabs). `eog_ids` counts
@@ -3460,21 +3469,17 @@ Both bugs are fixed: `generate_dense_backend` zeroes the DeltaNet state whenever
 prefix seeding goes through `Backend::copy_kv_prefix`, which Vulkan overrides
 for its planar Q8_0 layout. What is left:
 
-- The cancelled-prefill half has no test. The `cached.clear()` after
-  `cached.truncate(start)` is what makes an error mid-prefill zero the state on
-  the next call; deleting it leaves every test green. Landing a cancel between
-  two prefill chunks needs a hook into `sampling.rs` (`StepGate` is private).
+- The `cached.clear()` after `cached.truncate(start)` is now a backstop, not the
+  guard: `written_end != cached.len()` already refuses the overrun state, so
+  `qwen35_aborted_prefill_matches_a_fresh_slot` goes red only with both removed.
+  The clear's one remaining effect is to skip the snapshot-resume arm after an
+  aborted call, which costs a re-prefill from zero.
 - The Vulkan Q8_0 seed is covered only by
   `seeded_kv_prefix_decodes_like_its_source_vulkan`, which is `#[ignore]` and
   returns early without a device, so CI never runs it (see B140). It was run red
   and green on the iGPU.
 - The `copy_kv_prefix` overrides in `tp.rs`, `ep.rs` and `pipeline.rs` compile
   and were read, but were never run: they need a multi-GPU session.
-- `qwen35_reset_slot_matches_a_fresh_slot` writes its GGUF with a third
-  hand-rolled writer, next to the one in `config.rs`'s tests and
-  `SyntheticModel` / `TempGguf` in `tests/synthetic_deepseek2.rs`. A unit test
-  cannot import an integration test's helper; the fix is to move
-  `SyntheticModel` / `TempGguf` into `infr-testkit` and use it from all three.
 - The Vulkan attention read locates V's Q8 scales with the K cache's element
   count ("K and V caches share numel"). Not checked whether any Q8-capable model
   has K and V rows of different width.
@@ -3508,10 +3513,9 @@ instead of from zero. Left:
   by token; the batched DeltaNet kernels chunk from the dispatch's first row, so
   logits differ at about 1e-5..1e-4 and a near-tie can sample differently.
   Bit-identity across turn splits did not hold before either.
-- **Untested:** the ring guard after an aborted prefill (needs the cancel hook
-  B129 also wants), the `seed_from` high-water change, and the snapshot under a
-  real VRAM refusal (the test injects one through a wrapping backend, because no
-  knob makes the guard refuse a chosen allocation). The qwen35 chain tests are
+- **Untested:** the `seed_from` high-water change, and the snapshot under a real
+  VRAM refusal (the test injects one through a wrapping backend, because no knob
+  makes the guard refuse a chosen allocation). The qwen35 chain tests are
   `#[ignore]` and need a device whose `max_decode_chain` is at least 2 — the
   iGPU's watchdog caps it at 1, so they run only on the RX 7900 XTX.
 - B94 leans on rows past `last_written` being ignored. That is no longer true
@@ -3611,16 +3615,14 @@ the Apple target but were not run.
 
 ### B140 — tests that CI reports as passed without running them (2026-11-11)
 
-- **Model-gated unit tests in infr-llama.** The `cpu-goldens` job downloads
-  Qwen3-0.6B but runs only
-  `cargo test --release -p infr-llama --test cpu_backend` (confirmed in
-  `ci.yml`); the library test binary runs only in the model-less matrix, where
-  these return early. Reported as affected: the three grammar tests
-  (`constrained_step_honours_sampler_and_stays_in_grammar`,
-  `a_forced_run_is_cut_to_the_budget`, `forced_grammar_constrains_first_token`),
-  two tokenizer tests, and `loads_and_dims` in `qwen35.rs`. So forced-tool-call
-  grammar masking has no executed test in CI. Adding `--lib` to that job would
-  run the first group.
+- **Model-gated unit tests in infr-llama that still skip.** `cpu-goldens` now
+  also runs the library tests, so the grammar tests and
+  `user_text_special_tokens_are_literal` execute. Still skipping there:
+  `embedded_tokenizer_matches_sidecar` (needs a `tokenizer.json` beside the
+  GGUF, which an HF cache snapshot does not have) and `loads_and_dims` in
+  `qwen35.rs` (needs Qwen3.5-0.8B, which the job does not download). Noticed
+  while running them: `forced_grammar_constrains_first_token` passes but prints
+  a constrained prefix that is mostly whitespace.
 - **Metal model-level tests.** The `metal_*` tests in `cpu_backend.rs` are
   macOS-only and model-gated, and `test-macos` runs only `-p infr-metal` and
   downloads nothing (confirmed in `ci.yml`). Metal's runner, session, slot pool

@@ -32,6 +32,11 @@ pub struct ChatStream {
     raw: String,
     sent_r: usize, // reasoning bytes already emitted (offset within the reasoning region)
     sent_c: usize, // content bytes already emitted (offset within the content region)
+    // Content before a `<think>` that does not open the reply, fixed once the opener is seen:
+    // `(stop, end)`, where `stop` is a tool-call opener in it (or `end`), and how much of it has
+    // been emitted.
+    lead: Option<(usize, usize)>,
+    sent_lead: usize,
     allow_tools: bool,
     // Per-marker cursors so `emit` doesn't re-`find` from offset 0 over the whole buffer on every
     // pushed piece (that was O(n²) across a response). Each caches the first hit once found and
@@ -41,6 +46,98 @@ pub struct ChatStream {
     cur_tool: Cursor,  // Hermes/Qwen `<tool_call>`
     cur_pipe: Cursor,  // gemma4/E2B/DG `<|tool_call>`
     cur_final: Cursor, // channel-format `<channel|>`
+    bare: BareJson,
+}
+
+/// Incremental scan for a bare-JSON tool call at the head of a content region: skips leading
+/// whitespace, then tracks brace depth outside JSON strings until the first object closes. Each
+/// call scans only the bytes appended since the last, so streaming stays linear in the reply.
+#[derive(Default)]
+struct BareJson {
+    cs: Option<usize>, // the region start this state describes
+    scanned: usize,
+    head: BareHead,
+    depth: usize,
+    in_str: bool,
+    esc: bool,
+}
+
+#[derive(Default, Clone, Copy, PartialEq)]
+enum BareHead {
+    /// Only whitespace so far.
+    #[default]
+    Pending,
+    /// The region opens with `{` at this offset and the object has not closed yet.
+    Open(usize),
+    /// The first object closed and parses as a call; held until `finish` decides.
+    Call(usize),
+    /// Not a bare-JSON call: no leading `{`, or its first object is not a call.
+    No,
+}
+
+impl BareJson {
+    /// Where the region at `cs` opens a possible bare-JSON call, or `None` once it cannot be one.
+    fn open(&mut self, raw: &str, cs: usize) -> Option<usize> {
+        if self.cs != Some(cs) {
+            *self = Self {
+                cs: Some(cs),
+                scanned: cs,
+                ..Self::default()
+            };
+        }
+        let bytes = raw.as_bytes();
+        while self.scanned < bytes.len() {
+            let i = self.scanned;
+            let b = bytes[i];
+            self.scanned += 1;
+            match self.head {
+                BareHead::Pending => match b {
+                    b' ' | b'\n' | b'\t' | b'\r' => {}
+                    b'{' => {
+                        self.head = BareHead::Open(i);
+                        self.depth = 1;
+                    }
+                    _ => self.head = BareHead::No,
+                },
+                BareHead::Open(start) => {
+                    if self.in_str {
+                        match b {
+                            _ if self.esc => self.esc = false,
+                            b'\\' => self.esc = true,
+                            b'"' => self.in_str = false,
+                            _ => {}
+                        }
+                    } else {
+                        match b {
+                            b'"' => self.in_str = true,
+                            b'{' => self.depth += 1,
+                            b'}' => {
+                                self.depth -= 1;
+                                if self.depth == 0 {
+                                    // A call must be the whole region, so the first object
+                                    // decides: one that is not a call means none is coming.
+                                    let call = crate::tools::parse_bare_json_call(&raw[start..=i]);
+                                    self.head = if call.is_some() {
+                                        BareHead::Call(start)
+                                    } else {
+                                        BareHead::No
+                                    };
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                BareHead::Call(_) | BareHead::No => {
+                    self.scanned = bytes.len();
+                }
+            }
+        }
+        match self.head {
+            BareHead::Open(i) | BareHead::Call(i) => Some(i),
+            BareHead::Pending | BareHead::No => None,
+        }
+    }
 }
 
 /// A forward-only search for a fixed `needle` in an append-only buffer: once the needle is found its
@@ -90,12 +187,15 @@ impl ChatStream {
             raw: String::new(),
             sent_r: 0,
             sent_c: 0,
+            lead: None,
+            sent_lead: 0,
             allow_tools,
             cur_think_open: Cursor::default(),
             cur_think_close: Cursor::default(),
             cur_tool: Cursor::default(),
             cur_pipe: Cursor::default(),
             cur_final: Cursor::default(),
+            bare: BareJson::default(),
         }
     }
 
@@ -104,29 +204,11 @@ impl ChatStream {
         self.emit(false, on_delta);
     }
 
+    /// Flush the held-back tails (no marker can still be forming) and settle every stretch that
+    /// streaming held back from a tool-call opener: its calls fire, or it is emitted as content
+    /// when it holds none.
     pub fn finish(&mut self, on_delta: &mut dyn FnMut(Delta)) {
-        self.emit(true, on_delta); // flush the held-back tails (no marker can still be forming)
-        if self.allow_tools {
-            // The format is decided by the rule streaming uses ([`channel_thought_head`]), so a
-            // call fires here only from the region streaming held back as one: after `<channel|>`
-            // for channel output — a call quoted in its thought block is reasoning — and outside
-            // `<think>` otherwise, even when that content merely mentions a channel marker.
-            let body = if channel_thought_head(&self.raw).is_some() {
-                crate::split_channels(&self.raw).1
-            } else {
-                crate::split_think(&self.raw).1
-            };
-            // Dialect-aware: hermes JSON + qwen3.5/3.6 XML + gemma pipe-marker + llama3 bare JSON
-            // (hermes-only here silently dropped every non-qwen3 model's calls over serve).
-            let (_content, calls) = crate::parse_any_tool_calls(&body);
-            for call in calls {
-                on_delta(Delta::ToolCall {
-                    name: call.name,
-                    arguments: serde_json::to_string(&call.arguments)
-                        .unwrap_or_else(|_| "{}".to_string()),
-                });
-            }
-        }
+        self.emit(true, on_delta);
     }
 
     /// The earliest tool-call opener at/after `cs`, across every dialect `finish()` parses — Hermes
@@ -149,18 +231,12 @@ impl ChatStream {
     /// Position of a bare-JSON (`{…}`) tool-call opener in the content region starting at `cs`, or
     /// `None`. Scoped to the leading `{` of the region (skipping only whitespace) so ordinary prose
     /// that merely *contains* a brace is never suppressed. During streaming a leading `{` is held
-    /// back optimistically; on the final flush it's confirmed a real call via
-    /// [`crate::tools::parse_bare_json_call`] so a leading brace that isn't a call still streams as
-    /// content instead of being dropped.
-    fn bare_json_open(&self, cs: usize, final_flush: bool) -> Option<usize> {
-        let bytes = self.raw.as_bytes();
-        let mut i = cs;
-        while i < bytes.len() && matches!(bytes[i], b' ' | b'\n' | b'\t' | b'\r') {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b'{' {
-            return None;
-        }
+    /// back until its first object closes ([`BareJson`]): one that is not a call streams as content
+    /// from then on, instead of the whole reply arriving as one chunk at `finish`. On the final
+    /// flush it's confirmed a real call via [`crate::tools::parse_bare_json_call`] so a leading
+    /// brace that isn't a call still streams as content instead of being dropped.
+    fn bare_json_open(&mut self, cs: usize, final_flush: bool) -> Option<usize> {
+        let i = self.bare.open(&self.raw, cs)?;
         if final_flush && crate::tools::parse_bare_json_call(&self.raw[i..]).is_none() {
             return None; // leading `{` but not actually a call — let it stream as content
         }
@@ -181,20 +257,7 @@ impl ChatStream {
             };
             emit_region(&self.raw, hm, r_end, hold, &mut self.sent_r, true, on_delta);
             if let Some(cs) = c_start {
-                let tool_open = self.tool_open_at(cs, final_flush);
-                let (c_end, hold) = match tool_open {
-                    Some(t) if t >= cs => (t, false),
-                    _ => (self.raw.len(), !final_flush),
-                };
-                emit_region(
-                    &self.raw,
-                    cs,
-                    c_end,
-                    hold,
-                    &mut self.sent_c,
-                    false,
-                    on_delta,
-                );
+                self.emit_content(cs, final_flush, on_delta);
             }
             return;
         }
@@ -209,6 +272,39 @@ impl ChatStream {
         }
         let think_open = self.cur_think_open.find(&self.raw, TO);
         let think_close = self.cur_think_close.find(&self.raw, TC);
+        // Content before a `<think>` later in the reply. Until the opener arrives it streamed as
+        // the content region at offset 0, so that region's progress carries over; its end is then
+        // fixed, and streaming stops at a tool-call opener in it.
+        let lead = think_open
+            .filter(|&to| think_close.is_none_or(|tc| tc > to))
+            .map(|to| match self.lead {
+                Some(lead) => lead,
+                None => {
+                    self.sent_lead = std::mem::take(&mut self.sent_c);
+                    // The streaming rule even on the final flush: a held opener is judged by
+                    // `settle_held` on the lead-in alone, never with the `<think>` text after it.
+                    let stop = match to {
+                        0 => 0,
+                        _ => self.tool_open_at(0, false).map_or(to, |t| t.min(to)),
+                    };
+                    self.lead = Some((stop, to));
+                    (stop, to)
+                }
+            });
+        if let Some((stop, end)) = lead {
+            emit_region(
+                &self.raw,
+                0,
+                stop,
+                false,
+                &mut self.sent_lead,
+                false,
+                on_delta,
+            );
+            if final_flush && stop < end {
+                settle_held(&self.raw[stop..end], on_delta);
+            }
+        }
         // Reasoning region: between `<think>` and `</think>` (or end, while still thinking).
         if let Some(to) = think_open {
             let rs = to + TO.len();
@@ -218,6 +314,11 @@ impl ChatStream {
             };
             emit_region(&self.raw, rs, r_end, hold, &mut self.sent_r, true, on_delta);
         }
+        // A lead-in held at a tool-call opener is settled only at `finish`; content after the
+        // reasoning waits with it so the content arrives in order.
+        if !final_flush && self.lead.is_some_and(|(stop, end)| stop < end) {
+            return;
+        }
         // Content region: after `</think>` (or from the start when there's no `<think>` at all), up to
         // a tool-call opener (whose block is buffered, not streamed) or the end.
         let c_start = match think_close {
@@ -226,22 +327,78 @@ impl ChatStream {
             None => None,
         };
         if let Some(cs) = c_start {
-            let tool_open = self.tool_open_at(cs, final_flush);
-            let (c_end, hold) = match tool_open {
-                Some(t) if t >= cs => (t, false),
-                _ => (self.raw.len(), !final_flush),
-            };
-            emit_region(
-                &self.raw,
-                cs,
-                c_end,
-                hold,
-                &mut self.sent_c,
-                false,
-                on_delta,
-            );
+            self.emit_content(cs, final_flush, on_delta);
         }
     }
+
+    /// Stream the content region starting at `cs` up to its first tool-call opener. On the final
+    /// flush the stretch from that opener on is settled ([`settle_held`]).
+    fn emit_content(&mut self, cs: usize, final_flush: bool, on_delta: &mut dyn FnMut(Delta)) {
+        let tool_open = self.tool_open_at(cs, final_flush).filter(|&t| t >= cs);
+        let (c_end, hold) = match tool_open {
+            Some(t) => (t, false),
+            None => (self.raw.len(), !final_flush),
+        };
+        emit_region(
+            &self.raw,
+            cs,
+            c_end,
+            hold,
+            &mut self.sent_c,
+            false,
+            on_delta,
+        );
+        if let (true, Some(t)) = (final_flush, tool_open) {
+            settle_held(&self.raw[t..], on_delta);
+        }
+    }
+}
+
+/// Settle a stretch streaming held back from a tool-call opener. A `<think>` span in it is
+/// reasoning, not content, and goes out as such. Every call in the rest fires, and what is not a
+/// call is emitted as content verbatim: prose around the calls with its own whitespace, and any
+/// block that did not parse (see [`crate::parse_hermes_tool_calls`]) — nothing the model wrote is
+/// dropped. The one exception is a remainder that is only whitespace once the calls are out,
+/// which shows nothing.
+fn settle_held(held: &str, on_delta: &mut dyn FnMut(Delta)) {
+    let (body, reasoning) = split_reasoning_spans(held);
+    if !reasoning.is_empty() {
+        on_delta(Delta::Reasoning(reasoning));
+    }
+    // Dialect-aware: hermes JSON + qwen3.5/3.6 XML + gemma pipe-marker + llama3 bare JSON
+    // (hermes-only here silently dropped every non-qwen3 model's calls over serve).
+    let (content, calls) = crate::parse_any_tool_calls(&body);
+    let content = if calls.is_empty() { body } else { content };
+    if !content.trim().is_empty() {
+        on_delta(Delta::Content(content));
+    }
+    for call in calls {
+        on_delta(Delta::ToolCall {
+            name: call.name,
+            arguments: serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".to_string()),
+        });
+    }
+}
+
+/// `text` without its `<think>…</think>` spans (an unclosed one runs to the end), and the
+/// reasoning inside them.
+fn split_reasoning_spans(text: &str) -> (String, String) {
+    const TO: &str = "<think>";
+    const TC: &str = "</think>";
+    let (mut content, mut reasoning) = (String::new(), String::new());
+    let mut rest = text;
+    while let Some(o) = rest.find(TO) {
+        content.push_str(&rest[..o]);
+        let inner = &rest[o + TO.len()..];
+        let Some(c) = inner.find(TC) else {
+            reasoning.push_str(inner);
+            return (content, reasoning);
+        };
+        reasoning.push_str(&inner[..c]);
+        rest = &inner[c + TC.len()..];
+    }
+    content.push_str(rest);
+    (content, reasoning)
 }
 
 /// The heads that put a reply in the channel format (E2B/gpt-oss): reasoning after the thought
@@ -500,6 +657,191 @@ mod chat_stream_tests {
         assert!(c.contains("<|channel> marker"), "content lost: {c:?}");
         assert_eq!(t.len(), 1, "expected exactly one tool call, got {t:?}");
         assert_eq!(t[0].0, "run_bash");
+    }
+
+    /// With tools on, a reply opening with a JSON object that is not a call streams once the
+    /// object closes, instead of arriving as one chunk at `finish`. Braces and an escaped quote
+    /// inside a string do not end the object early.
+    #[test]
+    fn a_leading_json_answer_streams_before_finish() {
+        let pieces = [
+            "{\"a\": [1, ",
+            "2], \"b\": \"x} \\\"q\\\" {\"}",
+            " and the prose after it keeps coming",
+            " for a while longer.",
+        ];
+        let mut s = ChatStream::new(true);
+        let mut streamed = String::new();
+        for p in pieces {
+            s.push(p, &mut |d| {
+                if let Delta::Content(x) = d {
+                    streamed.push_str(&x)
+                }
+            });
+        }
+        assert!(
+            streamed.starts_with("{\"a\": [1, 2], \"b\": \"x} \\\"q\\\" {\"}"),
+            "the object was not streamed before finish: {streamed:?}"
+        );
+        let (_r, c, t) = run(&pieces, true);
+        assert!(t.is_empty(), "a plain object fired as a call: {t:?}");
+        assert_eq!(c, pieces.concat());
+    }
+
+    /// Content before a `<think>` that does not open the reply streams, in order, and does not
+    /// shift the content after `</think>`.
+    #[test]
+    fn content_before_a_late_think_is_streamed() {
+        let pieces = [
+            "Sure, let me check. ",
+            "<think>",
+            "plan",
+            "</think>",
+            "It is 4.",
+        ];
+        let mut out = Vec::new();
+        let mut s = ChatStream::new(false);
+        for p in pieces {
+            s.push(p, &mut |d| out.push(d));
+        }
+        s.finish(&mut |d| out.push(d));
+        let lead = out
+            .iter()
+            .position(|d| matches!(d, Delta::Content(x) if x.contains("check.")));
+        let think = out.iter().position(|d| matches!(d, Delta::Reasoning(_)));
+        assert!(
+            lead < think && lead.is_some(),
+            "lead missing or late: {out:?}"
+        );
+        let (r, c, _) = run(&pieces, false);
+        assert_eq!(r, "plan");
+        assert_eq!(c, "Sure, let me check. It is 4.");
+    }
+
+    /// A lead-in held at a tool-call opener before a `<think>` (a leading `{`, a `<tool_call>`)
+    /// that turns out not to be a call is emitted at `finish`, ahead of the content after the
+    /// reasoning, instead of vanishing.
+    #[test]
+    fn a_held_lead_in_that_is_no_call_is_emitted_in_order() {
+        for (pieces, want) in [
+            (
+                &[
+                    "{not a call} so ",
+                    "<think>",
+                    "plan",
+                    "</think>",
+                    "an answer long enough to stream",
+                ][..],
+                "{not a call} so an answer long enough to stream",
+            ),
+            (
+                &[
+                    "Hi <tool_call>oops ",
+                    "<think>",
+                    "plan",
+                    "</think>",
+                    "done, and more after that",
+                ][..],
+                "Hi <tool_call>oops done, and more after that",
+            ),
+        ] {
+            let (r, c, t) = run(pieces, true);
+            assert_eq!(r, "plan");
+            assert!(t.is_empty(), "no call was made: {t:?}");
+            assert_eq!(c, want);
+        }
+    }
+
+    /// A call after the reasoning is judged on the content after `</think>` alone, the region
+    /// streaming held: the lead-in before `<think>` does not stop it from firing.
+    #[test]
+    fn a_call_after_reasoning_fires_despite_a_lead_in() {
+        let (_r, c, t) = run(
+            &[
+                "Sure. ",
+                "<think>",
+                "plan",
+                "</think>",
+                "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}",
+            ],
+            true,
+        );
+        assert_eq!(t.len(), 1, "expected exactly one tool call, got {t:?}");
+        assert_eq!(t[0].0, "get_weather");
+        assert_eq!(c, "Sure. ");
+    }
+
+    /// A held tool-call marker whose body is not a call is shown as content, not dropped.
+    #[test]
+    fn a_marker_that_holds_no_call_is_emitted_as_content() {
+        let (_r, c, t) = run(&["Here: ", "<tool_call>not json</tool_call>"], true);
+        assert!(t.is_empty(), "{t:?}");
+        assert_eq!(c, "Here: <tool_call>not json</tool_call>");
+    }
+
+    /// A `<think>` span after a call in the held stretch is reasoning: it must not reach the
+    /// content.
+    #[test]
+    fn reasoning_after_a_held_call_is_not_content() {
+        let (r, c, t) = run(
+            &[
+                "<think>plan</think>",
+                "<tool_call>{\"name\": \"run_bash\", \"arguments\": {\"command\": \"ls\"}}</tool_call>",
+                "<think>second thoughts</think>",
+                "Done after the call.",
+            ],
+            true,
+        );
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert!(!c.contains("think") && !c.contains("second"), "{c:?}");
+        assert!(c.contains("Done after the call."), "{c:?}");
+        assert!(r.contains("second thoughts"), "{r:?}");
+    }
+
+    /// A `<tool_call>` block that does not parse is shown as content whether or not a valid
+    /// call sits beside it.
+    #[test]
+    fn an_unparseable_block_beside_a_call_is_shown() {
+        let (_r, c, t) = run(
+            &[
+                "Here: ",
+                "<tool_call>not json</tool_call> and ",
+                "<tool_call>{\"name\": \"run_bash\", \"arguments\": {}}</tool_call>",
+            ],
+            true,
+        );
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert!(c.contains("<tool_call>not json</tool_call>"), "{c:?}");
+    }
+
+    /// Prose after a removed call keeps the whitespace that separated it from the prose before.
+    #[test]
+    fn prose_around_a_removed_call_is_not_glued() {
+        let (_r, c, t) = run(
+            &[
+                "Sure.",
+                "<tool_call>{\"name\": \"run_bash\", \"arguments\": {}}</tool_call>",
+                " More text after it.",
+            ],
+            true,
+        );
+        assert_eq!(t.len(), 1, "{t:?}");
+        assert_eq!(c, "Sure. More text after it.");
+    }
+
+    /// A Hermes call followed by a pipe-format call: both fire and neither is shown.
+    #[test]
+    fn mixed_dialect_calls_all_fire() {
+        let (_r, c, t) = run(
+            &[
+                "<tool_call>{\"name\": \"run_bash\", \"arguments\": {}}</tool_call>",
+                "<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>}<tool_call|>",
+            ],
+            true,
+        );
+        let names: Vec<&str> = t.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["run_bash", "get_weather"]);
+        assert!(!c.contains("tool_call"), "{c:?}");
     }
 
     #[test]

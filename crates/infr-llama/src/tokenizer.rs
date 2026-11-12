@@ -13,6 +13,7 @@ use tokenizers::decoders::byte_level::ByteLevel as ByteLevelDecoder;
 use tokenizers::decoders::fuse::Fuse;
 use tokenizers::decoders::sequence::Sequence as DecoderSequence;
 use tokenizers::models::bpe::BPE;
+use tokenizers::normalizers::{Prepend, Replace};
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
 use tokenizers::pre_tokenizers::metaspace::{Metaspace, PrependScheme};
 use tokenizers::pre_tokenizers::sequence::Sequence as PreSequence;
@@ -40,11 +41,13 @@ fn parse_merges(arr: &[MetaValue]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Register `tokenizer.ggml.token_type` 3 (CONTROL) and 4 (USER_DEFINED) tokens on `tok`, matching
-/// HF: control tokens are SPECIAL (`AddedToken::from(s, true)`), user-defined ones are normal added
-/// tokens. Both encode atomically; only the special ones are dropped by
+/// Register `tokenizer.ggml.token_type` 2 (UNKNOWN), 3 (CONTROL) and 4 (USER_DEFINED) tokens on
+/// `tok` — the set llama.cpp splits out before tokenizing (`cache_special_tokens`). Unknown and
+/// control tokens are SPECIAL (`AddedToken::from(s, true)`), user-defined ones are normal added
+/// tokens. All encode atomically; only the special ones are dropped by
 /// `decode(.., skip_special=true)`, which is why `<think>`/`</think>` (type 4) must NOT be special —
-/// the reasoning block has to stay visible in the output for the reasoning split to find it.
+/// the reasoning block has to stay visible in the output for the reasoning split to find it. Each
+/// also takes the whitespace stripping [`SpecialStrip`] gives it.
 ///
 /// Absent `token_type` ⇒ nothing to register. The empty-vec guards are kept because `add_tokens` /
 /// `add_special_tokens` on an empty slice still bump the tokenizer's added-vocab bookkeeping, and
@@ -62,15 +65,25 @@ fn register_token_types(md: &Metadata, toks: &[MetaValue], tok: &mut Tokenizer) 
     else {
         return;
     };
+    let strip = SpecialStrip::of(md);
     let mut specials = Vec::new();
     let mut added = Vec::new();
     for (i, ty) in types.iter().enumerate() {
         let Some(s) = toks.get(i).and_then(MetaValue::as_str) else {
             continue;
         };
+        let (lstrip, rstrip) = strip.around(s);
+        let token = |special| {
+            AddedToken::from(s.to_string(), special)
+                .lstrip(lstrip)
+                .rstrip(rstrip)
+        };
         match ty.as_u64() {
-            Some(3) => specials.push(AddedToken::from(s.to_string(), true)),
-            Some(4) => added.push(AddedToken::from(s.to_string(), false)),
+            Some(2 | 3) => specials.push(token(true)),
+            // Matched on the raw text, before any normalizer, as llama.cpp's
+            // `tokenizer_st_partition` does: the SPM space-prefix normalizer must see the text
+            // AFTER a user-defined token as its own stretch, not prefix the stretch around it.
+            Some(4) => added.push(token(false).normalized(false)),
             _ => {}
         }
     }
@@ -79,6 +92,51 @@ fn register_token_types(md: &Metadata, toks: &[MetaValue], tok: &mut Tokenizer) 
     }
     if !specials.is_empty() {
         tok.add_special_tokens(&specials);
+    }
+}
+
+/// Which whitespace next to a special token is dropped when the token is split out of the input:
+/// llama.cpp's per-model LSTRIP / RSTRIP attributes (`llama_vocab::impl::load`, "Handle per token
+/// attributes"). Decided once per model from the same metadata, matched the same way — a
+/// substring of `tokenizer.ggml.pre` or `general.architecture`, or of `general.name` lowercased —
+/// and applied per token by [`SpecialStrip::around`]. Phi-3's chat template puts a newline after
+/// every turn marker, which its tokenizer drops. Whitespace is `char::is_whitespace` here and
+/// ASCII `isspace` there, so the two differ only on non-ASCII whitespace next to such a token.
+enum SpecialStrip {
+    /// Whitespace before this token (jina-v2 / nomic-bert-moe / jina-bert-v3 `<mask>`,
+    /// modern-bert `[MASK]`).
+    LeftOf(&'static str),
+    /// Whitespace after every special token except these (Phi-3).
+    RightExcept(&'static [&'static str]),
+    None,
+}
+
+impl SpecialStrip {
+    fn of(md: &Metadata) -> Self {
+        let name = md.str("general.name").unwrap_or("").to_lowercase();
+        let pre = md.str("tokenizer.ggml.pre").unwrap_or("");
+        let arch = md.str("general.architecture").unwrap_or("");
+        let any = |s: &str, subs: &[&str]| subs.iter().any(|sub| s.contains(sub));
+        if any(pre, &["jina-v2-de", "jina-v2-es", "jina-v2-code"])
+            || any(arch, &["nomic-bert-moe", "jina-bert-v3"])
+        {
+            Self::LeftOf("<mask>")
+        } else if any(&name, &["phi-3", "phi3"]) {
+            Self::RightExcept(&["<unk>", "<s>", "<|endoftext|>"])
+        } else if any(&name, &["modern-bert"]) {
+            Self::LeftOf("[MASK]")
+        } else {
+            Self::None
+        }
+    }
+
+    /// `(lstrip, rstrip)` for the special token `text`.
+    fn around(&self, text: &str) -> (bool, bool) {
+        match self {
+            Self::LeftOf(t) => (text == *t, false),
+            Self::RightExcept(keep) => (false, !keep.contains(&text)),
+            Self::None => (false, false),
+        }
     }
 }
 
@@ -421,27 +479,42 @@ fn build_spm_tokenizer(md: &Metadata) -> Result<Tokenizer> {
         .build()
         .map_err(|e| anyhow!("build spm bpe: {e}"))?;
     let mut tok = Tokenizer::new(bpe);
-    // SPM: spaces → ▁. add_space_prefix=true prepends a dummy ▁ (PrependScheme::First); gemma3
-    // sets it false. `split` stays OFF: llama.cpp merges over the whole escaped text
+    // SPM: spaces → ▁. `split` stays OFF: llama.cpp merges over the whole escaped text
     // (`llm_tokenizer_spm_session::tokenize`; gemma4 splits only at newline runs), and splitting at
     // every ▁ would make whitespace-run pieces (`▁▁`, `▁▁▁▁`) unreachable.
-    let add_prefix = matches!(
-        md.get("tokenizer.ggml.add_space_prefix"),
-        Some(MetaValue::Bool(true))
-    );
-    let scheme = if add_prefix {
-        PrependScheme::First
-    } else {
-        PrependScheme::Never
+    //
+    // `add_space_prefix` follows `llama_vocab::impl::load`: an absent key means true for an SPM
+    // vocab (`model == "llama"`, so Llama-2, Mistral v0.x, Phi-3) and false for gemma4, which
+    // llama.cpp loads as BPE; gemma3/gemma4 GGUFs set it false explicitly.
+    let add_prefix = match md.get("tokenizer.ggml.add_space_prefix") {
+        Some(MetaValue::Bool(b)) => *b,
+        _ => md.str("tokenizer.ggml.model") == Some("llama"),
     };
-    tok.with_pre_tokenizer(Some(Metaspace::new('▁', scheme, false)));
-    // Decode: reassemble byte-fallback bytes, fuse, then map ▁→space (Metaspace decoder).
-    let dec = DecoderSequence::new(vec![
+    tok.with_pre_tokenizer(Some(Metaspace::new('▁', PrependScheme::Never, false)));
+    if add_prefix {
+        // llama.cpp (`llama_vocab::impl::tokenize`, SPM arm) puts a space before every raw-text
+        // fragment that starts the input or follows a special or user-defined token, even one
+        // that already starts with a space. The normalizer runs once per stretch between added
+        // tokens, which is exactly that; Metaspace's own prepend skips text already starting
+        // with ▁, so " Hello" would get one ▁ where the reference has two.
+        tok.with_normalizer(Some(Prepend::new("▁".into())));
+    }
+    // Decode: map every ▁ to a space, reassemble byte-fallback bytes, fuse — stripping nothing:
+    // the concatenation of llama.cpp's `token_to_piece` with no `lstrip`, which is how its server
+    // turns a reply into text, so a reply keeps its leading space. Every caller here decodes
+    // generated ids. (`detokenize` additionally drops the first piece's leading space when the
+    // sequence does not start with a skipped BOS; HF's `decode` cannot tell a sequence's start
+    // from a window into a reply, and nothing here decodes a whole BOS-less sequence.)
+    //
+    // The ▁ → space step is a `Replace` decoder rather than Metaspace's because the grammar
+    // engine reads the decoder to learn each token's bytes: `toktrie_hf_tokenizers` takes the
+    // space character only from a `Replace("▁", " ")`, and otherwise hands the constraint every
+    // ▁ as its UTF-8 bytes, so a forced JSON tool call could not contain a space.
+    tok.with_decoder(Some(DecoderSequence::new(vec![
+        DecoderWrapper::Replace(Replace::new("▁", " ").map_err(|e| anyhow!("replace: {e}"))?),
         DecoderWrapper::ByteFallback(ByteFallback::default()),
         DecoderWrapper::Fuse(Fuse::default()),
-        DecoderWrapper::Metaspace(Metaspace::new('▁', scheme, true)),
-    ]);
-    tok.with_decoder(Some(dec));
+    ])));
     // CONTROL tokens (type 3, e.g. <bos>/<start_of_turn>/<end_of_turn>) encode atomically as
     // special; USER_DEFINED (type 4) as normal added tokens — see [`register_token_types`].
     register_token_types(md, toks, &mut tok);
@@ -667,13 +740,17 @@ mod tokenizer_tests {
     fn spm_space_runs_reach_multi_space_pieces() {
         let tokens = ["<unk>", "▁", "▁▁", "▁▁▁▁", "a"];
         // llama/gemma3 rebuild their merges from the scores; gemma4 ships them.
+        // The prefix is off so the input's own spaces are the whole run.
         let scored = vocab_md(
             "llama",
             &tokens,
-            vec![(
-                "tokenizer.ggml.scores",
-                MetaValue::Arr([0.0, -1.0, -2.0, -3.0, -1.0].map(MetaValue::F64).to_vec()),
-            )],
+            vec![
+                (
+                    "tokenizer.ggml.scores",
+                    MetaValue::Arr([0.0, -1.0, -2.0, -3.0, -1.0].map(MetaValue::F64).to_vec()),
+                ),
+                ("tokenizer.ggml.add_space_prefix", MetaValue::Bool(false)),
+            ],
         );
         let merged = vocab_md(
             "gemma4",
@@ -685,6 +762,141 @@ mod tokenizer_tests {
             let ids = tok.encode("    a", false).unwrap().get_ids().to_vec();
             assert_eq!(ids, [3, 4], "{:?}", md.str("tokenizer.ggml.model"));
         }
+    }
+
+    /// `add_space_prefix` as `llama_vocab::impl::load` and `tokenize` apply it: an SPM vocab
+    /// without the key gets the prefix, before every stretch of text that starts the input or
+    /// follows a special, unknown or user-defined token, even one already starting with a space.
+    /// Decoding maps every `▁` to a space and strips none, as llama.cpp's server builds a reply
+    /// from `token_to_piece`. An explicit false (gemma3) and gemma4's absent key mean no prefix.
+    #[test]
+    fn spm_space_prefix_follows_the_reference() {
+        // 0 <unk> (UNKNOWN), 1 <s> (CONTROL), 2 ▁, 3 a, 4 ▁a, 5 b, 6 ▁b, 7 !, 8 <x> (USER_DEFINED)
+        let tokens = ["<unk>", "<s>", "▁", "a", "▁a", "b", "▁b", "!", "<x>"];
+        let types = [2, 3, 1, 1, 1, 1, 1, 1, 4];
+        let md = |model: &str, prefix: Option<bool>| {
+            let mut extra = vec![
+                (
+                    "tokenizer.ggml.scores",
+                    MetaValue::Arr(tokens.iter().map(|_| MetaValue::F64(0.0)).collect()),
+                ),
+                (
+                    "tokenizer.ggml.token_type",
+                    MetaValue::Arr(types.map(MetaValue::U64).to_vec()),
+                ),
+            ];
+            if let Some(p) = prefix {
+                extra.push(("tokenizer.ggml.add_space_prefix", MetaValue::Bool(p)));
+            }
+            tokenizer_from_metadata(&vocab_md(model, &tokens, extra)).expect("synthetic SPM")
+        };
+        let ids = |tok: &Tokenizer, text: &str| tok.encode(text, false).unwrap().get_ids().to_vec();
+
+        for tok in [md("llama", None), md("llama", Some(true))] {
+            assert_eq!(ids(&tok, "a b!"), [4, 6, 7]);
+            assert_eq!(ids(&tok, " a"), [2, 4]);
+            assert_eq!(ids(&tok, "a<s>b"), [4, 1, 6]);
+            assert_eq!(ids(&tok, "<s>a<x>b"), [1, 4, 8, 6]);
+            assert_eq!(ids(&tok, "a<unk>b"), [4, 0, 6]);
+            assert_eq!(tok.decode(&[4, 6, 7], true).unwrap(), " a b!");
+            for text in ["a b!", " a", "  b"] {
+                assert_eq!(
+                    tok.decode(&ids(&tok, text), true).unwrap(),
+                    format!(" {text}")
+                );
+            }
+        }
+        for tok in [md("llama", Some(false)), md("gemma4", None)] {
+            assert_eq!(ids(&tok, " a b"), [4, 6]);
+            assert_eq!(tok.decode(&[4, 6, 7], true).unwrap(), " a b!");
+        }
+    }
+
+    /// The grammar engine learns each token's bytes from the decoder chain. An SPM piece must reach
+    /// it with `▁` as a space, or a constrained (forced tool-call) JSON reply could never contain
+    /// one; with the prefix on and off alike.
+    #[test]
+    fn spm_tokens_reach_the_grammar_engine_with_spaces() {
+        let tokens = ["<unk>", "<s>", "▁", "a", "▁a"];
+        for prefix in [None, Some(false)] {
+            let mut extra = vec![
+                (
+                    "tokenizer.ggml.scores",
+                    MetaValue::Arr(tokens.iter().map(|_| MetaValue::F64(0.0)).collect()),
+                ),
+                (
+                    "tokenizer.ggml.token_type",
+                    MetaValue::Arr([2, 3, 1, 1, 1].map(MetaValue::U64).to_vec()),
+                ),
+            ];
+            if let Some(p) = prefix {
+                extra.push(("tokenizer.ggml.add_space_prefix", MetaValue::Bool(p)));
+            }
+            let tok = tokenizer_from_metadata(&vocab_md("llama", &tokens, extra)).unwrap();
+            let env = crate::grammar::build_tok_env(&tok, tokens.len(), &[1]).expect("tok env");
+            assert_eq!(env.tok_trie().token(4), b" a", "prefix {prefix:?}");
+            assert_eq!(env.tok_trie().token(2), b" ", "prefix {prefix:?}");
+        }
+    }
+
+    /// llama.cpp's per-model whitespace stripping around special tokens: under a `general.name`
+    /// naming Phi-3, whitespace after every special token but `<s>` (and `<unk>`,
+    /// `<|endoftext|>`) is dropped before the next stretch is prefixed; any other name keeps it.
+    /// Under `tokenizer.ggml.pre` jina-v2-* or a `general.name` naming modern-bert, whitespace
+    /// before `<mask>` / `[MASK]` is dropped.
+    #[test]
+    fn special_token_whitespace_strips_like_the_reference() {
+        // 0 <unk>, 1 <s>, 2 ▁, 3 a, 4 ▁a, 5 <|user|>, 6 <|end|>
+        let tokens = ["<unk>", "<s>", "▁", "a", "▁a", "<|user|>", "<|end|>"];
+        let tok = |name: &str| {
+            tokenizer_from_metadata(&vocab_md(
+                "llama",
+                &tokens,
+                vec![
+                    (
+                        "tokenizer.ggml.scores",
+                        MetaValue::Arr(tokens.iter().map(|_| MetaValue::F64(0.0)).collect()),
+                    ),
+                    (
+                        "tokenizer.ggml.token_type",
+                        MetaValue::Arr([2, 3, 1, 1, 1, 3, 3].map(MetaValue::U64).to_vec()),
+                    ),
+                    ("general.name", MetaValue::Str(name.into())),
+                ],
+            ))
+            .expect("synthetic SPM")
+        };
+        let ids = |tok: &Tokenizer, text: &str| tok.encode(text, false).unwrap().get_ids().to_vec();
+        let phi = tok("Phi3");
+        assert_eq!(ids(&phi, "<|user|>\n a<|end|> \n"), [5, 4, 6]);
+        assert_eq!(ids(&phi, "<s> a"), [1, 2, 4]);
+        let other = tok("llama-spm");
+        assert_eq!(ids(&other, "<s> a"), [1, 2, 4]);
+        assert_eq!(ids(&other, "<|user|> a"), [5, 2, 4]);
+
+        let mask = |pre: &str, name: &str, mask: &str| {
+            let md = vocab_md(
+                "gpt2",
+                &["a", "\u{0120}", mask],
+                vec![
+                    ("tokenizer.ggml.merges", str_arr(&[])),
+                    ("tokenizer.ggml.pre", MetaValue::Str(pre.into())),
+                    ("general.name", MetaValue::Str(name.into())),
+                    (
+                        "tokenizer.ggml.token_type",
+                        MetaValue::Arr([1, 1, 3].map(MetaValue::U64).to_vec()),
+                    ),
+                ],
+            );
+            let tok = tokenizer_from_metadata(&md).expect("synthetic BPE vocab");
+            tok.encode(format!("a {mask}"), false)
+                .unwrap()
+                .get_ids()
+                .to_vec()
+        };
+        assert_eq!(mask("jina-v2-es", "x", "<mask>"), [0, 2]);
+        assert_eq!(mask("gpt-2", "modern-bert-base", "[MASK]"), [0, 2]);
+        assert_eq!(mask("gpt-2", "x", "[MASK]"), [0, 1, 2]);
     }
 
     /// The pre-split chunks `pre` produces for `text` on a byte-level BPE vocabulary, as slices of

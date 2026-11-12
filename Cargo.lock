@@ -1299,6 +1299,7 @@ dependencies = [
  "infr-metal",
  "infr-prof",
  "infr-prof-rt",
+ "infr-testkit",
  "infr-vulkan",
  "llguidance",
  "rayon",

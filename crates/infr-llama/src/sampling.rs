@@ -143,6 +143,10 @@ pub struct RequestCtx {
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// This sequence's turn-taking baton on the GPU (`None` = sole user, e.g. `infr run`).
     gate: Option<std::sync::Arc<StepGate>>,
+    /// Test-only: [`aborted`](Self::aborted) answers true from this poll on, counting from zero.
+    /// The prefill loop polls once before each chunk, so a test can cancel between two chunks.
+    #[cfg(test)]
+    abort_at_poll: Option<(usize, std::sync::atomic::AtomicUsize)>,
 }
 
 impl RequestCtx {
@@ -153,6 +157,8 @@ impl RequestCtx {
             abort: std::sync::atomic::AtomicBool::new(false),
             cancel: None,
             gate: None,
+            #[cfg(test)]
+            abort_at_poll: None,
         }
     }
 
@@ -164,12 +170,21 @@ impl RequestCtx {
             abort: std::sync::atomic::AtomicBool::new(false),
             cancel: None,
             gate: Some(gate),
+            #[cfg(test)]
+            abort_at_poll: None,
         }
     }
 
     /// Also stop when `cancel` is set, at the same poll sites as [`abort`](Self::abort).
     pub fn with_cancel(mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Abort from poll `at` on (see the field); `at = k` lets prefill chunks `0..k` run.
+    #[cfg(test)]
+    pub(crate) fn abort_at_poll(mut self, at: usize) -> Self {
+        self.abort_at_poll = Some((at, std::sync::atomic::AtomicUsize::new(0)));
         self
     }
 
@@ -188,6 +203,12 @@ impl RequestCtx {
     /// Polled by the decode loop once per token and the prefill loop once per chunk (relaxed atomic
     /// loads — no allocation, no lock).
     pub fn aborted(&self) -> bool {
+        #[cfg(test)]
+        if let Some((at, polls)) = &self.abort_at_poll {
+            if polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= *at {
+                return true;
+            }
+        }
         self.abort.load(std::sync::atomic::Ordering::Relaxed)
             || self
                 .cancel

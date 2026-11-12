@@ -182,6 +182,10 @@ jobs:
       # which is far too slow to time out in debug. Single-threaded because the
       # goldens mutate process-global generation env under a shared lock.
       - run: cargo test --release -p infr-llama --test cpu_backend --locked -- --test-threads=1
+      # The library's model-gated tests (forced-tool grammar masking, special-token
+      # handling in user text) return early without a model, so the model-less
+      # matrix reports them as passed; this job has the models.
+      - run: cargo test --release -p infr-llama --lib --locked
 
   build:
     name: cargo build --release

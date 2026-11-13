@@ -118,7 +118,7 @@ pub fn simulate_split(
     let split = expand_groups(&calls[..split.min(calls.len())]).len();
     let calls = &expand_groups(calls)[..];
     let mut phases = [SimStats::default(); 2];
-    // Resident block -> the batch epoch of its last touch, as `Pager::epoch` keeps it.
+    // Resident block -> the batch epoch of its last touch, as `Pager` keeps it in the block's slot.
     let mut resident: HashMap<BlockId, u64> = HashMap::with_capacity(n_slots);
     let mut pins: HashMap<BlockId, u32> = HashMap::new();
     let mut cur_epoch = 0u64;

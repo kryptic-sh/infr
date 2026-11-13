@@ -88,6 +88,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The pager no longer scans its whole cache to pick an eviction victim.**
+  `infr_core::pager::Pager` keeps its state by slot, with recency as a linked
+  list, so a miss costs the protected blocks it walks past instead of every
+  resident block, and a hit costs about half what it did. Every eviction
+  decision is unchanged (checked call by call against the old implementation).
+  Measured on Qwen3-30B-A3B with `paging.cache=4g` and `paging.dram=12g` on an
+  RX 7900 XTX: decode 75.1–76.1 → 82.5–82.7 tok/s.
 - **Decoding a paged MoE model does far less pager bookkeeping for layers whose
   experts are all in VRAM.** Each such layer used to check and touch every one
   of its experts, for each of its roles, on every token; it is now one check and

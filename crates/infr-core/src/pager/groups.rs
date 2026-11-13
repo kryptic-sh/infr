@@ -5,51 +5,63 @@
 //! [`Pager::touch_group`] is defined as exactly what touching every member with [`Pager::touch`]
 //! in ascending id order does when all of them are resident — the same hits counted, the same
 //! batch protection, and the same recency order afterwards, down to the order among the members —
-//! but it writes one stamp for the group instead of one per member. A member's recency is then the
-//! later of its own stamp and the one the group stamp gives it (`stamp + offset`, the stamp the
-//! `touch` of that member would have taken), and its batch epoch the later of its own and the
-//! group's. Victim selection reads both ([`Pager::coldest`]).
+//! but it moves one node instead of one per member. The touch puts the GROUP's node at the hot
+//! end of the recency list (`lru`), where it stands for its members in id order: they form the
+//! group's run, ranked where the node is, and batch-protected while the node's epoch is the
+//! current batch. Victim selection reaching the node takes the first run member that is not
+//! otherwise protected ([`Pager::group_victim`]).
 //!
-//! The group stamp stays exact while the group's members only leave or are touched: a member
-//! touched later takes a stamp above the group's, one that leaves is out of the ranking. What
-//! would break it is a member ADMITTED after the group touch, which must rank by its own insert
-//! alone (a cold-end insert especially). So an admission into a stamped group first writes the
-//! group stamp into every member still resident and drops it — O(group), at most once per group
-//! touch.
+//! A member leaves the run when it is touched at the hot end again (its own position is then
+//! hotter than the run's) and when it leaves the cache; a member touched without promotion (a
+//! cold-end hit) stays in it, as its rank does under per-member touches. Leaving is one write per
+//! slot, of the group touch's generation, so the next group touch rejoins every member in O(1) by
+//! starting a new generation. The members' own slot nodes stay where they were when the touch
+//! moved the group's node: such a stale node is unlinked when victim selection reaches it, and
+//! a member's own position is rewritten whenever it leaves the run.
+//!
+//! What would end the run's ranking is a member ADMITTED after the group touch, which must rank by
+//! its own insert alone (a cold-end insert especially). So an admission into a group with a node
+//! first moves the run's members, in id order, to where the node is, gives them the node's epoch,
+//! and drops the node — O(group), at most once per group touch.
 
+use super::lru::Lru;
 use super::trace::{Call, Outcome};
-use super::{BlockId, Pager};
-
-/// A group with no [`Pager::touch_group`] stamp in force.
-const NO_STAMP: i64 = i64::MIN;
+use super::{eligible, BlockId, Pager};
 
 /// The per-group state. Indexed by group, `id / len`; grown as blocks of higher groups arrive.
 #[derive(Debug)]
 pub(super) struct Groups {
     len: u32,
     /// `log2(len)` when `len` is a power of two (an MoE layer's expert count, nearly always), so
-    /// the victim scan's per-block group lookup is a shift rather than a division.
+    /// the per-block group lookup is a shift rather than a division.
     shift: Option<u32>,
     /// Resident members per group.
     resident: Vec<u32>,
-    /// The stamp the group's last [`Pager::touch_group`] gave its first member (member `k` has
-    /// `stamp + k`), or [`NO_STAMP`].
-    stamp: Vec<i64>,
-    /// The batch epoch of that touch, meaningful only while `stamp` is set.
+    /// Whether the group's node is in the recency list: a group touch in force.
+    touched: Vec<bool>,
+    /// Bumped by every group touch; a member is in the run while its slot's `left` differs.
+    generation: Vec<u64>,
+    /// The batch epoch of the group's last touch, meaningful only while `touched`.
     epoch: Vec<u64>,
-    /// How many groups have a stamp in force — zero keeps victim selection on its ungrouped path.
-    stamped: usize,
+    /// No member below this offset is in the run (they left it, or the cache): where victim
+    /// selection resumes. Only grows between group touches, which reset it.
+    cursor: Vec<u32>,
+    /// Per slot: the `generation` of its group's touch in force when the block there left the
+    /// run, or 0 (no generation is) when it has not since its admission.
+    left: Vec<u64>,
 }
 
 impl Groups {
-    fn new(len: u32) -> Self {
+    fn new(len: u32, n_slots: usize) -> Self {
         Self {
             len,
             shift: len.is_power_of_two().then(|| len.trailing_zeros()),
             resident: Vec::new(),
-            stamp: Vec::new(),
+            touched: Vec::new(),
+            generation: Vec::new(),
             epoch: Vec::new(),
-            stamped: 0,
+            cursor: Vec::new(),
+            left: vec![0; n_slots],
         }
     }
 
@@ -60,53 +72,39 @@ impl Groups {
         }
     }
 
-    /// `id`'s position in its group, as a stamp offset.
-    pub(super) fn offset(&self, id: BlockId) -> i64 {
-        i64::from(match self.shift {
-            Some(_) => id & (self.len - 1),
-            None => id % self.len,
-        })
+    /// The first member of group `g`.
+    fn first(&self, g: usize) -> BlockId {
+        g as BlockId * self.len
     }
 
-    /// Whether any group's stamp is in force.
-    pub(super) fn stamped(&self) -> bool {
-        self.stamped > 0
-    }
-
-    /// The stamp in force for `id`'s group, and its epoch.
-    pub(super) fn stamp_of(&self, id: BlockId) -> Option<(i64, u64)> {
+    /// Whether `id`, resident in slot `s`, is ranked by its group's node.
+    pub(super) fn in_run(&self, s: u32, id: BlockId) -> bool {
         let g = self.index(id);
-        match self.stamp.get(g) {
-            Some(&s) if s != NO_STAMP => Some((s, self.epoch[g])),
-            _ => None,
+        self.touched[g] && self.left[s as usize] != self.generation[g]
+    }
+
+    /// `id`, resident in slot `s`, takes a position of its own (a promotion).
+    pub(super) fn leave_run(&mut self, s: u32, id: BlockId) {
+        let g = self.index(id);
+        if self.touched[g] {
+            self.left[s as usize] = self.generation[g];
         }
     }
 
-    fn clear_stamp(&mut self, g: usize) -> Option<(i64, u64)> {
-        let s = std::mem::replace(&mut self.stamp[g], NO_STAMP);
-        (s != NO_STAMP).then(|| {
-            self.stamped -= 1;
-            (s, self.epoch[g])
-        })
-    }
-
-    fn admitted(&mut self, id: BlockId) {
+    /// Count `id` into its group, growing the per-group state to reach it. Returns how many groups
+    /// there are now.
+    fn admitted(&mut self, id: BlockId, s: u32) -> usize {
         let g = self.index(id);
         if g >= self.resident.len() {
             self.resident.resize(g + 1, 0);
-            self.stamp.resize(g + 1, NO_STAMP);
+            self.touched.resize(g + 1, false);
+            self.generation.resize(g + 1, 0);
             self.epoch.resize(g + 1, 0);
+            self.cursor.resize(g + 1, 0);
         }
         self.resident[g] += 1;
-    }
-
-    fn removed(&mut self, id: BlockId) {
-        let g = self.index(id);
-        self.resident[g] -= 1;
-        if self.resident[g] == 0 {
-            // No member left for the stamp to apply to; keep `stamped` an exact count.
-            self.clear_stamp(g);
-        }
+        self.left[s as usize] = 0;
+        self.resident.len()
     }
 
     /// The group whose first member is `first`, which must be a group boundary.
@@ -131,8 +129,8 @@ impl Pager {
     ///
     /// # Panics
     /// If `len` is zero, or the pager is already grouped by a different length — a block cannot
-    /// belong to two groupings, and silently regrouping would leave the old groups' stamps applied
-    /// to the wrong blocks.
+    /// belong to two groupings, and silently regrouping would leave the old groups' touches
+    /// ranking the wrong blocks.
     pub fn group_by(&mut self, len: u32) {
         assert!(len > 0, "pager: a block group must hold at least one block");
         if let Some(g) = &self.groups {
@@ -143,10 +141,12 @@ impl Pager {
             );
             return;
         }
-        let mut g = Groups::new(len);
-        for &id in self.resident.keys() {
-            g.admitted(id);
+        let mut g = Groups::new(len, self.n_slots);
+        let mut n_groups = 0;
+        for (&id, &s) in &self.resident {
+            n_groups = g.admitted(id, s);
         }
+        self.lru.grow_groups(n_groups);
         self.groups = Some(g);
     }
 
@@ -190,51 +190,93 @@ impl Pager {
         }
         let g = self.groups.as_mut().expect("checked above");
         let i = g.group_of_first(first);
-        if g.stamp[i] == NO_STAMP {
-            g.stamped += 1;
+        let node = self.lru.group(i);
+        if g.touched[i] {
+            self.lru.unlink(node);
         }
-        // The stamps the member touches would have taken: `hot + 1 ..= hot + len`, in id order.
-        g.stamp[i] = self.hot + 1;
+        self.lru.push_hot(node);
+        g.touched[i] = true;
+        g.generation[i] += 1;
         g.epoch[i] = self.cur_epoch;
-        self.hot += i64::from(g.len);
+        g.cursor[i] = 0;
         self.stats.hits += u64::from(g.len);
         true
     }
 
-    /// Bookkeeping for `id` becoming resident: count it, and first write a group stamp in force
-    /// into the members it covers (see the module doc for why an admission ends it).
-    pub(super) fn group_admit(&mut self, id: BlockId) {
-        let Self {
-            groups,
-            recency,
-            epoch,
-            ..
-        } = self;
-        let Some(g) = groups.as_mut() else {
+    /// The first member of group `i`'s run, in id order, that the walk may evict (see
+    /// [`Self::coldest`]), advancing the group's cursor past members no longer in the run and
+    /// dropping the group's node once none is.
+    pub(super) fn group_victim(&mut self, i: usize, guard: bool, pins: bool) -> Option<u32> {
+        let cur = self.cur_epoch;
+        let g = self
+            .groups
+            .as_mut()
+            .expect("a group node of a grouped pager");
+        if guard && g.epoch[i] == cur {
+            return None;
+        }
+        let first = g.first(i);
+        let mut below_all_in_run = true;
+        for k in g.cursor[i]..g.len {
+            match self.resident.get(&(first + k)) {
+                Some(&s) if g.left[s as usize] != g.generation[i] => {
+                    if eligible(&self.slots[s as usize], guard, pins, cur) {
+                        return Some(s);
+                    }
+                    below_all_in_run = false;
+                }
+                _ if below_all_in_run => g.cursor[i] = k + 1,
+                _ => {}
+            }
+        }
+        if g.cursor[i] == g.len {
+            g.touched[i] = false;
+            self.lru.unlink(self.lru.group(i));
+        }
+        None
+    }
+
+    /// Bookkeeping for `id` becoming resident in slot `s`: count it, and first end a group touch
+    /// in force on its group (see the module doc for why an admission ends it).
+    pub(super) fn group_admit(&mut self, id: BlockId, s: u32) {
+        let Some(g) = self.groups.as_mut() else {
             return;
         };
         let i = g.index(id);
-        if i < g.stamp.len() {
-            if let Some((stamp, ep)) = g.clear_stamp(i) {
-                let first = id - id % g.len;
-                for k in 0..g.len {
-                    let b = first + k;
-                    if let Some(r) = recency.get_mut(&b) {
-                        *r = (*r).max(stamp + i64::from(k));
+        if g.touched.get(i) == Some(&true) {
+            let node = self.lru.group(i);
+            let first = g.first(i);
+            for k in 0..g.len {
+                let Some(&m) = self.resident.get(&(first + k)) else {
+                    continue;
+                };
+                let slot = &mut self.slots[m as usize];
+                slot.epoch = slot.epoch.max(g.epoch[i]);
+                if g.left[m as usize] != g.generation[i] {
+                    let n = Lru::slot(m);
+                    if self.lru.is_linked(n) {
+                        self.lru.unlink(n);
                     }
-                    if let Some(e) = epoch.get_mut(&b) {
-                        *e = (*e).max(ep);
-                    }
+                    self.lru.insert_before(n, node);
                 }
             }
+            self.lru.unlink(node);
+            g.touched[i] = false;
         }
-        g.admitted(id);
+        let n_groups = g.admitted(id, s);
+        self.lru.grow_groups(n_groups);
     }
 
-    /// Bookkeeping for `id` leaving the cache.
+    /// Bookkeeping for `id` leaving the cache: with its group's last member goes the group's node.
     pub(super) fn group_removed(&mut self, id: BlockId) {
-        if let Some(g) = self.groups.as_mut() {
-            g.removed(id);
+        let Some(g) = self.groups.as_mut() else {
+            return;
+        };
+        let i = g.index(id);
+        g.resident[i] -= 1;
+        if g.resident[i] == 0 && g.touched[i] {
+            g.touched[i] = false;
+            self.lru.unlink(self.lru.group(i));
         }
     }
 }
@@ -400,6 +442,30 @@ mod tests {
             "only {evicted} evictions — the case never arose"
         );
         assert!(p.group_is_resident(0) && p.group_is_resident(LEN));
+    }
+
+    /// An admission into a touched group ends the group's touch, and the members it ranked keep
+    /// the batch protection it gave them: here block 6, touched in this batch only through its
+    /// group, must stay protected after its sibling 7 is evicted and re-admitted, so with every
+    /// other block pinned or touched too there is no victim.
+    #[test]
+    fn an_admission_into_a_touched_group_keeps_the_groups_batch_protection() {
+        let mut p = Pager::new(3);
+        p.group_by(2);
+        p.begin_batch();
+        for id in [6, 7, 0] {
+            p.touch(id);
+        }
+        p.begin_batch();
+        assert!(p.touch_group(6));
+        assert_eq!(p.evict(7), Some(1));
+        assert!(p.resolve_and_pin(7, Insert::Cold).is_some());
+        p.touch(0);
+        assert_eq!(
+            p.resolve_and_pin(9, Insert::Mru),
+            None,
+            "a member the batch touched through its group was given up"
+        );
     }
 
     #[test]

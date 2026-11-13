@@ -13,23 +13,34 @@ measuring half landed the same day; its numbers are under "Measurements".
 
 ## What the code does today
 
-`Pager` keeps four `HashMap`s keyed by `BlockId` (`resident`, `recency`,
-`epoch`, `pinned`), with recency as a signed stamp per block.
+Since step 2, `Pager` keeps its state by slot: the block in each slot, its batch
+epoch and its pin count, one `BlockId → slot` map (FxHash-keyed), and recency as
+an intrusive doubly linked list over the slots (`pager::lru`), coldest first.
 
-- A hit is a few hash writes (`epoch.insert`, `resident.get`, `recency.insert`).
-- **A miss on a full cache scans every resident block:** `coldest` iterates the
-  whole `recency` map and, for each entry, looks the block up in `epoch` (and in
-  `pinned` on the fallible path) before taking the minimum stamp. The doc on
-  `recency` accepts this because "it is paid only when choosing a victim, which
-  already costs a fill".
-- A batch that misses on k blocks runs that scan k times.
+- A hit is a map lookup and an epoch write, and an MRU hit also moves the slot
+  to the hot end: a few index writes.
+- **A miss on a full cache walks from the cold end** to the first block that is
+  neither pinned nor touched by the current batch, so it costs the protected
+  blocks it passes, not the cache size. A batch that cold-inserts k misses walks
+  past its own earlier inserts, k²/2 steps over the batch.
+- A group touch (`Pager::touch_group`) moves one node, the group's, to the hot
+  end; the walk reaching it takes the group's first unprotected member in id
+  order (`pager::groups`' module doc).
 - Policy is recency with two insertion points: the hot end (`touch`) and the
   cold end (`touch_cold`, `schedule`). `schedule` on a cyclic sweep keeps a
   stable resident prefix: `n_slots − 1` hits per pass, close to Belady but not
   equal to it (MIN rotates what it keeps; in steady state it misses about
   `(n_slots − 1)/(n_blocks − 1)` fewer blocks per pass). Nothing uses frequency.
 
-Whether the scan matters is a question of pool size and miss rate: it is
+Before step 2 the same policy ran on four `HashMap`s keyed by `BlockId`
+(`resident`, `recency`, `epoch`, `pinned`) with recency as a signed stamp per
+block, and **a miss on a full cache scanned every resident block** (`coldest`
+took the minimum stamp over the whole `recency` map, looking each block up in
+`epoch` and `pinned`), k times for a batch of k misses. That implementation is
+kept as the test-only reference model the new one is checked against
+(`pager::reference`).
+
+Whether the scan mattered was a question of pool size and miss rate: it was
 negligible beside a multi-megabyte upload for a pool of a few hundred blocks,
 and not for per-expert pools of a large MoE (a block per expert per role per
 layer) during a prefill sweep that misses on most of them. "Measurements" has
@@ -95,14 +106,13 @@ member in id order would, and a group is resident exactly while every member is
 What the numbers below support, largest measured end-to-end share first:
 
 1. **The trace hook, the micro-benchmark and the simulator** (step 1). Done.
-2. **The data-structure refactor** (step 2). Its measured case is narrower than
-   "the scan is slow": the scan is nearly all of the pager's own time on MoE
-   pools, but about 1% of end-to-end time in the recorded disk-bound run. What
-   justifies it is decode at a budget whose misses are served fast (6% of decode
-   in the large-DRAM run) and DeepSeek-scale prefill (0.20–0.26 s per pool per
-   generated chunk); resident decode no longer makes a hit per expert. Size it
-   against those, not against the scan in general. A slot-indexed structure must
-   carry the group stamps (`pager::groups`) into its LRU list.
+2. **The data-structure refactor** (step 2). Done: pager time per call falls by
+   2.9× (DeepSeek-scale routed decode whose blocks all fit) to 437× (the same
+   with slots for a quarter of the blocks) on the recorded and generated traces,
+   and decode at `paging.cache=4g` + `paging.dram=12g` ran 9% faster
+   ("Slot-indexed pager" under "Measurements"). The scan it removed was about 1%
+   of end-to-end time in the disk-bound run and up to 6% of decode where misses
+   are served fast.
 3. **MoE policy** (step 3), decode only: two-tier placement first (a DRAM tier
    smaller than VRAM works only as a victim cache), then eviction candidates
    compared in `sim` on the recorded `moe` trace. The decode-miss stall
@@ -343,6 +353,103 @@ the host records while the GPU runs earlier segments; the removed work is
 evidently off the critical path there. That is an inference from the numbers,
 not a measurement of the overlap.
 
+### Slot-indexed pager (2026-11-13)
+
+Step 2, measured on the Windows box (Ryzen 9 9950X3D, RX 7900 XTX). **Busy
+machine:** other sessions shared it and no quiet window was arranged. The `HEAD`
+and changed builds of the replay benchmark were alternated, three runs each;
+each cell is the range over the three (one value where they agreed). Recorded
+traces are step 1's `moe`, `moe-bigdram`, `dense` and `cpu`, and two recorded
+with group touches (`after-18g`: `paging.cache=18g`; `after-4g`:
+`paging.cache=4g`, `paging.dram=12g`). Every recorded pool replayed to its
+recorded outcomes under both builds. A selection of the rows:
+
+| trace / pool                                          | slots | ns/call before |       after | ns/hit before |     after | ns/miss before |   after |
+| ----------------------------------------------------- | ----: | -------------: | ----------: | ------------: | --------: | -------------: | ------: |
+| generated: cyclic sweep 40 blocks x32                 |     8 |      55.4–55.7 |   10.6–11.2 |     26.8–27.0 | 13.0–14.4 |        133–135 |      27 |
+| generated: cyclic sweep 40 blocks x32                 |    32 |      42.6–42.8 |         5.3 |     24.8–24.9 | 11.6–12.9 |        294–295 |      23 |
+| generated: moe prefill x2, 48x128 blocks              |  3072 |    12932–13033 |   49.8–50.1 |     15.6–15.8 |       4.8 |    17200–17303 |   63–64 |
+| generated: moe decode resident x9, 48x128 blocks      |  6144 |      27.1–27.6 |     6.3–7.2 |     23.5–23.8 |   6.1–6.2 |          59–62 |      10 |
+| generated: moe decode top-8 zipf 1 x64, 48x128 blocks |  1536 |      4437–4460 |   13.7–13.9 |     31.2–32.1 | 12.4–12.5 |    10993–11080 |      24 |
+| generated: moe prefill + decode x64, 48x128 blocks    |  3072 |      6784–6800 |   17.6–17.7 |     29.8–30.4 | 10.3–10.5 |    18951–19094 |      37 |
+| generated: moe prefill x2, 43x256 blocks              |  2752 |    17748–17788 | 111.3–111.6 |     15.2–15.4 |   4.7–4.8 |    20055–20219 | 126–127 |
+| generated: moe prefill x2, 43x256 blocks              |  8256 |    18050–18225 |   43.2–44.4 |     17.9–19.2 |   4.7–4.8 |    28417–28584 |   66–68 |
+| generated: moe decode top-8 zipf 1 x64, 43x256 blocks |  2752 |      5958–6027 |   13.8–14.1 |     33.1–33.6 | 12.1–12.6 |    16037–16103 |   26–27 |
+| moe down/1290240B host [moe.trace]                    |   187 |    483.6–487.3 |   12.8–13.1 |             — |         — |        962–967 |      29 |
+| moe gate/884736B [moe.trace]                          |  1315 |      3549–3574 |   21.0–21.5 |     27.1–27.2 |   9.3–9.5 |      9787–9936 |   47–48 |
+| moe gate/884736B host [moe-bigdram.trace]             |  4510 |      2396–2407 |     8.8–8.9 |     42.7–44.5 | 17.9–18.6 |      8050–8283 |   22–23 |
+| dense pool0/2359296B [dense.trace]                    |     9 |      60.3–60.7 |   11.3–11.7 |     26.5–26.8 | 12.9–14.0 |        141–143 |   27–28 |
+| dense pool2/1720320B [dense.trace]                    |     2 |      38.8–39.1 |   11.2–11.4 |     32.0–32.2 | 14.5–16.0 |          90–91 |      25 |
+| cpu 2359296B [cpu.trace]                              |    16 |      39.5–40.8 |     9.0–9.4 |     35.1–35.5 | 14.0–14.5 |        161–162 |   28–29 |
+| moe gate/884736B host [after-18g.trace]               |  6144 |      28.7–29.3 |     8.3–8.4 |     39.9–40.3 | 14.5–15.3 |             53 |      18 |
+| moe gate/884736B [after-18g.trace]                    |  6013 |      1287–1298 |     8.2–8.3 |          18.1 |   5.7–5.8 |      5265–5293 |      16 |
+| moe gate/884736B host [after-4g.trace]                |  4510 |      2508–2524 |     8.9–9.0 |     42.9–43.5 | 17.9–18.3 |      8045–8088 |      22 |
+| moe gate/884736B [after-4g.trace]                     |  1315 |      4214–4235 |   25.0–25.1 |     28.7–29.5 | 10.8–11.2 |    10071–10113 |   50–51 |
+
+Over all recorded pools:
+
+- **Misses no longer scan.** MoE VRAM pools: 2.8–10.1 µs per miss becomes 15–51
+  ns; host pools 52 ns–8.3 µs becomes 17–32 ns; dense 90–143 ns becomes 25–28
+  ns; CPU 102–182 ns becomes 28–30 ns. The generated DeepSeek-scale prefill,
+  where a batch walks past its own cold-end inserts, is the most expensive at
+  66–127 ns (20–31 µs before).
+- **Hits cost half or less on every pool, ungrouped ones included**: dense
+  26.5–32.5 → 12.5–16.0 ns, CPU 35.0–38.5 → 14.0–16.0 ns, host 38.3–44.5 →
+  14.2–18.6 ns, MoE VRAM 17.7–29.5 → 5.6–11.2 ns. A hit is one FxHash lookup, an
+  epoch write and a list move, where it was several SipHash map operations.
+- **The group touch moved with the build, not with its own code.** Resident
+  decode with group touches, one pool, per token (a token is 48 `begin_batch`
+  and 48 `touch_group` calls on 48 × 128, 43 of each on 43 × 256):
+
+  | build                                   | 48 × 128, µs | 43 × 256, µs |
+  | --------------------------------------- | ------------ | ------------ |
+  | `HEAD`, alternated with the first build | 2.200–2.212  | 3.625–3.638  |
+  | first build                             | 2.413–2.425  | 3.688–3.737  |
+  | `HEAD`, alternated with the final build | 2.200–2.237  | 3.550–3.625  |
+  | final build                             | 2.038–2.050  | 3.175–3.188  |
+
+  The first build was 0.20–0.23 µs per token slower on 48 × 128, 4.2–4.7 ns per
+  group touch, and 1.2–2.6 ns per touch on 43 × 256; trimming its duplicate
+  group lookup changed nothing (2.400–2.413 µs). The final build differs from it
+  only in the hash's finishing rotate and the pin assertion in `take_slot`,
+  neither on the group-touch path, and is 0.15–0.19 µs per token faster than
+  `HEAD`. So a few nanoseconds per group touch is within what code placement
+  moves here; the node move the touch now makes is not a measurable cost.
+  Per-expert resident touches went from 144–148 µs to 36 µs per token.
+
+- **The `id → slot` map:** a direct-index table in its place, alternated with
+  the FxHash map twice on the generated shapes, was 1–4 ns per call faster
+  (dense sweep at 8 slots 6.8–6.9 against 11.1–11.2 ns per call; routed decode
+  at 1536 slots 10.2–10.3 against 13.5–13.8). Not taken; see step 2.
+- **The pin assertion and the finishing rotate** (added after review) cost
+  nothing visible: the final build against the first, alternated three times,
+  ns/miss: dense sweep at 8 slots 24–26 against 24–27, MoE prefill at 3072 slots
+  60–63 against 62–64, routed decode at 1536 slots 24–25 against 22–24,
+  DeepSeek-scale prefill at 8256 slots 65–66 against 65–66; ns/hit on the dense
+  sweep 12.6–13.3 against 11.3–14.2. The table above is from the first build.
+- **B164 is gone.** Its harness (a 6144-id cold sweep through 3072 slots, and
+  MRU hits on a full 6144-slot pool, driving `Pager` from `infr-core` and the
+  same source built as a crate of its own, in one binary) reproduces the gap at
+  `HEAD` (sweep 12.58–12.61 µs against 8.40–8.46 µs, hit 22.65–22.80 ns against
+  16.15–16.18 ns) and shows none with the change (sweep 11.4–11.7 ns against
+  11.6–11.7 ns, hit 5.29–5.32 ns against 5.33–5.66 ns). Its cause was never
+  identified.
+
+**End to end**, Qwen3-30B-A3B Q4_K_M on the RX 7900 XTX,
+`infr bench -p 0 -n 48 -d 365 -r 3 --set paging.cache=4g --set paging.dram=12g`,
+binaries alternated (busy machine):
+
+| build   | tg48 @ d365, t/s: three runs of three reps |
+| ------- | ------------------------------------------ |
+| `HEAD`  | 75.9, 75.1, 76.1                           |
+| changed | 82.6, 82.5, 82.7                           |
+
+About 9% faster decode, in line with step 1's estimate that the pager was 6.3%
+of `moe-bigdram`'s decode tokens. One `infr run` of the same model and
+configuration (the 365-token prompt, 48 greedy tokens, `paging.stats`) gave
+byte-identical output and identical hit, miss and eviction counts on all eight
+pools under both binaries. The 18 GB configuration was not rerun.
+
 ## Steps
 
 ### 1. Measure before designing (done)
@@ -385,29 +492,73 @@ INFR_TEST_PAGER_TRACE=moe.trace cargo test --release -p infr-core \
 Timing numbers still belong in a quiet window, per the repo's measurement rules;
 the miss counts are exact on any machine.
 
-### 2. Data-structure refactor (cost per touch)
+### 2. Data-structure refactor (cost per touch) (done)
 
-Decided by step 1's numbers; the expected shape, to be confirmed against the
-consumers:
+What landed (the data structure is under "What the code does today"):
 
-- **Slot-indexed state instead of id-keyed maps.** Residency is bounded by
-  `n_slots`, so recency links, the epoch and the pin count can live in arrays
-  indexed by slot. The `id → slot` map is the one lookup that needs a key, and
-  where block ids are dense (the sessions assign them from a `layer_base`) it
-  can be a direct-index table rather than a hash.
-- **An intrusive doubly-linked LRU list** over slots: a hit is two link
-  rewrites, and the coldest unprotected block is a walk from the cold end that
-  stops at the first eligible slot, instead of a scan of everything. Both
-  insertion points map onto it directly (push at head, push at tail).
-- **Batch-aware victim selection:** hand the pager the whole batch (or its
-  count) so k victims come out of one pass.
-- The public API (`touch`, `touch_cold`, `schedule`, `resolve_and_pin`, the pin
-  calls) keeps its semantics; the existing test module is the contract and must
-  pass unchanged. If the consumers need a different entry point (a batched
-  resolve), add it and move them in the same change.
+- **Slot-indexed state**: the block, its epoch and its pin count live in an
+  array indexed by slot, and recency in an intrusive doubly linked list over the
+  slots (`pager::lru`). An MRU hit is a few link rewrites; a victim is a walk
+  from the cold end to the first unprotected slot.
+- **Group touches in the list**: a group's touch moves one node for the group,
+  which ranks its members in id order until they leave the run (an MRU touch, or
+  leaving the cache) or until an admission into the group places them
+  individually where the node was (`pager::groups`' module doc).
+- **The `id → slot` map is a `HashMap` keyed by FxHash** (rustc-hash 1.x's
+  multiply-rotate step, finished with rustc-hash 2.x's rotate left by 26 so that
+  ids differing only in high bits, such as `layer << 16 | expert`, do not share
+  a bucket; in-tree ids are dense from 0), not a direct-index table. The table
+  was measured (below) and is 1–4 ns per call faster, but sizes itself to the
+  largest id a caller names, and `BlockId` is opaque to the pager; the hash
+  keeps memory bounded by `n_slots` at that cost.
+- **Not built: batch-aware victim selection.** With the walk, a batch of k
+  cold-end misses costs k²/2 steps past its own inserts; on the generated
+  DeepSeek-scale prefill that is 66–127 ns per miss in all, against 20–31 µs
+  before, so a batched entry point would save nanoseconds beside an upload.
+- **Equivalence, mechanically**: the old implementation is kept, test-only, as
+  `pager::reference`, and `matches_the_reference_on_random_calls` and
+  `matches_the_reference_on_session_shapes` drive both with the same calls
+  (every public mutating call; groups of power-of-two and other lengths, grouped
+  from the start and part-way; batches up to wider than the pool; the legacy
+  no-batch path; pins held across batches) and compare every outcome, every
+  counter, `slot_of` of every id, `resident_count`, `pinned_blocks` and
+  `group_is_resident`. Twelve deliberate breakages of the new structure, each
+  restored after, and the tests that went red (`random` and `shapes` are the two
+  differential tests):
+  - cold-end insert at the hot end: `random`, `shapes`, `sim`'s driver check,
+    and four tests of cold sweeps and `schedule`'s prefix;
+  - a cold hit that promotes: `random` only;
+  - `take_slot` ignoring the batch guard: `random`, `shapes`, `sim`'s driver
+    check, `a_reused_slot_does_not_keep_the_victims_epoch`,
+    `batch_larger_than_cache_fails_loudly` and the two batch-sibling tests;
+  - a group's run walked in reverse id order: `random` and two `groups` tests;
+  - the group's batch guard ignored: `random` and
+    `a_group_touch_protects_its_members_for_the_batch`;
+  - an MRU touch not leaving the group's run, an admission not moving the run's
+    members where the node was, and the group cursor skipping protected members:
+    each `random` and `a_group_touch_is_a_touch_of_every_member`;
+  - an admission into a touched group dropping the group's epoch: `random` and
+    `an_admission_into_a_touched_group_keeps_the_groups_batch_protection`;
+  - a new block keeping its slot's previous epoch: `random`, `shapes`, `sim`'s
+    driver check, `a_reused_slot_does_not_keep_the_victims_epoch`,
+    `a_group_touch_is_a_touch_of_every_member` and three batch tests;
+  - no pin check in `take_slot`:
+    `an_infallible_miss_never_evicts_a_pinned_block` (the differential tests
+    keep to the contract there);
+  - no finishing rotate in the hash: the two hash tests.
 
-This is the large refactor if it is warranted: `Pager` is shared by every tier,
-so one change pays everywhere, and its tests run without hardware.
+  The existing tests pass, with one rewritten:
+  `eviction_drops_the_victim_epoch_entry` checked a per-id epoch map that no
+  longer exists (an epoch lives in its slot), so it could not fail;
+  `a_reused_slot_does_not_keep_the_victims_epoch` checks what can now go wrong
+  instead. Every recorded trace replays to its recorded outcomes.
+
+- **A pinned victim on the infallible path panics.** `touch`, `touch_cold` and
+  `schedule` do not look at pins; the old pager only `debug_assert`ed that no
+  pin was held when they evicted, so a release build evicted a pinned block
+  under its reader. `take_slot` now asserts, in every build, that its victim
+  holds no pin. No in-tree caller mixes pins with those entry points
+  (`HostPager` pins through `resolve_and_pin` and its probes only).
 
 ### 3. Policy (misses per trace)
 

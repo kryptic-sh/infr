@@ -857,13 +857,6 @@ residue worth tracking; what follows is that plus what was deliberately left.
     layer-major path today (its backend hosts no dense pager), so the flag is
     inert there until something forces it on.
 
-- **`Pager`'s eviction is O(n_slots) per miss.** A touch is O(1) now
-  (`infr_core::pager::Pager` keeps a `recency` stamp per block in a `HashMap`),
-  but choosing the victim (`Pager::coldest`) scans every resident block. That is
-  a scan per MISS, not per touch, and at today's model sizes it is not worth
-  changing. At DeepSeek-V4-Flash scale (256 experts × 43 layers per role) a
-  miss-heavy decode would pay it often; an ordered index on the stamp is the
-  fix. Not measured.
 - **The dense session mutex spans the disk read.** `stage_dense_linear`
   (`infr-vulkan/src/adapter.rs`) holds `be_.dense_pager().lock()` across
   `DensePagerSession::stage`, which reaches `HostPager::fill` and blocks on I/O.
@@ -3434,13 +3427,6 @@ first. What is left:
   there is no reference checkout here to check. Such a file would have decoded
   wrongly before and is refused now if its count is not also a multiple of the
   x86 group.
-- **Eviction now scans every resident block.** `Pager` ranks blocks by a recency
-  stamp in a map, so a hit is one map write (it was a deque scan) and choosing a
-  victim is a full scan (it was the first eligible entry, usually the front).
-  The order is unchanged. Not measured: the reviewer estimates a few
-  microseconds per miss at today's slot counts, next to an upload of a megabyte
-  or more, but a miss-heavy sweep at DeepSeek V4 slot counts would be the place
-  it shows (`deepseek.md` §0.3 names the LRU cost).
 - **`Claim` in `hostpager.rs` cannot be tested for a panic in the slot
   arithmetic** without fault injection into `Arena`; it is built before that
   code, and only the panicking-read case has a test. A poisoned `HostPager`
@@ -4512,24 +4498,37 @@ prefix's fixed slot assignment, which
 `schedule_stable_prefix_keeps_its_slots_across_passes` pins, for at most that.
 Not worth it unless a dense run is found where those uploads dominate.
 
-### B164 — `infr-core`'s build of `Pager` runs ~1.5× slower than the same source built alone (2026-11-13)
+### B165 — the slot-indexed pager: what step 2 left (2026-11-13)
 
-**Tag:** pager · perf · **Needs:** investigation
+**Tag:** pager · **Needs:** nothing; records
 
-Measured in the pager-instruments slice (busy machine, Ryzen 9 9950X3D, release,
-`target-cpu=native`), driving `Pager` with the same loop: a 6144-id cold sweep
-through 3072 slots costs about 12.9 µs per call and an MRU hit about 22.5 ns
-when `Pager` comes from `infr-core` (built as the workspace builds it, at `HEAD`
-and with the instruments alike), against about 8.5 µs and 16 ns when the same
-`pager.rs` source is compiled as a crate of its own or inside the calling test
-crate.
+`infr_core::pager::Pager` now keeps its state by slot with recency as a linked
+list (`docs/plan/06-pager-eviction.md`, step 2). Checked against the old
+implementation, kept as `pager::reference`, by a differential test; what that
+does not cover, and what was decided:
 
-Ruled out: the trace hook (`HEAD` and the instrumented tree are equal within
-noise in both builds); codegen-unit partitioning (one codegen unit did not
-change the gap); crossing a crate boundary as such (the standalone crate is also
-called across one); the `Call::apply` dispatch (direct calls show the same gap).
-Not explained. A guess, not checked: inlining decisions for the `HashMap`
-lookups in `coldest`'s per-entry closure that differ when `infr-core`
-instantiates the same map types elsewhere. Worth settling before the
-data-structure refactor is measured, since it moves every pager figure by the
-same factor.
+- **Behaviour that may surprise: the group-touch path's timing moves with code
+  it does not run.** Resident decode with group touches measured 4.2–4.7 ns per
+  group touch slower than `HEAD` with the first build of step 2 and 3–4 ns
+  faster with the final one, which changed only the id hash's finish and a pin
+  check on the miss path. Read a few nanoseconds per call on that path as code
+  placement, not as a change, unless it holds across builds.
+- **Considered and declined: a direct-index `id → slot` table.** Measured 1–4 ns
+  per call faster than the FxHash map, but it sizes itself to the largest id
+  named, and `BlockId` is opaque to the pager: a caller packing sparse ids would
+  allocate up to 16 GiB. Worth revisiting only with a constructor that takes the
+  id space (`trace::PoolInfo::n_blocks` already carries it for traced pools).
+- **Considered and declined: batch-aware victim selection.** A batch of k
+  cold-end misses walks past its own k earlier inserts, k²/2 steps; on the
+  DeepSeek-scale generated prefill that is 66–127 ns per miss all in.
+- **Behaviour that may surprise:** after a group touch the members' own list
+  nodes stay where they were, stale, and are unlinked when a victim walk reaches
+  them; a group's node is dropped once no member is left in its run. Neither
+  changes an outcome (the differential test), but a debugger shows both.
+- **Not verified:** the Vulkan pager parity tests and the paged MoE seam tests
+  ran on the RX 7900 XTX only, not on the integrated GPU;
+  `gpu_seam_paged_moe_matches_scout_oracle` passed in 0.018 s by returning at
+  its `need_model!` check: no Llama-4-Scout file is in the local cache. The 18
+  GB end-to-end configuration was not rerun. B164's anomaly (`infr-core`'s build
+  of the old pager ran ~1.5× slower than the same source built alone) no longer
+  reproduces with the new code; its cause was never identified.

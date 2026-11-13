@@ -239,12 +239,10 @@ stage 0.
 
 ### 0.3 Pager LRU
 
-`Pager` keeps one recency stamp per block, so a hit or an insert is a few hash
-writes; the `O(n_slots)` cost is the victim scan (`coldest`), paid on every miss
-once the cache is full. At V4-Flash scale (256 experts × 43 layers ≈ 11k blocks
-per role) a prefill sweep that misses on most of them pays that scan per miss.
-`docs/plan/06-pager-eviction.md` owns the measurement and the fix. Not needed
-for stages 1–2; needed before stage 4 is usable.
+Done: `Pager` keeps its state by slot with recency as a linked list, so a miss
+walks from the cold end past the protected blocks only, instead of scanning
+every resident block (`docs/plan/06-pager-eviction.md`, step 2, which has the
+measurements at V4-Flash-scale pool sizes).
 
 ## Stage 1 — `deepseek` (V1)
 

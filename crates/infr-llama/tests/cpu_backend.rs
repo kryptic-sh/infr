@@ -2490,10 +2490,11 @@ fn gpu_seam_paged_moe_host_tier_matches_resident() {
     );
 
     // The UNIFIED-memory shape: no host cache at all, every expert read from disk straight into
-    // the staging ring (`GpuPager::touch_staged_read`). A unified device takes this automatically
-    // because its streaming arena is already GPU-accessible RAM; `paging.dram_bypass` is what lets
-    // it be exercised HERE, on a discrete GPU, which is the only hardware available to test it on.
-    // Without this leg that path would ship with no coverage whatsoever.
+    // the staging ring (`HostPager::fill` from `MoePagerSession::stage_role`'s arena-less arm, on a
+    // VRAM miss only). A unified device takes this automatically because its streaming arena is
+    // already GPU-accessible RAM; `paging.dram_bypass` is what lets it be exercised HERE, on a
+    // discrete GPU, which is the only hardware available to test it on. Without this leg that path
+    // would ship with no coverage whatsoever.
     let bypass = model_cfg(&path, |c| {
         pin_ubatch(c);
         c.paging.cache = Some(infr_core::SizeSpec::Bytes(50 * 1024 * 1024));

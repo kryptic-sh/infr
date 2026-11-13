@@ -346,9 +346,22 @@ unpredictable, so both tiers cache with the existing policies (`touch` for
 decode, `touch_cold` for prefill sweeps). The DRAM tier is filled **only** from
 disk reads — never by copying a block back from VRAM, which spends a device→host
 transfer on bytes that can be re-read from disk instead. **LANDED** on the
-Vulkan MoE session: both entry points take `HostPager::pin` (the evicting
-shape), and each hands the tier below the same insertion policy it is using
-itself, so the two tiers cannot disagree about which experts are hot.
+Vulkan MoE session: `stage_role` takes `HostPager::pin` (the evicting shape) on
+a VRAM miss and only then, passing the tier below the insertion policy the arena
+is using for that batch. A VRAM hit never reaches the host tier, as on the dense
+path.
+
+What that means for policy: the DRAM tier's recency is the stream of VRAM
+_misses_, not of every touch, so it holds the experts most recently missed
+rather than a copy of VRAM's hot set. An expert that keeps hitting in VRAM ages
+out of DRAM, which is what frees DRAM for experts VRAM does not hold — closer to
+exclusive placement than to the inclusive mirror of VRAM's recency this tier had
+while it was also consulted on hits (and paid a disk read on such a hit whenever
+DRAM had already evicted the expert). The cost: an expert hot for a long stretch
+and then evicted from VRAM may no longer be in DRAM, because DRAM never saw its
+recent use, so its next miss reads the disk. Which shape misses less depends on
+the routing trace and has not been measured; the two-tier simulator in
+`docs/plan/06-pager-eviction.md` is the instrument for it.
 
 **Prefetch:**
 
@@ -414,14 +427,13 @@ that expert's own file offset inside the bank, under the same global
 `layer_base + local_id` the arena already keys on. That per-expert granularity
 is the whole point — a routed miss reads ONE expert off the file instead of
 faulting in a whole bank through the mapping, which is what §2 means by MoE
-being the tier's best case. Both entry points carry it: the demand path
-(`touch_role`, decode's routed readback) and the recorded path (`stage_role`),
-each passing the tier below the SAME insertion policy it uses itself — cold for
-a full-set prefill sweep, MRU for a routed decode touch — because §3.6 says MoE
-caches rather than partitions, so the two tiers should agree on what "hot"
-means. `register` checks every one of a layer's experts is present below, so a
-bank that was mis-registered fails at load rather than on the first routed miss
-that names the missing id.
+being the tier's best case. `stage_role` is the one entry point, for prefill
+sweeps and decode's routed readback alike: it consults the tier below only on a
+VRAM miss, with the insertion policy the arena uses for that batch — cold for a
+full-set prefill sweep, MRU for a routed decode touch (§3.6 says what that does
+to the DRAM tier's recency). `register` checks every one of a layer's experts is
+present below, so a bank that was mis-registered fails at load rather than on
+the first routed miss that names the missing id.
 
 **Metal (`infr-metal`).** Unified memory collapses the VRAM and DRAM tiers into
 **one**: an arena slot is host memory the GPU reads directly, so a disk read

@@ -156,9 +156,21 @@ cfg_struct! {
         /// (`infr_core::hostpager`), which reads weights from the model file itself instead of
         /// leaving residency to the OS page cache.
         ///
-        /// `None` (the default) keeps the zero-copy mmap path, which costs nothing and is right
-        /// whenever the weights fit. This budget is anonymous, non-evictable memory, so it is only
-        /// ever what the user asked for — never a fraction picked on their behalf.
+        /// What a value does is decided by `infr_core::hostmem::streaming_arena_plan` (the GPU
+        /// tiers, reached only once the weights do not fit VRAM) and `cpu_arena_plan` (the CPU
+        /// backend); read those for the arithmetic.
+        ///
+        /// - `None` (the default) is automatic. The CPU backend keeps the zero-copy mmap path when
+        ///   the weights fit host memory. Otherwise an arena is sized from what the host can spare,
+        ///   or the mmap path stays when nothing can be measured or too little is free. On a
+        ///   unified-memory GPU the automatic answer is no arena at all: blocks are read from the
+        ///   file straight into the GPU-visible arena above, as with `dram_bypass`.
+        /// - `Some(0)` keeps the mmap path.
+        /// - Any other size is the arena's budget, on unified memory too (a budget too small to
+        ///   seat one block keeps the mmap path).
+        ///
+        /// `dram_bypass` outranks every value here: the GPU tiers then read through with no
+        /// arena, and the CPU backend keeps the mmap path.
         dram: Option<SizeSpec> = None,
         /// `INFR_DRAM_BYPASS`: read paged blocks straight from disk into GPU memory, with NO host
         /// cache in between — the shape a unified-memory device takes automatically, because there

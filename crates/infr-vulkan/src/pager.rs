@@ -10,11 +10,12 @@
 //! [`GpuPager`] only knows about uniform `slot_bytes`-sized blocks keyed by an opaque
 //! `infr_core::pager::BlockId` — it has no idea a block is "an expert". The MoE integration
 //! (`infr-llama`'s seam / this crate's `adapter.rs`) packs a `BlockId` from `(layer, role,
-//! expert_id)` and calls [`GpuPager::ensure_resident`] with that block's mmap'd tensor bytes
-//! before dispatching the id-indexed GEMV/GEMM through the LUT hop (the `PAGED` branch in
-//! `shaders/native_gemv_id.comp` / `native_gemv_id_multi.comp`: `slot = lut[ids[slot]]`, scaled
-//! onto the arena's 64-bit device address as `arena_addr + slot * slot_bytes` — see the `lut_host`
-//! field's doc and `shaders/native_weight_addr.glsl`). A FUTURE dense layer-streaming policy
+//! expert_id)` and stages it through [`MoePagerSession::stage_role`] (a recorded ring→arena copy
+//! per miss, [`GpuPager::touch_staged`]) before dispatching the id-indexed GEMV/GEMM through the
+//! LUT hop (the `PAGED` branch in `shaders/native_gemv_id.comp` / `native_gemv_id_multi.comp`:
+//! `slot = lut[ids[slot]]`, scaled onto the arena's 64-bit device address as
+//! `arena_addr + slot * slot_bytes` — see the `lut_host` field's doc and
+//! `shaders/native_weight_addr.glsl`). A FUTURE dense layer-streaming policy
 //! (NOT implemented here — see the task doc) would reuse this exact struct with `BlockId =
 //! layer_idx`, `slot_bytes` = one layer's weight size, and a schedule-driven (not LRU) `touch`
 //! order (a dense decode visits layers in a fixed known order, so it can exact-prefetch layer
@@ -27,7 +28,9 @@
 //! session's append-only LUT tape ([`MoePagerSession::lut_window`]) at record time, so staging
 //! for later layers can keep mutating the mirror while earlier recorded-but-in-flight segments
 //! read a consistent view. The classic per-pager device LUT + [`GpuPager::flush_lut`] remain for
-//! the standalone [`GpuPager::ensure_resident`] surface (parity tests / future non-MoE users).
+//! the standalone [`GpuPager::ensure_resident`] surface, which no production path calls: it is
+//! how the paged-kernel parity tests (`tests/pager_*`, `tests/moe_mmq_*`, ...) fill an arena and
+//! LUT without a recorder.
 //!
 //! # Eviction policy
 //! Classic LRU for recency-driven touches (decode's routed-only path) plus the scan-resistant
@@ -182,36 +185,44 @@ impl GpuPager {
         self.lut_dev.as_ref()
     }
 
-    /// Already-resident check with NO mutation (for a caller that wants to decide whether it even
-    /// needs `bytes` in hand before calling `ensure_resident` — e.g. skip a host dequant/gather on
-    /// a hit).
+    /// Already-resident check with NO mutation and no stats — for a caller that must know whether
+    /// a touch WILL miss before making it (whether a ring half has room for the copy, whether a
+    /// whole layer is resident).
     pub fn is_resident(&self, id: BlockId) -> bool {
         self.pager.slot_of(id).is_some()
     }
 
-    /// [`Self::ensure_resident`]'s RECORDED twin: on a miss, memcpy `bytes` into the caller's
-    /// staging ring at `ring_off` (a host-mapped write) and record the ring→arena slot copy
-    /// through `rec` instead of submitting an immediate one-shot — the caller batches many
-    /// misses (and whole layers of compute) into one submission. Contract: the ring region
-    /// `[ring_off, ring_off + slot_bytes)` must stay untouched until that recording's submit
-    /// completes (the adapter's fenced ring-half rotation enforces this). The HOST LUT mirror is
-    /// updated exactly like `ensure_resident`; the device-visible copy is the caller's frozen
+    /// Resolve `id` against the arena and, on a MISS only, stage its bytes: `fill` writes them
+    /// into the caller's staging ring at `ring_off`, and the ring→arena slot copy is recorded
+    /// through `rec` instead of submitting an immediate one-shot — the caller batches many misses
+    /// (and whole layers of compute) into one submission. Returns the ring bytes consumed (0 on a
+    /// hit).
+    ///
+    /// `fill` is the tier the bytes come from, and it runs exactly when the arena misses: a hit
+    /// never reaches it. That is what keeps a VRAM hit off the tier below entirely — no disk read
+    /// for an expert the host arena does not hold, no host lock, and no host recency or counter
+    /// moved by traffic VRAM already served — the same shape [`Self::schedule_staged`] has for
+    /// dense blocks. `fill` gets the slot's whole ring region (`slot_bytes`) and writes the block
+    /// into its front.
+    ///
+    /// A miss is all-or-nothing: if `fill` fails (or the region lies outside the ring), the miss
+    /// is rolled back before the error returns — see [`Self::fill_or_roll_back`] — so the caller
+    /// needs no cleanup for this block, whatever it then does with the recording.
+    ///
+    /// Contract: the ring region `[ring_off, ring_off + slot_bytes)` must stay untouched until
+    /// that recording's submit completes (the adapter's fenced ring-half rotation enforces this).
+    /// The HOST LUT mirror is updated on a miss; the device-visible copy is the caller's frozen
     /// tape window (see [`MoePagerSession::lut_window`]) — `flush_lut` is NOT required on this
-    /// path. Returns the ring bytes consumed (0 on a hit).
+    /// path.
     pub fn touch_staged(
         &mut self,
         rec: &crate::recorder::Recorder<'_>,
         ring: &dyn Buffer,
         ring_off: usize,
         id: BlockId,
-        bytes: &[u8],
         scan: bool,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
     ) -> Result<usize> {
-        debug_assert_eq!(
-            bytes.len(),
-            self.slot_bytes,
-            "block byte size must match the arena's slot size"
-        );
         // `scan`: full-set sweep (batched prefill's touch-all) → the scan-resistant cold-end
         // policy; otherwise classic LRU (decode's routed-only touches). See
         // `infr_core::pager::Pager::touch_cold`.
@@ -223,67 +234,27 @@ impl GpuPager {
         match resolution {
             Resolution::Hit { .. } => Ok(0),
             Resolution::Miss { slot, evicted } => {
-                self.record_staged_placement(rec, id, slot, evicted);
-                let base = as_vk_buf(ring)?
-                    .mapped_ptr()
-                    .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
-                par_copy_to_mapped(bytes, unsafe { base.add(ring_off) });
-                rec.copy(
-                    ring,
-                    ring_off,
-                    self.arena.as_ref(),
-                    slot as usize * self.slot_bytes,
-                    self.slot_bytes,
-                );
-                Ok(self.slot_bytes)
-            }
-        }
-    }
-
-    /// [`Self::touch_staged`]'s twin for a block whose bytes are READ rather than copied — the
-    /// arena-less host tier a unified-memory device gets (`HostPager::stream_only`).
-    ///
-    /// Same residency decision and the same ring→arena copy; only the source differs, so the two
-    /// cannot drift on policy. Kept separate rather than folded behind a closure because the copy
-    /// they perform is genuinely different work: the mmap path memcpys a slice with
-    /// `par_copy_to_mapped` (many threads over one already-resident buffer), while this issues a
-    /// positioned read straight into the ring — one copy instead of the read-then-copy that going
-    /// through a host arena would cost.
-    pub fn touch_staged_read(
-        &mut self,
-        rec: &crate::recorder::Recorder<'_>,
-        ring: &dyn Buffer,
-        ring_off: usize,
-        id: BlockId,
-        host: &HostPager,
-        scan: bool,
-    ) -> Result<usize> {
-        let resolution = if scan {
-            self.pager.touch_cold(id)
-        } else {
-            self.pager.touch(id)
-        };
-        match resolution {
-            Resolution::Hit { .. } => Ok(0),
-            Resolution::Miss { slot, evicted } => {
-                self.record_staged_placement(rec, id, slot, evicted);
-                let n = host.block_bytes(id).ok_or_else(|| {
-                    be(format!("moe pager: block {id} is unknown to the host tier"))
+                let slot_bytes = self.slot_bytes;
+                self.fill_or_roll_back(id, evicted, || {
+                    if ring_off + slot_bytes > ring.len_bytes() {
+                        return Err(be(format!(
+                            "pager ring overrun: slot at {ring_off} + {slot_bytes} > {} bytes",
+                            ring.len_bytes()
+                        )));
+                    }
+                    let base = as_vk_buf(ring)?
+                        .mapped_ptr()
+                        .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
+                    // SAFETY: `[ring_off, ring_off + slot_bytes)` lies inside the ring (checked
+                    // above) and is this caller's own region of the persistently-mapped ring —
+                    // reserved by the cursor before this call and not reused until the recording
+                    // that reads it completes (the fn's ring contract). No other thread holds a
+                    // reference to it.
+                    let dst =
+                        unsafe { std::slice::from_raw_parts_mut(base.add(ring_off), slot_bytes) };
+                    fill(dst)
                 })?;
-                debug_assert!(
-                    n <= self.slot_bytes,
-                    "block bytes ({n}) exceed the arena's slot stride ({})",
-                    self.slot_bytes
-                );
-                let base = as_vk_buf(ring)?
-                    .mapped_ptr()
-                    .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
-                // SAFETY: `[ring_off, ring_off + n)` is this caller's own region of the
-                // persistently-mapped ring — reserved by the cursor before this call and not
-                // reused until the recording that reads it completes (the caller's ring
-                // contract). No other thread holds a reference to it.
-                let dst = unsafe { std::slice::from_raw_parts_mut(base.add(ring_off), n) };
-                host.fill(id, dst)?;
+                self.record_staged_placement(rec, id, slot, evicted);
                 rec.copy(
                     ring,
                     ring_off,
@@ -312,9 +283,37 @@ impl GpuPager {
         self.lut_dirty = true;
     }
 
+    /// Produce a miss's bytes with `fill`, or take the miss back if that fails.
+    ///
+    /// The pager has already placed `id` in a slot (displacing `evicted` when the arena was full)
+    /// by the time the bytes are produced, and the bytes can fail — a disk read, an exhausted host
+    /// tier, a ring overrun. Left as it is, that is a block "resident" in a slot holding somebody
+    /// else's bytes: a later touch hits it and the dispatch reads them as its weights. So on an
+    /// error `id` is evicted again (its slot goes back to the free list) and its LUT entry stays
+    /// absent. The displaced block stays displaced — its bytes are still in the slot, but the
+    /// pager no longer holds it — so its entry is cleared too; afterwards no entry names the slot.
+    /// Nothing reaches [`Self::record_staged_placement`] until `fill` succeeded, so the rolled-back
+    /// miss is on no recording's list either.
+    ///
+    /// The counters are not unwound: a failed fill still counts the miss it was, and the
+    /// eviction when it displaced a block, because both happened to the cache. `hits + misses` is
+    /// still the number of touches, and the next touch of `id` is another miss.
+    fn fill_or_roll_back<T>(
+        &mut self,
+        id: BlockId,
+        evicted: Option<u32>,
+        fill: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        fill().inspect_err(|_| {
+            self.pager.evict(id);
+            apply_placement(&mut self.lut_host, id, NOT_RESIDENT, evicted);
+            self.lut_dirty = true;
+        })
+    }
+
     /// [`Self::record_placement`] for a miss whose copy goes into `rec` rather than an immediate
-    /// submit, noted so [`Self::forget_unsubmitted`] can undo it. Called before anything on the
-    /// miss can fail, so an error part-way through still leaves the block on the list.
+    /// submit, noted so [`Self::forget_unsubmitted`] can undo it if that recording is discarded.
+    /// Called only once the miss's bytes are in the ring (see [`Self::fill_or_roll_back`]).
     fn record_staged_placement(
         &mut self,
         rec: &crate::recorder::Recorder<'_>,
@@ -381,7 +380,6 @@ impl GpuPager {
         match self.pager.schedule(id) {
             Resolution::Hit { slot } => Ok((slot, 0)),
             Resolution::Miss { slot, evicted } => {
-                self.record_staged_placement(rec, id, slot, evicted);
                 let slot_bytes = self.slot_bytes;
                 let fits = |total: usize| {
                     debug_assert!(
@@ -389,48 +387,56 @@ impl GpuPager {
                         "dense block bytes ({total}) exceed the pool's slot stride ({slot_bytes})"
                     );
                 };
-                let base = as_vk_buf(ring)?
-                    .mapped_ptr()
-                    .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
-                let total = match bytes {
-                    DenseBytes::Mmap(segments) => {
-                        let total: usize = segments.iter().map(|s| expert_bytes(s).len()).sum();
-                        fits(total);
-                        let mut off = ring_off;
-                        for s in segments {
-                            let seg = expert_bytes(s);
-                            par_copy_to_mapped(seg, unsafe { base.add(off) });
-                            off += seg.len();
+                // All-or-nothing, as in `touch_staged`: a block whose bytes cannot be produced is
+                // taken back out rather than left resident over its slot's previous occupant.
+                let total = self.fill_or_roll_back(id, evicted, || {
+                    let base = as_vk_buf(ring)?
+                        .mapped_ptr()
+                        .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
+                    Ok(match bytes {
+                        DenseBytes::Mmap(segments) => {
+                            let total: usize = segments.iter().map(|s| expert_bytes(s).len()).sum();
+                            fits(total);
+                            let mut off = ring_off;
+                            for s in segments {
+                                let seg = expert_bytes(s);
+                                par_copy_to_mapped(seg, unsafe { base.add(off) });
+                                off += seg.len();
+                            }
+                            total
                         }
-                        total
-                    }
-                    DenseBytes::Host => {
-                        let host = host.ok_or_else(|| {
-                            be(format!(
-                                "dense pager: block {id} has no host tier to read from"
-                            ))
-                        })?;
-                        let n = host.block_bytes(id).ok_or_else(|| {
-                            be(format!(
-                                "dense pager: block {id} is unknown to the host tier"
-                            ))
-                        })?;
-                        fits(n);
-                        // Delivered STRAIGHT into the ring. `HostPager::fill` copies out of its
-                        // arena on a hit and reads into a free slot while one remains, but once the
-                        // arena is full it reads the block into this buffer directly — one copy on
-                        // the streaming majority instead of two, which is the cost
-                        // `docs/perf/results.md` measured the pin-then-memcpy shape paying.
-                        //
-                        // SAFETY: `[ring_off, ring_off + n)` is this caller's own region of the
-                        // persistently-mapped ring — reserved by the cursor before this call, and
-                        // not reused until the recording that reads it completes (the fn's ring
-                        // contract). No other thread can hold a reference to it.
-                        let dst = unsafe { std::slice::from_raw_parts_mut(base.add(ring_off), n) };
-                        host.fill(id, dst)?;
-                        n
-                    }
-                };
+                        DenseBytes::Host => {
+                            let host = host.ok_or_else(|| {
+                                be(format!(
+                                    "dense pager: block {id} has no host tier to read from"
+                                ))
+                            })?;
+                            let n = host.block_bytes(id).ok_or_else(|| {
+                                be(format!(
+                                    "dense pager: block {id} is unknown to the host tier"
+                                ))
+                            })?;
+                            fits(n);
+                            // Delivered STRAIGHT into the ring. `HostPager::fill` copies out of
+                            // its arena on a hit and reads into a free slot while one remains, but
+                            // once the arena is full it reads the block into this buffer directly
+                            // — one copy on the streaming majority instead of two, which is the
+                            // cost `docs/perf/results.md` measured the pin-then-memcpy shape
+                            // paying.
+                            //
+                            // SAFETY: `[ring_off, ring_off + n)` is this caller's own region of
+                            // the persistently-mapped ring — reserved by the cursor before this
+                            // call, and not reused until the recording that reads it completes
+                            // (the fn's ring contract). No other thread can hold a reference to
+                            // it.
+                            let dst =
+                                unsafe { std::slice::from_raw_parts_mut(base.add(ring_off), n) };
+                            host.fill(id, dst)?;
+                            n
+                        }
+                    })
+                })?;
+                self.record_staged_placement(rec, id, slot, evicted);
                 // Word-align the copy length (the ring pad bytes it may carry are never read —
                 // see the fn doc); `total <= slot_bytes` and `slot_bytes % 4 == 0` keep it in
                 // the slot.
@@ -454,7 +460,10 @@ impl GpuPager {
     }
 
     /// Ensure `id` is resident, uploading `bytes` (exactly `slot_bytes`) through `staging` if it's
-    /// a miss. Updates the HOST lut mirror immediately; the device copy is deferred to
+    /// a miss, with one synchronous submit per miss. No production path calls this — the
+    /// execution path stages through [`Self::touch_staged`]; it is the paged-kernel parity tests'
+    /// way to fill an arena and the device LUT without a recorder. Updates the HOST lut mirror
+    /// immediately; the device copy is deferred to
     /// [`flush_lut`](Self::flush_lut) so a caller resolving several ids for one batch (see
     /// `infr_core::pager`'s within-batch note, which applies here unchanged) pays for exactly one
     /// LUT upload per batch, not one per id.
@@ -514,6 +523,21 @@ fn par_copy_to_mapped(src: &[u8], dst: *mut u8) {
     });
 }
 
+/// Copy one block's bytes into the front of its ring region — the miss half of
+/// [`GpuPager::touch_staged`] for a source already in host memory (a mmap'd bank, a pinned host
+/// slot). Errors rather than overrunning the region if the block is larger than the slot.
+fn copy_block(src: &[u8], dst: &mut [u8]) -> Result<()> {
+    let room = dst.len();
+    let dst = dst.get_mut(..src.len()).ok_or_else(|| {
+        be(format!(
+            "pager: a {}-byte block does not fit its {room}-byte ring region",
+            src.len()
+        ))
+    })?;
+    par_copy_to_mapped(src, dst.as_mut_ptr());
+    Ok(())
+}
+
 /// Device-to-device copy of `len` bytes from `src[0..len]` into `dst[slot*len .. (slot+1)*len]` —
 /// the pager's slot placement, which the shared `Backend::copy_buffer` can't express (it always
 /// copies `[0, bytes)` on both sides). Internal to this crate: raw `ash` calls mirroring
@@ -543,8 +567,8 @@ fn copy_into_slot(
 //
 // The pieces above are the block-agnostic host<->VRAM cache; everything below is the MoE-specific
 // glue: one [`GpuPager`] POOL per (expert role, per-expert byte size) pair, a table mapping a
-// bound weight BUFFER's identity to where its layer's expert bytes live in the mmap'd GGUF, and
-// the one persistent staging buffer every pool's uploads share.
+// bound weight BUFFER's identity to where its layer's expert bytes live (the mmap'd GGUF or the
+// pool's host tier), and the one persistent staging ring every pool's uploads share.
 //
 // Why (role, slot_bytes) pools and not one pager per role: the arena/LUT design requires every
 // block sharing an arena to have the SAME byte size (fixed slot offsets + a word-base LUT), and
@@ -672,7 +696,7 @@ struct Pool {
 }
 
 /// One model's whole paged-MoE session: the `(role, slot_bytes)` arena pools + the shared
-/// persistent staging buffer their uploads reuse (the bandwidth probe's headline finding — see
+/// persistent staging ring their uploads reuse (the bandwidth probe's headline finding — see
 /// `pager.rs`'s module doc and `tests/bandwidth_probe.rs`). Lives on the `VulkanBackend` HANDLE
 /// (NOT `VulkanShared` — the session's buffers hold `Arc<VulkanShared>` clones, and parking it on
 /// the shared state made an Arc cycle that leaked the device's whole VRAM footprint until process
@@ -681,12 +705,11 @@ struct Pool {
 /// cost, zero behavior change on the common (fits-in-VRAM) path.
 pub struct MoePagerSession {
     pools: Vec<Pool>,
-    /// `buffer_identity(placeholder)` -> (role, pool index, this layer's expert source), for
-    /// every PAGED `_exps` tensor. A non-paged layer's gate/up/down buffer is never registered
-    /// here — the adapter's lookup simply misses and falls through to the ordinary
-    /// resident-weight path.
-    sources: HashMap<usize, (Role, usize, ExpertSource)>,
-    staging: Box<dyn Buffer>,
+    /// `buffer_identity(placeholder)` -> (role, pool index, this layer's expert source, its expert
+    /// count — what `stage_role` checks a routed id against), for every PAGED `_exps` tensor. A
+    /// non-paged layer's gate/up/down buffer is never registered here — the adapter's lookup
+    /// simply misses and falls through to the ordinary resident-weight path.
+    sources: HashMap<usize, (Role, usize, ExpertSource, u32)>,
     /// Pinned staging RING for the recorded-upload path ([`GpuPager::touch_staged`]): two
     /// fence-rotated halves of [`Self::ring_half_bytes`] each, so the CPU stages the next
     /// segment's misses while the GPU executes the previous one (see
@@ -703,9 +726,6 @@ pub struct MoePagerSession {
     tape: Box<dyn Buffer>,
     tape_words: usize,
     print_stats: bool,
-    /// Reusable output buffer for [`Self::touch_role`]'s global-id list — cleared and refilled per
-    /// call so the demand path allocates no per-touch `Vec`.
-    global_scratch: Vec<u32>,
 }
 
 /// One pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
@@ -715,7 +735,7 @@ pub struct MoePagerSession {
 /// shared slot count is dragged down to fit the LARGEST pool's per-slot bytes within the VRAM
 /// budget and strands budget the smaller pools could have used as real hit rate (Scout: uniform
 /// 238 slots everywhere left ~6 GB of a 19 GB budget unused; per-pool sizing gives gate/up 312
-/// each). Each pool has its own LRU/LUT and `touch_role` resolves pools independently, so unequal
+/// each). Each pool has its own LRU/LUT and `stage_role` resolves pools independently, so unequal
 /// counts are correctness-neutral — a pool with fewer slots just misses more often. Computed by
 /// the caller (budget-driven count, then per-pool split — see `seam::mod`'s placement policy).
 pub struct MoePoolSpec {
@@ -764,7 +784,7 @@ impl MoePagerSession {
 
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
         let mut pools = Vec::with_capacity(layout.pools.len());
-        let mut staging_bytes = 4usize;
+        let mut max_slot = 4usize;
         for spec in &layout.pools {
             pools.push(Pool {
                 role: spec.role,
@@ -773,9 +793,8 @@ impl MoePagerSession {
                 pager: GpuPager::new(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes)?,
                 host: spec.host.clone(),
             });
-            staging_bytes = staging_bytes.max(spec.slot_bytes);
+            max_slot = max_slot.max(spec.slot_bytes);
         }
-        let staging = vk.alloc_uninit(staging_bytes, BufferUsage::Staging)?;
         // Each ring half must hold the largest slot, or `touch_staged` could never make progress
         // on that pool (the adapter rotates halves when one fills; a slot bigger than a half
         // would fit in neither).
@@ -785,7 +804,7 @@ impl MoePagerSession {
             // 0 budget → the clamp floor; the configured `paging.ring` override still wins.
             ring_bytes(0, vk.cfg().paging.ring)
         };
-        let ring_half_bytes = (ring_total / 2).max(staging_bytes);
+        let ring_half_bytes = (ring_total / 2).max(max_slot);
         let ring = vk.alloc_uninit(2 * ring_half_bytes, BufferUsage::Staging)?;
         // One graph's windows = paged layers x roles x n_expert words (Scout: 48 x 3 x 16 = 2.3k)
         // — 64k words (256 KiB) leaves an order of magnitude of headroom; `lut_window` hard-errors
@@ -795,13 +814,11 @@ impl MoePagerSession {
         Ok(Self {
             pools,
             sources: HashMap::new(),
-            staging,
             ring,
             ring_half_bytes,
             tape,
             tape_words,
             print_stats: vk.cfg().paging.stats,
-            global_scratch: Vec::new(),
         })
     }
 
@@ -853,7 +870,8 @@ impl MoePagerSession {
                 }
             }
         }
-        self.sources.insert(buf_id, (role, pool, source));
+        self.sources
+            .insert(buf_id, (role, pool, source, n_expert as u32));
         Ok(())
     }
 
@@ -861,66 +879,6 @@ impl MoePagerSession {
     /// adapter's per-`MoeFfn` dispatch check.
     pub fn is_paged(&self, role: Role, buf_id: usize) -> bool {
         self.sources.get(&buf_id).is_some_and(|(r, ..)| *r == role)
-    }
-
-    /// Resolve residency for every id in `local_ids` (this token's routed experts, LOCAL to the
-    /// layer) against `buf_id`'s pool, uploading misses through the shared staging buffer and
-    /// flushing the LUT once. Returns the GLOBAL ids (`layer_base + local_id`) the paged GEMV
-    /// must read instead of `local_ids` — see [`ExpertSource::layer_base`].
-    pub fn touch_role(
-        &mut self,
-        vk: &VulkanBackend,
-        role: Role,
-        buf_id: usize,
-        local_ids: &[u32],
-    ) -> Result<&[u32]> {
-        let (r, pool, src) = self
-            .sources
-            .get(&buf_id)
-            .ok_or_else(|| be("moe pager: touch on an unregistered buffer"))?;
-        debug_assert_eq!(*r, role, "touch_role: role/buffer mismatch");
-        let stride = src.stride_bytes;
-        let layer_base = src.layer_base;
-        let bank = match &src.bytes {
-            ExpertBytes::Mmap(a) => Some(expert_bytes(a)),
-            ExpertBytes::Host => None,
-        };
-        // Destructure the pool: the pager is taken mutably while the tier below is read, and
-        // indexing twice would borrow the whole `pools` vector each time.
-        let Pool { pager, host, .. } = &mut self.pools[*pool];
-        // Reuse a scratch Vec across calls instead of allocating one per touch — this is the
-        // steady-state demand path (per layer per token). NOTE: each miss still does one
-        // synchronous `one_shot` submit (inside `ensure_resident`); batching those into a single
-        // recorded submission would materially change the recorded stream — the RING/`stage_role`
-        // path exists precisely for that — so the demand path keeps the per-miss copy and only the
-        // per-call allocation is removed here.
-        let global = &mut self.global_scratch;
-        global.clear();
-        global.reserve(local_ids.len());
-        for &lid in local_ids {
-            let id = layer_base + lid;
-            match bank {
-                Some(bytes) => {
-                    let off = lid as usize * stride;
-                    let slice = bytes.get(off..off + stride).ok_or_else(|| {
-                        be("moe pager: expert id out of range for this layer's bank")
-                    })?;
-                    pager.ensure_resident(vk, self.staging.as_ref(), id, slice)?;
-                }
-                // Tier below: routing is unpredictable, so this caches under recency like the
-                // arena above it does on the demand path (`docs/disk-streaming-plan.md` §3.6).
-                None => {
-                    let host = host
-                        .as_ref()
-                        .ok_or_else(|| be(format!("moe pager: expert {id} has no host tier")))?;
-                    let pin = host.pin(id, Insert::Mru)?;
-                    pager.ensure_resident(vk, self.staging.as_ref(), id, &pin)?;
-                }
-            }
-            global.push(id);
-        }
-        pager.flush_lut(vk)?;
-        Ok(&self.global_scratch)
     }
 
     /// The shared upload ring / its per-half capacity (see the `ring` field's doc). The CURSOR
@@ -942,7 +900,7 @@ impl MoePagerSession {
     /// no-readback inline gate for a small-m (decode) layer: when true, any routing the GPU
     /// picks is covered, so the host needs no routing knowledge at all.
     pub fn all_resident(&self, buf_id: usize, n_expert: usize) -> bool {
-        let (_, pool, src) = match self.sources.get(&buf_id) {
+        let (_, pool, src, _) = match self.sources.get(&buf_id) {
             Some(s) => s,
             None => return false,
         };
@@ -955,7 +913,7 @@ impl MoePagerSession {
     /// mutation (the property that makes inline recording safe while earlier segments are still
     /// in flight).
     pub fn touch_all_hits(&mut self, buf_id: usize, n_expert: usize) -> Result<()> {
-        let (_, pool, src) = self
+        let (_, pool, src, _) = self
             .sources
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: touch on an unregistered buffer"))?;
@@ -976,7 +934,7 @@ impl MoePagerSession {
     /// BEFORE the first [`Self::stage_role`] call of that batch (rotations re-call `stage_role`
     /// WITHIN the same batch; the epoch protection must span them).
     pub fn begin_batch(&mut self, buf_id: usize) -> Result<()> {
-        let (_, pool, _) = self
+        let (_, pool, ..) = self
             .sources
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: begin_batch on an unregistered buffer"))?;
@@ -1009,10 +967,18 @@ impl MoePagerSession {
         scan: bool,
     ) -> Result<usize> {
         let (pool_idx, stride, layer_base, bytes_arc) = {
-            let (_, pool, src) = self
+            let (_, pool, src, n_expert) = self
                 .sources
                 .get(&buf_id)
                 .ok_or_else(|| be("moe pager: stage on an unregistered buffer"))?;
+            // Refused before anything is touched. On the host-backed path nothing else would
+            // catch it: `layer_base + lid` past this layer's experts is a valid block of the NEXT
+            // layer, which would be read and cached as if this layer had asked for it.
+            if let Some(&lid) = local_ids.iter().find(|&&lid| lid >= *n_expert) {
+                return Err(be(format!(
+                    "moe pager: expert id {lid} out of range for a {n_expert}-expert layer"
+                )));
+            }
             let arc = match &src.bytes {
                 ExpertBytes::Mmap(a) => Some(Arc::clone(a)),
                 ExpertBytes::Host => None,
@@ -1039,28 +1005,38 @@ impl MoePagerSession {
                 return Ok(i); // half full — caller rotates and continues from here
             }
             let ring_off = half_base + *cursor;
+            // Everything that can be checked without the tier below is checked before the touch
+            // (the id range above, the bank slice here); only producing the bytes goes into the
+            // miss-only `fill`.
             *cursor += match bank {
                 Some(bytes) => {
                     let off = lid as usize * stride;
                     let slice = bytes.get(off..off + stride).ok_or_else(|| {
                         be("moe pager: expert id out of range for this layer's bank")
                     })?;
-                    pager.touch_staged(rec, ring.as_ref(), ring_off, id, slice, scan)?
+                    pager.touch_staged(rec, ring.as_ref(), ring_off, id, scan, |dst| {
+                        copy_block(slice, dst)
+                    })?
                 }
-                // Tier below, under the SAME policy the arena above uses for this batch: a
-                // full-set prefill sweep inserts cold, a routed decode touch inserts MRU.
                 None => {
                     let host = host
                         .as_ref()
                         .ok_or_else(|| be(format!("moe pager: expert {id} has no host tier")))?;
                     if host.caches() {
+                        // Tier below, under the SAME insertion policy the arena above uses for this
+                        // batch: a full-set prefill sweep inserts cold, a routed decode touch MRU.
+                        // It sees only the arena's misses, as the dense path's tier below does.
                         let insert = if scan { Insert::Cold } else { Insert::Mru };
-                        let pin = host.pin(id, insert)?;
-                        pager.touch_staged(rec, ring.as_ref(), ring_off, id, &pin, scan)?
+                        pager.touch_staged(rec, ring.as_ref(), ring_off, id, scan, |dst| {
+                            copy_block(&host.pin(id, insert)?, dst)
+                        })?
                     } else {
                         // Unified memory: nothing is cached below, so read the expert straight
-                        // into the ring rather than through an arena that does not exist.
-                        pager.touch_staged_read(rec, ring.as_ref(), ring_off, id, host, scan)?
+                        // into the ring rather than through an arena that does not exist — one
+                        // copy instead of the read-then-copy a host arena would cost.
+                        pager.touch_staged(rec, ring.as_ref(), ring_off, id, scan, |dst| {
+                            host.fill(id, dst).map(|_| ())
+                        })?
                     }
                 }
             };
@@ -1081,7 +1057,7 @@ impl MoePagerSession {
         buf_id: usize,
         n_expert: usize,
     ) -> Result<u32> {
-        let (_, pool, src) = self
+        let (_, pool, src, _) = self
             .sources
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: lut_window on an unregistered buffer"))?;
@@ -1113,7 +1089,7 @@ impl MoePagerSession {
     }
 
     fn pool_of(&self, buf_id: usize) -> Result<&Pool> {
-        let (_, pool, _) = self
+        let (_, pool, ..) = self
             .sources
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: arena/lut lookup on an unregistered buffer"))?;
@@ -1205,7 +1181,7 @@ impl MoePagerSession {
     }
 }
 
-/// `VulkanBackend::moe_pager`'s field type — a `Mutex` since `touch_role` mutates the LRU/arena and
+/// `VulkanBackend::moe_pager`'s field type — a `Mutex` since `stage_role` mutates the LRU/arena and
 /// the adapter calls it from `execute_static` (`&VulkanBackend`, not `&mut`).
 pub type MoePagerCell = Mutex<Option<MoePagerSession>>;
 

@@ -25,13 +25,14 @@
 //!
 //! Run: `cargo test -p infr-vulkan --test dense_tier_parity -- --ignored --nocapture`
 use infr_core::backend::{Backend, BufferUsage};
-use infr_core::blockio::{BlockDesc, BlockExtent, FileBlockIo};
+use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo, FileBlockIo};
 use infr_core::hostpager::HostPager;
 use infr_core::DType;
 use infr_vulkan::pager::{
     buffer_identity, DenseBytes, DensePagerLayout, DensePagerSession, DensePoolSpec, DenseSource,
 };
 use infr_vulkan::VulkanBackend;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 const DTYPE: DType = DType::Q4_0;
@@ -459,6 +460,139 @@ fn a_host_block_missing_from_the_tier_below_is_refused_at_load() {
         "unexpected error: {err}"
     );
 
+    std::fs::remove_file(&path).unwrap();
+    std::fs::remove_dir(&dir).unwrap();
+}
+
+/// The model file, failing the read of one chosen block while `fail_on` names it.
+struct FaultIo {
+    file: FileBlockIo,
+    fail_on: AtomicU32,
+}
+
+impl BlockIo for FaultIo {
+    fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> infr_core::error::Result<()> {
+        if self.fail_on.load(Ordering::SeqCst) == desc.id {
+            return Err(infr_core::error::Error::backend(format!(
+                "injected read failure on {}",
+                desc.id
+            )));
+        }
+        self.file.read_block(desc, dst)
+    }
+}
+
+/// A block whose bytes cannot be read must not stay resident over its slot's previous occupant:
+/// `stage` fails, and once the read works the same block is a clean miss that serves the right
+/// output. The recording the failed call was given is SUBMITTED, not discarded, so nothing but the
+/// pager's own rollback can have cleaned up.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn a_failed_read_leaves_nothing_resident() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let (raw, stride) = block_and_stride();
+    let blocks: Vec<Vec<u8>> = (0..N_BLOCKS).map(|b| synth_weight_bytes(raw, b)).collect();
+    let dir = std::env::temp_dir().join(format!("infr-dense-tier-fault-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("weights.bin");
+    std::fs::write(&path, blocks.concat()).unwrap();
+
+    let x = synth_x(IN_F);
+    let x_buf = be.alloc(IN_F * 4, BufferUsage::Activations).unwrap();
+    be.upload(x_buf.as_ref(), bytemuck::cast_slice(&x)).unwrap();
+
+    let io = Arc::new(FaultIo {
+        file: FileBlockIo::open(&path).unwrap(),
+        fail_on: AtomicU32::new(u32::MAX),
+    });
+    let host = Arc::new(HostPager::new(DRAM_SLOTS, stride, io.clone()).unwrap());
+    for b in 0..N_BLOCKS {
+        host.register(BlockDesc {
+            id: b as u32,
+            extents: vec![BlockExtent {
+                offset: (b * raw) as u64,
+                len: raw,
+            }],
+        })
+        .unwrap();
+    }
+    let mut sess = DensePagerSession::new(
+        &be,
+        DensePagerLayout {
+            pools: vec![DensePoolSpec {
+                slot_bytes: stride,
+                n_slots: VRAM_SLOTS,
+                n_blocks: N_BLOCKS,
+                host: Some(host),
+            }],
+            ring_bytes: 2 * VRAM_SLOTS * stride,
+        },
+    )
+    .unwrap();
+    let placeholders: Vec<_> = (0..N_BLOCKS)
+        .map(|_| be.alloc_uninit(4, BufferUsage::Weights).unwrap())
+        .collect();
+    let ids: Vec<usize> = placeholders
+        .iter()
+        .map(|p| buffer_identity(p.as_ref()))
+        .collect();
+    for (b, &buf_id) in ids.iter().enumerate() {
+        sess.register(
+            0,
+            buf_id,
+            DenseSource {
+                bytes: DenseBytes::Host,
+                block_id: b as u32,
+            },
+        )
+        .unwrap();
+    }
+    // One block per recording, each in a fresh half: the ring holds every slot, so no rotation.
+    let stage = |sess: &mut DensePagerSession, b: usize| {
+        let rec = be.recorder().unwrap();
+        let mut cursor = 0;
+        let staged = sess.stage(&rec, 0, &mut cursor, ids[b]);
+        rec.finish().unwrap();
+        staged.map(|a| a.expect("the half holds a slot"))
+    };
+
+    // Fill VRAM, so the failing miss has to displace a block.
+    for b in 0..VRAM_SLOTS {
+        stage(&mut sess, b).unwrap();
+    }
+    let fail = VRAM_SLOTS;
+    io.fail_on.store(fail as u32, Ordering::SeqCst);
+    let err = stage(&mut sess, fail).expect_err("a failed read must fail the staging call");
+    assert!(
+        err.to_string().contains("injected read failure"),
+        "unexpected error: {err}"
+    );
+    let (vram, _) = sess.pool_stats()[0];
+    assert_eq!(
+        (vram.hits, vram.misses, vram.evictions),
+        (0, VRAM_SLOTS as u64 + 1, 1),
+        "the failed touch counts as the miss (and the eviction) it was"
+    );
+
+    io.fail_on.store(u32::MAX, Ordering::SeqCst);
+    let addr = stage(&mut sess, fail).unwrap();
+    let (vram, _) = sess.pool_stats()[0];
+    assert_eq!(
+        vram.hits, 0,
+        "the block whose read failed was served as a hit from a slot that never received it"
+    );
+    let (arena, want_addr) = be.alloc_arena_bda(blocks[fail].len()).unwrap();
+    be.upload(arena.as_ref(), &blocks[fail]).unwrap();
+    assert_eq!(
+        gemv_at(&be, addr, x_buf.as_ref()),
+        gemv_at(&be, want_addr, x_buf.as_ref()),
+        "the re-staged block serves the wrong output"
+    );
+
+    drop(sess);
     std::fs::remove_file(&path).unwrap();
     std::fs::remove_dir(&dir).unwrap();
 }

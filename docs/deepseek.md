@@ -239,10 +239,12 @@ stage 0.
 
 ### 0.3 Pager LRU
 
-`docs/backlog.md` already records it: `Pager`'s `mark_mru`/`evict`/`take_slot`
-are `O(n_slots)` per touch. At V4-Flash scale (256 experts × 43 layers ≈ 11k
-blocks per role) that stops being acceptable. Not needed for stages 1–2; needed
-before stage 4 is usable.
+`Pager` keeps one recency stamp per block, so a hit or an insert is a few hash
+writes; the `O(n_slots)` cost is the victim scan (`coldest`), paid on every miss
+once the cache is full. At V4-Flash scale (256 experts × 43 layers ≈ 11k blocks
+per role) a prefill sweep that misses on most of them pays that scan per miss.
+`docs/plan/06-pager-eviction.md` owns the measurement and the fix. Not needed
+for stages 1–2; needed before stage 4 is usable.
 
 ## Stage 1 — `deepseek` (V1)
 

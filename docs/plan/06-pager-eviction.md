@@ -36,10 +36,11 @@ measured, which is step 1.
 
 ## What the survey found (2026-11-13)
 
-A read-only pass, nothing built or run. The first item was re-read at its site
-by the planner; the rest is the survey's account; its line references are not
-repeated here and each claim should be re-read before code is written against
-it.
+A read-only pass, nothing built or run. The survey's account; its line
+references are not repeated here and each claim should be re-read before code is
+written against it. The tiering bug it found (the MoE session consulting the
+host tier on a VRAM hit) is fixed, and its remaining findings outside the order
+of work below are B156.
 
 **How much the pager is called.** Dense streaming is light: one `schedule` per
 streamed weight group, four to seven per layer, in pools of about forty blocks,
@@ -59,15 +60,6 @@ derived), about eleven thousand for DeepSeek V4-Flash. On 30B-A3B:
   readback before its touches. That, not the scan, is expected to dominate a
   decode miss (inferred, not measured).
 
-**A bug in the tiering, confirmed at the site.** `MoePagerSession::stage_role`
-calls `HostPager::pin` for every id before `GpuPager::touch_staged`, which
-ignores the bytes on a hit. So an expert that is resident in VRAM and absent
-from the DRAM arena is read from disk, may evict a DRAM block, and the bytes are
-discarded; and every VRAM hit pays two host locks. The dense path consults the
-tier below only on a miss, and `dense_tier_parity` asserts it; the MoE path has
-no such assertion. It also makes the DRAM tier's recency mirror VRAM's, which is
-part of why the hottest experts are held twice.
-
 **Other costs per touch:** `HostPager::fill` clones the block's extent list on
 every call, hits included; `lut_window` copies `n_expert` words per layer and
 role whether or not anything missed; misses in one batch are separate copy
@@ -78,9 +70,10 @@ baton (`StepGate`) already serialises whole forward steps under
 `serve --parallel`, so the session mutex held across a copy or a disk read
 serialises nothing further.
 
-**Dead code:** `MoePagerSession::touch_role`, `GpuPager::ensure_resident` and
-`flush_lut` have no production caller (tests only), and the streaming design doc
-still describes `touch_role` as the decode path.
+**Dead code:** `MoePagerSession::touch_role` is deleted.
+`GpuPager::ensure_resident`, `flush_lut` and the device LUT behind them have no
+production caller, but are how the paged-kernel parity tests fill an arena; see
+B156.
 
 **No instrument exists:** nothing records a touch trace, nothing times `Pager`,
 and `infr-core` has no ignored tests or benches to follow as a convention.
@@ -95,21 +88,18 @@ eviction; and the hit, miss and eviction counters keep their exact semantics.
 
 ## Order of work, revised by the survey
 
-1. **Stop consulting the host tier on a VRAM hit** in the MoE path, with a test
-   in the shape of `dense_tier_parity`'s "consulted == vram.misses". A bug fix,
-   independent of everything below.
-2. **The trace hook, the micro-benchmark and the simulator** (step 1's measuring
+1. **The trace hook, the micro-benchmark and the simulator** (step 1's measuring
    half, below).
-3. **Fully resident decode:** replace the per-token touch of every expert with
+2. **Fully resident decode:** replace the per-token touch of every expert with
    something that costs O(1) per layer and keeps recency meaningful. Needs a
    design: the routed ids are on the GPU, which is why every expert is touched
    today.
-4. **The data-structure refactor** (step 2), sized by the benchmark on the MoE
+3. **The data-structure refactor** (step 2), sized by the benchmark on the MoE
    pool sizes above.
-5. **Policy** (step 3), and the decode-miss stall as its own question: whether
+4. **Policy** (step 3), and the decode-miss stall as its own question: whether
    the readback and drain can be avoided or batched.
-6. Small ones alongside: the per-call clone in `HostPager::fill`, deduplicating
-   split-path ids, deleting the dead entry points and correcting the design doc.
+5. Small ones alongside: the per-call clone in `HostPager::fill` and
+   deduplicating split-path ids (both in B156).
 
 ## Steps
 
@@ -164,10 +154,12 @@ Only where the simulator shows a gap to Belady worth closing:
   doorkeeper in `HostPager` are partial answers). Candidates to simulate: a
   frequency-aware admission filter (TinyLFU-style), S3-FIFO, ARC, and LFU with
   aging. Pick by miss count on the recorded traces, then by bookkeeping cost.
-- **Tier-coordinated placement for MoE:** today each tier caches by the same
-  policy, so the hottest experts are held twice (VRAM and DRAM). Exclusive
-  placement would make DRAM hold the next-hottest set instead (B36 lists it as
-  unbuilt). Simulate the two-tier miss counts before building.
+- **Tier-coordinated placement for MoE:** each tier caches by the same policy,
+  and the DRAM tier sees only VRAM's misses, so it holds the experts most
+  recently missed rather than a mirror of VRAM's hot set
+  (`disk-streaming-plan.md` §3.6 says what that costs). Exclusive placement
+  would make DRAM hold the next-hottest set instead (B36 lists it as unbuilt).
+  Simulate the two-tier miss counts before building.
 - **Dense stays as it is:** the cyclic sweep is already optimal under
   `schedule`, and the planned partition (`TierPlan`) is a placement question,
   not an eviction one.

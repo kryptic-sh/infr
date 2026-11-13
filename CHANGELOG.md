@@ -20,6 +20,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`infr_core::fusion` loses two patterns no backend planned**:
   `RmsNormLinearCfg`, `MoeAddCfg`, `ExpertsOk`, and the `rmsnorm_linear` /
   `moe_add` fields of `FusionCfg` and `FusionPlan`.
+- **`infr_vulkan::pager`: `GpuPager::touch_staged` takes the block's bytes as a
+  fill closure that runs only on a miss**, and replaces `touch_staged_read`.
+  `MoePagerSession::touch_role`, which nothing in the engine called, is gone;
+  `stage_role` is the MoE session's entry point.
 
 ### Added
 
@@ -122,6 +126,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Paging an MoE model through the host RAM tier no longer reads experts the
+  GPU already holds.** Every routed expert used to be looked up in the host tier
+  before the GPU cache was checked, so an expert resident on the GPU but not in
+  host RAM was read from disk and thrown away, possibly evicting one host RAM
+  needed, and the host tier's hit and miss counts in `paging.stats` tracked GPU
+  traffic rather than its own. The host tier is now asked only on a GPU cache
+  miss, as it already was for dense models.
 - **Streaming no longer re-decodes the whole reply for every token.** Output is
   byte-identical; the work per token no longer grows with the reply's length.
 - **A tool call quoted inside a model's reasoning is no longer run as a call,

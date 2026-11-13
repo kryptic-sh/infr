@@ -4086,6 +4086,59 @@ rest is the reviewer's account.
   `matmul_native_f32a`, `dispatch_gemv_chunked`, and the ignored GPU test bodies
   in `recorder.rs`.
 
+### B156 — pager survey leftovers: MoE touch costs, test-only GPU pager surface, MoE DRAM policy (2026-11-13)
+
+Findings of the 2026-11-13 pager survey (`docs/plan/06-pager-eviction.md`, "What
+the survey found") that are not fixed, each re-read at its site on 2026-11-13;
+what is inference is said.
+
+- **Split-path ids are not deduplicated.** On a small-m `MoeFfn` with an absent
+  expert, `execute_paged_moe` (`adapter.rs`) downloads the router's ids buffer
+  and passes all `rows × n_used` entries to `stage_and_window` as they are. A
+  repeated expert is a same-batch VRAM hit (`moe_tier_parity`'s
+  `a_repeated_expert_is_staged_once` pins that it reaches the host tier once),
+  but each repeat is still a `Pager::touch` and counts as a hit in
+  `paging.stats`, so the hit rate on that path is inflated by repeats. Only rows
+  above one can repeat an expert (one row's top-k is distinct — inferred from
+  top-k, not checked in the router shader). Listed with the plan's small items.
+- **`touch_all_hits` promotes every expert of a fully resident layer.** The
+  inline path calls `all_resident` (one `slot_of` per expert) for each role,
+  then `touch_all_hits` (one MRU `Pager::touch` per expert) for each role, per
+  layer per decode token. The cost is `n_expert` touches per layer and role, and
+  recency loses which experts were routed: after such a token every expert of
+  the layer is equally hot. The plan's "fully resident decode" item owns the
+  redesign.
+- **`HostPager::fill` clones the block descriptor on every call.** The first
+  thing its loop does under the lock is `inner.descs.get(&id).cloned()`, a heap
+  copy of the extent list, before the resident check — so hits pay it too.
+  `fill` serves the dense host tier and the arena-less (unified-memory) MoE
+  tier. Listed with the plan's small items.
+- **Test-only GPU pager surface: `GpuPager::ensure_resident`, `flush_lut`,
+  `lut_buffer` and the device LUT.** No production path calls them (the MoE
+  execution path reads the LUT tape), but they are how the paged-kernel parity
+  binaries fill an arena: `grid_mmq_parity`, `moe_id_gemv_new_formats_parity`,
+  `moe_mmq_fp4_parity`, `moe_mmq_q2_0_parity`, `nc_gemm_parity`,
+  `pager_gemv_multi_parity`, `pager_gemv_parity`, `pager_mmq_parity`. Deleting
+  them means porting each fixture to `touch_staged` under a recorder plus a tape
+  window. Meanwhile every `GpuPager` allocates and seeds a device LUT of
+  `n_blocks` words that production never reads, and `MoePagerSession::lut` has
+  no caller at all.
+- **The MoE DRAM tier sees only VRAM misses, and what that costs is not
+  measured.** Experts that keep hitting in VRAM age out of DRAM. That frees DRAM
+  for experts VRAM does not hold, but an expert hot for a long stretch and then
+  evicted from VRAM may have left DRAM too, so its next miss reads the disk
+  (`disk-streaming-plan.md` §3.6). Which misses less depends on the routing
+  trace; the plan's two-tier simulator is the instrument. One data point, from
+  `infr run` on Qwen3-30B-A3B-Q4_K_M (7900 XTX, `paging.cache=4g`,
+  `paging.dram=1g`, greedy, 32 tokens): the host tier, smaller than VRAM there,
+  had no hits at all. A DRAM tier smaller than the VRAM arena may buy nothing
+  for MoE; whether auto-sizing should skip it in that case is open.
+- **`disk-streaming-plan.md` §3.5 describes a fault-injecting in-memory
+  `BlockIo` in `infr-testkit`; none exists.** The tests that inject read
+  failures define their own (`hostpager.rs`'s `FakeIo`, `moe_tier_parity`'s
+  `BankIo`, `dense_tier_parity`'s `FaultIo`). A shared one is worth building
+  when a fourth copy would be needed.
+
 ### Review coverage as of 2026-11-12
 
 Eight further read-only passes on 2026-11-12 went through what the earlier

@@ -2681,6 +2681,53 @@ mod tests {
         assert_eq!(calls[1].id, None);
     }
 
+    /// A float in a replayed tool call's arguments reaches the engine as the exact value the client
+    /// sent, so the chat template prints the same digits back: whether the arguments come as a
+    /// JSON string (the OpenAI shape) or as an object. Each of these lost its last digit when
+    /// serde_json parsed without `float_roundtrip` (`1e-25` became `9.999999999999999e-26`).
+    #[test]
+    fn replayed_tool_call_floats_survive_exactly() {
+        let floats = ["1e-25", "905046994.6356679", "2.5788702084023933e-304"];
+        let args = format!(
+            r#"{{"a":{},"b":{},"c":[{}]}}"#,
+            floats[0], floats[1], floats[2]
+        );
+        for arguments in [serde_json::to_string(&args).unwrap(), args.clone()] {
+            let raw = format!(
+                r#"{{"role":"assistant","content":null,"tool_calls":[
+                {{"type":"function","function":{{"name":"f","arguments":{arguments}}}}}]}}"#
+            );
+            let msg = dto_to_engine(&serde_json::from_str::<ChatMessageDto>(&raw).unwrap());
+            let a = &msg.tool_calls.expect("one call")[0].arguments;
+            let got = [&a["a"], &a["b"], &a["c"][0]].map(|v| v.as_f64().unwrap());
+            let want = floats.map(|f| f.parse::<f64>().unwrap());
+            assert_eq!(got.map(f64::to_bits), want.map(f64::to_bits), "{arguments}");
+            // …and the prompt prints them back: bare (Python's `repr`) and through `tojson`.
+            const PRINT: &str = "{% set a = messages[0].tool_calls[0].function.arguments %}\
+                {{ a.a }} {{ a.b }} {{ a.c[0] }}|{{ a | tojson }}";
+            let msgs = vec![serde_json::json!({"role": "assistant", "content": "",
+                "tool_calls": [{"type": "function",
+                                "function": {"name": "f", "arguments": a}}]})];
+            let prompt = infr_chat::render_template(
+                PRINT,
+                msgs,
+                serde_json::Value::Null,
+                "",
+                "",
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                prompt,
+                format!(
+                    r#"{0} {1} {2}|{{"a": {0}, "b": {1}, "c": [{2}]}}"#,
+                    floats[0], floats[1], floats[2]
+                )
+            );
+        }
+    }
+
     /// The ids `serve` hands out are ones every supported template accepts when the client replays
     /// them: Mistral's requires exactly nine alphanumerics. They are distinct per call and per
     /// completion, and the same (cid, index) always yields the same id.

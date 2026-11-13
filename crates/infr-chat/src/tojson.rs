@@ -16,7 +16,7 @@ use crate::template::check_width;
 /// Deepest nesting the writer descends into before refusing, as the reference does: llama.cpp's
 /// `JINJA_RECURSIVE_LIMIT` (`common/jinja/utils.h`). It also keeps a deep value from overflowing
 /// the stack.
-const NESTING_MAX: usize = 128;
+pub(crate) const NESTING_MAX: usize = 128;
 
 /// The reference's separators when the template names none: Python's `json.dumps` defaults, with
 /// the item separator losing its space once `indent` breaks the lines.
@@ -205,10 +205,8 @@ fn write_string(out: &mut String, s: &str, layout: &Layout) {
     }
 }
 
-/// `x` as Python's `repr(float)` writes it, which `json.dumps` and the reference's `float_repr`
-/// follow: the shortest digits that read back as `x`, in fixed notation when the decimal point
-/// falls at `-4 < point <= 16` (a whole number gets `.0`), otherwise as `d.ddde±XX`. `NaN` and
-/// `Infinity` are what `json.dumps` writes for the non-finite values.
+/// `x` as `json.dumps` and the reference's `float_repr` write it: Python's `repr(float)`
+/// ([`crate::pystr::float_repr`]) for a finite value, `NaN` and `Infinity` for the rest.
 fn python_float_repr(x: f64) -> String {
     if x.is_nan() {
         return "NaN".to_owned();
@@ -216,37 +214,7 @@ fn python_float_repr(x: f64) -> String {
     if x.is_infinite() {
         return if x < 0.0 { "-Infinity" } else { "Infinity" }.to_owned();
     }
-    // Rust's `{:e}` writes the same shortest round-trip digits, as `d[.ddd]e<exp>`.
-    let sci = format!("{:e}", x.abs());
-    let (mantissa, exp) = sci.split_once('e').expect("`{:e}` writes an exponent");
-    let exp: i32 = exp.parse().expect("`{:e}` writes an integer exponent");
-    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-    let n = digits.len() as i32;
-    let point = exp + 1; // digits before the decimal point
-    let mut out = String::from(if x.is_sign_negative() { "-" } else { "" });
-    if point > -4 && point <= 16 {
-        if point <= 0 {
-            out.push_str("0.");
-            out.extend(std::iter::repeat_n('0', point.unsigned_abs() as usize));
-            out.push_str(&digits);
-        } else if point >= n {
-            out.push_str(&digits);
-            out.extend(std::iter::repeat_n('0', (point - n) as usize));
-            out.push_str(".0");
-        } else {
-            let (int, frac) = digits.split_at(point as usize);
-            write!(out, "{int}.{frac}").expect("String write");
-        }
-    } else {
-        let (first, rest) = digits.split_at(1);
-        out.push_str(first);
-        if !rest.is_empty() {
-            write!(out, ".{rest}").expect("String write");
-        }
-        let sign = if exp < 0 { '-' } else { '+' };
-        write!(out, "e{sign}{:02}", exp.abs()).expect("String write");
-    }
-    out
+    crate::pystr::float_repr(x)
 }
 
 #[cfg(test)]

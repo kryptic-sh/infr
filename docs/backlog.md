@@ -2633,34 +2633,6 @@ CLI, hub, chat, profiling, and llama paths.
 platform-only Metal and Windows behavior was not executed. No formatter, linter,
 build, or test command was run for this report.
 
-### B81 — minijinja 2.24 prints booleans as `True` / `False` (2026-10-29)
-
-**Tag:** chat templates · **Needs:** a decision
-
-Regenerating `Cargo.lock` for v0.2.0 moved `minijinja` and `minijinja-contrib`
-from 2.21.0 to 2.24.0, and `{{ enable_thinking }}` started rendering as `True`
-instead of `true`: `template_tests::no_think_config_drives_enable_thinking`
-failed. 2.24 writes a bool the way Python's Jinja2 does (`value/mod.rs`,
-`utils.rs`), so any chat template that prints a bool, rather than testing one,
-changes its prompt text. Both crates are held at 2.21.0 in `Cargo.lock` only
-(`cargo update -p minijinja --precise 2.21.0`); the manifest still says `"2"`,
-so the next `cargo generate-lockfile` or `cargo update` brings 2.24 back.
-
-To decide: take 2.24 (it is probably closer to HF transformers, which renders
-these templates with Python's Jinja2; not verified against a real template that
-prints a bool) and change the test's expectation, or pin `~2.21` in
-`[workspace.dependencies]` until someone checks what HF and llama.cpp's minja
-actually emit.
-
-Checked 2026-11-12: llama.cpp's Jinja prints a bool as `True`
-(`value_bool_t::as_string` in `common/jinja/value.h`, the `tostring` builtin in
-`value.cpp`); `tojson` gives `true`. So 2.24 is the one that matches llama.cpp.
-A formatter override on 2.21 (`Environment::set_formatter`) covers only `{{ }}`,
-not a bool reaching text through `~` or `|string`, so it cannot fully match.
-Still the owner's call: take 2.24 and change the test's expectation (changes the
-prompt of any template that prints a bool), or pin `~2.21` to keep today's
-prompts.
-
 ## Whole-codebase review 2026-11-08
 
 Three read-only review passes over `main` @ `f2f89cb` (correctness, performance,
@@ -4250,69 +4222,103 @@ are now only a way to skip building a plan that would be refused. What is left:
   positions per execute, `QkNormRope` reading the bound buffer), not observed on
   a device.
 
-### B158 — chat-template renders: what still differs from llama.cpp (2026-11-13)
+### B158 — chat-template renders: what still differs from Python Jinja2 and llama.cpp (2026-11-13)
 
 **Tag:** chat · correctness
 
-`build_env` (`crates/infr-chat/src/template.rs`) turns on `trim_blocks` and
-`lstrip_blocks`, as llama.cpp's lexer (`common/jinja/lexer.cpp`) does for every
-chat template. Checked by rendering each cached GGUF's template (Qwen2.5-0.5B,
-Qwen3-0.6B / 1.7B / 30B-A3B, Qwen3.5-0.8B, gemma-3-1b, Llama-3.2-1B, SmolLM3-3B)
-for seven conversations (user; user without thinking; system + user; user /
-assistant / user, with and without thinking; user with one tool; the SmolLM3
-golden's) through infr and through llama.cpp's `test-chat-template --no-common`
-with the same variables. Every render matched byte for byte except the tool
-renders. Hugging Face transformers was not run (not installed here).
+**The rule (decided 2026-11-13):** infr renders chat templates as Python's
+Jinja2 does in the environment Hugging Face transformers builds for
+`apply_chat_template` (`_cached_compile_jinja_template` in
+`transformers/utils/chat_template_utils.py`: `ImmutableSandboxedEnvironment`,
+`trim_blocks`, `lstrip_blocks`, `loopcontrols`, its own `tojson`), since that is
+what a model was trained on. Where llama.cpp's engine departs from Python, infr
+follows Python. The oracle is `crates/infr-chat/tests/fixtures/jinja2_text.py`
+(Jinja2 3.1.6 on Python 3.15.2 here); its table of how each construct turns each
+kind of value into text is checked row by row by `tests/jinja2_text.rs`, whose
+`KNOWN_GAPS` holds every row infr does not match, each pinned to today's output.
 
-`tojson` now writes what llama.cpp's does (`crates/infr-chat/src/tojson.rs`).
-Rechecked the same way on the same templates with four tools conversations (one
-or two tool definitions with nested parameters and a description holding
-non-ASCII, `<`, `&` and both quotes; an assistant tool call in history; a tool
-result; one with scalar arguments): every render matches except the first item
-below. Gemma 3's template raises "Conversation roles must alternate" on a tool
-message in both engines. What is left:
+**Real templates, checked 2026-11-13.** Each cached GGUF's template
+(Qwen2.5-0.5B, Qwen3-0.6B / 1.7B / 30B-A3B, Qwen3.5-0.8B, gemma-3-1b,
+Llama-3.2-1B, SmolLM3-3B, ERNIE-4.5-0.3B), nine conversations each (plain,
+system, multi-turn with and without thinking, one and two tools, tool-call
+history with none / bool / `1e-07` / `1e+16` / `1e+22` / nested arguments and
+tool results), through the oracle and infr: all 81 match (three are refused by
+both: Llama 3.2 with two tool calls, Gemma 3 on the tool role). The plain-chat
+renders are byte-identical to infr 0.3.0's. The 74 templates in llama.cpp's
+`models/templates` (at `5676dfbe0`), nine conversations with thinking on and off
+(1332 renders, scratch-only: that directory's README gives provenance but no
+licensing, so none is copied into this repo): 994 match, 178 are refused by
+both, 36 differ, 90 are refused by infr only, 34 by Python only. Every
+non-match:
 
-- **Turning a non-string into text.** Most ways a template turns a bool, none,
-  float or container into text differ between the engines (integers, and floats
-  in fixed notation, match); rendered through both (llama.cpp
-  `test-chat-template --no-common`, infr `render_template`):
+- **`{% generation %}` (90 refused by infr only):** IFM-K2-Horizon,
+  LFM2.5-8B-A1B, LFM3, Laguna S 2.1 / XS 2.1 / XS.2. transformers registers the
+  tag (`AssistantTracker`, which renders its body unless an assistant mask is
+  asked for), so Hugging Face renders these; minijinja has no custom tags and
+  infr refuses the template. See B172.
+- **`~` on a float (26 of the 36 that differ):** GigaChat3 and GigaChat3.1
+  (`' // default: ' ~ default`, `minimum` / `maximum`) and functionary v3.2
+  (`' Default=' ~ default_value`, `Maximum=`, `Minimum=`) print a float default
+  or bound with Rust's digits: Python `// default: 1e-06`, `// maximum: 1e+16`;
+  infr `// default: 0.000001`, `// maximum: 10000000000000000.0`. A list default
+  now matches (`crates/infr-chat/src/pyvalue.rs`).
+- **functionary v3.1 and Markup (the other 10):** it writes
+  `"Use the function '"|safe + name + …`. In Python a `Markup` (`|safe`) plus a
+  plain string escapes the plain one even with autoescaping off, so the
+  reference prompt reads `&lt;now&gt; &amp; &#39;later&#39; &#34;x&#34;` and the
+  whole tool JSON is entity-escaped. minijinja concatenates a safe string
+  plainly. Surprising, not fixed: no other checked template relies on it.
+- **Python refuses, infr renders (34):** Cohere command-r-plus and Hermes 2 Pro
+  / Hermes 3 tool-use iterate `tools` when it is none (Python raises; minijinja
+  loops zero times, B170); llama.cpp's own `llama-cpp-deepseek-r1` passes a
+  `map` generator to `tojson` (Python cannot serialize a generator; infr's
+  `tojson` walks it).
 
-  | construct                          | llama.cpp                                 | infr (minijinja)                      |
-  | ---------------------------------- | ----------------------------------------- | ------------------------------------- |
-  | `true \| string`, `none \| string` | `True`, `None`                            | `true`, `none`                        |
-  | `'x' ~ true ~ none ~ 2.5`          | `xTrue2.5` (none prints nothing)          | `xtruenone2.5`                        |
-  | `'{} {}'.format(true, none)`       | `True None`                               | `true none`                           |
-  | `{{ true }}`, `{{ none }}`         | `True`, empty                             | `true`, `none`                        |
-  | a float `1e-7` from the input      | `\| string`: `1e-07`; bare `{{ }}`: `0.0` | `0.0000001` both ways                 |
-  | `{{ [1, 2] }}`, `{{ {'a': 1} }}`   | `12`, empty                               | `[1, 2]`, `{"a": 1}`                  |
-  | a dict `\| string`                 | `{'a': {}, 'b': [1, 'x'], 'c': True}`     | `{"a": {}, "b": [1, "x"], "c": true}` |
-  | `[true, none] \| join(',')`        | error (joins only strings and numbers)    | `true,none`                           |
-  | `'%s %s' \| format(true, none)`    | `%s %s` (nothing substituted)             | `true none`                           |
+What is left:
 
-  Inside a container `| string` also writes a float `1e-7` as `0.0` and `1e16`
-  as `10000000000000000.0` in llama.cpp.
-
-  llama.cpp's `string` and `~` follow Python's `str()` (`value_to_string_repr`
-  in `common/jinja/value.cpp`: single quotes, a string holding `'` in double
-  quotes, `True` / `None`), but its bare interpolation does not: it prints
-  nothing for none, a dict or a mapping inside a list, concatenates a list's
-  items, and prints a small float as `0.0`, none of which Jinja2 does. So exact
-  parity is not a formatter override (`Environment::set_formatter`) plus a
-  `string` filter: it would copy those interpolation quirks, which look like
-  llama.cpp bugs. Not built. **Decided 2026-11-13: follow Python Jinja2**, which
-  is what Hugging Face's `apply_chat_template` renders with and so what a model
-  was trained on, everywhere a template turns a non-string into text (bare
-  interpolation, `| string`, `~`, `join`, `format`). Where llama.cpp departs
-  from Python, infr follows Python and the llama.cpp comparison lists the case
-  as a known difference. The work starts by installing the `jinja2` package as
-  the test oracle: the Python behaviour has not been run here, only llama.cpp's
-  and minijinja's. Cached templates that reach it: Qwen3.5 prints each scalar
-  tool-call argument with `args_value | string`, so a bool, none or
-  exponent-range float argument renders differently (verified for `true`, `none`
-  and `1e-7`); SmolLM3 prints `tool | string` for `xml_tools`, which infr never
-  passes (B159). Qwen3.5's `'Picture ' ~ image_count.value` concatenates an
-  integer, which matches. No cached template interpolates a non-string bare.
-
+- **Known gaps against Python** (rows in `KNOWN_GAPS`):
+  - `~` on a float: minijinja concatenates with its own `Display`
+    (`ops::string_concat`), which has no hook, and a float cannot be wrapped the
+    way the request's lists and dicts are, since it must stay a number. Outside
+    `1e-4 <= |x| < 1e16` it comes out in fixed notation, `nan` as `NaN`, and a
+    tie rounds up (Rust's `{}`). Reached by GigaChat3 / 3.1 and functionary v3.2
+    (above). A list or dict the template builds itself (`'x' ~ [1, 'a']`) is
+    also written JSON-style; no checked template does that.
+  - minijinja has no tuple and no range type: `(1, 2)`, `dictsort`, `items` and
+    `range(3)` print as lists.
+  - A float in a `str.format` field with a spec but no type (`{:>20}`) gets
+    minijinja's six-digit `%g`; only an argument that meets nothing but
+    spec-less fields is converted first (`crates/infr-chat/src/pyformat.rs`).
+  - `'%r' | format`, `'{!r}'` and `'{!s}'` are refused by minijinja's formatter.
+  - An unassigned code point (Unicode category Cn) inside a container is written
+    raw; Python escapes it (`is_printable` in `crates/infr-chat/src/pystr.rs`
+    covers every other non-printable category, checked against every such
+    character in Python's Unicode 17.0 table).
+  - A list or dict the template builds (`tools.l | list`, a slice, `+`,
+    `dict(...)`) is minijinja's own value: `~` writes it JSON-style
+    (`["string", "null"]`), while the request's lists and dicts print as
+    Python's. No checked template concatenates one.
+  - `capitalize` upper-cases the first character where Python title-cases it:
+    `'ß'` gives `SS` (Python `Ss`), `'ǆ'` gives `Ǆ` (Python `ǅ`). The standard
+    library has no titlecase mapping, and a hand-written table was declined.
+  - `is sequence`: minijinja's `map` gives a list (Python an iterator: false)
+    and its slice a lazy iterable (Python a list: true), so those two answer the
+    other way round. `reverse` matches.
+  - minijinja's formatter applies some specs its own way: `'{:,}'.format(false)`
+    gives `False` (Python formats the integer, `0`) and `'{:.3}'.format(5)`
+    gives `5` (Python refuses a precision on an integer).
+  - Deliberate limits: a value nested deeper than `tojson::NESTING_MAX` is
+    refused where Python prints it, and minijinja refuses a string repeated past
+    100,000,000 bytes (`MAX_REPEATED_STRING_LEN`).
+- **llama.cpp departs from Python here, and infr follows Python** (from the same
+  table, llama.cpp at `5676dfbe0`): bare `{{ none }}` and a list or dict printed
+  bare come out empty or as concatenated items; `join` refuses non-strings;
+  printf-style `| format` substitutes nothing (`'%s %s' | format(true, none)`
+  prints `%s %s`); `none | default('d')` gives `d`; a float literal in exponent
+  form (`1e16`) is refused; a small float prints as `0.0` in bare `{{ }}`,
+  `join` and `str.format`; `1e16` prints `10000000000000000.0` bare; a string
+  holding both quote kinds is repr'd in double quotes (Python: single quotes and
+  `\'`), which shows in SmolLM3's `tool | string` for such a description.
 - **`tojson` divergences kept on purpose.** Integers outside the signed 64-bit
   range: llama.cpp wraps them (`[18446744073709551615, 9223372036854775808]`
   prints `[-1, -9223372036854775808]`), infr prints the true values. The indent
@@ -4376,7 +4382,8 @@ has no tool block. Mapping `tools` to `xml_tools` would therefore depart from
 the reference, and is more than a variable:
 
 - The template prints each tool with `tool | string`, Python's `str(dict)` in HF
-  (single quotes), which minijinja's `string` filter does not reproduce.
+  (single quotes). infr's `string` filter now writes that (B158), checked by
+  rendering this template with `xml_tools` set to a tools list.
 - The template has no `tool_calls` branch for assistant messages, so a replayed
   call is lost from history; tool results go through its `tool` role branch.
 - Replies come as `<tool_call>{"name": …, "arguments": …}</tool_call>`, the
@@ -4638,3 +4645,68 @@ printed max difference does, read against the F16 figures in
 `docs/plan/02-ernie4-5.md`. Making it a check needs per-file floors (an F16 dump
 can be held to about 0.01, a Q4_K_M one cannot: llama.cpp's own CPU and Vulkan
 differ by 1.2 on ERNIE 4.5 0.3B Q4_K_M).
+
+### B170 — Jinja behaviour that differs from Python and is not text conversion (2026-11-13)
+
+**Tag:** chat · correctness
+
+Found by the Python oracle table (B158, `crates/infr-chat/tests/jinja2_text.rs`,
+the last group of `KNOWN_GAPS`) and the llama.cpp template corpus; each was
+rendered through Python Jinja2 3.1.6 and infr. `{% break %}` / `{% continue %}`
+(minijinja's `loop_controls` feature) and `is iterable` / `is sequence` were
+fixed; these were not, and none is reached by a cached template:
+
+- **Unary minus binds tighter than attribute access**: minijinja parses `-v.i`
+  as `(-v).i` and refuses it; Python gives `-(v.i)`. `-(v.i)` works.
+- **`2 ** -1` is refused** (Python `0.5`); **`1 / 0` prints `inf`** (Python
+  raises); **`1 < nan` is true** (Python false; `nan < 1` and `nan == nan` are
+  false in both).
+- **`'abc' | float` and `'abc' | int` are refused** (Jinja2 returns the default,
+  `0.0` / `0`).
+- **`round` rounds half away from zero** (`2.5 | round` is `3.0`; Python's
+  `round` gives `2.0`) and takes no `method` argument (`round(0, 'floor')` is
+  refused). `replace` takes no `count` argument.
+- **`center`, `wordcount` and `striptags` do not exist** (minijinja-contrib has
+  `wordcount`, `striptags`, `truncate` and `wordwrap`, but `build_env` does not
+  add them); `true | indent(2)` renders `True` where Python raises.
+- **Iterating none is an empty loop** in minijinja; Python raises. Cohere
+  command-r-plus and Hermes 2 Pro / 3 tool-use iterate `tools` and so render in
+  infr for a conversation without tools, where Hugging Face refuses.
+
+### B171 — minijinja 3.x is out; infr is on 2.24 (2026-11-13)
+
+**Tag:** deps
+
+`Cargo.lock` holds `minijinja` and `minijinja-contrib` 2.24.0, the newest 2.x;
+3.1.0 is published. A new major version is its own change: `build_env`
+(`crates/infr-chat/src/template.rs`) wraps several of minijinja's filters by
+their signatures (`indent`, `format`, `batch`, `slice`, the string filters), and
+the Python text rules lean on `Value::is_kwargs`, `Kwargs::args` / `peek`, the
+formatter hook (`pystr.rs`, `pyformat.rs`) and on wrapping a `DynObject` to
+replace only its `render` (`pyvalue.rs`). Check whether 3.x gives `~` a hook or
+tuples a type before porting: either would close a B158 gap. Not read.
+
+### B172 — templates with `{% generation %}` are refused (2026-11-13)
+
+**Tag:** chat · compatibility · **Needs:** a decision
+
+Hugging Face's environment registers a `generation` tag (`AssistantTracker` in
+`transformers/utils/chat_template_utils.py`): it marks the assistant's tokens
+for training masks and otherwise renders its body unchanged. minijinja has no
+custom tags, so infr refuses any template that uses it ("unknown statement
+generation"). In llama.cpp's `models/templates` that is IFM-K2-Horizon,
+LFM2.5-8B-A1B, LFM3 and the three poolside Laguna templates, refused for every
+conversation (90 of the corpus's 1332 renders, B158). The oracle
+(`jinja2_text.py`) carries the tag as transformers does with no tracker active.
+
+The body runs in a scope of its own, as a `{% with %}` block's does:
+`{% set x = 1 %}{% generation %}{% set x = 2 %}in={{ x }}{% endgeneration %} out={{ x }}`
+renders `in=2 out=1` in Python (a fixture row, pinned in `KNOWN_GAPS`). LFM2.5,
+LFM3 and Laguna all `set` variables inside their generation blocks, so the
+semantics matter. A source rewrite before compiling would have to map
+`generation` / `endgeneration` to `{% with %}` / `{% endwith %}` with the same
+whitespace markers (an `{% if true %}` rewrite leaks the `set`: `out=2`), skip
+`{% raw %}` blocks and string literals, and be checked by rendering each
+rewritten template against the oracle for the corpus conversations, not just by
+the row above. The other route is a minijinja hook (none in 2.24; 3.x not read,
+B171). Not started.

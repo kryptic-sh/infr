@@ -54,7 +54,10 @@ serde = { version = "1", features = ["derive"] }
 # preserve_order: chat templates `tojson` the request's tool definitions into the prompt — HF
 # transformers and llama.cpp-minja both keep the author's key order, so infr must too (BTreeMap
 # would alphabetize the JSON the model sees).
-serde_json = { version = "1", features = ["preserve_order"] }
+# float_roundtrip: a float in a request (a replayed tool call's argument) reaches the chat template
+# as the exact value the client sent; the default parser can land one ulp off, and the prompt then
+# prints different digits (`1e-25` came out `9.999999999999999e-26`).
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 # The config-file layer (`infr_core::config::file`). Parsed as a `toml::Value` tree rather than a
 # serde-derived struct, because an unknown key must WARN and be skipped (docs/config-plan.md §11
 # [DECIDE-5]) and `deny_unknown_fields` can only fail.
@@ -84,7 +87,9 @@ clap_mangen = "0.3"
 # fuel: the chat template is attacker-supplied (it ships inside the DOWNLOADED model's GGUF), so
 # `infr_chat::template` bounds every render with `Environment::set_fuel` — without this feature the
 # setter does not exist and a template with a nested loop renders forever. See CHAT_TEMPLATE_FUEL.
-minijinja = { version = "2", features = ["preserve_order", "fuel"] }
+# loop_controls: `{% break %}` / `{% continue %}`, which Hugging Face's chat-template environment
+# loads (`jinja2.ext.loopcontrols`) and real templates use (Kimi-K3, Cohere's command-r7b).
+minijinja = { version = "2", features = ["preserve_order", "fuel", "loop_controls"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 # `strftime_now` in HF chat templates (Llama-3.x stamps "Today Date:") — llama.cpp-minja parity.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

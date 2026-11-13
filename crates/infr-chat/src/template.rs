@@ -114,12 +114,30 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
     // HF chat templates lean on Python str/dict/list methods (`.get`, `.items`, `.strip`, …) that
     // minijinja core doesn't implement — pycompat supplies them (e.g. gemma4's tool-calling template).
     // `str.format` pads to a width the template wrote, so it is bounded like the filters below.
+    // An argument that only meets `str()` fields is converted as Python's `str()` writes it.
     env.set_unknown_method_callback(|state, value, method, args| {
         if let ("format", Some(fmt)) = (method, value.as_str()) {
             check_format("str.format", fmt)?;
+            let args = crate::pyformat::str_format_args(fmt, args)?;
+            return minijinja_contrib::pycompat::unknown_method_callback(
+                state, value, method, &args,
+            );
         }
         minijinja_contrib::pycompat::unknown_method_callback(state, value, method, args)
     });
+    // Every way a template turns a non-string into text writes it as Python's Jinja2 does
+    // (`True`, `None`, `1e-07`, `{'a': [1, 'x']}`): see `crate::pystr`.
+    env.set_formatter(crate::pystr::formatter);
+    env.add_filter("string", crate::pystr::string_filter);
+    env.add_filter("join", crate::pystr::join_filter);
+    env.add_filter("upper", crate::pystr::upper_filter);
+    env.add_filter("lower", crate::pystr::lower_filter);
+    env.add_filter("capitalize", crate::pystr::capitalize_filter);
+    env.add_filter("title", crate::pystr::title_filter);
+    env.add_filter("trim", crate::pystr::trim_filter);
+    env.add_filter("replace", crate::pystr::replace_filter);
+    env.add_test("iterable", is_iterable);
+    env.add_test("sequence", is_sequence);
     env.add_function(
         "raise_exception",
         |msg: String| -> std::result::Result<String, minijinja::Error> {
@@ -152,15 +170,16 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
     // in place of minijinja's compact, HTML-escaping one. The reference also has it as a function.
     env.add_filter("tojson", crate::tojson::tojson_filter);
     env.add_function("tojson", crate::tojson::tojson_function);
-    // minijinja's own `indent` and printf-style `format` filters, behind the same width bound.
+    // minijinja's own `indent` and printf-style `format` filters, behind the same width bound;
+    // `format` takes each `%s` argument as Python's `str()` writes it, like `str.format`.
     env.add_filter(
         "indent",
-        |value: String,
+        |value: minijinja::value::StringInput<'_>,
          width: Option<usize>,
          first: Option<bool>,
          blank: Option<bool>,
          kwargs: minijinja::value::Kwargs|
-         -> Result<String, minijinja::Error> {
+         -> Result<minijinja::Value, minijinja::Error> {
             let asked = match width {
                 Some(w) => Some(w),
                 None => kwargs.get::<Option<usize>>("width")?,
@@ -171,11 +190,16 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
     );
     env.add_filter(
         "format",
-        |fmt: String,
+        |state: &minijinja::State,
+         fmt: &minijinja::Value,
          args: minijinja::value::Rest<minijinja::Value>|
-         -> Result<String, minijinja::Error> {
-            check_format("format", &fmt)?;
-            minijinja::filters::format(&fmt, args)
+         -> Result<minijinja::Value, minijinja::Error> {
+            // Jinja2 formats `str(value)`, whatever the value is.
+            let fmt = crate::pystr::string_filter(fmt)?;
+            let text = fmt.as_str().unwrap_or_default();
+            check_format("format", text)?;
+            let args = minijinja::value::Rest(crate::pyformat::printf_args(text, &args)?);
+            minijinja::filters::format(state, &fmt, args)
         },
     );
     // `|batch(n)` / `|slice(n)`: `Vec::with_capacity(n)` before an item is looked at.
@@ -203,6 +227,30 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
     );
     env.add_template_owned("chat", template.to_owned())?;
     Ok(env)
+}
+
+/// Jinja2's `iterable` test (`iter(value)` succeeds): false for none, a bool and a number,
+/// which minijinja's own test calls iterable. Nemotron 3 Nano and Qwen3-Coder ask
+/// `tools is iterable and tools | length > 0`, which minijinja's answer turned into an error on
+/// every conversation without tools.
+fn is_iterable(value: &minijinja::Value) -> bool {
+    use minijinja::value::ValueKind as K;
+    matches!(
+        value.kind(),
+        K::Undefined | K::String | K::Bytes | K::Seq | K::Map | K::Iterable
+    )
+}
+
+/// Jinja2's `sequence` test (`len(value)` and `value.__getitem__` both exist): true for a string,
+/// a dict and an undefined value as well as a list; false for a lazy iterable (`reverse`, `map`),
+/// as for Python's iterators. minijinja's slice of a list is lazy too, where Python's is a list:
+/// a gap pinned in `tests/jinja2_text.rs`.
+fn is_sequence(value: &minijinja::Value) -> bool {
+    use minijinja::value::ValueKind as K;
+    matches!(
+        value.kind(),
+        K::Undefined | K::String | K::Bytes | K::Seq | K::Map
+    )
 }
 
 /// Refuse a template-chosen width above [`TEMPLATE_WIDTH_MAX`] before any helper allocates it.
@@ -474,14 +522,18 @@ pub fn render_template(
     let tmpl = env
         .get_template("chat")
         .expect("template was just added under this name");
-    let mut ctx = serde_json::Map::new();
-    ctx.insert("messages".into(), Value::Array(msgs));
-    ctx.insert("tools".into(), tools);
-    ctx.insert("add_generation_prompt".into(), add_generation_prompt.into());
-    ctx.insert("bos_token".into(), bos_token.into());
-    ctx.insert("eos_token".into(), eos_token.into());
-    ctx.insert("enable_thinking".into(), enable_thinking.into());
-    tmpl.render(serde_json::Value::Object(ctx))
+    // The request's lists and dicts print as Python's `repr` wherever minijinja prints them.
+    use crate::pyvalue::from_json;
+    use minijinja::Value as V;
+    let ctx = V::from_iter([
+        ("messages", from_json(&Value::Array(msgs))),
+        ("tools", from_json(&tools)),
+        ("add_generation_prompt", V::from(add_generation_prompt)),
+        ("bos_token", V::from(bos_token)),
+        ("eos_token", V::from(eos_token)),
+        ("enable_thinking", V::from(enable_thinking)),
+    ]);
+    tmpl.render(ctx)
 }
 
 /// Single user turn through [`render_chat_jinja`] (`add_generation_prompt=true`). Shared by the GPU
@@ -768,7 +820,7 @@ mod template_tests {
         cfg.sampling.no_think = true;
         assert!(!thinking_enabled(&cfg), "sampling.no_think = thinking OFF");
 
-        // …and the flag really reaches the template context.
+        // …and the flag really reaches the template context, printed as Python prints a bool.
         const PROBE: &str = "think={{ enable_thinking }}";
         let mut cfg = Config::default();
         let on = render_template(
@@ -792,7 +844,7 @@ mod template_tests {
             thinking_enabled(&cfg),
         )
         .unwrap();
-        assert_eq!(on, "think=true");
-        assert_eq!(off, "think=false");
+        assert_eq!(on, "think=True");
+        assert_eq!(off, "think=False");
     }
 }

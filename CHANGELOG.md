@@ -6,6 +6,66 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Chat templates turn non-strings into text as Python's Jinja2 does**, which
+  is what Hugging Face's `apply_chat_template` renders with and so what models
+  were trained on: `True`, `False`, `None`; floats as Python's `repr` (`1e-07`,
+  `1e+16`, `2.0`, `0.30000000000000004`); lists and dicts as Python's `repr`
+  (`{'a': [1, 'x', True]}`). This covers bare `{{ }}`, `| string`, `| join`,
+  `upper` / `lower` / `capitalize` / `title` / `trim` / `replace`, `%s` and
+  spec-less `{}` fields of `| format` and `str.format`, and `~` on a list or
+  dict from the request. They used to print `true`, `none`, `0.0000001` and
+  JSON-style containers. Prompts that change where a template prints such a
+  value: Qwen3.5, StepFun 3.5, ByteDance Seed-OSS, MiniCPM5 and MiniMax-M3 in a
+  replayed tool call's arguments (a bool, null or exponent-range float now reads
+  `True`, `None`, `1e-07`); Apriel 1.5 and 1.6 in their tool block
+  (`tool | string`); Gemma 4 for a parameter typed `["string", "null"]`
+  (`['STRING', 'NULL']`); functionary v3.2 for a bool default (`False`) and
+  GigaChat3 for a list default. Plain chat renders as before for every cached
+  template. `~` on a float still writes Rust's digits (`0.000001`,
+  `10000000000000000.0`), which GigaChat3 and functionary v3.2 print for a float
+  default or bound.
+- **`tojson` and every other float print break ties as Python does.** When two
+  shortest digit strings are equally close, Python's `repr` and `json.dumps`
+  keep the even one (`1125899906842624.25` prints `1125899906842624.2`); infr
+  printed the odd one (`…4.3`). Other floats print as before.
+- **`minijinja` and `minijinja-contrib` move to 2.24.0**, which also changes how
+  templates run: `{% set %}` inside a `for` loop no longer leaks into the next
+  iteration; `.items()`, `.get()` and `.keys()` on a mapping with a key of the
+  same name call the method (2.21 refused "object is not callable" on any tool
+  schema with an `items` key, which is every array parameter, wherever a
+  template iterated it with `.items()`); a keyword argument takes an inline `if`
+  (`tojson(indent=2 if x else none)`); a string repeated past 100,000,000 bytes
+  is refused. GigaChat3 and 3.1 (`.items()` on a tool's parameters) and
+  muse-glimmer and muse-spark (the inline `if`) were refused for every
+  conversation with tools, and every conversation, respectively, and now render.
+
+### Fixed
+
+- **`{% break %}` and `{% continue %}` work in chat templates** (minijinja's
+  `loop_controls` feature; Hugging Face loads `jinja2.ext.loopcontrols`).
+  Cohere2MoE, Cohere's command-r7b tool-use template, Kimi-K3 and Reka-Edge were
+  refused for every conversation.
+- **`is iterable` and `is sequence` answer as Jinja2 does**: none is not
+  iterable, and a string, a dict and an undefined value are sequences. Nemotron
+  3 Nano and Qwen3-Coder ask `tools is iterable and tools | length > 0` and were
+  refused for every conversation without tools.
+- **`trim`, `title` and `capitalize` follow Python's string methods**: `trim`
+  strips what `str.strip()` strips (U+001C–U+001F too), and a final `Σ` is
+  lower-cased to `ς` (`'ΟΔΟΣ' | title` is `Οδος`). `is sequence` is false for
+  `reverse`'s result, as for Python's iterators. `'%s' | format(a=0)` formats
+  the whole mapping (`{'a': 0}`), and positional and keyword arguments together
+  are refused, as Jinja2 refuses them.
+- **A float in a request reaches the chat template exactly.** serde_json now
+  parses with `float_roundtrip`; a replayed tool-call argument such as `1e-25`
+  had been read one ulp off and printed back as `9.999999999999999e-26`.
+- **`str.format` fields that look up an attribute or an index**
+  (`'{a.b}'.format(a=…)`) get their argument unconverted, and a non-empty spec
+  on none, a list or a dict is refused as Python refuses it. `| format` with
+  more or fewer positional arguments than conversions is refused, and `%.3s`
+  cuts Python's `str()` of a bool or a container.
+
 ## [0.3.0] - 2026-11-13
 
 ### Breaking

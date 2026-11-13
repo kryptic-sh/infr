@@ -4929,7 +4929,6 @@ impl<'a> Recorder<'a> {
     /// Cached attention: q `[q_len,nh,hd]` (abs positions `pos_offset..`) over the K/V cache
     /// `[kv_len,nkv,hd]`.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn attention_kv(
         &self,
         q: &dyn Buffer,
@@ -7214,7 +7213,6 @@ impl<'a> Recorder<'a> {
 
     /// QK-norm + RoPE, pos from `params`. `out_base_mul` = 0 for Q (write to a temp), 1 for K (write
     /// to the cache at row pos).
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn qk_norm_rope_dyn(
         &self,

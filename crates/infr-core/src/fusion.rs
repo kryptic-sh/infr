@@ -187,8 +187,8 @@ fn plan_kv_write(graph: &Graph, plan: &mut FusionPlan) {
 /// cache leaves the rope's `dst` scratch unwritten — safe only if nothing reads it. Sharing this
 /// function keeps that check the same one every other pattern uses.
 pub fn dst_only_read_by_next(graph: &Graph, start: usize, dst: TensorId) -> bool {
-    for j in start..graph.ops.len() {
-        let (ins, outs) = graph.ops[j].io();
+    for op in graph.ops.iter().skip(start) {
+        let (ins, outs) = op.io();
         if ins.contains(&dst) {
             return false;
         }

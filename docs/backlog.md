@@ -3926,6 +3926,20 @@ reading `mtp/`:
 - CPU kernels not compared with a reference: `turbo.rs` (llama.cpp's checkout
   has no counterpart).
 
+### B153 — cargo 1.100's unused-dependency warnings (2026-11-13)
+
+Rust 1.100 (local on the Windows box on 2026-11-13; CI was still on 1.99.1 the
+day before) turned on `cargo::unused_dependencies`, and its clippy found
+`needless_range_loop` and `duplicate_attributes` sites, fixed the same day. The
+two manifest warnings are left, since neither fails `-D warnings`:
+
+- `tower-http` in `infr-server`: nothing under `crates/` names `tower_http`.
+  Removing it is the fix.
+- `infr-metal` in `infr-llama`: used only from macOS code, so it is unused on
+  Windows and Linux. A `[target.'cfg(target_os = "macos")'.dependencies]` entry
+  would say so, if the code that names it is gated the same way everywhere (not
+  checked).
+
 ### Review coverage as of 2026-11-12
 
 Eight further read-only passes on 2026-11-12 went through what the earlier

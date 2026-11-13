@@ -366,7 +366,7 @@ impl ExpertParallelBackend {
             }
             // One compiled plan per rank: clone the segment, set the rank's ep_band on its MoeFfn.
             let mut plans = Vec::with_capacity(w);
-            for r in 0..w {
+            for (r, rank) in self.ranks.iter().enumerate() {
                 let mut sub = lowered.clone();
                 sub.ops = lowered.ops[lo..hi].to_vec();
                 for op in &mut sub.ops {
@@ -382,7 +382,7 @@ impl ExpertParallelBackend {
                     .filter(|t| written.contains(t))
                     .collect();
                 sub.no_decode_replay = true;
-                plans.push(self.ranks[r].compile(&sub)?);
+                plans.push(rank.compile(&sub)?);
             }
             segments.push(Segment {
                 plans,
@@ -400,8 +400,8 @@ impl ExpertParallelBackend {
             let bytes = lowered.desc(tid).numel()
                 * crate::tp_allreduce::dtype_bytes(lowered.desc(tid).dtype);
             let mut bufs = Vec::with_capacity(w);
-            for r in 0..w {
-                bufs.push(self.ranks[r].alloc(bytes, BufferUsage::Activations)?);
+            for rank in &self.ranks {
+                bufs.push(rank.alloc(bytes, BufferUsage::Activations)?);
             }
             boundary_bufs.insert(tid, bufs);
         }

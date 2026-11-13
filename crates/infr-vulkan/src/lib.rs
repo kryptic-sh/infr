@@ -2517,13 +2517,10 @@ impl VulkanBackend {
         if caps.unified_memory {
             let mp = unsafe { instance.get_physical_device_memory_properties(physical_device) };
             let (mut all, mut dev_local) = (0u64, 0u64);
-            for i in 0..mp.memory_heap_count as usize {
-                all += mp.memory_heaps[i].size;
-                if mp.memory_heaps[i]
-                    .flags
-                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-                {
-                    dev_local += mp.memory_heaps[i].size;
+            for heap in &mp.memory_heaps[..mp.memory_heap_count as usize] {
+                all += heap.size;
+                if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                    dev_local += heap.size;
                 }
             }
             tracing::info!(

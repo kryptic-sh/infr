@@ -340,11 +340,11 @@ impl TensorParallelBackend {
         let mut cuts: Vec<usize> = Vec::new();
 
         let wu = w as u32;
-        for i in 0..n_ops {
+        for (i, op) in lowered.ops.iter_mut().enumerate() {
             // Read the branch operands + their input shard states up front (immutable), then take a
-            // fresh `&mut lowered.ops[i]` for the dim rewrite, then record the output state. Keeping
+            // fresh `&mut *op` for the dim rewrite, then record the output state. Keeping
             // the reads/writes disjoint avoids aliasing `state` while mutating it.
-            match lowered.ops[i].clone() {
+            match op.clone() {
                 Op::Linear { x, weight, dst, .. } => {
                     let sx = shard_of(&state, x);
                     let role = match bindings.get(weight) {
@@ -358,7 +358,7 @@ impl TensorParallelBackend {
                                 i,
                                 "column-parallel Linear needs a replicated input",
                             )?;
-                            if let Op::Linear { out_f, w_off, .. } = &mut lowered.ops[i] {
+                            if let Op::Linear { out_f, w_off, .. } = &mut *op {
                                 require(
                                     *w_off == 0,
                                     i,
@@ -374,7 +374,7 @@ impl TensorParallelBackend {
                                 i,
                                 "row-parallel Linear needs a sharded input",
                             )?;
-                            if let Op::Linear { in_f, .. } = &mut lowered.ops[i] {
+                            if let Op::Linear { in_f, .. } = &mut *op {
                                 *in_f = shard_dim(*in_f, wu, i, "row-parallel in_f")?;
                             }
                             state.insert(dst, Shard::Rep); // Rep AFTER the all-reduce recorded below
@@ -405,13 +405,13 @@ impl TensorParallelBackend {
                 | Op::GatedRmsNorm { x, dst, .. } => {
                     let sx = shard_of(&state, x);
                     if sx == Shard::Sharded {
-                        shard_n_head(&mut lowered.ops[i], wu, i)?;
+                        shard_n_head(&mut *op, wu, i)?;
                     }
                     state.insert(dst, sx);
                 }
                 Op::WriteKv { src, cache, .. } => {
                     if shard_of(&state, src) == Shard::Sharded {
-                        if let Op::WriteKv { row_stride, .. } = &mut lowered.ops[i] {
+                        if let Op::WriteKv { row_stride, .. } = &mut *op {
                             *row_stride = shard_dim(*row_stride, wu, i, "WriteKv row_stride")?;
                         }
                     }
@@ -421,7 +421,7 @@ impl TensorParallelBackend {
                 Op::Attention { q, dst, .. } => {
                     let sq = shard_of(&state, q);
                     if sq == Shard::Sharded {
-                        if let Op::Attention { n_head, n_kv, .. } = &mut lowered.ops[i] {
+                        if let Op::Attention { n_head, n_kv, .. } = &mut *op {
                             *n_head = shard_dim(*n_head, wu, i, "Attention n_head")?;
                             *n_kv = shard_dim(*n_kv, wu, i, "Attention n_kv")?;
                         }
@@ -431,7 +431,7 @@ impl TensorParallelBackend {
                 Op::GatedAct { gate, dst, .. } => {
                     let sg = shard_of(&state, gate);
                     if sg == Shard::Sharded {
-                        if let Op::GatedAct { nff, .. } = &mut lowered.ops[i] {
+                        if let Op::GatedAct { nff, .. } = &mut *op {
                             *nff = shard_dim(*nff, wu, i, "GatedAct nff")?;
                         }
                     }
@@ -440,7 +440,7 @@ impl TensorParallelBackend {
                 Op::GatedActFused { gu, dst, .. } => {
                     let sg = shard_of(&state, gu);
                     if sg == Shard::Sharded {
-                        if let Op::GatedActFused { nff, .. } = &mut lowered.ops[i] {
+                        if let Op::GatedActFused { nff, .. } = &mut *op {
                             *nff = shard_dim(*nff, wu, i, "GatedActFused nff")?;
                         }
                     }
@@ -564,8 +564,8 @@ impl TensorParallelBackend {
                 .collect();
             sub.no_decode_replay = true;
             let mut plans = Vec::with_capacity(w);
-            for r in 0..w {
-                plans.push(self.ranks[r].compile(&sub)?);
+            for rank in &self.ranks {
+                plans.push(rank.compile(&sub)?);
             }
             // Tensors this segment must have bound.
             let mut needed: HashSet<TensorId> = HashSet::new();
@@ -606,8 +606,8 @@ impl TensorParallelBackend {
             let bytes = desc.numel() * crate::tp_allreduce::dtype_bytes(desc.dtype);
             sizes.push(bytes);
             let mut bufs = Vec::with_capacity(w);
-            for r in 0..w {
-                bufs.push(self.ranks[r].alloc(bytes, BufferUsage::Activations)?);
+            for rank in &self.ranks {
+                bufs.push(rank.alloc(bytes, BufferUsage::Activations)?);
             }
             boundary_bufs.insert(tid, bufs);
         }
@@ -717,8 +717,8 @@ impl Backend for TensorParallelBackend {
                 let w = self.world();
                 let per = self.shard_bytes(bytes)?;
                 let mut bufs = Vec::with_capacity(w);
-                for r in 0..w {
-                    bufs.push(self.ranks[r].alloc(per, usage)?);
+                for rank in &self.ranks {
+                    bufs.push(rank.alloc(per, usage)?);
                 }
                 Ok(Box::new(TpBuffer {
                     kind: TpKind::Kv,
@@ -737,8 +737,8 @@ impl Backend for TensorParallelBackend {
                 let w = self.world();
                 let per = self.shard_bytes(bytes)?;
                 let mut bufs = Vec::with_capacity(w);
-                for r in 0..w {
-                    bufs.push(self.ranks[r].alloc_uninit(per, usage)?);
+                for rank in &self.ranks {
+                    bufs.push(rank.alloc_uninit(per, usage)?);
                 }
                 Ok(Box::new(TpBuffer {
                     kind: TpKind::Kv,

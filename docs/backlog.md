@@ -2305,16 +2305,24 @@ a hot path
 - **No read-ahead hint at model load.** `infr-gguf`'s `WillNeed` advice is
   `cfg(unix)`; the Windows equivalent is `PrefetchVirtualMemory`. Not measured
   whether load time on Windows suffers for it.
-- **`gpu_seam_kv_mainline_quants_coherent` fails on the 7900 XTX under
-  Windows.** Its `K=f16 V=turbo2` case continues the raw (untemplated) prompt as
-  `" -  -  -  - …"` on the AMD proprietary driver; the same test passes on the
-  Ryzen iGPU on the same driver, and `infr run` with `INFR_KV_TYPE_V=turbo2`
-  answers coherently on both. So it reads as 2-bit V losing its precision margin
-  on a 0.6B model under that driver's arithmetic rather than a Windows defect —
-  unverified; the coopmat path the dGPU takes (the iGPU refuses coopmat) is the
-  first thing to rule in or out. The same test passes on Linux RADV on the 7900
-  XTX (run, 2026-11-12), which points further at the proprietary driver;
-  confirming it needs the Windows box.
+- **`gpu_seam_kv_mainline_quants_coherent` fails on the 7900 XTX under Windows,
+  and it is the test, not the device.** Its `K=f16 V=turbo2` case continues the
+  raw (untemplated) prompt as `" -  -  -  - …"` on the AMD proprietary driver
+  (reproduced 2026-11-13, also with `INFR_NO_COOPMAT=1` and with
+  `INFR_NO_F16=1`, so coopmat is ruled out); it passes on the Ryzen iGPU on the
+  same driver and on Linux RADV on the 7900 XTX. A throwaway diagnostic compared
+  `prefill_logits_vulkan` with `prefill_logits_cpu` per KV format on prefixes of
+  `kv_check_prompt` (40, 70 and 80 tokens): for `V=turbo2` the cosine was 0.957
+  / 0.992 / 0.978 on the 7900 XTX and 0.943 / 0.991 / 0.977 on the iGPU, against
+  0.998 to 0.999 for an f16 cache on both, and it rises with the bit width on
+  both (`turbo4`: 0.993 to 0.998). So the discrete GPU is no further from the
+  CPU than the integrated one; 2-bit V on a 0.6B model sits close enough to a
+  greedy tie that `!is_degenerate` lands either way. The fix is B141's: score
+  the Vulkan KV formats numerically, as `assert_kv_formats_track_the_f32_cache`
+  does for the CPU, instead of asserting on the text. Needs a decision on what
+  replaces the `turbo2` text assertion. The same diagnostic showed `K=turbo2`
+  with an f16 V at cosine 0.5 to 0.74 against the CPU on both GPUs, which is the
+  "K needs more precision than V" rule and not a supported configuration.
 - **Remaining iGPU benchmark exclusions.** `decode_gemv_bw` still needs
   device-selection preservation, scaled cache-busting allocations, bounded
   repetition submissions and asserted parity. `bandwidth_probe` needs a separate
@@ -3963,22 +3971,78 @@ Windows 11 dev box (Ryzen 9 9950X3D, AMD proprietary driver) with
   `qwen35_trunk_unaffected`, `unified_qwen35_gpu_seam_matches_cpu` and
   `unified_qwen35_session_no_rewind`.
 
-Not run, stated as a gap:
+Notes and gaps:
 
-- **Anything on the 7900 XTX.** The discrete GPU on that box is kept free for
-  other work, so B75's `gpu_seam_kv_mainline_quants_coherent` failure under the
-  proprietary driver is still unconfirmed, and no coopmat kernel ran on Windows.
-  Three `infr-vulkan` library tests open every enumerated device (`multi.rs`,
+- **The 7900 XTX was run afterwards, the same day** (`INFR_DEV=Vulkan0`): the
+  same `infr-vulkan` selection passed (293 tests by the runners' own totals),
+  and so did the `infr-llama` selection apart from
+  `gpu_seam_kv_mainline_quants_coherent`, which is B75's known failure. The
+  multi-GPU tests (`expert_parallel_*`, `tensor_parallel_*`,
+  `pipeline_matches_single_device`, `two_models_two_devices_concurrent`) were
+  included there and reported ok; whether each executed or returned early was
+  not checked. The benches and probes were not run on it, and the parked `mtp_*`
+  tests were not run on either GPU.
+- Three `infr-vulkan` library tests open every enumerated device (`multi.rs`,
   `pipeline.rs` and `adapter.rs` call `VulkanBackend::new_on` per index), so a
   library-test run touches the discrete GPU whatever `INFR_DEV` says.
-- **The multi-GPU tests** (`expert_parallel_*`, `tensor_parallel_*`,
-  `pipeline_matches_single_device`, `two_models_two_devices_concurrent`) and the
-  parked `mtp_*` tests.
 - **Every model-gated test whose model is not cached.** They print `skip:` and
   count as passed under `--include-ignored`. That includes
   `gpu_seam_matches_cpu_llama`: it wants the Q8_0 file and the box has
   Llama-3.2-1B in Q4_K_M only.
 - No performance figure was taken; other work was running on the machine.
+
+### B155 — Vulkan streamed prefill and the default decode GEMV, 2026-11-13 read (2026-11-13)
+
+A read-only pass over the Vulkan code the coverage list had as unread
+(`streamed_prefill_gemm`, `native_sg_choice`, `native_rm_choice`, the
+`native_gemm_fma.comp` body, the mmq shader headers). Nothing was built or run
+by it. The first two findings were re-read at their sites afterwards; the rest
+is the reviewer's account.
+
+- **Performance, confirmed by re-reading: a streamed dense prefill never takes a
+  tiled GEMM on a device without f16 coopmat.** `streamed_gemm_applies` requires
+  `caps.f16_coopmat()`, and the streamed (`wsub`) branch of the `Op::Linear` arm
+  in `lower_op` returns before the non-coopmat tier the resident path uses, so
+  every streamed `Linear` with more than 16 rows goes to
+  `Recorder::linear_native_at`, which re-reads the whole weight once per row.
+  That covers Intel Arc and the integrated GPUs streaming exists for. The loss
+  was not measured, and no streamed model has been run on an iGPU. The reviewer
+  reports arena-addressed kernels already exist for the fix
+  (`Recorder::matmul_mmq_at`, `matmul_fma_at`), not re-checked.
+- **Correctness, conditional, confirmed by re-reading:
+  `native_gemv_rm_v2.comp`'s `VARIANT_REG` sizes `reg_part` for subgroups of at
+  least 16** (`THREADS / 16u` slots, written by `gl_SubgroupID`), and
+  `Recorder::linear_native_rm_v2_at` builds it with `VulkanBackend::kernel`,
+  which pins no subgroup size. `GemvCfg::variant` defaults to `"reg"`, so this
+  is the default single-row Q4_K decode GEMV. On a device whose default subgroup
+  size is below 16 the write is out of bounds. No such device is known to pass
+  backend init (which demands a pinnable 32), so this is a latent assumption,
+  and the kernel also ignores `caps.sg_pref`. Building it with
+  `kernel_sg(..., self.sgp())` changes the subgroup size the default decode
+  kernel runs at on AMD, so it needs a decode measurement first.
+- **Performance, narrow, reviewer's account:** `streamed_gemm_applies` excludes
+  streamed Q4_K weights whose `out_f` is a multiple of 64 and not of 128 because
+  the mmq shader "is not arena-converted"; the reviewer reports that
+  `native_gemm_mmq_dense_spv(Q4K)` now returns a streamed build reachable
+  through `matmul_mmq_at`, which would make the exclusion stale.
+- **Suspected, not established:** `native_rm_choice`'s doc says large GEMVs stay
+  on RM=1, while `rm_maxout` defaults to `usize::MAX`; the RM kernel is
+  described as bit-identical, so this is a performance question at most.
+  `native_gemm_mmq_nvfp4.comp`'s `ue4m3` uses `exp2()`, which GLSL does not
+  require to be exact.
+- **Tests that cover no production code** (reviewer's account):
+  `deltanet_shared_capacity_boundaries`, the `routing_rejects_*` tests and most
+  of `integrated_routing_and_bank_layout` in `tests/gemm_bench.rs`;
+  `selected_profile_invariants` and `required_timing_rejects_incomplete_samples`
+  in `tests/moe_id_gemv_real_dims.rs`. Nothing unit-tests the decisions of
+  `native_sg_choice` or `native_rm_choice`, and the recorder's ignored GPU tests
+  that need f16 coopmat print `skip:` and pass on a device without it.
+- Read with nothing found: `streamed_prefill_gemm`, `native_sg_choice`,
+  `native_rm_choice`, the `native_gemm_fma.comp` body, and the header blocks of
+  the mmq shaders (not diffed against a llama.cpp checkout). Not reached:
+  `matmul_native_off`, `matmul_native_splitk`, `matmul_native_f16a`,
+  `matmul_native_f32a`, `dispatch_gemv_chunked`, and the ignored GPU test bodies
+  in `recorder.rs`.
 
 ### Review coverage as of 2026-11-12
 
@@ -4019,9 +4083,9 @@ Still not read by any pass, stated as a gap:
   tests; the `#[cfg(test)]` modules of `seam/runner.rs`, `seam/weights.rs` and
   `recorder.rs`; `infr-hub/src/testhttp.rs`; `infr-plat`'s Windows-job native
   tests; the infr-server tests beyond a grep.
-- **Vulkan:** the bodies of `streamed_prefill_gemm`, `native_sg_choice` and
-  `native_rm_choice`; the `native_gemm_fma` body beyond its weight readers; the
-  header blocks of several mmq variants.
+- **Vulkan:** `matmul_native_off`, `matmul_native_splitk`, `matmul_native_f16a`,
+  `matmul_native_f32a` and `dispatch_gemv_chunked` (what this list named before
+  was read on 2026-11-13; see B155).
 - **Metal:** the first f16 / f32 writers in `kv_cache.metal`, the `topk_mask`
   and lightning-indexer tail of `attention.metal`, the rest of
   `elementwise_norms.metal`, the DeltaNet recurrence in `deltanet.metal`.

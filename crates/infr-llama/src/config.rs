@@ -16,6 +16,18 @@ pub(crate) const LLAMA4_ATTN_CHUNK: usize = 8192;
 /// the metadata parse. See [`Config::no_rope_step`].
 pub(crate) const SMOLLM3_NO_ROPE_STEP: usize = 4;
 
+/// The YaRN ramp corners deepseek2 and deepseek32 run with: the `llama_hparams::yarn_beta_fast` /
+/// `yarn_beta_slow` initializers (`llama.cpp/src/llama-hparams.h`), which those archs' loaders
+/// never overwrite from `rope.scaling.yarn_beta_fast` / `_slow`.
+const YARN_BETA_FAST: f32 = 32.0;
+const YARN_BETA_SLOW: f32 = 1.0;
+
+/// GLM 4.7 Lite's shape, which `llama_model_deepseek2::load_arch_hparams`
+/// (`llama.cpp/src/models/deepseek2.cpp`) gives SIGMOID routing when the file has no
+/// `expert_gating_func`: either trunk depth, and this vocabulary size.
+const GLM47_LITE_N_LAYER: [usize; 2] = [47, 48];
+const GLM47_LITE_N_VOCAB: u64 = 154_880;
+
 /// `Default` is an ALL-ZERO placeholder, not a runnable model: [`Config::from_gguf`] is the only
 /// source of a real one. It exists so a test can name the two or three fields the arithmetic it is
 /// checking actually reads (`Config { n_layer: 48, n_kv: 8, ..Default::default() }`) instead of
@@ -357,13 +369,13 @@ pub struct Config {
     /// recovers `attn_factor_org` from it, so it lands inside the squared mscale of the MLA score
     /// scale. `1.0` (llama.cpp's default) when the GGUF omits it.
     pub rope_attn_factor: f32,
-    /// DeepSeek V2+ YaRN: `rope.scaling.yarn_beta_fast` — the ramp's high-frequency corner, the
-    /// `beta_fast` of `ggml_rope_yarn_corr_dims`'s START dim. Defaults to llama.cpp's
-    /// `llama_hparams::yarn_beta_fast`.
+    /// DeepSeek V2+ YaRN: the ramp's high-frequency corner, the `beta_fast` of
+    /// `ggml_rope_yarn_corr_dims`'s START dim. Always `YARN_BETA_FAST`: the reference's
+    /// deepseek2 loader does not read `rope.scaling.yarn_beta_fast`.
     pub rope_yarn_beta_fast: f32,
-    /// DeepSeek V2+ YaRN: `rope.scaling.yarn_beta_slow` — the ramp's low-frequency corner, the
-    /// `beta_slow` of `ggml_rope_yarn_corr_dims`'s END dim. Defaults to llama.cpp's
-    /// `llama_hparams::yarn_beta_slow`.
+    /// DeepSeek V2+ YaRN: the ramp's low-frequency corner, the `beta_slow` of
+    /// `ggml_rope_yarn_corr_dims`'s END dim. Always `YARN_BETA_SLOW`: the reference's deepseek2
+    /// loader does not read `rope.scaling.yarn_beta_slow`.
     pub rope_yarn_beta_slow: f32,
     /// DeepSeek V2+ "lite" variant: `wq` present ⇒ lite (no wq_a/q_a_norm/wq_b). Detected by
     /// tensor presence, not GGUF key.
@@ -726,13 +738,21 @@ impl Config {
             };
         let (expert_gating_func, expert_weights_norm, rope_yarn_log_mul) = if deepseek2 || deepseek4
         {
-            // deepseek2 tolerates the key's absence (llama.cpp documents 0 as "softmax", the
-            // pre-`expert_gating_func` V2/V2.5 files); `deepseek32.cpp` and `deepseek4.cpp` read it
-            // with no such fallback, and neither arch's real value is softmax — defaulting it would
-            // silently re-route.
+            // deepseek2 tolerates the key's absence (0), which the MoE mapping below fills in by
+            // `deepseek2.cpp`'s rule for files written before the key existed. `deepseek32.cpp`
+            // and `deepseek4.cpp` read it with no such fallback, and neither arch's real value is
+            // softmax — defaulting it would silently re-route.
             let gf = if deepseek32 || deepseek4 {
                 let key = mk("expert_gating_func");
-                meta_u64(g, &key).with_context(|| format!("{key} missing"))? as u8
+                let gf = meta_u64(g, &key).with_context(|| format!("{key} missing"))? as u8;
+                // An explicit 0 is "no gating function": the reference keeps it, and
+                // `build_moe_ffn` (`llama-graph.cpp`) aborts on it at the first MoE layer, so
+                // llama.cpp cannot run the file. (deepseek4 refuses every value but
+                // sqrt-softplus further down.)
+                if deepseek32 && gf == 0 {
+                    bail!("{key} = 0 names no gating function (llama.cpp aborts on it)");
+                }
+                gf
             } else {
                 meta_u64(g, &mk("expert_gating_func")).unwrap_or(0) as u8
             };
@@ -763,9 +783,12 @@ impl Config {
         // ramp), `rope.scaling.factor` (the interpolate factor; llama.cpp defaults it to 1.0 when
         // the GGUF omits it), and `rope.scaling.original_context_length` (the corr_dim ramp's
         // `n_ctx_orig`; falls back to `context_length` like llama.cpp's `n_ctx_orig_yarn`).
-        // `rope.scaling.attn_factor` and the two `yarn_beta_*` ramp corners come along here: all
-        // three feed the same YaRN arithmetic (`seam::runner`'s `yarn_ff` ramp and `mla_scale`),
-        // and their defaults are llama.cpp's `llama_hparams` initializers.
+        // `rope.scaling.attn_factor` and the two ramp corners come along here: all three feed the
+        // same YaRN arithmetic (`seam::runner`'s `yarn_ff` ramp and `mla_scale`), and their
+        // defaults are llama.cpp's `llama_hparams` initializers. The corners are never read from
+        // the file: `deepseek2.cpp` and `deepseek32.cpp` do not read `rope.scaling.yarn_beta_fast`
+        // / `_slow` (only grok, k2-horizon, laguna and mistral3 do), so the reference ramps every
+        // deepseek2 file between its defaults whatever it declares.
         let (
             rope_scaling_yarn,
             rope_scaling_factor,
@@ -784,11 +807,16 @@ impl Config {
                 .or_else(|| meta_u64(g, &mk("context_length")))
                 .unwrap_or(8192) as usize;
             let attn_factor = meta_f64(g, &mk("rope.scaling.attn_factor")).unwrap_or(1.0) as f32;
-            let beta_fast = meta_f64(g, &mk("rope.scaling.yarn_beta_fast")).unwrap_or(32.0) as f32;
-            let beta_slow = meta_f64(g, &mk("rope.scaling.yarn_beta_slow")).unwrap_or(1.0) as f32;
-            (yarn, factor, orig_ctx, attn_factor, beta_fast, beta_slow)
+            (
+                yarn,
+                factor,
+                orig_ctx,
+                attn_factor,
+                YARN_BETA_FAST,
+                YARN_BETA_SLOW,
+            )
         } else {
-            (false, 1.0, 0, 1.0, 32.0, 1.0)
+            (false, 1.0, 0, 1.0, YARN_BETA_FAST, YARN_BETA_SLOW)
         };
         // KNOWN DIVERGENCE, left for the owner to decide: on `deepseek32` a multiplier the two
         // rules disagree on makes llama.cpp's attention factor differ from the `deepseek2` value
@@ -1190,10 +1218,26 @@ impl Config {
                     routed_weights_scale(),
                 )
             } else if deepseek2 || deepseek4 {
+                // For the GLM 4.7 Lite test below, `deepseek2.cpp::load_arch_hparams` sizes the
+                // vocabulary from `{arch}.vocab_size`, else the token list (not the embedding rows
+                // `vocab` is read from).
+                let glm47_lite = || {
+                    let n_vocab = meta_u64(g, &mk("vocab_size")).or_else(|| {
+                        g.metadata()
+                            .get("tokenizer.ggml.tokens")
+                            .and_then(MetaValue::as_arr)
+                            .map(|tokens| tokens.len() as u64)
+                    });
+                    GLM47_LITE_N_LAYER.contains(&n_layer) && n_vocab == Some(GLM47_LITE_N_VOCAB)
+                };
                 let gating = match expert_gating_func {
-                    // 0 = the key is absent, which llama.cpp documents as softmax for the old
-                    // V2/V2.5 GGUFs written before `expert_gating_func` existed
-                    // (`deepseek2.cpp::load_arch_hparams`).
+                    // 0 = the key is absent. `deepseek2.cpp::load_arch_hparams` fills it in for
+                    // the GGUFs written before `expert_gating_func` existed: sigmoid for GLM 4.7
+                    // Lite's shape, softmax (the old V2/V2.5 files) otherwise. `deepseek32` and
+                    // `deepseek4` require the key, so their 0 is never filled in this way.
+                    0 if deepseek2 && !deepseek32 && glm47_lite() => {
+                        infr_core::graph::MoeGating::Sigmoid
+                    }
                     0 | 1 => infr_core::graph::MoeGating::Softmax,
                     2 => infr_core::graph::MoeGating::Sigmoid,
                     4 => infr_core::graph::MoeGating::SqrtSoftplus,
@@ -2051,10 +2095,108 @@ mod tests {
         );
     }
 
-    /// B44: the YaRN knobs the loader used to drop. Absent keys must land on llama.cpp's own
-    /// `llama_hparams` defaults, present ones must be read.
+    /// `deepseek2.cpp::load_arch_hparams` fills an absent `expert_gating_func` with SIGMOID for
+    /// GLM 4.7 Lite's shape ([`GLM47_LITE_N_LAYER`] trunk layers and a [`GLM47_LITE_N_VOCAB`]
+    /// vocabulary, its size taken from `{arch}.vocab_size` or else the token list), with softmax
+    /// for every other shape; a key that is present is used as written.
     #[test]
-    fn deepseek2_yarn_knobs_are_read() {
+    fn deepseek2_absent_gating_follows_the_reference_rule() {
+        use infr_core::graph::MoeGating;
+        // `vocab` holds `{arch}.vocab_size` (a `U32`) and/or the token list (a `StrArr`).
+        let gating = |tag: &str, block_count: u32, vocab: &[Meta], func: Option<u32>| {
+            let mut keys = deepseek2_keys_with(&[("block_count", block_count)]);
+            if let Some(f) = func {
+                keys.push(("expert_gating_func", f));
+            }
+            let mut model = deepseek2_fixture(&keys);
+            for v in vocab {
+                let key = match v {
+                    Meta::U32(_) => "deepseek2.vocab_size",
+                    _ => "tokenizer.ggml.tokens",
+                };
+                model.meta.push((key.into(), v.clone()));
+            }
+            config_from_fixture(tag, &model)
+                .unwrap_or_else(|e| panic!("{tag}: {e:#}"))
+                .moe
+                .expect("deepseek2 fixture has experts")
+                .gating
+        };
+        let tokens = |n: usize| Meta::StrArr((0..n).map(|i| format!("t{i}")).collect());
+        let glm = [Meta::U32(154_880)];
+        assert_eq!(gating("ds2-glm47", 47, &glm, None), MoeGating::Sigmoid);
+        assert_eq!(gating("ds2-glm48", 48, &glm, None), MoeGating::Sigmoid);
+        assert_eq!(
+            gating("ds2-glm-tokens", 47, &[tokens(154_880)], None),
+            MoeGating::Sigmoid
+        );
+        // `vocab_size` wins over the token list when both are there and disagree.
+        assert_eq!(
+            gating(
+                "ds2-size-wins",
+                47,
+                &[Meta::U32(154_880), tokens(1000)],
+                None
+            ),
+            MoeGating::Sigmoid
+        );
+        assert_eq!(
+            gating(
+                "ds2-size-wins-not",
+                47,
+                &[Meta::U32(1000), tokens(154_880)],
+                None
+            ),
+            MoeGating::Softmax
+        );
+        // Any other shape, or no vocabulary size at all, stays softmax.
+        assert_eq!(gating("ds2-46", 46, &glm, None), MoeGating::Softmax);
+        assert_eq!(
+            gating("ds2-vocab", 47, &[Meta::U32(154_881)], None),
+            MoeGating::Softmax
+        );
+        assert_eq!(
+            gating("ds2-tokens", 48, &[tokens(1000)], None),
+            MoeGating::Softmax
+        );
+        assert_eq!(gating("ds2-novocab", 47, &[], None), MoeGating::Softmax);
+        // The key wins when it is there.
+        assert_eq!(
+            gating("ds2-glm-key1", 47, &glm, Some(1)),
+            MoeGating::Softmax
+        );
+        assert_eq!(gating("ds2-key2", 27, &[], Some(2)), MoeGating::Sigmoid);
+    }
+
+    /// An explicit `expert_gating_func = 0` names no gating function. `deepseek32.cpp` keeps it
+    /// and llama.cpp's `build_moe_ffn` then aborts, so the file is refused at load. (`deepseek4`
+    /// refuses every value but sqrt-softplus: `synthetic_deepseek4_requires_sqrt_softplus_gating`.)
+    #[test]
+    fn explicit_zero_gating_is_refused_where_the_reference_cannot_run_it() {
+        let keys = deepseek2_keys_with(&[]);
+        let mut ds32 = keys.clone();
+        ds32.extend([
+            ("expert_gating_func", 0),
+            ("attention.q_lora_rank", 1536),
+            ("attention.indexer.head_count", 64),
+            ("attention.indexer.key_length", 128),
+            ("attention.indexer.top_k", 2048),
+        ]);
+        let Err(err) = config_from_fixture("ds32-gating0", &arch_fixture("deepseek32", &ds32))
+        else {
+            panic!("deepseek32 with expert_gating_func = 0 must fail");
+        };
+        assert_eq!(
+            err.to_string(),
+            "deepseek32.expert_gating_func = 0 names no gating function (llama.cpp aborts on it)"
+        );
+    }
+
+    /// The YaRN knobs: `rope.scaling.attn_factor` is read, while the ramp corners stay at
+    /// llama.cpp's `llama_hparams` defaults even when the file declares others, because
+    /// `deepseek2.cpp` and `deepseek32.cpp` never read `rope.scaling.yarn_beta_fast` / `_slow`.
+    #[test]
+    fn deepseek2_yarn_knobs_match_the_reference() {
         let cfg = config_from_fixture("ds2-yarn-default", &deepseek2_fixture(DEEPSEEK2_BASE_KEYS))
             .expect("base deepseek2 fixture must parse");
         assert_eq!(cfg.rope_attn_factor, 1.0);
@@ -2064,10 +2206,24 @@ mod tests {
         let mut keys = DEEPSEEK2_BASE_KEYS.to_vec();
         keys.push(("rope.scaling.yarn_beta_fast", 16));
         keys.push(("rope.scaling.yarn_beta_slow", 2));
-        let cfg = config_from_fixture("ds2-yarn-set", &deepseek2_fixture(&keys))
-            .expect("deepseek2 fixture with YaRN knobs must parse");
-        assert_eq!(cfg.rope_yarn_beta_fast, 16.0);
-        assert_eq!(cfg.rope_yarn_beta_slow, 2.0);
+        for arch in ["deepseek2", "deepseek32"] {
+            let mut arch_keys = keys.clone();
+            if arch == "deepseek32" {
+                // deepseek32 requires the keys deepseek2 tolerates the absence of.
+                arch_keys.extend([
+                    ("expert_gating_func", 2),
+                    ("attention.q_lora_rank", 1536),
+                    ("attention.indexer.head_count", 64),
+                    ("attention.indexer.key_length", 128),
+                    ("attention.indexer.top_k", 2048),
+                ]);
+            }
+            let cfg =
+                config_from_fixture(&format!("{arch}-yarn-set"), &arch_fixture(arch, &arch_keys))
+                    .unwrap_or_else(|e| panic!("{arch} fixture with YaRN betas must parse: {e:#}"));
+            assert_eq!(cfg.rope_yarn_beta_fast, 32.0, "{arch}");
+            assert_eq!(cfg.rope_yarn_beta_slow, 1.0, "{arch}");
+        }
 
         // A non-unit `rope.scaling.attn_factor` scales the rotary halves of Q and K
         // (`deepseek2_mla_rope_magnitude_must_be_one`), so it is read only to be refused.

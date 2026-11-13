@@ -151,6 +151,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   tool definitions were already indented, in a replayed tool call's arguments
   and in any float written in exponent form), so tool-calling output can differ
   from earlier infr versions; prompts without tools are unchanged.
+- **DeepSeek V2/V3.2 GGUFs route and rope the way llama.cpp loads them.** A
+  `deepseek2` file without `expert_gating_func` and GLM 4.7 Lite's shape (47 or
+  48 layers, a 154880-token vocabulary) now routes its experts with sigmoid, as
+  llama.cpp chooses, instead of softmax. `rope.scaling.yarn_beta_fast` / `_slow`
+  are no longer read for `deepseek2` and `deepseek32`: llama.cpp ignores them on
+  those architectures, so a file declaring other values now ropes as it does
+  there. A `deepseek32` file with `expert_gating_func = 0` (no gating function)
+  is refused at load instead of routing as softmax; llama.cpp aborts on it.
 - **Paging an MoE model through the host RAM tier no longer reads experts the
   GPU already holds.** Every routed expert used to be looked up in the host tier
   before the GPU cache was checked, so an expert resident on the GPU but not in

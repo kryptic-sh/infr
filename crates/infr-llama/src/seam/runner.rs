@@ -239,8 +239,8 @@ fn session_stable(
         let corr = |nr: f32| {
             n_rot * (n_ctx_orig / (nr * std::f32::consts::TAU)).ln() / (2.0 * c.rope_theta.ln())
         };
-        // The two ramp corners are `beta_fast`/`beta_slow` (`ggml_rope_yarn_corr_dims`), read
-        // from the GGUF — V2-Lite happens to carry llama.cpp's own defaults.
+        // The two ramp corners are `beta_fast`/`beta_slow` (`ggml_rope_yarn_corr_dims`), at
+        // llama.cpp's defaults whatever the GGUF declares (see `Config::rope_yarn_beta_fast`).
         let start = (corr(c.rope_yarn_beta_fast).floor() as i64).clamp(0, (n_rot as i64) - 1);
         let end = (corr(c.rope_yarn_beta_slow).ceil() as i64).clamp(0, (n_rot as i64) - 1);
         let span = ((end - start) as f32).max(0.001);

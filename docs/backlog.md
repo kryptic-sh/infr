@@ -4373,23 +4373,39 @@ Options: refuse tools for a template that names `xml_tools` but not `tools` (an
 honest error), or build the mapping with those three pieces and a test against
 an HF render.
 
-### B160 — two deepseek2 parses that differ from llama.cpp (2026-11-13)
+### B160 — deepseek2 loader: what the reference-parity fixes did not reach (2026-11-13)
 
-**Tag:** deepseek · config · found by a separate read, verified by reading both
-sides; not fixed
+**Tag:** deepseek · config
 
-- **YaRN beta corners.** `Config::from_gguf` reads `rope.scaling.yarn_beta_fast`
-  / `yarn_beta_slow` for `deepseek2` and `deepseek32` (defaults 32 / 1).
-  llama.cpp's `deepseek2.cpp` and `deepseek32.cpp` never read those keys, and
-  the generic loader does not either; only `grok.cpp`, `k2-horizon.cpp`,
-  `laguna.cpp` and `mistral3.cpp` do. So the reference always uses the
-  `llama_hparams` defaults (32 / 1), and a file that carries other values would
-  rope differently in infr. No such file is known.
-- **Absent `expert_gating_func`.** infr maps an absent key to softmax
-  unconditionally (`0 | 1 => MoeGating::Softmax`). `deepseek2.cpp` picks SIGMOID
-  instead when `n_layer` is 47 or 48 and `n_vocab` is 154880 (its comment: GLM
-  4.7 Lite), softmax otherwise. A GLM 4.7 Lite file without the key would route
-  with the wrong function in infr.
+`Config::from_gguf` now ignores `rope.scaling.yarn_beta_fast` / `_slow` for
+`deepseek2` and `deepseek32`, picks sigmoid for an absent `expert_gating_func`
+on GLM 4.7 Lite's shape, and refuses `deepseek32.expert_gating_func = 0`, as
+llama.cpp's loaders do (for the last: llama.cpp keeps the 0 and `build_moe_ffn`
+in `llama-graph.cpp` hits `GGML_ABORT` on it, so it cannot run such a file
+either). Covered by config tests on synthetic fixtures only. No real `deepseek2`
+GGUF is cached here, so none of it was run end to end. Left:
+
+- **GLM 4.7 Lite files converted with MTP are refused at load.** llama.cpp's
+  converter (`Glm4MoeLiteModel` in `conversion/glm.py`, arch `deepseek2`) writes
+  `nextn_predict_layers` and counts those layers in `block_count` unless run
+  with `--no-mtp` (or the HF config has no `num_nextn_predict_layers`). infr
+  refuses `nextn_predict_layers` on `deepseek2` (only qwen35 and `deepseek32`
+  handle the split), so only `--no-mtp` or older conversions reach the new
+  gating rule. llama.cpp applies the rule to the trunk depth, loads the NextN
+  layers with `TENSOR_SKIP` unless MTP is requested (`nextn_flags` in
+  `llama-model.cpp`), and its text-generation graph runs only the trunk
+  (`il < n_layer` in `deepseek2.cpp`). Supporting these files for plain
+  generation therefore looks like what infr already does for `deepseek32`: split
+  the trunk off and skip the NextN blocks. A small follow-up slice, not started;
+  read in the code, not run.
+- **YaRN betas in real files.** Converters do write them for `deepseek2` files:
+  `set_mistral_config` (`conversion/mistral.py`, used by `MistralMoeModel` on
+  arch `deepseek2`) writes the Mistral `yarn.beta` / `yarn.alpha`, and
+  `TextModel.set_gguf_parameters` (`conversion/base.py`) writes HF
+  `rope_scaling.beta_fast` / `beta_slow` when present. So files with non-default
+  values plausibly exist, and infr now follows llama.cpp in ignoring them.
+  Whether that matches the HF reference implementation of those models (which
+  presumably uses the config's values) was not checked.
 
 ### B161 — the SmolLM3 golden runs nowhere by default, and its first case is a near tie (2026-11-13)
 

@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-13
+
 ### Breaking
 
 - **`infr_server::ChatOutcome` has a new field, `cached_tokens`.** An
@@ -181,6 +183,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   is a multiple of 64 but not of 128, or any width under `INFR_NO_GEMM_WARP` —
   instead of the GEMV. A weight too large for the tiled GEMM's addressing (a
   big-vocab output projection) keeps the chunked GEMV, as before.
+- **The host (DRAM) weight tier evicts by last use.** A hit did not refresh a
+  block's position, so eviction followed load order. Output is unchanged; MoE
+  models paged from disk should re-read fewer blocks.
 
 ### Removed
 
@@ -400,12 +405,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   startup with the feature named**, instead of an unnamed device-creation error.
 - **`kernels.vulkan.pv_splits = 0` or `kernels.vulkan.flash_splits = 0` no
   longer panics with a division by zero**; zero now means the adaptive default.
-
-### Changed
-
-- **The host (DRAM) weight tier evicts by last use.** A hit did not refresh a
-  block's position, so eviction followed load order. Output is unchanged; MoE
-  models paged from disk should re-read fewer blocks.
 
 ## [0.2.0] - 2026-10-29
 
@@ -1264,6 +1263,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pointer dereference in the `fmt::Pointer` impl for `Atomic`/`Shared`). Reached
   through `rayon`, so it applies to every CPU-backend build.
 
-[Unreleased]: https://github.com/kryptic-sh/infr/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/infr/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kryptic-sh/infr/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/kryptic-sh/infr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kryptic-sh/infr/releases/tag/v0.1.0

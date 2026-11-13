@@ -19,12 +19,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   a tensor this layout needs, or carrying one it does not use, is refused naming
   it. The Metal backend applies the router bias too, on the same rule; that path
   has not been run on Apple hardware.
+- **`infr_gguf::dequant::{factor_block, expand_factored, has_factored_form}`**:
+  one affine quant block decoded into its factored parts, and their expansion to
+  f32 — the two halves `dequant_factored` and `dequant_block` are now built
+  from, for a caller that wants a block at a time.
 - **`infr_llama::Config::optional_router_bias`**: whether the arch's reference
   loads `blk.N.exp_probs_b.bias` as optional on its MoE layers (deepseek2 and
   ernie4_5-moe).
 
 ### Changed
 
+- **MoE decode on the CPU backend is 3.4-3.5× faster.** A single-token MoE step
+  runs its routed experts on f32 activations, and dequantized every expert
+  weight row through the general host dequant first: four allocations and two
+  passes per row. Expert rows in every affine quant (Q4_0, Q4_1, Q5_0, Q5_1,
+  Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K) are now decoded 256 elements at a time on
+  the stack and fed straight into the dot, with the same bits as before, so
+  every output is unchanged. The codebook and fp4 formats (the IQ and TQ quants,
+  MXFP4 as gpt-oss's experts use, NVFP4, Q2_0) still take the old path. Warm
+  decode on a Ryzen 9 9950X3D, 16 threads: ERNIE-4.5-21B-A3B Q4_K_M from 7.4 to
+  25.2 tok/s (llama.cpp's CPU: 29.70), Qwen3-30B-A3B Q4_K_M from 7.5 to 26.1
+  tok/s (llama.cpp: 31.01). Prefill is unchanged.
 - **Chat templates turn non-strings into text as Python's Jinja2 does**, which
   is what Hugging Face's `apply_chat_template` renders with and so what models
   were trained on: `True`, `False`, `None`; floats as Python's `repr` (`1e-07`,

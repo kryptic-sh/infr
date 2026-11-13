@@ -42,17 +42,15 @@ pub fn dequant_block(dtype: infr_core::DType, bytes: &[u8]) -> Result<Vec<f32>> 
         d if is_quant(d) => {
             let f = dequant_factored(d, bytes)?;
             let mut out = vec![0f32; f.codes.len()];
-            let n16 = out.len() / 16;
-            for b16 in 0..n16 {
-                let base = b16 * 16;
-                let db = base / f.dblk; // dblk is a multiple of 16 → constant over the block
-                let dsc = f.dd[2 * db].to_f32();
-                let dmn = f.dd[2 * db + 1].to_f32();
-                let sc = dsc * f.scm[2 * b16] as f32;
-                let mn = dmn * f.scm[2 * b16 + 1] as f32;
-                for g in 0..16 {
-                    out[base + g] = sc * f.codes[base + g] as f32 + mn;
-                }
+            let spb = f.dblk / 16 * 2; // dblk is a multiple of 16
+            for (b, o) in out.chunks_exact_mut(f.dblk).enumerate() {
+                expand_factored(
+                    f.dd[2 * b].to_f32(),
+                    f.dd[2 * b + 1].to_f32(),
+                    &f.codes[b * f.dblk..(b + 1) * f.dblk],
+                    &f.scm[b * spb..(b + 1) * spb],
+                    o,
+                );
             }
             out
         }
@@ -118,21 +116,29 @@ fn rf16(b: &[u8]) -> half::f16 {
     half::f16::from_le_bytes([b[0], b[1]])
 }
 
-/// Decode any affine quant into [`Factored`] form. Each arm mirrors the llama.cpp reference
-/// dequant (see the per-format comments), but instead of expanding to per-element f32 scale/min it
-/// records the format's own structure: the f16 super scale(s) per block and the small integer
-/// multipliers per 16-element sub-block.
+/// Whether `dtype` is an affine quant with a [`Factored`] form — the formats
+/// [`dequant_factored`] and [`factor_block`] decode.
+pub fn has_factored_form(dtype: infr_core::DType) -> bool {
+    use infr_core::DType::*;
+    matches!(
+        dtype,
+        Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K
+    )
+}
+
+/// Decode any affine quant into [`Factored`] form. Each arm of [`factor_block`] mirrors the
+/// llama.cpp reference dequant (see the per-format comments), but instead of expanding to
+/// per-element f32 scale/min it records the format's own structure: the f16 super scale(s) per
+/// block and the small integer multipliers per 16-element sub-block.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub fn dequant_factored(dtype: infr_core::DType, bytes: &[u8]) -> Result<Factored> {
-    use infr_core::DType::*;
     // Only affine quants have a factored form; a non-affine dtype (F16/Iq*/Tq*/fp4)
     // must error, never panic — callers can pass an untrusted-model dtype here.
     // Which formats have a factored form is the decision here; the block GEOMETRY comes from the
     // shared decode spec (`infr_core::decode_spec::block_layout`) rather than a second hand-kept
     // `(elems, bytes)` table that could drift from the loader's.
-    match dtype {
-        Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2K | Q3K | Q4K | Q5K | Q6K => {}
-        other => bail!("dequant_factored: unsupported (non-affine) dtype {other:?}"),
+    if !has_factored_form(dtype) {
+        bail!("dequant_factored: unsupported (non-affine) dtype {dtype:?}");
     }
     let (qpb, bpb) = infr_core::decode_spec::block_layout(dtype);
     let nblk = bytes.len() / bpb;
@@ -141,261 +147,16 @@ pub fn dequant_factored(dtype: infr_core::DType, bytes: &[u8]) -> Result<Factore
     let mut codes = vec![0u8; numel];
     let mut scm = vec![0i16; numel / 16 * 2];
     let mut dd = vec![half::f16::ZERO; nblk * 2];
+    let spb = qpb / 16 * 2; // `scm` entries per quant block
     for b in 0..nblk {
-        let blk = &bytes[b * bpb..(b + 1) * bpb];
-        // (sc, m) for the two/sixteen 16-blocks of this quant block, written via `s16`.
-        let mut s16 = |b16: usize, sc: i16, m: i16| {
-            scm[2 * b16] = sc;
-            scm[2 * b16 + 1] = m;
-        };
-        match dtype {
-            // ── Q4_0: y = d*(q4 - 8), q4 ∈ 0..15 ──────────────────────────────
-            // Ref: llama.cpp dequantize_row_q4_0 (ggml-quants.c l.401)
-            // Block: [half d][uint8 qs[16]] → scale = d·1, min = d·(-8)
-            Q4_0 => {
-                let d = rf16(blk);
-                dd[2 * b] = d;
-                dd[2 * b + 1] = d;
-                s16(b * 2, 1, -8);
-                s16(b * 2 + 1, 1, -8);
-                let qs = &blk[2..18];
-                for j in 0..16 {
-                    codes[b * 32 + j] = qs[j] & 0x0F;
-                    codes[b * 32 + j + 16] = qs[j] >> 4;
-                }
-            }
-            // ── Q4_1: y = d*q4 + m ─────────────────────────────────────────────
-            // Ref: llama.cpp dequantize_row_q4_1 (ggml-quants.c l.421)
-            // Block: [half d][half m][uint8 qs[16]] → scale = d·1, min = m·1
-            Q4_1 => {
-                let d = rf16(blk);
-                let m = rf16(&blk[2..4]);
-                dd[2 * b] = d;
-                dd[2 * b + 1] = m;
-                s16(b * 2, 1, 1);
-                s16(b * 2 + 1, 1, 1);
-                let qs = &blk[4..20];
-                for j in 0..16 {
-                    codes[b * 32 + j] = qs[j] & 0x0F;
-                    codes[b * 32 + j + 16] = qs[j] >> 4;
-                }
-            }
-            // ── Q5_0: y = d*(q5 - 16), q5 ∈ 0..31 ──────────────────────────────
-            // Ref: llama.cpp dequantize_row_q5_0 (ggml-quants.c l.442)
-            // Block: [half d][uint8 qh[4]][uint8 qs[16]] → scale = d·1, min = d·(-16)
-            Q5_0 => {
-                let d = rf16(blk);
-                dd[2 * b] = d;
-                dd[2 * b + 1] = d;
-                s16(b * 2, 1, -16);
-                s16(b * 2 + 1, 1, -16);
-                let qh = u32::from_le_bytes(blk[2..6].try_into().unwrap());
-                let qs = &blk[6..22];
-                for j in 0..16 {
-                    let xh0 = ((qh >> j) << 4) & 0x10;
-                    let xh1 = (qh >> (j + 12)) & 0x10;
-                    codes[b * 32 + j] = ((qs[j] as u32 & 0x0F) | xh0) as u8;
-                    codes[b * 32 + j + 16] = ((qs[j] as u32 >> 4) | xh1) as u8;
-                }
-            }
-            // ── Q5_1: y = d*q5 + m ─────────────────────────────────────────────
-            // Ref: llama.cpp dequantize_row_q5_1 (ggml-quants.c l.468)
-            // Block: [half d][half m][uint8 qh[4]][uint8 qs[16]] → scale = d·1, min = m·1
-            Q5_1 => {
-                let d = rf16(blk);
-                let m = rf16(&blk[2..4]);
-                dd[2 * b] = d;
-                dd[2 * b + 1] = m;
-                s16(b * 2, 1, 1);
-                s16(b * 2 + 1, 1, 1);
-                let qh = u32::from_le_bytes(blk[4..8].try_into().unwrap());
-                let qs = &blk[8..24];
-                for j in 0..16 {
-                    let xh0 = ((qh >> j) << 4) & 0x10;
-                    let xh1 = (qh >> (j + 12)) & 0x10;
-                    codes[b * 32 + j] = ((qs[j] as u32 & 0x0F) | xh0) as u8;
-                    codes[b * 32 + j + 16] = ((qs[j] as u32 >> 4) | xh1) as u8;
-                }
-            }
-            // ── Q8_0: y = d*q8, q8 i8 stored biased by +128 → scale = d·1, min = d·(-128)
-            Q8_0 => {
-                let d = rf16(blk);
-                dd[2 * b] = d;
-                dd[2 * b + 1] = d;
-                s16(b * 2, 1, -128);
-                s16(b * 2 + 1, 1, -128);
-                for i in 0..32 {
-                    codes[b * 32 + i] = (blk[2 + i] as i8 as i16 + 128) as u8;
-                }
-            }
-            // ── Q2_K: y = d*(sc&0xF)*q2 - dmin*(sc>>4); per-16-elem sub-block scale/min ──
-            // Ref: llama.cpp dequantize_row_q2_K (ggml-quants.c l.903)
-            // Block (84 bytes): [uint8 scales[16]][uint8 qs[64]][half d][half dmin]
-            Q2K => {
-                let scales = &blk[0..16];
-                let qs = &blk[16..80];
-                dd[2 * b] = rf16(&blk[80..82]);
-                dd[2 * b + 1] = rf16(&blk[82..84]);
-                let base = b * 256;
-                let mut out = 0usize;
-                let mut is = 0usize;
-                let mut qoff = 0usize;
-                for _n in 0..2 {
-                    let mut shift = 0u32;
-                    for _j in 0..4 {
-                        for half in 0..2 {
-                            let sc = scales[is];
-                            is += 1;
-                            s16((base + out) / 16, (sc & 0xF) as i16, -((sc >> 4) as i16));
-                            for l in 0..16 {
-                                codes[base + out] = (qs[qoff + half * 16 + l] >> shift) & 3;
-                                out += 1;
-                            }
-                        }
-                        shift += 2;
-                    }
-                    qoff += 32;
-                }
-            }
-            // ── Q3_K: y = d*(sc6-32)*(q3u - 4); per-16-elem 6-bit sub-block scale ──
-            // Ref: llama.cpp dequantize_row_q3_K (ggml-quants.c l.1247)
-            // Block (110 bytes): [uint8 hmask[32]][uint8 qs[64]][uint8 scales[12]][half d]
-            // scale = d·(sc6-32), min = -4·scale = d·(-4·(sc6-32))
-            Q3K => {
-                let hmask = &blk[0..32];
-                let qs = &blk[32..96];
-                let scales_raw = &blk[96..108];
-                dd[2 * b] = rf16(&blk[108..110]);
-                dd[2 * b + 1] = dd[2 * b];
-                let base = b * 256;
-
-                // Decode 6-bit scales: port of the llama.cpp bit manipulation exactly.
-                // scales_raw is 12 bytes encoding 16 × 6-bit values.
-                // kmask1=0x03030303, kmask2=0x0f0f0f0f
-                let mut aux = [0u32; 4];
-                aux[0] = u32::from_le_bytes(scales_raw[0..4].try_into().unwrap());
-                aux[1] = u32::from_le_bytes(scales_raw[4..8].try_into().unwrap());
-                aux[2] = u32::from_le_bytes(scales_raw[8..12].try_into().unwrap());
-                let kmask1: u32 = 0x0303_0303;
-                let kmask2: u32 = 0x0f0f_0f0f;
-                let tmp = aux[2];
-                aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
-                aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
-                aux[0] = (aux[0] & kmask2) | ((tmp & kmask1) << 4);
-                aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
-                // aux as i8[16] gives decoded 6-bit scales; subtract 32 to get signed scale.
-                let sc6 = |i: usize| -> i16 {
-                    let sc = ((aux[i / 4] >> ((i % 4) * 8)) & 0xFF) as u8 as i8;
-                    sc as i16 - 32
-                };
-
-                let mut out = 0usize;
-                let mut is = 0usize;
-                let mut qoff = 0usize;
-                let mut m = 1u8;
-                for _n in 0..2 {
-                    let mut shift = 0u32;
-                    for _j in 0..4 {
-                        for half in 0..2 {
-                            let s = sc6(is);
-                            is += 1;
-                            s16((base + out) / 16, s, -4 * s);
-                            for l in 0..16 {
-                                let low2 = (qs[qoff + half * 16 + l] >> shift) & 3;
-                                let high = if hmask[half * 16 + l] & m != 0 {
-                                    1u8
-                                } else {
-                                    0u8
-                                };
-                                codes[base + out] = low2 | (high << 2); // 0..7
-                                out += 1;
-                            }
-                        }
-                        shift += 2;
-                        m <<= 1;
-                    }
-                    qoff += 32;
-                }
-            }
-            // ── Q4_K: y = d*sc6·q4 - dmin*m6; 6-bit scale/min per 32-elem sub-block ──
-            // Ref: llama.cpp dequantize_row_q4_K (via get_scale_min_k4)
-            Q4K => {
-                dd[2 * b] = rf16(&blk[0..2]);
-                dd[2 * b + 1] = rf16(&blk[2..4]);
-                let scales = &blk[4..16];
-                let qs = &blk[16..144];
-                let base = b * 256;
-                for j in 0..4 {
-                    let (sc1, m1) = k4(2 * j, scales);
-                    let (sc2, m2) = k4(2 * j + 1, scales);
-                    let b16 = b * 16 + j * 4;
-                    s16(b16, sc1 as i16, -(m1 as i16));
-                    s16(b16 + 1, sc1 as i16, -(m1 as i16));
-                    s16(b16 + 2, sc2 as i16, -(m2 as i16));
-                    s16(b16 + 3, sc2 as i16, -(m2 as i16));
-                    for l in 0..32 {
-                        let v = qs[j * 32 + l];
-                        codes[base + j * 64 + l] = v & 0xF;
-                        codes[base + j * 64 + 32 + l] = v >> 4;
-                    }
-                }
-            }
-            // ── Q5_K: like Q4_K with a 5th code bit from qh ──
-            Q5K => {
-                dd[2 * b] = rf16(&blk[0..2]);
-                dd[2 * b + 1] = rf16(&blk[2..4]);
-                let scales = &blk[4..16];
-                let qh = &blk[16..48];
-                let qs = &blk[48..176];
-                let base = b * 256;
-                let (mut u1, mut u2) = (1u8, 2u8);
-                for j in 0..4 {
-                    let (sc1, m1) = k4(2 * j, scales);
-                    let (sc2, m2) = k4(2 * j + 1, scales);
-                    let b16 = b * 16 + j * 4;
-                    s16(b16, sc1 as i16, -(m1 as i16));
-                    s16(b16 + 1, sc1 as i16, -(m1 as i16));
-                    s16(b16 + 2, sc2 as i16, -(m2 as i16));
-                    s16(b16 + 3, sc2 as i16, -(m2 as i16));
-                    for l in 0..32 {
-                        let v = qs[j * 32 + l];
-                        codes[base + j * 64 + l] = (v & 0xF) + if qh[l] & u1 != 0 { 16 } else { 0 };
-                        codes[base + j * 64 + 32 + l] =
-                            (v >> 4) + if qh[l] & u2 != 0 { 16 } else { 0 };
-                    }
-                    u1 <<= 2;
-                    u2 <<= 2;
-                }
-            }
-            // ── Q6_K: y = d*sc_i8*(q6 - 32); i8 scale per 16-elem sub-block ──
-            // scale = d·sc, min = -32·scale = d·(-32·sc); -32·sc ∈ [-4064, 4096] needs i16.
-            Q6K => {
-                let ql = &blk[0..128];
-                let qh = &blk[128..192];
-                let scales = &blk[192..208]; // 16 × int8
-                dd[2 * b] = rf16(&blk[208..210]);
-                dd[2 * b + 1] = dd[2 * b];
-                for half in 0..2 {
-                    let (qlo, qho, sco, base) =
-                        (half * 64, half * 32, half * 8, b * 256 + half * 128);
-                    for sci in [0usize, 2, 4, 6] {
-                        for is in 0..2usize {
-                            let s = scales[sco + is + sci] as i8 as i16;
-                            s16(base / 16 + sci + is, s, -32 * s);
-                        }
-                    }
-                    for l in 0..32 {
-                        codes[base + l] = (ql[qlo + l] & 0xF) | ((qh[qho + l] & 3) << 4);
-                        codes[base + l + 32] =
-                            (ql[qlo + l + 32] & 0xF) | (((qh[qho + l] >> 2) & 3) << 4);
-                        codes[base + l + 64] = (ql[qlo + l] >> 4) | (((qh[qho + l] >> 4) & 3) << 4);
-                        codes[base + l + 96] =
-                            (ql[qlo + l + 32] >> 4) | (((qh[qho + l] >> 6) & 3) << 4);
-                    }
-                }
-            }
-            _ => unreachable!(),
-        }
+        let [d, dmin] = factor_block(
+            dtype,
+            &bytes[b * bpb..(b + 1) * bpb],
+            &mut codes[b * qpb..(b + 1) * qpb],
+            &mut scm[b * spb..(b + 1) * spb],
+        );
+        dd[2 * b] = d;
+        dd[2 * b + 1] = dmin;
     }
     Ok(Factored {
         codes,
@@ -403,6 +164,300 @@ pub fn dequant_factored(dtype: infr_core::DType, bytes: &[u8]) -> Result<Factore
         dd,
         dblk,
     })
+}
+
+/// Decode ONE quant block `blk` of the affine `dtype` into its factored parts: the block's
+/// `qpb` codes into `codes`, its `(sc, m)` pair per 16 elements into `scm` (interleaved, as in
+/// [`Factored::scm`]), and its `[d, dmin]` super scales as the return value. The value of element
+/// `i` is then `(d·sc)·codes[i] + (dmin·m)` — see [`expand_factored`].
+///
+/// The one place the affine formats' bit layouts are decoded: [`dequant_factored`] runs it per
+/// block, and a caller that wants one block at a time (the CPU backend's f32 expert dot) runs it
+/// directly. Panics on a dtype without a factored form ([`has_factored_form`]) or on buffers not
+/// sized to one block. `#[inline(always)]` so a caller passing a constant `dtype` can have the
+/// dispatch folded away.
+#[inline(always)]
+pub fn factor_block(
+    dtype: infr_core::DType,
+    blk: &[u8],
+    codes: &mut [u8],
+    scm: &mut [i16],
+) -> [half::f16; 2] {
+    use infr_core::DType::*;
+    let mut dd = [half::f16::ZERO; 2];
+    // (sc, m) for the two/sixteen 16-blocks of this quant block, written via `s16`.
+    let mut s16 = |b16: usize, sc: i16, m: i16| {
+        scm[2 * b16] = sc;
+        scm[2 * b16 + 1] = m;
+    };
+    match dtype {
+        // ── Q4_0: y = d*(q4 - 8), q4 ∈ 0..15 ──────────────────────────────
+        // Ref: llama.cpp dequantize_row_q4_0 (ggml-quants.c l.401)
+        // Block: [half d][uint8 qs[16]] → scale = d·1, min = d·(-8)
+        Q4_0 => {
+            let d = rf16(blk);
+            dd[0] = d;
+            dd[1] = d;
+            s16(0, 1, -8);
+            s16(1, 1, -8);
+            let qs = &blk[2..18];
+            for j in 0..16 {
+                codes[j] = qs[j] & 0x0F;
+                codes[j + 16] = qs[j] >> 4;
+            }
+        }
+        // ── Q4_1: y = d*q4 + m ─────────────────────────────────────────────
+        // Ref: llama.cpp dequantize_row_q4_1 (ggml-quants.c l.421)
+        // Block: [half d][half m][uint8 qs[16]] → scale = d·1, min = m·1
+        Q4_1 => {
+            let d = rf16(blk);
+            let m = rf16(&blk[2..4]);
+            dd[0] = d;
+            dd[1] = m;
+            s16(0, 1, 1);
+            s16(1, 1, 1);
+            let qs = &blk[4..20];
+            for j in 0..16 {
+                codes[j] = qs[j] & 0x0F;
+                codes[j + 16] = qs[j] >> 4;
+            }
+        }
+        // ── Q5_0: y = d*(q5 - 16), q5 ∈ 0..31 ──────────────────────────────
+        // Ref: llama.cpp dequantize_row_q5_0 (ggml-quants.c l.442)
+        // Block: [half d][uint8 qh[4]][uint8 qs[16]] → scale = d·1, min = d·(-16)
+        Q5_0 => {
+            let d = rf16(blk);
+            dd[0] = d;
+            dd[1] = d;
+            s16(0, 1, -16);
+            s16(1, 1, -16);
+            let qh = u32::from_le_bytes(blk[2..6].try_into().unwrap());
+            let qs = &blk[6..22];
+            for j in 0..16 {
+                let xh0 = ((qh >> j) << 4) & 0x10;
+                let xh1 = (qh >> (j + 12)) & 0x10;
+                codes[j] = ((qs[j] as u32 & 0x0F) | xh0) as u8;
+                codes[j + 16] = ((qs[j] as u32 >> 4) | xh1) as u8;
+            }
+        }
+        // ── Q5_1: y = d*q5 + m ─────────────────────────────────────────────
+        // Ref: llama.cpp dequantize_row_q5_1 (ggml-quants.c l.468)
+        // Block: [half d][half m][uint8 qh[4]][uint8 qs[16]] → scale = d·1, min = m·1
+        Q5_1 => {
+            let d = rf16(blk);
+            let m = rf16(&blk[2..4]);
+            dd[0] = d;
+            dd[1] = m;
+            s16(0, 1, 1);
+            s16(1, 1, 1);
+            let qh = u32::from_le_bytes(blk[4..8].try_into().unwrap());
+            let qs = &blk[8..24];
+            for j in 0..16 {
+                let xh0 = ((qh >> j) << 4) & 0x10;
+                let xh1 = (qh >> (j + 12)) & 0x10;
+                codes[j] = ((qs[j] as u32 & 0x0F) | xh0) as u8;
+                codes[j + 16] = ((qs[j] as u32 >> 4) | xh1) as u8;
+            }
+        }
+        // ── Q8_0: y = d*q8, q8 i8 stored biased by +128 → scale = d·1, min = d·(-128)
+        Q8_0 => {
+            let d = rf16(blk);
+            dd[0] = d;
+            dd[1] = d;
+            s16(0, 1, -128);
+            s16(1, 1, -128);
+            for i in 0..32 {
+                codes[i] = (blk[2 + i] as i8 as i16 + 128) as u8;
+            }
+        }
+        // ── Q2_K: y = d*(sc&0xF)*q2 - dmin*(sc>>4); per-16-elem sub-block scale/min ──
+        // Ref: llama.cpp dequantize_row_q2_K (ggml-quants.c l.903)
+        // Block (84 bytes): [uint8 scales[16]][uint8 qs[64]][half d][half dmin]
+        Q2K => {
+            let scales = &blk[0..16];
+            let qs = &blk[16..80];
+            dd[0] = rf16(&blk[80..82]);
+            dd[1] = rf16(&blk[82..84]);
+            let base = 0;
+            let mut out = 0usize;
+            let mut is = 0usize;
+            let mut qoff = 0usize;
+            for _n in 0..2 {
+                let mut shift = 0u32;
+                for _j in 0..4 {
+                    for half in 0..2 {
+                        let sc = scales[is];
+                        is += 1;
+                        s16((base + out) / 16, (sc & 0xF) as i16, -((sc >> 4) as i16));
+                        for l in 0..16 {
+                            codes[base + out] = (qs[qoff + half * 16 + l] >> shift) & 3;
+                            out += 1;
+                        }
+                    }
+                    shift += 2;
+                }
+                qoff += 32;
+            }
+        }
+        // ── Q3_K: y = d*(sc6-32)*(q3u - 4); per-16-elem 6-bit sub-block scale ──
+        // Ref: llama.cpp dequantize_row_q3_K (ggml-quants.c l.1247)
+        // Block (110 bytes): [uint8 hmask[32]][uint8 qs[64]][uint8 scales[12]][half d]
+        // scale = d·(sc6-32), min = -4·scale = d·(-4·(sc6-32))
+        Q3K => {
+            let hmask = &blk[0..32];
+            let qs = &blk[32..96];
+            let scales_raw = &blk[96..108];
+            dd[0] = rf16(&blk[108..110]);
+            dd[1] = dd[0];
+            let base = 0;
+
+            // Decode 6-bit scales: port of the llama.cpp bit manipulation exactly.
+            // scales_raw is 12 bytes encoding 16 × 6-bit values.
+            // kmask1=0x03030303, kmask2=0x0f0f0f0f
+            let mut aux = [0u32; 4];
+            aux[0] = u32::from_le_bytes(scales_raw[0..4].try_into().unwrap());
+            aux[1] = u32::from_le_bytes(scales_raw[4..8].try_into().unwrap());
+            aux[2] = u32::from_le_bytes(scales_raw[8..12].try_into().unwrap());
+            let kmask1: u32 = 0x0303_0303;
+            let kmask2: u32 = 0x0f0f_0f0f;
+            let tmp = aux[2];
+            aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+            aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+            aux[0] = (aux[0] & kmask2) | ((tmp & kmask1) << 4);
+            aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+            // aux as i8[16] gives decoded 6-bit scales; subtract 32 to get signed scale.
+            let sc6 = |i: usize| -> i16 {
+                let sc = ((aux[i / 4] >> ((i % 4) * 8)) & 0xFF) as u8 as i8;
+                sc as i16 - 32
+            };
+
+            let mut out = 0usize;
+            let mut is = 0usize;
+            let mut qoff = 0usize;
+            let mut m = 1u8;
+            for _n in 0..2 {
+                let mut shift = 0u32;
+                for _j in 0..4 {
+                    for half in 0..2 {
+                        let s = sc6(is);
+                        is += 1;
+                        s16((base + out) / 16, s, -4 * s);
+                        for l in 0..16 {
+                            let low2 = (qs[qoff + half * 16 + l] >> shift) & 3;
+                            let high = if hmask[half * 16 + l] & m != 0 {
+                                1u8
+                            } else {
+                                0u8
+                            };
+                            codes[base + out] = low2 | (high << 2); // 0..7
+                            out += 1;
+                        }
+                    }
+                    shift += 2;
+                    m <<= 1;
+                }
+                qoff += 32;
+            }
+        }
+        // ── Q4_K: y = d*sc6·q4 - dmin*m6; 6-bit scale/min per 32-elem sub-block ──
+        // Ref: llama.cpp dequantize_row_q4_K (via get_scale_min_k4)
+        Q4K => {
+            dd[0] = rf16(&blk[0..2]);
+            dd[1] = rf16(&blk[2..4]);
+            let scales = &blk[4..16];
+            let qs = &blk[16..144];
+            let base = 0;
+            for j in 0..4 {
+                let (sc1, m1) = k4(2 * j, scales);
+                let (sc2, m2) = k4(2 * j + 1, scales);
+                let b16 = j * 4;
+                s16(b16, sc1 as i16, -(m1 as i16));
+                s16(b16 + 1, sc1 as i16, -(m1 as i16));
+                s16(b16 + 2, sc2 as i16, -(m2 as i16));
+                s16(b16 + 3, sc2 as i16, -(m2 as i16));
+                for l in 0..32 {
+                    let v = qs[j * 32 + l];
+                    codes[base + j * 64 + l] = v & 0xF;
+                    codes[base + j * 64 + 32 + l] = v >> 4;
+                }
+            }
+        }
+        // ── Q5_K: like Q4_K with a 5th code bit from qh ──
+        Q5K => {
+            dd[0] = rf16(&blk[0..2]);
+            dd[1] = rf16(&blk[2..4]);
+            let scales = &blk[4..16];
+            let qh = &blk[16..48];
+            let qs = &blk[48..176];
+            let base = 0;
+            let (mut u1, mut u2) = (1u8, 2u8);
+            for j in 0..4 {
+                let (sc1, m1) = k4(2 * j, scales);
+                let (sc2, m2) = k4(2 * j + 1, scales);
+                let b16 = j * 4;
+                s16(b16, sc1 as i16, -(m1 as i16));
+                s16(b16 + 1, sc1 as i16, -(m1 as i16));
+                s16(b16 + 2, sc2 as i16, -(m2 as i16));
+                s16(b16 + 3, sc2 as i16, -(m2 as i16));
+                for l in 0..32 {
+                    let v = qs[j * 32 + l];
+                    codes[base + j * 64 + l] = (v & 0xF) + if qh[l] & u1 != 0 { 16 } else { 0 };
+                    codes[base + j * 64 + 32 + l] = (v >> 4) + if qh[l] & u2 != 0 { 16 } else { 0 };
+                }
+                u1 <<= 2;
+                u2 <<= 2;
+            }
+        }
+        // ── Q6_K: y = d*sc_i8*(q6 - 32); i8 scale per 16-elem sub-block ──
+        // scale = d·sc, min = -32·scale = d·(-32·sc); -32·sc ∈ [-4064, 4096] needs i16.
+        Q6K => {
+            let ql = &blk[0..128];
+            let qh = &blk[128..192];
+            let scales = &blk[192..208]; // 16 × int8
+            dd[0] = rf16(&blk[208..210]);
+            dd[1] = dd[0];
+            for half in 0..2 {
+                let (qlo, qho, sco, base) = (half * 64, half * 32, half * 8, half * 128);
+                for sci in [0usize, 2, 4, 6] {
+                    for is in 0..2usize {
+                        let s = scales[sco + is + sci] as i8 as i16;
+                        s16(base / 16 + sci + is, s, -32 * s);
+                    }
+                }
+                for l in 0..32 {
+                    codes[base + l] = (ql[qlo + l] & 0xF) | ((qh[qho + l] & 3) << 4);
+                    codes[base + l + 32] =
+                        (ql[qlo + l + 32] & 0xF) | (((qh[qho + l] >> 2) & 3) << 4);
+                    codes[base + l + 64] = (ql[qlo + l] >> 4) | (((qh[qho + l] >> 4) & 3) << 4);
+                    codes[base + l + 96] =
+                        (ql[qlo + l + 32] >> 4) | (((qh[qho + l] >> 6) & 3) << 4);
+                }
+            }
+        }
+        other => panic!("factor_block: {other:?} has no factored form"),
+    }
+    dd
+}
+
+/// Expand factored parts sharing one `(d, dmin)` pair to f32: per 16-element run `k`,
+/// `out[i] = (d·scm[2k])·codes[i] + (dmin·scm[2k+1])` — a multiply then an add, no FMA
+/// contraction. `d`/`dmin` are the block's f16 super scales already widened. [`dequant_block`]
+/// expands through this, so anything else that does is the same bits by construction.
+#[inline(always)]
+pub fn expand_factored(d: f32, dmin: f32, codes: &[u8], scm: &[i16], out: &mut [f32]) {
+    let runs = out
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .zip(codes.as_chunks::<16>().0)
+        .zip(scm.as_chunks::<2>().0);
+    for ((o, c), &[sc, m]) in runs {
+        let sc = d * sc as f32;
+        let mn = dmin * m as f32;
+        for (o, &c) in o.iter_mut().zip(c) {
+            *o = sc * c as f32 + mn;
+        }
+    }
 }
 
 // ─── codebook (non-affine) dequant ───────────────────────────────────────────

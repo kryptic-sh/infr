@@ -1,6 +1,8 @@
 //! MoE expert-bank GEMM dispatch: activation-representation selection (`ActsKind` /
 //! `expert_acts_kind`) and the per-o-range GEMM (`expert_gemm_range`) that fans out to the
 //! quant-specific batch kernels.
+use crate::dequant_row::dequant_dot_rows;
+use crate::f32_row;
 use crate::kernels::{
     dot, dot_bf16, dot_f16, vec_dot_q32_batch8, vec_dot_q4k_batch, vec_dot_q4k_batch8,
     vec_dot_q5_0_32_batch, vec_dot_q5k_batch, vec_dot_q6k_batch, vec_dot_q8_0_32_batch,
@@ -10,7 +12,6 @@ use crate::quant::{Q8x32, Q8};
 #[cfg(target_arch = "x86_64")]
 use crate::repack::q4k_gemm_group;
 use crate::repack::Q4kPack;
-use crate::{bytes_to_f32, f32_row};
 use infr_core::tensor::DType;
 
 /// Activation batch for [`expert_gemm_range`] — the representation the weight dtype dictates
@@ -141,7 +142,9 @@ pub(crate) fn expert_gemm_range(
         }
         ExpertActs::Raw(xin) => {
             // f32 dots against raw activation rows: identical math to the old fallback (the
-            // weight row is dequantized ONCE, reused across all rows), o-major placement.
+            // weight row is dequantized ONCE, reused across all rows), o-major placement. The
+            // quant arm is `dequant_dot_rows`: the same bits without materializing the row.
+            let mut accs = Vec::new();
             for o in o0..o1 {
                 let row = &wbytes[o * bpr..o * bpr + bpr];
                 let col = &mut out_t[(o - o0) * count..(o - o0 + 1) * count];
@@ -162,12 +165,7 @@ pub(crate) fn expert_gemm_range(
                             *dst = dot_bf16(row, &xin[r * in_f..r * in_f + in_f]);
                         }
                     }
-                    _ => {
-                        let wf = bytes_to_f32(row, dt);
-                        for (r, dst) in col.iter_mut().enumerate() {
-                            *dst = dot(&wf, &xin[r * in_f..r * in_f + in_f]);
-                        }
-                    }
+                    _ => dequant_dot_rows(row, dt, xin, in_f, col, &mut accs),
                 }
             }
         }

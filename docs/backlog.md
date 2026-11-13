@@ -4692,25 +4692,53 @@ rewritten template against the oracle for the corpus conversations, not just by
 the row above. The other route is a minijinja hook (none in 2.24; 3.x not read,
 B171). Not started.
 
-### B173 — the CPU backend runs MoE models several times slower than llama.cpp's CPU (2026-11-14)
+### B173 — the CPU backend's prefill is 1.5-3.2× slower than llama.cpp's CPU, and its first forward pays the page-in (2026-11-14)
 
 **Tag:** perf · cpu · moe
 
-Measured on the Windows box (Ryzen 9 9950X3D) without a quiet window,
-`infr run --dev cpu --temp 0` against `llama-completion -ngl 0 --temp 0` on the
-same file and the same rendered chat prompt, each a fresh process:
+Opened for MoE models; decode was the MoE-specific part and is fixed
+(`dequant_row::dequant_dot_rows`: the f32-activation expert path used to
+dequantize every routed weight row through `bytes_to_f32`). Measured on the
+Windows box (Ryzen 9 9950X3D, 16 threads, `infr bench --ngl 0` vs
+`llama-bench -ngl 0`, other sessions idle, total CPU 0-5% between runs), warm
+reps only. "Before" is HEAD 4c389a78 and the pp512 columns come from one window
+interleaving it with the fix; "after" is the final build, interleaved with an
+equivalent earlier build in a later window:
 
-| model                    |     infr prefill | infr decode | llama.cpp prefill | llama.cpp decode |
-| ------------------------ | ---------------: | ----------: | ----------------: | ---------------: |
-| ERNIE-4.5-21B-A3B Q4_K_M | 19 tok @ 1 tok/s |   4.6 tok/s |       43.78 tok/s |      24.87 tok/s |
-| Qwen3-30B-A3B Q4_K_M     | 24 tok @ 1 tok/s |   3.4 tok/s |       59.51 tok/s |      29.75 tok/s |
+| model                                     | infr pp512 | llama.cpp pp512 | infr tg64 before | infr tg64 after | llama.cpp tg64 |
+| ----------------------------------------- | ---------: | --------------: | ---------------: | --------------: | -------------: |
+| ERNIE-4.5-21B-A3B Q4_K_M                  |  75-82 t/s |          187.94 |        7.34-7.51 |       25.0-25.3 |          29.70 |
+| Qwen3-30B-A3B Q4_K_M                      |    144-145 |          221.51 |        7.38-7.61 |       26.0-26.3 |          31.01 |
+| SmolLM3-3B Q4_K_M (dense, earlier window) |      180.8 |          576.85 |                — |            30.9 |          34.69 |
 
-Both are MoE with about 3B active parameters, so the gap is the CPU `Op::MoeFfn`
-path's, not one arch's. Not profiled: whether the time is the routed experts'
-kernels, the staged pipeline in `infr-cpu`'s MoE arm, or first-touch page-in of
-the mapped expert banks (each run was a new process, but the file had been read
-by earlier runs) is unknown. A first step is `infr bench -ngl 0` with `-r 3` to
-separate a cold first rep from warm ones, then a profile of a warm decode.
+- **Prefill is a general CPU-backend gap, not an MoE one**: the dense control
+  (SmolLM3-3B, an earlier window) is further behind than either MoE model.
+  Decode is now within ~15% on all three, with the expert GEMMs moving ~57 GB/s
+  of weights (roughly: per-layer `[prof-moe]` stage times against the expert
+  bytes), so it is near the memory bound; the f32 path is kept because switching
+  decode to int8 activations would change every MoE golden.
+- **ERNIE prefill is ~1.5× faster with `--set kernels.cpu.repack_mb=0`** (warm
+  pp512 reps 105-126 vs 73-90, interleaved, two pairs), though ERNIE's MoE never
+  uses the Q4_K packs (its gate/up are split, the pack path needs
+  `fused_gate_up`). The slowdown lands inside `Op::MoeFfn`'s gate_up stage
+  (summed over a forward: 1279 ms at 0 vs 3617 ms at 4096) and also in the dense
+  `Linear m=511 2560x2560 Q4K`, neither of which reads a pack; the only thing
+  the budget changes there is whether the dense Q6_K packs (`q6k_pack_for`) are
+  cached or rebuilt (via rayon) per call. Not explained. Qwen3-30B-A3B shows no
+  difference between the two budgets.
+- **The first forward pays the mmap page-in**: a fresh process's first pp512 rep
+  is ~26 t/s (gate_up stage 300-390 ms per layer cold vs 31-43 warm). Windows
+  gets no `WillNeed` hint (the `madvise` in `Gguf::map_and_parse` is
+  `cfg(unix)`). End to end a cold `infr bench -p 512 -r 1` (20.3 s wall) still
+  beats `llama-bench -p 512 -r 1 --no-warmup` (30.6 s), which pays the read at
+  load into its repacked buffers, so this is where the cost sits, not extra
+  cost. A `PrefetchVirtualMemory` at load would move it out of the first
+  request.
+- **Allocation churn**: a pp512 forward faults ~350K pages/s throughout warm
+  reps with private bytes flat at ~300 MB — large per-op `Vec`s mapped fresh and
+  released each op. Reusing `Op::MoeFfn`'s four stage buffers across calls cut
+  the fault rate roughly in half and moved ERNIE pp512 by ~4% (within noise over
+  two pairs), so it was not kept; the faults are not the prefill gap.
 
 ### B174 — the loose MoE prefill comparison passes a Vulkan router that ignores the bias (2026-11-14)
 
@@ -4767,3 +4795,41 @@ printed 314 values of `ffn_moe_weights_sum` across the 27 MoE layers (it elides
 middle rows), between 0.1847 and 0.8639. No change made; matching the clamp
 would only matter for a router whose bias routinely selects
 near-zero-probability experts.
+
+### B177 — the CPU f32 expert dot keeps hand-written Q4_K/Q5_K/Q6_K/Q8_0 decoders beside `factor_block` (2026-11-14)
+
+**Tag:** perf · cpu · duplication
+
+`dequant_row::decode_span` decodes Q4_K, Q5_K, Q6_K and Q8_0 through its own
+`q4k_block`/`q5k_block`/`q6k_block`/`q8_0_block`, which repeat the bit layouts
+`infr_gguf::dequant::factor_block` owns; the other six affine formats go through
+`factor_block` + `expand_factored` (the decode `bytes_to_f32` uses). Routing the
+four through the shared pair was tried and measured slower, interleaved, warm
+`tg64` reps on the Windows box: ERNIE-4.5-21B-A3B 12.13-12.19 t/s against
+24.75-25.68 for the hand-written decoders, with `factor_block` and
+`expand_factored` `#[inline(always)]`, one call site per format with a literal
+dtype, the block geometry a `const`, and the dot accumulating in registers; an
+earlier shared build without the per-format call sites measured Qwen3-30B-A3B
+10.33-10.89 against 26.20-26.88. A single-thread microbenchmark (since deleted)
+put the shared Q4_K decode at 78-79 ns per block against 52-55 hand-written and
+Q6_K at 79-82 against 105-108, so it does not account for the whole production
+gap; the cause was not found. The duplication is held by
+`decode_span_matches_bytes_to_f32_bitwise` and the two dot tests, which compare
+every format bit for bit against `bytes_to_f32`. Closing it means finding what
+the shared form costs in the multi-threaded expert GEMM (a profile of
+`expert_gemm_range` on both builds) and making `factor_block`'s hot arms as
+cheap as the hand-written ones, then deleting the four copies.
+
+### B178 — codebook and fp4 expert banks still dequantize per row through `bytes_to_f32` on CPU decode (2026-11-14)
+
+**Tag:** perf · cpu · moe
+
+`dequant_row::dequant_dot_rows` decodes only the formats with a factored form.
+Every other dtype — the IQ and TQ quants, MXFP4 (gpt-oss's expert banks), NVFP4,
+Q2_0 — still takes `dot(&bytes_to_f32(row, dt), x)` per weight row per routed
+expert on a single-token MoE step, the allocation-heavy path that made ERNIE and
+Qwen3 decode 3.4-3.5× slower before the affine formats moved off it. Not
+measured on a model in those formats (none is cached on the Windows box). The
+fix is the same shape: a per-block f32 decode into a stack span from the
+codebook decoders `dequant_codebook` already has, held bit for bit against
+`bytes_to_f32`.

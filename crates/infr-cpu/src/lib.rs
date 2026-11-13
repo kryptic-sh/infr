@@ -14,6 +14,7 @@ pub mod paged;
 mod pool;
 pub mod turbo;
 
+mod dequant_row;
 mod kernels;
 mod moe;
 mod quant;

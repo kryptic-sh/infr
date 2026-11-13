@@ -18,6 +18,7 @@ mod dequant_row;
 mod kernels;
 mod moe;
 mod quant;
+mod recycle;
 mod repack;
 
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
@@ -33,7 +34,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    dot, dot_bf16, dot_f16, gated_act_fn, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
+    dot, dot_bf16, dot_f16, dot_n, gated_act_fn, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
     vec_dot_iq1s_batch, vec_dot_iq2s, vec_dot_iq2s_batch, vec_dot_iq2xs, vec_dot_iq2xs_batch,
     vec_dot_iq2xxs, vec_dot_iq2xxs_batch, vec_dot_iq3s, vec_dot_iq3s_batch, vec_dot_iq3xxs,
     vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch, vec_dot_iq4xs, vec_dot_iq4xs_batch,
@@ -47,8 +48,8 @@ use kernels::{
 use moe::{expert_acts_kind, expert_gemm_range, ActsKind, ExpertActs};
 use quant::{quantize_q8, quantize_q8_32, Q8x32, Q8};
 #[cfg(target_arch = "x86_64")]
-use repack::{q4k_pack, q6k_gemm_group, q6k_pack, Q6kPack};
-use repack::{Q4kPack, Repack6CacheState, RepackCacheState};
+use repack::q4k_pack;
+use repack::{Q4kPack, RepackCacheState};
 
 /// Dequantized-weight cache: `(buffer address, byte-len, dtype) -> Arc<f32>`. See `weight_cache`.
 type WeightCache = HashMap<(u64, DType), Arc<Vec<f32>>>;
@@ -245,10 +246,6 @@ pub struct CpuBackend {
     /// packs are built transient and not inserted. The `usize` is the current cached-bytes total.
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     repack_cache: Mutex<RepackCacheState>,
-    /// Q6_K sibling of `repack_cache` (same keying and budget knob; separate accounting) — holds
-    /// e.g. the tied Q6_K lm_head's ~740 MB pack, built once per session.
-    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-    repack6_cache: Mutex<Repack6CacheState>,
     /// Persistent spin-pool for the op interpreter's parallel loops (see `pool.rs`, threadpool
     /// restructure phase 2). Built on first use so backends constructed for tests/tiny work
     /// never spawn threads. MoeFfn's nested per-expert fan-out stays on rayon (phase 3).
@@ -291,7 +288,6 @@ impl CpuBackend {
         Self {
             weight_cache: Mutex::default(),
             repack_cache: Mutex::default(),
-            repack6_cache: Mutex::default(),
             pool: std::sync::OnceLock::new(),
             cfg,
         }
@@ -334,8 +330,8 @@ impl CpuBackend {
             .get_or_init(|| pool::SpinPool::new(&self.cfg.kernels.cpu))
     }
 
-    /// The repack caches' byte budget (`kernels.cpu.repack_mb`, MiB → bytes). One spelling for both
-    /// [`Self::q4k_pack_for`] and [`Self::q6k_pack_for`], which had the same parse twice.
+    /// The repack cache's byte budget (`kernels.cpu.repack_mb`, MiB → bytes), read by
+    /// [`Self::q4k_pack_for`].
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) fn repack_budget_bytes(&self) -> usize {
         self.cfg.kernels.cpu.repack_mb * 1024 * 1024
@@ -363,23 +359,59 @@ impl CpuBackend {
         repack::cache_insert_if_absent(&mut guard, key, pack, bytes, self.repack_budget_bytes())
     }
 
-    /// Fetch-or-build the [`Q6kPack`] for one weight bank slice — `q4k_pack_for`'s Q6_K sibling.
+    /// Prefill `Op::Linear` on the packed VNNI GEMM (see [`linear_packed_ok`]): `out` is the
+    /// row-major `[m, out_f]` result, written in full. Each task packs one 8-row group into its
+    /// thread's scratch group and runs the GEMM over every token: the pack costs one pass over
+    /// the group's weights, which the `m` tokens share, and nothing is held past the call. The
+    /// `out_f % 8` tail rows take the per-row batch kernels. Every kernel here is bit-identical
+    /// to the single-token one, so the result does not depend on the route.
     #[cfg(target_arch = "x86_64")]
-    pub(crate) fn q6k_pack_for(
+    fn linear_packed(
         &self,
-        key: repack::PackKey,
-        w: &[u8],
+        dt: DType,
+        wbytes: &[u8],
         in_f: usize,
         out_f: usize,
-    ) -> Arc<Q6kPack> {
-        if let Some(p) = self.repack6_cache.lock().unwrap().0.get(&key) {
-            return p.clone();
+        q8s: &[Q8],
+        out: &mut [f32],
+    ) {
+        let m = q8s.len();
+        assert_eq!(out.len(), m * out_f);
+        let (nb, bpr, groups) = (in_f / 256, wbytes.len() / out_f, out_f / 8);
+        let gout = repack::GemmOut::row_major(out, out_f);
+        // SAFETY (both arms): `linear_packed_ok` checked AVX-512BW + VNNI; each task writes only
+        // its own group's rows `8g..8g + 8` of `out`, which outlives the `run`.
+        match dt {
+            DType::Q4K | DType::Q5K => self.pool().run(groups, &|g| unsafe {
+                let rows =
+                    std::array::from_fn(|i| &wbytes[(8 * g + i) * bpr..(8 * g + i + 1) * bpr]);
+                repack::q4k_pack_and_gemm_group(dt, rows, nb, q8s, gout, 8 * g);
+            }),
+            DType::Q6K => self.pool().run(groups, &|g| unsafe {
+                let rows =
+                    std::array::from_fn(|i| &wbytes[(8 * g + i) * bpr..(8 * g + i + 1) * bpr]);
+                repack::q6k_pack_and_gemm_group(rows, nb, q8s, gout, 8 * g);
+            }),
+            _ => unreachable!("linear_packed_ok admits Q4_K, Q5_K and Q6_K only"),
         }
-        let pack = Arc::new(q6k_pack(w, in_f, out_f));
-        let bytes = pack.bytes();
-        // Re-check under the lock: another thread may have inserted `key` between our miss and here.
-        let mut guard = self.repack6_cache.lock().unwrap();
-        repack::cache_insert_if_absent(&mut guard, key, pack, bytes, self.repack_budget_bytes())
+        let tail = out_f - 8 * groups;
+        if tail > 0 {
+            let mut cols = vec![0f32; tail * m];
+            self.pool().for_chunks_mut(&mut cols, m, 1, &|i, col| {
+                let o = 8 * groups + i;
+                let row = &wbytes[o * bpr..(o + 1) * bpr];
+                match dt {
+                    DType::Q4K => vec_dot_q4k_batch(row, q8s, in_f, col),
+                    DType::Q5K => vec_dot_q5k_batch(row, q8s, in_f, col),
+                    _ => vec_dot_q6k_batch(row, q8s, in_f, col),
+                }
+            });
+            for (i, col) in cols.chunks(m).enumerate() {
+                for (r, &v) in col.iter().enumerate() {
+                    out[r * out_f + 8 * groups + i] = v;
+                }
+            }
+        }
     }
 
     /// Wrap a zero-copy GGUF mmap view as a read-only weight buffer (no allocation, no `memcpy`).
@@ -463,6 +495,25 @@ pub(crate) fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
         // F32 / F16 / Bf16 / all quant + codebook types go through the shared host dequant.
         other => dequant_block(other, bytes).expect("cpu backend: host dequant"),
     }
+}
+
+/// Whether a prefill `Op::Linear` of `m` tokens over this weight runs on
+/// [`CpuBackend::linear_packed`]: Q4_K, Q5_K or Q6_K with at least one full 8-row group, at
+/// least [`repack::packed_min_tokens`] tokens, on a CPU with AVX-512BW and AVX-512 VNNI.
+#[cfg(target_arch = "x86_64")]
+fn linear_packed_ok(dt: DType, in_f: usize, out_f: usize, m: usize) -> bool {
+    matches!(dt, DType::Q4K | DType::Q5K | DType::Q6K)
+        && out_f >= 8
+        && in_f.is_multiple_of(256)
+        && m >= repack::packed_min_tokens(dt)
+        && is_x86_feature_detected!("avx512bw")
+        && is_x86_feature_detected!("avx512vnni")
+}
+
+/// The packed GEMM is x86_64-only, so off it no Linear takes that route.
+#[cfg(not(target_arch = "x86_64"))]
+const fn linear_packed_ok(_dt: DType, _in_f: usize, _out_f: usize, _m: usize) -> bool {
+    false
 }
 
 /// An F32 weight row as `f32`s: borrowed in place when it is 4-aligned (the hot path — every
@@ -769,6 +820,9 @@ impl Backend for CpuBackend {
         // f32 working store for every Input/Internal/Output handle (weights are read on demand:
         // norms via the small dequant cache, `Op::Linear` weights streamed row-by-row).
         let mut vals: Vec<Vec<f32>> = vec![Vec::new(); g.tensors.len()];
+        // Large op outputs come out of (and replaced tensors go back into) this pool, so a
+        // layer reuses the buffers the previous layer freed instead of faulting in fresh pages.
+        let mut rc = recycle::Recycler::default();
         // KV-cache tensors (the `cache` of `WriteKv`, the `k_cache`/`v_cache` of `Attention`) are
         // accessed straight from their bound buffers — `WriteKv` writes one row, `Attention` reads
         // `kv_len` rows. They're sized for the WHOLE context (`max_ctx`), so loading them into `vals`
@@ -780,7 +834,7 @@ impl Backend for CpuBackend {
         for (id, decl, p) in infr_core::exec::provisions(g) {
             let i = id.0 as usize;
             match p {
-                Provision::Zero => vals[i] = vec![0f32; decl.desc.numel()],
+                Provision::Zero => vals[i] = rc.zeroed(decl.desc.numel()),
                 Provision::Load => {
                     let buf = bindings.get(id).expect("cpu backend: unbound Input");
                     let bytes = cpu_buf(buf).read();
@@ -843,7 +897,7 @@ impl Backend for CpuBackend {
                     let ws = weight(w);
                     // Rows are independent (no cross-row reduction) — spin-pool over rows, same
                     // per-row math and order as before (bit-identical, just distributed).
-                    let mut out = vec![0f32; rows * dim];
+                    let mut out = rc.for_overwrite(rows * dim);
                     self.pool().for_chunks_mut(&mut out, dim, 4, &|r, orow| {
                         let xrow = &xs[r * dim..r * dim + dim];
                         let ss: f32 = (0..dim).map(|i| xrow[i] * xrow[i]).sum::<f32>() / dim as f32;
@@ -852,7 +906,7 @@ impl Backend for CpuBackend {
                             orow[i] = xrow[i] * s * ws[i];
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::RmsNormAdd {
                     x,
@@ -865,7 +919,7 @@ impl Backend for CpuBackend {
                     let dim = dim as usize;
                     let xs = &vals[x.0 as usize];
                     let ws = weight(w);
-                    let mut dst_vals = vals[dst.0 as usize].clone();
+                    let mut dst_vals = rc.copy_of(&vals[dst.0 as usize]);
                     self.pool()
                         .for_chunks_mut(&mut dst_vals, dim, 4, &|r, drow| {
                             let xrow = &xs[r * dim..r * dim + dim];
@@ -876,7 +930,7 @@ impl Backend for CpuBackend {
                                 drow[i] += xrow[i] * s * ws[i];
                             }
                         });
-                    vals[dst.0 as usize] = dst_vals;
+                    rc.set(&mut vals, dst.0 as usize, dst_vals);
                 }
                 Op::LayerNorm {
                     x,
@@ -893,7 +947,7 @@ impl Backend for CpuBackend {
                     let bs = weight(bias);
                     // Mean-centred norm (ggml_norm): biased variance, eps inside the sqrt, then
                     // `* weight + bias`. Rows are independent — spin-pool over rows like RmsNorm.
-                    let mut out = vec![0f32; rows * dim];
+                    let mut out = rc.for_overwrite(rows * dim);
                     self.pool().for_chunks_mut(&mut out, dim, 4, &|r, orow| {
                         let xrow = &xs[r * dim..r * dim + dim];
                         let mean = xrow.iter().sum::<f32>() / dim as f32;
@@ -904,7 +958,7 @@ impl Backend for CpuBackend {
                             orow[i] = (xrow[i] - mean) * s * ws[i] + bs[i];
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::Softmax {
                     x,
@@ -923,7 +977,7 @@ impl Backend for CpuBackend {
                         None => scale,
                     };
                     let xs = &vals[x.0 as usize];
-                    let mut out = vec![0f32; rows * dim];
+                    let mut out = rc.zeroed(rows * dim);
                     self.pool().for_chunks_mut(&mut out, dim, 1, &|r, o| {
                         let row = &xs[r * dim..r * dim + dim];
                         let mx = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v * scale));
@@ -938,7 +992,7 @@ impl Backend for CpuBackend {
                             *dst_v *= inv;
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::QkNorm {
                     x,
@@ -958,7 +1012,7 @@ impl Backend for CpuBackend {
                     // `None` = V4's weightless Q norm (bare `ggml_rms_norm` per head): the scale is
                     // the only factor. The reduction is identical either way.
                     let ws = w.map(weight);
-                    let mut out = vec![0f32; rows * nh * hd];
+                    let mut out = rc.zeroed(rows * nh * hd);
                     for r in 0..rows {
                         for h in 0..nh {
                             let b = (r * nh + h) * hd;
@@ -979,7 +1033,7 @@ impl Backend for CpuBackend {
                             }
                         }
                     }
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 // Fused per-head RMSNorm + SiLU gate multiply (qwen35 DeltaNet z-gate). Reduction
                 // structure is IDENTICAL to the `QkNorm` arm above (bit-stable normalization); the
@@ -999,7 +1053,7 @@ impl Backend for CpuBackend {
                     let xs = &vals[x.0 as usize];
                     let zs = &vals[gate.0 as usize];
                     let ws = weight(w);
-                    let mut out = vec![0f32; rows * nh * hd];
+                    let mut out = rc.zeroed(rows * nh * hd);
                     for r in 0..rows {
                         for h in 0..nh {
                             let b = (r * nh + h) * hd;
@@ -1014,7 +1068,7 @@ impl Backend for CpuBackend {
                             }
                         }
                     }
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::Linear {
                     x,
@@ -1040,14 +1094,14 @@ impl Backend for CpuBackend {
                     let bpr = bytes.len() / total_rows; // bytes per weight row
                     let row0 = w_off as usize / in_f;
                     let wbytes: &[u8] = &bytes[row0 * bpr..(row0 + out_f) * bpr];
-                    let mut out = vec![0f32; m * out_f];
+                    let mut out = rc.for_overwrite(m * out_f);
                     // REFERENCE mode (see `CpuBackend::reference`): decode the weight row to f32 and
                     // take a plain f32 dot, so the ONLY error is the weight's own quantization —
                     // the int8-activation kernels below carry ~4e-3 relative error, which flips
                     // greedy tokens at Q2_K. The float dtypes already take an exact dot, so they
                     // stay on their (identical, faster) production arms.
                     if reference && !matches!(dt, DType::F32 | DType::F16 | DType::Bf16) {
-                        let mut out_t = vec![0f32; out_f * m];
+                        let mut out_t = rc.zeroed(out_f * m);
                         self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                             let row = &wbytes[o * bpr..o * bpr + bpr];
                             let wf = bytes_to_f32(row, dt);
@@ -1060,7 +1114,8 @@ impl Backend for CpuBackend {
                                 *dst = out_t[o * m + r];
                             }
                         });
-                        vals[dst.0 as usize] = out;
+                        rc.give(out_t);
+                        rc.set(&mut vals, dst.0 as usize, out);
                         continue;
                     }
                     // One token (decode) is the hot path. Dispatch on the weight dtype to the fastest
@@ -1242,287 +1297,263 @@ impl Backend for CpuBackend {
                         } else {
                             Vec::new()
                         };
-                        let mut out_t = vec![0f32; out_f * m];
-                        // For Q4_K, use 8-row tiling: each rayon task handles 8 consecutive
-                        // output rows and loads the Q8 activation zmm ONCE per (block, nibble-pair),
-                        // reusing it across all 8 weight rows. This is 4× less activation traffic
-                        // than the 2-row path and 8× less than the single-row path. Remainder rows
-                        // (out_f % 8) fall through to the 2-row tile then the 1-row batch.
-                        if dt == DType::Q4K && out_f >= 8 {
-                            let groups8 = out_f / 8;
-                            let rem = out_f % 8;
-                            let (g8_t, rest_t) = out_t.split_at_mut(groups8 * 8 * m);
-                            // 8-row groups across the spin-pool.
-                            self.pool().for_chunks_mut(g8_t, 8 * m, 1, &|g, dc| {
-                                let o = g * 8;
-                                let (r0, rest) = dc.split_at_mut(m);
-                                let (r1, rest) = rest.split_at_mut(m);
-                                let (r2, rest) = rest.split_at_mut(m);
-                                let (r3, rest) = rest.split_at_mut(m);
-                                let (r4, rest) = rest.split_at_mut(m);
-                                let (r5, rest) = rest.split_at_mut(m);
-                                let (r6, r7) = rest.split_at_mut(m);
-                                vec_dot_q4k_batch8(
-                                    [
-                                        &wbytes[o * bpr..o * bpr + bpr],
-                                        &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr],
-                                        &wbytes[(o + 2) * bpr..(o + 2) * bpr + bpr],
-                                        &wbytes[(o + 3) * bpr..(o + 3) * bpr + bpr],
-                                        &wbytes[(o + 4) * bpr..(o + 4) * bpr + bpr],
-                                        &wbytes[(o + 5) * bpr..(o + 5) * bpr + bpr],
-                                        &wbytes[(o + 6) * bpr..(o + 6) * bpr + bpr],
-                                        &wbytes[(o + 7) * bpr..(o + 7) * bpr + bpr],
-                                    ],
-                                    &q8s,
-                                    in_f,
-                                    [r0, r1, r2, r3, r4, r5, r6, r7],
-                                );
-                            });
-                            // Remainder: up to 7 rows → 2-row pairs, then at most 1 odd tail.
-                            let pairs_rem = rem / 2;
-                            let (g2_t, odd_t) = rest_t.split_at_mut(pairs_rem * 2 * m);
-                            if pairs_rem > 0 {
-                                self.pool().for_chunks_mut(g2_t, 2 * m, 1, &|pair, dc| {
-                                    let o = groups8 * 8 + pair * 2;
+                        // AVX-512 VNNI: Q4_K, Q5_K and Q6_K run the packed 8-row GEMM straight
+                        // into the row-major output, with no o-major temp to transpose after.
+                        if linear_packed_ok(dt, in_f, out_f, m) {
+                            #[cfg(target_arch = "x86_64")]
+                            self.linear_packed(dt, wbytes, in_f, out_f, &q8s, &mut out);
+                            #[cfg(not(target_arch = "x86_64"))]
+                            unreachable!("linear_packed_ok is false off x86_64");
+                        } else {
+                            let mut out_t = rc.zeroed(out_f * m);
+                            // For Q4_K, use 8-row tiling: each rayon task handles 8 consecutive
+                            // output rows and loads the Q8 activation zmm ONCE per (block, nibble-pair),
+                            // reusing it across all 8 weight rows. This is 4× less activation traffic
+                            // than the 2-row path and 8× less than the single-row path. Remainder rows
+                            // (out_f % 8) fall through to the 2-row tile then the 1-row batch.
+                            if dt == DType::Q4K && out_f >= 8 {
+                                let groups8 = out_f / 8;
+                                let rem = out_f % 8;
+                                let (g8_t, rest_t) = out_t.split_at_mut(groups8 * 8 * m);
+                                // 8-row groups across the spin-pool.
+                                self.pool().for_chunks_mut(g8_t, 8 * m, 1, &|g, dc| {
+                                    let o = g * 8;
+                                    let (r0, rest) = dc.split_at_mut(m);
+                                    let (r1, rest) = rest.split_at_mut(m);
+                                    let (r2, rest) = rest.split_at_mut(m);
+                                    let (r3, rest) = rest.split_at_mut(m);
+                                    let (r4, rest) = rest.split_at_mut(m);
+                                    let (r5, rest) = rest.split_at_mut(m);
+                                    let (r6, r7) = rest.split_at_mut(m);
+                                    vec_dot_q4k_batch8(
+                                        [
+                                            &wbytes[o * bpr..o * bpr + bpr],
+                                            &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr],
+                                            &wbytes[(o + 2) * bpr..(o + 2) * bpr + bpr],
+                                            &wbytes[(o + 3) * bpr..(o + 3) * bpr + bpr],
+                                            &wbytes[(o + 4) * bpr..(o + 4) * bpr + bpr],
+                                            &wbytes[(o + 5) * bpr..(o + 5) * bpr + bpr],
+                                            &wbytes[(o + 6) * bpr..(o + 6) * bpr + bpr],
+                                            &wbytes[(o + 7) * bpr..(o + 7) * bpr + bpr],
+                                        ],
+                                        &q8s,
+                                        in_f,
+                                        [r0, r1, r2, r3, r4, r5, r6, r7],
+                                    );
+                                });
+                                // Remainder: up to 7 rows → 2-row pairs, then at most 1 odd tail.
+                                let pairs_rem = rem / 2;
+                                let (g2_t, odd_t) = rest_t.split_at_mut(pairs_rem * 2 * m);
+                                if pairs_rem > 0 {
+                                    self.pool().for_chunks_mut(g2_t, 2 * m, 1, &|pair, dc| {
+                                        let o = groups8 * 8 + pair * 2;
+                                        let (chunk_a, chunk_b) = dc.split_at_mut(m);
+                                        let row_a = &wbytes[o * bpr..o * bpr + bpr];
+                                        let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
+                                        vec_dot_q4k_batch2(
+                                            row_a, row_b, &q8s, in_f, chunk_a, chunk_b,
+                                        );
+                                    });
+                                }
+                                if rem % 2 != 0 {
+                                    let o = out_f - 1;
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
+                                }
+                            } else if dt == DType::Q4K && out_f >= 2 {
+                                // Small out_f < 8: fall back to 2-row tile.
+                                let pairs = out_f / 2;
+                                let (even_t, odd_t) = out_t.split_at_mut(pairs * 2 * m);
+                                self.pool().for_chunks_mut(even_t, 2 * m, 1, &|pair, dc| {
+                                    let o = pair * 2;
                                     let (chunk_a, chunk_b) = dc.split_at_mut(m);
                                     let row_a = &wbytes[o * bpr..o * bpr + bpr];
                                     let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
                                     vec_dot_q4k_batch2(row_a, row_b, &q8s, in_f, chunk_a, chunk_b);
                                 });
-                            }
-                            if rem % 2 != 0 {
-                                let o = out_f - 1;
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
-                            }
-                        } else if dt == DType::Q4K && out_f >= 2 {
-                            // Small out_f < 8: fall back to 2-row tile.
-                            let pairs = out_f / 2;
-                            let (even_t, odd_t) = out_t.split_at_mut(pairs * 2 * m);
-                            self.pool().for_chunks_mut(even_t, 2 * m, 1, &|pair, dc| {
-                                let o = pair * 2;
-                                let (chunk_a, chunk_b) = dc.split_at_mut(m);
-                                let row_a = &wbytes[o * bpr..o * bpr + bpr];
-                                let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
-                                vec_dot_q4k_batch2(row_a, row_b, &q8s, in_f, chunk_a, chunk_b);
-                            });
-                            if out_f % 2 != 0 {
-                                let o = out_f - 1;
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
-                            }
-                        } else if dt == DType::Q6K && out_f >= 8 && in_f.is_multiple_of(256) && {
-                            // `is_x86_feature_detected!` fails to COMPILE on aarch64 even behind
-                            // a runtime `cfg!` — it needs a real #[cfg] block (macOS CI trap).
-                            #[cfg(target_arch = "x86_64")]
-                            {
-                                is_x86_feature_detected!("avx512bw")
-                                    && is_x86_feature_detected!("avx512vnni")
-                            }
-                            #[cfg(not(target_arch = "x86_64"))]
-                            {
-                                false
-                            }
-                        } {
-                            // Q6_K on the interleaved-x8 pack (the tied Q6_K lm_head is a 189
-                            // GMAC GEMM every DG denoise step): 8 weight rows per activation
-                            // pass instead of 1 — same activation-reuse trick Q4_K got.
-                            #[cfg(target_arch = "x86_64")]
-                            {
-                                // Key the pack by the weight buffer's uid + this projection's byte
-                                // range inside it (`w_off` selects a slice of a fused weight), not
-                                // by `wbytes`' address — see `repack::PackKey`.
-                                let pack = self.q6k_pack_for(
-                                    (cpu_buf(buf).uid, row0 * bpr, wbytes.len()),
-                                    wbytes,
-                                    in_f,
-                                    out_f,
-                                );
-                                let groups8 = out_f / 8;
-                                let rem = out_f % 8;
-                                let (g8_t, rest_t) = out_t.split_at_mut(groups8 * 8 * m);
-                                self.pool().for_chunks_mut(g8_t, 8 * m, 1, &|g, dc| {
-                                    // SAFETY: VNNI dispatch checked in the branch condition.
-                                    unsafe { q6k_gemm_group(&pack.groups[g], pack.nb, &q8s, dc) };
+                                if out_f % 2 != 0 {
+                                    let o = out_f - 1;
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
+                                }
+                            } else if q8_0_blk32 {
+                                // Q8_0 weight with a sub-256 `in_f` (multiple of 32 but not 256): the
+                                // 256-superblock Q8 batch kernel would truncate the tail, so use the
+                                // native 32-block Q8x32-activation batch kernel instead. `in_f % 32 == 0`
+                                // always holds for a Q8_0 (32-block) weight.
+                                let q8s32: Vec<Q8x32> = self.pool().collect(m, &|r| {
+                                    quantize_q8_32(&xs[r * in_f..r * in_f + in_f])
                                 });
-                                if rem > 0 {
-                                    self.pool().for_chunks_mut(rest_t, m, 1, &|i, chunk| {
-                                        let o = groups8 * 8 + i;
-                                        let row = &wbytes[o * bpr..o * bpr + bpr];
-                                        vec_dot_q6k_batch(row, &q8s, in_f, chunk);
-                                    });
-                                }
+                                self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_q8_0_32_batch(row, &q8s32, in_f, chunk);
+                                });
+                            } else if dt == DType::Q5_0 && in_f.is_multiple_of(32) {
+                                // Dense-layer Q5_0 (DG stores 16 of its 30 dense ffn_down weights as
+                                // Q5_0): reuse the MoE path's Q8x32-activation batch kernel. This
+                                // dtype previously fell through to the dequant+f32-dot fallback below
+                                // (~11% of every DG denoise step in the samply profile) — the switch
+                                // puts it on the same int8-quantized-activation regime every other
+                                // quantized dtype in this dispatch already uses.
+                                let q8s32: Vec<Q8x32> = self.pool().collect(m, &|r| {
+                                    quantize_q8_32(&xs[r * in_f..r * in_f + in_f])
+                                });
+                                self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_q5_0_32_batch(row, &q8s32, in_f, chunk);
+                                });
+                            } else if dt == DType::Q5_1 && in_f.is_multiple_of(32) {
+                                // Q5_1 (affine sibling of Q5_0: `y = d·q5 + m`, 5-bit code + f16 `m`
+                                // min, block stride 24): previously fell through to the dequant+f32
+                                // fallback below. Reuse the Q8x32-activation batch kernel with the
+                                // affine per-block form.
+                                let q8s32: Vec<Q8x32> = self.pool().collect(m, &|r| {
+                                    quantize_q8_32(&xs[r * in_f..r * in_f + in_f])
+                                });
+                                self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_q5_1_32_batch(row, &q8s32, in_f, chunk);
+                                });
+                            } else if dt == DType::Q4_0 && in_f.is_multiple_of(32) {
+                                // Q4_0 (same 32-block int8-activation regime as Q5_0, minus the 5th
+                                // bit and with offset 8): previously fell through to the dequant+f32
+                                // fallback below. Reuse the Q8x32-activation batch kernel.
+                                let q8s32: Vec<Q8x32> = self.pool().collect(m, &|r| {
+                                    quantize_q8_32(&xs[r * in_f..r * in_f + in_f])
+                                });
+                                self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_q4_0_32_batch(row, &q8s32, in_f, chunk);
+                                });
+                            } else if dt == DType::Q4_1 && in_f.is_multiple_of(32) {
+                                // Q4_1 (affine sibling of Q4_0: `y = d·q4 + m`, block stride 20):
+                                // previously fell through to the dequant+f32 fallback below. Reuse the
+                                // Q8x32-activation batch kernel with the affine per-block form.
+                                let q8s32: Vec<Q8x32> = self.pool().collect(m, &|r| {
+                                    quantize_q8_32(&xs[r * in_f..r * in_f + in_f])
+                                });
+                                self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_q4_1_32_batch(row, &q8s32, in_f, chunk);
+                                });
+                            } else if dt == DType::Iq4Nl && in_f.is_multiple_of(32) {
+                                // IQ4_NL (flat 32-block codebook cousin of IQ4_XS: ONE f16 `d` per
+                                // 32-weight block, signed KVALUES codebook, no super-block scales):
+                                // previously fell through to the dequant+f32 fallback below. Reuse the
+                                // Q8x32-activation batch kernel with the codebook signed-dot.
+                                let q8s32: Vec<Q8x32> = self.pool().collect(m, &|r| {
+                                    quantize_q8_32(&xs[r * in_f..r * in_f + in_f])
+                                });
+                                self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_iq4nl_32_batch(row, &q8s32, in_f, chunk);
+                                });
+                            } else if dt == DType::Mxfp4 && in_f.is_multiple_of(32) {
+                                // MXFP4 (flat 32-block codebook, structurally identical to IQ4_NL but
+                                // with a 1-byte E8M0 exponent scale `d = 2^(e−128)` per block and the
+                                // KVALUES_MXFP4 codebook): previously fell through to the dequant+f32
+                                // fallback below. Reuse the Q8x32-activation batch kernel.
+                                let q8s32: Vec<Q8x32> = self.pool().collect(m, &|r| {
+                                    quantize_q8_32(&xs[r * in_f..r * in_f + in_f])
+                                });
+                                self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_mxfp4_32_batch(row, &q8s32, in_f, chunk);
+                                });
+                            } else if dt == DType::Q2_0 && in_f.is_multiple_of(64) {
+                                // Q2_0 ("Bonsai ternary", 2-bit linear-offset quant on a 64-weight
+                                // block): previously fell through to the dequant+f32 fallback below.
+                                // Reuse the Q8x32-activation batch kernel — each 64-weight block maps to
+                                // two consecutive 32-element activation sub-blocks. Guarded on
+                                // `is_multiple_of(64)` (the block size) so the sub-block count is even.
+                                let q8s32: Vec<Q8x32> = self.pool().collect(m, &|r| {
+                                    quantize_q8_32(&xs[r * in_f..r * in_f + in_f])
+                                });
+                                self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_q2_0_batch(row, &q8s32, in_f, chunk);
+                                });
+                            } else if dt == DType::Nvfp4 && in_f.is_multiple_of(64) {
+                                // NVFP4 (E2M1 codebook + four per-16-element UE4M3 sub-block scales on a
+                                // 64-weight block): previously fell through to the dequant+f32 fallback
+                                // below. Reuse the Q8x32-activation batch kernel — each 64-weight block
+                                // maps to two consecutive 32-element activation sub-blocks, and each of
+                                // those spans two NVFP4 sub-blocks with distinct weight scales. Guarded on
+                                // `is_multiple_of(64)` (the block size) so the sub-block count is even.
+                                let q8s32: Vec<Q8x32> = self.pool().collect(m, &|r| {
+                                    quantize_q8_32(&xs[r * in_f..r * in_f + in_f])
+                                });
+                                self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    vec_dot_nvfp4_batch(row, &q8s32, in_f, chunk);
+                                });
+                            } else {
+                                // Grain 8: at lm_head shape this loop is 262k one-row chunks; per-row
+                                // cursor claims (or rayon's per-item splitting) are real overhead.
+                                self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
+                                    let row = &wbytes[o * bpr..o * bpr + bpr];
+                                    match dt {
+                                        DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, chunk),
+                                        DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, chunk),
+                                        DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, chunk),
+                                        DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, chunk),
+                                        DType::Q2K => vec_dot_q2k_batch(row, &q8s, in_f, chunk),
+                                        DType::Q3K => vec_dot_q3k_batch(row, &q8s, in_f, chunk),
+                                        DType::Iq4Xs => vec_dot_iq4xs_batch(row, &q8s, in_f, chunk),
+                                        DType::Iq2S => vec_dot_iq2s_batch(row, &q8s, in_f, chunk),
+                                        DType::Iq2Xs => vec_dot_iq2xs_batch(row, &q8s, in_f, chunk),
+                                        DType::Iq2Xxs => {
+                                            vec_dot_iq2xxs_batch(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Iq1S => vec_dot_iq1s_batch(row, &q8s, in_f, chunk),
+                                        DType::Iq1M => vec_dot_iq1m_batch(row, &q8s, in_f, chunk),
+                                        DType::Iq3S => vec_dot_iq3s_batch(row, &q8s, in_f, chunk),
+                                        DType::Iq3Xxs => {
+                                            vec_dot_iq3xxs_batch(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Tq2_0 => vec_dot_tq2_0_batch(row, &q8s, in_f, chunk),
+                                        DType::Tq1_0 => vec_dot_tq1_0_batch(row, &q8s, in_f, chunk),
+                                        DType::F32 => {
+                                            let w32 = f32_row(row);
+                                            for r in 0..m {
+                                                chunk[r] =
+                                                    dot(&w32, &xs[r * in_f..r * in_f + in_f]);
+                                            }
+                                        }
+                                        DType::F16 => {
+                                            for r in 0..m {
+                                                chunk[r] =
+                                                    dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
+                                            }
+                                        }
+                                        DType::Bf16 => {
+                                            for r in 0..m {
+                                                chunk[r] =
+                                                    dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
+                                            }
+                                        }
+                                        _ => {
+                                            // Dequant the weight row ONCE, reuse across all m tokens.
+                                            let wf = bytes_to_f32(row, dt);
+                                            for r in 0..m {
+                                                chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
+                                            }
+                                        }
+                                    }
+                                });
                             }
-                        } else if q8_0_blk32 {
-                            // Q8_0 weight with a sub-256 `in_f` (multiple of 32 but not 256): the
-                            // 256-superblock Q8 batch kernel would truncate the tail, so use the
-                            // native 32-block Q8x32-activation batch kernel instead. `in_f % 32 == 0`
-                            // always holds for a Q8_0 (32-block) weight.
-                            let q8s32: Vec<Q8x32> = self
-                                .pool()
-                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
-                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_q8_0_32_batch(row, &q8s32, in_f, chunk);
-                            });
-                        } else if dt == DType::Q5_0 && in_f.is_multiple_of(32) {
-                            // Dense-layer Q5_0 (DG stores 16 of its 30 dense ffn_down weights as
-                            // Q5_0): reuse the MoE path's Q8x32-activation batch kernel. This
-                            // dtype previously fell through to the dequant+f32-dot fallback below
-                            // (~11% of every DG denoise step in the samply profile) — the switch
-                            // puts it on the same int8-quantized-activation regime every other
-                            // quantized dtype in this dispatch already uses.
-                            let q8s32: Vec<Q8x32> = self
-                                .pool()
-                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
-                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_q5_0_32_batch(row, &q8s32, in_f, chunk);
-                            });
-                        } else if dt == DType::Q5_1 && in_f.is_multiple_of(32) {
-                            // Q5_1 (affine sibling of Q5_0: `y = d·q5 + m`, 5-bit code + f16 `m`
-                            // min, block stride 24): previously fell through to the dequant+f32
-                            // fallback below. Reuse the Q8x32-activation batch kernel with the
-                            // affine per-block form.
-                            let q8s32: Vec<Q8x32> = self
-                                .pool()
-                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
-                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_q5_1_32_batch(row, &q8s32, in_f, chunk);
-                            });
-                        } else if dt == DType::Q4_0 && in_f.is_multiple_of(32) {
-                            // Q4_0 (same 32-block int8-activation regime as Q5_0, minus the 5th
-                            // bit and with offset 8): previously fell through to the dequant+f32
-                            // fallback below. Reuse the Q8x32-activation batch kernel.
-                            let q8s32: Vec<Q8x32> = self
-                                .pool()
-                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
-                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_q4_0_32_batch(row, &q8s32, in_f, chunk);
-                            });
-                        } else if dt == DType::Q4_1 && in_f.is_multiple_of(32) {
-                            // Q4_1 (affine sibling of Q4_0: `y = d·q4 + m`, block stride 20):
-                            // previously fell through to the dequant+f32 fallback below. Reuse the
-                            // Q8x32-activation batch kernel with the affine per-block form.
-                            let q8s32: Vec<Q8x32> = self
-                                .pool()
-                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
-                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_q4_1_32_batch(row, &q8s32, in_f, chunk);
-                            });
-                        } else if dt == DType::Iq4Nl && in_f.is_multiple_of(32) {
-                            // IQ4_NL (flat 32-block codebook cousin of IQ4_XS: ONE f16 `d` per
-                            // 32-weight block, signed KVALUES codebook, no super-block scales):
-                            // previously fell through to the dequant+f32 fallback below. Reuse the
-                            // Q8x32-activation batch kernel with the codebook signed-dot.
-                            let q8s32: Vec<Q8x32> = self
-                                .pool()
-                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
-                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_iq4nl_32_batch(row, &q8s32, in_f, chunk);
-                            });
-                        } else if dt == DType::Mxfp4 && in_f.is_multiple_of(32) {
-                            // MXFP4 (flat 32-block codebook, structurally identical to IQ4_NL but
-                            // with a 1-byte E8M0 exponent scale `d = 2^(e−128)` per block and the
-                            // KVALUES_MXFP4 codebook): previously fell through to the dequant+f32
-                            // fallback below. Reuse the Q8x32-activation batch kernel.
-                            let q8s32: Vec<Q8x32> = self
-                                .pool()
-                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
-                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_mxfp4_32_batch(row, &q8s32, in_f, chunk);
-                            });
-                        } else if dt == DType::Q2_0 && in_f.is_multiple_of(64) {
-                            // Q2_0 ("Bonsai ternary", 2-bit linear-offset quant on a 64-weight
-                            // block): previously fell through to the dequant+f32 fallback below.
-                            // Reuse the Q8x32-activation batch kernel — each 64-weight block maps to
-                            // two consecutive 32-element activation sub-blocks. Guarded on
-                            // `is_multiple_of(64)` (the block size) so the sub-block count is even.
-                            let q8s32: Vec<Q8x32> = self
-                                .pool()
-                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
-                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_q2_0_batch(row, &q8s32, in_f, chunk);
-                            });
-                        } else if dt == DType::Nvfp4 && in_f.is_multiple_of(64) {
-                            // NVFP4 (E2M1 codebook + four per-16-element UE4M3 sub-block scales on a
-                            // 64-weight block): previously fell through to the dequant+f32 fallback
-                            // below. Reuse the Q8x32-activation batch kernel — each 64-weight block
-                            // maps to two consecutive 32-element activation sub-blocks, and each of
-                            // those spans two NVFP4 sub-blocks with distinct weight scales. Guarded on
-                            // `is_multiple_of(64)` (the block size) so the sub-block count is even.
-                            let q8s32: Vec<Q8x32> = self
-                                .pool()
-                                .collect(m, &|r| quantize_q8_32(&xs[r * in_f..r * in_f + in_f]));
-                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                vec_dot_nvfp4_batch(row, &q8s32, in_f, chunk);
-                            });
-                        } else {
-                            // Grain 8: at lm_head shape this loop is 262k one-row chunks; per-row
-                            // cursor claims (or rayon's per-item splitting) are real overhead.
-                            self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
-                                let row = &wbytes[o * bpr..o * bpr + bpr];
-                                match dt {
-                                    DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, chunk),
-                                    DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, chunk),
-                                    DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, chunk),
-                                    DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, chunk),
-                                    DType::Q2K => vec_dot_q2k_batch(row, &q8s, in_f, chunk),
-                                    DType::Q3K => vec_dot_q3k_batch(row, &q8s, in_f, chunk),
-                                    DType::Iq4Xs => vec_dot_iq4xs_batch(row, &q8s, in_f, chunk),
-                                    DType::Iq2S => vec_dot_iq2s_batch(row, &q8s, in_f, chunk),
-                                    DType::Iq2Xs => vec_dot_iq2xs_batch(row, &q8s, in_f, chunk),
-                                    DType::Iq2Xxs => vec_dot_iq2xxs_batch(row, &q8s, in_f, chunk),
-                                    DType::Iq1S => vec_dot_iq1s_batch(row, &q8s, in_f, chunk),
-                                    DType::Iq1M => vec_dot_iq1m_batch(row, &q8s, in_f, chunk),
-                                    DType::Iq3S => vec_dot_iq3s_batch(row, &q8s, in_f, chunk),
-                                    DType::Iq3Xxs => vec_dot_iq3xxs_batch(row, &q8s, in_f, chunk),
-                                    DType::Tq2_0 => vec_dot_tq2_0_batch(row, &q8s, in_f, chunk),
-                                    DType::Tq1_0 => vec_dot_tq1_0_batch(row, &q8s, in_f, chunk),
-                                    DType::F32 => {
-                                        let w32 = f32_row(row);
-                                        for r in 0..m {
-                                            chunk[r] = dot(&w32, &xs[r * in_f..r * in_f + in_f]);
-                                        }
-                                    }
-                                    DType::F16 => {
-                                        for r in 0..m {
-                                            chunk[r] = dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
-                                        }
-                                    }
-                                    DType::Bf16 => {
-                                        for r in 0..m {
-                                            chunk[r] =
-                                                dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
-                                        }
-                                    }
-                                    _ => {
-                                        // Dequant the weight row ONCE, reuse across all m tokens.
-                                        let wf = bytes_to_f32(row, dt);
-                                        for r in 0..m {
-                                            chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
-                                        }
-                                    }
+                            // Transpose out_t[o * m + r] → out[r * out_f + o], parallel over the m output
+                            // rows (each gathers its out_f values from the o-major temp). The serial
+                            // version was ~20% of the matvec at large out_f × m.
+                            self.pool().for_chunks_mut(&mut out, out_f, 1, &|r, orow| {
+                                for (o, dst) in orow.iter_mut().enumerate() {
+                                    *dst = out_t[o * m + r];
                                 }
                             });
+                            rc.give(out_t);
                         }
-                        // Transpose out_t[o * m + r] → out[r * out_f + o], parallel over the m output
-                        // rows (each gathers its out_f values from the o-major temp). The serial
-                        // version was ~20% of the matvec at large out_f × m.
-                        self.pool().for_chunks_mut(&mut out, out_f, 1, &|r, orow| {
-                            for (o, dst) in orow.iter_mut().enumerate() {
-                                *dst = out_t[o * m + r];
-                            }
-                        });
                     }
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::Rope {
                     x,
@@ -1552,41 +1583,54 @@ impl Backend for CpuBackend {
                     let xs = &vals[x.0 as usize];
                     let pos = &vals[positions.0 as usize];
                     let ff = freq_factors.map(|f| &vals[f.0 as usize]);
-                    let mut out = xs.clone(); // dims beyond rope_dim pass through unchanged
-                                              // Pair p's two elements: INTERLEAVED (2p, 2p+1) for llama.cpp's ROPE_TYPE_NORM
-                                              // (the llama family, DeepSeek's q_pe/k_pe), SPLIT-HALF (p, p + rope_dim/2) for
-                                              // NEOX (deepseek32's lightning indexer). Angles and pass-through tail are the
-                                              // same either way — see `Op::Rope::neox`, and QkNormRope for the same pairing
-                                              // applied unconditionally.
+                    let mut out = rc.copy_of(xs); // dims beyond rope_dim pass through unchanged
+                                                  // Pair p's two elements: INTERLEAVED (2p, 2p+1) for llama.cpp's ROPE_TYPE_NORM
+                                                  // (the llama family, DeepSeek's q_pe/k_pe), SPLIT-HALF (p, p + rope_dim/2) for
+                                                  // NEOX (deepseek32's lightning indexer). Angles and pass-through tail are the
+                                                  // same either way — see `Op::Rope::neox`, and QkNormRope for the same pairing
+                                                  // applied unconditionally.
                     let hf = rd / 2;
-                    for r in 0..rows {
-                        let p0 = pos[r];
-                        for h in 0..nh {
-                            let b = (r * nh + h) * hd;
-                            for p in 0..hf {
-                                let (i0, i1) = if neox {
-                                    (p, p + hf)
-                                } else {
-                                    (2 * p, 2 * p + 1)
-                                };
-                                let mut ang = p0 * theta.powf(-2.0 * p as f32 / rd as f32);
-                                if let Some(ff) = &ff {
-                                    ang /= ff[p];
+                    // `ggml_rope_ext_back` is this rotation with `sin` negated and `cos`
+                    // untouched (`sin_sign` in ggml_compute_forward_rope_flt) — the transpose,
+                    // which is the inverse because nothing scales the magnitude here. See
+                    // `Op::Rope::backward`.
+                    let sin_sign = if backward { -1.0 } else { 1.0 };
+                    // Parallel over rows. A pair's angle depends on the row's position and the
+                    // pair index, never the head, so each row computes its (sin, cos) table once
+                    // and every head reuses it — the same values the per-head form computed.
+                    self.pool().for_chunks_mut(
+                        &mut out[..rows * nh * hd],
+                        nh * hd,
+                        1,
+                        &|r, orow| {
+                            let p0 = pos[r];
+                            let sc: Vec<(f32, f32)> = (0..hf)
+                                .map(|p| {
+                                    let mut ang = p0 * theta.powf(-2.0 * p as f32 / rd as f32);
+                                    if let Some(ff) = &ff {
+                                        ang /= ff[p];
+                                    }
+                                    (ang.sin() * sin_sign, ang.cos())
+                                })
+                                .collect();
+                            let xr = &xs[r * nh * hd..(r + 1) * nh * hd];
+                            for h in 0..nh {
+                                let b = h * hd;
+                                for (p, &(s, c)) in sc.iter().enumerate() {
+                                    let (i0, i1) = if neox {
+                                        (p, p + hf)
+                                    } else {
+                                        (2 * p, 2 * p + 1)
+                                    };
+                                    let a = xr[b + i0];
+                                    let bb = xr[b + i1];
+                                    orow[b + i0] = a * c - bb * s;
+                                    orow[b + i1] = a * s + bb * c;
                                 }
-                                // `ggml_rope_ext_back` is this rotation with `sin` negated and
-                                // `cos` untouched (`sin_sign` in ggml_compute_forward_rope_flt) —
-                                // the transpose, which is the inverse because nothing scales the
-                                // magnitude here. See `Op::Rope::backward`.
-                                let sin_sign = if backward { -1.0 } else { 1.0 };
-                                let (s, c) = (ang.sin() * sin_sign, ang.cos());
-                                let a = xs[b + i0];
-                                let bb = xs[b + i1];
-                                out[b + i0] = a * c - bb * s;
-                                out[b + i1] = a * s + bb * c;
                             }
-                        }
-                    }
-                    vals[dst.0 as usize] = out;
+                        },
+                    );
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::QkNormRope {
                     x,
@@ -1612,7 +1656,7 @@ impl Backend for CpuBackend {
                     let raw = &vals[x.0 as usize];
                     let x_stride = x_stride as usize;
                     // If input is interleaved (stride > 0), extract packed query data per row.
-                    let xs: Vec<f32> = if x_stride > 0 {
+                    let xs: std::borrow::Cow<[f32]> = if x_stride > 0 {
                         let mut packed = vec![0f32; rows * nh * hd];
                         for r in 0..rows {
                             let row_base = r * x_stride;
@@ -1622,15 +1666,15 @@ impl Backend for CpuBackend {
                                 packed[dst..dst + hd].copy_from_slice(&raw[src..src + hd]);
                             }
                         }
-                        packed
+                        packed.into()
                     } else {
-                        raw.clone()
+                        raw.as_slice().into()
                     };
                     let xs = &xs;
                     let ws = weight(w);
                     let pos = &vals[positions.0 as usize];
-                    let ff = freq_factors.map(|f| vals[f.0 as usize].clone());
-                    let mut out = vec![0f32; rows * nh * hd];
+                    let ff = freq_factors.map(|f| &vals[f.0 as usize]);
+                    let mut out = rc.for_overwrite(rows * nh * hd);
                     let hf = rd / 2;
                     // Parallel over the m rows. Within a row the RoPE angles depend only on the
                     // position (not the head), so precompute (cos,sin) per rope index ONCE per row and
@@ -1666,7 +1710,7 @@ impl Backend for CpuBackend {
                                 }
                             }
                         });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::WriteKv {
                     src,
@@ -1864,10 +1908,12 @@ impl Backend for CpuBackend {
                         AttnMask::SlidingWindow(w) => (w, None),
                         AttnMask::Canvas { lo } => (0usize, Some(lo)),
                     };
-                    let mut out = vec![0f32; rows * nh * hd];
+                    let mut out = rc.for_overwrite(rows * nh * hd);
                     // Each (ti, h) pair writes exactly one hd-sized output slice with no
                     // cross-iteration deps → embarrassingly parallel.  Chunk index i = ti*nh+h.
                     self.pool().for_chunks_mut(&mut out, hd, 2, &|i, ob_slice| {
+                        // The weighted V rows accumulate into this slice from zero.
+                        ob_slice.fill(0.0);
                         let ti = i / nh;
                         let h = i % nh;
                         let kvh = h / group;
@@ -1890,16 +1936,41 @@ impl Backend for CpuBackend {
                         let mut sc = vec![0f32; n_keys];
                         let mut mx = f32::NEG_INFINITY;
                         let qrow = &qs[qb..qb + hd];
+                        // Key j's cache row, j % cap_rows on a ring, walked without a division
+                        // per key.
+                        let ring_rows = |lo: usize| {
+                            let mut jr = if cap_rows > 0 { lo % cap_rows } else { lo };
+                            std::iter::from_fn(move || {
+                                let r = jr;
+                                jr += 1;
+                                if jr == cap_rows {
+                                    jr = 0;
+                                }
+                                Some(r)
+                            })
+                        };
+                        // Raw q·k dots, several keys at a time (`dot_n` overlaps their FMA
+                        // chains; each value is bit-identical to a lone `dot`).
+                        const KEYS: usize = 4;
+                        let krow = |jr: usize| {
+                            let kb = (jr * nkv + kvh) * hd;
+                            &ks[kb..kb + hd]
+                        };
+                        let mut key_rows = ring_rows(lo);
+                        let (quads, tail) = sc.as_chunks_mut::<KEYS>();
+                        for quad in quads {
+                            let jr: [usize; KEYS] =
+                                std::array::from_fn(|_| key_rows.next().unwrap());
+                            *quad = dot_n(qrow, jr.map(krow));
+                        }
+                        for (scj, jr) in tail.iter_mut().zip(key_rows) {
+                            *scj = dot(qrow, krow(jr));
+                        }
                         for (jj, scj) in sc.iter_mut().enumerate() {
                             let j = lo + jj;
-                            let jr = if cap_rows > 0 { j % cap_rows } else { j };
-                            let kb = (jr * nkv + kvh) * hd;
-                            // 8-accumulator SIMD dot (was a serial per-element f32 chain — kept
-                            // scalar in an earlier campaign only because the reassociation
-                            // flipped a golden hash; the numerics policy now allows it).
-                            *scj = dot(qrow, &ks[kb..kb + hd]) * scale;
+                            *scj *= scale;
                             // The top-k mask joins the score BEFORE the max, at key POSITION `j`
-                            // (not the ring row `jr`) — same rule as `Op::Mla::key_bias`.
+                            // (not the ring row) — same rule as `Op::Mla::key_bias`.
                             if let Some(kbias) = &kbias {
                                 *scj += kbias[ti * kv_len + j];
                             }
@@ -1912,17 +1983,19 @@ impl Backend for CpuBackend {
                         if let Some(sv) = sink {
                             mx = mx.max(sv);
                         }
+                        // Each score becomes its exponential in place: the denominator sums
+                        // them in key order and the weights below divide the same values, so
+                        // every exp is taken once.
                         let mut l = 0f32;
-                        for &s in &sc {
-                            l += (s - mx).exp();
+                        for s in sc.iter_mut() {
+                            *s = (*s - mx).exp();
+                            l += *s;
                         }
                         if let Some(sv) = sink {
                             l += (sv - mx).exp();
                         }
-                        for (jj, &s) in sc.iter().enumerate() {
-                            let j = lo + jj;
-                            let jr = if cap_rows > 0 { j % cap_rows } else { j };
-                            let p = (s - mx).exp() / l;
+                        for (&e, jr) in sc.iter().zip(ring_rows(lo)) {
+                            let p = e / l;
                             let vb = (jr * nkv + kvh) * hd;
                             // Independent lanes — vectorizes to FMA.
                             for (o, &v) in ob_slice.iter_mut().zip(&vs[vb..vb + hd]) {
@@ -1930,7 +2003,7 @@ impl Backend for CpuBackend {
                             }
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::GatedAct {
                     gate,
@@ -1961,7 +2034,7 @@ impl Backend for CpuBackend {
                     );
                     let gs = &vals[gate.0 as usize];
                     let us = &vals[up.0 as usize];
-                    let mut out = vec![0f32; rows * nff];
+                    let mut out = rc.for_overwrite(rows * nff);
                     self.pool().for_chunks_mut(&mut out, nff, 1, &|r, orow| {
                         let gb = if gate_block_width > 0 || gate_stride > 0 {
                             r * gate_stride
@@ -1985,7 +2058,7 @@ impl Backend for CpuBackend {
                             orow[i] = gated_act_fn(act, swiglu_clamp, gs[gi], us[ub + i]);
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::GatedActFused {
                     gu,
@@ -2004,7 +2077,7 @@ impl Backend for CpuBackend {
                     // are independent — spin-pool over rows, bit-identical to the serial version.
                     let (rows, nff) = (rows as usize, nff as usize);
                     let gus = &vals[gu.0 as usize];
-                    let mut out = vec![0f32; rows * nff];
+                    let mut out = rc.for_overwrite(rows * nff);
                     self.pool().for_chunks_mut(&mut out, nff, 1, &|r, orow| {
                         let gb = r * 2 * nff;
                         for i in 0..nff {
@@ -2012,7 +2085,7 @@ impl Backend for CpuBackend {
                                 gated_act_fn(act, swiglu_clamp, gus[gb + i], gus[gb + nff + i]);
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::Add { a, b, dst, n } => {
                     let n = n as usize;
@@ -2021,14 +2094,14 @@ impl Backend for CpuBackend {
                     // a ~0.7 MB memcpy + a one-thread loop per Add while 31 threads slept.)
                     let av = &vals[a.0 as usize];
                     let bv = &vals[b.0 as usize];
-                    let mut out = vec![0f32; n];
+                    let mut out = rc.for_overwrite(n);
                     self.pool().for_chunks_mut(&mut out, 4096, 4, &|c, oc| {
                         let base = c * 4096;
                         for (i, o) in oc.iter_mut().enumerate() {
                             *o = av[base + i] + bv[base + i];
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 // Broadcast bias: add the length-`n` `bias` to each of `rows` rows (Qwen2 q/k/v).
                 Op::AddBias {
@@ -2042,26 +2115,26 @@ impl Backend for CpuBackend {
                     let xs = &vals[x.0 as usize];
                     let bv = weight(bias); // bias is a bound weight, not an activation
                                            // Rows independent — spin-pool over rows, bit-identical (no whole-input clone).
-                    let mut out = vec![0f32; rows * n];
+                    let mut out = rc.zeroed(rows * n);
                     self.pool().for_chunks_mut(&mut out, n, 1, &|r, orow| {
                         for (c, o) in orow.iter_mut().enumerate() {
                             *o = xs[r * n + c] + bv[c];
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::Scale { x, dst, s, n } => {
                     let n = n as usize;
                     let xs = &vals[x.0 as usize];
                     // Elementwise — chunked spin-pool, bit-identical (no whole-input clone).
-                    let mut out = vec![0f32; n];
+                    let mut out = rc.zeroed(n);
                     self.pool().for_chunks_mut(&mut out, 4096, 4, &|c, oc| {
                         let base = c * 4096;
                         for (i, o) in oc.iter_mut().enumerate() {
                             *o = xs[base + i] * s;
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 // Broadcast multiply: the length-`n` `vec` scales every one of `rows` rows
                 // (diffusion-gemma's router input scale — the multiplicative twin of `AddBias`).
@@ -2076,13 +2149,13 @@ impl Backend for CpuBackend {
                     let xs = &vals[x.0 as usize];
                     let vv = weight(vecid); // vec is a bound weight, not an activation
                                             // Rows independent — spin-pool over rows, bit-identical (no whole-input clone).
-                    let mut out = vec![0f32; rows * n];
+                    let mut out = rc.zeroed(rows * n);
                     self.pool().for_chunks_mut(&mut out, n, 1, &|r, orow| {
                         for (c, o) in orow.iter_mut().enumerate() {
                             *o = xs[r * n + c] * vv[c];
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 // qwen35moe shared-expert combine: `moe` (routed-MoE output) + sigmoid(`gate[r]`) *
                 // `shexp` (the shared expert's own dense FFN output), row-broadcast — see the
@@ -2100,14 +2173,14 @@ impl Backend for CpuBackend {
                     let mv = &vals[moe.0 as usize];
                     let sv = &vals[shexp.0 as usize];
                     let gv = &vals[gate.0 as usize]; // [rows] raw pre-sigmoid logits
-                    let mut out = vec![0f32; rows * n];
+                    let mut out = rc.zeroed(rows * n);
                     self.pool().for_chunks_mut(&mut out, n, 1, &|r, orow| {
                         let g = 1.0 / (1.0 + (-gv[r]).exp());
                         for (c, o) in orow.iter_mut().enumerate() {
                             *o = mv[r * n + c] + g * sv[r * n + c];
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::Softcap { x, dst, cap, n } => {
                     let n = n as usize;
@@ -2117,14 +2190,14 @@ impl Backend for CpuBackend {
                     // vocab = ~67M `tanh` calls) this was the single most expensive scalar loop in
                     // the interpreter outside `Op::Linear`/`Op::MoeFfn`.
                     // Chunked (not per-element zip — 67M one-element items is pure plumbing).
-                    let mut out = vec![0f32; n];
+                    let mut out = rc.zeroed(n);
                     self.pool().for_chunks_mut(&mut out, 4096, 4, &|c, oc| {
                         let base = c * 4096;
                         for (i, o) in oc.iter_mut().enumerate() {
                             *o = cap * (xs[base + i] / cap).tanh();
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::EmbedGather {
                     ids,
@@ -2144,7 +2217,7 @@ impl Backend for CpuBackend {
                     let total_rows = g.desc(table).numel() / ne;
                     let bpr = bytes.len() / total_rows;
                     let ids_v = vals[ids.0 as usize].clone();
-                    let mut out = vec![0f32; rows * ne];
+                    let mut out = rc.zeroed(rows * ne);
                     for r in 0..rows {
                         let tok = ids_v[r] as usize;
                         let row = bytes_to_f32(&bytes[tok * bpr..(tok + 1) * bpr], dt);
@@ -2152,7 +2225,7 @@ impl Backend for CpuBackend {
                             *o = v * scale;
                         }
                     }
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::GatherI32 {
                     ids,
@@ -2180,7 +2253,7 @@ impl Backend for CpuBackend {
                     let bytes = cpu_buf(buf).read();
                     let bpr = ne * 4; // I32, one row of `ne`
                     let ids_v = vals[ids.0 as usize].clone();
-                    let mut out = vec![0f32; rows * ne];
+                    let mut out = rc.zeroed(rows * ne);
                     for r in 0..rows {
                         let tok = ids_v[r] as usize;
                         assert!(
@@ -2191,7 +2264,7 @@ impl Backend for CpuBackend {
                         let row = bytes_to_f32(&bytes[tok * bpr..(tok + 1) * bpr], dt);
                         out[r * ne..(r + 1) * ne].copy_from_slice(&row);
                     }
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::Sample {
                     x,
@@ -2207,7 +2280,7 @@ impl Backend for CpuBackend {
                     let logits = &vals[x.0 as usize][..n as usize];
                     let uu = vals[u.0 as usize][0];
                     let tok = sample_token(logits, uu, top_k as usize, temp, top_p);
-                    vals[dst.0 as usize] = vec![f32::from_bits(tok)];
+                    rc.set(&mut vals, dst.0 as usize, vec![f32::from_bits(tok)]);
                 }
                 Op::Argmax { x, dst, n, rows } => {
                     // Greedy device-side sampling: strict `>` keeps the lowest index on ties —
@@ -2228,7 +2301,7 @@ impl Backend for CpuBackend {
                         }
                         out.push(f32::from_bits(bi));
                     }
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::ArgmaxProb {
                     x,
@@ -2251,8 +2324,8 @@ impl Backend for CpuBackend {
                         }
                     }
                     let z: f32 = xs.iter().map(|&v| (v - best).exp()).sum();
-                    vals[dst_id.0 as usize] = vec![f32::from_bits(bi)];
-                    vals[dst_prob.0 as usize] = vec![1.0 / z];
+                    rc.set(&mut vals, dst_id.0 as usize, vec![f32::from_bits(bi)]);
+                    rc.set(&mut vals, dst_prob.0 as usize, vec![1.0 / z]);
                 }
                 Op::Copy {
                     src,
@@ -2358,11 +2431,11 @@ impl Backend for CpuBackend {
                         n_used as usize,
                         n_ff_exp as usize,
                     );
-                    let xs = vals[x.0 as usize].clone();
+                    let xs = rc.copy_of(&vals[x.0 as usize]);
                     // `router_x` is usually the SAME tensor as `x` (qwen3moe); diffusion-gemma binds
                     // a differently-normalized row (see the `Op::MoeFfn` doc). Clone independently —
                     // it may legitimately be a different handle with its own row layout.
-                    let rxs = vals[router_x.0 as usize].clone();
+                    let rxs = rc.copy_of(&vals[router_x.0 as usize]);
                     // `x` may hold several rows (the seam's batched prefill): route + run the
                     // expert FFN independently per row — the reference semantics for the GPU
                     // adapter's GPU-routed batched form.
@@ -2707,12 +2780,10 @@ impl Backend for CpuBackend {
                         }
                     }
                     let out_gu = if fused_gate_up { 2 * nffx } else { nffx };
-                    // o-major output offsets per bucket for the gate_up / down GEMM stages.
+                    // o-major output offsets per bucket for the gate_up GEMM stage.
                     let mut gu_off = vec![0usize; buckets.len() + 1];
-                    let mut d_off = vec![0usize; buckets.len() + 1];
                     for (b, &(_, _, count)) in buckets.iter().enumerate() {
                         gu_off[b + 1] = gu_off[b] + out_gu * count;
-                        d_off[b + 1] = d_off[b] + ne * count;
                     }
                     // 8-aligned o-chunks (64 rows) per bucket — the flat GEMM task list. Dynamic
                     // claiming spreads a straggler expert's chunks over every idle thread, which
@@ -2806,11 +2877,11 @@ impl Backend for CpuBackend {
                     };
                     #[cfg(not(target_arch = "x86_64"))]
                     let gu_packs: Vec<Option<std::sync::Arc<Q4kPack>>> = vec![None; buckets.len()];
-                    let mut gu_all = vec![0f32; gu_off[buckets.len()]];
+                    let mut gu_all = rc.for_overwrite(gu_off[buckets.len()]);
                     let mut up_all: Vec<f32> = if fused_gate_up {
                         Vec::new()
                     } else {
-                        vec![0f32; gu_off[buckets.len()]]
+                        rc.for_overwrite(gu_off[buckets.len()])
                     };
                     {
                         let tasks = gemm_tasks(out_gu);
@@ -2939,58 +3010,54 @@ impl Backend for CpuBackend {
                     };
                     let t_act = t_c.elapsed();
 
-                    // ── Stage D: down GEMMs (o-major), then per-pair un-transpose to row-major
-                    // with the per-expert `down_scale` folded in (`y = s * raw`, the same
-                    // scale-then-weight order the old per-expert loop applied).
+                    // ── Stage D: down GEMMs, each task's o-major block un-transposed straight
+                    // into its pairs' rows of `y_pairs` with the per-expert `down_scale` folded
+                    // in (`y = s * raw`, the same scale-then-weight order the old per-expert
+                    // loop applied). The block is still in cache when it is scattered; a separate
+                    // un-transpose pass over a whole-layer o-major buffer read a fresh line per
+                    // element (stride `count`).
                     let t_d = std::time::Instant::now();
-                    let mut down_all = vec![0f32; d_off[buckets.len()]];
+                    let mut y_pairs = rc.for_overwrite(n_pairs * ne);
                     {
                         let tasks = gemm_tasks(ne);
-                        let d_ptr = pool::SendPtr::new(down_all.as_mut_ptr());
+                        let y_ptr = pool::SendPtr::new(y_pairs.as_mut_ptr());
                         pool.run(tasks.len(), &|t| {
                             let (b, o0, o1) = tasks[t];
                             let (b, o0, o1) = (b as usize, o0 as usize, o1 as usize);
-                            let (e, _, count) = buckets[b];
-                            // SAFETY: disjoint (bucket, o-range) slices, as above.
-                            let dst = unsafe {
-                                std::slice::from_raw_parts_mut(
-                                    d_ptr.get().add(d_off[b] + o0 * count),
-                                    (o1 - o0) * count,
-                                )
-                            };
-                            expert_gemm_range(
-                                &db[e * dst_..(e + 1) * dst_],
-                                ddt,
-                                nffx,
-                                ne,
-                                &dacts_for(b),
-                                None,
-                                o0,
-                                o1,
-                                dst,
-                            );
+                            let (e, p0, count) = buckets[b];
+                            let s_e = dscale.as_ref().map(|ds| ds[e]);
+                            moe::with_block_scratch((o1 - o0) * count, |blk| {
+                                expert_gemm_range(
+                                    &db[e * dst_..(e + 1) * dst_],
+                                    ddt,
+                                    nffx,
+                                    ne,
+                                    &dacts_for(b),
+                                    None,
+                                    o0,
+                                    o1,
+                                    blk,
+                                );
+                                for i in 0..count {
+                                    // SAFETY: pair rows `p0..p0 + count` belong to bucket `b`
+                                    // alone and columns `o0..o1` to this task, so tasks write
+                                    // disjoint ranges of `y_pairs`, which outlives the `run`.
+                                    let yrow = unsafe {
+                                        std::slice::from_raw_parts_mut(
+                                            y_ptr.get().add((p0 + i) * ne + o0),
+                                            o1 - o0,
+                                        )
+                                    };
+                                    for (d, y) in yrow.iter_mut().enumerate() {
+                                        *y = match s_e {
+                                            Some(s_e) => blk[d * count + i] * s_e,
+                                            None => blk[d * count + i],
+                                        };
+                                    }
+                                }
+                            });
                         });
                     }
-                    let mut y_pairs = vec![0f32; n_pairs * ne];
-                    pool.for_chunks_mut(&mut y_pairs, ne, 1, &|p, yrow| {
-                        let b = pair_bucket[p] as usize;
-                        let i = pair_local[p] as usize;
-                        let (e, _, count) = buckets[b];
-                        let dt_slice = &down_all[d_off[b]..d_off[b] + ne * count];
-                        match &dscale {
-                            Some(ds) => {
-                                let s_e = ds[e];
-                                for (d, y) in yrow.iter_mut().enumerate() {
-                                    *y = dt_slice[d * count + i] * s_e;
-                                }
-                            }
-                            None => {
-                                for (d, y) in yrow.iter_mut().enumerate() {
-                                    *y = dt_slice[d * count + i];
-                                }
-                            }
-                        }
-                    });
                     let t_down = t_d.elapsed();
                     if prof_ops {
                         let (mut bmin, mut bmax, mut single) = (usize::MAX, 0usize, 0usize);
@@ -3015,7 +3082,7 @@ impl Backend for CpuBackend {
                     // ── Stage E: accumulate each row's expert contributions in the SAME order
                     // the original per-row loop used (rank order = idx sorted by descending
                     // router prob) — bit-identical to the old row_slots scatter+accumulate.
-                    let mut out = vec![0f32; rows * ne];
+                    let mut out = rc.zeroed(rows * ne);
                     pool.for_chunks_mut(&mut out, ne, 1, &|r, orow| {
                         let rr = &routes[r];
                         for (rank, &p) in slot_pair[r].iter().enumerate() {
@@ -3028,7 +3095,10 @@ impl Backend for CpuBackend {
                             }
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
+                    for stage in [gu_all, up_all, y_pairs, xs, rxs] {
+                        rc.give(stage);
+                    }
                 }
                 Op::Conv1dSilu {
                     x,
@@ -3051,7 +3121,7 @@ impl Backend for CpuBackend {
                         // the pool, then write the rebuilt history back.
                         let st = &mut vals[state.0 as usize];
                         let out = conv1d_silu(self.pool(), &xs, &ws, st, rr, cc, kk);
-                        vals[dst.0 as usize] = out;
+                        rc.set(&mut vals, dst.0 as usize, out);
                     } else {
                         let st = &mut vals[state.0 as usize]; // [(kernel-1), channels], oldest row first
                         let mut out = vec![0f32; rr * cc];
@@ -3079,7 +3149,7 @@ impl Backend for CpuBackend {
                                 }
                             }
                         }
-                        vals[dst.0 as usize] = out;
+                        rc.set(&mut vals, dst.0 as usize, out);
                     }
                 }
                 Op::DeltaNet {
@@ -3159,7 +3229,7 @@ impl Backend for CpuBackend {
                         vd,
                         eps,
                     );
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::Mla {
                     q,
@@ -3215,7 +3285,7 @@ impl Backend for CpuBackend {
                     // -inf elsewhere) — indexed by KEY POSITION, not by the ring row. `None` on
                     // deepseek2, where the arithmetic below is byte-for-byte what it was.
                     let kb = key_bias.map(|b| vals[b.0 as usize].clone());
-                    let mut out = vec![0f32; rows * nh * vhd];
+                    let mut out = rc.zeroed(rows * nh * vhd);
                     self.pool()
                         .for_chunks_mut(&mut out, vhd, 2, &|i, ob_slice| {
                             let ti = i / nh;
@@ -3304,7 +3374,7 @@ impl Backend for CpuBackend {
                                 }
                             }
                         });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::LightningIndexer {
                     q,
@@ -3403,7 +3473,7 @@ impl Backend for CpuBackend {
                                 *slot = f32::from_bits(bi as u32);
                             }
                         });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::TopkMask {
                     idx,
@@ -3429,7 +3499,7 @@ impl Backend for CpuBackend {
                             row[j] = 0.0;
                         }
                     }
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::HyperConnectMix {
                     mixes,
@@ -3501,10 +3571,10 @@ impl Backend for CpuBackend {
                             });
                         (post, post_out, comb, comb_out)
                     });
-                    vals[pre.0 as usize] = pre_out;
+                    rc.set(&mut vals, pre.0 as usize, pre_out);
                     if let Some((post, post_out, comb, comb_out)) = gate_out {
-                        vals[post.0 as usize] = post_out;
-                        vals[comb.0 as usize] = comb_out;
+                        rc.set(&mut vals, post.0 as usize, post_out);
+                        rc.set(&mut vals, comb.0 as usize, comb_out);
                     }
                 }
                 Op::HyperConnectPre {
@@ -3519,7 +3589,7 @@ impl Backend for CpuBackend {
                     hyper_check_hc(hc, "cpu Op::HyperConnectPre");
                     let xs = &vals[x.0 as usize];
                     let ws = &vals[weights.0 as usize];
-                    let mut out = vec![0f32; rows * ne];
+                    let mut out = rc.zeroed(rows * ne);
                     self.pool().for_chunks_mut(&mut out, ne, 1, &|t, o| {
                         // dst[t, i] = Σ_h x[t, h, i] * w[t, h], h ASCENDING — the accumulation
                         // order llama.cpp's chain of `ggml_add`s builds up.
@@ -3531,7 +3601,7 @@ impl Backend for CpuBackend {
                             }
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::HyperConnectPost {
                     x,
@@ -3549,7 +3619,7 @@ impl Backend for CpuBackend {
                     let rs = &vals[residual.0 as usize];
                     let ps = &vals[post.0 as usize];
                     let cs = &vals[comb.0 as usize];
-                    let mut out = vec![0f32; rows * hc * ne];
+                    let mut out = rc.zeroed(rows * hc * ne);
                     // One chunk per (token, dst stream).
                     self.pool().for_chunks_mut(&mut out, ne, 4, &|c, o| {
                         let (t, d) = (c / hc, c % hc);
@@ -3568,7 +3638,7 @@ impl Backend for CpuBackend {
                             }
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::CompressPool {
                     values,
@@ -3594,7 +3664,7 @@ impl Backend for CpuBackend {
                         vs.len(),
                         ss.len(),
                     );
-                    let mut out = vec![0f32; blocks * ne];
+                    let mut out = rc.zeroed(blocks * ne);
                     // One chunk per block. Within it every pass walks the window rows in order and
                     // the channels contiguously, so the softmax reduces over the STRIDED window
                     // axis without ever transposing the slab — the two `ggml_cont`s the reference
@@ -3627,7 +3697,7 @@ impl Backend for CpuBackend {
                             *o = if m == f32::NEG_INFINITY { 0.0 } else { *o / d };
                         }
                     });
-                    vals[dst.0 as usize] = out;
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
             }
             if let Some(t0) = __t0 {
@@ -3830,8 +3900,40 @@ fn deltanet_scan(
     out
 }
 
+/// Fixtures shared by the crate's unit tests.
+#[cfg(test)]
+pub(crate) mod test_util {
+    /// Deterministic quant weight bytes with every block's f16 scale(s) at `d_offs` set to small
+    /// finite values (random bits there would be NaN/inf half the time).
+    pub(crate) fn det_quant_rows(
+        rows: usize,
+        nb: usize,
+        blk: usize,
+        d_offs: &[usize],
+        seed: u64,
+    ) -> Vec<u8> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut w: Vec<u8> = (0..rows * nb * blk)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s as u8
+            })
+            .collect();
+        for (k, b) in w.chunks_mut(blk).enumerate() {
+            for (j, &off) in d_offs.iter().enumerate() {
+                let d = half::f16::from_f32(0.01 + 0.001 * ((k + j) % 7) as f32);
+                b[off..off + 2].copy_from_slice(&d.to_le_bytes());
+            }
+        }
+        w
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_util::det_quant_rows;
     use super::*;
     use infr_core::tensor::TensorDesc;
 
@@ -4321,6 +4423,155 @@ mod tests {
         assert_eq!(small.repack_budget_bytes(), 3 * 1024 * 1024);
         // Independent values, live at the same time — the thing a process-wide env read could not do.
         assert_eq!(dflt.repack_budget_bytes(), 4096 * 1024 * 1024);
+    }
+
+    /// The packed prefill Linear writes the row-major output directly, with an `out_f % 8` tail
+    /// on the per-row kernels: every element must be the single-token kernel's bits, for every
+    /// dtype it takes, a token count that is not a whole number of GEMM tiles, and a scratch
+    /// group reused across calls of different widths (it must not leak the previous call's rows).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn linear_packed_matches_the_single_token_kernels_bitwise() {
+        let (out_f, m) = (20usize, 7usize);
+        assert!(out_f % 8 != 0 && m > repack::TILE_TOKENS && m % repack::TILE_TOKENS != 0);
+        let be = CpuBackend::new();
+        for (dt, in_f) in [
+            (DType::Q4K, 512usize),
+            (DType::Q4K, 256),
+            (DType::Q4K, 768),
+            (DType::Q5K, 512),
+            (DType::Q5K, 256),
+            (DType::Q6K, 512),
+        ] {
+            if !linear_packed_ok(dt, in_f, out_f, m) {
+                // Only AVX-512 VNNI hosts take this route; others run the per-row kernels,
+                // which `linear_prefill_matches_the_single_token_kernels_bitwise` covers.
+                eprintln!("SKIP linear_packed: this CPU lacks AVX-512BW + AVX-512 VNNI");
+                return;
+            }
+            let nb = in_f / 256;
+            let w = match dt {
+                DType::Q4K => det_quant_rows(out_f, nb, 144, &[0, 2], in_f as u64),
+                DType::Q5K => det_quant_rows(out_f, nb, 176, &[0, 2], in_f as u64),
+                _ => det_quant_rows(out_f, nb, 210, &[208], in_f as u64),
+            };
+            let x: Vec<f32> = (0..m * in_f)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 17.0)
+                .collect();
+            let q8s: Vec<Q8> = x.chunks(in_f).map(quantize_q8).collect();
+            let mut out = vec![f32::NAN; m * out_f];
+            be.linear_packed(dt, &w, in_f, out_f, &q8s, &mut out);
+            let bpr = w.len() / out_f;
+            for o in 0..out_f {
+                let row = &w[o * bpr..(o + 1) * bpr];
+                for (r, q8) in q8s.iter().enumerate() {
+                    let want = match dt {
+                        DType::Q4K => vec_dot_q4k(row, q8, in_f),
+                        DType::Q5K => vec_dot_q5k(row, q8, in_f),
+                        _ => vec_dot_q6k(row, q8, in_f),
+                    };
+                    let got = out[r * out_f + o];
+                    assert_eq!(
+                        got.to_bits(),
+                        want.to_bits(),
+                        "{dt:?} in_f={in_f} o={o} r={r}: got {got}, want {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A prefill `Op::Linear` of `m` tokens through `execute`, returning its `[m, out_f]` output.
+    fn run_linear(dt: DType, w: &[u8], x: &[f32], m: usize, in_f: usize, out_f: usize) -> Vec<f32> {
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+        let wi = g.weight(TensorDesc::new(vec![out_f, in_f], dt));
+        let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+        g.push(Op::Linear {
+            x: xi,
+            weight: wi,
+            dst,
+            m: m as u32,
+            in_f: in_f as u32,
+            out_f: out_f as u32,
+            w_off: 0,
+        });
+        let be = CpuBackend::new();
+        let up = |bytes: &[u8]| {
+            let b = be.alloc(bytes.len(), BufferUsage::Activations).unwrap();
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let (xb, wb) = (up(&f32_bytes(x)), up(w));
+        let ob = be.alloc(m * out_f * 4, BufferUsage::Activations).unwrap();
+        let mut b = Bindings::new();
+        b.bind(xi, xb.as_ref());
+        b.bind(wi, wb.as_ref());
+        b.bind(dst, ob.as_ref());
+        be.execute(be.compile(&g).unwrap().as_ref(), &b).unwrap();
+        let mut bytes = vec![0u8; m * out_f * 4];
+        be.download(ob.as_ref(), &mut bytes).unwrap();
+        bytes
+            .chunks(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    /// Prefill `Op::Linear` on K-quant weights gives the single-token kernel's bits on every
+    /// element, whichever route this host takes: the packed GEMM (AVX-512 VNNI) or the per-row
+    /// batch kernels (any other CPU), and on both sides of each dtype's packed threshold
+    /// (`repack::packed_min_tokens`). On a VNNI host it also checks that each count takes the
+    /// route its threshold says. The thresholds' values are measurements, recorded where they
+    /// are defined; this test follows whatever they are set to.
+    #[test]
+    fn linear_prefill_matches_the_single_token_kernels_bitwise() {
+        let (in_f, out_f) = (512usize, 20usize);
+        let nb = in_f / 256;
+        for (dt, blk, d_offs) in [
+            (DType::Q4K, 144usize, &[0usize, 2][..]),
+            (DType::Q5K, 176, &[0, 2]),
+            (DType::Q6K, 210, &[208]),
+        ] {
+            let min = repack::packed_min_tokens(dt);
+            let w = det_quant_rows(out_f, nb, blk, d_offs, blk as u64);
+            // Below the threshold (when there is a below: prefill starts at two tokens), at it,
+            // and past a whole number of GEMM tiles.
+            let mut counts = vec![min.max(2), 2 * repack::TILE_TOKENS + 1];
+            if min > 2 {
+                counts.push(min - 1);
+            }
+            for m in counts {
+                let packed = linear_packed_ok(dt, in_f, out_f, m);
+                #[cfg(target_arch = "x86_64")]
+                if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+                    assert_eq!(packed, m >= min, "{dt:?} m={m}: wrong route");
+                } else {
+                    eprintln!("{dt:?} m={m}: no AVX-512 VNNI, per-row kernels only");
+                }
+                let x: Vec<f32> = (0..m * in_f)
+                    .map(|i| ((i * 29 % 97) as f32 - 48.0) / 13.0)
+                    .collect();
+                let got = run_linear(dt, &w, &x, m, in_f, out_f);
+                let bpr = w.len() / out_f;
+                for (r, xr) in x.chunks(in_f).enumerate() {
+                    let q8 = quantize_q8(xr);
+                    for o in 0..out_f {
+                        let row = &w[o * bpr..(o + 1) * bpr];
+                        let want = match dt {
+                            DType::Q4K => vec_dot_q4k(row, &q8, in_f),
+                            DType::Q5K => vec_dot_q5k(row, &q8, in_f),
+                            _ => vec_dot_q6k(row, &q8, in_f),
+                        };
+                        let g = got[r * out_f + o];
+                        assert_eq!(
+                            g.to_bits(),
+                            want.to_bits(),
+                            "{dt:?} m={m} packed={packed} o={o} r={r}: got {g}, want {want}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// `kernels.cpu.reference` is a plain field on the config the backend was handed, and

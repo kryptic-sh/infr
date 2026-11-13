@@ -4692,53 +4692,37 @@ rewritten template against the oracle for the corpus conversations, not just by
 the row above. The other route is a minijinja hook (none in 2.24; 3.x not read,
 B171). Not started.
 
-### B173 — the CPU backend's prefill is 1.5-3.2× slower than llama.cpp's CPU, and its first forward pays the page-in (2026-11-14)
+### B173 — the CPU backend's first forward pays the mmap page-in, and prefill has known costs left (2026-11-14)
 
-**Tag:** perf · cpu · moe
+**Tag:** perf · cpu
 
-Opened for MoE models; decode was the MoE-specific part and is fixed
-(`dequant_row::dequant_dot_rows`: the f32-activation expert path used to
-dequantize every routed weight row through `bytes_to_f32`). Measured on the
-Windows box (Ryzen 9 9950X3D, 16 threads, `infr bench --ngl 0` vs
-`llama-bench -ngl 0`, other sessions idle, total CPU 0-5% between runs), warm
-reps only. "Before" is HEAD 4c389a78 and the pp512 columns come from one window
-interleaving it with the fix; "after" is the final build, interleaved with an
-equivalent earlier build in a later window:
+Warm prefill is now ahead of llama.cpp's CPU on all three models measured (see
+the CHANGELOG entry: SmolLM3-3B 622-636 t/s against 579, ERNIE-4.5-21B-A3B
+374-449 against 246, Qwen3-30B-A3B 395-400 against 231, pp512, 16 threads,
+Windows box). At pp16 SmolLM3 is still behind (292-309 against 381); the MoE
+models are level or ahead. What is left:
 
-| model                                     | infr pp512 | llama.cpp pp512 | infr tg64 before | infr tg64 after | llama.cpp tg64 |
-| ----------------------------------------- | ---------: | --------------: | ---------------: | --------------: | -------------: |
-| ERNIE-4.5-21B-A3B Q4_K_M                  |  75-82 t/s |          187.94 |        7.34-7.51 |       25.0-25.3 |          29.70 |
-| Qwen3-30B-A3B Q4_K_M                      |    144-145 |          221.51 |        7.38-7.61 |       26.0-26.3 |          31.01 |
-| SmolLM3-3B Q4_K_M (dense, earlier window) |      180.8 |          576.85 |                — |            30.9 |          34.69 |
-
-- **Prefill is a general CPU-backend gap, not an MoE one**: the dense control
-  (SmolLM3-3B, an earlier window) is further behind than either MoE model.
-  Decode is now within ~15% on all three, with the expert GEMMs moving ~57 GB/s
-  of weights (roughly: per-layer `[prof-moe]` stage times against the expert
-  bytes), so it is near the memory bound; the f32 path is kept because switching
-  decode to int8 activations would change every MoE golden.
-- **ERNIE prefill is ~1.5× faster with `--set kernels.cpu.repack_mb=0`** (warm
-  pp512 reps 105-126 vs 73-90, interleaved, two pairs), though ERNIE's MoE never
-  uses the Q4_K packs (its gate/up are split, the pack path needs
-  `fused_gate_up`). The slowdown lands inside `Op::MoeFfn`'s gate_up stage
-  (summed over a forward: 1279 ms at 0 vs 3617 ms at 4096) and also in the dense
-  `Linear m=511 2560x2560 Q4K`, neither of which reads a pack; the only thing
-  the budget changes there is whether the dense Q6_K packs (`q6k_pack_for`) are
-  cached or rebuilt (via rayon) per call. Not explained. Qwen3-30B-A3B shows no
-  difference between the two budgets.
 - **The first forward pays the mmap page-in**: a fresh process's first pp512 rep
-  is ~26 t/s (gate_up stage 300-390 ms per layer cold vs 31-43 warm). Windows
-  gets no `WillNeed` hint (the `madvise` in `Gguf::map_and_parse` is
-  `cfg(unix)`). End to end a cold `infr bench -p 512 -r 1` (20.3 s wall) still
-  beats `llama-bench -p 512 -r 1 --no-warmup` (30.6 s), which pays the read at
-  load into its repacked buffers, so this is where the cost sits, not extra
-  cost. A `PrefetchVirtualMemory` at load would move it out of the first
-  request.
-- **Allocation churn**: a pp512 forward faults ~350K pages/s throughout warm
-  reps with private bytes flat at ~300 MB — large per-op `Vec`s mapped fresh and
-  released each op. Reusing `Op::MoeFfn`'s four stage buffers across calls cut
-  the fault rate roughly in half and moved ERNIE pp512 by ~4% (within noise over
-  two pairs), so it was not kept; the faults are not the prefill gap.
+  is 82 t/s on SmolLM3 and 27-30 on the MoE models (unchanged by the prefill
+  work). Windows gets no `WillNeed` hint (the `madvise` in `Gguf::map_and_parse`
+  is `cfg(unix)`); a `PrefetchVirtualMemory` at load would move the read out of
+  the first request.
+- **Where a warm pp512 forward still goes** (`INFR_PROF_OPS=1`, the final build
+  minus temporary timers): SmolLM3 ~790 ms, of which the Q4_K/Q6_K Linears ~585
+  ms, `Attention` ~116 ms (3.2 ms per layer), `GatedAct` ~45 ms (scalar `expf`),
+  and activation quantization (`quantize_q8`, one `Q8` of four `Vec`s per row
+  per Linear) ~45 ms. Qwen3-30B-A3B ~1300 ms: `MoeFfn` ~15-16 ms per layer
+  (gate_up ~4.7, down ~3.9, act ~1.5, gather ~0.9, f32 router ~0.8; a few ms not
+  attributed to a stage) and `Attention` 5.8 ms per layer (32 query heads over 4
+  KV heads).
+- **Ideas not tried**: attention that walks a GQA group's query heads together
+  so each K/V row is read once per group (and dequantizes the f16 K/V prefix in
+  parallel; it is serial per layer); quantizing a shared input once for the Q, K
+  and V Linears; a GEMM tile that keeps a token block in L2 across several 8-row
+  groups (each group streams every token's activations); building MoE stage C's
+  activations from tiles of the o-major gate/up block, which it now reads with
+  stride `count`; a vectorized Q6_K pack expansion (`q6k_pack_group_into` is
+  scalar bit-fiddling, paid per call per group).
 
 ### B174 — the loose MoE prefill comparison passes a Vulkan router that ignores the bias (2026-11-14)
 
@@ -4833,3 +4817,99 @@ measured on a model in those formats (none is cached on the Windows box). The
 fix is the same shape: a per-block f32 decode into a stack span from the
 codebook decoders `dequant_codebook` already has, held bit for bit against
 `bytes_to_f32`.
+
+### B179 — every CPU generate builds a fresh `CpuBackend`, so its caches never outlive a request (2026-11-14)
+
+**Tag:** perf · cpu · design
+
+`SeamModel::generate_cpu_constrained`, `generate_cpu_reference`, `bench` (via
+`generate_dense_cpu`) and the CPU chat path each construct a new `CpuBackend`
+per call, and `cpu_bind_with` maps every weight into a new `CpuBuffer` with a
+new uid per call. So `repack_cache` (the fused-MoE Q4_K packs, keyed by uid),
+`weight_cache` and the spin pool's threads are rebuilt for every request. The
+`infr bench` "untimed warmup to build runtime caches" builds them in a backend
+that is dropped before the timed reps. This is why the dense Q6_K pack cache
+(`q6k_pack_for`, removed in the B173 work) cost its full rayon pack build on
+every call: 94 ms per pp128 forward on SmolLM3. Only `DiffusionGemmaCpuSession`
+holds a backend across calls. Fixing it means a per-model backend plus a binder
+whose buffers (and so uids) persist; until then a per-call cache is worth only
+what it saves within one request. Not changed here.
+
+### B180 — ERNIE prefill was 1.5× faster with `kernels.cpu.repack_mb=0`; reproduced, gone, cause unproven (2026-11-14)
+
+**Tag:** perf · cpu · moe
+
+Reproduced on the old build (HEAD 62f85532): warm pp512 reps 78-89 t/s at the
+default budget against 115-125 at `repack_mb=0`, `Op::MoeFfn` 155 ms per layer
+against 82 ms (per-op profile). On the new build the two settings measure the
+same (449-463 t/s both, two pairs interleaved). The only thing the budget
+changed on ERNIE was whether the dense Q6_K packs were kept (the MoE split
+gate/up never used a pack); the MoE GEMMs it slowed then allocated a few dozen
+buffers per 8-row group per call (`vec_dot_q4k_batch8_ilv_vnni`, blocks of 20 KB
+and more, above the heap's low-fragmentation sizes) and faulted fresh pages for
+each stage buffer. Those allocations are gone and the Q6_K pack cache was
+removed, so the plausible mechanism (heap behaviour under the retained packs)
+can no longer be tested on the current code. Sampled with `typeperf` over each
+whole run (model load included), the old build averaged 353% user CPU at the
+default budget and 493% at 0, of the 1600% its 16 threads could use: it was
+mostly waiting, not computing. Kept as a surprise, not a bug.
+
+### B181 — the Diffusion-Gemma Q6_K lm_head now packs per call instead of from a session cache (2026-11-14)
+
+**Tag:** perf · cpu · unverified
+
+The dense Q6_K prefill path packs each 8-row group into a per-thread scratch
+group per call (`repack::q6k_pack_and_gemm_group`); the session-long Q6_K pack
+cache it replaced (`q6k_pack_for`, ~740 MB for gemma's tied 262k-row lm_head)
+was removed, because on every other CPU path the backend lives one request
+(B179) and the cache cost a full rebuild per call. For the Diffusion-Gemma
+session, which does keep its backend, the cache had been built once; now each
+denoise step pays one pack pass over the lm_head (a pass the step's GEMM over
+all canvas rows shares). Not measured: no Diffusion-Gemma model is on the
+Windows box. If a measurement shows a loss, a per-session pack keyed as before
+is the fix.
+
+### B182 — the per-op profile drops a reference-mode prefill Linear (2026-11-14)
+
+**Tag:** perf-tooling · cpu
+
+The `Op::Linear` arm's reference-mode branch ends with `continue`, which skips
+the per-op timing at the bottom of the interpreter loop, so `INFR_PROF_OPS=1`
+with `kernels.cpu.reference` leaves those Linears out of the table. Noticed
+while restructuring the prefill Linear; not changed.
+
+### B183 — what CI exercises of the CPU prefill paths depends on the runner's CPU (2026-11-14)
+
+**Tag:** tests · ci · cpu
+
+The packed K-quant GEMM (`repack::q4k_pack_and_gemm_group` /
+`q6k_pack_and_gemm_group`, behind `linear_packed_ok` and `expert_gemm_range`'s
+VNNI arm) only runs on a CPU with AVX-512BW and AVX-512 VNNI; elsewhere the same
+ops take the per-row batch kernels (`vec_dot_q*k_batch`, and
+`vec_dot_q4k_batch8` for Q4_K 8-row tiles). The workflow does not pin a CPU, so
+whether a run of `.github/workflows/ci.yml` exercises the packed path depends on
+the hardware GitHub assigns, and nothing in the logs says which. What each job
+covers:
+
+- `cargo test (ubuntu/macos/windows)` (`cargo nextest run --workspace`):
+  `linear_prefill_matches_the_single_token_kernels_bitwise` (lib.rs) and
+  `expert_gemm_range_matches_the_single_token_kernels_bitwise` (moe.rs) run on
+  every host and compare whatever route it takes against the single-token
+  kernels, on both sides of `repack::packed_min_tokens`. The packed-only tests
+  (`linear_packed_matches_the_single_token_kernels_bitwise`,
+  `q4k_pack_gemm_bit_identical_to_scalar`,
+  `q6k_pack_gemm_bit_identical_to_batch`) print a `SKIP` line and pass without
+  VNNI. macOS (aarch64) compiles none of the packed code.
+- `cargo test (CPU goldens, real models)` (ubuntu, release,
+  `--test cpu_backend`): downloads gemma-3-1b and Qwen3-0.6B Q4_K_M only. Their
+  multi-token prompts run prefill `Op::Linear` on Q4_K/Q6_K weights (packed with
+  VNNI, per-row without), `QkNormRope`, `Attention` (the `dot_n` scoring) and
+  the buffer recycler. No MoE model is downloaded, so `Op::MoeFfn`'s changed
+  stages (the packed expert tiles, the down-stage scatter, the `dot_n` f32
+  router) are not reached by any CI golden; the MoE goldens
+  (`cpu_golden_qwen3moe`, `cpu_golden_ernie4_5_moe`) ran only on the Windows dev
+  box. Plain `Op::Rope` (SmolLM3's path) is likewise exercised only there.
+
+Closing the gap would mean a small MoE GGUF in the goldens job and a way to
+force the per-row route on a VNNI host (or the packed route's absence) so both
+are tested on one machine.

@@ -265,9 +265,10 @@ because weights are mmap'd or uploaded once. A paged slot reuses one address for
 different blocks at identical length, so those keys collide and hand back
 another block's data — plausible garbage, not an error:
 
-- `infr-cpu`'s `repack_cache` / `repack6_cache`: `q4k_pack_for` / `q6k_pack_for`
-  key on `(w.as_ptr() as usize, w.len())`. **Must** be re-keyed on `BlockId`
-  before any CPU paging lands.
+- `infr-cpu`'s `repack_cache`: `q4k_pack_for` now keys on `repack::PackKey` —
+  the `CpuBuffer`'s uid plus the slice's byte offset and length, not its
+  address. Every `CpuBuffer`, a paged weight's included, takes a fresh uid, so a
+  reused address no longer collides.
 - `infr-cpu`'s `weight_cache` is safe as written — it keys on the `CpuBuffer`
   object address, not the slice — but it caches a dequantized f32 copy, so it is
   a budget consumer, not a correctness one.

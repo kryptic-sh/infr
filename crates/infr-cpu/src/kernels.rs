@@ -2129,191 +2129,12 @@ unsafe fn vec_dot_q4k_batch8_avx512bw(
     }
 }
 
-/// Interleaved-x8 Q4_K GEMM tile (AVX512-VNNI) — the ggml `block_q4_Kx8` idea applied per call:
-/// the 8 weight rows' expanded nibbles are INTERLEAVED per (super-block, sub-block, 8-byte group)
-/// so one contiguous zmm load carries the SAME 8 activation positions of ALL 8 rows (qword lane i
-/// = row i), and the activation qword is broadcast once. Per sub-block that's 4 dpbusd + ONE
-/// hadd + ONE mullo for all 8 rows — vs the flat batch8's 8 dpbusd + 16 mullo + per-row hadds —
-/// and every weight byte the inner loop touches is sequential.
-///
-/// `_mm256_hadd_epi32(lo, hi)` yields per-row sums in the fixed permutation [0,1,4,5,2,3,6,7]
-/// (its 128-bit-lane semantics); scales are pre-permuted to match and lanes un-permute only at
-/// the per-super-block extraction. Bit-identical to the scalar single-row kernel: the integer
-/// sums are exact regardless of association, and the per-(row, super-block) f32 expression and
-/// its accumulation order are unchanged.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw,avx512vnni")]
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-unsafe fn vec_dot_q4k_batch8_ilv_vnni(
-    rows: [&[u8]; 8],
-    q8s: &[Q8],
-    in_f: usize,
-    outs: [&mut [f32]; 8],
-) {
-    use std::arch::x86_64::*;
-    let m = q8s.len();
-    let nb = in_f / 256;
-    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
-    // hadd_epi32(lo, hi) sum-position j holds row PERM[j].
-    const PERM: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
-
-    // ── repack: expand nibbles per row (as the flat kernels do), then interleave ──
-    // ilv[b*2048 + s*256 + g*64 + i*8 .. +8] = row i, sub-block s, byte group g (8 B).
-    let mut d_arr: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0f32; nb]);
-    let mut dmin_arr: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0f32; nb]);
-    let mut m_arr: [Vec<[u32; 8]>; 8] = std::array::from_fn(|_| vec![[0u32; 8]; nb]);
-    // per-(b, s) PAIR-DUPLICATED scale vector in dpbusd lane order (lanes 2i, 2i+1 = row i) —
-    // consumed by the vertical 512-bit mullo; see q4k_gemm_group's sc16.
-    let mut sc16_vec = vec![[_mm512_setzero_si512(); 8]; nb];
-    // PERM-ordered per-(b,s) m-scales and per-b f32 d/dmin vectors: lets the sm accumulation and
-    // the final `q8.d*(d*sd - dmin*sm)` run 8-rows-wide in lane space (un-permuted only at the
-    // very end). No FMA anywhere — each mul/sub/add rounds separately, matching the scalar order.
-    let mut m_vec = vec![[_mm256_setzero_si256(); 8]; nb];
-    let mut d_vec = vec![_mm256_setzero_ps(); nb];
-    let mut dmin_vec = vec![_mm256_setzero_ps(); nb];
-    let mut ilv = vec![0u8; nb * 2048];
-    {
-        let mut sc_rows = [[0u32; 8]; 8]; // [row][s]
-        let mut tmp = [[0u8; 256]; 8]; // expanded nibbles, one superblock, all 8 rows
-        for b in 0..nb {
-            for i in 0..8 {
-                let blk = &rows[i][b * 144..b * 144 + 144];
-                d_arr[i][b] = rdf16(&blk[0..2]);
-                dmin_arr[i][b] = rdf16(&blk[2..4]);
-                let scales = &blk[4..16];
-                let qs = &blk[16..144];
-                for s in 0..8usize {
-                    let (sc, mv) = k4(s, scales);
-                    sc_rows[i][s] = sc;
-                    m_arr[i][b][s] = mv;
-                }
-                for k in 0..4usize {
-                    let nibs = load256(qs, k * 32);
-                    let lo = _mm256_and_si256(nibs, mask_lo);
-                    let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
-                    _mm256_storeu_si256(tmp[i][k * 64..].as_mut_ptr() as *mut __m256i, lo);
-                    _mm256_storeu_si256(tmp[i][k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi);
-                }
-            }
-            d_vec[b] = _mm256_setr_ps(
-                d_arr[PERM[0]][b],
-                d_arr[PERM[1]][b],
-                d_arr[PERM[2]][b],
-                d_arr[PERM[3]][b],
-                d_arr[PERM[4]][b],
-                d_arr[PERM[5]][b],
-                d_arr[PERM[6]][b],
-                d_arr[PERM[7]][b],
-            );
-            dmin_vec[b] = _mm256_setr_ps(
-                dmin_arr[PERM[0]][b],
-                dmin_arr[PERM[1]][b],
-                dmin_arr[PERM[2]][b],
-                dmin_arr[PERM[3]][b],
-                dmin_arr[PERM[4]][b],
-                dmin_arr[PERM[5]][b],
-                dmin_arr[PERM[6]][b],
-                dmin_arr[PERM[7]][b],
-            );
-            for s in 0..8usize {
-                sc16_vec[b][s] = _mm512_setr_epi32(
-                    sc_rows[0][s] as i32,
-                    sc_rows[0][s] as i32,
-                    sc_rows[1][s] as i32,
-                    sc_rows[1][s] as i32,
-                    sc_rows[2][s] as i32,
-                    sc_rows[2][s] as i32,
-                    sc_rows[3][s] as i32,
-                    sc_rows[3][s] as i32,
-                    sc_rows[4][s] as i32,
-                    sc_rows[4][s] as i32,
-                    sc_rows[5][s] as i32,
-                    sc_rows[5][s] as i32,
-                    sc_rows[6][s] as i32,
-                    sc_rows[6][s] as i32,
-                    sc_rows[7][s] as i32,
-                    sc_rows[7][s] as i32,
-                );
-                m_vec[b][s] = _mm256_setr_epi32(
-                    m_arr[PERM[0]][b][s] as i32,
-                    m_arr[PERM[1]][b][s] as i32,
-                    m_arr[PERM[2]][b][s] as i32,
-                    m_arr[PERM[3]][b][s] as i32,
-                    m_arr[PERM[4]][b][s] as i32,
-                    m_arr[PERM[5]][b][s] as i32,
-                    m_arr[PERM[6]][b][s] as i32,
-                    m_arr[PERM[7]][b][s] as i32,
-                );
-                for g in 0..4usize {
-                    let dst =
-                        &mut ilv[b * 2048 + s * 256 + g * 64..b * 2048 + s * 256 + g * 64 + 64];
-                    for i in 0..8 {
-                        dst[i * 8..i * 8 + 8]
-                            .copy_from_slice(&tmp[i][s * 32 + g * 8..s * 32 + g * 8 + 8]);
-                    }
-                }
-            }
-        }
-    }
-
-    let [o0, o1, o2, o3, o4, o5, o6, o7] = outs;
-    for r in 0..m {
-        let q8 = &q8s[r];
-        // Whole-row f32 accumulator, 8 rows wide in PERM lane order — un-permuted only at the
-        // final store. Every f32 op below is a separate mul/sub/add (NO fma): identical rounding
-        // sequence to the scalar per-row expression.
-        let mut sumf_v = _mm256_setzero_ps();
-        for b in 0..nb {
-            // sd/sm per row: sd vertical in 512-bit pair-lane space, sm in PERM lane order.
-            let mut sd_zmm = _mm512_setzero_si512();
-            let mut sm_ymm = _mm256_setzero_si256();
-            let q8b = &q8.qs[b * 256..b * 256 + 256];
-            for s in 0..8usize {
-                let mut acc = _mm512_setzero_si512();
-                for g in 0..4usize {
-                    let w = load512(&ilv, b * 2048 + s * 256 + g * 64);
-                    // q8b is &[i8]; read the 8 activation bytes as one little-endian qword.
-                    let a = _mm512_set1_epi64(
-                        (q8b[s * 32 + g * 8..].as_ptr() as *const i64).read_unaligned(),
-                    );
-                    acc = _mm512_dpbusd_epi32(acc, w, a);
-                }
-                // Vertical: scale pair lanes in 512-bit space; pair-merge deferred to once per
-                // super-block (integer-exact — see q4k_gemm_group's note).
-                sd_zmm = _mm512_add_epi32(sd_zmm, _mm512_mullo_epi32(acc, sc16_vec[b][s]));
-                let isum = _mm256_set1_epi32(q8.bsums[b * 8 + s]);
-                sm_ymm = _mm256_add_epi32(sm_ymm, _mm256_mullo_epi32(m_vec[b][s], isum));
-            }
-            let sd_lo = _mm512_castsi512_si256(sd_zmm);
-            let sd_hi = _mm512_extracti64x4_epi64::<1>(sd_zmm);
-            let sd_ymm = _mm256_hadd_epi32(sd_lo, sd_hi); // pair-merge -> PERM order
-                                                          // q8.d[b] * (d*sd - dmin*sm), 8 rows at once (cvtepi32→f32 is exact for these
-                                                          // magnitudes; mul/sub/mul/add sequence matches the scalar expression's rounding).
-            let sd_f = _mm256_cvtepi32_ps(sd_ymm);
-            let sm_f = _mm256_cvtepi32_ps(sm_ymm);
-            let t = _mm256_sub_ps(
-                _mm256_mul_ps(d_vec[b], sd_f),
-                _mm256_mul_ps(dmin_vec[b], sm_f),
-            );
-            sumf_v = _mm256_add_ps(sumf_v, _mm256_mul_ps(_mm256_set1_ps(q8.d[b]), t));
-        }
-        let mut lanes = [0f32; 8];
-        _mm256_storeu_ps(lanes.as_mut_ptr(), sumf_v);
-        o0[r] = lanes[0];
-        o1[r] = lanes[1];
-        o4[r] = lanes[2];
-        o5[r] = lanes[3];
-        o2[r] = lanes[4];
-        o3[r] = lanes[5];
-        o6[r] = lanes[6];
-        o7[r] = lanes[7];
-    }
-}
-
 /// Batch Q4_K 8-row tile: `outs[i][r] = vec_dot_q4k(rows[i], &q8s[r], in_f)` for all i,r.
-/// Bit-identical to the single-token kernel. On AVX-512BW machines the Q8 activation is
-/// loaded once per (block, nibble-pair) and dotted against all 8 weight rows — 8× activation
-/// reuse over single-row, 4× over 2-row. Falls back to 8× `vec_dot_q4k_batch` on older CPUs.
+/// Bit-identical to the single-token kernel. This is the 8-row path for CPUs without AVX-512
+/// VNNI; with it, every caller takes the packed GEMM (`repack::q4k_pack_and_gemm_group`). On
+/// AVX-512BW machines the Q8 activation is loaded once per (block, nibble-pair) and dotted
+/// against all 8 weight rows — 8× activation reuse over single-row, 4× over 2-row. Falls back to
+/// 8× `vec_dot_q4k_batch` on older CPUs.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs: [&mut [f32]; 8]) {
     debug_assert_eq!(
@@ -2323,9 +2144,6 @@ pub(crate) fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
-            return unsafe { vec_dot_q4k_batch8_ilv_vnni(rows, q8s, in_f, outs) };
-        }
         if is_x86_feature_detected!("avx512bw") {
             return unsafe { vec_dot_q4k_batch8_avx512bw(rows, q8s, in_f, outs) };
         }
@@ -5109,7 +4927,8 @@ pub(crate) fn vec_dot_q5_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
 }
 
 /// Interleaved-x8 tile over native 32-element blocks (AVX512-VNNI) for the MoE `down`
-/// projections — the [`vec_dot_q4k_batch8_ilv_vnni`] structure at Q8_0/Q5_0's own block size.
+/// projections — the interleaved Q4_K pack's structure (`repack::Q4kPackGroup`) at Q8_0/Q5_0's
+/// own block size.
 /// Weights become UNSIGNED for dpbusd: Q5_0's 5-bit codes already are (0..31; the −16 rides the
 /// `−16·bsum` term); Q8_0's signed bytes are biased `+128` at repack and the exact integer
 /// correction `−128·bsum[b]` is applied per block — both integer-exact, so results stay
@@ -6572,6 +6391,38 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// `[dot(a, bs[0]), dot(a, bs[1]), …]`, each bit-identical to [`dot`]: the same per-lane FMA
+/// order and the same lane sum. One `dot` is a chain of dependent FMAs, so a loop of them waits on
+/// FMA latency; computing `N` together gives the core `N` independent chains to overlap.
+// per-call leaf, too small to probe (see docs/perf/playbook.md)
+#[cfg_attr(infr_profile, infr_prof::skip)]
+#[inline]
+pub(crate) fn dot_n<const N: usize>(a: &[f32], bs: [&[f32]; N]) -> [f32; N] {
+    let n = a.len();
+    for b in &bs {
+        assert_eq!(b.len(), n, "dot_n: every b must have a's length");
+    }
+    let chunks = n / 8;
+    let mut acc = [[0f32; 8]; N];
+    for c in 0..chunks {
+        let base = c * 8;
+        let av = &a[base..base + 8];
+        for (k, b) in bs.iter().enumerate() {
+            let bv = &b[base..base + 8];
+            for (j, ac) in acc[k].iter_mut().enumerate() {
+                *ac = av[j].mul_add(bv[j], *ac);
+            }
+        }
+    }
+    std::array::from_fn(|k| {
+        let mut s: f32 = acc[k].iter().sum();
+        for i in chunks * 8..n {
+            s = a[i].mul_add(bs[k][i], s);
+        }
+        s
+    })
+}
+
 /// Gated-FFN activation applied to the gate value.
 // per-call leaf, too small to probe (see docs/perf/playbook.md)
 #[cfg_attr(infr_profile, infr_prof::skip)]
@@ -6604,7 +6455,9 @@ mod kernel_tests {
     // gate their bodies on the same arch, so the import must be gated too or it fails to resolve
     // on aarch64.
     #[cfg(target_arch = "x86_64")]
-    use crate::repack::{q4k_gemm_group, q4k_pack, q6k_gemm_group, q6k_pack};
+    use crate::repack::{
+        q4k_gemm_group_out, q4k_pack, q6k_pack_and_gemm_group, GemmOut, TILE_TOKENS,
+    };
     use infr_core::tensor::DType;
     use infr_gguf::dequant::{dequant_block, dequant_codebook};
 
@@ -6625,6 +6478,26 @@ mod kernel_tests {
     fn put_f16(b: &mut [u8], v: f32) {
         b.copy_from_slice(&half::f16::from_f32(v).to_le_bytes());
     }
+    /// `dot_n` must give each `dot` bit for bit, including lengths with a sub-8 tail and the
+    /// empty vector.
+    #[test]
+    fn dot_n_matches_dot_bitwise() {
+        for n in [0usize, 1, 7, 8, 9, 64, 128, 133] {
+            let a = det_x(n, 5 + n as u64);
+            let bs: Vec<Vec<f32>> = (0..4).map(|k| det_x(n, 100 * k + n as u64)).collect();
+            let got = dot_n(&a, [&bs[0][..], &bs[1][..], &bs[2][..], &bs[3][..]]);
+            for (k, b) in bs.iter().enumerate() {
+                let want = dot(&a, b);
+                assert_eq!(
+                    got[k].to_bits(),
+                    want.to_bits(),
+                    "n={n} k={k}: {} vs {want}",
+                    got[k]
+                );
+            }
+        }
+    }
+
     /// The reference activation the integer kernels actually see: `d8 * q8` per super-block.
     fn dequant_q8(q8: &Q8) -> Vec<f32> {
         let mut x = vec![0f32; q8.qs.len()];
@@ -6751,9 +6624,14 @@ mod kernel_tests {
         #[cfg(target_arch = "x86_64")]
         {
             if !(is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni")) {
-                return; // the pack/gemm pair only exists on the VNNI path
+                // The pack/GEMM pair runs only on the VNNI path; other CPUs take the per-row
+                // kernels, which the route tests in lib.rs and moe.rs check on any host.
+                eprintln!("SKIP: this CPU lacks AVX-512BW + AVX-512 VNNI");
+                return;
             }
-            let (in_f, out_f, m) = (512usize, 16usize, 5usize);
+            let (in_f, out_f, m) = (512usize, 16usize, 11usize);
+            // Several full token tiles of the GEMM and a remainder, so both loops run.
+            assert!(m > 2 * TILE_TOKENS && m % TILE_TOKENS != 0);
             let nb256 = in_f / 256;
             let mut w = det_bytes(out_f * nb256 * 210, 90);
             for o in 0..out_f {
@@ -6767,11 +6645,12 @@ mod kernel_tests {
             let q8s: Vec<Q8> = (0..m)
                 .map(|r| quantize_q8(&det_x(in_f, 91 + r as u64)))
                 .collect();
-            let pack = q6k_pack(&w, in_f, out_f);
             let bpr = w.len() / out_f;
-            for (g, pg) in pack.groups.iter().enumerate() {
+            for g in 0..out_f / 8 {
+                let rows = std::array::from_fn(|i| &w[(8 * g + i) * bpr..(8 * g + i + 1) * bpr]);
                 let mut cols = vec![0f32; 8 * m];
-                unsafe { q6k_gemm_group(pg, pack.nb, &q8s, &mut cols) };
+                let gout = GemmOut::o_major(&mut cols, m);
+                unsafe { q6k_pack_and_gemm_group(rows, nb256, &q8s, gout, 0) };
                 for i in 0..8 {
                     let o = g * 8 + i;
                     let mut want = vec![0f32; m];
@@ -6795,9 +6674,14 @@ mod kernel_tests {
         #[cfg(target_arch = "x86_64")]
         {
             if !(is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni")) {
-                return; // the pack/gemm pair only exists on the VNNI path
+                // The pack/GEMM pair runs only on the VNNI path; other CPUs take the per-row
+                // kernels, which the route tests in lib.rs and moe.rs check on any host.
+                eprintln!("SKIP: this CPU lacks AVX-512BW + AVX-512 VNNI");
+                return;
             }
-            let (in_f, out_f, m) = (512usize, 16usize, 5usize);
+            let (in_f, out_f, m) = (512usize, 16usize, 11usize);
+            // Several full token tiles of the GEMM and a remainder, so both loops run.
+            assert!(m > 2 * TILE_TOKENS && m % TILE_TOKENS != 0);
             let nb256 = in_f / 256;
             let mut w = det_bytes(out_f * nb256 * 144, 80);
             for o in 0..out_f {
@@ -6819,7 +6703,7 @@ mod kernel_tests {
             let bpr = w.len() / out_f;
             for (g, pg) in pack.groups.iter().enumerate() {
                 let mut cols = vec![0f32; 8 * m];
-                unsafe { q4k_gemm_group(pg, pack.nb, &q8s, &mut cols) };
+                unsafe { q4k_gemm_group_out(pg, pack.nb, &q8s, GemmOut::o_major(&mut cols, m), 0) };
                 for i in 0..8 {
                     let o = g * 8 + i;
                     let mut want = vec![0f32; m];

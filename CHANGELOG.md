@@ -29,6 +29,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Prefill on the CPU backend is 2.6-6.1× faster, and ahead of llama.cpp's CPU
+  at 512 tokens.** Warm pp512 on a Ryzen 9 9950X3D, 16 threads, interleaved with
+  the previous build: SmolLM3-3B Q4_K_M from 175-184 to 622-636 tok/s
+  (llama.cpp: 579), ERNIE-4.5-21B-A3B Q4_K_M from 73-81 to 374-449 (llama.cpp:
+  246), Qwen3-30B-A3B Q4_K_M from 147-151 to 395-400 (llama.cpp: 231). Short
+  prompts gain too: pp16 SmolLM3 54-68 to 292-309 (llama.cpp: 381), ERNIE 13-20
+  to 101-121 (llama.cpp: 111), Qwen3-30B-A3B 54-63 to 155-160 (llama.cpp: 120).
+  Every result is bit-identical to before and every CPU golden is unchanged. The
+  causes, in order of size: each op wrote a fresh multi-megabyte buffer, so the
+  forward spent much of its time faulting in zeroed pages (`execute` now reuses
+  the buffers the previous layer freed); Q4_K, Q5_K and Q6_K prefill Linears and
+  MoE expert GEMMs run a packed AVX-512 VNNI GEMM that carries four tokens per
+  pass over an 8-row weight group (Q6_K from three tokens up, below which its
+  per-row kernels are as fast), packs each group into per-thread scratch instead
+  of allocating per call, and writes the row-major output directly instead of
+  through a transposed temporary (Q5_K had no packed path at all; the dense Q6_K
+  path rebuilt its whole-weight pack on every request); `Rope` ran on one thread
+  and recomputed its angles per head; attention's q·k dots, and an f32 MoE
+  router's, waited on one FMA chain at a time; and the MoE down stage
+  un-transposed a whole layer's output with a cache line per element. The dense
+  Q6_K pack cache is gone, so `kernels.cpu.repack_mb` now bounds only the
+  fused-gate/up MoE Q4_K packs. Decode is unchanged.
 - **MoE decode on the CPU backend is 3.4-3.5× faster.** A single-token MoE step
   runs its routed experts on f32 activations, and dequantized every expert
   weight row through the general host dequant first: four allocations and two

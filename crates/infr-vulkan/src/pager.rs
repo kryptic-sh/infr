@@ -206,7 +206,7 @@ impl GpuPager {
     /// into its front.
     ///
     /// A miss is all-or-nothing: if `fill` fails (or the region lies outside the ring), the miss
-    /// is rolled back before the error returns — see [`Self::fill_or_roll_back`] — so the caller
+    /// is rolled back before the error returns (the private `fill_or_roll_back`), so the caller
     /// needs no cleanup for this block, whatever it then does with the recording.
     ///
     /// Contract: the ring region `[ring_off, ring_off + slot_bytes)` must stay untouched until

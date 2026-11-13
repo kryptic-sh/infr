@@ -19,6 +19,11 @@
 - Pull the latest changes before continuing each slice of work, preserving local
   changes when integrating upstream work.
 - Commit and push each completed slice to `main`.
+- Run what CI runs before pushing: `cargo fmt --all -- --check`,
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `cargo nextest run --workspace --locked`, and
+  `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`. The
+  docs job fails on a public item's doc linking to a private one.
 - Watch CI for the pushed commit, inspect its jobs, and resolve failures before
   considering the slice complete. A successful push alone is not verification. A
   push cancels the run before it, so let a run finish before pushing the next

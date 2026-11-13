@@ -2294,11 +2294,6 @@ a hot path
   2026-11-12, does not ("Access is denied", run 2026-11-13). `commit_file` now
   falls back to std's rename plus a flush of the renamed file when `MoveFileExW`
   refuses, and `a_commit_replaces_a_mapped_file` holds the case on every OS.
-- **Out-of-order ranged writes on NTFS.** `ranged::worker` writes chunks with
-  `seek_write` in any order. NTFS zero-fills everything below a write past the
-  valid-data length, synchronously, so a late chunk landing first in a large
-  file can stall a worker. Not measured. Marking the file sparse
-  (`FSCTL_SET_SPARSE`) or pre-sizing it would avoid it.
 - **Which `link_blob` arm runs on Windows.** Observed on this dev box: the
   snapshot entry `infr pull` made on 2026-09-23 is a symlink, so the
   `symlink_file` arm ran (Developer Mode grants the privilege). The hard-link

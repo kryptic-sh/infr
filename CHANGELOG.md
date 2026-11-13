@@ -197,6 +197,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   flushed to disk before it is renamed into the cache, a cached file whose size
   disagrees with the hub is fetched again, and two pulls of the same model at
   once both succeed.
+- **`infr pull` on Windows no longer stalls when a late part of a large file
+  arrives first.** NTFS filled everything below such a write with zeros before
+  it returned, which for the last chunk of a model meant writing the whole file
+  once just to place it. The partial download is now a sparse file.
 - **A repo id with a backslash, `..` or a drive prefix is refused**; on Windows
   it could write outside the cache.
 - **`generation_config.json` is found for a GGUF in a subdirectory** of its

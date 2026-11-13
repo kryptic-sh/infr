@@ -203,6 +203,11 @@ pub(crate) fn run(
         .write(true)
         .open(tmp)
         .map_err(|e| RangedError::Fatal(Error::from(e)))?;
+    // The workers write chunks in whatever order they finish. Not fatal when refused: the chunks
+    // still land, a late one first just waits for the filesystem to fill the gap below it.
+    if let Err(e) = infr_plat::fileio::allow_out_of_order_writes(&file) {
+        debug!("{label}: could not prepare the partial for out-of-order writes: {e}");
+    }
     parts::save(tmp, &plan).map_err(RangedError::Fatal)?;
 
     pb.set_position(plan.completed_bytes());

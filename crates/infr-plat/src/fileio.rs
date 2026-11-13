@@ -95,6 +95,56 @@ pub fn write_all_at(file: &File, buf: &[u8], offset: u64) -> io::Result<()> {
     }
 }
 
+/// Prepare `file` for writes that arrive in any order, as a download split into ranges makes them.
+///
+/// **Windows**: marks the file sparse (`FSCTL_SET_SPARSE`). Without it NTFS fills everything below
+/// a write past the end of the valid data with zeros before the write returns, so the last chunk
+/// of a large file landing first stalls its writer for the time it takes to write the whole file
+/// once. **Unix**: nothing to do, a write past the end leaves a hole. **Other targets**: an
+/// `Unsupported` error.
+///
+/// An error leaves the file usable: writes still land where they are told, only slower. A
+/// filesystem without sparse files (FAT, exFAT) answers that way.
+pub fn allow_out_of_order_writes(file: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let _ = file;
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+        use windows::Win32::System::IO::DeviceIoControl;
+
+        let mut returned = 0u32;
+        // SAFETY: the handle is open for the borrow of `file`; the call takes no input or output
+        // buffer, and `returned` outlives it.
+        unsafe {
+            DeviceIoControl(
+                HANDLE(file.as_raw_handle()),
+                FSCTL_SET_SPARSE,
+                None,
+                0,
+                None,
+                0,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .map_err(|_| io::Error::last_os_error())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "out-of-order writes are only prepared for on unix and windows",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +202,41 @@ mod tests {
         assert_eq!(got.len(), 5, "file must have grown: {got:?}");
         assert_eq!(&got[..2], b"ab");
         assert_eq!(got[4], b'z');
+    }
+
+    /// A write far past the end of a prepared file must not allocate the gap below it. Allocated
+    /// size is the observable: without the preparation NTFS backs the whole gap with zeros.
+    #[test]
+    fn a_prepared_file_keeps_a_hole_below_a_late_write() {
+        const GAP: u64 = 64 << 20;
+        let (_d, path) = scratch(b"");
+        let f = File::options().write(true).open(&path).expect("open rw");
+        allow_out_of_order_writes(&f).expect("prepare");
+        write_all_at(&f, b"tail", GAP).expect("write past the gap");
+        f.sync_all().expect("sync");
+        assert_eq!(f.metadata().expect("metadata").len(), GAP + 4);
+        let on_disk = allocated_bytes(&path);
+        assert!(
+            on_disk < GAP / 2,
+            "the gap was allocated: {on_disk} bytes on disk"
+        );
+    }
+
+    #[cfg(unix)]
+    fn allocated_bytes(path: &std::path::Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).expect("metadata").blocks() * 512
+    }
+
+    #[cfg(windows)]
+    fn allocated_bytes(path: &std::path::Path) -> u64 {
+        use windows::core::HSTRING;
+        use windows::Win32::Storage::FileSystem::GetCompressedFileSizeW;
+
+        let mut high = 0u32;
+        // SAFETY: the path is a NUL-terminated wide string owned by this frame, and `high`
+        // outlives the call.
+        let low = unsafe { GetCompressedFileSizeW(&HSTRING::from(path), Some(&mut high)) };
+        (u64::from(high) << 32) | u64::from(low)
     }
 }

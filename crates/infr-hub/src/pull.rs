@@ -2000,6 +2000,30 @@ mod tests {
         );
     }
 
+    /// A ranged download prepares its partial for out-of-order writes. Only Windows has anything
+    /// to observe (the sparse attribute, which the committed blob keeps); `infr-plat`'s own test
+    /// covers what the preparation does to allocation on every OS.
+    #[cfg(windows)]
+    #[test]
+    fn a_ranged_partial_is_sparse_on_windows() {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-sparse", 1, big());
+        let cache = TempRepo::new();
+
+        pull_one(&hub, &cache, &files, 4).unwrap();
+
+        let blob = cache.blobs().join(hub.sha(&files[0]));
+        let attrs = fs::metadata(&blob).unwrap().file_attributes();
+        assert_ne!(
+            attrs & FILE_ATTRIBUTE_SPARSE_FILE,
+            0,
+            "the ranged partial was never marked sparse (attributes {attrs:#x})"
+        );
+    }
+
     /// A file that finishes hands its connection to the one still going.
     ///
     /// This is the tail of every shard set: once fewer files remain than there are connections, a

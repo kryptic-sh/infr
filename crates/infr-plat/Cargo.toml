@@ -23,6 +23,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Console",           # SetConsoleCtrlHandler, ReadConsoleW
     "Win32_Storage_FileSystem",       # LockFileEx / UnlockFileEx
     "Win32_System_IO",                # OVERLAPPED
+    "Win32_System_Ioctl",             # FSCTL_SET_SPARSE
     "Win32_System_SystemInformation", # GlobalMemoryStatusEx
     "Win32_System_ProcessStatus",     # GetProcessMemoryInfo
     "Win32_Security",                 # CreateJobObjectW in native tests

@@ -4299,14 +4299,19 @@ message in both engines. What is left:
   items, and prints a small float as `0.0`, none of which Jinja2 does. So exact
   parity is not a formatter override (`Environment::set_formatter`) plus a
   `string` filter: it would copy those interpolation quirks, which look like
-  llama.cpp bugs. Not built; it needs its own decision (match `str()` where
-  llama.cpp does, and leave bare interpolation alone, or copy all of it). Cached
-  templates that reach it: Qwen3.5 prints each scalar tool-call argument with
-  `args_value | string`, so a bool, none or exponent-range float argument
-  renders differently (verified for `true`, `none` and `1e-7`); SmolLM3 prints
-  `tool | string` for `xml_tools`, which infr never passes (B159). Qwen3.5's
-  `'Picture ' ~ image_count.value` concatenates an integer, which matches. No
-  cached template interpolates a non-string bare.
+  llama.cpp bugs. Not built. **Decided 2026-11-13: follow Python Jinja2**, which
+  is what Hugging Face's `apply_chat_template` renders with and so what a model
+  was trained on, everywhere a template turns a non-string into text (bare
+  interpolation, `| string`, `~`, `join`, `format`). Where llama.cpp departs
+  from Python, infr follows Python and the llama.cpp comparison lists the case
+  as a known difference. The work starts by installing the `jinja2` package as
+  the test oracle: the Python behaviour has not been run here, only llama.cpp's
+  and minijinja's. Cached templates that reach it: Qwen3.5 prints each scalar
+  tool-call argument with `args_value | string`, so a bool, none or
+  exponent-range float argument renders differently (verified for `true`, `none`
+  and `1e-7`); SmolLM3 prints `tool | string` for `xml_tools`, which infr never
+  passes (B159). Qwen3.5's `'Picture ' ~ image_count.value` concatenates an
+  integer, which matches. No cached template interpolates a non-string bare.
 
 - **`tojson` divergences kept on purpose.** Integers outside the signed 64-bit
   range: llama.cpp wraps them (`[18446744073709551615, 9223372036854775808]`
@@ -4449,33 +4454,6 @@ row came from `cpu_prefill_matches_llama_debug_dump` fed a hand-made token file
 file, so only its printed infr top-5 means anything, and that run fails the
 test's comparison by construction. The golden is kept: the flip sits inside
 llama.cpp's own prefill-versus-decode spread.
-
-### B162 — `cpu_golden_qwen3moe` fails on this Windows box: suspected OS difference (2026-11-13)
-
-**Tag:** tests · moe
-
-`cpu_golden_qwen3moe` (`crates/infr-llama/tests/cpu_backend.rs`, `#[ignore]`d,
-runs nowhere in CI) fails here: got `0xe1a4ed6cecc5eb14`, want
-`0xbc4f22b22d3e3c1d`. What is established:
-
-- This golden had never run on Windows before: the Qwen3-30B-A3B GGUF was first
-  downloaded to this machine on 2026-11-13. The hash was set in `e252233a`
-  (2026-07-05), recorded by review as a Linux capture.
-- The chat-template change is not the cause: the same hash comes out with
-  `trim_blocks` / `lstrip_blocks` off, and this model's template renders
-  identically either way.
-- The output is coherent. The test prints only today's text,
-  `<think>\nOkay, the user is asking "The capital of France is". I need to provide the correct answer. Let`;
-  the comment above `QWEN3MOE_GOLDEN` records the blessed one as
-  `<think>\nOkay, the user is asking, "The capital of France is". …`. The first
-  difference is the token after ` asking`: `,` when blessed, ` "` today.
-
-Suspected cause: the Windows-versus-Linux greedy difference the doc on `per_os`
-describes, which is why the other long goldens carry a separate Windows hash.
-Not excluded: the GGUF on the Hub was re-uploaded after the hash was taken.
-Likely fix: once a Linux run confirms `0xbc4f22b22d3e3c1d` still holds, wrap it
-as `per_os(0xe1a4ed6cecc5eb14, 0xbc4f22b22d3e3c1d)`. Re-blessing on Windows
-alone would break Linux.
 
 ### B163 — whether `schedule` should close its small gap to Belady on a cyclic sweep (2026-11-13)
 

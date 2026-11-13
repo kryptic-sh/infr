@@ -2623,8 +2623,12 @@ fn qwen3moe_30b() -> Option<PathBuf> {
 // the staged-MoE `int8_ok` doc). Verified coherent ("<think>\nOkay, the user is asking, \"The
 // capital of France is\". I need to provide the correct answer.") — re-blessed for the
 // attention-SIMD reassociation (numerics policy: match-or-beat llama.cpp CPU precision).
-const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 24, 0xbc4f22b22d3e3c1d)];
+// The Windows hash was captured 2026-11-13, the day the Linux one was re-run and held.
+const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] = &[(
+    "The capital of France is",
+    24,
+    per_os(0xe1a4ed6cecc5eb14, 0xbc4f22b22d3e3c1d),
+)];
 
 /// Whole-vector cosine similarity (f64 accumulation) — used by the CPU/Vulkan cross-backend
 /// logits check below.

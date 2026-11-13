@@ -5,8 +5,9 @@
 Pure-Rust LLM inference engine. Vulkan-first, built to run on any mainstream
 GPU.
 
-> Early WIP. The only non-Rust parts are the GPU driver calls (Vulkan via `ash`)
-> and the compute shaders (SPIR-V).
+> Early WIP. The engine is Rust; GPU work goes through Vulkan (`ash`, SPIR-V
+> shaders) or Metal (MSL shaders), with no CUDA and no llama.cpp underneath. A
+> source build also compiles the C and C++ code some dependencies carry.
 
 ## Goal
 
@@ -78,8 +79,8 @@ and the 35B rides `qwen35moe` with no code changes
 2026-07-12 — the 1.7B / 4B / 8B all ride `qwen3`, zero-code, both in the TQ2_0
 repack (`superkaiii/Ternary-Bonsai-4B-GGUF`) and in llama.cpp's new **Q2_0**
 weight dtype (2.25 bpw, GGML type 42 — native in-shader dequant + dp4a mmq, no
-fork needed). infr is the **only engine that runs Q2_0 on a GPU** (llama.cpp
-merged the dtype CPU-only) — numbers in
+fork needed). Q2_0 runs on the GPU here; llama.cpp merged the dtype CPU-only and
+added its GPU backends later — numbers in
 [`docs/perf/results.md`](docs/perf/results.md). Pull the `Q2_0_g64` files:
 `infr run prism-ml/Ternary-Bonsai-8B-gguf:Q2_0_g64 "..."`.
 
@@ -176,9 +177,9 @@ curl -s localhost:8080/v1/chat/completions -d '{
 }'
 ```
 
-Works as a drop-in backend for OpenAI-API clients (opencode, the Claude Code
-CLI, etc.). Tool calling renders the model's own `tokenizer.chat_template`
-(Qwen, Llama-3.x, Gemma tool dialects supported).
+Works as a drop-in backend for OpenAI-API clients (hrdr, opencode, etc.). Tool
+calling renders the model's own `tokenizer.chat_template` (Qwen, Llama-3.x,
+Gemma tool dialects supported).
 
 `GET /metrics` serves Prometheus counters and gauges (`infr_requests_total`,
 `infr_generation_tokens_total`, `infr_decode_seconds_total`,
@@ -196,19 +197,15 @@ a per-request OpenAI `temperature`/`top_p` still overrides them. See
 Measured against llama.cpp on an **AMD Radeon RX 7900 XTX** (RDNA3, Vulkan /
 RADV), every validated model × quant, both engines on matched flags. Headline:
 
-- **Decode** — the reproducible half — wins **29 of 35** rows at `tg128` and
-  **24 of 35** at `tg64@d4096`.
 - **`pp4@d4096`** (multi-turn ingest, the shape a coding agent actually runs) is
-  the strongest column, roughly **1.5–2×** on the small and mid models.
-- Losses concentrate on **Qwen3-14B and the larger MoEs**, mostly at depth.
+  the strongest column: **34 of 35** rows. `pp512` also wins **34 of 35**.
+- **Decode** is the narrower win: **31 of 35** rows at `tg128` and **26 of 35**
+  at `tg64@d4096`, the softest column.
 
 **The full table, the per-row footnotes, and an honest account of where infr
-loses are in [`docs/perf/results.md`](docs/perf/results.md).** Two caveats live
-there and both matter: ratios move with _both_ engines, so snapshots taken
-against different `llama-bench` builds are not comparable; and infr's
-**prefill** columns vary up to ~30% run-to-run on an identical binary (a known
-tier/chunk nondeterminism), so quote prefill to one significant figure and
-decode as written.
+loses are in [`docs/perf/results.md`](docs/perf/results.md)** (the 2026-08-03
+snapshot). One caveat lives there and matters: ratios move with _both_ engines,
+so snapshots taken against different `llama-bench` builds are not comparable.
 
 To reproduce or extend the numbers — `infr bench` / `infr compare --sweep`
 flag-for-flag against `llama-bench`, plus per-op GPU profiling — see
@@ -234,16 +231,15 @@ is indexed at [`docs/perf/`](docs/perf/README.md).
   via a native **Metal backend** (`--dev metal`) covering every op the CPU
   reference does — dense, MoE (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is
   optimized (simdgroup-matrix GEMM + flash attention, raw-block quant decode;
-  within ~1.3-1.5× of llama.cpp Metal on M3 Pro — architecture and numbers in
-  [`docs/metal.md`](docs/metal.md))
+  decode at parity with llama.cpp Metal on M3 Pro, prefill 0.80–0.92× of it —
+  architecture and numbers in [`docs/metal.md`](docs/metal.md))
 - **Store:** the shared **HuggingFace Hub cache** — located via `$HF_HUB_CACHE`,
   else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`, in HF's own
   `models--<org>--<repo>/{blobs,snapshots,refs}` layout. A model pulled by
   `infr`, `llama.cpp`, or `huggingface_hub` is shared — downloaded once.
   `infr pull` fetches from `huggingface.co` over resumable HTTP Range with a
   progress bar; gated repos authenticate with `HF_TOKEN`.
-- **API:** OpenAI-compatible HTTP (streaming) — works with opencode / Claude
-  Code CLI
+- **API:** OpenAI-compatible HTTP (streaming) — works with hrdr / opencode
 
 ## Architecture
 

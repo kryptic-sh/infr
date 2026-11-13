@@ -794,6 +794,37 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The ordinary arm renames the marker into place WHILE its lock is held, which on Windows
+    /// needs the lock's handle to share delete access. The fallback below would hide a refusal —
+    /// every other test passes through it — so the rename's own result is what this observes.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn arming_renames_the_locked_marker_into_place() {
+        let dir = tmp_dir("rename-locked");
+        let c = cache_in(&dir, b"k");
+        let path = c.path().unwrap().to_path_buf();
+        let renamed = std::cell::RefCell::new(None);
+        c.arm_with(&path, |from, to| {
+            let r = std::fs::rename(from, to);
+            *renamed.borrow_mut() = Some(r.as_ref().map(|_| ()).map_err(|e| e.to_string()));
+            r
+        });
+        assert_eq!(
+            renamed.into_inner(),
+            Some(Ok(())),
+            "renaming a locked marker failed"
+        );
+        let marker = c.marker(&path);
+        assert!(
+            FileLock::try_acquire_existing(&marker)
+                .expect("probe the marker")
+                .is_none(),
+            "the renamed marker lost its lock"
+        );
+        c.disarm();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// When the rename into place fails, the marker is still locked — an unlocked one would be
     /// read as a corpse by any other run's sweep while its owner is alive.
     #[cfg(any(unix, windows))]

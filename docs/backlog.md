@@ -3421,10 +3421,12 @@ check kept where no lock can be taken. Accepted and documented in
 an upgrade; and when the rename into place fails, a sweep landing between
 opening and locking the fallback marker discards the cache once and leaves that
 run unprotected against its own hang. Not run: real NFS (where `flock` is
-emulated per process — the in-process registry is there for it), and Windows,
-which compiles but relies on share-delete opens that were not exercised. The
-cgroup headroom fix (`cgroup_level_headroom` subtracts inactive file cache) was
-likewise not run inside a real container, and does not subtract `active_file`.
+emulated per process — the in-process registry is there for it). Windows was run
+on 2026-11-13: renaming a marker while its lock is held and unlinking one under
+a lock both work there (`arming_renames_the_locked_marker_into_place` observes
+the rename, which the fallback would otherwise hide). The cgroup headroom fix
+(`cgroup_level_headroom` subtracts inactive file cache) was likewise not run
+inside a real container, and does not subtract `active_file`.
 
 ### B133 — what the loader, host-pager and LRU fixes left open (2026-11-12)
 
@@ -3939,6 +3941,9 @@ two manifest warnings are left, since neither fails `-D warnings`:
   Windows and Linux. A `[target.'cfg(target_os = "macos")'.dependencies]` entry
   would say so, if the code that names it is gated the same way everywhere (not
   checked).
+- `bytemuck` and `infr-prof` in `infr-core` are reported only by
+  `cargo clippy -p infr-core`, not by a `--workspace` run, so their use
+  presumably hangs on a feature another crate turns on (not checked).
 
 ### Review coverage as of 2026-11-12
 

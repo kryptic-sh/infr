@@ -17,11 +17,16 @@ Read in `src/models/smollm3.cpp` (llama.cpp `5676dfbe0`), in full:
 
 ## What infr already has
 
-`Config::no_rope_step` and the predicate beside it implement the same
-`(il + 1) % step == 0` rule for `llama4`. **Not yet read:** whether that
-predicate only skips RoPE or also switches the other things the NoPE layers of
-`llama4` do (the comment near it mentions an attention temperature). If it does
-more, SmolLM3 needs the skip separated from the rest.
+`Config::no_rope_step` with `Config::is_nope_layer` implements the same
+`(il + 1) % step == 0` rule for `llama4`. Read on 2026-11-13: in the runner's
+layer loop the predicate does two things, skip RoPE and drop the llama4 Q/K
+L2-norm handle, and that handle is `None` for every other family. The other
+llama4-only behaviour (the context cap from `faithful_ctx_limit`, the
+interleaved MoE step) is gated on the arch in `Config::from_gguf`, not on the
+step. So setting `no_rope_step = 4` for `smollm3` skips RoPE on those layers and
+changes nothing else, which is what the reference does. One runner test asserts
+a single-layer model's only layer applies RoPE (`is_nope_layer(0)`); with a step
+of 4 that still holds.
 
 ## Steps
 
@@ -30,8 +35,9 @@ more, SmolLM3 needs the skip separated from the rest.
    tokenizer model and `pre` value, and the chat template.
 2. `arch.rs`: add `SMOLLM3`. `Config::from_gguf`: the arm, with
    `no_rope_step = 4` set from the arch (the reference hardcodes it).
-3. Make the NoPE layers skip RoPE and nothing else. It is a graph-builder
-   branch, not a new op, so every backend gets it at once.
+3. Nothing to build in the graph: the NoPE branch already exists and every
+   backend gets it. Add a config test that the arch sets the step and that
+   layers 3, 7, … are the NoPE ones.
 4. Verify per the recipe: logits against `llama-cli` on the CPU backend, a CPU
    golden in `tests/cpu_backend.rs` (read the text before blessing), a
    `gpu_seam_matches_cpu_smollm3` test, then `infr run`.

@@ -188,6 +188,111 @@ pub(crate) fn scratch_capacity(have: Option<usize>, need: usize, max: usize) -> 
     }
 }
 
+/// Can the executor's STATIC walk run `g` once per token, with only the bound positions buffer
+/// advanced, and decode each position correctly? `Ok` names the positions tensor the walk takes
+/// the live position from (it must be bound); `Err` says why not.
+///
+/// The walk patches a decode-shaped graph (one with a single-row `Attention`) from live state:
+/// it reads the position off the buffer bound to the first `QkNormRope`/`Rope`'s `positions`
+/// (`run_graph`'s `dynpos`) and overrides the baked `pos` of every single-row `WriteKv` and the
+/// baked `pos`/`kv_len` of every single-row `Attention` with it. Every other op either reads no
+/// position or reads one this override does not reach, and the match below decides each op by
+/// name, with no catch-all arm, so a new `Op` cannot be admitted without a decision here.
+pub(crate) fn static_walk_live_positions(
+    g: &infr_core::graph::Graph,
+) -> Result<infr_core::tensor::TensorId, &'static str> {
+    use infr_core::graph::{AttnMask, Op};
+    let positions = g
+        .ops
+        .iter()
+        .find_map(|op| match op {
+            Op::QkNormRope { positions, .. } | Op::Rope { positions, .. } => Some(*positions),
+            _ => None,
+        })
+        .ok_or("no rope op names a positions buffer for the walk to read the live position from")?;
+    if !g
+        .ops
+        .iter()
+        .any(|op| matches!(op, Op::Attention { rows: 1, .. }))
+    {
+        return Err("no single-row attention, so the walk does not take the live position");
+    }
+    for op in &g.ops {
+        match op {
+            // Rope reads its positions per execute: the walk loads every bound Input afresh, and
+            // `ensure_device` uploads that load. QkNormRope's kernel reads the bound buffer
+            // itself. `neox`, `backward` and the frequency factors change the rotation, not where
+            // its position comes from.
+            Op::Rope { .. } | Op::QkNormRope { .. } => {}
+            // The walk overrides a single-row write's `pos`; a multi-row write keeps its baked
+            // rows.
+            Op::WriteKv { rows, .. } => {
+                if *rows != 1 {
+                    return Err("a multi-row WriteKv keeps its baked position");
+                }
+            }
+            Op::Attention {
+                rows,
+                mask,
+                key_bias,
+                ..
+            } => {
+                if *rows != 1 {
+                    return Err("a multi-row Attention keeps its baked position and length");
+                }
+                // A causal or sliding window is measured from the overridden `pos`; a canvas
+                // window's `lo` is a baked position.
+                if matches!(mask, AttnMask::Canvas { .. }) {
+                    return Err("a canvas Attention's window starts at a baked position");
+                }
+                // The score bias is `[rows, kv_len]` at the baked length (`TopkMask` makes it).
+                // Sinks are a per-head weight and read no position.
+                if key_bias.is_some() {
+                    return Err("an Attention key_bias is sized for the baked length");
+                }
+            }
+            // Each bakes a position or a length the walk does not override.
+            Op::Mla { .. } => return Err("Mla keeps its baked position and length"),
+            Op::TopkMask { .. } => return Err("TopkMask keeps its baked length"),
+            Op::LightningIndexer { .. } => {
+                return Err("LightningIndexer keeps its baked position and length")
+            }
+            Op::CompressPool { .. } => return Err("CompressPool pools a baked number of rows"),
+            // No position: elementwise, norms, projections, sampling, gathers, copies, MoE and
+            // the recurrent ops (whose state is the bound buffer, read and written in place).
+            Op::RmsNorm { .. }
+            | Op::RmsNormAdd { .. }
+            | Op::LayerNorm { .. }
+            | Op::Linear { .. }
+            | Op::Softmax { .. }
+            | Op::QkNorm { .. }
+            | Op::GatedRmsNorm { .. }
+            | Op::HyperConnectMix { .. }
+            | Op::HyperConnectPre { .. }
+            | Op::HyperConnectPost { .. }
+            | Op::GatedAct { .. }
+            | Op::GatedActFused { .. }
+            | Op::Add { .. }
+            | Op::AddBias { .. }
+            | Op::Scale { .. }
+            | Op::MulVec { .. }
+            | Op::Softcap { .. }
+            | Op::Argmax { .. }
+            | Op::ArgmaxProb { .. }
+            | Op::Sample { .. }
+            | Op::EmbedGather { .. }
+            | Op::GatherI32 { .. }
+            | Op::Copy { .. }
+            | Op::CopyStrided { .. }
+            | Op::MoeFfn { .. }
+            | Op::Conv1dSilu { .. }
+            | Op::DeltaNet { .. }
+            | Op::MoeSharedExpertAdd { .. } => {}
+        }
+    }
+    Ok(positions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,5 +627,193 @@ mod tests {
         assert_eq!(allocs, 4096usize.ilog2() as usize + 1);
         let cap = cap.unwrap();
         assert!(cap >= 4096 * row && cap < 2 * 4096 * row);
+    }
+
+    /// The static walk's live-position decision (`static_walk_live_positions`) on graphs shaped
+    /// like a llama decode step: plain `Rope` for Q and K, one f16 KV write and one causal
+    /// attention row. `with` adds or changes ops before the graph is judged.
+    mod static_walk {
+        use super::super::static_walk_live_positions;
+        use infr_core::graph::{AttnMask, Graph, Op};
+        use infr_core::tensor::TensorId;
+        use infr_core::{DType, TensorDesc};
+
+        /// The handles a test may wire extra ops to.
+        struct Ids {
+            positions: TensorId,
+            q: TensorId,
+            k_cache: TensorId,
+            scratch: TensorId,
+        }
+
+        const HD: usize = 64;
+
+        fn llama_decode(with: impl FnOnce(&mut Graph, &Ids)) -> Graph {
+            let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
+            let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+            let mut g = Graph::new();
+            let x = g.input(f32d(HD));
+            let positions = g.input(TensorDesc::new(vec![1], DType::I32));
+            let k_cache = g.input(f16d(16 * HD));
+            let v_cache = g.input(f16d(16 * HD));
+            let q = g.internal(f16d(HD));
+            let k = g.internal(f16d(HD));
+            let scratch = g.internal(f32d(16 * HD));
+            let dst = g.output(f32d(HD));
+            for (x, dst) in [(x, q), (x, k)] {
+                g.push(Op::Rope {
+                    x,
+                    positions,
+                    dst,
+                    rows: 1,
+                    n_head: 1,
+                    head_dim: HD as u32,
+                    rope_dim: HD as u32,
+                    theta: 1e4,
+                    freq_factors: None,
+                    x_stride: 0,
+                    neox: false,
+                    backward: false,
+                });
+            }
+            g.push(Op::WriteKv {
+                src: k,
+                cache: k_cache,
+                rows: 1,
+                row_stride: HD as u32,
+                pos: 0,
+            });
+            g.push(Op::Attention {
+                q,
+                k_cache,
+                v_cache,
+                dst,
+                rows: 1,
+                kv_len: 1,
+                n_head: 1,
+                n_kv: 1,
+                head_dim: HD as u32,
+                scale: 0.125,
+                mask: AttnMask::Causal,
+                pos: 0,
+                sinks: None,
+                key_bias: None,
+            });
+            let ids = Ids {
+                positions,
+                q,
+                k_cache,
+                scratch,
+            };
+            with(&mut g, &ids);
+            g
+        }
+
+        #[test]
+        fn a_llama_decode_step_takes_its_position_from_the_bound_buffer() {
+            let mut positions = None;
+            let g = llama_decode(|_, ids| positions = Some(ids.positions));
+            assert_eq!(static_walk_live_positions(&g), Ok(positions.unwrap()));
+            let g = llama_decode(|g, _| {
+                for op in &mut g.ops {
+                    if let Op::Attention { mask, .. } = op {
+                        *mask = AttnMask::SlidingWindow(4);
+                    }
+                }
+            });
+            assert!(static_walk_live_positions(&g).is_ok(), "a sliding window");
+        }
+
+        #[test]
+        fn a_multi_row_kv_write_keeps_its_baked_position() {
+            let g = llama_decode(|g, _| {
+                for op in &mut g.ops {
+                    if let Op::WriteKv { rows, .. } = op {
+                        *rows = 2;
+                    }
+                }
+            });
+            assert!(static_walk_live_positions(&g).is_err());
+        }
+
+        #[test]
+        fn a_canvas_window_is_a_baked_position() {
+            let g = llama_decode(|g, _| {
+                for op in &mut g.ops {
+                    if let Op::Attention { mask, .. } = op {
+                        *mask = AttnMask::Canvas { lo: 0 };
+                    }
+                }
+            });
+            assert!(static_walk_live_positions(&g).is_err());
+        }
+
+        #[test]
+        fn mla_keeps_its_baked_position() {
+            let g = llama_decode(|g, ids| {
+                g.push(Op::Mla {
+                    q: ids.q,
+                    k_cache: ids.k_cache,
+                    wk_b: ids.scratch,
+                    wv_b: ids.scratch,
+                    dst: ids.scratch,
+                    rows: 1,
+                    kv_len: 1,
+                    n_head: 1,
+                    q_head_dim: HD as u32,
+                    kv_lora_rank: 32,
+                    qk_nope_dim: 32,
+                    qk_rope_dim: 32,
+                    v_head_dim: 32,
+                    scale: 0.125,
+                    mask: AttnMask::Causal,
+                    pos: 0,
+                    theta: 1e4,
+                    freq_factors: None,
+                    key_bias: None,
+                })
+            });
+            assert!(static_walk_live_positions(&g).is_err());
+        }
+
+        #[test]
+        fn topk_mask_keeps_its_baked_length() {
+            let g = llama_decode(|g, ids| {
+                g.push(Op::TopkMask {
+                    idx: ids.scratch,
+                    dst: ids.scratch,
+                    rows: 1,
+                    kv_len: 1,
+                    top_k: 1,
+                })
+            });
+            assert!(static_walk_live_positions(&g).is_err());
+        }
+
+        #[test]
+        fn the_lightning_indexer_keeps_its_baked_position() {
+            let g = llama_decode(|g, ids| {
+                g.push(Op::LightningIndexer {
+                    q: ids.q,
+                    k_cache: ids.k_cache,
+                    weights: ids.scratch,
+                    dst: ids.scratch,
+                    rows: 1,
+                    kv_len: 1,
+                    n_head: 1,
+                    head_dim: HD as u32,
+                    top_k: 1,
+                    scale: 0.125,
+                    pos: 0,
+                })
+            });
+            assert!(static_walk_live_positions(&g).is_err());
+        }
+
+        #[test]
+        fn without_a_single_row_attention_the_walk_takes_no_live_position() {
+            let g = llama_decode(|g, _| g.ops.retain(|op| !matches!(op, Op::Attention { .. })));
+            assert!(static_walk_live_positions(&g).is_err());
+        }
     }
 }

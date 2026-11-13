@@ -218,6 +218,13 @@ impl DenseVulkanSession {
     pub fn vram(&self) -> infr_vulkan::VramInfo {
         self.be.vram()
     }
+
+    /// How many record-once decode recordings this session's backend has made
+    /// ([`infr_vulkan::VulkanBackend::decode_recordings`]): the way to see from outside whether a
+    /// generation's decode was recorded once and replayed, or recorded per token.
+    pub fn decode_recordings(&self) -> u64 {
+        self.be.decode_recordings()
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]

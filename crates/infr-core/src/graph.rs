@@ -1416,6 +1416,17 @@ pub struct Graph {
     /// execution modes run the SAME (static) kernels bit-identically; everything else keeps the
     /// replay fast path. See `infr-vulkan`'s `decode_eligible`.
     pub no_decode_replay: bool,
+    /// The producer built this graph for record-once decode replay, and it is correct ONLY when
+    /// replayed: its positions and KV lengths are baked for the first decoded token, and the
+    /// caller executes the one compiled plan for every later token, advancing only the bound
+    /// positions. Run statically, each of those tokens would write its KV row at the baked
+    /// position and attend the baked length, which is wrong output with no error.
+    ///
+    /// A backend asked to execute such a plan in a way that would not decode each position
+    /// correctly (it will not replay the plan, and its static walk would read the baked
+    /// positions) returns an error instead. Callers ask [`crate::backend::Backend::decode_replay_ready`] after compiling
+    /// and build per-token graphs when it says no, so the error is a backstop, not a path.
+    pub replay_only: bool,
     /// Set `true` ONLY for an MTP-verify batched forward — the trunk's speculative VERIFY pass
     /// (`crates/infr-llama/src/mtp/mod.rs`'s `run_verify`/`run_verify_full`, driven through
     /// `generate_dense_backend`'s `verify` branch). `false` (the `Graph::default()`/`Graph::new()`

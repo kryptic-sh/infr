@@ -5608,75 +5608,57 @@ pub(crate) fn generate_dense_backend(
         start // fall through to per-token loop for MoE / E2B / short suffixes
     };
 
-    // Record-once decode: for an eligible decode on a backend that supports replay (the Vulkan
-    // seam), build+compile+bind ONE plan here and reuse it across the whole decode loop. The
-    // adapter records the graph once and replays it per token, reading `pos` from the bound
-    // positions buffer + a params SSBO — so the baked pos=0 here is irrelevant, and the per-token
-    // host cost drops to just the emb/pos (+ E2B ipl) uploads. The gate mirrors the adapter's
-    // graph eligibility: every dense arch replays — qk-norm (qwen3), the gemma family (SWA
-    // windows + scale via push constants, freq_factors via qk_norm_rope_dyn_ff, V-norm/Softcap/
-    // Scale are pos-independent), llama (f16-out interleaved Rope via rope_f16_dyn), MoE. Backends
-    // without `decode_replay` (CPU interpreter, which reads the baked `pos`) and every ineligible
-    // model keep rebuilding + recompiling per token below.
-    // INFR_SEAM_NO_REPLAY=1 forces per-token rebuild (the adapter's static path) — slower, but
-    // INFR_PROF_OPS per-op GPU timestamps work there (the replay path can't report them).
-    // This gate MUST stay a strict subset of the adapter's `decode_eligible` — the plan below
-    // bakes pos=0/kv_len=1, which is only correct when the adapter replays it (dyn kernels read
-    // the live pos/kv_len); an ineligible graph would silently run the static path with the baked
-    // values. Hence the per-layer head-dim mirror of the adapter's Attention check.
-    // llama (no qk-norm) replays too — its f16-out Rope has a dyn kernel, with and without the
-    // llama3 freq_factors (`rope_f16_dyn_ff`).
-    // A paged MoE model (see `Backend::moe_paged`'s doc) forces the static per-execute path: the
-    // adapter's own `execute`/`execute_chain` already refuse to replay one (belt-and-suspenders,
-    // the actual correctness guarantee), but skipping `dyn_replay` here too avoids building the
-    // (then-never-used) replay plan's persistent scratch/self-advancing params machinery at all.
-    // Dense layer streaming forces static per-execute decode for the same replay-can't-express-it
-    // reason (per-token ring staging + per-slot weight offsets — see `Backend::dense_paged`).
-    let dyn_replay = caps.decode_replay
-        && !be.moe_paged()
+    // Record-once decode: on a backend that replays (the Vulkan and Metal seams), build, compile
+    // and bind ONE decode plan here and reuse it across the whole decode loop. The backend records
+    // the graph once and replays it per token, reading `pos` from the bound positions buffer (and,
+    // on Vulkan, a params SSBO), so the baked pos=0 is irrelevant and the per-token host cost
+    // drops to the emb/pos (+ E2B ipl) uploads. Backends without `decode_replay` (the CPU
+    // interpreter, which reads the baked `pos`) and every model whose plan will not replay keep
+    // rebuilding and recompiling per token below.
+    //
+    // Correctness does NOT rest on the gate below. The plan bakes pos=0/kv_len=1, which is right
+    // only when the backend replays it, so after compiling it the runner asks the backend
+    // (`Backend::decode_replay_ready`) and drops it for the per-token path on a "no"; the graph
+    // also carries `Graph::replay_only`, so a backend that is asked to run it without replaying
+    // returns an error instead of decoding every token at row 0. The gate's terms below copy
+    // Vulkan's refusals (`decode_eligible` and its pagers) only to skip building a replay plan
+    // that would be refused, and its scratch with it: a missing term costs that build, nothing
+    // more. They are not Metal's rules (Metal answers for itself, and also accepts plans its
+    // static walk decodes with live positions). INFR_SEAM_NO_REPLAY=1 forces the per-token path (INFR_PROF_OPS
+    // per-op GPU timestamps work there; the replay path can't report them).
+    let mirror_admits = !be.moe_paged()
         && !be.dense_paged()
         && !ec.kernels.vulkan.no_replay
         // DiffusionGemma graphs opt out of the replay tape entirely (`Graph::no_decode_replay`,
-        // set in `build` above — the adapter's `decode_eligible` rejects them, this mirror just
-        // skips building the then-unused replay plan). Keeps this gate a strict subset of the
-        // adapter's eligibility.
+        // set in `build` above).
         && !c.diffusion_gemma
-        // DeepSeek2 MLA: the adapter's `decode_eligible` rejects `Op::Mla` outright (its kernel has
-        // no record-once dyn twin), but this mirror gate has no Mla check — without this exclusion
-        // the replay tape is built with pos=0 baked into every WriteKv, and the adapter's
-        // eligible=false fallback then executes THAT tape statically for every decode token,
-        // writing each token's K to row 0 (rows 1.. never populated, attention sees a one-row
-        // cache). Keeps the "strict subset" promise the gate's doc states.
+        // DeepSeek2 MLA: `Op::Mla` has no record-once dyn twin. Before the backend was asked,
+        // missing this term ran the pos-0 tape statically: every token wrote its K to row 0 and
+        // attention saw a one-row cache.
         && !c.deepseek2
-        // DeepSeek V4: the same trap, from four ops at once. `Op::Attention { sinks }`,
-        // `Op::HyperConnectMix`/`Pre`/`Post`, `Op::Rope { backward }` and `Op::QkNorm { weight:
-        // None }` each have no record-once dyn twin, so the adapter's `decode_eligible` is false —
-        // and without this exclusion the tape is built with pos=0 baked into every `WriteKv` and
-        // every `Attention`, then run STATICALLY for every token. Measured: each token writes its
-        // KV to row 0 and attends only row 0 (itself), so a V4 prefill's CPU-vs-Vulkan cosine
-        // decayed with prompt length (1.0 at one token, 0.95 at two, 0.67 at three) while a
-        // `sliding_window = 1` model — where attending only your own row IS the right answer —
-        // stayed exact and hid it.
+        // DeepSeek V4: `Op::Attention { sinks }`, `Op::HyperConnectMix`/`Pre`/`Post`,
+        // `Op::Rope { backward }` and `Op::QkNorm { weight: None }` have no dyn twin. The same
+        // trap as deepseek2 once hid behind a `sliding_window = 1` test model, where attending
+        // only your own row IS the right answer.
         && !c.deepseek4
-        // A standalone f16 `WriteKv` has no dyn kernel: the adapter's `decode_eligible` replays an
-        // f16 K write only as the rope→WriteKv pair its peephole fuses into the cache, and keeps
-        // any other K write static. Two K writes here are not that pair, each mirrored by a term:
-        // llama4's rope layers L2-norm the roped K before it is written —
+        // A standalone f16 `WriteKv` has no dyn kernel: Vulkan replays an f16 K write only as
+        // the rope→WriteKv pair its peephole fuses into the cache. Two K writes here are not that
+        // pair: llama4's rope layers L2-norm the roped K before it is written —
         && !c.llama4
         // — and a NoPE layer (llama4's or smollm3's, `Config::is_nope_layer`) writes the raw K
         // through an `Op::Copy` cast with no rope at all.
         && c.no_rope_step == 0
-        // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
-        // `decode_eligible`: the low-bit block quants / bf16 / f32 / turbo ride a dequant→f16
-        // prepass with a standalone WriteKv that has no dyn kernel) — EXCEPT coupled Q8_0
-        // (K==V==Q8), which replays natively (store_q8_dyn write + the planar-Q8 dyn attention
-        // read). A DECOUPLED Q8 side still forces static (the dyn q8 kernels dequant both sides).
-        // Must mirror the adapter's rejection so this gate stays a strict subset — else the loop
-        // bakes pos=0 for a static run.
+        // Quantized/dense-alt KV caches ride a dequant→f16 prepass with a standalone WriteKv that
+        // has no dyn kernel — EXCEPT coupled Q8_0 (K==V==Q8), which replays natively
+        // (store_q8_dyn write + the planar-Q8 dyn attention read). A DECOUPLED Q8 side does not
+        // (the dyn q8 kernels dequant both sides).
         && ((k_fmt == DType::Q8_0 && v_fmt == DType::Q8_0)
             || (!kv_forces_static(k_fmt) && !kv_forces_static(v_fmt)))
+        // Vulkan's replayable attention head widths.
         && (0..c.n_layer)
-            .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512)
+            .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512);
+    let dyn_replay = caps.decode_replay
+        && (mirror_admits || replay_mirror_bypassed())
         // MTP h-tap (Phase 1, issue #33): the replay tape binds a FIXED set of tensors once: an
         // h-tap request changes the graph shape (an extra Output + Copy) per-call based on
         // whether THIS position is the one being sampled, which the static replay tape can't
@@ -5684,14 +5666,18 @@ pub(crate) fn generate_dense_backend(
         // slower, but this is a validation-only hook (see `h_out`'s doc), never a hot path.
         && h_out.is_none();
     let ro = if dyn_replay {
-        // `compile` builds pipelines and records the replay tape into the shared command pool —
-        // GPU work, so it takes a turn like any step.
+        // Held across the build and compile like any step's turn. No tape is recorded here:
+        // Vulkan records on the plan's first execute, and Metal's `compile` drops any tape it
+        // holds and records on execute too.
         let _gp = req.and_then(|r| r.gate_pass());
-        let (g, h) = build(
+        let (mut g, h) = build(
             1, 0, 1, false, None, false, false, gpu_argmax, gpu_sample, gpu_embed,
             false, // mtp_verify: ordinary per-token decode, not MTP verify
             None,  // span: the whole model in one graph
         );
+        // Baked at position 0 and valid for no other unless replayed: the backend refuses to run
+        // it any other way (see `Graph::replay_only`).
+        g.replay_only = true;
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
         bind_step_input(
@@ -5725,7 +5711,10 @@ pub(crate) fn generate_dense_backend(
         if let Some(uin) = h.u_in {
             b.bind(uin, u_buf.as_ref());
         }
-        Some((plan, b))
+        // The backend's own answer, not the gate's guess: a plan it will not replay is dropped
+        // here and every token takes the per-token path below, built at its true position.
+        be.decode_replay_ready(plan.as_ref(), &b)
+            .then_some((plan, b))
     } else {
         None
     };
@@ -6250,12 +6239,28 @@ pub(crate) fn generate_dense_backend(
     Ok((out, stats))
 }
 
+/// Test hook: lets `generate_dense_backend` build a replay plan its mirror gate would skip
+/// (`mirror_admits`), so a test can show the backend's own `decode_replay_ready` is what keeps a
+/// plan the backend will not replay off the decode loop. Always `false` outside this crate's
+/// unit tests.
+#[cfg(test)]
+fn replay_mirror_bypassed() -> bool {
+    tests::REPLAY_MIRROR_BYPASS.with(std::cell::Cell::get)
+}
+
+/// See the `cfg(test)` twin: no build outside the unit tests can bypass the gate.
+#[cfg(not(test))]
+fn replay_mirror_bypassed() -> bool {
+    false
+}
+
 /// Seed one per-token decode step's sampling uniform `u` into the host mirror of the `Op::Sample`
 /// uniform ring, for the step at `pos`. It goes to both slots a sampler may read: `pos & 63`, which
 /// a recorded replay indexes by the live position, and slot 0, which a static walk reads. Which of
-/// the two runs is the backend's own replay decision, not this loop's `dyn_replay`: Metal never
-/// records a graph with a plain `Rope`, so a llama-family plan built for replay still runs as a
-/// static walk, and a plan built static can still be recorded there.
+/// the two runs is the backend's own decision, not this loop's `dyn_replay`: on Metal the plan built
+/// for replay is either replayed from its tape or walked statically with live positions
+/// (`Backend::decode_replay_ready` accepts both), and a plan built per token is recorded on its own
+/// execute when its shape allows, a run that samples through the dynamic-position kernel.
 fn seed_step_uniform(ring: &mut [f32; 64], pos: usize, u: f32) {
     ring[pos & 63] = u;
     ring[0] = u;
@@ -6270,9 +6275,16 @@ mod tests {
     use crate::seam::TokenEmbd;
     use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
 
+    thread_local! {
+        /// Read by `super::replay_mirror_bypassed`. Per thread, so a test that sets it cannot
+        /// reach a generation another test runs at the same time.
+        pub(super) static REPLAY_MIRROR_BYPASS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
     /// B125: the runner cannot tell whether the backend replays its plan (sampler reads slot
-    /// `pos & 63`) or walks it statically (slot 0) — Metal decides that per graph, and a llama
-    /// plan built for replay runs static there. Each step's draw must reach both, or a
+    /// `pos & 63`) or walks it statically (slot 0) — Metal decides that per graph, and may walk
+    /// a plan built for replay statically. Each step's draw must reach both, or a
     /// temperature > 0 decode samples with a stale or zero uniform.
     #[test]
     fn a_step_uniform_reaches_both_sampler_slots() {
@@ -7033,6 +7045,13 @@ mod tests {
         fn max_decode_chain(&self) -> usize {
             self.vk.max_decode_chain()
         }
+        fn decode_replay_ready(
+            &self,
+            plan: &dyn infr_core::backend::Plan,
+            bindings: &infr_core::backend::Bindings,
+        ) -> bool {
+            self.vk.decode_replay_ready(plan, bindings)
+        }
         fn sync(&self) -> infr_core::error::Result<()> {
             self.vk.sync()
         }
@@ -7294,6 +7313,138 @@ mod tests {
             assert!(
                 moved > 1e-3,
                 "{arch}: rope_freqs.weight was ignored (logits moved by {moved})"
+            );
+        }
+    }
+
+    /// How far the Vulkan logits may sit from the CPU's, as a fraction of the CPU logits' largest
+    /// magnitude, for the synthetic llama below.
+    const REPLAY_PARITY_TOL: f32 = 1e-2;
+
+    /// Tokens the synthetic Vulkan run decodes: several, so one recording for the whole decode
+    /// (replay) and one per decoded token (a plan compiled per token) cannot coincide.
+    const MIRROR_TEST_DECODE: usize = 6;
+
+    /// A Vulkan generation of [`MIRROR_TEST_DECODE`] tokens for `prompt` (EOS ignored), through a
+    /// fresh backend opened on the environment's device with record-once replay allowed and the
+    /// runner's replay mirror bypassed (`REPLAY_MIRROR_BYPASS`). Returns the last prompt token's
+    /// logits, how many record-once recordings the backend made, and how many tokens it decoded.
+    fn vulkan_logits_past_the_mirror(
+        g: &Gguf,
+        cfg: &Config,
+        prompt: &[u32],
+    ) -> Option<(Vec<f32>, u64, usize)> {
+        let mut ec = EngineConfig::load_from_layers(&[
+            infr_core::config::ConfigLayer::env().expect("environment config")
+        ]);
+        ec.kernels.vulkan.no_replay = false;
+        ec.sampling.ignore_eos = true;
+        let Ok(vk) = infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(ec.clone())) else {
+            eprintln!("skip: no Vulkan device");
+            return None;
+        };
+        eprintln!(
+            "vulkan device: {}",
+            infr_core::backend::Backend::capabilities(&vk).name
+        );
+        let bind = crate::seam::vulkan_moe_binder(&vk, g, cfg, &ec, true, 64)
+            .expect("vulkan weight binder");
+        // Cleared on the way out, panic included, so no later test on this thread inherits it.
+        struct Bypass;
+        impl Drop for Bypass {
+            fn drop(&mut self) {
+                REPLAY_MIRROR_BYPASS.with(|b| b.set(false));
+            }
+        }
+        REPLAY_MIRROR_BYPASS.with(|b| b.set(true));
+        let bypass = Bypass;
+        let embd = std::sync::OnceLock::new();
+        let mut logits = Vec::new();
+        let (_, stats) = super::generate_dense_backend(
+            &vk,
+            &*bind,
+            g,
+            cfg,
+            &ec,
+            TokenEmbd::new(&embd, g),
+            None,
+            prompt,
+            MIRROR_TEST_DECODE,
+            |_| {},
+            &mut None,
+            64,
+            None,
+            None,
+            None,
+            Some(&mut logits),
+            None,
+            None,
+            None,
+        )
+        .expect("synthetic generation on Vulkan");
+        drop(bypass);
+        Some((logits, vk.decode_recordings(), stats.n_gen))
+    }
+
+    /// B157: the runner builds its decode plan once, at position 0, only for a backend that will
+    /// replay it — and it is the BACKEND that says so, after compiling the plan, not the runner's
+    /// mirror of the backend's rules. A NoPE layer writes its K through a cast the Vulkan replay
+    /// has no kernel for; SmolLM3 shipped with a mirror that did not know that, and its decode ran
+    /// the position-0 plan statically: each token wrote its KV to row 0 and attended one row. Here
+    /// the mirror is bypassed outright, so only the backend's answer stands between the decode
+    /// loop and that plan: the NoPE model must record no replay and still match the CPU. The same
+    /// fixture with rope on its layer is the control: its whole decode must run from ONE
+    /// recording (a per-token plan would record once per token), and match the CPU too.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn a_plan_the_backend_will_not_replay_takes_the_per_token_path_vulkan() {
+        let prompt: Vec<u32> = (0..12u32).map(|i| (i * 5 + 3) % Q35_VOCAB as u32).collect();
+        let cpu = infr_cpu::CpuBackend::new();
+        for nope in [false, true] {
+            let (g, mut cfg) = open_synthetic(
+                &format!("smollm3-nope-{nope}"),
+                &llama_gguf("smollm3", None),
+            );
+            if nope {
+                // Every layer NoPE, so the one-layer fixture makes the K write SmolLM3's every
+                // fourth layer makes.
+                cfg.no_rope_step = 1;
+            }
+            assert_eq!(cfg.is_nope_layer(0), nope);
+            let want = fresh_logits(
+                &cpu,
+                &crate::seam::cpu_upload_bind(&cpu),
+                &g,
+                &cfg,
+                &EngineConfig::default(),
+                &prompt,
+            );
+            let Some((got, recordings, n_gen)) = vulkan_logits_past_the_mirror(&g, &cfg, &prompt)
+            else {
+                return;
+            };
+            assert_eq!(
+                n_gen, MIRROR_TEST_DECODE,
+                "nope={nope}: decoded {n_gen} tokens"
+            );
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let diff = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!("nope={nope}: recordings={recordings} max|vk-cpu|={diff} scale={scale}");
+            // One recording serves the whole decode when it is replayed; a plan compiled per
+            // token would record once per token, and the NoPE graph cannot be recorded at all.
+            assert_eq!(
+                recordings,
+                u64::from(!nope),
+                "nope={nope}: {recordings} record-once recording(s) for {n_gen} decoded tokens"
+            );
+            assert_eq!(got.len(), want.len());
+            assert!(
+                diff <= REPLAY_PARITY_TOL * scale,
+                "nope={nope}: Vulkan logits differ from the CPU's by {diff} (scale {scale})"
             );
         }
     }

@@ -754,6 +754,16 @@ impl Backend for CpuBackend {
             .downcast_ref::<GraphPlan>()
             .expect("cpu backend: plan is not a GraphPlan")
             .graph;
+        // The interpreter never replays, and a graph built for replay is wrong when walked: every
+        // execute would decode at the baked position (see `Graph::replay_only`).
+        if g.replay_only {
+            return Err(infr_core::error::Error::Backend(
+                "cpu backend: refusing a graph built for record-once decode replay \
+                 (Graph::replay_only): this backend walks it statically, which would decode every \
+                 token at its baked position"
+                    .into(),
+            ));
+        }
 
         // f32 working store for every Input/Internal/Output handle (weights are read on demand:
         // norms via the small dequant cache, `Op::Linear` weights streamed row-by-row).

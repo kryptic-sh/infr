@@ -501,6 +501,14 @@ impl Backend for MetalBackend {
         self.execute_graph_chain(plan, bindings, n)
     }
 
+    /// `true` when `execute` either replays the recorded tape for this graph over these bindings
+    /// (`replay_capable`: the graph's shape, the bound buffers, the profiling mode and the
+    /// device's pipeline limits decide it) or walks it statically with every position taken
+    /// from the bound positions buffer (`policy::static_walk_live_positions`).
+    fn decode_replay_ready(&self, plan: &dyn Plan, bindings: &Bindings) -> bool {
+        self.plan_replays(plan, bindings)
+    }
+
     fn sync(&self) -> Result<()> {
         Ok(())
     }

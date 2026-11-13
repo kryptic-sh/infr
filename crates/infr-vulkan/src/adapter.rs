@@ -175,19 +175,109 @@ fn moe_small_m_threshold(be_: &VulkanBackend) -> usize {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
+    decode_refusal(be_, graph).is_none()
+}
+
+/// Why [`decode_eligible`] refuses a graph. Built on every ineligible compile (each prefill chunk,
+/// each per-token compile of a model that cannot replay), so it holds only `Copy` data; the text is
+/// formatted only for the error a replay-only graph gets (`Graph::replay_only`).
+#[derive(Clone, Copy, Debug)]
+enum DecodeRefusal {
+    NoReplayKnob,
+    GraphOptOut,
+    StandaloneF16WriteKv {
+        op: usize,
+    },
+    NoDynKernel {
+        op: usize,
+        kind: &'static str,
+    },
+    AttentionShape {
+        op: usize,
+        rows: u32,
+        head_dim: u32,
+    },
+    AttentionSinksOrBias {
+        op: usize,
+    },
+    MixedKvLen {
+        op: usize,
+        kv_len: u32,
+        prev: u32,
+    },
+    KvDtype {
+        op: usize,
+        k: infr_core::DType,
+        v: infr_core::DType,
+    },
+    F32Rope {
+        op: usize,
+    },
+    NotADecode,
+}
+
+impl std::fmt::Display for DecodeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::NoReplayKnob => {
+                f.write_str("kernels.vulkan.no_replay (INFR_SEAM_NO_REPLAY) is set")
+            }
+            Self::GraphOptOut => f.write_str("the graph opted out (Graph::no_decode_replay)"),
+            Self::StandaloneF16WriteKv { op } => {
+                write!(
+                    f,
+                    "op {op} (WriteKv): a standalone f16 K write has no dyn kernel"
+                )
+            }
+            Self::NoDynKernel { op, kind } => write!(f, "op {op} ({kind}): no dyn kernel"),
+            Self::AttentionShape { op, rows, head_dim } => write!(
+                f,
+                "op {op} (Attention): rows {rows} / head_dim {head_dim} is not a replayable \
+                 decode shape"
+            ),
+            Self::AttentionSinksOrBias { op } => {
+                write!(
+                    f,
+                    "op {op} (Attention): sinks / key_bias have no dyn kernel"
+                )
+            }
+            Self::MixedKvLen { op, kv_len, prev } => write!(
+                f,
+                "op {op} (Attention): kv_len {kv_len} differs from an earlier attention's {prev}, \
+                 so this is not a single-token decode"
+            ),
+            Self::KvDtype { op, k, v } => {
+                write!(
+                    f,
+                    "op {op} (Attention): KV cache {k:?}/{v:?} has no dyn kernel"
+                )
+            }
+            Self::F32Rope { op } => {
+                write!(f, "op {op} (Rope): only the f16-out rope has a dyn kernel")
+            }
+            Self::NotADecode => {
+                f.write_str("not a single-token decode: it needs a rope op and an attention op")
+            }
+        }
+    }
+}
+
+/// Why [`decode_eligible`] refuses `graph`, or `None` when it replays.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn decode_refusal(be_: &VulkanBackend, graph: &Graph) -> Option<DecodeRefusal> {
     // `kernels.vulkan.no_replay` (`INFR_SEAM_NO_REPLAY`) forces the static per-execute path
     // (INFR_PROF_OPS timestamps work there; the replay path can't report them). ONE field read
     // `is_ok()` here and `!no_replay` in the llama runner — both halves now come off the same
     // `Config`.
     if be_.cfg().kernels.vulkan.no_replay {
-        return false;
+        return Some(DecodeRefusal::NoReplayKnob);
     }
     // Producer opt-out (see `Graph::no_decode_replay`): the replay tape's `_dyn` kernels are only
     // reassociation-equivalent to the static recording, and some consumers (DiffusionGemma's
     // entropy-bound denoise, which chaotically amplifies a 1-ULP KV delta on the prefill frontier
     // row into different committed text) need the static path's exact arithmetic every execute.
     if graph.no_decode_replay {
-        return false;
+        return Some(DecodeRefusal::GraphOptOut);
     }
     let mut has_rope = false;
     let mut has_attn = false;
@@ -217,7 +307,7 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
                                 && matches!(graph.tensors[src.0 as usize].kind, TensorKind::Internal))
                 });
                 if !fused {
-                    return false;
+                    return Some(DecodeRefusal::StandaloneF16WriteKv { op: i });
                 }
             }
             // MLA attention (DeepSeek V2/V3) uses its own non-standard kernel — not eligible for
@@ -225,7 +315,15 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             // bakes its causal bound from the `pos` push constant at record time (there is no
             // params-driven `_dyn` twin), so a replayed tape would select keys for the position it
             // was recorded at.
-            Op::Mla { .. } | Op::LightningIndexer { .. } => return false,
+            Op::Mla { .. } => {
+                return Some(DecodeRefusal::NoDynKernel { op: i, kind: "Mla" });
+            }
+            Op::LightningIndexer { .. } => {
+                return Some(DecodeRefusal::NoDynKernel {
+                    op: i,
+                    kind: "LightningIndexer",
+                });
+            }
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -242,18 +340,28 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             } => {
                 has_attn = true;
                 if *rows != 1 || *head_dim % 4 != 0 || *head_dim > 512 {
-                    return false;
+                    return Some(DecodeRefusal::AttentionShape {
+                        op: i,
+                        rows: *rows,
+                        head_dim: *head_dim,
+                    });
                 }
                 // Attention sinks and key_bias have ONE kernel family (`attention_kv.comp`'s
                 // -DSINKS/-DBIAS static builds) and no params-driven `_dyn` twin, so a replayed
                 // tape would run the sink/bias-free split-K family instead. Force static.
                 if sinks.is_some() || key_bias.is_some() {
-                    return false;
+                    return Some(DecodeRefusal::AttentionSinksOrBias { op: i });
                 }
                 // Multi-position graph (see the comment above `attn_kv_len`): different kv_len across
                 // attention ops ⟹ not a single-token decode ⟹ ineligible for record-once replay.
                 match attn_kv_len {
-                    Some(prev) if prev != *kv_len => return false,
+                    Some(prev) if prev != *kv_len => {
+                        return Some(DecodeRefusal::MixedKvLen {
+                            op: i,
+                            kv_len: *kv_len,
+                            prev,
+                        });
+                    }
                     _ => attn_kv_len = Some(*kv_len),
                 }
                 // A COUPLED Q8_0 KV cache (K==V==Q8) replays: store_q8_dyn writes the row at
@@ -270,7 +378,11 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
                 let k_q8 = matches!(kdt, infr_core::DType::Q8_0);
                 let v_q8 = matches!(vdt, infr_core::DType::Q8_0);
                 if k_q8 != v_q8 || is_kv_prepass(kdt) || is_kv_prepass(vdt) {
-                    return false;
+                    return Some(DecodeRefusal::KvDtype {
+                        op: i,
+                        k: kdt,
+                        v: vdt,
+                    });
                 }
             }
             // freq_factors (gemma4 proportional RoPE) binds via qk_norm_rope_dyn_ff.
@@ -279,7 +391,7 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             // — needs the f16-out builder shape (the f32 in-place form has no dyn kernel).
             Op::Rope { dst, .. } => {
                 if !matches!(graph.desc(*dst).dtype, infr_core::DType::F16) {
-                    return false;
+                    return Some(DecodeRefusal::F32Rope { op: i });
                 }
                 has_rope = true;
             }
@@ -302,7 +414,10 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             _ => {}
         }
     }
-    has_rope && has_attn
+    match (has_rope, has_attn) {
+        (true, true) => None,
+        _ => Some(DecodeRefusal::NotADecode),
+    }
 }
 
 /// Read `positions[0]` for the record-once decode. The runner writes the position into a host-visible
@@ -5138,6 +5253,45 @@ fn hyper_check_hc(hc: u32, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// Does `execute` replay `plan`, rather than record it statically each call? The plan's own
+/// eligibility, unless a paged model forces the static path (see [`execute`]).
+fn replays(be_: &VulkanBackend, plan: &VkDecodePlan) -> bool {
+    plan.eligible && !be_.moe_paged() && !be_.dense_paged()
+}
+
+/// `Backend::decode_replay_ready`: the decision [`execute`] will make for `plan`, read off the
+/// compiled plan so the caller need not mirror it.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn decode_replay_ready(be_: &VulkanBackend, plan: &dyn Plan) -> bool {
+    plan.as_any()
+        .downcast_ref::<VkDecodePlan>()
+        .is_some_and(|plan| replays(be_, plan))
+}
+
+/// The error for a plan that will not be replayed but was built to be (`Graph::replay_only`):
+/// recording it statically would decode every token at the position baked into it. `Ok` for
+/// every other graph.
+fn refuse_replay_only(be_: &VulkanBackend, plan: &VkDecodePlan) -> Result<()> {
+    if !plan.graph.replay_only {
+        return Ok(());
+    }
+    let why = if be_.moe_paged() {
+        "the loaded model pages its MoE experts".to_string()
+    } else if be_.dense_paged() {
+        "the loaded model streams its dense layers".to_string()
+    } else {
+        decode_refusal(be_, &plan.graph).map_or_else(
+            || "the plan was compiled ineligible".to_string(),
+            |why| why.to_string(),
+        )
+    };
+    Err(be(format!(
+        "vulkan adapter: refusing to run a graph built for record-once decode replay \
+         (Graph::replay_only) statically, which would decode every token at its baked position: \
+         this backend will not replay it ({why})"
+    )))
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
     let plan = plan
@@ -5148,13 +5302,15 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     // execution needs a host readback between a MoE layer's router/top-k and its expert GEMVs
     // (see `execute_static`'s paged branch), which the record-once replay tape — recorded ONCE
     // with no host round-trip built in — can't express. `Backend::moe_paged`'s doc has the full
-    // rationale; the seam's `dyn_replay` gate mirrors this so a paged model never even BUILDS the
-    // (then-unused) replay plan, but this check is what actually guarantees correctness.
+    // rationale. `replays` is also what `decode_replay_ready` answers, so a caller that asked never
+    // hands this a replay-only graph it will not replay; one that did not ask gets the error from
+    // `refuse_replay_only` rather than a static run at the baked position.
     // Dense layer streaming forces the static path for a different reason than MoE (no readback
     // exists — layer order is deterministic — but the per-token ring staging + per-slot weight
     // offsets can't live inside a record-once tape whose descriptor sets and push constants are
     // frozen at record time).
-    if !plan.eligible || be_.moe_paged() || be_.dense_paged() {
+    if !replays(be_, plan) {
+        refuse_replay_only(be_, plan)?;
         return execute_static(be_, &plan.graph, bindings);
     }
 
@@ -5202,7 +5358,13 @@ pub(crate) fn execute_chain(
     let Some(plan) = plan.as_any().downcast_ref::<VkDecodePlan>() else {
         return Ok(None);
     };
-    if !plan.eligible || n == 0 || n > 64 || be_.moe_paged() || be_.dense_paged() {
+    if !replays(be_, plan) {
+        // Declining would hand the caller back to `execute`, which refuses the same plan; say why
+        // here, where the caller asked for the replay.
+        refuse_replay_only(be_, plan)?;
+        return Ok(None);
+    }
+    if n == 0 || n > 64 {
         return Ok(None);
     }
     let mut guard = plan.replay.lock().unwrap();
@@ -5449,6 +5611,9 @@ fn record_decode_replay(
     }
     let recorded = crate::recorder::RecordedCmd::from_segments(be_, segments);
     let bound = recorded_bindings(&scratch, bindings);
+    be_.shared
+        .decode_recordings
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(DecodeReplay {
         bound,
         scratch,

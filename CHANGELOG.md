@@ -24,6 +24,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fill closure that runs only on a miss**, and replaces `touch_staged_read`.
   `MoePagerSession::touch_role`, which nothing in the engine called, is gone;
   `stage_role` is the MoE session's entry point.
+- **`infr_core::Backend` has a new method, `decode_replay_ready`, and `Graph` a
+  new field, `replay_only`.** The seam runner now asks the backend, after
+  compiling the position-0 decode plan, whether executing that one plan per
+  token with the bound positions advanced decodes every position correctly (by a
+  recorded replay, or by a static walk that takes every position from live
+  state), instead of trusting its own copy of the backend's rules. It marks the
+  plan `replay_only`, which a backend must refuse to run any other way. The
+  method defaults to `false`: an out-of-tree backend that sets
+  `Capabilities::decode_replay` must override it or its decode takes the
+  per-token path, and must return an error for a `replay_only` graph it would
+  run at the baked positions.
 
 ### Added
 
@@ -33,6 +44,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   decode replay, so decode re-records each token. The template's `/think` and
   `/no_think` modes follow `--think` / `--no-think`; its tool definitions
   (`xml_tools`) are not passed yet.
+- **`VulkanBackend::decode_recordings` and
+  `DenseVulkanSession::decode_recordings`**: how many record-once decode
+  recordings the backend has made, which tells a decode replayed from one
+  recording from one recorded per token.
 - **`stream_options.include_usage` on `infr serve`.** A streaming request that
   sets it gets one more chunk before `[DONE]`, with an empty `choices` and the
   request's `usage`.

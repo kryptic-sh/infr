@@ -1982,8 +1982,21 @@ impl MetalBackend {
     }
 
     fn replay_capable(&self, g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
-        if self.active_counter_set().is_some() || !replay_shape(g, bindings, self.metal()) {
-            return false;
+        self.replay_blocker(g, bindings).is_none()
+    }
+
+    /// Why [`Self::replay_capable`] refuses `g` over `bindings`, or `None` when the executor
+    /// records and replays the tape for it.
+    fn replay_blocker(
+        &self,
+        g: &infr_core::graph::Graph,
+        bindings: &Bindings,
+    ) -> Option<&'static str> {
+        if self.active_counter_set().is_some() {
+            return Some("GPU-counter profiling is on, which disables the tape");
+        }
+        if !replay_shape(g, bindings, self.metal()) {
+            return Some("the graph is not a shape the replay tape records (see `replay_shape`)");
         }
         let Some((kern, need)) = g.ops.iter().find_map(|op| match op {
             Op::Attention {
@@ -1996,12 +2009,67 @@ impl MetalBackend {
             )),
             _ => None,
         }) else {
-            return false;
+            return Some("no attention with a dynamic-position kernel instantiation");
         };
-        self.pipelines
+        let fits = self
+            .pipelines
             .get(kern)
             .map(|pl| pl.max_total_threads_per_threadgroup() >= need)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        (!fits).then_some(
+            "this device's dynamic-position attention pipeline allows fewer threads per \
+             threadgroup than the kernel needs",
+        )
+    }
+
+    /// Does the STATIC walk of `g` over `bindings` decode the position the bound positions
+    /// buffer names? The graph-only half is `policy::static_walk_live_positions`; the walk also
+    /// needs the positions buffer it reads the live position from to be bound (`run_graph`'s
+    /// `dynpos`).
+    fn static_walk_live(
+        &self,
+        g: &infr_core::graph::Graph,
+        bindings: &Bindings,
+    ) -> std::result::Result<(), &'static str> {
+        let positions = policy::static_walk_live_positions(g)?;
+        match bindings.get(positions) {
+            Some(b) if metal_buf(b).len >= 4 => Ok(()),
+            _ => Err("the positions buffer the walk reads the live position from is not bound"),
+        }
+    }
+
+    /// `Backend::decode_replay_ready`: `plan`, executed once per token over `bindings` with the
+    /// bound positions advanced, decodes each position correctly — by the tape
+    /// ([`Self::replay_capable`]) or by a static walk that takes every position from live state
+    /// ([`Self::static_walk_live`]).
+    pub(crate) fn plan_replays(&self, plan: &dyn Plan, bindings: &Bindings) -> bool {
+        plan.as_any()
+            .downcast_ref::<infr_core::backend::GraphPlan>()
+            .is_some_and(|p| {
+                self.replay_capable(&p.graph, bindings)
+                    || self.static_walk_live(&p.graph, bindings).is_ok()
+            })
+    }
+
+    /// The error for a graph built for record-once decode replay (`Graph::replay_only`) that
+    /// neither the tape nor a live-position static walk decodes correctly: walking it would
+    /// decode at the positions baked into it. `Ok` for every other graph. The same predicate as
+    /// [`Self::plan_replays`], so a caller that asked never gets here.
+    fn refuse_replay_only(&self, g: &infr_core::graph::Graph, bindings: &Bindings) -> Result<()> {
+        if !g.replay_only {
+            return Ok(());
+        }
+        let Err(walk) = self.static_walk_live(g, bindings) else {
+            return Ok(());
+        };
+        let tape = self
+            .replay_blocker(g, bindings)
+            .unwrap_or("the tape was not recorded");
+        Err(Error::Backend(format!(
+            "metal backend: refusing to walk a graph built for record-once decode replay \
+             (Graph::replay_only), which would decode at its baked positions: the tape does not \
+             apply ({tape}) and the static walk does not take every position live ({walk})"
+        )))
     }
 
     pub(crate) fn execute_graph(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
@@ -2034,6 +2102,7 @@ impl MetalBackend {
             }
             return Ok(());
         }
+        self.refuse_replay_only(g, bindings)?;
 
         // Wrap the whole forward in one autorelease pool: the batched command buffers/encoders are
         // retained owned handles, so we drain the pool once per forward instead of once per op.
@@ -2057,6 +2126,9 @@ impl MetalBackend {
             return Ok(None);
         };
         if !self.replay_capable(g, bindings) {
+            // Declining would hand the caller back to `execute_graph`, which refuses the same
+            // graph; say why here, where the caller asked for the replay.
+            self.refuse_replay_only(g, bindings)?;
             return Ok(None);
         }
         let positions = g.ops.iter().find_map(|op| match op {

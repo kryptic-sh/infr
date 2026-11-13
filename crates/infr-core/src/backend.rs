@@ -155,7 +155,9 @@ pub struct Capabilities {
     /// The backend records a single-token decode graph ONCE and replays it per token, reading the
     /// position from a device-side params buffer (Vulkan seam) instead of the graph's baked `pos`.
     /// When set, the runner may compile the decode graph once (pos=0) and reuse it across the whole
-    /// decode loop. Backends that read the baked `pos`/`kv_len` (CPU interpreter) leave this false.
+    /// decode loop, if [`Backend::decode_replay_ready`] confirms the compiled plan decodes every
+    /// position that way.
+    /// Backends that read the baked `pos`/`kv_len` (CPU interpreter) leave this false.
     pub decode_replay: bool,
     /// The backend prefers the dense FFN's gate+up weights CONCATENATED into one `[2*nff, ne]`
     /// tensor (one GEMV/GEMM + `Op::GatedActFused` instead of two Linears + `Op::GatedAct`).
@@ -611,6 +613,30 @@ pub trait Backend: Send + Sync {
     /// nowhere near a watchdog, which is all of them except a slow iGPU).
     fn max_decode_chain(&self) -> usize {
         usize::MAX
+    }
+
+    /// Does `plan`, executed once per token with the bound positions advanced, decode each
+    /// position correctly? `plan` was compiled from a graph built for record-once decode replay
+    /// ([`Graph::replay_only`]): positions and KV lengths baked for the first token, the one plan
+    /// executed for every later token with `bindings` and only the bound positions changing.
+    ///
+    /// `true` is a promise about the result, not about the mechanism: the backend may replay a
+    /// recorded tape, or walk the plan statically taking every position and length from live
+    /// state rather than from the graph. `false` means neither holds, and the caller must build
+    /// and compile a graph per token instead; executing the plan anyway is an error
+    /// ([`Graph::replay_only`]).
+    ///
+    /// This is the backend's own decision, read off the compiled plan, so callers do not have to
+    /// keep a copy of the backend's rules. Asked once, right after `compile`, with the bindings
+    /// every later execute will use.
+    ///
+    /// Default `false`, the answer that is right for every backend that reads the baked positions
+    /// (the CPU interpreter). A backend that can honour the contract overrides it; one that sets
+    /// [`Capabilities::decode_replay`] and forgets to costs itself the fast decode path, never the
+    /// right answer, where a default of `true` would turn the same omission into every token
+    /// decoded at the baked position.
+    fn decode_replay_ready(&self, _plan: &dyn Plan, _bindings: &Bindings) -> bool {
+        false
     }
 
     fn sync(&self) -> Result<()>;

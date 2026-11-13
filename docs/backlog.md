@@ -3911,7 +3911,15 @@ Q4_K / Q6_K GEMV bodies read a weight row past the bank for an odd output width;
   that was estimated, not measured, for the lossiest format.
 - **In the macOS test job the bandwidth benches are most of the test time**
   (`gemv_bw` about 48 s of about 81 s summed in run 43212953975). They assert
-  nothing and run because the job passes `--include-ignored`.
+  nothing and run because the job passes `--include-ignored`. They also fail the
+  job: on 2026-11-13 run 43369452255 failed once in `f16_native_probe`
+  (`crates/infr-metal/tests/gemv_bw.rs`) with "dequant-cached f32 weight would
+  exceed the GPU working set: 4.64 GiB allocated + 0.28 GiB … > 4.67 GiB
+  budget", and passed on a re-run with no code change, so the probe's memory use
+  depends on the runner it lands on. The allocation total suggests buffers
+  accumulating across the probes in that test binary (not verified). The fix is
+  to stop running assert-nothing probes in the CI test job, or to bound their
+  allocations.
 - Not read by any pass: `kv_cache.metal`'s first f16 / f32 writers, the
   `topk_mask` and lightning-indexer tail of `attention.metal`, the rest of
   `elementwise_norms.metal`, most of `tests/parity.rs`, and
@@ -4195,52 +4203,39 @@ Still not read by any pass, stated as a gap:
   opening one, or a Metal device outside CI. Windows was run on 2026-11-13; see
   B154 for what that covered.
 
-### B157 — the decode-replay gate is a hand-kept mirror, and a miss is silent garbage (2026-11-13)
+### B157 — SmolLM3 decodes without the record-once replay (2026-11-13)
 
-**Tag:** vulkan · metal · seam · correctness · performance
+**Tag:** vulkan · metal · seam · performance
 
-`generate_dense_backend` (`crates/infr-llama/src/seam/runner.rs`) builds the
-decode graph ONCE at `pos = 0` / `kv_len = 1` when its `dyn_replay` gate says
-the backend will replay it. The Vulkan adapter decides replay on its own, in
-`decode_eligible` (`crates/infr-vulkan/src/adapter.rs`), and when that says no,
-`execute` runs the graph through `execute_static`, baked positions and all. So
-every reason `decode_eligible` refuses a graph has to be copied into the
-runner's gate by hand, and a missed one does not fail: every decode token writes
-KV row 0 and attends one row.
+The replay gate in `generate_dense_backend`
+(`crates/infr-llama/src/seam/runner.rs`) no longer carries correctness: after
+compiling the position-0 decode plan the runner asks
+`Backend::decode_replay_ready` and takes the per-token path on a "no", and the
+graph is marked `Graph::replay_only`, which Vulkan, Metal and CPU refuse to run
+in a way that would read its baked positions. The gate's `mirror_admits` terms
+are now only a way to skip building a plan that would be refused. What is left:
 
-It has now been missed three times. The `deepseek2` and `deepseek4` terms of the
-gate each describe the same trap, and SmolLM3 hit it on 2026-11-13: its NoPE
-layers write K through `Op::Copy` → f16 `WriteKv`, which `decode_eligible`
-refuses, while the gate excluded only `llama4`. `gpu_seam_matches_cpu_smollm3`
-on `INFR_DEV=Vulkan1` produced `"systemsystemsystem…"`, and passed with
-`kernels.vulkan.no_replay = true`. The gate now has a `c.no_rope_step == 0` term
-beside `!c.llama4`, and the test passes on both GPUs.
-
-**Not done: making a miss loud.** The adapter cannot tell a graph built for
-replay from a static decode graph at position 0 (the same ops, the same baked
-`pos`/`kv_len`), and the runner cannot ask the adapter (`VkDecodePlan` and the
-`adapter` module are private; `Backend` has no eligibility query). Either fix
-crosses crates:
-
-- **The narrow one:** a `Graph` flag beside `no_decode_replay` (`infr-core`
-  `graph.rs`, say `built_for_replay`), set by the runner on the replay build.
-  The adapter's `execute` / `execute_chain` return an `Err` naming the refusing
-  op when the flag is set and the plan is not eligible (or the backend is
-  paged). Metal's `replay_shape` (`crates/infr-metal/src/exec.rs`) needs the
-  same check, and only macOS CI compiles it. Test: a NoPE-shaped synthetic graph
-  with the gate term removed must return the error, not tokens.
-- **The real one:** a `Backend` query on the compiled plan (or graph), which the
-  runner consults after `compile` and falls back to the per-token path on a
-  "no". The gate's terms then become an optimisation (skip building a plan that
-  will not replay), not a correctness condition.
-
-**The cost to SmolLM3:** decode re-records every token on Vulkan. Seen on
-2026-11-13 on a busy machine, not a measurement: 205.5 tok/s decode on Vulkan0
-and 11.2 tok/s on Vulkan1 for a 37-token reply. Closing it needs either a `_dyn`
-twin for the standalone f16→f16 `WriteKv` (the K write a NoPE layer makes) or a
-fuse that writes the cast K straight into the cache the way `plan_kv_write` does
-for rope → `WriteKv`. llama4's rope layers have the same need, for their
-L2-normed K.
+- **SmolLM3 still decodes per token on Vulkan**, recording each token's graph
+  statically (`gpu_seam_smollm3_decode_records_no_replay` asserts it records no
+  replay). Seen on 2026-11-13 on a busy machine, not a measurement: 217 tok/s
+  decode on Vulkan0 and 11 tok/s on Vulkan1 (`infr bench -p 0 -n 64`), against
+  780 and 55 for Qwen3-0.6B. Closing it needs either a `_dyn` twin for the
+  standalone f16→f16 `WriteKv` (the K write a NoPE layer makes) or a fuse that
+  writes the cast K straight into the cache the way `plan_kv_write` does for
+  rope → `WriteKv`. llama4's rope layers have the same need, for their L2-normed
+  K. Then drop the `c.no_rope_step == 0` / `!c.llama4` gate terms.
+- **Metal's answer is not run on Metal.** `decode_replay_ready` there is true
+  when the tape replays the plan (`replay_capable`) or the static walk takes
+  every position from the bound positions buffer
+  (`policy::static_walk_live_positions` in `crates/infr-metal/src/policy.rs`, an
+  exhaustive `match` over `Op` that is unit-tested on every OS through
+  `crates/infr-metal/tests/policy.rs`). The rest (`static_walk_live`,
+  `refuse_replay_only`, the `execute_graph` / `execute_graph_chain` checks) was
+  cross-linted for `aarch64-apple-darwin` only; no Metal device has executed it.
+  The predicate's per-op decisions were read off the walk's arms in `exec.rs`
+  (`dynpos` overriding single-row `WriteKv` / `Attention`, `Rope` loading its
+  positions per execute, `QkNormRope` reading the bound buffer), not observed on
+  a device.
 
 ### B158 — chat-template renders: what still differs from llama.cpp (2026-11-13)
 

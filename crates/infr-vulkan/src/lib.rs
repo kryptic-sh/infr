@@ -389,6 +389,9 @@ struct VulkanShared {
     /// takes) and released in `VkBuffer::drop` via its `act_bytes`.
     act_live: AtomicU64,
     act_peak: AtomicU64,
+    /// Record-once decode recordings made since this backend was built
+    /// ([`VulkanBackend::decode_recordings`]).
+    decode_recordings: AtomicU64,
     /// SUBMIT SPLITTER: the most dispatches `execute_static` will record into one command buffer
     /// before submitting it and opening the next (`0` = unlimited, never split).
     ///
@@ -1306,6 +1309,15 @@ impl VulkanBackend {
             .collect();
         v.sort_unstable();
         v
+    }
+
+    /// How many record-once decode recordings this backend has made. A caller that compiles one
+    /// decode plan and executes it for every token records it once (again only if a bound buffer
+    /// changes); one that compiles a plan per token records once per token on an eligible graph,
+    /// and never on an ineligible one. The first is the fast decode path, and the output alone
+    /// cannot tell it from the others, so this is how a test sees which one ran.
+    pub fn decode_recordings(&self) -> u64 {
+        self.shared.decode_recordings.load(Ordering::Relaxed)
     }
 
     /// Initialize Vulkan: create instance, pick a GPU (prefer discrete), create a logical
@@ -2622,6 +2634,7 @@ impl VulkanBackend {
                 device_used: AtomicU64::new(0),
                 act_live: AtomicU64::new(0),
                 act_peak: AtomicU64::new(0),
+                decode_recordings: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
                 uma_overflow_type,
                 host_overflow_type,
@@ -4214,6 +4227,16 @@ impl Backend for VulkanBackend {
         n: usize,
     ) -> Result<Option<Vec<u32>>> {
         adapter::execute_chain(self, plan, bindings, n)
+    }
+
+    /// The same contract as every backend's (`Backend::decode_replay_ready`), and here it is
+    /// exactly "the adapter will replay this plan": the adapter's static path records every op
+    /// with the positions and lengths baked into the graph and patches none of them from live
+    /// state, so a plan it does not replay decodes every token at the baked position. The answer
+    /// is the plan's eligibility (`VkDecodePlan::eligible`) unless a pager forces the static path;
+    /// the bindings play no part in it.
+    fn decode_replay_ready(&self, plan: &dyn Plan, _bindings: &Bindings) -> bool {
+        adapter::decode_replay_ready(self, plan)
     }
 
     fn sync(&self) -> Result<()> {

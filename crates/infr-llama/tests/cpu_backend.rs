@@ -1688,6 +1688,61 @@ fn gpu_seam_matches_cpu_smollm3() {
     seam_vulkan_matches_cpu(&path, "Write a short paragraph about the ocean.", 32);
 }
 
+/// How many record-once decode recordings a short Vulkan session generation on `path` made, and
+/// how many tokens it decoded. One recording for the whole decode is the replay path; one per
+/// decoded token is a plan compiled per token on a graph the backend could have replayed; none is
+/// a decode the backend never replays.
+fn vulkan_decode_recordings(path: &std::path::Path) -> (u64, usize) {
+    let model = model_default(path);
+    let mut sess = model.vulkan_session(256).expect("session");
+    eprintln!("vulkan device: {}", sess.device_name());
+    let mut out = String::new();
+    let stats = model
+        .generate_vulkan_session(&mut sess, "The capital of France is", 8, None, |p| {
+            out.push_str(p)
+        })
+        .expect("generation");
+    let recordings = sess.decode_recordings();
+    eprintln!(
+        "{}: {recordings} decode recording(s) for {} decoded token(s): {out:?}",
+        path.display(),
+        stats.n_gen
+    );
+    (recordings, stats.n_gen)
+}
+
+/// The record-once decode replay is the fast decode path, and nothing about the output shows
+/// whether it was taken: since the runner asks the backend after compiling (B157) rather than
+/// trusting its own gate, a backend answer that turned "no" for a model that replays would cost a
+/// several-fold decode slowdown with every parity test still green. Qwen3 replays: one recording
+/// serves its whole decode, where a plan compiled per token would record once per token.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_qwen3_decode_replays_from_one_recording() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let mut _tlk = test_serial_lock();
+    let (recordings, n_gen) = vulkan_decode_recordings(&path);
+    assert!(n_gen > 1, "too few tokens decoded to tell the paths apart");
+    assert_eq!(
+        recordings, 1,
+        "Qwen3-0.6B decoded {n_gen} tokens without the one record-once replay"
+    );
+}
+
+/// SmolLM3's NoPE layers write their K through a cast the Vulkan replay has no kernel for, so its
+/// decode records nothing (see B157 for what replaying it would take).
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_smollm3_decode_records_no_replay() {
+    let path = need_model!(smollm3_3b(), "SmolLM3-3B");
+    let mut _tlk = test_serial_lock();
+    let (recordings, _) = vulkan_decode_recordings(&path);
+    assert_eq!(
+        recordings, 0,
+        "SmolLM3-3B recorded a replay its NoPE layers cannot be decoded by"
+    );
+}
+
 // ─── Qwen3.5 / Qwen3-Next (gated DeltaNet) ──────────────────────────────────────
 
 fn qwen35_08b() -> Option<PathBuf> {

@@ -31,4 +31,5 @@ windows = { version = "0.58", features = [
 ] }
 
 [dev-dependencies]
+memmap2.workspace = true
 tempfile = "3"

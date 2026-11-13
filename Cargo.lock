@@ -1332,6 +1332,7 @@ version = "0.2.0"
 dependencies = [
  "dirs",
  "libc",
+ "memmap2",
  "tempfile",
  "windows",
 ]

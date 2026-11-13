@@ -2287,12 +2287,13 @@ a hot path
   per-model starting cap would need the same watchdog evidence the current one
   was set from (see [igpu.md](igpu.md)).
 - **Declined: keeping an existing blob instead of renaming over it.** The review
-  suspected `download::commit`'s `fs::rename` over an already-cached blob would
-  fail on Windows while another infr has that blob memory-mapped. Tested on
-  Windows 11 with the blob mapped through `memmap2` for the whole download: the
-  rename succeeds (std renames with POSIX semantics, and std opens files with
-  `FILE_SHARE_DELETE`). Not a bug here; revisit only if an older Windows build
-  or a non-std file open ever maps a blob.
+  suspected that committing a download over an already-cached blob would fail on
+  Windows while another infr has that blob memory-mapped. std's `fs::rename`
+  succeeds there (POSIX semantics, and std opens files with
+  `FILE_SHARE_DELETE`); `MoveFileExW`, which `persist::commit_file` adopted on
+  2026-11-12, does not ("Access is denied", run 2026-11-13). `commit_file` now
+  falls back to std's rename plus a flush of the renamed file when `MoveFileExW`
+  refuses, and `a_commit_replaces_a_mapped_file` holds the case on every OS.
 - **Out-of-order ranged writes on NTFS.** `ranged::worker` writes chunks with
   `seek_write` in any order. NTFS zero-fills everything below a write past the
   valid-data length, synchronously, so a late chunk landing first in a large
@@ -2332,8 +2333,10 @@ a hot path
   stopped without measured throughput; full timing coverage is not claimed.
 - **Default-parallel local nextest exceeds available Windows commit capacity.**
   Validation hit allocation failures and `os error 1455` (paging file too
-  small), plus a downloader concurrency-floor failure under contention. The
-  whole workspace passed with `--test-threads=1`; no assertions or system memory
+  small), plus a downloader concurrency-floor failure under contention
+  (`pull::tests::a_finished_file_hands_over_its_connection` failed again on
+  2026-11-13 beside a release build, and passed five times alone). The whole
+  workspace passed with `--test-threads=1`; no assertions or system memory
   settings were changed. Revisit parallel resource scheduling separately.
 - **Why Windows CPU goldens diverge is unconfirmed.** `cpu_golden_qwen3` and
   `cpu_golden_gemma3`'s 48-token cases produce different, coherent text on
@@ -3512,7 +3515,10 @@ the Apple target but were not run.
   and sampling integration therefore never executes anywhere — no one on the
   project has a Metal device. `docs/ci-matrix.md` was corrected on this point.
 - **Windows golden hashes** (`per_os(windows, …)` in `QWEN3_GOLDEN` and
-  `GEMMA3_GOLDEN`) are never asserted: `cpu-goldens` is Ubuntu-only.
+  `GEMMA3_GOLDEN`) are never asserted in CI: `cpu-goldens` is Ubuntu-only. On
+  the Windows dev box they still match as of 2026-11-13 (`cpu_golden_qwen3`,
+  `cpu_golden_gemma3` and `cpu_golden_qwen3_quants` pass, after the 2026-11-12
+  tokenizer fixes).
 - **Tests that skip on an integrated GPU, and pass.** The qwen35 snapshot tests
   in `seam/runner.rs` (`with_q35_vulkan`) skip where `max_decode_chain` is 1,
   because no chain runs and no snapshot is taken. Four prefill-chunk helper
@@ -3817,9 +3823,11 @@ symlinks; a backslash in a repo id escaped the cache on Windows;
   not swept; with the copy fallback one is model-sized.
 - A hostile hub that misreports a file's size can force a re-download on every
   pull (the replacement only lands after its sha256 checks out).
-- **Not run:** the Windows arms (`MoveFileExW` write-through commit, the symlink
-  → hard link → copy fallback, file identity by volume serial and file index)
-  are lint-clean for a Windows target and were never executed; nor was a real
+- **Run on Windows 11 on 2026-11-13** (and by CI's `windows-2025` test job): the
+  `MoveFileExW` commit, the symlink → hard link → copy fallback (the refusals
+  are injected, so the hard-link and copy arms run even where symlinks work) and
+  file identity by volume serial and file index. The run found the commit
+  refusing a memory-mapped destination (fixed; see B75). **Not run:** a real
   power loss, or a filesystem that refuses a directory sync.
 - **Tests that did not test.** Two dozen model-gated tests in
   `tests/cpu_backend.rs` returned early and counted as passed in every CI job;

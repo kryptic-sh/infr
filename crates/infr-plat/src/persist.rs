@@ -16,10 +16,13 @@ use std::path::Path;
 /// **Unix**: `fsync` the file, `rename`, then `fsync` the directory that holds `dest`, which is
 /// what makes the new entry itself durable. **Windows**: `FlushFileBuffers` on the file, then
 /// `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, which does not return until the move is flushed —
-/// Windows cannot open a directory handle to flush the way unix does. **Other targets**: an
-/// `Unsupported` error rather than an unsynced rename reported as durable.
+/// Windows cannot open a directory handle to flush the way unix does — or, when the destination is
+/// memory-mapped and `MoveFileExW` refuses it, a POSIX-semantics rename followed by a flush of the
+/// renamed file. **Other targets**: an `Unsupported` error rather than an unsynced rename reported
+/// as durable.
 ///
-/// Verified on Linux only; the Windows arm is compiled by CI's native clippy and test jobs.
+/// The tests below run on Linux and Windows; that the bytes survive a power loss is not observable
+/// from a test on either.
 pub fn commit_file(tmp: &Path, dest: &Path) -> io::Result<()> {
     // Write access, because Windows refuses `FlushFileBuffers` on a read-only handle.
     OpenOptions::new().write(true).open(tmp)?.sync_all()?;
@@ -64,16 +67,33 @@ fn rename_durably(tmp: &Path, dest: &Path) -> io::Result<()> {
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
 
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_USER_MAPPED_FILE};
+
     let (from, to) = (HSTRING::from(tmp), HSTRING::from(dest));
     // SAFETY: both arguments are NUL-terminated wide strings owned by this frame for the call.
-    unsafe {
+    let moved = unsafe {
         MoveFileExW(
             &from,
             &to,
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     }
-    .map_err(|_| io::Error::last_os_error())
+    .map_err(|_| io::Error::last_os_error());
+    match moved {
+        // `MoveFileExW` refuses to replace a file another process has memory-mapped — a model an
+        // `infr serve` is running while it is pulled again. std's rename uses POSIX semantics,
+        // which unlink the old name and leave the mapping intact; the flush that
+        // `MOVEFILE_WRITE_THROUGH` would have waited for is then done on the file under its new
+        // name.
+        Err(e)
+            if e.raw_os_error() == Some(ERROR_ACCESS_DENIED.0 as i32)
+                || e.raw_os_error() == Some(ERROR_USER_MAPPED_FILE.0 as i32) =>
+        {
+            std::fs::rename(tmp, dest)?;
+            OpenOptions::new().write(true).open(dest)?.sync_all()
+        }
+        other => other,
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -104,6 +124,24 @@ mod tests {
 
         assert_eq!(fs::read(&dest).expect("read dest"), b"fresh bytes");
         assert!(!tmp.exists(), "the temp name must be gone");
+    }
+
+    /// A commit must replace a file another process has memory-mapped: re-pulling a model while an
+    /// `infr serve` holds it mapped lands on exactly that. The old mapping keeps the old bytes.
+    #[test]
+    fn a_commit_replaces_a_mapped_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (tmp, dest) = (dir.path().join(".partial"), dir.path().join("blob"));
+        fs::write(&dest, b"stale").expect("old file");
+        fs::write(&tmp, b"fresh bytes").expect("temp");
+        let mapped = fs::File::open(&dest).expect("open old file");
+        // SAFETY: nothing in this test writes to the mapped file; the commit replaces its name.
+        let map = unsafe { memmap2::Mmap::map(&mapped) }.expect("map old file");
+
+        commit_file(&tmp, &dest).expect("commit over a mapped file");
+
+        assert_eq!(fs::read(&dest).expect("read dest"), b"fresh bytes");
+        assert_eq!(&map[..], b"stale", "the mapping keeps the bytes it mapped");
     }
 
     /// The directory-sync answers that mean "this filesystem cannot", and only those, are excused.

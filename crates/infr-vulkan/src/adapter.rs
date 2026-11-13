@@ -1163,9 +1163,10 @@ fn lower_op(
     // BYTE address. The pool arena is a `bufferDeviceAddress` buffer read purely by 64-bit pointer
     // (NOT a bound SSBO), so the ~4 GiB `maxStorageBufferRange` cap is gone entirely (no descriptor
     // binds it). The op is lowered by an m-split that MIRRORS the resident selection, just
-    // arena-addressed: a genuine prefill chunk (`streamed_gemm_applies`) routes through the SAME
-    // coopmat-warp GEMM tile the resident path would pick (`streamed_prefill_gemm` → the -DSTREAMED
-    // twins of native_gemm/native_gemm_warp), while decode/small-m keep the single streamed GEMV
+    // arena-addressed: a genuine prefill chunk (`streamed_gemm_route`) routes through the SAME
+    // tiled GEMM the resident path would pick (`streamed_prefill_gemm` → the -DSTREAMED twins of
+    // native_gemm/native_gemm_warp on a coopmat device, `nc_prefill_gemm` → the dp4a mmq / fma
+    // warptile GEMMs otherwise), while decode/small-m keep the single streamed GEMV
     // (`linear_native_at`) — the arena-addressed kernels are the ONLY ones a >4 GiB pool ever
     // dispatches, which is what makes dropping the caps safe. `w_off` (a fused-QKV slice offset,
     // usually 0) rides on top as a within-slot element offset in both. The ring→arena copy hazard is
@@ -1285,8 +1286,8 @@ fn lower_op(
             // Dense layer streaming: the weight lives in a `bufferDeviceAddress` arena pool (see
             // the `wsub` param doc). The op reads the arena by 64-bit address (`arena_addr`), with
             // the op's own `w_off` (a fused-qkv slice offset, usually 0) riding on top as a
-            // within-slot element offset. A genuine prefill chunk routes to the SAME coopmat-warp
-            // GEMM tile the resident path would pick (arena-addressed) — the prefill perf win;
+            // within-slot element offset. A genuine prefill chunk routes to the SAME tiled GEMM
+            // the resident path would pick (arena-addressed) — the prefill perf win;
             // decode/small-m keep the single streamed GEMV. Both dispatch ONLY arena-addressed
             // kernels, never an unconverted SSBO one, which is what lets the seam drop the pool caps.
             if let Some(arena_addr) = wsub {
@@ -1296,7 +1297,25 @@ fn lower_op(
                     return Err(be("vulkan adapter: streamed Linear weight of a dtype \
                                    without offset-capable kernels"));
                 }
-                if streamed_gemm_applies(be_, dt, m, in_f, out_f) {
+                // A Tiled route the weight or grid cannot take keeps the per-row GEMV it had before
+                // that route existed (see `streamed_tiled_fits`).
+                let route = streamed_gemm_route(be_, dt, m, in_f, out_f).filter(|r| match r {
+                    StreamedGemm::Warp => true,
+                    StreamedGemm::Tiled(_) => streamed_tiled_fits(
+                        dt,
+                        m,
+                        in_f,
+                        out_f,
+                        &be_.cfg().kernels.vulkan,
+                        crate::recorder::Recorder::split_point_x(),
+                    ),
+                });
+                if let Some(StreamedGemm::Tiled(kind)) = route {
+                    nc_prefill_gemm(
+                        be_, graph, kind, dt, arena_addr, w_off, xb, y, dst, m, in_f, out_f, rec,
+                        pool, transient,
+                    )?;
+                } else if route == Some(StreamedGemm::Warp) {
                     // The tiled prefill GEMM can't be output-row chunked (see the resident-GEMM
                     // guard above) — a breaching streamed lm_head at m>16 fails loudly here.
                     if crate::recorder::bda_weight_breaches(
@@ -1605,42 +1624,30 @@ fn lower_op(
             // scalar GEMVs (the field-measured 10-30x prefill gap; decode was already at parity).
             // This tier remains the Arc DEFAULT; the opt-in `cm8_ok` XMX tier above takes only
             // the Linears it covers, and only under INFR_CM_8X8=1.
-            // Two arms, same padded-dst convention as `is_gemm`:
-            //  • `nc_mmq`: weight dtype in `infr_core::tensor::MOE_MMQ_DTYPES` + `caps.i8_dot` →
-            //    the DENSE dp4a mmq GEMM family (`matmul_mmq` — the same shader code the batched
-            //    MoE expert path already gates on `i8_dot` alone, base-grid build), fed by the
-            //    same `quant_q8` activation prepass the coopmat tier's Q4_K-mmq arm uses.
-            //  • `nc_fma`: f16/bf16/f32 weights (no integer codes to dp4a) → the shared-memory
-            //    fma warptile (`matmul_fma`, native_gemm_fma.comp — no subgroup ops, no f16
-            //    exts; bf16 reads stay native, no f32 upconvert).
+            // Two arms (`nc_gemm_choice`), same padded-dst convention as `is_gemm`:
+            //  • `NcGemm::Mmq` (`nc_mmq`): weight dtype in `infr_core::tensor::MOE_MMQ_DTYPES` +
+            //    `caps.i8_dot` → the DENSE dp4a mmq GEMM family (`matmul_mmq_at` — the same shader
+            //    code the batched MoE expert path already gates on `i8_dot` alone, base-grid
+            //    build), fed by the same `quant_q8` activation prepass the coopmat tier's Q4_K-mmq
+            //    arm uses.
+            //  • `NcGemm::Fma` (`nc_fma`): f16/bf16/f32 weights (no integer codes to dp4a) → the
+            //    shared-memory fma warptile (`matmul_fma_at`, native_gemm_fma.comp — no subgroup
+            //    ops, no f16 exts; bf16 reads stay native, no f32 upconvert).
+            // Both read the weight by 64-bit address, so a streamed weight takes the same tier
+            // (`streamed_gemm_route`).
             // Exercisable on coopmat hardware via INFR_NO_COOPMAT=1 (lib.rs's force-disable test
             // knob — drops the device feature itself, a faithful simulation). INFR_NO_MMQ_FALLBACK=1
             // disables the WHOLE tier (both arms) for A/B against the scalar floor.
-            let nc_tier =
-                gemm_ok && !be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.mmq_fallback;
-            let nc_mmq = nc_tier && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
-            let nc_fma =
-                nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_kernel_name(dt).is_some();
-            // The nc GEMMs index their tile by `gl_WorkGroupID.x` alone (the mmq builds already
-            // spend `.y` on the expert id of the batched-MoE twin), so their flat tile grid cannot
-            // take `dispatch_wide`'s 2-D split. A grid past the guaranteed x limit would be
-            // rejected or truncated by a driver that enforces it (ANV), so refuse it by name.
-            let nc_groups = crate::recorder::nc_gemm_groups(m, out_f);
-            if (nc_mmq || nc_fma) && nc_groups > crate::recorder::Recorder::split_point_x() as usize
-            {
-                return Err(be(format!(
-                    "vulkan adapter: non-coopmat prefill GEMM (m={m}, out_f={out_f}, {dt:?}) needs \
-                     {nc_groups} workgroups in one grid dimension, past the {} every Vulkan device \
-                     guarantees — run prefill in smaller batches",
-                    crate::recorder::Recorder::split_point_x()
-                )));
+            let nc = nc_gemm_choice(be_, dt, gemm_ok);
+            if nc.is_some() {
+                check_nc_gemm_grid(dt, m, out_f)?;
             }
             // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
             // (decode m=1, or the per-input-row GEMV) — the tiled coopmat/nc GEMMs below decode a
             // 64-row weight tile that can't be split into single input rows, so a breach on this
             // path (a multi-row lm_head: MTP speculative verify or all-position logits) must fail
             // loudly, never wrap. Issue #77: covered classes chunk; everything else stays loud.
-            if (is_gemm || nc_mmq || nc_fma)
+            if (is_gemm || nc.is_some())
                 && crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
             {
                 return Err(be(format!(
@@ -1920,43 +1927,16 @@ fn lower_op(
                     }
                     Ok(())
                 })?;
-            } else if nc_mmq || nc_fma {
-                // Non-coopmat prefill GEMM tier (see the `nc_tier` doc above). Same padded-dst
-                // dance as `is_gemm` (`with_padded_dst`): the GEMM writes ceil(m/64)*64 rows.
-                with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
-                    if nc_mmq {
-                        // Same pooled scratch tags/sizes as the coopmat tier's Q4_K-mmq arm — the
-                        // two arms are mutually exclusive per device, so the tags never collide.
-                        let nblk = in_f / 32;
-                        let mpad = m.div_ceil(64) * 64;
-                        let qa = pooled(pool, be_, "mmq_qa", mpad * in_f)?;
-                        let dact = pooled(pool, be_, "mmq_dact", mpad * nblk * 2)?;
-                        let sact = pooled(pool, be_, "mmq_sact", mpad * nblk * 2)?;
-                        rec.quant_q8(
-                            xb,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            m,
-                            in_f,
-                        );
-                        rec.matmul_mmq(
-                            dt,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            w,
-                            w_off,
-                            out,
-                            m,
-                            in_f,
-                            out_f,
-                        );
-                    } else {
-                        rec.matmul_fma(dt, xb, w, w_off, out, m, in_f, out_f);
-                    }
-                    Ok(())
-                })?;
+            } else if let Some(kind) = nc {
+                // Non-coopmat prefill GEMM tier (see the NON-COOPMAT doc above), reading the
+                // resident weight by its BDA — the streamed twin passes its arena address instead.
+                let w_addr = w
+                    .device_addr()
+                    .expect("resident-BDA weight: non-coopmat GEMM requires a u64 BDA address");
+                nc_prefill_gemm(
+                    be_, graph, kind, dt, w_addr, w_off, xb, y, dst, m, in_f, out_f, rec, pool,
+                    transient,
+                )?;
             } else if native_dense_supported(dt) {
                 // Decode (m=1) on int-dot-capable K-quants → mmv (see the fused-add branch above).
                 // Wave32-native GPUs take the multi-warp dp4a route first (`mmv_mw_choice`); AMD
@@ -5897,37 +5877,192 @@ fn sync_stream<'a>(
     Ok(())
 }
 
-/// Does a streamed dense `Op::Linear` at `(dt, m, in_f, out_f)` route to the arena-addressed
-/// coopmat-warp prefill GEMM (`streamed_prefill_gemm`), or fall back to the streamed GEMV? Mirrors
-/// the RESIDENT `is_gemm && native_dense_supported` gate so the streamed route tracks the resident
-/// route exactly — just arena-addressed. A genuine prefill chunk (m>16, past the resident mrow
-/// window) with a coopmat-warp-eligible native quant takes the GEMM; decode/small-m/verify keep the
-/// GEMV (the task's "small-m keeps the GEMV"). The one native-quant shape the resident path routes
-/// to the dp4a `mmq` GEMM instead of the coopmat-warp arm — Q4_K with out_f%128!=0 (no warp tile) —
-/// is NOT arena-converted (its shader reads the weight outside native_decode's NW chokepoint), so it
-/// too keeps the GEMV; every other native quant reaches the coopmat-warp arm `streamed_prefill_gemm`
-/// mirrors. Also mirrors the resident `warp_ok` gate's `INFR_NO_GEMM_WARP` escape hatch: with it
-/// set, the resident path drops out of the coopmat-warp arm entirely (falling to mmq/off-tier), so
-/// the streamed route must fall back to the GEMV too — otherwise a Q4_K out_f%128==0 shape would
-/// diverge (resident: mmq: streamed: still the coopmat GEMM twin), which can panic the twin-SPV
-/// lookup under that debug knob.
-fn streamed_gemm_applies(
+/// The two arms of the non-coopmat tiled prefill GEMM tier (see the NON-COOPMAT doc in
+/// `lower_op`'s `Op::Linear` arm): dp4a mmq for integer-coded weights, the fma warptile for float.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NcGemm {
+    Mmq,
+    Fma,
+}
+
+/// Which non-coopmat tiled GEMM serves a `dt` Linear whose shape passed `gemm_ok`, or `None` when
+/// the device has f16 coopmat (the coopmat tier owns it), `INFR_NO_MMQ_FALLBACK` disabled the tier,
+/// or no build covers `dt`. Shared by the resident arm and its streamed twin so they cannot drift.
+fn nc_gemm_choice(be_: &VulkanBackend, dt: infr_core::DType, gemm_ok: bool) -> Option<NcGemm> {
+    if !gemm_ok || be_.caps().f16_coopmat() || !be_.cfg().kernels.vulkan.mmq_fallback {
+        return None;
+    }
+    if be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt) {
+        Some(NcGemm::Mmq)
+    } else if crate::gemm::native_gemm_fma_kernel_name(dt).is_some() {
+        Some(NcGemm::Fma)
+    } else {
+        None
+    }
+}
+
+/// The nc GEMMs index their tile by `gl_WorkGroupID.x` alone (the mmq builds already spend `.y` on
+/// the expert id of the batched-MoE twin), so their flat tile grid cannot take `dispatch_wide`'s
+/// 2-D split. A grid past the guaranteed x limit would be rejected or truncated by a driver that
+/// enforces it (ANV), so refuse it by name.
+fn check_nc_gemm_grid(dt: infr_core::DType, m: usize, out_f: usize) -> Result<()> {
+    let nc_groups = crate::recorder::nc_gemm_groups(m, out_f);
+    if !nc_gemm_grid_fits(m, out_f, crate::recorder::Recorder::split_point_x()) {
+        return Err(be(format!(
+            "vulkan adapter: non-coopmat prefill GEMM (m={m}, out_f={out_f}, {dt:?}) needs \
+             {nc_groups} workgroups in one grid dimension, past the {} every Vulkan device \
+             guarantees — run prefill in smaller batches",
+            crate::recorder::Recorder::split_point_x()
+        )));
+    }
+    Ok(())
+}
+
+/// Does the nc GEMMs' flat tile grid for `(m, out_f)` fit in `max_groups_x` workgroups (the
+/// device-guaranteed x limit, `Recorder::split_point_x`)? See [`check_nc_gemm_grid`].
+fn nc_gemm_grid_fits(m: usize, out_f: usize, max_groups_x: u32) -> bool {
+    crate::recorder::nc_gemm_groups(m, out_f) <= max_groups_x as usize
+}
+
+/// Can a streamed Linear that [`streamed_gemm_route`] sent to a `Tiled` GEMM actually take it? The
+/// tiled GEMMs cannot be output-row chunked (a `bda_weight_breaches` weight — a big-vocab lm_head
+/// at m > 16: all-position logits, speculative verify) and their grid is capped at `max_groups_x`.
+/// The resident non-coopmat arm refuses both by name; the streamed op instead keeps the per-row
+/// GEMV (`linear_native_at`), which chunks a breaching weight and has no grid cap — the route those
+/// shapes ran on before the tiled one existed.
+fn streamed_tiled_fits(
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    vk: &infr_core::config::VulkanCfg,
+    max_groups_x: u32,
+) -> bool {
+    nc_gemm_grid_fits(m, out_f, max_groups_x)
+        && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
+}
+
+/// Record one tiled dp4a-mmq or fma-warptile prefill GEMM reading the weight at the 64-bit address
+/// `w_addr` (a resident weight's BDA, or a streamed slot's arena base) plus element offset `w_off`.
+/// Same padded-dst dance as every tiled tier (`with_padded_dst`): the GEMM writes ceil(m/64)*64
+/// rows. The caller has already checked the grid and `bda_weight_breaches` (refusing the op on the
+/// resident path, keeping the GEMV on the streamed one).
+#[allow(clippy::too_many_arguments)]
+fn nc_prefill_gemm(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    kind: NcGemm,
+    dt: infr_core::DType,
+    w_addr: u64,
+    w_off: usize,
+    xb: &dyn Buffer,
+    y: &dyn Buffer,
+    dst: &TensorId,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    rec: &Recorder<'_>,
+    pool: &mut ScratchPool,
+    transient: &mut Vec<Box<dyn Buffer>>,
+) -> Result<()> {
+    with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
+        match kind {
+            NcGemm::Mmq => {
+                // Same pooled scratch tags/sizes as the coopmat tier's Q4_K-mmq arm — one shape's
+                // scratch serves both, and only one of them runs per Linear.
+                let nblk = in_f / 32;
+                let mpad = m.div_ceil(64) * 64;
+                let qa = pooled(pool, be_, "mmq_qa", mpad * in_f)?;
+                let dact = pooled(pool, be_, "mmq_dact", mpad * nblk * 2)?;
+                let sact = pooled(pool, be_, "mmq_sact", mpad * nblk * 2)?;
+                rec.quant_q8(
+                    xb,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    m,
+                    in_f,
+                );
+                rec.matmul_mmq_at(
+                    dt,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    w_addr,
+                    w_off,
+                    out,
+                    m,
+                    in_f,
+                    out_f,
+                );
+            }
+            NcGemm::Fma => rec.matmul_fma_at(dt, xb, w_addr, w_off, out, m, in_f, out_f),
+        }
+        Ok(())
+    })
+}
+
+/// The tiled prefill GEMM a streamed dense `Op::Linear` takes — see [`streamed_gemm_route`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamedGemm {
+    /// The arena-addressed coopmat-warp tile (`streamed_prefill_gemm`).
+    Warp,
+    /// The dp4a mmq or fma warptile GEMM (`nc_prefill_gemm`).
+    Tiled(NcGemm),
+}
+
+/// Rows above which a streamed Linear is a prefill chunk that takes a tiled GEMM: the top of the
+/// resident multi-row GEMV bands (`MROW_BANDS`). At or below it the streamed op keeps the per-row
+/// streamed GEMV. That is a routing choice, not a missing kernel — `linear_native_mrow_at` and
+/// `linear_mmv_mrow_at` read the weight by address too — and the streamed small-m path has simply
+/// never been switched to them.
+const STREAMED_GEMM_MIN_ROWS: usize = MROW_BANDS[MROW16_BAND].max_m;
+
+/// Which arena-addressed tiled GEMM a streamed dense `Op::Linear` at `(dt, m, in_f, out_f)` takes,
+/// or `None` to fall back to the streamed GEMV (`linear_native_at`). Mirrors the RESIDENT arm's
+/// pick — just arena-addressed — for a genuine prefill chunk (past [`STREAMED_GEMM_MIN_ROWS`]);
+/// decode/small-m/verify keep the GEMV. The caller still checks [`streamed_tiled_fits`] for a
+/// `Tiled` route.
+///
+/// - **f16 coopmat:** the resident `is_gemm` arm sends Q4_K to the dp4a mmq GEMM whenever its
+///   `warp_ok` is false (out_f%128 != 0, or `INFR_NO_GEMM_WARP` set) and int8 dot plus `INFR_NO_MMQ`
+///   allow; the streamed twin takes the arena-addressed build of that same shader, so with
+///   `INFR_NO_GEMM_WARP` a streamed Q4_K at out_f%128 == 0 takes mmq too. Every other native quant
+///   takes the coopmat-warp twin (`native_warp_gemm`). One divergence remains, under the
+///   `INFR_NO_GEMM_WARP` debug knob only: the resident arm still runs those quants through
+///   `native_warp_gemm` (the knob only turns off its A_GLOBAL tile), while the streamed route falls
+///   back to the per-row GEMV.
+/// - **No f16 coopmat:** the non-coopmat tier, through the same [`nc_gemm_choice`] as the resident
+///   arm. The resident opt-in `_cm8` tier (`INFR_CM_8X8`) has no arena-addressed build, so a
+///   streamed Linear on such a device takes this tier where the resident one would take `_cm8`.
+fn streamed_gemm_route(
     be_: &VulkanBackend,
     dt: infr_core::DType,
     m: usize,
     in_f: usize,
     out_f: usize,
-) -> bool {
-    m > 16
+) -> Option<StreamedGemm> {
+    let gemm_ok = m > STREAMED_GEMM_MIN_ROWS
         && out_f.is_multiple_of(64)
         && in_f.is_multiple_of(32)
-        && be_.caps().f16_coopmat()
-        && native_dense_supported(dt)
-        && be_.cfg().kernels.vulkan.gemm_warp
-        && !(matches!(dt, infr_core::DType::Q4K)
-            && !out_f.is_multiple_of(128)
-            && be_.caps().i8_dot
-            && be_.cfg().kernels.vulkan.mmq)
+        && native_dense_supported(dt);
+    if !gemm_ok {
+        return None;
+    }
+    let vk = &be_.cfg().kernels.vulkan;
+    if !be_.caps().f16_coopmat() {
+        return nc_gemm_choice(be_, dt, gemm_ok).map(StreamedGemm::Tiled);
+    }
+    let warp_ok = out_f.is_multiple_of(128)
+        && crate::gemm::native_gemm_warp_kernel_name(dt).is_some()
+        && vk.gemm_warp;
+    if matches!(dt, infr_core::DType::Q4K) && !warp_ok && be_.caps().i8_dot && vk.mmq {
+        Some(StreamedGemm::Tiled(NcGemm::Mmq))
+    } else if vk.gemm_warp {
+        Some(StreamedGemm::Warp)
+    } else {
+        None
+    }
 }
 
 /// Arena-addressed twin of the resident `Op::Linear` `is_gemm && native_dense_supported` coopmat-
@@ -12242,5 +12377,30 @@ mod tests {
         copy(DType::F32, DType::F16).expect("the F32→F16 conversion must run");
         refused(copy(DType::F16, DType::F32), "Op::Copy F16→F32");
         refused(copy(DType::I32, DType::F32), "Op::Copy I32→F32");
+    }
+
+    /// `streamed_tiled_fits` refuses exactly the two shapes the tiled non-coopmat GEMMs cannot run
+    /// — a grid past the x limit, a weight past the u32 addressing cap — and accepts the rest, so
+    /// the streamed op keeps its chunked GEMV for those instead of failing.
+    #[test]
+    fn streamed_tiled_fits_refuses_an_oversized_grid_or_a_breaching_weight() {
+        let (dt, m, in_f, out_f) = (DType::Q8_0, 40, 256, 128);
+        let mut vk = infr_core::config::Config::default().kernels.vulkan;
+        let x_limit = crate::recorder::Recorder::split_point_x();
+        assert!(streamed_tiled_fits(dt, m, in_f, out_f, &vk, x_limit));
+
+        let groups = crate::recorder::nc_gemm_groups(m, out_f) as u32;
+        assert!(streamed_tiled_fits(dt, m, in_f, out_f, &vk, groups));
+        assert!(!streamed_tiled_fits(dt, m, in_f, out_f, &vk, groups - 1));
+
+        vk.bda_chunk_elems = Some((in_f * out_f) as u64);
+        assert!(!streamed_tiled_fits(dt, m, in_f, out_f, &vk, x_limit));
+    }
+
+    /// The streamed tiled-GEMM threshold is the top of the resident multi-row GEMV bands.
+    #[test]
+    fn streamed_gemm_min_rows_tracks_the_mrow_bands() {
+        let top = MROW_BANDS.iter().map(|b| b.max_m).max().unwrap();
+        assert_eq!(STREAMED_GEMM_MIN_ROWS, top);
     }
 }

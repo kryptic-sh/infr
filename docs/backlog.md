@@ -3996,19 +3996,34 @@ Notes and gaps:
 A read-only pass over the Vulkan code the coverage list had as unread
 (`streamed_prefill_gemm`, `native_sg_choice`, `native_rm_choice`, the
 `native_gemm_fma.comp` body, the mmq shader headers). Nothing was built or run
-by it. The first two findings were re-read at their sites afterwards; the rest
-is the reviewer's account.
+by it. The `native_gemv_rm_v2` finding was re-read at its site afterwards; the
+rest is the reviewer's account.
 
-- **Performance, confirmed by re-reading: a streamed dense prefill never takes a
-  tiled GEMM on a device without f16 coopmat.** `streamed_gemm_applies` requires
-  `caps.f16_coopmat()`, and the streamed (`wsub`) branch of the `Op::Linear` arm
-  in `lower_op` returns before the non-coopmat tier the resident path uses, so
-  every streamed `Linear` with more than 16 rows goes to
-  `Recorder::linear_native_at`, which re-reads the whole weight once per row.
-  That covers Intel Arc and the integrated GPUs streaming exists for. The loss
-  was not measured, and no streamed model has been run on an iGPU. The reviewer
-  reports arena-addressed kernels already exist for the fix
-  (`Recorder::matmul_mmq_at`, `matmul_fma_at`), not re-checked.
+- **Streamed prefill GEMM (`streamed_gemm_route`): coverage gaps.**
+  `streamed_gemm_route` now sends a streamed `Linear` past
+  `STREAMED_GEMM_MIN_ROWS` to `nc_prefill_gemm` (the same `nc_gemm_choice` the
+  resident arm uses). On a coopmat device with int8 dot it sends Q4_K to the
+  arena-addressed mmq build wherever the resident `warp_ok` is false (`out_f` a
+  multiple of 64 and not of 128, or any `out_f` under `INFR_NO_GEMM_WARP`). A
+  weight that breaches the u32 addressing cap, or a grid past the x limit, keeps
+  the chunked per-row GEMV (`streamed_tiled_fits`) rather than failing. Verified
+  on the Radeon iGPU (`Vulkan1`, no coopmat, int8 dot) and the 7900 XTX
+  (`Vulkan0`) by `tests/streamed_nc_gemm.rs` (kernel names after the streamed
+  run, streamed == resident bitwise, against the GEMV and the host oracle, and
+  the breaching-weight fallback with `bda_chunk_elems` lowered) and the
+  `gpu_seam_dense_stream_*` tests with Qwen3-1.7B-Q4_K_M. Not verified: Intel
+  Arc; a device without int8 dot (the fma arm only); a whole streamed model with
+  bf16 weights; the oversized-grid fallback on a GPU (only the host-side
+  predicate test covers it); the `INFR_CM_8X8` opt-in, where the resident Linear
+  takes `_cm8` but the streamed one takes this tier (no arena-addressed `_cm8`
+  build exists). Known divergence, debug knob only: under `INFR_NO_GEMM_WARP` a
+  resident non-Q4_K quant still runs `native_warp_gemm` while the streamed one
+  falls back to the GEMV. Open choice: streamed Linears at or below
+  `STREAMED_GEMM_MIN_ROWS` take the per-row GEMV although
+  `linear_native_mrow_at` / `linear_mmv_mrow_at` would read the arena by address
+  too. Not measured in a quiet window: one profiled `infr bench -p 128` of
+  Qwen3-1.7B on `Vulkan1` with `paging.cache=200m` and `INFR_PROF_OPS=1`, on a
+  busy machine, gave 10.0 t/s with the old route and 103.6 t/s with the new one.
 - **Correctness, conditional, confirmed by re-reading:
   `native_gemv_rm_v2.comp`'s `VARIANT_REG` sizes `reg_part` for subgroups of at
   least 16** (`THREADS / 16u` slots, written by `gl_SubgroupID`), and
@@ -4020,11 +4035,6 @@ is the reviewer's account.
   and the kernel also ignores `caps.sg_pref`. Building it with
   `kernel_sg(..., self.sgp())` changes the subgroup size the default decode
   kernel runs at on AMD, so it needs a decode measurement first.
-- **Performance, narrow, reviewer's account:** `streamed_gemm_applies` excludes
-  streamed Q4_K weights whose `out_f` is a multiple of 64 and not of 128 because
-  the mmq shader "is not arena-converted"; the reviewer reports that
-  `native_gemm_mmq_dense_spv(Q4K)` now returns a streamed build reachable
-  through `matmul_mmq_at`, which would make the exclusion stale.
 - **Suspected, not established:** `native_rm_choice`'s doc says large GEMVs stay
   on RM=1, while `rm_maxout` defaults to `usize::MAX`; the RM kernel is
   described as bit-identical, so this is a performance question at most.

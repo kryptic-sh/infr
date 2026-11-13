@@ -103,6 +103,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Memory headroom inside a cgroup no longer counts reclaimable file cache as
   used.** A container that had read a lot of files looked nearly full, and infr
   sized its host weight cache too small.
+- **Vulkan: prefill of a streamed dense model uses the tiled GEMM on a device
+  without f16 cooperative matrix** (integrated GPUs, Intel Arc). A weight
+  streamed through `paging.cache` took the per-row GEMV for every prefill chunk,
+  re-reading the whole weight once per prompt row; it now takes the same dp4a or
+  fma GEMM the weight would take resident, and its output matches the resident
+  run's. On a cooperative-matrix device with int8 dot, a streamed Q4_K weight
+  now takes the dp4a GEMM wherever the resident one does — an output width that
+  is a multiple of 64 but not of 128, or any width under `INFR_NO_GEMM_WARP` —
+  instead of the GEMV. A weight too large for the tiled GEMM's addressing (a
+  big-vocab output projection) keeps the chunked GEMV, as before.
 
 ### Removed
 

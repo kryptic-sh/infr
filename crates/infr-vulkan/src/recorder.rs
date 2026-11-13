@@ -3085,16 +3085,10 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Dtype-generic DENSE dp4a (mmq) tiled GEMM: `c = qa·W[w_base]ᵀ` for ANY
-    /// `infr_core::tensor::MOE_MMQ_DTYPES` member — the non-coopmat prefill tier's GEMM
-    /// (adapter.rs `nc_mmq`: no usable f16 coopmat, packed int8 dot present — Intel Arc/ANV).
-    /// Same kernels/conventions as [`Self::matmul_mmq_q4k`]/[`Self::matmul_mmq_q6k`] (which it
-    /// delegates to for those dtypes' names), extended to the full dense build set
-    /// (`native_gemm_mmq_dense_spv`): activations pre-quantized via `quant_q8`, `c` is
-    /// `ceil(m/64)*64` rows, requires `n%64`, `k%32`. `sact` (the per-32-block Σx term) is
-    /// always passed but bound ONLY for the min-carrying dtypes
-    /// (`infr_core::tensor::moe_mmq_needs_sact` — the same SSOT the `_xp` expert dispatch uses;
-    /// Q2_K self-computes its narrower Σx in-shader).
+    /// [`Self::matmul_mmq_at`] reading a bound weight buffer `w` at its own BDA address. No
+    /// production caller: the adapter's `nc_prefill_gemm` (the resident non-coopmat tier and the
+    /// streamed route alike) calls `matmul_mmq_at` with the address itself. Kept for the parity
+    /// tests that hold a weight buffer rather than an address.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq(
         &self,
@@ -3115,11 +3109,19 @@ impl<'a> Recorder<'a> {
         self.matmul_mmq_at(dtype, qa, dact, sact, arena_addr, w_base, c, m, k, n);
     }
 
-    /// `-DSTREAMED` twin of [`Self::matmul_mmq`] (slice A3 build-variant: see
-    /// `crate::gemm::native_gemm_mmq_dense_spv`). Same arena-by-address convention as
-    /// [`Self::linear_native_at`] — the resident build's weight SSBO slot takes a small
-    /// FILLER (`qa`) since the arena is never bound as a descriptor. Not wired into any production
-    /// dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    /// Dtype-generic DENSE dp4a (mmq) tiled GEMM: `c = qa·W[w_base]ᵀ` for ANY
+    /// `infr_core::tensor::MOE_MMQ_DTYPES` member, the weight read by 64-bit address `arena_addr`
+    /// (a resident weight's BDA or a streamed pool slot's arena base). The adapter's
+    /// `nc_prefill_gemm` dispatches it for the non-coopmat prefill tier (`NcGemm::Mmq`: no usable
+    /// f16 coopmat, packed int8 dot present — Intel Arc/ANV, integrated GPUs) and for a streamed
+    /// Q4_K Linear on a coopmat device that no warp tile covers. Builds come from
+    /// `crate::gemm::native_gemm_mmq_dense_spv`: activations pre-quantized via `quant_q8`, `c` is
+    /// `ceil(m/64)*64` rows, requires `n%64`, `k%32`. `sact` (the per-32-block Σx term) is
+    /// always passed but bound ONLY for the min-carrying dtypes
+    /// (`infr_core::tensor::moe_mmq_needs_sact` — the same SSOT the `_xp` expert dispatch uses;
+    /// Q2_K self-computes its narrower Σx in-shader). Same arena-by-address convention as
+    /// [`Self::linear_native_at`]: the weight SSBO slot takes a small FILLER (`qa`), since the
+    /// arena is never bound as a descriptor.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_at(
         &self,
@@ -3157,10 +3159,11 @@ impl<'a> Recorder<'a> {
         self.dispatch(kern, &bufs, 1, &push, groups);
     }
 
-    /// Arena-addressed body of [`Self::matmul_fma`] (see `crate::gemm::native_gemm_fma_spv`).
-    /// The vacated binding-1 slot takes a FILLER (`a`). Production routes here through
-    /// [`Self::matmul_fma`] (the weight's own BDA address); parity tests call it directly with an
-    /// explicit arena address.
+    /// Arena-addressed body of [`Self::matmul_fma`] (see `crate::gemm::native_gemm_fma_spv`):
+    /// the weight read by 64-bit address `arena_addr` (a resident weight's BDA or a streamed pool
+    /// slot's arena base). The vacated binding-1 slot takes a FILLER (`a`). The production entry:
+    /// the adapter's `nc_prefill_gemm` calls it for the non-coopmat tier's `NcGemm::Fma` arm,
+    /// resident and streamed alike.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_fma_at(
         &self,
@@ -3199,10 +3202,14 @@ impl<'a> Recorder<'a> {
     /// range — bits shifted `<<16` into f32 registers, no f16 clamp and no upconverted weight
     /// copy). Shared-memory fma warptile (BM=64×BN=64×BK=32, 256 threads, TM=TN=4 register
     /// block — see `native_gemm_fma.comp` for the Intel Arc design constraints: no subgroup
-    /// ops, no f16 extensions, 16.5 KB LDS, modest registers). Selected by the adapter's
-    /// non-coopmat tier (`nc_fma`, `!caps.f16_coopmat`); beats the per-row scalar GEMVs by
+    /// ops, no f16 extensions, 16.5 KB LDS, modest registers). Beats the per-row scalar GEMVs by
     /// amortizing each weight element across the 64-row tile, does NOT need to beat coopmat.
     /// `c` is `ceil(m/64)*64` rows (the usual padded-GEMM convention). Requires `n%64`, `k%32`.
+    ///
+    /// This wrapper reads a bound weight buffer `w` at its own BDA address and has no production
+    /// caller: the adapter's non-coopmat tier (`NcGemm::Fma`, `!caps.f16_coopmat`) calls
+    /// [`Self::matmul_fma_at`] with the address itself. Kept for the parity tests that hold a
+    /// weight buffer rather than an address.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_fma(
         &self,

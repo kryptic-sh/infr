@@ -2515,14 +2515,15 @@ fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
 }
 
 /// Streamed dense PREFILL parity — the perf-critical path this change adds. A LONG prompt forces a
-/// prefill chunk of m ≫ 16 tokens, which `streamed_gemm_applies` routes through the arena-addressed
-/// coopmat-warp GEMM twins (`native_gemm_warp_*_streamed`: the n128_ag / sk_ag tiles) instead of the
-/// per-row GEMV. Those are the SAME kernels the resident prefill picks, with the weight bytes merely
-/// relocated to an arena slot, so the streamed run must be token-identical to the all-resident run.
-/// (The tests above cover decode's small-m GEMV; a short prompt would never leave it — hence the
-/// length assertion.) Two streamed reps guard the barrier-drop class: the ring→arena copy vs the
-/// 64-bit pointer read is ordered by an explicit barrier the buffer hazard tracker can't see, so a
-/// dropped barrier surfaces as run-to-run nondeterminism.
+/// prefill chunk of m ≫ 16 tokens, which `streamed_gemm_route` routes through the arena-addressed
+/// tiled GEMMs (on a coopmat device the `native_gemm_warp_*_streamed` n128_ag / sk_ag tiles; without
+/// coopmat the dp4a mmq GEMMs when the device has int8 dot, else the per-row GEMV for this Q4_K/Q6_K
+/// model) instead of the per-row GEMV. Those are the SAME kernels the resident prefill picks, with
+/// the weight bytes merely relocated to an arena slot, so the streamed run must be token-identical
+/// to the all-resident run. (The tests above cover decode's small-m GEMV; a short prompt would
+/// never leave it — hence the length assertion.) Two streamed reps guard the barrier-drop class:
+/// the ring→arena copy vs the 64-bit pointer read is ordered by an explicit barrier the buffer
+/// hazard tracker can't see, so a dropped barrier surfaces as run-to-run nondeterminism.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_dense_stream_prefill_matches_resident() {

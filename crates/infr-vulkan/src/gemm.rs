@@ -858,8 +858,9 @@ pub(crate) fn native_gemm_mmq_q6k_spv() -> &'static [u32] {
 }
 /// The `-DSTREAMED` dense tiled dp4a (mmq) GEMM (kernel-cache name + SPIR-V) — the weight read from
 /// a `bufferDeviceAddress` arena; the sole weight build for the dense mmq set. Production
-/// dispatches it via [`crate::recorder::Recorder::matmul_mmq`]; parity tests call
-/// [`crate::recorder::Recorder::matmul_mmq_at`] directly with an explicit arena address. The `_xp*` EXPERT_GRID twins are also emitted (same gate in build.rs) but get their lookup
+/// dispatches it via [`crate::recorder::Recorder::matmul_mmq_at`] (the adapter's
+/// `nc_prefill_gemm`, with a resident weight's BDA or a streamed slot's arena base);
+/// [`crate::recorder::Recorder::matmul_mmq`] is the bound-buffer wrapper the parity tests use. The `_xp*` EXPERT_GRID twins are also emitted (same gate in build.rs) but get their lookup
 /// when the expert router grows an `arena: Option<u64>` arm at integration time.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_dense_spv(
@@ -963,7 +964,9 @@ pub(crate) fn linear_res_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V (kernel-cache name + words) for [`native_gemm_fma_kernel_name`]'s pick; the sole weight
-/// build — production dispatches it via [`crate::recorder::Recorder::matmul_fma`].
+/// build — production dispatches it via [`crate::recorder::Recorder::matmul_fma_at`] (the
+/// adapter's `nc_prefill_gemm`, resident or streamed); [`crate::recorder::Recorder::matmul_fma`]
+/// is the bound-buffer wrapper the parity tests use.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_fma_spv(
     dtype: infr_core::DType,

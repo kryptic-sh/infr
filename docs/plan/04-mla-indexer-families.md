@@ -21,12 +21,11 @@ column is what those names imply and nothing more.
 1. **Finish `deepseek4`** — already the first candidate in `plan.md`, tracked as
    B-DSV4-WIRING and B-DSV4-REAL: the compressed-KV tiers. `deepseek41` and
    `qwen4exp` both read compress ratios, so this unblocks the most.
-2. **`mistral-large4`** — the shortest file and the smallest delta by name. Read
-   it in full first; the unknowns are what `ssmax` computes (the graph scales
-   positions through `build_inp_attn_scale`), the KV source map (layers sharing
-   another layer's KV), and the model's size, which the builder does not name
-   (`type` is always unknown) — whether any published file fits the 7900 XTX
-   resident or needs streaming is a step-0 question.
+2. **`mistral-large4`** — read in full on 2026-11-13 and scoped as its own
+   phase, [07-mistral-large4.md](07-mistral-large4.md): one new op (a per-head
+   scale on the query), the rest configuration and graph assembly. The guess in
+   the table above held for the tensors it named and missed the removals (no
+   query LoRA, no router bias, no YaRN boost on the score).
 3. **Hyper-connections**, as a shared building block: they appear in
    `glm5-next`, `deepseek41` and `qwen4exp`. Build once, with a synthetic-model
    test in the style of `tests/synthetic_deepseek2.rs`, before any of the three.

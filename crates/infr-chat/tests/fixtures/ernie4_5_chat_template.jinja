@@ -1,0 +1,24 @@
+{%- if not add_generation_prompt is defined -%}
+    {%- set add_generation_prompt = true -%}
+{%- endif -%}
+{%- if not cls_token is defined -%}
+    {%- set cls_token = "<|begin_of_sentence|>" -%}
+{%- endif -%}
+{%- if not sep_token is defined -%}
+    {%- set sep_token = "<|end_of_sentence|>" -%}
+{%- endif -%}
+{{- cls_token -}}
+{%- for message in messages -%}
+    {%- if message["role"] == "user" -%}
+        {{- "User: " + message["content"] + "
+" -}}
+    {%- elif message["role"] == "assistant" -%}
+        {{- "Assistant: " + message["content"] + sep_token -}}
+    {%- elif message["role"] == "system" -%}
+        {{- message["content"] + "
+" -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+    {{- "Assistant: " -}}
+{%- endif -%}

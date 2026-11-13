@@ -3998,6 +3998,9 @@ fn arch_sampling(arch: &str) -> (f32, usize, f32) {
         // SmolLM3 (Hugging Face): the model card and generation_config recommend temp 0.6 /
         // top_p 0.95 and name no top_k, so top_k stays off as for Llama.
         SMOLLM3 => (0.6, 0, 0.95),
+        // ERNIE 4.5 (Baidu): the checkpoint's generation_config.json sets temp 0.8 / top_p 0.8
+        // and names no top_k.
+        ERNIE4_5 => (0.8, 0, 0.8),
         // DeepSeek: neutral chat default. The family publishes no per-arch recommendation, so all
         // four arch strings stay on the same neutral values rather than on invented ones; a file
         // that declares its own (`general.sampling.*`, or a `generation_config.json` sibling)
@@ -4943,6 +4946,8 @@ mod tests {
         assert_eq!(arch_sampling(LLAMA), (0.6, 0, 0.9));
         // SmolLM3: Llama's top_k off, with its own top_p.
         assert_eq!(arch_sampling(SMOLLM3), (0.6, 0, 0.95));
+        // ERNIE 4.5: its generation_config.json's temp and top_p, top_k off.
+        assert_eq!(arch_sampling(ERNIE4_5), (0.8, 0, 0.8));
     }
 
     /// A `deepseek4` GGUF carrying `extra` metadata, written to `dir/model.gguf` (a directory of

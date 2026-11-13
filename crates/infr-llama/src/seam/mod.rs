@@ -432,8 +432,9 @@ pub(crate) fn generate_dense_cpu(
 /// [`generate_dense_cpu`] on a caller-supplied `CpuBackend`, so a comparison can pick the
 /// REFERENCE backend ([`CpuBackend::reference`]) instead of the production int8-activation
 /// kernels. The distinction matters at low bit-widths: the int8 activation quant carries ~4e-3
-/// relative error on every quant dtype, which is invisible at Q4_K but flips greedy tokens at
-/// Q2_K — so a backend-vs-backend token comparison must be scored against the reference mode.
+/// relative error on every quant dtype, which flips greedy tokens at Q2_K and can still flip a
+/// near tie at Q4_K — so a backend-vs-backend token comparison must be scored against the
+/// reference mode.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_cpu_mode(

@@ -1901,9 +1901,10 @@ impl SeamModel {
     /// [`Self::generate_cpu`] on the REFERENCE CPU backend ([`infr_cpu::CpuBackend::reference`]):
     /// quantized weights are decoded to f32 and dotted in f32, so the run carries the weight's own
     /// quantization error and nothing else. The production path quantizes ACTIVATIONS to int8
-    /// (llama.cpp's `vec_dot_*_q8_K` regime) at ~4e-3 relative error, which is invisible at Q4_K+
-    /// but flips greedy tokens at Q2_K — so this, not `generate_cpu`, is the oracle a GPU-vs-CPU
-    /// token comparison must be scored against. Slower; not what the CPU goldens pin.
+    /// (llama.cpp's `vec_dot_*_q8_K` regime) at ~4e-3 relative error. That flips greedy tokens at
+    /// Q2_K, and at Q4_K it can still flip a near tie (ERNIE 4.5 0.3B Q4_K_M, B167) — so this, not
+    /// `generate_cpu`, is the oracle a GPU-vs-CPU token comparison must be scored against, on a
+    /// prompt whose margins clear that error. Slower; not what the CPU goldens pin.
     pub fn generate_cpu_reference(
         &self,
         prompt: &str,

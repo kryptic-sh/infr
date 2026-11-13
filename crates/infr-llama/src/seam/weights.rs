@@ -103,7 +103,7 @@ pub(super) struct AttnW {
     pub(super) wq: TensorId,
     pub(super) wk: TensorId,
     pub(super) wv: Option<TensorId>,
-    // Qwen2/2.5 q/k/v projection biases (`Config::qkv_bias`); `None` on every bias-free arch.
+    // q/k/v projection biases (`Config::qkv_bias`, e.g. Qwen2/2.5); `None` on a bias-free file.
     pub(super) qb: Option<TensorId>,
     pub(super) kb: Option<TensorId>,
     pub(super) vb: Option<TensorId>,

@@ -62,8 +62,10 @@ pub struct Config {
     pub eos_ids: Vec<u32>,
     /// Qwen3-style per-head RMSNorm on Q and K before RoPE.
     pub qk_norm: bool,
-    /// Qwen2/2.5 add a learned bias to the q/k/v projections (`Wx + b`); Qwen3 dropped them. o-proj
-    /// and FFN stay bias-free. `true` only for `arch == "qwen2"`.
+    /// The file carries a learned bias on every layer's q/k/v projections (`Wx + b`), which the
+    /// seam adds; o-proj and FFN stay bias-free. Decided by the tensors, as llama.cpp decides it,
+    /// for every arch whose reference builds through `build_qkv` — see `qkv_projection_biases`.
+    /// Qwen2/2.5 are the files that ship them.
     pub qkv_bias: bool,
     /// qwen2 needs the NEOX (rotate-half) RoPE but rides the no-qknorm path, whose `Op::Rope` is the
     /// INTERLEAVED (NORM) rotation — llama-arch GGUFs get that layout from the converter's q/k row
@@ -606,7 +608,8 @@ impl Config {
             | crate::arch::DEEPSEEK4
             | crate::arch::BITNET
             | crate::arch::BITNET_B158
-            | crate::arch::SMOLLM3 => false,
+            | crate::arch::SMOLLM3
+            | crate::arch::ERNIE4_5 => false,
             crate::arch::QWEN3
             | crate::arch::QWEN3_MOE
             | crate::arch::GEMMA3
@@ -626,10 +629,9 @@ impl Config {
                 crate::arch::QWEN35_MOE,
             ),
         };
-        // Qwen2/2.5 bias their q/k/v projections (Qwen3 removed them); every other supported arch is
-        // bias-free on attention. They also keep the HF rotate-half q/k row order (see the
-        // `permute_qk_neox` field doc).
-        let qkv_bias = arch == crate::arch::QWEN2;
+        // Qwen2/2.5 keep the HF rotate-half q/k row order (see the `permute_qk_neox` field doc).
+        // Their q/k/v projection biases are found by `qkv_projection_biases` below, as every
+        // arch's are.
         // bitnet, like qwen2, uses NEOX rope (llama.cpp maps LLM_ARCH_BITNET to LLAMA_ROPE_TYPE_NEOX)
         // and its GGUF keeps attn_q/attn_k in HF rotate-half order — permute the rows at load so the
         // no-qknorm interleaved `Op::Rope` reproduces NEOX (see the `permute_qk_neox` field doc).
@@ -1541,6 +1543,7 @@ impl Config {
             (0, 0.0, 0.0, 0.0, 0, 0.0)
         };
         refuse_unapplied_weight_scales(g, &arch, gemma4_moe || diffusion_gemma)?;
+        let qkv_bias = qkv_projection_biases(g, &arch, n_layer)?;
         // See `Config::faithful_ctx_limit`. deepseek32's builder reads neither temperature key,
         // so only the deepseek2 string is checked.
         let ctx_limit = if llama4 && no_rope_step > 0 {
@@ -1797,9 +1800,14 @@ fn applied_weight_scales(arch: &str) -> Vec<&'static str> {
             add(&EXPS_SCALES);
         }
         // `llama_model_llama4::graph`, `llama_model_qwen2::graph`, `llama_model_gemma3::graph`,
-        // `llama_model_deepseek::graph`, `llama_model_smollm3::graph`: build_qkv, build_attn(wo_s),
-        // output_s; every FFN scale NULL.
-        arch::LLAMA4 | arch::QWEN2 | arch::GEMMA3 | arch::DEEPSEEK | arch::SMOLLM3 => {
+        // `llama_model_deepseek::graph`, `llama_model_smollm3::graph`, `llama_model_ernie4_5::graph`:
+        // build_qkv, build_attn(wo_s), output_s; every FFN scale NULL.
+        arch::LLAMA4
+        | arch::QWEN2
+        | arch::GEMMA3
+        | arch::DEEPSEEK
+        | arch::SMOLLM3
+        | arch::ERNIE4_5 => {
             add(&QKV_SCALES);
             add(&["attn_output", "output"]);
         }
@@ -1900,6 +1908,62 @@ fn refuse_unapplied_weight_scales(g: &Gguf, arch: &str, dual_moe: bool) -> Resul
         );
     }
     Ok(())
+}
+
+/// The archs whose llama.cpp builder loads q/k/v through `create_tensor_qkv` and projects them
+/// through `build_qkv` on the attention path infr runs for them: the loader takes
+/// `attn_q.bias` / `attn_k.bias` / `attn_v.bias` as optional, and `build_qkv` adds each one the
+/// file carries, whatever the arch. Qwen2/2.5 are the files that ship them.
+const QKV_BIAS_ARCHS: [&str; 9] = [
+    crate::arch::LLAMA,
+    crate::arch::LLAMA4,
+    crate::arch::QWEN2,
+    crate::arch::QWEN3,
+    crate::arch::QWEN3_MOE,
+    crate::arch::GEMMA3,
+    crate::arch::DEEPSEEK,
+    crate::arch::SMOLLM3,
+    crate::arch::ERNIE4_5,
+];
+
+/// Whether this file's attention layers carry q/k/v projection biases that infr must add
+/// (`Config::qkv_bias`). For a [`QKV_BIAS_ARCHS`] arch that is decided by the tensors, as the
+/// reference decides it: all three on every layer turns the bias path on, none leaves it off, and
+/// anything in between — which the reference would apply bias by bias and layer by layer, and
+/// infr's single flag cannot — is refused naming the first missing tensor. qwen35/qwen35moe also
+/// build through `build_qkv`, but infr's gated-Q attention takes no bias, so a file carrying one
+/// is refused. The other archs' builders never load these tensors, so they are left unread as the
+/// reference leaves them.
+fn qkv_projection_biases(g: &Gguf, arch: &str, n_layer: usize) -> Result<bool> {
+    const BIASES: [&str; 3] = ["attn_q.bias", "attn_k.bias", "attn_v.bias"];
+    let names: std::collections::HashSet<&str> =
+        g.tensors().iter().map(|t| t.name.as_str()).collect();
+    let wanted = (0..n_layer).flat_map(|l| BIASES.map(|b| format!("blk.{l}.{b}")));
+    let (present, missing): (Vec<String>, Vec<String>) =
+        wanted.partition(|n| names.contains(n.as_str()));
+    if present.is_empty() {
+        return Ok(false);
+    }
+    if !QKV_BIAS_ARCHS.contains(&arch) {
+        if matches!(arch, crate::arch::QWEN35 | crate::arch::QWEN35_MOE) {
+            bail!(
+                "{}: this {arch} model carries attention projection biases, which llama.cpp \
+                 adds and infr's {arch} attention does not",
+                present[0]
+            );
+        }
+        return Ok(false);
+    }
+    if let Some(first) = missing.first() {
+        bail!(
+            "{first} is missing while {} is present: infr adds q/k/v projection biases only when \
+             every layer carries all three ({} of {} found)",
+            present[0],
+            present.len(),
+            present.len() + missing.len()
+        );
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -2455,6 +2519,85 @@ mod tests {
         assert!((0..cfg.n_layer).all(|l| !cfg.is_nope_layer(l)));
     }
 
+    /// ernie4_5 is the llama block parsed as written: the head width comes from
+    /// `attention.key_length` (wider than `n_embd / n_head` in the 0.3B file), Q/K stay in the
+    /// file's row order (its converter does not permute them and the reference ropes them NORM),
+    /// and none of the attention extras another arch hangs on this path is switched on.
+    #[test]
+    fn ernie4_5_parses_as_the_llama_block() {
+        let keys = [
+            ("block_count", 2),
+            ("embedding_length", 8),
+            ("attention.head_count", 2),
+            ("attention.head_count_kv", 1),
+            ("attention.key_length", 8),
+            ("attention.value_length", 8),
+            ("feed_forward_length", 16),
+        ];
+        let cfg = config_from_fixture("ernie4_5", &arch_fixture("ernie4_5", &keys))
+            .expect("ernie4_5 fixture must parse");
+        assert_eq!(cfg.n_embd / cfg.n_head, 4);
+        assert_eq!((cfg.head_dim, cfg.rope_dim), (8, 8));
+        assert!(!cfg.permute_qk_neox && !cfg.qkv_bias && !cfg.qk_norm);
+        assert!(!cfg.sub_norm && !cfg.llama4 && !cfg.kq_l2norm && !cfg.rope_freq_factors);
+        assert!((0..cfg.n_layer).all(|l| !cfg.is_nope_layer(l)));
+    }
+
+    /// q/k/v projection biases follow the tensors on every arch whose reference builds through
+    /// `build_qkv` (`qkv_projection_biases`): all three on every layer turn the path on, a partial
+    /// set is refused naming the missing tensor, qwen35's attention refuses them, and an arch whose
+    /// reference never loads them (bitnet) leaves them unread.
+    #[test]
+    fn qkv_biases_follow_the_tensors() {
+        const KEYS: &[(&str, u32)] = &[
+            ("block_count", 2),
+            ("embedding_length", 8),
+            ("attention.head_count", 2),
+            ("feed_forward_length", 16),
+        ];
+        let bias = |name: String| TensorSpec::new(name, vec![8], Fill::Exact(vec![0.0; 8]));
+        let with = |arch: &str, keys: &[(&str, u32)], names: &[String]| {
+            let mut m = arch_fixture(arch, keys);
+            m.tensors.extend(names.iter().cloned().map(bias));
+            m
+        };
+        let all: Vec<String> = (0..2)
+            .flat_map(|l| ["q", "k", "v"].map(|p| format!("blk.{l}.attn_{p}.bias")))
+            .collect();
+
+        for arch in ["ernie4_5", "llama", "qwen2"] {
+            let cfg = config_from_fixture(&format!("qkvb-{arch}"), &with(arch, KEYS, &all))
+                .expect("a full set of biases must parse");
+            assert!(cfg.qkv_bias, "{arch}: biases present but not applied");
+            let cfg = config_from_fixture(&format!("qkvb-none-{arch}"), &arch_fixture(arch, KEYS))
+                .expect("no biases must parse");
+            assert!(!cfg.qkv_bias, "{arch}: no biases but the path is on");
+        }
+
+        // Layer 1 lacks its v bias.
+        let Err(err) = config_from_fixture("qkvb-partial", &with("ernie4_5", KEYS, &all[..5]))
+        else {
+            panic!("a partial set of biases must be refused");
+        };
+        assert!(
+            err.to_string().starts_with("blk.1.attn_v.bias is missing"),
+            "{err}"
+        );
+
+        let mut qwen35_keys = QWEN35_BASE_KEYS.to_vec();
+        qwen35_keys.push(("ssm.conv_kernel", 4));
+        let q_bias = ["blk.0.attn_q.bias".to_string()];
+        let Err(err) = config_from_fixture("qkvb-qwen35", &with("qwen35", &qwen35_keys, &q_bias))
+        else {
+            panic!("qwen35 must refuse an attention bias");
+        };
+        assert!(err.to_string().starts_with(&q_bias[0]), "{err}");
+
+        let cfg = config_from_fixture("qkvb-bitnet", &with("bitnet", KEYS, &all))
+            .expect("bitnet's reference never loads these biases");
+        assert!(!cfg.qkv_bias);
+    }
+
     /// A `.scale` weight scale is refused only where the arch's llama.cpp builder APPLIES it and
     /// infr does not. One the builder ignores (passes NULL for) loads as before — one accepted
     /// case per arch family below, each a scale the converter really writes for NVFP4 files —
@@ -2494,6 +2637,8 @@ mod tests {
             ("qwen2", DENSE, "blk.0.ffn_down.scale"),
             // `llama_model_smollm3::graph`: build_ffn's scales NULL.
             ("smollm3", DENSE, "blk.0.ffn_down.scale"),
+            // `llama_model_ernie4_5::graph`: build_ffn's scales NULL.
+            ("ernie4_5", DENSE, "blk.0.ffn_up.scale"),
             // `llama_model_gemma3::graph`: build_ffn's scales NULL.
             ("gemma3", DENSE, "blk.0.ffn_gate.scale"),
             // `llama_model_deepseek2::graph`: build_moe_ffn without the `*_exps_s` arguments —
@@ -2519,6 +2664,7 @@ mod tests {
             ("llama", DENSE, "output.scale"),
             ("llama4", &llama4_keys[..], "blk.0.attn_output.scale"),
             ("smollm3", DENSE, "blk.0.attn_q.scale"),
+            ("ernie4_5", DENSE, "blk.0.attn_output.scale"),
             ("deepseek2", &deepseek2_keys[..], "blk.0.attn_output.scale"),
             ("qwen35", &qwen35_keys[..], "blk.0.ssm_out.scale"),
         ] {

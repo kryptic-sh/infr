@@ -65,6 +65,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   decode replay, so decode re-records each token. The template's `/think` and
   `/no_think` modes follow `--think` / `--no-think`; its tool definitions
   (`xml_tools`) are not passed yet.
+- **ERNIE 4.5 dense (`ernie4_5`).** Baidu's ERNIE-4.5-0.3B runs on the CPU and
+  Vulkan backends, including the record-once decode replay: the llama block with
+  heads wider than `n_embd / n_head`, its SentencePiece vocabulary and its chat
+  template. Its logits match llama.cpp's on the F16 file. The MoE sibling
+  `ernie4_5-moe` (21B-A3B) is not supported yet.
 - **`VulkanBackend::decode_recordings` and
   `DenseVulkanSession::decode_recordings`**: how many record-once decode
   recordings the backend has made, which tells a decode replayed from one
@@ -185,6 +190,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Attention q/k/v projection biases are added on every arch that carries them,
+  not only `qwen2`.** llama.cpp loads `attn_q.bias` / `attn_k.bias` /
+  `attn_v.bias` as optional for the llama-shaped families (`llama`, `llama4`,
+  `qwen2`, `qwen3`, `qwen3moe`, `gemma3`, `deepseek`, `smollm3`, `ernie4_5`) and
+  adds whichever are present; infr read them for `qwen2` only and ran any other
+  file that carried them without them. They are now added when every layer
+  carries all three; a file with only some of them is refused naming the first
+  missing one, and `qwen35` / `qwen35moe` refuse them. A `qwen2` file without
+  biases now loads instead of failing.
 - **Chat templates render their whitespace the way llama.cpp renders it.** The
   newline after a `{% %}` or `{# #}` tag and the indentation before one are now
   dropped (Jinja's `trim_blocks` and `lstrip_blocks`, which llama.cpp's template

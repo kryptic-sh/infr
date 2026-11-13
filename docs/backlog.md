@@ -4532,3 +4532,131 @@ does not cover, and what was decided:
   GB end-to-end configuration was not rerun. B164's anomaly (`infr-core`'s build
   of the old pager ran ~1.5× slower than the same source built alone) no longer
   reproduces with the new code; its cause was never identified.
+
+### B166 — infr never adds a BOS outside the chat template, whatever `add_bos_token` says (2026-11-13)
+
+**Tag:** chat · tokenizer · **Needs:** a decision on honouring `add_bos_token`
+
+**The rule, read in the code:** nothing in infr reads
+`tokenizer.ggml.add_bos_token`. `SeamModel::encode` calls
+`Tokenizer::encode(text, false)`, which adds no special token, and `render_core`
+(`crates/infr-chat/src/template.rs`) hands the BOS to the chat template only as
+the `bos_token` variable. So a prompt starts with a BOS exactly when the
+template writes one, for every model, and a raw prompt (no template) never gets
+one. llama.cpp prepends the BOS whenever the file sets `add_bos_token`. There is
+no ERNIE-specific rule in either engine; for ERNIE 4.5, infr matching the
+reference is a consequence of that general policy, not of a check.
+
+**What the reference wants for ERNIE 4.5:** Baidu's `tokenizer_config.json` for
+ERNIE-4.5-0.3B-PT has `add_bos_token: false`, and the model card tokenizes the
+chat render with `add_special_tokens=False`, so the reference input starts with
+the template's own `<|begin_of_sentence|>` and no `<s>`. The unsloth 0.3B GGUF
+sets `add_bos_token = true` (the 21B-A3B GGUF sets it `false`), so llama.cpp
+prepends `<s>` on the 0.3B file: `llama-completion -sp` prints
+`<s><|begin_of_sentence|> User: …`.
+
+**It changes the output.** Measured 2026-11-13 on the CPU unless noted,
+`--temp 0`, on the chat-rendered "What is the capital of France? Answer in one
+paragraph.":
+
+- llama.cpp F16 with its `<s>`: "The capital of France is Paris."
+- llama.cpp F16 with `add_bos_token` overridden to false: "The capital of France
+  is Paris. It is located in the heart of the country and is known for its rich
+  history, cultural attractions, and international influence." infr F16 on the
+  CPU and on Vulkan0 prints exactly this.
+- llama.cpp Q4_K_M with its `<s>`: "France is the capital of France."
+- llama.cpp Q4_K_M without it: "France is known for its rich history, culture,
+  and political power. The capital of France is Paris. …"; infr Q4_K_M on the
+  CPU and Vulkan0 starts the same and continues "… is Paris, which is located
+  …".
+
+So on this file infr follows the reference and llama.cpp does not. **The open
+question is the general policy:** a model whose template omits `{{ bos_token }}`
+and whose reference relies on the tokenizer adding it would lose its BOS in
+infr. None of the cached families was checked for that. The options are to
+honour `add_bos_token` (then this ERNIE file regresses to llama.cpp's behaviour
+unless its flag is overridden), or to keep the template-only rule and record it
+as deliberate.
+
+**Related, not verified:** the same `tokenizer_config.json` has
+`add_prefix_space: false`. The converter writes `add_space_prefix` from that key
+(`Ernie4_5Model.set_vocab` in `conversion/ernie.py`), but the unsloth 0.3B GGUF
+carries no `tokenizer.ggml.add_space_prefix`, so both llama.cpp and infr prefix
+a space (the tokenizer test pins llama.cpp's ids). Whether the Hugging Face
+tokenizer agrees was not checked.
+
+Also seen, not a bug: `<|end_of_sentence|>`, which the template writes after
+each assistant turn, is in neither engine's end-of-generation list. The 0.3B
+model ends its turns with `</s>`, the declared EOS.
+
+### B167 — the ERNIE 4.5 golden runs nowhere by default, and the ocean prompt is a near tie at Q4_K_M (2026-11-13)
+
+**Tag:** tests · ci
+
+`cpu_golden_ernie4_5` and `ernie4_5_tokenizes_as_llama_cpp`
+(`crates/infr-llama/tests/cpu_backend.rs`) are `#[ignore]`d for the same reason
+as B161: the `cpu-goldens` CI job downloads only Gemma 3 1B and Qwen3 0.6B. The
+golden's two 32-token hashes were captured on Windows only; no Linux run has
+confirmed them. To run them in CI: add `unsloth/ERNIE-4.5-0.3B-PT-GGUF`
+`ERNIE-4.5-0.3B-PT-Q4_K_M.gguf` (240645600 bytes) to that job, drop the
+`#[ignore]`s, and wrap a hash in `per_os` if Linux differs.
+
+`gpu_seam_matches_cpu_ernie4_5` runs the ocean prompt on the F16 file (723955168
+bytes) because on Q4_K_M it fails on both GPUs: after "The ocean is a vast," the
+f32-activation CPU oracle (`generate_cpu_reference`) picks " vast", while the
+Vulkan decode, infr's production CPU path and llama.cpp's CPU pick " dynamic".
+Prefill logits at that token, measured 2026-11-13 (they reproduce the review's
+figures):
+
+| path                         | " dynamic" (11290) | " vast" (12791) | top-1 by |
+| ---------------------------- | -----------------: | --------------: | -------- |
+| infr production CPU (int8)   |          16.520996 |       16.190592 | 0.330    |
+| Vulkan0 prefill (7900 XTX)   |           16.47949 |       16.536148 | 0.057    |
+| Vulkan1 prefill (integrated) |          16.530031 |       16.559702 | 0.030    |
+
+The reference backend's own value is not exposed (no reference-mode prefill).
+The docs on `SeamModel::generate_cpu_reference`, `seam_vulkan_matches_cpu`,
+`CpuBackend::reference` and `generate_dense_cpu_mode` said the int8 activation
+error is invisible at Q4_K and above; they now say it can flip a near tie.
+`gpu_seam_matches_cpu_ernie4_5_q4_k_m` covers the Q4_K_M kernels on a prompt
+chosen for its margins instead. Its 9-token answer is clear by at least 1.46 on
+every path, which also makes it blind to a Vulkan rope base off by 1000x (the
+32-token F16 case catches that one); it does catch a halved attention scale.
+
+### B168 — `Op::MoeFfn::exp_probs_b`'s doc says the bias is added to the logits (2026-11-13)
+
+**Tag:** docs · moe
+
+The field doc in `crates/infr-core/src/graph.rs` says the router bias is "added
+to logits for SELECTION only". The reference adds it to the GATED probabilities
+(`selection_probs = ggml_add(probs, exp_probs_b)` in `build_moe_ffn`), and so do
+the CPU backend (`sel_probs[e] = probs[e] + bias[e]`) and the Vulkan
+`moe_topk.comp` for sigmoid and sqrt-softplus gating. For softmax gating the
+Vulkan shader does add it to the raw logit, which is the bug item 3 of
+`docs/plan/02-ernie4-5.md` scopes; the doc should be corrected with that fix.
+
+Which files that can reach today: only `deepseek2` and `deepseek4` load
+`exp_probs_b` in infr (`deepseek2` covers `deepseek32`), and the real files of
+both that carry one are sigmoid or sqrt-softplus gated (V3, V3.2, V4), so no
+file infr is known to run takes the wrong path. A softmax-gated `deepseek2` file
+with a router bias would select the wrong experts on Vulkan today. Mistral Large
+3 is the softmax-gated `deepseek2` family: shard 1 of 9 of
+`unsloth/Mistral-Large-3-675B-Instruct-2512-GGUF` Q4_K_M (read with a 16 MiB
+range fetch; it carries the routers of layers 3–8) has `expert_gating_func = 1`
+and no `exp_probs_b`, and `conversion/mistral.py` does not name a correction
+bias. The other shards were not read.
+
+### B169 — the llama.cpp logit oracle passes an ERNIE 4.5 with permuted Q/K (2026-11-13)
+
+**Tag:** tests · oracle
+
+`cpu_prefill_matches_llama_debug_dump` scores infr against a `llama-debug` dump
+on mutual top-5 containment and a probability cosine above 0.7, floors set for
+DeepSeek's quantized noise. With `ernie4_5` mutated to permute its Q/K rows, the
+F16 story-prompt comparison still passed (probability cosine 0.9992, shared
+top-5 4/5) while the max absolute logit difference it now prints went from
+0.0057 to 4.27. So a green run of this test does not show an arch is right; the
+printed max difference does, read against the F16 figures in
+`docs/plan/02-ernie4-5.md`. Making it a check needs per-file floors (an F16 dump
+can be held to about 0.01, a Q4_K_M one cannot: llama.cpp's own CPU and Vulkan
+differ by 1.2 on ERNIE 4.5 0.3B Q4_K_M).

@@ -31,6 +31,17 @@ pub const LLAMA4: &str = "llama4";
 /// the NoPE layers change nothing else: no chunked attention, no temperature, no L2-norm, no MoE
 /// (`llama_model_smollm3`, `src/models/smollm3.cpp`).
 pub const SMOLLM3: &str = "smollm3";
+/// ERNIE 4.5 dense (Baidu's ERNIE-4.5-0.3B): the [`LLAMA`] block verbatim (RMS pre-norms,
+/// separate Q/K/V, NORM/interleaved rope, parallel SiLU FFN, output tied to the embedding when
+/// `output.weight` is absent). The converter writes Q/K without llama's permute and the reference
+/// ropes them NORM all the same, so no row permute applies here either; the head width
+/// (`attention.key_length`) is not `n_embd / n_head` in the 0.3B file. The reference loads
+/// optional `attn_q/k/v.bias` and adds them when present (so does infr: `Config::qkv_bias` follows
+/// the tensors; the 0.3B file has none), loads an optional `attn_output.bias` it never applies,
+/// and reads `rope.dimension_sections` only for the multimodal rope its text path does not use
+/// (`llama_model_ernie4_5`, `src/models/ernie4-5.cpp`). The MoE sibling `ernie4_5-moe` is not
+/// supported.
+pub const ERNIE4_5: &str = "ernie4_5";
 /// Qwen2/2.5 (incl. Qwen2.5-Coder, R1-Distill-Qwen). Llama path + q/k/v projection biases; ships
 /// HF rotate-half q/k order, so the loader permutes rows (`Config::permute_qk_neox`).
 pub const QWEN2: &str = "qwen2";
@@ -137,6 +148,7 @@ pub const TRANSFORMER: &[&str] = &[
     BITNET_B158,
     DEEPSEEK,
     SMOLLM3,
+    ERNIE4_5,
 ];
 
 /// Read `general.architecture` from a GGUF WITHOUT a full model load (mirrors
@@ -225,4 +237,5 @@ pub const ALL: &[&str] = &[
     QWEN35,
     QWEN35_MOE,
     SMOLLM3,
+    ERNIE4_5,
 ];

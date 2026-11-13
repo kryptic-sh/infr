@@ -7224,6 +7224,60 @@ mod tests {
         model
     }
 
+    /// q/k/v projection biases are added on any arch whose reference builds through `build_qkv`,
+    /// not only on qwen2 (`config::qkv_projection_biases`). On the llama-shaped `ernie4_5` fixture:
+    /// zero biases must leave the logits exactly where the bias-free file puts them (the path is
+    /// on and adds nothing), and nonzero ones must move them (the path is on and adds them).
+    #[test]
+    fn qkv_biases_are_added_on_a_non_qwen2_arch() {
+        let prompt: Vec<u32> = (0..6u32).map(|i| (i * 5 + 3) % Q35_VOCAB as u32).collect();
+        let cpu = infr_cpu::CpuBackend::new();
+        let width = Q35_NE; // two heads of `Q35_NE / 2`, as `llama_gguf` builds q, k and v
+        let with_biases = |value: &dyn Fn(usize) -> f32| {
+            let mut m = llama_gguf("ernie4_5", None);
+            for proj in ["attn_q", "attn_k", "attn_v"] {
+                m.tensors.push(TensorSpec::new(
+                    format!("blk.0.{proj}.bias"),
+                    vec![width],
+                    Fill::Exact((0..width).map(value).collect()),
+                ));
+            }
+            m
+        };
+        let logits = |tag: &str, m: &SyntheticModel| {
+            let (g, cfg) = open_synthetic(tag, m);
+            let l = fresh_logits(
+                &cpu,
+                &crate::seam::cpu_upload_bind(&cpu),
+                &g,
+                &cfg,
+                &EngineConfig::default(),
+                &prompt,
+            );
+            (cfg.qkv_bias, l)
+        };
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        let (on, plain) = logits("qkvb-none", &llama_gguf("ernie4_5", None));
+        assert!(!on, "a file without biases must not turn the bias path on");
+        let (on, zero) = logits("qkvb-zero", &with_biases(&|_| 0.0));
+        assert!(
+            on,
+            "a file carrying all three biases must turn the bias path on"
+        );
+        assert_eq!(max_diff(&zero, &plain), 0.0, "zero biases moved the logits");
+        let (_, biased) = logits("qkvb-set", &with_biases(&|i| ((i % 7) as f32 - 3.0) * 0.25));
+        let moved = max_diff(&biased, &plain);
+        assert!(
+            moved > 1e-3,
+            "nonzero biases left the logits in place ({moved})"
+        );
+    }
+
     /// The last prompt token's logits for `prompt` on `be`, from a fresh slot.
     fn fresh_logits(
         be: &dyn infr_core::backend::Backend,

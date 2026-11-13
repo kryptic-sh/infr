@@ -886,9 +886,11 @@ fn gpu_seam_flash_matches_cpu() {
 ///
 /// The oracle is the REFERENCE CPU backend (`CpuBackend::reference`: weights decoded to f32, f32
 /// dot), NOT the production int8-activation kernels. Those carry ~4e-3 relative error on every
-/// quant dtype — measured against the host decode: CPU 3.4e-3..4.7e-3 vs Vulkan ~1e-7 — which is
-/// invisible at Q4_K+ but flips a greedy token at Q2_K. Scoring the GPU against the int8 CPU leg
-/// therefore failed the more accurate implementation; the reference mode is the honest oracle.
+/// quant dtype — measured against the host decode: CPU 3.4e-3..4.7e-3 vs Vulkan ~1e-7 — which
+/// flips a greedy token at Q2_K. Scoring the GPU against the int8 CPU leg therefore failed the
+/// more accurate implementation; the reference mode is the honest oracle. At Q4_K the error can
+/// still flip a near tie (ERNIE 4.5 0.3B Q4_K_M on the ocean prompt, B167), so a prompt run here
+/// must have clear top-1 margins along its output.
 fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
     seam_vulkan_matches_cpu_cfg(path, prompt, n, |_| {});
 }
@@ -1740,6 +1742,152 @@ fn gpu_seam_smollm3_decode_records_no_replay() {
     assert_eq!(
         recordings, 0,
         "SmolLM3-3B recorded a replay its NoPE layers cannot be decoded by"
+    );
+}
+
+// ─── ERNIE 4.5 dense (the llama block, SentencePiece vocabulary) ─────────────────
+
+fn ernie4_5_03b() -> Option<PathBuf> {
+    find_gguf(
+        "unsloth--ERNIE-4.5-0.3B-PT-GGUF",
+        "ERNIE-4.5-0.3B-PT-Q4_K_M.gguf",
+    )
+}
+
+fn ernie4_5_03b_f16() -> Option<PathBuf> {
+    find_gguf(
+        "unsloth--ERNIE-4.5-0.3B-PT-GGUF",
+        "ERNIE-4.5-0.3B-PT-F16.gguf",
+    )
+}
+
+/// infr's SentencePiece tokenizer on the ERNIE 4.5 vocabulary gives the ids llama.cpp gives:
+/// `llama-tokenize -f <file> --ids --no-bos --no-escape` (special tokens parsed, its default) on
+/// each string, with llama.cpp `5676dfbe0`. Covers the space prefix and whitespace runs, CJK,
+/// accented Latin, Japanese, Korean, an emoji the vocabulary holds whole (`▁🙂`), byte fallback
+/// (the skin-tone modifier after `👍` and the ZWJ family `👨‍👩‍👧` have no piece, so they encode
+/// as `<0x..>` byte tokens around the ZWJ piece), and the CONTROL tokens the chat template and the
+/// multimodal vocabulary use, which must encode atomically.
+#[test]
+#[ignore = "needs ERNIE-4.5-0.3B-PT in the HF cache"]
+fn ernie4_5_tokenizes_as_llama_cpp() {
+    let path = need_model!(ernie4_5_03b(), "ERNIE-4.5-0.3B-PT");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    let cases: &[(&str, &[u32])] = &[
+        ("Hello world", &[30802, 3135]),
+        (
+            "  leading spaces,   inner   runs\tand\ttabs\n\nnewlines\n",
+            &[
+                269, 8143, 15075, 93938, 269, 10411, 269, 11105, 22, 417, 22, 10066, 23, 23, 1158,
+                6219, 23,
+            ],
+        ),
+        (
+            "北京是中国的首都，它的历史悠久。",
+            &[42854, 93986, 14740, 37102, 93956, 6806, 3731, 57960, 93977],
+        ),
+        (
+            "Ünïcödé café naïve — 日本語のテキスト 한국어 🙂",
+            &[
+                72245, 95964, 93930, 13299, 94039, 89043, 1013, 95964, 698, 2020, 63795, 97290,
+                94867, 68598, 67026, 96553, 80529,
+            ],
+        ),
+        (
+            "ok 👍🏽 family 👨\u{200d}👩\u{200d}👧!",
+            &[
+                3098, 93919, 99877, 253, 172, 156, 202, 3982, 93919, 253, 172, 158, 181, 96395,
+                253, 172, 158, 182, 96395, 253, 172, 158, 180, 94018,
+            ],
+        ),
+        (
+            "<|begin_of_sentence|>User: hi there\nAssistant: ok<|end_of_sentence|></s>",
+            &[
+                100273, 8933, 93963, 6956, 883, 23, 92267, 93963, 3098, 100272, 2,
+            ],
+        ),
+        (
+            "x<mask:1>y <|LOC_5|> 2024-11-13 3.14159",
+            &[
+                843, 100274, 398, 93919, 100302, 269, 5, 3, 5, 7, 93942, 4, 4, 93942, 4, 6, 93919,
+                6, 93937, 4, 7, 4, 8, 12,
+            ],
+        ),
+    ];
+    for (text, want) in cases {
+        assert_eq!(
+            model.encode(text).expect("encode"),
+            *want,
+            "infr and llama.cpp tokenize {text:?} differently"
+        );
+    }
+}
+
+// Captured + verified coherent on Windows: "The capital of France is **Paris**." (the model ends
+// the turn there) and an ocean paragraph ("The ocean is a vast, dynamic body of water …"). How
+// infr's greedy output compares with llama.cpp's is in docs/plan/02-ernie4-5.md. The rendered
+// prompt opens with the template's `<|begin_of_sentence|>` and no `<s>`, as the reference's
+// input does; llama.cpp adds an `<s>` for this file and answers differently (B166).
+const ERNIE4_5_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0xfd644a0cebde4e73),
+    (
+        "Write a short paragraph about the ocean.",
+        32,
+        0x1a643a859ae6ff58,
+    ),
+];
+
+/// CPU-only: ERNIE 4.5 0.3B golden-hash lock — the llama graph with `attention.key_length` heads
+/// wider than `n_embd / n_head`.
+#[test]
+#[ignore = "needs ERNIE-4.5-0.3B-PT in the HF cache"]
+fn cpu_golden_ernie4_5() {
+    let path = need_model!(ernie4_5_03b(), "ERNIE-4.5-0.3B-PT");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    check_golden(&model, ERNIE4_5_GOLDEN);
+}
+
+/// The Vulkan seam must match the CPU oracle token-for-token on ERNIE 4.5 0.3B. Run on the F16
+/// file: at Q4_K_M, after "The ocean is a vast,", the f32-activation oracle picks " vast" where
+/// the Vulkan seam, infr's production CPU path and llama.cpp's CPU all pick " dynamic" and then
+/// agree for the rest of the 32 tokens, so the Q4_K_M weights put this prompt on a near tie
+/// between the two activation regimes rather than on an arch difference.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_ernie4_5() {
+    let path = need_model!(ernie4_5_03b_f16(), "ERNIE-4.5-0.3B-PT F16");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "Write a short paragraph about the ocean.", 32);
+}
+
+/// The Vulkan quantized kernels on ERNIE's shapes (Q4_K/Q6_K projections, 128-wide heads over a
+/// 1024-wide residual) against the CPU oracle, on the Q4_K_M file. The prompt was picked for its
+/// margins: along the whole 9-token answer ("The chemical symbol for gold is **Au**.") the top-1
+/// logit leads the runner-up by at least 1.46 on infr's production CPU prefill and on both GPUs'
+/// prefill (measured 2026-11-13, docs/plan/02-ernie4-5.md), far above the int8-activation error
+/// that splits the ocean prompt above. Past the ninth token the answer reaches a near tie.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_ernie4_5_q4_k_m() {
+    let path = need_model!(ernie4_5_03b(), "ERNIE-4.5-0.3B-PT");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is the chemical symbol for gold?", 9);
+}
+
+/// ERNIE 4.5 writes every K through the rope→WriteKv pair the replay fuses, so its decode is one
+/// record-once replay, as Qwen3's is (see [`gpu_seam_qwen3_decode_replays_from_one_recording`]).
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_ernie4_5_decode_replays_from_one_recording() {
+    let path = need_model!(ernie4_5_03b(), "ERNIE-4.5-0.3B-PT");
+    let mut _tlk = test_serial_lock();
+    let (recordings, n_gen) = vulkan_decode_recordings(&path);
+    assert!(n_gen > 1, "too few tokens decoded to tell the paths apart");
+    assert_eq!(
+        recordings, 1,
+        "ERNIE-4.5-0.3B decoded {n_gen} tokens without the one record-once replay"
     );
 }
 
@@ -4766,6 +4914,16 @@ fn prefill_matches_llama_debug_dump(vulkan: bool) {
     let cos = cosine(&ours, &llama_logits);
     let cos_p = cosine(&softmax(&ours), &softmax(&llama_logits));
     eprintln!("infr/llama.cpp whole-vocab cosine: logits {cos}, probabilities {cos_p}");
+    let max_abs = ours
+        .iter()
+        .zip(&llama_logits)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let shared_top5 = ours_top[..5]
+        .iter()
+        .filter(|(id, _)| theirs_top[..5].iter().any(|(t, _)| t == id))
+        .count();
+    eprintln!("infr/llama.cpp max |logit diff| {max_abs}, shared top-5 ids {shared_top5}/5");
     assert!(
         ours_top[..5].iter().any(|&(id, _)| id == theirs_top[0].0)
             && theirs_top[..5].iter().any(|&(id, _)| id == ours_top[0].0),

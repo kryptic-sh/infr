@@ -300,9 +300,9 @@ impl CpuBackend {
     /// its weight to f32 and takes a plain f32 dot, so the only error left is the weight's own
     /// quantization. The production path instead quantizes the ACTIVATIONS to int8 (the
     /// llama.cpp `vec_dot_*_q8_K` regime) — same arithmetic ggml uses, and ~2-3 orders of
-    /// magnitude cheaper, but it carries ~4e-3 relative error on every dtype. That error is
-    /// invisible at Q4_K+ yet flips greedy tokens at Q2_K, which is why a GPU-vs-CPU token
-    /// comparison must use THIS mode as its oracle rather than the production kernels (see
+    /// magnitude cheaper, but it carries ~4e-3 relative error on every dtype. That error flips
+    /// greedy tokens at Q2_K, and at Q4_K it can still flip a near tie, which is why a GPU-vs-CPU
+    /// token comparison must use THIS mode as its oracle rather than the production kernels (see
     /// `gpu_seam_matches_cpu_qwen3_q2k`): the GPU's f32 dequant GEMV is ~1e-7 against the host
     /// decode, so the int8 CPU leg was the drifting one.
     ///

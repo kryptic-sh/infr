@@ -1271,13 +1271,7 @@ fn moe_ref(
         .map(|e| dot(&router[e * ne..(e + 1) * ne], x))
         .collect();
     let probs: Vec<f32> = match gating {
-        MoeGating::Softmax => {
-            let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut p: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
-            let psum: f32 = p.iter().sum();
-            p.iter_mut().for_each(|v| *v /= psum);
-            p
-        }
+        MoeGating::Softmax => softmax_ref(&logits),
         MoeGating::Sigmoid => logits.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect(),
         MoeGating::SqrtSoftplus => logits
             .iter()
@@ -1292,12 +1286,46 @@ fn moe_ref(
             .collect(),
     };
     // Selection-only copy: `bias` shifts top-k selection; the UNBIASED `probs` still drive weights.
-    let mut sel: Vec<f32> = match bias {
+    let sel: Vec<f32> = match bias {
         Some(b) => probs.iter().zip(b).map(|(&p, &bi)| p + bi).collect(),
         None => probs.clone(),
     };
-    // Group-limited routing: per-group score = sum of the top-2 sel values; keep the top
-    // `n_expert_groups_used` groups, mask the rest to -inf (llama.cpp `build_moe_ffn`).
+    let idx = select_experts(sel, n_expert_groups, n_expert_groups_used, n_used);
+    // norm_w: renormalize the selected (UNBIASED) probs to sum to 1, then scale.
+    let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+    let mut out = vec![0f32; ne];
+    for &e in &idx {
+        // gate/up are [n_expert, n_ff_exp, ne], down is [n_expert, ne, n_ff_exp] (row-major).
+        let gs = e * n_ff_exp * ne;
+        let ds = e * ne * n_ff_exp;
+        let actv: Vec<f32> = (0..n_ff_exp)
+            .map(|j| {
+                let g = dot(&gate[gs + j * ne..gs + (j + 1) * ne], x);
+                let u = dot(&up[gs + j * ne..gs + (j + 1) * ne], x);
+                let silu = |z: f32| z / (1.0 + (-z).exp());
+                silu(g) * u
+            })
+            .collect();
+        let w_e = probs[e] / wsum * scale;
+        for i in 0..ne {
+            out[i] += w_e * dot(&down[ds + i * n_ff_exp..ds + (i + 1) * n_ff_exp], &actv);
+        }
+    }
+    out
+}
+
+/// The top-`n_used` experts by `scores` (descending), after group-limited routing when
+/// `n_expert_groups > 1`: a group scores the sum of its top-2 `scores`, the top
+/// `n_expert_groups_used` groups are kept and the rest masked to -inf (llama.cpp
+/// `build_moe_ffn`). [`moe_ref`] passes the gated probabilities plus the bias; a test passes other
+/// scores to show what a different selection rule would pick.
+fn select_experts(
+    mut sel: Vec<f32>,
+    n_expert_groups: usize,
+    n_expert_groups_used: usize,
+    n_used: usize,
+) -> Vec<usize> {
+    let n_expert = sel.len();
     if n_expert_groups > 1 && n_expert_groups_used > 0 {
         let per = n_expert / n_expert_groups;
         let mut gscore = Vec::with_capacity(n_expert_groups);
@@ -1327,27 +1355,141 @@ fn moe_ref(
     let mut idx: Vec<usize> = (0..n_expert).collect();
     idx.sort_by(|&a, &b| sel[b].partial_cmp(&sel[a]).unwrap());
     idx.truncate(n_used);
-    // norm_w: renormalize the selected (UNBIASED) probs to sum to 1, then scale.
-    let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
-    let mut out = vec![0f32; ne];
-    for &e in &idx {
-        // gate/up are [n_expert, n_ff_exp, ne], down is [n_expert, ne, n_ff_exp] (row-major).
-        let gs = e * n_ff_exp * ne;
-        let ds = e * ne * n_ff_exp;
-        let actv: Vec<f32> = (0..n_ff_exp)
-            .map(|j| {
-                let g = dot(&gate[gs + j * ne..gs + (j + 1) * ne], x);
-                let u = dot(&up[gs + j * ne..gs + (j + 1) * ne], x);
-                let silu = |z: f32| z / (1.0 + (-z).exp());
-                silu(g) * u
-            })
-            .collect();
-        let w_e = probs[e] / wsum * scale;
-        for i in 0..ne {
-            out[i] += w_e * dot(&down[ds + i * n_ff_exp..ds + (i + 1) * n_ff_exp], &actv);
-        }
+    idx
+}
+
+/// The softmax probabilities of `logits` (shift by the max, divide by the sum), as [`moe_ref`]
+/// and the CPU backend compute them.
+fn softmax_ref(logits: &[f32]) -> Vec<f32> {
+    let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let p: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+    let psum: f32 = p.iter().sum();
+    p.iter().map(|v| v / psum).collect()
+}
+
+/// One renormalized, SiLU, split gate/up `Op::MoeFfn` routing case at rows = 1 and
+/// ne = n_ff_exp = 32 (the Vulkan expert id-GEMV's floor; see `moe_sqrt_softplus_parity`), whose
+/// router logits are `lead` (router row `e` is `lead[e]` on its first input and 0 elsewhere, the
+/// input all ones): the CPU backend against [`moe_ref`], then Vulkan against the CPU when a GPU is
+/// present.
+fn moe_routing_parity(
+    name: &str,
+    gating: MoeGating,
+    lead: &[f32],
+    bias: Option<&[f32]>,
+    groups: (usize, usize),
+    n_used: usize,
+) {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (ne, n_expert, n_ff_exp) = (32usize, lead.len(), 32usize);
+    let mut g = Graph::new();
+    let x = g.input(f32d(ne));
+    let router_x = g.input(f32d(ne));
+    let router = g.weight(f32d(n_expert * ne));
+    let gate_exps = g.weight(f32d(n_expert * n_ff_exp * ne));
+    let up_exps = g.weight(f32d(n_expert * n_ff_exp * ne));
+    let down_exps = g.weight(f32d(n_expert * ne * n_ff_exp));
+    let exp_probs_b = bias.map(|_| g.weight(f32d(n_expert)));
+    let dst = g.output(f32d(ne));
+    g.push(Op::MoeFfn {
+        x,
+        router_x,
+        router,
+        gate_exps,
+        up_exps,
+        down_exps,
+        down_scale: None,
+        fused_gate_up: false,
+        dst,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        n_ff_exp: n_ff_exp as u32,
+        scale: 1.0,
+        act: Activation::Silu,
+        gating,
+        norm_w: true,
+        weight_before: false,
+        ep_band: None,
+        exp_probs_b,
+        n_expert_groups: groups.0 as u32,
+        n_expert_groups_used: groups.1 as u32,
+        swiglu_clamp: None,
+        expert_ids: None,
+    });
+    let xi = [1.0f32; 32];
+    let ri: Vec<f32> = (0..n_expert * ne)
+        .map(|i| if i % ne == 0 { lead[i / ne] } else { 0.0 })
+        .collect();
+    let gi = gen(n_expert * n_ff_exp * ne, 21);
+    let ui = gen(n_expert * n_ff_exp * ne, 22);
+    let di = gen(n_expert * ne * n_ff_exp, 23);
+    let ins = [(x, &xi[..]), (router_x, &xi[..])];
+    let mut ws = vec![
+        (router, &ri[..]),
+        (gate_exps, &gi[..]),
+        (up_exps, &ui[..]),
+        (down_exps, &di[..]),
+    ];
+    if let (Some(id), Some(b)) = (exp_probs_b, bias) {
+        ws.push((id, b));
     }
-    out
+    let c = run(&cpu, &g, &ins, &ws, dst, ne);
+    let reference = moe_ref(
+        &xi, &ri, &gi, &ui, &di, ne, n_expert, n_used, n_ff_exp, 1.0, gating, bias, groups.0,
+        groups.1,
+    );
+    let e = maxerr(&c, &reference);
+    println!("MoeFfn({name}) cpu-vs-ref max_err={e:e}");
+    assert!(
+        e < 1e-4,
+        "MoeFfn {name} diverges from reference: max_err={e:e}"
+    );
+    if let Some(vk) = gpu() {
+        let v = run(&vk, &g, &ins, &ws, dst, ne);
+        let e = maxerr(&c, &v);
+        println!("MoeFfn({name}) cpu-vs-vulkan max_err={e:e}");
+        assert!(e < 1e-3, "MoeFfn {name} diverges on Vulkan: max_err={e:e}");
+    }
+}
+
+/// Softmax gating with a router bias (ERNIE 4.5 MoE's router): the bias is added to the softmax
+/// PROBABILITY for selection (llama.cpp `selection_probs = ggml_add(probs, exp_probs_b)`), whose
+/// scale the whole row sets, not to the logit. Logits 3.0 … 0.7 give probabilities 0.375 … 0.038;
+/// a +0.45 / +0.40 bias on experts 4 and 5 lifts their selection scores to 0.501 / 0.446, past
+/// expert 0's 0.375, so the reference selects {4, 5}, while adding the same bias to the logits
+/// (1.45, 1.30 against 3.0 and 2.5) would select {0, 1}. Both selections are asserted on the
+/// reference's own arithmetic, so the data cannot drift into a case the rule does not decide. The
+/// weights still come from the unbiased probabilities of 4 and 5, renormalized.
+#[test]
+fn moe_softmax_bias_parity() {
+    let lead = [3.0f32, 2.5, 2.0, 1.5, 1.0, 0.9, 0.8, 0.7];
+    let bias = [0.0f32, 0.0, 0.0, 0.0, 0.45, 0.40, 0.0, 0.0];
+    let biased = |s: Vec<f32>| -> Vec<f32> { s.iter().zip(&bias).map(|(a, b)| a + b).collect() };
+    assert_eq!(select_experts(biased(softmax_ref(&lead)), 0, 0, 2), [4, 5]);
+    assert_eq!(select_experts(biased(lead.to_vec()), 0, 0, 2), [0, 1]);
+    moe_routing_parity(
+        "softmax+bias",
+        MoeGating::Softmax,
+        &lead,
+        Some(&bias),
+        (0, 0),
+        2,
+    );
+}
+
+/// Softmax gating with group-limited routing and no bias: a group scores the sum of its top-2
+/// selection PROBABILITIES (llama.cpp `build_moe_ffn` sums `selection_probs`). Group 0 holds
+/// logits 3.0 and 0.0, group 1 holds 2.0 and 1.9: by probability group 0 wins (20.1 + 1.0 against
+/// 7.4 + 6.7, in units of the shared denominator), by logit sum group 1 would (3.0 against 3.9).
+/// With one group kept and two experts used, the reference selects {0, 1} and the logit rule
+/// {2, 3}; both are asserted on the reference's arithmetic.
+#[test]
+fn moe_softmax_groups_parity() {
+    let lead = [3.0f32, 0.0, 2.0, 1.9];
+    assert_eq!(select_experts(softmax_ref(&lead), 2, 1, 2), [0, 1]);
+    assert_eq!(select_experts(lead.to_vec(), 2, 1, 2), [2, 3]);
+    moe_routing_parity("softmax+groups", MoeGating::Softmax, &lead, None, (2, 1), 2);
 }
 
 /// `Op::MoeFfn` with DeepSeek V4 gating — `MoeGating::SqrtSoftplus` (`sqrt(softplus(logit))`,

@@ -4816,11 +4816,11 @@ impl MetalBackend {
                 // weighting; llama4's sigmoid/no-renorm/weight-before-FFN routing is CPU-only (see
                 // the `llama4` arch note) and never reaches a GPU backend in-tree.
                 //
-                // DeepSeek V2+ adds two routing inputs this path does not read: the `exp_probs_b`
-                // selection bias and group-limited routing. Sigmoid-gated V3 already fails the
-                // gating check above, but softmax + renorm + `expert_group_count > 1` is a legal
-                // deepseek2 config that would otherwise pass it and then route with neither the
-                // bias nor the group mask applied — the wrong experts, silently. Refuse instead.
+                // The `exp_probs_b` selection bias is added to the softmax probabilities on both
+                // paths below (ERNIE 4.5 MoE's router). Group-limited routing is not implemented:
+                // sigmoid-gated V3 already fails the gating check above, but softmax + renorm +
+                // `expert_group_count > 1` is a legal deepseek2 config that would otherwise pass it
+                // and then route without the group mask — the wrong experts, silently. Refuse it.
                 assert!(
                     matches!(gating, infr_core::graph::MoeGating::Softmax)
                         && norm_w
@@ -4828,15 +4828,18 @@ impl MetalBackend {
                     "Metal MoeFfn: only softmax + renorm + output-weighting supported (llama4 is CPU-only)"
                 );
                 assert!(
-                    exp_probs_b.is_none() && n_expert_groups <= 1,
-                    "Metal MoeFfn: DeepSeek V2+ router extensions are unimplemented here \
-                     (exp_probs_b bias: {}, expert groups: {n_expert_groups}, used: \
-                     {n_expert_groups_used}) — run this model on the CPU or Vulkan backend",
-                    exp_probs_b.is_some(),
+                    n_expert_groups <= 1,
+                    "Metal MoeFfn: group-limited routing is unimplemented here (expert groups: \
+                     {n_expert_groups}, used: {n_expert_groups_used}) — run this model on the CPU \
+                     or Vulkan backend",
                 );
-                // DeepSeek V4 hash routing supplies the selection outright, so the two
-                // SELECTION-only inputs above have nothing left to act on — the assert already
-                // rules them out here, which is the same exclusion the CPU reference enforces.
+                // DeepSeek V4 hash routing supplies the selection outright, so the SELECTION-only
+                // bias has nothing left to act on — the same exclusion the CPU reference enforces.
+                assert!(
+                    expert_ids.is_none() || exp_probs_b.is_none(),
+                    "Metal MoeFfn: expert_ids (hash routing) supplies the selection — exp_probs_b \
+                     has nothing to select"
+                );
                 let (ne, n_expert, n_used, nffx) = (
                     ne as usize,
                     n_expert as usize,
@@ -4885,16 +4888,22 @@ impl MetalBackend {
                         Some(hid) => self.ensure_device(r, hid)?,
                         None => logits.clone(),
                     };
+                    // The router bias, or the same harmless placeholder (`has_bias == 0`).
+                    let bb = match exp_probs_b {
+                        Some(epb) => self.weight_buf(epb, g, bindings)?,
+                        None => logits.clone(),
+                    };
                     let pso = self.pipelines.get("moe_topk")?;
                     let mut p = (n_expert as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(n_used as u32).to_ne_bytes());
                     p.extend_from_slice(&scale.to_ne_bytes());
                     p.extend_from_slice(&u32::from(expert_ids.is_some()).to_ne_bytes());
+                    p.extend_from_slice(&u32::from(exp_probs_b.is_some()).to_ne_bytes());
                     self.encode_tg_w(
                         r,
                         &pso,
-                        &[logits.as_ref(), hb.as_ref(), tbl.as_ref()],
-                        1 << 2,
+                        &[logits.as_ref(), hb.as_ref(), bb.as_ref(), tbl.as_ref()],
+                        1 << 3,
                         &p,
                         rows * 32,
                         32,
@@ -5179,6 +5188,7 @@ impl MetalBackend {
                     self.ensure_host(r, g, id);
                     r.vals[id.0 as usize].clone()
                 });
+                let bias = exp_probs_b.map(|id| self.weight_host(id, g, bindings));
                 let mut out = vec![0f32; rows * ne];
                 for (row, orow) in out.chunks_mut(ne).enumerate() {
                     let xr = &xs[row * ne..row * ne + ne];
@@ -5208,10 +5218,16 @@ impl MetalBackend {
                             })
                             .collect(),
                         None => {
+                            // The router bias shifts the SELECTION only (the CPU reference's
+                            // `sel_probs`); the weights below use the unbiased `probs`.
+                            let sel: Vec<f32> = match &bias {
+                                Some(b) => probs.iter().zip(b).map(|(p, b)| p + b).collect(),
+                                None => probs.clone(),
+                            };
                             let mut idx: Vec<usize> = (0..n_expert).collect();
                             idx.sort_by(|&a, &b| {
-                                probs[b]
-                                    .partial_cmp(&probs[a])
+                                sel[b]
+                                    .partial_cmp(&sel[a])
                                     .unwrap_or(std::cmp::Ordering::Equal)
                             });
                             idx.truncate(n_used);

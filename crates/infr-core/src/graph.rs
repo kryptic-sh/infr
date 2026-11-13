@@ -1045,9 +1045,11 @@ pub enum Op {
         /// `infr_vulkan::ExpertParallelBackend`'s per-rank graph lowering; every model builder and
         /// the CPU/Metal reference interpreters leave it `None` (EP is a Vulkan-only path).
         ep_band: Option<(u32, u32)>,
-        /// DeepSeek V2+: per-layer router bias `[n_expert]` added to logits for SELECTION only;
-        /// the unbias'd probs are still used for the per-expert routing weights. `None` = no bias.
-        /// Must be `None` when [`Op::MoeFfn::expert_ids`] is set — there is no selection to bias.
+        /// DeepSeek V3+ / ERNIE 4.5 MoE: per-layer router bias `[n_expert]` added to the GATED
+        /// probabilities (after `gating`: the full-row softmax, the sigmoid, …) for SELECTION only,
+        /// as llama.cpp's `selection_probs = ggml_add(probs, exp_probs_b)`; the unbiased probs are
+        /// still used for the per-expert routing weights. `None` = no bias. Must be `None` when
+        /// [`Op::MoeFfn::expert_ids`] is set — there is no selection to bias.
         exp_probs_b: Option<TensorId>,
         /// DeepSeek V3+: group-limited routing — number of expert groups (0 = no grouping). Must be
         /// `0`/`1` when [`Op::MoeFfn::expert_ids`] is set (same reason as `exp_probs_b`).

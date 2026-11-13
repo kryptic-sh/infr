@@ -980,14 +980,17 @@ pub(crate) fn generate_dense_backend(
                 wload(&[&p("ffn_down_exps.scale")])?;
                 wload(&[&p("post_ffw_norm_2.weight")])?;
             } else if c.moe.is_some() && c.is_moe_layer(l) {
-                // qwen3moe / qwen35moe / llama4 (MoE layer): router + stacked per-expert gate/up/
-                // down banks. (llama4 interleaves dense layers on `moe_interleave_step`; those fall
-                // through to the dense branches below — Scout's step==1 makes every layer MoE.)
+                // qwen3moe / qwen35moe / llama4 / deepseek / ernie4_5-moe (MoE layer): router +
+                // stacked per-expert gate/up/down banks. The dense layers `Config::is_moe_layer`
+                // leaves out (a leading dense block, or off the interleave step) fall through to
+                // the dense branches below.
                 wload(&[&p("ffn_gate_inp.weight")])?;
                 wload(&[&p("ffn_gate_exps.weight")])?;
                 wload(&[&p("ffn_up_exps.weight")])?;
                 wload(&[&p("ffn_down_exps.weight")])?;
-                if c.deepseek2 {
+                // Optional per layer where the reference loads it so (`Config::optional_router_bias`:
+                // deepseek2, ernie4_5-moe).
+                if c.optional_router_bias {
                     let ep_name = p("exp_probs_b.bias");
                     if g.tensors().iter().any(|t| t.name == ep_name) {
                         wload(&[&ep_name])?;

@@ -3999,8 +3999,8 @@ fn arch_sampling(arch: &str) -> (f32, usize, f32) {
         // top_p 0.95 and name no top_k, so top_k stays off as for Llama.
         SMOLLM3 => (0.6, 0, 0.95),
         // ERNIE 4.5 (Baidu): the checkpoint's generation_config.json sets temp 0.8 / top_p 0.8
-        // and names no top_k.
-        ERNIE4_5 => (0.8, 0, 0.8),
+        // and names no top_k; the 21B-A3B MoE GGUF declares the same in `general.sampling.*`.
+        ERNIE4_5 | ERNIE4_5_MOE => (0.8, 0, 0.8),
         // DeepSeek: neutral chat default. The family publishes no per-arch recommendation, so all
         // four arch strings stay on the same neutral values rather than on invented ones; a file
         // that declares its own (`general.sampling.*`, or a `generation_config.json` sibling)
@@ -4948,6 +4948,7 @@ mod tests {
         assert_eq!(arch_sampling(SMOLLM3), (0.6, 0, 0.95));
         // ERNIE 4.5: its generation_config.json's temp and top_p, top_k off.
         assert_eq!(arch_sampling(ERNIE4_5), (0.8, 0, 0.8));
+        assert_eq!(arch_sampling(ERNIE4_5_MOE), (0.8, 0, 0.8));
     }
 
     /// A `deepseek4` GGUF carrying `extra` metadata, written to `dir/model.gguf` (a directory of

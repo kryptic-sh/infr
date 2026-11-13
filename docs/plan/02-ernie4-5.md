@@ -4,8 +4,10 @@
 shares the arch file, is tiny, and proved the block and tokenizer before the MoE
 model is downloaded.
 
-**Status:** the dense `ernie4_5` arch is done (steps 1–2 below). The MoE
-`ernie4_5-moe` arch is scoped, not started.
+**Status:** the dense `ernie4_5` arch and the MoE `ernie4_5-moe` arch are both
+done on the CPU and Vulkan. The MoE arch's Metal path is written and compiled
+for the Apple target but has not run; the phase closes once CI's macOS job has
+run its parity cases (see the end of this file).
 
 ## Dense `ernie4_5`: done
 
@@ -161,98 +163,183 @@ land and oceans. It is home to countless" on every device;
 - **Linux:** the golden hashes were captured on Windows only, and the golden
   runs nowhere in CI (B167).
 
-## MoE `ernie4_5-moe`: scoped, not started
+## MoE `ernie4_5-moe`: done; Metal unverified
 
-Read in full: `src/models/ernie4-5-moe.cpp` (the graph), the MoE half of
-`llama_model_ernie4_5::load_arch_hparams` / `load_arch_tensors`
-(`src/models/ernie4-5.cpp`), `build_moe_ffn` (`src/llama-graph.cpp`) and the
-converter (`conversion/ernie.py`). The 21B-A3B Q4_K_M file was **not**
-downloaded; its metadata and tensor directory come from its first 8 MiB, fetched
-with an HTTP range request.
+### The file
 
-### What the 21B-A3B file carries
+`unsloth/ERNIE-4.5-21B-A3B-PT-GGUF`, `ERNIE-4.5-21B-A3B-PT-Q4_K_M.gguf`,
+13331015456 bytes, pulled with
+`infr pull unsloth/ERNIE-4.5-21B-A3B-PT-GGUF:Q4_K_M` (snapshot `de45a831`). Its
+metadata and tensor directory are what the range fetch below recorded: 28
+blocks, 389 tensors, `blk.0` dense, `blk.1`–`blk.27` MoE with an
+`exp_probs_b.bias` each, `interleave_moe_layer_step` 1,
+`leading_dense_block_count` 1, `expert_feed_forward_length` 1536 (a scalar),
+`expert_shared_feed_forward_length` 3072. The routed `ffn_down_exps` banks are
+mixed: the pager splits the down role into a 3.2 MB-per-expert pool of 832
+experts (13 layers) and a 2.2 MB one of 896 (14 layers). The repo has no F16
+file; its `Q8_0` (23205355296 bytes) would be the one to pull for a tighter
+oracle (B169's per-file floors). It was not downloaded.
 
-`general.architecture = "ernie4_5-moe"`, 28 blocks, 389 tensors,
-`embedding_length` 2560, 20 heads / 4 KV heads (head width 128, from
-`n_embd / n_head`; no `key_length` key), `feed_forward_length` 12288 (the dense
-layer), `expert_count` 64, `expert_used_count` 6, `expert_feed_forward_length`
-1536 (a scalar), `leading_dense_block_count` 1, `interleave_moe_layer_step` 1,
-`expert_shared_count` 2, `expert_shared_feed_forward_length` 3072,
-`general.sampling.temp` / `top_p` 0.8, `add_bos_token = false` (the 0.3B file
-has `true`), no `expert_gating_func`, no `expert_group_count`, no
-`expert_weights_scale`. `blk.0` is dense (`ffn_gate`/`ffn_up`/`ffn_down`);
-`blk.1`–`blk.27` carry `ffn_gate_inp` `[2560, 64]` F32, `exp_probs_b.bias`
-`[64]` F32, `ffn_{gate,up,down}_exps`, and `ffn_{gate,up,down}_shexp`.
+### What it took
 
-### What the reference does
+- **Config** (`crates/infr-llama/src/config.rs`): `arch::ERNIE4_5_MOE` and its
+  arms (no q/k-norm, the `qkv_projection_biases` and applied-weight-scale rows
+  of the dense arch). `Config::is_moe_layer` is now one rule for every arch,
+  `il >= n_layer_dense_lead && (moe_interleave_step == 0 || (il + 1) % step == 0)`;
+  each earlier arch sets at most one of the two, so their layer kinds are
+  unchanged. The router is the default softmax / renormalized / unscaled
+  `MoeConfig`; `expert_feed_forward_length` is a scalar or an array whose
+  entries agree (`ernie4_5_moe_expert_ff`), `interleave_moe_layer_step` is
+  required and positive, `shexp_ff` comes from
+  `expert_shared_feed_forward_length` and is summed ungated.
+  `Config::optional_router_bias` (deepseek2, ernie4_5-moe) gates the optional
+  per-layer `exp_probs_b.bias` load in `seam::runner`, which was deepseek2-only.
+  `ernie4_5_moe_tensors` refuses a missing tensor or an unexpected one by name,
+  as llama.cpp refuses a file with tensors it did not create; `ffn_gate_exps` is
+  required (the reference allows an ungated expert FFN infr has no path for).
+- **Vulkan router** (`crates/infr-vulkan/shaders/moe_topk.comp`): under a
+  softmax router, selection ranks the full-row probability
+  (`exp(logit - max) / sum`, the CPU's arithmetic) whenever a bias or expert
+  groups take part (`sel_by_prob`); without either it still ranks raw logits, so
+  every other model's routing is unchanged. The same flaw affected group scores
+  (sums of logits instead of probabilities), and the same change fixes it. Every
+  Vulkan MoE path routes through this one kernel via `Recorder::moe_topk`: the
+  resident `Op::MoeFfn` arms, `execute_paged_moe` (whose readback reads the
+  kernel's ids), and expert-parallel, whose lowering keeps `exp_probs_b` on each
+  rank's op with the router weights replicated (read, not run).
+- **Metal** (`crates/infr-metal/shaders/moe.metal`, `src/exec.rs`): the device
+  `moe_topk` kernel takes a bias buffer and a `has_bias` flag and ranks
+  `exp(logit - max) / psum + bias`; the host fallback sorts on `probs + bias`.
+  Group routing is still refused, and so is a bias next to hash routing. The
+  `Op::MoeFfn::exp_probs_b` doc now says what the bias is added to (it said the
+  logits).
 
-- **Layer kind:** a layer is MoE iff `il >= leading_dense_block_count` **and**
-  `(il + 1) % interleave_moe_layer_step == 0`. The loader creates MoE tensors
-  for every `il >= leading_dense_block_count` regardless of the step, so a file
-  with a step above 1 would not load there; the shipped file has step 1.
-- **Router:** `build_moe_ffn` with SOFTMAX gating, `norm_w = true` (renormalize
-  the selected weights), no weight scale (the key is not read; 0 means
-  unscaled), no expert groups, weights applied after the experts. When
-  `exp_probs_b` is present it is added to the **softmax probabilities** for
-  selection only; the weights come from the unbiased probabilities.
-- **Shared expert:** when `expert_shared_feed_forward_length > 0`, a plain
-  SiLU-gated FFN on the same normed input, **summed with no gate**.
-- **Attention / norms / output:** identical to the dense arch.
+### Verified (Windows box, llama.cpp `5676dfbe0`)
 
-### What infr already has (symbols)
+- **Logits, CPU** (`cpu_prefill_matches_llama_debug_dump` on `llama-debug`
+  dumps):
 
-- `MoeConfig` with `gating = MoeGating::Softmax`, `norm_w = true`, `scale = 1.0`
-  — the default arm of the `moe` parse in `Config::from_gguf`.
-- Plain-summed shared expert: `Config::shexp_ff` with `shexp_gated = false` (the
-  llama4 / DeepSeek path), loaded as `ffn_*_shexp` in `seam::runner`.
-- Leading dense layers: `Config::n_layer_dense_lead` (DeepSeek), and the MoE
-  interleave step `Config::moe_interleave_step` (llama4).
-- Router bias: `Op::MoeFfn::exp_probs_b`, loaded from `exp_probs_b.bias` in
-  `seam::runner` (DeepSeek V3), sized in `seam::wshape`.
-- The CPU backend (`infr-cpu`, `Op::MoeFfn`) adds the bias to the GATED
-  probabilities whatever the gating function, which is the reference rule.
+  | prompt                       | max \|Δlogit\| | shared top-5 | probability cosine | top-1 |
+  | ---------------------------- | -------------: | -----------: | -----------------: | ----- |
+  | `The capital of France is`   |     0.49118963 |          5/5 |  0.999999982307742 | same  |
+  | `北京是中国的首都，它的历史` |      0.4421668 |          5/5 |  0.998523170262377 | same  |
 
-### What is missing
+  llama.cpp's own CPU and Vulkan0 logits on the same two prompts differ by up to
+  0.5907817 and 0.4977362.
 
-1. **Config (small):** `ernie4_5-moe` arch const and arms; `MoeConfig` from the
-   default softmax/renorm arm; `shexp_ff` from
-   `expert_shared_feed_forward_length` (as qwen35moe reads it) with
-   `shexp_gated = false`; `n_layer_dense_lead` and `moe_interleave_step` both
-   read, and `Config::is_moe_layer` taught to apply **both** conditions (today
-   it applies the dense lead for DeepSeek or the step for llama4, never both).
-   `expert_feed_forward_length` as a per-layer array is not handled; the 21B
-   file has a scalar, so refuse an array rather than read its first entry.
-2. **Weight loading (small):** load `exp_probs_b.bias` for this arch (today the
-   load is gated on `deepseek2` / `deepseek4`), optional per layer as the
-   reference has it.
-3. **Vulkan router (kernel work):** `moe_topk.comp`'s `sel_score` ranks a
-   SOFTMAX-gated router by the raw logit, then adds the bias. Without a bias
-   that is the same order as the probabilities; with one it is not, because the
-   reference adds the bias to `softmax(logits)`, whose scale is set by the whole
-   row. The shader's comment says no real `exp_probs_b` model uses softmax
-   gating; ERNIE 4.5 MoE is one. The selection needs the full-row softmax (max
-   and denominator over every expert, which the un-renormalized branch already
-   computes for its weights) before the bias is added, and a parity case for
-   softmax + bias in `crates/infr-llama/tests/seam_op_parity.rs`. No file infr
-   runs today reaches the wrong rule: the `exp_probs_b` files it loads
-   (deepseek2/32/4) are sigmoid or sqrt-softplus gated, and the softmax-gated
-   Mistral Large 3 shard that was read carries no bias (B168). Whether the
-   expert-parallel path (`ExpertParallelBackend`) carries the bias to each rank
-   was not checked.
-4. **Metal (kernel work or refusal):** the Metal `Op::MoeFfn` refuses any
-   `exp_probs_b`, so the 21B file fails loudly there today. Implementing it is
-   the same selection rule as item 3; until then the refusal stands.
-5. **Verification:** the loose GPU comparison (top-5 overlap and a cosine floor)
-   the recipe prescribes for MoE, against the CPU and against llama.cpp.
+- **Greedy, CPU.** Seven chat prompts, the chat render's ids fed to
+  `llama-server` (CPU, `n_probs` 5, temperature 0) and to
+  `SeamModel::generate_cpu_ids`; the prompt ids are the same on both sides (the
+  21B file sets `add_bos_token = false`, so neither engine adds `<s>`, B166).
+  Every split lands where llama.cpp's own top two are close:
 
-### Size and disk
+  | prompt                                                      | agree | llama.cpp's smallest lead (first 32) |
+  | ----------------------------------------------------------- | ----: | -----------------------------------: |
+  | What is the capital of France? Answer in one paragraph.     | 48/48 |                      0.279 at step 7 |
+  | Count from one to twenty in words.                          | 48/48 |                      0.614 at step 0 |
+  | What is the chemical symbol for gold?                       | 36/48 |                     0.355 at step 11 |
+  | 请用中文介绍一下长城。                                      | 28/48 |                     0.059 at step 28 |
+  | Explain what a prime number is.                             | 16/48 |                     0.070 at step 16 |
+  | What are the three primary colors?                          |  5/48 |                      0.004 at step 5 |
+  | List the planets of the solar system in order from the sun. |  0/48 |    0.161 at step 0 (0.025 at step 6) |
 
-`ERNIE-4.5-21B-A3B-PT-Q4_K_M.gguf` is 13331015456 bytes; the C: drive had
-406018056192 bytes free when this was written. It fits the 7900 XTX resident and
-needs streaming on the integrated GPU.
+  "Write a short paragraph about the ocean." agrees for 12 tokens and splits on
+  `’` against `'`, a 0.0702 lead on llama.cpp's CPU.
 
-## Risks
+- **End to end** (`infr run --temp 0 --max-new 64` against
+  `llama-completion --temp 0` on the rendered prompt, "What is the capital of
+  France? Answer in one paragraph."): infr's CPU text equals llama.cpp's CPU
+  text, and infr's Vulkan0 text equals llama.cpp's Vulkan0 text. The CPU and
+  Vulkan answers split from each other after "the Eiffel Tower," in both engines
+  alike.
+- **Golden:** `cpu_golden_ernie4_5_moe`'s two hashes are the same on Windows and
+  on Linux (run in the WSL clone at `~/b162/infr`).
+- **GPU** (`INFR_DEV`): on Vulkan0 (RX 7900 XTX) and Vulkan1 (integrated),
+  `gpu_seam_matches_cpu_ernie4_5_moe` (chat-rendered ocean prompt prefill: top-5
+  shared; max |Δlogit| 0.5761112 and cosine 0.9986429426009094 on Vulkan0,
+  0.48740315 and 0.9988556443707916 on Vulkan1),
+  `gpu_seam_matches_cpu_ernie4_5_moe_tokens`, the paged test and the replay test
+  pass. The token test compares Vulkan against the f32 reference CPU backend;
+  its prompt's top-1 leads along the 32 generated tokens, measured on that
+  oracle path, are 0.5467 at the first token, 0.9894 at the third and at least
+  4.88 elsewhere, and 0.5191 at the first token on Vulkan0's prefill, where the
+  two paths' logits for the leading pair differ by 0.032 and 0.059. infr's
+  production int8-activation CPU path leads there by only 0.2335.
+- **Paged:** `gpu_seam_paged_ernie4_5_moe_matches_resident` decodes the same 16
+  ids as the resident run with 4 GiB of VRAM cache over 12 GiB of DRAM, and with
+  256 MiB over 512 MiB, on both GPUs. The routed experts total 12309626880 bytes
+  (one layer's banks 489553920 or 424673280, by the down projection's quant). As
+  the pager resolves the budgets on Vulkan0: at 4 GiB / 12 GiB, 1581 of the 5184
+  expert blocks fit in VRAM and the DRAM tier holds all of them; at 256 MiB /
+  512 MiB the VRAM arena is floored to 64 slots per pool, above the budget, and
+  the DRAM tier splits into 36 / 75 / 75 / 39 slots across the down-Q6_K / gate
+  / up / down-Q4_K pools, so experts are re-read from the file. That the paged
+  runs really page is shown by
+  `infr bench --set paging.cache=4g --set paging.dram=12g --set paging.stats=true`
+  on Vulkan0: "28/28 expert layers PAGED" and per-pool evictions and disk reads
+  in the `[moe pager]` lines.
+- **The router fix on the real model:** with the old `moe_topk.comp`,
+  `gpu_seam_matches_cpu_ernie4_5_moe_tokens` fails on Vulkan0 — the GPU writes
+  "one, two, three, …", the text the CPU writes with the bias dropped — while
+  the loose prefill comparison still passes (cosine 0.9976271849367727, max
+  |Δlogit| 0.813328), so the loose form alone does not guard the router.
 
-- The router selection fix in item 3 changes a shader every MoE family's decode
-  runs through; it must leave the no-bias path byte-identical, which the
-  existing parity cases cover.
+### Tests added, and what turns each red
+
+- `ernie4_5_moe_layer_kind_needs_lead_and_step`,
+  `ernie4_5_moe_tensors_are_checked_by_name`,
+  `ernie4_5_moe_refuses_what_the_reference_cannot_load` (`config.rs`): all three
+  red when `is_moe_layer` drops the step condition, and when it drops the
+  dense-lead condition.
+- `moe_softmax_bias_parity`, `moe_softmax_groups_parity` (`seam_op_parity.rs`,
+  through the shared `moe_routing_parity` and `select_experts`): the Vulkan leg
+  red on the old shader (max_err 8.5518897e-1 and 1.2022667e0 against the CPU),
+  green after (2.3841858e-7, 2.0861626e-7); the CPU leg red when the CPU backend
+  adds the bias to the logits.
+- `cpu_golden_ernie4_5_moe` (ignored, model-gated): red when the CPU adds the
+  bias to the logits, when `seam::runner` skips loading the bias, and when the
+  shared expert is dropped (which also takes the llama.cpp oracle to 0/5 shared
+  top-5 and a max |Δlogit| of 19.249985).
+- `gpu_seam_matches_cpu_ernie4_5_moe`,
+  `gpu_seam_matches_cpu_ernie4_5_moe_tokens`,
+  `gpu_seam_paged_ernie4_5_moe_matches_resident`,
+  `gpu_seam_ernie4_5_moe_decode_replays_from_one_recording` (ignored, Vulkan):
+  the tokens test red on the old shader, as above.
+- `moe_ffn_softmax_bias_host_parity`, `moe_ffn_softmax_bias_device_parity`
+  (`crates/infr-metal/tests/parity.rs`, CI's macOS job): each asserts the CPU
+  output moves with the bias by more than ten times the parity tolerance, in the
+  parity check's own relative metric, so a Metal router that drops it or adds it
+  to the logits fails. Not run on Metal here; the CPU half, reproduced in a
+  scratch binary, gives 4.287163 (host case) and 3.6820276 (device case) against
+  the 0.01 floor.
+
+### Performance (Vulkan0, Q4_K_M, 3 reps)
+
+No quiet window was arranged; the box was shared (Git Bash's load average read
+between 2.67 and 8.47 across these runs), so the rates are indicative only.
+
+| run                                            | pp512 (t/s) | tg128 (t/s) |
+| ---------------------------------------------- | ----------: | ----------: |
+| `infr bench`, resident                         |      2633.1 |       177.4 |
+| `infr bench`, paged (4 GiB VRAM / 12 GiB DRAM) |      1186.9 |       122.5 |
+| `llama-bench -ngl 99 -dev Vulkan0`             |     3964.86 |      212.88 |
+
+Decode takes the record-once replay (one recording for the whole decode on both
+GPUs). On the CPU, `infr run` prefilled 19 tokens at 1 tok/s and decoded at 4.6
+tok/s where `llama-completion` did 43.78 and 24.87; Qwen3-30B-A3B shows the same
+gap, so it is not this arch's (B173).
+
+### Not verified
+
+- **Metal:** the kernel and host-path change are compiled locally only through
+  `cargo clippy --target aarch64-apple-darwin`; the MSL is compiled at run time,
+  so nothing here has compiled it. The two new Metal parity cases run in CI's
+  `test-macos` job.
+- **Expert parallelism** with a router bias: read, not run.
+- **Other quants:** only Q4_K_M was run.
+
+### What remains before the phase closes
+
+CI's macOS job passing the two Metal cases. Then close the phase out per the
+planning rules; code comments (`cpu_backend.rs`) and B167 / B169 cite figures in
+this file, so those move with it.

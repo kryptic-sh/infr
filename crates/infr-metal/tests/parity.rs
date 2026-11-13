@@ -3515,6 +3515,108 @@ fn moe_ffn_q6k_device_parity() {
     moe_quant_test(DType::Q6K, synth_q6k, 90);
 }
 
+// Softmax gating with a router bias (ERNIE 4.5 MoE's router): the bias is added to the softmax
+// PROBABILITY for selection, the weights come from the unbiased probabilities. `x` is one-hot, so
+// router row `e` scores `LEAD[e]`: probabilities 0.375 … 0.038, and a +0.45 / +0.40 bias on
+// experts 4 and 5 makes the reference select {4, 5}, where both the bias-free router and one that
+// added the bias to the logits would select {0, 1}. The CPU run without the bias is asserted to
+// differ from the CPU run with it, so a Metal router that drops the bias, or adds it to the
+// logits, cannot pass. `dtype` picks the path: F32 experts take the host fallback, Q4_K the
+// device path's `moe_topk` kernel (the same data as `moe_softmax_bias_parity` in infr-llama).
+fn moe_softmax_bias_test(dtype: DType, synth: fn(usize, u32) -> Vec<u8>, seed: u32) {
+    const LEAD: [f32; 8] = [3.0, 2.5, 2.0, 1.5, 1.0, 0.9, 0.8, 0.7];
+    const BIAS: [f32; 8] = [0.0, 0.0, 0.0, 0.0, 0.45, 0.40, 0.0, 0.0];
+    let (ne, n_expert, n_used, nff) = (256usize, LEAD.len(), 2usize, 256usize);
+    let build = |with_bias: bool| {
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![ne], DType::F32));
+        let router = g.weight(TensorDesc::new(vec![n_expert, ne], DType::F32));
+        let gate = g.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype));
+        let up = g.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype));
+        let down = g.weight(TensorDesc::new(vec![n_expert, ne, nff], dtype));
+        let bias = g.weight(TensorDesc::new(vec![n_expert], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![ne], DType::F32));
+        g.push(Op::MoeFfn {
+            x,
+            router_x: x,
+            router,
+            gate_exps: gate,
+            up_exps: up,
+            down_exps: down,
+            down_scale: None,
+            fused_gate_up: false,
+            dst,
+            ne: ne as u32,
+            n_expert: n_expert as u32,
+            n_used: n_used as u32,
+            n_ff_exp: nff as u32,
+            scale: 1.0,
+            act: infr_core::graph::Activation::Silu,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b: with_bias.then_some(bias),
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
+        });
+        let mut xi = vec![0f32; ne];
+        xi[0] = 1.0;
+        let ri: Vec<f32> = (0..n_expert * ne)
+            .map(|i| if i % ne == 0 { LEAD[i / ne] } else { 0.0 })
+            .collect();
+        let mut bound = vec![
+            (x, f32_bytes(&xi)),
+            (router, f32_bytes(&ri)),
+            (gate, synth(n_expert * nff * ne, seed)),
+            (up, synth(n_expert * nff * ne, seed + 1)),
+            (down, synth(n_expert * ne * nff, seed + 2)),
+        ];
+        if with_bias {
+            bound.push((bias, f32_bytes(&BIAS)));
+        }
+        (g, bound, dst)
+    };
+    let (g, bound, dst) = build(true);
+    let (g0, bound0, dst0) = build(false);
+    let cpu = run(&CpuBackend::new(), &g, &bound, dst, ne);
+    let cpu0 = run(&CpuBackend::new(), &g0, &bound0, dst0, ne);
+    // In `assert_parity`'s own metric (relative to `max(|cpu|, 1)`): a Metal output equal to the
+    // bias-free one must miss the tolerance by a wide factor, not by a rounding.
+    const TOL: f32 = 1e-3;
+    let moved = cpu
+        .iter()
+        .zip(&cpu0)
+        .map(|(a, b)| (a - b).abs() / a.abs().max(1.0))
+        .fold(0f32, f32::max);
+    assert!(
+        moved > 10.0 * TOL,
+        "the bias does not change the CPU output ({moved}), so this case cannot tell a router \
+         that ignores it"
+    );
+    assert_parity(&g, &bound, dst, ne, TOL);
+}
+
+/// F32 experts: the host fallback's router (`sel_probs`-style sort on probabilities plus bias).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_softmax_bias_host_parity() {
+    moe_softmax_bias_test(
+        DType::F32,
+        |n, seed| f32_bytes(&rand_f32(n, seed as u64)),
+        110,
+    );
+}
+
+/// Q4_K experts: the device path's `moe_topk` kernel ranks probability plus bias.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_softmax_bias_device_parity() {
+    moe_softmax_bias_test(DType::Q4K, synth_q4k, 120);
+}
+
 // Batched rows through the device MoE path (rows spanning two 256-row chunks): every row routes
 // independently; parity vs the CPU reference's per-row loop.
 #[test]

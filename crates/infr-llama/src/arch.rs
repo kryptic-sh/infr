@@ -39,9 +39,16 @@ pub const SMOLLM3: &str = "smollm3";
 /// optional `attn_q/k/v.bias` and adds them when present (so does infr: `Config::qkv_bias` follows
 /// the tensors; the 0.3B file has none), loads an optional `attn_output.bias` it never applies,
 /// and reads `rope.dimension_sections` only for the multimodal rope its text path does not use
-/// (`llama_model_ernie4_5`, `src/models/ernie4-5.cpp`). The MoE sibling `ernie4_5-moe` is not
-/// supported.
+/// (`llama_model_ernie4_5`, `src/models/ernie4-5.cpp`). The MoE sibling is [`ERNIE4_5_MOE`].
 pub const ERNIE4_5: &str = "ernie4_5";
+/// ERNIE 4.5 MoE (Baidu's ERNIE-4.5-21B-A3B): the [`ERNIE4_5`] attention block with a routed FFN
+/// on every layer from `leading_dense_block_count` on that also falls on the
+/// `interleave_moe_layer_step` (both conditions, `Config::is_moe_layer`); the others keep the
+/// dense SiLU FFN. The router is softmax-gated with the selected weights renormalized and no
+/// weight scale, an optional per-layer `exp_probs_b` bias added to the softmax PROBABILITIES for
+/// selection only, and a shared expert summed in with no gate
+/// (`llama_model_ernie4_5_moe`, `src/models/ernie4-5-moe.cpp`).
+pub const ERNIE4_5_MOE: &str = "ernie4_5-moe";
 /// Qwen2/2.5 (incl. Qwen2.5-Coder, R1-Distill-Qwen). Llama path + q/k/v projection biases; ships
 /// HF rotate-half q/k order, so the loader permutes rows (`Config::permute_qk_neox`).
 pub const QWEN2: &str = "qwen2";
@@ -149,6 +156,7 @@ pub const TRANSFORMER: &[&str] = &[
     DEEPSEEK,
     SMOLLM3,
     ERNIE4_5,
+    ERNIE4_5_MOE,
 ];
 
 /// Read `general.architecture` from a GGUF WITHOUT a full model load (mirrors
@@ -238,4 +246,5 @@ pub const ALL: &[&str] = &[
     QWEN35_MOE,
     SMOLLM3,
     ERNIE4_5,
+    ERNIE4_5_MOE,
 ];

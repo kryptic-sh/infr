@@ -186,9 +186,10 @@ pub struct Config {
     /// llama4 (Scout etc.): `true` only for `arch == "llama4"`. Gates every field below plus the
     /// per-layer NoPE / weightless-L2-norm attention wiring and the sigmoid-gated MoE in `seam`.
     pub llama4: bool,
-    /// llama4 `interleave_moe_layer_step`: layer `il` is a MoE layer iff `(il+1) % step == 0`
-    /// (`step == 1` on Scout → every layer). Other layers are dense FFN. `0` for every non-llama4
-    /// model (whose MoE archs — qwen3moe etc. — are MoE on ALL layers; see [`Config::is_moe_layer`]).
+    /// `interleave_moe_layer_step` (llama4, ernie4_5-moe): a MoE layer must satisfy
+    /// `(il+1) % step == 0` (`step == 1` on Scout and ERNIE 4.5 21B-A3B → every layer). Other
+    /// layers are dense FFN. `0` for every other model (no step condition; see
+    /// [`Config::is_moe_layer`]).
     pub moe_interleave_step: usize,
     /// The NoPE layer step: layer `il` SKIPS rope iff `(il+1) % step == 0`. llama4 iRoPE's
     /// `no_rope_layer_step` (4 on Scout — pattern "3 local-rope, 1 global-NoPE"), where the NoPE
@@ -216,11 +217,16 @@ pub struct Config {
     /// no-renormalization softmax gating, threshold-mode `is_moe_layer`, and an ungated
     /// shared expert (summed in plain, like llama4). See docs/deepseek.md § Stage 1.
     pub deepseek: bool,
-    /// DeepSeek: the first `n_layer_dense_lead` layers use a DENSE FFN; the rest are MoE
-    /// (unless the model has no MoE — `Config::moe` is `None` — in which case every layer
-    /// is dense regardless). `0` = every layer MoE (not used today). Non-DeepSeek models
-    /// ignore this field.
+    /// DeepSeek V1/V2/V3.2 and ernie4_5-moe (`leading_dense_block_count`): the first
+    /// `n_layer_dense_lead` layers use a DENSE FFN; the rest are MoE where the interleave step
+    /// allows (see [`Config::is_moe_layer`]), unless the model has no MoE (`Config::moe` is
+    /// `None`), in which case every layer is dense regardless. `0` for every other model.
     pub n_layer_dense_lead: usize,
+    /// The arch's reference loads `blk.N.exp_probs_b.bias` (the MoE router's selection bias) as
+    /// OPTIONAL on each MoE layer and applies it where present: deepseek2 (whose pre-V3 files have
+    /// none) and ernie4_5-moe. deepseek4 requires it per layer and is handled on its own; every
+    /// other arch's reference never loads it.
+    pub optional_router_bias: bool,
     /// DeepSeek V2+: `true` for `arch == "deepseek2"` AND for `arch == "deepseek32"` (V3.2 is the
     /// same skeleton plus an indexer — see [`Config::deepseek32`]). Gates MLA attention (absorbed
     /// form with asymmetric K/V dims + single K row), YaRN rope scaling, and group-limited MoE
@@ -515,20 +521,15 @@ impl Config {
         self.diffusion_gemma || self.gemma4_moe
     }
 
-    /// Whether layer `il` uses the routed-expert (MoE) FFN. For every MoE arch except llama4 and
-    /// deepseek that's EVERY layer (`moe_interleave_step == 0`). llama4 interleaves MoE with dense
-    /// layers on a fixed step (`(il+1) % step == 0`). DeepSeek V1/V2/V3.2 use a threshold: the first
-    /// `n_layer_dense_lead` layers are dense, the rest are MoE — V4 has no dense-lead layers at all
-    /// and rides the every-layer branch. `false` for dense models (`self.moe` is `None`).
+    /// Whether layer `il` uses the routed-expert (MoE) FFN: past the `n_layer_dense_lead` leading
+    /// dense layers AND on the `moe_interleave_step` (when one is set), as `ernie4-5-moe.cpp`
+    /// tests both. Each other arch sets at most one of the two: DeepSeek V1/V2/V3.2 a dense lead,
+    /// llama4 a step, and every other MoE arch (V4 included) neither, which makes every layer MoE.
+    /// `false` for dense models (`self.moe` is `None`).
     pub fn is_moe_layer(&self, il: usize) -> bool {
         self.moe.is_some()
-            && if self.deepseek || self.deepseek2 {
-                il >= self.n_layer_dense_lead
-            } else if self.moe_interleave_step > 0 {
-                (il + 1).is_multiple_of(self.moe_interleave_step)
-            } else {
-                true
-            }
+            && il >= self.n_layer_dense_lead
+            && (self.moe_interleave_step == 0 || (il + 1).is_multiple_of(self.moe_interleave_step))
     }
 
     /// Whether layer `il` SKIPS rope (a NoPE layer: llama4 iRoPE's global-attention layers, or
@@ -609,7 +610,8 @@ impl Config {
             | crate::arch::BITNET
             | crate::arch::BITNET_B158
             | crate::arch::SMOLLM3
-            | crate::arch::ERNIE4_5 => false,
+            | crate::arch::ERNIE4_5
+            | crate::arch::ERNIE4_5_MOE => false,
             crate::arch::QWEN3
             | crate::arch::QWEN3_MOE
             | crate::arch::GEMMA3
@@ -667,6 +669,10 @@ impl Config {
         // smollm3 is the llama block with a hardcoded NoPE step and nothing else (see
         // `arch::SMOLLM3`), so it gates only `no_rope_step` below; every llama4 gate stays off.
         let smollm3 = arch == crate::arch::SMOLLM3;
+        // ernie4_5-moe is the dense ernie4_5 (llama) block with an FFN swapped in on its MoE
+        // layers; it gates only the MoE parses below (`moe`, `n_layer_dense_lead`,
+        // `moe_interleave_step`, `shexp_ff`, `optional_router_bias`).
+        let ernie4_5_moe = arch == crate::arch::ERNIE4_5_MOE;
         let diffusion_gemma = arch == crate::arch::DIFFUSION_GEMMA;
         // diffusion-gemma's backbone IS gemma4's (heterogeneous per-layer dims, V-norm,
         // freq_factors, softcap) verbatim — see docs/diffusion-gemma.md — so it folds into the same
@@ -1189,13 +1195,18 @@ impl Config {
             || deepseek
             || deepseek2
             || deepseek4
+            || ernie4_5_moe
         {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
                 meta_u64(g, &mk("expert_used_count")).context("expert_used_count")? as usize;
-            let n_ff_exp = meta_u64(g, &mk("expert_feed_forward_length"))
-                .map(|v| v as usize)
-                .unwrap_or(n_ff / n_used.max(1));
+            let n_ff_exp = if ernie4_5_moe {
+                ernie4_5_moe_expert_ff(g, &mk("expert_feed_forward_length"), n_layer)?
+            } else {
+                meta_u64(g, &mk("expert_feed_forward_length"))
+                    .map(|v| v as usize)
+                    .unwrap_or(n_ff / n_used.max(1))
+            };
             // llama4 hardcodes SIGMOID gating, NO top-k renormalization, and weight-before-FFN
             // (`models/llama4.cpp::build_arch_graph` → `build_moe_ffn(.., norm_w=false, ..,
             // LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID)` with `weight_before_ffn = arch == LLAMA4`).
@@ -1262,6 +1273,9 @@ impl Config {
                     routed_weights_scale(),
                 )
             } else {
+                // qwen3moe, qwen35moe, gemma4 MoE, diffusion-gemma and ernie4_5-moe (whose builder
+                // passes `hparams.expert_weights_scale`, a key its loader never reads, so it stays
+                // at 0 = unscaled).
                 (infr_core::graph::MoeGating::Softmax, true, false, 1.0)
             };
             Some(MoeConfig {
@@ -1459,7 +1473,8 @@ impl Config {
         };
         let attn_out_gate = qwen35;
         // DeepSeek: first N layers are dense FFN, the rest are MoE.
-        let n_layer_dense_lead = if deepseek || deepseek2 {
+        // ernie4_5-moe reads the same key, optional (`ernie4-5.cpp::load_arch_hparams`).
+        let n_layer_dense_lead = if deepseek || deepseek2 || ernie4_5_moe {
             meta_u64(g, &mk("leading_dense_block_count")).unwrap_or(0) as usize
         } else {
             0
@@ -1469,7 +1484,9 @@ impl Config {
         // (`models/llama4.cpp`: `n_ff_shexp = n_ff_exp`). DeepSeek's shared expert is
         // `n_ff_exp * n_expert_shared` wide (llama.cpp fuses `n_expert_shared` experts into one
         // wider branch — see docs/deepseek.md § Stage 1). `0` = no shared expert.
-        let shexp_ff = if qwen35_moe {
+        // ernie4_5-moe reads `expert_shared_feed_forward_length` as qwen35moe does (optional, 0 = no
+        // shared expert) and sums the branch in with no gate.
+        let shexp_ff = if qwen35_moe || ernie4_5_moe {
             meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize
         } else if llama4 {
             moe.map(|m| m.n_ff_exp).unwrap_or(0)
@@ -1500,6 +1517,14 @@ impl Config {
             (step, no_rope, l2)
         } else if smollm3 {
             (0, SMOLLM3_NO_ROPE_STEP, false)
+        } else if ernie4_5_moe {
+            // Required, and asserted positive by the graph builder (`ernie4-5-moe.cpp`).
+            let key = mk("interleave_moe_layer_step");
+            let step = meta_u64(g, &key).with_context(|| format!("{key} missing"))? as usize;
+            if step == 0 {
+                bail!("{key} must be positive");
+            }
+            (step, 0, false)
         } else {
             (0, 0, false)
         };
@@ -1567,7 +1592,7 @@ impl Config {
         } else {
             None
         };
-        Ok(Config {
+        let cfg = Config {
             n_layer,
             n_head,
             n_kv,
@@ -1628,6 +1653,7 @@ impl Config {
             sub_norm,
             deepseek,
             n_layer_dense_lead,
+            optional_router_bias: deepseek2 || ernie4_5_moe,
             deepseek2,
             deepseek32,
             deepseek4,
@@ -1662,7 +1688,11 @@ impl Config {
             rope_yarn_beta_fast,
             rope_yarn_beta_slow,
             is_lite,
-        })
+        };
+        if ernie4_5_moe {
+            ernie4_5_moe_tensors(g, &cfg)?;
+        }
+        Ok(cfg)
     }
 }
 
@@ -1800,14 +1830,16 @@ fn applied_weight_scales(arch: &str) -> Vec<&'static str> {
             add(&EXPS_SCALES);
         }
         // `llama_model_llama4::graph`, `llama_model_qwen2::graph`, `llama_model_gemma3::graph`,
-        // `llama_model_deepseek::graph`, `llama_model_smollm3::graph`, `llama_model_ernie4_5::graph`:
-        // build_qkv, build_attn(wo_s), output_s; every FFN scale NULL.
+        // `llama_model_deepseek::graph`, `llama_model_smollm3::graph`, `llama_model_ernie4_5::graph`,
+        // `llama_model_ernie4_5_moe::graph`: build_qkv, build_attn(wo_s), output_s; every FFN
+        // scale NULL (ernie4_5-moe calls the `build_moe_ffn` overload without `*_exps_s`).
         arch::LLAMA4
         | arch::QWEN2
         | arch::GEMMA3
         | arch::DEEPSEEK
         | arch::SMOLLM3
-        | arch::ERNIE4_5 => {
+        | arch::ERNIE4_5
+        | arch::ERNIE4_5_MOE => {
             add(&QKV_SCALES);
             add(&["attn_output", "output"]);
         }
@@ -1914,7 +1946,7 @@ fn refuse_unapplied_weight_scales(g: &Gguf, arch: &str, dual_moe: bool) -> Resul
 /// through `build_qkv` on the attention path infr runs for them: the loader takes
 /// `attn_q.bias` / `attn_k.bias` / `attn_v.bias` as optional, and `build_qkv` adds each one the
 /// file carries, whatever the arch. Qwen2/2.5 are the files that ship them.
-const QKV_BIAS_ARCHS: [&str; 9] = [
+const QKV_BIAS_ARCHS: [&str; 10] = [
     crate::arch::LLAMA,
     crate::arch::LLAMA4,
     crate::arch::QWEN2,
@@ -1924,7 +1956,125 @@ const QKV_BIAS_ARCHS: [&str; 9] = [
     crate::arch::DEEPSEEK,
     crate::arch::SMOLLM3,
     crate::arch::ERNIE4_5,
+    crate::arch::ERNIE4_5_MOE,
 ];
+
+/// ernie4_5-moe's routed-expert width from `key` (`expert_feed_forward_length`). The reference
+/// reads it per layer (`get_key_or_arr` into `n_ff_exp_arr`, one entry per block) but sizes every
+/// layer's expert tensors from the FIRST entry alone (`hparams.n_ff_exp()`), ignoring the rest.
+/// infr's single `MoeConfig::n_ff_exp` takes a scalar or an array whose entries all agree, and
+/// refuses an array whose entries differ: what such a file means is unclear (the reference's
+/// reading of it disagrees with its own metadata), so infr does not pick an entry for it.
+fn ernie4_5_moe_expert_ff(g: &Gguf, key: &str, n_layer: usize) -> Result<usize> {
+    let value = g
+        .metadata()
+        .get(key)
+        .with_context(|| format!("{key} missing"))?;
+    if let Some(arr) = value.as_arr() {
+        if arr.len() != n_layer {
+            bail!("{key} has {} entries for {n_layer} layers", arr.len());
+        }
+        let widths: Vec<u64> = arr.iter().filter_map(MetaValue::as_u64).collect();
+        if widths.len() != arr.len() || widths.iter().any(|&w| w != widths[0]) {
+            bail!(
+                "{key} = {widths:?}: infr runs one expert width for every layer, and the \
+                 reference sizes every layer's experts from the first entry"
+            );
+        }
+        return Ok(widths[0] as usize);
+    }
+    value
+        .as_u64()
+        .map(|w| w as usize)
+        .with_context(|| format!("{key} is not an integer"))
+}
+
+/// Every tensor an ernie4_5-moe file must carry is there, and it carries nothing else, layer kinds
+/// taken from [`Config::is_moe_layer`] — the graph's rule (`ernie4-5-moe.cpp` tests the dense lead
+/// AND the interleave step). llama.cpp's loader
+/// (`llama_model_ernie4_5::load_arch_tensors`) differs for a step above 1: it creates MoE tensors
+/// on every layer past the lead whatever the step, so such a file cannot satisfy both its loader
+/// and its graph; infr follows the graph (B175). Like llama.cpp, infr refuses a file carrying
+/// tensors it does not use. Dense layers (`!cfg.is_moe_layer(l)`) take
+/// `ffn_gate`/`ffn_up`/`ffn_down`; MoE layers take the router, the three expert banks, the shared
+/// expert's three when `cfg.shexp_ff > 0`, and an optional `exp_probs_b.bias`. The optional
+/// tensors are `output.weight` (else tied to the embedding), `attn_output.bias` (loaded and never
+/// applied by the reference, nor by infr) and `attn_q/k/v.bias` (all or none, which
+/// `qkv_projection_biases` has already enforced). `.scale` / `.input_scale` siblings are left to
+/// `refuse_unapplied_weight_scales`. The reference treats `ffn_gate_exps` as optional (an
+/// ungated expert FFN); infr has no ungated expert path, so it is required here. The missing
+/// tensor, or the unexpected one, is named in the error.
+fn ernie4_5_moe_tensors(g: &Gguf, cfg: &Config) -> Result<()> {
+    let present: std::collections::HashSet<&str> =
+        g.tensors().iter().map(|t| t.name.as_str()).collect();
+    let mut required: Vec<String> = vec!["token_embd.weight".into(), "output_norm.weight".into()];
+    let mut optional: Vec<String> = vec!["output.weight".into()];
+    for l in 0..cfg.n_layer {
+        let p = |n: &str| format!("blk.{l}.{n}");
+        for n in [
+            "attn_norm.weight",
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "ffn_norm.weight",
+        ] {
+            required.push(p(n));
+        }
+        optional.push(p("attn_output.bias"));
+        if cfg.qkv_bias {
+            for n in ["attn_q.bias", "attn_k.bias", "attn_v.bias"] {
+                required.push(p(n));
+            }
+        }
+        if cfg.is_moe_layer(l) {
+            for n in [
+                "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            ] {
+                required.push(p(n));
+            }
+            if cfg.shexp_ff > 0 {
+                for n in [
+                    "ffn_gate_shexp.weight",
+                    "ffn_up_shexp.weight",
+                    "ffn_down_shexp.weight",
+                ] {
+                    required.push(p(n));
+                }
+            }
+            optional.push(p("exp_probs_b.bias"));
+        } else {
+            for n in ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"] {
+                required.push(p(n));
+            }
+        }
+    }
+    if let Some(missing) = required.iter().find(|n| !present.contains(n.as_str())) {
+        bail!("ernie4_5-moe: {missing} is missing");
+    }
+    let known: std::collections::HashSet<&str> = required
+        .iter()
+        .chain(&optional)
+        .map(String::as_str)
+        .collect();
+    let mut extra: Vec<&str> = present
+        .iter()
+        .copied()
+        .filter(|n| !known.contains(n) && !n.ends_with(".scale") && !n.ends_with(".input_scale"))
+        .collect();
+    extra.sort_unstable();
+    if let Some(first) = extra.first() {
+        bail!(
+            "ernie4_5-moe: {first} is not a tensor this layer layout uses ({} unexpected) — \
+             llama.cpp refuses such a file too",
+            extra.len()
+        );
+    }
+    Ok(())
+}
 
 /// Whether this file's attention layers carry q/k/v projection biases that infr must add
 /// (`Config::qkv_bias`). For a [`QKV_BIAS_ARCHS`] arch that is decided by the tensors, as the
@@ -2517,6 +2667,181 @@ mod tests {
             .expect("llama fixture must parse");
         assert_eq!(cfg.no_rope_step, 0);
         assert!((0..cfg.n_layer).all(|l| !cfg.is_nope_layer(l)));
+    }
+
+    /// The `ernie4_5-moe` keys of a six-layer fixture: two leading dense layers and an interleave
+    /// step of 2, so the reference's rule (`il >= lead && (il + 1) % step == 0`) makes layers 3
+    /// and 5 MoE, where the dense lead alone would give 2–5 and the step alone 1, 3, 5.
+    const ERNIE_MOE_KEYS: &[(&str, u32)] = &[
+        ("block_count", 6),
+        ("embedding_length", 8),
+        ("attention.head_count", 2),
+        ("attention.head_count_kv", 1),
+        ("feed_forward_length", 16),
+        ("expert_count", 4),
+        ("expert_used_count", 2),
+        ("expert_feed_forward_length", 8),
+        ("expert_shared_feed_forward_length", 8),
+        ("leading_dense_block_count", 2),
+        ("interleave_moe_layer_step", 2),
+    ];
+    const ERNIE_MOE_LAYERS: [usize; 2] = [3, 5];
+
+    /// The tensor names an `ernie4_5-moe` file with `ERNIE_MOE_KEYS` carries when `moe_layers` are
+    /// its MoE layers: attention and norms everywhere, the dense trio elsewhere, and the router,
+    /// expert banks and shared expert on the MoE layers. Listed here rather than derived from the
+    /// code under test, so the fixture says what the file looks like independently of it.
+    fn ernie_moe_tensor_names(moe_layers: &[usize]) -> Vec<String> {
+        let mut names = vec!["output_norm.weight".to_string()];
+        for l in 0..6 {
+            let mut layer = vec![
+                "attn_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "ffn_norm.weight",
+            ];
+            if moe_layers.contains(&l) {
+                layer.extend([
+                    "ffn_gate_inp.weight",
+                    "ffn_gate_exps.weight",
+                    "ffn_up_exps.weight",
+                    "ffn_down_exps.weight",
+                    "ffn_gate_shexp.weight",
+                    "ffn_up_shexp.weight",
+                    "ffn_down_shexp.weight",
+                ]);
+            } else {
+                layer.extend(["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"]);
+            }
+            names.extend(layer.into_iter().map(|n| format!("blk.{l}.{n}")));
+        }
+        names
+    }
+
+    /// An `ernie4_5-moe` fixture with `keys` and exactly the tensors `names` (plus the dummy
+    /// embedding every fixture carries). Shapes are placeholders: the parse reads names only.
+    fn ernie_moe_fixture(keys: &[(&str, u32)], names: &[String]) -> SyntheticModel {
+        let mut m = arch_fixture("ernie4_5-moe", keys);
+        m.tensors.extend(
+            names
+                .iter()
+                .map(|n| TensorSpec::new(n.clone(), vec![8], Fill::Exact(vec![0.0; 8]))),
+        );
+        m
+    }
+
+    /// ernie4_5-moe's layer kinds need BOTH of the reference's conditions, and its router is the
+    /// softmax / renormalized / unscaled one with an optional bias and an ungated shared expert.
+    #[test]
+    fn ernie4_5_moe_layer_kind_needs_lead_and_step() {
+        let names = ernie_moe_tensor_names(&ERNIE_MOE_LAYERS);
+        let cfg = config_from_fixture("ernie-moe", &ernie_moe_fixture(ERNIE_MOE_KEYS, &names))
+            .expect("ernie4_5-moe fixture must parse");
+        let moe: Vec<usize> = (0..cfg.n_layer).filter(|&l| cfg.is_moe_layer(l)).collect();
+        assert_eq!(moe, ERNIE_MOE_LAYERS);
+        let mc = cfg.moe.expect("ernie4_5-moe is MoE");
+        assert_eq!(mc.gating, infr_core::graph::MoeGating::Softmax);
+        assert!(mc.norm_w && !mc.weight_before);
+        assert_eq!((mc.scale, mc.n_ff_exp), (1.0, 8));
+        assert_eq!((mc.n_expert_groups, mc.n_expert_groups_used), (0, 0));
+        assert_eq!((cfg.shexp_ff, cfg.shexp_gated), (8, false));
+        assert!(cfg.optional_router_bias);
+        assert!(!cfg.deepseek && !cfg.deepseek2 && !cfg.llama4 && !cfg.qk_norm);
+        assert!(!cfg.permute_qk_neox && !cfg.qkv_bias);
+    }
+
+    /// Every tensor the layout needs is required and anything else is refused, each by name; the
+    /// router bias is optional per MoE layer and refused on a dense one.
+    #[test]
+    fn ernie4_5_moe_tensors_are_checked_by_name() {
+        let names = ernie_moe_tensor_names(&ERNIE_MOE_LAYERS);
+        let parse = |tag: &str, names: &[String]| {
+            config_from_fixture(tag, &ernie_moe_fixture(ERNIE_MOE_KEYS, names))
+        };
+        let refused = |tag: &str, names: &[String]| match parse(tag, names) {
+            Ok(_) => panic!("{tag}: must be refused"),
+            Err(e) => e.to_string(),
+        };
+
+        let mut with_bias = names.clone();
+        with_bias.push("blk.3.exp_probs_b.bias".into());
+        parse("ernie-moe-bias", &with_bias).expect("a router bias on a MoE layer is optional");
+
+        let missing: Vec<String> = names
+            .iter()
+            .filter(|n| *n != "blk.5.ffn_up_shexp.weight")
+            .cloned()
+            .collect();
+        let err = refused("ernie-moe-missing", &missing);
+        assert_eq!(err, "ernie4_5-moe: blk.5.ffn_up_shexp.weight is missing");
+
+        for extra in [
+            "blk.2.exp_probs_b.bias",          // a bias on a dense layer
+            "blk.1.ffn_gate_inp.weight",       // a router on the step but inside the dense lead
+            "blk.4.ffn_gate_inp.weight",       // a router past the dense lead but off the step
+            "blk.3.ffn_gate_inp_shexp.weight", // a shared-expert gate this arch never reads
+        ] {
+            let mut more = names.clone();
+            more.push(extra.into());
+            let err = refused(&format!("ernie-moe-extra-{extra}"), &more);
+            assert!(
+                err.starts_with(&format!("ernie4_5-moe: {extra} is not a tensor")),
+                "{err}"
+            );
+        }
+    }
+
+    /// The reference requires `interleave_moe_layer_step` (and asserts it positive) and sizes
+    /// every layer's experts from the first `expert_feed_forward_length` entry, so infr takes a
+    /// scalar or a uniform array and refuses the rest.
+    #[test]
+    fn ernie4_5_moe_refuses_what_the_reference_cannot_load() {
+        let names = ernie_moe_tensor_names(&ERNIE_MOE_LAYERS);
+        let keys_without = |drop: &str| -> Vec<(&str, u32)> {
+            ERNIE_MOE_KEYS
+                .iter()
+                .copied()
+                .filter(|(k, _)| *k != drop)
+                .collect()
+        };
+        let parse = |tag: &str, m: &SyntheticModel| config_from_fixture(tag, m);
+
+        let m = ernie_moe_fixture(&keys_without("interleave_moe_layer_step"), &names);
+        let err = parse("ernie-moe-nostep", &m).expect_err("the step is required");
+        assert_eq!(
+            err.to_string(),
+            "ernie4_5-moe.interleave_moe_layer_step missing"
+        );
+
+        let mut zero = keys_without("interleave_moe_layer_step");
+        zero.push(("interleave_moe_layer_step", 0));
+        let err = parse("ernie-moe-step0", &ernie_moe_fixture(&zero, &names))
+            .expect_err("a zero step is refused");
+        assert!(err.to_string().ends_with("must be positive"), "{err}");
+
+        let with_widths = |widths: Vec<u32>| {
+            let mut m = ernie_moe_fixture(&keys_without("expert_feed_forward_length"), &names);
+            m.meta.push((
+                "ernie4_5-moe.expert_feed_forward_length".into(),
+                Meta::U32Arr(widths),
+            ));
+            m
+        };
+        let cfg = parse("ernie-moe-ffarr", &with_widths(vec![8; 6]))
+            .expect("a uniform per-layer width parses");
+        assert_eq!(cfg.moe.map(|m| m.n_ff_exp), Some(8));
+        let err = parse(
+            "ernie-moe-ffarr-mixed",
+            &with_widths(vec![8, 8, 8, 8, 8, 16]),
+        )
+        .expect_err("differing per-layer widths are refused");
+        assert!(
+            err.to_string()
+                .starts_with("ernie4_5-moe.expert_feed_forward_length = [8, 8, 8, 8, 8, 16]"),
+            "{err}"
+        );
     }
 
     /// ernie4_5 is the llama block parsed as written: the head width comes from

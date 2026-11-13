@@ -6,6 +6,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **ERNIE 4.5 MoE (`ernie4_5-moe`).** Baidu's ERNIE-4.5-21B-A3B runs on the CPU
+  and Vulkan backends, with its experts resident or paged, and decodes on the
+  record-once replay: the dense `ernie4_5` attention, a routed FFN (6 of 64
+  experts) on every layer past the leading dense one and on the interleave step,
+  a softmax router whose `exp_probs_b` bias picks the experts while the unbiased
+  probabilities weight them, and a shared expert summed in. Its prefill logits
+  share llama.cpp's top-5, and a chat answer's 64 greedy tokens are the same
+  text as llama.cpp's, CPU against CPU and Vulkan against Vulkan. A file missing
+  a tensor this layout needs, or carrying one it does not use, is refused naming
+  it. The Metal backend applies the router bias too, on the same rule; that path
+  has not been run on Apple hardware.
+- **`infr_llama::Config::optional_router_bias`**: whether the arch's reference
+  loads `blk.N.exp_probs_b.bias` as optional on its MoE layers (deepseek2 and
+  ernie4_5-moe).
+
 ### Changed
 
 - **Chat templates turn non-strings into text as Python's Jinja2 does**, which
@@ -43,6 +60,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Vulkan MoE routing ranks softmax probabilities, as llama.cpp does, when a
+  router bias or expert groups take part.** `moe_topk.comp` ranked a
+  softmax-gated router by raw logit and then added the `exp_probs_b` bias, and
+  scored expert groups by summing logits; the reference adds the bias to, and
+  sums, the full-row softmax probabilities, which can select different experts.
+  The resident and paged paths both route through this kernel and were run with
+  the fix; expert-parallel calls the same kernel by reading the code, but was
+  not run. No file infr ran before reaches the changed rule: the bias-carrying
+  `deepseek2` / `deepseek32` / `deepseek4` files it runs are sigmoid or
+  sqrt-softplus gated, and softmax routing without a bias or groups is
+  unchanged. A softmax-gated `deepseek2` file carrying `expert_group_count` > 1
+  would have routed differently on Vulkan; none was run. ERNIE 4.5 MoE is the
+  first model that needs the rule.
 - **`{% break %}` and `{% continue %}` work in chat templates** (minijinja's
   `loop_controls` feature; Hugging Face loads `jinja2.ext.loopcontrols`).
   Cohere2MoE, Cohere's command-r7b tool-use template, Kimi-K3 and Reka-Edge were

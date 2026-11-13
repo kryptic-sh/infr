@@ -1849,6 +1849,178 @@ fn cpu_golden_ernie4_5() {
     check_golden(&model, ERNIE4_5_GOLDEN);
 }
 
+fn ernie4_5_21b_a3b() -> Option<PathBuf> {
+    find_gguf(
+        "unsloth--ERNIE-4.5-21B-A3B-PT-GGUF",
+        "ERNIE-4.5-21B-A3B-PT-Q4_K_M.gguf",
+    )
+}
+
+// Captured + verified coherent: a one-paragraph answer that Paris is the capital, and the numbers
+// one to twenty spelled out. The same hashes came out on Windows and on Linux (WSL), so neither is
+// `per_os`. On both prompts infr's CPU greedy ids equal llama.cpp's (CPU, same chat-rendered ids)
+// for 48 tokens; see docs/plan/02-ernie4-5.md.
+const ERNIE4_5_MOE_GOLDEN: &[(&str, usize, u64)] = &[
+    (
+        "What is the capital of France? Answer in one paragraph.",
+        32,
+        0x2bdcaa6640a6c155,
+    ),
+    ("Count from one to twenty in words.", 32, 0x181422562a27a9dd),
+];
+
+/// CPU-only: ERNIE 4.5 21B-A3B golden-hash lock — the routed FFN behind one leading dense layer,
+/// the softmax router with its `exp_probs_b` selection bias, and the ungated shared expert.
+#[test]
+#[ignore = "needs ERNIE-4.5-21B-A3B-PT in the HF cache"]
+fn cpu_golden_ernie4_5_moe() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    check_golden(&model, ERNIE4_5_MOE_GOLDEN);
+}
+
+/// ERNIE 4.5 21B-A3B's prompt prefill through the Vulkan seam against the CPU, in the loose MoE
+/// form (`gpu_seam_matches_cpu_qwen35moe`'s doc): six of 64 experts per token is a discrete
+/// selection a near tie can flip between the two backends, so the bar is mutual top-5 containment
+/// and a cosine floor on the last-row logits rather than equality. The cosine floor sits well
+/// under what this pair measures and far above what unrelated rows give
+/// (`cpu_prefill_matches_llama_debug_dump`'s table).
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_ernie4_5_moe() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    let rendered = model
+        .render_chat("Write a short paragraph about the ocean.")
+        .expect("render chat");
+    let tokens = model.encode(&rendered).expect("encode");
+    let cpu_last = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+    let gpu_last = model
+        .prefill_logits_vulkan(&tokens)
+        .expect("vulkan prefill");
+    assert_eq!(cpu_last.len(), gpu_last.len(), "logits shape");
+    assert!(
+        gpu_last.iter().all(|v| v.is_finite()),
+        "non-finite logit in the Vulkan prefill output"
+    );
+    let (cpu_top, gpu_top) = (top_k(&cpu_last, 5), top_k(&gpu_last, 5));
+    let max_abs = cpu_last
+        .iter()
+        .zip(&gpu_last)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let cos = cosine(&cpu_last, &gpu_last);
+    println!("cpu    top-5: {cpu_top:?}");
+    println!("vulkan top-5: {gpu_top:?}");
+    println!("cpu/vulkan max |logit diff| {max_abs}, whole-vocab cosine {cos}");
+    assert!(
+        cpu_top.iter().any(|&(id, _)| id == gpu_top[0].0)
+            && gpu_top.iter().any(|&(id, _)| id == cpu_top[0].0),
+        "CPU/Vulkan top tokens are not in each other's top-5: cpu={:?} vulkan={:?}",
+        cpu_top[0],
+        gpu_top[0]
+    );
+    assert!(
+        cos > 0.99,
+        "CPU/Vulkan last-row logits diverged: cosine={cos}"
+    );
+}
+
+/// Token identity between the Vulkan seam and the CPU oracle on ERNIE 4.5 21B-A3B, on a prompt
+/// picked for its margins. Along the 32-token answer ("1. One\n2. Two\n…"), measured on the two
+/// paths this test compares (2026-11-14): on the f32 reference CPU backend the oracle uses, the
+/// top-1 logit leads the runner-up by 0.5467 at the first token, 0.9894 at the third and at
+/// least 4.88 everywhere else; on Vulkan0's prefill by 0.5191 at the first token. At that first
+/// token the two paths' logits for the leading pair differ by 0.032 and 0.059, so the smallest
+/// lead is about nine times the larger gap. Thinner leads exist elsewhere — infr's production
+/// int8-activation CPU path leads by only 0.2335 there — which is why this compares against the
+/// reference backend.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_ernie4_5_moe_tokens() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "Count from one to twenty in words.", 32);
+}
+
+/// The paged MoE expert cache on ERNIE 4.5 21B-A3B: VRAM and DRAM budgets forced below the
+/// model, so routed experts stream from the host tier and from the file, must decode the same
+/// ids as the all-resident run (`gpu_seam_paged_moe_matches_resident_and_cpu` is the Qwen3-30B
+/// twin). The routed experts total 12309626880 bytes over the 27 MoE layers; one layer's banks are
+/// 489553920 bytes where its down projection is Q6_K and 424673280 where it is Q4_K. Two budgets,
+/// as the pager resolves them (`paging.stats`, Vulkan0): 4 GiB of VRAM holds 1581 of the 5184
+/// expert blocks while the 12 GiB DRAM tier holds them all; at 256 MiB / 512 MiB the VRAM arena
+/// is floored to 64 slots per pool (one layer's experts per role, above the budget) and the DRAM
+/// tier splits into 36 / 75 / 75 / 39 slots across the down-Q6_K / gate / up / down-Q4_K pools,
+/// so both down pools hold less than one layer and experts are re-read from the file every layer.
+/// Prefill is pinned to one row per chunk on every run so all of them take the same small-m
+/// expert kernels and a divergence can only be the pager's.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_paged_ernie4_5_moe_matches_resident() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    let n = 16usize;
+    let pin_ubatch = |c: &mut infr_llama::EngineConfig| {
+        c.device.ubatch = Some(1);
+        c.device.ubatch_specified = true;
+    };
+    let model = model_cfg(&path, pin_ubatch);
+    let rendered = model
+        .render_chat("Count from one to twenty in words.")
+        .expect("render chat");
+    let prompt_ids = model.encode(&rendered).expect("encode");
+
+    let mut resident_ids = Vec::new();
+    model
+        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+        .expect("resident gpu gen");
+    eprintln!(
+        "resident: {:?}",
+        model.decode(&resident_ids).expect("decode")
+    );
+
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    for (what, cache, dram) in [
+        ("4 GiB VRAM / 12 GiB DRAM", 4 * GIB, 12 * GIB),
+        ("256 MiB VRAM / 512 MiB DRAM", 256 * MIB, 512 * MIB),
+    ] {
+        let paged = model_cfg(&path, |c| {
+            pin_ubatch(c);
+            c.paging.cache = Some(infr_core::SizeSpec::Bytes(cache));
+            c.paging.dram = Some(infr_core::SizeSpec::Bytes(dram));
+            c.paging.stats = true;
+        });
+        let mut paged_ids = Vec::new();
+        paged
+            .generate_vulkan_ids(&prompt_ids, n, |id| paged_ids.push(id))
+            .expect("paged gpu gen");
+        assert_eq!(
+            paged_ids, resident_ids,
+            "paged MoE ({what}) diverged from the all-resident GPU run"
+        );
+    }
+}
+
+/// ERNIE 4.5 MoE decodes from one record-once recording on Vulkan: the routed FFN is replay-safe
+/// (GPU-side top-k feeding id-indexed expert kernels), so the router bias and shared expert must
+/// not knock it off that path (see [`gpu_seam_qwen3_decode_replays_from_one_recording`]).
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_ernie4_5_moe_decode_replays_from_one_recording() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    let (recordings, n_gen) = vulkan_decode_recordings(&path);
+    assert!(n_gen > 1, "too few tokens decoded to tell the paths apart");
+    assert_eq!(
+        recordings, 1,
+        "ERNIE-4.5-21B-A3B decoded {n_gen} tokens without the one record-once replay"
+    );
+}
+
 /// The Vulkan seam must match the CPU oracle token-for-token on ERNIE 4.5 0.3B. Run on the F16
 /// file: at Q4_K_M, after "The ocean is a vast,", the f32-activation oracle picks " vast" where
 /// the Vulkan seam, infr's production CPU path and llama.cpp's CPU all pick " dynamic" and then

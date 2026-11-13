@@ -55,10 +55,10 @@ different:
 
 `llama`, `llama4`, `qwen2`, `qwen3`, `qwen3moe`, `gemma3`, `gemma4` (dense / E2B
 / 26B-A4B MoE on the one string), `qwen35`, `qwen35moe`, `diffusion-gemma`,
-`bitnet`, `bitnet-b1.58`, `smollm3`, `ernie4_5`, and the DeepSeek line —
-`deepseek`, `deepseek2`, `deepseek32`, `deepseek4` (status per stage in
-[`deepseek.md`](deepseek.md): `deepseek4` loads but refuses any layer with a
-non-zero `compress_ratio`).
+`bitnet`, `bitnet-b1.58`, `smollm3`, `ernie4_5`, `ernie4_5-moe`, and the
+DeepSeek line — `deepseek`, `deepseek2`, `deepseek32`, `deepseek4` (status per
+stage in [`deepseek.md`](deepseek.md): `deepseek4` loads but refuses any layer
+with a non-zero `compress_ratio`).
 
 Fine-tunes on those backbones run with no code change (Ornith-1.0 and
 Ternary-Bonsai are the validated examples — see the root
@@ -321,13 +321,12 @@ here.
    (`compress_ratio` 4 and 128), tracked as B-DSV4-WIRING and B-DSV4-REAL in
    [`backlog.md`](backlog.md); until they land the shipped V4-Flash file is
    refused at layer 2.
-2. **GLM-4.7-Flash** (~30B MoE) or **Ernie 4.5 21B-A3B** (MoE). Mostly standard
-   MoE FFN — infr's batched-expert path covers it — plus minor arch quirks (GLM
-   post-norm / partial RoPE). Expect recipe steps 3–4 only for GLM; ERNIE's
-   softmax router with a selection bias also needs a Vulkan router change and
-   Metal support, scoped in [`plan/02-ernie4-5.md`](plan/02-ernie4-5.md). Some
-   GLM variants ship native MTP heads, which infr currently parks
-   ([`mtp.md`](mtp.md)) — those tensors go unused rather than unsupported.
+2. **GLM-4.7-Flash** (~30B MoE). Mostly standard MoE FFN — infr's batched-expert
+   path covers it — plus minor arch quirks (post-norm / partial RoPE); expect
+   recipe steps 3–4 only. Some GLM variants ship native MTP heads, which infr
+   currently parks ([`mtp.md`](mtp.md)) — those tensors go unused rather than
+   unsupported. ERNIE 4.5 21B-A3B, the other MoE named here, has landed
+   ([`plan/02-ernie4-5.md`](plan/02-ernie4-5.md)).
 3. **Nemotron-Nano / Nemotron-H** (Mamba2-Transformer hybrid MoE). Adds **Mamba2
    SSM**, extending the existing `Conv1dSilu` + `DeltaNet` linear-attention
    machinery — a real differentiator, since llama.cpp's Mamba-hybrid GGUF path

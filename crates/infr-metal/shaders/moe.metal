@@ -209,11 +209,17 @@ kernel void moe_reduce(device const float* y   [[buffer(0)]],
 // reduction is SKIPPED rather than run and overwritten — it exists only to rank experts. The
 // softmax shift/denominator and the weight formula are unchanged: `build_moe_ffn` reads the
 // weights out of `ggml_get_rows(probs, selected_experts)` on both routing paths.
-struct MoeTopkParams { uint n_expert; uint n_used; float scale; uint hash; };
+//
+// `has_bias != 0` = the router's `exp_probs_b` (ERNIE 4.5 MoE): selection ranks the softmax
+// PROBABILITY plus the bias (llama.cpp `selection_probs = ggml_add(probs, exp_probs_b)`, the CPU
+// reference's `sel_probs`), while the weights below still come from the unbiased probabilities.
+// Without a bias the ranking stays on the raw logit, the same order as the probability.
+struct MoeTopkParams { uint n_expert; uint n_used; float scale; uint hash; uint has_bias; };
 kernel void moe_topk(device const float* logits_all [[buffer(0)]],
                      device const uint*  hash_ids   [[buffer(1)]],
-                     device uint*        tbl_all    [[buffer(2)]],
-                     constant MoeTopkParams& p  [[buffer(3)]],
+                     device const float* bias       [[buffer(2)]],
+                     device uint*        tbl_all    [[buffer(3)]],
+                     constant MoeTopkParams& p  [[buffer(4)]],
                      uint gid [[thread_position_in_grid]]) {
     // one simdgroup (32 threads) per token row; each lane owns experts e = lane + 32j
     uint row = gid / 32u;
@@ -246,7 +252,8 @@ kernel void moe_topk(device const float* logits_all [[buffer(0)]],
             uint be = 0xFFFFFFFFu;
             uint j = 0u;
             for (uint e = lane; e < p.n_expert; e += 32u, j++) {
-                if ((taken & (1u << j)) == 0u && logits[e] > bv) { bv = logits[e]; be = e; }
+                float s = (p.has_bias != 0u) ? exp(logits[e] - maxl) / psum + bias[e] : logits[e];
+                if ((taken & (1u << j)) == 0u && s > bv) { bv = s; be = e; }
             }
             float m = simd_max(bv);
             // No lane offers an expert when every untaken logit is NaN or -inf: clamp the

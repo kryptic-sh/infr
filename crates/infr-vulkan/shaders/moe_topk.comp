@@ -11,14 +11,16 @@
 //   * `has_bias` — router bias (exp_probs_b) is added to the GATED selection probs (`probs +
 //     bias`, llama.cpp `selection_probs = ggml_add(probs, exp_probs_b)`), affecting SELECTION
 //     only; weights come from the unbiased probs. This breaks the old monotonicity invariant
-//     (top-k-by-logit ≠ top-k-by-score) — see `sel_score`.
+//     (top-k-by-logit ≠ top-k-by-score) — see `sel_score`. For softmax gating the probability is
+//     the full-row softmax (max and denominator over every expert, `ssm_max` / `ssm_sum`).
 //   * `n_expert_groups` / `n_expert_groups_used` — group-limited routing: per-group top-2 scores
 //     are summed for a group score; the top `n_expert_groups_used` groups are kept, the rest
 //     masked to -inf (matching llama.cpp `build_moe_ffn`).
 //
-// When neither extension is active (has_bias==0 && n_expert_groups<=1), this is byte-identical to
-// the previous version — the thread-0 pre-phase sets `ssel_adj` to all zeros, and every lane adds
-// zero to its local scores, so the arithmetic is unchanged.
+// When neither extension is active (has_bias==0 && n_expert_groups<=1), the arithmetic is that of
+// the pre-extension kernel — the thread-0 pre-phase sets `ssel_adj` to all zeros, every lane adds
+// zero to its local scores, and softmax selection still ranks raw logits (`sel_by_prob` is
+// false).
 //
 // DeepSeek V4 HASH ROUTING (`hash != 0`): the selection arrives pre-gathered in `hash_ids`
 // (`ffn_gate_tid2eid` indexed by token id, llama.cpp's `selected_experts_in`). Everything above
@@ -66,6 +68,12 @@ shared uint sidx[128];
 // B67 was exactly that drift, at 256 vs. the scan's headroom.
 shared float ssel_adj[gl_WorkGroupSize.x * MAX_CHUNKS];
 
+// The full-row softmax shift and denominator over every expert's unbiased logit, for
+// `sel_score`'s softmax branch when `sel_by_prob()`. Thread 0 fills both in the pre-phase, before
+// the barrier every other reader waits on; nothing reads them otherwise.
+shared float ssm_max;
+shared float ssm_sum;
+
 // WEIGHT score for one expert's (unbiased) logit. `mx` is the softmax shift and is used by the
 // softmax branch only: it must be >= every logit this is called with, or `exp` overflows. It is a
 // PARAMETER rather than a shared global because the right shift depends on which set the caller
@@ -90,17 +98,27 @@ float score_of(float logit, float mx) {
     }
 }
 
-// SELECTION score for the bias/groups extension — the gated PROBABILITY plus the router bias,
-// matching llama.cpp `selection_probs = ggml_add(probs, exp_probs_b)` (llama-graph.cpp:1882-1883)
-// and the CPU interpreter (`sel_probs[e] = probs[e] + bias[e]`). The pre-extension code selected
-// by raw logits, which is only equivalent when the bias is zero: sigmoid/sqrt-softplus are
-// strictly monotone in the logit, so their prob ordering IS the logit ordering, but `probs + bias`
-// is NOT monotone in `logits + bias`, so a real exp_probs_b model (V3/V3.1, sigmoid gated) would
-// route to different experts under the old code. Softmax keeps the raw-logit ordering (monotone in
-// the normalized prob; no real exp_probs_b model uses softmax gating).
+// Whether softmax selection must rank PROBABILITIES rather than raw logits: whenever a router
+// bias or group-limited routing feeds the ranking. Push-constant only, so workgroup-uniform.
+bool sel_by_prob() {
+    return pc.gating == 0u
+        && (pc.has_bias != 0u || (pc.n_expert_groups > 1u && pc.n_expert_groups_used > 0u));
+}
+
+// SELECTION score — the gated PROBABILITY, to which the caller adds the router bias / group mask,
+// matching llama.cpp `selection_probs = ggml_add(probs, exp_probs_b)` and its group scores (sums
+// of `selection_probs`) in `build_moe_ffn`, and the CPU interpreter (`sel_probs[e] = probs[e] +
+// bias[e]`). Selecting by raw logits is only equivalent when nothing is added and no group sums
+// are taken: sigmoid/sqrt-softplus are strictly monotone in the logit, but `probs + bias` is NOT
+// monotone in `logits + bias`, and neither is a sum of two probabilities in the sum of their
+// logits. Softmax is the one gating where the probability depends on the whole row, so it ranks
+// `exp(logit - ssm_max) / ssm_sum` (the CPU's arithmetic: shift by the row max, divide by the
+// ascending sum) under `sel_by_prob()`, and the raw logit otherwise — the same order as the
+// probability, and the path every bias-free, group-free softmax model takes unchanged. ERNIE 4.5
+// MoE (softmax + exp_probs_b) is the model that reaches the probability branch.
 float sel_score(float logit) {
     if (pc.gating == 0u) {
-        return logit;
+        return sel_by_prob() ? exp(logit - ssm_max) / ssm_sum : logit;
     } else if (pc.gating == 1u) {
         return 1.0 / (1.0 + exp(-logit));
     } else {
@@ -154,6 +172,16 @@ void select_topk(uint t, uint lbase, uint obase) {
     if (t == 0u) {
         bool do_adj = (pc.has_bias != 0u) || (pc.n_expert_groups > 1u && pc.n_expert_groups_used > 0u);
         if (do_adj) {
+            if (sel_by_prob()) {
+                // Full-row softmax over the UNBIASED logits, as the CPU computes `probs`: the
+                // max, then the ascending sum of shifted exps.
+                float mx = -1e30;
+                for (uint e = 0u; e < pc.n_expert; e++) { mx = max(mx, logits[lbase + e]); }
+                float sm = 0.0;
+                for (uint e = 0u; e < pc.n_expert; e++) { sm += exp(logits[lbase + e] - mx); }
+                ssm_max = mx;
+                ssm_sum = sm;
+            }
             // Start with bias (or zero).
             for (uint e = 0u; e < pc.n_expert; e++) {
                 ssel_adj[e] = (pc.has_bias != 0u) ? bias[e] : 0.0;

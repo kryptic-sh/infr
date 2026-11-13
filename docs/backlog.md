@@ -4586,6 +4586,10 @@ confirmed them. To run them in CI: add `unsloth/ERNIE-4.5-0.3B-PT-GGUF`
 `ERNIE-4.5-0.3B-PT-Q4_K_M.gguf` (240645600 bytes) to that job, drop the
 `#[ignore]`s, and wrap a hash in `per_os` if Linux differs.
 
+`cpu_golden_ernie4_5_moe` (the 21B-A3B MoE) is `#[ignore]`d too. Its two hashes
+are the same on Windows and Linux (WSL, 2026-11-14), but its file is 13331015456
+bytes, which is not a download for the `cpu-goldens` job.
+
 `gpu_seam_matches_cpu_ernie4_5` runs the ocean prompt on the F16 file (723955168
 bytes) because on Q4_K_M it fails on both GPUs: after "The ocean is a vast," the
 f32-activation CPU oracle (`generate_cpu_reference`) picks " vast", while the
@@ -4607,29 +4611,6 @@ error is invisible at Q4_K and above; they now say it can flip a near tie.
 chosen for its margins instead. Its 9-token answer is clear by at least 1.46 on
 every path, which also makes it blind to a Vulkan rope base off by 1000x (the
 32-token F16 case catches that one); it does catch a halved attention scale.
-
-### B168 — `Op::MoeFfn::exp_probs_b`'s doc says the bias is added to the logits (2026-11-13)
-
-**Tag:** docs · moe
-
-The field doc in `crates/infr-core/src/graph.rs` says the router bias is "added
-to logits for SELECTION only". The reference adds it to the GATED probabilities
-(`selection_probs = ggml_add(probs, exp_probs_b)` in `build_moe_ffn`), and so do
-the CPU backend (`sel_probs[e] = probs[e] + bias[e]`) and the Vulkan
-`moe_topk.comp` for sigmoid and sqrt-softplus gating. For softmax gating the
-Vulkan shader does add it to the raw logit, which is the bug item 3 of
-`docs/plan/02-ernie4-5.md` scopes; the doc should be corrected with that fix.
-
-Which files that can reach today: only `deepseek2` and `deepseek4` load
-`exp_probs_b` in infr (`deepseek2` covers `deepseek32`), and the real files of
-both that carry one are sigmoid or sqrt-softplus gated (V3, V3.2, V4), so no
-file infr is known to run takes the wrong path. A softmax-gated `deepseek2` file
-with a router bias would select the wrong experts on Vulkan today. Mistral Large
-3 is the softmax-gated `deepseek2` family: shard 1 of 9 of
-`unsloth/Mistral-Large-3-675B-Instruct-2512-GGUF` Q4_K_M (read with a 16 MiB
-range fetch; it carries the routers of layers 3–8) has `expert_gating_func = 1`
-and no `exp_probs_b`, and `conversion/mistral.py` does not name a correction
-bias. The other shards were not read.
 
 ### B169 — the llama.cpp logit oracle passes an ERNIE 4.5 with permuted Q/K (2026-11-13)
 
@@ -4710,3 +4691,79 @@ whitespace markers (an `{% if true %}` rewrite leaks the `set`: `out=2`), skip
 rewritten template against the oracle for the corpus conversations, not just by
 the row above. The other route is a minijinja hook (none in 2.24; 3.x not read,
 B171). Not started.
+
+### B173 — the CPU backend runs MoE models several times slower than llama.cpp's CPU (2026-11-14)
+
+**Tag:** perf · cpu · moe
+
+Measured on the Windows box (Ryzen 9 9950X3D) without a quiet window,
+`infr run --dev cpu --temp 0` against `llama-completion -ngl 0 --temp 0` on the
+same file and the same rendered chat prompt, each a fresh process:
+
+| model                    |     infr prefill | infr decode | llama.cpp prefill | llama.cpp decode |
+| ------------------------ | ---------------: | ----------: | ----------------: | ---------------: |
+| ERNIE-4.5-21B-A3B Q4_K_M | 19 tok @ 1 tok/s |   4.6 tok/s |       43.78 tok/s |      24.87 tok/s |
+| Qwen3-30B-A3B Q4_K_M     | 24 tok @ 1 tok/s |   3.4 tok/s |       59.51 tok/s |      29.75 tok/s |
+
+Both are MoE with about 3B active parameters, so the gap is the CPU `Op::MoeFfn`
+path's, not one arch's. Not profiled: whether the time is the routed experts'
+kernels, the staged pipeline in `infr-cpu`'s MoE arm, or first-touch page-in of
+the mapped expert banks (each run was a new process, but the file had been read
+by earlier runs) is unknown. A first step is `infr bench -ngl 0` with `-r 3` to
+separate a cold first rep from warm ones, then a profile of a warm decode.
+
+### B174 — the loose MoE prefill comparison passes a Vulkan router that ignores the bias (2026-11-14)
+
+**Tag:** tests · moe
+
+`gpu_seam_matches_cpu_ernie4_5_moe` scores the Vulkan prefill against the CPU in
+the recipe's loose MoE form (mutual top-5, a cosine floor). Run against the
+`moe_topk.comp` from before the softmax-plus-bias fix — which, on this model,
+routes as if the bias were absent — it still passed: cosine 0.9976271849367727
+and max |Δlogit| 0.813328 against 0.9986429426009094 and 0.5761112 with the fix.
+The token test on a margin-checked prompt
+(`gpu_seam_matches_cpu_ernie4_5_moe_tokens`) is what failed ("one, two, three,
+…" against "1. One\n2. Two\n…"). So for a MoE port the loose form shows the
+graph is wired, and only a token comparison on a prompt with measured leads
+shows the router picks the reference's experts. `docs/plan.md`'s recipe step 3
+says only the loose form for MoE; adding the token test to it is the change. Not
+done here because the recipe is shared text the next port should decide on.
+
+### B175 — llama.cpp's ERNIE 4.5 MoE loader and graph disagree on layer kinds for an interleave step above 1 (2026-11-14)
+
+**Tag:** moe · reference
+
+`llama_model_ernie4_5::load_arch_tensors` (`src/models/ernie4-5.cpp`) creates
+MoE tensors on every layer from `leading_dense_block_count` on, whatever
+`interleave_moe_layer_step` says, while the graph (`ernie4-5-moe.cpp`) runs a
+layer as MoE only when it is past the lead AND `(il + 1) % step == 0`. With a
+step above 1 a file cannot satisfy both: the loader wants expert tensors on the
+off-step layers, the graph then runs them dense with tensors it never created.
+infr follows the graph (`Config::is_moe_layer`, and `ernie4_5_moe_tensors`
+expects dense FFN tensors off the step and refuses MoE tensors there). Every
+ERNIE 4.5 MoE file seen has step 1 (the 21B-A3B Q4_K_M), where the two agree.
+Not checked: which layout Baidu's checkpoints or the converter would produce for
+a step above 1, or what the Hugging Face modelling code does. Revisit if such a
+file appears.
+
+### B176 — the renormalized MoE weight sum is clamped at 6.1e-5 in llama.cpp and at 1e-20 in infr (2026-11-14)
+
+**Tag:** moe · numerics
+
+llama.cpp's `build_moe_ffn` (`src/llama-graph.cpp`, the `norm_w` branch) clamps
+the selected weights' sum with
+`ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY)` (the smallest normal
+f16) before dividing (except `LLM_ARCH_DEEPSEEK41`, which adds 1e-20). infr's
+CPU backend (`Op::MoeFfn`), the Metal host path, the Metal `moe_topk` kernel and
+the parity harness's `moe_ref` use `max(sum, 1e-20)` on the selected
+probabilities; Vulkan's `moe_topk.comp` renormalizes exponentials shifted by the
+selection's largest logit, whose sum is at least 1, so its clamp never acts and
+it divides by the true sum. The two rules differ only when the selected UNBIASED
+probabilities sum below 6.1e-5, which a selection bias can in principle cause:
+ERNIE 4.5 MoE is the first softmax model with one. On the 21B-A3B Q4_K_M file it
+does not come close: `llama-eval-callback` on the chat-rendered "What is the
+capital of France? Answer in one paragraph." (19 prompt tokens, one generated)
+printed 314 values of `ffn_moe_weights_sum` across the 27 MoE layers (it elides
+middle rows), between 0.1847 and 0.8639. No change made; matching the clamp
+would only matter for a router whose bias routinely selects
+near-zero-probability experts.

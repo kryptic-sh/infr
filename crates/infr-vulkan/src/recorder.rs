@@ -13974,7 +13974,7 @@ mod tests {
     /// selection, not over the first pick.
     ///
     /// A router bias breaks the "first pick carries the largest logit" assumption — selection is by
-    /// `logit + bias`, weights come from the unbiased logits — so the first pick can be an expert
+    /// `prob + bias`, weights come from the unbiased logits — so the first pick can be an expert
     /// whose logit is far BELOW another selected one. Shifting by the first pick's logit then makes
     /// `exp(logit - shift)` overflow to `+inf`, and under `norm_w` the renormalization divides
     /// `inf/inf` = NaN. The gap here (0 vs 100) is synthetic: this is the hazard the shift protects
@@ -14028,7 +14028,7 @@ mod tests {
         let mut wb = vec![0u8; n_tokens * n_used * 4];
         be.download(bwts.as_ref(), &mut wb).unwrap();
         let wts: &[f32] = bytemuck::cast_slice(&wb);
-        // Selection is by `logit + bias`: 200 beats 100 beats the rest.
+        // Selection is by `prob + bias`: expert 0's ~0 + 200 beats expert 1's ~1, then the rest.
         assert_eq!(ids, &[0u32, 1], "selection order changed: {ids:?}");
         // Weights come from the UNBIASED logits, renormalized over the selection: expert 1's 100
         // dominates expert 0's 0, so the pair is ~[0, 1].

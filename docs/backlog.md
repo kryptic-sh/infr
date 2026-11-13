@@ -2305,24 +2305,15 @@ a hot path
 - **No read-ahead hint at model load.** `infr-gguf`'s `WillNeed` advice is
   `cfg(unix)`; the Windows equivalent is `PrefetchVirtualMemory`. Not measured
   whether load time on Windows suffers for it.
-- **`gpu_seam_kv_mainline_quants_coherent` fails on the 7900 XTX under Windows,
-  and it is the test, not the device.** Its `K=f16 V=turbo2` case continues the
-  raw (untemplated) prompt as `" -  -  -  - …"` on the AMD proprietary driver
-  (reproduced 2026-11-13, also with `INFR_NO_COOPMAT=1` and with
-  `INFR_NO_F16=1`, so coopmat is ruled out); it passes on the Ryzen iGPU on the
-  same driver and on Linux RADV on the 7900 XTX. A throwaway diagnostic compared
-  `prefill_logits_vulkan` with `prefill_logits_cpu` per KV format on prefixes of
-  `kv_check_prompt` (40, 70 and 80 tokens): for `V=turbo2` the cosine was 0.957
-  / 0.992 / 0.978 on the 7900 XTX and 0.943 / 0.991 / 0.977 on the iGPU, against
-  0.998 to 0.999 for an f16 cache on both, and it rises with the bit width on
-  both (`turbo4`: 0.993 to 0.998). So the discrete GPU is no further from the
-  CPU than the integrated one; 2-bit V on a 0.6B model sits close enough to a
-  greedy tie that `!is_degenerate` lands either way. The fix is B141's: score
-  the Vulkan KV formats numerically, as `assert_kv_formats_track_the_f32_cache`
-  does for the CPU, instead of asserting on the text. Needs a decision on what
-  replaces the `turbo2` text assertion. The same diagnostic showed `K=turbo2`
-  with an f16 V at cosine 0.5 to 0.74 against the CPU on both GPUs, which is the
-  "K needs more precision than V" rule and not a supported configuration.
+- **`K=turbo2` is far from the CPU on both GPUs.** A throwaway diagnostic
+  (2026-11-13) compared `prefill_logits_vulkan` with `prefill_logits_cpu` on
+  prefixes of `kv_check_prompt` (40, 70 and 80 tokens): `K=turbo2` with an f16 V
+  scored a logit cosine of 0.5 to 0.74 on both GPUs, against 0.94 to 0.99 for
+  `V=turbo2` with an f16 K. That is the "K needs more precision than V" rule,
+  and `K=turbo2` is not a configuration any test runs; recorded so the number is
+  not rediscovered as a GPU bug. (The 7900 XTX failure of the old text-asserting
+  Vulkan KV test, which this bullet used to describe, went with B141's numeric
+  check: `gpu_seam_kv_formats_track_cpu` passes on both GPUs.)
 - **Remaining iGPU benchmark exclusions.** `decode_gemv_bw` still needs
   device-selection preservation, scaled cache-busting allocations, bounded
   repetition submissions and asserted parity. `bandwidth_probe` needs a separate
@@ -3534,17 +3525,57 @@ the Apple target but were not run.
 
 ### B141 — assertions weaker than the tests' names (2026-11-11)
 
-- **The Vulkan KV-format "coherent" tests still assert only
-  `!is_degenerate(out)`**, which empty output, garbage and an implementation
-  that ignores the KV dtype all pass. Their CPU twins go through
-  `assert_kv_formats_track_the_f32_cache`: a format's logits must differ bit for
-  bit from both the f16 and the f32 cache's (so neither the default nor a silent
-  fall-back to f32 passes), and on most rows of a short repeated prompt the f32
-  cache's greedy token must be among the format's few best — a near-tie flip
-  counts as agreement, a broken quantizer does not (a q4_0 with its nibble
-  halves swapped agrees on no row, run). The floor sits above the share of rows
-  that are not copies of an earlier repetition, so a cache wrong on all of them
-  fails. The Vulkan ones have no all-rows logits API to score with.
+- **What the Vulkan KV-format check cannot see.** `gpu_seam_kv_q8_tracks_cpu`
+  and `gpu_seam_kv_formats_track_cpu` score every format through
+  `assert_vulkan_kv_formats_track_the_cpu`: the Vulkan seam's last-row logits on
+  `KV_VULKAN_PREFIXES` prefixes of `kv_check_prompt` (each a batched prefill
+  that writes the cache, then one decode step that reads it) must differ from
+  the Vulkan f16 cache's, and must reach a per-bit-width cosine floor against
+  the CPU reference backend running the same format. Measured 2026-11-13 on
+  Qwen3-0.6B; each item names its device. What it leaves uncovered:
+  - **An f32 cache is exempt from the "differs from f16" half, by design.**
+    Vulkan's attention is f16. The f32 cache is written by
+    `store_kv_f32_from_f16` for K (the f16 rope output) and `store_kv_f32` for V
+    (`store_kv_dense_kernel`), and read back through the `store_f16` cast into
+    the f16 scratch (bf16 goes through `dequant_kv_f16` instead). So the f32
+    cache holds K at f16 precision and V's cast to f16 moves from the write to
+    the read; its logits equal the f16 cache's bit for bit on every prefix,
+    observed on both GPUs. `store_kv_dense.comp` calls this a storage choice
+    bounded by the f16 query precision. An f32 KV cache on Vulkan therefore
+    costs twice the f16 memory and changes no logit — not a bug, but worth
+    knowing before recommending it.
+  - **A uniform scale error of a few percent passes** (all on the integrated
+    GPU). Inflating the GPU-stored block scale by 5% left the worst cosine at
+    0.9690 for a q4_0 V cache (floor 0.95) and 0.9952 for coupled q8_0 (floor
+    0.98). By 25% both fail: q4_0 at 0.9421 on the 31-token prefix, q8_0 at
+    0.9656 on the 31-token prefix (the first prefix under each floor; the run
+    stops there). The floors sit under what correct caches reach — turbo3 0.9722
+    on the 7900 XTX, iq4_nl 0.9749 and turbo2 0.9581 on the integrated GPU — so
+    a smaller error is inside one row's noise.
+  - **The coopmat prefill attention tiers are never reached.**
+    `verify_dense_vulkan` sizes the KV cache at the prompt plus two rows, and
+    the flash and nonfa tiers each need the KV length rounded up to their tile
+    to fit the cache, so on the 7900 XTX the prefixes long enough for those
+    tiers (64 prefill rows or more) fall back to the split-K or scalar
+    attention, while the integrated GPU (no coopmat) runs `attn_nc_fa` for them.
+    The two GPUs therefore run different prefill attention in this test, and the
+    flash prefill with its padded dequant scratch is exercised by no KV-format
+    test. Established by reading the gates; which of split-K or scalar runs was
+    not instrumented.
+  - **Multi-step decode is covered only by text.** With `logits_out` set, the
+    chained decode is off and each forward runs exactly one decode step, so the
+    replay tape advancing over many steps, and decode reading rows written by
+    earlier decode steps, are reached only by the q8 test's
+    `generate_vulkan_session` text check.
+  - **Every quantised format sits on V except q8_0.** No low-bit, iq4_nl or
+    turbo K is quantised and no coupled low-bit K==V pair runs, so the
+    `flash_dequant` path and the opt-in inline decode (`kv.inline_decode`) are
+    never reached.
+  - **The `kv.force_q8` alias runs only on the session text path**; the numeric
+    check names q8_0 through `kv_types`.
+  - **Only the last row of each prefix is scored**, so the batched prefill's
+    attention is checked only through what it writes into later layers' cache,
+    not row by row.
 - **Reported, not re-read:** `metal_kv_scratch_paths_are_coherent` pins one hash
   for eight KV formats with no f16 control; `mtp_head_trunk_acceptance_rate`
   prints the rate and asserts nothing about it (its model is not cached); no
@@ -3964,8 +3995,9 @@ Windows 11 dev box (Ryzen 9 9950X3D, AMD proprietary driver) with
   model is cached: `cpu_golden_qwen3`, `cpu_golden_gemma3`, `cpu_golden_qwen35`,
   `cpu_golden_qwen3_quants` (the rows whose file is cached), the
   `cpu_kv_*_coherent` tests, the CPU paging tests, `gpu_seam_golden_qwen3`,
-  `gpu_seam_flash_matches_cpu`, `gpu_seam_kv_mainline_quants_coherent`,
-  `gpu_seam_kv_q8_coherent`, `gpu_seam_kv_reuse_matches_fresh`,
+  `gpu_seam_flash_matches_cpu`, `gpu_seam_kv_mainline_quants_coherent` and
+  `gpu_seam_kv_q8_coherent` (since replaced by `gpu_seam_kv_formats_track_cpu`
+  and `gpu_seam_kv_q8_tracks_cpu`), `gpu_seam_kv_reuse_matches_fresh`,
   `gpu_seam_matches_cpu_gemma3`, `gpu_seam_matches_cpu_qwen2`,
   `gpu_seam_multi_slot_prefix_sharing`, `h_tap_matches_lm_head`,
   `qwen35_trunk_unaffected`, `unified_qwen35_gpu_seam_matches_cpu` and
@@ -3976,7 +4008,7 @@ Notes and gaps:
 - **The 7900 XTX was run afterwards, the same day** (`INFR_DEV=Vulkan0`): the
   same `infr-vulkan` selection passed (293 tests by the runners' own totals),
   and so did the `infr-llama` selection apart from
-  `gpu_seam_kv_mainline_quants_coherent`, which is B75's known failure. The
+  `gpu_seam_kv_mainline_quants_coherent`, which was B75's known failure. The
   multi-GPU tests (`expert_parallel_*`, `tensor_parallel_*`,
   `pipeline_matches_single_device`, `two_models_two_devices_concurrent`) were
   included there and reported ok; whether each executed or returned early was

@@ -1704,9 +1704,9 @@ impl Backend for CpuBackend {
                                 // this backend deliberately differs on exact-halfway activations.
                                 // That is intentional and safe: no path pins the CPU KV Q8 bytes
                                 // bit-for-bit — the CPU/GPU KV Q8 tests are all coherence/tolerance
-                                // checks (kv_q8_roundtrip err<0.02, gpu_seam_kv_q8_coherent), never
-                                // exact-byte goldens — and halfway ties are vanishingly rare, so the
-                                // <0.5 LSB difference never changes a decoded token.
+                                // checks (kv_q8_roundtrip err<0.02, gpu_seam_kv_q8_tracks_cpu),
+                                // never exact-byte goldens — and halfway ties are vanishingly rare,
+                                // so the <0.5 LSB difference never changes a decoded token.
                                 // `base`/`n` are element counts and rows are 32-aligned (the runner
                                 // gates on it), so blocks never straddle a write.
                                 debug_assert!(base % 32 == 0 && n % 32 == 0);

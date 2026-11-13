@@ -548,8 +548,10 @@ pub(crate) fn generate_dense_backend(
         && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
     // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan + Metal; need 32-block alignment.
     let blk_ok = matches!(be.name(), "cpu" | "vulkan" | "metal") && kv_align_ok;
-    // Dense f32/bf16 KV: CPU + Vulkan + Metal. Vulkan/Metal store dense; f32 reads natively (its
-    // own f32 attention), bf16 reads via a cast→f16 prepass.
+    // Dense f32/bf16 KV: CPU + Vulkan + Metal. Metal reads f32 natively (see the mixed-format clamp
+    // below). Vulkan reads both through a prepass into an f16 scratch for its f16 attention (f32
+    // via the `store_f16` cast, bf16 via `dequant_kv_f16`), so there an f32 cache yields the f16
+    // cache's numerics.
     let dense_ok = matches!(be.name(), "cpu" | "vulkan" | "metal");
     // The requested format's NAME is parsed by the shared grammar (`infr_core::budget`, the same
     // table the placement estimator prices with); only the per-format CAPABILITY gates below are

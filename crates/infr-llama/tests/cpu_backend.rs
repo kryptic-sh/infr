@@ -346,6 +346,13 @@ fn logits_digest(logits: &[f32]) -> u64 {
     h.finish()
 }
 
+/// [`kv_check_prompt`] rendered through the model's chat template and tokenized.
+fn kv_check_ids(model: &infr_llama::SeamModel) -> Vec<u32> {
+    model
+        .encode(&model.render_chat(&kv_check_prompt()).expect("render chat"))
+        .expect("encode")
+}
+
 fn kv_rows(path: &std::path::Path, k: &str, v: &str, ids: &[u32]) -> Vec<f32> {
     model_cfg(path, |c| kv_types(c, k, v))
         .verify_logits_and_h_cpu(ids)
@@ -381,10 +388,7 @@ fn kv_tops(logits: &[f32], rows: usize) -> Vec<Vec<usize>> {
 fn kv_reference(path: &std::path::Path) -> &'static KvReference {
     static REFERENCE: std::sync::OnceLock<KvReference> = std::sync::OnceLock::new();
     REFERENCE.get_or_init(|| {
-        let model = model_cfg(path, |c| kv_types(c, "f32", "f32"));
-        let ids = model
-            .encode(&model.render_chat(&kv_check_prompt()).expect("render chat"))
-            .expect("encode");
+        let ids = kv_check_ids(&model_cfg(path, |c| kv_types(c, "f32", "f32")));
         let f32 = kv_rows(path, "f32", "f32", &ids);
         let picks = kv_picks(&f32, ids.len());
         let f32 = logits_digest(&f32);
@@ -428,6 +432,172 @@ fn assert_kv_formats_track_the_f32_cache(path: &std::path::Path, formats: &[(&st
             agree as f64 >= KV_ROW_AGREEMENT_MIN * rows as f64,
             "K={k} V={v} agrees with the f32 cache on {agree} of {rows} rows (floor {KV_ROW_AGREEMENT_MIN})"
         );
+    }
+}
+
+/// How many prefixes of [`kv_check_prompt`] the Vulkan KV-format check scores. The Vulkan seam
+/// hands back only the last row's logits, so each prefix is a whole forward: a batched prefill that
+/// writes the cache and attends over it, then the prefix's final token through the decode
+/// attention, which reads the cache back again. Spread from a quarter of the prompt to its end, so
+/// most of them sit inside a repetition the cache has to supply.
+const KV_VULKAN_PREFIXES: usize = 8;
+
+/// Lowest logit cosine, on any scored prefix, between the Vulkan seam and the CPU reference running
+/// the SAME cache format, for formats of eight bits or more per element. Measured worst on
+/// Qwen3-0.6B (2026-11-13, both the 7900 XTX and the integrated RDNA2 GPU): 0.9963, for K=f16
+/// V=q8_0 on the integrated GPU. A GPU row scored against the CPU's PREVIOUS row — a cache that
+/// served the wrong position — measured about 0.5 for every format, so the floor sits far from
+/// both. A uniform error of a few percent in a stored block scale stays above every floor; the
+/// measurements are in `docs/backlog.md` § B141.
+const KV_VULKAN_COSINE_MIN: f64 = 0.98;
+
+/// [`KV_VULKAN_COSINE_MIN`] for the 3- to 5-bit formats (the 4- and 5-bit block quants, iq4_nl,
+/// turbo3, turbo4). Their GPU and CPU runs round differently into a coarse grid, and on a 0.6B model
+/// that moves the logits further: measured worst 0.9722 (K=f16 V=turbo3, 7900 XTX), with iq4_nl at
+/// 0.9749 next (integrated GPU).
+const KV_VULKAN_COSINE_MIN_LOW_BIT: f64 = 0.95;
+
+/// [`KV_VULKAN_COSINE_MIN`] for turbo2, the one 2-bit format: measured worst 0.9581 (K=f16
+/// V=turbo2, integrated GPU).
+const KV_VULKAN_COSINE_MIN_2BIT: f64 = 0.93;
+
+/// The cosine floor for one `(K, V)` format: the floor of its less precise side. A format with no
+/// tier here panics rather than borrowing another format's floor.
+fn kv_vulkan_cosine_floor(k: &str, v: &str) -> f64 {
+    let floor = |dt: &str| match dt {
+        "f32" | "f16" | "bf16" | "q8_0" => KV_VULKAN_COSINE_MIN,
+        "q4_0" | "q4_1" | "q5_0" | "q5_1" | "iq4_nl" | "turbo3" | "turbo4" => {
+            KV_VULKAN_COSINE_MIN_LOW_BIT
+        }
+        "turbo2" => KV_VULKAN_COSINE_MIN_2BIT,
+        other => panic!("no Vulkan KV cosine floor for format {other:?}"),
+    };
+    floor(k).min(floor(v))
+}
+
+/// How many of the [`KV_VULKAN_PREFIXES`] scored prefixes may have the CPU's greedy token outside
+/// the Vulkan seam's top [`KV_TOP_K`]. One, so a single near-tie flip between backends passes and a
+/// second does not; every format measured none (2026-11-13, both GPUs).
+const KV_VULKAN_PICK_MISSES_MAX: usize = 1;
+
+/// What every Vulkan KV-format check compares against, computed once per test binary: the
+/// prompt's tokens, the prefixes scored, and the Vulkan seam's own f16-cache logits on them.
+struct VulkanKvReference {
+    ids: Vec<u32>,
+    prefixes: Vec<usize>,
+    f16: Vec<Vec<f32>>,
+}
+
+/// The Vulkan seam's last-row logits for each prefix, on a `(K, V)` cache.
+fn kv_vulkan_rows(
+    path: &std::path::Path,
+    k: &str,
+    v: &str,
+    r: &VulkanKvReference,
+) -> Vec<Vec<f32>> {
+    let model = model_cfg(path, |c| kv_types(c, k, v));
+    r.prefixes
+        .iter()
+        .map(|&p| {
+            model
+                .prefill_logits_vulkan(&r.ids[..p])
+                .expect("vulkan logits")
+        })
+        .collect()
+}
+
+fn kv_vulkan_reference(path: &std::path::Path) -> &'static VulkanKvReference {
+    static REFERENCE: std::sync::OnceLock<VulkanKvReference> = std::sync::OnceLock::new();
+    REFERENCE.get_or_init(|| {
+        let ids = kv_check_ids(&model_default(path));
+        let first = ids.len() / 4;
+        let prefixes = (0..KV_VULKAN_PREFIXES)
+            .map(|i| first + i * (ids.len() - first) / (KV_VULKAN_PREFIXES - 1))
+            .collect();
+        let mut r = VulkanKvReference {
+            ids,
+            prefixes,
+            f16: Vec::new(),
+        };
+        r.f16 = kv_vulkan_rows(path, "f16", "f16", &r);
+        assert_vulkan_kv_rows_track_the_cpu(path, "f16", "f16", &r, &r.f16);
+        r
+    })
+}
+
+/// Score Vulkan last-row logits on a `(K, V)` cache against the CPU REFERENCE backend (f32
+/// weights, f32 dot — the oracle `seam_vulkan_matches_cpu` uses) running the same format: on every
+/// prefix the two must reach the format's cosine floor, and the CPU's greedy token may fall outside
+/// the GPU's top [`KV_TOP_K`] on at most [`KV_VULKAN_PICK_MISSES_MAX`] of the prefixes.
+fn assert_vulkan_kv_rows_track_the_cpu(
+    path: &std::path::Path,
+    k: &str,
+    v: &str,
+    r: &VulkanKvReference,
+    gpu: &[Vec<f32>],
+) {
+    let cpu = model_cfg(path, |c| {
+        kv_types(c, k, v);
+        c.kernels.cpu.reference = true;
+    })
+    .verify_logits_and_h_cpu(&r.ids)
+    .expect("all-rows logits")
+    .0;
+    let vocab = cpu.len() / r.ids.len();
+    let floor = kv_vulkan_cosine_floor(k, v);
+    let mut agree = 0;
+    let mut worst = f64::INFINITY;
+    assert_eq!(gpu.len(), r.prefixes.len(), "one GPU row per prefix");
+    for (&p, got) in r.prefixes.iter().zip(gpu) {
+        let want = &cpu[(p - 1) * vocab..p * vocab];
+        let cos = cosine(got, want);
+        worst = worst.min(cos);
+        assert!(
+            cos >= floor,
+            "Vulkan K={k} V={v}: logit cosine {cos:.4} against the CPU on the {p}-token prefix (floor {floor})"
+        );
+        let pick = kv_picks(want, 1)[0];
+        if pick.is_some_and(|p| kv_tops(got, 1)[0].contains(&p)) {
+            agree += 1;
+        }
+    }
+    let rows = r.prefixes.len();
+    eprintln!(
+        "Vulkan KV K={k} V={v}: worst cosine {worst:.4} against the CPU, {agree} of {rows} picks agree"
+    );
+    assert!(
+        rows - agree <= KV_VULKAN_PICK_MISSES_MAX,
+        "Vulkan K={k} V={v} misses the CPU's pick on {} of {rows} prefixes (at most {KV_VULKAN_PICK_MISSES_MAX})",
+        rows - agree
+    );
+}
+
+/// The Vulkan twin of [`assert_kv_formats_track_the_f32_cache`]: every `(K, V)` cache format must
+/// (a) actually reach the cache — its logits differ from the Vulkan f16 cache's — and (b) track the
+/// CPU reference running the same format (see [`assert_vulkan_kv_rows_track_the_cpu`]).
+///
+/// The f32 cache is exempt from (a), by design: Vulkan's attention is f16, so it writes K from the
+/// f16 rope output and casts the f32 cache back to an f16 scratch before reading it (see
+/// `store_kv_dense.comp`). The only rounding an f32 cache would remove — V's cast to f16 — happens
+/// at the read instead of the write, so its logits equal the f16 cache's bit for bit. It is still
+/// scored on (b).
+fn assert_vulkan_kv_formats_track_the_cpu(path: &std::path::Path, formats: &[(&str, &str)]) {
+    let r = kv_vulkan_reference(path);
+    let f16 = r
+        .f16
+        .iter()
+        .map(|row| logits_digest(row))
+        .collect::<Vec<_>>();
+    for &(k, v) in formats {
+        let got = kv_vulkan_rows(path, k, v, r);
+        if (k, v) != ("f32", "f32") {
+            let digests = got.iter().map(|row| logits_digest(row)).collect::<Vec<_>>();
+            assert!(
+                digests != f16,
+                "Vulkan K={k} V={v} produced the f16 cache's logits bit for bit — the dtype never reached the cache"
+            );
+        }
+        assert_vulkan_kv_rows_track_the_cpu(path, k, v, r, &got);
     }
 }
 
@@ -774,93 +944,70 @@ fn gpu_seam_kv_reuse_matches_fresh() {
     );
 }
 
-/// Q8_0 KV cache on the Vulkan seam. COUPLED K==V==q8 (INFR_KV_Q8) decode now rides the
-/// record-once replay (store_q8_dyn planar write + attn_partial_dynac_q8 / attention_kv_dyn_q8
-/// planar read, pos/kv_len from the self-advancing params SSBO), so (a)/(b) exercise the replayed
-/// tape end to end plus the static prefill (store_q8 + flash dequant). DECOUPLED sides (c) still
-/// force per-execute static decode (per-side attn_partial_{k,v}q8 kernels). All must produce
-/// coherent (non-degenerate) greedy output. Q8 KV shifts the numerics (no exact match with the
-/// f16 golden), but the near-lossless quant must stay sensible; a broken quantize/dequant, a
-/// mis-gated kernel, or a wrong planar scales base (`cap`) would collapse or garble the output.
+/// Q8_0 KV cache on the Vulkan seam, scored numerically by
+/// [`assert_vulkan_kv_formats_track_the_cpu`]. COUPLED K==V==q8 decode rides the record-once replay
+/// (store_q8_dyn planar write + attn_partial_dynac_q8 / attention_kv_dyn_q8 planar read), the
+/// prefill the static store_q8 + flash dequant; each DECOUPLED side forces per-execute static
+/// decode (per-side attn_partial_{k,v}q8 kernels reading one Q8 side and one f16 side). Every
+/// scored prefix ends in a decode step, so each of those kernels reads the cache the prefill wrote.
+/// A broken quantize/dequant, a mis-gated kernel or a wrong planar scales base (`cap`) moves the
+/// logits off the CPU's.
+///
+/// The session path (`kv.force_q8`, the `INFR_KV_Q8` alias, through `generate_vulkan_session`)
+/// keeps a text check: q8 tracks the CPU closely enough that a collapsed generation there is a
+/// bug, not a near-tie.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_kv_q8_coherent() {
+fn gpu_seam_kv_q8_tracks_cpu() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let mut _tlk = test_serial_lock();
-    let head = |s: &str| s.chars().take(64).collect::<String>();
-    // A prompt long enough (>64 tokens) to take the prefill path, then a deep-cache decode.
-    let long =
-        "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6);
+    assert_vulkan_kv_formats_track_the_cpu(
+        &path,
+        &[("q8_0", "q8_0"), ("q8_0", "f16"), ("f16", "q8_0")],
+    );
 
     let model = model_cfg(&path, |c| c.kv.force_q8 = true);
-    // (a) one-shot static path.
-    let g_static = model
-        .generate_dense_vulkan(&long, 24)
-        .expect("q8 static gen");
-    assert!(
-        !is_degenerate(&g_static),
-        "Q8 static Vulkan output degenerate: {:?}",
-        head(&g_static)
-    );
-    // (b) session path (record-once: the whole decode loop replays ONE recorded Q8 tape).
     let mut sess = model.vulkan_session(512).expect("q8 session");
-    let mut g_sess = String::new();
+    let mut out = String::new();
     model
-        .generate_vulkan_session(&mut sess, &long, 24, None, |p| g_sess.push_str(p))
+        .generate_vulkan_session(&mut sess, &kv_check_prompt(), 24, None, |p| out.push_str(p))
         .expect("q8 session gen");
     assert!(
-        !is_degenerate(&g_sess),
+        !is_degenerate(&out),
         "Q8 session Vulkan output degenerate: {:?}",
-        head(&g_sess)
+        out.chars().take(64).collect::<String>()
     );
-
-    // (c) DECOUPLED K/V: each mixed side (K=q8/V=f16 and K=f16/V=q8) must also stay coherent — the
-    // per-side attn_partial_{k,v}q8 / attention_kv_{k,v}q8 variants read one Q8 side + one f16 side.
-    for (k, v) in [("q8_0", "f16"), ("f16", "q8_0")] {
-        let m = model_cfg(&path, |c| kv_types(c, k, v));
-        let out = m.generate_dense_vulkan(&long, 20).expect("mixed gen");
-        assert!(
-            !is_degenerate(&out),
-            "mixed K={k} V={v} Vulkan output degenerate: {:?}",
-            head(&out)
-        );
-    }
 }
 
-/// Mainline low-bit KV quants on the Vulkan seam: q4_0/q4_1/q5_0/q5_1/iq4_nl run via a quantizing
-/// WriteKv (quant_kv) + a dequant→f16 prefix prepass (dequant_kv_f16, reusing native_decode) feeding
-/// the standard f16 flash/split/scalar attention. K=f16 with each quantized V must stay coherent
-/// (K needs higher precision). A broken GPU quantize or dequant would garble even a V-only cache.
+/// The other KV cache formats on the Vulkan seam, scored numerically by
+/// [`assert_vulkan_kv_formats_track_the_cpu`]: the low-bit block quants q4_0/q4_1/q5_0/q5_1/iq4_nl
+/// (a quantizing WriteKv, quant_kv, plus a dequant→f16 prepass, dequant_kv_f16, feeding the f16
+/// attention), the dense f32/bf16 caches (coupled), and the TurboQuant widths (quant_turbo plus
+/// dequant_turbo_f16). The quantized ones run on V with K=f16, since K needs higher precision.
+///
+/// No text assertion: greedy text on a 0.6B model with a 2-bit V cache sits close enough to a tie
+/// that it degenerated on the 7900 XTX and not on an integrated GPU (2026-11-13) while the logits
+/// tracked the CPU equally well on both.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_kv_mainline_quants_coherent() {
+fn gpu_seam_kv_formats_track_cpu() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let mut _tlk = test_serial_lock();
-    let head = |s: &str| s.chars().take(64).collect::<String>();
-    // Long enough (>64 tokens) to take the flash prefill on the dequanted scratch, then deep decode.
-    let long =
-        "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6);
-    // K=f16 with each quantized V, plus the dense f32/bf16 caches (coupled).
-    for (k, v) in [
-        ("f16", "q4_0"),
-        ("f16", "q4_1"),
-        ("f16", "q5_0"),
-        ("f16", "q5_1"),
-        ("f16", "iq4_nl"),
-        ("f32", "f32"),
-        ("bf16", "bf16"),
-        ("f16", "turbo2"),
-        ("f16", "turbo3"),
-        ("f16", "turbo4"),
-    ] {
-        let model = model_cfg(&path, |c| kv_types(c, k, v));
-        let out = model.generate_dense_vulkan(&long, 24).expect("gpu kv gen");
-        assert!(
-            !is_degenerate(&out),
-            "GPU K={k} V={v} degenerate: {:?}",
-            head(&out)
-        );
-    }
+    assert_vulkan_kv_formats_track_the_cpu(
+        &path,
+        &[
+            ("f16", "q4_0"),
+            ("f16", "q4_1"),
+            ("f16", "q5_0"),
+            ("f16", "q5_1"),
+            ("f16", "iq4_nl"),
+            ("f32", "f32"),
+            ("bf16", "bf16"),
+            ("f16", "turbo2"),
+            ("f16", "turbo3"),
+            ("f16", "turbo4"),
+        ],
+    );
 }
 
 /// Multi-slot KV prefix sharing: two INTERLEAVED conversations with a common long prefix (a
@@ -2197,6 +2344,8 @@ const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
 /// Whole-vector cosine similarity (f64 accumulation) — used by the CPU/Vulkan cross-backend
 /// logits check below.
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    // `zip` would stop at the shorter slice and score a partial row as a whole one.
+    assert_eq!(a.len(), b.len(), "cosine over slices of different lengths");
     let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
     for (&x, &y) in a.iter().zip(b.iter()) {
         dot += (x as f64) * (y as f64);

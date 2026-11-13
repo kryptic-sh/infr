@@ -4194,3 +4194,113 @@ Still not read by any pass, stated as a gap:
 - **Nothing was run on:** an Intel or NVIDIA GPU, a multi-GPU world beyond
   opening one, or a Metal device outside CI. Windows was run on 2026-11-13; see
   B154 for what that covered.
+
+### B157 — the decode-replay gate is a hand-kept mirror, and a miss is silent garbage (2026-11-13)
+
+**Tag:** vulkan · metal · seam · correctness · performance
+
+`generate_dense_backend` (`crates/infr-llama/src/seam/runner.rs`) builds the
+decode graph ONCE at `pos = 0` / `kv_len = 1` when its `dyn_replay` gate says
+the backend will replay it. The Vulkan adapter decides replay on its own, in
+`decode_eligible` (`crates/infr-vulkan/src/adapter.rs`), and when that says no,
+`execute` runs the graph through `execute_static`, baked positions and all. So
+every reason `decode_eligible` refuses a graph has to be copied into the
+runner's gate by hand, and a missed one does not fail: every decode token writes
+KV row 0 and attends one row.
+
+It has now been missed three times. The `deepseek2` and `deepseek4` terms of the
+gate each describe the same trap, and SmolLM3 hit it on 2026-11-13: its NoPE
+layers write K through `Op::Copy` → f16 `WriteKv`, which `decode_eligible`
+refuses, while the gate excluded only `llama4`. `gpu_seam_matches_cpu_smollm3`
+on `INFR_DEV=Vulkan1` produced `"systemsystemsystem…"`, and passed with
+`kernels.vulkan.no_replay = true`. The gate now has a `c.no_rope_step == 0` term
+beside `!c.llama4`, and the test passes on both GPUs.
+
+**Not done: making a miss loud.** The adapter cannot tell a graph built for
+replay from a static decode graph at position 0 (the same ops, the same baked
+`pos`/`kv_len`), and the runner cannot ask the adapter (`VkDecodePlan` and the
+`adapter` module are private; `Backend` has no eligibility query). Either fix
+crosses crates:
+
+- **The narrow one:** a `Graph` flag beside `no_decode_replay` (`infr-core`
+  `graph.rs`, say `built_for_replay`), set by the runner on the replay build.
+  The adapter's `execute` / `execute_chain` return an `Err` naming the refusing
+  op when the flag is set and the plan is not eligible (or the backend is
+  paged). Metal's `replay_shape` (`crates/infr-metal/src/exec.rs`) needs the
+  same check, and only macOS CI compiles it. Test: a NoPE-shaped synthetic graph
+  with the gate term removed must return the error, not tokens.
+- **The real one:** a `Backend` query on the compiled plan (or graph), which the
+  runner consults after `compile` and falls back to the per-token path on a
+  "no". The gate's terms then become an optimisation (skip building a plan that
+  will not replay), not a correctness condition.
+
+**The cost to SmolLM3:** decode re-records every token on Vulkan. Seen on
+2026-11-13 on a busy machine, not a measurement: 205.5 tok/s decode on Vulkan0
+and 11.2 tok/s on Vulkan1 for a 37-token reply. Closing it needs either a `_dyn`
+twin for the standalone f16→f16 `WriteKv` (the K write a NoPE layer makes) or a
+fuse that writes the cast K straight into the cache the way `plan_kv_write` does
+for rope → `WriteKv`. llama4's rope layers have the same need, for their
+L2-normed K.
+
+### B158 — infr renders chat templates without trim_blocks / lstrip_blocks (2026-11-13)
+
+**Tag:** chat · correctness
+
+infr-chat's template environment (`build_env` in
+`crates/infr-chat/src/template.rs`, from line 98) never turns on minijinja's
+`trim_blocks` or `lstrip_blocks`. llama.cpp's jinja lexer has both on by default
+for chat templates (`common/jinja/lexer.cpp` lines 132–138:
+`opt_lstrip_blocks = true`, `opt_trim_blocks = true`), and HF's
+`apply_chat_template` does the same. So a newline after a block or comment tag
+that the reference drops stays in infr's prompt.
+
+Seen on SmolLM3's template (unsloth's GGUF): the newline after its third line's
+comment survives because the fourth line, `{# ───── defaults ───── #}`, has no
+`-` to trim it, so infr's render starts with `"\n"`.
+`infr run --set debug.chat=true` shows it, and llama.cpp tokenizes that render
+to 79 tokens with a leading 198 (`\n`), the same count infr prefilled. A
+llama.cpp render would not carry it. `cpu_golden_smollm3` locks that render in,
+so turning the options on will move its hashes. Not checked: how many other
+shipped templates differ, and which other golden hashes move. That is its own
+slice, with re-blessing.
+
+### B159 — SmolLM3's tool definitions are dropped silently (2026-11-13)
+
+**Tag:** chat · tools
+
+`render_template` (`crates/infr-chat/src/template.rs`) passes tool definitions
+as `tools`. SmolLM3's template reads `xml_tools` and `python_tools` and never
+`tools`, so a request with tools renders exactly as one without them, and the
+model is never told they exist. Nothing errors. A fix maps `tools` to
+`xml_tools` for templates that name it (and checks the `<tool_call>` reply
+parses through the existing dialect), or refuses tools for such a template.
+
+### B160 — two deepseek2 parses that differ from llama.cpp (2026-11-13)
+
+**Tag:** deepseek · config · found by a separate read, verified by reading both
+sides; not fixed
+
+- **YaRN beta corners.** `Config::from_gguf` reads `rope.scaling.yarn_beta_fast`
+  / `yarn_beta_slow` for `deepseek2` and `deepseek32` (defaults 32 / 1).
+  llama.cpp's `deepseek2.cpp` and `deepseek32.cpp` never read those keys, and
+  the generic loader does not either; only `grok.cpp`, `k2-horizon.cpp`,
+  `laguna.cpp` and `mistral3.cpp` do. So the reference always uses the
+  `llama_hparams` defaults (32 / 1), and a file that carries other values would
+  rope differently in infr. No such file is known.
+- **Absent `expert_gating_func`.** infr maps an absent key to softmax
+  unconditionally (`0 | 1 => MoeGating::Softmax`). `deepseek2.cpp` picks SIGMOID
+  instead when `n_layer` is 47 or 48 and `n_vocab` is 154880 (its comment: GLM
+  4.7 Lite), softmax otherwise. A GLM 4.7 Lite file without the key would route
+  with the wrong function in infr.
+
+### B161 — the SmolLM3 golden runs nowhere by default (2026-11-13)
+
+**Tag:** tests · ci
+
+`cpu_golden_smollm3` (`crates/infr-llama/tests/cpu_backend.rs`) is `#[ignore]`d
+because the `cpu-goldens` CI job downloads only Gemma 3 1B and Qwen3 0.6B. Its
+two 32-token hashes were captured on Windows only; 32 is the length the other
+goldens keep OS-stable, but no Linux run has confirmed it for this model. To run
+it in CI: add `unsloth/SmolLM3-3B-GGUF` `SmolLM3-3B-Q4_K_M.gguf` (about 1.9 GB)
+to that job's download list, bump its cache key, drop the `#[ignore]`, and wrap
+a hash in `per_os` if the Linux run differs.

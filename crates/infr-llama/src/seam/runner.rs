@@ -2675,9 +2675,10 @@ pub(crate) fn generate_dense_backend(
             let rope_dim = c.layer_rope_dim(l);
             // EVERY deepseek4 layer is sliding-window (`set_swa_pattern(0)`) — never `Causal`.
             let swa = (gemma || c.deepseek4) && c.is_swa_layer(l);
-            // llama4 iRoPE: NoPE (global) layers skip rope entirely; rope (local) layers apply a
-            // weightless per-head L2-norm to Q/K AFTER rope (`Llama4TextL2Norm`). `l2norm` is the
-            // ones-vector handle on llama4 rope layers, `None` on NoPE layers and every other model.
+            // NoPE layers (llama4 iRoPE's global layers, smollm3's) skip rope entirely; llama4's
+            // rope (local) layers apply a weightless per-head L2-norm to Q/K AFTER rope
+            // (`Llama4TextL2Norm`). `l2norm` is the ones-vector handle on llama4 rope layers,
+            // `None` on NoPE layers and every other model.
             let nope = c.is_nope_layer(l);
             let l2norm = if nope { None } else { qk_ones };
             // DiffusionGemma canvas denoise (docs/diffusion-gemma.md): every canvas query attends
@@ -2705,7 +2706,7 @@ pub(crate) fn generate_dense_backend(
                 1.0 / (hd as f32).sqrt()
             };
             // gemma4 proportional-RoPE applies only on full-attention layers; llama/llama4's
-            // factors on every layer that ropes (a llama4 NoPE layer emits no rope at all).
+            // factors on every layer that ropes (a NoPE layer emits no rope at all).
             // `rope_freqs` is `None` for every other arch (see `session_stable`).
             let layer_ff = if gemma4 && swa { None } else { rope_freqs };
             // DeepSeek V4's per-layer SwiGLU clamps: `swiglu_clamp_exp[il]` on the ROUTED experts
@@ -3044,7 +3045,7 @@ pub(crate) fn generate_dense_backend(
                     });
                 }
                 // The attention kernels read an **f16** q (`q16`), so the normed+roped f32 query is
-                // cast into it exactly as llama4's NoPE layer casts its unroped one — `Op::Copy`,
+                // cast into it exactly as a NoPE layer casts its unroped one — `Op::Copy`,
                 // whose lowering does the f32→f16 conversion. The rope itself has to stay on the
                 // f32 buffer: Vulkan's `backward` rope build is f32-out only, and the de-rope reads
                 // the ATTENTION OUTPUT, not this.
@@ -3687,12 +3688,13 @@ pub(crate) fn generate_dense_backend(
                             k16
                         }
                         None if nope => {
-                            // llama4 NoPE (global) layer: NO rope, NO L2-norm — the reference
-                            // caches the RAW K projection. `Op::Copy` is a value-preserving cast
-                            // here (CPU stores every buffer as f32 regardless of declared dtype,
-                            // so this is a no-op there; Vulkan's WriteKv/attention kernels require
-                            // the f16 scratch, and the adapter's `Op::Copy` lowering casts f32→f16
-                            // instead of a raw byte copy when src/dst dtypes differ).
+                            // NoPE layer (llama4 global, smollm3): NO rope, NO L2-norm — the
+                            // reference caches the RAW K projection. `Op::Copy` is a
+                            // value-preserving cast here (CPU stores every buffer as f32
+                            // regardless of declared dtype, so this is a no-op there; Vulkan's
+                            // WriteKv/attention kernels require the f16 scratch, and the adapter's
+                            // `Op::Copy` lowering casts f32→f16 instead of a raw byte copy when
+                            // src/dst dtypes differ).
                             g.push(Op::Copy {
                                 src: k,
                                 src_off: 0,
@@ -3779,11 +3781,12 @@ pub(crate) fn generate_dense_backend(
                         q16
                     }
                     None if nope => {
-                        // llama4 NoPE (global) layer: Q is UNROPED — cast the raw f32 projection
-                        // into q16 the same way K does above (`Op::Copy`, value-preserving; see
-                        // its doc there). The reference multiplies Q by an attention-temperature
-                        // scale here; it is exactly 1.0 only below `Config::faithful_ctx_limit`,
-                        // which is why the context is capped there.
+                        // NoPE layer (llama4 global, smollm3): Q is UNROPED — cast the raw f32
+                        // projection into q16 the same way K does above (`Op::Copy`,
+                        // value-preserving; see its doc there). llama4's reference multiplies Q by
+                        // an attention-temperature scale here; it is exactly 1.0 only below
+                        // `Config::faithful_ctx_limit`, which is why the context is capped there.
+                        // smollm3's applies none.
                         g.push(Op::Copy {
                             src: q,
                             src_off: 0,
@@ -5655,11 +5658,14 @@ pub(crate) fn generate_dense_backend(
         // `sliding_window = 1` model — where attending only your own row IS the right answer —
         // stayed exact and hid it.
         && !c.deepseek4
-        // llama4: neither of its K writes is the rope→WriteKv pair the adapter's peephole fuses
-        // into the cache (a rope layer L2-norms the roped K first; a NoPE layer only casts the raw
-        // K), and a standalone f16 `WriteKv` has no dyn kernel, so the adapter's
-        // `decode_eligible` keeps the graph static. Mirrored here like the exclusions above.
+        // A standalone f16 `WriteKv` has no dyn kernel: the adapter's `decode_eligible` replays an
+        // f16 K write only as the rope→WriteKv pair its peephole fuses into the cache, and keeps
+        // any other K write static. Two K writes here are not that pair, each mirrored by a term:
+        // llama4's rope layers L2-norm the roped K before it is written —
         && !c.llama4
+        // — and a NoPE layer (llama4's or smollm3's, `Config::is_nope_layer`) writes the raw K
+        // through an `Op::Copy` cast with no rope at all.
+        && c.no_rope_step == 0
         // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
         // `decode_eligible`: the low-bit block quants / bf16 / f32 / turbo ride a dequant→f16
         // prepass with a standalone WriteKv that has no dyn kernel) — EXCEPT coupled Q8_0

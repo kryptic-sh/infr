@@ -24,6 +24,13 @@ pub const LLAMA: &str = "llama";
 /// are not implemented; the context is capped where the first of them would change the output —
 /// see `Config::faithful_ctx_limit`.
 pub const LLAMA4: &str = "llama4";
+/// SmolLM3 (Hugging Face's SmolLM3-3B): the [`LLAMA`] block verbatim (RMS pre-norms, separate
+/// Q/K/V, NORM/interleaved rope, parallel SiLU FFN, output tied to the embedding when
+/// `output.weight` is absent) except that every `Config::no_rope_step`-th layer skips rope (NoPE).
+/// Unlike [`LLAMA4`], the reference hardcodes that step rather than reading it from the file, and
+/// the NoPE layers change nothing else: no chunked attention, no temperature, no L2-norm, no MoE
+/// (`llama_model_smollm3`, `src/models/smollm3.cpp`).
+pub const SMOLLM3: &str = "smollm3";
 /// Qwen2/2.5 (incl. Qwen2.5-Coder, R1-Distill-Qwen). Llama path + q/k/v projection biases; ships
 /// HF rotate-half q/k order, so the loader permutes rows (`Config::permute_qk_neox`).
 pub const QWEN2: &str = "qwen2";
@@ -129,6 +136,7 @@ pub const TRANSFORMER: &[&str] = &[
     BITNET,
     BITNET_B158,
     DEEPSEEK,
+    SMOLLM3,
 ];
 
 /// Read `general.architecture` from a GGUF WITHOUT a full model load (mirrors
@@ -216,4 +224,5 @@ pub const ALL: &[&str] = &[
     DEEPSEEK4,
     QWEN35,
     QWEN35_MOE,
+    SMOLLM3,
 ];

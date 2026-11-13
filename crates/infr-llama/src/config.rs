@@ -11,6 +11,11 @@ use infr_gguf::Gguf;
 /// file. See [`Config::faithful_ctx_limit`].
 pub(crate) const LLAMA4_ATTN_CHUNK: usize = 8192;
 
+/// smollm3's `n_no_rope_layer_step`: hardcoded in `llama_model_smollm3::load_arch_hparams`
+/// (`llama.cpp/src/models/smollm3.cpp`), not read from the file, so it lives here rather than in
+/// the metadata parse. See [`Config::no_rope_step`].
+pub(crate) const SMOLLM3_NO_ROPE_STEP: usize = 4;
+
 /// `Default` is an ALL-ZERO placeholder, not a runnable model: [`Config::from_gguf`] is the only
 /// source of a real one. It exists so a test can name the two or three fields the arithmetic it is
 /// checking actually reads (`Config { n_layer: 48, n_kv: 8, ..Default::default() }`) instead of
@@ -171,9 +176,11 @@ pub struct Config {
     /// (`step == 1` on Scout → every layer). Other layers are dense FFN. `0` for every non-llama4
     /// model (whose MoE archs — qwen3moe etc. — are MoE on ALL layers; see [`Config::is_moe_layer`]).
     pub moe_interleave_step: usize,
-    /// llama4 iRoPE `no_rope_layer_step`: layer `il` SKIPS rope (NoPE / global attention) iff
-    /// `(il+1) % step == 0` (4 on Scout — pattern "3 local-rope, 1 global-NoPE"). `0` = every layer
-    /// uses rope (every non-llama4 model, and a llama4 checkpoint with `attention.sliding_window==0`).
+    /// The NoPE layer step: layer `il` SKIPS rope iff `(il+1) % step == 0`. llama4 iRoPE's
+    /// `no_rope_layer_step` (4 on Scout — pattern "3 local-rope, 1 global-NoPE"), where the NoPE
+    /// layers are also global attention, and smollm3's `SMOLLM3_NO_ROPE_STEP`, where skipping rope
+    /// is the only difference. `0` = every layer uses rope (every other model, and a llama4
+    /// checkpoint with `attention.sliding_window==0`).
     pub no_rope_step: usize,
     /// See [`Config::faithful_ctx_limit`], which reads it.
     pub ctx_limit: Option<usize>,
@@ -510,8 +517,8 @@ impl Config {
             }
     }
 
-    /// llama4 iRoPE: whether layer `il` SKIPS rope (a NoPE / global-attention layer). `false` for
-    /// every non-llama4 model (`no_rope_step == 0`).
+    /// Whether layer `il` SKIPS rope (a NoPE layer: llama4 iRoPE's global-attention layers, or
+    /// smollm3's). `false` for every model with `no_rope_step == 0`.
     pub fn is_nope_layer(&self, il: usize) -> bool {
         self.no_rope_step > 0 && (il + 1).is_multiple_of(self.no_rope_step)
     }
@@ -586,7 +593,8 @@ impl Config {
             | crate::arch::DEEPSEEK32
             | crate::arch::DEEPSEEK4
             | crate::arch::BITNET
-            | crate::arch::BITNET_B158 => false,
+            | crate::arch::BITNET_B158
+            | crate::arch::SMOLLM3 => false,
             crate::arch::QWEN3
             | crate::arch::QWEN3_MOE
             | crate::arch::GEMMA3
@@ -642,6 +650,9 @@ impl Config {
         // a weightless post-rope Q/K L2-norm. All the divergent semantics are HARDCODED for `llama4`
         // in the reference loader (`models/llama4.cpp`), not metadata-driven.
         let llama4 = arch == crate::arch::LLAMA4;
+        // smollm3 is the llama block with a hardcoded NoPE step and nothing else (see
+        // `arch::SMOLLM3`), so it gates only `no_rope_step` below; every llama4 gate stays off.
+        let smollm3 = arch == crate::arch::SMOLLM3;
         let diffusion_gemma = arch == crate::arch::DIFFUSION_GEMMA;
         // diffusion-gemma's backbone IS gemma4's (heterogeneous per-layer dims, V-norm,
         // freq_factors, softcap) verbatim — see docs/diffusion-gemma.md — so it folds into the same
@@ -1441,6 +1452,8 @@ impl Config {
             // `use_kq_norm = type != LLM_TYPE_17B_128E` (i.e. n_expert != 128).
             let l2 = moe.map(|m| m.n_expert != 128).unwrap_or(true);
             (step, no_rope, l2)
+        } else if smollm3 {
+            (0, SMOLLM3_NO_ROPE_STEP, false)
         } else {
             (0, 0, false)
         };
@@ -1740,8 +1753,9 @@ fn applied_weight_scales(arch: &str) -> Vec<&'static str> {
             add(&EXPS_SCALES);
         }
         // `llama_model_llama4::graph`, `llama_model_qwen2::graph`, `llama_model_gemma3::graph`,
-        // `llama_model_deepseek::graph`: build_qkv, build_attn(wo_s), output_s; every FFN scale NULL.
-        arch::LLAMA4 | arch::QWEN2 | arch::GEMMA3 | arch::DEEPSEEK => {
+        // `llama_model_deepseek::graph`, `llama_model_smollm3::graph`: build_qkv, build_attn(wo_s),
+        // output_s; every FFN scale NULL.
+        arch::LLAMA4 | arch::QWEN2 | arch::GEMMA3 | arch::DEEPSEEK | arch::SMOLLM3 => {
             add(&QKV_SCALES);
             add(&["attn_output", "output"]);
         }
@@ -2259,6 +2273,32 @@ mod tests {
         assert_eq!(cfg.faithful_ctx_limit(), None);
     }
 
+    /// smollm3 takes its NoPE step from the arch (the reference hardcodes it; the file carries no
+    /// key), so layers 3, 7, … skip rope; that is ALL it takes from llama4's iRoPE — no context
+    /// cap, no L2-norm, no MoE interleave. The llama arch it otherwise matches ropes every layer.
+    #[test]
+    fn smollm3_skips_rope_on_every_fourth_layer() {
+        let keys = [
+            ("block_count", 8),
+            ("embedding_length", 8),
+            ("attention.head_count", 2),
+            ("feed_forward_length", 16),
+        ];
+        let cfg = config_from_fixture("smollm3-nope", &arch_fixture("smollm3", &keys))
+            .expect("smollm3 fixture must parse");
+        assert_eq!(cfg.no_rope_step, SMOLLM3_NO_ROPE_STEP);
+        let nope: Vec<usize> = (0..cfg.n_layer).filter(|&l| cfg.is_nope_layer(l)).collect();
+        assert_eq!(nope, [3, 7]);
+        assert!(!cfg.llama4 && !cfg.kq_l2norm && !cfg.qk_norm);
+        assert_eq!(cfg.moe_interleave_step, 0);
+        assert_eq!(cfg.faithful_ctx_limit(), None);
+
+        let cfg = config_from_fixture("smollm3-llama", &arch_fixture("llama", &keys))
+            .expect("llama fixture must parse");
+        assert_eq!(cfg.no_rope_step, 0);
+        assert!((0..cfg.n_layer).all(|l| !cfg.is_nope_layer(l)));
+    }
+
     /// A `.scale` weight scale is refused only where the arch's llama.cpp builder APPLIES it and
     /// infr does not. One the builder ignores (passes NULL for) loads as before — one accepted
     /// case per arch family below, each a scale the converter really writes for NVFP4 files —
@@ -2296,6 +2336,8 @@ mod tests {
             ("llama4", &llama4_keys[..], "blk.0.ffn_up_exps.scale"),
             // `llama_model_qwen2::graph`: build_ffn's scales NULL.
             ("qwen2", DENSE, "blk.0.ffn_down.scale"),
+            // `llama_model_smollm3::graph`: build_ffn's scales NULL.
+            ("smollm3", DENSE, "blk.0.ffn_down.scale"),
             // `llama_model_gemma3::graph`: build_ffn's scales NULL.
             ("gemma3", DENSE, "blk.0.ffn_gate.scale"),
             // `llama_model_deepseek2::graph`: build_moe_ffn without the `*_exps_s` arguments —
@@ -2320,6 +2362,7 @@ mod tests {
             ("llama", DENSE, "blk.0.ffn_down.scale"),
             ("llama", DENSE, "output.scale"),
             ("llama4", &llama4_keys[..], "blk.0.attn_output.scale"),
+            ("smollm3", DENSE, "blk.0.attn_q.scale"),
             ("deepseek2", &deepseek2_keys[..], "blk.0.attn_output.scale"),
             ("qwen35", &qwen35_keys[..], "blk.0.ssm_out.scale"),
         ] {

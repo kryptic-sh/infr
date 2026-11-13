@@ -204,7 +204,8 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             // (`infr_core::fusion`'s `plan_kv_write`: the rope op RIGHT BEFORE the WriteKv writes
             // the cache itself); a standalone f16→f16 WriteKv has no dyn kernel. llama4 writes its
             // K that way on both of its layer kinds — L2-normed after the rope, or the raw cast on
-            // a NoPE layer — so such a graph stays static.
+            // a NoPE layer — and so does any other family's NoPE layer (smollm3), so such a graph
+            // stays static.
             Op::WriteKv { src, cache, .. }
                 if matches!(graph.desc(*src).dtype, infr_core::DType::F16)
                     && matches!(graph.desc(*cache).dtype, infr_core::DType::F16) =>

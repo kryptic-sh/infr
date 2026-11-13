@@ -3995,6 +3995,9 @@ fn arch_sampling(arch: &str) -> (f32, usize, f32) {
         GEMMA3 | GEMMA4 | DIFFUSION_GEMMA => (1.0, 64, 0.95),
         // Meta Llama 3.x / 4 default generation_config: temp 0.6, top_p 0.9, top_k off.
         LLAMA | LLAMA4 => (0.6, 0, 0.9),
+        // SmolLM3 (Hugging Face): the model card and generation_config recommend temp 0.6 /
+        // top_p 0.95 and name no top_k, so top_k stays off as for Llama.
+        SMOLLM3 => (0.6, 0, 0.95),
         // DeepSeek: neutral chat default. The family publishes no per-arch recommendation, so all
         // four arch strings stay on the same neutral values rather than on invented ones; a file
         // that declares its own (`general.sampling.*`, or a `generation_config.json` sibling)
@@ -4938,6 +4941,8 @@ mod tests {
         assert_eq!(arch_sampling(GEMMA4), (1.0, 64, 0.95));
         // Llama: top_k off (0 = keep all), top_p 0.9.
         assert_eq!(arch_sampling(LLAMA), (0.6, 0, 0.9));
+        // SmolLM3: Llama's top_k off, with its own top_p.
+        assert_eq!(arch_sampling(SMOLLM3), (0.6, 0, 0.95));
     }
 
     /// A `deepseek4` GGUF carrying `extra` metadata, written to `dir/model.gguf` (a directory of

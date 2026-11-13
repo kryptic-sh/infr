@@ -27,6 +27,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **SmolLM3 (`smollm3`).** Hugging Face's SmolLM3-3B runs on the CPU and Vulkan
+  backends: the llama block with rope skipped on every fourth layer, as
+  llama.cpp hardcodes it. Its NoPE layers keep it off the Vulkan record-once
+  decode replay, so decode re-records each token. The template's `/think` and
+  `/no_think` modes follow `--think` / `--no-think`; its tool definitions
+  (`xml_tools`) are not passed yet.
 - **`stream_options.include_usage` on `infr serve`.** A streaming request that
   sets it gets one more chunk before `[DONE]`, with an empty `choices` and the
   request's `usage`.

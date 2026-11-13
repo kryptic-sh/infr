@@ -129,9 +129,23 @@ fn cpu_gen(model: &infr_llama::SeamModel, prompt: &str, n: usize) -> String {
 
 /// Assert (or, with `INFR_BLESS=1`, print) the golden hash for each case.
 fn check_golden(model: &infr_llama::SeamModel, cases: &[(&str, usize, u64)]) {
+    check_golden_with(model, |p| model.render_chat(p).expect("render chat"), cases);
+}
+
+/// [`check_golden`] with the prompt turned into the model's input by `render` instead of
+/// [`infr_llama::SeamModel::render_chat`] — for a template whose default render is not stable
+/// from one day to the next.
+fn check_golden_with(
+    model: &infr_llama::SeamModel,
+    render: impl Fn(&str) -> String,
+    cases: &[(&str, usize, u64)],
+) {
     let bless = std::env::var("INFR_BLESS").is_ok();
     for (prompt, n, want) in cases {
-        let out = cpu_gen(model, prompt, *n);
+        let mut out = String::new();
+        model
+            .generate_cpu(&render(prompt), *n, None, |p| out.push_str(p))
+            .expect("cpu generate");
         let h = fnv1a(&out);
         if bless {
             // Print the text too so a human can verify it's coherent before locking the hash.
@@ -1604,6 +1618,67 @@ fn cpu_golden_gemma3() {
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     check_golden(&model, GEMMA3_GOLDEN);
+}
+
+// ─── SmolLM3 (the llama block, rope skipped on every 4th layer) ──────────────────
+
+fn smollm3_3b() -> Option<PathBuf> {
+    find_gguf("unsloth--SmolLM3-3B-GGUF", "SmolLM3-3B-Q4_K_M.gguf")
+}
+
+/// `prompt` as a SmolLM3 chat turn that renders the same on every day. The template's default
+/// system block stamps `strftime_now`'s date into the prompt, so a golden over `render_chat`
+/// would change at midnight; its `/system_override` system message replaces that block with the
+/// message's own text, and `/no_think` picks the non-reasoning generation prompt.
+fn smollm3_render(model: &infr_llama::SeamModel, prompt: &str) -> String {
+    model
+        .render_chat_messages(&[
+            (
+                "system",
+                "You are a helpful AI assistant named SmolLM, trained by Hugging Face.                  /system_override /no_think",
+            ),
+            ("user", prompt),
+        ])
+        .expect("render chat")
+}
+
+// Captured + verified coherent: "The capital of France is Paris." (it stops there), and an ocean
+// paragraph ("The ocean is a vast and mysterious world, teeming with life …"). Both cases are the
+// short length that stays OS-stable for the other models here; captured on Windows only.
+const SMOLLM3_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0x8bfd779284f134df),
+    (
+        "Write a short paragraph about the ocean.",
+        32,
+        0x44563169e114b778,
+    ),
+];
+
+/// CPU-only: SmolLM3 golden-hash lock — the llama graph with rope skipped on the NoPE layers
+/// (`Config::is_nope_layer`). Its greedy output was compared with llama.cpp's before the bless.
+#[test]
+#[ignore = "needs SmolLM3-3B in the HF cache"]
+fn cpu_golden_smollm3() {
+    let path = need_model!(smollm3_3b(), "SmolLM3-3B");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    let rendered = smollm3_render(&model, "");
+    assert!(
+        !rendered.contains("Today Date"),
+        "the override must drop the dated system block:
+{rendered}"
+    );
+    check_golden_with(&model, |p| smollm3_render(&model, p), SMOLLM3_GOLDEN);
+}
+
+/// SmolLM3's NoPE layers write their K unroped, through the same `Op::Copy` path as llama4's;
+/// the Vulkan seam must still match the CPU oracle token-for-token.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_smollm3() {
+    let path = need_model!(smollm3_3b(), "SmolLM3-3B");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "Write a short paragraph about the ocean.", 32);
 }
 
 // ─── Qwen3.5 / Qwen3-Next (gated DeltaNet) ──────────────────────────────────────

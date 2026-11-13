@@ -55,9 +55,10 @@ different:
 
 `llama`, `llama4`, `qwen2`, `qwen3`, `qwen3moe`, `gemma3`, `gemma4` (dense / E2B
 / 26B-A4B MoE on the one string), `qwen35`, `qwen35moe`, `diffusion-gemma`,
-`bitnet`, `bitnet-b1.58`, and the DeepSeek line — `deepseek`, `deepseek2`,
-`deepseek32`, `deepseek4` (status per stage in [`deepseek.md`](deepseek.md):
-`deepseek4` loads but refuses any layer with a non-zero `compress_ratio`).
+`bitnet`, `bitnet-b1.58`, `smollm3`, and the DeepSeek line — `deepseek`,
+`deepseek2`, `deepseek32`, `deepseek4` (status per stage in
+[`deepseek.md`](deepseek.md): `deepseek4` loads but refuses any layer with a
+non-zero `compress_ratio`).
 
 Fine-tunes on those backbones run with no code change (Ornith-1.0 and
 Ternary-Bonsai are the validated examples — see the root

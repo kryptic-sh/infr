@@ -48,6 +48,7 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | ----------------- | ----------------- | -------------------------------------------------------------------------- |
 | Llama             | `llama`           | dense transformer                                                          |
 | Llama 4           | `llama4`          | sigmoid top-1 MoE + shared expert, iRoPE, paged experts                    |
+| SmolLM3           | `smollm3`         | llama block, rope skipped on every 4th layer (NoPE)                        |
 | Qwen2 / Qwen2.5   | `qwen2`           | dense, QKV bias, NEOX rope                                                 |
 | Qwen3             | `qwen3`           | dense, QK-norm                                                             |
 | Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts, paged experts                             |

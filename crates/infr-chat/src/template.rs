@@ -93,8 +93,8 @@ pub(crate) const TEMPLATE_WIDTH_MAX: usize = 1024;
 pub(crate) const FORMAT_NUMBER_MAX: usize = 1 << 20;
 
 /// Build a minijinja `Environment` with the full infr jinja surface (pycompat, `raise_exception`,
-/// `strftime_now`, `tojson` with `indent=`), a [`CHAT_TEMPLATE_FUEL`] execution bound, and the
-/// given chat template compiled under `"chat"`.
+/// `strftime_now`, `tojson` as llama.cpp writes it), a [`CHAT_TEMPLATE_FUEL`] execution bound,
+/// and the given chat template compiled under `"chat"`.
 fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinja::Error> {
     let mut env = minijinja::Environment::new();
     // Bound the render before anything else — see CHAT_TEMPLATE_FUEL for why an untrusted template
@@ -148,33 +148,10 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
             Ok(out)
         },
     );
-    // `tojson` with the optional `indent=` kwarg (Llama-3.x uses `tojson(indent=4)` for the tool
-    // definitions; Qwen-family uses the bare compact form). Not minijinja's built-in `json` filter:
-    // that one HTML-escapes (`<` → `<`), which llama.cpp/HF renders don't.
-    env.add_filter(
-        "tojson",
-        |v: minijinja::Value,
-         kwargs: minijinja::value::Kwargs|
-         -> Result<String, minijinja::Error> {
-            let indent: Option<usize> = kwargs.get("indent")?;
-            kwargs.assert_all_used()?;
-            let out = match indent {
-                Some(n) => {
-                    check_width("tojson indent", n)?;
-                    let pad = " ".repeat(n);
-                    let fmt = serde_json::ser::PrettyFormatter::with_indent(pad.as_bytes());
-                    let mut buf = Vec::new();
-                    let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
-                    serde::Serialize::serialize(&v, &mut ser)
-                        .ok()
-                        .and_then(|()| String::from_utf8(buf).ok())
-                }
-                None => serde_json::to_string(&v).ok(),
-            };
-            // Unserializable values degrade to "null" (pre-existing lenient behavior).
-            Ok(out.unwrap_or_else(|| "null".to_owned()))
-        },
-    );
+    // `tojson` as the reference writes it (Python's `json.dumps` separators, no HTML escaping),
+    // in place of minijinja's compact, HTML-escaping one. The reference also has it as a function.
+    env.add_filter("tojson", crate::tojson::tojson_filter);
+    env.add_function("tojson", crate::tojson::tojson_function);
     // minijinja's own `indent` and printf-style `format` filters, behind the same width bound.
     env.add_filter(
         "indent",
@@ -229,7 +206,7 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
 }
 
 /// Refuse a template-chosen width above [`TEMPLATE_WIDTH_MAX`] before any helper allocates it.
-fn check_width(what: &str, width: usize) -> Result<(), minijinja::Error> {
+pub(crate) fn check_width(what: &str, width: usize) -> Result<(), minijinja::Error> {
     check_bound(what, width, TEMPLATE_WIDTH_MAX)
 }
 
@@ -480,8 +457,8 @@ fn thinking_enabled(cfg: &Config) -> bool {
 }
 
 /// Render a raw chat-template STRING with the full infr jinja environment (pycompat,
-/// `raise_exception`, `tojson` with `indent=`, `strftime_now`) and prompt context (`messages`,
-/// `tools`, bos/eos, `enable_thinking`). This is the GGUF-free seam — `render_core` wraps it, and
+/// `raise_exception`, `tojson` as llama.cpp writes it, `strftime_now`) and prompt context
+/// (`messages`, `tools`, bos/eos, `enable_thinking`). This is the GGUF-free seam — `render_core` wraps it, and
 /// template-compat regression tests feed known templates (e.g. Llama-3.x) straight through it.
 #[allow(clippy::too_many_arguments)]
 pub fn render_template(

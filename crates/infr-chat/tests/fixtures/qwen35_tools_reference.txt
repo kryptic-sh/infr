@@ -1,0 +1,64 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "get_weather", "description": "Weather for a city — Zürich, 東京 <b>bold</b> & \"quoted\" 'single'", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "City name"}, "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}, "days": {"type": "integer", "minimum": 1, "maximum": 7, "default": 1.0}, "detail": {"type": "object", "properties": {"hourly": {"type": "boolean"}, "threshold": {"type": "number"}}}}, "required": ["city"]}}}
+{"type": "function", "function": {"name": "search", "description": "Search the web", "parameters": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+What's the weather in Zürich?<|im_end|>
+<|im_start|>assistant
+<tool_call>
+<function=get_weather>
+<parameter=city>
+Zürich
+</parameter>
+<parameter=unit>
+celsius
+</parameter>
+<parameter=days>
+3
+</parameter>
+<parameter=detail>
+{"hourly": true, "threshold": 0.5}
+</parameter>
+<parameter=tags>
+["a", "b"]
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+{"temp": 21.5, "sky": "clear"}
+</tool_response><|im_end|>
+<|im_start|>user
+Thanks<|im_end|>
+<|im_start|>assistant
+<think>

@@ -1178,7 +1178,6 @@ dependencies = [
  "infr-gguf",
  "minijinja",
  "minijinja-contrib",
- "serde",
  "serde_json",
  "tokenizers 0.20.4",
  "tracing",

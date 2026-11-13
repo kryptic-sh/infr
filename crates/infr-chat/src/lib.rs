@@ -12,6 +12,7 @@
 
 mod stream;
 mod template;
+mod tojson;
 mod tools;
 
 pub use stream::{prompt_prefills_think, ChatStream, Delta};

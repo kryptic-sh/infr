@@ -141,6 +141,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Llama 3.2 render as before for the conversations checked. The prompt of any
   other model whose template leaves a newline after a tag, or indents a tag,
   changes too.
+- **Tool definitions and replayed tool calls reach the model in llama.cpp's JSON
+  layout.** A chat template's `tojson` now writes what llama.cpp's writes
+  (Python's `json.dumps` with `ensure_ascii=False`): `", "` and `": "`
+  separators where infr wrote compact JSON, floats as Python writes them
+  (`1e-05`, `1e+16`), and the `ensure_ascii`, `separators` and positional
+  arguments templates may pass, which used to be a render error. The tools
+  prompt of Qwen2.5, Qwen3, Qwen3.5 and Llama 3.2 changes (for Llama 3.2, whose
+  tool definitions were already indented, in a replayed tool call's arguments
+  and in any float written in exponent form), so tool-calling output can differ
+  from earlier infr versions; prompts without tools are unchanged.
 - **Paging an MoE model through the host RAM tier no longer reads experts the
   GPU already holds.** Every routed expert used to be looked up in the host tier
   before the GPU cache was checked, so an expert resident on the GPU but not in

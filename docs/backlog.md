@@ -4253,23 +4253,77 @@ Qwen3-0.6B / 1.7B / 30B-A3B, Qwen3.5-0.8B, gemma-3-1b, Llama-3.2-1B, SmolLM3-3B)
 for seven conversations (user; user without thinking; system + user; user /
 assistant / user, with and without thinking; user with one tool; the SmolLM3
 golden's) through infr and through llama.cpp's `test-chat-template --no-common`
-with the same variables. Every render now matches byte for byte except the tool
-renders below. Hugging Face transformers was not run (not installed here). What
-is left:
+with the same variables. Every render matched byte for byte except the tool
+renders. Hugging Face transformers was not run (not installed here).
 
-- **`tojson` separators.** infr's `tojson` (no `indent=`) is compact
-  (`{"a":1,"b":2}`); llama.cpp prints `{"a": 1, "b": 2}`. The Jinja2 harness in
-  llama.cpp's `tests/test-jinja.cpp`, which says it is kept in sync with
-  transformers' `chat_template_utils.py`, defines `tojson` as a plain
-  `json.dumps`, whose default separators are those spaced ones. So the tool
-  block of every Qwen2.5 / Qwen3 / Qwen3.5 prompt with tools differs from the
-  reference in those spaces; Llama 3.2's (`tojson(indent=4)`) matches. Changing
-  it moves every tools prompt for those models; the Llama-3 fixture test
-  `tojson_without_indent_stays_compact` pins today's compact form.
+`tojson` now writes what llama.cpp's does (`crates/infr-chat/src/tojson.rs`).
+Rechecked the same way on the same templates with four tools conversations (one
+or two tool definitions with nested parameters and a description holding
+non-ASCII, `<`, `&` and both quotes; an assistant tool call in history; a tool
+result; one with scalar arguments): every render matches except the first item
+below. Gemma 3's template raises "Conversation roles must alternate" on a tool
+message in both engines. What is left:
+
+- **Turning a non-string into text.** Most ways a template turns a bool, none,
+  float or container into text differ between the engines (integers, and floats
+  in fixed notation, match); rendered through both (llama.cpp
+  `test-chat-template --no-common`, infr `render_template`):
+
+  | construct                          | llama.cpp                                 | infr (minijinja)                      |
+  | ---------------------------------- | ----------------------------------------- | ------------------------------------- |
+  | `true \| string`, `none \| string` | `True`, `None`                            | `true`, `none`                        |
+  | `'x' ~ true ~ none ~ 2.5`          | `xTrue2.5` (none prints nothing)          | `xtruenone2.5`                        |
+  | `'{} {}'.format(true, none)`       | `True None`                               | `true none`                           |
+  | `{{ true }}`, `{{ none }}`         | `True`, empty                             | `true`, `none`                        |
+  | a float `1e-7` from the input      | `\| string`: `1e-07`; bare `{{ }}`: `0.0` | `0.0000001` both ways                 |
+  | `{{ [1, 2] }}`, `{{ {'a': 1} }}`   | `12`, empty                               | `[1, 2]`, `{"a": 1}`                  |
+  | a dict `\| string`                 | `{'a': {}, 'b': [1, 'x'], 'c': True}`     | `{"a": {}, "b": [1, "x"], "c": true}` |
+  | `[true, none] \| join(',')`        | error (joins only strings and numbers)    | `true,none`                           |
+  | `'%s %s' \| format(true, none)`    | `%s %s` (nothing substituted)             | `true none`                           |
+
+  Inside a container `| string` also writes a float `1e-7` as `0.0` and `1e16`
+  as `10000000000000000.0` in llama.cpp.
+
+  llama.cpp's `string` and `~` follow Python's `str()` (`value_to_string_repr`
+  in `common/jinja/value.cpp`: single quotes, a string holding `'` in double
+  quotes, `True` / `None`), but its bare interpolation does not: it prints
+  nothing for none, a dict or a mapping inside a list, concatenates a list's
+  items, and prints a small float as `0.0`, none of which Jinja2 does. So exact
+  parity is not a formatter override (`Environment::set_formatter`) plus a
+  `string` filter: it would copy those interpolation quirks, which look like
+  llama.cpp bugs. Not built; it needs its own decision (match `str()` where
+  llama.cpp does, and leave bare interpolation alone, or copy all of it). Cached
+  templates that reach it: Qwen3.5 prints each scalar tool-call argument with
+  `args_value | string`, so a bool, none or exponent-range float argument
+  renders differently (verified for `true`, `none` and `1e-7`); SmolLM3 prints
+  `tool | string` for `xml_tools`, which infr never passes (B159). Qwen3.5's
+  `'Picture ' ~ image_count.value` concatenates an integer, which matches. No
+  cached template interpolates a non-string bare.
+
+- **`tojson` divergences kept on purpose.** Integers outside the signed 64-bit
+  range: llama.cpp wraps them (`[18446744073709551615, 9223372036854775808]`
+  prints `[-1, -9223372036854775808]`), infr prints the true values. The indent
+  bound: `tojson(indent=2000)` renders in llama.cpp and is refused by infr
+  (`TEMPLATE_WIDTH_MAX`, the guard against a template-sized allocation).
+- **Tools and messages are passed as the request wrote them.** llama-server
+  rebuilds each tool as `{type, function: {name, description, parameters}}`
+  (`common_chat_tools_parse_oaicompat` then
+  `common_chat_tools_to_json_oaicompat` in `common/chat.cpp`): other keys
+  dropped, `description` filled with `""`, keys in that order. infr hands the
+  request's `tools` to the template as they came, so a request with other keys
+  or another key order prints a different tool block. Messages are built as
+  `role, content, reasoning_content, name, tool_call_id, tool_calls` there and
+  `role, content, tool_calls, tool_call_id, name` in `message_to_json`, which
+  shows only in a template that `tojson`s a whole message (none of the cached
+  ones). Read in the code, not rendered. A tool-call `arguments` string that is
+  not JSON stays a string in infr (`parse_oai_tool_calls` in `infr-server`);
+  llama.cpp refuses it for templates that take object arguments.
 - **Variables.** infr always passes `tools` (null without tools) and
   `add_generation_prompt`; llama.cpp leaves `tools` out when there are none and
-  `add_generation_prompt` out when false. No checked template renders
-  differently for it (`tools is defined` is the case that would).
+  `add_generation_prompt` out when false. Only Llama 3.2's template asks
+  `tools is defined`, and it then sets `tools = none`, so it renders the same;
+  rechecked by rendering a tool-less conversation with `tools` left out on the
+  reference side through every cached template: all match.
 - **Lexer edge cases, none copied.** Each was read in both lexers
   (`common/jinja/lexer.cpp`; minijinja 2.21.0 `src/compiler/lexer.rs`) and
   rendered through both engines. None is expected in a real chat template; every

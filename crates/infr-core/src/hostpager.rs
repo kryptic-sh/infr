@@ -317,6 +317,32 @@ impl HostPager {
             .map(|d| d.nbytes())
     }
 
+    /// Record this tier's residency calls into `file` (`paging.trace`; see
+    /// [`crate::pager::trace`]), labelled `label` with `n_blocks` blocks. Call it before the first
+    /// pin or fill. An arena-less ([`Self::stream_only`]) tier records nothing: its pager is never
+    /// called.
+    pub fn trace_to(
+        &self,
+        file: &Arc<crate::pager::trace::TraceFile>,
+        label: String,
+        n_blocks: usize,
+    ) -> Result<()> {
+        if !self.caches() {
+            return Ok(());
+        }
+        let info = crate::pager::trace::PoolInfo {
+            tier: crate::pager::trace::Tier::Dram,
+            label,
+            n_blocks,
+        };
+        Ok(self.inner.lock().unwrap().pager.trace_to(file, info)?)
+    }
+
+    /// Flush this tier's trace, if it has one (see [`Pager::flush_trace`]).
+    pub fn flush_trace(&self) -> Result<()> {
+        Ok(self.inner.lock().unwrap().pager.flush_trace()?)
+    }
+
     /// Open a new touch batch — same meaning as [`Pager::begin_batch`].
     pub fn begin_batch(&self) {
         self.inner.lock().unwrap().pager.begin_batch();

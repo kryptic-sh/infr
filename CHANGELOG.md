@@ -24,6 +24,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fill closure that runs only on a miss**, and replaces `touch_staged_read`.
   `MoePagerSession::touch_role`, which nothing in the engine called, is gone;
   `stage_role` is the MoE session's entry point.
+- **`infr_cpu::paged::PagedWeights::new` takes a third argument**, the
+  `paging.trace` file its pools record into (`None` for no trace).
 - **`infr_core::Backend` has a new method, `decode_replay_ready`, and `Graph` a
   new field, `replay_only`.** The seam runner now asks the backend, after
   compiling the position-0 decode plan, whether executing that one plan per
@@ -38,6 +40,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`paging.trace` (`INFR_PAGER_TRACE`): a pager touch trace.** Set it to a file
+  path and every pager pool of the run (the VRAM expert and streaming arenas,
+  the DRAM tier under them, the CPU backend's host pools) records each call it
+  serves there: the entry point, the block, batch boundaries and the outcome
+  (hit, or miss and the block it evicted). The format is documented in
+  `infr_core::pager::trace`; a pool's trace replays to exactly the hit, miss and
+  eviction counts `paging.stats` prints. Unset, it costs one test per pager
+  call. For developers, `infr_core::pager::sim` replays a trace under other
+  eviction policies (Belady's among them, a lower bound on traces without
+  probes), `infr_core::pager::shapes` generates the access patterns real
+  sessions make, and `infr-core`'s `pager_bench` test times the pager on both.
 - **SmolLM3 (`smollm3`).** Hugging Face's SmolLM3-3B runs on the CPU and Vulkan
   backends: the llama block with rope skipped on every fourth layer, as
   llama.cpp hardcodes it. Its NoPE layers keep it off the Vulkan record-once

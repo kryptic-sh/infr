@@ -26,6 +26,7 @@ use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
 use infr_core::error::Result;
 use infr_core::hostpager::{HostPager, HostPagerStats, Pin};
 use infr_core::loader::TensorInfo;
+use infr_core::pager::trace::TraceFile;
 use infr_core::pager::Insert;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -89,12 +90,21 @@ pub struct PagedWeights {
 
 impl PagedWeights {
     /// Build the pools named by [`plan_pools`]. Allocates every arena up front, so a budget that
-    /// cannot be committed fails here rather than part-way through a generation.
-    pub fn new(plans: &[PoolPlan], io: Arc<dyn BlockIo>) -> Result<Self> {
+    /// cannot be committed fails here rather than part-way through a generation. With `trace`
+    /// (`paging.trace`), every pool records its residency calls there.
+    pub fn new(
+        plans: &[PoolPlan],
+        io: Arc<dyn BlockIo>,
+        trace: Option<&Arc<TraceFile>>,
+    ) -> Result<Self> {
         let mut pools = Vec::with_capacity(plans.len());
         let mut classes = HashMap::with_capacity(plans.len());
         for (i, p) in plans.iter().enumerate() {
-            pools.push(HostPager::new(p.n_slots, p.slot_bytes, Arc::clone(&io))?);
+            let pool = HostPager::new(p.n_slots, p.slot_bytes, Arc::clone(&io))?;
+            if let Some(t) = trace {
+                pool.trace_to(t, format!("cpu {}B", p.slot_bytes), p.n_blocks)?;
+            }
+            pools.push(pool);
             classes.insert(p.slot_bytes, i);
         }
         Ok(Self {
@@ -143,6 +153,13 @@ impl PagedWeights {
     /// has pinned everything the op names.
     pub fn try_pin(&self, id: PagedId) -> Option<Pin<'_>> {
         self.pools[id.pool].try_pin(id.block)
+    }
+
+    /// `paging.trace`: hand every pool's buffered trace events to the trace file — every pool,
+    /// even after one fails — and return the first failure.
+    pub fn flush_trace(&self) -> Result<()> {
+        let results: Vec<Result<()>> = self.pools.iter().map(HostPager::flush_trace).collect();
+        results.into_iter().collect()
     }
 
     /// Per-pool `(slot bytes, slot count, stats)`, for the paging report.
@@ -244,7 +261,7 @@ mod tests {
     fn registration_maps_equal_sizes_to_one_pool() {
         let io = Arc::new(FakeIo(AtomicUsize::new(0)));
         let plans = plan_pools(64 * MIB, &tensors(&[(4 * MIB, 4), (8 * MIB, 2)]));
-        let w = PagedWeights::new(&plans, io).expect("pools");
+        let w = PagedWeights::new(&plans, io, None).expect("pools");
         let a = w.register(&[(0, 4 * MIB)]).unwrap().expect("paged");
         let b = w.register(&[(99, 4 * MIB)]).unwrap().expect("paged");
         let c = w.register(&[(0, 8 * MIB)]).unwrap().expect("paged");
@@ -259,7 +276,7 @@ mod tests {
     fn pin_reads_once_then_hits() {
         let io = Arc::new(FakeIo(AtomicUsize::new(0)));
         let plans = plan_pools(64 * MIB, &tensors(&[(MIB, 4)]));
-        let w = PagedWeights::new(&plans, io.clone()).expect("pools");
+        let w = PagedWeights::new(&plans, io.clone(), None).expect("pools");
         let id = w.register(&[(0, MIB)]).unwrap().expect("paged");
         assert_eq!(&w.pin(id).unwrap()[..8], &[0u8; 8]);
         assert_eq!(io.0.load(Ordering::SeqCst), 1);

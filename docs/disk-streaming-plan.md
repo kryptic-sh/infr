@@ -23,8 +23,10 @@ The residency machinery is already block-agnostic and already has two policies:
 - `infr_core::pager::Pager` — pure host-side bookkeeping (`n_slots` slots, a
   `BlockId → slot` map, LRU order, batch epochs). No bytes, no device types.
   Three entry points: `touch` (recency/LRU, MoE decode), `touch_cold`
-  (scan-resistant, prefill sweeps) and `schedule` (exact cyclic sweep,
-  Belady-parity — dense layer streaming). `ring_bytes` prices the staging ring.
+  (scan-resistant, prefill sweeps) and `schedule` (cyclic sweep: a stable
+  resident prefix of `n_slots − 1` blocks, within `(n_slots − 1)/(n_blocks − 1)`
+  misses per pass of Belady's optimum — dense layer streaming). `ring_bytes`
+  prices the staging ring.
 - `infr_vulkan::pager::GpuPager` — a `Pager` plus a VRAM slot arena (BDA), a
   device LUT, and uploads through a reused pinned staging ring.
   `MoePagerSession` drives it with `(layer, role, expert)` blocks;
@@ -60,8 +62,8 @@ feature is **not** "make it possible". It is "make it not thrash":
    case: every page evicted exactly before its next use. Same pathology
    `Pager::touch_cold`/`schedule` exist to fix (that doc records the in-tree
    measurement: 768/768 blocks re-uploaded per rep on Scout pp512 under plain
-   LRU). We can apply Belady-parity policy per tier; the kernel cannot, because
-   it does not know the sweep order.
+   LRU). We can apply a near-optimal sweep policy per tier; the kernel cannot,
+   because it does not know the sweep order.
 2. **No prefetch we control.** Kernel readahead is a sequential heuristic over
    file offsets. Our access order is known for the whole pass on dense, and one
    layer ahead for MoE on CPU (the router runs on the host), so reads can be
@@ -325,10 +327,11 @@ in two tiers is waste — a block resident in VRAM never needs a DRAM copy. So
 `TierPlan` assigns each block one home tier at load: VRAM home takes as many
 blocks as its budget holds minus a streaming window, DRAM home takes as many of
 the remainder as its budget holds, and everything left streams from disk each
-pass into those windows under the existing `schedule` (cold-insert,
-Belady-parity) policy. Per-pass disk traffic is then
-`model − VRAM_home − DRAM_home`, which is the minimum any policy achieves on a
-sweep.
+pass into those windows under the existing `schedule` (cold-insert, stable
+prefix) policy. Per-pass disk traffic is then `model − VRAM_home − DRAM_home`,
+which is within a fraction of a block per pass of the minimum any policy
+achieves on a sweep (Belady rotates which blocks it keeps and saves
+`(n_slots − 1)/(n_blocks − 1)` misses per pass more).
 
 **The DRAM half of that partition is LANDED, without `TierPlan`.**
 `HostPager::fill` reaches the same place by first-touch rather than by planning:

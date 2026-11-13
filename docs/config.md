@@ -200,7 +200,12 @@ spills KV to system RAM when VRAM runs out.
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),
 `ring` overrides the upload staging ring, `stats` prints per-pool
-hit/miss/eviction counts.
+hit/miss/eviction counts, and `trace` (`INFR_PAGER_TRACE`, a file path) records
+every pool's pager calls to that file, one file for the whole run, in the format
+`infr_core::pager::trace` documents. A trace replays to exactly the counts
+`stats` prints; `infr-core`'s `pager_bench` test replays it, times it and
+compares today's eviction policy with Belady's (a lower bound for that request
+sequence when the trace has no probes). Unset, tracing costs nothing measurable.
 
 **`[kernels]`** — two backend-independent graph-shape gates (`qkv_fuse`,
 `gated_rmsnorm`) plus one sub-section per backend. Everything under them is a

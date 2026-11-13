@@ -2963,9 +2963,13 @@ impl VulkanBackend {
             .register(role, buf_id, source, n_expert)
     }
 
-    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no paged model is loaded.
+    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no paged model is loaded. Also where
+    /// `paging.trace` is flushed, so the trace on disk covers what the printed counters cover.
     pub fn print_moe_pager_stats(&self) {
-        if let Some(s) = self.moe_pager.lock().unwrap().as_ref() {
+        if let Some(s) = self.moe_pager.lock().unwrap().as_mut() {
+            if let Err(e) = s.flush_trace() {
+                tracing::warn!("[moe pager] {e}");
+            }
             s.print_stats_if_enabled();
         }
     }
@@ -3003,9 +3007,13 @@ impl VulkanBackend {
             .register(pool, buf_id, source)
     }
 
-    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no dense-streamed model is loaded.
+    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no dense-streamed model is loaded. Also
+    /// flushes `paging.trace`, as [`Self::print_moe_pager_stats`] does.
     pub fn print_dense_pager_stats(&self) {
-        if let Some(s) = self.dense_pager.lock().unwrap().as_ref() {
+        if let Some(s) = self.dense_pager.lock().unwrap().as_mut() {
+            if let Err(e) = s.flush_trace() {
+                tracing::warn!("[dense pager] {e}");
+            }
             s.print_stats_if_enabled();
         }
     }

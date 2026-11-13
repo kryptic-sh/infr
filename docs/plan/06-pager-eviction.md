@@ -8,8 +8,8 @@ justify it.
 Read for this plan on 2026-11-13: `infr_core::pager::Pager` in full by the
 planner, then `hostpager.rs`, `infr-vulkan/src/pager.rs`,
 `infr-cpu/src/paged.rs` and the call sites that drive them by a read-only survey
-(step 1's reading half, recorded under "What the survey found"). Nothing was
-measured yet.
+(step 1's reading half, recorded under "What the survey found"). Step 1's
+measuring half landed the same day; its numbers are under "Measurements".
 
 ## What the code does today
 
@@ -24,15 +24,16 @@ measured yet.
   already costs a fill".
 - A batch that misses on k blocks runs that scan k times.
 - Policy is recency with two insertion points: the hot end (`touch`) and the
-  cold end (`touch_cold`, `schedule`). `schedule` on a cyclic sweep is
-  Belady-optimal by test (`schedule_cyclic_sweep_is_belady_optimal`). Nothing
-  uses frequency.
+  cold end (`touch_cold`, `schedule`). `schedule` on a cyclic sweep keeps a
+  stable resident prefix: `n_slots − 1` hits per pass, close to Belady but not
+  equal to it (MIN rotates what it keeps; in steady state it misses about
+  `(n_slots − 1)/(n_blocks − 1)` fewer blocks per pass). Nothing uses frequency.
 
 Whether the scan matters is a question of pool size and miss rate: it is
 negligible beside a multi-megabyte upload for a pool of a few hundred blocks,
 and not for per-expert pools of a large MoE (a block per expert per role per
-layer) during a prefill sweep that misses on most of them. That has not been
-measured, which is step 1.
+layer) during a prefill sweep that misses on most of them. "Measurements" has
+the numbers.
 
 ## What the survey found (2026-11-13)
 
@@ -86,40 +87,240 @@ exhaustion changes nothing; `evict` is an uncounted removal that returns its
 slot to a LIFO free list handed out from slot 0; the free list drains before any
 eviction; and the hit, miss and eviction counters keep their exact semantics.
 
-## Order of work, revised by the survey
+## Order of work, revised by the measurements
 
-1. **The trace hook, the micro-benchmark and the simulator** (step 1's measuring
-   half, below).
+What the numbers below support, largest measured end-to-end share first:
+
+1. **The trace hook, the micro-benchmark and the simulator** (step 1). Done.
 2. **Fully resident decode:** replace the per-token touch of every expert with
-   something that costs O(1) per layer and keeps recency meaningful. Needs a
-   design: the routed ids are on the GPU, which is why every expert is touched
-   today.
-3. **The data-structure refactor** (step 2), sized by the benchmark on the MoE
-   pool sizes above.
-4. **Policy** (step 3), and the decode-miss stall as its own question: whether
-   the readback and drain can be avoided or batched.
+   something that costs O(1) per layer and keeps recency meaningful. The largest
+   end-to-end pager share measured: about 5% of decode at 133 tok/s, all of it
+   spent on HITS. Needs a design: the routed ids are on the GPU, which is why
+   every expert is touched today.
+3. **The data-structure refactor** (step 2). Its measured case is narrower than
+   "the scan is slow": the scan is nearly all of the pager's own time on MoE
+   pools, but about 1% of end-to-end time in the recorded disk-bound run. What
+   justifies it is the hit cost of resident decode (if step 2's design still
+   touches per expert), decode at a budget whose misses are served fast (6% of
+   decode in the large-DRAM run), and DeepSeek-scale prefill (0.20–0.26 s per
+   pool per generated chunk). Size it against those, not against the scan in
+   general.
+4. **MoE policy** (step 3), decode only: two-tier placement first (a DRAM tier
+   smaller than VRAM works only as a victim cache), then eviction candidates
+   compared in `sim` on the recorded `moe` trace. The decode-miss stall
+   (readback and drain) is its own question beside it.
 5. Small ones alongside: the per-call clone in `HostPager::fill` and
    deduplicating split-path ids (both in B156).
 
+## Measurements (2026-11-13)
+
+Taken with the step-1 tools on the Windows box (Ryzen 9 9950X3D). **Busy
+machine:** other sessions shared it; total CPU was 1–6% while the benchmark ran
+and no quiet window was arranged, so the nanosecond columns are indicative. The
+hit rates and miss counts are exact.
+
+Columns: `blocks` is the id space a pool's header names (the MoE pools of one
+role share the model's whole `48 × 128` space, so a `down` pool, whose layers
+are split between two quant sizes, reaches only half of it: `ids`); `ns/hit` and
+`ns/miss` are split from the per-call total by timing runs of same-outcome calls
+(the method is in the benchmark's `time_trace`); `gap` is the share of today's
+misses Belady avoids on that request sequence; `scan share` is the share of
+pager time misses spend beyond what a hit costs — the victim scan, essentially.
+
+**What a Belady figure means here.** It is the fewest misses _this recorded
+request sequence_ allows with the same slots, batch guard and pins, and it is a
+lower bound only for traces of `begin_batch`, the `touch` family,
+`resolve_and_pin` and `unpin`: there it holds by an exchange argument and was
+checked against a brute-force optimum on 3000 small random traces, not proven.
+With `pin_if_resident` probes or `repin`s it is not a bound (a probe pins only a
+resident block, so pins depend on the policy; `sim` has a counterexample), and
+no figure is given: the `cpu` pools below. It also does not say what another
+policy would save end to end where the requests themselves depend on residency,
+as MoE decode's do (below).
+
+### Recorded traces
+
+Five runs, each checked first: **every pool's replayed hit, miss and eviction
+counts equal the `paging.stats` line the run printed** (35 pools, all equal), so
+the traces are complete.
+
+- `moe`: Qwen3-30B-A3B Q4_K_M on the RX 7900 XTX, `paging.cache=4g`,
+  `paging.dram=1g`, a 441-token prompt and 48 decode tokens (prefill 441 tokens
+  in 28,366 ms, decode 11.7 tok/s). About a fifth of the experts fit VRAM.
+- `moe-bigdram`: the same with `paging.dram=12g` (decode 19.8 tok/s, prefill
+  28,720 ms). Its VRAM pools' counts are identical to `moe`'s.
+- `moe-resident`: `paging.cache=18g`, which seats 98% of the experts (decode
+  132.9 tok/s, mostly `touch_all_hits`).
+- `dense`: Qwen3-1.7B Q4_K_M on the integrated GPU, `paging.cache=400m` (unified
+  memory: no DRAM arena, so only VRAM pools).
+- `cpu`: Qwen3-1.7B Q4_K_M on the CPU backend, `paging.dram=300m`, 16 tokens.
+
+| trace / pool                         | blocks |  ids | slots |  calls | hit rate | ns/call | ns/hit | ns/miss | misses: current | misses: Belady |   gap | scan share |
+| ------------------------------------ | -----: | ---: | ----: | -----: | -------: | ------: | -----: | ------: | --------------: | -------------: | ----: | ---------: |
+| moe, down 1.3 MB                     |   6144 | 3072 |   657 |  19704 |    64.1% |  1717.2 |   25.2 |    5087 |            6616 |           4773 | 27.9% |      98.6% |
+| moe, down 1.3 MB host                |   6144 | 3072 |   187 |  13232 |     0.0% |   502.3 |      — |     989 |            6616 |           5520 | 16.6% |          — |
+| moe, gate 0.9 MB                     |   6144 | 6144 |  1315 |  33600 |    61.1% |  3587.1 |   27.0 |    9981 |           12112 |           8865 | 26.8% |      99.3% |
+| moe, gate host                       |   6144 | 6144 |   375 |  24224 |     0.0% |   916.8 |      — |    1824 |           12112 |          10261 | 15.3% |          — |
+| moe, up 0.9 MB                       |   6144 | 6144 |  1315 |  33600 |    61.1% |  3612.5 |   27.2 |   10057 |           12112 |           8865 | 26.8% |      99.3% |
+| moe, up host                         |   6144 | 6144 |   375 |  24224 |     0.0% |   916.9 |      — |    1828 |           12112 |          10261 | 15.3% |          — |
+| moe, down 0.9 MB                     |   6144 | 3072 |   657 |  13896 |    56.1% |  2030.5 |   28.1 |    5102 |            5558 |           4247 | 23.6% |      98.7% |
+| moe, down 0.9 MB host                |   6144 | 3072 |   187 |  11116 |     0.0% |   497.7 |      — |     990 |            5558 |           4860 | 12.6% |          — |
+| moe-bigdram, down 1.3 MB host        |   6144 | 3072 |  2255 |  13232 |    45.9% |  1151.9 |   43.2 |    4204 |            3580 |           3072 | 14.2% |      97.0% |
+| moe-bigdram, gate host (up alike)    |   6144 | 6144 |  4510 |  24224 |    40.8% |  2480.7 |   43.8 |    8112 |            7166 |           6144 | 14.3% |      98.6% |
+| moe-bigdram, down 0.9 MB host        |   6144 | 3072 |  2255 |  11116 |    35.4% |  1327.4 |   41.1 |    4079 |            3588 |           3072 | 14.4% |      97.5% |
+| moe-resident, down 1.3 MB            |   6144 | 3072 |  3006 | 145152 |    97.5% |   108.5 |   22.1 |    3606 |            3504 |           3336 |  4.8% |      79.8% |
+| moe-resident, gate 0.9 MB (up alike) |   6144 | 6144 |  6013 | 296112 |    97.6% |   180.0 |   23.4 |    6768 |            6950 |           6538 |  5.9% |      87.3% |
+| moe-resident, down 0.9 MB            |   6144 | 3072 |  3006 | 150960 |    97.6% |   107.0 |   22.1 |    3684 |            3516 |           3336 |  5.1% |      79.6% |
+| moe-resident, gate host              |   6144 | 6144 |  6144 |  13900 |    11.6% |    28.0 |   38.1 |      49 |            6144 |           6144 |  0.0% |      13.6% |
+| dense, pool0 2.4 MB                  |     56 |   56 |     9 |   6048 |    14.0% |    58.1 |   25.9 |     135 |            2600 |           2449 |  5.8% |      72.6% |
+| dense, pool1 1.2 MB                  |     42 |   42 |     7 |   4536 |    15.6% |    52.2 |   25.2 |     123 |            1914 |           1831 |  4.3% |      70.5% |
+| dense, pool3 14.2 MB                 |     28 |   28 |     4 |   3024 |    15.5% |    41.7 |   25.9 |     100 |            1278 |           1272 |  0.5% |      63.9% |
+| dense, pool2/4/5 (each)              |     14 |   14 |     2 |   1512 |    12.2% |    36.6 |   30.0 |      83 |             664 |            660 |  0.6% |      54.4% |
+| cpu, 2.4 MB                          |     56 |   56 |    16 |   3808 |    25.2% |    38.9 |   33.3 |     156 |             712 |              — |     — |      52.9% |
+| cpu, 7.1 MB                          |     70 |   70 |    20 |   4760 |    25.5% |    42.7 |   33.1 |     177 |             886 |              — |     — |      56.9% |
+
+`moe-bigdram`'s VRAM rows equal `moe`'s, and `moe-resident`'s other host pools
+read like its gate host; the other `cpu` classes read like the two shown.
+
+### Prefill and decode apart
+
+The `moe` gaps above mix the two phases. Split at each pool's last prefill call
+(`touch_cold`), from one simulated run each (`recorded_phase_split`):
+
+| pool                          | prefill: current / Belady | decode: current / Belady | decode batches: touch-all / routed |
+| ----------------------------- | ------------------------- | ------------------------ | ---------------------------------- |
+| moe, down 1.3 MB              | 3072 / 3072 (0.0%)        | 3544 / 1701 (52.0%)      | 48 / 1104                          |
+| moe, gate (up alike)          | 6144 / 6144 (0.0%)        | 5968 / 2721 (54.4%)      | 48 / 2256                          |
+| moe, down 0.9 MB              | 3072 / 3072 (0.0%)        | 2486 / 1175 (52.7%)      | 0 / 1152                           |
+| moe-resident, down 1.3 MB     | 3468 / 3270 (5.7%)        | 36 / 66 (−83.3%)         | 1008 / 144                         |
+| moe-resident, gate (up alike) | 6876 / 6537 (4.9%)        | 74 / 1 (98.6%)           | 2064 / 240                         |
+| moe-resident, down 0.9 MB     | 3468 / 3270 (5.7%)        | 48 / 66 (−37.5%)         | 1056 / 96                          |
+
+A touch-all batch is one layer's `touch_all_hits`: all 128 experts MRU-touched;
+a routed batch touches the 8 experts the router picked. The decode path picks
+between them per layer by `all_resident`, which the trace does not record, so a
+different eviction policy would have produced a different request stream.
+
+- **`moe`:** the prefill is a first sweep through a cache a fifth of its size,
+  and every policy misses each block once. **Decode is where the gap is: about
+  half of the decode misses (52–54%)** on a stream that is 96–100% routed
+  batches, whose requests are the router's demand. It is still a bound on this
+  sequence only.
+- **`moe-resident`:** decode is 88–92% touch-all batches, whose "next uses" are
+  bookkeeping touches of every expert, not demand; Belady's decode figures there
+  (including the negative ones, where it spends decode misses to save prefill
+  ones) say nothing about routed demand. Its 5–6% is the first fill of a cache
+  2% smaller than the expert set. It does not show room for policy.
+
+### The DRAM tier
+
+In `moe` every host pool hit 0.0%, and all 36,398 host reads went to disk. That
+follows from the configuration, not from the policy: the host tier sees only
+VRAM's misses, and a block VRAM misses twice has had many other VRAM misses —
+each a host access to a distinct block — in between. Checked on the trace: for
+blocks the host was asked for twice, the distinct host blocks accessed between
+the two requests were a median of 910 / 1965 / 1965 / 1103 (down 1.3 MB, gate,
+up, down 0.9 MB) against 187 / 375 / 375 / 187 host slots; 3, 10, 10 and 6 of
+the 3544, 5968, 5968 and 2486 re-requests had fewer in between than the slot
+count, and none of them hit. **A DRAM tier smaller than VRAM under the same
+policy can only work as a victim cache** — admitting what VRAM evicts, not what
+it misses (exclusive placement, step 3).
+
+With `paging.dram=12g` (`moe-bigdram`: 2255 / 4510 / 4510 / 2255 host slots,
+3.4× VRAM's) the host tier hits 35–46%, its disk reads fall from 36,398 to
+21,500 and decode runs at 19.8 tok/s instead of 11.7. That is the regime the
+auto-sized DRAM tier is meant for; this one run is all that was measured of it.
+Belady's gap on it is 14%.
+
+### The cost of the hook itself
+
+Unset, `paging.trace` is one `Option` test per call. Measured by building
+`infr-core` at `HEAD` and with the hook in two otherwise identical workspaces
+and running the same driver against each, alternately, three times (busy
+machine): a 6144-id cold sweep through 3072 slots 12.92–12.99 µs per call
+before, 12.80–13.05 after; MRU hits 22.39–23.45 ns before, 22.65–22.76 after. No
+difference outside the noise. (The same comparison found an older anomaly in how
+`infr-core` builds the pager: B164.)
+
+### What the numbers say
+
+Arithmetic from the tables (ns/call × calls; wall time from the runs' own
+lines):
+
+- **(i) The victim scan is nearly all of the pager's own time on MoE pools:**
+  98.6–99.3% of it on the `moe` VRAM pools, 80–88% even on `moe-resident`.
+- **(ii) As a share of end-to-end time it is about 1% in the recorded disk-bound
+  run.** `moe`'s pager time over all eight pools: VRAM 19704 × 1717.2 + 33600 ×
+  3587.1 + 33600 × 3612.5 + 13896 × 2030.5 ns = 304.0 ms, host 13232 × 502.3 +
+  24224 × 916.8 + 24224 × 916.9 + 11116 × 497.7 ns = 56.6 ms, together 0.36 s.
+  The run took 28.37 s of prefill plus 48 / 11.7 = 4.10 s of decode, 32.47 s:
+  **1.1%**. Each of its misses is a ~1 MB expert read from disk: the host tier
+  read 34.9 GB (`paging.stats`) in that time.
+- **(iii) The scan matters end to end only where misses are served fast, or at
+  larger pools.** At an assumed 25 GB/s host-to-VRAM (not measured here), a 0.88
+  MB expert upload takes 35 µs and a 1.29 MB one 52 µs; the scan beside it is 10
+  µs per miss in the 1315-slot pools and 5 µs in the 657-slot ones, so 10–28% of
+  a miss's cost when the bytes are already in DRAM. In decode, the VRAM pools'
+  misses cost (5968 × 9981 + 5968 × 10057 + 3544 × 5087 + 2486 × 5102) ns plus
+  their hits, about 152 ms over 48 tokens: 3.2 ms per token. That is 3.7% of
+  `moe`'s 85.5 ms tokens and 6.3% of `moe-bigdram`'s 50.5 ms ones. On the
+  generated DeepSeek-scale prefill a miss scans for 20–31 µs, comparable to its
+  upload, and a chunk costs 0.20–0.26 s of pager time per pool.
+- **(iv) Fully resident decode is the largest end-to-end share measured, and it
+  is spent on hits.** `moe-resident`'s decode made 130,140 + 266,038 + 266,038 +
+  135,888 = 798,104 hits over 48 tokens (16,627 per token); at 22.1–23.4 ns each
+  that is 18.2 ms, 0.38 ms per token, against 1 / 132.9 = 7.52 ms per token:
+  **5.0%** (the `all_resident` lookups beside them are not pager calls and are
+  not counted). A slot-indexed structure makes each of those hits cheaper; a
+  design that stops touching every expert removes them.
+- **Policy:** prefill sweeps are within 1.2–1.8% of Belady (generated) and 0%
+  (recorded first sweep), dense streaming within 0.5–5.8%. **Constrained MoE
+  decode is the only place with room: Belady halves the decode misses of the
+  `moe` request sequence.** Each saved miss is an expert upload and, there, a
+  disk read — the bigger lever than the scan in that regime, with the caveats
+  above about what the bound means.
+
 ## Steps
 
-### 1. Measure before designing
+### 1. Measure before designing (done)
 
-- Read the three consumers and write down, per session type, the pool sizes real
-  models produce and how many touches and misses one decode token and one
-  prefill chunk make.
-- A pager micro-benchmark in `infr-core` (a `#[ignore]`d test or a bench binary,
-  following how the crate already does timing tests): replay a touch trace
-  against `Pager` and report nanoseconds per touch and per miss. Traces: a
-  cyclic sweep, a Zipf-skewed routed pattern with a prefill sweep mixed in, and
-  at least one trace **recorded from a real MoE run**. Recording needs a trace
-  hook on the sessions behind `INFR_PAGER_STATS` (or a sibling debug key); the
-  hook is part of this step.
-- From the same traces, an offline policy simulator: misses under today's
-  policy, under each candidate in step 3, and under Belady (the lower bound a
-  trace allows). This is the instrument that says whether policy work is worth
-  anything for a given model.
-- Take the timing numbers in a quiet window, per the repo's measurement rules.
+The reading half is "What the survey found". The measuring half is three tools,
+kept in the tree so every later step is compared the same way:
+
+- **The trace:** `paging.trace` (`INFR_PAGER_TRACE`) names a file; every pager
+  pool of the run (VRAM expert and streaming arenas, the DRAM tier under them,
+  the CPU backend's pools) writes its calls there. The recorder lives inside
+  `Pager`, given to a pool at construction (`Pager::trace_to`); the format is in
+  `infr_core::pager::trace`'s module doc. A trace replays to the exact outcome
+  of every call (`trace::replay`, tested), so its counts equal the run's
+  `paging.stats` lines.
+- **The simulator:** `infr_core::pager::sim`. `simulate` owns residency, the
+  batch guard, pins and counting; a `Policy` only orders blocks and names a
+  victim. `Recency` is today's pager (checked against the real one on every
+  trace it is run on), `Belady` the lower bound under the same constraints for
+  traces without probes or repins (`belady_is_a_bound`; see "What a Belady
+  figure means here"). A candidate for step 3 is one more `Policy` impl.
+- **The benchmark:** `crates/infr-core/tests/pager_bench.rs`, `#[ignore]`d.
+  `generated_traces` replays the shapes in `infr_core::pager::shapes` (dense
+  sweep, MoE prefill, resident and routed decode, prefill plus decode, at
+  Qwen3-30B-A3B and DeepSeek-scale pool sizes); `recorded_traces` replays the
+  files in `INFR_TEST_PAGER_TRACE`; `recorded_trace_counters` prints a recorded
+  trace's replayed counters beside which to set the run's `paging.stats`.
+
+To reproduce the measurements below:
+
+```text
+infr run <model> "<prompt>" --dev Vulkan0 --temp 0 --max-new 48 \
+  --set paging.cache=4g --set paging.dram=1g --set paging.stats=true \
+  --set paging.trace=moe.trace
+cargo test --release -p infr-core --test pager_bench -- --ignored --nocapture \
+  --test-threads=1 generated_traces
+INFR_TEST_PAGER_TRACE=moe.trace cargo test --release -p infr-core \
+  --test pager_bench -- --ignored --nocapture --test-threads=1 recorded_traces
+```
+
+Timing numbers still belong in a quiet window, per the repo's measurement rules;
+the miss counts are exact on any machine.
 
 ### 2. Data-structure refactor (cost per touch)
 
@@ -160,9 +361,10 @@ Only where the simulator shows a gap to Belady worth closing:
   (`disk-streaming-plan.md` §3.6 says what that costs). Exclusive placement
   would make DRAM hold the next-hottest set instead (B36 lists it as unbuilt).
   Simulate the two-tier miss counts before building.
-- **Dense stays as it is:** the cyclic sweep is already optimal under
-  `schedule`, and the planned partition (`TierPlan`) is a placement question,
-  not an eviction one.
+- **Dense stays as it is:** `schedule`'s stable prefix is within
+  `(n_slots − 1)/(n_blocks − 1)` misses per pass of Belady in steady state (0.5–
+  5.8% of misses on the recorded dense pools), and the planned partition
+  (`TierPlan`) is a placement question, not an eviction one.
 
 ### 4. The costs around eviction
 

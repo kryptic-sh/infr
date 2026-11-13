@@ -169,7 +169,10 @@ fn cpu_paged_store(
     let io = std::sync::Arc::new(
         infr_core::blockio::FileBlockIo::open_shards(&g.shards()).map_err(|e| anyhow!("{e}"))?,
     );
-    let store = infr_cpu::paged::PagedWeights::new(&plans, io).map_err(|e| anyhow!("{e}"))?;
+    let trace = infr_core::pager::trace::TraceFile::for_config(ec.paging.trace.as_deref())
+        .map_err(|e| anyhow!("{e}"))?;
+    let store = infr_cpu::paged::PagedWeights::new(&plans, io, trace.as_ref())
+        .map_err(|e| anyhow!("{e}"))?;
     tracing::info!(
         "host paging: {} weight class(es), {:.2} GB arena of a {:.2} GB budget",
         plans.len(),
@@ -472,8 +475,14 @@ pub(crate) fn generate_dense_cpu_mode(
         None, // denoise_req
         req,
     );
-    if let Some(store) = store.filter(|_| ec.paging.stats) {
-        report_host_paging(&store);
+    if let Some(store) = &store {
+        // Flushed where the stats are taken, so the trace on disk covers what they report.
+        if let Err(e) = store.flush_trace() {
+            tracing::warn!("[host pager] {e}");
+        }
+        if ec.paging.stats {
+            report_host_paging(store);
+        }
     }
     out
 }

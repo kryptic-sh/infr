@@ -46,6 +46,7 @@ use ash::vk;
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::error::Result;
 use infr_core::hostpager::HostPager;
+use infr_core::pager::trace::{PoolInfo, Tier, TraceFile};
 use infr_core::pager::{BlockId, Insert, Pager, PagerStats, Resolution, NOT_RESIDENT};
 use infr_core::Backend;
 
@@ -175,6 +176,17 @@ impl GpuPager {
 
     pub fn stats(&self) -> PagerStats {
         self.pager.stats()
+    }
+
+    /// Record this arena's residency calls into `file` (`paging.trace`). Call it before the first
+    /// touch — see [`Pager::trace_to`].
+    pub fn trace_to(&mut self, file: &Arc<TraceFile>, info: PoolInfo) -> Result<()> {
+        Ok(self.pager.trace_to(file, info)?)
+    }
+
+    /// Flush this arena's trace, if it has one.
+    pub fn flush_trace(&mut self) -> Result<()> {
+        Ok(self.pager.flush_trace()?)
     }
 
     pub fn arena_buffer(&self) -> &dyn Buffer {
@@ -643,6 +655,34 @@ fn expert_bytes(arc: &Arc<dyn AsRef<[u8]> + Send + Sync>) -> &[u8] {
     inner.as_ref()
 }
 
+/// Flush every pool's trace and its host tier's — all of them, even after one fails — and return
+/// the first failure, but only the first time this session sees one (`reported`): a failed trace
+/// stays failed, and the stats points that flush run after every generation.
+fn flush_traces<'a>(
+    pools: impl Iterator<Item = (&'a mut GpuPager, Option<&'a Arc<HostPager>>)>,
+    reported: &mut bool,
+) -> Result<()> {
+    let mut first = None;
+    for (pager, host) in pools {
+        let results = [
+            pager.flush_trace(),
+            host.map_or(Ok(()), |h| h.flush_trace()),
+        ];
+        for r in results {
+            if let (Err(e), None) = (r, &first) {
+                first = Some(e);
+            }
+        }
+    }
+    match first {
+        Some(e) if !*reported => {
+            *reported = true;
+            Err(e)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The shared `hits/misses/evictions/hit_rate` fragment of both sessions' `paging.stats` lines
 /// (each session prepends its own label + slot size and appends its own slot-count suffix).
 fn stats_suffix(s: &PagerStats) -> String {
@@ -726,6 +766,8 @@ pub struct MoePagerSession {
     tape: Box<dyn Buffer>,
     tape_words: usize,
     print_stats: bool,
+    /// Whether a `paging.trace` write failure was already reported (see [`flush_traces`]).
+    trace_failure_reported: bool,
 }
 
 /// One pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
@@ -785,12 +827,28 @@ impl MoePagerSession {
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
         let mut pools = Vec::with_capacity(layout.pools.len());
         let mut max_slot = 4usize;
+        let trace = TraceFile::for_config(vk.cfg().paging.trace.as_deref())?;
         for spec in &layout.pools {
+            // MoE pools are pointer-addressed (`bufferDeviceAddress`) — no per-arena SSBO cap.
+            let mut pager = GpuPager::new(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes)?;
+            if let Some(t) = &trace {
+                let label = format!("moe {}/{}B", spec.role.name(), spec.slot_bytes);
+                if let Some(h) = &spec.host {
+                    h.trace_to(t, format!("{label} host"), layout.n_blocks)?;
+                }
+                pager.trace_to(
+                    t,
+                    PoolInfo {
+                        tier: Tier::Vram,
+                        label,
+                        n_blocks: layout.n_blocks,
+                    },
+                )?;
+            }
             pools.push(Pool {
                 role: spec.role,
                 slot_bytes: spec.slot_bytes,
-                // MoE pools are pointer-addressed (`bufferDeviceAddress`) — no per-arena SSBO cap.
-                pager: GpuPager::new(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes)?,
+                pager,
                 host: spec.host.clone(),
             });
             max_slot = max_slot.max(spec.slot_bytes);
@@ -819,6 +877,7 @@ impl MoePagerSession {
             tape,
             tape_words,
             print_stats: vk.cfg().paging.stats,
+            trace_failure_reported: false,
         })
     }
 
@@ -1132,6 +1191,18 @@ impl MoePagerSession {
         agg
     }
 
+    /// `paging.trace`: hand every pool's buffered trace events, and its host tier's, to the trace
+    /// file. Called where the stats are printed, so the trace on disk covers what the printed
+    /// counters cover. Every pool is flushed even after one fails; the first failure is returned
+    /// the first time only, since a failed trace stays failed and this runs after every generation.
+    pub fn flush_trace(&mut self) -> Result<()> {
+        let pools = self
+            .pools
+            .iter_mut()
+            .map(|p| (&mut p.pager, p.host.as_ref()));
+        flush_traces(pools, &mut self.trace_failure_reported)
+    }
+
     /// `paging.stats` (`INFR_PAGER_STATS=1`): print each pool's hit/miss/eviction counters. Called
     /// after generation finishes (see the CLI's bench/run/serve exit paths) — cheap enough to
     /// always compute, only printed when asked.
@@ -1282,6 +1353,8 @@ pub struct DensePagerSession {
     ring: Box<dyn Buffer>,
     ring_half_bytes: usize,
     print_stats: bool,
+    /// Whether a `paging.trace` write failure was already reported (see [`flush_traces`]).
+    trace_failure_reported: bool,
 }
 
 impl DensePagerSession {
@@ -1303,16 +1376,29 @@ impl DensePagerSession {
         );
         let mut pools = Vec::with_capacity(layout.pools.len());
         let mut max_slot = 4usize;
-        for spec in layout.pools {
+        let trace = TraceFile::for_config(vk.cfg().paging.trace.as_deref())?;
+        for (i, spec) in layout.pools.into_iter().enumerate() {
             max_slot = max_slot.max(spec.slot_bytes);
-            pools.push(DensePool {
-                // Dense-streaming pool: the arena is a `bufferDeviceAddress` buffer the streamed
-                // kernels read through a 64-bit pointer, so it may span as much VRAM as the
-                // budget allows — no `maxStorageBufferRange` cap (the pre-BDA ~4 GiB-per-pool
-                // ceiling this lifts), no u32 element-reach cap.
-                pager: GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes)?,
-                spec,
-            });
+            // Dense-streaming pool: the arena is a `bufferDeviceAddress` buffer the streamed
+            // kernels read through a 64-bit pointer, so it may span as much VRAM as the budget
+            // allows — no `maxStorageBufferRange` cap (the pre-BDA ~4 GiB-per-pool ceiling this
+            // lifts), no u32 element-reach cap.
+            let mut pager = GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes)?;
+            if let Some(t) = &trace {
+                let label = format!("dense pool{i}/{}B", spec.slot_bytes);
+                if let Some(h) = &spec.host {
+                    h.trace_to(t, format!("{label} host"), spec.n_blocks)?;
+                }
+                pager.trace_to(
+                    t,
+                    PoolInfo {
+                        tier: Tier::Vram,
+                        label,
+                        n_blocks: spec.n_blocks,
+                    },
+                )?;
+            }
+            pools.push(DensePool { pager, spec });
         }
         let ring_total = if layout.ring_bytes > 0 {
             layout.ring_bytes
@@ -1328,6 +1414,7 @@ impl DensePagerSession {
             ring,
             ring_half_bytes,
             print_stats: vk.cfg().paging.stats,
+            trace_failure_reported: false,
         })
     }
 
@@ -1446,6 +1533,15 @@ impl DensePagerSession {
             .iter()
             .map(|p| (p.pager.stats(), p.spec.host.as_ref().map(|h| h.stats())))
             .collect()
+    }
+
+    /// [`MoePagerSession::flush_trace`]'s dense twin.
+    pub fn flush_trace(&mut self) -> Result<()> {
+        let pools = self
+            .pools
+            .iter_mut()
+            .map(|p| (&mut p.pager, p.spec.host.as_ref()));
+        flush_traces(pools, &mut self.trace_failure_reported)
     }
 
     /// `paging.stats` (`INFR_PAGER_STATS=1`): per-pool hit/miss/eviction counters (cyclic-sweep

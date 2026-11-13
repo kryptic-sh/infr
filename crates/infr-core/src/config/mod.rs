@@ -152,6 +152,10 @@ cfg_struct! {
         ring: Option<SizeSpec> = None,
         /// `INFR_PAGER_STATS`.
         stats: bool = false,
+        /// `INFR_PAGER_TRACE`: write every pager pool's touch trace to this file (the format is
+        /// `infr_core::pager::trace`'s). One file holds every pool of the run; it is replayable to
+        /// the exact hit, miss and eviction counts `stats` prints. `None` = no trace, and no cost.
+        trace: Option<PathBuf> = None,
         /// `INFR_DRAM_CACHE`: the HOST weight-cache budget — the DRAM tier
         /// (`infr_core::hostpager`), which reads weights from the model file itself instead of
         /// leaving residency to the OS page cache.

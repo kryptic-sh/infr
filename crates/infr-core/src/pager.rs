@@ -17,11 +17,23 @@
 //! The second policy reuses the SAME slot bookkeeping for `BlockId = layer_idx` (or a per-tensor
 //! block within a layer) in a dense model whose weights don't fit VRAM: a dense forward visits
 //! layers in a fixed, known order every step, so residency is schedule-driven via
-//! [`Pager::schedule`] (exact cyclic-sweep eviction, Belady-parity — see its doc) rather than
+//! [`Pager::schedule`] (a stable resident prefix, near Belady's optimum — see its doc) rather than
 //! demand/LRU. The PREFETCH side (staging layer `l+1`'s bytes while `l` executes) is the
 //! backend's job — `infr-vulkan`'s `DensePagerSession` records uploads ahead of GPU execution
 //! through its pipelined ring; this module stays pure residency/eviction bookkeeping.
+//!
+//! ## Instruments
+//! [`trace`] records a pool's calls (`paging.trace`) and replays them; [`sim`] replays a trace
+//! under other eviction policies (Belady's optimum among them) without a model; [`shapes`]
+//! generates the access patterns real sessions make, for the simulator and the replay benchmark
+//! (`tests/pager_bench.rs`).
 use std::collections::HashMap;
+
+pub mod shapes;
+pub mod sim;
+pub mod trace;
+
+use trace::{Call, Outcome};
 
 /// Opaque identifier for one pageable block. The pager never interprets this — callers pack
 /// whatever key space they need (an expert id, a `(layer, role, expert)` tuple, a layer index for
@@ -109,6 +121,9 @@ pub struct Pager {
     /// whole op, spanning batches.
     pinned: HashMap<BlockId, u32>,
     stats: PagerStats,
+    /// `paging.trace`: where this pool's calls are recorded, or `None` (the default), in which
+    /// case each entry point pays one test of this field and nothing more.
+    trace: Option<Box<trace::Recorder>>,
 }
 
 /// Where a miss inserts into the LRU order — the two policies this pager already had, named so a
@@ -162,6 +177,47 @@ impl Pager {
             cur_epoch: 0,
             pinned: HashMap::new(),
             stats: PagerStats::default(),
+            trace: None,
+        }
+    }
+
+    /// Record every call this pager serves from now on into `file` (see [`trace`]), under a new
+    /// pool header built from `info` and this pager's slot count.
+    ///
+    /// # Panics
+    /// If this pager has served a call already. A trace has to start from the empty pager its
+    /// replay starts from, or it replays to different outcomes: the recorder is part of
+    /// construction, not something to switch on mid-run.
+    pub fn trace_to(
+        &mut self,
+        file: &std::sync::Arc<trace::TraceFile>,
+        info: trace::PoolInfo,
+    ) -> std::io::Result<()> {
+        let fresh = self.resident.is_empty()
+            && self.cur_epoch == 0
+            && self.free.len() == self.n_slots
+            && (self.stats.hits, self.stats.misses) == (0, 0);
+        assert!(
+            fresh,
+            "pager: a trace must start before the first call to replay"
+        );
+        self.trace = Some(Box::new(trace::Recorder::new(file, &info, self.n_slots)?));
+        Ok(())
+    }
+
+    /// Hand this pool's buffered trace events to its file and flush the file. A no-op without a
+    /// trace. An error means the trace is incomplete (a write failed; recording stopped there).
+    pub fn flush_trace(&mut self) -> std::io::Result<()> {
+        match self.trace.as_mut() {
+            Some(t) => t.flush(),
+            None => Ok(()),
+        }
+    }
+
+    #[inline(always)]
+    fn record(&mut self, call: Call, outcome: Outcome) {
+        if let Some(t) = self.trace.as_mut() {
+            t.record(call, outcome);
         }
     }
 
@@ -171,6 +227,7 @@ impl Pager {
     /// cold-end scan inserts, where LRU position alone no longer protects batch siblings).
     pub fn begin_batch(&mut self) {
         self.cur_epoch += 1;
+        self.record(Call::BeginBatch, Outcome::Done);
     }
 
     pub fn n_slots(&self) -> usize {
@@ -224,6 +281,12 @@ impl Pager {
     /// paged in (caller must upload the block's bytes into `slot` and write the device LUT entry
     /// `id -> slot` before any dispatch reads it).
     pub fn touch(&mut self, id: BlockId) -> Resolution {
+        let r = self.touch_untraced(id);
+        self.record(Call::Touch(id), Outcome::Resolved(r));
+        r
+    }
+
+    fn touch_untraced(&mut self, id: BlockId) -> Resolution {
         self.epoch.insert(id, self.cur_epoch);
         if let Some(&slot) = self.resident.get(&id) {
             self.stats.hits += 1;
@@ -253,6 +316,15 @@ impl Pager {
     /// On a `Miss` the caller must fill the slot before reading it; on a `Hit` it is already valid.
     /// Either way the block comes back pinned exactly once.
     pub fn resolve_and_pin(&mut self, id: BlockId, insert: Insert) -> Option<Resolution> {
+        let r = self.resolve_and_pin_untraced(id, insert);
+        self.record(
+            Call::ResolveAndPin(id, insert),
+            r.map_or(Outcome::Refused, Outcome::Resolved),
+        );
+        r
+    }
+
+    fn resolve_and_pin_untraced(&mut self, id: BlockId, insert: Insert) -> Option<Resolution> {
         if let Some(&slot) = self.resident.get(&id) {
             self.epoch.insert(id, self.cur_epoch);
             self.stats.hits += 1;
@@ -282,6 +354,12 @@ impl Pager {
     /// thrashing cache report ~50% and a perfect one report 100%: the two become indistinguishable
     /// where it matters. Returns `None` if `id` is not resident.
     pub fn repin(&mut self, id: BlockId) -> Option<u32> {
+        let slot = self.repin_untraced(id);
+        self.record(Call::Repin(id), Outcome::Slot(slot));
+        slot
+    }
+
+    fn repin_untraced(&mut self, id: BlockId) -> Option<u32> {
         let slot = *self.resident.get(&id)?;
         *self.pinned.entry(id).or_insert(0) += 1;
         Some(slot)
@@ -293,6 +371,12 @@ impl Pager {
     /// the tier below". A hit counts as a hit; a miss counts as nothing, because no residency
     /// decision was made.
     pub fn pin_if_resident(&mut self, id: BlockId) -> Option<u32> {
+        let slot = self.pin_if_resident_untraced(id);
+        self.record(Call::PinIfResident(id), Outcome::Slot(slot));
+        slot
+    }
+
+    fn pin_if_resident_untraced(&mut self, id: BlockId) -> Option<u32> {
         let slot = *self.resident.get(&id)?;
         self.epoch.insert(id, self.cur_epoch);
         self.stats.hits += 1;
@@ -314,6 +398,7 @@ impl Pager {
             }
             None => panic!("pager: unpin of block {id}, which holds no pin"),
         }
+        self.record(Call::Unpin(id), Outcome::Done);
     }
 
     /// How many distinct blocks are pinned right now — the number a caller sizes `n_slots`
@@ -332,6 +417,12 @@ impl Pager {
     /// If `id` is pinned. Removing a block someone is reading is the exact failure pins exist to
     /// prevent, so it is a caller bug, not a recoverable state.
     pub fn evict(&mut self, id: BlockId) -> Option<u32> {
+        let slot = self.evict_untraced(id);
+        self.record(Call::Evict(id), Outcome::Slot(slot));
+        slot
+    }
+
+    fn evict_untraced(&mut self, id: BlockId) -> Option<u32> {
         assert!(
             !self.pinned.contains_key(&id),
             "pager: evict of pinned block {id}"
@@ -350,17 +441,22 @@ impl Pager {
     /// end (it won't be needed again until every other block has been visited) and a hit keeps
     /// its position (promotion would let the sweep evict the stable set). The cache converges to
     /// a stable resident prefix of `n_slots - 1` blocks re-hit every pass plus one churn slot the
-    /// remaining blocks cycle through — the same hit count Belady's offline-optimal policy
-    /// achieves on a cyclic sweep (see `schedule_cyclic_sweep_is_belady_optimal`).
+    /// remaining blocks cycle through: `n_slots - 1` hits per pass (see
+    /// `schedule_cyclic_sweep_keeps_a_stable_prefix`). That is close to Belady's offline optimum
+    /// but not equal to it — MIN rotates which blocks it keeps — and in steady state it misses
+    /// about `(n_slots - 1) / (n_blocks - 1)` more blocks per pass than MIN, under one (the
+    /// simulator measures it: `sim`'s `schedule_on_a_sweep_is_within_one_miss_per_pass_of_belady`).
     ///
     /// Mechanically this shares [`Self::touch_cold`]'s cold-end insertion; it is a separate entry
     /// point because the CONTRACT differs: `touch_cold` promises scan-resistance for full-set
     /// sweeps MIXED with recency (`touch`) traffic on the same pager, while `schedule` promises
-    /// Belady-parity for a pager driven EXCLUSIVELY by one fixed cyclic order (dense layer
+    /// the stable prefix for a pager driven EXCLUSIVELY by one fixed cyclic order (dense layer
     /// streaming never mixes policies on a pool). Within-batch safety still rides the batch
     /// epoch ([`Self::begin_batch`]), not insertion order.
     pub fn schedule(&mut self, id: BlockId) -> Resolution {
-        self.touch_cold(id)
+        let r = self.touch_cold_untraced(id);
+        self.record(Call::Schedule(id), Outcome::Resolved(r));
+        r
     }
 
     /// [`Self::touch`]'s SCAN-RESISTANT twin, for full-set sweeps (a batched-prefill layer
@@ -374,6 +470,12 @@ impl Pager {
     /// routed-only path) keep their hot set at the MRU end, out of the sweep's victim zone.
     /// Within-batch safety comes from the batch epoch (see [`Self::begin_batch`]), NOT ordering.
     pub fn touch_cold(&mut self, id: BlockId) -> Resolution {
+        let r = self.touch_cold_untraced(id);
+        self.record(Call::TouchCold(id), Outcome::Resolved(r));
+        r
+    }
+
+    fn touch_cold_untraced(&mut self, id: BlockId) -> Resolution {
         self.epoch.insert(id, self.cur_epoch);
         if let Some(&slot) = self.resident.get(&id) {
             self.stats.hits += 1;
@@ -821,11 +923,12 @@ mod tests {
     }
 
     #[test]
-    fn schedule_cyclic_sweep_is_belady_optimal() {
+    fn schedule_cyclic_sweep_keeps_a_stable_prefix() {
         // Dense layer streaming's access shape: N blocks visited 0..N in order, repeated every
-        // forward pass, through C < N slots. Belady (evict the furthest-next-use block) yields
-        // exactly C-1 hits per steady-state pass on this trace; `schedule` must match it —
-        // plain LRU would yield ZERO (every block evicted right before its reuse).
+        // forward pass, through C < N slots. `schedule` keeps a stable prefix of C-1 blocks, so
+        // every pass after the first hits exactly C-1 times — plain LRU would hit ZERO times
+        // (every block evicted right before its reuse). Belady does slightly better still by
+        // rotating what it keeps; `sim`'s tests measure that gap.
         let (n_blocks, n_slots, passes) = (10u32, 4usize, 5u64);
         let mut p = Pager::new(n_slots);
         for _ in 0..passes {
@@ -839,7 +942,7 @@ mod tests {
         assert_eq!(
             p.stats().hits,
             want_hits,
-            "schedule policy fell short of the Belady hit count on a cyclic sweep"
+            "schedule policy fell short of the stable prefix's hit count on a cyclic sweep"
         );
     }
 

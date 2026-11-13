@@ -4463,3 +4463,46 @@ Not excluded: the GGUF on the Hub was re-uploaded after the hash was taken.
 Likely fix: once a Linux run confirms `0xbc4f22b22d3e3c1d` still holds, wrap it
 as `per_os(0xe1a4ed6cecc5eb14, 0xbc4f22b22d3e3c1d)`. Re-blessing on Windows
 alone would break Linux.
+
+### B163 — whether `schedule` should close its small gap to Belady on a cyclic sweep (2026-11-13)
+
+**Tag:** pager · policy · **Needs:** a decision, low priority
+
+`Pager::schedule` keeps a stable resident prefix on a cyclic sweep:
+`n_slots − 1` hits per pass. Belady's MIN rotates which blocks it keeps and does
+a little better; in steady state the difference tends to
+`(n_slots − 1)/(n_blocks − 1)` misses per pass (simulated with `pager::sim`:
+0.3375 per pass at 10 blocks / 4 slots over 400 passes against 1/3, 0.1925 at 40
+/ 8 against 0.1795; short runs carry an end effect of a few misses). The docs
+and the test that used to call `schedule` Belady-optimal were corrected in the
+pager-instruments slice (`schedule_cyclic_sweep_keeps_a_stable_prefix`).
+
+Open: is the gap worth closing? On the recorded dense trace (Qwen3-1.7B,
+`paging.cache=400m`, iGPU; `docs/plan/06-pager-eviction.md`, "Measurements")
+Belady saves 0.5–5.8% of each pool's misses, the most on the pool with the most
+slots (pool0: 2600 against 2449). A rotating policy would give up the stable
+prefix's fixed slot assignment, which
+`schedule_stable_prefix_keeps_its_slots_across_passes` pins, for at most that.
+Not worth it unless a dense run is found where those uploads dominate.
+
+### B164 — `infr-core`'s build of `Pager` runs ~1.5× slower than the same source built alone (2026-11-13)
+
+**Tag:** pager · perf · **Needs:** investigation
+
+Measured in the pager-instruments slice (busy machine, Ryzen 9 9950X3D, release,
+`target-cpu=native`), driving `Pager` with the same loop: a 6144-id cold sweep
+through 3072 slots costs about 12.9 µs per call and an MRU hit about 22.5 ns
+when `Pager` comes from `infr-core` (built as the workspace builds it, at `HEAD`
+and with the instruments alike), against about 8.5 µs and 16 ns when the same
+`pager.rs` source is compiled as a crate of its own or inside the calling test
+crate.
+
+Ruled out: the trace hook (`HEAD` and the instrumented tree are equal within
+noise in both builds); codegen-unit partitioning (one codegen unit did not
+change the gap); crossing a crate boundary as such (the standalone crate is also
+called across one); the `Call::apply` dispatch (direct calls show the same gap).
+Not explained. A guess, not checked: inlining decisions for the `HashMap`
+lookups in `coldest`'s per-entry closure that differ when `infr-core`
+instantiates the same map types elsewhere. Worth settling before the
+data-structure refactor is measured, since it moves every pager figure by the
+same factor.

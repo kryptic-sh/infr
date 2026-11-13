@@ -3940,6 +3940,46 @@ two manifest warnings are left, since neither fails `-D warnings`:
   `cargo clippy -p infr-core`, not by a `--workspace` run, so their use
   presumably hangs on a feature another crate turns on (not checked).
 
+### B154 — the 2026-11-13 Windows run: what executed, what did not (2026-11-13)
+
+The 2026-11-12 fixes were written on Linux. They were run the next day on the
+Windows 11 dev box (Ryzen 9 9950X3D, AMD proprietary driver) with
+`INFR_DEV=Vulkan1`, the integrated RDNA2 GPU, single-threaded. All of it passed:
+
+- `cargo nextest run --workspace` and `cargo clippy --workspace --all-targets`.
+- `infr-vulkan`: the library tests and every test binary under `tests/` except
+  the benches and probes (`attn_dsplit_probe`, `attn_ktile_probe`,
+  `bandwidth_probe`, `decode_gemv_bw`, `gemm_bench`, `interconnect_probe`,
+  `small_m_bench`, `moe_id_gemv_real_dims`), with `--include-ignored`.
+- `infr-llama`: `seam_op_parity` and `synthetic_deepseek2` with
+  `--include-ignored`, the library tests, and from `cpu_backend` the tests whose
+  model is cached: `cpu_golden_qwen3`, `cpu_golden_gemma3`, `cpu_golden_qwen35`,
+  `cpu_golden_qwen3_quants` (the rows whose file is cached), the
+  `cpu_kv_*_coherent` tests, the CPU paging tests, `gpu_seam_golden_qwen3`,
+  `gpu_seam_flash_matches_cpu`, `gpu_seam_kv_mainline_quants_coherent`,
+  `gpu_seam_kv_q8_coherent`, `gpu_seam_kv_reuse_matches_fresh`,
+  `gpu_seam_matches_cpu_gemma3`, `gpu_seam_matches_cpu_qwen2`,
+  `gpu_seam_multi_slot_prefix_sharing`, `h_tap_matches_lm_head`,
+  `qwen35_trunk_unaffected`, `unified_qwen35_gpu_seam_matches_cpu` and
+  `unified_qwen35_session_no_rewind`.
+
+Not run, stated as a gap:
+
+- **Anything on the 7900 XTX.** The discrete GPU on that box is kept free for
+  other work, so B75's `gpu_seam_kv_mainline_quants_coherent` failure under the
+  proprietary driver is still unconfirmed, and no coopmat kernel ran on Windows.
+  Three `infr-vulkan` library tests open every enumerated device (`multi.rs`,
+  `pipeline.rs` and `adapter.rs` call `VulkanBackend::new_on` per index), so a
+  library-test run touches the discrete GPU whatever `INFR_DEV` says.
+- **The multi-GPU tests** (`expert_parallel_*`, `tensor_parallel_*`,
+  `pipeline_matches_single_device`, `two_models_two_devices_concurrent`) and the
+  parked `mtp_*` tests.
+- **Every model-gated test whose model is not cached.** They print `skip:` and
+  count as passed under `--include-ignored`. That includes
+  `gpu_seam_matches_cpu_llama`: it wants the Q8_0 file and the box has
+  Llama-3.2-1B in Q4_K_M only.
+- No performance figure was taken; other work was running on the machine.
+
 ### Review coverage as of 2026-11-12
 
 Eight further read-only passes on 2026-11-12 went through what the earlier
@@ -3992,5 +4032,6 @@ Still not read by any pass, stated as a gap:
   `infr-gguf` (no reference to hand); `turbo.rs` (llama.cpp has no counterpart);
   the 331 llama.cpp commits between the pin the docs name and the checkout
   (B-DSHW-PULL).
-- **Nothing was run on:** a Windows machine, an Intel or NVIDIA GPU, a multi-GPU
-  world beyond opening one, or a Metal device outside CI.
+- **Nothing was run on:** an Intel or NVIDIA GPU, a multi-GPU world beyond
+  opening one, or a Metal device outside CI. Windows was run on 2026-11-13; see
+  B154 for what that covered.

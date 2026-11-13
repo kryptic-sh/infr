@@ -52,10 +52,10 @@ derived), about eleven thousand for DeepSeek V4-Flash. On 30B-A3B:
 
 - a prefill chunk that touches every expert makes 48 × 3 × 128 = 18,432
   `touch_cold` calls, each miss scanning its pool;
-- a decode token with every layer resident makes 18,432 MRU touches through
-  `touch_all_hits` plus as many `slot_of` lookups through `all_resident`, to
-  record nothing useful: promoting every expert of a layer leaves recency with
-  no information about which were routed;
+- a decode token with every layer resident made 18,432 MRU touches through
+  `touch_all_hits` plus as many `slot_of` lookups through `all_resident`. Both
+  are now one call per layer and role (a block group; see "Fully resident
+  decode" under "Measurements");
 - a decode token on the split path makes 48 × 3 × 8 = 1,152 touches, and any
   absent expert in a layer costs a blocking submit, a full drain and an id
   readback before its touches. That, not the scan, is expected to dominate a
@@ -85,31 +85,29 @@ in the current batch is never a victim, with plain LRU when batches are not in
 use; cold-end hits do not promote and hot-end hits do; pins are counted and
 exhaustion changes nothing; `evict` is an uncounted removal that returns its
 slot to a LIFO free list handed out from slot 0; the free list drains before any
-eviction; and the hit, miss and eviction counters keep their exact semantics.
+eviction; the hit, miss and eviction counters keep their exact semantics; a
+group touch (`Pager::touch_group`) leaves the pager exactly as a `touch` of each
+member in id order would, and a group is resident exactly while every member is
+(`pager::groups`' tests, among them a randomized equivalence check).
 
 ## Order of work, revised by the measurements
 
 What the numbers below support, largest measured end-to-end share first:
 
 1. **The trace hook, the micro-benchmark and the simulator** (step 1). Done.
-2. **Fully resident decode:** replace the per-token touch of every expert with
-   something that costs O(1) per layer and keeps recency meaningful. The largest
-   end-to-end pager share measured: about 5% of decode at 133 tok/s, all of it
-   spent on HITS. Needs a design: the routed ids are on the GPU, which is why
-   every expert is touched today.
-3. **The data-structure refactor** (step 2). Its measured case is narrower than
+2. **The data-structure refactor** (step 2). Its measured case is narrower than
    "the scan is slow": the scan is nearly all of the pager's own time on MoE
    pools, but about 1% of end-to-end time in the recorded disk-bound run. What
-   justifies it is the hit cost of resident decode (if step 2's design still
-   touches per expert), decode at a budget whose misses are served fast (6% of
-   decode in the large-DRAM run), and DeepSeek-scale prefill (0.20–0.26 s per
-   pool per generated chunk). Size it against those, not against the scan in
-   general.
-4. **MoE policy** (step 3), decode only: two-tier placement first (a DRAM tier
+   justifies it is decode at a budget whose misses are served fast (6% of decode
+   in the large-DRAM run) and DeepSeek-scale prefill (0.20–0.26 s per pool per
+   generated chunk); resident decode no longer makes a hit per expert. Size it
+   against those, not against the scan in general. A slot-indexed structure must
+   carry the group stamps (`pager::groups`) into its LRU list.
+3. **MoE policy** (step 3), decode only: two-tier placement first (a DRAM tier
    smaller than VRAM works only as a victim cache), then eviction candidates
    compared in `sim` on the recorded `moe` trace. The decode-miss stall
    (readback and drain) is its own question beside it.
-5. Small ones alongside: the per-call clone in `HostPager::fill` and
+4. Small ones alongside: the per-call clone in `HostPager::fill` and
    deduplicating split-path ids (both in B156).
 
 ## Measurements (2026-11-13)
@@ -272,13 +270,78 @@ lines):
   that is 18.2 ms, 0.38 ms per token, against 1 / 132.9 = 7.52 ms per token:
   **5.0%** (the `all_resident` lookups beside them are not pager calls and are
   not counted). A slot-indexed structure makes each of those hits cheaper; a
-  design that stops touching every expert removes them.
+  design that stops touching every expert removes them — which is what landed
+  next (below).
 - **Policy:** prefill sweeps are within 1.2–1.8% of Belady (generated) and 0%
   (recorded first sweep), dense streaming within 0.5–5.8%. **Constrained MoE
   decode is the only place with room: Belady halves the decode misses of the
   `moe` request sequence.** Each saved miss is an expert upload and, there, a
   disk read — the bigger lever than the scan in that regime, with the caveats
   above about what the bound means.
+
+### Fully resident decode (2026-11-13)
+
+**What the touches were for.** A wholly resident layer took the inline path:
+`all_resident` (one `slot_of` per expert and role), then `touch_all_hits` (a
+`begin_batch` and an MRU `touch` of every expert). The batch epoch those touches
+set protected nothing: the next call on the pool is `stage_and_window`'s own
+`begin_batch`, before any touch, and the slots a frozen window names are ordered
+against later copies by the adapter's arena barriers. What the touches did do is
+keep the layer recent, so that a miss elsewhere evicts the paged layers' stale
+experts rather than a layer used every token — which would send that layer down
+the split path (a blocking readback) on its next token.
+
+**What replaced them.** `Pager` groups blocks into equal runs (`group_by`; an
+MoE pool's layer is a group, registered by `MoePagerSession::register`). It
+counts each group's resident members on every admission and removal, so
+`all_resident` is one lookup, and `touch_group` stands for an MRU touch of every
+member in id order: one stamp for the group (member `k` ranks at `stamp + k`),
+its batch epoch, and the hits counted. Victim selection ranks a block by the
+later of its own stamp and its group's; an admission into a stamped group first
+writes the group stamp into the members still resident and drops it. **The
+policy is unchanged on purpose**: a group touch leaves the pager exactly as the
+per-member touches did (`pager::groups`' randomized equivalence test, for
+power-of-two and other group lengths), so the cost goes and the eviction
+decisions stay. What that policy means is in B156.
+
+**Exact counts**, Qwen3-30B-A3B Q4_K_M on the RX 7900 XTX, a 365-token prompt
+and 48 greedy tokens, traces recorded with the `HEAD` binary and the changed
+one:
+
+| configuration                 | VRAM pool calls per decode token: before / after | output, `paging.stats` | call sequence (group touches expanded) |
+| ----------------------------- | ------------------------------------------------ | ---------------------- | -------------------------------------- |
+| `paging.cache=18g`            | 16,905 / 522                                     | identical              | identical, all 8 pools                 |
+| `paging.cache=4g`, `dram=12g` | 1,659 / 1,278                                    | identical              | identical, all 8 pools                 |
+
+Per wholly resident layer and role that is 130 calls (`b`, 128 `t`, `b`) before
+and 3 (`b`, `g`, `b`) after. "Decode" is everything after the pool's last cold
+touch. At 4 GB one layer stays wholly resident in three of the four pools, so
+the fast path runs there too, once per token.
+
+**Pager time (replay benchmark, busy machine).** Generated resident decode, one
+pool, per token: 146.9 → 1.85 µs (48 × 128) and 271.9 → 2.96 µs (43 × 256).
+Replaying the recorded traces, the four VRAM pools' pager time over the whole
+run (prefill included), two repetitions each: 18 GB 110.4 / 111.7 ms before,
+92.3 / 92.5 ms after; 4 GB 301.7 / 299.1 ms before, 312.5 / 295.0 ms after — the
+same within the spread. (A first version looked up a block's group twice per
+victim-scan step and by division; at 4 GB its per-miss scan was 3–7% slower, so
+the lookup is now one, by shift for a power-of-two group.)
+
+**Decode throughput (`infr bench -p 0 -n 48 -d 365 -r 3`, RX 7900 XTX, busy
+machine, binaries alternated):**
+
+| configuration                 | before (t/s)        | after (t/s)         |
+| ----------------------------- | ------------------- | ------------------- |
+| `paging.cache=18g`            | 145.0, 146.3, 145.6 | 145.5, 145.6, 145.5 |
+| `paging.cache=4g`, `dram=12g` | 74.9, 76.0, 75.8    | 74.9, 76.1, 75.5    |
+
+No difference outside the run-to-run spread, at 18 GB either, although the
+replay puts the pager work removed at about 0.38 ms per token ((110.4 − 92.3) ms
+over 48 tokens, matching the step-1 estimate). In these runs the submit splitter
+is armed (the paging prefill's first forward passes its danger threshold), so
+the host records while the GPU runs earlier segments; the removed work is
+evidently off the critical path there. That is an inference from the numbers,
+not a measurement of the overlap.
 
 ## Steps
 

@@ -4,8 +4,9 @@
 //! Each shape follows a survey of the consumers (`docs/plan/06-pager-eviction.md`, "What the
 //! survey found"): dense streaming is one `schedule` per weight group, each its own batch; an MoE
 //! pool holds one block per (layer, expert) of one role, a batched prefill opens one batch per
-//! layer and cold-touches every expert in it, and decode either MRU-touches every expert of a
-//! layer (`touch_all_hits`, when the layer is fully resident) or the routed ones only.
+//! layer and cold-touches every expert in it, and decode either touches a fully resident layer
+//! as a whole (`touch_all_hits`: one group touch since the per-layer group landed, every expert
+//! MRU-touched before it) or the routed experts only.
 //!
 //! Randomness is xorshift64 (Marsaglia's 13/7/17 triple, as the crate's other tests use), seeded
 //! per shape, so a shape is the same trace on every run and machine.
@@ -134,14 +135,23 @@ impl Moe {
         }
     }
 
-    /// One decode token with every layer resident: per layer, one batch MRU-touching every
-    /// expert (`touch_all_hits`).
+    /// One decode token with every layer resident, as `touch_all_hits` made it before it touched
+    /// layers as groups: per layer, one batch MRU-touching every expert.
     pub fn decode_token_all(&self, calls: &mut Vec<Call>) {
         for layer in 0..self.n_layers {
             calls.push(Call::BeginBatch);
             for e in 0..self.n_expert {
                 calls.push(Call::Touch(self.id(layer, e)));
             }
+        }
+    }
+
+    /// One decode token with every layer resident, as `touch_all_hits` makes it: per layer, one
+    /// batch touching the layer's experts as one group.
+    pub fn decode_token_grouped(&self, calls: &mut Vec<Call>) {
+        for layer in 0..self.n_layers {
+            calls.push(Call::BeginBatch);
+            calls.push(Call::TouchGroup(self.id(layer, 0), self.n_expert));
         }
     }
 
@@ -199,6 +209,21 @@ impl Moe {
         let mut t = self.pool(format!("moe decode resident x{tokens}"), self.n_blocks());
         for _ in 0..tokens {
             self.decode_token_all(&mut t.calls);
+        }
+        t
+    }
+
+    /// [`Self::decode_resident`] as the session makes it today: one token touching every expert
+    /// (which admits them all, as the first token after a prefill would have), then `tokens`
+    /// tokens touching each layer as a group.
+    pub fn decode_resident_grouped(&self, tokens: usize) -> PoolTrace {
+        let mut t = self.pool(
+            format!("moe decode resident grouped 1+{tokens}"),
+            self.n_blocks(),
+        );
+        self.decode_token_all(&mut t.calls);
+        for _ in 0..tokens {
+            self.decode_token_grouped(&mut t.calls);
         }
         t
     }
@@ -283,6 +308,11 @@ mod tests {
         let per_pass = (m.n_layers * (m.n_expert + 1)) as usize;
         assert_eq!(m.prefill(2048, 2).calls.len(), 2 * per_pass);
         assert_eq!(m.decode_resident(3).calls.len(), 3 * per_pass);
+        // A grouped token is one batch and one group touch per layer.
+        assert_eq!(
+            m.decode_resident_grouped(3).calls.len(),
+            per_pass + 3 * 2 * m.n_layers as usize
+        );
         let routed = m.decode_routed(2048, 4, 1);
         assert_eq!(
             routed.calls.len(),

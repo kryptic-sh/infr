@@ -21,7 +21,9 @@
 //! the victim scan, which the data-structure refactor would remove.
 
 use infr_core::pager::shapes::{cyclic_sweep, Moe};
-use infr_core::pager::sim::{belady_is_a_bound, simulate, simulate_split, Belady, Recency};
+use infr_core::pager::sim::{
+    belady_is_a_bound, expand_groups, simulate, simulate_split, Belady, Recency,
+};
 use infr_core::pager::trace::{self, Call, Outcome, PoolTrace};
 use infr_core::pager::Resolution;
 use infr_core::Pager;
@@ -56,6 +58,26 @@ fn replay_once(t: &PoolTrace) -> Duration {
         black_box(c.apply(black_box(&mut p)));
     }
     start.elapsed()
+}
+
+/// Median nanoseconds to replay `t.calls[from..]` into a pager that has served `t.calls[..from]`
+/// untimed.
+fn time_after(t: &PoolTrace, from: usize) -> f64 {
+    let mut runs = Vec::new();
+    let begun = Instant::now();
+    while runs.len() < MIN_REPS || begun.elapsed() < MIN_TIME {
+        let mut p = Pager::new(t.n_slots);
+        for &c in &t.calls[..from] {
+            c.apply(&mut p);
+        }
+        let start = Instant::now();
+        for &c in &t.calls[from..] {
+            black_box(c.apply(black_box(&mut p)));
+        }
+        runs.push(start.elapsed().as_nanos() as f64);
+    }
+    runs.sort_by(f64::total_cmp);
+    runs[runs.len() / 2]
 }
 
 /// What one `Instant::now()` costs here, so a segment's clock read can be taken back out.
@@ -254,16 +276,41 @@ fn generated_traces() {
         top_k: 8,
         zipf_s: 1.0,
     };
+    let mut resident_per_token = Vec::new();
     for m in [qwen, deep] {
         let n = m.n_blocks();
         for slots in [n / 4, n / 2, 3 * n / 4] {
             report(&m.prefill(slots, 2), overhead);
         }
-        report(&m.decode_resident(8), overhead);
+        // Resident decode, as each token's per-expert touches made it and as its group touches do
+        // now. Both traces start with the same token touching every expert, which admits them
+        // all; only the tokens after it are timed.
+        let tokens = 8;
+        let (per_expert, grouped) = (
+            m.decode_resident(1 + tokens),
+            m.decode_resident_grouped(tokens),
+        );
+        report(&per_expert, overhead);
+        report(&grouped, overhead);
+        let admitting = m.decode_resident(1).calls.len();
+        let per_token = |t: &PoolTrace| time_after(t, admitting) / tokens as f64;
+        resident_per_token.push((m, per_token(&per_expert), per_token(&grouped)));
         for slots in [n / 4, n / 2, 3 * n / 4] {
             report(&m.decode_routed(slots, 64, 1), overhead);
         }
         report(&m.session(n / 2, 64, 1), overhead);
+    }
+    println!();
+    println!("| resident decode, one pool | pager µs/token: touch every expert | touch each layer as a group |");
+    println!("|---|---:|---:|");
+    for (m, per_expert, grouped) in resident_per_token {
+        println!(
+            "| {}x{} | {:.2} | {:.3} |",
+            m.n_layers,
+            m.n_expert,
+            per_expert / 1e3,
+            grouped / 1e3
+        );
     }
 }
 
@@ -333,11 +380,15 @@ fn recorded_trace_counters() {
 #[test]
 #[ignore = "needs recorded traces: set INFR_TEST_PAGER_TRACE"]
 fn recorded_phase_split() {
+    // Group touches are counted as the touches of every member they stand for, so a touch-all
+    // batch reads the same whether it was recorded before or after group touches landed.
     println!(
         "| pool | prefill misses: current / Belady (gap) | decode misses: current / Belady (gap)          | decode batches: touch-all / routed |"
     );
     println!("|---|---|---|---|");
-    for t in recorded() {
+    for mut t in recorded() {
+        t.calls = expand_groups(&t.calls);
+        t.outcomes.clear();
         let Some(last_cold) = t
             .calls
             .iter()

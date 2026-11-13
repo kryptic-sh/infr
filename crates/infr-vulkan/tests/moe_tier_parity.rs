@@ -17,6 +17,12 @@
 //! checked the way the paged kernels read it: through the layer's frozen LUT window in the tape,
 //! then the arena slot it names.
 //!
+//! The decode fast path's bookkeeping is checked here too, on the same fixture: a layer whose
+//! experts are all resident is found so in one call (`all_resident`) and touched as one group
+//! (`touch_all_hits`). Its tests show the group touch keeps such layers resident against misses
+//! elsewhere, content-checked through windows frozen before those misses, and that a layer stops
+//! counting as resident the moment one expert leaves, on every path one can leave by.
+//!
 //! Run: `cargo test -p infr-vulkan --test moe_tier_parity -- --ignored --nocapture`
 use infr_core::backend::{Backend, Buffer, BufferUsage};
 use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
@@ -136,6 +142,8 @@ struct Fixture<'a> {
     _placeholders: Vec<Box<dyn Buffer>>,
     buf_ids: Vec<usize>,
     bank: Vec<u8>,
+    /// VRAM slots in the session's one pool.
+    n_slots: usize,
     half: usize,
     cursor: usize,
     rotations: usize,
@@ -149,6 +157,17 @@ impl<'a> Fixture<'a> {
         host: Option<Arc<HostPager>>,
         bytes: impl Fn(usize) -> ExpertBytes,
     ) -> Self {
+        Self::with_slots(be, bank, host, bytes, VRAM_SLOTS)
+    }
+
+    /// [`Self::new`] with `n_slots` VRAM slots instead of [`VRAM_SLOTS`].
+    fn with_slots(
+        be: &'a VulkanBackend,
+        bank: &[u8],
+        host: Option<Arc<HostPager>>,
+        bytes: impl Fn(usize) -> ExpertBytes,
+        n_slots: usize,
+    ) -> Self {
         let layers = bank.len() / (N_EXPERT * STRIDE);
         let mut sess = MoePagerSession::new(
             be,
@@ -157,7 +176,7 @@ impl<'a> Fixture<'a> {
                 pools: vec![MoePoolSpec {
                     role: Role::Gate,
                     slot_bytes: STRIDE,
-                    n_slots: VRAM_SLOTS,
+                    n_slots,
                     host,
                 }],
                 ring_bytes: RING_BYTES,
@@ -190,6 +209,7 @@ impl<'a> Fixture<'a> {
             _placeholders: placeholders,
             buf_ids,
             bank: bank.to_vec(),
+            n_slots,
             half: 0,
             cursor: 0,
             rotations: 0,
@@ -249,7 +269,13 @@ impl<'a> Fixture<'a> {
     /// holding exactly its own bytes.
     fn check(&mut self, layer: usize, ids: &[u32], what: &str) {
         let lut = self.lut(layer);
-        let mut arena = vec![0u8; VRAM_SLOTS * STRIDE];
+        self.check_window(layer, &lut, ids, what);
+    }
+
+    /// [`Self::check`] through a window frozen earlier: every expert in `ids` of `layer` names a
+    /// slot that holds exactly its bytes now, after everything staged since the window froze.
+    fn check_window(&self, layer: usize, lut: &[u32], ids: &[u32], what: &str) {
+        let mut arena = vec![0u8; self.n_slots * STRIDE];
         self.be
             .download(self.sess.arena(self.buf_ids[layer]).unwrap(), &mut arena)
             .unwrap();
@@ -577,4 +603,174 @@ fn an_out_of_range_expert_is_refused_before_any_state_changes() {
             "{what}: the next layer's expert was staged"
         );
     }
+}
+
+/// The decode fast path for one layer, as `execute_paged_moe` takes it: when every expert is
+/// resident, touch the layer as a group, open the empty staging batch, and freeze its window.
+/// `None` when the layer is not wholly resident (the adapter would read the router back instead).
+fn fast_path(fx: &mut Fixture, layer: usize) -> Option<Vec<u32>> {
+    let buf_id = fx.buf_ids[layer];
+    if !fx.sess.all_resident(buf_id, N_EXPERT) {
+        return None;
+    }
+    fx.sess.touch_all_hits(buf_id, N_EXPERT).unwrap();
+    fx.stage(layer, &[], false).unwrap();
+    Some(fx.lut(layer))
+}
+
+/// Every expert id of a layer.
+fn every_expert() -> Vec<u32> {
+    (0..N_EXPERT as u32).collect()
+}
+
+/// The eviction-safety property on an almost-resident pool. Two layers are wholly resident and
+/// take the fast path every token; a third, with room for only part of its experts, misses on
+/// every token. The group touch keeps the two layers the most recently used, so the third layer's
+/// misses must take their victims from its own older experts: after each token's misses have been
+/// copied in, the windows the two layers froze BEFORE those misses must still name slots holding
+/// exactly their experts' bytes. (The adapter orders a layer's dispatch before later copies with
+/// its arena barriers, so a production dispatch reads its slots before then; reading them after
+/// is the stronger form, and the one that shows which blocks the misses chose.)
+///
+/// Without the group touch (or with one that does not reach the recency order), the two layers'
+/// experts would be the coldest in the pool from their last miss on, and the third layer's misses
+/// would overwrite them.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn resident_layers_keep_their_slots_against_misses_elsewhere() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let bank = synth_bank(3);
+    let (host, _) = host_tier(&bank, true);
+    // Room for two whole layers and two experts of the third.
+    let n_slots = 2 * N_EXPERT + 2;
+    let mut fx = Fixture::with_slots(&be, &bank, Some(host), |_| ExpertBytes::Host, n_slots);
+    // The prefill: every expert of layers 0 and 1, two of layer 2.
+    fx.stage(0, &every_expert(), true).unwrap();
+    fx.stage(1, &every_expert(), true).unwrap();
+    fx.stage(2, &[0, 1], false).unwrap();
+    let mut evictions = fx.stats().0.evictions;
+    assert_eq!(evictions, 0, "the prefill already evicted");
+    for token in 0..8u32 {
+        let what = format!("token {token}");
+        let w0 = fast_path(&mut fx, 0).unwrap_or_else(|| panic!("{what}: layer 0 not resident"));
+        let w1 = fast_path(&mut fx, 1).unwrap_or_else(|| panic!("{what}: layer 1 not resident"));
+        assert!(fast_path(&mut fx, 2).is_none(), "{what}: layer 2 fits?");
+        // Layer 2's routed pair walks through its experts, so every token misses twice.
+        let pair = [
+            (2 * token) % N_EXPERT as u32,
+            (2 * token + 1) % N_EXPERT as u32,
+        ];
+        fx.stage(2, &pair, false).unwrap();
+        fx.check(2, &pair, &what);
+        fx.check_window(
+            0,
+            &w0,
+            &every_expert(),
+            &format!("{what}, layer 0's window"),
+        );
+        fx.check_window(
+            1,
+            &w1,
+            &every_expert(),
+            &format!("{what}, layer 1's window"),
+        );
+        let now = fx.stats().0.evictions;
+        if token > 0 {
+            assert!(now > evictions, "{what}: layer 2 missed without evicting");
+        }
+        evictions = now;
+    }
+    let (vram, _) = fx.stats();
+    eprintln!(
+        "vram: {} hits / {} misses / {} evictions",
+        vram.hits, vram.misses, vram.evictions
+    );
+}
+
+/// A layer counts as wholly resident only while every one of its experts is — the gate that lets
+/// a decode step record without reading the router back, where a stale "yes" dispatches through a
+/// window entry that names no slot (or another expert's). The count must drop the moment an
+/// expert leaves, on each path that takes one: a victim of a miss in another layer, a miss whose
+/// read fails after displacing a victim (`fill_or_roll_back` keeps the victim out), and a miss in
+/// the layer itself whose read fails (its admission is rolled back). The discarded-recording path
+/// (`forget_unsubmitted`) needs a recorder's serial and is tested in the crate
+/// (`pager::tests::a_discarded_recording_unmarks_a_resident_layer`).
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn a_layer_stops_being_resident_when_an_expert_leaves() {
+    let Ok(be) = VulkanBackend::new() else {
+        eprintln!("skip: no Vulkan device");
+        return;
+    };
+    let bank = synth_bank(2);
+    let (host, io) = host_tier(&bank, true);
+    // One whole layer and one more expert.
+    let mut fx = Fixture::with_slots(&be, &bank, Some(host), |_| ExpertBytes::Host, N_EXPERT + 1);
+    let resident = |fx: &Fixture, layer: usize| fx.sess.all_resident(fx.buf_ids[layer], N_EXPERT);
+
+    // Every expert but the last: not resident. A failed read of the last one: still not, though
+    // the pager admitted it before the read failed.
+    let last = N_EXPERT as u32 - 1;
+    fx.stage(0, &every_expert()[..N_EXPERT - 1], false).unwrap();
+    assert!(!resident(&fx, 0));
+    io.fail_on.store(last, Ordering::SeqCst);
+    fx.stage(0, &[last], false)
+        .expect_err("the injected read must fail");
+    assert!(
+        !resident(&fx, 0),
+        "a rolled-back admission left the layer resident"
+    );
+    io.fail_on.store(NO_FAULT, Ordering::SeqCst);
+    fx.stage(0, &[last], false).unwrap();
+    assert!(resident(&fx, 0), "the layer's last expert arrived");
+    assert!(fast_path(&mut fx, 0).is_some());
+
+    // Layer 1 takes the free slot, then a second expert of it evicts one of layer 0's.
+    fx.stage(1, &[0], false).unwrap();
+    assert!(resident(&fx, 0));
+    fx.stage(1, &[1], false).unwrap();
+    assert!(!resident(&fx, 0), "a victim left its layer resident");
+    assert!(
+        fast_path(&mut fx, 0).is_none(),
+        "the fast path took a layer with an expert missing"
+    );
+    // A whole-layer touch of it is refused, not served.
+    let err = fx
+        .sess
+        .touch_all_hits(fx.buf_ids[0], N_EXPERT)
+        .expect_err("touching a partly resident layer must fail");
+    assert!(err.to_string().contains("not wholly"), "{err}");
+
+    // Back to wholly resident, then a miss in layer 1 whose read fails AFTER it displaced one of
+    // layer 0's experts: the victim stays out, so layer 0 is not resident. Layer 1's one resident
+    // expert is touched first (a hit), so layer 0 holds the coldest blocks.
+    fx.stage(0, &every_expert(), false).unwrap();
+    assert!(resident(&fx, 0));
+    let lut1 = fx.lut(1);
+    let held: Vec<u32> = (0..N_EXPERT as u32)
+        .filter(|&e| lut1[e as usize] != NOT_RESIDENT)
+        .collect();
+    assert_eq!(held.len(), 1, "layer 1 should hold one expert: {lut1:?}");
+    assert_eq!(fx.stage(1, &held, false).unwrap(), 0, "expected a hit");
+    assert_ne!(held[0], 2, "the failing miss must be a miss");
+    let victim_read = N_EXPERT as u32 + 2;
+    io.fail_on.store(victim_read, Ordering::SeqCst);
+    fx.stage(1, &[2], false)
+        .expect_err("the injected read must fail");
+    io.fail_on.store(NO_FAULT, Ordering::SeqCst);
+    assert!(
+        !resident(&fx, 0),
+        "a failed miss's victim left its layer resident"
+    );
+    // The survivors still serve their own bytes.
+    let lut = fx.lut(0);
+    let present: Vec<u32> = every_expert()
+        .into_iter()
+        .filter(|&e| lut[e as usize] != NOT_RESIDENT)
+        .collect();
+    assert_eq!(present.len(), N_EXPERT - 1);
+    fx.check(0, &present, "after the failed miss");
 }

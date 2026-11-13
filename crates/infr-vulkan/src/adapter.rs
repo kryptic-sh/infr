@@ -6371,8 +6371,10 @@ fn stage_and_window<'a>(
 ///     chunk records into one submission; misses ride recorded ring→arena copies whose only
 ///     backpressure is the fenced ring-half rotation (`rotate_stream` — CPU staging overlaps GPU
 ///     execution instead of serializing with it).
-///   - Small-m (decode) layers whose full expert set is resident: `touch_all_hits` (LRU upkeep,
-///     no residency/LUT mutation) + a frozen LUT window, recorded inline — zero host syncs.
+///   - Small-m (decode) layers whose full expert set is resident: `touch_all_hits` (recency
+///     upkeep — one group touch per role, O(1), no residency/LUT mutation) + a frozen LUT window,
+///     recorded inline — zero host syncs. The residency check is O(1) per role too
+///     (`MoePagerSession::all_resident`).
 ///   - Small-m layers with any absent expert: the ONE remaining blocking sync (`sync_stream`) to
 ///     read the router's ids — a mapped memcpy, the ids buffer is `Staging` — then routed-only
 ///     staging into the fresh ambient segment (which stays open for the next layer).

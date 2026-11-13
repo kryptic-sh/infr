@@ -35,7 +35,10 @@
 //! # Eviction policy
 //! Classic LRU for recency-driven touches (decode's routed-only path) plus the scan-resistant
 //! cold-end insertion (`infr_core::pager::Pager::touch_cold`) for the batched prefill's
-//! full-set sweeps — see that method's doc for why plain LRU is pathological there. llama.cpp
+//! full-set sweeps — see that method's doc for why plain LRU is pathological there. A decode layer
+//! whose experts are all resident is touched as one block group
+//! ([`MoePagerSession::touch_all_hits`]): the recency every expert's MRU touch would give it, at
+//! one call per layer and role. llama.cpp
 //! issue #20757's SLRU-with-admission remains the documented upgrade if these thrash on an
 //! adversarial pattern.
 use std::collections::HashMap;
@@ -202,6 +205,27 @@ impl GpuPager {
     /// whole layer is resident).
     pub fn is_resident(&self, id: BlockId) -> bool {
         self.pager.slot_of(id).is_some()
+    }
+
+    /// Group this arena's blocks into runs of `len` (an MoE pool: one layer's experts) — see
+    /// `infr_core::pager::Pager::group_by`. Errors instead of panicking when the arena is already
+    /// grouped by another length.
+    fn group_by(&mut self, len: u32) -> Result<()> {
+        match self.pager.group_len() {
+            Some(l) if l != len => Err(be(format!(
+                "pager: arena blocks are grouped by {l}, cannot also group them by {len}"
+            ))),
+            _ => {
+                self.pager.group_by(len);
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether every block of the group starting at `first` is resident, in O(1). The arena must be
+    /// grouped (the MoE session groups each pool when it registers a layer).
+    pub fn is_group_resident(&self, first: BlockId) -> bool {
+        self.pager.group_is_resident(first)
     }
 
     /// Resolve `id` against the arena and, on a MISS only, stage its bytes: `fill` writes them
@@ -908,6 +932,16 @@ impl MoePagerSession {
                     role, source.stride_bytes,
                 ))
             })?;
+        // The layer is one block group of its pool, which is what makes the decode fast path's
+        // residency check and recency upkeep one call per layer instead of one per expert
+        // (`all_resident`, `touch_all_hits`). Its experts must be exactly one group.
+        if n_expert == 0 || !source.layer_base.is_multiple_of(n_expert as u32) {
+            return Err(be(format!(
+                "moe pager: layer base {} is not a whole number of {n_expert}-expert layers",
+                source.layer_base
+            )));
+        }
+        self.pools[pool].pager.group_by(n_expert as u32)?;
         if matches!(source.bytes, ExpertBytes::Host) {
             let host = self.pools[pool].host.as_ref().ok_or_else(|| {
                 be(format!(
@@ -957,34 +991,50 @@ impl MoePagerSession {
 
     /// Whether ALL `n_expert` experts of `buf_id`'s layer are resident in its pool — the
     /// no-readback inline gate for a small-m (decode) layer: when true, any routing the GPU
-    /// picks is covered, so the host needs no routing knowledge at all.
+    /// picks is covered, so the host needs no routing knowledge at all. O(1): the layer is one
+    /// block group of its pool, whose resident count the pager keeps (`Pager::group_is_resident`).
+    /// `false` for an unregistered buffer, or an `n_expert` other than the layer registered with.
     pub fn all_resident(&self, buf_id: usize, n_expert: usize) -> bool {
-        let (_, pool, src, _) = match self.sources.get(&buf_id) {
-            Some(s) => s,
-            None => return false,
-        };
-        let pager = &self.pools[*pool].pager;
-        (0..n_expert as u32).all(|e| pager.is_resident(src.layer_base + e))
+        match self.sources.get(&buf_id) {
+            Some((_, pool, src, n)) if *n as usize == n_expert => {
+                self.pools[*pool].pager.is_group_resident(src.layer_base)
+            }
+            _ => false,
+        }
     }
 
-    /// LRU maintenance for an inline-recorded (no-readback) layer: mark all `n_expert` blocks
-    /// MRU. Callers gate on [`Self::all_resident`], so every touch is a hit — no uploads, no LUT
-    /// mutation (the property that makes inline recording safe while earlier segments are still
-    /// in flight).
+    /// Recency upkeep for an inline-recorded (no-readback) layer, in one call: the layer's
+    /// experts are touched as one group (`Pager::touch_group`), which leaves the pool exactly as
+    /// an MRU touch of every one of them in id order would — the same hits counted and the same
+    /// recency order — without the per-expert work. Callers gate on [`Self::all_resident`]; a
+    /// layer that is not wholly resident is an error, and touches nothing. No uploads and no LUT
+    /// mutation (the property that makes inline recording safe while earlier segments are still in
+    /// flight).
+    ///
+    /// The upkeep is what keeps a layer used every token wholly resident: a miss elsewhere evicts
+    /// the least recently used block, and without it a fully resident layer's experts would age
+    /// from the moment it last missed, become the victims, and send the layer down the split path
+    /// (a blocking readback) on its next token. It is not what makes the step safe to record —
+    /// the batch opened here is closed by the next `begin_batch` on the pool before any touch, and
+    /// the slots the window names are ordered against later copies by the adapter's barriers.
     pub fn touch_all_hits(&mut self, buf_id: usize, n_expert: usize) -> Result<()> {
-        let (_, pool, src, _) = self
+        let (_, pool, src, n) = self
             .sources
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: touch on an unregistered buffer"))?;
+        if *n as usize != n_expert {
+            return Err(be(format!(
+                "moe pager: touch of {n_expert} experts on a {n}-expert layer"
+            )));
+        }
         let layer_base = src.layer_base;
         let pager = &mut self.pools[*pool].pager;
         pager.begin_batch();
-        for e in 0..n_expert as u32 {
-            let r = pager.pager.touch(layer_base + e);
-            debug_assert!(
-                matches!(r, Resolution::Hit { .. }),
-                "touch_all_hits on a non-resident block (all_resident gate violated)"
-            );
+        if !pager.pager.touch_group(layer_base) {
+            return Err(be(format!(
+                "moe pager: touch_all_hits on layer base {layer_base}, which is not wholly \
+                 resident (the all_resident gate was not checked)"
+            )));
         }
         Ok(())
     }
@@ -1585,6 +1635,76 @@ pub type DensePagerCell = Mutex<Option<DensePagerSession>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recording discarded after it staged a layer's last missing expert takes that placement
+    /// back (`forget_unsubmitted`), and with it the layer's "wholly resident": the decode fast path
+    /// must not record against a window naming a slot whose copy never ran. (The other ways an
+    /// expert leaves are tested on the public surface, in `tests/moe_tier_parity.rs`; this one
+    /// needs the recording's serial.)
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn a_discarded_recording_unmarks_a_resident_layer() {
+        let Ok(be) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (stride, n_expert, buf_id) = (256usize, 4usize, 1usize);
+        let mut sess = MoePagerSession::new(
+            &be,
+            MoePagerLayout {
+                n_blocks: n_expert,
+                pools: vec![MoePoolSpec {
+                    role: Role::Gate,
+                    slot_bytes: stride,
+                    n_slots: n_expert,
+                    host: None,
+                }],
+                // A half holds every expert, so no staging call has to rotate.
+                ring_bytes: 2 * n_expert * stride,
+            },
+        )
+        .unwrap();
+        let bank: Vec<u8> = (0..n_expert * stride).map(|i| i as u8).collect();
+        sess.register(
+            Role::Gate,
+            buf_id,
+            ExpertSource {
+                bytes: ExpertBytes::Mmap(Arc::new(bank)),
+                stride_bytes: stride,
+                layer_base: 0,
+            },
+            n_expert,
+        )
+        .unwrap();
+        let stage = |sess: &mut MoePagerSession, rec: &crate::recorder::Recorder<'_>, ids| {
+            sess.begin_batch(buf_id).unwrap();
+            let mut cursor = 0;
+            assert_eq!(
+                sess.stage_role(rec, 0, &mut cursor, buf_id, ids, false)
+                    .unwrap(),
+                ids.len()
+            );
+        };
+        let rec = be.recorder().unwrap();
+        stage(&mut sess, &rec, &[0, 1, 2]);
+        rec.finish().unwrap();
+        assert!(!sess.all_resident(buf_id, n_expert));
+        let rec = be.recorder().unwrap();
+        stage(&mut sess, &rec, &[3]);
+        assert!(sess.all_resident(buf_id, n_expert));
+        sess.forget_unsubmitted(rec.serial());
+        rec.discard().unwrap();
+        assert!(
+            !sess.all_resident(buf_id, n_expert),
+            "a discarded recording's placement left the layer resident"
+        );
+        assert!(sess.touch_all_hits(buf_id, n_expert).is_err());
+        // The submitted placements survive.
+        let rec = be.recorder().unwrap();
+        stage(&mut sess, &rec, &[3]);
+        rec.finish().unwrap();
+        assert!(sess.all_resident(buf_id, n_expert));
+        assert_eq!(sess.stats(Role::Gate).misses, 5, "0, 1, 2, then 3 twice");
+    }
 
     // ── #4: GpuPager::new dimension validation returns Err (not panic) on bad input ──────────────
     #[test]

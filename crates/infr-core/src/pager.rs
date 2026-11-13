@@ -29,6 +29,7 @@
 //! (`tests/pager_bench.rs`).
 use std::collections::HashMap;
 
+mod groups;
 pub mod shapes;
 pub mod sim;
 pub mod trace;
@@ -120,6 +121,9 @@ pub struct Pager {
     /// dispatch batch while a pin lasts as long as the borrow — a CPU kernel reads a weight for a
     /// whole op, spanning batches.
     pinned: HashMap<BlockId, u32>,
+    /// Equal-size block groups ([`Self::group_by`]), or `None` for a pager that never groups.
+    /// Only the MoE expert pools group; every other consumer pays one test of this field.
+    groups: Option<groups::Groups>,
     stats: PagerStats,
     /// `paging.trace`: where this pool's calls are recorded, or `None` (the default), in which
     /// case each entry point pays one test of this field and nothing more.
@@ -176,6 +180,7 @@ impl Pager {
             epoch: HashMap::with_capacity(n_slots),
             cur_epoch: 0,
             pinned: HashMap::new(),
+            groups: None,
             stats: PagerStats::default(),
             trace: None,
         }
@@ -267,13 +272,30 @@ impl Pager {
         self.recency.insert(id, self.cold);
     }
 
-    /// The least-recently-used resident block that `eligible` accepts.
-    fn coldest(&self, eligible: impl Fn(BlockId) -> bool) -> Option<BlockId> {
-        self.recency
-            .iter()
-            .filter(|&(&b, _)| eligible(b))
-            .min_by_key(|&(_, &stamp)| stamp)
-            .map(|(&b, _)| b)
+    /// The least-recently-used resident block that `eligible` accepts, skipping, when
+    /// `batch_guard`, a block the current batch touched through its group ([`Self::touch_group`];
+    /// `eligible` sees only the block's own epoch). A block's recency is its own stamp, or the one
+    /// its group's last touch gave it if that is later. Each block's group is looked up once, and
+    /// only while some group touch is in force: an ungrouped pager ranks exactly as before groups.
+    fn coldest(&self, batch_guard: bool, eligible: impl Fn(BlockId) -> bool) -> Option<BlockId> {
+        let ranked = self.recency.iter().filter(|&(&b, _)| eligible(b));
+        let Some(g) = self.groups.as_ref().filter(|g| g.stamped()) else {
+            return ranked.min_by_key(|&(_, &stamp)| stamp).map(|(&b, _)| b);
+        };
+        ranked
+            .filter_map(|(&b, &own)| match g.stamp_of(b) {
+                Some((stamp, epoch)) => (!(batch_guard && epoch == self.cur_epoch))
+                    .then(|| (b, own.max(stamp + g.offset(b)))),
+                None => Some((b, own)),
+            })
+            .min_by_key(|&(_, stamp)| stamp)
+            .map(|(b, _)| b)
+    }
+
+    /// `id` becomes resident at `slot` (every miss's admission).
+    fn admit(&mut self, id: BlockId, slot: u32) {
+        self.group_admit(id);
+        self.resident.insert(id, slot);
     }
 
     /// Ensure `id` is resident, evicting the least-recently-used unprotected block if the cache
@@ -295,7 +317,7 @@ impl Pager {
         }
         self.stats.misses += 1;
         let (slot, evicted) = self.take_slot();
-        self.resident.insert(id, slot);
+        self.admit(id, slot);
         self.mark_mru(id);
         Resolution::Miss { slot, evicted }
     }
@@ -337,7 +359,7 @@ impl Pager {
         let (slot, evicted) = self.take_slot_opt()?;
         self.epoch.insert(id, self.cur_epoch);
         self.stats.misses += 1;
-        self.resident.insert(id, slot);
+        self.admit(id, slot);
         match insert {
             Insert::Mru => self.mark_mru(id),
             Insert::Cold => self.mark_cold(id),
@@ -430,6 +452,7 @@ impl Pager {
         let slot = self.resident.remove(&id)?;
         self.recency.remove(&id);
         self.epoch.remove(&id);
+        self.group_removed(id);
         self.free.push(slot);
         Some(slot)
     }
@@ -483,7 +506,7 @@ impl Pager {
         }
         self.stats.misses += 1;
         let (slot, evicted) = self.take_slot();
-        self.resident.insert(id, slot);
+        self.admit(id, slot);
         self.mark_cold(id);
         Resolution::Miss { slot, evicted }
     }
@@ -501,7 +524,7 @@ impl Pager {
         // find no victim at all. (The infallible `take_slot` expresses the same exemption as its
         // `cur_epoch == 0` assert.)
         let batches = self.cur_epoch != 0;
-        let victim = self.coldest(|b| {
+        let victim = self.coldest(batches, |b| {
             !(batches && self.epoch.get(&b) == Some(&self.cur_epoch))
                 && !self.pinned.contains_key(&b)
         })?;
@@ -514,6 +537,7 @@ impl Pager {
         // bounded by `n_slots`, accumulating a stale entry per distinct BlockId ever touched. A
         // stale entry could also mask an id as "current batch" across a `cur_epoch` wraparound.
         self.epoch.remove(&victim);
+        self.group_removed(victim);
         self.stats.evictions += 1;
         Some((vslot, Some(victim)))
     }
@@ -533,7 +557,7 @@ impl Pager {
             return (s, None);
         }
         let victim = self
-            .coldest(|b| self.epoch.get(&b) != Some(&self.cur_epoch))
+            .coldest(true, |b| self.epoch.get(&b) != Some(&self.cur_epoch))
             // Every resident block touched by the CURRENT batch means the batch exceeded
             // n_slots — the sizing floor (`Pager::new`'s doc) was violated upstream. Falling
             // back to plain LRU would silently evict a batch sibling mid-flight (the
@@ -562,7 +586,7 @@ impl Pager {
                     self.n_slots
                 );
                 // Epoch never used (legacy caller): plain LRU.
-                self.coldest(|_| true)
+                self.coldest(false, |_| true)
                     .expect("pager: a full cache with no resident block to evict")
             });
         self.recency.remove(&victim);
@@ -574,6 +598,7 @@ impl Pager {
         // bounded by `n_slots`, accumulating a stale entry per distinct BlockId ever touched. A
         // stale entry could also mask an id as "current batch" across a `cur_epoch` wraparound.
         self.epoch.remove(&victim);
+        self.group_removed(victim);
         self.stats.evictions += 1;
         (vslot, Some(victim))
     }

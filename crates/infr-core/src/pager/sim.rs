@@ -21,6 +21,13 @@
 //! whose requests depend on residency (the MoE decode path picks touch-all or routed touches from
 //! `all_resident`) would make different requests under a different policy.
 //!
+//! A group touch ([`Call::TouchGroup`]) is read as the request it stands for: a `touch` of every
+//! member in id order ([`expand_groups`]). That is exactly what the pager does with one it accepts;
+//! one it refuses (a member absent) changes nothing in the pager but would admit the missing
+//! members here. The MoE session only makes a group touch after checking the group is resident, so
+//! a recorded trace holds none it refused, and the replay benchmark checks [`Recency`]'s counts
+//! against the pager's on every trace, which would catch one.
+//!
 //! A candidate policy (S3-FIFO, ARC, a TinyLFU admission filter, ...) is one more [`Policy`] impl.
 //! Admission (declining to cache a block at all) is not expressible yet: the driver admits every
 //! miss, as `Pager` must.
@@ -62,8 +69,9 @@ pub struct SimStats {
 }
 
 /// Whether [`Belady`]'s misses are a lower bound for `calls`: true when the trace holds only
-/// `begin_batch`, `touch`, `touch_cold`, `schedule`, `resolve_and_pin` and `unpin` (see the module
-/// doc for why probes, repins and evicts are out).
+/// `begin_batch`, `touch`, `touch_cold`, `schedule`, `resolve_and_pin`, `unpin` and group touches
+/// (which the simulator reads as touches; see the module doc), and not for probes, repins and
+/// evicts (see the module doc for why).
 pub fn belady_is_a_bound(calls: &[Call]) -> bool {
     calls.iter().all(|c| {
         matches!(
@@ -74,8 +82,22 @@ pub fn belady_is_a_bound(calls: &[Call]) -> bool {
                 | Call::Schedule(_)
                 | Call::ResolveAndPin(..)
                 | Call::Unpin(_)
+                | Call::TouchGroup(..)
         )
     })
+}
+
+/// `calls` with every group touch replaced by a `touch` of each member in id order — the requests
+/// it stands for (see the module doc). Every other call is kept as it is.
+pub fn expand_groups(calls: &[Call]) -> Vec<Call> {
+    let mut out = Vec::with_capacity(calls.len());
+    for &c in calls {
+        match c {
+            Call::TouchGroup(first, len) => out.extend((first..first + len).map(Call::Touch)),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Run `calls` against a cache of `n_slots` under `policy`.
@@ -86,12 +108,15 @@ pub fn simulate(n_slots: usize, calls: &[Call], policy: &mut dyn Policy) -> SimS
 
 /// [`simulate`], with the counts of calls before `split` and from `split` on reported apart — one
 /// run, so the policy's decisions are those of the whole trace (a prefill/decode boundary, say).
+/// `split` indexes `calls` as given; a group touch counts in the phase it was made in.
 pub fn simulate_split(
     n_slots: usize,
     calls: &[Call],
     policy: &mut dyn Policy,
     split: usize,
 ) -> [SimStats; 2] {
+    let split = expand_groups(&calls[..split.min(calls.len())]).len();
+    let calls = &expand_groups(calls)[..];
     let mut phases = [SimStats::default(); 2];
     // Resident block -> the batch epoch of its last touch, as `Pager::epoch` keeps it.
     let mut resident: HashMap<BlockId, u64> = HashMap::with_capacity(n_slots);
@@ -134,6 +159,7 @@ pub fn simulate_split(
                 }
                 continue;
             }
+            Call::TouchGroup(..) => unreachable!("expanded above"),
         };
         let pins_on_success = matches!(call, Call::ResolveAndPin(..) | Call::PinIfResident(_));
         if resident.contains_key(&id) {
@@ -264,6 +290,7 @@ impl Belady {
             | Call::PinIfResident(id)
             | Call::Repin(id) => Some(id),
             Call::BeginBatch | Call::Unpin(_) | Call::Evict(_) => None,
+            Call::TouchGroup(..) => unreachable!("`simulate` expands group touches"),
         }
     }
 
@@ -497,6 +524,7 @@ mod tests {
                     }
                     go(at + 1, st, n_slots, calls, memo)
                 }
+                Call::TouchGroup(..) => unreachable!("random traces hold no group touches"),
                 Call::Touch(id)
                 | Call::TouchCold(id)
                 | Call::Schedule(id)
@@ -669,6 +697,7 @@ mod tests {
             out.push(m.session(slots, 40, 5));
         }
         out.push(m.decode_resident(4));
+        out.push(m.decode_resident_grouped(4));
         out
     }
 

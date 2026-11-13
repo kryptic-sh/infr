@@ -4109,13 +4109,40 @@ what is inference is said.
   `paging.stats`, so the hit rate on that path is inflated by repeats. Only rows
   above one can repeat an expert (one row's top-k is distinct — inferred from
   top-k, not checked in the router shader). Listed with the plan's small items.
-- **`touch_all_hits` promotes every expert of a fully resident layer.** The
-  inline path calls `all_resident` (one `slot_of` per expert) for each role,
-  then `touch_all_hits` (one MRU `Pager::touch` per expert) for each role, per
-  layer per decode token. The cost is `n_expert` touches per layer and role, and
-  recency loses which experts were routed: after such a token every expert of
-  the layer is equally hot. The plan's "fully resident decode" item owns the
-  redesign.
+- **A wholly resident layer's experts all rank as used, routed or not.** The
+  cost is gone (`all_resident` and `touch_all_hits` are one call per layer and
+  role: a block group in `Pager`, `pager::groups`), but the policy was kept on
+  purpose: a group touch is defined as an MRU touch of every member in id order,
+  and the recorded Qwen3-30B-A3B runs (18 GB and 4 GB/12 GB budgets) make
+  identical eviction decisions before and after. So after a fast-path token
+  every expert of the layer ranks above anything used earlier, in id order, and
+  a miss that reaches such a layer takes its lowest-numbered expert, not its
+  least-routed one. Ranking by routed use needs the routed ids on the host — the
+  readback the fast path exists to avoid — or a usage record the GPU writes and
+  the host reads later, off the critical path. Needs a decision, after a `sim`
+  comparison on an almost-resident trace whether any other ranking misses less
+  there; none was run.
+- **The fast path still copies a LUT window per layer and role per token.**
+  `lut_window` writes `n_expert` words into the tape (512 B per layer and role
+  on Qwen3-30B-A3B) even when nothing in the layer moved. Considered and
+  declined for now: reusing an earlier window would need a per-group residency
+  generation plus knowing that the tape region still holds it — the tape cursor
+  starts at zero for every `execute_static` call and resets at every
+  `sync_stream`, so a window outlives neither. Not measured on its own.
+- **`INFR_SUBMIT_DISPATCHES=0` does not stop the submit splitter arming, though
+  its warning says it does.** The `ARMED` warning in `infr-vulkan`'s `lib.rs`
+  tells the user to set it to 0 to disable splitting, but a cap of 0 is the
+  never-split state the arming check starts from (`cur == 0` and a forward past
+  `SUBMIT_DANGER_NS` arms it), so 0 changes nothing. Seen on 2026-11-13: a paged
+  Qwen3-30B-A3B bench with the variable at 0 still reported `submit split/16`.
+  Either the warning or the knob is wrong; no way to keep a dGPU from splitting
+  exists today. Matters for measurements: whether the host's recording is on the
+  critical path depends on it.
+- **`GpuPager::ensure_resident` (test-only) does not roll back a failed
+  upload.** `Pager::touch` admits the block before `vk.upload` and
+  `copy_into_slot` run, and an error from either leaves it resident (and now
+  counted in its group) with no bytes and no LUT entry. The production paths go
+  through `fill_or_roll_back`; only the paged-kernel parity fixtures call this.
 - **`HostPager::fill` clones the block descriptor on every call.** The first
   thing its loop does under the lock is `inner.descs.get(&id).cloned()`, a heap
   copy of the extent list, before the resident check — so hits pay it too.

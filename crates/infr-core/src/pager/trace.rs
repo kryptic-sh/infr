@@ -31,6 +31,10 @@
 //! | `p <id>` | [`Pager::repin`] | `<slot>` or `-` |
 //! | `u <id>` | [`Pager::unpin`] | — |
 //! | `e <id>` | [`Pager::evict`] | `<slot>` or `-` |
+//! | `g <first> <len>` | [`Pager::touch_group`] on a pager grouped by `len` ([`Pager::group_by`]) | `h` (every member was resident) or `-` (refused) |
+//!
+//! `g` arrived after the format's first traces; a file without it reads as before, and a reader
+//! that predates it rejects it as an unknown op rather than misreading it.
 //!
 //! A call that returns something may carry `?` instead of its outcome: "not recorded", which is
 //! how a generated trace ([`PoolTrace::write`] of a pool with no outcomes) is written. A pool's
@@ -116,6 +120,9 @@ pub enum Call {
     Repin(BlockId),
     Unpin(BlockId),
     Evict(BlockId),
+    /// [`Pager::touch_group`] of the group starting at the block, on a pager grouped by the
+    /// length.
+    TouchGroup(BlockId, u32),
 }
 
 /// What a [`Call`] returned.
@@ -130,6 +137,8 @@ pub enum Outcome {
     /// [`Call::PinIfResident`], [`Call::Repin`] and [`Call::Evict`]: the slot, or `None` when the
     /// block was not resident.
     Slot(Option<u32>),
+    /// [`Call::TouchGroup`]: whether the group was resident, and so touched.
+    Grouped(bool),
 }
 
 impl Call {
@@ -154,6 +163,10 @@ impl Call {
                 Outcome::Done
             }
             Call::Evict(id) => Outcome::Slot(p.evict(id)),
+            Call::TouchGroup(first, len) => {
+                p.group_by(len);
+                Outcome::Grouped(p.touch_group(first))
+            }
         }
     }
 
@@ -168,7 +181,8 @@ impl Call {
             | Call::PinIfResident(id)
             | Call::Repin(id)
             | Call::Unpin(id)
-            | Call::Evict(id) => Some(id),
+            | Call::Evict(id)
+            | Call::TouchGroup(id, _) => Some(id),
         }
     }
 }
@@ -190,6 +204,7 @@ fn write_event(out: &mut Vec<u8>, pool: u32, call: Call, outcome: Option<Outcome
         Call::Repin(id) => write!(w, "{pool} p {id}"),
         Call::Unpin(id) => write!(w, "{pool} u {id}"),
         Call::Evict(id) => write!(w, "{pool} e {id}"),
+        Call::TouchGroup(first, len) => write!(w, "{pool} g {first} {len}"),
     };
     let returns = !matches!(call, Call::BeginBatch | Call::Unpin(_));
     let _ = match outcome {
@@ -206,6 +221,8 @@ fn write_event(out: &mut Vec<u8>, pool: u32, call: Call, outcome: Option<Outcome
         })) => write!(w, " m {slot} -"),
         Some(Outcome::Refused | Outcome::Slot(None)) => write!(w, " -"),
         Some(Outcome::Slot(Some(slot))) => write!(w, " {slot}"),
+        Some(Outcome::Grouped(true)) => write!(w, " h"),
+        Some(Outcome::Grouped(false)) => write!(w, " -"),
     };
     w.push(b'\n');
 }
@@ -619,6 +636,19 @@ fn parse_event(line: &str) -> Result<(u32, Call, Option<Outcome>), String> {
             "p" => (Call::Repin(id), slot(3)?),
             "e" => (Call::Evict(id), slot(3)?),
             "u" => (Call::Unpin(id), (Some(Outcome::Done), 3)),
+            "g" => {
+                let len: u32 = num(field(3)?)?;
+                if len == 0 {
+                    return Err(format!("a zero-length group in `{line}`"));
+                }
+                let outcome = match field(4)? {
+                    "?" => None,
+                    "h" => Some(Outcome::Grouped(true)),
+                    "-" => Some(Outcome::Grouped(false)),
+                    o => return Err(format!("unknown group outcome `{o}`")),
+                };
+                (Call::TouchGroup(id, len), (outcome, 5))
+            }
             o => return Err(format!("unknown op `{o}`")),
         }
     };
@@ -714,6 +744,11 @@ mod tests {
         Call::BeginBatch,
         Call::Touch(1),
         Call::Touch(2),
+        // Groups of two: {0, 1} is resident, {2, 3} is not.
+        Call::TouchGroup(0, 2),
+        Call::TouchGroup(2, 2),
+        Call::Touch(0),
+        Call::TouchGroup(0, 2),
     ];
 
     fn every_entry_point(p: &mut Pager) -> Vec<Outcome> {
@@ -761,6 +796,7 @@ mod tests {
             })
         )));
         assert!(got.contains(&Outcome::Slot(None)));
+        assert!(got.contains(&Outcome::Grouped(true)) && got.contains(&Outcome::Grouped(false)));
         traced.flush_trace().expect("flush");
 
         let parsed = parse(io::BufReader::new(File::open(&path).expect("reopen"))).expect("parse");
@@ -855,6 +891,11 @@ mod tests {
             ("# infr pager trace v1\npool 0 vram 2 2 x\n0 t 1 -\n", 3),
             ("# infr pager trace v1\npool 0 vram 2 2 x\n0 t 1 h 0 9\n", 3),
             ("# infr pager trace v1\npool 0 sram 2 2 x\n", 2),
+            ("# infr pager trace v1\npool 0 vram 2 2 x\n0 g 0 0 h\n", 3),
+            (
+                "# infr pager trace v1\npool 0 vram 2 2 x\n0 g 0 2 m 0 -\n",
+                3,
+            ),
         ] {
             let e = parse(body.as_bytes()).expect_err(body);
             assert_eq!(e.line, line, "{body:?}: {e}");

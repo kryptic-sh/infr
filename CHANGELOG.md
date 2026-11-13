@@ -37,6 +37,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Capabilities::decode_replay` must override it or its decode takes the
   per-token path, and must return an error for a `replay_only` graph it would
   run at the baked positions.
+- **`infr_core::pager::trace::Call` has a new variant, `TouchGroup`, and
+  `Outcome` a new variant, `Grouped`** (a pager's group touch, written `g` in a
+  trace); an exhaustive match on either must handle them, and a trace reader
+  built before this rejects traces that contain one.
+- **`infr_vulkan::pager::MoePagerSession::register` now refuses a layer whose
+  `layer_base` is not a multiple of its expert count, or whose expert count
+  differs from another layer's in the same pool.** Each layer is one block group
+  of its pool.
 
 ### Added
 
@@ -80,6 +88,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Decoding a paged MoE model does far less pager bookkeeping for layers whose
+  experts are all in VRAM.** Each such layer used to check and touch every one
+  of its experts, for each of its roles, on every token; it is now one check and
+  one touch per layer and role, through a new block-group mechanism in
+  `infr_core::pager::Pager` (`group_by`, `group_is_resident`, `touch_group`).
+  Eviction decisions are unchanged: on Qwen3-30B-A3B with `paging.cache=18g`,
+  which keeps most layers wholly resident, the VRAM pools' pager calls per
+  decode token fell from 16,905 to 522 with identical output and identical
+  `paging.stats` counters. Decode throughput on an RX 7900 XTX did not change
+  measurably.
 - **Tokenization now follows llama.cpp for more models, so their prompt token
   ids change.** Llama 3 (`llama-bpe` and its aliases) and Qwen3.5 / Qwen3.6
   (`qwen35`) GGUFs were split with the GPT-2 regex; they now use their own, and

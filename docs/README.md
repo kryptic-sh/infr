@@ -68,6 +68,8 @@ at that index. It holds:
 
 ## Roadmaps & history
 
+- [plan/](plan/00-index.md) — the phase plans: new model families, streaming for
+  any model size, pager eviction. One file per phase, indexed in `00-index.md`.
 - [plan.md](plan.md) — the whole-system shape in one place: what shipped against
   the original MVP, the crate layout and backend seam, the step-by-step recipe
   for **adding a model architecture**, and the ranked candidate families.

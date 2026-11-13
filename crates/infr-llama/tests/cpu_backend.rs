@@ -1642,9 +1642,15 @@ fn smollm3_render(model: &infr_llama::SeamModel, prompt: &str) -> String {
         .expect("render chat")
 }
 
-// Captured + verified coherent: "The capital of France is Paris." (it stops there), and an ocean
-// paragraph ("The ocean is a vast and mysterious world, teeming with life …"). Both cases are the
-// short length that stays OS-stable for the other models here; captured on Windows only.
+// Captured + verified coherent: "The capital of France is Paris." (infr ends the turn there), and
+// an ocean paragraph ("The ocean is a vast and mysterious world, teeming with life …"). Both cases
+// are the short length that stays OS-stable for the other models here; captured on Windows only.
+//
+// Against llama.cpp on the same prompt ids: the ocean case matches for all 32 tokens. The France
+// case matches for 7 and then sits on a near tie between end-of-turn and " Paris": both engines'
+// prefill of that prefix rank end-of-turn first, while llama.cpp's token-by-token decode ranks
+// " Paris" first, which is what `llama-completion` prints ("Paris. Paris is a city …"). The
+// measured margins are in docs/backlog.md (B161).
 const SMOLLM3_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0x8bfd779284f134df),
     (
@@ -1655,7 +1661,8 @@ const SMOLLM3_GOLDEN: &[(&str, usize, u64)] = &[
 ];
 
 /// CPU-only: SmolLM3 golden-hash lock — the llama graph with rope skipped on the NoPE layers
-/// (`Config::is_nope_layer`). Its greedy output was compared with llama.cpp's before the bless.
+/// (`Config::is_nope_layer`). How its greedy output compares with llama.cpp's is on
+/// [`SMOLLM3_GOLDEN`].
 #[test]
 #[ignore = "needs SmolLM3-3B in the HF cache"]
 fn cpu_golden_smollm3() {

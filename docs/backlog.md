@@ -4242,27 +4242,56 @@ fuse that writes the cast K straight into the cache the way `plan_kv_write` does
 for rope → `WriteKv`. llama4's rope layers have the same need, for their
 L2-normed K.
 
-### B158 — infr renders chat templates without trim_blocks / lstrip_blocks (2026-11-13)
+### B158 — chat-template renders: what still differs from llama.cpp (2026-11-13)
 
 **Tag:** chat · correctness
 
-infr-chat's template environment (`build_env` in
-`crates/infr-chat/src/template.rs`, from line 98) never turns on minijinja's
-`trim_blocks` or `lstrip_blocks`. llama.cpp's jinja lexer has both on by default
-for chat templates (`common/jinja/lexer.cpp` lines 132–138:
-`opt_lstrip_blocks = true`, `opt_trim_blocks = true`), and HF's
-`apply_chat_template` does the same. So a newline after a block or comment tag
-that the reference drops stays in infr's prompt.
+`build_env` (`crates/infr-chat/src/template.rs`) turns on `trim_blocks` and
+`lstrip_blocks`, as llama.cpp's lexer (`common/jinja/lexer.cpp`) does for every
+chat template. Checked by rendering each cached GGUF's template (Qwen2.5-0.5B,
+Qwen3-0.6B / 1.7B / 30B-A3B, Qwen3.5-0.8B, gemma-3-1b, Llama-3.2-1B, SmolLM3-3B)
+for seven conversations (user; user without thinking; system + user; user /
+assistant / user, with and without thinking; user with one tool; the SmolLM3
+golden's) through infr and through llama.cpp's `test-chat-template --no-common`
+with the same variables. Every render now matches byte for byte except the tool
+renders below. Hugging Face transformers was not run (not installed here). What
+is left:
 
-Seen on SmolLM3's template (unsloth's GGUF): the newline after its third line's
-comment survives because the fourth line, `{# ───── defaults ───── #}`, has no
-`-` to trim it, so infr's render starts with `"\n"`.
-`infr run --set debug.chat=true` shows it, and llama.cpp tokenizes that render
-to 79 tokens with a leading 198 (`\n`), the same count infr prefilled. A
-llama.cpp render would not carry it. `cpu_golden_smollm3` locks that render in,
-so turning the options on will move its hashes. Not checked: how many other
-shipped templates differ, and which other golden hashes move. That is its own
-slice, with re-blessing.
+- **`tojson` separators.** infr's `tojson` (no `indent=`) is compact
+  (`{"a":1,"b":2}`); llama.cpp prints `{"a": 1, "b": 2}`. The Jinja2 harness in
+  llama.cpp's `tests/test-jinja.cpp`, which says it is kept in sync with
+  transformers' `chat_template_utils.py`, defines `tojson` as a plain
+  `json.dumps`, whose default separators are those spaced ones. So the tool
+  block of every Qwen2.5 / Qwen3 / Qwen3.5 prompt with tools differs from the
+  reference in those spaces; Llama 3.2's (`tojson(indent=4)`) matches. Changing
+  it moves every tools prompt for those models; the Llama-3 fixture test
+  `tojson_without_indent_stays_compact` pins today's compact form.
+- **Variables.** infr always passes `tools` (null without tools) and
+  `add_generation_prompt`; llama.cpp leaves `tools` out when there are none and
+  `add_generation_prompt` out when false. No checked template renders
+  differently for it (`tools is defined` is the case that would).
+- **Lexer edge cases, none copied.** Each was read in both lexers
+  (`common/jinja/lexer.cpp`; minijinja 2.21.0 `src/compiler/lexer.rs`) and
+  rendered through both engines. None is expected in a real chat template; every
+  cached template starts with a tag and has no `\r`. Copying the first two would
+  mean copying llama.cpp bugs.
+  - **First text before the first tag.** llama.cpp's `lstrip_blocks` walk drops
+    the template's first text when it reaches offset 0 over spaces or tabs, or
+    when that text is a single character: `A{% if true %}B{% endif %}` and
+    `A  {% if true %}B{% endif %}` render `B` there, `AB` and `A  B` in
+    minijinja; `\n{% if true %}A{% endif %}` renders `A` there, `\nA` in
+    minijinja.
+  - **Unicode whitespace before a line-start tag.** minijinja strips it
+    (`char::is_whitespace`); llama.cpp does not (byte-wise `isspace`):
+    `A\n　{% if true %}B{% endif %}` renders `A\nB` in minijinja and keeps the
+    U+3000 in llama.cpp.
+  - **A lone `\r` line break.** llama.cpp turns `\r\n` and `\r` in the source
+    into `\n` before lexing; minijinja keeps them and does not treat a lone `\r`
+    as a line start for `lstrip_blocks`: `A\r  {% if true %}B{% endif %}`
+    renders `A\nB` in llama.cpp and `A\r  B` in minijinja.
+  - **`{%+` / `+%}`.** minijinja reads them (keep the whitespace at that tag);
+    llama.cpp's lexer has no such case, and `test-chat-template` exited with no
+    output on `{% if true +%}\nA{% endif %}` (minijinja: `\nA`).
 
 ### B159 — SmolLM3's tool definitions are dropped silently (2026-11-13)
 
@@ -4271,9 +4300,24 @@ slice, with re-blessing.
 `render_template` (`crates/infr-chat/src/template.rs`) passes tool definitions
 as `tools`. SmolLM3's template reads `xml_tools` and `python_tools` and never
 `tools`, so a request with tools renders exactly as one without them, and the
-model is never told they exist. Nothing errors. A fix maps `tools` to
-`xml_tools` for templates that name it (and checks the `<tool_call>` reply
-parses through the existing dialect), or refuses tools for such a template.
+model is never told they exist. Nothing errors.
+
+llama.cpp does the same: nothing in `common/` names `xml_tools` or
+`python_tools`, and no specialized handler matches SmolLM3, so its own render of
+a tools request (checked through `test-chat-template` with the common path) also
+has no tool block. Mapping `tools` to `xml_tools` would therefore depart from
+the reference, and is more than a variable:
+
+- The template prints each tool with `tool | string`, Python's `str(dict)` in HF
+  (single quotes), which minijinja's `string` filter does not reproduce.
+- The template has no `tool_calls` branch for assistant messages, so a replayed
+  call is lost from history; tool results go through its `tool` role branch.
+- Replies come as `<tool_call>{"name": …, "arguments": …}</tool_call>`, the
+  Hermes shape `parse_hermes_tool_calls` reads; not run against SmolLM3 output.
+
+Options: refuse tools for a template that names `xml_tools` but not `tools` (an
+honest error), or build the mapping with those three pieces and a test against
+an HF render.
 
 ### B160 — two deepseek2 parses that differ from llama.cpp (2026-11-13)
 
@@ -4293,7 +4337,7 @@ sides; not fixed
   4.7 Lite), softmax otherwise. A GLM 4.7 Lite file without the key would route
   with the wrong function in infr.
 
-### B161 — the SmolLM3 golden runs nowhere by default (2026-11-13)
+### B161 — the SmolLM3 golden runs nowhere by default, and its first case is a near tie (2026-11-13)
 
 **Tag:** tests · ci
 
@@ -4304,3 +4348,53 @@ goldens keep OS-stable, but no Linux run has confirmed it for this model. To run
 it in CI: add `unsloth/SmolLM3-3B-GGUF` `SmolLM3-3B-Q4_K_M.gguf` (about 1.9 GB)
 to that job's download list, bump its cache key, drop the `#[ignore]`, and wrap
 a hash in `per_os` if the Linux run differs.
+
+Against llama.cpp, measured 2026-11-13 on this Windows box, CPU, on identical
+prompt ids (llama.cpp's own 39-token render, which infr's now matches byte for
+byte): the ocean case matches for all 32 tokens. The France case matches for 7
+tokens (`The capital of France is Paris.`); infr then ends the turn, and
+`llama-completion` continues `Paris is a city known for …`. The 8th token is a
+near tie between end-of-turn (128012) and ` Paris` (12366), and llama.cpp itself
+picks differently depending on how it gets there:
+
+| engine and path, over the same 46 ids                    | 128012 |  12366 | margin               |
+| -------------------------------------------------------- | -----: | -----: | -------------------- |
+| infr CPU prefill (raw logits)                            | 29.185 | 29.139 | end-of-turn by 0.047 |
+| llama.cpp `llama-server` prefill (logprobs)              | −0.847 | −0.911 | end-of-turn by 0.064 |
+| llama.cpp `llama-server` token-by-token decode (logprob) | −0.970 | −0.818 | ` Paris` by 0.152    |
+
+A logprob difference is a logit difference, so the margins compare directly.
+Third place is ` It` (1102) in every row, about 1 logit further down. infr's
+decode path, the one the golden runs, was not dumped; it ends the turn. The infr
+row came from `cpu_prefill_matches_llama_debug_dump` fed a hand-made token file
+(`llama-debug` does not parse special tokens in `-p`) and an unrelated logits
+file, so only its printed infr top-5 means anything, and that run fails the
+test's comparison by construction. The golden is kept: the flip sits inside
+llama.cpp's own prefill-versus-decode spread.
+
+### B162 — `cpu_golden_qwen3moe` fails on this Windows box: suspected OS difference (2026-11-13)
+
+**Tag:** tests · moe
+
+`cpu_golden_qwen3moe` (`crates/infr-llama/tests/cpu_backend.rs`, `#[ignore]`d,
+runs nowhere in CI) fails here: got `0xe1a4ed6cecc5eb14`, want
+`0xbc4f22b22d3e3c1d`. What is established:
+
+- This golden had never run on Windows before: the Qwen3-30B-A3B GGUF was first
+  downloaded to this machine on 2026-11-13. The hash was set in `e252233a`
+  (2026-07-05), recorded by review as a Linux capture.
+- The chat-template change is not the cause: the same hash comes out with
+  `trim_blocks` / `lstrip_blocks` off, and this model's template renders
+  identically either way.
+- The output is coherent. The test prints only today's text,
+  `<think>\nOkay, the user is asking "The capital of France is". I need to provide the correct answer. Let`;
+  the comment above `QWEN3MOE_GOLDEN` records the blessed one as
+  `<think>\nOkay, the user is asking, "The capital of France is". …`. The first
+  difference is the token after ` asking`: `,` when blessed, ` "` today.
+
+Suspected cause: the Windows-versus-Linux greedy difference the doc on `per_os`
+describes, which is why the other long goldens carry a separate Windows hash.
+Not excluded: the GGUF on the Hub was re-uploaded after the hash was taken.
+Likely fix: once a Linux run confirms `0xbc4f22b22d3e3c1d` still holds, wrap it
+as `per_os(0xe1a4ed6cecc5eb14, 0xbc4f22b22d3e3c1d)`. Re-blessing on Windows
+alone would break Linux.

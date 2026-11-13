@@ -55,8 +55,8 @@ static ENV_CACHE: LazyLock<Mutex<HashMap<String, SharedEnv>>> =
 /// Symptom when the limit IS hit: `tmpl.render` returns `minijinja::Error` with
 /// `ErrorKind::OutOfFuel` ("ran out of fuel"), which [`render_core`] wraps as
 /// [`TemplateError::Render`] — so `serve` answers with the template error message and `infr run`
-/// falls back to [`chatml`](crate::chatml), exactly as for any other malformed template. Nothing
-/// hangs and no slot leaks.
+/// stops with its no-usable-template error, exactly as for any other malformed template (there is
+/// no fallback prompt format). Nothing hangs and no slot leaks.
 pub(crate) const CHAT_TEMPLATE_FUEL: u64 = 100_000_000;
 
 /// Largest pad width or count a template may hand a native helper whose argument is parsed
@@ -101,6 +101,16 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
     // must never be handed an unbounded interpreter. The tracker is created per render, so the
     // budget is not consumed across the cached environment's lifetime.
     env.set_fuel(Some(CHAT_TEMPLATE_FUEL));
+    // The reference renders chat templates with Jinja's `trim_blocks` and `lstrip_blocks` on:
+    // llama.cpp's lexer (`common/jinja/lexer.cpp`, `opt_trim_blocks` / `opt_lstrip_blocks`)
+    // always applies both, and the Jinja2 environments llama.cpp checks itself against
+    // (`tests/test-jinja.cpp`, `scripts/jinja/jinja-tester.py`) set both. They drop the newline
+    // right after a `%}` or `#}`, and the spaces between a line's start and a `{%` or `{#`.
+    // Without them the model is fed whitespace llama.cpp never sends (SmolLM3's render started
+    // with a stray "\n"). Neither applies to `{{ }}`, in either engine. minijinja's default of
+    // dropping one trailing newline from the template source already matches the reference.
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
     // HF chat templates lean on Python str/dict/list methods (`.get`, `.items`, `.strip`, …) that
     // minijinja core doesn't implement — pycompat supplies them (e.g. gemma4's tool-calling template).
     // `str.format` pads to a width the template wrote, so it is bounded like the filters below.
@@ -306,7 +316,8 @@ impl std::error::Error for TemplateError {}
 /// THE jinja chat renderer — turns `(role, content)` messages into a prompt via the GGUF's embedded
 /// `tokenizer.chat_template`. Template handling (pycompat, `enable_thinking`, bos/eos, tools) lives
 /// here so every caller (single-turn, multi-turn, CPU + GPU backends) shares it. Returns `None` if
-/// there's no template or it fails to render (caller falls back to `chatml`).
+/// there's no template or it fails to render; callers turn that into an error (there is no
+/// fallback prompt format).
 ///
 /// `cfg` supplies the two knobs this renderer reads — `sampling.no_think` (`INFR_NO_THINK`) and
 /// `debug.chat` (`INFR_DEBUG_CHAT`). It is a BORROWED parameter rather than a field on a renderer
@@ -586,6 +597,43 @@ mod template_tests {
     /// A template rendered through every infr entry point, with `messages` = [`msgs`].
     fn render(src: &str) -> Result<String, minijinja::Error> {
         render_template(src, msgs(), Value::Null, "", "", true, true)
+    }
+
+    /// Whitespace around tags renders the way llama.cpp's chat-template lexer renders it. Every
+    /// expected string here is what llama.cpp's `test-chat-template --no-common` printed for the
+    /// same template.
+    ///
+    /// Three cases cannot fail under any minijinja option today: the two expression-tag cases and
+    /// the same-line text case (minijinja never trims at `{{ }}`, and strips only whitespace that
+    /// starts a line). They are not evidence for the options; they guard against a hand-written
+    /// whitespace preprocessor, or another engine, that trims more than the reference does.
+    #[test]
+    fn whitespace_around_tags_matches_the_reference() {
+        let cases = [
+            // trim_blocks: the newline right after a comment or a block tag goes…
+            ("{# note #}\nA", "A"),
+            ("{% if true %}\nA{% endif %}", "A"),
+            // …but only the first one.
+            ("{% if true %}\n\nA{% endif %}", "\nA"),
+            // lstrip_blocks: indentation before a block tag or a comment goes…
+            ("A\n  {% if true %}B{% endif %}", "A\nB"),
+            ("A\n  {# note #}B", "A\nB"),
+            // …but not text before the tag on the same line.
+            ("X\nA  {% if true %}B{% endif %}", "X\nA  B"),
+            // Expression tags are left alone on both sides.
+            ("{{ 'A' }}\nB", "A\nB"),
+            ("A\n  {{ 'B' }}", "A\n  B"),
+            // One trailing newline of the template source is dropped.
+            ("A\n", "A"),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|&(src, want)| {
+                let got = render(src).unwrap();
+                (got != want).then(|| format!("{src:?}: got {got:?}, want {want:?}"))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// `strftime_now` with a specifier chrono does not know is a template ERROR, not a panic: the

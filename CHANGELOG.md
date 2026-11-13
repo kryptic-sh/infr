@@ -132,6 +132,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Chat templates render their whitespace the way llama.cpp renders it.** The
+  newline after a `{% %}` or `{# #}` tag and the indentation before one are now
+  dropped (Jinja's `trim_blocks` and `lstrip_blocks`, which llama.cpp's template
+  engine always applies). Of the templates checked, only SmolLM3's prompt
+  changes: it no longer starts with a stray newline token, so SmolLM3's output
+  can differ from earlier infr versions. Qwen2.5, Qwen3, Qwen3.5, Gemma 3 and
+  Llama 3.2 render as before for the conversations checked. The prompt of any
+  other model whose template leaves a newline after a tag, or indents a tag,
+  changes too.
 - **Paging an MoE model through the host RAM tier no longer reads experts the
   GPU already holds.** Every routed expert used to be looked up in the host tier
   before the GPU cache was checked, so an expert resident on the GPU but not in

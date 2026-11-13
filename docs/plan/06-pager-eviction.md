@@ -5,10 +5,11 @@ paged pools) costs as little as it can per touch, and picks victims as well as
 the access pattern allows. A large refactor is in scope where the measurements
 justify it.
 
-Read for this plan on 2026-11-13: `infr_core::pager::Pager` in full. **Not
-read:** `hostpager.rs`, `infr-vulkan/src/pager.rs`, `infr-cpu/src/paged.rs`, and
-how the Vulkan sessions batch their touches. Step 1 below reads them before any
-design is fixed.
+Read for this plan on 2026-11-13: `infr_core::pager::Pager` in full by the
+planner, then `hostpager.rs`, `infr-vulkan/src/pager.rs`,
+`infr-cpu/src/paged.rs` and the call sites that drive them by a read-only survey
+(step 1's reading half, recorded under "What the survey found"). Nothing was
+measured yet.
 
 ## What the code does today
 
@@ -32,6 +33,83 @@ negligible beside a multi-megabyte upload for a pool of a few hundred blocks,
 and not for per-expert pools of a large MoE (a block per expert per role per
 layer) during a prefill sweep that misses on most of them. That has not been
 measured, which is step 1.
+
+## What the survey found (2026-11-13)
+
+A read-only pass, nothing built or run. The first item was re-read at its site
+by the planner; the rest is the survey's account; its line references are not
+repeated here and each claim should be re-read before code is written against
+it.
+
+**How much the pager is called.** Dense streaming is light: one `schedule` per
+streamed weight group, four to seven per layer, in pools of about forty blocks,
+so the scan is negligible there. MoE is where the volume is. A block is one
+expert of one role in one layer, and a pool holds `layers × n_expert` of them:
+768 per role for Llama-4-Scout, 6144 for Qwen3-30B-A3B (48 layers × 128 experts,
+derived), about eleven thousand for DeepSeek V4-Flash. On 30B-A3B:
+
+- a prefill chunk that touches every expert makes 48 × 3 × 128 = 18,432
+  `touch_cold` calls, each miss scanning its pool;
+- a decode token with every layer resident makes 18,432 MRU touches through
+  `touch_all_hits` plus as many `slot_of` lookups through `all_resident`, to
+  record nothing useful: promoting every expert of a layer leaves recency with
+  no information about which were routed;
+- a decode token on the split path makes 48 × 3 × 8 = 1,152 touches, and any
+  absent expert in a layer costs a blocking submit, a full drain and an id
+  readback before its touches. That, not the scan, is expected to dominate a
+  decode miss (inferred, not measured).
+
+**A bug in the tiering, confirmed at the site.** `MoePagerSession::stage_role`
+calls `HostPager::pin` for every id before `GpuPager::touch_staged`, which
+ignores the bytes on a hit. So an expert that is resident in VRAM and absent
+from the DRAM arena is read from disk, may evict a DRAM block, and the bytes are
+discarded; and every VRAM hit pays two host locks. The dense path consults the
+tier below only on a miss, and `dense_tier_parity` asserts it; the MoE path has
+no such assertion. It also makes the DRAM tier's recency mirror VRAM's, which is
+part of why the hottest experts are held twice.
+
+**Other costs per touch:** `HostPager::fill` clones the block's extent list on
+every call, hits included; `lut_window` copies `n_expert` words per layer and
+role whether or not anything missed; misses in one batch are separate copy
+commands; ids on the small-m split path are not deduplicated.
+
+**Lock scope is not the serve bottleneck it was taken for:** the per-step GPU
+baton (`StepGate`) already serialises whole forward steps under
+`serve --parallel`, so the session mutex held across a copy or a disk read
+serialises nothing further.
+
+**Dead code:** `MoePagerSession::touch_role`, `GpuPager::ensure_resident` and
+`flush_lut` have no production caller (tests only), and the streaming design doc
+still describes `touch_role` as the decode path.
+
+**No instrument exists:** nothing records a touch trace, nothing times `Pager`,
+and `infr-core` has no ignored tests or benches to follow as a convention.
+
+**What a refactor must keep** (each pinned by an existing test): a miss returns
+the slot's previous occupant; a resident block keeps its slot; a block touched
+in the current batch is never a victim, with plain LRU when batches are not in
+use; cold-end hits do not promote and hot-end hits do; pins are counted and
+exhaustion changes nothing; `evict` is an uncounted removal that returns its
+slot to a LIFO free list handed out from slot 0; the free list drains before any
+eviction; and the hit, miss and eviction counters keep their exact semantics.
+
+## Order of work, revised by the survey
+
+1. **Stop consulting the host tier on a VRAM hit** in the MoE path, with a test
+   in the shape of `dense_tier_parity`'s "consulted == vram.misses". A bug fix,
+   independent of everything below.
+2. **The trace hook, the micro-benchmark and the simulator** (step 1's measuring
+   half, below).
+3. **Fully resident decode:** replace the per-token touch of every expert with
+   something that costs O(1) per layer and keeps recency meaningful. Needs a
+   design: the routed ids are on the GPU, which is why every expert is touched
+   today.
+4. **The data-structure refactor** (step 2), sized by the benchmark on the MoE
+   pool sizes above.
+5. **Policy** (step 3), and the decode-miss stall as its own question: whether
+   the readback and drain can be avoided or batched.
+6. Small ones alongside: the per-call clone in `HostPager::fill`, deduplicating
+   split-path ids, deleting the dead entry points and correcting the design doc.
 
 ## Steps
 

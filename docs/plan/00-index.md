@@ -27,7 +27,7 @@ The standing goal: any model size on any hardware, disk to DRAM to VRAM.
 | Phase | What                                                                | Status      |
 | ----- | ------------------------------------------------------------------- | ----------- |
 | 05    | [Streaming for any model on any hardware](05-streaming-any-size.md) | not started |
-| 06    | [Pager eviction: cost and policy](06-pager-eviction.md)             | not started |
+| 06    | [Pager eviction: cost and policy](06-pager-eviction.md)             | surveyed    |
 
 ## Notes on the model phases
 

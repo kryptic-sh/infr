@@ -548,6 +548,90 @@ than idle, was about 1-2% slower on the evicting Qwen3 decode in all four pairs
 and level on the dense streamed SmolLM3-3B, so the cadence starts over after a
 rotation as after a drain. Why the restart wins there was not measured.
 
+### Filling a cache that holds the model (2026-11-14)
+
+The readback rows above (`cache=20g -d 0`) come from experts no token routed to:
+no layer became wholly resident because nothing had read those experts.
+`MoePagerSession::request_fills` now has a background thread read them, straight
+into a host-memory staging buffer, and a layer that drains for its router ids
+copies what is ready into free slots in the segment it is about to wait for
+(`stage_ready_fills`), only in pools with a slot for every registered expert
+(step 5). On the RX 7900 XTX (`INFR_DEV=Vulkan0`), `infr bench`, three builds
+alternated (`HEAD` without fills; the first fill build, whose forward copied
+each read expert from a host buffer into the staging ring; this one), two runs
+of each; each cell is a run's average; total CPU load 0.6-8.1% across the matrix
+(`typeperf`, sampled before each run):
+
+| model, configuration            | `HEAD` t/s   | first fill build t/s | this build t/s |
+| ------------------------------- | ------------ | -------------------- | -------------- |
+| Qwen3 tg128 `cache=20g`         | 121.4, 119.8 | 113.1, 113.5         | 117.0, 117.7   |
+| Qwen3 tg2048 `cache=20g`        | 123.7, 123.8 | 165.7, 167.7         | 167.6, 168.6   |
+| Qwen3 tg128 `cache=20g -d 365`  | 176.8, 176.9 | 177.0, 176.9         | 177.0, 177.2   |
+| Qwen3 tg128 `cache=4g dram=12g` | 52.0, 51.8   | 51.9, 52.6           | 52.4, 51.9     |
+| Qwen3 tg128 `-d 365`, resident  | 186.1, 186.4 | 186.0, 186.2         | 186.3, 186.4   |
+| ERNIE tg128 `cache=20g`         | 139.1, 139.9 | 132.1, 133.8         | 136.6, 135.9   |
+| ERNIE tg2048 `cache=20g`        | 141.1, 140.6 | 174.5, 174.5         | 174.4, 174.5   |
+| ERNIE tg128 `cache=20g -d 365`  | 177.7, 177.9 | 177.9, 178.1         | 177.9, 177.9   |
+| ERNIE tg128 `cache=4g dram=12g` | 122.2, 123.2 | 123.4, 122.8         | 121.8, 122.3   |
+| ERNIE tg128 `-d 365`, resident  | 183.8, 184.2 | 184.3, 184.2         | 184.6, 184.3   |
+
+`infr bench` runs an untimed warm rep of the measured shape first; at tg2048
+that is where the fills land, and the timed rep runs on wholly resident layers
+(no resident tg2048 was measured to compare against). At tg128 the warm rep is
+too short: the reads come off the drive at one expert per 1.3-6.1 ms (a
+temporary print in the first fill build's reader; stalls up to 200 ms), so the
+timed reps still fill — about 550 experts per 128-token rep of Qwen3, of about
+9300 still absent after the warm rep (`paging.stats`) — and pay for it: 3%
+(Qwen3) and 2% (ERNIE) below `HEAD`, about half what the first fill build paid.
+
+What that remaining cost is, from runs of Qwen3 tg128 `cache=20g` with variants
+switched in by temporary environment variables (each group alternated with its
+own `HEAD` runs, two of each; each cell a run's average; total CPU load 0.4-5.9%
+across the groups):
+
+| variant (where the copies are recorded; staging memory)                  | `HEAD` t/s   | variant t/s  |
+| ------------------------------------------------------------------------ | ------------ | ------------ |
+| before the drain; ReBAR VRAM; each read replaced by a 2 ms sleep         | 121.3, 120.2 | 120.7, 120.7 |
+| before the drain; ReBAR VRAM                                             | 121.3, 120.2 | 116.1, 116.1 |
+| before the drain, no barriers around the copies; ReBAR VRAM              | 121.3, 120.2 | 116.5, 114.9 |
+| before the drain, no barriers around the copies; host memory             | 121.3, 120.2 | 116.0, 117.4 |
+| before the drain; host memory (shipped)                                  | 121.8, 121.6 | 116.9, 117.2 |
+| the same, reads only after eight whole forwards without a miss           | 121.8, 121.6 | 115.0, 115.0 |
+| own submission right after the drain; host memory                        | 121.6, 120.1 | 115.4, 115.3 |
+| own submission right after the drain; ReBAR VRAM                         | 121.6, 120.1 | 114.2, 113.9 |
+| own submission, one expert per drain; host memory                        | 119.9, 120.6 | 116.7, 116.8 |
+| own submission, one expert per drain; ReBAR VRAM                         | 119.9, 120.6 | 114.0, 115.2 |
+| own submission, one expert per drain; reads replaced by a 2 ms sleep     | 119.9, 120.6 | 117.1, 116.7 |
+| own submission; reads replaced by a 2 ms sleep                           | 120.6, 121.5 | 118.0, 117.5 |
+| own submission; a 2 ms sleep, then the slot zeroed in ReBAR VRAM         | 120.6, 121.5 | 117.6, 117.3 |
+| own submission; read into host memory, written to ReBAR 64 KiB per 20 us | 120.6, 121.5 | 115.9, 116.4 |
+
+With the reads replaced by a sleep of about their length, and everything else
+unchanged, the decode runs at the `HEAD` rate (first row): staging, the copies
+and the partly resident layers cost nothing measurable, so the remaining 3% is
+the reads themselves. They do not delay routed misses: with `paging.stats` the
+decode makes no demand miss in either timed rep. Which part of a read costs the
+forward (the kernel's buffered copy, interrupts, the file cache) was not found
+(B186). A submission of the fill copies of their own costs host time on the
+critical path (about 170 us per forward with three or four of them, a temporary
+timer), which is why it lost; staging into ReBAR VRAM was no faster than host
+memory and takes VRAM outside the cache budget, so the buffer is host memory.
+
+`gpu_seam_paged_moe_fills_until_wholly_resident` shows the mechanism end to end
+on ERNIE at `cache=20g`: 32-token generations of one prompt on one session go
+from 1053 router-id readbacks to 0 after 1785 fills (34 generations, as with the
+first fill build: the reads set the pace), no eviction, every generation the
+resident text, and a second prompt that routes to filled experts decodes the
+resident text too. `tests/moe_fill_parity.rs` checks the filled bytes against
+the bank, from each tier a miss reads from.
+
+Variants tried before the first fill build (Qwen3, `cache=20g`, single runs):
+reading the fills synchronously in the forward, bounded at 128 MiB per forward
+(bench tg128 171.0 t/s, but `infr run` decode 5.6 to 2.5 tok/s) or at 2 ms
+(bench tg128 85.3-85.9 t/s); the background reader without the demand gate
+(`infr run` decode 6.8 to 4.7 tok/s); gated per call instead of per layer's
+forward (5.6). Details in B186.
+
 ## Steps
 
 ### 1. Measure before designing (done)
@@ -712,14 +796,18 @@ larger, in order of what the numbers say it is worth:
 - **Stop draining the queue for every layer that is not wholly resident.** A
   layer whose routed experts all hit still pays a blocking submit, a full queue
   wait and a new recorder (about 37 us beyond its GPU work on this card), only
-  because the host cannot know they hit until it reads the ids. Options: let the
-  GPU resolve slots itself from a live device-side LUT (the `GpuPager` device
-  LUT exists for the parity tests; no production caller), with a per-layer miss
-  flag the host checks after the forward and a re-run of the token from the
-  first missed layer; or make a layer wholly resident when the cache has free
-  slots for the rest of its experts, which only matters when no prefill of 48
-  tokens or more ever swept the layer. The first is the general one and needs
-  the redo path to leave the KV cache exactly as a clean run would.
+  because the host cannot know they hit until it reads the ids. Where every
+  expert pool can hold every expert, this is done: experts no token routed to
+  are read by a background thread and filled into free slots (never evicting)
+  until each layer is wholly resident ("Filling a cache that holds the model").
+  Left: budgets that cannot hold the model, where the general option remains —
+  let the GPU resolve slots itself from a live device-side LUT (the `GpuPager`
+  device LUT exists for the parity tests; no production caller), with a
+  per-layer miss flag the host checks after the forward and a re-run of the
+  token from the first missed layer, which needs the redo path to leave the KV
+  cache exactly as a clean run would. Also left: the fill reads are one expert
+  at a time off the drive, and while they run they cost a short decode about 3%
+  that nothing but the reads explains (B186).
 - **Fewer bytes per token on an evicting budget** is step 3: Qwen3-30B-A3B's 72
   misses per token are 3.4 ms of PCIe transfer the GPU waits for, and Belady
   halves this sequence's decode misses.

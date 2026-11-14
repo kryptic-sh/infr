@@ -5012,3 +5012,94 @@ and GPU".
   budget after a prefill** (Qwen3-30B-A3B 50-52 t/s at `-d 0` against 82 at
   `-d 365`). Not investigated. A guess, unchecked: the host tier starts empty,
   so the decode reads its misses from disk until it fills.
+
+### B186 — what the MoE fill slice found and left (2026-11-14)
+
+**Tag:** vulkan · perf · paging · **Blocked on:** nothing
+
+Found while adding fills (`MoePagerSession::request_fills`, `stage_ready_fills`,
+the drain arm of `adapter::execute_paged_moe`); the measurements are in
+`docs/plan/06-pager-eviction.md`, "Filling a cache that holds the model".
+
+- **A short decode from no prefill still pays for the fill reads.** At
+  `paging.cache=20g`, tg128 with no prefill is about 3% below the build without
+  fills on Qwen3-30B-A3B and 2% on ERNIE (plan 06 has the interleaved figures;
+  the first fill build was 6% and 5% below), and the A/B there pins it on the
+  reader's file reads themselves: with the read replaced by a 2 ms sleep and
+  everything else unchanged (staging, copies, partial residency) the forwards
+  ran at the no-fill rate, and with `paging.stats` the decode made no demand
+  miss in either timed rep, so the reads are not delaying routed misses on the
+  shared handle either. (The sleep run filled garbage, so its tokens differed; a
+  decode step's time depends on its tokens only through routing, and that run
+  missed 25 experts in its second 128 forwards and none in its third, by a
+  temporary print.) What in the reads slows the forward was not found: CPU or
+  cache interference of the kernel's buffered-read copy, interrupts, or the file
+  cache are all unchecked guesses. Two things to try, both outside the fill
+  code: a file handle of the reader's own opened for overlapped or unbuffered
+  I/O (`FileBlockIo` reads through one synchronous handle, B35), and reading a
+  run of a bank's adjacent experts in one call (`HostPager::read` reads one
+  block).
+- **Fill throughput is the reader's, and it is slow.** One background thread
+  reads one expert at a time; an expert no token routed to was never read, so it
+  comes off the drive cold. Timed with a temporary print in the reader on
+  Qwen3-30B-A3B (`paging.cache=20g`, default DRAM tier): 1.3-6.1 ms per 0.9 MB
+  expert, with stalls of 48-200 ms. More reads in flight would shorten that,
+  under the same handle caveat as above.
+- **Only a cache that holds every expert fills.** A budget that holds most of
+  the model (ERNIE at `paging.cache=10g` holds its routed set, not every expert)
+  never fills and keeps the readbacks. Filling there would need a policy for
+  which free slots a fill may take without starving a later routed miss; not
+  designed. The GPU-side LUT with a miss flag and redo (plan 06, step 5) is the
+  general answer for those budgets.
+- **The demand gate is per layer and per forward.** A layer requests fills only
+  when no expert was missed since its previous call; one miss anywhere cancels
+  the queued reads. A decode that keeps missing now and then (a long, varied
+  generation from a cold cache) therefore fills slowly. A stricter gate (eight
+  whole forwards without a miss before any read) was measured and was not faster
+  at tg128 (plan 06), so the softer direction (a miss rate) is the one left
+  untried. Because any demand miss cancels every queued fill, a varied
+  generation may not start filling until its routed set is nearly warm; the
+  end-to-end test (`gpu_seam_paged_moe_fills_until_wholly_resident`) repeats one
+  prompt, so it does not show this, and it is unmeasured.
+- **Tried and declined**, each against interleaved runs of the build without
+  fills (figures in plan 06): the forward copying each read expert from a host
+  buffer into the staging ring (the first version of this slice); the reader
+  reading straight into a ReBAR staging buffer (the forward's copy is gone, but
+  the reader's writes cross the bus; no faster than host memory, and it takes
+  VRAM outside the cache budget); submitting the fill copies on their own right
+  after the drain (about 50 us of host time per submission on the critical path,
+  measured with a temporary timer); copies without the arena barriers around
+  them; one fill per drain; throttling the reader's writes to 64 KiB per 20 us.
+  None closed the gap the reads leave. From the first version: fills read
+  synchronously in the forward (bounded at 128 MiB per forward, `infr run`
+  decode fell from 5.6 to 2.5 tok/s; at 2 ms, bench tg128 85.3-85.9 t/s); a
+  reader with no demand gate (`infr run` decode 6.8 to 4.7 tok/s); gating per
+  call rather than per layer's forward (5.6 tok/s). Single runs, CPU load not
+  recorded for those three.
+- **`infr run` at `paging.cache=20g` prefills a 9-token prompt in about 6.7 s**
+  (Qwen3-30B-A3B, before and after this change alike). Not investigated; likely
+  the same cold reads as B185's last item.
+- **`infr-vulkan/src/pager.rs` grew by the fill machinery** (`FillReader`,
+  `FillQueue`, `FillMemory`, `Fills`, and `MoePagerSession`'s `request_fills`,
+  `stage_ready_fills`, `fills_copied`, `end_forward`), which is a seam of its
+  own: a `pager::fill` child module could hold all of it, the session methods as
+  an `impl` block there. Not split in this slice, which was scoped to the
+  existing files.
+- **Not verified:** a model whose expert pools mix slot sizes (UD quants), where
+  one role's pool can hold every expert and another's cannot — such layers never
+  fill, by `MoePagerSession::fills_layer`, but no test runs one. Throughput was
+  measured on the RX 7900 XTX only; the integrated GPU ran the fill tests for
+  correctness, not for speed.
+- **Test gaps:** no test kills the reader inside a session or a forward (the
+  dead-reader path is tested on `FillReader` alone, in `pager.rs`), and
+  concurrent forwards on one backend were not reviewed against
+  `MoePagerSession::fills_copied`, which frees every staging slot whose
+  recording's serial is at most the one just waited. The case to check: a second
+  forward on another thread holding a recording with a lower serial that is not
+  yet submitted, whose slots that call would free while its copies have still to
+  run. Not reviewed.
+- **The reader is still joined under the `moe_pager` lock on the rare paths:**
+  `end_forward` hands it back to be dropped outside the lock, but turning fills
+  off (`MoePagerSession::fills_off`, on a failed fill or a dead reader) and the
+  last staged slot of an off session (`release_staged_fills`) drop it in place,
+  waiting for a read in progress. Once per session at most; left as is.

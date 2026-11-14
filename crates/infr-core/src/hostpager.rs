@@ -15,7 +15,8 @@
 //!   happens under the lock, on a miss, for a block that thread has just pinned. A pinned block
 //!   cannot be evicted, so no other thread can be handed the same slot meanwhile.
 //! - **A slot is read only through a [`Pin`]**, which exists only for a block that is `Ready` and
-//!   pinned. Any thread asking for a `Loading` block waits instead of reading it.
+//!   pinned, **or under the lock** while its block is `Ready` ([`HostPager::read`]'s hit copy). Any
+//!   thread asking for a `Loading` block waits instead of reading it.
 //! - **The arena is never reallocated**, and no reference to the whole buffer is ever formed —
 //!   every access is a `from_raw_parts` over one slot's own range, so a reader of slot 3 and a
 //!   filler of slot 7 never hold overlapping references.
@@ -216,8 +217,10 @@ impl HostPager {
     /// budget that does not fit fails here rather than part-way through a generation.
     ///
     /// `n_slots` must be at least the number of blocks one caller pins simultaneously, times the
-    /// number of concurrent callers (`infr serve`'s `--parallel`). Below that floor [`Self::pin`]
-    /// returns the exhaustion error rather than evicting a block someone is reading.
+    /// number of concurrent callers (`infr serve`'s `--parallel`) — a [`Self::fill`] in progress
+    /// counts as a caller pinning one block; a [`Self::read`] holds no pin and does not count.
+    /// Below that floor [`Self::pin`] returns the exhaustion error rather than evicting a block
+    /// someone is reading.
     pub fn new(n_slots: usize, slot_bytes: usize, io: Arc<dyn BlockIo>) -> Result<Self> {
         if n_slots == 0 || slot_bytes == 0 {
             return Err(Error::backend(format!(
@@ -484,8 +487,12 @@ impl HostPager {
     ///
     /// There is no insertion-policy argument because nothing would read it: the LRU order exists to
     /// choose a victim, and this never has one. A caller that mixed this with [`Self::pin`] on one
-    /// pager would make the order matter again — nothing does, and the cold-end insert below is the
-    /// conservative choice if one ever did.
+    /// pager would make the order matter again — nothing does (a background reader beside pinning
+    /// callers uses [`Self::read`] instead), and the cold-end insert below is the conservative
+    /// choice if one ever did.
+    ///
+    /// While it copies a hit out, or reads an admitted block, this call holds a pin on the block,
+    /// so it counts towards the floor [`Self::new`] states as one more concurrent caller.
     pub fn fill(&self, id: BlockId, dst: &mut [u8]) -> Result<Fill> {
         // `(admitted slot, descriptor)` — the slot is `None` when this call will stream.
         let (slot, desc) = loop {
@@ -559,6 +566,64 @@ impl HostPager {
         drop(pin);
         self.ready.notify_all();
         Ok(Fill::Admitted)
+    }
+
+    /// Deliver `id`'s bytes into `dst` without taking a slot or a pin: a resident block is copied
+    /// out of the arena ([`Fill::Hit`], moving no counter), any other is read straight into `dst`
+    /// ([`Fill::Streamed`]) and stays unresident, whether or not it has missed before.
+    ///
+    /// For a caller running BESIDE this tier's pinning callers whose bytes are never asked for
+    /// here again — the VRAM pager's background fill reader, whose blocks the arena above keeps
+    /// for good. Because it holds no pin, it adds nothing to the floor [`Self::new`] states and
+    /// can never make a [`Self::pin`] find every slot pinned; because it admits nothing, it keeps
+    /// no copy here at all.
+    ///
+    /// The hit copy runs under the residency lock instead of under a pin, so a concurrent
+    /// [`Self::pin`] waits for it (one block's memcpy) rather than failing. `dst` must be at least
+    /// the block's length; only that prefix is written.
+    pub fn read(&self, id: BlockId, dst: &mut [u8]) -> Result<Fill> {
+        let desc = loop {
+            let inner = self.inner.lock().unwrap();
+            let Some(desc) = inner.descs.get(&id).cloned() else {
+                return Err(Error::backend(format!(
+                    "host pager: block {id} was never registered"
+                )));
+            };
+            let n = desc.nbytes();
+            if dst.len() < n {
+                return Err(Error::backend(format!(
+                    "host pager: block {id} is {n} bytes, its destination {}",
+                    dst.len()
+                )));
+            }
+            match inner.state.get(&id) {
+                Some(SlotState::Loading) => {
+                    let _unused = self.ready.wait(inner).unwrap();
+                    continue;
+                }
+                Some(SlotState::Ready) => {
+                    if let Some(slot) = inner.pager.slot_of(id) {
+                        // SAFETY: `id` is `Ready` in `slot`, and this thread holds the lock. A slot
+                        // is written only for a `Loading` block, and only after the lock assigned
+                        // it that slot — which needs `id` evicted first, an eviction that cannot
+                        // happen while the lock is held. So no writer is active on these bytes for
+                        // as long as this reference lives (it ends before the lock drops);
+                        // concurrent `Pin` readers only read. `n <= slot_bytes` per `register`.
+                        let src = unsafe { self.arena.slot_ref(slot, n) };
+                        dst[..n].copy_from_slice(src);
+                        return Ok(Fill::Hit);
+                    }
+                    break desc;
+                }
+                None => break desc,
+            }
+        };
+        let n = desc.nbytes();
+        self.io.read_block(&desc, &mut dst[..n])?;
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+        self.streamed.fetch_add(1, Ordering::Relaxed);
+        Ok(Fill::Streamed)
     }
 
     /// Pin `id` only if it is already resident and readable — never reads from the tier below.
@@ -1206,6 +1271,111 @@ mod tests {
         // The slot is free again, so block 1 admits — once its own doorkeeper miss is spent.
         assert_eq!(p.fill(1, &mut dst).unwrap(), Fill::Streamed);
         assert_eq!(p.fill(1, &mut dst).unwrap(), Fill::Admitted);
+    }
+
+    /// Reads like [`FakeIo`], except that a read of `gated` while the gate is shut reports itself
+    /// and then waits for the gate to open — so a test can act while that read is in progress.
+    struct GateIo {
+        gated: BlockId,
+        /// `(shut, a gated read has started)`.
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl GateIo {
+        fn new(gated: BlockId) -> Self {
+            Self {
+                gated,
+                state: Mutex::new((false, false)),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn shut(&self) {
+            *self.state.lock().unwrap() = (true, false);
+        }
+
+        fn open(&self) {
+            self.state.lock().unwrap().0 = false;
+            self.changed.notify_all();
+        }
+
+        /// Wait until a gated read has started; `false` if none did within the timeout.
+        fn wait_started(&self) -> bool {
+            let s = self.state.lock().unwrap();
+            let (s, _) = self
+                .changed
+                .wait_timeout_while(s, std::time::Duration::from_secs(10), |s| !s.1)
+                .unwrap();
+            s.1
+        }
+    }
+
+    impl BlockIo for GateIo {
+        fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+            if desc.id == self.gated {
+                let mut s = self.state.lock().unwrap();
+                if s.0 {
+                    s.1 = true;
+                    self.changed.notify_all();
+                    while s.0 {
+                        s = self.changed.wait(s).unwrap();
+                    }
+                }
+            }
+            dst[..desc.nbytes()].fill(desc.id as u8);
+            Ok(())
+        }
+    }
+
+    /// `read` — the way a background reader beside pinning callers gets bytes — never pins and
+    /// never admits, so it runs safely on the smallest arena: while it reads a block, a `pin` of
+    /// another block still gets the only slot. (`fill` there would admit the block on its second
+    /// miss and hold the slot pinned across the read, and that `pin` would fail with every slot
+    /// pinned.) A hit is copied out, moves no counter and leaves no pin behind.
+    #[test]
+    fn read_never_takes_a_slot_or_a_pin() {
+        let io = Arc::new(GateIo::new(2));
+        let p = Arc::new(HostPager::new(1, 16, io.clone()).expect("host pager"));
+        for id in [1, 2, 3] {
+            p.register(desc(id, 16)).expect("register");
+        }
+        let mut dst = [0u8; 16];
+        assert_eq!(p.read(2, &mut dst).unwrap(), Fill::Streamed);
+        assert_eq!(dst, [2u8; 16]);
+
+        // The block's second miss, held mid-read.
+        io.shut();
+        let reader = {
+            let p = Arc::clone(&p);
+            std::thread::spawn(move || {
+                let mut dst = [0u8; 16];
+                p.read(2, &mut dst)
+                    .map(|f| (f, dst))
+                    .map_err(|e| e.to_string())
+            })
+        };
+        assert!(io.wait_started(), "the gated read never started");
+        let pin = p.pin(1, Insert::Mru);
+        io.open();
+        let pin = pin.expect("a read in progress kept the only slot from a pin");
+        assert_eq!(&pin[..], &[1u8; 16]);
+        drop(pin);
+        let (fill, bytes) = reader.join().unwrap().expect("read");
+        assert_eq!((fill, bytes), (Fill::Streamed, [2u8; 16]));
+        assert!(p.try_pin(2).is_none(), "read admitted the block");
+
+        // A hit on block 1: its bytes, nothing counted, no pin left — block 3 can still evict it.
+        let before = p.stats();
+        assert_eq!(p.read(1, &mut dst).unwrap(), Fill::Hit);
+        assert_eq!(dst, [1u8; 16]);
+        let after = p.stats();
+        assert_eq!(
+            (after.pager.hits, after.pager.misses, after.reads),
+            (before.pager.hits, before.pager.misses, before.reads),
+            "a hit copy moved the counters"
+        );
+        assert_eq!(&p.pin(3, Insert::Mru).expect("pin")[..], &[3u8; 16][..]);
     }
 
     #[test]

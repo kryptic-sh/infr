@@ -2005,6 +2005,142 @@ fn gpu_seam_paged_ernie4_5_moe_matches_resident() {
     }
 }
 
+/// One generation on `sess`, and how many router-id readbacks (`SegmentCuts::drain`) its forwards
+/// made.
+fn paged_generation(
+    model: &infr_llama::SeamModel,
+    sess: &mut infr_llama::seam::model::DenseVulkanSession,
+    prompt: &str,
+    n: usize,
+) -> (String, u64) {
+    let before = sess.segment_cuts().drain;
+    let mut out = String::new();
+    model
+        .generate_vulkan_session(sess, prompt, n, None, |p| out.push_str(p))
+        .expect("paged generation");
+    (out, sess.segment_cuts().drain - before)
+}
+
+/// The paged MoE cache fills experts no token routed to (`MoePagerSession::request_fills`) when
+/// every pool can hold every expert of the model: decode from a short prompt then reaches wholly
+/// resident layers, which take the inline path and read no router ids back. With 20 GiB the
+/// cache holds every ERNIE-4.5-21B-A3B expert; generations of the same prompt repeat on one
+/// session until one makes no readback at all, every expert being resident. The reads behind the
+/// fills run on a background thread at the drive's rate, so the bound is on progress, not on the
+/// drive: the test fails when several generations in a row fill nothing while readbacks remain
+/// (or, as a backstop, after a very generous number of generations). Every generation must decode
+/// what the all-resident run decodes, and nothing may be evicted. A filled expert is one this
+/// prompt never routes to, so a second prompt follows once the cache is full: whatever it routes
+/// to beyond the first prompt's experts it reads from slots only a fill wrote, and it too must
+/// decode what the all-resident run decodes.
+///
+/// At 4 GiB and at 10 GiB of VRAM the pools cannot hold the model, so nothing is filled, and the
+/// output is still the resident one.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_paged_moe_fills_until_wholly_resident() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    const N: usize = 32;
+    // Generations in a row with no new fill before the fills count as stuck, and the backstop.
+    const STALL_ROUNDS: usize = 8;
+    const MAX_ROUNDS: usize = 1024;
+    const GIB: u64 = 1 << 30;
+    let prompt = "Count from one to twenty in words.";
+    let other = "Name three rivers in Europe and the seas they flow into.";
+    // One row per prefill chunk, so every run takes the same small-m expert kernels and a
+    // divergence can only be the pager's (as in `gpu_seam_paged_ernie4_5_moe_matches_resident`).
+    let pin_ubatch = |c: &mut infr_llama::EngineConfig| {
+        c.device.ubatch = Some(1);
+        c.device.ubatch_specified = true;
+    };
+
+    let (want, want_other) = {
+        let model = model_cfg(&path, pin_ubatch);
+        let mut sess = model.vulkan_session(512).expect("resident session");
+        assert!(sess.moe_pager_totals().is_none(), "the resident run paged");
+        (
+            paged_generation(&model, &mut sess, prompt, N).0,
+            paged_generation(&model, &mut sess, other, N).0,
+        )
+    };
+    eprintln!("resident: {want:?} / {want_other:?}");
+
+    let ample = model_cfg(&path, |c| {
+        pin_ubatch(c);
+        c.paging.cache = Some(infr_core::SizeSpec::Bytes(20 * GIB));
+    });
+    let mut sess = ample.vulkan_session(512).expect("paged session");
+    let (mut rounds, mut stalled, mut filled) = (0, 0, 0);
+    loop {
+        let (out, drains) = paged_generation(&ample, &mut sess, prompt, N);
+        rounds += 1;
+        let (stats, fills) = sess.moe_pager_totals().expect("the ample run paged");
+        if fills > filled {
+            (filled, stalled) = (fills, 0);
+        } else {
+            stalled += 1;
+        }
+        eprintln!("round {rounds}: {drains} readbacks, {fills} fills, {stats:?}");
+        assert_eq!(
+            out, want,
+            "round {rounds} diverged from the all-resident run"
+        );
+        assert_eq!(stats.evictions, 0, "a cache that holds the model evicted");
+        if drains == 0 {
+            assert!(fills > 0, "no readbacks without a single fill");
+            break;
+        }
+        assert!(
+            stalled < STALL_ROUNDS && rounds < MAX_ROUNDS,
+            "still {drains} readbacks after {rounds} generations of {N} tokens ({fills} fills, \
+             none in the last {stalled})"
+        );
+    }
+    let (out, drains) = paged_generation(&ample, &mut sess, other, N);
+    assert_eq!(
+        out, want_other,
+        "the second prompt diverged once the cache was full"
+    );
+    assert_eq!(
+        drains, 0,
+        "the second prompt read router ids back from a full cache"
+    );
+
+    drop(sess);
+    drop(ample);
+
+    // Two budgets that cannot hold the model: one that evicts every generation (with a DRAM
+    // tier), and one that holds this prompt's routed experts, so that its later generations
+    // miss nothing and the demand-first gate in `request_fills` would let fills through. Neither
+    // may fill: its pools cannot hold every expert, so a fill could take a slot a routed expert
+    // later has to evict for.
+    for (what, cache, dram, rounds) in [
+        ("4 GiB VRAM / 12 GiB DRAM", 4 * GIB, Some(12 * GIB), 2),
+        ("10 GiB VRAM", 10 * GIB, None, 4),
+    ] {
+        let tight = model_cfg(&path, |c| {
+            pin_ubatch(c);
+            c.paging.cache = Some(infr_core::SizeSpec::Bytes(cache));
+            c.paging.dram = dram.map(infr_core::SizeSpec::Bytes);
+        });
+        let mut sess = tight.vulkan_session(512).expect("paged session");
+        let mut drains = 0;
+        for round in 1..=rounds {
+            let (out, d) = paged_generation(&tight, &mut sess, prompt, N);
+            drains = d;
+            assert_eq!(out, want, "{what}, round {round}: diverged");
+        }
+        let (stats, fills) = sess.moe_pager_totals().expect("the tight run paged");
+        eprintln!("{what}: {fills} fills, {drains} readbacks in the last round, {stats:?}");
+        assert_eq!(
+            fills, 0,
+            "{what}: a cache that cannot hold the model filled"
+        );
+        assert!(drains > 0, "{what}: wholly resident layers without fills");
+    }
+}
+
 /// ERNIE 4.5 MoE decodes from one record-once recording on Vulkan: the routed FFN is replay-safe
 /// (GPU-side top-k feeding id-indexed expert kernels), so the router bias and shared expert must
 /// not knock it off that path (see [`gpu_seam_qwen3_decode_replays_from_one_recording`]).

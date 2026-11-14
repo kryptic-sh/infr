@@ -40,7 +40,9 @@
 //! ([`MoePagerSession::touch_all_hits`]): the recency every expert's MRU touch would give it, at
 //! one call per layer and role. llama.cpp
 //! issue #20757's SLRU-with-admission remains the documented upgrade if these thrash on an
-//! adversarial pattern.
+//! adversarial pattern. A pool with a slot for every expert registered in it never evicts, and
+//! there experts no token routed to are filled into free slots
+//! ([`MoePagerSession::request_fills`]) so a decode layer becomes wholly resident.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -119,6 +121,9 @@ pub struct GpuPager {
     /// [`Self::forget_unsubmitted`] must take them back out.
     staged: Vec<BlockId>,
     staged_serial: Option<u64>,
+    /// Blocks admitted by [`Self::fill_staged`] — into a free slot, with nothing routed to them —
+    /// since construction. Each is also one of the pager's misses.
+    fills: u64,
 }
 
 impl GpuPager {
@@ -160,6 +165,7 @@ impl GpuPager {
             lut_dirty: false,
             staged: Vec::new(),
             staged_serial: None,
+            fills: 0,
         })
     }
 
@@ -179,6 +185,11 @@ impl GpuPager {
 
     pub fn stats(&self) -> PagerStats {
         self.pager.stats()
+    }
+
+    /// How many blocks [`Self::fill_staged`] has admitted.
+    pub fn fills(&self) -> u64 {
+        self.fills
     }
 
     /// Record this arena's residency calls into `file` (`paging.trace`). Call it before the first
@@ -301,6 +312,53 @@ impl GpuPager {
                 Ok(self.slot_bytes)
             }
         }
+    }
+
+    /// Admit `id`, which nothing has asked for yet, into a FREE slot: the copy of its bytes from
+    /// `src[src_off..]` (already written there) into the slot is recorded through `rec`, under the
+    /// placement bookkeeping [`Self::touch_staged`] keeps — so [`Self::forget_unsubmitted`] takes
+    /// it back if `rec` is discarded. It inserts at the cold end, like a prefill sweep's admission,
+    /// and never evicts: with no free slot the call is refused and nothing changes, so no caller
+    /// can make a fill displace a block. A resident `id` is left alone (`false`). Counted among the
+    /// pager's misses, and in [`Self::fills`].
+    pub fn fill_staged(
+        &mut self,
+        rec: &crate::recorder::Recorder<'_>,
+        src: &dyn Buffer,
+        src_off: usize,
+        id: BlockId,
+    ) -> Result<bool> {
+        if self.is_resident(id) {
+            return Ok(false);
+        }
+        if self.pager.resident_count() >= self.pager.n_slots() {
+            return Err(be(format!(
+                "pager: fill of block {id} refused — every slot is taken, and a fill never evicts"
+            )));
+        }
+        if src_off + self.slot_bytes > src.len_bytes() {
+            return Err(be(format!(
+                "pager: fill of block {id} reads past its {}-byte source",
+                src.len_bytes()
+            )));
+        }
+        // A free slot exists, and the pager hands out free slots before it evicts anything.
+        let Resolution::Miss { slot, evicted } = self.pager.touch_cold(id) else {
+            return Err(be(format!(
+                "pager: fill of block {id}, checked absent, resolved as a hit"
+            )));
+        };
+        debug_assert!(evicted.is_none(), "a free slot cannot have evicted");
+        self.record_staged_placement(rec, id, slot, evicted);
+        rec.copy(
+            src,
+            src_off,
+            self.arena.as_ref(),
+            slot as usize * self.slot_bytes,
+            self.slot_bytes,
+        );
+        self.fills += 1;
+        Ok(true)
     }
 
     /// `n` host-mirror LUT words starting at block id `base` — the source a frozen tape window
@@ -757,6 +815,18 @@ struct Pool {
     /// This pool's tier BELOW VRAM, holding one block per expert (see [`ExpertBytes::Host`]), or
     /// `None` to read every miss from the mmap.
     host: Option<Arc<HostPager>>,
+    /// Blocks registered into this pool: the experts of every layer [`MoePagerSession::register`]
+    /// placed here.
+    registered: usize,
+}
+
+impl Pool {
+    /// Whether the arena has a slot for every block registered into it, so that nothing it ever
+    /// admits displaces another block — the condition under which a fill is free of eviction, now
+    /// and later (see [`MoePagerSession::request_fills`]).
+    fn holds_every_block(&self) -> bool {
+        self.registered <= self.pager.n_slots()
+    }
 }
 
 /// One model's whole paged-MoE session: the `(role, slot_bytes)` arena pools + the shared
@@ -792,6 +862,328 @@ pub struct MoePagerSession {
     print_stats: bool,
     /// Whether a `paging.trace` write failure was already reported (see [`flush_traces`]).
     trace_failure_reported: bool,
+    /// Filling experts no token routed to ([`Self::request_fills`]).
+    fills: Fills,
+}
+
+/// The background fill reader's staging buffer, in bytes: as many experts read and not yet
+/// copied into the arena as fit in it, and never fewer than one. It bounds the memory filling
+/// uses and how far the reader runs ahead of the forwards that admit what it read.
+pub const FILL_AHEAD_BYTES: usize = 64 << 20;
+
+/// How many experts of `slot_bytes` the fill staging buffer holds: as many as fit in
+/// [`FILL_AHEAD_BYTES`], and never fewer than one, so that an expert larger than that is still
+/// filled rather than never requested.
+fn fill_slot_count(slot_bytes: usize) -> usize {
+    (FILL_AHEAD_BYTES / slot_bytes.max(1)).max(1)
+}
+
+/// Where the background reader takes one fill's bytes from (see [`ExpertBytes`]).
+enum FillFrom {
+    /// The layer's whole bank in memory or mapped; the expert starts at `offset`.
+    Bank {
+        bank: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        offset: usize,
+    },
+    /// The pool's tier below, read through [`HostPager::read`].
+    Host(Arc<HostPager>),
+}
+
+/// One expert the reader is asked for: block `id` (of the layer whose experts start at block
+/// `layer`) in pool `pool`, `len` bytes.
+struct FillJob {
+    pool: usize,
+    layer: u32,
+    id: BlockId,
+    len: usize,
+    from: FillFrom,
+}
+
+/// One expert the reader has read into staging slot `slot`, or failed to.
+struct FillReady {
+    pool: usize,
+    layer: u32,
+    id: BlockId,
+    slot: usize,
+    read: Result<()>,
+}
+
+/// The queue between [`MoePagerSession`] and its reader thread.
+#[derive(Default)]
+struct FillQueue {
+    jobs: std::collections::VecDeque<FillJob>,
+    ready: Vec<FillReady>,
+    /// Staging slots that hold nothing anyone needs: neither a read in progress, nor a ready
+    /// expert, nor bytes a recorded copy has yet to read.
+    free: Vec<usize>,
+    stop: bool,
+    /// The reader last went to sleep with jobs queued and no free slot — waiting for a release.
+    /// Lets a unit test see that it waits for a held slot instead of guessing with a sleep.
+    #[cfg(test)]
+    starved: bool,
+}
+
+struct FillShared {
+    queue: Mutex<FillQueue>,
+    /// Signalled when a job is queued, a slot is freed, or the reader is told to stop.
+    wake: std::sync::Condvar,
+}
+
+/// The mapped memory [`FillReader`] reads experts into.
+enum FillMemory {
+    /// A host-visible buffer the arena copies read from ([`FillReader::buffer`]).
+    Gpu(Box<dyn Buffer>),
+    /// Plain host memory, for the reader's unit tests, which have no device.
+    #[cfg(test)]
+    Host(Vec<std::cell::UnsafeCell<u8>>),
+}
+
+impl FillMemory {
+    /// The first byte, and the whole extent in bytes.
+    fn extent(&self) -> Result<(*mut u8, usize)> {
+        match self {
+            FillMemory::Gpu(b) => {
+                let p = as_vk_buf(b.as_ref())?
+                    .mapped_ptr()
+                    .ok_or_else(|| be("moe pager: fill staging buffer is not mapped"))?;
+                Ok((p, b.len_bytes()))
+            }
+            #[cfg(test)]
+            FillMemory::Host(v) => Ok((std::cell::UnsafeCell::raw_get(v.as_ptr()), v.len())),
+        }
+    }
+}
+
+/// The fill staging memory's first byte, handed to the reader thread.
+struct SlotBase(*mut u8);
+
+// SAFETY: only the reader thread dereferences it, and only for a slot it holds exclusively (see
+// `FillReader::run`); the memory it points into is owned by the `FillReader`, which joins that
+// thread before freeing it.
+unsafe impl Send for SlotBase {}
+
+/// The background thread that reads fills' bytes straight into a mapped staging buffer, so that a
+/// forward neither reads nor copies them: it records one buffer-to-arena copy per expert. The
+/// reader holds the sources it reads from (bank `Arc`s, the tier below), never the session or the
+/// device; it owns the staging memory, and its `Drop` stops and joins the thread before that
+/// memory is freed.
+///
+/// Every call from the session side answers `None` (or `false`) once the thread has ended or
+/// poisoned the queue's lock: the caller then turns fills off, and nothing waits on a dead reader.
+struct FillReader {
+    shared: Arc<FillShared>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Freed after the thread is joined: `Drop` below runs before the fields drop.
+    memory: FillMemory,
+    slot_bytes: usize,
+    n_slots: usize,
+}
+
+impl FillReader {
+    /// Start a reader over `memory`, which must hold `n_slots` slots of `slot_bytes`.
+    fn spawn(memory: FillMemory, slot_bytes: usize, n_slots: usize) -> Result<Self> {
+        let (base, len) = memory.extent()?;
+        if n_slots == 0 || slot_bytes.checked_mul(n_slots).is_none_or(|n| n > len) {
+            return Err(be(format!(
+                "moe pager: a {len}-byte fill staging buffer cannot hold {n_slots} x {slot_bytes} B"
+            )));
+        }
+        let shared = Arc::new(FillShared {
+            queue: Mutex::new(FillQueue {
+                free: (0..n_slots).collect(),
+                ..FillQueue::default()
+            }),
+            wake: std::sync::Condvar::new(),
+        });
+        let worker = Arc::clone(&shared);
+        let base = SlotBase(base);
+        let thread = std::thread::Builder::new()
+            .name("infr-moe-fill".into())
+            .spawn(move || Self::run(&worker, base, slot_bytes))
+            .map_err(|e| be(format!("moe pager: fill reader thread not started: {e}")))?;
+        Ok(Self {
+            shared,
+            thread: Some(thread),
+            memory,
+            slot_bytes,
+            n_slots,
+        })
+    }
+
+    fn run(shared: &FillShared, base: SlotBase, slot_bytes: usize) {
+        loop {
+            let (job, slot) = {
+                let Ok(mut q) = shared.queue.lock() else {
+                    return;
+                };
+                loop {
+                    if q.stop {
+                        return;
+                    }
+                    if !q.jobs.is_empty() && !q.free.is_empty() {
+                        let job = q.jobs.pop_front().expect("checked non-empty");
+                        break (job, q.free.pop().expect("checked non-empty"));
+                    }
+                    #[cfg(test)]
+                    {
+                        q.starved = !q.jobs.is_empty();
+                    }
+                    q = match shared.wake.wait(q) {
+                        Ok(q) => q,
+                        Err(_) => return,
+                    };
+                    #[cfg(test)]
+                    {
+                        q.starved = false;
+                    }
+                }
+            };
+            let read = if job.len > slot_bytes {
+                Err(be(format!(
+                    "moe pager: a {}-byte expert does not fit a {slot_bytes}-byte fill slot",
+                    job.len
+                )))
+            } else {
+                // SAFETY: `slot` came off the free list under the lock, so this thread is its only
+                // holder: the session returns a slot to the list only once no recorded copy will
+                // read it again, and this thread hands it on (in `ready`) only after this write
+                // ends. The slot lies inside the memory `spawn` checked, which outlives this
+                // thread: the owning `FillReader` joins it before freeing the memory.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(base.0.add(slot * slot_bytes), job.len)
+                };
+                match &job.from {
+                    FillFrom::Bank { bank, offset } => expert_bytes(bank)
+                        .get(*offset..*offset + job.len)
+                        .map(|src| dst.copy_from_slice(src))
+                        .ok_or_else(|| be("moe pager: fill past the end of its layer's bank")),
+                    FillFrom::Host(host) => host.read(job.id, dst).map(|_| ()),
+                }
+            };
+            let Ok(mut q) = shared.queue.lock() else {
+                return;
+            };
+            q.ready.push(FillReady {
+                pool: job.pool,
+                layer: job.layer,
+                id: job.id,
+                slot,
+                read,
+            });
+        }
+    }
+
+    /// The queue, unless the reader has ended (a panic) or poisoned it.
+    fn queue(&self) -> Option<std::sync::MutexGuard<'_, FillQueue>> {
+        if self.thread.as_ref().is_none_or(|t| t.is_finished()) {
+            return None;
+        }
+        self.shared.queue.lock().ok()
+    }
+
+    /// The staging buffer the arena copies read from; `None` in the unit tests' host memory.
+    fn buffer(&self) -> Option<&dyn Buffer> {
+        match &self.memory {
+            FillMemory::Gpu(b) => Some(b.as_ref()),
+            #[cfg(test)]
+            FillMemory::Host(_) => None,
+        }
+    }
+
+    /// Queue `jobs` for reading.
+    fn post(&self, jobs: Vec<FillJob>) -> bool {
+        let Some(mut q) = self.queue() else {
+            return false;
+        };
+        q.jobs.extend(jobs);
+        drop(q);
+        self.shared.wake.notify_all();
+        true
+    }
+
+    /// Take back every queued job the reader has not started.
+    fn cancel_queued(&self) -> Option<Vec<FillJob>> {
+        Some(self.queue()?.jobs.drain(..).collect())
+    }
+
+    /// Take every read the reader has finished.
+    fn take_ready(&self) -> Option<Vec<FillReady>> {
+        Some(std::mem::take(&mut self.queue()?.ready))
+    }
+
+    /// Return staging slots whose bytes nothing will read again. Each must be held — taken by
+    /// the reader and not released since — which debug builds check.
+    fn release(&self, slots: impl IntoIterator<Item = usize>) -> bool {
+        let Some(mut q) = self.queue() else {
+            return false;
+        };
+        for slot in slots {
+            debug_assert!(
+                slot < self.n_slots && !q.free.contains(&slot),
+                "fill staging slot {slot} released while not held"
+            );
+            q.free.push(slot);
+        }
+        drop(q);
+        self.shared.wake.notify_all();
+        true
+    }
+}
+
+impl Drop for FillReader {
+    fn drop(&mut self) {
+        // Poison-tolerant: the reader may have died holding the lock, and stopping must not panic.
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop = true;
+        self.shared.wake.notify_all();
+        if let Some(t) = self.thread.take() {
+            // A reader that panicked was reported when the session found it gone
+            // (`MoePagerSession::fill_reader_died`); joining is all that is left to do with it.
+            let _panicked = t.join().is_err();
+        }
+    }
+}
+
+/// A background fill reader [`MoePagerSession::end_forward`] stopped using. Dropping it stops the
+/// reader thread, waiting for a read in progress, and then frees its staging memory — so drop it
+/// once the session's lock is released.
+#[must_use = "dropping it waits for the reader; drop it outside the session's lock"]
+pub struct StoppedFillReader(Option<FillReader>);
+
+/// [`MoePagerSession`]'s background filling — see [`MoePagerSession::request_fills`].
+#[derive(Default)]
+struct Fills {
+    /// Started by the first request; stopped by a forward that asked for nothing
+    /// ([`MoePagerSession::end_forward`]).
+    reader: Option<FillReader>,
+    /// Filling is off for the rest of the session — the reader died, or could not be started —
+    /// which was reported once.
+    off: bool,
+    /// `(pool, block)` of every job posted to the reader and not yet taken back.
+    in_flight: std::collections::HashSet<(usize, BlockId)>,
+    /// Per layer, keyed by its first block id (`ExpertSource::layer_base`).
+    layers: HashMap<u32, LayerFill>,
+    /// Staging slots whose arena copy went into recording `.0` (a `Recorder::serial`), held until
+    /// that recording is known to have completed ([`MoePagerSession::fills_copied`]) or never to
+    /// run ([`MoePagerSession::forget_unsubmitted`]).
+    staged: Vec<(u64, usize)>,
+    /// Whether a layer asked for fills since the last [`MoePagerSession::end_forward`].
+    asked: bool,
+}
+
+/// One layer's fill state.
+#[derive(Default)]
+struct LayerFill {
+    /// [`MoePagerSession::demand_misses`] at this layer's previous request — the demand gate.
+    quiet: Option<u64>,
+    /// The next local expert id a request looks at: every one before it was resident or asked
+    /// for when a request passed it, unless a cancel moved the cursor back.
+    cursor: u32,
+    /// This layer's jobs in [`Fills::in_flight`].
+    in_flight: usize,
 }
 
 /// One pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
@@ -842,10 +1234,12 @@ pub use infr_core::pager::ring_bytes;
 
 impl MoePagerSession {
     /// [`GpuPager::forget_unsubmitted`] over every pool: recording `serial` is being discarded.
+    /// The fill staging slots its copies would have read are free again.
     pub fn forget_unsubmitted(&mut self, serial: u64) {
         for p in &mut self.pools {
             p.pager.forget_unsubmitted(serial);
         }
+        self.release_staged_fills(|s| s == serial);
     }
 
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
@@ -874,6 +1268,7 @@ impl MoePagerSession {
                 slot_bytes: spec.slot_bytes,
                 pager,
                 host: spec.host.clone(),
+                registered: 0,
             });
             max_slot = max_slot.max(spec.slot_bytes);
         }
@@ -902,6 +1297,7 @@ impl MoePagerSession {
             tape_words,
             print_stats: vk.cfg().paging.stats,
             trace_failure_reported: false,
+            fills: Fills::default(),
         })
     }
 
@@ -963,8 +1359,13 @@ impl MoePagerSession {
                 }
             }
         }
-        self.sources
-            .insert(buf_id, (role, pool, source, n_expert as u32));
+        if let Some((_, old_pool, _, old_n)) = self
+            .sources
+            .insert(buf_id, (role, pool, source, n_expert as u32))
+        {
+            self.pools[old_pool].registered -= old_n as usize;
+        }
+        self.pools[pool].registered += n_expert;
         Ok(())
     }
 
@@ -1153,6 +1554,357 @@ impl MoePagerSession {
         Ok(local_ids.len())
     }
 
+    /// Whether `buf_id`'s pool has a slot for every expert registered into it (every layer's, not
+    /// only this one's) — the condition [`Self::request_fills`] requires. `false` for an
+    /// unregistered buffer.
+    pub fn holds_every_expert(&self, buf_id: usize) -> bool {
+        self.sources
+            .get(&buf_id)
+            .is_some_and(|(_, pool, ..)| self.pools[*pool].holds_every_block())
+    }
+
+    /// Whether the layer whose roles' tensors are `buf_ids` fills: every role's pool holds every
+    /// expert registered into it ([`Self::holds_every_expert`]), and filling has not been turned
+    /// off (the reader died or could not start).
+    pub fn fills_layer(&self, buf_ids: &[usize]) -> bool {
+        !self.fills.off && buf_ids.iter().all(|&b| self.holds_every_expert(b))
+    }
+
+    /// Ask the background reader for the absent experts of one layer — `buf_ids` are its roles'
+    /// tensors — so that a later [`Self::stage_ready_fills`] can admit them and the layer becomes
+    /// wholly resident without a token ever routing to them: the decode path with no router
+    /// readback ([`Self::all_resident`]). Experts are asked for in id order, every role of one id
+    /// before the next, so the layer completes as a unit; each layer keeps a cursor, so a request
+    /// looks only at experts it has not passed before. An expert is read from wherever a miss
+    /// would read it — the bank in memory or the mapping, or the tier below through
+    /// [`HostPager::read`], which neither pins nor keeps a copy there (its pool never evicts, so a
+    /// copy below would never be read again) — straight into the reader's staging buffer, on the
+    /// reader's thread. The buffer's slots ([`FILL_AHEAD_BYTES`]) bound what is asked for and not
+    /// yet admitted. `vk` allocates that buffer on the first request.
+    ///
+    /// Demand reads come first: a layer's call requests nothing unless no expert was missed, in
+    /// any pool, since that layer's previous call — a whole forward, every other layer's routing
+    /// included — and a call that finds a miss takes back every request the reader has not
+    /// started on. So the reader competes for the drive, and for the host's memory bandwidth, with
+    /// a decode that is still warming its routed set for at most the read in progress.
+    ///
+    /// Refused unless every role's pool has a slot for every expert registered into it
+    /// ([`Self::holds_every_expert`]): only then is a fill certain never to evict, nor to take a
+    /// slot a routed expert would later have to evict something else to get. Does nothing once
+    /// filling is off ([`Self::fills_layer`]); a reader that cannot be started turns it off with a
+    /// warning rather than failing the forward, which needs no fill.
+    pub fn request_fills(&mut self, vk: &VulkanBackend, buf_ids: &[usize]) -> Result<()> {
+        if !buf_ids.iter().all(|&b| self.holds_every_expert(b)) {
+            return Err(be(
+                "moe pager: fill requested for a pool that cannot hold all its registered experts",
+            ));
+        }
+        // (pool, layer base, expert count, source) per role; registered, per the check above.
+        let roles: Vec<(usize, u32, u32, &ExpertSource)> = buf_ids
+            .iter()
+            .filter_map(|b| self.sources.get(b))
+            .map(|(_, pool, src, n)| (*pool, src.layer_base, *n, src))
+            .collect();
+        let Some(&(_, layer, ..)) = roles.first() else {
+            return Ok(());
+        };
+        if roles.iter().any(|&(_, base, ..)| base != layer) {
+            return Err(be(
+                "moe pager: fill requested across tensors of different layers",
+            ));
+        }
+        self.fills.asked = true;
+        if self.fills.off {
+            return Ok(());
+        }
+        let demand = self.demand_misses();
+        let Self { pools, fills, .. } = self;
+        let st = fills.layers.entry(layer).or_default();
+        if st.quiet.replace(demand) != Some(demand) {
+            // A token missed since this layer last asked: take back what the reader has not
+            // started on, so it reads nothing more while routed experts are still being read.
+            let Some(reader) = &fills.reader else {
+                return Ok(());
+            };
+            let Some(jobs) = reader.cancel_queued() else {
+                Self::fill_reader_died(fills);
+                return Ok(());
+            };
+            for job in jobs {
+                fills.in_flight.remove(&(job.pool, job.id));
+                if let Some(l) = fills.layers.get_mut(&job.layer) {
+                    l.in_flight -= 1;
+                    l.cursor = l.cursor.min(job.id - job.layer);
+                }
+            }
+            return Ok(());
+        }
+        if fills.reader.is_none() {
+            let slot_bytes = pools.iter().map(|p| p.slot_bytes).max().unwrap_or(4);
+            let n_slots = fill_slot_count(slot_bytes);
+            // Host memory the GPU reads over the bus (`HostWeights`), not the ReBAR VRAM a
+            // `Staging` buffer gets: it stays out of the VRAM budget, and the reader's writes stay
+            // off the bus (measured no slower; `docs/plan/06-pager-eviction.md`).
+            let started = vk
+                .alloc_uninit(n_slots * slot_bytes, BufferUsage::HostWeights)
+                .and_then(|b| FillReader::spawn(FillMemory::Gpu(b), slot_bytes, n_slots));
+            match started {
+                Ok(r) => fills.reader = Some(r),
+                Err(e) => {
+                    // Fills only save readbacks; a decode without them is the decode as before.
+                    Self::fills_off(fills, e);
+                    return Ok(());
+                }
+            }
+        }
+        let reader = fills.reader.as_ref().expect("started above");
+        let mut room = reader
+            .n_slots
+            .saturating_sub(fills.in_flight.len() + fills.staged.len());
+        let st = fills.layers.get_mut(&layer).expect("inserted above");
+        let n_expert = roles.iter().map(|&(.., n, _)| n).min().unwrap_or(0);
+        if room == 0 {
+            return Ok(());
+        }
+        if st.cursor >= n_expert {
+            if st.in_flight > 0 {
+                return Ok(()); // every absent expert is asked for already
+            }
+            // Passed every expert with nothing in flight, yet the layer is not wholly resident
+            // (the caller is on the readback arm): something came back out — a fill whose
+            // recording was discarded — so look again from the start.
+            st.cursor = 0;
+        }
+        let mut jobs = Vec::new();
+        'scan: while st.cursor < n_expert {
+            let lid = st.cursor;
+            for &(pool_idx, base, _, src) in &roles {
+                let pool = &pools[pool_idx];
+                let id = base + lid;
+                if pool.pager.is_resident(id) || fills.in_flight.contains(&(pool_idx, id)) {
+                    continue;
+                }
+                if room == 0 {
+                    break 'scan;
+                }
+                let from = match &src.bytes {
+                    ExpertBytes::Mmap(bank) => FillFrom::Bank {
+                        bank: Arc::clone(bank),
+                        offset: lid as usize * src.stride_bytes,
+                    },
+                    ExpertBytes::Host => {
+                        FillFrom::Host(Arc::clone(pool.host.as_ref().ok_or_else(|| {
+                            be(format!("moe pager: expert {id} has no host tier"))
+                        })?))
+                    }
+                };
+                fills.in_flight.insert((pool_idx, id));
+                st.in_flight += 1;
+                room -= 1;
+                jobs.push(FillJob {
+                    pool: pool_idx,
+                    layer,
+                    id,
+                    len: src.stride_bytes,
+                    from,
+                });
+            }
+            st.cursor += 1;
+        }
+        if !jobs.is_empty() && !reader.post(jobs) {
+            Self::fill_reader_died(fills);
+        }
+        Ok(())
+    }
+
+    /// Admit every expert the background reader has finished reading ([`Self::request_fills`])
+    /// into a free slot of its pool ([`GpuPager::fill_staged`]): each one's copy from the reader's
+    /// staging buffer into its arena slot is recorded through `rec`, between two
+    /// `arena_stream_barrier`s — so it is ordered after every arena read recorded before this
+    /// call, and every dispatch recorded after it, in this recording or a later one, reads the
+    /// filled bytes. An expert some token routed to while it was being read is already resident
+    /// and is dropped. Returns how many were admitted.
+    ///
+    /// A fill that cannot be admitted — its read failed, or its pool refused it — never fails the
+    /// caller's forward, which needs no fill: its staging slot is released, the others are
+    /// admitted, and filling is turned off for the session with one warning. A token that does
+    /// route to an expert that cannot be read still fails, through the demand path.
+    ///
+    /// The staging slots stay held until [`Self::fills_copied`] reports `rec` complete or
+    /// [`Self::forget_unsubmitted`] reports it discarded — only then may the reader write them
+    /// again.
+    pub fn stage_ready_fills(&mut self, rec: &crate::recorder::Recorder<'_>) -> Result<usize> {
+        let Self { pools, fills, .. } = self;
+        let Some(reader) = fills.reader.as_ref().filter(|_| !fills.off) else {
+            return Ok(0);
+        };
+        // Checked before anything is taken off the queue, so an error here strands no read.
+        let Some(src) = reader.buffer() else {
+            return Err(be("moe pager: fill staging memory is not a device buffer"));
+        };
+        let Some(ready) = reader.take_ready() else {
+            Self::fill_reader_died(fills);
+            return Ok(0);
+        };
+        let (mut admitted, mut free, mut failed) = (0, Vec::new(), None);
+        for r in ready {
+            fills.in_flight.remove(&(r.pool, r.id));
+            if let Some(l) = fills.layers.get_mut(&r.layer) {
+                l.in_flight -= 1;
+            }
+            if let Err(e) = r.read {
+                free.push(r.slot);
+                failed.get_or_insert(e);
+                continue;
+            }
+            let pager = &mut pools[r.pool].pager;
+            if pager.is_resident(r.id) {
+                free.push(r.slot);
+                continue;
+            }
+            if admitted == 0 {
+                rec.arena_stream_barrier();
+            }
+            match pager.fill_staged(rec, src, r.slot * reader.slot_bytes, r.id) {
+                Ok(_) => {
+                    fills.staged.push((rec.serial(), r.slot));
+                    admitted += 1;
+                }
+                Err(e) => {
+                    free.push(r.slot);
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        if admitted > 0 {
+            rec.arena_stream_barrier();
+        }
+        if !free.is_empty() && !reader.release(free) {
+            Self::fill_reader_died(fills);
+        }
+        if let Some(e) = failed {
+            Self::fills_off(fills, format_args!("a fill could not be admitted: {e}"));
+        }
+        Ok(admitted)
+    }
+
+    /// Every recording up to `serial` (a `Recorder::serial`) has completed or been discarded: the
+    /// adapter calls this once it has waited the queue idle after submitting recording `serial`,
+    /// recordings being submitted in the order they were made. The fill staging slots their
+    /// copies read ([`Self::stage_ready_fills`]) are free for the reader again.
+    pub fn fills_copied(&mut self, serial: u64) {
+        self.release_staged_fills(|s| s <= serial);
+    }
+
+    /// Free the fill staging slots whose copies went into a recording `done` accepts — one that
+    /// has completed or will never run.
+    fn release_staged_fills(&mut self, done: impl Fn(u64) -> bool) {
+        let fills = &mut self.fills;
+        let mut free = Vec::new();
+        fills.staged.retain(|&(s, slot)| {
+            if done(s) {
+                free.push(slot);
+            }
+            !done(s)
+        });
+        if free.is_empty() {
+            return;
+        }
+        match &fills.reader {
+            Some(r) if !fills.off => {
+                if !r.release(free) {
+                    Self::fill_reader_died(fills);
+                }
+            }
+            // A dead reader's memory outlives it until no recorded copy reads it.
+            _ if fills.staged.is_empty() => fills.reader = None,
+            _ => {}
+        }
+    }
+
+    /// The forward that just ended asked for no fill ([`Self::request_fills`]) — every layer that
+    /// could fill was wholly resident, or a prefill sweep staged all its experts — so whatever the
+    /// reader still holds or is reading is for experts already resident: stop it and free its
+    /// memory. Called by the adapter after each forward. A later forward that finds a layer not
+    /// wholly resident again (a discarded recording took fills back) starts a new reader.
+    ///
+    /// The reader is handed back rather than stopped here: dropping the returned value stops it,
+    /// which waits for a read in progress, so the caller drops it after releasing the session's
+    /// lock and no other forward waits on that read.
+    pub fn end_forward(&mut self) -> StoppedFillReader {
+        let fills = &mut self.fills;
+        if std::mem::take(&mut fills.asked) || fills.reader.is_none() || !fills.staged.is_empty() {
+            return StoppedFillReader(None);
+        }
+        fills.in_flight.clear();
+        fills.layers.clear();
+        StoppedFillReader(fills.reader.take())
+    }
+
+    /// Staging slots of the background reader that are not free: a read in progress or finished
+    /// and not yet admitted, or admitted with its copy not yet known to have run. `0` once the
+    /// reader is stopped, its memory freed.
+    pub fn fill_slots_held(&self) -> usize {
+        match &self.fills.reader {
+            None => 0,
+            Some(r) => r
+                .queue()
+                .map_or(self.fills.staged.len(), |q| r.n_slots - q.free.len()),
+        }
+    }
+
+    /// Experts asked of the background reader and neither admitted nor taken back yet.
+    pub fn fills_pending(&self) -> usize {
+        self.fills.in_flight.len()
+    }
+
+    /// Whether the background fill reader is running ([`Self::request_fills`] starts it,
+    /// [`Self::end_forward`] stops it).
+    pub fn fill_reader_active(&self) -> bool {
+        self.fills.reader.is_some() && !self.fills.off
+    }
+
+    /// The reader thread ended or poisoned its queue — only a panic does either:
+    /// [`Self::fills_off`].
+    fn fill_reader_died(fills: &mut Fills) {
+        Self::fills_off(fills, "the background fill reader stopped unexpectedly");
+    }
+
+    /// Turn fills off for good, saying why once; the forwards go on reading router ids back where
+    /// a layer is not wholly resident, as they would with no fills. The reader is told to read
+    /// nothing more, and its memory is freed once no recorded copy reads it.
+    fn fills_off(fills: &mut Fills, why: impl std::fmt::Display) {
+        if !fills.off {
+            tracing::warn!("[moe pager] background filling is off for this session: {why}");
+        }
+        fills.off = true;
+        if let Some(r) = &fills.reader {
+            // What it has not started is dropped; a dead reader answers `None`, with nothing to
+            // take back.
+            drop(r.cancel_queued());
+        }
+        fills.in_flight.clear();
+        fills.layers.clear();
+        if fills.staged.is_empty() {
+            fills.reader = None;
+        }
+    }
+
+    /// Experts admitted by [`Self::stage_ready_fills`] across every pool, since the session was
+    /// created.
+    pub fn fills(&self) -> u64 {
+        self.pools.iter().map(|p| p.pager.fills()).sum()
+    }
+
+    /// Misses of every pool that were not fills: the experts tokens routed to and found absent.
+    fn demand_misses(&self) -> u64 {
+        self.pools
+            .iter()
+            .map(|p| p.pager.stats().misses)
+            .sum::<u64>()
+            - self.fills()
+    }
+
     /// Freeze `buf_id`'s layer LUT window — `n_expert` slot indices starting at its `layer_base`,
     /// copied from the pool's host mirror into the tape at `*tape_cursor` — and return the tape
     /// word offset the layer's dispatches pass as `lut_base` (`lut[base + local_id]`). Must be
@@ -1263,10 +2015,11 @@ impl MoePagerSession {
         for p in &self.pools {
             let s = p.pager.stats();
             tracing::info!(
-                "[moe pager] {}/{:.1}MB: {} slots={}",
+                "[moe pager] {}/{:.1}MB: {} fills={} slots={}",
                 p.role.name(),
                 p.slot_bytes as f64 / 1e6,
                 stats_suffix(&s),
+                p.pager.fills(),
                 p.pager.n_slots(),
             );
             // The tier below, when there is one. Its READS are the line that matters: an arena miss
@@ -1769,5 +2522,208 @@ mod tests {
         let mut lut = vec![NOT_RESIDENT; 2];
         apply_placement(&mut lut, 99, 3, Some(88));
         assert_eq!(lut, vec![NOT_RESIDENT; 2]);
+    }
+
+    /// An expert larger than the whole fill-ahead budget still gets a staging slot — one — so it
+    /// is filled like any other rather than never requested.
+    #[test]
+    fn an_expert_larger_than_the_fill_budget_gets_one_slot() {
+        assert_eq!(fill_slot_count(FILL_AHEAD_BYTES + 4), 1);
+        assert_eq!(fill_slot_count(FILL_AHEAD_BYTES), 1);
+        assert_eq!(fill_slot_count(FILL_AHEAD_BYTES / 4), 4);
+    }
+
+    /// Fill-reader memory with no device behind it: `n_slots` slots of `slot_bytes`, zeroed.
+    fn host_fill_memory(slot_bytes: usize, n_slots: usize) -> FillMemory {
+        FillMemory::Host(
+            (0..slot_bytes * n_slots)
+                .map(|_| std::cell::UnsafeCell::new(0))
+                .collect(),
+        )
+    }
+
+    /// Poll `reader` until `done` accepts what it has ready, or fail after a generous timeout.
+    /// `None` from the reader (it has died) is passed to `done` too.
+    fn poll_reader(reader: &FillReader, mut done: impl FnMut(Option<Vec<FillReady>>) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done(reader.take_ready()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fill reader never got there"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn bank_job(bank: Arc<dyn AsRef<[u8]> + Send + Sync>, id: BlockId, offset: usize) -> FillJob {
+        FillJob {
+            pool: 0,
+            layer: 0,
+            id,
+            len: 16,
+            from: FillFrom::Bank { bank, offset },
+        }
+    }
+
+    /// The reader puts each expert's own bytes into the staging slot it reports, and a slot is
+    /// handed out again only after it is released: with one slot and two jobs, the second waits.
+    #[test]
+    fn the_fill_reader_reads_each_expert_into_its_slot() {
+        let bank: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new((0..64u8).collect::<Vec<u8>>());
+        let reader = FillReader::spawn(host_fill_memory(16, 1), 16, 1).unwrap();
+        let (base, _) = reader.memory.extent().unwrap();
+        let slot_bytes = |slot: usize| {
+            // SAFETY: the reader has handed this slot over (it is in `ready`) and holds no other
+            // job, so nothing writes it while it is read.
+            unsafe { std::slice::from_raw_parts(base.add(slot * 16), 16) }.to_vec()
+        };
+        assert!(reader.post(vec![bank_job(bank.clone(), 1, 16), bank_job(bank, 3, 48)]));
+        let mut ready = Vec::new();
+        poll_reader(&reader, |r| {
+            ready.extend(r.expect("reader alive"));
+            !ready.is_empty()
+        });
+        // The only slot is held until released, so the reader must go to sleep with the second
+        // job still queued — and never get there if it took the held slot for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let q = reader.queue().expect("reader alive");
+            if q.starved {
+                assert_eq!(q.jobs.len(), 1, "the second job was taken");
+                assert!(q.ready.is_empty() && q.free.is_empty());
+                break;
+            }
+            drop(q);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader never waited for the held slot: a second read went into it"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(ready.len(), 1);
+        let first = ready.pop().unwrap();
+        assert_eq!((first.id, first.slot), (1, 0));
+        first.read.unwrap();
+        assert_eq!(slot_bytes(0), (16..32u8).collect::<Vec<_>>());
+        assert!(reader.release([first.slot]));
+        let mut second = None;
+        poll_reader(&reader, |r| {
+            second = r.expect("reader alive").pop();
+            second.is_some()
+        });
+        assert_eq!(second.unwrap().id, 3);
+        assert_eq!(slot_bytes(0), (48..64u8).collect::<Vec<_>>());
+    }
+
+    /// A reader thread that panics is noticed: its calls answer `None`/`false` instead of an empty
+    /// queue forever, which is what lets the session turn fills off rather than wait on it.
+    #[test]
+    fn a_dead_fill_reader_is_noticed() {
+        struct Panics;
+        impl AsRef<[u8]> for Panics {
+            fn as_ref(&self) -> &[u8] {
+                panic!("injected fill read panic")
+            }
+        }
+        let reader = FillReader::spawn(host_fill_memory(16, 2), 16, 2).unwrap();
+        assert!(reader.post(vec![bank_job(Arc::new(Panics), 0, 0)]));
+        poll_reader(&reader, |r| r.is_none());
+        assert!(!reader.post(vec![bank_job(Arc::new(Panics), 1, 0)]));
+        assert!(!reader.release([0]));
+        assert!(reader.cancel_queued().is_none());
+    }
+
+    /// Releasing a staging slot the session does not hold — here one that is already free — is a
+    /// broken ownership protocol, which debug builds catch.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "released while not held")]
+    fn releasing_a_free_fill_slot_panics_in_debug() {
+        let reader = FillReader::spawn(host_fill_memory(16, 2), 16, 2).unwrap();
+        reader.release([1]);
+    }
+
+    /// A recording discarded after background fills were admitted into it takes them back
+    /// (`forget_unsubmitted`) and frees their staging slots, which the reader needs for anything
+    /// more; the layer then fills again and becomes wholly resident.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn a_discarded_recording_frees_its_fill_slots() {
+        let Ok(be) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (stride, n_expert, buf_id) = (256usize, 4usize, 1usize);
+        let mut sess = MoePagerSession::new(
+            &be,
+            MoePagerLayout {
+                n_blocks: n_expert,
+                pools: vec![MoePoolSpec {
+                    role: Role::Gate,
+                    slot_bytes: stride,
+                    n_slots: n_expert,
+                    host: None,
+                }],
+                ring_bytes: 2 * n_expert * stride,
+            },
+        )
+        .unwrap();
+        let bank: Vec<u8> = (0..n_expert * stride).map(|i| i as u8).collect();
+        sess.register(
+            Role::Gate,
+            buf_id,
+            ExpertSource {
+                bytes: ExpertBytes::Mmap(Arc::new(bank)),
+                stride_bytes: stride,
+                layer_base: 0,
+            },
+            n_expert,
+        )
+        .unwrap();
+        sess.begin_batch(buf_id).unwrap();
+        let rec = be.recorder().unwrap();
+        let mut cursor = 0;
+        sess.stage_role(&rec, 0, &mut cursor, buf_id, &[0], false)
+            .unwrap();
+        rec.finish().unwrap();
+        // The first request only notes the demand count; the second asks for the rest.
+        sess.request_fills(&be, &[buf_id]).unwrap();
+        sess.request_fills(&be, &[buf_id]).unwrap();
+        let absent = n_expert - 1;
+        assert_eq!(sess.fills_pending(), absent);
+        let rec = be.recorder().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut admitted = 0;
+        while admitted < absent {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader never got there"
+            );
+            admitted += sess.stage_ready_fills(&rec).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(sess.all_resident(buf_id, n_expert));
+        assert_eq!(sess.fill_slots_held(), absent);
+        sess.forget_unsubmitted(rec.serial());
+        rec.discard().unwrap();
+        assert!(!sess.all_resident(buf_id, n_expert));
+        assert_eq!(
+            sess.fill_slots_held(),
+            0,
+            "a discarded recording's fills kept their staging slots"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !sess.all_resident(buf_id, n_expert) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the layer never filled again"
+            );
+            let rec = be.recorder().unwrap();
+            sess.stage_ready_fills(&rec).unwrap();
+            rec.finish().unwrap();
+            sess.fills_copied(u64::MAX);
+            sess.request_fills(&be, &[buf_id]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(sess.fill_slots_held(), 0);
     }
 }

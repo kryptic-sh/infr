@@ -425,7 +425,7 @@ struct VulkanShared {
     untimed_segments: AtomicU64,
     /// Segments a forward closed and submitted before its recording ended, by cause — see
     /// [`SegmentCuts`].
-    segment_cuts: [AtomicU64; 3],
+    segment_cuts: [AtomicU64; SegmentCut::COUNT],
     /// The device runs the AMD proprietary driver (`driverID == AMD_PROPRIETARY`, the AMD Windows
     /// driver this box runs) — the one driver the CU-scaled split-K window was measured on. See
     /// `adapter::split_k_compute_units`.
@@ -2675,7 +2675,7 @@ impl VulkanBackend {
                     && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY,
                 segment_gpu_ns: AtomicU64::new(0),
                 untimed_segments: AtomicU64::new(0),
-                segment_cuts: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+                segment_cuts: [const { AtomicU64::new(0) }; SegmentCut::COUNT],
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
@@ -2957,6 +2957,7 @@ impl VulkanBackend {
             watchdog: n(SegmentCut::Watchdog),
             early: n(SegmentCut::Early),
             rotation: n(SegmentCut::Rotation),
+            drain: n(SegmentCut::Drain),
         }
     }
 
@@ -3028,6 +3029,21 @@ impl VulkanBackend {
             }
             s.print_stats_if_enabled();
         }
+    }
+
+    /// The paged-MoE session's VRAM counters summed over every pool, and how many experts it
+    /// admitted as fills (`pager::MoePagerSession::fills`, also counted among the misses) — or
+    /// `None` when no paged model is loaded.
+    pub fn moe_pager_totals(&self) -> Option<(infr_core::pager::PagerStats, u64)> {
+        let guard = self.moe_pager.lock().unwrap();
+        let sess = guard.as_ref()?;
+        let mut total = infr_core::pager::PagerStats::default();
+        for (_, s, _) in sess.pool_stats() {
+            total.hits += s.hits;
+            total.misses += s.misses;
+            total.evictions += s.evictions;
+        }
+        Some((total, sess.fills()))
     }
 
     /// Locked access to the paged-MoE session for the adapter's `execute_static` — `pub(crate)`
@@ -4682,7 +4698,8 @@ fn next_submit_cap(cur: usize, busy_ns: u64, dispatches: usize, disabled: bool) 
     }
 }
 
-/// Why a forward closed the open segment and submitted it without waiting. The first two are
+/// Why a forward closed the open segment and submitted it before its recording ended — without
+/// waiting, except for [`SegmentCut::Drain`], which waits for the queue. The first two are
 /// `adapter::execute_static`'s cuts at an op boundary, checked in this order by [`segment_cut`]:
 /// the watchdog bound first, so the early cadence can only ever add cuts to the ones the splitter
 /// makes.
@@ -4694,6 +4711,14 @@ pub(crate) enum SegmentCut {
     Early = 1,
     /// A paged forward's staging ring half was full (`adapter::rotate_stream`), mid-op.
     Rotation = 2,
+    /// A paged MoE layer that was not wholly resident read its router ids back
+    /// (`adapter::sync_stream`), submitting the open segment and draining the queue.
+    Drain = 3,
+}
+
+impl SegmentCut {
+    /// How many causes there are: the size of `VulkanShared::segment_cuts`.
+    const COUNT: usize = SegmentCut::Drain as usize + 1;
 }
 
 /// Which cut, if any, a segment holding `dispatches` takes under the splitter's `watchdog_cap` and
@@ -4723,6 +4748,10 @@ pub struct SegmentCuts {
     /// Staging-ring rotations of a paged forward: the ring half being filled could not hold the
     /// next miss, so the open segment was submitted and staging moved to the other half.
     pub rotation: u64,
+    /// Router-id readbacks of paged MoE layers: a decode layer whose experts were not all resident
+    /// submitted the open segment and waited for the queue to drain before it could stage its
+    /// routed experts.
+    pub drain: u64,
 }
 
 /// One forward's timing for the submit splitter, started by [`VulkanBackend::forward_clock`] and

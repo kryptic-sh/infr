@@ -18,7 +18,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   submit splitter (`device.submit_dispatches`), whose watchdog cap is still
   checked first, so it never lengthens a submit.
   `infr_vulkan::VulkanBackend::segment_cuts` counts that backend's watchdog
-  cuts, early cuts and ring rotations.
+  cuts, early cuts and ring rotations, and (`SegmentCuts::drain`) the blocking
+  router-id readbacks of paged MoE layers that were not wholly resident.
 - **ERNIE 4.5 MoE (`ernie4_5-moe`).** Baidu's ERNIE-4.5-21B-A3B runs on the CPU
   and Vulkan backends, with its experts resident or paged, and decodes on the
   record-once replay: the dense `ernie4_5` attention, a routed FFN (6 of 64
@@ -34,12 +35,44 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   one affine quant block decoded into its factored parts, and their expansion to
   f32 — the two halves `dequant_factored` and `dequant_block` are now built
   from, for a caller that wants a block at a time.
+- **`infr_core::hostpager::HostPager::read`**: a block's bytes into the caller's
+  buffer without taking a slot or a pin, so a background reader beside the
+  tier's pinning callers can never make a `pin` fail. It comes with the paged
+  MoE session's filling API (`MoePagerSession`'s `request_fills`,
+  `stage_ready_fills`, `fills_copied`, `end_forward` returning a
+  `StoppedFillReader`, `fills_layer`, `fill_reader_active`, `fill_slots_held`,
+  `fills_pending` and `fills`; `GpuPager::fill_staged` and `GpuPager::fills`;
+  `infr_vulkan::pager::FILL_AHEAD_BYTES`), with
+  `VulkanBackend::moe_pager_totals`, and with `segment_cuts` and
+  `moe_pager_totals` on `infr_llama`'s `DenseVulkanSession`.
 - **`infr_llama::Config::optional_router_bias`**: whether the arch's reference
   loads `blk.N.exp_probs_b.bias` as optional on its MoE layers (deepseek2 and
   ernie4_5-moe).
 
 ### Changed
 
+- **Paged MoE decode on Vulkan reaches its no-readback path from a short prompt
+  when the expert cache can hold the whole model.** A MoE layer decodes without
+  reading its router ids back only once every one of its experts is in VRAM, and
+  until now only a long prefill put the experts no token routes to there:
+  decoding from a short prompt read router ids back on every layer of every
+  token for as long as it ran. Now, when every expert pool has a slot for every
+  expert, a background thread reads the experts no token has routed to (from
+  wherever a miss reads them, straight into a host staging buffer) while the
+  decode runs, and the decode copies them into free slots — never evicting —
+  until each layer is wholly resident; the thread stops once nothing is left to
+  fill. Reads start only after a whole forward without a miss, so they do not
+  compete with the experts a decode is still routing to; a cache that cannot
+  hold the model never fills. A fill whose read fails turns filling off for the
+  session with a warning instead of failing the decode; only a token that routes
+  to that expert fails, as before. On the RX 7900 XTX at `paging.cache=20g` with
+  no prefill, interleaved runs: tg2048 Qwen3-30B-A3B 123.7, 123.8 to 167.6,
+  168.6 t/s, ERNIE-4.5-21B-A3B 141.1, 140.6 to 174.4, 174.5 (the bench's untimed
+  warm-up run of the same length is where the fills land). The reads still cost
+  a short decode a little before it gains: tg128 there goes from 121.4, 119.8 to
+  117.0, 117.7 (Qwen3) and 139.1, 139.9 to 136.6, 135.9 (ERNIE). After a
+  365-token prefill, at `paging.cache=4g paging.dram=12g`, and resident,
+  throughput is unchanged. `paging.stats` prints each pool's `fills`.
 - **Paged MoE decode on Vulkan is up to 11% faster** where the expert cache
   holds every layer: a paged decode token is re-recorded each time, and the GPU
   used to wait for the whole recording before starting. On the RX 7900 XTX,

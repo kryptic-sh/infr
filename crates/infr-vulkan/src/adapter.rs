@@ -5688,8 +5688,13 @@ fn discard_segment(be_: &VulkanBackend, rec: Recorder<'_>) -> Result<()> {
     rec.discard()
 }
 
-/// Take back every weight-pager placement whose copy went into recording `serial`, which will
-/// never run: it is being discarded, or its submit failed after consuming it.
+/// Take back every weight-pager placement whose copy went into recording `serial`, and free the
+/// MoE fill staging slots its copies read, because the recording is not known to have run. The
+/// callers: `discard_segment` (it is being discarded), and `submit_wait` / `submit_nowait` when
+/// [`Recorder::finish`] / [`Recorder::finish_nowait`] fails — either the submit failed after
+/// consuming it, or (`finish` only) the wait for the queue after a successful submit failed. In
+/// that last case the copies may have run; taking their placements back then costs only a
+/// re-read, and the failure is in practice a lost device, which runs nothing more.
 fn forget_staged(be_: &VulkanBackend, serial: u64) {
     if let Some(s) = be_.moe_pager().lock().unwrap().as_mut() {
         s.forget_unsubmitted(serial);
@@ -5987,6 +5992,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     transient.extend(pool.into_values());
     let last = rec.take().expect("segment always Some at loop end");
     submitted_dispatches += last.dispatches();
+    let last_serial = last.serial();
     submit_wait(be_, last)?;
     // The blocking finish above already waited the queue idle — draining just releases the
     // pipelined segments' command buffers/fences (every buffer they referenced outlives this
@@ -5995,6 +6001,17 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         seg.wait().map_err(|e| be(e.to_string()))?;
     }
     pstream.drain()?;
+    if be_.moe_paged() {
+        // The session's lock is released at the end of this statement.
+        let stopped = be_.moe_pager().lock().unwrap().as_mut().map(|sess| {
+            // The queue is idle, so every recording up to `last` has completed.
+            sess.fills_copied(last_serial);
+            sess.end_forward()
+        });
+        // Stopping the reader waits for its read in progress: outside the lock, so no other
+        // forward waits too.
+        drop(stopped);
+    }
     // Feed this forward back into the splitter: `finish` waited the queue idle and every segment
     // has been waited, so each one's GPU interval is in the clock's sum. See `ForwardClock` for
     // why that, and not this forward's wall time, is what the watchdog bound is judged by.
@@ -6130,17 +6147,23 @@ fn rotate_stream<'a>(
 /// Blocking submit of the ambient segment (queue idle on return) + full stream drain — the ONE
 /// remaining host sync on the paged path, paid only by a small-m layer whose expert set is not
 /// fully resident (its router ids must be read back before its GEMVs can be staged). Both ring
-/// halves and the whole tape are reusable afterwards.
+/// halves and the whole tape are reusable afterwards, and so are the background fills' staging
+/// slots whose copies went into this segment or an earlier one (`MoePagerSession::fills_copied`).
 fn sync_stream<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
 ) -> Result<()> {
     let last = rec.take().expect("segment always Some between ops");
+    let serial = last.serial();
     submit_wait(be_, last)?;
+    be_.note_segment_cut(crate::SegmentCut::Drain);
     ps.drain()?; // fences already signaled (queue idle) — releases their transient objects
     ps.cursor = 0;
     ps.tape_cursor = 0;
+    if let Some(sess) = be_.moe_pager().lock().unwrap().as_mut() {
+        sess.fills_copied(serial); // the queue is idle: every recording up to `last` completed
+    }
     *rec = Some(be_.recorder()?);
     Ok(())
 }
@@ -6479,7 +6502,11 @@ fn stage_and_window<'a>(
 ///     (`MoePagerSession::all_resident`).
 ///   - Small-m layers with any absent expert: the ONE remaining blocking sync (`sync_stream`) to
 ///     read the router's ids — a mapped memcpy, the ids buffer is `Staging` — then routed-only
-///     staging into the fresh ambient segment (which stays open for the next layer).
+///     staging into the fresh ambient segment (which stays open for the next layer). Where every
+///     role's pool can hold every expert of the model, such a layer also asks the session's
+///     background reader for its experts no token routed to (`MoePagerSession::request_fills`),
+///     and admits what the reader has ready into free slots just before its sync, until every
+///     layer is wholly resident and takes the arm above.
 ///
 /// Every path reads layer-LOCAL expert ids against a frozen per-(layer, role) LUT window in the
 /// session's tape (`lut[window + local_id]` — see `MoePagerSession::lut_window`), never the live
@@ -6654,6 +6681,14 @@ fn execute_paged_moe<'a>(
     let touch_all = rows * n_used >= 3 * n_expert;
     // Layer-LOCAL ids to stage; empty = residency already guaranteed (all-resident inline path).
     let mut stage_ids: Vec<u32> = Vec::new();
+    // Whether this layer fills its experts no token has routed to (see below), and its roles'
+    // tensors (a fused gate_up bank has no Up source).
+    let mut fill = false;
+    let roles: &[usize] = if *fused_gate_up {
+        &[gate_id, down_id]
+    } else {
+        &[gate_id, up_id, down_id]
+    };
     if touch_all {
         stage_ids = (0..n_expert as u32).collect();
     } else {
@@ -6678,6 +6713,22 @@ fn execute_paged_moe<'a>(
             }
             sess.touch_all_hits(down_id, n_expert)?;
         } else {
+            // Fill the layer's other absent experts so that it becomes wholly resident and takes
+            // the inline arm above — but only where every role's pool has a slot for every expert
+            // registered in it: then a fill never evicts, now or later. With any pool short of
+            // that, the layer stays on this arm as before, so a budget that cannot hold the model
+            // never fills. What the background reader has ready (any layer's) is admitted HERE:
+            // one recorded copy per expert from the reader's staging buffer, into the segment
+            // `sync_stream` is about to submit and wait for, so the staging slots are free again
+            // once that wait returns. The forward copies no bytes itself.
+            {
+                let mut guard = be_.moe_pager().lock().unwrap();
+                let sess = guard.as_mut().expect("checked above");
+                fill = sess.fills_layer(roles);
+                if fill {
+                    sess.stage_ready_fills(rec.as_ref().expect("segment always Some between ops"))?;
+                }
+            }
             // Split: the router's routing is host-unknown and some routed expert may be absent —
             // block once, read the ids off the mapped Staging buffer, stage exactly the routed
             // set into the fresh ambient segment (which then stays open for the layers after).
@@ -6704,6 +6755,14 @@ fn execute_paged_moe<'a>(
         stage_and_window(be_, rec, ps, up_id, &stage_ids, n_expert, touch_all)?
     };
     let down_w = stage_and_window(be_, rec, ps, down_id, &stage_ids, n_expert, touch_all)?;
+    if fill {
+        // Ask the reader for this layer's absent experts, now that its routed ones are staged.
+        // The reads run off this thread, and a later readback layer admits them — in this
+        // forward or a later one.
+        let mut guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_mut().expect("checked above");
+        sess.request_fills(be_, roles)?;
+    }
     // RAW: order every ring→arena copy this op just staged (gate/up/down, TRANSFER writes
     // invisible to the buffer hazard tracker) before the first dispatch below that reads the
     // arena by pointer — covers both the batched `matmul_mmq_experts_paged` arm and the small-m

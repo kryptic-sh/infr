@@ -225,6 +225,19 @@ impl DenseVulkanSession {
     pub fn decode_recordings(&self) -> u64 {
         self.be.decode_recordings()
     }
+
+    /// The segments this session's forwards submitted before their recording ended, by cause
+    /// ([`infr_vulkan::VulkanBackend::segment_cuts`]) — among them the router-id readbacks of
+    /// paged MoE layers that were not wholly resident.
+    pub fn segment_cuts(&self) -> infr_vulkan::SegmentCuts {
+        self.be.segment_cuts()
+    }
+
+    /// The paged-MoE expert cache's counters and fills
+    /// ([`infr_vulkan::VulkanBackend::moe_pager_totals`]); `None` when no layer is paged.
+    pub fn moe_pager_totals(&self) -> Option<(infr_core::pager::PagerStats, u64)> {
+        self.be.moe_pager_totals()
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]

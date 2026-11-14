@@ -75,6 +75,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **CPU prefill of the causal convolutions is several times faster.** qwen35's
+  `Op::Conv1dSilu` and LFM3's `Op::ShortConv` now share one convolution that
+  runs each tap across a whole row against a transposed kernel, and the short
+  convolution forms `B ⊙ X` as it reads it instead of in a serial pass of its
+  own; the results are bit-identical to before. Per layer on a 512-token chunk
+  (`INFR_PROF_OPS`, 16 threads, warm reps): `Conv1dSilu` 4137.6-4237.1 us to
+  690.4-698.2 us on Qwen3.5-0.8B, `ShortConv` 4130.8-4279.0 us to 389.8-435.3 us
+  on LFM3-1.7B. pp512 on the Windows box, two interleaved runs of four reps
+  each: Qwen3.5-0.8B Q4_K_M 913.6 and 882.6 t/s to 1052.8 and 1022.6; LFM3-1.7B
+  Q4_K_M 610.0 and 620.9 to 680.6 and 672.1 (the LFM3 means include a cold first
+  rep near 160 t/s; the warm reps reached 774.2 and 790.4 before, 863.5 and
+  865.5 after). Decode is unchanged.
 - **The KV-cache estimate prices a recurrent layer at its fixed state size.**
   The context fit and the placement sweep used to price a qwen35 DeltaNet layer
   as if it cached K and V per token, so a qwen35 session's default context was

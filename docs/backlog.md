@@ -5103,14 +5103,14 @@ the drain arm of `adapter::execute_paged_moe`); the measurements are in
   last staged slot of an off session (`release_staged_fills`) drop it in place,
   waiting for a read in progress. Once per session at most; left as is.
 
-### B188 — LFM3 prefill trails llama.cpp on every device; decode trails it on CPU (2026-11-14)
+### B188 — LFM3 prefill trails llama.cpp on every device; decode trails it on CPU (2026-11-14, profiled 2026-11-15)
 
-**Tag:** perf · lfm3
+**Tag:** perf · lfm3 · **Blocked on:** nothing; what is left is the shared GEMM,
+GEMV and attention kernels, each its own slice
 
 `LFM3-1.7B-Q4_K_M.gguf`, `infr bench` against `llama-bench` (llama.cpp
-`5676dfbe0`), three reps each, measured one after the other on 2026-11-14 with
-the CPU 1–3% busy before each run (`typeperf`); no other session was asked to
-pause:
+`5676dfbe0`), measured on 2026-11-14 with the CPU 1–3% busy before each run
+(`typeperf`); no other session was asked to pause:
 
 | device                | infr pp512 | llama.cpp pp512 | infr tg128 | llama.cpp tg128 |
 | --------------------- | ---------: | --------------: | ---------: | --------------: |
@@ -5118,15 +5118,72 @@ pause:
 | Vulkan1 (integrated)  |      138.3 |          195.94 |       23.6 |           25.11 |
 | CPU (16 threads)      |      565.5 |         1082.25 |       51.3 |           60.43 |
 
-infr's CPU pp512 mean includes a first rep of 161.9 t/s (the mmap page-in of
-B173); its other two reps reached up to 773.4. Not profiled, so where the time
-goes is not known. Leads, unverified: fused QKV is off for LFM3 twice over — the
-short-convolution layers have no `attn_q`, which `fuse_qkv_decision` requires of
-every layer, and the Q4_K_M file mixes Q4_K and Q6_K `attn_v` — so each
-attention layer runs three narrow prefill GEMMs; the head-gate projection is a
-16-wide GEMM per attention layer; `Op::ShortConv`'s batch pass recomputes
-`B ⊙ X` per tap (seven times per output) and runs as two dispatches. A
-`kernels.prof` breakdown of one pp512 chunk on each device is the next step.
+Every infr CPU pp512 mean includes a cold first rep near 160 t/s (the mmap
+page-in of B173). Profiled on 2026-11-15 with `INFR_PROF_OPS=1` (plus
+`INFR_PROF_OP_SHAPES=1` on Vulkan) against llama.cpp's `GGML_VK_PERF_LOGGER=1`.
+
+**What the profile pinned on LFM3, now fixed:** the CPU `Op::ShortConv` took
+4130.8-4279.0 us per layer per pp512 chunk, 53.70-55.63 ms of a 661.6-665.1 ms
+warm forward, in serial index arithmetic around a scalar conv; it now takes
+389.8-435.3 us (CHANGELOG). The rest is not LFM3-specific: Qwen3-1.7B Q4_K_M, a
+dense model of the same width, trails by about the same ratio on each device
+(pp512: CPU 742.9 best warm rep against 993.53, Vulkan0 7597.2 against 9730.23,
+Vulkan1 126.3 against 186.83; CPU tg128 49.6 against 56.64).
+
+- **Vulkan0, the dense GEMM.** Device time 197.6 ms over 3 pp512 reps against
+  llama.cpp's 49615.6 us for one; the `native_gemm_warp_*` rows are 49.20%,
+  23.57% and 15.26% of infr's. Per call: the fused gate/up (k=2048, n=15360) 1.1
+  ms against llama.cpp's two n=7680 GEMMs at 419.025 us each; `ffn_down`
+  (k=7680) Q4_K 794.7 us and Q6_K 820.5 us (split-K) against 510.896 and 574.68;
+  `shortconv.in_proj` (n=6144) 505.8 us against 348.076; the 2048x2048
+  projections 152.8 us plus a 16.5 us split-K reduce against 152.852. On this
+  device llama.cpp runs Q4_K and Q6_K prefill through its int8 coopmat MMQ
+  (`matmul_q4_k_q8_1`, `matmul_q6_k_q8_1`, created when
+  `coopmat_int_support && rdna3`), and the 7900 XTX reports `i8cm:y`; infr's
+  `native_gemm_warp_*` dequantizes into f16 coopmat. This is B184's first item
+  with its next step answered: an int8-coopmat Q4_K/Q6_K prefill GEMM is the
+  port to try.
+- **Vulkan1 (integrated), the dp4a GEMM and attention.** 7.38 s of device time
+  over 2 pp512 reps against llama.cpp's 2.60563e+06 us for one. The gate/up
+  `native_gemm_mmq_q4k_streamed` (2048x15360, 128-row chunks) totals 3.26 s over
+  the 2 reps against llama.cpp's 1.14047e+06 us for its q4_K n=7680 GEMMs in
+  one; the Q6_K `ffn_down` 946.9 ms against 389354 us; `attn_nc_fa_hd128` 541.8
+  ms against `FLASH_ATTN_EXT` 117913 us.
+- **CPU, the Q4_K/Q6_K GEMM.** After the fix a warm forward is 567.8-569.7 ms
+  (one later run, whose unchanged Linears also ran faster than in the first
+  profile, so the two windows differ), and its five largest rows are Linears
+  (218.52 ms for the gate and up GEMMs, then 60.06, 57.33, 53.71 and 49.71 ms);
+  llama.cpp's CPU pp512 was 979.14 and 1082.25 t/s on the two days. Also
+  `GatedAct` 30.77 ms (scalar `expf`, B173) and `Attention` 28.75 + 16.41 ms.
+  CPU decode is GEMV-bound (2048x7680 39.02%, the Q6_K lm_head 17.23%, 7680x2048
+  Q6_K 11.20% of the decode profile), and Qwen3-1.7B trails there too.
+- **Vulkan1 decode.** Device time (`INFR_SEAM_NO_REPLAY=1`) 1.39 s over 32
+  tokens against llama.cpp's 39845.8 us for one. The gaps: the K/V projections
+  (2048x512) at 68.9 us (`gemv_rm_v2`, Q4_K) and 92.0 us (plain GEMV, Q6_K)
+  against 22.832 and 31.128 us, `ffn_down` at 414.5 us against 296.803 (Q4_K)
+  and 408.506 (Q6_K), and the Q6_K lm_head at 8.7 ms against 7254.64 us. The
+  decode GEMV gates (`MMV_MIN_ELEMS` and the variant choice) were tuned on the
+  7900 XTX.
+
+**Considered and declined, with what was measured:**
+
+- **Fused QKV for LFM3 on Vulkan.** `fuse_qkv_decision` refuses it because the
+  short-convolution layers have no `attn_q` and because 5 of the 11 attention
+  layers carry a Q6_K `attn_v`. On Vulkan0 the separate q, k and v GEMMs cost
+  152.8, 47.5 and 47.5-50.5 us plus their split-K reduces; fusing can save at
+  most part of the k and v share, and a per-layer rule would fuse 6 layers. Not
+  built or measured.
+- **The head-gate projection (2048x16) at m=512 on Vulkan** runs as the per-row
+  GEMV (`gemv_streamed`, one workgroup per output): 75.3 us per layer on Vulkan0
+  against llama.cpp's 3.956 us, 1.25% of device time; 162.6 us per chunk on the
+  integrated GPU. No prefill GEMM tiles n below 64, so a fix is a small-n
+  kernel, or a padded weight plus a gate stride on `Op::HeadGate` on all three
+  backends. Not done for that share.
+- **`Op::ShortConv` on Vulkan** recomputes `B ⊙ X` per tap and runs as two
+  dispatches, and is already ahead of llama.cpp: `shortconv_par` 19.7 us and
+  `shortconv_shift` 1.9 us per layer on Vulkan0 against `SSM_CONV` 20.483 us
+  plus a `CONCAT` and two `MUL`s; 278.9 us against `SSM_CONV` 1023.68 us on the
+  integrated GPU. No change.
 
 ### B189 — what the LFM3 phase did not verify (2026-11-14)
 

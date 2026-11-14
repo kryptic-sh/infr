@@ -3132,10 +3132,14 @@ impl Backend for CpuBackend {
                     kernel,
                 } => {
                     let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
-                    let xs = vals[x.0 as usize].clone(); // [rows, channels]
                     let ws = weight(w); // [channels, kernel] row-major (per-channel kernel)
-                    let st = &mut vals[state.0 as usize];
-                    let out = causal_conv1d(self.pool(), &xs, &ws, st, rr, cc, kk, true);
+                    debug_assert_ne!(x, state, "Conv1dSilu reads its own history as input");
+                    // Taken out for the call so the history can be written while `x` is read.
+                    let mut st = std::mem::take(&mut vals[state.0 as usize]);
+                    let mut out = rc.for_overwrite(rr * cc);
+                    let xs = &vals[x.0 as usize]; // [rows, channels]
+                    conv1d_silu(self.pool(), xs, &ws, &mut st, &mut out, rr, cc, kk);
+                    vals[state.0 as usize] = st;
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::ShortConv {
@@ -3148,20 +3152,22 @@ impl Backend for CpuBackend {
                     kernel,
                 } => {
                     let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
-                    let bv = &vals[bcx.0 as usize]; // [rows, 3*channels]: B | C | X per row
-                    let bx: Vec<f32> = (0..rr * cc)
-                        .map(|i| {
-                            let row = &bv[(i / cc) * 3 * cc..];
-                            row[i % cc] * row[2 * cc + i % cc]
-                        })
-                        .collect();
                     let ws = weight(w); // [channels, kernel]
-                    let st = &mut vals[state.0 as usize];
-                    let mut out = causal_conv1d(self.pool(), &bx, &ws, st, rr, cc, kk, false);
-                    let bv = &vals[bcx.0 as usize];
-                    for (i, o) in out.iter_mut().enumerate() {
-                        *o *= bv[(i / cc) * 3 * cc + cc + i % cc];
-                    }
+                    debug_assert_ne!(bcx, state, "ShortConv reads its own history as input");
+                    // Taken out for the call so the history can be written while `bcx` is read.
+                    let mut st = std::mem::take(&mut vals[state.0 as usize]);
+                    let mut out = rc.for_overwrite(rr * cc);
+                    short_conv(
+                        self.pool(),
+                        &vals[bcx.0 as usize],
+                        &ws,
+                        &mut st,
+                        &mut out,
+                        rr,
+                        cc,
+                        kk,
+                    );
+                    vals[state.0 as usize] = st;
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::DeltaNet {
@@ -3748,120 +3754,187 @@ impl Backend for CpuBackend {
     }
 }
 
-/// Depthwise causal conv (fixed per-channel kernel of width `kk`) over a rolling history `st`
-/// carried across token batches, followed by SiLU when `silu` (qwen35's `Op::Conv1dSilu`) and by
-/// nothing otherwise (LFM's `Op::ShortConv`). Returns the `[rows, channels]` output and leaves `st`
-/// holding the trailing `kk-1` input rows.
-///
-/// Decode and tiny batches walk the rows serially, shifting the history per token; real prefill
-/// (`rows >= (kk-1).max(2)`, the gate the Vulkan and Metal kernels use) runs [`conv1d_par`]. The two
-/// paths are bit-identical (see there), so the gate is perf only.
+/// qwen35's `Op::Conv1dSilu`: [`causal_conv`] over the `[rows, channels]` input `xs`, then SiLU.
+/// Returns the output and leaves `st` holding the trailing `kk-1` rows of `xs`.
 #[allow(clippy::too_many_arguments)]
-fn causal_conv1d(
+fn conv1d_silu(
     pool: &pool::SpinPool,
     xs: &[f32],
     ws: &[f32],
     st: &mut [f32],
+    out: &mut [f32],
     rr: usize,
     cc: usize,
     kk: usize,
-    silu: bool,
-) -> Vec<f32> {
-    if rr >= (kk - 1).max(2) {
-        return conv1d_par(pool, xs, ws, st, rr, cc, kk, silu);
-    }
-    let mut out = vec![0f32; rr * cc];
-    for t in 0..rr {
-        let xt = &xs[t * cc..t * cc + cc];
-        for ch in 0..cc {
-            // window = [history rows.. , current x]; tap j uses weight[ch*kk + j].
-            let mut acc = 0f32;
-            for j in 0..kk - 1 {
-                acc += st[j * cc + ch] * ws[ch * kk + j];
+) {
+    causal_conv(
+        pool,
+        &PlainRows { xs, cc },
+        ws,
+        st,
+        out,
+        rr,
+        cc,
+        kk,
+        &|_, orow| {
+            for o in orow {
+                *o /= 1.0 + (-*o).exp();
             }
-            acc += xt[ch] * ws[ch * kk + (kk - 1)];
-            out[t * cc + ch] = conv_act(acc, silu);
-        }
-        // shift history (drop oldest, append raw x).
-        for j in 0..kk.saturating_sub(2) {
-            for ch in 0..cc {
-                st[j * cc + ch] = st[(j + 1) * cc + ch];
-            }
-        }
-        if kk >= 2 {
-            st[(kk - 2) * cc..(kk - 1) * cc].copy_from_slice(xt);
-        }
-    }
-    out
+        },
+    );
 }
 
-/// The conv's output activation: SiLU, or the identity.
-fn conv_act(acc: f32, silu: bool) -> f32 {
-    if silu {
-        acc / (1.0 + (-acc).exp())
-    } else {
-        acc
-    }
-}
-
-/// The parallel body of [`causal_conv1d`].
+/// LFM's gated short convolution (`Op::ShortConv`): for each row `t` of `bcx = [B | C | X]`
+/// (`[rows, 3·channels]`), `out[t] = C[t] ⊙ conv(B ⊙ X)[t]`, the conv being [`causal_conv`] with
+/// no activation. `st` holds the trailing `kk-1` rows of `B ⊙ X` and is advanced in place.
 ///
-/// Parallel reformulation (the whole trick): the conv is depthwise + causal with a fixed kernel, so
-/// every output reads only the VIRTUAL sequence `[state ‖ x]` and all `rr*cc` outputs are
-/// independent — the row loop parallelizes with no cross-row state. With
-/// `virtual[i][ch] = state_init[i*cc+ch]` for `i < km1` else `xs[(i-km1)*cc+ch]`,
-/// `out[t*cc+ch] = silu(Σ_{j=0}^{kk-1} virtual[t+j][ch] * ws[ch*kk+j])`, and the new history is the
-/// trailing `km1` virtual rows: `new_state[j*cc+ch] = virtual[rr+j][ch]`.
-///
-/// Bit-identity vs the serial shift-register loop: at serial step `t` the shifted `st[j]` equals
-/// `virtual[t+j]` (`j in 0..km1`) and the current `xt` equals `virtual[t+km1]`, so accumulating the
-/// taps in the SAME ascending `j` order (0..kk) reproduces the serial float accumulation
-/// float-for-float. The state rebuild is a pure copy (no arithmetic), so it is trivially identical.
-/// Handles `kk == 1` (km1=0, no history: `out[t]=silu(xs[t]*w[0])`) and `rr < km1` (the rebuild
-/// reads leftover old state via the `i < km1` branch of `virtual`).
+/// `B ⊙ X` is formed as each tap reads it rather than stored: a multiply per tap is cheaper than
+/// a separate pass writing a `[rows, channels]` intermediate, and the products are the same f32
+/// values either way, so the result is bit-identical to building `B ⊙ X` first.
 #[allow(clippy::too_many_arguments)]
-fn conv1d_par(
+fn short_conv(
     pool: &pool::SpinPool,
-    xs: &[f32],
+    bcx: &[f32],
     ws: &[f32],
     st: &mut [f32],
-    rows: usize,
-    channels: usize,
-    kernel: usize,
-    silu: bool,
-) -> Vec<f32> {
-    let (rr, cc, kk) = (rows, channels, kernel);
-    let km1 = kk - 1;
-    // Snapshot the incoming history so the parallel closure can read it immutably while we rebuild
-    // `st` afterward.
-    let state_init = st.to_vec();
-    let virt = |i: usize, ch: usize| -> f32 {
-        if i < km1 {
-            state_init[i * cc + ch]
-        } else {
-            xs[(i - km1) * cc + ch]
-        }
-    };
-    let mut out = vec![0f32; rr * cc];
-    // Chunk `out` by output ROW (chunk == cc → chunk index `t` is the row index). Pure scheduling,
-    // math unchanged → bit-identical; grain of 4 matches the sibling row-parallel ops.
-    pool.for_chunks_mut(&mut out, cc, 4, &|t, orow| {
-        for ch in 0..cc {
-            // Taps summed in ASCENDING j (0..kk) to match the serial accumulation order exactly.
-            let mut acc = 0f32;
-            for j in 0..kk {
-                acc += virt(t + j, ch) * ws[ch * kk + j];
+    out: &mut [f32],
+    rr: usize,
+    cc: usize,
+    kk: usize,
+) {
+    causal_conv(
+        pool,
+        &GatedRows { bcx, cc },
+        ws,
+        st,
+        out,
+        rr,
+        cc,
+        kk,
+        &|t, orow| {
+            let c = &bcx[t * 3 * cc + cc..t * 3 * cc + 2 * cc];
+            for (o, &cv) in orow.iter_mut().zip(c) {
+                *o *= cv;
             }
-            orow[ch] = conv_act(acc, silu);
-        }
-    });
-    // Rebuild the rolling history = trailing km1 virtual rows (pure copy, no arithmetic).
-    for j in 0..km1 {
-        for ch in 0..cc {
-            st[j * cc + ch] = virt(rr + j, ch);
+        },
+    );
+}
+
+/// The input sequence of a [`causal_conv`], read a row at a time.
+trait ConvRows: Sync {
+    /// `acc[ch] += row_r[ch] * w[ch]` for every channel.
+    fn madd(&self, r: usize, w: &[f32], acc: &mut [f32]);
+    /// `dst[ch] = row_r[ch]` for every channel.
+    fn copy_row(&self, r: usize, dst: &mut [f32]);
+}
+
+/// A `[rows, channels]` input read as is.
+struct PlainRows<'a> {
+    xs: &'a [f32],
+    cc: usize,
+}
+
+impl ConvRows for PlainRows<'_> {
+    fn madd(&self, r: usize, w: &[f32], acc: &mut [f32]) {
+        let x = &self.xs[r * self.cc..(r + 1) * self.cc];
+        for ((a, &xv), &wv) in acc.iter_mut().zip(x).zip(w) {
+            *a += xv * wv;
         }
     }
-    out
+
+    fn copy_row(&self, r: usize, dst: &mut [f32]) {
+        dst.copy_from_slice(&self.xs[r * self.cc..(r + 1) * self.cc]);
+    }
+}
+
+/// `B ⊙ X` of `[B | C | X]` rows, multiplied as it is read.
+struct GatedRows<'a> {
+    bcx: &'a [f32],
+    cc: usize,
+}
+
+impl GatedRows<'_> {
+    fn bx(&self, r: usize) -> (&[f32], &[f32]) {
+        let row = &self.bcx[r * 3 * self.cc..(r + 1) * 3 * self.cc];
+        (&row[..self.cc], &row[2 * self.cc..])
+    }
+}
+
+impl ConvRows for GatedRows<'_> {
+    fn madd(&self, r: usize, w: &[f32], acc: &mut [f32]) {
+        let (b, x) = self.bx(r);
+        for (((a, &bv), &xv), &wv) in acc.iter_mut().zip(b).zip(x).zip(w) {
+            *a += (bv * xv) * wv;
+        }
+    }
+
+    fn copy_row(&self, r: usize, dst: &mut [f32]) {
+        let (b, x) = self.bx(r);
+        for ((d, &bv), &xv) in dst.iter_mut().zip(b).zip(x) {
+            *d = bv * xv;
+        }
+    }
+}
+
+/// Depthwise causal conv with a fixed per-channel kernel `ws` (`[channels, kk]`) over the virtual
+/// sequence `[st ‖ input]`, where `st` is the rolling history of the last `kk-1` input rows carried
+/// across token batches: `out[t][ch] = Σ_{j<kk} virt[t+j][ch] · ws[ch·kk + j]`, then `post(t, row)`.
+/// Leaves `st` holding the trailing `kk-1` rows of the virtual sequence.
+///
+/// Every output row reads only the virtual sequence, so rows are independent and run across the
+/// pool. Each channel sums its taps from zero in ascending `j`, the order of a serial loop that
+/// shifts the history per token, so the two are bit-identical (the tests hold this against such a
+/// loop). The taps run as whole rows against a transposed kernel so the channel loop vectorizes.
+#[allow(clippy::too_many_arguments)]
+fn causal_conv<R: ConvRows>(
+    pool: &pool::SpinPool,
+    input: &R,
+    ws: &[f32],
+    st: &mut [f32],
+    out: &mut [f32],
+    rr: usize,
+    cc: usize,
+    kk: usize,
+    post: &(dyn Fn(usize, &mut [f32]) + Sync),
+) {
+    let km1 = kk - 1;
+    // `wt[j*cc + ch] = ws[ch*kk + j]`: tap `j` of every channel as one contiguous row.
+    let mut wt = vec![0f32; kk * cc];
+    for ch in 0..cc {
+        for j in 0..kk {
+            wt[j * cc + ch] = ws[ch * kk + j];
+        }
+    }
+    {
+        let hist: &[f32] = st;
+        // Chunk `out` by row (chunk == cc, so the chunk index is the row); grain of 4 matches the
+        // sibling row-parallel ops.
+        pool.for_chunks_mut(out, cc, 4, &|t, orow| {
+            orow.fill(0.0);
+            for (j, wj) in wt.chunks_exact(cc).enumerate() {
+                let i = t + j;
+                if i < km1 {
+                    let h = &hist[i * cc..(i + 1) * cc];
+                    for ((o, &hv), &w) in orow.iter_mut().zip(h).zip(wj) {
+                        *o += hv * w;
+                    }
+                } else {
+                    input.madd(i - km1, wj, orow);
+                }
+            }
+            post(t, orow);
+        });
+    }
+    // New history = the trailing `km1` virtual rows. Ascending `j` reads old rows at `j + rr > j`,
+    // which are not yet overwritten, so the shift runs in place.
+    for j in 0..km1 {
+        let i = rr + j;
+        if i < km1 {
+            st.copy_within(i * cc..(i + 1) * cc, j * cc);
+        } else {
+            input.copy_row(i - km1, &mut st[j * cc..(j + 1) * cc]);
+        }
+    }
 }
 
 /// Parallel DeltaNet scan: ONE pool task per value head. The outer token scan is inherently
@@ -4027,7 +4100,7 @@ mod tests {
     }
 
     // Naive serial reference: a byte-for-byte copy of the ORIGINAL shift-register conv loop. The
-    // parallel `conv1d_par` reformulation must reproduce both `out` and the rebuilt `state` exactly.
+    // parallel `conv1d_silu` must reproduce both `out` and the rebuilt `state` exactly.
     fn conv1d_silu_ref(
         xs: &[f32],
         ws: &[f32],
@@ -4066,22 +4139,23 @@ mod tests {
         out
     }
 
-    // The parallel `conv1d_par` reformulation must be BIT-IDENTICAL (exact f32 equality) to the
+    /// Deterministic pseudo-random pattern (no RNG) for the conv tests: a hashed ramp in [-1, 1).
+    fn conv_pat(seed: usize, i: usize) -> f32 {
+        let h = (i
+            .wrapping_mul(2654435761)
+            .wrapping_add(seed.wrapping_mul(40503)))
+            & 0xffff;
+        (h as f32 / 32768.0) - 1.0
+    }
+
+    // `conv1d_silu` (the parallel `causal_conv`) must be BIT-IDENTICAL (exact f32 equality) to the
     // naive serial reference for BOTH the output and the rebuilt state, across a matrix of
     // (rows, kernel, channels) that spans: real-prefill sizes, decode (rr==1), rr == kk-1, a case
     // with rr < kk-1 (rebuild reads leftover old state), kk==1 (no history), kk==2, small channel
-    // counts, and a large channel count that forces the pool's multi-chunk path — with the SiLU
-    // (`Op::Conv1dSilu`) and without it (`Op::ShortConv`).
+    // counts, and row counts that split across the pool's tasks.
     #[test]
     fn conv1d_silu_bit_identical_to_serial() {
-        // Deterministic pseudo-random pattern (no RNG): a cheap hashed ramp in [-1, 1).
-        let pat = |seed: usize, i: usize| -> f32 {
-            let h = (i
-                .wrapping_mul(2654435761)
-                .wrapping_add(seed.wrapping_mul(40503)))
-                & 0xffff;
-            (h as f32 / 32768.0) - 1.0
-        };
+        let pat = conv_pat;
         let be = CpuBackend::new();
         let pool = be.pool();
         for &(rr, kk) in &[
@@ -4093,29 +4167,71 @@ mod tests {
             (2, 2),
             (2, 4),
         ] {
-            for (&cc, silu) in [40usize, 512]
-                .iter()
-                .flat_map(|cc| [(cc, true), (cc, false)])
-            {
+            for cc in [40usize, 512] {
                 let km1 = kk - 1;
                 let xs: Vec<f32> = (0..rr * cc).map(|i| pat(1, i)).collect();
                 let ws: Vec<f32> = (0..cc * kk).map(|i| pat(2, i)).collect();
                 let st0: Vec<f32> = (0..km1 * cc).map(|i| pat(3, i)).collect();
 
                 let mut st_ref = st0.clone();
-                let out_ref = conv1d_silu_ref(&xs, &ws, &mut st_ref, rr, cc, kk, silu);
+                let out_ref = conv1d_silu_ref(&xs, &ws, &mut st_ref, rr, cc, kk, true);
 
                 let mut st_par = st0.clone();
-                let out_par = conv1d_par(pool, &xs, &ws, &mut st_par, rr, cc, kk, silu);
+                let mut out_par = vec![f32::NAN; rr * cc];
+                conv1d_silu(pool, &xs, &ws, &mut st_par, &mut out_par, rr, cc, kk);
 
                 assert_eq!(
                     out_par, out_ref,
-                    "output mismatch at rr={rr} kk={kk} cc={cc} silu={silu}"
+                    "output mismatch at rr={rr} kk={kk} cc={cc}"
                 );
                 assert_eq!(
                     st_par, st_ref,
-                    "rebuilt state mismatch at rr={rr} kk={kk} cc={cc} silu={silu}"
+                    "rebuilt state mismatch at rr={rr} kk={kk} cc={cc}"
                 );
+            }
+        }
+    }
+
+    // `short_conv` must be BIT-IDENTICAL to the composition it fuses — `B ⊙ X`, the serial
+    // activation-free conv, then `C ⊙` — for the output and the advanced history, over LFM3's
+    // kernel width and the edge shapes of the test above: decode (rr==1), rr < kk-1 (the history
+    // shift reads old rows), kk==1 and kk==2, and a row count that splits across the pool's tasks.
+    #[test]
+    fn short_conv_bit_identical_to_composition() {
+        let be = CpuBackend::new();
+        let pool = be.pool();
+        for &(rr, kk) in &[
+            (1usize, 7usize),
+            (3, 7),
+            (6, 7),
+            (64, 7),
+            (8, 4),
+            (5, 1),
+            (2, 2),
+        ] {
+            for cc in [40usize, 512] {
+                let km1 = kk - 1;
+                let bcx: Vec<f32> = (0..rr * 3 * cc).map(|i| conv_pat(1, i)).collect();
+                let ws: Vec<f32> = (0..cc * kk).map(|i| conv_pat(2, i)).collect();
+                let st0: Vec<f32> = (0..km1 * cc).map(|i| conv_pat(3, i)).collect();
+
+                let bx: Vec<f32> = (0..rr * cc)
+                    .map(|i| {
+                        bcx[(i / cc) * 3 * cc + i % cc] * bcx[(i / cc) * 3 * cc + 2 * cc + i % cc]
+                    })
+                    .collect();
+                let mut st_ref = st0.clone();
+                let mut out_ref = conv1d_silu_ref(&bx, &ws, &mut st_ref, rr, cc, kk, false);
+                for (i, o) in out_ref.iter_mut().enumerate() {
+                    *o *= bcx[(i / cc) * 3 * cc + cc + i % cc];
+                }
+
+                let mut st = st0.clone();
+                let mut out = vec![f32::NAN; rr * cc];
+                short_conv(pool, &bcx, &ws, &mut st, &mut out, rr, cc, kk);
+
+                assert_eq!(out, out_ref, "output mismatch at rr={rr} kk={kk} cc={cc}");
+                assert_eq!(st, st_ref, "history mismatch at rr={rr} kk={kk} cc={cc}");
             }
         }
     }

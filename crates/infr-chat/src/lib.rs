@@ -10,6 +10,7 @@
 //! - [`split_channels`] / [`parse_tool_calls`] — parse model output (reasoning vs answer,
 //!   `<|tool_call>` blocks).
 
+mod generation;
 mod pyformat;
 mod pystr;
 mod pyvalue;

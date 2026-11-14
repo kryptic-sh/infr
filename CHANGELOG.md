@@ -208,6 +208,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `loop_controls` feature; Hugging Face loads `jinja2.ext.loopcontrols`).
   Cohere2MoE, Cohere's command-r7b tool-use template, Kimi-K3 and Reka-Edge were
   refused for every conversation.
+- **Chat templates that use Hugging Face's `{% generation %}` tag render.**
+  transformers registers the tag (`AssistantTracker`) and renders its body
+  unchanged, in a scope of its own; minijinja has no custom tags, so infr
+  refused every such template. Each tag is now compiled as a `{% with %}` block,
+  which scopes a `{% set %}` in its body the same way, with its whitespace
+  control kept, and a misused one (unclosed, closing nothing, crossed with
+  another block, given arguments) is refused as Jinja2 refuses it.
+  IFM-K2-Horizon, LFM2.5-8B-A1B, LFM3 and poolside's Laguna S 2.1 / XS 2.1 /
+  XS.2 templates now render each conversation checked as Hugging Face renders
+  it.
 - **`is iterable` and `is sequence` answer as Jinja2 does**: none is not
   iterable, and a string, a dict and an undefined value are sequences. Nemotron
   3 Nano and Qwen3-Coder ask `tools is iterable and tools | length > 0` and were

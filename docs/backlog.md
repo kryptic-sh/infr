@@ -4251,15 +4251,11 @@ both: Llama 3.2 with two tool calls, Gemma 3 on the tool role). The plain-chat
 renders are byte-identical to infr 0.3.0's. The 74 templates in llama.cpp's
 `models/templates` (at `5676dfbe0`), nine conversations with thinking on and off
 (1332 renders, scratch-only: that directory's README gives provenance but no
-licensing, so none is copied into this repo): 994 match, 178 are refused by
-both, 36 differ, 90 are refused by infr only, 34 by Python only. Every
-non-match:
+licensing, so none is copied into this repo; re-run 2026-11-14 once the
+`{% generation %}` tag was supported, `crates/infr-chat/src/generation.rs`):
+1084 match, 178 are refused by both, 36 differ, 34 are refused by Python only,
+none by infr only. Every non-match:
 
-- **`{% generation %}` (90 refused by infr only):** IFM-K2-Horizon,
-  LFM2.5-8B-A1B, LFM3, Laguna S 2.1 / XS 2.1 / XS.2. transformers registers the
-  tag (`AssistantTracker`, which renders its body unless an assistant mask is
-  asked for), so Hugging Face renders these; minijinja has no custom tags and
-  infr refuses the template. See B172.
 - **`~` on a float (26 of the 36 that differ):** GigaChat3 and GigaChat3.1
   (`' // default: ' ~ default`, `minimum` / `maximum`) and functionary v3.2
   (`' Default=' ~ default_value`, `Maximum=`, `Minimum=`) print a float default
@@ -4658,6 +4654,32 @@ fixed; these were not, and none is reached by a cached template:
   command-r-plus and Hermes 2 Pro / 3 tool-use iterate `tools` and so render in
   infr for a conversation without tools, where Hugging Face refuses.
 
+### B187 — `{% generation %}` as `{% with %}` is looser than Jinja2 in a macro-only corner (2026-11-14)
+
+**Tag:** chat · compatibility · **Needs:** nothing now
+
+`rewrite_generation_tags` (`crates/infr-chat/src/generation.rs`) compiles the
+tag as `{% with %}`. transformers parses the body into a `CallBlock`, a macro
+body, so three things differ, none of which a template that renders on Hugging
+Face can show:
+
+- `{% break %}` / `{% continue %}` directly inside the tag inside a loop: Jinja2
+  raises a syntax error ("outside loop"); minijinja's `parse_with_block` keeps
+  the loop state, so infr accepts it.
+- `caller`, `varargs` and `kwargs` read inside the tag are the body macro's own
+  in Jinja2 (`{}` / `()` at top level, "No caller defined"); under `with` they
+  are the enclosing macro's or undefined.
+- A tag written with non-ASCII whitespace before `%}` (a no-break space) is
+  accepted by Jinja2 and refused by infr with "takes no arguments"; minijinja
+  without its `unicode` feature refuses such whitespace in any block.
+
+Evidence: the Jinja2 side was run (3.1.6, the oracle's environment); the
+minijinja side was read in its parser, not run. The unit tests' expected strings
+in `generation.rs` are hand-written constants checked once against Jinja2, not
+rows the oracle regenerates; moving them into the `jinja2_text.json` fixture
+would stop them drifting. The corpus counts under B158 come from a scratch
+harness over llama.cpp's templates that is not checked in.
+
 ### B171 — minijinja 3.x is out; infr is on 2.24 (2026-11-13)
 
 **Tag:** deps
@@ -4669,32 +4691,9 @@ their signatures (`indent`, `format`, `batch`, `slice`, the string filters), and
 the Python text rules lean on `Value::is_kwargs`, `Kwargs::args` / `peek`, the
 formatter hook (`pystr.rs`, `pyformat.rs`) and on wrapping a `DynObject` to
 replace only its `render` (`pyvalue.rs`). Check whether 3.x gives `~` a hook or
-tuples a type before porting: either would close a B158 gap. Not read.
-
-### B172 — templates with `{% generation %}` are refused (2026-11-13)
-
-**Tag:** chat · compatibility · **Needs:** a decision
-
-Hugging Face's environment registers a `generation` tag (`AssistantTracker` in
-`transformers/utils/chat_template_utils.py`): it marks the assistant's tokens
-for training masks and otherwise renders its body unchanged. minijinja has no
-custom tags, so infr refuses any template that uses it ("unknown statement
-generation"). In llama.cpp's `models/templates` that is IFM-K2-Horizon,
-LFM2.5-8B-A1B, LFM3 and the three poolside Laguna templates, refused for every
-conversation (90 of the corpus's 1332 renders, B158). The oracle
-(`jinja2_text.py`) carries the tag as transformers does with no tracker active.
-
-The body runs in a scope of its own, as a `{% with %}` block's does:
-`{% set x = 1 %}{% generation %}{% set x = 2 %}in={{ x }}{% endgeneration %} out={{ x }}`
-renders `in=2 out=1` in Python (a fixture row, pinned in `KNOWN_GAPS`). LFM2.5,
-LFM3 and Laguna all `set` variables inside their generation blocks, so the
-semantics matter. A source rewrite before compiling would have to map
-`generation` / `endgeneration` to `{% with %}` / `{% endwith %}` with the same
-whitespace markers (an `{% if true %}` rewrite leaks the `set`: `out=2`), skip
-`{% raw %}` blocks and string literals, and be checked by rendering each
-rewritten template against the oracle for the corpus conversations, not just by
-the row above. The other route is a minijinja hook (none in 2.24; 3.x not read,
-B171). Not started.
+tuples a type before porting: either would close a B158 gap. Not read. A way to
+register a statement there would also let the source rewrite that compiles
+`{% generation %}` as `{% with %}` (`crates/infr-chat/src/generation.rs`) go.
 
 ### B173 — the CPU backend's first forward pays the mmap page-in, and prefill has known costs left (2026-11-14)
 

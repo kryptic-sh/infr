@@ -93,8 +93,8 @@ pub(crate) const TEMPLATE_WIDTH_MAX: usize = 1024;
 pub(crate) const FORMAT_NUMBER_MAX: usize = 1 << 20;
 
 /// Build a minijinja `Environment` with the full infr jinja surface (pycompat, `raise_exception`,
-/// `strftime_now`, `tojson` as llama.cpp writes it), a [`CHAT_TEMPLATE_FUEL`] execution bound,
-/// and the given chat template compiled under `"chat"`.
+/// `strftime_now`, `tojson` as llama.cpp writes it, transformers' `generation` tag), a
+/// [`CHAT_TEMPLATE_FUEL`] execution bound, and the given chat template compiled under `"chat"`.
 fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinja::Error> {
     let mut env = minijinja::Environment::new();
     // Bound the render before anything else — see CHAT_TEMPLATE_FUEL for why an untrusted template
@@ -225,7 +225,10 @@ fn build_env(template: &str) -> Result<minijinja::Environment<'static>, minijinj
             minijinja::filters::slice(state, value, count, fill_with)
         },
     );
-    env.add_template_owned("chat", template.to_owned())?;
+    // Hugging Face's `{% generation %}` tag, which minijinja cannot register, as the `{% with %}`
+    // block that scopes its body the same way.
+    let template = crate::generation::rewrite_generation_tags(template)?;
+    env.add_template_owned("chat", template.into_owned())?;
     Ok(env)
 }
 

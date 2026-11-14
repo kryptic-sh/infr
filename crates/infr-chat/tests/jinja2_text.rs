@@ -81,11 +81,6 @@ const KNOWN_GAPS: &[(&str, Option<&str>)] = &[
         "{{ undefined_name is sequence }}|{{ ('a b'.split())[1:] is sequence }}|{{ range(2) is iterable }}",
         Some("True|False|True"),
     ),
-    // `{% generation %}`, transformers' tag: minijinja has no custom tags (B172).
-    (
-        "{% set x = 1 %}{% generation %}{% set x = 2 %}in={{ x }}{% endgeneration %} out={{ x }}",
-        None,
-    ),
     // minijinja's formatter applies a spec its own way: a bool under `,` stays a bool (Python
     // formats it as the integer), and a precision on an integer is accepted (Python refuses it).
     ("{{ '{:,}'.format(false) }}", Some("False")),

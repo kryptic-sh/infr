@@ -717,6 +717,9 @@ fn main() {
         // audit by name.
         ("linear_f32r", "linear_f32r", &[]),
         ("linear_f32r", "linear_f32r_mrow8", &["-DMROW=8"]),
+        // One row, vec4 K stream: the decode-hot router GEMV (ERNIE-4.5 2560→64, qwen3moe
+        // 2048→128) — see `Recorder::linear_f32_at`.
+        ("linear_f32r", "linear_f32r_v4", &["-DMROW=1", "-DVEC4"]),
         (
             "linear_f32r",
             "linear_f32r_mrow4_v4",

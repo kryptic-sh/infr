@@ -1078,14 +1078,49 @@ fn split_k_chunk_count_cap(span: usize, chunk: usize) -> usize {
 /// fixed-order reduce. Returns 1 (direct tile, no partials round-trip) for wide/filled shapes.
 /// Shared by the resident native-quant arm, the F16 split-K arm, and the streamed twin so their
 /// tile decisions can't drift.
-fn split_k_plan(m: usize, in_f: usize, out_f: usize) -> usize {
+///
+/// The window is `max(SPLIT_K_FIXED_GRID, SPLIT_K_FILL_PER_CU · compute_units)`: a CU count can
+/// only widen it, never shrink it below the fixed window every device ran before. Callers pass
+/// [`split_k_compute_units`], which is 0 (the fixed window) wherever the scaling is unmeasured.
+fn split_k_plan(m: usize, in_f: usize, out_f: usize, compute_units: u32) -> usize {
     let narrow_grid = m.div_ceil(64) * (out_f / 128).max(1);
-    if out_f.is_multiple_of(128) && in_f >= 1024 && narrow_grid < 128 {
-        (256 / narrow_grid).next_power_of_two().clamp(1, 8)
+    let below = SPLIT_K_FIXED_GRID.max(SPLIT_K_FILL_PER_CU * compute_units as usize);
+    if out_f.is_multiple_of(128) && in_f >= 1024 && narrow_grid < below {
+        (2 * below / narrow_grid).next_power_of_two().clamp(1, 8)
     } else {
         1
     }
 }
+
+/// The compute-unit count [`split_k_plan`] scales its window by: the device's on the AMD
+/// proprietary driver, the only driver the scaled window was measured on, and 0 (the fixed
+/// window) on every other driver — RADV (where the fixed window was tuned), NVIDIA, Intel —
+/// until someone measures them (docs/backlog.md B-NVSHAPE-CORECOUNT says what to run).
+fn split_k_compute_units(be_: &VulkanBackend) -> u32 {
+    split_k_cu_for_driver(be_.amd_proprietary_driver(), be_.caps().compute_units)
+}
+
+/// [`split_k_compute_units`]'s rule, pure for its unit test.
+fn split_k_cu_for_driver(amd_proprietary: bool, compute_units: u32) -> u32 {
+    if amd_proprietary {
+        compute_units
+    } else {
+        0
+    }
+}
+
+/// [`split_k_plan`]'s window floor: split a GEMM whose plain tile grid is below this many
+/// workgroups, aiming at twice it — the whole window when the CU count is 0 or small.
+const SPLIT_K_FIXED_GRID: usize = 128;
+
+/// [`split_k_plan`]'s window per compute unit: split a GEMM whose plain tile grid is below this
+/// many workgroups per CU, aiming at twice it. Measured on the RX 7900 XTX (96 CUs, AMD Windows
+/// driver) with `INFR_PROF_OPS` at pp512, plain tile vs split: Qwen3-30B-A3B `attn_output`
+/// (k=4096, n=2048, 128 wgs) 458 → 302 us, SmolLM3-3B `ffn_down` (k=11008, n=2048) 1392 → 962
+/// us; the fixed 128-wg window left those shapes on the plain tile. 4 and 5.3 per CU measured
+/// alike; 2.7 per CU slowed ERNIE-4.5's k=2560 n=3072 projection (349 → 404 us, two splits)
+/// where 4 per CU picks four (354 us). Below 32 CUs the fixed floor is the larger term.
+const SPLIT_K_FILL_PER_CU: usize = 4;
 
 /// The coopmat-warp prefill GEMM tile selection shared by the resident native-dense `Op::Linear`
 /// arm and its arena-addressed streamed twin (`streamed_prefill_gemm`): the A_GLOBAL f16-A cast,
@@ -1134,7 +1169,7 @@ fn native_warp_gemm(
     } else {
         None
     };
-    let splits = split_k_plan(m, in_f, out_f);
+    let splits = split_k_plan(m, in_f, out_f, split_k_compute_units(be_));
     if splits > 1 && k64 && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some() {
         let mpad = m.div_ceil(64) * 64;
         let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
@@ -2002,15 +2037,15 @@ fn lower_op(
                         // `gemm_proj` BN=64 tile below (28% of the whole denoise step) vs llama.cpp's
                         // 14.1ms @ 27 TFLOPS for the IDENTICAL shape — the single biggest
                         // infr-vs-fork per-stage delta. Same narrow-grid split-K policy as the
-                        // native-quant branch above (out_f%128, deep k, grid < 128 wgs); the F16
-                        // decode is exact (see native_decode.glsl FMT_F16), so numerics match the
+                        // native-quant branch above (out_f%128, deep k, grid under
+                        // `split_k_plan`'s window); the F16 decode is exact (see native_decode.glsl FMT_F16), so numerics match the
                         // f16 coopmat route up to accumulation order. Everything that doesn't hit
                         // the split-K window keeps the `matmul_proj` route unchanged.
                         // Same splits policy as the quant branch above (`split_k_plan`). Probed deeper
                         // splits at the SC shape (splits=4/8/16 via a temporary env override): the op
                         // shaved 30.0 -> 25.8-28.4ms but dg-step stayed flat (1100-1107, within noise),
                         // so the shared formula stays — no bespoke tuning knob.
-                        let splits = split_k_plan(m, in_f, out_f);
+                        let splits = split_k_plan(m, in_f, out_f, split_k_compute_units(be_));
                         if matches!(dt, infr_core::DType::F16)
                             && splits > 1
                             && in_f.is_multiple_of(64)
@@ -5764,7 +5799,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // and run back-to-back on the queue, so the GPU sees the same uninterrupted stream of work —
     // only the watchdog's view changes, from one long job to several short ones.
     let cap = be_.submit_dispatch_cap();
-    let t_forward = std::time::Instant::now();
+    let clock = be_.forward_clock();
     let mut submitted_dispatches = 0usize;
     /// In-flight segments allowed at once. Each one pins a command buffer plus its descriptor
     /// pools until the GPU is done reading them, and the devices that split are exactly the
@@ -5946,9 +5981,10 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         seg.wait().map_err(|e| be(e.to_string()))?;
     }
     pstream.drain()?;
-    // Feed this forward back into the splitter: `finish` waited the queue idle, so the elapsed
-    // time now covers every segment's GPU execution. See `VulkanBackend::observe_forward`.
-    be_.observe_forward(t_forward.elapsed(), submitted_dispatches);
+    // Feed this forward back into the splitter: `finish` waited the queue idle and every segment
+    // has been waited, so each one's GPU interval is in the clock's sum. See `ForwardClock` for
+    // why that, and not this forward's wall time, is what the watchdog bound is judged by.
+    clock.observe(be_, submitted_dispatches);
     Ok(())
 }
 
@@ -7514,8 +7550,58 @@ mod tests {
         }
     }
 
+    /// With the compute-unit count known, the window scales with it: on a 96-CU part the
+    /// 128-wg pp512 projections the fixed window left on the plain tile now split, and a filled
+    /// grid still does not.
+    #[test]
+    fn split_k_plan_scales_with_compute_units() {
+        // (m, in_f, out_f) → splits on 96 CUs: Qwen3-30B-A3B attn_output, SmolLM3 ffn_down,
+        // ERNIE-4.5 shared-expert up (192 wgs), and a filled 384-wg grid.
+        assert_eq!(split_k_plan(512, 4096, 2048, 96), 8);
+        assert_eq!(split_k_plan(512, 11008, 2048, 96), 8);
+        assert_eq!(split_k_plan(512, 2560, 3072, 96), 4);
+        assert_eq!(split_k_plan(512, 2048, 6144, 96), 1);
+        // The fixed window leaves the 128-wg shape whole.
+        assert_eq!(split_k_plan(512, 4096, 2048, 0), 1);
+    }
+
+    /// A small or unknown CU count never narrows the window below the fixed one: every shape
+    /// splits exactly as the fixed window splits it (the 2-CU iGPU and the unknown-count case
+    /// behave as before the count was used).
+    #[test]
+    fn split_k_plan_small_or_unknown_cu_is_the_fixed_window() {
+        for cu in [0u32, 1, 2, 16, 31, 32] {
+            for &m in &[1usize, 16, 64, 256, 512, 1024] {
+                for &(in_f, out_f) in &[(4096usize, 2048usize), (2048, 512), (262144, 2816)] {
+                    assert_eq!(
+                        split_k_plan(m, in_f, out_f, cu),
+                        split_k_plan(m, in_f, out_f, 0),
+                        "cu={cu} m={m} in_f={in_f} out_f={out_f}"
+                    );
+                }
+            }
+        }
+        // The DiffusionGemma soft-embedding shape (m=256, k=262144, n=2816 → 88 wgs) keeps its
+        // split on 2 CUs — a narrower window would drop it to the slow `matmul_proj` tile.
+        assert_eq!(split_k_plan(256, 262144, 2816, 2), 2);
+    }
+
+    /// Only the measured driver gets the scaled window; every other driver reports 0 (the fixed
+    /// window) whatever its CU count.
+    #[test]
+    fn split_k_scaling_is_limited_to_the_measured_driver() {
+        assert_eq!(split_k_cu_for_driver(true, 96), 96);
+        assert_eq!(split_k_cu_for_driver(false, 96), 0);
+        assert_eq!(
+            split_k_plan(512, 4096, 2048, split_k_cu_for_driver(false, 96)),
+            1,
+            "an unmeasured driver must keep the fixed window"
+        );
+    }
+
     /// #6: the extracted `split_k_plan` must reproduce the copy-pasted narrow-grid/splits formula
-    /// exactly (it fed the resident native-quant arm, the F16 split-K arm, and the streamed twin).
+    /// exactly (it fed the resident native-quant arm, the F16 split-K arm, and the streamed twin)
+    /// when the compute-unit count is unknown.
     #[test]
     fn split_k_plan_matches_inline_formula() {
         let inline = |m: usize, in_f: usize, out_f: usize| -> usize {
@@ -7530,7 +7616,7 @@ mod tests {
             for &in_f in &[256usize, 512, 1024, 2048, 4096, 6144, 262144] {
                 for &out_f in &[128usize, 256, 512, 1024, 1152, 2048, 2816, 4096, 6144, 8192] {
                     assert_eq!(
-                        split_k_plan(m, in_f, out_f),
+                        split_k_plan(m, in_f, out_f, 0),
                         inline(m, in_f, out_f),
                         "split_k_plan mismatch at m={m} in_f={in_f} out_f={out_f}"
                     );

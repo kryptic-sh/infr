@@ -408,6 +408,25 @@ struct VulkanShared {
     /// from measurement after every forward (`infr_core::submit_cap_from_measurement`), so the
     /// bound tracks whatever the device actually is rather than a table of magic numbers.
     submit_dispatch_cap: AtomicUsize,
+    /// `device.submit_dispatches = 0` (`INFR_SUBMIT_DISPATCHES=0`) was configured: the splitter
+    /// is OFF for the life of the backend, and `observe_forward` never arms it. The variable's
+    /// documented meaning ("0 = never split — the kill switch if this ever misjudges a device");
+    /// before this flag a configured 0 only seeded the cap and the first slow forward re-armed it.
+    submit_split_disabled: bool,
+    /// Nanoseconds per timestamp tick for the per-SEGMENT GPU timing every non-persistent
+    /// [`Recorder`] writes (a timestamp before its first command and after its last), or `None`
+    /// when the compute queue family reports no timestamp bits. See [`ForwardClock`].
+    segment_ts_period: Option<f32>,
+    /// Sum of every completed segment's GPU interval (ns), added by `Recorder::finish` and
+    /// `PendingSegment::wait`. [`ForwardClock`] diffs it around a forward.
+    segment_gpu_ns: AtomicU64,
+    /// Completed segments that carried no GPU interval (no timestamp support). A forward with any
+    /// such segment is judged by its wall time instead — see [`ForwardClock::observe`].
+    untimed_segments: AtomicU64,
+    /// The device runs the AMD proprietary driver (`driverID == AMD_PROPRIETARY`, the AMD Windows
+    /// driver this box runs) — the one driver the CU-scaled split-K window was measured on. See
+    /// `adapter::split_k_compute_units`.
+    amd_proprietary_driver: bool,
     /// UNIFIED-MEMORY parts only (`None` on every discrete GPU): the host-visible memory type on
     /// the non-device-local heap that `GpuOnly` allocations SPILL into once the device-local heap
     /// is full. See [`probe_uma_overflow_type`] for why counting that heap in the budget is not
@@ -1679,6 +1698,15 @@ impl VulkanBackend {
             .position(|p| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
             .map(|i| i as u32)
             .ok_or_else(|| be("no compute queue family found"))?;
+        // Per-segment GPU timing for the submit splitter (`ForwardClock`): usable only when the
+        // chosen queue family writes timestamps at all.
+        let segment_ts_period = (qf_props[queue_family_index as usize].timestamp_valid_bits > 0)
+            .then(|| {
+                unsafe { instance.get_physical_device_properties(physical_device) }
+                    .limits
+                    .timestamp_period
+            })
+            .filter(|p| *p > 0.0);
 
         // ── probe device extensions ────────────────────────────────────────────
         let avail_exts = unsafe { instance.enumerate_device_extension_properties(physical_device) }
@@ -2500,6 +2528,8 @@ impl VulkanBackend {
         // split) — the kill switch if this ever misjudges a device. A non-numeric value is still
         // rejected loudly, now by the env layer, with the SAME text
         // (`ConfigError::Env` renders as `INFR_SUBMIT_DISPATCHES: expected a dispatch count …`).
+        // A configured 0 is the kill switch: never split, and never let a measurement arm it.
+        let submit_split_disabled = cfg.device.submit_dispatches == Some(0);
         let submit_dispatch_cap = cfg
             .device
             .submit_dispatches
@@ -2636,6 +2666,12 @@ impl VulkanBackend {
                 act_peak: AtomicU64::new(0),
                 decode_recordings: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
+                submit_split_disabled,
+                segment_ts_period,
+                amd_proprietary_driver: device_probe.driver_id_reported
+                    && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY,
+                segment_gpu_ns: AtomicU64::new(0),
+                untimed_segments: AtomicU64::new(0),
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
@@ -2854,50 +2890,49 @@ impl VulkanBackend {
         self.shared.submit_dispatch_cap.load(Ordering::Relaxed)
     }
 
-    /// Feed a completed forward's measurement back into the submit splitter: `elapsed` of wall
-    /// across `dispatches` dispatches, measured with the queue drained at both ends. Re-tunes the
-    /// cap so the NEXT forward's segments land inside `infr_core::SUBMIT_BUDGET_NS` on whatever
-    /// device this actually is — the loop that makes the splitter hardware-agnostic instead of a
-    /// table of per-GPU constants.
+    /// Whether this device runs the AMD proprietary driver (see the shared field's doc).
+    pub(crate) fn amd_proprietary_driver(&self) -> bool {
+        self.shared.amd_proprietary_driver
+    }
+
+    /// Start timing one forward for the submit splitter — see [`ForwardClock`].
+    pub(crate) fn forward_clock(&self) -> ForwardClock {
+        ForwardClock {
+            wall: std::time::Instant::now(),
+            gpu_ns: self.shared.segment_gpu_ns.load(Ordering::Relaxed),
+            untimed: self.shared.untimed_segments.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Feed a completed forward's measurement back into the submit splitter: `busy_ns` of GPU
+    /// time across `dispatches` dispatches (see [`ForwardClock::observe`] for where that number
+    /// comes from). Re-tunes the cap so the NEXT forward's segments land inside
+    /// `infr_core::SUBMIT_BUDGET_NS` on whatever device this actually is — the loop that makes the
+    /// splitter hardware-agnostic instead of a table of per-GPU constants.
     ///
-    /// The cap only ever RATCHETS DOWN within a process. A forward's wall time is a noisy sample
-    /// (a cold pipeline compile, a busy host, a first-touch page fault all inflate it), and the
+    /// The cap only ever RATCHETS DOWN within a process. A forward's time is a noisy sample (a
+    /// cold pipeline compile, a busy host, a first-touch page fault all inflate it), and the
     /// asymmetry of the two mistakes is total: too small a cap costs a few extra submits, too
     /// large a cap costs a device-lost. So a slow sample tightens the bound and a fast one is
     /// simply ignored.
-    pub(crate) fn observe_forward(&self, elapsed: std::time::Duration, dispatches: usize) {
-        let ns = elapsed.as_nanos() as u64;
+    pub(crate) fn observe_forward(&self, busy_ns: u64, dispatches: usize) {
         let cur = self.submit_dispatch_cap();
-        // A device that has never split (every discrete GPU) only starts splitting if a forward
-        // actually lands in watchdog territory — see `infr_core::SUBMIT_DANGER_NS`. Without this,
-        // the measured cap (finite, just very large) would eventually split a big enough graph on
-        // a perfectly healthy dGPU, which is a tuned path this has no business touching.
-        if cur == 0 && ns < infr_core::SUBMIT_DANGER_NS {
-            return;
-        }
-        let want = infr_core::submit_cap_from_measurement(ns, dispatches);
-        if want == 0 {
-            return; // measurement says "no split needed"; never loosen an existing cap on it
-        }
-        let next = if cur == 0 { want } else { cur.min(want) };
+        let next = next_submit_cap(cur, busy_ns, dispatches, self.shared.submit_split_disabled);
         if next != cur {
             self.shared
                 .submit_dispatch_cap
                 .store(next, Ordering::Relaxed);
             // SAY IT OUT LOUD when a never-split device starts splitting. This transition is
-            // latched (the cap only ratchets down) and it is decided by ONE wall-clock sample, so
-            // a slow first forward — a cold pipeline build, a loaded host — permanently changes
-            // the submit structure of every later forward in the process. Two runs of the same
-            // command can therefore differ in submit count while dispatching byte-identical
-            // kernels, which is invisible in `INFR_PROF_OPS` and looks exactly like unexplained
-            // benchmark variance. `infr bench` reports the final cap for the same reason.
+            // latched (the cap only ratchets down) and it is decided by ONE sample, so a slow
+            // forward permanently changes the submit structure of every later forward in the
+            // process. Two runs of the same command can therefore differ in submit count while
+            // dispatching byte-identical kernels, which is invisible in `INFR_PROF_OPS` and looks
+            // exactly like unexplained benchmark variance. `infr bench` reports the final cap for
+            // the same reason.
             if cur == 0 {
                 tracing::warn!(
-                    "[infr] submit splitter ARMED: a forward took {:.0} ms over {dispatches} \
-                     dispatches (past the {} ms danger threshold), so forwards now split every \
-                     {next} dispatches for the rest of this process. Set \
-                     INFR_SUBMIT_DISPATCHES=0 to disable.",
-                    ns as f64 / 1e6,
+                    "[infr] submit splitter ARMED: a forward kept the GPU busy {:.0} ms over                      {dispatches} dispatches (past the {} ms danger threshold), so forwards now                      split every {next} dispatches for the rest of this process. Set                      INFR_SUBMIT_DISPATCHES=0 to disable.",
+                    busy_ns as f64 / 1e6,
                     infr_core::SUBMIT_DANGER_NS / 1_000_000,
                 );
             }
@@ -4598,6 +4633,73 @@ pub(crate) fn test_config() -> Config {
     cfg
 }
 
+/// The submit splitter's cap after one forward: `cur` is the cap now, `busy_ns` the forward's
+/// GPU-busy time across `dispatches` dispatches, `disabled` the configured kill switch
+/// (`INFR_SUBMIT_DISPATCHES=0`). Pure, so the arming rule is testable without a GPU.
+///
+/// A never-split device (`cur == 0`, every discrete GPU) arms only on a forward that kept the GPU
+/// busy past `infr_core::SUBMIT_DANGER_NS`; a splitting device only ever tightens.
+fn next_submit_cap(cur: usize, busy_ns: u64, dispatches: usize, disabled: bool) -> usize {
+    if disabled {
+        return 0;
+    }
+    // A device that has never split (every discrete GPU) only starts splitting if a forward
+    // actually lands in watchdog territory — see `infr_core::SUBMIT_DANGER_NS`. Without this,
+    // the measured cap (finite, just very large) would eventually split a big enough graph on
+    // a perfectly healthy dGPU, which is a tuned path this has no business touching.
+    if cur == 0 && busy_ns < infr_core::SUBMIT_DANGER_NS {
+        return 0;
+    }
+    let want = infr_core::submit_cap_from_measurement(busy_ns, dispatches);
+    if want == 0 {
+        return cur; // measurement says "no split needed"; never loosen an existing cap on it
+    }
+    if cur == 0 {
+        want
+    } else {
+        cur.min(want)
+    }
+}
+
+/// One forward's timing for the submit splitter, started by [`VulkanBackend::forward_clock`] and
+/// fed back by [`Self::observe`].
+///
+/// WHAT IT JUDGES: GPU time, not wall time. The splitter exists to keep each SUBMIT under the
+/// driver's / OS's GPU hang timeout, which counts the time a command buffer runs on the GPU. A
+/// forward's wall time also holds host work the GPU never sees — on a paged model's cold first
+/// forward that is seconds of weight page-in (ERNIE-4.5-21B-A3B with `paging.cache=4g`: 8 s of
+/// wall over 75 dispatches on an RX 7900 XTX), which used to arm the splitter on a discrete GPU
+/// for the rest of the process and cut every later forward into 16-dispatch submits. Every
+/// non-persistent [`Recorder`] stamps its command buffer's start and end, the completed segments'
+/// intervals are summed on the backend, and this diffs that sum around the forward.
+///
+/// A segment without timestamps (a queue family that writes none) makes the whole forward fall
+/// back to its wall time: over-counting can only split more, which is the safe direction.
+pub(crate) struct ForwardClock {
+    wall: std::time::Instant,
+    gpu_ns: u64,
+    untimed: u64,
+}
+
+impl ForwardClock {
+    /// The time this forward is judged by: its summed GPU segment time, or its wall time when any
+    /// of its segments went untimed.
+    fn busy_ns(&self, be_: &VulkanBackend) -> u64 {
+        let untimed = be_.shared.untimed_segments.load(Ordering::Relaxed) - self.untimed;
+        if untimed > 0 {
+            self.wall.elapsed().as_nanos() as u64
+        } else {
+            be_.shared.segment_gpu_ns.load(Ordering::Relaxed) - self.gpu_ns
+        }
+    }
+
+    /// Feed this forward (`dispatches` across all its segments, every one of them completed) to
+    /// [`VulkanBackend::observe_forward`].
+    pub(crate) fn observe(self, be_: &VulkanBackend, dispatches: usize) {
+        be_.observe_forward(self.busy_ns(be_), dispatches);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5022,6 +5124,103 @@ mod tests {
 
     /// `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides the measured initial submit
     /// cap, `0` meaning "never split"; unset keeps `initial_submit_dispatch_cap(integrated)`.
+    /// A configured 0 is also a kill switch: a forward that would arm the splitter does not.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_submit_dispatches_zero_is_never_armed() {
+        let mut cfg = test_config();
+        cfg.device.submit_dispatches = Some(0);
+        let be = VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with");
+        be.observe_forward(3 * infr_core::SUBMIT_DANGER_NS, 750);
+        assert_eq!(
+            be.submit_dispatch_cap(),
+            0,
+            "INFR_SUBMIT_DISPATCHES=0 re-armed"
+        );
+    }
+
+    /// The arming rule over GPU-busy time: a never-split device arms only past the danger
+    /// threshold, a splitting device only tightens, and the kill switch wins over both.
+    #[test]
+    fn next_submit_cap_arms_only_on_long_gpu_forwards() {
+        let danger = infr_core::SUBMIT_DANGER_NS;
+        // A healthy discrete forward stays unsplit.
+        assert_eq!(next_submit_cap(0, 40_000_000, 750, false), 0);
+        // A forward that kept the GPU busy past the threshold arms, at the measured cap.
+        let armed = next_submit_cap(0, 3 * danger, 750, false);
+        assert_eq!(
+            armed,
+            infr_core::submit_cap_from_measurement(3 * danger, 750)
+        );
+        assert!(armed > 0 && armed < 750, "armed cap {armed}");
+        // An armed device never loosens on a fast sample, and tightens on a slower one.
+        assert_eq!(next_submit_cap(armed, 1_000_000, 750, false), armed);
+        assert!(next_submit_cap(armed, 30 * danger, 750, false) < armed);
+        // The kill switch.
+        assert_eq!(next_submit_cap(0, 3 * danger, 750, true), 0);
+    }
+
+    /// The splitter judges a forward by its GPU time: host time inside the forward — what a paged
+    /// model's cold page-in is — must not arm it. One "forward" of two segments with a host sleep
+    /// past the danger threshold between them, judged through the same `ForwardClock` that
+    /// `execute_static` uses; the cap must be exactly what it was (0 on a discrete GPU, the seeded
+    /// integrated cap otherwise). Judged by wall time instead, this arms (discrete) or tightens to
+    /// the 16-dispatch floor (integrated).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn host_time_in_a_forward_does_not_arm_the_splitter() {
+        let be = VulkanBackend::new_with(Arc::new(test_config())).expect("VulkanBackend::new_with");
+        let before = be.submit_dispatch_cap();
+        let buf = be.alloc(1 << 20, BufferUsage::Activations).unwrap();
+        let clock = be.forward_clock();
+        let rec = be.recorder().unwrap();
+        rec.zero(buf.as_ref(), 1 << 18);
+        let seg = rec.finish_nowait().unwrap();
+        std::thread::sleep(std::time::Duration::from_nanos(
+            infr_core::SUBMIT_DANGER_NS + 200_000_000,
+        ));
+        seg.wait().unwrap();
+        let rec = be.recorder().unwrap();
+        rec.seed_barrier();
+        rec.zero(buf.as_ref(), 1 << 18);
+        rec.finish().unwrap();
+        let busy = clock.busy_ns(&be);
+        assert!(
+            busy < infr_core::SUBMIT_DANGER_NS / 10,
+            "judged {busy} ns for two tiny segments"
+        );
+        clock.observe(&be, 2);
+        assert_eq!(
+            be.submit_dispatch_cap(),
+            before,
+            "host time in the forward moved the submit cap"
+        );
+    }
+
+    /// The segment clock measures GPU work: a forward of real dispatches reports a non-zero GPU
+    /// time no larger than its wall time (on a device whose queue writes timestamps — every device
+    /// this runs on; an untimed device would fall back to wall time, which this also bounds).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn forward_clock_measures_gpu_time() {
+        let be = VulkanBackend::new_with(Arc::new(test_config())).expect("VulkanBackend::new_with");
+        let buf = be.alloc(64 << 20, BufferUsage::Activations).unwrap();
+        let wall = std::time::Instant::now();
+        let clock = be.forward_clock();
+        let rec = be.recorder().unwrap();
+        for _ in 0..8 {
+            rec.zero(buf.as_ref(), 16 << 20);
+        }
+        rec.finish().unwrap();
+        let busy = clock.busy_ns(&be);
+        let wall_ns = wall.elapsed().as_nanos() as u64;
+        assert!(busy > 0, "no GPU time measured");
+        assert!(
+            busy <= wall_ns,
+            "GPU time {busy} ns exceeds wall {wall_ns} ns"
+        );
+    }
+
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_submit_dispatches_overrides_the_splitter_cap() {

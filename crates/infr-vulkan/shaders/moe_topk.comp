@@ -18,7 +18,7 @@
 //     masked to -inf (matching llama.cpp `build_moe_ffn`).
 //
 // When neither extension is active (has_bias==0 && n_expert_groups<=1), the arithmetic is that of
-// the pre-extension kernel — the thread-0 pre-phase sets `ssel_adj` to all zeros, every lane adds
+// the pre-extension kernel — the lanes stage `ssel_adj` as all zeros, every lane adds
 // zero to its local scores, and softmax selection still ranks raw logits (`sel_by_prob` is
 // false).
 //
@@ -32,6 +32,8 @@
 //
 // General `n_expert`: each lane owns `ceil(n_expert / 128)` experts (lane `t` owns `t, t+128,
 // t+256, ...`, up to MAX_CHUNKS). Out-of-range/absent slots load the -1e30 sentinel.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 layout(push_constant) uniform PC {
     uint n_expert;
@@ -52,6 +54,8 @@ layout(binding = 2) readonly buffer HB { uint hash_ids[]; }; // tid2eid gather, 
 layout(binding = 3) buffer IB { uint ids[]; };
 layout(binding = 4) writeonly buffer WB { float wts[]; };
 
+// Per-SUBGROUP candidates of one selection round (indexed by gl_SubgroupID; sized for the
+// smallest possible subgroup, one lane).
 shared float sval[128];
 shared uint sidx[128];
 
@@ -67,6 +71,14 @@ shared uint sidx[128];
 // compile-time constant tied to `local_size_x` above), so the two can never drift apart again —
 // B67 was exactly that drift, at 256 vs. the scan's headroom.
 shared float ssel_adj[gl_WorkGroupSize.x * MAX_CHUNKS];
+// The row's logits, staged by every lane before either routing path, and the selected ids in
+// slot order (written by lane 0 alongside `ids`): the thread-0 pre-phase and weight phase walk
+// these instead of issuing their serial loops as global loads — a dependent `ids` → `logits`
+// load chain per slot — on decode's critical path once per MoE layer. Same values in the same
+// order, so the arithmetic is unchanged. `ssel` holds `n_used` ≤ `n_expert` entries (the host
+// refuses more).
+shared float slog[gl_WorkGroupSize.x * MAX_CHUNKS];
+shared uint ssel[gl_WorkGroupSize.x * MAX_CHUNKS];
 
 // The full-row softmax shift and denominator over every expert's unbiased logit, for
 // `sel_score`'s softmax branch when `sel_by_prob()`. Thread 0 fills both in the pre-phase, before
@@ -136,6 +148,12 @@ void main() {
     uint lbase = tok * pc.n_expert;
     uint obase = tok * pc.n_used;
 
+    for (uint c = 0u; c < MAX_CHUNKS; c++) {
+        uint e = t + c * 128u;
+        if (e < pc.n_expert) { slog[e] = logits[lbase + e]; }
+    }
+    barrier(); // slog published
+
     // ── Hash-routed layer: copy the supplied selection in and jump straight to the weights ──
     // Lane 0 alone writes `ids`, exactly as the top-k path does, so the weight phase (also lane 0)
     // reads back its own writes and needs no cross-lane visibility. A lane-parallel copy would:
@@ -146,7 +164,9 @@ void main() {
             for (uint k = 0u; k < pc.n_used; k++) {
                 // Clamped for the same reason the top-k winner is: an out-of-range id would make
                 // the downstream id-indexed GEMV read past the expert bank and fault the GPU.
-                ids[obase + k] = min(hash_ids[obase + k], pc.n_expert - 1u);
+                uint id = min(hash_ids[obase + k], pc.n_expert - 1u);
+                ids[obase + k] = id;
+                ssel[k] = id;
             }
         }
     } else {
@@ -159,16 +179,18 @@ void main() {
 // constant, so the caller's branch is workgroup-uniform and the barriers below are reached by
 // every lane or by none.
 void select_topk(uint t, uint lbase, uint obase) {
-    // ── Load per-lane logits ──
+    // ── Per-lane logits; stage the bias (or zero) into shared ──
     float llog[MAX_CHUNKS];
     bool taken[MAX_CHUNKS];
     for (uint c = 0u; c < MAX_CHUNKS; c++) {
         uint e = t + c * 128u;
-        llog[c] = (e < pc.n_expert) ? logits[lbase + e] : -1e30;
+        llog[c] = (e < pc.n_expert) ? slog[e] : -1e30;
         taken[c] = false;
+        if (e < pc.n_expert) { ssel_adj[e] = (pc.has_bias != 0u) ? bias[e] : 0.0; }
     }
+    barrier(); // the bias part of ssel_adj published
 
-    // ── Thread 0: pre-fill ssel_adj = bias + group mask ──
+    // ── Thread 0: full-row softmax stats + group mask on top of the staged bias ──
     if (t == 0u) {
         bool do_adj = (pc.has_bias != 0u) || (pc.n_expert_groups > 1u && pc.n_expert_groups_used > 0u);
         if (do_adj) {
@@ -176,15 +198,11 @@ void select_topk(uint t, uint lbase, uint obase) {
                 // Full-row softmax over the UNBIASED logits, as the CPU computes `probs`: the
                 // max, then the ascending sum of shifted exps.
                 float mx = -1e30;
-                for (uint e = 0u; e < pc.n_expert; e++) { mx = max(mx, logits[lbase + e]); }
+                for (uint e = 0u; e < pc.n_expert; e++) { mx = max(mx, slog[e]); }
                 float sm = 0.0;
-                for (uint e = 0u; e < pc.n_expert; e++) { sm += exp(logits[lbase + e] - mx); }
+                for (uint e = 0u; e < pc.n_expert; e++) { sm += exp(slog[e] - mx); }
                 ssm_max = mx;
                 ssm_sum = sm;
-            }
-            // Start with bias (or zero).
-            for (uint e = 0u; e < pc.n_expert; e++) {
-                ssel_adj[e] = (pc.has_bias != 0u) ? bias[e] : 0.0;
             }
             // Group-limited routing.
             uint ng = pc.n_expert_groups;
@@ -197,7 +215,7 @@ void select_topk(uint t, uint lbase, uint obase) {
                     float b0 = -1e30, b1 = -1e30;
                     uint base = g * n_per;
                     for (uint e = base; e < base + n_per; e++) {
-                        float s = sel_score(logits[lbase + e]) + ssel_adj[e];
+                        float s = sel_score(slog[e]) + ssel_adj[e];
                         if (s > b0) { b1 = b0; b0 = s; }
                         else if (s > b1) { b1 = s; }
                     }
@@ -224,45 +242,55 @@ void select_topk(uint t, uint lbase, uint obase) {
                     }
                 }
             }
-        } else {
-            // No extensions: ssel_adj stays zero — the lane-level arithmetic below is unchanged.
-            for (uint e = 0u; e < pc.n_expert; e++) { ssel_adj[e] = 0.0; }
         }
+        // No extensions: the lanes staged zeros — the lane-level arithmetic below is unchanged.
     }
     barrier(); // ssel_adj published
 
     // ── Top-k selection (uses llog + ssel_adj) ──
+    // Each lane's selection scores are fixed across rounds; score them once.
+    float lsc[MAX_CHUNKS];
+    for (uint c = 0u; c < MAX_CHUNKS; c++) {
+        uint e = t + c * 128u;
+        lsc[c] = (e < pc.n_expert) ? (sel_score(llog[c]) + ssel_adj[e]) : -1e30;
+    }
     for (uint k = 0u; k < pc.n_used; k++) {
         float bv = -1e30;
         uint be = 0xFFFFFFFFu;
         for (uint c = 0u; c < MAX_CHUNKS; c++) {
             if (!taken[c]) {
                 uint e = t + c * 128u;
-                float s = (e < pc.n_expert) ? (sel_score(llog[c]) + ssel_adj[e]) : -1e30;
+                float s = lsc[c];
                 if (s > bv) { bv = s; be = e; }
             }
         }
-        sval[t] = bv;
-        sidx[t] = be;
-        barrier();
-        for (uint s = 64u; s > 0u; s /= 2u) {
-            if (t < s) {
-                bool better = sval[t + s] > sval[t]
-                    || (sval[t + s] == sval[t] && sidx[t + s] < sidx[t]);
-                if (better) {
-                    sval[t] = sval[t + s];
-                    sidx[t] = sidx[t + s];
-                }
-            }
-            barrier();
+        // Workgroup arg-max, (highest score, then lowest expert id): within each subgroup by
+        // subgroup ops, then across the few subgroups by every lane walking their candidates — two
+        // barriers per round instead of the log2(128)-step shared tree (a round per selected
+        // expert sits on decode's critical path once per MoE layer). Same winner as the tree:
+        // both are the lexicographic (max score, min id) over all lanes.
+        float sm = subgroupMax(bv);
+        uint si = subgroupMin(bv == sm ? be : 0xFFFFFFFFu);
+        if (subgroupElect()) {
+            sval[gl_SubgroupID] = sm;
+            sidx[gl_SubgroupID] = si;
         }
+        barrier();
+        float wv = sval[0];
         uint winner = sidx[0];
+        for (uint g = 1u; g < gl_NumSubgroups; g++) {
+            if (sval[g] > wv || (sval[g] == wv && sidx[g] < winner)) {
+                wv = sval[g];
+                winner = sidx[g];
+            }
+        }
         // Clamp to the valid expert range. NaN logits make every `>` comparison false, so the
         // selection can end on the 0xFFFFFFFF sentinel (or any out-of-range slot); the downstream
         // idm indexes weights by this id, and an OOB id reads past the weight buffer → GPU fault.
         winner = min(winner, pc.n_expert - 1u);
         if (t == 0u) {
             ids[obase + k] = winner;
+            ssel[k] = winner;
         }
         for (uint c = 0u; c < MAX_CHUNKS; c++) {
             if (t + c * 128u == winner) { taken[c] = true; }
@@ -288,17 +316,17 @@ void weights_of(uint t, uint lbase, uint obase) {
         // can exceed this max — so it computes its own shift; see B49.
         float mx = -1e30;
         for (uint k = 0u; k < pc.n_used; k++) {
-            float vl = logits[lbase + ids[obase + k]];
+            float vl = slog[ssel[k]];
             if (vl > mx) { mx = vl; }
         }
         if (pc.norm_w != 0u) {
             float wsum_sel = 0.0;
             for (uint k = 0u; k < pc.n_used; k++) {
-                wsum_sel += score_of(logits[lbase + ids[obase + k]], mx);
+                wsum_sel += score_of(slog[ssel[k]], mx);
             }
             wsum_sel = max(wsum_sel, 1e-20);
             for (uint k = 0u; k < pc.n_used; k++) {
-                wts[obase + k] = score_of(logits[lbase + ids[obase + k]], mx) / wsum_sel * pc.scale;
+                wts[obase + k] = score_of(slog[ssel[k]], mx) / wsum_sel * pc.scale;
             }
         } else if (pc.gating == 0u) {
             // Softmax over ALL experts, un-renormalized: the weight of a selected expert is its
@@ -321,20 +349,20 @@ void weights_of(uint t, uint lbase, uint obase) {
             // fixed and the broken kernel are indistinguishable there. See docs/backlog.md B49.
             float mx_all = -1e30;
             for (uint e = 0u; e < pc.n_expert; e++) {
-                float vl = logits[lbase + e];
+                float vl = slog[e];
                 if (vl > mx_all) { mx_all = vl; }
             }
             float full_sum = 0.0;
             for (uint e = 0u; e < pc.n_expert; e++) {
-                full_sum += exp(logits[lbase + e] - mx_all);
+                full_sum += exp(slog[e] - mx_all);
             }
             full_sum = max(full_sum, 1e-20);
             for (uint k = 0u; k < pc.n_used; k++) {
-                wts[obase + k] = exp(logits[lbase + ids[obase + k]] - mx_all) / full_sum * pc.scale;
+                wts[obase + k] = exp(slog[ssel[k]] - mx_all) / full_sum * pc.scale;
             }
         } else {
             for (uint k = 0u; k < pc.n_used; k++) {
-                wts[obase + k] = score_of(logits[lbase + ids[obase + k]], mx) * pc.scale;
+                wts[obase + k] = score_of(slog[ssel[k]], mx) * pc.scale;
             }
         }
     }

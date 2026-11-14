@@ -939,6 +939,14 @@ pub(crate) fn linear_f32r_mrow8_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// `-DSTREAMED` twin SPIR-V of `linear_f32r_v4` (one row, vec4 K stream; see the shader's
+/// `MROW && VEC4` arm).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_v4_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_v4.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// `-DSTREAMED` twin SPIR-V of `linear_f32r_mrow4_v4` (slice A4; see the shader's
 /// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

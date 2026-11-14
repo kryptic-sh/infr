@@ -930,6 +930,11 @@ pub struct Recorder<'a> {
     /// (`kind:mM:KxN`) instead of the bare kernel name. Read once at construction.
     op_shapes: bool,
     query_pool: vk::QueryPool,
+    /// Two timestamps bracketing this command buffer's GPU execution (index 0 written first,
+    /// index 1 by `finish`/`finish_nowait`), for the submit splitter's GPU-time measurement
+    /// (`crate::ForwardClock`). Null on a persistent recorder or when the queue writes no
+    /// timestamps; the completed segment then counts as untimed.
+    seg_query_pool: vk::QueryPool,
     ts_labels: RefCell<Vec<&'static str>>,
     /// Dispatches past the query-pool capacity: counted (and reported) instead of stamped.
     ts_dropped: std::cell::Cell<usize>,
@@ -1079,6 +1084,38 @@ impl<'a> Recorder<'a> {
         } else {
             vk::QueryPool::null()
         };
+        // BOTTOM_OF_PIPE on both stamps: a timestamp is written once every PREVIOUSLY SUBMITTED
+        // command has finished that stage, so stamp 0 lands when this segment can actually start
+        // (after the segment queued ahead of it), not while that one is still running — the
+        // per-segment intervals then tile the queue instead of overlapping.
+        let seg_query_pool = if !persistent && backend.shared.segment_ts_period.is_some() {
+            match unsafe {
+                device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2),
+                    None,
+                )
+            } {
+                Ok(qp) => {
+                    unsafe {
+                        device.cmd_reset_query_pool(cmd, qp, 0, 2);
+                        device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                            qp,
+                            0,
+                        );
+                    }
+                    qp
+                }
+                // Untimed is a supported state (the forward falls back to wall time), so a failed
+                // create degrades instead of failing the recording.
+                Err(_) => vk::QueryPool::null(),
+            }
+        } else {
+            vk::QueryPool::null()
+        };
 
         Ok(Self {
             be: backend,
@@ -1095,6 +1132,7 @@ impl<'a> Recorder<'a> {
             prof_ops,
             op_shapes,
             query_pool,
+            seg_query_pool,
             ts_labels: RefCell::new(Vec::new()),
             ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
@@ -1941,6 +1979,32 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Which `linear_f32r` build [`Self::linear_f32_at`] dispatches for `rows` × `in_f` — public
+    /// so the parity test can assert the shape it meant to cover actually reached that kernel.
+    ///
+    /// The two escapes govern different things: `INFR_NO_F32_MROW` (`f32_mrow`) turns off the
+    /// ROW-TILED builds (several rows per workgroup, `rows > 1`), `INFR_NO_F32_V4` (`f32_v4`) the
+    /// vec4 K stream. The one-row vec4 build has no row tiling, so only the vec4 escape reaches it.
+    /// It exists because the MoE router GEMV sits on decode's critical path once per layer and
+    /// launches only out_f workgroups (64 on ERNIE-4.5-21B-A3B), so it is latency-bound like the
+    /// small-m prefill shapes the vec4 tiles were made for: measured 12.0 → 4.5 us per call on the
+    /// RX 7900 XTX with `INFR_PROF_OPS`.
+    pub fn linear_f32_kernel(&self, rows: usize, in_f: usize) -> &'static str {
+        let v4 = in_f.is_multiple_of(4) && self.vk().f32_v4;
+        let mrow = rows > 1 && self.vk().f32_mrow;
+        if rows == 1 && v4 {
+            "linear_f32r_v4"
+        } else if mrow && v4 && rows <= 4 {
+            "linear_f32r_mrow4_v4"
+        } else if mrow && v4 {
+            "linear_f32r_mrow8_v4"
+        } else if mrow {
+            "linear_f32r_mrow8"
+        } else {
+            "linear_f32r"
+        }
+    }
+
     /// Arena-addressed body of [`Self::linear_f32`] — mirrors the eager dispatcher's mrow/vec4
     /// variant routing (same env escapes) so parity comparisons land on the same kernel.
     /// Production routes here through [`Self::linear_f32`] (the weight's own BDA address); parity
@@ -1955,32 +2019,22 @@ impl<'a> Recorder<'a> {
         out_f: usize,
     ) {
         self.label_gemv("lin_f32_streamed", rows, in_f, out_f);
-        let use_mrow = rows > 1 && self.vk().f32_mrow;
-        let use_v4 = use_mrow && in_f.is_multiple_of(4) && self.vk().f32_v4;
-        let (name, spv, groups) = if use_v4 && rows <= 4 {
-            (
-                "linear_f32r_mrow4_v4",
+        let name = self.linear_f32_kernel(rows, in_f);
+        let (spv, groups) = match name {
+            "linear_f32r_v4" => (crate::gemm::linear_f32r_v4_spv(), out_f as u32),
+            "linear_f32r_mrow4_v4" => (
                 crate::gemm::linear_f32r_mrow4_v4_spv(),
                 (out_f * rows.div_ceil(4)) as u32,
-            )
-        } else if use_v4 {
-            (
-                "linear_f32r_mrow8_v4",
+            ),
+            "linear_f32r_mrow8_v4" => (
                 crate::gemm::linear_f32r_mrow8_v4_spv(),
                 (out_f * rows.div_ceil(8)) as u32,
-            )
-        } else if use_mrow {
-            (
-                "linear_f32r_mrow8",
+            ),
+            "linear_f32r_mrow8" => (
                 crate::gemm::linear_f32r_mrow8_spv(),
                 (out_f * rows.div_ceil(8)) as u32,
-            )
-        } else {
-            (
-                "linear_f32r",
-                crate::gemm::linear_f32r_spv(),
-                (rows * out_f) as u32,
-            )
+            ),
+            _ => (crate::gemm::linear_f32r_spv(), (rows * out_f) as u32),
         };
         let k = self.be.kernel(name, spv, 3, 20);
         let mut push = [0u8; 20];
@@ -3049,7 +3103,9 @@ impl<'a> Recorder<'a> {
     /// Tiled Q6_K dp4a (mmq) GEMM for a stacked expert (the MoE down projection): `c = qa·W[w_base]ᵀ`
     /// using hardware int8 dot-product (activations pre-quantized via `quant_q8`; the per-block sum is
     /// unused — Q6_K is symmetric, no min). `c` is `ceil(m/64)*64` rows. Faster than the coopmat-f16
-    /// `matmul_native` for u6 weights. Requires `n%64`, `k%16`.
+    /// `matmul_native` for u6 weights. Requires `n%64`, and `k%256` so every weight row starts on a
+    /// Q6_K superblock (the shader addresses rows by whole 210-byte blocks); `assert_native_k`
+    /// enforces only `k%32`, which every Q6_K tensor's `k%256` satisfies.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_q6k(
         &self,
@@ -8728,6 +8784,12 @@ impl<'a> Recorder<'a> {
                  is sized for this many experts and would corrupt routing above it"
             )));
         }
+        if n_used > n_expert {
+            return Err(be(format!(
+                "moe_topk: n_used ({n_used}) exceeds n_expert ({n_expert}) — moe_topk.comp's \
+                 per-slot selection scratch holds at most n_expert ids"
+            )));
+        }
         // Group-limited routing engages at more than one group with at least one kept (the
         // shader's own test). It splits the experts into equal runs of `n_expert / groups`, so a
         // remainder would sit outside every group, and indexes per-group arrays of a fixed size.
@@ -9395,6 +9457,13 @@ impl<'a> Recorder<'a> {
         } else {
             desc.xp
         };
+        // INFR_PROF_OP_SHAPES: itemize the stage label by tile kernel and shape
+        // (`expert_down:native_gemm_mmq_q6k_xp:1536x2560`) — a model mixing down dtypes across
+        // layers otherwise lands every layer in one `expert_down` bucket.
+        if self.op_shapes {
+            self.next_label
+                .set(Some(intern_label(format!("{stage}:{name}:{k}x{n}"))));
+        }
         let nb = desc.resident_nb;
         let kern = self.be.kernel(name, spv, nb, 24);
         let mut push = [0u8; 24];
@@ -10201,6 +10270,9 @@ impl<'a> Recorder<'a> {
             if self.query_pool != vk::QueryPool::null() {
                 device.destroy_query_pool(self.query_pool, None);
             }
+            if self.seg_query_pool != vk::QueryPool::null() {
+                device.destroy_query_pool(self.seg_query_pool, None);
+            }
             let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
             device.free_command_buffers(cmd_pool, &[self.cmd]);
             for p in self.pools.borrow().iter() {
@@ -10228,6 +10300,7 @@ impl<'a> Recorder<'a> {
                 );
             }
         }
+        self.stamp_segment_end();
         let queue = self.be.shared.queue;
         // Each fallible step frees the transient objects before propagating — see `free_transient`.
         if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
@@ -10249,6 +10322,7 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("queue_wait_idle: {e}")));
         }
+        account_segment(&self.be.shared, self.seg_query_pool);
         if self.stages {
             eprintln!(
                 "[prof] record={:.1}ms submit+gpu={:.1}ms",
@@ -10307,10 +10381,12 @@ impl<'a> Recorder<'a> {
                 fence: None,
                 cmd: vk::CommandBuffer::null(),
                 pools: Vec::new(),
+                seg_query_pool: vk::QueryPool::null(),
                 dispatches,
             });
         }
         let device = &self.be.shared.device;
+        self.stamp_segment_end();
         // On SUCCESS the cmd buffer + pools are handed to the returned `PendingSegment` (freed in
         // its `wait`); on every ERROR exit we own them still and must free them here (`Recorder`
         // has no `Drop`) — see `free_transient`.
@@ -10342,8 +10418,24 @@ impl<'a> Recorder<'a> {
             fence: Some(fence),
             cmd: self.cmd,
             pools: self.pools.borrow().clone(),
+            seg_query_pool: self.seg_query_pool,
             dispatches,
         })
+    }
+
+    /// Write the segment's closing GPU timestamp (index 1 of `seg_query_pool`), the last command
+    /// before the command buffer ends. No-op on an untimed recorder.
+    fn stamp_segment_end(&self) {
+        if self.seg_query_pool != vk::QueryPool::null() {
+            unsafe {
+                self.be.shared.device.cmd_write_timestamp(
+                    self.cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.seg_query_pool,
+                    1,
+                );
+            }
+        }
     }
 
     /// Unconditional global compute+transfer barrier — the mandatory FIRST command of a recorder
@@ -10637,6 +10729,8 @@ pub struct PendingSegment {
     fence: Option<vk::Fence>,
     cmd: vk::CommandBuffer,
     pools: Vec<vk::DescriptorPool>,
+    /// The recorder's `seg_query_pool`, read and destroyed once the fence signals.
+    seg_query_pool: vk::QueryPool,
     /// Dispatches this segment carried — the submit splitter sums them across a forward to feed
     /// `VulkanBackend::observe_forward`.
     dispatches: usize,
@@ -10661,7 +10755,14 @@ impl PendingSegment {
         };
         let device = &self.shared.device;
         let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        if waited.is_ok() {
+            account_segment(&self.shared, self.seg_query_pool);
+        }
         unsafe {
+            if self.seg_query_pool != vk::QueryPool::null() {
+                device.destroy_query_pool(self.seg_query_pool, None);
+                self.seg_query_pool = vk::QueryPool::null();
+            }
             device.destroy_fence(fence, None);
             let cmd_pool = *self.shared.cmd_pool.lock().unwrap();
             device.free_command_buffers(cmd_pool, &[self.cmd]);
@@ -10670,6 +10771,38 @@ impl PendingSegment {
             }
         }
         waited.map_err(|e| be(format!("wait segment fence: {e}")))
+    }
+}
+
+/// Add one COMPLETED segment's GPU interval to the backend's running sum (or count it untimed) —
+/// the input `crate::ForwardClock` judges a forward by. `qp` is that segment's two-stamp pool,
+/// null when it was recorded untimed; it is only read here, never destroyed.
+fn account_segment(shared: &crate::VulkanShared, qp: vk::QueryPool) {
+    use std::sync::atomic::Ordering;
+    let Some(period) = shared
+        .segment_ts_period
+        .filter(|_| qp != vk::QueryPool::null())
+    else {
+        shared.untimed_segments.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let mut ticks = [0u64; 2];
+    let read = unsafe {
+        shared.device.get_query_pool_results(
+            qp,
+            0,
+            &mut ticks,
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+        )
+    };
+    match read {
+        Ok(()) => {
+            let ns = (ticks[1].wrapping_sub(ticks[0]) as f64 * period as f64) as u64;
+            shared.segment_gpu_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+        Err(_) => {
+            shared.untimed_segments.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -14045,6 +14178,96 @@ mod tests {
             (wts[1] - 1.0).abs() < 1e-6,
             "expected ~1 for the high-logit pick: {wts:?}"
         );
+    }
+
+    /// `moe_topk`'s workgroup arg-max must pick (highest score, then LOWEST expert id) in slot
+    /// order — the order the host router and the CPU interpreter use — whichever lane, chunk and
+    /// subgroup the candidates live in. 160 experts put each lane on two chunks (`t`, `t+128`),
+    /// and the tied maxima sit in different subgroups at every subgroup size the device may pick
+    /// (ids 3, 70, 130 tie; 40 and 100 tie one step lower), so a reduction that drops the id
+    /// tie-break, or keeps only one subgroup's candidate, picks a different id or order. A second
+    /// row runs the biased-softmax selection (ERNIE 4.5's `sel_by_prob` path) on well-separated
+    /// scores, with the weights checked against the renormalized softmax.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn moe_topk_selects_by_score_then_lowest_id() {
+        let be = be_with(|_| {});
+        let (n_expert, n_used) = (160usize, 6usize);
+        let run = |logits: &[f32], bias: &[f32], has_bias: bool| -> (Vec<u32>, Vec<f32>) {
+            let blog = upf32(&be, logits);
+            let bbias = upf32(&be, bias);
+            let bids = be.alloc(n_used * 4, BufferUsage::Readback).unwrap();
+            let bwts = be.alloc(n_used * 4, BufferUsage::Readback).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.moe_topk(
+                blog.as_ref(),
+                bids.as_ref(),
+                bwts.as_ref(),
+                bbias.as_ref(),
+                1,
+                n_expert,
+                n_used,
+                1.0,
+                0, // softmax
+                true,
+                has_bias,
+                0,
+                0,
+                bbias.as_ref(),
+                false,
+            )
+            .unwrap();
+            rec.finish().unwrap();
+            let mut idb = vec![0u8; n_used * 4];
+            be.download(bids.as_ref(), &mut idb).unwrap();
+            let mut wb = vec![0u8; n_used * 4];
+            be.download(bwts.as_ref(), &mut wb).unwrap();
+            (
+                bytemuck::cast_slice::<u8, u32>(&idb).to_vec(),
+                bytemuck::cast_slice::<u8, f32>(&wb).to_vec(),
+            )
+        };
+
+        // Ties on raw logits (no bias: softmax selection ranks the logits themselves).
+        let mut logits: Vec<f32> = (0..n_expert).map(|e| (e as f32 * 0.37).sin()).collect();
+        for e in [3usize, 70, 130] {
+            logits[e] = 5.0;
+        }
+        for e in [100usize, 40] {
+            logits[e] = 4.0;
+        }
+        logits[159] = 3.0;
+        let (ids, wts) = run(&logits, &vec![0.0; n_expert], false);
+        assert_eq!(ids, [3, 70, 130, 40, 100, 159], "tie order: {ids:?}");
+        let ex: Vec<f32> = ids
+            .iter()
+            .map(|&e| (logits[e as usize] - 5.0).exp())
+            .collect();
+        let sum: f32 = ex.iter().sum();
+        for (w, e) in wts.iter().zip(&ex) {
+            assert!((w - e / sum).abs() < 1e-6, "weights {wts:?}");
+        }
+
+        // Biased softmax (ERNIE 4.5): the bias reorders the selection, the weights stay unbiased.
+        let logits: Vec<f32> = (0..n_expert).map(|e| (e as f32 * 0.21).cos()).collect();
+        let mut bias = vec![0.0f32; n_expert];
+        for (rank, e) in [150usize, 7, 128, 64, 1, 99].into_iter().enumerate() {
+            bias[e] = 10.0 - rank as f32;
+        }
+        let (ids, wts) = run(&logits, &bias, true);
+        assert_eq!(ids, [150, 7, 128, 64, 1, 99], "biased order: {ids:?}");
+        let mx = ids
+            .iter()
+            .map(|&e| logits[e as usize])
+            .fold(f32::MIN, f32::max);
+        let ex: Vec<f32> = ids
+            .iter()
+            .map(|&e| (logits[e as usize] - mx).exp())
+            .collect();
+        let sum: f32 = ex.iter().sum();
+        for (w, e) in wts.iter().zip(&ex) {
+            assert!((w - e / sum).abs() < 1e-6, "biased weights {wts:?}");
+        }
     }
 
     /// First run of digits after `marker` — `128` from `layout(local_size_x = 128,`, `8` from

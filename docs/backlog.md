@@ -1736,11 +1736,11 @@ only `coopMatPerElementNV`, not flexible dimensions / tensor addressing / block
 loads, so the full gate would make it skip on hardware where its own experiment
 would run.
 
-### B-NVSHAPE-CORECOUNT — the shader-core count now exists on every vendor; nothing occupancy-driven consumes it (2026-08-11)
+### B-NVSHAPE-CORECOUNT — the shader-core count exists on every vendor; of the occupancy constants, only the prefill GEMM split-K uses it (2026-08-11)
 
 **Tag:** vulkan · nvidia · intel · **Blocked on:** NVIDIA/Intel hardware to
-validate; a decision on whether the split-K constants should be device-derived
-at all
+validate; a RADV re-measure of the GEMM split-K window; per-site measurements
+for the attention split-K constants
 
 `caps::shader_core_count` now sources the count the way llama.cpp does —
 `VK_NV_shader_sm_builtins`' `shaderSMCount` on NVIDIA,
@@ -1756,40 +1756,44 @@ did through the v1 product (RX 7900 XTX 96, Raphael iGPU 2), so preferring v2 is
 a no-op here. **The NVIDIA and Intel branches have never executed** — no such
 part exists on this machine.
 
-**Consequence nobody has watched run:** the only consumer is
-`infr_core::integrated_ubatch_rows` via `infr_llama::seam::default_ubatch_rows`,
-which scales the integrated prefill chunk from the count. An Intel iGPU in the
-table (0xB080, Panther Lake Xe3 LPG, 12) previously got 0 → the 128-row floor
-and would now get 768 rows. That is what the scaling function means, but it is a
-6x larger per-submit chunk on a watchdog-sensitive part, unvalidated. If an
-Intel iGPU ever hangs in prefill, this is the first thing to look at;
-`INFR_UBATCH` overrides it.
+**Consequence nobody has watched run:** besides `split_k_plan` (below), the
+consumer is `infr_core::integrated_ubatch_rows` via
+`infr_llama::seam::default_ubatch_rows`, which scales the integrated prefill
+chunk from the count. An Intel iGPU in the table (0xB080, Panther Lake Xe3
+LPG, 12) previously got 0 → the 128-row floor and would now get 768 rows. That
+is what the scaling function means, but it is a 6x larger per-submit chunk on a
+watchdog-sensitive part, unvalidated. If an Intel iGPU ever hangs in prefill,
+this is the first thing to look at; `INFR_UBATCH` overrides it.
 
-**Deliberately NOT wired into split-K or tile selection.** The audit that
-produced this entry left `infr`'s split-K selection untraced; it has now been
-traced, and the answer is that a core count does not obviously improve it:
+**Wired into ONE split-K site since (2026-11-14): `split_k_plan`, on ONE
+driver.** The prefill GEMM's narrow-grid split-K window is now
+`max(SPLIT_K_FIXED_GRID, SPLIT_K_FILL_PER_CU · CUs)` (128, and 4 per CU), so a
+CU count can only widen it, and only on the AMD proprietary driver
+(`driverID == AMD_PROPRIETARY`, `split_k_compute_units`) — the one it was
+measured on, an RX 7900 XTX (96 CUs) under the AMD Windows driver. There the
+128-wg pp512 projections the fixed window left unsplit got faster (Qwen3-30B-A3B
+`attn_output` 458 → 302 us, SmolLM3-3B `ffn_down` 1392 → 962 us). Below 32 CUs
+the floor is the larger term, so the integrated GPU behaves as before.
 
-- Four independent sites carry a hardcoded "workgroups needed to fill this GPU"
-  number — `split_k_plan` (`adapter.rs`, threshold 128 / target 256), the two
-  flash split-K formulas and the PV split-K formula (`recorder.rs`, threshold
-  1024 / target 2048), plus the `wide_grid >= 128` wide-tile gates and
-  `ATTN_SPLIT.target_chunks = 32`.
-- Their implied workgroups-per-core ratios are not the same number: 256/96 ≈ 2.7
-  for the GEMM, 2048/96 ≈ 21 for attention. So the constants encode per-kernel
-  occupancy (waves in flight, register/LDS pressure), not core count, and
-  nothing in the probe knows that factor.
-- Replacing them with `cores * K` therefore means inventing a `K` per site,
-  chosen so that 96 reproduces today's empirically tuned constant, and then
-  extrapolating it onto hardware nobody here can measure. That is a guess with a
-  silent failure mode, so it was not built.
-- Two extra costs if someone does: `split_k_plan` is pinned by a formula
-  equivalence test in `adapter.rs`, and the attention chunk policy is
-  **duplicated in GLSL** (`attn_live.comp` recomputes it on the GPU), so a
-  device-derived target needs a new push constant.
+**Unmeasured, so still on the fixed window:** RADV (the platform the README /
+`docs/perf/results.md` benchmarks ran on, and where the fixed window was tuned),
+AMDVLK, NVIDIA and Intel. To extend it to one of them: run
+`infr bench -p 512 -n 0` on a dense model (SmolLM3-3B) and an MoE one
+(Qwen3-30B-A3B) with `INFR_PROF_OPS=1 INFR_PROF_OP_SHAPES=1`, once with the
+driver allowed in `split_k_cu_for_driver` and once without, interleaved, and
+compare the `native_gemm_warp_*` rows at 128-384 workgroups; widen the rule only
+for a driver where they win.
 
-The honest next step is a measurement, not a refactor: a second GPU with a
-different core count, running the four sites' current constants against
-core-derived ones.
+The other sites are still hardcoded, for the reason this entry gave:
+
+- the two flash split-K formulas and the PV split-K formula (`recorder.rs`,
+  threshold 1024 / target 2048), plus the `wide_grid >= 128` wide-tile gates and
+  `ATTN_SPLIT.target_chunks = 32`. Their implied workgroups-per-core ratio
+  (2048/96 ≈ 21 for attention) is a different per-kernel occupancy factor from
+  the GEMM's, so each needs its own measurement, not the GEMM's constant.
+- The attention chunk policy is **duplicated in GLSL** (`attn_live.comp`
+  recomputes it on the GPU), so a device-derived target there needs a new push
+  constant.
 
 ### B-NVSHAPE-MMQ-PER-ARCH — upstream tunes quantized-GEMM tile shape per microarchitecture; infr has one shape (2026-08-11)
 
@@ -4913,3 +4917,70 @@ covers:
 Closing the gap would mean a small MoE GGUF in the goldens job and a way to
 force the per-row route on a VNNI host (or the packed route's absence) so both
 are tested on one machine.
+
+### B184 — what still separates Vulkan MoE prefill and decode from llama.cpp on the RX 7900 XTX (2026-11-14)
+
+**Tag:** vulkan · perf · **Blocked on:** nothing; each item is its own slice
+
+Measured on the RX 7900 XTX with the AMD Windows driver (not RADV), pp512 / tg,
+`INFR_PROF_OPS=1 INFR_PROF_OP_SHAPES=1` against llama.cpp `5676dfbe0`'s
+`GGML_VK_PERF_LOGGER=1`, after the Q6_K expert GEMM, split-K window, router
+top-k and router GEMV fixes. ERNIE-4.5-21B-A3B Q4_K_M pp512 device time is 157.5
+ms against llama.cpp's 129.4 ms; what is left, largest first:
+
+- **The dense coopmat prefill GEMM (`native_gemm_warp_*`) is the biggest
+  remainder, and it is not MoE-specific.** ERNIE's shared-expert gate/up (Q5_K,
+  k=2560 n=3072) 366.6 us vs 235.8 us, `attn_q`/`attn_output` (Q4_K, 2560²)
+  317.7 vs 254.9 us. On the dense control SmolLM3-3B the fused gate/up (k=2048,
+  n=22016, a 1376-wg grid that fills the device) runs 1615.8 us against
+  llama.cpp's two GEMMs at 608.8 us each, and `ffn_down` even split is 962-1034
+  us vs 734-825. So it is tile efficiency, not occupancy alone: on these shapes
+  llama.cpp runs 26-38 TFLOPS, infr 21-29. Next step: compare against
+  llama.cpp's mmq / coopmat pipeline choice on this driver for q4_K/q5_K at
+  n=512 before touching tiles.
+- **Expert gate/up dp4a GEMM (`native_gemm_mmq_q4k_xp`):** 946.3 us vs 903.8 us
+  per call (54 calls), ~2.3 ms per pp512. Small; the Q6_K down that was 3x
+  behind is now at parity (1087.5 vs 1071.3 us).
+- **Activation quant passes:** `quant_q8_gather` 97.9 us + `quant_q8` 73.2 us
+  per MoE layer; llama.cpp's `MUL_MAT_ID` quantizes inside its own pipeline.
+- **Decode:** ERNIE tg128 is 187 vs 213 t/s. Per-op the id-indexed expert GEMVs
+  are close (`native_idm_q4k` 27.5 us vs llama.cpp 24.5 / 22.3 us,
+  `native_idm_q6k_sg2` 39.5 vs 30.3 us); per-token device time (5.0 ms, no
+  replay) is below the wall time (5.35 ms), so part of the rest is host/submit
+  side and was not profiled. Qwen3-30B-A3B decode per-op is at or below
+  llama.cpp's.
+
+**Paged prefill and the split-K window — explained and fixed.** The scaled
+window first cut paged ERNIE-4.5-21B-A3B pp512
+(`paging.cache=4g paging.dram=12g`) from 1182 to 855 t/s while its summed per-op
+GPU time fell. The cause was the submit splitter, not the GEMM: the cold first
+paged forward spends about 8 s over 75 dispatches paging weights in, and
+`VulkanBackend::observe_forward` judged forwards by WALL time, so that host work
+crossed `SUBMIT_DANGER_NS` and armed the splitter on a discrete GPU for the rest
+of the process — every later forward cut into 16-dispatch submits, with
+`MAX_INFLIGHT` waits growing from 0.8 ms to 344 ms once split-K added
+dispatches. The reviewer's matrix: old window + armed 1171/1186, scaled + armed
+858/860, scaled + never armed 1193.7, old + never armed 1184/1173. The splitter
+now judges a forward by its GPU time — every non-persistent `Recorder` stamps
+its command buffer's start and end, `ForwardClock` sums the completed segments —
+falling back to wall time only when a segment carries no timestamps. That is
+what the watchdog bounds (per-submit GPU execution), so a genuinely long GPU
+forward still arms it (`next_submit_cap_arms_only_on_long_gpu_forwards`) and
+host time no longer does (`host_time_in_a_forward_does_not_arm_the_splitter`).
+`INFR_SUBMIT_DISPATCHES=0` now really disables it, as its documentation and the
+warning always said. The paged opt-out of the scaled window is gone.
+
+**Paged decode lost the accidental split, and Qwen3-30B-A3B noticed.** With the
+splitter no longer armed, interleaved against the previous build: paged ERNIE
+pp512 1169-1174 → 1185-1189 and tg128 123.2-123.5 → 126.6, paged Qwen3-30B-A3B
+pp512 483-485 → 482-487 but tg128 53.4-53.7 → 51.2-51.3. Paged decode is not
+replayed (it re-records each token), so a 16-dispatch split let the GPU start on
+the first segments while the host was still recording and staging the rest; one
+submit per forward serializes them. Not measured further. If it is the
+recording/staging overlap, the fix is a deliberate early-submit cadence for
+paged forwards, decided on throughput — not borrowing the watchdog splitter,
+whose cap is a safety bound. Measure first: `INFR_PROF_OPS` per-segment GPU time
+against wall on paged Qwen3-30B-A3B tg128, split vs unsplit.
+
+**Not re-measured:** the README / `docs/perf/results.md` table, which is a RADV
+snapshot; nothing here was run on RADV.

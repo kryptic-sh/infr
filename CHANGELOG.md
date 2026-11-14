@@ -62,6 +62,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   decode on a Ryzen 9 9950X3D, 16 threads: ERNIE-4.5-21B-A3B Q4_K_M from 7.4 to
   25.2 tok/s (llama.cpp's CPU: 29.70), Qwen3-30B-A3B Q4_K_M from 7.5 to 26.1
   tok/s (llama.cpp: 31.01). Prefill is unchanged.
+- **Vulkan MoE prefill and decode are faster, and so is dense prefill on the AMD
+  Windows driver.** Interleaved with the previous build on an RX 7900 XTX (AMD
+  Windows driver, idle machine), pp512 / tg128 tok/s: ERNIE-4.5-21B-A3B Q4_K_M
+  2618-2620 → 3021-3043 and 178.1-178.2 → 187.5-187.6 (llama.cpp Vulkan: 4032 /
+  213.3); Qwen3-30B-A3B Q4_K_M 2855-2858 → 3118-3131 and 173.8 → 191.7
+  (llama.cpp: 3798 / 202.8); SmolLM3-3B Q4_K_M 3615-3640 → 4020-4022 prefill,
+  decode unchanged (229.9-230.1 → 229.4-229.6; llama.cpp: 5462 / 256.6). The
+  Q6_K int8 GEMM (most Q4_K_M MoE quants' `ffn_down_exps`, and dense Q6_K
+  prefill on GPUs without f16 coopmat) stepped through k 16 elements per barrier
+  pair and decoded every weight byte with its own load, running 3.7× slower than
+  the Q4_K one on ERNIE's down shape; it now stages 32 elements per step from
+  word loads (3309 → 1080 us per layer at pp512; on the Raphael iGPU
+  Qwen3-0.6B's Q6_K GEMMs 152.5 → 113.9 ms per pp512, prefill 273.5-273.6 →
+  280.5-280.6). Its outputs move at ulp level against the old kernel (float
+  accumulation order; the integer sums are unchanged). On the AMD proprietary
+  driver only, the prefill GEMM's narrow-grid split-K window also scales with
+  the compute-unit count (never below the old 128 workgroups), so
+  128-192-workgroup projections on a 96-CU GPU split too (`attn_output` 458 →
+  302 us on Qwen3-30B-A3B); every other driver, RADV included, keeps the old
+  window. The router top-k picks each expert with subgroup operations instead of
+  a seven-step shared-memory tree and reads the row from shared memory (13.1 →
+  8.8 us per layer on ERNIE decode), and the one-row f32 router GEMV streams
+  vec4 (12.0 → 4.5 us). Router logits and the reordered split-K sums move
+  results within the existing GPU-vs-CPU parity tolerances; the top-k picks
+  experts by the same rule (highest score, then lowest id).
 - **Chat templates turn non-strings into text as Python's Jinja2 does**, which
   is what Hugging Face's `apply_chat_template` renders with and so what models
   were trained on: `True`, `False`, `None`; floats as Python's `repr` (`1e-07`,
@@ -97,6 +122,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A paged model's first forward no longer cuts every later Vulkan forward into
+  16-dispatch submits.** The submit splitter, which keeps each submit under the
+  driver's GPU hang timeout, judged a forward by its wall time, so the seconds a
+  cold paged forward spends reading weights in (8 s over 75 dispatches for
+  ERNIE-4.5-21B-A3B with `paging.cache=4g`) armed it on a discrete GPU for the
+  rest of the process. It now judges the GPU time each submit actually ran,
+  timed with two timestamps per command buffer (wall time only where the queue
+  writes none). Paged ERNIE-4.5-21B-A3B on the RX 7900 XTX: pp512 1169-1174 →
+  1185-1189, tg128 123.2-123.5 → 126.6; paged Qwen3-30B-A3B: pp512 483-485 →
+  482-487, but tg128 53.4-53.7 → 51.2-51.3, because its paged decode had been
+  profiting from the accidental split (see docs/backlog.md B184).
+  `INFR_SUBMIT_DISPATCHES=0` now disables the splitter for good, as documented;
+  before, the first slow forward re-armed it.
 - **Vulkan MoE routing ranks softmax probabilities, as llama.cpp does, when a
   router bias or expert groups take part.** `moe_topk.comp` ranked a
   softmax-gated router by raw logit and then added the `exp_probs_b` bias, and

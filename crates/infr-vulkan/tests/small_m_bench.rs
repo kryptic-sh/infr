@@ -310,23 +310,27 @@ fn mmv_mrow_matches_single_row_mmv() {
     eprintln!("mmv_mrow == m=1 mmv GEMV at reassociation tolerance (Q4K/Q6K, both layouts)");
 }
 
-/// The vec4 f32 prefill GEMV variants (`linear_f32r_mrow4_v4` rows<=4 / `linear_f32r_mrow8_v4`)
-/// must match a host f64 reference to f32 reassociation tolerance (vec4-lane accumulation +
-/// pairwise horizontal add reorders the K sum vs the scalar kernels — tolerance-level only).
-/// rows=1 (scalar 1-row kernel) and an in_f % 4 != 0 shape (scalar mrow8 fallback) ride along
-/// to pin the whole dispatch table.
+/// The vec4 f32 GEMV variants (`linear_f32r_v4` rows=1, `linear_f32r_mrow4_v4` rows<=4,
+/// `linear_f32r_mrow8_v4`) must match a host f64 reference to f32 reassociation tolerance
+/// (vec4-lane accumulation + pairwise horizontal add reorders the K sum vs the scalar kernels —
+/// tolerance-level only). in_f % 4 != 0 shapes (the scalar 1-row kernel and the scalar mrow8
+/// fallback) ride along to pin the whole dispatch table.
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn linear_f32_v4_matches_host() {
     let Some(be) = bench_support::optional_backend() else {
         return;
     };
-    for (rows, in_f, out_f) in [
-        (4usize, 1536usize, 256usize), // mrow4_v4 (the E2B per-layer proj shape)
-        (2, 256, 1536),                // mrow4_v4, transposed direction
-        (6, 1536, 256),                // mrow8_v4
-        (1, 1536, 256),                // 1-row scalar kernel
-        (4, 252, 64),                  // in_f % 4 != 0 → scalar mrow8 fallback
+    // (rows, in_f, out_f, the kernel the shape must reach under the default config).
+    for (rows, in_f, out_f, kernel) in [
+        (4usize, 1536usize, 256usize, "linear_f32r_mrow4_v4"), // the E2B per-layer proj shape
+        (2, 256, 1536, "linear_f32r_mrow4_v4"),                // transposed direction
+        (6, 1536, 256, "linear_f32r_mrow8_v4"),
+        (1, 1536, 256, "linear_f32r_v4"),
+        (1, 2560, 64, "linear_f32r_v4"), // the ERNIE-4.5 MoE router shape
+        (1, 1000, 96, "linear_f32r_v4"), // in_f/4 = 250: a ragged last 64-lane stride
+        (1, 250, 64, "linear_f32r"),     // in_f % 4 != 0 → 1-row scalar kernel
+        (4, 250, 64, "linear_f32r_mrow8"), // in_f % 4 != 0 → scalar mrow8 fallback
     ] {
         let ws: Vec<f32> = (0..out_f * in_f)
             .map(|i| ((i % 113) as f32 - 56.0) * 0.017)
@@ -342,6 +346,11 @@ fn linear_f32_v4_matches_host() {
             .alloc(rows * out_f * 4, BufferUsage::Activations)
             .unwrap();
         let rec = be.recorder().unwrap();
+        assert_eq!(
+            rec.linear_f32_kernel(rows, in_f),
+            kernel,
+            "rows={rows} in_f={in_f} did not reach the kernel it covers"
+        );
         rec.linear_f32(w.as_ref(), x.as_ref(), y.as_ref(), rows, in_f, out_f);
         rec.finish().unwrap();
         let mut out = vec![0u8; rows * out_f * 4];

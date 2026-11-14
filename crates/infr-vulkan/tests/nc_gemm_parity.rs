@@ -221,7 +221,13 @@ fn run_mmq(be: &VulkanBackend, dt: DType) {
             }
         }
         assert_eq!(seen, [[u16::MAX; 2]; 4], "Q4K nibble coverage");
-
+    }
+    // The three weight routes — bound SSBO at an element offset, BDA at a byte offset, and the
+    // paged arena after an eviction moved the slot — must agree bitwise with the plain dispatch.
+    // Q6_K rides along for its `rw` word reads through the STREAMED/PAGED `arena_word` path: its
+    // 256-element prefix is one 210-byte block, so every offset route starts 2 bytes off a word.
+    if matches!(dt, DType::Q4K | DType::Q6K) {
+        let needs_sact = infr_core::tensor::moe_mmq_needs_sact(dt);
         let mut prefixed = synth_bank(dt, 256, 0x1234);
         prefixed.extend_from_slice(&bank);
         let bound = be.alloc(prefixed.len(), BufferUsage::Weights).unwrap();
@@ -283,17 +289,31 @@ fn run_mmq(be: &VulkanBackend, dt: DType) {
         )
         .unwrap();
         let rec = be.recorder().unwrap();
-        rec.matmul_mmq_q4k(
-            qa.as_ref(),
-            dact.as_ref(),
-            sact.as_ref(),
-            bound.as_ref(),
-            256,
-            route_outs[0].as_ref(),
-            M,
-            K,
-            N,
-        );
+        // The bound-SSBO builds (`nw[]` reads, no arena address) — dtype-specific entry points.
+        if dt == DType::Q4K {
+            rec.matmul_mmq_q4k(
+                qa.as_ref(),
+                dact.as_ref(),
+                sact.as_ref(),
+                bound.as_ref(),
+                256,
+                route_outs[0].as_ref(),
+                M,
+                K,
+                N,
+            );
+        } else {
+            rec.matmul_mmq_q6k(
+                qa.as_ref(),
+                dact.as_ref(),
+                bound.as_ref(),
+                256,
+                route_outs[0].as_ref(),
+                M,
+                K,
+                N,
+            );
+        }
         rec.matmul_mmq_at(
             dt,
             qa.as_ref(),
@@ -311,7 +331,7 @@ fn run_mmq(be: &VulkanBackend, dt: DType) {
             "expert_gateup",
             qa.as_ref(),
             dact.as_ref(),
-            Some(sact.as_ref()),
+            needs_sact.then(|| sact.as_ref() as &dyn Buffer),
             pager.arena_addr(),
             pager.slot_bytes() as u32,
             pager.lut_buffer(),
@@ -339,6 +359,7 @@ fn run_mmq(be: &VulkanBackend, dt: DType) {
                 assert_eq!(a.to_bits(), b.to_bits(), "{route}: mismatch at {i}");
             }
         }
+        println!("{label}: SSBO / offset BDA / paged reload routes bitwise equal");
     }
     println!("{label}: OK");
 }

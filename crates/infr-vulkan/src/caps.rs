@@ -227,7 +227,8 @@ pub(crate) fn device_architecture(p: &DeviceProbe) -> DeviceArch {
 /// counts the physical array.
 ///
 /// UNVALIDATED per vendor: only the AMD steps run on hardware here (an RX 7900 XTX and a Raphael
-/// iGPU, both RADV, both advertising v1 and v2). The NVIDIA and Intel steps have never executed —
+/// iGPU, both advertising v1 and v2; observed under the AMD Windows driver, and the 7900 XTX
+/// under RADV per the 2026-08-11 audit — no record says which driver the iGPU was read on there). The NVIDIA and Intel steps have never executed —
 /// there is no such part on this machine — and their correctness rests on the transcription and the
 /// tests below, nothing more.
 pub(crate) fn shader_core_count(p: &DeviceProbe) -> u32 {

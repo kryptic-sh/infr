@@ -8,6 +8,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`paging.early_submit`** (config only, default 8; `0` = off): on Vulkan, a
+  paged forward (MoE experts or dense layers streamed through the VRAM cache) is
+  cut into segments that the GPU starts on while the host records the rest. The
+  first segment closes at this many dispatches and each later one at twice the
+  last. It starts over each time a paged MoE layer drains the queue for its
+  router ids and each time the staging ring rotates, so a forward takes a
+  logarithmic number of cuts between two of those, not in all. Separate from the
+  submit splitter (`device.submit_dispatches`), whose watchdog cap is still
+  checked first, so it never lengthens a submit.
+  `infr_vulkan::VulkanBackend::segment_cuts` counts that backend's watchdog
+  cuts, early cuts and ring rotations.
 - **ERNIE 4.5 MoE (`ernie4_5-moe`).** Baidu's ERNIE-4.5-21B-A3B runs on the CPU
   and Vulkan backends, with its experts resident or paged, and decodes on the
   record-once replay: the dense `ernie4_5` attention, a routed FFN (6 of 64
@@ -29,6 +40,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Paged MoE decode on Vulkan is up to 11% faster** where the expert cache
+  holds every layer: a paged decode token is re-recorded each time, and the GPU
+  used to wait for the whole recording before starting. On the RX 7900 XTX,
+  interleaved with the previous build, tg128 after a 365-token prefill at
+  `paging.cache=20g`: Qwen3-30B-A3B 160.4, 158.7 to 176.8, 177.1 t/s,
+  ERNIE-4.5-21B-A3B 166.2, 165.8 to 177.9, 178.1 (resident: 186.4 and 184.4). At
+  `paging.cache=4g paging.dram=12g` Qwen3-30B-A3B goes from 76.7, 79.8 to 82.5,
+  82.1; ERNIE there is unchanged, and ERNIE decoding with no prefill at
+  `paging.cache=20g` is about 1.5% slower (141.6, 141.5 to 139.8, 139.1).
+  Streamed dense prefill on the integrated GPU gains too (Qwen3-1.7B pp128 at
+  `paging.cache=200m`: 117.3, 117.2 to 130.5, 130.2). Resident runs take no
+  early cut.
 - **Prefill on the CPU backend is 2.6-6.1× faster, and ahead of llama.cpp's CPU
   at 512 tokens.** Warm pp512 on a Ryzen 9 9950X3D, 16 threads, interleaved with
   the previous build: SmolLM3-3B Q4_K_M from 175-184 to 622-636 tok/s

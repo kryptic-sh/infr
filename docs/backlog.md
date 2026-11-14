@@ -4950,37 +4950,65 @@ ms against llama.cpp's 129.4 ms; what is left, largest first:
   side and was not profiled. Qwen3-30B-A3B decode per-op is at or below
   llama.cpp's.
 
-**Paged prefill and the split-K window — explained and fixed.** The scaled
-window first cut paged ERNIE-4.5-21B-A3B pp512
-(`paging.cache=4g paging.dram=12g`) from 1182 to 855 t/s while its summed per-op
-GPU time fell. The cause was the submit splitter, not the GEMM: the cold first
-paged forward spends about 8 s over 75 dispatches paging weights in, and
-`VulkanBackend::observe_forward` judged forwards by WALL time, so that host work
-crossed `SUBMIT_DANGER_NS` and armed the splitter on a discrete GPU for the rest
-of the process — every later forward cut into 16-dispatch submits, with
-`MAX_INFLIGHT` waits growing from 0.8 ms to 344 ms once split-K added
-dispatches. The reviewer's matrix: old window + armed 1171/1186, scaled + armed
-858/860, scaled + never armed 1193.7, old + never armed 1184/1173. The splitter
-now judges a forward by its GPU time — every non-persistent `Recorder` stamps
-its command buffer's start and end, `ForwardClock` sums the completed segments —
-falling back to wall time only when a segment carries no timestamps. That is
-what the watchdog bounds (per-submit GPU execution), so a genuinely long GPU
-forward still arms it (`next_submit_cap_arms_only_on_long_gpu_forwards`) and
-host time no longer does (`host_time_in_a_forward_does_not_arm_the_splitter`).
-`INFR_SUBMIT_DISPATCHES=0` now really disables it, as its documentation and the
-warning always said. The paged opt-out of the scaled window is gone.
-
-**Paged decode lost the accidental split, and Qwen3-30B-A3B noticed.** With the
-splitter no longer armed, interleaved against the previous build: paged ERNIE
-pp512 1169-1174 → 1185-1189 and tg128 123.2-123.5 → 126.6, paged Qwen3-30B-A3B
-pp512 483-485 → 482-487 but tg128 53.4-53.7 → 51.2-51.3. Paged decode is not
-replayed (it re-records each token), so a 16-dispatch split let the GPU start on
-the first segments while the host was still recording and staging the rest; one
-submit per forward serializes them. Not measured further. If it is the
-recording/staging overlap, the fix is a deliberate early-submit cadence for
-paged forwards, decided on throughput — not borrowing the watchdog splitter,
-whose cap is a safety bound. Measure first: `INFR_PROF_OPS` per-segment GPU time
-against wall on paged Qwen3-30B-A3B tg128, split vs unsplit.
+**Paged decode throughput** is no longer here: the early-submit cadence
+(`paging.early_submit`) replaced the overlap the accidental watchdog split used
+to give, and the measured breakdown of a paged decode step and the larger
+options it points to are in `docs/plan/06-pager-eviction.md` ("A paged decode
+step, host and GPU" and step 5). What that slice found and left is B185.
 
 **Not re-measured:** the README / `docs/perf/results.md` table, which is a RADV
 snapshot; nothing here was run on RADV.
+
+### B185 — what the paged early-submit slice found and left (2026-11-14)
+
+**Tag:** vulkan · perf · paging · **Blocked on:** nothing
+
+Found while adding `paging.early_submit` (`adapter::EarlySubmit`); the
+measurements are in `docs/plan/06-pager-eviction.md`, "A paged decode step, host
+and GPU".
+
+- **The splitter undercounts a paged forward's dispatches.** `execute_static`
+  adds to `submitted_dispatches` only the segments its own cut submits and the
+  last one; segments submitted by the paged MoE path (`rotate_stream`,
+  `sync_stream`) and by dense staging rotations are not counted, while their GPU
+  time is in `ForwardClock`'s sum. `submit_cap_from_measurement` therefore sees
+  more GPU time per dispatch than there was and, once armed, picks a smaller cap
+  than it should: the safe direction, but the cap on a paged iGPU forward is
+  tighter than measured. Read in code, not measured. Fix: carry a dispatch count
+  on `PagedStream` and add it.
+- **The early cadence costs ERNIE-4.5-21B-A3B about 1.5% on the router-readback
+  path with nothing evicting** (`paging.cache=20g`, `-p 0 -d 0`: 141.6, 141.5 →
+  139.8, 139.1 t/s, interleaved). There every MoE layer drains the queue for its
+  router ids, the segment between drains is about 28 dispatches, and a cut costs
+  12-18 µs of host time (a submit, a fence, a timestamp query pool, a new
+  command buffer) against little recording left to hide. Qwen3-30B-A3B gains on
+  the same path (116.1, 117.5 → 120.5, 120.3). That configuration needs a decode
+  with no prefill (a prefill of 48 or more tokens makes every layer resident at
+  that budget and takes the inline path), so it was left; a cadence that does
+  not restart after a drain is the obvious variant to measure.
+- **`seed_barrier` at an early cut could not be shown to matter here.**
+  Commenting it out left `paged_early_submit` and its bit-identity checks green
+  on the RX 7900 XTX (three runs): the AMD Windows driver evidently serializes
+  submits on the queue. The barrier stays (it is what the Vulkan spec requires),
+  but the tests do not prove it on this hardware; RADV or another vendor might.
+- **Considered and declined:** busy-polling the fence instead of
+  `vkQueueWaitIdle` at the per-layer router drain (`sync_stream`) — 75.1-76.0
+  against 80.9-81.7 t/s on Qwen3-30B-A3B at `paging.cache=4g paging.dram=12g`;
+  and splitting an expert's staging memcpy across the rayon pool
+  (`par_copy_to_mapped` at 256 KiB chunks instead of 4 MiB) — 62.2-62.5 against
+  81.4-81.8 t/s. The single-thread copy into the ReBAR ring already runs near
+  the PCIe link rate. Also declined: carrying the early cadence on across a
+  staging-ring rotation (`rotate_stream` leaves the GPU busy, unlike a drain),
+  which was 1-2% slower on the evicting Qwen3-30B-A3B decode and level on dense
+  streaming; figures in plan 06 next to the fixed-count variant. Why starting
+  over wins there was not measured.
+- **ERNIE's paged decode after a prefill starts with a burst of misses.** At
+  `paging.cache=4g paging.dram=12g -d 365`, a 64-forward window right after the
+  prefill averaged 21.6 ms per forward (11.6 ms of it staging), later windows
+  7.1-7.2 ms: the prefill sweep evicts the decode hot set and decode pays to
+  refill it. `tg128` (88-90 t/s) averages over both. A policy question for step
+  3 of the eviction plan.
+- **Paged decode with no prefill at `paging.cache=4g` is far below the same
+  budget after a prefill** (Qwen3-30B-A3B 50-52 t/s at `-d 0` against 82 at
+  `-d 365`). Not investigated. A guess, unchecked: the host tier starts empty,
+  so the decode reads its misses from disk until it fills.

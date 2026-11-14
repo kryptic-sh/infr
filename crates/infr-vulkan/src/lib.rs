@@ -423,6 +423,9 @@ struct VulkanShared {
     /// Completed segments that carried no GPU interval (no timestamp support). A forward with any
     /// such segment is judged by its wall time instead — see [`ForwardClock::observe`].
     untimed_segments: AtomicU64,
+    /// Segments a forward closed and submitted before its recording ended, by cause — see
+    /// [`SegmentCuts`].
+    segment_cuts: [AtomicU64; 3],
     /// The device runs the AMD proprietary driver (`driverID == AMD_PROPRIETARY`, the AMD Windows
     /// driver this box runs) — the one driver the CU-scaled split-K window was measured on. See
     /// `adapter::split_k_compute_units`.
@@ -2672,6 +2675,7 @@ impl VulkanBackend {
                     && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY,
                 segment_gpu_ns: AtomicU64::new(0),
                 untimed_segments: AtomicU64::new(0),
+                segment_cuts: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
@@ -2936,6 +2940,23 @@ impl VulkanBackend {
                     infr_core::SUBMIT_DANGER_NS / 1_000_000,
                 );
             }
+        }
+    }
+
+    /// Count one segment a forward closed and submitted before its recording ended.
+    pub(crate) fn note_segment_cut(&self, cut: SegmentCut) {
+        self.shared.segment_cuts[cut as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Segments this backend's forwards have closed and submitted before their recording ended,
+    /// by cause, since the backend was created. The counters live on this backend's device state,
+    /// so two backends in one process count separately.
+    pub fn segment_cuts(&self) -> SegmentCuts {
+        let n = |c: SegmentCut| self.shared.segment_cuts[c as usize].load(Ordering::Relaxed);
+        SegmentCuts {
+            watchdog: n(SegmentCut::Watchdog),
+            early: n(SegmentCut::Early),
+            rotation: n(SegmentCut::Rotation),
         }
     }
 
@@ -4661,6 +4682,49 @@ fn next_submit_cap(cur: usize, busy_ns: u64, dispatches: usize, disabled: bool) 
     }
 }
 
+/// Why a forward closed the open segment and submitted it without waiting. The first two are
+/// `adapter::execute_static`'s cuts at an op boundary, checked in this order by [`segment_cut`]:
+/// the watchdog bound first, so the early cadence can only ever add cuts to the ones the splitter
+/// makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SegmentCut {
+    /// The submit splitter's dispatch cap (`VulkanShared::submit_dispatch_cap`) was reached.
+    Watchdog = 0,
+    /// The paged forwards' early-submit cadence (`paging.early_submit`) was reached.
+    Early = 1,
+    /// A paged forward's staging ring half was full (`adapter::rotate_stream`), mid-op.
+    Rotation = 2,
+}
+
+/// Which cut, if any, a segment holding `dispatches` takes under the splitter's `watchdog_cap` and
+/// the paged `early` cadence (either `0` = off). Pure, so the precedence is testable without a GPU.
+pub(crate) fn segment_cut(
+    dispatches: usize,
+    watchdog_cap: usize,
+    early: usize,
+) -> Option<SegmentCut> {
+    if watchdog_cap > 0 && dispatches >= watchdog_cap {
+        Some(SegmentCut::Watchdog)
+    } else if early > 0 && dispatches >= early {
+        Some(SegmentCut::Early)
+    } else {
+        None
+    }
+}
+
+/// One backend's counts of the segments its forwards closed and submitted before their recording
+/// ended, by cause, from [`VulkanBackend::segment_cuts`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegmentCuts {
+    /// Cuts made by the submit splitter (the GPU hang watchdog bound).
+    pub watchdog: u64,
+    /// Cuts made by the paged forwards' early-submit cadence.
+    pub early: u64,
+    /// Staging-ring rotations of a paged forward: the ring half being filled could not hold the
+    /// next miss, so the open segment was submitted and staging moved to the other half.
+    pub rotation: u64,
+}
+
 /// One forward's timing for the submit splitter, started by [`VulkanBackend::forward_clock`] and
 /// fed back by [`Self::observe`].
 ///
@@ -5137,6 +5201,19 @@ mod tests {
             0,
             "INFR_SUBMIT_DISPATCHES=0 re-armed"
         );
+    }
+
+    /// A segment is cut by the splitter whenever its cap is reached, whatever the paged early
+    /// cadence says; the cadence only cuts below the cap, and either count at `0` is off.
+    #[test]
+    fn the_watchdog_cut_takes_precedence_over_early_submit() {
+        assert_eq!(segment_cut(64, 64, 16), Some(SegmentCut::Watchdog));
+        assert_eq!(segment_cut(64, 64, 64), Some(SegmentCut::Watchdog));
+        assert_eq!(segment_cut(20, 64, 16), Some(SegmentCut::Early));
+        assert_eq!(segment_cut(15, 64, 16), None);
+        assert_eq!(segment_cut(20, 0, 16), Some(SegmentCut::Early));
+        assert_eq!(segment_cut(20, 16, 0), Some(SegmentCut::Watchdog));
+        assert_eq!(segment_cut(1_000_000, 0, 0), None);
     }
 
     /// The arming rule over GPU-busy time: a never-split device arms only past the danger

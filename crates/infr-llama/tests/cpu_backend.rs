@@ -3007,23 +3007,31 @@ fn gpu_seam_dense_stream_matches_resident_and_cpu() {
 
     // 0.2 GB is far below the model's ~1.4 GB of streamable projections — every pool runs at its
     // floor slot count, so (nearly) every layer re-uploads every pass: real eviction pressure.
-    let streamed = model_cfg(&path, |c| {
-        c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
-        c.paging.stats = true; // see `gpu_seam_paged_moe_matches_resident_and_cpu`
-    });
-    let mut streamed_ids = Vec::new();
-    streamed
-        .generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id))
-        .expect("streamed gpu gen");
+    // `paging.early_submit`: the default cadence, then one that cuts the forward after its first
+    // dispatch and at every doubling after it — the most early cuts a streamed forward takes. This
+    // shows the output survives them; it does not show that `seed_barrier` is what orders the
+    // segments (the AMD Windows driver stays bit-identical without it, B185), and the cut counts
+    // themselves are asserted in infr-vulkan's `paged_early_submit`.
+    for early_submit in [infr_llama::EngineConfig::default().paging.early_submit, 1] {
+        let streamed = model_cfg(&path, |c| {
+            c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
+            c.paging.stats = true; // see `gpu_seam_paged_moe_matches_resident_and_cpu`
+            c.paging.early_submit = early_submit;
+        });
+        let mut streamed_ids = Vec::new();
+        streamed
+            .generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id))
+            .expect("streamed gpu gen");
 
-    assert_eq!(
-        streamed_ids, resident_ids,
-        "dense streaming diverged from the all-resident GPU run"
-    );
-    assert_eq!(
-        streamed_ids, cpu_ids,
-        "dense streaming diverged from the CPU reference"
-    );
+        assert_eq!(
+            streamed_ids, resident_ids,
+            "dense streaming (early_submit={early_submit}) diverged from the all-resident GPU run"
+        );
+        assert_eq!(
+            streamed_ids, cpu_ids,
+            "dense streaming (early_submit={early_submit}) diverged from the CPU reference"
+        );
+    }
 }
 
 /// The same dense streaming path with its THIRD tier engaged (`paging.dram`): every streamed weight

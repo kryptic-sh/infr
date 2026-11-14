@@ -450,6 +450,104 @@ configuration (the 365-token prompt, 48 greedy tokens, `paging.stats`) gave
 byte-identical output and identical hit, miss and eviction counts on all eight
 pools under both binaries. The 18 GB configuration was not rerun.
 
+### A paged decode step, host and GPU (2026-11-14)
+
+Qwen3-30B-A3B and ERNIE-4.5-21B-A3B Q4_K_M on the RX 7900 XTX,
+`infr bench -p 0 -n 128`, from a build with temporary timers in `execute_static`
+(wall, GPU time from the segment timestamps, time blocked in `vkQueueWaitIdle`
+and fence waits, time in `stage_and_window`, router drains), averaged over the
+last 64 forwards of a run. Total CPU load 1-6% (`typeperf`) throughout; no other
+GPU work was arranged around it. Per forward, `early` = `paging.early_submit`:
+
+| model, configuration                                    | early | wall, ms | GPU, ms | host not waiting, ms | staging, ms | drains | segments | t/s   |
+| ------------------------------------------------------- | ----- | -------- | ------- | -------------------- | ----------- | ------ | -------- | ----- |
+| Qwen3, `cache=20g -d 365` (all layers resident)         | 0     | 6.071    | 5.176   | 0.698                | 0.007       | 0      | 1        | 160.7 |
+| Qwen3, `cache=20g -d 365`                               | 8     | 5.493    | 5.365   | 0.881                | 0.008       | 0      | 8        | 176.6 |
+| Qwen3, `cache=20g -d 0` (no misses, readback per layer) | 0     | 8.211    | 5.422   | 0.956                | 0.042       | 48     | 49       | 114.7 |
+| Qwen3, `cache=20g -d 0`                                 | 8     | 7.702    | 5.309   | 1.668                | 0.036       | 48     | 98       | 121.4 |
+| Qwen3, `cache=4g dram=12g -d 365` (evicting)            | 0     | 12.403   | 5.793   | 4.315                | 3.387       | 48     | 49       | 80.6  |
+| Qwen3, `cache=4g dram=12g -d 365`                       | 8     | 12.152   | 5.646   | 5.157                | 3.388       | 48     | 98       | 82.2  |
+| ERNIE, `cache=20g -d 365`                               | 0     | 5.838    | 5.138   | 0.505                | 0.004       | 0      | 1        | 166.2 |
+| ERNIE, `cache=20g -d 365`                               | 8     | 5.442    | 5.323   | 0.605                | 0.004       | 0      | 7        | 178.2 |
+| ERNIE, `cache=20g -d 0`                                 | 0     | 6.720    | 5.018   | 0.630                | 0.014       | 27     | 28       | 141.8 |
+| ERNIE, `cache=20g -d 0`                                 | 8     | 6.866    | 5.135   | 1.629                | 0.018       | 27     | 83       | 138.0 |
+
+Resident decode of the same models at `-d 365` is 186.4 and 184.4 t/s. What the
+rows say:
+
+- **All layers resident (the inline path), the gap was the recording.** The
+  forward recorded about 1060 (Qwen3) or 755 (ERNIE) dispatches into one command
+  buffer in 0.70 / 0.51 ms while the GPU sat idle, then waited for it. The pager
+  itself is not the cost: nothing is staged. The early cadence starts the GPU
+  after the first eight dispatches and cuts six to eight times per forward:
+  160.7 to 176.6 and 166.2 to 178.2 t/s, 5 and 3% short of resident. What is
+  left is the cuts themselves (each segment boundary adds GPU time: 5.18 to 5.37
+  ms over seven cuts) and the last segment's recording; replaying a recording
+  removes both (step 5).
+- **Every layer short of resident drains the queue for its router ids.**
+  `cache=20g -d 0` evicts nothing, but no prefill ever touched the experts the
+  decode has not routed to, so no layer is wholly resident and each takes the
+  readback path: 48 (27) blocking drains per token. GPU time is unchanged; a
+  Qwen3 token's wall exceeds it by 2.8 ms, 0.96 ms of host work the GPU waits
+  for and 1.83 ms of waiting beyond the GPU's own time, about 37 us per drain.
+  Early submit helps Qwen3 a little there and costs ERNIE a little (B185).
+- **Evicting, the bytes are the floor.** At `cache=4g dram=12g` Qwen3 misses
+  about 72 experts per token in steady state (9218 VRAM misses over the 128
+  timed tokens, all served from DRAM), and staging them is 3.39 ms per token:
+  about 21 GB/s into the ReBAR staging ring, near the PCIe link rate on this
+  card. Splitting that copy across threads made it slower (B185). Fewer misses
+  (step 3) is the lever there; the 48 drains are the second one.
+
+Before and after, interleaved (`infr bench -r 2`, two runs of each build,
+alternated; each cell is the two runs' averages; total CPU load 0.4-5.8% across
+the whole matrix):
+
+| model, configuration                   | `HEAD` t/s     | early submit t/s |
+| -------------------------------------- | -------------- | ---------------- |
+| Qwen3 tg128 `cache=4g dram=12g`        | 50.4, 50.2     | 51.3, 52.4       |
+| Qwen3 tg128 `cache=4g dram=12g -d 365` | 76.7, 79.8     | 82.5, 82.1       |
+| Qwen3 pp512 `cache=4g dram=12g`        | 444.0, 467.9   | 451.0, 470.0     |
+| Qwen3 tg128 `cache=20g -d 365`         | 160.4, 158.7   | 176.8, 177.1     |
+| Qwen3 tg128 `cache=20g`                | 116.1, 117.5   | 120.5, 120.3     |
+| Qwen3 pp512 `cache=20g`                | 3146.8, 3157.9 | 3193.5, 3199.0   |
+| Qwen3 tg128 `-d 365`, resident         | 186.3, 186.4   | 186.4, 186.4     |
+| Qwen3 pp512, resident                  | 3153.2, 3142.7 | 3137.6, 3142.4   |
+| ERNIE tg128 `cache=4g dram=12g`        | 123.9, 123.8   | 123.6, 123.2     |
+| ERNIE tg128 `cache=4g dram=12g -d 365` | 88.8, 88.9     | 89.6, 88.6       |
+| ERNIE pp512 `cache=4g dram=12g`        | 1160.9, 1177.6 | 1166.7, 1171.9   |
+| ERNIE tg128 `cache=20g -d 365`         | 166.2, 165.8   | 177.9, 178.1     |
+| ERNIE tg128 `cache=20g`                | 141.6, 141.5   | 139.8, 139.1     |
+| ERNIE pp512 `cache=20g`                | 2995.9, 3024.2 | 3109.2, 3120.8   |
+| ERNIE tg128 `-d 365`, resident         | 184.1, 184.5   | 184.5, 184.4     |
+| ERNIE pp512, resident                  | 3084.9, 3090.2 | 3063.1, 3073.5   |
+| SmolLM3-3B tg128, resident             | 227.8, 227.7   | 228.9, 227.2     |
+| SmolLM3-3B pp512, resident             | 3988.9, 3982.9 | 3992.4, 3999.3   |
+| Qwen3-1.7B tg32, iGPU, `cache=200m`    | 5.5, 5.4       | 5.6, 5.5         |
+| Qwen3-1.7B pp128, iGPU, `cache=200m`   | 117.3, 117.2   | 130.5, 130.2     |
+
+The resident rows take no early cut (the cadence is off unless a pager session
+exists) and moved within their spread. The Qwen3-1.7B rows are dense streaming
+on the integrated GPU, where the submit splitter is armed (`submit split/40`);
+the cadence adds its cuts below that cap.
+
+Two variants of the cadence on the RX 7900 XTX, measured the same way against
+the shipped one (each cell is a run's average over `-r 2`; runs alternated, two
+of each; total CPU load 0.8-4.9% across both matrices):
+
+| variant against shipped                       | model, configuration                   | variant t/s    | shipped t/s    |
+| --------------------------------------------- | -------------------------------------- | -------------- | -------------- |
+| fixed count (cut every 8 dispatches)          | Qwen3 tg128 `cache=20g -d 365`         | 149.7, 151.1   | 177.1, 176.6   |
+| carry on across a ring rotation (drains only) | Qwen3 tg128 `cache=4g dram=12g -d 365` | 81.8, 82.0     | 82.6, 83.3     |
+| carry on across a ring rotation (drains only) | Qwen3 tg128 `cache=4g dram=12g`        | 51.7, 51.2     | 52.3, 52.4     |
+| carry on across a ring rotation (drains only) | SmolLM3-3B tg64 `cache=1g` (dense)     | 21.7, 21.6     | 21.8, 21.7     |
+| carry on across a ring rotation (drains only) | SmolLM3-3B pp256 `cache=1g` (dense)    | 2368.0, 2356.9 | 2368.2, 2336.0 |
+
+A fixed count pays a cut every few dispatches for the whole forward. Carrying
+the cadence on across a staging-ring rotation, which leaves the GPU busy rather
+than idle, was about 1-2% slower on the evicting Qwen3 decode in all four pairs
+and level on the dense streamed SmolLM3-3B, so the cadence starts over after a
+rotation as after a drain. Why the restart wins there was not measured.
+
 ## Steps
 
 ### 1. Measure before designing (done)
@@ -591,6 +689,40 @@ Read in step 1, measured before changing:
 - Lock scope: `DensePagerSession::stage` copies under the session mutex
   (`disk-streaming-plan.md` §1.1). A pager that is cheap per touch still
   serialises `serve --parallel` behind that lock.
+
+### 5. Paged decode without per-token recording or per-layer drains
+
+Measured under "A paged decode step, host and GPU"; the early-submit cadence
+(`paging.early_submit`) is the contained part and landed. What is left is
+larger, in order of what the numbers say it is worth:
+
+- **Replay a paged decode while nothing changes residency.** With every layer
+  resident a paged decode token records the same dispatches every time: the
+  inline path's LUT windows hold the same slots, the tape cursor restarts at the
+  same word, and the pager's per-layer group touches are host bookkeeping that
+  need not be recorded. A `record_decode_replay` twin that records the paged
+  inline arm against `_dyn` position kernels, plus a residency epoch on
+  `MoePagerSession` (and the dense session) bumped on every admission and
+  eviction, would replay while the epoch holds and fall back to `execute_static`
+  the moment it moves. Worth the remaining 3-5% to resident on a model whose
+  experts fit the cache (176.8 / 177.9 against 186.4 / 184.4 t/s), and nothing
+  on an evicting budget, which moves the epoch every token. The touches still
+  have to run each token (they keep paged layers recent), so the replay path
+  must call `touch_all_hits` without recording.
+- **Stop draining the queue for every layer that is not wholly resident.** A
+  layer whose routed experts all hit still pays a blocking submit, a full queue
+  wait and a new recorder (about 37 us beyond its GPU work on this card), only
+  because the host cannot know they hit until it reads the ids. Options: let the
+  GPU resolve slots itself from a live device-side LUT (the `GpuPager` device
+  LUT exists for the parity tests; no production caller), with a per-layer miss
+  flag the host checks after the forward and a re-run of the token from the
+  first missed layer; or make a layer wholly resident when the cache has free
+  slots for the rest of its experts, which only matters when no prefill of 48
+  tokens or more ever swept the layer. The first is the general one and needs
+  the redo path to leave the KV cache exactly as a clean run would.
+- **Fewer bytes per token on an evicting budget** is step 3: Qwen3-30B-A3B's 72
+  misses per token are 3.4 ms of PCIe transfer the GPU waits for, and Belady
+  halves this sequence's decode misses.
 
 ## Verification
 

@@ -195,6 +195,21 @@ cfg_struct! {
         /// would only add activation residency — hence the auto rule. Both overrides exist for A/B:
         /// forcing it ON is how a resident model can be diffed against the chunk-major order.
         layer_major: Option<bool> = None,
+        /// Early-submit cadence for PAGED Vulkan forwards, in dispatches (`0` = off). Config
+        /// only, no `INFR_*` key.
+        ///
+        /// A paged forward is re-recorded every token (its staging decisions change, so it cannot
+        /// replay one recording as a resident decode does). Recorded as one command buffer, the
+        /// GPU idles until the host has recorded all of it; closing the open segment and
+        /// submitting it once it holds this many dispatches lets the GPU run those while the host
+        /// records the rest. The count doubles after every cut, and starts over each time the
+        /// forward drains the queue (a paged MoE layer reading its router ids back) or rotates its
+        /// staging ring, so a forward takes a logarithmic number of cuts between two of those,
+        /// and those can come once per layer (`adapter::EarlySubmit` in `infr-vulkan`). A
+        /// throughput mechanism, separate from the submit splitter (`device.submit_dispatches`),
+        /// which bounds a submit against the GPU hang watchdog: a segment is closed when EITHER
+        /// count is reached, so this never lengthens a submit the splitter would have cut.
+        early_submit: usize = 8,
     }
 }
 

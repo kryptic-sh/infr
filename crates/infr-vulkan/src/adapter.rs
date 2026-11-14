@@ -5799,6 +5799,14 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // and run back-to-back on the queue, so the GPU sees the same uninterrupted stream of work —
     // only the watchdog's view changes, from one long job to several short ones.
     let cap = be_.submit_dispatch_cap();
+    // Paged forwards only: see `EarlySubmit`. It reuses the splitter's submit-and-continue
+    // below, so its segments are pipelined, windowed and timed exactly like the watchdog's, and
+    // `crate::segment_cut` checks the watchdog cap first, so it only ever adds cuts.
+    let mut early = EarlySubmit::new(if be_.moe_paged() || be_.dense_paged() {
+        be_.cfg().paging.early_submit
+    } else {
+        0
+    });
     let clock = be_.forward_clock();
     let mut submitted_dispatches = 0usize;
     /// In-flight segments allowed at once. Each one pins a command buffer plus its descriptor
@@ -5850,8 +5858,13 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         }
         // Split BETWEEN ops, never inside one: a single op can lower to several dispatches that
         // share transient scratch, and the hazard tracking that orders them is per-recorder.
-        // Crossing the cap therefore closes the segment at the next op boundary.
-        if cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap) {
+        // Crossing the cap, or the paged early-submit cadence, therefore closes the segment at the
+        // next op boundary.
+        let cut = rec
+            .as_ref()
+            .and_then(|r| crate::segment_cut(r.dispatches(), cap, early.threshold(r.serial())));
+        if let Some(cut) = cut {
+            be_.note_segment_cut(cut);
             let seg = submit_nowait(be_, rec.take().expect("segment always Some between ops"))?;
             submitted_dispatches += seg.dispatches();
             segments.push_back(seg);
@@ -5869,6 +5882,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             // order on the queue, so this one barrier orders the whole segment after everything
             // already submitted.
             fresh.seed_barrier();
+            early.cut(fresh.serial());
             rec = Some(fresh);
         }
         // Every error exit below goes through `abort_segment`: the segment being recorded has no
@@ -5988,6 +6002,57 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     Ok(())
 }
 
+/// The early-submit cadence of a PAGED forward (`paging.early_submit`): when to close the open
+/// segment and submit it so the GPU starts on it while the host records the rest.
+///
+/// A paged forward is re-recorded every token, and as one command buffer the GPU idles until the
+/// host has recorded all of it. Every cut costs a submit, a fence, a segment timestamp pair and a
+/// full `seed_barrier`, and cutting at a fixed count lost to this cadence on the RX 7900 XTX
+/// (`docs/plan/06-pager-eviction.md`, "A paged decode step, host and GPU"). So the threshold starts
+/// at the configured count and doubles at every cut: the GPU starts after the first few
+/// dispatches, and each segment runs long enough to hide the recording of the next.
+///
+/// The paging paths also replace the open recorder themselves, and the cadence starts over from
+/// the configured count after either. A paged MoE layer that drains the queue for its router
+/// readback (`sync_stream`) leaves the GPU idle, so starting over is what the cadence is for. A
+/// staging-ring rotation (`rotate_stream`) submits without waiting and leaves the GPU busy, but
+/// carrying the cadence on across one instead was measured slower on an evicting paged MoE decode
+/// (same plan section), so it starts over there too. A forward therefore takes a logarithmic
+/// number of early cuts between two such replacements, not in all.
+struct EarlySubmit {
+    /// The configured first threshold, `0` = off.
+    first: usize,
+    /// The open segment's threshold.
+    next: usize,
+    /// Serial of the recorder the last cut opened ([`Recorder::serial`]); any other open recorder
+    /// was opened by the paging paths (`sync_stream`, `rotate_stream`).
+    opened: Option<u64>,
+}
+
+impl EarlySubmit {
+    fn new(first: usize) -> Self {
+        Self {
+            first,
+            next: first,
+            opened: None,
+        }
+    }
+
+    /// The dispatch count at which the open recorder `serial` is cut (`0` = never).
+    fn threshold(&mut self, serial: u64) -> usize {
+        if self.opened != Some(serial) {
+            self.next = self.first;
+        }
+        self.next
+    }
+
+    /// A segment was cut and `fresh_serial` opened in its place.
+    fn cut(&mut self, fresh_serial: u64) {
+        self.next = self.next.saturating_mul(2);
+        self.opened = Some(fresh_serial);
+    }
+}
+
 /// Get-or-alloc a pooled buffer with an explicit `usage` (unlike [`pooled`], which is always
 /// `Activations`) — the paged MoE router-ids scratch needs `Staging` (host-visible, so the
 /// small-m split path's readback is a plain mapped memcpy with no extra submit).
@@ -6049,6 +6114,7 @@ fn rotate_stream<'a>(
     ps: &mut PagedStream,
 ) -> Result<()> {
     let seg = submit_nowait(be_, rec.take().expect("segment always Some between ops"))?;
+    be_.note_segment_cut(crate::SegmentCut::Rotation);
     ps.pending[ps.half] = Some(seg);
     ps.half ^= 1;
     ps.cursor = 0;
@@ -7043,6 +7109,33 @@ mod tests {
     use infr_core::graph::Graph;
     use infr_core::tensor::TensorDesc;
     use infr_core::DType;
+
+    /// The paged early-submit cadence starts at the configured count, doubles at every cut it
+    /// opened the next recorder for, starts over when the paging paths opened the recorder (a
+    /// paged MoE drain or a ring rotation), and never cuts when configured off.
+    #[test]
+    fn early_submit_doubles_and_restarts_after_a_foreign_recorder() {
+        let mut e = EarlySubmit::new(8);
+        assert_eq!(e.threshold(10), 8);
+        e.cut(11);
+        assert_eq!(e.threshold(11), 16);
+        e.cut(12);
+        assert_eq!(e.threshold(12), 32);
+        // `sync_stream` or `rotate_stream` replaced the open recorder: back to the configured count.
+        assert_eq!(e.threshold(40), 8);
+        e.cut(41);
+        assert_eq!(e.threshold(41), 16);
+
+        let mut off = EarlySubmit::new(0);
+        assert_eq!(off.threshold(1), 0);
+        off.cut(2);
+        assert_eq!(off.threshold(2), 0);
+        assert_eq!(crate::segment_cut(1_000_000, 0, off.threshold(2)), None);
+
+        let mut big = EarlySubmit::new(usize::MAX / 2 + 1);
+        big.cut(3);
+        assert_eq!(big.threshold(3), usize::MAX, "the doubling saturates");
+    }
 
     /// Read a `#define <name> <integer>` back out of GLSL source, with or without GLSL's `u`
     /// suffix. Panics when the define is gone — a shader that no longer states its bound is exactly

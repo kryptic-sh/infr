@@ -85,7 +85,9 @@ measurement in a quiet window before and after.
    reads on Windows): the page cache holds a second copy of what the arena
    holds, which halves effective DRAM on a model far larger than RAM.
 5. **Eviction cost and policy:** its own phase,
-   [06-pager-eviction.md](06-pager-eviction.md).
+   [06-pager-eviction.md](06-pager-eviction.md). That includes the per-token
+   cost of a paged decode step (re-recording, per-layer router drains), measured
+   there, with what is left as its step 5.
 6. **Direct-to-ring reads** for blocks that are never admitted to DRAM: only
    meaningful once a planned partition exists (`TierPlan`, §3.6).
 

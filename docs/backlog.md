@@ -4927,16 +4927,40 @@ Measured on the RX 7900 XTX with the AMD Windows driver (not RADV), pp512 / tg,
 top-k and router GEMV fixes. ERNIE-4.5-21B-A3B Q4_K_M pp512 device time is 157.5
 ms against llama.cpp's 129.4 ms; what is left, largest first:
 
-- **The dense coopmat prefill GEMM (`native_gemm_warp_*`) is the biggest
-  remainder, and it is not MoE-specific.** ERNIE's shared-expert gate/up (Q5_K,
-  k=2560 n=3072) 366.6 us vs 235.8 us, `attn_q`/`attn_output` (Q4_K, 2560²)
-  317.7 vs 254.9 us. On the dense control SmolLM3-3B the fused gate/up (k=2048,
-  n=22016, a 1376-wg grid that fills the device) runs 1615.8 us against
-  llama.cpp's two GEMMs at 608.8 us each, and `ffn_down` even split is 962-1034
-  us vs 734-825. So it is tile efficiency, not occupancy alone: on these shapes
-  llama.cpp runs 26-38 TFLOPS, infr 21-29. Next step: compare against
-  llama.cpp's mmq / coopmat pipeline choice on this driver for q4_K/q5_K at
-  n=512 before touching tiles.
+- **Dense K-quant prefill now runs on int8 coopmat (2026-11-15, CHANGELOG); what
+  that slice left:**
+  - The GEMM is gated on the AMD proprietary driver (`i8cm_kq_ready`). RADV
+    RDNA3/RDNA4 was not measured; the old Q8_0 int8 kernel lost to f16 there
+    (`docs/perf/playbook.md`), but that kernel staged a 16-column tile per
+    workgroup and is not evidence about this one. Measure there before widening.
+  - Q8_0, Q4_0/Q5_0/Q4_1/Q5_1, IQ4_NL/IQ4_XS, MXFP4 and Q3_K prefill still
+    dequantize into `native_gemm_warp_*`; llama.cpp runs all of them on the same
+    int8 coopmat MMQ on RDNA3. Each is a weight decode in `prefetch` /
+    `store_to_shared` of `native_gemm_i8cm_kq.comp` plus a build; the existing
+    `native_gemm_i8cm_q8_0.comp` measurement kernel would then be redundant.
+  - The streamed dense path (`streamed_prefill_gemm`) and the MoE expert GEMMs
+    (`native_gemm_mmq_q4k_xp` and siblings, dp4a) do not use it. llama.cpp's
+    `matmul_id_subgroup_q4_k_q8_1` is the expert analogue.
+  - Tiles: two (`I8cmTile::L` 128x128, `M` 64x64) chosen by grid fill
+    (`i8cm_kq_choice`). Forcing one tile everywhere on Qwen3-1.7B pp512: the
+    fused gate/up 417.1 us (L) against 491.6 us (M); the 2048-wide projections
+    103.6 against 101.5 us; `ffn_down` 347.6 / 304.7 against 354.7 / 298.8 us
+    (Q6_K / Q4_K); the 1024-wide K/V 101.4 against 64.2 us. No split-K variant;
+    no tile between the two was tried.
+  - Precision: B192 has the measured cost on real text.
+  - The gate is `DriverId::AMD_PROPRIETARY`, which Linux AMDGPU-PRO reports too;
+    only the Windows driver was measured. On those devices the int8
+    accumulator-layout probe (`verify_i8_coopmat_layout`) now runs at init by
+    default, where it used to run only under `INFR_I8_COOPMAT=1`; a failure logs
+    an error and leaves the int8 GEMMs off.
+  - Q6_K reads `d` and its scale pair as the whole 32-bit word holding them, as
+    `native_decode.glsl`'s `ru16` does: for a word-aligned superblock the `d`
+    word runs 2 bytes past the superblock's end. That stays in bounds because
+    every weight upload is padded to a 4-byte multiple
+    (`linear::pad_to_u32_align`): only an odd superblock count ends a buffer on
+    a word-aligned last superblock, and its 210-byte tail is then 2 bytes short
+    of a word, which the pad fills. The `ql`/`qh` reads end inside the
+    superblock.
 - **Expert gate/up dp4a GEMM (`native_gemm_mmq_q4k_xp`):** 946.3 us vs 903.8 us
   per call (54 calls), ~2.3 ms per pp512. Small; the Q6_K down that was 3x
   behind is now at parity (1087.5 vs 1071.3 us).
@@ -5130,19 +5154,12 @@ dense model of the same width, trails by about the same ratio on each device
 (pp512: CPU 742.9 best warm rep against 993.53, Vulkan0 7597.2 against 9730.23,
 Vulkan1 126.3 against 186.83; CPU tg128 49.6 against 56.64).
 
-- **Vulkan0, the dense GEMM.** Device time 197.6 ms over 3 pp512 reps against
-  llama.cpp's 49615.6 us for one; the `native_gemm_warp_*` rows are 49.20%,
-  23.57% and 15.26% of infr's. Per call: the fused gate/up (k=2048, n=15360) 1.1
-  ms against llama.cpp's two n=7680 GEMMs at 419.025 us each; `ffn_down`
-  (k=7680) Q4_K 794.7 us and Q6_K 820.5 us (split-K) against 510.896 and 574.68;
-  `shortconv.in_proj` (n=6144) 505.8 us against 348.076; the 2048x2048
-  projections 152.8 us plus a 16.5 us split-K reduce against 152.852. On this
-  device llama.cpp runs Q4_K and Q6_K prefill through its int8 coopmat MMQ
-  (`matmul_q4_k_q8_1`, `matmul_q6_k_q8_1`, created when
-  `coopmat_int_support && rdna3`), and the 7900 XTX reports `i8cm:y`; infr's
-  `native_gemm_warp_*` dequantizes into f16 coopmat. This is B184's first item
-  with its next step answered: an int8-coopmat Q4_K/Q6_K prefill GEMM is the
-  port to try.
+- **Vulkan0, the dense GEMM: closed by the int8 coopmat K-quant GEMM**
+  (CHANGELOG; LFM3 pp512 7165.3 / 7045.8 to 12098.1 / 12075.9 t/s against
+  llama.cpp's 10172.32). What is left on that device's pp512 profile
+  (`INFR_PROF_OPS`, 2 reps): the head-gate GEMV (below) at 80.8 us per attention
+  layer, attention (`attn_flash_warp_bm32` 275.5 us, `attn_pv_warp` 215.9 us),
+  and the quant passes at 14.7 us each.
 - **Vulkan1 (integrated), the dp4a GEMM and attention.** 7.38 s of device time
   over 2 pp512 reps against llama.cpp's 2.60563e+06 us for one. The gate/up
   `native_gemm_mmq_q4k_streamed` (2048x15360, 128-row chunks) totals 3.26 s over
@@ -5247,6 +5264,66 @@ Vulkan1 126.3 against 186.83; CPU tg128 49.6 against 56.64).
   device's own session, the 7900 XTX, CPU production and reference). The same
   device's F16 prefill is within 0.0053259134 of llama.cpp on the 1092-token
   prompt, so the test runs on F16.
+
+### B192 — what int8 prefill activations cost in accuracy (2026-11-15)
+
+**Tag:** vulkan · precision · **Needs:** a decision on the default (the numbers
+for it are here)
+
+The int8 coopmat K-quant prefill GEMM (CHANGELOG) quantizes activations to int8
+per 32-element block, as llama.cpp's Vulkan backend does on the same card, where
+the f16 coopmat GEMM rounded them to f16. Measured on the RX 7900 XTX with
+`int8_prefill_accuracy` (`crates/infr-llama/tests/`, ignored, a measurement): 6
+windows of 512 tokens of wikitext-2 `wiki.test.raw`, the second half of each
+scored (1530 positions), every backend against infr's CPU reference
+(`kernels.cpu.reference`, f32 activations), on the exact tokens
+`llama-perplexity -c 512 --chunks 6` used (llama.cpp `5676dfbe0`):
+
+| Qwen3-1.7B Q4_K_M | KLD mean | KLD max |  top-1 |     PPL | cos mean |  cos min | max abs Δlogit |
+| ----------------- | -------: | ------: | -----: | ------: | -------: | -------: | -------------: |
+| infr CPU ref      |        0 |       0 |      1 | 16.3087 |        1 |        1 |              0 |
+| infr int8 off     | 0.000003 | 0.00013 | 0.9987 | 16.3126 | 0.999999 | 0.999752 |         0.4452 |
+| infr int8 on      | 0.001722 | 0.09546 | 0.9765 | 16.3407 | 0.999644 | 0.955304 |         6.5250 |
+| llama.cpp Vulkan  | 0.001792 | 0.26817 | 0.9824 | 16.2741 |          |          |                |
+| llama.cpp CPU     | 0.008603 | 0.28568 | 0.9529 | 16.2613 |          |          |                |
+
+| SmolLM3-3B Q4_K_M | KLD mean | KLD max |  top-1 |    PPL | cos mean |  cos min | max abs Δlogit |
+| ----------------- | -------: | ------: | -----: | -----: | -------: | -------: | -------------: |
+| infr CPU ref      |        0 |       0 |      1 | 8.2465 |        1 |        1 |              0 |
+| infr int8 off     | 0.000002 | 0.00008 | 0.9987 | 8.2475 | 1.000000 | 0.999988 |         0.1723 |
+| infr int8 on      | 0.000730 | 0.01062 | 0.9863 | 8.2575 | 0.999871 | 0.993740 |         1.7175 |
+| llama.cpp Vulkan  | 0.000328 | 0.01412 | 0.9863 | 8.2638 |          |          |                |
+| llama.cpp CPU     | 0.002466 | 0.04499 | 0.9739 | 8.2610 |          |          |                |
+
+llama.cpp's rows come from its `--kl-divergence-base` dumps, which keep each
+row's log-probabilities only down to 16 nats below the top, so they carry no
+logit cosine, and their PPL is llama.cpp's own `Final estimate` (a perplexity
+read back from the clamped dump is biased low); its CPU backend quantizes
+activations too (`q8_K`), hence its larger KLD. In short: with the int8 GEMM,
+infr is as close to the f32 reference as llama.cpp's Vulkan backend on
+Qwen3-1.7B (KLD 0.00172 against 0.00179, top-1 0.9765 against 0.9824) and
+further on SmolLM3-3B (KLD 0.00073 against 0.00033, top-1 equal at 0.9863);
+against the f16 path, top-1 agreement with the reference falls from 0.9987 to
+0.9765 / 0.9863 and perplexity rises by 0.17% / 0.12% (16.3126 to 16.3407,
+8.2475 to 8.2575). Why SmolLM3's KLD is twice llama.cpp's was not looked into.
+
+**Greedy continuations** (64 tokens after the first 256 tokens of each window,
+the same decode GEMV either way; leading tokens shared, re-tokenized from text):
+Qwen3-1.7B on/off 64, 12, 24, 10, 33, 33 (off against the CPU reference 20, 22,
+56, 64, 45, 52); SmolLM3-3B on/off 8, 29, 64, 64, 13, 46 (off against the
+reference 8, 7, 64, 25, 64, 50). Continuations split at near ties within a few
+dozen tokens whichever prefill runs, the f16 path included; neither prefill
+tracks the reference's greedy text better on these prompts.
+
+**Tests that score it:** `gpu_seam_int8_prefill_tracks_cpu` (Qwen3-0.6B, f16 KV,
+default path) holds the shipped prefill's logit cosine against the CPU reference
+to 0.995 (measured 0.9984) and fails if the int8 GEMM did not run;
+`gpu_seam_kv_formats_track_cpu` pins `kernels.vulkan.i8cm_kq = false` so its
+floors score the cache format alone (with the int8 GEMM its turbo2 case measured
+0.9213 against a 0.93 floor). `seam_op_parity`'s
+`kquant_linear_*_within_int8_bound` hold each K-quant Linear to a worst-case
+bound of the activation quantization (worst observed 0.087-0.205 of it), and
+`i8cm_kq_matches_its_decomposition` holds the kernel to its own decomposition.
 
 ### B191 — MTP sessions are sized outside the context fit (2026-11-15)
 

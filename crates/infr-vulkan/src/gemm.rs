@@ -1157,6 +1157,67 @@ pub(crate) fn repack_q8_to_f8_streamed_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// Workgroup tile of the int8 cooperative-matrix K-quant prefill GEMM
+/// (`native_gemm_i8cm_kq.comp`). The extents MIRROR the `-DTILE_*` defines of the matching
+/// builds in `build.rs`; `i8cm_kq_tiles_match_build` fails if they drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum I8cmTile {
+    /// 128 tokens x 128 weight rows, two k blocks per stage, 512 threads.
+    L,
+    /// 64 tokens x 64 weight rows, four k blocks per stage, 128 threads.
+    M,
+}
+
+impl I8cmTile {
+    /// Tokens (output rows) per workgroup.
+    pub(crate) fn tokens(self) -> usize {
+        match self {
+            I8cmTile::L => 128,
+            I8cmTile::M => 64,
+        }
+    }
+    /// Weight rows (output columns) per workgroup.
+    pub(crate) fn rows(self) -> usize {
+        match self {
+            I8cmTile::L => 128,
+            I8cmTile::M => 64,
+        }
+    }
+    /// 32-element k blocks staged per step; `k / 32` must be a multiple of it.
+    pub(crate) fn k_blocks(self) -> usize {
+        match self {
+            I8cmTile::L => 2,
+            I8cmTile::M => 4,
+        }
+    }
+}
+
+/// SPIR-V for the int8 cooperative-matrix K-quant prefill GEMM (`native_gemm_i8cm_kq.comp`):
+/// `(kernel cache name, spv)` for `dtype` at `tile`, `None` for a dtype it has no build for.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_i8cm_kq_spv(
+    dtype: infr_core::DType,
+    tile: I8cmTile,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    use infr_core::DType::*;
+    Some(match (dtype, tile) {
+        (Q4K, I8cmTile::L) => spv!("native_gemm_i8cm_q4k_l"),
+        (Q4K, I8cmTile::M) => spv!("native_gemm_i8cm_q4k_m"),
+        (Q5K, I8cmTile::L) => spv!("native_gemm_i8cm_q5k_l"),
+        (Q5K, I8cmTile::M) => spv!("native_gemm_i8cm_q5k_m"),
+        (Q6K, I8cmTile::L) => spv!("native_gemm_i8cm_q6k_l"),
+        (Q6K, I8cmTile::M) => spv!("native_gemm_i8cm_q6k_m"),
+        _ => return None,
+    })
+}
+
 /// SPIR-V for the int8-coopmat GEMM's "Idea 2" whole-row-activation-scale measurement variant
 /// (see `native_gemm_i8cm_q8_0.comp` #ifdef ROW_SCALE), gated behind `INFR_I8_ROW_SCALE=1`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -3739,6 +3800,35 @@ impl VulkanBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`I8cmTile`]'s extents are what the recorder sizes the grid and the adapter gates shapes
+    /// by; the shader only knows the `-DTILE_*` defines `build.rs` hands each build. A drift
+    /// would dispatch the wrong grid (rows never written) or admit shapes the tile cannot stage.
+    #[test]
+    fn i8cm_kq_tiles_match_build() {
+        let build = include_str!("../build.rs");
+        for (dtype, fmt) in [
+            (infr_core::DType::Q4K, "Q4K"),
+            (infr_core::DType::Q5K, "Q5K"),
+            (infr_core::DType::Q6K, "Q6K"),
+        ] {
+            for tile in [I8cmTile::L, I8cmTile::M] {
+                let (name, _) = native_gemm_i8cm_kq_spv(dtype, tile).expect("i8cm build");
+                let at = build
+                    .find(&format!("\"{name}\""))
+                    .unwrap_or_else(|| panic!("{name} not in build.rs"));
+                let entry = &build[at..at + build[at..].find(')').expect("entry end")];
+                for want in [
+                    format!("\"-DFMT_{fmt}\""),
+                    format!("\"-DTILE_BT={}u\"", tile.tokens()),
+                    format!("\"-DTILE_BW={}u\"", tile.rows()),
+                    format!("\"-DTILE_BKS={}u\"", tile.k_blocks()),
+                ] {
+                    assert!(entry.contains(&want), "{name}: {entry} lacks {want}");
+                }
+            }
+        }
+    }
 
     /// B7 slice 3a — the decode specialization's reduction must be a PLAIN subgroup reduce, never
     /// a clustered one. `attn_partial_dsplit.comp` (the width probe) spells the same width-32

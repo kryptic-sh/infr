@@ -3600,6 +3600,21 @@ pub(crate) fn verify_rows_cpu_with_h(
     Ok((logits, h))
 }
 
+/// The Vulkan binder the one-shot verify forwards share: pad each weight to a 4-byte multiple and
+/// upload it.
+fn vulkan_upload_bind(vk: &infr_vulkan::VulkanBackend) -> Box<BindWeight<'_>> {
+    Box::new(move |_name, tb, dt, _n| {
+        let bytes = tb.materialize();
+        let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
+        let buf = vk
+            .alloc(padded.len(), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        vk.upload(buf.as_ref(), &padded)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok((buf, dt))
+    })
+}
+
 /// [`verify_dense_cpu`]'s Vulkan twin — the same one-shot causal prefill through the production
 /// Vulkan seam, for the CPU/Vulkan cross-backend parity check.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -3616,16 +3631,7 @@ pub(crate) fn verify_dense_vulkan(
     let mut state = None;
     generate_dense_backend(
         vk,
-        &|_name, tb, dt, _n| {
-            let bytes = tb.materialize();
-            let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
-            let buf = vk
-                .alloc(padded.len(), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            vk.upload(buf.as_ref(), &padded)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok((buf, dt))
-        },
+        &vulkan_upload_bind(vk),
         g,
         cfg,
         ec,
@@ -3640,6 +3646,46 @@ pub(crate) fn verify_dense_vulkan(
         None,
         None,
         Some(&mut logits),
+        None,
+        None,
+        None,
+    )?;
+    Ok(logits)
+}
+
+/// [`verify_rows_cpu_with_h`]'s Vulkan twin without the `h` rows: one batched forward of every
+/// token through the production Vulkan seam, returning `[tokens.len() * vocab]` logits — the
+/// all-positions shape a next-token accuracy comparison against the CPU reference needs. Dense
+/// non-MoE models only, as the VERIFY branch it rides.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn verify_rows_vulkan(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    tokens: &[u32],
+) -> AResult<Vec<f32>> {
+    let mut logits = Vec::new();
+    let mut state = None;
+    generate_dense_backend(
+        vk,
+        &vulkan_upload_bind(vk),
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        tokens,
+        0,
+        |_| {},
+        &mut state,
+        tokens.len() + 2,
+        None,
+        Some(&mut logits),
+        None,
+        None,
         None,
         None,
         None,

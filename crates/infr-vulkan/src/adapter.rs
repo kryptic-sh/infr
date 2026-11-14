@@ -1125,6 +1125,42 @@ const SPLIT_K_FIXED_GRID: usize = 128;
 /// where 4 per CU picks four (354 us). Below 32 CUs the fixed floor is the larger term.
 const SPLIT_K_FILL_PER_CU: usize = 4;
 
+/// The int8 cooperative-matrix K-quant prefill GEMM tile for a Linear (`native_gemm_i8cm_kq.comp`),
+/// or `None` when the shape is off every tile and the f16 coopmat GEMM takes it. The caller has
+/// already checked the device (`VulkanBackend::i8cm_kq_ready`). The large tile reuses each staged
+/// block across four times the outputs of the medium one, so it wins once its grid alone fills
+/// the device; below that the medium tile's fourfold grid is what keeps the CUs busy.
+fn i8cm_kq_choice(
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    w_off: usize,
+    compute_units: u32,
+) -> Option<crate::gemm::I8cmTile> {
+    use crate::gemm::I8cmTile;
+    use infr_core::DType::{Q4K, Q5K, Q6K};
+    if !matches!(dt, Q4K | Q5K | Q6K) || !in_f.is_multiple_of(256) || !w_off.is_multiple_of(256) {
+        return None;
+    }
+    let grid = |t: I8cmTile| m.div_ceil(t.tokens()) * (out_f / t.rows());
+    let tile = if out_f.is_multiple_of(I8cmTile::L.rows())
+        && grid(I8cmTile::L) >= I8CM_L_FILL_PER_CU * compute_units as usize
+    {
+        I8cmTile::L
+    } else if out_f.is_multiple_of(I8cmTile::M.rows()) {
+        I8cmTile::M
+    } else {
+        return None;
+    };
+    // The kernel reads its tile from a 1-D workgroup id; a grid past the guaranteed
+    // `maxComputeWorkGroupCount[0]` stays on the f16 GEMM rather than truncate.
+    (grid(tile) <= u16::MAX as usize).then_some(tile)
+}
+
+/// [`i8cm_kq_choice`]'s large-tile threshold: workgroups of the large tile per compute unit.
+const I8CM_L_FILL_PER_CU: usize = 2;
+
 /// The coopmat-warp prefill GEMM tile selection shared by the resident native-dense `Op::Linear`
 /// arm and its arena-addressed streamed twin (`streamed_prefill_gemm`): the A_GLOBAL f16-A cast,
 /// the narrow-n split-K (`split_k_plan`), or the direct tile — reading the weight from `w_addr`
@@ -1303,15 +1339,16 @@ fn lower_op(
     // holds one entry; gemma's SWA/global alternation (and gemma4-12b's hd 256/512) holds a few.
     dyn_args: &mut Vec<DynAttnCtx>,
     pool: &mut ScratchPool,
-    // Multi-row mmv quantized-activation memo: `Some((x, m, in_f))` when the pooled `mmvr_*`
-    // scratch already holds `quant_q8(x)` for that shape. Consecutive same-x Linears (fused-QKV
-    // offset GEMVs, gate+up) then skip the requant — which not only drops ~40% of the quant
-    // dispatches but, more importantly, removes the WAR hazard (quant rewrites qa → barrier
-    // against the previous mmv's read) that would otherwise serialize the sibling GEMVs.
-    // `take()`n at the top of every call: ONLY the mmv-mrow branch restores it, so any other op
-    // in between (which may rewrite `x` — e.g. next layer's RmsNorm into the same scratch id)
-    // invalidates the memo by construction.
-    mmv_memo: &mut Option<(TensorId, usize, usize)>,
+    // Quantized-activation memo: `Some((x, m, in_f, pool))` when the pooled `{pool}_*` scratch
+    // (`mmvr` for the multi-row mmv, `mmq` for the int8 coopmat GEMM) already holds `quant_q8(x)`
+    // for that shape. Consecutive same-x Linears (fused-QKV offset GEMVs, gate+up, separate
+    // q/k/v GEMMs) then skip the requant — which not only drops the repeated quant dispatches
+    // but removes the WAR hazard (quant rewrites qa → barrier against the previous reader) that
+    // would otherwise serialize the sibling Linears. `take()`n at the top of every call: ONLY the
+    // two branches that fill a pool restore it, so any other op in between (which may rewrite
+    // `x` — e.g. next layer's RmsNorm into the same scratch id) invalidates the memo by
+    // construction, and the pool tag keeps one branch from trusting the other's scratch.
+    mmv_memo: &mut Option<(TensorId, usize, usize, &'static str)>,
     // Dense layer streaming (see `pager::DensePagerSession`): `Some(arena_addr)` when this op is an
     // `Op::Linear` whose weight is a streamed block — `arena_addr` is the resident slot's arena base
     // BYTE address. The pool arena is a `bufferDeviceAddress` buffer read purely by 64-bit pointer
@@ -1714,7 +1751,7 @@ fn lower_op(
                     // Same x already quantized by the immediately-preceding Linear(s)? Reuse it
                     // (see `mmv_memo`'s doc — the take()/restore protocol guarantees nothing
                     // rewrote x or the pooled qa in between).
-                    if memo_prev != Some((*x, m, in_f)) {
+                    if memo_prev != Some((*x, m, in_f, "mmvr")) {
                         rec.quant_q8(
                             xb,
                             pool[&qa].as_ref(),
@@ -1724,7 +1761,7 @@ fn lower_op(
                             in_f,
                         );
                     }
-                    *mmv_memo = Some((*x, m, in_f));
+                    *mmv_memo = Some((*x, m, in_f, "mmvr"));
                     rec.linear_mmv_mrow(
                         dt,
                         w,
@@ -1883,6 +1920,11 @@ fn lower_op(
                         && be_.caps().bf16_coopmat()
                         && (bf16cm_wide || bf16cm_narrow)
                         && be_.cfg().kernels.vulkan.bf16_coopmat;
+                    let i8cm_kq_tile = if be_.i8cm_kq_ready() {
+                        i8cm_kq_choice(dt, m, in_f, out_f, w_off, be_.caps().compute_units)
+                    } else {
+                        None
+                    };
                     if cm8_ok {
                         // 8x8x16 `_cm8` warptile (see the `cm8_ok` doc above). First in the chain:
                         // when it's true, `caps.f16_coopmat()` is false (the shapes are mutually
@@ -1988,6 +2030,42 @@ fn lower_op(
                         }
                     } else if bf16cm_ok {
                         rec.matmul_bf16cm(xb, w, w_off, out, m, in_f, out_f);
+                    } else if let Some(tile) = i8cm_kq_tile {
+                        // int8 cooperative-matrix K-quant GEMM (see `i8cm_kq_choice`): quantize
+                        // the activations to int8 per 32-block once, then integer WMMA on the
+                        // raw weight blocks.
+                        let nblk = in_f / 32;
+                        let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
+                        let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
+                        let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
+                        if memo_prev != Some((*x, m, in_f, "mmq")) {
+                            be_.note_i8cm_kq(crate::I8cmKqEvent::QuantPass);
+                            rec.quant_q8(
+                                xb,
+                                pool[&qa].as_ref(),
+                                pool[&dact].as_ref(),
+                                pool[&sact].as_ref(),
+                                m,
+                                in_f,
+                            );
+                        }
+                        *mmv_memo = Some((*x, m, in_f, "mmq"));
+                        let w_addr = w.device_addr().expect(
+                            "resident-BDA weight: the int8 coopmat GEMM requires a u64 BDA address",
+                        );
+                        rec.matmul_i8cm_kq(
+                            dt,
+                            tile,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            w_addr,
+                            w_off,
+                            out,
+                            m,
+                            in_f,
+                            out_f,
+                        );
                     } else if matches!(dt, infr_core::DType::Q4K)
                         && !warp_ok
                         && be_.caps().i8_dot
@@ -5558,7 +5636,7 @@ fn record_decode_replay(
             rec.params_advance(params.as_ref());
         }
         let mode = RopeMode::Dynamic(params.as_ref());
-        let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
+        let mut mmv_memo: Option<(TensorId, usize, usize, &'static str)> = None;
         for (op_idx, op) in graph.ops.iter().enumerate() {
             if skip_op.contains(&op_idx) {
                 continue;
@@ -5839,7 +5917,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut pool: ScratchPool = HashMap::new();
-    let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
+    let mut mmv_memo: Option<(TensorId, usize, usize, &'static str)> = None;
     let mut pstream = PagedStream::default();
 
     // ── submit splitter ───────────────────────────────────────────────────────────────────────
@@ -7747,6 +7825,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The int8 coopmat K-quant tile: the large tile once its own grid fills the device, the
+    /// medium one below that, and nothing for a dtype, k, weight offset or width off every tile
+    /// or a grid a 1-D workgroup id cannot reach.
+    #[test]
+    fn i8cm_kq_choice_picks_by_fill_and_shape() {
+        use crate::gemm::I8cmTile::{L, M};
+        use infr_core::DType::{Q4K, Q5K, Q6K, Q8_0};
+        const CU: u32 = 96;
+        // Qwen3-1.7B at pp512: the fused gate/up fills the device with the large tile; the
+        // 2048-wide projections and the narrow K/V ones do not.
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 12288, 0, CU), Some(L));
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 0, CU), Some(M));
+        assert_eq!(i8cm_kq_choice(Q6K, 512, 6144, 2048, 0, CU), Some(M));
+        assert_eq!(i8cm_kq_choice(Q5K, 512, 2048, 1024, 0, CU), Some(M));
+        // The threshold scales with the device.
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 0, 32), Some(L));
+        // A width the large tile cannot cover takes the medium one even when it would fill.
+        assert_eq!(i8cm_kq_choice(Q4K, 4096, 2048, 64 * 401, 0, CU), Some(M));
+        assert_eq!(i8cm_kq_choice(Q8_0, 512, 2048, 2048, 0, CU), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2080, 2048, 0, CU), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 128, CU), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2016, 0, CU), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 8192, 2048, 151_936, 0, CU), None);
     }
 
     /// With the compute-unit count known, the window scales with it: on a 96-CU part the

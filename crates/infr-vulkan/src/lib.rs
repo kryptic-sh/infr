@@ -13,6 +13,8 @@ mod adapter;
 mod caps;
 pub mod ep;
 mod gemm;
+#[cfg(test)]
+mod i8cm_kq_tests;
 pub mod linear;
 mod matmul;
 mod multi;
@@ -392,6 +394,8 @@ struct VulkanShared {
     /// Record-once decode recordings made since this backend was built
     /// ([`VulkanBackend::decode_recordings`]).
     decode_recordings: AtomicU64,
+    /// What the int8 coopmat K-quant prefill GEMM has recorded ([`VulkanBackend::i8cm_kq_counts`]).
+    i8cm_kq_counts: [AtomicU64; 3],
     /// SUBMIT SPLITTER: the most dispatches `execute_static` will record into one command buffer
     /// before submitting it and opening the next (`0` = unlimited, never split).
     ///
@@ -1340,6 +1344,37 @@ impl VulkanBackend {
     /// cannot tell it from the others, so this is how a test sees which one ran.
     pub fn decode_recordings(&self) -> u64 {
         self.shared.decode_recordings.load(Ordering::Relaxed)
+    }
+
+    /// Whether prefill Linears on Q4_K/Q5_K/Q6_K weights take the int8 cooperative-matrix GEMM
+    /// on this backend (see `i8cm_kq_ready`): a test asks this to know which numerics it scores,
+    /// and to say so when it skips.
+    pub fn int8_coopmat_prefill(&self) -> bool {
+        self.i8cm_kq_ready()
+    }
+
+    /// How many int8 coopmat K-quant GEMMs this backend has recorded, per tile, and how many
+    /// activation quant passes their Linears recorded (one fewer per Linear that reused the
+    /// previous one's). The output cannot show which GEMM or how many quant passes ran, so this
+    /// is how a test sees it.
+    pub fn i8cm_kq_counts(&self) -> I8cmKqCounts {
+        let c = |i: usize| self.shared.i8cm_kq_counts[i].load(Ordering::Relaxed);
+        I8cmKqCounts {
+            large_tile: c(0),
+            medium_tile: c(1),
+            quant_passes: c(2),
+        }
+    }
+
+    /// Count one recorded int8 coopmat K-quant GEMM, or one activation quant pass of such a
+    /// Linear, for [`Self::i8cm_kq_counts`].
+    pub(crate) fn note_i8cm_kq(&self, what: I8cmKqEvent) {
+        let i = match what {
+            I8cmKqEvent::LargeTile => 0,
+            I8cmKqEvent::MediumTile => 1,
+            I8cmKqEvent::QuantPass => 2,
+        };
+        self.shared.i8cm_kq_counts[i].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Initialize Vulkan: create instance, pick a GPU (prefer discrete), create a logical
@@ -2668,6 +2703,7 @@ impl VulkanBackend {
                 act_live: AtomicU64::new(0),
                 act_peak: AtomicU64::new(0),
                 decode_recordings: AtomicU64::new(0),
+                i8cm_kq_counts: [const { AtomicU64::new(0) }; 3],
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
                 submit_split_disabled,
                 segment_ts_period,
@@ -2788,26 +2824,45 @@ impl VulkanBackend {
     /// to lay its accumulator fragment out the way the kernel reads it (see
     /// [`Self::verify_i8_coopmat_layout`]). The adapter's dispatch gate reads exactly this.
     pub(crate) fn i8_coopmat_ready(&self) -> bool {
-        self.shared.i8cm_layout_ok.get() == Some(&true)
+        self.cfg.kernels.vulkan.i8_coopmat && self.shared.i8cm_layout_ok.get() == Some(&true)
+    }
+
+    /// The int8 cooperative-matrix K-quant prefill GEMM (`native_gemm_i8cm_kq.comp`) may be
+    /// dispatched: the accumulator-layout probe passed (the kernel descales in-fragment exactly
+    /// like the Q8_0 one), it is not switched off (`INFR_NO_I8CM_KQ`), and the device runs the
+    /// AMD proprietary driver (`DriverId::AMD_PROPRIETARY`, which Linux AMDGPU-PRO reports as well
+    /// as the Windows driver; only the Windows driver was measured, CHANGELOG). RADV stays on the f16
+    /// coopmat GEMM until someone measures it there: int8 coopmat hung an older Mesa (commit
+    /// ad82a77), and the earlier Q8_0 int8 coopmat kernel lost to f16 on RDNA4 RADV
+    /// (docs/perf/playbook.md).
+    pub(crate) fn i8cm_kq_ready(&self) -> bool {
+        self.i8cm_kq_wanted() && self.shared.i8cm_layout_ok.get() == Some(&true)
+    }
+
+    /// Whether this run could dispatch the K-quant int8 coopmat GEMM, before the layout probe.
+    fn i8cm_kq_wanted(&self) -> bool {
+        self.cfg.kernels.vulkan.i8cm_kq && self.amd_proprietary_driver()
     }
 
     /// Known-answer check of this driver's int8 coopmat accumulator fragment layout, run once at
-    /// init when the i8 coopmat tier is opted in — and the ONLY thing standing between a driver
-    /// that lays that fragment out differently and silently wrong GEMM results.
+    /// init when an int8 coopmat GEMM could be dispatched — and the ONLY thing standing between a
+    /// driver that lays that fragment out differently and silently wrong GEMM results.
     ///
-    /// `native_gemm_i8cm_q8_0.comp` applies its per-block descale IN-FRAGMENT, reading `csub[i]` as
-    /// matrix element `(2*i + (lane>>4), lane&15)`. `KHR_cooperative_matrix` fixes that mapping per
+    /// `native_gemm_i8cm_q8_0.comp` and `native_gemm_i8cm_kq.comp` apply their per-block descale
+    /// IN-FRAGMENT, reading `csub[i]` as matrix element `(2*i + (lane>>4), lane&15)`. `KHR_cooperative_matrix` fixes that mapping per
     /// IMPLEMENTATION, not across implementations: it was derived empirically on RADV/RDNA3 and no
     /// other device here has ever run it. So the tier is only armed once this device has multiplied
     /// two known matrices and read the product back through that same mapping — anything else
     /// leaves the tier OFF with a loud error, which is the one behaviour that cannot produce
     /// plausible wrong numbers on hardware nobody can test.
     ///
-    /// Does nothing (and costs nothing) unless the tier is both enumerated and opted into, so the
-    /// default run pays no init dispatch.
+    /// Does nothing (and costs nothing) unless a tier is both enumerated and wanted (the Q8_0
+    /// opt-in, or [`Self::i8cm_kq_wanted`]), so a run that could not use one pays no init
+    /// dispatch.
     fn verify_i8_coopmat_layout(&self) {
-        if !(self.shared.caps.i8_coopmat() && self.cfg.kernels.vulkan.i8_coopmat) {
-            return; // tier unreachable this run — nothing to arm, nothing to check
+        let wanted = self.cfg.kernels.vulkan.i8_coopmat || self.i8cm_kq_wanted();
+        if !(self.shared.caps.i8_coopmat() && wanted) {
+            return; // no int8 coopmat tier reachable this run — nothing to arm, nothing to check
         }
         match self.run_i8_coopmat_layout_probe() {
             Ok(out) => match crate::caps::check_i8_coopmat_layout(&out) {
@@ -2815,23 +2870,23 @@ impl VulkanBackend {
                     let _ = self.shared.i8cm_layout_ok.set(true);
                     tracing::info!(
                         "[infr] int8 coopmat: accumulator fragment layout verified on this driver \
-                         — INFR_I8_COOPMAT tier armed"
+                         — int8 coopmat GEMM tiers armed"
                     );
                 }
                 Err(why) => {
                     let _ = self.shared.i8cm_layout_ok.set(false);
                     tracing::error!(
-                        "[infr] int8 coopmat REFUSED (INFR_I8_COOPMAT=1 ignored): {why}. The GEMM \
-                         would return plausible wrong numbers on this driver, so the tier stays \
-                         off and the dp4a/coopmat-f16 tiers run instead."
+                        "[infr] int8 coopmat REFUSED: {why}. The int8 coopmat GEMMs would \
+                         return plausible wrong numbers on this driver, so they stay off and the \
+                         dp4a/coopmat-f16 tiers run instead."
                     );
                 }
             },
             Err(e) => {
                 let _ = self.shared.i8cm_layout_ok.set(false);
                 tracing::error!(
-                    "[infr] int8 coopmat REFUSED (INFR_I8_COOPMAT=1 ignored): the accumulator \
-                     layout probe could not run on this device ({e}) — the tier stays off."
+                    "[infr] int8 coopmat REFUSED: the accumulator layout probe could not run \
+                     on this device ({e}) — the int8 coopmat GEMMs stay off."
                 );
             }
         }
@@ -4791,6 +4846,25 @@ impl ForwardClock {
     pub(crate) fn observe(self, be_: &VulkanBackend, dispatches: usize) {
         be_.observe_forward(self.busy_ns(be_), dispatches);
     }
+}
+
+/// [`VulkanBackend::i8cm_kq_counts`]: totals since the backend was built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct I8cmKqCounts {
+    /// GEMMs recorded at the 128x128 tile.
+    pub large_tile: u64,
+    /// GEMMs recorded at the 64x64 tile.
+    pub medium_tile: u64,
+    /// Activation quant passes recorded for those GEMMs.
+    pub quant_passes: u64,
+}
+
+/// What [`VulkanBackend::note_i8cm_kq`] counts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum I8cmKqEvent {
+    LargeTile,
+    MediumTile,
+    QuantPass,
 }
 
 #[cfg(test)]

@@ -75,6 +75,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Vulkan prefill of Q4_K, Q5_K and Q6_K weights now quantizes the activations
+  to int8, as llama.cpp's Vulkan backend does, on devices running the AMD
+  proprietary driver** (`DriverId::AMD_PROPRIETARY`; measured on the Windows
+  driver only). Each 32-element block of activations is quantized to int8 once
+  (shared by sibling projections that read the same input) and an integer
+  cooperative-matrix GEMM (`native_gemm_i8cm_kq.comp`) reads the weight blocks
+  raw, where the f16 coopmat GEMM rounded activations to f16 and dequantized
+  every weight. The device must also pass the int8 accumulator-layout check at
+  init, which now runs by default there. RADV and every other device keep their
+  GEMMs. Turn it off with `INFR_NO_I8CM_KQ=1`
+  (`kernels.vulkan.i8cm_kq = false`). pp512 on the RX 7900 XTX, two interleaved
+  runs of three reps each against the previous build: Qwen3-1.7B Q4_K_M 7580.6
+  and 7504.5 t/s to 11901.5 and 11869.9; LFM3-1.7B Q4_K_M 7165.3 and 7045.8 to
+  12098.1 and 12075.9; SmolLM3-3B Q4_K_M 4000.9 and 3994.2 to 6258.9 and 6253.3
+  (llama.cpp on the same files: 9612.77, 10172.32, 5437.08). Per call on LFM3
+  the fused gate/up went from 1.1 ms to 576.2 us and `ffn_down` from 794.7 /
+  820.5 us (Q4_K / Q6_K) to 397.6 / 457.4 us. Decode and the integrated GPU are
+  unchanged (Qwen3-1.7B there: 126.2 t/s pp512 before and after). **What it
+  costs in accuracy**, over 1530 positions of wikitext-2 against the f32 CPU
+  reference: next-token top-1 agreement falls from 0.9987 to 0.9765 (Qwen3-1.7B)
+  and from 0.9987 to 0.9863 (SmolLM3-3B), mean KL divergence rises from 0.000003
+  to 0.001722 and from 0.000002 to 0.000730, and perplexity from 16.3126 to
+  16.3407 (+0.17%) and from 8.2475 to 8.2575 (+0.12%). llama.cpp's Vulkan
+  backend on the same tokens: top-1 0.9824 and 0.9863, KL divergence 0.001792
+  and 0.000328. Details in `docs/backlog.md` B192.
+- **`quant_q8` quantizes eight blocks per workgroup** instead of one, with the
+  same per-block arithmetic, so its results are unchanged. On a Qwen3-1.7B pp512
+  forward on the RX 7900 XTX the quant passes took 3.35 ms over six per layer
+  and now take 1.5 ms over four (the two repeats on the K and V inputs reuse the
+  Q projection's).
 - **CPU prefill of the causal convolutions is several times faster.** qwen35's
   `Op::Conv1dSilu` and LFM3's `Op::ShortConv` now share one convolution that
   runs each tap across a whole row against a transposed kernel, and the short

@@ -1213,6 +1213,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_GEMV_RM",
         "INFR_NO_GEMV_SG",
         "INFR_NO_GPU_POS",
+        "INFR_NO_I8CM_KQ",
         "INFR_NO_MMQ",
         "INFR_NO_MMQ_FALLBACK",
         "INFR_NO_MMV",

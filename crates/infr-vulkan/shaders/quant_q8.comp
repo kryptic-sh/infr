@@ -1,17 +1,22 @@
 #version 460
 // Quantize f32 activations A[m,k] → symmetric int8 (Q8) per BLK-element block, for the dp4a mmq
-// prefill matmul. One workgroup (= one subgroup, 32 threads) per (row, block). Outputs:
+// prefill matmul. One subgroup (32 threads) per (row, block), QUANT_Q8_BLOCKS_PER_WG of them per
+// workgroup: a 32-thread workgroup per block left the pass launch-bound (one workgroup per 32
+// elements). Each block's reductions stay within its own subgroup, so the result does not depend
+// on how many blocks share a workgroup. Outputs:
 //   qa[m,k]    int8   — q = round(a / d), d = amax/127  (K contiguous → read as packed u32 by mmq)
 //   d_act      f16    — per-block scale, [m, nblk]
 //   s_act      f16    — per-block Σ(d·q) = Σ(dequant a), [m, nblk]  (folds the weight-min term)
-// Fixed BLK=32 (the u4 weight block) → local_size_x = 32 = one subgroup per block.
+// Fixed BLK=32 (the u4 weight block) = one subgroup; dispatched at a required subgroup size of 32.
+// MIRRORS `QUANT_Q8_BLOCKS_PER_WG` in recorder.rs (`quant_q8_blocks_per_wg_matches_shader`).
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_8bit_storage : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
-layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+#define QUANT_Q8_BLOCKS_PER_WG 8u
+layout(local_size_x = 32 * QUANT_Q8_BLOCKS_PER_WG, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC { uint m; uint k; uint blk; } pc;
 // Binding order mirrors the recorder's hazard convention (inputs first, outputs last), so the
@@ -36,14 +41,16 @@ layout(binding = SBI) writeonly buffer SBuf { float16_t sact[]; }; // [m, nblk]
 
 void main() {
     uint nblk = pc.k / pc.blk;
-    // Flat (row, block) index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
-    // `maxComputeWorkGroupCount[0]`; equal to `gl_WorkGroupID.x` when unsplit. A padding
-    // workgroup of the split grid returns whole, so the subgroup ops below stay uniform.
-    uint gid = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x; // 0 .. m*nblk-1
+    // Flat (row, block) index: the flat workgroup index across `Recorder::dispatch_wide`'s 2-D
+    // split of a grid wider than `maxComputeWorkGroupCount[0]` (equal to `gl_WorkGroupID.x` when
+    // unsplit), then this subgroup's block within the workgroup. A block past the end returns
+    // with its whole subgroup, so the subgroup ops below stay uniform.
+    uint wg = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    uint gid = wg * QUANT_Q8_BLOCKS_PER_WG + gl_SubgroupID; // 0 .. m*nblk-1
     if (gid >= pc.m * nblk) { return; }
     uint row = gid / nblk;
     uint blk = gid % nblk;
-    uint t = gl_LocalInvocationID.x;   // 0 .. blk-1
+    uint t = gl_SubgroupInvocationID;  // 0 .. blk-1
     uint idx = row * pc.k + blk * pc.blk + t;
 
 #ifdef GATHER

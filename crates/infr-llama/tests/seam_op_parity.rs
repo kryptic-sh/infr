@@ -6585,3 +6585,479 @@ fn compress_pool_all_neg_inf_window_is_zero() {
         );
     }
 }
+
+// ---- K-quant prefill `Op::Linear`: what int8 activations may cost.
+//
+// The Vulkan prefill GEMMs for Q4_K/Q5_K/Q6_K quantize the activations to int8 per 32-element
+// block (`quant_q8`: d = amax/127 in f32, codes round(x/d), d and s = Σd·q stored as f16) before
+// an integer dot — the int8 cooperative-matrix GEMM on devices that run it, the dp4a mmq GEMM on
+// devices without f16 coopmat. Against the exact product of the f32 activations and the
+// dequantized weight, with each block's weight written w = s_w·q + min (min = 0 for Q6_K), the
+// error per 32-block is at most
+//   Σ|s_w·q|·e + |min|·(16·d·(1+2⁻²⁰) + max((|Σx| + 16·d)·2⁻¹¹, 2⁻²⁵))
+//   e = ½·d·(1+2⁻²⁰) + 127·max(d·2⁻¹¹, 2⁻²⁵)
+// The scaled part: half a code step (the 2⁻²⁰ covers the f32 rounding of x/d), plus the f16
+// rounding of d — relative 2⁻¹¹ while d is a normal f16, half the subnormal spacing (2⁻²⁵)
+// below that — over at most 127 codes. The min part: s differs from Σx by at most the 32 codes'
+// half steps (16·d), and its f16 rounding is relative to s itself, |s| ≤ |Σx| + 16·d, again with
+// the subnormal floor. The inputs below hit both edges: blocks whose sum is near zero and blocks
+// whose scale is an f16 subnormal (amax under 127·2⁻¹⁴ ≈ 0.0078).
+//
+// This is a worst-case bound, and loose: the codes' errors add with random signs, and the
+// measured worst sits near a tenth of it. It is the contract the activation quantization is held
+// to, not the test with teeth for a decode slip — that is `infr-vulkan`'s
+// `i8cm_kq_matches_its_decomposition`, which holds the kernel to its own decomposition within
+// 1e-5 of the term sum.
+
+/// A valid K-quant bank of `n_elems` weights: random quant and scale bits, small super-scales.
+fn kq_bank(dt: DType, n_elems: usize, seed: u64) -> Vec<u8> {
+    let (epb, bpb) = infr_gguf::block_layout(dt);
+    let mut s = seed;
+    let mut byte = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 33) as u8
+    };
+    let mut out = Vec::with_capacity(n_elems / epb * bpb);
+    for _ in 0..n_elems / epb {
+        let mut b: Vec<u8> = (0..bpb).map(|_| byte()).collect();
+        let d = half::f16::from_f32(0.004 + byte() as f32 * 1e-5).to_le_bytes();
+        let dmin = half::f16::from_f32(0.01 + byte() as f32 * 1e-5).to_le_bytes();
+        match dt {
+            DType::Q4K | DType::Q5K => {
+                b[0..2].copy_from_slice(&d);
+                b[2..4].copy_from_slice(&dmin);
+            }
+            DType::Q6K => b[208..210].copy_from_slice(&d),
+            other => panic!("no synth for {other:?}"),
+        }
+        out.extend_from_slice(&b);
+    }
+    out
+}
+
+/// Each 32-block's `min` (`−dmin·mn`; 0 for Q6_K): the dequant of the bank with its quant bits
+/// cleared.
+fn kq_block_mins(dt: DType, bank: &[u8]) -> Vec<f32> {
+    let (epb, bpb) = infr_gguf::block_layout(dt);
+    let quant_bytes = match dt {
+        DType::Q4K => 16..144,
+        DType::Q5K => 16..176,
+        DType::Q6K => return vec![0.0; bank.len() / bpb * epb / 32],
+        other => panic!("no mins for {other:?}"),
+    };
+    let mut zeroed = bank.to_vec();
+    for block in zeroed.chunks_mut(bpb) {
+        block[quant_bytes.clone()].fill(0);
+    }
+    let w = infr_gguf::dequant::dequant_block(dt, &zeroed).unwrap();
+    w.chunks(32).map(|c| c[0]).collect()
+}
+
+/// Upload `inputs` (f32) and `weights` (raw bytes), execute `g` on `be`, and download `outs`.
+fn run_bytes(
+    be: &dyn Backend,
+    g: &Graph,
+    inputs: &[(TensorId, &[f32])],
+    weights: &[(TensorId, &[u8])],
+    outs: &[(TensorId, usize)],
+) -> Vec<Vec<f32>> {
+    let plan = be.compile(g).expect("compile");
+    let mut keep = Vec::new();
+    for (id, data) in inputs {
+        let b = be.alloc(data.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(b.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        keep.push((*id, b));
+    }
+    for (id, bytes) in weights {
+        let b = be.alloc(bytes.len(), BufferUsage::Weights).unwrap();
+        be.upload(b.as_ref(), bytes).unwrap();
+        keep.push((*id, b));
+    }
+    for (id, n) in outs {
+        keep.push((*id, be.alloc(n * 4, BufferUsage::Readback).unwrap()));
+    }
+    let mut b = Bindings::new();
+    for (id, buf) in &keep {
+        b.bind(*id, buf.as_ref());
+    }
+    be.execute(plan.as_ref(), &b).expect("execute");
+    outs.iter()
+        .map(|(id, n)| {
+            let (_, buf) = keep.iter().find(|(k, _)| k == id).unwrap();
+            let mut o = vec![0f32; *n];
+            be.download(buf.as_ref(), bytemuck::cast_slice_mut(&mut o))
+                .unwrap();
+            o
+        })
+        .collect()
+}
+
+/// A one-Linear graph: `[m, in_f]` input through `out_f` rows of `bank` from element `w_off`.
+fn kq_linear_run(
+    be: &dyn Backend,
+    dt: DType,
+    bank: &[u8],
+    x: &[f32],
+    (m, in_f, out_f, w_off): (usize, usize, usize, usize),
+) -> Vec<f32> {
+    let (epb, bpb) = infr_gguf::block_layout(dt);
+    let mut g = Graph::new();
+    let xi = g.input(f32d(m * in_f));
+    let w = g.weight(TensorDesc::new(vec![bank.len() / bpb * epb], dt));
+    let dst = g.output(f32d(m * out_f));
+    g.push(Op::Linear {
+        x: xi,
+        weight: w,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: w_off as u32,
+    });
+    run_bytes(be, &g, &[(xi, x)], &[(w, bank)], &[(dst, m * out_f)]).remove(0)
+}
+
+/// Which int8 coopmat tile a Linear should take through the adapter, when the device runs it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KqTile {
+    Large,
+    Medium,
+}
+
+/// Activations whose blocks cycle through four kinds: two with a mean of either sign (a block
+/// summing to zero would hide the min term), one near zero mean, one whose amax puts its scale in
+/// the f16 subnormal range.
+fn kq_activations(m: usize, in_f: usize) -> Vec<f32> {
+    (0..m * in_f)
+        .map(|i| {
+            let b = i / 32;
+            let wave = (i as f32 * 0.37).sin();
+            match b % 4 {
+                0 | 1 => (wave + ((b % 7) as f32 - 3.0) * 0.2) * (0.5 + (b % 13) as f32 * 0.25),
+                2 => wave * (0.5 + (b % 13) as f32 * 0.25),
+                _ => wave * 0.003,
+            }
+        })
+        .collect()
+}
+
+/// One prefill-shaped K-quant Linear on Vulkan, held to the int8-activation bound above. On a
+/// device that runs the int8 coopmat GEMM the Linear must have taken it, at `tile`; elsewhere the
+/// bound is checked on the device's own GEMM and the test says so.
+fn kquant_linear_within_int8_bound(
+    dt: DType,
+    (m, in_f, out_f, w_off): (usize, usize, usize, usize),
+    tile: KqTile,
+) {
+    let Some(vk) = gpu() else {
+        eprintln!("kquant_linear_{dt:?}: no Vulkan device — skipped");
+        return;
+    };
+    let bank = kq_bank(dt, w_off + out_f * in_f, 0x5eed ^ dt as u64);
+    let w = infr_gguf::dequant::dequant_block(dt, &bank).unwrap();
+    let mins = kq_block_mins(dt, &bank);
+    let x = kq_activations(m, in_f);
+    let before = vk.i8cm_kq_counts();
+    let got = kq_linear_run(&vk, dt, &bank, &x, (m, in_f, out_f, w_off));
+    let after = vk.i8cm_kq_counts();
+    if vk.int8_coopmat_prefill() {
+        let ran = (
+            after.large_tile - before.large_tile,
+            after.medium_tile - before.medium_tile,
+        );
+        let want = match tile {
+            KqTile::Large => (1, 0),
+            KqTile::Medium => (0, 1),
+        };
+        assert_eq!(
+            ran, want,
+            "{dt:?}: the Linear did not take the int8 coopmat GEMM at the {tile:?} tile"
+        );
+    } else {
+        eprintln!(
+            "kquant_linear_{dt:?}: no int8 coopmat GEMM on this device — bound checked on its own \
+             prefill GEMM"
+        );
+    }
+
+    let nblk = in_f / 32;
+    let p11 = 2f64.powi(-11);
+    let sub = 2f64.powi(-25);
+    let slop = 1.0 + 2f64.powi(-20);
+    // Per activation block: its scale d and Σx.
+    let act: Vec<(f64, f64)> = x
+        .chunks(32)
+        .map(|xs| {
+            let d = xs.iter().fold(0f32, |a, v| a.max(v.abs())) as f64 / 127.0;
+            (d, xs.iter().map(|v| *v as f64).sum())
+        })
+        .collect();
+    // Per weight block: Σ|w − min| and min.
+    let wts: Vec<(f64, f64)> = (0..out_f * nblk)
+        .map(|ob| {
+            let min = mins[w_off / 32 + ob] as f64;
+            let ws = &w[w_off + ob * 32..][..32];
+            (ws.iter().map(|v| (*v as f64 - min).abs()).sum(), min)
+        })
+        .collect();
+    use rayon::prelude::*;
+    let rows: Vec<(f64, f64)> = (0..m)
+        .into_par_iter()
+        .map(|r| {
+            let xr = &x[r * in_f..][..in_f];
+            let (mut worst_bound, mut worst_rel) = (0f64, 0f64);
+            for o in 0..out_f {
+                let wr = &w[w_off + o * in_f..][..in_f];
+                let (mut exact, mut abs) = (0f64, 0f64);
+                for (xv, wv) in xr.iter().zip(wr) {
+                    let t = *xv as f64 * *wv as f64;
+                    exact += t;
+                    abs += t.abs();
+                }
+                let mut bound = 0f64;
+                for b in 0..nblk {
+                    let (d, sx) = act[r * nblk + b];
+                    let (scaled, min) = wts[o * nblk + b];
+                    let e = 0.5 * d * slop + 127.0 * (d * p11).max(sub);
+                    let s_err = 16.0 * d * slop + ((sx.abs() + 16.0 * d) * p11).max(sub);
+                    bound += scaled * e + min.abs() * s_err;
+                }
+                // f32 accumulation over the row, on whichever side: far below the terms above.
+                let noise = 1e-5 * abs;
+                let g = got[r * out_f + o] as f64;
+                let err = (g - exact).abs();
+                assert!(
+                    err <= bound + noise,
+                    "{dt:?}: row {r} col {o}: got {g} want {exact}, error {err:e} over the int8 \
+                     bound {bound:e}"
+                );
+                worst_bound = worst_bound.max(err / (bound + noise));
+                worst_rel = worst_rel.max(err / abs);
+            }
+            (worst_bound, worst_rel)
+        })
+        .collect();
+    let worst_bound = rows.iter().fold(0f64, |a, r| a.max(r.0));
+    let worst_rel = rows.iter().fold(0f64, |a, r| a.max(r.1));
+    println!(
+        "K-quant Linear {dt:?} m={m} {in_f}x{out_f} on vulkan: worst error / bound = \
+         {worst_bound:.3}, worst error / Σ|x·w| = {worst_rel:e}"
+    );
+}
+
+/// The medium tile: a token count off every tile, a weight 64 rows into its tensor, a grid well
+/// under twice any GPU's compute units.
+const KQ_MEDIUM: (usize, usize, usize, usize) = (200, 1024, 512, 64 * 1024);
+/// The large tile: a grid of 384 large tiles, past twice the compute units of any GPU up to 192.
+const KQ_LARGE: (usize, usize, usize, usize) = (512, 512, 12288, 0);
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q4k_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q4K, KQ_MEDIUM, KqTile::Medium);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q4k_large_tile_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q4K, KQ_LARGE, KqTile::Large);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q5k_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q5K, KQ_MEDIUM, KqTile::Medium);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q5k_large_tile_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q5K, KQ_LARGE, KqTile::Large);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q6k_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q6K, KQ_MEDIUM, KqTile::Medium);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q6k_large_tile_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q6K, KQ_LARGE, KqTile::Large);
+}
+
+// ---- The quantized-activation memo (`lower_op`'s `mmv_memo`).
+//
+// Consecutive Linears reading the same activations reuse one `quant_q8` of them. Each case runs a
+// graph whose Linears could reuse a stale copy if the memo were wrong, and compares every output
+// bitwise with the same Linear run alone in its own graph (which quantizes for itself).
+
+/// `src` copied into the internal `dst` (`rows` x `n`), the way a layer's norm fills the scratch
+/// the next projections read.
+fn kq_copy(g: &mut Graph, src: TensorId, dst: TensorId, rows: usize, n: usize) {
+    g.push(Op::CopyStrided {
+        src,
+        src_off: 0,
+        src_stride: n as u32,
+        dst,
+        dst_off: 0,
+        dst_stride: n as u32,
+        rows: rows as u32,
+        n: n as u32,
+    });
+}
+
+fn kq_lin(
+    g: &mut Graph,
+    x: TensorId,
+    w: TensorId,
+    dst: TensorId,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    g.push(Op::Linear {
+        x,
+        weight: w,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    });
+}
+
+/// Three Linears on one input quantize it once and match three Linears that each quantize; a
+/// Linear after the input was rewritten quantizes again; a Linear after a multi-row GEMV on the
+/// same input (whose memo names the GEMV's own scratch) does not trust it.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_quant_memo_matches_per_projection_quantization() {
+    let Some(vk) = gpu() else {
+        eprintln!("kquant_quant_memo: no Vulkan device — skipped");
+        return;
+    };
+    if !vk.int8_coopmat_prefill() {
+        eprintln!("kquant_quant_memo: no int8 coopmat GEMM on this device — skipped");
+        return;
+    }
+    let dt = DType::Q4K;
+    let (epb, bpb) = infr_gguf::block_layout(dt);
+    let wdesc = |n: usize| TensorDesc::new(vec![n / bpb * epb], dt);
+    let alone = |bank: &[u8], x: &[f32], m: usize, in_f: usize, out_f: usize| {
+        kq_linear_run(&vk, dt, bank, x, (m, in_f, out_f, 0))
+    };
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(p, q)| p.to_bits() == q.to_bits());
+
+    // Shared input: q, k and v from one copy.
+    let (m, in_f) = (200usize, 1024usize);
+    let outs = [1024usize, 256, 256];
+    let banks: Vec<Vec<u8>> = outs
+        .iter()
+        .enumerate()
+        .map(|(i, o)| kq_bank(dt, o * in_f, 0x7a11 + i as u64))
+        .collect();
+    let x0 = kq_activations(m, in_f);
+    let x1: Vec<f32> = x0.iter().map(|v| -0.5 * v + 0.1).collect();
+    {
+        let mut g = Graph::new();
+        let src = g.input(f32d(m * in_f));
+        let x = g.internal(f32d(m * in_f));
+        kq_copy(&mut g, src, x, m, in_f);
+        let ws: Vec<TensorId> = banks.iter().map(|b| g.weight(wdesc(b.len()))).collect();
+        let ds: Vec<TensorId> = outs.iter().map(|o| g.output(f32d(m * o))).collect();
+        for i in 0..3 {
+            kq_lin(&mut g, x, ws[i], ds[i], m, in_f, outs[i]);
+        }
+        let before = vk.i8cm_kq_counts();
+        let got = run_bytes(
+            &vk,
+            &g,
+            &[(src, &x0)],
+            &ws.iter()
+                .zip(&banks)
+                .map(|(w, b)| (*w, b.as_slice()))
+                .collect::<Vec<_>>(),
+            &ds.iter()
+                .zip(&outs)
+                .map(|(d, o)| (*d, m * o))
+                .collect::<Vec<_>>(),
+        );
+        let quants = vk.i8cm_kq_counts().quant_passes - before.quant_passes;
+        assert_eq!(quants, 1, "q, k and v on one input should quantize it once");
+        for i in 0..3 {
+            assert!(
+                same(&got[i], &alone(&banks[i], &x0, m, in_f, outs[i])),
+                "projection {i} on the shared quantization differs from quantizing alone"
+            );
+        }
+    }
+
+    // The input rewritten between two Linears: the second must quantize the new contents.
+    {
+        let mut g = Graph::new();
+        let s0 = g.input(f32d(m * in_f));
+        let s1 = g.input(f32d(m * in_f));
+        let x = g.internal(f32d(m * in_f));
+        let wq = g.weight(wdesc(banks[0].len()));
+        let wk = g.weight(wdesc(banks[1].len()));
+        let dq = g.output(f32d(m * outs[0]));
+        let dk = g.output(f32d(m * outs[1]));
+        kq_copy(&mut g, s0, x, m, in_f);
+        kq_lin(&mut g, x, wq, dq, m, in_f, outs[0]);
+        kq_copy(&mut g, s1, x, m, in_f);
+        kq_lin(&mut g, x, wk, dk, m, in_f, outs[1]);
+        let got = run_bytes(
+            &vk,
+            &g,
+            &[(s0, &x0), (s1, &x1)],
+            &[(wq, &banks[0]), (wk, &banks[1])],
+            &[(dq, m * outs[0]), (dk, m * outs[1])],
+        );
+        assert!(
+            same(&got[1], &alone(&banks[1], &x1, m, in_f, outs[1])),
+            "a Linear after its input was rewritten reused the stale quantization"
+        );
+    }
+
+    // A multi-row GEMV (8 rows, an 8M-element weight) and then a GEMM (a width past the GEMV
+    // band) on the same input: the GEMV's memo names its own scratch, which the GEMM must not
+    // read as its own.
+    {
+        let (m, in_f, o_a, o_b) = (8usize, 4096usize, 2048usize, 12288usize);
+        let ba = kq_bank(dt, o_a * in_f, 0xa1);
+        let bb = kq_bank(dt, o_b * in_f, 0xb2);
+        let xs = kq_activations(m, in_f);
+        let mut g = Graph::new();
+        let src = g.input(f32d(m * in_f));
+        let x = g.internal(f32d(m * in_f));
+        let wa = g.weight(wdesc(ba.len()));
+        let wb = g.weight(wdesc(bb.len()));
+        let da = g.output(f32d(m * o_a));
+        let db = g.output(f32d(m * o_b));
+        kq_copy(&mut g, src, x, m, in_f);
+        kq_lin(&mut g, x, wa, da, m, in_f, o_a);
+        kq_lin(&mut g, x, wb, db, m, in_f, o_b);
+        let before = vk.i8cm_kq_counts();
+        let got = run_bytes(
+            &vk,
+            &g,
+            &[(src, &xs)],
+            &[(wa, &ba), (wb, &bb)],
+            &[(da, m * o_a), (db, m * o_b)],
+        );
+        let after = vk.i8cm_kq_counts();
+        assert_eq!(
+            after.medium_tile + after.large_tile - before.medium_tile - before.large_tile,
+            1,
+            "only the wide Linear should take the int8 coopmat GEMM"
+        );
+        assert!(
+            same(&got[1], &alone(&bb, &xs, m, in_f, o_b)),
+            "the GEMM read the multi-row GEMV's quantization as its own"
+        );
+    }
+}

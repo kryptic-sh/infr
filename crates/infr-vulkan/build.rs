@@ -2284,6 +2284,70 @@ fn main() {
             "native_gemm_i8cm_q8_0_rowscale",
             &["-DROW_SCALE"],
         ),
+        // int8 coopmat (WMMA) prefill GEMM for the K-quants, weight read by device address
+        // (native_gemm_i8cm_kq.comp; adapter.rs `i8cm_kq_ok`). Two tiles per format: `_l`
+        // (128 tokens x 128 rows, 512 threads) for grids that fill the device, `_m` (64 x 64,
+        // 128 threads) for the narrower ones.
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q4k_l",
+            &[
+                "-DFMT_Q4K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=128u",
+                "-DTILE_BKS=2u",
+            ],
+        ),
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q4k_m",
+            &[
+                "-DFMT_Q4K",
+                "-DTILE_BT=64u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=4u",
+            ],
+        ),
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q5k_l",
+            &[
+                "-DFMT_Q5K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=128u",
+                "-DTILE_BKS=2u",
+            ],
+        ),
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q5k_m",
+            &[
+                "-DFMT_Q5K",
+                "-DTILE_BT=64u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=4u",
+            ],
+        ),
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q6k_l",
+            &[
+                "-DFMT_Q6K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=128u",
+                "-DTILE_BKS=2u",
+            ],
+        ),
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q6k_m",
+            &[
+                "-DFMT_Q6K",
+                "-DTILE_BT=64u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=4u",
+            ],
+        ),
         // Row-wise activation quant for the int8-coopmat GEMM's "Idea 2" measurement (whole-K
         // scale instead of per-32-block; see quant_q8_row.comp). Gated by INFR_I8_ROW_SCALE=1.
         ("quant_q8_row", "quant_q8_row", &[]),

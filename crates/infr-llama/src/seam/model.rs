@@ -1068,6 +1068,23 @@ impl SeamModel {
         )
     }
 
+    /// [`verify_logits_and_h_cpu`](Self::verify_logits_and_h_cpu)'s Vulkan twin, logits only:
+    /// every position's next-token logits (`[tokens.len() * vocab]`) from one batched prefill
+    /// forward. Dense non-MoE models only.
+    pub fn verify_logits_vulkan(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
+            .map_err(|e| anyhow!("vulkan init: {e}"))?;
+        crate::seam::verify_rows_vulkan(
+            &vk,
+            &self.gguf,
+            &self.cfg,
+            &self.ecfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            tokens,
+        )
+    }
+
     /// Open a Phase-2 DiffusionGemma denoise session on the CPU reference backend (see
     /// `docs/diffusion-gemma.md`): [`prefill`](DiffusionGemmaCpuSession::prefill) causally
     /// prefills the prompt ONCE (encoder scalars, KV rows `0..P`), then repeated

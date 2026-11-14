@@ -267,6 +267,9 @@ cfg_struct! {
         i8_coopmat: bool = false,
         /// `INFR_I8_ROW_SCALE`.
         i8_row_scale: bool = false,
+        /// `INFR_NO_I8CM_KQ` (inverted): the int8 cooperative-matrix K-quant prefill GEMM
+        /// (`native_gemm_i8cm_kq.comp`) on the devices it was measured faster on.
+        i8cm_kq: bool = true,
         /// `INFR_NO_F16` (inverted).
         f16: bool = true,
         /// `INFR_NO_I8DOT` (inverted).

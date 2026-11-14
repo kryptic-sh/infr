@@ -304,6 +304,10 @@ fn assert_native_k(kernel: &str, in_f: usize) {
     );
 }
 
+/// 32-element blocks `quant_q8.comp` quantizes per workgroup, one subgroup each. MIRRORS the
+/// shader's `QUANT_Q8_BLOCKS_PER_WG`; `quant_q8_blocks_per_wg_matches_shader` fails on a drift.
+const QUANT_Q8_BLOCKS_PER_WG: usize = 8;
+
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
 
@@ -2671,6 +2675,64 @@ impl<'a> Recorder<'a> {
                 Self::vkb(dact),
                 Self::vkb(sact),
                 Self::vkb(w),
+                Self::vkb(c),
+            ],
+            1,
+            &push,
+            groups,
+        );
+    }
+
+    /// int8 cooperative-matrix prefill GEMM for a K-quant weight (`native_gemm_i8cm_kq.comp`):
+    /// `c[m, n] = qa·Wᵀ` with `qa`/`dact`/`sact` from [`Self::quant_q8`] and the weight read by
+    /// its 64-bit device address `w_addr` from element `w_base`. Writes only the `m` real rows of
+    /// `c`. The adapter dispatches it only once the accumulator-layout probe has passed
+    /// (`VulkanBackend::i8cm_kq_ready`); the shape contract is asserted here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matmul_i8cm_kq(
+        &self,
+        dtype: infr_core::DType,
+        tile: crate::gemm::I8cmTile,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        w_addr: u64,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (name, spv) = crate::gemm::native_gemm_i8cm_kq_spv(dtype, tile)
+            .unwrap_or_else(|| panic!("matmul_i8cm_kq: no int8 coopmat build for {dtype:?}"));
+        assert!(
+            k.is_multiple_of(256) && w_base.is_multiple_of(256),
+            "{name}: k ({k}) and w_base ({w_base}) must be whole K-quant superblocks"
+        );
+        assert!(
+            n.is_multiple_of(tile.rows()) && (k / 32).is_multiple_of(tile.k_blocks()),
+            "{name}: n ({n}) or k ({k}) is off the {tile:?} tile"
+        );
+        self.label_gemm(name, m, k, n);
+        self.be.note_i8cm_kq(match tile {
+            crate::gemm::I8cmTile::L => crate::I8cmKqEvent::LargeTile,
+            crate::gemm::I8cmTile::M => crate::I8cmKqEvent::MediumTile,
+        });
+        let kern = self.be.kernel_sg(name, spv, 4, 24, 32);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
+        let groups = (m.div_ceil(tile.tokens()) * (n / tile.rows())) as u32;
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
                 Self::vkb(c),
             ],
             1,
@@ -9494,7 +9556,7 @@ impl<'a> Recorder<'a> {
             ],
             3,
             &p,
-            (n_slots * (k_dim / 32)) as u32,
+            (n_slots * (k_dim / 32)).div_ceil(QUANT_Q8_BLOCKS_PER_WG) as u32,
         );
     }
 
@@ -10071,7 +10133,7 @@ impl<'a> Recorder<'a> {
             ],
             3,
             &p,
-            (m * (k / 32)) as u32,
+            (m * (k / 32)).div_ceil(QUANT_Q8_BLOCKS_PER_WG) as u32,
         );
     }
 
@@ -11123,6 +11185,15 @@ mod tests {
             const { std::cell::Cell::new(None) };
     }
 
+    /// The grid `quant_q8`/`quant_q8_gather` are dispatched at is sized by
+    /// [`QUANT_Q8_BLOCKS_PER_WG`]; the shader indexes its blocks by its own copy of the number.
+    #[test]
+    fn quant_q8_blocks_per_wg_matches_shader() {
+        let src = include_str!("../shaders/quant_q8.comp");
+        let want = format!("#define QUANT_Q8_BLOCKS_PER_WG {QUANT_Q8_BLOCKS_PER_WG}u");
+        assert!(src.contains(&want), "quant_q8.comp lacks `{want}`");
+    }
+
     /// A backend built on an EXPLICIT Vulkan kernel-tier configuration.
     ///
     /// This is what replaced `EnvGuard::with([("INFR_FLASH_SPLITS", "4"), …])` in every test below:
@@ -11415,6 +11486,8 @@ mod tests {
         const NT: usize = 128 * N;
         // One workgroup per 32-element block.
         const NQ8: usize = 32 * 11;
+        // `quant_q8`: QUANT_Q8_BLOCKS_PER_WG blocks per workgroup, the last workgroup ragged.
+        const NQ8B: usize = 32 * (QUANT_Q8_BLOCKS_PER_WG * 4 + 3);
         // Workgroup-per-unit kernels (rope family, attention, qk_norm_rope, linear_bf16).
         const HD: usize = 64;
         const UNITS: usize = 5;
@@ -11535,13 +11608,13 @@ mod tests {
             ),
             (
                 "quant_q8",
-                vec![f(NQ8), f(NQ8), f(NQ8), f(NQ8)],
-                Box::new(|r, b| r.quant_q8(b[0], b[1], b[2], b[3], 1, NQ8)),
+                vec![f(NQ8B), f(NQ8B), f(NQ8B), f(NQ8B)],
+                Box::new(|r, b| r.quant_q8(b[0], b[1], b[2], b[3], 1, NQ8B)),
             ),
             (
                 "quant_q8_gather",
-                vec![f(NQ8), (4, Fill::Zero, Act), f(NQ8), f(NQ8), f(NQ8)],
-                Box::new(|r, b| r.quant_q8_gather(b[0], b[1], b[2], b[3], b[4], 1, NQ8)),
+                vec![f(NQ8B), (4, Fill::Zero, Act), f(NQ8B), f(NQ8B), f(NQ8B)],
+                Box::new(|r, b| r.quant_q8_gather(b[0], b[1], b[2], b[3], b[4], 1, NQ8B)),
             ),
             (
                 "store_f16_off",

@@ -1,0 +1,371 @@
+#version 460
+// int8 cooperative-matrix (WMMA) prefill GEMM for the K-quants (Q4_K, Q5_K, Q6_K):
+// C[m,n] = A[m,k]·Wᵀ with A pre-quantized by `quant_q8` (int8 `qa`, per-32-block f16 scale
+// `dact` and Σd·q `sact`) and W read raw by its 64-bit device address. A port of llama.cpp's
+// `mul_mmq_cm1.comp` (the `matmul_q4_k_q8_1` family its Vulkan backend runs on RDNA3), with the
+// roles transposed to infr's row-major output: the activation tile is the coopmat A operand
+// (rows = tokens) and the weight tile is the B operand (columns = output features), so the 16
+// lanes that share an accumulator row store 16 adjacent floats.
+//
+// Per 32-element k block the int32 dot of the int8 activations and the int8 weight values comes
+// from `coopMatMulAdd`; each lane then scales its own accumulator elements into float sums:
+//   Q4_K/Q5_K: w = d·sc·q − dmin·mn  →  Σ = dA·(d·sc)·Σqa·q + sA·(−dmin·mn)
+//   Q6_K:      w = d·sc16·(q − 32), one scale per 16-element half → one int32 product per half.
+// Reading accumulator elements directly relies on the fragment layout `coopmat_i8_layout.comp`
+// verifies at init (`VulkanBackend::verify_i8_coopmat_layout`): lane `l` owns elements
+// (2·e + (l >> 4), l & 15). Nothing dispatches this kernel unless that probe passed.
+//
+// Workgroup tile BT tokens × BW weight rows, each subgroup a 32×32 block of it (2×2 fragments),
+// k staged BK_STEP blocks of 32 at a time through shared memory, the next step's global reads
+// held in registers while the current step computes. Requires n % BW == 0, k % 256 == 0 (a
+// K-quant superblock), w_base % 256 == 0 and k / 32 % BK_STEP == 0; rows past m read zeros and
+// are never stored. requiredSubgroupSize = 32.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+
+#include "native_weight_addr.glsl"
+
+#if !defined(FMT_Q4K) && !defined(FMT_Q5K) && !defined(FMT_Q6K)
+#error "native_gemm_i8cm_kq: define FMT_Q4K, FMT_Q5K or FMT_Q6K"
+#endif
+#if !defined(TILE_BT) || !defined(TILE_BW) || !defined(TILE_BKS)
+#error "native_gemm_i8cm_kq: define TILE_BT, TILE_BW and TILE_BKS"
+#endif
+
+const uint BT = TILE_BT;       // tokens per workgroup
+const uint BW = TILE_BW;       // weight rows (output features) per workgroup
+const uint BK_STEP = TILE_BKS; // 32-element k blocks staged per barrier pair
+const uint FRAG = 16u;
+const uint SG_T = BT / 32u;
+const uint NSG = SG_T * (BW / 32u);
+const uint THREADS = NSG * 32u;
+// Shared row pitch in words: BK_STEP blocks of 8 words, padded so neighbouring rows start in
+// different banks.
+const uint QP = BK_STEP * 8u + 4u;
+
+#ifdef FMT_Q6K
+const uint KSCALES = 2u; // one weight scale per 16-element half block
+#else
+const uint KSCALES = 1u;
+#endif
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint w_lo; uint w_hi;
+} pc;
+layout(binding = 0) readonly buffer QA { uvec4 qa4[]; };       // [m, k] int8, 16 per uvec4
+layout(binding = 1) readonly buffer DA { float16_t dact[]; };  // [m, k/32]
+layout(binding = 2) readonly buffer SA { float16_t sact[]; };  // [m, k/32]
+layout(binding = 3) writeonly buffer CB { float c[]; };        // [m, n]
+
+shared uint As[BT * QP];
+shared uint Bs[BW * QP];
+shared float Ad[BK_STEP * BT];
+shared float Bd[BK_STEP * KSCALES * BW];
+#ifndef FMT_Q6K
+shared float Asum[BK_STEP * BT];
+shared float Bmin[BK_STEP * BW];
+#endif
+
+// Register staging, one entry per item this thread moves per k step.
+const uint A_PER = (BT * BK_STEP * 2u) / THREADS;               // uvec4 halves of a 32 block
+const uint AS_PER = (BT * BK_STEP + THREADS - 1u) / THREADS;    // activation scales
+const uint B_PER = (BW * BK_STEP * 4u) / THREADS;               // 8-value quarters of a block
+const uint BS_PER = (BW * BK_STEP + THREADS - 1u) / THREADS;    // weight scales
+
+uvec4 pre_a[A_PER];
+vec2 pre_as[AS_PER];
+#if defined(FMT_Q4K)
+const uint SB_WORDS = 36u; // 144-byte superblock: d|dmin, scales[12], qs[128]
+uvec2 pre_b[B_PER];
+uvec4 pre_bs[BS_PER];
+#elif defined(FMT_Q5K)
+const uint SB_WORDS = 44u; // 176-byte superblock: d|dmin, scales[12], qh[32], qs[128]
+uvec4 pre_b[B_PER];        // qs pair, qh pair
+uvec4 pre_bs[BS_PER];
+#else
+const uint SB_BYTES = 210u; // ql[128], qh[64], scales[16] int8, d f16 — only 2-byte aligned
+uvec3 pre_bl[B_PER];
+uvec3 pre_bh[B_PER];
+uvec2 pre_bs[BS_PER];
+#endif
+
+// The 32-element weight block a (row, step-local block) item reads.
+uint wblock(uint o0, uint row, uint kb, uint ks) {
+    return (pc.w_base + (o0 + row) * pc.k) / 32u + kb + ks;
+}
+
+#ifdef FMT_Q6K
+// Eight bytes at a 2-byte-aligned offset: three words read raw; `join8` shifts them into place
+// once the loads have landed, so the shift costs nothing while the reads are in flight.
+uvec3 read8(uint byte_off) {
+    uint wi = byte_off >> 2u;
+    return uvec3(arena_word(wi), arena_word(wi + 1u), arena_word(wi + 2u));
+}
+uvec2 join8(uvec3 w, uint byte_off) {
+    if ((byte_off & 2u) == 0u) {
+        return w.xy;
+    }
+    return uvec2((w.x >> 16u) | (w.y << 16u), (w.y >> 16u) | (w.z << 16u));
+}
+uint half16(uint word, uint byte_off) {
+    return (byte_off & 2u) == 0u ? (word & 0xFFFFu) : (word >> 16u);
+}
+// Signed 6-bit value q − 32 in each byte of a packed word.
+uint recenter32(uint v) {
+    return ((v | 0x80808080u) - 0x20202020u) ^ 0x80808080u;
+}
+#endif
+
+void prefetch(uint t0, uint o0, uint kb, uint tid) {
+    uint nblk = pc.k / 32u;
+    [[unroll]] for (uint i = 0u; i < A_PER; i++) {
+        uint idx = tid + i * THREADS;
+        uint r = idx / (BK_STEP * 2u);
+        uint q = idx % (BK_STEP * 2u);
+        uint row = t0 + r;
+        pre_a[i] = row < pc.m ? qa4[row * (pc.k / 16u) + kb * 2u + q] : uvec4(0u);
+    }
+    [[unroll]] for (uint i = 0u; i < AS_PER; i++) {
+        uint idx = tid + i * THREADS;
+        uint r = idx / BK_STEP;
+        uint ks = idx % BK_STEP;
+        uint row = t0 + r;
+        bool live = idx < BT * BK_STEP && row < pc.m;
+        uint at = row * nblk + kb + ks;
+        pre_as[i] = live ? vec2(float(dact[at]), float(sact[at])) : vec2(0.0);
+    }
+    [[unroll]] for (uint i = 0u; i < B_PER; i++) {
+        uint idx = tid + i * THREADS;
+        uint r = idx / (BK_STEP * 4u);
+        uint ks = (idx / 4u) % BK_STEP;
+        uint lr = idx % 4u;
+        uint gb = wblock(o0, r, kb, ks);
+        uint sb = gb >> 3u;
+        uint sub = gb & 7u;
+#if defined(FMT_Q4K)
+        pre_b[i] = arena_word2(sb * SB_WORDS + 4u + (sub >> 1u) * 8u + lr * 2u);
+#elif defined(FMT_Q5K)
+        uvec2 qs = arena_word2(sb * SB_WORDS + 12u + (sub >> 1u) * 8u + lr * 2u);
+        uvec2 qh = arena_word2(sb * SB_WORDS + 4u + lr * 2u);
+        pre_b[i] = uvec4(qs, qh);
+#else
+        uint g = sub >> 2u;
+        uint j = sub & 3u;
+        uint base = sb * SB_BYTES;
+        pre_bl[i] = read8(base + g * 64u + (j & 1u) * 32u + lr * 8u);
+        pre_bh[i] = read8(base + 128u + g * 32u + lr * 8u);
+#endif
+    }
+    [[unroll]] for (uint i = 0u; i < BS_PER; i++) {
+        uint idx = tid + i * THREADS;
+        uint r = idx / BK_STEP;
+        uint ks = idx % BK_STEP;
+        if (idx < BW * BK_STEP) {
+            uint gb = wblock(o0, r, kb, ks);
+            uint sb = gb >> 3u;
+#if defined(FMT_Q6K)
+            uint base = sb * SB_BYTES;
+            uint sub = gb & 7u;
+            pre_bs[i] = uvec2(arena_word((base + 192u + sub * 2u) >> 2u),
+                              arena_word((base + 208u) >> 2u));
+#else
+            pre_bs[i] = arena_word4(sb * SB_WORDS);
+#endif
+        }
+    }
+}
+
+void store_to_shared(uint o0, uint kb, uint tid) {
+    [[unroll]] for (uint i = 0u; i < A_PER; i++) {
+        uint idx = tid + i * THREADS;
+        uint r = idx / (BK_STEP * 2u);
+        uint q = idx % (BK_STEP * 2u);
+        uint at = r * QP + q * 4u;
+        As[at] = pre_a[i].x;
+        As[at + 1u] = pre_a[i].y;
+        As[at + 2u] = pre_a[i].z;
+        As[at + 3u] = pre_a[i].w;
+    }
+    [[unroll]] for (uint i = 0u; i < AS_PER; i++) {
+        uint idx = tid + i * THREADS;
+        if (idx < BT * BK_STEP) {
+            uint r = idx / BK_STEP;
+            uint ks = idx % BK_STEP;
+            Ad[ks * BT + r] = pre_as[i].x;
+#ifndef FMT_Q6K
+            Asum[ks * BT + r] = pre_as[i].y;
+#endif
+        }
+    }
+    [[unroll]] for (uint i = 0u; i < B_PER; i++) {
+        uint idx = tid + i * THREADS;
+        uint r = idx / (BK_STEP * 4u);
+        uint ks = (idx / 4u) % BK_STEP;
+        uint lr = idx % 4u;
+        uint sub = wblock(o0, r, kb, ks) & 7u;
+        uvec2 v;
+#if defined(FMT_Q4K)
+        v = (pre_b[i] >> ((sub & 1u) * 4u)) & 0x0F0F0F0Fu;
+#elif defined(FMT_Q5K)
+        v = (pre_b[i].xy >> ((sub & 1u) * 4u)) & 0x0F0F0F0Fu;
+        v |= ((pre_b[i].zw >> sub) & 0x01010101u) << 4u;
+#else
+        uint gb = wblock(o0, r, kb, ks);
+        uint base = (gb >> 3u) * SB_BYTES;
+        uint g = sub >> 2u;
+        uint j = sub & 3u;
+        uvec2 ql = join8(pre_bl[i], base + g * 64u + (j & 1u) * 32u + lr * 8u);
+        uvec2 qh = join8(pre_bh[i], base + 128u + g * 32u + lr * 8u);
+        ql = (ql >> ((j >> 1u) * 4u)) & 0x0F0F0F0Fu;
+        v = ql | (((qh >> (j * 2u)) & 0x03030303u) << 4u);
+        v = uvec2(recenter32(v.x), recenter32(v.y));
+#endif
+        uint at = r * QP + ks * 8u + lr * 2u;
+        Bs[at] = v.x;
+        Bs[at + 1u] = v.y;
+    }
+    [[unroll]] for (uint i = 0u; i < BS_PER; i++) {
+        uint idx = tid + i * THREADS;
+        if (idx < BW * BK_STEP) {
+            uint r = idx / BK_STEP;
+            uint ks = idx % BK_STEP;
+            uint gb = wblock(o0, r, kb, ks);
+            uint sub = gb & 7u;
+#if defined(FMT_Q6K)
+            uint base = (gb >> 3u) * SB_BYTES;
+            uint sc = half16(pre_bs[i].x, base + 192u + sub * 2u);
+            float d = unpackHalf2x16(half16(pre_bs[i].y, base + 208u)).x;
+            Bd[(ks * KSCALES) * BW + r] = d * float(int(sc << 24u) >> 24);
+            Bd[(ks * KSCALES + 1u) * BW + r] = d * float(int(sc << 16u) >> 24);
+#else
+            // get_scale_min_k4: for j < 4 the 6-bit scale/min sit in bytes j and j+4; above
+            // that they are split across byte j+4 (low bits) and the top two bits of bytes
+            // j-4 and j. Byte b of the scales lives in word 1 + b/4 at lane b%4.
+            uint j = sub & 3u;
+            uint s_j = (pre_bs[i].y >> (8u * j)) & 0xFFu;
+            uint s_j4 = (pre_bs[i].z >> (8u * j)) & 0xFFu;
+            uint s_j8 = (pre_bs[i].w >> (8u * j)) & 0xFFu;
+            uint sc = sub < 4u ? (s_j & 0x3Fu) : ((s_j8 & 0x0Fu) | ((s_j >> 6u) << 4u));
+            uint mn = sub < 4u ? (s_j4 & 0x3Fu) : ((s_j8 >> 4u) | ((s_j4 >> 6u) << 4u));
+            vec2 dm = unpackHalf2x16(pre_bs[i].x);
+            Bd[ks * BW + r] = dm.x * float(sc);
+            Bmin[ks * BW + r] = -dm.y * float(mn);
+#endif
+        }
+    }
+}
+
+void main() {
+    w_addr = arena_base(pc.w_lo, pc.w_hi);
+    uint tiles_t = (pc.m + BT - 1u) / BT;
+    uint t0 = (gl_WorkGroupID.x % tiles_t) * BT;
+    uint o0 = (gl_WorkGroupID.x / tiles_t) * BW;
+    uint tid = gl_LocalInvocationIndex;
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint wt0 = (sg % SG_T) * 32u; // this subgroup's token offset in the tile
+    uint ww0 = (sg / SG_T) * 32u; // and its weight-row offset
+    uint col = lane & 15u;
+    uint rhalf = lane >> 4u;
+
+    float sums[2u * 2u * 8u];
+    [[unroll]] for (uint i = 0u; i < 32u; i++) {
+        sums[i] = 0.0;
+    }
+
+    uint nblk = pc.k / 32u;
+    prefetch(t0, o0, 0u, tid);
+    for (uint kb = 0u; kb < nblk; kb += BK_STEP) {
+        store_to_shared(o0, kb, tid);
+        barrier();
+        if (kb + BK_STEP < nblk) {
+            prefetch(t0, o0, kb + BK_STEP, tid);
+        }
+        [[unroll]] for (uint ks = 0u; ks < BK_STEP; ks++) {
+            coopmat<int8_t, gl_ScopeSubgroup, FRAG, FRAG, gl_MatrixUseA> fa[4];
+            coopmat<int8_t, gl_ScopeSubgroup, FRAG, FRAG, gl_MatrixUseB> fb[4];
+            [[unroll]] for (uint r = 0u; r < 2u; r++) {
+                [[unroll]] for (uint h = 0u; h < 2u; h++) {
+                    coopMatLoad(fa[r * 2u + h], As, (wt0 + r * FRAG) * QP + ks * 8u + h * 4u, QP,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                }
+            }
+            [[unroll]] for (uint cf = 0u; cf < 2u; cf++) {
+                [[unroll]] for (uint h = 0u; h < 2u; h++) {
+                    coopMatLoad(fb[cf * 2u + h], Bs, (ww0 + cf * FRAG) * QP + ks * 8u + h * 4u, QP,
+                                gl_CooperativeMatrixLayoutColumnMajor);
+                }
+            }
+            float bd0[2];
+            float bd1[2];
+            [[unroll]] for (uint cf = 0u; cf < 2u; cf++) {
+                uint wr = ww0 + cf * FRAG + col;
+#ifdef FMT_Q6K
+                bd0[cf] = Bd[(ks * KSCALES) * BW + wr];
+                bd1[cf] = Bd[(ks * KSCALES + 1u) * BW + wr];
+#else
+                bd0[cf] = Bd[ks * BW + wr];
+                bd1[cf] = Bmin[ks * BW + wr];
+#endif
+            }
+            [[unroll]] for (uint r = 0u; r < 2u; r++) {
+                float ad[8];
+#ifndef FMT_Q6K
+                float as_[8];
+#endif
+                [[unroll]] for (uint e = 0u; e < 8u; e++) {
+                    uint tr = wt0 + r * FRAG + 2u * e + rhalf;
+                    ad[e] = Ad[ks * BT + tr];
+#ifndef FMT_Q6K
+                    as_[e] = Asum[ks * BT + tr];
+#endif
+                }
+                [[unroll]] for (uint cf = 0u; cf < 2u; cf++) {
+                    uint s = (r * 2u + cf) * 8u;
+#ifdef FMT_Q6K
+                    coopmat<int, gl_ScopeSubgroup, FRAG, FRAG, gl_MatrixUseAccumulator> acc0 =
+                        coopmat<int, gl_ScopeSubgroup, FRAG, FRAG, gl_MatrixUseAccumulator>(0);
+                    coopmat<int, gl_ScopeSubgroup, FRAG, FRAG, gl_MatrixUseAccumulator> acc1 =
+                        coopmat<int, gl_ScopeSubgroup, FRAG, FRAG, gl_MatrixUseAccumulator>(0);
+                    acc0 = coopMatMulAdd(fa[r * 2u], fb[cf * 2u], acc0);
+                    acc1 = coopMatMulAdd(fa[r * 2u + 1u], fb[cf * 2u + 1u], acc1);
+                    [[unroll]] for (uint e = 0u; e < 8u; e++) {
+                        float dot = fma(float(acc0[e]), bd0[cf], float(acc1[e]) * bd1[cf]);
+                        sums[s + e] = fma(dot, ad[e], sums[s + e]);
+                    }
+#else
+                    coopmat<int, gl_ScopeSubgroup, FRAG, FRAG, gl_MatrixUseAccumulator> acc =
+                        coopmat<int, gl_ScopeSubgroup, FRAG, FRAG, gl_MatrixUseAccumulator>(0);
+                    acc = coopMatMulAdd(fa[r * 2u], fb[cf * 2u], acc);
+                    acc = coopMatMulAdd(fa[r * 2u + 1u], fb[cf * 2u + 1u], acc);
+                    [[unroll]] for (uint e = 0u; e < 8u; e++) {
+                        float t = fma(float(acc[e]) * ad[e], bd0[cf], sums[s + e]);
+                        sums[s + e] = fma(as_[e], bd1[cf], t);
+                    }
+#endif
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint r = 0u; r < 2u; r++) {
+        [[unroll]] for (uint cf = 0u; cf < 2u; cf++) {
+            uint s = (r * 2u + cf) * 8u;
+            uint oc = o0 + ww0 + cf * FRAG + col;
+            [[unroll]] for (uint e = 0u; e < 8u; e++) {
+                uint tr = t0 + wt0 + r * FRAG + 2u * e + rhalf;
+                if (tr < pc.m) {
+                    c[tr * pc.n + oc] = sums[s + e];
+                }
+            }
+        }
+    }
+}

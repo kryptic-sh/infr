@@ -503,13 +503,21 @@ struct VulkanKvReference {
 }
 
 /// The Vulkan seam's last-row logits for each prefix, on a `(K, V)` cache.
+///
+/// The prefill GEMMs are pinned to f16 activations (`kernels.vulkan.i8cm_kq = false`): these
+/// checks score the cache format, and the int8 coopmat GEMM's activation rounding would be a
+/// second error source under the same floors. `gpu_seam_int8_prefill_tracks_cpu` scores the
+/// shipped default instead.
 fn kv_vulkan_rows(
     path: &std::path::Path,
     k: &str,
     v: &str,
     r: &VulkanKvReference,
 ) -> Vec<Vec<f32>> {
-    let model = model_cfg(path, |c| kv_types(c, k, v));
+    let model = model_cfg(path, |c| {
+        kv_types(c, k, v);
+        c.kernels.vulkan.i8cm_kq = false;
+    });
     r.prefixes
         .iter()
         .map(|&p| {
@@ -534,21 +542,23 @@ fn kv_vulkan_reference(path: &std::path::Path) -> &'static VulkanKvReference {
             f16: Vec::new(),
         };
         r.f16 = kv_vulkan_rows(path, "f16", "f16", &r);
-        assert_vulkan_kv_rows_track_the_cpu(path, "f16", "f16", &r, &r.f16);
+        let floor = kv_vulkan_cosine_floor("f16", "f16");
+        assert_vulkan_kv_rows_track_the_cpu(path, "f16", "f16", &r, &r.f16, floor);
         r
     })
 }
 
 /// Score Vulkan last-row logits on a `(K, V)` cache against the CPU REFERENCE backend (f32
 /// weights, f32 dot — the oracle `seam_vulkan_matches_cpu` uses) running the same format: on every
-/// prefix the two must reach the format's cosine floor, and the CPU's greedy token may fall outside
-/// the GPU's top [`KV_TOP_K`] on at most [`KV_VULKAN_PICK_MISSES_MAX`] of the prefixes.
+/// prefix the two must reach the cosine `floor`, and the CPU's greedy token may fall outside the
+/// GPU's top [`KV_TOP_K`] on at most [`KV_VULKAN_PICK_MISSES_MAX`] of the prefixes.
 fn assert_vulkan_kv_rows_track_the_cpu(
     path: &std::path::Path,
     k: &str,
     v: &str,
     r: &VulkanKvReference,
     gpu: &[Vec<f32>],
+    floor: f64,
 ) {
     let cpu = model_cfg(path, |c| {
         kv_types(c, k, v);
@@ -558,7 +568,6 @@ fn assert_vulkan_kv_rows_track_the_cpu(
     .expect("all-rows logits")
     .0;
     let vocab = cpu.len() / r.ids.len();
-    let floor = kv_vulkan_cosine_floor(k, v);
     let mut agree = 0;
     let mut worst = f64::INFINITY;
     assert_eq!(gpu.len(), r.prefixes.len(), "one GPU row per prefix");
@@ -611,7 +620,7 @@ fn assert_vulkan_kv_formats_track_the_cpu(path: &std::path::Path, formats: &[(&s
                 "Vulkan K={k} V={v} produced the f16 cache's logits bit for bit — the dtype never reached the cache"
             );
         }
-        assert_vulkan_kv_rows_track_the_cpu(path, k, v, r, &got);
+        assert_vulkan_kv_rows_track_the_cpu(path, k, v, r, &got, kv_vulkan_cosine_floor(k, v));
     }
 }
 
@@ -1023,6 +1032,58 @@ fn gpu_seam_kv_formats_track_cpu() {
             ("f16", "turbo3"),
             ("f16", "turbo4"),
         ],
+    );
+}
+
+/// [`gpu_seam_int8_prefill_tracks_cpu`]'s floor: the shipped prefill (the int8 coopmat GEMM, f16
+/// KV) against the CPU reference on the KV-format test's prompt and prefixes. Measured worst
+/// 0.9984 on the 7900 XTX (2026-11-15; 0.9996 with the GEMM pinned to f16 activations); a
+/// prefill whose GEMM misreads its weights measures far below.
+const VULKAN_INT8_PREFILL_COSINE_MIN: f64 = 0.995;
+
+/// The shipped Vulkan prefill — the int8 coopmat K-quant GEMM where the device runs it, f16 KV —
+/// scored against the CPU reference on the KV-format test's prompt and prefixes, which pin the
+/// GEMM to f16 activations to isolate the cache. Its logits must differ from that pinned path's
+/// (or the int8 GEMM never ran) and stay above [`VULKAN_INT8_PREFILL_COSINE_MIN`].
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_int8_prefill_tracks_cpu() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let mut _tlk = test_serial_lock();
+    let mut cfg = infr_llama::EngineConfig::default();
+    cfg.device.dev = std::env::var("INFR_DEV").ok();
+    let armed = infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(cfg))
+        .map(|vk| vk.int8_coopmat_prefill())
+        .unwrap_or(false);
+    if !armed {
+        eprintln!(
+            "gpu_seam_int8_prefill_tracks_cpu: no int8 coopmat prefill GEMM on this device — skipped"
+        );
+        return;
+    }
+    let r = kv_vulkan_reference(&path);
+    let model = model_cfg(&path, |c| kv_types(c, "f16", "f16"));
+    let rows: Vec<Vec<f32>> = r
+        .prefixes
+        .iter()
+        .map(|&p| {
+            model
+                .prefill_logits_vulkan(&r.ids[..p])
+                .expect("vulkan logits")
+        })
+        .collect();
+    let digests = |rs: &[Vec<f32>]| rs.iter().map(|row| logits_digest(row)).collect::<Vec<_>>();
+    assert!(
+        digests(&rows) != digests(&r.f16),
+        "the default prefill produced the f16-activation GEMM's logits bit for bit — the int8 coopmat GEMM never ran"
+    );
+    assert_vulkan_kv_rows_track_the_cpu(
+        &path,
+        "f16",
+        "f16",
+        r,
+        &rows,
+        VULKAN_INT8_PREFILL_COSINE_MIN,
     );
 }
 

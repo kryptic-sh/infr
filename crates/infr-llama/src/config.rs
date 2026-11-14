@@ -168,6 +168,25 @@ pub struct Config {
     /// `attn_q` (`[h0 q(hd) | h0 gate(hd) | h1 q | h1 gate | …]`, NOT two contiguous blocks) —
     /// the one real trap in `docs/qwen35.md`. `true` only for qwen35.
     pub attn_out_gate: bool,
+    /// LFM3 (`arch == "lfm3"`): gated short-convolution layers ([`Config::is_shortconv_layer`])
+    /// interleaved with attention layers that carry QK-norm and a per-head sigmoid output gate
+    /// (`attn_gate`), sandwich norms, and a per-layer sliding-window pattern
+    /// ([`Config::swa_layers`]). `false` for every other arch.
+    pub lfm3: bool,
+    /// LFM3: which layers are short-convolution layers (`attention.head_count_kv[il] == 0`, as
+    /// `lfm3.cpp::load_arch_hparams` decides). Empty for every other arch.
+    pub shortconv_layers: Vec<bool>,
+    /// LFM3: the short convolution's kernel width (`shortconv.l_cache`); its rolling history holds
+    /// one fewer row. `0` for every other arch.
+    pub shortconv_l_cache: usize,
+    /// LFM3: the per-layer sliding-window flags (`attention.sliding_window_pattern`, read as an
+    /// array the way `lfm3.cpp` reads it), which [`Config::is_swa_layer`] answers from when it is
+    /// non-empty. Empty for every other arch, whose window layers follow `swa_pattern`.
+    pub swa_layers: Vec<bool>,
+    /// The file carries a post-mixer and a post-FFN RMSNorm on every layer (`post_attention_norm`,
+    /// `post_ffw_norm`), applied to the sublayer output before its residual add: every gemma, and
+    /// an LFM3 file that ships them.
+    pub sandwich_norm: bool,
     /// MTP/NextN (Qwen3.5/3.6, issue #33 — see `docs/mtp.md`): the number of extra decoder blocks
     /// `{arch}.block_count` includes BEYOND the trunk (`{arch}.nextn_predict_layers`). `n_layer`
     /// above is already the TRUNK count (`block_count - n_layer_nextn`) — every existing field/
@@ -415,7 +434,8 @@ fn positive_array_model_dimension(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Config {
     /// Whether layer `il` uses sliding-window (vs full) attention. gemma interleaves SWA with full
-    /// attention on a fixed period; non-gemma models are always full.
+    /// attention on a fixed period, LFM3 names each layer in [`Config::swa_layers`]; every other
+    /// model is always full.
     ///
     /// deepseek4 is neither: `deepseek4.cpp::load_arch_hparams` calls `set_swa_pattern(0)`, whose
     /// `n_pattern == 0 || …` arm marks EVERY layer sliding-window. `swa_pattern` cannot express
@@ -425,6 +445,9 @@ impl Config {
     pub fn is_swa_layer(&self, il: usize) -> bool {
         if self.deepseek4 {
             return self.swa_window > 0;
+        }
+        if !self.swa_layers.is_empty() {
+            return self.swa_window > 0 && self.swa_layers[il];
         }
         self.swa_window > 0 && self.swa_pattern > 1 && !(il + 1).is_multiple_of(self.swa_pattern)
     }
@@ -567,6 +590,42 @@ impl Config {
             && self.full_attn_interval > 0
             && (il + 1).is_multiple_of(self.full_attn_interval)
     }
+    /// LFM3: whether layer `il` is a gated short-convolution layer (vs attention). `false` for
+    /// every layer of every other arch.
+    pub fn is_shortconv_layer(&self, il: usize) -> bool {
+        self.shortconv_layers.get(il).copied().unwrap_or(false)
+    }
+
+    /// Whether layer `il` keeps a fixed-size recurrent state instead of a per-token KV cache: a
+    /// qwen35 gated-DeltaNet layer or an LFM3 short-convolution layer. That state lives in the
+    /// layer's two cache slots ([`Config::recurrent_state_elems`]), cannot be rewound to a shorter
+    /// prefix, and is what every session path that reuses or rewinds a cache must reset instead.
+    pub fn is_recurrent_layer(&self, il: usize) -> bool {
+        (self.qwen35 && !self.is_qwen35_attn_layer(il)) || self.is_shortconv_layer(il)
+    }
+
+    /// Whether any layer keeps a recurrent state ([`Config::is_recurrent_layer`]).
+    pub fn has_recurrent_state(&self) -> bool {
+        (0..self.n_layer).any(|il| self.is_recurrent_layer(il))
+    }
+
+    /// f32 element counts of a recurrent layer's two state buffers, held in its K and V cache
+    /// slots: qwen35's conv history and DeltaNet `S` matrix, or LFM3's short-convolution history
+    /// and a one-element placeholder (the short convolution has no second state, and the slot is
+    /// still bound). `None` for a layer that caches K/V per token.
+    pub fn recurrent_state_elems(&self, il: usize) -> Option<(usize, usize)> {
+        if self.is_shortconv_layer(il) {
+            Some(((self.shortconv_l_cache - 1) * self.n_embd, 1))
+        } else if self.is_recurrent_layer(il) {
+            Some((
+                (self.ssm_d_conv - 1) * self.q35_conv_channels(),
+                self.q35_num_v_heads() * self.q35_head_k_dim() * self.q35_head_v_dim(),
+            ))
+        } else {
+            None
+        }
+    }
+
     /// qwen35 gated-DeltaNet derived dims (see `docs/qwen35.md`) — ports of the old seam's `Cfg`
     /// helpers of the same name, now living on the shared `Config`.
     pub fn q35_num_k_heads(&self) -> usize {
@@ -616,7 +675,8 @@ impl Config {
             | crate::arch::QWEN3_MOE
             | crate::arch::GEMMA3
             | crate::arch::GEMMA4
-            | crate::arch::DIFFUSION_GEMMA => true,
+            | crate::arch::DIFFUSION_GEMMA
+            | crate::arch::LFM3 => true,
             // qwen35's full-attention layers are qk-normed like qwen3/gemma (see `docs/qwen35.md`).
             // Kept as its own match arm (rather than folded into `arch::TRANSFORMER` above) because
             // `is_qwen35` gates a handful of qwen35-only fields below it; the error message renders
@@ -693,6 +753,9 @@ impl Config {
         // shape (routed-expert bank + shared expert vs plain dense).
         let qwen35_moe = arch == crate::arch::QWEN35_MOE;
         let qwen35 = arch == crate::arch::QWEN35 || qwen35_moe;
+        // LFM3 is its own skeleton (short-convolution layers between QK-normed, head-gated
+        // attention layers); it gates only its own parses below and shares no other arch's flag.
+        let lfm3 = arch == crate::arch::LFM3;
         let mk = |k: &str| format!("{arch}.{k}");
         // DeepSeek2-specific metadata: MLA dims, MoE gating function, YaRN (everything EXCEPT
         // "lite" detection, which needs n_layer — added after `n_layer` below).
@@ -1144,6 +1207,14 @@ impl Config {
                 None => n_head,
             }
         };
+        // LFM3's `attention.head_count_kv` is a per-layer array whose zeros are the
+        // short-convolution layers (`lfm3.cpp`: `is_recr = n_head_kv(il) == 0`); the attention
+        // layers' shared count is the model's `n_kv`.
+        let (n_kv, shortconv_layers) = if lfm3 {
+            lfm3_layer_kinds(g, &mk("attention.head_count_kv"), n_layer)?
+        } else {
+            (n_kv, Vec::new())
+        };
         let n_ff_layers: Vec<usize> = if let Some(arr) = g
             .metadata()
             .get(&mk("feed_forward_length"))
@@ -1320,12 +1391,17 @@ impl Config {
             .and_then(|v| match v {
                 MetaValue::F64(f) => Some(*f as f32),
                 _ => None,
-            })
-            // qwen35's old seam (`Cfg::from_gguf`) defaults this to 1e-6, not the generic 1e-5.
-            .unwrap_or(if qwen35 { 1e-6 } else { 1e-5 });
+            });
+        // `lfm3.cpp::load_arch_hparams` reads the epsilon with a plain `get_key`: required there.
+        if lfm3 && rms_eps.is_none() {
+            bail!("{} missing", mk("attention.layer_norm_rms_epsilon"));
+        }
+        // qwen35's old seam (`Cfg::from_gguf`) defaults this to 1e-6, not the generic 1e-5.
+        let rms_eps = rms_eps.unwrap_or(if qwen35 { 1e-6 } else { 1e-5 });
         // deepseek4 reads `attention.sliding_window` with a plain `get_key` — its raw attention is
         // sliding-window on EVERY layer, so the window is not optional decoration there.
-        let swa_window = if deepseek4 {
+        // LFM3 reads it with a plain `get_key` too: every LFM3 mixes window and full layers.
+        let swa_window = if deepseek4 || lfm3 {
             req_dim("attention.sliding_window")?
         } else if gemma {
             meta_u64(g, &mk("attention.sliding_window")).unwrap_or(0) as usize
@@ -1336,7 +1412,8 @@ impl Config {
         // has no full layers (`set_swa_pattern(0)`). `Config::is_swa_layer` special-cases the arch
         // instead — reading `attention.sliding_window_pattern` here would invent a period the file
         // does not declare and make five layers in six look full.
-        let swa_pattern = if swa_window == 0 || deepseek4 {
+        // LFM3 names each layer instead (`swa_layers` below), so it has no period either.
+        let swa_pattern = if swa_window == 0 || deepseek4 || lfm3 {
             0
         } else if let Some(arr) = g
             .metadata()
@@ -1354,7 +1431,12 @@ impl Config {
         // field is for. deepseek4's sliding-window layers do not: a ratio-0 layer ropes at the
         // plain `rope_theta`, and the compressed tiers use `compress_rope_theta` (a separate field)
         // — so V4 keeps them equal rather than picking up gemma's 10000 fallback.
-        let swa_rope_theta = if swa_window > 0 && !deepseek4 {
+        let swa_rope_theta = if lfm3 {
+            // Required, as `lfm3.cpp` reads it with a plain `get_key`.
+            meta_f64(g, &mk("rope.freq_base_swa"))
+                .with_context(|| format!("{} missing", mk("rope.freq_base_swa")))?
+                as f32
+        } else if swa_window > 0 && !deepseek4 {
             g.metadata()
                 .get(&mk("rope.freq_base_swa"))
                 .and_then(|v| match v {
@@ -1472,6 +1554,58 @@ impl Config {
             [0u32; 4]
         };
         let attn_out_gate = qwen35;
+        // LFM3 extras, read as `lfm3.cpp::load_arch_hparams` reads them.
+        let (swa_layers, shortconv_l_cache) = if lfm3 {
+            // A file declaring `attention.causal = false` is the non-causal "d1" variant, whose
+            // full-attention layers read the prompt both ways with no cache at all — a different
+            // model from the causal one this port runs.
+            if let Some(MetaValue::Bool(false)) = g.metadata().get(&mk("attention.causal")) {
+                bail!(
+                    "{} = false (the non-causal LFM3 variant) is not supported",
+                    mk("attention.causal")
+                );
+            }
+            let key = mk("attention.sliding_window_pattern");
+            let swa: Vec<bool> = g
+                .metadata()
+                .get(&key)
+                .and_then(MetaValue::as_arr)
+                .with_context(|| format!("{key} missing or not an array"))?
+                .iter()
+                .map(|v| match v {
+                    MetaValue::Bool(b) => Ok(*b),
+                    other => bail!("{key} holds {other:?}, not a bool"),
+                })
+                .collect::<Result<_>>()?;
+            if swa.len() != n_layer {
+                bail!("{key} has {} entries for {n_layer} layers", swa.len());
+            }
+            if !swa.iter().any(|&w| w) {
+                bail!("LFM3 requires sliding window attention layers; {key} marks none");
+            }
+            // `lfm3.cpp::load_arch_tensors` creates `rope_freqs` as a required tensor on the
+            // first full-attention layer (window layers take none), so a file with a full layer
+            // and no divisors is refused there rather than roped without them.
+            let full_layer = (0..n_layer).find(|&l| !shortconv_layers[l] && !swa[l]);
+            if let Some(l) = full_layer {
+                if !g.tensors().iter().any(|t| t.name == "rope_freqs.weight") {
+                    bail!(
+                        "LFM3 full-attention layer {l} needs rope_freqs.weight, which is missing"
+                    );
+                }
+            }
+            let l_cache = req_dim("shortconv.l_cache")?;
+            if l_cache < 2 {
+                bail!(
+                    "{} = {l_cache}: the short convolution needs a history",
+                    mk("shortconv.l_cache")
+                );
+            }
+            (swa, l_cache)
+        } else {
+            (Vec::new(), 0)
+        };
+        let sandwich_norm = gemma || (lfm3 && lfm3_sandwich_norm(g, n_layer)?);
         // DeepSeek: first N layers are dense FFN, the rest are MoE.
         // ernie4_5-moe reads the same key, optional (`ernie4-5.cpp::load_arch_hparams`).
         let n_layer_dense_lead = if deepseek || deepseek2 || ernie4_5_moe {
@@ -1611,7 +1745,7 @@ impl Config {
             qk_norm,
             qkv_bias,
             permute_qk_neox,
-            rope_freq_factors: arch == crate::arch::LLAMA || llama4 || gemma4,
+            rope_freq_factors: arch == crate::arch::LLAMA || llama4 || gemma4 || lfm3,
             gemma,
             gemma4,
             diffusion_gemma,
@@ -1642,6 +1776,11 @@ impl Config {
             ssm_dt_rank,
             rope_sections,
             attn_out_gate,
+            lfm3,
+            shortconv_layers,
+            shortconv_l_cache,
+            swa_layers,
+            sandwich_norm,
             n_layer_nextn,
             shexp_ff,
             llama4,
@@ -1694,6 +1833,57 @@ impl Config {
         }
         Ok(cfg)
     }
+}
+
+/// LFM3's per-layer `attention.head_count_kv` (`key`): `0` marks a short-convolution layer, and
+/// every attention layer must carry the same positive count, which is returned as the model's
+/// `n_kv` beside the per-layer short-convolution flags.
+fn lfm3_layer_kinds(g: &Gguf, key: &str, n_layer: usize) -> Result<(usize, Vec<bool>)> {
+    let counts: Vec<u64> = g
+        .metadata()
+        .get(key)
+        .and_then(MetaValue::as_arr)
+        .with_context(|| format!("{key} missing or not a per-layer array"))?
+        .iter()
+        .map(|v| v.as_u64().with_context(|| format!("{key} holds {v:?}")))
+        .collect::<Result<_>>()?;
+    if counts.len() != n_layer {
+        bail!("{key} has {} entries for {n_layer} layers", counts.len());
+    }
+    let mut attn = counts.iter().copied().filter(|&c| c > 0);
+    let n_kv = attn
+        .next()
+        .with_context(|| format!("{key}: no attention layer"))?;
+    if let Some(other) = attn.find(|&c| c != n_kv) {
+        bail!("{key}: attention layers with {n_kv} and {other} KV heads are not supported");
+    }
+    Ok((n_kv as usize, counts.iter().map(|&c| c == 0).collect()))
+}
+
+/// Whether an LFM3 file carries sandwich norms. `lfm3.cpp` loads `attn_post_norm` and
+/// `ffn_post_norm` as optional, but refuses a layer with only one of them; infr also refuses a
+/// file whose layers disagree, since the norms are loaded under one flag.
+fn lfm3_sandwich_norm(g: &Gguf, n_layer: usize) -> Result<bool> {
+    let has = |l: usize, s: &str| {
+        let name = format!("blk.{l}.{s}");
+        g.tensors().iter().any(|t| t.name == name)
+    };
+    let per_layer: Vec<(bool, bool)> = (0..n_layer)
+        .map(|l| {
+            (
+                has(l, "post_attention_norm.weight"),
+                has(l, "post_ffw_norm.weight"),
+            )
+        })
+        .collect();
+    if let Some(l) = per_layer.iter().position(|&(a, f)| a != f) {
+        bail!("LFM3 layer {l} carries only one of post_attention_norm / post_ffw_norm");
+    }
+    let first = per_layer.first().is_some_and(|&(a, _)| a);
+    if per_layer.iter().any(|&(a, _)| a != first) {
+        bail!("LFM3 layers disagree on carrying sandwich norms");
+    }
+    Ok(first)
 }
 
 /// qwen35's `{arch}.attention.recurrent_layers`: which of the `n_layer_all` blocks are

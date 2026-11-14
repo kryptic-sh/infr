@@ -3762,6 +3762,75 @@ fn conv1d_silu_parity() {
     assert_close(&cpu[1], &mtl[1], 0.0, "conv1d state"); // shift is exact
 }
 
+/// LFM's gated short convolution at its kernel width (7): one token and three (the token-serial
+/// kernel) and a prefill-sized batch (the two-pass kernel), from a nonzero history, scored on the
+/// output and on the history left behind.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn shortconv_parity() {
+    let (cc, kk) = (96usize, 7usize);
+    for rows in [1usize, 3, 37] {
+        let mut g = Graph::new();
+        let bcx = g.input(TensorDesc::new(vec![rows, 3 * cc], DType::F32));
+        let w = g.weight(TensorDesc::new(vec![cc, kk], DType::F32));
+        let state = g.input(TensorDesc::new(vec![kk - 1, cc], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![rows, cc], DType::F32));
+        g.push(Op::ShortConv {
+            bcx,
+            weight: w,
+            state,
+            dst,
+            rows: rows as u32,
+            channels: cc as u32,
+            kernel: kk as u32,
+        });
+        let bound = vec![
+            (bcx, f32_bytes(&rand_f32(rows * 3 * cc, 90))),
+            (w, f32_bytes(&rand_f32(cc * kk, 91))),
+            (state, f32_bytes(&rand_f32((kk - 1) * cc, 92))),
+        ];
+        let reads = [(dst, rows * cc), (state, (kk - 1) * cc)];
+        let cpu = run_multi(&CpuBackend::new(), &g, &bound, &reads);
+        let mtl = run_multi(&MetalBackend::new().expect("metal"), &g, &bound, &reads);
+        assert_close(
+            &cpu[0],
+            &mtl[0],
+            1e-5,
+            &format!("shortconv rows={rows} dst"),
+        );
+        assert_close(
+            &cpu[1],
+            &mtl[1],
+            1e-6,
+            &format!("shortconv rows={rows} state"),
+        );
+    }
+}
+
+/// LFM3's per-head sigmoid output gate at the 1.7B model's head shape.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn head_gate_parity() {
+    let (rows, nh, hd) = (5usize, 16usize, 128usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows * nh * hd], DType::F32));
+    let gate = g.input(TensorDesc::new(vec![rows * nh], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows * nh * hd], DType::F32));
+    g.push(Op::HeadGate {
+        x,
+        gate,
+        dst,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(rows * nh * hd, 93))),
+        (gate, f32_bytes(&rand_f32(rows * nh, 94))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 1e-5);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn deltanet_parity() {

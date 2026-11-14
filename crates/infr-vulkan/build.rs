@@ -575,6 +575,13 @@ fn main() {
         ("conv1d_silu", "conv1d_silu", &[]),
         ("conv1d_silu_par", "conv1d_silu_par", &[]),
         ("conv1d_shift", "conv1d_shift", &[]),
+        // LFM's gated short convolution (Op::ShortConv): the same three conv sources, reading
+        // B ⊙ X from the [rows, 3*cc] in-projection and writing C ⊙ conv (no SiLU).
+        ("conv1d_silu", "shortconv", &["-DSHORTCONV"]),
+        ("conv1d_silu_par", "shortconv_par", &["-DSHORTCONV"]),
+        ("conv1d_shift", "shortconv_shift", &["-DSHORTCONV"]),
+        // LFM3 attention output gate (Op::HeadGate): one sigmoid per (row, head).
+        ("head_gate", "head_gate", &[]),
         ("copy_strided", "copy_strided", &[]),
         ("mul_sigmoid", "mul_sigmoid", &[]),
         ("add", "add", &[]),

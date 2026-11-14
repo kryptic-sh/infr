@@ -25,6 +25,17 @@ uint64_t w_ptr = 0ul;
 layout(binding = 2) readonly buffer SB { float cstate[]; }; // [(kconv-1)*cc], pre-call history
 layout(binding = 3) writeonly buffer OB { float outp[]; };  // [rows, cc]
 
+// -DSHORTCONV builds LFM's gated short convolution (`Op::ShortConv`) from this same source: binding
+// 0 is then the `[rows, 3*cc]` in-projection output, read per row as B | C | X; the conv input is
+// B ⊙ X and the output C ⊙ conv, with no activation.
+#ifdef SHORTCONV
+#define CONV_IN(t, ch) (qkv[(t) * 3u * pc.cc + (ch)] * qkv[(t) * 3u * pc.cc + 2u * pc.cc + (ch)])
+#define CONV_OUT(t, ch, acc) (qkv[(t) * 3u * pc.cc + pc.cc + (ch)] * (acc))
+#else
+#define CONV_IN(t, ch) qkv[(t) * pc.cc + (ch)]
+#define CONV_OUT(t, ch, acc) ((acc) / (1.0 + exp(-(acc))))
+#endif
+
 void main() {
     // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
     // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
@@ -41,9 +52,8 @@ void main() {
     if (t >= km1) {
         // bulk: the whole window lies in qkv — no per-tap select (a ternary here compiles to
         // OpSelect, which issues BOTH loads incl. a far-out-of-bounds cstate read every tap).
-        uint b = (t - km1) * pc.cc + ch;
         for (uint k = 0u; k < pc.kconv; k++) {
-            acc += qkv[b + k * pc.cc] * WV(ch * pc.kconv + k);
+            acc += CONV_IN(t - km1 + k, ch) * WV(ch * pc.kconv + k);
         }
     } else {
         // first kconv-1 rows: window straddles [state ‖ qkv]
@@ -53,10 +63,10 @@ void main() {
             if (i < km1) {
                 x = cstate[i * pc.cc + ch];
             } else {
-                x = qkv[(i - km1) * pc.cc + ch];
+                x = CONV_IN(i - km1, ch);
             }
             acc += x * WV(ch * pc.kconv + k);
         }
     }
-    outp[idx] = acc / (1.0 + exp(-acc)); // SiLU
+    outp[idx] = CONV_OUT(t, ch, acc);
 }

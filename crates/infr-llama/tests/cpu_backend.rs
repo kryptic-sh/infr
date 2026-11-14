@@ -2919,6 +2919,146 @@ fn mtp_spec_acceptance_stats() {
     }
 }
 
+// ─── LFM3 (short-convolution layers between gated, windowed attention layers) ────────
+
+fn lfm3_17b() -> Option<PathBuf> {
+    find_gguf("LiquidAI--LFM3-1.7B-GGUF", "LFM3-1.7B-Q4_K_M.gguf")
+}
+
+fn lfm3_17b_f16() -> Option<PathBuf> {
+    find_gguf("LiquidAI--LFM3-1.7B-GGUF", "LFM3-1.7B-F16.gguf")
+}
+
+// Captured + verified coherent; both render with thinking on (the template's default), so the
+// text is the model's reasoning. How infr's output compares with llama.cpp's is in
+// docs/plan/03-lfm3.md.
+const LFM3_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0x8d3a3dd9844d239f),
+    (
+        "Tell me a short story about a lighthouse keeper.",
+        32,
+        0x6e5098d3a5bec173,
+    ),
+];
+
+/// CPU-only: LFM3 1.7B golden-hash lock — the gated short convolution with its carried history,
+/// the head-gated attention on window and full layers, and the sandwich norms.
+#[test]
+#[ignore = "needs LFM3-1.7B in the HF cache"]
+fn cpu_golden_lfm3() {
+    let path = need_model!(lfm3_17b(), "LFM3-1.7B");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    check_golden(&model, LFM3_GOLDEN);
+}
+
+/// The Vulkan seam against the CPU oracle on the LFM3 F16 file, token for token: prefill and then
+/// decode one token at a time, so the short convolution's history is carried through both the
+/// batch and the token-serial kernels.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_lfm3() {
+    let path = need_model!(lfm3_17b_f16(), "LFM3-1.7B F16");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "Write a short paragraph about the ocean.", 32);
+}
+
+/// The same on the Q4_K_M file, whose quantized kernels the F16 run does not reach.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_lfm3_q4_k_m() {
+    let path = need_model!(lfm3_17b(), "LFM3-1.7B");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is the chemical symbol for gold?", 16);
+}
+
+/// LFM3's decode is one record-once replay: the short convolution and the head gate carry no
+/// position, so nothing in its graph forces a per-token plan.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_lfm3_decode_replays_from_one_recording() {
+    let path = need_model!(lfm3_17b(), "LFM3-1.7B");
+    let mut _tlk = test_serial_lock();
+    let (recordings, n_gen) = vulkan_decode_recordings(&path);
+    assert!(n_gen > 1, "too few tokens decoded to tell the paths apart");
+    assert_eq!(
+        recordings, 1,
+        "LFM3 decoded {n_gen} tokens without the one record-once replay"
+    );
+}
+
+/// An LFM3 session whose first turn is longer than the sliding-window ring (`window + ubatch`
+/// rows), so the window layers' ring has wrapped when the second turn extends it: the extension
+/// reuses the short-convolution history and the ring together, prefills only the suffix, and
+/// generates what a fresh full prefill generates. On the F16 file: at Q4_K_M the integrated GPU's
+/// fresh prefill picks " does" over " marbles" at the third token where its own session, the
+/// 7900 XTX and both CPU paths pick " marbles" — a near tie, not a reuse fault (the same device's
+/// F16 prefill is within 0.0054 of llama.cpp's on a 1092-token prompt; docs/plan/03-lfm3.md).
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_lfm3_session_extends_past_the_window() {
+    let path = need_model!(lfm3_17b_f16(), "LFM3-1.7B F16");
+    let mut _tlk = test_serial_lock();
+    // The chunk is pinned so the ring the session allocates (`window + chunk` rows) is known here,
+    // at the integrated-GPU floor: a pinned chunk overrides that device's smaller default, and a
+    // 1024-row chunk there hung this test past an hour.
+    const UBATCH: usize = 128;
+    const CTX: usize = 4096;
+    let model = model_cfg(&path, |c| {
+        c.sampling.ignore_eos = true;
+        c.device.ubatch = Some(UBATCH);
+    });
+    let colours = ["red", "green", "blue", "yellow", "white", "black", "orange"];
+    let facts: String = (0..180)
+        .map(|i| {
+            format!(
+                "Box {i} is {} and holds {} marbles. ",
+                colours[i % 7],
+                i * 7 % 50
+            )
+        })
+        .collect();
+    let p1 = format!("{facts}How many marbles does box 3 hold?");
+    let mut sess = model.vulkan_session(CTX).expect("session");
+    let mut t1 = String::new();
+    let s1 = model
+        .generate_vulkan_session(&mut sess, &p1, 8, None, |p| t1.push_str(p))
+        .expect("turn 1");
+    let vk = infr_vulkan::VulkanBackend::new().expect("vulkan init");
+    let ring_rows = infr_llama::seam::window_ring_rows(
+        model.config(),
+        CTX,
+        UBATCH,
+        infr_core::backend::Backend::kv_row_align(&vk),
+    )
+    .expect("LFM3 has window layers");
+    assert!(
+        ring_rows < CTX,
+        "the window layers must ring at this context"
+    );
+    assert!(
+        s1.n_prompt > ring_rows,
+        "turn 1 prefilled {} tokens, too few to wrap the {ring_rows}-row window ring",
+        s1.n_prompt
+    );
+    let p2 = format!("{p1}{t1} And how many does box 10 hold?");
+    let mut t2 = String::new();
+    let s2 = model
+        .generate_vulkan_session(&mut sess, &p2, 8, None, |p| t2.push_str(p))
+        .expect("turn 2");
+    assert!(
+        s2.n_prompt < 64,
+        "turn 2 prefilled {} tokens: the session did not extend turn 1",
+        s2.n_prompt
+    );
+    let fresh = model.generate_dense_vulkan(&p2, 8).expect("fresh turn 2");
+    assert_eq!(
+        t2.trim(),
+        fresh.trim(),
+        "extending past the window ring diverged from a fresh full prefill"
+    );
+}
+
 // ─── Qwen3-MoE (routed experts) ─────────────────────────────────────────────────
 
 fn qwen3moe_30b() -> Option<PathBuf> {
@@ -5187,13 +5327,58 @@ fn gpu_prefill_matches_llama_debug_dump() {
     prefill_matches_llama_debug_dump(true);
 }
 
-fn prefill_matches_llama_debug_dump(vulkan: bool) {
+/// The oracle on an LFM3 F16 file, held to the logits themselves: max |Δlogit| below
+/// [`LFM3_F16_MAX_ABS`]. The probability-cosine and top-5 floors above are loose enough to pass
+/// with the head gate dropped (5.780733, 3/5) or the window pattern ignored (5.19669 on a
+/// 1092-token prompt, 4/5), which this bound is not. The dump must reach past the 256-token
+/// window, or ignoring the window would not show.
+///
+/// ```text
+/// llama-debug -m LFM3-1.7B-F16.gguf -p "<a prompt of more than 256 tokens>" --save-logits
+/// INFR_LLAMA_DUMP=data/llamacpp-LFM3-1.7B-F16.bin INFR_LLAMA_DUMP_MODEL=LFM3-1.7B-F16.gguf \n///   cargo test -p infr-llama --release --test cpu_backend -- --ignored cpu_prefill_matches_llama_debug_dump_lfm3
+/// ```
+#[test]
+#[ignore = "needs INFR_LLAMA_DUMP and INFR_LLAMA_DUMP_MODEL for an LFM3 F16 file"]
+fn cpu_prefill_matches_llama_debug_dump_lfm3() {
+    let Some(score) = prefill_matches_llama_debug_dump(false) else {
+        return;
+    };
+    assert!(
+        score.config.lfm3,
+        "INFR_LLAMA_DUMP_MODEL is not an LFM3 file"
+    );
+    assert!(
+        score.n_tokens > score.config.swa_window,
+        "the dump's {} tokens do not reach past the {}-token window",
+        score.n_tokens,
+        score.config.swa_window
+    );
+    assert!(
+        score.max_abs < LFM3_F16_MAX_ABS,
+        "infr's CPU misses llama.cpp by {} on the LFM3 F16 file",
+        score.max_abs
+    );
+}
+
+/// The bound [`cpu_prefill_matches_llama_debug_dump_lfm3`] holds infr's CPU to on the F16 file:
+/// a few times the largest correct gap measured (docs/plan/03-lfm3.md), three orders of magnitude
+/// under the gaps of a dropped head gate or an ignored window pattern.
+const LFM3_F16_MAX_ABS: f32 = 0.02;
+
+/// What [`prefill_matches_llama_debug_dump`] measured, for a caller that holds a model to more.
+struct LlamaDumpScore {
+    max_abs: f32,
+    n_tokens: usize,
+    config: infr_llama::Config,
+}
+
+fn prefill_matches_llama_debug_dump(vulkan: bool) -> Option<LlamaDumpScore> {
     let (Ok(dump), Ok(model_path)) = (
         std::env::var("INFR_LLAMA_DUMP"),
         std::env::var("INFR_LLAMA_DUMP_MODEL"),
     ) else {
         eprintln!("skip: INFR_LLAMA_DUMP / INFR_LLAMA_DUMP_MODEL not set");
-        return;
+        return None;
     };
     let mut _tlk = test_serial_lock();
     let (tokens, llama_logits) = read_llama_debug_dump(std::path::Path::new(&dump));
@@ -5270,4 +5455,9 @@ fn prefill_matches_llama_debug_dump(vulkan: bool) {
             model.decode(&ids).expect("decode"),
         );
     }
+    Some(LlamaDumpScore {
+        max_abs,
+        n_tokens: tokens.len(),
+        config: model.config().clone(),
+    })
 }

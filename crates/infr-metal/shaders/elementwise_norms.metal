@@ -33,6 +33,17 @@ kernel void mul_vec_f32(device const float* x    [[buffer(0)]],
     if (gid < p.total) dst[gid] = x[gid] * vec_[gid % p.n];
 }
 
+// LFM3 attention output gate (Op::HeadGate): one sigmoid per (row, head), `g` holding one logit
+// per head, broadcast over the head's `head_dim` lanes.
+struct HeadGateParams { uint n; uint head_dim; };
+kernel void head_gate_f32(device const float* x   [[buffer(0)]],
+                          device const float* g   [[buffer(1)]],
+                          device float*       dst [[buffer(2)]],
+                          constant HeadGateParams& p [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid < p.n) dst[gid] = x[gid] / (1.0f + exp(-g[gid / p.head_dim]));
+}
+
 struct ScaleParams { float s; uint n; };
 kernel void scale_f32(device const float* x   [[buffer(0)]],
                       device float*       dst [[buffer(1)]],

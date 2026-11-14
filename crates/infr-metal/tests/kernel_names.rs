@@ -29,6 +29,7 @@ const KERNEL_PREFIXES: &[&str] = &[
     "dequant_",
     "embed_gather_",
     "gatedact",
+    "head_gate",
     "linear_",
     "moe_",
     "qknorm",
@@ -36,6 +37,7 @@ const KERNEL_PREFIXES: &[&str] = &[
     "rope_",
     "sample_f32",
     "scale_f32",
+    "shortconv_",
     "softcap",
     "writekv_",
 ];

@@ -1095,6 +1095,33 @@ pub enum Op {
         channels: u32,
         kernel: u32,
     },
+    /// LFM's gated short convolution (`build_lfm_shortconv` in llama.cpp's `lfm-base.cpp`), over
+    /// `rows` tokens in order. `bcx` is the `[rows, 3*channels]` in-projection output, each row read
+    /// as three `channels`-wide blocks `B | C | X`. Per token: `bx = B ⊙ X`, then the depthwise
+    /// causal conv `conv[ch] = Σ_{j<kernel-1} state[j,ch]·w[ch,j] + bx[ch]·w[ch,kernel-1]` with NO
+    /// activation, then `dst = C ⊙ conv`; the history then shifts (drop oldest, append `bx`).
+    /// `weight` is `[channels, kernel]` and `state` the rolling `[(kernel-1), channels]` history,
+    /// oldest row first — the layouts [`Op::Conv1dSilu`] uses. `dst` is `[rows, channels]`.
+    ShortConv {
+        bcx: TensorId,
+        weight: TensorId,
+        state: TensorId,
+        dst: TensorId,
+        rows: u32,
+        channels: u32,
+        kernel: u32,
+    },
+    /// Per-head sigmoid output gate (LFM3 attention): `dst[r, h*head_dim + i] =
+    /// x[r, h*head_dim + i] * sigmoid(gate[r, h])`. `x`/`dst` are `[rows, n_head*head_dim]`, `gate`
+    /// is `[rows, n_head]` — one raw logit per head per token. In place when `dst == x`.
+    HeadGate {
+        x: TensorId,
+        gate: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
+    },
     /// Gated-DeltaNet linear-attention recurrence step (qwen35), one token. Per VALUE head:
     /// L2-normalize `q`,`k`; scale `q` by `1/√head_k`; `beta = sigmoid(b)`, `decay =
     /// exp(a_coef·softplus(a + dt_bias))`; update the persistent state `S[head_k, head_v]`: `S *=
@@ -1184,6 +1211,8 @@ impl Op {
             Op::CopyStrided { .. } => "CopyStrided",
             Op::MoeFfn { .. } => "MoeFfn",
             Op::Conv1dSilu { .. } => "Conv1dSilu",
+            Op::ShortConv { .. } => "ShortConv",
+            Op::HeadGate { .. } => "HeadGate",
             Op::DeltaNet { .. } => "DeltaNet",
             Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
         }
@@ -1368,6 +1397,14 @@ impl Op {
                 dst,
                 ..
             } => (vec![x, weight, state], vec![state, dst]),
+            Op::ShortConv {
+                bcx,
+                weight,
+                state,
+                dst,
+                ..
+            } => (vec![bcx, weight, state], vec![state, dst]),
+            Op::HeadGate { x, gate, dst, .. } => (vec![x, gate], vec![dst]),
             Op::DeltaNet {
                 q,
                 k,

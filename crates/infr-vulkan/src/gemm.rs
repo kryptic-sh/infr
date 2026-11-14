@@ -2936,6 +2936,35 @@ pub(crate) fn conv1d_silu_par_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// The `-DSHORTCONV` builds of `conv1d_silu.comp`, `conv1d_silu_par.comp` and `conv1d_shift.comp`:
+/// LFM's gated short convolution (`Op::ShortConv`), token-serial, batch pass 1 and the batch history
+/// rebuild. Production entries: [`crate::recorder::Recorder::shortconv`] and
+/// [`crate::recorder::Recorder::shortconv_batch`].
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn shortconv_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shortconv.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn shortconv_par_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shortconv_par.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn shortconv_shift_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shortconv_shift.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the per-head sigmoid output gate (`Op::HeadGate`, LFM3 attention).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn head_gate_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/head_gate.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the batched strided row copy (Op::CopyStrided in one dispatch).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn copy_strided_spv() -> &'static [u32] {

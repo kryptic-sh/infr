@@ -404,12 +404,15 @@ fn decode_refusal(be_: &VulkanBackend, graph: &Graph) -> Option<DecodeRefusal> {
             // the recorded tape re-reads the live state every replay, and the tape's leading
             // global barrier orders iteration i's state write before i+1's read under replay_n.
             // GatedRmsNorm (qwen35 DeltaNet z-gate) is pos-independent elementwise like QkNorm —
-            // same replay-safety argument.
+            // same replay-safety argument. ShortConv (LFM) is Conv1dSilu's argument again, and
+            // HeadGate (LFM3) is pos-independent elementwise.
             Op::MoeFfn { .. }
             | Op::QkNorm { .. }
             | Op::GatedRmsNorm { .. }
             | Op::Softcap { .. }
             | Op::Conv1dSilu { .. }
+            | Op::ShortConv { .. }
+            | Op::HeadGate { .. }
             | Op::DeltaNet { .. } => {}
             _ => {}
         }
@@ -3947,6 +3950,50 @@ fn lower_op(
                 *rows as usize,
                 *channels as usize,
                 *kernel as usize,
+            );
+        }
+        // LFM gated short convolution: the same seq/batch split as Conv1dSilu above, on the
+        // `-DSHORTCONV` builds of its shaders.
+        Op::ShortConv {
+            bcx,
+            weight,
+            state,
+            dst,
+            rows,
+            channels,
+            kernel,
+        } => {
+            let cv = if *rows as usize >= (*kernel as usize).saturating_sub(1).max(2) {
+                Recorder::shortconv_batch
+            } else {
+                Recorder::shortconv
+            };
+            cv(
+                rec,
+                r(*bcx)?,
+                r(*weight)?,
+                r(*state)?,
+                r(*dst)?,
+                *rows as usize,
+                *channels as usize,
+                *kernel as usize,
+            );
+        }
+        // LFM3 attention output gate: one sigmoid per (row, head).
+        Op::HeadGate {
+            x,
+            gate,
+            dst,
+            rows,
+            n_head,
+            head_dim,
+        } => {
+            rec.head_gate(
+                r(*x)?,
+                r(*gate)?,
+                r(*dst)?,
+                (*rows * *n_head * *head_dim) as usize,
+                *head_dim as usize,
             );
         }
         // Qwen3-Next gated DeltaNet recurrence (persistent `state` S mutated in place).

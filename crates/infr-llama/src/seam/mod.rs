@@ -681,7 +681,15 @@ pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize)
     } else {
         0
     };
-    let per_row = (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet) as u64;
+    // LFM's scratch (the runner's `lfm_scratch`): the B | C | X
+    // in-projection (three n_embd), the conv output (n_embd) and the per-head gate logits.
+    let shortconv = if cfg.lfm3 {
+        4 * (4 * cfg.n_embd + cfg.n_head)
+    } else {
+        0
+    };
+    let per_row =
+        (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet + shortconv) as u64;
     rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1
 }
 
@@ -1080,9 +1088,9 @@ pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
 /// sliding-window layer, so `kv_rows_at` returns the whole context — and why the allocation asserts it
 /// (see `generate_dense_backend`'s KV loop).
 ///
-/// Recurrent-state layers (qwen35 DeltaNet) have no per-token cache to size; their callers branch
-/// to the fixed conv/S-state allocation BEFORE reaching here, and the estimates price them with
-/// this attention geometry as they always have.
+/// Recurrent-state layers (qwen35 DeltaNet, LFM short convolution) have no per-token cache to
+/// size; every caller branches to their fixed state ([`Config::recurrent_state_elems`]) before
+/// reaching here.
 /// **deepseek4 (V4) caches ONE `head_dim`-wide MQA row per side per token**, and the V side is a
 /// DUPLICATE of the K side rather than the MLA-style 0-width placeholder (docs/backlog.md B53).
 ///
@@ -1248,6 +1256,22 @@ pub(crate) fn kv_rows_at(
     rows.next_multiple_of(row_align)
 }
 
+/// The rows the shortest sliding-window ring holds in a slot of `max_ctx` tokens whose prefill
+/// chunk is `ubatch` rows, on a backend whose cache rows align to `row_align`
+/// (`Backend::kv_row_align`), or `None` for a model with no window layer. A slot that has written
+/// past that many positions has wrapped the ring and recycled its earliest rows.
+pub fn window_ring_rows(
+    cfg: &Config,
+    max_ctx: usize,
+    ubatch: usize,
+    row_align: usize,
+) -> Option<usize> {
+    (0..cfg.n_layer)
+        .filter(|&l| cfg.is_swa_layer(l))
+        .map(|l| kv_rows_at(cfg, l, max_ctx, true, ubatch, row_align))
+        .min()
+}
+
 /// KV-cache footprint ESTIMATE summed over all layers at chunk height `ubatch` and side format:
 /// `q8` prices BOTH sides Q8_0 (34 B / 32-elem block, `next_multiple_of(4)`, mirroring
 /// [`kv_fmt_bytes`]), else f16 (2 B/elem); +64 rows/layer slop. The ONE pricing helper the dense
@@ -1287,6 +1311,14 @@ pub(crate) fn kv_bytes_estimate_fmt(
 ) -> u64 {
     (0..cfg.n_layer)
         .map(|l| {
+            // A recurrent layer's state is fixed-size f32 whatever the context, and is priced
+            // twice: the live state and the one snapshot of it a slot can hold
+            // (`SeamKv::mtp_delta_ckpt`, which MTP rollback and the decode loop's prefill-boundary
+            // snapshot share). MTP fails a request whose snapshot cannot be allocated, so a
+            // context fitted to fill the device must leave room for it.
+            if let Some((k_elems, v_elems)) = cfg.recurrent_state_elems(l) {
+                return (2 * (k_elems + v_elems) * 4) as u64;
+            }
             let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch, 1) + KV_SLOP_ROWS;
             // Per-side widths, NOT one shared width: MLA's K row is `kv_lora_rank + qk_rope_dim`
             // and it has no V side (see `kv_row_elems`).
@@ -1716,9 +1748,9 @@ pub(crate) fn reclamp_ctx_to_live_room(
 
 /// Bytes layer `l`'s two cache buffers ALLOCATE at `want_ctx` and prefill chunk `ubatch` —
 /// `(K side, V side)`, exactly what the runner hands `Backend::alloc` with `BufferUsage::KvCache`.
-/// A qwen35 DeltaNet layer holds its conv history and recurrent state there instead (fixed-size
-/// f32, not `want_ctx`-scaled); an attention layer holds `kv_rows_at` rows of its own per-side
-/// width.
+/// A recurrent layer (qwen35 DeltaNet, LFM short convolution) holds its fixed-size f32 state there
+/// instead ([`Config::recurrent_state_elems`], not `want_ctx`-scaled); an attention layer holds
+/// `kv_rows_at` rows of its own per-side width.
 pub(crate) fn kv_layer_alloc_bytes(
     cfg: &Config,
     l: usize,
@@ -1729,10 +1761,8 @@ pub(crate) fn kv_layer_alloc_bytes(
     k_fmt: DType,
     v_fmt: DType,
 ) -> (usize, usize) {
-    if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
-        let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
-        let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
-        return (conv_elems * 4, s_elems * 4);
+    if let Some((k_elems, v_elems)) = cfg.recurrent_state_elems(l) {
+        return (k_elems * 4, v_elems * 4);
     }
     // Per-token row widths, MLA included: DeepSeek2 caches ONE compressed row
     // (kv_lora_rank + qk_rope_dim) per token and has no V side, so `v_row` is 0 and `kv_side_bytes`
@@ -2736,9 +2766,10 @@ fn dense_multi_gpu_guard(cfg: &Config, label: &str) -> AResult<()> {
             "{label} supports dense models only; this is an MoE model — use INFR_EXPERT_PARALLEL"
         ));
     }
-    if cfg.qwen35 {
+    if cfg.has_recurrent_state() {
         return Err(anyhow!(
-            "{label} does not support qwen35 (DeltaNet recurrent-state placement is a separate slice)"
+            "{label} does not support recurrent-state layers (qwen35 DeltaNet, LFM short \
+             convolution); their placement is a separate slice"
         ));
     }
     if cfg.n_embd_per_layer > 0 {
@@ -4148,6 +4179,69 @@ mod seam_helper_tests {
         // The pre-fix pricing, spelled out: K+V at the head-dim product.
         let old = (cfg.n_layer * rows * 2 * (cfg.n_kv * cfg.head_dim) * 2) as u64;
         assert_eq!(est, old * 3 / 2, "the estimate was 1.5x short");
+    }
+
+    /// A recurrent layer's state does not grow with the context, so the estimate prices it at the
+    /// fixed size the runner allocates (`Config::recurrent_state_elems`), while an attention layer
+    /// beside it still scales with the rows. The state is priced twice: the live copy and the one
+    /// snapshot a slot can hold beside it (`SeamKv::mtp_delta_ckpt`, shared by MTP rollback and the
+    /// prefill-boundary snapshot), whose allocation would otherwise reach past a context fitted
+    /// to fill VRAM.
+    #[test]
+    fn kv_bytes_estimate_prices_recurrent_state_at_its_fixed_size() {
+        let cfg = Config {
+            n_layer: 2,
+            n_embd: 64,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 16,
+            lfm3: true,
+            shortconv_layers: vec![true, false],
+            shortconv_l_cache: 4,
+            ..Default::default()
+        };
+        let est = |ctx| super::kv_bytes_estimate_fmt(&cfg, ctx, false, 512, DType::F16, DType::F16);
+        let state = ((cfg.shortconv_l_cache - 1) * cfg.n_embd + 1) * 4;
+        for ctx in [1024usize, 4096] {
+            let attn = (ctx + super::KV_SLOP_ROWS) * 2 * (cfg.n_kv * cfg.head_dim) * 2;
+            assert_eq!(est(ctx), (2 * state + attn) as u64, "ctx {ctx}");
+        }
+    }
+
+    /// qwen35's MTP rollback snapshots the DeltaNet state of every recurrent layer (conv history
+    /// and `S`) and fails the request when that allocation is refused, so the estimate must hold
+    /// room for the copy: two of each recurrent layer's state, one attention layer's rows.
+    #[test]
+    fn kv_bytes_estimate_prices_the_qwen35_snapshot_copy() {
+        let cfg = Config {
+            n_layer: 4,
+            n_embd: 64,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 16,
+            qwen35: true,
+            full_attn_interval: 4,
+            ssm_d_conv: 4,
+            ssm_d_inner: 64,
+            ssm_d_state: 16,
+            ssm_n_group: 2,
+            ssm_dt_rank: 4,
+            ..Default::default()
+        };
+        let recurrent: Vec<usize> = (0..cfg.n_layer)
+            .filter(|&l| cfg.is_recurrent_layer(l))
+            .collect();
+        assert_eq!(
+            recurrent,
+            [0, 1, 2],
+            "three DeltaNet layers, then attention"
+        );
+        let (k, v) = cfg.recurrent_state_elems(0).expect("a DeltaNet layer");
+        let ctx = 2048usize;
+        let attn = (ctx + super::KV_SLOP_ROWS) * 2 * (cfg.n_kv * cfg.head_dim) * 2;
+        let want = recurrent.len() * 2 * (k + v) * 4 + attn;
+        let est = super::kv_bytes_estimate_fmt(&cfg, ctx, false, 512, DType::F16, DType::F16);
+        assert_eq!(est, want as u64);
     }
 
     /// `kv_q8_layout_ok` is the "may this model use a q8 cache" gate the Vulkan auto-q8 placement

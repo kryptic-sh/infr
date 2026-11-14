@@ -17,7 +17,7 @@ GPU seam test.
 | ----- | ------------------------------------------------------------------------------- | --------------------- |
 | 01    | SmolLM3 (`smollm3`): near config-only                                           | done                  |
 | 02    | [ERNIE 4.5](02-ernie4-5.md) (`ernie4_5`, then `ernie4_5-moe`)                   | done; Metal awaits CI |
-| 03    | [LFM3](03-lfm3.md) (`lfm3`): recent, 1.7B                                       | not started           |
+| 03    | [LFM3](03-lfm3.md) (`lfm3`): recent, 1.7B                                       | done; Metal awaits CI |
 | 04    | [The MLA + indexer families](04-mla-indexer-families.md), Mistral Large 4 first | not started           |
 | 07    | [Mistral Large 4](07-mistral-large4.md) (`mistral-large4`): scoped, staged      | scoped                |
 
@@ -36,9 +36,9 @@ Every phase was scoped on 2026-11-13 from the llama.cpp checkout at
 `~/Projects/mxaddict/llama.cpp` (commit `5676dfbe0`). Phase 02 was diffed
 against `src/models/llama.cpp`; 03 and 04 were scoped from the keys and tensors
 their files name; 07 from a full read of its builder. Each phase file states
-which. Phase 02's dense GGUF and its 21B-A3B MoE GGUF have been dumped and run;
-no GGUF of any other open phase's family has been yet: step 0 of the recipe
-comes first in each phase and may change its estimate.
+which. Phase 02's dense GGUF and its 21B-A3B MoE GGUF, and phase 03's LFM3 1.7B,
+have been dumped and run; no GGUF of any other open phase's family has been yet:
+step 0 of the recipe comes first in each phase and may change its estimate.
 
 Considered and declined, with the reason, so they are not re-proposed:
 

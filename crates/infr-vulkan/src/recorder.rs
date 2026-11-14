@@ -897,6 +897,15 @@ fn bda_out_f_chunks(
     Ok(chunks)
 }
 
+/// Which causal depthwise conv a shared conv dispatch records: qwen35's conv + SiLU
+/// (`Op::Conv1dSilu`) or LFM's gated short convolution (`Op::ShortConv`, the `-DSHORTCONV` builds
+/// of the same shaders).
+#[derive(Clone, Copy)]
+enum ConvKind {
+    Silu,
+    Short,
+}
+
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
@@ -8555,9 +8564,87 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
-        let kern = self
-            .be
-            .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 20);
+        self.conv_seq_at(ConvKind::Silu, qkv, arena_addr, state, out, rows, cc, kconv);
+    }
+
+    /// LFM's gated short convolution (`Op::ShortConv`), token-serial: `bcx` is the
+    /// `[rows, 3*cc]` B | C | X in-projection, `out` `[rows, cc]` is C ⊙ conv(B ⊙ X), and the
+    /// history `state` `[(kconv-1)*cc]` (of B ⊙ X) is updated in place. The `-DSHORTCONV` build of
+    /// `shaders/conv1d_silu.comp`, weight read through its BDA address like [`Self::conv1d_silu`].
+    pub fn shortconv(
+        &self,
+        bcx: &dyn Buffer,
+        w: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: shortconv requires a u64 BDA device address");
+        self.conv_seq_at(
+            ConvKind::Short,
+            bcx,
+            arena_addr,
+            state,
+            out,
+            rows,
+            cc,
+            kconv,
+        );
+    }
+
+    /// [`Self::shortconv`] for `rows ≥ kconv-1`: every output in parallel, then the history
+    /// rebuilt from the last `kconv-1` rows — the [`Self::conv1d_silu_batch`] two-pass shape.
+    pub fn shortconv_batch(
+        &self,
+        bcx: &dyn Buffer,
+        w: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: shortconv_batch requires a u64 BDA device address");
+        self.conv_batch_at(
+            ConvKind::Short,
+            bcx,
+            arena_addr,
+            state,
+            out,
+            rows,
+            cc,
+            kconv,
+        );
+    }
+
+    /// The token-serial conv dispatch [`Self::conv1d_silu_at`] and [`Self::shortconv`] share;
+    /// `kind` picks the shader build.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_seq_at(
+        &self,
+        kind: ConvKind,
+        qkv: &dyn Buffer,
+        arena_addr: u64,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        let kern = match kind {
+            ConvKind::Silu => self
+                .be
+                .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 20),
+            ConvKind::Short => self
+                .be
+                .kernel("shortconv", crate::gemm::shortconv_spv(), 4, 20),
+        };
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
@@ -8594,19 +8681,40 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
-        debug_assert!(
-            rows >= kconv - 1,
-            "conv1d_silu_batch_at needs rows ≥ kconv-1"
-        );
+        self.conv_batch_at(ConvKind::Silu, qkv, arena_addr, state, out, rows, cc, kconv);
+    }
+
+    /// The two-pass batch conv dispatch [`Self::conv1d_silu_batch_at`] and
+    /// [`Self::shortconv_batch`] share; `kind` picks the shader builds.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_batch_at(
+        &self,
+        kind: ConvKind,
+        qkv: &dyn Buffer,
+        arena_addr: u64,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        debug_assert!(rows >= kconv - 1, "the batch conv needs rows ≥ kconv-1");
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let k1 = self
-            .be
-            .kernel("conv1d_silu_par", crate::gemm::conv1d_silu_par_spv(), 4, 20);
+        let k1 = match kind {
+            ConvKind::Silu => {
+                self.be
+                    .kernel("conv1d_silu_par", crate::gemm::conv1d_silu_par_spv(), 4, 20)
+            }
+            ConvKind::Short => {
+                self.be
+                    .kernel("shortconv_par", crate::gemm::shortconv_par_spv(), 4, 20)
+            }
+        };
         self.dispatch_wide(
             k1,
             &[
@@ -8623,9 +8731,16 @@ impl<'a> Recorder<'a> {
         push2[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push2[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
         push2[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
-        let k2 = self
-            .be
-            .kernel("conv1d_shift", crate::gemm::conv1d_shift_spv(), 2, 12);
+        let k2 = match kind {
+            ConvKind::Silu => {
+                self.be
+                    .kernel("conv1d_shift", crate::gemm::conv1d_shift_spv(), 2, 12)
+            }
+            ConvKind::Short => {
+                self.be
+                    .kernel("shortconv_shift", crate::gemm::shortconv_shift_spv(), 2, 12)
+            }
+        };
         self.dispatch_wide(
             k2,
             &[Self::vkb(qkv), Self::vkb(state)],
@@ -8697,6 +8812,31 @@ impl<'a> Recorder<'a> {
             1,
             &push,
             (n as u32).div_ceil(64),
+        );
+    }
+
+    /// Per-head sigmoid gate (`Op::HeadGate`): `y[i] = x[i] * sigmoid(g[i / head_dim])` over `n`
+    /// elements, `g` holding one logit per head per row. See shaders/head_gate.comp.
+    pub fn head_gate(
+        &self,
+        x: &dyn Buffer,
+        g: &dyn Buffer,
+        y: &dyn Buffer,
+        n: usize,
+        head_dim: usize,
+    ) {
+        let kern = self
+            .be
+            .kernel("head_gate", crate::gemm::head_gate_spv(), 3, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(head_dim as u32).to_ne_bytes());
+        self.dispatch_wide(
+            kern,
+            &[Self::vkb(x), Self::vkb(g), Self::vkb(y)],
+            1,
+            &push,
+            (n as u32).div_ceil(256),
         );
     }
 

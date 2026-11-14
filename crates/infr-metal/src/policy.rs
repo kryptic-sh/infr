@@ -286,6 +286,8 @@ pub(crate) fn static_walk_live_positions(
             | Op::CopyStrided { .. }
             | Op::MoeFfn { .. }
             | Op::Conv1dSilu { .. }
+            | Op::ShortConv { .. }
+            | Op::HeadGate { .. }
             | Op::DeltaNet { .. }
             | Op::MoeSharedExpertAdd { .. } => {}
         }

@@ -1376,12 +1376,15 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) 
             // qwen35 (Qwen3-Next) decode ops: all pos-independent, on-device, recurrent state
             // updated in the BOUND buffer — tape-safe when the arm's device gate holds (the
             // host fallbacks can't tape, so the gates mirror the arms').
+            // HeadGate (LFM3) is pos-independent elementwise and always on the device.
             Op::QkNorm { .. }
             | Op::GatedRmsNorm { .. }
             | Op::Scale { .. }
             | Op::Copy { .. }
-            | Op::CopyStrided { .. } => {}
-            Op::Conv1dSilu { state, kernel, .. } => {
+            | Op::CopyStrided { .. }
+            | Op::HeadGate { .. } => {}
+            // LFM's ShortConv takes the same device gate as Conv1dSilu.
+            Op::Conv1dSilu { state, kernel, .. } | Op::ShortConv { state, kernel, .. } => {
                 if *kernel > 8
                     || !m.deltanet
                     || bindings.get(*state).is_none()
@@ -1540,6 +1543,8 @@ fn op_name(op: &Op) -> &'static str {
         Op::CopyStrided { .. } => "CopyStrided",
         Op::MoeFfn { .. } => "MoeFfn",
         Op::Conv1dSilu { .. } => "Conv1dSilu",
+        Op::ShortConv { .. } => "ShortConv",
+        Op::HeadGate { .. } => "HeadGate",
         Op::DeltaNet { .. } => "DeltaNet",
         Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
     }
@@ -1557,6 +1562,45 @@ fn hyper_check_hc(hc: u32, what: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The host fallback of the causal depthwise convs (`Op::Conv1dSilu` with `silu`, `Op::ShortConv`
+/// without): `rr` tokens in order over the `[(kk-1), cc]` history `st`, oldest row first, which it
+/// leaves holding the trailing inputs. Mirrors the CPU reference's serial loop.
+fn host_causal_conv(
+    xs: &[f32],
+    ws: &[f32],
+    st: &mut [f32],
+    rr: usize,
+    cc: usize,
+    kk: usize,
+    silu: bool,
+) -> Vec<f32> {
+    let mut out = vec![0f32; rr * cc];
+    for t in 0..rr {
+        let xt = &xs[t * cc..t * cc + cc];
+        for ch in 0..cc {
+            let mut acc = 0f32;
+            for j in 0..kk - 1 {
+                acc += st[j * cc + ch] * ws[ch * kk + j];
+            }
+            acc += xt[ch] * ws[ch * kk + (kk - 1)];
+            out[t * cc + ch] = if silu {
+                acc / (1.0 + (-acc).exp())
+            } else {
+                acc
+            };
+        }
+        for j in 0..kk.saturating_sub(2) {
+            for ch in 0..cc {
+                st[j * cc + ch] = st[(j + 1) * cc + ch];
+            }
+        }
+        if kk >= 2 {
+            st[(kk - 2) * cc..(kk - 1) * cc].copy_from_slice(xt);
+        }
+    }
+    out
 }
 
 /// Gated-FFN activation applied to the gate value (matches `infr-cpu`'s `act_fn`).
@@ -5343,30 +5387,111 @@ impl MetalBackend {
                 let xs = r.vals[x.0 as usize].clone(); // [rows, channels]
                 let ws = self.weight_host(weight, g, bindings); // [channels, kernel]
                 let st = &mut r.vals[state.0 as usize]; // [(kernel-1), channels], oldest first
-                let mut out = vec![0f32; rr * cc];
-                for t in 0..rr {
-                    let xt = &xs[t * cc..t * cc + cc];
-                    for ch in 0..cc {
-                        let mut acc = 0f32;
-                        for j in 0..kk - 1 {
-                            acc += st[j * cc + ch] * ws[ch * kk + j];
+                let out = host_causal_conv(&xs, &ws, st, rr, cc, kk, true);
+                r.vals[dst.0 as usize] = out;
+                r.loc[dst.0 as usize] = Loc::Host;
+            }
+            // LFM gated short convolution: Conv1dSilu's kernels and gates, on the B ⊙ X input
+            // with a C ⊙ output and no SiLU (see `Op::ShortConv`).
+            Op::ShortConv {
+                bcx,
+                weight,
+                state,
+                dst,
+                rows,
+                channels,
+                kernel,
+            } => {
+                let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
+                if kk <= 8 && self.metal().deltanet {
+                    if let Some(sb) = bindings.get(state) {
+                        let bx = self.ensure_device(r, bcx)?;
+                        let bw = self.weight_buf(weight, g, bindings)?;
+                        let bd = self.dev_dst(r, dst, rr * cc)?;
+                        let sbuf = metal_buf(sb);
+                        let i = state.0 as usize;
+                        r.dev[i] = Some(Arc::new(sbuf.raw.clone()));
+                        r.loc[i] = Loc::Device;
+                        let mut p = (rr as u32).to_ne_bytes().to_vec();
+                        p.extend_from_slice(&(cc as u32).to_ne_bytes());
+                        p.extend_from_slice(&(kk as u32).to_ne_bytes());
+                        if prefer_conv1d_parallel(rr, kk) && self.metal().conv1d_par {
+                            let pso = self.pipelines.get("shortconv_par_f32")?;
+                            self.encode_w(
+                                r,
+                                &pso,
+                                &[bx.as_ref(), bw.as_ref(), &sbuf.raw, bd.as_ref()],
+                                1 << 3,
+                                &p,
+                                rr * cc,
+                            );
+                            let shift = self.pipelines.get("shortconv_shift_f32")?;
+                            self.encode_w(
+                                r,
+                                &shift,
+                                &[bx.as_ref(), &sbuf.raw],
+                                1 << 1,
+                                &p,
+                                (kk - 1) * cc,
+                            );
+                        } else {
+                            let pso = self.pipelines.get("shortconv_f32")?;
+                            self.encode_w(
+                                r,
+                                &pso,
+                                &[bx.as_ref(), bw.as_ref(), &sbuf.raw, bd.as_ref()],
+                                (1 << 2) | (1 << 3),
+                                &p,
+                                cc,
+                            );
                         }
-                        acc += xt[ch] * ws[ch * kk + (kk - 1)];
-                        out[t * cc + ch] = acc / (1.0 + (-acc).exp()); // silu
+                        r.loc[dst.0 as usize] = Loc::Device;
+                        return Ok(());
                     }
-                    for j in 0..kk.saturating_sub(2) {
-                        for ch in 0..cc {
-                            st[j * cc + ch] = st[(j + 1) * cc + ch];
-                        }
-                    }
-                    if kk >= 2 {
-                        for ch in 0..cc {
-                            st[(kk - 2) * cc + ch] = xt[ch];
-                        }
-                    }
+                }
+                self.ensure_host(r, g, bcx);
+                self.ensure_host(r, g, state);
+                let bv = r.vals[bcx.0 as usize].clone(); // [rows, 3*channels]: B | C | X
+                let bxs: Vec<f32> = (0..rr * cc)
+                    .map(|i| {
+                        let row = &bv[(i / cc) * 3 * cc..];
+                        row[i % cc] * row[2 * cc + i % cc]
+                    })
+                    .collect();
+                let ws = self.weight_host(weight, g, bindings);
+                let st = &mut r.vals[state.0 as usize];
+                let mut out = host_causal_conv(&bxs, &ws, st, rr, cc, kk, false);
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o *= bv[(i / cc) * 3 * cc + cc + i % cc];
                 }
                 r.vals[dst.0 as usize] = out;
                 r.loc[dst.0 as usize] = Loc::Host;
+            }
+            // LFM3 attention output gate, one sigmoid per (row, head).
+            Op::HeadGate {
+                x,
+                gate,
+                dst,
+                rows,
+                n_head,
+                head_dim,
+            } => {
+                let total = (rows * n_head * head_dim) as usize;
+                let bx = self.ensure_device(r, x)?;
+                let bg = self.ensure_device(r, gate)?;
+                let bd = self.dev_dst(r, dst, total)?;
+                let pso = self.pipelines.get("head_gate_f32")?;
+                let mut p = (total as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&head_dim.to_ne_bytes());
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bg.as_ref(), bd.as_ref()],
+                    1 << 2,
+                    &p,
+                    total,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::DeltaNet {
                 q,

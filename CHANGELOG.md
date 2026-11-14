@@ -8,6 +8,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **LFM3 (`lfm3`).** Liquid AI's LFM3-1.7B runs on the CPU and Vulkan backends
+  and decodes on the record-once replay: gated short-convolution layers (`B ⊙ X`
+  through a causal depthwise conv, then `C ⊙`) between QK-normed attention
+  layers that mix full and sliding-window attention by a per-layer pattern and
+  scale each head by a sigmoid gate, with sandwich norms on every layer. Its CPU
+  prefill logits match llama.cpp's to within 0.004 on the F16 file, including a
+  1092-token prompt past the 256-token window, and greedy continuations of a
+  multi-turn chat and of that long prompt are token-identical. A session that
+  extends the previous turn keeps the convolution history, and one that resumes
+  at the previous turn's prefill boundary restores the snapshot taken there; any
+  other turn starts it from zero, as for qwen35. A file declaring the non-causal
+  variant (`attention.causal = false`) is refused, and so, as in llama.cpp, is a
+  file without `attention.layer_norm_rms_epsilon` or, when it has a
+  full-attention layer, without `rope_freqs.weight`. The Metal backend has the
+  two new ops too; that path has not been run on Apple hardware.
+- **`Op::ShortConv` and `Op::HeadGate`** (`infr_core::graph`): LFM's gated short
+  convolution and a per-head sigmoid output gate, on the CPU, Vulkan and Metal
+  backends.
+- **`infr_llama::Config`**: `lfm3`, `shortconv_layers`, `shortconv_l_cache`,
+  `swa_layers` (a per-layer window pattern `is_swa_layer` answers from) and
+  `sandwich_norm`, with `is_shortconv_layer`, `is_recurrent_layer`,
+  `has_recurrent_state` and `recurrent_state_elems`.
+- **`infr_llama::seam::window_ring_rows`**: the rows a session's shortest
+  sliding-window ring holds at a given context and prefill chunk.
 - **`paging.early_submit`** (config only, default 8; `0` = off): on Vulkan, a
   paged forward (MoE experts or dense layers streamed through the VRAM cache) is
   cut into segments that the GPU starts on while the host records the rest. The
@@ -51,6 +75,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The KV-cache estimate prices a recurrent layer at its fixed state size.**
+  The context fit and the placement sweep used to price a qwen35 DeltaNet layer
+  as if it cached K and V per token, so a qwen35 session's default context was
+  sized against memory the runner never allocates. They now price its conv and
+  `S` state (and LFM3's convolution history) at what is allocated, twice over:
+  the live state and the one snapshot of it a slot keeps for MTP rollback and
+  for resuming at a prefill boundary. The snapshot's allocation fails the
+  request when refused, so the fit now keeps room for it; the MTP head's own KV
+  cache is still not priced.
 - **Paged MoE decode on Vulkan reaches its no-readback path from a short prompt
   when the expert cache can hold the whole model.** A MoE layer decodes without
   reading its router ids back only once every one of its experts is in VRAM, and
@@ -178,6 +211,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A qwen35 file that stores `ssm_conv1d` in f16 or bf16 is widened to f32 at
+  load.** The Vulkan conv shaders read the kernel as f32 whatever the file's
+  dtype, so such a file read half-precision bits as floats there. LFM3's
+  `shortconv.conv` takes the same path.
 - **A paged model's first forward no longer cuts every later Vulkan forward into
   16-dispatch submits.** The submit splitter, which keeps each submit under the
   driver's GPU hang timeout, judged a forward by its wall time, so the seconds a

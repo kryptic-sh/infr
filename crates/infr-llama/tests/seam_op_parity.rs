@@ -21,6 +21,20 @@ fn run(
     out: TensorId,
     out_len: usize,
 ) -> Vec<f32> {
+    run_and_read(be, g, inputs, weights, out, out_len, &[]).0
+}
+
+/// [`run`], also downloading the inputs named in `read` after the execute — the recurrent ops'
+/// state, which they rewrite in place.
+fn run_and_read(
+    be: &dyn Backend,
+    g: &Graph,
+    inputs: &[(TensorId, &[f32])],
+    weights: &[(TensorId, &[f32])],
+    out: TensorId,
+    out_len: usize,
+    read: &[TensorId],
+) -> (Vec<f32>, Vec<Vec<f32>>) {
     let plan = be.compile(g).expect("compile");
     // Alloc + upload all inputs/weights first (owned), then bind from the Vec so the bound refs
     // outlive `execute`.
@@ -51,7 +65,17 @@ fn run(
     let mut o = vec![0f32; out_len];
     be.download(obuf.as_ref(), bytemuck::cast_slice_mut(&mut o))
         .unwrap();
-    o
+    let read = read
+        .iter()
+        .map(|id| {
+            let (_, buf) = keep.iter().find(|(k, _)| k == id).expect("read an input");
+            let mut v = vec![0f32; buf.len_bytes() / 4];
+            be.download(buf.as_ref(), bytemuck::cast_slice_mut(&mut v))
+                .unwrap();
+            v
+        })
+        .collect();
+    (o, read)
 }
 
 fn gpu() -> Option<infr_vulkan::VulkanBackend> {
@@ -657,6 +681,128 @@ fn conv1d_silu_parity() {
     );
     println!("Conv1dSilu max_err={:e}", maxerr(&c, &v));
     assert!(maxerr(&c, &v) < 1e-3, "Conv1dSilu diverges");
+}
+
+/// LFM's gated short convolution on Vulkan against the CPU: one token and three tokens (the
+/// token-serial kernel) and a prefill-sized batch (the two-pass kernel), each from a NONZERO
+/// history so the carried state is read, and each scored on the output AND the history the op
+/// leaves behind for the next call.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn shortconv_parity() {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (cc, kernel) = (96usize, 7usize);
+    for rows in [1usize, 3, 37] {
+        let mut g = Graph::new();
+        let bcx = g.input(f32d(rows * 3 * cc));
+        let w = g.weight(f32d(cc * kernel));
+        let state = g.input(f32d((kernel - 1) * cc));
+        let dst = g.output(f32d(rows * cc));
+        g.push(Op::ShortConv {
+            bcx,
+            weight: w,
+            state,
+            dst,
+            rows: rows as u32,
+            channels: cc as u32,
+            kernel: kernel as u32,
+        });
+        let xi = gen(rows * 3 * cc, 21);
+        let wi = gen(cc * kernel, 22);
+        let st = gen((kernel - 1) * cc, 23);
+        let go = |be: &dyn Backend| {
+            run_and_read(
+                be,
+                &g,
+                &[(bcx, &xi), (state, &st)],
+                &[(w, &wi)],
+                dst,
+                rows * cc,
+                &[state],
+            )
+        };
+        let (c, cs) = go(&cpu);
+        let (v, vs) = go(&vk);
+        let (out_err, state_err) = (maxerr(&c, &v), maxerr(&cs[0], &vs[0]));
+        println!("ShortConv rows={rows} out max_err={out_err:e} state max_err={state_err:e}");
+        assert!(out_err < 1e-4, "ShortConv rows={rows}: output diverges");
+        assert!(state_err < 1e-5, "ShortConv rows={rows}: history diverges");
+    }
+}
+
+/// LFM3's per-head sigmoid gate on Vulkan against the CPU, at the 1.7B model's head shape.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn head_gate_parity() {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, hd) = (5usize, 16usize, 128usize);
+    let mut g = Graph::new();
+    let x = g.input(f32d(rows * nh * hd));
+    let gate = g.input(f32d(rows * nh));
+    let dst = g.output(f32d(rows * nh * hd));
+    g.push(Op::HeadGate {
+        x,
+        gate,
+        dst,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+    });
+    let xi = gen(rows * nh * hd, 31);
+    let gi = gen(rows * nh, 32);
+    let go = |be: &dyn Backend| run(be, &g, &[(x, &xi), (gate, &gi)], &[], dst, rows * nh * hd);
+    let (c, v) = (go(&cpu), go(&vk));
+    println!("HeadGate max_err={:e}", maxerr(&c, &v));
+    assert!(maxerr(&c, &v) < 1e-5, "HeadGate diverges");
+
+    // In place, as the runner applies it: on an internal activation that an earlier op wrote and a
+    // later op reads, with `dst == x`.
+    let n = rows * nh * hd;
+    let mut g = Graph::new();
+    let x = g.input(f32d(n));
+    let gate = g.input(f32d(rows * nh));
+    let attn = g.internal(f32d(n));
+    let dst = g.output(f32d(n));
+    g.push(Op::Copy {
+        src: x,
+        src_off: 0,
+        dst: attn,
+        dst_off: 0,
+        n: n as u32,
+    });
+    g.push(Op::HeadGate {
+        x: attn,
+        gate,
+        dst: attn,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+    });
+    g.push(Op::Copy {
+        src: attn,
+        src_off: 0,
+        dst,
+        dst_off: 0,
+        n: n as u32,
+    });
+    let go = |be: &dyn Backend| run(be, &g, &[(x, &xi), (gate, &gi)], &[], dst, n);
+    let (ci, vi) = (go(&cpu), go(&vk));
+    println!(
+        "HeadGate in place max_err={:e} (cpu vs its out-of-place {:e})",
+        maxerr(&c, &vi),
+        maxerr(&c, &ci)
+    );
+    assert!(maxerr(&c, &ci) < 1e-6, "HeadGate in place moves the CPU");
+    assert!(
+        maxerr(&c, &vi) < 1e-5,
+        "HeadGate in place diverges on Vulkan"
+    );
 }
 
 #[test]

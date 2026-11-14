@@ -61,6 +61,7 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | Gemma 4 **MoE**   | `gemma4`          | 26B-A4B: dual FFN (dense GeGLU ∥ 8-of-128 routed), AR                      |
 | Qwen3.5 / Qwen3.6 | `qwen35`          | hybrid gated-DeltaNet + attention (NOT `qwen3next`)                        |
 | Qwen3.6 MoE       | `qwen35moe`       | `qwen35` skeleton + routed experts + shared expert                         |
+| LFM3              | `lfm3`            | gated short-convolution layers + head-gated SWA/full attention             |
 | DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode                     |
 | BitNet b1.58      | `bitnet`          | llama skeleton + SubLN, ternary TQ2_0 weights                              |
 | BitNet b1.58 (MS) | `bitnet-b1.58`    | same, for the `microsoft/bitnet-b1.58-*` GGUFs (i2_s)                      |

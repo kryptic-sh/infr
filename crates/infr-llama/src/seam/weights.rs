@@ -110,6 +110,20 @@ pub(super) struct AttnW {
     pub(super) q_norm: Option<TensorId>,
     pub(super) k_norm: Option<TensorId>,
     pub(super) wo: TensorId,
+    /// LFM3's `attn_gate.weight` `[n_embd, n_head]`: one sigmoid gate logit per head, projected
+    /// from the attention input and applied to that head's output before `wo` (`Op::HeadGate`).
+    /// `None` on every other arch.
+    pub(super) head_gate: Option<TensorId>,
+}
+
+/// LFM's gated short-convolution mixer (`build_lfm_shortconv`): `in_proj` to B | C | X, the
+/// depthwise causal conv over `B ⊙ X` (`Op::ShortConv`), `out_proj`. Like [`DeltaW`] it owns no
+/// KV cache — its conv history is session state held in the layer's `kbufs` slot (see
+/// `Config::recurrent_state_elems`).
+pub(super) struct ShortConvW {
+    pub(super) in_proj: TensorId,
+    pub(super) conv: TensorId,
+    pub(super) out_proj: TensorId,
 }
 
 /// qwen35 gated-DeltaNet linear-attention mixer weights (see `docs/qwen35.md`). Unlike `AttnW` this
@@ -231,10 +245,12 @@ pub(super) struct LayerHcW {
     pub(super) ffn: HcTriple,
 }
 
-/// The layer's token mixer: classic attention, qwen35 gated-DeltaNet, DeepSeek MLA, or DeepSeek V4.
+/// The layer's token mixer: classic attention, qwen35 gated-DeltaNet, LFM short convolution,
+/// DeepSeek MLA, or DeepSeek V4.
 pub(super) enum MixerW {
     Attn(AttnW),
     DeltaNet(DeltaW),
+    ShortConv(ShortConvW),
     Mla(MlaW),
     Dsv4(Dsv4W),
 }
@@ -365,7 +381,7 @@ pub(crate) struct SeamKv {
     /// `snapshot_delta`/`restore_delta` they wrap): a device-resident copy of every DeltaNet
     /// layer's recurrent state at the last CLEAN committed boundary, plus the cached-token length
     /// there. Its append-only state can't rewind by cache truncation the way a per-position KV
-    /// cache can (see the `c.qwen35` branch in `generate_dense_backend`'s `start` computation), so
+    /// cache can (see the recurrent-state branch in `generate_dense_backend`'s `start`), so
     /// this is what lets a turn resume from that boundary instead of re-prefilling from zero. Two
     /// writers: MTP spec decode (a partial-accept cycle rolls back to the committed prefix) and
     /// the decode loop, which snapshots the prefill boundary before a chained decode that may run
@@ -376,15 +392,15 @@ pub(crate) struct SeamKv {
     pub(super) delta_snapshot_refused: bool,
 }
 
-/// The device-resident DeltaNet-state snapshot backing [`snapshot_delta`] — one conv-state + one
-/// S-state buffer per qwen35 DeltaNet layer (parallel to `layers`), plus the cached-token length
-/// the snapshot corresponds to. Allocated once (lazily) and reused every cycle. Its size is the
-/// live recurrent state's: per DeltaNet layer, `4 * ((ssm_d_conv - 1) * q35_conv_channels +
-/// q35_num_v_heads * q35_head_k_dim * q35_head_v_dim)` bytes.
+/// The device-resident recurrent-state snapshot backing [`snapshot_delta`] — a copy of both state
+/// buffers of every recurrent layer (`Config::is_recurrent_layer`: qwen35 DeltaNet, LFM short
+/// convolution; parallel to `layers`), plus the cached-token length the snapshot corresponds to.
+/// Allocated once (lazily) and reused every cycle. Its size is the live recurrent state's
+/// (`Config::recurrent_state_elems`).
 pub(super) struct MtpDeltaCkpt {
     kbufs: Vec<Box<dyn Buffer>>,
     vbufs: Vec<Box<dyn Buffer>>,
-    /// The layer indices (into `SeamKv::kbufs`/`vbufs`) that are DeltaNet mixers.
+    /// The layer indices (into `SeamKv::kbufs`/`vbufs`) that are recurrent.
     layers: Vec<usize>,
     cached_len: usize,
     /// False once the slot's tokens no longer start with the ones the snapshot consumed (a reset
@@ -392,10 +408,10 @@ pub(super) struct MtpDeltaCkpt {
     valid: bool,
 }
 
-/// Snapshot the qwen35 DeltaNet recurrent state in `kbufs`/`vbufs` into `ckpt` (allocated on first
-/// use, through the same `KvCache` allocation as the state itself), recording that it has
-/// consumed `cached_len` tokens: one `Backend::copy_buffer` per state buffer. A no-op on a
-/// model with no DeltaNet layers.
+/// Snapshot the recurrent state in `kbufs`/`vbufs` into `ckpt` (allocated on first use, through
+/// the same `KvCache` allocation as the state itself), recording that it has consumed
+/// `cached_len` tokens: one `Backend::copy_buffer` per state buffer. A no-op on a model with no
+/// recurrent layers.
 pub(super) fn snapshot_delta(
     be: &dyn Backend,
     cfg: &Config,
@@ -406,7 +422,7 @@ pub(super) fn snapshot_delta(
 ) -> AResult<()> {
     if ckpt.is_none() {
         let layers: Vec<usize> = (0..cfg.n_layer)
-            .filter(|&l| cfg.qwen35 && !cfg.is_qwen35_attn_layer(l))
+            .filter(|&l| cfg.is_recurrent_layer(l))
             .collect();
         if layers.is_empty() {
             return Ok(());
@@ -533,6 +549,16 @@ impl SeamKv {
         invalidate_delta(&mut self.mtp_delta_ckpt);
     }
 
+    /// The rows the shortest sliding-window ring of this slot holds, or `None` when its window
+    /// layers keep full-context caches (no ring, or no window layer). A slot that has written
+    /// past that many positions has wrapped the ring and recycled its earliest rows.
+    pub(crate) fn window_ring_rows(&self, be: &dyn Backend, cfg: &Config) -> Option<usize> {
+        if !self.kv_ring {
+            return None;
+        }
+        crate::seam::window_ring_rows(cfg, self.max_ctx, self.ubatch, be.kv_row_align())
+    }
+
     /// Number of token ids materialized in this slot's KV cache.
     pub(crate) fn cached_len(&self) -> usize {
         self.cached.len()
@@ -545,13 +571,13 @@ impl SeamKv {
         invalidate_delta(&mut self.mtp_delta_ckpt);
     }
 
-    /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
-    /// Snapshot the qwen35 DeltaNet recurrent state (every DeltaNet layer's conv + S buffers) plus
-    /// the current `cached` length into the device-resident [`MtpDeltaCkpt`] (allocated once on the
-    /// first call). The MTP spec-decode loop calls this at a CLEAN committed boundary (after the
-    /// prime prefill and after every fully-accepted cycle) so a later partial-accept cycle can roll
-    /// back to it via [`mtp_restore_delta`]. A no-op on a non-qwen35 model (no DeltaNet layers). The
-    /// snapshot is a pure device→device buffer copy (`Backend::copy_buffer`), never a host bounce.
+    /// Snapshot the recurrent state (both state buffers of every recurrent layer:
+    /// `Config::is_recurrent_layer`) plus the current `cached` length into the device-resident
+    /// [`MtpDeltaCkpt`] (allocated once on the first call). The MTP spec-decode loop calls this at
+    /// a CLEAN committed boundary (after the prime prefill and after every fully-accepted cycle) so
+    /// a later partial-accept cycle can roll back to it via [`mtp_restore_delta`]. A no-op on a
+    /// model with no recurrent layers. The snapshot is a pure device→device buffer copy
+    /// (`Backend::copy_buffer`), never a host bounce.
     pub(crate) fn mtp_snapshot_delta(&mut self, be: &dyn Backend, cfg: &Config) -> AResult<()> {
         snapshot_delta(
             be,
@@ -578,23 +604,23 @@ impl SeamKv {
         Ok(())
     }
 
+    /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
     pub(crate) fn fork(&self, be: &dyn Backend, cfg: &Config) -> AResult<SeamKv> {
         let e2b = self.ipl_buf.is_some();
         let npl = cfg.n_embd_per_layer.max(1);
         let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
         let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for l in 0..cfg.n_layer {
-            // qwen35 DeltaNet layers: fixed-size conv/S state, NOT a `max_ctx`-scaled KV cache (see
-            // the matching alloc in `generate_dense_backend`'s state init and `MixerW::DeltaNet`).
-            if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
-                let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
-                let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
+            // Recurrent layers (qwen35 DeltaNet, LFM short convolution): fixed-size state, NOT a
+            // `max_ctx`-scaled KV cache (see the matching alloc in `generate_dense_backend`'s state
+            // init and `Config::recurrent_state_elems`).
+            if let Some((k_elems, v_elems)) = cfg.recurrent_state_elems(l) {
                 kbufs.push(
-                    be.alloc(conv_elems * 4, BufferUsage::KvCache)
+                    be.alloc(k_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 vbufs.push(
-                    be.alloc(s_elems * 4, BufferUsage::KvCache)
+                    be.alloc(v_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 continue;
@@ -697,8 +723,8 @@ impl SeamKv {
     /// prefix — e.g. the system prompt) via a device-side buffer copy, so the new conversation
     /// skips re-prefilling it. `p` must be ≤ src's materialized length.
     ///
-    /// qwen35: a no-op. The gated-DeltaNet recurrent state is a single fixed-size summary of
-    /// EVERY token fed so far — there's no "first `p` tokens' worth" of it to slice out and copy
+    /// A model with a recurrent state (qwen35, LFM3): a no-op. That state is a single fixed-size
+    /// summary of EVERY token fed so far — there's no "first `p` tokens' worth" of it to slice out and copy
     /// the way a real per-position KV cache allows (see `docs/qwen35.md` and the no-rewind rule in
     /// `generate_dense_backend`). Leaving `self.cached` empty (this slot's `fork()` already zeroed
     /// its state) is the CORRECT fallback: the next call on this slot fully re-prefills, exactly
@@ -710,7 +736,7 @@ impl SeamKv {
         src: &SeamKv,
         p: usize,
     ) -> AResult<()> {
-        if cfg.qwen35 {
+        if cfg.has_recurrent_state() {
             return Ok(());
         }
         let p = p.min(src.cached.len()).min(self.max_ctx);
@@ -724,23 +750,11 @@ impl SeamKv {
         // reuse on long conversations is lost. (Seeding a wrapped source's window TAIL would be
         // exact too, but needs two-segment copies per side per layer + a tail-only `cached`
         // semantics — deferred until serve traffic shows it matters.)
-        if self.kv_ring {
-            let wrapped = (0..cfg.n_layer)
-                .filter(|&l| cfg.is_swa_layer(l))
-                .map(|l| {
-                    crate::seam::kv_rows_at(
-                        cfg,
-                        l,
-                        self.max_ctx,
-                        true,
-                        self.ubatch,
-                        be.kv_row_align(),
-                    )
-                })
-                .any(|rows_l| src.written_end > rows_l);
-            if wrapped {
-                return Ok(());
-            }
+        if self
+            .window_ring_rows(be, cfg)
+            .is_some_and(|rows| src.written_end > rows)
+        {
+            return Ok(());
         }
         for l in 0..cfg.n_layer {
             // One prefix position is `k_row`/`v_row` elements per side — MLA's compressed row is

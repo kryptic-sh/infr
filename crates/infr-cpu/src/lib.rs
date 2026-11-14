@@ -2182,6 +2182,28 @@ impl Backend for CpuBackend {
                     });
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
+                // LFM3 attention output gate: one sigmoid per (row, head), broadcast over the
+                // head's `head_dim` lanes — see the `Op::HeadGate` doc.
+                Op::HeadGate {
+                    x,
+                    gate,
+                    dst,
+                    rows,
+                    n_head,
+                    head_dim,
+                } => {
+                    let (nh, hd) = (n_head as usize, head_dim as usize);
+                    let xs = &vals[x.0 as usize];
+                    let gv = &vals[gate.0 as usize]; // [rows, n_head] raw logits
+                    let mut out = rc.zeroed(rows as usize * nh * hd);
+                    self.pool().for_chunks_mut(&mut out, hd, 16, &|rh, orow| {
+                        let g = 1.0 / (1.0 + (-gv[rh]).exp());
+                        for (i, o) in orow.iter_mut().enumerate() {
+                            *o = xs[rh * hd + i] * g;
+                        }
+                    });
+                    rc.set(&mut vals, dst.0 as usize, out);
+                }
                 Op::Softcap { x, dst, cap, n } => {
                     let n = n as usize;
                     let xs = &vals[x.0 as usize];
@@ -3112,45 +3134,35 @@ impl Backend for CpuBackend {
                     let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
                     let xs = vals[x.0 as usize].clone(); // [rows, channels]
                     let ws = weight(w); // [channels, kernel] row-major (per-channel kernel)
-                                        // Gate (perf only — both paths are bit-identical): only pay the pool spin-up on
-                                        // real prefill. Decode (rr==1) and tiny batches keep the serial shift-register
-                                        // loop, mirroring the Vulkan/Metal `rr >= (kk-1).max(2)` gate.
-                    if rr >= (kk - 1).max(2) {
-                        // Parallel path: reformulate over the virtual `[state ‖ x]` sequence so every
-                        // output row is independent (see `conv1d_silu`). Snapshot state up front, run
-                        // the pool, then write the rebuilt history back.
-                        let st = &mut vals[state.0 as usize];
-                        let out = conv1d_silu(self.pool(), &xs, &ws, st, rr, cc, kk);
-                        rc.set(&mut vals, dst.0 as usize, out);
-                    } else {
-                        let st = &mut vals[state.0 as usize]; // [(kernel-1), channels], oldest row first
-                        let mut out = vec![0f32; rr * cc];
-                        // Process the rows in sequence, carrying the rolling history across tokens.
-                        for t in 0..rr {
-                            let xt = &xs[t * cc..t * cc + cc];
-                            for ch in 0..cc {
-                                // window = [history rows.. , current x]; tap j uses weight[ch*kk + j].
-                                let mut acc = 0f32;
-                                for j in 0..kk - 1 {
-                                    acc += st[j * cc + ch] * ws[ch * kk + j];
-                                }
-                                acc += xt[ch] * ws[ch * kk + (kk - 1)];
-                                out[t * cc + ch] = acc / (1.0 + (-acc).exp()); // silu
-                            }
-                            // shift history (drop oldest, append raw x).
-                            for j in 0..kk.saturating_sub(2) {
-                                for ch in 0..cc {
-                                    st[j * cc + ch] = st[(j + 1) * cc + ch];
-                                }
-                            }
-                            if kk >= 2 {
-                                for ch in 0..cc {
-                                    st[(kk - 2) * cc + ch] = xt[ch];
-                                }
-                            }
-                        }
-                        rc.set(&mut vals, dst.0 as usize, out);
+                    let st = &mut vals[state.0 as usize];
+                    let out = causal_conv1d(self.pool(), &xs, &ws, st, rr, cc, kk, true);
+                    rc.set(&mut vals, dst.0 as usize, out);
+                }
+                Op::ShortConv {
+                    bcx,
+                    weight: w,
+                    state,
+                    dst,
+                    rows,
+                    channels,
+                    kernel,
+                } => {
+                    let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
+                    let bv = &vals[bcx.0 as usize]; // [rows, 3*channels]: B | C | X per row
+                    let bx: Vec<f32> = (0..rr * cc)
+                        .map(|i| {
+                            let row = &bv[(i / cc) * 3 * cc..];
+                            row[i % cc] * row[2 * cc + i % cc]
+                        })
+                        .collect();
+                    let ws = weight(w); // [channels, kernel]
+                    let st = &mut vals[state.0 as usize];
+                    let mut out = causal_conv1d(self.pool(), &bx, &ws, st, rr, cc, kk, false);
+                    let bv = &vals[bcx.0 as usize];
+                    for (i, o) in out.iter_mut().enumerate() {
+                        *o *= bv[(i / cc) * 3 * cc + cc + i % cc];
                     }
+                    rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::DeltaNet {
                     q,
@@ -3736,9 +3748,63 @@ impl Backend for CpuBackend {
     }
 }
 
-/// Depthwise causal conv (fixed per-channel kernel of width `kk`) followed by SiLU, over a rolling
-/// history `st` carried across token batches. Returns the `[rows, channels]` output and REBUILDS
-/// `st` in place to the trailing `km1 = kk-1` history rows.
+/// Depthwise causal conv (fixed per-channel kernel of width `kk`) over a rolling history `st`
+/// carried across token batches, followed by SiLU when `silu` (qwen35's `Op::Conv1dSilu`) and by
+/// nothing otherwise (LFM's `Op::ShortConv`). Returns the `[rows, channels]` output and leaves `st`
+/// holding the trailing `kk-1` input rows.
+///
+/// Decode and tiny batches walk the rows serially, shifting the history per token; real prefill
+/// (`rows >= (kk-1).max(2)`, the gate the Vulkan and Metal kernels use) runs [`conv1d_par`]. The two
+/// paths are bit-identical (see there), so the gate is perf only.
+#[allow(clippy::too_many_arguments)]
+fn causal_conv1d(
+    pool: &pool::SpinPool,
+    xs: &[f32],
+    ws: &[f32],
+    st: &mut [f32],
+    rr: usize,
+    cc: usize,
+    kk: usize,
+    silu: bool,
+) -> Vec<f32> {
+    if rr >= (kk - 1).max(2) {
+        return conv1d_par(pool, xs, ws, st, rr, cc, kk, silu);
+    }
+    let mut out = vec![0f32; rr * cc];
+    for t in 0..rr {
+        let xt = &xs[t * cc..t * cc + cc];
+        for ch in 0..cc {
+            // window = [history rows.. , current x]; tap j uses weight[ch*kk + j].
+            let mut acc = 0f32;
+            for j in 0..kk - 1 {
+                acc += st[j * cc + ch] * ws[ch * kk + j];
+            }
+            acc += xt[ch] * ws[ch * kk + (kk - 1)];
+            out[t * cc + ch] = conv_act(acc, silu);
+        }
+        // shift history (drop oldest, append raw x).
+        for j in 0..kk.saturating_sub(2) {
+            for ch in 0..cc {
+                st[j * cc + ch] = st[(j + 1) * cc + ch];
+            }
+        }
+        if kk >= 2 {
+            st[(kk - 2) * cc..(kk - 1) * cc].copy_from_slice(xt);
+        }
+    }
+    out
+}
+
+/// The conv's output activation: SiLU, or the identity.
+fn conv_act(acc: f32, silu: bool) -> f32 {
+    if silu {
+        acc / (1.0 + (-acc).exp())
+    } else {
+        acc
+    }
+}
+
+/// The parallel body of [`causal_conv1d`].
 ///
 /// Parallel reformulation (the whole trick): the conv is depthwise + causal with a fixed kernel, so
 /// every output reads only the VIRTUAL sequence `[state ‖ x]` and all `rr*cc` outputs are
@@ -3753,7 +3819,8 @@ impl Backend for CpuBackend {
 /// float-for-float. The state rebuild is a pure copy (no arithmetic), so it is trivially identical.
 /// Handles `kk == 1` (km1=0, no history: `out[t]=silu(xs[t]*w[0])`) and `rr < km1` (the rebuild
 /// reads leftover old state via the `i < km1` branch of `virtual`).
-fn conv1d_silu(
+#[allow(clippy::too_many_arguments)]
+fn conv1d_par(
     pool: &pool::SpinPool,
     xs: &[f32],
     ws: &[f32],
@@ -3761,6 +3828,7 @@ fn conv1d_silu(
     rows: usize,
     channels: usize,
     kernel: usize,
+    silu: bool,
 ) -> Vec<f32> {
     let (rr, cc, kk) = (rows, channels, kernel);
     let km1 = kk - 1;
@@ -3784,7 +3852,7 @@ fn conv1d_silu(
             for j in 0..kk {
                 acc += virt(t + j, ch) * ws[ch * kk + j];
             }
-            orow[ch] = acc / (1.0 + (-acc).exp()); // silu
+            orow[ch] = conv_act(acc, silu);
         }
     });
     // Rebuild the rolling history = trailing km1 virtual rows (pure copy, no arithmetic).
@@ -3959,7 +4027,7 @@ mod tests {
     }
 
     // Naive serial reference: a byte-for-byte copy of the ORIGINAL shift-register conv loop. The
-    // parallel `conv1d_silu` reformulation must reproduce both `out` and the rebuilt `state` exactly.
+    // parallel `conv1d_par` reformulation must reproduce both `out` and the rebuilt `state` exactly.
     fn conv1d_silu_ref(
         xs: &[f32],
         ws: &[f32],
@@ -3967,6 +4035,7 @@ mod tests {
         rr: usize,
         cc: usize,
         kk: usize,
+        silu: bool,
     ) -> Vec<f32> {
         let mut out = vec![0f32; rr * cc];
         for t in 0..rr {
@@ -3977,7 +4046,11 @@ mod tests {
                     acc += st[j * cc + ch] * ws[ch * kk + j];
                 }
                 acc += xt[ch] * ws[ch * kk + (kk - 1)];
-                out[t * cc + ch] = acc / (1.0 + (-acc).exp());
+                out[t * cc + ch] = if silu {
+                    acc / (1.0 + (-acc).exp())
+                } else {
+                    acc
+                };
             }
             for j in 0..kk.saturating_sub(2) {
                 for ch in 0..cc {
@@ -3993,11 +4066,12 @@ mod tests {
         out
     }
 
-    // The parallel `conv1d_silu` reformulation must be BIT-IDENTICAL (exact f32 equality) to the
+    // The parallel `conv1d_par` reformulation must be BIT-IDENTICAL (exact f32 equality) to the
     // naive serial reference for BOTH the output and the rebuilt state, across a matrix of
     // (rows, kernel, channels) that spans: real-prefill sizes, decode (rr==1), rr == kk-1, a case
     // with rr < kk-1 (rebuild reads leftover old state), kk==1 (no history), kk==2, small channel
-    // counts, and a large channel count that forces the pool's multi-chunk path.
+    // counts, and a large channel count that forces the pool's multi-chunk path — with the SiLU
+    // (`Op::Conv1dSilu`) and without it (`Op::ShortConv`).
     #[test]
     fn conv1d_silu_bit_identical_to_serial() {
         // Deterministic pseudo-random pattern (no RNG): a cheap hashed ramp in [-1, 1).
@@ -4019,25 +4093,28 @@ mod tests {
             (2, 2),
             (2, 4),
         ] {
-            for &cc in &[40usize, 512] {
+            for (&cc, silu) in [40usize, 512]
+                .iter()
+                .flat_map(|cc| [(cc, true), (cc, false)])
+            {
                 let km1 = kk - 1;
                 let xs: Vec<f32> = (0..rr * cc).map(|i| pat(1, i)).collect();
                 let ws: Vec<f32> = (0..cc * kk).map(|i| pat(2, i)).collect();
                 let st0: Vec<f32> = (0..km1 * cc).map(|i| pat(3, i)).collect();
 
                 let mut st_ref = st0.clone();
-                let out_ref = conv1d_silu_ref(&xs, &ws, &mut st_ref, rr, cc, kk);
+                let out_ref = conv1d_silu_ref(&xs, &ws, &mut st_ref, rr, cc, kk, silu);
 
                 let mut st_par = st0.clone();
-                let out_par = conv1d_silu(pool, &xs, &ws, &mut st_par, rr, cc, kk);
+                let out_par = conv1d_par(pool, &xs, &ws, &mut st_par, rr, cc, kk, silu);
 
                 assert_eq!(
                     out_par, out_ref,
-                    "output mismatch at rr={rr} kk={kk} cc={cc}"
+                    "output mismatch at rr={rr} kk={kk} cc={cc} silu={silu}"
                 );
                 assert_eq!(
                     st_par, st_ref,
-                    "rebuilt state mismatch at rr={rr} kk={kk} cc={cc}"
+                    "rebuilt state mismatch at rr={rr} kk={kk} cc={cc} silu={silu}"
                 );
             }
         }

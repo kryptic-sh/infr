@@ -55,7 +55,7 @@ different:
 
 `llama`, `llama4`, `qwen2`, `qwen3`, `qwen3moe`, `gemma3`, `gemma4` (dense / E2B
 / 26B-A4B MoE on the one string), `qwen35`, `qwen35moe`, `diffusion-gemma`,
-`bitnet`, `bitnet-b1.58`, `smollm3`, `ernie4_5`, `ernie4_5-moe`, and the
+`bitnet`, `bitnet-b1.58`, `smollm3`, `ernie4_5`, `ernie4_5-moe`, `lfm3`, and the
 DeepSeek line — `deepseek`, `deepseek2`, `deepseek32`, `deepseek4` (status per
 stage in [`deepseek.md`](deepseek.md): `deepseek4` loads but refuses any layer
 with a non-zero `compress_ratio`).

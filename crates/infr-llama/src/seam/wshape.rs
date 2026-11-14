@@ -45,9 +45,11 @@ pub(super) fn expected_weight_shape(c: &Config, name: &str) -> Option<Vec<usize>
         return None;
     }
     let delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
+    let shortconv = c.is_shortconv_layer(l);
     let mla = c.deepseek2 && !c.deepseek4;
-    // The standard attention mixer (`MixerW::Attn`): every arch but DeltaNet, MLA and V4.
-    let attn = !delta && !c.deepseek2 && !c.deepseek4;
+    // The standard attention mixer (`MixerW::Attn`): every arch but DeltaNet, LFM's short
+    // convolution, MLA and V4.
+    let attn = !delta && !shortconv && !c.deepseek2 && !c.deepseek4;
     let (hd, nkv, nff) = (c.layer_head_dim(l), c.layer_n_kv(l), c.layer_n_ff(l));
     let (qrow, kvrow) = (c.n_head * hd, nkv * hd);
     let moe_layer = !c.dual_moe() && c.moe.is_some() && c.is_moe_layer(l);
@@ -65,6 +67,12 @@ pub(super) fn expected_weight_shape(c: &Config, name: &str) -> Option<Vec<usize>
         "attn_q_norm.weight" | "attn_k_norm.weight" if attn => vec![hd],
         "attn_output.weight" if attn => vec![qrow, ne],
         "attn_sub_norm.weight" if attn => vec![qrow],
+        // LFM3's per-head output gate: one logit per head (`Op::HeadGate`).
+        "attn_gate.weight" if attn && c.lfm3 => vec![ne, c.n_head],
+        // LFM's short convolution: B | C | X in-projection, the per-channel kernel, the output.
+        "shortconv.in_proj.weight" if shortconv => vec![ne, 3 * ne],
+        "shortconv.conv.weight" if shortconv => vec![c.shortconv_l_cache, ne],
+        "shortconv.out_proj.weight" if shortconv => vec![ne, ne],
         "ffn_gate.weight" | "ffn_up.weight" if dense_ffn => vec![ne, nff],
         "ffn_down.weight" if dense_ffn => vec![nff, ne],
         "ffn_sub_norm.weight" if dense_ffn => vec![nff],

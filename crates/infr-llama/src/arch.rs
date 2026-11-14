@@ -131,6 +131,15 @@ pub const DEEPSEEK4: &str = "deepseek4";
 /// file, so `Config::from_gguf` keeps `arch` verbatim for key lookups and treats this as bitnet via
 /// [`is_bitnet`]. These files ship i2_s ternary weights (host-dequant → f16 at load).
 pub const BITNET_B158: &str = "bitnet-b1.58";
+/// LFM3 (Liquid AI): gated short-convolution layers (`in_proj` → `B ⊙ X` → a causal depthwise
+/// conv with no activation → `C ⊙` → `out_proj`, `Op::ShortConv`) between attention layers that
+/// carry QK-norm, NEOX rope and a per-head SIGMOID output gate (`attn_gate`, `Op::HeadGate`).
+/// The attention layers mix full and sliding-window attention by a per-layer array, rope at
+/// `rope.freq_base_swa` on the window layers and with `rope_freqs` divisors on the full ones;
+/// sandwich norms and a SwiGLU FFN on every layer. The short convolution keeps a recurrent state
+/// like qwen35's DeltaNet (`Config::is_recurrent_layer`). llama.cpp: `src/models/lfm3.cpp` and
+/// `lfm-base.cpp`; the non-causal "d1" variant is refused.
+pub const LFM3: &str = "lfm3";
 
 /// True for either BitNet arch string ([`BITNET`] or [`BITNET_B158`]) — the two are behaviorally
 /// identical (llama skeleton + SubLN, NEOX rope); they differ only in the metadata key prefix.
@@ -157,6 +166,7 @@ pub const TRANSFORMER: &[&str] = &[
     SMOLLM3,
     ERNIE4_5,
     ERNIE4_5_MOE,
+    LFM3,
 ];
 
 /// Read `general.architecture` from a GGUF WITHOUT a full model load (mirrors
@@ -247,4 +257,5 @@ pub const ALL: &[&str] = &[
     SMOLLM3,
     ERNIE4_5,
     ERNIE4_5_MOE,
+    LFM3,
 ];

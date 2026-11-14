@@ -82,8 +82,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `S` state (and LFM3's convolution history) at what is allocated, twice over:
   the live state and the one snapshot of it a slot keeps for MTP rollback and
   for resuming at a prefill boundary. The snapshot's allocation fails the
-  request when refused, so the fit now keeps room for it; the MTP head's own KV
-  cache is still not priced.
+  request when refused, so the fit now keeps room for it.
 - **Paged MoE decode on Vulkan reaches its no-readback path from a short prompt
   when the expert cache can hold the whole model.** A MoE layer decodes without
   reading its router ids back only once every one of its experts is in VRAM, and

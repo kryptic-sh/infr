@@ -3051,6 +3051,15 @@ fn gpu_seam_lfm3_session_extends_past_the_window() {
         "turn 2 prefilled {} tokens: the session did not extend turn 1",
         s2.n_prompt
     );
+    // A snapshot resume also prefills only a short suffix, but it restarts at turn 1's prefill
+    // boundary or before it; only the extend path keeps the tokens turn 1 generated.
+    let boundary = s1.n_cached + s1.n_prompt;
+    assert!(
+        s2.n_cached > boundary,
+        "turn 2 reused {} tokens, not past turn 1's {boundary}-token prefill boundary: it resumed \
+         from the snapshot instead of extending",
+        s2.n_cached
+    );
     let fresh = model.generate_dense_vulkan(&p2, 8).expect("fresh turn 2");
     assert_eq!(
         t2.trim(),

@@ -5191,29 +5191,43 @@ attention layer runs three narrow prefill GEMMs; the head-gate projection is a
   device's F16 prefill is within 0.0053259134 of llama.cpp on the 1092-token
   prompt, so the test runs on F16.
 
-### B191 — the qwen35 MTP head's KV cache is priced by no estimate (2026-11-15)
+### B191 — MTP sessions are sized outside the context fit (2026-11-15)
 
 **Tag:** correctness · vram fit · qwen35 · mtp
 
-The MTP head session (`build` in `infr-llama/src/mtp/mod.rs`) allocates its own
-K and V cache, each `max_ctx * n_kv * head_dim` f16 elements, outside the
-trunk's `n_layer`. `kv_bytes_estimate_fmt` (`seam/mod.rs`) does not count it,
-and neither does any other estimate found by reading. Before the LFM3 change the
-estimate priced every DeltaNet layer as a per-token attention cache, an
-over-count large enough to hide the head's cache; the estimate is now exact, so
-a qwen35 MTP session whose context is fitted to fill VRAM can have that
-allocation refused. Found by reading; not reproduced. The fix is to add the
-head's cache to the fit when MTP is enabled, with a unit test beside
-`kv_bytes_estimate_prices_the_qwen35_snapshot_copy`. The estimate also counts
-one snapshot copy that a device with a one-step decode chain (CPU, Metal) never
-allocates, which is a small over-count on the safe side.
+The first reading of this entry was that the MTP head's own K and V cache
+(`MtpHeadSession::build` in `infr-llama/src/mtp/mod.rs`) should be added to the
+context fit (`kv_bytes_estimate_fmt` in `seam/mod.rs`). Checked by reading, that
+fix would price nothing real, so it was not made:
 
-Also from the same review, not fixed:
+- MTP is parked: `mtp_enabled` returns `false`, so `should_use_mtp` never
+  returns `true` and no chat path builds a head. The `infr bench` `mtp` arm and
+  `infr compare`'s `mtp128` column check `mtp_enabled` too.
+- With MTP on, the fit is not used for it. `generate_mtp_spec_*_timed` sizes
+  both the head's cache and a fresh trunk session (`run_verify` into
+  `generate_dense_backend`, which takes `max_ctx` as given) to
+  `prompt tokens + max_new + DEFAULT_N_MAX + 8`, per call. `DenseSeamChat`'s MTP
+  branch of `generate` never opens the fitted persistent session, and neither
+  does its warmup, which goes through `generate`.
+- When the head's allocation is refused, `build` returns the error and the
+  request fails; there is no fallback to plain decode.
 
-- `gpu_seam_lfm3_session_extends_past_the_window` cannot tell the extend path
-  from a snapshot resume: turn 2 re-tokenizes `p1 + t1` from text, and if a
-  token boundary shifts it resumes and still prefills few tokens. Asserting turn
-  2's cached length against turn 1's would pin the path.
+What is real, for whoever unparks MTP: `DenseSeamChat::generate_constrained`
+always opens the fitted persistent session, which the default context sizes to
+fill VRAM, and keeps it. A later MTP `generate` then allocates the trunk session
+and the head's cache on a second `VulkanBackend` (`mtp_vk`) beside it, so a
+server that answered one forced tool call first can have every MTP request
+refused. The fix belongs to the MTP session lifetime (share the persistent
+session, or drop it before an MTP turn), not to the fit. The head also uploads
+its own copy of the embedding table (`build_embed_chain_buf`) on GPU backends
+that run the fused draft chain, which nothing counts either.
+
+The trunk estimate also counts one snapshot copy that a device with a one-step
+decode chain (CPU, Metal) never allocates, which is a small over-count on the
+safe side.
+
+#### Also from the same review, not fixed
+
 - infr refuses LFM3 files llama.cpp accepts, none of which exists yet: attention
   layers with different nonzero `attention.head_count_kv`, a scalar
   `head_count_kv` (llama.cpp reads it with `get_key_or_arr`), layers that

@@ -69,6 +69,25 @@ pub struct SeamModel {
     /// path recomputes this 2-3× (`kv_fit_ctx` → `kv_fit_ctx_fmt`, the auto-q8 re-probe, then the
     /// clamp log line) — cache it so the scan runs once per model. See [`SeamModel::footprint`].
     footprint: std::sync::OnceLock<crate::weights::WeightFootprint>,
+    /// The CPU backend and the weights bound for it, kept between CPU generations (see
+    /// [`crate::seam::CpuResident`] and [`SeamModel::with_cpu`]).
+    cpu: std::sync::Mutex<CpuSlot>,
+}
+
+/// Where a [`SeamModel`] keeps its CPU resident between generations.
+#[derive(Default)]
+struct CpuSlot {
+    /// The model's resident, when no generation has it out. `None` before the first generation,
+    /// while one runs, and after one whose cold init did not get as far as binding.
+    resident: Option<crate::seam::CpuResident>,
+    /// A generation has the model's own resident out (taken from `resident`, or opened because
+    /// there was none and nobody else had one out). A generation that starts meanwhile opens a
+    /// resident of its own, which is never put back: it was sized while the model's own was
+    /// still allocated, so its paged arena may be smaller or absent.
+    out: bool,
+    /// Residents opened for this model, the model's own and every overflow one.
+    #[cfg(test)]
+    opened: usize,
 }
 
 /// The conversation SLOTS a persistent GPU seam session owns: up to `INFR_KV_SLOTS` (default 4)
@@ -427,7 +446,77 @@ impl SeamModel {
             per_layer_embd,
             tokenizer,
             footprint: std::sync::OnceLock::new(),
+            cpu: std::sync::Mutex::new(CpuSlot::default()),
         })
+    }
+
+    /// Run `f` on this model's CPU resident, on a backend built from the model's configuration
+    /// (reference mode when `kernels.cpu.reference` is set). The resident is taken out of the
+    /// model for the call, and only the model's own goes back (see [`CpuSlot`]): a generation
+    /// that starts while another has it out opens a resident of its own (the behaviour every CPU
+    /// generation had before residents existed), shares no backend or paged store with it, and
+    /// drops it at the end. The model's own goes back if it got as far as binding the weights;
+    /// otherwise it is dropped, and the next generation opens a new one.
+    fn with_cpu<T>(&self, f: impl FnOnce(&mut crate::seam::CpuResident) -> Result<T>) -> Result<T> {
+        // The lock is never held across `f`, so a panic in a generation cannot poison it.
+        let (taken, own) = {
+            let mut slot = self
+                .cpu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let own = !slot.out;
+            slot.out = true;
+            #[cfg(test)]
+            if slot.resident.is_none() {
+                slot.opened += 1;
+            }
+            (slot.resident.take(), own)
+        };
+        // The model's own resident goes back, and `out` clears, under one lock when this call ends
+        // however it ends (a failed open and a panic in `f` included): a generation starting in
+        // between must never see the model's resident in the slot while `out` still says it is
+        // away, or it would take it as an overflow one and drop it. A resident a panic unwound
+        // through is not kept: a lock inside its backend may be poisoned.
+        struct Lease<'a> {
+            slot: Option<&'a std::sync::Mutex<CpuSlot>>,
+            res: Option<crate::seam::CpuResident>,
+        }
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                if let Some(m) = self.slot {
+                    let mut slot = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    slot.resident = self
+                        .res
+                        .take()
+                        .filter(|r| r.is_bound() && !std::thread::panicking());
+                    slot.out = false;
+                }
+            }
+        }
+        let mut lease = Lease {
+            slot: own.then_some(&self.cpu),
+            res: None,
+        };
+        let res = lease.res.insert(match taken {
+            Some(res) => res,
+            None => crate::seam::CpuResident::open(
+                CpuBackend::new_with(self.ecfg.clone()),
+                &self.ecfg,
+                &self.gguf,
+            )?,
+        });
+        f(res)
+    }
+
+    /// Look at the CPU resident this model holds between generations (`None` before the first, and
+    /// while one is running), and how many residents it has opened.
+    #[cfg(test)]
+    pub(crate) fn with_cpu_resident<T>(
+        &self,
+        f: impl FnOnce(Option<&crate::seam::CpuResident>, usize) -> T,
+    ) -> T {
+        let slot = self.cpu.lock().unwrap();
+        f(slot.resident.as_ref(), slot.opened)
     }
 
     /// The ENGINE configuration this model was loaded with (see the `ecfg` field). Every seam path
@@ -1141,17 +1230,20 @@ impl SeamModel {
     /// directly comparable to `llama-bench -ngl 0`. Dummy tokens — timing is data-independent.
     pub fn bench(&self, n_prompt: usize, n_gen: usize) -> Result<crate::GenStats> {
         let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
-        let (_, stats) = crate::seam::generate_dense_cpu(
-            &self.gguf,
-            &self.cfg,
-            &self.ecfg,
-            self.embd(),
-            self.per_layer_embd.as_ref(),
-            &prompt,
-            n_gen,
-            None, // req: bench is a sole sequence — env sampling, no abort latch, no gate
-            |_| {},
-        )?;
+        let (_, stats) = self.with_cpu(|res| {
+            crate::seam::generate_dense_cpu(
+                res,
+                &self.gguf,
+                &self.cfg,
+                &self.ecfg,
+                self.embd(),
+                self.per_layer_embd.as_ref(),
+                &prompt,
+                n_gen,
+                None, // req: bench is a sole sequence — env sampling, no abort latch, no gate
+                |_| {},
+            )
+        })?;
         Ok(stats)
     }
 
@@ -1912,19 +2004,21 @@ impl SeamModel {
         // Stream each generated token: incrementally detokenize and emit the new suffix.
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = crate::StreamOffsets::default();
-        let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
-            infr_cpu::CpuBackend::new_with(self.ecfg.clone()),
-            &self.gguf,
-            &self.cfg,
-            &self.ecfg,
-            self.embd(),
-            self.per_layer_embd.as_ref(),
-            &prompt_tokens,
-            max_new,
-            constraint,
-            req,
-            |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
-        )?;
+        let (_generated, stats) = self.with_cpu(|res| {
+            crate::seam::generate_dense_cpu_mode(
+                res,
+                &self.gguf,
+                &self.cfg,
+                &self.ecfg,
+                self.embd(),
+                self.per_layer_embd.as_ref(),
+                &prompt_tokens,
+                max_new,
+                constraint,
+                req,
+                |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+            )
+        })?;
         Ok(stats)
     }
 
@@ -1945,8 +2039,15 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
         let mut printed = crate::StreamOffsets::default();
-        let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
+        // Its own resident, dropped with the call: the oracle is not a serving path, and its
+        // backend runs a different mode from the model's kept one.
+        let mut res = crate::seam::CpuResident::open(
             infr_cpu::CpuBackend::reference_with(self.ecfg.clone()),
+            &self.ecfg,
+            &self.gguf,
+        )?;
+        let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
+            &mut res,
             &self.gguf,
             &self.cfg,
             &self.ecfg,
@@ -1971,17 +2072,20 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
-        let (generated, _stats) = crate::seam::generate_dense_cpu(
-            &self.gguf,
-            &self.cfg,
-            &self.ecfg,
-            self.embd(),
-            self.per_layer_embd.as_ref(),
-            prompt_tokens,
-            max_new,
-            None, // req: token-identity checks are a sole sequence — env sampling, no gate
-            on_id,
-        )?;
+        let (generated, _stats) = self.with_cpu(|res| {
+            crate::seam::generate_dense_cpu(
+                res,
+                &self.gguf,
+                &self.cfg,
+                &self.ecfg,
+                self.embd(),
+                self.per_layer_embd.as_ref(),
+                prompt_tokens,
+                max_new,
+                None, // req: token-identity checks are a sole sequence — env sampling, no gate
+                on_id,
+            )
+        })?;
         Ok(generated)
     }
 }

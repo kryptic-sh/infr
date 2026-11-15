@@ -75,6 +75,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A CPU model keeps its backend and bound weights between requests.**
+  `SeamModel::generate_cpu`, `generate_cpu_constrained`, `generate_cpu_ids` and
+  `bench` (so `infr run`/`infr serve`/`infr bench` with `--ngl 0`) used to build
+  a new `CpuBackend`, bind every weight and, with `paging.dram` set, open a new
+  host arena on every call, so the arena re-read the whole model from disk per
+  request. They now share one per model: the weights are bound once, the
+  backend's derived-weight caches (and the fused-MoE repack cache, up to
+  `kernels.cpu.repack_mb`) and the paged arena last as long as the model. With
+  `INFR_DRAM_CACHE` set, warm-request time to first token went from 245.3-289.7
+  to 79.6-88.0 ms on Qwen3-1.7B Q4_K_M (2 GB arena) and from 2253.9-2398.7 to
+  242.8-258.9 ms on ERNIE-4.5-21B-A3B Q4_K_M (16 GB), 16 threads, two
+  interleaved rounds of five warm requests with 2-6% of the box busy elsewhere;
+  without paging nothing measurable changed (ERNIE warm prefill 202.4 ms before,
+  203.5 ms after, averaged over 24 requests each). Every generation's tokens are
+  unchanged. The spin pool is still built per generation: kept, it prefilled
+  ERNIE about 10% slower (new `CpuBackend::release_pool`, called after each
+  generation). A second generation running while another holds the model's
+  backend gets one of its own, as before, and drops it at the end: it never
+  replaces the model's. Weights the loader rewrote into owned memory, the
+  backend's caches and the paged arena are now held while the model is idle.
+  `paging.stats` now counts since the model's first CPU generation.
+- **`infr bench --ngl 0` warms up with a whole timed rep.** The warmup used to
+  be shorter than a rep for tg (one generated token) and pg (`p` prompt tokens
+  and one generated); pp already prefilled the timed prompt. A MoE model's first
+  tg rep no longer reads experts the warmup never routed to: Qwen3-30B-A3B
+  Q4_K_M tg64 reps 3.68, 26.24, 25.24 before, 26.53, 27.02, 27.20 after. With
+  `paging.dram` set, every rep now runs on the arena the warmup already filled,
+  where each rep used to fill its own, so CPU bench numbers under paging (such
+  as those in `docs/perf/results.md`) do not compare with earlier ones.
 - **CPU prefill of dense K-quant models is level with llama.cpp's CPU on
   Windows, and decode within about 6%** (Ryzen 9 9950X3D, 16 threads; two
   interleaved rounds of four reps against the previous build and

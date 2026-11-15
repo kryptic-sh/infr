@@ -522,6 +522,25 @@ pub(crate) struct SeamWeights {
     pub(super) layer_has_epb: Vec<bool>,
 }
 
+/// What a cold init bound for one backend and derived from the model: the weights and the
+/// session-stable derivations, without any KV. A caller that keeps its backend across generations
+/// hands this back (`runner::generate_dense_backend_bound`), so the next cold init allocates only
+/// its KV and IO buffers. Valid only on the backend that bound it, which is why the CPU path keeps
+/// the two together in one `crate::seam::CpuResident`.
+pub(crate) struct BoundWeights {
+    pub(super) weights: std::sync::Arc<SeamWeights>,
+    pub(super) stable: std::sync::Arc<SessionStable>,
+}
+
+impl BoundWeights {
+    /// The bound weights' identity: equal across two generations exactly when the second reused
+    /// the first's.
+    #[cfg(test)]
+    pub(crate) fn weights_ptr(&self) -> *const SeamWeights {
+        std::sync::Arc::as_ptr(&self.weights)
+    }
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SeamKv {
     /// The context this slot's KV cache was allocated for — the AUTHORITY on a session's window,
@@ -562,6 +581,19 @@ impl SeamKv {
     /// Number of token ids materialized in this slot's KV cache.
     pub(crate) fn cached_len(&self) -> usize {
         self.cached.len()
+    }
+
+    /// This slot's weights and session-stable derivations, shared (`Arc`) rather than copied.
+    pub(crate) fn bound(&self) -> BoundWeights {
+        BoundWeights {
+            weights: std::sync::Arc::clone(&self.weights),
+            stable: std::sync::Arc::clone(&self.stable),
+        }
+    }
+
+    /// Whether this slot runs on `bound`'s weights (the same allocation, not an equal copy).
+    pub(crate) fn shares(&self, bound: &BoundWeights) -> bool {
+        std::sync::Arc::ptr_eq(&self.weights, &bound.weights)
     }
 
     /// Forget the materialized tokens (the KV rows become dead; the next prompt prefills from

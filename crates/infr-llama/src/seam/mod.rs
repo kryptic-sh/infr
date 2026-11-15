@@ -395,6 +395,65 @@ fn metal_upload_bind(be: &infr_metal::MetalBackend) -> Box<BindWeight<'_>> {
 // prompt ingestion (looped) and generation — so no GEMM/flash prefill kernels are needed on CPU.
 // The KV cache grows one row per step. Validates the agnostic seam end-to-end against the GPU path.
 
+/// A CPU backend kept with what it costs to rebuild: its paged-weight store (`paging.dram`) and the
+/// weights bound for it. A [`crate::SeamModel`] holds one between generations, so the bound
+/// weights, the backend's derived-weight caches (keyed by those buffers' uids, which stay the
+/// same) and the host arena's resident blocks all carry over to the next request instead of being
+/// rebuilt by it. The spin pool does not: each generation releases it
+/// ([`CpuBackend::release_pool`]) and the next builds its own.
+///
+/// One generation at a time: a caller takes the resident out of its model for the whole call and
+/// puts it back afterwards (`SeamModel::with_cpu`), so nothing in it is ever used by two
+/// generations at once. A generation that finds none there opens its own.
+pub(crate) struct CpuResident {
+    be: CpuBackend,
+    store: Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>,
+    /// Set by the first generation whose cold init got as far as binding every weight.
+    bound: Option<weights::BoundWeights>,
+}
+
+impl CpuResident {
+    /// A resident on `be` with nothing bound yet. The paged store is sized here, once, from the
+    /// host memory available now.
+    pub(crate) fn open(be: CpuBackend, ec: &EngineConfig, g: &Gguf) -> AResult<Self> {
+        Ok(Self {
+            store: cpu_paged_store(ec, g)?,
+            be,
+            bound: None,
+        })
+    }
+
+    /// Whether a generation bound the weights. Only then is the resident worth keeping: a cold init
+    /// that failed part of the way may have registered some weights with the paged store, and the
+    /// next attempt would register them again.
+    pub(crate) fn is_bound(&self) -> bool {
+        self.bound.is_some()
+    }
+
+    /// The bound weights' identity, for a test to see that a later generation reused them.
+    #[cfg(test)]
+    pub(crate) fn weights_ptr(&self) -> Option<*const weights::SeamWeights> {
+        self.bound.as_ref().map(|b| b.weights_ptr())
+    }
+
+    /// The paged store's `(hits, bytes read from the model file)` since it opened; `None` without
+    /// one.
+    #[cfg(test)]
+    pub(crate) fn paged_counts(&self) -> Option<(u64, u64)> {
+        self.store.as_ref().map(|st| {
+            st.pool_stats().iter().fold((0, 0), |(h, b), (_, _, s)| {
+                (h + s.pager.hits, b + s.bytes_read)
+            })
+        })
+    }
+
+    /// The paged store's identity; `None` without one.
+    #[cfg(test)]
+    pub(crate) fn store_ptr(&self) -> Option<*const infr_cpu::paged::PagedWeights> {
+        self.store.as_ref().map(std::sync::Arc::as_ptr)
+    }
+}
+
 /// Greedy CPU generation for a decoder (Qwen3 / Llama / Gemma 3 / Gemma 4 dense+E2B / qwen3moe). The
 /// attention block is shared; the FFN is either a dense gated FFN or a routed-expert MoE bank; gemma4
 /// E2B adds per-layer input embeddings + KV-layer sharing. `prompt` is the full token prefix; returns
@@ -402,9 +461,10 @@ fn metal_upload_bind(be: &infr_metal::MetalBackend) -> Box<BindWeight<'_>> {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_cpu(
+    res: &mut CpuResident,
     g: &Gguf,
     cfg: &Config,
-    ec: &std::sync::Arc<EngineConfig>,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -412,33 +472,25 @@ pub(crate) fn generate_dense_cpu(
     req: Option<&crate::sampling::RequestCtx>,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    // The CPU backend takes the config the SEAM was handed instead of
-    // building one from the environment inside `CpuBackend::new` (the old bridge is gone).
     generate_dense_cpu_mode(
-        CpuBackend::new_with(ec.clone()),
-        g,
-        cfg,
-        ec,
-        token_embd,
-        ple,
-        prompt,
-        max_new,
-        None, // constraint
-        req,
-        on_token,
+        res, g, cfg, ec, token_embd, ple, prompt, max_new, None, // constraint
+        req, on_token,
     )
 }
 
-/// [`generate_dense_cpu`] on a caller-supplied `CpuBackend`, so a comparison can pick the
-/// REFERENCE backend ([`CpuBackend::reference`]) instead of the production int8-activation
-/// kernels. The distinction matters at low bit-widths: the int8 activation quant carries ~4e-3
-/// relative error on every quant dtype, which flips greedy tokens at Q2_K and can still flip a
-/// near tie at Q4_K — so a backend-vs-backend token comparison must be scored against the
-/// reference mode.
+/// [`generate_dense_cpu`] with an optional grammar constraint, on a caller-supplied
+/// [`CpuResident`], so a comparison can pick one on the REFERENCE backend
+/// ([`CpuBackend::reference`]) instead of the production int8-activation kernels. The distinction
+/// matters at low bit-widths: the int8 activation quant carries ~4e-3 relative error on every quant
+/// dtype, which flips greedy tokens at Q2_K and can still flip a near tie at Q4_K — so a
+/// backend-vs-backend token comparison must be scored against the reference mode.
+///
+/// Each call allocates its own KV cache, sized to `prompt + max_new + 1`, and starts it empty: the
+/// resident carries the backend and its weights between calls, never a conversation.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_cpu_mode(
-    cpu_be: CpuBackend,
+    res: &mut CpuResident,
     g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
@@ -452,31 +504,50 @@ pub(crate) fn generate_dense_cpu_mode(
 ) -> AResult<(Vec<u32>, GenStats)> {
     // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a weight binder that maps
     // each tensor straight from the GGUF mmap (no alloc, no memcpy) — or, when `paging.dram` asks
-    // for a host weight cache, registers the big ones to be read from the file on demand.
-    let store = cpu_paged_store(ec, g)?;
-    let bind = cpu_bind_with(&cpu_be, store.clone());
-    let out = generate_dense_backend(
-        &cpu_be,
-        &bind,
-        g,
-        cfg,
-        ec,
-        token_embd,
-        ple,
-        prompt,
-        max_new,
-        on_token,
-        &mut None,
-        prompt.len() + max_new + 1,
-        constraint,
-        None, // verify
-        None, // verify_ids
-        None, // logits_out
-        None, // h_out
-        None, // denoise_req
-        req,
-    );
-    if let Some(store) = &store {
+    // for a host weight cache, registers the big ones to be read from the file on demand. Once
+    // the resident holds bound weights the binder is never called.
+    let mut state = None;
+    let out = {
+        let bind = cpu_bind_with(&res.be, res.store.clone());
+        runner::generate_dense_backend_bound(
+            res.bound.as_ref(),
+            &res.be,
+            &bind,
+            g,
+            cfg,
+            ec,
+            token_embd,
+            ple,
+            prompt,
+            max_new,
+            on_token,
+            &mut state,
+            prompt.len() + max_new + 1,
+            constraint,
+            None, // verify
+            None, // verify_ids
+            None, // logits_out
+            None, // h_out
+            None, // denoise_req
+            req,
+        )
+    };
+    // A cold init that got as far as building `state` left the bound weights in it, whole, even
+    // when the generation failed after that; they are kept. One that failed earlier (a weight that
+    // would not bind, a refused KV allocation) left `state` empty, so nothing is kept, and
+    // `SeamModel::with_cpu` drops a resident that never got bound weights.
+    match (&res.bound, &state) {
+        (None, _) => res.bound = state.as_ref().map(SeamKv::bound),
+        (Some(b), Some(kv)) => debug_assert!(
+            kv.shares(b),
+            "the generation bound its own weights beside the resident's"
+        ),
+        (Some(_), None) => {}
+    }
+    // Kept: the caches. Not kept: the spin pool, which measured slower across requests than
+    // built per request (`CpuBackend::release_pool`).
+    res.be.release_pool();
+    if let Some(store) = &res.store {
         // Flushed where the stats are taken, so the trace on disk covers what they report.
         if let Err(e) = store.flush_trace() {
             tracing::warn!("[host pager] {e}");
@@ -488,7 +559,9 @@ pub(crate) fn generate_dense_cpu_mode(
     out
 }
 
-/// `paging.stats` (`INFR_PAGER_STATS=1`): what the host tier actually did, per size class.
+/// `paging.stats` (`INFR_PAGER_STATS=1`): what the host tier actually did, per size class, since
+/// the store opened — on a model's [`CpuResident`], since its first CPU generation, so each
+/// report includes every earlier request's counts.
 ///
 /// The hit rate alone cannot distinguish a tier that is working from one that was never asked, so
 /// the read count and the bytes moved are reported beside it: those are what a run's throughput is

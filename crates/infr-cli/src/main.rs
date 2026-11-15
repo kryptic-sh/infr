@@ -2688,20 +2688,8 @@ fn cmd_bench_cpu(
     let watch = infr_llama::WeightWatch::open_model(gguf)?;
     let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
     let measure_tg = pg.is_none() && n_gen > 0;
-    // One untimed warmup with the timed run's own prompt, as llama-bench's warmup prompt run, so
-    // the weights the timed reps read are already faulted in from the mapping. (Each rep builds
-    // its own backend, so nothing else carries over.) A one-token prompt with nothing to
-    // generate, which this used to be for pp, runs no forward and faulted nothing in.
-    let _ = if let Some((p, _)) = pg {
-        model.bench(p, 1)
-    } else if measure_tg {
-        model.bench(depth.max(1), 1)
-    } else {
-        model.bench(n_prompt, 0)
-    };
-    let mut samples = Vec::with_capacity(reps);
-    for _ in 0..reps {
-        let ts = if let Some((p, g)) = pg {
+    let rep = || -> anyhow::Result<f64> {
+        Ok(if let Some((p, g)) = pg {
             let s = model.bench(p, g)?; // pg: prefill p + decode g, throughput (p+g)/total
             (p + g) as f64 / (s.prompt_secs + s.decode_secs)
         } else if measure_tg {
@@ -2710,8 +2698,18 @@ fn cmd_bench_cpu(
         } else {
             let s = model.bench(n_prompt, 0)?; // pp: prefill only
             n_prompt as f64 / s.prompt_secs
-        };
-        samples.push(ts);
+        })
+    };
+    // One untimed warmup that IS a timed rep, as llama-bench's warmup run: it builds the model's
+    // CPU resident (backend, bound weights, their caches and any paged arena) that every timed rep
+    // then reuses — each rep still builds its own spin pool — and faults in from the mapping every
+    // weight the reps read. Under greedy sampling (the
+    // default) its tokens are the reps' tokens, so a MoE model's decode routes through the same
+    // experts; a one-token warmup left the first tg rep paying for the experts it had not touched.
+    rep()?;
+    let mut samples = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        samples.push(rep()?);
     }
     let label = if let Some((p, g)) = pg {
         format!("pg{p}+{g}")

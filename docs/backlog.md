@@ -4736,13 +4736,15 @@ final build, 16 threads:
   against 118.05-118.16 warm; 16 threads, pp64 first rep 20.18 t/s against
   1076.55-1096.52), so the soft faults serialize. `infr bench` pp runs no longer
   show it (the warmup is the timed prompt itself; Qwen3-30B-A3B's first pp512
-  rep 417.37 against 415.36-418.04), but a real first request does, and so does
-  a MoE model's first tg rep: the tg warmup generates one token, which routes
-  through a handful of experts (Qwen3-30B-A3B tg64 3.90 against 27.99-28.08).
-  Windows gets no `WillNeed` hint (the `madvise` in `Gguf::map_and_parse` is
-  `cfg(unix)`); whether `PrefetchVirtualMemory` maps pages in or only reads them
-  into the standby list (the file is already cached on a re-run, so the second
-  would not help) was not tested.
+  rep 417.37 against 415.36-418.04), but a real first request does. The CPU
+  bench's warmup is now a whole timed rep, so a MoE model's first tg rep no
+  longer pays for experts the one-token warmup never routed to (Qwen3-30B-A3B
+  tg64 reps 3.68, 26.24, 25.24 and 3.66, 27.58, 27.68 before; 26.53, 27.02,
+  27.20 and 27.32, 27.43, 27.17 after). Windows gets no `WillNeed` hint (the
+  `madvise` in `Gguf::map_and_parse` is `cfg(unix)`); whether
+  `PrefetchVirtualMemory` maps pages in or only reads them into the standby list
+  (the file is already cached on a re-run, so the second would not help) was not
+  tested.
 - **Thread placement is Windows only.** The spin pool's threads select CPU sets
   naming one logical processor per allowed core
   (`infr_plat::cpu::spread_placement`) when they fit one per core. Linux and
@@ -4896,22 +4898,57 @@ fix is the same shape: a per-block f32 decode into a stack span from the
 codebook decoders `dequant_codebook` already has, held bit for bit against
 `bytes_to_f32`.
 
-### B179 — every CPU generate builds a fresh `CpuBackend`, so its caches never outlive a request (2026-11-14)
+### B179 — what keeping one CPU backend per model left (2026-11-15)
 
 **Tag:** perf · cpu · design
 
-`SeamModel::generate_cpu_constrained`, `generate_cpu_reference`, `bench` (via
-`generate_dense_cpu`) and the CPU chat path each construct a new `CpuBackend`
-per call, and `cpu_bind_with` maps every weight into a new `CpuBuffer` with a
-new uid per call. So `repack_cache` (the fused-MoE Q4_K packs, keyed by uid),
-`weight_cache` and the spin pool's threads are rebuilt for every request. The
-`infr bench` "untimed warmup to build runtime caches" builds them in a backend
-that is dropped before the timed reps. This is why the dense Q6_K pack cache
-(`q6k_pack_for`, removed in the B173 work) cost its full rayon pack build on
-every call: 94 ms per pp128 forward on SmolLM3. Only `DiffusionGemmaCpuSession`
-holds a backend across calls. Fixing it means a per-model backend plus a binder
-whose buffers (and so uids) persist; until then a per-call cache is worth only
-what it saves within one request. Not changed here.
+Since 2026-11-15 a `SeamModel` keeps a `seam::CpuResident` (backend, paged
+store, bound weights) between CPU generations (`generate_cpu`,
+`generate_cpu_constrained`, `generate_cpu_ids`, `bench`). Left as it was, or not
+verified:
+
+- **The spin pool is still built per generation.** A pool kept across requests
+  prefilled ERNIE-4.5-21B-A3B Q4_K_M about 10% slower (three interleaved rounds,
+  six warm requests each, prompt ms: kept 208.9-222.8, 197.4-212.7, 205.0-219.0;
+  pool rebuilt per request 178.0-207.3, 183.5-200.9, 184.1-207.5; whole backend
+  rebuilt 184.4-199.7, 182.7-200.1, 185.2-201.9), spread over every op in the
+  per-op profile rather than one kernel. So each generation ends with
+  `CpuBackend::release_pool`. Why a long-lived pool is slower was not found;
+  Windows thread scheduling of long-parked workers is a guess. Fixing it would
+  save the pool spawn per request, which was not separately measured.
+- **The repack cache's gain is unmeasured.** It only serves models with a fused
+  `ffn_gate_up_exps` (gemma4 26B-A4B, Diffusion-Gemma), none of which is on the
+  Windows box. It now lives as long as the model, bounded by
+  `kernels.cpu.repack_mb` (default 4096 MiB) and never evicted, so an idle model
+  holds up to that much; before, it was freed at the end of each request.
+- **Memory held while idle.** Everything the resident holds now stays allocated
+  between requests: the paged store's arena (`paging.dram`), which is what makes
+  it a cache; every weight the loader rewrote into owned memory instead of
+  mapping it (BitNet i2_s dequantized to f16, qwen2's NEOX-permuted q/k,
+  deepseek2's `attn_k_b`/`attn_v_b` expanded to f32, f16 or bf16 conv weights
+  widened to f32); and the backend's `weight_cache` (the dequantized norm
+  weights). Under automatic paging (`paging.dram` unset), both whether to page
+  at all and the arena's size are decided once, from the host memory available
+  at the model's first CPU generation.
+- **No way to drop a model's resident short of dropping the model.** It matters
+  in a mixed process: a model loaded with `paging.dram` that runs a CPU oracle
+  through `generate_cpu_ids` beside its GPU sessions keeps that CPU arena for
+  the model's life. Nothing in the tree does this outside tests, so no API was
+  added; a `SeamModel` method that empties the slot (when no generation has the
+  resident out) would be the fix, and is small.
+- **A second generation while another holds the resident** opens its own and
+  drops it at the end, never putting it back, since it was sized while the
+  model's own was still allocated (its arena may be smaller, or absent).
+- **`paging.stats` counts are cumulative** since the model's first CPU
+  generation, not per request.
+- **Still per call**: `generate_cpu_reference` (a reference-mode backend, the
+  oracle path), the CPU MTP path (`mtp::backends`), the `verify_dense_cpu`
+  family, and the overflow generation above (with its own paged arena if
+  `paging.dram` asks for one, as every generation did before). `infr serve`
+  serialises CPU requests behind one lock, so that last case does not arise
+  there.
+- **Pool placement** is computed on the thread that builds the pool, now the
+  thread of each generation as before, so nothing changed there.
 
 ### B180 — ERNIE prefill was 1.5× faster with `kernels.cpu.repack_mb=0`; reproduced, gone, cause unproven (2026-11-14)
 
@@ -4939,13 +4976,15 @@ mostly waiting, not computing. Kept as a surprise, not a bug.
 The dense Q6_K prefill path packs each 8-row group into a per-thread scratch
 group per call (`repack::q6k_pack_and_gemm_group`); the session-long Q6_K pack
 cache it replaced (`q6k_pack_for`, ~740 MB for gemma's tied 262k-row lm_head)
-was removed, because on every other CPU path the backend lives one request
-(B179) and the cache cost a full rebuild per call. For the Diffusion-Gemma
-session, which does keep its backend, the cache had been built once; now each
-denoise step pays one pack pass over the lm_head (a pass the step's GEMM over
-all canvas rows shares). Not measured: no Diffusion-Gemma model is on the
-Windows box. If a measurement shows a loss, a per-session pack keyed as before
-is the fix.
+was removed, because at the time every other CPU path built its backend per
+request and the cache cost a full rebuild per call. Since 2026-11-15 the plain
+CPU generations keep one backend per model (`seam::CpuResident`, B179), so a
+pack cache would now survive between requests there too, at its full size held
+for the model's life. For the Diffusion-Gemma session, which keeps its backend,
+the cache had been built once; now each denoise step pays one pack pass over the
+lm_head (a pass the step's GEMM over all canvas rows shares). Not measured: no
+Diffusion-Gemma model is on the Windows box. If a measurement shows a loss, a
+per-backend pack keyed as before is the fix, bounded like `repack_cache`.
 
 ### B182 — the per-op profile drops a reference-mode prefill Linear (2026-11-14)
 

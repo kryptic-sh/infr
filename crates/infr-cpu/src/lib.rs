@@ -330,6 +330,15 @@ impl CpuBackend {
         Self::new_with(Arc::new(cfg))
     }
 
+    /// Drop the spin pool and its threads; the next [`Backend::execute`] that needs one builds a
+    /// new one. For a caller that keeps this backend between generations for its caches but not
+    /// its threads: measured on 2026-11-15, a pool kept across ERNIE-4.5-21B-A3B requests
+    /// prefilled about 10% slower than one built per request (docs/backlog.md, B179). An idle
+    /// backend then holds no threads either.
+    pub fn release_pool(&mut self) {
+        self.pool = std::sync::OnceLock::new();
+    }
+
     fn pool(&self) -> &pool::SpinPool {
         self.pool
             .get_or_init(|| pool::SpinPool::new(&self.cfg.kernels.cpu))

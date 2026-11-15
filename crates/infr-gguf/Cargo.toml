@@ -10,6 +10,7 @@ repository.workspace = true
 infr-prof.workspace = true
 infr-prof-rt.workspace = true
 infr-core.workspace = true
+infr-plat.workspace = true
 memmap2.workspace = true
 half.workspace = true
 anyhow.workspace = true

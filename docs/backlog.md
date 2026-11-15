@@ -5736,38 +5736,73 @@ at the arena slot's address. What that slice did not do:
 
 ### B194 — the Qwen3-30B-A3B tests take host RAM low on the discrete GPU too (2026-11-15)
 
-**Tag:** test suite · host memory · **Blocked on:** a decision on how to bound
-the discrete-GPU runs
+**Tag:** test suite · host memory · **Blocked on:** the 30B re-run on `Vulkan0`
+under a memory watchdog (the user's), now that the main cause is fixed
 
 The integrated-GPU half is done: `cpu_backend`'s `resident_room` /
 `need_resident_room!` skip a test that would hold a multi-GB model on a
 unified-memory device unless `UNIFIED_RESIDENT_FACTOR` times the GGUF size plus
-`UNIFIED_HOST_MARGIN` is available (`docs/windows.md` has the rule). On
-`Vulkan1` every Qwen3-30B-A3B and ERNIE-4.5-21B-A3B GPU test now prints its
-`skip:` line at once, except `gpu_seam_paged_moe_matches_resident_and_cpu`,
-which skips only its resident leg and fell from 34815 MiB to a minimum of 25126
-MiB available (passed).
+`UNIFIED_HOST_MARGIN` is available (`docs/windows.md` has the rule).
 
-What remains is the discrete GPU (`Vulkan0`, 24 GB VRAM). The host still maps
-and reads the whole file there, and nothing guards it. Run alone and sampled
-with `typeperf "\Memory\Available MBytes"` at 1 s:
+**The discrete-GPU cause was measured and fixed (2026-11-16).** A resident load
+on `Vulkan0` kept every mapped page the upload read in the process working set
+for as long as the model was loaded; on Windows those count as in use, not as
+standby. Measured with `typeperf` on an `infr serve` process (load, an 800-token
+prompt with 600 generated tokens, 8 s idle): working set minus its private part
+was 1.01 to 1.04 times the file (LFM3-1.7B F16 3.47 GB: 3351 MiB; SmolLM3-3B
+Q4_K_M 1.92 GB: 1886 MiB; Qwen3-1.7B Q4_K_M 1.11 GB: 1100 MiB), the private
+working set only 0.22 to 0.26 GB, and it held through prefill, decode and idle.
+`paging.release_uploaded` (default on) now releases each resident weight's
+mapped pages after its upload (`TensorBytes::release_resident`,
+`infr_plat::mem::release_mapped`), and the same runs keep about 50 MiB mapped:
+available memory falls 0.33 GB instead of 3.6 GB for the F16 file. Not
+re-measured on Qwen3-30B-A3B; its resident expert banks take the same upload
+path, so `gpu_seam_golden_qwen3moe` should lose most of its 18 GB drop.
 
-- `gpu_seam_golden_qwen3moe`: 34763 MiB at start, minimum 16458 MiB, passed.
-- `gpu_seam_paged_moe_matches_resident_and_cpu`: 34519 MiB at start, falling
-  about 0.5 GB/s through the CPU and resident legs; killed by the sampler's 12
-  GB stop rule at 10408 MiB (lowest sample 9259 MiB), so it did not finish and
-  its result on `Vulkan0` after this change is unverified. It printed no `skip:`
-  line.
+What remains:
 
-Not run on `Vulkan0` after the change:
-`gpu_seam_paged_moe_host_tier_matches_resident` and the five ERNIE-4.5-21B-A3B
-GPU tests, so "they still run and pass on the discrete GPU" is unverified for
-all of them. Why the mapped pages stay in the working set across legs (one
-process, one mapping per `SeamModel`, every leg's model alive until the test
-returns) is a guess, not measured. Options: price host-side mapped bytes on a
-discrete device too and skip below a margin; drop each leg's model before
-loading the next; run the CPU leg from a separate `SeamModel` that is dropped
-before the GPU legs.
+- **The tests with a CPU leg.** The CPU backend reads weights through the
+  mapping, so a CPU leg faults the whole file into the working set by design,
+  and on the same `SeamModel` the GPU legs share that mapping.
+  `gpu_seam_paged_moe_matches_resident_and_cpu` fell from 34519 MiB to under 10
+  GB before the fix; how much of that was the CPU leg, the resident leg and the
+  paged leg's host tier is not measured. If it still runs low: drop each leg's
+  model before loading the next, or run the CPU leg from a separate `SeamModel`
+  dropped before the GPU legs.
+- **Not run on `Vulkan0`:** `gpu_seam_paged_moe_host_tier_matches_resident` and
+  the five ERNIE-4.5-21B-A3B GPU tests.
+- **Commit charge is still about the model's size.** `Private Bytes` of the same
+  serve processes was 1.9 GB (Qwen3-1.7B), 2.7 GB (SmolLM3) and 4.1 GB (LFM3
+  F16) with a private working set of about 0.24 GB in each, with or without the
+  release, so it is committed but not resident: most likely the driver's commit
+  for the device-local weight allocations. It does not lower available memory,
+  but it counts against the commit limit, which is what B75's `os error 1455`
+  (paging file too small) runs out of. Not investigated further.
+- **Not released:** weights the loader rewrites (`WBytes::Owned`: the qwen2 q/k
+  permute, the conv and MLA dequants, BitNet) leave their source pages resident;
+  the multi-GPU binders (pipeline, tensor and expert parallel) and MTP's weight
+  set do not release; a unified-memory device does not either, where the mapped
+  pages are part of `UNIFIED_RESIDENT_FACTOR` and releasing them was not
+  measured. macOS and the BSDs answer `Unsupported` (macOS's `MADV_DONTNEED` is
+  a priority hint whose effect nothing here can observe).
+- **Linux is only CI-verified** (`infr-plat`'s and `infr-gguf`'s unit tests:
+  `madvise(MADV_DONTNEED)` and `/proc/self/pagemap`); no model has been run
+  there with the release. Linux's `MemAvailable` already counts part of the page
+  cache, mapped pages included, so the gain there may be smaller than on
+  Windows; not measured.
+
+- **Left from the review of the release (2026-11-16), none a wrong result:**
+  `vulkan_moe_binder` builds a `PageReleaser`, and so spawns and joins a thread,
+  on every call, including every Diffusion-Gemma denoise step and prefill, where
+  it releases nothing (start the thread on the first release instead);
+  `release_mapped_pages` warns once per weight on an error, which can be
+  hundreds of identical lines per load (warn once per binder); every fresh
+  binder releases again, so a CPU resident on the same model re-faults the file
+  after each one-shot GPU call, and a re-upload after a state reset reads from
+  standby or disk; a tied `token_embd.weight` read by the host gather is
+  released and then faulted back whole once. The 18.5 GB Qwen3-30B-A3B case on
+  `Vulkan0` has not been run with the release: expected a drop of 1-2 GB in
+  available memory in place of 18 GB, not measured.
 
 ### B195 — sampling and constrained decoding: what a first full read found (2026-11-15)
 

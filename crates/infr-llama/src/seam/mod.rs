@@ -2644,6 +2644,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
     }
 
+    // A resident weight's mapped pages are released once its bytes are in VRAM. Not on a
+    // unified-memory device: there the "VRAM" is host RAM, and nothing has been measured to say
+    // releasing the source pages is worth a refault there.
+    let releaser =
+        (ec.paging.release_uploaded && !vk.capabilities().unified_memory).then(PageReleaser::new);
+
     Ok(Box::new(move |name, tb, dt, numel| {
         // Raw upload for EVERY dtype — the file's bytes go straight to VRAM (u32-padded) and the
         // kernel reads/dequants the native dtype in-shader. F16 → f16 coopmat GEMM / f16 GEMV;
@@ -2821,8 +2827,107 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .map_err(|e| anyhow!("{e}"))?;
         vk.upload(buf.as_ref(), &padded)
             .map_err(|e| anyhow!("{e}"))?;
+        drop(padded);
+        drop(bytes);
+        if let Some(r) = &releaser {
+            r.release(name, tb);
+        }
         Ok((buf, dt))
     }))
+}
+
+/// Hands the mapped pages of weights that now live in VRAM back to the OS file cache
+/// (`paging.release_uploaded`), on a thread of its own so the trim stays off the load's critical
+/// path. Measured on Windows (2026-11-16): about 0.3 s for the 3.46 GB LFM3-1.7B F16 file
+/// inline, against an 8 s load. Dropping it closes the queue and joins the thread, which by then
+/// (the binder lives for the whole first generation) has long finished.
+///
+/// Only the resident upload path sends weights here: a paged or streamed weight is read through
+/// the mapping again on every miss, so its pages are the pager's to keep. `Owned` bytes have
+/// nothing to release: they are a load-time rewrite with no mapped form, and the source pages that
+/// rewrite read are not tracked. A host reader that touches a released weight later (a CPU leg on
+/// the same model, the host embedding gather) faults it back in once and keeps it until a later
+/// binder for the same model uploads, and so releases, that weight again.
+struct PageReleaser {
+    tx: Option<std::sync::mpsc::Sender<(String, Vec<TensorBytes>)>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PageReleaser {
+    /// Start the release thread; if the OS refuses one, releases happen inline on the caller.
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<TensorBytes>)>();
+        match std::thread::Builder::new()
+            .name("infr-release-mapped".into())
+            .spawn(move || {
+                for (name, views) in rx {
+                    release_mapped_pages(&name, &views);
+                }
+            }) {
+            Ok(thread) => Self {
+                tx: Some(tx),
+                thread: Some(thread),
+            },
+            Err(e) => {
+                tracing::debug!("no thread for releasing mapped pages, releasing inline: {e}");
+                Self {
+                    tx: None,
+                    thread: None,
+                }
+            }
+        }
+    }
+
+    /// Queue `tb`'s mapped views for release (or release them now, without a thread).
+    fn release(&self, name: &str, tb: WBytes) {
+        let views = match tb {
+            WBytes::Mmap(t) => vec![t],
+            WBytes::Concat(parts) => parts,
+            WBytes::Owned(_) => return,
+        };
+        match &self.tx {
+            // A send fails only once the thread is gone, which takes a panic in it; the views come
+            // back in the error and are released here instead.
+            Some(tx) => {
+                if let Err(std::sync::mpsc::SendError((name, views))) =
+                    tx.send((name.to_owned(), views))
+                {
+                    release_mapped_pages(&name, &views);
+                }
+            }
+            None => release_mapped_pages(name, &views),
+        }
+    }
+}
+
+impl Drop for PageReleaser {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(t) = self.thread.take() {
+            if t.join().is_err() {
+                tracing::warn!("the mapped-page release thread panicked");
+            }
+        }
+    }
+}
+
+/// Release one weight's mapped views (see [`PageReleaser`]). A release that fails costs host
+/// memory, never correctness, so it is logged rather than failing the load; an unsupported
+/// platform is logged once per weight at debug level.
+fn release_mapped_pages(name: &str, views: &[TensorBytes]) {
+    for v in views {
+        match v.release_resident() {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                tracing::debug!("{name}: mapped pages kept resident: {e}");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("{name}: releasing its mapped pages after the upload failed: {e}");
+                return;
+            }
+        }
+    }
 }
 
 /// Open one Vulkan backend per physical device index (the shared front of every multi-GPU

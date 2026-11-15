@@ -145,6 +145,28 @@ impl TensorBytes {
     pub fn file_range(&self) -> (u64, usize) {
         (self.file_base + self.off as u64, self.len)
     }
+
+    /// Drop this view's pages from the process's resident set, leaving the mapping valid: a later
+    /// read faults them back in from the OS file cache, or from disk. For a weight whose bytes
+    /// were copied somewhere else (a discrete GPU's VRAM) and are not read through the mapping
+    /// again, so the host stops holding a second copy. Pages shared with a neighbouring tensor go
+    /// too and come back on their next read.
+    ///
+    /// `Err` with [`std::io::ErrorKind::Unsupported`] on a platform with no release call
+    /// ([`infr_plat::mem::release_mapped`] names them); nothing is released then.
+    pub fn release_resident(&self) -> std::io::Result<()> {
+        // SAFETY: a `TensorBytes` is only built by `Gguf::tensor_bytes_arc`, over a shard mapping
+        // `map_and_parse` made with `Mmap::map` from a file opened read-only: shared, read-only
+        // and file-backed, which is the contract `release_mapped` asks for.
+        unsafe { infr_plat::mem::release_mapped(self) }
+    }
+
+    /// Bytes of this view's pages in the process's resident set right now (whole pages, so up to
+    /// a page more at each end than the view's length). What
+    /// [`Self::release_resident`] is observed through.
+    pub fn resident_bytes(&self) -> std::io::Result<u64> {
+        infr_plat::mem::resident_bytes(self)
+    }
 }
 
 // ─── byte-cursor ──────────────────────────────────────────────────────────────
@@ -1175,6 +1197,32 @@ mod tests {
         );
         // And it really is a file offset: the same bytes are there when read through the file.
         assert_eq!(&bytes[off as usize..off as usize + len], &view[..]);
+    }
+
+    /// A released view leaves the resident set and still reads the file's bytes. The platform
+    /// helper's own tests cover a multi-page range; this one covers the path through a `Gguf`.
+    #[test]
+    fn a_released_view_reads_back_the_same() {
+        let bytes = build_fixture();
+        let tmp = write_temp_gguf(&bytes);
+        let gguf = Gguf::open(tmp.path()).expect("open fixture");
+        let view = gguf.tensor_bytes_arc("tensor0").expect("view");
+        let expected = &bytes[bytes.len() - 16..];
+        assert_eq!(&view[..], expected);
+        match view.release_resident() {
+            Ok(()) => {
+                assert_eq!(view.resident_bytes().expect("residency"), 0);
+                assert_eq!(
+                    &view[..],
+                    expected,
+                    "a released view must read back the file"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                eprintln!("skip: mapped-page release is not implemented on this platform");
+            }
+            Err(e) => panic!("release failed: {e}"),
+        }
     }
 
     /// The pager's disk tier reads a tensor by `(offset, len)` taken from

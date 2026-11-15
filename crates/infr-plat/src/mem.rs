@@ -167,6 +167,9 @@ fn windows_memory_status() -> Option<windows::Win32::System::SystemInformation::
 #[cfg(any(windows, test))]
 mod windows_job;
 
+mod mapped;
+pub use mapped::{release_mapped, resident_bytes};
+
 /// Read macOS's VM statistics via `host_statistics64`, or `None` if the kernel call fails.
 ///
 /// `mach_host_self()` returns a send right to the host port that is valid for the life of the

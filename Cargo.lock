@@ -1261,6 +1261,7 @@ dependencies = [
  "anyhow",
  "half",
  "infr-core",
+ "infr-plat",
  "infr-prof",
  "infr-prof-rt",
  "memmap2",

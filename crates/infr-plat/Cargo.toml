@@ -25,7 +25,8 @@ windows = { version = "0.58", features = [
     "Win32_System_IO",                # OVERLAPPED
     "Win32_System_Ioctl",             # FSCTL_SET_SPARSE
     "Win32_System_SystemInformation", # GlobalMemoryStatusEx
-    "Win32_System_ProcessStatus",     # GetProcessMemoryInfo
+    "Win32_System_ProcessStatus",     # GetProcessMemoryInfo, QueryWorkingSetEx
+    "Win32_System_Memory",            # VirtualUnlock (releases mapped pages from the working set)
     "Win32_Security",                 # CreateJobObjectW in native tests
     "Win32_System_JobObjects",        # QueryInformationJobObject
     "Win32_System_Threading",         # JOBOBJECT_EXTENDED_LIMIT_INFORMATION embeds IO_COUNTERS

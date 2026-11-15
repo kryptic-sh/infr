@@ -210,6 +210,18 @@ cfg_struct! {
         /// which bounds a submit against the GPU hang watchdog: a segment is closed when EITHER
         /// count is reached, so this never lengthens a submit the splitter would have cut.
         early_submit: usize = 8,
+        /// Hand a resident weight's mapped pages back to the OS file cache once its bytes are in
+        /// a DISCRETE GPU's memory (`infr_gguf::TensorBytes::release_resident`). Config only, no
+        /// `INFR_*` key; `false` is the A/B switch.
+        ///
+        /// Without it, every page the upload read stays in the process's resident set for as long
+        /// as the model is loaded. On Windows those pages count as in use, not as standby cache,
+        /// so the host keeps about the model's size of memory unavailable beside the copy in VRAM.
+        /// The mapping stays valid either way: a later host read of a released weight faults its
+        /// pages back in once. Never applied on a unified-memory device, on the CPU backend, or
+        /// to paged and streamed weights, which are read through the mapping again; see
+        /// `vulkan_moe_binder` in `infr-llama`.
+        release_uploaded: bool = true,
     }
 }
 

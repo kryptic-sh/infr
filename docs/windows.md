@@ -130,6 +130,14 @@ the device, the model size and the memory found, and do not run.
 still holds the paged run to the CPU reference. On a discrete GPU every one of
 them runs.
 
+On a discrete GPU the mapped pages a resident upload read are released from the
+working set after each weight's upload (`paging.release_uploaded`), so they sit
+on the standby list and count as available; before that they stayed in the
+working set, counted as in use, for as long as the model was loaded. A test with
+a CPU leg still holds the whole file there, because the CPU backend reads its
+weights through the mapping. The process's `Private Bytes` (commit) stays near
+the model's size either way without being resident; see backlog B194.
+
 On a small iGPU, do **not** enable the whole ignored suite. `bandwidth_probe`
 retains large allocations, `decode_gemv_bw` retains cache-busting workloads and
 unbounded repetition submissions, and `interconnect_probe` uses POSIX-only

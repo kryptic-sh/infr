@@ -21,24 +21,23 @@ it that way.
 
 ## What it owns
 
-| module   | capability                                    |
-| -------- | --------------------------------------------- |
-| `cpu`    | physical core count, compute-thread placement |
-| `fileio` | positioned reads and writes                   |
-| `link`   | the content-addressed store's link step       |
-| `lock`   | an exclusive, crash-safe file lock            |
-| `mem`    | how much host memory could be committed       |
-| `paths`  | config / cache / home directory resolution    |
-| `proc`   | process liveness                              |
-| `signal` | `SIGINT` / `SIGTERM`, or the local equivalent |
-| `stdin`  | an interruptible byte read from fd 0          |
+| module   | capability                                     |
+| -------- | ---------------------------------------------- |
+| `cpu`    | physical core count, compute-thread placement  |
+| `fileio` | positioned reads and writes                    |
+| `link`   | the content-addressed store's link step        |
+| `lock`   | an exclusive, crash-safe file lock             |
+| `mem`    | committable host memory, mapped-page residency |
+| `paths`  | config / cache / home directory resolution     |
+| `proc`   | process liveness                               |
+| `signal` | `SIGINT` / `SIGTERM`, or the local equivalent  |
+| `stdin`  | an interruptible byte read from fd 0           |
 
 ## What must not be sanded off
 
 The recurring failure here is giving two different guarantees one signature, so
-that "not supported on this platform" arrives at a caller as "passed". Three
-cases are live, and each is documented at its definition rather than smoothed
-over:
+that "not supported on this platform" arrives at a caller as "passed". Each live
+case is documented at its definition rather than smoothed over:
 
 - **`mem::available`** is clamped by the cgroup limit on Linux and by the
   process's Job Object limit on Windows, and is **host-wide on macOS**
@@ -48,6 +47,13 @@ over:
 - **`lock::FileLock`** is advisory on Unix (`flock`) and mandatory on Windows
   (`LockFileEx`). It promises the weaker of the two; a caller written against
   the stronger one would work on Windows and quietly do nothing on Linux.
+- **`mem::release_mapped`** and **`mem::resident_bytes`** are implemented on
+  Windows (`VirtualUnlock`, `QueryWorkingSetEx`) and Linux
+  (`madvise(MADV_DONTNEED)`, `/proc/self/pagemap`) and answer
+  `ErrorKind::Unsupported` everywhere else, macOS included. `release_mapped` is
+  `unsafe`: on Linux `MADV_DONTNEED` zero-fills private or anonymous memory, so
+  it is sound only on a shared read-only file mapping, which
+  `infr_gguf::TensorBytes::release_resident` is the safe way to name.
 - **`proc::pid_alive`** answers `true` where there is no probe — losing a
   tripwire rather than reporting a live process as dead. A new platform should
   get a real probe, not inherit that arm.

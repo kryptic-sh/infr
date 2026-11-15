@@ -8,6 +8,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`paging.release_uploaded`** (config only, default on): once a resident
+  weight is uploaded to a discrete GPU, its mapped file pages are released from
+  the process's resident set on a background thread; the mapping stays valid and
+  a later host read faults them back in. Before, the whole model stayed in the
+  working set beside its VRAM copy for as long as it was loaded, which on
+  Windows counts as memory in use. Measured on an RX 7900 XTX under
+  `infr serve`, available host memory fell by 0.33 GB instead of 3.6 GB for
+  LFM3-1.7B F16 (3.47 GB), 0.31 instead of 2.1 for SmolLM3-3B Q4_K_M and 0.29
+  instead of 1.34 for Qwen3-1.7B Q4_K_M, with identical output and no change in
+  load time, pp512 or tg128. Not applied on unified-memory devices, the CPU
+  backend, or paged and streamed weights.
+- **`infr_plat::mem::release_mapped` / `resident_bytes`** and
+  **`infr_gguf::TensorBytes::release_resident` / `resident_bytes`**: release a
+  file mapping's pages from the resident set and count those still in it.
+  Implemented on Windows and Linux; other platforms return
+  `ErrorKind::Unsupported`.
 - **`VulkanBackend::linear_tier_counts`** (`LinearTierCounts`): how many int8
   and dequant multi-row GEMVs and dp4a K-quant GEMMs a backend has recorded,
   beside `i8cm_kq_counts`, so a test can see which Linear kernel ran.

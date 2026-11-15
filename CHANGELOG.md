@@ -194,7 +194,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   to 0.001722 and from 0.000002 to 0.000730, and perplexity from 16.3126 to
   16.3407 (+0.17%) and from 8.2475 to 8.2575 (+0.12%). llama.cpp's Vulkan
   backend on the same tokens: top-1 0.9824 and 0.9863, KL divergence 0.001792
-  and 0.000328. Details in `docs/backlog.md` B192.
+  and 0.000328 as scored from its `--kl-divergence-base` dump, whose 16-nat
+  floor biases that score low; infr's logits scored through the same encoding
+  give 0.001479 and 0.000335. Details in `docs/backlog.md` B192.
 - **`quant_q8` quantizes eight blocks per workgroup** instead of one, with the
   same per-block arithmetic, so its results are unchanged. On a Qwen3-1.7B pp512
   forward on the RX 7900 XTX the quant passes took 3.35 ms over six per layer

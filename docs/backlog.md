@@ -5418,6 +5418,10 @@ scored (1530 positions), every backend against infr's CPU reference
 | infr int8 on      | 0.001722 | 0.09546 | 0.9765 | 16.3407 | 0.999644 | 0.955304 |         6.5250 |
 | llama.cpp Vulkan  | 0.001792 | 0.26817 | 0.9824 | 16.2741 |          |          |                |
 | llama.cpp CPU     | 0.008603 | 0.28568 | 0.9529 | 16.2613 |          |          |                |
+| _as dumped:_      |          |         |        |         |          |          |                |
+| infr CPU ref      | -0.00024 | 0.00004 |      1 |         |          |          |                |
+| infr int8 off     | -0.00024 | 0.00011 | 0.9987 |         |          |          |                |
+| infr int8 on      | 0.001479 | 0.09518 | 0.9765 |         |          |          |                |
 
 | SmolLM3-3B Q4_K_M | KLD mean | KLD max |  top-1 |    PPL | cos mean |  cos min | max abs Δlogit |
 | ----------------- | -------: | ------: | -----: | -----: | -------: | -------: | -------------: |
@@ -5426,18 +5430,49 @@ scored (1530 positions), every backend against infr's CPU reference
 | infr int8 on      | 0.000730 | 0.01062 | 0.9863 | 8.2575 | 0.999871 | 0.993740 |         1.7175 |
 | llama.cpp Vulkan  | 0.000328 | 0.01412 | 0.9863 | 8.2638 |          |          |                |
 | llama.cpp CPU     | 0.002466 | 0.04499 | 0.9739 | 8.2610 |          |          |                |
+| _as dumped:_      |          |         |        |        |          |          |                |
+| infr CPU ref      | -0.00039 | 0.00001 |      1 |        |          |          |                |
+| infr int8 off     | -0.00039 | 0.00001 | 0.9987 |        |          |          |                |
+| infr int8 on      | 0.000335 | 0.01035 | 0.9863 |        |          |          |                |
 
 llama.cpp's rows come from its `--kl-divergence-base` dumps, which keep each
 row's log-probabilities only down to 16 nats below the top, so they carry no
 logit cosine, and their PPL is llama.cpp's own `Final estimate` (a perplexity
 read back from the clamped dump is biased low); its CPU backend quantizes
-activations too (`q8_K`), hence its larger KLD. In short: with the int8 GEMM,
-infr is as close to the f32 reference as llama.cpp's Vulkan backend on
-Qwen3-1.7B (KLD 0.00172 against 0.00179, top-1 0.9765 against 0.9824) and
-further on SmolLM3-3B (KLD 0.00073 against 0.00033, top-1 equal at 0.9863);
-against the f16 path, top-1 agreement with the reference falls from 0.9987 to
+activations too (`q8_K`), hence its larger KLD.
+
+**Scored here as the candidate against infr's reference, a dump's clamp biases
+KLD low too, so llama.cpp's KLD only compares with the "as dumped" rows.** Every
+token below the floor reads back at the floor, above its true log-probability
+(the dumped row no longer sums to one), and the reference's mass down there
+enters the sum with a negative sign. This is a property of how this test scores
+a dump, not of llama.cpp's own `--kl-divergence` run, where the dump is the base
+and terms below the floor are dropped. The test now also scores infr's logits
+put through the dump's own encoding (`as_dumped`, the encoding
+`perplexity.cpp`'s `log_softmax` writes): the reference against its own dump is
+the bias alone, -0.00024 on Qwen3-1.7B and -0.00039 on SmolLM3-3B, which has
+more tail mass below the floor. On that common footing infr's int8 prefill is
+closer to the f32 reference than llama.cpp's Vulkan backend on Qwen3-1.7B (KLD
+0.001479 against 0.001792) and level with it on SmolLM3-3B (0.000335 against
+0.000328, and llama.cpp's row also carries its f16 KV cache and flash
+attention). The "SmolLM3's KLD is twice llama.cpp's" reading of the raw rows
+(0.00073 against 0.00033) was this bias, not the kernel. Per a reading of
+llama.cpp `5676dfbe0`, not a measurement, the two kernels do the same thing: it
+quantizes activations for every Q4_K and Q6_K matmul in both files, lm_head
+included (`ggml_vk_mul_mat_q_f16`: `can_quantize_y` with no size or type
+exception beyond `GGML_PREC_*` source precision, which these files do not set);
+`quantize_q8_1.comp` is infr's `quant_q8` (32-element blocks, d = amax/127
+rounded to f16 after quantizing with the f32 d, round to nearest, f16 Σd·q);
+`mul_mmq_cm1.comp` scales each block's int32 dot in f32 with the same d·sc /
+dmin·m terms and f32 accumulators. Nothing was changed in the kernel. The f16 KV
+cache and flash attention share of llama.cpp's row was not measured. Top-1 is
+unaffected by the clamp (the top token is never clamped), and there infr trails
+llama.cpp on Qwen3-1.7B, 0.9765 against 0.9824, and ties on SmolLM3-3B; not
+looked into, and small next to the KLD ordering.
+
+Against the f16 path, top-1 agreement with the reference falls from 0.9987 to
 0.9765 / 0.9863 and perplexity rises by 0.17% / 0.12% (16.3126 to 16.3407,
-8.2475 to 8.2575). Why SmolLM3's KLD is twice llama.cpp's was not looked into.
+8.2475 to 8.2575).
 
 **Greedy continuations** (64 tokens after the first 256 tokens of each window,
 the same decode GEMV either way; leading tokens shared, re-tokenized from text):

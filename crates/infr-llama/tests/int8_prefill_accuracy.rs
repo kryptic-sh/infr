@@ -11,6 +11,12 @@
 //! next token below it, so a perplexity read back from the dump is biased low. Take llama.cpp's
 //! perplexity from its own `Final estimate` line instead.
 //!
+//! Scoring a dump as the candidate against the reference, as this test does, the clamp also biases
+//! KL divergence low, by the reference's own probability mass more than 16 nats below its top
+//! token, which differs by model. So the infr rows are scored twice: from their
+//! raw logits, and from those logits put through the dump's encoding (the `, dumped` rows). Only
+//! the dumped rows compare with llama.cpp's; the reference's own dumped row is the size of the bias.
+//!
 //! Run (one model per run; dumps from `llama-perplexity -f <text> -c 512 --chunks 6
 //! --kl-divergence-base <file>`, the first of them supplies the tokens):
 //!
@@ -94,6 +100,32 @@ fn log_softmax(logits: &[f32]) -> Vec<f64> {
         .ln()
         + max;
     logits.iter().map(|&v| v as f64 - lse).collect()
+}
+
+/// `logits` as log-probabilities the way a `llama-perplexity --kl-divergence-base` dump stores and
+/// reads them back (the encoding `perplexity.cpp`'s `log_softmax` writes, in its f32 arithmetic): every logit more
+/// than 16 below the top raised to that floor, the rest rounded to 65535 steps above it.
+fn as_dumped(logits: &[f32]) -> Vec<f64> {
+    let max = logits.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v));
+    let min = logits
+        .iter()
+        .fold(f32::INFINITY, |a, &v| a.min(v))
+        .max(max - 16.0);
+    let sum_exp: f64 = logits.iter().map(|&v| (v - max).exp() as f64).sum();
+    let min_lp = min - max - sum_exp.ln() as f32;
+    let scale = (max - min) / 65535.0;
+    let inv = 1.0 / scale;
+    logits
+        .iter()
+        .map(|&v| {
+            let code = if v > min {
+                (inv * (v - min)).round_ties_even()
+            } else {
+                0.0
+            };
+            (min_lp + scale * code) as f64
+        })
+        .collect()
 }
 
 fn argmax<T: PartialOrd + Copy>(v: &[T]) -> usize {
@@ -221,6 +253,14 @@ fn int8_prefill_accuracy_against_the_cpu_reference() {
         ("infr vulkan int8 on".into(), Score::default()),
     ];
     scores.extend(llama.iter().map(|(n, _)| (n.clone(), Score::default())));
+    let dumped = scores.len();
+    for name in [
+        "infr cpu ref, dumped",
+        "infr int8 off, dumped",
+        "infr int8 on, dumped",
+    ] {
+        scores.push((name.into(), Score::default()));
+    }
     // The reference against itself: its own perplexity, and zeros elsewhere.
     let mut ref_score = Score::default();
     for c in 0..base.n_chunk {
@@ -240,9 +280,13 @@ fn int8_prefill_accuracy_against_the_cpu_reference() {
             let rl = &ref_logits[p * vocab..][..vocab];
             let rlp = log_softmax(rl);
             ref_score.add(&rlp, Some(rl), &rlp, rl, next);
+            scores[dumped].1.add(&as_dumped(rl), None, &rlp, rl, next);
             for (i, v) in vk.iter().enumerate() {
                 let l = &v[p * vocab..][..vocab];
                 scores[i].1.add(&log_softmax(l), Some(l), &rlp, rl, next);
+                scores[dumped + 1 + i]
+                    .1
+                    .add(&as_dumped(l), None, &rlp, rl, next);
             }
             for (j, (_, d)) in llama.iter().enumerate() {
                 let lp: Vec<f64> = d.log_probs(c, r).iter().map(|&v| v as f64).collect();

@@ -194,6 +194,11 @@ memory. Both sit behind the API key when one is set.
 a per-request OpenAI `temperature`/`top_p` still overrides them. See
 [Configuration](#configuration).
 
+Per-request sampling fields: `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
+`presence_penalty`, `frequency_penalty`, `repeat_penalty`, `logit_bias`, `stop`
+and `max_tokens` / `max_completion_tokens`. `n` above 1, `logprobs` and
+`top_logprobs` are not supported and answer `400`.
+
 ## Performance
 
 Measured against llama.cpp on an **AMD Radeon RX 7900 XTX** (RDNA3, Vulkan /

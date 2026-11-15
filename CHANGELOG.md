@@ -6,7 +6,40 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Breaking
+
+- **`infr_server::ChatGenerator::vocab_size`** is a new required method: the
+  length of the logits row a `logit_bias` is applied to. The server checks a
+  request's `logit_bias` ids against it before generation, so a streaming
+  request gets the `400` too; it asks only when the request carries a bias.
+  **`infr_llama::sampling::Sampler`** gains a `min_p` field and
+  **`RequestSampling`** gains `min_p` and `logit_bias`, so struct literals of
+  `Sampler` must set it. **`ChatRequest`**'s `logit_bias` is a `LogitBiasArg`,
+  and its `n` and `top_logprobs` are raw JSON values validated by
+  `GenParams::from_request`.
+
 ### Added
+
+- **`infr serve` honours `logit_bias` and `min_p`.** `logit_bias` (OpenAI: token
+  id to a bias in -100..=100) is added to the logits before the penalties, as
+  llama.cpp's chain does, on every path of the dense seam decode loop (Vulkan,
+  CPU and Metal): host sampling, greedy (a biased argmax, so a -100 ban holds at
+  temperature 0) and grammar-constrained tool calls, where a bias reorders the
+  tokens the grammar allows and never unmasks one. `min_p` (llama.cpp's rule:
+  drop tokens whose probability is below `min_p` times the top token's, on the
+  raw logits) cuts beside top-k and top-p; `0` is bit-identical to before. Both
+  take the sequence off device sampling and chained decode the way a penalty
+  does — a `logit_bias`, at any temperature; `min_p`, when the device sampler
+  would otherwise run, since it has no min-p cut (greedy keeps device argmax,
+  which min-p cannot change). A key that is not a token id in canonical decimal
+  (`"5"`, not `"+5"` or `"05"`) below the model's vocabulary, an id given twice,
+  a bias outside -100..=100 or a `min_p` outside 0..=1 is a `400` naming the
+  parameter. DiffusionGemma and Metal speculative decoding, whose samplers read
+  neither field, refuse a request carrying a `logit_bias` or a non-zero `min_p`
+  with a `400` naming it (`UnsupportedSampling`, which serve maps to
+  `infr_server::ParamError`; a generator returning a `ParamError` is now
+  answered `400`, or a terminal error frame naming the parameter when
+  streaming). `infr run` has no `--min-p`.
 
 - **`paging.release_uploaded`** (config only, default on): once a resident
   weight is uploaded to a discrete GPU, its mapped file pages are released from
@@ -100,6 +133,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the slot alignment each needs.
 
 ### Changed
+
+- **`infr serve` answers `n > 1`, `logprobs: true` and `top_logprobs > 0` with a
+  `400`** saying the feature is not supported, instead of returning one choice
+  and no log probabilities as if the request had been honoured. `n: 1`,
+  `logprobs: false`, `top_logprobs: 0` and `null` are accepted as before, and a
+  whole-number float (`n: 1.0`) reads as that integer; any other non-integer `n`
+  or `top_logprobs` is a `400` naming the parameter.
 
 - **A streamed dense model whose cache holds every block decodes through the
   record-once replay and the decode chain** (Vulkan), as a resident one does,
@@ -457,6 +497,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   conversation with tools, and every conversation, respectively, and now render.
 
 ### Fixed
+
+- **A uniform draw of exactly 0 no longer picks an arbitrary low-id token** when
+  sampling with `top_k` 0 and `top_p` 1. That support is kept in id order, so a
+  zero draw (one in 2^24) took the lowest id with any probability at all — for
+  example a token pushed 100 below the top, whose probability only fails to
+  underflow. It now takes the most likely token, as the sorted paths already
+  did.
 
 - **Penalties apply under a forced tool call.** With `tool_choice` set to
   `"required"` or a named function, `frequency_penalty`, `presence_penalty` and

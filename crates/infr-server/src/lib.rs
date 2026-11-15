@@ -122,6 +122,14 @@ pub trait ChatGenerator: Send + Sync {
     /// cannot see rather than a placeholder. It must not wait on a generation: both routes call it
     /// while requests are running.
     fn status(&self) -> GeneratorStatus;
+
+    /// How many token ids this generator's model has — the length of the logits row a
+    /// `logit_bias` is applied to — so a request's `logit_bias` may name only ids below it. The
+    /// server asks only for a request that carries a bias, and before the request reaches
+    /// [`chat`](Self::chat), so a bad id is a `400` on a streaming request too, where the `200`
+    /// goes out before generation starts. It is read on the request path, so return a value
+    /// computed once rather than counting the vocabulary each time.
+    fn vocab_size(&self) -> usize;
 }
 
 /// What one [`ChatGenerator::chat`] call produced: why it ended, plus the real token counts the
@@ -163,8 +171,10 @@ impl std::error::Error for ContextLengthExceeded {}
 
 /// Top-level chat completion request (OpenAI wire format).
 ///
-/// Unknown fields are IGNORED (no `deny_unknown_fields`) — an OpenAI client sending `n`, `user`,
-/// `logit_bias`, … must not 400. Known-but-invalid VALUES do 400, via [`GenParams::from_request`].
+/// Unknown fields are IGNORED (no `deny_unknown_fields`) — an OpenAI client sending `user`,
+/// `response_format`, … must not 400. Known-but-invalid VALUES do 400, via
+/// [`GenParams::from_request`], and so do the known fields asking for a feature the server does
+/// not have (`n > 1`, `logprobs`), rather than being answered as if they had been honoured.
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -204,9 +214,89 @@ pub struct ChatRequest {
     /// llama.cpp extension (1.0 = off).
     #[serde(default)]
     pub repeat_penalty: Option<f32>,
+    /// llama.cpp/vLLM extension (0 = off): drop tokens less likely than `min_p` times the top one.
+    #[serde(default)]
+    pub min_p: Option<f32>,
+    /// OpenAI `logit_bias`: `{"<token id>": bias}`. Kept as the client sent it so a malformed
+    /// map is a `400` naming the parameter, not a body-parse failure.
+    #[serde(default)]
+    pub logit_bias: Option<LogitBiasArg>,
+    /// OpenAI `n`: how many choices to return. Only one is supported. A raw value for the same
+    /// reason as `logit_bias`; see [`GenParams::from_request`].
+    #[serde(default)]
+    pub n: Option<serde_json::Value>,
+    /// OpenAI `logprobs`. Not supported: `true` is a `400`.
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    /// OpenAI `top_logprobs`. Not supported: anything above zero is a `400`. A raw value, as `n`.
+    #[serde(default)]
+    pub top_logprobs: Option<serde_json::Value>,
     /// OpenAI `stream_options`; only `include_usage` is read.
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+}
+
+/// A request's `logit_bias` as the client sent it: the object's entries in order with a repeated
+/// key kept (a JSON object map would silently merge it), or the JSON type sent instead of an
+/// object. `null` deserializes as an absent field.
+#[derive(Debug)]
+pub enum LogitBiasArg {
+    Entries(Vec<(String, serde_json::Value)>),
+    /// Not an object; the JSON type it was, for the `400`.
+    NotAnObject(&'static str),
+}
+
+impl<'de> Deserialize<'de> for LogitBiasArg {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = LogitBiasArg;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut m: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = m.next_entry::<String, serde_json::Value>()? {
+                    entries.push(entry);
+                }
+                Ok(LogitBiasArg::Entries(entries))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut s: A,
+            ) -> Result<Self::Value, A::Error> {
+                while s.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(LogitBiasArg::NotAnObject("array"))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(LogitBiasArg::NotAnObject("boolean"))
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(LogitBiasArg::NotAnObject("number"))
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(LogitBiasArg::NotAnObject("number"))
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(LogitBiasArg::NotAnObject("number"))
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(LogitBiasArg::NotAnObject("string"))
+            }
+        }
+        d.deserialize_any(V)
+    }
 }
 
 /// OpenAI `stream_options`. With `include_usage`, a streamed reply ends with one extra chunk that
@@ -249,22 +339,68 @@ pub struct GenParams {
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub repeat_penalty: Option<f32>,
+    pub min_p: Option<f32>,
+    /// `(token id, bias)` pairs in ascending id order. Ids are checked against the model's
+    /// vocabulary by [`check_vocab`](Self::check_vocab), which needs the routed generator.
+    pub logit_bias: Vec<(u32, f32)>,
     /// Already normalised: empty strings dropped (an empty stop would fire on the first token).
     pub stop: Vec<String>,
 }
 
 /// An OpenAI-shaped 400: `{"error":{"message":..,"type":"invalid_request_error","param":..}}`.
+///
+/// Also an error a [`ChatGenerator`] may return from [`chat`](ChatGenerator::chat) for a request
+/// it cannot honour: the server answers it as this `400` (a terminal error frame when streaming),
+/// not a `500`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParamError {
     pub param: &'static str,
     pub message: String,
 }
 
+impl std::fmt::Display for ParamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParamError {}
+
 impl GenParams {
     /// Validate + normalise the request's sampling fields. Out-of-range values are a 400, NEVER a
     /// silent clamp and never a panic (OpenAI's own ranges: temperature 0..2, top_p 0..1,
-    /// presence/frequency -2..2, at most 4 stop sequences).
+    /// presence/frequency -2..2, logit_bias -100..100, at most 4 stop sequences; min_p 0..1).
+    /// `n > 1`, `logprobs: true` and `top_logprobs > 0` are a 400 too: the server returns one
+    /// choice and no log probabilities, and a reply shaped as if it had would be wrong.
     pub fn from_request(req: &ChatRequest) -> Result<Self, ParamError> {
+        let unsupported = |param: &'static str, what: &str| ParamError {
+            param,
+            message: format!("{param}: {what} is not supported by this server"),
+        };
+        match whole_number("n", req.n.as_ref())? {
+            None | Some(1) => {}
+            Some(n) if n < 1 => {
+                return Err(ParamError {
+                    param: "n",
+                    message: format!("n must be >= 1, got {n}"),
+                })
+            }
+            Some(n) => return Err(unsupported("n", &format!("returning {n} choices"))),
+        }
+        if req.logprobs == Some(true) {
+            return Err(unsupported("logprobs", "returning log probabilities"));
+        }
+        match whole_number("top_logprobs", req.top_logprobs.as_ref())? {
+            None | Some(0) => {}
+            Some(k) if k < 0 => {
+                return Err(ParamError {
+                    param: "top_logprobs",
+                    message: format!("top_logprobs must be >= 0, got {k}"),
+                })
+            }
+            Some(_) => return Err(unsupported("top_logprobs", "returning log probabilities")),
+        }
+
         let rng = |param: &'static str,
                    v: Option<f32>,
                    lo: f32,
@@ -334,6 +470,8 @@ impl GenParams {
             }
         }
 
+        let logit_bias = parse_logit_bias(req.logit_bias.as_ref())?;
+
         Ok(Self {
             // OpenAI renamed `max_tokens` -> `max_completion_tokens`; the new name wins.
             max_tokens: req.max_completion_tokens.or(req.max_tokens),
@@ -344,9 +482,108 @@ impl GenParams {
             presence_penalty: rng("presence_penalty", req.presence_penalty, -2.0, 2.0)?,
             frequency_penalty: rng("frequency_penalty", req.frequency_penalty, -2.0, 2.0)?,
             repeat_penalty: req.repeat_penalty,
+            min_p: rng("min_p", req.min_p, 0.0, 1.0)?,
+            logit_bias,
             stop,
         })
     }
+
+    /// The `logit_bias` ids against the routed model's vocabulary: an id at or past `vocab` names
+    /// no token, so the request is a 400 rather than a bias that silently does nothing.
+    pub fn check_vocab(&self, vocab: usize) -> Result<(), ParamError> {
+        match self.logit_bias.iter().find(|&&(t, _)| t as usize >= vocab) {
+            Some(&(t, _)) => Err(ParamError {
+                param: "logit_bias",
+                message: format!(
+                    "logit_bias names token {t}, but the model's vocabulary has {vocab} tokens"
+                ),
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+/// An integer count field (`n`, `top_logprobs`): absent or `null` is `None`, and a whole number
+/// is that integer — `1.0` reads as `1`, as OpenAI's own validation reads it. Anything else is a
+/// 400 naming `param`, where typing the field as an integer made it a body-parse failure that
+/// named nothing.
+fn whole_number(
+    param: &'static str,
+    v: Option<&serde_json::Value>,
+) -> Result<Option<i64>, ParamError> {
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    if let Some(i) = v.as_i64() {
+        return Ok(Some(i));
+    }
+    if let Some(u) = v.as_u64() {
+        // Past `i64`: still a count, and every caller rejects one this large.
+        return Ok(Some(i64::try_from(u).unwrap_or(i64::MAX)));
+    }
+    match v.as_f64() {
+        Some(f) if f.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&f) => {
+            Ok(Some(f as i64))
+        }
+        _ => Err(ParamError {
+            param,
+            message: format!("{param} must be an integer, got {v}"),
+        }),
+    }
+}
+
+/// OpenAI's bound on a `logit_bias` value, either sign.
+const LOGIT_BIAS_LIMIT: f64 = 100.0;
+
+/// OpenAI `logit_bias` (`{"<token id>": bias}`) as `(id, bias)` pairs sorted by id. Absent or
+/// `null` is no bias.
+///
+/// A key must be the id in canonical decimal (`"5"`, never `"+5"` or `"05"`), and an id may
+/// appear once: otherwise several spellings of one token would stack their biases past the
+/// validated range.
+fn parse_logit_bias(v: Option<&LogitBiasArg>) -> Result<Vec<(u32, f32)>, ParamError> {
+    let err = |message: String| ParamError {
+        param: "logit_bias",
+        message,
+    };
+    let entries = match v {
+        None => return Ok(Vec::new()),
+        Some(LogitBiasArg::Entries(e)) => e,
+        Some(LogitBiasArg::NotAnObject(t)) => {
+            return Err(err(format!(
+                "logit_bias must be an object mapping token ids to biases, got a {t}"
+            )))
+        }
+    };
+    let mut out = Vec::with_capacity(entries.len());
+    for (key, val) in entries {
+        let canonical = key.bytes().all(|b| b.is_ascii_digit())
+            && (key == "0" || (!key.is_empty() && !key.starts_with('0')));
+        let id: u32 = canonical
+            .then(|| key.parse().ok())
+            .flatten()
+            .ok_or_else(|| {
+                err(format!(
+                    "logit_bias key {key:?} is not a token id (a non-negative integer written \
+                     without sign or leading zeros)"
+                ))
+            })?;
+        let bias = val
+            .as_f64()
+            .ok_or_else(|| err(format!("logit_bias for token {id} must be a number")))?;
+        if !(-LOGIT_BIAS_LIMIT..=LOGIT_BIAS_LIMIT).contains(&bias) {
+            return Err(err(format!(
+                "logit_bias for token {id} must be between -{LOGIT_BIAS_LIMIT} and \
+                 {LOGIT_BIAS_LIMIT}, got {bias}"
+            )));
+        }
+        out.push((id, bias as f32));
+    }
+    out.sort_by_key(|&(id, _)| id);
+    if let Some(w) = out.windows(2).find(|w| w[0].0 == w[1].0) {
+        return Err(err(format!("logit_bias names token {} twice", w[0].0)));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1458,6 +1695,13 @@ async fn chat_completions_handler(
     // The response `model` field echoes the entry ACTUALLY served, not the raw request string, so a
     // client that omitted/mis-named the model sees which one answered.
     let entry = state.route(&req.model);
+    // `logit_bias` ids depend on the model, so they are checked only once it is known, and only
+    // when there are any. No engine (a headless state) answers 500 further on, whatever the ids.
+    if let (false, Some(engine)) = (params.logit_bias.is_empty(), &entry.engine) {
+        if let Err(e) = params.check_vocab(engine.vocab_size()) {
+            return param_error(Some(e.param), e.message);
+        }
+    }
     let model_id = entry.id.to_string();
     let ctx = ReqCtx {
         id: next_req_id(),
@@ -1644,8 +1888,8 @@ async fn non_streaming(
         Err(e) => {
             stats.fold_failure();
             tracing::warn!(req = req_id, error = %e, "request failed");
-            match e.downcast_ref::<ContextLengthExceeded>() {
-                Some(c) => (StatusCode::BAD_REQUEST, Json(context_length_body(c))).into_response(),
+            match request_error_body(&e) {
+                Some(body) => (StatusCode::BAD_REQUEST, Json(body)).into_response(),
                 None => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
             }
         }
@@ -1908,8 +2152,8 @@ async fn streaming(
                 // this apart from success (matching the non-streaming 500). `[DONE]` still follows,
                 // via `DoneGuard` (audit finding 1). An over-long prompt carries the same typed error
                 // the non-streaming path answers with a 400, so a client can tell it from a crash.
-                match e.downcast_ref::<ContextLengthExceeded>() {
-                    Some(c) => done.fail_with(context_length_body(c), &c.message),
+                match request_error_body(&e) {
+                    Some(body) => done.fail_with(body, &e.to_string()),
                     None => done.fail(&e.to_string()),
                 }
             }
@@ -2096,6 +2340,16 @@ fn context_length_body(c: &ContextLengthExceeded) -> serde_json::Value {
         Some("context_length_exceeded"),
         &c.message,
     )
+}
+
+/// The `400` body for a generator error that is the request's fault — an over-long prompt, or a
+/// [`ParamError`] the generator could not honour — or `None` for a failure of the server's own.
+fn request_error_body(e: &anyhow::Error) -> Option<serde_json::Value> {
+    if let Some(c) = e.downcast_ref::<ContextLengthExceeded>() {
+        return Some(context_length_body(c));
+    }
+    e.downcast_ref::<ParamError>()
+        .map(|p| invalid_request_body(Some(p.param), None, &p.message))
 }
 
 /// A body the JSON extractor refused. Malformed JSON and wrong field types are a `400` (not axum's
@@ -2478,6 +2732,9 @@ mod tests {
         assert_eq!(card["owned_by"], "local");
     }
 
+    /// The vocabulary every test generator reports, for the `logit_bias` id check.
+    const TEST_VOCAB: usize = 1000;
+
     /// What a test generator with nothing to say about its device reports.
     fn cpu_status() -> GeneratorStatus {
         GeneratorStatus {
@@ -2504,6 +2761,10 @@ mod tests {
                     unified: false,
                 }),
             }
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
         }
 
         fn chat(
@@ -3040,10 +3301,57 @@ mod tests {
     #[test]
     fn unknown_fields_are_ignored_not_rejected() {
         let p = GenParams::from_request(&req(
-            r#"{"model":"m","messages":[],"n":1,"user":"bob","logit_bias":{},"logprobs":true}"#,
+            r#"{"model":"m","messages":[],"user":"bob","response_format":{"type":"text"}}"#,
         ))
         .unwrap();
         assert_eq!(p, GenParams::default());
+    }
+
+    /// The values of `n`, `logprobs`, `top_logprobs` and `logit_bias` that ask for nothing
+    /// unsupported — one choice, no log probabilities, no bias, or `null` — are accepted.
+    #[test]
+    fn neutral_choice_and_logprob_fields_are_accepted() {
+        for raw in [
+            r#"{"model":"m","messages":[],"n":1,"logprobs":false,"top_logprobs":0,"logit_bias":{}}"#,
+            r#"{"model":"m","messages":[],"n":null,"logprobs":null,"top_logprobs":null,
+                "logit_bias":null,"min_p":null}"#,
+        ] {
+            let p = GenParams::from_request(&req(raw)).unwrap();
+            assert_eq!(p, GenParams::default(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn min_p_and_logit_bias_parse() {
+        let p = GenParams::from_request(&req(r#"{"model":"m","messages":[],"min_p":0.05,
+                "logit_bias":{"50256":-100,"7":3.5,"12":100}}"#))
+        .unwrap();
+        assert_eq!(p.min_p, Some(0.05));
+        assert_eq!(p.logit_bias, vec![(7, 3.5), (12, 100.0), (50256, -100.0)]);
+    }
+
+    /// `0` is a canonical id, and a whole-number float `n` / `top_logprobs` reads as that integer
+    /// (as OpenAI's own validation does): `n: 1.0` is one choice.
+    #[test]
+    fn zero_ids_and_whole_number_counts_are_accepted() {
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"n":1.0,"top_logprobs":0.0,"logit_bias":{"0":-1}}"#,
+        ))
+        .unwrap();
+        assert_eq!(p.logit_bias, vec![(0, -1.0)]);
+    }
+
+    /// A `logit_bias` id is a token only below the routed model's vocabulary size.
+    #[test]
+    fn logit_bias_ids_are_checked_against_the_vocabulary() {
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"logit_bias":{"999":1,"3":-1}}"#,
+        ))
+        .unwrap();
+        assert_eq!(p.check_vocab(1000), Ok(()));
+        let e = p.check_vocab(999).unwrap_err();
+        assert_eq!(e.param, "logit_bias");
+        assert!(e.message.contains("999"), "{}", e.message);
     }
 
     #[test]
@@ -3108,6 +3416,76 @@ mod tests {
             (
                 r#"{"model":"m","messages":[],"stop":["a","b","c","d","e"]}"#,
                 "stop",
+            ),
+            (r#"{"model":"m","messages":[],"min_p":-0.1}"#, "min_p"),
+            (r#"{"model":"m","messages":[],"min_p":1.5}"#, "min_p"),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":[1]}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"a":1}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"-1":1}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"5":"x"}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"5":100.5}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"5":-101}}"#,
+                "logit_bias",
+            ),
+            (r#"{"model":"m","messages":[],"n":2}"#, "n"),
+            (r#"{"model":"m","messages":[],"n":0}"#, "n"),
+            (r#"{"model":"m","messages":[],"logprobs":true}"#, "logprobs"),
+            (
+                r#"{"model":"m","messages":[],"top_logprobs":3}"#,
+                "top_logprobs",
+            ),
+            (
+                r#"{"model":"m","messages":[],"top_logprobs":-1}"#,
+                "top_logprobs",
+            ),
+            // Only canonical decimal ids: each of these names token 5 a second way, and together
+            // they would stack past the bias range on one token.
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"+5":-100}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"05":-100}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{" 5":-100}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"":-100}}"#,
+                "logit_bias",
+            ),
+            // The same id twice, which a JSON object map would otherwise collapse to one.
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"5":-100,"5":-100}}"#,
+                "logit_bias",
+            ),
+            (r#"{"model":"m","messages":[],"n":1.5}"#, "n"),
+            (r#"{"model":"m","messages":[],"n":"1"}"#, "n"),
+            (
+                r#"{"model":"m","messages":[],"top_logprobs":0.5}"#,
+                "top_logprobs",
+            ),
+            (
+                r#"{"model":"m","messages":[],"top_logprobs":[]}"#,
+                "top_logprobs",
             ),
         ] {
             let e = GenParams::from_request(&req(raw)).unwrap_err();
@@ -3686,6 +4064,10 @@ mod tests {
             cpu_status()
         }
 
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
         fn chat(
             &self,
             _messages: &[ChatMessage],
@@ -3884,6 +4266,10 @@ mod tests {
             cpu_status()
         }
 
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
         fn chat(
             &self,
             _messages: &[ChatMessage],
@@ -3932,6 +4318,54 @@ mod tests {
         );
     }
 
+    /// A generator that refuses every request with a [`ParamError`], as a backend that cannot
+    /// apply a sampling field does.
+    struct RefusingGen;
+    impl ChatGenerator for RefusingGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            _on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            Err(ParamError {
+                param: "min_p",
+                message: "min_p is not supported by the test backend".into(),
+            }
+            .into())
+        }
+    }
+
+    /// A generator's [`ParamError`] is the request's fault: a 400 naming the field, and when
+    /// streaming a terminal error frame carrying the same, not a 500 or an anonymous failure.
+    #[tokio::test]
+    async fn a_generator_param_error_is_a_400_naming_the_field() {
+        let gen: Arc<dyn ChatGenerator> = Arc::new(RefusingGen);
+        let base = r#""model":"m","messages":[{"role":"user","content":"hi"}]"#;
+        let resp = post_chat(router_for(gen.clone()), &format!("{{{base}}}")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["param"], "min_p");
+        let resp = post_chat(router_for(gen), &format!(r#"{{{base},"stream":true}}"#)).await;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(r#""param":"min_p""#), "{text}");
+        assert!(text.contains("invalid_request_error"), "{text}");
+    }
+
     /// A generator whose `chat` PANICS mid-stream, which is not the same as returning `Err`: the
     /// unwind skips every arm of the `match res` below it, so before B23 the only thing that ran
     /// was `DoneGuard`'s `[DONE]`.
@@ -3939,6 +4373,10 @@ mod tests {
     impl ChatGenerator for PanicGen {
         fn status(&self) -> GeneratorStatus {
             cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
         }
 
         fn chat(
@@ -4381,6 +4819,96 @@ mod tests {
             .unwrap()
     }
 
+    /// A generator that counts how often the server asks for its vocabulary size.
+    struct VocabCountingGen(Arc<AtomicU64>);
+    impl ChatGenerator for VocabCountingGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            TEST_VOCAB
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_delta(Delta::Content("ok".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
+        }
+    }
+
+    /// The vocabulary size is asked for only when a request carries a `logit_bias` to check: a
+    /// request without one must not pay for it.
+    #[tokio::test]
+    async fn the_vocab_size_is_read_only_for_a_logit_bias() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let gen: Arc<dyn ChatGenerator> = Arc::new(VocabCountingGen(calls.clone()));
+        let base = r#""model":"m","messages":[{"role":"user","content":"hi"}]"#;
+        for extra in ["", r#","logit_bias":{}"#, r#","logit_bias":null"#] {
+            let resp = post_chat(router_for(gen.clone()), &format!("{{{base}{extra}}}")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "asked without a bias");
+        let body = format!(r#"{{{base},"logit_bias":{{"3":-100}}}}"#);
+        let resp = post_chat(router_for(gen), &body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "the bias was not checked");
+    }
+
+    /// The new request checks answer an OpenAI-shaped 400 naming the parameter, on a streaming
+    /// request as well — the `logit_bias` vocabulary check included, which needs the routed
+    /// generator — and the neutral values still get a reply.
+    #[tokio::test]
+    async fn unsupported_and_invalid_sampling_fields_are_400s() {
+        let gen: Arc<dyn ChatGenerator> = Arc::new(EchoGen("a"));
+        let base = r#""model":"m","messages":[{"role":"user","content":"hi"}]"#;
+        let vocab = TEST_VOCAB;
+        for stream in [false, true] {
+            for (extra, param) in [
+                (r#""n":2"#.to_string(), "n"),
+                (r#""logprobs":true"#.to_string(), "logprobs"),
+                (r#""top_logprobs":2"#.to_string(), "top_logprobs"),
+                (r#""min_p":2"#.to_string(), "min_p"),
+                (r#""logit_bias":{"1":-150}"#.to_string(), "logit_bias"),
+                (format!(r#""logit_bias":{{"{vocab}":-100}}"#), "logit_bias"),
+                (
+                    r#""logit_bias":{"5":-100,"+5":-100}"#.to_string(),
+                    "logit_bias",
+                ),
+                (r#""n":"2""#.to_string(), "n"),
+                (r#""top_logprobs":1.5"#.to_string(), "top_logprobs"),
+            ] {
+                let body = format!(r#"{{{base},"stream":{stream},{extra}}}"#);
+                let resp = post_chat(router_for(gen.clone()), &body).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(v["error"]["type"], "invalid_request_error", "{body}");
+                assert_eq!(v["error"]["param"], param, "{body}");
+            }
+        }
+        let last = vocab - 1;
+        let body = format!(
+            r#"{{{base},"n":1.0,"logprobs":false,"top_logprobs":0,"min_p":0.1,
+                "logit_bias":{{"{last}":-100}}}}"#
+        );
+        let resp = post_chat(router_for(gen), &body).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{body}");
+    }
+
     fn router_for(generator: Arc<dyn ChatGenerator>) -> Router {
         build_router(AppState::new(
             generator,
@@ -4396,6 +4924,10 @@ mod tests {
     impl ChatGenerator for CachedPrefixGen {
         fn status(&self) -> GeneratorStatus {
             cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
         }
 
         fn chat(
@@ -4480,6 +5012,10 @@ mod tests {
     impl ChatGenerator for OverflowGen {
         fn status(&self) -> GeneratorStatus {
             cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
         }
 
         fn chat(
@@ -4649,6 +5185,10 @@ mod tests {
     impl ChatGenerator for HangGen {
         fn status(&self) -> GeneratorStatus {
             cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
         }
 
         fn chat(

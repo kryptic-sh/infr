@@ -206,7 +206,8 @@ impl Constraint {
 /// `penalties`, when a request sets any, are applied to `logits` before the mask, as they are on
 /// an unconstrained step, and every token this step emits is recorded in them, forced ones
 /// included: a forced tool call honours `frequency_penalty`/`presence_penalty`/`repeat_penalty`
-/// like any other generation (llama.cpp applies penalties and the grammar together). A penalty
+/// like any other generation (llama.cpp applies penalties and the grammar together). The
+/// request's `logit_bias` travels in the same state and is applied with them. A penalty or bias
 /// keeps a finite logit finite (see [`crate::sampling::Penalties::apply`]), so it can reorder the
 /// grammar-legal tokens but never mask one out, and "mask exhausted" still means the grammar
 /// itself allows nothing.
@@ -478,6 +479,7 @@ mod tests {
             temp: 0.0,
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
         };
         let run = |mut penalties: Option<&mut crate::sampling::Penalties>| -> Vec<u32> {
             let env = build_tok_env(&tok, vocab, &[eos]).expect("tok env");
@@ -529,6 +531,77 @@ c: \"a\" | \"b\""
         );
     }
 
+    /// **`logit_bias` reaches a constrained generation.** The same four-letter `a`/`b` grammar
+    /// over logits that prefer `a`: banning `a` must make every position `b`, greedy and
+    /// sampled.
+    #[test]
+    fn a_constrained_step_applies_logit_bias() {
+        let tok = byte_tokenizer();
+        let vocab = tok.get_vocab_size(true);
+        let id = |s: &str| tok.token_to_id(s).expect("single-byte token");
+        let (a, b, eos) = (id("a"), id("b"), id("z"));
+        let run = |bias: Vec<(u32, f32)>, sampler: crate::sampling::Sampler, seed: u64| {
+            let ctx = crate::sampling::RequestCtx::new(crate::sampling::RequestSampling {
+                logit_bias: bias,
+                ..Default::default()
+            });
+            let mut p = crate::sampling::Penalties::resolve(Some(&ctx)).expect("bias active");
+            let env = build_tok_env(&tok, vocab, &[eos]).expect("tok env");
+            let grammar = TopLevelGrammar::from_lark(
+                "start: c c c c
+c: \"a\" | \"b\""
+                    .to_string(),
+            );
+            let mut c = Constraint::new(env, grammar).expect("constraint");
+            let mut rng = seed;
+            let mut out = Vec::new();
+            for _ in 0..8 {
+                let mut logits = vec![0.0f32; vocab];
+                logits[a as usize] = 1.0;
+                logits[b as usize] = 0.9;
+                let (step, done) = constrained_step(
+                    &mut c,
+                    &mut logits,
+                    &[eos],
+                    sampler,
+                    &mut rng,
+                    usize::MAX,
+                    Some(&mut p),
+                )
+                .expect("constrained step");
+                out.extend(step);
+                if done || out.len() >= 4 {
+                    break;
+                }
+            }
+            out
+        };
+        let greedy = crate::sampling::Sampler {
+            temp: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+        };
+        let sampled = crate::sampling::Sampler {
+            temp: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+        };
+        assert_eq!(
+            run(vec![(a, -100.0)], greedy, 1),
+            [b, b, b, b],
+            "a banned token was drawn under a grammar at temperature 0"
+        );
+        for seed in 1..=64 {
+            assert_eq!(
+                run(vec![(a, -100.0)], sampled, seed),
+                [b, b, b, b],
+                "seed {seed}: a banned token was drawn under a grammar"
+            );
+        }
+    }
+
     /// Tokens the grammar FORCES are emitted without a draw, and they must reach the penalty state
     /// too. The env is canonical and the grammar a fixed literal, which is what makes llguidance
     /// fast-forward (see [`a_forced_run_is_cut_to_the_budget`]).
@@ -555,6 +628,7 @@ c: \"a\" | \"b\""
             temp: 0.0,
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
         };
         let mut logits = vec![0.0f32; vocab];
         let (step, _) = constrained_step(
@@ -670,6 +744,7 @@ c: \"a\" | \"b\""
             temp: 0.0,
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
         };
         // temp==0 is deterministic regardless of seed.
         assert_eq!(
@@ -685,6 +760,7 @@ c: \"a\" | \"b\""
             temp: 1.2,
             top_k: 0,
             top_p: 0.95,
+            min_p: 0.0,
         };
         let a = run(sampled, 12345);
         let b = run(sampled, 12345);
@@ -737,6 +813,7 @@ c: \"a\" | \"b\""
             temp: 0.0,
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
         };
         let step = |c: &mut Constraint, budget: usize| {
             let mut logits = vec![0.0f32; cfg.vocab];

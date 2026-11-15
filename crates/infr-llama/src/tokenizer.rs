@@ -1052,12 +1052,14 @@ mod tokenizer_tests {
             temp: 0.0,
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
         };
         assert_eq!(sample_logits(&logits, greedy, &mut rng), 1);
         let topk1 = Sampler {
             temp: 1.0,
             top_k: 1,
             top_p: 1.0,
+            min_p: 0.0,
         };
         assert_eq!(sample_logits(&logits, topk1, &mut rng), 1);
         // top_k=2 → only the two largest logits (indices 1 and 3) can ever be sampled.
@@ -1065,6 +1067,7 @@ mod tokenizer_tests {
             temp: 1.0,
             top_k: 2,
             top_p: 1.0,
+            min_p: 0.0,
         };
         for _ in 0..200 {
             let id = sample_logits(&logits, topk2, &mut rng);

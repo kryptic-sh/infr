@@ -202,9 +202,14 @@ impl ChatModel for SpecMetalChat {
         &mut self,
         prompt: &str,
         max_new: usize,
-        _req: Option<&crate::sampling::RequestCtx>,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        // `generate_metal_spec` takes no request state: it decodes greedily on the process
+        // sampler, so a request's logit bias or min-p would be ignored.
+        if let Some(r) = req {
+            r.sampling().refuse_seam_only_fields("Metal speculative")?;
+        }
         self.ensure_sessions()?;
         // Split borrows: sessions come out of the options for the call.
         let mut ts = self.target_session.take().unwrap();

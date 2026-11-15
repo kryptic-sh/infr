@@ -1707,6 +1707,9 @@ struct SeamGenerator {
     /// The backend label `/status` reports. Fixed at construction: reading anything off `model`
     /// would wait on its lock, which a generation holds for its whole run.
     backend: &'static str,
+    /// The model's logits row length (`Config::vocab`), read once at construction for the same
+    /// reason: the server's `logit_bias` id check asks for it on the request path.
+    vocab: usize,
 }
 
 impl SeamGenerator {
@@ -1721,6 +1724,7 @@ impl SeamGenerator {
     ) -> anyhow::Result<Self> {
         Ok(Self {
             backend,
+            vocab: model.render_model().config().vocab,
             model: std::sync::Mutex::new(model),
             renderer: infr_llama::chat::OaiRenderer::open_with_tokenizer(gguf_path, tok, cfg)?,
             watch: infr_llama::WeightWatch::open_model(gguf_path)?,
@@ -1734,6 +1738,8 @@ struct ParallelGenerator {
     engine: infr_llama::parallel::ParallelSeam,
     renderer: infr_llama::chat::OaiRenderer,
     watch: infr_llama::WeightWatch,
+    /// The model's logits row length, as for [`SeamGenerator`].
+    vocab: usize,
 }
 
 impl ParallelGenerator {
@@ -1745,6 +1751,7 @@ impl ParallelGenerator {
         cfg: Arc<Config>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
+            vocab: engine.model().config().vocab,
             engine,
             renderer: infr_llama::chat::OaiRenderer::open_with_tokenizer(gguf_path, tok, cfg)?,
             watch: infr_llama::WeightWatch::open_model(gguf_path)?,
@@ -1886,6 +1893,8 @@ fn request_sampling(p: &infr_server::GenParams) -> infr_llama::sampling::Request
         presence_penalty: p.presence_penalty.unwrap_or(0.0),
         frequency_penalty: p.frequency_penalty.unwrap_or(0.0),
         repeat_penalty: p.repeat_penalty.unwrap_or(1.0),
+        min_p: p.min_p,
+        logit_bias: p.logit_bias.clone(),
         ..Default::default()
     }
 }
@@ -1900,6 +1909,10 @@ impl infr_server::ChatGenerator for SeamGenerator {
             ctx_per_slot: None,
             memory: None,
         }
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab
     }
 
     fn chat(
@@ -1929,6 +1942,10 @@ impl infr_server::ChatGenerator for ParallelGenerator {
                 unified: vram.uma,
             }),
         }
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab
     }
 
     fn chat(
@@ -2025,6 +2042,7 @@ fn run_chat(
                 )
                 .map_err(|e| {
                     context_length_exceeded(&e, params.max_tokens.is_some())
+                        .or_else(|| unsupported_sampling(&e))
                         .unwrap_or_else(|| anyhow::anyhow!("forced tool call failed: {e}"))
                 })?;
             let (name, arguments) = forced_tool_call(&body).ok_or_else(|| {
@@ -2068,7 +2086,9 @@ fn run_chat(
                     }
                 })
                 .map_err(|e| {
-                    context_length_exceeded(&e, params.max_tokens.is_some()).unwrap_or(e)
+                    context_length_exceeded(&e, params.max_tokens.is_some())
+                        .or_else(|| unsupported_sampling(&e))
+                        .unwrap_or(e)
                 })?;
             // No stop fired: whatever the matcher was holding back was never a stop prefix.
             let tail = stops.flush();
@@ -2116,6 +2136,20 @@ fn chat_outcome(
         completion_tokens: stats.n_gen as u32,
         cached_tokens: stats.n_cached as u32,
     }
+}
+
+/// A backend's [`infr_llama::sampling::UnsupportedSampling`] as the server's
+/// [`infr_server::ParamError`], which it answers `400` naming the field; `None` for any other
+/// error.
+fn unsupported_sampling(e: &anyhow::Error) -> Option<anyhow::Error> {
+    let u = e.downcast_ref::<infr_llama::sampling::UnsupportedSampling>()?;
+    Some(
+        infr_server::ParamError {
+            param: u.param,
+            message: u.to_string(),
+        }
+        .into(),
+    )
 }
 
 /// The engine's [`infr_llama::ContextOverflow`] as the server's typed
@@ -4469,6 +4503,44 @@ mod tests {
         assert!(!tool_parsing_allowed(Some(&empty), None));
         assert!(tool_parsing_allowed(Some(&tools), None));
         assert!(!tool_parsing_allowed(Some(&tools), Some("none")));
+    }
+
+    /// A request's `min_p` and `logit_bias` reach the sequence's sampling scope; absent, they stay
+    /// off.
+    #[test]
+    fn request_sampling_carries_min_p_and_logit_bias() {
+        let p = infr_server::GenParams {
+            min_p: Some(0.1),
+            logit_bias: vec![(3, -100.0), (9, 2.0)],
+            ..Default::default()
+        };
+        let s = request_sampling(&p);
+        assert_eq!(s.min_p, Some(0.1));
+        assert_eq!(s.logit_bias, [(3, -100.0), (9, 2.0)]);
+        let s = request_sampling(&infr_server::GenParams::default());
+        assert_eq!(s.min_p, None);
+        assert!(!s.patches_logits());
+    }
+
+    /// A backend's refusal of a sampling field reaches the server as its `ParamError`, which it
+    /// answers 400 naming the field; other errors are left alone.
+    #[test]
+    fn unsupported_sampling_becomes_a_param_error() {
+        let e: anyhow::Error = infr_llama::sampling::UnsupportedSampling {
+            param: "logit_bias",
+            backend: "diffusion-gemma",
+        }
+        .into();
+        let mapped = unsupported_sampling(&e).expect("mapped");
+        let p = mapped
+            .downcast_ref::<infr_server::ParamError>()
+            .expect("a ParamError");
+        assert_eq!(p.param, "logit_bias");
+        assert_eq!(
+            p.message,
+            "logit_bias is not supported by the diffusion-gemma backend"
+        );
+        assert!(unsupported_sampling(&anyhow::anyhow!("boom")).is_none());
     }
 
     /// The forced-call parser accepts only a complete call. Every `None` here is now a failed

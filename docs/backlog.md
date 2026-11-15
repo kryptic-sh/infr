@@ -2751,6 +2751,10 @@ the per-token host path: a submit + wait, a full-vocab logits download and
 `sampling.rs`), no chaining. Estimated 5–10 % of tg on 8B-class, more on small
 models.
 
+A request with a `logit_bias` takes the same host path, and so does one with
+`min_p > 0` when `Op::Sample` would otherwise run (the kernel has no min-p cut;
+greedy keeps `Op::Argmax`, which min-p cannot change).
+
 Options: extend `Op::Sample` to full-vocab top-p (stage 1 emits per-workgroup
 max / rescaled sum-exp partials so the denominator is full-vocab; fall back to
 the host for the rare token whose top-`SAMPLE_KMAX` set does not reach `top_p`);
@@ -5736,8 +5740,7 @@ at the arena slot's address. What that slice did not do:
 
 ### B194 — the Qwen3-30B-A3B tests take host RAM low on the discrete GPU too (2026-11-15)
 
-**Tag:** test suite · host memory · **Blocked on:** the 30B re-run on `Vulkan0`
-under a memory watchdog (the user's), now that the main cause is fixed
+**Tag:** test suite · host memory · **Blocked on:** nothing
 
 The integrated-GPU half is done: `cpu_backend`'s `resident_room` /
 `need_resident_room!` skip a test that would hold a multi-GB model on a
@@ -5755,22 +5758,16 @@ working set only 0.22 to 0.26 GB, and it held through prefill, decode and idle.
 `paging.release_uploaded` (default on) now releases each resident weight's
 mapped pages after its upload (`TensorBytes::release_resident`,
 `infr_plat::mem::release_mapped`), and the same runs keep about 50 MiB mapped:
-available memory falls 0.33 GB instead of 3.6 GB for the F16 file. Not
-re-measured on Qwen3-30B-A3B; its resident expert banks take the same upload
-path, so `gpu_seam_golden_qwen3moe` should lose most of its 18 GB drop.
+available memory falls 0.33 GB instead of 3.6 GB for the F16 file. Re-run on
+`Vulkan0` at `9bc928cb` (2026-11-16): the filter
+`(test(gpu_seam) | test(paged)) & (test(moe) | test(ernie))` with
+`--run-ignored all --test-threads 1` passed 15 of 15, the Qwen3-30B-A3B and
+ERNIE-4.5-21B-A3B tests among them, and available memory sampled every 2 s over
+the whole run never fell below 24821 MiB. Only the minimum over the run was
+recorded, not a figure per test.
 
 What remains:
 
-- **The tests with a CPU leg.** The CPU backend reads weights through the
-  mapping, so a CPU leg faults the whole file into the working set by design,
-  and on the same `SeamModel` the GPU legs share that mapping.
-  `gpu_seam_paged_moe_matches_resident_and_cpu` fell from 34519 MiB to under 10
-  GB before the fix; how much of that was the CPU leg, the resident leg and the
-  paged leg's host tier is not measured. If it still runs low: drop each leg's
-  model before loading the next, or run the CPU leg from a separate `SeamModel`
-  dropped before the GPU legs.
-- **Not run on `Vulkan0`:** `gpu_seam_paged_moe_host_tier_matches_resident` and
-  the five ERNIE-4.5-21B-A3B GPU tests.
 - **Commit charge is still about the model's size.** `Private Bytes` of the same
   serve processes was 1.9 GB (Qwen3-1.7B), 2.7 GB (SmolLM3) and 4.1 GB (LFM3
   F16) with a private working set of about 0.24 GB in each, with or without the
@@ -5800,9 +5797,7 @@ What remains:
   binder releases again, so a CPU resident on the same model re-faults the file
   after each one-shot GPU call, and a re-upload after a state reset reads from
   standby or disk; a tied `token_embd.weight` read by the host gather is
-  released and then faulted back whole once. The 18.5 GB Qwen3-30B-A3B case on
-  `Vulkan0` has not been run with the release: expected a drop of 1-2 GB in
-  available memory in place of 18 GB, not measured.
+  released and then faulted back whole once.
 
 ### B195 — sampling and constrained decoding: what a first full read found (2026-11-15)
 
@@ -5844,13 +5839,25 @@ shader bodies.
   `repeat_last_n` is not a request field. **Needs a decision:** match llama.cpp,
   or keep the OpenAI reading for presence/frequency and seed only the repeat
   window from the prompt. Fix the doc either way.
-- **`logit_bias`, `min_p`, `logprobs` and `n` are accepted and ignored.**
-  `ChatRequest` tolerates unknown fields by design and none of these reaches
-  `GenParams`: a token banned with `logit_bias` can still appear, `n: 3` returns
-  one choice. B137 records the same for `response_format`. Options: implement
-  `logit_bias` beside `Penalties::apply` (forcing host sampling as penalties
-  do), return 400 for `n > 1` and `logprobs`, or record them as deliberate
-  drops.
+- **What is left of `logit_bias`, `min_p`, `logprobs` and `n`.** `infr serve`
+  now applies `logit_bias` (in `Penalties::apply`, ahead of the penalties) and
+  `min_p` (in `truncated_softmax`) on the dense seam decode loop, and answers
+  `n > 1`, `logprobs: true` and `top_logprobs > 0` with a 400. Still open:
+  DiffusionGemma's denoise sampler and `SpecMetalChat` apply neither, and now
+  refuse a request carrying either (`refuse_seam_only_fields`, a 400) — applying
+  them there is separate work, and both still ignore the penalties without a
+  word; the parked MTP paths read only the process sampler; `infr run` has no
+  `--min-p`, which needs a `sampling.min_p` config key, its env and manifest
+  entries and the flag, and the GGUF's `general.sampling.min_p` is still ignored
+  (see `unapplied_sampling_keys`). Returning several choices or log
+  probabilities is feature work nobody has asked for. `sample_from_dist` (MTP's
+  draw over `truncated_dist`, id order when `top_p` is 1) keeps the zero-draw
+  shape `sample_logits` was fixed for: a uniform of exactly 0 takes the lowest
+  id with any mass. `top_k` is still typed `Option<i64>`, so `"top_k": 40.0` or
+  a string is a body-parse 400 that names no parameter, where `n` and
+  `top_logprobs` now name theirs. The `SpecMetalChat` refusal compiles only on
+  macOS and has not been built or run. B137 records `response_format`, still
+  accepted and ignored.
 - **MTP's `residual_dist` is quadratic in the support.** `dist_prob` is a linear
   search and `residual_dist` (`seam/model.rs`) calls it per entry, so two
   distributions spanning the vocabulary cost about the square of its size per

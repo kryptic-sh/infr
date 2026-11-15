@@ -1656,10 +1656,11 @@ pub(crate) fn generate_dense_backend_bound(
     // GPU-sampling ops bake the sampler config into the graph.
     let sampler = crate::sampling::Sampler::resolve(req, &ec.sampling);
     let mut rng = crate::sampling::resolve_seed(req, &ec.sampling);
-    // Repetition penalties (`infr serve`'s presence/frequency/repeat request fields). `None` for
-    // every non-serve caller AND for any request that leaves them at their neutral defaults — see
-    // `Penalties::resolve`. When active they must MUTATE the logits row, so they force the host
-    // sampling path below (exactly like a grammar constraint does).
+    // Repetition penalties and `logit_bias` (`infr serve`'s presence/frequency/repeat and
+    // logit_bias request fields). `None` for every non-serve caller AND for any request that leaves
+    // them at their neutral defaults — see `Penalties::resolve`. When active they must MUTATE the
+    // logits row, so they force the host sampling path below (exactly like a grammar constraint
+    // does).
     let mut penalties = crate::sampling::Penalties::resolve(req);
     let penalize = penalties.is_some();
     // GPU-resident greedy sampling (`Op::Argmax` appended to the decode graph): only the 4-byte
@@ -1674,10 +1675,13 @@ pub(crate) fn generate_dense_backend_bound(
     // inverse-CDF'd with a host-drawn uniform uploaded as 4 bytes/token — the host consumes the
     // SAME xorshift stream as the host sampler (`next_uniform`), so the two paths are
     // distribution-identical. Gate mirrors the kernel bound (2..=SAMPLE_KMAX); top_k == 0
-    // (full-vocab) and grammar-constrained decodes keep the host path. INFR_NO_GPU_SAMPLE = A/B.
+    // (full-vocab), a `min_p` cut (the kernel has none) and grammar-constrained decodes keep the
+    // host path. `gpu_argmax` needs no such guard: min-p always keeps the top token.
+    // INFR_NO_GPU_SAMPLE = A/B.
     let gpu_sample = !gpu_argmax
         && sampler.temp > 0.0
         && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
+        && sampler.min_p <= 0.0
         && constraint.is_none()
         && !penalize
         && caps.gpu_sample
@@ -6314,8 +6318,9 @@ pub(crate) fn generate_dense_backend_bound(
                     be.download(id_out, &mut idb).map_err(|e| anyhow!("{e}"))?;
                     u32::from_le_bytes(idb)
                 } else {
-                    // Serve-only: repetition penalties patch the row in place (no-op allocation-wise
-                    // — `penalties` is `None` on every other path, so this is one branch per token).
+                    // Serve-only: logit_bias and repetition penalties patch the row in place (no-op
+                    // allocation-wise — `penalties` is `None` on every other path, so this is one
+                    // branch per token).
                     if let Some(p) = penalties.as_ref() {
                         p.apply(&mut logits);
                     }
@@ -7726,6 +7731,136 @@ mod tests {
             ));
         }
         model
+    }
+
+    /// The tokens a CPU generation of the one-layer synthetic llama emits for `prompt` under
+    /// `sampling` — the serve path's request scope, through the real decode loop and its
+    /// device-sampling gates (the CPU backend runs `Op::Argmax` and `Op::Sample` as a GPU does).
+    fn llama_tokens(
+        g: &Gguf,
+        cfg: &Config,
+        prompt: &[u32],
+        sampling: crate::sampling::RequestSampling,
+    ) -> Vec<u32> {
+        let cpu = infr_cpu::CpuBackend::new();
+        let embd = std::sync::OnceLock::new();
+        let req = crate::sampling::RequestCtx::new(sampling);
+        let mut ec = EngineConfig::default();
+        ec.sampling.ignore_eos = true;
+        let (out, _) = super::generate_dense_backend(
+            &cpu,
+            &crate::seam::cpu_upload_bind(&cpu),
+            g,
+            cfg,
+            &ec,
+            TokenEmbd::new(&embd, g),
+            None,
+            prompt,
+            LLAMA_GEN,
+            |_| {},
+            &mut None,
+            64,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&req),
+        )
+        .expect("synthetic generation");
+        out
+    }
+
+    /// Tokens [`llama_tokens`] generates.
+    const LLAMA_GEN: usize = 8;
+
+    /// **`logit_bias` takes the sequence off device sampling.** Greedy decode would otherwise run
+    /// `Op::Argmax` and never download the row the bias patches, so the bias would be silently
+    /// ignored: the banned greedy token would still come out, and a forced token would not. The
+    /// observable is the token stream itself.
+    #[test]
+    fn logit_bias_reaches_a_device_sampled_decode() {
+        let (g, cfg) = open_synthetic("logit-bias", &llama_gguf("llama", None));
+        let prompt = [3u32, 1, 4, 1, 5];
+        let greedy = || crate::sampling::RequestSampling {
+            temp: Some(0.0),
+            ..Default::default()
+        };
+        let plain = llama_tokens(&g, &cfg, &prompt, greedy());
+        assert_eq!(plain.len(), LLAMA_GEN);
+        let first = plain[0];
+        let banned = llama_tokens(
+            &g,
+            &cfg,
+            &prompt,
+            crate::sampling::RequestSampling {
+                logit_bias: vec![(first, -100.0)],
+                ..greedy()
+            },
+        );
+        assert!(
+            !banned.contains(&first),
+            "token {first} was banned and still generated: {banned:?}"
+        );
+        let target = (first + 1) % Q35_VOCAB as u32;
+        let forced = llama_tokens(
+            &g,
+            &cfg,
+            &prompt,
+            crate::sampling::RequestSampling {
+                logit_bias: vec![(target, 100.0)],
+                ..greedy()
+            },
+        );
+        assert_eq!(
+            forced, [target; LLAMA_GEN],
+            "+100 did not force token {target}"
+        );
+    }
+
+    /// **`min_p` takes the sequence off device sampling**, which has no min-p cut. At temperature
+    /// 1.5 with top-k 8 (inside `Op::Sample`'s bound) the seeded run draws something other than
+    /// greedy; `min_p` 1 leaves only the top token, so the same request with it must reproduce
+    /// greedy exactly — it cannot if the device sampler drew the tokens.
+    #[test]
+    fn min_p_reaches_a_device_sampled_decode() {
+        let (g, cfg) = open_synthetic("min-p", &llama_gguf("llama", None));
+        let prompt = [3u32, 1, 4, 1, 5];
+        let greedy = llama_tokens(
+            &g,
+            &cfg,
+            &prompt,
+            crate::sampling::RequestSampling {
+                temp: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let sampled = |min_p| {
+            llama_tokens(
+                &g,
+                &cfg,
+                &prompt,
+                crate::sampling::RequestSampling {
+                    temp: Some(1.5),
+                    top_k: Some(8),
+                    top_p: Some(1.0),
+                    seed: Some(11),
+                    min_p,
+                    ..Default::default()
+                },
+            )
+        };
+        assert_ne!(
+            sampled(None),
+            greedy,
+            "this seed samples greedy anyway, so the test checks nothing"
+        );
+        assert_eq!(
+            sampled(Some(1.0)),
+            greedy,
+            "min_p 1 did not reach the sampler"
+        );
     }
 
     /// q/k/v projection biases are added on any arch whose reference builds through `build_qkv`,

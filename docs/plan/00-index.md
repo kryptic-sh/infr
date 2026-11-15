@@ -13,13 +13,14 @@ only when they are genuinely little work. Each is taken through the full recipe:
 CPU reference first, a logit comparison with llama.cpp, a CPU golden, then the
 GPU seam test.
 
-| Phase | What                                                                            | Status                |
-| ----- | ------------------------------------------------------------------------------- | --------------------- |
-| 01    | SmolLM3 (`smollm3`): near config-only                                           | done                  |
-| 02    | [ERNIE 4.5](02-ernie4-5.md) (`ernie4_5`, then `ernie4_5-moe`)                   | done; Metal awaits CI |
-| 03    | [LFM3](03-lfm3.md) (`lfm3`): recent, 1.7B                                       | done; Metal awaits CI |
-| 04    | [The MLA + indexer families](04-mla-indexer-families.md), Mistral Large 4 first | not started           |
-| 07    | [Mistral Large 4](07-mistral-large4.md) (`mistral-large4`): scoped, staged      | scoped                |
+| Phase | What                                                                                                  | Status                |
+| ----- | ----------------------------------------------------------------------------------------------------- | --------------------- |
+| 01    | SmolLM3 (`smollm3`): near config-only                                                                 | done                  |
+| 02    | [ERNIE 4.5](02-ernie4-5.md) (`ernie4_5`, then `ernie4_5-moe`)                                         | done; Metal awaits CI |
+| 03    | [LFM3](03-lfm3.md) (`lfm3`): recent, 1.7B                                                             | done; Metal awaits CI |
+| 04    | [The MLA + indexer families](04-mla-indexer-families.md), Mistral Large 4 first                       | not started           |
+| 07    | [Mistral Large 4](07-mistral-large4.md) (`mistral-large4`): scoped, staged                            | scoped                |
+| 09    | [DeepSeek V4 compressed tiers](09-deepseek-v4-compressed.md) (`deepseek4`), then DeepSeek performance | scoped                |
 
 ## Streaming and paging
 

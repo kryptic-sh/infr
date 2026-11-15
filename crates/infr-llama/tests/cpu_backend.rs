@@ -34,6 +34,102 @@ macro_rules! need_model {
     };
 }
 
+/// Host memory a model resident on a unified-memory device must still leave free. The gate runs
+/// on a box other sessions share, and a gate run on the integrated GPU that took the host down to
+/// its last few GB was killed for low memory and took other sessions' runs with it, so the floor
+/// is the headroom those sessions are owed, not what this run needs to finish.
+const UNIFIED_HOST_MARGIN: u64 = 12 << 30;
+
+/// Host bytes a resident load takes on a unified-memory device per byte of GGUF: the device copy,
+/// which is system RAM there, plus the mapped file pages the upload read through, which stay in the
+/// process's working set while the model is up. Measured on Windows on 2026-11-15 with the
+/// integrated GPU, each test run alone: Qwen3-30B-A3B Q4_K_M's 18.56 GB file took available memory
+/// from 38058 MiB to 3596 MiB (1.95 bytes per file byte), and ERNIE-4.5-21B-A3B Q4_K_M's 13.33 GB
+/// file from 35444 MiB to 11135 MiB (1.91), rounded up here.
+const UNIFIED_RESIDENT_FACTOR: u64 = 2;
+
+/// Whether a test may load a `model_bytes` model, given whether the device's memory is the host's
+/// (`unified`) and the host memory `available` now. `Err` carries why not.
+///
+/// A discrete device always runs: its VRAM is its own pool and the host only maps the file. A
+/// unified device runs when the load, priced at [`UNIFIED_RESIDENT_FACTOR`] per file byte, leaves
+/// [`UNIFIED_HOST_MARGIN`] free, and skips when it would not — or when the platform cannot say how
+/// much is free, since that is no evidence it fits.
+fn resident_verdict(unified: bool, available: Option<u64>, model_bytes: u64) -> Result<(), String> {
+    if !unified {
+        return Ok(());
+    }
+    let gb = |b: u64| b as f64 / 1e9;
+    let need = model_bytes
+        .saturating_mul(UNIFIED_RESIDENT_FACTOR)
+        .saturating_add(UNIFIED_HOST_MARGIN);
+    match available {
+        None => Err(format!(
+            "({:.1} GB) on a unified-memory device: no host-memory probe on this platform, so \
+             nothing shows it fits",
+            gb(model_bytes)
+        )),
+        Some(avail) if avail < need => Err(format!(
+            "({:.1} GB) on a unified-memory device needs {:.1} GB of host memory \
+             ({UNIFIED_RESIDENT_FACTOR} x the model + a {:.1} GB margin); {:.1} GB available",
+            gb(model_bytes),
+            gb(need),
+            gb(UNIFIED_HOST_MARGIN),
+            gb(avail)
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The model at `path`'s size on disk, summed over every shard of a split GGUF (opening any one
+/// shard opens the whole set).
+fn model_file_bytes(path: &std::path::Path) -> u64 {
+    infr_gguf::Gguf::open(path)
+        .expect("open gguf")
+        .shards()
+        .iter()
+        .map(|&(_, len)| len)
+        .sum()
+}
+
+/// [`resident_verdict`] for a `model_bytes` model on `dev`, with the reason naming the device. The
+/// unified flag is the device listing's `integrated`, the same device-type test the Vulkan backend
+/// sets `Capabilities::unified_memory` from, so nothing is allocated before the decision.
+fn device_room(dev: &infr_vulkan::DeviceInfo, model_bytes: u64) -> Result<(), String> {
+    resident_verdict(
+        dev.integrated,
+        infr_core::hostmem::available_bytes(),
+        model_bytes,
+    )
+    .map_err(|why| format!("{why}, on Vulkan{} ({})", dev.index, dev.name))
+}
+
+/// [`device_room`] for the model at `path` on the device these tests load on (`INFR_DEV`, else the
+/// default pick). A device listing that fails decides nothing: the load reports that failure
+/// itself, as it did before this check.
+fn resident_room(path: &std::path::Path) -> Result<(), String> {
+    let mut cfg = infr_llama::EngineConfig::default();
+    cfg.device.dev = std::env::var("INFR_DEV").ok();
+    let Some(dev) = infr_vulkan::VulkanBackend::enumerate_devices(&cfg)
+        .ok()
+        .and_then(|devs| devs.into_iter().find(|d| d.is_default_pick))
+    else {
+        return Ok(());
+    };
+    device_room(&dev, model_file_bytes(path))
+}
+
+/// Self-skip a test that needs the model at `$path` loaded when [`resident_room`] says the device
+/// cannot hold it without starving the host, printing the reason as a `skip:` line.
+macro_rules! need_resident_room {
+    ($path:expr, $what:expr) => {
+        if let Err(why) = resident_room(&$path) {
+            eprintln!("skip: {} {why}", $what);
+            return;
+        }
+    };
+}
+
 /// Serialize the model-gated GPU tests against each other.
 ///
 /// No test in this file drives a knob through the environment any more — the last one,
@@ -87,6 +183,28 @@ fn kv_types(cfg: &mut infr_llama::EngineConfig, k: &str, v: &str) {
     cfg.kv.type_k_specified = true;
     cfg.kv.type_v = infr_core::budget::parse_kv_dtype(v);
     cfg.kv.type_v_specified = true;
+}
+
+/// The residency rule decides without a GPU: discrete always runs, unified runs only with room for
+/// the load and the margin, and an unknown amount of free memory never counts as room.
+#[test]
+fn resident_verdict_skips_only_what_starves_a_unified_host() {
+    let model: u64 = 16 << 30;
+    let need = model * UNIFIED_RESIDENT_FACTOR + UNIFIED_HOST_MARGIN;
+
+    // A discrete device runs whatever the host has, even nothing or an unknown amount.
+    assert!(resident_verdict(false, Some(0), model).is_ok());
+    assert!(resident_verdict(false, None, model).is_ok());
+    // A unified device runs exactly at the boundary and skips a byte short of it.
+    assert!(resident_verdict(true, Some(need), model).is_ok());
+    let why = resident_verdict(true, Some(need - 1), model).expect_err("a byte short must skip");
+    assert!(why.contains("available"), "reason names the memory: {why}");
+    // Room for the model alone, without the margin, is not room.
+    assert!(resident_verdict(true, Some(model * UNIFIED_RESIDENT_FACTOR), model).is_err());
+    // A model a quarter the size runs on what was a byte short for the larger one.
+    assert!(resident_verdict(true, Some(need - 1), model / 4).is_ok());
+    // No probe on a unified device is a skip, not a pass.
+    assert!(resident_verdict(true, None, model / 4).is_err());
 }
 
 // ─── CPU-only correctness (no GPU) ───────────────────────────────────────────────
@@ -1453,6 +1571,7 @@ fn metal_kv_scratch_paths_are_coherent() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma4() {
     let path = need_model!(gemma4_12b(), "gemma-4-12b");
+    need_resident_room!(path, "gemma-4-12b");
     let mut _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 12);
 }
@@ -1543,6 +1662,7 @@ fn gpu_seam_streamed_e2b_stays_chunk_major() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
+    need_resident_room!(path, "Qwen3-30B-A3B");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let rendered = model
@@ -1951,6 +2071,7 @@ fn cpu_golden_ernie4_5_moe() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_ernie4_5_moe() {
     let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    need_resident_room!(path, "ERNIE-4.5-21B-A3B-PT");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let rendered = model
@@ -2002,6 +2123,7 @@ fn gpu_seam_matches_cpu_ernie4_5_moe() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_ernie4_5_moe_tokens() {
     let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    need_resident_room!(path, "ERNIE-4.5-21B-A3B-PT");
     let mut _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "Count from one to twenty in words.", 32);
 }
@@ -2022,6 +2144,7 @@ fn gpu_seam_matches_cpu_ernie4_5_moe_tokens() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_ernie4_5_moe_matches_resident() {
     let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    need_resident_room!(path, "ERNIE-4.5-21B-A3B-PT");
     let mut _tlk = test_serial_lock();
     let n = 16usize;
     let pin_ubatch = |c: &mut infr_llama::EngineConfig| {
@@ -2101,6 +2224,7 @@ fn paged_generation(
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_moe_fills_until_wholly_resident() {
     let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    need_resident_room!(path, "ERNIE-4.5-21B-A3B-PT");
     let mut _tlk = test_serial_lock();
     const N: usize = 32;
     // Generations in a row with no new fill before the fills count as stuck, and the backstop.
@@ -2209,6 +2333,7 @@ fn gpu_seam_paged_moe_fills_until_wholly_resident() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_ernie4_5_moe_decode_replays_from_one_recording() {
     let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    need_resident_room!(path, "ERNIE-4.5-21B-A3B-PT");
     let mut _tlk = test_serial_lock();
     let (recordings, n_gen) = vulkan_decode_recordings(&path);
     assert!(n_gen > 1, "too few tokens decoded to tell the paths apart");
@@ -3218,10 +3343,25 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
         .generate_cpu_ids(&prompt_ids, n, |id| cpu_ids.push(id))
         .expect("cpu gen");
 
-    let mut resident_ids = Vec::new();
-    model
-        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
-        .expect("resident gpu gen");
+    // Where a resident copy would starve a unified-memory host (`resident_room`), the paged run
+    // is held to the CPU reference alone: it needs no device copy, and it is independent of the
+    // pager, so the paged leg keeps a real bar.
+    let resident_ids = match resident_room(&path) {
+        Ok(()) => {
+            let mut ids = Vec::new();
+            model
+                .generate_vulkan_ids(&prompt_ids, n, |id| ids.push(id))
+                .expect("resident gpu gen");
+            Some(ids)
+        }
+        Err(why) => {
+            eprintln!(
+                "skip: the all-resident leg (the paged run is compared with the CPU reference \
+                 only, which can split from the GPU on a near tie), Qwen3-30B-A3B {why}"
+            );
+            None
+        }
+    };
 
     // 0.05 GB is far below what even ONE Q4_K_M expert layer's gate+up+down banks need — guarantees
     // real eviction pressure across the model's 48 MoE layers.
@@ -3238,13 +3378,22 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
         .generate_vulkan_ids(&prompt_ids, n, |id| paged_ids.push(id))
         .expect("paged gpu gen");
 
+    let resident_ok = resident_ids.is_some();
+    if let Some(resident_ids) = resident_ids {
+        assert_eq!(
+            paged_ids, resident_ids,
+            "paged MoE diverged from the all-resident GPU run"
+        );
+    }
     assert_eq!(
-        paged_ids, resident_ids,
-        "paged MoE diverged from the all-resident GPU run"
-    );
-    assert_eq!(
-        paged_ids, cpu_ids,
-        "paged MoE diverged from the CPU reference"
+        paged_ids,
+        cpu_ids,
+        "paged MoE diverged from the CPU reference{}",
+        if resident_ok {
+            ""
+        } else {
+            " (no resident run to compare: it was skipped)"
+        }
     );
 }
 
@@ -3262,6 +3411,7 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_moe_host_tier_matches_resident() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
+    need_resident_room!(path, "Qwen3-30B-A3B");
     let mut _tlk = test_serial_lock();
     let n = 8usize;
 
@@ -3508,6 +3658,9 @@ fn qwen3_14b_q8() -> Option<PathBuf> {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
     let path = need_model!(qwen3_14b_q8(), "Qwen3-14B-Q8_0");
+    // The streamed leg's `paging.cache` budget is system RAM on a unified device too, so the whole
+    // test needs the room a resident load does.
+    need_resident_room!(path, "Qwen3-14B-Q8_0");
     let mut _tlk = test_serial_lock();
     let n = 8usize;
 
@@ -3756,6 +3909,7 @@ fn cpu_qwen35moe_prefill_finite() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen35moe() {
     let path = need_model!(qwen35moe_35b_a3b(), "Qwen3.6-35B-A3B");
+    need_resident_room!(path, "Qwen3.6-35B-A3B");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let tokens = model
@@ -3925,6 +4079,10 @@ fn cpu_llama4_scout_greedy() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_moe_matches_scout_oracle() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");
+    // Paged, not resident, but on a unified device the automatic placement fills the device heap
+    // from the same RAM, and the decode reads through the mapping of the whole file. Nothing has
+    // measured that cost, so it is held to the resident price rather than assumed cheaper.
+    need_resident_room!(path, "Llama-4-Scout (paged by automatic placement)");
     let mut _tlk = test_serial_lock();
     let model = model_cfg(&path, |c| c.paging.stats = true);
     let mut ids = model.encode("The capital of France is").expect("encode");
@@ -4028,6 +4186,7 @@ fn cpu_diffusion_gemma_prefill_finite() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_diffusion_gemma() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    need_resident_room!(path, "diffusiongemma-26B-A4B");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let tokens = model
@@ -4212,6 +4371,7 @@ fn cpu_diffusion_gemma_denoise_step() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    need_resident_room!(path, "diffusiongemma-26B-A4B");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let vocab = model.config().vocab;
@@ -4327,6 +4487,7 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_diffusion_gemma_denoise_replay_matches_static() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    need_resident_room!(path, "diffusiongemma-26B-A4B");
     // The guard now only serializes this GPU test against the others: BOTH halves of
     // `INFR_SEAM_NO_REPLAY` (the seam's replay gate and the Vulkan adapter's
     // `decode_eligible`) read the per-model `kernels.vulkan.no_replay`, so the mode is
@@ -4408,6 +4569,7 @@ fn gpu_diffusion_gemma_denoise_replay_matches_static() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn diffusion_gemma_decode_matches_oracle() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    need_resident_room!(path, "diffusiongemma-26B-A4B");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     assert!(
@@ -4798,6 +4960,15 @@ fn expert_parallel_matches_single_device() {
             devs.len()
         );
         return;
+    }
+    // The single-rank reference holds the whole model on the first device, so each device the run
+    // uses is priced at the whole model, not its share of the split.
+    let model_bytes = model_file_bytes(&path);
+    for dev in &devs[..2] {
+        if let Err(why) = device_room(dev, model_bytes) {
+            eprintln!("skip: expert_parallel_matches_single_device: Qwen3-30B-A3B {why}");
+            return;
+        }
     }
     let _tlk = test_serial_lock();
     // Force the id-indexed small-m expert path for both prefill and decode (light + deterministic),
@@ -5216,6 +5387,7 @@ fn cpu_deepseek2_prefill_finite() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_deepseek2() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
+    need_resident_room!(path, "DeepSeek-V2-Lite-Chat");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let tokens = model

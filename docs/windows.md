@@ -119,6 +119,17 @@ cargo test --release -p infr-vulkan -p infr-llama -- --include-ignored --test-th
 are much faster with `--release`. `--test-threads 1` keeps the GPU tests from
 contending for one device's memory.
 
+On an integrated GPU the device's memory is the host's, and a model held
+resident there costs more host RAM than its file size: the device copy plus the
+mapped file pages the upload read, priced at `UNIFIED_RESIDENT_FACTOR` per file
+byte. The `cpu_backend` tests that hold a multi-GB model resident check this
+first (`resident_room`): where the load would leave less than
+`UNIFIED_HOST_MARGIN` of host memory available, they print a `skip:` line naming
+the device, the model size and the memory found, and do not run.
+`gpu_seam_paged_moe_matches_resident_and_cpu` skips only its resident leg and
+still holds the paged run to the CPU reference. On a discrete GPU every one of
+them runs.
+
 On a small iGPU, do **not** enable the whole ignored suite. `bandwidth_probe`
 retains large allocations, `decode_gemv_bw` retains cache-busting workloads and
 unbounded repetition submissions, and `interconnect_probe` uses POSIX-only

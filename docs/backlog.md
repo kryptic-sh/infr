@@ -5644,27 +5644,40 @@ at the arena slot's address. What that slice did not do:
   on is unit-tested only); an f16 `w_off` (refused, as it is resident); the
   Metal backend (no pager, unchanged).
 
-### B194 — the Qwen3-30B-A3B GPU tests take nearly all host RAM on the iGPU (2026-11-15)
+### B194 — the Qwen3-30B-A3B tests take host RAM low on the discrete GPU too (2026-11-15)
 
-**Tag:** test suite · iGPU · **Blocked on:** nothing; needs a decision on what
-the iGPU leg should run
+**Tag:** test suite · host memory · **Blocked on:** a decision on how to bound
+the discrete-GPU runs
 
-On the Windows box's integrated GPU (`Vulkan1`, unified memory), the
-all-resident leg of `gpu_seam_paged_moe_host_tier_matches_resident` places
-Qwen3-30B-A3B Q4_K_M (18.5 GB of weights) in shared RAM, with the paged legs'
-host arenas on top. Run alone, it took available host memory from 37751 MB to a
-minimum of 3698 MB (`typeperf "\Memory\Available MBytes"` at 1 s, 75.5 s run,
-passed). A GPU gate run on `Vulkan1` with the
-`test(gpu_seam) | test(stream) | test(tier) | test(paged) | test(lfm3)` filter
-was killed by the agent harness for low memory on 2026-11-15. Of that filter's
-`test(stream) | test(tier)` GPU tests, each run alone and measured the same way,
-this is the only one near the limit (every other one kept 32307 MB or more
-available); the rest of the filter was not measured. It predates the
-float-streaming change that was being gated. The other Qwen3-30B-A3B
-`gpu_seam_paged_moe_*` tests in the same filter have the same resident leg and
-were not measured. Options: skip the resident leg on a unified device when the
-model exceeds a fraction of host RAM (the paged legs are the point there), or
-run the 30B tests on the discrete GPU only and say so in their doc.
+The integrated-GPU half is done: `cpu_backend`'s `resident_room` /
+`need_resident_room!` skip a test that would hold a multi-GB model on a
+unified-memory device unless `UNIFIED_RESIDENT_FACTOR` times the GGUF size plus
+`UNIFIED_HOST_MARGIN` is available (`docs/windows.md` has the rule). On
+`Vulkan1` every Qwen3-30B-A3B and ERNIE-4.5-21B-A3B GPU test now prints its
+`skip:` line at once, except `gpu_seam_paged_moe_matches_resident_and_cpu`,
+which skips only its resident leg and fell from 34815 MiB to a minimum of 25126
+MiB available (passed).
+
+What remains is the discrete GPU (`Vulkan0`, 24 GB VRAM). The host still maps
+and reads the whole file there, and nothing guards it. Run alone and sampled
+with `typeperf "\Memory\Available MBytes"` at 1 s:
+
+- `gpu_seam_golden_qwen3moe`: 34763 MiB at start, minimum 16458 MiB, passed.
+- `gpu_seam_paged_moe_matches_resident_and_cpu`: 34519 MiB at start, falling
+  about 0.5 GB/s through the CPU and resident legs; killed by the sampler's 12
+  GB stop rule at 10408 MiB (lowest sample 9259 MiB), so it did not finish and
+  its result on `Vulkan0` after this change is unverified. It printed no `skip:`
+  line.
+
+Not run on `Vulkan0` after the change:
+`gpu_seam_paged_moe_host_tier_matches_resident` and the five ERNIE-4.5-21B-A3B
+GPU tests, so "they still run and pass on the discrete GPU" is unverified for
+all of them. Why the mapped pages stay in the working set across legs (one
+process, one mapping per `SeamModel`, every leg's model alive until the test
+returns) is a guess, not measured. Options: price host-side mapped bytes on a
+discrete device too and skip below a margin; drop each leg's model before
+loading the next; run the CPU leg from a separate `SeamModel` that is dropped
+before the GPU legs.
 
 ### B195 — sampling and constrained decoding: what a first full read found (2026-11-15)
 

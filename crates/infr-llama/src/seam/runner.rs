@@ -6268,7 +6268,8 @@ pub(crate) fn generate_dense_backend_bound(
             }
             if let Some(cst) = constraint.as_deref_mut() {
                 // Grammar-forced span (serve's tool_choice "required"/named): the shared
-                // llguidance step. Empty step ⇒ the constrained span ended.
+                // llguidance step, which also applies and records the request's penalties.
+                // Empty step ⇒ the constrained span ended.
                 let (step, done) = crate::grammar::constrained_step(
                     cst,
                     &mut logits,
@@ -6276,6 +6277,7 @@ pub(crate) fn generate_dense_backend_bound(
                     sampler,
                     &mut rng,
                     max_new.saturating_sub(out.len()),
+                    penalties.as_mut(),
                 )
                 .map_err(|e| anyhow!("{e}"))?;
                 decode_t += step_t0.elapsed();

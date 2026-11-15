@@ -203,17 +203,26 @@ impl Constraint {
 /// so only its first `budget` are consumed — the grammar stays where those leave it — and an
 /// exhausted budget emits nothing.
 ///
+/// `penalties`, when a request sets any, are applied to `logits` before the mask, as they are on
+/// an unconstrained step, and every token this step emits is recorded in them, forced ones
+/// included: a forced tool call honours `frequency_penalty`/`presence_penalty`/`repeat_penalty`
+/// like any other generation (llama.cpp applies penalties and the grammar together). A penalty
+/// keeps a finite logit finite (see [`crate::sampling::Penalties::apply`]), so it can reorder the
+/// grammar-legal tokens but never mask one out, and "mask exhausted" still means the grammar
+/// itself allows nothing.
+///
 /// Returns `(tokens emitted this step, grammar finished)`; an EMPTY step means the constrained
 /// span is done (accepting EOS, mask exhausted, or no budget left). ONE implementation shared by
 /// the bespoke decode loop and both seam decode paths.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn constrained_step(
+pub(crate) fn constrained_step(
     c: &mut Constraint,
     logits: &mut [f32],
     eos_ids: &[u32],
     sampler: crate::sampling::Sampler,
     rng: &mut u64,
     budget: usize,
+    mut penalties: Option<&mut crate::sampling::Penalties>,
 ) -> Result<(Vec<u32>, bool)> {
     if budget == 0 {
         return Ok((Vec::new(), false));
@@ -222,8 +231,16 @@ pub fn constrained_step(
     if !forced.is_empty() {
         forced.truncate(budget);
         c.consume(&forced)?;
+        if let Some(p) = penalties {
+            for &t in &forced {
+                p.observe(t);
+            }
+        }
         let done = c.stopped();
         return Ok((forced, done));
+    }
+    if let Some(p) = penalties.as_deref() {
+        p.apply(logits);
     }
     c.apply_mask(logits)?;
     loop {
@@ -239,6 +256,9 @@ pub fn constrained_step(
             continue;
         }
         if c.try_accept(cand)? {
+            if let Some(p) = penalties.as_deref_mut() {
+                p.observe(cand);
+            }
             let done = c.stopped();
             return Ok((vec![cand], done));
         }
@@ -428,6 +448,137 @@ mod tests {
         assert_eq!(ENV_BUILDS.with(|n| n.get()) - before, 1);
     }
 
+    /// A request's frequency penalty, as `infr serve` builds it.
+    fn frequency_penalty(f: f32) -> crate::sampling::RequestCtx {
+        crate::sampling::RequestCtx::new(crate::sampling::RequestSampling {
+            frequency_penalty: f,
+            ..Default::default()
+        })
+    }
+
+    /// How far `penalties` push each of `ids` down from a zero logit.
+    fn pushed_down(penalties: &crate::sampling::Penalties, ids: &[u32], vocab: usize) -> Vec<f32> {
+        let mut row = vec![0.0f32; vocab];
+        penalties.apply(&mut row);
+        ids.iter().map(|&i| row[i as usize]).collect()
+    }
+
+    /// **Penalties reach a constrained generation.** A grammar of four letters, each `a` or `b`,
+    /// over logits that prefer `a` slightly: greedy picks `aaaa` with no penalty, and a frequency
+    /// penalty must push the repeated `a` below `b`, so the run alternates. The penalty state must
+    /// also have seen every constrained token. Before the fix the constrained step neither applied
+    /// nor recorded penalties, so both runs came out `aaaa` and the state stayed empty.
+    #[test]
+    fn a_constrained_step_applies_and_records_penalties() {
+        let tok = byte_tokenizer();
+        let vocab = tok.get_vocab_size(true);
+        let id = |s: &str| tok.token_to_id(s).expect("single-byte token");
+        let (a, b, eos) = (id("a"), id("b"), id("z"));
+        let greedy = crate::sampling::Sampler {
+            temp: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        let run = |mut penalties: Option<&mut crate::sampling::Penalties>| -> Vec<u32> {
+            let env = build_tok_env(&tok, vocab, &[eos]).expect("tok env");
+            let grammar = TopLevelGrammar::from_lark(
+                "start: c c c c
+c: \"a\" | \"b\""
+                    .to_string(),
+            );
+            let mut c = Constraint::new(env, grammar).expect("constraint");
+            let mut out = Vec::new();
+            for _ in 0..8 {
+                let mut logits = vec![0.0f32; vocab];
+                logits[a as usize] = 1.0;
+                logits[b as usize] = 0.9;
+                let (step, done) = constrained_step(
+                    &mut c,
+                    &mut logits,
+                    &[eos],
+                    greedy,
+                    &mut 1,
+                    usize::MAX,
+                    penalties.as_deref_mut(),
+                )
+                .expect("constrained step");
+                out.extend(step);
+                if done || out.len() >= 4 {
+                    break;
+                }
+            }
+            out
+        };
+
+        assert_eq!(
+            run(None),
+            [a, a, a, a],
+            "without a penalty greedy repeats `a`"
+        );
+        let ctx = frequency_penalty(1.0);
+        let mut p = crate::sampling::Penalties::resolve(Some(&ctx)).expect("penalty active");
+        assert_eq!(
+            run(Some(&mut p)),
+            [a, b, a, b],
+            "a frequency penalty must steer the constrained run off the repeated token"
+        );
+        assert_eq!(
+            pushed_down(&p, &[a, b], vocab),
+            [-2.0, -2.0],
+            "the penalty state did not see the constrained tokens"
+        );
+    }
+
+    /// Tokens the grammar FORCES are emitted without a draw, and they must reach the penalty state
+    /// too. The env is canonical and the grammar a fixed literal, which is what makes llguidance
+    /// fast-forward (see [`a_forced_run_is_cut_to_the_budget`]).
+    #[test]
+    fn forced_tokens_reach_the_penalty_state() {
+        // No prefix space: llguidance tokenizes the literal to fast-forward it, and a leading
+        // space token would not be the grammar's first byte.
+        let mut tok = byte_tokenizer();
+        tok.with_pre_tokenizer(Some(
+            tokenizers::pre_tokenizers::byte_level::ByteLevel::default().add_prefix_space(false),
+        ));
+        let vocab = tok.get_vocab_size(true);
+        let eos = tok.token_to_id("z").expect("single-byte token");
+        let json = tok.to_string(false).expect("serialize tokenizer");
+        let mut bt = ByteTokenizer::from_json_bytes(json.as_bytes()).expect("byte tokenizer");
+        bt.set_eos_tokens(&[eos]);
+        let env: TokEnv =
+            Arc::new(ByteTokenizerEnv::new(bt, Some(vocab)).expect("canonical tok env"));
+        let grammar = TopLevelGrammar::from_lark("start: \"abab\"".to_string());
+        let mut c = Constraint::new(env, grammar).expect("constraint");
+        let ctx = frequency_penalty(1.0);
+        let mut p = crate::sampling::Penalties::resolve(Some(&ctx)).expect("penalty active");
+        let greedy = crate::sampling::Sampler {
+            temp: 0.0,
+            top_k: 0,
+            top_p: 1.0,
+        };
+        let mut logits = vec![0.0f32; vocab];
+        let (step, _) = constrained_step(
+            &mut c,
+            &mut logits,
+            &[eos],
+            greedy,
+            &mut 1,
+            usize::MAX,
+            Some(&mut p),
+        )
+        .expect("constrained step");
+        assert!(step.len() >= 2, "the literal must force a run: {step:?}");
+        let counts: Vec<f32> = step
+            .iter()
+            .map(|t| -(step.iter().filter(|&u| u == t).count() as f32))
+            .collect();
+        assert_eq!(
+            pushed_down(&p, &step, vocab),
+            counts,
+            "a forced token was not recorded"
+        );
+    }
+
     fn qwen3_06b() -> Option<PathBuf> {
         crate::test_hub_gguf("unsloth/Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_K_M.gguf")
     }
@@ -501,6 +652,7 @@ mod tests {
                     sampler,
                     &mut rng,
                     usize::MAX,
+                    None,
                 )
                 .expect("constrained step");
                 if step.is_empty() {
@@ -588,7 +740,7 @@ mod tests {
         };
         let step = |c: &mut Constraint, budget: usize| {
             let mut logits = vec![0.0f32; cfg.vocab];
-            constrained_step(c, &mut logits, &[cfg.eos], greedy, &mut 1, budget)
+            constrained_step(c, &mut logits, &[cfg.eos], greedy, &mut 1, budget, None)
                 .expect("constrained step")
         };
 

@@ -385,6 +385,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Penalties apply under a forced tool call.** With `tool_choice` set to
+  `"required"` or a named function, `frequency_penalty`, `presence_penalty` and
+  `repeat_penalty` were silently ignored: the grammar-constrained step neither
+  applied them to the logits nor recorded the tokens it emitted. It now does
+  both, forced tokens included, as llama.cpp does. A penalty extreme enough to
+  overflow a logit (a `repeat_penalty` near zero passes validation) now
+  saturates it instead of turning it to ±inf, which made every probability NaN
+  so the draw fell through to the least likely token.
+- **`top_p: 1` with top-k off no longer sorts the vocabulary every token.** With
+  no top-k cut (the default for Llama-3.x, Llama-4 and SmolLM3) and `top_p` of
+  1, the host sampler sorted the whole vocabulary on each token to build a
+  nucleus that keeps everything. It now takes the whole distribution in one
+  pass, as llama.cpp does. The sampling distribution is the same up to tail
+  tokens whose mass is below f32 resolution, which the sorted pass could cut and
+  this one keeps; the token drawn for a given `seed` changes in this case.
 - **F16 and F32 dense weights stream on Vulkan.** The dense streaming planner
   took only the native quant and bf16 formats, so an f16 or f32 checkpoint had
   no streamable weights: a capped `paging.cache` (`INFR_CACHE`) was silently

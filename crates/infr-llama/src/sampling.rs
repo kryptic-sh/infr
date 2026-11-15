@@ -396,6 +396,9 @@ impl Penalties {
     /// Skipping is the right failure mode because a penalty is a soft PREFERENCE, not a
     /// correctness constraint: an id outside the row cannot be sampled from that row at all, so
     /// dropping its nudge changes nothing about the outcome, while panicking kills a live request.
+    ///
+    /// A finite logit stays finite and a `-inf` one stays `-inf`: the grammar-constrained step
+    /// relies on that to tell a penalized token from a masked one.
     pub(crate) fn apply(&self, logits: &mut [f32]) {
         if self.repeat != 1.0 && self.last_n > 0 {
             // llama.cpp's `penalties` sampler scales each DISTINCT id in the window ONCE — a token
@@ -409,17 +412,32 @@ impl Penalties {
                 let Some(l) = logits.get_mut(t as usize) else {
                     continue; // id past the end of this row — unsamplable here, so nothing to bias
                 };
-                *l = if *l > 0.0 {
+                let scaled = if *l > 0.0 {
                     *l / self.repeat
                 } else {
                     *l * self.repeat
+                };
+                // `repeat` is any finite positive value, so an extreme one can overflow a finite
+                // logit to ±inf. Saturate instead: under a grammar an infinite logit reads as
+                // masked (or swamps the softmax), and a penalty must only reorder tokens.
+                *l = if l.is_finite() {
+                    scaled.clamp(f32::MIN, f32::MAX)
+                } else {
+                    scaled
                 };
             }
         }
         if self.presence != 0.0 || self.frequency != 0.0 {
             for (&t, &n) in &self.counts {
                 if let Some(l) = logits.get_mut(t as usize) {
-                    *l -= self.presence + self.frequency * n as f32;
+                    let shifted = *l - (self.presence + self.frequency * n as f32);
+                    // Saturate here too, for the same reason as the repeat scale above: the
+                    // server bounds these two, but a library caller can pass any value.
+                    *l = if l.is_finite() {
+                        shifted.clamp(f32::MIN, f32::MAX)
+                    } else {
+                        shifted
+                    };
                 }
             }
         }
@@ -499,17 +517,21 @@ const NUCLEUS_PROBE_K: usize = 1024;
 
 /// Widening factor when [`NUCLEUS_PROBE_K`] candidates did not reach `top_p`.
 ///
-/// `top_p = 1.0` legitimately wants the WHOLE vocab (and a near-uniform row wants it even at
-/// top_p 0.9), so the widening path is live code, not a defensive branch — it just has to get
-/// there in few passes, because each pass re-runs the O(n) selection. Doubling takes 8 passes to
-/// cross 128256 from 1024; ×8 takes 2 (1024 → 8192 → n, see the `n / 2` snap below). Measured at
-/// n = 128256 / top_p = 1.0: ×2 = 4.54ms per call, ×8 = 3.22ms, old heap = 5.27ms.
+/// A near-uniform row can want the WHOLE vocab even at top_p 0.9, so the widening path is live
+/// code, not a defensive branch — it just has to get there in few passes, because each pass
+/// re-runs the O(n) selection. Doubling takes 8 passes to cross 128256 from 1024; ×8 takes 2
+/// (1024 → 8192 → n, see the `n / 2` snap below). Measured at n = 128256 / top_p = 1.0, back when
+/// that case still came through here: ×2 = 4.54ms per call, ×8 = 3.22ms, old heap = 5.27ms.
+/// `top_p >= 1` now skips the selection entirely (see [`truncated_softmax`]).
 const NUCLEUS_WIDEN: usize = 8;
 
 /// Build the truncated, normalized sampling support shared by [`sample_logits`] and
 /// [`truncated_dist`]: top-k select, temperature softmax, normalize, then the top-p (nucleus)
-/// cutoff. Returns `(idx, probs)` — parallel, descending by logit, ALREADY truncated to the
-/// nucleus, with `probs` normalized over the selected support (so it sums to ≤1, the nucleus mass).
+/// cutoff. Returns `(idx, probs)` — parallel, ALREADY truncated to the nucleus, with `probs`
+/// normalized over the selected support (so it sums to ≤1, the nucleus mass). The pairs are
+/// descending by logit, except with `top_k == 0` and `top_p >= 1`: that support is every token with
+/// nonzero probability, in ascending index order, and no consumer may take `idx[0]` as the most
+/// likely token.
 /// The caller performs the final draw (bit-pinned) or hands the pairs out; keeping the draw OUT of
 /// here is what preserves the existing sampler's exact float ops.
 ///
@@ -573,6 +595,31 @@ fn truncated_softmax(
         let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let sum: f32 = logits.iter().map(|&l| ((l - maxl) / temp).exp()).sum();
 
+        // `top_p >= 1` with no top-k cut (`top_k` 0, or at least `n`) keeps every token that has
+        // any mass, so no order is needed and none is built: one O(n) pass in index order, where
+        // the widening below would end in a sort of the whole vocab (llama.cpp's top-p returns at
+        // once for `p >= 1` as well). Each kept probability is the same expression over the same
+        // `maxl` and `sum` the widening loop computes, so the distribution is unchanged; only the
+        // ORDER differs, and with it the token a given uniform lands on. Zero-probability tokens
+        // (masked `-inf`, or underflowed) are left out, which the sorted loop gets for free by
+        // putting them last: in index order one in front would take a draw of exactly 0. The
+        // sorted loop can also stop a hair early, once the rounded cumulative sum reaches 1.0;
+        // this pass never drops a token with mass.
+        // A row whose `sum` is not finite (a NaN or `+inf` logit, or every logit `-inf`) has no
+        // distribution to keep and stays on the sorted path, which handles it as before.
+        if top_p >= 1.0 && sum.is_finite() {
+            let mut idx = Vec::with_capacity(n);
+            let mut probs = Vec::with_capacity(n);
+            for (i, &l) in logits.iter().enumerate() {
+                let p = ((l - maxl) / temp).exp() / sum;
+                if p > 0.0 {
+                    idx.push(i);
+                    probs.push(p);
+                }
+            }
+            return (idx, probs);
+        }
+
         // What is NOT load-bearing is materializing an order over the whole vocab. This used to
         // build a `BinaryHeap<HeapItem>` of every entry — 128256 × 16B = 2.0 MiB allocated and
         // heapified per token — and then pop ~18 of them. Now: one bounded partial selection.
@@ -592,6 +639,8 @@ fn truncated_softmax(
             if k < n {
                 order.select_nth_unstable_by(k - 1, cmp); // top-k at the front (unordered)
             }
+            #[cfg(test)]
+            tests::NUCLEUS_SORTED.with(|s| s.set(s.get() + k));
             order[..k].sort_unstable_by(cmp); // descending by logit, ties by index
             let mut probs: Vec<f32> = Vec::with_capacity(k);
             let mut cum = 0.0f32;
@@ -607,7 +656,8 @@ fn truncated_softmax(
             }
             if reached || k == n {
                 // `reached`: `probs` already stops at the cutoff. `k == n`: the nucleus is the
-                // whole vocab (top_p = 1.0, or a flat enough row) and `probs` holds all of it —
+                // whole vocab (a flat enough row, or a `top_p >= 1` row the early return above
+                // left here because its `sum` is not finite) and `probs` holds all of it —
                 // which is exactly what the heap returned when it popped itself empty. Never
                 // truncate the nucleus short of `top_p`; that would drop mass the draw expects.
                 let idx = order[..probs.len()].to_vec();
@@ -719,6 +769,14 @@ pub(crate) fn sample_from_dist(dist: &[(u32, f32)], rng: &mut u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        /// Entries the `top_k == 0` arm of [`truncated_softmax`] has sorted on this thread, summed
+        /// over every pass of its widening loop. Per thread, so tests running in parallel cannot
+        /// add to each other's count.
+        pub(super) static NUCLEUS_SORTED: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
     /// A NaN logit must not panic the bounded top-k arm: its comparator once called NaN "equal"
     /// to everything, which is not a total order, and the selection then panicked.
     #[test]
@@ -982,6 +1040,57 @@ mod tests {
         assert_eq!(logits.len(), 4, "the row is not resized");
     }
 
+    /// A penalty only reorders tokens: an extreme (but accepted) `repeat_penalty` saturates a
+    /// finite logit instead of overflowing it to ±inf, and a masked `-inf` logit stays masked.
+    #[test]
+    fn penalties_keep_finite_logits_finite() {
+        for repeat in [f32::MAX, f32::MIN_POSITIVE] {
+            let ctx = RequestCtx::new(RequestSampling {
+                repeat_penalty: repeat,
+                repeat_last_n: 64,
+                frequency_penalty: 2.0,
+                ..Default::default()
+            });
+            let mut p = Penalties::resolve(Some(&ctx)).expect("penalty active");
+            for t in 0..3 {
+                p.observe(t);
+            }
+            let mut logits = vec![-30.0f32, 30.0, f32::NEG_INFINITY, 1.0];
+            p.apply(&mut logits);
+            for (i, l) in logits[..2].iter().enumerate() {
+                assert!(l.is_finite(), "repeat {repeat}: logit {i} became {l}");
+            }
+            assert_eq!(logits[2], f32::NEG_INFINITY, "repeat {repeat}: unmasked");
+            assert_eq!(logits[3], 1.0, "repeat {repeat}: an unseen token moved");
+        }
+        // The additive penalties saturate as well: a frequency penalty no server request can
+        // carry, in either direction, on a token seen twice.
+        for frequency in [-1e38f32, 1e38] {
+            let ctx = RequestCtx::new(RequestSampling {
+                frequency_penalty: frequency,
+                ..Default::default()
+            });
+            let mut p = Penalties::resolve(Some(&ctx)).expect("penalty active");
+            for t in [0, 0, 1, 1, 2] {
+                p.observe(t);
+            }
+            let mut logits = vec![-3e38f32, 3e38, f32::NEG_INFINITY, 1.0];
+            p.apply(&mut logits);
+            for (i, l) in logits[..2].iter().enumerate() {
+                assert!(l.is_finite(), "frequency {frequency}: logit {i} became {l}");
+            }
+            assert_eq!(
+                logits[2],
+                f32::NEG_INFINITY,
+                "frequency {frequency}: unmasked"
+            );
+            assert_eq!(
+                logits[3], 1.0,
+                "frequency {frequency}: an unseen token moved"
+            );
+        }
+    }
+
     /// An empty support is "can't happen" (a real vocab is never empty), so the two draw entry
     /// points must at least AGREE about what "can't happen" does. They didn't: `sample_from_dist`
     /// returned `0`, while `sample_logits` either panicked on `idx[idx.len() - 1]` (the sampled
@@ -1235,8 +1344,14 @@ mod tests {
     /// [`reference_full_sort`] — the byte-for-byte pre-refactor algorithm. The two pinned
     /// characterization tests above cover two hand-picked rows; this covers the corners that
     /// actually break a partial-selection rewrite: `n` below the probe size (1, 2, 7 — the clamp),
-    /// `n` far above it (4096), `top_p = 1.0` (the whole vocab, so the widening path must run to
-    /// completion), `top_p = 0.01` (a one-token nucleus), `-inf` masked rows, and heavy ties.
+    /// `n` far above it (4096), `top_p = 0.01` (a one-token nucleus), `-inf` masked rows, and heavy
+    /// ties.
+    ///
+    /// `top_p = 1.0` with no top-k builds no order (see [`truncated_softmax`]), so the token a
+    /// uniform lands on legitimately differs from the reference's there. Those cases are checked
+    /// against [`assert_full_support`] instead: the same support and the same probability per
+    /// token, and the token drawn inside it. A `top_k` at or above `n` cuts nothing and takes the
+    /// same path; with a top-k that cuts, `top_p = 1.0` still gets the token check.
     ///
     /// **Tie caveat — what is and is not asserted.** The old implementation popped a `BinaryHeap`
     /// whose order among EQUAL keys is unspecified, and `reference_full_sort` sorts with
@@ -1256,6 +1371,7 @@ mod tests {
         let mut tied_rows = 0usize;
         let mut tie_swaps = 0usize;
         let mut widened = 0usize;
+        let mut full_rows = 0usize;
         for &n in &[1usize, 2, 7, 17, 64, 255, 1024, 4096] {
             for &seed in &[1u64, 7, 12_345] {
                 for &temp in &[0.05f32, 0.6, 1.0, 2.5] {
@@ -1279,7 +1395,17 @@ mod tests {
                                 rng, rng_ref,
                                 "{what}: both paths must consume exactly one RNG draw"
                             );
-                            if has_duplicate_logits(&logits) {
+                            if (top_k == 0 || top_k >= n) && top_p >= 1.0 {
+                                // No order is built here, so the token a uniform lands on is not
+                                // the reference's: compare the distribution instead, and check
+                                // the draw came from it.
+                                full_rows += 1;
+                                let support = assert_full_support(&logits, temp, &what);
+                                assert!(
+                                    support.contains(&(got as usize)),
+                                    "{what}: drew {got}, which has no probability"
+                                );
+                            } else if has_duplicate_logits(&logits) {
                                 tied_rows += 1;
                                 assert_eq!(
                                     logits[got as usize].total_cmp(&logits[want as usize]),
@@ -1293,6 +1419,7 @@ mod tests {
                                 assert_eq!(got, want, "{what}: sampled token changed");
                             }
                             if top_k == 0
+                                && top_p < 1.0
                                 && truncated_softmax(&logits, temp, 0, top_p).0.len()
                                     > NUCLEUS_PROBE_K
                             {
@@ -1311,9 +1438,13 @@ mod tests {
             "no case exceeded the {NUCLEUS_PROBE_K}-candidate probe — the widening path was never \
              exercised by this sweep"
         );
+        assert!(full_rows > 0, "no case took the top_p >= 1 support");
         // Informational, not asserted either way: how often the index tiebreak picked a different
         // (equal-probability) token than the heap's arbitrary order would have.
-        eprintln!("{cases} cases, {tied_rows} tied rows, {tie_swaps} tie swaps, {widened} widened");
+        eprintln!(
+            "{cases} cases, {tied_rows} tied rows, {tie_swaps} tie swaps, {widened} widened, \
+             {full_rows} full support"
+        );
     }
 
     /// The support oracle for the widening path: full sort, no bounded probe, no widening — but
@@ -1338,15 +1469,88 @@ mod tests {
         (idx, probs)
     }
 
-    /// **The widening path, end to end.** `top_p = 1.0` on a flat row needs EVERY entry, so the
-    /// `NUCLEUS_PROBE_K` probe must widen (×`NUCLEUS_WIDEN`, then snap to `n`) rather than hand
+    /// What `truncated_softmax` must return for `top_k == 0` and `top_p >= 1`, checked without
+    /// assuming any order: every token with nonzero probability exactly once, each with exactly
+    /// the probability `reference_support` gives it (same `maxl`, same index-order `sum`, same
+    /// expression, so equality is exact), and no token without one. Returns the support.
+    ///
+    /// Two independent views of "the same distribution": the definition (each token's own
+    /// probability, no order involved) and the sorted oracle. The oracle can stop a hair before
+    /// the end once its rounded cumulative sum reaches 1.0, so it is held to the tokens it keeps,
+    /// and the tokens it cut are held to carrying almost no mass.
+    fn assert_full_support(
+        logits: &[f32],
+        temp: f32,
+        what: &str,
+    ) -> std::collections::HashSet<usize> {
+        let (idx, probs) = truncated_softmax(logits, temp, 0, 1.0);
+        assert_eq!(
+            idx.len(),
+            probs.len(),
+            "{what}: idx and probs differ in length"
+        );
+        let got: std::collections::HashMap<usize, f32> =
+            idx.iter().copied().zip(probs.iter().copied()).collect();
+        assert_eq!(got.len(), idx.len(), "{what}: a token appears twice");
+
+        let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|&l| ((l - maxl) / temp).exp()).sum();
+        for (i, &l) in logits.iter().enumerate() {
+            let p = ((l - maxl) / temp).exp() / sum;
+            if p > 0.0 {
+                assert_eq!(
+                    got.get(&i),
+                    Some(&p),
+                    "{what}: token {i} has the wrong mass"
+                );
+            } else {
+                assert!(!got.contains_key(&i), "{what}: token {i} has no mass");
+            }
+        }
+
+        let (ridx, rprobs) = reference_support(logits, temp, 1.0);
+        for (&i, &p) in ridx.iter().zip(&rprobs) {
+            if p > 0.0 {
+                assert_eq!(
+                    got.get(&i),
+                    Some(&p),
+                    "{what}: token {i} differs from the oracle"
+                );
+            }
+        }
+        // The rounding bound of an `n`-term sequential f32 sum: what the oracle's early stop and
+        // the support's total can be off by without anything being wrong.
+        let tol = (logits.len() as f32 * f32::EPSILON).max(1e-3);
+        let kept: std::collections::HashSet<usize> = ridx.into_iter().collect();
+        let cut: f32 = got
+            .iter()
+            .filter(|(i, _)| !kept.contains(i))
+            .map(|(_, &p)| p)
+            .sum();
+        assert!(
+            cut <= tol,
+            "{what}: the oracle cut {cut} of mass, not rounding"
+        );
+
+        let mass: f32 = probs.iter().sum();
+        assert!(
+            (mass - 1.0).abs() <= tol,
+            "{what}: support mass {mass} != 1"
+        );
+        got.into_keys().collect()
+    }
+
+    /// **The widening path, end to end.** A flat row at `top_p` near 1 needs nearly EVERY entry, so
+    /// the `NUCLEUS_PROBE_K` probe must widen (×`NUCLEUS_WIDEN`, then snap to `n`) rather than hand
     /// back a truncated nucleus — silently truncating would drop mass the draw expects and, via
     /// [`truncated_dist`], change MTP's speculative accept ratios. Rows are sized to land on both
-    /// sides of the probe and of one widening step, including exact-boundary sizes.
+    /// sides of the probe and of one widening step, including exact-boundary sizes. `top_p = 1.0`
+    /// takes no order at all, so it is held to [`assert_full_support`] instead of the sorted oracle.
     #[test]
     fn nucleus_widening_reaches_the_full_vocab() {
-        let mut saw_full = false;
+        let mut saw_snap = false;
         let mut saw_widened = false;
+        let mut saw_full_support = false;
         for &n in &[
             NUCLEUS_PROBE_K - 1,
             NUCLEUS_PROBE_K,
@@ -1356,25 +1560,27 @@ mod tests {
         ] {
             for &(temp, top_p) in &[(1.0f32, 1.0f32), (0.6, 0.999), (1.0, 0.9)] {
                 // Perfectly flat: every token carries the same mass, so the nucleus is as deep as
-                // `top_p` demands and nothing about the row lets the probe get lucky.
+                // `top_p` demands and nothing about the row lets the probe get lucky. And a random
+                // row, where the widening lands mid-tail.
                 let flat = vec![0.0f32; n];
-                assert_eq!(
-                    truncated_softmax(&flat, temp, 0, top_p),
-                    reference_support(&flat, temp, top_p),
-                    "flat n={n} temp={temp} top_p={top_p}: bounded probe != full sort"
-                );
-                let got = truncated_softmax(&flat, temp, 0, top_p).0;
-                saw_full |= got.len() == n;
-                saw_widened |= got.len() > NUCLEUS_PROBE_K;
-
-                // And the same on a random row, where the widening lands mid-tail.
                 let rnd = seeded_logits(n, 99, 2.0, 0, false);
-                assert_eq!(
-                    truncated_softmax(&rnd, temp, 0, top_p),
-                    reference_support(&rnd, temp, top_p),
-                    "random n={n} temp={temp} top_p={top_p}: bounded probe != full sort"
-                );
-                saw_widened |= truncated_softmax(&rnd, temp, 0, top_p).0.len() > NUCLEUS_PROBE_K;
+                for (shape, row) in [("flat", &flat), ("random", &rnd)] {
+                    let what = format!("{shape} n={n} temp={temp} top_p={top_p}");
+                    if top_p >= 1.0 {
+                        let support = assert_full_support(row, temp, &what);
+                        saw_full_support |= support.len() == n;
+                        continue;
+                    }
+                    let got = truncated_softmax(row, temp, 0, top_p);
+                    assert_eq!(
+                        got,
+                        reference_support(row, temp, top_p),
+                        "{what}: bounded probe != full sort"
+                    );
+                    saw_widened |= got.0.len() > NUCLEUS_PROBE_K;
+                    // Past one widening step's worth, which at these sizes only `k = n` can hold.
+                    saw_snap |= got.0.len() > NUCLEUS_PROBE_K * NUCLEUS_WIDEN;
+                }
             }
         }
         assert!(
@@ -1382,9 +1588,92 @@ mod tests {
             "no row exceeded the {NUCLEUS_PROBE_K}-candidate probe — widening untested"
         );
         assert!(
-            saw_full,
-            "no row pulled in the WHOLE vocab — the snap-to-n leg of the widening is untested"
+            saw_snap,
+            "no row needed more than one widening step — the snap-to-n leg is untested"
         );
+        assert!(
+            saw_full_support,
+            "no top_p = 1.0 row kept the WHOLE vocab — the full support is untested"
+        );
+    }
+
+    /// **`top_p >= 1` with no top-k keeps the whole distribution, and gets it right**, on a row the
+    /// size of a real vocabulary: a large random row, a masked one (the shape a grammar leaves),
+    /// a heavily tied one, and a flat one, at several temperatures. A support that dropped or
+    /// duplicated a token, kept a masked one, or normalized over anything but the full row fails
+    /// [`assert_full_support`]. Draws over many seeds must also land only on tokens with mass,
+    /// through both [`sample_logits`] and [`truncated_dist`]/[`sample_from_dist`].
+    ///
+    /// That the fast path is FASTER is measured, not asserted (timing in a unit test is noise);
+    /// [`top_p_one_without_top_k_sorts_nothing`] asserts the mechanism that makes it so.
+    #[test]
+    fn top_p_one_without_top_k_keeps_the_whole_distribution() {
+        const VOCAB: usize = 128_256;
+        let rows = [
+            ("random", seeded_logits(VOCAB, 5, 8.0, 0, false)),
+            ("masked", seeded_logits(VOCAB, 6, 8.0, 0, true)),
+            ("tied", seeded_logits(VOCAB, 7, 4.0, 2, false)),
+            ("flat", vec![0.0f32; VOCAB]),
+        ];
+        for (shape, row) in &rows {
+            for &temp in &[0.05f32, 0.6, 1.0, 2.5] {
+                let what = format!("{shape} temp={temp}");
+                let support = assert_full_support(row, temp, &what);
+                if *shape == "masked" {
+                    assert!(
+                        support.iter().all(|&i| row[i].is_finite()),
+                        "{what}: a masked token is in the support"
+                    );
+                }
+                let s = Sampler {
+                    temp,
+                    top_k: 0,
+                    top_p: 1.0,
+                };
+                let dist = truncated_dist(row, s);
+                assert_eq!(dist.len(), support.len(), "{what}: MTP support differs");
+                let mut rng = legal_xorshift_state(0xC0FFEE);
+                for _ in 0..64 {
+                    let t = sample_logits(row, s, &mut rng) as usize;
+                    assert!(support.contains(&t), "{what}: drew {t}, which has no mass");
+                    let t = sample_from_dist(&dist, &mut rng) as usize;
+                    assert!(
+                        support.contains(&t),
+                        "{what}: MTP drew {t}, which has no mass"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The mechanism: `top_p >= 1` with no top-k sorts nothing.** The widening loop would end in
+    /// a sort of all `n` entries; counted through `NUCLEUS_SORTED`. The `top_p < 1` row is the
+    /// control that shows the counter is live, and the non-finite rows show the degenerate cases
+    /// still take the sorted path they always did.
+    #[test]
+    fn top_p_one_without_top_k_sorts_nothing() {
+        let sorted = |logits: &[f32], top_p: f32| {
+            NUCLEUS_SORTED.with(|s| s.set(0));
+            let _ = truncated_softmax(logits, 0.8, 0, top_p);
+            NUCLEUS_SORTED.with(std::cell::Cell::get)
+        };
+        let row = seeded_logits(NUCLEUS_PROBE_K * 16, 11, 2.0, 0, false);
+        assert_eq!(sorted(&row, 1.0), 0, "top_p = 1.0 sorted the vocab");
+        assert!(sorted(&row, 0.9) > 0, "the counter never moved");
+
+        let mut nan = row.clone();
+        nan[3] = f32::NAN;
+        let all_masked = vec![f32::NEG_INFINITY; row.len()];
+        for (what, r) in [("NaN", &nan), ("all -inf", &all_masked)] {
+            assert!(sorted(r, 1.0) > 0, "{what} row left the sorted path");
+            let (idx, probs) = truncated_softmax(r, 0.8, 0, 1.0);
+            assert_eq!(
+                idx.len(),
+                r.len(),
+                "{what} row: the sorted path keeps every entry"
+            );
+            assert_eq!(idx.len(), probs.len());
+        }
     }
 
     /// `truncated_dist` shares `truncated_softmax`, and it RENORMALIZES over the returned support —
@@ -1401,8 +1690,27 @@ mod tests {
                     top_k: 0,
                     top_p,
                 };
-                let (want_idx, want_probs) = reference_support(&logits, temp, top_p);
                 let got = truncated_dist(&logits, s);
+                if top_p >= 1.0 {
+                    // No order here: the same tokens, each renormalized over the support's own
+                    // index-order total, which is what `truncated_dist` divides by.
+                    let what = format!("n={n} temp={temp} top_p={top_p}");
+                    let support = assert_full_support(&logits, temp, &what);
+                    let (idx, probs) = truncated_softmax(&logits, temp, 0, top_p);
+                    let total: f32 = probs.iter().sum();
+                    let want: std::collections::HashMap<usize, f32> =
+                        idx.into_iter().zip(probs).collect();
+                    assert_eq!(got.len(), support.len(), "{what}: MTP support drifted");
+                    for &(i, p) in &got {
+                        assert_eq!(
+                            Some(p),
+                            want.get(&(i as usize)).map(|w| w / total),
+                            "{what}: prob of {i} drifted"
+                        );
+                    }
+                    continue;
+                }
+                let (want_idx, want_probs) = reference_support(&logits, temp, top_p);
                 assert_eq!(
                     got.iter().map(|&(i, _)| i as usize).collect::<Vec<_>>(),
                     want_idx,

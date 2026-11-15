@@ -5710,17 +5710,6 @@ shader bodies.
   **Needs a decision:** keep the HF order and document the difference, or
   switch, which changes four implementations together and re-pins the GPU parity
   and `reference_full_sort` tests.
-- **`top_k == 0` with `top_p >= 1.0` sorts the whole vocabulary on the host for
-  every token.** The cumulative f32 sum rarely reaches exactly 1.0, so the
-  `top_k == 0` arm of `truncated_softmax` widens to `n` and sorts it; the
-  comment on `NUCLEUS_WIDEN` puts that at 3.22 ms per token at a 128256 vocab
-  (not re-measured). llama.cpp's top-p returns at once for `p >= 1`. Triggered
-  by an architecture whose default `top_k` is 0 (Llama-3.x, Llama-4, SmolLM3)
-  and a client sending `top_p: 1`, which also keeps the GPU sampler off. Fix:
-  return the full support unsorted in that case; the distribution is unchanged
-  but the token drawn for a seed changes, so
-  `randomized_differential_against_reference_full_sort` and
-  `nucleus_widening_reaches_the_full_vocab` need to compare support as a set.
 - **Penalties differ from llama.cpp.** `Penalties::resolve` starts empty and
   `observe` sees generated tokens only, where llama.cpp's server feeds every
   prompt token to the sampler first; presence and frequency count over the whole
@@ -5730,12 +5719,6 @@ shader bodies.
   `repeat_last_n` is not a request field. **Needs a decision:** match llama.cpp,
   or keep the OpenAI reading for presence/frequency and seed only the repeat
   window from the prompt. Fix the doc either way.
-- **Penalties are skipped under a grammar.** In `generate_dense_backend`
-  (`seam/runner.rs`) the constrained branch calls `grammar::constrained_step`
-  without `Penalties::apply`, and its tokens never reach `observe`. A forced
-  tool call with `frequency_penalty` or `repeat_penalty` gets none, silently;
-  llama.cpp applies both. Fix: apply and observe in that branch, or reject the
-  combination with a 400.
 - **`logit_bias`, `min_p`, `logprobs` and `n` are accepted and ignored.**
   `ChatRequest` tolerates unknown fields by design and none of these reaches
   `GenParams`: a token banned with `logit_bias` can still appear, `n: 3` returns
@@ -5743,6 +5726,12 @@ shader bodies.
   `logit_bias` beside `Penalties::apply` (forcing host sampling as penalties
   do), return 400 for `n > 1` and `logprobs`, or record them as deliberate
   drops.
+- **MTP's `residual_dist` is quadratic in the support.** `dist_prob` is a linear
+  search and `residual_dist` (`seam/model.rs`) calls it per entry, so two
+  distributions spanning the vocabulary cost about the square of its size per
+  call. A `top_p` of 1 with no top-k always returns the whole support (the old
+  sorted path usually did too). Only matters once MTP is un-parked with sampling
+  on; index one side by token id.
 - **Question, needs a run:** `constrained_step` (`grammar.rs`) resamples the
   whole row, with a new vocabulary-sized vector, each time `try_accept` rejects
   a candidate. The module doc implies the mask and `consume` agree, so

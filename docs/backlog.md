@@ -5127,10 +5127,10 @@ the drain arm of `adapter::execute_paged_moe`); the measurements are in
   last staged slot of an off session (`release_staged_fills`) drop it in place,
   waiting for a read in progress. Once per session at most; left as is.
 
-### B188 — LFM3 prefill trails llama.cpp on every device; decode trails it on CPU (2026-11-14, profiled 2026-11-15)
+### B188 — LFM3 prefill trails llama.cpp on the CPU; decode trails it on CPU (2026-11-14, profiled 2026-11-15)
 
-**Tag:** perf · lfm3 · **Blocked on:** nothing; what is left is the shared GEMM,
-GEMV and attention kernels, each its own slice
+**Tag:** perf · lfm3 · **Blocked on:** nothing; what is left is the CPU GEMM and
+GEMV, the Vulkan0 attention and head gate, each its own slice
 
 `LFM3-1.7B-Q4_K_M.gguf`, `infr bench` against `llama-bench` (llama.cpp
 `5676dfbe0`), measured on 2026-11-14 with the CPU 1–3% busy before each run
@@ -5160,12 +5160,50 @@ Vulkan1 126.3 against 186.83; CPU tg128 49.6 against 56.64).
   (`INFR_PROF_OPS`, 2 reps): the head-gate GEMV (below) at 80.8 us per attention
   layer, attention (`attn_flash_warp_bm32` 275.5 us, `attn_pv_warp` 215.9 us),
   and the quant passes at 14.7 us each.
-- **Vulkan1 (integrated), the dp4a GEMM and attention.** 7.38 s of device time
-  over 2 pp512 reps against llama.cpp's 2.60563e+06 us for one. The gate/up
-  `native_gemm_mmq_q4k_streamed` (2048x15360, 128-row chunks) totals 3.26 s over
-  the 2 reps against llama.cpp's 1.14047e+06 us for its q4_K n=7680 GEMMs in
-  one; the Q6_K `ffn_down` 946.9 ms against 389354 us; `attn_nc_fa_hd128` 541.8
-  ms against `FLASH_ATTN_EXT` 117913 us.
+- **Vulkan1 (integrated): closed, prefill and decode now ahead of llama.cpp**
+  (2026-11-15, CHANGELOG: the register-blocked `native_gemm_dp4a_kq` GEMM, the
+  register-blocked `attn_nc_fa`, a four-output int8 decode GEMV at every width).
+  `infr bench` three reps, interleaved with the previous build, against
+  `llama-bench` in the same window: Qwen3-1.7B pp512 231.9-232.0 against 187.04,
+  tg128 27.4-27.5 against 25.46; LFM3-1.7B pp512 236.7-236.8 against 195.95,
+  tg128 26.7 against 25.27. What is left on the pp512 profile (one rep,
+  `INFR_PROF_OPS`): Qwen3 2.20 s of device time (llama.cpp's perf logger
+  2.72966e+06 us), of it the dp4a GEMMs 1.80 s, `attn_nc_fa_hd128` 254.8 ms
+  (llama.cpp `FLASH_ATTN_EXT` 325380 us), `quant_q8` 84.1 ms over 448 passes;
+  LFM3 2.16 s, of it the fused gate/up 971.0 ms (10.1 ms per call), `ffn_down`
+  250.0 / 243.1 ms (Q6_K / Q4_K), attention 94.2 ms, the head-gate GEMV
+  (`gemv_streamed:m128:2048x16`) 9.2 ms. Open on this device:
+  - The dp4a GEMM reaches about 805 GFLOPS on the gate/up shape (2·128·2048·
+    12288 in 8.0 ms); the device's dp4a peak was not measured. In the tile sweep
+    below the larger per-thread tiles lost to register spills. Untried:
+    nibble-packed Q4_K in shared memory (half the weight reads, llama.cpp's
+    layout) and a wider k step with fewer staging registers.
+  - Prefill chunks of 64 rows or fewer keep the `native_gemm_mmq_*` tile
+    (`DP4A_KQ_MIN_ROWS`, measured on Qwen3 only: pp64 139.3 t/s dp4a against
+    145.3 mmq, pp80 162.6 against 93.8). A 64-token dp4a tile was not built.
+  - Decode device time (`INFR_SEAM_NO_REPLAY=1`, 32 tokens): LFM3 1.20 s, Qwen3
+    1.18 s, against llama.cpp's 39666.6 and 40111.4 us for one token. The LFM3
+    2048x512 k/v projections stay on the dequant GEMV (61.1 us `gemv_rm_v2`,
+    Q4_K; 80.4 us plain, Q6_K) against llama.cpp's 22.672 and 30.52 us; see the
+    declined item below for why. The Q6_K lm_head is behind too: 7.6 ms (LFM3)
+    and 9.0 ms (Qwen3) against 7319.04 and 8460.76 us; llama.cpp runs Q6_K on
+    its dequant GEMV on AMD, infr's scalar Q6_K GEMV is far slower there (19.5
+    ms for the LFM3 lm_head with `kernels.vulkan.mmv_mw=false`).
+  - Not measured: any other non-coopmat GPU. Intel Arc, a discrete RDNA1/RDNA2
+    card or anything else without an f16 cooperative matrix now takes the dp4a
+    GEMM and the new attention unmeasured; the four-output GEMV change is gated
+    on `Capabilities::integrated` and reaches no discrete GPU. It does reach
+    every other device that reports itself integrated: Intel iGPUs and Apple
+    GPUs under MoltenVK now take the four-output GEMV at every width, measured
+    on neither. Small-m prefill (rows 2-8) on an integrated GPU now takes the
+    four-output GEMV at in_f >= 2048 too, unmeasured.
+  - Verify batches past 8 rows take the two-output m16 GEMV build, so on an
+    integrated GPU decode and such a verify no longer share a reduction at
+    in_f >= 2048 (they already did not below 2048 on any device).
+  - `kquant_linear_*_within_int8_bound` (`seam_op_parity`) runs through the
+    adapter and so through the dp4a GEMM on this device, but asserts which GEMM
+    ran only for the int8 coopmat one; a dp4a counter like `i8cm_kq_counts`
+    would make it say so.
 - **CPU, the Q4_K/Q6_K GEMM.** After the fix a warm forward is 567.8-569.7 ms
   (one later run, whose unchanged Linears also ran faster than in the first
   profile, so the two windows differ), and its five largest rows are Linears
@@ -5174,16 +5212,35 @@ Vulkan1 126.3 against 186.83; CPU tg128 49.6 against 56.64).
   `GatedAct` 30.77 ms (scalar `expf`, B173) and `Attention` 28.75 + 16.41 ms.
   CPU decode is GEMV-bound (2048x7680 39.02%, the Q6_K lm_head 17.23%, 7680x2048
   Q6_K 11.20% of the decode profile), and Qwen3-1.7B trails there too.
-- **Vulkan1 decode.** Device time (`INFR_SEAM_NO_REPLAY=1`) 1.39 s over 32
-  tokens against llama.cpp's 39845.8 us for one. The gaps: the K/V projections
-  (2048x512) at 68.9 us (`gemv_rm_v2`, Q4_K) and 92.0 us (plain GEMV, Q6_K)
-  against 22.832 and 31.128 us, `ffn_down` at 414.5 us against 296.803 (Q4_K)
-  and 408.506 (Q6_K), and the Q6_K lm_head at 8.7 ms against 7254.64 us. The
-  decode GEMV gates (`MMV_MIN_ELEMS` and the variant choice) were tuned on the
-  7900 XTX.
 
 **Considered and declined, with what was measured:**
 
+- **The int8 decode GEMV for the small k/v projections on an integrated GPU**
+  (dropping `mmv_mw_choice`'s 2M-element floor when `Capabilities::integrated`).
+  Measured on the RDNA2 iGPU, LFM3-1.7B: the 2048x512 k/v went from 64.4 / 80.0
+  us (Q4_K / Q6_K, dequant GEMV) to 19.7 us on average, tg128 26.7 to 27.5 t/s.
+  Declined because it moves numerics: int8 activations on those GEMVs flip
+  `gpu_seam_golden_qwen3` on that device (got `0xe91c03c96815974c`, text still
+  coherent: "Okay, the user is asking about the capital of France. Let me think.
+  I know that France is a country in Europe, and its capital is"), while the
+  7900 XTX keeps the f32 GEMV there and the golden is one hash for every device.
+  Taking it needs a per-device golden, or the floor lowered on every device and
+  the golden re-blessed (measured nowhere but this iGPU).
+- **Tiles for the dp4a K-quant GEMM on the integrated GPU** (Qwen3-1.7B pp512,
+  one rep each, before the attention change; per-call gate/up and Q6_K
+  `ffn_down`): 64 tokens x 128 rows, 8x8 per thread, 128 threads: 183.1 t/s, 8.0
+  / 4.9 ms; **128 x 64, 8x8, 128 threads (shipped): 187.4 t/s, 8.0 / 4.1 ms**;
+  128 x 128, 8x8, 256 threads: 184.7 t/s; 128 x 128, 16x8 per thread: 94.9 t/s
+  (17.7 ms gate/up, spills); 128 x 64, 8x4, 256 threads: 155.6 t/s; 128 x 64,
+  16x4: 183.2 t/s; 64 x 64 with four k blocks per step: 104.3 t/s; 128 x 64 with
+  one k block per step: 173.2 t/s. A required subgroup size of 32 measured
+  identical (187.6 t/s): the driver already picks wave32.
+- **Plain `dotPacked4x8EXT` plus an add instead of the saturating accumulate**
+  in the old mmq kernel: the gate/up call went from 13.6 to 14.5 ms; the
+  saturating form maps to the native instruction on this driver.
+- **A larger ubatch on the integrated GPU** (pp512 is compute-bound there):
+  126.5 t/s at 256 and 126.6 at 512 against 126.2 at the default 128, before
+  this slice.
 - **Fused QKV for LFM3 on Vulkan.** `fuse_qkv_decision` refuses it because the
   short-convolution layers have no `attn_q` and because 5 of the 11 attention
   layers carry a Q6_K `attn_v`. On Vulkan0 the separate q, k and v GEMMs cost

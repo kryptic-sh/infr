@@ -1,0 +1,141 @@
+#version 460
+// Packed-int8-dot (dp4a) prefill GEMM for the K-quants (Q4_K, Q5_K, Q6_K) on devices without an
+// int8 cooperative matrix: C[m,n] = A[m,k]·Wᵀ with A pre-quantized by `quant_q8` and W read raw by
+// its 64-bit device address. The staging is `native_gemm_i8cm_kq.comp`'s (kq_stage.glsl); only
+// the product differs, and the per-block scaling is the same decomposition:
+//   Q4_K/Q5_K: Σ = dA·(d·sc)·Σqa·q + sA·(−dmin·mn)
+//   Q6_K:      Σ = dA·(d·sc16₀·Σ₀ + d·sc16₁·Σ₁), one int32 dot per 16-element half.
+//
+// Why this shape rather than `native_gemm_mmq_*` (64×64 tile, 4×4 outputs per thread, one k block
+// per barrier pair): on a small GPU that kernel is bound by shared-memory reads, eight words for
+// every sixteen dot instructions, and by per-block barriers and byte-wise scale decodes. Here each
+// thread owns TT tokens × TW weight rows (llama.cpp's `mul_mmq.comp` register-blocks the same
+// way), holds its TW weight blocks in registers for a k block and streams its tokens past them,
+// so a k block costs TW + TT block reads for TT·TW dots, and BK_STEP blocks share one barrier
+// pair with the next step's global reads in flight.
+//
+// A thread's weight rows are TW apart by NWT (lanes of a subgroup read neighbouring rows, and
+// their stores are adjacent floats); its tokens likewise by NTT. Requires n % BW == 0,
+// k % 256 == 0, w_base % 256 == 0 and k / 32 % BK_STEP == 0; rows past m read zeros and are never
+// stored.
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_integer_dot_product : require
+
+#include "native_weight_addr.glsl"
+
+#if !defined(FMT_Q4K) && !defined(FMT_Q5K) && !defined(FMT_Q6K)
+#error "native_gemm_dp4a_kq: define FMT_Q4K, FMT_Q5K or FMT_Q6K"
+#endif
+#if !defined(TILE_BT) || !defined(TILE_BW) || !defined(TILE_BKS) || !defined(TILE_TT) \
+    || !defined(TILE_TW)
+#error "native_gemm_dp4a_kq: define TILE_BT, TILE_BW, TILE_BKS, TILE_TT and TILE_TW"
+#endif
+
+const uint BT = TILE_BT;       // tokens per workgroup
+const uint BW = TILE_BW;       // weight rows (output features) per workgroup
+const uint BK_STEP = TILE_BKS; // 32-element k blocks staged per barrier pair
+const uint TT = TILE_TT;       // tokens per thread
+const uint TW = TILE_TW;       // weight rows per thread
+const uint NWT = BW / TW;      // threads across the weight rows
+const uint NTT = BT / TT;      // threads across the tokens
+const uint THREADS = NWT * NTT;
+
+layout(local_size_x = THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform PC {
+    uint m; uint n; uint k; uint w_base; uint w_lo; uint w_hi;
+} pc;
+layout(binding = 0) readonly buffer QA { uvec4 qa4[]; };       // [m, k] int8, 16 per uvec4
+layout(binding = 1) readonly buffer DA { float16_t dact[]; };  // [m, k/32]
+layout(binding = 2) readonly buffer SA { float16_t sact[]; };  // [m, k/32]
+layout(binding = 3) writeonly buffer CB { float c[]; };        // [m, n]
+
+#include "kq_stage.glsl"
+
+void main() {
+    w_addr = arena_base(pc.w_lo, pc.w_hi);
+    uint tiles_t = (pc.m + BT - 1u) / BT;
+    uint t0 = (gl_WorkGroupID.x % tiles_t) * BT;
+    uint o0 = (gl_WorkGroupID.x / tiles_t) * BW;
+    uint tid = gl_LocalInvocationIndex;
+    uint tw = tid % NWT;
+    uint tt = tid / NWT;
+
+    float acc[TT][TW];
+    [[unroll]] for (uint i = 0u; i < TT; i++) {
+        [[unroll]] for (uint j = 0u; j < TW; j++) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    uint nblk = pc.k / 32u;
+    prefetch(t0, o0, 0u, tid);
+    for (uint kb = 0u; kb < nblk; kb += BK_STEP) {
+        store_to_shared(o0, kb, tid);
+        barrier();
+        if (kb + BK_STEP < nblk) {
+            prefetch(t0, o0, kb + BK_STEP, tid);
+        }
+        [[unroll]] for (uint ks = 0u; ks < BK_STEP; ks++) {
+            int bq[TW][8];
+            float bd0[TW];
+            float bd1[TW];
+            [[unroll]] for (uint j = 0u; j < TW; j++) {
+                uint wr = tw + j * NWT;
+                [[unroll]] for (uint p = 0u; p < 8u; p++) {
+                    bq[j][p] = int(Bs[wr * QP + ks * 8u + p]);
+                }
+#ifdef FMT_Q6K
+                bd0[j] = Bd[(ks * KSCALES) * BW + wr];
+                bd1[j] = Bd[(ks * KSCALES + 1u) * BW + wr];
+#else
+                bd0[j] = Bd[ks * BW + wr];
+                bd1[j] = Bmin[ks * BW + wr];
+#endif
+            }
+            [[unroll]] for (uint i = 0u; i < TT; i++) {
+                uint tr = tt + i * NTT;
+                int aq[8];
+                [[unroll]] for (uint p = 0u; p < 8u; p++) {
+                    aq[p] = int(As[tr * QP + ks * 8u + p]);
+                }
+                float ad = Ad[ks * BT + tr];
+#ifndef FMT_Q6K
+                float as_ = Asum[ks * BT + tr];
+#endif
+                [[unroll]] for (uint j = 0u; j < TW; j++) {
+#ifdef FMT_Q6K
+                    int q0 = 0;
+                    int q1 = 0;
+                    [[unroll]] for (uint p = 0u; p < 4u; p++) {
+                        q0 = dotPacked4x8AccSatEXT(aq[p], bq[j][p], q0);
+                        q1 = dotPacked4x8AccSatEXT(aq[p + 4u], bq[j][p + 4u], q1);
+                    }
+                    float dot = fma(float(q0), bd0[j], float(q1) * bd1[j]);
+                    acc[i][j] = fma(dot, ad, acc[i][j]);
+#else
+                    int q = 0;
+                    [[unroll]] for (uint p = 0u; p < 8u; p++) {
+                        q = dotPacked4x8AccSatEXT(aq[p], bq[j][p], q);
+                    }
+                    float t = fma(float(q) * ad, bd0[j], acc[i][j]);
+                    acc[i][j] = fma(as_, bd1[j], t);
+#endif
+                }
+            }
+        }
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0u; i < TT; i++) {
+        uint tr = t0 + tt + i * NTT;
+        if (tr < pc.m) {
+            [[unroll]] for (uint j = 0u; j < TW; j++) {
+                c[tr * pc.n + o0 + tw + j * NWT] = acc[i][j];
+            }
+        }
+    }
+}

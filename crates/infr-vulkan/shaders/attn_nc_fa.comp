@@ -7,16 +7,23 @@
 // at depth). Every flash/nonfa prefill kernel here is coopmat SPIR-V, so before this kernel a
 // non-coopmat device ran ALL prefill attention rows one at a time.
 //
-// Design constraints (Intel Arc audit; tuned blind on RADV under INFR_NO_COOPMAT=1):
-//  • NO subgroup ops anywhere — accumulation is per-thread registers + shared staging, and no
-//    layout depends on gl_SubgroupSize (Arc enumerates 8-32; ANV may pick any).
-//  • SMALL row tile: BM=32 (16 for the hd=512 build) × BN=64 kv block, 256 threads — Alchemist
-//    SIMD8 EUs spill easily and prefer more, smaller workgroups. Registers stay modest: the QK
-//    phase holds E=BN·BM/256 score accumulators (8/4), the PV phase 32/TPR partial sums (≤4).
-//  • Shared ≤64 KB: Qs+KVs BK-chunk staging (the native_gemm_fma warptile pattern) + Ss score
-//    tile + Os accumulator = 37.6 KB (hd≤128) / 54.0 KB (hd≤256) / 47.6 KB (hd=512, BM=16).
+// Design constraints (Intel Arc audit):
+//  • NO subgroup ops anywhere — reductions go through shared memory, and no layout depends on
+//    gl_SubgroupSize (Arc enumerates 8-32; ANV may pick any).
+//  • SMALL row tile: BM=32 (16 for the hd=512 build) × BN=64 kv block, 256 threads.
+//  • Shared within the 32 KB every Vulkan device guarantees (`maxComputeSharedMemorySize`): Q is
+//    staged in KC-dim chunks next to the matching K chunk, V in VC-dim chunks into the same
+//    buffer, and the output accumulator lives in registers.
 //  • Barriers AFTER all shared reads of an iteration (the mmq race lesson) — a fast thread must
 //    never restage Qs/KVs/Ss while a slow one still reads the previous block's values.
+//
+// Register blocking, which is what makes the tier fast on a small GPU: shared-memory reads, not
+// arithmetic, bound the earlier one-score-column-per-load form. Each thread computes RS query
+// rows × 2 key columns of the score tile from vec4 reads (RS + 2 reads per 4·2·RS fmas), and
+// RO rows × 4 dims of the output per V chunk (RO + 4 reads per 16·RO fmas per 4 keys). The
+// softmax runs SM_T threads per row with the row max and sum combined through shared memory.
+// Every score and output sum keeps the order of the scalar form it replaced (k ascending, keys
+// ascending within a block), so only the block partial's fold into the accumulator moved.
 //
 // Semantics mirror attn_partial.comp exactly (the kernel this tier replaces at rows≥64):
 //  • causal: row r (absolute position pos+qr0+r) attends keys ≤ its own position;
@@ -41,17 +48,28 @@
 #define HD_MAX 128
 #endif
 #if HD_MAX > 256
-#define BM 16u // hd=512: halve the row tile so Os stays 32 KB
+#define BM 16u // hd=512: halve the row tile to keep the output registers per thread
 #else
 #define BM 32u
 #endif
 
-const uint BN = 64u; // kv positions per block
-const uint BK = 32u; // staged dims per QK chunk (= staged dims per PV chunk)
+const uint BN = 64u;            // kv positions per block
 const uint THREADS = 256u;
-const uint SK = BK + 1u; // +1 pad de-conflicts strided column reads
-const uint TPR = THREADS / BM; // threads cooperating on one query row (8 / 16)
-const uint E = BN / TPR; // score columns per thread (8 / 4)
+const uint KC = 32u;            // dims per QK chunk
+const uint VC = 64u;            // dims per PV chunk
+const uint QP4 = KC / 4u + 1u;  // vec4 pitch of a Q or K chunk row (+1 spreads banks)
+const uint VP4 = VC / 4u;       // vec4 pitch of a V chunk row
+const uint SP = BN + 4u;        // float pitch of a score row (+4 keeps rows 16-byte aligned)
+// QK: thread (rg, cg) owns rows rg·RS .. +RS and key columns cg, cg + BN/2.
+const uint QK_COLS = BN / 2u;
+const uint RS = BM / (THREADS / QK_COLS);
+// PV: thread (rp, dq) owns rows rp·RO .. +RO and dims dq·4 .. +4 of each V chunk.
+const uint PV_DQ = VC / 4u;
+const uint RO = BM / (THREADS / PV_DQ);
+const uint NVC = HD_MAX / VC;   // V chunks in the widest head this build takes
+// Softmax: SM_T threads per row, SM_C key columns each.
+const uint SM_T = THREADS / BM;
+const uint SM_C = BN / SM_T;
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -71,13 +89,14 @@ layout(binding = 1) readonly buffer KB { f16vec4 k4[]; }; // [rcap, nkv, hd] (ri
 layout(binding = 2) readonly buffer VB { f16vec4 v4[]; }; // [rcap, nkv, hd]
 layout(binding = 3) writeonly buffer OB { float o[]; };   // [q_len, nh, hd]
 
-shared float Qs[BM * SK];      // BK-dim chunk of the query tile
-shared float KVs[BN * SK];     // BK-dim chunk of the K block, then 32-dim chunks of V
-shared float Ss[BM * BN];      // raw scores, then probabilities
-shared float Os[BM * HD_MAX];  // O accumulator (rescaled online)
-shared float mrow[BM];         // running row max
-shared float lrow[BM];         // running row sum
-shared float corr[BM];         // per-row rescale for the current block
+shared vec4 Qs[BM * QP4];       // KC-dim chunk of the query tile
+shared vec4 KVs[BN * VP4];      // KC-dim chunk of the K block, then VC-dim chunks of V
+shared float Ss[BM * SP];       // masked scores, then probabilities
+shared float redm[THREADS];     // per-thread partial row max
+shared float reds[THREADS];     // per-thread partial row sum
+shared float mrow[BM];          // running row max
+shared float lrow[BM];          // running row sum
+shared float corr[BM];          // per-row rescale for the current block
 
 void main() {
     uint qt = gl_WorkGroupID.x / pc.nh;
@@ -93,18 +112,34 @@ void main() {
     uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
 #define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
 
-    for (uint i = li; i < BM * hd; i += THREADS) { Os[i] = 0.0; }
     if (li < BM) {
         mrow[li] = -1e30;
         lrow[li] = 0.0;
     }
+    // A tile with no live block reads lrow straight after this, with no barrier in between.
     barrier();
 
-    // This thread's fixed score coordinates: query row `tr`, columns tj0*E .. +E.
-    uint tr = li / TPR;
-    uint tj0 = li % TPR;
-    uint qpos = pc.pos + qr0 + tr;
-    uint lo_r = (pc.window > 0u && qpos + 1u > pc.window) ? qpos + 1u - pc.window : 0u;
+    uint cg = li % QK_COLS;
+    uint rg = li / QK_COLS;
+    uint dq = li % PV_DQ;
+    uint rp = li / PV_DQ;
+    uint srow = li / SM_T;
+    uint spart = li % SM_T;
+
+    // The QK rows' causal ends and window bases.
+    uint qpos[RS];
+    uint lo_r[RS];
+    [[unroll]] for (uint i = 0u; i < RS; i++) {
+        qpos[i] = pc.pos + qr0 + rg * RS + i;
+        lo_r[i] = (pc.window > 0u && qpos[i] + 1u > pc.window) ? qpos[i] + 1u - pc.window : 0u;
+    }
+
+    vec4 acc_o[RO][NVC];
+    [[unroll]] for (uint i = 0u; i < RO; i++) {
+        [[unroll]] for (uint c = 0u; c < NVC; c++) {
+            acc_o[i][c] = vec4(0.0);
+        }
+    }
 
     // kv block range: [row 0's window base, last row's causal end). Later rows' window bases are
     // at most BM-1 > 0 positions above the base — always inside the first block (BM <= 32 < BN).
@@ -114,120 +149,140 @@ void main() {
     uint kvend = min(pc.kv_len, pc.pos + qr0 + BM);
 
     for (uint b0 = lo_tile; b0 < kvend; b0 += BN) {
-        // ── S = Q·Kᵀ over BK-dim chunks (native_gemm_fma's staging pattern) ──
-        float accs[E];
-        [[unroll]] for (uint e = 0u; e < E; e++) accs[e] = 0.0;
-        for (uint k0 = 0u; k0 < hd; k0 += BK) {
-            // stage Qs: BM rows × BK dims as vec4s (one per thread for BM=32; rows >= q_len and
-            // dims >= hd stage zeros — q is sized q_len rows, NOT tile-padded)
-            for (uint idx = li; idx < BM * (BK / 4u); idx += THREADS) {
-                uint r = idx / (BK / 4u);
-                uint c4 = idx % (BK / 4u);
+        // ── S = Q·Kᵀ over KC-dim chunks ──
+        float s[RS][2];
+        [[unroll]] for (uint i = 0u; i < RS; i++) {
+            s[i][0] = 0.0;
+            s[i][1] = 0.0;
+        }
+        for (uint k0 = 0u; k0 < hd; k0 += KC) {
+            // stage Qs: BM rows × KC dims (rows >= q_len and dims >= hd stage zeros — q is sized
+            // q_len rows, NOT tile-padded)
+            for (uint idx = li; idx < BM * (KC / 4u); idx += THREADS) {
+                uint r = idx / (KC / 4u);
+                uint c4 = idx % (KC / 4u);
                 uint gr = qr0 + r;
                 uint d = k0 + c4 * 4u;
-                vec4 qv = (gr < pc.q_len && d < hd)
-                              ? vec4(q4[(gr * pc.nh + h) * hd4 + (d >> 2u)])
-                              : vec4(0.0);
-                uint b = r * SK + c4 * 4u;
-                Qs[b] = qv.x;
-                Qs[b + 1u] = qv.y;
-                Qs[b + 2u] = qv.z;
-                Qs[b + 3u] = qv.w;
+                Qs[r * QP4 + c4] = (gr < pc.q_len && d < hd)
+                                       ? vec4(q4[(gr * pc.nh + h) * hd4 + (d >> 2u)])
+                                       : vec4(0.0);
             }
-            // stage KVs: BN keys × BK dims (positions >= kv_len stage zeros; ring rows via RROW)
-            for (uint idx = li; idx < BN * (BK / 4u); idx += THREADS) {
-                uint j = idx / (BK / 4u);
-                uint c4 = idx % (BK / 4u);
+            // stage K: BN keys × KC dims (positions >= kv_len stage zeros; ring rows via RROW)
+            for (uint idx = li; idx < BN * (KC / 4u); idx += THREADS) {
+                uint j = idx / (KC / 4u);
+                uint c4 = idx % (KC / 4u);
                 uint kpos = b0 + j;
                 uint d = k0 + c4 * 4u;
-                vec4 kv = (kpos < pc.kv_len && d < hd)
-                              ? vec4(k4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
-                              : vec4(0.0);
-                uint b = j * SK + c4 * 4u;
-                KVs[b] = kv.x;
-                KVs[b + 1u] = kv.y;
-                KVs[b + 2u] = kv.z;
-                KVs[b + 3u] = kv.w;
+                KVs[j * QP4 + c4] = (kpos < pc.kv_len && d < hd)
+                                        ? vec4(k4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
+                                        : vec4(0.0);
             }
             barrier();
-            for (uint kk = 0u; kk < BK; kk++) {
-                float av = Qs[tr * SK + kk];
-                [[unroll]] for (uint e = 0u; e < E; e++) {
-                    accs[e] += av * KVs[(tj0 * E + e) * SK + kk];
+            [[unroll]] for (uint c4 = 0u; c4 < KC / 4u; c4++) {
+                vec4 ka = KVs[cg * QP4 + c4];
+                vec4 kb = KVs[(cg + QK_COLS) * QP4 + c4];
+                [[unroll]] for (uint i = 0u; i < RS; i++) {
+                    vec4 qv = Qs[(rg * RS + i) * QP4 + c4];
+                    s[i][0] += qv.x * ka.x;
+                    s[i][0] += qv.y * ka.y;
+                    s[i][0] += qv.z * ka.z;
+                    s[i][0] += qv.w * ka.w;
+                    s[i][1] += qv.x * kb.x;
+                    s[i][1] += qv.y * kb.y;
+                    s[i][1] += qv.z * kb.z;
+                    s[i][1] += qv.w * kb.w;
                 }
             }
             // AFTER all shared reads of this chunk (mmq race lesson).
             barrier();
         }
         // mask (causal end, window base, kv end) and publish this block's scores
-        [[unroll]] for (uint e = 0u; e < E; e++) {
-            uint j = tj0 * E + e;
-            uint kpos = b0 + j;
-            bool dead = kpos >= pc.kv_len || kpos > qpos || kpos < lo_r;
-            Ss[tr * BN + j] = dead ? -1e30 : accs[e] * scale;
-        }
-        barrier();
-
-        // ── online softmax for this block (one thread per row) ──
-        if (li < BM) {
-            float rmax = mrow[li];
-            for (uint j = 0u; j < BN; j++) { rmax = max(rmax, Ss[li * BN + j]); }
-            float cf = exp(mrow[li] - rmax);
-            float rsum = 0.0;
-            for (uint j = 0u; j < BN; j++) {
-                float s = Ss[li * BN + j];
-                // dead scores stay EXACTLY zero even in an all-dead block (where rmax would be
-                // -1e30 and exp(s - rmax) = exp(0) = 1 — pad rows / window edges hit this).
-                float p = (s > -1e29) ? exp(s - rmax) : 0.0;
-                Ss[li * BN + j] = p;
-                rsum += p;
-            }
-            lrow[li] = lrow[li] * cf + rsum;
-            mrow[li] = rmax;
-            corr[li] = cf;
-        }
-        barrier();
-
-        // rescale the accumulator by this block's correction factor
-        for (uint i = li; i < BM * hd; i += THREADS) { Os[i] *= corr[i / hd]; }
-        barrier();
-
-        // ── O += P·V over 32-dim chunks of V (KVs restaged per chunk) ──
-        for (uint d0 = 0u; d0 < hd; d0 += 32u) {
-            for (uint idx = li; idx < BN * 8u; idx += THREADS) {
-                uint j = idx / 8u;
-                uint c4 = idx % 8u;
+        [[unroll]] for (uint i = 0u; i < RS; i++) {
+            [[unroll]] for (uint e = 0u; e < 2u; e++) {
+                uint j = cg + e * QK_COLS;
                 uint kpos = b0 + j;
-                uint d = d0 + c4 * 4u;
-                vec4 vv = (kpos < pc.kv_len && d < hd)
-                              ? vec4(v4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
-                              : vec4(0.0);
-                uint b = j * SK + c4 * 4u;
-                KVs[b] = vv.x;
-                KVs[b + 1u] = vv.y;
-                KVs[b + 2u] = vv.z;
-                KVs[b + 3u] = vv.w;
+                bool dead = kpos >= pc.kv_len || kpos > qpos[i] || kpos < lo_r[i];
+                Ss[(rg * RS + i) * SP + j] = dead ? -1e30 : s[i][e] * scale;
             }
-            barrier();
-            // row tr, dims d0 + tj0 + TPR·u — fixed disjoint ownership, no atomics needed
-            [[unroll]] for (uint u = 0u; u < 32u / TPR; u++) {
-                uint dl = tj0 + TPR * u;
-                if (d0 + dl < hd) {
-                    float s = 0.0;
-                    for (uint j = 0u; j < BN; j++) { s += Ss[tr * BN + j] * KVs[j * SK + dl]; }
-                    Os[tr * hd + d0 + dl] += s;
+        }
+        barrier();
+
+        // ── online softmax for this block: SM_T threads per row ──
+        float sv[SM_C];
+        float pmax = -1e30;
+        [[unroll]] for (uint c = 0u; c < SM_C; c++) {
+            sv[c] = Ss[srow * SP + spart * SM_C + c];
+            pmax = max(pmax, sv[c]);
+        }
+        redm[li] = pmax;
+        barrier();
+        float mold = mrow[srow];
+        float rmax = mold;
+        [[unroll]] for (uint t = 0u; t < SM_T; t++) {
+            rmax = max(rmax, redm[srow * SM_T + t]);
+        }
+        float psum = 0.0;
+        [[unroll]] for (uint c = 0u; c < SM_C; c++) {
+            // dead scores stay EXACTLY zero even in an all-dead block (where rmax would be
+            // -1e30 and exp(s - rmax) = exp(0) = 1 — pad rows / window edges hit this).
+            float p = (sv[c] > -1e29) ? exp(sv[c] - rmax) : 0.0;
+            Ss[srow * SP + spart * SM_C + c] = p;
+            psum += p;
+        }
+        reds[li] = psum;
+        barrier();
+        if (spart == 0u) {
+            float rsum = 0.0;
+            [[unroll]] for (uint t = 0u; t < SM_T; t++) {
+                rsum += reds[srow * SM_T + t];
+            }
+            float cf = exp(mold - rmax);
+            lrow[srow] = lrow[srow] * cf + rsum;
+            mrow[srow] = rmax;
+            corr[srow] = cf;
+        }
+
+        // ── O = O·corr + P·V over VC-dim chunks of V (KVs restaged per chunk) ──
+        [[unroll]] for (uint c = 0u; c < NVC; c++) {
+            uint d0 = c * VC;
+            if (d0 < hd) {
+                for (uint idx = li; idx < BN * VP4; idx += THREADS) {
+                    uint j = idx / VP4;
+                    uint c4 = idx % VP4;
+                    uint kpos = b0 + j;
+                    uint d = d0 + c4 * 4u;
+                    KVs[j * VP4 + c4] = (kpos < pc.kv_len && d < hd)
+                                            ? vec4(v4[(RROW(kpos) * pc.nkv + kvh) * hd4 + (d >> 2u)])
+                                            : vec4(0.0);
                 }
+                barrier();
+                [[unroll]] for (uint i = 0u; i < RO; i++) {
+                    uint r = rp * RO + i;
+                    vec4 part = vec4(0.0);
+                    for (uint j = 0u; j < BN; j++) {
+                        part += Ss[r * SP + j] * KVs[j * VP4 + dq];
+                    }
+                    acc_o[i][c] = acc_o[i][c] * corr[r] + part;
+                }
+                barrier();
             }
-            barrier();
         }
     }
 
-    for (uint i = li; i < BM * hd; i += THREADS) {
-        uint r = i / hd;
+    [[unroll]] for (uint i = 0u; i < RO; i++) {
+        uint r = rp * RO + i;
         uint gr = qr0 + r;
-        if (gr < pc.q_len) {
-            float l = lrow[r];
-            o[(gr * pc.nh + h) * hd + (i % hd)] = (l > 0.0) ? Os[i] / l : 0.0;
+        float l = lrow[r];
+        [[unroll]] for (uint c = 0u; c < NVC; c++) {
+            uint d = c * VC + dq * 4u;
+            if (gr < pc.q_len && d < hd) {
+                vec4 v = (l > 0.0) ? acc_o[i][c] / l : vec4(0.0);
+                uint at = (gr * pc.nh + h) * hd + d;
+                o[at] = v.x;
+                o[at + 1u] = v.y;
+                o[at + 2u] = v.z;
+                o[at + 3u] = v.w;
+            }
         }
     }
 }

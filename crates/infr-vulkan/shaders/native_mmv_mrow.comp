@@ -245,7 +245,10 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
 void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint bd = (gelem / 256u) * 210u;
     uint p0 = gelem % 256u;
-    float d = f16tof32(ru16(bd + 208u));
+    // `d` (bytes 208..209) and this group's two scale bytes sit at even offsets, so each pair is
+    // one half of one word: one load apiece instead of a load per byte.
+    uint dbyte = bd + 208u;
+    float d = f16tof32(NW(dbyte >> 2u) >> ((dbyte & 2u) * 8u));
     uint hf = p0 / 128u; uint og = (p0 % 128u) / 32u;
     uint qho = hf * 32u; uint scbase = bd + 192u + hf * 8u + 2u * og;
     bool high = og >= 2u; uint qshift = og * 2u;
@@ -284,8 +287,9 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
             qp[j] = (q + 0x60606060u) ^ 0x80808080u;
         }
     }
-    f0 = d * float(sgn8(rb(scbase)));
-    f1 = d * float(sgn8(rb(scbase + 1u)));
+    uint scw = NW(scbase >> 2u) >> ((scbase & 2u) * 8u);
+    f0 = d * float(sgn8(scw & 0xFFu));
+    f1 = d * float(sgn8((scw >> 8u) & 0xFFu));
 }
 #endif
 

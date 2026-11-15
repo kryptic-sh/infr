@@ -678,9 +678,19 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
 /// reads the environment and nothing latches process-wide.
 const BDA_CHUNK_UNIT_MAX: u64 = 1 << 32;
 
+/// Does the int8 dp4a multi-row GEMV take its four-outputs-per-workgroup build (`-DOUTS4`) for
+/// activation rows of width `in_f`? A discrete GPU takes it below 2048 wide, where the
+/// two-output layout leaves lanes of the workgroup idle; an integrated GPU at every width, where
+/// it measured faster at every LFM3-1.7B decode shape on the RDNA2 iGPU (the per-op timings are
+/// in the CHANGELOG and backlog B188).
+fn mmv_o4(vk: &infr_core::config::VulkanCfg, in_f: usize, integrated: bool) -> bool {
+    vk.mmv_o4 && (in_f < 2048 || integrated)
+}
+
 /// The int8 dp4a multi-row GEMV build [`Recorder::linear_mmv_mrow_at`] dispatches for `rows`
-/// activation rows of width `in_f`, under `vk`'s layout knobs (`mmv_o4`, `mmv_m4`), with or
-/// without the fused residual: `(kernel name, SPIR-V, outputs per workgroup)`. `None` when no
+/// activation rows of width `in_f` on an `integrated` GPU or not, under `vk`'s layout knobs
+/// (`mmv_o4`, `mmv_m4`; see [`mmv_o4`]), with or without the fused residual:
+/// `(kernel name, SPIR-V, outputs per workgroup)`. `None` when no
 /// such build exists, so a tier gate that asks this before choosing the kernel can never pick a
 /// variant the recorder would then fail to find — the variant tables are sparse (the residual
 /// builds exist only at `m4`, none at all for some dtypes, and rows past 8 have no residual twin).
@@ -690,6 +700,7 @@ pub(crate) fn mmv_mrow_variant(
     rows: usize,
     in_f: usize,
     res: bool,
+    integrated: bool,
 ) -> Option<(&'static str, &'static [u32], u32)> {
     if rows > 8 {
         if res {
@@ -697,7 +708,7 @@ pub(crate) fn mmv_mrow_variant(
         }
         return crate::gemm::native_mmv_mrow_m16_spv(dtype).map(|(n, s)| (n, s, 2));
     }
-    let o4 = in_f < 2048 && vk.mmv_o4;
+    let o4 = mmv_o4(vk, in_f, integrated);
     let m4 = rows <= 4 && vk.mmv_m4;
     crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
         .map(|(n, s)| (n, s, if o4 { 4 } else { 2 }))
@@ -711,8 +722,9 @@ pub(crate) fn mmv_mrow_fuseq_variant(
     dtype: infr_core::DType,
     in_f: usize,
     res: bool,
+    integrated: bool,
 ) -> Option<(&'static str, &'static [u32], u32)> {
-    let o4 = in_f < 2048 && vk.mmv_o4;
+    let o4 = mmv_o4(vk, in_f, integrated);
     crate::gemm::native_mmv_mrow_variant_fuseq_spv(dtype, o4, true, res)
         .map(|(n, s)| (n, s, if o4 { 4 } else { 2 }))
 }
@@ -1418,7 +1430,7 @@ impl<'a> Recorder<'a> {
     /// Intel A770 (Mesa ANV) enforces exactly the guaranteed minimum, and a wide GEMV (a
     /// ~150k-vocab lm_head, or `rows * gate_up_intermediate` at multi-row prefill) can dispatch
     /// past it in one dimension — the segfault-adjacent bug this splits around.
-    const MAX_GROUP_COUNT_X: u32 = 65_535;
+    pub(crate) const MAX_GROUP_COUNT_X: u32 = 65_535;
 
     /// Dispatch a FLAT `n`-workgroup 1-D grid, splitting into a safe 2-D grid
     /// (`MAX_GROUP_COUNT_X` × `ceil(n / MAX_GROUP_COUNT_X)`) whenever `n` would otherwise exceed
@@ -2683,6 +2695,59 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// Packed-int8-dot prefill GEMM for a K-quant weight (`native_gemm_dp4a_kq.comp`), the
+    /// non-coopmat tier's K-quant arm: `c[m, n] = qa·Wᵀ` with `qa`/`dact`/`sact` from
+    /// [`Self::quant_q8`] and the weight read by its 64-bit device address `w_addr` from element
+    /// `w_base`. Writes only the `m` real rows of `c`; the shape contract is asserted here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matmul_dp4a_kq(
+        &self,
+        dtype: infr_core::DType,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        w_addr: u64,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (name, spv) = crate::gemm::native_gemm_dp4a_kq_spv(dtype)
+            .unwrap_or_else(|| panic!("matmul_dp4a_kq: no dp4a K-quant build for {dtype:?}"));
+        let tile = crate::gemm::DP4A_KQ_TILE;
+        assert!(
+            k.is_multiple_of(256) && w_base.is_multiple_of(256),
+            "{name}: k ({k}) and w_base ({w_base}) must be whole K-quant superblocks"
+        );
+        assert!(
+            n.is_multiple_of(tile.rows) && (k / 32).is_multiple_of(tile.k_blocks),
+            "{name}: n ({n}) or k ({k}) is off the tile"
+        );
+        self.label_gemm(name, m, k, n);
+        let kern = self.be.kernel(name, spv, 4, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
+        let groups = (m.div_ceil(tile.tokens) * (n / tile.rows)) as u32;
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(c),
+            ],
+            1,
+            &push,
+            groups,
+        );
+    }
+
     /// int8 cooperative-matrix prefill GEMM for a K-quant weight (`native_gemm_i8cm_kq.comp`):
     /// `c[m, n] = qa·Wᵀ` with `qa`/`dact`/`sact` from [`Self::quant_q8`] and the weight read by
     /// its 64-bit device address `w_addr` from element `w_base`. Writes only the `m` real rows of
@@ -3794,12 +3859,13 @@ impl<'a> Recorder<'a> {
         let res = residual.is_some();
         // Callers gate on this same lookup (`mmv_mrow_variant`), so a miss is a caller bug.
         let (name, spv, outs) =
-            mmv_mrow_variant(self.vk(), dtype, rows, in_f, res).unwrap_or_else(|| {
-                panic!(
-                    "linear_mmv_mrow_at: no int8 mrow build for {dtype:?} rows={rows} \
+            mmv_mrow_variant(self.vk(), dtype, rows, in_f, res, self.be.caps().integrated)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "linear_mmv_mrow_at: no int8 mrow build for {dtype:?} rows={rows} \
                      in_f={in_f} residual={res} under the mmv_o4/mmv_m4 knobs"
-                )
-            });
+                    )
+                });
         let groups = (out_f as u32).div_ceil(outs);
         let nbind = if res { 6 } else { 5 };
         let k = self.be.kernel(name, spv, nbind, 24);
@@ -3944,9 +4010,12 @@ impl<'a> Recorder<'a> {
         let res = residual.is_some();
         // Callers gate on this same lookup (`mmv_mrow_fuseq_variant`), so a miss is a caller bug.
         let (name, spv, outs) =
-            mmv_mrow_fuseq_variant(self.vk(), dtype, in_f, res).unwrap_or_else(|| {
-                panic!("linear_mmv_mrow_fuseq: no FUSE_QUANT build for {dtype:?} residual={res}")
-            });
+            mmv_mrow_fuseq_variant(self.vk(), dtype, in_f, res, self.be.caps().integrated)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "linear_mmv_mrow_fuseq: no FUSE_QUANT build for {dtype:?} residual={res}"
+                    )
+                });
         let nbind: usize = if res { 3 } else { 2 };
         let k = self.be.kernel(name, spv, nbind, 24);
         let mut push = [0u8; 24];
@@ -13631,6 +13700,12 @@ mod tests {
         run_attn_nc_fa(100, 300, 4, 2, 128, 64, 1.0, None);
         // hd=64 (BK tail guards: hd < the build's HD_MAX)
         run_attn_nc_fa(80, 300, 9, 3, 64, 0, 0.0, None);
+        // Head dims off the 64-dim V chunk, hd128 build: 96 leaves the second V chunk half
+        // full; 80 leaves a partial QK chunk as well, here windowed.
+        run_attn_nc_fa(100, 300, 4, 2, 96, 0, 0.0, None);
+        run_attn_nc_fa(100, 300, 4, 1, 80, 64, 0.0, None);
+        // hd256 build at 192: the build's last V chunk lies wholly past the head and is skipped.
+        run_attn_nc_fa(96, 288, 8, 4, 192, 0, 0.0, None);
         // hd256 build, windowed (gemma4 SWA shape)
         run_attn_nc_fa(96, 400, 8, 4, 256, 128, 1.0, None);
         // hd512 build (BM=16 tile)

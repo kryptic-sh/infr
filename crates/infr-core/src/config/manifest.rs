@@ -171,6 +171,7 @@ knobs! {
     "INFR_I8_COOPMAT"   => "kernels.vulkan.i8_coopmat",   Presence,    Ignored, "1", migrated;
     "INFR_I8_ROW_SCALE" => "kernels.vulkan.i8_row_scale", Presence,    Ignored, "1", migrated;
     "INFR_NO_I8CM_KQ"   => "kernels.vulkan.i8cm_kq",      PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_DP4A_KQ"   => "kernels.vulkan.dp4a_kq",      PresenceInv, Ignored, "1", migrated;
     "INFR_NO_F16"       => "kernels.vulkan.f16",          PresenceInv, Ignored, "1", migrated;
     "INFR_NO_I8DOT"     => "kernels.vulkan.i8_dot",       PresenceInv, Ignored, "1", migrated;
 

@@ -270,6 +270,10 @@ cfg_struct! {
         /// `INFR_NO_I8CM_KQ` (inverted): the int8 cooperative-matrix K-quant prefill GEMM
         /// (`native_gemm_i8cm_kq.comp`) on the devices it was measured faster on.
         i8cm_kq: bool = true,
+        /// `INFR_NO_DP4A_KQ` (inverted): the packed-int8-dot K-quant prefill GEMM
+        /// (`native_gemm_dp4a_kq.comp`) as the non-coopmat tier's K-quant GEMM; off, those
+        /// shapes take the per-dtype `native_gemm_mmq_*` tile.
+        dp4a_kq: bool = true,
         /// `INFR_NO_F16` (inverted).
         f16: bool = true,
         /// `INFR_NO_I8DOT` (inverted).

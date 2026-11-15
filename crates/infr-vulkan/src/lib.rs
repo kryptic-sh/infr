@@ -14,7 +14,7 @@ mod caps;
 pub mod ep;
 mod gemm;
 #[cfg(test)]
-mod i8cm_kq_tests;
+mod kq_gemm_tests;
 pub mod linear;
 mod matmul;
 mod multi;

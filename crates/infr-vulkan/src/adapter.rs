@@ -861,7 +861,8 @@ fn mmv_mw_choice(
     // SPIR-V existence gate: the unified rows=1 path dispatches exactly the build this lookup
     // names (same knobs, same residual flag), so a `Some` here can never reach a variant the
     // recorder lacks — the residual builds exist only under `mmv_m4`, and not for every dtype.
-    let have_spv = crate::recorder::mmv_mrow_variant(vk, dt, 1, in_f, res).is_some();
+    let have_spv =
+        crate::recorder::mmv_mrow_variant(vk, dt, 1, in_f, res, caps.integrated).is_some();
     have_spv.then_some(warps)
 }
 
@@ -1155,7 +1156,7 @@ fn i8cm_kq_choice(
     };
     // The kernel reads its tile from a 1-D workgroup id; a grid past the guaranteed
     // `maxComputeWorkGroupCount[0]` stays on the f16 GEMM rather than truncate.
-    (grid(tile) <= u16::MAX as usize).then_some(tile)
+    (grid(tile) <= Recorder::MAX_GROUP_COUNT_X as usize).then_some(tile)
 }
 
 /// [`i8cm_kq_choice`]'s large-tile threshold: workgroups of the large tile per compute unit.
@@ -1240,8 +1241,9 @@ fn native_warp_gemm(
 }
 
 /// The padded-dst dance shared by every tiled prefill GEMM tier (`is_gemm`, the non-coopmat
-/// `nc_mmq`/`nc_fma` tier, and the streamed twin): the GEMM writes `ceil(m/64)*64` rows, so an
-/// Internal (row-padded) `dst` is written direct, while a non-Internal `dst` (e.g. the lm_head
+/// `nc_mmq`/`nc_fma` tier, and the streamed twin): a GEMM may write up to `ceil(m/64)*64` rows
+/// (some tiles store their pad rows, the dp4a K-quant GEMM does not), so an Internal (row-padded)
+/// `dst` is written direct, while a non-Internal `dst` (e.g. the lm_head
 /// `logits` Output) gets a padded temp the `record` closure fills, then a copy of the `m` real
 /// rows back into `y`. Extracted so the three tiers stay byte-identical.
 fn with_padded_dst<F>(
@@ -1260,7 +1262,7 @@ where
 {
     let dst_internal = matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
     let eb = graph.desc(*dst).dtype.dense_bytes(1).unwrap_or(4);
-    // alloc_uninit: the GEMM writes all mpad rows before the copy reads m of them.
+    // alloc_uninit: the copy reads only the m real rows, and the GEMM writes every one of them.
     let tmp = if dst_internal {
         None
     } else {
@@ -1340,14 +1342,16 @@ fn lower_op(
     dyn_args: &mut Vec<DynAttnCtx>,
     pool: &mut ScratchPool,
     // Quantized-activation memo: `Some((x, m, in_f, pool))` when the pooled `{pool}_*` scratch
-    // (`mmvr` for the multi-row mmv, `mmq` for the int8 coopmat GEMM) already holds `quant_q8(x)`
-    // for that shape. Consecutive same-x Linears (fused-QKV offset GEMVs, gate+up, separate
-    // q/k/v GEMMs) then skip the requant — which not only drops the repeated quant dispatches
-    // but removes the WAR hazard (quant rewrites qa → barrier against the previous reader) that
-    // would otherwise serialize the sibling Linears. `take()`n at the top of every call: ONLY the
-    // two branches that fill a pool restore it, so any other op in between (which may rewrite
-    // `x` — e.g. next layer's RmsNorm into the same scratch id) invalidates the memo by
-    // construction, and the pool tag keeps one branch from trusting the other's scratch.
+    // (`mmvr` for the multi-row mmv, `mmv` for the m=1 int8 decode GEMV, `mmq` for the int8
+    // coopmat GEMM, `mmq_nc` for the non-coopmat tier's dp4a GEMMs, whose `mmq_*` scratch is
+    // padded to whole 64-row tiles) already holds `quant_q8(x)` for that shape. Consecutive same-x
+    // Linears (fused-QKV offset GEMVs, gate+up, separate q/k/v GEMMs) then skip the requant —
+    // which not only drops the repeated quant dispatches but removes the WAR hazard (quant
+    // rewrites qa → barrier against the previous reader) that would otherwise serialize the
+    // sibling Linears. `take()`n at the top of every call: ONLY the branches that fill a pool
+    // restore it, so any other op in between (which may rewrite `x` — e.g. next layer's RmsNorm
+    // into the same scratch id) invalidates the memo by construction, and the pool tag keeps one
+    // branch from trusting the other's scratch.
     mmv_memo: &mut Option<(TensorId, usize, usize, &'static str)>,
     // Dense layer streaming (see `pager::DensePagerSession`): `Some(arena_addr)` when this op is an
     // `Op::Linear` whose weight is a streamed block — `arena_addr` is the resident slot's arena base
@@ -1503,8 +1507,8 @@ fn lower_op(
                 });
                 if let Some(StreamedGemm::Tiled(kind)) = route {
                     nc_prefill_gemm(
-                        be_, graph, kind, dt, arena_addr, w_off, xb, y, dst, m, in_f, out_f, rec,
-                        pool, transient,
+                        be_, graph, kind, dt, arena_addr, w_off, x, xb, y, dst, m, in_f, out_f,
+                        rec, pool, transient, memo_prev, mmv_memo,
                     )?;
                 } else if route == Some(StreamedGemm::Warp) {
                     // The tiled prefill GEMM can't be output-row chunked (see the resident-GEMM
@@ -1584,6 +1588,7 @@ fn lower_op(
                                 dt,
                                 in_f,
                                 true,
+                                be_.caps().integrated,
                             )
                             .is_some()
                         {
@@ -2166,8 +2171,8 @@ fn lower_op(
                     .device_addr()
                     .expect("resident-BDA weight: non-coopmat GEMM requires a u64 BDA address");
                 nc_prefill_gemm(
-                    be_, graph, kind, dt, w_addr, w_off, xb, y, dst, m, in_f, out_f, rec, pool,
-                    transient,
+                    be_, graph, kind, dt, w_addr, w_off, x, xb, y, dst, m, in_f, out_f, rec, pool,
+                    transient, memo_prev, mmv_memo,
                 )?;
             } else if native_dense_supported(dt) {
                 // Decode (m=1) on int-dot-capable K-quants → mmv (see the fused-add branch above).
@@ -2205,6 +2210,7 @@ fn lower_op(
                             dt,
                             in_f,
                             false,
+                            be_.caps().integrated,
                         )
                         .is_some()
                     {
@@ -2215,14 +2221,17 @@ fn lower_op(
                     let qa = pooled(pool, be_, "mmv_qa", in_f)?;
                     let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
                     let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
-                    rec.quant_q8(
-                        xb,
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        pool[&sact].as_ref(),
-                        1,
-                        in_f,
-                    );
+                    if memo_prev != Some((*x, 1, in_f, "mmv")) {
+                        rec.quant_q8(
+                            xb,
+                            pool[&qa].as_ref(),
+                            pool[&dact].as_ref(),
+                            pool[&sact].as_ref(),
+                            1,
+                            in_f,
+                        );
+                    }
+                    *mmv_memo = Some((*x, 1, in_f, "mmv"));
                     if unified_mmv_row1(be_.caps()) {
                         // Same kernel/reduction as the m>=3 verify tier, dispatched at rows=1 — see
                         // the fused-add branch above and `unified_mmv_row1`'s doc.
@@ -6362,7 +6371,9 @@ fn streamed_tiled_fits(
 /// `w_addr` (a resident weight's BDA, or a streamed slot's arena base) plus element offset `w_off`.
 /// Same padded-dst dance as every tiled tier (`with_padded_dst`): the GEMM writes ceil(m/64)*64
 /// rows. The caller has already checked the grid and `bda_weight_breaches` (refusing the op on the
-/// resident path, keeping the GEMV on the streamed one).
+/// resident path, keeping the GEMV on the streamed one). The dp4a arm quantizes `x` into the
+/// pooled `mmq_*` scratch unless `memo_prev` says that scratch already holds it (the
+/// `mmv_memo` protocol of `lower_op`), and records that it does.
 #[allow(clippy::too_many_arguments)]
 fn nc_prefill_gemm(
     be_: &VulkanBackend,
@@ -6371,6 +6382,7 @@ fn nc_prefill_gemm(
     dt: infr_core::DType,
     w_addr: u64,
     w_off: usize,
+    x: &TensorId,
     xb: &dyn Buffer,
     y: &dyn Buffer,
     dst: &TensorId,
@@ -6380,6 +6392,8 @@ fn nc_prefill_gemm(
     rec: &Recorder<'_>,
     pool: &mut ScratchPool,
     transient: &mut Vec<Box<dyn Buffer>>,
+    memo_prev: Option<(TensorId, usize, usize, &'static str)>,
+    mmv_memo: &mut Option<(TensorId, usize, usize, &'static str)>,
 ) -> Result<()> {
     with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
         match kind {
@@ -6391,32 +6405,81 @@ fn nc_prefill_gemm(
                 let qa = pooled(pool, be_, "mmq_qa", mpad * in_f)?;
                 let dact = pooled(pool, be_, "mmq_dact", mpad * nblk * 2)?;
                 let sact = pooled(pool, be_, "mmq_sact", mpad * nblk * 2)?;
-                rec.quant_q8(
-                    xb,
-                    pool[&qa].as_ref(),
-                    pool[&dact].as_ref(),
-                    pool[&sact].as_ref(),
-                    m,
-                    in_f,
-                );
-                rec.matmul_mmq_at(
-                    dt,
-                    pool[&qa].as_ref(),
-                    pool[&dact].as_ref(),
-                    pool[&sact].as_ref(),
-                    w_addr,
-                    w_off,
-                    out,
-                    m,
-                    in_f,
-                    out_f,
-                );
+                // Its own memo tag: these buffers are sized to whole 64-row tiles, so they are
+                // the int8 coopmat arm's (`"mmq"`) only when m happens to be a multiple of 64.
+                if memo_prev != Some((*x, m, in_f, "mmq_nc")) {
+                    rec.quant_q8(
+                        xb,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        m,
+                        in_f,
+                    );
+                }
+                *mmv_memo = Some((*x, m, in_f, "mmq_nc"));
+                if dp4a_kq_ok(&be_.cfg().kernels.vulkan, dt, m, in_f, out_f, w_off) {
+                    rec.matmul_dp4a_kq(
+                        dt,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        w_addr,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                } else {
+                    rec.matmul_mmq_at(
+                        dt,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        w_addr,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                }
             }
             NcGemm::Fma => rec.matmul_fma_at(dt, xb, w_addr, w_off, out, m, in_f, out_f),
         }
         Ok(())
     })
 }
+
+/// Does the non-coopmat tier's dp4a GEMM for `(dt, m, in_f, out_f, w_off)` take the K-quant
+/// register-blocked kernel (`native_gemm_dp4a_kq.comp`) rather than the per-dtype
+/// `native_gemm_mmq_*` tile? Its shape contract is whole superblocks along k, whole tiles along
+/// n, and a 1-D grid inside the guaranteed `maxComputeWorkGroupCount[0]`; at or below
+/// [`DP4A_KQ_MIN_ROWS`] the smaller mmq tile wastes less.
+fn dp4a_kq_ok(
+    vk: &infr_core::config::VulkanCfg,
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    w_off: usize,
+) -> bool {
+    let tile = crate::gemm::DP4A_KQ_TILE;
+    vk.dp4a_kq
+        && m > DP4A_KQ_MIN_ROWS
+        && crate::gemm::native_gemm_dp4a_kq_spv(dt).is_some()
+        && in_f.is_multiple_of(256)
+        && w_off.is_multiple_of(256)
+        && (in_f / 32).is_multiple_of(tile.k_blocks)
+        && out_f.is_multiple_of(tile.rows)
+        && m.div_ceil(tile.tokens) * (out_f / tile.rows) <= Recorder::MAX_GROUP_COUNT_X as usize
+}
+
+/// Rows at or below which [`dp4a_kq_ok`] keeps the `native_gemm_mmq_*` tile: one half-empty
+/// dp4a token tile costs more than the mmq tile that fits the rows. Measured on the integrated
+/// RDNA2 GPU (Qwen3-1.7B Q4_K_M, dp4a on / off): pp64 139.3 / 145.3 t/s, pp80 162.6 / 93.8.
+const DP4A_KQ_MIN_ROWS: usize = 64;
 
 /// The tiled prefill GEMM a streamed dense `Op::Linear` takes — see [`streamed_gemm_route`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7850,6 +7913,30 @@ mod tests {
         assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 128, CU), None);
         assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2016, 0, CU), None);
         assert_eq!(i8cm_kq_choice(Q4K, 8192, 2048, 151_936, 0, CU), None);
+    }
+
+    /// The dp4a K-quant GEMM takes a K-quant Linear past one half token tile whose k, weight
+    /// offset and width fit its tile and whose grid a 1-D workgroup id reaches; everything else
+    /// keeps the per-dtype mmq tile, as does every shape with the switch off.
+    #[test]
+    fn dp4a_kq_ok_gates_dtype_shape_and_rows() {
+        use infr_core::DType::{Q4K, Q5K, Q6K, Q8_0};
+        let vk = infr_core::config::VulkanCfg::default();
+        assert!(dp4a_kq_ok(&vk, Q4K, 128, 2048, 12288, 0));
+        assert!(dp4a_kq_ok(&vk, Q5K, 512, 2048, 1024, 0));
+        assert!(dp4a_kq_ok(&vk, Q6K, 128, 6144, 2048, 0));
+        assert!(dp4a_kq_ok(&vk, Q4K, DP4A_KQ_MIN_ROWS + 1, 2048, 2048, 0));
+        assert!(!dp4a_kq_ok(&vk, Q4K, DP4A_KQ_MIN_ROWS, 2048, 2048, 0));
+        assert!(!dp4a_kq_ok(&vk, Q8_0, 128, 2048, 2048, 0));
+        assert!(!dp4a_kq_ok(&vk, Q4K, 128, 2080, 2048, 0));
+        assert!(!dp4a_kq_ok(&vk, Q4K, 128, 2048, 2048, 128));
+        assert!(!dp4a_kq_ok(&vk, Q4K, 128, 2048, 2016, 0));
+        assert!(!dp4a_kq_ok(&vk, Q4K, 128 * 1024, 2048, 151_936, 0));
+        let off = infr_core::config::VulkanCfg {
+            dp4a_kq: false,
+            ..vk
+        };
+        assert!(!dp4a_kq_ok(&off, Q4K, 128, 2048, 12288, 0));
     }
 
     /// With the compute-unit count known, the window scales with it: on a 96-CU part the
@@ -12366,39 +12453,46 @@ mod tests {
     }
 
     /// The decode tier offers the int8 mrow kernel only when the EXACT build the recorder will
-    /// request exists: for every int8 decode dtype, layout knob and residual flag, a `Some` from
-    /// `mmv_mw_choice` must name a variant `mmv_mrow_variant` can load. The residual builds exist
-    /// only at `mmv_m4`, so with that knob off a fused decode must be declined, not offered.
+    /// request exists: for every int8 decode dtype, layout knob and residual flag, on a discrete
+    /// and an integrated device, a `Some` from `mmv_mw_choice` must name a variant
+    /// `mmv_mrow_variant` can load. The residual builds exist only at `mmv_m4`, so with that knob
+    /// off a fused decode must be declined, not offered.
     #[test]
     fn mmv_choice_offers_only_built_variants() {
-        let caps = infr_core::backend::Capabilities {
-            i8_dot: true,
-            ..Default::default()
-        };
         let mut declined_res = 0;
-        for &dt in &POLICY_DTYPES {
-            for m4 in [false, true] {
-                for o4 in [false, true] {
-                    for res in [false, true] {
-                        for in_f in [1024usize, 4096] {
-                            let vk = infr_core::config::VulkanCfg {
-                                mmv_m4: m4,
-                                mmv_o4: o4,
-                                mmv_mw: Some(true),
-                                ..Default::default()
-                            };
-                            let out_f = 4096;
-                            let offered = mmv_mw_choice(&caps, &vk, dt, in_f, out_f, res);
-                            let built =
-                                crate::recorder::mmv_mrow_variant(&vk, dt, 1, in_f, res).is_some();
-                            if offered.is_some() {
-                                assert!(
-                                    built,
-                                    "{dt:?} m4={m4} o4={o4} res={res} in_f={in_f}: offered a \
-                                     variant the recorder has no build for"
-                                );
-                            } else if res && !m4 {
-                                declined_res += 1;
+        for integrated in [false, true] {
+            let caps = infr_core::backend::Capabilities {
+                i8_dot: true,
+                integrated,
+                ..Default::default()
+            };
+            for &dt in &POLICY_DTYPES {
+                for m4 in [false, true] {
+                    for o4 in [false, true] {
+                        for res in [false, true] {
+                            for in_f in [1024usize, 4096] {
+                                let vk = infr_core::config::VulkanCfg {
+                                    mmv_m4: m4,
+                                    mmv_o4: o4,
+                                    mmv_mw: Some(true),
+                                    ..Default::default()
+                                };
+                                let out_f = 4096;
+                                let offered = mmv_mw_choice(&caps, &vk, dt, in_f, out_f, res);
+                                let built = crate::recorder::mmv_mrow_variant(
+                                    &vk, dt, 1, in_f, res, integrated,
+                                )
+                                .is_some();
+                                if offered.is_some() {
+                                    assert!(
+                                        built,
+                                        "{dt:?} integrated={integrated} m4={m4} o4={o4} \
+                                         res={res} in_f={in_f}: offered a variant the recorder \
+                                         has no build for"
+                                    );
+                                } else if res && !m4 {
+                                    declined_res += 1;
+                                }
                             }
                         }
                     }
@@ -12408,6 +12502,77 @@ mod tests {
         assert!(
             declined_res > 0,
             "no fused decode was declined under mmv_m4=false — the check above never ran"
+        );
+    }
+
+    /// An integrated GPU asks for the four-output (`o4`) int8 GEMV builds at every width, where a
+    /// discrete one asks for them only below 2048 wide; the m=2..16 tier gates on the plain build
+    /// alone and `linear_mmv_mrow_at` panics on a missing variant. So for every dtype with an int8
+    /// mrow build, every layout knob, width class and row tier an integrated device can reach, the
+    /// SPIR-V lookup must succeed; a fused-residual build must exist wherever the discrete device
+    /// at the same knobs has one; and the FUSE_QUANT table must cover every dtype it covers at all.
+    #[test]
+    fn integrated_mmv_selection_finds_every_build() {
+        use crate::recorder::{mmv_mrow_fuseq_variant, mmv_mrow_variant};
+        let mut o4_wide = 0;
+        let mut fuseq = 0;
+        for &dt in &POLICY_DTYPES {
+            assert!(
+                crate::gemm::native_mmv_mrow_kernel_name(dt).is_some(),
+                "{dt:?} is listed in POLICY_DTYPES but has no int8 mrow build"
+            );
+            for m4 in [false, true] {
+                for o4 in [false, true] {
+                    let vk = infr_core::config::VulkanCfg {
+                        mmv_m4: m4,
+                        mmv_o4: o4,
+                        ..Default::default()
+                    };
+                    // Below, at and above the width where a discrete GPU drops the `o4` build.
+                    for in_f in [1024usize, 2048, 4096] {
+                        for rows in 1..=16 {
+                            let Some((name, _, outs)) =
+                                mmv_mrow_variant(&vk, dt, rows, in_f, false, true)
+                            else {
+                                panic!(
+                                    "{dt:?} m4={m4} o4={o4} in_f={in_f} rows={rows}: no int8 \
+                                     mrow build for an integrated device"
+                                );
+                            };
+                            if o4 && in_f >= 2048 && rows <= 8 {
+                                assert_eq!(outs, 4, "{name}: integrated took a two-output build");
+                                o4_wide += 1;
+                            }
+                        }
+                        let res_integrated =
+                            mmv_mrow_variant(&vk, dt, 1, in_f, true, true).is_some();
+                        let res_discrete =
+                            mmv_mrow_variant(&vk, dt, 1, in_f, true, false).is_some();
+                        assert_eq!(
+                            res_integrated, res_discrete,
+                            "{dt:?} m4={m4} o4={o4} in_f={in_f}: the fused-residual build \
+                             differs between an integrated and a discrete device"
+                        );
+                        for res in [false, true] {
+                            if crate::gemm::native_mmv_mrow_variant_fuseq_spv(dt, false, true, res)
+                                .is_some()
+                            {
+                                assert!(
+                                    mmv_mrow_fuseq_variant(&vk, dt, in_f, res, true).is_some(),
+                                    "{dt:?} o4={o4} in_f={in_f} res={res}: no FUSE_QUANT build \
+                                     for an integrated device"
+                                );
+                                fuseq += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(o4_wide > 0, "no wide integrated lookup took the o4 build");
+        assert!(
+            fuseq > 0,
+            "no dtype has a FUSE_QUANT build — that check never ran"
         );
     }
 

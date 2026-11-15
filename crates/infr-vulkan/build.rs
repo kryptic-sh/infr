@@ -2348,6 +2348,45 @@ fn main() {
                 "-DTILE_BKS=4u",
             ],
         ),
+        // Packed-int8-dot K-quant prefill GEMM for devices without an int8 cooperative matrix
+        // (native_gemm_dp4a_kq.comp; adapter.rs `dp4a_kq_ok`): BT tokens x BW weight rows per
+        // workgroup, TT x TW outputs per thread. MIRRORS `gemm::DP4A_KQ_TILE`.
+        (
+            "native_gemm_dp4a_kq",
+            "native_gemm_dp4a_q4k",
+            &[
+                "-DFMT_Q4K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=2u",
+                "-DTILE_TT=8u",
+                "-DTILE_TW=8u",
+            ],
+        ),
+        (
+            "native_gemm_dp4a_kq",
+            "native_gemm_dp4a_q5k",
+            &[
+                "-DFMT_Q5K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=2u",
+                "-DTILE_TT=8u",
+                "-DTILE_TW=8u",
+            ],
+        ),
+        (
+            "native_gemm_dp4a_kq",
+            "native_gemm_dp4a_q6k",
+            &[
+                "-DFMT_Q6K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=2u",
+                "-DTILE_TT=8u",
+                "-DTILE_TW=8u",
+            ],
+        ),
         // Row-wise activation quant for the int8-coopmat GEMM's "Idea 2" measurement (whole-K
         // scale instead of per-32-block; see quant_q8_row.comp). Gated by INFR_I8_ROW_SCALE=1.
         ("quant_q8_row", "quant_q8_row", &[]),

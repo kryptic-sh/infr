@@ -1006,7 +1006,7 @@ pub(crate) fn native_gemm_fma_kernel_name(dtype: infr_core::DType) -> Option<&'s
 }
 /// SPIR-V for the non-coopmat shared-memory fma flash-attention prefill (the "nc_fa" tier, see
 /// `attn_nc_fa.comp`): fused QK^T → online softmax → PV for devices without a usable f16 coopmat
-/// (adapter.rs `nc_fa_ok`). Three shared-Os builds; returns the smallest that fits `hd` as
+/// (adapter.rs `nc_fa_ok`). Three builds by widest head; returns the smallest that fits `hd` as
 /// `(kernel_cache_name, spv, BM row tile)`, or `None` for hd > 512.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_nc_fa_spv(hd: usize) -> Option<(&'static str, &'static [u32], usize)> {
@@ -1214,6 +1214,54 @@ pub(crate) fn native_gemm_i8cm_kq_spv(
         (Q5K, I8cmTile::M) => spv!("native_gemm_i8cm_q5k_m"),
         (Q6K, I8cmTile::L) => spv!("native_gemm_i8cm_q6k_l"),
         (Q6K, I8cmTile::M) => spv!("native_gemm_i8cm_q6k_m"),
+        _ => return None,
+    })
+}
+
+/// Workgroup and thread tile of the packed-int8-dot K-quant prefill GEMM
+/// (`native_gemm_dp4a_kq.comp`). The extents MIRROR the `-DTILE_*` defines of its builds in
+/// `build.rs`; `dp4a_kq_tile_matches_build` fails if they drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Dp4aKqTile {
+    /// Tokens (output rows) per workgroup.
+    pub(crate) tokens: usize,
+    /// Weight rows (output columns) per workgroup.
+    pub(crate) rows: usize,
+    /// 32-element k blocks staged per step; `k / 32` must be a multiple of it.
+    pub(crate) k_blocks: usize,
+    /// Tokens per thread.
+    pub(crate) thread_tokens: usize,
+    /// Weight rows per thread.
+    pub(crate) thread_rows: usize,
+}
+
+/// The one tile every `native_gemm_dp4a_*` build uses.
+pub(crate) const DP4A_KQ_TILE: Dp4aKqTile = Dp4aKqTile {
+    tokens: 128,
+    rows: 64,
+    k_blocks: 2,
+    thread_tokens: 8,
+    thread_rows: 8,
+};
+
+/// SPIR-V for the packed-int8-dot K-quant prefill GEMM (`native_gemm_dp4a_kq.comp`):
+/// `(kernel cache name, spv)` for `dtype`, `None` for a dtype it has no build for.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_dp4a_kq_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    use infr_core::DType::*;
+    Some(match dtype {
+        Q4K => spv!("native_gemm_dp4a_q4k"),
+        Q5K => spv!("native_gemm_dp4a_q5k"),
+        Q6K => spv!("native_gemm_dp4a_q6k"),
         _ => return None,
     })
 }
@@ -3826,6 +3874,41 @@ mod tests {
                 ] {
                     assert!(entry.contains(&want), "{name}: {entry} lacks {want}");
                 }
+            }
+        }
+    }
+
+    /// [`DP4A_KQ_TILE`] is what the recorder sizes the grid and the adapter gates shapes by; the
+    /// shader only knows the `-DTILE_*` defines `build.rs` hands each build. Also holds the
+    /// staging's exact-division requirement (kq_stage.glsl: every thread moves the same number of
+    /// activation halves and weight quarters per step).
+    #[test]
+    fn dp4a_kq_tile_matches_build() {
+        let build = include_str!("../build.rs");
+        let t = DP4A_KQ_TILE;
+        let threads = (t.tokens / t.thread_tokens) * (t.rows / t.thread_rows);
+        assert_eq!(threads * t.thread_tokens * t.thread_rows, t.tokens * t.rows);
+        assert_eq!((t.tokens * t.k_blocks * 2) % threads, 0);
+        assert_eq!((t.rows * t.k_blocks * 4) % threads, 0);
+        for (dtype, fmt) in [
+            (infr_core::DType::Q4K, "Q4K"),
+            (infr_core::DType::Q5K, "Q5K"),
+            (infr_core::DType::Q6K, "Q6K"),
+        ] {
+            let (name, _) = native_gemm_dp4a_kq_spv(dtype).expect("dp4a build");
+            let at = build
+                .find(&format!("\"{name}\""))
+                .unwrap_or_else(|| panic!("{name} not in build.rs"));
+            let entry = &build[at..at + build[at..].find(')').expect("entry end")];
+            for want in [
+                format!("\"-DFMT_{fmt}\""),
+                format!("\"-DTILE_BT={}u\"", t.tokens),
+                format!("\"-DTILE_BW={}u\"", t.rows),
+                format!("\"-DTILE_BKS={}u\"", t.k_blocks),
+                format!("\"-DTILE_TT={}u\"", t.thread_tokens),
+                format!("\"-DTILE_TW={}u\"", t.thread_rows),
+            ] {
+                assert!(entry.contains(&want), "{name}: {entry} lacks {want}");
             }
         }
     }

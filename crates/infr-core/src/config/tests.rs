@@ -1204,6 +1204,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_BM16",
         "INFR_NO_DN_CHUNK",
         "INFR_NO_DN_SPLIT",
+        "INFR_NO_DP4A_KQ",
         "INFR_NO_F32_MROW",
         "INFR_NO_F32_V4",
         "INFR_NO_FLASH_WARP",

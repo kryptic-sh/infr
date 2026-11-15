@@ -75,6 +75,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Vulkan prefill and decode on GPUs without a cooperative matrix are faster,
+  and ahead of llama.cpp on the integrated GPU measured** (RDNA2 iGPU, AMD
+  Windows driver; two interleaved runs of three reps each against the previous
+  build): Qwen3-1.7B Q4_K_M pp512 126.2 and 126.2 t/s to 231.9 and 232.0, tg128
+  23.8 and 23.8 to 27.5 and 27.4; LFM3-1.7B Q4_K_M pp512 138.2 and 138.3 to
+  236.7 and 236.8, tg128 23.7 and 23.6 to 26.7 and 26.7 (llama.cpp on the same
+  files and device: 187.04 / 25.46 and 195.95 / 25.27). What changed:
+  - **K-quant prefill GEMM.** Q4_K, Q5_K and Q6_K Linears past 64 rows take a
+    new register-blocked int8-dot GEMM (`native_gemm_dp4a_kq.comp`: 128 tokens
+    by 64 weight rows per workgroup, 8 by 8 outputs per thread, two 32-element k
+    blocks per barrier pair, on the int8 coopmat GEMM's staging) where the
+    per-dtype `native_gemm_mmq_*` tile computed 4 by 4 outputs per thread and
+    synchronized every k block. The integer sums are the old kernel's; only the
+    float association of the per-block scaling moved. Per call on Qwen3-1.7B
+    pp512: the fused gate/up 13.6 to 8.0 ms, the Q6_K `ffn_down` 8.0 to 4.1 ms,
+    the 2048-wide projections 2.3 to 1.3 ms. Turn it off with
+    `INFR_NO_DP4A_KQ=1` (`kernels.vulkan.dp4a_kq = false`).
+  - **Non-coopmat prefill attention (`attn_nc_fa.comp`)** register-blocks the
+    score and output tiles, runs the softmax on every thread and keeps the
+    output accumulator in registers: 6.5 to 2.3 ms per call on Qwen3-1.7B pp512.
+    It now fits the 32768 bytes of shared memory every Vulkan device guarantees;
+    it used to ask for 37632 (hd 128), 54016 (hd 256) and 47616 (hd 512).
+  - **The int8 decode GEMV on an integrated GPU** computes four outputs per
+    workgroup at every width (a discrete GPU keeps that below 2048 wide): on
+    LFM3-1.7B the fused gate/up 628.6 to 544.4 us, `ffn_down` 403.6 to 363.1 us,
+    the lm_head 8.7 to 7.6 ms per token.
+  - **Sibling Linears share one quantized input** on the non-coopmat GEMMs and
+    on the m=1 int8 GEMV, and the Q6_K int8 GEMV reads a block's `d` and its two
+    scales with one load each. On the RX 7900 XTX this is the only change that
+    runs: Qwen3-1.7B tg128 447.5 and 447.3 to 479.6 and 479.1 t/s (the k and v
+    GEMVs reuse the q projection's quantized input: 5376 to 3584 quant passes
+    over 32 tokens); LFM3-1.7B tg128 and both pp512 are unchanged within noise.
 - **Vulkan prefill of Q4_K, Q5_K and Q6_K weights now quantizes the activations
   to int8, as llama.cpp's Vulkan backend does, on devices running the AMD
   proprietary driver** (`DriverId::AMD_PROPRIETARY`; measured on the Windows

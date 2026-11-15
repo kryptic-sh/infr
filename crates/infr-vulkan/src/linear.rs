@@ -498,12 +498,12 @@ mod tests {
         );
         for in_f in [1024, 4096] {
             assert!(
-                crate::recorder::mmv_mrow_variant(&vk, Iq4Xs, 1, in_f, true).is_none(),
+                crate::recorder::mmv_mrow_variant(&vk, Iq4Xs, 1, in_f, true, false).is_none(),
                 "Iq4Xs has no _res mrow build — the lookup must say so (in_f={in_f})"
             );
             // A dtype that DOES have the residual build reports it, so the lookup isn't vacuously
             // empty for everyone.
-            assert!(crate::recorder::mmv_mrow_variant(&vk, Q4K, 1, in_f, true).is_some());
+            assert!(crate::recorder::mmv_mrow_variant(&vk, Q4K, 1, in_f, true, false).is_some());
         }
     }
 

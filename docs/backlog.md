@@ -807,10 +807,16 @@ residue worth tracking; what follows is that plus what was deliberately left.
   SELECTION is seen on the Ryzen 9950X3D's Raphael iGPU (RADV): `unified_memory`
   is set there and the banner prints `UNIFIED MEMORY` (run). What is NOT covered
   is the sizing: nothing sizes `paging.cache` (which on such parts comes out of
-  shared RAM) against HOST memory the way `paging.dram` is, and no streamed
-  model has been run on the iGPU. A feature (a host-memory term in the arena
-  sizing) plus a run of a streamed model on the iGPU. Metal has no pager until
-  phase 4, so it inherits none of this yet.
+  shared RAM) against HOST memory the way `paging.dram` is. Streamed models DO
+  run on the Windows box's iGPU (`Vulkan1`, 2026-11-15, the arena-less
+  `stream_only` host tier selected automatically): ERNIE-4.5-0.3B and LFM3-1.7B
+  F16 at `paging.cache=200m` are token-identical to resident
+  (`gpu_seam_dense_stream_f16_matches_resident`), and the GPU gate filter
+  (`test(gpu_seam) | test(stream) | test(tier) | test(paged)`, the Qwen3-1.7B
+  `gpu_seam_dense_stream_*` tests among them) passes there; ERNIE-4.5-0.3B F16
+  measured pp512 271.1 and tg32 11.9 t/s streamed against 295.7 and 37.4
+  resident. Left: the feature (a host-memory term in the arena sizing). Metal
+  has no pager until phase 4, so it inherits none of this yet.
 - **Layer-major prefill LANDED; what is left is where it does not reach.** The
   chunk loop now runs inside the layer loop for a streamed model
   (`seam::layer_major_prefill`, the `spans`/`chunks` walk in
@@ -5601,3 +5607,61 @@ reads all of it. The seams it already has, each nameable and testable alone:
 
 Not started: a move-only split first, then behaviour changes in their own
 commits.
+
+### B193 — what float dense streaming left (2026-11-15)
+
+**Tag:** streaming · plan 05 · **Blocked on:** nothing; each is its own slice
+
+F16 and F32 dense projections stream on Vulkan since 2026-11-15: the planner
+admits `infr_vulkan::linear::dense_stream_supported` dtypes, and a streamed
+float `Op::Linear` runs `float_linear` (adapter) — the resident float dispatch —
+at the arena slot's address. What that slice did not do:
+
+- **A streamed f16 Linear+Add pair is unfused.** `execute_static` removes every
+  streamed weight's `Linear→Add` fusion because the native fused kernels bake a
+  zero offset, so a streamed f16 decode residual runs `linear_f16` plus a
+  standalone Add where the resident one runs `linear_res`. Same arithmetic (the
+  fused kernel adds the residual to the same reduction), one more dispatch per
+  pair. `Recorder::linear_add_at` already takes an address, so keeping the f16
+  pairs fused is a filter change plus a test. Not measured.
+- **The resident footprint still misprices two load-time widenings.**
+  `weights::tensor_resident_bytes` now counts every dtype at its file bytes
+  except `I2S`, but `wload` also widens an f16/bf16 depthwise conv kernel
+  (`ssm_conv1d`, `shortconv.conv`) and deepseek2's quantised `attn_k_b`/
+  `attn_v_b` to f32. Small tensors; the estimate is low by their difference.
+- **The streamed path costs throughput even when every block is resident.**
+  ERNIE-4.5-0.3B F16 on the RX 7900 XTX at `INFR_CACHE=1G`, where all 108 blocks
+  have a slot: pp512 8509 t/s and tg128 358.1 t/s against 22508 and 449.7
+  resident (one run each, reps 3; host load not sampled for the capped run).
+  That is the streamed machinery itself (per-op staging, the arena barriers,
+  layer-major prefill), not float kernels — they are the resident ones — and it
+  is not diagnosed here.
+- **Not verified:** a slot placed past 4 GiB of an arena (the base is a 64-bit
+  host-computed address and the float kernels never add the slot position in
+  u32, read in `DensePagerSession::stage`, but no test allocates such an arena);
+  an f16 or f32 model larger than VRAM under AUTO placement (every run here
+  forced the cap with `paging.cache`; the f32 pricing fix that placement depends
+  on is unit-tested only); an f16 `w_off` (refused, as it is resident); the
+  Metal backend (no pager, unchanged).
+
+### B194 — the Qwen3-30B-A3B GPU tests take nearly all host RAM on the iGPU (2026-11-15)
+
+**Tag:** test suite · iGPU · **Blocked on:** nothing; needs a decision on what
+the iGPU leg should run
+
+On the Windows box's integrated GPU (`Vulkan1`, unified memory), the
+all-resident leg of `gpu_seam_paged_moe_host_tier_matches_resident` places
+Qwen3-30B-A3B Q4_K_M (18.5 GB of weights) in shared RAM, with the paged legs'
+host arenas on top. Run alone, it took available host memory from 37751 MB to a
+minimum of 3698 MB (`typeperf "\Memory\Available MBytes"` at 1 s, 75.5 s run,
+passed). A GPU gate run on `Vulkan1` with the
+`test(gpu_seam) | test(stream) | test(tier) | test(paged) | test(lfm3)` filter
+was killed by the agent harness for low memory on 2026-11-15. Of that filter's
+`test(stream) | test(tier)` GPU tests, each run alone and measured the same way,
+this is the only one near the limit (every other one kept 32307 MB or more
+available); the rest of the filter was not measured. It predates the
+float-streaming change that was being gated. The other Qwen3-30B-A3B
+`gpu_seam_paged_moe_*` tests in the same filter have the same resident leg and
+were not measured. Options: skip the resident leg on a unified device when the
+model exceeds a fraction of host RAM (the paged legs are the point there), or
+run the 30B tests on the discrete GPU only and say so in their doc.

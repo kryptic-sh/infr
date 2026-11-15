@@ -17,12 +17,17 @@ item marked **to confirm** was taken from a doc and not re-read in code on
 
 These are the ones that break the goal outright, so they come first.
 
-1. **Float weights do not stream on Vulkan.** `native_dense_supported` excludes
-   F16 and F32 because their kernels take no weight offset, so an f16 checkpoint
-   has no streamable dense weights (`disk-streaming-plan.md` §3.2). Needs
-   offset-capable (arena-addressed) f16 / f32 GEMV and GEMM kernels, or a
-   load-time decision to run such a file through a quantised cache. **To
-   confirm** in `adapter.rs`.
+1. **Only llama-shaped projections stream.** The dense planner in `seam/mod.rs`
+   (`dense_plan`) enumerates each layer's `attn_q/k/v`, `attn_output`,
+   `ffn_gate`/`ffn_up` and `ffn_down`, whatever their dtype (F16 and F32
+   included since 2026-11-15). Any other per-layer projection stays resident
+   under any budget: LFM3's `shortconv.in_proj`/`out_proj` (read on LFM3-1.7B
+   F16: 92 groups stream, the 13 conv layers' two projections, about 13% of its
+   parameters, do not), and, **to confirm** by the same count, qwen35's DeltaNet
+   projections, gemma4 E2B's per-layer projections and the MLA families'
+   projections. Needs those groups in the enumeration (and in
+   `fuse_*_decision`'s upload-order contract), each with its streamed dispatch
+   checked to take an arena address.
 2. **Weights rewritten at load cannot be re-read from the file:** the qwen2 NEOX
    q/k row permute and the BitNet `I2S` → f16 dequant (§3.2). Options: apply the
    rewrite per block on the read path (a `BlockIo` wrapper that transforms after

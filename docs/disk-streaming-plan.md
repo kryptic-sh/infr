@@ -195,9 +195,13 @@ one file, and sharded-GGUF support is deferred (§7).
 **Blocks that cannot be re-read from the file.** The seam rewrites some tensors
 at load — the qwen2 NEOX q/k row permute, the BitNet `I2S` → f16 dequant — and
 the Vulkan dense streaming path already excludes them for that reason. It also
-excludes dtypes whose kernels take no weight offset (`native_dense_supported`;
-F16/F32 are out, so an f16 checkpoint has **no** streamable dense weights on
-Vulkan today). Both exclusions are conditions on the tier planner, not
+excludes dtypes the streamed dispatch cannot read from an arena slot
+(`infr_vulkan::linear::dense_stream_supported`): every native quant format and
+bf16 take an element offset into the slot, and F16/F32 run the resident float
+kernels, which read their weight from a 64-bit base address, at the slot's
+address (a float slot is aligned like a resident weight,
+`dense_stream_slot_align`). So since 2026-11-15 an f16 or f32 checkpoint streams
+like a quantised one. Both exclusions are conditions on the tier planner, not
 afterthoughts: the eligibility predicate moves out of the Vulkan-only
 `dense_plan` block in `seam/mod.rs` and next to `fuse_gu_decision` /
 `fuse_qkv_decision`, where the other shared enumeration rules live, so CPU and

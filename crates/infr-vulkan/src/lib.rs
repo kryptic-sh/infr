@@ -3101,6 +3101,24 @@ impl VulkanBackend {
         Some((total, sess.fills()))
     }
 
+    /// [`Self::moe_pager_totals`]'s dense twin: the dense layer-streaming session's counters summed
+    /// over every pool — or `None` when no weight of the loaded model streams.
+    pub fn dense_pager_totals(&self) -> Option<crate::pager::DenseTotals> {
+        let guard = self.dense_pager.lock().unwrap();
+        let sess = guard.as_ref()?;
+        let mut t = crate::pager::DenseTotals {
+            groups: sess.n_streamed(),
+            ..Default::default()
+        };
+        for (s, host) in sess.pool_stats() {
+            t.vram.hits += s.hits;
+            t.vram.misses += s.misses;
+            t.vram.evictions += s.evictions;
+            t.file_reads += host.map_or(0, |h| h.reads);
+        }
+        Some(t)
+    }
+
     /// Locked access to the paged-MoE session for the adapter's `execute_static` — `pub(crate)`
     /// (only `adapter.rs` reaches into this); see `pager.rs`'s module doc for why this lives
     /// outside the `Graph`/`Bindings` seam instead of a per-op flag.

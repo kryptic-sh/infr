@@ -257,6 +257,12 @@ impl DenseVulkanSession {
     pub fn moe_pager_totals(&self) -> Option<(infr_core::pager::PagerStats, u64)> {
         self.be.moe_pager_totals()
     }
+
+    /// The dense layer-streaming cache's counters
+    /// ([`infr_vulkan::VulkanBackend::dense_pager_totals`]); `None` when nothing streams.
+    pub fn dense_pager_totals(&self) -> Option<infr_vulkan::pager::DenseTotals> {
+        self.be.dense_pager_totals()
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]

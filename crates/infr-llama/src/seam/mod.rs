@@ -2294,10 +2294,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
     //      VRAM; otherwise stream with budget = remaining VRAM after resident-weights+KV+reserve.
     //      An explicit oversized INFR_CTX whose KV can't sit beside resident weights falls back
     //      to streaming the same way (never clamped here — the ctx the caller asked for is kept).
-    // Streamable = the per-layer Linear projection groups whose dtype has offset-capable native
-    // kernels (`native_dense_supported`, F16/F32 excluded — `matmul_proj`/`linear_f32` take no
-    // weight offset) and whose bytes upload unmodified from the mmap (the qwen2 NEOX q/k row
-    // permute rewrites bytes at load, so those tensors stay resident).
+    // Streamable = the per-layer Linear projection groups whose dtype the streamed dispatch reads
+    // from an arena slot (`dense_stream_supported`: every native format, plus F16/F32, which run
+    // the resident float kernels at the slot's address) and whose bytes upload unmodified from the
+    // mmap (the qwen2 NEOX q/k row permute rewrites bytes at load, so those tensors stay resident).
     let mut dense_plan: std::collections::HashMap<String, (usize, u32, Vec<String>)> =
         std::collections::HashMap::new();
     // The tier BELOW VRAM, one entry per dense pool (empty = none: every miss reads the mmap).
@@ -2338,15 +2338,15 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
         let tinfo = |n: &str| g.tensors().iter().find(|t| t.name == n);
         // Eligible groups with their (dtype, raw bytes, numel) — a group whose tensors are
-        // missing (DeltaNet layers, gemma4 V-less layers) or whose dtype lacks offset-capable
-        // kernels simply stays resident.
+        // missing (DeltaNet layers, gemma4 V-less layers) or whose dtype has no arena-addressed
+        // dispatch simply stays resident.
         let eligible: Vec<(Vec<String>, infr_core::DType, usize, usize)> = groups
             .into_iter()
             .filter_map(|comps| {
                 let infos: Vec<_> = comps.iter().map(|n| tinfo(n)).collect::<Option<_>>()?;
                 let dt = infos[0].dtype;
                 if !infos.iter().all(|t| t.dtype == dt)
-                    || !infr_vulkan::linear::native_dense_supported(dt)
+                    || !infr_vulkan::linear::dense_stream_supported(dt)
                 {
                     return None;
                 }
@@ -2462,24 +2462,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 }
             }
         }
-        // Slot stride: the group's raw bytes padded to a whole number of quant blocks AND
-        // u32 words, so every slot base is block-aligned (the kernels' element-offset weight
-        // addressing needs `slot_byte_base = whole blocks`) and the arena binds as
-        // `array<u32>`. Hoisted above the budget decision so the streaming-chunk sweep below
-        // can price the full-arena need with the exact strides the pools use.
-        let lcm = |a: usize, b: usize| {
-            let gcd = {
-                let (mut x, mut y) = (a, b);
-                while y != 0 {
-                    (x, y) = (y, x % y);
-                }
-                x
-            };
-            a / gcd * b
-        };
-        let stride_of = |dt: infr_core::DType, raw: usize| {
-            raw.next_multiple_of(lcm(infr_gguf::block_layout(dt).1, 4))
-        };
+        // Slot stride (`dense_stream_slot_stride`): the group's raw bytes padded to a whole
+        // number of quant blocks AND to the dtype's slot alignment (u32 words for the native
+        // kernels, the resident arena's placement for the float ones), so every slot base is
+        // block-aligned (the kernels' element-offset weight addressing needs `slot_byte_base =
+        // whole blocks`) and the arena reads as `array<u32>`. Hoisted above the budget decision
+        // so the streaming-chunk sweep below can price the full-arena need with the exact
+        // strides the pools use.
+        let stride_of = infr_vulkan::linear::dense_stream_slot_stride;
         let budget = match cache_override {
             Some(spec) => Some(spec.resolve(vram.available)),
             None if resident => None,
@@ -2562,7 +2552,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let specs: Vec<infr_vulkan::pager::DensePoolSpec> = pools
                 .iter()
                 .enumerate()
-                .map(|(i, &(_, stride, nb))| {
+                .map(|(i, &(dtype, stride, nb))| {
                     // Proportional budget split (byte share == access share: every block is read
                     // exactly once per sweep). Floor 2 slots so the next block's upload can
                     // overlap the previous block's dispatch instead of serializing on one slot.
@@ -2577,6 +2567,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     let floor = 2.min(nb).max(1);
                     let budget_slots = ((share / stride as u64) as usize).clamp(floor, nb);
                     infr_vulkan::pager::DensePoolSpec {
+                        dtype,
                         slot_bytes: stride,
                         n_slots: budget_slots,
                         n_blocks: nb,
@@ -2650,6 +2641,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // guard between this plan's group enumeration and the runner's actual upload grouping
         // (`fuse_*_decision` keeps them aligned; a mismatch here is a bug, caught loudly).
         if let Some((pool, block_id, comps)) = dense_plan.get(name) {
+            // The same u32 element cap the resident upload below applies: a streamed group runs
+            // the same kernels, and the float ones index their weight in u32 elements.
+            check_bda_element_cap(name, "tensor", numel)?;
             // With a host tier under this pool, the group's bytes are read from the model file on
             // demand instead of faulted in through the mmap. `file_ranges` is `None` exactly for
             // bytes the loader REWROTE, which correspond to nothing on disk — those keep the mmap

@@ -230,6 +230,7 @@ fn the_host_tier_stages_the_same_bytes_the_mmap_source_does() {
     let mmap = sweep(
         &be,
         DensePoolSpec {
+            dtype: DTYPE,
             slot_bytes: stride,
             n_slots: VRAM_SLOTS,
             n_blocks: N_BLOCKS,
@@ -260,6 +261,7 @@ fn the_host_tier_stages_the_same_bytes_the_mmap_source_does() {
     let host_leg = sweep(
         &be,
         DensePoolSpec {
+            dtype: DTYPE,
             slot_bytes: stride,
             n_slots: VRAM_SLOTS,
             n_blocks: N_BLOCKS,
@@ -291,6 +293,7 @@ fn the_host_tier_stages_the_same_bytes_the_mmap_source_does() {
     let stream_leg = sweep(
         &be,
         DensePoolSpec {
+            dtype: DTYPE,
             slot_bytes: stride,
             n_slots: VRAM_SLOTS,
             n_blocks: N_BLOCKS,
@@ -435,6 +438,7 @@ fn a_host_block_missing_from_the_tier_below_is_refused_at_load() {
         &be,
         DensePagerLayout {
             pools: vec![DensePoolSpec {
+                dtype: DTYPE,
                 slot_bytes: stride,
                 n_slots: 1,
                 n_blocks: 2,
@@ -523,6 +527,7 @@ fn a_failed_read_leaves_nothing_resident() {
         &be,
         DensePagerLayout {
             pools: vec![DensePoolSpec {
+                dtype: DTYPE,
                 slot_bytes: stride,
                 n_slots: VRAM_SLOTS,
                 n_blocks: N_BLOCKS,

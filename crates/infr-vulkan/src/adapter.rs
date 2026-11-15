@@ -1104,6 +1104,15 @@ fn split_k_compute_units(be_: &VulkanBackend) -> u32 {
     split_k_cu_for_driver(be_.amd_proprietary_driver(), be_.caps().compute_units)
 }
 
+impl VulkanBackend {
+    /// How many K splits the split-K warptile takes for an `m` x `in_f` → `out_f` prefill GEMM on
+    /// this device (1 = none): `split_k_plan` at this device's compute-unit window, the decision
+    /// the `Op::Linear` dispatch consults. Public so a route test reads it instead of restating it.
+    pub fn split_k_splits(&self, m: usize, in_f: usize, out_f: usize) -> usize {
+        split_k_plan(m, in_f, out_f, split_k_compute_units(self))
+    }
+}
+
 /// [`split_k_compute_units`]'s rule, pure for its unit test.
 fn split_k_cu_for_driver(amd_proprietary: bool, compute_units: u32) -> u32 {
     if amd_proprietary {
@@ -1368,9 +1377,10 @@ fn lower_op(
     // ordered explicitly by `arena_stream_barrier` at the staging site (`stage_dense_linear`) — the
     // SAME slot/RAW barrier already covers the prefill dispatch. Every other op — and every
     // non-streamed model — passes `None` (zero change). Only the `Op::Linear` arm reads it; the
-    // seam's placement guarantees a streamed weight's dtype rides the offset-capable native paths
-    // (`native_dense_supported`) and never the fused-residual peephole (filtered by `execute_static`
-    // before the loop).
+    // seam's placement admits only `linear::dense_stream_supported` dtypes, and a streamed weight
+    // never takes the fused-residual peephole (filtered by `execute_static` before the loop). An
+    // F16/F32 weight bypasses that m-split and runs `float_linear` — the resident float dispatch —
+    // at the slot address.
     wsub: Option<u64>,
 ) -> Result<()> {
     let memo_prev = mmv_memo.take();
@@ -1486,11 +1496,19 @@ fn lower_op(
             // decode/small-m keep the single streamed GEMV. Both dispatch ONLY arena-addressed
             // kernels, never an unconverted SSBO one, which is what lets the seam drop the pool caps.
             if let Some(arena_addr) = wsub {
-                // Placement guarantees an offset-capable native dtype (the f16/f32 fallback arms
-                // take no weight offset) — a violation here would read the wrong arena bytes.
+                // A float weight runs the resident float dispatch with the slot's address in place
+                // of the resident buffer's: the same kernels, the same routing, the same bytes.
+                if matches!(dt, infr_core::DType::F16 | infr_core::DType::F32) {
+                    return float_linear(
+                        be_, graph, dt, arena_addr, w_off, x, xb, y, dst, m, in_f, out_f, rec,
+                        pool, transient, memo_prev, mmv_memo,
+                    );
+                }
+                // Placement admits only `dense_stream_supported` dtypes, and everything past the
+                // float arm above is a native one — anything else here would read the wrong bytes.
                 if !native_dense_supported(dt) {
                     return Err(be("vulkan adapter: streamed Linear weight of a dtype \
-                                   without offset-capable kernels"));
+                                   without arena-addressed kernels"));
                 }
                 // A Tiled route the weight or grid cannot take keeps the per-row GEMV it had before
                 // that route existed (see `streamed_tiled_fits`).
@@ -1534,29 +1552,6 @@ fn lower_op(
                     rec.linear_native_at(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
                 }
                 return Ok(());
-            }
-            // `w_off` on a NON-native (float) weight. The native quant/bf16 kernels take the offset
-            // as a push field; the float fallbacks have no such field and index the weight from
-            // element 0 — so an unhandled `w_off` there reads rows 0..out_f and is silently wrong.
-            //
-            // F32 is handled: every float GEMV in this backend already addresses its weight by a
-            // 64-bit `bufferDeviceAddress` (`Recorder::linear_f32` is `linear_f32_at` at
-            // `w.device_addr()`), so a ROW-ALIGNED slice is just a shifted base pointer, which is
-            // what the `w_off != 0` arm at the F32 dispatch below passes. DeepSeek V4's grouped
-            // output projection is the caller (`w_off = g * o_lora_rank * in_f`); an f32 `wo_a` is
-            // what the synthetic V4 fixture writes, and what the CPU-vs-Vulkan parity test runs.
-            //
-            // F16 is NOT, and is refused rather than approximated: its m>1 path is the coopmat
-            // `matmul_proj` and its m=1 path is `linear`/`linear_f16_noext`, three more shifted-
-            // address call sites plus a 4-byte alignment obligation on the two that read the
-            // weight as packed u32 words — and nothing in the tree produces an f16 `w_off` today,
-            // so every line of it would be untested. A real (quantized) V4 GGUF takes the native
-            // path above and never reaches here.
-            if w_off != 0 && !native_dense_supported(dt) && dt != infr_core::DType::F32 {
-                return Err(be(format!(
-                    "vulkan adapter: Linear w_off on a {dt:?} weight — only the native (quant / \
-                     bf16) kernels and the f32 GEMV take a weight offset"
-                )));
             }
             // Fused Linear+Add (decode residual): one GEMV with the residual added in-kernel —
             // see linear_add_peephole. `y` (the Linear's scratch dst) is never written.
@@ -1676,6 +1671,17 @@ fn lower_op(
                     rec.linear_add(w, xb, rr, yf, m, in_f, out_f);
                 }
                 return Ok(());
+            }
+            // Float weights take their own dispatch, shared with the streamed arm above. None of
+            // the native-only tiers below has a float build (`float_weights_skip_native_tiers`).
+            if matches!(dt, infr_core::DType::F16 | infr_core::DType::F32) {
+                let w_addr = w
+                    .device_addr()
+                    .expect("resident-BDA weight: float Linear requires a u64 BDA address");
+                return float_linear(
+                    be_, graph, dt, w_addr, w_off, x, xb, y, dst, m, in_f, out_f, rec, pool,
+                    transient, memo_prev, mmv_memo,
+                );
             }
             // Prefill (m>1): a TILED GEMM writes ceil(m/64)*64 rows DIRECTLY into `y` (Internal
             // buffers are row-padded to 64 up front, so no temp/copy). Needs n%64==0, k%32==0.
@@ -1809,10 +1815,8 @@ fn lower_op(
                 && out_f % 128 == 0
                 && in_f % 64 == 0
                 && crate::gemm::native_gemm_warp_cm8_build_spv(dt).is_some();
-            let is_gemm = cm8_ok
-                || (gemm_ok
-                    && be_.caps().f16_coopmat()
-                    && (native_dense_supported(dt) || matches!(dt, infr_core::DType::F16)));
+            let is_gemm =
+                cm8_ok || (gemm_ok && be_.caps().f16_coopmat() && native_dense_supported(dt));
             // ── NON-COOPMAT prefill GEMM tier (never taken when `caps.f16_coopmat` — zero effect
             // on coopmat-capable defaults). The Intel Arc A770 (Mesa ANV) enumerates f16 coopmat
             // only at M=8,N=8,K=16 — `caps.f16_coopmat()` is false there (see lib.rs) — but HAS
@@ -2104,7 +2108,7 @@ fn lower_op(
                             in_f,
                             out_f,
                         );
-                    } else if native_dense_supported(dt) {
+                    } else {
                         // A_GLOBAL f16-A cast / narrow-n split-K / direct tile — the SAME tile selection
                         // as the streamed twin (`native_warp_gemm`), reading the resident weight by its
                         // BDA. Occupancy note: dropping the As stage shrinks LDS to Bs-only → ~1.5x on
@@ -2116,51 +2120,6 @@ fn lower_op(
                         native_warp_gemm(
                             be_, dt, w_addr, w_off, xb, out, m, in_f, out_f, rec, pool,
                         )?;
-                    } else {
-                        // F16 deep-k narrow-n → SPLIT-K warptile (DG slice-7 comparative
-                        // attribution): the SC soft-embedding GEMM (m=canvas=256, k=vocab=262144,
-                        // n=ne=2816, f16 weight) measured 58ms/step at ~6.5 TFLOPS on the legacy
-                        // `gemm_proj` BN=64 tile below (28% of the whole denoise step) vs llama.cpp's
-                        // 14.1ms @ 27 TFLOPS for the IDENTICAL shape — the single biggest
-                        // infr-vs-fork per-stage delta. Same narrow-grid split-K policy as the
-                        // native-quant branch above (out_f%128, deep k, grid under
-                        // `split_k_plan`'s window); the F16 decode is exact (see native_decode.glsl FMT_F16), so numerics match the
-                        // f16 coopmat route up to accumulation order. Everything that doesn't hit
-                        // the split-K window keeps the `matmul_proj` route unchanged.
-                        // Same splits policy as the quant branch above (`split_k_plan`). Probed deeper
-                        // splits at the SC shape (splits=4/8/16 via a temporary env override): the op
-                        // shaved 30.0 -> 25.8-28.4ms but dg-step stayed flat (1100-1107, within noise),
-                        // so the shared formula stays — no bespoke tuning knob.
-                        let splits = split_k_plan(m, in_f, out_f, split_k_compute_units(be_));
-                        if matches!(dt, infr_core::DType::F16)
-                            && splits > 1
-                            && in_f.is_multiple_of(64)
-                            && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some()
-                            && be_.cfg().kernels.vulkan.gemm_warp
-                        {
-                            let mpad = m.div_ceil(64) * 64;
-                            let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
-                            let w_addr = w.device_addr().expect(
-                            "resident-BDA weight: F16 split-K Linear requires a u64 BDA address",
-                        );
-                            rec.matmul_native_splitk(
-                                dt,
-                                xb,
-                                w_addr,
-                                w_off,
-                                pool[&pk].as_ref(),
-                                out,
-                                m,
-                                in_f,
-                                out_f,
-                                splits,
-                                false,
-                            );
-                        } else {
-                            // f16 coopmat GEMM. `matmul_proj` internally forks on `wq.device_addr()`
-                            // (see its recorder doc) — no threading needed here.
-                            rec.matmul_proj(xb, w, out, m, in_f, out_f);
-                        }
                     }
                     Ok(())
                 })?;
@@ -2302,41 +2261,11 @@ fn lower_op(
                 } else {
                     rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
                 }
-            } else if matches!(dt, infr_core::DType::F32) {
-                // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj, DeepSeek
-                // V4's grouped output projection): the seam uploads native dtype, and the f16 GEMV
-                // would read the f32 bytes as f16 garbage.
-                if w_off == 0 {
-                    rec.linear_f32(w, xb, y, m, in_f, out_f);
-                } else {
-                    // Row-aligned slice of the weight (`w_off % in_f == 0`, `Op::Linear::w_off`'s
-                    // contract) expressed as a shifted base ADDRESS, because `linear_f32r.comp` has
-                    // no offset field. Alignment: the vec4 variant declares a 16-byte-aligned
-                    // buffer_reference and is only chosen when `in_f % 4 == 0`, and `w_off` is a
-                    // whole multiple of `in_f`, so `w_off * 4` bytes is a multiple of 16 exactly
-                    // when that variant can run. The scalar variants need 4, which any f32 element
-                    // offset satisfies. Asserted rather than assumed — a violation would read
-                    // misaligned and is not otherwise detectable.
-                    if w_off % in_f != 0 {
-                        return Err(be(format!(
-                            "vulkan adapter: Linear w_off {w_off} is not a whole multiple of \
-                             in_f {in_f} — the f32 GEMV addresses a row-aligned weight slice"
-                        )));
-                    }
-                    let base = w.device_addr().ok_or_else(|| {
-                        be("vulkan adapter: f32 Linear with w_off needs a BDA weight address")
-                    })?;
-                    rec.linear_f32_at(base + (w_off * 4) as u64, xb, y, m, in_f, out_f);
-                }
-            } else if be_.caps().f16 {
-                rec.linear(w, xb, y, m, in_f, out_f);
             } else {
-                // No shaderFloat16 (implies no coopmat too — f16 is a coopmat prerequisite):
-                // linear_f16.comp's `float16_t` SSBO read needs the Float16 SPIR-V capability the
-                // device lacks. linear_f16_noext.comp is the same dispatch shape reading the f16
-                // weight buffer as packed u32 words and unpacking via the CORE `unpackHalf2x16`
-                // builtin instead — correctness-first, not perf-tuned (no row-tiling).
-                rec.linear_f16_noext(w, xb, y, m, in_f, out_f);
+                // F16/F32 returned through `float_linear` above; nothing else has a Linear kernel.
+                return Err(be(format!(
+                    "vulkan adapter: no Linear kernel reads a {dt:?} weight"
+                )));
             }
         }
         Op::Add { a, b, dst, n } => rec.add(r(*a)?, r(*b)?, r(*dst)?, *n as usize),
@@ -6544,6 +6473,153 @@ fn streamed_gemm_route(
     }
 }
 
+/// `Op::Linear` on an F16 or F32 weight whose bytes start at `w_addr`: a resident weight's own
+/// BDA address, or the arena slot a dense-streaming pool staged it into. Both callers go through
+/// here, so a streamed float weight runs exactly the kernels its resident twin would, in the same
+/// routing. Every kernel here takes its weight's base as a 64-bit address — which is why the slot
+/// address is all a streamed weight needs — and the split-K warptile and the fma GEMM also take
+/// an element offset (`w_off`) on top of it; the GEMVs and `gemm_proj` take none.
+///
+/// Routing, in order:
+///  • f16 prefill on a coopmat device (`m > 1`, `out_f % 64`, `in_f % 32`): the narrow-grid
+///    split-K warptile where `split_k_plan` asks for it (the DiffusionGemma SC soft-embedding,
+///    m=256, k=262144, n=2816: 58 ms/step on the BN=64 `gemm_proj` tile at ~6.5 TFLOPS against
+///    llama.cpp's 14.1 ms; the F16 decode is exact, see native_decode.glsl FMT_F16), else the
+///    coopmat `matmul_proj`.
+///  • any float prefill without coopmat: the non-coopmat fma warptile (`nc_gemm_choice`).
+///  • everything else: the f32 GEMV (`linear_f32r` family) or the f16 GEMV (`linear_f16`, or
+///    `linear_f16_noext` on a device without `shaderFloat16`).
+///
+/// `w_off` (`Op::Linear::w_off`, a row-aligned slice): F32 shifts the base address (DeepSeek V4's
+/// grouped output projection, `w_off = g * o_lora_rank * in_f`, is the caller; the synthetic V4
+/// fixture's f32 `wo_a` is what the CPU-vs-Vulkan parity test runs). F16 is refused rather than
+/// approximated: nothing in the tree produces an f16 `w_off`. `linear_f16` and `gemm_proj` have no
+/// offset field, so it would be a shifted base address, and `gemm_proj` and `linear_f16_noext`
+/// read the weight as u32 words (4-byte `buffer_reference_align`), which an odd-element shift
+/// breaks — an alignment rule every route would have to carry, with nothing to test it.
+#[allow(clippy::too_many_arguments)]
+fn float_linear(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    dt: infr_core::DType,
+    w_addr: u64,
+    w_off: usize,
+    x: &TensorId,
+    xb: &dyn Buffer,
+    y: &dyn Buffer,
+    dst: &TensorId,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    rec: &Recorder<'_>,
+    pool: &mut ScratchPool,
+    transient: &mut Vec<Box<dyn Buffer>>,
+    memo_prev: Option<(TensorId, usize, usize, &'static str)>,
+    mmv_memo: &mut Option<(TensorId, usize, usize, &'static str)>,
+) -> Result<()> {
+    let is_f16 = match dt {
+        infr_core::DType::F16 => true,
+        infr_core::DType::F32 => false,
+        _ => {
+            return Err(be(format!(
+                "vulkan adapter: float Linear dispatch reached with a {dt:?} weight"
+            )))
+        }
+    };
+    if w_off != 0 && is_f16 {
+        return Err(be(format!(
+            "vulkan adapter: Linear w_off on a {dt:?} weight — the f16 Linear routes take no \
+             weight offset (see `float_linear`)"
+        )));
+    }
+    let gemm_ok = m > 1 && out_f.is_multiple_of(64) && in_f.is_multiple_of(32);
+    // Only f16 has a coopmat GEMM (`gemm_proj` stages the weight as f16 for the matrix cores);
+    // an f32 prefill on a coopmat device keeps the row-tiled f32 GEMV.
+    let is_gemm = is_f16 && gemm_ok && be_.caps().f16_coopmat();
+    let nc = nc_gemm_choice(be_, dt, gemm_ok);
+    if nc.is_some() {
+        check_nc_gemm_grid(dt, m, out_f)?;
+    }
+    // The tiled GEMMs decode a 64-row weight tile that cannot be split into single input rows, so a
+    // `>= 2^32`-element weight fails loudly there rather than wrap (issue #77).
+    if (is_gemm || nc.is_some())
+        && crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
+    {
+        return Err(be(format!(
+            "vulkan adapter: output-projection tiled GEMM (m={m}, in_f={in_f}, out_f={out_f}, \
+             {dt:?}) reads a >= 2^32-element weight — chunked dispatch covers only m=1 decode and \
+             the per-row GEMV (issue #77). This is a multi-row lm_head (speculative verify / \
+             all-position logits) on a big-vocab model."
+        )));
+    }
+    if is_gemm {
+        // Same padded-dst dance as every other tiled GEMM (`with_padded_dst`).
+        with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
+            let splits = split_k_plan(m, in_f, out_f, split_k_compute_units(be_));
+            if splits > 1
+                && in_f.is_multiple_of(64)
+                && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some()
+                && be_.cfg().kernels.vulkan.gemm_warp
+            {
+                let mpad = m.div_ceil(64) * 64;
+                let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
+                rec.matmul_native_splitk(
+                    dt,
+                    xb,
+                    w_addr,
+                    w_off,
+                    pool[&pk].as_ref(),
+                    out,
+                    m,
+                    in_f,
+                    out_f,
+                    splits,
+                    false,
+                );
+            } else {
+                rec.matmul_proj_at(xb, w_addr, out, m, in_f, out_f);
+            }
+            Ok(())
+        })
+    } else if let Some(kind) = nc {
+        nc_prefill_gemm(
+            be_, graph, kind, dt, w_addr, w_off, x, xb, y, dst, m, in_f, out_f, rec, pool,
+            transient, memo_prev, mmv_memo,
+        )
+    } else if !is_f16 {
+        // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj, DeepSeek V4's
+        // grouped output projection, an all-f32 checkpoint): the f16 GEMV would read the f32 bytes
+        // as f16 garbage.
+        //
+        // A `w_off` is a row-aligned slice of the weight (`w_off % in_f == 0`, `Op::Linear::w_off`'s
+        // contract) expressed as a shifted base ADDRESS, because `linear_f32r.comp` has no offset
+        // field. Alignment: the vec4 variant declares a 16-byte-aligned buffer_reference and is only
+        // chosen when `in_f % 4 == 0`, and `w_off` is a whole multiple of `in_f`, so `w_off * 4`
+        // bytes is a multiple of 16 exactly when that variant can run. The scalar variants need 4,
+        // which any f32 element offset satisfies. Asserted rather than assumed — a violation would
+        // read misaligned and is not otherwise detectable.
+        if !w_off.is_multiple_of(in_f) {
+            return Err(be(format!(
+                "vulkan adapter: Linear w_off {w_off} is not a whole multiple of in_f {in_f} — the \
+                 f32 GEMV addresses a row-aligned weight slice"
+            )));
+        }
+        rec.linear_f32_at(w_addr + (w_off * 4) as u64, xb, y, m, in_f, out_f);
+        Ok(())
+    } else if be_.caps().f16 {
+        rec.linear_at(w_addr, xb, y, m, in_f, out_f);
+        Ok(())
+    } else {
+        // No shaderFloat16 (implies no coopmat too — f16 is a coopmat prerequisite):
+        // linear_f16.comp's `float16_t` read needs the Float16 SPIR-V capability the device lacks.
+        // linear_f16_noext.comp is the same dispatch shape reading the f16 weight as packed u32
+        // words and unpacking via the CORE `unpackHalf2x16` builtin instead — correctness-first,
+        // not perf-tuned (no row-tiling).
+        rec.linear_f16_noext_at(w_addr, xb, y, m, in_f, out_f);
+        Ok(())
+    }
+}
+
 /// Arena-addressed twin of the resident `Op::Linear` `is_gemm && native_dense_supported` coopmat-
 /// warp prefill arm (see the `is_gemm` block in `lower_op`): the SAME tile selection (A_GLOBAL
 /// f16-A cast, narrow-n split-K, or the direct tile) and the SAME padded-dst dance, but the weight
@@ -7887,6 +7963,32 @@ mod tests {
                     "n_chunks {n_chunks} > 1024 at span {span}, base {base}"
                 );
             }
+        }
+    }
+
+    /// `lower_op` sends an F16/F32 `Op::Linear` to `float_linear` ahead of the multi-row GEMV, the
+    /// `_cm8` and int8 coopmat tiers and the native GEMV/GEMM arms. That order is only free while
+    /// none of them has a float build: a float build added to one of them would be skipped, not
+    /// taken, and this is where that shows.
+    #[test]
+    fn float_weights_skip_native_tiers() {
+        use infr_core::DType::{F16, F32};
+        for dt in [F16, F32] {
+            assert!(!native_dense_supported(dt), "{dt:?}");
+            assert!(crate::gemm::native_mrow_kernel_name(dt).is_none(), "{dt:?}");
+            assert!(
+                crate::gemm::native_mmv_mrow_kernel_name(dt).is_none(),
+                "{dt:?}"
+            );
+            assert!(
+                crate::gemm::native_gemm_warp_cm8_build_spv(dt).is_none(),
+                "{dt:?}"
+            );
+            assert!(
+                i8cm_kq_choice(dt, 512, 4096, 4096, 0, 96).is_none(),
+                "{dt:?}"
+            );
+            assert!(crate::linear::dense_stream_supported(dt), "{dt:?}");
         }
     }
 

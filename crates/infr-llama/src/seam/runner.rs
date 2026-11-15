@@ -795,8 +795,8 @@ pub(crate) fn generate_dense_backend_bound(
                     // the seam does (permute_rows / row_bytes / the CPU Op::Linear all assume one quant
                     // block per weight row, and the GPU has no i2_s kernel). Host-dequant to f16 ONCE
                     // here; every downstream stage then treats it as a plain f16 weight. The f16
-                    // footprint (numel*2) is exactly what `weights::tensor_resident_bytes` already
-                    // prices for a non-`native_dense_supported` dtype, so the VRAM budget stays honest.
+                    // footprint (numel*2) is exactly what `weights::tensor_resident_bytes` prices
+                    // for `I2S`, so the VRAM budget stays honest.
                     let mut cat: Vec<u8> = Vec::new();
                     let mut numel = 0usize;
                     for name in names {

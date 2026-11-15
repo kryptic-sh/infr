@@ -115,6 +115,7 @@ fn stream_weight(be: &VulkanBackend, dt: DType, wb: &[u8]) -> Box<dyn Buffer> {
     let stride = wb.len().next_multiple_of(blk_bytes * 4);
     be.init_dense_pager(DensePagerLayout {
         pools: vec![DensePoolSpec {
+            dtype: dt,
             slot_bytes: stride,
             n_slots: 1,
             n_blocks: 1,

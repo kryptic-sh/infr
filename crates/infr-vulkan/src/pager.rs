@@ -2109,14 +2109,28 @@ pub struct DenseSource {
     pub block_id: u32,
 }
 
-/// One dense pool's fixed layout: every block in it shares `slot_bytes` (the PADDED stride —
-/// a multiple of 4 (u32 arena) AND of the pool dtype's block byte size, so a slot base is always
-/// a whole number of quant blocks). The arena is a `bufferDeviceAddress` buffer read by 64-bit
+/// A dense streaming session's counters summed over its pools
+/// ([`crate::VulkanBackend::dense_pager_totals`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DenseTotals {
+    /// The VRAM arenas' residency counters.
+    pub vram: PagerStats,
+    /// Blocks the host tiers read off the model file; 0 without a host tier.
+    pub file_reads: u64,
+    /// Weight groups registered to stream.
+    pub groups: usize,
+}
+
+/// One dense pool's fixed layout: every block in it is `dtype` and shares `slot_bytes` (the PADDED
+/// stride, [`crate::linear::dense_stream_slot_stride`]: whole quant blocks at the dtype's slot
+/// alignment, so every slot base is block- and kernel-aligned). The arena is a `bufferDeviceAddress` buffer read by 64-bit
 /// pointer (see [`DensePagerSession`]), so `n_slots` is bounded only by the VRAM budget share (and
 /// the seam's floor) — there is NO per-arena `maxStorageBufferRange` cap and NO u32 element-reach
 /// cap (a slot's base byte address is computed in 64-bit; the op's `w_off` element offset rides on
 /// top within the kernel). Contrast the resident/SSBO path, which those two caps DID bind.
 pub struct DensePoolSpec {
+    /// The weight dtype every block in the pool holds.
+    pub dtype: infr_core::DType,
     pub slot_bytes: usize,
     pub n_slots: usize,
     pub n_blocks: usize,
@@ -2182,11 +2196,29 @@ impl DensePagerSession {
         let trace = TraceFile::for_config(vk.cfg().paging.trace.as_deref())?;
         for (i, spec) in layout.pools.into_iter().enumerate() {
             max_slot = max_slot.max(spec.slot_bytes);
+            // A slot sits at the arena base plus a multiple of `slot_bytes`, so it is aligned for
+            // the pool's kernels exactly when the stride and the base both are.
+            let align = crate::linear::dense_stream_slot_align(spec.dtype);
+            if crate::linear::dense_stream_slot_stride(spec.dtype, spec.slot_bytes)
+                != spec.slot_bytes
+            {
+                return Err(be(format!(
+                    "dense pool {i}: a {:?} slot stride of {} bytes is not whole blocks at {align}-                     byte alignment",
+                    spec.dtype, spec.slot_bytes
+                )));
+            }
             // Dense-streaming pool: the arena is a `bufferDeviceAddress` buffer the streamed
             // kernels read through a 64-bit pointer, so it may span as much VRAM as the budget
             // allows — no `maxStorageBufferRange` cap (the pre-BDA ~4 GiB-per-pool ceiling this
             // lifts), no u32 element-reach cap.
             let mut pager = GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes)?;
+            if !pager.arena_addr().is_multiple_of(align as u64) {
+                return Err(be(format!(
+                    "dense pool {i}: arena address {:#x} is not {align}-byte aligned for {:?}",
+                    pager.arena_addr(),
+                    spec.dtype
+                )));
+            }
             if let Some(t) = &trace {
                 let label = format!("dense pool{i}/{}B", spec.slot_bytes);
                 if let Some(h) = &spec.host {
@@ -2270,6 +2302,11 @@ impl DensePagerSession {
     /// per-`Op::Linear` dispatch check.
     pub fn is_streamed(&self, buf_id: usize) -> bool {
         self.sources.contains_key(&buf_id)
+    }
+
+    /// How many weight groups are registered to stream.
+    pub fn n_streamed(&self) -> usize {
+        self.sources.len()
     }
 
     /// Ensure `buf_id`'s block is resident, staging a miss through `rec`-recorded ring→arena

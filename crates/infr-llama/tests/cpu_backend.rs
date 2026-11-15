@@ -3425,6 +3425,73 @@ fn gpu_seam_dense_stream_host_tier_matches_resident() {
     );
 }
 
+/// Dense streaming of a real F16 checkpoint: a capped cache streams its per-layer projections
+/// through the arena (they used to stay resident, the cap ignored), and greedy output — a long
+/// prompt for the tiled prefill GEMMs, then decode — is token-identical to the all-resident run,
+/// since a streamed float weight runs the resident float kernels at the slot's address.
+///
+/// ERNIE-4.5-0.3B is the plain llama-shaped case; LFM3-1.7B adds the short-convolution layers,
+/// whose `in_proj`/`out_proj` are not among the streamed groups and stay resident.
+#[test]
+#[ignore = "requires a Vulkan GPU and the F16 ERNIE-4.5-0.3B / LFM3-1.7B files"]
+fn gpu_seam_dense_stream_f16_matches_resident() {
+    let mut _tlk = test_serial_lock();
+    let models = [
+        ("ERNIE-4.5-0.3B F16", ernie4_5_03b_f16()),
+        ("LFM3-1.7B F16", lfm3_17b_f16()),
+    ];
+    let mut ran = 0;
+    for (name, path) in models {
+        let Some(path) = path else {
+            eprintln!("skip {name}: not in the HF cache");
+            continue;
+        };
+        let n = 8usize;
+        let model = model_default(&path);
+        let long = "Explain, step by step and in thorough detail, how a transformer language \
+            model processes a sequence of tokens through its embedding, attention, and \
+            feed-forward layers. "
+            .repeat(4);
+        let rendered = model.render_chat(&long).expect("render chat");
+        let prompt_ids = model.encode(&rendered).expect("encode");
+        assert!(prompt_ids.len() > 64, "{name}: prompt too short for a GEMM");
+
+        let mut resident_ids = Vec::new();
+        model
+            .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+            .expect("resident gpu gen");
+
+        // Far below either model's streamable projections: every pool at its floor.
+        let streamed = model_cfg(&path, |c| {
+            c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
+            c.paging.stats = true;
+        });
+        // A session, for its counters: did the cap make the projections stream?
+        let mut session = streamed.vulkan_session(4096).expect("streamed session");
+        streamed
+            .generate_vulkan_session(&mut session, &rendered, n, None, |_| {})
+            .expect("streamed session gen");
+        let totals = session
+            .dense_pager_totals()
+            .unwrap_or_else(|| panic!("{name}: nothing streamed under a 200 MiB cache"));
+        println!("{name}: {totals:?}");
+        assert!(totals.vram.evictions > 0, "{name}: the cap did not bite");
+        // Free its device context and weights before the id-level run opens its own backend.
+        drop(session);
+
+        let mut streamed_ids = Vec::new();
+        streamed
+            .generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id))
+            .expect("streamed gpu gen");
+        assert_eq!(
+            streamed_ids, resident_ids,
+            "{name}: dense streaming diverged from the all-resident GPU run"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither F16 model is in the HF cache");
+}
+
 fn qwen3_17b() -> Option<PathBuf> {
     find_gguf("unsloth--Qwen3-1.7B-GGUF", "Qwen3-1.7B-Q4_K_M.gguf")
 }

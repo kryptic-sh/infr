@@ -258,6 +258,45 @@ pub fn native_dense_supported(dtype: infr_core::DType) -> bool {
     native_dense_dtypes().contains(&dtype)
 }
 
+/// Dtypes whose dense `Op::Linear` weight can live in a dense layer-streaming arena slot (see
+/// [`crate::pager::DensePagerSession`]): every [`native_dense_supported`] format, plus F16 and
+/// F32. A streamed float weight runs the resident float dispatch with the slot's address in place
+/// of the resident buffer's: every float kernel takes its weight's base as a 64-bit address
+/// (`Recorder::linear_at`, `matmul_proj_at`, `linear_f32_at`, `matmul_native_splitk`,
+/// `matmul_fma_at`), so the same kernels read the same bytes, relocated.
+pub fn dense_stream_supported(dtype: infr_core::DType) -> bool {
+    native_dense_supported(dtype) || matches!(dtype, infr_core::DType::F16 | infr_core::DType::F32)
+}
+
+/// The byte alignment a dense-streaming slot of `dtype` must start on, on top of holding a whole
+/// number of quant blocks. The native kernels read u32 words, so 4 is enough for them. The float
+/// kernels are the resident ones, written against the resident arena's `BDA_WEIGHT_ALIGN`
+/// placement (`linear_f32r`'s vec4 build declares a 16-byte `buffer_reference_align`), so a float
+/// slot is aligned the way a resident float weight is.
+pub fn dense_stream_slot_align(dtype: infr_core::DType) -> usize {
+    match dtype {
+        infr_core::DType::F16 | infr_core::DType::F32 => crate::BDA_WEIGHT_ALIGN as usize,
+        _ => 4,
+    }
+}
+
+/// The slot stride a dense-streaming pool of `dtype` uses for a block of `raw_bytes`: rounded up
+/// to whole quant blocks AND to [`dense_stream_slot_align`], so every slot of an aligned arena
+/// starts block- and kernel-aligned. The seam's planner sizes its pools with it, and
+/// [`crate::pager::DensePagerSession::new`] refuses a pool whose stride it would change.
+pub fn dense_stream_slot_stride(dtype: infr_core::DType, raw_bytes: usize) -> usize {
+    let (_, block) = infr_gguf::block_layout(dtype);
+    let align = dense_stream_slot_align(dtype);
+    let gcd = {
+        let (mut x, mut y) = (block, align);
+        while y != 0 {
+            (x, y) = (y, x % y);
+        }
+        x
+    };
+    raw_bytes.next_multiple_of(block / gcd * align)
+}
+
 /// Pad raw GGUF block bytes to the next multiple of 4 for upload as `array<u32>`.
 /// Appends zero bytes; the final u32 word's padding bytes are never read (they
 /// contain only out-of-block data which the shader never accesses for valid g).

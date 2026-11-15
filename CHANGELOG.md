@@ -72,6 +72,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`infr_llama::Config::optional_router_bias`**: whether the arch's reference
   loads `blk.N.exp_probs_b.bias` as optional on its MoE layers (deepseek2 and
   ernie4_5-moe).
+- **`VulkanBackend::dense_pager_totals`** (and `dense_pager_totals` on
+  `infr_llama`'s `DenseVulkanSession`): the dense streaming cache's VRAM
+  counters, the blocks its host tier read off the model file, and how many
+  weight groups stream, as an `infr_vulkan::pager::DenseTotals`; `None` when
+  nothing streams. With `infr_vulkan::linear::dense_stream_supported` and
+  `dense_stream_slot_align`, the dtypes the dense streaming planner accepts and
+  the slot alignment each needs.
 
 ### Changed
 
@@ -378,6 +385,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **F16 and F32 dense weights stream on Vulkan.** The dense streaming planner
+  took only the native quant and bf16 formats, so an f16 or f32 checkpoint had
+  no streamable weights: a capped `paging.cache` (`INFR_CACHE`) was silently
+  ignored and the whole model loaded resident, and a model larger than VRAM had
+  nowhere to go but resident. Their per-layer projections now stream like a
+  quant model's, through the VRAM arena and the host tier, and run the resident
+  float kernels at the arena slot's address, so the output is token-identical to
+  the resident run (ERNIE-4.5-0.3B and LFM3-1.7B F16, synthetic f16 and f32
+  llamas, on the RX 7900 XTX and the integrated GPU). Resident throughput is
+  unchanged: pp512/tg128 on the RX 7900 XTX, interleaved, before 22609/449.9 and
+  22278/449.7 t/s, after 22508/449.7 and 22046/450.0 for ERNIE-4.5-0.3B F16;
+  before 5673/160.6 and 5697/160.5, after 5706/160.6 and 5716/160.5 for
+  LFM3-1.7B F16 (host CPU 3% busy). Streamed at `paging.cache=200m`,
+  ERNIE-4.5-0.3B F16 runs pp512 5751 t/s and tg128 42.7 t/s, LFM3-1.7B F16 1982
+  and 9.1.
+- **An f32 weight is priced at f32 in the VRAM placement.** The weight footprint
+  (`weight_footprint`) counted every non-quant tensor at two bytes an element,
+  but f32 tensors upload as f32, so an all-f32 model was priced at half its size
+  and placed resident on a device it does not fit. The fix reaches every model
+  with f32 tensors — norms, biases, f32 MoE routers, SSM tensors, gemma E2B's
+  per-layer projections — so placement now sees slightly more weight bytes than
+  before: a clamped default context can come out a little shorter, and a model
+  on the edge of fitting can now stream where it went resident. Measured with
+  the same formula over the cached files: Qwen3-1.7B Q4_K_M +0.25 MB (1.1012 →
+  1.1015 GB), Qwen3-30B-A3B Q4_K_M +25.59 MB (18.5251 → 18.5507 GB, its f32
+  routers), ERNIE-4.5-21B-A3B Q4_K_M +9.14 MB.
 - **`infr bench --ngl 0` warms up before a pp measurement.** The untimed warmup
   was a one-token prompt with nothing to generate, which runs no forward, so the
   first timed rep paid the whole page-in of the weight mapping (Qwen3-1.7B pp512

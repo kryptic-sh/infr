@@ -53,6 +53,11 @@ unsafe impl Sync for Shared {}
 pub(crate) struct SpinPool {
     shared: Arc<Shared>,
     handles: Vec<std::thread::JoinHandle<()>>,
+    /// The placement every worker took and the caller takes during [`SpinPool::place_caller`]:
+    /// [`infr_plat::cpu::spread_placement`] for this pool's threads, read once on the thread that
+    /// built the pool, when `kernels.cpu.core_spread` is set. An affinity change after that is
+    /// not picked up by this pool.
+    pub(crate) placement: Option<infr_plat::cpu::Placement>,
     /// Worker thread count (callers participate too, so parallelism = workers + 1).
     workers: usize,
     /// `!kernels.cpu.spinpool`: run jobs through rayon instead.
@@ -191,23 +196,57 @@ impl SpinPool {
             budget_cap: AtomicU32::new(spin_limit),
             sleeping: (0..workers).map(|_| AtomicBool::new(false)).collect(),
         });
+        // Built on the thread constructing the pool, which is the thread that will dispatch to it,
+        // so the placement also respects that thread's own affinity; a worker's is the process's,
+        // never narrower than that.
+        let placement = cfg
+            .core_spread
+            .then(|| infr_plat::cpu::spread_placement(n_threads))
+            .flatten();
         let handles = (0..workers)
             .map(|me| {
                 let sh = shared.clone();
+                let placement = placement.clone();
                 std::thread::Builder::new()
                     .name(format!("infr-spin-{me}"))
-                    .spawn(move || worker_loop(me, sh))
+                    .spawn(move || {
+                        // The worker lives as long as the pool, so its placement is never
+                        // cleared; the thread exits with it.
+                        if let Some(p) = &placement {
+                            apply_or_warn(p);
+                        }
+                        worker_loop(me, sh)
+                    })
                     .expect("spin-pool: spawn failed")
             })
             .collect();
         SpinPool {
             shared,
             handles,
+            placement,
             workers,
             rayon_fallback,
             spin_limit,
             in_run: AtomicBool::new(false),
         }
+    }
+
+    /// Threads a job runs on: the workers and the caller.
+    pub(crate) fn threads(&self) -> usize {
+        self.workers + 1
+    }
+
+    /// Give the calling thread the pool's placement until the returned guard drops, which clears
+    /// it again; `None` when the pool has no placement or the thread already has one of its own
+    /// (an outer call's, or someone else's: that one stays in force). Two system calls here and
+    /// one at the drop: the placement itself was worked out when the pool was built.
+    pub(crate) fn place_caller(&self) -> Option<CallerPlacement> {
+        let p = self.placement.as_ref()?;
+        // `then`, not `then_some`: a guard built eagerly and discarded would clear the thread's
+        // existing placement in its drop.
+        apply_or_warn(p).then(|| CallerPlacement {
+            _not_send: std::marker::PhantomData,
+        })
     }
 
     /// Run `f(0..n_tasks)` across the pool (caller participates). Dynamic task claim; returns
@@ -369,6 +408,42 @@ impl SpinPool {
         // size and alignment as `T`, and all `len` elements are initialized per the argument
         // above — so the allocation is valid to reinterpret as a `Vec<T>` of the same capacity.
         unsafe { Vec::from_raw_parts(ptr as *mut T, len, cap) }
+    }
+}
+
+/// Put the calling thread on the pool's placement, so the pool's threads stay off each other's
+/// SMT siblings while the OS still places them. Left to the OS, Windows put the spin pool's
+/// threads on SMT siblings of each other, which cost dense prefill a large share of its rate (see
+/// the CHANGELOG). Returns whether the placement was applied (`false` when the thread already
+/// had one). A failure only costs speed, so it is reported once per process and not again.
+fn apply_or_warn(p: &infr_plat::cpu::Placement) -> bool {
+    match infr_plat::cpu::apply_placement(p) {
+        Ok(applied) => applied,
+        Err(e) => {
+            warn_placement_once(&e);
+            false
+        }
+    }
+}
+
+fn warn_placement_once(e: &std::io::Error) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("spin-pool: thread placement failed, left to the OS: {e}");
+    }
+}
+
+/// The caller's placement from [`SpinPool::place_caller`]; dropping it clears the placement on
+/// the thread that drops it, so it is not `Send`.
+pub(crate) struct CallerPlacement {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for CallerPlacement {
+    fn drop(&mut self) {
+        if let Err(e) = infr_plat::cpu::clear_placement() {
+            warn_placement_once(&e);
+        }
     }
 }
 

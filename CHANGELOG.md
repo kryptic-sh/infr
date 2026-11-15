@@ -75,6 +75,69 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **CPU prefill of dense K-quant models is level with llama.cpp's CPU on
+  Windows, and decode within about 6%** (Ryzen 9 9950X3D, 16 threads; two
+  interleaved rounds of four reps against the previous build and
+  `llama-bench -ngl 0 -t 16` on the same files, taken with an intermediate
+  version that pinned each pool thread to a core of its own; the placement that
+  shipped matched it within noise, see below). pp512 warm reps: Qwen3-1.7B
+  Q4_K_M 692.96-709.05 and 628.43-733.11 t/s to 1078.38-1111.61 and
+  1026.68-1143.06 (llama.cpp 1128.14-1141.88 and 1120.53-1151.13); LFM3-1.7B
+  Q4_K_M 828.63-858.74 and 876.27-877.32 to 1226.86-1251.96 and 1069.51-1206.10
+  (llama.cpp 1135.79-1193.56 and 1112.89-1159.61). tg128: Qwen3-1.7B 51.11 and
+  51.12 to 56.83 and 56.72 (llama.cpp 59.88-60.24); LFM3-1.7B 52.62 and 52.43 to
+  59.36 and 59.62 (llama.cpp 53.95-61.40). Every result is bit-identical to
+  before; the CPU goldens are unchanged. Also measured, one run each: SmolLM3-3B
+  Q4_K_M pp512 warm reps 435.77-436.57 to 654.70-680.70, tg64 30.71 to 33.06;
+  Qwen3-30B-A3B Q4_K_M pp512 warm reps 285.90-288.06 to 414.52-418.84, tg64 warm
+  reps 24.03-24.07 to 27.81-27.95. What changed:
+  - **Pool threads keep off each other's SMT siblings on Windows.** Left to the
+    OS, the spin pool's 16 threads ended up on SMT siblings of each other: a
+    process restricted to one logical processor per core ran Qwen3-1.7B pp512 at
+    1120.55-1154.06 t/s against 725.65-746.13 unrestricted, and an unrestricted
+    run started near 1072 and fell to about 750 within four reps. When a pool's
+    threads (workers and the dispatching thread) fit one per allowed core, each
+    pool thread, and the thread running the graph for the length of the walk,
+    now selects CPU sets naming one logical processor of every such core, the OS
+    still placing the threads among those; with more threads than cores (`-t 32`
+    here) nothing is selected and the OS keeps every allowed logical processor.
+    It never widens an affinity: only cores inside the process's affinity (and
+    the pool-building thread's own, when narrower) are named, a thread that
+    already has CPU sets keeps them, and a process with default CPU sets is left
+    alone. The placement is worked out once per pool, so an affinity change
+    after that is not picked up by it. Several processes or sessions share the
+    whole set, so they do not stack: two concurrent `infr bench --ngl 0 -t 4`
+    runs of Qwen3-1.7B pp512 measured 399.21-413.06 t/s each, against
+    230.22-240.99 left to the OS (and 218.77-225.92, in an earlier window, with
+    one fixed core per thread, an intermediate version of this change). Single
+    process, two interleaved rounds against `kernels.cpu.core_spread = false`:
+    Qwen3-1.7B pp512 1109.62-1135.26 against 743.41-753.98, LFM3-1.7B
+    1217.95-1270.19 against 862.84-891.19; three rounds of tg128: Qwen3-1.7B
+    55.60, 55.81 and 55.82 against 53.95, 54.02 and 54.07, LFM3-1.7B 56.93-58.02
+    against 52.47-53.79; `-t 32` pp512 1025.83-1055.54 against 1027.26-1062.36
+    (no placement either way). In an earlier window, fixed per-core pins
+    measured the same as the CPU-set placement within noise.
+    `kernels.cpu.core_spread = false` turns it off. The default thread count
+    (one per physical core) now counts only the cores inside the process's
+    affinity, of every efficiency class. Platforms other than Windows have no
+    placement yet and keep the OS's.
+    `infr_plat::cpu::{spread_placement, apply_placement, clear_placement, current_placement, Placement}`
+    are new.
+  - **Decode's Q4_K and Q6_K dots fold the scales into the widening multiply**
+    (`vec_dot_q4k`, `vec_dot_q6k` on AVX-512BW) and take one horizontal sum per
+    super-block instead of one per sub-block (Q4_K) or per 16 elements (Q6_K);
+    the Q4_K scales unpack eight at a time. Single-thread throughput over a 64
+    MB weight matrix: Q6_K 14.7-14.9 to 40.0-45.5 GB/s, Q4_K 26.4-27.2 (after
+    the scale fold alone) to 34.2-37.4. Qwen3-1.7B tg32 on one thread: 11.11 to
+    31.66 t/s (llama.cpp 31.82).
+  - **A single-token Linear claims up to 128 weight rows per pool task**
+    (`out_f / (2 · threads)`, at least 16) instead of always 16: Qwen3-1.7B
+    tg128 54.96 and 55.20 to 56.34 and 56.77; LFM3-1.7B unchanged within noise.
+  - **Prefill attention runs a block of 16 query rows per task for one head**,
+    latest block first, so the rows of a block share that head's K/V rows in
+    their core's cache: 3.56-3.64 to 2.84-2.91 ms per Qwen3-1.7B layer at pp512.
+    The f16 KV prefix is widened to f32 across the pool instead of on the
+    dispatching thread.
 - **Vulkan prefill and decode on GPUs without a cooperative matrix are faster,
   and ahead of llama.cpp on the integrated GPU measured** (RDNA2 iGPU, AMD
   Windows driver; two interleaved runs of three reps each against the previous
@@ -284,6 +347,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`infr bench --ngl 0` warms up before a pp measurement.** The untimed warmup
+  was a one-token prompt with nothing to generate, which runs no forward, so the
+  first timed rep paid the whole page-in of the weight mapping (Qwen3-1.7B pp512
+  first reps of 156.74 and 140.11 t/s against 628.43-733.11 warm on the previous
+  build) and dragged the mean. A pp run now warms up with its own prompt, as
+  `llama-bench`'s warmup prompt run does; Qwen3-30B-A3B's first pp512 rep is
+  warm too (417.37 against 415.36-418.04). A pg run warms up with its prompt and
+  one generated token, and a tg run, as before, with one generated token, so a
+  MoE model's first tg rep still pays for the experts it had not routed to
+  (Qwen3-30B-A3B tg64 3.90 against 27.99-28.08). A fresh process's first real
+  request still pays the page-in (backlog B173).
 - **A qwen35 file that stores `ssm_conv1d` in f16 or bf16 is widened to f32 at
   load.** The Vulkan conv shaders read the kernel as f32 whatever the file's
   dtype, so such a file read half-precision bits as floats there. LFM3's

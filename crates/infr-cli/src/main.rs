@@ -2688,8 +2688,17 @@ fn cmd_bench_cpu(
     let watch = infr_llama::WeightWatch::open_model(gguf)?;
     let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
     let measure_tg = pg.is_none() && n_gen > 0;
-    // One untimed warmup to build runtime caches before the timed reps.
-    let _ = model.bench(depth.max(1), if measure_tg || pg.is_some() { 1 } else { 0 });
+    // One untimed warmup with the timed run's own prompt, as llama-bench's warmup prompt run, so
+    // the weights the timed reps read are already faulted in from the mapping. (Each rep builds
+    // its own backend, so nothing else carries over.) A one-token prompt with nothing to
+    // generate, which this used to be for pp, runs no forward and faulted nothing in.
+    let _ = if let Some((p, _)) = pg {
+        model.bench(p, 1)
+    } else if measure_tg {
+        model.bench(depth.max(1), 1)
+    } else {
+        model.bench(n_prompt, 0)
+    };
     let mut samples = Vec::with_capacity(reps);
     for _ in 0..reps {
         let ts = if let Some((p, g)) = pg {

@@ -29,6 +29,7 @@ windows = { version = "0.58", features = [
     "Win32_Security",                 # CreateJobObjectW in native tests
     "Win32_System_JobObjects",        # QueryInformationJobObject
     "Win32_System_Threading",         # JOBOBJECT_EXTENDED_LIMIT_INFORMATION embeds IO_COUNTERS
+    "Win32_System_Kernel",            # PROCESSOR_NUMBER (the placement test reads where it runs)
 ] }
 
 [dev-dependencies]

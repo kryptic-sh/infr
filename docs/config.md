@@ -227,8 +227,11 @@ and these exist to force one off when bisecting a correctness or perf problem.
   the MSL → AIR front end is not cacheable and still runs every launch). Like
   `kernels.cpu.reference` it has no `INFR_*` twin.
 - **`[kernels.cpu]`** — `spin` (spin-pool idle ceiling), `spinpool`,
-  `repack_mb`, and `reference` (the bit-reference kernel path, which has no
-  `INFR_*` twin and never had one).
+  `repack_mb`, `reference` (the bit-reference kernel path, which has no `INFR_*`
+  twin and never had one), and `core_spread` (keep the spin pool's threads, and
+  the thread running the graph, on one logical processor per allowed core so no
+  two share a core's SMT siblings; only when the threads fit one per allowed
+  core; Windows only, no `INFR_*` twin).
 
 **`[spec]`** — MTP / speculative decode: `mtp`, `k`, `decode_chain`, `draft` (a
 draft-model path), the GPU-side sampling steps (`gpu_argmax`, `gpu_sample`,

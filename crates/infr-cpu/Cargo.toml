@@ -16,6 +16,7 @@ half.workspace = true
 rayon.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+infr-plat.workspace = true
 
 [dev-dependencies]
 # The shared backend decode-parity harness (`tests/decode_parity.rs`).

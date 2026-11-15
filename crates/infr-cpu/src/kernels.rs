@@ -232,20 +232,59 @@ unsafe fn vec_dot_q4k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     sumf
 }
 
-/// AVX-512BW kernel for `vec_dot_q4k`: processes TWO sub-blocks per iteration (64 elements) with
-/// 512-bit SIMD. For each pair (s=2k even, s=2k+1 odd), the 32-byte nibble chunk is unpacked into
-/// a zmm (low nibbles in lower 256 bits, high nibbles in upper 256 bits) and multiplied against the
-/// corresponding 64 contiguous Q8 bytes. The zmm result is split back to two ymm sums, giving both
-/// `iprod_even` and `iprod_odd` in one pass — half the memory traffic of the avx2 path.
+/// All eight 6-bit `(scale, min)` pairs of a Q4_K/Q5_K super-block's 12 scale bytes at once, as
+/// little-endian byte lanes: byte `s` of the first word is `k4(s, scales).0`, of the second
+/// `k4(s, scales).1`. llama.cpp's `utmp`/`kmask` unpacking, word-wide instead of a field per
+/// call.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn k4_all(scales: &[u8]) -> (u64, u64) {
+    const KMASK1: u32 = 0x3f3f_3f3f;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    const KMASK3: u32 = 0x0303_0303;
+    let w = |i: usize| u32::from_le_bytes(scales[4 * i..4 * i + 4].try_into().unwrap());
+    let (u0, u1, u2) = (w(0), w(1), w(2));
+    let sc_lo = u0 & KMASK1;
+    let sc_hi = (u2 & KMASK2) | (((u0 >> 6) & KMASK3) << 4);
+    let m_lo = u1 & KMASK1;
+    let m_hi = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
+    (
+        sc_lo as u64 | (sc_hi as u64) << 32,
+        m_lo as u64 | (m_hi as u64) << 32,
+    )
+}
+
+/// AVX-512BW kernel for `vec_dot_q4k`: two sub-blocks per step, with the scales folded into the
+/// widening multiply so a super-block costs one horizontal sum instead of one per sub-block.
+///
+/// Per step the 32-byte nibble chunk serving sub-blocks `2k` (low nibbles) and `2k + 1` (high)
+/// becomes one zmm against the 64 contiguous Q8 bytes; `maddubs` gives i16 pair sums (at most
+/// `2·15·127`), and `madd` against the sub-blocks' scales broadcast per half (at most 63) widens
+/// them to i32 already scaled. So the accumulator holds `Σ sc·iprod` lane-split, and one
+/// `reduce_add` per super-block gives `sd` — integers, exact in any order, so the f32 expression
+/// and with it the result are the scalar kernel's bit for bit. Decode streams every weight row
+/// through this once per token, which is why the per-sub-block horizontal sums this replaced
+/// mattered (measured in the CHANGELOG).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     use std::arch::x86_64::*;
     let nb = in_f / 256;
+    assert!(
+        row.len() >= nb * 144,
+        "vec_dot_q4k: row shorter than {nb} blocks"
+    );
+    assert!(q8.qs.len() >= nb * 256 && q8.bsums.len() >= nb * 8 && q8.d.len() >= nb);
     let mut sumf = 0f32;
     let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
-    let ones512 = _mm512_set1_epi16(1i16);
+    // i16 lanes 0..16 pick scale 2k, lanes 16..32 scale 2k + 1: the zmm halves' sub-blocks.
+    let pick: [__m512i; 4] = std::array::from_fn(|k| {
+        _mm512_inserti64x4::<1>(
+            _mm512_castsi256_si512(_mm256_set1_epi16(2 * k as i16)),
+            _mm256_set1_epi16(2 * k as i16 + 1),
+        )
+    });
     for b in 0..nb {
         let blk = &row[b * 144..b * 144 + 144];
         let d = rdf16(&blk[0..2]);
@@ -253,33 +292,23 @@ unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let scales = &blk[4..16];
         let qs = &blk[16..144];
         let q8b = &q8.qs[b * 256..b * 256 + 256];
-        let (mut sd, mut sm) = (0i32, 0i32);
-        // k=0..4 covers sub-block pairs (0,1), (2,3), (4,5), (6,7).
-        for k in 0..4usize {
-            let (sc_e, m_e) = k4(2 * k, scales);
-            let (sc_o, m_o) = k4(2 * k + 1, scales);
-            // Load 32 nibble bytes serving both sub-blocks 2k (low) and 2k+1 (high).
+        let (sc8, m8) = k4_all(scales);
+        let sc_v = _mm512_castsi128_si512(_mm_cvtepu8_epi16(_mm_cvtsi64_si128(sc8 as i64)));
+        let sm = hadd_i32_ymm(_mm256_mullo_epi32(
+            _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(m8 as i64)),
+            load256(&q8.bsums, b * 8),
+        ));
+        let mut acc = _mm512_setzero_si512();
+        for (k, pick_k) in pick.iter().enumerate() {
             let nibbles = load256(qs, k * 32);
-            let lo_nib = _mm256_and_si256(nibbles, mask_lo); // sub-block 2k  (u8, 0–15)
-            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo); // sub-block 2k+1
-                                                                                   // Pack into zmm: lower 256 = lo_nib (for 2k), upper 256 = hi_nib (for 2k+1).
+            let lo_nib = _mm256_and_si256(nibbles, mask_lo);
+            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
             let q4_zmm = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo_nib), hi_nib);
-            // Load 64 Q8 bytes: [2k*32..(2k+1)*32] in lower, [(2k+1)*32..(2k+2)*32] in upper.
-            let q8_zmm = load512(q8b, k * 64);
-            // maddubs 512-bit: u8(q4)×i8(q8) → 32×i16 pair-sums.
-            let prod = _mm512_maddubs_epi16(q4_zmm, q8_zmm);
-            // madd with 1: widen 32×i16 → 16×i32.
-            let sum32 = _mm512_madd_epi16(prod, ones512);
-            // Lower 256 = 8×i32 for sub-block 2k; upper 256 = 8×i32 for sub-block 2k+1.
-            let lo_ymm = _mm512_castsi512_si256(sum32);
-            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
-            let iprod_e = hadd_i32_ymm(lo_ymm);
-            let iprod_o = hadd_i32_ymm(hi_ymm);
-            let isum_e = q8.bsums[b * 8 + 2 * k];
-            let isum_o = q8.bsums[b * 8 + 2 * k + 1];
-            sd += sc_e as i32 * iprod_e + sc_o as i32 * iprod_o;
-            sm += m_e as i32 * isum_e + m_o as i32 * isum_o;
+            let prod = _mm512_maddubs_epi16(q4_zmm, load512(q8b, k * 64));
+            let scale = _mm512_permutexvar_epi16(*pick_k, sc_v);
+            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(prod, scale));
         }
+        let sd = _mm512_reduce_add_epi32(acc);
         sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
     }
     sumf
@@ -644,8 +673,9 @@ unsafe fn vec_dot_q6k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// using zmm registers (512-bit). The two ql half-lo slices are packed into one zmm via
 /// `_mm512_inserti64x4`; qh loads as a single 64-byte zmm (the two halves are contiguous). For
 /// each of the 4 q6 columns, both halves' q8 are also packed into one zmm, so a single
-/// `maddubs512 → madd512` covers 64 elements at once. Results are split back to two ymm
-/// (h0/h1) then two xmm per ymm (per-sub-block) for the scalar scale accumulation.
+/// `maddubs512 → madd512` covers 64 elements at once, the `madd` against the sub-blocks' scales
+/// (see the loop), so one horizontal sum per super-block replaces the sixteen per-sub-block ones
+/// this used to take. Bit-identical to the scalar kernel.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -654,11 +684,22 @@ unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     let nb = in_f / 256;
     let mut sumf = 0f32;
 
+    assert!(
+        row.len() >= nb * 210,
+        "vec_dot_q6k: row shorter than {nb} blocks"
+    );
+    assert!(q8.qs.len() >= nb * 256 && q8.bsums16.len() >= nb * 16 && q8.d.len() >= nb);
     let mask_0f_z = _mm512_set1_epi8(0x0F_u8 as i8);
     let mask_30_z = _mm512_set1_epi8(0x30_u8 as i8);
     let mask_03_z = _mm512_set1_epi8(0x03_u8 as i8);
-    let ones_u8_z = _mm512_set1_epi8(1i8);
-    let ones_i16_z = _mm512_set1_epi16(1i16);
+    // i16 lane groups of eight for column `ci`: scales 2ci, 2ci + 1, 8 + 2ci, 9 + 2ci.
+    let pick: [__m512i; 4] = std::array::from_fn(|ci| {
+        let lanes: [i16; 32] = std::array::from_fn(|l| {
+            let sub = 2 * ci + (l / 8) % 2 + 8 * (l / 16);
+            sub as i16
+        });
+        _mm512_loadu_si512(lanes.as_ptr() as *const __m512i)
+    });
 
     for b in 0..nb {
         let blk = &row[b * 210..b * 210 + 210];
@@ -702,55 +743,28 @@ unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             _mm512_and_si512(_mm512_srli_epi16(qh_z, 2), mask_30_z),
         );
 
-        // Collect per-sub-block i32 values in arrays; accumulate in 0..16 order (scalar-identical).
-        let mut simd_sumi = [0i32; 16];
-        let mut simd_bsum = [0i32; 16];
-
+        // The scales ride the widening multiply: after `maddubs` (pair sums, at most
+        // `2·63·127`) the i16 lanes of column `ci` cover sub-blocks `2ci`, `2ci + 1` (h0) and
+        // `8 + 2ci`, `9 + 2ci` (h1), eight lanes each, and `madd` against those scales leaves
+        // `Σ sc·sumi` lane-split in i32. The `−32·bsum` offset is `Σ sc·bsums16`, taken once per
+        // super-block from the activation's precomputed sums. Integers throughout, exact in any
+        // order, so `isum` and the f32 line below are the scalar kernel's bit for bit.
+        let sc16 = _mm512_castsi256_si512(_mm256_cvtepi8_epi16(load128(scales, 0)));
+        let mut acc = _mm512_setzero_si512();
         for (ci, q6_col_z) in [q6_c0_z, q6_c2_z, q6_c4_z, q6_c6_z].iter().enumerate() {
             // q8 for h0 column ci: q8b[ci*32..ci*32+32]; h1: q8b[128+ci*32..128+ci*32+32].
             let q8_h0 = load256(q8b, ci * 32);
             let q8_h1 = load256(q8b, 128 + ci * 32);
             let q8_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q8_h0), q8_h1);
-
-            // 512-bit dot: maddubs → madd.
             let prod = _mm512_maddubs_epi16(*q6_col_z, q8_z);
-            let sum32_z = _mm512_madd_epi16(prod, ones_i16_z);
-
-            let bsum_i16_z = _mm512_maddubs_epi16(ones_u8_z, q8_z);
-            let bsum_i32_z = _mm512_madd_epi16(bsum_i16_z, ones_i16_z);
-
-            // Lower ymm = h0 (sub-blocks ci*2, ci*2+1); upper ymm = h1 (sub-blocks 8+ci*2, 8+ci*2+1).
-            let sum_h0 = _mm512_castsi512_si256(sum32_z);
-            let sum_h1 = _mm512_extracti64x4_epi64::<1>(sum32_z);
-            let bsum_h0 = _mm512_castsi512_si256(bsum_i32_z);
-            let bsum_h1 = _mm512_extracti64x4_epi64::<1>(bsum_i32_z);
-
-            // Each ymm: lower xmm = first 16 elements (is=0), upper xmm = elements 16..31 (is=1).
-            let s_h0_lo = _mm256_castsi256_si128(sum_h0);
-            let s_h0_hi = _mm256_extracti128_si256::<1>(sum_h0);
-            let s_h1_lo = _mm256_castsi256_si128(sum_h1);
-            let s_h1_hi = _mm256_extracti128_si256::<1>(sum_h1);
-            let b_h0_lo = _mm256_castsi256_si128(bsum_h0);
-            let b_h0_hi = _mm256_extracti128_si256::<1>(bsum_h0);
-            let b_h1_lo = _mm256_castsi256_si128(bsum_h1);
-            let b_h1_hi = _mm256_extracti128_si256::<1>(bsum_h1);
-
-            simd_sumi[ci * 2] = hadd_i32_xmm(s_h0_lo);
-            simd_sumi[ci * 2 + 1] = hadd_i32_xmm(s_h0_hi);
-            simd_sumi[8 + ci * 2] = hadd_i32_xmm(s_h1_lo);
-            simd_sumi[8 + ci * 2 + 1] = hadd_i32_xmm(s_h1_hi);
-
-            simd_bsum[ci * 2] = hadd_i32_xmm(b_h0_lo);
-            simd_bsum[ci * 2 + 1] = hadd_i32_xmm(b_h0_hi);
-            simd_bsum[8 + ci * 2] = hadd_i32_xmm(b_h1_lo);
-            simd_bsum[8 + ci * 2 + 1] = hadd_i32_xmm(b_h1_hi);
+            let scale = _mm512_permutexvar_epi16(pick[ci], sc16);
+            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(prod, scale));
         }
-
-        // Integer epilogue — see `vec_dot_q6k_scalar` (i32 sum is order-free and exact).
-        let mut s = 0i32;
-        for sub in 0..16 {
-            s += scales[sub] as i8 as i32 * (simd_sumi[sub] - 32 * simd_bsum[sub]);
-        }
+        let corr = _mm512_reduce_add_epi32(_mm512_mullo_epi32(
+            _mm512_cvtepi8_epi32(load128(scales, 0)),
+            load512(&q8.bsums16, b * 16),
+        ));
+        let s = _mm512_reduce_add_epi32(acc) - 32 * corr;
         sumf += d * q8.d[b] * s as f32;
     }
     sumf
@@ -9659,6 +9673,124 @@ mod kernel_tests {
     #[cfg(target_arch = "x86_64")]
     fn tier_rel(got: f32, want: f32) -> f32 {
         (got - want).abs() / want.abs().max(1e-3)
+    }
+
+    /// The AVX-512BW single-row Q4_K and Q6_K kernels fold the scales into the widening
+    /// multiply but keep the integer sums exact, so they must give the scalar kernels' bits, not
+    /// just a close value: over several rows and widths of one to eight super-blocks, with an
+    /// activation whose first block is zero (`d = 0`) where there are several, and at the edges
+    /// of the scale, code and activation ranges, where an intermediate would saturate first.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4k_q6k_avx512bw_match_the_scalar_kernels_bitwise() {
+        if !is_x86_feature_detected!("avx512bw") {
+            eprintln!("SKIP q4k_q6k_avx512bw_match_the_scalar_kernels_bitwise: no avx512bw");
+            return;
+        }
+        let mut ran = 0;
+        for nb in [1usize, 3, 8] {
+            let in_f = nb * 256;
+            // A zeroed first block (`d = 0` there) once the row has other blocks to carry it.
+            let mut xs = vec![det_x(in_f, 0x5CA1E + nb as u64)];
+            if nb > 1 {
+                let mut x0 = det_x(in_f, 0xB17 + nb as u64);
+                x0[..256].fill(0.0);
+                xs.push(x0);
+            }
+            for x in xs {
+                let q8 = quantize_q8(&x);
+                for seed in 0..6u32 {
+                    let w4 = infr_testkit::synth_weight(DType::Q4K, in_f, 0x4B + seed);
+                    let w6 = infr_testkit::synth_weight(DType::Q6K, in_f, 0x6B + seed);
+                    let (s4, v4) = (vec_dot_q4k_scalar(&w4, &q8, in_f), unsafe {
+                        vec_dot_q4k_avx512bw(&w4, &q8, in_f)
+                    });
+                    let (s6, v6) = (vec_dot_q6k_scalar(&w6, &q8, in_f), unsafe {
+                        vec_dot_q6k_avx512bw(&w6, &q8, in_f)
+                    });
+                    assert_eq!(
+                        v4.to_bits(),
+                        s4.to_bits(),
+                        "q4k nb={nb} seed={seed}: {v4} vs {s4}"
+                    );
+                    assert_eq!(
+                        v6.to_bits(),
+                        s6.to_bits(),
+                        "q6k nb={nb} seed={seed}: {v6} vs {s6}"
+                    );
+                    assert!(s4 != 0.0 && s6 != 0.0, "vacuous case nb={nb} seed={seed}");
+                    ran += 1;
+                }
+            }
+        }
+        assert_eq!(ran, 30);
+
+        // The ranges' edges: every 6-bit scale and min at 63 (Q4_K), every int8 scale at 127 and
+        // at -128 (Q6_K), codes all at their top (15 / 63), all zero and mixed, against
+        // activations that quantize to +127 everywhere, -127 everywhere and alternating.
+        let nb = 2usize;
+        let in_f = nb * 256;
+        let acts: [Vec<f32>; 3] = [
+            vec![1.0; in_f],
+            vec![-1.0; in_f],
+            (0..in_f)
+                .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+                .collect(),
+        ];
+        let mut edges = 0;
+        for x in &acts {
+            let q8 = quantize_q8(x);
+            assert!(
+                q8.qs.iter().all(|&q| q.abs() == 127),
+                "activation is not at its edge"
+            );
+            for code in [0xFFu8, 0x00, 0xA5] {
+                let mut w4 = vec![code; nb * 144];
+                for b in 0..nb {
+                    put_f16(&mut w4[b * 144..b * 144 + 2], 0.75);
+                    put_f16(&mut w4[b * 144 + 2..b * 144 + 4], 0.5);
+                    w4[b * 144 + 4..b * 144 + 16].fill(0xFF);
+                }
+                let s4 = vec_dot_q4k_scalar(&w4, &q8, in_f);
+                let v4 = unsafe { vec_dot_q4k_avx512bw(&w4, &q8, in_f) };
+                assert_eq!(
+                    v4.to_bits(),
+                    s4.to_bits(),
+                    "q4k code {code:#x}: {v4} vs {s4}"
+                );
+                for scale in [127u8, 0x80] {
+                    let mut w6 = vec![code; nb * 210];
+                    for b in 0..nb {
+                        w6[b * 210 + 192..b * 210 + 208].fill(scale);
+                        put_f16(&mut w6[b * 210 + 208..b * 210 + 210], 0.25);
+                    }
+                    let s6 = vec_dot_q6k_scalar(&w6, &q8, in_f);
+                    let v6 = unsafe { vec_dot_q6k_avx512bw(&w6, &q8, in_f) };
+                    assert_eq!(
+                        v6.to_bits(),
+                        s6.to_bits(),
+                        "q6k code {code:#x} scale {scale:#x}: {v6} vs {s6}"
+                    );
+                    edges += 1;
+                }
+            }
+        }
+        assert_eq!(edges, 18);
+    }
+
+    /// `k4_all` unpacks every scale/min pair `k4` does, for arbitrary scale bytes.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn k4_all_matches_k4() {
+        for seed in 0..64u64 {
+            let scales = det_bytes(12, 0xC0FFEE + seed);
+            let (sc, m) = k4_all(&scales);
+            for s in 0..8 {
+                let want = k4(s, &scales);
+                let got = ((sc >> (8 * s)) as u8 as u32, (m >> (8 * s)) as u8 as u32);
+                assert_eq!(got, want, "seed {seed} sub-block {s}");
+            }
+        }
     }
 
     /// Single-row (`m=1`, Q8 super-block activation) int8 dots: avx2 + avx512bw vs scalar.

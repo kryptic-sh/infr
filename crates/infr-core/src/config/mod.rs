@@ -477,6 +477,14 @@ cfg_struct! {
         /// had one — it is the model the rest of the campaign follows: a typed field on the
         /// owning struct, chosen by the caller.
         reference: bool = false,
+        /// Keep the spin pool's threads (and the thread running the graph, for the walk) on one
+        /// logical processor per allowed core, the OS still placing them among those, so no two
+        /// of them share a core's SMT siblings. Only when the pool's threads fit one per allowed
+        /// core; with more, the OS keeps every allowed logical processor. Never wider than the
+        /// process's or the pool-building thread's affinity, read once when the pool is built. Where the platform has no placement (`infr_plat::cpu::spread_placement`,
+        /// Windows only today) the OS places the threads whatever this says. No env key, like
+        /// [`CpuCfg::reference`]: `--set kernels.cpu.core_spread=false` or the TOML file.
+        core_spread: bool = true,
     }
 }
 

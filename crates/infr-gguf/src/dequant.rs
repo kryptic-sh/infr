@@ -74,11 +74,13 @@ pub fn f32_to_f16_sat(x: f32) -> half::f16 {
 
 // per-call leaf, too small to probe (see docs/perf/playbook.md)
 #[cfg_attr(infr_profile, infr_prof::skip)]
+#[inline]
 pub fn rdf16(b: &[u8]) -> f32 {
     half::f16::from_le_bytes([b[0], b[1]]).to_f32()
 }
 // per-call leaf, too small to probe (see docs/perf/playbook.md)
 #[cfg_attr(infr_profile, infr_prof::skip)]
+#[inline]
 pub fn k4(j: usize, q: &[u8]) -> (u32, u32) {
     // get_scale_min_k4: extract 6-bit scale `d` and min `m` for sub-block j (0..8) from scales[12]
     if j < 4 {

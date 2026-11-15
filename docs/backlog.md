@@ -4695,37 +4695,112 @@ tuples a type before porting: either would close a B158 gap. Not read. A way to
 register a statement there would also let the source rewrite that compiles
 `{% generation %}` as `{% with %}` (`crates/infr-chat/src/generation.rs`) go.
 
-### B173 — the CPU backend's first forward pays the mmap page-in, and prefill has known costs left (2026-11-14)
+### B173 — what the CPU backend still leaves on dense prefill and decode (2026-11-14, re-measured 2026-11-15)
 
 **Tag:** perf · cpu
 
-Warm prefill is now ahead of llama.cpp's CPU on all three models measured (see
-the CHANGELOG entry: SmolLM3-3B 622-636 t/s against 579, ERNIE-4.5-21B-A3B
-374-449 against 246, Qwen3-30B-A3B 395-400 against 231, pp512, 16 threads,
-Windows box). At pp16 SmolLM3 is still behind (292-309 against 381); the MoE
-models are level or ahead. What is left:
+On 2026-11-15 (CHANGELOG: pool threads kept off each other's SMT siblings, the
+decode Q4_K/Q6_K dot rewrite, blocked prefill attention) Windows CPU pp512 is
+level with llama.cpp on Qwen3-1.7B and LFM3-1.7B Q4_K_M and decode is within
+about 6%. What is left, from `INFR_PROF_OPS=1` on one warm pp512 forward of the
+final build, 16 threads:
 
-- **The first forward pays the mmap page-in**: a fresh process's first pp512 rep
-  is 82 t/s on SmolLM3 and 27-30 on the MoE models (unchanged by the prefill
-  work). Windows gets no `WillNeed` hint (the `madvise` in `Gguf::map_and_parse`
-  is `cfg(unix)`); a `PrefetchVirtualMemory` at load would move the read out of
-  the first request.
-- **Where a warm pp512 forward still goes** (`INFR_PROF_OPS=1`, the final build
-  minus temporary timers): SmolLM3 ~790 ms, of which the Q4_K/Q6_K Linears ~585
-  ms, `Attention` ~116 ms (3.2 ms per layer), `GatedAct` ~45 ms (scalar `expf`),
-  and activation quantization (`quantize_q8`, one `Q8` of four `Vec`s per row
-  per Linear) ~45 ms. Qwen3-30B-A3B ~1300 ms: `MoeFfn` ~15-16 ms per layer
-  (gate_up ~4.7, down ~3.9, act ~1.5, gather ~0.9, f32 router ~0.8; a few ms not
-  attributed to a stage) and `Attention` 5.8 ms per layer (32 query heads over 4
-  KV heads).
-- **Ideas not tried**: attention that walks a GQA group's query heads together
-  so each K/V row is read once per group (and dequantizes the f16 K/V prefix in
-  parallel; it is serial per layer); quantizing a shared input once for the Q, K
-  and V Linears; a GEMM tile that keeps a token block in L2 across several 8-row
-  groups (each group streams every token's activations); building MoE stage C's
-  activations from tiles of the o-major gate/up block, which it now reads with
-  stride `count`; a vectorized Q6_K pack expansion (`q6k_pack_group_into` is
-  scalar bit-fiddling, paid per call per group).
+- **Qwen3-1.7B, 435.4 ms**: the 2048x6144 Q4_K gate/up GEMMs 138.17 ms (2467.3
+  us per call, 12.86 GFLOP each, about 5.2 TOPS int8), `Attention` 77.63 ms
+  (2772.4 us per layer), the 2048x2048 Q4_K Linears 53.02 ms, the Q6_K
+  `ffn_down` 43.68 ms, `GatedAct` 18.17 ms. LFM3-1.7B measured 399.4-444.8 ms
+  over three forwards in the same window (the box was not quiet: other sessions
+  share it), the 2048x7680 gate/up 148.70-165.23 ms of it.
+- **Attention.** Single-threaded on a Qwen3 pp512 layer (34.49 ms): taking the
+  `exp` out left 32.62 ms, taking the PV accumulation out as well left 20.37 ms,
+  so the q·k dots and their bookkeeping are about 60% and PV about a third
+  (measured with the PV chunking declined below in place, which changed
+  nothing). A register-blocked q·k tile (several queries against several keys,
+  each dot keeping `dot`'s eight-lane FMA order so the result stays
+  bit-identical) is the untried next step; see "considered and declined" for
+  what did not help.
+- **GatedAct** (scalar `expf`, about 4% of the forward): a vectorized SiLU
+  changes the bits of every FFN, so every CPU golden on every CI platform would
+  need re-blessing, and the Windows/Linux/macOS hashes cannot all be produced on
+  this box. Needs the user's call: a default-off switch buys nobody anything, a
+  default-on one is a golden re-bless on three platforms.
+- **Decode** (Qwen3-1.7B tg128 56.72-56.83 against llama.cpp's 59.88-60.24;
+  single-threaded it is level: 31.66 against 31.82 tg32). The gap is in scaling
+  past 8 threads; not profiled further. Candidates: the per-op handoff (about
+  480 ops per token), the serial ops between the GEMVs, and the activation
+  quantization the q/k/v and gate/up Linears each redo on the same input
+  (`quantize_q8` measured 1.27 us per 2048-element row, so at most a fraction of
+  a millisecond per token).
+- **A fresh process's first forward pays the mmap page-in**: about 3 s on
+  Qwen3-1.7B whatever the thread count (single-thread pp512 first rep 70.37 t/s
+  against 118.05-118.16 warm; 16 threads, pp64 first rep 20.18 t/s against
+  1076.55-1096.52), so the soft faults serialize. `infr bench` pp runs no longer
+  show it (the warmup is the timed prompt itself; Qwen3-30B-A3B's first pp512
+  rep 417.37 against 415.36-418.04), but a real first request does, and so does
+  a MoE model's first tg rep: the tg warmup generates one token, which routes
+  through a handful of experts (Qwen3-30B-A3B tg64 3.90 against 27.99-28.08).
+  Windows gets no `WillNeed` hint (the `madvise` in `Gguf::map_and_parse` is
+  `cfg(unix)`); whether `PrefetchVirtualMemory` maps pages in or only reads them
+  into the standby list (the file is already cached on a re-run, so the second
+  would not help) was not tested.
+- **Thread placement is Windows only.** The spin pool's threads select CPU sets
+  naming one logical processor per allowed core
+  (`infr_plat::cpu::spread_placement`) when they fit one per core. Linux and
+  macOS have no placement in `infr_plat::cpu`, so the OS places the pool there;
+  whether Linux has the same SMT placement problem was not measured (B76). Under
+  a restricted affinity the placement stays inside it: `start /affinity 5` ran
+  Qwen3-1.7B on two threads, logical processors 0 and 2 at 98.46-100% and 1, 3
+  and 30 at 0-5.97% (`typeperf`). Not measured or not verified:
+  - A hybrid part. The fastest-class preference is unit-tested only, and whether
+    the default thread count should be the P-cores alone there (it counts every
+    allowed core, so an 8P+16E part gets 24 threads, of which the E-cores may
+    slow a spin-waiting pool) is unmeasured.
+  - More than 64 logical processors. On Windows 11 a process's threads span
+    every group, yet `process_mask` (in `infr_plat::cpu`) reads
+    `GetProcessAffinityMask` and `GetProcessGroupAffinity`; if the latter
+    reports a single group (the primary one) and the former a non-zero mask for
+    it, as the documentation suggests for a process not yet spread over groups,
+    `physical_cores` and every placement would be confined to that one group. A
+    suspicion from the documentation, untested.
+  - Job objects with CPU-set limits, and CPU sets the OS flags Allocated or
+    Parked (the flags byte of each record is not read). Untested; a placement
+    the OS refuses fails safe (one warning, the OS's placement).
+  - Work outside the spin pool: `SpinPool::run`'s rayon fallback (another job
+    holds the pool, or `kernels.cpu.spinpool = false`) runs on rayon threads,
+    which get no placement. The MoE expert fan-out runs on the spin pool
+    (checked: that fallback is the only rayon use left in `infr-cpu` outside
+    tests).
+  - A process started with default CPU sets (left alone by design).
+- **Ideas not tried**: quantizing a shared input once for the Q, K and V Linears
+  (and gate/up); building MoE stage C's activations from tiles of the o-major
+  gate/up block, which it now reads with stride `count`; a vectorized Q6_K pack
+  expansion (`q6k_pack_group_into` is scalar bit-fiddling, paid per call per
+  group); a 16-row by 4-token GEMM tile (one activation broadcast feeding two
+  weight vectors) for the packed K-quant GEMM.
+
+**Considered and declined, with what was measured (2026-11-15):**
+
+- **Several 8-row groups per GEMM task with a 64-token block** (each task packs
+  four groups into thread-local scratch and walks token blocks across them, so
+  activations come from L2 rather than L3): LFM3 pp512 forward 389.3, 390.4 and
+  398.7 ms against 396.4, 398.1 and 399.7 without, interleaved. Within the
+  window's noise once the threads were pinned; not kept.
+- **Attention's PV accumulated in 64-element register chunks across the keys**
+  (the same FMA chain per element): 2797.1 to 2909.5 us per layer, no gain.
+- **Eight keys per `dot_n` in attention instead of four**: 20.37 to 20.86 ms on
+  the single-thread layer with `exp` and PV removed, no gain.
+- **`SetThreadIdealProcessorEx` as the placement**: Qwen3-1.7B pp512 reps
+  1074.94, 930.14, 748.02, 761.68, the same decay as no placement (1072.52,
+  991.43, 765.08, 750.60), against 1096.27-1152.17 with one fixed core per
+  thread.
+- **One fixed core per thread (hard affinity), the first version of the
+  placement**: no faster than the CPU-set placement that shipped (one window:
+  Qwen3-1.7B pp512 1099.74-1159.29 against 1115.18-1147.24, LFM3-1.7B
+  1212.47-1267.58 against 1212.27-1262.83), it overrode a restricted process
+  affinity, and every pool took the same cores, so two concurrent `-t 4` benches
+  ran at 218.77-225.92 t/s each against 392.25-412.41. The fallback the review
+  proposed, a group-affinity mask of first siblings, was not built, since CPU
+  sets held the rate.
 
 ### B174 — the loose MoE prefill comparison passes a Vulkan router that ignores the bias (2026-11-14)
 
@@ -5127,10 +5202,10 @@ the drain arm of `adapter::execute_paged_moe`); the measurements are in
   last staged slot of an off session (`release_staged_fills`) drop it in place,
   waiting for a read in progress. Once per session at most; left as is.
 
-### B188 — LFM3 prefill trails llama.cpp on the CPU; decode trails it on CPU (2026-11-14, profiled 2026-11-15)
+### B188 — LFM3 against llama.cpp: CPU closed, Vulkan0 attention and head gate left (2026-11-14, profiled 2026-11-15)
 
-**Tag:** perf · lfm3 · **Blocked on:** nothing; what is left is the CPU GEMM and
-GEMV, the Vulkan0 attention and head gate, each its own slice
+**Tag:** perf · lfm3 · **Blocked on:** nothing; what is left is the Vulkan0
+attention and head gate, each its own slice (the CPU remainder is in B173)
 
 `LFM3-1.7B-Q4_K_M.gguf`, `infr bench` against `llama-bench` (llama.cpp
 `5676dfbe0`), measured on 2026-11-14 with the CPU 1–3% busy before each run
@@ -5204,14 +5279,14 @@ Vulkan1 126.3 against 186.83; CPU tg128 49.6 against 56.64).
     adapter and so through the dp4a GEMM on this device, but asserts which GEMM
     ran only for the int8 coopmat one; a dp4a counter like `i8cm_kq_counts`
     would make it say so.
-- **CPU, the Q4_K/Q6_K GEMM.** After the fix a warm forward is 567.8-569.7 ms
-  (one later run, whose unchanged Linears also ran faster than in the first
-  profile, so the two windows differ), and its five largest rows are Linears
-  (218.52 ms for the gate and up GEMMs, then 60.06, 57.33, 53.71 and 49.71 ms);
-  llama.cpp's CPU pp512 was 979.14 and 1082.25 t/s on the two days. Also
-  `GatedAct` 30.77 ms (scalar `expf`, B173) and `Attention` 28.75 + 16.41 ms.
-  CPU decode is GEMV-bound (2048x7680 39.02%, the Q6_K lm_head 17.23%, 7680x2048
-  Q6_K 11.20% of the decode profile), and Qwen3-1.7B trails there too.
+- **CPU: closed for prefill, LFM3 decode level** (2026-11-15, CHANGELOG: the
+  spin pool's threads had been sharing cores, and the decode Q4_K/Q6_K dots took
+  a horizontal sum per sub-block). Two interleaved rounds of four reps:
+  LFM3-1.7B pp512 1226.86-1251.96 and 1069.51-1206.10 t/s against llama.cpp's
+  1135.79-1193.56 and 1112.89-1159.61, tg128 59.36 and 59.62 against
+  53.95-61.40; Qwen3-1.7B pp512 1078.38-1111.61 and 1026.68-1143.06 against
+  1128.14-1141.88 and 1120.53-1151.13, tg128 56.83 and 56.72 against
+  59.88-60.24. What is left on the CPU is in B173.
 
 **Considered and declined, with what was measured:**
 

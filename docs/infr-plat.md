@@ -23,7 +23,7 @@ it that way.
 
 | module   | capability                                    |
 | -------- | --------------------------------------------- |
-| `cpu`    | physical core count                           |
+| `cpu`    | physical core count, compute-thread placement |
 | `fileio` | positioned reads and writes                   |
 | `link`   | the content-addressed store's link step       |
 | `lock`   | an exclusive, crash-safe file lock            |

@@ -248,11 +248,12 @@ pub struct CpuBackend {
     repack_cache: Mutex<RepackCacheState>,
     /// Persistent spin-pool for the op interpreter's parallel loops (see `pool.rs`, threadpool
     /// restructure phase 2). Built on first use so backends constructed for tests/tiny work
-    /// never spawn threads. MoeFfn's nested per-expert fan-out stays on rayon (phase 3).
+    /// never spawn threads; `execute` builds it up front only for a graph with an `Op::Linear`,
+    /// to place the dispatching thread for the walk.
     pool: std::sync::OnceLock<pool::SpinPool>,
     /// The engine configuration this backend reads its knobs from — one value, held for the
     /// backend's whole life, borrowed (never cloned) at every read site. The knobs it reads are
-    /// `kernels.cpu.{spin,spinpool,repack_mb,reference}`, `prof.prof_ops` and
+    /// the `kernels.cpu` ones ([`infr_core::config::CpuCfg`]), `prof.prof_ops` and
     /// `debug.moe_counts{,_dump}`.
     ///
     /// Every construction site inside this repo goes through [`CpuBackend::new_with`] (the seam
@@ -262,6 +263,9 @@ pub struct CpuBackend {
     /// per-read `std::env::var` calls it replaced. It is not a bridge to be deleted — it is the
     /// documented no-argument constructor.
     cfg: Arc<Config>,
+    /// Query rows one `Op::Attention` task runs for one head: [`ATTN_QUERY_BLOCK`]. A field so a
+    /// test can set 1, the one-pair-per-task decomposition the blocking replaced.
+    attn_query_block: usize,
 }
 
 /// `default()` is `new()` — the env-sourced bridge, NOT `Config::default()`. Keeping them the same
@@ -290,6 +294,7 @@ impl CpuBackend {
             repack_cache: Mutex::default(),
             pool: std::sync::OnceLock::new(),
             cfg,
+            attn_query_block: ATTN_QUERY_BLOCK,
         }
     }
 
@@ -496,6 +501,23 @@ pub(crate) fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
         other => dequant_block(other, bytes).expect("cpu backend: host dequant"),
     }
 }
+
+/// Elements of the f16 KV prefix one pool task widens to f32 in `Op::Attention`: large enough
+/// that a task outweighs its claim, small enough to spread a few-thousand-row prefix over
+/// every thread.
+const KV_WIDEN_CHUNK: usize = 1 << 14;
+
+/// Fewest weight rows a single-token `Op::Linear` task claims: a row's dot is well under a
+/// microsecond, so fewer would make the shared task cursor the bottleneck.
+const DECODE_ROWS_MIN: usize = 16;
+/// Most weight rows a single-token `Op::Linear` task claims. Measured on Qwen3-1.7B Q4_K_M
+/// decode at 16 threads (9950X3D): a fixed 16 rows per task lost to a fixed 128, a fixed 256 or
+/// 512 lost to 128 again (too few tasks to balance), and per-shape sizing capped here matched
+/// or beat the fixed 128 on both Qwen3 and LFM3 (CHANGELOG).
+const DECODE_ROWS_MAX: usize = 128;
+
+/// Query rows one `Op::Attention` task runs for one head; see the dispatch there.
+const ATTN_QUERY_BLOCK: usize = 16;
 
 /// Whether a prefill `Op::Linear` of `m` tokens over this weight runs on
 /// [`CpuBackend::linear_packed`]: Q4_K, Q5_K or Q6_K with at least one full 8-row group, at
@@ -816,6 +838,16 @@ impl Backend for CpuBackend {
                     .into(),
             ));
         }
+
+        // The op loop runs on this thread, which takes a share of every pool job: give it the
+        // pool's placement for the walk. A graph with a Linear is about to use the pool, so it is
+        // built here if it does not exist yet; one without leaves an unbuilt pool unbuilt (the
+        // scan is once per walk, not per op).
+        let pool_in_use =
+            self.pool.get().is_some() || g.ops.iter().any(|op| matches!(op, Op::Linear { .. }));
+        let _placed = pool_in_use.then(|| self.pool().place_caller()).flatten();
+        #[cfg(test)]
+        tests::EXEC_PLACEMENT.set(infr_plat::cpu::current_placement());
 
         // f32 working store for every Input/Internal/Output handle (weights are read on demand:
         // norms via the small dequant cache, `Op::Linear` weights streamed row-by-row).
@@ -1163,9 +1195,12 @@ impl Backend for CpuBackend {
                                 | DType::Q2_0
                         ) || q8_0_blk32)
                             .then(|| [quantize_q8_32(xrow)]);
-                        // Spin-pool, 16 output rows per claimed task (decode's per-row dot is
-                        // ~µs-scale; per-row claims would be all cursor contention).
-                        self.pool().for_chunks_mut(&mut out, 1, 16, &|o, dst_o| {
+                        // Rows per claimed task: enough tasks for every thread to take two,
+                        // but no smaller than `DECODE_ROWS_MIN` (per-row claims would be all
+                        // cursor contention) nor larger than `DECODE_ROWS_MAX`.
+                        let grain = (out_f / (2 * self.pool().threads()))
+                            .clamp(DECODE_ROWS_MIN, DECODE_ROWS_MAX);
+                        self.pool().for_chunks_mut(&mut out, 1, grain, &|o, dst_o| {
                             let row = &wbytes[o * bpr..o * bpr + bpr];
                             dst_o[0] = match dt {
                                 DType::Q4K => vec_dot_q4k(row, q8.as_ref().unwrap(), in_f),
@@ -1862,12 +1897,27 @@ impl Backend for CpuBackend {
                     // kv_len <= cap_rows and everything below is the old identity indexing.
                     let cap_rows = g.desc(k_cache).numel() / (nkv * hd).max(1);
                     let need = kv_len.min(cap_rows) * nkv * hd;
-                    let deq = |b: &[u8], dt: DType| -> Vec<f32> {
+                    let mut deq = |b: &[u8], dt: DType| -> Vec<f32> {
                         match dt {
-                            DType::F16 => bytemuck::cast_slice::<u8, u16>(b)[..need]
-                                .iter()
-                                .map(|&x| half::f16::from_bits(x).to_f32())
-                                .collect(),
+                            // The f16 cache (the default) widens across the pool with the
+                            // hardware conversion rather than serially per element on this
+                            // thread. Widening is exact, so the values are the same either way.
+                            DType::F16 => {
+                                use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
+                                let src: &[half::f16] =
+                                    bytemuck::cast_slice::<u8, u16>(b)[..need].reinterpret_cast();
+                                let mut dst = rc.for_overwrite(need);
+                                self.pool().for_chunks_mut(
+                                    &mut dst,
+                                    KV_WIDEN_CHUNK,
+                                    1,
+                                    &|c, piece| {
+                                        let s0 = c * KV_WIDEN_CHUNK;
+                                        src[s0..s0 + piece.len()].convert_to_f32_slice(piece);
+                                    },
+                                );
+                                dst
+                            }
                             DType::Q8_0 => crate::dequant_prefix_q8_0(b, need),
                             // TurboQuant blocks store the WHT-rotated values; dequant + inverse WHT
                             // recovers the original domain so the f32 SDPA below runs unchanged.
@@ -1910,12 +1960,10 @@ impl Backend for CpuBackend {
                     };
                     let mut out = rc.for_overwrite(rows * nh * hd);
                     // Each (ti, h) pair writes exactly one hd-sized output slice with no
-                    // cross-iteration deps → embarrassingly parallel.  Chunk index i = ti*nh+h.
-                    self.pool().for_chunks_mut(&mut out, hd, 2, &|i, ob_slice| {
+                    // cross-iteration deps → embarrassingly parallel.
+                    let attend = |ti: usize, h: usize, ob_slice: &mut [f32]| {
                         // The weighted V rows accumulate into this slice from zero.
                         ob_slice.fill(0.0);
-                        let ti = i / nh;
-                        let h = i % nh;
                         let kvh = h / group;
                         let qb = (ti * nh + h) * hd;
                         let abs = pos as usize + ti; // absolute position of this query
@@ -2002,7 +2050,37 @@ impl Backend for CpuBackend {
                                 *o = v.mul_add(p, *o);
                             }
                         }
+                    };
+                    // One task is one head over a block of consecutive query rows, so the block
+                    // re-reads that head's K/V rows from its core's own cache; with one
+                    // (row, head) pair per task every query fetched the whole prefix again
+                    // from the shared L3. Blocks run latest first: under a causal mask a later
+                    // row attends more keys, and the big tasks are best not left for the tail.
+                    // Each pair's arithmetic is unchanged, so the output is too.
+                    let qblk = self.attn_query_block;
+                    let n_blocks = rows.div_ceil(qblk);
+                    assert_eq!(out.len(), rows * nh * hd);
+                    let outp = pool::SendPtr::new(out.as_mut_ptr());
+                    self.pool().run(n_blocks * nh, &|task| {
+                        let blk = n_blocks - 1 - task / nh;
+                        let h = task % nh;
+                        let t1 = ((blk + 1) * qblk).min(rows);
+                        for ti in blk * qblk..t1 {
+                            assert!(ti < rows && h < nh, "attention task outside the output");
+                            // SAFETY: `(ti, h)` with `ti < rows` and `h < nh` (both asserted) is
+                            // in bounds of `out` (asserted length), and each pair belongs to exactly one task,
+                            // so no two tasks touch the same slice; `out` outlives the `run`.
+                            let ob_slice = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    outp.get().add((ti * nh + h) * hd),
+                                    hd,
+                                )
+                            };
+                            attend(ti, h, ob_slice);
+                        }
                     });
+                    rc.give(ks);
+                    rc.give(vs);
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::GatedAct {
@@ -4074,6 +4152,12 @@ pub(crate) mod test_util {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        /// The dispatching thread's placement as `execute` saw it once it had placed itself:
+        /// what the placement tests read to see the walk ran placed.
+        pub(crate) static EXEC_PLACEMENT: std::cell::Cell<Option<infr_plat::cpu::Placement>> =
+            const { std::cell::Cell::new(None) };
+    }
     use super::test_util::det_quant_rows;
     use super::*;
     use infr_core::tensor::TensorDesc;
@@ -4672,6 +4756,247 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A causal prefill `Op::Attention` of `rows` query rows at position `pos` over an f16 K/V
+    /// cache, through `execute` on `be` inside a rayon pool of `threads` (which sizes the spin
+    /// pool), returning its `[rows, n_head * head_dim]` output.
+    fn run_attention(be: CpuBackend, threads: usize, rows: usize, pos: usize) -> Vec<f32> {
+        let (nh, nkv, hd) = (4usize, 2usize, 64usize);
+        let kv_len = pos + rows;
+        let q: Vec<f32> = (0..rows * nh * hd)
+            .map(|i| ((i * 31 % 97) as f32 - 48.0) / 40.0)
+            .collect();
+        let kv = |seed: usize| -> Vec<u8> {
+            (0..kv_len * nkv * hd)
+                .flat_map(|i| {
+                    let v = ((i * 17 + seed) % 89) as f32 / 30.0 - 1.4;
+                    half::f16::from_f32(v).to_le_bytes()
+                })
+                .collect()
+        };
+        let mut g = Graph::new();
+        let qi = g.input(TensorDesc::new(vec![rows, nh * hd], DType::F32));
+        let ki = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let vi = g.input(TensorDesc::new(vec![kv_len * nkv * hd], DType::F16));
+        let dst = g.output(TensorDesc::new(vec![rows, nh * hd], DType::F32));
+        g.push(Op::Attention {
+            q: qi,
+            k_cache: ki,
+            v_cache: vi,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale: 1.0 / (hd as f32).sqrt(),
+            mask: AttnMask::Causal,
+            pos: pos as u32,
+            sinks: None,
+            key_bias: None,
+        });
+        let up = |bytes: &[u8]| {
+            let b = be.alloc(bytes.len(), BufferUsage::Activations).unwrap();
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let (qb, kb, vb) = (up(&f32_bytes(&q)), up(&kv(3)), up(&kv(11)));
+        let ob = be
+            .alloc(rows * nh * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        let mut b = Bindings::new();
+        b.bind(qi, qb.as_ref());
+        b.bind(ki, kb.as_ref());
+        b.bind(vi, vb.as_ref());
+        b.bind(dst, ob.as_ref());
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(|| be.execute(be.compile(&g).unwrap().as_ref(), &b).unwrap());
+        let mut bytes = vec![0u8; rows * nh * hd * 4];
+        be.download(ob.as_ref(), &mut bytes).unwrap();
+        bytes
+            .chunks(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    /// Blocked prefill attention gives the bits of one (row, head) pair per task, the
+    /// decomposition it replaced, on one thread and on several: a whole number of blocks plus a
+    /// partial last one, from position 0 and from a later position.
+    #[test]
+    fn attention_blocks_match_one_pair_per_task_bitwise() {
+        let rows = 2 * ATTN_QUERY_BLOCK + 5;
+        for pos in [0usize, 9] {
+            let mut per_pair = CpuBackend::new();
+            per_pair.attn_query_block = 1;
+            let want = run_attention(per_pair, 1, rows, pos);
+            assert!(want.iter().all(|v| v.is_finite()), "non-finite output");
+            let nonzero = want.iter().filter(|v| **v != 0.0).count();
+            assert!(
+                nonzero > want.len() / 2,
+                "vacuous output: {nonzero} non-zero"
+            );
+            for threads in [1usize, 8] {
+                let got = run_attention(CpuBackend::new(), threads, rows, pos);
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "pos={pos} threads={threads} element {i}: {g} vs {w}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Run `body` on a fresh thread inside a rayon pool of four threads (which sizes the spin
+    /// pool), with a backend whose pool is already built; skip, saying why, when this machine
+    /// gives a four-thread pool no placement.
+    #[cfg(windows)]
+    fn with_placed_pool(name: &str, body: impl FnOnce(&CpuBackend) + Send) {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap()
+            .install(|| {
+                let be = CpuBackend::new();
+                if be.pool().placement.is_none() {
+                    eprintln!(
+                        "SKIP {name}: no placement for four threads here (fewer than four \
+                         allowed cores, nothing to narrow, or default CPU sets)"
+                    );
+                    return;
+                }
+                body(&be);
+            });
+    }
+
+    /// A one-Linear graph and its bindings over `be`'s buffers; `bind_weight = false` leaves the
+    /// weight unbound so the walk panics after placing itself.
+    #[cfg(windows)]
+    fn small_linear(be: &CpuBackend, bind_weight: bool) -> std::thread::Result<()> {
+        let (m, in_f, out_f) = (2usize, 256usize, 8usize);
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+        let wi = g.weight(TensorDesc::new(vec![out_f, in_f], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+        g.push(Op::Linear {
+            x: xi,
+            weight: wi,
+            dst,
+            m: m as u32,
+            in_f: in_f as u32,
+            out_f: out_f as u32,
+            w_off: 0,
+        });
+        let up = |bytes: &[u8]| {
+            let b = be.alloc(bytes.len(), BufferUsage::Activations).unwrap();
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let xb = up(&f32_bytes(&vec![0.5; m * in_f]));
+        let wb = up(&f32_bytes(&vec![0.25; out_f * in_f]));
+        let ob = be.alloc(m * out_f * 4, BufferUsage::Activations).unwrap();
+        let mut b = Bindings::new();
+        b.bind(xi, xb.as_ref());
+        if bind_weight {
+            b.bind(wi, wb.as_ref());
+        }
+        b.bind(dst, ob.as_ref());
+        let plan = be.compile(&g).unwrap();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            be.execute(plan.as_ref(), &b).unwrap();
+        }))
+    }
+
+    /// Every worker runs placed: a job with a task per worker reads the selection back on each
+    /// thread other than the dispatching one.
+    #[cfg(windows)]
+    #[test]
+    fn pool_workers_run_placed() {
+        with_placed_pool("pool_workers_run_placed", |be| {
+            let pool = be.pool();
+            let me = std::thread::current().id();
+            let seen = std::sync::Mutex::new(Vec::new());
+            // Enough tasks, each slow enough, that every worker claims some.
+            pool.run(64, &|_| {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                if std::thread::current().id() != me {
+                    seen.lock()
+                        .unwrap()
+                        .push(infr_plat::cpu::current_placement());
+                }
+            });
+            let seen = seen.into_inner().unwrap();
+            assert!(!seen.is_empty(), "no task ran on a worker");
+            for p in &seen {
+                assert_eq!(
+                    p, &pool.placement,
+                    "a worker ran without the pool's placement"
+                );
+            }
+        });
+    }
+
+    /// The walk runs placed and leaves the dispatching thread unplaced afterwards, whether it
+    /// returns or panics (the "unbound Weight" panic message in the test output is that case).
+    #[cfg(windows)]
+    #[test]
+    fn execute_places_the_caller_only_for_the_walk() {
+        with_placed_pool("execute_places_the_caller_only_for_the_walk", |be| {
+            let want = be.pool().placement.clone();
+            EXEC_PLACEMENT.set(None);
+            small_linear(be, true).expect("the walk");
+            assert_eq!(EXEC_PLACEMENT.take(), want, "the walk ran unplaced");
+            assert_eq!(
+                infr_plat::cpu::current_placement(),
+                None,
+                "left placed after return"
+            );
+            assert!(small_linear(be, false).is_err(), "an unbound weight panics");
+            assert_eq!(
+                EXEC_PLACEMENT.take(),
+                want,
+                "the panicking walk ran unplaced"
+            );
+            assert_eq!(
+                infr_plat::cpu::current_placement(),
+                None,
+                "left placed after a panic"
+            );
+        });
+    }
+
+    /// A walk inside an outer placement leaves the outer one in force until the outer guard
+    /// drops, and a thread with a selection of its own keeps it through a walk.
+    #[cfg(windows)]
+    #[test]
+    fn execute_leaves_an_existing_placement_alone() {
+        with_placed_pool("execute_leaves_an_existing_placement_alone", |be| {
+            let want = be.pool().placement.clone();
+            let outer = be.pool().place_caller().expect("outer placement");
+            small_linear(be, true).expect("the inner walk");
+            assert_eq!(
+                infr_plat::cpu::current_placement(),
+                want,
+                "the inner walk cleared it"
+            );
+            drop(outer);
+            assert_eq!(infr_plat::cpu::current_placement(), None);
+
+            let own = infr_plat::cpu::spread_placement(1).expect("a one-thread placement");
+            assert!(infr_plat::cpu::apply_placement(&own).expect("apply our own"));
+            small_linear(be, true).expect("the walk");
+            assert_eq!(
+                infr_plat::cpu::current_placement().as_ref(),
+                Some(&own),
+                "the walk replaced or cleared the thread's own selection"
+            );
+            infr_plat::cpu::clear_placement().expect("clear our own");
+        });
     }
 
     /// A prefill `Op::Linear` of `m` tokens through `execute`, returning its `[m, out_f]` output.

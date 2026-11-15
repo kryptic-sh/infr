@@ -1080,8 +1080,8 @@ fn split_k_chunk_count_cap(span: usize, chunk: usize) -> usize {
 /// arm's split-K comment in `lower_op`): a plain tile's grid underfills the device for narrow-n
 /// (`n=1024` → 64 wgs on a 96-wg part), so split k across enough extra workgroups to fill, with a
 /// fixed-order reduce. Returns 1 (direct tile, no partials round-trip) for wide/filled shapes.
-/// Shared by the resident native-quant arm, the F16 split-K arm, and the streamed twin so their
-/// tile decisions can't drift.
+/// Shared by `quant_linear`'s coopmat warp tile and `float_linear`'s F16 split-K arm, resident
+/// and streamed alike.
 ///
 /// The window is `max(SPLIT_K_FIXED_GRID, SPLIT_K_FILL_PER_CU · compute_units)`: a CU count can
 /// only widen it, never shrink it below the fixed window every device ran before. Callers pass
@@ -1171,11 +1171,10 @@ fn i8cm_kq_choice(
 /// [`i8cm_kq_choice`]'s large-tile threshold: workgroups of the large tile per compute unit.
 const I8CM_L_FILL_PER_CU: usize = 2;
 
-/// The coopmat-warp prefill GEMM tile selection shared by the resident native-dense `Op::Linear`
-/// arm and its arena-addressed streamed twin (`streamed_prefill_gemm`): the A_GLOBAL f16-A cast,
-/// the narrow-n split-K (`split_k_plan`), or the direct tile — reading the weight from `w_addr`
-/// (the resident weight's BDA, or the streamed pool-arena base). Callers pass the padded `out`
-/// (see `with_padded_dst`). Extracted so the two paths can't drift ("must track exactly").
+/// The coopmat-warp prefill GEMM tile selection of `quant_linear`'s coopmat tier: the A_GLOBAL
+/// f16-A cast, the narrow-n split-K (`split_k_plan`), or the direct tile — reading the weight from
+/// `w_addr` (the resident weight's BDA, or the streamed pool-arena base). Callers pass the padded
+/// `out` (see `with_padded_dst`).
 #[allow(clippy::too_many_arguments)]
 fn native_warp_gemm(
     be_: &VulkanBackend,
@@ -1249,8 +1248,8 @@ fn native_warp_gemm(
     Ok(())
 }
 
-/// The padded-dst dance shared by every tiled prefill GEMM tier (`is_gemm`, the non-coopmat
-/// `nc_mmq`/`nc_fma` tier, and the streamed twin): a GEMM may write up to `ceil(m/64)*64` rows
+/// The padded-dst dance shared by every tiled prefill GEMM tier (the coopmat tier and the
+/// non-coopmat `nc_mmq`/`nc_fma` tier, resident and streamed): a GEMM may write up to `ceil(m/64)*64` rows
 /// (some tiles store their pad rows, the dp4a K-quant GEMM does not), so an Internal (row-padded)
 /// `dst` is written direct, while a non-Internal `dst` (e.g. the lm_head
 /// `logits` Output) gets a padded temp the `record` closure fills, then a copy of the `m` real
@@ -1366,21 +1365,18 @@ fn lower_op(
     // `Op::Linear` whose weight is a streamed block — `arena_addr` is the resident slot's arena base
     // BYTE address. The pool arena is a `bufferDeviceAddress` buffer read purely by 64-bit pointer
     // (NOT a bound SSBO), so the ~4 GiB `maxStorageBufferRange` cap is gone entirely (no descriptor
-    // binds it). The op is lowered by an m-split that MIRRORS the resident selection, just
-    // arena-addressed: a genuine prefill chunk (`streamed_gemm_route`) routes through the SAME
-    // tiled GEMM the resident path would pick (`streamed_prefill_gemm` → the -DSTREAMED twins of
-    // native_gemm/native_gemm_warp on a coopmat device, `nc_prefill_gemm` → the dp4a mmq / fma
-    // warptile GEMMs otherwise), while decode/small-m keep the single streamed GEMV
-    // (`linear_native_at`) — the arena-addressed kernels are the ONLY ones a >4 GiB pool ever
-    // dispatches, which is what makes dropping the caps safe. `w_off` (a fused-QKV slice offset,
-    // usually 0) rides on top as a within-slot element offset in both. The ring→arena copy hazard is
+    // binds it). A quantised op takes the resident routing (`quant_linear`) with the slot address
+    // in place of the resident weight's, skipping the few tiers whose kernel binds the weight
+    // buffer — the arena-addressed kernels are the ONLY ones a >4 GiB pool ever dispatches, which
+    // is what makes dropping the caps safe. `w_off` (a fused-QKV slice offset, usually 0) rides on
+    // top as a within-slot element offset. The ring→arena copy hazard is
     // ordered explicitly by `arena_stream_barrier` at the staging site (`DensePagerSession::stage`,
     // which argues why a hit needs none) — the SAME barrier covers the prefill dispatch. Every
     // other op — and every non-streamed model — passes `None` (zero change). Only the
     // `Op::Linear` arm reads it; the seam's placement admits only `linear::dense_stream_supported`
     // dtypes, and a streamed weight never takes the fused-residual peephole (filtered by
-    // `execute_static` before the loop). An F16/F32 weight bypasses that m-split and runs
-    // `float_linear` — the resident float dispatch — at the slot address.
+    // `execute_static` before the loop). An F16/F32 weight runs `float_linear` — the resident
+    // float dispatch — at the slot address.
     wsub: Option<u64>,
 ) -> Result<()> {
     let memo_prev = mmv_memo.take();
@@ -1491,10 +1487,9 @@ fn lower_op(
             // Dense layer streaming: the weight lives in a `bufferDeviceAddress` arena pool (see
             // the `wsub` param doc). The op reads the arena by 64-bit address (`arena_addr`), with
             // the op's own `w_off` (a fused-qkv slice offset, usually 0) riding on top as a
-            // within-slot element offset. A genuine prefill chunk routes to the SAME tiled GEMM
-            // the resident path would pick (arena-addressed) — the prefill perf win;
-            // decode/small-m keep the single streamed GEMV. Both dispatch ONLY arena-addressed
-            // kernels, never an unconverted SSBO one, which is what lets the seam drop the pool caps.
+            // within-slot element offset. Every shape takes the kernel the resident path would pick
+            // (arena-addressed), and ONLY arena-addressed kernels, never an unconverted SSBO one,
+            // which is what lets the seam drop the pool caps.
             if let Some(arena_addr) = wsub {
                 // A float weight runs the resident float dispatch with the slot's address in place
                 // of the resident buffer's: the same kernels, the same routing, the same bytes.
@@ -1510,48 +1505,29 @@ fn lower_op(
                     return Err(be("vulkan adapter: streamed Linear weight of a dtype \
                                    without arena-addressed kernels"));
                 }
-                // A Tiled route the weight or grid cannot take keeps the per-row GEMV it had before
-                // that route existed (see `streamed_tiled_fits`).
-                let route = streamed_gemm_route(be_, dt, m, in_f, out_f).filter(|r| match r {
-                    StreamedGemm::Warp => true,
-                    StreamedGemm::Tiled(_) => streamed_tiled_fits(
-                        dt,
-                        m,
-                        in_f,
-                        out_f,
-                        &be_.cfg().kernels.vulkan,
-                        crate::recorder::Recorder::split_point_x(),
-                    ),
-                });
-                if let Some(StreamedGemm::Tiled(kind)) = route {
-                    nc_prefill_gemm(
-                        be_, graph, kind, dt, arena_addr, w_off, x, xb, y, dst, m, in_f, out_f,
-                        rec, pool, transient, memo_prev, mmv_memo,
-                    )?;
-                } else if route == Some(StreamedGemm::Warp) {
-                    // The tiled prefill GEMM can't be output-row chunked (see the resident-GEMM
-                    // guard above) — a breaching streamed lm_head at m>16 fails loudly here.
-                    if crate::recorder::bda_weight_breaches(
-                        dt,
-                        in_f,
-                        out_f,
-                        &be_.cfg().kernels.vulkan,
-                    ) {
-                        return Err(be(format!(
-                            "vulkan adapter: streamed output-projection GEMM (m={m}, in_f={in_f}, \
-                             out_f={out_f}, {dt:?}) reads a >= 2^32-element weight — chunked \
-                             dispatch covers only m=1 decode and the per-row GEMV (issue #77)."
-                        )));
-                    }
-                    streamed_prefill_gemm(
-                        be_, graph, dt, arena_addr, w_off, xb, y, dst, m, in_f, out_f, rec, pool,
-                        transient,
-                    )?;
-                } else {
-                    // GEMV path — chunk-covered inside `linear_native_at` for a breaching weight.
-                    rec.linear_native_at(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
-                }
-                return Ok(());
+                // The resident routing, reading the slot by address (see `quant_linear`).
+                return quant_linear(
+                    be_,
+                    graph,
+                    dt,
+                    QuantWeight {
+                        addr: arena_addr,
+                        buffer: None,
+                    },
+                    w_off,
+                    x,
+                    xb,
+                    y,
+                    dst,
+                    m,
+                    in_f,
+                    out_f,
+                    rec,
+                    pool,
+                    transient,
+                    memo_prev,
+                    mmv_memo,
+                );
             }
             // Fused Linear+Add (decode residual): one GEMV with the residual added in-kernel —
             // see linear_add_peephole. `y` (the Linear's scratch dst) is never written.
@@ -1683,590 +1659,31 @@ fn lower_op(
                     transient, memo_prev, mmv_memo,
                 );
             }
-            // Prefill (m>1): a TILED GEMM writes ceil(m/64)*64 rows DIRECTLY into `y` (Internal
-            // buffers are row-padded to 64 up front, so no temp/copy). Needs n%64==0, k%32==0.
-            //  • Q4_K → mmq (dp4a int8): quantize activations once, integer matmul on the raw
-            //    blocks (no per-GEMM weight dequant) — the u4 prefill default.
-            //  • other native quants → coopmat `matmul_native` (in-shader dequant).
-            //  • f16 (float weights are uploaded as f16) → f16 coopmat `matmul_proj`.
-            // Decode (m=1) and non-tileable shapes fall through to the GEMV.
-            // Small multi-row batches (m = 2..8: spec-decode verify rows, a short chat-turn
-            // suffix prefill) take the multi-row GEMV first — the single-M-tile coopmat GEMM
-            // launches only n/64 workgroups (underfills the GPU: measured 51-182 GB/s effective
-            // weight stream vs the GEMV class's 292-651 on a 7900 XTX), and the plain GEMV
-            // re-streams the weight per row. 7900 XTX, 8B Q4_K shapes: m=2 is 5.6-8.3x the GEMM
-            // route, m=4 1.4-4.1x, m=8 1.7-2.6x — EXCEPT very wide n at m>=5 (gate+up n=24576:
-            // 384 tiles fill the GPU and the mrow's per-thread m*32-FMA inner loop turns
-            // ALU-bound), so m=5..8 gates on out_f <= 8192 (<=128 tiles = the GEMM-underfill
-            // regime). Writes exactly m rows (no padded-dst dance). Formats without an mrow
-            // build fall through to the GEMM; INFR_NO_MROW forces the old route (A/B).
-            // The int8 dp4a mrow's own gates (see the block comment below) — hoisted so the
-            // 9..=16 tier can require them UP FRONT: unlike m<=8 there is no dequant-mrow
-            // fallback above 8 rows, so entering the tier is only legal when the int8 kernel is
-            // actually dispatchable.
-            let mmv_gate = be_.caps().i8_dot
-                && in_f * out_f >= 8 << 20
-                && out_f < 65536
-                && crate::gemm::native_mmv_mrow_kernel_name(dt).is_some()
-                && mrow_int8_dtype_ok(be_.caps(), &be_.cfg().kernels.vulkan, dt, graph.mtp_verify)
-                && be_.cfg().kernels.vulkan.mmv;
-            // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
-            // once its rollback window carries a few committed rows on top of the n_max drafts.
-            // These shapes previously fell through to the split-K coopmat tile, which streams the
-            // same weight at 2-4x the per-row cost at this m (9B mtp128 measured: q4k down-proj
-            // m=11 sk_ag 148us vs mmvr m=7 67.5us; q6k 194us). Same out_f <= 8192 wide-n cutoff
-            // as m=5..8 (the GEMM tiles win on gate_up-wide shapes), same formats as the m<=8
-            // int8 tier (others keep the GEMM route — no dequant mrow above 8 rows).
-            // The two bands' SHAPE arithmetic lives in `MROW_BANDS` (shared policy); the
-            // capability half — kernel builds, dtype sets, caps, env hatches — stays here.
-            let mrow_tier = infr_core::tier::linear_tier(m, out_f, &MROW_BANDS);
-            let in_band = |b: usize| mrow_tier == infr_core::tier::LinearTier::MultiRow { band: b };
-            let mrow16 = in_band(MROW16_BAND)
-                && mmv_gate
-                && crate::gemm::native_mmv_mrow_m16_kernel_name(dt).is_some()
-                && be_.cfg().kernels.vulkan.mrow16;
-            if (in_band(MROW_BAND) || mrow16)
-                && in_f % 32 == 0
-                && crate::gemm::native_mrow_kernel_name(dt).is_some()
-                && be_.cfg().kernels.vulkan.mrow
-            {
-                // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
-                // integer-dot the raw weight blocks against ALL rows — the dequant mrow's
-                // per-sub-block scalar byte-extract dequant is the m-batch GEMV cost on ALU-bound
-                // shapes (E2B pp4@d4096: GEMV class 21.0 → 17.0us/op, pp4 366 → 383 t/s). Dtype
-                // eligibility is `mrow_int8_dtype_ok(caps, dt, graph.mtp_verify)`: an MTP-verify
-                // batch (`Graph::mtp_verify`) is gated to the SAME dtype set as the m=1 decode
-                // tier (`mmv_int8_decode_dtypes`) — int8 in both streams or in neither, never
-                // split (that split IS the Q5_K token-divergence bug; `mmv_mrow_symmetric_q2k_q3k`
-                // proves the two kernels agree once both are on). Ordinary prefill instead reads
-                // `mrow_int8_prefill_dtypes` — every measured win, independent of the decode set.
-                // Gates:
-                //  • m >= 3: m=2 is the single-head MTP spec-verify shape, whose accept loop
-                //    holds a hard output-identical-to-target-greedy bar (`mtp_spec_matches_
-                //    target_only_greedy`) — int8-quantized activations perturb the verify logits
-                //    enough to risk argmax flips vs the m=1 decode GEMV, so that shape keeps the
-                //    f32-dequant mrow.
-                //  • weight >= 8M elements: below that the kernel is dispatch-latency-floor
-                //    bound (the int8 math saves nothing) and the extra quant_q8 bubble is a pure
-                //    loss — qwen3-0.6b (all projections < 8M) measured pp4@d4096 934 → 854 t/s
-                //    ungated, and E2B's own win came from its gu/down (9.4-18.9M elems).
-                //  • out_f < 65536: the vocab-sized lm_head GEMV is pure weight-bandwidth (the
-                //    dequant ALU hides fully behind the stream) — the int8 form measured a hair
-                //    SLOWER there (qwen3-0.6b pp4@d4096 931 vs 916 with lm_head included).
-                // Same INFR_NO_MMV escape as the m=1 mmv (A/B).
-                if m >= 3 && mmv_gate {
-                    let nblk = in_f / 32;
-                    let qa = pooled(pool, be_, "mmvr_qa", m * in_f)?;
-                    let dact = pooled(pool, be_, "mmvr_dact", m * nblk * 2)?;
-                    let sact = pooled(pool, be_, "mmvr_sact", m * nblk * 2)?;
-                    // Same x already quantized by the immediately-preceding Linear(s)? Reuse it
-                    // (see `mmv_memo`'s doc — the take()/restore protocol guarantees nothing
-                    // rewrote x or the pooled qa in between).
-                    if memo_prev != Some((*x, m, in_f, "mmvr")) {
-                        rec.quant_q8(
-                            xb,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            m,
-                            in_f,
-                        );
-                    }
-                    *mmv_memo = Some((*x, m, in_f, "mmvr"));
-                    rec.linear_mmv_mrow(
-                        dt,
-                        w,
-                        w_off,
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        pool[&sact].as_ref(),
-                        None,
-                        y,
-                        m,
-                        in_f,
-                        out_f,
-                    );
-                    return Ok(());
-                }
-                rec.linear_native_mrow(dt, w, w_off, xb, y, m, in_f, out_f);
-                return Ok(());
-            }
-            let gemm_ok = m > 1 && out_f % 64 == 0 && in_f % 32 == 0;
-            // The whole GEMM tier below (matmul_native*/matmul_proj, the coopmat tiled prefill
-            // GEMM) dispatches ONLY coopmat SPIR-V — RADV still executes it on hardware without
-            // the feature (silent, no fault), so gating is required, not optional (issue: coopmat
-            // dispatch on a device that lacks VK_KHR_cooperative_matrix segfaults on some
-            // drivers). `!caps.f16_coopmat` routes to the NON-COOPMAT GEMM tier below (`nc_mmq`/
-            // `nc_fma` — real tiled GEMMs with no coopmat SPIR-V), and only past that to the
-            // scalar `else` arms (`linear_native`/`linear`/`linear_f32` — the SAME scalar
-            // dequant-in-shader kernels the m==1 decode GEMV already uses, generalized to
-            // `rows=m`; they dispatch `rows*out_f` (or row-tiled) workgroups with no upper bound
-            // on `rows`, so they are a drop-in, just without any weight-reuse-across-rows win).
-            // Bit-identical to before when caps are all true.
-            // ── 8x8x16 coopmat prefill GEMM tier (Intel Arc/ANV XMX; `caps.f16_coopmat_8x8()` is
-            // Some only when the device enumerates the 8x8x16 f16 shape AND `INFR_CM_8X8=1` —
-            // NEVER on RADV, which enumerates 16x16x16 and keeps the full tier below untouched).
-            // Only `native_gemm_warp`'s `_cm8` builds exist at this shape: one fixed
-            // NARROW_N+BM32 tile (BN=128, BK=64 → n%128, k%64) over the hot k-quants + Q8_0.
-            // Anything it can't cover (dtype without a `_cm8` build, non-dividing shape) keeps
-            // falling to the nc_mmq/nc_fma tier — the Arc default this knob A/Bs against.
-            let cm8_ok = gemm_ok
-                && be_.caps().f16_coopmat_8x8()
-                && out_f % 128 == 0
-                && in_f % 64 == 0
-                && crate::gemm::native_gemm_warp_cm8_build_spv(dt).is_some();
-            let is_gemm =
-                cm8_ok || (gemm_ok && be_.caps().f16_coopmat() && native_dense_supported(dt));
-            // ── NON-COOPMAT prefill GEMM tier (never taken when `caps.f16_coopmat` — zero effect
-            // on coopmat-capable defaults). The Intel Arc A770 (Mesa ANV) enumerates f16 coopmat
-            // only at M=8,N=8,K=16 — `caps.f16_coopmat()` is false there (see lib.rs) — but HAS
-            // packed int8 dot, and prefill GEMMs previously fell all the way to the per-row
-            // scalar GEMVs (the field-measured 10-30x prefill gap; decode was already at parity).
-            // This tier remains the Arc DEFAULT; the opt-in `cm8_ok` XMX tier above takes only
-            // the Linears it covers, and only under INFR_CM_8X8=1.
-            // Two arms (`nc_gemm_choice`), same padded-dst convention as `is_gemm`:
-            //  • `NcGemm::Mmq` (`nc_mmq`): weight dtype in `infr_core::tensor::MOE_MMQ_DTYPES` +
-            //    `caps.i8_dot` → the DENSE dp4a mmq GEMM family (`matmul_mmq_at` — the same shader
-            //    code the batched MoE expert path already gates on `i8_dot` alone, base-grid
-            //    build), fed by the same `quant_q8` activation prepass the coopmat tier's Q4_K-mmq
-            //    arm uses.
-            //  • `NcGemm::Fma` (`nc_fma`): f16/bf16/f32 weights (no integer codes to dp4a) → the
-            //    shared-memory fma warptile (`matmul_fma_at`, native_gemm_fma.comp — no subgroup
-            //    ops, no f16 exts; bf16 reads stay native, no f32 upconvert).
-            // Both read the weight by 64-bit address, so a streamed weight takes the same tier
-            // (`streamed_gemm_route`).
-            // Exercisable on coopmat hardware via INFR_NO_COOPMAT=1 (lib.rs's force-disable test
-            // knob — drops the device feature itself, a faithful simulation). INFR_NO_MMQ_FALLBACK=1
-            // disables the WHOLE tier (both arms) for A/B against the scalar floor.
-            let nc = nc_gemm_choice(be_, dt, gemm_ok);
-            if nc.is_some() {
-                check_nc_gemm_grid(dt, m, out_f)?;
-            }
-            // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
-            // (decode m=1, or the per-input-row GEMV) — the tiled coopmat/nc GEMMs below decode a
-            // 64-row weight tile that can't be split into single input rows, so a breach on this
-            // path (a multi-row lm_head: MTP speculative verify or all-position logits) must fail
-            // loudly, never wrap. Issue #77: covered classes chunk; everything else stays loud.
-            if (is_gemm || nc.is_some())
-                && crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
-            {
-                return Err(be(format!(
-                    "vulkan adapter: output-projection tiled GEMM (m={m}, in_f={in_f}, \
-                     out_f={out_f}, {dt:?}) reads a >= 2^32-element weight — chunked dispatch \
-                     covers only m=1 decode and the per-row GEMV (issue #77). This is a multi-row \
-                     lm_head (speculative verify / all-position logits) on a big-vocab model."
-                )));
-            }
-            if is_gemm {
-                // GEMM writes ceil(m/64)*64 rows; `with_padded_dst` writes an Internal (row-padded)
-                // `dst` direct and a non-Internal dst (the lm_head `logits` Output) via a padded
-                // temp + copy of the m real rows. Same dance as the nc tier and the streamed twin.
-                with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
-                    // Q4_K: the 8-warp warptile coopmat GEMM (native_gemm_warp, in-shader dequant)
-                    // beats mmq dp4a at prefill shapes (161 vs 417µs on [512,1024]×[1024,6144] — the
-                    // wide tile amortizes staging; RADV can't use int8 WMMA). mmq stays for shapes NO
-                    // warp tile can cover — n%128≠0 (the NARROW_N tile covers n%128; gemma3-1b's
-                    // ne=1152 projections sat on scalar mmq at ~10 TF under the old n%256 gate).
-                    // INFR_NO_MMQ also skips mmq for A/B.
-                    let warp_ok = out_f % 128 == 0
-                        && crate::gemm::native_gemm_warp_kernel_name(dt).is_some()
-                        && be_.cfg().kernels.vulkan.gemm_warp;
-                    // int8 cooperative-matrix (WMMA) prefill GEMM — MEASUREMENT path, Q8_0 only
-                    // (crates/infr-vulkan/shaders/native_gemm_i8cm_q8_0.comp). `caps.i8_coopmat` is
-                    // hardware detection only (see its doc); this dispatch ALSO requires
-                    // `INFR_I8_COOPMAT=1` (default off) because int8 coopmat hung the GPU on an older
-                    // Mesa despite enumerating fine there too (commit ad82a77) — the toggle keeps that
-                    // regression class opt-in until a Mesa-version-gated default is warranted. Default
-                    // behavior (unset) is completely unaffected: this is a new, additive branch ahead
-                    // of the existing Q4_K-mmq / warp-coopmat / off-tier arms below, which are
-                    // untouched.
-                    // fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM — Q8_0 only
-                    // (crates/infr-vulkan/shaders/native_gemm_f8cm_q8_0.comp). `caps.f8_coopmat` is
-                    // hardware enumeration only (RDNA4/Navi44 confirmed, see lib.rs `has_f8_coopmat`);
-                    // this dispatch ALSO requires `INFR_F8_COOPMAT=1` (default off) because — unlike
-                    // `i8cm_ok` below — this kernel hasn't been run/measured on real fp8-coopmat
-                    // hardware at all yet (this dev box has none), so the opt-in stays until an RDNA4
-                    // pass validates correctness. Checked AHEAD of `i8cm_ok`: both are Q8_0-only
-                    // measurement tiers, so when a caller opts into fp8 it takes priority. Default
-                    // behavior (unset) is completely unaffected — new, additive branch ahead of the
-                    // i8cm / Q4_K-mmq / warp-coopmat / off-tier arms below, which are untouched.
-                    //
-                    // Shape gate mirrors `warp_ok`'s f16 warptile pick: WIDE (BN=256, BK=32) needs
-                    // out_f%256==0 && in_f%32==0; NARROW_N (BN=128, BK=64) needs out_f%128==0 &&
-                    // in_f%64==0 for shapes the wide tile can't cover (n%128 not n%256 — see
-                    // native_gemm_f8cm_q8_0.comp's -DNARROW_N). Neither divides (e.g. out_f%128!=0, or
-                    // out_f%128==0 with in_f%64!=0 so narrow's BK=64 can't stage either) -> f8cm_ok is
-                    // false and the shape falls through to i8cm/mmq/native below, unaffected.
-                    let f8_wide = out_f % 256 == 0 && in_f % 32 == 0;
-                    let f8_narrow = !f8_wide && out_f % 128 == 0 && in_f % 64 == 0;
-                    let f8cm_ok = matches!(dt, infr_core::DType::Q8_0)
-                        && be_.caps().f8_coopmat()
-                        && (f8_wide || f8_narrow)
-                        && be_.cfg().kernels.vulkan.f8_coopmat;
-                    // `i8_coopmat_ready` is `caps.i8_coopmat()` AND the `INFR_I8_COOPMAT=1` opt-in
-                    // AND this driver having PASSED the accumulator-layout known-answer probe at
-                    // init (see `VulkanBackend::verify_i8_coopmat_layout`): the kernel's
-                    // in-fragment descale reads accumulator elements at a mapping that is fixed per
-                    // implementation, so enumeration alone does not make it safe to dispatch.
-                    let i8cm_ok = matches!(dt, infr_core::DType::Q8_0) && be_.i8_coopmat_ready();
-                    // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM — the `-DBF16CM` build of the
-                    // SAME production kernel (crates/infr-vulkan/shaders/native_gemm_warp.comp) that
-                    // `native_gemm_warp_bf16` (the f16-clamped path below) already uses; only the
-                    // coopmat A/B operand type differs, so it should match that kernel's speed while
-                    // keeping bf16's full exponent range. `caps.bf16_coopmat` is hardware enumeration
-                    // only (RDNA4/Navi44 confirmed, see lib.rs `has_bf16_coopmat`); this dispatch ALSO
-                    // requires `INFR_BF16_COOPMAT=1` (default off) because this variant hasn't been
-                    // run/measured on real bf16-coopmat hardware at all yet (this dev box has none), so
-                    // the opt-in stays until an RDNA4 pass validates correctness. Default behavior
-                    // (unset) is completely unaffected: Bf16 keeps routing through the existing
-                    // `native_dense_supported` arm below (`native_gemm_warp_bf16`, the f16-clamped
-                    // path), byte-identical to before this branch existed. Shape gate mirrors
-                    // `f8_wide`/`f8_narrow`: WIDE (BN=256, BK=32) needs out_f%256==0 && in_f%32==0;
-                    // NARROW_N (BN=128, BK=64) needs out_f%128==0 && in_f%64==0.
-                    let bf16cm_wide = out_f % 256 == 0 && in_f % 32 == 0;
-                    let bf16cm_narrow = !bf16cm_wide && out_f % 128 == 0 && in_f % 64 == 0;
-                    let bf16cm_ok = matches!(dt, infr_core::DType::Bf16)
-                        && be_.caps().bf16_coopmat()
-                        && (bf16cm_wide || bf16cm_narrow)
-                        && be_.cfg().kernels.vulkan.bf16_coopmat;
-                    let i8cm_kq_tile = if be_.i8cm_kq_ready() {
-                        i8cm_kq_choice(dt, m, in_f, out_f, w_off, be_.caps().compute_units)
-                    } else {
-                        None
-                    };
-                    if cm8_ok {
-                        // 8x8x16 `_cm8` warptile (see the `cm8_ok` doc above). First in the chain:
-                        // when it's true, `caps.f16_coopmat()` is false (the shapes are mutually
-                        // exclusive), so every 16x16x16 branch below would mis-dispatch — none of
-                        // their SPIR-V exists at the device's fragment shape.
-                        rec.matmul_native_cm8(dt, xb, w, w_off, out, m, in_f, out_f);
-                    } else if f8cm_ok {
-                        // E4M3's range is tiny (max normal 448) — unscaled f32 activations overflow to
-                        // inf/NaN on cast, which is what produced garbage output on the first RDNA4
-                        // run. `quant_f8_row` pre-scales activations into E4M3's range (one amax/scale
-                        // per row) before the coopmat GEMM, which descales the output by that same
-                        // per-row scale in its epilogue. Q8_0 weights are unscaled (see
-                        // native_gemm_f8cm_q8_0.comp doc — their post-dequant magnitude is expected to
-                        // already fit E4M3).
-                        let qa = pooled(pool, be_, "f8cm_qa", m * in_f)?;
-                        let srow = pooled(pool, be_, "f8cm_srow", m * 4)?;
-                        rec.quant_f8_row(xb, pool[&qa].as_ref(), pool[&srow].as_ref(), m, in_f);
-                        // INFR_F8_PREPACK=1 (requires INFR_F8_COOPMAT=1 too, since it only takes
-                        // effect inside this arm): bakes the Q8_0 block scale into an E4M3 weight
-                        // buffer ONCE via `repack_q8_to_f8`, then the GEMM's Bs staging reads that
-                        // buffer DIRECTLY — no in-shader dqblk. Isolates whether removing the
-                        // dequant-ALU bottleneck (the SAME cost f16 pays; fp8-dqblk measured 0.73x
-                        // f16 on RDNA4) lets fp8's 2x WMMA rate win. The E4M3 buffer is pooled
-                        // per-shape scratch (like every other tier here) and re-repacked on EVERY
-                        // forward call — a real deployment would cache the repack at load time, not
-                        // redo it per Linear; this is a per-op profiling isolation path, not the
-                        // proposed production shape. Unset (default): unchanged dqblk path below,
-                        // byte-identical to before this branch existed.
-                        if be_.cfg().kernels.vulkan.f8_prepack {
-                            let f8_w8 = pooled(pool, be_, "f8_w8", out_f * in_f)?;
-                            rec.repack_q8_to_f8(w, w_off, pool[&f8_w8].as_ref(), out_f, in_f);
-                            rec.matmul_f8cm_q8_0_prepacked(
-                                pool[&qa].as_ref(),
-                                pool[&srow].as_ref(),
-                                pool[&f8_w8].as_ref(),
-                                out,
-                                m,
-                                in_f,
-                                out_f,
-                            );
-                        } else {
-                            rec.matmul_f8cm_q8_0(
-                                pool[&qa].as_ref(),
-                                pool[&srow].as_ref(),
-                                w,
-                                w_off,
-                                out,
-                                m,
-                                in_f,
-                                out_f,
-                            );
-                        }
-                    } else if i8cm_ok {
-                        // "Idea 2" measurement (INFR_I8_ROW_SCALE=1, requires INFR_I8_COOPMAT=1 too):
-                        // whole-row (block-invariant) activation scale instead of quant_q8's
-                        // per-32-block scale — see native_gemm_i8cm_q8_0.comp #ifdef ROW_SCALE /
-                        // quant_q8_row.comp. Separate pool tag (different buffer size/layout) and a
-                        // separate kernel pair, so this can be measured and reverted independently of
-                        // the i8cm baseline path above.
-                        if be_.cfg().kernels.vulkan.i8_row_scale {
-                            let qa = pooled(pool, be_, "i8cm_qa_row", m * in_f)?;
-                            let dact_row = pooled(pool, be_, "i8cm_dact_row", m * 2)?;
-                            rec.quant_q8_row(
-                                xb,
-                                pool[&qa].as_ref(),
-                                pool[&dact_row].as_ref(),
-                                m,
-                                in_f,
-                            );
-                            rec.matmul_i8cm_q8_0_rowscale(
-                                pool[&qa].as_ref(),
-                                pool[&dact_row].as_ref(),
-                                w,
-                                w_off,
-                                out,
-                                m,
-                                in_f,
-                                out_f,
-                            );
-                        } else {
-                            let nblk = in_f / 32;
-                            let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
-                            let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
-                            let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
-                            rec.quant_q8(
-                                xb,
-                                pool[&qa].as_ref(),
-                                pool[&dact].as_ref(),
-                                pool[&sact].as_ref(),
-                                m,
-                                in_f,
-                            );
-                            rec.matmul_i8cm_q8_0(
-                                pool[&qa].as_ref(),
-                                pool[&dact].as_ref(),
-                                w,
-                                w_off,
-                                out,
-                                m,
-                                in_f,
-                                out_f,
-                            );
-                        }
-                    } else if bf16cm_ok {
-                        rec.matmul_bf16cm(xb, w, w_off, out, m, in_f, out_f);
-                    } else if let Some(tile) = i8cm_kq_tile {
-                        // int8 cooperative-matrix K-quant GEMM (see `i8cm_kq_choice`): quantize
-                        // the activations to int8 per 32-block once, then integer WMMA on the
-                        // raw weight blocks.
-                        let nblk = in_f / 32;
-                        let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
-                        let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
-                        let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
-                        if memo_prev != Some((*x, m, in_f, "mmq")) {
-                            be_.note_i8cm_kq(crate::I8cmKqEvent::QuantPass);
-                            rec.quant_q8(
-                                xb,
-                                pool[&qa].as_ref(),
-                                pool[&dact].as_ref(),
-                                pool[&sact].as_ref(),
-                                m,
-                                in_f,
-                            );
-                        }
-                        *mmv_memo = Some((*x, m, in_f, "mmq"));
-                        let w_addr = w.device_addr().expect(
-                            "resident-BDA weight: the int8 coopmat GEMM requires a u64 BDA address",
-                        );
-                        rec.matmul_i8cm_kq(
-                            dt,
-                            tile,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            w_addr,
-                            w_off,
-                            out,
-                            m,
-                            in_f,
-                            out_f,
-                        );
-                    } else if matches!(dt, infr_core::DType::Q4K)
-                        && !warp_ok
-                        && be_.caps().i8_dot
-                        && be_.cfg().kernels.vulkan.mmq
-                    {
-                        // mmq (dp4a int8): quantize activations once, integer matmul on raw blocks.
-                        // Scratch is pooled — every same-shape Linear in the graph reuses one set.
-                        // Sized to whole 64-row tiles: the mmq shaders stage every row of the last
-                        // tile, and only the `m` real rows are quantized.
-                        let nblk = in_f / 32;
-                        let mpad = m.div_ceil(64) * 64;
-                        let qa = pooled(pool, be_, "mmq_qa", mpad * in_f)?;
-                        let dact = pooled(pool, be_, "mmq_dact", mpad * nblk * 2)?;
-                        let sact = pooled(pool, be_, "mmq_sact", mpad * nblk * 2)?;
-                        rec.quant_q8(
-                            xb,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            m,
-                            in_f,
-                        );
-                        rec.matmul_mmq_q4k(
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            w,
-                            w_off,
-                            out,
-                            m,
-                            in_f,
-                            out_f,
-                        );
-                    } else {
-                        // A_GLOBAL f16-A cast / narrow-n split-K / direct tile — the SAME tile selection
-                        // as the streamed twin (`native_warp_gemm`), reading the resident weight by its
-                        // BDA. Occupancy note: dropping the As stage shrinks LDS to Bs-only → ~1.5x on
-                        // the 8B prefill shapes (o proj 29→44 TF). Pool pad rows may hold stale garbage;
-                        // GEMM rows are independent, and dst pad rows are never read.
-                        let w_addr = w
-                            .device_addr()
-                            .expect("resident-BDA weight: dense Linear requires a u64 BDA address");
-                        native_warp_gemm(
-                            be_, dt, w_addr, w_off, xb, out, m, in_f, out_f, rec, pool,
-                        )?;
-                    }
-                    Ok(())
-                })?;
-            } else if let Some(kind) = nc {
-                // Non-coopmat prefill GEMM tier (see the NON-COOPMAT doc above), reading the
-                // resident weight by its BDA — the streamed twin passes its arena address instead.
-                let w_addr = w
-                    .device_addr()
-                    .expect("resident-BDA weight: non-coopmat GEMM requires a u64 BDA address");
-                nc_prefill_gemm(
-                    be_, graph, kind, dt, w_addr, w_off, x, xb, y, dst, m, in_f, out_f, rec, pool,
-                    transient, memo_prev, mmv_memo,
-                )?;
-            } else if native_dense_supported(dt) {
-                // Decode (m=1) on int-dot-capable K-quants → mmv (see the fused-add branch above).
-                // Wave32-native GPUs take the multi-warp dp4a route first (`mmv_mw_choice`); AMD
-                // falls through to the scalar GEMV (default) or the old mmv (INFR_MMV_DECODE=1).
-                // A `>= 2^32`-element lm_head is chunk-covered on the native dequant GEMV
-                // (`linear_native`, the `else` below) but NOT on this multi-warp int8 dp4a mmv
-                // route — route a breaching weight to the chunked path rather than wrap its u32
-                // index (issue #77). Only lm_head/embed can breach; the tier skipped here matters
-                // only for a 256k-vocab model's single vocab GEMV.
-                let mw = if m == 1
-                    && !crate::recorder::bda_weight_breaches(
-                        dt,
-                        in_f,
-                        out_f,
-                        &be_.cfg().kernels.vulkan,
-                    ) {
-                    mmv_mw_choice(
-                        be_.caps(),
-                        &be_.cfg().kernels.vulkan,
-                        dt,
-                        in_f,
-                        out_f,
-                        false,
-                    )
-                } else {
-                    None
-                };
-                if let Some(warps) = mw {
-                    // FUSE_QUANT opt-in: inline activation quantization, skip the
-                    // separate quant_q8 dispatch. Only some dtypes have that build.
-                    if be_.cfg().kernels.vulkan.mmv_fuse_quant
-                        && crate::recorder::mmv_mrow_fuseq_variant(
-                            &be_.cfg().kernels.vulkan,
-                            dt,
-                            in_f,
-                            false,
-                            be_.caps().integrated,
-                        )
-                        .is_some()
-                    {
-                        rec.linear_mmv_mrow_fuseq(dt, w, w_off, xb, None, y, 1, in_f, out_f);
-                        return Ok(());
-                    }
-                    let nblk = in_f / 32;
-                    let qa = pooled(pool, be_, "mmv_qa", in_f)?;
-                    let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
-                    let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
-                    if memo_prev != Some((*x, 1, in_f, "mmv")) {
-                        rec.quant_q8(
-                            xb,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            1,
-                            in_f,
-                        );
-                    }
-                    *mmv_memo = Some((*x, 1, in_f, "mmv"));
-                    if unified_mmv_row1(be_.caps()) {
-                        // Same kernel/reduction as the m>=3 verify tier, dispatched at rows=1 — see
-                        // the fused-add branch above and `unified_mmv_row1`'s doc.
-                        rec.linear_mmv_mrow(
-                            dt,
-                            w,
-                            w_off,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            None,
-                            y,
-                            1,
-                            in_f,
-                            out_f,
-                        );
-                    } else {
-                        rec.linear_mmv_mw(
-                            dt,
-                            warps,
-                            w,
-                            w_off,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            None,
-                            y,
-                            in_f,
-                            out_f,
-                        );
-                    }
-                } else if m == 1
-                    && mmv_decode_enabled(&be_.cfg().kernels.vulkan)
-                    && be_.caps().i8_dot
-                    && in_f % 32 == 0
-                    && in_f * out_f >= MMV_MIN_ELEMS
-                    && crate::gemm::native_mmv_kernel_name(dt, false).is_some()
-                    // A `>= 2^32`-element lm_head is chunk-covered on the native dequant GEMV
-                    // (`linear_native`, below) but NOT on this int8 dp4a mmv tier — route a
-                    // breaching weight to the chunked path rather than wrap its u32 index (issue
-                    // #77). Only lm_head/embed can breach, and the perf tier they skip here matters
-                    // only for a 256k-vocab model's single vocab GEMV.
-                    && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
-                {
-                    let nblk = in_f / 32;
-                    let qa = pooled(pool, be_, "mmv_qa", in_f)?;
-                    let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
-                    let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
-                    rec.quant_q8(
-                        xb,
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        pool[&sact].as_ref(),
-                        1,
-                        in_f,
-                    );
-                    rec.linear_mmv(
-                        dt,
-                        w,
-                        w_off,
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        pool[&sact].as_ref(),
-                        y,
-                        in_f,
-                        out_f,
-                    );
-                } else {
-                    rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
-                }
-            } else {
-                // F16/F32 returned through `float_linear` above; nothing else has a Linear kernel.
-                return Err(be(format!(
-                    "vulkan adapter: no Linear kernel reads a {dt:?} weight"
-                )));
-            }
+            let w_addr = w.device_addr().ok_or_else(|| {
+                be("vulkan adapter: a quantised Linear weight without a device address")
+            })?;
+            quant_linear(
+                be_,
+                graph,
+                dt,
+                QuantWeight {
+                    addr: w_addr,
+                    buffer: Some(w),
+                },
+                w_off,
+                x,
+                xb,
+                y,
+                dst,
+                m,
+                in_f,
+                out_f,
+                rec,
+                pool,
+                transient,
+                memo_prev,
+                mmv_memo,
+            )?;
         }
         Op::Add { a, b, dst, n } => rec.add(r(*a)?, r(*b)?, r(*dst)?, *n as usize),
         Op::AddBias {
@@ -6242,7 +5659,7 @@ enum NcGemm {
 
 /// Which non-coopmat tiled GEMM serves a `dt` Linear whose shape passed `gemm_ok`, or `None` when
 /// the device has f16 coopmat (the coopmat tier owns it), `INFR_NO_MMQ_FALLBACK` disabled the tier,
-/// or no build covers `dt`. Shared by the resident arm and its streamed twin so they cannot drift.
+/// or no build covers `dt`. Shared by `quant_linear` and `float_linear`.
 fn nc_gemm_choice(be_: &VulkanBackend, dt: infr_core::DType, gemm_ok: bool) -> Option<NcGemm> {
     if !gemm_ok || be_.caps().f16_coopmat() || !be_.cfg().kernels.vulkan.mmq_fallback {
         return None;
@@ -6279,21 +5696,684 @@ fn nc_gemm_grid_fits(m: usize, out_f: usize, max_groups_x: u32) -> bool {
     crate::recorder::nc_gemm_groups(m, out_f) <= max_groups_x as usize
 }
 
-/// Can a streamed Linear that [`streamed_gemm_route`] sent to a `Tiled` GEMM actually take it? The
-/// tiled GEMMs cannot be output-row chunked (a `bda_weight_breaches` weight — a big-vocab lm_head
-/// at m > 16: all-position logits, speculative verify) and their grid is capped at `max_groups_x`.
-/// The resident non-coopmat arm refuses both by name; the streamed op instead keeps the per-row
-/// GEMV (`linear_native_at`), which chunks a breaching weight and has no grid cap — the route those
-/// shapes ran on before the tiled one existed.
-fn streamed_tiled_fits(
+/// A quantised `Op::Linear` weight: where its bytes start, and the buffer holding them when it
+/// is resident.
+#[derive(Clone, Copy)]
+struct QuantWeight<'a> {
+    /// The weight's first byte as a 64-bit device address: a resident weight's BDA, or the arena
+    /// slot a dense-streaming pool staged it into.
+    addr: u64,
+    /// The resident weight's buffer, for the few tiers whose kernel binds the weight as a
+    /// descriptor rather than reading it by address; `None` for a streamed slot, which those
+    /// tiers skip.
+    buffer: Option<&'a dyn Buffer>,
+}
+
+/// `Op::Linear` on a native quantised weight (`native_dense_supported`, plus any dtype the
+/// non-coopmat fma tier reads), resident or streamed: the one routing both take, so a streamed
+/// weight runs the kernel its resident twin would for the same shape, device and switches, and
+/// only the weight's address differs. Not reached for F16/F32 (`float_linear`) or a fused
+/// Linear+Add.
+///
+/// Where a streamed weight (`w.buffer` is `None`) cannot follow the resident route:
+///  • the tiers whose kernel binds the weight buffer — every one of them opt-in: the `_cm8`
+///    warptile, the fp8, bf16 and int8 Q8_0 coopmat GEMMs (the last has an arena-addressed build,
+///    compiled for its parity test only) — are skipped, and the Linear takes the next tier down
+///    (the non-coopmat tier where `_cm8` would run);
+///  • the narrow Q4_K dp4a GEMM reads the slot through the arena-addressed build of the same
+///    shader (`matmul_mmq_at`);
+///  • a tiled GEMM it cannot take (a weight past the u32 addressing cap, a non-coopmat grid past
+///    the device's x limit) keeps the per-row GEMV, where the resident Linear fails loudly.
+///
+/// The quantised-activation memo (`mmv_memo`, see `lower_op`) holds `quant_q8(x)` only, keyed by
+/// the activation tensor and shape, so it is independent of the weight and of where it lives.
+/// Staging a streamed weight between two Linears that share `x` records a copy into the arena
+/// and nothing that writes the pooled quant scratch, and a segment cut or ring rotation in
+/// between keeps that scratch (the pool lives for the whole forward) and orders the new
+/// segment after the old with a seeded barrier.
+#[allow(clippy::too_many_arguments)]
+fn quant_linear(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    dt: infr_core::DType,
+    w: QuantWeight<'_>,
+    w_off: usize,
+    x: &TensorId,
+    xb: &dyn Buffer,
+    y: &dyn Buffer,
+    dst: &TensorId,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    rec: &Recorder<'_>,
+    pool: &mut ScratchPool,
+    transient: &mut Vec<Box<dyn Buffer>>,
+    memo_prev: Option<(TensorId, usize, usize, &'static str)>,
+    mmv_memo: &mut Option<(TensorId, usize, usize, &'static str)>,
+) -> Result<()> {
+    // Prefill (m>1): a TILED GEMM writes ceil(m/64)*64 rows DIRECTLY into `y` (Internal
+    // buffers are row-padded to 64 up front, so no temp/copy). Needs n%64==0, k%32==0.
+    //  • Q4_K → mmq (dp4a int8): quantize activations once, integer matmul on the raw
+    //    blocks (no per-GEMM weight dequant) — the u4 prefill default.
+    //  • other native quants → coopmat `matmul_native` (in-shader dequant).
+    //  • f16 (float weights are uploaded as f16) → f16 coopmat `matmul_proj`.
+    // Decode (m=1) and non-tileable shapes fall through to the GEMV.
+    // Small multi-row batches (m = 2..8: spec-decode verify rows, a short chat-turn
+    // suffix prefill) take the multi-row GEMV first — the single-M-tile coopmat GEMM
+    // launches only n/64 workgroups (underfills the GPU: measured 51-182 GB/s effective
+    // weight stream vs the GEMV class's 292-651 on a 7900 XTX), and the plain GEMV
+    // re-streams the weight per row. 7900 XTX, 8B Q4_K shapes: m=2 is 5.6-8.3x the GEMM
+    // route, m=4 1.4-4.1x, m=8 1.7-2.6x — EXCEPT very wide n at m>=5 (gate+up n=24576:
+    // 384 tiles fill the GPU and the mrow's per-thread m*32-FMA inner loop turns
+    // ALU-bound), so m=5..8 gates on out_f <= 8192 (<=128 tiles = the GEMM-underfill
+    // regime). Writes exactly m rows (no padded-dst dance). Formats without an mrow
+    // build fall through to the GEMM; INFR_NO_MROW forces the old route (A/B).
+    // The int8 dp4a mrow's own gates (see the block comment below) — hoisted so the
+    // 9..=16 tier can require them UP FRONT: unlike m<=8 there is no dequant-mrow
+    // fallback above 8 rows, so entering the tier is only legal when the int8 kernel is
+    // actually dispatchable.
+    let mmv_gate = be_.caps().i8_dot
+        && in_f * out_f >= 8 << 20
+        && out_f < 65536
+        && crate::gemm::native_mmv_mrow_kernel_name(dt).is_some()
+        && mrow_int8_dtype_ok(be_.caps(), &be_.cfg().kernels.vulkan, dt, graph.mtp_verify)
+        && be_.cfg().kernels.vulkan.mmv;
+    // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
+    // once its rollback window carries a few committed rows on top of the n_max drafts.
+    // These shapes previously fell through to the split-K coopmat tile, which streams the
+    // same weight at 2-4x the per-row cost at this m (9B mtp128 measured: q4k down-proj
+    // m=11 sk_ag 148us vs mmvr m=7 67.5us; q6k 194us). Same out_f <= 8192 wide-n cutoff
+    // as m=5..8 (the GEMM tiles win on gate_up-wide shapes), same formats as the m<=8
+    // int8 tier (others keep the GEMM route — no dequant mrow above 8 rows).
+    // The two bands' SHAPE arithmetic lives in `MROW_BANDS` (shared policy); the
+    // capability half — kernel builds, dtype sets, caps, env hatches — stays here.
+    let mrow_tier = infr_core::tier::linear_tier(m, out_f, &MROW_BANDS);
+    let in_band = |b: usize| mrow_tier == infr_core::tier::LinearTier::MultiRow { band: b };
+    let mrow16 = in_band(MROW16_BAND)
+        && mmv_gate
+        && crate::gemm::native_mmv_mrow_m16_kernel_name(dt).is_some()
+        && be_.cfg().kernels.vulkan.mrow16;
+    // The multi-row GEMVs index the weight in u32 and are not chunked, so a weight past the
+    // addressing cap leaves this tier for the chunked per-row GEMV (see `tiled_gemm_fits` below).
+    if (in_band(MROW_BAND) || mrow16)
+        && in_f.is_multiple_of(32)
+        && crate::gemm::native_mrow_kernel_name(dt).is_some()
+        && be_.cfg().kernels.vulkan.mrow
+        && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
+    {
+        // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
+        // integer-dot the raw weight blocks against ALL rows — the dequant mrow's
+        // per-sub-block scalar byte-extract dequant is the m-batch GEMV cost on ALU-bound
+        // shapes (E2B pp4@d4096: GEMV class 21.0 → 17.0us/op, pp4 366 → 383 t/s). Dtype
+        // eligibility is `mrow_int8_dtype_ok(caps, dt, graph.mtp_verify)`: an MTP-verify
+        // batch (`Graph::mtp_verify`) is gated to the SAME dtype set as the m=1 decode
+        // tier (`mmv_int8_decode_dtypes`) — int8 in both streams or in neither, never
+        // split (that split IS the Q5_K token-divergence bug; `mmv_mrow_symmetric_q2k_q3k`
+        // proves the two kernels agree once both are on). Ordinary prefill instead reads
+        // `mrow_int8_prefill_dtypes` — every measured win, independent of the decode set.
+        // Gates:
+        //  • m >= 3: m=2 is the single-head MTP spec-verify shape, whose accept loop
+        //    holds a hard output-identical-to-target-greedy bar (`mtp_spec_matches_
+        //    target_only_greedy`) — int8-quantized activations perturb the verify logits
+        //    enough to risk argmax flips vs the m=1 decode GEMV, so that shape keeps the
+        //    f32-dequant mrow.
+        //  • weight >= 8M elements: below that the kernel is dispatch-latency-floor
+        //    bound (the int8 math saves nothing) and the extra quant_q8 bubble is a pure
+        //    loss — qwen3-0.6b (all projections < 8M) measured pp4@d4096 934 → 854 t/s
+        //    ungated, and E2B's own win came from its gu/down (9.4-18.9M elems).
+        //  • out_f < 65536: the vocab-sized lm_head GEMV is pure weight-bandwidth (the
+        //    dequant ALU hides fully behind the stream) — the int8 form measured a hair
+        //    SLOWER there (qwen3-0.6b pp4@d4096 931 vs 916 with lm_head included).
+        // Same INFR_NO_MMV escape as the m=1 mmv (A/B).
+        if m >= 3 && mmv_gate {
+            let nblk = in_f / 32;
+            let qa = pooled(pool, be_, "mmvr_qa", m * in_f)?;
+            let dact = pooled(pool, be_, "mmvr_dact", m * nblk * 2)?;
+            let sact = pooled(pool, be_, "mmvr_sact", m * nblk * 2)?;
+            // Same x already quantized by the immediately-preceding Linear(s)? Reuse it
+            // (see `mmv_memo`'s doc — the take()/restore protocol guarantees nothing
+            // rewrote x or the pooled qa in between).
+            if memo_prev != Some((*x, m, in_f, "mmvr")) {
+                rec.quant_q8(
+                    xb,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    m,
+                    in_f,
+                );
+            }
+            *mmv_memo = Some((*x, m, in_f, "mmvr"));
+            rec.linear_mmv_mrow_at(
+                dt,
+                w.addr,
+                w_off,
+                pool[&qa].as_ref(),
+                pool[&dact].as_ref(),
+                pool[&sact].as_ref(),
+                None,
+                y,
+                m,
+                in_f,
+                out_f,
+            );
+            return Ok(());
+        }
+        rec.linear_native_mrow_at(dt, w.addr, w_off, xb, y, m, in_f, out_f);
+        return Ok(());
+    }
+    let gemm_ok = m > 1 && out_f.is_multiple_of(64) && in_f.is_multiple_of(32);
+    // The whole GEMM tier below (matmul_native*/matmul_proj, the coopmat tiled prefill
+    // GEMM) dispatches ONLY coopmat SPIR-V — RADV still executes it on hardware without
+    // the feature (silent, no fault), so gating is required, not optional (issue: coopmat
+    // dispatch on a device that lacks VK_KHR_cooperative_matrix segfaults on some
+    // drivers). `!caps.f16_coopmat` routes to the NON-COOPMAT GEMM tier below (`nc_mmq`/
+    // `nc_fma` — real tiled GEMMs with no coopmat SPIR-V), and only past that to the
+    // scalar `else` arms (`linear_native`/`linear`/`linear_f32` — the SAME scalar
+    // dequant-in-shader kernels the m==1 decode GEMV already uses, generalized to
+    // `rows=m`; they dispatch `rows*out_f` (or row-tiled) workgroups with no upper bound
+    // on `rows`, so they are a drop-in, just without any weight-reuse-across-rows win).
+    // Bit-identical to before when caps are all true.
+    // ── 8x8x16 coopmat prefill GEMM tier (Intel Arc/ANV XMX; `caps.f16_coopmat_8x8()` is
+    // Some only when the device enumerates the 8x8x16 f16 shape AND `INFR_CM_8X8=1` —
+    // NEVER on RADV, which enumerates 16x16x16 and keeps the full tier below untouched).
+    // Only `native_gemm_warp`'s `_cm8` builds exist at this shape: one fixed
+    // NARROW_N+BM32 tile (BN=128, BK=64 → n%128, k%64) over the hot k-quants + Q8_0.
+    // Anything it can't cover (dtype without a `_cm8` build, non-dividing shape) keeps
+    // falling to the nc_mmq/nc_fma tier — the Arc default this knob A/Bs against.
+    // Its kernel binds the weight as a descriptor, so a streamed slot (no buffer) never takes it.
+    let cm8_ok = gemm_ok
+        && w.buffer.is_some()
+        && be_.caps().f16_coopmat_8x8()
+        && out_f.is_multiple_of(128)
+        && in_f.is_multiple_of(64)
+        && crate::gemm::native_gemm_warp_cm8_build_spv(dt).is_some();
+    let is_gemm = cm8_ok || (gemm_ok && be_.caps().f16_coopmat() && native_dense_supported(dt));
+    // ── NON-COOPMAT prefill GEMM tier (never taken when `caps.f16_coopmat` — zero effect
+    // on coopmat-capable defaults). The Intel Arc A770 (Mesa ANV) enumerates f16 coopmat
+    // only at M=8,N=8,K=16 — `caps.f16_coopmat()` is false there (see lib.rs) — but HAS
+    // packed int8 dot, and prefill GEMMs previously fell all the way to the per-row
+    // scalar GEMVs (the field-measured 10-30x prefill gap; decode was already at parity).
+    // This tier remains the Arc DEFAULT; the opt-in `cm8_ok` XMX tier above takes only
+    // the Linears it covers, and only under INFR_CM_8X8=1.
+    // Two arms (`nc_gemm_choice`), same padded-dst convention as `is_gemm`:
+    //  • `NcGemm::Mmq` (`nc_mmq`): weight dtype in `infr_core::tensor::MOE_MMQ_DTYPES` +
+    //    `caps.i8_dot` → the DENSE dp4a mmq GEMM family (`matmul_mmq_at` — the same shader
+    //    code the batched MoE expert path already gates on `i8_dot` alone, base-grid
+    //    build), fed by the same `quant_q8` activation prepass the coopmat tier's Q4_K-mmq
+    //    arm uses.
+    //  • `NcGemm::Fma` (`nc_fma`): f16/bf16/f32 weights (no integer codes to dp4a) → the
+    //    shared-memory fma warptile (`matmul_fma_at`, native_gemm_fma.comp — no subgroup
+    //    ops, no f16 exts; bf16 reads stay native, no f32 upconvert).
+    // Both read the weight by 64-bit address, so a streamed weight takes the same tier.
+    // Exercisable on coopmat hardware via INFR_NO_COOPMAT=1 (lib.rs's force-disable test
+    // knob — drops the device feature itself, a faithful simulation). INFR_NO_MMQ_FALLBACK=1
+    // disables the WHOLE tier (both arms) for A/B against the scalar floor.
+    let nc = nc_gemm_choice(be_, dt, gemm_ok);
+    // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
+    // (decode m=1, or the per-input-row GEMV) — the tiled coopmat/nc GEMMs below decode a
+    // 64-row weight tile that can't be split into single input rows, so a breach on this
+    // path (a multi-row lm_head: MTP speculative verify or all-position logits) must fail
+    // loudly, never wrap. Issue #77: covered classes chunk; everything else stays loud.
+    // The nc GEMMs' grid is also capped (`check_nc_gemm_grid`).
+    let vk = &be_.cfg().kernels.vulkan;
+    let tiled = is_gemm || nc.is_some();
+    if tiled
+        && !tiled_gemm_fits(
+            dt,
+            m,
+            in_f,
+            out_f,
+            nc.is_some(),
+            vk,
+            Recorder::split_point_x(),
+        )
+        && (w.buffer.is_none() || m <= MROW_BANDS[MROW16_BAND].max_m)
+    {
+        // The chunked per-row GEMV instead of failing: it chunks a breaching weight and has no
+        // grid cap. A streamed weight takes it at any row count — the route a streamed prefill
+        // ran on before it took the tiled GEMMs — and a resident one in the multi-row band,
+        // whose own kernels declined the breaching weight above. A resident tiled GEMM past
+        // that band stays loud.
+        rec.linear_native_routed_at(dt, w.addr, w_off, xb, y, m, in_f, out_f);
+        return Ok(());
+    }
+    if nc.is_some() {
+        check_nc_gemm_grid(dt, m, out_f)?;
+    }
+    if tiled && crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk) {
+        return Err(be(format!(
+            "vulkan adapter: output-projection tiled GEMM (m={m}, in_f={in_f}, \
+             out_f={out_f}, {dt:?}) reads a >= 2^32-element weight — chunked dispatch \
+             covers only m=1 decode and the per-row GEMV (issue #77). This is a multi-row \
+             lm_head (speculative verify / all-position logits) on a big-vocab model."
+        )));
+    }
+    if is_gemm {
+        // GEMM writes ceil(m/64)*64 rows; `with_padded_dst` writes an Internal (row-padded)
+        // `dst` direct and a non-Internal dst (the lm_head `logits` Output) via a padded
+        // temp + copy of the m real rows. Same dance as the nc tier.
+        with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
+            // Q4_K: the 8-warp warptile coopmat GEMM (native_gemm_warp, in-shader dequant)
+            // beats mmq dp4a at prefill shapes (161 vs 417µs on [512,1024]×[1024,6144] — the
+            // wide tile amortizes staging; RADV can't use int8 WMMA). mmq stays for shapes NO
+            // warp tile can cover — n%128≠0 (the NARROW_N tile covers n%128; gemma3-1b's
+            // ne=1152 projections sat on scalar mmq at ~10 TF under the old n%256 gate).
+            // INFR_NO_MMQ also skips mmq for A/B.
+            let warp_ok = out_f.is_multiple_of(128)
+                && crate::gemm::native_gemm_warp_kernel_name(dt).is_some()
+                && be_.cfg().kernels.vulkan.gemm_warp;
+            // int8 cooperative-matrix (WMMA) prefill GEMM — MEASUREMENT path, Q8_0 only
+            // (crates/infr-vulkan/shaders/native_gemm_i8cm_q8_0.comp). `caps.i8_coopmat` is
+            // hardware detection only (see its doc); this dispatch ALSO requires
+            // `INFR_I8_COOPMAT=1` (default off) because int8 coopmat hung the GPU on an older
+            // Mesa despite enumerating fine there too (commit ad82a77) — the toggle keeps that
+            // regression class opt-in until a Mesa-version-gated default is warranted. Default
+            // behavior (unset) is completely unaffected: this is a new, additive branch ahead
+            // of the existing Q4_K-mmq / warp-coopmat / off-tier arms below, which are
+            // untouched.
+            // fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM — Q8_0 only
+            // (crates/infr-vulkan/shaders/native_gemm_f8cm_q8_0.comp). `caps.f8_coopmat` is
+            // hardware enumeration only (RDNA4/Navi44 confirmed, see lib.rs `has_f8_coopmat`);
+            // this dispatch ALSO requires `INFR_F8_COOPMAT=1` (default off) because — unlike
+            // `i8cm_ok` below — this kernel hasn't been run/measured on real fp8-coopmat
+            // hardware at all yet (this dev box has none), so the opt-in stays until an RDNA4
+            // pass validates correctness. Checked AHEAD of `i8cm_ok`: both are Q8_0-only
+            // measurement tiers, so when a caller opts into fp8 it takes priority. Default
+            // behavior (unset) is completely unaffected — new, additive branch ahead of the
+            // i8cm / Q4_K-mmq / warp-coopmat / off-tier arms below, which are untouched.
+            //
+            // Shape gate mirrors `warp_ok`'s f16 warptile pick: WIDE (BN=256, BK=32) needs
+            // out_f%256==0 && in_f%32==0; NARROW_N (BN=128, BK=64) needs out_f%128==0 &&
+            // in_f%64==0 for shapes the wide tile can't cover (n%128 not n%256 — see
+            // native_gemm_f8cm_q8_0.comp's -DNARROW_N). Neither divides (e.g. out_f%128!=0, or
+            // out_f%128==0 with in_f%64!=0 so narrow's BK=64 can't stage either) -> f8cm_ok is
+            // false and the shape falls through to i8cm/mmq/native below, unaffected.
+            let f8_wide = out_f.is_multiple_of(256) && in_f.is_multiple_of(32);
+            let f8_narrow = !f8_wide && out_f.is_multiple_of(128) && in_f.is_multiple_of(64);
+            let f8cm_ok = matches!(dt, infr_core::DType::Q8_0)
+                && be_.caps().f8_coopmat()
+                && (f8_wide || f8_narrow)
+                && be_.cfg().kernels.vulkan.f8_coopmat;
+            // `i8_coopmat_ready` is `caps.i8_coopmat()` AND the `INFR_I8_COOPMAT=1` opt-in
+            // AND this driver having PASSED the accumulator-layout known-answer probe at
+            // init (see `VulkanBackend::verify_i8_coopmat_layout`): the kernel's
+            // in-fragment descale reads accumulator elements at a mapping that is fixed per
+            // implementation, so enumeration alone does not make it safe to dispatch.
+            let i8cm_ok = matches!(dt, infr_core::DType::Q8_0) && be_.i8_coopmat_ready();
+            // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM — the `-DBF16CM` build of the
+            // SAME production kernel (crates/infr-vulkan/shaders/native_gemm_warp.comp) that
+            // `native_gemm_warp_bf16` (the f16-clamped path below) already uses; only the
+            // coopmat A/B operand type differs, so it should match that kernel's speed while
+            // keeping bf16's full exponent range. `caps.bf16_coopmat` is hardware enumeration
+            // only (RDNA4/Navi44 confirmed, see lib.rs `has_bf16_coopmat`); this dispatch ALSO
+            // requires `INFR_BF16_COOPMAT=1` (default off) because this variant hasn't been
+            // run/measured on real bf16-coopmat hardware at all yet (this dev box has none), so
+            // the opt-in stays until an RDNA4 pass validates correctness. Default behavior
+            // (unset) is completely unaffected: Bf16 keeps routing through the existing
+            // `native_dense_supported` arm below (`native_gemm_warp_bf16`, the f16-clamped
+            // path), byte-identical to before this branch existed. Shape gate mirrors
+            // `f8_wide`/`f8_narrow`: WIDE (BN=256, BK=32) needs out_f%256==0 && in_f%32==0;
+            // NARROW_N (BN=128, BK=64) needs out_f%128==0 && in_f%64==0.
+            let bf16cm_wide = out_f.is_multiple_of(256) && in_f.is_multiple_of(32);
+            let bf16cm_narrow =
+                !bf16cm_wide && out_f.is_multiple_of(128) && in_f.is_multiple_of(64);
+            let bf16cm_ok = matches!(dt, infr_core::DType::Bf16)
+                && be_.caps().bf16_coopmat()
+                && (bf16cm_wide || bf16cm_narrow)
+                && be_.cfg().kernels.vulkan.bf16_coopmat;
+            let i8cm_kq_tile = if be_.i8cm_kq_ready() {
+                i8cm_kq_choice(dt, m, in_f, out_f, w_off, be_.caps().compute_units)
+            } else {
+                None
+            };
+            // The tiers below that bind the weight buffer run only on a resident weight.
+            let bound = |ok: bool| w.buffer.filter(|_| ok);
+            if let Some(wb) = bound(cm8_ok) {
+                // 8x8x16 `_cm8` warptile (see the `cm8_ok` doc above). First in the chain:
+                // when it's true, `caps.f16_coopmat()` is false (the shapes are mutually
+                // exclusive), so every 16x16x16 branch below would mis-dispatch — none of
+                // their SPIR-V exists at the device's fragment shape.
+                rec.matmul_native_cm8(dt, xb, wb, w_off, out, m, in_f, out_f);
+            } else if let Some(wb) = bound(f8cm_ok) {
+                // E4M3's range is tiny (max normal 448) — unscaled f32 activations overflow to
+                // inf/NaN on cast, which is what produced garbage output on the first RDNA4
+                // run. `quant_f8_row` pre-scales activations into E4M3's range (one amax/scale
+                // per row) before the coopmat GEMM, which descales the output by that same
+                // per-row scale in its epilogue. Q8_0 weights are unscaled (see
+                // native_gemm_f8cm_q8_0.comp doc — their post-dequant magnitude is expected to
+                // already fit E4M3).
+                let qa = pooled(pool, be_, "f8cm_qa", m * in_f)?;
+                let srow = pooled(pool, be_, "f8cm_srow", m * 4)?;
+                rec.quant_f8_row(xb, pool[&qa].as_ref(), pool[&srow].as_ref(), m, in_f);
+                // INFR_F8_PREPACK=1 (requires INFR_F8_COOPMAT=1 too, since it only takes
+                // effect inside this arm): bakes the Q8_0 block scale into an E4M3 weight
+                // buffer ONCE via `repack_q8_to_f8`, then the GEMM's Bs staging reads that
+                // buffer DIRECTLY — no in-shader dqblk. Isolates whether removing the
+                // dequant-ALU bottleneck (the SAME cost f16 pays; fp8-dqblk measured 0.73x
+                // f16 on RDNA4) lets fp8's 2x WMMA rate win. The E4M3 buffer is pooled
+                // per-shape scratch (like every other tier here) and re-repacked on EVERY
+                // forward call — a real deployment would cache the repack at load time, not
+                // redo it per Linear; this is a per-op profiling isolation path, not the
+                // proposed production shape. Unset (default): unchanged dqblk path below,
+                // byte-identical to before this branch existed.
+                if be_.cfg().kernels.vulkan.f8_prepack {
+                    let f8_w8 = pooled(pool, be_, "f8_w8", out_f * in_f)?;
+                    rec.repack_q8_to_f8(wb, w_off, pool[&f8_w8].as_ref(), out_f, in_f);
+                    rec.matmul_f8cm_q8_0_prepacked(
+                        pool[&qa].as_ref(),
+                        pool[&srow].as_ref(),
+                        pool[&f8_w8].as_ref(),
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                } else {
+                    rec.matmul_f8cm_q8_0(
+                        pool[&qa].as_ref(),
+                        pool[&srow].as_ref(),
+                        wb,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                }
+            } else if let Some(wb) = bound(i8cm_ok) {
+                // "Idea 2" measurement (INFR_I8_ROW_SCALE=1, requires INFR_I8_COOPMAT=1 too):
+                // whole-row (block-invariant) activation scale instead of quant_q8's
+                // per-32-block scale — see native_gemm_i8cm_q8_0.comp #ifdef ROW_SCALE /
+                // quant_q8_row.comp. Separate pool tag (different buffer size/layout) and a
+                // separate kernel pair, so this can be measured and reverted independently of
+                // the i8cm baseline path above.
+                if be_.cfg().kernels.vulkan.i8_row_scale {
+                    let qa = pooled(pool, be_, "i8cm_qa_row", m * in_f)?;
+                    let dact_row = pooled(pool, be_, "i8cm_dact_row", m * 2)?;
+                    rec.quant_q8_row(xb, pool[&qa].as_ref(), pool[&dact_row].as_ref(), m, in_f);
+                    rec.matmul_i8cm_q8_0_rowscale(
+                        pool[&qa].as_ref(),
+                        pool[&dact_row].as_ref(),
+                        wb,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                } else {
+                    let nblk = in_f / 32;
+                    let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
+                    let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
+                    let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
+                    rec.quant_q8(
+                        xb,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        m,
+                        in_f,
+                    );
+                    rec.matmul_i8cm_q8_0(
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        wb,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                }
+            } else if let Some(wb) = bound(bf16cm_ok) {
+                rec.matmul_bf16cm(xb, wb, w_off, out, m, in_f, out_f);
+            } else if let Some(tile) = i8cm_kq_tile {
+                // int8 cooperative-matrix K-quant GEMM (see `i8cm_kq_choice`): quantize
+                // the activations to int8 per 32-block once, then integer WMMA on the
+                // raw weight blocks.
+                let nblk = in_f / 32;
+                let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
+                let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
+                let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
+                if memo_prev != Some((*x, m, in_f, "mmq")) {
+                    be_.note_i8cm_kq(crate::I8cmKqEvent::QuantPass);
+                    rec.quant_q8(
+                        xb,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        m,
+                        in_f,
+                    );
+                }
+                *mmv_memo = Some((*x, m, in_f, "mmq"));
+                rec.matmul_i8cm_kq(
+                    dt,
+                    tile,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    w.addr,
+                    w_off,
+                    out,
+                    m,
+                    in_f,
+                    out_f,
+                );
+            } else if matches!(dt, infr_core::DType::Q4K)
+                && !warp_ok
+                && be_.caps().i8_dot
+                && be_.cfg().kernels.vulkan.mmq
+            {
+                // mmq (dp4a int8): quantize activations once, integer matmul on raw blocks.
+                // Scratch is pooled — every same-shape Linear in the graph reuses one set.
+                // Sized to whole 64-row tiles: the mmq shaders stage every row of the last
+                // tile, and only the `m` real rows are quantized.
+                let nblk = in_f / 32;
+                let mpad = m.div_ceil(64) * 64;
+                let qa = pooled(pool, be_, "mmq_qa", mpad * in_f)?;
+                let dact = pooled(pool, be_, "mmq_dact", mpad * nblk * 2)?;
+                let sact = pooled(pool, be_, "mmq_sact", mpad * nblk * 2)?;
+                rec.quant_q8(
+                    xb,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    m,
+                    in_f,
+                );
+                // A streamed slot reads through the arena-addressed build of the same shader.
+                match w.buffer {
+                    Some(wb) => rec.matmul_mmq_q4k(
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        wb,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    ),
+                    None => rec.matmul_mmq_at(
+                        dt,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        w.addr,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    ),
+                }
+            } else {
+                // A_GLOBAL f16-A cast / narrow-n split-K / direct tile (`native_warp_gemm`),
+                // reading the weight by address. Occupancy note: dropping the As stage shrinks
+                // LDS to Bs-only → ~1.5x on the 8B prefill shapes (o proj 29→44 TF). Pool pad
+                // rows may hold stale garbage; GEMM rows are independent, and dst pad rows are
+                // never read.
+                native_warp_gemm(be_, dt, w.addr, w_off, xb, out, m, in_f, out_f, rec, pool)?;
+            }
+            Ok(())
+        })?;
+    } else if let Some(kind) = nc {
+        // Non-coopmat prefill GEMM tier (see the NON-COOPMAT doc above), reading the weight by
+        // address.
+        nc_prefill_gemm(
+            be_, graph, kind, dt, w.addr, w_off, x, xb, y, dst, m, in_f, out_f, rec, pool,
+            transient, memo_prev, mmv_memo,
+        )?;
+    } else if native_dense_supported(dt) {
+        // Decode (m=1) on int-dot-capable K-quants → mmv (see the fused-add branch above).
+        // Wave32-native GPUs take the multi-warp dp4a route first (`mmv_mw_choice`); AMD
+        // falls through to the scalar GEMV (default) or the old mmv (INFR_MMV_DECODE=1).
+        // A `>= 2^32`-element lm_head is chunk-covered on the native dequant GEMV
+        // (`linear_native`, the `else` below) but NOT on this multi-warp int8 dp4a mmv
+        // route — route a breaching weight to the chunked path rather than wrap its u32
+        // index (issue #77). Only lm_head/embed can breach; the tier skipped here matters
+        // only for a 256k-vocab model's single vocab GEMV.
+        let mw = if m == 1
+            && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
+        {
+            mmv_mw_choice(
+                be_.caps(),
+                &be_.cfg().kernels.vulkan,
+                dt,
+                in_f,
+                out_f,
+                false,
+            )
+        } else {
+            None
+        };
+        if let Some(warps) = mw {
+            // FUSE_QUANT opt-in: inline activation quantization, skip the
+            // separate quant_q8 dispatch. Only some dtypes have that build.
+            if be_.cfg().kernels.vulkan.mmv_fuse_quant
+                && crate::recorder::mmv_mrow_fuseq_variant(
+                    &be_.cfg().kernels.vulkan,
+                    dt,
+                    in_f,
+                    false,
+                    be_.caps().integrated,
+                )
+                .is_some()
+            {
+                rec.linear_mmv_mrow_fuseq_at(dt, w.addr, w_off, xb, None, y, 1, in_f, out_f);
+                return Ok(());
+            }
+            let nblk = in_f / 32;
+            let qa = pooled(pool, be_, "mmv_qa", in_f)?;
+            let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
+            let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
+            if memo_prev != Some((*x, 1, in_f, "mmv")) {
+                rec.quant_q8(
+                    xb,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    1,
+                    in_f,
+                );
+            }
+            *mmv_memo = Some((*x, 1, in_f, "mmv"));
+            if unified_mmv_row1(be_.caps()) {
+                // Same kernel/reduction as the m>=3 verify tier, dispatched at rows=1 — see
+                // the fused-add branch above and `unified_mmv_row1`'s doc.
+                rec.linear_mmv_mrow_at(
+                    dt,
+                    w.addr,
+                    w_off,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    None,
+                    y,
+                    1,
+                    in_f,
+                    out_f,
+                );
+            } else {
+                rec.linear_mmv_mw_at(
+                    dt,
+                    warps,
+                    w.addr,
+                    w_off,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    None,
+                    y,
+                    in_f,
+                    out_f,
+                );
+            }
+        } else if m == 1
+            && mmv_decode_enabled(&be_.cfg().kernels.vulkan)
+            && be_.caps().i8_dot
+            && in_f.is_multiple_of(32)
+            && in_f * out_f >= MMV_MIN_ELEMS
+            && crate::gemm::native_mmv_kernel_name(dt, false).is_some()
+            // A `>= 2^32`-element lm_head is chunk-covered on the native dequant GEMV
+            // (`linear_native`, below) but NOT on this int8 dp4a mmv tier — route a
+            // breaching weight to the chunked path rather than wrap its u32 index (issue
+            // #77). Only lm_head/embed can breach, and the perf tier they skip here matters
+            // only for a 256k-vocab model's single vocab GEMV.
+            && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
+        {
+            let nblk = in_f / 32;
+            let qa = pooled(pool, be_, "mmv_qa", in_f)?;
+            let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
+            let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
+            rec.quant_q8(
+                xb,
+                pool[&qa].as_ref(),
+                pool[&dact].as_ref(),
+                pool[&sact].as_ref(),
+                1,
+                in_f,
+            );
+            rec.linear_mmv_at(
+                dt,
+                w.addr,
+                w_off,
+                pool[&qa].as_ref(),
+                pool[&dact].as_ref(),
+                pool[&sact].as_ref(),
+                y,
+                in_f,
+                out_f,
+            );
+        } else {
+            rec.linear_native_routed_at(dt, w.addr, w_off, xb, y, m, in_f, out_f);
+        }
+    } else {
+        // F16/F32 returned through `float_linear` above; nothing else has a Linear kernel.
+        return Err(be(format!(
+            "vulkan adapter: no Linear kernel reads a {dt:?} weight"
+        )));
+    }
+    Ok(())
+}
+
+/// Can a prefill Linear at `(dt, m, in_f, out_f)` that `quant_linear` routed to a tiled GEMM take
+/// it? The tiled GEMMs cannot be output-row chunked (a `bda_weight_breaches` weight — a big-vocab
+/// lm_head at m > 1: all-position logits, speculative verify), and the non-coopmat ones (`nc`)
+/// index their grid in one dimension capped at `max_groups_x`. Where it cannot, `quant_linear`
+/// takes the chunked per-row GEMV or fails loudly.
+fn tiled_gemm_fits(
     dt: infr_core::DType,
     m: usize,
     in_f: usize,
     out_f: usize,
+    nc: bool,
     vk: &infr_core::config::VulkanCfg,
     max_groups_x: u32,
 ) -> bool {
-    nc_gemm_grid_fits(m, out_f, max_groups_x)
+    (!nc || nc_gemm_grid_fits(m, out_f, max_groups_x))
         && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
 }
 
@@ -6410,69 +6490,6 @@ fn dp4a_kq_ok(
 /// dp4a token tile costs more than the mmq tile that fits the rows. Measured on the integrated
 /// RDNA2 GPU (Qwen3-1.7B Q4_K_M, dp4a on / off): pp64 139.3 / 145.3 t/s, pp80 162.6 / 93.8.
 const DP4A_KQ_MIN_ROWS: usize = 64;
-
-/// The tiled prefill GEMM a streamed dense `Op::Linear` takes — see [`streamed_gemm_route`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StreamedGemm {
-    /// The arena-addressed coopmat-warp tile (`streamed_prefill_gemm`).
-    Warp,
-    /// The dp4a mmq or fma warptile GEMM (`nc_prefill_gemm`).
-    Tiled(NcGemm),
-}
-
-/// Rows above which a streamed Linear is a prefill chunk that takes a tiled GEMM: the top of the
-/// resident multi-row GEMV bands (`MROW_BANDS`). At or below it the streamed op keeps the per-row
-/// streamed GEMV. That is a routing choice, not a missing kernel — `linear_native_mrow_at` and
-/// `linear_mmv_mrow_at` read the weight by address too — and the streamed small-m path has simply
-/// never been switched to them.
-const STREAMED_GEMM_MIN_ROWS: usize = MROW_BANDS[MROW16_BAND].max_m;
-
-/// Which arena-addressed tiled GEMM a streamed dense `Op::Linear` at `(dt, m, in_f, out_f)` takes,
-/// or `None` to fall back to the streamed GEMV (`linear_native_at`). Mirrors the RESIDENT arm's
-/// pick — just arena-addressed — for a genuine prefill chunk (past [`STREAMED_GEMM_MIN_ROWS`]);
-/// decode/small-m/verify keep the GEMV. The caller still checks [`streamed_tiled_fits`] for a
-/// `Tiled` route.
-///
-/// - **f16 coopmat:** the resident `is_gemm` arm sends Q4_K to the dp4a mmq GEMM whenever its
-///   `warp_ok` is false (out_f%128 != 0, or `INFR_NO_GEMM_WARP` set) and int8 dot plus `INFR_NO_MMQ`
-///   allow; the streamed twin takes the arena-addressed build of that same shader, so with
-///   `INFR_NO_GEMM_WARP` a streamed Q4_K at out_f%128 == 0 takes mmq too. Every other native quant
-///   takes the coopmat-warp twin (`native_warp_gemm`). One divergence remains, under the
-///   `INFR_NO_GEMM_WARP` debug knob only: the resident arm still runs those quants through
-///   `native_warp_gemm` (the knob only turns off its A_GLOBAL tile), while the streamed route falls
-///   back to the per-row GEMV.
-/// - **No f16 coopmat:** the non-coopmat tier, through the same [`nc_gemm_choice`] as the resident
-///   arm. The resident opt-in `_cm8` tier (`INFR_CM_8X8`) has no arena-addressed build, so a
-///   streamed Linear on such a device takes this tier where the resident one would take `_cm8`.
-fn streamed_gemm_route(
-    be_: &VulkanBackend,
-    dt: infr_core::DType,
-    m: usize,
-    in_f: usize,
-    out_f: usize,
-) -> Option<StreamedGemm> {
-    let gemm_ok = m > STREAMED_GEMM_MIN_ROWS
-        && out_f.is_multiple_of(64)
-        && in_f.is_multiple_of(32)
-        && native_dense_supported(dt);
-    if !gemm_ok {
-        return None;
-    }
-    let vk = &be_.cfg().kernels.vulkan;
-    if !be_.caps().f16_coopmat() {
-        return nc_gemm_choice(be_, dt, gemm_ok).map(StreamedGemm::Tiled);
-    }
-    let warp_ok = out_f.is_multiple_of(128)
-        && crate::gemm::native_gemm_warp_kernel_name(dt).is_some()
-        && vk.gemm_warp;
-    if matches!(dt, infr_core::DType::Q4K) && !warp_ok && be_.caps().i8_dot && vk.mmq {
-        Some(StreamedGemm::Tiled(NcGemm::Mmq))
-    } else if vk.gemm_warp {
-        Some(StreamedGemm::Warp)
-    } else {
-        None
-    }
-}
 
 /// `Op::Linear` on an F16 or F32 weight whose bytes start at `w_addr`: a resident weight's own
 /// BDA address, or the arena slot a dense-streaming pool staged it into. Both callers go through
@@ -6619,43 +6636,6 @@ fn float_linear(
         rec.linear_f16_noext_at(w_addr, xb, y, m, in_f, out_f);
         Ok(())
     }
-}
-
-/// Arena-addressed twin of the resident `Op::Linear` `is_gemm && native_dense_supported` coopmat-
-/// warp prefill arm (see the `is_gemm` block in `lower_op`): the SAME tile selection (A_GLOBAL
-/// f16-A cast, narrow-n split-K, or the direct tile) and the SAME padded-dst dance, but the weight
-/// is read from the pool arena by 64-bit address (`arena_addr`) — the recorder methods pass the
-/// address to whatever tile they pick and bind the activation as the binding-1 filler, so the
-/// arena is NEVER a bound descriptor. `w_off` (a fused-QKV slice offset)
-/// rides on top as a within-slot element offset. The ring→arena copy that filled the slot is
-/// already ordered before this dispatch by the RAW `arena_stream_barrier` `DensePagerSession::stage`
-/// recorded right after it.
-#[allow(clippy::too_many_arguments)]
-fn streamed_prefill_gemm(
-    be_: &VulkanBackend,
-    graph: &Graph,
-    dt: infr_core::DType,
-    arena_addr: u64,
-    w_off: usize,
-    xb: &dyn Buffer,
-    y: &dyn Buffer,
-    dst: &TensorId,
-    m: usize,
-    in_f: usize,
-    out_f: usize,
-    rec: &Recorder<'_>,
-    pool: &mut ScratchPool,
-    transient: &mut Vec<Box<dyn Buffer>>,
-) -> Result<()> {
-    // Padded-dst dance + tile selection are shared with the resident native-dense arm (the whole
-    // point of this twin is that they track EXACTLY) — read from `arena_addr` instead of a bound
-    // weight. `with_padded_dst` handles the ceil(m/64)*64 row padding; `native_warp_gemm` picks the
-    // A_GLOBAL / split-K / direct tile.
-    with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
-        native_warp_gemm(
-            be_, dt, arena_addr, w_off, xb, out, m, in_f, out_f, rec, pool,
-        )
-    })
 }
 
 /// Ensure a streamed dense Linear weight (`wid` — see `pager::buffer_identity`) is resident,
@@ -8081,7 +8061,7 @@ mod tests {
     }
 
     /// #6: the extracted `split_k_plan` must reproduce the copy-pasted narrow-grid/splits formula
-    /// exactly (it fed the resident native-quant arm, the F16 split-K arm, and the streamed twin)
+    /// exactly (it fed the resident native-quant arm, the F16 split-K arm, and the streamed route)
     /// when the compute-unit count is unknown.
     #[test]
     fn split_k_plan_matches_inline_formula() {
@@ -13192,28 +13172,23 @@ mod tests {
         refused(copy(DType::I32, DType::F32), "Op::Copy I32→F32");
     }
 
-    /// `streamed_tiled_fits` refuses exactly the two shapes the tiled non-coopmat GEMMs cannot run
-    /// — a grid past the x limit, a weight past the u32 addressing cap — and accepts the rest, so
-    /// the streamed op keeps its chunked GEMV for those instead of failing.
+    /// `tiled_gemm_fits` refuses exactly the two shapes the tiled GEMMs cannot run — a
+    /// non-coopmat grid past the x limit, a weight past the u32 addressing cap — and accepts the
+    /// rest; the grid cap applies only to the non-coopmat GEMMs.
     #[test]
-    fn streamed_tiled_fits_refuses_an_oversized_grid_or_a_breaching_weight() {
+    fn tiled_gemm_fits_refuses_an_oversized_grid_or_a_breaching_weight() {
         let (dt, m, in_f, out_f) = (DType::Q8_0, 40, 256, 128);
         let mut vk = infr_core::config::Config::default().kernels.vulkan;
         let x_limit = crate::recorder::Recorder::split_point_x();
-        assert!(streamed_tiled_fits(dt, m, in_f, out_f, &vk, x_limit));
+        assert!(tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, x_limit));
 
         let groups = crate::recorder::nc_gemm_groups(m, out_f) as u32;
-        assert!(streamed_tiled_fits(dt, m, in_f, out_f, &vk, groups));
-        assert!(!streamed_tiled_fits(dt, m, in_f, out_f, &vk, groups - 1));
+        assert!(tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, groups));
+        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, groups - 1));
+        assert!(tiled_gemm_fits(dt, m, in_f, out_f, false, &vk, groups - 1));
 
         vk.bda_chunk_elems = Some((in_f * out_f) as u64);
-        assert!(!streamed_tiled_fits(dt, m, in_f, out_f, &vk, x_limit));
-    }
-
-    /// The streamed tiled-GEMM threshold is the top of the resident multi-row GEMV bands.
-    #[test]
-    fn streamed_gemm_min_rows_tracks_the_mrow_bands() {
-        let top = MROW_BANDS.iter().map(|b| b.max_m).max().unwrap();
-        assert_eq!(STREAMED_GEMM_MIN_ROWS, top);
+        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, x_limit));
+        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, false, &vk, x_limit));
     }
 }

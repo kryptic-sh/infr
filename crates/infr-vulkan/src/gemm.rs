@@ -39,8 +39,9 @@ pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> Option<&'stati
 /// `bufferDeviceAddress` arena pool by 64-bit address (native_weight_addr.glsl) instead of a bound
 /// SSBO — the ONLY weight build for this family (the bound-SSBO resident build died with the eager
 /// `VulkanBackend::linear_native` / `Recorder::linear_native_{sg,rm,rm_v2}` callers that were its
-/// sole consumers). All streamed dense Linears (any m) route through this one kernel's rows loop —
-/// see [`crate::recorder::Recorder::linear_native_at`] and [`crate::pager::DensePagerSession`].
+/// sole consumers). The plain dequant GEMV of `Recorder::linear_native_routed_at`, resident and
+/// streamed, and the per-row fallback a breaching weight takes — see
+/// [`crate::recorder::Recorder::linear_native_at`] and [`crate::pager::DensePagerSession`].
 /// `res`: production dispatches fused-residual GEMVs too (the decode Linear+Add fusion,
 /// [`crate::recorder::Recorder::linear_add_native`]), so both arms are load-bearing. `None` for a
 /// dtype without a native GEMV build.

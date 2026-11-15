@@ -396,6 +396,9 @@ struct VulkanShared {
     decode_recordings: AtomicU64,
     /// What the int8 coopmat K-quant prefill GEMM has recorded ([`VulkanBackend::i8cm_kq_counts`]).
     i8cm_kq_counts: [AtomicU64; 3],
+    /// What the multi-row GEMVs and the dp4a K-quant GEMM have recorded
+    /// ([`VulkanBackend::linear_tier_counts`]).
+    linear_tier_counts: [AtomicU64; 3],
     /// `adapter::execute_static` calls ([`VulkanBackend::static_executes`]).
     static_executes: AtomicU64,
     /// Arena barriers recorded around pager staging copies ([`VulkanBackend::arena_barriers`]).
@@ -1403,6 +1406,29 @@ impl VulkanBackend {
             I8cmKqEvent::QuantPass => 2,
         };
         self.shared.i8cm_kq_counts[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many multi-row GEMVs (int8 and dequant, two or more rows) and packed-int8-dot K-quant
+    /// GEMMs this backend has recorded. Like [`Self::i8cm_kq_counts`], these are kernel choices
+    /// the output cannot show — the alternatives agree to within rounding — so a test reads them
+    /// here.
+    pub fn linear_tier_counts(&self) -> LinearTierCounts {
+        let c = |i: usize| self.shared.linear_tier_counts[i].load(Ordering::Relaxed);
+        LinearTierCounts {
+            mrow_int8: c(0),
+            mrow_dequant: c(1),
+            dp4a_kq: c(2),
+        }
+    }
+
+    /// Count one recorded Linear kernel for [`Self::linear_tier_counts`].
+    pub(crate) fn note_linear_tier(&self, what: LinearTierEvent) {
+        let i = match what {
+            LinearTierEvent::MrowInt8 => 0,
+            LinearTierEvent::MrowDequant => 1,
+            LinearTierEvent::Dp4aKq => 2,
+        };
+        self.shared.linear_tier_counts[i].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Initialize Vulkan: create instance, pick a GPU (prefer discrete), create a logical
@@ -2732,6 +2758,7 @@ impl VulkanBackend {
                 act_peak: AtomicU64::new(0),
                 decode_recordings: AtomicU64::new(0),
                 i8cm_kq_counts: [const { AtomicU64::new(0) }; 3],
+                linear_tier_counts: [const { AtomicU64::new(0) }; 3],
                 static_executes: AtomicU64::new(0),
                 arena_barriers: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
@@ -4921,6 +4948,25 @@ pub(crate) enum I8cmKqEvent {
     LargeTile,
     MediumTile,
     QuantPass,
+}
+
+/// [`VulkanBackend::linear_tier_counts`]: totals since the backend was built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinearTierCounts {
+    /// int8 multi-row GEMVs (`Recorder::linear_mmv_mrow_at`) recorded at two or more rows.
+    pub mrow_int8: u64,
+    /// Dequant multi-row GEMVs (`Recorder::linear_native_mrow_at`).
+    pub mrow_dequant: u64,
+    /// Packed-int8-dot K-quant GEMMs (`Recorder::matmul_dp4a_kq`).
+    pub dp4a_kq: u64,
+}
+
+/// What [`VulkanBackend::note_linear_tier`] counts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LinearTierEvent {
+    MrowInt8,
+    MrowDequant,
+    Dp4aKq,
 }
 
 #[cfg(test)]

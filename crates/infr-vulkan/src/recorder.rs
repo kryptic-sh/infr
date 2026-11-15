@@ -808,7 +808,7 @@ fn bda_gemv_needs_chunk(
 }
 
 /// Whether a `[out_f, in_f]` dense weight breaches a u32 addressing cap (at slice offset 0). The
-/// tiled-GEMM prefill tiers (coopmat / nc_mmq / nc_fma / streamed_prefill_gemm) cannot be
+/// tiled-GEMM prefill tiers (coopmat / nc_mmq / nc_fma) cannot be
 /// output-row chunked the way the GEMV can (their 64-row M-tile is not decomposable into single
 /// input rows), so a breaching weight on those paths — a multi-row lm_head, i.e. MTP speculative
 /// verify or an all-position-logits request on a big-vocab model — must fail LOUDLY rather than
@@ -2196,8 +2196,8 @@ impl<'a> Recorder<'a> {
     /// `-DSTREAMED` twin of [`Self::matmul_proj`] (the coopmat f16 projection GEMM: see
     /// `gemm_proj.comp`'s STREAMED doc). Same arena-by-address convention as
     /// [`Self::matmul_mmq_at`] — the resident build's weight-SSBO slot (binding 1) takes a
-    /// harmless FILLER (`a`) since the arena is never bound as a descriptor. Not wired into any
-    /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    /// harmless FILLER (`a`) since the arena is never bound as a descriptor. The adapter's
+    /// `float_linear` dispatches it for resident and streamed f16 weights alike.
     pub fn matmul_proj_at(
         &self,
         a: &dyn Buffer,
@@ -2261,7 +2261,7 @@ impl<'a> Recorder<'a> {
         a: &dyn Buffer,
         // The weight's 64-bit base address: a resident weight's own BDA address
         // (`w.device_addr()`), or a dense-pager streamed block's slot base in the pager arena (see
-        // adapter.rs `streamed_prefill_gemm`). The picked tile reads the weight by this address
+        // adapter.rs `quant_linear`). The picked tile reads the weight by this address
         // (native_weight_addr.glsl); it is never bound as a descriptor.
         w_addr: u64,
         w_base: usize,
@@ -2725,6 +2725,7 @@ impl<'a> Recorder<'a> {
             "{name}: n ({n}) or k ({k}) is off the tile"
         );
         self.label_gemm(name, m, k, n);
+        self.be.note_linear_tier(crate::LinearTierEvent::Dp4aKq);
         let kern = self.be.kernel(name, spv, 4, 24);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
@@ -3449,9 +3450,27 @@ impl<'a> Recorder<'a> {
         let arena_addr = w
             .device_addr()
             .expect("resident-BDA weight: linear_native requires a u64 BDA device address");
+        self.linear_native_routed_at(dtype, arena_addr, w_base, x, y, rows, in_f, out_f);
+    }
+
+    /// [`Self::linear_native`] for a weight read by 64-bit address `arena_addr` alone (a resident
+    /// weight's BDA, or a streamed slot's arena base): the same SG → RM-v2 → RM → plain precedence,
+    /// so a streamed weight takes the GEMV its resident twin would.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_routed_at(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
         // Replicate the resident SG → RM-v2 → RM → plain precedence, routing each branch to its own
-        // `_streamed` twin (the build tables are 1:1 mirrored — see this fn's doc). Every branch
-        // reachable here has a streamed kernel to route to.
+        // `_streamed` twin (the build tables are 1:1 mirrored — see `linear_native`'s doc). Every
+        // branch reachable here has a streamed kernel to route to.
         if rows == 1 {
             if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
                 if crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
@@ -3482,10 +3501,9 @@ impl<'a> Recorder<'a> {
     /// addressed by `arena_addr` — the resident slot's base BYTE address — NOT a bound SSBO. This
     /// lifts the ~4 GiB `maxStorageBufferRange` cap the resident/SSBO GEMV binding has. `w_base` is
     /// the op's own WITHIN-slot element offset (a fused-QKV slice, usually 0), added to the
-    /// per-output index exactly as the resident path does. All streamed dense Linears (any m) route
-    /// here — the rows loop handles m>1 (re-streaming the weight per row: correct, and streaming is
-    /// already a memory-bound fallback where kernel micro-optimization is dominated by PCIe/residency
-    /// cost).
+    /// per-output index exactly as the resident path does. The plain arm of
+    /// [`Self::linear_native_routed_at`], and the per-row fallback (the rows loop re-streams the
+    /// weight per row) a weight past the u32 addressing cap takes at m > 1, since it chunks.
     ///
     /// The arena is read purely by the `arena_addr` push constant — it is NEVER bound as a
     /// descriptor (a `WHOLE_SIZE` binding of this multi-GiB pager arena would re-impose
@@ -3583,8 +3601,8 @@ impl<'a> Recorder<'a> {
     /// `-DSTREAMED` twin of [`Self::linear_native_mrow`] (slice A1 build-variant: see
     /// `crate::gemm::native_mrow_spv`). Same arena-by-address convention as
     /// [`Self::linear_native_at`] — binding 0 (the resident build's weight SSBO) takes a
-    /// small FILLER (`x`) since the arena is never bound as a descriptor. Not wired into any
-    /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    /// small FILLER (`x`) since the arena is never bound as a descriptor. The adapter's
+    /// `quant_linear` dispatches it for resident and streamed weights alike.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_mrow_at(
         &self,
@@ -3600,6 +3618,8 @@ impl<'a> Recorder<'a> {
         debug_assert!((2..=8).contains(&rows));
         assert_native_k("linear_native_mrow_at", in_f);
         self.label_gemv("mrow_streamed", rows, in_f, out_f);
+        self.be
+            .note_linear_tier(crate::LinearTierEvent::MrowDequant);
         let (name, spv) = crate::gemm::native_mrow_spv(dtype).expect("native mrow streamed spv");
         let k = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
@@ -3620,9 +3640,8 @@ impl<'a> Recorder<'a> {
 
     /// `-DSTREAMED` twin of the reassociation-tolerant subgroup+NUM_ROWS decode GEMV
     /// (`native_gemv_sg.comp`, slice A1 build-variant: see `crate::gemm::native_sg_streamed_build_spv`).
-    /// `m=1` decode only (matches the resident SG route's own gate); `nr` ∈ {2,4,8}. Not wired into
-    /// any production dispatch yet; exists so a parity test can exercise the `_streamed` SPV
-    /// directly.
+    /// `m=1` decode only (matches the resident SG route's own gate); `nr` ∈ {2,4,8}. Dispatched
+    /// through [`Self::linear_native_routed_at`].
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_sg_at(
         &self,
@@ -3675,8 +3694,8 @@ impl<'a> Recorder<'a> {
 
     /// `-DSTREAMED` twin of the multi-output-row decode GEMV (`native_gemv_rm.comp`, slice A1
     /// build-variant: see `crate::gemm::native_rm_streamed_build_spv`). `m=1` decode only (matches
-    /// the resident RM route's own gate); `rm` ∈ {2,4}. Not wired into any production dispatch yet;
-    /// exists so a parity test can exercise the `_streamed` SPV directly.
+    /// the resident RM route's own gate); `rm` ∈ {2,4}. Dispatched through
+    /// [`Self::linear_native_routed_at`].
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_rm_at(
         &self,
@@ -3729,8 +3748,8 @@ impl<'a> Recorder<'a> {
 
     /// `-DSTREAMED` twin of an experimental RM kernel variant (`native_gemv_rm_v2.comp`, slice A1
     /// build-variant: see `crate::gemm::native_rm_v2_streamed_build_spv`). `m=1` decode only, `RM=2`
-    /// fixed (all current variant builds). Not wired into any production dispatch yet; exists so a
-    /// parity test can exercise the `_streamed` SPV directly.
+    /// fixed (all current variant builds). Dispatched through [`Self::linear_native_routed_at`]
+    /// when a GEMV variant is configured.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_rm_v2_at(
         &self,
@@ -3784,8 +3803,9 @@ impl<'a> Recorder<'a> {
     /// `-DSTREAMED` twin of [`Self::linear_mmv`] (slice A2 build-variant: see
     /// `crate::gemm::native_mmv_spv`). Same arena-by-address convention as
     /// [`Self::linear_native_at`] — binding 0 (the resident build's weight SSBO) takes a
-    /// small FILLER (`qa`) since the arena is never bound as a descriptor. Not wired into any
-    /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    /// small FILLER (`qa`) since the arena is never bound as a descriptor. The adapter's
+    /// `quant_linear` dispatches it (the opt-in m=1 int8 decode GEMV) for resident and streamed
+    /// weights alike.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_mmv_at(
         &self,
@@ -3856,6 +3876,9 @@ impl<'a> Recorder<'a> {
         );
         assert_native_k("linear_mmv_mrow_at", in_f);
         self.label_gemv("mmvr_streamed", rows, in_f, out_f);
+        if rows > 1 {
+            self.be.note_linear_tier(crate::LinearTierEvent::MrowInt8);
+        }
         let res = residual.is_some();
         // Callers gate on this same lookup (`mmv_mrow_variant`), so a miss is a caller bug.
         let (name, spv, outs) =
@@ -3996,6 +4019,27 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: linear_mmv_mrow_fuseq requires a u64 BDA device address");
+        self.linear_mmv_mrow_fuseq_at(dtype, arena_addr, w_base, x, residual, y, rows, in_f, out_f);
+    }
+
+    /// [`Self::linear_mmv_mrow_fuseq`] for a weight read by 64-bit address `arena_addr` alone (a
+    /// resident weight's BDA, or a streamed slot's arena base).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_mmv_mrow_fuseq_at(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer, // [rows, in_f] f32 activations
+        residual: Option<&dyn Buffer>,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
         debug_assert!(
             (1..=4).contains(&rows),
             "FUSE_QUANT is decode-only (rows<=4)"
@@ -4004,9 +4048,6 @@ impl<'a> Recorder<'a> {
             residual.is_none() || rows == 1,
             "fused residual is decode-only (rows=1)"
         );
-        let arena_addr = w
-            .device_addr()
-            .expect("resident-BDA weight: linear_mmv_mrow_fuseq requires a u64 BDA device address");
         let res = residual.is_some();
         // Callers gate on this same lookup (`mmv_mrow_fuseq_variant`), so a miss is a caller bug.
         let (name, spv, outs) =
@@ -4062,10 +4103,9 @@ impl<'a> Recorder<'a> {
     /// [`Self::linear_native_at`] — binding 0 (the resident build's weight SSBO) takes a small
     /// FILLER (`x`) since the arena is never bound as a descriptor; `arena_lo`/`arena_hi` are
     /// appended LAST to the push block, after the resident `w_base` slot (always 0 — the residual
-    /// native GEMV is not used for stacked experts). Not wired into any production dispatch yet
-    /// (today's fused-add peephole filters streamed weights out before this path is ever reached —
-    /// see adapter.rs's Linear+Add lowering); exists so a parity test can exercise the `_streamed`
-    /// SPV directly ahead of the resident-BDA endgame that will need it.
+    /// native GEMV is not used for stacked experts). Reached through [`Self::linear_add_native`]
+    /// for a resident weight; a streamed weight never takes the fused Linear+Add yet (adapter.rs's
+    /// `execute_static` unfuses it).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add_native_at(
         &self,
@@ -4319,10 +4359,9 @@ impl<'a> Recorder<'a> {
     /// arena-by-address / FILLER convention as [`Self::linear_mmv_at`] — binding 0 (the
     /// resident build's weight SSBO) takes a small FILLER (`qa`) since the arena is never bound as a
     /// descriptor; `residual` is inserted right before the trailing `y` write (6 bindings total, vs
-    /// the plain arm's 5), and `arena_lo`/`arena_hi` are appended LAST to the push block. Not wired
-    /// into any production dispatch yet (today's fused-add peephole filters streamed weights out
-    /// before this path is ever reached — see adapter.rs's Linear+Add lowering); exists so a parity
-    /// test can exercise the `_streamed` SPV directly ahead of the resident-BDA endgame.
+    /// the plain arm's 5), and `arena_lo`/`arena_hi` are appended LAST to the push block. Reached
+    /// through [`Self::linear_add_mmv`] for a resident weight; a streamed weight never takes the
+    /// fused Linear+Add yet (adapter.rs's `execute_static` unfuses it).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add_mmv_at(
         &self,

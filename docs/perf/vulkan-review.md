@@ -341,9 +341,9 @@ All four are overrideable via `INFR_SG`, `INFR_MMV_MW`, `INFR_MMV_MW_WARPS`.
   this pass — the perf.md campaign log already covers the batched-MoE
   dispatch-collapse win (class 4, pp512 0.59→0.91×).
 
-- **Dense layer streaming** (`streamed_prefill_gemm`): the adapter's path for
-  models too large to fit in VRAM, sized by `paging.cache` / `paging.dram`
-  (there is no `INFR_DENSE_PAGE`). Not traced.
+- **Dense layer streaming** (`quant_linear` / `float_linear` with a slot
+  address): the adapter's path for models too large to fit in VRAM, sized by
+  `paging.cache` / `paging.dram` (there is no `INFR_DENSE_PAGE`). Not traced.
 
 - **Canvas/DiffusionGemma**: The `AttnMask::Canvas` path in attention routing.
   Not traced — perf.md notes it's benchmarked differently (dg-step vs pp/tg).

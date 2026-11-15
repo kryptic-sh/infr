@@ -3663,10 +3663,10 @@ cache dtype). Left:
   `mmv_choice_offers_only_built_variants`' "offered ⇒ built" half, and the new
   gate-vs-table asserts for `native_mrow` / `native_gemm_fma` in `linear.rs`.
 - **Not read by that pass:** the bodies of the native GEMV / mmv / GEMM kernels
-  (dequant and indexing), `streamed_prefill_gemm`, `native_sg_choice` /
-  `native_rm_choice`, the DeltaNet recurrence maths, the `mla.comp` body, and
-  the `argmax_prob`, `quant_kv`, `store_kv_dense`, `quant_turbo` and
-  `embed_gather` shader bodies.
+  (dequant and indexing), `streamed_prefill_gemm` (since removed),
+  `native_sg_choice` / `native_rm_choice`, the DeltaNet recurrence maths, the
+  `mla.comp` body, and the `argmax_prob`, `quant_kv`, `store_kv_dense`,
+  `quant_turbo` and `embed_gather` shader bodies.
 - To measure in a quiet window: per-op decode time for `rmsnorm` /
   `rmsnorm_wide` and `deltanet_norm` after the added uniform branch.
 
@@ -4002,36 +4002,20 @@ Notes and gaps:
 ### B155 — Vulkan streamed prefill and the default decode GEMV, 2026-11-13 read (2026-11-13)
 
 A read-only pass over the Vulkan code the coverage list had as unread
-(`streamed_prefill_gemm`, `native_sg_choice`, `native_rm_choice`, the
-`native_gemm_fma.comp` body, the mmq shader headers). Nothing was built or run
-by it. The `native_gemv_rm_v2` finding was re-read at its site afterwards; the
-rest is the reviewer's account.
+(`streamed_prefill_gemm`, since folded into `adapter::quant_linear`,
+`native_sg_choice`, `native_rm_choice`, the `native_gemm_fma.comp` body, the mmq
+shader headers). Nothing was built or run by it. The `native_gemv_rm_v2` finding
+was re-read at its site afterwards; the rest is the reviewer's account.
 
-- **Streamed prefill GEMM (`streamed_gemm_route`): coverage gaps.**
-  `streamed_gemm_route` now sends a streamed `Linear` past
-  `STREAMED_GEMM_MIN_ROWS` to `nc_prefill_gemm` (the same `nc_gemm_choice` the
-  resident arm uses). On a coopmat device with int8 dot it sends Q4_K to the
-  arena-addressed mmq build wherever the resident `warp_ok` is false (`out_f` a
-  multiple of 64 and not of 128, or any `out_f` under `INFR_NO_GEMM_WARP`). A
-  weight that breaches the u32 addressing cap, or a grid past the x limit, keeps
-  the chunked per-row GEMV (`streamed_tiled_fits`) rather than failing. Verified
-  on the Radeon iGPU (`Vulkan1`, no coopmat, int8 dot) and the 7900 XTX
-  (`Vulkan0`) by `tests/streamed_nc_gemm.rs` (kernel names after the streamed
-  run, streamed == resident bitwise, against the GEMV and the host oracle, and
-  the breaching-weight fallback with `bda_chunk_elems` lowered) and the
-  `gpu_seam_dense_stream_*` tests with Qwen3-1.7B-Q4_K_M. Not verified: Intel
-  Arc; a device without int8 dot (the fma arm only); a whole streamed model with
-  bf16 weights; the oversized-grid fallback on a GPU (only the host-side
-  predicate test covers it); the `INFR_CM_8X8` opt-in, where the resident Linear
-  takes `_cm8` but the streamed one takes this tier (no arena-addressed `_cm8`
-  build exists). Known divergence, debug knob only: under `INFR_NO_GEMM_WARP` a
-  resident non-Q4_K quant still runs `native_warp_gemm` while the streamed one
-  falls back to the GEMV. Open choice: streamed Linears at or below
-  `STREAMED_GEMM_MIN_ROWS` take the per-row GEMV although
-  `linear_native_mrow_at` / `linear_mmv_mrow_at` would read the arena by address
-  too. Not measured in a quiet window: one profiled `infr bench -p 128` of
-  Qwen3-1.7B on `Vulkan1` with `paging.cache=200m` and `INFR_PROF_OPS=1`, on a
-  busy machine, gave 10.0 t/s with the old route and 103.6 t/s with the new one.
+- **Streamed quantised Linear routing: what is still unverified.** Since
+  2026-11-15 resident and streamed quantised Linears share `quant_linear` (plan
+  08 step 4), so the earlier divergences (`INFR_NO_GEMM_WARP`, the per-row GEMV
+  at small m) are gone; the opt-in tiers a streamed slot skips are in B193.
+  Verified on `Vulkan0` and `Vulkan1` by `tests/streamed_nc_gemm.rs`. Not
+  verified: Intel Arc; a device without int8 dot (the fma arm only); a whole
+  streamed model with bf16 weights; the oversized-grid fallback on a GPU (only
+  the host-side `tiled_gemm_fits` test covers the predicate, and nothing
+  dispatches a grid past the x limit).
 - **Correctness, conditional, confirmed by re-reading:
   `native_gemv_rm_v2.comp`'s `VARIANT_REG` sizes `reg_part` for subgroups of at
   least 16** (`THREADS / 16u` slots, written by `gl_SubgroupID`), and
@@ -4055,12 +4039,12 @@ rest is the reviewer's account.
   in `tests/moe_id_gemv_real_dims.rs`. Nothing unit-tests the decisions of
   `native_sg_choice` or `native_rm_choice`, and the recorder's ignored GPU tests
   that need f16 coopmat print `skip:` and pass on a device without it.
-- Read with nothing found: `streamed_prefill_gemm`, `native_sg_choice`,
-  `native_rm_choice`, the `native_gemm_fma.comp` body, and the header blocks of
-  the mmq shaders (not diffed against a llama.cpp checkout). Not reached:
-  `matmul_native_off`, `matmul_native_splitk`, `matmul_native_f16a`,
-  `matmul_native_f32a`, `dispatch_gemv_chunked`, and the ignored GPU test bodies
-  in `recorder.rs`.
+- Read with nothing found: `streamed_prefill_gemm` (since removed),
+  `native_sg_choice`, `native_rm_choice`, the `native_gemm_fma.comp` body, and
+  the header blocks of the mmq shaders (not diffed against a llama.cpp
+  checkout). Not reached: `matmul_native_off`, `matmul_native_splitk`,
+  `matmul_native_f16a`, `matmul_native_f32a`, `dispatch_gemv_chunked`, and the
+  ignored GPU test bodies in `recorder.rs`.
 
 ### B156 — pager survey leftovers: MoE touch costs, test-only GPU pager surface, MoE DRAM policy (2026-11-13)
 
@@ -5058,9 +5042,9 @@ ms against llama.cpp's 129.4 ms; what is left, largest first:
     int8 coopmat MMQ on RDNA3. Each is a weight decode in `prefetch` /
     `store_to_shared` of `native_gemm_i8cm_kq.comp` plus a build; the existing
     `native_gemm_i8cm_q8_0.comp` measurement kernel would then be redundant.
-  - The streamed dense path (`streamed_prefill_gemm`) and the MoE expert GEMMs
-    (`native_gemm_mmq_q4k_xp` and siblings, dp4a) do not use it. llama.cpp's
-    `matmul_id_subgroup_q4_k_q8_1` is the expert analogue.
+  - The MoE expert GEMMs (`native_gemm_mmq_q4k_xp` and siblings, dp4a) do not
+    use it; the streamed dense path does since 2026-11-15 (plan 08 step 4).
+    llama.cpp's `matmul_id_subgroup_q4_k_q8_1` is the expert analogue.
   - Tiles: two (`I8cmTile::L` 128x128, `M` 64x64) chosen by grid fill
     (`i8cm_kq_choice`). Forcing one tile everywhere on Qwen3-1.7B pp512: the
     fused gate/up 417.1 us (L) against 491.6 us (M); the 2048-wide projections
@@ -5636,15 +5620,53 @@ at the arena slot's address. What that slice did not do:
   arena barriers only around a staging copy. ERNIE-4.5-0.3B F16 on the RX 7900
   XTX at `INFR_CACHE=1G` now prefills at the resident rate (pp512 22614 / 22707
   against 22763 / 22134 resident) and decodes at 385.3 / 383.4 t/s against 449.8
-  / 449.6. What is left is the plan's remaining steps: decode replay for a
-  session that holds every block (the rest of ERNIE's decode gap, and 147 of
-  Qwen3-1.7B Q4_K_M's 171 t/s), the int8 K-quant GEMM for streamed prefill (the
-  whole remaining Qwen3 prefill gap, 7.7k against 12.1k), and a 24 t/s Qwen3
-  decode residue nothing measured so far explains. On the integrated GPU
-  (`Vulkan1`) Qwen3-1.7B's streamed decode is a third of resident with nothing
-  evicted (9.3 against 27.4 t/s at `INFR_CACHE=2G`) while ERNIE F16's is not
-  (36.4 against 37.6); not diagnosed, the streamed K-quant GEMV route is the
-  first suspect.
+  / 449.6. Step 4 landed the same day: a streamed quantised Linear now takes the
+  resident routing (`adapter::quant_linear`) at every row count, so Qwen3-1.7B
+  Q4_K_M at `INFR_CACHE=2G` prefills at the resident rate (pp512 12122 / 12037
+  against 11841 / 11798 resident) and decodes at 387 t/s (was 308; resident
+  479), and on the integrated GPU (`Vulkan1`) its streamed decode went from 9.3
+  to 26.9 t/s against 27.5 resident — that was the old streamed GEMV route, the
+  suspect named here before. What is left is the plan's remaining steps: decode
+  replay for a session that holds every block (step 3), and Linear+Add fusion
+  for streamed weights (step 5).
+- **Streamed quantised Linears skip four opt-in tiers.** `quant_linear` runs a
+  streamed slot past the `_cm8` warptile (`INFR_CM_8X8`), the fp8 coopmat GEMM
+  (`INFR_F8_COOPMAT`), the int8 Q8_0 coopmat GEMM (`INFR_I8_COOPMAT`) and the
+  bf16 coopmat GEMM (`INFR_BF16_COOPMAT`), because their dispatches bind the
+  resident weight buffer, and takes the next tier down instead. With one of
+  those switches on, a streamed Linear therefore runs a different-precision
+  kernel from its resident twin and the outputs are not bit-identical; on the
+  default configuration no route differs. What enabling each would take: the
+  `_cm8` and BF16CM warptiles already compile under `-DSTREAMED`
+  (`native_gemm_warp`'s arena reads), and `build.rs` drops their twins only
+  because nothing calls them (`dead_streamed_twin`) — emit the twins and add
+  `_at` recorder methods. The int8 Q8_0 GEMM has an arena-addressed build and
+  recorder method (`Recorder::matmul_i8cm_q8_0_at`), compiled only for its
+  parity test (`parity` feature); its row-scale variant's `_streamed` SPV is
+  built but has no `_at` method. The fp8 GEMM has no streamed build at all
+  (`native_gemm_f8cm_q8_0.comp` reads a bound weight; only the prepack's
+  `repack_q8_to_f8` has a `-DSTREAMED` twin), so it needs a shader change. None
+  is measured or tested on a streamed weight.
+- **SmolLM3-3B decodes faster streamed than resident** (RX 7900 XTX, tg128:
+  251.3 t/s at `INFR_CACHE=2G` against 228.3 resident, 2026-11-15). Linear
+  routing is identical at m = 1, and neither run replays (SmolLM3's NoPE layers
+  keep it off the record-once replay, B157; resident with
+  `INFR_SEAM_NO_REPLAY=1` is 228.4). The difference is early submit
+  (`paging.early_submit`), which only a paged forward gets: the streamed run
+  with `--set paging.early_submit=0` drops to 223.0, and resident with
+  `INFR_NO_FUSE_ADD=1` (the Linear+Add fusion the streamed run lacks) is 224.8,
+  so streamed without early submit sits just below resident for the missing
+  fusion. Resident static decode records the whole forward before submitting,
+  and the streamed one overlaps recording with the GPU. One `INFR_PROF_OPS=1`
+  tg64 of each shows the same kernels except the fused `_res` GEMVs against
+  plain GEMVs plus `add` (resident 40128 dispatches, streamed 44736), but
+  profiling itself serializes the forward (resident with and without replay give
+  the same 40128-dispatch report, 255.8 and 256.9 ms device total, so it cannot
+  show the overlap) and the streamed profile's per-dispatch times came out about
+  twice the resident ones (attention 43.8 against 24.1 us), which reads as a GPU
+  clock difference under the profiler, not a kernel one. Suggests: early submit
+  for resident static forwards (a non-replaying model such as SmolLM3) could be
+  worth about 10% decode there. Not tried.
 - **The paged MoE path still records arena barriers on a hit.** Plan 08 step 2
   made the dense pager record them only around a copy;
   `adapter::execute_paged_moe` still records one before and one after every

@@ -8,6 +8,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`VulkanBackend::linear_tier_counts`** (`LinearTierCounts`): how many int8
+  and dequant multi-row GEMVs and dp4a K-quant GEMMs a backend has recorded,
+  beside `i8cm_kq_counts`, so a test can see which Linear kernel ran.
 - **LFM3 (`lfm3`).** Liquid AI's LFM3-1.7B runs on the CPU and Vulkan backends
   and decodes on the record-once replay: gated short-convolution layers (`B ⊙ X`
   through a causal depthwise conv, then `C ⊙`) between QK-normed attention
@@ -82,6 +85,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A streamed quantised Linear runs the kernel its resident twin would**
+  (Vulkan). Streamed dense weights had a routing of their own that left out the
+  int8 K-quant coopmat GEMM, the multi-row GEMVs and every decode GEMV but the
+  plain one; resident and streamed now share one decision, reading a streamed
+  weight from its arena slot. On the RX 7900 XTX, two interleaved rounds, host
+  CPU load 0-9%: Qwen3-1.7B Q4_K_M at `INFR_CACHE=2G` went from pp512 7659 /
+  7576 to 12122 / 12037 t/s (resident: 11841 / 11798) and tg128 from 308.3 /
+  308.0 to 387.4 / 387.5; SmolLM3-3B Q4_K_M at `INFR_CACHE=2G` from pp512 4033 /
+  4042 to 6344 / 6320 (resident: 6299 / 6260) and tg128 from 172.2 / 172.1 to
+  251.6 / 250.7. An evicting cache prefills at the same rate (Qwen3 at 800M:
+  7508 / 7480 to 11893 / 11889); evicting decode is unchanged within noise. On
+  the integrated GPU (one round) streamed decode holding every block went from
+  9.28 to 26.85 t/s for Qwen3 (resident 27.45) and from 4.64 to 12.68 for
+  SmolLM3 (resident 12.66); prefill there already took the resident GEMMs. On
+  the default configuration streamed output is now bit-identical to resident
+  where it used to differ by the int8 activation rounding; with `INFR_CM_8X8`,
+  `INFR_F8_COOPMAT`, `INFR_I8_COOPMAT` or `INFR_BF16_COOPMAT` a streamed Linear
+  still skips that opt-in tier and runs a different-precision kernel than
+  resident. A weight past the u32 addressing cap at 2 to 16 rows now takes the
+  chunked per-row GEMV, resident and streamed: the multi-row GEMVs used to take
+  it unchunked. At more rows a streamed one takes that GEMV too, and a resident
+  one still fails loudly.
 - **A streamed dense model whose cache holds every block no longer pays for
   streaming it does not do** (Vulkan). Layer-major prefill now runs only for a
   prompt of more than one chunk on a cache that cannot hold every block

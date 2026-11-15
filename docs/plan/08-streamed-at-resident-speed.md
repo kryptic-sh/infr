@@ -10,9 +10,9 @@ evicted. The recorded case is in `backlog.md` B193 (ERNIE-4.5-0.3B F16, RX 7900
 XTX, every block resident: prefill and decode both well below the resident
 figures, same kernels).
 
-**Status:** steps 0–2 done (2026-11-15). The findings below were read from the
-code first; step 0 measured them, and the order of the remaining steps follows
-that measurement.
+**Status:** steps 0–2 and 4 done (2026-11-15). The findings below were read from
+the code first; step 0 measured them, and the order of the remaining steps
+follows that measurement.
 
 ## What step 0 measured
 
@@ -80,11 +80,11 @@ the order step 0 found them to cost:
    `dense_paged()`, and the runner's `mirror_admits` repeats the condition, so
    every token rebuilds, recompiles, re-records and waits. The largest remaining
    decode term on both models.
-3. **Quantised streamed prefill skips resident kernel tiers.**
-   `streamed_gemm_route` does not consider the int8 K-quant coopmat GEMM
-   (`matmul_i8cm_kq` takes a weight address) nor the multi-row kernels for small
-   row counts. Measured as the whole remaining Q4_K_M prefill gap on the RX 7900
-   XTX.
+3. **Quantised streamed Linears skipped resident kernel tiers.** Fixed by step
+   4: the streamed route had its own decision tree, which left out the int8
+   K-quant coopmat GEMM, the multi-row GEMVs and every decode GEMV tier but the
+   plain one. It was the whole remaining Q4_K_M prefill gap on the RX 7900 XTX,
+   and most of the streamed Q4_K_M decode gap on both GPUs.
 4. **Two arena barriers per streamed Linear, hit or miss.** Fixed by step 2.
 5. **Linear+Add is unfused for streamed weights** (`execute_static`), although
    `Recorder::linear_add_at`, `linear_add_native_at` and `linear_add_mmv_at`
@@ -133,14 +133,16 @@ carrying the cadence across a ring rotation, a fixed-count cadence.
    `decode_recordings()` reads one after a run, and two after a forced epoch
    change, with identical tokens; a decode that starts from an empty cache
    exercises the staging pass.
-4. **Resident kernel routing for quantised streamed prefill:** the int8 K-quant
-   GEMM and the multi-row kernels, under the resident gates. Observable: the
-   existing int8 kernel counters move on a streamed prefill.
+4. ~~Resident kernel routing for quantised streamed Linears.~~ Done; see below.
 5. **Keep Linear+Add fused for streamed weights**, through the address-taking
    variants, in the static path and in the replay. Observable: a streamed decode
    forward has the same dispatch count as a resident one.
-6. **Find the Qwen3 decode residue** (24 t/s on the RX 7900 XTX, and a third of
-   resident on the iGPU, below) once replay lands, if it survives it.
+6. ~~Find the Qwen3 decode residue~~ (24 t/s on the RX 7900 XTX, and a third of
+   resident on the iGPU). It was the streamed GEMV route, removed by step 4:
+   streamed Qwen3 decode holding every block went from 308 to 387 t/s on the RX
+   7900 XTX (resident with replay: 479), and from 9.3 to 26.9 on the iGPU
+   against 27.5 resident. Whether anything is left once replay lands is step 3's
+   to measure.
 7. **Only if a gap remains:** early submit off for static forwards of a session
    that holds every block, decided by measurement.
 
@@ -196,6 +198,92 @@ Qwen3's streamed prefill, now at the resident rate. Qwen3's streamed decode
 there is a third of resident with nothing evicted (9.3 against 27.4 t/s); ERNIE
 F16 shows no such gap. Not diagnosed; the streamed K-quant GEMV route is the
 first suspect, as for the smaller Qwen3 residue on the discrete GPU.
+
+## Results of step 4
+
+What the two routes did before, by device and row count, for a native quantised
+weight (F16/F32 already shared `float_linear`):
+
+| Rows | Resident, coopmat device                                                                                                                                       | Streamed before, coopmat device               | Resident, no coopmat                   | Streamed before, no coopmat |
+| ---- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- | -------------------------------------- | --------------------------- |
+| 1    | multi-warp int8 GEMV where wave32-native, else the int8 mmv (opt-in), else the SG → RM-v2 → RM → plain dequant GEMV                                            | plain dequant GEMV                            | same as coopmat                        | plain dequant GEMV          |
+| 2–16 | the int8 multi-row GEMV (m ≥ 3, weight ≥ 8M elements, int8 dot) or the dequant one (m ≤ 8), per `MROW_BANDS`                                                   | plain GEMV per row                            | same                                   | plain GEMV per row          |
+| > 16 | opt-in `_cm8`/fp8/int8 Q8_0/bf16 coopmat tiers, then the int8 K-quant coopmat GEMM (Q4_K/Q5_K/Q6_K, AMD proprietary), then narrow Q4_K mmq, then the warp tile | narrow Q4_K mmq (or dp4a), else the warp tile | dp4a K-quant GEMM (m > 64) or mmq, fma | same as resident            |
+
+Now both run one function, `adapter::quant_linear`, with the weight given as an
+address plus the resident buffer when there is one. A streamed slot skips only
+the opt-in tiers whose kernel binds the weight buffer (`_cm8`, fp8, int8 Q8_0
+and bf16 coopmat), reads the narrow Q4_K mmq through its arena-addressed build,
+and keeps the chunked per-row GEMV for a weight past the u32 addressing cap or a
+non-coopmat grid past the device's x limit (`tiled_gemm_fits`). A resident
+weight takes that GEMV too at up to the multi-row band's 16 rows, where the
+multi-row GEMVs, which are not chunked, used to take a breaching weight; past 16
+rows the resident Linear still fails loudly, as before. With `INFR_CM_8X8`,
+`INFR_F8_COOPMAT`, `INFR_I8_COOPMAT` or `INFR_BF16_COOPMAT` set, a streamed
+Linear takes the next tier down from its resident twin, so the bit-identity
+below holds on the default configuration only. The quantised-activation memo is
+keyed by the activation only and its pooled scratch lives for the whole forward,
+so staging copies, early-submit cuts and ring rotations between two Linears that
+share `x` do not invalidate it; `streamed_quant_takes_the_resident_kernels`
+counts one quant pass per execution over three Linears on an evicting pool.
+
+Observable: `VulkanBackend::i8cm_kq_counts` and the new `linear_tier_counts`
+(multi-row int8 and dequant GEMVs, dp4a K-quant GEMMs), asserted equal between a
+streamed and a resident run in `streamed_quant_takes_the_resident_kernels`
+(`infr-vulkan/tests/streamed_nc_gemm.rs`), with bit-identical outputs. On the
+tree before the step it fails on both GPUs: on `Vulkan0` the m=200 Q4_K case
+counts no int8 coopmat tile streamed against six resident, and the m=1 case
+differs in the first output element; on `Vulkan1` the m=4 case counts no
+multi-row GEMV streamed against six resident.
+
+Measured with the step 0 harness, the tree before the step and after it
+interleaved in alternating order over two rounds on the RX 7900 XTX, host CPU
+load 0–9% and at least 36.8 GB of host memory free at every start. "Holds all"
+is `INFR_CACHE=2G` for both models (`INFR_PAGER_STATS=1` showed every pool at
+`slots=n/n`, no evictions); the evicting control is 800M for Qwen3-1.7B and 1G
+for SmolLM3-3B. t/s, round 1 / round 2:
+
+| Case          | before        | after         |
+| ------------- | ------------- | ------------- |
+| Qwen3 pp512 R | 12031 / 11818 | 11841 / 11798 |
+| Qwen3 pp512 S | 7659 / 7576   | 12122 / 12037 |
+| Qwen3 pp512 E | 7508 / 7480   | 11893 / 11889 |
+| Qwen3 tg128 R | 479.1 / 478.5 | 479.1 / 478.2 |
+| Qwen3 tg128 S | 308.3 / 308.0 | 387.4 / 387.5 |
+| Qwen3 tg128 E | 58.4 / 57.9   | 59.3 / 58.7   |
+| Smol pp512 R  | 6289 / 6245   | 6299 / 6260   |
+| Smol pp512 S  | 4033 / 4042   | 6344 / 6320   |
+| Smol pp512 E  | 3986 / 3968   | 6111 / 6092   |
+| Smol tg128 R  | 228.0 / 228.2 | 228.0 / 228.3 |
+| Smol tg128 S  | 172.2 / 172.1 | 251.6 / 250.7 |
+| Smol tg128 E  | 21.90 / 21.72 | 21.78 / 21.57 |
+
+The integrated GPU (`Vulkan1`), one round, same budgets, host CPU load 0–3%:
+
+| Case          | before | after |
+| ------------- | ------ | ----- |
+| Qwen3 pp512 R | 231.5  | 231.8 |
+| Qwen3 pp512 S | 231.7  | 231.7 |
+| Qwen3 pp512 E | 214.4  | 214.2 |
+| Qwen3 tg128 R | 27.47  | 27.45 |
+| Qwen3 tg128 S | 9.28   | 26.85 |
+| Qwen3 tg128 E | 7.23   | 13.64 |
+| Smol pp512 R  | 120.3  | 119.8 |
+| Smol pp512 S  | 120.4  | 119.6 |
+| Smol pp512 E  | 110.6  | 110.8 |
+| Smol tg128 R  | 12.90  | 12.66 |
+| Smol tg128 S  | 4.64   | 12.68 |
+| Smol tg128 E  | 3.45   | 5.48  |
+
+Streamed prefill is now at the resident rate on the discrete GPU, holding every
+block or evicting (one 512-token chunk reads one sweep either way). On the iGPU
+prefill already took the same non-coopmat GEMMs, and nothing moved. Streamed
+decode gains on both GPUs; holding every block it now sits 2.2% (Qwen3) and
+0.2–1.7% (SmolLM3) below resident on the iGPU. On the RX 7900 XTX the replay
+(step 3) is the expected rest of the gap; this window did not split it. The
+evicting decode on the RX 7900 XTX moved within run noise (SmolLM3 0.5–0.7%
+lower, Qwen3 1.4% higher). The resident rows did not change in code; the 1.9%
+SmolLM3 decode difference on the iGPU is one round of noise, not retaken.
 
 ## Verification
 

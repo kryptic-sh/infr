@@ -3493,7 +3493,7 @@ fn main() {
     //     the 8-warp warptile: wide/NARROW_N/A_GLOBAL/SPLIT_K/BM* × every quant format, plus the
     //     opt-in -DBF16CM / `_cm8` (-DCM_M=8) coopmat variants and the -DFMT_F16 split-K build). A
     //     streamed dense prefill Linear routes through the SAME tile the resident path picks, just
-    //     arena-addressed (adapter.rs `streamed_prefill_gemm`). Previously EXCLUDED BF16CM/CM_M=8/
+    //     arena-addressed (adapter.rs `quant_linear`). Previously EXCLUDED BF16CM/CM_M=8/
     //     FMT_F16 as opt-in-only or float-upload-only — re-audited: none of the three change the
     //     weight-READ source. BF16CM/CM_M only retype/resize the coopmat A/B fragment (CMTYPE /
     //     CM_M/CM_N), and FMT_F16's dq/dqblk (native_decode.glsl) route through the exact same

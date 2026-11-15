@@ -2304,6 +2304,17 @@ impl DensePagerSession {
         self.sources.contains_key(&buf_id)
     }
 
+    /// Whether every pool has a slot for each of its blocks, so nothing is ever evicted: the
+    /// residency pager hands out a free slot before it picks a victim
+    /// (`infr_core::pager::Pager`'s `take_slot`), and a placement that is taken back (a failed
+    /// fill, a discarded recording) returns its slot to the free list. Each block is then staged
+    /// once and hit on every later pass.
+    pub fn holds_every_block(&self) -> bool {
+        self.pools
+            .iter()
+            .all(|p| p.pager.n_slots() >= p.spec.n_blocks)
+    }
+
     /// How many weight groups are registered to stream.
     pub fn n_streamed(&self) -> usize {
         self.sources.len()
@@ -2318,6 +2329,40 @@ impl DensePagerSession {
     /// overflows it (the u32 element-reach the SSBO path needed is gone). Residency rides the exact
     /// cyclic-sweep policy (`infr_core::pager::Pager::schedule`); one block = one touch batch (the
     /// epoch guard protects it across the caller's rotations).
+    ///
+    /// # Ordering the arena
+    ///
+    /// A slot is written only by the ring→arena copies this records (`TRANSFER_WRITE`) and read
+    /// only by streamed dispatches through a 64-bit pointer (`SHADER_READ`), which the recorder's
+    /// buffer hazard tracker cannot see. So a COPY is bracketed by two
+    /// [`crate::recorder::Recorder::arena_stream_barrier`]s, and a hit records none:
+    ///
+    /// - A pipeline barrier orders every command before it in submission order against every
+    ///   command after it, across command buffers and submits on the backend's one queue. What
+    ///   makes recording order the submission order for the arena's commands: `execute_static`
+    ///   submits each segment before opening the next and ends with a blocking submit, and the
+    ///   paged paths never replay a recording. Other submits reach the same queue in between
+    ///   (scratch zero-fills, uploads, the positions readback fallback) but none of them reads or
+    ///   writes a dense arena; nothing outside this fn writes one. Two forwards never interleave
+    ///   their recordings: the backend holds no lock across an execute, so the caller serialises
+    ///   them, a session by `&mut`, and `serve --parallel` by its step baton
+    ///   (`RequestCtx::gate_pass`), held across each whole execute (a prefill chunk or a decode
+    ///   step). The session mutex is held only for one `stage` call.
+    /// - RAW: the barrier after a copy is recorded into the same recorder before this returns, and
+    ///   segments are cut only between ops, so no cut can fall between a copy and its barrier.
+    ///   Every dispatch that reads the slot's current bytes is recorded after that barrier: the
+    ///   op this call stages for, the other Linears of a fused block that hit it later, any later
+    ///   forward, whether an early-submit cut, a ring rotation or a blocking submit separates them.
+    ///   A hit therefore needs no barrier of its own; its block's last write already has one.
+    /// - WAR: a miss may overwrite a slot that dispatches recorded earlier still read (an evicted
+    ///   block's, possibly in an earlier segment still executing). The barrier before the copy
+    ///   orders all of them before it. A hit writes nothing, so it has no WAR to order.
+    /// - WAW: a second copy into a slot is after the first copy's own trailing barrier.
+    /// - A copy in a recording that is discarded never runs; [`Self::forget_unsubmitted`] takes its
+    ///   placement back, so no later hit relies on it.
+    ///
+    /// The barrier is a full compute/transfer one, so recording it on a hit as well would also
+    /// serialise independent dispatches the hazard tracker lets overlap, for no ordering gained.
     pub fn stage(
         &mut self,
         rec: &crate::recorder::Recorder<'_>,
@@ -2337,10 +2382,15 @@ impl DensePagerSession {
             .ok_or_else(|| be("dense pager: stage on an unregistered buffer"))?;
         let pool = &mut pools[*pool_idx];
         let id = src.block_id;
-        if !pool.pager.is_resident(id) && *cursor + pool.spec.slot_bytes > *ring_half_bytes {
+        let hit = pool.pager.is_resident(id);
+        if !hit && *cursor + pool.spec.slot_bytes > *ring_half_bytes {
             return Ok(None); // half full — caller rotates and re-calls
         }
         pool.pager.begin_batch();
+        if !hit {
+            // WAR: every arena read recorded so far before this miss's copy (see the fn doc).
+            rec.arena_stream_barrier();
+        }
         // Pass the source through by reference — `schedule_staged` derefs mmap segments via
         // `expert_bytes` and pins a host block in place, so neither tier materializes a copy here.
         let (slot, consumed) = pool.pager.schedule_staged(
@@ -2352,6 +2402,10 @@ impl DensePagerSession {
             pool.spec.host.as_deref(),
         )?;
         *cursor += consumed;
+        if consumed > 0 {
+            // RAW: the copy before every later dispatch that reads the slot (see the fn doc).
+            rec.arena_stream_barrier();
+        }
         // Slot base BYTE address = arena base + slot * slot_bytes, in 64-bit (the BDA arena's
         // `arena_addr()`; the streamed kernel dereferences this pointer). No cap: the multiply and
         // the address are 64-bit, so an arena of any size the VRAM budget allows is addressable.

@@ -1374,13 +1374,13 @@ fn lower_op(
     // (`linear_native_at`) — the arena-addressed kernels are the ONLY ones a >4 GiB pool ever
     // dispatches, which is what makes dropping the caps safe. `w_off` (a fused-QKV slice offset,
     // usually 0) rides on top as a within-slot element offset in both. The ring→arena copy hazard is
-    // ordered explicitly by `arena_stream_barrier` at the staging site (`stage_dense_linear`) — the
-    // SAME slot/RAW barrier already covers the prefill dispatch. Every other op — and every
-    // non-streamed model — passes `None` (zero change). Only the `Op::Linear` arm reads it; the
-    // seam's placement admits only `linear::dense_stream_supported` dtypes, and a streamed weight
-    // never takes the fused-residual peephole (filtered by `execute_static` before the loop). An
-    // F16/F32 weight bypasses that m-split and runs `float_linear` — the resident float dispatch —
-    // at the slot address.
+    // ordered explicitly by `arena_stream_barrier` at the staging site (`DensePagerSession::stage`,
+    // which argues why a hit needs none) — the SAME barrier covers the prefill dispatch. Every
+    // other op — and every non-streamed model — passes `None` (zero change). Only the
+    // `Op::Linear` arm reads it; the seam's placement admits only `linear::dense_stream_supported`
+    // dtypes, and a streamed weight never takes the fused-residual peephole (filtered by
+    // `execute_static` before the loop). An F16/F32 weight bypasses that m-split and runs
+    // `float_linear` — the resident float dispatch — at the slot address.
     wsub: Option<u64>,
 ) -> Result<()> {
     let memo_prev = mmv_memo.take();
@@ -5795,6 +5795,7 @@ fn submit_nowait(
 /// batches and every ineligible decode (gemma/E2B/MoE/qwen35).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+    be_.note_static_execute();
     let scratch = alloc_scratch(be_, graph)?;
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
@@ -6626,8 +6627,9 @@ fn float_linear(
 /// is read from the pool arena by 64-bit address (`arena_addr`) — the recorder methods pass the
 /// address to whatever tile they pick and bind the activation as the binding-1 filler, so the
 /// arena is NEVER a bound descriptor. `w_off` (a fused-QKV slice offset)
-/// rides on top as a within-slot element offset. The ring→arena copy is already ordered before this
-/// dispatch by `stage_dense_linear`'s RAW `arena_stream_barrier` (same slot, same segment).
+/// rides on top as a within-slot element offset. The ring→arena copy that filled the slot is
+/// already ordered before this dispatch by the RAW `arena_stream_barrier` `DensePagerSession::stage`
+/// recorded right after it.
 #[allow(clippy::too_many_arguments)]
 fn streamed_prefill_gemm(
     be_: &VulkanBackend,
@@ -6660,8 +6662,9 @@ fn streamed_prefill_gemm(
 /// staging a miss through the session ring into the ambient segment and rotating the stream
 /// (pipelined `finish_nowait` + fenced ring-half swap, exactly `rotate_stream`'s contract) when
 /// the current half can't hold it. Returns the resident slot's arena base BYTE address for the
-/// streamed dispatch (see `DensePagerSession::stage`). Progress is guaranteed: a ring half holds
-/// at least the largest pool slot (asserted at session construction).
+/// streamed dispatch (see `DensePagerSession::stage`, which also records the arena barriers around
+/// a copy, and only around a copy). Progress is guaranteed: a ring half holds at least the largest
+/// pool slot (asserted at session construction).
 fn stage_dense_linear<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
@@ -6669,12 +6672,6 @@ fn stage_dense_linear<'a>(
     wid: usize,
 ) -> Result<u64> {
     loop {
-        // WAR: order any prior streamed dispatch's arena read (a 64-bit pointer read, invisible to
-        // the buffer hazard tracker) before the ring→arena copy this `stage` may record into a
-        // re-used slot. Emitted before the copy; harmless on a hit (no copy recorded).
-        rec.as_ref()
-            .expect("segment always Some between ops")
-            .arena_stream_barrier();
         let staged = {
             let mut guard = be_.dense_pager().lock().unwrap();
             let sess = guard
@@ -6689,14 +6686,7 @@ fn stage_dense_linear<'a>(
             )?
         };
         match staged {
-            Some(arena_addr) => {
-                // RAW: order the ring→arena copy just recorded before the streamed dispatch that
-                // reads the slot by pointer (see `Recorder::arena_stream_barrier`).
-                rec.as_ref()
-                    .expect("segment always Some between ops")
-                    .arena_stream_barrier();
-                return Ok(arena_addr);
-            }
+            Some(arena_addr) => return Ok(arena_addr),
             None => rotate_stream(be_, rec, ps)?,
         }
     }

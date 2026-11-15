@@ -783,8 +783,9 @@ pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize
     ctx.div_ceil(ub) as u64 * ub as u64 * cfg.n_embd as u64 * 4
 }
 
-/// Does this session prefill LAYER-MAJOR — every chunk through layer L before any chunk reaches
-/// L+1 — instead of running the whole model per chunk?
+/// May this session prefill LAYER-MAJOR — every chunk through layer L before any chunk reaches
+/// L+1 — instead of running the whole model per chunk? Whether a given prompt then does is
+/// [`layer_major_this_prompt`].
 ///
 /// The two orders compute the same thing; they differ in what they re-read. Chunk-major sweeps the
 /// entire weight set once PER CHUNK, which is free when the weights are resident and is the whole
@@ -792,7 +793,7 @@ pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize
 /// 25.26 GB against a single sweep's 6.32 GB, and prefilled 3.08x slower for it. Layer-major reads
 /// one sweep regardless of chunk count, at the cost of holding every chunk's residual stream at once
 /// ([`layer_major_act_bytes`]) — a trade that only pays when there is I/O to save, hence the default
-/// of "on exactly when the weights stream".
+/// of "on exactly when the weights stream" (and, per prompt, only when it can save a read).
 ///
 /// `paging.layer_major` overrides in both directions (A/B, and the only way to put a RESIDENT model
 /// on this path). Either way it needs a backend that carries a bound `Input` from one execute to the
@@ -828,6 +829,27 @@ pub(crate) fn layer_major_prefill(
         return false;
     }
     want
+}
+
+/// Does THIS prompt prefill layer-major, given whether the session would
+/// ([`layer_major_prefill`])?
+///
+/// The auto rule runs it only where it can save a read: a prompt of more than one chunk, on a
+/// cache that cannot hold every block. One chunk is one sweep in either order, and a cache with a
+/// slot per block reads each block once per session whatever the order, so layer-major there only
+/// adds a span per layer, each paying its own graph build, compile, scratch and blocking submit.
+/// `paging.layer_major = true` still forces it (the A/B arm); `false` never arrives as wanted.
+///
+/// The activation reserve does not follow this per-prompt answer: it is priced for the session
+/// ([`layer_major_act_bytes`]) because the arenas are sized before any prompt arrives, so a prompt
+/// that runs chunk-major leaves it unused rather than short.
+pub(crate) fn layer_major_this_prompt(
+    ec: &EngineConfig,
+    wanted: bool,
+    n_chunks: usize,
+    holds_every_block: bool,
+) -> bool {
+    wanted && (ec.paging.layer_major == Some(true) || (n_chunks > 1 && !holds_every_block))
 }
 
 /// Safety pad on [`dense_act_reserve_at`]'s per-row terms, as `(numerator, denominator)`.
@@ -4822,6 +4844,49 @@ mod seam_helper_tests {
             XTX_ROOM < vram.available,
             "…again a case the raw free figure would have waved through"
         );
+    }
+
+    /// The per-prompt half of the layer-major gate: auto runs it only where it can save a read
+    /// (several chunks over a cache that cannot hold every block), and `true` forces it anyway.
+    #[test]
+    fn layer_major_runs_only_where_it_saves_a_read() {
+        let with = |lm: Option<bool>| EngineConfig {
+            paging: infr_core::config::PagingCfg {
+                layer_major: lm,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let auto = with(None);
+        // (wanted, chunks, holds every block) -> layer-major
+        let cases = [
+            ((true, 1, false), false),
+            ((true, 1, true), false),
+            ((true, 3, true), false),
+            ((true, 3, false), true),
+            ((false, 3, false), false),
+        ];
+        for ((wanted, n, holds), want) in cases {
+            assert_eq!(
+                super::layer_major_this_prompt(&auto, wanted, n, holds),
+                want,
+                "auto: wanted={wanted} chunks={n} holds_every_block={holds}"
+            );
+        }
+        let forced = with(Some(true));
+        for (n, holds) in [(1, true), (1, false), (3, true)] {
+            assert!(
+                super::layer_major_this_prompt(&forced, true, n, holds),
+                "paging.layer_major = true forces it (chunks={n}, holds={holds})"
+            );
+        }
+        // `false` reaches here as not wanted (`layer_major_prefill` refuses it first).
+        assert!(!super::layer_major_this_prompt(
+            &with(Some(false)),
+            false,
+            3,
+            false
+        ));
     }
 
     /// **Drift guard (backlog B11), the rung half.** The shared `ubatch_candidates` ladder exists so

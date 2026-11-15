@@ -82,6 +82,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A streamed dense model whose cache holds every block no longer pays for
+  streaming it does not do** (Vulkan). Layer-major prefill now runs only for a
+  prompt of more than one chunk on a cache that cannot hold every block
+  (`paging.layer_major` still forces it either way; new
+  `Backend::dense_holds_every_block`), and the two arena barriers around a
+  streamed Linear's staging copy are recorded only when a copy is, not on every
+  hit. On the RX 7900 XTX, two interleaved rounds, host CPU load 0-7%:
+  ERNIE-4.5-0.3B F16 at `INFR_CACHE=1G` went from pp512 8505 / 8236 to 22614 /
+  22707 t/s (resident: 22763 / 22134) and tg128 from 357.5 / 358.3 to 385.3 /
+  383.4 (resident: 449.8 / 449.6); Qwen3-1.7B Q4_K_M at `INFR_CACHE=2G` from
+  pp512 4148 / 4226 to 7711 / 7666 and tg128 from 292.3 / 291.9 to 307.7 /
+  307.8. A 512-token prompt on an evicting cache, one chunk, gains the same way
+  (ERNIE at 512M: 6533 / 6676 to 21733 / 21903); evicting decode is unchanged.
+  Tokens are unchanged. New counters `VulkanBackend::static_executes` and
+  `arena_barriers` (also on the Vulkan session) show which path ran.
 - **A CPU model keeps its backend and bound weights between requests.**
   `SeamModel::generate_cpu`, `generate_cpu_constrained`, `generate_cpu_ids` and
   `bench` (so `infr run`/`infr serve`/`infr bench` with `--ngl 0`) used to build

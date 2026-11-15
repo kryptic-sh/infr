@@ -5630,12 +5630,42 @@ at the arena slot's address. What that slice did not do:
   (`ssm_conv1d`, `shortconv.conv`) and deepseek2's quantised `attn_k_b`/
   `attn_v_b` to f32. Small tensors; the estimate is low by their difference.
 - **The streamed path costs throughput even when every block is resident.**
-  ERNIE-4.5-0.3B F16 on the RX 7900 XTX at `INFR_CACHE=1G`, where all 108 blocks
-  have a slot: pp512 8509 t/s and tg128 358.1 t/s against 22508 and 449.7
-  resident (one run each, reps 3; host load not sampled for the capped run).
-  That is the streamed machinery itself (per-op staging, the arena barriers,
-  layer-major prefill), not float kernels — they are the resident ones — and it
-  is not diagnosed here.
+  Measured and split in `docs/plan/08-streamed-at-resident-speed.md` (step 0).
+  Steps 1 and 2 there landed on 2026-11-15: layer-major prefill now runs only
+  for a multi-chunk prompt on a cache that cannot hold every block, and the
+  arena barriers only around a staging copy. ERNIE-4.5-0.3B F16 on the RX 7900
+  XTX at `INFR_CACHE=1G` now prefills at the resident rate (pp512 22614 / 22707
+  against 22763 / 22134 resident) and decodes at 385.3 / 383.4 t/s against 449.8
+  / 449.6. What is left is the plan's remaining steps: decode replay for a
+  session that holds every block (the rest of ERNIE's decode gap, and 147 of
+  Qwen3-1.7B Q4_K_M's 171 t/s), the int8 K-quant GEMM for streamed prefill (the
+  whole remaining Qwen3 prefill gap, 7.7k against 12.1k), and a 24 t/s Qwen3
+  decode residue nothing measured so far explains. On the integrated GPU
+  (`Vulkan1`) Qwen3-1.7B's streamed decode is a third of resident with nothing
+  evicted (9.3 against 27.4 t/s at `INFR_CACHE=2G`) while ERNIE F16's is not
+  (36.4 against 37.6); not diagnosed, the streamed K-quant GEMV route is the
+  first suspect.
+- **The paged MoE path still records arena barriers on a hit.** Plan 08 step 2
+  made the dense pager record them only around a copy;
+  `adapter::execute_paged_moe` still records one before and one after every
+  paged `MoeFfn`'s staging, copy or not, so a wholly resident expert layer pays
+  two full barriers per forward. Not measured; applying the same rule there is a
+  possible later step.
+- **The arena-barrier change is checked by output, not by a validator.** The
+  streamed parity suites passed 5 times on `Vulkan0` and 3 on `Vulkan1` after
+  barriers went to copies only. Synchronization validation was tried
+  (`VK_LOADER_LAYERS_ENABLE=VK_LAYER_KHRONOS_validation` with
+  `VK_LAYER_VALIDATE_SYNC=1`, SDK 1.4.357) and logged no hazard, but it logged
+  none either with `INFR_NOBARRIER=1`, so it was not shown to be running and
+  proves nothing; it also cannot see the arena's pointer reads at all. A working
+  syncval recipe, checked against `INFR_NOBARRIER`, is still to find.
+- **A session whose cache holds every block still reserves the layer-major
+  activation.** `dense_stream_budget_at` holds `layer_major_act_bytes` back from
+  the arenas for every streamed session, because the arenas are sized before it
+  is known whether they will hold every block. A session that ends up holding
+  them never runs layer-major, so that reserve (`ctx * n_embd * 4` bytes) is
+  unused; at a borderline budget it can be what keeps the cache from holding
+  every block. Safe direction, not measured.
 - **Not verified:** a slot placed past 4 GiB of an arena (the base is a 64-bit
   host-computed address and the float kernels never add the slot position in
   u32, read in `DensePagerSession::stage`, but no test allocates such an arena);

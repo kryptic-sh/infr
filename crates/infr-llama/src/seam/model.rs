@@ -263,6 +263,18 @@ impl DenseVulkanSession {
     pub fn dense_pager_totals(&self) -> Option<infr_vulkan::pager::DenseTotals> {
         self.be.dense_pager_totals()
     }
+
+    /// Static (not replayed) executes this session's backend made
+    /// ([`infr_vulkan::VulkanBackend::static_executes`]) — how a test counts a prefill's spans.
+    pub fn static_executes(&self) -> u64 {
+        self.be.static_executes()
+    }
+
+    /// Arena barriers this session's backend recorded around staging copies
+    /// ([`infr_vulkan::VulkanBackend::arena_barriers`]).
+    pub fn arena_barriers(&self) -> u64 {
+        self.be.arena_barriers()
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]

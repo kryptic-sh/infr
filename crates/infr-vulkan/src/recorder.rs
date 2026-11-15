@@ -3496,8 +3496,8 @@ impl<'a> Recorder<'a> {
     /// descriptor set stays fully written — same convention as the MoE `-DPAGED` dispatch, which
     /// fills binding 0 with `lut`, not the giant arena (see [`Self::linear_native_id_paged`]). The
     /// ring→arena copy vs pointer-read hazard is ordered explicitly by
-    /// [`Self::arena_stream_barrier`] at the staging site (the pointer read is invisible to the
-    /// buffer hazard tracker).
+    /// [`Self::arena_stream_barrier`] around the copy at the staging site (the pointer read is
+    /// invisible to the buffer hazard tracker).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_at(
         &self,
@@ -9272,7 +9272,12 @@ impl<'a> Recorder<'a> {
     ///     (`SHADER_READ`) `TRANSFER`→`COMPUTE_SHADER`;
     ///   • WAR — a prior dispatch's arena read (`SHADER_READ`) completes before a later copy
     ///     overwrites that slot (`TRANSFER_WRITE`) `COMPUTE_SHADER`→`TRANSFER`.
-    /// Streaming is PCIe/residency-bound, so the extra barrier per staged block is noise.
+    /// It is a full compute/transfer barrier, so it also stops independent dispatches on either
+    /// side from overlapping. The dense pager records it only around a copy and never for a block
+    /// that is already resident (`pager::DensePagerSession::stage` argues why a hit needs none).
+    /// The paged MoE path (`adapter::execute_paged_moe`) still records one before and one after
+    /// each paged `MoeFfn`'s staging whether or not that staging copied anything, and
+    /// `MoePagerSession::stage_ready_fills` brackets the fills it admits.
     pub fn arena_stream_barrier(&self) {
         let mb = vk::MemoryBarrier::default()
             .src_access_mask(
@@ -9297,6 +9302,7 @@ impl<'a> Recorder<'a> {
             );
         }
         *self.barriers.borrow_mut() += 1;
+        self.be.note_arena_barrier();
     }
 
     /// Log the sampled token id into the chained-decode ring: `ring[params[0] & 63] = id[0]`.

@@ -668,6 +668,14 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Whether every dense streaming pool has a slot for each of its blocks, so the cache, once
+    /// filled, never evicts and each block is read off the tier below at most once per session.
+    /// A runner keys read-saving reorderings off this (layer-major prefill saves nothing then).
+    /// `false` whenever [`Backend::dense_paged`] is `false`.
+    fn dense_holds_every_block(&self) -> bool {
+        false
+    }
+
     /// Whether this backend honours [`crate::Op::DeltaNet`]'s `src_stride`: q/k/v read as
     /// per-row slices of ONE buffer instead of three packed ones. A runner emits the strided form
     /// only where this is true; a backend that ignored the stride would read k and v from q's

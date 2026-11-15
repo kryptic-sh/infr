@@ -5588,7 +5588,9 @@ pub(crate) fn generate_dense_backend_bound(
         // layer L before any chunk reaches L+1, so the model is swept ONCE per prompt at the same
         // chunk-sized dispatches (a taller chunk reaches the same I/O and bakes a submit long
         // enough to trip the GPU watchdog — see the chunk comment above). See
-        // `crate::seam::layer_major_prefill` for the gate and the measurement behind it.
+        // `crate::seam::layer_major_prefill` for the gate and the measurement behind it, and
+        // `crate::seam::layer_major_this_prompt` for why one chunk, or a cache that holds every
+        // block, keeps chunk-major.
         //
         // Correctness is the same causal argument either way: a chunk's attention reads its own
         // layer's KV rows for positions below its own, and chunks run in ASCENDING order inside
@@ -5596,12 +5598,6 @@ pub(crate) fn generate_dense_backend_bound(
         // SWA ring is untouched by the reorder — its bound is per layer and per dispatch
         // ("window + one chunk", see `kv_rows_at`), and each layer's ring still sees exactly the same
         // ascending sequence of writes it saw chunk-major.
-        let layer_major = crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b);
-        let spans: Vec<std::ops::Range<usize>> = if layer_major {
-            (0..c.n_layer).map(|l| l..l + 1).collect()
-        } else {
-            std::iter::once(0..c.n_layer).collect()
-        };
         let chunks: Vec<(usize, usize)> = {
             let mut v = Vec::new();
             let mut cs = start;
@@ -5611,6 +5607,17 @@ pub(crate) fn generate_dense_backend_bound(
                 cs = ce;
             }
             v
+        };
+        let layer_major = crate::seam::layer_major_this_prompt(
+            ec,
+            crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b),
+            chunks.len(),
+            be.dense_holds_every_block(),
+        );
+        let spans: Vec<std::ops::Range<usize>> = if layer_major {
+            (0..c.n_layer).map(|l| l..l + 1).collect()
+        } else {
+            std::iter::once(0..c.n_layer).collect()
         };
         // A chunk's uploaded inputs and its residual stream, materialized on first use and
         // dropped after the chunk's LAST span. Chunk-major (one span) therefore holds exactly one
@@ -6400,8 +6407,10 @@ pub(crate) fn generate_dense_backend_bound(
     if let Some(peak) = be.activation_peak() {
         let rows = crate::seam::ubatch_rows(ec);
         // Both halves of what a prefill holds live, so the comparison stays honest in either
-        // order: the per-chunk scratch, plus — layer-major only — the whole prompt's residual
-        // stream, which is exactly what the placement budgets were told to leave room for.
+        // order: the per-chunk scratch, plus — for a session that may prefill layer-major — the
+        // whole prompt's residual stream, which is exactly what the placement budgets were told
+        // to leave room for. A prompt that ran chunk-major anyway (one chunk, or a cache holding
+        // every block: `layer_major_this_prompt`) peaks below that, which is not an over-run.
         let reserved = crate::seam::dense_act_reserve_at(c, max_ctx, rows).saturating_add(
             if crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b) {
                 crate::seam::layer_major_act_bytes(c, max_ctx, rows)
@@ -7410,6 +7419,9 @@ mod tests {
         }
         fn dense_paged(&self) -> bool {
             self.vk.dense_paged()
+        }
+        fn dense_holds_every_block(&self) -> bool {
+            self.vk.dense_holds_every_block()
         }
     }
 

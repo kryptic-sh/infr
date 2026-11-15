@@ -15,6 +15,10 @@
 //! misses read the mapping, and one with a host arena under the VRAM one (`paging.dram`), so the
 //! float blocks are also read back off the model file.
 //!
+//! Two more tests pin what a streamed session that HOLDS every block skips: layer-major prefill
+//! (counted in static executes per prefill) and the arena barriers around staging copies (counted
+//! per forward), each against an evicting budget that still pays for them.
+//!
 //! ```text
 //! INFR_DEV=Vulkan0 cargo test -p infr-llama --release --test synthetic_float_stream -- --ignored
 //! ```
@@ -212,4 +216,159 @@ fn synthetic_f16_llama_streams_and_matches_resident() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn synthetic_f32_llama_streams_and_matches_resident() {
     check(Float::F32);
+}
+
+/// A dense cache far above this model's projections: what is left after the staging ring takes
+/// its share (`infr_core::pager::ring_bytes`) still gives every pool a slot per block. The tests
+/// assert it: no evictions at this budget.
+const HOLDS_ALL: u64 = 512 * 1024 * 1024;
+/// Below what `infr_core::pager::ring_bytes` takes for the ring, so the arenas get nothing and
+/// every pool runs at the seam's per-pool slot floor (where it builds each `DensePoolSpec`), below
+/// its block count. The tests assert it evicts.
+const EVICTS: u64 = 64 * 1024;
+
+/// A prompt of `n` tokens; its prefill is `n - 1` rows (the decode loop feeds the last one).
+fn prompt_of(n: usize, salt: usize) -> String {
+    (0..n)
+        .map(|i| token_text((i * 7 + 3 + salt) % VOCAB))
+        .collect()
+}
+
+fn load_at(tmp: &TempGguf, cache: Option<u64>, ubatch: usize) -> infr_llama::SeamModel {
+    load(tmp, |c| {
+        c.device.ubatch = Some(ubatch);
+        c.device.ubatch_specified = true;
+        if let Some(b) = cache {
+            c.paging.cache = Some(infr_core::SizeSpec::Bytes(b));
+            c.paging.dram = Some(infr_core::SizeSpec::Bytes(0));
+        }
+    })
+}
+
+/// Layer-major prefill runs only where it can save a read: several chunks over a cache that
+/// cannot hold every block. One chunk, or a cache with a slot per block, prefills chunk-major —
+/// one static execute per chunk — instead of one per (layer, chunk). Before that rule a streamed
+/// session always ran layer-major, so the first two cases made `N_LAYER` times their chunk count.
+/// Each case also generates the resident run's tokens at the same chunk height.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn synthetic_streamed_prefill_is_layer_major_only_where_it_saves_reads() {
+    let tmp = TempGguf::write("float-stream-layer-major", &llama(Float::F16));
+    const TOKENS: usize = 40;
+    let prompt = prompt_of(TOKENS, 0);
+    let rows = TOKENS - 1;
+    for (cache, ubatch, layer_major, what) in [
+        (
+            HOLDS_ALL,
+            64,
+            false,
+            "one chunk, a cache that holds every block",
+        ),
+        (
+            HOLDS_ALL,
+            16,
+            false,
+            "several chunks, a cache that holds every block",
+        ),
+        (EVICTS, 64, false, "one chunk, an evicting cache"),
+        (EVICTS, 16, true, "several chunks, an evicting cache"),
+    ] {
+        let chunks = rows.div_ceil(ubatch) as u64;
+        let want = if layer_major {
+            N_LAYER as u64 * chunks
+        } else {
+            chunks
+        };
+        let model = load_at(&tmp, Some(cache), ubatch);
+        let mut session = model.vulkan_session(256).expect("vulkan session");
+        // Every static execute comes from `Backend::execute`, and with `max_new = 0` the runner
+        // calls it only per prefill span: loading the weights and picking the slot upload
+        // without executing, and the decode loop stops before feeding the last prompt token.
+        let before = session.static_executes();
+        model
+            .generate_vulkan_session(&mut session, &prompt, 0, None, |_| {})
+            .expect("prefill");
+        let executes = session.static_executes() - before;
+        let t = session
+            .dense_pager_totals()
+            .unwrap_or_else(|| panic!("{what}: no weight streamed"));
+        println!("{what}: {executes} static executes, {t:?}");
+        assert_eq!(
+            t.vram.evictions == 0,
+            cache == HOLDS_ALL,
+            "{what}: the cache did not hold (or evict) as the case says ({t:?})"
+        );
+        assert_eq!(
+            executes, want,
+            "{what}: static executes per prefill ({chunks} chunks, {N_LAYER} layers)"
+        );
+
+        let (streamed, _) = generate(&model, &prompt);
+        let (resident, none) = generate(&load_at(&tmp, None, ubatch), &prompt);
+        assert!(none.is_none(), "{what}: the resident run streamed");
+        assert_eq!(streamed, resident, "{what}: diverged from the resident run");
+    }
+}
+
+/// The arena barriers bracket a staging COPY and nothing else: on a session that holds every
+/// block, a second generation (every block resident) records none, and on an evicting one each
+/// forward records exactly two per miss. Before that rule every streamed Linear recorded two, hit
+/// or miss, so both counts read twice the stagings instead.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn synthetic_streamed_arena_barriers_only_around_copies() {
+    let tmp = TempGguf::write("float-stream-barriers", &llama(Float::F16));
+    for (cache, what) in [
+        (HOLDS_ALL, "a cache that holds every block"),
+        (EVICTS, "an evicting cache"),
+    ] {
+        let model = load_at(&tmp, Some(cache), 64);
+        let mut session = model.vulkan_session(256).expect("vulkan session");
+        let mut run = |salt: usize| {
+            let b0 = session.arena_barriers();
+            let t0 = session.dense_pager_totals().unwrap_or_default();
+            model
+                .generate_vulkan_session(&mut session, &prompt_of(40, salt), N_GEN, None, |_| {})
+                .expect("vulkan generation");
+            let t = session
+                .dense_pager_totals()
+                .unwrap_or_else(|| panic!("{what}: no weight streamed"));
+            let barriers = session.arena_barriers() - b0;
+            let (hits, misses) = (t.vram.hits - t0.vram.hits, t.vram.misses - t0.vram.misses);
+            println!("{what}, run {salt}: {barriers} arena barriers, {hits} hits, {misses} misses");
+            (barriers, hits, misses, t)
+        };
+        let (first, _, first_misses, t) = run(0);
+        assert_eq!(
+            first,
+            2 * first_misses,
+            "{what}: the first generation records two barriers per copy"
+        );
+        let (second, hits, misses, t2) = run(1);
+        assert!(hits > 0, "{what}: the second generation hit nothing");
+        assert_eq!(
+            second,
+            2 * misses,
+            "{what}: the second generation records two barriers per copy and none per hit"
+        );
+        if cache == HOLDS_ALL {
+            // One miss per group: the seam numbers each pool's blocks from its own counter and
+            // registers each group once, so no two registered buffers share a block.
+            assert_eq!(
+                (first_misses, t.vram.evictions),
+                (t.groups as u64, 0),
+                "{what}: every block is staged exactly once"
+            );
+            assert_eq!(
+                (second, misses),
+                (0, 0),
+                "{what}: a session holding every block records no barrier once it is filled"
+            );
+        } else {
+            assert!(
+                misses > 0 && t2.vram.evictions > 0,
+                "{what}: the cap did not bite ({t2:?})"
+            );
+        }
+    }
 }

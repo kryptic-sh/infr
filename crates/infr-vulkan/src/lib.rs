@@ -396,6 +396,10 @@ struct VulkanShared {
     decode_recordings: AtomicU64,
     /// What the int8 coopmat K-quant prefill GEMM has recorded ([`VulkanBackend::i8cm_kq_counts`]).
     i8cm_kq_counts: [AtomicU64; 3],
+    /// `adapter::execute_static` calls ([`VulkanBackend::static_executes`]).
+    static_executes: AtomicU64,
+    /// Arena barriers recorded around pager staging copies ([`VulkanBackend::arena_barriers`]).
+    arena_barriers: AtomicU64,
     /// SUBMIT SPLITTER: the most dispatches `execute_static` will record into one command buffer
     /// before submitting it and opening the next (`0` = unlimited, never split).
     ///
@@ -1344,6 +1348,30 @@ impl VulkanBackend {
     /// cannot tell it from the others, so this is how a test sees which one ran.
     pub fn decode_recordings(&self) -> u64 {
         self.shared.decode_recordings.load(Ordering::Relaxed)
+    }
+
+    /// How many `adapter::execute_static` calls this backend has made since it was built. The
+    /// record-once decode replay also records op by op and is not counted. A layer-major prefill
+    /// makes one per (layer, chunk) and a chunk-major one one per chunk, which the output cannot
+    /// show, so this is how a test sees which order ran.
+    pub fn static_executes(&self) -> u64 {
+        self.shared.static_executes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_static_execute(&self) {
+        self.shared.static_executes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many arena barriers (`Recorder::arena_stream_barrier`) this backend has recorded since
+    /// it was built — the explicit ordering around a pager's staging copies into a pointer-read
+    /// arena, dense and MoE alike. A dense streaming forward records two per block it copies and
+    /// none for a block that is already resident.
+    pub fn arena_barriers(&self) -> u64 {
+        self.shared.arena_barriers.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_arena_barrier(&self) {
+        self.shared.arena_barriers.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether prefill Linears on Q4_K/Q5_K/Q6_K weights take the int8 cooperative-matrix GEMM
@@ -2704,6 +2732,8 @@ impl VulkanBackend {
                 act_peak: AtomicU64::new(0),
                 decode_recordings: AtomicU64::new(0),
                 i8cm_kq_counts: [const { AtomicU64::new(0) }; 3],
+                static_executes: AtomicU64::new(0),
+                arena_barriers: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
                 submit_split_disabled,
                 segment_ts_period,
@@ -4403,6 +4433,14 @@ impl Backend for VulkanBackend {
 
     fn dense_paged(&self) -> bool {
         self.dense_pager.lock().unwrap().is_some()
+    }
+
+    fn dense_holds_every_block(&self) -> bool {
+        self.dense_pager
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(crate::pager::DensePagerSession::holds_every_block)
     }
 
     /// Single-row DeltaNet has a strided build (`Recorder::deltanet_strided`); the adapter

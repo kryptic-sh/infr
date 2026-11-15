@@ -349,6 +349,12 @@ impl ParallelSeam {
         &self.model
     }
 
+    /// The backend every slot of this engine runs on — for its counters and test hooks
+    /// (`decode_recordings`, `dense_pager_totals`, `force_dense_epoch_move_after`).
+    pub fn backend(&self) -> &infr_vulkan::VulkanBackend {
+        &self.vk
+    }
+
     /// A fresh per-sequence context wired to this engine's baton — one per request.
     pub fn request_ctx(&self, sampling: crate::sampling::RequestSampling) -> RequestCtx {
         match &self.gate {

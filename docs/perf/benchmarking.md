@@ -95,15 +95,18 @@ is token-identical to the resident run. Embeddings, lm_head, norms and biases
 stay resident (lm_head is read at every token edge — streaming it adds its full
 bytes to every token's PCIe bill with zero locality to exploit). Placement is
 automatic (resident when everything fits — zero change); `INFR_CACHE=<size>`
-forces streaming with that budget. Honest expectations: prefill amortizes
-uploads across the whole batch (Qwen3-14B Q8_0, ~15.7 GB, at `INFR_CACHE=8g`:
-pp512 987 t/s vs 1505 resident = 0.66×); decode has no locality to exploit, so
-it is capped at PCIe_bw ÷ overflow_bytes per token — physics, not a bug (same
-setup: ~7.0 GB re-uploaded per token ÷ ~22 GB/s ≈ 3.1 t/s ceiling, measured 3.1
-t/s; the CPU backend does 4.4 t/s at that ~45% overflow, so streaming only beats
-CPU when the overflow is smaller — measured crossover on this box is around a
-quarter of the model overflowing). An MoE model whose DENSE part also doesn't
-fit is out of scope and errors clearly.
+forces streaming with that budget. A cache that holds every block decodes
+through the record-once replay like a resident model (re-recorded whenever a
+placement changes), so its decode steps stage nothing and `INFR_PAGER_STATS`
+counts no hits for them; one that evicts re-records every token. Honest
+expectations: prefill amortizes uploads across the whole batch (Qwen3-14B Q8_0,
+~15.7 GB, at `INFR_CACHE=8g`: pp512 987 t/s vs 1505 resident = 0.66×); decode
+has no locality to exploit, so it is capped at PCIe_bw ÷ overflow_bytes per
+token — physics, not a bug (same setup: ~7.0 GB re-uploaded per token ÷ ~22 GB/s
+≈ 3.1 t/s ceiling, measured 3.1 t/s; the CPU backend does 4.4 t/s at that ~45%
+overflow, so streaming only beats CPU when the overflow is smaller — measured
+crossover on this box is around a quarter of the model overflowing). An MoE
+model whose DENSE part also doesn't fit is out of scope and errors clearly.
 
 **Size grammar** — `paging.cache` / `INFR_CACHE` and `device.ctx` / `INFR_CTX` /
 `--ctx` share one value grammar (`infr_core::parse_size`): a plain number is the

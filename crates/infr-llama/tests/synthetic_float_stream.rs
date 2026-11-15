@@ -372,3 +372,254 @@ fn synthetic_streamed_arena_barriers_only_around_copies() {
         }
     }
 }
+
+/// What one greedy generation on a fresh session showed: its text, and how far the backend's
+/// counters moved (decode recordings, static executes, arena barriers) along with the dense
+/// cache's totals after it.
+struct Run {
+    text: String,
+    recordings: u64,
+    static_executes: u64,
+    barriers: u64,
+    totals: Option<infr_vulkan::pager::DenseTotals>,
+}
+
+/// Generate `N_GEN` tokens for `prompt` on a fresh session of `model`, moving the dense cache's
+/// placement epoch before the `epoch_move`th decode replay when that is `Some`.
+fn run(model: &infr_llama::SeamModel, prompt: &str, epoch_move: Option<u64>) -> Run {
+    let mut session = model.vulkan_session(256).expect("vulkan session");
+    let (r0, s0, b0) = (
+        session.decode_recordings(),
+        session.static_executes(),
+        session.arena_barriers(),
+    );
+    if let Some(n) = epoch_move {
+        session.force_dense_epoch_move_after(n);
+    }
+    let mut text = String::new();
+    model
+        .generate_vulkan_session(&mut session, prompt, N_GEN, None, |p| text.push_str(p))
+        .expect("vulkan generation");
+    Run {
+        text,
+        recordings: session.decode_recordings() - r0,
+        static_executes: session.static_executes() - s0,
+        barriers: session.arena_barriers() - b0,
+        totals: session.dense_pager_totals(),
+    }
+}
+
+/// `load_at` at the default chunk height, with the decode chain at `chain` steps (`0` = off) and
+/// the record-once replay off when `no_replay`.
+fn load_decode(
+    tmp: &TempGguf,
+    cache: Option<u64>,
+    chain: usize,
+    no_replay: bool,
+) -> infr_llama::SeamModel {
+    load(tmp, |c| {
+        c.spec.decode_chain = chain;
+        c.kernels.vulkan.no_replay = no_replay;
+        if let Some(b) = cache {
+            c.paging.cache = Some(infr_core::SizeSpec::Bytes(b));
+            c.paging.dram = Some(infr_core::SizeSpec::Bytes(0));
+        }
+    })
+}
+
+/// The default decode chain, and the chain off.
+const CHAINS: [usize; 2] = [8, 0];
+
+/// A streamed session that holds every block decodes from ONE record-once recording, as the
+/// resident path does, and one that evicts records none (it re-stages every token). The tokens
+/// are the resident run's in every case, and the streamed run's with the replay switched off.
+/// Before streamed sessions were admitted to the replay, the holding case recorded nothing.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn synthetic_streamed_decode_replays_while_every_block_is_held() {
+    for float in [Float::F16, Float::F32] {
+        let tmp = TempGguf::write(&format!("float-stream-replay-{float:?}"), &llama(float));
+        let prompt = prompt_of(40, 0);
+        for chain in CHAINS {
+            let what = |case: &str| format!("{float:?}, chain {chain}, {case}");
+            let resident = run(&load_decode(&tmp, None, chain, false), &prompt, None);
+            assert!(resident.totals.is_none(), "{}: streamed", what("resident"));
+            assert_eq!(resident.recordings, 1, "{}", what("resident"));
+            for (cache, no_replay, recordings, case) in [
+                (HOLDS_ALL, false, 1, "holding every block"),
+                (HOLDS_ALL, true, 0, "holding every block, replay off"),
+                (EVICTS, false, 0, "evicting"),
+            ] {
+                let streamed = run(
+                    &load_decode(&tmp, Some(cache), chain, no_replay),
+                    &prompt,
+                    None,
+                );
+                let t = streamed
+                    .totals
+                    .unwrap_or_else(|| panic!("{}: no weight streamed", what(case)));
+                println!(
+                    "{}: {} recordings, {} static executes, {t:?}",
+                    what(case),
+                    streamed.recordings,
+                    streamed.static_executes
+                );
+                assert_eq!(
+                    t.vram.evictions == 0,
+                    cache == HOLDS_ALL,
+                    "{}: the cache did not hold (or evict) as the case says",
+                    what(case)
+                );
+                assert_eq!(
+                    streamed.recordings,
+                    recordings,
+                    "{}: decode recordings",
+                    what(case)
+                );
+                assert_eq!(
+                    streamed.text,
+                    resident.text,
+                    "{}: diverged from the resident run",
+                    what(case)
+                );
+            }
+        }
+    }
+}
+
+/// A placement change mid-decode invalidates the recording: forcing the epoch to move before the
+/// second replay makes that replay record again (two recordings in all), and the tokens stay the
+/// resident run's. A replay that ignored the epoch would keep its one recording.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn synthetic_streamed_replay_records_again_when_placements_move() {
+    let tmp = TempGguf::write("float-stream-epoch", &llama(Float::F16));
+    let prompt = prompt_of(40, 0);
+    for chain in CHAINS {
+        let resident = run(&load_decode(&tmp, None, chain, false), &prompt, None);
+        let model = load_decode(&tmp, Some(HOLDS_ALL), chain, false);
+        let moved = run(&model, &prompt, Some(2));
+        println!("chain {chain}: {} recordings", moved.recordings);
+        assert_eq!(moved.recordings, 2, "chain {chain}: decode recordings");
+        assert_eq!(
+            moved.text, resident.text,
+            "chain {chain}: diverged from the resident run after the epoch moved"
+        );
+    }
+}
+
+/// A decode that starts on an empty cache, with no prefill before it (a one-token prompt), stages
+/// every streamed block in a pass of its own before recording: each block misses once, with two
+/// arena barriers per copy, no static execute runs, and the decode replays from one recording with
+/// the resident run's tokens. Without the staging pass the recording finds no resident block.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn synthetic_streamed_replay_stages_an_empty_cache_first() {
+    let tmp = TempGguf::write("float-stream-cold-replay", &llama(Float::F16));
+    let prompt = prompt_of(1, 0);
+    for chain in CHAINS {
+        let resident = run(&load_decode(&tmp, None, chain, false), &prompt, None);
+        let cold = run(
+            &load_decode(&tmp, Some(HOLDS_ALL), chain, false),
+            &prompt,
+            None,
+        );
+        let t = cold
+            .totals
+            .unwrap_or_else(|| panic!("chain {chain}: no weight streamed"));
+        println!(
+            "chain {chain}: {} recordings, {} static executes, {} barriers, {t:?}",
+            cold.recordings, cold.static_executes, cold.barriers
+        );
+        assert_eq!(
+            (t.vram.misses, t.vram.evictions),
+            (t.groups as u64, 0),
+            "chain {chain}: every block staged exactly once"
+        );
+        assert_eq!(
+            cold.static_executes, 0,
+            "chain {chain}: a static forward ran"
+        );
+        assert_eq!(
+            cold.barriers,
+            2 * t.vram.misses,
+            "chain {chain}: barriers per copy"
+        );
+        assert_eq!(cold.recordings, 1, "chain {chain}: decode recordings");
+        assert_eq!(
+            cold.text, resident.text,
+            "chain {chain}: diverged from the resident run"
+        );
+    }
+}
+
+/// Two sequences decoding at once on one `serve --parallel` engine whose streamed cache holds
+/// every block, while the placement epoch moves under them. Each must generate what it generates
+/// alone, and the move must make the recordings made before it be rebuilt, not replayed stale.
+///
+/// The engine's warmup (`ParallelSeam::new`) decodes a token first, so every block is staged
+/// before any request: under `serve --parallel` the cache is never empty when two sequences run,
+/// and the epoch then moves only on a taken-back or rolled-back placement. The forced move stands
+/// in for that. Counted per replay check over both sequences, so it lands between two checks
+/// while at least one sequence holds a recording made before it and has a check left: at least
+/// one rebuild, two when both are mid-decode.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn synthetic_streamed_parallel_sequences_rebuild_on_an_epoch_move() {
+    let tmp = TempGguf::write("float-stream-parallel", &llama(Float::F16));
+    let prompts = [prompt_of(40, 0), prompt_of(40, 5)];
+    // The move lands at this replay check: the second when chained (two checks per sequence), the
+    // sixth per token (twelve per sequence).
+    for (chain, move_at) in [(8usize, 2u64), (0, 6)] {
+        let serial: Vec<String> = prompts
+            .iter()
+            .map(|p| run(&load_decode(&tmp, Some(HOLDS_ALL), chain, false), p, None).text)
+            .collect();
+        assert_ne!(serial[0], serial[1], "the two prompts decode alike");
+        let engine = infr_llama::parallel::ParallelSeam::new(
+            load_decode(&tmp, Some(HOLDS_ALL), chain, false),
+            2,
+            None,
+        )
+        .expect("parallel engine");
+        let be = engine.backend();
+        let r0 = be.decode_recordings();
+        be.force_dense_epoch_move_after(move_at);
+        let greedy = infr_llama::sampling::RequestSampling {
+            temp: Some(0.0),
+            ..Default::default()
+        };
+        let texts: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = prompts
+                .iter()
+                .map(|p| {
+                    let req = engine.request_ctx(greedy.clone());
+                    let engine = &engine;
+                    s.spawn(move || {
+                        let mut text = String::new();
+                        engine
+                            .generate(p, N_GEN, None, &req, |piece| text.push_str(piece))
+                            .expect("parallel generation");
+                        text
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("sequence thread"))
+                .collect()
+        });
+        let recordings = be.decode_recordings() - r0;
+        let t = be.dense_pager_totals().expect("no weight streamed");
+        println!("chain {chain}: {recordings} recordings over two sequences, {t:?}");
+        assert_eq!(t.vram.evictions, 0, "chain {chain}: the cache did not hold");
+        assert!(
+            recordings >= 3,
+            "chain {chain}: {recordings} recordings — the epoch move rebuilt nothing"
+        );
+        assert_eq!(
+            texts, serial,
+            "chain {chain}: a concurrent sequence diverged from its serial run"
+        );
+    }
+}

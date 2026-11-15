@@ -5840,7 +5840,9 @@ pub(crate) fn generate_dense_backend_bound(
     // static walk decodes with live positions). INFR_SEAM_NO_REPLAY=1 forces the per-token path (INFR_PROF_OPS
     // per-op GPU timestamps work there; the replay path can't report them).
     let mirror_admits = !be.moe_paged()
-        && !be.dense_paged()
+        // A dense streaming cache replays only while it holds every block: one that evicts
+        // re-stages blocks into recycled slots every token, which a recording cannot follow.
+        && (!be.dense_paged() || be.dense_holds_every_block())
         && !ec.kernels.vulkan.no_replay
         // DiffusionGemma graphs opt out of the replay tape entirely (`Graph::no_decode_replay`,
         // set in `build` above).

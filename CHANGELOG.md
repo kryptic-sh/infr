@@ -85,6 +85,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A streamed dense model whose cache holds every block decodes through the
+  record-once replay and the decode chain** (Vulkan), as a resident one does,
+  instead of re-recording and waiting on every token. The recording bakes each
+  streamed weight's slot address and is recorded again whenever the dense
+  pager's new placement epoch (`DensePagerSession::placement_epoch`) moves; a
+  decode that starts on an empty cache stages its weights in a pass of its own
+  first. A cache that cannot hold every block keeps the per-token path. On the
+  RX 7900 XTX, two interleaved rounds, host CPU load 0-4% at all but one start:
+  Qwen3-1.7B Q4_K_M at `INFR_CACHE=2G` went from tg128 386.4 / 385.5 to 469.4 /
+  469.1 t/s (resident: 479.0 / 478.8), and ERNIE-4.5-0.3B F16 at `INFR_CACHE=1G`
+  from 384.7 / 384.8 to 444.3 / 444.2 (resident: 449.7 / 449.9); on the
+  integrated GPU (one round) Qwen3 went from 26.81 to 27.54 (resident 27.42).
+  Prefill, the evicting budgets and SmolLM3-3B (which does not replay) are
+  unchanged within noise. A replayed step stages nothing, so `paging.stats` and
+  `dense_pager_totals` no longer count hits for it. New
+  `VulkanBackend::force_dense_epoch_move_after` (a test hook) and
+  `ParallelSeam::backend`.
 - **A streamed quantised Linear runs the kernel its resident twin would**
   (Vulkan). Streamed dense weights had a routing of their own that left out the
   int8 K-quant coopmat GEMM, the multi-row GEMVs and every decode GEMV but the

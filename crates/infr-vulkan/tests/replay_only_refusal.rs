@@ -30,11 +30,13 @@ fn backend(no_replay: bool) -> Option<VulkanBackend> {
 }
 
 /// The single-token decode shape the replay path takes (rope + one attention row over an f16
-/// KV cache), built for replay when `replay_only`, and run once at position 0. Returns what
-/// `decode_replay_ready`, `execute` and `execute_chain` said.
+/// KV cache), built for replay when `replay_only`, opted out of replay (`Graph::no_decode_replay`)
+/// when `opt_out`, and run once at position 0. Returns what `decode_replay_ready`, `execute` and
+/// `execute_chain` said.
 fn run(
     be: &VulkanBackend,
     replay_only: bool,
+    opt_out: bool,
 ) -> (
     bool,
     infr_core::Result<()>,
@@ -44,6 +46,7 @@ fn run(
     let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
     let mut g = Graph::new();
     g.replay_only = replay_only;
+    g.no_decode_replay = opt_out;
     let x = g.input(f32d(nh * hd));
     let qw = g.weight(f32d(hd));
     let pos = g.input(TensorDesc::new(vec![1], DType::I32));
@@ -114,7 +117,7 @@ fn a_replay_only_plan_the_adapter_will_not_replay_is_refused() {
         return;
     };
     eprintln!("vulkan device: {}", be.capabilities().name);
-    let (ready, executed, chained) = run(&be, true);
+    let (ready, executed, chained) = run(&be, true, false);
     assert!(
         !ready,
         "no_replay is set, yet the plan reports it will replay"
@@ -134,7 +137,7 @@ fn a_replay_only_plan_the_adapter_will_not_replay_is_refused() {
 
     // The same graph, not built for replay, is an ordinary static decode at position 0: the
     // refusal is about the flag, not a fixture the static path cannot run.
-    let (ready, executed, chained) = run(&be, false);
+    let (ready, executed, chained) = run(&be, false, false);
     assert!(!ready);
     executed.expect("an ordinary graph must still run statically");
     assert!(chained
@@ -154,7 +157,7 @@ fn a_replay_only_plan_the_adapter_replays_runs() {
         return;
     };
     eprintln!("vulkan device: {}", be.capabilities().name);
-    let (ready, executed, chained) = run(&be, true);
+    let (ready, executed, chained) = run(&be, true, false);
     assert!(
         ready,
         "an eligible single-token decode must report it will replay"
@@ -167,4 +170,48 @@ fn a_replay_only_plan_the_adapter_replays_runs() {
         1,
         "the plan reported ready but the adapter did not record one replay for it"
     );
+}
+
+/// A dense streaming session whose cache holds every block replays, so when it refuses a
+/// replay-only plan the reason is the plan's own: here the graph opted out of replay. The refusal
+/// used to blame the streaming cache ("cannot hold every block"), which was false for this session
+/// and hid the real reason.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn a_streamed_session_that_holds_every_block_refuses_with_the_plans_reason() {
+    use infr_vulkan::pager::{DensePagerLayout, DensePoolSpec};
+    let Some(be) = backend(false) else {
+        return;
+    };
+    eprintln!("vulkan device: {}", be.capabilities().name);
+    let stride = infr_vulkan::linear::dense_stream_slot_stride(DType::F16, 4096);
+    be.init_dense_pager(DensePagerLayout {
+        pools: vec![DensePoolSpec {
+            dtype: DType::F16,
+            slot_bytes: stride,
+            n_slots: 2,
+            n_blocks: 2,
+            host: None,
+        }],
+        ring_bytes: 0,
+    })
+    .unwrap();
+    assert!(be.dense_paged() && be.dense_holds_every_block());
+    let (ready, executed, chained) = run(&be, true, true);
+    assert!(!ready, "an opted-out plan reports it will replay");
+    for err in [
+        executed.expect_err("a replay-only plan ran statically"),
+        chained.expect_err("execute_chain declined a replay-only plan instead of refusing it"),
+    ] {
+        let err = err.to_string();
+        eprintln!("refused: {err}");
+        assert!(
+            err.contains("Graph::no_decode_replay"),
+            "the refusal must give the plan's reason: {err}"
+        );
+        assert!(
+            !err.contains("cannot hold every block"),
+            "the refusal blames a cache that holds every block: {err}"
+        );
+    }
 }

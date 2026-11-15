@@ -124,6 +124,8 @@ pub struct GpuPager {
     /// Blocks admitted by [`Self::fill_staged`] — into a free slot, with nothing routed to them —
     /// since construction. Each is also one of the pager's misses.
     fills: u64,
+    /// Placement changes since construction (see [`Self::placements`]).
+    placements: u64,
 }
 
 impl GpuPager {
@@ -166,6 +168,7 @@ impl GpuPager {
             staged: Vec::new(),
             staged_serial: None,
             fills: 0,
+            placements: 0,
         })
     }
 
@@ -192,6 +195,15 @@ impl GpuPager {
         self.fills
     }
 
+    /// How many times a block was placed in a slot or taken out of one since construction: every
+    /// miss that placed its block (and the eviction it made), every miss rolled back because its
+    /// bytes could not be produced, and every placement [`Self::forget_unsubmitted`] took back. A
+    /// hit changes nothing and does not count. Two equal readings mean every block resident at
+    /// the first is still resident in the same slot at the second.
+    pub fn placements(&self) -> u64 {
+        self.placements
+    }
+
     /// Record this arena's residency calls into `file` (`paging.trace`). Call it before the first
     /// touch — see [`Pager::trace_to`].
     pub fn trace_to(&mut self, file: &Arc<TraceFile>, info: PoolInfo) -> Result<()> {
@@ -216,6 +228,11 @@ impl GpuPager {
     /// whole layer is resident).
     pub fn is_resident(&self, id: BlockId) -> bool {
         self.pager.slot_of(id).is_some()
+    }
+
+    /// The slot `id` is resident in, with no mutation and no stats; `None` when it is absent.
+    pub fn resident_slot(&self, id: BlockId) -> Option<u32> {
+        self.pager.slot_of(id)
     }
 
     /// Group this arena's blocks into runs of `len` (an MoE pool: one layer's experts) — see
@@ -375,6 +392,7 @@ impl GpuPager {
     fn record_placement(&mut self, id: BlockId, slot: u32, evicted: Option<u32>) {
         apply_placement(&mut self.lut_host, id, slot, evicted);
         self.lut_dirty = true;
+        self.placements += 1;
     }
 
     /// Produce a miss's bytes with `fill`, or take the miss back if that fails.
@@ -402,6 +420,7 @@ impl GpuPager {
             self.pager.evict(id);
             apply_placement(&mut self.lut_host, id, NOT_RESIDENT, evicted);
             self.lut_dirty = true;
+            self.placements += 1;
         })
     }
 
@@ -437,6 +456,7 @@ impl GpuPager {
             if self.pager.evict(id).is_some() {
                 apply_placement(&mut self.lut_host, id, NOT_RESIDENT, None);
                 self.lut_dirty = true;
+                self.placements += 1;
             }
         }
         self.staged_serial = None;
@@ -2147,6 +2167,15 @@ struct DensePool {
     pager: GpuPager,
 }
 
+impl DensePool {
+    /// Slot `slot`'s base BYTE address: arena base + `slot * slot_bytes`, in 64-bit (the BDA
+    /// arena's `arena_addr()`; the streamed kernel dereferences this pointer). No cap: the multiply
+    /// and the address are 64-bit, so an arena of any size the VRAM budget allows is addressable.
+    fn slot_addr(&self, slot: u32) -> u64 {
+        self.pager.arena_addr() + slot as u64 * self.spec.slot_bytes as u64
+    }
+}
+
 /// Layout for [`DensePagerSession::new`] — like [`MoePagerLayout`], sized up front so the session
 /// exists (and `Backend::dense_paged` answers truthy) BEFORE the seam's weight-load closure binds
 /// the first placeholder.
@@ -2172,6 +2201,8 @@ pub struct DensePagerSession {
     print_stats: bool,
     /// Whether a `paging.trace` write failure was already reported (see [`flush_traces`]).
     trace_failure_reported: bool,
+    /// Epoch moves forced by [`Self::force_epoch_move`], added into [`Self::placement_epoch`].
+    forced_epoch_moves: u64,
 }
 
 impl DensePagerSession {
@@ -2250,7 +2281,37 @@ impl DensePagerSession {
             ring_half_bytes,
             print_stats: vk.cfg().paging.stats,
             trace_failure_reported: false,
+            forced_epoch_moves: 0,
         })
+    }
+
+    /// The placement epoch: it moves whenever any pool places a block in a slot or takes one out
+    /// ([`GpuPager::placements`], summed over the pools), and on [`Self::force_epoch_move`]. A
+    /// recording that bakes slot addresses ([`Self::resident_addr`]) is valid exactly while this
+    /// reads what it read when the addresses were taken.
+    pub fn placement_epoch(&self) -> u64 {
+        self.pools.iter().map(|p| p.pager.placements()).sum::<u64>() + self.forced_epoch_moves
+    }
+
+    /// Move [`Self::placement_epoch`] without changing any placement — a test's way to make a
+    /// recording that baked slot addresses stale while every block stays where it was.
+    pub fn force_epoch_move(&mut self) {
+        self.forced_epoch_moves += 1;
+    }
+
+    /// The arena BYTE address `buf_id`'s block is resident at, or `None` when it is not resident.
+    /// No mutation: no recency, no counters, no trace (contrast [`Self::stage`]). An error for a
+    /// buffer that is not a registered streamed block.
+    pub fn resident_addr(&self, buf_id: usize) -> Result<Option<u64>> {
+        let (pool_idx, src) = self
+            .sources
+            .get(&buf_id)
+            .ok_or_else(|| be("dense pager: address of an unregistered buffer"))?;
+        let pool = &self.pools[*pool_idx];
+        Ok(pool
+            .pager
+            .resident_slot(src.block_id)
+            .map(|slot| pool.slot_addr(slot)))
     }
 
     /// Register one streamed block — called from the seam's weight-load closure (once per
@@ -2338,16 +2399,22 @@ impl DensePagerSession {
     /// [`crate::recorder::Recorder::arena_stream_barrier`]s, and a hit records none:
     ///
     /// - A pipeline barrier orders every command before it in submission order against every
-    ///   command after it, across command buffers and submits on the backend's one queue. What
-    ///   makes recording order the submission order for the arena's commands: `execute_static`
-    ///   submits each segment before opening the next and ends with a blocking submit, and the
-    ///   paged paths never replay a recording. Other submits reach the same queue in between
-    ///   (scratch zero-fills, uploads, the positions readback fallback) but none of them reads or
-    ///   writes a dense arena; nothing outside this fn writes one. Two forwards never interleave
-    ///   their recordings: the backend holds no lock across an execute, so the caller serialises
-    ///   them, a session by `&mut`, and `serve --parallel` by its step baton
-    ///   (`RequestCtx::gate_pass`), held across each whole execute (a prefill chunk or a decode
-    ///   step). The session mutex is held only for one `stage` call.
+    ///   command after it, across command buffers and submits on the backend's one queue. Arena
+    ///   commands reach the queue in two ways. A static forward (`adapter::execute_static`, and
+    ///   `adapter::stage_for_replay`, which records only copies) submits each segment before
+    ///   opening the next and ends with a blocking submit, so its recording order is its
+    ///   submission order. A decode replay (`adapter::current_replay`) records no copy, only
+    ///   reads, and is covered by the last item below. Other submits reach the same queue in
+    ///   between (scratch zero-fills, uploads, the positions readback fallback) but none of them
+    ///   reads or writes a dense arena; nothing outside this fn writes one. Two forwards never
+    ///   interleave their recordings, and that is the caller's to guarantee: the backend does not
+    ///   serialise executes itself, so a session does it by `&mut`, and `serve --parallel` by its
+    ///   step baton (`RequestCtx::gate_pass`), held across each whole execute (a prefill chunk, a
+    ///   decode step or a chained chunk). This session's mutex is no substitute: a static forward
+    ///   holds it only for one `stage` call, so another thread could see a block placed whose copy
+    ///   is recorded but not yet submitted. A replay holds it from its epoch check to its
+    ///   completion (last item), which keeps `stage` calls out of that window but cannot make an
+    ///   unsubmitted copy visible.
     /// - RAW: the barrier after a copy is recorded into the same recorder before this returns, and
     ///   segments are cut only between ops, so no cut can fall between a copy and its barrier.
     ///   Every dispatch that reads the slot's current bytes is recorded after that barrier: the
@@ -2360,6 +2427,27 @@ impl DensePagerSession {
     /// - WAW: a second copy into a slot is after the first copy's own trailing barrier.
     /// - A copy in a recording that is discarded never runs; [`Self::forget_unsubmitted`] takes its
     ///   placement back, so no later hit relies on it.
+    /// - A replayed decode recording is made only for a session that holds every block, and bakes
+    ///   the slot addresses [`Self::resident_addr`] gave it together with the
+    ///   [`Self::placement_epoch`] they were read at. RAW: each block it reads was resident when
+    ///   it was recorded, so that block's copy and its trailing barrier went into a static forward
+    ///   or the staging pass, and that forward had ended with its blocking submit before the
+    ///   recording was made (executes are serialised, above, and a copy whose recording was
+    ///   discarded or failed to submit is taken back, which moves the epoch). The barrier is
+    ///   therefore earlier in submission order than every replay, and its second scope
+    ///   (`COMPUTE_SHADER`, `SHADER_READ`) covers the replay's pointer reads, so a replay needs
+    ///   no barrier of its own for the arena: the leading global barrier a GPU-position recording
+    ///   opens with is not what orders it, and a recording made with `INFR_NO_GPU_POS`, which has
+    ///   none, is ordered the same way. WAR: holding every block, a miss copies only into a free
+    ///   slot, and a slot a recording reads is not free while its block stays placed. A block
+    ///   leaves its slot only through a placement change ([`Self::forget_unsubmitted`] or a
+    ///   rolled-back miss), which moves the epoch. The adapter reads the epoch under this
+    ///   session's lock immediately before every replay submit, re-records if it moved, and holds
+    ///   the lock until the replay has completed, so no `stage` can run between the check and the
+    ///   end of the replay, whichever sequence of `serve --parallel` it stages for. A replay whose
+    ///   submit fails part-way first waits for the segments it did submit
+    ///   (`RecordedCmd::replay`); one whose wait fails has lost the device, which runs nothing
+    ///   more.
     ///
     /// The barrier is a full compute/transfer one, so recording it on a hit as well would also
     /// serialise independent dispatches the hazard tracker lets overlap, for no ordering gained.
@@ -2406,18 +2494,15 @@ impl DensePagerSession {
             // RAW: the copy before every later dispatch that reads the slot (see the fn doc).
             rec.arena_stream_barrier();
         }
-        // Slot base BYTE address = arena base + slot * slot_bytes, in 64-bit (the BDA arena's
-        // `arena_addr()`; the streamed kernel dereferences this pointer). No cap: the multiply and
-        // the address are 64-bit, so an arena of any size the VRAM budget allows is addressable.
-        let addr = pool.pager.arena_addr() + slot as u64 * pool.spec.slot_bytes as u64;
-        Ok(Some(addr))
+        Ok(Some(pool.slot_addr(slot)))
     }
 
     pub fn ring_half_bytes(&self) -> usize {
         self.ring_half_bytes
     }
 
-    /// Per-pool `(VRAM residency, host tier)` counters, in pool order.
+    /// Per-pool `(VRAM residency, host tier)` counters, in pool order. Replayed decode steps are
+    /// not in them (see [`Self::print_stats_if_enabled`]).
     ///
     /// The host half is what separates a VRAM miss the DRAM tier absorbed from one that reached the
     /// disk — the two are indistinguishable in every other number this session reports, and a
@@ -2441,6 +2526,11 @@ impl DensePagerSession {
     /// `paging.stats` (`INFR_PAGER_STATS=1`): per-pool hit/miss/eviction counters (cyclic-sweep
     /// hit rate = `(n_slots-1) / n_blocks` per pass at steady state — the honest expectation to
     /// check against).
+    ///
+    /// The counters count [`Self::stage`] calls, so they cover static forwards (prefill, and every
+    /// decode step of a session that cannot hold every block) and the staging pass before a decode
+    /// recording. A replayed decode step makes no `stage` call and counts nothing: on a session
+    /// that holds every block, decode adds no hits once it replays.
     pub fn print_stats_if_enabled(&self) {
         if !self.print_stats {
             return;
@@ -2548,6 +2638,144 @@ mod tests {
         rec.finish().unwrap();
         assert!(sess.all_resident(buf_id, n_expert));
         assert_eq!(sess.stats(Role::Gate).misses, 5, "0, 1, 2, then 3 twice");
+    }
+
+    /// Every placement change moves the dense placement epoch, and a hit does not: a miss into a
+    /// free slot, a miss that evicts, a miss whose bytes fail (rolled back, its victim staying
+    /// evicted) and a placement taken back from a discarded recording. A decode replay bakes slot
+    /// addresses and trusts them exactly while the epoch stands still, so each of these is a case
+    /// where a stale recording would read the wrong bytes.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn every_placement_change_moves_the_dense_epoch() {
+        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
+        let Ok(be) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        /// The tier below: every block's bytes are produced except the one it names.
+        struct FailOn(BlockId);
+        impl BlockIo for FailOn {
+            fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+                if desc.id == self.0 {
+                    return Err(infr_core::error::Error::backend(format!(
+                        "injected read failure on block {}",
+                        desc.id
+                    )));
+                }
+                dst[..desc.nbytes()].fill(desc.id as u8 + 1);
+                Ok(())
+            }
+        }
+        let stride = crate::linear::dense_stream_slot_stride(infr_core::DType::F32, 4096);
+        // Pool 0 holds its three blocks; pool 1 has two slots for four, read through a host tier
+        // that fails block 3.
+        let host = Arc::new(HostPager::new(4, stride, Arc::new(FailOn(3))).unwrap());
+        for id in 0..4 {
+            host.register(BlockDesc {
+                id,
+                extents: vec![BlockExtent {
+                    offset: id as u64 * stride as u64,
+                    len: stride,
+                }],
+            })
+            .unwrap();
+        }
+        let spec = |n_slots, n_blocks, host| DensePoolSpec {
+            dtype: infr_core::DType::F32,
+            slot_bytes: stride,
+            n_slots,
+            n_blocks,
+            host,
+        };
+        let mut sess = DensePagerSession::new(
+            &be,
+            DensePagerLayout {
+                pools: vec![spec(3, 3, None), spec(2, 4, Some(host))],
+                ring_bytes: 4 * stride,
+            },
+        )
+        .unwrap();
+        // Buffer identities are opaque keys to the session; small integers will do.
+        let held = |b: usize| 100 + b;
+        let evicting = |b: usize| 200 + b;
+        for b in 0..3u32 {
+            let bytes = DenseBytes::Mmap(vec![
+                Arc::new(vec![b as u8; stride]) as Arc<dyn AsRef<[u8]> + Send + Sync>
+            ]);
+            let source = DenseSource { bytes, block_id: b };
+            sess.register(0, held(b as usize), source).unwrap();
+        }
+        for b in 0..4u32 {
+            let source = DenseSource {
+                bytes: DenseBytes::Host,
+                block_id: b,
+            };
+            sess.register(1, evicting(b as usize), source).unwrap();
+        }
+        // Stage `buf_id` in a recording of its own and submit it.
+        let stage = |sess: &mut DensePagerSession, buf_id: usize| {
+            let rec = be.recorder().unwrap();
+            let mut cursor = 0;
+            let staged = sess.stage(&rec, 0, &mut cursor, buf_id);
+            rec.finish().unwrap();
+            staged.map(|addr| addr.expect("a ring half holds one slot"))
+        };
+
+        let e = sess.placement_epoch();
+        stage(&mut sess, held(0)).unwrap();
+        let after_miss = sess.placement_epoch();
+        assert_ne!(
+            after_miss, e,
+            "a miss into a free slot did not move the epoch"
+        );
+        stage(&mut sess, held(0)).unwrap();
+        assert_eq!(sess.placement_epoch(), after_miss, "a hit moved the epoch");
+
+        // A placement whose recording is discarded is taken back.
+        let rec = be.recorder().unwrap();
+        let mut cursor = 0;
+        sess.stage(&rec, 0, &mut cursor, held(1)).unwrap();
+        let before_forget = sess.placement_epoch();
+        sess.forget_unsubmitted(rec.serial());
+        rec.discard().unwrap();
+        assert_ne!(
+            sess.placement_epoch(),
+            before_forget,
+            "taking back an unsubmitted placement did not move the epoch"
+        );
+
+        // Pool 1 fills its two slots, then block 2 evicts one of them.
+        stage(&mut sess, evicting(0)).unwrap();
+        stage(&mut sess, evicting(1)).unwrap();
+        let before_evict = sess.placement_epoch();
+        stage(&mut sess, evicting(2)).unwrap();
+        assert_eq!(sess.pool_stats()[1].0.evictions, 1, "block 2 did not evict");
+        assert_ne!(
+            sess.placement_epoch(),
+            before_evict,
+            "an evicting miss did not move the epoch"
+        );
+        // Block 3's bytes fail: its miss evicts a block and is rolled back, so the victim is gone
+        // and nothing took its slot.
+        let resident = |sess: &DensePagerSession| {
+            (0..3)
+                .filter(|&b| sess.resident_addr(evicting(b)).unwrap().is_some())
+                .count()
+        };
+        assert_eq!(resident(&sess), 2);
+        let before_rollback = sess.placement_epoch();
+        assert!(stage(&mut sess, evicting(3)).is_err());
+        assert_eq!(
+            resident(&sess),
+            1,
+            "the failed miss did not evict its victim"
+        );
+        assert_eq!(sess.resident_addr(evicting(3)).unwrap(), None);
+        assert_ne!(
+            sess.placement_epoch(),
+            before_rollback,
+            "a rolled-back miss that evicted a block did not move the epoch"
+        );
     }
 
     // ── #4: GpuPager::new dimension validation returns Err (not panic) on bad input ──────────────

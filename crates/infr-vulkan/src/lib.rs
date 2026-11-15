@@ -394,6 +394,9 @@ struct VulkanShared {
     /// Record-once decode recordings made since this backend was built
     /// ([`VulkanBackend::decode_recordings`]).
     decode_recordings: AtomicU64,
+    /// Countdown to a forced dense placement-epoch move
+    /// ([`VulkanBackend::force_dense_epoch_move_after`]); `0` = none pending.
+    dense_epoch_move_in: AtomicU64,
     /// What the int8 coopmat K-quant prefill GEMM has recorded ([`VulkanBackend::i8cm_kq_counts`]).
     i8cm_kq_counts: [AtomicU64; 3],
     /// What the multi-row GEMVs and the dp4a K-quant GEMM have recorded
@@ -1351,6 +1354,24 @@ impl VulkanBackend {
     /// cannot tell it from the others, so this is how a test sees which one ran.
     pub fn decode_recordings(&self) -> u64 {
         self.shared.decode_recordings.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: move the dense streaming session's placement epoch
+    /// (`pager::DensePagerSession::placement_epoch`) just before the `n`th decode replay from now
+    /// checks it (`n >= 1`; `0` cancels a pending move). Nothing is re-placed, so a correct
+    /// replay re-records once and decodes the same tokens; [`Self::decode_recordings`] shows the
+    /// second recording. A backend that does not replay a streamed decode never counts down.
+    pub fn force_dense_epoch_move_after(&self, n: u64) {
+        self.shared.dense_epoch_move_in.store(n, Ordering::Relaxed);
+    }
+
+    /// Count one decode replay down toward [`Self::force_dense_epoch_move_after`]'s move: `true`
+    /// for the one that reaches it.
+    pub(crate) fn take_dense_epoch_move(&self) -> bool {
+        self.shared
+            .dense_epoch_move_in
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok_and(|was| was == 1)
     }
 
     /// How many `adapter::execute_static` calls this backend has made since it was built. The
@@ -2757,6 +2778,7 @@ impl VulkanBackend {
                 act_live: AtomicU64::new(0),
                 act_peak: AtomicU64::new(0),
                 decode_recordings: AtomicU64::new(0),
+                dense_epoch_move_in: AtomicU64::new(0),
                 i8cm_kq_counts: [const { AtomicU64::new(0) }; 3],
                 linear_tier_counts: [const { AtomicU64::new(0) }; 3],
                 static_executes: AtomicU64::new(0),
@@ -3159,7 +3181,8 @@ impl VulkanBackend {
     }
 
     /// [`Self::moe_pager_totals`]'s dense twin: the dense layer-streaming session's counters summed
-    /// over every pool — or `None` when no weight of the loaded model streams.
+    /// over every pool — or `None` when no weight of the loaded model streams. A replayed decode
+    /// step stages nothing and is not counted (see `pager::DensePagerSession::pool_stats`).
     pub fn dense_pager_totals(&self) -> Option<crate::pager::DenseTotals> {
         let guard = self.dense_pager.lock().unwrap();
         let sess = guard.as_ref()?;

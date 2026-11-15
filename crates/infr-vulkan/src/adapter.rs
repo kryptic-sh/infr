@@ -75,6 +75,10 @@ struct DecodeReplay {
     /// recorded descriptors still point at those buffers, so a replay with any of them rebound is
     /// not replayed: the recording is dropped and rebuilt against the new bindings.
     bound: Vec<(TensorId, BoundId)>,
+    /// The dense streaming session's placement epoch the recording's streamed weight addresses were
+    /// read at ([`StreamedSlots::epoch`]); `None` when no weight streams. A replay checks it first
+    /// (see [`current_replay`]).
+    epoch: Option<u64>,
     /// Transient GEMM/attention scratch the recording references. Empty for an eligible decode (all
     /// ops are GEMV/silu/dyn kernels with no transient), held anyway so a stray one can't dangle.
     _transient: Vec<Box<dyn Buffer>>,
@@ -1375,8 +1379,8 @@ fn lower_op(
     // other op — and every non-streamed model — passes `None` (zero change). Only the
     // `Op::Linear` arm reads it; the seam's placement admits only `linear::dense_stream_supported`
     // dtypes, and a streamed weight never takes the fused-residual peephole (filtered by
-    // `execute_static` before the loop). An F16/F32 weight runs `float_linear` — the resident
-    // float dispatch — at the slot address.
+    // `unfuse_streamed_adds` before the loop, on both paths). An F16/F32 weight runs
+    // `float_linear` — the resident float dispatch — at the slot address.
     wsub: Option<u64>,
 ) -> Result<()> {
     let memo_prev = mmv_memo.take();
@@ -4769,9 +4773,17 @@ fn hyper_check_hc(hc: u32, what: &str) -> Result<()> {
 }
 
 /// Does `execute` replay `plan`, rather than record it statically each call? The plan's own
-/// eligibility, unless a paged model forces the static path (see [`execute`]).
+/// eligibility, unless a pager forces the static path (see [`execute`]): a paged MoE model always,
+/// a dense streaming one whose cache cannot hold every block.
 fn replays(be_: &VulkanBackend, plan: &VkDecodePlan) -> bool {
-    plan.eligible && !be_.moe_paged() && !be_.dense_paged()
+    plan.eligible
+        && !be_.moe_paged()
+        && be_
+            .dense_pager()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(crate::pager::DensePagerSession::holds_every_block)
 }
 
 /// `Backend::decode_replay_ready`: the decision [`execute`] will make for `plan`, read off the
@@ -4790,15 +4802,18 @@ fn refuse_replay_only(be_: &VulkanBackend, plan: &VkDecodePlan) -> Result<()> {
     if !plan.graph.replay_only {
         return Ok(());
     }
-    let why = if be_.moe_paged() {
-        "the loaded model pages its MoE experts".to_string()
-    } else if be_.dense_paged() {
-        "the loaded model streams its dense layers".to_string()
-    } else {
+    // The terms of `replays`, in its order: the plan's own eligibility first, so a session that
+    // could replay but holds an ineligible graph is told why the graph is ineligible.
+    let why = if !plan.eligible {
         decode_refusal(be_, &plan.graph).map_or_else(
             || "the plan was compiled ineligible".to_string(),
             |why| why.to_string(),
         )
+    } else if be_.moe_paged() {
+        "the loaded model pages its MoE experts".to_string()
+    } else {
+        "the loaded model streams its dense layers through a cache that cannot hold every block"
+            .to_string()
     };
     Err(be(format!(
         "vulkan adapter: refusing to run a graph built for record-once decode replay \
@@ -4821,9 +4836,10 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     // hands this a replay-only graph it will not replay; one that did not ask gets the error from
     // `refuse_replay_only` rather than a static run at the baked position.
     // Dense layer streaming forces the static path for a different reason than MoE (no readback
-    // exists — layer order is deterministic — but the per-token ring staging + per-slot weight
-    // offsets can't live inside a record-once tape whose descriptor sets and push constants are
-    // frozen at record time).
+    // exists — layer order is deterministic): a cache that cannot hold every block re-stages
+    // blocks into recycled slots every token, which a record-once tape with its slot addresses
+    // frozen at record time cannot follow. A cache that holds every block never moves a block once
+    // it is placed, so it replays (see `current_replay`).
     if !replays(be_, plan) {
         refuse_replay_only(be_, plan)?;
         return execute_static(be_, &plan.graph, bindings);
@@ -4840,9 +4856,8 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     {
         *guard = None;
     }
-    if guard.is_none() {
-        *guard = Some(record_decode_replay(be_, &plan.graph, bindings)?);
-    }
+    // Held until the replay below has completed (see `current_replay`).
+    let _placements = current_replay(be_, &plan.graph, bindings, &mut guard)?;
     let replay = guard.as_ref().unwrap();
     if !replay.self_advancing {
         // Host fallback (INFR_NO_GPU_POS): pos from positions[0] (decode rows=1); kv_len = pos+1.
@@ -4892,9 +4907,9 @@ pub(crate) fn execute_chain(
         *guard = None;
         return Ok(None);
     }
-    if guard.is_none() {
-        *guard = Some(record_decode_replay(be_, &plan.graph, bindings)?);
-    }
+    // Held until the chain below has completed (see `current_replay`). A recording made here reads
+    // its first position from the positions buffer, which the caller writes before every chain.
+    let _placements = current_replay(be_, &plan.graph, bindings, &mut guard)?;
     let replay = guard.as_ref().unwrap();
     let (true, Some(ring)) = (replay.self_advancing, replay.ring.as_ref()) else {
         return Ok(None);
@@ -4928,15 +4943,180 @@ pub(crate) fn execute_chain(
     Ok(Some(ids))
 }
 
+/// The slot addresses a decode recording reads its streamed weights at
+/// ([`record_decode_replay`]'s `slots`), and the placement epoch they were taken at.
+struct StreamedSlots {
+    /// `DensePagerSession::placement_epoch` when the addresses were read.
+    epoch: u64,
+    /// `buffer_identity(weight)` → its slot's arena byte address, for every streamed Linear weight
+    /// of the graph.
+    addrs: HashMap<usize, u64>,
+}
+
+/// The dense session's lock, held by a replay from its epoch check until it has completed.
+type PlacementGuard<'a> = std::sync::MutexGuard<'a, Option<crate::pager::DensePagerSession>>;
+
+/// How many times [`current_replay`] re-reads the placements before it gives up: a stale or
+/// missing recording takes a staging pass, a recording, and the check that accepts it.
+const REPLAY_PREPARE_ATTEMPTS: usize = 4;
+
+/// Leave in `guard` a recording of `graph` that is valid for the current weight placements, making
+/// one if there is none, and return the dense session's lock for the caller to hold across the
+/// replay's submit and wait (`None` when no weight streams, and nothing to hold).
+///
+/// A dense streaming session reaches here only while its cache holds every block ([`replays`]).
+/// The recording bakes each streamed weight's slot address, which stays right only while no
+/// placement changes, so it carries the session's placement epoch and is checked against it, under
+/// the session's lock, before every submit: a moved epoch drops it and records again, as a rebound
+/// buffer does. Holding that lock until the replay completes is what keeps any `stage` call, for
+/// this sequence or another, from landing between the check and the replay (the ordering argument
+/// is on `DensePagerSession::stage`). Holding every block, nothing is ever evicted, so the epoch
+/// moves only when a block is first placed or a placement is taken back.
+///
+/// Before recording, every streamed weight of the graph that is not resident yet (a decode that
+/// starts on an empty cache, with no prefill before it) is staged in a forward of its own
+/// ([`stage_for_replay`]); the addresses are then read without touching the pager.
+///
+/// A replayed step calls no `stage`, so it moves no recency and counts no hit. Recency decides
+/// nothing while every block has a slot (there is no victim to choose), and the counters say what
+/// they cover (`DensePagerSession::print_stats_if_enabled`).
+fn current_replay<'a>(
+    be_: &'a VulkanBackend,
+    graph: &Graph,
+    bindings: &Bindings,
+    guard: &mut Option<DecodeReplay>,
+) -> Result<Option<PlacementGuard<'a>>> {
+    if !be_.dense_paged() {
+        if guard.is_none() {
+            *guard = Some(record_decode_replay(be_, graph, bindings, None)?);
+        }
+        return Ok(None);
+    }
+    if be_.take_dense_epoch_move() {
+        if let Some(sess) = be_.dense_pager().lock().unwrap().as_mut() {
+            sess.force_epoch_move();
+        }
+    }
+    for _ in 0..REPLAY_PREPARE_ATTEMPTS {
+        let placements = be_.dense_pager().lock().unwrap();
+        let sess = placements
+            .as_ref()
+            .ok_or_else(|| be("vulkan adapter: the dense streaming session went away"))?;
+        let epoch = sess.placement_epoch();
+        if guard.as_ref().is_some_and(|r| r.epoch == Some(epoch)) {
+            return Ok(Some(placements));
+        }
+        let mut addrs = HashMap::new();
+        let mut missing = Vec::new();
+        for wid in streamed_linear_weights(sess, graph, bindings) {
+            match sess.resident_addr(wid)? {
+                Some(addr) => {
+                    addrs.insert(wid, addr);
+                }
+                None => missing.push(wid),
+            }
+        }
+        // Released before anything below takes it again: staging, and a recording's error path
+        // (`forget_staged`).
+        drop(placements);
+        *guard = None;
+        if missing.is_empty() {
+            *guard = Some(record_decode_replay(
+                be_,
+                graph,
+                bindings,
+                Some(StreamedSlots { epoch, addrs }),
+            )?);
+        } else {
+            stage_for_replay(be_, &missing)?;
+        }
+    }
+    Err(be(format!(
+        "vulkan adapter: the streamed weight placements kept changing over \
+         {REPLAY_PREPARE_ATTEMPTS} attempts to record the decode replay"
+    )))
+}
+
+/// Every streamed Linear weight `graph` reads, by `buffer_identity`, each once, in graph order.
+fn streamed_linear_weights(
+    sess: &crate::pager::DensePagerSession,
+    graph: &Graph,
+    bindings: &Bindings,
+) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    graph
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Linear { weight, .. } => bindings.get(*weight),
+            _ => None,
+        })
+        .map(crate::pager::buffer_identity)
+        .filter(|&wid| sess.is_streamed(wid) && seen.insert(wid))
+        .collect()
+}
+
+/// Stage the blocks of `wids` (streamed weights that are not resident) in a forward of their own,
+/// before a decode recording reads them ([`current_replay`]). The copies go through
+/// `DensePagerSession::stage` like a static forward's, with its barriers around each, and the
+/// forward ends with a blocking submit, so they have run before the recording is replayed.
+fn stage_for_replay(be_: &VulkanBackend, wids: &[usize]) -> Result<()> {
+    let mut rec = Some(be_.recorder()?);
+    let mut ps = PagedStream::default();
+    for &wid in wids {
+        if let Err(e) = stage_dense_linear(be_, &mut rec, &mut ps, wid) {
+            return Err(abort_segment(be_, rec.take(), e));
+        }
+    }
+    submit_wait(
+        be_,
+        rec.take().expect("segment always Some between stagings"),
+    )?;
+    ps.drain()
+}
+
+/// Take the Linear+Add fusion back from every pair whose Linear weight `streamed` names (by
+/// `buffer_identity`): the fused kernels bake a zero weight offset, so the pair runs as the
+/// streamed Linear plus the standalone Add (the same arithmetic: the fused kernel only moves the
+/// same add in-kernel). The static path and the decode recording both apply it.
+fn unfuse_streamed_adds(
+    plan: &mut infr_core::fusion::FusionPlan,
+    graph: &Graph,
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+    streamed: impl Fn(usize) -> bool,
+) -> Result<()> {
+    let mut unfuse: Vec<usize> = Vec::new();
+    for &idx in plan.linear_add.keys() {
+        if let Op::Linear { weight, .. } = &graph.ops[idx] {
+            let w = resolve(scratch, bindings, *weight)?;
+            if streamed(crate::pager::buffer_identity(w)) {
+                unfuse.push(idx);
+            }
+        }
+    }
+    for idx in unfuse {
+        plan.linear_add.remove(&idx);
+        plan.skip.remove(&(idx + 1));
+    }
+    Ok(())
+}
+
 /// Build the record-once decode replay: persistent scratch + params SSBO, one recording via the
 /// `_dyn` (params-driven) kernels for the pos-dependent ops. Only called for a [`decode_eligible`]
 /// graph. The returned recording is replayed (not submitted here) — the caller updates `params` and
 /// calls `replay()`.
+///
+/// `slots` is `Some` exactly when the model streams dense weights: every streamed Linear weight the
+/// graph reads, at the slot address it is resident at (see [`current_replay`]). The Linear reads
+/// the arena there, as `execute_static` does after staging, and no pager state changes. A streamed
+/// weight missing from it is an error, never a read of the placeholder buffer.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn record_decode_replay(
     be_: &VulkanBackend,
     graph: &Graph,
     bindings: &Bindings,
+    slots: Option<StreamedSlots>,
 ) -> Result<DecodeReplay> {
     let scratch = alloc_scratch(be_, graph)?;
     // `[pos, kv_len]` — Staging (host-visible mapped) so per-token `upload` is a plain memcpy.
@@ -4949,10 +5129,43 @@ fn record_decode_replay(
             _ => None,
         })
         .ok_or_else(|| be("vulkan adapter: eligible decode has no positions tensor"))?;
-    let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
+    let epoch = slots.as_ref().map(|s| s.epoch);
+    // Every streamed Linear weight the graph reads, taken under the session's lock once: the walk
+    // below checks each Linear against it without locking again.
+    let streamed: std::collections::HashSet<usize> = match &slots {
+        Some(_) => be_
+            .dense_pager()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|sess| streamed_linear_weights(sess, graph, bindings))
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+    let mut plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
+    unfuse_streamed_adds(&mut plan, graph, &scratch, bindings, |wid| {
+        streamed.contains(&wid)
+    })?;
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
+    // A streamed Linear's slot address; `None` for every other op.
+    let streamed_addr = |op: &Op| -> Result<Option<u64>> {
+        let (Some(slots), Op::Linear { weight, .. }) = (&slots, op) else {
+            return Ok(None);
+        };
+        let wid = crate::pager::buffer_identity(resolve(&scratch, bindings, *weight)?);
+        match slots.addrs.get(&wid) {
+            Some(&addr) => Ok(Some(addr)),
+            None if streamed.contains(&wid) => Err(be(
+                "vulkan adapter: a decode recording reached a streamed weight that was not \
+                 resident when its slot addresses were taken",
+            )),
+            None => Ok(None),
+        }
+    };
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
@@ -5011,17 +5224,22 @@ fn record_decode_replay(
                         .map_err(|e| be(e.to_string()))?,
                 );
             }
+            let wsub = streamed_addr(op)?;
             // Peephole: fuse Op::Linear (f32, m<=4) + Op::GatedAct (Gelu, strided up) into one
-            // e2b_gate dispatch for E2B per-layer inp_gate projections.
-            if let Op::Linear {
-                x,
-                weight,
-                dst,
-                m,
-                in_f,
-                out_f,
-                ..
-            } = op
+            // e2b_gate dispatch for E2B per-layer inp_gate projections. `e2b_gate` binds a
+            // resident weight, so a streamed one keeps the plain Linear.
+            if let (
+                None,
+                Op::Linear {
+                    x,
+                    weight,
+                    dst,
+                    m,
+                    in_f,
+                    out_f,
+                    ..
+                },
+            ) = (wsub, op)
             {
                 if graph.desc(*weight).dtype == infr_core::DType::F32
                     && *m <= 4
@@ -5076,7 +5294,7 @@ fn record_decode_replay(
                 &mut dyn_args,
                 &mut pool,
                 &mut mmv_memo,
-                None,
+                wsub,
             )?;
         }
         for c in dyn_args.drain(..) {
@@ -5137,6 +5355,7 @@ fn record_decode_replay(
         ring,
         positions,
         recorded,
+        epoch,
         _transient: transient,
     })
 }
@@ -5234,26 +5453,11 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
 
     let mut plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
-    // Dense layer streaming: the fused Linear+Add kernels bake a ZERO weight offset, so un-fuse
-    // any pair whose Linear weight is a streamed block — the standalone Add op runs instead
-    // (bit-identical math: the fused kernel only moves the same exact add in-kernel).
-    if be_.dense_paged() {
-        let guard = be_.dense_pager().lock().unwrap();
-        if let Some(sess) = guard.as_ref() {
-            let mut unfuse: Vec<usize> = Vec::new();
-            for &idx in plan.linear_add.keys() {
-                if let Op::Linear { weight, .. } = &graph.ops[idx] {
-                    let w = resolve(&scratch, bindings, *weight)?;
-                    if sess.is_streamed(crate::pager::buffer_identity(w)) {
-                        unfuse.push(idx);
-                    }
-                }
-            }
-            for idx in unfuse {
-                plan.linear_add.remove(&idx);
-                plan.skip.remove(&(idx + 1));
-            }
-        }
+    // Dense layer streaming: no streamed Linear keeps its residual Add fused.
+    if let Some(sess) = be_.dense_pager().lock().unwrap().as_ref() {
+        unfuse_streamed_adds(&mut plan, graph, &scratch, bindings, |wid| {
+            sess.is_streamed(wid)
+        })?;
     }
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;

@@ -3642,6 +3642,89 @@ fn gpu_seam_dense_stream_f16_matches_resident() {
     assert!(ran > 0, "neither F16 model is in the HF cache");
 }
 
+/// One greedy generation on a fresh session of `model`: its text, the decode recordings it made
+/// and the dense streaming cache's counters after it (`None` when nothing streams).
+fn stream_session_run(
+    model: &infr_llama::SeamModel,
+    prompt: &str,
+    n: usize,
+) -> (String, u64, Option<infr_vulkan::pager::DenseTotals>) {
+    let mut session = model.vulkan_session(1024).expect("session");
+    let r0 = session.decode_recordings();
+    let mut text = String::new();
+    model
+        .generate_vulkan_session(&mut session, prompt, n, None, |p| text.push_str(p))
+        .expect("generation");
+    (
+        text,
+        session.decode_recordings() - r0,
+        session.dense_pager_totals(),
+    )
+}
+
+/// A real model streamed through a cache that holds every block decodes from one record-once
+/// recording, with the decode chain on and off, and generates the resident run's tokens and the
+/// streamed run's with the replay switched off. Qwen3-1.7B Q4_K_M takes the quantised kernels at
+/// the slot address, ERNIE-4.5-0.3B F16 the float ones.
+#[test]
+#[ignore = "requires a Vulkan GPU and the Qwen3-1.7B / F16 ERNIE-4.5-0.3B files"]
+fn gpu_seam_dense_stream_holding_every_block_replays() {
+    let mut _tlk = test_serial_lock();
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let models = [
+        ("Qwen3-1.7B Q4_K_M", qwen3_17b(), 2 * GIB),
+        ("ERNIE-4.5-0.3B F16", ernie4_5_03b_f16(), GIB),
+    ];
+    let n = 16usize;
+    let mut ran = 0;
+    for (name, path, cache) in models {
+        let Some(path) = path else {
+            eprintln!("skip {name}: not in the HF cache");
+            continue;
+        };
+        let rendered = model_default(&path)
+            .render_chat("What is 2+2? Answer briefly.")
+            .expect("render chat");
+        for chain in [8usize, 0] {
+            let cfg = |cache: Option<u64>, no_replay: bool| {
+                model_cfg(&path, |c| {
+                    c.spec.decode_chain = chain;
+                    c.kernels.vulkan.no_replay = no_replay;
+                    if let Some(b) = cache {
+                        c.paging.cache = Some(infr_core::SizeSpec::Bytes(b));
+                    }
+                })
+            };
+            let (resident, r_rec, none) = stream_session_run(&cfg(None, false), &rendered, n);
+            assert!(none.is_none(), "{name}: the resident run streamed");
+            assert_eq!(
+                r_rec, 1,
+                "{name}, chain {chain}: resident decode recordings"
+            );
+            for (no_replay, want) in [(false, 1), (true, 0)] {
+                let (text, rec, totals) =
+                    stream_session_run(&cfg(Some(cache), no_replay), &rendered, n);
+                let t = totals.unwrap_or_else(|| panic!("{name}: nothing streamed"));
+                println!("{name}, chain {chain}, no_replay {no_replay}: {rec} recordings, {t:?}");
+                assert_eq!(
+                    t.vram.evictions, 0,
+                    "{name}: the cache did not hold every block"
+                );
+                assert_eq!(
+                    rec, want,
+                    "{name}, chain {chain}, no_replay {no_replay}: decode recordings"
+                );
+                assert_eq!(
+                    text, resident,
+                    "{name}, chain {chain}, no_replay {no_replay}: diverged from the resident run"
+                );
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither model is in the HF cache");
+}
+
 fn qwen3_17b() -> Option<PathBuf> {
     find_gguf("unsloth--Qwen3-1.7B-GGUF", "Qwen3-1.7B-Q4_K_M.gguf")
 }

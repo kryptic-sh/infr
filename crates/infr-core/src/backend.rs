@@ -659,9 +659,10 @@ pub trait Backend: Send + Sync {
     /// VRAM cache (dense layer streaming — the `crate::pager::Pager::schedule` policy; see
     /// `infr_vulkan::pager`'s dense session). Unlike [`Backend::moe_paged`] no host readback is
     /// ever needed (dense layer order is deterministic, every "miss" is known in advance), but
-    /// the record-once decode replay still can't express the per-token ring staging +
-    /// arena-offset rebinding, so the same gates that force a paged-MoE model onto the
-    /// per-execute static path check this too. `false` for every backend but Vulkan, and for
+    /// the record-once decode replay can't follow blocks that are re-staged into recycled slots
+    /// every token, so the gates that force a paged-MoE model onto the per-execute static path
+    /// check this too, unless [`Backend::dense_holds_every_block`] (no block then moves once
+    /// placed, and Vulkan replays). `false` for every backend but Vulkan, and for
     /// Vulkan whenever the loaded model's dense weights fit VRAM (the overwhelming common case —
     /// zero change there).
     fn dense_paged(&self) -> bool {
@@ -670,7 +671,8 @@ pub trait Backend: Send + Sync {
 
     /// Whether every dense streaming pool has a slot for each of its blocks, so the cache, once
     /// filled, never evicts and each block is read off the tier below at most once per session.
-    /// A runner keys read-saving reorderings off this (layer-major prefill saves nothing then).
+    /// A runner keys read-saving reorderings off this (layer-major prefill saves nothing then),
+    /// and admits such a session to the record-once decode replay.
     /// `false` whenever [`Backend::dense_paged`] is `false`.
     fn dense_holds_every_block(&self) -> bool {
         false

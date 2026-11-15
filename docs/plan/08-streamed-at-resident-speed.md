@@ -10,9 +10,9 @@ evicted. The recorded case is in `backlog.md` B193 (ERNIE-4.5-0.3B F16, RX 7900
 XTX, every block resident: prefill and decode both well below the resident
 figures, same kernels).
 
-**Status:** steps 0–2 and 4 done (2026-11-15). The findings below were read from
-the code first; step 0 measured them, and the order of the remaining steps
-follows that measurement.
+**Status:** steps 0–4 done (2026-11-15). The findings below were read from the
+code first; step 0 measured them, and the order of the remaining steps follows
+that measurement.
 
 ## What step 0 measured
 
@@ -76,10 +76,10 @@ Extra work the streamed path did per forward once every block was in VRAM, in
 the order step 0 found them to cost:
 
 1. **Layer-major prefill ran even when it saves no reads.** Fixed by step 1.
-2. **Decode never replays and never chains.** `adapter::replays` is false while
-   `dense_paged()`, and the runner's `mirror_admits` repeats the condition, so
-   every token rebuilds, recompiles, re-records and waits. The largest remaining
-   decode term on both models.
+2. **Decode never replayed and never chained.** `adapter::replays` was false
+   while `dense_paged()`, and the runner's `mirror_admits` repeated the
+   condition, so every token rebuilt, recompiled, re-recorded and waited. Fixed
+   by step 3 for a cache that holds every block.
 3. **Quantised streamed Linears skipped resident kernel tiers.** Fixed by step
    4: the streamed route had its own decision tree, which left out the int8
    K-quant coopmat GEMM, the multi-row GEMVs and every decode GEMV tier but the
@@ -121,18 +121,9 @@ carrying the cadence across a ring rotation, a fixed-count cadence.
    copy and none on a hit; its doc carries the ordering argument. Observable:
    `VulkanBackend::arena_barriers`, asserted in
    `synthetic_streamed_arena_barriers_only_around_copies`.
-3. **Replay and chain decode while placements are stable.** Admit a dense-paged
-   session to `replays()` when it holds every block. Add a placement epoch to
-   the GPU pager, bumped on every placement change; record it in the replay and
-   re-record when it moves. Before recording, stage any streamed weight that is
-   not yet resident in its own submit. While recording, resolve each streamed
-   weight to its slot address without mutating the pager, and fail rather than
-   fall back if one is missing. A session that cannot hold every block keeps the
-   current path. Re-check `DensePagerSession::stage`'s ordering argument, which
-   assumes recordings are submitted in the order they were recorded. Observable:
-   `decode_recordings()` reads one after a run, and two after a forced epoch
-   change, with identical tokens; a decode that starts from an empty cache
-   exercises the staging pass.
+3. ~~Replay and chain decode while placements are stable.~~ Done: a dense
+   streaming session whose cache holds every block replays and chains its decode
+   like a resident one; see below.
 4. ~~Resident kernel routing for quantised streamed Linears.~~ Done; see below.
 5. **Keep Linear+Add fused for streamed weights**, through the address-taking
    variants, in the static path and in the replay. Observable: a streamed decode
@@ -284,6 +275,103 @@ decode gains on both GPUs; holding every block it now sits 2.2% (Qwen3) and
 evicting decode on the RX 7900 XTX moved within run noise (SmolLM3 0.5–0.7%
 lower, Qwen3 1.4% higher). The resident rows did not change in code; the 1.9%
 SmolLM3 decode difference on the iGPU is one round of noise, not retaken.
+
+## Results of step 3
+
+What was built:
+
+- **Admission.** `adapter::replays` admits a dense streaming session when
+  `DensePagerSession::holds_every_block`, and the runner's `mirror_admits` asks
+  `Backend::dense_holds_every_block`. A cache that cannot hold every block keeps
+  the static path, unchanged; so does a model the replay cannot express
+  (SmolLM3's NoPE layers, B157).
+- **Placement epoch.** `GpuPager::placements` counts every placement change (a
+  miss placing its block and its eviction, a rolled-back miss, a placement
+  `forget_unsubmitted` takes back); `DensePagerSession::placement_epoch` sums it
+  over the pools. A decode recording stores the epoch its slot addresses were
+  read at (`DecodeReplay::epoch`).
+- **Before every replay or chained submit** (`adapter::current_replay`, called
+  from `execute` and `execute_chain`), the epoch is read under the dense
+  session's lock; a moved epoch drops the recording and records again, as a
+  rebound buffer does, and the lock is held until the replay has completed.
+- **Staging pass.** Before recording, any streamed weight of the graph that is
+  not resident yet is staged in a forward of its own (`stage_for_replay`,
+  through `DensePagerSession::stage`, blocking submit). The recording then reads
+  each slot address through `DensePagerSession::resident_addr`, which changes
+  nothing, and fails with an error if a streamed weight is not in that set.
+- **Fusion.** The recording drops the Linear+Add fusion of a streamed weight
+  through the same helper the static path uses (`unfuse_streamed_adds`); keeping
+  the pairs fused is still step 5.
+- **Statistics.** A replayed step calls no `stage`, so it counts no hit and
+  moves no recency; with a slot per block there is no victim to choose, so
+  recency decides nothing. `paging.stats` and `dense_pager_totals` say so.
+
+The ordering argument is on `DensePagerSession::stage`: a replay reads only
+slots whose copies, with their trailing arena barrier, were submitted and waited
+before the recording was made, and that barrier's second scope covers the
+replay's pointer reads in either `INFR_NO_GPU_POS` mode; a slot a recording
+reads can be written only after its block leaves it, which moves the epoch. It
+assumes executes on one backend are serialised, which `serve --parallel` does
+with its step baton; the execute sites were traced and are listed in
+`backlog.md` B193, and
+`synthetic_streamed_parallel_sequences_rebuild_on_an_epoch_move` runs two
+sequences on one engine across an epoch move. Every placement change is shown to
+move the epoch by `every_placement_change_moves_the_dense_epoch`.
+
+Observable: `decode_recordings()` reads one after a streamed decode that holds
+every block and none on an evicting one
+(`synthetic_streamed_decode_replays_while_every_block_is_held`, F16 and F32,
+chain on and off, and `gpu_seam_dense_stream_holding_every_block_replays` on
+Qwen3-1.7B Q4_K_M and ERNIE-4.5-0.3B F16), two after a forced epoch move
+(`synthetic_streamed_replay_records_again_when_placements_move`,
+`VulkanBackend::force_dense_epoch_move_after`), and a one-token prompt on an
+empty cache stages every block once, runs no static forward and replays from one
+recording (`synthetic_streamed_replay_stages_an_empty_cache_first`). Tokens are
+the resident run's and the streamed run's with `INFR_SEAM_NO_REPLAY` in every
+case.
+
+Measured with the step 0 harness, the tree before the step and after it
+interleaved in alternating order over two rounds on the RX 7900 XTX, host CPU
+load 0–4% at every start but one (26%, the first round's evicting ERNIE decode
+on the tree before), and at least 35.8 GB of host memory free. "Holds all" is
+`INFR_CACHE=2G` for Qwen3-1.7B and SmolLM3-3B and 1G for ERNIE-4.5-0.3B; the
+evicting control is 800M, 1G and 512M. t/s, round 1 / round 2:
+
+| Case          | before        | after         |
+| ------------- | ------------- | ------------- |
+| Qwen3 tg128 R | 479.3 / 478.5 | 479.0 / 478.8 |
+| Qwen3 tg128 S | 386.4 / 385.5 | 469.4 / 469.1 |
+| Qwen3 tg128 E | 59.1 / 58.7   | 58.8 / 58.6   |
+| Qwen3 pp512 R | 11953 / 11904 | 12020 / 11857 |
+| Qwen3 pp512 S | 12212 / 12079 | 12232 / 12094 |
+| Qwen3 pp512 E | 11910 / 11871 | 11999 / 11885 |
+| ERNIE tg128 R | 449.9 / 449.5 | 449.7 / 449.9 |
+| ERNIE tg128 S | 384.7 / 384.8 | 444.3 / 444.2 |
+| ERNIE tg128 E | 71.2 / 71.5   | 72.6 / 71.5   |
+| ERNIE pp512 R | 22141 / 22261 | 22330 / 22046 |
+| ERNIE pp512 S | 22287 / 22409 | 22805 / 22767 |
+| ERNIE pp512 E | 22050 / 21768 | 21804 / 21871 |
+| Smol tg128 R  | 228.6 / 227.1 | 228.2 / 228.1 |
+| Smol tg128 S  | 251.8 / 251.0 | 251.2 / 251.5 |
+| Smol tg128 E  | 21.7 / 21.6   | 21.6 / 21.6   |
+| Smol pp512 R  | 6269 / 6275   | 6274 / 6258   |
+| Smol pp512 S  | 6333 / 6319   | 6330 / 6303   |
+| Smol pp512 E  | 6080 / 6071   | 6094 / 6075   |
+
+The integrated GPU (`Vulkan1`), Qwen3-1.7B tg128, one round, same budgets, host
+CPU load 0–6%:
+
+| Case          | before | after |
+| ------------- | ------ | ----- |
+| Qwen3 tg128 R | 27.39  | 27.42 |
+| Qwen3 tg128 S | 26.81  | 27.54 |
+| Qwen3 tg128 E | 12.95  | 12.92 |
+
+Streamed decode holding every block is now within 2.0% of resident for Qwen3
+(469 against 479) and 1.2% for ERNIE (444 against 450). Fusion (step 5) is the
+known difference left: step 0 measured it at about 1% of ERNIE's resident decode
+without replay and about 3 t/s of Qwen3's. SmolLM3 does not replay (NoPE) and is
+unchanged, as are prefill and the evicting budget, within run noise.
 
 ## Verification
 

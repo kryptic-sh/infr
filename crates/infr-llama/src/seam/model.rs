@@ -245,6 +245,13 @@ impl DenseVulkanSession {
         self.be.decode_recordings()
     }
 
+    /// Test hook: move the dense streaming cache's placement epoch before the `n`th decode replay
+    /// from now ([`infr_vulkan::VulkanBackend::force_dense_epoch_move_after`]), so that replay
+    /// records again with nothing re-placed.
+    pub fn force_dense_epoch_move_after(&self, n: u64) {
+        self.be.force_dense_epoch_move_after(n);
+    }
+
     /// The segments this session's forwards submitted before their recording ended, by cause
     /// ([`infr_vulkan::VulkanBackend::segment_cuts`]) — among them the router-id readbacks of
     /// paged MoE layers that were not wholly resident.

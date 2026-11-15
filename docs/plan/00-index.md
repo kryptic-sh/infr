@@ -25,11 +25,11 @@ GPU seam test.
 
 The standing goal: any model size on any hardware, disk to DRAM to VRAM.
 
-| Phase | What                                                                                  | Status               |
-| ----- | ------------------------------------------------------------------------------------- | -------------------- |
-| 05    | [Streaming for any model on any hardware](05-streaming-any-size.md)                   | not started          |
-| 06    | [Pager eviction: cost and policy](06-pager-eviction.md)                               | steps 1–2 done       |
-| 08    | [A streamed model that fits runs at resident speed](08-streamed-at-resident-speed.md) | steps 0–2 and 4 done |
+| Phase | What                                                                                  | Status         |
+| ----- | ------------------------------------------------------------------------------------- | -------------- |
+| 05    | [Streaming for any model on any hardware](05-streaming-any-size.md)                   | not started    |
+| 06    | [Pager eviction: cost and policy](06-pager-eviction.md)                               | steps 1–2 done |
+| 08    | [A streamed model that fits runs at resident speed](08-streamed-at-resident-speed.md) | steps 0–4 done |
 
 ## Notes on the model phases
 

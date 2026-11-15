@@ -5626,9 +5626,18 @@ at the arena slot's address. What that slice did not do:
   against 11841 / 11798 resident) and decodes at 387 t/s (was 308; resident
   479), and on the integrated GPU (`Vulkan1`) its streamed decode went from 9.3
   to 26.9 t/s against 27.5 resident — that was the old streamed GEMV route, the
-  suspect named here before. What is left is the plan's remaining steps: decode
-  replay for a session that holds every block (step 3), and Linear+Add fusion
-  for streamed weights (step 5).
+  suspect named here before. Step 3 landed the same day: a session whose cache
+  holds every block now decodes through the record-once replay and the chain,
+  re-recording when the dense pager's placement epoch moves, so streamed decode
+  holding every block reads 469.4 / 469.1 t/s for Qwen3 (resident 479.0 / 478.8)
+  and 444.3 / 444.2 for ERNIE (resident 449.7 / 449.9). What is left is
+  Linear+Add fusion for streamed weights (step 5), the known difference.
+- **Replayed streamed decode steps count no pager hits.** A replay makes no
+  `DensePagerSession::stage` call, so `paging.stats` and `dense_pager_totals`
+  cover static forwards and the staging pass only: a session holding every block
+  shows its prefill's hits and nothing for its decode. Documented on
+  `print_stats_if_enabled`; crediting hits per replay would need a counter-only
+  entry point on `infr_core::pager::Pager`, not built.
 - **Streamed quantised Linears skip four opt-in tiers.** `quant_linear` runs a
   streamed slot past the `_cm8` warptile (`INFR_CM_8X8`), the fp8 coopmat GEMM
   (`INFR_F8_COOPMAT`), the int8 Q8_0 coopmat GEMM (`INFR_I8_COOPMAT`) and the
@@ -5680,7 +5689,36 @@ at the arena slot's address. What that slice did not do:
   `VK_LAYER_VALIDATE_SYNC=1`, SDK 1.4.357) and logged no hazard, but it logged
   none either with `INFR_NOBARRIER=1`, so it was not shown to be running and
   proves nothing; it also cannot see the arena's pointer reads at all. A working
-  syncval recipe, checked against `INFR_NOBARRIER`, is still to find.
+  syncval recipe, checked against `INFR_NOBARRIER`, is still to find. The same
+  holds for the streamed decode replay (plan 08 step 3): its ordering argument
+  is written on `DensePagerSession::stage` and checked only by token identity,
+  the streamed parity suites passing 5 times on `Vulkan0` and 3 on `Vulkan1`
+  with no flake.
+- **Streamed replay under `serve --parallel` rests on the step baton.** The
+  replay's ordering assumes executes on one backend are serialised: two
+  unserialised threads could have a replay read a block whose copy another
+  thread recorded but has not submitted (the dense session's mutex does not
+  prevent that; see `DensePagerSession::stage`). Every execute reachable from
+  `ParallelSeam::generate` (`generate_dense_vulkan_session` into
+  `generate_dense_backend_bound`) was traced to a `RequestCtx::gate_pass` scope
+  on 2026-11-15: placement and the cold init, the prefix-seed KV copy, the
+  recurrent-state restore and snapshot, the decode IO allocations, each prefill
+  chunk or layer-major span, the record-once plan's build and its drop, and
+  every decode-loop iteration (chained chunk, replayed step, per-token rebuild,
+  and the logits, hidden-state and sampled-id readbacks). The verify and denoise
+  branches are not reachable from it. The engine's warmup decodes a token before
+  any request, which stages every block, so under `serve --parallel` a cache
+  that holds every block is full before two sequences run and its epoch then
+  moves only on a taken-back or rolled-back placement.
+  `synthetic_streamed_parallel_sequences_rebuild_on_an_epoch_move` runs two
+  sequences on one engine with a forced move between them. A new execute site
+  added without the baton would break this silently; nothing checks it
+  mechanically.
+- **The placement epoch is global to the session.** Any placement moves it,
+  including one of a block no current recording reads, which then costs every
+  live recording a needless re-record (one per sequence). Holding every block,
+  that happens only while blocks are first placed, so it was left; a per-block
+  check (compare the recording's own slots) would remove it.
 - **A session whose cache holds every block still reserves the layer-major
   activation.** `dense_stream_budget_at` holds `layer_major_act_bytes` back from
   the arenas for every streamed session, because the arenas are sized before it

@@ -10997,18 +10997,29 @@ impl RecordedCmd {
     /// cross-segment RAW/WAR memory dependency (a pipeline barrier's first scope spans everything
     /// submitted earlier on the same queue). A discrete GPU has exactly ONE segment, so this is a
     /// single submit + wait — byte-identical to the record-once fast path.
+    ///
+    /// A submit that fails part-way still waits for the segments submitted before it, so the
+    /// recording has stopped running when this returns either way: a caller holding a lock until
+    /// the replay is over (the dense streaming replay, `adapter::current_replay`) holds it that
+    /// long on the error path too. On a lost device the wait returns at once with its own error.
     pub fn replay(&self) -> Result<()> {
         let device = &self.shared.device;
         unsafe {
             for seg in &self.segments {
-                device
-                    .queue_submit(
-                        self.shared.queue,
-                        &[vk::SubmitInfo::default()
-                            .command_buffers(std::slice::from_ref(&seg.cmd))],
-                        vk::Fence::null(),
-                    )
-                    .map_err(|e| be(format!("replay submit: {e}")))?;
+                let submitted = device.queue_submit(
+                    self.shared.queue,
+                    &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&seg.cmd))],
+                    vk::Fence::null(),
+                );
+                if let Err(e) = submitted {
+                    return Err(match device.queue_wait_idle(self.shared.queue) {
+                        Ok(()) => be(format!("replay submit: {e}")),
+                        Err(w) => be(format!(
+                            "replay submit: {e} (and the wait for the segments submitted \
+                             before it: {w})"
+                        )),
+                    });
+                }
             }
             device
                 .queue_wait_idle(self.shared.queue)

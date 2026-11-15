@@ -5,34 +5,46 @@ layer but two of the shipped V4-Flash file. Scoped on 2026-11-16 by reading
 llama.cpp at `5676dfbe0` (`src/models/deepseek4.cpp`,
 `src/llama-kv-cache-dsv4.cpp`, `src/llama-graph.cpp`, `src/models/models.h`).
 Statements marked **[I]** were inferred, not read; **[U]** are unknown. Nothing
-here has been built or run yet. Cite functions, not lines: both reference files
-have grown since the notes in `docs/deepseek.md` were written.
+here has been built or run yet, except slices S0 and S1 (marked below). Cite
+functions, not lines: both reference files have grown since the notes in
+`docs/deepseek.md` were written.
 
 ## 0. The reference moved past our records
 
-Fix these first (slice S0), or a port copies stale behaviour:
+Fixed in slice S0 (done 2026-11-16); kept as the record of what moved:
 
 1. `dsv4_build_comp_plan` now ends with `n_kv = max(PAD(n_kv, 256), 256)`, so
    the compressed branch runs on every ubatch. `deepseek.md` boundary condition
-   2 no longer holds. An all-masked compressed half adds nothing **[I]**, so
-   infr may still skip the segment when every `n_visible` is 0.
+   2 no longer holds. An all-masked compressed half adds nothing (every padded
+   column is `-inf`-masked, and the LID top-k count `min(width, top_k)` keeps
+   every visible row either way), so infr may still skip the segment when every
+   `n_visible` is 0. `dsv4_plan.rs` carries only the unpadded width,
+   `n_visible_max`.
 2. HCA gets a dummy commit too (the `!pad_blocks && state_write_idxs.empty()`
    branch writes one dummy block to row `kv_size-1`). `deepseek.md` condition 4
    and the `DSV4_HCA_RATIO` doc in `dsv4_plan.rs` say otherwise.
 3. `llama_kv_cache_dsv4::init_batch` now uses `split_equal`, so for one sequence
-   `n_seq_tokens = n_tokens` and CSA pads `ceil(n_tokens/4)` dummy blocks, not
-   one. The `split_simple` derivation in `dsv4_plan.rs` and
-   `csa_ubatch_with_no_commits_pads_exactly_one_dummy` describe the old pin.
-   Dummies only land in the masked row `kv_size-1`, so no number changes
-   **[I]**.
-4. The LID plan is built by its own call with identical parameters.
-5. B-DSHW-FUSED-REF is stale: the reference's Vulkan backend now has
-   `dsv4_hc_{comb,pre,post}.comp` and `lightning_indexer.comp`, and its CPU
-   backend implements the HC, indexer and top-k-mask ops.
+   `n_seq_tokens = n_tokens` and CSA pads its commits up to `ceil(n_tokens/4)`
+   BLOCKS, which is at most one dummy, not `ceil(n_tokens/4)` dummies: the
+   reference refuses a sequence two or more blocks short ("DSV4 CSA sequence
+   positions are not contiguous"), and contiguous positions are never more than
+   one short. (The first draft of this item said `ceil(n_tokens/4)` dummies; the
+   code says otherwise.) The refusal was unreachable under `split_simple`; with
+   `split_equal` the function can reach it, though `llama_batch_allocr::init`
+   rejects a sequence with non-continuous positions before `init_batch` runs, so
+   the port carries it as a guard, not as a path a real batch takes. Dummies
+   only land in the masked row `kv_size-1`, so no number changes **[I]**.
+4. The LID plan is built by its own call with identical parameters (its own
+   state and cache, whose sizes equal the CSA ones on V4).
+5. B-DSHW-FUSED-REF was stale: the reference's Vulkan backend now has
+   `dsv4_hc_{comb,pre,post}.comp` and `lightning_indexer.comp` (no top-k-mask
+   case), and its CPU and Metal backends implement the HC, indexer and
+   top-k-mask ops.
 6. `deepseek.md` says no public GGUF declares `deepseek32`. The HF API reports
    that architecture for `sszymczyk/DeepSeek-V3.2-Exp-light-GGUF` (Q4_K_M 404
    GB; V3.2-Exp weights; tensor list not read). It cannot run on this box.
-   Correct `deepseek.md` and B102.
+   Corrected in `deepseek.md`, the README, B102 and the `cpu_backend.rs` V3.2
+   comment.
 
 ## 1. What a compressed layer computes
 
@@ -70,10 +82,13 @@ is cleared. infr needs no 256 padding.
 - **RoPE on a compressed layer is not the plain one.** Every rope there (query,
   kv, the backward de-rope, compressed rows, indexer query) uses
   `freq_base = compress_rope_theta` with YaRN: `freq_scale = 1/factor`,
-  `ext_factor` 1, `n_ctx_orig`, betas 32 and 1 (V4 does not read the beta keys).
+  `ext_factor` 1 (because the file's `rope.scaling.type` is `"yarn"`; a
+  `"linear"` or absent type gives 0, a uniform `1/freq_scale` angle scale),
+  `n_ctx_orig`, betas 32 and 1 (no V4 loader key reads the beta keys).
   `dsv4_rope_attn_factor` cancels the magnitude scale to 1. Ratio-0 layers keep
   `rope_theta` with no YaRN, which infr already does. All are NORM ropes over
-  the tail of the head.
+  the tail of the head. `Config::dsv4_compressed_rope_divisors` (S1) builds the
+  `freq_factors` vector, and its doc states the mapping onto `Op::Rope`.
 - **Query:** `qr = rmsnorm_w(q_a_norm, wq_a·cur)`; `q = wq_b·qr` as
   `[512, heads, T]`, a weightless per-head RMS norm, tail roped at the token
   position.
@@ -134,16 +149,16 @@ Decode is the same graph with `T = 1`. The raw window `[p-127, p]` matches
 
 ## 2. What infr is missing
 
-Present: `dsv4_plan.rs` (no caller, old pin), `Op::CompressPool`,
+Present: `dsv4_plan.rs` (no caller, re-synced in S0), `Op::CompressPool`,
 `Op::TopkMask`, `Op::LightningIndexer` (V3.2 contract), `Op::Attention` with
 `sinks` and `key_bias`, the ratio-0 `MixerW::Dsv4` emit, `wload`'s `is_dsv4` arm
 (uploads the compressor and indexer tensors; `wpush` does not declare them),
 `dsv4_weight_shape`, the config fields, the refusal in `generate_dense_backend`,
 and the `dsv4_model` fixture.
 
-1. **YaRN for compressed layers:** read `rope.scaling.*` for `deepseek4` (today
-   only `deepseek2` does) and build the `ff` divisor vector at
-   `compress_rope_theta`, reusing the deepseek2 `yarn_ff` helper.
+1. **YaRN for compressed layers:** done in S1 —
+   `Config::dsv4_compressed_rope_divisors`, built by the `yarn_freq_divisors`
+   helper the deepseek2 `yarn_ff` now calls too. Not applied anywhere yet.
 2. **A row gather** (`Op::GatherRows`): f32 rows by i32 index, with a source
    column offset, a grouped destination layout (for the two overlap halves) and
    a fill value for index `-1` (the sentinel).
@@ -164,7 +179,8 @@ and the `dsv4_model` fixture.
 7. **`wpush` handles** mirroring `wload`, then drop the build closure's assert.
 8. **Per-step i32 inputs:** compressed-row positions, gather indices, APE rows.
 9. **Fixtures:** all-HCA and all-CSA layouts, a one-layer `hc_mult = 1` variant
-   for from-definition checks, YaRN keys.
+   for from-definition checks. (YaRN keys: a variant exists,
+   `dsv4_model_with_scaling`, kept out of the canonical fixture.)
 
 ## 3. Slices
 
@@ -173,8 +189,8 @@ unchanged.
 
 | #   | Slice                                                                                                                   | Verification that can fail                                                                                                                                                                                                                    |
 | --- | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| S0  | Re-sync `dsv4_plan.rs` with section 0, add a count of real commits; fix the docs                                        | literal-vector tests: an HCA decode step gets one dummy at the last row; a 9-token CSA ubatch with no commit gets 3; the commit count excludes dummies                                                                                        |
-| S1  | `deepseek4` YaRN config and the compressed-tier `ff` vector (unused yet)                                                | `ff` against a closed form at chosen positions; dropping the yarn key gives 1                                                                                                                                                                 |
+| S0  | **Done 2026-11-16.** Re-sync `dsv4_plan.rs` with section 0, add a count of real commits; fix the docs                   | literal-vector tests: an HCA decode step gets one dummy at the last row; a 9-token CSA ubatch with no commit is refused (one block short gets one dummy); the commit count excludes dummies                                                   |
+| S1  | **Done 2026-11-16.** `deepseek4` YaRN config and the compressed-tier `ff` vector (unused yet)                           | `ff` against a closed form at chosen positions; a file with no scaling keys gives 1; a factor without a type is "linear", a uniform divisor                                                                                                   |
 | S2  | B53: one cache as K and V (`kv_row_elems` → `(hd, 0)`, CPU attention takes one guard)                                   | an op-parity case binding one id to both sides; ratio-0 logits bit-identical                                                                                                                                                                  |
 | S3  | `Op::GatherRows` on CPU and Vulkan; Metal arm written                                                                   | from-definition parity with fill, grouping and column offset; a swapped column offset goes red                                                                                                                                                |
 | S4a | CPU two-segment attention and the indexer block ratio                                                                   | equals single-segment attention over a concatenated cache with an explicit bias; `None` and ratio 1 bit-identical to today                                                                                                                    |
@@ -203,6 +219,17 @@ opened). Smaller published files exist (`unsloth` UD-IQ1_S 82.5 GB; a 60.8 GB
 "Fractal" repack) whose tensor types infr may not load **[U]**. On 64 GB of RAM
 the file is read through the page cache: expect a per-token infr run of a
 300-token prompt to take minutes **[I]**.
+
+**The Q2_K_S file does not load in llama.cpp on this box (2026-11-16).** Three
+`llama-debug --save-logits -ngl 0` runs on the 98.6 GB file with 61.6 GB of RAM,
+two of them with `--no-warmup`: the process working set reached 45 to 48 GB
+within about 70 s, available memory fell under 1 GB, and none printed a loader
+line or wrote a dump (one ran for an hour, one for over 20 minutes). The default
+load mode maps the file and prefetches it. Not tried: `--load-mode none` and
+`dio` (both read the weights into allocated memory, which cannot hold this
+file), a larger page file, or a smaller file. S8 therefore needs a file that
+fits in RAM (the 60.8 GB repack, if both engines load its tensor types) or
+another machine; until then the real file is checked by infr alone.
 
 ## 5. Performance, after correctness
 

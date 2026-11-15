@@ -5510,8 +5510,9 @@ fn gpu_seam_matches_cpu_deepseek2() {
 // ── DeepSeek V3.2, at real V3 scale ────────────────────────────────────────────
 //
 // `unsloth/DeepSeek-V3.2-GGUF` declares `general.architecture = "deepseek2"`, not `deepseek32`:
-// every public V3.2 GGUF does, because the converters emit the model as dense MLA and drop the
-// lightning indexer. So these tests exercise the `deepseek2` path at 671B/61-layer/256-expert
+// its converter emitted the model as dense MLA and dropped the lightning indexer. (Public files
+// that declare `deepseek32` exist, but none small enough for this box — `docs/backlog.md` B102.)
+// So these tests exercise the `deepseek2` path at 671B/61-layer/256-expert
 // scale, and they are the FIRST time group-limited routing (`n_expert_groups`) and the
 // `exp_probs_b` router bias run on a real file rather than the synthetic GGUFs of
 // `tests/synthetic_deepseek2.rs`.
@@ -5547,7 +5548,7 @@ fn cpu_deepseek_v32_config() {
     assert_eq!(
         g.metadata().str("general.architecture"),
         Some(infr_llama::arch::DEEPSEEK2),
-        "every public V3.2 GGUF declares deepseek2, not deepseek32"
+        "this V3.2 GGUF declares deepseek2, not deepseek32"
     );
     assert!(cfg.deepseek2, "deepseek2 gate");
     assert!(

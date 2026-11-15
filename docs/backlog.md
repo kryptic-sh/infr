@@ -26,6 +26,31 @@ Provenance tags point at the finding that opened the item:
 
 ## Open
 
+### B-DSV2-NONYARN-SCALE — deepseek2 ignores a non-YaRN `rope.scaling.factor` (2026-11-16)
+
+**Tag:** deepseek · **Kind:** suspected divergence, unverified
+
+Found while reading the reference's rope-scaling defaults for `deepseek4` (plan
+09, S1). llama.cpp's generic `llama_model::load_hparams` defaults
+`rope.scaling.type` to `"linear"` and turns any `rope.scaling.factor` into
+`freq_scale = 1/factor`; `llama-context.cpp` then gives a `"linear"` file
+`ext_factor = 0`, which in ggml's `rope_yarn` is a uniform angle scale by
+`freq_scale`, and a `"none"` file `freq_scale = 1`. infr's `deepseek2` parse
+keys everything on `rope.scaling.type == "yarn"`: a `deepseek2` file that
+declares a factor with type `"linear"` (or no type) gets no scaling at all in
+`seam::runner`'s `yarn_ff`. `deepseek4` now handles all three types
+(`Config::dsv4_compressed_rope_divisors`). The score scale would differ too:
+`deepseek2.cpp` derives its attention factor and the squared magnitude scale in
+`kq_scale` from `freq_scale` whatever `ext_factor` is, and nothing cancels them
+when `ext_factor` is 0, while infr's non-YaRN `mla_scale` is the file's
+`rope_attn_factor` alone.
+
+Not verified: that `deepseek2.cpp`'s rope actually receives `cparams`'
+`freq_scale` on that path (its rope calls were not read), and whether any
+published `deepseek2` file declares a factor without YaRN — every one this
+project has opened declares `"yarn"`. Closing it means reading those calls, then
+either mirroring the `deepseek4` parse or refusing such a file.
+
 ### B1 — `kernels.vulkan.dn_chunk_scan` reads opposite to its name
 
 **Tag:** CR-N10 · **Needs:** a decision (re-read 2026-11-12)
@@ -1193,44 +1218,27 @@ iGPU when pointed at it.
 
 **Slice B — ratios 4 and 128.** Needs new ops, not just wiring:
 
-- **The plan half of `dsv4_build_comp_plan` is ported (2026-08-30), the buffer
-  half is not.** `build_dsv4_comp_plan` in
+- **The plan half of `dsv4_build_comp_plan` is ported, re-synced with llama.cpp
+  `5676dfbe0` (2026-11-16); the buffer half is not.** `build_dsv4_comp_plan` in
   `crates/infr-llama/src/seam/dsv4_plan.rs` is a pure Rust function — no graph
-  emission, no backend calls — that computes the same
-  `n_visible`/`n_kv`/`state_pos`/`state_read_idxs`/`state_write_idxs`/
-  `state_write_pos`/`state_persist_{src,dst}_idxs` vectors the reference does,
-  including the `[persistent | scratch | sentinel]` gather layout and the
-  two-contiguous-halves read order for the overlapping compressors. Covered by
-  literal-vector tests (not just lengths) and red/green fault injection on the
-  floor-vs-ceil, `n_kv` padding, overlap-halves-order, persist-dedup and
-  CSA-only-dummy traps. **Nothing calls it yet** — no persistent compressor
-  state buffers, no `Op::CompressPool` wiring, not referenced from `runner.rs`.
-  Narrower than the reference, deliberately:
-  - **Single stream only.** Takes an explicit `n_seqs` and refuses above `1`,
-    mirroring the reference's `n_stream <= 1 && ubatch.n_seqs_unq > 1` throw.
-    `dsv4_stream_offset`'s arithmetic (`0` whenever `n_stream <= 1`) is dropped
-    rather than carried as dead code.
-  - **No rollback/`n_rs_seq` planes** (`state_restore_*`/`state_snapshot_*`):
-    infr's V4 has no speculative-decode rollback consumer, so they are left off
-    the plan struct entirely rather than carried as vectors nobody fills.
-  - **No coupled-ubatch CSA branch** (`dsv4_ubatch_has_coupled`): only the
-    non-coupled dummy-block path is ported, since a single sequence is never
-    coupled.
-  - **No contiguity guard, because it cannot fire here.** The reference pads to
-    `ceil(max(1, ubatch.n_seq_tokens)/ratio)` blocks and refuses a sequence more
-    than one block short of that. For a single-stream cache —
-    `raw_per_seq == false && comp_per_seq == false`, infr's exact and only scope
-    — `llama_kv_cache_dsv4::init_batch` always splits with `split_simple`, whose
-    `ubatch_add(idxs, idxs.size(), false)` passes `n_seqs == n_tokens` and so
-    makes `n_seq_tokens = n_tokens/n_seqs` unconditionally `1`, whatever the
-    ubatch's token count. That block count is therefore the constant `1`: the
-    padding rule collapses to "an ubatch that commits nothing gets exactly one
-    dummy", and the refusal's `n_writes + 1 != n_blocks` is only reachable at
-    `n_writes == 0`, where it holds trivially. The port implements the collapsed
-    rule and omits the unreachable refusal. **A future multi-stream slice must
-    revisit this**, since `split_equal` does produce a real per-sequence token
-    count — that is the point at which `n_seq_tokens` has to become a parameter
-    rather than a constant.
+  emission, no backend calls — that computes the reference's
+  `n_visible`/`state_pos`/`state_read_idxs`/`state_write_idxs`/
+  `state_write_pos`/`state_persist_{src,dst}_idxs` vectors, including the
+  `[persistent | scratch | sentinel]` gather layout, the two-contiguous-halves
+  read order for the overlapping compressors, both dummy rules (CSA/LID pad
+  their commits up to `ceil(n_tokens/4)` blocks, at most one dummy, and refuse a
+  non-contiguous ubatch; HCA adds one dummy when nothing commits) and a count of
+  the real commits, which come first. It reports the unpadded compressed width
+  (`n_visible_max`) where the reference pads `n_kv` to a 256 multiple with a
+  floor of 256, a width-only padding whose columns are masked. Covered by
+  hand-derived literal-vector tests and red/green fault injection. **Nothing
+  calls it yet** — no persistent compressor state buffers, no `Op::CompressPool`
+  wiring, not referenced from `runner.rs`. Narrower than the reference,
+  deliberately: single stream only (refuses `n_seqs > 1`, mirroring the
+  reference's throw), no rollback/`n_rs_seq` planes (no speculative-decode
+  consumer), and no coupled-ubatch branch (one sequence is never coupled). A
+  multi-stream slice must add the per-sequence ring and cache offsets and the
+  per-sequence block padding.
 - **`Op::Attention::key_bias` landed on CPU/Vulkan/Metal (2026-08-30), but
   nothing calls it for CSA yet.** The op-level capability is done and
   parity-tested (`crates/infr-llama/tests/seam_op_parity.rs`'s
@@ -2102,30 +2110,34 @@ again — nothing needs to be built.
   comment records the 2026-08-12 re-bless and the text it now generates), but it
   locks what infr does, not what is correct — see B102.
 
-### B-DSHW-FUSED-REF — upstream's fused DeepSeek kernels exist on CUDA and SYCL only (2026-08-11)
+### B-DSHW-FUSED-REF — where upstream's fused DeepSeek kernels live (2026-08-11, updated 2026-11-16)
 
 **Tag:** deepseek · reference · **Blocked on:** nothing; this is a design
 reference, not a defect
 
-Enumerated by listing each backend's source directory at the new pin: fused
-DeepSeek kernels exist as `lightning-indexer` and `dsv4-hc` under
-`ggml/src/ggml-cuda/` and `ggml/src/ggml-sycl/` (the SYCL pair is **new in this
-pull**), and **nowhere else** — no Vulkan, no Metal, no CPU equivalent, and the
-Vulkan shader directory has no indexer or hyper-connection shader at all.
+At llama.cpp `5676dfbe0` the DeepSeek ops `GGML_OP_LIGHTNING_INDEXER`,
+`GGML_OP_DSV4_HC_COMB` / `_PRE` / `_POST` and `GGML_OP_TOP_K_MASK` have a case
+in the CPU, CUDA and Metal backends' op switches. Vulkan has the indexer and the
+three hyper-connection ops (`lightning_indexer.comp`, `dsv4_hc_comb.comp`,
+`dsv4_hc_pre.comp`, `dsv4_hc_post.comp` under
+`ggml/src/ggml-vulkan/vulkan-shaders/`) but no `GGML_OP_TOP_K_MASK` case; SYCL
+likewise has the four but not the mask. Listed by grepping each backend's op
+switch and the Vulkan shader directory, not by reading the kernels. These are
+the reference kernels to read before writing or tuning infr's own (B-DSV4-HC and
+the indexer's Vulkan cost in plan 09 § 5).
 
-Useful specifics for anyone porting, read directly from
-`ggml_cuda_lightning_indexer_supported`: the fused path is refused unless the
-indexer head dim is exactly 128 and the head count is 64 or 32, every non-quant
-`q`/`k` stride is 16-byte aligned, and `k`'s type is one of F32, BF16, F16,
-Q8_0, Q5_1, Q5_0, Q4_1, Q4_0. `dsv4-hc` exposes three entry points —
-`ggml_cuda_op_dsv4_hc_comb`, `_pre`, `_post` — matching the
-`build_hc_pre`/`build_hc_post` decomposition `infr` already mirrors.
-
-Worth noting `infr`'s `Op::LightningIndexer` is architecturally **ahead** of
-upstream on both backends that have it: its doc records that llama.cpp expands
-the selected indices back into a `-inf` mask and runs dense attention,
-"realising none of the FLOP saving", whereas `infr` emits the `top_k` indices
-and leaves the gather open to the consumer. Nothing here suggests changing that.
+The reference's CSA attention is sparse where flash attention is on.
+`deepseek4.cpp`'s `build_top_k_mask` still expands the selected indices into a
+`-inf` mask over every compressed row, but `build_csa_attention` passes
+`n_kv_max` (the raw window plus the top-k count) through `build_attn_mha` to
+`ggml_flash_attn_ext_set_n_kv_max`, and the CUDA and Vulkan backends compact the
+mask and attend over at most that many columns (`fattn-common.cuh`'s
+`use_sparse`; `flash_attn_sparse_compact.comp`); Metal has `n_kv_max` handling
+in `fa_aux.metal`. Read on 2026-11-16, kernels not run. So infr's planned
+two-segment attention, which masks rather than gathers, will do more work than
+the reference past about 2051 tokens; plan 09 § 5 lists gathering the CSA top-k
+as its answer. The OpenCL and Hexagon backends also have cases for these ops and
+were not looked at.
 
 ### B-DSHW-PULL — the llama.cpp reference has moved past the pin the docs name (2026-08-11, updated 2026-11-12)
 
@@ -2987,11 +2999,17 @@ open
 One can, and the tree already tests it: `cpu_deepseek_v32_config` and the
 `#[ignore]`d `cpu_deepseek_v32_golden` in
 `crates/infr-llama/tests/cpu_backend.rs` run against
-`unsloth/DeepSeek-V3.2-GGUF`. But that file — like every published V3.2
-conversion, per the test module's own comment — declares
-`general.architecture = "deepseek2"` and carries no indexer tensors. So a real
-V3.2 runs the stage-2 dense-MLA path, and the `deepseek32` arch (MLA plus the
-indexer) is reachable only from the synthetic fixtures. Both docs now say so.
+`unsloth/DeepSeek-V3.2-GGUF`. That file declares
+`general.architecture = "deepseek2"` and carries no indexer tensors, so it runs
+the stage-2 dense-MLA path.
+
+Public files that DO declare `deepseek32` exist too, contrary to what the docs
+and the V3.2 test module's comment in `cpu_backend.rs` said: the Hugging Face
+API (`/api/models/sszymczyk/DeepSeek-V3.2-Exp-light-GGUF`, read 2026-11-16)
+reports `architecture: deepseek32` for that repo's Q4_K_M split, about 404 GB in
+all — V3.2-Exp weights, tensor list not read. It cannot run on this box, so the
+`deepseek32` arch (MLA plus the indexer) is still exercised only by the
+synthetic fixtures. All three now say so.
 
 What that leaves unverified:
 

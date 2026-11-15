@@ -3,12 +3,14 @@
 Status: **Stage 3 done.** A `deepseek32` (V3.2) model loads, builds a graph with
 the lightning indexer wired in, and generates on CPU and Vulkan — see § Stage 3
 for what that is verified against. The `deepseek32` path is exercised by
-synthetic fixtures only, because **no public GGUF declares `deepseek32`**: every
-published V3.2 conversion declares `deepseek2` and drops the indexer tensors, so
-a real V3.2 file runs the stage-2 dense-MLA path instead
-(`cpu_deepseek_v32_config` and the `#[ignore]`d `cpu_deepseek_v32_golden`, on
-`unsloth/DeepSeek-V3.2-GGUF`). See `backlog.md` B102 for what that leaves
-unverified.
+synthetic fixtures only. Public GGUFs that declare `deepseek32` do exist — the
+Hugging Face API reports that architecture for
+`sszymczyk/DeepSeek-V3.2-Exp-light-GGUF` (Q4_K_M, about 404 GB; tensor list not
+read) — but none fits this box. The conversion the tree does test,
+`unsloth/DeepSeek-V3.2-GGUF`, declares `deepseek2` and drops the indexer
+tensors, so it runs the stage-2 dense-MLA path instead
+(`cpu_deepseek_v32_config` and the `#[ignore]`d `cpu_deepseek_v32_golden`). See
+`backlog.md` B102 for what that leaves unverified.
 
 Stage 2: CPU path works end-to-end on V2-Lite; Vulkan and Metal MLA kernels are
 implemented, wired, and executed on their real devices (Vulkan on the GPU box,
@@ -591,9 +593,9 @@ a gather remains a pure optimisation on top.
 
 All verification of the indexer is synthetic — `tests/synthetic_deepseek2.rs`
 builds a `deepseek32` GGUF from the same description as the `deepseek2` one plus
-an indexer. A real V3.2 file exists locally, but like every public conversion it
-declares `deepseek2` and carries no indexer tensors, so it cannot exercise any
-of this.
+an indexer. A real V3.2 file exists locally, but it declares `deepseek2` and
+carries no indexer tensors, so it cannot exercise any of this; the public files
+that do declare `deepseek32` are far larger than this box can run.
 
 - `synthetic_deepseek32_cpu_prefill_is_finite` — the whole model runs.
 - `gpu_synthetic_deepseek32_matches_cpu` — CPU vs Vulkan: cosine
@@ -1117,19 +1119,21 @@ header says so outright: "DSV4 raw attention only uses the SWA half of
 Two consequences the old prose hid. **`state_size == 2*ratio` is what makes a
 compressor overlapping, and only CSA and LID are** — `hca_state` gets
 `state_size == ratio`, so HCA pools a single non-overlapping block. And **the
-LID plan is not computed at all**: `plans_lid(plans_csa)` (line 1785) copies the
-CSA plan verbatim, because both run at ratio 4 with `overlap = true` and the
-same `state_size`. Only the row widths differ.
+LID plan is built from the same parameters as the CSA plan**: the
+`llama_kv_cache_dsv4_context` constructor calls `dsv4_build_comp_plans` once per
+tier, and the LID call reads its own state and cache, whose ratio (4), overlap,
+state size (8) and row count equal the CSA ones on V4, with the same
+`pad_blocks = true` — so the two plans are equal. Only the row widths differ.
 
 #### The per-ubatch plan
 
-`dsv4_build_comp_plan` (lines 418-599) is the whole state machine. Per token, at
-absolute position `pos`:
+`dsv4_build_comp_plan` is the whole state machine. Per token, at absolute
+position `pos`:
 
 ```text
 state_pos[i]  = pos % ratio                 // APE row id, gathers attn_comp_ape
 n_visible[i]  = (pos + 1) / ratio           // FLOOR — completed blocks only
-plan.n_kv     = GGML_PAD(max_i n_visible[i], 256)
+plan.n_kv     = max(GGML_PAD(max_i n_visible[i], 256), 256)
 ```
 
 The compressor state is a **ring of `state_size` rows** indexed
@@ -1212,15 +1216,16 @@ Each is a place where a plausible implementation runs and is wrong.
    `n_visible`, or that flushes the partial block at the end of a prefill,
    exposes a row built from a half-filled window.
 
-2. **`n_kv == 0` changes the GRAPH, not just the mask.**
-   `dsv4_build_comp_inputs` builds `inp.kq_mask` only `if (plan.n_kv > 0)`
-   (`llama-graph.cpp:839`), and `build_attention` dispatches on that mask being
-   non-null (`deepseek4.cpp:1050-1063`). So a ubatch in which **no** token has
-   completed a block — any prefill shorter than 128 tokens on an HCA layer,
-   shorter than 4 on a CSA layer — runs `build_raw_attention` instead: pure
-   sliding window, no compressed half at all. This is the first thing a short
-   synthetic prefill will hit, and it is a different graph, so it cannot be
-   papered over with masking.
+2. **The compressed half is always in the graph, even before any block
+   completes.** `dsv4_build_comp_plan` ends with
+   `plan.n_kv = max(GGML_PAD(plan.n_kv, 256), 256)`, so `n_kv` is never 0 and
+   the compressed mask, and with it the compressed branch, exist on every
+   ubatch; a ubatch in which no token has completed a block — any prefill
+   shorter than 128 tokens on an HCA layer, shorter than 4 on a CSA layer — gets
+   an all-`-inf` compressed half. (Earlier pins skipped the branch when `n_kv`
+   was 0; that is no longer the reference.) An all-masked half weighs exactly
+   zero, so infr may skip the segment when every `n_visible` is 0 and compute
+   the same numbers; `dsv4_plan.rs` reports the unpadded width for that reason.
 
 3. **Padded `n_kv` versus per-token visible length.** `plan.n_kv` is padded to
    256 so the graph shape does not change at every block boundary, and the mask
@@ -1233,13 +1238,24 @@ Each is a place where a plausible implementation runs and is wrong.
    the raw half plus the attention sink — which is exactly why the sink joins
    the softmax max as well as the denominator.
 
-4. **The CSA scratch write.** On a non-boundary CSA step, lines 534-563 push a
-   dummy commit to `cache_off + kv_size - 1` — the cache's LAST row — sourced
-   from one repeated row, purely so a decode step's graph matches a boundary
-   step's. It is garbage, and it is safe only because `n_visible < kv_size`
-   always keeps it masked. **HCA has no such fallback** (the branch is gated
-   `ratio == DSV4_CSA_RATIO`), so an HCA layer's commit op genuinely appears and
-   disappears with the block boundary.
+4. **Dummy commits to the last row, on every tier.** A dummy commit writes
+   `cache_off + kv_size - 1` — the cache's LAST row — at rope position 0,
+   sourced from the first token's state row repeated, purely so the compress and
+   write ops keep their place in the graph. It is garbage, safe only because
+   `n_visible < kv_size` always keeps it masked. Two rules add one, selected by
+   `dsv4_build_comp_plan`'s `pad_blocks` argument:
+   - **CSA and LID (`pad_blocks = true`)** pad each sequence's commits up to the
+     ubatch's block count `ceil(max(1, n_seq_tokens)/ratio)`. `init_batch`
+     splits with `split_equal`, so for one sequence `n_seq_tokens` is the whole
+     ubatch. Contiguous positions complete that many blocks or one fewer, so
+     this adds at most one dummy; a sequence two or more blocks short is refused
+     ("DSV4 CSA sequence positions are not contiguous").
+   - **HCA (`pad_blocks = false`)** adds one dummy when the ubatch commits
+     nothing at all (`!pad_blocks && state_write_idxs.empty()`).
+
+   Dummies are appended after every real commit, in the write vectors and in
+   each read half, so a consumer that writes only the real commits takes a
+   prefix.
 
 #### Two corrections to what this document said about V4's indexer
 

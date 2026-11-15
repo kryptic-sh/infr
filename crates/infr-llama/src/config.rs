@@ -381,28 +381,36 @@ pub struct Config {
     /// divisors and the constant mscale² attention boost — see `docs/deepseek.md` § YaRN.
     /// llama.cpp activates the full ramp whenever this flag is set (`yarn_ext_factor = 1.0` in
     /// `llama-context.cpp`), regardless of the current context length.
+    ///
+    /// Also read for `deepseek4`, where it gates the same ramp on the COMPRESSED layers' ropes
+    /// only ([`Config::dsv4_compressed_rope_divisors`]); V4 has no MLA score boost.
     pub rope_scaling_yarn: bool,
     /// DeepSeek V2+ YaRN: `rope.scaling.factor` — the long-context interpolate factor (40 for
     /// V2-Lite). `1.0` when the GGUF omits it. The per-pair divisor is `freq_scale = 1/factor`
     /// ramped toward 1.0 below `corr_dim` (see `docs/deepseek.md`).
+    ///
+    /// On `deepseek4` it is also the uniform divisor of a `"linear"` file, and it
+    /// is forced to `1.0` when the file declares `rope.scaling.type = "none"`.
     pub rope_scaling_factor: f32,
     /// DeepSeek V2+ YaRN: `rope.scaling.original_context_length` — the context the model was
     /// TRAINED at, the `n_ctx_orig` of the corr_dim ramp (4096 for V2-Lite). Defaults to
     /// `context_length` when the GGUF omits it (llama.cpp's `n_ctx_orig_yarn` fallback). NOT
     /// `n_ctx_train`: this GGUF sets `context_length = 163840` while the yarn ramp must use 4096.
+    /// Read for `deepseek4` too.
     pub rope_scaling_orig_ctx: usize,
     /// DeepSeek V2+ YaRN: `rope.scaling.attn_factor` — llama.cpp's `hparams.rope_attn_factor`,
     /// folded into `cparams.yarn_attn_factor` (`llama-context.cpp`) BEFORE the deepseek2 builder
     /// recovers `attn_factor_org` from it, so it lands inside the squared mscale of the MLA score
-    /// scale. `1.0` (llama.cpp's default) when the GGUF omits it.
+    /// scale. `1.0` (llama.cpp's default) when the GGUF omits it. Always `1.0` on `deepseek4`,
+    /// whose ropes take `dsv4_rope_attn_factor` in place of `cparams.yarn_attn_factor`.
     pub rope_attn_factor: f32,
     /// DeepSeek V2+ YaRN: the ramp's high-frequency corner, the `beta_fast` of
     /// `ggml_rope_yarn_corr_dims`'s START dim. Always `YARN_BETA_FAST`: the reference's
-    /// deepseek2 loader does not read `rope.scaling.yarn_beta_fast`.
+    /// deepseek2 and deepseek4 loaders do not read `rope.scaling.yarn_beta_fast`.
     pub rope_yarn_beta_fast: f32,
     /// DeepSeek V2+ YaRN: the ramp's low-frequency corner, the `beta_slow` of
     /// `ggml_rope_yarn_corr_dims`'s END dim. Always `YARN_BETA_SLOW`: the reference's deepseek2
-    /// loader does not read `rope.scaling.yarn_beta_slow`.
+    /// and deepseek4 loaders do not read `rope.scaling.yarn_beta_slow`.
     pub rope_yarn_beta_slow: f32,
     /// DeepSeek V2+ "lite" variant: `wq` present ⇒ lite (no wq_a/q_a_norm/wq_b). Detected by
     /// tensor presence, not GGUF key.
@@ -465,6 +473,55 @@ impl Config {
     /// arch (`hash_layer_count == 0`).
     pub fn is_hash_moe_layer(&self, il: usize) -> bool {
         il < self.hash_layer_count
+    }
+
+    /// deepseek4: the per-pair rope frequency divisors (`rope_dim / 2` floats) of every rope on a
+    /// COMPRESSED layer (ratio 4 or 128), at base [`Config::compress_rope_theta`]. `None` for
+    /// every other arch. Nothing applies it yet: the compressed tiers are refused before a graph
+    /// is built, and ratio-0 layers rope plain at [`Config::rope_theta`] (`deepseek4.cpp` passes
+    /// them `freq_scale = 1` and `ext_factor = 0`).
+    ///
+    /// How the reference's rope maps onto `Op::Rope`. `deepseek4.cpp` ropes the query, the kv
+    /// row, the attention output's de-rope, each compressed row and the indexer query of a
+    /// compressed layer with `ggml_rope_ext(…, n_rot, rope_type, n_ctx_orig,
+    /// compress_rope_base, freq_scale, ext_factor, dsv4_rope_attn_factor(freq_scale, ext_factor),
+    /// beta_fast, beta_slow)` and no `freq_factors` tensor, then `ggml_rope_set_offset(…, nope)`:
+    /// - **Angle.** `freq_scale = 1/rope.scaling.factor`; `ext_factor` is 1 for a `"yarn"` file
+    ///   and 0 otherwise; the betas are `llama_hparams`' defaults. With `ext_factor = 1`, ggml's
+    ///   `rope_yarn` angle is the plain angle divided by `yarn_freq_divisors`' entry (the same
+    ///   real number; the f32 roundings differ), which is what `Op::Rope::freq_factors` divides
+    ///   by (pair `p`, angle `pos · theta^(-2p/rope_dim) / ff[p]`), with
+    ///   `theta = compress_rope_theta`. With `ext_factor = 0` the angle is `freq_scale · θe`, a
+    ///   uniform divisor of `1/freq_scale`. The divisor is the whole of what `freq_factors`
+    ///   expects: the reference passes no `freq_factors` tensor of its own to multiply in.
+    /// - **Magnitude.** None is left over: ggml multiplies cos and sin by `attn_factor`, and by
+    ///   `1 + 0.1·ln(1/freq_scale)` when `ext_factor != 0`; `dsv4_rope_attn_factor` is the
+    ///   reciprocal of that second factor (or 1 when `ext_factor == 0`), so the product is 1 up
+    ///   to one f32 rounding — and `Op::Rope` applies no magnitude at all.
+    /// - **Pairing and span.** `llama_model::rope_type` puts DEEPSEEK4 in the NORM group, so
+    ///   `Op::Rope { neox: false }` (adjacent pairs). `ggml_rope_set_offset(nope)` rotates the
+    ///   LAST `n_rot` dims of each head (`[nope, nope + n_rot)`), so the head's tail is gathered
+    ///   to a packed `rope_dim`-wide row first, as the ratio-0 arm already does.
+    /// - **Width.** Every one of those ropes rotates `hparams.n_rot()` dims, the indexer's too, so
+    ///   one vector of `rope_dim / 2` divisors serves all of them.
+    pub fn dsv4_compressed_rope_divisors(&self) -> Option<Vec<f32>> {
+        if !self.deepseek4 {
+            return None;
+        }
+        let pairs = self.rope_dim / 2;
+        Some(if self.rope_scaling_yarn {
+            yarn_freq_divisors(
+                self.rope_dim,
+                self.compress_rope_theta,
+                self.rope_scaling_orig_ctx,
+                self.rope_scaling_factor,
+                self.rope_yarn_beta_fast,
+                self.rope_yarn_beta_slow,
+            )
+        } else {
+            let freq_scale = 1.0 / self.rope_scaling_factor;
+            vec![1.0 / freq_scale; pairs]
+        })
     }
 
     /// RoPE base for layer `il`: gemma3 SWA (local) layers use the smaller `swa_rope_theta`, full
@@ -886,6 +943,38 @@ impl Config {
                 YARN_BETA_FAST,
                 YARN_BETA_SLOW,
             )
+        } else if deepseek4 {
+            // V4 reads only what the generic `llama_model::load_hparams` reads — no deepseek4
+            // loader key touches rope scaling — and applies it on the compressed tiers alone
+            // (`Config::dsv4_compressed_rope_divisors`). Absent, the type is `"linear"` and the
+            // factor 0, i.e. no scaling; `"none"` forces `freq_scale = 1` whatever the factor
+            // (`llama-context.cpp`); an unknown string trips the reference's
+            // `GGML_ASSERT(rope_scaling_type_train != UNSPECIFIED)`. `longrope` is a type the
+            // reference knows and V4 does not use, so it is refused here rather than given a
+            // meaning no file has been checked against.
+            let type_key = mk("rope.scaling.type");
+            let ty = g
+                .metadata()
+                .get(&type_key)
+                .and_then(MetaValue::as_str)
+                .unwrap_or("linear");
+            let factor = meta_f64(g, &mk("rope.scaling.factor"))
+                .or_else(|| meta_f64(g, &mk("rope.scale_linear")))
+                .unwrap_or(0.0) as f32;
+            let factor = if factor == 0.0 { 1.0 } else { factor };
+            let (yarn, factor) = match ty {
+                "yarn" => (true, factor),
+                "linear" => (false, factor),
+                "none" => (false, 1.0),
+                other => bail!("{type_key} = {other:?}: deepseek4 supports none, linear and yarn"),
+            };
+            let orig_ctx = meta_u64(g, &mk("rope.scaling.original_context_length"))
+                .or_else(|| meta_u64(g, &mk("context_length")))
+                .unwrap_or(8192) as usize;
+            // `rope.scaling.attn_factor` is not read: `deepseek4.cpp` passes its own
+            // `dsv4_rope_attn_factor` to every rope instead of `cparams.yarn_attn_factor`, the
+            // only place that key lands. Nor are the beta keys, as for deepseek2.
+            (yarn, factor, orig_ctx, 1.0, YARN_BETA_FAST, YARN_BETA_SLOW)
         } else {
             (false, 1.0, 0, 1.0, YARN_BETA_FAST, YARN_BETA_SLOW)
         };
@@ -1987,6 +2076,48 @@ fn mla_rope_mscale(yarn: bool, factor: f32, log_mul: f32, attn_factor: f32) -> f
         1.0
     };
     ratio * attn_factor
+}
+
+/// The YaRN per-pair rope frequency DIVISORS (`n_rot / 2` floats) for an `Op::Rope`'s
+/// `freq_factors`: pair `p`'s angle is the plain `pos · base^(-2p/n_rot)` divided by entry `p`.
+///
+/// Ported from ggml's `rope_yarn` (`ggml/src/ggml-cpu/ops.cpp`) with `ext_factor = 1`, which is
+/// what `llama-context.cpp` resolves for a file whose `rope.scaling.type` is `"yarn"`. ggml blends
+/// the interpolated and extrapolated angles, `θ = fs·θe·(1 − r) + θe·r` with
+/// `fs = freq_scale = 1/factor` and `r = rope_yarn_ramp(corr_dims, 2p)`, which is
+/// `θe / (1 / (fs + (1 − fs)·r))` — so the divisor is `1 / (fs + (1 − fs)·r)`: 1 on the
+/// high-frequency pairs below the ramp, `factor` past it. `corr_dims` is
+/// `ggml_rope_yarn_corr_dims` with ggml's default truncation (start floored, end ceiled), and
+/// `n_ctx_orig` is the ramp's original context. Both corners are clamped into `[0, n_rot)`, where
+/// ggml clamps only the start's floor and the end's ceiling; the two agree unless the corrected
+/// start lies past the last pair or the end before the first.
+///
+/// This is only the ANGLE half of `rope_yarn`: its magnitude factor `mscale` is not represented,
+/// and each caller says why it is 1 for its arch.
+pub(crate) fn yarn_freq_divisors(
+    n_rot: usize,
+    base: f32,
+    n_ctx_orig: usize,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Vec<f32> {
+    let n_rot = n_rot as f32;
+    let n_ctx_orig = n_ctx_orig as f32;
+    let freq_scale = 1.0 / factor;
+    // corr_dim(n_rot): the dim below which the ramp is fully active — `ggml_rope_yarn_corr_dim`.
+    let corr =
+        |nr: f32| n_rot * (n_ctx_orig / (nr * std::f32::consts::TAU)).ln() / (2.0 * base.ln());
+    let start = (corr(beta_fast).floor() as i64).clamp(0, (n_rot as i64) - 1);
+    let end = (corr(beta_slow).ceil() as i64).clamp(0, (n_rot as i64) - 1);
+    let span = ((end - start) as f32).max(0.001);
+    (0..(n_rot as usize / 2))
+        .map(|p| {
+            let ramp = 1.0 - (((p as f32) - start as f32) / span).clamp(0.0, 1.0);
+            let s = freq_scale + (1.0 - freq_scale) * ramp;
+            1.0 / s
+        })
+        .collect()
 }
 
 /// `build_qkv` (`llama-graph.cpp`): the separate or fused q/k/v projections, each through
@@ -3354,5 +3485,85 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    /// The compressed-tier rope divisors of a V4-Flash-shaped config (compress base 160000,
+    /// `n_rot` 64, YaRN factor 16 over an original context of 65536), against ggml's formulas
+    /// written out here in f64 rather than through `yarn_freq_divisors`:
+    ///
+    /// - `ggml_rope_yarn_corr_dim(n_dims, n_ctx_orig, beta, base)
+    ///   = n_dims · ln(n_ctx_orig / (2π·beta)) / (2·ln base)`, truncated to
+    ///   `[floor(corr(beta_fast = 32)), ceil(corr(beta_slow = 1))]` = `[15, 25]`
+    ///   (15.45… and 24.70… before truncation).
+    /// - `rope_yarn_ramp(15, 25, 2p) = 1 − clamp((p − 15) / 10, 0, 1)`, and with `ext_factor = 1`
+    ///   the angle is `θe·(fs·(1 − ramp) + ramp)` with `fs = 1/16`, so the divisor is
+    ///   `1 / (fs + (1 − fs)·ramp)`.
+    ///
+    /// Pair 0 and the start corner (pair 15) are unscaled (1), the end corner (pair 25) and the
+    /// last pair are fully interpolated (16), and the ramp's interior is checked at three pairs.
+    #[test]
+    fn dsv4_compressed_rope_divisors_match_ggml_yarn_closed_form() {
+        let cfg = Config {
+            deepseek4: true,
+            rope_dim: 64,
+            compress_rope_theta: 160000.0,
+            rope_theta: 10000.0,
+            rope_scaling_yarn: true,
+            rope_scaling_factor: 16.0,
+            rope_scaling_orig_ctx: 65536,
+            rope_yarn_beta_fast: 32.0,
+            rope_yarn_beta_slow: 1.0,
+            ..Default::default()
+        };
+        let corr = |beta: f64| {
+            64.0 * (65536.0 / (2.0 * std::f64::consts::PI * beta)).ln() / (2.0 * 160000f64.ln())
+        };
+        assert_eq!((corr(32.0).floor(), corr(1.0).ceil()), (15.0, 25.0));
+
+        let ff = cfg.dsv4_compressed_rope_divisors().expect("deepseek4");
+        assert_eq!(ff.len(), 32);
+        let fs = 1.0 / 16.0;
+        let closed = |p: f64| {
+            let ramp = 1.0 - ((p - 15.0) / 10.0).clamp(0.0, 1.0);
+            1.0 / (fs + (1.0 - fs) * ramp)
+        };
+        for (p, want) in [
+            (0, 1.0),
+            (15, 1.0),
+            (16, 1.0 / 0.90625),
+            (20, 1.0 / 0.53125),
+            (24, 6.4),
+            (25, 16.0),
+            (31, 16.0),
+        ] {
+            assert!(
+                (closed(p as f64) - want).abs() < 1e-12,
+                "closed form at pair {p}"
+            );
+            let got = ff[p] as f64;
+            assert!(
+                (got - want).abs() <= 1e-6 * want,
+                "pair {p}: got {got}, want {want}"
+            );
+        }
+
+        // Without YaRN the same config has no ramp: a factor of 1 leaves every pair unscaled, and a
+        // "linear" factor divides every pair alike. Neither arch nor base matters to that.
+        let plain = Config {
+            rope_scaling_yarn: false,
+            rope_scaling_factor: 1.0,
+            ..cfg.clone()
+        };
+        assert_eq!(plain.dsv4_compressed_rope_divisors(), Some(vec![1.0; 32]));
+        let linear = Config {
+            rope_scaling_yarn: false,
+            ..cfg.clone()
+        };
+        assert_eq!(linear.dsv4_compressed_rope_divisors(), Some(vec![16.0; 32]));
+        let not_v4 = Config {
+            deepseek4: false,
+            ..cfg
+        };
+        assert_eq!(not_v4.dsv4_compressed_rope_divisors(), None);
     }
 }

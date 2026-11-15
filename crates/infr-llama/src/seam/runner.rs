@@ -232,27 +232,16 @@ fn session_stable(
     // this GGUF inflates to 163840. Bound as a per-step f32 Input exactly like `rope_freqs`.
     // `None` = plain rope (non-yarn models).
     let yarn_ff: Option<Vec<f32>> = if c.rope_scaling_yarn && c.qk_rope_dim > 0 {
-        let n_rot = c.qk_rope_dim as f32;
-        let n_ctx_orig = c.rope_scaling_orig_ctx as f32;
-        let freq_scale = 1.0 / c.rope_scaling_factor;
-        // corr_dim(n_rot): the dim below which the ramp is fully active — `ggml_rope_yarn_corr_dim`.
-        let corr = |nr: f32| {
-            n_rot * (n_ctx_orig / (nr * std::f32::consts::TAU)).ln() / (2.0 * c.rope_theta.ln())
-        };
         // The two ramp corners are `beta_fast`/`beta_slow` (`ggml_rope_yarn_corr_dims`), at
         // llama.cpp's defaults whatever the GGUF declares (see `Config::rope_yarn_beta_fast`).
-        let start = (corr(c.rope_yarn_beta_fast).floor() as i64).clamp(0, (n_rot as i64) - 1);
-        let end = (corr(c.rope_yarn_beta_slow).ceil() as i64).clamp(0, (n_rot as i64) - 1);
-        let span = ((end - start) as f32).max(0.001);
-        Some(
-            (0..(n_rot as usize / 2))
-                .map(|p| {
-                    let ramp = 1.0 - (((p as f32) - start as f32) / span).clamp(0.0, 1.0);
-                    let s = freq_scale + (1.0 - freq_scale) * ramp;
-                    1.0 / s
-                })
-                .collect(),
-        )
+        Some(crate::config::yarn_freq_divisors(
+            c.qk_rope_dim,
+            c.rope_theta,
+            c.rope_scaling_orig_ctx,
+            c.rope_scaling_factor,
+            c.rope_yarn_beta_fast,
+            c.rope_yarn_beta_slow,
+        ))
     } else {
         None
     };

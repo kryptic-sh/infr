@@ -2147,6 +2147,13 @@ fn synthetic_deepseek4_config_gates() {
     );
     assert!(!cfg.rope_scaling_yarn);
     assert_eq!(cfg.rope_yarn_log_mul, 0.0);
+    // No `rope.scaling.*` keys at all: the reference's defaults are type "linear" with factor 0,
+    // i.e. `freq_scale = 1` — the compressed tiers rope unscaled.
+    assert_eq!(
+        cfg.dsv4_compressed_rope_divisors(),
+        Some(vec![1.0; d.rope_dim / 2]),
+        "a V4 file without scaling keys has no YaRN"
+    );
     assert_eq!(cfg.n_expert_groups, 0, "V4 does not group-limit routing");
     assert_eq!(cfg.n_layer_dense_lead, 0, "V4 has no dense-lead layers");
     assert_eq!(cfg.n_layer_nextn, 0, "V4 has no NextN blocks");
@@ -2693,6 +2700,79 @@ fn synthetic_deepseek4_mandatory_keys_are_required() {
             "a deepseek4 GGUF without {full} must be refused naming it, got: {err}"
         );
     }
+}
+
+/// `deepseek4` with `rope.scaling.*` keys — the canonical fixture plus the keys, rather than the
+/// keys in the fixture itself, so every other V4 test keeps reading a file without them.
+fn dsv4_model_with_scaling(keys: Vec<(&str, Meta)>) -> SyntheticModel {
+    let mut m = deepseek4_model();
+    for (k, v) in keys {
+        m.meta.push((format!("deepseek4.{k}"), v));
+    }
+    m.meta.sort_by(|a, b| a.0.cmp(&b.0));
+    m
+}
+
+/// The rope-scaling keys are read for `deepseek4`, by the generic loader's rules: `type`,
+/// `factor` and `original_context_length` are used, while the beta corners and
+/// `rope.scaling.attn_factor` are not (no V4 loader key reads them, and `deepseek4.cpp` passes
+/// its own attention factor). The fixture's rope is 16 dims at compress base 40000, so with an
+/// original context of 65536 ggml's truncated corr dims are `[floor 4.37…, ceil 6.99…] = [4, 7]`
+/// at the default betas, and the divisors are `1 / (fs + (1 − fs)·ramp)` with `fs = 1/16` and
+/// `ramp = 1 − clamp((p − 4)/3, 0, 1)`: 1 up to pair 4, then 16/11, 8/3, 16. A `yarn_beta_fast`
+/// of 4 would move the start corner to 5 (floor 5.94…) and make pair 5 unscaled, so pair 5 is
+/// what shows the declared beta was ignored.
+#[test]
+fn synthetic_deepseek4_rope_scaling_keys_are_read() {
+    let yarn = || {
+        vec![
+            ("rope.scaling.type", Meta::Str("yarn".into())),
+            ("rope.scaling.factor", Meta::F32(16.0)),
+            ("rope.scaling.original_context_length", Meta::U32(65536)),
+        ]
+    };
+    let cfg_of = |tag: &str, m: &SyntheticModel| {
+        let tmp = TempGguf::write(tag, m);
+        let g = infr_gguf::Gguf::open(tmp.path()).expect("open synthetic GGUF");
+        infr_llama::Config::from_gguf(&g).expect("Config::from_gguf")
+    };
+
+    let mut keys = yarn();
+    keys.push(("rope.scaling.yarn_beta_fast", Meta::F32(4.0)));
+    keys.push(("rope.scaling.attn_factor", Meta::F32(3.0)));
+    let cfg = cfg_of("ds4-yarn", &dsv4_model_with_scaling(keys));
+    assert!(cfg.rope_scaling_yarn);
+    assert_eq!(cfg.rope_scaling_factor, 16.0);
+    assert_eq!(cfg.rope_scaling_orig_ctx, 65536);
+    assert_eq!(
+        (cfg.rope_yarn_beta_fast, cfg.rope_yarn_beta_slow),
+        (32.0, 1.0)
+    );
+    assert_eq!(cfg.rope_attn_factor, 1.0);
+    let want = [1.0, 1.0, 1.0, 1.0, 1.0, 16.0 / 11.0, 8.0 / 3.0, 16.0];
+    let got = cfg.dsv4_compressed_rope_divisors().expect("deepseek4");
+    assert_eq!(got.len(), want.len());
+    for (p, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!((g - w).abs() <= 1e-6 * w, "pair {p}: got {g}, want {w}");
+    }
+
+    // "none" forces `freq_scale = 1` whatever the factor; no type at all means "linear", whose
+    // factor divides every pair alike; and a type the reference does not know is refused.
+    let mut none = yarn();
+    none[0].1 = Meta::Str("none".into());
+    let cfg = cfg_of("ds4-rope-none", &dsv4_model_with_scaling(none));
+    assert_eq!(cfg.dsv4_compressed_rope_divisors(), Some(vec![1.0; 8]));
+    let linear = yarn().split_off(1);
+    let cfg = cfg_of("ds4-rope-linear", &dsv4_model_with_scaling(linear));
+    assert!(!cfg.rope_scaling_yarn);
+    assert_eq!(cfg.dsv4_compressed_rope_divisors(), Some(vec![16.0; 8]));
+    let mut odd = yarn();
+    odd[0].1 = Meta::Str("ntk".into());
+    let err = config_err("ds4-rope-ntk", &dsv4_model_with_scaling(odd));
+    assert!(
+        err.contains("deepseek4.rope.scaling.type"),
+        "an unknown rope scaling type must be refused naming the key, got: {err}"
+    );
 }
 
 /// **A COMPRESSED layer is still refused, by name, and the message says which layer and which

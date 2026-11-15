@@ -5665,3 +5665,80 @@ float-streaming change that was being gated. The other Qwen3-30B-A3B
 were not measured. Options: skip the resident leg on a unified device when the
 model exceeds a fraction of host RAM (the paged legs are the point there), or
 run the 30B tests on the discrete GPU only and say so in their doc.
+
+### B195 — sampling and constrained decoding: what a first full read found (2026-11-15)
+
+**Tag:** sampling · serve · parity · perf · **Evidence:** read from the code and
+compared with llama.cpp `5676dfbe0` (`common/common.h`, `src/llama-sampler.cpp`,
+`tools/server/server-context.cpp`); nothing was built or run. Earlier passes had
+cleared only seed handling, penalty indexing, `StopMatcher` and the GPU sampler
+shader bodies.
+
+- **`SpecMetalChat` drops the request's `RequestCtx`.**
+  `SpecMetalChat::generate` (`chat/metal.rs`) takes `_req` and
+  `SeamModel::generate_metal_spec` has no parameter for it and polls no latch.
+  Under `infr serve` on macOS with `INFR_SPEC_DRAFT` set, a stop sequence, a
+  deadline or a client hang-up does not stop decoding (the text is still cut by
+  `StopMatcher`, the compute runs to `max_tokens` holding the model), and a
+  request's `temperature`, `seed` and penalties are ignored without a word. B151
+  records the same for the parked MTP path only; this one is live. Fix: thread
+  `req` through, poll `abort_requested(req)` per draft/verify round, and reject
+  or log a request with `temperature > 0`. Needs macOS to run.
+- **Temperature is applied before top-p; llama.cpp applies it after.**
+  `truncated_softmax` (`sampling.rs`) cuts the nucleus on tempered
+  probabilities, and `infr-cpu`'s `sample_token`, `sample_topk.comp` and the
+  Metal sampler copy that order. llama.cpp's default chain ends with temperature
+  and its top-p takes the softmax of the raw logits. Logits `[2, 0, 0]` at temp
+  0.6, top_p 0.9: llama.cpp keeps all three tokens (raw 0.787 / 0.107 / 0.107)
+  and draws token 0 at 0.933; infr's tempered 0.933 already passes the cut, so
+  it always draws token 0. Below temp 1 infr's nucleus is systematically
+  smaller. infr's order is the one HF transformers uses, and `arch_sampling`
+  defaults come from HF `generation_config`; nothing says which was intended.
+  **Needs a decision:** keep the HF order and document the difference, or
+  switch, which changes four implementations together and re-pins the GPU parity
+  and `reference_full_sort` tests.
+- **`top_k == 0` with `top_p >= 1.0` sorts the whole vocabulary on the host for
+  every token.** The cumulative f32 sum rarely reaches exactly 1.0, so the
+  `top_k == 0` arm of `truncated_softmax` widens to `n` and sorts it; the
+  comment on `NUCLEUS_WIDEN` puts that at 3.22 ms per token at a 128256 vocab
+  (not re-measured). llama.cpp's top-p returns at once for `p >= 1`. Triggered
+  by an architecture whose default `top_k` is 0 (Llama-3.x, Llama-4, SmolLM3)
+  and a client sending `top_p: 1`, which also keeps the GPU sampler off. Fix:
+  return the full support unsorted in that case; the distribution is unchanged
+  but the token drawn for a seed changes, so
+  `randomized_differential_against_reference_full_sort` and
+  `nucleus_widening_reaches_the_full_vocab` need to compare support as a set.
+- **Penalties differ from llama.cpp.** `Penalties::resolve` starts empty and
+  `observe` sees generated tokens only, where llama.cpp's server feeds every
+  prompt token to the sampler first; presence and frequency count over the whole
+  generation, where llama.cpp windows one count to `penalty_last_n` for all
+  three. `RequestSampling::default`'s doc says a request setting only
+  `repeat_penalty` "gets llama.cpp's behavior", which is false, and
+  `repeat_last_n` is not a request field. **Needs a decision:** match llama.cpp,
+  or keep the OpenAI reading for presence/frequency and seed only the repeat
+  window from the prompt. Fix the doc either way.
+- **Penalties are skipped under a grammar.** In `generate_dense_backend`
+  (`seam/runner.rs`) the constrained branch calls `grammar::constrained_step`
+  without `Penalties::apply`, and its tokens never reach `observe`. A forced
+  tool call with `frequency_penalty` or `repeat_penalty` gets none, silently;
+  llama.cpp applies both. Fix: apply and observe in that branch, or reject the
+  combination with a 400.
+- **`logit_bias`, `min_p`, `logprobs` and `n` are accepted and ignored.**
+  `ChatRequest` tolerates unknown fields by design and none of these reaches
+  `GenParams`: a token banned with `logit_bias` can still appear, `n: 3` returns
+  one choice. B137 records the same for `response_format`. Options: implement
+  `logit_bias` beside `Penalties::apply` (forcing host sampling as penalties
+  do), return 400 for `n > 1` and `logprobs`, or record them as deliberate
+  drops.
+- **Question, needs a run:** `constrained_step` (`grammar.rs`) resamples the
+  whole row, with a new vocabulary-sized vector, each time `try_accept` rejects
+  a candidate. The module doc implies the mask and `consume` agree, so
+  rejections may never happen; count them on a forced tool call before changing
+  anything.
+
+Checked and found right: empty and all-`-inf` rows, a `-inf` token is never
+drawn while a finite one exists, the top-p `>=` comparison, request parameter
+ranges, and no sampler plan is cached across requests. Not read: MTP and
+Diffusion-Gemma sampling, `moe_sample.comp` and the argmax shaders, the
+recorder's sampling dispatch, CLI flag validation, and the tokenizer beyond the
+streaming detokenizer.

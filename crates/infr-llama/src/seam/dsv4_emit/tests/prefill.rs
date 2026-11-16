@@ -63,10 +63,27 @@ fn layouts() -> Vec<Layout> {
 
 /// `layout`'s file opened with prefill chunks of `ubatch` rows.
 fn open(layout: &Layout, m: &SyntheticModel, ubatch: usize) -> Model {
+    open_as(layout, m, ubatch, None)
+}
+
+/// `layout`'s file opened with prefill chunks of `ubatch` rows, prefilling layer-major in
+/// segments of at most `segment` rows when `layer_major` is `Some(segment)` (`usize::MAX`: one
+/// segment), chunk-major when `None`.
+fn open_as(
+    layout: &Layout,
+    m: &SyntheticModel,
+    ubatch: usize,
+    layer_major: Option<usize>,
+) -> Model {
     let mut ec = EngineConfig::default();
     ec.device.ubatch = Some(ubatch);
     ec.device.ubatch_specified = true;
-    Model::open_with(&format!("dsv4-pf-{}-{ubatch}", layout.name), m, ec)
+    if let Some(rows) = layer_major {
+        ec.paging.layer_major = Some(true);
+        ec.paging.layer_major_rows = Some(rows);
+    }
+    let order = layer_major.map_or("cm".to_string(), |r| format!("lm{r}"));
+    Model::open_with(&format!("dsv4-pf-{}-{ubatch}-{order}", layout.name), m, ec)
 }
 
 /// `layout`'s file, with its token embedding stored as f16 when `f16_embedding`. The fixture's
@@ -124,12 +141,74 @@ fn graph_rows(len: usize, chunk: usize) -> Vec<u32> {
     rows
 }
 
+/// The row count of every `Op::Attention` a `len`-token prompt runs, in execution order, on a
+/// model of `n_layer` layers prefilled in chunks of `chunk`: chunk-major, every graph runs every
+/// layer; layer-major in segments of at most `segment` rows (`layer_major: Some(segment)`), each
+/// segment runs layer by layer, every chunk of the segment through a layer before the next layer.
+/// The decode loop's one-row graph runs every layer last either way.
+fn attention_rows(
+    len: usize,
+    chunk: usize,
+    n_layer: usize,
+    layer_major: Option<usize>,
+) -> Vec<u32> {
+    let rows = graph_rows(len, chunk);
+    let (prefill, decode) = rows.split_at(rows.len() - 1);
+    let mut out = Vec::new();
+    match layer_major {
+        None => {
+            for &r in prefill {
+                out.extend(std::iter::repeat_n(r, n_layer));
+            }
+        }
+        Some(segment) => {
+            // Segments by hand: consecutive chunks while their rows fit, a lone chunk otherwise.
+            let mut segs: Vec<Vec<u32>> = Vec::new();
+            let mut held = 0usize;
+            for &r in prefill {
+                match segs.last_mut() {
+                    Some(seg) if held + r as usize <= segment => seg.push(r),
+                    _ => {
+                        segs.push(vec![r]);
+                        held = 0;
+                    }
+                }
+                held += r as usize;
+            }
+            for seg in segs {
+                for _ in 0..n_layer {
+                    out.extend(&seg);
+                }
+            }
+        }
+    }
+    for &r in decode {
+        out.extend(std::iter::repeat_n(r, n_layer));
+    }
+    out
+}
+
 /// Prefill `prompt` on a fresh session of `m` (the prompt's last position is the decode loop's,
 /// as on every model), then decode [`DECODE`] more ids on the same session one token per graph.
 /// Checks, through `infr_cpu::op_tap`, that the prompt ran in the graphs a `chunk`-position
-/// prefill runs (every layer's attention at each graph's row count) and that each graph gathered
-/// its token embedding from the f16 table in the graph exactly when `gathered`.
+/// chunk-major prefill runs (every layer's attention at each graph's row count) and that each
+/// graph gathered its token embedding from the f16 table in the graph exactly when `gathered`.
 fn observe(m: &Model, prompt: &[u32], chunk: usize, gathered: bool) -> Observed {
+    observe_as(m, prompt, chunk, None, gathered)
+}
+
+/// [`observe`], for a model prefilling layer-major in segments of at most `segment` rows when
+/// `layer_major` is `Some(segment)`: the op tap must then show every layer's attention in that
+/// order ([`attention_rows`]), so a run that fell back to chunk-major cannot pass. The embedding
+/// is gathered by the first layer span, chunk by chunk, so its gathers come in the same order as
+/// chunk-major's.
+fn observe_as(
+    m: &Model,
+    prompt: &[u32],
+    chunk: usize,
+    layer_major: Option<usize>,
+    gathered: bool,
+) -> Observed {
     let mut s: Option<SeamKv> = None;
     infr_cpu::indexer_tap::start();
     infr_cpu::op_tap::start();
@@ -145,15 +224,14 @@ fn observe(m: &Model, prompt: &[u32], chunk: usize, gathered: bool) -> Observed 
             _ => None,
         })
         .collect();
-    let per_layer: Vec<u32> = want_rows
-        .iter()
-        .flat_map(|&r| std::iter::repeat_n(r, m.cfg.n_layer))
-        .collect();
     assert_eq!(
         attention,
-        per_layer,
-        "a {}-token prompt in chunks of {chunk} ran in other graphs",
-        prompt.len()
+        attention_rows(prompt.len(), chunk, m.cfg.n_layer, layer_major),
+        "a {}-token prompt in chunks of {chunk} ({}) ran in other graphs",
+        prompt.len(),
+        layer_major.map_or("chunk-major".into(), |s| format!(
+            "layer-major in segments of {s}"
+        )),
     );
     let embedded: Vec<u32> = ops
         .iter()
@@ -175,11 +253,18 @@ fn observe(m: &Model, prompt: &[u32], chunk: usize, gathered: bool) -> Observed 
     let csa_layers: Vec<usize> = (0..m.cfg.n_layer)
         .filter(|&l| m.cfg.layer_compress_ratio(l) == CSA)
         .collect();
+    // A position is scored once per ratio-4 layer, in layer order whichever way the prompt runs:
+    // chunk-major, a graph runs its layers in order; layer-major, a layer runs every chunk of a
+    // segment before the next layer starts. So a row's layer is how many rows of its position came
+    // before it.
+    let mut seen: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut selections: Vec<Selection> = tapped
         .iter()
         .filter_map(|r| {
-            // Every graph that scores runs one indexer per ratio-4 layer, in layer order; a row
-            // that sees no block is scored over nothing and kept for no one.
+            let nth = seen.entry(r.pos).or_insert(0);
+            let layer = csa_layers[*nth];
+            *nth += 1;
+            // A row that sees no block is scored over nothing and kept for no one.
             let visible = (r.pos + 1) / CSA;
             (visible > 0).then(|| {
                 let mut kept: Vec<u32> = r
@@ -190,7 +275,6 @@ fn observe(m: &Model, prompt: &[u32], chunk: usize, gathered: bool) -> Observed 
                     .collect();
                 kept.sort_unstable();
                 kept.dedup();
-                let layer = csa_layers[r.op % csa_layers.len()];
                 (r.pos, layer, (kept.len() != visible).then_some(kept))
             })
         })
@@ -378,6 +462,97 @@ fn batched_prefill_equals_one_position_per_graph_canonical() {
     batched_equals_one_position_per_graph("canonical");
 }
 
+/// The layer-major orders every layout is prefilled in, as (chunk height, segment rows): one
+/// segment at an unaligned small height, a mid height and the whole prompt (one chunk, still run
+/// as one layer span per graph); segments of two chunks at two heights; and segments shorter
+/// than a chunk, so each chunk is a segment of its own.
+const LAYER_MAJOR: [(usize, usize); 6] = [
+    (3, usize::MAX),
+    (37, usize::MAX),
+    (SESSION_CTX, usize::MAX),
+    (3, 7),
+    (37, 80),
+    (150, 40),
+];
+
+/// **A prompt prefilled layer-major equals the same prompt prefilled one position per graph, bit
+/// for bit** — and so equals the chunk-major prefill of [`batched_equals_one_position_per_graph`]:
+/// the last position's logits, every row's indexer selection, every compressed cache and ring
+/// after the prompt, and the greedy decode after it. On the layout named `name`, at [`lens`], in
+/// every [`LAYER_MAJOR`] order, with the embedding on the host and gathered in the graph.
+///
+/// Layer-major runs one layer for every chunk of a segment before the next layer, carrying each
+/// chunk's `hc_mult`-wide residual stream between the layer spans (`DecodeHandles::hc_resid`).
+/// Every piece of V4's state belongs to one layer — its raw cache, compressed caches, rings and
+/// indexer cache — and each layer still sees its chunks in ascending order, so each layer's
+/// state receives the same writes in the same order as chunk-major, and each op the same rows:
+/// equal bits, not merely close ones. The op tap checks every run took the order it names.
+fn layer_major_equals_one_position_per_graph(name: &str) {
+    let layout = layouts()
+        .into_iter()
+        .find(|l| l.name == name)
+        .unwrap_or_else(|| panic!("no layout {name}"));
+    let host = layout_file(&layout, false);
+    let gathered = layout_file(&layout, true);
+    let lm =
+        |m: &SyntheticModel, (k, seg): (usize, usize)| (k, seg, open_as(&layout, m, k, Some(seg)));
+    let cases = [
+        (
+            "host embedding",
+            false,
+            open(&layout, &host, 1),
+            LAYER_MAJOR.map(|o| lm(&host, o)).into(),
+        ),
+        (
+            "gathered embedding",
+            true,
+            open(&layout, &gathered, 1),
+            vec![lm(&gathered, LAYER_MAJOR[1]), lm(&gathered, LAYER_MAJOR[4])],
+        ),
+    ];
+    let mut diffs = Vec::new();
+    for &len in lens(&layout) {
+        let prompt = ids(len, 11);
+        for (what, gathered, one, runs) in &cases {
+            let want = observe(one, &prompt, 1, *gathered);
+            for (k, seg, m) in runs {
+                let got = observe_as(m, &prompt, *k, Some(*seg), *gathered);
+                diffs.extend(report(
+                    &format!("{name} at {len} tokens, {what}, layer-major chunk {k} segment {seg}"),
+                    &got,
+                    &want,
+                ));
+            }
+        }
+    }
+    assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+}
+
+#[test]
+fn layer_major_prefill_equals_one_position_per_graph_ratio0() {
+    layer_major_equals_one_position_per_graph("ratio0");
+}
+
+#[test]
+fn layer_major_prefill_equals_one_position_per_graph_hca() {
+    layer_major_equals_one_position_per_graph("hca");
+}
+
+#[test]
+fn layer_major_prefill_equals_one_position_per_graph_csa() {
+    layer_major_equals_one_position_per_graph("csa");
+}
+
+#[test]
+fn layer_major_prefill_equals_one_position_per_graph_mixed() {
+    layer_major_equals_one_position_per_graph("mixed");
+}
+
+#[test]
+fn layer_major_prefill_equals_one_position_per_graph_canonical() {
+    layer_major_equals_one_position_per_graph("canonical");
+}
+
 /// **One position per graph through the batched prefill is the decode loop's own computation**:
 /// `device.ubatch = 1` prefills a position in a one-row graph without the model head, the decode
 /// loop in a one-row graph with it, and a prompt fed one turn per token (every turn extending the
@@ -527,6 +702,163 @@ fn batched_prefill_cancelled_between_chunks_is_not_reused() {
     assert!(after.logits == want.logits, "logits");
     assert!(
         chunked.comp_state(&s, false) == chunked.comp_state(&fresh, false),
+        "compressed buffers"
+    );
+}
+
+/// The canonical layout opened layer-major (one segment) at chunk height `chunk`, and the same
+/// file one position per graph.
+fn canonical_layer_major(chunk: usize) -> (Model, Model) {
+    let layout = layouts()
+        .into_iter()
+        .find(|l| l.name == "canonical")
+        .expect("the canonical layout");
+    let file = session_model(&layout.dims);
+    (
+        open_as(&layout, &file, chunk, Some(usize::MAX)),
+        open(&layout, &file, 1),
+    )
+}
+
+/// **A layer-major extending turn prefills only its suffix, from where the turn before left
+/// every layer's state**: [`batched_extending_turn_prefills_only_its_suffix`] with the second
+/// turn's suffix run layer-major in chunks of 37 (the op tap shows the order), equal to one
+/// prefill of the 300 tokens one position per graph: logits and every compressed buffer.
+#[test]
+fn layer_major_extending_turn_prefills_only_its_suffix() {
+    let (lm, one) = canonical_layer_major(37);
+    let prompt = ids(300, 12);
+    let mut s = None;
+    let first = lm
+        .generate(&prompt[..150], 1, &mut s, None)
+        .expect("first turn");
+    assert_eq!(first.n_cached, 0);
+    infr_cpu::op_tap::start();
+    let second = lm.generate(&prompt, 1, &mut s, None).expect("second turn");
+    let ops = infr_cpu::op_tap::take();
+    assert_eq!(
+        second.n_cached, 150,
+        "the extending turn re-prefilled instead of reusing the session"
+    );
+    let attention: Vec<u32> = ops
+        .iter()
+        .filter_map(|o| match *o {
+            TappedOp::Attention { rows } => Some(rows),
+            _ => None,
+        })
+        .collect();
+    // The suffix: positions 150..298 (149 rows) in chunks of 37 and the one row left, layer by
+    // layer, then the decode row.
+    let n_layer = lm.cfg.n_layer;
+    let mut want = Vec::new();
+    for _ in 0..n_layer {
+        want.extend([37, 37, 37, 37, 1]);
+    }
+    want.extend(std::iter::repeat_n(1, n_layer));
+    assert_eq!(attention, want, "the suffix did not run layer-major");
+    let mut fresh = None;
+    let want = one
+        .generate(&prompt, 1, &mut fresh, None)
+        .expect("one prefill");
+    assert!(second.logits == want.logits, "logits");
+    assert!(
+        lm.comp_state(&s, false) == one.comp_state(&fresh, false),
+        "compressed buffers"
+    );
+}
+
+/// **A layer-major turn that does not extend the session resets it first**, as the chunk-major
+/// one does ([`batched_non_extending_turn_resets`]).
+#[test]
+fn layer_major_non_extending_turn_resets() {
+    let (lm, _) = canonical_layer_major(7);
+    let (long, short) = (ids(300, 13), ids(40, 14));
+    let mut s = None;
+    lm.generate(&long, 1, &mut s, None).expect("long turn");
+    let got = lm.generate(&short, 1, &mut s, None).expect("short turn");
+    assert_eq!(got.n_cached, 0, "a turn sharing nothing reused the session");
+    let mut fresh = None;
+    let want = lm.generate(&short, 1, &mut fresh, None).expect("fresh");
+    assert!(got.logits == want.logits, "logits");
+    assert!(
+        lm.comp_state(&s, true) == lm.comp_state(&fresh, true),
+        "the reset left a ring row dirty"
+    );
+}
+
+/// **A layer-major prefill cancelled between two layers leaves nothing the next request
+/// reuses.** The cancel lands part-way through the canonical layout's layer 1 (a CSA layer): every
+/// chunk has run layer 0, two chunks layer 1, none the layers after. So layer 1's compressed state
+/// has advanced past the first turn and layers 2 and 3's have not — asserted, since that half-
+/// advanced state is what must not be reused. The two guards of
+/// [`batched_prefill_cancelled_between_chunks_is_not_reused`] hold here too, each asserted: the
+/// session records no prompt, and `written_end` is past the whole suffix (raised before each
+/// chunk's first span). The next request re-prefills from position 0, equal to a fresh session:
+/// logits and every compressed buffer. (The ring zeroing that reset does is not what this shows:
+/// a prefill from position 0 rewrites a ring before reading it, and the test that sees the zeroing
+/// is [`layer_major_non_extending_turn_resets`].)
+#[test]
+fn layer_major_prefill_cancelled_between_layers_is_not_reused() {
+    let chunk = 7;
+    let (lm, _) = canonical_layer_major(chunk);
+    let prompt = ids(80, 15);
+    // Longer than what the cancelled run wrote (its first two chunks reach position 43), so a
+    // fresh prefill rewrites every compressed row that run left, and the buffers compare whole.
+    let then = [&prompt[..30], &ids(20, 16)[..]].concat();
+    let mut s = None;
+    lm.generate(&prompt[..30], 1, &mut s, None)
+        .expect("first turn");
+    let after_first: Vec<Vec<Vec<u8>>> = (0..lm.cfg.n_layer)
+        .map(|l| lm.layer_comp_state(&s, l, false))
+        .collect();
+    // The suffix is positions 30..79 in chunks of 7: 7 chunks a layer.
+    let chunks = (prompt.len() - 1 - 30).div_ceil(chunk);
+    let req = crate::sampling::RequestCtx::new(Default::default()).abort_at_poll(chunks + 2);
+    let err = match lm.generate(&prompt, 1, &mut s, Some(&req)) {
+        Ok(_) => panic!("the prefill was not cancelled"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("cancelled during prompt prefill"),
+        "{err}"
+    );
+    let ratios: Vec<usize> = (0..lm.cfg.n_layer)
+        .map(|l| lm.cfg.layer_compress_ratio(l))
+        .collect();
+    assert_eq!(ratios, [0, 4, 128, 4, 0], "the canonical layout moved");
+    assert!(
+        lm.layer_comp_state(&s, 1, false) != after_first[1],
+        "layer 1 did not advance before the cancel"
+    );
+    for l in [2, 3] {
+        assert!(
+            lm.layer_comp_state(&s, l, false) == after_first[l],
+            "layer {l} advanced: the cancel did not land between layers 1 and 2"
+        );
+    }
+    let kv = s.as_ref().expect("a session");
+    assert!(
+        kv.cached.is_empty(),
+        "the cancelled turn left the session recording {} tokens",
+        kv.cached.len()
+    );
+    assert!(
+        kv.written_end >= prompt.len() - 1,
+        "the cancelled turn's chunks ran without raising written_end ({})",
+        kv.written_end
+    );
+    let after = lm
+        .generate(&then, 1, &mut s, None)
+        .expect("turn after the cancel");
+    assert_eq!(
+        after.n_cached, 0,
+        "the turn after the cancel reused the session"
+    );
+    let mut fresh = None;
+    let want = lm.generate(&then, 1, &mut fresh, None).expect("fresh");
+    assert!(after.logits == want.logits, "logits");
+    assert!(
+        lm.comp_state(&s, false) == lm.comp_state(&fresh, false),
         "compressed buffers"
     );
 }
@@ -838,5 +1170,47 @@ fn shipped_dtypes_chunked_prefill_equals_one_position_per_graph() {
         let got = observe(&open(k), &prompt, k, false);
         diffs.extend(report(&format!("shipped dtypes, chunk {k}"), &got, &want));
     }
+    // And layer-major (`paging.layer_major` forced), in one segment: the same ops on the same
+    // rows in another order, so the same bits.
+    for k in [37, SESSION_CTX] {
+        let mut ec = EngineConfig::default();
+        ec.device.ubatch = Some(k);
+        ec.device.ubatch_specified = true;
+        ec.paging.layer_major = Some(true);
+        let lm = Model::open_with(&format!("dsv4-pf-shipped-lm-{k}"), &m, ec);
+        let got = observe_as(&lm, &prompt, k, Some(usize::MAX), false);
+        diffs.extend(report(
+            &format!("shipped dtypes, layer-major chunk {k}"),
+            &got,
+            &want,
+        ));
+    }
     assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+}
+
+/// **With quantized expert banks, a layer-major prefill equals the chunk-major one at the same
+/// chunk height bit for bit**, int8 activations included: the reorder hands every op the same
+/// rows, and each row's activations are quantized on their own. So the layer-major path sits
+/// within [`QUANTIZED_BANKS_MAX_DIFF`] of one position per graph exactly where chunk-major does
+/// (the test above). In reference mode it equals one position per graph.
+#[test]
+fn quantized_banks_layer_major_equals_chunk_major() {
+    let m = quantized_banks();
+    let prompt = ids(300, 11);
+    let open_lm = |reference: bool| {
+        let mut ec = EngineConfig::default();
+        ec.device.ubatch = Some(37);
+        ec.device.ubatch_specified = true;
+        ec.kernels.cpu.reference = reference;
+        ec.paging.layer_major = Some(true);
+        Model::open_with(&format!("dsv4-pf-q8-lm-{reference}"), &m, ec)
+    };
+    let chunked = observe(&open_quantized(&m, 37, false), &prompt, 37, false);
+    let lm = observe_as(&open_lm(false), &prompt, 37, Some(usize::MAX), false);
+    let d = report("layer-major against chunk-major, chunk 37", &lm, &chunked);
+    assert!(d.is_empty(), "{}", d.join("\n"));
+    let ref_one = observe(&open_quantized(&m, 1, true), &prompt, 1, false);
+    let ref_lm = observe_as(&open_lm(true), &prompt, 37, Some(usize::MAX), false);
+    let d = report("reference mode, layer-major chunk 37", &ref_lm, &ref_one);
+    assert!(d.is_empty(), "{}", d.join("\n"));
 }

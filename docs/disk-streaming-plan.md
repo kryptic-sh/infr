@@ -371,6 +371,18 @@ recent use, so its next miss reads the disk. Which shape misses less depends on
 the routing trace and has not been measured; the two-tier simulator in
 `docs/plan/06-pager-eviction.md` is the instrument for it.
 
+**Prefill order decides what a sweep costs.** A prefill chunk is a sweep: a
+chunk-major prompt of `n` chunks reads the streamed weights `n` times. Every
+streamed model on a device pager prefills layer-major (every chunk through layer
+`l` before any reaches `l+1`; `seam::layer_major_prefill`), so a prompt reads
+each block once. On the CPU's host arena DeepSeek V4 does too since 2026-11-17,
+its expert banks read once per prompt instead of once per chunk, with residency
+hints from the producer: a layer's chunks insert what they pin at the hot end
+(`WeightReuse::Again`), and its last chunk demotes the layer's weights so the
+next layer evicts them first (`WeightReuse::Done`, `Pager::demote`). Measured
+and what is left: `docs/deepseek.md` § "Layer-major prefill on the CPU",
+`backlog.md` § B-CPU-EXPERT-PAGING.
+
 **Prefetch:**
 
 - Dense, any backend: the order is known for the whole pass; issue block `l+k`'s

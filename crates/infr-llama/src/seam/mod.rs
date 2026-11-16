@@ -252,7 +252,15 @@ fn cpu_committed_bytes(ec: &EngineConfig, g: &Gguf, cfg: &Config) -> u64 {
         .filter(|t| t.nbytes < infr_cpu::paged::MIN_PAGED_BYTES)
         .map(|t| t.nbytes as u64)
         .sum();
+    // A layer-major prefill's carried residual streams (`layer_major_segment_rows`), up to one
+    // segment of the context.
+    let carry = if host_layer_major(cfg) {
+        LAYER_MAJOR_CARRY_BYTES.min(ctx as u64 * layer_major_row_bytes(cfg))
+    } else {
+        0
+    };
     kv + small
+        + carry
         + CPU_ACTIVATION_RESERVE
         + cpu_repack_reserve(ec, g.tensors(), infr_cpu::q4k_expert_repack_available())
 }
@@ -937,14 +945,13 @@ pub(crate) fn layer_major_prefill(
     let want = ec.paging.layer_major.unwrap_or(streaming);
     if want && !spannable {
         // gemma4-E2B: its layer stack reads `per_layer_inp`, which the graph PROLOGUE builds, so a
-        // span starting past layer 0 would read an unbound tensor. DeepSeek V4: its residual is
-        // `hc_mult` streams wide and a span hands over one. This is the gate for both — the
-        // matching `assert!`s in `build` are internal invariants, and a streamed E2B model reached
-        // its as a PANIC on an ordinary `bench`/`run` until this arm existed.
+        // span starting past layer 0 would read an unbound tensor. This is the gate — the matching
+        // `assert!` in `build` is an internal invariant, and a streamed E2B model reached it as a
+        // PANIC on an ordinary `bench`/`run` until this arm existed. (DeepSeek V4's wider residual
+        // is carried by the spans themselves: `DecodeHandles::hc_resid`.)
         tracing::warn!(
             "layer-major prefill cannot split this architecture's layer stack (gemma4-E2B's \
-             per-layer inputs are built by the graph prologue; DeepSeek V4's residual is several \
-             streams wide) — prefilling chunk-major"
+             per-layer inputs are built by the graph prologue) — prefilling chunk-major"
         );
         return false;
     }
@@ -981,6 +988,74 @@ pub(crate) fn layer_major_this_prompt(
     holds_every_block: bool,
 ) -> bool {
     wanted && (ec.paging.layer_major == Some(true) || (n_chunks > 1 && !holds_every_block))
+}
+
+/// Whether `cfg`'s family prefills layer-major when its weights stream through the CPU's host
+/// arena (`Backend::host_paged`), as every family does over a device pager.
+///
+/// DeepSeek V4 only, deliberately. It is the family this was built and measured for: its
+/// V4-Flash file pages its experts from disk, and a chunk-major prompt of several chunks re-reads
+/// most of 90.9 GB of expert banks per chunk (`docs/deepseek.md` § "Layer-major prefill on the
+/// CPU"). The order is generic and `paging.layer_major = true` already forces it on any family,
+/// but no other family has been checked bit for bit against its chunk-major prefill on the CPU,
+/// so none gets it by default.
+pub(crate) fn host_layer_major(cfg: &Config) -> bool {
+    cfg.deepseek4
+}
+
+/// What a layer-major prefill may hold between layers for its whole segment of the prompt: the
+/// residual stream (DeepSeek V4's `hc_mult` streams wide) and the chunk's embedded input rows.
+/// Priced by [`cpu_committed_bytes`] on a CPU DeepSeek V4 run beside the activation reserve;
+/// `layer_major_segments_carry_one_gib_at_v4_flash_geometry` pins the rows it gives V4-Flash.
+pub(crate) const LAYER_MAJOR_CARRY_BYTES: u64 = 1 << 30;
+
+/// The bytes one prompt row costs a layer-major prefill between layers: the f32 residual stream
+/// (`hc_mult` streams of `n_embd` on DeepSeek V4, one elsewhere), the embedded input row the first
+/// span reads, and its token id and position.
+pub(crate) fn layer_major_row_bytes(cfg: &Config) -> u64 {
+    let streams = if cfg.deepseek4 { cfg.hc_mult as u64 } else { 1 };
+    (streams + 1) * cfg.n_embd as u64 * 4 + 8
+}
+
+/// The most prompt rows one layer-major SEGMENT carries ([`layer_major_segments`]):
+/// `paging.layer_major_rows` when set, else, on DeepSeek V4, as many as
+/// [`LAYER_MAJOR_CARRY_BYTES`] holds at [`layer_major_row_bytes`]. Every other family carries the
+/// whole prompt, as it always has (its residual is priced for the whole context by
+/// [`layer_major_act_bytes`]).
+pub(crate) fn layer_major_segment_rows(ec: &EngineConfig, cfg: &Config) -> usize {
+    match ec.paging.layer_major_rows {
+        Some(n) => n.max(1),
+        None if cfg.deepseek4 => {
+            usize::try_from(LAYER_MAJOR_CARRY_BYTES / layer_major_row_bytes(cfg))
+                .unwrap_or(usize::MAX)
+                .max(1)
+        }
+        None => usize::MAX,
+    }
+}
+
+/// Group consecutive prefill `chunks` (`(start, end)` positions) into segments of at most
+/// `max_rows` rows, as ranges of chunk indices; a chunk taller than `max_rows` is a segment alone.
+/// A layer-major prefill runs each segment through every layer before the next segment starts, so
+/// it holds one segment's residual streams at a time and sweeps the weights once per segment.
+pub(crate) fn layer_major_segments(
+    chunks: &[(usize, usize)],
+    max_rows: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let (mut first, mut rows) = (0, 0usize);
+    for (i, &(s, e)) in chunks.iter().enumerate() {
+        let r = e - s;
+        if i > first && rows + r > max_rows {
+            out.push(first..i);
+            (first, rows) = (i, 0);
+        }
+        rows += r;
+    }
+    if first < chunks.len() {
+        out.push(first..chunks.len());
+    }
+    out
 }
 
 /// Safety pad on [`dense_act_reserve_at`]'s per-row terms, as `(numerator, denominator)`.
@@ -5423,6 +5498,58 @@ mod seam_helper_tests {
             XTX_ROOM < vram.available,
             "…again a case the raw free figure would have waved through"
         );
+    }
+
+    /// Segments are runs of whole consecutive chunks of at most `max_rows` rows, a chunk taller
+    /// than that alone, every chunk in exactly one, in order.
+    #[test]
+    fn layer_major_segments_take_whole_chunks_up_to_the_cap() {
+        let chunks = [(0, 37), (37, 74), (74, 111), (111, 148), (148, 150)];
+        assert_eq!(super::layer_major_segments(&chunks, usize::MAX), vec![0..5]);
+        assert_eq!(
+            super::layer_major_segments(&chunks, 80),
+            vec![0..2, 2..5],
+            "two 37-row chunks fit 80 rows, a third does not; 37 + 37 + 2 do"
+        );
+        assert_eq!(
+            super::layer_major_segments(&chunks, 74),
+            vec![0..2, 2..4, 4..5],
+            "a segment may fill the cap exactly"
+        );
+        assert_eq!(
+            super::layer_major_segments(&chunks, 10),
+            vec![0..1, 1..2, 2..3, 3..4, 4..5],
+            "a chunk taller than the cap is a segment alone"
+        );
+        assert!(super::layer_major_segments(&[], 10).is_empty());
+    }
+
+    /// The automatic segment holds what [`super::LAYER_MAJOR_CARRY_BYTES`] carries: at DeepSeek
+    /// V4-Flash's geometry (`n_embd` 4096, four hyper-connection streams) a row costs the four
+    /// streams and the embedded input row in f32 plus its id and position, 81 928 bytes, so a
+    /// GiB holds 13 105 rows. Every other family carries the whole prompt unless
+    /// `paging.layer_major_rows` says otherwise, and that setting wins on V4 too.
+    #[test]
+    fn layer_major_segments_carry_one_gib_at_v4_flash_geometry() {
+        let v4 = Config {
+            deepseek4: true,
+            hc_mult: 4,
+            n_embd: 4096,
+            ..Config::default()
+        };
+        assert_eq!(super::layer_major_row_bytes(&v4), 5 * 4096 * 4 + 8);
+        let ec = EngineConfig::default();
+        assert_eq!(super::layer_major_segment_rows(&ec, &v4), 13_105);
+        let dense = Config {
+            n_embd: 4096,
+            ..Config::default()
+        };
+        assert_eq!(super::layer_major_segment_rows(&ec, &dense), usize::MAX);
+        let mut capped = EngineConfig::default();
+        capped.paging.layer_major_rows = Some(512);
+        assert_eq!(super::layer_major_segment_rows(&capped, &v4), 512);
+        assert_eq!(super::layer_major_segment_rows(&capped, &dense), 512);
+        assert!(super::host_layer_major(&v4) && !super::host_layer_major(&dense));
     }
 
     /// The per-prompt half of the layer-major gate: auto runs it only where it can save a read

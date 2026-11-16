@@ -92,6 +92,8 @@ pub(super) struct Model {
     embd: std::sync::OnceLock<Vec<f32>>,
     be: CpuBackend,
     ec: EngineConfig,
+    /// The file on disk, kept for as long as the model: a host arena reads weights from it.
+    _file: TempGguf,
 }
 
 /// What one generation returned: the ids it generated, the logits its first one was sampled
@@ -120,7 +122,33 @@ impl Model {
             embd: std::sync::OnceLock::new(),
             be: CpuBackend::new_with(std::sync::Arc::new(ec.clone())),
             ec,
+            _file: tmp,
         }
+    }
+
+    /// A host weight arena of `budget` bytes over this model's file (`paging.dram`), planned and
+    /// sized as a CPU run's is; `None` when the budget seats no pool.
+    pub(super) fn host_arena(
+        &self,
+        budget: u64,
+    ) -> Option<std::sync::Arc<infr_cpu::paged::PagedWeights>> {
+        let mut ec = self.ec.clone();
+        ec.paging.dram = Some(infr_core::SizeSpec::Bytes(budget));
+        crate::seam::cpu_paged_store(&ec, &self.g, &self.cfg).expect("host arena")
+    }
+
+    /// [`Self::generate`] with the weights bound through `store` (registered on first use, so a
+    /// fresh `state` and a fresh store go together) — the CPU run's own binder.
+    pub(super) fn generate_paged(
+        &self,
+        store: &std::sync::Arc<infr_cpu::paged::PagedWeights>,
+        prompt: &[u32],
+        max_new: usize,
+        state: &mut Option<SeamKv>,
+    ) -> anyhow::Result<Gen> {
+        let n_expert = self.cfg.moe.as_ref().map(|m| m.n_expert);
+        let bind = crate::seam::cpu_bind_with(&self.be, Some(store.clone()), n_expert);
+        self.generate_bound(&bind, prompt, max_new, state, None)
     }
 
     /// The last position's logits of `prompt` on `state` (a fresh session when it is `None`).
@@ -145,10 +173,28 @@ impl Model {
         state: &mut Option<SeamKv>,
         req: Option<&crate::sampling::RequestCtx>,
     ) -> anyhow::Result<Gen> {
+        self.generate_bound(
+            &crate::seam::cpu_upload_bind(&self.be),
+            prompt,
+            max_new,
+            state,
+            req,
+        )
+    }
+
+    /// [`Self::generate`] with the weights bound by `bind`.
+    fn generate_bound(
+        &self,
+        bind: &crate::seam::BindWeight<'_>,
+        prompt: &[u32],
+        max_new: usize,
+        state: &mut Option<SeamKv>,
+        req: Option<&crate::sampling::RequestCtx>,
+    ) -> anyhow::Result<Gen> {
         let mut logits = Vec::new();
         let (ids, stats) = crate::seam::generate_dense_backend(
             &self.be,
-            &crate::seam::cpu_upload_bind(&self.be),
+            bind,
             &self.g,
             &self.cfg,
             &self.ec,
@@ -190,16 +236,26 @@ impl Model {
     /// `crate::seam::dsv4_comp_bufs` order: the rings only when `rings_only`, else the block
     /// caches too.
     pub(super) fn comp_state(&self, state: &Option<SeamKv>, rings_only: bool) -> Vec<Vec<u8>> {
+        (0..self.cfg.n_layer)
+            .flat_map(|l| self.layer_comp_state(state, l, rings_only))
+            .collect()
+    }
+
+    /// [`Self::comp_state`] of layer `l` alone.
+    pub(super) fn layer_comp_state(
+        &self,
+        state: &Option<SeamKv>,
+        l: usize,
+        rings_only: bool,
+    ) -> Vec<Vec<u8>> {
         let kv = state.as_ref().expect("a session");
+        let geometry = crate::seam::dsv4_comp_bufs(&self.cfg, l, kv.max_ctx, kv.k_fmt);
         let mut out = Vec::new();
-        for l in 0..self.cfg.n_layer {
-            let geometry = crate::seam::dsv4_comp_bufs(&self.cfg, l, kv.max_ctx, kv.k_fmt);
-            for (b, buf) in geometry.iter().zip(&kv.cbufs[l]) {
-                if b.ring || !rings_only {
-                    let mut v = vec![0u8; buf.len_bytes()];
-                    self.be.download(buf.as_ref(), &mut v).expect("download");
-                    out.push(v);
-                }
+        for (b, buf) in geometry.iter().zip(&kv.cbufs[l]) {
+            if b.ring || !rings_only {
+                let mut v = vec![0u8; buf.len_bytes()];
+                self.be.download(buf.as_ref(), &mut v).expect("download");
+                out.push(v);
             }
         }
         out

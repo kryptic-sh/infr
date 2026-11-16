@@ -751,10 +751,11 @@ context went from about 57 ms to about 1.1 ms per decode token (op-level,
 synthetic; `docs/deepseek.md` § "The CSA tier's CPU cost"). What is left of it
 is `docs/backlog.md` § B-DSV4-CPU-PERF, first the attention reading the kept
 rows once per head; ~~then batched prefill~~ — done on the CPU (2026-11-16,
-below); a span-carried hyper-connection stream so layer-major and streamed
-prefill serve V4; paged MoE with hash routing and the clamp, then B184; the
-sinks and compressed attention tiers on Vulkan, gathering the CSA top-k at long
-context instead of masking; the indexer's cost per CSA layer; `CompressPool` and
+below); ~~a span-carried hyper-connection stream so layer-major and streamed
+prefill serve V4~~ — done on the CPU (2026-11-17, § "Layer-major prefill"
+below); paged MoE with hash routing and the clamp, then B184; the sinks and
+compressed attention tiers on Vulkan, gathering the CSA top-k at long context
+instead of masking; the indexer's cost per CSA layer; `CompressPool` and
 hyper-connection kernels (B-DSV4-POOL, B-DSV4-HC); decode replay, measured
 first.
 
@@ -858,6 +859,21 @@ prompt there was not measured.
 **Left on one position per graph:** every GPU backend (a ratio-0 V4 file on
 Vulkan; the compressed tiers are refused there), decode, and a suffix of at most
 two positions (as on every model).
+
+### Layer-major prefill (2026-11-17)
+
+**Built, on the CPU.** A prompt of several chunks whose experts stream through
+the host arena runs each layer for every chunk before the next layer, so each
+routed expert is read once per prompt instead of once per chunk. A partial-span
+build carries the widened residual (`DecodeHandles::hc_resid`); the compressed
+state needed nothing, being per layer and still written in position order; a
+prompt longer than 1 GiB of carried rows runs in segments
+(`seam::layer_major_segments`). Bit-exact against one position per graph on
+every layout, segmented and not, with the session lifecycle and the llama.cpp
+oracle cases; the real file read each expert once (pager trace) but was not
+faster on a 69-token prompt in three chunks. `docs/deepseek.md` § "Layer-major
+prefill on the CPU" has the details and the numbers; `backlog.md` §
+B-CPU-EXPERT-PAGING what is left.
 
 `deepseek2` / V3: an `Op::Mla` split-K decode arm and a prefill tier
 (B-DSHW-MLA-SCALAR-TIER has the gaps); B108 on CPU at depth. Do not reopen

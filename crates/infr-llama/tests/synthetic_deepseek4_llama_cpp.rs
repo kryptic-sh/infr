@@ -461,12 +461,26 @@ fn parse_sum_line(line: &str) -> (&str, f64) {
 }
 
 fn load(tmp: &TempGguf) -> infr_llama::SeamModel {
-    infr_llama::SeamModel::load_with(
-        tmp.path(),
-        None,
-        std::sync::Arc::new(infr_llama::EngineConfig::default()),
-    )
-    .expect("synthetic model load")
+    load_with(tmp, infr_llama::EngineConfig::default())
+}
+
+fn load_with(tmp: &TempGguf, ec: infr_llama::EngineConfig) -> infr_llama::SeamModel {
+    infr_llama::SeamModel::load_with(tmp.path(), None, std::sync::Arc::new(ec))
+        .expect("synthetic model load")
+}
+
+/// The chunk height the layer-major leg of [`infr_scores`] prefills at: short enough that every
+/// stored length past it runs several chunks through each layer.
+const LAYER_MAJOR_UBATCH: usize = 64;
+
+/// The engine configuration that prefills layer-major (`paging.layer_major` forced on, as a CPU
+/// DeepSeek V4 run streaming its experts from disk takes it) in chunks of [`LAYER_MAJOR_UBATCH`].
+fn layer_major_config() -> infr_llama::EngineConfig {
+    let mut ec = infr_llama::EngineConfig::default();
+    ec.paging.layer_major = Some(true);
+    ec.device.ubatch = Some(LAYER_MAJOR_UBATCH);
+    ec.device.ubatch_specified = true;
+    ec
 }
 
 fn softmax(v: &[f32]) -> Vec<f64> {
@@ -544,13 +558,38 @@ impl std::fmt::Display for Score {
 /// Probability cosine is printed, not asserted: it stays close to 1 under both breaks.
 const ORACLE_MAX_ABS: f32 = 2e-3;
 
+/// The row count of every `Op::Attention` a `len`-token prompt runs layer-major in chunks of
+/// [`LAYER_MAJOR_UBATCH`] on `n_layer` layers: every chunk of the batched prefill (all positions
+/// but the last, when more than two) through a layer before the next, then the decode loop's one
+/// row through every layer.
+fn layer_major_attention(len: usize, n_layer: usize) -> Vec<u32> {
+    let prefill = if len > 2 { len - 1 } else { 0 };
+    let chunks: Vec<u32> = (0..prefill)
+        .step_by(LAYER_MAJOR_UBATCH)
+        .map(|s| LAYER_MAJOR_UBATCH.min(prefill - s) as u32)
+        .collect();
+    let mut out: Vec<u32> = (0..n_layer).flat_map(|_| chunks.clone()).collect();
+    let decode = if len > 2 { 1 } else { len };
+    for _ in 0..decode {
+        out.extend(std::iter::repeat_n(1, n_layer));
+    }
+    out
+}
+
 /// infr's CPU prefill of `case` against each of `runs` (one fixture's), returning one score per run.
+///
+/// Each prompt is prefilled twice: chunk-major at the default height, and layer-major in chunks of
+/// [`LAYER_MAJOR_UBATCH`] ([`layer_major_config`]). The two must give the same logits bit for bit
+/// (on these f32 files every op computes a row the same way whatever the order and the row count),
+/// so the score, held to the oracle's bound by the callers, is the layer-major path's as much as
+/// the chunk-major one's.
 fn infr_scores(case: &OracleCase, runs: &[OracleRun]) -> Vec<(usize, Score)> {
     let tmp = TempGguf::write(
         &format!("dsv4-oracle-{}", case.name),
         &oracle_model(case, false),
     );
     let model = load(&tmp);
+    let layer_major = load_with(&tmp, layer_major_config());
     let vocab = model.config().vocab;
     runs.iter()
         .map(|run| {
@@ -566,6 +605,30 @@ fn infr_scores(case: &OracleCase, runs: &[OracleRun]) -> Vec<(usize, Score)> {
                 "the fixture is for another vocabulary"
             );
             let ours = model.prefill_logits_cpu(&run.tokens).expect("cpu prefill");
+            infr_cpu::op_tap::start();
+            let lm = layer_major
+                .prefill_logits_cpu(&run.tokens)
+                .expect("layer-major cpu prefill");
+            let attention: Vec<u32> = infr_cpu::op_tap::take()
+                .into_iter()
+                .filter_map(|o| match o {
+                    infr_cpu::op_tap::TappedOp::Attention { rows } => Some(rows),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                attention,
+                layer_major_attention(len, model.config().n_layer),
+                "{} at {len} tokens: the prefill did not run layer-major",
+                case.name
+            );
+            assert!(
+                lm == ours,
+                "{} at {len} tokens: the layer-major prefill's logits differ from chunk-major's \
+                 by up to {}",
+                case.name,
+                max_abs_diff(&lm, &ours)
+            );
             (len, score(&ours, &run.logits))
         })
         .collect()

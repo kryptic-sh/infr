@@ -878,10 +878,12 @@ residue worth tracking; what follows is that plus what was deliberately left.
     n_embd 5120 it is 671 MB of arena. Sizing it against a per-request prompt
     length, or reserving in bands, needs the budget to be re-decidable after
     load, which it is not today.
-  - **Only the dense Vulkan path.** MoE expert paging, MTP, the qwen35/DeltaNet
-    bespoke path, Metal and the CPU backend all keep chunk-major: the gate is
-    `Backend::dense_paged`, and the E2B arch is refused by
-    `layer_major_prefill`'s `spannable` arm (its `per_layer_inp` is
+  - **Only the dense Vulkan path, and DeepSeek V4 on the CPU's host arena**
+    (since 2026-11-17, `Backend::host_paged`; § B-CPU-EXPERT-PAGING). Vulkan's
+    MoE expert paging, MTP, the qwen35/DeltaNet bespoke path, Metal and every
+    other family on the CPU keep chunk-major: the gate is `Backend::dense_paged`
+    (or `host_paged` with `seam::host_layer_major`), and the E2B arch is refused
+    by `layer_major_prefill`'s `spannable` arm (its `per_layer_inp` is
     prologue-built and a later span cannot see it). That gate is load-bearing,
     not belt-and-braces: E2B DOES take the batched-prefill path, so while the
     only refusal was the `assert!` in `build`, a streamed E2B panicked on an
@@ -1303,11 +1305,10 @@ the breaks). What is left:
   above). The fixture's f32 expert banks fail `moe_batched_ok`, which the V4
   gate does not consult on the CPU, whose `Op::MoeFfn` takes any dtype at any
   row count.
-- **A partial layer span is refused** (the assert beside the compress-ratio
-  one): the widened residual is `hc_mult` streams wide and a span hands over one
-  `n_embd`-wide `hidden` buffer. Layer-major prefill therefore cannot serve V4
-  as written; a span-carried widened stream would need `hidden` to be the wide
-  buffer for V4 builds.
+- **A partial layer span carries the widened stream since 2026-11-17**
+  (`DecodeHandles::hc_resid`, `docs/deepseek.md` § "Layer-major prefill on the
+  CPU"), so layer-major prefill serves V4 on the CPU. Not run on any GPU
+  backend: V4's batched prefill is the CPU's only.
 - **Metal has never been executed** (no Apple hardware). The V4 emit is
   backend-generic, so Metal will take it as soon as its own gaps close — but its
   DEVICE MoE path asserts `MoeGating::Softmax` and V4's gating is mandatory
@@ -1703,6 +1704,9 @@ and Metal refuse the file's first compressed layer by name.
 - **Prefill of a cold model reads every whole weight once** (7.6 GB of dense
   classes, 4.8 s of summed read time at 12g) before the experts; 16 s for five
   tokens. Not optimized.
+- **A long prompt prefills layer-major since 2026-11-17** and reads each routed
+  expert once (§ B-CPU-EXPERT-PAGING has the runs and what is left); a 69-token
+  prompt in three 32-row chunks prefilled in 98.96 s.
 - **Buffered reads grow the system file cache's working set.** On the 48-token
   default run `\Memory\Cache Bytes` rose from 245 MiB to 3701 MiB, which counts
   as in use, not available; available memory bottomed at 19154 MiB against the
@@ -1755,17 +1759,42 @@ only its routed experts (`CpuBackend::moe_banks`). Left:
   the whole context without the sliding-window ring the CPU uses, which
   over-prices it (conservative). The 1 GiB activation reserve is a reserve, not
   a measurement per model.
-- **A long prompt on V4-Flash is a whole-file read per chunk, so it was not
-  run.** A prefill chunk taller than about 43 rows routes 6 of 256 experts per
-  row to well over half of every bank, so it reads nearly all 90.9 GB of expert
-  banks; with the 12 GB cache's 5.24 GB of experts that is about 85 GB, roughly
-  80 s at the 1.05 GB/s this drive gave, per chunk (estimate, not run). The
-  sweep insert (`paged::expert_insert`) keeps the resident share across chunks
-  but cannot make a chunk cheaper than the banks it reads; on synthetic chunks
-  it took hits from 0 to about 135 of 576 pins and reads from 2277 to 1872 over
-  four chunks (`a_prefill_sweep_keeps_its_resident_set`). Making a long prompt
-  affordable needs a different shape: smaller chunks with expert-major order
-  across a whole prompt, or reading each expert once for every chunk.
+- **A V4 prompt of several chunks now prefills layer-major and reads each routed
+  expert once (2026-11-17); what that left.** `docs/deepseek.md` § "Layer-major
+  prefill on the CPU" has the design, the tests and the runs. On the real file a
+  69-token prompt in three chunks read 13 122 expert blocks (36.1 GB), each
+  exactly once by the pager trace, against 20 342 (56.0 GB) chunk-major. Left:
+  - **It was slower in wall time on every prompt run:** 98.96 and 114.89 s
+    against 91.59 s chunk-major (one run each order, a shared box). Per 2.75 MB
+    read layer-major spent 22.2 ms of lane time and chunk-major 13.7 ms; the
+    likely cause is that chunk-major's re-reads come from the OS file cache
+    (buffered reads; about 27 GB of standby between runs), not checked. The case
+    the order is for — a prompt of more than one 1024-row chunk, where a
+    chunk-major sweep is about 85 GB and no file cache holds it — was estimated
+    (about 170 GB against 90 for two chunks), not run: two such sweeps take
+    minutes and push the box's available memory under the run guard's floor (run
+    1 here, 46.5 GB read plus a decode, did). Unbuffered reads (B-DSV4-REAL)
+    would remove the confound and the double caching both.
+  - **Non-wait time was higher layer-major** (16.0 s against 8.8 s, 129 span
+    graphs against 3, run 4 against run 3). Not profiled: per-execute setup
+    (scratch, the pool's wake), the graph build for the whole model per span, or
+    noise from the other session.
+  - **The decode after a layer-major prefill starts cold.** The demotions
+    (`WeightReuse::Done`) make each finished layer the next victims, so the pool
+    ends holding the first and last layers' experts; the first decode-loop pass
+    missed 729 of 774 pins (run 4). A pool of 1904 slots holds about 26 a layer
+    beyond one layer's floor of 768: keeping each layer's most-routed experts
+    (by rows, counted over its chunks) out of the demotion, up to that share,
+    would hand the decode a warm set. Needs per-bank routing counts kept across
+    a layer's graphs in the CPU backend. Not built.
+  - **The pool still needs one layer's every expert** (768 slots, 2.1 GB on
+    V4-Flash): layer-major reads each expert once only while a layer's union
+    fits beside what is pinned, which the floor guarantees.
+  - **Other families keep chunk-major on the CPU arena**
+    (`seam::host_layer_major`): no other family was checked bit for bit
+    layer-major on the CPU (gemma4's KV-sharing layers read another layer's
+    cache, which needs its own argument). `paging.layer_major = true` forces it
+    on any family.
 - **The six-minute hang on a broken bank stride (2026-11-16) is explained as far
   as it can be: not the pool; a same-thread double lock is the one mechanism
   found, and it now fails loudly.** Breaking `CpuBackend::moe_banks` so every

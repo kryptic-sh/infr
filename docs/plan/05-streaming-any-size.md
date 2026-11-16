@@ -95,6 +95,13 @@ measurement in a quiet window before and after.
    there, with what is left as its step 5.
 6. **Direct-to-ring reads** for blocks that are never admitted to DRAM: only
    meaningful once a planned partition exists (`TierPlan`, §3.6).
+7. **Prefill order on the CPU's host arena.** DeepSeek V4 prefills layer-major
+   there since 2026-11-17, reading each routed expert once per prompt (each once
+   by the pager trace on the real file); every other family still sweeps the
+   arena once per chunk. Not yet a wall-time win on the short prompts run,
+   likely because buffered reads let the OS file cache serve chunk-major's
+   re-reads (item 4 would settle it); the decode after starts with a cold expert
+   pool. Both in `backlog.md` § B-CPU-EXPERT-PAGING.
 
 ## D. Safety
 

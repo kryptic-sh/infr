@@ -378,6 +378,10 @@ pub(super) struct DecodeHandles {
     // DeepSeek V4: each layer's compressed-tier buffer Inputs, bound to `SeamKv::cbufs[l]` in
     // `crate::seam::dsv4_comp_bufs` order; empty for every other layer.
     comp: Vec<Vec<TensorId>>,
+    // DeepSeek V4 built as a PARTIAL layer span (a layer-major prefill): the `[batch, hc_mult *
+    // n_embd]` widened residual stream, carried between spans in a caller-owned buffer the ops
+    // advance in place. `None` for every whole-model build, where it is graph scratch.
+    hc_resid: Option<TensorId>,
     // Per-step i32 Inputs whose values the build computed from this graph's positions (V4's
     // compressor plan: APE row ids, gather indices, block rope positions), with those values. The
     // driver uploads each into a buffer of its own and binds it (`upload_step_i32`).
@@ -1912,18 +1916,12 @@ pub(crate) fn generate_dense_backend_bound(
             l_first == 0 || !e2b,
             "gemma4-E2B cannot start a layer span past layer 0 (per_layer_inp is prologue-built)"
         );
-        // The widened `[batch, hc_mult, n_embd]` residual stream lives in graph scratch and is
-        // collapsed back to `[batch, n_embd]` only by the model head. A partial layer span carries
-        // its residual in the caller's `hidden` buffer, which is `n_embd` wide — there is nowhere
-        // to hand the other `hc_mult - 1` streams over. V4's batched prefill is chunk-major, one
-        // whole-model span per chunk (`layer_major_prefill` is told V4 cannot be split); this is
-        // the backstop.
-        assert!(
-            !c.deepseek4 || (l_first == 0 && l_end == c.n_layer),
-            "deepseek4 cannot be built as a partial layer span ({l_first}..{l_end} of {}): the \
-             hyper-connection residual is hc_mult streams wide and a span hands over one",
-            c.n_layer
-        );
+        // DeepSeek V4's residual is the widened `[batch, hc_mult, n_embd]` stream, which only the
+        // model head collapses back to `[batch, n_embd]`; `hidden` is just the embedding it is
+        // widened from. A PARTIAL layer span therefore carries the wide stream itself, in a
+        // caller-owned Input (`DecodeHandles::hc_resid`): the span that starts the stack widens
+        // `hidden` into it, every span advances it in place, and no partial span runs the head.
+        let hc_carry = c.deepseek4 && (l_first, l_end) != (0, c.n_layer);
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
         // DiffusionGemma: force the per-execute STATIC path for every graph of this model (see
@@ -2521,8 +2519,14 @@ pub(crate) fn generate_dense_backend_bound(
         //   hc_pre / hc_post   [batch, hc]      collapse weights / per-stream output gates
         //   hc_comb    [batch, hc, hc]          Sinkhorn-normalised mixing matrix
         let hcw = c.hc_mult * ne;
+        // `hcr[0]` is where the stream stands at every layer boundary, so it is the one a partial
+        // span carries (`hc_carry`).
         let hcr = [
-            g.internal(f32d(batch * hcw.max(1))),
+            if hc_carry {
+                g.input(f32d(batch * hcw))
+            } else {
+                g.internal(f32d(batch * hcw.max(1)))
+            },
             g.internal(f32d(batch * hcw.max(1))),
         ];
         let hc_normed = g.internal(f32d(batch * hcw.max(1)));
@@ -2922,8 +2926,9 @@ pub(crate) fn generate_dense_backend_bound(
         // and neither it nor `docs/backlog.md` § B-DSV4-WIRING records how the reference seeds the
         // widened stream. Replicating the input across streams is what the hyper-connections
         // formulation calls for and what makes the head's collapse a partition of unity at depth 0;
-        // it is recorded as unverified in `docs/backlog.md` § B-DSV4-HC.
-        if c.deepseek4 {
+        // it is recorded as unverified in `docs/backlog.md` § B-DSV4-HC. Part of the prologue: a
+        // span past layer 0 reads the stream an earlier span left in `hcr[0]`.
+        if c.deepseek4 && prologue {
             for h in 0..c.hc_mult {
                 g.push(Op::CopyStrided {
                     src: hidden,
@@ -4776,8 +4781,9 @@ pub(crate) fn generate_dense_backend_bound(
         // which the LM-head tail below then reads exactly as every other arch does. `build_hc_head`
         // is `Op::HyperConnectMix { gates: None }` + `Op::HyperConnectPre` — its `output_hc_fn` is
         // `{hc_dim, hc}`, so its `mixes` IS the `pre` chunk, read at the same `scale[0]` /
-        // `base[0..hc]` indices the wrapping form uses.
-        if let Some(t) = &hc_head {
+        // `base[0..hc]` indices the wrapping form uses. A partial span stops at a layer boundary
+        // with the stream left in `hcr[0]` for the next.
+        if let (Some(t), false) = (&hc_head, hc_carry) {
             let ones = hc_ones.expect("deepseek4 build always declares hc_ones");
             g.push(Op::RmsNorm {
                 x: hcr[0],
@@ -4932,6 +4938,7 @@ pub(crate) fn generate_dense_backend_bound(
                 k_cache,
                 v_cache,
                 comp,
+                hc_resid: hc_carry.then_some(hcr[0]),
                 step_i32,
                 weights,
             },
@@ -5672,9 +5679,7 @@ pub(crate) fn generate_dense_backend_bound(
     // re-reads than it saves in readbacks.)
     // `moe_batched_ok` (this `MOE_MMQ_DTYPES` eligibility scan) is a session-stable derivation —
     // computed once in `session_stable` and read here off `stable`.
-    // DeepSeek V4 takes its own gate (`dsv4_emit::batched_prefill_ok`), and always prefills
-    // chunk-major: a layer-major span cannot carry its `hc_mult`-wide residual across spans (see
-    // the assert in `build`).
+    // DeepSeek V4 takes its own gate (`dsv4_emit::batched_prefill_ok`).
     let batched_prefill_ok = if c.deepseek4 {
         super::dsv4_emit::batched_prefill_ok(be.name())
     } else {
@@ -5747,21 +5752,39 @@ pub(crate) fn generate_dense_backend_bound(
             }
             v
         };
+        // The weights stream either through a device pager (`dense_paged`) or, on the CPU, through
+        // the host arena (`host_paged`). Layer-major over the host arena is DeepSeek V4's alone,
+        // the family it was built and checked for; every other family keeps its chunk-major
+        // prefill there (`crate::seam::host_layer_major`).
+        let host_stream = crate::seam::host_layer_major(c) && be.host_paged();
         let layer_major = crate::seam::layer_major_this_prompt(
             ec,
-            crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b && !c.deepseek4),
+            crate::seam::layer_major_prefill(ec, &caps, be.dense_paged() || host_stream, !e2b),
             chunks.len(),
-            be.dense_holds_every_block(),
+            if host_stream {
+                be.host_holds_every_block()
+            } else {
+                be.dense_holds_every_block()
+            },
         );
         let spans: Vec<std::ops::Range<usize>> = if layer_major {
             (0..c.n_layer).map(|l| l..l + 1).collect()
         } else {
             std::iter::once(0..c.n_layer).collect()
         };
+        // Layer-major holds every chunk's residual stream between layers, so a prompt longer than
+        // the rows `crate::seam::layer_major_segment_rows` allows runs as consecutive SEGMENTS of
+        // whole chunks, each layer-major in itself: each segment sweeps the weights once.
+        // Chunk-major is one segment, whose order is the plain chunk order.
+        let segments: Vec<std::ops::Range<usize>> = if layer_major {
+            crate::seam::layer_major_segments(&chunks, crate::seam::layer_major_segment_rows(ec, c))
+        } else {
+            std::iter::once(0..chunks.len()).collect()
+        };
         // A chunk's uploaded inputs and its residual stream, materialized on first use and
         // dropped after the chunk's LAST span. Chunk-major (one span) therefore holds exactly one
-        // chunk's buffers at a time, as it always did; layer-major holds every chunk's, which is
-        // the activation cost `crate::seam::layer_major_act_bytes` prices.
+        // chunk's buffers at a time, as it always did; layer-major holds every chunk's of the
+        // segment, which is the activation cost `crate::seam::layer_major_act_bytes` prices.
         struct PfChunk {
             m: usize,
             /// Token ids (gpu_embed) or the host-embedded f32 rows.
@@ -5774,196 +5797,227 @@ pub(crate) fn generate_dense_backend_bound(
             pos: Box<dyn Buffer>,
             /// gemma4-E2B per-layer token rows.
             ipl: Option<Box<dyn Buffer>>,
+            /// DeepSeek V4 split into layer spans: the `[m, hc_mult * n_embd]` widened residual
+            /// stream the spans hand each other (`DecodeHandles::hc_resid`).
+            wide: Option<Box<dyn Buffer>>,
         }
         let mut live: Vec<Option<PfChunk>> = (0..chunks.len()).map(|_| None).collect();
-        for (si, span) in spans.iter().enumerate() {
-            for (ci, &(cstart, cend)) in chunks.iter().enumerate() {
-                // Shutdown (SIGINT/SIGTERM) or a per-request abort: do not START another chunk.
-                // The chunk that was already in flight is not cut off — the backend drains it and
-                // returns `Error::Aborted` from `be.execute` below, which lands here as the same
-                // bail. Nothing useful was produced (a half-filled KV cache is not a generation),
-                // so this is an error and not a partial success; the CLI turns the latched signal
-                // into the conventional 130/143 exit status regardless of what this call returns.
-                if crate::sampling::abort_requested(req) {
-                    if infr_core::shutdown::shutdown_requested() {
-                        anyhow::bail!("aborted: shutdown requested");
+        for seg in &segments {
+            for (si, span) in spans.iter().enumerate() {
+                for ci in seg.clone() {
+                    let (cstart, cend) = chunks[ci];
+                    // Shutdown (SIGINT/SIGTERM) or a per-request abort: do not START another chunk.
+                    // The chunk that was already in flight is not cut off — the backend drains it and
+                    // returns `Error::Aborted` from `be.execute` below, which lands here as the same
+                    // bail. Nothing useful was produced (a half-filled KV cache is not a generation),
+                    // so this is an error and not a partial success; the CLI turns the latched signal
+                    // into the conventional 130/143 exit status regardless of what this call returns.
+                    if crate::sampling::abort_requested(req) {
+                        if infr_core::shutdown::shutdown_requested() {
+                            anyhow::bail!("aborted: shutdown requested");
+                        }
+                        anyhow::bail!("aborted: request cancelled during prompt prefill");
                     }
-                    anyhow::bail!("aborted: request cancelled during prompt prefill");
-                }
-                // One dispatch = one turn on the GPU. Dropped at the end of the iteration, handing
-                // the baton to whichever sequence has been waiting longest.
-                let _gp = req.and_then(|r| r.gate_pass());
-                let pf_m = cend - cstart;
-                if live[ci].is_none() {
-                    // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
-                    // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
-                    // the old f32 rows upload (4*n_embd*pf_m bytes).
-                    let upload_ids = || -> AResult<Box<dyn Buffer>> {
-                        let ids: Vec<i32> =
-                            prompt[cstart..cend].iter().map(|&t| t as i32).collect();
-                        let b = be
+                    // One dispatch = one turn on the GPU. Dropped at the end of the iteration, handing
+                    // the baton to whichever sequence has been waiting longest.
+                    let _gp = req.and_then(|r| r.gate_pass());
+                    let pf_m = cend - cstart;
+                    if live[ci].is_none() {
+                        // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
+                        // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
+                        // the old f32 rows upload (4*n_embd*pf_m bytes).
+                        let upload_ids = || -> AResult<Box<dyn Buffer>> {
+                            let ids: Vec<i32> =
+                                prompt[cstart..cend].iter().map(|&t| t as i32).collect();
+                            let b = be
+                                .alloc(pf_m * 4, BufferUsage::Staging)
+                                .map_err(|e| anyhow!("{e}"))?;
+                            be.upload(b.as_ref(), bytemuck::cast_slice(&ids))
+                                .map_err(|e| anyhow!("{e}"))?;
+                            Ok(b)
+                        };
+                        let ids = if hash_ids && !gpu_embed {
+                            Some(upload_ids()?)
+                        } else {
+                            None
+                        };
+                        let input = if gpu_embed {
+                            upload_ids()?
+                        } else {
+                            let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
+                            let token_embd = token_embd.get()?; // host embed gather → materialize
+                            for &tok in &prompt[cstart..cend] {
+                                let base = tok as usize * ne;
+                                pf_hidden.extend(
+                                    token_embd[base..base + ne].iter().map(|&x| x * embed_scale),
+                                );
+                            }
+                            let b = be
+                                .alloc(pf_m * ne * 4, BufferUsage::Staging)
+                                .map_err(|e| anyhow!("{e}"))?;
+                            be.upload(b.as_ref(), bytemuck::cast_slice(&pf_hidden))
+                                .map_err(|e| anyhow!("{e}"))?;
+                            b
+                        };
+                        // The residual stream. A layer-span build carries `hidden` in a CALLER-owned
+                        // buffer rather than graph scratch, so the chunk owns one: on the host-embed
+                        // path the uploaded rows already ARE the layer stack's input and `input`
+                        // serves, while the gpu_embed path uploads ids there and the in-graph gather
+                        // needs somewhere to write. Sized EXACTLY like the `[batch, n_embd]` handle it
+                        // binds — the interpreters' write-back is a length-checked `copy_from_slice`
+                        // against the declared numel, and the host-embed path has always bound this
+                        // shape, so nothing writes past it.
+                        let resid = if gpu_embed {
+                            Some(
+                                be.alloc(pf_m * ne * 4, BufferUsage::Activations)
+                                    .map_err(|e| anyhow!("{e}"))?,
+                            )
+                        } else {
+                            None
+                        };
+                        // Absolute positions [cstart, ..., cend-1].
+                        let pf_positions: Vec<i32> = (cstart as i32..cend as i32).collect();
+                        let pos = be
                             .alloc(pf_m * 4, BufferUsage::Staging)
                             .map_err(|e| anyhow!("{e}"))?;
-                        be.upload(b.as_ref(), bytemuck::cast_slice(&ids))
+                        be.upload(pos.as_ref(), bytemuck::cast_slice(&pf_positions))
                             .map_err(|e| anyhow!("{e}"))?;
-                        Ok(b)
-                    };
-                    let ids = if hash_ids && !gpu_embed {
-                        Some(upload_ids()?)
-                    } else {
-                        None
-                    };
-                    let input = if gpu_embed {
-                        upload_ids()?
-                    } else {
-                        let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
-                        let token_embd = token_embd.get()?; // host embed gather → materialize
-                        for &tok in &prompt[cstart..cend] {
-                            let base = tok as usize * ne;
-                            pf_hidden.extend(
-                                token_embd[base..base + ne].iter().map(|&x| x * embed_scale),
-                            );
-                        }
-                        let b = be
-                            .alloc(pf_m * ne * 4, BufferUsage::Staging)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        be.upload(b.as_ref(), bytemuck::cast_slice(&pf_hidden))
-                            .map_err(|e| anyhow!("{e}"))?;
-                        b
-                    };
-                    // The residual stream. A layer-span build carries `hidden` in a CALLER-owned
-                    // buffer rather than graph scratch, so the chunk owns one: on the host-embed
-                    // path the uploaded rows already ARE the layer stack's input and `input`
-                    // serves, while the gpu_embed path uploads ids there and the in-graph gather
-                    // needs somewhere to write. Sized EXACTLY like the `[batch, n_embd]` handle it
-                    // binds — the interpreters' write-back is a length-checked `copy_from_slice`
-                    // against the declared numel, and the host-embed path has always bound this
-                    // shape, so nothing writes past it.
-                    let resid = if gpu_embed {
-                        Some(
-                            be.alloc(pf_m * ne * 4, BufferUsage::Activations)
-                                .map_err(|e| anyhow!("{e}"))?,
-                        )
-                    } else {
-                        None
-                    };
-                    // Absolute positions [cstart, ..., cend-1].
-                    let pf_positions: Vec<i32> = (cstart as i32..cend as i32).collect();
-                    let pos = be
-                        .alloc(pf_m * 4, BufferUsage::Staging)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    be.upload(pos.as_ref(), bytemuck::cast_slice(&pf_positions))
-                        .map_err(|e| anyhow!("{e}"))?;
-                    // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only
-                    // — the model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build`
-                    // prologue).
-                    let ipl = if let (Some(ple), false) = (ple, gpu_ple) {
-                        let rows = e2b_ipl_rows(g, ple, &prompt[cstart..cend])?;
-                        let b = be
-                            .alloc(rows.len() * 4, BufferUsage::Staging)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
-                            .map_err(|e| anyhow!("{e}"))?;
-                        Some(b)
-                    } else {
-                        None
-                    };
-                    live[ci] = Some(PfChunk {
-                        m: pf_m,
-                        input,
-                        ids,
-                        resid,
-                        pos,
-                        ipl,
-                    });
-                }
-                let ch = live[ci]
-                    .as_ref()
-                    .expect("the chunk's buffers were just materialized");
-                let pf_t0 = std::time::Instant::now();
-                // HEADLESS build (`logits_rows == 0`, task #27): nothing ever consumes a prefill
-                // chunk's logits — the decode loop below feeds the LAST prompt token itself and
-                // samples from its own fresh logits — so the LM-head tail (whole-chunk
-                // output_norm, last-row Copy, vocab-wide Linear, Softcap) is skipped per chunk. On
-                // a 262k-vocab model that drops a vocab×n_embd GEMV + a [chunk, n_embd] RmsNorm
-                // per chunk.
-                // MTP h-tap gap (Phase 2 TODO, docs/mtp.md): the chunked BATCHED-PREFILL path
-                // never taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring
-                // that requires this path to carry `logits_rows == pf_m` on demand, which Phase 2
-                // will add alongside the actual head forward.
-                let (pf_g, pf_h) = build(
-                    ch.m,
-                    cstart,
-                    0,
-                    false,
-                    None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    // The token-id input + in-graph gather belong to the span that STARTS the
-                    // stack; a later span reads the residual stream that one left behind.
-                    gpu_embed && span.start == 0,
-                    false, // mtp_verify: ordinary chunked prefill, not MTP verify
-                    Some(span.clone()),
-                );
-                let t_build = pf_t0.elapsed();
-                let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
-                let t_compile = pf_t0.elapsed();
-                let step_bufs = upload_step_i32(be, &pf_h)?;
-                let mut pf_b = Bindings::new();
-                if let Some(ids) = pf_h.tok_ids {
-                    pf_b.bind(ids, ch.ids.as_deref().unwrap_or(ch.input.as_ref()));
-                }
-                pf_b.bind(
-                    pf_h.hidden,
-                    ch.resid.as_deref().unwrap_or(ch.input.as_ref()),
-                );
-                pf_b.bind(pf_h.positions, ch.pos.as_ref());
-                if let (Some(pid), Some(ib)) = (pf_h.pl_tok_in, &ch.ipl) {
-                    pf_b.bind(pid, ib.as_ref());
-                }
-                // gemma4's proportional-RoPE divisors + the K/V caches + the weights
-                // (`bind_layer_io`): without the `rope_freqs` bind the batched graph has a live
-                // unbound Input and panics.
-                bind_layer_io(
-                    &mut pf_b,
-                    &pf_h,
-                    c.n_layer,
-                    rf_buf,
-                    yff_buf,
-                    &kbufs[..],
-                    &vbufs[..],
-                    &cbufs[..],
-                    &step_bufs[..],
-                    &wbufs[..],
-                );
-                debug_assert!(
-                    pf_h.logits.is_none(),
-                    "headless prefill build has no logits"
-                );
-                *written_end = (*written_end).max(cstart + ch.m);
-                be.execute(pf_plan.as_ref(), &pf_b)
-                    .map_err(|e| anyhow!("{e}"))?;
-                // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
-                // build, plan compile, and execute (record + submit + GPU) — where a small-batch
-                // chunk's fixed cost lives decides whether to attack recording or kernels. `l` is
-                // the layer span, the whole model unless this is a layer-major prefill.
-                if ec.prof.stages {
-                    tracing::info!(
-                        "[pf prof] m={} l={}..{} build={:.1}ms compile={:.1}ms execute={:.1}ms",
+                        // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only
+                        // — the model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build`
+                        // prologue).
+                        let ipl = if let (Some(ple), false) = (ple, gpu_ple) {
+                            let rows = e2b_ipl_rows(g, ple, &prompt[cstart..cend])?;
+                            let b = be
+                                .alloc(rows.len() * 4, BufferUsage::Staging)
+                                .map_err(|e| anyhow!("{e}"))?;
+                            be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
+                                .map_err(|e| anyhow!("{e}"))?;
+                            Some(b)
+                        } else {
+                            None
+                        };
+                        // Every span of a split V4 stack reads and advances it; the first fills it.
+                        let wide = if c.deepseek4 && layer_major {
+                            Some(
+                                be.alloc(pf_m * c.hc_mult * ne * 4, BufferUsage::Activations)
+                                    .map_err(|e| anyhow!("{e}"))?,
+                            )
+                        } else {
+                            None
+                        };
+                        live[ci] = Some(PfChunk {
+                            m: pf_m,
+                            input,
+                            ids,
+                            resid,
+                            pos,
+                            ipl,
+                            wide,
+                        });
+                    }
+                    let ch = live[ci]
+                        .as_ref()
+                        .expect("the chunk's buffers were just materialized");
+                    let pf_t0 = std::time::Instant::now();
+                    // HEADLESS build (`logits_rows == 0`, task #27): nothing ever consumes a prefill
+                    // chunk's logits — the decode loop below feeds the LAST prompt token itself and
+                    // samples from its own fresh logits — so the LM-head tail (whole-chunk
+                    // output_norm, last-row Copy, vocab-wide Linear, Softcap) is skipped per chunk. On
+                    // a 262k-vocab model that drops a vocab×n_embd GEMV + a [chunk, n_embd] RmsNorm
+                    // per chunk.
+                    // MTP h-tap gap (Phase 2 TODO, docs/mtp.md): the chunked BATCHED-PREFILL path
+                    // never taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring
+                    // that requires this path to carry `logits_rows == pf_m` on demand, which Phase 2
+                    // will add alongside the actual head forward.
+                    let (mut pf_g, pf_h) = build(
                         ch.m,
-                        span.start,
-                        span.end,
-                        t_build.as_secs_f64() * 1e3,
-                        (t_compile - t_build).as_secs_f64() * 1e3,
-                        (pf_t0.elapsed() - t_compile).as_secs_f64() * 1e3,
+                        cstart,
+                        0,
+                        false,
+                        None,
+                        false,
+                        false,
+                        false,
+                        false,
+                        // The token-id input + in-graph gather belong to the span that STARTS the
+                        // stack; a later span reads the residual stream that one left behind.
+                        gpu_embed && span.start == 0,
+                        false, // mtp_verify: ordinary chunked prefill, not MTP verify
+                        Some(span.clone()),
                     );
-                }
-                prompt_t += pf_t0.elapsed();
-                // Last span for this chunk: its uploads and its residual stream are dead.
-                if si + 1 == spans.len() {
-                    live[ci] = None;
+                    // Layer-major: the next chunk of this segment reads this span's weights again, and
+                    // after the segment's last chunk nothing in this prefill does. A weight cache keeps
+                    // them for the one and lets them go first after the other (`WeightReuse`).
+                    pf_g.weight_reuse = match (layer_major, ci + 1 == seg.end) {
+                        (false, _) => infr_core::graph::WeightReuse::Sweep,
+                        (true, false) => infr_core::graph::WeightReuse::Again,
+                        (true, true) => infr_core::graph::WeightReuse::Done,
+                    };
+                    let t_build = pf_t0.elapsed();
+                    let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
+                    let t_compile = pf_t0.elapsed();
+                    let step_bufs = upload_step_i32(be, &pf_h)?;
+                    let mut pf_b = Bindings::new();
+                    if let Some(ids) = pf_h.tok_ids {
+                        pf_b.bind(ids, ch.ids.as_deref().unwrap_or(ch.input.as_ref()));
+                    }
+                    pf_b.bind(
+                        pf_h.hidden,
+                        ch.resid.as_deref().unwrap_or(ch.input.as_ref()),
+                    );
+                    pf_b.bind(pf_h.positions, ch.pos.as_ref());
+                    if let (Some(pid), Some(ib)) = (pf_h.pl_tok_in, &ch.ipl) {
+                        pf_b.bind(pid, ib.as_ref());
+                    }
+                    if let Some(hr) = pf_h.hc_resid {
+                        let wide = ch
+                            .wide
+                            .as_deref()
+                            .expect("a split V4 stack's chunk owns its wide residual");
+                        pf_b.bind(hr, wide);
+                    }
+                    // gemma4's proportional-RoPE divisors + the K/V caches + the weights
+                    // (`bind_layer_io`): without the `rope_freqs` bind the batched graph has a live
+                    // unbound Input and panics.
+                    bind_layer_io(
+                        &mut pf_b,
+                        &pf_h,
+                        c.n_layer,
+                        rf_buf,
+                        yff_buf,
+                        &kbufs[..],
+                        &vbufs[..],
+                        &cbufs[..],
+                        &step_bufs[..],
+                        &wbufs[..],
+                    );
+                    debug_assert!(
+                        pf_h.logits.is_none(),
+                        "headless prefill build has no logits"
+                    );
+                    *written_end = (*written_end).max(cstart + ch.m);
+                    be.execute(pf_plan.as_ref(), &pf_b)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
+                    // build, plan compile, and execute (record + submit + GPU) — where a small-batch
+                    // chunk's fixed cost lives decides whether to attack recording or kernels. `l` is
+                    // the layer span, the whole model unless this is a layer-major prefill.
+                    if ec.prof.stages {
+                        tracing::info!(
+                            "[pf prof] m={} l={}..{} build={:.1}ms compile={:.1}ms execute={:.1}ms",
+                            ch.m,
+                            span.start,
+                            span.end,
+                            t_build.as_secs_f64() * 1e3,
+                            (t_compile - t_build).as_secs_f64() * 1e3,
+                            (pf_t0.elapsed() - t_compile).as_secs_f64() * 1e3,
+                        );
+                    }
+                    prompt_t += pf_t0.elapsed();
+                    // Last span for this chunk: its uploads and its residual stream are dead.
+                    if si + 1 == spans.len() {
+                        live[ci] = None;
+                    }
                 }
             }
         }

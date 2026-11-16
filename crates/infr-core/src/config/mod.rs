@@ -195,6 +195,12 @@ cfg_struct! {
         /// would only add activation residency — hence the auto rule. Both overrides exist for A/B:
         /// forcing it ON is how a resident model can be diffed against the chunk-major order.
         layer_major: Option<bool> = None,
+        /// The most prompt rows one layer-major prefill SEGMENT carries between layers. Config
+        /// only, no `INFR_*` key. A longer prompt runs as consecutive segments of whole chunks,
+        /// each layer-major, so the residual streams it holds stay bounded and the weights are
+        /// swept once per segment. `None` = automatic: on DeepSeek V4, as many rows as one GiB of
+        /// carried activations holds; every other family carries the whole prompt.
+        layer_major_rows: Option<usize> = None,
         /// Early-submit cadence for PAGED Vulkan forwards, in dispatches (`0` = off). Config
         /// only, no `INFR_*` key.
         ///

@@ -1252,9 +1252,10 @@ Decode stays one token per graph. The gate is `dsv4_emit::batched_prefill_ok`:
 the CPU only, since a GPU backend refuses the compressed layers and a ratio-0 V4
 graph of several rows has not run on one, and the CPU's `Op::MoeFfn` routes any
 expert dtype at any row count (the other backends' batched expert path needs
-`MOE_MMQ_DTYPES` banks, which the synthetic file's f32 banks are not). Always
-chunk-major: a layer-major span cannot hand over the `hc_mult`-wide residual, so
-`layer_major_prefill` is told V4 cannot be split.
+`MOE_MMQ_DTYPES` banks, which the synthetic file's f32 banks are not). Since
+2026-11-17 a prompt of several chunks prefills LAYER-MAJOR when the experts
+stream from disk through the host arena (§ "Layer-major prefill on the CPU"
+below); everywhere else the order is chunk-major as described here.
 
 **Why a chunk's rows see exactly what one position per graph shows them.** The
 emits were already written for any row count; the runner only fed one row.
@@ -1449,6 +1450,134 @@ the real file the banks do not fit in RAM and stream from disk one routed expert
 at a time, where a chunk reads each routed expert once for all the rows that
 route to it instead of once per token; that saving was not measured on a long
 prompt (a 5-token one prefills in 16.2 s with a 12 GB arena, § B-DSV4-REAL).
+
+### Layer-major prefill on the CPU (2026-11-17)
+
+**Why.** On V4-Flash a chunk of more than about 43 rows routes to most of every
+layer's 256 experts, so a chunk-major prompt reads nearly all 90.9 GB of expert
+banks once PER CHUNK through a 12 GB arena that keeps about 5 GB of them. The
+fix is the order every streamed model already had on the GPU (plan 08): run
+every chunk of the prompt through layer L before any chunk reaches L+1, so each
+layer's experts are read once for the whole prompt.
+
+**What it is.** The runner's existing layer-major walk (`spans` × `chunks` in
+`generate_dense_backend`, one single-layer span graph per (layer, chunk)), now
+also taken by V4 on the CPU:
+
+- **The wide residual crosses spans.** A partial-span V4 build declares the
+  widened `[rows, hc_mult * n_embd]` stream (`hcr[0]`, where it stands at every
+  layer boundary) as a caller-owned Input, `DecodeHandles::hc_resid`; each chunk
+  owns one (`PfChunk::wide`). The span that starts the stack widens `hidden`
+  into it, every span advances it in place (the CPU writes a mutated f32 Input
+  back), and no partial span runs the hyper-connection head. A whole-model build
+  is unchanged: the stream stays graph scratch.
+- **The compressed state needs nothing new.** Every piece of it — the raw window
+  ring, both compressed caches, the rings, the indexer cache — belongs to one
+  layer, and within a layer the chunks still run in ascending order, so each
+  layer's state receives the same writes in the same order as chunk-major, and
+  every op the same rows. A row's block visibility (`comp_visible`), the
+  indexer's per-row top-k and the ring persists are per graph and unchanged.
+- **When.** `seam::layer_major_prefill`'s automatic rule (on when the weights
+  stream) now counts the CPU's host arena for V4 (`Backend::host_paged`,
+  `seam::host_layer_major`), and `layer_major_this_prompt` still runs it only
+  for a prompt of more than one chunk over an arena that cannot hold every block
+  (`Backend::host_holds_every_block`). Other families keep chunk-major on the
+  host arena (none was checked bit for bit there); `paging.layer_major = true`
+  forces the order on any family, as before.
+- **Bounded memory.** Layer-major holds every chunk's residual between layers:
+  `seam::layer_major_row_bytes` per row, the four streams and the embedded input
+  row in f32 plus id and position (81 928 bytes at V4-Flash's geometry). A
+  prompt longer than `LAYER_MAJOR_CARRY_BYTES` (1 GiB) of that, 13 105 rows on
+  V4-Flash, runs as consecutive SEGMENTS of whole chunks
+  (`seam::layer_major_segments`), each layer-major, so the experts are read once
+  per segment. `paging.layer_major_rows` (config only) sets the cap; other
+  families carry the whole prompt as before. `cpu_committed_bytes` prices the
+  carry on a V4 run.
+- **Residency hints.** A span graph carries `Graph::weight_reuse`: `Again` while
+  more chunks of its layer follow, `Done` on the layer's last. On the CPU arena
+  `Again`/`Done` insert what a graph pins at the hot end
+  (`paged::expert_insert`, `paged::whole_insert`) — a cold-end insert, right for
+  an ordinary chunk's sweep, would make a chunk's misses evict the experts the
+  chunk before brought in — and after a `Done` graph every paged weight it read
+  is demoted to the cold end (`HostPager::demote`, `Pager::demote`), so the next
+  layer's misses take a finished layer before anything older (a previous turn's
+  residents, or the first layers of this prompt, which then survive for the
+  decode).
+
+**Verified** (`seam/dsv4_emit/tests/prefill.rs`, bit for bit): on the five
+layouts, at every prompt length of the chunked tests, layer-major in one segment
+at chunk heights 3, 37 and the whole prompt (one chunk, still run as one span
+per layer), in segments of two chunks (3 rows in 7, 37 in 80) and in segments
+shorter than a chunk (150 in 40), with the embedding on the host and gathered in
+the graph, equals one position per graph — logits, every row's kept blocks,
+every compressed cache and ring, and the decode after — and every run's op tap
+shows the layer-major order it names. An extending turn prefills its suffix
+layer-major from the turn before's state; a non-extending turn resets the rings
+(red without the reset); a cancel landing between layers 1 and 2 leaves layer
+1's state advanced and layers 2 and 3's not (asserted), records no prompt,
+raises `written_end` past the suffix and is not reused. With Q8_0 expert banks
+layer-major equals chunk-major at the same height bit for bit (int8 activations
+included), and in reference mode equals one position per graph. The llama.cpp
+oracle cases now also prefill layer-major in chunks of 64, asserted bit-equal to
+the chunk-major logits they score. Breaks that turned these red: widening the
+stream in every span (every layer-major test and the paging test), sweep
+(`Sweep`) hints in the layer-major walk (the paging test: 619 reads against a
+bound of 504), the V4 host gate off (the paging test), both cancel guards off
+(the cancel test).
+
+**Reads, synthetic** (counters, asserted): `infr_cpu`'s
+`layer_major_chunks_read_each_routed_expert_once` (six layers, top-4 of 32,
+eight 8-row chunks, a pool of one layer's experts) reads 546 blocks layer-major,
+exactly the blocks routed to, against 889 with sweep hints and 2177 chunk-major;
+`a_finished_layer_is_evicted_before_older_residents` reads 354 instead of 546 on
+a second prefill with the demotions. Through the runner
+(`dsv4_emit/tests/paging.rs`: the canonical layout with 32 experts of 32 KiB a
+bank, 480 expert blocks, a 300-token prompt in nine chunks of 37): 444 reads
+with an arena holding every block, 495 layer-major with 120 slots (the prompt's
+reads plus at most the decode step's 60 misses), about 2880 chunk-major with the
+same 120 slots; the logits are bit-identical.
+
+**Reads and time, real file** (V4-Flash Q2_K_S, `--dev cpu`,
+`INFR_DRAM_CACHE=12g` — 1904 expert slots of 2.75 MB, 5.24 GB, of 33 024 expert
+blocks — `INFR_PAGER_STATS`, `INFR_PAGER_TRACE`; 2026-11-17, the box shared with
+another session's GPU tests). Per-block read counts come from the pager trace,
+whose expert pool records every pin; a layer-major prefill ends at the pool's
+last demotion, so its reads are separable from the decode's. Before the first
+run the expected volume was at most about 87 GB (130 rows of 6-of-256 routing,
+if routing were uniform: about 244 experts a layer), about 83 s at the 1.05 GB/s
+this drive gave in 2026-11-16's bench.
+
+| run | prompt, chunks         | order       | expert reads in the prefill                 | prefill  |
+| --- | ---------------------- | ----------- | ------------------------------------------- | -------- |
+| 1   | 131 tok, 80 + 50       | layer-major | 16 881 (46.5 GB), 1 each                    | 104.3 s  |
+| 2   | 69 tok, 32 + 32 + 4    | layer-major | 13 122 (36.1 GB), 1 each                    | 98.96 s  |
+| 3   | 69 tok, 32 + 32 + 4    | chunk-major | 20 342 (56.0 GB) with the last token's pass | 91.59 s  |
+| 4   | 69 tok, as 3, after it | layer-major | 13 122 (36.1 GB), 1 each                    | 114.89 s |
+
+Run 1's prefill time is the sum of its span executes: the watchdog stopped it in
+the decode (available memory reached the 12 GB floor), so its counters were not
+printed; the trace up to then holds the whole prefill. Routing is far from
+uniform: 131 tokens touch about 131 of 256 experts a layer. Before run 3, the
+per-(layer, chunk) expert sets in run 2's trace, replayed chunk-major through a
+model of the pool, predicted 19 983 prefill reads (24 741 for run 1's prompt:
+68.1 GB, unrun); run 3 read 20 342 including the last prompt position's pass
+(774 pins), so the model holds: 1.55 times run 2's reads.
+
+**But it was not faster on these prompts.** Chunk-major took 91.6 s against 99.0
+and 114.9 s layer-major. Per read (2.75 MB, four lanes), chunk-major spent 13.7
+ms of read time and layer-major 22.2 ms (run 4: 307.5 s for 13 851 reads; run 3:
+278.5 s for 20 342). The likely reason, not established: reads are buffered, and
+chunk-major's second and third chunks re-read blocks it read seconds before,
+which the OS file cache (about 27 GB of standby between runs) still held, while
+every layer-major read is a block's first. Its non-wait time was also higher,
+16.0 s against 8.8 s (129 span graphs against 3), not profiled. At the default
+chunk height (1024) the order only runs for a prompt of more than one chunk,
+where each chunk-major sweep reads most of the 90.9 GB and no file cache holds
+it; that case was not run (one 1024-row chunk is about 85 GB of reads, so two
+chunks were estimated at roughly 170 GB against about 90). The first decode-loop
+pass after a layer-major prefill missed 729 of its 774 expert pins (run 4): the
+demotions leave the first and last layers resident, not the experts a decode
+uses most. Decode after run 2's prefill: 6 tokens in 11.08 s.
 
 ### `compress_ratio` is the master per-layer switch
 

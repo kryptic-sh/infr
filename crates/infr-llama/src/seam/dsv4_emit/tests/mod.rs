@@ -4,6 +4,7 @@
 //! model in `tests/synthetic_deepseek4_llama_cpp.rs`.
 
 mod compressor;
+mod paging;
 mod prefill;
 mod session;
 

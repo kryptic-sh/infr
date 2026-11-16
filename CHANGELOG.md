@@ -18,6 +18,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `infr_cpu::q4k_expert_repack_available`, `infr_core::blockio::IO_FANOUT` and
   `HANDLES_PER_FILE` are public.
 
+- **Weight-residency hints and demotion.** `infr_cpu::paged::expert_insert`
+  takes the graph's `infr_core::graph::WeightReuse` as a third argument;
+  `infr_core::pager::trace::Call` gains a `Demote` variant (trace op `d`), so an
+  exhaustive match on it must handle one. New: `Graph::weight_reuse`,
+  `Graph::touched`, `Pager::demote`, `HostPager::demote`,
+  `PagedWeights::{pin_as, demote, demote_experts, holds_every_block}`,
+  `paged::whole_insert`, `Backend::{host_paged, host_holds_every_block}`
+  (default `false`) and `sim::Policy::demote` (default no-op).
+
 - **`infr_server::ChatGenerator::vocab_size`** is a new required method: the
   length of the logits row a `logit_bias` is applied to. The server checks a
   request's `logit_bias` ids against it before generation, so a streaming
@@ -29,6 +38,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `GenParams::from_request`.
 
 ### Added
+
+- **DeepSeek V4 prefills layer-major on the CPU when its experts stream from
+  disk.** A prompt of more than one chunk over a host arena (`paging.dram`,
+  `INFR_DRAM_CACHE`) that cannot hold every block runs every chunk through a
+  layer before the next, so each routed expert is read once per prompt instead
+  of once per chunk: on DeepSeek-V4-Flash Q2_K_S with a 12 GB arena a 69-token
+  prompt in three chunks read 36.1 GB of experts, each once, against 56.0 GB
+  chunk-major. It was not faster there (98.96 s against 91.59 s; chunk-major's
+  re-reads likely come from the OS file cache); the order is for prompts longer
+  than one 1024-row chunk, where a chunk-major sweep reads most of the 90.9 GB
+  of experts. Bit-identical to the chunk-major prefill. The span graphs carry
+  V4's widened residual between layers, a prompt longer than 1 GiB of carried
+  rows runs in segments (`paging.layer_major_rows`, config only, sets the cap),
+  and the CPU arena keeps a layer's weights hot across its chunks and lets them
+  go first after its last. Other families are unchanged on the CPU.
 
 - **Wave64-only AMD GPUs (GCN: Polaris, Vega) run on the Vulkan backend** (issue
   #94), ported from korewaChino's KessokuNet fork. A device that cannot pin a

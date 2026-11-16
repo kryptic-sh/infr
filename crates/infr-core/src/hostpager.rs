@@ -661,6 +661,16 @@ impl HostPager {
         Some(self.pinned(id, slot, &inner))
     }
 
+    /// Make `id`, if resident, the next block this tier evicts: its caller is done with it for a
+    /// long while ([`Pager::demote`]). Reads nothing and frees nothing; a pin held on it still
+    /// protects it, and a later pin finds it resident if nothing needed its slot first.
+    pub fn demote(&self, id: BlockId) {
+        if !self.caches() {
+            return; // nothing is ever resident on an arena-less tier
+        }
+        self.inner.lock().unwrap().pager.demote(id);
+    }
+
     /// Build the `Pin` for an already-pinned, `Ready` block. Takes the guard by reference to make
     /// the caller prove it holds the lock while reading the descriptor's length.
     fn pinned(&self, id: BlockId, slot: u32, inner: &Inner) -> Pin<'_> {
@@ -947,6 +957,36 @@ mod tests {
             p.try_pin(2).is_none(),
             "the least recently used block survived"
         );
+    }
+
+    /// A demoted block is the next victim however recently it was used, and still a hit until
+    /// something needs its slot; a demoted block that is pinned stays put.
+    #[test]
+    fn a_demoted_block_is_evicted_first_and_kept_until_then() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(3, 16, io, &[1, 2, 3, 4, 5]);
+        for id in [1u32, 2, 3] {
+            drop(p.pin(id, Insert::Mru).expect("pin"));
+        }
+        p.demote(3); // the most recent, now the coldest
+        assert!(p.try_pin(3).is_some(), "a demotion evicted the block");
+        drop(p.pin(4, Insert::Mru).expect("pin"));
+        assert!(
+            p.try_pin(3).is_none(),
+            "the demoted block was not the victim"
+        );
+        assert!(p.try_pin(1).is_some() && p.try_pin(2).is_some());
+        // Pinned while demoted: the next eviction passes over it to the least recent other.
+        let held = p.pin(4, Insert::Mru).expect("pin");
+        p.demote(4);
+        drop(p.pin(5, Insert::Mru).expect("pin"));
+        assert!(p.try_pin(4).is_some(), "a pinned block was evicted");
+        assert!(
+            p.try_pin(1).is_none(),
+            "the least recent unpinned block survived"
+        );
+        drop(held);
+        p.demote(99); // never registered: nothing to do
     }
 
     /// B134: across several hits, eviction follows LAST use, not admission: each eviction takes

@@ -292,6 +292,20 @@ impl Pager {
         Some(slot)
     }
 
+    /// Move `id` to the cold end, if resident: the old pager's form of [`super::Pager::demote`].
+    ///
+    /// # Panics
+    /// On a grouped pager, as the pager does.
+    pub fn demote(&mut self, id: BlockId) -> Option<u32> {
+        assert!(
+            self.groups.is_none(),
+            "pager: demote of block {id} on a grouped pager"
+        );
+        let slot = *self.resident.get(&id)?;
+        self.mark_cold(id);
+        Some(slot)
+    }
+
     /// Schedule-driven residency for a DETERMINISTIC cyclic sweep — the dense layer-streaming
     /// policy the module doc names (`BlockId = layer`, every forward pass visits blocks in the
     /// same fixed order). This is NOT demand/LRU: under a cyclic sweep the block whose next use
@@ -672,6 +686,7 @@ mod tests {
                 Outcome::Done
             }
             Call::Evict(id) => Outcome::Slot(r.evict(id)),
+            Call::Demote(id) => Outcome::Slot(r.demote(id)),
             Call::TouchGroup(first, len) => {
                 r.group_by(len);
                 Outcome::Grouped(r.touch_group(first))
@@ -798,6 +813,7 @@ mod tests {
         cold_hits: u64,
         legacy_evictions: u64,
         readmits_after_group_touch: u64,
+        demotions: u64,
     }
 
     fn run(case: Case, seed: u64, reached: &mut Reached) {
@@ -917,6 +933,15 @@ mod tests {
                 14 => {
                     if !held.contains(&id) {
                         p.apply(Call::Evict(id));
+                    }
+                }
+                // Defined on an ungrouped pager only (`Pager::demote`). A pinned or batch-touched
+                // block is demoted too: it stays protected, which is what is checked.
+                25 => {
+                    if p.r.groups.is_none() {
+                        if let Outcome::Slot(Some(_)) = p.apply(Call::Demote(id)) {
+                            reached.demotions += 1;
+                        }
                     }
                 }
                 15..=18 => {
@@ -1056,6 +1081,7 @@ mod tests {
             cold_hits,
             legacy_evictions,
             readmits_after_group_touch,
+            demotions,
         } = reached;
         for (what, n) in [
             ("group touches", group_touches),
@@ -1072,6 +1098,7 @@ mod tests {
                 "admissions after a group touch and a re-admitted member",
                 readmits_after_group_touch,
             ),
+            ("demotions of a resident block", demotions),
         ] {
             assert!(n >= 1000, "only {n} {what}: the case was barely exercised");
         }

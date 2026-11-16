@@ -680,6 +680,21 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Whether the loaded model's weights are read from the model file into a host arena smaller
+    /// than them (`paging.dram` on the CPU backend), so that a pass over every weight costs disk
+    /// reads. The host-memory sibling of [`Backend::dense_paged`]; a runner keys the same
+    /// read-saving reorderings off it. `false` unless a backend says otherwise.
+    fn host_paged(&self) -> bool {
+        false
+    }
+
+    /// Whether every pool of the host arena [`Backend::host_paged`] describes has a slot for each
+    /// of its blocks, so each weight is read from disk at most once per session whatever the
+    /// order. `false` whenever [`Backend::host_paged`] is `false`.
+    fn host_holds_every_block(&self) -> bool {
+        false
+    }
+
     /// Whether this backend honours [`crate::Op::DeltaNet`]'s `src_stride`: q/k/v read as
     /// per-row slices of ONE buffer instead of three packed ones. A runner emits the strided form
     /// only where this is true; a backend that ignored the stride would read k and v from q's

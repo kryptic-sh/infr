@@ -5,6 +5,7 @@
 use super::test_util::det_quant_rows;
 use super::*;
 use infr_core::blockio::{BlockDesc, BlockIo};
+use infr_core::graph::WeightReuse;
 use infr_core::tensor::TensorDesc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::time::Duration;
@@ -454,14 +455,189 @@ fn a_prefill_sweep_keeps_its_resident_set() {
     }
 }
 
+/// The prompt [`layer_major`] and [`chunk_major`] run: `CHUNKS` chunks of `rows` rows each.
+const CHUNKS: u64 = 8;
+
+/// A layer-major prefill of `built`'s stack over `paged`: every chunk through layer 0, then every
+/// chunk through layer 1, and so on, one single-layer graph per (layer, chunk) whose
+/// `weight_reuse` is `hint(last chunk of the layer)`. Returns each chunk's output.
+fn layer_major(
+    built: &Built,
+    layer: &mut Built,
+    be: &CpuBackend,
+    paged: &[Box<dyn Buffer>],
+    hint: fn(bool) -> WeightReuse,
+) -> Vec<Vec<f32>> {
+    let per_layer = built.banks.len() / built.routers.len();
+    let n = built.g.desc(built.x).numel();
+    let mut acts: Vec<Vec<f32>> = (0..CHUNKS).map(|c| rng(50 + c, n)).collect();
+    for (l, (_, router)) in built.routers.iter().enumerate() {
+        layer.routers[0].1 = router.clone();
+        let banks = refs(&paged[l * per_layer..(l + 1) * per_layer]);
+        for (c, x) in acts.iter_mut().enumerate() {
+            layer.g.weight_reuse = hint(c as u64 + 1 == CHUNKS);
+            *x = layer.run(be, &banks, x);
+        }
+    }
+    acts
+}
+
+/// The same prompt chunk-major: the whole stack per chunk, as an ordinary forward pass.
+fn chunk_major(built: &Built, be: &CpuBackend, paged: &[Box<dyn Buffer>]) -> Vec<Vec<f32>> {
+    let rows_ne = built.g.desc(built.x).numel();
+    (0..CHUNKS)
+        .map(|c| built.run(be, &refs(paged), &rng(50 + c, rows_ne)))
+        .collect()
+}
+
+/// The layer-major hints a prefill gives: [`WeightReuse::Again`] while more chunks of the layer
+/// follow, [`WeightReuse::Done`] on its last.
+fn prefill_hints(last: bool) -> WeightReuse {
+    if last {
+        WeightReuse::Done
+    } else {
+        WeightReuse::Again
+    }
+}
+
+/// **A layer-major prefill reads each expert it routes to once, with a pool of one layer's
+/// experts.** Six layers of top-4-of-32 routing, eight chunks of eight rows: one chunk routes to
+/// part of a layer's experts, the eight together to nearly all of them. With the pool at the
+/// expert floor (one layer's experts, a sixth of all blocks), layer-major with the prefill's hints
+/// (`Again`, `Done` on a layer's last chunk) reads exactly as many blocks as with a pool that
+/// holds every block, where nothing is read twice — and computes the chunk-major outputs bit for
+/// bit. The same order with the ordinary forward's insert policy (`Sweep`: a sweep's chunk goes to
+/// the cold end) reads experts again within a layer, since a chunk's misses evict the experts the
+/// chunk before brought in; chunk-major reads most of the model once per chunk. Measured
+/// 2026-11-17, of 576 blocks: a pool of every block reads 546 (the blocks routed to); one layer's
+/// pool reads 546 layer-major, 889 layer-major with sweep hints and 2177 chunk-major.
+#[test]
+fn layer_major_chunks_read_each_routed_expert_once() {
+    let moe = Moe {
+        dt: DType::F32,
+        fused: false,
+        layers: 6,
+        ne: 128,
+        nff: 128,
+        n_expert: 32,
+        n_used: 4,
+        rows: 8,
+    };
+    let built = moe.build();
+    let all: usize = built.banks.iter().map(|(_, _, b)| b.len()).sum();
+    let floor = built.floor_bytes();
+    let run = |budget: usize, order: &str| {
+        let be = CpuBackend::new();
+        let (io, _store, paged) =
+            built.paged(&be, moe.n_expert, moe.n_used, budget, Duration::ZERO);
+        let mut layer = Moe { layers: 1, ..moe }.build();
+        let out = match order {
+            "layer-major" => layer_major(&built, &mut layer, &be, &paged, prefill_hints),
+            "layer-major, sweep hints" => {
+                layer_major(&built, &mut layer, &be, &paged, |_| WeightReuse::Sweep)
+            }
+            _ => chunk_major(&built, &be, &paged),
+        };
+        (io.reads(), out)
+    };
+    let (once, want) = run(all, "layer-major");
+    let (lm, lm_out) = run(floor, "layer-major");
+    let (swept, _) = run(floor, "layer-major, sweep hints");
+    let (cm, cm_out) = run(floor, "chunk-major");
+    let blocks = 6 * 3 * moe.n_expert;
+    let counts = format!(
+        "{blocks} expert blocks; reads with a pool of all of them {once}, with one layer's: \
+         layer-major {lm}, layer-major with sweep hints {swept}, chunk-major {cm}"
+    );
+    assert!(once <= blocks, "{counts}");
+    assert_eq!(
+        lm, once,
+        "a layer-major prefill read an expert twice: {counts}"
+    );
+    assert!(swept > lm, "the hints changed nothing: {counts}");
+    assert!(
+        cm > 2 * lm,
+        "chunk-major did not re-read the model: {counts}"
+    );
+    for (c, (a, b)) in lm_out.iter().zip(&cm_out).enumerate() {
+        assert_eq!(
+            bits(a),
+            bits(b),
+            "chunk {c}: layer-major computed other bits"
+        );
+    }
+    for (c, (a, b)) in lm_out.iter().zip(&want).enumerate() {
+        assert_eq!(
+            bits(a),
+            bits(b),
+            "chunk {c}: the pool size changed the bits"
+        );
+    }
+}
+
+/// **A layer-major prefill lets each finished layer go first.** The last chunk of a layer runs
+/// with [`WeightReuse::Done`], which moves the layer's experts to the cold end, so the next
+/// layer's misses evict a layer this prefill no longer needs before anything older. With a pool
+/// of two layers' experts, a second prefill of the same prompt then still finds the experts of
+/// the first layer (kept, since every later layer's misses took the layer just finished) and of
+/// the last one: it reads fewer blocks than when every chunk is hinted `Again`, which leaves plain
+/// recency to evict the oldest layer each time and so leaves only the last two layers resident,
+/// both evicted again by the time a second prefill could use them. Measured 2026-11-17: 546 reads
+/// each first prefill, then 354 with demotion against 546 without.
+#[test]
+fn a_finished_layer_is_evicted_before_older_residents() {
+    let moe = Moe {
+        dt: DType::F32,
+        fused: false,
+        layers: 6,
+        ne: 128,
+        nff: 128,
+        n_expert: 32,
+        n_used: 4,
+        rows: 8,
+    };
+    let built = moe.build();
+    let run = |hint: fn(bool) -> WeightReuse| {
+        let be = CpuBackend::new();
+        let budget = 2 * built.floor_bytes();
+        let (io, _store, paged) =
+            built.paged(&be, moe.n_expert, moe.n_used, budget, Duration::ZERO);
+        let mut layer = Moe { layers: 1, ..moe }.build();
+        layer_major(&built, &mut layer, &be, &paged, hint);
+        let first = io.reads();
+        layer_major(&built, &mut layer, &be, &paged, hint);
+        (first, io.reads() - first)
+    };
+    let (first, demoted) = run(prefill_hints);
+    let (first_lru, kept_by_recency) = run(|_| WeightReuse::Again);
+    let counts = format!(
+        "first prefill {first} reads ({first_lru} without demotion); second prefill {demoted} \
+         reads with the finished layers demoted, {kept_by_recency} without"
+    );
+    assert_eq!(first, first_lru, "{counts}");
+    assert!(demoted < kept_by_recency, "{counts}");
+}
+
 /// The insert rule itself: decode-shaped ops recency, sweeps the cold end.
 #[test]
 fn a_decode_step_inserts_by_recency_and_a_sweep_at_the_cold_end() {
     use infr_core::pager::Insert;
-    assert_eq!(paged::expert_insert(6, 256), Insert::Mru);
-    assert_eq!(paged::expert_insert(127, 256), Insert::Mru);
-    assert_eq!(paged::expert_insert(128, 256), Insert::Cold);
-    assert_eq!(paged::expert_insert(256, 256), Insert::Cold);
+    assert_eq!(
+        paged::expert_insert(6, 256, WeightReuse::Sweep),
+        Insert::Mru
+    );
+    assert_eq!(
+        paged::expert_insert(127, 256, WeightReuse::Sweep),
+        Insert::Mru
+    );
+    assert_eq!(
+        paged::expert_insert(128, 256, WeightReuse::Sweep),
+        Insert::Cold
+    );
+    assert_eq!(
+        paged::expert_insert(256, 256, WeightReuse::Sweep),
+        Insert::Cold
+    );
 }
 
 /// A per-expert bank is readable only through `Op::MoeFfn`: any other op naming one is refused

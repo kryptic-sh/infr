@@ -36,6 +36,7 @@
 
 use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
 use infr_core::error::{Error, Result};
+use infr_core::graph::WeightReuse;
 use infr_core::hostpager::{HostPager, HostPagerStats, Pin};
 use infr_core::pager::trace::TraceFile;
 use infr_core::pager::Insert;
@@ -140,12 +141,31 @@ impl PagedExperts {
 ///   also flushes the decode working set. At the cold end the resident set stays put, hits on it
 ///   do not move it, and the chunk's misses stream through the coldest slots.
 ///
+/// - **Any op of a graph whose weights are read again next ([`WeightReuse::Again`] or
+///   [`WeightReuse::Done`]): [`Insert::Mru`].** A layer-major prefill runs one layer for every
+///   chunk of the prompt in turn, so what a chunk brings in is what the next chunk of the same
+///   layer needs: at the cold end it would be the next chunk's first victims, read again per
+///   chunk. At the hot end the victims are older layers' experts, which that layer's last chunk
+///   demoted ([`PagedWeights::demote_experts`]).
+///
 /// Measured with `a_prefill_sweep_keeps_its_resident_set` (synthetic, counters): see its doc.
-pub fn expert_insert(routed: usize, n_expert: usize) -> Insert {
-    if 2 * routed >= n_expert {
+pub fn expert_insert(routed: usize, n_expert: usize, reuse: WeightReuse) -> Insert {
+    if reuse != WeightReuse::Sweep {
+        Insert::Mru
+    } else if 2 * routed >= n_expert {
         Insert::Cold
     } else {
         Insert::Mru
+    }
+}
+
+/// Where a whole weight a graph pins goes in the recency order: the cold end for an ordinary
+/// forward pass (see [`PagedWeights::pin`]), the hot end when the next graphs read it again
+/// ([`WeightReuse::Again`], [`WeightReuse::Done`]) — the same reasoning as [`expert_insert`].
+pub fn whole_insert(reuse: WeightReuse) -> Insert {
+    match reuse {
+        WeightReuse::Sweep => Insert::Cold,
+        WeightReuse::Again | WeightReuse::Done => Insert::Mru,
     }
 }
 
@@ -398,7 +418,36 @@ impl PagedWeights {
     /// use is furthest away. Recency is the pathological choice for that shape — it is what the OS
     /// page cache does, and what `docs/perf/results.md` measured collapsing.
     pub fn pin(&self, id: PagedId) -> Result<Pin<'_>> {
-        self.pools[id.pool].pin(id.block, Insert::Cold)
+        self.pin_as(id, Insert::Cold)
+    }
+
+    /// [`Self::pin`], placing a miss (and promoting a hit) as `insert` says — see
+    /// [`whole_insert`] for which.
+    pub fn pin_as(&self, id: PagedId, insert: Insert) -> Result<Pin<'_>> {
+        self.pools[id.pool].pin(id.block, insert)
+    }
+
+    /// Make `id` the next victim of its pool once its pins are gone, if it is resident: its
+    /// reader is done with it ([`WeightReuse::Done`]).
+    pub fn demote(&self, id: PagedId) {
+        self.pools[id.pool].demote(id.block);
+    }
+
+    /// [`Self::demote`] every resident expert of `bank`.
+    pub fn demote_experts(&self, bank: PagedExperts) {
+        for e in 0..bank.n_expert {
+            self.pools[bank.pool].demote(bank.first + e);
+        }
+    }
+
+    /// Whether every pool holds a slot for each block registered with it, so nothing is ever
+    /// evicted and each block is read at most once (`Backend::host_holds_every_block`).
+    pub fn holds_every_block(&self) -> bool {
+        let next = self.next_block.lock().unwrap();
+        self.pools
+            .iter()
+            .zip(next.iter())
+            .all(|(p, &n)| n as usize <= p.n_slots())
     }
 
     /// Make expert `e` of `bank` resident and pin it, reading from the model file on a miss, and

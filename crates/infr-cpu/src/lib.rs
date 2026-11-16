@@ -326,6 +326,11 @@ pub struct CpuBackend {
     /// stride, so its upper experts slice past the bank's end inside the pool's tasks.
     #[cfg(test)]
     double_whole_bank_stride: std::sync::atomic::AtomicBool,
+    /// The host arena the last paged weight bound to this backend reads from
+    /// ([`Self::paged_weight`], [`Self::paged_experts_weight`]), for
+    /// `Backend::host_paged`. Weak: the bound weights own the store, and a reused backend whose
+    /// model was dropped (serve's model reload) must not keep answering for it.
+    paged_store: Mutex<std::sync::Weak<paged::PagedWeights>>,
 }
 
 /// `default()` is `new()` — the env-sourced bridge, NOT `Config::default()`. Keeping them the same
@@ -357,7 +362,13 @@ impl CpuBackend {
             attn_query_block: ATTN_QUERY_BLOCK,
             #[cfg(test)]
             double_whole_bank_stride: std::sync::atomic::AtomicBool::new(false),
+            paged_store: Mutex::new(std::sync::Weak::new()),
         }
+    }
+
+    /// Record `store` as the arena this backend's paged weights read from.
+    fn note_paged_store(&self, store: &Arc<paged::PagedWeights>) {
+        *self.paged_store.lock().unwrap() = Arc::downgrade(store);
     }
 
     /// A backend in REFERENCE mode: every quantized `Op::Linear` (dense and MoE-expert) decodes
@@ -503,6 +514,7 @@ impl CpuBackend {
         id: paged::PagedId,
         nbytes: usize,
     ) -> Box<dyn Buffer> {
+        self.note_paged_store(&store);
         Box::new(CpuBuffer {
             uid: next_buffer_uid(),
             store: CpuStore::Paged { store, id, nbytes },
@@ -518,6 +530,7 @@ impl CpuBackend {
         bank: paged::PagedExperts,
         nbytes: usize,
     ) -> Box<dyn Buffer> {
+        self.note_paged_store(&store);
         Box::new(CpuBuffer {
             uid: next_buffer_uid(),
             store: CpuStore::PagedExperts {
@@ -559,7 +572,7 @@ impl CpuBackend {
             };
             match &cb.store {
                 CpuStore::Paged { store, id, .. } => {
-                    pins.push(store.pin(*id)?);
+                    pins.push(store.pin_as(*id, paged::whole_insert(g.weight_reuse))?);
                     waited_on = Some(store);
                 }
                 CpuStore::PagedExperts { .. } if matches!(op, Op::MoeFfn { .. }) => {}
@@ -595,6 +608,7 @@ impl CpuBackend {
         bufs: &[&'b CpuBuffer],
         n_expert: usize,
         routed: &[usize],
+        reuse: infr_core::graph::WeightReuse,
     ) -> Result<Vec<Bank<'b>>> {
         let mut jobs: Vec<(usize, usize)> = Vec::new();
         let mut store: Option<&'b paged::PagedWeights> = None;
@@ -619,7 +633,7 @@ impl CpuBackend {
             .collect();
         if let Some(store) = store {
             let t0 = std::time::Instant::now();
-            let insert = paged::expert_insert(routed.len(), n_expert);
+            let insert = paged::expert_insert(routed.len(), n_expert, reuse);
             let lanes = infr_core::blockio::IO_FANOUT.min(jobs.len());
             let jobs = &jobs;
             let pin_lane = &|lane: usize| {
@@ -3192,7 +3206,9 @@ impl Backend for CpuBackend {
                     let routed: Vec<usize> = buckets.iter().map(|&(e, _, _)| e).collect();
                     let mut bank_bufs = vec![cpu_buf(gbuf), cpu_buf(dbuf)];
                     bank_bufs.extend(ubuf);
-                    let mut banks = self.moe_banks(&bank_bufs, n_expert, &routed)?.into_iter();
+                    let mut banks = self
+                        .moe_banks(&bank_bufs, n_expert, &routed, g.weight_reuse)?
+                        .into_iter();
                     let (gb, db) = (
                         banks.next().expect("gate bank"),
                         banks.next().expect("down bank"),
@@ -4238,6 +4254,10 @@ impl Backend for CpuBackend {
             p.flush();
         }
 
+        if g.weight_reuse == infr_core::graph::WeightReuse::Done {
+            demote_paged_reads(g, bindings);
+        }
+
         // Write back the buffers the model reads after execute: Outputs (logits) and mutated f32
         // Inputs (conv/recurrent state). KV caches were written in place by `WriteKv`, so they're
         // skipped — no full-cache copy. Weights are read-only; positions are I32, unchanged. The
@@ -4253,6 +4273,43 @@ impl Backend for CpuBackend {
 
     fn sync(&self) -> Result<()> {
         Ok(())
+    }
+
+    fn host_paged(&self) -> bool {
+        self.paged_store.lock().unwrap().strong_count() > 0
+    }
+
+    fn host_holds_every_block(&self) -> bool {
+        self.paged_store
+            .lock()
+            .unwrap()
+            .upgrade()
+            .is_some_and(|s| s.holds_every_block())
+    }
+}
+
+/// [`infr_core::graph::WeightReuse::Done`]: make every paged weight some op of `g` read the next
+/// victim of its pool — a whole weight, and every expert of a bank paged per expert — so the
+/// reads that follow evict what this graph was the last to need before anything still live.
+fn demote_paged_reads(g: &Graph, bindings: &Bindings) {
+    let mut seen = std::collections::HashSet::new();
+    for op in &g.ops {
+        for id in op.io().0 {
+            let Some(cb) = bindings
+                .get(id)
+                .and_then(|b| b.as_any().downcast_ref::<CpuBuffer>())
+            else {
+                continue;
+            };
+            if !seen.insert(cb.uid) {
+                continue;
+            }
+            match &cb.store {
+                CpuStore::Paged { store, id, .. } => store.demote(*id),
+                CpuStore::PagedExperts { store, bank, .. } => store.demote_experts(*bank),
+                CpuStore::Owned(_) | CpuStore::Mapped(_) => {}
+            }
+        }
     }
 }
 

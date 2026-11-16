@@ -78,11 +78,22 @@ pub fn provision(kind: TensorKind, id: TensorId, direct: &HashSet<TensorId>) -> 
 
 /// Every handle in declaration order with its [`Provision`] — the shared form of the pre-walk
 /// working-store setup loop. Yields the decl too, since the caller needs `desc.numel()`/`dtype`.
+///
+/// An `Input` no op reads or writes ([`Graph::touched`]) is [`Provision::Skip`]ped whatever its
+/// kind: a layer-span graph declares every layer's caches and state but runs one layer, and
+/// mirroring the others into the working store (and writing the f32 ones back unchanged) would
+/// cost every span a copy of the whole model's state.
 pub fn provisions(graph: &Graph) -> impl Iterator<Item = (TensorId, &TensorDecl, Provision)> + '_ {
     let direct = graph.in_place_inputs();
+    let touched = graph.touched();
     graph.tensors.iter().enumerate().map(move |(i, decl)| {
         let id = TensorId(i as u32);
-        (id, decl, provision(decl.kind, id, direct))
+        let p = if decl.kind == TensorKind::Input && !touched.contains(&id) {
+            Provision::Skip
+        } else {
+            provision(decl.kind, id, direct)
+        };
+        (id, decl, p)
     })
 }
 
@@ -109,15 +120,20 @@ pub fn writes_back(
 /// The handles [`writes_back`] selects, in declaration order — the shared form of the post-walk
 /// write-back loop's header. The COPY itself stays per-backend (host memcpy / device DtoD /
 /// unified-memory store).
+///
+/// An `Input` no op touches is left out: [`provisions`] never loaded it, so there is nothing to
+/// copy back.
 pub fn write_back_targets(graph: &Graph) -> impl Iterator<Item = TensorId> + '_ {
     let direct = graph.in_place_inputs();
+    let touched = graph.touched();
     graph
         .tensors
         .iter()
         .enumerate()
         .filter_map(move |(i, decl)| {
             let id = TensorId(i as u32);
-            writes_back(decl.kind, decl.desc.dtype, id, direct).then_some(id)
+            let dead = decl.kind == TensorKind::Input && !touched.contains(&id);
+            (!dead && writes_back(decl.kind, decl.desc.dtype, id, direct)).then_some(id)
         })
 }
 
@@ -217,6 +233,31 @@ mod tests {
         g
     }
 
+    /// An `Input` no op touches is neither loaded nor written back, whatever its dtype: a
+    /// layer-span graph declares every layer's state and runs one layer's ops. Touched by one op,
+    /// the same f32 Input is loaded and written back again.
+    #[test]
+    fn an_input_no_op_touches_is_neither_loaded_nor_written_back() {
+        let mut g = kinds_graph();
+        let dead = g.input(TensorDesc::new(vec![4], DType::F32));
+        let p = |g: &Graph, of: TensorId| provisions(g).find(|(id, _, _)| *id == of).unwrap().2;
+        assert_eq!(p(&g, dead), Provision::Skip);
+        assert!(!write_back_targets(&g).any(|id| id == dead));
+        let mut live = kinds_graph();
+        let dead = live.input(TensorDesc::new(vec![4], DType::F32));
+        let w = live.weight(TensorDesc::new(vec![4], DType::F32));
+        live.push(Op::RmsNorm {
+            x: dead,
+            weight: w,
+            dst: dead,
+            rows: 1,
+            dim: 4,
+            eps: 1e-6,
+        });
+        assert_eq!(p(&live, dead), Provision::Load);
+        assert!(write_back_targets(&live).any(|id| id == dead));
+    }
+
     /// `provision` reproduces the classification the cpu/metal setup loops spelled inline:
     /// Internal/Output materialize, a plain Input loads, a Weight and an in-place (KV) Input do
     /// nothing.
@@ -228,7 +269,7 @@ mod tests {
             got,
             vec![
                 Provision::Load, // 0 hidden: plain f32 Input
-                Provision::Load, // 1 positions: plain i32 Input (loaded, never written back)
+                Provision::Skip, // 1 positions: no op touches it
                 Provision::Skip, // 2 weight: lazily dequantized
                 Provision::Zero, // 3 scratch: Internal
                 Provision::Skip, // 4 k_cache: in place

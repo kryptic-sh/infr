@@ -549,6 +549,36 @@ impl Pager {
         Some(slot)
     }
 
+    /// Move `id` to the cold end of the recency order, if it is resident: its caller will not read
+    /// it again for a long while, so it should be the next victim. Residency, pins, the batch
+    /// epoch and the counters are unchanged — a pinned or batch-protected block still cannot be
+    /// chosen, and a later hit promotes it as usual. Successive demotions put the last one
+    /// coldest. Returns its slot, or `None` when it was not resident.
+    ///
+    /// # Panics
+    /// On a grouped pager ([`Self::group_by`]): a member of a touched group ranks by its group's
+    /// node, and no caller needs a demotion to override that, so it is refused rather than given
+    /// a meaning nothing checks. The host-arena pools, the one caller, never group.
+    pub fn demote(&mut self, id: BlockId) -> Option<u32> {
+        let slot = self.demote_untraced(id);
+        self.record(Call::Demote(id), Outcome::Slot(slot));
+        slot
+    }
+
+    fn demote_untraced(&mut self, id: BlockId) -> Option<u32> {
+        assert!(
+            self.groups.is_none(),
+            "pager: demote of block {id} on a grouped pager"
+        );
+        let slot = *self.resident.get(&id)?;
+        let n = Lru::slot(slot);
+        if self.lru.is_linked(n) {
+            self.lru.unlink(n);
+        }
+        self.lru.push_cold(n);
+        Some(slot)
+    }
+
     /// Schedule-driven residency for a DETERMINISTIC cyclic sweep — the dense layer-streaming
     /// policy the module doc names (`BlockId = layer`, every forward pass visits blocks in the
     /// same fixed order). This is NOT demand/LRU: under a cyclic sweep the block whose next use

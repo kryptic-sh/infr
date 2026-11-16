@@ -31,10 +31,11 @@
 //! | `p <id>` | [`Pager::repin`] | `<slot>` or `-` |
 //! | `u <id>` | [`Pager::unpin`] | — |
 //! | `e <id>` | [`Pager::evict`] | `<slot>` or `-` |
+//! | `d <id>` | [`Pager::demote`] | `<slot>` or `-` |
 //! | `g <first> <len>` | [`Pager::touch_group`] on a pager grouped by `len` ([`Pager::group_by`]) | `h` (every member was resident) or `-` (refused) |
 //!
-//! `g` arrived after the format's first traces; a file without it reads as before, and a reader
-//! that predates it rejects it as an unknown op rather than misreading it.
+//! `g` and `d` arrived after the format's first traces; a file without them reads as before, and a
+//! reader that predates one rejects it as an unknown op rather than misreading it.
 //!
 //! A call that returns something may carry `?` instead of its outcome: "not recorded", which is
 //! how a generated trace ([`PoolTrace::write`] of a pool with no outcomes) is written. A pool's
@@ -120,6 +121,8 @@ pub enum Call {
     Repin(BlockId),
     Unpin(BlockId),
     Evict(BlockId),
+    /// [`Pager::demote`].
+    Demote(BlockId),
     /// [`Pager::touch_group`] of the group starting at the block, on a pager grouped by the
     /// length.
     TouchGroup(BlockId, u32),
@@ -134,8 +137,8 @@ pub enum Outcome {
     Resolved(Resolution),
     /// [`Call::ResolveAndPin`] found every resident block protected.
     Refused,
-    /// [`Call::PinIfResident`], [`Call::Repin`] and [`Call::Evict`]: the slot, or `None` when the
-    /// block was not resident.
+    /// [`Call::PinIfResident`], [`Call::Repin`], [`Call::Evict`] and [`Call::Demote`]: the slot,
+    /// or `None` when the block was not resident.
     Slot(Option<u32>),
     /// [`Call::TouchGroup`]: whether the group was resident, and so touched.
     Grouped(bool),
@@ -163,6 +166,7 @@ impl Call {
                 Outcome::Done
             }
             Call::Evict(id) => Outcome::Slot(p.evict(id)),
+            Call::Demote(id) => Outcome::Slot(p.demote(id)),
             Call::TouchGroup(first, len) => {
                 p.group_by(len);
                 Outcome::Grouped(p.touch_group(first))
@@ -182,6 +186,7 @@ impl Call {
             | Call::Repin(id)
             | Call::Unpin(id)
             | Call::Evict(id)
+            | Call::Demote(id)
             | Call::TouchGroup(id, _) => Some(id),
         }
     }
@@ -204,6 +209,7 @@ fn write_event(out: &mut Vec<u8>, pool: u32, call: Call, outcome: Option<Outcome
         Call::Repin(id) => write!(w, "{pool} p {id}"),
         Call::Unpin(id) => write!(w, "{pool} u {id}"),
         Call::Evict(id) => write!(w, "{pool} e {id}"),
+        Call::Demote(id) => write!(w, "{pool} d {id}"),
         Call::TouchGroup(first, len) => write!(w, "{pool} g {first} {len}"),
     };
     let returns = !matches!(call, Call::BeginBatch | Call::Unpin(_));
@@ -635,6 +641,7 @@ fn parse_event(line: &str) -> Result<(u32, Call, Option<Outcome>), String> {
             "q" => (Call::PinIfResident(id), slot(3)?),
             "p" => (Call::Repin(id), slot(3)?),
             "e" => (Call::Evict(id), slot(3)?),
+            "d" => (Call::Demote(id), slot(3)?),
             "u" => (Call::Unpin(id), (Some(Outcome::Done), 3)),
             "g" => {
                 let len: u32 = num(field(3)?)?;
@@ -741,6 +748,8 @@ mod tests {
         Call::Evict(9),
         Call::ResolveAndPin(10, Insert::Mru),
         Call::Unpin(10),
+        Call::Demote(10),
+        Call::Demote(9), // not resident
         Call::BeginBatch,
         Call::Touch(1),
         Call::Touch(2),

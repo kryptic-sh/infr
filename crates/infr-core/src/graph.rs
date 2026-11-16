@@ -1822,6 +1822,31 @@ pub struct Graph {
     /// Not part of the graph's identity — cloning carries a filled cache along if present, and an
     /// empty one refills once on the clone's first query.
     in_place_cache: std::sync::OnceLock<std::collections::HashSet<TensorId>>,
+    /// Memoized [`Self::touched`], on the same terms as `in_place_cache`.
+    touched_cache: std::sync::OnceLock<std::collections::HashSet<TensorId>>,
+    /// How the weights this graph reads will be read next: a residency hint for a backend that
+    /// keeps weights in a cache smaller than the model (the CPU's host arena). A backend without
+    /// such a cache ignores it, and so may one that has its own schedule; it never changes what a
+    /// graph computes. [`WeightReuse::Sweep`] (the default) is every graph but a layer-major
+    /// prefill's.
+    pub weight_reuse: WeightReuse,
+}
+
+/// [`Graph::weight_reuse`]: what the producer knows about the next reads of a graph's weights.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WeightReuse {
+    /// No promise: a forward pass, which reads every weight once and comes back to each only
+    /// after reading all the others. The cache keeps its own policies.
+    #[default]
+    Sweep,
+    /// The graphs right after this one read the same weights again (a layer-major prefill runs
+    /// one layer for every chunk of the prompt in turn), so whatever this graph brings in should
+    /// stay: place it at the hot end of the recency order.
+    Again,
+    /// As [`Self::Again`] while it runs, and this is the LAST graph to read these weights for a
+    /// long while (the last chunk of a layer in a layer-major prefill): once it has run, move
+    /// them to the cold end, so that the next reads evict them before anything still live.
+    Done,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1869,6 +1894,21 @@ impl Graph {
                     }
                     _ => {}
                 }
+            }
+            set
+        })
+    }
+
+    /// Every handle some op of this graph reads or writes ([`Op::io`]). A declared handle outside
+    /// it is dead in this graph: a layer-span graph declares every layer's caches but runs the
+    /// ops of its own layers only. Memoized like [`Self::in_place_inputs`].
+    pub fn touched(&self) -> &std::collections::HashSet<TensorId> {
+        self.touched_cache.get_or_init(|| {
+            let mut set = std::collections::HashSet::new();
+            for op in &self.ops {
+                let (reads, writes) = op.io();
+                set.extend(reads);
+                set.extend(writes);
             }
             set
         })

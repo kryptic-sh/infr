@@ -48,6 +48,9 @@ pub trait Policy {
     fn insert(&mut self, at: usize, id: BlockId, call: Call);
     /// `id` left the cache: as a victim, or through an explicit `evict`.
     fn remove(&mut self, id: BlockId);
+    /// The caller said resident `id` will not be read for a long while ([`Call::Demote`]). A
+    /// policy that orders by recency moves it to the cold end; one that does not may ignore it.
+    fn demote(&mut self, _id: BlockId) {}
     /// The block to evict among the resident ones `evictable` accepts, or `None` if it accepts
     /// none. The driver removes it (and calls [`Self::remove`]).
     fn victim(&mut self, at: usize, evictable: &dyn Fn(BlockId) -> bool) -> Option<BlockId>;
@@ -159,6 +162,12 @@ pub fn simulate_split(
                 }
                 continue;
             }
+            Call::Demote(id) => {
+                if resident.contains_key(&id) {
+                    policy.demote(id);
+                }
+                continue;
+            }
             Call::TouchGroup(..) => unreachable!("expanded above"),
         };
         let pins_on_success = matches!(call, Call::ResolveAndPin(..) | Call::PinIfResident(_));
@@ -254,6 +263,11 @@ impl Policy for Recency {
         }
     }
 
+    fn demote(&mut self, id: BlockId) {
+        self.cold -= 1;
+        self.place(id, self.cold);
+    }
+
     fn victim(&mut self, _at: usize, evictable: &dyn Fn(BlockId) -> bool) -> Option<BlockId> {
         self.order.values().copied().find(|&b| evictable(b))
     }
@@ -289,7 +303,7 @@ impl Belady {
             | Call::ResolveAndPin(id, _)
             | Call::PinIfResident(id)
             | Call::Repin(id) => Some(id),
-            Call::BeginBatch | Call::Unpin(_) | Call::Evict(_) => None,
+            Call::BeginBatch | Call::Unpin(_) | Call::Evict(_) | Call::Demote(_) => None,
             Call::TouchGroup(..) => unreachable!("`simulate` expands group touches"),
         }
     }
@@ -511,6 +525,8 @@ mod tests {
                     }
                     go(at + 1, st, n_slots, calls, memo)
                 }
+                // Victim choice is the brute force's own, so an ordering hint changes nothing.
+                Call::Demote(_) => go(at + 1, st, n_slots, calls, memo),
                 Call::Repin(id) => {
                     if st.resident.contains_key(&id) {
                         pin(&mut st, id);

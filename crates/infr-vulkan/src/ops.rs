@@ -44,6 +44,40 @@ fn hash_spv(spv: &[u32]) -> u64 {
 /// `constant_id` of `W64` in `shaders/wave64.glsl`.
 pub(crate) const WAVE64_SPEC_ID: u32 = 1000;
 
+/// The subgroup width the wave64 path pins every pipeline to.
+const WAVE64_WIDTH: u32 = 64;
+
+/// How a pipeline's subgroup is pinned: `requiredSubgroupSize`, and whether it is created with
+/// `REQUIRE_FULL_SUBGROUPS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SubgroupPin {
+    pub size: u32,
+    pub full: bool,
+}
+
+/// The [`SubgroupPin`] for a kernel that asked for `required_sg`, or `None` to leave the width to
+/// the driver.
+///
+/// On the wave64 path every pipeline pins [`WAVE64_WIDTH`], whatever it asked for: the
+/// `wave64.glsl` remap assumes each subgroup is 64 lanes holding two 32-lane halves in
+/// `gl_LocalInvocationIndex` order. Full subgroups are then requested wherever the spec allows it
+/// (a literal `local_size_x` that is a multiple of 64, VUID-02759), so a workgroup is never split
+/// into partial subgroups; a 32-wide workgroup is one subgroup whose upper half is inactive, and
+/// cannot ask for it.
+pub(crate) fn subgroup_pin(
+    required_sg: Option<u32>,
+    wave64: bool,
+    local_size: Option<[u32; 3]>,
+) -> Option<SubgroupPin> {
+    if wave64 {
+        return Some(SubgroupPin {
+            size: WAVE64_WIDTH,
+            full: local_size.is_some_and(|l| l[0] % WAVE64_WIDTH == 0),
+        });
+    }
+    required_sg.map(|size| SubgroupPin { size, full: true })
+}
+
 /// Build one kernel's Vulkan objects, returning an error instead of aborting the process.
 ///
 /// The kernel cache (`VulkanBackend::kernel_inner`) turns an error into a panic, after releasing
@@ -152,14 +186,14 @@ pub(crate) fn try_make_compute_kernel(
         .map_entries(std::slice::from_ref(&w64_entry))
         .data(&w64_data);
     if wave64 {
-        // Pin every pipeline to 64 without REQUIRE_FULL_SUBGROUPS (local_size 32 kernels can't meet it).
-        req_sz = req_sz.required_subgroup_size(64);
-        stage = stage.specialization_info(&w64_spec).push_next(&mut req_sz);
-    } else if let Some(sz) = required_sg {
-        req_sz = req_sz.required_subgroup_size(sz);
-        stage = stage
-            .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
-            .push_next(&mut req_sz);
+        stage = stage.specialization_info(&w64_spec);
+    }
+    if let Some(pin) = subgroup_pin(required_sg, wave64, crate::spirv::local_size(spv)) {
+        req_sz = req_sz.required_subgroup_size(pin.size);
+        if pin.full {
+            stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+        }
+        stage = stage.push_next(&mut req_sz);
     }
     // Everything built so far, for the error paths below (nothing else may return early past here
     // without releasing them).
@@ -607,6 +641,167 @@ impl VulkanBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave64_pins_every_pipeline_to_64_and_full_only_where_allowed() {
+        let wg = |x| Some([x, 1, 1]);
+        // Wave32 devices: exactly what the kernel asked for, always with full subgroups.
+        assert_eq!(subgroup_pin(None, false, wg(64)), None);
+        assert_eq!(
+            subgroup_pin(Some(32), false, wg(32)),
+            Some(SubgroupPin {
+                size: 32,
+                full: true
+            })
+        );
+        assert_eq!(
+            subgroup_pin(Some(16), false, wg(128)),
+            Some(SubgroupPin {
+                size: 16,
+                full: true
+            })
+        );
+        // Wave64: 64 whatever was asked, including nothing; full only for a multiple of 64.
+        for asked in [None, Some(16), Some(32)] {
+            for (x, full) in [(32, false), (64, true), (96, false), (256, true)] {
+                assert_eq!(
+                    subgroup_pin(asked, true, wg(x)),
+                    Some(SubgroupPin { size: 64, full }),
+                    "asked {asked:?}, local_size_x {x}"
+                );
+            }
+            assert_eq!(
+                subgroup_pin(asked, true, None),
+                Some(SubgroupPin {
+                    size: 64,
+                    full: false
+                }),
+                "an unreadable workgroup size must not claim full subgroups"
+            );
+        }
+    }
+
+    /// Every built module that touches subgroups is either covered by `shaders/wave64.glsl` (it
+    /// carries the `W64` specialization constant) or is on the short list of kernels whose
+    /// subgroup arithmetic holds at ANY width, or is a cooperative-matrix kernel (never dispatched
+    /// on the wave64 path); and a covered module uses only the operations the
+    /// remap makes 32-lane: reductions (plain, or clustered at a width dividing 32), the float
+    /// inclusive scan `vw_inclusive_add` emits, and elect. Anything else (broadcast, shuffle,
+    /// ballot, vote, quad, an exclusive scan, the lane masks) would silently span both halves of a
+    /// 64-wide subgroup on the wave64 path.
+    #[test]
+    fn subgroup_kernels_are_wave64_safe() {
+        // SPIR-V enumerants (unified spec 1.6).
+        const OP_CAPABILITY: u32 = 17;
+        const CAPABILITY_COOPMAT: u32 = 6022; // CooperativeMatrixKHR
+        const OP_CONSTANT: u32 = 43;
+        const OP_DECORATE: u32 = 71;
+        const DECORATION_SPEC_ID: u32 = 1;
+        const DECORATION_BUILTIN: u32 = 11;
+        const OP_ELECT: u32 = 333;
+        const OP_FADD: u32 = 350;
+        const OP_ARITH_FIRST: u32 = 349; // OpGroupNonUniformIAdd
+        const OP_ARITH_LAST: u32 = 364; // OpGroupNonUniformLogicalXor
+        const OP_QUAD_LAST: u32 = 366; // OpGroupNonUniformQuadSwap
+        const OP_ROTATE: u32 = 4431; // OpGroupNonUniformRotateKHR
+        const REDUCE: u32 = 0;
+        const INCLUSIVE_SCAN: u32 = 1;
+        const CLUSTERED_REDUCE: u32 = 3;
+        // SubgroupSize, NumSubgroups, SubgroupId, SubgroupLocalInvocationId.
+        const SUBGROUP_BUILTINS: [u32; 4] = [36, 38, 40, 41];
+        // SubgroupEq/Ge/Gt/Le/LtMask.
+        const LANE_MASKS: std::ops::RangeInclusive<u32> = 4416..=4420;
+        // Kernels written for any subgroup width, read for it: `moe_topk.comp` reduces with
+        // subgroupMax/Min, picks a lane with subgroupElect and walks `gl_NumSubgroups` partials,
+        // none of which assumes 32 lanes.
+        const WIDTH_AGNOSTIC: &[&str] = &["moe_topk"];
+
+        let (mut covered, mut agnostic, mut coopmat) = (0, 0, 0);
+        for entry in std::fs::read_dir(env!("OUT_DIR")).expect("OUT_DIR") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "spv") {
+                continue;
+            }
+            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+            let spv = crate::gemm::spv_words(&std::fs::read(&path).expect("read spv"));
+            let mut consts = std::collections::HashMap::new();
+            let (mut w64, mut uses, mut cm, mut bad) = (false, false, false, Vec::new());
+            let mut clustered_ids = Vec::new();
+            let mut at = 5usize;
+            while at < spv.len() {
+                let wc = (spv[at] >> 16) as usize;
+                assert!(wc > 0 && at + wc <= spv.len(), "{name}: malformed SPIR-V");
+                let (op, ins) = (spv[at] & 0xffff, &spv[at..at + wc]);
+                match op {
+                    OP_CAPABILITY => cm |= ins[1] == CAPABILITY_COOPMAT,
+                    OP_CONSTANT if wc == 4 => {
+                        consts.insert(ins[2], ins[3]);
+                    }
+                    OP_DECORATE if wc == 4 && ins[2] == DECORATION_SPEC_ID => {
+                        w64 |= ins[3] == WAVE64_SPEC_ID;
+                    }
+                    OP_DECORATE if wc == 4 && ins[2] == DECORATION_BUILTIN => {
+                        if SUBGROUP_BUILTINS.contains(&ins[3]) {
+                            uses = true;
+                        } else if LANE_MASKS.contains(&ins[3]) {
+                            uses = true;
+                            bad.push(format!("lane-mask builtin {}", ins[3]));
+                        }
+                    }
+                    OP_ELECT => uses = true,
+                    OP_ARITH_FIRST..=OP_ARITH_LAST => {
+                        uses = true;
+                        match ins[4] {
+                            REDUCE => {}
+                            INCLUSIVE_SCAN if op == OP_FADD => {}
+                            CLUSTERED_REDUCE => clustered_ids.push(ins[6]),
+                            g => bad.push(format!("opcode {op} with group operation {g}")),
+                        }
+                    }
+                    o if (OP_ELECT..=OP_QUAD_LAST).contains(&o) || o == OP_ROTATE => {
+                        uses = true;
+                        bad.push(format!("opcode {o}"));
+                    }
+                    _ => {}
+                }
+                at += wc;
+            }
+            for id in clustered_ids {
+                match consts.get(&id) {
+                    Some(&n) if n <= 32 && 32 % n == 0 => {}
+                    n => bad.push(format!("cluster size {n:?} does not divide 32")),
+                }
+            }
+            if !uses {
+                continue;
+            }
+            if cm {
+                // Cooperative-matrix kernels never run on the wave64 path: the backend drops every
+                // coopmat tier there (`!wave64` on `coopmat_f16` in `VulkanBackend::new_with`),
+                // because a coopmat fragment spans the whole 64-lane subgroup.
+                coopmat += 1;
+            } else if w64 {
+                assert!(
+                    bad.is_empty(),
+                    "{name}: includes wave64.glsl but uses subgroup operations the 32-lane remap \
+                     does not cover: {bad:?}"
+                );
+                covered += 1;
+            } else {
+                assert!(
+                    WIDTH_AGNOSTIC.iter().any(|k| name.starts_with(k)),
+                    "{name}: uses subgroups without including wave64.glsl (and is not one of the \
+                     width-agnostic kernels) — on a wave64 device its subgroups are 64 lanes"
+                );
+                agnostic += 1;
+            }
+        }
+        assert!(
+            covered > 0 && agnostic > 0 && coopmat > 0,
+            "matched {covered} wave64.glsl modules, {agnostic} width-agnostic and {coopmat} \
+             coopmat ones — the check ran over nothing"
+        );
+    }
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]

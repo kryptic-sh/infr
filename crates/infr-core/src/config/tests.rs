@@ -1138,6 +1138,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_CM_8X8",
         "INFR_DEBUG_COOPMAT",
         "INFR_DEV",
+        "INFR_FORCE_WAVE64",
         "INFR_NO_COOPMAT",
         "INFR_NO_F16",
         "INFR_NO_I8DOT",

@@ -290,6 +290,11 @@ cfg_struct! {
         f16: bool = true,
         /// `INFR_NO_I8DOT` (inverted).
         i8_dot: bool = true,
+        /// `INFR_FORCE_WAVE64`: a TESTING knob. Run the wave64 emulation (every pipeline pinned to
+        /// subgroup 64, `shaders/wave64.glsl`'s 32-lane halves, cooperative matrix off) on a device
+        /// that could pin 32, so the path wave64-only GPUs (AMD GCN) take can be exercised on RDNA.
+        /// Refuses the device if it cannot pin 64. Never faster: leave it off.
+        force_wave64: bool = false,
 
         /// `INFR_NO_GEMM_WARP` (inverted).
         gemm_warp: bool = true,

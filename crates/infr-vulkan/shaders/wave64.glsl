@@ -4,7 +4,6 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_KHR_shader_subgroup_clustered : require
-#extension GL_KHR_shader_subgroup_shuffle : require
 
 layout(constant_id = 1000) const bool W64 = false;
 
@@ -14,10 +13,16 @@ uint vw_sgsize() { return W64 ? 32u : gl_SubgroupSize; }
 bool vw_elect() {
     return W64 ? (subgroupClusteredMin(gl_SubgroupInvocationID, 32u) == gl_SubgroupInvocationID) : subgroupElect();
 }
+// Each half scans only its own lanes: the other half's are zeroed rather than subtracted back out
+// afterwards, which would cancel catastrophically when the lower half's total dwarfs the upper's.
 float vw_inclusive_add(float x) {
-    float inc = subgroupInclusiveAdd(x);
-    float lo = subgroupShuffle(inc, 31u);
-    return (W64 && gl_SubgroupInvocationID >= 32u) ? inc - lo : inc;
+    if (!W64) {
+        return subgroupInclusiveAdd(x);
+    }
+    bool hi = gl_SubgroupInvocationID >= 32u;
+    float lo_scan = subgroupInclusiveAdd(hi ? 0.0 : x);
+    float hi_scan = subgroupInclusiveAdd(hi ? x : 0.0);
+    return hi ? hi_scan : lo_scan;
 }
 
 #define gl_SubgroupInvocationID vw_lane()

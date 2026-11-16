@@ -23,11 +23,11 @@
 // should match that kernel's speed while keeping bf16's accuracy).
 #ifdef BF16CM
 #extension GL_EXT_bfloat16 : require
-#include "wave64.glsl"
 #define CMTYPE bfloat16_t
 #else
 #define CMTYPE float16_t
 #endif
+#include "wave64.glsl"
 
 // Cooperative-matrix FRAGMENT shape (the coopmat<> template dims), default 16x16x16 — the shape
 // every desktop RADV/NVIDIA device enumerates. -DCM_M=8 -DCM_N=8 (the `_cm8` builds, selected at

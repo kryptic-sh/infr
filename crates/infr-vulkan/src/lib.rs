@@ -337,7 +337,9 @@ struct VulkanShared {
     /// and only where the driver was OBSERVED to round an f32→f16 conversion some other way — see
     /// [`VulkanBackend::arm_f16_rounding`].
     rte_f16: AtomicBool,
-    /// Wave64-only device (GCN): pipelines pin 64 and `shaders/wave64.glsl` emulates wave32 halves.
+    /// The wave64 path ([`crate::caps::SubgroupMode::Wave64`]): a wave64-only device (GCN), or one
+    /// forced onto it by `kernels.vulkan.force_wave64`. Every pipeline pins subgroup 64 and sets
+    /// `shaders/wave64.glsl`'s `W64`, which runs the wave32 kernels as 32-lane halves.
     wave64: bool,
     /// Set once the int8 coopmat accumulator-layout known-answer probe has run on this device:
     /// `true` = this driver lays the fragment out the way `native_gemm_i8cm_q8_0.comp` reads it.
@@ -1978,6 +1980,33 @@ impl VulkanBackend {
         let has_memmodel_dev = memmodel_feat.vulkan_memory_model_device_scope != 0;
         let has_sgsize = sgsize_feat.subgroup_size_control != 0;
         let has_full_sg = sgsize_feat.compute_full_subgroups != 0;
+        // ── subgroup width ── decided before the coopmat tiers below, which wave64 turns off.
+        let sg_mode = {
+            let mut sg_props = vk::PhysicalDeviceSubgroupProperties::default();
+            let mut sgsize_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default()
+                .push_next(&mut sg_props)
+                .push_next(&mut sgsize_props);
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut p2) };
+            let probe = crate::caps::SubgroupProbe {
+                size_control: has_sgsize,
+                min: if has_sgsize {
+                    sgsize_props.min_subgroup_size
+                } else {
+                    0
+                },
+                max: if has_sgsize {
+                    sgsize_props.max_subgroup_size
+                } else {
+                    0
+                },
+                operations: sg_props.supported_operations,
+                stages: sg_props.supported_stages,
+            };
+            crate::caps::subgroup_mode(&probe, vkcfg.force_wave64)
+                .map_err(|e| be(format!("{e} — falling back to another backend")))?
+        };
+        let wave64 = matches!(sg_mode, crate::caps::SubgroupMode::Wave64 { .. });
         // Packed i8 dot: ext advertised AND the feature bit set (same ext-AND-feature discipline as
         // coopmat). Detection-only — the current i8 mmv is DEFAULT-OFF at m=1 (scalar wins), and no
         // shader here uses the ext builtin yet, so we don't add it to the enabled feature chain; the
@@ -2192,6 +2221,10 @@ impl VulkanBackend {
         let has_f16 = has_f16 && vkcfg.f16;
         let coopmat_f16 = coopmat_f16
             .filter(|_| has_f16 && vkcfg.coopmat)
+            // A cooperative matrix spans the whole subgroup, so `wave64.glsl`'s 32-lane halves
+            // cannot hold the 32-lane fragment layout every coopmat kernel here is written for.
+            // Dropping f16 drops every coopmat sub-tier below with it.
+            .filter(|_| !wave64)
             .filter(|&s| {
                 // 8x8x16 additionally needs a pinnable subgroup size 16: the `_cm8` builds run
                 // 128 threads = 8 warps × 16 lanes (XMX/DPAS is SIMD16-native) and reuse the
@@ -2422,9 +2455,7 @@ impl VulkanBackend {
         let mut maint3_props = vk::PhysicalDeviceMaintenance3Properties::default();
         // Float controls (core in Vulkan 1.2) say whether a shader may declare its f16 rounding.
         let mut float_controls = vk::PhysicalDeviceFloatControlsProperties::default();
-        let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
-            .push_next(&mut subgroup_props)
             .push_next(&mut sgsize_props)
             .push_next(&mut maint3_props)
             .push_next(&mut float_controls);
@@ -2442,46 +2473,28 @@ impl VulkanBackend {
             .into_owned();
         // (0,0) when subgroup-size-control is unsupported: can't pin any size — the adapter treats
         // that as "no 32-pin available" and uses the driver's default subgroup for the fallback.
-        let (subgroup_min, subgroup_max) = if has_sgsize {
-            (
+        // Under `kernels.vulkan.force_wave64` the range reads [64, 64], so every tier decision
+        // downstream sees what a wave64-only device would report.
+        let (subgroup_min, subgroup_max) = match sg_mode {
+            crate::caps::SubgroupMode::Wave64 { forced: true } => (64, 64),
+            _ if has_sgsize => (
                 sgsize_props.min_subgroup_size,
                 sgsize_props.max_subgroup_size,
-            )
-        } else {
-            (0, 0)
+            ),
+            _ => (0, 0),
         };
-
-        // Kernels are written for wave32; wave64-only devices run them as 32-lane halves (wave64.glsl).
-        let pin32 = has_sgsize && subgroup_min <= 32 && 32 <= subgroup_max;
-        let wave64 = !pin32 && has_sgsize && subgroup_min <= 64 && 64 <= subgroup_max;
-        if !pin32 && !wave64 {
-            return Err(be(format!(
-                "infr's Vulkan backend requires a pinnable subgroup size of 32 or 64; this \
-                 device's subgroup range is [{subgroup_min}, {subgroup_max}] and \
-                 subgroup_size_control={has_sgsize} — falling back to another backend"
-            )));
-        }
-        // After the wave32 check, whose message says more about a device without subgroup control.
+        // The subgroup width itself was settled above (`sg_mode`), before the coopmat tiers.
         check_required_features(has_int8, has_full_sg)?;
-        // wave64.glsl puts clustered and shuffle ops in every module, live or not.
-        let need_ops = vk::SubgroupFeatureFlags::BASIC
-            | vk::SubgroupFeatureFlags::ARITHMETIC
-            | vk::SubgroupFeatureFlags::CLUSTERED
-            | vk::SubgroupFeatureFlags::SHUFFLE;
-        if !subgroup_props
-            .supported_stages
-            .contains(vk::ShaderStageFlags::COMPUTE)
-            || !subgroup_props.supported_operations.contains(need_ops)
-        {
-            return Err(be(format!(
-                "infr's Vulkan backend requires basic/arithmetic/clustered/shuffle subgroup ops in \
-                 compute; this device reports operations {:?} in stages {:?} — falling back to \
-                 another backend",
-                subgroup_props.supported_operations, subgroup_props.supported_stages
-            )));
-        }
-        if wave64 {
-            tracing::info!("[infr] wave64-only device: running wave32 kernels as 32-lane halves");
+        match sg_mode {
+            crate::caps::SubgroupMode::Native => {}
+            crate::caps::SubgroupMode::Wave64 { forced: false } => tracing::info!(
+                "[infr] wave64-only device: running the wave32 kernels as 32-lane halves of each \
+                 64-wide subgroup; cooperative-matrix tiers off"
+            ),
+            crate::caps::SubgroupMode::Wave64 { forced: true } => tracing::warn!(
+                "[infr] kernels.vulkan.force_wave64: running the wave64 emulation on a device that \
+                 can pin 32 (testing only); cooperative-matrix tiers off"
+            ),
         }
 
         // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────

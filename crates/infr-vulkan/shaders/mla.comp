@@ -2,8 +2,8 @@
 #ifdef MLA_SG
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
-#include "wave64.glsl"
 #endif
+#include "wave64.glsl"
 // MLA attention (DeepSeek V2/V3 absorbed form). One workgroup per (token, head); 128 lanes
 // cooperate on that head's math. The KV cache holds ONE row per token (key_length =
 // kv_lora_rank + qk_rope_dim wide); V is the first kv_lora_rank columns — aliased from K,

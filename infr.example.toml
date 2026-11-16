@@ -138,6 +138,7 @@ i8_dot = true
 coopmat_8x8 = false # Intel Arc XMX 8x8x16 opt-in
 i8_coopmat = false
 bf16_coopmat = false
+force_wave64 = false # testing only: run the wave64 (AMD GCN) path on a wave32 device
 
 # GEMM / GEMV tiers.
 gemm_warp = true

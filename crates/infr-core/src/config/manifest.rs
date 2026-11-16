@@ -174,6 +174,7 @@ knobs! {
     "INFR_NO_DP4A_KQ"   => "kernels.vulkan.dp4a_kq",      PresenceInv, Ignored, "1", migrated;
     "INFR_NO_F16"       => "kernels.vulkan.f16",          PresenceInv, Ignored, "1", migrated;
     "INFR_NO_I8DOT"     => "kernels.vulkan.i8_dot",       PresenceInv, Ignored, "1", migrated;
+    "INFR_FORCE_WAVE64" => "kernels.vulkan.force_wave64", Presence,    Ignored, "1", migrated;
 
     // ── kernels.vulkan — GEMM / GEMV tiers ───────────────────────────────────
     "INFR_NO_GEMM_WARP"     => "kernels.vulkan.gemm_warp",      PresenceInv, Ignored, "1",  migrated;

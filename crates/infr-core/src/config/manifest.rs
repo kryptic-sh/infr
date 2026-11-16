@@ -351,6 +351,11 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
         "test/dev fixture: points at a llama.cpp binary on disk (cli/main.rs).",
     ),
     (
+        "INFR_LLAMA_FIXTURE_OUT",
+        "test/dev fixture: the directory the llama.cpp fixture regenerators write into \
+         (infr-testkit/src/llama_cpp.rs); unset, they only compare.",
+    ),
+    (
         "INFR_DIFFUSION_VISUAL",
         "CLI presentation only, NOT a Config field: it is `infr run --diffusion-visual`, \
          a plain clap flag whose `env =` fallback keeps the old spelling working. The literal that \

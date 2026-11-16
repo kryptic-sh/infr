@@ -20,7 +20,7 @@ GPU seam test.
 | 03    | [LFM3](03-lfm3.md) (`lfm3`): recent, 1.7B                                                             | done; Metal awaits CI |
 | 04    | [The MLA + indexer families](04-mla-indexer-families.md), Mistral Large 4 first                       | not started           |
 | 07    | [Mistral Large 4](07-mistral-large4.md) (`mistral-large4`): scoped, staged                            | scoped                |
-| 09    | [DeepSeek V4 compressed tiers](09-deepseek-v4-compressed.md) (`deepseek4`), then DeepSeek performance | S0-S4b done           |
+| 09    | [DeepSeek V4 compressed tiers](09-deepseek-v4-compressed.md) (`deepseek4`), then DeepSeek performance | S0-S4b, S5a done      |
 
 ## Streaming and paging
 

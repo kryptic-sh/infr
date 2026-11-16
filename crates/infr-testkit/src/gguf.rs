@@ -114,11 +114,12 @@ impl Meta {
 
 // ─── deterministic tensor values ─────────────────────────────────────────────────
 
-/// Stable FNV-1a-64 — the per-tensor RNG seed. Not `DefaultHasher`, which is not stable across
-/// toolchains and would make the "same file every run" promise a lie on the next compiler.
-fn fnv1a64(s: &str) -> u64 {
+/// Stable FNV-1a-64 — the per-tensor RNG seed (over the tensor name), and a digest a test can
+/// check in for a whole file's bytes. Not `DefaultHasher`, which is not stable across toolchains
+/// and would make the "same file every run" promise a lie on the next compiler.
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in s.as_bytes() {
+    for b in bytes {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
@@ -127,7 +128,7 @@ fn fnv1a64(s: &str) -> u64 {
 
 /// SplitMix64 finalizer — the whole RNG. Stateless, so element `i` of a tensor depends only on
 /// `(name, i)` and never on how many tensors came before it.
-fn splitmix64(x: u64) -> u64 {
+pub fn splitmix64(x: u64) -> u64 {
     let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -192,7 +193,7 @@ impl TensorSpec {
     }
 
     pub fn values(&self) -> Vec<f32> {
-        let seed = fnv1a64(&self.name);
+        let seed = fnv1a64(self.name.as_bytes());
         match &self.fill {
             Fill::Rand(amp) => (0..self.numel()).map(|i| uniform(seed, i) * amp).collect(),
             Fill::Gain => (0..self.numel())

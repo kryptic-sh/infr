@@ -1,7 +1,7 @@
 # llama.cpp logits for the synthetic LFM3 model (`lfm3_model` in synthetic_lfm3.rs) at
 # the last position of ORACLE_PROMPT, one per vocabulary id.
 # llama.cpp version: 0.9.0-dev (build 12352, commit 5676dfbe0)
-# Regenerate: INFR_LLAMA_DEBUG=<llama-debug> cargo test -p infr-llama --test synthetic_lfm3 -- --ignored synthetic_lfm3_regenerate_llama_cpp_fixture
+# Regenerate: INFR_LLAMA_DEBUG=<llama-debug> INFR_LLAMA_FIXTURE_OUT=<dir> cargo test -p infr-llama --test synthetic_lfm3 -- --ignored synthetic_lfm3_regenerate_llama_cpp_fixture
 # which runs: llama-debug -m <synthetic gguf> -p <ORACLE_PROMPT as text> --save-logits --logits-output-dir <dir>
 # tokens: 3 11 5 40 27 8 61 14 33 20 47 9 52 36 18 62 25 44 7 30 56 12 39 21
 0.7664279

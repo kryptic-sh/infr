@@ -10,18 +10,20 @@
 //! The same model is also scored against llama.cpp itself, with no model download:
 //! `fixtures/synthetic_lfm3_llama_cpp.txt` holds the logits llama.cpp computed for it, and
 //! [`synthetic_lfm3_cpu_matches_llama_cpp`] compares infr's CPU prefill with them. The fixture's
-//! header names the llama.cpp build and the command that wrote it; to regenerate it, point
-//! `INFR_LLAMA_DEBUG` at a `llama-debug` binary and run the ignored
-//! [`synthetic_lfm3_regenerate_llama_cpp_fixture`].
+//! header names the llama.cpp build and the command that wrote it. The ignored
+//! [`synthetic_lfm3_regenerate_llama_cpp_fixture`], with `INFR_LLAMA_DEBUG` naming a `llama-debug`
+//! binary, recomputes it and checks the checked-in data still matches; it writes the new file only
+//! into a directory `INFR_LLAMA_FIXTURE_OUT` names.
 //!
 //! ```text
 //! cargo test -p infr-llama --test synthetic_lfm3
 //! cargo test -p infr-llama --test synthetic_lfm3 -- --include-ignored   # + Vulkan
-//! INFR_LLAMA_DEBUG=<llama.cpp>/build/bin/Release/llama-debug.exe \
+//! INFR_LLAMA_DEBUG=<llama.cpp>/build/bin/Release/llama-debug.exe [INFR_LLAMA_FIXTURE_OUT=<dir>] \
 //!   cargo test -p infr-llama --test synthetic_lfm3 -- --ignored synthetic_lfm3_regenerate_llama_cpp_fixture
 //! ```
 
 use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
+use infr_testkit::llama_cpp::{llama_cpp_version, llama_debug_logits, write_or_compare_fixture};
 
 const N_LAYER: usize = 4;
 const NE: usize = 64;
@@ -390,66 +392,27 @@ fn synthetic_lfm3_cpu_matches_llama_cpp() {
     );
 }
 
-/// Rewrite the fixture [`synthetic_lfm3_cpu_matches_llama_cpp`] reads: write the synthetic GGUF,
+/// Recompute the fixture [`synthetic_lfm3_cpu_matches_llama_cpp`] reads: write the synthetic GGUF,
 /// run `llama-debug --save-logits` on [`ORACLE_PROMPT`]'s text (the binary `INFR_LLAMA_DEBUG`
 /// names), check llama.cpp tokenized it to exactly those ids, and record its last-position logits
-/// with the build's version line and the command.
+/// with the build's version line and the command. The result is compared with the checked-in file,
+/// or written into the directory `INFR_LLAMA_FIXTURE_OUT` names (`write_or_compare_fixture`), so
+/// running every ignored test with llama.cpp configured never rewrites the tree.
+///
+/// Without `INFR_LLAMA_DEBUG` it returns at once: the GPU gate runs every ignored test on machines
+/// with no llama.cpp build, and this is a tool for regenerating data, not a check that has to run
+/// everywhere (that is [`synthetic_lfm3_cpu_matches_llama_cpp`], which never skips).
 #[test]
-#[ignore = "regenerates the llama.cpp fixture: needs INFR_LLAMA_DEBUG (a llama-debug binary)"]
+#[ignore = "recomputes the llama.cpp fixture: needs INFR_LLAMA_DEBUG (a llama-debug binary)"]
 fn synthetic_lfm3_regenerate_llama_cpp_fixture() {
     let Ok(exe) = std::env::var("INFR_LLAMA_DEBUG") else {
         eprintln!("skip: INFR_LLAMA_DEBUG not set");
         return;
     };
     let tmp = TempGguf::write("lfm3-oracle", &lfm3_model());
-    let out_dir = tmp.path().with_extension("llama-debug");
     let prompt: String = ORACLE_PROMPT.iter().map(|&id| token_text(id)).collect();
-    let version = run_headless(&exe, &["--version".as_ref()]);
-    let version = version
-        .lines()
-        .find(|l| l.starts_with("version:"))
-        .unwrap_or_else(|| panic!("no version line from {exe} --version:\n{version}"))
-        .to_string();
-    run_headless(
-        &exe,
-        &[
-            "-m".as_ref(),
-            tmp.path().as_os_str(),
-            "-p".as_ref(),
-            prompt.as_ref(),
-            "--save-logits".as_ref(),
-            "--logits-output-dir".as_ref(),
-            out_dir.as_os_str(),
-        ],
-    );
-    let stem = tmp
-        .path()
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .expect("a UTF-8 file stem");
-    let read = |suffix: &str| {
-        let path = out_dir.join(format!("llamacpp-{stem}{suffix}"));
-        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        assert_eq!(bytes.len() % 4, 0, "{} is not 4-byte words", path.display());
-        bytes
-    };
-    let logits: Vec<f32> = read(".bin")
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&c| f32::from_le_bytes(c))
-        .collect();
-    let tokens: Vec<u32> = read("-tokens.bin")
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|&c| u32::from_le_bytes(c))
-        .collect();
-    for suffix in [".bin", ".txt", "-prompt.txt", "-tokens.bin"] {
-        std::fs::remove_file(out_dir.join(format!("llamacpp-{stem}{suffix}")))
-            .expect("remove a llama-debug output");
-    }
-    std::fs::remove_dir(&out_dir).expect("remove the llama-debug output directory");
+    let version = llama_cpp_version(&exe);
+    let (tokens, logits) = llama_debug_logits(&exe, tmp.path(), &prompt, &[]);
     assert_eq!(
         tokens, ORACLE_PROMPT,
         "llama.cpp tokenized the prompt differently"
@@ -465,8 +428,9 @@ fn synthetic_lfm3_regenerate_llama_cpp_fixture() {
         "# llama.cpp logits for the synthetic LFM3 model (`lfm3_model` in synthetic_lfm3.rs) at\n\
          # the last position of ORACLE_PROMPT, one per vocabulary id.\n\
          # llama.cpp {version}\n\
-         # Regenerate: INFR_LLAMA_DEBUG=<llama-debug> cargo test -p infr-llama --test \
-         synthetic_lfm3 -- --ignored synthetic_lfm3_regenerate_llama_cpp_fixture\n\
+         # Regenerate: INFR_LLAMA_DEBUG=<llama-debug> INFR_LLAMA_FIXTURE_OUT=<dir> cargo test \
+         -p infr-llama --test synthetic_lfm3 -- --ignored \
+         synthetic_lfm3_regenerate_llama_cpp_fixture\n\
          # which runs: llama-debug -m <synthetic gguf> -p <ORACLE_PROMPT as text> --save-logits \
          --logits-output-dir <dir>\n\
          # tokens: {}\n",
@@ -476,33 +440,8 @@ fn synthetic_lfm3_regenerate_llama_cpp_fixture() {
         text.push_str(&format!("{v}\n"));
     }
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(ORACLE_FIXTURE);
-    std::fs::write(&path, text).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
-    println!("wrote {} ({version})", path.display());
-}
-
-/// Run `exe` with `args` and no console window, panicking on a failure; returns its stdout and
-/// stderr together (llama.cpp logs to stderr).
-fn run_headless(exe: &str, args: &[&std::ffi::OsStr]) -> String {
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(args).stdin(std::process::Stdio::null());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        /// `CREATE_NO_WINDOW` from the Win32 process-creation flags: a console program started
-        /// from a test runner opens no window of its own. Other platforms have no such window.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
+    if let Some(written) = write_or_compare_fixture(&path, &text) {
+        println!("wrote {}", written.display());
     }
-    let out = cmd.output().unwrap_or_else(|e| panic!("run {exe}: {e}"));
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        out.status.success(),
-        "{exe} failed ({}):\n{text}",
-        out.status
-    );
-    text
+    println!("{version}");
 }

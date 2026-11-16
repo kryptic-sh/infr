@@ -1,0 +1,560 @@
+# llama.cpp per-tensor sums, one ubatch per token, at the positions below for the synthetic deepseek4 oracle case `hca` (synthetic_deepseek4_llama_cpp.rs).
+# llama.cpp version: 0.9.0-dev (build 12352, commit 5676dfbe0)
+# Regenerate: INFR_LLAMA_DEBUG=<llama-debug> INFR_LLAMA_FIXTURE_OUT=<dir> cargo test -p infr-llama --test synthetic_deepseek4_llama_cpp -- --ignored synthetic_dsv4_regenerate_llama_cpp_fixtures
+# which runs: llama-debug -m <synthetic gguf> -p <the first 300 prompt ids as text> -c 1024 -ub 1 --no-warmup --tensor-filter csa_state_compress --tensor-filter lid_state_compress --tensor-filter hca_state_compress --tensor-filter lid_top_k --tensor-filter attn_csa_lid --tensor-filter attn_hca --tensor-filter attn_raw --tensor-filter attn_out --tensor-filter ffn_out --tensor-filter result_norm
+# gguf: 1606880 bytes, fnv1a64 0x91458f4bf29a1ade
+# `# position: p` starts the lines for 0-based position p (the step that feeds the
+# prompt's (p+1)-th id). Each line is `<tensor> = (<type>) <op>(<sources>) = {<shape>}
+# sum <sum>`, in graph order, the name carrying the layer as `-<il>`. Sums are
+# llama.cpp's `%f`: six decimals, absolute, so compare them with an absolute
+# tolerance. `result_norm` has no rows (sum 0) except at the last position, the only
+# one llama-debug asks logits for.
+# Layer 4 is the null tail (synthetic_deepseek4_llama_cpp.rs): its csa_*/lid_*
+# tensors and its all-zero attn_out exist only in llama.cpp's file; infr's file
+# has a ratio-0 layer there.
+# position: 3
+hca_state_compress-0 = (f32)    RESHAPE(node_20{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -996.465454
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -996.478027
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -996.478027
+hca_state_compress-0 = (f32)    RESHAPE(node_30{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 1702.320435
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 1702.313354
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 1702.313354
+hca_state_compress-0 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -7.784992
+hca_state_compress-0 = (f32)        MUL(norm-0{48, 1, 1, 1}, blk.0.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -7.050510
+hca_state_compress-0 = (f32)       ROPE(hca_state_compress-0{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -7.050510
+hca_state_compress-0 (view) = (f32)       VIEW(hca_state_compress-0{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -7.050510
+attn_hca-0 = (f32)    RESHAPE(node_73{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -5.499322
+attn_hca-0 (reshaped) = (f32)    RESHAPE(attn_hca-0{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -5.499322
+attn_out-0 = (f32)    MUL_MAT(blk.0.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-0 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -1.487275
+ffn_out-0 = (f32)        ADD(ffn_moe_out-0{64, 1, 1, 1}, ffn_shexp-0{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -9.488614
+hca_state_compress-1 = (f32)    RESHAPE(node_157{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 462.722626
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 462.724426
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 462.724426
+hca_state_compress-1 = (f32)    RESHAPE(node_167{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -1183.477295
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -1183.501831
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -1183.501831
+hca_state_compress-1 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 3.615045
+hca_state_compress-1 = (f32)        MUL(norm-1{48, 1, 1, 1}, blk.1.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 4.090672
+hca_state_compress-1 = (f32)       ROPE(hca_state_compress-1{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 4.090672
+hca_state_compress-1 (view) = (f32)       VIEW(hca_state_compress-1{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 4.090672
+attn_hca-1 = (f32)    RESHAPE(node_210{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 8.194526
+attn_hca-1 (reshaped) = (f32)    RESHAPE(attn_hca-1{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 8.194526
+attn_out-1 = (f32)    MUL_MAT(blk.1.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-1 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 1.220454
+ffn_out-1 = (f32)        ADD(ffn_moe_out-1{64, 1, 1, 1}, ffn_shexp-1{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -8.019183
+hca_state_compress-2 = (f32)    RESHAPE(node_296{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 942.728821
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 942.720947
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 942.720947
+hca_state_compress-2 = (f32)    RESHAPE(node_306{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 908.670837
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 908.679871
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 908.679871
+hca_state_compress-2 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 7.365120
+hca_state_compress-2 = (f32)        MUL(norm-2{48, 1, 1, 1}, blk.2.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 6.784677
+hca_state_compress-2 = (f32)       ROPE(hca_state_compress-2{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 6.784677
+hca_state_compress-2 (view) = (f32)       VIEW(hca_state_compress-2{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 6.784677
+attn_hca-2 = (f32)    RESHAPE(node_349{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -9.306029
+attn_hca-2 (reshaped) = (f32)    RESHAPE(attn_hca-2{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -9.306029
+attn_out-2 = (f32)    MUL_MAT(blk.2.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-2 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -0.263187
+ffn_out-2 = (f32)        ADD(ffn_moe_out-2{64, 1, 1, 1}, ffn_shexp-2{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 7.415635
+hca_state_compress-3 = (f32)    RESHAPE(node_435{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 121.494301
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 121.483307
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 121.483307
+hca_state_compress-3 = (f32)    RESHAPE(node_445{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -1062.593262
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -1062.595947
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -1062.595947
+hca_state_compress-3 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 0.949177
+hca_state_compress-3 = (f32)        MUL(norm-3{48, 1, 1, 1}, blk.3.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 0.642743
+hca_state_compress-3 = (f32)       ROPE(hca_state_compress-3{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 0.642743
+hca_state_compress-3 (view) = (f32)       VIEW(hca_state_compress-3{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 0.642743
+attn_hca-3 = (f32)    RESHAPE(node_488{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 0.739847
+attn_hca-3 (reshaped) = (f32)    RESHAPE(attn_hca-3{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 0.739847
+attn_out-3 = (f32)    MUL_MAT(blk.3.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-3 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -6.448996
+ffn_out-3 = (f32)        ADD(ffn_moe_out-3{64, 1, 1, 1}, ffn_shexp-3{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -9.730858
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum 0.000000
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum -inf
+csa_state_compress-4 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -4.722402
+csa_state_compress-4 = (f32)        MUL(norm-4{48, 1, 1, 1}, blk.4.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -5.271897
+csa_state_compress-4 = (f32)       ROPE(csa_state_compress-4{48, 1, 1, 1}, dsv4_csa_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -5.271897
+csa_state_compress-4 (view) = (f32)       VIEW(csa_state_compress-4{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -5.271897
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum 0.000000
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum -inf
+lid_state_compress-4 = (f32)       CONT( (permuted){128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 20.158440
+lid_state_compress-4 = (f32)        MUL(norm-4{128, 1, 1, 1}, blk.4.indexer_compressor_norm.weight{128, 1, 1, 1}}) = {128, 1, 1, 1} sum 25.171818
+lid_state_compress-4 = (f32)       ROPE(lid_state_compress-4{128, 1, 1, 1}, dsv4_lid_state_write_pos{1, 1, 1, 1}}) = {128, 1, 1, 1} sum 25.171818
+lid_state_compress-4 (reshaped) = (f32)    RESHAPE(lid_state_compress-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 25.171818
+lid_state_compress_rot-4 = (f32)    RESHAPE(node_671{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 15.687213
+lid_state_compress_rot-4 (view) = (f32)       VIEW(lid_state_compress_rot-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 15.687213
+lid_top_k-4 = (i32)       CONT(node_716{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+lid_top_k-4 (reshaped) = (i32)    RESHAPE(lid_top_k-4{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+attn_csa_lid-4 = (f32)    RESHAPE(node_721{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 9.710693
+attn_csa_lid-4 (reshaped) = (f32)    RESHAPE(attn_csa_lid-4{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 9.710693
+attn_out-4 = (f32)    MUL_MAT(blk.4.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-4 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 0.000000
+ffn_out-4 = (f32)        ADD(ffn_moe_out-4{64, 1, 1, 1}, ffn_shexp-4{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -6.418376
+result_norm = (f32)        MUL(norm{64, 0, 1, 1}, output_norm.weight{64, 1, 1, 1}}) = {64, 0, 1, 1} sum 0.000000
+# position: 4
+hca_state_compress-0 = (f32)    RESHAPE(node_20{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -857.885681
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -857.876648
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -857.876648
+hca_state_compress-0 = (f32)    RESHAPE(node_30{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 8.920996
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 8.914932
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 8.914932
+hca_state_compress-0 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -6.702248
+hca_state_compress-0 = (f32)        MUL(norm-0{48, 1, 1, 1}, blk.0.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -6.951730
+hca_state_compress-0 = (f32)       ROPE(hca_state_compress-0{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -6.951730
+hca_state_compress-0 (view) = (f32)       VIEW(hca_state_compress-0{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -6.951730
+attn_hca-0 = (f32)    RESHAPE(node_73{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 0.224288
+attn_hca-0 (reshaped) = (f32)    RESHAPE(attn_hca-0{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 0.224288
+attn_out-0 = (f32)    MUL_MAT(blk.0.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-0 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -6.655770
+ffn_out-0 = (f32)        ADD(ffn_moe_out-0{64, 1, 1, 1}, ffn_shexp-0{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 14.467267
+hca_state_compress-1 = (f32)    RESHAPE(node_157{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -2419.228271
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -2419.227295
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -2419.227295
+hca_state_compress-1 = (f32)    RESHAPE(node_167{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -76.171097
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -76.173256
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -76.173256
+hca_state_compress-1 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -18.900230
+hca_state_compress-1 = (f32)        MUL(norm-1{48, 1, 1, 1}, blk.1.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -15.661900
+hca_state_compress-1 = (f32)       ROPE(hca_state_compress-1{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -15.661900
+hca_state_compress-1 (view) = (f32)       VIEW(hca_state_compress-1{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -15.661900
+attn_hca-1 = (f32)    RESHAPE(node_210{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 6.806357
+attn_hca-1 (reshaped) = (f32)    RESHAPE(attn_hca-1{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 6.806357
+attn_out-1 = (f32)    MUL_MAT(blk.1.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-1 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 0.455422
+ffn_out-1 = (f32)        ADD(ffn_moe_out-1{64, 1, 1, 1}, ffn_shexp-1{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -5.242724
+hca_state_compress-2 = (f32)    RESHAPE(node_296{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 27.115757
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 27.124825
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 27.124825
+hca_state_compress-2 = (f32)    RESHAPE(node_306{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 733.544312
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 733.542236
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 733.542236
+hca_state_compress-2 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 0.211841
+hca_state_compress-2 = (f32)        MUL(norm-2{48, 1, 1, 1}, blk.2.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -0.559085
+hca_state_compress-2 = (f32)       ROPE(hca_state_compress-2{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -0.559085
+hca_state_compress-2 (view) = (f32)       VIEW(hca_state_compress-2{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -0.559085
+attn_hca-2 = (f32)    RESHAPE(node_349{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -10.280876
+attn_hca-2 (reshaped) = (f32)    RESHAPE(attn_hca-2{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -10.280876
+attn_out-2 = (f32)    MUL_MAT(blk.2.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-2 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -0.715809
+ffn_out-2 = (f32)        ADD(ffn_moe_out-2{64, 1, 1, 1}, ffn_shexp-2{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 1.681073
+hca_state_compress-3 = (f32)    RESHAPE(node_435{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -1644.260132
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -1644.258301
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -1644.258301
+hca_state_compress-3 = (f32)    RESHAPE(node_445{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -1069.379761
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -1069.381714
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -1069.381714
+hca_state_compress-3 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -12.845822
+hca_state_compress-3 = (f32)        MUL(norm-3{48, 1, 1, 1}, blk.3.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -12.507004
+hca_state_compress-3 = (f32)       ROPE(hca_state_compress-3{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -12.507004
+hca_state_compress-3 (view) = (f32)       VIEW(hca_state_compress-3{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -12.507004
+attn_hca-3 = (f32)    RESHAPE(node_488{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -3.770836
+attn_hca-3 (reshaped) = (f32)    RESHAPE(attn_hca-3{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -3.770836
+attn_out-3 = (f32)    MUL_MAT(blk.3.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-3 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -5.572918
+ffn_out-3 = (f32)        ADD(ffn_moe_out-3{64, 1, 1, 1}, ffn_shexp-3{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 2.831552
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum 30.733517
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum -22.074327
+csa_state_compress-4 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -1.116370
+csa_state_compress-4 = (f32)        MUL(norm-4{48, 1, 1, 1}, blk.4.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -1.356256
+csa_state_compress-4 = (f32)       ROPE(csa_state_compress-4{48, 1, 1, 1}, dsv4_csa_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -1.356256
+csa_state_compress-4 (view) = (f32)       VIEW(csa_state_compress-4{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -1.356256
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum -50.919689
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum -27.138588
+lid_state_compress-4 = (f32)       CONT( (permuted){128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 1.103643
+lid_state_compress-4 = (f32)        MUL(norm-4{128, 1, 1, 1}, blk.4.indexer_compressor_norm.weight{128, 1, 1, 1}}) = {128, 1, 1, 1} sum 0.354347
+lid_state_compress-4 = (f32)       ROPE(lid_state_compress-4{128, 1, 1, 1}, dsv4_lid_state_write_pos{1, 1, 1, 1}}) = {128, 1, 1, 1} sum 0.354347
+lid_state_compress-4 (reshaped) = (f32)    RESHAPE(lid_state_compress-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 0.354347
+lid_state_compress_rot-4 = (f32)    RESHAPE(node_671{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 14.651986
+lid_state_compress_rot-4 (view) = (f32)       VIEW(lid_state_compress_rot-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 14.651986
+lid_top_k-4 = (i32)       CONT(node_716{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+lid_top_k-4 (reshaped) = (i32)    RESHAPE(lid_top_k-4{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+attn_csa_lid-4 = (f32)    RESHAPE(node_721{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 9.635477
+attn_csa_lid-4 (reshaped) = (f32)    RESHAPE(attn_csa_lid-4{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 9.635477
+attn_out-4 = (f32)    MUL_MAT(blk.4.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-4 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 0.000000
+ffn_out-4 = (f32)        ADD(ffn_moe_out-4{64, 1, 1, 1}, ffn_shexp-4{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 1.203073
+result_norm = (f32)        MUL(norm{64, 0, 1, 1}, output_norm.weight{64, 1, 1, 1}}) = {64, 0, 1, 1} sum 0.000000
+# position: 22
+hca_state_compress-0 = (f32)    RESHAPE(node_20{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -2061.631592
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -2061.643555
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -2061.643555
+hca_state_compress-0 = (f32)    RESHAPE(node_30{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -319.028992
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -319.058105
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -319.058105
+hca_state_compress-0 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -16.106522
+hca_state_compress-0 = (f32)        MUL(norm-0{48, 1, 1, 1}, blk.0.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -14.925716
+hca_state_compress-0 = (f32)       ROPE(hca_state_compress-0{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -14.925716
+hca_state_compress-0 (view) = (f32)       VIEW(hca_state_compress-0{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -14.925716
+attn_hca-0 = (f32)    RESHAPE(node_73{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -7.654370
+attn_hca-0 (reshaped) = (f32)    RESHAPE(attn_hca-0{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -7.654370
+attn_out-0 = (f32)    MUL_MAT(blk.0.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-0 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -3.721243
+ffn_out-0 = (f32)        ADD(ffn_moe_out-0{64, 1, 1, 1}, ffn_shexp-0{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 1.190424
+hca_state_compress-1 = (f32)    RESHAPE(node_157{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -1346.674561
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -1346.696045
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -1346.696045
+hca_state_compress-1 = (f32)    RESHAPE(node_167{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 991.198120
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 991.142944
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 991.142944
+hca_state_compress-1 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -10.520854
+hca_state_compress-1 = (f32)        MUL(norm-1{48, 1, 1, 1}, blk.1.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -10.043622
+hca_state_compress-1 = (f32)       ROPE(hca_state_compress-1{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -10.043622
+hca_state_compress-1 (view) = (f32)       VIEW(hca_state_compress-1{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -10.043622
+attn_hca-1 = (f32)    RESHAPE(node_210{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 5.754955
+attn_hca-1 (reshaped) = (f32)    RESHAPE(attn_hca-1{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 5.754955
+attn_out-1 = (f32)    MUL_MAT(blk.1.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-1 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 1.632200
+ffn_out-1 = (f32)        ADD(ffn_moe_out-1{64, 1, 1, 1}, ffn_shexp-1{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -2.125896
+hca_state_compress-2 = (f32)    RESHAPE(node_296{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 842.575745
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 842.556091
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 842.556091
+hca_state_compress-2 = (f32)    RESHAPE(node_306{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 150.560883
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 150.552933
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 150.552933
+hca_state_compress-2 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 6.582545
+hca_state_compress-2 = (f32)        MUL(norm-2{48, 1, 1, 1}, blk.2.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 5.789115
+hca_state_compress-2 = (f32)       ROPE(hca_state_compress-2{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 5.789115
+hca_state_compress-2 (view) = (f32)       VIEW(hca_state_compress-2{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 5.789115
+attn_hca-2 = (f32)    RESHAPE(node_349{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -2.417744
+attn_hca-2 (reshaped) = (f32)    RESHAPE(attn_hca-2{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -2.417744
+attn_out-2 = (f32)    MUL_MAT(blk.2.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-2 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -1.526747
+ffn_out-2 = (f32)        ADD(ffn_moe_out-2{64, 1, 1, 1}, ffn_shexp-2{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 24.293568
+hca_state_compress-3 = (f32)    RESHAPE(node_435{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -1826.573364
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -1826.556641
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -1826.556641
+hca_state_compress-3 = (f32)    RESHAPE(node_445{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -992.276062
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -992.275269
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -992.275269
+hca_state_compress-3 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -14.270227
+hca_state_compress-3 = (f32)        MUL(norm-3{48, 1, 1, 1}, blk.3.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -12.054358
+hca_state_compress-3 = (f32)       ROPE(hca_state_compress-3{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -12.054358
+hca_state_compress-3 (view) = (f32)       VIEW(hca_state_compress-3{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -12.054358
+attn_hca-3 = (f32)    RESHAPE(node_488{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 0.486532
+attn_hca-3 (reshaped) = (f32)    RESHAPE(attn_hca-3{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 0.486532
+attn_out-3 = (f32)    MUL_MAT(blk.3.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-3 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -4.221590
+ffn_out-3 = (f32)        ADD(ffn_moe_out-3{64, 1, 1, 1}, ffn_shexp-3{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 2.359369
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum -4.336978
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum 14.335145
+csa_state_compress-4 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -0.081242
+csa_state_compress-4 = (f32)        MUL(norm-4{48, 1, 1, 1}, blk.4.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -0.043452
+csa_state_compress-4 = (f32)       ROPE(csa_state_compress-4{48, 1, 1, 1}, dsv4_csa_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -0.043452
+csa_state_compress-4 (view) = (f32)       VIEW(csa_state_compress-4{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -0.043452
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum -94.930420
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum -16.665524
+lid_state_compress-4 = (f32)       CONT( (permuted){128, 1, 1, 1}, }) = {128, 1, 1, 1} sum -17.252115
+lid_state_compress-4 = (f32)        MUL(norm-4{128, 1, 1, 1}, blk.4.indexer_compressor_norm.weight{128, 1, 1, 1}}) = {128, 1, 1, 1} sum -16.917286
+lid_state_compress-4 = (f32)       ROPE(lid_state_compress-4{128, 1, 1, 1}, dsv4_lid_state_write_pos{1, 1, 1, 1}}) = {128, 1, 1, 1} sum -16.917286
+lid_state_compress-4 (reshaped) = (f32)    RESHAPE(lid_state_compress-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum -16.917286
+lid_state_compress_rot-4 = (f32)    RESHAPE(node_671{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 6.637156
+lid_state_compress_rot-4 (view) = (f32)       VIEW(lid_state_compress_rot-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 6.637156
+lid_top_k-4 = (i32)       CONT(node_716{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+lid_top_k-4 (reshaped) = (i32)    RESHAPE(lid_top_k-4{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+attn_csa_lid-4 = (f32)    RESHAPE(node_721{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -2.423836
+attn_csa_lid-4 (reshaped) = (f32)    RESHAPE(attn_csa_lid-4{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -2.423836
+attn_out-4 = (f32)    MUL_MAT(blk.4.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-4 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 0.000000
+ffn_out-4 = (f32)        ADD(ffn_moe_out-4{64, 1, 1, 1}, ffn_shexp-4{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 16.030933
+result_norm = (f32)        MUL(norm{64, 0, 1, 1}, output_norm.weight{64, 1, 1, 1}}) = {64, 0, 1, 1} sum 0.000000
+# position: 23
+hca_state_compress-0 = (f32)    RESHAPE(node_20{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 195.974030
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 195.972565
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 195.972565
+hca_state_compress-0 = (f32)    RESHAPE(node_30{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -227.921234
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -227.922852
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -227.922852
+hca_state_compress-0 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 1.531054
+hca_state_compress-0 = (f32)        MUL(norm-0{48, 1, 1, 1}, blk.0.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 1.492251
+hca_state_compress-0 = (f32)       ROPE(hca_state_compress-0{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 1.492251
+hca_state_compress-0 (view) = (f32)       VIEW(hca_state_compress-0{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 1.492251
+attn_hca-0 = (f32)    RESHAPE(node_73{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -11.236370
+attn_hca-0 (reshaped) = (f32)    RESHAPE(attn_hca-0{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -11.236370
+attn_out-0 = (f32)    MUL_MAT(blk.0.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-0 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 2.269223
+ffn_out-0 = (f32)        ADD(ffn_moe_out-0{64, 1, 1, 1}, ffn_shexp-0{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -7.624502
+hca_state_compress-1 = (f32)    RESHAPE(node_157{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -814.519165
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -814.534546
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -814.534546
+hca_state_compress-1 = (f32)    RESHAPE(node_167{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 775.662964
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 775.645752
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 775.645752
+hca_state_compress-1 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -6.363477
+hca_state_compress-1 = (f32)        MUL(norm-1{48, 1, 1, 1}, blk.1.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -5.271036
+hca_state_compress-1 = (f32)       ROPE(hca_state_compress-1{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -5.271036
+hca_state_compress-1 (view) = (f32)       VIEW(hca_state_compress-1{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -5.271036
+attn_hca-1 = (f32)    RESHAPE(node_210{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 9.274343
+attn_hca-1 (reshaped) = (f32)    RESHAPE(attn_hca-1{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 9.274343
+attn_out-1 = (f32)    MUL_MAT(blk.1.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-1 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -0.877487
+ffn_out-1 = (f32)        ADD(ffn_moe_out-1{64, 1, 1, 1}, ffn_shexp-1{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 5.064238
+hca_state_compress-2 = (f32)    RESHAPE(node_296{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -2254.723633
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -2254.721436
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -2254.721436
+hca_state_compress-2 = (f32)    RESHAPE(node_306{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 622.833374
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 622.831238
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 622.831238
+hca_state_compress-2 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -17.614986
+hca_state_compress-2 = (f32)        MUL(norm-2{48, 1, 1, 1}, blk.2.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -16.603508
+hca_state_compress-2 = (f32)       ROPE(hca_state_compress-2{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -16.603508
+hca_state_compress-2 (view) = (f32)       VIEW(hca_state_compress-2{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -16.603508
+attn_hca-2 = (f32)    RESHAPE(node_349{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -12.868587
+attn_hca-2 (reshaped) = (f32)    RESHAPE(attn_hca-2{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -12.868587
+attn_out-2 = (f32)    MUL_MAT(blk.2.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-2 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -1.395870
+ffn_out-2 = (f32)        ADD(ffn_moe_out-2{64, 1, 1, 1}, ffn_shexp-2{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 11.240003
+hca_state_compress-3 = (f32)    RESHAPE(node_435{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -1272.367920
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -1272.370972
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -1272.370972
+hca_state_compress-3 = (f32)    RESHAPE(node_445{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 322.772034
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 322.766876
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 322.766876
+hca_state_compress-3 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -9.940282
+hca_state_compress-3 = (f32)        MUL(norm-3{48, 1, 1, 1}, blk.3.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -9.170549
+hca_state_compress-3 = (f32)       ROPE(hca_state_compress-3{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -9.170549
+hca_state_compress-3 (view) = (f32)       VIEW(hca_state_compress-3{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -9.170549
+attn_hca-3 = (f32)    RESHAPE(node_488{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 0.269227
+attn_hca-3 (reshaped) = (f32)    RESHAPE(attn_hca-3{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 0.269227
+attn_out-3 = (f32)    MUL_MAT(blk.3.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-3 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -2.107560
+ffn_out-3 = (f32)        ADD(ffn_moe_out-3{64, 1, 1, 1}, ffn_shexp-3{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -8.816607
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum 18.024897
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum 10.498123
+csa_state_compress-4 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 4.563658
+csa_state_compress-4 = (f32)        MUL(norm-4{48, 1, 1, 1}, blk.4.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 8.009610
+csa_state_compress-4 = (f32)       ROPE(csa_state_compress-4{48, 1, 1, 1}, dsv4_csa_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 4.067105
+csa_state_compress-4 (view) = (f32)       VIEW(csa_state_compress-4{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 4.067105
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum 16.468067
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum 12.150702
+lid_state_compress-4 = (f32)       CONT( (permuted){128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 20.308155
+lid_state_compress-4 = (f32)        MUL(norm-4{128, 1, 1, 1}, blk.4.indexer_compressor_norm.weight{128, 1, 1, 1}}) = {128, 1, 1, 1} sum 32.120838
+lid_state_compress-4 = (f32)       ROPE(lid_state_compress-4{128, 1, 1, 1}, dsv4_lid_state_write_pos{1, 1, 1, 1}}) = {128, 1, 1, 1} sum 27.810179
+lid_state_compress-4 (reshaped) = (f32)    RESHAPE(lid_state_compress-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 27.810179
+lid_state_compress_rot-4 = (f32)    RESHAPE(node_671{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 12.495766
+lid_state_compress_rot-4 (view) = (f32)       VIEW(lid_state_compress_rot-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 12.495766
+lid_top_k-4 = (i32)       CONT(node_716{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+lid_top_k-4 (reshaped) = (i32)    RESHAPE(lid_top_k-4{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+attn_csa_lid-4 = (f32)    RESHAPE(node_721{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 12.522913
+attn_csa_lid-4 (reshaped) = (f32)    RESHAPE(attn_csa_lid-4{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 12.522913
+attn_out-4 = (f32)    MUL_MAT(blk.4.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-4 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 0.000000
+ffn_out-4 = (f32)        ADD(ffn_moe_out-4{64, 1, 1, 1}, ffn_shexp-4{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -3.714477
+result_norm = (f32)        MUL(norm{64, 0, 1, 1}, output_norm.weight{64, 1, 1, 1}}) = {64, 0, 1, 1} sum 0.000000
+# position: 127
+hca_state_compress-0 = (f32)    RESHAPE(node_20{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -166.876862
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -166.876877
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -166.876877
+hca_state_compress-0 = (f32)    RESHAPE(node_30{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 238.325363
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 238.325211
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 238.325211
+hca_state_compress-0 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -1.649136
+hca_state_compress-0 = (f32)        MUL(norm-0{48, 1, 1, 1}, blk.0.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -3.858870
+hca_state_compress-0 = (f32)       ROPE(hca_state_compress-0{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -3.858870
+hca_state_compress-0 (view) = (f32)       VIEW(hca_state_compress-0{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -3.858870
+attn_hca-0 = (f32)    RESHAPE(node_73{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -1.226415
+attn_hca-0 (reshaped) = (f32)    RESHAPE(attn_hca-0{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -1.226415
+attn_out-0 = (f32)    MUL_MAT(blk.0.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-0 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 2.655480
+ffn_out-0 = (f32)        ADD(ffn_moe_out-0{64, 1, 1, 1}, ffn_shexp-0{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 3.441145
+hca_state_compress-1 = (f32)    RESHAPE(node_157{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 431.706848
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 431.706879
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 431.706879
+hca_state_compress-1 = (f32)    RESHAPE(node_167{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -373.241272
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -373.240906
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -373.240906
+hca_state_compress-1 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 7.389318
+hca_state_compress-1 = (f32)        MUL(norm-1{48, 1, 1, 1}, blk.1.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 17.323425
+hca_state_compress-1 = (f32)       ROPE(hca_state_compress-1{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 17.323425
+hca_state_compress-1 (view) = (f32)       VIEW(hca_state_compress-1{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 17.323425
+attn_hca-1 = (f32)    RESHAPE(node_210{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 1.932268
+attn_hca-1 (reshaped) = (f32)    RESHAPE(attn_hca-1{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 1.932268
+attn_out-1 = (f32)    MUL_MAT(blk.1.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-1 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -1.879645
+ffn_out-1 = (f32)        ADD(ffn_moe_out-1{64, 1, 1, 1}, ffn_shexp-1{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -12.219980
+hca_state_compress-2 = (f32)    RESHAPE(node_296{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -315.338257
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -315.339081
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -315.339081
+hca_state_compress-2 = (f32)    RESHAPE(node_306{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 30.821936
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 30.821850
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 30.821850
+hca_state_compress-2 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -2.436721
+hca_state_compress-2 = (f32)        MUL(norm-2{48, 1, 1, 1}, blk.2.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -6.022609
+hca_state_compress-2 = (f32)       ROPE(hca_state_compress-2{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -6.022609
+hca_state_compress-2 (view) = (f32)       VIEW(hca_state_compress-2{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -6.022609
+attn_hca-2 = (f32)    RESHAPE(node_349{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 2.529943
+attn_hca-2 (reshaped) = (f32)    RESHAPE(attn_hca-2{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 2.529943
+attn_out-2 = (f32)    MUL_MAT(blk.2.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-2 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 2.197428
+ffn_out-2 = (f32)        ADD(ffn_moe_out-2{64, 1, 1, 1}, ffn_shexp-2{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -8.556047
+hca_state_compress-3 = (f32)    RESHAPE(node_435{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -21.800713
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -21.800591
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -21.800591
+hca_state_compress-3 = (f32)    RESHAPE(node_445{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -274.490265
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -274.490692
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -274.490692
+hca_state_compress-3 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 1.392618
+hca_state_compress-3 = (f32)        MUL(norm-3{48, 1, 1, 1}, blk.3.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 5.434239
+hca_state_compress-3 = (f32)       ROPE(hca_state_compress-3{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 5.434239
+hca_state_compress-3 (view) = (f32)       VIEW(hca_state_compress-3{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 5.434239
+attn_hca-3 = (f32)    RESHAPE(node_488{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 2.650305
+attn_hca-3 (reshaped) = (f32)    RESHAPE(attn_hca-3{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 2.650305
+attn_out-3 = (f32)    MUL_MAT(blk.3.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-3 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -3.952391
+ffn_out-3 = (f32)        ADD(ffn_moe_out-3{64, 1, 1, 1}, ffn_shexp-3{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -0.917962
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum -8.990626
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum 16.052179
+csa_state_compress-4 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -5.137221
+csa_state_compress-4 = (f32)        MUL(norm-4{48, 1, 1, 1}, blk.4.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -8.282646
+csa_state_compress-4 = (f32)       ROPE(csa_state_compress-4{48, 1, 1, 1}, dsv4_csa_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -6.652175
+csa_state_compress-4 (view) = (f32)       VIEW(csa_state_compress-4{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -6.652175
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum -45.480389
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum 10.946967
+lid_state_compress-4 = (f32)       CONT( (permuted){128, 1, 1, 1}, }) = {128, 1, 1, 1} sum -5.095495
+lid_state_compress-4 = (f32)        MUL(norm-4{128, 1, 1, 1}, blk.4.indexer_compressor_norm.weight{128, 1, 1, 1}}) = {128, 1, 1, 1} sum -9.110018
+lid_state_compress-4 = (f32)       ROPE(lid_state_compress-4{128, 1, 1, 1}, dsv4_lid_state_write_pos{1, 1, 1, 1}}) = {128, 1, 1, 1} sum -12.177528
+lid_state_compress-4 (reshaped) = (f32)    RESHAPE(lid_state_compress-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum -12.177528
+lid_state_compress_rot-4 = (f32)    RESHAPE(node_671{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 5.746914
+lid_state_compress_rot-4 (view) = (f32)       VIEW(lid_state_compress_rot-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 5.746914
+lid_top_k-4 = (i32)       CONT(node_716{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+lid_top_k-4 (reshaped) = (i32)    RESHAPE(lid_top_k-4{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+attn_csa_lid-4 = (f32)    RESHAPE(node_721{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -1.730728
+attn_csa_lid-4 (reshaped) = (f32)    RESHAPE(attn_csa_lid-4{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -1.730728
+attn_out-4 = (f32)    MUL_MAT(blk.4.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-4 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 0.000000
+ffn_out-4 = (f32)        ADD(ffn_moe_out-4{64, 1, 1, 1}, ffn_shexp-4{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 22.580122
+result_norm = (f32)        MUL(norm{64, 0, 1, 1}, output_norm.weight{64, 1, 1, 1}}) = {64, 0, 1, 1} sum 0.000000
+# position: 128
+hca_state_compress-0 = (f32)    RESHAPE(node_20{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -1029.381836
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -1029.379517
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -1029.379517
+hca_state_compress-0 = (f32)    RESHAPE(node_30{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -577.679565
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -577.671814
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -577.671814
+hca_state_compress-0 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -8.042013
+hca_state_compress-0 = (f32)        MUL(norm-0{48, 1, 1, 1}, blk.0.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -7.382156
+hca_state_compress-0 = (f32)       ROPE(hca_state_compress-0{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -7.382156
+hca_state_compress-0 (view) = (f32)       VIEW(hca_state_compress-0{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -7.382156
+attn_hca-0 = (f32)    RESHAPE(node_73{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -4.589494
+attn_hca-0 (reshaped) = (f32)    RESHAPE(attn_hca-0{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -4.589494
+attn_out-0 = (f32)    MUL_MAT(blk.0.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-0 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 2.915017
+ffn_out-0 = (f32)        ADD(ffn_moe_out-0{64, 1, 1, 1}, ffn_shexp-0{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -28.544735
+hca_state_compress-1 = (f32)    RESHAPE(node_157{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 985.609558
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 985.632202
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 985.632202
+hca_state_compress-1 = (f32)    RESHAPE(node_167{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -1300.268921
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -1300.276367
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -1300.276367
+hca_state_compress-1 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 7.700090
+hca_state_compress-1 = (f32)        MUL(norm-1{48, 1, 1, 1}, blk.1.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 7.239931
+hca_state_compress-1 = (f32)       ROPE(hca_state_compress-1{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 7.239931
+hca_state_compress-1 (view) = (f32)       VIEW(hca_state_compress-1{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 7.239931
+attn_hca-1 = (f32)    RESHAPE(node_210{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 1.854670
+attn_hca-1 (reshaped) = (f32)    RESHAPE(attn_hca-1{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 1.854670
+attn_out-1 = (f32)    MUL_MAT(blk.1.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-1 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -1.250821
+ffn_out-1 = (f32)        ADD(ffn_moe_out-1{64, 1, 1, 1}, ffn_shexp-1{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -0.381080
+hca_state_compress-2 = (f32)    RESHAPE(node_296{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -2293.984131
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -2293.968994
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -2293.968994
+hca_state_compress-2 = (f32)    RESHAPE(node_306{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 1761.219482
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 1761.243042
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 1761.243042
+hca_state_compress-2 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -17.921732
+hca_state_compress-2 = (f32)        MUL(norm-2{48, 1, 1, 1}, blk.2.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -14.300292
+hca_state_compress-2 = (f32)       ROPE(hca_state_compress-2{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -14.300292
+hca_state_compress-2 (view) = (f32)       VIEW(hca_state_compress-2{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -14.300292
+attn_hca-2 = (f32)    RESHAPE(node_349{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 0.857232
+attn_hca-2 (reshaped) = (f32)    RESHAPE(attn_hca-2{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 0.857232
+attn_out-2 = (f32)    MUL_MAT(blk.2.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-2 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 1.806799
+ffn_out-2 = (f32)        ADD(ffn_moe_out-2{64, 1, 1, 1}, ffn_shexp-2{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 4.631669
+hca_state_compress-3 = (f32)    RESHAPE(node_435{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 1564.924316
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 1564.949951
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 1564.949951
+hca_state_compress-3 = (f32)    RESHAPE(node_445{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 32.307064
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 32.331665
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 32.331665
+hca_state_compress-3 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 12.226017
+hca_state_compress-3 = (f32)        MUL(norm-3{48, 1, 1, 1}, blk.3.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 9.976624
+hca_state_compress-3 = (f32)       ROPE(hca_state_compress-3{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 9.976624
+hca_state_compress-3 (view) = (f32)       VIEW(hca_state_compress-3{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 9.976624
+attn_hca-3 = (f32)    RESHAPE(node_488{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 4.042203
+attn_hca-3 (reshaped) = (f32)    RESHAPE(attn_hca-3{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 4.042203
+attn_out-3 = (f32)    MUL_MAT(blk.3.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-3 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 0.599545
+ffn_out-3 = (f32)        ADD(ffn_moe_out-3{64, 1, 1, 1}, ffn_shexp-3{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 4.250107
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum -33.897366
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum -56.096798
+csa_state_compress-4 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 1.669521
+csa_state_compress-4 = (f32)        MUL(norm-4{48, 1, 1, 1}, blk.4.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 2.370644
+csa_state_compress-4 = (f32)       ROPE(csa_state_compress-4{48, 1, 1, 1}, dsv4_csa_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 2.370644
+csa_state_compress-4 (view) = (f32)       VIEW(csa_state_compress-4{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 2.370644
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum -40.212791
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum -66.381287
+lid_state_compress-4 = (f32)       CONT( (permuted){128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 6.865644
+lid_state_compress-4 = (f32)        MUL(norm-4{128, 1, 1, 1}, blk.4.indexer_compressor_norm.weight{128, 1, 1, 1}}) = {128, 1, 1, 1} sum 6.707046
+lid_state_compress-4 = (f32)       ROPE(lid_state_compress-4{128, 1, 1, 1}, dsv4_lid_state_write_pos{1, 1, 1, 1}}) = {128, 1, 1, 1} sum 6.707046
+lid_state_compress-4 (reshaped) = (f32)    RESHAPE(lid_state_compress-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 6.707046
+lid_state_compress_rot-4 = (f32)    RESHAPE(node_671{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 6.848400
+lid_state_compress_rot-4 (view) = (f32)       VIEW(lid_state_compress_rot-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 6.848400
+lid_top_k-4 = (i32)       CONT(node_716{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+lid_top_k-4 (reshaped) = (i32)    RESHAPE(lid_top_k-4{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+attn_csa_lid-4 = (f32)    RESHAPE(node_721{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 3.662317
+attn_csa_lid-4 (reshaped) = (f32)    RESHAPE(attn_csa_lid-4{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 3.662317
+attn_out-4 = (f32)    MUL_MAT(blk.4.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-4 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 0.000000
+ffn_out-4 = (f32)        ADD(ffn_moe_out-4{64, 1, 1, 1}, ffn_shexp-4{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -5.896115
+result_norm = (f32)        MUL(norm{64, 0, 1, 1}, output_norm.weight{64, 1, 1, 1}}) = {64, 0, 1, 1} sum 0.000000
+# position: 299
+hca_state_compress-0 = (f32)    RESHAPE(node_20{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -903.882690
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -903.875122
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -903.875122
+hca_state_compress-0 = (f32)    RESHAPE(node_30{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -564.578125
+hca_state_compress-0 (permuted) = (f32)    PERMUTE(hca_state_compress-0{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -564.571899
+hca_state_compress-0 (permuted) (cont) = (f32)       CONT(hca_state_compress-0 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -564.571899
+hca_state_compress-0 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -7.061537
+hca_state_compress-0 = (f32)        MUL(norm-0{48, 1, 1, 1}, blk.0.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -6.495078
+hca_state_compress-0 = (f32)       ROPE(hca_state_compress-0{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -6.495078
+hca_state_compress-0 (view) = (f32)       VIEW(hca_state_compress-0{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -6.495078
+attn_hca-0 = (f32)    RESHAPE(node_73{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -6.034263
+attn_hca-0 (reshaped) = (f32)    RESHAPE(attn_hca-0{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -6.034263
+attn_out-0 = (f32)    MUL_MAT(blk.0.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-0 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 2.173235
+ffn_out-0 = (f32)        ADD(ffn_moe_out-0{64, 1, 1, 1}, ffn_shexp-0{64, 1, 1, 1}}) = {64, 1, 1, 1} sum 1.780168
+hca_state_compress-1 = (f32)    RESHAPE(node_157{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 365.490356
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 365.477966
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 365.477966
+hca_state_compress-1 = (f32)    RESHAPE(node_167{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -50.913437
+hca_state_compress-1 (permuted) = (f32)    PERMUTE(hca_state_compress-1{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -50.908466
+hca_state_compress-1 (permuted) (cont) = (f32)       CONT(hca_state_compress-1 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -50.908466
+hca_state_compress-1 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 2.855390
+hca_state_compress-1 = (f32)        MUL(norm-1{48, 1, 1, 1}, blk.1.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 2.982723
+hca_state_compress-1 = (f32)       ROPE(hca_state_compress-1{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 2.982723
+hca_state_compress-1 (view) = (f32)       VIEW(hca_state_compress-1{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 2.982723
+attn_hca-1 = (f32)    RESHAPE(node_210{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -2.515560
+attn_hca-1 (reshaped) = (f32)    RESHAPE(attn_hca-1{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -2.515560
+attn_out-1 = (f32)    MUL_MAT(blk.1.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-1 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 0.274259
+ffn_out-1 = (f32)        ADD(ffn_moe_out-1{64, 1, 1, 1}, ffn_shexp-1{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -3.806722
+hca_state_compress-2 = (f32)    RESHAPE(node_296{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 142.630814
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 142.633514
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 142.633514
+hca_state_compress-2 = (f32)    RESHAPE(node_306{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -832.870544
+hca_state_compress-2 (permuted) = (f32)    PERMUTE(hca_state_compress-2{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -832.867065
+hca_state_compress-2 (permuted) (cont) = (f32)       CONT(hca_state_compress-2 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -832.867065
+hca_state_compress-2 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 1.114312
+hca_state_compress-2 = (f32)        MUL(norm-2{48, 1, 1, 1}, blk.2.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 0.356781
+hca_state_compress-2 = (f32)       ROPE(hca_state_compress-2{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 0.356781
+hca_state_compress-2 (view) = (f32)       VIEW(hca_state_compress-2{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 0.356781
+attn_hca-2 = (f32)    RESHAPE(node_349{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -5.920656
+attn_hca-2 (reshaped) = (f32)    RESHAPE(attn_hca-2{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -5.920656
+attn_out-2 = (f32)    MUL_MAT(blk.2.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-2 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 4.800797
+ffn_out-2 = (f32)        ADD(ffn_moe_out-2{64, 1, 1, 1}, ffn_shexp-2{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -7.919410
+hca_state_compress-3 = (f32)    RESHAPE(node_435{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum 466.897369
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum 466.890259
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum 466.890259
+hca_state_compress-3 = (f32)    RESHAPE(node_445{48, 128, 1, 1}, }) = {48, 128, 1, 1} sum -1307.290527
+hca_state_compress-3 (permuted) = (f32)    PERMUTE(hca_state_compress-3{48, 128, 1, 1}, }) = {128, 48, 1, 1} sum -1307.320435
+hca_state_compress-3 (permuted) (cont) = (f32)       CONT(hca_state_compress-3 (permuted){128, 48, 1, 1}, }) = {128, 48, 1, 1} sum -1307.320435
+hca_state_compress-3 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 3.647601
+hca_state_compress-3 = (f32)        MUL(norm-3{48, 1, 1, 1}, blk.3.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum 2.957750
+hca_state_compress-3 = (f32)       ROPE(hca_state_compress-3{48, 1, 1, 1}, dsv4_hca_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum 2.957750
+hca_state_compress-3 (view) = (f32)       VIEW(hca_state_compress-3{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum 2.957750
+attn_hca-3 = (f32)    RESHAPE(node_488{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum 1.903281
+attn_hca-3 (reshaped) = (f32)    RESHAPE(attn_hca-3{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum 1.903281
+attn_out-3 = (f32)    MUL_MAT(blk.3.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-3 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum -2.385858
+ffn_out-3 = (f32)        ADD(ffn_moe_out-3{64, 1, 1, 1}, ffn_shexp-3{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -25.624516
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum 1.037938
+csa_state_compress-4 = (f32)    RESHAPE( (view) (cont){48, 4, 1, 1}, }) = {48, 4, 1, 1} sum 13.103188
+csa_state_compress-4 = (f32)       CONT( (permuted){48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -2.378507
+csa_state_compress-4 = (f32)        MUL(norm-4{48, 1, 1, 1}, blk.4.attn_compressor_norm.weight{48, 1, 1, 1}}) = {48, 1, 1, 1} sum -3.719101
+csa_state_compress-4 = (f32)       ROPE(csa_state_compress-4{48, 1, 1, 1}, dsv4_csa_state_write_pos{1, 1, 1, 1}}) = {48, 1, 1, 1} sum -8.169714
+csa_state_compress-4 (view) = (f32)       VIEW(csa_state_compress-4{48, 1, 1, 1}, }) = {48, 1, 1, 1} sum -8.169714
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum 31.001507
+lid_state_compress-4 = (f32)    RESHAPE( (view) (cont){128, 4, 1, 1}, }) = {128, 4, 1, 1} sum 33.053440
+lid_state_compress-4 = (f32)       CONT( (permuted){128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 6.842711
+lid_state_compress-4 = (f32)        MUL(norm-4{128, 1, 1, 1}, blk.4.indexer_compressor_norm.weight{128, 1, 1, 1}}) = {128, 1, 1, 1} sum 13.046219
+lid_state_compress-4 = (f32)       ROPE(lid_state_compress-4{128, 1, 1, 1}, dsv4_lid_state_write_pos{1, 1, 1, 1}}) = {128, 1, 1, 1} sum 12.789491
+lid_state_compress-4 (reshaped) = (f32)    RESHAPE(lid_state_compress-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 12.789491
+lid_state_compress_rot-4 = (f32)    RESHAPE(node_671{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 14.718917
+lid_state_compress_rot-4 (view) = (f32)       VIEW(lid_state_compress_rot-4{128, 1, 1, 1}, }) = {128, 1, 1, 1} sum 14.718917
+lid_top_k-4 = (i32)       CONT(node_716{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+lid_top_k-4 (reshaped) = (i32)    RESHAPE(lid_top_k-4{256, 1, 1, 1}, }) = {256, 1, 1, 1} sum 32640.000000
+attn_csa_lid-4 = (f32)    RESHAPE(node_721{48, 2, 1, 1}, }) = {96, 1, 1, 1} sum -4.076914
+attn_csa_lid-4 (reshaped) = (f32)    RESHAPE(attn_csa_lid-4{96, 1, 1, 1}, }) = {48, 2, 1, 1} sum -4.076914
+attn_out-4 = (f32)    MUL_MAT(blk.4.attn_output_b.weight{32, 64, 1, 1}, attn_wo_a-4 (permuted) (cont){32, 1, 1, 1}}) = {64, 1, 1, 1} sum 0.000000
+ffn_out-4 = (f32)        ADD(ffn_moe_out-4{64, 1, 1, 1}, ffn_shexp-4{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -5.250390
+result_norm = (f32)        MUL(norm{64, 1, 1, 1}, output_norm.weight{64, 1, 1, 1}}) = {64, 1, 1, 1} sum -12.001838

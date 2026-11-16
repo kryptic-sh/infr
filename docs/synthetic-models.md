@@ -125,6 +125,25 @@ independent of disk space.
 to a temp file, and drives it through the real `Config::from_gguf` and the real
 seam. Its module doc has an explicit "Adding an architecture" section.
 
+Two synthetic models are also scored against llama.cpp itself, which is what
+rule 2 below asks of a golden: `synthetic_lfm3.rs` and
+`synthetic_deepseek4_llama_cpp.rs` check in the logits `llama-debug` computes
+for the very file the test builds, each with an ignored test that recomputes
+them from a `llama-debug` binary named by `INFR_LLAMA_DEBUG` and compares; it
+writes new data only into a directory `INFR_LLAMA_FIXTURE_OUT` names, so running
+every ignored test never rewrites the tree. The oracle scores sit in the fixture
+header as generated lines, which is what rule 2 asks. The V4 one also records
+the GGUF's byte length and FNV-1a digest in each fixture header, and a test
+fails when the builder writes other bytes, so the data cannot silently describe
+another model. Where an oracle point depends on a discrete choice (V4's indexer
+top-k), the regenerator also checks that the choice survives noise the size of
+f16 rounding, because a random-weight model sits on near-ties more often than
+one would guess. A synthetic file has to be one llama.cpp loads, which is a
+stricter bar than infr's loader: for V4 it took the real file's `value_length`,
+hyper-connection count and indexer width, a tokenizer a prompt string maps onto,
+and at least one ratio-4 layer, without which the reference's cache setup
+crashes (`docs/plan/09-deepseek-v4-compressed.md` section 4).
+
 **Reusable as-is** (everything above `mla_model`): `Meta` (the metadata value
 writer), `TensorSpec` + `Fill` (name, ggml-order shape, deterministic values),
 `SyntheticModel` and its byte writer, `TempGguf`.
@@ -193,7 +212,7 @@ Per-architecture, from `crates/infr-llama/src/arch.rs`'s 16 constants:
 | `llama4`          | all 3 correctness tests dark                  | **fully dark**                         |
 | `diffusion-gemma` | all 6 tests dark                              | **fully dark**                         |
 | `deepseek32`      | synthetic only — no real GGUF declares it     | converter gap, not a download gap      |
-| `deepseek4`       | synthetic only — smallest real quant ~82.5 GB | by design                              |
+| `deepseek4`       | synthetic only — smallest real quant ~82.5 GB | ratio-0 scored against llama.cpp in CI |
 | `bitnet-b1.58`    | **nothing, at any tier**                      | never tested; not even a config assert |
 
 Model-level quant coverage is narrower than it looks: of 24 weight quants swept

@@ -991,6 +991,26 @@ above for why it is a separate op rather than a mode of `Op::EmbedGather`, and
 `docs/backlog.md` § B-DSV4-HASH for what it still does not cover (Metal, the
 paged MoE path, perf).
 
+### llama.cpp over the synthetic file (2026-11-16, plan 09 S5a)
+
+The ratio-0 tier is now checked against llama.cpp itself, in CI, with no
+download: `crates/infr-llama/tests/synthetic_deepseek4_llama_cpp.rs` scores
+infr's CPU prefill of a synthetic V4 file against `llama-debug --save-logits`
+over the same file at prompts of 7 to 520 tokens. The largest gap is
+1.5926361e-4, at 520 tokens (the `ratio0` fixture header records every length),
+so the ratio-0 emit had no bug for this oracle to find. llama.cpp's data for
+three compressed layouts (mixed, all ratio 4, all ratio 128) is checked in
+beside it for slices S6 and S7, with per-tensor sums of the compressors, the
+indexer and each layer for bisecting; only the all-ratio-4 case lets the
+indexer's top-k drop blocks, and only to 131 tokens, because longer prompts
+always held a top-k near-tie that f16 rounding of the keys can flip. Getting
+llama.cpp to load the file took four fixture changes and one workaround for a
+llama.cpp crash on any V4 file without a ratio-4 layer;
+`docs/plan/09-deepseek-v4-compressed.md` section 4 lists them with the numbers,
+the indexer-precision note for S7 and the regeneration command. The fixture
+builder is `crates/infr-llama/tests/dsv4_fixture/mod.rs`, shared by both test
+binaries.
+
 ### `compress_ratio` is the master per-layer switch
 
 `hparams.set_swa_pattern(0)` makes **every** layer sliding-window, so long-range
@@ -1360,7 +1380,10 @@ Ordered by how much damage a wrong assumption does.
    distinguishable on disk.
 9. **llama.cpp's V4 support is young.** Its model-type detection for V4 is a
    stub where both branches return `UNKNOWN`. Treat the reference as possibly
-   buggy rather than authoritative.
+   buggy rather than authoritative. Seen at `5676dfbe0`: a V4 file with no
+   ratio-4 layer kills the process with an integer division by zero while the
+   lightning-indexer cache is built, and `hyper_connection.count` must be 4
+   (plan 09 section 4).
 
 ## What was not covered
 

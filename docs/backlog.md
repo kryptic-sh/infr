@@ -1262,11 +1262,19 @@ llama.cpp to bless the synthetic file, per `docs/synthetic-models.md` rule 2.
   source tensor: the CPU executor never loads a KV cache operand into its store,
   so a gather reading one would find it empty. Its Metal kernel and the Metal
   aliased-attention test have not run anywhere yet; the macOS CI job runs them.
+- **The oracle for slice B is checked in (2026-11-16, plan 09 S5a).**
+  llama.cpp's logits for three synthetic compressed layouts (`mixed`, `csa`,
+  `hca`) at prompts up to 520 tokens (131 for `csa`, the only one whose top-k
+  drops blocks), and its per-tensor sums at chosen positions, are in
+  `crates/infr-llama/tests/fixtures/`;
+  `synthetic_dsv4_compressed_cases_are_still_refused` goes red when a case
+  starts generating, and that case then gets scored like `ratio0` (§
+  B-DSV4-ORACLE).
 
 **What slice A left unverified, in its own right:**
 
 - **`batch > 1` has never been EXECUTED for V4 on any backend.** The only V4
-  fixture that exists (`crates/infr-llama/tests/synthetic_deepseek2.rs`'s
+  fixture that exists (`crates/infr-llama/tests/dsv4_fixture/mod.rs`'s
   `dsv4_model`) writes f32 expert banks, so `moe_batched_ok` is false and the
   chunked batched prefill is unreachable from it — and `generate_dense_backend`
   now excludes V4 from that path outright rather than leave an untested shape
@@ -1558,6 +1566,56 @@ Verified by running `infr run` against the file on the CPU backend (2026-08-12):
 config parses, `wload` resolves every tensor, and the refusal is reached. NOT
 re-run after the hash slice — the compressed-layer refusal is ordered first and
 fires at layer 2 regardless, so the observable would not have moved.
+
+Since 2026-11-16 the ratio-0 graph's numbers ARE established against llama.cpp,
+on a synthetic file (§ B-DSV4-ORACLE), at the real file's hyper-connection count
+and with its YaRN keys. That says the emit computes what the reference computes;
+it still says nothing about this file's logits, which need the compressed tiers
+and a machine (or a smaller quant) llama.cpp can load it on.
+
+### B-DSV4-ORACLE — llama.cpp over the synthetic V4 file: what it covers and what it does not (2026-11-16)
+
+**Tag:** deepseek · **Blocked on:** nothing (each gap names its own)
+
+`crates/infr-llama/tests/synthetic_deepseek4_llama_cpp.rs` and
+`docs/plan/09-deepseek-v4-compressed.md` section 4 have the design and the
+numbers. Open items:
+
+- **Two llama.cpp defects at `5676dfbe0`, not reported upstream.** A V4 file
+  with no ratio-4 layer dies with an integer division by zero in
+  `llama_kv_cache`'s constructor (the forced LID rotation loops `n_rot_k` to 0),
+  and `build_hc_mixes` asserts `hc_mult == 4`. Neither affects the shipped file.
+  Reporting them is the user's call; the oracle works around the first with a
+  null ratio-4 tail layer (`OracleCase::null_tail`), which is exact only while
+  `attn_output_b` multiplies a finite attention output.
+- **Only the CPU backend is scored against llama.cpp.** Vulkan's ratio-0 emit is
+  checked against infr's own CPU (`gpu_synthetic_deepseek4_ratio0_matches_cpu`,
+  at `hc_mult = 2`), not against the oracle data; a `prefill_logits_vulkan` twin
+  of `synthetic_dsv4_ratio0_cpu_matches_llama_cpp` behind the GPU `#[ignore]` is
+  a few lines.
+- **`hc_mult = 2` and `hc_mult = 1` cannot be oracle-checked**, because
+  llama.cpp refuses them. The canonical fixture keeps `hc_mult = 2` for infr's
+  own tests, so those paths stay checked only by infr's mechanism tests.
+- **What the synthetic oracle cannot reach:** quantized weights (every tensor is
+  f32 but the i32 routing table, so the BF16 routers and Q8_0/Q2_K paths of the
+  real file are untouched), batched prefill (infr's V4 prefill is per token),
+  the `deepseek-v3` tokenizer, and decode past the prompt.
+- **The sums files are 52 to 66 KB each**, mostly the compressors' intermediate
+  rows at 7 positions. Trimming to the final roped rows would halve them; kept
+  whole because S6/S7 bisect on the intermediates.
+- **The indexer's top-k is oracle-checked only up to 131 tokens, on one case
+  (`csa`).** Longer prompts with a biting `top_k` always held a near-tie that
+  ±1e-3 noise on the indexer weights flips (40 prompt sequences tried at 300
+  tokens, 30 at 520; plan 09 section 4). Covering long-context selection needs a
+  fixture whose indexer scores are decisive by construction (for example keys
+  with a few strongly separated levels) rather than random; not attempted. The
+  robustness check is by perturbation, not by reading the score gaps, which
+  `llama-debug` prints only as the first and last three values of each row.
+- **S7's indexer precision is argued, not measured:** infr's planned unrotated
+  f16 LID keys round differently from llama.cpp's Hadamard-rotated ones (plan 09
+  section 4). The stored biting points survive ±1e-3 weight noise, so they are
+  expected to keep their selection under that difference; S7's comparison is the
+  measurement.
 
 ### B-GGUF-META-IGNORED — GGUF keys infr still does not apply (2026-11-12)
 

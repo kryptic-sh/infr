@@ -5,8 +5,8 @@ layer but two of the shipped V4-Flash file. Scoped on 2026-11-16 by reading
 llama.cpp at `5676dfbe0` (`src/models/deepseek4.cpp`,
 `src/llama-kv-cache-dsv4.cpp`, `src/llama-graph.cpp`, `src/models/models.h`).
 Statements marked **[I]** were inferred, not read; **[U]** are unknown. Nothing
-here has been built or run yet, except slices S0 to S4b (marked below). Cite
-functions, not lines: both reference files have grown since the notes in
+here has been built or run yet, except slices S0 to S4b and S5a (marked below).
+Cite functions, not lines: both reference files have grown since the notes in
 `docs/deepseek.md` were written.
 
 ## 0. The reference moved past our records
@@ -55,7 +55,9 @@ V4-Flash (`config.json` of `deepseek-ai/DeepSeek-V4-Flash`): hidden 4096, head
 dim 512 of which the last 64 are rotated, 64 heads, `q_lora` 1024, window 128,
 indexer 64 heads × 128, `index_topk` 512, `compress_rope_theta` 160000,
 `rope_theta` 10000, YaRN factor 16 with original context 65536. CSA layers are
-2, 4, …, 42; HCA layers 3, 5, …, 41 **[I]** from the ratio list.
+2, 4, …, 42; HCA layers 3, 5, …, 41, read off the GGUF's `compress_ratios` (46
+entries for 43 blocks: the three surplus are zeros, which infr's loader drops by
+reading a prefix).
 
 ### Persistent buffers per layer
 
@@ -210,29 +212,35 @@ and the `dsv4_model` fixture.
    mean "cannot truncate").
 7. **`wpush` handles** mirroring `wload`, then drop the build closure's assert.
 8. **Per-step i32 inputs:** compressed-row positions, gather indices, APE rows.
-9. **Fixtures:** all-HCA and all-CSA layouts, a one-layer `hc_mult = 1` variant
-   for from-definition checks. (YaRN keys: a variant exists,
-   `dsv4_model_with_scaling`, kept out of the canonical fixture.)
+9. **Fixtures:** the all-CSA, all-HCA and mixed layouts exist since S5a, as
+   llama.cpp oracle cases (`synthetic_deepseek4_llama_cpp.rs`, section 4), all
+   at `hc_mult = 4` and with YaRN keys. A one-layer `hc_mult = 1` variant for
+   from-definition checks is still owed, and can only be checked against a hand
+   computation: llama.cpp asserts `hc_mult == 4`, and a one-layer HCA file does
+   not load there at all (no ratio-4 layer, section 4). The fixture builder
+   moved to `tests/dsv4_fixture/mod.rs` so both test binaries build the same
+   file.
 
 ## 3. Slices
 
 Every slice leaves the ratio-0, hash, `deepseek2` and `deepseek32` tests
 unchanged.
 
-| #   | Slice                                                                                                                   | Verification that can fail                                                                                                                                                                                                                    |
-| --- | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| S0  | **Done 2026-11-16.** Re-sync `dsv4_plan.rs` with section 0, add a count of real commits; fix the docs                   | literal-vector tests: an HCA decode step gets one dummy at the last row; a 9-token CSA ubatch with no commit is refused (one block short gets one dummy); the commit count excludes dummies                                                   |
-| S1  | **Done 2026-11-16.** `deepseek4` YaRN config and the compressed-tier `ff` vector (unused yet)                           | `ff` against a closed form at chosen positions; a file with no scaling keys gives 1; a factor without a type is "linear", a uniform divisor                                                                                                   |
-| S2  | **Done 2026-11-16.** B53: one cache as K and V (`kv_row_elems` → `(hd, 0)`, CPU attention takes one guard at a time)    | an op-parity case binding one id to both sides; ratio-0 logits bit-identical, checked ONCE by hand (no test in the tree locks them; see below)                                                                                                |
-| S3  | **Done 2026-11-16.** `Op::GatherRows` on CPU and Vulkan; Metal arm written                                              | from-definition parity with fill, grouping and column offset; a swapped column offset goes red                                                                                                                                                |
-| S4a | **Done 2026-11-16.** CPU two-segment attention and the indexer block ratio                                              | equals single-segment attention over a concatenated cache with an explicit bias; `None` and ratio 1 bit-identical to today                                                                                                                    |
-| S4b | **Done 2026-11-16.** Vulkan: the same; Metal refuses the segment, its indexer kernel takes the ratio                    | CPU-vs-Vulkan op parity at head dim 48 and 512                                                                                                                                                                                                |
-| S5  | Persistent buffers, geometry, the no-rewind predicate, `wpush` handles; refusal kept                                    | hand-computed V4-Flash footprint; a V4 session refuses a partial rewind                                                                                                                                                                       |
-| S6  | CPU HCA emit; lift the ratio-128 refusal                                                                                | perturbing `attn_compressor_kv` leaves positions 0..126 bit-identical and moves 127 on; a from-definition cache row on the one-layer fixture; a run split at 150 of 200 tokens equals the unsplit run                                         |
-| S7  | CPU CSA emit: overlap, LID, indexer, top-k; lift the last refusal                                                       | commit timing at position 3; from-definition rows 0 and 1 (row 1 reads block 0 as its previous half); with `top_k` 5, indexer weights are inert up to position 22 and move logits from 23; `top_k >= n_visible` equals zeroed indexer weights |
-| S8  | Real-file CPU oracle against llama.cpp                                                                                  | `cpu_prefill_matches_llama_debug_dump` on V4-Flash, one prompt under 100 tokens and one over 300 (HCA live); the `deepseek-v3` tokenizer question closed with `llama-tokenize`                                                                |
-| S9  | Vulkan whole model; then paged MoE with hash routing and the SwiGLU clamp (both refused today; the model exceeds 24 GB) | synthetic GPU-vs-CPU; the real-file dump comparison on Vulkan                                                                                                                                                                                 |
-| S10 | Metal: gather, two-segment attention, the indexer ratio (written in S4b), sqrt-softplus router, `GatherI32`             | macOS CI only                                                                                                                                                                                                                                 |
+| #   | Slice                                                                                                                                                  | Verification that can fail                                                                                                                                                                                                                                                                                   |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| S0  | **Done 2026-11-16.** Re-sync `dsv4_plan.rs` with section 0, add a count of real commits; fix the docs                                                  | literal-vector tests: an HCA decode step gets one dummy at the last row; a 9-token CSA ubatch with no commit is refused (one block short gets one dummy); the commit count excludes dummies                                                                                                                  |
+| S1  | **Done 2026-11-16.** `deepseek4` YaRN config and the compressed-tier `ff` vector (unused yet)                                                          | `ff` against a closed form at chosen positions; a file with no scaling keys gives 1; a factor without a type is "linear", a uniform divisor                                                                                                                                                                  |
+| S2  | **Done 2026-11-16.** B53: one cache as K and V (`kv_row_elems` → `(hd, 0)`, CPU attention takes one guard at a time)                                   | an op-parity case binding one id to both sides; ratio-0 logits bit-identical, checked ONCE by hand (no test in the tree locks them; see below)                                                                                                                                                               |
+| S3  | **Done 2026-11-16.** `Op::GatherRows` on CPU and Vulkan; Metal arm written                                                                             | from-definition parity with fill, grouping and column offset; a swapped column offset goes red                                                                                                                                                                                                               |
+| S4a | **Done 2026-11-16.** CPU two-segment attention and the indexer block ratio                                                                             | equals single-segment attention over a concatenated cache with an explicit bias; `None` and ratio 1 bit-identical to today                                                                                                                                                                                   |
+| S4b | **Done 2026-11-16.** Vulkan: the same; Metal refuses the segment, its indexer kernel takes the ratio                                                   | CPU-vs-Vulkan op parity at head dim 48 and 512                                                                                                                                                                                                                                                               |
+| S5a | **Done 2026-11-16.** llama.cpp loads the synthetic V4 file; ratio-0 compared in CI; compressed-case data checked in, every biting indexer point robust | ratio-0 comparison red under a window off by one and under dropped sinks; digest guard red under a one-value change; robustness check red on the near-ties it found; sums parse test red on a dropped line; YaRN ramp test red at original context 65536; compare-only regeneration red on one changed logit |
+| S5  | Persistent buffers, geometry, the no-rewind predicate, `wpush` handles; refusal kept                                                                   | hand-computed V4-Flash footprint; a V4 session refuses a partial rewind                                                                                                                                                                                                                                      |
+| S6  | CPU HCA emit; lift the ratio-128 refusal; score the `hca` oracle case                                                                                  | perturbing `attn_compressor_kv` leaves positions 0..126 bit-identical and moves 127 on; a from-definition cache row on the one-layer fixture; a run split at 150 of 200 tokens equals the unsplit run                                                                                                        |
+| S7  | CPU CSA emit: overlap, LID, indexer, top-k; lift the last refusal; score `csa` and `mixed`                                                             | commit timing at position 3; from-definition rows 0 and 1 (row 1 reads block 0 as its previous half); with `top_k` 5, indexer weights are inert up to position 22 and move logits from 23; `top_k >= n_visible` equals zeroed indexer weights                                                                |
+| S8  | Real-file CPU oracle against llama.cpp                                                                                                                 | `cpu_prefill_matches_llama_debug_dump` on V4-Flash, one prompt under 100 tokens and one over 300 (HCA live); the `deepseek-v3` tokenizer question closed with `llama-tokenize`                                                                                                                               |
+| S9  | Vulkan whole model; then paged MoE with hash routing and the SwiGLU clamp (both refused today; the model exceeds 24 GB)                                | synthetic GPU-vs-CPU; the real-file dump comparison on Vulkan                                                                                                                                                                                                                                                |
+| S10 | Metal: gather, two-segment attention, the indexer ratio (written in S4b), sqrt-softplus router, `GatherI32`                                            | macOS CI only                                                                                                                                                                                                                                                                                                |
 
 S2's logits check was a one-off: a temporary test wrote the bit patterns of four
 ratio-0 fixtures (`PROMPT`; windows 1 and 3 at a 40-token prompt; hash-routed)
@@ -240,8 +248,8 @@ on CPU, Vulkan0 and Vulkan1 from the pre-change tree, and the changed tree
 reproduced all twelve exactly; the test was then deleted. No permanent lock was
 added, because `docs/synthetic-models.md` rule 2 allows a synthetic golden only
 when it is blessed against an external oracle, and these values would be
-self-blessed. An oracle-blessed V4 lock (llama.cpp over the synthetic file) is
-backlog work.
+self-blessed. The oracle-blessed V4 lock came with S5a: llama.cpp's logits over
+the synthetic file, scored in CI (section 4).
 
 S4's "unchanged" check was the same kind of one-off: a temporary test wrote the
 output bits of twelve `Op::Attention` shapes (causal, sliding window and ring,
@@ -303,19 +311,181 @@ load mode maps the file and prefetches it. Not tried: `--load-mode none` and
 `dio` (both read the weights into allocated memory, which cannot hold this
 file), a larger page file, or a smaller file. S8 therefore needs a file that
 fits in RAM (the 60.8 GB repack, if both engines load its tensor types) or
-another machine; until then the real file is checked by infr alone.
-
-**A second oracle that needs no large file: llama.cpp on the synthetic V4
-fixture.** `dsv4_model` in `synthetic_deepseek2.rs` already writes a small GGUF
-with ratio 4 and 128 layers at small windows. If llama.cpp loads it,
-`llama-debug --save-logits` over that file scores both compressor kinds in
-seconds, which is also what `docs/synthetic-models.md` rule 2 asks of a
-synthetic golden. Not tried yet: whether the fixture carries every key and
-tensor llama.cpp's loader and tokenizer demand is unknown **[U]**. It is the
-next slice (S5a): make the fixture load in llama.cpp and compare the ratio-0
-logits, which infr already computes, before S6 and S7 rely on it. The 60.8 GB
+another machine; until then the real file is checked by infr alone. The 60.8 GB
 "Fractal" repack is not an alternative: its repository ships patched llama.cpp
 binaries, so stock llama.cpp presumably cannot read it (not tried).
+
+**The second oracle, done in S5a (2026-11-16): llama.cpp on the synthetic V4
+file.** `crates/infr-llama/tests/synthetic_deepseek4_llama_cpp.rs` builds four
+cases from `dsv4_fixture`'s `dsv4_model` and checks in what llama.cpp computes
+for them. All four are at `hc_mult = 4`, with an indexer key width of 128, hash
+routing on the first layers, and YaRN keys (below):
+
+| case     | `compress_ratios`               | indexer `top_k` | prompt lengths           |
+| -------- | ------------------------------- | --------------- | ------------------------ |
+| `ratio0` | `[0,0,0,0,0]` + null tail       | 512             | 7, 30, 70, 131, 300, 520 |
+| `mixed`  | `[0,4,128,4,0]`                 | 512             | 7, 30, 70, 131, 300, 520 |
+| `csa`    | `[4,4,4,4]`                     | 5               | 7, 30, 70, 131           |
+| `hca`    | `[128,128,128,128]` + null tail | 512             | 7, 30, 70, 131, 300, 520 |
+
+`tests/fixtures/synthetic_dsv4_<case>_llama_cpp.txt` holds the last-position
+logits at each length (each prompt a prefix of one id sequence per case; 4.9 to
+8.9 KB a file). For the three compressed cases, `..._llama_cpp_sums.txt` (52 to
+66 KB) holds per-tensor sums at positions 3, 4, 22, 23, 127, 128 and the last of
+a run fed one token per ubatch, 300 tokens long (131 for `csa`). Each header
+names the llama.cpp build, the commands, the GGUF's byte length and FNV-1a
+digest, and generated measurements: the logit range per length, the indexer
+robustness per length, and for `ratio0` infr's own scores against the data.
+`synthetic_dsv4_llama_cpp_fixtures_match_their_gguf` fails, naming the command
+below, when the builder writes other bytes.
+
+The regenerator compares by default and writes only into a directory
+`INFR_LLAMA_FIXTURE_OUT` names, so the GPU gate (`--run-ignored all`) never
+rewrites the tree, with or without `INFR_LLAMA_DEBUG`; the LFM3 regenerator now
+works the same way (`infr_testkit::llama_cpp::write_or_compare_fixture`).
+Without `INFR_LLAMA_DEBUG` both return at once rather than fail: the gate runs
+every ignored test on machines with no llama.cpp build, and the checks that must
+run everywhere are the non-ignored ones. Run twice, the regenerator reproduced
+every file:
+
+```text
+INFR_LLAMA_DEBUG=~/Projects/mxaddict/llama.cpp/build/bin/Release/llama-debug.exe \
+INFR_LLAMA_FIXTURE_OUT=crates/infr-llama/tests/fixtures \
+  cargo test -p infr-llama --test synthetic_deepseek4_llama_cpp -- --ignored \
+  synthetic_dsv4_regenerate_llama_cpp_fixtures
+```
+
+`synthetic_dsv4_write_oracle_ggufs` (`INFR_DSV4_GGUF_DIR`) writes both sides'
+files for bisecting by hand with `llama-eval-callback` or `llama-debug`.
+
+What llama.cpp at `5676dfbe0` demanded of the fixture, each a way the old
+fixture differed from the real file:
+
+1. `attention.value_length` (the real file has 512, its `key_length`):
+   `build_attention_impl` asserts the two are equal, and the default is
+   `n_embd / n_head`. infr reads no V width; added to the fixture.
+2. `hyper_connection.count = 4` (the real value): `build_hc_mixes` asserts
+   `hc == 4`. The canonical fixture keeps 2 for infr's own tests.
+3. An indexer key width of at least 64 (the real file has 128): the LID cache
+   forces a Hadamard rotation whose matrices exist only from 64 up, so 24 died
+   in `llama_kv_cache::init_rotation` with "invalid unordered_map key". The
+   oracle files use 128; the canonical fixture keeps 24, which no other
+   canonical dimension equals (128 would equal its `hc_dim`), now through a
+   per-dims `Dsv4Dims::indexer`.
+4. **At least one ratio-4 layer.** Without one the LID cache has no layers, and
+   `llama_kv_cache`'s constructor doubles `n_rot_k` from 64 until the `u32`
+   wraps to 0, then takes a remainder by it: exit `0xC0000094` (integer division
+   by zero) with no message. So no all-ratio-0 or all-HCA V4 file loads in
+   llama.cpp at this pin; the real file has CSA layers and is unaffected. Worked
+   around with a NULL tail layer: ratio 4 in llama.cpp's file, ratio 0 in
+   infr's, `attn_output_b` all zero in both, so that layer's attention adds
+   exactly zero on either side.
+5. A vocabulary llama.cpp can type a prompt in: the printable ASCII characters
+   from `!`, no merges, so a prompt string reads back as exactly its ids, and
+   `add_bos_token = false`, as the real file declares. Prompts skip `"`, `\` and
+   the EOS id.
+
+Items 1 and 5 changed the canonical fixture. A one-off bit comparison (ratio-0
+logits at two prompts, old metadata against new) showed no ratio-0 number moved:
+infr reads none of those keys on that path.
+
+**Indexer near-ties, and why `csa` stops at 131 tokens.** Where the top-k drops
+blocks, a row whose k-th and (k+1)-th scores nearly tie flips its selection
+under rounding, and a stored point that flips under rounding cannot judge S7.
+The regenerator measures it by perturbation at every such point: ±1e-3 relative
+noise on `indexer.attn_q_b` and `indexer_compressor_kv` (about twice the f16
+rounding of the keys), three draws; a kept selection moves the logits by exactly
+0, since the scores only choose blocks, and the bound is 1e-4. It fails the run
+on a near-tie, and also unless ±0.5 noise moves the logits by more than 1e-2, so
+the indexer stays load-bearing. With `top_k` 5 the near-ties are unavoidable on
+long prompts: 4 CSA layers × hundreds of rows × a selection among dozens of
+blocks. Measured with llama.cpp: none of 40 prompt sequences held at 300 tokens
+(moves 1.3e-4 to 1.2e-1) and none of 30 at 520 (9.0e-4 to 7.1e-2), and the first
+`mixed` sequence failed at 70 tokens (7.3e-3) when it used `top_k` 5. So only
+`csa` lets the top-k bite, and only to 131 tokens; there the noise moves nothing
+at 30, 70 and 131 tokens while ±0.5 moves 8.8e-2, 6.1e-1 and 6.5e-1. The other
+cases use the real file's `top_k` 512, which keeps every visible block (the
+reference keeps `min(width, top_k)` with the width padded to at least 256), so
+they can go to 520 tokens with nothing to tie.
+
+**What S7 must do about indexer precision.** llama.cpp scores the indexer on
+keys rotated by an orthonormal Walsh-Hadamard matrix (`ggml_gen_hadamard`, H² =
+I) and then stored as f16 in `kv_lid`, against a query rotated by the same
+matrix. infr's plan (section 2 item 5) stores unrotated keys as f16 and skips
+the query rotation. In exact arithmetic the two give the same scores; in f16
+they do not, because rounding `Hk` and rounding `k` make different per-element
+errors of up to 2^-11 relative. That is below the ±1e-3 noise every stored
+biting point was checked against, so at those points the selections should agree
+**[I]** and the logits should meet the ratio-0 bound (2e-3); llama.cpp's own
+one-token-per-ubatch run differs from its batched run by at most 3.2e-4 over all
+cases and lengths, which is the scale of what remains. A gap of order 1e-1 at a
+biting point and not elsewhere means a flipped selection: compare `lid_top_k` in
+the sums file. S7 must not add biting points beyond what the regenerator's
+robustness check accepts, and needs no rotation of its own unless it wants
+bit-closer agreement.
+
+**Ratio-0 result: infr's CPU matches llama.cpp; no infr bug found.** From the
+`ratio0` header, max |logit diff| at 7 / 30 / 70 / 131 / 300 / 520 tokens:
+3.4570694e-6 / 5.376339e-5 / 2.771616e-5 / 8.420646e-5 / 4.518032e-5 /
+1.5926361e-4; probability cosine at least 0.9999999980694658; top-1 agrees at
+every length. The logits span -2.9464645 to 2.3770182 at 7 tokens and -4.006359
+to 2.3026319 at 520 (`# logits at ... span` lines), so nothing is saturated.
+This is the first time the ratio-0 emit has been compared with llama.cpp on any
+file: hash and bias routing, four-stream hyper-connections, sinks, the grouped
+output projection, the de-rope, the sliding window past 64 tokens, and ratio-0
+layers ignoring the YaRN keys. `synthetic_dsv4_ratio0_cpu_matches_llama_cpp`
+holds it at 2e-3 in CI. Shown to fail: a window one token too wide gives
+2.0916581e-1 / 2.2315145e-1 / 1.2815297e-1 / 1.021879 from 70 tokens on (7 and
+30 unchanged, inside the window); dropped sinks give 3.8182247e-1 / 1.7681241e-1
+/ 7.642567e-2 / 5.416107e-2 / 5.1752746e-2 / 7.2669625e-2 at every length, with
+top-1 flipping at 30 and 70. Probability cosine stays at or above
+0.9320889705648777 and 0.9901684623372332 under those breaks, so max |diff| is
+what is asserted.
+
+**YaRN.** The oracle files declare type `yarn`, factor 16 and an original
+context of 512, not the real file's 65536. With the fixture's 16-dim rope at
+compress base 40000, 65536 leaves five of the eight pairs unscaled (divisors 1,
+1, 1, 1, 1, 1.4545456, 2.666667, 16), so the rotation only differs from an
+unscaled one slowly with position; 512 gives 1, 1.3061224, 1.882353, 3.368421,
+16, 16, 16, 16 (`synthetic_dsv4_oracle_yarn_ramp_varies` prints and checks
+this). Max |logit diff| that `--rope-scaling none` causes in llama.cpp, per
+length:
+
+| case     | original context 65536 (7 / 30 / 70 / 131 / 300 / 520)    | 512 (the files now)                                    |
+| -------- | --------------------------------------------------------- | ------------------------------------------------------ |
+| `ratio0` | 0 at every length                                         | 0 at every length                                      |
+| `mixed`  | 9.11e-4 / 3.94e-3 / 9.02e-3 / 7.58e-3 / 1.64e-2 / 4.50e-2 | 7.48e-2 / 3.02e-1 / 4.79e-1 / 4.63e-1 / 6.01e-1 / 1.34 |
+| `csa`    | 2.01e-3 / 3.44e-2 / 1.46e-2 / 8.55e-1 (to 131)            | 4.50e-1 / 1.73 / 1.16 / 2.67 (to 131)                  |
+| `hca`    | 2.30e-3 / 3.22e-2 / 1.82e-2 / 1.65e-2 / 1.62e-2 / 3.33e-2 | 5.82e-1 / 2.29 / 1.02 / 2.46 / 3.24 / 3.83             |
+
+At 65536 the effect at 7 tokens was 9.11e-4 to 2.30e-3, about the 2e-3 bound, so
+only the longer prompts could have caught a YaRN error; at 512 it is at least
+7.48e-2 at every length. (The 8.55e-1 for `csa` at 131 includes the indexer
+choosing other blocks under the other rope.) `ratio0` moving by exactly 0
+confirms that llama.cpp leaves ratio-0 layers unscaled.
+
+`synthetic_dsv4_compressed_cases_are_still_refused` asserts the three compressed
+cases still hit the ratio-0-only refusal; it goes red the moment S6 or S7 lets
+one through, and the fix is to score that case with `cpu_matches_llama_cpp`.
+
+The sums files keep every intermediate `build_overlap_compressed_kv_from_state`
+and `build_hca_compressed_kv_from_state` name with `cb` (`csa_state_compress`,
+`lid_state_compress` and its `_rot`, `hca_state_compress`: the gathered previous
+and current windows, the pooled row, the normed row, the roped row), then
+`lid_top_k`, `attn_csa_lid`, `attn_hca`, `attn_raw`, `attn_out` and `ffn_out`
+per layer, and `result_norm`; the four names this section gave for bisecting are
+the ones this commit prints. `# position: p` heads each position (the logits
+files use `# tokens:` for a prompt's ids, a different line). A bisect must allow
+for four things, each also said in the file headers: at `-ub 1` the reference
+runs every compressor on every step, a real commit or the dummy one (section 0
+items 2 and 3); `lid_top_k` is a sum of indices, meaningful only once more than
+`top_k` blocks are visible; sums are printed `%f`, six absolute decimals, so
+compare with an absolute tolerance; and `result_norm` has no rows (sum 0) except
+at the last position. In `hca` the null tail's `csa_*`/`lid_*` tensors and its
+zero `attn_out` exist only on llama.cpp's side.
+`synthetic_dsv4_llama_cpp_sums_files_parse` reads the checked-in files in CI and
+writes them back, and `synthetic_dsv4_sums_log_splits_into_positions` runs the
+log parser on a hand-written log, so neither can rot.
 
 ## 5. Performance, after correctness
 

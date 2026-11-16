@@ -37,6 +37,7 @@
 //! and a backend gets coverage the moment it implements the seam.
 
 pub mod gguf;
+pub mod llama_cpp;
 
 use infr_core::backend::{Backend, Bindings, BufferUsage};
 use infr_core::decode_spec::{block_spec, WEIGHT_QUANTS};

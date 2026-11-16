@@ -2071,17 +2071,20 @@ filter on `coopmat_f16`).
   outside the [64, 64] range the path reports.
 - **Not checked:** `requiredSubgroupSizeStages` containing COMPUTE, for the 64
   pin and for the existing 32 pin alike. Both drivers here report it.
-- **Unexplained flake, Qwen3-30B-A3B on the RX 7900 XTX:** "prompt 18 + gen 8
-  exceeds the session KV capacity 0" from `gpu_seam_golden_qwen3moe` (one forced
-  run) and `gpu_seam_paged_moe_matches_resident_and_cpu` (one forced gate run,
-  one of two forced reruns, and one of four NATIVE runs of this branch), and one
-  of four forced `infr run`s exceeding the VRAM budget after the measured
-  context clamp chose 6634 tokens against 0.96 GiB free. `origin/main` passed
-  that test in all five runs tried, interleaved with the branch's. The free VRAM
-  the clamp measures moved between 0.54 and 1.09 GiB across runs; coopmat off
-  selects different GEMM kernels whose scratch footprint may differ. It always
-  failed cleanly, never with a wrong result. Too few runs to say whether the
-  branch, the wave64 path, or the free VRAM at the time is the cause.
+- **The Qwen3-30B-A3B "KV capacity 0" failures were not this path (settled
+  2026-11-17):** on a quiet box, `gpu_seam_paged_moe_matches_resident_and_cpu`
+  passed 62 of 62 runs alternating `origin/main` and the branch (15+15 native,
+  15+15 forced, 8+8 back to back after the test that precedes it in the gate),
+  and the test's resident leg measured the same live room after its weights on
+  `origin/main`, the branch and the branch forced, to the byte in the same round
+  (3.19 GiB at its 1-row chunk). A capacity of 0 needs that room under the 0.30
+  GiB a one-token context and the driver reserve take, so about 2.9 GiB more
+  device memory held by another process between the expert-budget snapshot and
+  the post-load measurement. The earlier failures all came within a few hours of
+  each other, when other GPU work on the box is the likeliest cause; nothing
+  recorded what held the memory then. Such a session now refuses at load with
+  the measured numbers (`reclamp_ctx_to_live_room`), so the next one explains
+  itself.
 - **Integer inclusive scan:** `vw_half_inclusive_add` is float-only, so an
   integer `subgroupInclusiveAdd` under the header fails to compile (glslc: the
   macro's float arm cannot be assigned to a `uint`). No kernel has one; a kernel

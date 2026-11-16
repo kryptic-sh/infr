@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Compile GLSL compute shaders (which need features WGSL/naga can't express, e.g.
 /// cooperative matrix) to SPIR-V via `glslc` at build time. Output to OUT_DIR.
@@ -3654,7 +3655,15 @@ fn main() {
             }
         })
         .collect();
-    compile_shaders(&glslc_path(), &out, &builds);
+    if let Err(msg) = compile_shaders(&glslc_path(), &out, &builds) {
+        // `cargo::error` prints each line once as `error: infr-vulkan@…: <line>` and fails the
+        // build when the script returns. Exiting non-zero instead would make cargo also dump the
+        // script's stdout, printing the whole message a second time.
+        for line in msg.lines() {
+            println!("cargo::error={line}");
+        }
+        return;
+    }
     // Shader-set fingerprint for the on-disk vkPipelineCache (see src/pcache.rs): FNV-1a over
     // every compiled SPIR-V blob in the (stable) build-list order. Any shader edit, new variant,
     // or glslc/define change flips it, and the persisted cache file is discarded wholesale —
@@ -3792,45 +3801,196 @@ fn gen_grids(out: &str) {
     std::fs::write(format!("{out}/native_grids.glsl"), s).expect("write native_grids.glsl");
 }
 
-/// Compile every `(source stem, output stem, defines)` build to `{out}/{output stem}.spv`, spread
-/// over the build script's job allowance (`NUM_JOBS`, which cargo sets from `-j`).
+/// The `glslc` flags every shader compiles with.
+const GLSLC_FLAGS: [&str; 3] = ["-fshader-stage=comp", "--target-env=vulkan1.3", "-O"];
+
+/// Output stems of the builds [`compile_shaders`] compiles first, before the rest fan out: the
+/// ones an old `glslc` is most likely to reject. `deltanet_prep` is the cooperative-matrix shader
+/// shaderc 2023.8 failed on (#93); the others each carry one of the newest constructs the shaders
+/// use — E4M3 and bf16 cooperative matrices, int8 cooperative matrices with buffer references,
+/// packed integer dot products, buffer references, clustered subgroup reductions.
+///
+/// They are entries of the real build list rather than a hand-written probe shader, so they
+/// cannot drift from what the build needs, and compiling them first costs nothing: their output
+/// is the real output. They only make a too-old toolchain fail in seconds; a failure anywhere
+/// else gets the same message from [`glslc_failure`].
+const CANARIES: &[&str] = &[
+    "deltanet_prep",
+    "native_gemm_f8cm_q8_0",
+    "native_gemm_warp_bf16cm",
+    "native_gemm_i8cm_q8_0_streamed",
+    "native_gemm_dp4a_q4k",
+    "linear_f16",
+    "attn_flash_warp",
+];
+
+/// What is known about which `glslc` builds the shaders, and which one the build runs (see
+/// [`glslc_path`]). Known-good and known-bad releases only: the first release that compiles
+/// every shader has not been pinned down.
+const GLSLC_HELP: &str = "Known to build every shader: shaderc 2026.1, 2026.3 and 2026.4. \
+Known not to: shaderc 2023.8 (Ubuntu 24.04's package).\n\
+Install a current Vulkan SDK (https://vulkan.lunarg.com/sdk/home), or shaderc 2026 or newer.\n\
+The build runs the glslc on PATH, else the Vulkan SDK's ($VULKAN_SDK/Bin, or bin on Linux and macOS).";
+
+/// Why one `glslc` run did not produce its SPIR-V.
+enum GlslcError {
+    /// The process could not be started at all.
+    Spawn(std::io::Error),
+    /// It ran and exited unsuccessfully, printing `stderr`.
+    Failed {
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+}
+
+type Build = (String, String, Vec<String>);
+
+/// Compile every `(source stem, output stem, defines)` build to `{out}/{output stem}.spv`, the
+/// [`CANARIES`] first, and return the message to stop the build with if any compile fails.
+fn compile_shaders(glslc: &Path, out: &str, builds: &[Build]) -> Result<(), String> {
+    for (src_stem, _, _) in builds {
+        println!("cargo:rerun-if-changed=shaders/{src_stem}.comp");
+    }
+    let (canaries, rest): (Vec<&Build>, Vec<&Build>) = builds
+        .iter()
+        .partition(|(_, dst_stem, _)| CANARIES.contains(&dst_stem.as_str()));
+    for name in CANARIES {
+        assert!(
+            canaries.iter().any(|(_, dst_stem, _)| dst_stem == name),
+            "canary build `{name}` is not in the build list; update CANARIES"
+        );
+    }
+    compile_parallel(glslc, out, &canaries)?;
+    compile_parallel(glslc, out, &rest)
+}
+
+/// Compile `builds`, spread over the build script's job allowance (`NUM_JOBS`, which cargo sets
+/// from `-j`).
 ///
 /// One `glslc` process per variant, one after another, made every shader edit a multi-minute
 /// rebuild — worst on Windows, where starting a process costs several times what it does on Linux.
 /// The builds are independent (each writes only its own `.spv`), and everything downstream reads
-/// the outputs back in list order, so completion order is irrelevant. A failed compile panics its
-/// worker, and `thread::scope` re-raises that panic here once the other workers finish.
-fn compile_shaders(glslc: &Path, out: &str, builds: &[(String, String, Vec<String>)]) {
-    for (src_stem, _, _) in builds {
-        println!("cargo:rerun-if-changed=shaders/{src_stem}.comp");
-    }
+/// the outputs back in list order, so completion order is irrelevant. The first failure wins:
+/// workers start no new compile once one has failed, and failures already in flight are only
+/// counted, so the build stops with one message rather than one per worker.
+fn compile_parallel(glslc: &Path, out: &str, builds: &[&Build]) -> Result<(), String> {
     let jobs = std::env::var("NUM_JOBS")
         .ok()
         .and_then(|n| n.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(1);
     let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let first: Mutex<Option<String>> = Mutex::new(None);
+    let others = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for _ in 0..jobs.min(builds.len()) {
             scope.spawn(|| {
-                while let Some((src_stem, dst_stem, defines)) =
-                    builds.get(next.fetch_add(1, Ordering::Relaxed))
-                {
+                while !failed.load(Ordering::Relaxed) {
+                    let Some((src_stem, dst_stem, defines)) =
+                        builds.get(next.fetch_add(1, Ordering::Relaxed))
+                    else {
+                        break;
+                    };
                     let src = format!("shaders/{src_stem}.comp");
-                    let status = Command::new(glslc)
-                        .args(["-fshader-stage=comp", "--target-env=vulkan1.3", "-O"])
+                    let run = Command::new(glslc)
+                        .args(GLSLC_FLAGS)
                         .arg(format!("-I{out}"))
                         .args(defines)
                         .arg(&src)
                         .arg("-o")
                         .arg(format!("{out}/{dst_stem}.spv"))
-                        .status()
-                        .expect("failed to run glslc — install shaderc (provides glslc)");
-                    assert!(status.success(), "glslc failed for {src}");
+                        .output();
+                    let err = match run {
+                        Ok(o) if o.status.success() => continue,
+                        Ok(o) => GlslcError::Failed {
+                            status: o.status,
+                            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+                        },
+                        Err(e) => GlslcError::Spawn(e),
+                    };
+                    failed.store(true, Ordering::Relaxed);
+                    let mut first = first.lock().unwrap_or_else(|e| e.into_inner());
+                    if first.is_none() {
+                        let what = if defines.is_empty() {
+                            format!("{src} (output {dst_stem}.spv)")
+                        } else {
+                            format!("{src} with {} (output {dst_stem}.spv)", defines.join(" "))
+                        };
+                        *first = Some(glslc_failure(glslc, &what, err));
+                    } else {
+                        others.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             });
         }
     });
+    match first.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        None => Ok(()),
+        Some(msg) => match others.into_inner() {
+            0 => Err(msg),
+            n => Err(format!(
+                "{msg}\n({n} more shader(s) failed while this one was being reported.)"
+            )),
+        },
+    }
+}
+
+/// The message a failed `glslc` run stops the build with: which shader, which `glslc` and its
+/// version, what it printed, and what to do about it. The wording follows the evidence — a
+/// diagnostic on stderr usually means a shaderc too old for the shader; silence or a failure to
+/// start means `glslc` itself is broken or missing.
+fn glslc_failure(glslc: &Path, what: &str, err: GlslcError) -> String {
+    let shown = glslc_display(glslc);
+    let (status, stderr) = match err {
+        GlslcError::Spawn(e) => return format!("cannot run {shown}: {e}\n{GLSLC_HELP}"),
+        GlslcError::Failed { status, stderr } => (status, stderr),
+    };
+    let version = Command::new(glslc)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|v| {
+            let text = String::from_utf8_lossy(&v.stdout).into_owned();
+            text.lines().next().map(|l| l.trim().to_string())
+        })
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let head = format!(
+        "glslc failed to compile {what} ({status})\n  glslc:   {shown}\n  version: {version}\n"
+    );
+    if stderr.trim().is_empty() {
+        return format!(
+            "{head}It printed nothing. A glslc that exits without a diagnostic most likely \
+             crashed or could not load (a missing library, a broken install) rather than \
+             rejecting the shader.\n{GLSLC_HELP}"
+        );
+    }
+    let diagnostic: String = stderr.lines().map(|l| format!("  {l}\n")).collect();
+    format!(
+        "{head}glslc said:\n{diagnostic}\
+         The usual cause is a shaderc too old for infr's shaders.\n{GLSLC_HELP}"
+    )
+}
+
+/// How a failure message names the `glslc` that ran: the path itself when [`glslc_path`] chose
+/// one, else the bare name the OS resolves from `PATH`, with the first `glslc` file there as a
+/// hint. That file is only what is most likely to have run: the OS skips a non-executable file
+/// on Unix, and searches its own directories first on Windows.
+fn glslc_display(glslc: &Path) -> String {
+    if glslc.components().count() > 1 {
+        return glslc.display().to_string();
+    }
+    let exe = format!("glslc{}", std::env::consts::EXE_SUFFIX);
+    let first = std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|dir| dir.join(&exe))
+            .find(|cand| cand.is_file())
+    });
+    match first {
+        Some(found) => format!("glslc (from PATH, first match {})", found.display()),
+        None => "glslc (not found on PATH)".to_string(),
+    }
 }
 
 /// The `glslc` to run: the one on `PATH`, else the Vulkan SDK's (`$VULKAN_SDK/Bin`).

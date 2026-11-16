@@ -33,8 +33,10 @@ runs:
         key: glslc-${{ runner.os }}-${{ runner.arch }}-${{ steps.image.outputs.id }}
         restore-keys: glslc-${{ runner.os }}-${{ runner.arch }}-
 
-    # Ubuntu 24.04 ships shaderc 2023.8, which predates GL_EXT_integer_dot_product
-    # and cannot compile the dp4a shaders; ubuntu-26.04 carries shaderc 2025+.
+    # Ubuntu 24.04 ships shaderc 2023.8, which cannot compile infr's shaders:
+    # #93 shows its optimizer rejecting deltanet_prep.comp's cooperative-matrix
+    # multiply-add (whether it also lacks GL_EXT_integer_dot_product is
+    # unverified). ubuntu-26.04 carries shaderc 2026.1, which builds them all.
     #
     # The cache holds the `.deb` files apt downloaded for glslc and whatever it
     # pulled in with it. On 2026-11-11 the runners could not resolve the Ubuntu

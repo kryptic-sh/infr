@@ -34,7 +34,7 @@ build script falls back to `%VULKAN_SDK%\Bin\glslc.exe` when `glslc` is not on
 `PATH`, so an old shell still builds. Check the install with:
 
 ```powershell
-glslc --version          # shaderc — any 2025+ release (needs GL_EXT_integer_dot_product)
+glslc --version          # shaderc — 2026.1 or newer is known to work; 2023.8 is known not to
 vulkaninfo --summary     # lists the GPUs the driver exposes to Vulkan
 ```
 
@@ -295,8 +295,13 @@ Win32 API contracts.
 
 ## Troubleshooting
 
-- **`failed to run glslc`** — the Vulkan SDK is missing, or neither `PATH` nor
+- **`cannot run glslc`** — the Vulkan SDK is missing, or neither `PATH` nor
   `VULKAN_SDK` reaches it. Open a new shell after installing the SDK.
+- **`glslc failed to compile shaders/...`** — the message names the shader, the
+  `glslc` that ran and its version, and what `glslc` printed. A diagnostic
+  usually means a shaderc too old for the shaders; install a current Vulkan SDK,
+  or put a newer `glslc` earlier on `PATH`. If it printed nothing, the `glslc`
+  install itself is broken.
 - **`LNK1104: cannot open file 'target\release\infr.exe'`** or
   `Access is denied. (os error 5)` during a build — an `infr.exe` from that
   target directory is still running (a `serve` left in another window). Stop it

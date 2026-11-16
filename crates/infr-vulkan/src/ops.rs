@@ -430,6 +430,13 @@ impl VulkanBackend {
         };
         drop(map);
         if built {
+            // One line per pipeline this backend creates, with what it was created with, so two
+            // builds' kernel sets can be compared (`RUST_LOG=infr_vulkan::kernels=debug`).
+            tracing::debug!(
+                target: "infr_vulkan::kernels",
+                "kernel built: {name} sg={} n_buf={n_buf} push={push_size}",
+                required_sg.map_or_else(|| "-".to_string(), |s| s.to_string()),
+            );
             self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save
         } else {
             // Cache HIT: the cache is keyed on `name` alone, so a name reused with a different

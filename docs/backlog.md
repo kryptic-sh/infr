@@ -1766,8 +1766,9 @@ only its routed experts (`CpuBackend::moe_banks`). Left:
   four chunks (`a_prefill_sweep_keeps_its_resident_set`). Making a long prompt
   affordable needs a different shape: smaller chunks with expert-major order
   across a whole prompt, or reading each expert once for every chunk.
-- **The six-minute hang on a broken bank stride (2026-11-16) did not reproduce,
-  and was probably not the pool.** Breaking `CpuBackend::moe_banks` so every
+- **The six-minute hang on a broken bank stride (2026-11-16) is explained as far
+  as it can be: not the pool; a same-thread double lock is the one mechanism
+  found, and it now fails loudly.** Breaking `CpuBackend::moe_banks` so every
   bank held whole takes the gate bank's stride fails
   `paged_experts_compute_what_whole_banks_compute_while_evicting` in about a
   second (checked with and without `RUST_BACKTRACE=1`): `SpinPool::run` already
@@ -1775,17 +1776,34 @@ only its routed experts (`CpuBackend::moe_banks`). Left:
   `bufs[0].len_bytes()` inside the `.map` that holds `b.read()` hangs instead,
   with no panic at all: for bank 0, `len_bytes` relocks the `Mutex` whose guard
   `read()` holds, and a `std` mutex is not reentrant. Whether the original break
-  was spelled that way is unknown. What a kernel panic did get wrong — a generic
-  panic message, every remaining task still run, owned buffers left poisoned for
-  the next forward — is fixed and pinned by `pool::tests` and
-  `a_kernel_panic_fails_the_forward_and_the_next_one_computes`.
-- **Not checked: locks above the CPU backend after a panicking forward.**
-  `infr serve` turns a panicking generation into a failed request
+  was spelled that way is unknown. The graph-level form of the same deadlock —
+  one owned buffer bound to two operands an op holds locked at once — is now
+  refused by `refuse_relock` in `Op::MoeFfn` (router against every bank,
+  `down_scale` and `exp_probs_b`; each bank against the others) and `Op::Mla`
+  (`k_cache` against `wk_b`/`wv_b`), pinned by
+  `moe_ffn_refuses_one_owned_buffer_bound_to_two_banks` and
+  `mla_refuses_one_owned_buffer_bound_to_the_cache_and_a_weight` (both hang to
+  the 60 s `within` limit with the check disabled). `Op::LightningIndexer` holds
+  its k-cache lock for the op body but locks no other owned buffer (its `q` and
+  `weights` come from the interpreter's f32 values), so it needs no guard. No
+  other arm of `CpuBackend::execute` holds two owned locks at once (read
+  2026-11-17: `Op::Attention` takes its K, V and compressed-cache guards one
+  statement at a time; `Op::Linear` and the gathers hold one). A code path
+  outside a graph that relocks, like the `len_bytes` break above, is not
+  guarded.
+- **Locks above the CPU backend after a panicking forward: settled for
+  `infr serve`.** A panicking generation becomes a failed request
   (`spawn_blocking`; non-streaming gets a 500 carrying the panic message,
-  streaming an error frame from `DoneGuard`), and `lock_recovered` in `infr-cli`
-  clears the model mutex's poison and resets the KV session. Any other `Mutex`
-  that `infr-llama` holds across a CPU `execute` and locks with `unwrap` would
-  still fail every later request; none was looked for.
+  streaming an error frame from `DoneGuard`), and no backend state is reused:
+  `SeamModel::with_cpu`'s `Lease` drops the resident (backend, caches, paged
+  store, bound weights) when `std::thread::panicking()`, and its slot lock uses
+  `into_inner` and is never held across the closure; `generate_dense_cpu_mode`
+  allocates a KV cache per call; `lock_recovered` resets DiffusionGemma's
+  session (`reset_kv` drops it); MTP on the CPU builds a `CpuBackend` per call;
+  `ParallelGenerator` is Vulkan-only; and no production code catches a panic
+  around `execute` and keeps going. So clearing poison in `lock_bytes` changes
+  nothing a `serve` user sees; it matters to a library caller that catches the
+  panic and reuses the backend, which must then discard its session state.
 - **Not covered by a test on a real MoE file other than V4-Flash** (the
   synthetic V4 fixture and an op-level test cover the mechanism, the latter
   bitwise against whole banks while evicting for f32, Q8_0, Q4_K and Q2_K in

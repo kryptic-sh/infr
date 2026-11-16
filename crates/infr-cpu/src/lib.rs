@@ -208,11 +208,13 @@ impl std::ops::Deref for CpuRead<'_> {
 /// An owned buffer's bytes, poisoned or not.
 ///
 /// A panic in an op poisons every owned buffer the op held (its outputs, a whole expert bank, a KV
-/// cache), and `unwrap` would then fail every later graph that binds one: a long-lived backend,
-/// as `infr serve` keeps, would fail each request after the first panic. The poison carries no
-/// broken invariant here — the mutex guards plain bytes, which a later graph overwrites or the
-/// caller discards (`serve` resets the KV session after a panicking generation) — so it is
-/// cleared rather than propagated.
+/// cache), and `unwrap` would then fail every later graph that binds one. No in-tree caller reuses
+/// a backend after a panic (each drops it and its buffers), but a library caller that catches the
+/// panic and keeps the backend would be stuck with it, so the poison is cleared here.
+///
+/// Only the locks are usable again: after a panic the buffers' CONTENTS are unspecified (a KV row
+/// an earlier `WriteKv` of the failed graph wrote is not marked as such). A caller that catches the
+/// panic must discard or rewind its session state, as every in-tree caller does by dropping it.
 fn lock_bytes(m: &Mutex<Vec<u8>>) -> std::sync::MutexGuard<'_, Vec<u8>> {
     m.lock().unwrap_or_else(|poisoned| {
         m.clear_poison();
@@ -783,6 +785,32 @@ fn cpu_buf(b: &dyn Buffer) -> &CpuBuffer {
     b.as_any()
         .downcast_ref::<CpuBuffer>()
         .expect("cpu backend: buffer is not a CpuBuffer (mixed backends?)")
+}
+
+/// Refuse a graph that binds one OWNED buffer to `held` and to any of `others`, for an op that
+/// keeps `held` locked while it locks those. The second lock would deadlock on the first, with no
+/// message: an owned buffer is a `std` mutex, which is not reentrant. Mapped and paged buffers
+/// take no lock, so they are not compared.
+///
+/// # Panics
+/// Naming the op and both operands, when two of them are the same owned buffer.
+fn refuse_relock(op: &str, held: (&str, &dyn Buffer), others: &[(&str, Option<&dyn Buffer>)]) {
+    let owned_uid = |b: &dyn Buffer| {
+        let b = cpu_buf(b);
+        matches!(b.store, CpuStore::Owned(_)).then_some(b.uid)
+    };
+    let Some(uid) = owned_uid(held.1) else {
+        return;
+    };
+    for (name, other) in others {
+        if other.is_some_and(|o| owned_uid(o) == Some(uid)) {
+            panic!(
+                "cpu {op}: {} and {name} are bound to the same owned buffer, which the op would \
+                 lock twice at once (a deadlock); bind each to its own buffer",
+                held.0
+            );
+        }
+    }
 }
 
 /// Dequantize the first `need` elements of a one-row-per-token KV cache at its declared `dtype`.
@@ -2865,6 +2893,30 @@ impl Backend for CpuBackend {
                     let dbuf = bindings
                         .get(down_exps)
                         .expect("cpu backend: unbound down_exps");
+                    // The router stays locked to the end of the op, the banks from `moe_banks` on;
+                    // `down_scale` and `exp_probs_b` are read under the router's lock.
+                    let ubuf_any = (!fused_gate_up)
+                        .then(|| bindings.get(up_exps).expect("cpu backend: unbound up_exps"));
+                    let opt = |id: Option<TensorId>| id.and_then(|id| bindings.get(id));
+                    refuse_relock(
+                        "Op::MoeFfn",
+                        ("router", rbuf),
+                        &[
+                            ("gate_exps", Some(gbuf)),
+                            ("up_exps", ubuf_any),
+                            ("down_exps", Some(dbuf)),
+                            ("down_scale", opt(down_scale)),
+                            ("exp_probs_b", opt(exp_probs_b)),
+                        ],
+                    );
+                    refuse_relock(
+                        "Op::MoeFfn",
+                        ("gate_exps", gbuf),
+                        &[("up_exps", ubuf_any), ("down_exps", Some(dbuf))],
+                    );
+                    if let Some(u) = ubuf_any {
+                        refuse_relock("Op::MoeFfn", ("up_exps", u), &[("down_exps", Some(dbuf))]);
+                    }
                     let rbytes = cpu_buf(rbuf).read();
                     let rdt = g.desc(router).dtype;
                     let gdt = g.desc(gate_exps).dtype;
@@ -2873,11 +2925,9 @@ impl Backend for CpuBackend {
                     // first); split gets its own separate up_exps/up buffer. The banks themselves
                     // are bound only once routing has picked the experts: a bank paged per expert
                     // has nothing to read before then.
-                    let (ubuf, udt) = if fused_gate_up {
-                        (None, gdt)
-                    } else {
-                        let ubuf = bindings.get(up_exps).expect("cpu backend: unbound up_exps");
-                        (Some(cpu_buf(ubuf)), g.desc(up_exps).dtype)
+                    let (ubuf, udt) = match ubuf_any {
+                        None => (None, gdt),
+                        Some(u) => (Some(cpu_buf(u)), g.desc(up_exps).dtype),
                     };
                     // One expert's byte band in the gate bank: the repack cache's key.
                     #[cfg(target_arch = "x86_64")]
@@ -3700,6 +3750,12 @@ impl Backend for CpuBackend {
                     let qs = &vals[q.0 as usize];
                     // K cache: one key_len-wide row per token. V = first kv_lora columns of same row.
                     let kbuf = bindings.get(k_cache).expect("cpu backend: unbound k_cache");
+                    // `k_cache` stays locked while `weight` may read `wk_b` and `wv_b`.
+                    refuse_relock(
+                        "Op::Mla",
+                        ("k_cache", kbuf),
+                        &[("wk_b", bindings.get(wk_b)), ("wv_b", bindings.get(wv_b))],
+                    );
                     let kguard = cpu_buf(kbuf).read();
                     let cap_rows = g.desc(k_cache).numel() / key_len.max(1);
                     let need = kv_len.min(cap_rows) * key_len;
@@ -4506,32 +4562,37 @@ pub(crate) mod test_util {
     }
 
     /// Run `body` on a thread of its own and return what it returns, failing if it takes longer
-    /// than a generous bound: a test of a hang otherwise waits forever instead of failing.
+    /// than a generous bound: a test of a hang otherwise waits forever instead of failing. A panic
+    /// in `body` fails the test with that panic's message.
     pub(crate) fn within<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
         let limit = std::time::Duration::from_secs(if cfg!(miri) { 900 } else { 60 });
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || tx.send(body()).expect("the test is waiting for this"));
+        std::thread::spawn(move || {
+            let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            tx.send(got).expect("the test is waiting for this")
+        });
         match rx.recv_timeout(limit) {
-            Ok(v) => v,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                panic!("still running after {limit:?}: hung")
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("the test body panicked (its message is above)")
-            }
+            Ok(Ok(v)) => v,
+            Ok(Err(p)) => panic!("the test body panicked: {}", payload_text(p)),
+            Err(e) => panic!("no result after {limit:?} ({e}): hung"),
         }
     }
 
     /// Run `f` under `catch_unwind`: the message of its panic, or `None` when it returned.
     pub(crate) fn panic_of(f: impl FnOnce()) -> Option<String> {
         let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).err()?;
-        Some(match p.downcast::<String>() {
+        Some(payload_text(p))
+    }
+
+    /// A panic payload's message: the `String` or `&str` a `panic!` carries.
+    fn payload_text(p: Box<dyn std::any::Any + Send>) -> String {
+        match p.downcast::<String>() {
             Ok(s) => *s,
             Err(p) => p
                 .downcast::<&'static str>()
                 .map(|s| (*s).to_owned())
                 .unwrap_or_else(|_| "<a payload that is not a string>".to_owned()),
-        })
+        }
     }
 }
 
@@ -4546,6 +4607,60 @@ mod tests {
     use super::test_util::det_quant_rows;
     use super::*;
     use infr_core::tensor::TensorDesc;
+
+    /// One owned buffer bound to `Op::Mla`'s `k_cache` and to a weight it reads is refused by
+    /// name: the op holds the cache's lock while it reads `wk_b` and `wv_b`, so the second lock on
+    /// the same mutex would hang with no message.
+    #[test]
+    fn mla_refuses_one_owned_buffer_bound_to_the_cache_and_a_weight() {
+        super::test_util::within(|| {
+            let mut g = Graph::new();
+            let q = g.input(TensorDesc::new(vec![1, 8], DType::F32));
+            let k_cache = g.input(TensorDesc::new(vec![2, 8], DType::F32));
+            let wk_b = g.weight(TensorDesc::new(vec![1, 4, 4], DType::F32));
+            let wv_b = g.weight(TensorDesc::new(vec![1, 4, 4], DType::F32));
+            let dst = g.output(TensorDesc::new(vec![1, 4], DType::F32));
+            g.push(Op::Mla {
+                q,
+                k_cache,
+                wk_b,
+                wv_b,
+                dst,
+                rows: 1,
+                kv_len: 2,
+                n_head: 1,
+                q_head_dim: 8,
+                kv_lora_rank: 4,
+                qk_nope_dim: 4,
+                qk_rope_dim: 4,
+                v_head_dim: 4,
+                scale: 1.0,
+                mask: AttnMask::Causal,
+                pos: 1,
+                theta: 1e4,
+                freq_factors: None,
+                key_bias: None,
+            });
+            let be = CpuBackend::new();
+            let alloc = |n: usize| be.alloc(n * 4, BufferUsage::Activations).unwrap();
+            let (qb, shared, wvb, yb) = (alloc(8), alloc(16), alloc(16), alloc(4));
+            let mut bind = Bindings::new();
+            bind.bind(q, qb.as_ref());
+            bind.bind(k_cache, shared.as_ref());
+            bind.bind(wk_b, shared.as_ref());
+            bind.bind(wv_b, wvb.as_ref());
+            bind.bind(dst, yb.as_ref());
+            let plan = be.compile(&g).unwrap();
+            let msg = super::test_util::panic_of(|| {
+                let _ = be.execute(plan.as_ref(), &bind);
+            })
+            .expect("the doubly bound cache was not refused");
+            assert!(
+                msg.contains("Op::Mla: k_cache and wk_b are bound to the same owned buffer"),
+                "{msg}"
+            );
+        })
+    }
 
     /// B133: with `general.alignment` below 4 an F32 or I32 tensor can start at an address that is
     /// not 4-aligned; reading it must decode, not panic in a cast.

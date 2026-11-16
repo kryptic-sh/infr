@@ -552,3 +552,36 @@ fn a_kernel_panic_fails_the_forward_and_the_next_one_computes() {
         );
     })
 }
+
+/// One owned buffer bound to two banks of one `Op::MoeFfn` is refused by name. The op holds every
+/// bank's lock at once, so the second lock on the same mutex would hang the forward with no
+/// message — the shape of the one hang the 2026-11-16 investigation reproduced.
+#[test]
+fn moe_ffn_refuses_one_owned_buffer_bound_to_two_banks() {
+    super::test_util::within(|| {
+        let moe = Moe {
+            dt: DType::Q8_0,
+            fused: false,
+            layers: 1,
+            ne: 512,
+            nff: 256,
+            n_expert: 8,
+            n_used: 2,
+            rows: 4,
+        };
+        let built = moe.build();
+        let be = CpuBackend::new();
+        let whole = built.whole(&be);
+        let x = rng(9, moe.rows * moe.ne);
+        // Binding order is gate, up, down: the gate bank stands in for the up bank too.
+        let banks = [whole[0].as_ref(), whole[0].as_ref(), whole[2].as_ref()];
+        let msg = super::test_util::panic_of(|| {
+            built.run(&be, &banks, &x);
+        })
+        .expect("the doubly bound bank was not refused");
+        assert!(
+            msg.contains("Op::MoeFfn: gate_exps and up_exps are bound to the same owned buffer"),
+            "{msg}"
+        );
+    })
+}

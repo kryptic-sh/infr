@@ -217,6 +217,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **A GPU session with no room left for any context fails with the numbers.**
+  When the device's free memory after the weights cannot hold even a one-token
+  context (another application took the room, or the model is too large), the
+  session now refuses at load with the allocatable memory measured and what a
+  one-token context needs, instead of failing each request with "prompt N + gen
+  M exceeds the session KV capacity 0".
+
 - **The CPU backend pages MoE expert banks per expert, and DeepSeek V4-Flash
   decodes about 100 times faster from disk.** With a host weight arena
   (`paging.dram`, or the automatic one when a model does not fit memory) an

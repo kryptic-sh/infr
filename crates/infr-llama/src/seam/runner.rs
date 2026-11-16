@@ -1345,7 +1345,7 @@ pub(crate) fn generate_dense_backend_bound(
         // and the driver's own memory that no pre-load footprint prices — so the budget query here
         // is a MEASUREMENT where the clamp that sized `want_ctx` could only estimate. Shrinks only,
         // and never a context the user pinned. See `reclamp_ctx_to_live_room`.
-        let want_ctx = crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt);
+        let want_ctx = crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)?;
         // A model infr only matches the reference over a bounded context gets no larger cache.
         // Sessions arrive already capped (`SeamModel::session_ctx`); this is the one-shot paths'
         // cap (they size `prompt + max_new + 1`). The load already warned.

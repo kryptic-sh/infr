@@ -2027,9 +2027,9 @@ pub(crate) fn reclamp_ctx_to_live_room(
     want_ctx: usize,
     k_fmt: DType,
     v_fmt: DType,
-) -> usize {
+) -> AResult<usize> {
     let Some(room) = be.device_alloc_room() else {
-        return want_ctx;
+        return Ok(want_ctx);
     };
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let budget = room.saturating_sub(POST_KV_DEVICE_RESERVE);
@@ -2045,7 +2045,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     // is what an MoE forward's activations actually need beside them.
     let at = |ub: usize| kv_fit_ctx_in_budget(cfg, ec, budget, None, &[ub], k_fmt, v_fmt);
     let Some(_) = at(cands[0]) else {
-        return want_ctx; // pure recurrent-state arch: no per-token KV to size.
+        return Ok(want_ctx); // pure recurrent-state arch: no per-token KV to size.
     };
     // The tallest rung that serves the whole window, else the rung that serves the most of it.
     let (chunk, fit) = cands
@@ -2064,8 +2064,20 @@ pub(crate) fn reclamp_ctx_to_live_room(
     if chunk < ubatch_rows(ec) {
         repin_ubatch_lower(chunk);
     }
+    let ubatch = ubatch_rows(ec);
+    let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
+    tracing::debug!(
+        room_bytes = room,
+        post_kv_reserve_bytes = POST_KV_DEVICE_RESERVE,
+        act_reserve_bytes = dense_act_reserve_at(cfg, fit, ubatch),
+        kv_bytes = kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, k_fmt, v_fmt),
+        ubatch,
+        want_ctx,
+        fit,
+        "ctx fit against the live device room"
+    );
     if fit >= want_ctx {
-        return want_ctx;
+        return Ok(want_ctx);
     }
     if ec.device.ctx.is_some() {
         tracing::warn!(
@@ -2077,10 +2089,26 @@ pub(crate) fn reclamp_ctx_to_live_room(
              does.",
             gib(room),
         );
-        return want_ctx;
+        return Ok(want_ctx);
     }
-    let ubatch = ubatch_rows(ec);
-    let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
+    if fit == 0 {
+        // Not one token of context fits: say so with the measured numbers, rather than let the
+        // request fail later as a context overflow against a capacity of 0.
+        let floor = dense_act_reserve_at(cfg, 1, ubatch)
+            + kv_bytes_estimate_fmt(cfg, 1, ring, ubatch, k_fmt, v_fmt);
+        return Err(anyhow!(
+            "this model does not fit the device's free memory: after its weights are resident the \
+             device reports {:.2} GiB allocatable, and even a one-token context needs {:.2} GiB \
+             ({:.2} GiB of KV and activation reserve at a {ubatch}-row chunk, plus {:.2} GiB held \
+             for the driver's own later allocations). Free device memory held by other \
+             applications, cap the expert cache (INFR_CACHE / paging.cache), or use a smaller \
+             quant of the model.",
+            gib(room),
+            gib(floor + POST_KV_DEVICE_RESERVE),
+            gib(floor),
+            gib(POST_KV_DEVICE_RESERVE),
+        ));
+    }
     tracing::warn!(
         requested_ctx = want_ctx,
         fits_ctx = fit,
@@ -2094,7 +2122,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
         gib(dense_act_reserve_at(cfg, fit, ubatch)),
         gib(POST_KV_DEVICE_RESERVE),
     );
-    fit
+    Ok(fit)
 }
 
 /// Bytes layer `l`'s two cache buffers ALLOCATE at `want_ctx` and prefill chunk `ubatch` —
@@ -5624,7 +5652,7 @@ mod seam_helper_tests {
         let (k, v) = (DType::F16, DType::F16);
         let want = 32768;
         let call = |be: &dyn infr_core::backend::Backend, ec: &EngineConfig| {
-            super::reclamp_ctx_to_live_room(be, &cfg, ec, want, k, v)
+            super::reclamp_ctx_to_live_room(be, &cfg, ec, want, k, v).expect("reclamp")
         };
 
         // No budget to report: the caller's window survives untouched.
@@ -5658,6 +5686,23 @@ mod seam_helper_tests {
             ..Default::default()
         };
         assert_eq!(call(&RoomOnly(Some(tight)), &pinned), want);
+
+        // Not one token fits: refused with the measured room, not handed on as a context of 0
+        // for the request to overflow later ("exceeds the session KV capacity 0").
+        let err = super::reclamp_ctx_to_live_room(
+            &RoomOnly(Some(super::POST_KV_DEVICE_RESERVE)),
+            &cfg,
+            &ec,
+            want,
+            k,
+            v,
+        )
+        .expect_err("a room holding only the driver reserve must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not fit") && msg.contains("0.25 GiB allocatable"),
+            "{msg}"
+        );
     }
 
     /// The KV refuse rung fires only when the buffers the guard checks provably cannot land: past

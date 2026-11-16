@@ -1,0 +1,227 @@
+# 11 — CPU output bit-identical on every platform, GPUs within tolerance of it
+
+The CPU backend is to produce the same bits on every operating system, every CPU
+tier and every architecture, with tests that exploit that: one checked-in value
+per case, exact comparisons, the same assertions on every CI system. Every GPU
+is then checked against that one CPU reference within a stated tolerance. This
+phase comes before the rest of the kernel-tuning phase (10), which needs the
+fixed reference to judge tuned values.
+
+Audited and scoped on 2026-11-17. Tags: **[read]** verified by reading,
+**[ran]** verified by running, **[I]** inferred, **[U]** unknown. Nothing is
+built yet.
+
+## 0. The cause, measured
+
+A standalone probe evaluated each math function the CPU path takes from the C
+runtime on a few hundred thousand f32 inputs, natively on Windows (rustc
+1.100.0, MSVC, UCRT) and under WSL Ubuntu 26.04 (rustc 1.99.0, glibc 2.43) on
+the same Ryzen, at baseline and at `target-cpu=native` **[ran]**. Baseline and
+native agree with each other on each system. Windows against Linux:
+
+| Function                                   | Inputs differing | Max ULP |
+| ------------------------------------------ | ---------------- | ------- |
+| `f32::exp`                                 | 267 of 400k      | 1       |
+| `f32::ln`                                  | 75 of 300k       | 1       |
+| `f32::ln_1p`                               | 69,165 of 300k   | 1       |
+| `f32::tanh`                                | 5,131 of 300k    | 1       |
+| `f32::powf` (RoPE bases)                   | 153 of 203k      | 1       |
+| `sin`/`cos` at Qwen3's RoPE angles         | 4,970 of 524k    | 1       |
+| `f32::mul_add`, `f64::mul_add` (any build) | 0                | 0       |
+
+So the recorded guess was right: the difference is the C runtime's math
+functions, and it enters at layer 0 of every forward (RoPE `sin`/`cos`/`powf`),
+then every attention softmax (`exp`), every SiLU or GELU, the MoE router and
+DeltaNet. Greedy text forks at the first near-tie, which is why short goldens
+agree and long ones carry `per_os` hashes.
+
+Neither runtime is correctly rounded across the board; glibc 2.43's `tanhf` and
+`log1pf` are **[ran]**, which means Linux output also depends on the glibc
+VERSION (the released binary links the user's glibc), a plausible cause of the
+runner-against-dev-box divergence `docs/synthetic-models.md` records **[I]**.
+
+Nothing else was found that differs between operating systems **[read]**: thread
+count never changes an arithmetic order (the pool only partitions outputs);
+there is no fast-math, contraction, FTZ or DAZ; allocator state never reaches
+results; the RNG is integer xorshift. `mul_add` is exact everywhere (hardware
+FMA, or the C runtime's software `fma`, which the probe found identical) but is
+a slow library call on the baseline x86 builds CI and the release ship.
+
+## 1. Where platform math enters
+
+Rust lowers `exp`, `ln`, `ln_1p`, `tanh`, `powf`, `sin`, `cos` to calls into the
+C runtime; `sqrt`, `round`, `floor`, `ceil`, `trunc` are exact everywhere
+**[read, ran]**. Production call sites:
+
+- `infr-cpu/src/lib.rs`: `Op::Softmax`, `Op::GatedRmsNorm`, `Op::Rope`,
+  `Op::QkNormRope`, `Op::Attention`'s softmax, `Op::HeadGate`, `Op::Softcap`,
+  `Op::ArgmaxProb`, the MoE router's softmax, sigmoid and sqrt-softplus,
+  `Op::Mla`'s rope and softmax, the hyper-connection sigmoids, `CompressPool`,
+  `hyper_sinkhorn`, `sample_token`, `conv1d_silu`, `deltanet_scan`.
+- `infr-cpu/src/kernels.rs`: `act_fn` (SiLU, GELU through `tanh`, sigmoid).
+- `infr-llama`: `sampling.rs` (temperature softmax, min-p), `config.rs`
+  (`mla_rope_mscale`, `yarn_freq_divisors`), `seam/runner.rs` (the MLA YaRN
+  scale), `seam/sc.rs` (Diffusion-Gemma self-conditioning), `mtp/mod.rs`,
+  `diffusion.rs`.
+- `infr-core/src/pager/shapes.rs` uses an f64 `powf` for a pager workload shape,
+  not inference.
+
+`infr-gguf` has none, and tokenization has no float arithmetic that reaches
+output.
+
+**SIMD tiers [read]:** dispatch is by `is_x86_feature_detected!`; aarch64 runs
+the scalar kernels (there are no NEON kernels). Every quantized family
+accumulates in i32 and finishes with one f32 expression written without FMA in
+every tier, and the f32 dots use one fixed `mul_add` order. So tier identity
+holds by design, but it is only partly TESTED: `batch_tier_tests` compares one
+row against a batch within a tier, for the K-quants and Q8_0; tier against
+scalar for tiers below the host's, and the 32-element-block, IQ and ternary
+families, are asserted by comments.
+
+**Row count [U]:** `Op::Linear` is identical across row counts (B200).
+`Op::MoeFfn` differs by design between one row and several (int8 activations),
+attention's row blocking was not reviewed for it, and the prefill chunk height
+can depend on a machine's memory.
+
+**Host math that feeds the GPUs [read]:** the YaRN divisors, the MLA YaRN scale,
+host sampling and Diffusion-Gemma's self-conditioning.
+
+## 2. The fix: project-owned, correctly rounded f32 math
+
+`infr_core::math`: `exp`, `ln`, `ln_1p`, `tanh`, `sin_cos`, `powf` for f32, and
+thin `sigmoid`, `silu`, `gelu_tanh`, `softplus` built on them. Chosen over a
+pure-Rust libm dependency (a new dependency, not correctly rounded, with
+arch-specific paths to audit **[I]**) and over simple polynomials (accurate to a
+ULP or two, so test expectations would encode the implementation).
+
+Correctly rounded means each result is the mathematically nearest f32, which
+makes it a fact that any other correctly rounded library agrees with, and lets
+test expectations come from a high-precision reference rather than from the code
+under test. The design is CORE-MATH's: evaluate in f64, with a rare hard-case
+fallback.
+
+**The determinism rule inside the module:** only `+ - * /`, `sqrt` and integer
+operations; no `mul_add`; nothing that depends on target features. Then
+baseline, native and aarch64 builds, and lane-wise SIMD versions, give the same
+bits, and one code path is fast everywhere. Whether 53 bits of working precision
+is enough without FMA is to be confirmed per function against CORE-MATH's bounds
+**[I]**.
+
+**Speed [I]:** a scalar correctly rounded `exp` of this design should cost about
+what glibc's does. The backlog's measurements (B173) put the scalar `exp` in the
+activation at a few percent of a prefill, and a vectorized `exp` as a win that
+was blocked on a three-platform re-bless; a lane-wise version with identical
+operations becomes possible here, provably identical to the scalar one over
+every input. Measure per-op times for the activation, attention, RoPE and
+softmax before and after on both systems.
+
+## 3. The guarantee, as milestones
+
+- **L1 — identical across operating systems.** The math module, every call site
+  migrated, a lint against the platform library. One re-bless of the CPU
+  goldens.
+- **L2 — identical across SIMD tiers, CPUs and thread counts.** Holds by design;
+  needs proof: a forced-tier switch (`kernels.cpu.max_tier`), op-level hashes at
+  every tier the host supports and at several thread counts, a
+  tier-against-scalar kernel test for every family, and row-count identity for
+  the MoE layer and attention. Cheap unless a family fails, in which case its
+  kernel is made to match the scalar expression.
+- **L3 — identical across architectures.** aarch64 runs the scalar kernels and
+  `mul_add` is exact on both, so this should follow from L1 **[I]**; it needs
+  the same hashes asserted on macOS arm64, an audit of `f32::max` at ±0, and a
+  rule that any future NEON kernel matches scalar (a possible speed cost only
+  then).
+
+No part is expected to cost measurable speed; the one to measure is correctly
+rounded `sin`/`cos` for RoPE at long context.
+
+## 4. Tests
+
+1. **Known answers per function:** a checked-in table of inputs, hard cases and
+   range edges included, with the correctly rounded result, generated once by a
+   development-time script from a multi-precision library (never run in CI); an
+   ignored exhaustive test over every f32 input per unary function; a dense-grid
+   hash asserted on every CI system.
+2. **A lint:** `crates/infr-core/tests/no_platform_libm.rs`, modelled on
+   `no_bare_print.rs`, forbids direct `.exp(`, `.ln(`, `.tanh(`, `.sin(`,
+   `.powf(` and their relatives in production code outside the math module, with
+   an explicit allowlist.
+3. **Op-level hashes, no model needed:** synthetic graphs per op family with
+   integer-generated weights, each output's bits hashed against ONE checked-in
+   value, in the normal test job on every system, at every forced tier and at
+   several thread counts.
+4. **Whole-model goldens:** short single-hash cases asserted on Windows too
+   (today the Windows halves are never asserted in CI); `per_os` deleted. The
+   goldens job is CI's critical path today; the hash subset becomes its own
+   short step.
+5. **Simpler afterwards:** the per-OS hashes and the notes that explain them,
+   the exclusion of Qwen3.5 from CI as not portable, the caveats about goldens
+   not reproducing across CPUs.
+6. **Stays tolerance-based:** comparisons with llama.cpp dumps, GPU against CPU,
+   and comparisons of two CPU paths that differ by design (production against
+   reference, quantized KV against f32).
+
+## 5. Slices
+
+| #   | Slice                                                                                                                                                                         | Evidence                                                                      |
+| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| S0  | An env-gated per-op output hash in the CPU executor (`INFR_CPU_OP_HASH`), kept as a debug aid; the cross-OS bisect on the cached Qwen3-0.6B case whose `per_os` hashes differ | the first op that differs on Windows against WSL (expected: layer 0's RoPE)   |
+| S1  | `infr_core::math`, the known-answer table and its generator, the exhaustive test, the grid hash on every system, the lint with today's sites allowlisted                      | known answers on every system; the exhaustive test finds none wrongly rounded |
+| S2  | Migrate every call site, empty the allowlist, re-bless the CPU goldens once (Windows natively, Linux under WSL and in CI), delete `per_os`                                    | one hash per case on both systems; per-op timings; llama.cpp distances        |
+| S3  | A Windows leg for the goldens subset; the op-level hash suite in the test matrix                                                                                              | the same hash on every CI system                                              |
+| S4  | `kernels.cpu.max_tier`, the tier-against-scalar test for every family, thread-count hashes, row-count identity for the MoE layer and attention                                | one AVX-512 machine proves every x86 tier                                     |
+| S5  | A vectorized `exp` (and `tanh`) identical to the scalar one                                                                                                                   | per-op time; exhaustive identity                                              |
+| S6  | Optional: runtime-dispatched FMA dots for baseline x86 builds, bits unchanged                                                                                                 | speed of the released build                                                   |
+
+## 6. GPUs against the one CPU reference
+
+**Today [read]** (`crates/infr-llama/tests/cpu_backend.rs`): GPU tests are a mix
+of exact tokens against the CPU reference path, whole-vocabulary logit cosine
+against the CPU (which B60 showed cannot separate a match from a mismatch; B174
+and B141 record specific weak ones), exact-hash GPU goldens, and GPU-against-GPU
+self-consistency. Op-level parity uses the production CPU with absolute error
+thresholds.
+
+**The reference is the CPU's reference mode** (`kernels.cpu.reference`: f32
+dots, no int8 activations). Its error is closest to exact, and B192 already
+scores every GPU variant against it. The production CPU path has its own int8
+activation error in places that differ from a GPU's, and keeps its own exact
+goldens.
+
+**Target.** Teacher-force the CPU reference's tokens through the GPU so the two
+never fork, and score several positions with: KL divergence over the full
+vocabulary; cosine over the reference's top-k probability mass; the largest
+logit difference relative to the reference row's logit range; and top-1
+agreement where the reference's margin is not a near-tie. Tolerances are per
+class (f32/f16 paths, int8-activation paths, quantized KV per bit width, MoE),
+each set from the worst value measured on the RX 7900 XTX and the integrated
+GPU, native and with 64 lanes forced, times a stated margin, in one table with
+provenance. Each must be shown to fail on a set of deliberate bugs: a dropped
+bias, a mis-scaled block, an attention mask off by one, a RoPE pairing or
+position error, a router that ignores its bias, a wrong quant nibble map,
+swapped gate and up, a wrong norm epsilon.
+
+**The exact-token GPU goldens** are retired from gating in favour of the
+tolerance test, since tunable kernels let each device choose parameters that
+change bits and contributors cannot bless hashes for their own devices. One
+command for hardware nobody has seen: `infr tune check --against cpu-reference`,
+which runs the op-level families and the teacher-forced comparison on a small
+model and prints the distances with pass or fail.
+
+| #   | Slice                                                                 |
+| --- | --------------------------------------------------------------------- |
+| G1  | The teacher-forced harness and metrics                                |
+| G2  | Measure both GPUs at both lane widths; set the tolerance table        |
+| G3  | The mutation demonstrations                                           |
+| G4  | Convert the cosine tests and the golden tests; wire `infr tune check` |
+
+G1 to G4 follow L1. The weak assertions B60, B174 and B141 name can be tightened
+before that.
+
+## 7. What changes for users
+
+Every CPU output changes once, on every platform, when the call sites move to
+the new math; goldens are re-blessed once and each case then has one hash.
+GPU-against-CPU token tests may flip where margins are thin and are re-checked.
+Distances to llama.cpp should move negligibly, since its own math already
+differs from both runtimes by a ULP or two; measure.

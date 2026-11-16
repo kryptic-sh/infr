@@ -32,6 +32,15 @@ The standing goal: any model size on any hardware, disk to DRAM to VRAM.
 | 06    | [Pager eviction: cost and policy](06-pager-eviction.md)                               | steps 1–2 done |
 | 08    | [A streamed model that fits runs at resident speed](08-streamed-at-resident-speed.md) | steps 0–4 done |
 
+## Numerics
+
+Priority: phase 11 goes ahead of the rest of phase 10, which needs the fixed CPU
+reference to judge tuned values against.
+
+| Phase | What                                                                                               | Status |
+| ----- | -------------------------------------------------------------------------------------------------- | ------ |
+| 11    | [CPU output bit-identical on every platform, GPUs within tolerance of it](11-cpu-bit-identical.md) | scoped |
+
 ## Vulkan backend
 
 | Phase | What                                                                                  | Status |

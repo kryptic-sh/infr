@@ -554,7 +554,7 @@ params = { "moe.small_m" = 65, "gemv_sg.rows" = 4, "no_such.param" = 1, "quant_q
     assert_eq!(value_of(&r, "gemv_sg.rows"), ("4".into(), "row bad".into()));
     assert_eq!(r.report.rows[0].params, vec!["gemv_sg.rows".to_string()]);
 
-    let err = |r: Result<Resolved, String>| r.err().expect("must refuse");
+    let err = |r: Result<Resolved, String>| r.expect_err("must refuse");
     let e = err(resolve_with(
         &facts,
         &Config::default(),
@@ -649,7 +649,8 @@ fn every_alias_writes_the_old_value() {
     let facts = fixture("rx7900xtx-amdwin");
     // (env pairs, [(parameter key, resolved value)]).
     let cases: &[(Pairs, Pairs)] = &[
-        (&[("INFR_SG", "16")], &[("device.sg_pref", "16")]),
+        // The 7900 XTX cannot pin 16: the width in use is 32, as the backend always fell back to.
+        (&[("INFR_SG", "16")], &[("device.sg_pref", "32")]),
         (&[("INFR_SG", "32")], &[("device.sg_pref", "32")]),
         (&[("INFR_NO_GEMV_RM", "")], &[("gemv_rm.enabled", "false")]),
         (&[("INFR_GEMV_RM", "4")], &[("gemv_rm.rows", "4")]),
@@ -752,9 +753,12 @@ fn every_alias_writes_the_old_value() {
         None,
     )
     .unwrap();
-    assert_eq!(
-        value_of(&r, "gemm_i8cm_kq.enabled"),
-        ("false".into(), "default".into())
+    // (An explicitly set no-op spelling is recorded as an "unset" at its level.)
+    let (v, src) = value_of(&r, "gemm_i8cm_kq.enabled");
+    assert_eq!(v, "false");
+    assert!(
+        src.starts_with("default; cli alias") && src.ends_with("(unset)"),
+        "{src}"
     );
     let r = resolve_with(
         &facts,
@@ -763,10 +767,9 @@ fn every_alias_writes_the_old_value() {
         None,
     )
     .unwrap();
-    assert_eq!(
-        value_of(&r, "mmv_mw.warps@q4_k"),
-        ("1".into(), "default".into())
-    );
+    let (v, src) = value_of(&r, "mmv_mw.warps@q4_k");
+    assert_eq!(v, "1");
+    assert!(src.starts_with("default;"), "{src}");
 }
 
 /// An alias set by a hand-built config (no layer recorded it, as `be_with` builds them) still
@@ -882,6 +885,8 @@ fn gemv_aliases_resolve_like_the_old_env_reads() {
         } else {
             get("INFR_GEMV_VARIANT").or_else(|| Some("reg".to_string()))
         };
+        // A name with no build (`o4` here) found nothing and took the RM path: `None`.
+        let variant = variant.filter(|v| crate::gemm::GEMV_RM_V2_VARIANTS.contains(&v.as_str()));
         assert_eq!(t.gemv_variant, variant, "{st:?}");
         assert_eq!(t.gemv_rm_enabled, get("INFR_NO_GEMV_RM").is_none());
         assert_eq!(u64::from(t.gemv_rm_rows), num("INFR_GEMV_RM", 2));
@@ -1058,4 +1063,500 @@ fn the_inventory_checks_can_fail() {
             .unwrap(),
     );
     assert!(!uses_subgroup_ops(&add) && !add.contains("coopmat"));
+}
+
+// ── declared ranges against what the code downstream can hold ────────────────
+
+/// Every bounded parameter refuses the first value past its bound, naming the key: the bounds
+/// are what the code after it can hold (the 8-split partials scratch, the watchdog-safe MoE
+/// small-batch ceiling, divisors that must not be 0, the builds that exist).
+#[test]
+fn values_past_each_bound_are_refused() {
+    let facts = fixture("rx7900xtx-amdwin");
+    let cases: &[(&str, &str, &str)] = &[
+        ("attn_flash.splits", "9", "0..=8"),
+        ("attn_pv.splits", "9", "0..=8"),
+        ("attn_flash.max_splits", "9", "2..=8"),
+        ("attn_pv.max_splits", "9", "2..=8"),
+        ("attn_pv.max_splits", "64", "2..=8"),
+        ("attn_flash.max_splits", "1", "2..=8"),
+        ("attn_pv.max_splits", "1", "2..=8"),
+        ("attn_flash.kv_per_split", "0", "1..="),
+        ("attn_pv.kv_per_split", "0", "1..="),
+        ("attn_canvas.chunks", "0", "1..="),
+        ("moe.small_m", "65", "0..=64"),
+        ("device.sg_pref", "64", "16 or 32"),
+        ("mmv_mw.warps", "3", "1|2|4|8|16"),
+        ("mmv_mw.warps@q4_k", "32", "1|2|4|8|16"),
+        ("gemv.variant", "bogus", "reg|sg|dbuf|wg128|none"),
+        ("gemv.variant", "REG", "reg|sg|dbuf|wg128|none"),
+    ];
+    for (key, bad, range) in cases {
+        let e = resolve_with(
+            &facts,
+            &env_cfg(&[("INFR_TUNE", &format!("{key}={bad}"))]),
+            &[],
+            None,
+        )
+        .err()
+        .unwrap_or_else(|| panic!("`{key}={bad}` was accepted"));
+        assert!(e.contains(key) && e.contains(range), "{key}={bad}: {e}");
+    }
+    // The values at each bound are accepted.
+    for ok in [
+        "attn_flash.splits=8",
+        "attn_pv.splits=8",
+        "attn_pv.max_splits=8",
+        "moe.small_m=64",
+        "mmv_mw.warps=16",
+        "gemv.variant=none",
+        "gemv.variant=wg128",
+    ] {
+        resolve_with(&facts, &env_cfg(&[("INFR_TUNE", ok)]), &[], None)
+            .unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+    // The split bounds ARE the scratch the adapter sizes.
+    for key in ["attn_flash.splits", "attn_pv.splits"] {
+        assert_eq!(
+            families::find(key).unwrap().ty.describe(),
+            format!("0..={}", super::ATTN_PREFILL_MAX_SPLITS)
+        );
+    }
+}
+
+/// With every parameter at its most aggressive in-range value, the split policy still never
+/// asks for more partials than the scratch holds (the review's `max_splits=64,target_wg=100000`
+/// is now refused, and the largest accepted set stays inside).
+#[test]
+fn split_policy_stays_inside_the_scratch_at_the_extremes() {
+    let cfg = env_cfg(&[(
+        "INFR_TUNE",
+        "attn_pv.max_splits=8,attn_pv.target_wg=4294967295,attn_pv.min_kv=0,attn_pv.kv_per_split=1,\
+         attn_pv.full_wg=4294967295,attn_flash.max_splits=8,attn_flash.target_wg=4294967295",
+    )]);
+    let t = resolve_with(&fixture("unknown"), &cfg, &[], None)
+        .unwrap()
+        .tuning;
+    for base in [0u32, 1, 2, 100, 1 << 20] {
+        for kv in [0u32, 1, 4096, 1 << 30] {
+            assert!(t.pv.count(base, kv) <= super::ATTN_PREFILL_MAX_SPLITS);
+            assert!(t.flash.count(base, kv) <= super::ATTN_PREFILL_MAX_SPLITS);
+        }
+    }
+    let e = resolve_with(
+        &fixture("unknown"),
+        &env_cfg(&[(
+            "INFR_TUNE",
+            "attn_pv.max_splits=64,attn_pv.target_wg=100000",
+        )]),
+        &[],
+        None,
+    )
+    .unwrap_err();
+    assert!(e.contains("attn_pv.max_splits"), "{e}");
+}
+
+/// The dispatch-side guard: a split count past the scratch panics instead of writing past it.
+#[test]
+#[should_panic(expected = "outside 1..=8")]
+fn a_split_count_past_the_scratch_panics() {
+    let t = fixture_tuning("unknown");
+    super::AttnSplit {
+        splits: super::ATTN_PREFILL_MAX_SPLITS + 1,
+        ..t.flash
+    }
+    .count(1, 1);
+}
+
+// ── old knobs at their edges: exactly the old behaviour ──────────────────────
+
+/// What a resolved alias must give, for one raw environment value.
+#[derive(Debug, PartialEq)]
+enum Old {
+    /// The parameter's value (what the old read site used, or an equivalent the kernels treat
+    /// identically).
+    Is(String),
+    /// Refused with an error naming the knob (only values that wrote out of bounds before).
+    Refused,
+}
+
+/// For every old environment knob and the edge inputs — empty, whitespace, malformed, negative,
+/// zero, at and past each bound, past `u32` and past `u64` — the resolved parameter is exactly
+/// what the old read site at the merge base computed from the same input. Each `old` closure
+/// transcribes that read site: the env layer's `num`/`opt_num`/presence grammar (`s.parse()`,
+/// untrimmed), then the site's own fallback or clamp.
+#[test]
+fn old_knobs_at_their_edges_behave_as_before() {
+    let inputs = [
+        "",
+        " ",
+        " 4",
+        "abc",
+        "-1",
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "8",
+        "9",
+        "32",
+        "64",
+        "65",
+        "100000",
+        "4294967296",
+        "99999999999999999999",
+        "sg",
+        "none",
+        "reg",
+    ];
+    let num32 = |raw: &str, d: u64| raw.parse::<u32>().map(u64::from).ok().unwrap_or(d);
+    let numz = |raw: &str, d: u64| raw.parse::<usize>().map(|v| v as u64).ok().unwrap_or(d);
+    let splits = |raw: &str| match raw.parse::<usize>() {
+        Err(_) => Old::Is("0".into()),
+        Ok(v) => match u32::try_from(v).ok().filter(|&n| n > 0) {
+            None => Old::Is("0".into()),
+            Some(n) if n <= super::ATTN_PREFILL_MAX_SPLITS => Old::Is(n.to_string()),
+            Some(_) => Old::Refused,
+        },
+    };
+    let show = |v: u64| {
+        if v == u64::MAX {
+            "max".to_string()
+        } else {
+            v.to_string()
+        }
+    };
+    type OldFn<'a> = Box<dyn Fn(&str) -> Old + 'a>;
+    let specs: Vec<(&str, &str, OldFn)> = vec![
+        (
+            "INFR_GEMV_RM",
+            "gemv_rm.rows",
+            Box::new(|r| Old::Is(num32(r, 2).to_string())),
+        ),
+        (
+            "INFR_GEMV_RM_MAXOUT",
+            "gemv_rm.max_out",
+            Box::new(|r| Old::Is(show(numz(r, u64::MAX)))),
+        ),
+        (
+            "INFR_GEMV_RM_MINOUT",
+            "gemv_rm.min_out",
+            Box::new(|r| Old::Is(numz(r, 2048).to_string())),
+        ),
+        (
+            "INFR_GEMV_SG_MINOUT",
+            "gemv_sg.min_out",
+            Box::new(|r| Old::Is(numz(r, 2048).to_string())),
+        ),
+        (
+            "INFR_GEMV_SG_MAXOUT",
+            "gemv_sg.max_out",
+            Box::new(|r| Old::Is(numz(r, 8192).to_string())),
+        ),
+        (
+            "INFR_GEMV_SG_NR",
+            "gemv_sg.rows",
+            Box::new(|r| Old::Is(num32(r, 2).to_string())),
+        ),
+        // An unknown name, the empty one included, found no build: the RM path, as `none`.
+        (
+            "INFR_GEMV_VARIANT",
+            "gemv.variant",
+            Box::new(|r| {
+                Old::Is(
+                    if crate::gemm::GEMV_RM_V2_VARIANTS.contains(&r) {
+                        r
+                    } else {
+                        "none"
+                    }
+                    .into(),
+                )
+            }),
+        ),
+        (
+            "INFR_NO_GEMV_REG",
+            "gemv.variant",
+            Box::new(|_| Old::Is("none".into())),
+        ),
+        (
+            "INFR_NO_GEMV_RM",
+            "gemv_rm.enabled",
+            Box::new(|_| Old::Is("false".into())),
+        ),
+        (
+            "INFR_NO_GEMV_SG",
+            "gemv_sg.enabled",
+            Box::new(|_| Old::Is("false".into())),
+        ),
+        (
+            "INFR_NO_GEMV_ID_SG",
+            "gemv_id_sg.enabled",
+            Box::new(|_| Old::Is("false".into())),
+        ),
+        (
+            "INFR_NO_I8CM_KQ",
+            "gemm_i8cm_kq.enabled",
+            Box::new(|_| Old::Is("false".into())),
+        ),
+        (
+            "INFR_MOE_SMALL_M",
+            "moe.small_m",
+            Box::new(|r| Old::Is(numz(r, 8).min(64).to_string())),
+        ),
+        (
+            "INFR_CANVAS_CHUNK_N",
+            "attn_canvas.chunks",
+            Box::new(|r| Old::Is(numz(r, 3).max(1).to_string())),
+        ),
+        ("INFR_FLASH_SPLITS", "attn_flash.splits", Box::new(splits)),
+        ("INFR_PV_SPLITS", "attn_pv.splits", Box::new(splits)),
+        (
+            "INFR_FLASH_BM",
+            "attn_flash.force_bm32",
+            Box::new(|r| Old::Is((r == "32").to_string())),
+        ),
+        (
+            "INFR_FLASH_MIN_ROWS",
+            "attn_flash.min_rows",
+            Box::new(|r| Old::Is(numz(r, 24).to_string())),
+        ),
+        // The multi-warp GEMV is unreachable (`unified_mmv_row1`), so the old WARPS value reached
+        // no dispatch whatever it was; a count with no build now leaves the default instead of
+        // carrying a number nothing reads. A built count is kept as before.
+        (
+            "INFR_MMV_MW_WARPS",
+            "mmv_mw.warps@q6_k",
+            Box::new(|r| {
+                let w = r.parse::<usize>().ok().and_then(|w| u32::try_from(w).ok());
+                Old::Is(match w {
+                    Some(w @ (1 | 2 | 4 | 8 | 16)) => w.to_string(),
+                    _ => "8".into(),
+                })
+            }),
+        ),
+    ];
+    let facts = fixture("rx7900xtx-amdwin");
+    for (env, key, old) in &specs {
+        for raw in inputs {
+            let want = old(raw);
+            let got = match resolve_with(&facts, &env_cfg(&[(env, raw)]), table::builtin(), None) {
+                Ok(r) => Old::Is(value_of(&r, key).0),
+                Err(e) => {
+                    assert!(e.contains(env), "{env}={raw:?}: error names no knob: {e}");
+                    Old::Refused
+                }
+            };
+            assert_eq!(got, want, "{env}={raw:?} → `{key}`");
+        }
+    }
+    // `INFR_SG` keeps its loud env grammar: anything but 16 or 32 is refused by the env layer.
+    for raw in ["", " ", "16 ", "17", "64", "abc"] {
+        let get = |k: &str| (k == "INFR_SG").then(|| raw.to_string());
+        assert!(
+            infr_core::config::env::parse(&get).is_err(),
+            "INFR_SG={raw:?}"
+        );
+    }
+}
+
+/// The subgroup width the report (and its hash) carries is the one IN USE: `INFR_SG=16` on a
+/// device that cannot pin 16 resolves to 32, and says why; where 16 is pinnable it stays 16.
+#[test]
+fn an_unpinnable_sg_pref_reports_the_width_in_use() {
+    let r = resolve_with(
+        &fixture("unknown"),
+        &env_cfg(&[("INFR_SG", "16")]),
+        &[],
+        None,
+    )
+    .unwrap();
+    let (v, src) = value_of(&r, "device.sg_pref");
+    assert_eq!(v, "32");
+    assert!(
+        src.contains("INFR_SG") && src.contains("cannot pin 16"),
+        "{src}"
+    );
+    assert_eq!(r.tuning.sg_pref, 32);
+    let plain = resolve_with(&fixture("unknown"), &Config::default(), &[], None).unwrap();
+    assert_eq!(
+        r.report.hash(),
+        plain.report.hash(),
+        "the hash is of the width in use"
+    );
+    let r = resolve_with(
+        &fixture("intel-arc-a770-anv"),
+        &env_cfg(&[("INFR_SG", "16")]),
+        &[],
+        None,
+    )
+    .unwrap();
+    assert_eq!(value_of(&r, "device.sg_pref").0, "16");
+}
+
+// ── precedence edge cases ────────────────────────────────────────────────────
+
+/// An alias set at a higher level to a value with no effect (its unset spelling) resets the
+/// parameter to what the table gives, beating a lower level's tuning key: the higher level wins
+/// whichever spelling it uses.
+#[test]
+fn an_unset_alias_at_a_higher_level_wins() {
+    let facts = fixture("rx7900xtx-amdwin");
+    let cfg = Config::load_from_layers(&[
+        file_layer("[kernels.vulkan.tune]\n\"mmv_mw.warps\" = 4\n"),
+        cli_layer(&["kernels.vulkan.mmv_mw_warps=none"]),
+    ]);
+    let r = resolve_with(&facts, &cfg, table::builtin(), None).unwrap();
+    let (v, src) = value_of(&r, "mmv_mw.warps@q4_k");
+    assert_eq!(v, "1");
+    assert!(
+        src.contains("cli alias") && src.contains("(unset)"),
+        "{src}"
+    );
+    // `i8cm_kq = true` was always "let the driver decide": over a lower key turning the GEMM off,
+    // it restores the row's value on the driver the row names.
+    let cfg = Config::load_from_layers(&[
+        env_layer(&[("INFR_TUNE", "gemm_i8cm_kq.enabled=false")]),
+        cli_layer(&["kernels.vulkan.i8cm_kq=true"]),
+    ]);
+    let r = resolve_with(&facts, &cfg, table::builtin(), None).unwrap();
+    assert_eq!(value_of(&r, "gemm_i8cm_kq.enabled").0, "true");
+    // At the SAME level the new key still wins over the alias's unset.
+    let cfg = Config::load_from_layers(&[cli_layer(&[
+        "kernels.vulkan.mmv_mw_warps=none",
+        "kernels.vulkan.tune.mmv_mw.warps=4",
+    ])]);
+    let r = resolve_with(&facts, &cfg, table::builtin(), None).unwrap();
+    assert_eq!(value_of(&r, "mmv_mw.warps@q4_k").0, "4");
+}
+
+/// Within one command line the whole-map spelling and per-key spellings of `tune` merge.
+#[test]
+fn tune_spellings_on_one_command_line_merge() {
+    let cfg = Config::load_from_layers(&[cli_layer(&[
+        "kernels.vulkan.tune.gemv_sg.rows=8",
+        "kernels.vulkan.tune=moe.small_m=4",
+    ])]);
+    let r = resolve_with(&fixture("unknown"), &cfg, &[], None).unwrap();
+    assert_eq!(value_of(&r, "gemv_sg.rows").0, "8");
+    assert_eq!(value_of(&r, "moe.small_m").0, "4");
+}
+
+/// A `Config` built in code records no layers, so a numeric alias field equal to its config
+/// default cannot be told from an unset one and counts as unset (a tuning key in the same config
+/// then wins); a different value counts as set at the config level.
+#[test]
+fn a_code_built_alias_at_its_default_is_unset() {
+    let mut cfg = Config::default();
+    cfg.kernels.vulkan.gemv.sg_nr = 2;
+    cfg.kernels
+        .vulkan
+        .tune
+        .entries
+        .push(infr_core::config::TuneEntry {
+            key: "gemv_sg.rows".into(),
+            value: "4".into(),
+            level: infr_core::config::TuneLevel::Config,
+        });
+    let r = resolve_with(&fixture("unknown"), &cfg, &[], None).unwrap();
+    assert_eq!(value_of(&r, "gemv_sg.rows").0, "4");
+    cfg.kernels.vulkan.gemv.sg_nr = 8;
+    let r = resolve_with(&fixture("unknown"), &cfg, &[], None).unwrap();
+    // Same level: the key beats the alias.
+    assert_eq!(value_of(&r, "gemv_sg.rows").0, "4");
+    cfg.kernels.vulkan.tune.entries.clear();
+    let r = resolve_with(&fixture("unknown"), &cfg, &[], None).unwrap();
+    assert_eq!(value_of(&r, "gemv_sg.rows").0, "8");
+}
+
+// ── row match keys ───────────────────────────────────────────────────────────
+
+/// A row's driver must be a Vulkan driver id name (a typo would silently match nothing); the
+/// vendor and arch were already checked.
+#[test]
+fn row_match_values_are_checked() {
+    let bad = |m: &str| {
+        table::parse(&format!("[[row]]\nid = \"x\"\nmatch = {{ {m} }}\n"), "t").unwrap_err()
+    };
+    assert!(bad("vendor = \"amd\", driver = \"AMD_PROPIETARY\"").contains("driver id name"));
+    assert!(bad("vendor = \"amd\", arch = \"Rdna3\"").contains("architecture"));
+    assert!(bad("vendor = \"ati\"").contains("vendor"));
+    for ok in [
+        "AMD_PROPRIETARY",
+        "MESA_RADV",
+        "NVIDIA_PROPRIETARY",
+        "unreported",
+    ] {
+        table::parse(
+            &format!("[[row]]\nid = \"x\"\nmatch = {{ vendor = \"amd\", driver = \"{ok}\" }}\n"),
+            "t",
+        )
+        .unwrap_or_else(|e| panic!("{ok}: {e}"));
+    }
+}
+
+/// The structural tie check over the rows themselves: no two built-in rows that one device could
+/// both match, at the same level and specificity, set a parameter differently — whether or not
+/// any fixture is that device.
+#[test]
+fn no_structural_ties_in_the_table() {
+    let c = table::conflicts(table::builtin());
+    assert!(c.is_empty(), "{c:#?}");
+}
+
+/// The structural check catches a tie no fixture exercises, and leaves rows that cannot meet.
+#[test]
+fn the_structural_tie_check_can_fail() {
+    let rows = |a: &str, b: &str| {
+        table::parse(
+            &format!(
+                "[[row]]\nid = \"a\"\nmatch = {{ {a} }}\nparams = {{ \"gemv_sg.rows\" = 4 }}\n\
+                 [[row]]\nid = \"b\"\nmatch = {{ {b} }}\nparams = {{ \"gemv_sg.rows\" = 8 }}\n"
+            ),
+            "t",
+        )
+        .unwrap()
+    };
+    // No fixture is an integrated AMD on RADV with 40+ CUs, but one device could be both.
+    assert_eq!(
+        table::conflicts(&rows(
+            "vendor = \"amd\", driver = \"MESA_RADV\"",
+            "vendor = \"amd\", cu_min = 40"
+        ))
+        .len(),
+        1
+    );
+    // Different drivers can never meet; different specificity is ordered, not tied.
+    assert!(table::conflicts(&rows(
+        "vendor = \"amd\", driver = \"MESA_RADV\"",
+        "vendor = \"amd\", driver = \"AMD_PROPRIETARY\""
+    ))
+    .is_empty());
+    assert!(table::conflicts(&rows(
+        "vendor = \"amd\", driver = \"MESA_RADV\"",
+        "vendor = \"amd\", driver = \"MESA_RADV\", integrated = true"
+    ))
+    .is_empty());
+    assert!(table::conflicts(&rows(
+        "vendor = \"amd\", cu_min = 40",
+        "vendor = \"amd\", cu_max = 20"
+    ))
+    .is_empty());
+}
+
+/// `rows = false` is "generic defaults only": on AMD's proprietary driver it also turns off the
+/// two rows that driver's GEMM choices come from, and the report says so.
+#[test]
+fn rows_off_drops_the_driver_rows_and_says_so() {
+    let mut cfg = Config::default();
+    cfg.kernels.vulkan.tuning.rows = false;
+    let r = resolve_fixture("rx7900xtx-amdwin", &cfg);
+    assert!(!r.tuning.i8cm_kq_enabled && !r.tuning.split_k_scale_by_cu);
+    assert!(r.report.rows_off);
+    let text = r.report.show();
+    assert!(
+        text.contains("rows: off") && text.contains("int8 cooperative-matrix"),
+        "{text}"
+    );
+    assert!(r.report.list(None).contains("INFR_TUNE_NO_ROWS"));
 }

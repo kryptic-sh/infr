@@ -42,8 +42,8 @@ pub(crate) enum Ty {
     Bool,
     /// One of a fixed set of integers.
     Set(&'static [u64]),
-    /// A build name; `none` means no build.
-    Text,
+    /// One of a fixed set of build names, or `none` for no build.
+    Names(&'static [&'static str]),
 }
 
 impl Ty {
@@ -53,7 +53,7 @@ impl Ty {
             Ty::Uint { min, max } => format!("{min}..={}", show_uint(max)),
             Ty::Bool => "true|false".to_string(),
             Ty::Set(v) => v.iter().map(u64::to_string).collect::<Vec<_>>().join("|"),
-            Ty::Text => "build name|none".to_string(),
+            Ty::Names(names) => format!("{}|none", names.join("|")),
         }
     }
 
@@ -95,11 +95,11 @@ impl Ty {
                     })
                 }
             }
-            Ty::Text => {
-                if raw.is_empty() {
-                    Err("empty build name".to_string())
-                } else {
+            Ty::Names(names) => {
+                if raw == "none" || names.contains(&raw) {
                     Ok(Value::Text(raw.to_string()))
+                } else {
+                    Err(format!("must be one of {} (got {raw:?})", self.describe()))
                 }
             }
         }
@@ -111,7 +111,7 @@ impl Ty {
             (Ty::Uint { min, max }, Value::Uint(x)) => (min..=max).contains(x),
             (Ty::Set(set), Value::Uint(x)) => set.contains(x),
             (Ty::Bool, Value::Bool(_)) => true,
-            (Ty::Text, Value::Text(s)) => !s.is_empty(),
+            (Ty::Names(names), Value::Text(s)) => s == "none" || names.contains(&s.as_str()),
             _ => false,
         }
     }
@@ -234,6 +234,10 @@ const fn uint(min: u64, max: u64) -> Ty {
 const U32: u64 = u32::MAX as u64;
 const USIZE: u64 = usize::MAX as u64;
 
+/// The warps counts `native_mmv_mw.comp` is built at (`gemm::native_mmv_mw_spv`; not every
+/// format has every count, see docs/backlog.md on `linear_mmv_mw_at`).
+const MMV_MW_WARPS: &[u64] = &[1, 2, 4, 8, 16];
+
 fn fixed_set(_: &mut Tuning, _: Qual, _: &Value) {
     unreachable!("a fixed parameter is never set")
 }
@@ -265,9 +269,9 @@ pub(crate) static PARAMS: &[Param] = &[
         family: "gemv",
         name: "variant",
         kind: Kind::Variant,
-        ty: Ty::Text,
+        ty: Ty::Names(crate::gemm::GEMV_RM_V2_VARIANTS),
         axis: Axis::None,
-        doc: "multi-row decode GEMV build tried before the RM path (reg, sg, dbuf, wg128, ...)",
+        doc: "multi-row decode GEMV build tried before the RM path (none: straight to the RM path)",
         rule: "reg",
         default: |_, _| Value::Text("reg".to_string()),
         get: |t, _| Value::Text(t.gemv_variant.clone().unwrap_or_else(|| "none".to_string())),
@@ -390,7 +394,7 @@ pub(crate) static PARAMS: &[Param] = &[
         family: "mmv_mw",
         name: "warps",
         kind: Kind::Variant,
-        ty: uint(0, U32),
+        ty: Ty::Set(MMV_MW_WARPS),
         axis: Axis::Dtype,
         doc: "warps per workgroup of the multi-warp int8 decode GEMV (native_mmv_mw), when the \
               decode does not take the unified rows=1 kernel",
@@ -455,9 +459,10 @@ pub(crate) static PARAMS: &[Param] = &[
         family: "attn_flash",
         name: "splits",
         kind: Kind::Host,
-        ty: uint(0, U32),
+        ty: uint(0, super::ATTN_PREFILL_MAX_SPLITS as u64),
         axis: Axis::None,
-        doc: "flash-attention prefill split-K count; 0 = the policy below",
+        doc: "flash-attention prefill split-K count, at most 8 (the partials scratch); 0 = the \
+              policy below",
         rule: "0 (policy)",
         default: |_, _| Value::Uint(0),
         get: |t, _| Value::Uint(u64::from(t.flash.splits)),
@@ -491,7 +496,7 @@ pub(crate) static PARAMS: &[Param] = &[
         family: "attn_flash",
         name: "max_splits",
         kind: Kind::Host,
-        ty: uint(2, 8),
+        ty: uint(2, super::ATTN_PREFILL_MAX_SPLITS as u64),
         axis: Axis::None,
         doc: "policy: most splits (the partials scratch is sized for 8)",
         rule: "8",
@@ -527,9 +532,10 @@ pub(crate) static PARAMS: &[Param] = &[
         family: "attn_pv",
         name: "splits",
         kind: Kind::Host,
-        ty: uint(0, U32),
+        ty: uint(0, super::ATTN_PREFILL_MAX_SPLITS as u64),
         axis: Axis::None,
-        doc: "non-flash coopmat attention P·V split-K count; 0 = the policy below",
+        doc: "non-flash coopmat attention P·V split-K count, at most 8 (the partials scratch); \
+              0 = the policy below",
         rule: "0 (policy)",
         default: |_, _| Value::Uint(0),
         get: |t, _| Value::Uint(u64::from(t.pv.splits)),
@@ -563,9 +569,9 @@ pub(crate) static PARAMS: &[Param] = &[
         family: "attn_pv",
         name: "max_splits",
         kind: Kind::Host,
-        ty: uint(2, U32),
+        ty: uint(2, super::ATTN_PREFILL_MAX_SPLITS as u64),
         axis: Axis::None,
-        doc: "policy: most splits",
+        doc: "policy: most splits (the partials scratch is sized for 8)",
         rule: "8",
         default: |_, _| Value::Uint(8),
         get: |t, _| Value::Uint(u64::from(t.pv.max_splits)),
@@ -817,6 +823,10 @@ pub(crate) struct Alias {
     /// when the setting has no effect on the parameter (unset, or a value the old site treated
     /// as "use the default").
     pub read: fn(&Config, bool) -> Option<Writes>,
+    /// Every parameter it can write. A layer that sets the knob to a value with no effect (its
+    /// unset spelling, or one the old read site ignored) RESETS these at its level to what the
+    /// levels below config give (default, rows, tuning file), so a higher level always wins.
+    pub params: &'static [&'static str],
 }
 
 fn one(key: &'static str, v: Value) -> Option<Writes> {
@@ -824,7 +834,9 @@ fn one(key: &'static str, v: Value) -> Option<Writes> {
 }
 
 /// A split-count knob (`Option<usize>`): a value that fits a `u32` and is not 0 is the count;
-/// 0 or a value past `u32` meant "the adaptive policy" at the old read site, which is 0 here.
+/// 0 or a value past `u32` meant "the adaptive policy" at the old read site, which is 0 here. A
+/// count past [`super::ATTN_PREFILL_MAX_SPLITS`] is written as is and refused by the parameter's
+/// range: the old site dispatched it, writing partials past the end of the 8-split scratch.
 fn splits_alias(v: Option<usize>, key: &'static str) -> Option<Writes> {
     let v = v?;
     let n = u32::try_from(v).ok().filter(|&n| n > 0).unwrap_or(0);
@@ -836,6 +848,7 @@ fn splits_alias(v: Option<usize>, key: &'static str) -> Option<Writes> {
 pub(crate) static ALIASES: &[Alias] = &[
     Alias {
         path: "device.subgroup_pref",
+        params: &["device.sg_pref"],
         read: |c, _| {
             c.device
                 .subgroup_pref
@@ -844,6 +857,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.gemv.no_rm",
+        params: &["gemv_rm.enabled"],
         read: |c, _| {
             c.kernels
                 .vulkan
@@ -854,6 +868,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.gemv.rm",
+        params: &["gemv_rm.rows"],
         read: |c, set| {
             let v = c.kernels.vulkan.gemv.rm;
             (set || v != 2).then(|| vec![("gemv_rm.rows", Value::Uint(u64::from(v)))])
@@ -861,6 +876,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.gemv.rm_maxout",
+        params: &["gemv_rm.max_out"],
         read: |c, set| {
             let v = c.kernels.vulkan.gemv.rm_maxout;
             (set || v != usize::MAX).then(|| vec![("gemv_rm.max_out", Value::Uint(v as u64))])
@@ -868,6 +884,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.gemv.rm_minout",
+        params: &["gemv_rm.min_out"],
         read: |c, set| {
             let v = c.kernels.vulkan.gemv.rm_minout;
             (set || v != 2048).then(|| vec![("gemv_rm.min_out", Value::Uint(v as u64))])
@@ -875,6 +892,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.gemv.no_sg",
+        params: &["gemv_sg.enabled"],
         read: |c, _| {
             c.kernels
                 .vulkan
@@ -885,6 +903,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.gemv.no_id_sg",
+        params: &["gemv_id_sg.enabled"],
         read: |c, _| {
             c.kernels
                 .vulkan
@@ -895,6 +914,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.gemv.sg_minout",
+        params: &["gemv_sg.min_out"],
         read: |c, set| {
             let v = c.kernels.vulkan.gemv.sg_minout;
             (set || v != 2048).then(|| vec![("gemv_sg.min_out", Value::Uint(v as u64))])
@@ -902,6 +922,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.gemv.sg_maxout",
+        params: &["gemv_sg.max_out"],
         read: |c, set| {
             let v = c.kernels.vulkan.gemv.sg_maxout;
             (set || v != 8192).then(|| vec![("gemv_sg.max_out", Value::Uint(v as u64))])
@@ -909,6 +930,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.gemv.sg_nr",
+        params: &["gemv_sg.rows"],
         read: |c, set| {
             let v = c.kernels.vulkan.gemv.sg_nr;
             (set || v != 2).then(|| vec![("gemv_sg.rows", Value::Uint(u64::from(v)))])
@@ -916,14 +938,23 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.gemv.variant",
+        params: &["gemv.variant"],
+        // A name with no build (an empty one included) found nothing at the old site and fell
+        // through to the RM path — exactly what `none` does.
         read: |c, set| {
             let v = c.kernels.vulkan.gemv.variant.as_deref();
-            (set || v != Some("reg"))
-                .then(|| vec![("gemv.variant", Value::Text(v.unwrap_or("none").to_string()))])
+            let known = v.filter(|n| crate::gemm::GEMV_RM_V2_VARIANTS.contains(n));
+            (set || v != Some("reg")).then(|| {
+                vec![(
+                    "gemv.variant",
+                    Value::Text(known.unwrap_or("none").to_string()),
+                )]
+            })
         },
     },
     Alias {
         path: "kernels.vulkan.i8cm_kq",
+        params: &["gemm_i8cm_kq.enabled"],
         // Only OFF ever meant anything: `true` (the default) left the driver gate in charge.
         read: |c, _| {
             (!c.kernels.vulkan.i8cm_kq).then(|| vec![("gemm_i8cm_kq.enabled", Value::Bool(false))])
@@ -931,14 +962,19 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.mmv_mw_warps",
-        // Every format at once; a value past `u32` fell back to the per-format default.
+        params: &["mmv_mw.warps"],
+        // A count with no build (or past u32) never reached a dispatch: the old read site fell
+        // back to the default past u32, and the multi-warp path is unreachable today. No-op.
         read: |c, _| {
-            let w = u32::try_from(c.kernels.vulkan.mmv_mw_warps?).ok()?;
-            one("mmv_mw.warps", Value::Uint(u64::from(w)))
+            let w = u64::try_from(c.kernels.vulkan.mmv_mw_warps?).ok()?;
+            MMV_MW_WARPS
+                .contains(&w)
+                .then(|| vec![("mmv_mw.warps", Value::Uint(w))])
         },
     },
     Alias {
         path: "kernels.vulkan.moe_small_m",
+        params: &["moe.small_m"],
         // The old site clamped to 0..=64 (`tier::EnvRows`); the parameter's range is that clamp.
         read: |c, set| {
             let v = c.kernels.vulkan.moe_small_m;
@@ -947,6 +983,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.canvas_chunk_n",
+        params: &["attn_canvas.chunks"],
         // The old site floored at 1 (`tier::EnvRows`).
         read: |c, set| {
             let v = c.kernels.vulkan.canvas_chunk_n;
@@ -955,10 +992,12 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.flash_splits",
+        params: &["attn_flash.splits"],
         read: |c, _| splits_alias(c.kernels.vulkan.flash_splits, "attn_flash.splits"),
     },
     Alias {
         path: "kernels.vulkan.flash_bm32",
+        params: &["attn_flash.force_bm32"],
         read: |c, set| {
             let v = c.kernels.vulkan.flash_bm32;
             (set || v).then(|| vec![("attn_flash.force_bm32", Value::Bool(v))])
@@ -966,6 +1005,7 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.flash_min_rows",
+        params: &["attn_flash.min_rows"],
         read: |c, set| {
             let v = c.kernels.vulkan.flash_min_rows;
             (set || v != 24).then(|| vec![("attn_flash.min_rows", Value::Uint(v as u64))])
@@ -973,9 +1013,30 @@ pub(crate) static ALIASES: &[Alias] = &[
     },
     Alias {
         path: "kernels.vulkan.pv_splits",
+        params: &["attn_pv.splits"],
         read: |c, _| splits_alias(c.kernels.vulkan.pv_splits, "attn_pv.splits"),
     },
 ];
+
+/// The value a device can actually USE for `p` when the resolved value is `v`, if different, with
+/// the reason: a 16-wide `device.sg_pref` on a device that cannot pin 16 runs at 32 (the rule the
+/// backend has always applied, now part of resolution so the report and its hash show the width in
+/// use).
+pub(crate) fn in_use(p: &Param, f: &DeviceFacts, v: &Value) -> Option<(Value, String)> {
+    if p.family == "device" && p.name == "sg_pref" && *v == Value::Uint(16) {
+        let pinnable = f.subgroup_min <= 16 && 16 <= f.subgroup_max;
+        if !pinnable {
+            return Some((
+                Value::Uint(32),
+                format!(
+                    "16 requested, but this device's subgroup range [{}, {}] cannot pin 16",
+                    f.subgroup_min, f.subgroup_max
+                ),
+            ));
+        }
+    }
+    None
+}
 
 /// The `INFR_*` name(s) of the alias at `path`, for a source label.
 pub(crate) fn alias_env_names(path: &str) -> String {

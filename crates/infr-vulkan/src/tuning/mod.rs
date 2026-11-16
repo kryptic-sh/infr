@@ -134,6 +134,11 @@ pub(crate) const MMV_MW_DTYPES: &[(&str, infr_core::DType)] = {
     ]
 };
 
+/// The most split-K partials the coopmat attention prefill can take: the adapter sizes the flash
+/// (`flash_po`/`pm`/`pl`) and PV (`nonfa_pv`) partials scratch for this many, and the
+/// `attn_flash.*` / `attn_pv.*` split counts are bounded by it.
+pub(crate) const ATTN_PREFILL_MAX_SPLITS: u32 = 8;
+
 /// The split-count policy one attention prefill family runs ([`Tuning::flash`] / [`Tuning::pv`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AttnSplit {
@@ -157,6 +162,17 @@ impl AttnSplit {
     /// enough splits to reach about `target_wg` workgroups, between 2 and `max_splits`, with at
     /// least `kv_per_split` keys each).
     pub fn count(&self, base_wg: u32, kv: u32) -> u32 {
+        let n = self.policy(base_wg, kv);
+        // The partials scratch holds this many; a larger count writes past its end. The ranges of
+        // `splits` and `max_splits` already keep every resolved set inside it.
+        assert!(
+            (1..=ATTN_PREFILL_MAX_SPLITS).contains(&n),
+            "attention split count {n} outside 1..={ATTN_PREFILL_MAX_SPLITS}"
+        );
+        n
+    }
+
+    fn policy(&self, base_wg: u32, kv: u32) -> u32 {
         if self.splits > 0 {
             return self.splits;
         }

@@ -100,7 +100,7 @@ fn opt_kv_dtype(get: Get, key: &str) -> Option<Option<DType>> {
     get(key).map(|v| crate::budget::parse_kv_dtype(&v))
 }
 
-/// A multi-GPU device list. This is one of the five knobs that ERROR on a bad value today, so the
+/// A multi-GPU device list. This is one of the six knobs that ERROR on a bad value today, so the
 /// error propagates out of the layer instead of falling back. The per-knob minimum device counts
 /// differ (2 / 2 / 1) and are passed straight through to the shared parser.
 ///

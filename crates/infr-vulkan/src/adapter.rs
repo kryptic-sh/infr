@@ -1074,7 +1074,10 @@ fn split_k_plan(m: usize, in_f: usize, out_f: usize, window: usize) -> usize {
     let narrow_grid = m.div_ceil(64) * (out_f / 128).max(1);
     let below = window;
     if out_f.is_multiple_of(128) && in_f >= 1024 && narrow_grid < below {
-        (2 * below / narrow_grid).next_power_of_two().clamp(1, 8)
+        (below.saturating_mul(2) / narrow_grid)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .clamp(1, 8)
     } else {
         1
     }
@@ -3092,9 +3095,24 @@ fn lower_op(
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
                     // set serves every layer instead of n_layer live copies (~1GB each at 8B p8k).
-                    let po = pooled(pool, be_, "flash_po", 8 * mpad * nh * hd * 4)?;
-                    let pm = pooled(pool, be_, "flash_pm", 8 * mpad * nh * 4)?;
-                    let pl = pooled(pool, be_, "flash_pl", 8 * mpad * nh * 4)?;
+                    let po = pooled(
+                        pool,
+                        be_,
+                        "flash_po",
+                        crate::tuning::ATTN_PREFILL_MAX_SPLITS as usize * mpad * nh * hd * 4,
+                    )?;
+                    let pm = pooled(
+                        pool,
+                        be_,
+                        "flash_pm",
+                        crate::tuning::ATTN_PREFILL_MAX_SPLITS as usize * mpad * nh * 4,
+                    )?;
+                    let pl = pooled(
+                        pool,
+                        be_,
+                        "flash_pl",
+                        crate::tuning::ATTN_PREFILL_MAX_SPLITS as usize * mpad * nh * 4,
+                    )?;
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),
                         None => r(*k_cache)?,
@@ -3140,7 +3158,12 @@ fn lower_op(
                     // fills every [mpad, kv_pad] row; PV partials are written per split before
                     // the reduce), and one set serves every same-shape layer.
                     let s = pooled(pool, be_, "nonfa_s", nh * mpad * kv_pad * 2)?;
-                    let pv = pooled(pool, be_, "nonfa_pv", 8 * mpad * nh * hd * 4)?;
+                    let pv = pooled(
+                        pool,
+                        be_,
+                        "nonfa_pv",
+                        crate::tuning::ATTN_PREFILL_MAX_SPLITS as usize * mpad * nh * hd * 4,
+                    )?;
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),
                         None => r(*k_cache)?,
@@ -8587,6 +8610,27 @@ mod tests {
         DType::Q5_1,
         DType::Iq4Nl,
     ];
+
+    /// `mmv_mw_choice` reads WARPS with `?`: a format in the int8 decode set without a
+    /// `mmv_mw.warps` qualifier would silently drop off the tier. Every format any setting of the
+    /// tri-state can put on the decode set must have one.
+    #[test]
+    fn mmv_mw_dtypes_have_a_warps_qualifier() {
+        let caps = infr_core::backend::Capabilities::default();
+        let t = crate::tuning::tests::fixture_tuning("unknown");
+        for mmv_mw in [None, Some(true), Some(false)] {
+            let vk = infr_core::config::VulkanCfg {
+                mmv_mw,
+                ..Default::default()
+            };
+            for &dt in mmv_int8_decode_dtypes(&caps, &vk) {
+                assert!(
+                    t.mmv_mw_warps(dt).is_some(),
+                    "{dt:?} is on the int8 decode set but has no `mmv_mw.warps` qualifier"
+                );
+            }
+        }
+    }
 
     #[test]
     fn int8_decode_and_mrow_tiers_agree_on_policy_dtypes() {

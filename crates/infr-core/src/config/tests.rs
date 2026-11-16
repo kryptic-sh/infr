@@ -1484,3 +1484,47 @@ fn tuning_switches_parse() {
         Some(Path::new("t.toml"))
     );
 }
+
+/// A relative `tuning.file` in a config file names a file beside that config file; an absolute
+/// one, and one from the environment or the command line, are left as given (the environment's
+/// and command line's stay relative to the working directory).
+#[test]
+fn a_relative_tuning_file_in_a_config_file_is_beside_it() {
+    let text = "[kernels.vulkan.tuning]\nfile = \"tune.toml\"\n";
+    let (p, _) = file::parse_str(text, Path::new("/etc/infr/config.toml")).unwrap();
+    let cfg = Config::load_from_layers(&[p]);
+    assert_eq!(
+        cfg.kernels.vulkan.tuning.file.as_deref(),
+        Some(Path::new("/etc/infr/tune.toml"))
+    );
+    // `./infr.toml` (no folder part) keeps the path as written.
+    let cfg = Config::load_from_layers(&[file_layer(text)]);
+    assert_eq!(
+        cfg.kernels.vulkan.tuning.file.as_deref(),
+        Some(Path::new("tune.toml"))
+    );
+    let abs = if cfg!(windows) {
+        "C:/t/tune.toml"
+    } else {
+        "/t/tune.toml"
+    };
+    let (p, _) = file::parse_str(
+        &format!("[kernels.vulkan.tuning]\nfile = \"{abs}\"\n"),
+        Path::new("/etc/infr/config.toml"),
+    )
+    .unwrap();
+    assert_eq!(
+        Config::load_from_layers(&[p])
+            .kernels
+            .vulkan
+            .tuning
+            .file
+            .as_deref(),
+        Some(Path::new(abs))
+    );
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_TUNE_FILE", "tune.toml")])]);
+    assert_eq!(
+        cfg.kernels.vulkan.tuning.file.as_deref(),
+        Some(Path::new("tune.toml"))
+    );
+}

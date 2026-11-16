@@ -2552,20 +2552,11 @@ impl VulkanBackend {
         // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────
         // `device.sg_pref`: its generic default is the capability rule in `tuning::families`, and
         // `device.subgroup_pref` (`INFR_SG`) is its alias; a value other than 16 or 32 was refused
-        // by the resolver above, which names the setting.
+        // by the resolver above, which names the setting. A 16 the device cannot pin (e.g.
+        // INFR_SG=16 on RADV wave32: subgroup_min == 32) already came back as 32, with a warning,
+        // so the report and its hash carry the width in use (`tuning::families::in_use`). 32 is
+        // always pinnable here (hard-required above).
         let sg_pref = tuned.sg_pref;
-        // A 16 request/default is only usable where 16 is pinnable; otherwise CLEANLY fall back
-        // to 32 (e.g. INFR_SG=16 on RADV wave32: subgroup_min == 32 → stays 32, path set
-        // unchanged). 32 is always pinnable here (hard-required above).
-        let sg_pref = if sg_pref == 16 && !(subgroup_min <= 16 && 16 <= subgroup_max) {
-            tracing::warn!(
-                "[infr] INFR_SG=16 requested but this device's subgroup range \
-                 [{subgroup_min}, {subgroup_max}] cannot pin 16 — keeping 32"
-            );
-            32
-        } else {
-            sg_pref
-        };
 
         let caps = Capabilities {
             name: device_name,

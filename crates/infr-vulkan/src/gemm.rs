@@ -195,6 +195,11 @@ pub(crate) fn native_rm_streamed_build_spv(
     }
 }
 
+/// Every variant name [`native_rm_v2_streamed_build_spv`] has a build for (for some dtype) —
+/// the values the `gemv.variant` tuning parameter accepts besides `none`.
+/// `gemv_variants_all_have_a_build` holds the two together.
+pub(crate) const GEMV_RM_V2_VARIANTS: &[&str] = &["reg", "sg", "dbuf", "wg128"];
+
 /// SPIR-V + kernel name for an experimental RM kernel variant (env-gated, default OFF) — the ONLY
 /// weight build for this family (the bound-SSBO resident build died with the eager
 /// `Recorder::linear_native_rm_v2` caller, its sole consumer). Returns (kernel_name, spv) for the
@@ -3878,6 +3883,24 @@ impl VulkanBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every name the `gemv.variant` tuning parameter accepts has a build, and no build is
+    /// missing from the list (a name probed over every dtype the family covers).
+    #[test]
+    fn gemv_variants_all_have_a_build() {
+        use infr_core::DType::{Q4K, Q6K};
+        for v in GEMV_RM_V2_VARIANTS {
+            assert!(
+                [Q4K, Q6K]
+                    .iter()
+                    .any(|&dt| native_rm_v2_streamed_build_spv(v, dt, false).is_some()),
+                "gemv variant `{v}` has no build"
+            );
+        }
+        for bogus in ["", " ", "none", "o4", "REG"] {
+            assert!(native_rm_v2_streamed_build_spv(bogus, Q4K, false).is_none());
+        }
+    }
 
     /// [`I8cmTile`]'s extents are what the recorder sizes the grid and the adapter gates shapes
     /// by; the shader only knows the `-DTILE_*` defines `build.rs` hands each build. A drift

@@ -323,7 +323,8 @@ macro_rules! cfg_struct {
                         let ::core::option::Option::Some(t) = tail else {
                             let v = <$LT as $crate::config::partial::ConfigValue>::parse_set(raw)
                                 .map_err($crate::config::SetPathError::Value)?;
-                            self.$lf = ::core::option::Option::Some(v);
+                            // Within a layer, too, an open map keeps what it already holds.
+                            <$LT as $crate::config::partial::ConfigValue>::fold(&mut self.$lf, v);
                             return ::core::result::Result::Ok(());
                         };
                         return <$LT as $crate::config::partial::ConfigValue>::set_below(

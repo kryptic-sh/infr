@@ -261,7 +261,17 @@ fn parse_match(t: &toml::Table, label: &str) -> Result<Match, String> {
                 }
                 m.arch = Some(s);
             }
-            "driver" => m.driver = Some(text(k, v)?),
+            "driver" => {
+                let d = text(k, v)?;
+                if d != "unreported" && !driver_names().contains(&d) {
+                    return Err(format!(
+                        "{label}: `match.driver` {d:?} is not a Vulkan driver id name (one of: \
+                         unreported, {})",
+                        driver_names().join(", ")
+                    ));
+                }
+                m.driver = Some(d);
+            }
             "integrated" => {
                 m.integrated = Some(
                     v.as_bool()
@@ -287,6 +297,83 @@ fn parse_match(t: &toml::Table, label: &str) -> Result<Match, String> {
         }
     }
     Ok(m)
+}
+
+/// Every `VkDriverId` name ash knows (`AMD_PROPRIETARY`, `MESA_RADV`, …), as a row's
+/// `match.driver` and the device facts spell it.
+pub(crate) fn driver_names() -> &'static [String] {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES.get_or_init(|| {
+        // The registry numbers driver ids from 1 and has fewer than 64; an id ash does not know
+        // prints as its number, which the filter drops.
+        (1..64)
+            .map(|i| super::driver_name(ash::vk::DriverId::from_raw(i)))
+            .filter(|n| n.starts_with(|c: char| c.is_ascii_alphabetic()))
+            .collect()
+    })
+}
+
+impl Match {
+    /// Whether one device could satisfy both `self` and `other` (each key both name must be
+    /// satisfiable at once; a name pattern is assumed to be).
+    pub(crate) fn compatible(&self, other: &Match) -> bool {
+        fn eq<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+            match (a, b) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+        }
+        fn overlap(lo: [Option<u32>; 2], hi: [Option<u32>; 2]) -> bool {
+            let lo = lo.iter().flatten().max().copied().unwrap_or(0);
+            let hi = hi.iter().flatten().min().copied().unwrap_or(u32::MAX);
+            lo <= hi
+        }
+        let ids = match (&self.device_id, &other.device_id) {
+            (Some(a), Some(b)) => a.iter().any(|x| b.contains(x)),
+            _ => true,
+        };
+        eq(&self.vendor, &other.vendor)
+            && eq(&self.arch, &other.arch)
+            && eq(&self.driver, &other.driver)
+            && eq(&self.integrated, &other.integrated)
+            && eq(&self.subgroup_min, &other.subgroup_min)
+            && eq(&self.subgroup_max, &other.subgroup_max)
+            && ids
+            && overlap(
+                [self.driver_version_min, other.driver_version_min],
+                [self.driver_version_max, other.driver_version_max],
+            )
+            && overlap([self.cu_min, other.cu_min], [self.cu_max, other.cu_max])
+    }
+}
+
+/// Pairs of rows that tie — same level (class or device) and the same number of match fields —
+/// that one device could match both of, and that set the same parameter key to different values:
+/// which one wins would be file order, not intent. One line per conflict.
+pub(crate) fn conflicts(rows: &[Row]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, a) in rows.iter().enumerate() {
+        for b in &rows[i + 1..] {
+            if a.matcher.is_device() != b.matcher.is_device()
+                || a.matcher.fields() != b.matcher.fields()
+                || !a.matcher.compatible(&b.matcher)
+            {
+                continue;
+            }
+            for (k, va) in &a.params {
+                if let Some((_, vb)) = b.params.iter().find(|(kb, _)| kb == k) {
+                    if va != vb {
+                        out.push(format!(
+                            "rows `{}` and `{}` can match the same device with equal \
+                             specificity and set `{k}` to {va} and {vb}",
+                            a.id, b.id
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The built-in rows. A parse failure is a build defect the table tests catch, so this panics.

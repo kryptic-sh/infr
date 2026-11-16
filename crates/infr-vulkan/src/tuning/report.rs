@@ -47,18 +47,25 @@ pub struct TuningReport {
     pub rows: Vec<RowReport>,
     /// Every parameter.
     pub params: Vec<ParamReport>,
+    /// The built-in table's rows were switched off (`kernels.vulkan.tuning.rows = false`).
+    pub rows_off: bool,
 }
+
+/// What switching the table's rows off means, for `show` and `list`.
+pub const ROWS_OFF_NOTE: &str = "the built-in table's rows are off (`kernels.vulkan.tuning.rows = false` / `INFR_TUNE_NO_ROWS`): every value is its generic default. On AMD's proprietary driver that also turns off the int8 cooperative-matrix K-quant prefill GEMM and the compute-unit-scaled split-K window those rows enable, so prefill takes the f16 coopmat GEMM (about a third slower pp512 on the RX 7900 XTX).";
 
 impl TuningReport {
     pub(crate) fn new(
         device: &DeviceFacts,
         rows: Vec<RowReport>,
         params: Vec<ParamReport>,
+        rows_off: bool,
     ) -> Self {
         Self {
             device: device.clone(),
             rows,
             params,
+            rows_off,
         }
     }
 
@@ -109,7 +116,9 @@ impl TuningReport {
             self.match_key(),
             self.hash(),
         );
-        if self.rows.is_empty() {
+        if self.rows_off {
+            out.push_str(&format!(" off — {ROWS_OFF_NOTE}\n"));
+        } else if self.rows.is_empty() {
             out.push_str(" none\n");
         } else {
             out.push('\n');
@@ -145,8 +154,15 @@ impl TuningReport {
              or `[kernels.vulkan.tune]` in infr.toml; `infr tune show` says where each value \
              came from.\n\
              kind: host = a dispatch threshold or count, variant = picks a kernel build, pin = a \
-             subgroup width, fixed = equals a shader literal (reported, not settable).\n\n",
+             subgroup width, fixed = equals a shader literal (reported, not settable).\n\
+             `kernels.vulkan.tuning.rows = false` (`INFR_TUNE_NO_ROWS`) drops the built-in table's \
+             rows and leaves the generic defaults; on AMD's proprietary driver that turns off the \
+             int8 cooperative-matrix prefill GEMM and the CU-scaled split-K window (slower \
+             prefill).\n\n",
         );
+        if self.rows_off {
+            out.push_str(&format!("Note: {ROWS_OFF_NOTE}\n\n"));
+        }
         let mut last_family = "";
         for p in self
             .params

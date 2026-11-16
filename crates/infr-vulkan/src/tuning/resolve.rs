@@ -24,6 +24,7 @@ use super::table::{self, Row, Verified};
 use super::{DeviceFacts, Tuning};
 
 /// The resolved set and its report.
+#[derive(Debug)]
 pub(crate) struct Resolved {
     pub tuning: Tuning,
     pub report: TuningReport,
@@ -45,7 +46,9 @@ struct Setting {
     rank: (usize, bool, usize),
     param: &'static Param,
     qual: Qual,
-    value: Value,
+    /// `None` resets the parameter to what the levels below config gave it (an alias set to a
+    /// value with no effect, at a level above a tuning key).
+    value: Option<Value>,
     label: String,
 }
 
@@ -94,6 +97,12 @@ pub(crate) fn resolve_with(
         note_row(row, &set, &mut rows_report, stage);
     }
     if let Some((path, rows)) = &file {
+        for c in table::conflicts(rows) {
+            tracing::warn!(
+                "[infr] tuning file {}: {c} — the later row wins",
+                path.display()
+            );
+        }
         for (i, row) in rows.iter().enumerate() {
             if disabled(&row.id) || !row.matcher.matches(facts) {
                 continue;
@@ -118,6 +127,23 @@ pub(crate) fn resolve_with(
     for (i, alias) in ALIASES.iter().enumerate() {
         let recorded = tune.alias_level(alias.path);
         let Some(writes) = (alias.read)(cfg, recorded.is_some()) else {
+            // Set by a layer, but to a value with no effect: that layer's word is "the default",
+            // which must still beat a tuning key from a LOWER layer.
+            if let Some(level) = recorded {
+                let label = format!("{} (unset)", alias_label(level, alias.path));
+                for key in alias.params {
+                    let (param, qual) =
+                        families::lookup(key).expect("alias names a real parameter");
+                    settings.push(Setting {
+                        stage: Stage::User(level),
+                        rank: (0, qual.is_some(), i),
+                        param,
+                        qual,
+                        value: None,
+                        label: label.clone(),
+                    });
+                }
+            }
             continue;
         };
         let level = recorded.unwrap_or_default();
@@ -139,7 +165,7 @@ pub(crate) fn resolve_with(
                 rank: (0, qual.is_some(), i),
                 param,
                 qual,
-                value,
+                value: Some(value),
                 label: label.clone(),
             });
         }
@@ -153,7 +179,7 @@ pub(crate) fn resolve_with(
             rank: (1, qual.is_some(), i),
             param,
             qual,
-            value,
+            value: Some(value),
             label,
         });
     }
@@ -171,12 +197,31 @@ pub(crate) fn resolve_with(
                 "default"
             }
             .to_string();
+            // What the levels below config give: an alias's "unset" goes back to it.
+            let mut base: Option<(Value, String)> = None;
             for s in settings
                 .iter()
                 .filter(|s| std::ptr::eq(s.param, p) && (s.qual.is_none() || s.qual == slot))
             {
-                value = s.value.clone();
-                source = s.label.clone();
+                if matches!(s.stage, Stage::User(_)) && base.is_none() {
+                    base = Some((value.clone(), source.clone()));
+                }
+                match &s.value {
+                    Some(v) => {
+                        value = v.clone();
+                        source = s.label.clone();
+                    }
+                    None => {
+                        let (v, src) = base.clone().expect("set on entering the user levels");
+                        value = v;
+                        source = format!("{src}; {}", s.label);
+                    }
+                }
+            }
+            if let Some((used, why)) = families::in_use(p, facts, &value) {
+                tracing::warn!("[infr] tuning: `{}` {why} — using {used}", p.key());
+                source = format!("{source}; {why}, so {used} is used");
+                value = used;
             }
             if p.kind != Kind::Fixed {
                 (p.set)(&mut tuning, slot, &value);
@@ -209,7 +254,7 @@ pub(crate) fn resolve_with(
     }
     Ok(Resolved {
         tuning,
-        report: TuningReport::new(facts, rows_report, params),
+        report: TuningReport::new(facts, rows_report, params, !tcfg.rows),
     })
 }
 
@@ -252,7 +297,7 @@ fn row_settings(
                     rank: (row.matcher.fields(), qual.is_some(), index),
                     param,
                     qual,
-                    value,
+                    value: Some(value),
                     label: label.clone(),
                 });
                 set.push(key.clone());

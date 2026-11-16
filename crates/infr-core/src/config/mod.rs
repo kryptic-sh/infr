@@ -271,11 +271,13 @@ cfg_struct! {
     TuningCfg / PartialTuningCfg {
         /// `INFR_TUNE_FILE`: a tuning file of rows in the built-in table's schema, applied above
         /// the built-in rows and below every config, environment and command-line setting. A
-        /// value in it that fails validation is a hard error.
+        /// value in it that fails validation is a hard error. Relative to the config file's folder
+        /// when set in a config file, to the working directory from the environment or `--set`.
         file: Option<PathBuf> = None,
         /// `INFR_TUNE_NO_ROWS` (inverted): apply the built-in table's device-class and device
         /// rows. `false` resolves every parameter from its generic default (and the user's
-        /// settings) alone.
+        /// settings) alone — on AMD's proprietary driver that includes turning off the int8
+        /// coopmat K-quant prefill GEMM and the CU-scaled split-K window, which are rows.
         rows: bool = true,
         /// `INFR_TUNE_DISABLE`: ids of table rows to ignore (built-in or tuning-file rows), so one
         /// suspect row can be switched off without losing the rest.
@@ -903,9 +905,10 @@ pub enum ConfigError {
         /// The repeated path.
         path: String,
     },
-    /// An environment variable held a value the engine rejects LOUDLY today (`INFR_SG`,
-    /// `INFR_SUBMIT_DISPATCHES`, the three multi-GPU device lists). Those keep erroring — that is
-    /// the behaviour being preserved, not an `unwrap_or` (R1).
+    /// An environment variable held a value the engine rejects LOUDLY (`INFR_SG`,
+    /// `INFR_SUBMIT_DISPATCHES`, the three multi-GPU device lists, and `INFR_TUNE`, which was born
+    /// strict). Those keep erroring — that is the behaviour being preserved, not an
+    /// `unwrap_or` (R1).
     #[error("{key}: {message}")]
     Env {
         /// The `INFR_*` variable.
@@ -964,9 +967,9 @@ impl Config {
     /// `Config::default()`.
     ///
     /// That infallibility is exactly why `VulkanBackend::new` and
-    /// `MetalBackend::new` do NOT use this: all five loud keys are `Config`-sourced now, so
+    /// `MetalBackend::new` do NOT use this: all six loud keys are `Config`-sourced, so
     /// swallowing the layer error there would silently drop an `INFR_SG` /
-    /// `INFR_SUBMIT_DISPATCHES` / device-list rejection a caller gets today. They build the same
+    /// `INFR_SUBMIT_DISPATCHES` / device-list / `INFR_TUNE` rejection a caller gets today. They build the same
     /// fold with `ConfigLayer::env()?` instead.
     pub fn load_from_env() -> Config {
         let layer = ConfigLayer::env().unwrap_or_default();

@@ -92,6 +92,16 @@ pub fn parse_str(text: &str, label: &Path) -> Result<(PartialConfig, Vec<String>
     let mut partial = PartialConfig::default();
     let mut warnings = Vec::new();
     walk(&doc, "", &known, &mut partial, &mut warnings)?;
+    // A relative tuning-file path inside a config file names a file beside THAT file, the usual
+    // convention for a path in a config file; `INFR_TUNE_FILE` and `--set` stay relative to the
+    // working directory.
+    if let Some(Some(tf)) = &mut partial.kernels.vulkan.tuning.file {
+        if tf.is_relative() {
+            if let Some(dir) = label.parent().filter(|d| !d.as_os_str().is_empty()) {
+                *tf = dir.join(&*tf);
+            }
+        }
+    }
     super::tune::stamp_layer(&mut partial, super::TuneLevel::Config);
     Ok((partial, warnings))
 }

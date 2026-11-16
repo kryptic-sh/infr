@@ -73,8 +73,8 @@ pub enum Grammar {
 
 /// What a BAD value does in the ENVIRONMENT layer today — which R1 freezes.
 ///
-/// Most keys swallow it (`.and_then(parse).ok().unwrap_or(default)`); five reject it loudly and
-/// must keep doing so. The FILE layer is stricter for everyone: a value that does not parse into
+/// Most keys swallow it (`.and_then(parse).ok().unwrap_or(default)`); six reject it loudly and
+/// must keep doing so (`INFR_TUNE` among them, strict from the day it was added). The FILE layer is stricter for everyone: a value that does not parse into
 /// a known key's type is always a hard error there, which is why `ctx = "banana"` fails to load
 /// from a file while `INFR_CTX=banana` is still silently ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

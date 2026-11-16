@@ -1053,6 +1053,7 @@ fn tune_json(r: &infr_vulkan::tuning::TuningReport) -> serde_json::Value {
         },
         "match": r.match_key(),
         "hash": r.hash(),
+        "rows_off": r.rows_off,
         "rows": r.rows.iter().map(|row| serde_json::json!({
             "id": row.id,
             "level": row.level,

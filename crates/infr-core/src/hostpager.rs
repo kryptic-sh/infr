@@ -193,6 +193,10 @@ pub struct HostPagerStats {
     /// Of those reads, how many went STRAIGHT to the caller because the arena was full
     /// ([`Fill::Streamed`]). `reads - streamed` is what the arena absorbed.
     pub streamed: u64,
+    /// Time spent inside those reads, summed over every reading thread, in nanoseconds. Reads that
+    /// overlap each count in full, so this over-states wall time; `bytes_read` over it is the rate
+    /// one read sees, not the device's.
+    pub read_ns: u64,
 }
 
 /// A fixed-budget host cache of uniform `slot_bytes` blocks, read in place.
@@ -210,6 +214,7 @@ pub struct HostPager {
     reads: AtomicU64,
     bytes_read: AtomicU64,
     streamed: AtomicU64,
+    read_ns: AtomicU64,
 }
 
 impl HostPager {
@@ -242,6 +247,7 @@ impl HostPager {
             reads: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             streamed: AtomicU64::new(0),
+            read_ns: AtomicU64::new(0),
         })
     }
 
@@ -287,6 +293,7 @@ impl HostPager {
             reads: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             streamed: AtomicU64::new(0),
+            read_ns: AtomicU64::new(0),
         })
     }
 
@@ -357,7 +364,17 @@ impl HostPager {
             reads: self.reads.load(Ordering::Relaxed),
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
             streamed: self.streamed.load(Ordering::Relaxed),
+            read_ns: self.read_ns.load(Ordering::Relaxed),
         }
+    }
+
+    /// Read `desc` from the tier below into `dst`, timing it into `read_ns`.
+    fn read_below(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+        let t = std::time::Instant::now();
+        let r = self.io.read_block(desc, dst);
+        let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.read_ns.fetch_add(ns, Ordering::Relaxed);
+        r
     }
 
     /// Bytes this tier's arena occupies.
@@ -451,7 +468,7 @@ impl HostPager {
         // reading. That makes this `&mut` the only reference to these bytes for its whole life,
         // which ends before the state flips to `Ready` below. `len <= slot_bytes` per `register`.
         let dst = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, len), len) };
-        self.io.read_block(&desc, dst)?;
+        self.read_below(&desc, dst)?;
         std::mem::forget(claim);
         let mut inner = self.inner.lock().unwrap();
         inner.state.insert(id, SlotState::Ready);
@@ -538,7 +555,7 @@ impl HostPager {
         let Some(slot) = slot else {
             // Streamed: no arena involvement at all, so no lock and no residency change.
             let n = desc.nbytes();
-            self.io.read_block(&desc, &mut dst[..n])?;
+            self.read_below(&desc, &mut dst[..n])?;
             self.reads.fetch_add(1, Ordering::Relaxed);
             self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
             self.streamed.fetch_add(1, Ordering::Relaxed);
@@ -552,7 +569,7 @@ impl HostPager {
         let n = desc.nbytes();
         // SAFETY: see `pin`'s fill — identical claim, identical proof.
         let arena = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, n), n) };
-        self.io.read_block(&desc, arena)?;
+        self.read_below(&desc, arena)?;
         std::mem::forget(claim);
         let mut inner = self.inner.lock().unwrap();
         inner.state.insert(id, SlotState::Ready);
@@ -619,7 +636,7 @@ impl HostPager {
             }
         };
         let n = desc.nbytes();
-        self.io.read_block(&desc, &mut dst[..n])?;
+        self.read_below(&desc, &mut dst[..n])?;
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
         self.streamed.fetch_add(1, Ordering::Relaxed);

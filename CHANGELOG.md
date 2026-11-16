@@ -8,6 +8,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Breaking
 
+- **Host paging API.** `infr_cpu::paged::plan_pools` takes the model's weights
+  as `Pageable`s (size and read pattern, an expert bank's with its layer)
+  instead of `TensorInfo`s; `PoolPlan` gains a public `experts` field, so struct
+  literals of it must set one; `PagedWeights::pool_stats` returns `PoolReport`s;
+  `infr_core::hostmem::cpu_arena_plan` takes the run's `committed` host bytes;
+  `HostPagerStats` gains `read_ns`. New: `PagedWeights::register_experts` /
+  `pin_expert`, `CpuBackend::paged_experts_weight`,
+  `infr_cpu::q4k_expert_repack_available`, `infr_core::blockio::IO_FANOUT` and
+  `HANDLES_PER_FILE` are public.
+
 - **`infr_server::ChatGenerator::vocab_size`** is a new required method: the
   length of the logits row a `logit_bias` is applied to. The server checks a
   request's `logit_bias` ids against it before generation, so a streaming
@@ -33,19 +43,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   every-tier files from 7 to 520 tokens, and an all-CSA file from 7 to 131
   tokens with a `top_k` of 5, so the top-k drops blocks; at every row of those
   runs infr's indexer keeps the blocks llama.cpp keeps, but for two listed
-  f16-rounding near-ties. Not verified: the shipped DeepSeek-V4-Flash file has
-  never been run (it is larger than this machine's RAM); that it gets past every
-  refusal on the CPU is inferred from its metadata and the synthetic fixtures,
-  not run: some refusals sit after the weight upload and depend on the file's
-  tensors, and no oracle has checked its numbers; nor the top-k selection past
-  131 tokens. The compressed caches default to f16 on the CPU; a quantized KV
-  format applies only when asked for by name and is unverified against the
-  reference, which rotates those rows before quantizing them. Such a session
-  cannot rewind: a prompt that does not extend the previous one exactly
-  re-prefills from the start, as on qwen35. A compressed V4 layer on Vulkan or
-  Metal is refused by name, and V4's prefill runs one token per step. Its
-  compressed caches and compressor state are counted in the KV footprint, the
-  context fit and the `--ctx` clamp.
+  f16-rounding near-ties. The shipped DeepSeek-V4-Flash file (98.6 GB) now runs
+  on the CPU of a 64 GB machine through the host weight arena and generated
+  coherent text for two prompts, but no oracle has checked its numbers
+  (llama.cpp cannot load it there); nor is the top-k selection checked past 131
+  tokens. The compressed caches default to f16 on the CPU; a quantized KV format
+  applies only when asked for by name and is unverified against the reference,
+  which rotates those rows before quantizing them. Such a session cannot rewind:
+  a prompt that does not extend the previous one exactly re-prefills from the
+  start, as on qwen35. A compressed V4 layer on Vulkan or Metal is refused by
+  name, and V4's prefill runs one token per step. Its compressed caches and
+  compressor state are counted in the KV footprint, the context fit and the
+  `--ctx` clamp.
 
 - **`Op::GatherRows` — DeepSeek V4's compressor source gather — on CPU and
   Vulkan, with a Metal kernel.** Gathers f32 rows by i32 index, a column window
@@ -191,6 +200,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The CPU backend pages MoE expert banks per expert, and DeepSeek V4-Flash
+  decodes about 100 times faster from disk.** With a host weight arena
+  (`paging.dram`, or the automatic one when a model does not fit memory) an
+  expert bank is one block per expert, and `Op::MoeFfn` pins only the experts
+  its router picked, all banks' reads in flight at once on threads of their own.
+  A bank used to be one block, so a routed expert read the whole bank. The arena
+  now goes first to the weights every token reads (attention, shared experts,
+  the output head), then to experts; it used to be split by file size, which
+  left most dense weights to be re-read every token. Experts a decode step reads
+  are kept by recency; a prefill chunk that routes to half or more of a bank is
+  inserted at the cold end instead, so a long prompt's chunks keep the resident
+  set rather than each evicting what the next needs (synthetic: 0 hits a chunk
+  before, about 135 of 576 after). On Windows each model file is opened once per
+  concurrent read, because Windows runs a handle's reads one at a time. Measured
+  on `ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S` (98.6 GB, CPU, 12 GB arena,
+  "Hi", 64 GB Windows box): prefill of 5 tokens 147.1 s → 16.2 s, decode 123.3 s
+  → 1.28 s a token; tokens unchanged.
+
 - **DeepSeek V4 prefills in chunks on the CPU backend.** A `deepseek4` prompt
   used to prefill one position per graph, walking every layer's weights (and on
   the real model every routed expert a token picks) once per prompt token; it
@@ -211,9 +238,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   synthetic file's 512-token prefill went from 1589 / 1620 ms to 27.9 / 27.5 ms
   (per-graph overhead, nearly all of it), and one V4-Flash routed-expert layer
   with Q2_K banks costs 0.62-0.63 ms per position in a 1024-row chunk, the
-  default height, against 5.7 ms one position at a time. The shipped file has
-  not been run, so its own gain, mostly expert banks read from disk once per
-  chunk instead of once per token, is not measured.
+  default height, against 5.7 ms one position at a time. On the shipped file a
+  5-token prompt prefills in 16.2 s at a 12 GB host arena, most of it the first
+  read of every dense weight; a long prompt's gain there was not measured.
   `infr_cpu::indexer_tap::IndexerRow` gains `op`, the ordinal of the indexer op
   that scored the row; the new `infr_cpu::op_tap` records each graph's attention
   row counts and embedding gathers for tests, and
@@ -231,7 +258,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   9950X3D: a ratio-4 (CSA) layer at a 64k context went from 57.5 / 57.2 ms to
   1.15 / 1.05 ms per token (indexer 38.8 → 0.39 ms, attention 18.8 → 0.77 ms),
   and at 8k from 7.3 / 7.1 to 0.77 / 0.76 ms; ratio-128 layers and the synthetic
-  file end to end are unchanged within noise. The real file has not been run.
+  file end to end are unchanged within noise. On the shipped file a decode token
+  costs 1.28 s with a 12 GB host arena, nearly all of it expert reads from disk.
   DeepSeek V3.2 emits the same indexer op over whole batches, so its prefill and
   decode take the new scoring and selection too; no V3.2 model was timed.
 
@@ -608,6 +636,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   conversation with tools, and every conversation, respectively, and now render.
 
 ### Fixed
+
+- **The automatic host weight arena no longer starves the machine.** It left an
+  eighth of available memory, so a 98.6 GB model on a box with 43.97 GB
+  available got a 38.47 GB arena and available memory fell to 10957 MB within a
+  minute. It now leaves half of what is available. On the CPU it first prices
+  the run's KV cache, the weights too small to page, an activation reserve and,
+  where the fused Q4_K expert path can fill it, the repack cache
+  (`kernels.cpu.repack_mb`); and a model counts as fitting memory, keeping the
+  mapping, only when its weights fit beside that same run memory. The same
+  V4-Flash run now takes a 21.6 GB arena; available memory stayed above 19 GB
+  over a 48-token generation. `INFR_DRAM_CACHE` still names a size outright.
+- **The GPU backends' automatic host tier is smaller on a machine short of
+  memory.** The same half rule sizes the DRAM tier under Vulkan dense streaming
+  and the paged MoE cache (`paging.dram` unset), so where little memory is
+  available that tier is about half the size it was: on a 16 GB machine with 9
+  GB available, about 4.5 GB instead of about 7.9 GB. Measured with those two
+  budgets forced on Qwen3-30B-A3B Q4_K_M (RX 7900 XTX, `paging.cache` 2 GiB, 41
+  tokens): decode 7.96 → 7.53 tokens/s, host-tier hit rate 53-55% → 37-39%.
+  Where the model's expert banks fit within half of what is available (this 64
+  GB box), nothing changes.
+- **DeepSeek V4's tokenizer matches llama.cpp.**
+  `tokenizer.ggml.pre = "joyai-llm"` had no mapping, so infr warned and split
+  with the GPT-2 regex; it now uses the DeepSeek V3 regex list llama.cpp gives
+  it, and twelve adversarial strings tokenize to `llama-tokenize`'s ids.
 
 - **A prefill chunk is never taller than the session's sliding-window ring.** A
   window layer's ring holds the window plus the prefill chunk height the session

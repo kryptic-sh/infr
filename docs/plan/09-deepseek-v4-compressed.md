@@ -551,8 +551,8 @@ has. For bisecting, `llama-debug --verbose` prints sums of `hca_state_compress`,
 File: `ggml-org/DeepSeek-V4-Flash-0731-GGUF` Q2_K_S, 98.6 GB (the one infr has
 opened). Smaller published files exist (`unsloth` UD-IQ1_S 82.5 GB; a 60.8 GB
 "Fractal" repack) whose tensor types infr may not load **[U]**. On 64 GB of RAM
-the file is read through the page cache: expect a per-token infr run of a
-300-token prompt to take minutes **[I]**.
+infr reads it through its host weight arena, one routed expert at a time: 1.28 s
+a decode token with a 12 GB arena (measured 2026-11-16, backlog B-DSV4-REAL).
 
 **The Q2_K_S file does not load in llama.cpp on this box (2026-11-16).** Three
 `llama-debug --save-logits -ngl 0` runs on the 98.6 GB file with 61.6 GB of RAM,
@@ -850,9 +850,10 @@ graph fails. The breaks below were joined by: no ring cap (the ring test), each
 cancel guard alone (its own assertion in the cancel test), the V4 gate off
 (every layout's chunked test, by its graph heights), no in-graph gather (the
 gathered-embedding case), no memory bound (the bound test), no int8 activations
-(the quantized-bank test, which requires a difference). The real file's gain is
-the expert banks streamed once per chunk instead of once per routing token; not
-measured, since the file has not been run.
+(the quantized-bank test, which requires a difference). The real file now runs
+(backlog B-DSV4-REAL): a 5-token prompt prefills in 16.2 s with a 12 GB arena,
+most of it the first read of every dense weight; the chunking gain on a long
+prompt there was not measured.
 
 **Left on one position per graph:** every GPU backend (a ratio-0 V4 file on
 Vulkan; the compressed tiers are refused there), decode, and a suffix of at most

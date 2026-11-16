@@ -26,16 +26,24 @@ pub fn available_bytes() -> Option<u64> {
 }
 
 /// Never take the last of the machine's memory: the larger of this and [`HEADROOM_FRACTION`] of
-/// what is available is left alone.
-///
-/// The arena is not the only thing the run needs host memory for — the pinned staging ring, the
-/// CPU backend's activations, the tokenizer, and whatever else shares the box. A fixed floor
-/// matters on small hosts where a fraction rounds to nothing.
+/// what is available is left alone, on top of what the caller says the run will hold besides the
+/// arena (`committed`). A fixed floor matters on small hosts where a fraction rounds to nothing.
 const HEADROOM_MIN: u64 = 1 << 30;
 
-/// The share of available memory left unclaimed on a large host, where a 1 GiB floor would be
-/// negligible. Reciprocal — `available / HEADROOM_FRACTION`.
-const HEADROOM_FRACTION: u64 = 8;
+/// The share of available memory an automatic arena leaves to everything else on the machine.
+/// Reciprocal — `available / HEADROOM_FRACTION`.
+///
+/// Half, because the arena is anonymous memory the OS cannot reclaim, and what it buys flattens
+/// well before it takes everything: a dense model's arena only has to outlast the mapped sweep it
+/// replaces, and a MoE model's expert hit rate grows far slower than the slots added to it. What
+/// the rest of the machine loses does not flatten. The rule this replaced kept an eighth: on the
+/// Windows box, with 43.97 GB available, it sized a 38.47 GB arena for DeepSeek V4-Flash, and
+/// available memory fell from 42109 MB to 10957 MB within a minute, where a watchdog stopped the
+/// run. A fixed margin would not scale instead: the test guard's
+/// `UNIFIED_HOST_MARGIN` (`infr-llama/tests/cpu_backend.rs`) is what a shared development box owes
+/// its other sessions, and as a floor it would turn the tier off on any host with less than that
+/// available. On that box half is the larger of the two.
+const HEADROOM_FRACTION: u64 = 2;
 
 /// Below this an arena is not worth building: the tier costs a copy per streamed block, and a
 /// budget this small holds so little of a model that the hit rate cannot pay for it.
@@ -131,6 +139,14 @@ impl Requested {
 ///
 /// `explicit` (the user's `paging.dram`) always wins, including on unified memory: forcing this
 /// path on hardware that would not choose it is how it gets tested at all.
+///
+/// The automatic size is the same half-of-available rule as the CPU's, with nothing committed
+/// (the KV cache lives in VRAM). Deliberately the same: what the rule protects against is the
+/// arena itself, anonymous memory the OS cannot reclaim, and a GPU run's arena is that just as
+/// much as a CPU run's. What it costs was measured on 2026-11-16 on Qwen3-30B-A3B Q4_K_M, RX
+/// 7900 XTX (`paging.cache` 2 GiB, 41 decoded tokens): the arenas the old eighth rule and this one
+/// would size on a machine with 9 GB available, forced by `INFR_DRAM_CACHE`, decoded at 7.96 and
+/// 7.53 tokens/s with host-tier hit rates of 53-55% and 37-39%.
 pub fn streaming_arena_plan(
     explicit: Requested,
     available: Option<u64>,
@@ -164,7 +180,32 @@ pub fn streaming_arena_plan(
 /// The extra rung over [`streaming_arena_plan`] is [`Skip::Fits`]: when the weights fit, the mmap
 /// path is zero-copy and an arena could only add copies, so paging a model that fits would be a
 /// regression. `explicit` still wins over that test in both directions.
-pub fn cpu_arena_plan(explicit: Requested, available: Option<u64>, pageable: u64) -> ArenaPlan {
+///
+/// `committed` is the host memory the run will hold besides the arena — its KV cache, the weights
+/// that stay mapped, its activations. Both automatic decisions count it the same way:
+///
+/// - **Fits** when `pageable + committed <= available`: the page cache can then hold every weight
+///   beside the run's own memory. The mapping needs no headroom on top, because page-cache pages
+///   are reclaimable — the OS takes them back from the run under pressure, which it cannot do with
+///   an arena.
+/// - **Otherwise an arena** of [`auto_arena_bytes`]' size, which leaves half of what is available
+///   untouched, since an arena is anonymous memory nobody can reclaim.
+///
+/// That makes the step at the boundary deliberate: a model a little too big for memory goes from
+/// the whole page cache to an arena of about half of what is available. The page cache does not
+/// degrade gently there — on a cyclic sweep a recency-evicting cache that is short by a little
+/// misses on nearly every block (`docs/perf/results.md` measured decode 23-33x slower) — while an
+/// arena with a cold-end insert keeps its share of the weights resident whatever its size, so the
+/// smaller arena should still be the faster side (inferred from those two behaviours, not measured
+/// at the boundary); and sizing it up to most of the machine near the
+/// boundary is the starvation the half rule exists to prevent. An explicit budget is not reduced
+/// by `committed`.
+pub fn cpu_arena_plan(
+    explicit: Requested,
+    available: Option<u64>,
+    committed: u64,
+    pageable: u64,
+) -> ArenaPlan {
     match explicit {
         Requested::Fixed(b) => return ArenaPlan::Take(b),
         Requested::Off => return ArenaPlan::Skip(Skip::Disabled),
@@ -177,10 +218,10 @@ pub fn cpu_arena_plan(explicit: Requested, available: Option<u64>, pageable: u64
     let Some(available) = available else {
         return ArenaPlan::Skip(Skip::NoProbe);
     };
-    if pageable <= available {
+    if pageable.saturating_add(committed) <= available {
         return ArenaPlan::Skip(Skip::Fits);
     }
-    match auto_arena_bytes(available, 0, pageable) {
+    match auto_arena_bytes(available, committed, pageable) {
         0 => ArenaPlan::Skip(Skip::TooLittle),
         n => ArenaPlan::Take(n),
     }
@@ -205,11 +246,45 @@ mod tests {
         }
     }
 
-    /// On a large host the fraction is what binds, not the floor.
+    /// On a large host the fraction is what binds, not the floor: half of what is available is
+    /// left alone.
     #[test]
     fn a_large_host_leaves_the_fraction() {
         let avail = 64 * GIB;
-        assert_eq!(auto_arena_bytes(avail, 0, u64::MAX), avail - avail / 8);
+        assert_eq!(auto_arena_bytes(avail, 0, u64::MAX), 32 * GIB);
+    }
+
+    /// The rule by hand, on the figures that motivated it and at both ends of the scale.
+    ///
+    /// - The Windows box running DeepSeek V4-Flash: 43.97 GB available and 98.54 GB pageable. Half
+    ///   is left (21.985 GB), and a 1 GiB `committed` comes off the rest: 43.97e9 - 21.985e9 -
+    ///   1073741824 = 20911258176 bytes. The rule this replaced answered 38.47 GB here.
+    /// - 4 GiB available: half (2 GiB) beats the 1 GiB floor, so 2 GiB is the arena.
+    /// - 1.5 GiB available: half is 0.75 GiB, below the floor, so 1 GiB is left and 0.5 GiB taken.
+    /// - 1.2 GiB available: the floor leaves 0.2 GiB, under `MIN_USEFUL`, so no arena.
+    #[test]
+    fn the_budget_by_hand() {
+        assert_eq!(
+            auto_arena_bytes(43_970_000_000, GIB, 98_540_000_000),
+            20_911_258_176
+        );
+        assert_eq!(auto_arena_bytes(4 * GIB, 0, u64::MAX), 2 * GIB);
+        assert_eq!(auto_arena_bytes(3 * GIB / 2, 0, u64::MAX), GIB / 2);
+        assert_eq!(auto_arena_bytes(6 * GIB / 5, 0, u64::MAX), 0);
+        // The CPU plan passes its committed bytes through; an explicit budget ignores them.
+        assert_eq!(
+            cpu_arena_plan(Requested::Auto, Some(43_970_000_000), GIB, 98_540_000_000),
+            ArenaPlan::Take(20_911_258_176)
+        );
+        assert_eq!(
+            cpu_arena_plan(
+                Requested::Fixed(12 * GIB),
+                Some(43_970_000_000),
+                40 * GIB,
+                u64::MAX
+            ),
+            ArenaPlan::Take(12 * GIB)
+        );
     }
 
     /// Unified memory: the VRAM budget comes out of the same RAM, so it must reduce the arena
@@ -240,11 +315,14 @@ mod tests {
         let forced = Requested::Fixed(3 * GIB);
         // CPU: a model that comfortably fits is still paged when asked.
         assert_eq!(
-            cpu_arena_plan(forced, Some(64 * GIB), GIB),
+            cpu_arena_plan(forced, Some(64 * GIB), 0, GIB),
             ArenaPlan::Take(3 * GIB)
         );
         // ...and with no probe at all.
-        assert_eq!(cpu_arena_plan(forced, None, GIB), ArenaPlan::Take(3 * GIB));
+        assert_eq!(
+            cpu_arena_plan(forced, None, 0, GIB),
+            ArenaPlan::Take(3 * GIB)
+        );
         // Streaming tiers: honoured on unified memory, which auto-sizing declines.
         assert_eq!(
             streaming_arena_plan(forced, Some(64 * GIB), true, 40 * GIB),
@@ -263,7 +341,7 @@ mod tests {
     fn a_zero_budget_is_the_off_switch() {
         assert_eq!(Requested::from_config(Some(0), false), Requested::Off);
         assert_eq!(
-            cpu_arena_plan(Requested::Off, Some(GIB), 200 * GIB),
+            cpu_arena_plan(Requested::Off, Some(GIB), 0, 200 * GIB),
             ArenaPlan::Skip(Skip::Disabled)
         );
         assert_eq!(
@@ -291,12 +369,32 @@ mod tests {
     #[test]
     fn a_model_that_fits_is_not_paged() {
         assert_eq!(
-            cpu_arena_plan(Requested::Auto, Some(64 * GIB), 8 * GIB),
+            cpu_arena_plan(Requested::Auto, Some(64 * GIB), 0, 8 * GIB),
             ArenaPlan::Skip(Skip::Fits)
         );
         // Exactly fitting still counts as fitting.
         assert_eq!(
-            cpu_arena_plan(Requested::Auto, Some(8 * GIB), 8 * GIB),
+            cpu_arena_plan(Requested::Auto, Some(8 * GIB), 0, 8 * GIB),
+            ArenaPlan::Skip(Skip::Fits)
+        );
+    }
+
+    /// The fit test counts `committed` as the budget does: at the boundary and one byte either side
+    /// of it, and the size of the step from the mapping to an arena there. 10 GiB available with
+    /// 1 GiB committed: 9 GiB of weights fit; one byte more does not, and gets the half rule's
+    /// arena, 10 - 5 - 1 = 4 GiB.
+    #[test]
+    fn the_fit_boundary_counts_committed_memory() {
+        let (avail, committed) = (10 * GIB, GIB);
+        let plan = |pageable| cpu_arena_plan(Requested::Auto, Some(avail), committed, pageable);
+        assert_eq!(plan(9 * GIB - 1), ArenaPlan::Skip(Skip::Fits));
+        assert_eq!(plan(9 * GIB), ArenaPlan::Skip(Skip::Fits));
+        assert_eq!(plan(9 * GIB + 1), ArenaPlan::Take(4 * GIB));
+        // Weights that fit only if the run's own memory is ignored do not fit.
+        assert_eq!(plan(10 * GIB), ArenaPlan::Take(4 * GIB));
+        // With nothing committed the boundary is the available memory itself.
+        assert_eq!(
+            cpu_arena_plan(Requested::Auto, Some(avail), 0, avail),
             ArenaPlan::Skip(Skip::Fits)
         );
     }
@@ -304,7 +402,7 @@ mod tests {
     /// Requirement two: a model that does NOT fit streams, without being asked to.
     #[test]
     fn a_model_that_does_not_fit_streams() {
-        match cpu_arena_plan(Requested::Auto, Some(32 * GIB), 200 * GIB) {
+        match cpu_arena_plan(Requested::Auto, Some(32 * GIB), 0, 200 * GIB) {
             ArenaPlan::Take(n) => assert!(n > 0 && n < 32 * GIB, "implausible budget {n}"),
             other => panic!("an over-sized model must stream, got {other:?}"),
         }
@@ -343,7 +441,7 @@ mod tests {
     #[test]
     fn no_probe_is_distinct_from_fitting() {
         assert_eq!(
-            cpu_arena_plan(Requested::Auto, None, 200 * GIB),
+            cpu_arena_plan(Requested::Auto, None, 0, 200 * GIB),
             ArenaPlan::Skip(Skip::NoProbe)
         );
         assert_eq!(

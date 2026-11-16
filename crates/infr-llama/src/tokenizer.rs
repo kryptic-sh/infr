@@ -282,7 +282,7 @@ pub(crate) fn tokenizer_from_metadata(md: &Metadata) -> Result<Tokenizer> {
     // Isolated splits reproduce llama.cpp's sequential application).
     // The sequences below follow llama.cpp's `src/llama-vocab.cpp` verbatim.
     //
-    // llama.cpp additionally sets `clean_spaces = false` for all three DeepSeek pre-types. Nothing
+    // llama.cpp additionally sets `clean_spaces = false` for the DeepSeek pre-types. Nothing
     // is needed here to match that: `clean_spaces` is read in exactly one place, the DETOKENIZER
     // (`llama_vocab::impl::detokenize`), where it drops the space before `?!.,`, strips a lone
     // apostrophe between spaces, and closes up `'s`/`'m`/`'re`/`'ve`. It never runs during
@@ -298,7 +298,11 @@ pub(crate) fn tokenizer_from_metadata(md: &Metadata) -> Result<Tokenizer> {
             let seq = build_multi_split_seq(DEEPSEEK_CODER_PRE_RES.as_slice())?;
             tok.with_pre_tokenizer(Some(seq));
         }
-        "deepseek-v3" => {
+        // llama.cpp gives `joyai-llm` (DeepSeek V4's vocabulary) the `DEEPSEEK3_LLM` regex list
+        // itself — one `case` arm in `llm_tokenizer_bpe` — and `clean_spaces = false` like the
+        // DeepSeek types. That arm also serves `hunyuan-dense` and `hy_v4`; those are not mapped
+        // here, because no file with either was at hand to check ids against.
+        "deepseek-v3" | "joyai-llm" => {
             let seq = build_multi_split_seq(DEEPSEEK_V3_PRE_RES.as_slice())?;
             tok.with_pre_tokenizer(Some(seq));
         }
@@ -995,6 +999,103 @@ mod tokenizer_tests {
         assert_eq!(ids("llama-bpe"), [4]);
         assert_eq!(ids("dbrx"), [3, 2]);
         assert_eq!(ids("glm4"), [3, 2]);
+    }
+
+    /// DeepSeek V4's vocabulary (`tokenizer.ggml.pre = "joyai-llm"`) tokenizes as llama.cpp does:
+    /// the ids `llama-tokenize -f <file> --ids --no-bos --no-escape` (vocabulary only) printed for
+    /// each string with llama.cpp `5676dfbe0`. Covers whitespace runs, tabs and newlines, CJK,
+    /// accented Latin, kana and Hangul, digit runs, code with CRLF, punctuation runs and
+    /// contractions, non-ASCII spaces and letterlike symbols, fullwidth forms, emoji with a
+    /// skin-tone modifier and ZWJ sequences, and the chat template's control tokens.
+    ///
+    /// Reads only the metadata of the split file's small first shard; ignored because it needs
+    /// that file in the HF cache.
+    #[test]
+    #[ignore = "needs ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S in the HF cache"]
+    fn deepseek_v4_tokenizes_as_llama_cpp() {
+        let Some(path) = crate::util::test_hub_gguf(
+            "ggml-org/DeepSeek-V4-Flash-0731-GGUF",
+            "DeepSeek-V4-Flash-0731-Q2_K_S-00001-of-00002.gguf",
+        ) else {
+            eprintln!("skip: DeepSeek-V4-Flash-0731 Q2_K_S not in the HF cache");
+            return;
+        };
+        let g = Gguf::open(&path).expect("open the V4 GGUF");
+        assert_eq!(g.metadata().str("tokenizer.ggml.pre"), Some("joyai-llm"));
+        let tok = build_tokenizer(&g).expect("V4 tokenizer");
+        let cases: &[(&str, &[u32])] = &[
+            ("Hello world", &[19923, 2058]),
+            (
+                "  leading spaces,   inner   runs\tand\ttabs\n\nnewlines\n",
+                &[
+                    223, 6646, 13564, 14, 262, 11544, 262, 12122, 200, 458, 17299, 10284, 271,
+                    2839, 12678, 201,
+                ],
+            ),
+            (
+                "北京是中国的首都，它的历史悠久。",
+                &[6127, 389, 17607, 41175, 303, 8301, 126466, 320],
+            ),
+            (
+                "Ünïcödé café naïve — 日本語のテキスト 한국어 🙂",
+                &[
+                    52526, 80, 16709, 69, 54879, 619, 57664, 112752, 2136, 223, 88768, 1576, 17383,
+                    20367, 24552, 51345, 9227, 68139,
+                ],
+            ),
+            (
+                "3.14159 + 2024-11-16 = 1234567890; x=-0.5e-3",
+                &[
+                    21, 16, 9926, 3318, 940, 223, 939, 22, 15, 779, 15, 926, 438, 223, 6895, 18009,
+                    25744, 18, 29, 1527, 19042, 18, 16, 23, 71, 15, 21,
+                ],
+            ),
+            (
+                "def f(x):\n    return x*2  # ok!!!\r\n",
+                &[
+                    3465, 285, 4042, 3395, 361, 1354, 1527, 12, 20, 223, 1823, 9109, 34513, 204,
+                    201,
+                ],
+            ),
+            (
+                "<｜User｜>Hi<｜Assistant｜></think>",
+                &[128803, 23166, 128804, 128822],
+            ),
+            (
+                "!!!???...,,,;;; :-) (a)[b]{c} \"q\" 'it's' don't I'm",
+                &[
+                    34513, 50640, 27658, 18005, 25074, 29, 47138, 11, 343, 67, 12696, 68, 33188,
+                    69, 95, 582, 83, 4, 905, 279, 734, 9, 2090, 1664, 342, 4571,
+                ],
+            ),
+            (
+                "a \u{a0}. b ℹ℺ℿ",
+                &[67, 223, 2162, 16, 291, 14508, 120, 10419, 121, 10419, 126],
+            ),
+            (
+                "ｆｕｌｌｗｉｄｔｈ ＡＢＣ　全角カタカナ ひらがな",
+                &[
+                    5879, 231, 5879, 246, 5879, 237, 5879, 237, 5879, 248, 125567, 5879, 229,
+                    127088, 5879, 233, 223, 65503, 102530, 78665, 18524, 984, 2877, 15961, 11767,
+                    15961, 27071, 223, 40259, 4970, 2936, 2942,
+                ],
+            ),
+            (
+                "ok 👍🏽 family 👨\u{200d}👩\u{200d}👧!",
+                &[
+                    633, 102527, 40965, 124, 3096, 52780, 104, 46088, 25730, 105, 46088, 25730,
+                    103, 3,
+                ],
+            ),
+            ("Hi", &[23166]),
+        ];
+        for (text, want) in cases {
+            assert_eq!(
+                tok.encode(*text, false).expect("encode").get_ids(),
+                *want,
+                "infr and llama.cpp tokenize {text:?} differently"
+            );
+        }
     }
 
     // Validate the GGUF-derived tokenizer against the HF tokenizer.json sidecar (same model).

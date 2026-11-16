@@ -9,6 +9,8 @@
 //! the GPU backends are validated against.
 #![allow(clippy::needless_range_loop)]
 
+mod attn_kv;
+mod indexer;
 #[doc(hidden)]
 pub mod indexer_tap;
 pub mod kvquant;
@@ -512,11 +514,6 @@ pub(crate) fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
         other => dequant_block(other, bytes).expect("cpu backend: host dequant"),
     }
 }
-
-/// Elements of the f16 KV prefix one pool task widens to f32 in `Op::Attention`: large enough
-/// that a task outweighs its claim, small enough to spread a few-thousand-row prefix over
-/// every thread.
-const KV_WIDEN_CHUNK: usize = 1 << 14;
 
 /// Fewest weight rows a single-token `Op::Linear` task claims: a row's dot is well under a
 /// microsecond, so fewer would make the shared task cursor the bottleneck.
@@ -1910,54 +1907,25 @@ impl Backend for CpuBackend {
                     // kv_len <= cap_rows and everything below is the old identity indexing.
                     let cap_rows = g.desc(k_cache).numel() / (nkv * hd).max(1);
                     let need = kv_len.min(cap_rows) * nkv * hd;
-                    let mut deq = |b: &[u8], dt: DType, need: usize| -> Vec<f32> {
-                        match dt {
-                            // The f16 cache (the default) widens across the pool with the
-                            // hardware conversion rather than serially per element on this
-                            // thread. Widening is exact, so the values are the same either way.
-                            DType::F16 => {
-                                use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
-                                let src: &[half::f16] =
-                                    bytemuck::cast_slice::<u8, u16>(b)[..need].reinterpret_cast();
-                                let mut dst = rc.for_overwrite(need);
-                                self.pool().for_chunks_mut(
-                                    &mut dst,
-                                    KV_WIDEN_CHUNK,
-                                    1,
-                                    &|c, piece| {
-                                        let s0 = c * KV_WIDEN_CHUNK;
-                                        src[s0..s0 + piece.len()].convert_to_f32_slice(piece);
-                                    },
-                                );
-                                dst
-                            }
-                            DType::Q8_0 => crate::dequant_prefix_q8_0(b, need),
-                            // TurboQuant blocks store the WHT-rotated values; dequant + inverse WHT
-                            // recovers the original domain so the f32 SDPA below runs unchanged.
-                            dt @ (DType::Turbo2 | DType::Turbo3 | DType::Turbo4) => {
-                                crate::turbo::dequant_prefix_orig(dt, b, need)
-                            }
-                            // bf16 + mainline low-bit quants: dequant the block-aligned prefix via the
-                            // shared GGUF dequant (only the valid `kv_len` rows, not the whole cache).
-                            DType::Bf16
-                            | DType::Q4_0
-                            | DType::Q4_1
-                            | DType::Q5_0
-                            | DType::Q5_1
-                            | DType::Iq4Nl => {
-                                let pb = infr_gguf::nbytes(dt, need);
-                                infr_gguf::dequant::dequant_block(dt, &b[..pb])
-                                    .expect("cpu backend: KV dequant")
-                            }
-                            _ => bytemuck::cast_slice::<u8, f32>(b)[..need].to_vec(),
-                        }
-                    };
                     // One guard at a time: an owned buffer's guard is a non-reentrant mutex, and a
                     // cache that serves as both K and V (deepseek4, whose attention reads its K
                     // rows as V) binds one buffer to both sides. That pair is dequantized once.
-                    let ks = deq(&cpu_buf(kbuf).read(), g.desc(k_cache).dtype, need);
-                    let vs_own = (v_cache != k_cache)
-                        .then(|| deq(&cpu_buf(vbuf).read(), g.desc(v_cache).dtype, need));
+                    let ks = attn_kv::kv_prefix_f32(
+                        self.pool(),
+                        &mut rc,
+                        &cpu_buf(kbuf).read(),
+                        g.desc(k_cache).dtype,
+                        need,
+                    );
+                    let vs_own = (v_cache != k_cache).then(|| {
+                        attn_kv::kv_prefix_f32(
+                            self.pool(),
+                            &mut rc,
+                            &cpu_buf(vbuf).read(),
+                            g.desc(v_cache).dtype,
+                            need,
+                        )
+                    });
                     let vs: &[f32] = vs_own.as_deref().unwrap_or(&ks);
                     // DeepSeek V4's compressed segment (`None` everywhere else): its first `len`
                     // rows, which serve as both its keys and its values, and its optional
@@ -1966,13 +1934,19 @@ impl Backend for CpuBackend {
                         let cbuf = bindings
                             .get(c.cache)
                             .expect("cpu backend: unbound compressed cache");
-                        let rows_c = deq(
+                        let bias = c.bias.map(|b| &vals[b.0 as usize][..]);
+                        let seg = attn_kv::comp_rows(
+                            self.pool(),
+                            &mut rc,
                             &cpu_buf(cbuf).read(),
                             g.desc(c.cache).dtype,
-                            c.len as usize * nkv * hd,
+                            nkv * hd,
+                            bias,
+                            rows,
+                            pos,
+                            c,
                         );
-                        let bias = c.bias.map(|b| &vals[b.0 as usize][..]);
-                        (rows_c, bias, c)
+                        (seg, bias, c)
                     });
                     // Per-head attention sinks (V4's `attn_sinks`, `None` everywhere else): one
                     // extra logit per head in the max AND the denominator, never in the numerator.
@@ -2014,12 +1988,15 @@ impl Backend for CpuBackend {
                             }
                         };
                         let n_keys = hi - lo;
-                        // Visible compressed keys, scored after the raw ones in the same buffer
-                        // so one max, one denominator and one weighted sum cover both (the
-                        // reference's concatenated `[raw | compressed]` attention).
-                        let n_comp = cs.as_ref().map_or(0, |(_, _, c)| {
-                            infr_core::graph::comp_visible(abs as u32, c.ratio, c.len) as usize
-                        });
+                        // The compressed keys that can carry weight, scored after the raw ones in
+                        // the same buffer so one max, one denominator and one weighted sum cover
+                        // both (the reference's concatenated `[raw | compressed]` attention). A
+                        // key the bias sets to `-inf` is not scored at all: its exponential is
+                        // exactly 0, so leaving it out of the max, the denominator and the sum
+                        // changes none of them — llama.cpp's flash attention skips it the same
+                        // way.
+                        let kept_j: &[u32] = cs.as_ref().map_or(&[], |(seg, _, _)| &seg.keys[ti]);
+                        let n_comp = kept_j.len();
                         let mut sc = vec![0f32; n_keys + n_comp];
                         let (sc_raw, sc_comp) = sc.split_at_mut(n_keys);
                         let mut mx = f32::NEG_INFINITY;
@@ -2064,25 +2041,26 @@ impl Backend for CpuBackend {
                             }
                             mx = mx.max(*scj);
                         }
-                        // Compressed block `j` is row `j`: no ring, the cache holds every block.
-                        let crow = |j: usize| {
-                            let rows_c = &cs.as_ref().expect("n_comp > 0 implies comp").0;
-                            let kb = (j * nkv + kvh) * hd;
-                            &rows_c[kb..kb + hd]
+                        // Compressed block `j` is the cache's row `j`: no ring, the cache holds
+                        // every block. Only the rows some query keeps were converted, at their
+                        // `slot`.
+                        let crow = |j: u32| {
+                            let seg = &cs.as_ref().expect("n_comp > 0 implies comp").0;
+                            seg.row(j, kvh, hd, nkv)
                         };
                         let (cquads, ctail) = sc_comp.as_chunks_mut::<KEYS>();
-                        for (qi, quad) in cquads.iter_mut().enumerate() {
-                            *quad = dot_n(qrow, std::array::from_fn(|i| crow(qi * KEYS + i)));
+                        let (kquads, ktail) = kept_j.as_chunks::<KEYS>();
+                        for (quad, js) in cquads.iter_mut().zip(kquads) {
+                            *quad = dot_n(qrow, js.map(crow));
                         }
-                        let ctail_lo = n_comp - ctail.len();
-                        for (i, scj) in ctail.iter_mut().enumerate() {
-                            *scj = dot(qrow, crow(ctail_lo + i));
+                        for (scj, &j) in ctail.iter_mut().zip(ktail) {
+                            *scj = dot(qrow, crow(j));
                         }
                         let cbias = cs.as_ref().and_then(|(_, b, c)| b.map(|b| (b, c.len)));
-                        for (j, scj) in sc_comp.iter_mut().enumerate() {
+                        for (scj, &j) in sc_comp.iter_mut().zip(kept_j) {
                             *scj *= scale;
                             if let Some((b, len)) = cbias {
-                                *scj += b[ti * len as usize + j];
+                                *scj += b[ti * len as usize + j as usize];
                             }
                             mx = mx.max(*scj);
                         }
@@ -2114,7 +2092,7 @@ impl Backend for CpuBackend {
                             }
                         }
                         // A compressed key's value row is its key row.
-                        for (j, &e) in e_comp.iter().enumerate() {
+                        for (&e, &j) in e_comp.iter().zip(kept_j) {
                             let p = e / l;
                             for (o, &v) in ob_slice.iter_mut().zip(crow(j)) {
                                 *o = v.mul_add(p, *o);
@@ -2153,8 +2131,8 @@ impl Backend for CpuBackend {
                     if let Some(vs) = vs_own {
                         rc.give(vs);
                     }
-                    if let Some((rows_c, _, _)) = cs {
-                        rc.give(rows_c);
+                    if let Some((seg, _, _)) = cs {
+                        rc.give(seg.rows);
                     }
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
@@ -3665,63 +3643,35 @@ impl Backend for CpuBackend {
                          is {kv_len} — a wrapped indexer cache has already lost keys this op must \
                          score"
                     );
-                    let need = kv_len * hd;
-                    let ks = dequant_cache_prefix(&kguard, g.desc(k_cache).dtype, need);
+                    // Causal: a key whose block the query has not completed is not eligible
+                    // (with one position per key, any key past the query's own position), and
+                    // the cache holds only kv_len keys. Only the eligible prefix is scored or
+                    // read — nothing reads the rest.
+                    let his: Vec<usize> = (0..rows)
+                        .map(|ti| ((pos + ti + 1) / block_ratio).min(kv_len))
+                        .collect();
+                    let n_read = his.iter().copied().max().unwrap_or(0) * hd;
+                    let kdt = g.desc(k_cache).dtype;
+                    let wide_keys;
+                    let keys = if kdt == DType::F16 {
+                        use half::slice::HalfBitsSliceExt;
+                        indexer::Keys::F16(
+                            bytemuck::cast_slice::<u8, u16>(&kguard)[..n_read].reinterpret_cast(),
+                        )
+                    } else {
+                        wide_keys = dequant_cache_prefix(&kguard, kdt, n_read);
+                        indexer::Keys::F32(&wide_keys)
+                    };
+                    // Split across the pool by keys, so that one decode row scores on every core.
+                    let sc = indexer::score(self.pool(), qs, ws, keys, nh, hd, scale, &his);
                     let mut out = vec![0f32; rows * top_k];
                     let tap = indexer_tap::active().then(|| std::sync::Mutex::new(Vec::new()));
                     self.pool()
                         .for_chunks_mut(&mut out, top_k, 1, &|ti, slots| {
-                            // Causal: a key whose block the query has not completed is not
-                            // eligible (with one position per key, any key past the query's own
-                            // position), and the cache holds only kv_len keys.
-                            let hi = ((pos + ti + 1) / block_ratio).min(kv_len);
-                            // score[j] = Σ_h (w[t,h] * scale) * relu(q[t,h] · k[j]), the head sum in
-                            // ASCENDING h (ggml_sum_rows' order over the contiguous head axis). Only
-                            // the eligible prefix is computed — nothing reads the rest.
-                            let mut sc = vec![0f32; hi];
-                            for (j, s) in sc.iter_mut().enumerate() {
-                                let kb = j * hd;
-                                let mut acc = 0f32;
-                                for h in 0..nh {
-                                    let qo = (ti * nh + h) * hd;
-                                    let d = crate::kernels::dot(&qs[qo..qo + hd], &ks[kb..kb + hd]);
-                                    acc += (ws[ti * nh + h] * scale) * d.max(0.0);
-                                }
-                                *s = acc;
-                            }
-                            // Select top_k by (eligible first, score DESC, index ASC). Scanning `j`
-                            // ascending and taking only a STRICTLY better candidate is what makes the
-                            // tie-break the lower index — the same rule as `Op::Argmax`.
-                            let mut taken = vec![false; kv_len];
-                            for slot in slots.iter_mut() {
-                                let mut bi = usize::MAX;
-                                for j in 0..kv_len {
-                                    if taken[j] {
-                                        continue;
-                                    }
-                                    let better = match (j < hi, bi < hi) {
-                                        // Nothing chosen yet.
-                                        _ if bi == usize::MAX => true,
-                                        // An eligible key outranks every ineligible one.
-                                        (true, false) => true,
-                                        (false, true) => false,
-                                        // Both eligible: strictly higher score wins (a tie keeps the
-                                        // lower index, which `bi` already holds).
-                                        (true, true) => sc[j] > sc[bi],
-                                        // Both ineligible: index order, so `bi` keeps it.
-                                        (false, false) => false,
-                                    };
-                                    if better {
-                                        bi = j;
-                                    }
-                                }
-                                taken[bi] = true;
-                                // i32 index carried as a u32 bit pattern in the f32 slot — the same
-                                // convention `Op::Argmax` uses for a token id.
-                                *slot = f32::from_bits(bi as u32);
-                            }
+                            let row: Vec<f32> = (0..his[ti]).map(|j| sc[j * rows + ti]).collect();
+                            indexer::select_top_k(&row, slots);
                             if let Some(tap) = &tap {
-                                tap.lock().expect("indexer tap lock").push((ti, sc));
+                                tap.lock().expect("indexer tap lock").push((ti, row));
                             }
                         });
                     if let Some(tap) = tap {

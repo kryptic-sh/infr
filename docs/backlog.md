@@ -1419,39 +1419,67 @@ and parity-tested on CPU + Vulkan (and typechecked on Metal). What is left:
   a real V4 GGUF turns out to use a small eps, a backend that dropped the
   over-dst eps would pass every test here. Same blocker: the real file's eps.
 
-### B-DSV4-CPU-PERF — the CPU CSA tier computes what the top-k throws away (2026-11-16)
+### B-DSV4-CPU-PERF — what the V4 compressed layers still cost on the CPU (2026-11-16)
 
-**Tag:** deepseek · performance · **Blocked on:** nothing; the next slice after
-plan 09 S7 (plan 09 § 5)
+**Tag:** deepseek · performance · **Blocked on:** nothing (plan 09 § 5)
 
-Two findings of the S7 review, read in the code, **not measured**. The numbers
-are arithmetic at V4-Flash's geometry (21 CSA layers, 64 heads of 512, indexer
-64 heads × 128, `top_k` 512) at a 64k context, so 16 384 visible blocks per CSA
-layer:
+The S7 review's two findings are fixed: `Op::Attention` attends only the
+compressed keys whose top-k bias is finite and converts only the cache rows some
+query keeps (`infr-cpu`'s `attn_kv::comp_rows`), and `Op::LightningIndexer`
+scores one row's keys across the pool and keeps its top-k by a partial selection
+(`infr-cpu`'s `indexer` module). Output is bit-identical (`docs/deepseek.md` §
+"The CSA tier's CPU cost"). What remains, measured with
+`crates/infr-llama/tests/dsv4_cpu_bench.rs` (one decode row at V4-Flash's
+geometry over random f16 caches, 32 threads, a quiet Ryzen 9 9950X3D):
 
-- **`Op::Attention` with `comp` scores every visible block, then masks.** The
-  CPU arm (`infr-cpu`'s `Op::Attention`, the `comp` branch) takes a full `q·k`
-  dot and a full value accumulate for every one of the segment's `len` blocks
-  and adds the top-k bias afterwards, so a block the bias sets to `-inf` still
-  costs both. Per token that is about 64 × 16 384 × (512 + 512) × 21 ≈ 22 G
-  multiply-adds, against about 0.7 G for the 512 kept blocks alone, and it grows
-  linearly with the context. It also dequantizes the whole `len × head_dim`
-  compressed prefix into a fresh f32 `Vec` per layer per step (8.4 M values per
-  CSA layer here). llama.cpp's CPU flash attention skips a `-inf` mask entry
-  before the dot (`ggml_compute_forward_flash_attn_ext_f16_one_chunk`). Fix
-  candidates: skip `-inf` bias entries in the dot and the accumulate, or gather
-  the kept blocks (the indexer's indices) and attend those only; convert per key
-  rather than the whole prefix.
-- **`Op::LightningIndexer` on the CPU is one task per query row**
-  (`for_chunks_mut` over the `[rows, top_k]` output), so a decode step (one row)
-  scores all 16 384 blocks × 64 heads × 128 on one core, and it selects by
-  repeated linear scan, O(`top_k` · `kv_len`) per row (512 × 16 384 ≈ 8.4 M
-  comparisons per CSA layer per token). Fix candidates: split the scoring of one
-  row across keys; select with a partial sort or a heap, keeping the lower-index
-  tie rule.
+- **The attention re-reads the kept rows once per head.** At 64k context a CSA
+  layer now costs about 1.05-1.15 ms per token (indexer 0.36-0.39 ms, attention
+  0.71-0.77 ms) and an HCA layer 0.66-0.70 ms, so about 21 × 1.1 + 20 × 0.7 ≈ 37
+  ms per token over the compressed layers. The attention is flat in the context
+  (0.63-0.77 ms from 2k to 64k: it reads at most `top_k` compressed rows); about
+  0.2 ms of it is the raw window and the op's fixed costs (the HCA layer at 2k,
+  16 compressed rows, takes 0.23-0.24 ms). The rest is 64 heads each streaming
+  the same 512 converted rows (1 MiB of f32) twice, for the dot and the weighted
+  sum: one task is one head (`Op::Attention`'s dispatch), so V4's single KV head
+  is read 64 times from L2/L3. Grouping the heads that share a KV head into one
+  task, each kept row loaded once and dotted with every head's query, would cut
+  that traffic by the group size. It changes the attention dispatch every model
+  uses, so it needs its own measurement across models; the per-head arithmetic
+  would not change, so `attention_blocks_match_one_pair_per_task_bitwise` and
+  the two-segment concatenation test keep their bit-for-bit checks.
+- **The bench pays a pool wake per op.** It executes each op as its own graph,
+  so the pool's workers have parked between ops; in a decode they would still be
+  spinning. The fixed 0.2 ms above is an upper bound for that reason.
+- **A quantized compressed cache still converts a prefix.** At f16 (the default)
+  and f32 the attention converts the kept rows only; at any other KV format it
+  dequantizes the prefix up to the last kept row (`attn_kv::comp_rows`' fallback
+  arm), which at 64k is most of `len`. Converting quantized rows one by one
+  needs a per-row dequant for every KV format, including TurboQuant's rotated
+  blocks.
+- **Multi-row graphs: measured for the indexer alone, on DeepSeek V3.2's
+  shape.** `Op::LightningIndexer` is also what V3.2 emits, with `rows: batch`
+  and `block_ratio` 1, so its prefill and decode take the same new scoring and
+  selection. A reviewer's scratch bench at 64 heads × 128, `top_k` 2048, f16
+  keys, 32 threads, old against new with equal output digests: 512 rows × 4096
+  keys 462-464 → 39.9 ms; 512 × 16384 2030-2037 → 149-151 ms; 32 × 16384 134-143
+  → 9.5 ms; 1 × 16384 61 → 0.37 ms. Not in the tree's bench, and no V3.2 model
+  was run. The score buffer is now `rows × keys` f32, zeroed per op and not
+  recycled (32 MiB for 512 rows at 16k keys; about 335 MiB at a 160k context by
+  arithmetic), where the old code held one row per task: fine for time, a cost
+  in headroom at long-context prefill. The runner feeds V4 one token per graph.
+  The key-split scoring and the per-row selection are written for any row count
+  and tested at several (`indexer::tests`), and the attention converts the union
+  of the rows' kept sets, which for a long prefill approaches `len`.
+- **The rings' round trip** (§ B-DSV4-WIRING) is per token but not O(context):
+  it was not measured here.
 
-Measure both against `llama-bench` before and after, at a long context, on a
-file that fits (the synthetic one scaled up, or the real file under a watchdog).
+- **The bench's absolute figures are best-case.** It repeats one op over one
+  layer's caches (16 MiB compressed, 4 MiB indexer), which stay in the 9950X3D's
+  L3 between runs; a real decode walks every compressed layer's caches. That
+  flatters the old code more than the new, which reads only kept rows, so the
+  ratio is not inflated. `dot_mn` keeps 16 eight-wide accumulators live, which
+  likely spills on AVX2-only x86 and on NEON: speed only, not measured on
+  either.
 
 ### B-DSV4-POOL — what `Op::CompressPool` does NOT cover yet (2026-08-13)
 

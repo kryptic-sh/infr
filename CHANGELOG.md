@@ -28,12 +28,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   overlapping windows of 8 positions into its own cache and, with
   `indexer_compressor_*`, into the lightning indexer's key cache, and its
   attention output weighs only the `attention.indexer.top_k` blocks the indexer
-  scores highest (the CPU still scores every visible block and masks the rest;
-  `docs/backlog.md` § B-DSV4-CPU-PERF). On synthetic files llama.cpp also runs,
-  infr's CPU logits match llama.cpp's to within 9.4e-5 at every stored length:
-  all-HCA and every-tier files from 7 to 520 tokens, and an all-CSA file from 7
-  to 131 tokens with a `top_k` of 5, so the top-k drops blocks; at every row of
-  those runs infr's indexer keeps the blocks llama.cpp keeps, but for two listed
+  scores highest. On synthetic files llama.cpp also runs, infr's CPU logits
+  match llama.cpp's to within 9.4e-5 at every stored length: all-HCA and
+  every-tier files from 7 to 520 tokens, and an all-CSA file from 7 to 131
+  tokens with a `top_k` of 5, so the top-k drops blocks; at every row of those
+  runs infr's indexer keeps the blocks llama.cpp keeps, but for two listed
   f16-rounding near-ties. Not verified: the shipped DeepSeek-V4-Flash file has
   never been run (it is larger than this machine's RAM); that it gets past every
   refusal on the CPU is inferred from its metadata and the synthetic fixtures,
@@ -191,6 +190,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the slot alignment each needs.
 
 ### Changed
+
+- **DeepSeek V4's compressed layers cost the CPU what they use.**
+  `Op::Attention` attends only the compressed blocks the top-k keeps, skipping a
+  masked one before its dot as llama.cpp does, and converts only the cache rows
+  it reads instead of the whole committed prefix; `Op::LightningIndexer` scores
+  a decode row's blocks across every core and keeps its top-k by a partial
+  selection instead of a linear scan per slot. Output is bit-identical (the
+  synthetic V4 file's logits keep their digest). Measured op-level on synthetic
+  caches at V4-Flash's geometry, one decode row, 32 threads on a Ryzen 9
+  9950X3D: a ratio-4 (CSA) layer at a 64k context went from 57.5 / 57.2 ms to
+  1.15 / 1.05 ms per token (indexer 38.8 → 0.39 ms, attention 18.8 → 0.77 ms),
+  and at 8k from 7.3 / 7.1 to 0.77 / 0.76 ms; ratio-128 layers and the synthetic
+  file end to end are unchanged within noise. The real file has not been run.
+  DeepSeek V3.2 emits the same indexer op over whole batches, so its prefill and
+  decode take the new scoring and selection too; no V3.2 model was timed.
 
 - **DeepSeek V4 (`deepseek4`) stores its attention row once.** V4's attention
   reads the same row as K and V (`build_attn_mha(q, k_all, k_all, …)`), and the

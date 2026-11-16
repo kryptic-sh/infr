@@ -4554,22 +4554,40 @@ fn exec_bytes(
     o
 }
 
+/// `v` stored at a KV cache dtype the two-segment tests use.
+fn cache_bytes(dt: DType, v: &[f32]) -> Vec<u8> {
+    match dt {
+        DType::F16 => f16_bytes(v),
+        DType::F32 => bytemuck::cast_slice(v).to_vec(),
+        DType::Bf16 => v
+            .iter()
+            .flat_map(|&x| half::bf16::from_f32(x).to_le_bytes())
+            .collect(),
+        other => panic!("no {other:?} cache in these tests"),
+    }
+}
+
 /// Run the case's two-segment op on `be`; with `comp_on` false, the same op with `comp: None`
 /// (the compressed cache then not even declared).
 fn comp_run(be: &dyn Backend, c: &CompCase, d: &CompData, comp_on: bool) -> Vec<f32> {
+    comp_run_at(be, c, d, comp_on, DType::F16)
+}
+
+/// [`comp_run`] with every cache at `dt`.
+fn comp_run_at(be: &dyn Backend, c: &CompCase, d: &CompData, comp_on: bool, dt: DType) -> Vec<f32> {
     let n_out = c.rows * c.nh * c.hd;
     let row = c.nkv * c.hd;
     let mut g = Graph::new();
     let mut binds = Vec::new();
     let q = g.input(TensorDesc::new(vec![n_out], DType::F16));
     binds.push((q, f16_bytes(&d.q), BufferUsage::Activations));
-    let kc = g.input(TensorDesc::new(vec![c.cap * row], DType::F16));
-    binds.push((kc, f16_bytes(&d.k), BufferUsage::KvCache));
+    let kc = g.input(TensorDesc::new(vec![c.cap * row], dt));
+    binds.push((kc, cache_bytes(dt, &d.k), BufferUsage::KvCache));
     let vc = if c.alias {
         kc
     } else {
-        let vc = g.input(TensorDesc::new(vec![c.cap * row], DType::F16));
-        binds.push((vc, f16_bytes(&d.v), BufferUsage::KvCache));
+        let vc = g.input(TensorDesc::new(vec![c.cap * row], dt));
+        binds.push((vc, cache_bytes(dt, &d.v), BufferUsage::KvCache));
         vc
     };
     let sinks = c.sinks.then(|| {
@@ -4582,8 +4600,8 @@ fn comp_run(be: &dyn Backend, c: &CompCase, d: &CompData, comp_on: bool) -> Vec<
         sk
     });
     let comp = comp_on.then(|| {
-        let cache = g.input(TensorDesc::new(vec![d.c.len()], DType::F16));
-        binds.push((cache, f16_bytes(&d.c), BufferUsage::KvCache));
+        let cache = g.input(TensorDesc::new(vec![d.c.len()], dt));
+        binds.push((cache, cache_bytes(dt, &d.c), BufferUsage::KvCache));
         let bias = c.bias.then(|| {
             let cb = g.input(f32d(c.rows * c.len));
             binds.push((
@@ -4627,6 +4645,11 @@ fn comp_run(be: &dyn Backend, c: &CompCase, d: &CompData, comp_on: bool) -> Vec<
 /// A canvas over the whole cache makes the bias the only mask. CPU only: the Vulkan bias kernel
 /// refuses a canvas.
 fn comp_concat_run(be: &dyn Backend, c: &CompCase, d: &CompData) -> Vec<f32> {
+    comp_concat_run_at(be, c, d, DType::F16)
+}
+
+/// [`comp_concat_run`] with both caches at `dt`.
+fn comp_concat_run_at(be: &dyn Backend, c: &CompCase, d: &CompData, dt: DType) -> Vec<f32> {
     let (n_out, row, kv_len) = (c.rows * c.nh * c.hd, c.nkv * c.hd, c.kv_len());
     let total = kv_len + c.len;
     let gather = |src: &[f32]| -> Vec<f32> {
@@ -4646,13 +4669,13 @@ fn comp_concat_run(be: &dyn Backend, c: &CompCase, d: &CompData) -> Vec<f32> {
     }
     let mut g = Graph::new();
     let q = g.input(TensorDesc::new(vec![n_out], DType::F16));
-    let kc = g.input(TensorDesc::new(vec![total * row], DType::F16));
-    let vc = g.input(TensorDesc::new(vec![total * row], DType::F16));
+    let kc = g.input(TensorDesc::new(vec![total * row], dt));
+    let vc = g.input(TensorDesc::new(vec![total * row], dt));
     let bias = g.input(f32d(c.rows * total));
     let mut binds = vec![
         (q, f16_bytes(&d.q), BufferUsage::Activations),
-        (kc, f16_bytes(&gather(&d.k)), BufferUsage::KvCache),
-        (vc, f16_bytes(&gather(&d.v)), BufferUsage::KvCache),
+        (kc, cache_bytes(dt, &gather(&d.k)), BufferUsage::KvCache),
+        (vc, cache_bytes(dt, &gather(&d.v)), BufferUsage::KvCache),
         (
             bias,
             bytemuck::cast_slice(&kb).to_vec(),
@@ -5189,6 +5212,71 @@ fn attention_comp_segment_multi_tile() {
                     e < COMP_VK_TOL,
                     "multi-tile {name}: Vulkan vs definition {e:e}"
                 );
+            }
+        }
+    }
+}
+
+/// The CPU attends only the compressed keys whose bias is finite, and converts only the cache
+/// rows some query keeps: with most of a long segment masked it must give, bit for bit, what the
+/// concatenated single segment gives (whose raw path scores and weighs every key, the masked ones
+/// at exactly 0), and the f64 definition. Each query row keeps a different set — a sparse one
+/// spread from the first block to the last visible one, kept keys interleaved one for one with
+/// masked ones, one whose kept count leaves a partial group of keys, and one with every key
+/// masked — so the rows the op converts are a union no single row's set describes. Two kv heads,
+/// so a converted row holds both heads' halves. Caches at f16 and f32 (converted row by row) and
+/// bf16 (converted as a prefix).
+#[test]
+fn attention_comp_segment_skips_masked_keys() {
+    let cpu = infr_cpu::CpuBackend::new();
+    for sinks in [false, true] {
+        let mut c = CompCase::new("masked keys", 4, 4093, 4, 2, 64, 4);
+        (c.window, c.cap, c.sinks, c.bias) = (64, 70, sinks, true);
+        let mut d = comp_data(&c);
+        let mut kept = [0usize; 4];
+        for t in 0..c.rows {
+            let n_vis = (c.pos + t + 1) / c.ratio;
+            for j in 0..c.len {
+                let keep = match t {
+                    0 => j % 97 == 0 || j + 1 == n_vis,
+                    1 => j % 2 == 1,
+                    2 => (500..507).contains(&j),
+                    _ => false,
+                };
+                let b = &mut d.bias[t * c.len + j];
+                if !keep {
+                    *b = f32::NEG_INFINITY;
+                } else if !b.is_finite() {
+                    *b = 0.25;
+                }
+                kept[t] += usize::from(keep && j < n_vis);
+            }
+        }
+        assert!(
+            kept[0] > 4 && kept[0] * 20 < c.len,
+            "row 0 keeps few: {kept:?}"
+        );
+        assert_eq!(kept[2] % 4, 3, "row 2 leaves a partial group");
+        assert_eq!(kept[3], 0);
+        let want = comp_ref(&c, &d, CompVariant::Faithful);
+        let gap = maxdiff64(&want, &comp_ref(&c, &d, CompVariant::NoBias));
+        assert!(
+            gap > COMP_GAP,
+            "sinks {sinks}: the bias does not bite ({gap:e})"
+        );
+        for dt in [DType::F16, DType::F32, DType::Bf16] {
+            let name = format!("sinks {sinks}, {dt:?}");
+            let two = comp_run_at(&cpu, &c, &d, true, dt);
+            assert_eq!(
+                bits(&two),
+                bits(&comp_concat_run_at(&cpu, &c, &d, dt)),
+                "{name}: skipping masked keys changed the output"
+            );
+            // The data is f16-exact, which bf16 is not.
+            if dt != DType::Bf16 {
+                let e = maxerr64(&two, &want);
+                println!("masked keys {name}: cpu vs definition {e:e}");
+                assert!(e < COMP_TOL, "masked keys {name}: CPU vs definition {e:e}");
             }
         }
     }

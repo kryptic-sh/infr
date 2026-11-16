@@ -1182,6 +1182,55 @@ which the runner never builds for V4 (`block_ratio` 1 in the indexer, and
 persisting before compressing); the stand-alone tests in
 `seam/dsv4_emit/tests/compressor.rs` hold them.
 
+### The CSA tier's CPU cost (2026-11-16)
+
+The CPU's compressed layers now cost what they use. `Op::Attention` attends only
+the compressed keys whose top-k bias is finite — a key at `-inf` is skipped
+before its dot, as llama.cpp's
+`ggml_compute_forward_flash_attn_ext_f16_one_chunk` skips it — and converts to
+f32 only the cache rows some query keeps (at most `top_k` per row at f16 or f32;
+every visible row on an HCA layer, which has no bias). `Op::LightningIndexer`
+splits one row's keys across the pool, dots four query heads against four keys
+at a time (`dot_mn`), and keeps the top-k by a partial selection.
+
+**Output bits do not change.** A skipped key's exponential is exactly 0, so the
+max, the denominator (summed in key order) and the weighted sum are what they
+were; each kept key's dot is the same `dot` (`dot_n` and `dot_mn` equal it bit
+for bit); each indexer score sums the heads in the same order; and the selection
+keeps the same keys in the same order, ties to the lower index, a row with a NaN
+score handed to the old scan. The synthetic V4 file's logits after 64, 256 and
+512 tokens have the same digest before and after. Two inputs can differ: a NaN
+or infinity in a masked compressed row no longer reaches the output (it is never
+read, as in llama.cpp), and a weighted sum that was `-0.0` can now be `+0.0`.
+
+Measured with `crates/infr-llama/tests/dsv4_cpu_bench.rs` (one decode row of one
+layer at V4-Flash's geometry — 64 heads of 512, raw window 128, indexer 64 heads
+× 128, `top_k` 512 — over random f16 caches; median ms; 32 threads on a Ryzen 9
+9950X3D, total CPU load 0-3% before and after, no other build or bench running).
+Synthetic and op-level: the real file has not been run. Two interleaved rounds,
+the commit before (`0be008dd`) then this change:
+
+| context | CSA blocks | indexer before | indexer after | CSA attention before | CSA attention after | CSA layer before | CSA layer after |
+| ------- | ---------- | -------------- | ------------- | -------------------- | ------------------- | ---------------- | --------------- |
+| 2k      | 512        | 1.24 / 1.15    | 0.063 / 0.061 | 0.73 / 0.62          | 0.69 / 0.72         | 1.88 / 1.78      | 0.75 / 0.78     |
+| 8k      | 2 048      | 4.82 / 4.86    | 0.079 / 0.080 | 2.53 / 2.28          | 0.69 / 0.68         | 7.34 / 7.12      | 0.77 / 0.76     |
+| 32k     | 8 192      | 19.36 / 19.33  | 0.201 / 0.196 | 7.79 / 9.44          | 0.63 / 0.71         | 27.07 / 28.75    | 0.83 / 0.91     |
+| 64k     | 16 384     | 38.78 / 38.61  | 0.389 / 0.355 | 18.85 / 18.82        | 0.77 / 0.71         | 57.51 / 57.21    | 1.15 / 1.05     |
+
+The CSA layer is the indexer, its top-k mask and the attention; the mask is a
+few microseconds at every size. The HCA layer's attention (16 to 512 compressed
+rows, no bias, all kept) did not change: 0.23-0.82 ms before, 0.23-0.70 after.
+At 64k context the compressed layers went from about 21 × 57 + 20 × 0.7 ≈ 1.2 s
+per token to about 21 × 1.1 + 20 × 0.7 ≈ 37 ms. What dominates now is the
+attention's 64 heads each reading the same kept rows (`docs/backlog.md` §
+B-DSV4-CPU-PERF).
+
+The synthetic file end to end (ratios `[0, 4, 128, 4, 0]`, `top_k` 5, prefill
+token by token) is unchanged within noise: 512 tokens in 1724 / 1699 ms before
+and 1683 / 1702 ms after. Its indexer took 16.4 ms of the run before and 0.8 ms
+after (`INFR_PROF_OPS=1`); a first cut split its tiny keys over the pool and
+took 223 ms, which is why a scoring task now has a minimum amount of work.
+
 ### `compress_ratio` is the master per-layer switch
 
 `hparams.set_swa_pattern(0)` makes **every** layer sliding-window, so long-range

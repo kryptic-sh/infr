@@ -742,23 +742,21 @@ log parser on a hand-written log, so neither can rot.
 
 Measure against `llama-bench` (CPU and Vulkan builds) on the same file.
 
-V4, in order: the two CPU findings of the S7 review (`docs/backlog.md` §
-B-DSV4-CPU-PERF, read, not measured): the attention scores and accumulates every
-visible compressed block and only then applies the top-k mask (about 22 G
-multiply-adds per token at V4-Flash's geometry and 64k context, against 0.7 G
-for the kept 512 blocks; llama.cpp's CPU flash attention skips `-inf` mask
-entries), and the indexer scores a decode row on one core and selects by
-repeated linear scan; then the CPU attention arm converts the whole committed
-compressed prefix (`len` rows) to f32 on every call, as it already does for the
-raw cache, which at long context is `ctx/4` rows per CSA layer per decode step
-(convert per key inside the dot instead, or keep an f32 shadow); batched prefill
-(per-token today, which multiplies expert I/O by the prompt length; needs an ids
-buffer per chunk for hash layers); a span-carried hyper-connection stream so
-layer-major and streamed prefill serve V4; paged MoE with hash routing and the
-clamp, then B184; the sinks and compressed attention tiers on Vulkan, gathering
-the CSA top-k at long context instead of masking; the indexer's cost per CSA
-layer; `CompressPool` and hyper-connection kernels (B-DSV4-POOL, B-DSV4-HC);
-decode replay, measured first.
+V4, in order: ~~the two CPU findings of the S7 review~~ — done (2026-11-16): the
+CPU attention attends only the compressed keys the top-k keeps and converts only
+their rows, and the indexer scores a decode row across the pool and selects
+partially, bit-identical output; one CSA layer at V4-Flash's geometry and 64k
+context went from about 57 ms to about 1.1 ms per decode token (op-level,
+synthetic; `docs/deepseek.md` § "The CSA tier's CPU cost"). What is left of it
+is `docs/backlog.md` § B-DSV4-CPU-PERF, first the attention reading the kept
+rows once per head; then batched prefill (per-token today, which multiplies
+expert I/O by the prompt length; needs an ids buffer per chunk for hash layers);
+a span-carried hyper-connection stream so layer-major and streamed prefill serve
+V4; paged MoE with hash routing and the clamp, then B184; the sinks and
+compressed attention tiers on Vulkan, gathering the CSA top-k at long context
+instead of masking; the indexer's cost per CSA layer; `CompressPool` and
+hyper-connection kernels (B-DSV4-POOL, B-DSV4-HC); decode replay, measured
+first.
 
 `deepseek2` / V3: an `Op::Mla` split-K decode arm and a prefill tier
 (B-DSHW-MLA-SCALAR-TIER has the gaps); B108 on CPU at depth. Do not reopen

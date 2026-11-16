@@ -6437,6 +6437,47 @@ pub(crate) fn dot_n<const N: usize>(a: &[f32], bs: [&[f32]; N]) -> [f32; N] {
     })
 }
 
+/// `[[dot(as[m], bs[n]) for n] for m]`, each bit-identical to [`dot`]. Against [`dot_n`] it also
+/// shares each `bs` chunk across the `M` rows of `as`, so a block of `M × N` products costs
+/// `M + N` loads instead of `M × (1 + N)` — the shape of many queries scored against the same
+/// keys.
+// per-call leaf, too small to probe (see docs/perf/playbook.md)
+#[cfg_attr(infr_profile, infr_prof::skip)]
+#[inline]
+pub(crate) fn dot_mn<const M: usize, const N: usize>(
+    a_s: [&[f32]; M],
+    bs: [&[f32]; N],
+) -> [[f32; N]; M] {
+    let n = bs.first().map_or(0, |b| b.len());
+    for v in a_s.iter().chain(&bs) {
+        assert_eq!(v.len(), n, "dot_mn: every vector must have one length");
+    }
+    let chunks = n / 8;
+    let mut acc = [[[0f32; 8]; N]; M];
+    let a8: [&[[f32; 8]]; M] = a_s.map(|a| a[..chunks * 8].as_chunks::<8>().0);
+    let b8: [&[[f32; 8]]; N] = bs.map(|b| b[..chunks * 8].as_chunks::<8>().0);
+    for c in 0..chunks {
+        let bv: [[f32; 8]; N] = std::array::from_fn(|k| b8[k][c]);
+        for m in 0..M {
+            let av = a8[m][c];
+            for k in 0..N {
+                for j in 0..8 {
+                    acc[m][k][j] = av[j].mul_add(bv[k][j], acc[m][k][j]);
+                }
+            }
+        }
+    }
+    std::array::from_fn(|m| {
+        std::array::from_fn(|k| {
+            let mut s: f32 = acc[m][k].iter().sum();
+            for i in chunks * 8..n {
+                s = a_s[m][i].mul_add(bs[k][i], s);
+            }
+            s
+        })
+    })
+}
+
 /// Gated-FFN activation applied to the gate value.
 // per-call leaf, too small to probe (see docs/perf/playbook.md)
 #[cfg_attr(infr_profile, infr_prof::skip)]
@@ -6508,6 +6549,31 @@ mod kernel_tests {
                     "n={n} k={k}: {} vs {want}",
                     got[k]
                 );
+            }
+        }
+    }
+
+    /// `dot_mn` must give each `dot` bit for bit, including lengths with a sub-8 tail and the
+    /// empty vector.
+    #[test]
+    fn dot_mn_matches_dot_bitwise() {
+        for n in [0usize, 1, 7, 8, 9, 64, 128, 133] {
+            let a_s: Vec<Vec<f32>> = (0..3).map(|m| det_x(n, 7 * m + n as u64)).collect();
+            let bs: Vec<Vec<f32>> = (0..4).map(|k| det_x(n, 100 * k + n as u64)).collect();
+            let got = dot_mn(
+                [&a_s[0][..], &a_s[1][..], &a_s[2][..]],
+                [&bs[0][..], &bs[1][..], &bs[2][..], &bs[3][..]],
+            );
+            for (m, a) in a_s.iter().enumerate() {
+                for (k, b) in bs.iter().enumerate() {
+                    let want = dot(a, b);
+                    assert_eq!(
+                        got[m][k].to_bits(),
+                        want.to_bits(),
+                        "n={n} m={m} k={k}: {} vs {want}",
+                        got[m][k]
+                    );
+                }
             }
         }
     }

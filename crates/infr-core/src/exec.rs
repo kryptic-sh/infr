@@ -203,6 +203,7 @@ mod tests {
             pos: 0,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         g.push(Op::RmsNorm {
             x: hidden,

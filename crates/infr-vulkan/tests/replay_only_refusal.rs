@@ -83,6 +83,7 @@ fn run(
         pos: 0,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let buf = |bytes: usize, usage| be.alloc(bytes, usage).unwrap();
     let xb = buf(nh * hd * 4, BufferUsage::Activations);

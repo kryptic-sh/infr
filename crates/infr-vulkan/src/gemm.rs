@@ -3289,6 +3289,15 @@ dyn_spv!(attention_kv_sinks_spv, "attention_kv_sinks");
 // same way it does for sinks.
 dyn_spv!(attention_kv_bias_spv, "attention_kv_bias");
 dyn_spv!(attention_kv_sinks_bias_spv, "attention_kv_sinks_bias");
+// `Op::Attention::comp` (deepseek4's compressed key segment), with and without sinks and the
+// segment's own top-k bias — the adapter routes a comp op onto this scalar f16 path.
+dyn_spv!(attention_kv_comp_spv, "attention_kv_comp");
+dyn_spv!(attention_kv_comp_bias_spv, "attention_kv_comp_bias");
+dyn_spv!(attention_kv_comp_sinks_spv, "attention_kv_comp_sinks");
+dyn_spv!(
+    attention_kv_comp_sinks_bias_spv,
+    "attention_kv_comp_sinks_bias"
+);
 // KV-cache u64/BDA twins (#74, slice 1): the `-DKV_BDA` builds of the scalar attention_kv family —
 // K/V read by 64-bit device address (kv_addr.glsl) instead of bound SSBOs. Bound twins above stay
 // for kv_addr_parity.rs; production forks here via Recorder::attention_kv_at / attention_kv_dyn_at.

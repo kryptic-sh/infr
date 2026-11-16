@@ -921,6 +921,7 @@ mod tests {
             pos: (PREFIX - 1) as u32,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         let plan = be.compile(&g).expect("compile Attention");
         let qb = be

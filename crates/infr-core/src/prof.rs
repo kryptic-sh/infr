@@ -328,6 +328,7 @@ mod tests {
                 pos: 0,
                 sinks: None,
                 key_bias: None,
+                comp: None,
             },
             Op::RmsNorm {
                 x,

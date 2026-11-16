@@ -73,6 +73,7 @@ fn failed_replay_recording_frees_its_segment() {
         pos: 0,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     {
         let buf = |bytes: usize, usage| be.alloc(bytes, usage).unwrap();

@@ -1880,7 +1880,11 @@ impl Backend for CpuBackend {
                     pos,
                     sinks,
                     key_bias,
+                    comp,
                 } => {
+                    if let Err(e) = infr_core::graph::check_attention(g, op) {
+                        panic!("cpu backend: {e}");
+                    }
                     let (rows, kv_len, nh, nkv, hd) = (
                         rows as usize,
                         kv_len as usize,
@@ -1904,7 +1908,7 @@ impl Backend for CpuBackend {
                     // kv_len <= cap_rows and everything below is the old identity indexing.
                     let cap_rows = g.desc(k_cache).numel() / (nkv * hd).max(1);
                     let need = kv_len.min(cap_rows) * nkv * hd;
-                    let mut deq = |b: &[u8], dt: DType| -> Vec<f32> {
+                    let mut deq = |b: &[u8], dt: DType, need: usize| -> Vec<f32> {
                         match dt {
                             // The f16 cache (the default) widens across the pool with the
                             // hardware conversion rather than serially per element on this
@@ -1949,10 +1953,25 @@ impl Backend for CpuBackend {
                     // One guard at a time: an owned buffer's guard is a non-reentrant mutex, and a
                     // cache that serves as both K and V (deepseek4, whose attention reads its K
                     // rows as V) binds one buffer to both sides. That pair is dequantized once.
-                    let ks = deq(&cpu_buf(kbuf).read(), g.desc(k_cache).dtype);
+                    let ks = deq(&cpu_buf(kbuf).read(), g.desc(k_cache).dtype, need);
                     let vs_own = (v_cache != k_cache)
-                        .then(|| deq(&cpu_buf(vbuf).read(), g.desc(v_cache).dtype));
+                        .then(|| deq(&cpu_buf(vbuf).read(), g.desc(v_cache).dtype, need));
                     let vs: &[f32] = vs_own.as_deref().unwrap_or(&ks);
+                    // DeepSeek V4's compressed segment (`None` everywhere else): its first `len`
+                    // rows, which serve as both its keys and its values, and its optional
+                    // `[rows, len]` score bias. See `Op::Attention::comp`.
+                    let cs = comp.map(|c| {
+                        let cbuf = bindings
+                            .get(c.cache)
+                            .expect("cpu backend: unbound compressed cache");
+                        let rows_c = deq(
+                            &cpu_buf(cbuf).read(),
+                            g.desc(c.cache).dtype,
+                            c.len as usize * nkv * hd,
+                        );
+                        let bias = c.bias.map(|b| &vals[b.0 as usize][..]);
+                        (rows_c, bias, c)
+                    });
                     // Per-head attention sinks (V4's `attn_sinks`, `None` everywhere else): one
                     // extra logit per head in the max AND the denominator, never in the numerator.
                     // See `Op::Attention::sinks`.
@@ -1993,7 +2012,14 @@ impl Backend for CpuBackend {
                             }
                         };
                         let n_keys = hi - lo;
-                        let mut sc = vec![0f32; n_keys];
+                        // Visible compressed keys, scored after the raw ones in the same buffer
+                        // so one max, one denominator and one weighted sum cover both (the
+                        // reference's concatenated `[raw | compressed]` attention).
+                        let n_comp = cs.as_ref().map_or(0, |(_, _, c)| {
+                            infr_core::graph::comp_visible(abs as u32, c.ratio, c.len) as usize
+                        });
+                        let mut sc = vec![0f32; n_keys + n_comp];
+                        let (sc_raw, sc_comp) = sc.split_at_mut(n_keys);
                         let mut mx = f32::NEG_INFINITY;
                         let qrow = &qs[qb..qb + hd];
                         // Key j's cache row, j % cap_rows on a ring, walked without a division
@@ -2017,7 +2043,7 @@ impl Backend for CpuBackend {
                             &ks[kb..kb + hd]
                         };
                         let mut key_rows = ring_rows(lo);
-                        let (quads, tail) = sc.as_chunks_mut::<KEYS>();
+                        let (quads, tail) = sc_raw.as_chunks_mut::<KEYS>();
                         for quad in quads {
                             let jr: [usize; KEYS] =
                                 std::array::from_fn(|_| key_rows.next().unwrap());
@@ -2026,13 +2052,35 @@ impl Backend for CpuBackend {
                         for (scj, jr) in tail.iter_mut().zip(key_rows) {
                             *scj = dot(qrow, krow(jr));
                         }
-                        for (jj, scj) in sc.iter_mut().enumerate() {
+                        for (jj, scj) in sc_raw.iter_mut().enumerate() {
                             let j = lo + jj;
                             *scj *= scale;
                             // The top-k mask joins the score BEFORE the max, at key POSITION `j`
                             // (not the ring row) — same rule as `Op::Mla::key_bias`.
                             if let Some(kbias) = &kbias {
                                 *scj += kbias[ti * kv_len + j];
+                            }
+                            mx = mx.max(*scj);
+                        }
+                        // Compressed block `j` is row `j`: no ring, the cache holds every block.
+                        let crow = |j: usize| {
+                            let rows_c = &cs.as_ref().expect("n_comp > 0 implies comp").0;
+                            let kb = (j * nkv + kvh) * hd;
+                            &rows_c[kb..kb + hd]
+                        };
+                        let (cquads, ctail) = sc_comp.as_chunks_mut::<KEYS>();
+                        for (qi, quad) in cquads.iter_mut().enumerate() {
+                            *quad = dot_n(qrow, std::array::from_fn(|i| crow(qi * KEYS + i)));
+                        }
+                        let ctail_lo = n_comp - ctail.len();
+                        for (i, scj) in ctail.iter_mut().enumerate() {
+                            *scj = dot(qrow, crow(ctail_lo + i));
+                        }
+                        let cbias = cs.as_ref().and_then(|(_, b, c)| b.map(|b| (b, c.len)));
+                        for (j, scj) in sc_comp.iter_mut().enumerate() {
+                            *scj *= scale;
+                            if let Some((b, len)) = cbias {
+                                *scj += b[ti * len as usize + j];
                             }
                             mx = mx.max(*scj);
                         }
@@ -2054,11 +2102,19 @@ impl Backend for CpuBackend {
                         if let Some(sv) = sink {
                             l += (sv - mx).exp();
                         }
-                        for (&e, jr) in sc.iter().zip(ring_rows(lo)) {
+                        let (e_raw, e_comp) = sc.split_at(n_keys);
+                        for (&e, jr) in e_raw.iter().zip(ring_rows(lo)) {
                             let p = e / l;
                             let vb = (jr * nkv + kvh) * hd;
                             // Independent lanes — vectorizes to FMA.
                             for (o, &v) in ob_slice.iter_mut().zip(&vs[vb..vb + hd]) {
+                                *o = v.mul_add(p, *o);
+                            }
+                        }
+                        // A compressed key's value row is its key row.
+                        for (j, &e) in e_comp.iter().enumerate() {
+                            let p = e / l;
+                            for (o, &v) in ob_slice.iter_mut().zip(crow(j)) {
                                 *o = v.mul_add(p, *o);
                             }
                         }
@@ -2094,6 +2150,9 @@ impl Backend for CpuBackend {
                     rc.give(ks);
                     if let Some(vs) = vs_own {
                         rc.give(vs);
+                    }
+                    if let Some((rows_c, _, _)) = cs {
+                        rc.give(rows_c);
                     }
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
@@ -3414,6 +3473,17 @@ impl Backend for CpuBackend {
                     freq_factors,
                     key_bias,
                 } => {
+                    if let Some(b) = key_bias {
+                        if let Err(e) = infr_core::graph::check_score_bias(
+                            g,
+                            b,
+                            rows,
+                            kv_len,
+                            "Op::Mla key_bias",
+                        ) {
+                            panic!("cpu backend: {e}");
+                        }
+                    }
                     let (rows, kv_len, nh, qhd, kv_lora, np, qkr, vhd) = (
                         rows as usize,
                         kv_len as usize,
@@ -3550,14 +3620,26 @@ impl Backend for CpuBackend {
                     top_k,
                     scale,
                     pos,
+                    block_ratio,
                 } => {
-                    let (rows, kv_len, nh, hd, top_k, pos) = (
+                    assert!(
+                        block_ratio >= 1,
+                        "cpu Op::LightningIndexer: block_ratio 0 — a key covers at least one \
+                         position"
+                    );
+                    let (rows, kv_len, nh, hd, top_k, pos, block_ratio) = (
                         rows as usize,
                         kv_len as usize,
                         n_head as usize,
                         head_dim as usize,
                         top_k as usize,
                         pos as usize,
+                        block_ratio as usize,
+                    );
+                    assert!(
+                        kv_len > 0 && top_k > 0,
+                        "cpu Op::LightningIndexer: kv_len {kv_len} / top_k {top_k} — an indexer \
+                         over no keys selects nothing; the caller skips it (and its TopkMask)"
                     );
                     assert!(
                         top_k <= kv_len,
@@ -3586,9 +3668,10 @@ impl Backend for CpuBackend {
                     let mut out = vec![0f32; rows * top_k];
                     self.pool()
                         .for_chunks_mut(&mut out, top_k, 1, &|ti, slots| {
-                            // Causal: a key at an absolute position past the query's is not eligible,
-                            // and the cache holds only kv_len positions.
-                            let hi = (pos + ti + 1).min(kv_len);
+                            // Causal: a key whose block the query has not completed is not
+                            // eligible (with one position per key, any key past the query's own
+                            // position), and the cache holds only kv_len keys.
+                            let hi = ((pos + ti + 1) / block_ratio).min(kv_len);
                             // score[j] = Σ_h (w[t,h] * scale) * relu(q[t,h] · k[j]), the head sum in
                             // ASCENDING h (ggml_sum_rows' order over the contiguous head axis). Only
                             // the eligible prefix is computed — nothing reads the rest.
@@ -3644,6 +3727,11 @@ impl Backend for CpuBackend {
                     kv_len,
                     top_k,
                 } => {
+                    assert!(
+                        kv_len > 0 && top_k > 0,
+                        "cpu Op::TopkMask: kv_len {kv_len} / top_k {top_k} — a mask over no keys \
+                         selects nothing; the caller skips it"
+                    );
                     let (rows, kv_len, top_k) = (rows as usize, kv_len as usize, top_k as usize);
                     let ids = &vals[idx.0 as usize];
                     let mut out = vec![f32::NEG_INFINITY; rows * kv_len];
@@ -4861,6 +4949,7 @@ mod tests {
             pos: pos as u32,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         let up = |bytes: &[u8]| {
             let b = be.alloc(bytes.len(), BufferUsage::Activations).unwrap();

@@ -1,12 +1,17 @@
 #version 460
 // Causal GQA attention over an f16 KV cache, tiled online softmax. One workgroup per (token, head).
-// q/k/v f16, o f32. hd <= 512 (thread t owns output dims t, t+64, …, t+7*64 that fall < hd).
+// q/k/v f16, o f32. hd <= ATTN_KV_MAX_HD (thread t owns output dims t, t+64, … that fall < hd).
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout(push_constant) uniform PC {
     uint q_len; uint kv_len; uint nh; uint nkv; uint hd; uint pos_offset; uint window; float scale; uint cap;
+#ifdef COMP
+    // -DCOMP builds: the compressed segment's committed rows and positions per block
+    // (`Op::Attention::comp`).
+    uint comp_len; uint comp_ratio;
+#endif
 #ifdef KV_BDA
     // -DKV_BDA build: K/V cache base device addresses, uvec2-split (avoids 8-byte push align) — see
     // kv_addr.glsl. K binding 1 / V binding 2 disappear; those descriptor slots go unused (filler).
@@ -76,6 +81,28 @@ layout(binding = 2) readonly buffer VB { float16_t v[]; };
 // `o` moves to binding 4 (params takes binding 3) so the recorder's reads|writes split is output-last.
 layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
 layout(binding = 4) buffer OB { float o[]; };
+#elif defined(COMP)
+// -DCOMP builds (`attention_kv_comp*`): DeepSeek V4's compressed key segment, `[comp_len rows,
+// nkv * hd]` f16, attended after the raw keys in the same online softmax and serving as its own
+// values (`Op::Attention::comp`). It binds after the optional sinks; the optional `-DCOMP_BIAS`
+// `[q_len, comp_len]` f32 score bias (`Op::TopkMask`'s output) after it; `o` last.
+#if defined(SINKS) && defined(COMP_BIAS)
+layout(binding = 3) readonly buffer SB { float sink[]; };
+layout(binding = 4) readonly buffer CB { float16_t ck[]; };
+layout(binding = 5) readonly buffer CBB { float cbias[]; };
+layout(binding = 6) buffer OB { float o[]; };
+#elif defined(SINKS)
+layout(binding = 3) readonly buffer SB { float sink[]; };
+layout(binding = 4) readonly buffer CB { float16_t ck[]; };
+layout(binding = 5) buffer OB { float o[]; };
+#elif defined(COMP_BIAS)
+layout(binding = 3) readonly buffer CB { float16_t ck[]; };
+layout(binding = 4) readonly buffer CBB { float cbias[]; };
+layout(binding = 5) buffer OB { float o[]; };
+#else
+layout(binding = 3) readonly buffer CB { float16_t ck[]; };
+layout(binding = 4) buffer OB { float o[]; };
+#endif
 #elif defined(SINKS) && defined(BIAS)
 // -DSINKS -DBIAS build (`attention_kv_sinks_bias`): both extras at once — DeepSeek V4's CSA
 // layers carry `attn_sinks` AND the lightning indexer's top-k mask on the SAME attention. Sinks
@@ -111,9 +138,19 @@ layout(binding = 3) buffer OB { float o[]; };
 #else
 #define ADD_BIAS(s, row, j) (s)
 #endif
+#ifdef COMP_BIAS
+#define ADD_COMP_BIAS(s, row, j) ((s) + cbias[(row) * pc.comp_len + (j)])
+#else
+#define ADD_COMP_BIAS(s, row, j) (s)
+#endif
 
 const uint TILE = 1024u;
-shared float q_sh[512];
+// Widest head this kernel serves: the staged query, and the output dims its 64 threads own
+// (`ATTN_KV_ACC` each). The host refuses wider heads (`ATTN_KV_MAX_HD` in adapter.rs, kept in
+// step by `attention_kv_bound_matches_host`).
+#define ATTN_KV_MAX_HD 512
+#define ATTN_KV_ACC (ATTN_KV_MAX_HD / 64)
+shared float q_sh[ATTN_KV_MAX_HD];
 shared float sc[1024];
 shared float red[64];
 
@@ -156,9 +193,9 @@ void main() {
 
     float m = -3.0e38;
     float l = 0.0;
-    // Up to 8 output dims per thread (t + c*64), covering hd up to 512 (gemma4 full layers).
-    float acc[8];
-    for (uint c = 0u; c < 8u; c++) { acc[c] = 0.0; }
+    // Up to ATTN_KV_ACC output dims per thread (t + c*64), covering hd up to ATTN_KV_MAX_HD.
+    float acc[ATTN_KV_ACC];
+    for (uint c = 0u; c < uint(ATTN_KV_ACC); c++) { acc[c] = 0.0; }
 
     // Start at the window's tile: skip tiles entirely below `lo` (fully masked). This guarantees
     // every processed tile has ≥1 in-window key, so `mnew` is finite and masked keys get exp→0
@@ -206,7 +243,7 @@ void main() {
         float corr = exp(m - mnew);
         l = l * corr + tsum;
         m = mnew;
-        for (uint c = 0u; c < 8u; c++) {
+        for (uint c = 0u; c < uint(ATTN_KV_ACC); c++) {
             uint d = t + c * 64u;
             if (d < hd) {
                 float a = 0.0;
@@ -220,6 +257,69 @@ void main() {
         barrier();
     }
 
+#ifdef COMP
+    // The compressed segment: blocks j < (qpos + 1) / comp_ratio (integer floor, so a block is
+    // visible from the token that completes it) and j < comp_len, folded into the SAME running
+    // (m, l, acc) as the raw tiles above, so one softmax covers both — the reference's attention
+    // over its concatenated `[raw | compressed]` cache. Block j is row j (no ring), and its key
+    // row is also its value row. The tile body is the raw loop's with those reads swapped in; the
+    // raw loop is left as it was so the builds without COMP compile to the same code.
+    //
+    // A tile whose every key the bias masks to -inf is harmless here, unlike in the raw loop:
+    // the raw tiles always include the query's own key, so `m` is finite before this loop and
+    // `mnew = max(m, -inf)` stays finite, sending each masked key's exp to exactly 0.
+    uint nvis = min((qpos + 1u) / pc.comp_ratio, pc.comp_len);
+    for (uint ts = 0u; ts < nvis; ts += TILE) {
+        uint te = min(ts + TILE, nvis);
+        float lmax = -3.0e38;
+        for (uint j = ts + t; j < te; j += 64u) {
+            uint kbase = (j * pc.nkv + kvh) * hd;
+            float dotv = 0.0;
+            for (uint d = 0u; d < hd; d++) { dotv += q_sh[d] * float(ck[kbase + d]); }
+            float s = ADD_COMP_BIAS(dotv * scale, ti, j);
+            sc[j - ts] = s;
+            lmax = max(lmax, s);
+        }
+        red[t] = lmax;
+        barrier();
+        for (uint stride = 32u; stride > 0u; stride /= 2u) {
+            if (t < stride) { red[t] = max(red[t], red[t + stride]); }
+            barrier();
+        }
+        float mnew = max(m, red[0]);
+        barrier();
+
+        float lsum = 0.0;
+        for (uint j = ts + t; j < te; j += 64u) {
+            float p = exp(sc[j - ts] - mnew);
+            sc[j - ts] = p;
+            lsum += p;
+        }
+        red[t] = lsum;
+        barrier();
+        for (uint stride = 32u; stride > 0u; stride /= 2u) {
+            if (t < stride) { red[t] += red[t + stride]; }
+            barrier();
+        }
+        float tsum = red[0];
+
+        float corr = exp(m - mnew);
+        l = l * corr + tsum;
+        m = mnew;
+        for (uint c = 0u; c < uint(ATTN_KV_ACC); c++) {
+            uint d = t + c * 64u;
+            if (d < hd) {
+                float a = 0.0;
+                for (uint j = ts; j < te; j++) {
+                    a += sc[j - ts] * float(ck[(j * pc.nkv + kvh) * hd + d]);
+                }
+                acc[c] = acc[c] * corr + a;
+            }
+        }
+        barrier();
+    }
+#endif
+
     uint obase = (ti * pc.nh + h) * hd;
 #ifdef SINKS
     // Fold the sink into the finished (m, l) the same way the tile loop folds each new tile: it
@@ -231,10 +331,10 @@ void main() {
     float mfin = max(m, sk_h);
     float scorr = exp(m - mfin);
     l = l * scorr + exp(sk_h - mfin);
-    for (uint c = 0u; c < 8u; c++) { acc[c] *= scorr; }
+    for (uint c = 0u; c < uint(ATTN_KV_ACC); c++) { acc[c] *= scorr; }
 #endif
     float inv = 1.0 / l;
-    for (uint c = 0u; c < 8u; c++) {
+    for (uint c = 0u; c < uint(ATTN_KV_ACC); c++) {
         uint d = t + c * 64u;
         if (d < hd) { o[obase + d] = acc[c] * inv; }
     }

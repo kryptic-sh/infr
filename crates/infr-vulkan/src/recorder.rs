@@ -4799,14 +4799,15 @@ impl<'a> Recorder<'a> {
         top_k: u32,
         scale: f32,
         pos: u32,
+        block_ratio: u32,
     ) {
         let k = self.be.kernel(
             "lightning_indexer",
             crate::gemm::lightning_indexer_spv(),
             5,
-            28,
+            32,
         );
-        let mut push = [0u8; 28];
+        let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&rows.to_ne_bytes());
         push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
         push[8..12].copy_from_slice(&n_head.to_ne_bytes());
@@ -4814,6 +4815,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&top_k.to_ne_bytes());
         push[20..24].copy_from_slice(&scale.to_ne_bytes());
         push[24..28].copy_from_slice(&pos.to_ne_bytes());
+        push[28..32].copy_from_slice(&block_ratio.to_ne_bytes());
         self.dispatch_wide(
             k,
             &[
@@ -5436,6 +5438,73 @@ impl<'a> Recorder<'a> {
             &push,
             (q_len * nh) as u32,
         );
+    }
+
+    /// [`Self::attention_kv`] plus DeepSeek V4's COMPRESSED key segment (`attention_kv.comp`'s
+    /// `-DCOMP` builds, `Op::Attention::comp`): `comp[comp_len, nkv*hd]` f16 is attended after the
+    /// raw keys in the same online softmax, block `j` visible to the row at `p` iff
+    /// `j < (p + 1) / comp_ratio`, and serves as its own values. `sinks[nh]` (optional) binds at
+    /// slot 3, then `comp`, then the optional `comp_bias[q_len, comp_len]` f32, output last.
+    ///
+    /// Same f16-KV-only, static, bound restriction as [`Self::attention_kv_sinks`]; the raw-side
+    /// bias of [`Self::attention_kv_bias`] has no `-DCOMP` twin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_comp(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        sinks: Option<&dyn Buffer>,
+        comp: &dyn Buffer,
+        comp_bias: Option<&dyn Buffer>,
+        o: &dyn Buffer,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+        window: usize,
+        scale: f32,
+        cap: usize,
+        comp_len: u32,
+        comp_ratio: u32,
+    ) {
+        let (name, spv) = match (sinks.is_some(), comp_bias.is_some()) {
+            (false, false) => ("attention_kv_comp", crate::gemm::attention_kv_comp_spv()),
+            (false, true) => (
+                "attention_kv_comp_bias",
+                crate::gemm::attention_kv_comp_bias_spv(),
+            ),
+            (true, false) => (
+                "attention_kv_comp_sinks",
+                crate::gemm::attention_kv_comp_sinks_spv(),
+            ),
+            (true, true) => (
+                "attention_kv_comp_sinks_bias",
+                crate::gemm::attention_kv_comp_sinks_bias_spv(),
+            ),
+        };
+        let mut bufs = vec![Self::vkb(q), Self::vkb(kc), Self::vkb(vc)];
+        bufs.extend(sinks.map(Self::vkb));
+        bufs.push(Self::vkb(comp));
+        bufs.extend(comp_bias.map(Self::vkb));
+        // `o` LAST: the trailing binding is the hazard-tracked write.
+        bufs.push(Self::vkb(o));
+        let kern = self.be.kernel(name, spv, bufs.len(), 44);
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        push[36..40].copy_from_slice(&comp_len.to_ne_bytes());
+        push[40..44].copy_from_slice(&comp_ratio.to_ne_bytes());
+        self.dispatch_wide(kern, &bufs, 1, &push, (q_len * nh) as u32);
     }
 
     /// `-DKV_BDA` twin of [`Self::attention_kv`] (#74 slice 1): reads the K/V cache by 64-bit device

@@ -497,6 +497,7 @@ mod tests {
             pos: 0,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         g
     }
@@ -684,6 +685,7 @@ mod tests {
             pos: 0,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
 
         let ids = g.input(TensorDesc::new(vec![1], DType::I32));
@@ -4186,7 +4188,20 @@ impl MetalBackend {
                 pos,
                 sinks,
                 key_bias,
+                comp,
             } => {
+                // DeepSeek V4's compressed key segment (`Op::Attention::comp`) has no Metal kernel:
+                // its only consumer has a head wider than this backend's attention bound below,
+                // so a kernel here would serve no model. Refuse it rather than attend the raw
+                // keys alone.
+                infr_core::graph::check_attention(g, op).map_err(Error::Unsupported)?;
+                if comp.is_some() {
+                    return Err(Error::Unsupported(
+                        "metal attention: Op::Attention::comp (DeepSeek V4's compressed keys) has \
+                         no Metal kernel"
+                            .into(),
+                    ));
+                }
                 let (rows, kv_len, nh, nkv, hd) = (
                     rows as usize,
                     kv_len as usize,
@@ -5812,6 +5827,10 @@ impl MetalBackend {
                 freq_factors,
                 key_bias,
             } => {
+                if let Some(b) = key_bias {
+                    infr_core::graph::check_score_bias(g, b, rows, kv_len, "Op::Mla key_bias")
+                        .map_err(Error::Unsupported)?;
+                }
                 // MLA attention (DeepSeek V2/V3 absorbed form), ported from the Vulkan mla.comp:
                 // the kernel reads the K cache in its native f16 (`device const half*`, one half per
                 // element — the Metal layout, not Vulkan's u32-packed-pair), so an f16 cache is
@@ -5920,7 +5939,15 @@ impl MetalBackend {
                 top_k,
                 scale,
                 pos,
+                block_ratio,
             } => {
+                if block_ratio == 0 {
+                    return Err(Error::Unsupported(
+                        "metal Op::LightningIndexer: block_ratio 0 — a key covers at least one \
+                         position"
+                            .into(),
+                    ));
+                }
                 // DeepSeek V3.2's top-k key selector, ported from the Vulkan
                 // `lightning_indexer.comp`: one threadgroup of 256 threads per query row scores
                 // every cached key and then runs `top_k` argmax rounds over those scores. Like
@@ -5935,6 +5962,13 @@ impl MetalBackend {
                 // Every output slot must name a key that exists. llama.cpp clamps at graph-build
                 // time (`n_top_k = min(indexer_score->ne[0], n_indexer_top_k)`); the kernel cannot
                 // refuse the work, so refuse it here rather than emit a duplicated index.
+                if kv_len == 0 || top_k == 0 {
+                    return Err(Error::Unsupported(format!(
+                        "metal Op::LightningIndexer: kv_len {kv_len} / top_k {top_k} — an \
+                         indexer over no keys selects nothing; the caller skips it (and its \
+                         TopkMask)"
+                    )));
+                }
                 if top_k > kv_len {
                     return Err(Error::Unsupported(format!(
                         "metal Op::LightningIndexer: top_k {top_k} exceeds kv_len {kv_len} — \
@@ -5972,6 +6006,7 @@ impl MetalBackend {
                 p.extend_from_slice(&top_k.to_ne_bytes());
                 p.extend_from_slice(&scale.to_ne_bytes());
                 p.extend_from_slice(&pos.to_ne_bytes());
+                p.extend_from_slice(&block_ratio.to_ne_bytes());
                 let pso = self.pipelines.get("lightning_indexer_f16kv")?;
                 let bufs: Vec<&MtlBuffer> = vec![
                     bq.as_ref(),
@@ -6010,6 +6045,12 @@ impl MetalBackend {
                 // Every index the scatter writes must land inside the mask row; the kernel cannot
                 // refuse the dispatch and an out-of-range device write is undefined. Same bound
                 // `Op::LightningIndexer` enforces on the indices it produces.
+                if kv_len == 0 || top_k == 0 {
+                    return Err(Error::Unsupported(format!(
+                        "metal Op::TopkMask: kv_len {kv_len} / top_k {top_k} — a mask over no \
+                         keys selects nothing; the caller skips it"
+                    )));
+                }
                 if top_k > kv_len {
                     return Err(Error::Unsupported(format!(
                         "metal Op::TopkMask: top_k {top_k} exceeds kv_len {kv_len} — the indices \

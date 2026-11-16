@@ -769,6 +769,25 @@ fn main() {
             "attention_kv_sinks_bias",
             &["-DSINKS", "-DBIAS"],
         ),
+        // `Op::Attention::comp` (deepseek4's compressed CSA/HCA keys): the same ONE-build rule,
+        // on the sinks and segment-bias axes V4 actually combines it with (HCA: sinks; CSA: sinks
+        // and the top-k bias). The raw-side `-DBIAS` never combines with it.
+        ("attention_kv", "attention_kv_comp", &["-DCOMP"]),
+        (
+            "attention_kv",
+            "attention_kv_comp_bias",
+            &["-DCOMP", "-DCOMP_BIAS"],
+        ),
+        (
+            "attention_kv",
+            "attention_kv_comp_sinks",
+            &["-DCOMP", "-DSINKS"],
+        ),
+        (
+            "attention_kv",
+            "attention_kv_comp_sinks_bias",
+            &["-DCOMP", "-DSINKS", "-DCOMP_BIAS"],
+        ),
         // Planar Q8_0 KV cache: scalar dequant-on-read variants. K/V decouple (-DKQ8 / -DVQ8) → 3
         // quant combos for the STATIC scalar path; coupled-only for the record-once (dead for Q8).
         ("attention_kv", "attention_kv_q8", &["-DKQ8", "-DVQ8"]),

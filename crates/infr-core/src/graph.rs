@@ -106,6 +106,41 @@ pub struct HyperGates {
     pub comb: TensorId,
 }
 
+/// DeepSeek V4's COMPRESSED key segment on [`Op::Attention`] (`comp`): a CSA or HCA layer's
+/// compressed cache, attended beside the raw sliding window in the same softmax.
+///
+/// The reference concatenates the two caches into one (`build_csa_lid_attention` /
+/// `build_hca_attention`: `ggml_concat(raw_k, comp_k)` with the raw mask and the compressed mask
+/// concatenated the same way) and runs one attention over the result with the per-head sink. This
+/// carries the second half as its own operand instead, which is the same function without the
+/// per-step copy of up to `ctx/ratio` rows.
+///
+/// Key `j` of the compressed cache is visible to query row `t` (absolute position `p = pos + t`)
+/// iff `j < len` and `j < (p + 1) / ratio`, integer FLOOR: a block becomes visible at the token
+/// that completes it, never before (`llama_kv_cache_dsv4`'s plan `n_visible`, written into the
+/// compressed mask by `dsv4_set_kq_mask`). A visible key scores `q·cache[j] * scale + bias[t, j]`
+/// and its value row is `cache[j]` itself: the compressed cache serves as both K and V (V4's
+/// `build_attn_mha(q, k_all, k_all, …)`), `n_kv * head_dim` wide like the raw rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompSegment {
+    /// Compressed rows `[cap_rows, n_kv * head_dim]`, row `j` holding block `j`. A persistent
+    /// buffer like the raw cache, read in place and never written by this op; `cap_rows >= len`.
+    pub cache: TensorId,
+    /// Committed rows: no key at or past `len` is read. The caller passes the ubatch's widest
+    /// visible count (`Dsv4CompPlan::n_visible_max`), so `len` never cuts a visible key.
+    pub len: u32,
+    /// Positions per compressed block, at least 1 (V4 uses `DSV4_CSA_RATIO` and
+    /// `DSV4_HCA_RATIO`).
+    pub ratio: u32,
+    /// Optional additive score bias `[rows, len]` f32, row stride `len`, added before the softmax
+    /// max — exactly [`Op::TopkMask`]'s `dst` laid out with its `kv_len` = `len`, so the CSA emit
+    /// passes the indexer's expanded selection straight in. A key is attended only when it is
+    /// causally visible (above) AND its bias is finite, which is the reference's
+    /// `top-k mask + causal mask` sum: a selected-but-invisible index (the indexer fills its tail
+    /// with those when fewer than `top_k` keys are visible) stays masked. `None` on HCA layers.
+    pub bias: Option<TensorId>,
+}
+
 /// How a tensor handle is provisioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TensorKind {
@@ -412,6 +447,17 @@ pub enum Op {
         /// `None` for every arch in this codebase today, and on that path each backend runs the code
         /// it ran before this field existed — no current model's numerics can move.
         key_bias: Option<TensorId>,
+        /// Optional compressed key segment (DeepSeek V4's CSA/HCA tiers, see [`CompSegment`]),
+        /// attended after the raw keys in ONE softmax: the score max, the denominator and the
+        /// output each run over the visible raw keys, then the visible compressed keys, then the
+        /// sink when `sinks` is set. The raw keys keep `mask` exactly as without it.
+        ///
+        /// Requires `key_bias: None` (the compressed segment carries its own bias, and V4 has no
+        /// raw-side one) and a causal or sliding-window `mask`; [`check_attention`] is the
+        /// host check every backend runs. CPU and Vulkan serve it; Metal refuses it.
+        ///
+        /// `None` leaves every backend on the code it ran before this field existed.
+        comp: Option<CompSegment>,
     },
     /// Multi-head Latent Attention (DeepSeek V2/V3). Absorbed form: one compressed K row per token
     /// (V is an aliased prefix view), `wk_b` absorbs Q nope into the latent space before the dot
@@ -463,8 +509,14 @@ pub enum Op {
         key_bias: Option<TensorId>,
     },
     /// Expand `Op::LightningIndexer`'s `[rows, top_k]` i32 key indices into the additive
-    /// `[rows, kv_len]` f32 score mask `Op::Mla::key_bias` consumes: `0.0` at every selected key,
+    /// `[rows, kv_len]` f32 score mask `Op::Mla::key_bias` (V3.2) and [`CompSegment::bias`] (V4,
+    /// with `kv_len` the segment's `len`) consume: `0.0` at every selected key,
     /// `f32::NEG_INFINITY` everywhere else.
+    ///
+    /// A selected index is not by itself a visible key: when fewer than `top_k` keys are eligible
+    /// the indexer fills the tail with ineligible ones, and the consumer's own causal rule keeps
+    /// them masked — the reference's `build_top_k_mask` likewise ADDS this mask to the causal
+    /// one, so a key is attended only when it is both selected and causally visible.
     ///
     /// This is the whole of "how top-k feeds attention" (`docs/deepseek.md`): llama.cpp materialises
     /// the same `[n_kv, n_tokens]` mask and adds it to the causal one, so the numerics are faithful
@@ -478,7 +530,9 @@ pub enum Op {
     ///
     /// `-inf` (not a large finite negative) is safe because at least one key is always selected:
     /// `top_k >= 1` and the indexer's own order ranks every causally-eligible key above every
-    /// ineligible one, so each row's softmax max is finite and `exp(-inf - max) == 0` exactly.
+    /// ineligible one, so each row's softmax max is finite and `exp(-inf - max) == 0` exactly. On
+    /// V4 a row may see no compressed key at all, and its max stays finite through the raw keys
+    /// the same attention scores first (each row's own key among them).
     /// Indices are read as u32 bit patterns out of the i32 `idx` tensor — [`Op::Argmax`]'s carrier
     /// convention, which is what `Op::LightningIndexer` writes.
     TopkMask {
@@ -671,15 +725,21 @@ pub enum Op {
         /// Channels per row; the compressor's `n_embd_head`, doubled where the tier doubles it.
         n_embd: u32,
     },
-    /// DeepSeek V3.2's **lightning indexer** (`deepseek32.cpp`'s `// lightning indexer` block, the
-    /// non-fused branch): a cheap per-(query row, key) relevance score whose top-`top_k` keys are
-    /// the only ones that layer's real MLA attention may then see. Per query row `t` at absolute
-    /// position `abs = pos + t`:
+    /// DeepSeek's **lightning indexer** (V3.2: `deepseek32.cpp`'s `// lightning indexer` block, the
+    /// non-fused branch; V4: `deepseek4.cpp`'s `build_lid_top_k`, whose fused form is ggml's
+    /// `GGML_OP_LIGHTNING_INDEXER` with the same arithmetic): a cheap per-(query row, key)
+    /// relevance score whose top-`top_k` keys are the only ones that layer's real attention may
+    /// then see. Per query row `t` at absolute position `abs = pos + t`:
     ///
     /// ```text
-    /// score[t, j] = Σ_h  (w[t, h] * scale) * ReLU( q[t, h] · k[j] )     for j <= abs
+    /// score[t, j] = Σ_h  (w[t, h] * scale) * ReLU( q[t, h] · k[j] )     for j < (abs + 1) / block_ratio
     /// dst[t, :]   = the top_k key positions j by (score DESC, j ASC)
     /// ```
+    ///
+    /// With `block_ratio` 1 (V3.2) the bound is `j <= abs`, one key per token. V4's keys are the
+    /// LID compressor's blocks (`kv_lid`, one row per `block_ratio` positions), and a block is
+    /// eligible from the token that completes it on: the integer floor is the compressed mask's
+    /// `n_visible` (`dsv4_set_kq_mask`), so the indexer and [`CompSegment`] agree on every key.
     ///
     /// Four things the reference pins down that a plausible-looking variant gets silently wrong:
     ///
@@ -706,9 +766,11 @@ pub enum Op {
     ///
     /// What the CALLER owes (deepseek32's traps, see `docs/deepseek.md` § "The lightning indexer"):
     /// `q` arrives ALREADY ASSEMBLED and ALREADY ROPE'D — this op does no rope of its own (unlike
-    /// [`Op::Mla`], which ropes its q_pe internally). The indexer head is laid out `[rope | nope]`,
-    /// the OPPOSITE of the MLA head, and its rope is NEOX where the main rope is NORM; both are the
-    /// graph builder's problem, and by the time the head reaches here it is just `head_dim` floats.
+    /// [`Op::Mla`], which ropes its q_pe internally). V3.2's indexer head is laid out
+    /// `[rope | nope]`, the OPPOSITE of the MLA head, and its rope is NEOX where the main rope is
+    /// NORM; V4 ropes the head's tail with the compressed-layer rope instead (`build_lid_top_k`'s
+    /// `ggml_rope_set_offset`). Both are the graph builder's problem, and by the time the head
+    /// reaches here it is just `head_dim` floats.
     /// The **Hadamard rotation** llama.cpp applies to `q` and `k` is deliberately NOT ported: it is
     /// one orthogonal transform applied identically to both sides, so it preserves every dot
     /// product and exists only for quantisation friendliness — nothing to reproduce in an
@@ -721,14 +783,15 @@ pub enum Op {
     /// cap_rows`, and every backend refuses a cache with fewer than `kv_len` rows. A wrapped ring
     /// cannot arise here and could not be served if it did — masking is causal only, so position 0
     /// is eligible for every query row, and a ring that had wrapped would have overwritten row 0
-    /// with a later position before this op ever ran. (V3.2's indexer has no sliding window; the
-    /// caches that wrap in this codebase are the SWA ones.) Emitting indices rather than a `-inf`
+    /// with a later position before this op ever ran. (V3.2's indexer has no sliding window, nor
+    /// does V4's block cache, which holds every block of the context; the caches that wrap in this
+    /// codebase are the SWA ones.) Emitting indices rather than a `-inf`
     /// mask keeps both the mask expansion and a later gather open to the consumer (see
     /// `docs/deepseek.md` § "How top-k feeds attention"): llama.cpp itself expands them back into a
     /// mask and runs dense attention, realising none of the FLOP saving.
     ///
     /// **Ordering is total and identical on every backend**: by score descending, ties broken
-    /// toward the LOWER key index. Keys past the causal bound (`j > abs`) rank below every eligible
+    /// toward the LOWER key index. Keys past the causal bound rank below every eligible
     /// key and among themselves by ascending index, so when fewer than `top_k` keys are eligible
     /// the tail fills with the lowest ineligible positions. That short case is llama.cpp's too —
     /// it clamps only against `n_kv` (`n_top_k = min(indexer_score->ne[0], n_indexer_top_k)`) and
@@ -740,13 +803,13 @@ pub enum Op {
     ///
     /// `top_k <= kv_len` is a precondition (the caller clamps, as llama.cpp's `min` does); each
     /// backend refuses a larger `top_k` rather than naming keys that do not exist. Masking is
-    /// causal only — V3.2's indexer has no sliding window, so there is no [`AttnMask`] here.
+    /// causal only — neither indexer has a sliding window, so there is no [`AttnMask`] here.
     LightningIndexer {
         /// Indexer queries `[rows, n_head, head_dim]`, f32, rope already applied.
         q: TensorId,
-        /// Indexer key cache `[cap_rows, head_dim]` — ONE row per token (MQA). `cap_rows = numel /
-        /// head_dim` must be at least `kv_len`; key `j` is row `j` (see above on why there is no
-        /// ring fold here).
+        /// Indexer key cache `[cap_rows, head_dim]` — ONE row per key (MQA): per token on V3.2, per
+        /// compressed block on V4. `cap_rows = numel / head_dim` must be at least `kv_len`; key `j`
+        /// is row `j` (see above on why there is no ring fold here).
         k_cache: TensorId,
         /// Per-head indexer weights `w` `[rows, n_head]`, f32 — `indexer_proj · x`, UNSCALED (this
         /// op applies `scale`).
@@ -762,6 +825,10 @@ pub enum Op {
         scale: f32,
         /// Absolute position of the first query row (the causal bound is `pos + t`).
         pos: u32,
+        /// Positions per key, at least 1: key `j` is eligible for the row at `abs` iff
+        /// `j < (abs + 1) / block_ratio`. 1 is V3.2's per-token cache; V4's LID cache uses
+        /// `DSV4_CSA_RATIO`.
+        block_ratio: u32,
     },
     /// Gated FFN activation: `dst[r,i] = act(gate[r,i]) * up[r, i + up_off]` (`rows × nff`). `gate`
     /// and `up` are separate handles (a backend may fuse them into one buffer internally). `up_off`
@@ -1367,11 +1434,16 @@ impl Op {
                 dst,
                 sinks,
                 key_bias,
+                comp,
                 ..
             } => {
                 let mut r = vec![q, k_cache, v_cache];
                 r.extend(sinks);
                 r.extend(key_bias);
+                if let Some(c) = comp {
+                    r.push(c.cache);
+                    r.extend(c.bias);
+                }
                 (r, vec![dst])
             }
             Op::Mla {
@@ -1588,6 +1660,111 @@ pub fn check_gather_rows(g: &Graph, op: &Op) -> Result<usize, String> {
     Ok(g.desc(src).numel() / src_stride as usize)
 }
 
+/// The host-side check of an additive score bias read at row stride `cols`: [`Op::Attention`]'s
+/// `key_bias` and its segment's [`CompSegment::bias`], and [`Op::Mla`]'s `key_bias`. The kernels
+/// index it as `bias[row * cols + col]`, so the shape must be EXACTLY `rows * cols` f32: a shorter
+/// one is read past its end, and a longer one (an [`Op::TopkMask`] run at a wider `kv_len`) puts
+/// every row after the first at the wrong offset, which no kernel can notice.
+pub fn check_score_bias(
+    g: &Graph,
+    bias: TensorId,
+    rows: u32,
+    cols: u32,
+    what: &str,
+) -> Result<(), String> {
+    let d = g.desc(bias);
+    if d.dtype != crate::DType::F32 {
+        return Err(format!("{what}: the bias must be F32, got {:?}", d.dtype));
+    }
+    let (have, want) = (d.numel() as u64, u64::from(rows) * u64::from(cols));
+    if have != want {
+        return Err(format!(
+            "{what}: the bias holds {have} elements, not rows {rows} x {cols} — it is read at row \
+             stride {cols}"
+        ));
+    }
+    Ok(())
+}
+
+/// The host-side check every backend runs before an [`Op::Attention`]: the `key_bias` shape
+/// ([`check_score_bias`]) and, when `comp` is set, the segment's contract on [`CompSegment`] and
+/// the field's doc, which a kernel cannot enforce. A zero ratio would divide by zero; a cache whose
+/// rows are not whole, or fewer than `len`, would be read past its end or at the wrong offset; a
+/// cache in another dtype than the raw one is not the reference's layout (`llama_kv_cache_dsv4`
+/// allocates every tier with the same `type_k`). Which dtypes a kernel reads is each backend's
+/// business.
+pub fn check_attention(g: &Graph, op: &Op) -> Result<(), String> {
+    let Op::Attention {
+        k_cache,
+        rows,
+        kv_len,
+        n_kv,
+        head_dim,
+        mask,
+        key_bias,
+        comp,
+        ..
+    } = *op
+    else {
+        return Err(format!("check_attention: got {}", op.kind()));
+    };
+    if let Some(b) = key_bias {
+        check_score_bias(g, b, rows, kv_len, "Op::Attention key_bias")?;
+    }
+    let Some(c) = comp else {
+        return Ok(());
+    };
+    if c.ratio == 0 {
+        return Err("Op::Attention comp: ratio 0 — a block holds at least one position".into());
+    }
+    if key_bias.is_some() {
+        return Err(
+            "Op::Attention comp: key_bias is set too — the compressed segment carries its own \
+             bias and no backend combines a raw-side one with it"
+                .into(),
+        );
+    }
+    if matches!(mask, AttnMask::Canvas { .. }) {
+        return Err(
+            "Op::Attention comp: AttnMask::Canvas — compressed visibility is causal by definition"
+                .into(),
+        );
+    }
+    let (cd, kd) = (g.desc(c.cache).dtype, g.desc(k_cache).dtype);
+    if cd != kd {
+        return Err(format!(
+            "Op::Attention comp: the compressed cache is {cd:?} but the raw cache is {kd:?} — \
+             every tier shares one cache dtype"
+        ));
+    }
+    let row = u64::from(n_kv) * u64::from(head_dim);
+    let numel = g.desc(c.cache).numel() as u64;
+    if row == 0 || !numel.is_multiple_of(row) {
+        return Err(format!(
+            "Op::Attention comp: the compressed cache holds {numel} elements, not whole rows of \
+             n_kv x head_dim = {row}"
+        ));
+    }
+    if numel / row < u64::from(c.len) {
+        return Err(format!(
+            "Op::Attention comp: the compressed cache holds {} rows but len is {}",
+            numel / row,
+            c.len
+        ));
+    }
+    if let Some(b) = c.bias {
+        check_score_bias(g, b, rows, c.len, "Op::Attention comp")?;
+    }
+    Ok(())
+}
+
+/// How many keys of a compressed segment the query at absolute position `abs` sees: blocks
+/// `j < (abs + 1) / ratio` (integer floor, see [`CompSegment`]), never more than the `len`
+/// committed. `ratio` must be non-zero, which [`check_attention`] enforces.
+pub fn comp_visible(abs: u32, ratio: u32, len: u32) -> u32 {
+    ((abs + 1) / ratio).min(len)
+}
+
 /// An ordered op-list over declared tensor handles. Node index in `tensors` == [`TensorId`].
 #[derive(Clone, Default)]
 pub struct Graph {
@@ -1671,10 +1848,17 @@ impl Graph {
                         set.insert(*cache);
                     }
                     Op::Attention {
-                        k_cache, v_cache, ..
+                        k_cache,
+                        v_cache,
+                        comp,
+                        ..
                     } => {
                         set.insert(*k_cache);
                         set.insert(*v_cache);
+                        // The compressed cache is a persistent buffer read the same way.
+                        if let Some(c) = comp {
+                            set.insert(c.cache);
+                        }
                     }
                     // Both DeepSeek ops read a one-row-per-token cache the same way: straight out
                     // of its BOUND buffer at the op's own dtype, never through the interpreter's
@@ -1803,6 +1987,7 @@ mod tests {
             pos: 0,
             sinks: None,
             key_bias: None,
+            comp: None,
         };
         assert_eq!(attn.io(), (vec![t(7), t(6), t(8)], vec![t(9)]));
     }
@@ -1908,6 +2093,7 @@ mod tests {
             pos: 0,
             sinks: sk,
             key_bias: kb,
+            comp: None,
         };
         assert_eq!(
             attn(None, None).io(),
@@ -1994,6 +2180,7 @@ mod tests {
             pos: 0,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         // A non-KV op must NOT contribute any in-place input.
         g.push(Op::Add {

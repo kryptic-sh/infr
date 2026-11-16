@@ -2504,6 +2504,7 @@ fn q8_attention_test(rows: usize, kv_len: usize, hd: usize, pos: usize, tol: f32
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let nkv_elems = kv_len * nkv * hd;
     let bound = vec![
@@ -2616,6 +2617,7 @@ fn kvquant_attention_graph(
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let nkv_elems = cache_rows * nkv * hd;
     let bound = vec![
@@ -2834,6 +2836,7 @@ fn attention_gqa_causal_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 41))),
@@ -2875,6 +2878,7 @@ fn attention_decode_hd256_short_kv_parity() {
             pos: pos as u32,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         let bound = vec![
             (q, f32_bytes(&rand_f32(rows * nh * hd, 71 + kv_len as u64))),
@@ -2917,6 +2921,7 @@ fn attention_prefill_wide_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 61))),
@@ -2954,6 +2959,7 @@ fn attention_flash_matches_reference() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 71))),
@@ -2993,6 +2999,7 @@ fn attention_flash_hd72_matches_reference() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 171))),
@@ -3029,6 +3036,7 @@ fn attention_flash2_hd128_matches_reference() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 181))),
@@ -3065,6 +3073,7 @@ fn attention_flash2_four_row_prefill_match(
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, seed))),
@@ -3122,6 +3131,7 @@ fn attention_flash2_hd256_matches_reference() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 401))),
@@ -3157,6 +3167,7 @@ fn attention_vec_hd256_sliding_window_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 404))),
@@ -3193,6 +3204,7 @@ fn attention_flash2_sliding_window_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 191))),
@@ -3229,6 +3241,7 @@ fn attention_long_context_split32_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 51))),
@@ -3264,6 +3277,7 @@ fn attention_long_context_split32_hd96_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 201))),
@@ -3301,6 +3315,7 @@ fn attention_vec_sliding_window_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 211))),
@@ -3335,6 +3350,7 @@ fn attention_sliding_window_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 44))),
@@ -4054,6 +4070,7 @@ fn attention_canvas_split32_matches_reference() {
         pos: 0,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 501))),
@@ -4089,6 +4106,7 @@ fn attention_canvas_split8_hd256_matches_reference() {
         pos: 0,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 511))),
@@ -4910,6 +4928,7 @@ fn lightning_indexer_parity() {
             top_k: c.top_k as u32,
             scale,
             pos: c.pos as u32,
+            block_ratio: 1,
         });
         let bound = vec![
             (q, f32_bytes(&qi)),
@@ -5091,6 +5110,7 @@ fn attention_sinks_parity() {
             pos: 0,
             sinks: with_sinks.then_some(sk),
             key_bias: None,
+            comp: None,
         });
         (g, q, kc, vc, sk, dst)
     };
@@ -5185,6 +5205,7 @@ fn attention_key_bias_parity() {
             pos: 0,
             sinks: with_sinks.then_some(sk),
             key_bias: kb,
+            comp: None,
         });
         (g, q, kc, vc, kb, sk, dst)
     };
@@ -5278,6 +5299,7 @@ fn attention_key_bias_removes_the_masked_keys_parity() {
             pos: (kv_len - 1) as u32,
             sinks: None,
             key_bias: kb,
+            comp: None,
         });
         let mut b = vec![
             (q, f32_bytes(&qv)),
@@ -5882,6 +5904,7 @@ fn attention_one_cache_as_k_and_v_parity() {
             pos: 0,
             sinks: Some(sk),
             key_bias: None,
+            comp: None,
         });
         let mut bound = vec![
             (q, f32_bytes(&qi)),

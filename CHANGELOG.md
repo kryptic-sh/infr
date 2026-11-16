@@ -31,6 +31,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   which cannot see index values when recording. Nothing emits the op yet; the
   Metal kernel runs only on the macOS CI job.
 
+- **`Op::Attention::comp` — DeepSeek V4's compressed key segment — on CPU and
+  Vulkan, and `Op::LightningIndexer::block_ratio`.** A `CompSegment` attends a
+  compressed cache beside the raw window in the same softmax as the per-head
+  sink: block `j` is visible to the query at position `p` once
+  `j < (p + 1) / ratio`, scores `q·c[j]·scale` plus an optional `[rows, len]`
+  bias (the indexer's top-k mask, as `Op::TopkMask` writes it) and is its own
+  value. This is the reference's attention over a concatenated
+  `[raw | compressed]` cache without the copy. Vulkan serves it with `-DCOMP`
+  builds of the scalar `attention_kv` kernel (f16 caches, head dim up to 512, no
+  decode replay); Metal refuses it. The indexer's `block_ratio` makes key `j`
+  eligible iff `j < (p + 1) / block_ratio`, so it scores V4's LID blocks; 1 is
+  V3.2's per-token rule. Every existing graph passes `comp: None` and
+  `block_ratio: 1` and computes the same bits. Nothing emits either yet.
+  `Op::Attention::key_bias` and `Op::Mla::key_bias` must now be exactly
+  `[rows, kv_len]` f32 (`infr_core::graph::check_score_bias`): a longer one was
+  read at the wrong row offset. `Op::LightningIndexer` and `Op::TopkMask` refuse
+  `kv_len` or `top_k` 0.
+
 - **`infr serve` honours `logit_bias` and `min_p`.** `logit_bias` (OpenAI: token
   id to a bias in -100..=100) is added to the logits before the penalties, as
   llama.cpp's chain does, on every path of the dense seam decode loop (Vulkan,

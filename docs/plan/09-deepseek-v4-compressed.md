@@ -5,7 +5,7 @@ layer but two of the shipped V4-Flash file. Scoped on 2026-11-16 by reading
 llama.cpp at `5676dfbe0` (`src/models/deepseek4.cpp`,
 `src/llama-kv-cache-dsv4.cpp`, `src/llama-graph.cpp`, `src/models/models.h`).
 Statements marked **[I]** were inferred, not read; **[U]** are unknown. Nothing
-here has been built or run yet, except slices S0 to S3 (marked below). Cite
+here has been built or run yet, except slices S0 to S4b (marked below). Cite
 functions, not lines: both reference files have grown since the notes in
 `docs/deepseek.md` were written.
 
@@ -130,8 +130,10 @@ is cleared. infr needs no 256 padding.
   `score[t,j] = Σ_h w[t,h]·relu(iq[t,h]·lidK[j])`, with `j >= n_visible[t]`
   masked.
 - Keep the top `min(rows, 512)`; a compressed key is visible only if it is in
-  the top-k and `j < n_visible[t]`. Top-k only bites once `n_visible > 512`,
-  beyond about 2051 tokens **[I]**.
+  the top-k and `j < n_visible[t]` (`build_top_k_mask` adds the 0/`-inf`
+  selection mask to the compressed causal mask; when fewer than 512 rows are
+  visible, the selected tail is masked rows and stays masked). Top-k only bites
+  once `n_visible > 512`, from position 2051 on (`(2051 + 1) / 4 = 513`).
 - Attention: one softmax over the raw window, the visible compressed keys and
   the per-head sink, scale `1/sqrt(512)`, V = K; de-rope at the query position;
   grouped `wo_a`/`wo_b` as on ratio 0.
@@ -181,13 +183,27 @@ and the `dsv4_model` fixture.
 3. **No scatter is needed [I]:** for one stream the committed rows are
    consecutive (one `WriteKv` per tier, real commits only, never the dummies),
    and the persisted ring rows are at most two contiguous runs (copies).
-4. **Two-segment attention:** `Op::Attention` gains an optional compressed
-   segment `{ cache, len, ratio, bias }`; key `j` is visible to row `t` iff
-   `j < (pos+t+1)/ratio`. `None` must leave every backend on today's path.
-   Declined: copying both segments into one scratch cache (the Vulkan sinks
-   kernel refuses a canvas mask, and it copies about ctx/4 rows per layer per
-   step).
-5. **`Op::LightningIndexer` gains a block ratio** (1 keeps V3.2).
+4. **Two-segment attention:** done in S4a/S4b — `Op::Attention::comp`, a
+   `CompSegment { cache, len, ratio, bias }`; key `j < len` is visible to row
+   `t` iff `j < (pos+t+1)/ratio`, the cache is its own V, and the optional bias
+   is `[rows, len]`, which is `Op::TopkMask`'s output at `kv_len = len`. It
+   requires `key_bias: None` and a causal or sliding-window mask
+   (`check_attention`). CPU, and Vulkan through `-DCOMP` builds of
+   `attention_kv.comp` (f16 caches, head dim up to 512, static recording only);
+   Metal refuses it. `None` leaves every backend on today's path: the
+   attention_kv builds without `-DCOMP` compile to byte-identical SPIR-V, and
+   the CPU arm's raw-key arithmetic is unchanged. Declined: copying both
+   segments into one scratch cache (the Vulkan sinks kernel refuses a canvas
+   mask, and it copies about ctx/4 rows per layer per step).
+5. **`Op::LightningIndexer` gains a block ratio:** done in S4a/S4b —
+   `block_ratio`, key `j` eligible iff `j < (abs+1)/block_ratio`; 1 keeps V3.2
+   bit for bit. The V4 emit passes the LID cache as `k_cache` (one 128-wide f16
+   row per block), `kv_len = n_visible_max` and `top_k = min(kv_len, 512)`. The
+   scoring is ggml's `GGML_OP_LIGHTNING_INDEXER` (`Σ_h w·relu(q·k)`, `w`
+   pre-scaled by `1/sqrt(128·64)`), the same as V3.2's non-fused branch. The LID
+   compressor and the indexer query are Hadamard-rotated in the reference
+   (`attn_rot_k` is forced on for the LID cache); one orthogonal transform on
+   both sides, so the emit skips it on both.
 6. **Persistent buffers** per layer, threaded through allocation, graph inputs,
    reset, `fork`, `seed_from`, `kv_layer_alloc_bytes`, the footprint estimates;
    V4 becomes not rewindable (audit the callers of `has_recurrent_state()` that
@@ -209,14 +225,14 @@ unchanged.
 | S1  | **Done 2026-11-16.** `deepseek4` YaRN config and the compressed-tier `ff` vector (unused yet)                           | `ff` against a closed form at chosen positions; a file with no scaling keys gives 1; a factor without a type is "linear", a uniform divisor                                                                                                   |
 | S2  | **Done 2026-11-16.** B53: one cache as K and V (`kv_row_elems` → `(hd, 0)`, CPU attention takes one guard at a time)    | an op-parity case binding one id to both sides; ratio-0 logits bit-identical, checked ONCE by hand (no test in the tree locks them; see below)                                                                                                |
 | S3  | **Done 2026-11-16.** `Op::GatherRows` on CPU and Vulkan; Metal arm written                                              | from-definition parity with fill, grouping and column offset; a swapped column offset goes red                                                                                                                                                |
-| S4a | CPU two-segment attention and the indexer block ratio                                                                   | equals single-segment attention over a concatenated cache with an explicit bias; `None` and ratio 1 bit-identical to today                                                                                                                    |
-| S4b | Vulkan: the same                                                                                                        | CPU-vs-Vulkan op parity at head dim 48 and 512                                                                                                                                                                                                |
+| S4a | **Done 2026-11-16.** CPU two-segment attention and the indexer block ratio                                              | equals single-segment attention over a concatenated cache with an explicit bias; `None` and ratio 1 bit-identical to today                                                                                                                    |
+| S4b | **Done 2026-11-16.** Vulkan: the same; Metal refuses the segment, its indexer kernel takes the ratio                    | CPU-vs-Vulkan op parity at head dim 48 and 512                                                                                                                                                                                                |
 | S5  | Persistent buffers, geometry, the no-rewind predicate, `wpush` handles; refusal kept                                    | hand-computed V4-Flash footprint; a V4 session refuses a partial rewind                                                                                                                                                                       |
 | S6  | CPU HCA emit; lift the ratio-128 refusal                                                                                | perturbing `attn_compressor_kv` leaves positions 0..126 bit-identical and moves 127 on; a from-definition cache row on the one-layer fixture; a run split at 150 of 200 tokens equals the unsplit run                                         |
 | S7  | CPU CSA emit: overlap, LID, indexer, top-k; lift the last refusal                                                       | commit timing at position 3; from-definition rows 0 and 1 (row 1 reads block 0 as its previous half); with `top_k` 5, indexer weights are inert up to position 22 and move logits from 23; `top_k >= n_visible` equals zeroed indexer weights |
 | S8  | Real-file CPU oracle against llama.cpp                                                                                  | `cpu_prefill_matches_llama_debug_dump` on V4-Flash, one prompt under 100 tokens and one over 300 (HCA live); the `deepseek-v3` tokenizer question closed with `llama-tokenize`                                                                |
 | S9  | Vulkan whole model; then paged MoE with hash routing and the SwiGLU clamp (both refused today; the model exceeds 24 GB) | synthetic GPU-vs-CPU; the real-file dump comparison on Vulkan                                                                                                                                                                                 |
-| S10 | Metal: gather, two-segment attention, indexer field, sqrt-softplus router, `GatherI32`                                  | macOS CI only                                                                                                                                                                                                                                 |
+| S10 | Metal: gather, two-segment attention, the indexer ratio (written in S4b), sqrt-softplus router, `GatherI32`             | macOS CI only                                                                                                                                                                                                                                 |
 
 S2's logits check was a one-off: a temporary test wrote the bit patterns of four
 ratio-0 fixtures (`PROMPT`; windows 1 and 3 at a 40-token prompt; hash-routed)
@@ -226,6 +242,39 @@ added, because `docs/synthetic-models.md` rule 2 allows a synthetic golden only
 when it is blessed against an external oracle, and these values would be
 self-blessed. An oracle-blessed V4 lock (llama.cpp over the synthetic file) is
 backlog work.
+
+S4's "unchanged" check was the same kind of one-off: a temporary test wrote the
+output bits of twelve `Op::Attention` shapes (causal, sliding window and ring,
+canvas, sinks, `key_bias`, both, the V4 one-cache shape; head dims 48 to 512;
+prefill and decode) and three `Op::LightningIndexer` shapes on CPU, Vulkan0 and
+Vulkan1 from the pre-change tree; the changed tree, with `comp: None` and
+`block_ratio: 1`, reproduced every one. Separately, the fifteen existing
+`attention_kv.comp` builds compile to byte-identical SPIR-V before and after
+(compiled with `build.rs`'s `glslc` flags and hashed).
+
+### Notes for S6 and S7: before the first block
+
+`build_attention_impl` still has a raw-only branch (`build_raw_attention`) for a
+compressed layer, taken when the tier's compressed mask (`kq_mask`) is null.
+`dsv4_build_comp_inputs` creates that mask only when the plan's `n_kv > 0`, and
+`dsv4_build_comp_plan` ends with `n_kv = max(PAD(n_kv, 256), 256)`, so at this
+pin the branch is unreachable for any ubatch with tokens: the compressed half
+always runs, all `-inf` until a block completes (section 0 item 1). The two
+statements agree; the fallback is dead code, not the reference's behaviour.
+Numerically an all-masked compressed half adds nothing, so infr's emit is free
+to skip it:
+
+- **HCA:** when `n_visible_max` is 0, pass `comp: None` (a `len` 0 segment
+  computes the same bits on CPU, `attention_comp_segment_*`, but there is
+  nothing to bind it to).
+- **CSA:** when `n_visible_max` is 0, skip `Op::LightningIndexer` and
+  `Op::TopkMask` as well as the segment: both ops refuse `kv_len` or `top_k` 0
+  on every backend (`lightning_indexer_and_topk_mask_refuse_zero_keys`), since a
+  zero-length score or mask tensor has nothing to select. Otherwise
+  `kv_len = len = n_visible_max` and `top_k = min(len, index_topk)`, which is at
+  least 1.
+- Rows inside a ubatch with no visible block while others have some are the
+  segment's ordinary case (tested); their max is finite through the raw keys.
 
 Prefill one-batch against token-by-token equality is the best single test of the
 plan, state and sentinel logic; it arrives with batched V4 prefill (section 5).
@@ -256,18 +305,33 @@ file), a larger page file, or a smaller file. S8 therefore needs a file that
 fits in RAM (the 60.8 GB repack, if both engines load its tensor types) or
 another machine; until then the real file is checked by infr alone.
 
+**A second oracle that needs no large file: llama.cpp on the synthetic V4
+fixture.** `dsv4_model` in `synthetic_deepseek2.rs` already writes a small GGUF
+with ratio 4 and 128 layers at small windows. If llama.cpp loads it,
+`llama-debug --save-logits` over that file scores both compressor kinds in
+seconds, which is also what `docs/synthetic-models.md` rule 2 asks of a
+synthetic golden. Not tried yet: whether the fixture carries every key and
+tensor llama.cpp's loader and tokenizer demand is unknown **[U]**. It is the
+next slice (S5a): make the fixture load in llama.cpp and compare the ratio-0
+logits, which infr already computes, before S6 and S7 rely on it. The 60.8 GB
+"Fractal" repack is not an alternative: its repository ships patched llama.cpp
+binaries, so stock llama.cpp presumably cannot read it (not tried).
+
 ## 5. Performance, after correctness
 
 Measure against `llama-bench` (CPU and Vulkan builds) on the same file.
 
-V4, in order: batched prefill (per-token today, which multiplies expert I/O by
-the prompt length; needs an ids buffer per chunk for hash layers); a
-span-carried hyper-connection stream so layer-major and streamed prefill serve
-V4; paged MoE with hash routing and the clamp, then B184; the sinks and
-compressed attention tiers on Vulkan, gathering the CSA top-k at long context
-instead of masking; the indexer's cost per CSA layer; `CompressPool` and
-hyper-connection kernels (B-DSV4-POOL, B-DSV4-HC); decode replay, measured
-first.
+V4, in order: the CPU attention arm converts the whole committed compressed
+prefix (`len` rows) to f32 on every call, as it already does for the raw cache,
+which at long context is `ctx/4` rows per CSA layer per decode step (convert per
+key inside the dot instead, or keep an f32 shadow); batched prefill (per-token
+today, which multiplies expert I/O by the prompt length; needs an ids buffer per
+chunk for hash layers); a span-carried hyper-connection stream so layer-major
+and streamed prefill serve V4; paged MoE with hash routing and the clamp, then
+B184; the sinks and compressed attention tiers on Vulkan, gathering the CSA
+top-k at long context instead of masking; the indexer's cost per CSA layer;
+`CompressPool` and hyper-connection kernels (B-DSV4-POOL, B-DSV4-HC); decode
+replay, measured first.
 
 `deepseek2` / V3: an `Op::Mla` split-K decode arm and a prefill tier
 (B-DSHW-MLA-SCALAR-TIER has the gaps); B108 on CPU at depth. Do not reopen

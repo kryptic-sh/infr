@@ -1196,7 +1196,7 @@ kernel void topk_mask_f32(device const uint*  idx [[buffer(0)]],
 // order; the Metal f16 cache is `device half*` (one half per element), so there is no
 // u32-packed-pair unpacking — index it directly.
 //
-//   score[t, j] = Sum_h (w[t, h] * scale) * relu( q[t, h] . k[j] )     for j <= pos + t
+//   score[t, j] = Sum_h (w[t, h] * scale) * relu( q[t, h] . k[j] )     for j < (pos + t + 1) / block_ratio
 //   dst[t, :]   = the top_k key positions by (score DESC, index ASC)
 //
 // The ReLU is INSIDE the head-weighted sum and `scale` multiplies the WEIGHT, never the score —
@@ -1215,6 +1215,7 @@ struct LidxParams {
     uint top_k;
     float scale;           // 1/sqrt(head_dim * n_head) — applied to the WEIGHT
     uint pos;              // absolute position of the first query row
+    uint block_ratio;      // positions per key: 1 for V3.2's per-token keys, V4's LID block size
 };
 
 constant constexpr uint LIDX_NTHREAD = 256u;
@@ -1252,9 +1253,9 @@ kernel void lightning_indexer_f16kv(device const float* q       [[buffer(0)]],
     // loop by it and never read a `sval`/`sidx` slot no thread wrote.
     uint ntg = min(ntgr, LIDX_NTHREAD);
 
-    // Causal bound: a key at an absolute position past the query's is not eligible, and only
-    // `kv_len` positions are cached.
-    uint hi = min(p.pos + row + 1u, p.kv_len);
+    // Causal bound: a key whose block the query has not completed is not eligible (with one
+    // position per key, any key past the query's own position), and only `kv_len` keys are cached.
+    uint hi = min((p.pos + row + 1u) / p.block_ratio, p.kv_len);
     uint sbase = row * p.kv_len;
 
     // -- Phase 1: score every key --

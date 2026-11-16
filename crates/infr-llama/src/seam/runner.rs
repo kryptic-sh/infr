@@ -3263,6 +3263,7 @@ pub(crate) fn generate_dense_backend_bound(
                     // CSA's top-k score bias is not wired into this builder yet (see
                     // `docs/backlog.md`) — landed but unwired, same as `Op::CompressPool` was.
                     key_bias: None,
+                    comp: None,
                 });
                 // DE-ROPE the attention output's rope slice, per head, by the QUERY position —
                 // `ggml_rope_ext_back` at the same theta and layout as the forward q rope. Nothing
@@ -3519,6 +3520,7 @@ pub(crate) fn generate_dense_backend_bound(
                             top_k: ix_top_k as u32,
                             scale: 1.0 / ((ix_hd * ix_nh) as f32).sqrt(),
                             pos: start_pos as u32,
+                            block_ratio: 1,
                         });
                         // Expand the indices into the additive `-inf`-outside-top-k score mask the
                         // MLA kernels add. llama.cpp materialises the same mask and runs DENSE
@@ -4031,6 +4033,7 @@ pub(crate) fn generate_dense_backend_bound(
                     pos: start_pos as u32,
                     sinks: None,
                     key_bias: None,
+                    comp: None,
                 });
                 // LFM3: one sigmoid gate per head, projected from the attention input and applied
                 // to that head's output before the o-projection.

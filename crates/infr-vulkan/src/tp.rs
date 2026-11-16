@@ -418,7 +418,14 @@ impl TensorParallelBackend {
                     // The cache tensor is a per-rank KV shard (state already Sharded from binding).
                     state.insert(cache, Shard::Sharded);
                 }
-                Op::Attention { q, dst, .. } => {
+                Op::Attention { q, dst, comp, .. } => {
+                    // The compressed cache would need the same per-rank head split as the raw
+                    // one, which nothing allocates.
+                    require(
+                        comp.is_none(),
+                        i,
+                        "an Attention compressed segment is unsupported under TP",
+                    )?;
                     let sq = shard_of(&state, q);
                     if sq == Shard::Sharded {
                         if let Op::Attention { n_head, n_kv, .. } = &mut *op {

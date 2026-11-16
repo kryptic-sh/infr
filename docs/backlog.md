@@ -1223,21 +1223,26 @@ llama.cpp to bless the synthetic file, per `docs/synthetic-models.md` rule 2.
   consumer), and no coupled-ubatch branch (one sequence is never coupled). A
   multi-stream slice must add the per-sequence ring and cache offsets and the
   per-sequence block padding.
-- **`Op::Attention::key_bias` landed on CPU/Vulkan/Metal (2026-08-30), but
-  nothing calls it for CSA yet.** The op-level capability is done and
-  parity-tested (`crates/infr-llama/tests/seam_op_parity.rs`'s
-  `attention_key_bias_*` tests, `crates/infr-metal/tests/parity.rs`'s
-  `attention_key_bias_*_parity` `#[ignore]`d tests) — same kernel family as
-  `sinks` on every backend, combinable with it. What is still missing is the CSA
-  graph itself: a builder in `runner.rs` that concatenates `[raw | compressed]`
-  K/V, runs `Op::TopkMask` over it, and passes the result as `key_bias` on an
-  ordinary `Op::Attention` alongside `mw.sinks` — none of which exists yet
-  (deepseek4's only real `Op::Attention` sinks call site in `runner.rs` still
-  passes `key_bias: None`). Needs the `[raw | compressed]` concatenation layout
-  decided first, which is part of Slice B above.
-- **`Op::LightningIndexer`'s contract is written for V3.2's per-token key
-  cache.** V4's keys come out of the compressor, so `top_k` counts compressed
-  blocks; re-read the op's `k_cache`/`kv_len` meaning before reusing it.
+- **Two-segment attention landed on CPU and Vulkan (2026-11-16, plan 09 S4),
+  unwired.** `Op::Attention::comp` (`CompSegment { cache, len, ratio, bias }`)
+  attends the compressed cache beside the raw window in one softmax with the
+  sink, so there is no `[raw | compressed]` concatenation to build: the CSA emit
+  passes `kv_csa` as `cache`, `n_visible_max` as `len`, ratio 4 and
+  `Op::TopkMask`'s output (at `kv_len = len`) as `bias`; HCA passes `kv_hca`,
+  ratio 128 and no bias. `key_bias` stays the V3.2/raw-side field and is refused
+  together with `comp`. Tests: `seam_op_parity.rs`'s `attention_comp_segment_*`
+  and `indexer_topk_mask_two_segment_chain`.
+- **`Op::LightningIndexer` takes V4's block cache (2026-11-16):** `block_ratio`
+  makes key `j` eligible iff `j < (abs+1)/block_ratio` (1 is V3.2, bit for bit).
+  The emit passes `kv_lid` as `k_cache`, `kv_len = n_visible_max` and
+  `top_k = min(kv_len, index_topk)`; the `cap_rows >= kv_len` rule holds because
+  the block cache never wraps. The scoring matches ggml's
+  `GGML_OP_LIGHTNING_INDEXER` (`w` pre-scaled by `1/sqrt(head·heads)`); the
+  reference's Hadamard rotation of the LID query and keys is skipped on both
+  sides, as on V3.2. A selected index past a row's visible count (the indexer
+  fills its tail with those when fewer than `top_k` blocks are visible) gets a 0
+  from `Op::TopkMask` and stays masked by the segment's own visibility rule,
+  which is the reference's `top-k mask + causal mask` sum.
 - **The raw cache is one K=V cache (2026-11-16):** `seam::kv_row_elems` gives V4
   `(head_dim, 0)`, the emit writes the row once and binds the K cache to both
   `Op::Attention` sides. The compressed caches and the three compressor states
@@ -1315,6 +1320,24 @@ a silent fallback.
   exists to avoid. A perf pass means teaching at least `attn_partial` +
   `attn_combine` the sink (it folds cleanly into the combine's final `(m, l)`,
   which is where the split-K partials already merge).
+- **`Op::Attention { comp }` on Vulkan** (2026-11-16) is `attention_kv.comp`'s
+  four `-DCOMP` builds (with and without sinks and the segment bias): f16 raw
+  and compressed caches, head dim up to `ATTN_KV_MAX_HD`, static recording only
+  (`decode_eligible` refuses it). It is the scalar one-workgroup-per-(row, head)
+  kernel and attends EVERY visible compressed key, masking the unselected ones
+  with the bias, so a CSA layer's cost grows with `n_visible` (ctx/4) where the
+  reference's flash path compacts to the top-k (B-DSHW-FUSED-REF). The
+  tensor-parallel lowering refuses it (the compressed cache has no per-rank
+  split). **Metal refuses `comp`** outright: V4's head dim 512 is past its
+  attention bound, so a kernel there would serve no model yet (plan 09 S10).
+  Metal's indexer kernel takes `block_ratio` but has not run anywhere; the macOS
+  CI job runs `crates/infr-metal/tests/parity.rs`, whose indexer case is
+  ratio 1.
+- **The CPU attention arm widens the compressed prefix to f32 on every call**
+  (2026-11-16): `len` rows per op, the same pattern as its raw cache, so a CSA
+  layer at long context converts `ctx/4` rows per decode step before attending
+  any of them. Converting per key inside the dot (or an f32 shadow cache) would
+  remove it; not measured yet (plan 09 § 5).
 - **`Op::Attention { sinks }` on Metal** runs only `ATTN_SINKS_KERNEL`'s two
   instantiations (`attention_sinks_f32`, `attention_sinks_f16kv`). Refused: a
   decoupled or quantized K/V pair, `AttnMask::Canvas`, and the decode-replay
@@ -2133,11 +2156,12 @@ The reference's CSA attention is sparse where flash attention is on.
 `ggml_flash_attn_ext_set_n_kv_max`, and the CUDA and Vulkan backends compact the
 mask and attend over at most that many columns (`fattn-common.cuh`'s
 `use_sparse`; `flash_attn_sparse_compact.comp`); Metal has `n_kv_max` handling
-in `fa_aux.metal`. Read on 2026-11-16, kernels not run. So infr's planned
-two-segment attention, which masks rather than gathers, will do more work than
-the reference past about 2051 tokens; plan 09 § 5 lists gathering the CSA top-k
-as its answer. The OpenCL and Hexagon backends also have cases for these ops and
-were not looked at.
+in `fa_aux.metal`. Read on 2026-11-16, kernels not run. So infr's two-segment
+attention (`Op::Attention::comp`), which masks rather than gathers, does more
+work than the reference from position 2051 on, when a CSA row's visible blocks
+first outnumber the top-k; plan 09 § 5 lists gathering the CSA top-k as its
+answer. The OpenCL and Hexagon backends also have cases for these ops and were
+not looked at.
 
 ### B-DSHW-PULL — the llama.cpp reference has moved past the pin the docs name (2026-08-11, updated 2026-11-12)
 

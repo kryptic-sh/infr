@@ -235,6 +235,7 @@ pub(crate) fn static_walk_live_positions(
                 rows,
                 mask,
                 key_bias,
+                comp,
                 ..
             } => {
                 if *rows != 1 {
@@ -249,6 +250,10 @@ pub(crate) fn static_walk_live_positions(
                 // Sinks are a per-head weight and read no position.
                 if key_bias.is_some() {
                     return Err("an Attention key_bias is sized for the baked length");
+                }
+                // A compressed segment's committed length and bias are the baked step's.
+                if comp.is_some() {
+                    return Err("an Attention comp segment keeps its baked length");
                 }
             }
             // Each bakes a position or a length the walk does not override.
@@ -701,6 +706,7 @@ mod tests {
                 pos: 0,
                 sinks: None,
                 key_bias: None,
+                comp: None,
             });
             let ids = Ids {
                 positions,
@@ -808,6 +814,7 @@ mod tests {
                     top_k: 1,
                     scale: 0.125,
                     pos: 0,
+                    block_ratio: 1,
                 })
             });
             assert!(static_walk_live_positions(&g).is_err());

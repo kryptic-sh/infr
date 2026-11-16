@@ -242,7 +242,7 @@ impl std::fmt::Display for DecodeRefusal {
             Self::AttentionSinksOrBias { op } => {
                 write!(
                     f,
-                    "op {op} (Attention): sinks / key_bias have no dyn kernel"
+                    "op {op} (Attention): sinks / key_bias / comp have no dyn kernel"
                 )
             }
             Self::MixedKvLen { op, kv_len, prev } => write!(
@@ -340,6 +340,7 @@ fn decode_refusal(be_: &VulkanBackend, graph: &Graph) -> Option<DecodeRefusal> {
                 kv_len,
                 sinks,
                 key_bias,
+                comp,
                 ..
             } => {
                 has_attn = true;
@@ -350,10 +351,11 @@ fn decode_refusal(be_: &VulkanBackend, graph: &Graph) -> Option<DecodeRefusal> {
                         head_dim: *head_dim,
                     });
                 }
-                // Attention sinks and key_bias have ONE kernel family (`attention_kv.comp`'s
-                // -DSINKS/-DBIAS static builds) and no params-driven `_dyn` twin, so a replayed
-                // tape would run the sink/bias-free split-K family instead. Force static.
-                if sinks.is_some() || key_bias.is_some() {
+                // Attention sinks, key_bias and the compressed segment have ONE kernel family
+                // (`attention_kv.comp`'s -DSINKS/-DBIAS/-DCOMP static builds) and no
+                // params-driven `_dyn` twin, so a replayed tape would run the split-K family that
+                // knows none of them. Force static.
+                if sinks.is_some() || key_bias.is_some() || comp.is_some() {
                     return Some(DecodeRefusal::AttentionSinksOrBias { op: i });
                 }
                 // Multi-position graph (see the comment above `attn_kv_len`): different kv_len across
@@ -1310,6 +1312,12 @@ pub(crate) const MLA_MAX_KV_LORA_RANK: u32 = 512;
 /// `Op::QkNormRope` arm of [`lower_op`] refuses a wider head, and `qk_norm_rope_bound_matches_host`
 /// fails if the two drift.
 pub(crate) const QK_NORM_ROPE_MAX_HD: u32 = 512;
+
+/// Widest head the scalar `attention_kv.comp` family serves: its `q_sh` shared array, and the
+/// `acc` dims its 64 threads each own. MIRRORS its `#define ATTN_KV_MAX_HD`; the `Op::Attention`
+/// arm of [`lower_op`] refuses a wider head on the compressed-segment route, and
+/// `attention_kv_bound_matches_host` fails if the two drift.
+pub(crate) const ATTN_KV_MAX_HD: usize = 512;
 
 /// Widest DeltaNet key head (`head_k`) the recurrence kernels' shared-memory state and row
 /// buffers hold. MIRRORS `#define DN_MAX_KD` in every `deltanet*.comp` that sizes such a buffer;
@@ -2392,6 +2400,7 @@ fn lower_op(
             pos,
             sinks,
             key_bias,
+            comp,
         } => {
             let (rows, kv_len, nh, nkv, hd, pos) = (
                 *rows as usize,
@@ -2419,6 +2428,58 @@ fn lower_op(
             // kv_len (padded, for nonfa's 256-row tiles) outruns the rows actually present. On a
             // full-context cache kv_len <= att_cap_rows always, so none of these gates move.
             let att_cap_rows = cap / (nkv * hd).max(1);
+            infr_core::graph::check_attention(graph, op).map_err(be)?;
+            // DeepSeek V4's compressed key segment (`Op::Attention::comp`) is served by the
+            // `-DCOMP` builds of the same scalar kernel the sinks route below takes, and nothing
+            // else: no tier of the ladder knows the segment, and one that ignored it would be a
+            // plausible softmax over half the keys.
+            if let Some(c) = comp {
+                let f16 = |t: infr_core::tensor::TensorId| {
+                    matches!(graph.desc(t).dtype, infr_core::DType::F16)
+                };
+                if !f16(*k_cache) || !f16(*v_cache) || !f16(c.cache) {
+                    return Err(be(
+                        "vulkan adapter: Op::Attention with comp needs f16 raw and compressed \
+                         caches — that build has no quant read and no dequant prepass",
+                    ));
+                }
+                // The kernel's per-thread accumulator covers this many output dims, the same
+                // bound every `attention_kv` build has.
+                if hd > ATTN_KV_MAX_HD {
+                    return Err(be(format!(
+                        "vulkan adapter: Op::Attention with comp: head_dim {hd} exceeds the \
+                         attention_kv bound {ATTN_KV_MAX_HD}"
+                    )));
+                }
+                let window = match mask {
+                    AttnMask::SlidingWindow(w) => *w,
+                    // `check_attention` refused a canvas mask.
+                    AttnMask::Causal | AttnMask::Canvas { .. } => 0,
+                };
+                let sk = sinks.map(r).transpose()?;
+                let cb = c.bias.map(r).transpose()?;
+                rec.attention_kv_comp(
+                    r(*q)?,
+                    r(*k_cache)?,
+                    r(*v_cache)?,
+                    sk,
+                    r(c.cache)?,
+                    cb,
+                    r(*dst)?,
+                    rows,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                    window,
+                    *scale,
+                    cap,
+                    c.len,
+                    c.ratio,
+                );
+                return Ok(());
+            }
             // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) and the CSA top-k score
             // bias (`Op::Attention::key_bias`) live in exactly ONE kernel family —
             // `attention_kv.comp`'s -DSINKS/-DBIAS builds, combinable (deepseek4 CSA layers carry
@@ -4523,6 +4584,10 @@ fn lower_op(
             freq_factors,
             key_bias,
         } => {
+            if let Some(b) = key_bias {
+                infr_core::graph::check_score_bias(graph, *b, *rows, *kv_len, "Op::Mla key_bias")
+                    .map_err(be)?;
+            }
             // `mla.comp` holds the absorbed query and the V accumulator in FIXED-size shared
             // arrays, so an over-wide latent would write past them (shared memory is not bounds
             // checked — the symptom is corrupted neighbours or a lost device, not a fault). The
@@ -4596,11 +4661,23 @@ fn lower_op(
             top_k,
             scale,
             pos,
+            block_ratio,
         } => {
+            if *block_ratio == 0 {
+                return Err(be(
+                    "vulkan Op::LightningIndexer: block_ratio 0 — a key covers at least one position",
+                ));
+            }
             // Every output slot must name a key that exists. llama.cpp clamps at graph-build time
             // (`n_top_k = min(indexer_score->ne[0], n_indexer_top_k)`); the kernel cannot refuse
             // the work, so refuse it here with the dims to name rather than emit a duplicated or
             // sentinel index.
+            if *kv_len == 0 || *top_k == 0 {
+                return Err(be(format!(
+                    "vulkan Op::LightningIndexer: kv_len {kv_len} / top_k {top_k} — an indexer \
+                     over no keys selects nothing; the caller skips it (and its TopkMask)"
+                )));
+            }
             if top_k > kv_len {
                 return Err(be(format!(
                     "vulkan Op::LightningIndexer: top_k {top_k} exceeds kv_len {kv_len} — there \
@@ -4647,6 +4724,7 @@ fn lower_op(
                 *top_k,
                 *scale,
                 *pos,
+                *block_ratio,
             );
         }
         Op::TopkMask {
@@ -4659,6 +4737,12 @@ fn lower_op(
             // Every index the scatter writes must land inside the row. The kernel cannot refuse
             // the dispatch and an out-of-range write into an SSBO is undefined, so refuse here —
             // this is the same bound `Op::LightningIndexer` enforces on its own output.
+            if *kv_len == 0 || *top_k == 0 {
+                return Err(be(format!(
+                    "vulkan Op::TopkMask: kv_len {kv_len} / top_k {top_k} — a mask over no keys \
+                     selects nothing; the caller skips it"
+                )));
+            }
             if top_k > kv_len {
                 return Err(be(format!(
                     "vulkan Op::TopkMask: top_k {top_k} exceeds kv_len {kv_len} — the indices \
@@ -7878,6 +7962,7 @@ mod tests {
             pos: 0,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         let plan = be_.compile(&g).unwrap();
         let vk_plan = plan.as_any().downcast_ref::<VkDecodePlan>().unwrap();
@@ -9294,6 +9379,7 @@ mod tests {
             pos: pos as u32,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
         let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();
@@ -9798,6 +9884,7 @@ mod tests {
                 pos: pos as u32,
                 sinks: None,
                 key_bias: None,
+                comp: None,
             });
             let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
             let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();
@@ -9912,6 +9999,7 @@ mod tests {
             pos: (kv_len - rows) as u32,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         let up = |b: &[u8]| {
             let buf = be_.alloc(b.len(), BufferUsage::Activations).unwrap();
@@ -10048,6 +10136,7 @@ mod tests {
                 pos: pos as u32,
                 sinks: None,
                 key_bias: None,
+                comp: None,
             });
             g.push(Op::Copy {
                 src: di,
@@ -12674,6 +12763,29 @@ mod tests {
         }
     }
 
+    /// `attention_kv.comp` stages the query and owns its output dims through `ATTN_KV_MAX_HD`,
+    /// which the host bound of the same name must match.
+    #[test]
+    fn attention_kv_bound_matches_host() {
+        let src = include_str!("../shaders/attention_kv.comp");
+        assert_eq!(
+            glsl_define_u32(src, "ATTN_KV_MAX_HD") as usize,
+            ATTN_KV_MAX_HD,
+            "attention_kv.comp's head bound drifted from the host guard"
+        );
+        for sized in [
+            "shared float q_sh[ATTN_KV_MAX_HD];",
+            "#define ATTN_KV_ACC (ATTN_KV_MAX_HD / 64)",
+            "float acc[ATTN_KV_ACC];",
+            "layout(local_size_x = 64,",
+        ] {
+            assert!(
+                src.contains(sized),
+                "attention_kv.comp no longer has `{sized}`, which the bound relies on"
+            );
+        }
+    }
+
     /// `qk_norm_rope.comp` and `qk_norm_rope_interleaved.comp` stage a head in a shared array the
     /// host bound `QK_NORM_ROPE_MAX_HD` must match; see `mla_shader_bounds_match_host`.
     #[test]
@@ -13237,6 +13349,7 @@ mod tests {
                 pos: 0,
                 sinks: None,
                 key_bias: None,
+                comp: None,
             });
             assert!(
                 decode_eligible(&be_, &g),

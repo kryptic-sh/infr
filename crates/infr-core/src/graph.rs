@@ -1452,10 +1452,12 @@ impl Op {
                 wk_b,
                 wv_b,
                 dst,
+                freq_factors,
                 key_bias,
                 ..
             } => {
                 let mut r = vec![q, k_cache, wk_b, wv_b];
+                r.extend(freq_factors);
                 r.extend(key_bias);
                 (r, vec![dst])
             }
@@ -1765,6 +1767,40 @@ pub fn comp_visible(abs: u32, ratio: u32, len: u32) -> u32 {
     ((abs + 1) / ratio).min(len)
 }
 
+/// A set of handles memoized from a [`Graph`]'s `ops`, filled on its first query.
+///
+/// It must never answer for other ops than it was computed from. [`Graph::push`] resets it; a
+/// clone starts empty (a clone's `ops` is commonly replaced by a slice of them, as the Vulkan
+/// pipeline and expert-parallel executors do); and a query after `ops` changed length behind the
+/// memo's back (it is a public field) panics instead of answering stale. An in-place edit of an op
+/// that keeps the count is not caught: a graph's ops are not to be edited once it has been
+/// queried; the in-tree edits (the executors' sub-graphs, the Metal policy tests) edit a fresh
+/// clone or a graph not yet queried.
+#[derive(Default)]
+struct OpsMemo(std::sync::OnceLock<(usize, std::collections::HashSet<TensorId>)>);
+
+impl Clone for OpsMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl OpsMemo {
+    fn get(
+        &self,
+        ops: &[Op],
+        compute: impl FnOnce() -> std::collections::HashSet<TensorId>,
+    ) -> &std::collections::HashSet<TensorId> {
+        let (n, set) = self.0.get_or_init(|| (ops.len(), compute()));
+        assert_eq!(
+            *n,
+            ops.len(),
+            "graph: its ops changed after a memoized query over them (edit a clone instead)"
+        );
+        set
+    }
+}
+
 /// An ordered op-list over declared tensor handles. Node index in `tensors` == [`TensorId`].
 #[derive(Clone, Default)]
 pub struct Graph {
@@ -1819,11 +1855,10 @@ pub struct Graph {
     /// mutate in place), computed lazily on first query and reused. `execute` calls it PER TOKEN;
     /// without this it re-scanned every op and re-allocated a `HashSet` each call. Interior-mutable
     /// (`OnceLock`) so it fills through a shared `&Graph` (the plan holds the graph immutably).
-    /// Not part of the graph's identity — cloning carries a filled cache along if present, and an
-    /// empty one refills once on the clone's first query.
-    in_place_cache: std::sync::OnceLock<std::collections::HashSet<TensorId>>,
+    /// Not part of the graph's identity: see [`OpsMemo`] for when it is refilled.
+    in_place_cache: OpsMemo,
     /// Memoized [`Self::touched`], on the same terms as `in_place_cache`.
-    touched_cache: std::sync::OnceLock<std::collections::HashSet<TensorId>>,
+    touched_cache: OpsMemo,
     /// How the weights this graph reads will be read next: a residency hint for a backend that
     /// keeps weights in a cache smaller than the model (the CPU's host arena). A backend without
     /// such a cache ignores it, and so may one that has its own schedule; it never changes what a
@@ -1865,7 +1900,7 @@ impl Graph {
     /// MEMOIZED — `execute` queries it per token and must not re-scan every op / re-alloc a
     /// `HashSet` each call. Returns a borrow of the cached set.
     pub fn in_place_inputs(&self) -> &std::collections::HashSet<TensorId> {
-        self.in_place_cache.get_or_init(|| {
+        self.in_place_cache.get(&self.ops, || {
             let mut set = std::collections::HashSet::new();
             for op in &self.ops {
                 match op {
@@ -1903,7 +1938,7 @@ impl Graph {
     /// it is dead in this graph: a layer-span graph declares every layer's caches but runs the
     /// ops of its own layers only. Memoized like [`Self::in_place_inputs`].
     pub fn touched(&self) -> &std::collections::HashSet<TensorId> {
-        self.touched_cache.get_or_init(|| {
+        self.touched_cache.get(&self.ops, || {
             let mut set = std::collections::HashSet::new();
             for op in &self.ops {
                 let (reads, writes) = op.io();
@@ -1959,6 +1994,8 @@ impl Graph {
     /// Append an op to the list.
     pub fn push(&mut self, op: Op) {
         self.ops.push(op);
+        self.in_place_cache = OpsMemo::default();
+        self.touched_cache = OpsMemo::default();
     }
 
     pub fn desc(&self, id: TensorId) -> &TensorDesc {
@@ -1973,6 +2010,925 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every tensor handle `op` holds: each `TensorId` and `Option<TensorId>` field, and the
+    /// handles inside its `CompSegment` and `HyperGates`. An exhaustive match that names every field
+    /// of every variant (no `..` and no wildcard arm), so a new variant, or a new field of any type,
+    /// fails to compile here until it is listed — which is what keeps
+    /// [`io_names_every_tensor_an_op_holds`] complete.
+    fn tensor_fields(op: &Op) -> Vec<TensorId> {
+        match *op {
+            Op::RmsNorm {
+                x,
+                weight,
+                dst,
+                rows: _,
+                dim: _,
+                eps: _,
+            } => vec![x, weight, dst],
+            Op::RmsNormAdd {
+                x,
+                weight,
+                dst,
+                rows: _,
+                dim: _,
+                eps: _,
+            } => vec![x, weight, dst],
+            Op::LayerNorm {
+                x,
+                weight,
+                bias,
+                dst,
+                rows: _,
+                dim: _,
+                eps: _,
+            } => vec![x, weight, bias, dst],
+            Op::Linear {
+                x,
+                weight,
+                dst,
+                m: _,
+                in_f: _,
+                out_f: _,
+                w_off: _,
+            } => vec![x, weight, dst],
+            Op::Softmax {
+                x,
+                dst,
+                rows: _,
+                dim: _,
+                scale: _,
+                scale_buf,
+            } => {
+                let mut v = vec![x, dst];
+                v.extend(scale_buf);
+                v
+            }
+            Op::QkNorm {
+                x,
+                weight,
+                dst,
+                rows: _,
+                n_head: _,
+                head_dim: _,
+                eps: _,
+                x_stride: _,
+            } => {
+                let mut v = vec![x, dst];
+                v.extend(weight);
+                v
+            }
+            Op::GatedRmsNorm {
+                x,
+                weight,
+                gate,
+                dst,
+                rows: _,
+                n_head: _,
+                head_dim: _,
+                eps: _,
+            } => vec![x, weight, gate, dst],
+            Op::Rope {
+                x,
+                positions,
+                dst,
+                rows: _,
+                n_head: _,
+                head_dim: _,
+                rope_dim: _,
+                theta: _,
+                freq_factors,
+                x_stride: _,
+                neox: _,
+                backward: _,
+            } => {
+                let mut v = vec![x, positions, dst];
+                v.extend(freq_factors);
+                v
+            }
+            Op::QkNormRope {
+                x,
+                weight,
+                positions,
+                dst,
+                rows: _,
+                n_head: _,
+                head_dim: _,
+                rope_dim: _,
+                theta: _,
+                eps: _,
+                freq_factors,
+                x_stride: _,
+            } => {
+                let mut v = vec![x, weight, positions, dst];
+                v.extend(freq_factors);
+                v
+            }
+            Op::WriteKv {
+                src,
+                cache,
+                rows: _,
+                row_stride: _,
+                pos: _,
+            } => vec![src, cache],
+            Op::Attention {
+                q,
+                k_cache,
+                v_cache,
+                dst,
+                rows: _,
+                kv_len: _,
+                n_head: _,
+                n_kv: _,
+                head_dim: _,
+                scale: _,
+                mask: _,
+                pos: _,
+                sinks,
+                key_bias,
+                comp,
+            } => {
+                let mut v = vec![q, k_cache, v_cache, dst];
+                v.extend(sinks);
+                v.extend(key_bias);
+                if let Some(CompSegment {
+                    cache,
+                    len: _,
+                    ratio: _,
+                    bias,
+                }) = comp
+                {
+                    v.push(cache);
+                    v.extend(bias);
+                }
+                v
+            }
+            Op::Mla {
+                q,
+                k_cache,
+                wk_b,
+                wv_b,
+                dst,
+                rows: _,
+                kv_len: _,
+                n_head: _,
+                q_head_dim: _,
+                kv_lora_rank: _,
+                qk_nope_dim: _,
+                qk_rope_dim: _,
+                v_head_dim: _,
+                scale: _,
+                mask: _,
+                pos: _,
+                theta: _,
+                freq_factors,
+                key_bias,
+            } => {
+                let mut v = vec![q, k_cache, wk_b, wv_b, dst];
+                v.extend(freq_factors);
+                v.extend(key_bias);
+                v
+            }
+            Op::TopkMask {
+                idx,
+                dst,
+                rows: _,
+                kv_len: _,
+                top_k: _,
+            } => vec![idx, dst],
+            Op::HyperConnectMix {
+                mixes,
+                scale,
+                base,
+                pre,
+                gates,
+                rows: _,
+                hc: _,
+                eps: _,
+                n_iter: _,
+            } => {
+                let mut v = vec![mixes, scale, base, pre];
+                if let Some(HyperGates { post, comb }) = gates {
+                    v.push(post);
+                    v.push(comb);
+                }
+                v
+            }
+            Op::HyperConnectPre {
+                x,
+                weights,
+                dst,
+                rows: _,
+                hc: _,
+                n_embd: _,
+            } => vec![x, weights, dst],
+            Op::HyperConnectPost {
+                x,
+                residual,
+                post,
+                comb,
+                dst,
+                rows: _,
+                hc: _,
+                n_embd: _,
+            } => vec![x, residual, post, comb, dst],
+            Op::CompressPool {
+                values,
+                scores,
+                dst,
+                blocks: _,
+                window: _,
+                n_embd: _,
+            } => vec![values, scores, dst],
+            Op::LightningIndexer {
+                q,
+                k_cache,
+                weights,
+                dst,
+                rows: _,
+                kv_len: _,
+                n_head: _,
+                head_dim: _,
+                top_k: _,
+                scale: _,
+                pos: _,
+                block_ratio: _,
+            } => vec![q, k_cache, weights, dst],
+            Op::GatedAct {
+                gate,
+                up,
+                dst,
+                rows: _,
+                nff: _,
+                act: _,
+                up_off: _,
+                up_stride: _,
+                gate_stride: _,
+                gate_block_width: _,
+                swiglu_clamp: _,
+            } => vec![gate, up, dst],
+            Op::GatedActFused {
+                gu,
+                dst,
+                rows: _,
+                nff: _,
+                act: _,
+                swiglu_clamp: _,
+            } => vec![gu, dst],
+            Op::Add { a, b, dst, n: _ } => vec![a, b, dst],
+            Op::AddBias {
+                x,
+                bias,
+                dst,
+                rows: _,
+                n: _,
+            } => vec![x, bias, dst],
+            Op::Scale { x, dst, s: _, n: _ } => vec![x, dst],
+            Op::MulVec {
+                x,
+                vec,
+                dst,
+                rows: _,
+                n: _,
+            } => vec![x, vec, dst],
+            Op::Softcap {
+                x,
+                dst,
+                cap: _,
+                n: _,
+            } => vec![x, dst],
+            Op::Argmax {
+                x,
+                dst,
+                n: _,
+                rows: _,
+            } => vec![x, dst],
+            Op::ArgmaxProb {
+                x,
+                dst_id,
+                dst_prob,
+                n: _,
+            } => vec![x, dst_id, dst_prob],
+            Op::Sample {
+                x,
+                u,
+                dst,
+                n: _,
+                top_k: _,
+                temp: _,
+                top_p: _,
+            } => vec![x, u, dst],
+            Op::EmbedGather {
+                ids,
+                table,
+                dst,
+                rows: _,
+                ne: _,
+                scale: _,
+            } => vec![ids, table, dst],
+            Op::GatherI32 {
+                ids,
+                table,
+                dst,
+                rows: _,
+                ne: _,
+            } => vec![ids, table, dst],
+            Op::GatherRows {
+                src,
+                idx,
+                dst,
+                rows: _,
+                idx_off: _,
+                src_stride: _,
+                src_col: _,
+                n: _,
+                group: _,
+                dst_group_stride: _,
+                dst_row_off: _,
+                fill: _,
+            } => vec![src, idx, dst],
+            Op::Copy {
+                src,
+                src_off: _,
+                dst,
+                dst_off: _,
+                n: _,
+            } => vec![src, dst],
+            Op::CopyStrided {
+                src,
+                src_off: _,
+                src_stride: _,
+                dst,
+                dst_off: _,
+                dst_stride: _,
+                rows: _,
+                n: _,
+            } => vec![src, dst],
+            Op::MoeFfn {
+                x,
+                router_x,
+                router,
+                gate_exps,
+                up_exps,
+                down_exps,
+                down_scale,
+                fused_gate_up: _,
+                dst,
+                ne: _,
+                n_expert: _,
+                n_used: _,
+                n_ff_exp: _,
+                scale: _,
+                act: _,
+                swiglu_clamp: _,
+                gating: _,
+                norm_w: _,
+                weight_before: _,
+                ep_band: _,
+                exp_probs_b,
+                n_expert_groups: _,
+                n_expert_groups_used: _,
+                expert_ids,
+            } => {
+                let mut v = vec![x, router_x, router, gate_exps, up_exps, down_exps, dst];
+                v.extend(down_scale);
+                v.extend(exp_probs_b);
+                v.extend(expert_ids);
+                v
+            }
+            Op::Conv1dSilu {
+                x,
+                weight,
+                state,
+                dst,
+                rows: _,
+                channels: _,
+                kernel: _,
+            } => vec![x, weight, state, dst],
+            Op::ShortConv {
+                bcx,
+                weight,
+                state,
+                dst,
+                rows: _,
+                channels: _,
+                kernel: _,
+            } => vec![bcx, weight, state, dst],
+            Op::HeadGate {
+                x,
+                gate,
+                dst,
+                rows: _,
+                n_head: _,
+                head_dim: _,
+            } => vec![x, gate, dst],
+            Op::DeltaNet {
+                q,
+                k,
+                v,
+                b,
+                a,
+                a_coef,
+                dt_bias,
+                state,
+                dst,
+                rows: _,
+                n_vhead: _,
+                n_khead: _,
+                head_k: _,
+                head_v: _,
+                eps: _,
+                src_stride: _,
+            } => vec![q, k, v, b, a, a_coef, dt_bias, state, dst],
+            Op::MoeSharedExpertAdd {
+                moe,
+                shexp,
+                gate,
+                dst,
+                rows: _,
+                n: _,
+            } => vec![moe, shexp, gate, dst],
+        }
+    }
+
+    /// One instance of every [`Op`] variant, each tensor field a distinct handle and every optional
+    /// handle present. A struct literal must name every field, so a new field fails to compile here.
+    fn every_op() -> Vec<Op> {
+        let next = std::cell::Cell::new(0u32);
+        let t = || {
+            next.set(next.get() + 1);
+            TensorId(next.get())
+        };
+        vec![
+            Op::RmsNorm {
+                x: t(),
+                weight: t(),
+                dst: t(),
+                rows: 0,
+                dim: 0,
+                eps: 0.0,
+            },
+            Op::RmsNormAdd {
+                x: t(),
+                weight: t(),
+                dst: t(),
+                rows: 0,
+                dim: 0,
+                eps: 0.0,
+            },
+            Op::LayerNorm {
+                x: t(),
+                weight: t(),
+                bias: t(),
+                dst: t(),
+                rows: 0,
+                dim: 0,
+                eps: 0.0,
+            },
+            Op::Linear {
+                x: t(),
+                weight: t(),
+                dst: t(),
+                m: 0,
+                in_f: 0,
+                out_f: 0,
+                w_off: 0,
+            },
+            Op::Softmax {
+                x: t(),
+                dst: t(),
+                rows: 0,
+                dim: 0,
+                scale: 0.0,
+                scale_buf: Some(t()),
+            },
+            Op::QkNorm {
+                x: t(),
+                weight: Some(t()),
+                dst: t(),
+                rows: 0,
+                n_head: 0,
+                head_dim: 0,
+                eps: 0.0,
+                x_stride: 0,
+            },
+            Op::GatedRmsNorm {
+                x: t(),
+                weight: t(),
+                gate: t(),
+                dst: t(),
+                rows: 0,
+                n_head: 0,
+                head_dim: 0,
+                eps: 0.0,
+            },
+            Op::Rope {
+                x: t(),
+                positions: t(),
+                dst: t(),
+                rows: 0,
+                n_head: 0,
+                head_dim: 0,
+                rope_dim: 0,
+                theta: 0.0,
+                freq_factors: Some(t()),
+                x_stride: 0,
+                neox: false,
+                backward: false,
+            },
+            Op::QkNormRope {
+                x: t(),
+                weight: t(),
+                positions: t(),
+                dst: t(),
+                rows: 0,
+                n_head: 0,
+                head_dim: 0,
+                rope_dim: 0,
+                theta: 0.0,
+                eps: 0.0,
+                freq_factors: Some(t()),
+                x_stride: 0,
+            },
+            Op::WriteKv {
+                src: t(),
+                cache: t(),
+                rows: 0,
+                row_stride: 0,
+                pos: 0,
+            },
+            Op::Attention {
+                q: t(),
+                k_cache: t(),
+                v_cache: t(),
+                dst: t(),
+                rows: 0,
+                kv_len: 0,
+                n_head: 0,
+                n_kv: 0,
+                head_dim: 0,
+                scale: 0.0,
+                mask: AttnMask::Causal,
+                pos: 0,
+                sinks: Some(t()),
+                key_bias: Some(t()),
+                comp: Some(CompSegment {
+                    cache: t(),
+                    len: 0,
+                    ratio: 1,
+                    bias: Some(t()),
+                }),
+            },
+            Op::Mla {
+                q: t(),
+                k_cache: t(),
+                wk_b: t(),
+                wv_b: t(),
+                dst: t(),
+                rows: 0,
+                kv_len: 0,
+                n_head: 0,
+                q_head_dim: 0,
+                kv_lora_rank: 0,
+                qk_nope_dim: 0,
+                qk_rope_dim: 0,
+                v_head_dim: 0,
+                scale: 0.0,
+                mask: AttnMask::Causal,
+                pos: 0,
+                theta: 0.0,
+                freq_factors: Some(t()),
+                key_bias: Some(t()),
+            },
+            Op::TopkMask {
+                idx: t(),
+                dst: t(),
+                rows: 0,
+                kv_len: 0,
+                top_k: 0,
+            },
+            Op::HyperConnectMix {
+                mixes: t(),
+                scale: t(),
+                base: t(),
+                pre: t(),
+                gates: Some(HyperGates {
+                    post: t(),
+                    comb: t(),
+                }),
+                rows: 0,
+                hc: 0,
+                eps: 0.0,
+                n_iter: 0,
+            },
+            Op::HyperConnectPre {
+                x: t(),
+                weights: t(),
+                dst: t(),
+                rows: 0,
+                hc: 0,
+                n_embd: 0,
+            },
+            Op::HyperConnectPost {
+                x: t(),
+                residual: t(),
+                post: t(),
+                comb: t(),
+                dst: t(),
+                rows: 0,
+                hc: 0,
+                n_embd: 0,
+            },
+            Op::CompressPool {
+                values: t(),
+                scores: t(),
+                dst: t(),
+                blocks: 0,
+                window: 0,
+                n_embd: 0,
+            },
+            Op::LightningIndexer {
+                q: t(),
+                k_cache: t(),
+                weights: t(),
+                dst: t(),
+                rows: 0,
+                kv_len: 0,
+                n_head: 0,
+                head_dim: 0,
+                top_k: 0,
+                scale: 0.0,
+                pos: 0,
+                block_ratio: 0,
+            },
+            Op::GatedAct {
+                gate: t(),
+                up: t(),
+                dst: t(),
+                rows: 0,
+                nff: 0,
+                act: Activation::Silu,
+                up_off: 0,
+                up_stride: 0,
+                gate_stride: 0,
+                gate_block_width: 0,
+                swiglu_clamp: None,
+            },
+            Op::GatedActFused {
+                gu: t(),
+                dst: t(),
+                rows: 0,
+                nff: 0,
+                act: Activation::Silu,
+                swiglu_clamp: None,
+            },
+            Op::Add {
+                a: t(),
+                b: t(),
+                dst: t(),
+                n: 0,
+            },
+            Op::AddBias {
+                x: t(),
+                bias: t(),
+                dst: t(),
+                rows: 0,
+                n: 0,
+            },
+            Op::Scale {
+                x: t(),
+                dst: t(),
+                s: 0.0,
+                n: 0,
+            },
+            Op::MulVec {
+                x: t(),
+                vec: t(),
+                dst: t(),
+                rows: 0,
+                n: 0,
+            },
+            Op::Softcap {
+                x: t(),
+                dst: t(),
+                cap: 0.0,
+                n: 0,
+            },
+            Op::Argmax {
+                x: t(),
+                dst: t(),
+                n: 0,
+                rows: 0,
+            },
+            Op::ArgmaxProb {
+                x: t(),
+                dst_id: t(),
+                dst_prob: t(),
+                n: 0,
+            },
+            Op::Sample {
+                x: t(),
+                u: t(),
+                dst: t(),
+                n: 0,
+                top_k: 0,
+                temp: 0.0,
+                top_p: 0.0,
+            },
+            Op::EmbedGather {
+                ids: t(),
+                table: t(),
+                dst: t(),
+                rows: 0,
+                ne: 0,
+                scale: 0.0,
+            },
+            Op::GatherI32 {
+                ids: t(),
+                table: t(),
+                dst: t(),
+                rows: 0,
+                ne: 0,
+            },
+            Op::GatherRows {
+                src: t(),
+                idx: t(),
+                dst: t(),
+                rows: 0,
+                idx_off: 0,
+                src_stride: 0,
+                src_col: 0,
+                n: 0,
+                group: 0,
+                dst_group_stride: 0,
+                dst_row_off: 0,
+                fill: 0.0,
+            },
+            Op::Copy {
+                src: t(),
+                src_off: 0,
+                dst: t(),
+                dst_off: 0,
+                n: 0,
+            },
+            Op::CopyStrided {
+                src: t(),
+                src_off: 0,
+                src_stride: 0,
+                dst: t(),
+                dst_off: 0,
+                dst_stride: 0,
+                rows: 0,
+                n: 0,
+            },
+            Op::MoeFfn {
+                x: t(),
+                router_x: t(),
+                router: t(),
+                gate_exps: t(),
+                up_exps: t(),
+                down_exps: t(),
+                down_scale: Some(t()),
+                fused_gate_up: false,
+                dst: t(),
+                ne: 0,
+                n_expert: 0,
+                n_used: 0,
+                n_ff_exp: 0,
+                scale: 0.0,
+                act: Activation::Silu,
+                swiglu_clamp: None,
+                gating: MoeGating::Softmax,
+                norm_w: false,
+                weight_before: false,
+                ep_band: None,
+                exp_probs_b: Some(t()),
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+                expert_ids: Some(t()),
+            },
+            Op::Conv1dSilu {
+                x: t(),
+                weight: t(),
+                state: t(),
+                dst: t(),
+                rows: 0,
+                channels: 0,
+                kernel: 0,
+            },
+            Op::ShortConv {
+                bcx: t(),
+                weight: t(),
+                state: t(),
+                dst: t(),
+                rows: 0,
+                channels: 0,
+                kernel: 0,
+            },
+            Op::HeadGate {
+                x: t(),
+                gate: t(),
+                dst: t(),
+                rows: 0,
+                n_head: 0,
+                head_dim: 0,
+            },
+            Op::DeltaNet {
+                q: t(),
+                k: t(),
+                v: t(),
+                b: t(),
+                a: t(),
+                a_coef: t(),
+                dt_bias: t(),
+                state: t(),
+                dst: t(),
+                rows: 0,
+                n_vhead: 0,
+                n_khead: 0,
+                head_k: 0,
+                head_v: 0,
+                eps: 0.0,
+                src_stride: 0,
+            },
+            Op::MoeSharedExpertAdd {
+                moe: t(),
+                shexp: t(),
+                gate: t(),
+                dst: t(),
+                rows: 0,
+                n: 0,
+            },
+        ]
+    }
+
+    /// **The memoized handle sets follow the ops.** A push after a query answers for the new op; a
+    /// clone whose ops are replaced (the executors' sub-graphs) answers for its own ops, not the
+    /// original's; a query after the public `ops` changed length behind the memo panics.
+    #[test]
+    fn memoized_sets_never_answer_for_other_ops() {
+        let mut g = Graph::new();
+        let x = g.input(crate::tensor::TensorDesc::new(
+            vec![4],
+            crate::tensor::DType::F32,
+        ));
+        let c = g.input(crate::tensor::TensorDesc::new(
+            vec![8],
+            crate::tensor::DType::F16,
+        ));
+        let y = g.internal(crate::tensor::TensorDesc::new(
+            vec![4],
+            crate::tensor::DType::F32,
+        ));
+        g.push(Op::Scale {
+            x,
+            dst: y,
+            s: 1.0,
+            n: 4,
+        });
+        assert!(!g.touched().contains(&c) && g.in_place_inputs().is_empty());
+        g.push(Op::WriteKv {
+            src: x,
+            cache: c,
+            rows: 1,
+            row_stride: 4,
+            pos: 0,
+        });
+        assert!(g.touched().contains(&c) && g.in_place_inputs().contains(&c));
+        let mut sub = g.clone();
+        sub.ops.truncate(1);
+        assert!(!sub.touched().contains(&c) && sub.in_place_inputs().is_empty());
+        let stale = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            g.ops.pop();
+            g.touched().len()
+        }));
+        assert!(stale.is_err(), "a query after the ops shrank answered");
+    }
+
+    /// **`Op::io` names every tensor an op holds.** The interpreters (the CPU's and Metal's) load
+    /// and write back only the handles some op's `io()` lists (`crate::exec::provisions`), so a
+    /// tensor an op reads but `io()` omits would reach that op as an empty vector. Checked for every
+    /// variant against [`tensor_fields`]; `Op::Mla`'s `freq_factors` was the one gap found.
+    #[test]
+    fn io_names_every_tensor_an_op_holds() {
+        let ops = every_op();
+        let mut seen = std::collections::HashSet::new();
+        for op in &ops {
+            assert!(seen.insert(op.kind()), "{} listed twice", op.kind());
+            let (r, w) = op.io();
+            let named: std::collections::HashSet<TensorId> = r.into_iter().chain(w).collect();
+            let missing: Vec<TensorId> = tensor_fields(op)
+                .into_iter()
+                .filter(|id| !named.contains(id))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "Op::{}'s io() omits handles {missing:?}",
+                op.kind()
+            );
+        }
+    }
+
     use crate::tensor::{DType, TensorDesc};
 
     /// `Op::io` reports the exact read/write handles — the contract the multi-device pipeline

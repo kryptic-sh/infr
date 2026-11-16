@@ -657,6 +657,39 @@ fn the_last_rows_experts_survive_a_layer_major_prefill() {
     );
 }
 
+/// **`host_streams` answers for the weights it is handed, not for the backend.** Two models on
+/// one backend: the one whose pool holds every block does not stream, the one whose pool holds a
+/// third does, whichever was bound last; weights with no paged buffer do not stream.
+#[test]
+fn host_streams_answers_for_the_model_asked_about() {
+    let moe = Moe {
+        dt: DType::F32,
+        fused: false,
+        layers: 3,
+        ne: 128,
+        nff: 128,
+        n_expert: 32,
+        n_used: 4,
+        rows: 8,
+    };
+    let built = moe.build();
+    let all: usize = built.banks.iter().map(|(_, _, b)| b.len()).sum();
+    let be = CpuBackend::new();
+    let (_, _, small) = built.paged(&be, 32, 4, built.floor_bytes(), Duration::ZERO);
+    let (_, _, whole) = built.paged(&be, 32, 4, all, Duration::ZERO);
+    let streams = |bufs: &[Box<dyn Buffer>]| be.host_streams(&mut bufs.iter().map(|b| b.as_ref()));
+    assert!(
+        streams(&small),
+        "a pool of one layer's experts does not stream"
+    );
+    assert!(!streams(&whole), "a pool holding every block streams");
+    assert!(
+        streams(&small),
+        "the model bound last answered for the other"
+    );
+    assert!(!streams(&built.whole(&be)), "banks held whole stream");
+}
+
 /// The insert rule itself: decode-shaped ops recency, sweeps the cold end.
 #[test]
 fn a_decode_step_inserts_by_recency_and_a_sweep_at_the_cold_end() {

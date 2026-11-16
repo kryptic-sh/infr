@@ -1478,14 +1478,21 @@ also taken by V4 on the CPU:
   every op the same rows. A row's block visibility (`comp_visible`), the
   indexer's per-row top-k and the ring persists are per graph and unchanged.
 - **When.** `seam::layer_major_prefill`'s automatic rule (on when the weights
-  stream) now counts the CPU's host arena for V4 (`Backend::host_paged`), but
-  only for chunks of at least `seam::HOST_LAYER_MAJOR_MIN_ROWS` (256) rows
-  (`seam::host_layer_major`; the measurements below are why), and
-  `layer_major_this_prompt` still runs it only for a prompt of more than one
-  chunk over an arena that cannot hold every block
-  (`Backend::host_holds_every_block`). Other families keep chunk-major on the
-  host arena (none was checked bit for bit there); `paging.layer_major` forces
-  either order on any family, as before (`INFR_LAYER_MAJOR=0` / `1`).
+  stream) now counts the CPU's host arena for V4 (`seam::host_layer_major`):
+  when the run's own weights stream through an arena that cannot hold them and
+  has slots (`Backend::host_streams`, asked about the model's bound buffers, not
+  the backend), for a sole request (not one sharing the backend with others, as
+  `infr serve --parallel` makes; nothing concurrent was measured), and when the
+  prompt's FIRST chunk is at least `seam::HOST_LAYER_MAJOR_MIN_ROWS` rows (the
+  measurements below are why). That first chunk's height comes from
+  `dsv4_emit::prefill_chunk_rows` at the prefill's start position, so a prompt
+  prefilled from position 0 at the default height qualifies at any length, and
+  an extending turn starting deep in the context may not
+  (`layer_major_gate_follows_the_first_chunk` pins the boundary).
+  `layer_major_this_prompt` still runs it only for more than one chunk. Other
+  families keep chunk-major on the host arena (none was checked bit for bit
+  there); `paging.layer_major` forces either order on any family, as before
+  (`INFR_LAYER_MAJOR=0` / `1`).
 - **Bounded memory.** Layer-major holds every chunk's residual between layers:
   `seam::layer_major_row_bytes` per row, the four streams and the embedded input
   row in f32 plus id and position (81 928 bytes at V4-Flash's geometry). A
@@ -1493,8 +1500,9 @@ also taken by V4 on the CPU:
   V4-Flash, runs as consecutive SEGMENTS of whole chunks
   (`seam::layer_major_segments`), each layer-major, so the experts are read once
   per segment. `paging.layer_major_rows` (config only) sets the cap; other
-  families carry the whole prompt as before. `cpu_committed_bytes` prices the
-  carry on a V4 run.
+  families carry the whole prompt as before. An automatic V4 arena too small for
+  the weights gives the carry up (`seam::layer_major_carry_bytes`); a model that
+  fits, or an explicit `paging.dram`, reserves nothing for it.
 - **Residency hints.** A span graph carries `Graph::weight_reuse`: `Again` while
   more chunks of its layer follow, `Done` on the layer's last. On the CPU arena
   `Again`/`Done` insert what a graph pins at the hot end
@@ -1504,8 +1512,13 @@ also taken by V4 on the CPU:
   is demoted to the cold end (`HostPager::demote`, `Pager::demote`), so the next
   layer's misses take a finished layer before anything older — except, per bank,
   the experts the layer's last row routed to and then its most-routed ones, up
-  to `paged::DONE_KEEP_EXPERTS` (8; `paged::done_keep`), which stay at the hot
-  end for the decode that follows (its first token continues from that row).
+  to a share the pool has room for (`PagedWeights::done_keep_share`: its slots
+  beyond one op's pins over its banks, at most `paged::DONE_KEEP_EXPERTS`; 8 on
+  V4-Flash at 12 GB), which stay at the hot end for the decode that follows (its
+  first token continues from that row). On the CPU two live generations never
+  share a store (`SeamModel::with_cpu` opens a resident per concurrent
+  generation), so the demotions cannot reach another session's working set
+  today; a pinned block is never evicted whatever its place.
 
 **Verified** (`seam/dsv4_emit/tests/prefill.rs`, bit for bit): on the five
 layouts, at every prompt length of the chunked tests, layer-major in one segment

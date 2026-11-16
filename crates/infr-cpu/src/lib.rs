@@ -326,11 +326,6 @@ pub struct CpuBackend {
     /// stride, so its upper experts slice past the bank's end inside the pool's tasks.
     #[cfg(test)]
     double_whole_bank_stride: std::sync::atomic::AtomicBool,
-    /// The host arena the last paged weight bound to this backend reads from
-    /// ([`Self::paged_weight`], [`Self::paged_experts_weight`]), for
-    /// `Backend::host_paged`. Weak: the bound weights own the store, and a reused backend whose
-    /// model was dropped (serve's model reload) must not keep answering for it.
-    paged_store: Mutex<std::sync::Weak<paged::PagedWeights>>,
 }
 
 /// `default()` is `new()` — the env-sourced bridge, NOT `Config::default()`. Keeping them the same
@@ -362,13 +357,7 @@ impl CpuBackend {
             attn_query_block: ATTN_QUERY_BLOCK,
             #[cfg(test)]
             double_whole_bank_stride: std::sync::atomic::AtomicBool::new(false),
-            paged_store: Mutex::new(std::sync::Weak::new()),
         }
-    }
-
-    /// Record `store` as the arena this backend's paged weights read from.
-    fn note_paged_store(&self, store: &Arc<paged::PagedWeights>) {
-        *self.paged_store.lock().unwrap() = Arc::downgrade(store);
     }
 
     /// A backend in REFERENCE mode: every quantized `Op::Linear` (dense and MoE-expert) decodes
@@ -514,7 +503,6 @@ impl CpuBackend {
         id: paged::PagedId,
         nbytes: usize,
     ) -> Box<dyn Buffer> {
-        self.note_paged_store(&store);
         Box::new(CpuBuffer {
             uid: next_buffer_uid(),
             store: CpuStore::Paged { store, id, nbytes },
@@ -530,7 +518,6 @@ impl CpuBackend {
         bank: paged::PagedExperts,
         nbytes: usize,
     ) -> Box<dyn Buffer> {
-        self.note_paged_store(&store);
         Box::new(CpuBuffer {
             uid: next_buffer_uid(),
             store: CpuStore::PagedExperts {
@@ -3213,9 +3200,12 @@ impl Backend for CpuBackend {
                         let by_count: Vec<(usize, usize)> =
                             buckets.iter().map(|&(e, _, n)| (e, n)).collect();
                         let last = routes.last().map_or(&[][..], |r| &r.idx[..]);
-                        let keep = paged::done_keep(last, &by_count);
                         for b in &bank_bufs {
-                            kept_experts.insert(b.uid, keep.clone());
+                            if let CpuStore::PagedExperts { store, bank, .. } = &b.store {
+                                let share = store.done_keep_share(*bank, bank_bufs.len());
+                                kept_experts
+                                    .insert(b.uid, paged::done_keep(last, &by_count, share));
+                            }
                         }
                     }
                     let mut banks = self
@@ -4287,16 +4277,21 @@ impl Backend for CpuBackend {
         Ok(())
     }
 
-    fn host_paged(&self) -> bool {
-        self.paged_store.lock().unwrap().strong_count() > 0
-    }
-
-    fn host_holds_every_block(&self) -> bool {
-        self.paged_store
-            .lock()
-            .unwrap()
-            .upgrade()
-            .is_some_and(|s| s.holds_every_block())
+    /// The arena the first paged buffer among `weights` reads from: a model's paged weights all
+    /// share one ([`paged::PagedWeights::streams`] says whether it streams).
+    fn host_streams(&self, weights: &mut dyn Iterator<Item = &dyn Buffer>) -> bool {
+        for b in weights {
+            let Some(cb) = b.as_any().downcast_ref::<CpuBuffer>() else {
+                continue;
+            };
+            match &cb.store {
+                CpuStore::Paged { store, .. } | CpuStore::PagedExperts { store, .. } => {
+                    return store.streams();
+                }
+                CpuStore::Owned(_) | CpuStore::Mapped(_) => {}
+            }
+        }
+        false
     }
 }
 

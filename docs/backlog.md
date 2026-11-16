@@ -879,11 +879,11 @@ residue worth tracking; what follows is that plus what was deliberately left.
     length, or reserving in bands, needs the budget to be re-decidable after
     load, which it is not today.
   - **Only the dense Vulkan path, and DeepSeek V4 on the CPU's host arena**
-    (since 2026-11-17, `Backend::host_paged`; § B-CPU-EXPERT-PAGING). Vulkan's
+    (since 2026-11-17, `Backend::host_streams`; § B-CPU-EXPERT-PAGING). Vulkan's
     MoE expert paging, MTP, the qwen35/DeltaNet bespoke path, Metal and every
     other family on the CPU keep chunk-major: the gate is `Backend::dense_paged`
-    (or `host_paged` with `seam::host_layer_major`), and the E2B arch is refused
-    by `layer_major_prefill`'s `spannable` arm (its `per_layer_inp` is
+    (or `host_streams` with `seam::host_layer_major`), and the E2B arch is
+    refused by `layer_major_prefill`'s `spannable` arm (its `per_layer_inp` is
     prologue-built and a later span cannot see it). That gate is load-bearing,
     not belt-and-braces: E2B DOES take the batched-prefill path, so while the
     only refusal was the `assert!` in `build`, a streamed E2B panicked on an
@@ -1786,9 +1786,39 @@ only its routed experts (`CpuBackend::moe_banks`). Left:
   - **The decode warm start keeps only the last row's experts and the most
     routed of the last chunk** (`paged::done_keep`, 8 a bank): the first
     decode-loop pass hit 470 of 774 expert pins after a 1443-token prompt (729
-    misses of 774 without it). Counting routed rows over all of a layer's
-    chunks, not just its last, and sizing the share from the pool, were not
-    tried.
+    misses of 774 without it). The share now comes from the pool's room
+    (`PagedWeights::done_keep_share`). Counting routed rows over all of a
+    layer's chunks, not just its last, was not tried.
+  - **Not measured, and so not on by default: chunks of 256 rows, and concurrent
+    sessions.** `HOST_LAYER_MAJOR_MIN_ROWS` (256) admits first chunks no run had
+    (only 32, slower, and 1024, faster, were measured); a request sharing the
+    backend (`infr serve --parallel`, chunks of `device.ubatch_parallel`) keeps
+    chunk-major whatever its height. To decide both: on V4-Flash at 12 GB, the
+    same 1443-token prompt at `--ubatch 256` and `512`, layer-major against
+    chunk-major (`INFR_LAYER_MAJOR`), with `INFR_PAGER_STATS` (prefill time,
+    reads, re-reads and their time); then two concurrent
+    `infr serve --parallel 2` requests, one decoding while the other prefills a
+    long prompt, comparing the decoding one's ms a token and expert hits in both
+    orders. On the CPU today two concurrent generations do not share an arena
+    (each opens its own resident, `SeamModel::with_cpu`), so the question is
+    their combined memory and disk bandwidth, not one evicting the other's
+    experts; if they ever share one, the demotions must spare what the other
+    session uses.
+  - **The chunk-major run held about 8.5 GB more of the box's memory than the
+    layer-major ones** (lowest free memory 11.5 GB against about 20 GB, run 6
+    against 5 and 7), unexplained. The guess that a whole-model graph zero-fills
+    every layer's intermediate buffers at once does not hold up in the code: the
+    compressed tiers' scratch is declared once per tier and shared by every
+    layer of it (`dsv4_emit::Dsv4Tiers`), and the other scratch once per graph,
+    so a whole-model graph holds at most both tiers' scratch at the chunk height
+    where a span graph holds one tier's — hundreds of MB at 1024 rows (the
+    widened stream's two `[rows, hc_mult * n_embd]` f32 buffers are 128 MiB),
+    not gigabytes. Chunk-major had read about 1.7 times the bytes by then (108
+    GB predicted against 64), and buffered reads grow the system file cache's
+    working set (§ B-DSV4-REAL), which is the more likely cause; not measured.
+  - **An arena with no slots cannot stream** (`PagedWeights::streams` asks for
+    slots): unreachable on the CPU, whose pools always have at least one
+    (`HostPager::new` refuses none), kept as a guard.
   - **The pool still needs one layer's every expert** (768 slots, 2.1 GB on
     V4-Flash): layer-major reads each expert once only while a layer's union
     fits beside what is pinned, which the floor guarantees.

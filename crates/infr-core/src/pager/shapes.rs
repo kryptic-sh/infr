@@ -12,7 +12,7 @@
 //! per shape, so a shape is the same trace on every run and machine.
 
 use super::trace::{Call, PoolTrace};
-use super::BlockId;
+use super::{BlockId, Insert};
 
 /// xorshift64 (G. Marsaglia, "Xorshift RNGs", 2003, the `<<13 >>7 <<17` triple).
 #[derive(Debug, Clone)]
@@ -250,6 +250,54 @@ impl Moe {
         let mut t = self.pool(format!("moe prefill + decode x{tokens}"), n_slots);
         self.prefill_chunk(&mut t.calls);
         let mut router = self.router(seed);
+        for _ in 0..tokens {
+            self.decode_token_routed(&mut router, &mut t.calls);
+        }
+        t
+    }
+
+    /// A layer-major prefill as the CPU host arena serves it, then `tokens` routed decode tokens.
+    /// Per layer, each of `chunks` chunks pins the distinct experts `rows` routed picks hit,
+    /// placing misses and hits at the hot end (`WeightReuse::Again`), and unpins them; after the
+    /// layer's last chunk every expert of the layer is demoted but the first `keep` that chunk
+    /// picked (`WeightReuse::Done`, `paged::done_keep`).
+    pub fn layer_major_session(
+        &self,
+        n_slots: usize,
+        chunks: usize,
+        rows: usize,
+        keep: usize,
+        tokens: usize,
+        seed: u64,
+    ) -> PoolTrace {
+        let mut t = self.pool(
+            format!("moe layer-major prefill x{chunks} keep {keep} + decode x{tokens}"),
+            n_slots,
+        );
+        let mut router = self.router(seed);
+        for layer in 0..self.n_layers {
+            let mut last: Vec<u32> = Vec::new();
+            for _ in 0..chunks {
+                last.clear();
+                for _ in 0..rows * self.top_k as usize {
+                    let e = router.rank[layer as usize][router.zipf.sample(&mut router.rng)];
+                    if !last.contains(&e) {
+                        last.push(e);
+                    }
+                }
+                t.calls.push(Call::BeginBatch);
+                for &e in &last {
+                    t.calls
+                        .push(Call::ResolveAndPin(self.id(layer, e), Insert::Mru));
+                }
+                for &e in &last {
+                    t.calls.push(Call::Unpin(self.id(layer, e)));
+                }
+            }
+            for e in (0..self.n_expert).filter(|e| !last[..keep.min(last.len())].contains(e)) {
+                t.calls.push(Call::Demote(self.id(layer, e)));
+            }
+        }
         for _ in 0..tokens {
             self.decode_token_routed(&mut router, &mut t.calls);
         }

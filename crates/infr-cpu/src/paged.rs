@@ -159,28 +159,28 @@ pub fn expert_insert(routed: usize, n_expert: usize, reuse: WeightReuse) -> Inse
     }
 }
 
-/// How many experts of each bank a layer's last layer-major chunk keeps out of its demotion
-/// ([`done_keep`]). The decode after the prompt routes a few experts per layer (six on V4-Flash).
-/// Sized so every layer's kept share of V4-Flash fits the slots a 12 GB arena has beyond one
-/// layer's floor, and so survives the prefill (`the_done_share_fits_a_12g_arena` checks it).
+/// The most experts of each bank a layer's last layer-major chunk keeps out of its demotion
+/// ([`done_keep`]); the pool's room lowers it ([`PagedWeights::done_keep_share`]). The decode
+/// after the prompt routes a few experts per layer (six on V4-Flash), so a few more than that.
 pub const DONE_KEEP_EXPERTS: usize = 8;
 
 /// The experts a layer-major layer's last chunk ([`WeightReuse::Done`]) keeps resident for the
-/// decode that follows: the ones its LAST row routed to (the decode's first token continues
-/// from that row), then the ones most of its rows routed to (`by_count`, expert and row count),
-/// up to [`DONE_KEEP_EXPERTS`]. Without it the demotions leave whatever layers happened to be
-/// demoted last, and the first decode pass reads most of its experts from disk again.
-pub fn done_keep(last_row: &[usize], by_count: &[(usize, usize)]) -> Vec<usize> {
-    let mut keep: Vec<usize> = Vec::with_capacity(DONE_KEEP_EXPERTS);
+/// decode that follows, at most `share` ([`PagedWeights::done_keep_share`]): the ones its LAST row
+/// routed to (the decode's first token continues from that row), then the ones most of its rows
+/// routed to (`by_count`, expert and row count). Without it the demotions leave whatever layers
+/// happened to be demoted last, and the first decode pass reads most of its experts from disk
+/// again.
+pub fn done_keep(last_row: &[usize], by_count: &[(usize, usize)], share: usize) -> Vec<usize> {
+    let mut keep: Vec<usize> = Vec::with_capacity(share);
     for &e in last_row {
-        if keep.len() < DONE_KEEP_EXPERTS && !keep.contains(&e) {
+        if keep.len() < share && !keep.contains(&e) {
             keep.push(e);
         }
     }
     let mut ranked = by_count.to_vec();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     for (e, _) in ranked {
-        if keep.len() >= DONE_KEEP_EXPERTS {
+        if keep.len() >= share {
             break;
         }
         if !keep.contains(&e) {
@@ -473,14 +473,31 @@ impl PagedWeights {
         }
     }
 
-    /// Whether every pool holds a slot for each block registered with it, so nothing is ever
-    /// evicted and each block is read at most once (`Backend::host_holds_every_block`).
-    pub fn holds_every_block(&self) -> bool {
+    /// How many experts of each bank of `bank`'s pool a finished layer may keep out of its
+    /// demotion ([`done_keep`]): the pool's slots beyond one op's pins (`n_expert` for each of the
+    /// op's `banks_per_op` banks), shared by every bank registered with the pool, and at most
+    /// [`DONE_KEEP_EXPERTS`]. So the kept sets of every layer fit beside the pins of the op that
+    /// runs, and a pool at its floor keeps none.
+    pub fn done_keep_share(&self, bank: PagedExperts, banks_per_op: usize) -> usize {
+        let n_expert = bank.n_expert();
+        let registered = self.next_block.lock().unwrap()[bank.pool] as usize;
+        let banks = (registered / n_expert.max(1)).max(1);
+        let spare = self.pools[bank.pool]
+            .n_slots()
+            .saturating_sub(n_expert * banks_per_op);
+        (spare / banks).min(DONE_KEEP_EXPERTS)
+    }
+
+    /// Whether some pool has more blocks registered than slots, and slots to keep a block in: a
+    /// pass over its blocks then reads some of them from disk again, and the order of the passes
+    /// decides how many (`Backend::host_streams`). A pool that holds all of its blocks reads each
+    /// once per session whatever the order, and one with no slot caches nothing to save.
+    pub fn streams(&self) -> bool {
         let next = self.next_block.lock().unwrap();
         self.pools
             .iter()
             .zip(next.iter())
-            .all(|(p, &n)| n as usize <= p.n_slots())
+            .any(|(p, &n)| p.n_slots() > 0 && n as usize > p.n_slots())
     }
 
     /// Make expert `e` of `bank` resident and pin it, reading from the model file on a miss, and
@@ -941,12 +958,47 @@ mod tests {
         }
     }
 
+    /// **The kept share comes from the pool the planner built.** With V4-Flash's expert banks
+    /// (43 layers of three, 256 experts of 2 752 512 bytes) planned for the 1904 expert slots its
+    /// 12 GB arena got, every layer keeps the full share and the kept sets of all layers fit beside
+    /// one op's pins; at the floor (one layer's experts) nothing is kept; in between, the share
+    /// shrinks so the kept sets still fit.
     #[test]
-    fn the_done_share_fits_a_12g_arena() {
-        // V4-Flash at `INFR_DRAM_CACHE=12g`: 1904 expert slots, a layer's floor of 3 x 256, 43
-        // layers of three banks (`docs/deepseek.md` § "Layer-major prefill on the CPU").
-        let (slots, floor, layers, banks) = (1904usize, 3 * 256usize, 43usize, 3usize);
-        assert!(DONE_KEEP_EXPERTS * banks * layers <= slots - floor);
+    fn the_done_keep_share_fits_the_planned_pool() {
+        let (n_expert, eb, layers) = (256usize, 2_752_512usize, 43usize);
+        let banks: Vec<Pageable> = (0..3 * layers)
+            .map(|i| Pageable {
+                nbytes: n_expert * eb,
+                reads: Reads::Experts {
+                    n_expert,
+                    n_used: 6,
+                    layer: i / PER_LAYER,
+                },
+            })
+            .collect();
+        let floor = PER_LAYER * n_expert;
+        for (slots, want) in [
+            (1904usize, DONE_KEEP_EXPERTS),
+            (floor, 0),
+            (floor + 3 * 129, 3),
+        ] {
+            let plans = plan_pools(slots * eb, &banks);
+            assert_eq!(plans.len(), 1);
+            assert_eq!(plans[0].n_slots, slots);
+            let w = PagedWeights::new(&plans, Arc::new(FakeIo::default()), None).unwrap();
+            let bank = (0..3 * layers)
+                .map(|i| {
+                    w.register_experts(&[((i * n_expert * eb) as u64, n_expert * eb)], n_expert)
+                        .unwrap()
+                        .expect("bank")
+                })
+                .collect::<Vec<_>>()
+                .pop()
+                .expect("banks");
+            let share = w.done_keep_share(bank, PER_LAYER);
+            assert_eq!(share, want, "at {slots} slots");
+            assert!(share * 3 * layers + floor <= slots, "at {slots} slots");
+        }
     }
 
     /// The last row's experts first, then the most-routed, up to the share, without repeats; ties
@@ -964,10 +1016,12 @@ mod tests {
             (13, 5),
         ];
         assert_eq!(
-            done_keep(&[5, 0], &by_count),
-            vec![5, 0, 3, 7, 13, 9, 12, 11][..DONE_KEEP_EXPERTS].to_vec()
+            done_keep(&[5, 0], &by_count, 8),
+            vec![5, 0, 3, 7, 13, 9, 12, 11]
         );
-        assert_eq!(done_keep(&[], &[(4, 1)]), vec![4]);
+        assert_eq!(done_keep(&[5, 0], &by_count, 3), vec![5, 0, 3]);
+        assert_eq!(done_keep(&[5, 0], &by_count, 0), Vec::<usize>::new());
+        assert_eq!(done_keep(&[], &[(4, 1)], 8), vec![4]);
     }
 
     #[test]

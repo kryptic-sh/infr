@@ -711,6 +711,8 @@ mod tests {
             out.push(m.prefill(slots, 3));
             out.push(m.decode_routed(slots, 40, 3));
             out.push(m.session(slots, 40, 5));
+            // Demotions: `Recency::demote` against the real pager's cold-end move.
+            out.push(m.layer_major_session(slots, 3, 2, 2, 40, 7));
         }
         out.push(m.decode_resident(4));
         out.push(m.decode_resident_grouped(4));

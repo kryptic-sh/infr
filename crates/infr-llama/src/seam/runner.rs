@@ -5753,20 +5753,19 @@ pub(crate) fn generate_dense_backend_bound(
             v
         };
         // The weights stream either through a device pager (`dense_paged`) or, on the CPU, through
-        // the host arena (`host_paged`). Layer-major over the host arena is DeepSeek V4's alone,
-        // and only at chunk heights where it was measured to pay
-        // (`crate::seam::host_layer_major`).
+        // a host arena that cannot hold them (`host_streams`, asked about this model's own
+        // weights). Layer-major over the host arena is DeepSeek V4's alone, for a sole request,
+        // at the chunk heights where it was measured to pay (`crate::seam::host_layer_major`).
         let first_rows = chunks.first().map_or(0, |&(s, e)| e - s);
-        let host_stream = crate::seam::host_layer_major(c, first_rows) && be.host_paged();
+        let shared = req.is_some_and(crate::sampling::RequestCtx::shares_gpu);
+        let host_stream = crate::seam::host_layer_major(c, first_rows, shared)
+            && be.host_streams(&mut wbufs.iter().map(|b| b.as_ref()));
         let layer_major = crate::seam::layer_major_this_prompt(
             ec,
             crate::seam::layer_major_prefill(ec, &caps, be.dense_paged() || host_stream, !e2b),
             chunks.len(),
-            if host_stream {
-                be.host_holds_every_block()
-            } else {
-                be.dense_holds_every_block()
-            },
+            // A streaming host arena cannot hold every block by `host_streams`' own definition.
+            !host_stream && be.dense_holds_every_block(),
         );
         let spans: Vec<std::ops::Range<usize>> = if layer_major {
             (0..c.n_layer).map(|l| l..l + 1).collect()

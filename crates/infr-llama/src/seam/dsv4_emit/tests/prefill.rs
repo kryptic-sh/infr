@@ -912,6 +912,35 @@ fn prefill_chunk_rows_bound_the_csa_buffers() {
     assert_eq!(prefill_chunk_rows(&no_csa.cfg, 1 << 20, 1024), 1024);
 }
 
+/// **The host-arena layer-major gate follows the first chunk's height, so the prefill's start
+/// position** (`crate::seam::host_layer_major` over `prefill_chunk_rows`). On a file with a CSA
+/// layer at the default 1024-row chunk, a prefill from position 0 qualifies (whatever the
+/// prompt's length: later chunks are not consulted), and so does one starting at 64k or 160k;
+/// the first chunk falls under `HOST_LAYER_MAJOR_MIN_ROWS` (256) rows between start positions
+/// 261 891 and 261 892, worked by hand: 256 rows at 261 891 hold 256 x (262 147 / 4) x 4 =
+/// 67 108 864 bytes, exactly `DSV4_PREFILL_SCORE_BYTES`, and at 261 892 256 x 65 537 x 4 =
+/// 67 109 888, past it. An extending turn starting later prefills chunk-major.
+#[test]
+fn layer_major_gate_follows_the_first_chunk() {
+    let csa = Model::open_with(
+        "dsv4-pf-gate",
+        &session_model(&dsv4_dims()),
+        EngineConfig::default(),
+    );
+    let min = crate::seam::HOST_LAYER_MAJOR_MIN_ROWS;
+    assert_eq!(min, 256, "the boundary below is for 256 rows");
+    let gate = |start: usize| {
+        crate::seam::host_layer_major(&csa.cfg, prefill_chunk_rows(&csa.cfg, start, 1024), false)
+    };
+    for start in [0, 64 << 10, 160 << 10, 261_891] {
+        assert!(gate(start), "a prefill starting at {start} lost the order");
+    }
+    assert_eq!(prefill_chunk_rows(&csa.cfg, 261_891, 1024), min);
+    for start in [261_892, 400 << 10, 1 << 20] {
+        assert!(!gate(start), "a prefill starting at {start} kept the order");
+    }
+}
+
 /// **A prompt chunk is never taller than the sliding-window ring of the session it runs in.** The
 /// raw window's ring holds `window + chunk` rows for the chunk height the session was MADE with;
 /// `ubatch_rows` answers for the placement scope current at each call, so a session made under a

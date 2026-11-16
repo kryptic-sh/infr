@@ -138,17 +138,19 @@ impl Model {
     }
 
     /// [`Self::generate`] with the weights bound through `store` (registered on first use, so a
-    /// fresh `state` and a fresh store go together) — the CPU run's own binder.
+    /// fresh `state` and a fresh store go together) — the CPU run's own binder — under `req` when
+    /// given.
     pub(super) fn generate_paged(
         &self,
         store: &std::sync::Arc<infr_cpu::paged::PagedWeights>,
         prompt: &[u32],
         max_new: usize,
         state: &mut Option<SeamKv>,
+        req: Option<&crate::sampling::RequestCtx>,
     ) -> anyhow::Result<Gen> {
         let n_expert = self.cfg.moe.as_ref().map(|m| m.n_expert);
         let bind = crate::seam::cpu_bind_with(&self.be, Some(store.clone()), n_expert);
-        self.generate_bound(&bind, prompt, max_new, state, None)
+        self.generate_bound(&bind, prompt, max_new, state, req)
     }
 
     /// The last position's logits of `prompt` on `state` (a fresh session when it is `None`).

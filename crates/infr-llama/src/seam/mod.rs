@@ -137,6 +137,14 @@ fn cpu_paged_store(
             return Ok(None);
         }
         infr_core::hostmem::ArenaPlan::Take(n) => {
+            // An automatic arena too small for the weights may serve a layer-major prefill, which
+            // holds its carried rows beside it: that comes out of the arena, and only then. An
+            // explicit budget is the user's, as before.
+            let n = if explicit == infr_core::hostmem::Requested::Auto && n < pageable {
+                n.saturating_sub(layer_major_carry_bytes(ec, cfg))
+            } else {
+                n
+            };
             if explicit == infr_core::hostmem::Requested::Auto {
                 tracing::info!(
                     "host paging: {:.2} GB of weights exceed the {:.2} GB of host memory \
@@ -252,17 +260,22 @@ fn cpu_committed_bytes(ec: &EngineConfig, g: &Gguf, cfg: &Config) -> u64 {
         .filter(|t| t.nbytes < infr_cpu::paged::MIN_PAGED_BYTES)
         .map(|t| t.nbytes as u64)
         .sum();
-    // A layer-major prefill's carried residual streams (`layer_major_segment_rows`), up to one
-    // segment of the context.
-    let carry = if host_layer_major(cfg, usize::MAX) {
-        LAYER_MAJOR_CARRY_BYTES.min(ctx as u64 * layer_major_row_bytes(cfg))
-    } else {
-        0
-    };
     kv + small
-        + carry
         + CPU_ACTIVATION_RESERVE
         + cpu_repack_reserve(ec, g.tensors(), infr_cpu::q4k_expert_repack_available())
+}
+
+/// What a layer-major prefill over the CPU's host arena holds between layers at most: one
+/// segment of carried rows (`layer_major_segment_rows`) at the run's context, on a family that
+/// takes the order there ([`host_layer_major`]); 0 for every other family.
+fn layer_major_carry_bytes(ec: &EngineConfig, cfg: &Config) -> u64 {
+    if !host_layer_major(cfg, usize::MAX, false) {
+        return 0;
+    }
+    let ctx = crate::chat::cfg_ctx(ec, cfg.n_ctx_train)
+        .unwrap_or_else(|| cfg.n_ctx_train.min(CPU_BUDGET_CTX));
+    let rows = ctx.min(layer_major_segment_rows(ec, cfg)) as u64;
+    rows * layer_major_row_bytes(cfg)
 }
 
 /// The CPU repack cache's budget (`kernels.cpu.repack_mb`) when this run can fill it, else 0.
@@ -992,34 +1005,47 @@ pub(crate) fn layer_major_this_prompt(
     wanted && (ec.paging.layer_major == Some(true) || (n_chunks > 1 && !holds_every_block))
 }
 
-/// Whether a prompt cut into chunks of `chunk_rows` (its first, tallest chunk) prefills
-/// layer-major when `cfg`'s weights stream through the CPU's host arena (`Backend::host_paged`);
-/// [`layer_major_this_prompt`] still asks for more than one chunk over an arena that cannot hold
-/// every block. `paging.layer_major` overrides it either way.
+/// Whether a prompt whose first prefill chunk is `first_chunk_rows` tall prefills layer-major
+/// when `cfg`'s weights stream through the CPU's host arena (`Backend::host_streams`);
+/// [`layer_major_this_prompt`] still asks for more than one chunk. `paging.layer_major`
+/// overrides it either way.
 ///
 /// **DeepSeek V4 only, deliberately.** It is the family this was built and measured for, and no
 /// other family has been checked bit for bit against its chunk-major prefill on the CPU.
 ///
-/// **Chunks of at least [`HOST_LAYER_MAJOR_MIN_ROWS`] only.** Measured on V4-Flash with a 12 GB
+/// **A sole request only** (`shared` is a request that takes turns with others,
+/// `RequestCtx::shares_gpu`, as `infr serve --parallel` makes). Only sole requests were
+/// measured; a shared one prefills in shorter chunks (`device.ubatch_parallel`), and the
+/// layer-major residency hints (hot-end inserts, the demotion of each finished layer) assume one
+/// prefill owns the pool's recency order, where chunk-major's cold-end inserts were chosen to
+/// leave other sessions' decode working sets alone.
+///
+/// **A first chunk of at least [`HOST_LAYER_MAJOR_MIN_ROWS`] only.** The gate reads the FIRST
+/// chunk, whose height `dsv4_emit::prefill_chunk_rows` derives from the session's chunk height
+/// and the prefill's START position: on a file with a CSA layer it shrinks the chunk as the
+/// context grows. So a prompt prefilled from position 0 at the default height qualifies at any
+/// length (its later chunks may shrink below the minimum and still run layer-major), while a turn
+/// that extends a session from deep in its context may get a first chunk below the minimum and
+/// prefill chunk-major (`layer_major_gate_follows_the_first_chunk` pins where). Measured on V4-Flash with a 12 GB
 /// arena (`docs/deepseek.md` § "Layer-major prefill on the CPU"): at the default 1024-row chunk a
 /// 1443-token prompt prefilled in 206.8 s layer-major, where chunk-major had spent 209.5 s on its
 /// first chunk alone; in 32-row chunks a 69-token prompt was SLOWER layer-major (98.96 and 114.89
 /// s against 91.59 s). A small chunk routes to a small part of each bank, so chunk-major re-reads
 /// little per chunk, and what it re-reads it had read seconds before, which the OS file cache
 /// largely still holds; layer-major's reads are all first reads.
-pub(crate) fn host_layer_major(cfg: &Config, chunk_rows: usize) -> bool {
-    cfg.deepseek4 && chunk_rows >= HOST_LAYER_MAJOR_MIN_ROWS
+pub(crate) fn host_layer_major(cfg: &Config, first_chunk_rows: usize, shared: bool) -> bool {
+    cfg.deepseek4 && !shared && first_chunk_rows >= HOST_LAYER_MAJOR_MIN_ROWS
 }
 
-/// The shortest prefill chunk [`host_layer_major`] runs layer-major. The two measured heights are
-/// 32 rows (slower) and 1024 (faster); this sits between them, low enough that the long-context
-/// shrink of V4's chunk (`dsv4_emit::prefill_chunk_rows`, which only drops below 1024 rows past
-/// 64k positions) keeps the order up to about 400k positions. Nothing between the two was run.
+/// The shortest first prefill chunk [`host_layer_major`] runs layer-major. The two measured
+/// heights are 32 rows (slower) and 1024 (faster); nothing between them was run, and this sits
+/// between them so that a sole request keeps the order while V4's long-context shrink
+/// (`dsv4_emit::prefill_chunk_rows`) leaves its first chunk at least this tall.
 pub(crate) const HOST_LAYER_MAJOR_MIN_ROWS: usize = 256;
 
 /// What a layer-major prefill may hold between layers for its whole segment of the prompt: the
 /// residual stream (DeepSeek V4's `hc_mult` streams wide) and the chunk's embedded input rows.
-/// Priced by [`cpu_committed_bytes`] on a CPU DeepSeek V4 run beside the activation reserve;
+/// Taken out of an automatic CPU arena too small for the weights ([`layer_major_carry_bytes`]);
 /// `layer_major_segments_carry_one_gib_at_v4_flash_geometry` pins the rows it gives V4-Flash.
 pub(crate) const LAYER_MAJOR_CARRY_BYTES: u64 = 1 << 30;
 
@@ -5564,9 +5590,16 @@ mod seam_helper_tests {
         assert_eq!(super::layer_major_segment_rows(&capped, &v4), 512);
         assert_eq!(super::layer_major_segment_rows(&capped, &dense), 512);
         let min = super::HOST_LAYER_MAJOR_MIN_ROWS;
-        assert!(super::host_layer_major(&v4, min) && super::host_layer_major(&v4, 1024));
-        assert!(!super::host_layer_major(&v4, min - 1) && !super::host_layer_major(&v4, 32));
-        assert!(!super::host_layer_major(&dense, 1024));
+        assert!(super::host_layer_major(&v4, min, false));
+        assert!(super::host_layer_major(&v4, 1024, false));
+        assert!(!super::host_layer_major(&v4, min - 1, false));
+        assert!(!super::host_layer_major(&v4, 32, false));
+        assert!(!super::host_layer_major(&dense, 1024, false));
+        // A request sharing the backend (`infr serve --parallel`) keeps chunk-major at any height,
+        // its own parallel chunk height included.
+        let parallel = super::ubatch_rows_parallel(&ec);
+        assert!(!super::host_layer_major(&v4, parallel, true));
+        assert!(!super::host_layer_major(&v4, 1024, true));
     }
 
     /// The per-prompt half of the layer-major gate: auto runs it only where it can save a read

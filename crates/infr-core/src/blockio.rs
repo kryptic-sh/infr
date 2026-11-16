@@ -425,8 +425,8 @@ fn read_pieces<'a>(
             .err();
         for h in handles {
             // A panicking reader is a bug in this function, not an I/O condition: propagate it
-            // rather than reporting a block that was never filled as read.
-            if let Err(e) = h.join().expect("block reader thread panicked") {
+            // rather than reporting a block that was never filled as read, with its own message.
+            if let Err(e) = h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)) {
                 first_err.get_or_insert(e);
             }
         }

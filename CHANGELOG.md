@@ -654,6 +654,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A panic inside a CPU kernel now fails the forward with its own message, and
+  the backend stays usable.** The CPU thread pool replaced a task's panic with a
+  generic `spin-pool: a task panicked`, and kept running every remaining task of
+  the job, each of which usually panicked the same way and paid the panic hook
+  again. It now re-raises the first task's own panic on the calling thread (an
+  out-of-bounds slice reports its index and length) once every thread has
+  stopped, and skips the tasks no thread had started. The panic also left every
+  owned CPU buffer the op held (outputs, KV cache, a bank held whole) poisoned,
+  so on a backend that outlives one forward, as `infr serve` keeps, every later
+  forward that bound one failed; those buffers now recover. The expert read
+  lanes and multi-shard block reads re-raise their thread's own panic as well.
 - **A shader that fails to compile now stops the build with one clear message**
   (#93). A `glslc` too old for infr's shaders used to surface as a bare
   `glslc failed for shaders/...` panic per worker thread, with the real

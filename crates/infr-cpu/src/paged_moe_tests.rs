@@ -509,3 +509,46 @@ fn only_moe_ffn_may_read_a_bank_paged_per_expert() {
     let err = be.execute(plan.as_ref(), &bind).expect_err("must refuse");
     assert!(err.to_string().contains("Op::MoeFfn"), "{err}");
 }
+
+/// **A panic inside a kernel the pool runs fails the forward promptly, and the backend computes
+/// the next one correctly.** A bank held whole read at twice its expert stride slices past the
+/// bank's end inside the gate GEMM's tasks — the fault that once left a test process idle until it
+/// was killed. The forward must fail with that slice's own message, and the same backend, banks and
+/// pool must then compute what they computed before the fault.
+#[test]
+fn a_kernel_panic_fails_the_forward_and_the_next_one_computes() {
+    super::test_util::within(|| {
+        let moe = Moe {
+            dt: DType::Q8_0,
+            fused: false,
+            layers: 1,
+            ne: 512,
+            nff: 256,
+            n_expert: 32,
+            n_used: 4,
+            rows: 48,
+        };
+        let built = moe.build();
+        let be = CpuBackend::new();
+        let whole = built.whole(&be);
+        let x = rng(7, moe.rows * moe.ne);
+        let want = built.run(&be, &refs(&whole), &x);
+
+        be.double_whole_bank_stride.store(true, SeqCst);
+        let msg = super::test_util::panic_of(|| {
+            built.run(&be, &refs(&whole), &x);
+        })
+        .expect("the out-of-bounds expert slice did not fail the forward");
+        assert!(
+            msg.contains("out of range for slice"),
+            "not the slice's own panic: {msg}"
+        );
+        be.double_whole_bank_stride.store(false, SeqCst);
+
+        let got = built.run(&be, &refs(&whole), &x);
+        assert!(
+            bits(&got) == bits(&want),
+            "the forward after the panic computed differently"
+        );
+    })
+}

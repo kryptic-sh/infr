@@ -1766,11 +1766,26 @@ only its routed experts (`CpuBackend::moe_banks`). Left:
   four chunks (`a_prefill_sweep_keeps_its_resident_set`). Making a long prompt
   affordable needs a different shape: smaller chunks with expert-major order
   across a whole prompt, or reading each expert once for every chunk.
-- **A panic inside a CPU pool task can hang the process** instead of failing:
-  seen once on 2026-11-16, when a deliberately broken bank stride sliced past a
-  bank inside the MoE GEMMs and the test process sat idle for six minutes until
-  killed. Not investigated; `pool.rs` has a test that a panicking task's
-  completed values are dropped, so the hang is somewhere else.
+- **The six-minute hang on a broken bank stride (2026-11-16) did not reproduce,
+  and was probably not the pool.** Breaking `CpuBackend::moe_banks` so every
+  bank held whole takes the gate bank's stride fails
+  `paged_experts_compute_what_whole_banks_compute_while_evicting` in about a
+  second (checked with and without `RUST_BACKTRACE=1`): `SpinPool::run` already
+  caught task panics and waited for its workers. Writing that same break as
+  `bufs[0].len_bytes()` inside the `.map` that holds `b.read()` hangs instead,
+  with no panic at all: for bank 0, `len_bytes` relocks the `Mutex` whose guard
+  `read()` holds, and a `std` mutex is not reentrant. Whether the original break
+  was spelled that way is unknown. What a kernel panic did get wrong — a generic
+  panic message, every remaining task still run, owned buffers left poisoned for
+  the next forward — is fixed and pinned by `pool::tests` and
+  `a_kernel_panic_fails_the_forward_and_the_next_one_computes`.
+- **Not checked: locks above the CPU backend after a panicking forward.**
+  `infr serve` turns a panicking generation into a failed request
+  (`spawn_blocking`; non-streaming gets a 500 carrying the panic message,
+  streaming an error frame from `DoneGuard`), and `lock_recovered` in `infr-cli`
+  clears the model mutex's poison and resets the KV session. Any other `Mutex`
+  that `infr-llama` holds across a CPU `execute` and locks with `unwrap` would
+  still fail every later request; none was looked for.
 - **Not covered by a test on a real MoE file other than V4-Flash** (the
   synthetic V4 fixture and an op-level test cover the mechanism, the latter
   bitwise against whole banks while evicting for f32, Q8_0, Q4_K and Q2_K in

@@ -144,6 +144,7 @@ pub struct CpuBuffer {
 }
 
 enum CpuStore {
+    /// Locked through [`lock_bytes`], never `lock().unwrap()`.
     Owned(Mutex<Vec<u8>>),
     Mapped(TensorBytes),
     /// Read from the model file into the host arena on demand (`paging.dram`). The bytes are only
@@ -204,6 +205,21 @@ impl std::ops::Deref for CpuRead<'_> {
     }
 }
 
+/// An owned buffer's bytes, poisoned or not.
+///
+/// A panic in an op poisons every owned buffer the op held (its outputs, a whole expert bank, a KV
+/// cache), and `unwrap` would then fail every later graph that binds one: a long-lived backend,
+/// as `infr serve` keeps, would fail each request after the first panic. The poison carries no
+/// broken invariant here — the mutex guards plain bytes, which a later graph overwrites or the
+/// caller discards (`serve` resets the KV session after a panicking generation) — so it is
+/// cleared rather than propagated.
+fn lock_bytes(m: &Mutex<Vec<u8>>) -> std::sync::MutexGuard<'_, Vec<u8>> {
+    m.lock().unwrap_or_else(|poisoned| {
+        m.clear_poison();
+        poisoned.into_inner()
+    })
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl CpuBuffer {
     /// A writable buffer over `bytes` (KV, recurrent state, per-step IO).
@@ -230,7 +246,7 @@ impl CpuBuffer {
     /// panic here means an op read a weight its `Op::io()` did not list.
     fn read(&self) -> CpuRead<'_> {
         match &self.store {
-            CpuStore::Owned(m) => CpuRead::Owned(m.lock().unwrap()),
+            CpuStore::Owned(m) => CpuRead::Owned(lock_bytes(m)),
             CpuStore::Mapped(t) => CpuRead::Mapped(t),
             CpuStore::Paged { store, id, .. } => CpuRead::Pinned(store.try_pin(*id).expect(
                 "cpu backend: a paged weight was read without being pinned first — the op's \
@@ -245,7 +261,7 @@ impl CpuBuffer {
     /// Mutable owned storage; panics for mapped (read-only) weights.
     fn owned(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
         match &self.store {
-            CpuStore::Owned(m) => m.lock().unwrap(),
+            CpuStore::Owned(m) => lock_bytes(m),
             CpuStore::Mapped(_) | CpuStore::Paged { .. } | CpuStore::PagedExperts { .. } => {
                 panic!("cpu backend: write to a read-only weight buffer")
             }
@@ -257,7 +273,7 @@ impl CpuBuffer {
 impl Buffer for CpuBuffer {
     fn len_bytes(&self) -> usize {
         match &self.store {
-            CpuStore::Owned(m) => m.lock().unwrap().len(),
+            CpuStore::Owned(m) => lock_bytes(m).len(),
             CpuStore::Mapped(t) => t.len(),
             CpuStore::Paged { nbytes, .. } | CpuStore::PagedExperts { nbytes, .. } => *nbytes,
         }
@@ -304,6 +320,10 @@ pub struct CpuBackend {
     /// Query rows one `Op::Attention` task runs for one head: [`ATTN_QUERY_BLOCK`]. A field so a
     /// test can set 1, the one-pair-per-task decomposition the blocking replaced.
     attn_query_block: usize,
+    /// A test's deliberate fault: `Op::MoeFfn` reads a bank held whole at twice its expert
+    /// stride, so its upper experts slice past the bank's end inside the pool's tasks.
+    #[cfg(test)]
+    double_whole_bank_stride: std::sync::atomic::AtomicBool,
 }
 
 /// `default()` is `new()` — the env-sourced bridge, NOT `Config::default()`. Keeping them the same
@@ -333,6 +353,8 @@ impl CpuBackend {
             pool: std::sync::OnceLock::new(),
             cfg,
             attn_query_block: ATTN_QUERY_BLOCK,
+            #[cfg(test)]
+            double_whole_bank_stride: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -617,7 +639,8 @@ impl CpuBackend {
                     .collect();
                 let mut got = pin_lane(0);
                 for h in others {
-                    got.extend(h.join().expect("an expert pin thread panicked"));
+                    // The lane's own panic, not a generic one: it names what failed.
+                    got.extend(h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
                 }
                 got
             });
@@ -634,6 +657,15 @@ impl CpuBackend {
                 _ => {
                     let bytes = b.read();
                     let stride = bytes.len() / n_expert;
+                    #[cfg(test)]
+                    let stride = if self
+                        .double_whole_bank_stride
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        2 * stride
+                    } else {
+                        stride
+                    };
                     Bank::Whole { bytes, stride }
                 }
             })
@@ -4471,6 +4503,35 @@ pub(crate) mod test_util {
             }
         }
         w
+    }
+
+    /// Run `body` on a thread of its own and return what it returns, failing if it takes longer
+    /// than a generous bound: a test of a hang otherwise waits forever instead of failing.
+    pub(crate) fn within<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        let limit = std::time::Duration::from_secs(if cfg!(miri) { 900 } else { 60 });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(body()).expect("the test is waiting for this"));
+        match rx.recv_timeout(limit) {
+            Ok(v) => v,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("still running after {limit:?}: hung")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the test body panicked (its message is above)")
+            }
+        }
+    }
+
+    /// Run `f` under `catch_unwind`: the message of its panic, or `None` when it returned.
+    pub(crate) fn panic_of(f: impl FnOnce()) -> Option<String> {
+        let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).err()?;
+        Some(match p.downcast::<String>() {
+            Ok(s) => *s,
+            Err(p) => p
+                .downcast::<&'static str>()
+                .map(|s| (*s).to_owned())
+                .unwrap_or_else(|_| "<a payload that is not a string>".to_owned()),
+        })
     }
 }
 

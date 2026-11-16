@@ -562,9 +562,34 @@ testable without a machine that happens to have the right amount of RAM free.
   `infr_plat::mem::available`, which also answers on macOS (host-wide) and
   Windows (Job-Object-clamped); a platform with no probe answers `None`, which
   callers treat as "do not auto-size" and never as "assume plenty".
-- **`auto_arena_bytes`** — leaves the larger of 1 GiB and an eighth of what is
-  available, never budgets past the pageable bytes (more would buy nothing), and
-  returns 0 below a floor worth having.
+- **`auto_arena_bytes`** — the automatic budget is
+  `min(pageable, available - committed - max(1 GiB, available / 2))`, and 0
+  below a floor worth having. `committed` is what the run holds besides the
+  arena: zero for the GPU tiers (their KV lives in VRAM), and for the CPU
+  backend (`seam::cpu_committed_bytes`) its KV cache at `device.ctx` (else the
+  trained context capped at 8192, priced f16), the weights too small to page, a
+  1 GiB activation reserve, and the repack cache budget where the fused Q4_K
+  expert path can fill it (`seam::cpu_repack_reserve`). Half, not a fixed
+  margin, so it scales: the shared-box test guard's 12 GiB `UNIFIED_HOST_MARGIN`
+  as a floor would turn the tier off on any host with less available, while an
+  eighth (the rule until 2026-11-16) gave DeepSeek V4-Flash a 38.47 GB arena on
+  a host with 43.97 GB available and starved it. Verified on that file with no
+  `INFR_DRAM_CACHE`: 45.48 GB available gave a 21.56 GB arena beside 1.19 GB
+  committed, and the process stayed within it over a 48-token run (private bytes
+  20872 MiB); available memory bottomed at 19154 MiB, under the 21687 MiB half
+  because buffered reads grew the system file cache by about 3.4 GiB (backlog
+  B-DSV4-REAL).
+- **The CPU backend's split of that budget** (`infr_cpu::paged::plan_pools`) —
+  one pool per block size and read pattern; whole weights (read in full every
+  pass) are seated before expert pools (an expert bank paged one block per
+  expert, read only when routed), each class first given its floor (one block,
+  or every expert one `Op::MoeFfn` pins at once).
+- **The CPU's fit test uses the same accounting** — the mapping is kept only
+  when `pageable + committed <= available` (no headroom: page-cache pages are
+  reclaimable). One byte past it the half rule's arena applies, a deliberate
+  step: a recency-evicting page cache short by a little misses on nearly every
+  block of a sweep, so a smaller arena should still win there (inferred, not
+  measured at the boundary).
 - **`cpu_arena_plan` / `streaming_arena_plan`** — the two decisions, differing
   in one rung: the Vulkan tiers are already past the fit decision, while the CPU
   backend has to make it. Both answer with a reason when they decline, because

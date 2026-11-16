@@ -16,6 +16,8 @@ pub mod indexer_tap;
 pub mod kvquant;
 pub mod op_tap;
 pub mod paged;
+#[cfg(test)]
+mod paged_moe_tests;
 mod pool;
 pub mod turbo;
 
@@ -152,6 +154,13 @@ enum CpuStore {
         id: paged::PagedId,
         nbytes: usize,
     },
+    /// An expert bank paged per expert: only `Op::MoeFfn` reads it, and only the experts its
+    /// routing picked, which it pins itself once routing has run — see [`CpuBackend::moe_banks`].
+    PagedExperts {
+        store: Arc<paged::PagedWeights>,
+        bank: paged::PagedExperts,
+        nbytes: usize,
+    },
 }
 
 /// A uniform read view over any storage (a `MutexGuard` for owned, the slice for mapped, a pin for
@@ -161,6 +170,26 @@ enum CpuRead<'a> {
     Mapped(&'a TensorBytes),
     /// Holds the block resident for as long as the view lives.
     Pinned(infr_core::hostpager::Pin<'a>),
+}
+
+/// One expert bank as `Op::MoeFfn` reads it: expert `e`'s bytes through [`Bank::expert`].
+enum Bank<'a> {
+    /// Held as one view — mapped, owned, or paged whole — of `n_expert` slices `stride` bytes
+    /// apart.
+    Whole { bytes: CpuRead<'a>, stride: usize },
+    /// Paged per expert: the op's routed experts, each pinned, and `None` for every other.
+    Experts(Vec<Option<infr_core::hostpager::Pin<'a>>>),
+}
+
+impl Bank<'_> {
+    fn expert(&self, e: usize) -> &[u8] {
+        match self {
+            Bank::Whole { bytes, stride } => &bytes[e * stride..(e + 1) * stride],
+            Bank::Experts(pins) => pins[e].as_deref().unwrap_or_else(|| {
+                panic!("cpu Op::MoeFfn read expert {e}, which its routing did not pin")
+            }),
+        }
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -207,13 +236,17 @@ impl CpuBuffer {
                 "cpu backend: a paged weight was read without being pinned first — the op's \
                  Op::io() reads must name every weight its body reads",
             )),
+            CpuStore::PagedExperts { .. } => panic!(
+                "cpu backend: an expert bank paged per expert was read whole — only \
+                 Op::MoeFfn reads one, through its routed experts' pins"
+            ),
         }
     }
     /// Mutable owned storage; panics for mapped (read-only) weights.
     fn owned(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
         match &self.store {
             CpuStore::Owned(m) => m.lock().unwrap(),
-            CpuStore::Mapped(_) | CpuStore::Paged { .. } => {
+            CpuStore::Mapped(_) | CpuStore::Paged { .. } | CpuStore::PagedExperts { .. } => {
                 panic!("cpu backend: write to a read-only weight buffer")
             }
         }
@@ -226,7 +259,7 @@ impl Buffer for CpuBuffer {
         match &self.store {
             CpuStore::Owned(m) => m.lock().unwrap().len(),
             CpuStore::Mapped(t) => t.len(),
-            CpuStore::Paged { nbytes, .. } => *nbytes,
+            CpuStore::Paged { nbytes, .. } | CpuStore::PagedExperts { nbytes, .. } => *nbytes,
         }
     }
     fn as_any(&self) -> &dyn Any {
@@ -452,18 +485,45 @@ impl CpuBackend {
         })
     }
 
+    /// Wrap an expert bank registered per expert (see [`paged::PagedWeights::register_experts`])
+    /// as a read-only weight buffer. Nothing is read here: `Op::MoeFfn` pins the experts it routes
+    /// to.
+    pub fn paged_experts_weight(
+        &self,
+        store: Arc<paged::PagedWeights>,
+        bank: paged::PagedExperts,
+        nbytes: usize,
+    ) -> Box<dyn Buffer> {
+        Box::new(CpuBuffer {
+            uid: next_buffer_uid(),
+            store: CpuStore::PagedExperts {
+                store,
+                bank,
+                nbytes,
+            },
+        })
+    }
+
     /// Pin every paged weight `op` READS, returning guards that keep them resident until dropped.
     ///
     /// Driven by [`Op::io`], the same exhaustive enumeration the multi-device pipeline executor
     /// uses — so a new `Op` variant cannot forget to declare its reads here without also failing
     /// that. A weight an op reads without listing panics at `CpuBuffer::read` rather than silently
     /// reading an evicted slot.
+    ///
+    /// An expert bank paged per expert is skipped for `Op::MoeFfn`, which pins its routed experts
+    /// itself ([`Self::moe_banks`]) — which ones is not known until its router has run. Any other op
+    /// naming one is refused: nothing else reads a bank, and reading all of it would defeat the
+    /// point of paging it by expert.
     fn pin_op_weights<'b>(
         &self,
         op: &Op,
+        g: &Graph,
         bindings: &'b Bindings<'b>,
     ) -> Result<Vec<infr_core::hostpager::Pin<'b>>> {
         let mut pins = Vec::new();
+        let t0 = std::time::Instant::now();
+        let mut waited_on: Option<&paged::PagedWeights> = None;
         for id in op.io().0 {
             let Some(buf) = bindings.get(id) else {
                 continue;
@@ -473,11 +533,111 @@ impl CpuBackend {
             let Some(cb) = buf.as_any().downcast_ref::<CpuBuffer>() else {
                 continue;
             };
-            if let CpuStore::Paged { store, id, .. } = &cb.store {
-                pins.push(store.pin(*id)?);
+            match &cb.store {
+                CpuStore::Paged { store, id, .. } => {
+                    pins.push(store.pin(*id)?);
+                    waited_on = Some(store);
+                }
+                CpuStore::PagedExperts { .. } if matches!(op, Op::MoeFfn { .. }) => {}
+                CpuStore::PagedExperts { .. } => {
+                    return Err(infr_core::error::Error::backend(format!(
+                        "cpu backend: {} reads an expert bank paged per expert, which only \
+                         Op::MoeFfn can read",
+                        infr_core::prof::op_label(op, g)
+                    )))
+                }
+                CpuStore::Owned(_) | CpuStore::Mapped(_) => {}
             }
         }
+        if let Some(store) = waited_on {
+            store.note_wait(t0.elapsed());
+        }
         Ok(pins)
+    }
+
+    /// The expert banks of one `Op::MoeFfn`, ready to read for the experts in `routed`.
+    ///
+    /// A bank paged per expert gets exactly those experts pinned, and nothing else read; any other
+    /// bank is read whole, as before. The pins of every bank go out in one wave on
+    /// [`infr_core::blockio::IO_FANOUT`] threads of their own, so a decode step's misses — a few
+    /// experts in each of three banks — are read concurrently rather than one after another. Not
+    /// on the compute pool: a run held to one compute thread (`-t 1`) would otherwise read one
+    /// expert at a time. More lanes than that would only queue on the file's handles.
+    ///
+    /// Which end of the recency order they go to is [`paged::expert_insert`]'s call: the most
+    /// recent for a decode step, the cold end for a chunk that sweeps most of every bank.
+    fn moe_banks<'b>(
+        &self,
+        bufs: &[&'b CpuBuffer],
+        n_expert: usize,
+        routed: &[usize],
+    ) -> Result<Vec<Bank<'b>>> {
+        let mut jobs: Vec<(usize, usize)> = Vec::new();
+        let mut store: Option<&'b paged::PagedWeights> = None;
+        for (i, b) in bufs.iter().enumerate() {
+            if let CpuStore::PagedExperts { store: s, bank, .. } = &b.store {
+                if bank.n_expert() != n_expert {
+                    return Err(infr_core::error::Error::backend(format!(
+                        "cpu Op::MoeFfn: a bank registered with {} experts is routed over {n_expert}",
+                        bank.n_expert()
+                    )));
+                }
+                jobs.extend(routed.iter().map(|&e| (i, e)));
+                store = Some(s);
+            }
+        }
+        let mut pinned: Vec<Vec<Option<infr_core::hostpager::Pin<'b>>>> = bufs
+            .iter()
+            .map(|b| match b.store {
+                CpuStore::PagedExperts { .. } => (0..n_expert).map(|_| None).collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        if let Some(store) = store {
+            let t0 = std::time::Instant::now();
+            let insert = paged::expert_insert(routed.len(), n_expert);
+            let lanes = infr_core::blockio::IO_FANOUT.min(jobs.len());
+            let jobs = &jobs;
+            let pin_lane = &|lane: usize| {
+                jobs.iter()
+                    .skip(lane)
+                    .step_by(lanes)
+                    .map(|&(i, e)| {
+                        let CpuStore::PagedExperts { store, bank, .. } = &bufs[i].store else {
+                            unreachable!("only per-expert banks were queued");
+                        };
+                        (i, e, store.pin_expert(*bank, e, insert))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            // The calling thread takes lane 0, so a single-lane wave spawns nothing.
+            let got = std::thread::scope(|s| {
+                let others: Vec<_> = (1..lanes)
+                    .map(|lane| s.spawn(move || pin_lane(lane)))
+                    .collect();
+                let mut got = pin_lane(0);
+                for h in others {
+                    got.extend(h.join().expect("an expert pin thread panicked"));
+                }
+                got
+            });
+            store.note_wait(t0.elapsed());
+            for (i, e, pin) in got {
+                pinned[i][e] = Some(pin?);
+            }
+        }
+        Ok(bufs
+            .iter()
+            .zip(pinned)
+            .map(|(b, pins)| match b.store {
+                CpuStore::PagedExperts { .. } => Bank::Experts(pins),
+                _ => {
+                    let bytes = b.read();
+                    let stride = bytes.len() / n_expert;
+                    Bank::Whole { bytes, stride }
+                }
+            })
+            .collect())
     }
 
     /// Fetch-or-build a dequantized weight from `weight_cache` under its `(buffer uid, dtype)` key
@@ -572,6 +732,21 @@ fn borrow_two_mut<T>(v: &mut [T], a: usize, b: usize) -> (&T, &mut T) {
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
+/// Whether this CPU takes the fused Q4_K expert path whose packs fill the repack cache
+/// (`kernels.cpu.repack_mb`): the VNNI GEMM, which needs AVX-512 BW and VNNI. A model with a fused
+/// Q4_K gate_up bank can then hold up to that budget in packs on top of its weights, which the
+/// seam prices when it sizes a host weight arena.
+pub fn q4k_expert_repack_available() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 fn cpu_buf(b: &dyn Buffer) -> &CpuBuffer {
     b.as_any()
         .downcast_ref::<CpuBuffer>()
@@ -918,7 +1093,7 @@ impl Backend for CpuBackend {
             // an I/O failure there could only panic. The guards drop at the end of the iteration.
             // Empty (and free) for a model with no paged weights, which is every model until
             // `paging.dram` is set.
-            let _pins = self.pin_op_weights(op, bindings)?;
+            let _pins = self.pin_op_weights(op, g, bindings)?;
             let __t0 = if prof_ops {
                 Some(std::time::Instant::now())
             } else {
@@ -2659,22 +2834,22 @@ impl Backend for CpuBackend {
                         .get(down_exps)
                         .expect("cpu backend: unbound down_exps");
                     let rbytes = cpu_buf(rbuf).read();
-                    let gb = cpu_buf(gbuf).read();
-                    let db = cpu_buf(dbuf).read();
                     let rdt = g.desc(router).dtype;
                     let gdt = g.desc(gate_exps).dtype;
                     let ddt = g.desc(down_exps).dtype;
                     // Fused: `gate_exps` holds BOTH roles ([ne, 2*n_ff_exp, n_expert], gate rows
-                    // first); split gets its own separate up_exps/up buffer.
-                    let (ub, udt) = if fused_gate_up {
+                    // first); split gets its own separate up_exps/up buffer. The banks themselves
+                    // are bound only once routing has picked the experts: a bank paged per expert
+                    // has nothing to read before then.
+                    let (ubuf, udt) = if fused_gate_up {
                         (None, gdt)
                     } else {
                         let ubuf = bindings.get(up_exps).expect("cpu backend: unbound up_exps");
-                        (Some(cpu_buf(ubuf).read()), g.desc(up_exps).dtype)
+                        (Some(cpu_buf(ubuf)), g.desc(up_exps).dtype)
                     };
-                    let gst = gb.len() / n_expert;
-                    let ust = ub.as_ref().map(|b| b.len() / n_expert);
-                    let dst_ = db.len() / n_expert;
+                    // One expert's byte band in the gate bank: the repack cache's key.
+                    #[cfg(target_arch = "x86_64")]
+                    let gst = cpu_buf(gbuf).len_bytes() / n_expert;
                     let dscale = down_scale.map(weight); // per-expert scale [n_expert], if any
 
                     // ── Router: ONE batched matvec over every row (router_x is tiny — [n_expert, ne]
@@ -2918,6 +3093,17 @@ impl Backend for CpuBackend {
                         }
                     }
                     let n_pairs = pair_row.len();
+                    // The banks, for exactly the experts routing picked. Gate first, down second,
+                    // up (split banks only) last.
+                    let routed: Vec<usize> = buckets.iter().map(|&(e, _, _)| e).collect();
+                    let mut bank_bufs = vec![cpu_buf(gbuf), cpu_buf(dbuf)];
+                    bank_bufs.extend(ubuf);
+                    let mut banks = self.moe_banks(&bank_bufs, n_expert, &routed)?.into_iter();
+                    let (gb, db) = (
+                        banks.next().expect("gate bank"),
+                        banks.next().expect("down bank"),
+                    );
+                    let ub = banks.next();
                     // `debug.moe_counts`: print the REAL per-expert row-count distribution
                     // for this chunk/layer (this CPU interpreter's top-k routing is bit-identical
                     // to the GPU's, so this is a host-side stand-in for reading the GPU's own
@@ -3068,8 +3254,7 @@ impl Backend for CpuBackend {
                             && gdt == DType::Q4K
                             && ne.is_multiple_of(256)
                             && (2 * nffx).is_multiple_of(8)
-                            && is_x86_feature_detected!("avx512bw")
-                            && is_x86_feature_detected!("avx512vnni");
+                            && q4k_expert_repack_available();
                         if packable {
                             pool.collect(buckets.len(), &|b| {
                                 let e = buckets[b].0;
@@ -3077,7 +3262,7 @@ impl Backend for CpuBackend {
                                 // it, never the slice address — see `repack::PackKey`.
                                 Some(self.q4k_pack_for(
                                     (cpu_buf(gbuf).uid, e * gst, gst),
-                                    &gb[e * gst..(e + 1) * gst],
+                                    gb.expert(e),
                                     ne,
                                     2 * nffx,
                                 ))
@@ -3109,7 +3294,7 @@ impl Backend for CpuBackend {
                                 )
                             };
                             expert_gemm_range(
-                                &gb[e * gst..(e + 1) * gst],
+                                gb.expert(e),
                                 gdt,
                                 ne,
                                 out_gu,
@@ -3122,7 +3307,6 @@ impl Backend for CpuBackend {
                         });
                         if !fused_gate_up {
                             let ub = ub.as_ref().expect("split gate/up: up_exps missing");
-                            let ust = ust.expect("split gate/up: up stride missing");
                             let up_ptr = pool::SendPtr::new(up_all.as_mut_ptr());
                             pool.run(tasks.len(), &|t| {
                                 let (b, o0, o1) = tasks[t];
@@ -3136,7 +3320,7 @@ impl Backend for CpuBackend {
                                     )
                                 };
                                 expert_gemm_range(
-                                    &ub[e * ust..(e + 1) * ust],
+                                    ub.expert(e),
                                     udt,
                                     ne,
                                     nffx,
@@ -3239,7 +3423,7 @@ impl Backend for CpuBackend {
                             let s_e = dscale.as_ref().map(|ds| ds[e]);
                             moe::with_block_scratch((o1 - o0) * count, |blk| {
                                 expert_gemm_range(
-                                    &db[e * dst_..(e + 1) * dst_],
+                                    db.expert(e),
                                     ddt,
                                     nffx,
                                     ne,

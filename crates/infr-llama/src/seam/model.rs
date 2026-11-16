@@ -528,6 +528,7 @@ impl SeamModel {
                 CpuBackend::new_with(self.ecfg.clone()),
                 &self.ecfg,
                 &self.gguf,
+                &self.cfg,
             )?,
         });
         f(res)
@@ -2074,6 +2075,7 @@ impl SeamModel {
             infr_cpu::CpuBackend::reference_with(self.ecfg.clone()),
             &self.ecfg,
             &self.gguf,
+            &self.cfg,
         )?;
         let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
             &mut res,

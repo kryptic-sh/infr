@@ -101,25 +101,34 @@ impl<'a> TokenEmbd<'a> {
 ///
 /// Returns `None` — not an error — when nothing seats, so every degraded case falls back to
 /// today's behaviour rather than failing the load.
+///
+/// # What the automatic budget leaves
+/// The arena is taken from what is available only after [`cpu_committed_bytes`] — the run's KV
+/// cache, the weights that stay mapped, its activations — and after the headroom
+/// [`infr_core::hostmem::auto_arena_bytes`] leaves to the rest of the machine, so the budget is
+/// what the process adds on top of everything else it holds.
 fn cpu_paged_store(
     ec: &EngineConfig,
     g: &Gguf,
+    cfg: &Config,
 ) -> AResult<Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>> {
     // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
     let explicit = infr_core::hostmem::Requested::from_config(
         ec.paging.dram.map(|s| s.resolve(0)),
         ec.paging.dram_bypass,
     );
+    let weights = cpu_pageable(g, cfg);
     // Only the weights this backend would actually page count toward "does it fit": the sub-floor
     // tensors stay mapped either way, so counting them could page a model that fits.
-    let pageable: u64 = g
-        .tensors()
+    let pageable: u64 = weights
         .iter()
-        .filter(|t| t.nbytes >= infr_cpu::paged::MIN_PAGED_BYTES)
-        .map(|t| t.nbytes as u64)
+        .filter(|w| w.nbytes >= infr_cpu::paged::MIN_PAGED_BYTES)
+        .map(|w| w.nbytes as u64)
         .sum();
     let available = infr_core::hostmem::available_bytes();
-    let budget = match infr_core::hostmem::cpu_arena_plan(explicit, available, pageable) {
+    let committed = cpu_committed_bytes(ec, g, cfg);
+    let budget = match infr_core::hostmem::cpu_arena_plan(explicit, available, committed, pageable)
+    {
         // Only the GPU tiers can want a reader with no cache under them (their arena IS the cache
         // on unified memory). For the CPU backend this arena is the only tier there is, so a
         // read-through with nothing behind it would be a pure regression on the mapping.
@@ -132,10 +141,12 @@ fn cpu_paged_store(
                 tracing::info!(
                     "host paging: {:.2} GB of weights exceed the {:.2} GB of host memory \
                      available, so they stream from disk through a {:.2} GB arena instead of the \
-                     OS page cache (set INFR_DRAM_CACHE to override)",
+                     OS page cache, leaving half of what is available beside the run's other \
+                     {:.2} GB (set INFR_DRAM_CACHE to override)",
                     pageable as f64 / 1e9,
                     available.unwrap_or(0) as f64 / 1e9,
                     n as f64 / 1e9,
+                    committed as f64 / 1e9,
                 );
             }
             n as usize
@@ -158,7 +169,7 @@ fn cpu_paged_store(
             return Ok(None);
         }
     };
-    let plans = infr_cpu::paged::plan_pools(budget, g.tensors());
+    let plans = infr_cpu::paged::plan_pools(budget, &weights);
     if plans.is_empty() {
         tracing::warn!(
             "host paging: a {:.2} GB budget seats no weight class of this model — keeping the \
@@ -174,14 +185,107 @@ fn cpu_paged_store(
         .map_err(|e| anyhow!("{e}"))?;
     let store = infr_cpu::paged::PagedWeights::new(&plans, io, trace.as_ref())
         .map_err(|e| anyhow!("{e}"))?;
+    let experts: usize = plans
+        .iter()
+        .filter(|p| p.experts)
+        .map(|p| p.n_slots * p.slot_bytes)
+        .sum();
     tracing::info!(
-        "host paging: {} weight class(es), {:.2} GB arena of a {:.2} GB budget",
+        "host paging: {} weight class(es), {:.2} GB arena of a {:.2} GB budget ({:.2} GB of it \
+         single experts)",
         plans.len(),
         store.arena_bytes() as f64 / 1e9,
         budget as f64 / 1e9,
+        experts as f64 / 1e9,
     );
     Ok(Some(std::sync::Arc::new(store)))
 }
+
+/// Every weight of `g` as the CPU host tier sees it: an expert bank (see [`is_expert_bank`]) of a
+/// MoE model is read `n_used` experts at a time, everything else whole. A bank whose name carries
+/// no layer index is counted as one more bank of a shared layer, which can only raise its class's
+/// floor.
+fn cpu_pageable(g: &Gguf, cfg: &Config) -> Vec<infr_cpu::paged::Pageable> {
+    use infr_cpu::paged::{Pageable, Reads};
+    g.tensors()
+        .iter()
+        .map(|t| Pageable {
+            nbytes: t.nbytes,
+            reads: match &cfg.moe {
+                Some(m) if is_expert_bank(&t.name) => Reads::Experts {
+                    n_expert: m.n_expert,
+                    n_used: m.n_used,
+                    layer: exps_layer(&t.name).unwrap_or(usize::MAX),
+                },
+                _ => Reads::Whole,
+            },
+        })
+        .collect()
+}
+
+/// The layer index of a `blk.{l}.…_exps…` tensor name.
+fn exps_layer(name: &str) -> Option<usize> {
+    if !name.contains("_exps") {
+        return None;
+    }
+    name.strip_prefix("blk.")
+        .and_then(|r| r.split('.').next())
+        .and_then(|l| l.parse::<usize>().ok())
+}
+
+/// Host memory a CPU run holds besides its weight arena, which the automatic arena budget must
+/// leave room for: the KV cache at the context the run will use, the weights too small to page
+/// (mapped, and in the working set once a pass reads them), [`CPU_ACTIVATION_RESERVE`], and the
+/// Q4_K repack cache where the run can fill it ([`cpu_repack_reserve`]).
+///
+/// The context is `device.ctx` when set, else the trained context capped at
+/// [`CPU_BUDGET_CTX`] — a CPU generation sizes its cache to its own prompt and output, which is
+/// unknown when the arena is sized once for every generation the model will serve. The cache is
+/// priced at f16, the CPU default, without the sliding-window ring, which only shrinks it.
+fn cpu_committed_bytes(ec: &EngineConfig, g: &Gguf, cfg: &Config) -> u64 {
+    let ctx = crate::chat::cfg_ctx(ec, cfg.n_ctx_train)
+        .unwrap_or_else(|| cfg.n_ctx_train.min(CPU_BUDGET_CTX));
+    let kv = kv_bytes_estimate(cfg, ctx, false, 1, false);
+    let small: u64 = g
+        .tensors()
+        .iter()
+        .filter(|t| t.nbytes < infr_cpu::paged::MIN_PAGED_BYTES)
+        .map(|t| t.nbytes as u64)
+        .sum();
+    kv + small
+        + CPU_ACTIVATION_RESERVE
+        + cpu_repack_reserve(ec, g.tensors(), infr_cpu::q4k_expert_repack_available())
+}
+
+/// The CPU repack cache's budget (`kernels.cpu.repack_mb`) when this run can fill it, else 0.
+///
+/// The fused Q4_K expert path keeps a pack of every routed expert it multiplies, up to that budget
+/// (`CpuBackend::q4k_pack_for`), on CPUs where `has_path` ([`infr_cpu::q4k_expert_repack_available`])
+/// and for models with a fused Q4_K gate_up bank (qwen35moe, gemma4's MoE). Those packs are
+/// anonymous memory beside the arena, so they are priced at the whole budget: the cache keeps
+/// what it built until the budget is spent.
+fn cpu_repack_reserve(
+    ec: &EngineConfig,
+    tensors: &[infr_core::loader::TensorInfo],
+    has_path: bool,
+) -> u64 {
+    let fused_q4k = tensors
+        .iter()
+        .any(|t| t.name.ends_with("ffn_gate_up_exps.weight") && t.dtype == DType::Q4K);
+    if has_path && fused_q4k {
+        (ec.kernels.cpu.repack_mb as u64) << 20
+    } else {
+        0
+    }
+}
+
+/// The context a CPU run's KV cache is priced at when `device.ctx` does not name one — the same
+/// default the Metal chat opens its sessions at.
+const CPU_BUDGET_CTX: usize = 8192;
+
+/// Host memory set aside for what a CPU forward allocates per pass — activations, the MoE pair
+/// buffers of a prefill chunk, the interpreter's recycled scratch — which nothing prices per model.
+const CPU_ACTIVATION_RESERVE: u64 = 1 << 30;
 
 /// Build the host DRAM tier under a set of Vulkan arena pools — one
 /// [`infr_core::hostpager::HostPager`] per pool, since a pool is already exactly a block-size class,
@@ -332,7 +436,7 @@ fn vulkan_host_tier(
 }
 
 fn cpu_upload_bind(be: &CpuBackend) -> Box<BindWeight<'_>> {
-    cpu_bind_with(be, None)
+    cpu_bind_with(be, None, None)
 }
 
 /// The CPU binder. With a `store`, a weight whose bytes come straight off disk (no load-time
@@ -341,12 +445,24 @@ fn cpu_upload_bind(be: &CpuBackend) -> Box<BindWeight<'_>> {
 fn cpu_bind_with<'a>(
     be: &'a CpuBackend,
     store: Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>,
+    n_expert: Option<usize>,
 ) -> Box<BindWeight<'a>> {
-    Box::new(move |_name, tb, dt, _n| {
+    Box::new(move |name, tb, dt, _n| {
         if let Some(store) = &store {
             // `file_ranges` is `None` exactly for bytes the loader REWROTE (the qwen2 q/k permute,
             // the BitNet dequant), which correspond to nothing on disk and so cannot be re-read.
             if let Some(ranges) = tb.file_ranges() {
+                // An expert bank goes to the per-expert pool when there is one, so that a pass
+                // reads only its routed experts; a bank that pool declines is offered whole below.
+                if let Some(n) = n_expert.filter(|_| is_expert_bank(name)) {
+                    if let Some(bank) = store
+                        .register_experts(&ranges, n)
+                        .map_err(|e| anyhow!("{e}"))?
+                    {
+                        let nbytes = ranges.iter().map(|(_, l)| l).sum();
+                        return Ok((be.paged_experts_weight(store.clone(), bank, nbytes), dt));
+                    }
+                }
                 if let Some(id) = store.register(&ranges).map_err(|e| anyhow!("{e}"))? {
                     let nbytes = ranges.iter().map(|(_, l)| l).sum();
                     return Ok((be.paged_weight(store.clone(), id, nbytes), dt));
@@ -416,9 +532,9 @@ pub(crate) struct CpuResident {
 impl CpuResident {
     /// A resident on `be` with nothing bound yet. The paged store is sized here, once, from the
     /// host memory available now.
-    pub(crate) fn open(be: CpuBackend, ec: &EngineConfig, g: &Gguf) -> AResult<Self> {
+    pub(crate) fn open(be: CpuBackend, ec: &EngineConfig, g: &Gguf, cfg: &Config) -> AResult<Self> {
         Ok(Self {
-            store: cpu_paged_store(ec, g)?,
+            store: cpu_paged_store(ec, g, cfg)?,
             be,
             bound: None,
         })
@@ -442,8 +558,8 @@ impl CpuResident {
     #[cfg(test)]
     pub(crate) fn paged_counts(&self) -> Option<(u64, u64)> {
         self.store.as_ref().map(|st| {
-            st.pool_stats().iter().fold((0, 0), |(h, b), (_, _, s)| {
-                (h + s.pager.hits, b + s.bytes_read)
+            st.pool_stats().iter().fold((0, 0), |(h, b), p| {
+                (h + p.stats.pager.hits, b + p.stats.bytes_read)
             })
         })
     }
@@ -509,7 +625,11 @@ pub(crate) fn generate_dense_cpu_mode(
     // the resident holds bound weights the binder is never called.
     let mut state = None;
     let out = {
-        let bind = cpu_bind_with(&res.be, res.store.clone());
+        let bind = cpu_bind_with(
+            &res.be,
+            res.store.clone(),
+            cfg.moe.as_ref().map(|m| m.n_expert),
+        );
         runner::generate_dense_backend_bound(
             res.bound.as_ref(),
             &res.be,
@@ -568,19 +688,27 @@ pub(crate) fn generate_dense_cpu_mode(
 /// the read count and the bytes moved are reported beside it: those are what a run's throughput is
 /// bounded by, and what the mmap baseline in `docs/perf/results.md` is compared against.
 fn report_host_paging(store: &infr_cpu::paged::PagedWeights) {
-    for (slot_bytes, n_slots, s) in store.pool_stats() {
+    for p in store.pool_stats() {
+        let s = p.stats;
+        let what = if p.experts { "expert" } else { "whole" };
         tracing::info!(
-            "[host pager] {:.1}MB x {n_slots} slots: {} hits, {} misses ({:.1}% hit), {} evictions, \
-             {} reads, {:.2} GB from disk",
-            slot_bytes as f64 / 1e6,
+            "[host pager] {what} {:.1}MB x {} slots: {} hits, {} misses ({:.1}% hit), {} \
+             evictions, {} reads, {:.2} GB from disk in {:.1}s of reads",
+            p.slot_bytes as f64 / 1e6,
+            p.n_slots,
             s.pager.hits,
             s.pager.misses,
             s.pager.hit_rate() * 100.0,
             s.pager.evictions,
             s.reads,
             s.bytes_read as f64 / 1e9,
+            s.read_ns as f64 / 1e9,
         );
     }
+    tracing::info!(
+        "[host pager] {:.1}s waiting for weights to become resident",
+        store.wait().as_secs_f64()
+    );
 }
 
 /// GPU seam runner: the SAME dense forward as [`generate_dense_cpu`], but on the Vulkan backend
@@ -2282,15 +2410,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
             }
         }
     }
-    // The layer index of a `blk.{l}.…_exps…` tensor name.
-    let exps_layer = |name: &str| -> Option<usize> {
-        if !name.contains("_exps") {
-            return None;
-        }
-        name.strip_prefix("blk.")
-            .and_then(|r| r.split('.').next())
-            .and_then(|l| l.parse::<usize>().ok())
-    };
     // A FUSED gate_up bank pages under `Role::Gate` (one double-width slot per expert; the model
     // then has no `Role::Up` sources at all) — see `infr_vulkan::pager`'s MoE-session doc.
     let moe_role_of = |name: &str| -> Option<infr_vulkan::pager::Role> {
@@ -4361,7 +4480,10 @@ mod bda_cap_tests {
 
 #[cfg(test)]
 mod seam_helper_tests {
-    use super::{kv_pair_bytes, Config, DType, EngineConfig, PlacementPins, PlacementScope};
+    use super::{
+        cpu_repack_reserve, kv_pair_bytes, Config, DType, EngineConfig, PlacementPins,
+        PlacementScope,
+    };
 
     /// Whether this process's default prefill chunk is the discrete one these tests assert. The
     /// device class is process-global and published by the first Vulkan backend any test in this
@@ -4553,6 +4675,32 @@ mod seam_helper_tests {
     /// `2 x (n_kv x head_dim)` = 384 elements/token/layer against a reality of 576 K-only —
     /// under-reserving by exactly 1.5x, with the context clamp and the resident-fit sweep computing
     /// off that.
+    #[test]
+    fn the_cpu_repack_cache_is_priced_only_where_it_can_fill() {
+        let t = |name: &str, dtype| infr_core::loader::TensorInfo {
+            name: name.to_string(),
+            shape: vec![1],
+            dtype,
+            offset: 0,
+            nbytes: 1,
+        };
+        let ec = EngineConfig::default();
+        let budget = (ec.kernels.cpu.repack_mb as u64) << 20;
+        let fused = [t("blk.0.ffn_gate_up_exps.weight", DType::Q4K)];
+        assert_eq!(cpu_repack_reserve(&ec, &fused, true), budget);
+        assert_eq!(cpu_repack_reserve(&ec, &fused, false), 0, "no VNNI path");
+        let split = [
+            t("blk.0.ffn_gate_exps.weight", DType::Q4K),
+            t("blk.0.ffn_up_exps.weight", DType::Q4K),
+        ];
+        assert_eq!(cpu_repack_reserve(&ec, &split, true), 0, "split banks");
+        let q6 = [t("blk.0.ffn_gate_up_exps.weight", DType::Q6K)];
+        assert_eq!(cpu_repack_reserve(&ec, &q6, true), 0, "not Q4_K");
+        let mut small = EngineConfig::default();
+        small.kernels.cpu.repack_mb = 7;
+        assert_eq!(cpu_repack_reserve(&small, &fused, true), 7 << 20);
+    }
+
     #[test]
     fn kv_bytes_estimate_prices_the_mla_row_it_allocates() {
         let cfg = deepseek_v2_lite_kv();

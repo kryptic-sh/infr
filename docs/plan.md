@@ -58,7 +58,8 @@ different:
 `bitnet`, `bitnet-b1.58`, `smollm3`, `ernie4_5`, `ernie4_5-moe`, `lfm3`, and the
 DeepSeek line — `deepseek`, `deepseek2`, `deepseek32`, `deepseek4` (status per
 stage in [`deepseek.md`](deepseek.md): `deepseek4` runs every layer tier on the
-CPU backend only, and the shipped V4-Flash file has not been run).
+CPU backend only; the shipped V4-Flash file runs there from disk at 1.28 s a
+token with a 12 GB cache, unchecked by any oracle).
 
 Fine-tunes on those backbones run with no code change (Ornith-1.0 and
 Ternary-Bonsai are the validated examples — see the root
@@ -319,9 +320,10 @@ here.
    for `deepseek2`, the lightning indexer for `deepseek32`; see
    [`deepseek.md`](deepseek.md)), and V4's compressed-KV tiers (`compress_ratio`
    4 and 128) now run on the CPU backend, matched to llama.cpp on synthetic
-   files. What is left is the shipped V4-Flash file's own numbers (larger than
-   this machine's RAM), batched prefill and the GPU backends, tracked as
-   B-DSV4-WIRING and B-DSV4-REAL in [`backlog.md`](backlog.md) and
+   files. The shipped V4-Flash file runs on the CPU from disk (1.28 s a decode
+   token with a 12 GB arena). What is left is an oracle for its numbers
+   (llama.cpp cannot load it here), its decode speed and the GPU backends,
+   tracked as B-DSV4-WIRING and B-DSV4-REAL in [`backlog.md`](backlog.md) and
    [`plan/09-deepseek-v4-compressed.md`](plan/09-deepseek-v4-compressed.md).
 2. **GLM-4.7-Flash** (~30B MoE). Mostly standard MoE FFN — infr's batched-expert
    path covers it — plus minor arch quirks (post-norm / partial RoPE); expect

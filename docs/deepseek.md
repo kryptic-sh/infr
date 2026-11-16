@@ -84,7 +84,7 @@ model small enough to develop against.**
 | 1     | `deepseek`   | `deepseek-llm-7b-chat`, `deepseek-moe-16b-chat`  | yes (~4 / ~10 GB Q4) |
 | 2     | `deepseek2`  | `DeepSeek-V2-Lite-Chat` (16B total, 2.4B active) | yes (~10 GB Q4)      |
 | 3     | `deepseek32` | **none — V3.2 is 671B**                          | no                   |
-| 4     | `deepseek4`  | **none — V4-Flash smallest quant is 82.5 GB**    | no                   |
+| 4     | `deepseek4`  | V4-Flash Q2_K_S (98.6 GB), paged from disk       | yes, CPU only        |
 
 GGUFs for the stage-1/2 models exist (TheBloke, mradermacher, legraphista).
 Stages 3 and 4 can only ever be exercised through the disk pager at 80+ GB, at a
@@ -747,19 +747,21 @@ there on synthetic files (see "The HCA tier" and "The CSA tier" below); a
 compressed layer on a GPU backend is refused by name. **What a V4 file needs to
 run now:** the CPU backend (`--dev cpu`), RAM for its weights (the shipped
 V4-Flash Q2_K_S is 98.6 GB, which this machine's 64 GB cannot hold; a run pages
-it from disk). The CPU prefills a V4 prompt in chunks of many positions per
-graph, as it does every other model (see "Batched prefill" below); the GPU
-backends prefill one position per graph. The shipped file has not been run: that
-it gets past every refusal on the CPU is inferred from its metadata and the
-synthetic fixtures, not run: some refusals sit after the weight upload and
-depend on the file's tensors, and no number it computes has been checked by any
-oracle. The compressed caches default to f16 (what the oracle checks); a
-quantized KV format is an explicit opt-in, unverified against the reference,
-which Hadamard-rotates those rows before quantizing them. See "Slice A — ratio
-0" below for what that covers, "Slice A2 — hash routing" for the
-`ffn_gate_tid2eid` gather, and `docs/backlog.md` § B-DSV4-WIRING for what is
-left. Note that no layer of the SHIPPED V4-Flash file is both ratio-0 and
-bias-routed — see `docs/backlog.md` § B-DSV4-REAL.
+it from disk through the host weight arena, one routed expert at a time). The
+CPU prefills a V4 prompt in chunks of many positions per graph, as it does every
+other model (see "Batched prefill" below); the GPU backends prefill one position
+per graph. The shipped file runs on the CPU since 2026-11-16: with a 12 GB arena
+it prefills a 5-token prompt in 16.2 s and decodes at 1.28 s a token, nearly all
+of it expert reads from disk, and it answered two prompts coherently
+(`docs/backlog.md` § B-DSV4-REAL has the measurements). No number it computes
+has been checked by any oracle: llama.cpp cannot load it on this machine. The
+compressed caches default to f16 (what the oracle checks); a quantized KV format
+is an explicit opt-in, unverified against the reference, which Hadamard-rotates
+those rows before quantizing them. See "Slice A — ratio 0" below for what that
+covers, "Slice A2 — hash routing" for the `ffn_gate_tid2eid` gather, and
+`docs/backlog.md` § B-DSV4-WIRING for what is left. Note that no layer of the
+SHIPPED V4-Flash file is both ratio-0 and bias-routed — see `docs/backlog.md` §
+B-DSV4-REAL.
 
 The 2026-08-10 read slice that preceded it was a read, not a port:
 `llama-kv-cache-dsv4.cpp` had never been read in full, which made this section's
@@ -1210,8 +1212,9 @@ Measured with `crates/infr-llama/tests/dsv4_cpu_bench.rs` (one decode row of one
 layer at V4-Flash's geometry — 64 heads of 512, raw window 128, indexer 64 heads
 × 128, `top_k` 512 — over random f16 caches; median ms; 32 threads on a Ryzen 9
 9950X3D, total CPU load 0-3% before and after, no other build or bench running).
-Synthetic and op-level: the real file has not been run. Two interleaved rounds,
-the commit before (`0be008dd`) then this change:
+Synthetic and op-level; the real file's per-token cost is disk-bound (§
+B-DSV4-REAL) and was not broken down by op. Two interleaved rounds, the commit
+before (`0be008dd`) then this change:
 
 | context | CSA blocks | indexer before | indexer after | CSA attention before | CSA attention after | CSA layer before | CSA layer after |
 | ------- | ---------- | -------------- | ------------- | -------------------- | ------------------- | ---------------- | --------------- |
@@ -1419,9 +1422,10 @@ banks held in RAM; two rounds): one row costs 5.73 / 5.70 ms, a chunk of 64 rows
 default height, 0.63 / 0.62, so 9.1 / 9.2 times less per position at the default
 chunk. The one-row baseline repeats the same row, so its experts stay warm in
 L3, which a real prompt's distinct tokens do not: the ratio is conservative. On
-the real file the banks do not fit in RAM and stream from disk, where a chunk
-reads each routed expert once for all the rows that route to it instead of once
-per token; that saving is the larger one and has not been measured.
+the real file the banks do not fit in RAM and stream from disk one routed expert
+at a time, where a chunk reads each routed expert once for all the rows that
+route to it instead of once per token; that saving was not measured on a long
+prompt (a 5-token one prefills in 16.2 s with a 12 GB arena, § B-DSV4-REAL).
 
 ### `compress_ratio` is the master per-layer switch
 

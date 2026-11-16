@@ -1834,6 +1834,78 @@ fn synthetic_deepseek4_shared_expert_clamp_is_read_when_present() {
     assert_eq!(cfg.swiglu_clamp_shexp, vec![2.5; dsv4_dims().n_layer()]);
 }
 
+/// **The CPU host tier pages a V4 expert bank per expert.** With `paging.dram` set, a generation
+/// reads from the file only the experts its routing picks, and its tokens are the mapped run's.
+///
+/// The banks are widened to exactly `MIN_PAGED_BYTES` of f32 so that they page at all. The
+/// pager's trace is what shows the granularity: it must hold an expert pool, and no bank may have
+/// had more of its experts pinned than the generation's tokens could route to. A bank paged whole
+/// leaves no expert pool; an op that pinned every expert of a bank breaks the bound.
+#[test]
+fn synthetic_deepseek4_cpu_pages_experts_per_expert() {
+    let d = Dsv4Dims {
+        n_expert: 64,
+        n_ff_exp: 64,
+        ..dsv4_dims()
+    };
+    assert_eq!(
+        d.n_embd * d.n_ff_exp * d.n_expert * 4,
+        infr_cpu::paged::MIN_PAGED_BYTES,
+        "the banks must be exactly pageable"
+    );
+    let tmp = TempGguf::write("ds4-cpu-paged-experts", &dsv4_model(&d));
+    let trace = std::env::temp_dir().join(format!(
+        "infr-ds4-cpu-paged-experts-{}.trace",
+        std::process::id()
+    ));
+    let load = |edit: &dyn Fn(&mut infr_llama::EngineConfig)| {
+        let mut ec = infr_llama::EngineConfig::default();
+        edit(&mut ec);
+        infr_llama::SeamModel::load_with(tmp.path(), None, std::sync::Arc::new(ec))
+            .expect("load the synthetic V4 file")
+    };
+    const N_GEN: usize = 4;
+    let want = load(&|_| {})
+        .generate_cpu_ids(PROMPT, N_GEN, |_| {})
+        .expect("mapped generation");
+    let got = load(&|ec| {
+        ec.paging.dram = Some(infr_core::SizeSpec::Bytes(64 << 20));
+        ec.paging.trace = Some(trace.clone());
+    })
+    .generate_cpu_ids(PROMPT, N_GEN, |_| {})
+    .expect("paged generation");
+    let text = std::fs::read(&trace).expect("read the pager trace");
+    std::fs::remove_file(&trace).expect("remove the pager trace");
+    assert_eq!(got, want, "paging the experts changed the generated tokens");
+
+    let parsed = infr_core::pager::trace::parse(&text[..]).expect("parse the pager trace");
+    let experts = parsed
+        .pools
+        .iter()
+        .find(|p| p.label.starts_with("cpu expert"))
+        .unwrap_or_else(|| panic!("no expert pool in the trace: the banks were paged whole"));
+    let mut pinned: std::collections::BTreeMap<u32, std::collections::BTreeSet<u32>> =
+        Default::default();
+    for call in &experts.calls {
+        if let infr_core::pager::trace::Call::ResolveAndPin(id, _) = *call {
+            let e = id % d.n_expert as u32;
+            pinned.entry(id / d.n_expert as u32).or_default().insert(e);
+        }
+    }
+    let banks = 3 * d.n_layer();
+    assert_eq!(pinned.len(), banks, "a bank was never read: {pinned:?}");
+    // Every token of the prompt and of the output routes `n_used` experts per layer, and nothing
+    // else may be read.
+    let bound = (PROMPT.len() + N_GEN) * d.n_used;
+    for (bank, es) in &pinned {
+        assert!(
+            es.len() <= bound,
+            "bank {bank} pinned {} experts, more than {bound} tokens x routes could pick",
+            es.len()
+        );
+    }
+}
+
 /// **The hash-routing table is `GGML_TYPE_I32` on disk, and the loader carries it as integers.**
 ///
 /// Every other tensor this harness writes is f32, and so was this one until a real V4 file was

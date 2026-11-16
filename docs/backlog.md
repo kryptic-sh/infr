@@ -761,16 +761,16 @@ is left:
   concurrent reader is what fixed it. Prefetch only becomes interesting once the
   arena is big enough that the tier stops being I/O-bound. Do not build it
   before then.
-- **The reader's speedup is Linux/NVMe only.** `FileBlockIo` splits a block
-  across `IO_FANOUT` concurrent positioned reads, measured 1.2-1.5 → 2.2 GB/s on
-  this box's Samsung 980. Correctness is platform-independent (each read carries
-  its own offset), but the SPEEDUP is not: on Windows `seek_read` issues
-  `ReadFile` with an `OVERLAPPED` offset and a handle not opened
-  `FILE_FLAG_OVERLAPPED` has concurrent operations serialized by the kernel, so
-  the fanout may buy nothing until the file is opened for overlapped I/O.
-  Untested on Windows and macOS. A rotational disk is also untested and is the
-  one case where the concurrency could plausibly HURT (seek interleaving);
-  nothing in the code adapts to device type.
+- **The reader's concurrency, by platform.** `FileBlockIo` splits a block across
+  `IO_FANOUT` concurrent positioned reads, measured 1.2-1.5 → 2.2 GB/s on Linux
+  on the Samsung 980. On Windows a handle opened for synchronous I/O runs its
+  requests one at a time, so since 2026-11-16 every shard is opened `IO_FANOUT`
+  times and reads take the handles in turn: with random 2.75 MB reads of the 98
+  GB V4 file, sixteen threads on one handle read 0.65 GB/s (one thread's speed)
+  and four threads on a handle each 1.05 GB/s, eight or sixteen no more
+  (standalone bench). Untested on macOS. A rotational disk is also untested and
+  is the one case where the concurrency could plausibly HURT (seek
+  interleaving); nothing in the code adapts to device type.
 - **The rest of phase 5**, still gated on measurements not taken: io_uring only
   if the reader proves queue-depth bound beyond what `IO_FANOUT` concurrent
   `pread`s reach (on this drive they already hit the device ceiling, so there
@@ -822,7 +822,18 @@ residue worth tracking; what follows is that plus what was deliberately left.
   GB under an 8 GB cap and reaches 0.38 t/s against the swept best of 0.39. The
   macOS and Windows arms are only checked for plausible figures (the
   `*_live_probe_is_plausible` tests, which pass on CI's macOS and Windows legs);
-  neither has been benchmarked against a cap.
+  neither has been benchmarked against a cap. **The rule changed on 2026-11-16**
+  from leaving an eighth of available memory to leaving half (and, on the CPU,
+  pricing the run's KV cache, unpaged weights, a 1 GiB activation reserve and
+  the repack cache first): an eighth sized a 38.47 GB arena on the Windows box
+  and starved it (§ B-DSV4-REAL). The Linux 7.44 GB / 0.38 t/s figure above was
+  taken under the old rule and was not re-measured; under an 8 GB cap the new
+  rule takes about half as much, for the Vulkan tiers too. The trade on the GPU
+  side, measured on this box by forcing the two rules' budgets for a 9
+  GB-available machine on Qwen3-30B-A3B Q4_K_M (RX 7900 XTX, `paging.cache` 2
+  GiB): decode 7.96 → 7.53 tokens/s, host-tier hit rate 53-55% → 37-39%. Run
+  automatically on this box both rules size the whole 17.55 GB of experts, so
+  comparing against the old tree there would measure nothing.
 - **The unified-memory path's sizing is unverified.** An iGPU/APU streams
   `DISK → GPU-accessible RAM` with no host cache (`HostPager::stream_only`,
   selected by `DeviceCaps::unified_memory`). The MECHANISM is covered on a
@@ -1209,14 +1220,12 @@ the synthetic all-HCA, all-CSA and every-tier files (`docs/deepseek.md` § "The
 HCA tier" and "The CSA tier", plan 09 § "S5 and S6" and § S7 for the numbers and
 the breaks). What is left:
 
-- **The shipped V4-Flash file's numbers.** It has never been run. That it gets
-  past every refusal on the CPU is inferred from its metadata and the synthetic
-  fixtures, not run: some refusals sit after the weight upload and depend on the
-  file's tensors. Its geometry (43 layers: 2 ratio-0, 21 CSA, 20 HCA; head 512
-  with a 64-dim rope; indexer 64 heads × 128, `top_k` 512; window 128) was
-  re-read off the first shard's metadata for S7, but no forward pass has run on
-  it: it is 98.6 GB on a 64 GB machine. The run, under a watchdog, and its
-  comparison are plan 09 S8 (§ B-DSV4-REAL).
+- **The shipped V4-Flash file's numbers.** It runs on the CPU since 2026-11-16
+  and generated coherent text for two prompts (§ B-DSV4-REAL), but no oracle has
+  checked a number it computes: llama.cpp cannot load it on this machine. Its
+  geometry (43 layers: 2 ratio-0, 21 CSA, 20 HCA; head 512 with a 64-dim rope;
+  indexer 64 heads × 128, `top_k` 512; window 128) is read off the first shard's
+  metadata. The comparison is plan 09 S8.
 - **The LID cache's width under the KV formats.** The compressed caches take the
   raw cache's format (`check_attention` demands one dtype across segments).
   `kv_row_align_ok` holds every compressed row to the 32-element blocks, and
@@ -1502,9 +1511,10 @@ geometry over random f16 caches, 32 threads, a quiet Ryzen 9 9950X3D):
   / 5.70 ms one row at a time; 2.8 at 64 rows, barely any gain at 16 (each row's
   experts are mostly distinct). The one-row baseline repeats one row, so its
   experts stay warm in L3: conservative. The real file streams its banks from
-  disk, where a chunk reads each routed expert once for all its rows; how much
-  that saves per token, and whether the default chunk height is the right one
-  for it, needs the real file (§ B-DSV4-REAL).
+  disk, where a chunk reads each routed expert once for all its rows. On the
+  real file (§ B-DSV4-REAL) a 5-token prompt prefills in 16.21 s at a 12 GB
+  arena, most of it the first read of every dense weight; whether the default
+  chunk height is right for a long prompt there was not measured.
 - **The rings' round trip** (§ B-DSV4-WIRING) is per token but not O(context):
   it was not measured here.
 
@@ -1631,73 +1641,143 @@ is left:
   reduction with an `n_used`-element copy, so it can only be faster; also not
   measured.
 
-### B-DSV4-REAL — the shipped V4 file runs on CPU, far too slowly; its numbers are unverified (2026-08-13, run 2026-11-16)
+### B-DSV4-REAL — the shipped V4 file runs on CPU at 1.28 s a token (12 GB cache); its numbers are unverified (2026-08-13, run 2026-11-16)
 
 **Tag:** deepseek · streaming · **Blocked on:** nothing
 
-**First run, 2026-11-16, tree at `879a8677`, CPU backend, 64 GB machine.**
-`INFR_DRAM_CACHE=12g infr run ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S "Hi" --dev cpu --temp 0 --max-new 4 --ctx 1024 --no-think`
-printed `Hi! How can`. Every refusal passed. The log read
-`host paging: 9 weight class(es), 12.67 GB arena of a 12.88 GB budget` and
-`[prefill 5 tok @ 0 tok/s (140230 ms) | decode 4 tok @ 0.0 tok/s]`; wall time 10
-m 39 s; available host memory started at 43311 MB and never fell below 24787 MB
-(sampled every 2 s). The paragraphs below this one predate the run and still say
-it has not happened, as do `CHANGELOG.md`'s unreleased V4 entries,
-`docs/deepseek.md`, `docs/plan.md` and plan 09: correct them with the fixes
-below.
+**It runs.** `ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S` (98.6 GB) generates
+coherent text on the CPU backend of the 64 GB Windows box, through the host
+weight arena:
+`INFR_DRAM_CACHE=12g infr run ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S "Hi" --dev cpu --temp 0 --max-new 9 --ctx 1024 --no-think`
+printed `Hi! How can I help you today?`, and the default budget (no
+`INFR_DRAM_CACHE`) counted from one to twenty-three in words for "Count from one
+to forty in words." with `--max-new 48`. Those are the only two prompts run.
 
-What the run left, in order:
+**Speed, before and after 2026-11-16's fixes** (CPU, Ryzen 9950X3D, 32 threads,
+the box has a Samsung SSD 980 1TB and a KINGSTON SNVS1000G; which one holds the
+HF cache was not checked):
 
-- **Decode costs about two minutes a token, prefill 28 s a token.** A token
-  routes to 6 of 256 experts in each of 43 layers, on the order of 2 GB of
-  expert data by the file's sizes, which this machine's NVMe reads in about a
-  second. Not profiled. Unchecked guesses: the arena is split across the weight
-  classes so the expert banks get a sliver; the Q8_0 attention, compressor and
-  indexer weights of every layer compete with the experts and are evicted each
-  token; a whole expert bank is the paging unit; reads are small. Measure bytes
-  read, read calls and evictions per class per token before changing anything.
-- **The automatic host-cache budget leaves too little.** Without
-  `INFR_DRAM_CACHE` the same command logged
-  `98.54 GB of weights exceed the 43.97 GB of host memory available, so they stream from disk through a 38.47 GB arena`
-  and available memory fell from 42109 MB to 10957 MB in 54 s, where a watchdog
-  stopped it. The budget should leave a margin of the kind `UNIFIED_HOST_MARGIN`
-  gives the test guard, and count the process's other allocations.
-- **`tokenizer.ggml.pre = "joyai-llm"` has no mapping**, so infr warns and uses
-  the GPT-2 regex; llama.cpp maps it (`LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM`,
-  `clean_spaces = false`, in `llama-vocab.cpp`). Token ids for this file may
-  differ from llama.cpp's until it is added; not compared.
-- **A first attempt at all three exists, unreviewed and ungated**, as a git
-  stash on the Windows dev box named "wip: V4-Flash real-file findings": the
-  coder was stopped mid-way, in the middle of a red check that had removed the
-  tokenizer mapping, so the stash may hold that removal. Treat it as a draft to
-  read, not as work to commit.
+| tree       | cache           | prefill (5 tok) | decode        |
+| ---------- | --------------- | --------------- | ------------- |
+| `879a8677` | 12g             | 147.09 s        | 123338 ms/tok |
+| this fix   | 12g             | 16.21 s         | 1284 ms/tok   |
+| this fix   | default 21.6 GB | 16.03 s         | 1199 ms/tok   |
 
-Measured from `ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S` (`block_count = 43`,
-`hash_layer_count = 3`, `compress_ratios` = `[0, 0, 4, 128, 4, 128, …, 4]` over
-the 43 layers, then three surplus zeros): **no layer of the real model is both
-ratio-0 and bias-routed.** Layers 0 and 1 are the only ratio-0 layers and both
-are hash-routed; layers 2..42 are all compressed (alternating 4/128), and layer
-2 is compressed AND hash-routed.
+The decode figure is the run's average over 9 to 10 tokens, the first decode
+token included; across tokens 2-9 of the 12g run it was 1.15 s a token (the
+`max-new 1` and `max-new 9` runs differenced). On the 48-token default run it
+was 815 ms a token as the 21.6 GB arena warmed (72.8% expert hits).
 
-Since plan 09 S7 (2026-11-16) every tier this file uses generates on the CPU, so
-`generate_dense_backend` should no longer refuse it there; that is inferred from
-its metadata and the synthetic fixtures, not run, and some refusals sit after
-the weight upload and depend on the file's tensors. On Vulkan and Metal its
-first compressed layer is refused by name. **The file has not been run since the
-CSA refusal was lifted:** a forward pass pages 98.6 GB of weights through a 64
-GB machine, which is left to a run under a watchdog. Its metadata was re-read
-for S7 (from the 5 MB first shard only) and gives the geometry
+**Where a decode token's time went.** Before: every expert bank was ONE block of
+704.6 MB, so a routed expert dragged in its whole bank; 4 forward passes read
+336.11 GB of banks (477 reads) plus 24.83 GB of dense weights, which the
+proportional budget split had left few slots, at about 0.70 GB/s — about 90 GB
+per token. After (12g, tokens 2-9): 292.5 expert reads of 2.75 MB a token (0.805
+GB), 481.5 expert hits (62%), no dense reads at all (every whole weight
+resident, 0 evictions), 0.84 s a token waiting on residency and about 0.31 s of
+compute. The disk-bound estimate — 0.805 GB at the 1.05 GB/s four concurrent
+reads reach on this drive (measured with a standalone positioned-read bench) —
+is 0.77 s, plus compute 1.08 s against 1.15 s measured.
+
+**Not established: any NUMBER the graph computes on this file.** The synthetic
+oracle (§ B-DSV4-ORACLE) says the emit computes what llama.cpp computes on small
+files at this file's hyper-connection count and YaRN keys; it says nothing about
+the quantized weights, the 64-head indexer at `top_k` 512 past 2051 tokens, or
+long-context top-k selection, and llama.cpp cannot load this file on this
+machine (plan 09 § 4). Coherent English for two prompts is the only evidence.
+Its tokenizer IS checked: `joyai-llm` now maps to the `deepseek-v3` regex list,
+and `deepseek_v4_tokenizes_as_llama_cpp` holds twelve strings to
+`llama-tokenize`'s ids (vocabulary only, first shard). The "Hi" prompt's ids
+(`[0, 128803, 23166, 128804, 128822]`) did not change with the mapping. Vulkan
+and Metal refuse the file's first compressed layer by name.
+
+**What is left, ranked:**
+
+- **Decode is disk-bound on expert misses** (0.805 GB a token at 12g). A bigger
+  cache helps only as it warms. Levers not built: overlapping the next pin wave
+  with compute (routing for layer l is only known after its attention, so this
+  would be the down bank's reads behind the gate/up GEMMs, or a speculative
+  prefetch from the previous token's routing); unbuffered reads
+  (`FILE_FLAG_NO_BUFFERING`), which would also stop the double caching below.
+- **Compute is about 0.31 s a token** and was not profiled per op on this file.
+- **Prefill of a cold model reads every whole weight once** (7.6 GB of dense
+  classes, 4.8 s of summed read time at 12g) before the experts; 16 s for five
+  tokens. Not optimized.
+- **Buffered reads grow the system file cache's working set.** On the 48-token
+  default run `\Memory\Cache Bytes` rose from 245 MiB to 3701 MiB, which counts
+  as in use, not available; available memory bottomed at 19154 MiB against the
+  21687 MiB (half of 43329 MiB) the budget rule leaves. The process itself
+  stayed inside its budget (private bytes 20872 MiB for a 21.55 GB arena plus
+  1.19 GB priced). The `RANDOM_ACCESS` and `SEQUENTIAL_SCAN` open flags did not
+  prevent it in a standalone bench; unbuffered I/O would, and needs
+  sector-aligned reads.
+
+Measured from the file's metadata (`block_count = 43`, `hash_layer_count = 3`,
+`compress_ratios` = `[0, 0, 4, 128, 4, 128, …, 4]` over the 43 layers, then
+three surplus zeros): **no layer of the real model is both ratio-0 and
+bias-routed.** Layers 0 and 1 are the only ratio-0 layers and both are
+hash-routed; layers 2..42 are all compressed (alternating 4/128), and layer 2 is
+compressed AND hash-routed. The geometry
 `kv_footprint_of_deepseek4_flash_counts_its_compressed_tiers` prices: head 512
 with a 64-dim rope, indexer 64 heads × 128 with `top_k` 512, window 128,
 `compress_rope_freq_base` 160000, YaRN factor 16 over 65536.
 
-What is NOT established: any NUMBER the graph computes on this file. The
-synthetic oracle (§ B-DSV4-ORACLE) says the emit computes what llama.cpp
-computes on small files at this file's hyper-connection count and YaRN keys; it
-says nothing about the quantized weights, the 64-head indexer at `top_k` 512
-past 2051 tokens, or long-context top-k selection, and llama.cpp cannot load
-this file on this machine (plan 09 § 4). Verified earlier against the real file:
-names, shapes, `Config::from_gguf`, `wload` and the hash-routing table's shape.
+### B-CPU-EXPERT-PAGING — what per-expert CPU paging left (2026-11-16)
+
+**Tag:** streaming · cpu · **Blocked on:** nothing
+
+`infr_cpu::paged` pages a MoE bank one block per expert and `Op::MoeFfn` pins
+only its routed experts (`CpuBackend::moe_banks`). Left:
+
+- **The expert pool needs one op's worst case to exist at all:** `n_expert`
+  slots for each bank of that pool's slice size one layer has (three on
+  V4-Flash's split banks: 768 slots, 2.1 GB), because a prefill chunk can route
+  to every expert and the op pins all of a layer's banks together. Below that
+  the banks stay mapped, as any unseatable class does. Pinning per bank, or per
+  group of buckets, would lower the floor; not built, and no budget that small
+  was tried on a real MoE file.
+- **`infr serve --parallel N` on the CPU** holds up to N ops' pins at once; the
+  floor prices one (the gap B35 records for the whole tier, now larger for
+  experts). And each CPU resident sizes its arena when it opens: a second
+  generation that starts while the model's own resident is out opens another
+  (`SeamModel::with_cpu`), which measures available memory at that moment —
+  after the first arena was taken — and takes half of what is left. Two
+  concurrent generations can so hold three quarters of what was available at the
+  first one's start. Behaviour read from the code, not run on a large model.
+- **The repack cache is priced at its whole budget** (`cpu_repack_reserve`, 4096
+  MiB by default) whenever the fused Q4_K expert path can fill it, though the
+  packs a run actually keeps may be fewer; not measured on a paged Q4_K MoE
+  model (qwen35moe, gemma4's MoE).
+- **`cpu_committed_bytes` prices the KV cache at f16**, the CPU default; a
+  user-named f32 KV is under-priced. It goes through `kv_bytes_estimate`, the
+  function the GPU fit uses, so V4's compressed caches are priced at what the
+  session allocates for them (`dsv4_comp_bytes`), and the raw cache is priced at
+  the whole context without the sliding-window ring the CPU uses, which
+  over-prices it (conservative). The 1 GiB activation reserve is a reserve, not
+  a measurement per model.
+- **A long prompt on V4-Flash is a whole-file read per chunk, so it was not
+  run.** A prefill chunk taller than about 43 rows routes 6 of 256 experts per
+  row to well over half of every bank, so it reads nearly all 90.9 GB of expert
+  banks; with the 12 GB cache's 5.24 GB of experts that is about 85 GB, roughly
+  80 s at the 1.05 GB/s this drive gave, per chunk (estimate, not run). The
+  sweep insert (`paged::expert_insert`) keeps the resident share across chunks
+  but cannot make a chunk cheaper than the banks it reads; on synthetic chunks
+  it took hits from 0 to about 135 of 576 pins and reads from 2277 to 1872 over
+  four chunks (`a_prefill_sweep_keeps_its_resident_set`). Making a long prompt
+  affordable needs a different shape: smaller chunks with expert-major order
+  across a whole prompt, or reading each expert once for every chunk.
+- **A panic inside a CPU pool task can hang the process** instead of failing:
+  seen once on 2026-11-16, when a deliberately broken bank stride sliced past a
+  bank inside the MoE GEMMs and the test process sat idle for six minutes until
+  killed. Not investigated; `pool.rs` has a test that a panicking task's
+  completed values are dropped, so the hang is somewhere else.
+- **Not covered by a test on a real MoE file other than V4-Flash** (the
+  synthetic V4 fixture and an op-level test cover the mechanism, the latter
+  bitwise against whole banks while evicting for f32, Q8_0, Q4_K and Q2_K in
+  both bank layouts; Qwen3-30B-A3B and ERNIE-4.5-21B-A3B on the CPU with
+  `paging.dram` were not run).
+- **`hunyuan-dense` and `hy_v4`** share llama.cpp's regex arm with `joyai-llm`
+  and are still unmapped: no file with either pre-type to check ids against.
 
 ### B-DSV4-ORACLE — llama.cpp over the synthetic V4 file: what it covers and what it does not (2026-11-16)
 

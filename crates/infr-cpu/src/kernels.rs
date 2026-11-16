@@ -6502,6 +6502,9 @@ pub(crate) fn gated_act_fn(act: Activation, clamp: Option<f32>, gate: f32, up: f
     }
 }
 
+#[cfg(all(test, target_arch = "x86_64"))]
+mod batch_tier_tests;
+
 #[cfg(test)]
 mod kernel_tests {
     use super::*;

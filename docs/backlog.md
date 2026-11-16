@@ -1259,11 +1259,11 @@ the breaks). What is left:
   batched prefill makes this trade; it is recorded, not a defect. The shipped
   V4-Flash file's routed banks are all Q2_K (read from its tensor-info header),
   which stays on f32 activations at any row count, so it does not reach that
-  file's experts. What is unverified there: Q8_0 `Op::Linear` at several rows
-  against one row (the shipped attention, compressors, indexers, shared experts
-  and hyper-connection matmuls are Q8_0;
-  `linear_prefill_matches_the_single_token_kernels_bitwise` covers Q4_K, Q5_K
-  and Q6_K only). A Q8_0 case in that test would settle it.
+  file's experts; the synthetic file in the shipped dtypes is bit-identical
+  chunked and one position per graph
+  (`shipped_dtypes_chunked_prefill_equals_one_position_per_graph`). Not checked
+  on the real file itself: a long prompt there at `INFR_UBATCH=1` against the
+  default (§ B-DSV4-REAL: a 5-token prompt alone takes 16 s).
 - **Quantized KV caches round differently from llama.cpp's.** At a quantized
   `type_k` with a head width divisible by 64 (q8_0, q4_0 on V4-Flash's 512),
   llama.cpp's `llama_kv_cache` rotates q, the raw row, the compressed row and
@@ -5439,7 +5439,15 @@ covers:
   (`linear_packed_matches_the_single_token_kernels_bitwise`,
   `q4k_pack_gemm_bit_identical_to_scalar`,
   `q6k_pack_gemm_bit_identical_to_batch`) print a `SKIP` line and pass without
-  VNNI. macOS (aarch64) compiles none of the packed code.
+  VNNI. macOS (aarch64) compiles none of the packed code. Since 2026-11-17
+  `tests/linear_batch_identity.rs` holds every weight dtype's prefill
+  `Op::Linear` to its one-row bits on the host's own route, and
+  `kernels::batch_tier_tests` calls the tier kernels directly for each
+  one-row/batch pairing an x86_64 host can dispatch (scalar, AVX2, AVX-512BW
+  without VNNI, VNNI), skipping the tiers the runner lacks: a runner with
+  AVX-512 VNNI covers every pairing an AVX2-only or AVX-512-without-VNNI host
+  would run, and any x86_64 runner covers the scalar and (with AVX2) AVX2 ones.
+  The packed GEMM still needs a VNNI runner.
 - `cargo test (CPU goldens, real models)` (ubuntu, release,
   `--test cpu_backend`): downloads gemma-3-1b and Qwen3-0.6B Q4_K_M only. Their
   multi-token prompts run prefill `Op::Linear` on Q4_K/Q6_K weights (packed with
@@ -6389,3 +6397,87 @@ no layers and a head width of 0, the
 wraps to 0, and the next test divides by zero. The synthetic oracle files keep
 their null tail layer (B-DSV4-ORACLE) until a llama.cpp with the fix is the
 pinned reference; then that layer can go.
+
+### B200 — what the CPU `Op::Linear` row-count identity slice left (2026-11-17)
+
+**Tag:** tests · cpu · **Kind:** coverage gaps and recorded behaviour
+
+`tests/linear_batch_identity.rs` holds every weight dtype's prefill `Op::Linear`
+(F32, F16, BF16 and every `WEIGHT_QUANTS` format) to its one-row bits and to an
+f64 reference under a bound derived from the int8 activation quantizer;
+`kernels::batch_tier_tests` does the same for each x86_64 tier pairing. Q5_0 is
+the one dtype that differs (B201). What it left:
+
+- **Paths no switch reaches.** The kernel tier is chosen by runtime feature
+  detection; `Op::Linear` has no config knob for it, so the op-level test runs
+  only the host's own tiers (the kernel test covers the other x86_64 pairings).
+  There are no NEON kernels: aarch64 runs the scalar ones, which macOS CI runs
+  through both tests. `kernels.cpu.repack_mb` does not reach `Op::Linear` (its
+  packed GEMM packs each call into scratch; the repack cache serves `Op::MoeFfn`
+  only), so it is not a route to force here. `Op::Linear` has no bias; a bias is
+  a separate op and was not part of this check.
+- **What the int8 activation quantizer does at the edges** (`quantize_q8`,
+  `quantize_q8_32`), the same on every route, so not a row-count difference: a
+  block whose largest magnitude is so small that `127 / max` overflows (around
+  3.7e-37 and below) gives every nonzero value the full code, an error of up to
+  that maximum where the bound elsewhere is half a step; a NaN is dropped to
+  code 0 (the f32 dtypes propagate it); an infinity sets the block scale to
+  infinity and its codes to 0, so the block contributes NaN. Neither NaN nor
+  infinity has a defined result there, so the identity tests do not feed them.
+- **Not reviewed:** `Op::MoeFfn`'s row-count behaviour beyond what the V4
+  fixtures pin (its int8 switch is documented in `docs/deepseek.md`), and the
+  paged-weights route into `Op::Linear`, which reads the same bytes through
+  another path.
+
+### B201 — Q5_0 `Op::Linear` at one row: int8 activations chosen over f32 (decided 2026-11-17)
+
+**Tag:** cpu · precision · **Kind:** decision made, alternative declined
+
+**State.** A one-row `Op::Linear` on a Q5_0 weight dequantizes the row and takes
+an f32 dot; several rows quantize the activations to int8 per 32-element block
+and run `vec_dot_q5_0_32_batch`. Every other quantized dtype runs int8
+activations at one row too. So Q5_0 is the one weight dtype whose prefill and
+decode are not bit-identical: `tests/linear_batch_identity.rs` pins the gap
+(`Q5_0_GAP_REL`; ordinary rows 2.6e-3 of the output's `Σ|w·x|`, 33.2 absolute at
+most on its wide-range row) and requires it to be non-zero.
+
+**Decision (owner, 2026-11-17): int8 activations at one row**, for consistency
+with every other quantized dtype and decode speed, over the small distance to
+llama.cpp that f32 keeps. The change follows this entry in its own commit; that
+commit turns the pin above into the bitwise check. The options as weighed:
+
+- **int8 at one row (taken).** Prefill and decode bit-identical, as for every
+  other dtype; one-row `Op::Linear` 2.2-8.8x faster on 4096×4096, 4096×14336 and
+  14336×4096 (CHANGELOG). Slightly further from llama.cpp's CPU logits: the
+  reviewer's measurement on gemma-3-1b Q4_K_M (50 prefix lengths, one row per
+  graph) gave mean KL 8.64e-3 for int8 against 7.04e-3 for f32, top-1 agreement
+  45/50 against 48/50, int8 closer on 17 of 50 prompts, max |logit difference|
+  between the two 1.315.
+- **f32 for batches too (declined).** Closest to the exact sum, and bit-identity
+  either way, but Q5_0 prefill would lose the int8 kernel. Measured (release,
+  the generic dequantize-then-`dot` arm infr would fall back to, medians, two
+  interleaved rounds, other builds sharing the machine), int8 against f32: 64
+  rows 4096×4096 3.85 / 19.7 ms, 4096×14336 12.2-12.3 / 72.6-78.3 ms, 14336×4096
+  12.6 / 74.2-75.2 ms; 512 rows 4096×4096 30.1-30.6 / 189-205 ms, 4096×14336
+  103-123 / 624-716 ms, 14336×4096 111-123 / 578-767 ms: 5 to 7 times slower. A
+  purpose-built f32 GEMM would narrow that; none exists.
+
+**Context for the next time this comes up.**
+
+- llama.cpp runs Q5_0 against int8 activations too (`ggml-cpu.c`:
+  `[GGML_TYPE_Q5_0]` has `vec_dot_type = GGML_TYPE_Q8_0`), with an fp16 block
+  scale (`block_q8_0`'s `ggml_half d`) where infr keeps the activation scale in
+  f32, so the two still round differently.
+- Cached models with Q5_0 tensors (read from their tensor-info headers):
+  gemma-3-1b-it Q4_K_M, 117 (every layer's `attn_q`, `attn_k`, `ffn_gate`,
+  `ffn_up`, and 13 `attn_v`); Qwen2.5-0.5B-Instruct q4_k_m, 133 (every layer's
+  `attn_q`, `attn_k`, `attn_output`, `ffn_gate`, `ffn_up`, 12 `attn_v`, and
+  `token_embd`, which is also its tied output head).
+- Batched prefill stops one token short: the prompt's last token always runs as
+  a one-row graph, so the first sampled token's logits come from the one-row
+  path. The choice therefore moves `SeamModel::prefill_logits_cpu` and the CPU
+  side of `prefill_matches_llama_debug_dump`, not only the decode steps.
+- `Op::MoeFfn`'s one-row Q5_0 expert path stays on f32 activations on purpose
+  (`int8_ok = rows >= 2 && !reference`, `crates/infr-cpu/src/moe.rs`); this
+  decision is about `Op::Linear` only.
+- What int8 activations cost in accuracy in general is B192.

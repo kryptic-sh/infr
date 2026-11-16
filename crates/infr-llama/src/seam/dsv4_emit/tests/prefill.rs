@@ -732,3 +732,111 @@ fn quantized_banks_chunked_prefill_is_close_and_reference_is_exact() {
     );
     assert!(d.is_empty(), "{}", d.join("\n"));
 }
+
+/// The canonical layout stored in the shipped V4-Flash file's dtypes (`docs/deepseek.md`, "The
+/// shipped file's dtypes"): every attention, compressor, indexer, hyper-connection and
+/// shared-expert matmul weight, the APE tables, `token_embd` and `output_hc_fn` Q8_0, the head
+/// `output` Q6_K, the routers BF16 and the routed expert banks Q2_K; norms, sinks, biases and the
+/// hash tables stay as the fixture has them. Widened so every one of those rows is a whole
+/// number of its dtype's blocks (`n_embd` and `n_ff_exp` 256 for the Q6_K head and the Q2_K
+/// banks, `head_dim` and the indexer's head 64 and 32 for the Q8_0 output and APE rows).
+fn shipped_dtypes() -> SyntheticModel {
+    let d = Dsv4Dims {
+        n_embd: 256,
+        head_dim: 64,
+        n_ff_exp: 256,
+        indexer: IndexerDims {
+            head_size: 32,
+            ..super::super::dsv4_fixture::dsv4_indexer()
+        },
+        ..dsv4_dims()
+    };
+    const Q8_0: &[&str] = &[
+        "attn_q_a",
+        "attn_q_b",
+        "attn_kv",
+        "attn_output_a",
+        "attn_output_b",
+        "hc_attn_fn",
+        "hc_ffn_fn",
+        "attn_compressor_kv",
+        "attn_compressor_gate",
+        "attn_compressor_ape",
+        "indexer.proj",
+        "indexer.attn_q_b",
+        "indexer_compressor_kv",
+        "indexer_compressor_gate",
+        "indexer_compressor_ape",
+        "ffn_gate_shexp",
+        "ffn_up_shexp",
+        "ffn_down_shexp",
+    ];
+    let mut m = session_model(&d);
+    let mut per_dtype = std::collections::BTreeMap::<String, usize>::new();
+    for t in &mut m.tensors {
+        let Some(base) = t.name.strip_suffix(".weight") else {
+            continue;
+        };
+        // `blk.{l}.attn_q_b` → `attn_q_b`; the model-level tensors keep their whole name.
+        let name = match base.strip_prefix("blk.").and_then(|r| r.split_once('.')) {
+            Some((_, local)) => local,
+            None => base,
+        };
+        let fill = if Q8_0.contains(&name) || name == "token_embd" || name == "output_hc_fn" {
+            Fill::Quant(DType::Q8_0)
+        } else if name == "output" {
+            Fill::Quant(DType::Q6K)
+        } else if name.ends_with("_exps") {
+            Fill::Quant(DType::Q2K)
+        } else if name == "ffn_gate_inp" {
+            Fill::ExactBf16(t.values())
+        } else {
+            continue;
+        };
+        *per_dtype.entry(name.to_string()).or_default() += 1;
+        t.fill = fill;
+    }
+    // Every name above matched on every layer that has it: a renamed tensor would silently stay
+    // f32 and leave its dtype untested.
+    let ratio4 = d.compress_ratios.iter().filter(|&&r| r == 4).count();
+    let compressed = d.compress_ratios.iter().filter(|&&r| r != 0).count();
+    let want = |n: &str| match n {
+        "token_embd" | "output" | "output_hc_fn" => 1,
+        n if n.starts_with("indexer") => ratio4,
+        n if n.starts_with("attn_compressor") => compressed,
+        _ => d.n_layer(),
+    };
+    for (n, &got) in &per_dtype {
+        assert_eq!(got, want(n), "{n}: re-typed on {got} layers");
+    }
+    assert_eq!(per_dtype.len(), Q8_0.len() + 7, "{per_dtype:?}");
+    m
+}
+
+/// **On the shipped file's dtypes, chunked prefill equals one position per graph, bit for bit.**
+/// Every Q8_0 matmul runs `Op::Linear` at the chunk's row count on the batched int8 kernels and at
+/// one row on the one-row kernels, which give the same bits (`infr-cpu`'s
+/// `linear_batch_identity`); the Q2_K expert banks keep f32 activations at every row count; the
+/// BF16 routers take an f32 dot. So unlike [`quantized_banks`], nothing here may differ: the
+/// logits, every row's kept blocks, every compressed cache and ring, and the decode after, at a
+/// chunk height under a CSA block, an unaligned one, and the whole prompt, in the production
+/// kernels.
+#[test]
+fn shipped_dtypes_chunked_prefill_equals_one_position_per_graph() {
+    let m = shipped_dtypes();
+    let open = |ubatch: usize| {
+        let mut ec = EngineConfig::default();
+        ec.device.ubatch = Some(ubatch);
+        ec.device.ubatch_specified = true;
+        Model::open_with(&format!("dsv4-pf-shipped-{ubatch}"), &m, ec)
+    };
+    // Past the raw window, an HCA block and the first position whose top-k drops a block.
+    let prompt = ids(200, 11);
+    let want = observe(&open(1), &prompt, 1, false);
+    let mut diffs = Vec::new();
+    for k in [3, 37, SESSION_CTX] {
+        let got = observe(&open(k), &prompt, k, false);
+        diffs.extend(report(&format!("shipped dtypes, chunk {k}"), &got, &want));
+    }
+    assert!(diffs.is_empty(), "{}", diffs.join("\n"));
+}

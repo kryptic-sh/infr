@@ -286,6 +286,24 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
         .filter(|&n| n >= 2)
         .map(Some);
 
+    // ── kernels.vulkan.tuning / tune ─────────────────────────────────────────
+    v.tuning.file = opt_path(get, "INFR_TUNE_FILE");
+    v.tuning.rows = presence_inv(get, "INFR_TUNE_NO_ROWS");
+    v.tuning.disable = get("INFR_TUNE_DISABLE")
+        .map(|s| <Vec<String> as super::ConfigValue>::parse_set(&s).unwrap_or_default());
+    // A tuning setting is a typed user value: a malformed one is refused loudly, like every
+    // tuning value the backend later finds out of range.
+    if let Some(raw) = get("INFR_TUNE") {
+        let entries = super::tune::parse_list(&raw).map_err(|message| ConfigError::Env {
+            key: "INFR_TUNE",
+            message,
+        })?;
+        v.tune = Some(super::TuneMap {
+            entries,
+            aliases: Vec::new(),
+        });
+    }
+
     // `GemvKnobs::resolve`, verbatim — this whole group is already a pure resolver today.
     let g = &mut v.gemv;
     g.no_rm = presence(get, "INFR_NO_GEMV_RM");
@@ -404,5 +422,6 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // survive this layer to be able to turn concurrency back off over a config file that raised it.
     p.hub.pull_jobs = num::<usize>(get, "INFR_PULL_JOBS");
 
+    super::tune::stamp_layer(&mut p, super::TuneLevel::Env);
     Ok(p)
 }

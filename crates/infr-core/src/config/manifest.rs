@@ -245,6 +245,14 @@ knobs! {
     "INFR_NO_GEMV_REG"    => "kernels.vulkan.gemv.variant",   PresenceClears, Ignored, "1",     migrated;
     "INFR_GEMV_VARIANT"   => "kernels.vulkan.gemv.variant",   Text,           Ignored, "rm",    migrated;
 
+    // ── kernels.vulkan.tuning / tune ─────────────────────────────────────────
+    // The per-device tuning table's user layer (`infr-vulkan`'s `tuning` module). `INFR_TUNE` is
+    // a typed user value, so a malformed one is refused loudly.
+    "INFR_TUNE"           => "kernels.vulkan.tune",           Text,        Error,   "gemv_sg.rows=4", migrated;
+    "INFR_TUNE_FILE"      => "kernels.vulkan.tuning.file",    Path,        Ignored, "/tmp/tune.toml", migrated;
+    "INFR_TUNE_NO_ROWS"   => "kernels.vulkan.tuning.rows",    PresenceInv, Ignored, "1",              migrated;
+    "INFR_TUNE_DISABLE"   => "kernels.vulkan.tuning.disable", Text,        Ignored, "amd-proprietary-split-k", migrated;
+
     // ── kernels.metal ────────────────────────────────────────────────────────
     "INFR_METAL_NO_F16_NATIVE"    => "kernels.metal.f16_native",    PresenceInv, Ignored, "1", migrated;
     "INFR_METAL_NO_F32_NATIVE"    => "kernels.metal.f32_native",    PresenceInv, Ignored, "1", migrated;

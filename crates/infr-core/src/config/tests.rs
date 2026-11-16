@@ -1322,6 +1322,10 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_PULL_JOBS",
         "INFR_NO_MLA_SG",
         "INFR_PAGER_TRACE",
+        "INFR_TUNE",
+        "INFR_TUNE_DISABLE",
+        "INFR_TUNE_FILE",
+        "INFR_TUNE_NO_ROWS",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
@@ -1343,5 +1347,140 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         got, want,
         "the manifest's `migrated` set drifted from the slices that landed — flip an entry and \
          list it here in the SAME commit"
+    );
+}
+
+// ── kernels.vulkan.tune / tuning ─────────────────────────────────────────────
+
+/// The tuning map is reachable three ways — a `[kernels.vulkan.tune]` table (flat quoted keys or
+/// nested tables), `INFR_TUNE`, and `--set kernels.vulkan.tune.<key>` — and each entry carries the
+/// layer it came from. Folding keeps every layer's entries, lowest layer first.
+#[test]
+fn tune_map_reaches_every_layer_with_its_level() {
+    use super::TuneLevel;
+    let file = file_layer(
+        "[kernels.vulkan.tune]\n\"gemv_sg.rows\" = 4\n\"mmv_mw.warps@q4_k\" = 2\n\
+         [kernels.vulkan.tune.moe]\nsmall_m = 16\n",
+    );
+    let env = env_layer(&[("INFR_TUNE", "attn_flash.splits=2, moe.small_m=4")]);
+    let cli = cli_layer(&["kernels.vulkan.tune.attn_canvas.chunks=5"]);
+    let cfg = Config::load_from_layers(&[file, env, cli]);
+    let got: Vec<(&str, &str, TuneLevel)> = cfg
+        .kernels
+        .vulkan
+        .tune
+        .entries
+        .iter()
+        .map(|e| (e.key.as_str(), e.value.as_str(), e.level))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("gemv_sg.rows", "4", TuneLevel::Config),
+            ("mmv_mw.warps@q4_k", "2", TuneLevel::Config),
+            ("moe.small_m", "16", TuneLevel::Config),
+            ("attn_flash.splits", "2", TuneLevel::Env),
+            ("moe.small_m", "4", TuneLevel::Env),
+            ("attn_canvas.chunks", "5", TuneLevel::Cli),
+        ]
+    );
+}
+
+/// A malformed key or value is refused at the layer: loudly from the environment and the command
+/// line, as a value error from the file. (Whether the parameter EXISTS is the Vulkan resolver's
+/// call — it owns the list.)
+#[test]
+fn tune_key_shape_is_checked() {
+    for bad in [
+        "nodot=1",
+        "Gemv.rows=1",
+        "gemv.rows@=1",
+        "gemv.rows=",
+        "gemv.rows",
+    ] {
+        let err = try_env_layer(&[("INFR_TUNE", bad)]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Env {
+                    key: "INFR_TUNE",
+                    ..
+                }
+            ),
+            "{bad}: {err:?}"
+        );
+    }
+    let err = cli::parse_reporting(&ConfigOverrides {
+        sets: vec!["kernels.vulkan.tune.gemv=4".to_string()],
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::Value { .. }), "{err:?}");
+    assert!(file::parse_str(
+        "[kernels.vulkan.tune]\n\"Bad.key\" = 1\n",
+        Path::new("infr.toml")
+    )
+    .is_err());
+    // A well-formed key for a parameter that does not exist passes here.
+    assert!(try_env_layer(&[("INFR_TUNE", "no_such.param=1")]).is_ok());
+}
+
+/// Each layer records which alias knobs it set, at its own level, so the resolver can order an
+/// alias against a tuning key from another layer; a layer that set none records none.
+#[test]
+fn alias_knobs_record_their_layer() {
+    use super::TuneLevel;
+    let cfg = Config::load_from_layers(&[
+        file_layer("[kernels.vulkan]\nflash_splits = 2\n"),
+        env_layer(&[("INFR_FLASH_SPLITS", "4"), ("INFR_SG", "16")]),
+        cli_layer(&["kernels.vulkan.gemv.sg_nr=2"]),
+    ]);
+    let t = &cfg.kernels.vulkan.tune;
+    assert_eq!(
+        t.alias_level("kernels.vulkan.flash_splits"),
+        Some(TuneLevel::Env)
+    );
+    assert_eq!(t.alias_level("device.subgroup_pref"), Some(TuneLevel::Env));
+    assert_eq!(
+        t.alias_level("kernels.vulkan.gemv.sg_nr"),
+        Some(TuneLevel::Cli)
+    );
+    assert_eq!(t.alias_level("kernels.vulkan.pv_splits"), None);
+    // Knobs that are not aliases are not recorded, and an empty layer stays empty.
+    assert!(env_layer(&[("INFR_NO_MMV", "1")])
+        .kernels
+        .vulkan
+        .tune
+        .is_none());
+    assert!(env_layer(&[]).is_empty());
+}
+
+/// `kernels.vulkan.tuning.*`: the file path, the rows switch and the disable list, from the file
+/// and the environment.
+#[test]
+fn tuning_switches_parse() {
+    let d = Config::default();
+    assert!(d.kernels.vulkan.tuning.rows);
+    assert!(d.kernels.vulkan.tuning.disable.is_empty());
+    assert_eq!(d.kernels.vulkan.tuning.file, None);
+    let cfg = Config::load_from_layers(&[file_layer(
+        "[kernels.vulkan.tuning]\nfile = \"my.toml\"\nrows = false\ndisable = [\"a\", \"b\"]\n",
+    )]);
+    assert_eq!(
+        cfg.kernels.vulkan.tuning.file.as_deref(),
+        Some(Path::new("my.toml"))
+    );
+    assert!(!cfg.kernels.vulkan.tuning.rows);
+    assert_eq!(cfg.kernels.vulkan.tuning.disable, vec!["a", "b"]);
+    let cfg = Config::load_from_layers(&[env_layer(&[
+        ("INFR_TUNE_NO_ROWS", ""),
+        ("INFR_TUNE_DISABLE", "x, y"),
+        ("INFR_TUNE_FILE", "t.toml"),
+    ])]);
+    assert!(!cfg.kernels.vulkan.tuning.rows);
+    assert_eq!(cfg.kernels.vulkan.tuning.disable, vec!["x", "y"]);
+    assert_eq!(
+        cfg.kernels.vulkan.tuning.file.as_deref(),
+        Some(Path::new("t.toml"))
     );
 }

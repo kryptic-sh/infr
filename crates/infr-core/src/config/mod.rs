@@ -41,12 +41,14 @@ pub mod env;
 pub mod file;
 pub mod manifest;
 pub mod partial;
+pub mod tune;
 
 #[cfg(test)]
 mod tests;
 
 pub use cli::ConfigOverrides;
 pub use partial::{ConfigValue, SetPathError};
+pub use tune::{TuneEntry, TuneLevel, TuneMap};
 
 use partial::cfg_struct;
 
@@ -232,7 +234,10 @@ cfg_struct! {
 }
 
 cfg_struct! {
-    /// The native GEMV knob family (`recorder.rs`'s `GemvKnobs`, today `OnceLock`-memoized).
+    /// The native GEMV knob family. Every field is an ALIAS of a Vulkan tuning parameter
+    /// (`gemv.*`, `gemv_rm.*`, `gemv_sg.*`, `gemv_id_sg.*`; `infr tune list` names them): the
+    /// backend's tuning resolver reads these fields and writes the parameter at the level that set
+    /// them ([`tune::TUNE_ALIASES`]), and the kernels read the parameter.
     GemvCfg / PartialGemvCfg {
         /// `INFR_NO_GEMV_RM`: force the RM=1 path.
         no_rm: bool = false,
@@ -260,16 +265,47 @@ cfg_struct! {
 }
 
 cfg_struct! {
+    /// How the Vulkan backend resolves its per-device tuning parameters (`infr-vulkan`'s `tuning`
+    /// module; `infr tune show` prints the result). The values themselves are set under
+    /// [`VulkanCfg::tune`].
+    TuningCfg / PartialTuningCfg {
+        /// `INFR_TUNE_FILE`: a tuning file of rows in the built-in table's schema, applied above
+        /// the built-in rows and below every config, environment and command-line setting. A
+        /// value in it that fails validation is a hard error.
+        file: Option<PathBuf> = None,
+        /// `INFR_TUNE_NO_ROWS` (inverted): apply the built-in table's device-class and device
+        /// rows. `false` resolves every parameter from its generic default (and the user's
+        /// settings) alone.
+        rows: bool = true,
+        /// `INFR_TUNE_DISABLE`: ids of table rows to ignore (built-in or tuning-file rows), so one
+        /// suspect row can be switched off without losing the rest.
+        disable: Vec<String> = Vec::new(),
+    }
+}
+
+cfg_struct! {
     /// Vulkan kernel-tier selection. Every field is named for the thing being ENABLED and is
     /// `true` when the feature is on; the env layer inverts the `INFR_NO_*` spellings. The four
     /// `no_*` fields are the sanctioned exceptions — their EFFECT is negative, so a positive
     /// name would be a lie.
+    ///
+    /// The fields listed in [`tune::TUNE_ALIASES`] (`flash_splits`, `pv_splits`,
+    /// `flash_min_rows`, `flash_bm32`, `mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`,
+    /// `i8cm_kq`, the `gemv` group) are aliases of Vulkan tuning parameters: they keep their
+    /// spelling and meaning, and the backend's tuning resolver turns them into the parameter.
     VulkanCfg / PartialVulkanCfg {
         subs {
             /// The GEMV family.
             gemv: GemvCfg => PartialGemvCfg,
+            /// How the per-device tuning parameters are resolved.
+            tuning: TuningCfg => PartialTuningCfg,
         }
         leaves {
+        /// `INFR_TUNE` / `[kernels.vulkan.tune]` / `--set kernels.vulkan.tune.<key>=<value>`: the
+        /// user's per-device tuning settings, `family.param[@qualifier] = value` (`infr tune list`
+        /// names every parameter). An open map: its keys are checked for shape here and resolved
+        /// by the Vulkan backend, where an unknown key or an out-of-range value is a hard error.
+        tune: TuneMap = TuneMap::default(),
         /// `INFR_NO_COOPMAT` (inverted). ANDed with [`VulkanCfg::f16`] at the probe: with
         /// `INFR_NO_F16` set, coopmat is off regardless — preserve that AND.
         coopmat: bool = true,

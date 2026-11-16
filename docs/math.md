@@ -1,0 +1,179 @@
+# `infr_core::math`: the same bits on every platform
+
+`f32::exp`, `ln`, `ln_1p`, `tanh`, `powf`, `sin` and `cos` lower to the C
+runtime, and the C runtimes disagree in the last bit: UCRT on Windows against
+glibc on Linux, one glibc version against another, and so on. Every CPU output
+computed through one of them inherits the disagreement, which is why some CPU
+goldens carry one hash per operating system. `infr_core::math` replaces them
+with functions that return the **correctly rounded** binary32 result — the one
+nearest the exact mathematical value, ties to even — so there is exactly one
+right answer, the same everywhere, and tests can take it from a multi-precision
+library instead of from the code under test. The plan this serves is
+[`plan/11-cpu-bit-identical.md`](plan/11-cpu-bit-identical.md).
+
+As of this writing the module exists and is tested; **no call site uses it yet**
+(that is slice S2, which changes every CPU output once). The lint
+`crates/infr-core/tests/no_platform_libm.rs` lists the call sites still on the
+platform functions.
+
+## What it guarantees
+
+| Function                                   | Correct rounding                     | Verified by                                |
+| ------------------------------------------ | ------------------------------------ | ------------------------------------------ |
+| `exp`, `ln`, `ln_1p`, `tanh`               | every binary32 input                 | exhaustive test, all 2^32 inputs           |
+| `sin`, `cos`, `sin_cos`                    | every binary32 input                 | exhaustive test, all 2^32 inputs           |
+| `powf`                                     | tested domain (see below)            | known answers, grid hash                   |
+| `sigmoid`, `silu`, `gelu_tanh`, `softplus` | not correctly rounded: deterministic | the call sites' own expressions, see below |
+
+Special values follow the Rust standard library's documentation and C99
+(`powf`'s cases per C99 F.9.4.4): NaN in gives NaN out, overflow gives `inf`,
+underflow gives a correctly rounded subnormal or zero.
+
+**`powf`.** The fast path's error bound and the exact-result handling are argued
+in `crates/infr-core/src/math/pow.rs`: `x^y` can be exactly a rounding boundary
+(`11^7`, `66049^1.5`, `(2^-16)^9.375`), and those are detected with integer
+arithmetic and rounded to even. What is NOT proven is that every inexact `x^y`
+lies further than the accurate path's error (about `2^-90` relative) from a
+boundary: there are 2^64 input pairs, so no exhaustive test, and the module
+relies on no published worst-case bound. It is tested on the known-answer table
+(mpmath, including RoPE's `theta^(-2p/d)` for the bases models use) and on the
+grid. Its production uses are RoPE's frequencies (f32) and a pager workload
+shape, which is f64 and has no counterpart here yet.
+
+**The helpers** are the expressions the CPU backend's call sites write,
+operation for operation, with the platform function replaced:
+`sigmoid(x) = 1/(1 + exp(-x))`, `silu(x) = x/(1 + exp(-x))`, `gelu_tanh` as
+`act_fn` writes it, `softplus(x) = max(x, 0) + ln_1p(exp(-|x|))` as the DeltaNet
+scan writes it. Moving a call site onto one changes its bits only where the
+platform function was wrong.
+
+## The determinism rule
+
+Inside the module only binary64/binary32 `+ - * /`, `sqrt`, comparisons,
+conversions, and integer and bit operations. No `mul_add`, no standard-library
+or C-runtime math, nothing that depends on target features, no table computed at
+run time. IEEE 754 specifies each of those operations exactly and Rust never
+contracts or reassociates them, so baseline x86-64, AVX-512 and aarch64 builds
+give identical bits.
+
+## How it works
+
+CORE-MATH's design for binary32: evaluate in binary64 with a proven error bound;
+when every real number within that bound rounds to the same binary32, that is
+the answer; otherwise (rarely) evaluate in double-double, about 100 bits, and
+round that. Double-double products use Dekker's splitting, not FMA. Each source
+file states its algorithm, its sources and its error bounds:
+
+| File        | Functions             | Reduction                                                   |
+| ----------- | --------------------- | ----------------------------------------------------------- |
+| `exp.rs`    | `exp`, `tanh`         | `x = k ln2/64 + r`, table of `2^(j/64)`                     |
+| `log.rs`    | `ln`, `ln_1p`         | 128-entry reciprocal table on the significand               |
+| `trig.rs`   | `sin`, `cos`          | Cody–Waite below `2^22`, Payne–Hanek (bits of `2/pi`) above |
+| `pow.rs`    | `powf`                | `exp(y ln x)` in double-double, exact cases by integers     |
+| `dd.rs`     | double-double         | error-free transformations, rounding to binary32            |
+| `tables.rs` | constants (generated) |                                                             |
+
+## Tests
+
+All in `crates/infr-core/tests/math.rs`:
+
+- `known_answers`: `tests/data/math_kat.txt`, generated by
+  `scripts/gen_math_kat.py` with mpmath — special values, subnormals, range
+  edges, a spread of inputs, RoPE angles for two model geometries, `powf` exact
+  and midpoint cases, and per unary function the hardest inputs found (those
+  whose exact result lies nearest a rounding boundary).
+- `grid_hashes`: each function over a fixed grid (a spread over all bit patterns
+  plus a dense range of the values the backend feeds it), the result bits hashed
+  against one checked-in value. CI runs it on Linux, Windows and macOS; one
+  value for all three is the cross-platform guarantee.
+- `exhaustive_*` (ignored): every binary32 input against an independent
+  reference in `tests/math_support/oracle.rs`, which has its own double-double
+  arithmetic, its own constants (`ln 2` from a series, `pi` from its published
+  hex digits) and different algorithms (no tables; the trigonometric reduction
+  by big-integer division). It reports any result it cannot decide rather than
+  guessing.
+- `platform_libm_differences`, `bench_against_std` (ignored): information only.
+
+Run them:
+
+```sh
+cargo test -p infr-core --release --test math                         # KAT, grid
+cargo test -p infr-core --release --test math -- --ignored exhaustive  # minutes each
+cargo test -p infr-core --release --test math -- --ignored --nocapture platform_libm bench
+```
+
+## Regenerating the tables
+
+```sh
+python -m venv .venv && .venv/bin/pip install mpmath   # never the system Python
+.venv/bin/python -I scripts/gen_math_kat.py tables
+MATH_HARD_OUT=hard.txt cargo test -p infr-core --release --test math -- --ignored exhaustive
+.venv/bin/python -I scripts/gen_math_kat.py kat --hard hard.txt
+```
+
+`tables` must reproduce `tables.rs` byte for byte; a difference means the script
+or mpmath changed and has to be explained before it is committed. `kat` takes
+candidate hard cases from the exhaustive run (`MATH_HARD_OUT`) and from its own
+random scan, and mpmath decides which are hardest.
+
+## Measured (2026-11-17, Ryzen 9 9950X3D, AVX-512)
+
+**Exhaustive**, Windows, release build, 32 threads: for each function every one
+of the 4,294,967,296 inputs correctly rounded, none wrong, none undecided.
+
+| Function | Time  |
+| -------- | ----- |
+| `exp`    | 76 s  |
+| `ln`     | 74 s  |
+| `ln_1p`  | 71 s  |
+| `tanh`   | 77 s  |
+| `sin`    | 618 s |
+| `cos`    | 596 s |
+
+(`sin`/`cos` are slow because the reference reduces by big-integer long
+division.) One more fact the exhaustive test established: `exp`'s binary64 fast
+path alone, with the accurate path switched off (its allowance set to `2^-70`),
+is already correctly rounded for every input. The accurate path stays as the
+backstop the error bound calls for, but a vectorized `exp` (plan slice S5) can
+match the scalar bits without one.
+
+**The grid hash** is the same on Windows (MSVC, `target-cpu=native`, debug and
+release, and a baseline `x86-64` release build) and on Linux under WSL (glibc
+2.43, `target-cpu=native`, release).
+
+**How far the platform libraries are from it** on the grid
+(`platform_libm_differences`); every difference is 1 ulp. These are the outputs
+that move when the call sites migrate:
+
+| Function | Windows (UCRT) | Linux (glibc 2.43) |
+| -------- | -------------: | -----------------: |
+| `exp`    |             10 |                 67 |
+| `ln`     |            253 |                607 |
+| `ln_1p`  |         13,212 |                  0 |
+| `tanh`   |          2,938 |                  0 |
+| `sin`    |            261 |              2,627 |
+| `cos`    |            252 |              2,581 |
+| `powf`   |             13 |                 11 |
+
+out of 300,000 inputs per unary function and 200,000 `powf` pairs.
+
+**Speed** (`bench_against_std`): scalar, one thread, release, median ns per call
+over interleaved rounds. Windows CPU load 0-2% around the run; the WSL run's own
+load average was 0.0-0.1 (the Windows host's load is not visible from there).
+
+| Function (inputs)       | `math` (Win) | UCRT | ratio | `math` (WSL) | glibc | ratio |
+| ----------------------- | -----------: | ---: | ----: | -----------: | ----: | ----: |
+| `exp` (softmax, -20..0) |         4.14 | 1.58 |  2.62 |         4.23 |  1.62 |  2.62 |
+| `ln` (1e-6..4)          |         6.59 | 1.82 |  3.62 |         6.60 |  1.37 |  4.81 |
+| `ln_1p` (-0.9..4)       |         6.83 | 2.75 |  2.48 |         6.81 |  2.36 |  2.88 |
+| `tanh` (-6..6)          |         5.55 | 4.83 |  1.15 |         5.60 |  2.70 |  2.08 |
+| `sin` (RoPE angles)     |         8.27 | 3.58 |  2.31 |         8.04 |  2.28 |  3.53 |
+| `cos` (RoPE angles)     |         8.14 | 3.37 |  2.42 |         8.11 |  2.54 |  3.19 |
+| `silu` (-6..6)          |         4.67 | 2.36 |  1.98 |         4.58 |  1.84 |  2.49 |
+| `powf` (RoPE `theta^e`) |        22.44 | 4.06 |  5.52 |        22.83 |  2.72 |  8.40 |
+
+So the scalar functions are about 2-5 times slower than the C runtimes, not at
+the parity the plan expected (8 times for `powf`, which RoPE calls once per
+frequency, not per element). Per element of an activation or a softmax that is a
+few nanoseconds; whether it shows in a forward is for S2 to measure per op, and
+S5's vectorized `exp` and `tanh` are the planned answer where it does.

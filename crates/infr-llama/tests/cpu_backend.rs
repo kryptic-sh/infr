@@ -164,9 +164,11 @@ fn model_cfg(
     f: impl FnOnce(&mut infr_llama::EngineConfig),
 ) -> infr_llama::SeamModel {
     let mut cfg = infr_llama::EngineConfig::default();
-    // The one environment knob these tests honour: WHICH GPU they run on, so a box with more than
-    // one (a dGPU beside an iGPU) can test either. Unset keeps the first-discrete default.
+    // The environment knobs these tests honour: WHICH GPU they run on, so a box with more than
+    // one (a dGPU beside an iGPU) can test either (unset keeps the first-discrete default); and
+    // `INFR_FORCE_WAVE64`, so the wave64 path AMD GCN takes can be scored on an RDNA card.
     cfg.device.dev = std::env::var("INFR_DEV").ok();
+    cfg.kernels.vulkan.force_wave64 = std::env::var_os("INFR_FORCE_WAVE64").is_some();
     f(&mut cfg);
     infr_llama::SeamModel::load_with(path, None, std::sync::Arc::new(cfg)).expect("model load")
 }

@@ -79,7 +79,7 @@ fn run_and_read(
 }
 
 fn gpu() -> Option<infr_vulkan::VulkanBackend> {
-    infr_vulkan::VulkanBackend::new().ok()
+    infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new())
 }
 
 /// Does an in-place-mutated recurrent state Input PERSIST across `execute` calls? (Decode runs one

@@ -109,6 +109,8 @@ pub struct Capabilities {
     /// GEMM pins `requiredSubgroupSize = 32` (RDNA3 wave32); a device whose range excludes 32 can't
     /// run the pinned kernel and must fall back to a non-pinned variant. `(0, 0)` =
     /// subgroup-size-control unsupported (can't pin at all — use the driver's default subgroup).
+    /// A wave64-only device (AMD GCN) reports `(64, 64)`, and so does any device run with the
+    /// `kernels.vulkan.force_wave64` testing knob.
     pub subgroup_min: u32,
     pub subgroup_max: u32,
     /// PREFERRED pinned subgroup size for the bandwidth-critical decode GEMV/reduction kernel

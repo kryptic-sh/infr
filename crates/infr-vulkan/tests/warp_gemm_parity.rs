@@ -24,7 +24,7 @@ fn synth_bytes(n: usize, seed: usize) -> Vec<u8> {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn warp_ag_isa_probe() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

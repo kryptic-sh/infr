@@ -2276,6 +2276,19 @@ pub(crate) fn coopmat_i8_layout_spv() -> &'static [u32] {
         )))
     })
 }
+/// SPIR-V for the wave64 path's known-answer probe (`wave64_probe.comp`) — dispatched once at init
+/// on a device that takes that path, to check that a 32-wide workgroup is one subgroup scanned in
+/// invocation order.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn wave64_probe_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/wave64_probe.spv"
+        )))
+    })
+}
 /// SPIR-V for the 256-thread subgroup RMSNorm (`y=rmsnorm(x,w)`). Used by the recorder's `rmsnorm`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn rmsnorm_spv() -> &'static [u32] {
@@ -3944,6 +3957,7 @@ mod tests {
     fn attn_decode_reduction_is_not_clustered() {
         const OP_GROUP_NON_UNIFORM_FADD: u16 = 350;
         const REDUCE: u32 = 0;
+        const CLUSTERED_REDUCE: u32 = 3;
         // A SPIR-V module is a 5-word header then a stream of instructions; word 0 of each is
         // (wordcount << 16) | opcode.
         fn reduce_ops(spv: &[u32]) -> Vec<u32> {
@@ -3982,8 +3996,11 @@ mod tests {
                 !ops.is_empty(),
                 "{name}: found no OpGroupNonUniformFAdd at all — this check matched nothing"
             );
+            // Each ClusteredReduce must be the wave64.glsl twin of a plain Reduce (dead unless W64).
+            let reduces = ops.iter().filter(|&&o| o == REDUCE).count();
+            let clustered = ops.iter().filter(|&&o| o == CLUSTERED_REDUCE).count();
             assert!(
-                ops.iter().all(|&o| o == REDUCE),
+                reduces + clustered == ops.len() && clustered <= reduces,
                 "{name}: subgroup float add is not a plain Reduce (operations {ops:?}); \
                  3 = ClusteredReduce, which changes the reduction tree and breaks bit-identity"
             );

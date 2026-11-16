@@ -326,7 +326,7 @@ fn quant_act(x: &[f32]) -> Vec<f32> {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn paged_mmq_expert_gemm_matches_host_under_eviction() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -543,7 +543,7 @@ fn paged_mmq_expert_gemm_matches_host_under_eviction() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn paged_mmq_expert_gemm_new_formats_matches_host() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

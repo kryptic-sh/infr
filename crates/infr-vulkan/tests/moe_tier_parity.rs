@@ -343,7 +343,7 @@ fn run_leg(
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn the_host_tier_is_consulted_only_on_a_vram_miss() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -474,7 +474,7 @@ fn the_host_tier_is_consulted_only_on_a_vram_miss() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn a_failed_read_leaves_nothing_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -538,7 +538,7 @@ fn a_failed_read_leaves_nothing_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn a_repeated_expert_is_staged_once() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -568,7 +568,7 @@ fn a_repeated_expert_is_staged_once() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn an_out_of_range_expert_is_refused_before_any_state_changes() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -638,7 +638,7 @@ fn every_expert() -> Vec<u32> {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn resident_layers_keep_their_slots_against_misses_elsewhere() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -701,7 +701,7 @@ fn resident_layers_keep_their_slots_against_misses_elsewhere() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn a_layer_stops_being_resident_when_an_expert_leaves() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

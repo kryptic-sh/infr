@@ -297,7 +297,7 @@ fn check(c: &Case) {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn streamed_float_decode_matches_resident() {
-    if VulkanBackend::new().is_err() {
+    if infr_testkit::gpu_or_skip(VulkanBackend::new()).is_none() {
         eprintln!("skip: no Vulkan device");
         return;
     }
@@ -326,7 +326,7 @@ fn streamed_float_decode_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn streamed_float_prefill_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

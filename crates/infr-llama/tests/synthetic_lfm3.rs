@@ -152,11 +152,9 @@ fn lfm3_model() -> SyntheticModel {
 }
 
 fn load(tmp: &TempGguf) -> anyhow::Result<infr_llama::SeamModel> {
-    infr_llama::SeamModel::load_with(
-        tmp.path(),
-        None,
-        std::sync::Arc::new(infr_llama::EngineConfig::default()),
-    )
+    let mut cfg = infr_llama::EngineConfig::default();
+    infr_testkit::honour_env(&mut cfg);
+    infr_llama::SeamModel::load_with(tmp.path(), None, std::sync::Arc::new(cfg))
 }
 
 fn cpu_logits(tag: &str, model: &SyntheticModel) -> Vec<f32> {

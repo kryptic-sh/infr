@@ -354,7 +354,7 @@ fn run_config(
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn mmq_q2_0_expert_gemm_matches_host() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

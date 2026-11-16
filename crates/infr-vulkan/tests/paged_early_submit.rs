@@ -45,6 +45,7 @@ fn backend(early_submit: usize, submit_dispatches: Option<usize>) -> VulkanBacke
     cfg.device.dev = Config::load_from_layers(&[env]).device.dev;
     cfg.paging.early_submit = early_submit;
     cfg.device.submit_dispatches = submit_dispatches;
+    infr_testkit::honour_env(&mut cfg);
     VulkanBackend::new_with(Arc::new(cfg)).expect("Vulkan device")
 }
 

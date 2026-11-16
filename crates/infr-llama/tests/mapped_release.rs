@@ -25,6 +25,7 @@ fn engine_cfg(release: bool) -> infr_llama::EngineConfig {
     let mut cfg = infr_llama::EngineConfig::default();
     cfg.device.dev = std::env::var("INFR_DEV").ok();
     cfg.paging.release_uploaded = release;
+    infr_testkit::honour_env(&mut cfg);
     cfg
 }
 

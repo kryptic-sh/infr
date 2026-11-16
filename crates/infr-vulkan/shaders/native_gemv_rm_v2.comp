@@ -4,6 +4,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #endif
+#include "wave64.glsl"
 // Experimental decode GEMV variants for RM kernel tuning (env-gated, default OFF).
 // Variants selected via compile flags:
 //   VARIANT_SG    — subgroup shuffle reduce (replaces shared-mem tree + 2 barriers per row)

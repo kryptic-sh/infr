@@ -7,7 +7,7 @@ use infr_vulkan::VulkanBackend;
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn planar_q8_store_dequant_roundtrip() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -56,7 +56,7 @@ fn planar_q8_store_dequant_roundtrip() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn planar_q8_store_dyn_roundtrip() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -120,7 +120,7 @@ fn to_f16_bytes(v: &[f32]) -> Vec<u8> {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn planar_q8_attn_partial_matches_f16() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -243,7 +243,7 @@ fn planar_q8_attn_partial_matches_f16() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn planar_q8_attn_partial_mixed_kv() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -339,7 +339,7 @@ fn planar_q8_attn_partial_mixed_kv() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn planar_q8_dynac_matches_f16() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -463,7 +463,7 @@ fn planar_q8_dynac_matches_f16() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn planar_q8_store_replay_tape_matches_static() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

@@ -25,7 +25,7 @@ fn f16v(lo: u8, hi: u8) -> f32 {
 #[ignore = "requires a Vulkan GPU"]
 fn mmv_mrow_o4_tall_head_matches_host_reference() {
     let log = gpuav_support::enable("tall-head");
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

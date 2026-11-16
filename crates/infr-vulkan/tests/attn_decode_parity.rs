@@ -545,7 +545,8 @@ fn backend(attn_decode: bool) -> Option<VulkanBackend> {
     let env = infr_core::config::ConfigLayer::env().expect("test environment config");
     cfg.device.dev = Config::load_from_layers(&[env]).device.dev;
     cfg.kernels.vulkan.attn_decode = attn_decode;
-    VulkanBackend::new_with(Arc::new(cfg)).ok()
+    infr_testkit::honour_env(&mut cfg);
+    infr_testkit::gpu_or_skip(VulkanBackend::new_with(Arc::new(cfg)))
 }
 
 fn run_all(attn_decode: bool) -> Option<(Vec<Legs>, Vec<&'static str>)> {

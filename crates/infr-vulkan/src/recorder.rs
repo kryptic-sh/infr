@@ -11462,6 +11462,49 @@ mod tests {
         assert_eq!(be_with(|_| {}).capabilities().name, want);
     }
 
+    /// `kernels.vulkan.force_wave64` puts a device that can pin 32 on the wave64 path a GCN part
+    /// takes: no cooperative-matrix tier, the subgroup range a wave64-only part reports, and a
+    /// subgroup reduction (rmsnorm: `subgroupAdd`, `subgroupElect`, `gl_SubgroupID`,
+    /// `gl_NumSubgroups`) still matching the host. Skips on a device that cannot pin 64.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn force_wave64_takes_the_wave64_path() {
+        let c = VulkanBackend::new().unwrap().capabilities();
+        if !(c.subgroup_min <= 64 && 64 <= c.subgroup_max) {
+            eprintln!(
+                "skipped: subgroup range [{}, {}]",
+                c.subgroup_min, c.subgroup_max
+            );
+            return;
+        }
+        let be = be_with(|v| v.force_wave64 = true);
+        assert!(be.shared.wave64);
+        let c = be.capabilities();
+        assert_eq!((c.subgroup_min, c.subgroup_max), (64, 64));
+        assert_eq!(
+            (c.coopmat_f16, c.coopmat_f8, c.coopmat_i8, c.coopmat_bf16),
+            (None, None, None, None),
+            "a coopmat fragment spans the whole 64-lane subgroup"
+        );
+        // 3 rows of 1000: every 256-lane workgroup reduces across all of its subgroups.
+        let (rows, dim, eps) = (3usize, 1000usize, 1e-5f32);
+        let x: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i * 37 % 101) as f32) * 0.02 - 1.0)
+            .collect();
+        let w: Vec<f32> = (0..dim).map(|i| 1.0 + (i % 7) as f32 * 0.05).collect();
+        let got = be.rmsnorm(&x, &w, rows, dim, eps).unwrap();
+        for r in 0..rows {
+            let row = &x[r * dim..(r + 1) * dim];
+            let ms = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+            let scale = 1.0 / (ms + eps).sqrt();
+            for i in 0..dim {
+                let want = row[i] * scale * w[i];
+                let g = got[r * dim + i];
+                assert!((g - want).abs() < 1e-4, "row {r} col {i}: {g} vs {want}");
+            }
+        }
+    }
+
     /// `Recorder::vkb` refuses to bind a resident-BDA sub-tensor whose range passes the device's
     /// `maxStorageBufferRange` — a VUID violation whose consequence is whatever the driver does
     /// with the descriptor — and binds the same tensor once the limit covers it.
@@ -11578,6 +11621,7 @@ mod tests {
             be.shared.push_descriptor.is_some(),
             floor,
             false,
+            be.shared.wave64,
         )
         .err()
         .expect("a 1024-wide workgroup on a 128-wide device must be refused")

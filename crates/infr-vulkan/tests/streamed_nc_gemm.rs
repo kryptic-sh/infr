@@ -242,7 +242,7 @@ fn check(c: &Case) {
 #[test]
 #[ignore = "requires a Vulkan GPU without f16 cooperative matrix"]
 fn streamed_prefill_takes_the_non_coopmat_gemm() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -301,7 +301,7 @@ fn narrow_q4k_gemm(be: &VulkanBackend) -> &'static str {
 #[test]
 #[ignore = "requires a Vulkan GPU with f16 cooperative matrix and int8 dot"]
 fn streamed_narrow_q4k_takes_the_resident_gemm_on_coopmat() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -329,7 +329,7 @@ fn streamed_narrow_q4k_takes_the_resident_gemm_on_coopmat() {
 #[test]
 #[ignore = "requires a Vulkan GPU: without f16 coopmat, or with f16 coopmat and int8 dot"]
 fn streamed_breaching_weight_keeps_the_gemv() {
-    let Ok(probe) = VulkanBackend::new() else {
+    let Some(probe) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -369,6 +369,7 @@ fn streamed_breaching_weight_keeps_the_gemv() {
     cfg.device.dev = Config::load_from_layers(&[env]).device.dev;
     // The whole weight is exactly the cap, so it breaches; a 64-row chunk of it does not.
     cfg.kernels.vulkan.bda_chunk_elems = Some((c.out_f * IN_F) as u64);
+    infr_testkit::honour_env(&mut cfg);
     let be = VulkanBackend::new_with(Arc::new(cfg)).expect("Vulkan device");
     let label = label(&c);
     let wb = weight_bytes(c.dt, c.out_f);
@@ -631,7 +632,7 @@ fn route_check(c: &RouteCase) -> Counts {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn streamed_quant_takes_the_resident_kernels() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -711,7 +712,7 @@ fn streamed_quant_takes_the_resident_kernels() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn breaching_weight_in_the_multi_row_band_takes_the_gemv() {
-    if VulkanBackend::new().is_err() {
+    if infr_testkit::gpu_or_skip(VulkanBackend::new()).is_none() {
         eprintln!("skip: no Vulkan device");
         return;
     }
@@ -726,6 +727,7 @@ fn breaching_weight_in_the_multi_row_band_takes_the_gemv() {
     let env = ConfigLayer::env().expect("test environment config");
     cfg.device.dev = Config::load_from_layers(&[env]).device.dev;
     cfg.kernels.vulkan.bda_chunk_elems = Some((c.out_f * c.in_f) as u64);
+    infr_testkit::honour_env(&mut cfg);
     let be = VulkanBackend::new_with(Arc::new(cfg)).expect("Vulkan device");
     let wb = infr_testkit::synth_weight(c.dt, c.out_f * c.in_f, 7);
     let x = infr_testkit::gen_f32(c.m * c.in_f, 11);

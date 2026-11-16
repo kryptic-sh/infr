@@ -30,6 +30,7 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #endif
+#include "wave64.glsl"
 
 #ifdef WIDE
 #define NTHREAD 1024u

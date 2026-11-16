@@ -201,7 +201,7 @@ const AFFINE_DTYPES: &[DType] = &[
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn new_dtype_id_gemv_matches_host() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -298,7 +298,7 @@ fn new_dtype_id_gemv_matches_host() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn new_dtype_id_gemv_paged_matches_host_under_eviction_churn() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -422,7 +422,7 @@ fn new_dtype_id_gemv_paged_matches_host_under_eviction_churn() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn id_gemv_multi_rejects_sub_block_in_f() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

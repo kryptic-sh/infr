@@ -35,6 +35,7 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_clustered : require
 #extension GL_EXT_control_flow_attributes : require
+#include "wave64.glsl"
 
 // workgroup = WARPS_M*WARPS_N subgroups of 32 lanes = (BM/16)*2*32 = BM*4 threads.
 layout(local_size_x = (BM_TILE * 4), local_size_y = 1, local_size_z = 1) in;

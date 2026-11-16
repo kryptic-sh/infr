@@ -1,0 +1,21 @@
+#version 460
+// Known-answer probe for the wave64 path (`VulkanBackend::verify_wave64_layout`), dispatched once
+// at init on a device that runs it. `wave64.glsl` treats a workgroup of at most 32 invocations as
+// ONE subgroup whose operations span exactly that workgroup, and `deltanet_gates.comp` reads its
+// inclusive scan in gl_LocalInvocationIndex order. This one 32-wide workgroup, pinned to subgroup
+// 64 like every kernel there, records what the driver actually did: per invocation, the number of
+// subgroups, how many lanes its subgroup holds, and its inclusive-scan rank. The host expects
+// (1, 32, index + 1) from every invocation. Deliberately NOT built on `wave64.glsl`: it reads the
+// real subgroups that header is built on.
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) writeonly buffer OB { uint outp[]; }; // [32][3]
+
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    outp[i * 3u + 0u] = gl_NumSubgroups;
+    outp[i * 3u + 1u] = subgroupAdd(1u);
+    outp[i * 3u + 2u] = subgroupInclusiveAdd(1u);
+}

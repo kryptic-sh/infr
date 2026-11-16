@@ -114,7 +114,7 @@ fn host_expert_gemm(
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn grid_mmq_expert_gemm_matches_host_and_is_deterministic() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -312,7 +312,7 @@ fn grid_mmq_expert_gemm_matches_host_and_is_deterministic() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn grid_mmq_paged_expert_gemm_matches_host_under_eviction() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

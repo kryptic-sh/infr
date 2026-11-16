@@ -7851,7 +7851,7 @@ mod tests {
     }
 
     /// The `-DMLA_SG` tier is capability-gated at the point of use, not just by the backend's
-    /// device-level wave32 refusal: a device whose subgroup range excludes the pinned width must
+    /// device-level subgroup gate: a device whose subgroup range excludes the pinned width must
     /// get the scalar two-pass builds, whose eight-way selector must in turn never hand a `sg`
     /// name a scalar build's SPIR-V (kernels are cached by NAME, so a mismatch would poison the
     /// cache entry for the whole process).

@@ -186,7 +186,7 @@ fn run(be: &VulkanBackend, label: &str, counts_host: &[u32], k: usize, n: usize)
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn q6k_expert_gemm_matches_host_at_every_tile() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

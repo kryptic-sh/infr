@@ -30,6 +30,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Wave64-only AMD GPUs (GCN: Polaris, Vega) run on the Vulkan backend** (issue
+  #94), ported from korewaChino's KessokuNet fork. A device that cannot pin a
+  32-wide subgroup but can pin 64 used to be refused at startup; it now runs the
+  same kernels on 64-lane subgroups (`shaders/wave64.glsl`, behind a
+  specialization constant: a workgroup of up to 32 invocations is one subgroup,
+  a larger one is split into 32-lane halves), with the cooperative-matrix tiers
+  off, after a startup known-answer dispatch confirms the driver lays small
+  workgroups out the way that needs. A device must now report the clustered
+  subgroup operations (both AMD drivers on this project's RDNA GPUs do).
+  Verified on this project's hardware only through the new
+  `kernels.vulkan.force_wave64` testing knob (`INFR_FORCE_WAVE64`), which runs
+  the same path on an RDNA GPU. GCN itself has not run this version: the fork's
+  author tested the fork's original commit on an RX 580 (RADV), before the
+  changes made here. Wave32 devices run the same kernels as before, but the
+  SPIR-V of every shader that uses subgroups changed, so the on-disk pipeline
+  cache is rebuilt once.
+
 - **DeepSeek V4 with compressed layers generates on the CPU backend.** Every
   `deepseek4` layer tier now runs: a ratio-128 (HCA) layer pools every completed
   block of 128 positions into its compressed cache (`attn_compressor_*`, a

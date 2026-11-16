@@ -32,6 +32,12 @@ The standing goal: any model size on any hardware, disk to DRAM to VRAM.
 | 06    | [Pager eviction: cost and policy](06-pager-eviction.md)                               | steps 1–2 done |
 | 08    | [A streamed model that fits runs at resident speed](08-streamed-at-resident-speed.md) | steps 0–4 done |
 
+## Vulkan backend
+
+| Phase | What                                                                                  | Status |
+| ----- | ------------------------------------------------------------------------------------- | ------ |
+| 10    | [Kernels with per-device tunable parameters](10-tunable-kernels.md), one tuning table | scoped |
+
 ## Notes on the model phases
 
 Every phase was scoped on 2026-11-13 from the llama.cpp checkout at

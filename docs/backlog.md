@@ -1631,9 +1631,46 @@ is left:
   reduction with an `n_used`-element copy, so it can only be faster; also not
   measured.
 
-### B-DSV4-REAL — the shipped V4 file has not been run; its numbers are unverified (2026-08-13)
+### B-DSV4-REAL — the shipped V4 file runs on CPU, far too slowly; its numbers are unverified (2026-08-13, run 2026-11-16)
 
-**Tag:** deepseek · **Blocked on:** a run that fits this machine (plan 09 S8)
+**Tag:** deepseek · streaming · **Blocked on:** nothing
+
+**First run, 2026-11-16, tree at `879a8677`, CPU backend, 64 GB machine.**
+`INFR_DRAM_CACHE=12g infr run ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S "Hi" --dev cpu --temp 0 --max-new 4 --ctx 1024 --no-think`
+printed `Hi! How can`. Every refusal passed. The log read
+`host paging: 9 weight class(es), 12.67 GB arena of a 12.88 GB budget` and
+`[prefill 5 tok @ 0 tok/s (140230 ms) | decode 4 tok @ 0.0 tok/s]`; wall time 10
+m 39 s; available host memory started at 43311 MB and never fell below 24787 MB
+(sampled every 2 s). The paragraphs below this one predate the run and still say
+it has not happened, as do `CHANGELOG.md`'s unreleased V4 entries,
+`docs/deepseek.md`, `docs/plan.md` and plan 09: correct them with the fixes
+below.
+
+What the run left, in order:
+
+- **Decode costs about two minutes a token, prefill 28 s a token.** A token
+  routes to 6 of 256 experts in each of 43 layers, on the order of 2 GB of
+  expert data by the file's sizes, which this machine's NVMe reads in about a
+  second. Not profiled. Unchecked guesses: the arena is split across the weight
+  classes so the expert banks get a sliver; the Q8_0 attention, compressor and
+  indexer weights of every layer compete with the experts and are evicted each
+  token; a whole expert bank is the paging unit; reads are small. Measure bytes
+  read, read calls and evictions per class per token before changing anything.
+- **The automatic host-cache budget leaves too little.** Without
+  `INFR_DRAM_CACHE` the same command logged
+  `98.54 GB of weights exceed the 43.97 GB of host memory available, so they stream from disk through a 38.47 GB arena`
+  and available memory fell from 42109 MB to 10957 MB in 54 s, where a watchdog
+  stopped it. The budget should leave a margin of the kind `UNIFIED_HOST_MARGIN`
+  gives the test guard, and count the process's other allocations.
+- **`tokenizer.ggml.pre = "joyai-llm"` has no mapping**, so infr warns and uses
+  the GPT-2 regex; llama.cpp maps it (`LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM`,
+  `clean_spaces = false`, in `llama-vocab.cpp`). Token ids for this file may
+  differ from llama.cpp's until it is added; not compared.
+- **A first attempt at all three exists, unreviewed and ungated**, as a git
+  stash on the Windows dev box named "wip: V4-Flash real-file findings": the
+  coder was stopped mid-way, in the middle of a red check that had removed the
+  tokenizer mapping, so the stash may hold that removal. Treat it as a draft to
+  read, not as work to commit.
 
 Measured from `ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S` (`block_count = 43`,
 `hash_layer_count = 3`, `compress_ratios` = `[0, 0, 4, 128, 4, 128, …, 4]` over

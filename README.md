@@ -45,30 +45,30 @@ e.g. `infr run unsloth/Qwen3-14B-GGUF:Q4_K_M`). Models share the standard
 All run on the Vulkan GPU backend unless noted. The chat template (turn markers,
 system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 
-| Family            | Arch (GGUF)       | Notes                                                                      |
-| ----------------- | ----------------- | -------------------------------------------------------------------------- |
-| Llama             | `llama`           | dense transformer                                                          |
-| Llama 4           | `llama4`          | sigmoid top-1 MoE + shared expert, iRoPE, paged experts                    |
-| SmolLM3           | `smollm3`         | llama block, rope skipped on every 4th layer (NoPE)                        |
-| ERNIE 4.5 (dense) | `ernie4_5`        | llama block, wide heads (`attention.key_length`)                           |
-| ERNIE 4.5 MoE     | `ernie4_5-moe`    | 21B-A3B: softmax router + selection bias, shared expert, paged experts     |
-| Qwen2 / Qwen2.5   | `qwen2`           | dense, QKV bias, NEOX rope                                                 |
-| Qwen3             | `qwen3`           | dense, QK-norm                                                             |
-| Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts, paged experts                             |
-| Gemma 3           | `gemma3`          | SWA + QK-norm + GeGLU, dual-RoPE                                           |
-| Gemma 4 (dense)   | `gemma4`          | per-layer head dims, proportional RoPE, V-norm                             |
-| Gemma 4 **E2B**   | `gemma4`          | + per-layer input embeddings / FFN, KV sharing                             |
-| Gemma 4 **MoE**   | `gemma4`          | 26B-A4B: dual FFN (dense GeGLU ∥ 8-of-128 routed), AR                      |
-| Qwen3.5 / Qwen3.6 | `qwen35`          | hybrid gated-DeltaNet + attention (NOT `qwen3next`)                        |
-| Qwen3.6 MoE       | `qwen35moe`       | `qwen35` skeleton + routed experts + shared expert                         |
-| LFM3              | `lfm3`            | gated short-convolution layers + head-gated SWA/full attention             |
-| DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode                     |
-| BitNet b1.58      | `bitnet`          | llama skeleton + SubLN, ternary TQ2_0 weights                              |
-| BitNet b1.58 (MS) | `bitnet-b1.58`    | same, for the `microsoft/bitnet-b1.58-*` GGUFs (i2_s)                      |
-| DeepSeek V1       | `deepseek`        | softmax MoE + shared expert; CPU-tested on MoE-16B only                    |
-| DeepSeek V2 / V3  | `deepseek2`       | MLA + YaRN + group-limited MoE; validated on V2-Lite; V3.2 files run here  |
-| DeepSeek V3.2     | `deepseek32`      | + lightning indexer; synthetic only, published files too big to test here  |
-| DeepSeek V4       | `deepseek4`       | every tier runs on CPU; synthetic files match llama.cpp; V4-Flash: not run |
+| Family            | Arch (GGUF)       | Notes                                                                                     |
+| ----------------- | ----------------- | ----------------------------------------------------------------------------------------- |
+| Llama             | `llama`           | dense transformer                                                                         |
+| Llama 4           | `llama4`          | sigmoid top-1 MoE + shared expert, iRoPE, paged experts                                   |
+| SmolLM3           | `smollm3`         | llama block, rope skipped on every 4th layer (NoPE)                                       |
+| ERNIE 4.5 (dense) | `ernie4_5`        | llama block, wide heads (`attention.key_length`)                                          |
+| ERNIE 4.5 MoE     | `ernie4_5-moe`    | 21B-A3B: softmax router + selection bias, shared expert, paged experts                    |
+| Qwen2 / Qwen2.5   | `qwen2`           | dense, QKV bias, NEOX rope                                                                |
+| Qwen3             | `qwen3`           | dense, QK-norm                                                                            |
+| Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts, paged experts                                            |
+| Gemma 3           | `gemma3`          | SWA + QK-norm + GeGLU, dual-RoPE                                                          |
+| Gemma 4 (dense)   | `gemma4`          | per-layer head dims, proportional RoPE, V-norm                                            |
+| Gemma 4 **E2B**   | `gemma4`          | + per-layer input embeddings / FFN, KV sharing                                            |
+| Gemma 4 **MoE**   | `gemma4`          | 26B-A4B: dual FFN (dense GeGLU ∥ 8-of-128 routed), AR                                     |
+| Qwen3.5 / Qwen3.6 | `qwen35`          | hybrid gated-DeltaNet + attention (NOT `qwen3next`)                                       |
+| Qwen3.6 MoE       | `qwen35moe`       | `qwen35` skeleton + routed experts + shared expert                                        |
+| LFM3              | `lfm3`            | gated short-convolution layers + head-gated SWA/full attention                            |
+| DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode                                    |
+| BitNet b1.58      | `bitnet`          | llama skeleton + SubLN, ternary TQ2_0 weights                                             |
+| BitNet b1.58 (MS) | `bitnet-b1.58`    | same, for the `microsoft/bitnet-b1.58-*` GGUFs (i2_s)                                     |
+| DeepSeek V1       | `deepseek`        | softmax MoE + shared expert; CPU-tested on MoE-16B only                                   |
+| DeepSeek V2 / V3  | `deepseek2`       | MLA + YaRN + group-limited MoE; validated on V2-Lite; V3.2 files run here                 |
+| DeepSeek V3.2     | `deepseek32`      | + lightning indexer; synthetic only, published files too big to test here                 |
+| DeepSeek V4       | `deepseek4`       | every tier runs on CPU; synthetic files match llama.cpp; V4-Flash runs, minutes per token |
 
 DeepSeek status and what each stage is verified against:
 [`docs/deepseek.md`](docs/deepseek.md).

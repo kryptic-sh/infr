@@ -661,6 +661,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Q5_0 weights give the same result on the CPU at one row as at several.** A
+  one-row `Op::Linear` on a Q5_0 weight (every decode step, and the prompt's
+  last token, whose logits pick the first generated token) dequantized the row
+  and took an f32 dot, while prefill quantized the activations to int8 and ran
+  `vec_dot_q5_0_32_batch`, so a token's projection depended on how many tokens
+  shared its graph, and a chunked prefill differed from one token at a time. One
+  row now runs the same int8 kernel, as Q4_0, Q4_1 and Q5_1 already did.
+  **Output changes on every model with Q5_0 tensors**, among the cached ones
+  gemma-3-1b Q4_K_M (its `attn_q`, `attn_k`, `ffn_gate`, `ffn_up`) and
+  Qwen2.5-0.5B q4_k_m (including its tied embedding and output head). The cost
+  is accuracy: on gemma-3-1b Q4_K_M against llama.cpp's CPU logits (50 prompt
+  lengths) mean KL rose from 7.04e-3 to 8.64e-3 and top-1 agreement fell from
+  48/50 to 45/50. The gain is decode speed, 2.2 to 8.8 times on the measured
+  shapes (one-row `Op::Linear`, median per shape of each round, three rounds
+  interleaved with the previous build while other builds shared the machine, in
+  × out: 4096×4096 1.03-1.10 ms to 0.39 ms, 4096×14336 3.22-3.56 ms to 1.15-1.48
+  ms, 14336×4096 9.9-11.9 ms to 1.33-1.63 ms). `docs/backlog.md` B201 records
+  the trade and the f32 alternative declined.
 - **A panic inside a CPU kernel now fails the forward with its own message.**
   The CPU thread pool replaced a task's panic with a generic
   `spin-pool: a task panicked`, and kept running every remaining task of the

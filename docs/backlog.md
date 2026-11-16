@@ -6405,8 +6405,9 @@ pinned reference; then that layer can go.
 `tests/linear_batch_identity.rs` holds every weight dtype's prefill `Op::Linear`
 (F32, F16, BF16 and every `WEIGHT_QUANTS` format) to its one-row bits and to an
 f64 reference under a bound derived from the int8 activation quantizer;
-`kernels::batch_tier_tests` does the same for each x86_64 tier pairing. Q5_0 is
-the one dtype that differs (B201). What it left:
+`kernels::batch_tier_tests` does the same for each x86_64 tier pairing. Q5_0 was
+the one dtype that differed until its one row moved onto the int8 kernel (B201).
+What it left:
 
 - **Paths no switch reaches.** The kernel tier is chosen by runtime feature
   detection; `Op::Linear` has no config knob for it, so the op-level test runs
@@ -6433,18 +6434,17 @@ the one dtype that differs (B201). What it left:
 
 **Tag:** cpu · precision · **Kind:** decision made, alternative declined
 
-**State.** A one-row `Op::Linear` on a Q5_0 weight dequantizes the row and takes
-an f32 dot; several rows quantize the activations to int8 per 32-element block
-and run `vec_dot_q5_0_32_batch`. Every other quantized dtype runs int8
-activations at one row too. So Q5_0 is the one weight dtype whose prefill and
-decode are not bit-identical: `tests/linear_batch_identity.rs` pins the gap
-(`Q5_0_GAP_REL`; ordinary rows 2.6e-3 of the output's `Σ|w·x|`, 33.2 absolute at
-most on its wide-range row) and requires it to be non-zero.
+**Was.** A one-row `Op::Linear` on a Q5_0 weight dequantized the row and took an
+f32 dot, while several rows quantized the activations to int8 per 32-element
+block and ran `vec_dot_q5_0_32_batch`, so Q5_0 was the one weight dtype whose
+prefill and decode were not bit-identical (2.6e-3 of the output's `Σ|w·x|` on
+ordinary rows of `tests/linear_batch_identity.rs`).
 
 **Decision (owner, 2026-11-17): int8 activations at one row**, for consistency
 with every other quantized dtype and decode speed, over the small distance to
-llama.cpp that f32 keeps. The change follows this entry in its own commit; that
-commit turns the pin above into the bitwise check. The options as weighed:
+llama.cpp that f32 keeps. Landed the same day: one row runs the batch kernel on
+its own int8 activation, and the identity test checks Q5_0 bit for bit like
+every other dtype. The options as weighed:
 
 - **int8 at one row (taken).** Prefill and decode bit-identical, as for every
   other dtype; one-row `Op::Linear` 2.2-8.8x faster on 4096×4096, 4096×14336 and

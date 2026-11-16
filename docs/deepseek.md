@@ -1329,14 +1329,14 @@ the next layer, the indexer's scores (a selection at a near-tie can flip between
 `INFR_UBATCH=1` and the default) and the logits. Every MoE model's CPU batched
 prefill makes the same trade. `Op::Linear` is not part of it: it quantizes the
 activations of a quantized weight at one row too, and its batched kernels equal
-its one-row ones bit for bit on every weight dtype but Q5_0 (below), which V4
-does not use. `quantized_banks_chunked_prefill_is_close_and_reference_is_exact`
-gives the canonical file Q8_0 expert banks (`infr_testkit`'s new `Fill::Quant`)
-and pins it at 300 tokens: chunked against one position per graph, max |logit
-diff| 1.71e-4 at the prompt's last position and 2.37e-4 at the first decoded one
-(held at 1e-3), 87 of 594 indexer selections different (the canonical indexer's
-four heads leave many near-ties), every chunk height bit-identical to every
-other (each row is quantized alone); in reference mode (`kernels.cpu.reference`)
+its one-row ones bit for bit on every weight dtype (below).
+`quantized_banks_chunked_prefill_is_close_and_reference_is_exact` gives the
+canonical file Q8_0 expert banks (`infr_testkit`'s new `Fill::Quant`) and pins
+it at 300 tokens: chunked against one position per graph, max |logit diff|
+1.71e-4 at the prompt's last position and 2.37e-4 at the first decoded one (held
+at 1e-3), 87 of 594 indexer selections different (the canonical indexer's four
+heads leave many near-ties), every chunk height bit-identical to every other
+(each row is quantized alone); in reference mode (`kernels.cpu.reference`)
 chunked and one-position prefill are bit-identical again, and its one-position
 run equals the production one.
 
@@ -1356,23 +1356,23 @@ chunked and one-position prefill are bit-identical on that file therefore rests
 on Q8_0 `Op::Linear` (and the BF16 router GEMM inside `Op::MoeFfn`, which stays
 on f32 activations).
 
-**`Op::Linear` at several rows equals it at one, on every dtype but Q5_0
-(2026-11-17).** `infr-cpu`'s `tests/linear_batch_identity.rs` runs every weight
-dtype (F32, F16, BF16 and every GGUF quant infr loads) through one `Op::Linear`
-of R rows and R of one row each, at R from 1 to 129 across the batched kernels'
-tile edges, at widths of one block, of an odd block count off the 256 boundary
-and (for the 32-element formats) on it, at 1, 3, 15 and 16 outputs, with zero,
-one-spike, all-negative, subnormal, wide-range and exact int8 rounding-tie rows,
-in the production kernels and in reference mode: every value bit-identical but
-Q5_0's, and every one inside a bound derived from the int8 quantizer against an
-f64 reference. `kernels::batch_tier_tests` checks each x86_64 tier pairing
-(scalar, AVX2, AVX-512BW, VNNI) directly, so one machine covers what the others
-dispatch. Q5_0 is not identical: it takes an f32-activation dot at one row and
-the int8 kernel at several (2.6e-3 of the output's scale on ordinary rows,
-pinned as a gap that must stay non-zero); moving its one row onto the int8
-kernel was decided on 2026-11-17 (`docs/backlog.md` B201). On the synthetic file
-stored in the shipped dtypes (every matmul above Q8_0, the head Q6_K, the
-routers BF16, the banks Q2_K, widened so each row is whole blocks),
+**`Op::Linear` at several rows equals it at one, on every dtype (2026-11-17).**
+`infr-cpu`'s `tests/linear_batch_identity.rs` runs every weight dtype (F32, F16,
+BF16 and every GGUF quant infr loads) through one `Op::Linear` of R rows and R
+of one row each, at R from 1 to 129 across the batched kernels' tile edges, at
+widths of one block, of an odd block count off the 256 boundary and (for the
+32-element formats) on it, at 1, 3, 15 and 16 outputs, with zero, one-spike,
+all-negative, subnormal, wide-range and exact int8 rounding-tie rows, in the
+production kernels and in reference mode: every value bit-identical, and every
+one inside a bound derived from the int8 quantizer against an f64 reference.
+`kernels::batch_tier_tests` checks each x86_64 tier pairing (scalar, AVX2,
+AVX-512BW, VNNI) directly, so one machine covers what the others dispatch. Q5_0
+was not identical: it took an f32-activation dot at one row and the int8 kernel
+at several (2.6e-3 of the output's scale on ordinary rows); its one row now runs
+the same int8 kernel, 2.2 to 8.8 times faster on the measured decode shapes and
+slightly further from llama.cpp's logits (`docs/backlog.md` B201). On the
+synthetic file stored in the shipped dtypes (every matmul above Q8_0, the head
+Q6_K, the routers BF16, the banks Q2_K, widened so each row is whole blocks),
 `shipped_dtypes_chunked_prefill_equals_one_position_per_graph` finds chunked
 prefill at heights 3, 37 and the whole prompt bit-identical to one position per
 graph over 200 tokens: logits, kept blocks, caches and rings, and the decode

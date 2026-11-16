@@ -1425,13 +1425,16 @@ impl Backend for CpuBackend {
                                 | DType::Tq1_0
                         ) && !q8_0_blk32)
                             .then(|| quantize_q8(xrow));
-                        // Q4_0/Q4_1/IQ4_NL (and sub-256 Q8_0) use the native-32-block int8
-                        // activation (Q8x32), not the 256-superblock Q8; quantize the single
-                        // activation row once.
+                        // Q4_0/Q4_1/Q5_0/Q5_1/IQ4_NL (and sub-256 Q8_0) use the native-32-block
+                        // int8 activation (Q8x32), not the 256-superblock Q8; quantize the single
+                        // activation row once. Each of them runs the SAME batch kernel prefill
+                        // runs, on a one-row batch, so a row's result does not depend on how
+                        // many rows share its `Op::Linear`.
                         let q8_32: Option<[Q8x32; 1]> = (matches!(
                             dt,
                             DType::Q4_0
                                 | DType::Q4_1
+                                | DType::Q5_0
                                 | DType::Q5_1
                                 | DType::Iq4Nl
                                 | DType::Mxfp4
@@ -1485,6 +1488,15 @@ impl Backend for CpuBackend {
                                 }
                                 DType::Q4_1 => {
                                     vec_dot_q4_1_32_batch(
+                                        row,
+                                        q8_32.as_ref().unwrap(),
+                                        in_f,
+                                        dst_o,
+                                    );
+                                    return;
+                                }
+                                DType::Q5_0 => {
+                                    vec_dot_q5_0_32_batch(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,

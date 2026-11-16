@@ -6,7 +6,6 @@
 //! computation as one-position-per-graph prefill (and as the decode steps after it) if every one
 //! of those routes gives the one-row kernel's bits. This file pins that, through the public op:
 //! one `execute` over `R` rows against `R` executes of one row each, on the same weight bytes.
-//! The dtypes in [`ONE_ROW_F32`] differ by design today; their gap is pinned instead.
 //!
 //! Each case also scores both against a from-definition f64 reference (the host decode of the
 //! same bytes, then `Σ w·x` in f64) under an error bound derived from the arithmetic the kernels
@@ -36,35 +35,12 @@ const ROWS: &[usize] = &[1, 2, 3, 4, 5, 7, 8, 9, 31, 32, 33, 64, 127, 129];
 /// group plus a 7-row tail, and whole 8-row groups.
 const OUT_F: &[usize] = &[1, 3, 15, 16];
 
-/// Weight dtypes that are NOT bit-identical between one row and several: their one-row
-/// `Op::Linear` dequantizes the weight and takes an f32 dot, while several rows quantize the
-/// activations to int8 and run the batch kernel (`vec_dot_q5_0_32_batch`). Only Q5_0, and only
-/// because its one-row arm was never moved when its batched one was.
-///
-/// The alternatives are int8 activations at one row too (every other quantized dtype's choice:
-/// consistent, and 2.2-8.8x faster per decode step, but measured further from llama.cpp's logits
-/// on gemma-3-1b Q4_K_M: mean KL 8.64e-3 against 7.04e-3, top-1 agreement 45/50 against 48/50)
-/// or f32 activations for batches too (closest to the exact sum, at the cost of Q5_0 prefill
-/// speed). Which one is the owner's call: docs/backlog.md, B201. Until then this file pins the
-/// gap ([`Q5_0_GAP_REL`]) instead of asserting identity.
-const ONE_ROW_F32: &[DType] = &[DType::Q5_0];
-
-/// The largest Q5_0 `|prefill − one row| / Σ|w·x|` this file's shapes may show, per
-/// [`act_row`] pattern: about 1.5x what was measured (2026-11-17, AVX-512 VNNI host), to allow
-/// another host's kernel tier. Ordinary rows sit near 2.6e-3; the spike row (2) loses every
-/// other value of its block to the int8 scale, and the subnormal-only row (5) is the quantizer's
-/// overflow case (B200), so those two are large on purpose. The zero row (1) must not differ.
-const Q5_0_GAP_REL: [f64; 8] = [4e-3, 0.0, 0.65, 5e-3, 6.5e-3, 1.8, 6e-3, 2.5e-2];
-
-/// The largest Q5_0 `|prefill − one row|` over every row: measured 33.2, on the wide-range row.
-const Q5_0_GAP_ABS: f64 = 50.0;
-
 /// The float weight dtypes, which take f32 activations at every row count.
 const FLOATS: &[DType] = &[DType::F32, DType::F16, DType::Bf16];
 
 /// How a dtype's `Op::Linear` quantizes its activations — mirrored from the dispatch in
-/// `infr_cpu`'s `Op::Linear` arm. It sets the error bound, and where one row and several differ
-/// ([`ONE_ROW_F32`]) the sweep measures the gap instead of comparing bits.
+/// `infr_cpu`'s `Op::Linear` arm. Only the error bound depends on it: the bitwise check holds
+/// either way.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Acts {
     /// f32 activations: the only error is the f32 dot's rounding.
@@ -74,8 +50,8 @@ enum Acts {
     Int8(usize),
 }
 
-fn acts(dt: DType, in_f: usize, rows: usize, reference: bool) -> Acts {
-    if reference || FLOATS.contains(&dt) || (rows == 1 && ONE_ROW_F32.contains(&dt)) {
+fn acts(dt: DType, in_f: usize, reference: bool) -> Acts {
+    if reference || FLOATS.contains(&dt) {
         return Acts::F32;
     }
     match dt {
@@ -276,37 +252,11 @@ fn reference(w: &[f32], x: &[f32], acts: Acts) -> (f64, f64) {
     (exact, bound)
 }
 
-/// [`reference`] plus `Σ|w·x|`, the scale a gap between two routes is measured against.
-fn reference_mag(w: &[f32], x: &[f32], acts: Acts) -> (f64, f64, f64) {
-    let (exact, bound) = reference(w, x, acts);
-    let mag = w
-        .iter()
-        .zip(x)
-        .map(|(&a, &b)| (a as f64 * b as f64).abs())
-        .sum();
-    (exact, bound, mag)
-}
-
 /// What one dtype's sweep found: how many elements were compared, and the largest
 /// `|got − reference| / bound` over them (≤ 1 passes).
 struct Sweep {
     elems: usize,
     worst: f64,
-    /// For a dtype in [`ONE_ROW_F32`]: how far its prefill values sit from its one-row ones.
-    gap: Gap,
-}
-
-/// The gap between prefill and one-row values of a dtype that is not bit-identical, by
-/// activation pattern ([`act_row`]'s `r % 8`).
-#[derive(Default)]
-struct Gap {
-    compared: usize,
-    differing: usize,
-    /// Largest `|prefill − one row|` per pattern.
-    abs: [f64; 8],
-    /// Largest `|prefill − one row| / Σ|w·x|` per pattern: the gap against the output's own
-    /// magnitude scale. A zero row has none and stays 0.
-    rel: [f64; 8],
 }
 
 /// Check one dtype at every width, output count and row count on `be`: each prefill row bit for
@@ -317,11 +267,9 @@ fn sweep(be: &CpuBackend, dt: DType, reference_mode: bool) -> Sweep {
     let mut s = Sweep {
         elems: 0,
         worst: 0.0,
-        gap: Gap::default(),
     };
     for (wi, &in_f) in widths(dt).iter().enumerate() {
-        let a = acts(dt, in_f, 1, reference_mode);
-        let a_batch = acts(dt, in_f, 2, reference_mode);
+        let a = acts(dt, in_f, reference_mode);
         let xs: Vec<Vec<f32>> = (0..max_m).map(|r| act_row(r, in_f)).collect();
         for &out_f in OUT_F {
             let wbytes = weight(dt, in_f, out_f, 0x11 + (wi * 31 + out_f) as u32);
@@ -354,26 +302,6 @@ fn sweep(be: &CpuBackend, dt: DType, reference_mode: bool) -> Sweep {
                 for (r, want) in single[..m].iter().enumerate() {
                     for (o, w) in want.iter().enumerate() {
                         let g = got[r * out_f + o];
-                        if a_batch != a {
-                            // A dtype whose one row and batches quantize differently: score the
-                            // batch against the reference on its own, and measure the gap.
-                            let (exact, bound, mag) =
-                                reference_mag(&wvals[o * in_f..(o + 1) * in_f], &xs[r], a_batch);
-                            let err = (g as f64 - exact).abs();
-                            assert!(
-                                err <= bound,
-                                "{dt:?} in_f={in_f} out_f={out_f} m={m} row {r} o={o}: prefill \
-                                 {g:e} vs reference {exact:e}: error {err:e} over bound {bound:e}"
-                            );
-                            let (d, p) = ((g as f64 - *w as f64).abs(), r % 8);
-                            s.gap.compared += 1;
-                            s.gap.differing += (g.to_bits() != w.to_bits()) as usize;
-                            s.gap.abs[p] = s.gap.abs[p].max(d);
-                            if mag > 0.0 {
-                                s.gap.rel[p] = s.gap.rel[p].max(d / mag);
-                            }
-                            continue;
-                        }
                         assert_eq!(
                             g.to_bits(),
                             w.to_bits(),
@@ -394,51 +322,17 @@ fn every_dtype() -> Vec<DType> {
     FLOATS.iter().chain(WEIGHT_QUANTS).copied().collect()
 }
 
-/// The production kernels: every weight dtype's prefill route gives its decode route's bits,
-/// except the [`ONE_ROW_F32`] ones, whose gap is pinned instead (and must be there: if it closes,
-/// move the dtype back to the bitwise check).
+/// The production kernels: every weight dtype's prefill route gives its decode route's bits.
 #[test]
 fn prefill_linear_matches_one_row_linear_bitwise_for_every_dtype() {
     let be = CpuBackend::new_with(Arc::new(Config::default()));
     for dt in every_dtype() {
         let s = sweep(&be, dt, false);
-        if ONE_ROW_F32.contains(&dt) {
-            let g = &s.gap;
-            assert!(
-                g.compared > 0 && g.rel[0] > 0.0,
-                "{dt:?}: prefill now equals the one-row path on ordinary rows; make it bitwise"
-            );
-            for (p, (&got, &max)) in g.rel.iter().zip(&Q5_0_GAP_REL).enumerate() {
-                assert!(
-                    got <= max,
-                    "{dt:?} pattern {p}: prefill is {got:e} of the output's scale from the \
-                     one-row path, over the pinned {max:e}"
-                );
-            }
-            let abs = g.abs.iter().fold(0f64, |m, &v| m.max(v));
-            assert!(
-                abs <= Q5_0_GAP_ABS,
-                "{dt:?}: prefill is {abs:e} from one row"
-            );
-        } else {
-            assert_eq!(s.gap.compared, 0, "{dt:?} skipped the bitwise check");
-        }
         eprintln!(
-            "{dt:?}: {} values, worst error {:.3} of the bound; {} of {} prefill values off \
-             the one-row ones, by pattern: abs {:?}, relative {:?}",
-            s.elems,
-            s.worst,
-            s.gap.differing,
-            s.gap.compared,
-            sci(&s.gap.abs),
-            sci(&s.gap.rel)
+            "{dt:?}: {} values, worst error {:.3} of the bound",
+            s.elems, s.worst
         );
     }
-}
-
-/// `v` in scientific notation, for the sweep's report.
-fn sci(v: &[f64]) -> Vec<String> {
-    v.iter().map(|x| format!("{x:.2e}")).collect()
 }
 
 /// Reference mode (`kernels.cpu.reference`): the f32-dequant dot at every row count.

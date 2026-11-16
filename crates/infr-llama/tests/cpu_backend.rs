@@ -1787,17 +1787,25 @@ fn llama32_1b() -> Option<PathBuf> {
 }
 
 // Captured + verified coherent: "The capital of France is Paris. 😊", a brave-knight short story
-// ("The rain in Silverwood always tasted of regret"). Re-blessed THREE times: dense Q5_0 Linear
+// ("The rain in Silverwood always tasted of regret"). Re-blessed: dense Q5_0 Linear
 // onto the int8 kernel, then the attention-SIMD reassociation, then the Q8_0 sub-256-in_f fix
 // (gemma3-1b's 1152-dim projections are Q8_0, whose CPU dot previously TRUNCATED to 1024 elems —
 // see vec_dot_q8_0 routing). The corrected output is token-identical to the Vulkan backend
 // (independent int8 impl), so this bless fixes a wrong golden, not a precision drift.
+//
+// Re-blessed 2026-11-17 when one-row Q5_0 Linear (gemma3-1b's attn_q/attn_k/ffn_gate/ffn_up)
+// moved from an f32 dot onto the int8 kernel prefill already ran (docs/backlog.md B201): every
+// decode step and the prompt's last token changed rounding, and the knight story's text with
+// them; the France case kept its hash. Both halves were computed on the same Ryzen 9 9950X3D,
+// natively on Windows and under WSL (Ubuntu 26.04) for the other half, and came out equal. The
+// Ubuntu CI runner is the final word on that half: an exact-token golden may not reproduce
+// across CPU microarchitectures.
 const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0xe5a37ab078db3a2c),
     (
         "Tell me a short story about a brave knight.",
         48,
-        per_os(0x47634670c5e2ac70, 0x28e39d5dd5b5f858),
+        per_os(0x5147de9a0ddfae50, 0x5147de9a0ddfae50),
     ),
 ];
 

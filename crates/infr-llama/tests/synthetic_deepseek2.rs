@@ -1650,11 +1650,11 @@ fn deepseek4_model() -> SyntheticModel {
     dsv4_model(&dsv4_dims())
 }
 
-/// The refusal `generate_dense_backend` returns for a V4 model with any COMPRESSED (ratio 4 or 128)
-/// layer — the canonical fixture's first blocker. Keyed on the invariant half of the message: which
-/// tier generates. The layer index and the ratio are in the other half, and the tests that care
-/// about them assert those separately.
-const DSV4_REFUSAL: &str = "only the ratio-0 tier (pure sliding window) generates";
+/// The refusal `generate_dense_backend` returns for a V4 model with a ratio-4 (CSA) layer — the
+/// canonical fixture's first blocker. Keyed on the invariant half of the message: which tier does
+/// not generate. The layer index is in the other half, and the tests that care about it assert it
+/// separately.
+const DSV4_REFUSAL: &str = "has compress_ratio 4: the CSA tier does not generate yet";
 
 /// The error a `deepseek4` fixture fails with, from EITHER the model load or the prefill, as a full
 /// `{:#}` chain. Both are damage sites for this arch — a missing `token_embd` is refused by
@@ -2339,38 +2339,59 @@ fn synthetic_deepseek4_rope_scaling_keys_are_read() {
     );
 }
 
-/// **A COMPRESSED layer is still refused, by name, and the message says which layer and which
-/// tier.** The ratio-0 tier generates (see the `synthetic_deepseek4_ratio0_*` tests below); ratios 4
-/// and 128 need the compressed-KV state machine, which does not exist — and running them through
-/// the ratio-0 graph would silently drop every long-range key, not fail.
+/// **A CSA (ratio 4) layer is still refused, by name, and the message says which layer.** Ratios 0
+/// and 128 generate on the CPU; ratio 4 needs the overlapping compressor and the lightning
+/// indexer, which are not emitted yet — and running it through the ratio-0 graph would silently
+/// drop every long-range key, not fail.
 ///
-/// The canonical fixture's layer 1 is the first non-zero ratio, so that is the layer named.
+/// The canonical fixture's layer 1 is the first ratio-4 layer, so that is the layer named. Its
+/// ratio-128 layer 2 is not what refuses: a model whose only compressed layer is ratio 128
+/// generates, here on the CPU (`synthetic_deepseek4_llama_cpp.rs` scores that tier against
+/// llama.cpp).
 #[test]
-fn synthetic_deepseek4_refuses_a_compressed_layer() {
+fn synthetic_deepseek4_refuses_a_csa_layer() {
     let err = dsv4_err("ds4-refusal", &deepseek4_model());
     println!("deepseek4 graph build: {err}");
     assert_eq!(
         err,
-        "arch=deepseek4 (DeepSeek V4) layer 1 has compress_ratio 4: only the ratio-0 tier (pure \
-         sliding window) generates. A compressed layer needs the CSA compressor over blocks of 4 \
-         tokens, its persistent compressor state, the CSA/HCA block cache and the lightning \
-         indexer with its own compressor + LID cache — none of which is implemented. See \
-         docs/deepseek.md § Stage 4."
+        "arch=deepseek4 (DeepSeek V4) layer 1 has compress_ratio 4: the CSA tier does not \
+         generate yet. It needs the overlapping CSA compressor over blocks of 4 tokens and the \
+         lightning indexer with its own compressor + LID cache; ratio-0 and ratio-128 (HCA) \
+         layers generate, on the CPU backend. See docs/deepseek.md § Stage 4."
     );
 
-    // The OTHER compressed tier names itself too — a model whose only non-zero ratio is 128 must
-    // not be reported as a CSA layer.
     let mut d = dsv4_dims();
     d.compress_ratios = vec![0, 0, 128, 0, 0];
     d.hash_layer_count = 0;
-    let err = dsv4_err("ds4-refusal-hca", &dsv4_model(&d));
-    println!("deepseek4 hca-only graph build: {err}");
+    let logits = cpu_logits("ds4-hca-only", &dsv4_model(&d));
     assert!(
-        err.contains("layer 2 has compress_ratio 128")
-            && err.contains("HCA compressor over blocks of 128 tokens")
-            && !err.contains("lightning indexer"),
-        "the ratio-128 refusal must name the HCA tier and NOT the indexer (which is ratio 4's), \
-         got: {err}"
+        logits.iter().all(|v| v.is_finite()),
+        "a ratio-128-only V4 model must generate on the CPU, got {logits:?}"
+    );
+}
+
+/// **A compressed V4 layer is refused on Vulkan, loudly.** The HCA emit's graph has been checked
+/// against llama.cpp on the CPU only; until a GPU run is checked against it (plan 09 S9) a GPU
+/// backend must refuse the model by name rather than run it unverified, and say how to select the
+/// CPU. The refusal comes before the weight upload, which the GPU binder would otherwise run.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_synthetic_deepseek4_refuses_a_compressed_layer_on_vulkan() {
+    let _lk = gpu_serial_lock();
+    let mut d = dsv4_dims();
+    d.compress_ratios = vec![0, 0, 128, 0, 0];
+    d.hash_layer_count = 0;
+    let tmp = TempGguf::write("ds4-hca-vk", &dsv4_model(&d));
+    let err = match load(&tmp).prefill_logits_vulkan(PROMPT) {
+        Ok(logits) => panic!("Vulkan ran a compressed V4 layer: {logits:?}"),
+        Err(e) => format!("{e:#}"),
+    };
+    println!("deepseek4 hca on vulkan: {err}");
+    assert!(
+        err.contains("layer 2 has compress_ratio 128: the compressed tiers run on the CPU")
+            && err.contains("this is the vulkan backend")
+            && err.contains("`--dev cpu`, `INFR_DEV=cpu`"),
+        "the Vulkan refusal must name the layer and the backend, got: {err}"
     );
 }
 

@@ -6,8 +6,9 @@ use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
 use super::weights::{
-    AttnW, BoundWeights, DeltaW, Dsv4W, FfnW, HcTriple, IndexerW, LayerHcW, LayerW, MixerW, MlaW,
-    MoeSharedW, SeamKv, SeamWeights, SessionStable, ShortConvW,
+    AttnW, BoundWeights, DeltaW, Dsv4CompW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W, FfnW, HcTriple,
+    IndexerW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, SeamKv, SeamWeights, SessionStable,
+    ShortConvW,
 };
 use super::{common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, WBytes};
 use crate::seam::TokenEmbd;
@@ -108,11 +109,12 @@ fn resident_after_gen(cur: &[u32], last_written: Option<usize>) -> Vec<u32> {
 }
 
 /// Bind the per-layer IO + weights shared by EVERY decode/prefill/verify/denoise execution: the
-/// `rope_freqs` Input (when present), each layer's K/V cache pair, and the flat weight list
-/// (declaration == upload order). Extracted so the four bind sites (denoise, verify, record-once,
-/// per-token) can never drift — a forgotten bind here (e.g. `rope_freqs`) is a live unbound-Input
-/// panic at execute. The caller still binds the per-site pieces (hidden/tok_ids, positions,
-/// logits, sampling/h-tap/ipl/SC handles).
+/// `rope_freqs` Input (when present), each layer's K/V cache pair and V4 compressed-tier buffers,
+/// the graph's per-step i32 inputs (`step_bufs`, from [`upload_step_i32`]), and the flat weight
+/// list (declaration == upload order). Extracted so the bind sites (denoise, verify, record-once,
+/// per-token, prefill chunks) can never drift — a forgotten bind here (e.g. `rope_freqs`) is a live
+/// unbound-Input panic at execute. The caller still binds the per-site pieces (hidden/tok_ids,
+/// positions, logits, sampling/h-tap/ipl/SC handles).
 #[allow(clippy::type_complexity)]
 fn bind_layer_io<'a>(
     b: &mut Bindings<'a>,
@@ -122,6 +124,8 @@ fn bind_layer_io<'a>(
     yff_buf: &'a Option<(Box<dyn Buffer>, usize)>,
     kbufs: &'a [Box<dyn Buffer>],
     vbufs: &'a [Box<dyn Buffer>],
+    cbufs: &'a [Vec<Box<dyn Buffer>>],
+    step_bufs: &'a [Box<dyn Buffer>],
     wbufs: &'a [Box<dyn Buffer>],
 ) {
     if let (Some(rid), Some((rb, _))) = (h.rope_freqs, rf_buf) {
@@ -137,6 +141,12 @@ fn bind_layer_io<'a>(
         if h.v_cache[l] != h.k_cache[l] {
             b.bind(h.v_cache[l], vbufs[l].as_ref());
         }
+        for (id, buf) in h.comp[l].iter().zip(&cbufs[l]) {
+            b.bind(*id, buf.as_ref());
+        }
+    }
+    for ((id, _), buf) in h.step_i32.iter().zip(step_bufs) {
+        b.bind(*id, buf.as_ref());
     }
     for (i, wid) in h.weights.iter().enumerate() {
         b.bind(*wid, wbufs[i].as_ref());
@@ -246,6 +256,11 @@ fn session_stable(
             c.rope_yarn_beta_fast,
             c.rope_yarn_beta_slow,
         ))
+    } else if c.deepseek4 && (0..c.n_layer).any(|l| c.layer_compress_ratio(l) != 0) {
+        // DeepSeek V4 has no `qk_rope_dim`; the same Input carries the divisors of every rope on
+        // its COMPRESSED layers (`Config::dsv4_compressed_rope_divisors`). Ratio-0 layers rope
+        // plain and never read it.
+        c.dsv4_compressed_rope_divisors()
     } else {
         None
     };
@@ -360,18 +375,61 @@ pub(super) struct DecodeHandles {
     tok_id: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
+    // DeepSeek V4: each layer's compressed-tier buffer Inputs, bound to `SeamKv::cbufs[l]` in
+    // `crate::seam::dsv4_comp_bufs` order; empty for every other layer.
+    comp: Vec<Vec<TensorId>>,
+    // Per-step i32 Inputs whose values the build computed from this graph's positions (V4's
+    // compressor plan: APE row ids, gather indices, block rope positions), with those values. The
+    // driver uploads each into a buffer of its own and binds it (`upload_step_i32`).
+    step_i32: Vec<(TensorId, Vec<i32>)>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
-/// Zero every recurrent layer's state (`Config::recurrent_state_elems`) in `kbufs`/`vbufs`, the
-/// start a turn that cannot reuse the state prefills from.
-fn zero_recurrent_state(
+/// Upload each of `h.step_i32`'s values into a buffer of its own, in the same order, for
+/// [`bind_layer_io`] to bind. Empty, and free, for every graph without such inputs.
+fn upload_step_i32(be: &dyn Backend, h: &DecodeHandles) -> AResult<Vec<Box<dyn Buffer>>> {
+    h.step_i32
+        .iter()
+        .map(|(_, v)| {
+            let b = be
+                .alloc(v.len() * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(b.as_ref(), bytemuck::cast_slice(v))
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(b)
+        })
+        .collect()
+}
+
+/// Zero every recurrent layer's state (`Config::recurrent_state_elems`) in `kbufs`/`vbufs` and
+/// every V4 compressor state ring in `cbufs`, the start a turn that cannot reuse the state
+/// prefills from (`Config::has_unrewindable_state`).
+///
+/// A V4 compressed cache is left as it is, because of the invariant the no-rewind rule keeps:
+/// every ring row and compressed row a graph reads was written since the last reset, by the one
+/// contiguous sequence `cached` describes (an extending turn reads the rows earlier turns of that
+/// sequence wrote; every other turn resets first). Within that sequence a compressed row is read
+/// only once its block is committed — the segment's `len` is the graph's widest visible count and
+/// the attention masks each query row to its own `(pos+1)/ratio` — and a block pools only the
+/// positions from its first to the one that completes it, every one written earlier in the
+/// sequence (through the ring) or by this graph (its own rows). HCA reads no position below 0, so
+/// the gather fill is never used. Zeroing a cache would cost a context-sized upload for
+/// nothing; zeroing the rings is cheap and makes a reset session's state equal a fresh one's.
+fn zero_unrewindable_state(
     be: &dyn Backend,
     c: &Config,
+    max_ctx: usize,
+    k_fmt: DType,
     kbufs: &[Box<dyn Buffer>],
     vbufs: &[Box<dyn Buffer>],
+    cbufs: &[Vec<Box<dyn Buffer>>],
 ) -> AResult<()> {
     for l in 0..c.n_layer {
+        let geometry = crate::seam::dsv4_comp_bufs(c, l, max_ctx, k_fmt);
+        for (b, buf) in geometry.iter().zip(&cbufs[l]).filter(|(b, _)| b.ring) {
+            be.upload(buf.as_ref(), bytemuck::cast_slice(&vec![0f32; b.elems]))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
         if let Some((k_elems, v_elems)) = c.recurrent_state_elems(l) {
             be.upload(
                 kbufs[l].as_ref(),
@@ -690,6 +748,25 @@ pub(crate) fn generate_dense_backend_bound(
         && crate::seam::kv_ring_wanted(c, ec)
         && matches!(k_fmt, DType::F16 | DType::Q8_0)
         && matches!(v_fmt, DType::F16 | DType::Q8_0);
+
+    // DeepSeek V4's compressed tiers on a GPU backend. Their graph (`Op::GatherRows`,
+    // `Op::CompressPool`, the compressor ring persisted through `Op::Copy` into an f32 Input, the
+    // two-segment `Op::Attention`) is checked against llama.cpp on the CPU interpreter only; no GPU
+    // backend has run it (plan 09 slice S9). Refused before the weight upload and the cache
+    // allocation, unlike the tier refusals below, which sit after the upload on purpose so that
+    // every tensor of a V4 file is validated first; this one does not depend on the tensors.
+    if c.deepseek4 && be.name() != "cpu" {
+        if let Some(l) = (0..c.n_layer).find(|&l| c.layer_compress_ratio(l) != 0) {
+            return Err(anyhow!(
+                "arch=deepseek4 (DeepSeek V4) layer {l} has compress_ratio {}: the compressed \
+                 tiers run on the CPU backend only so far, and this is the {} backend. Select the \
+                 CPU backend with `--dev cpu`, `INFR_DEV=cpu`, or `dev = \"cpu\"` under \
+                 `[device]` in the config file. See docs/deepseek.md § Stage 4.",
+                c.layer_compress_ratio(l),
+                be.name()
+            ));
+        }
+    }
 
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
     if state.is_none() {
@@ -1297,9 +1374,18 @@ pub(crate) fn generate_dense_backend_bound(
             })
             .collect();
         let room = be.device_alloc_room();
+        // The guard sees every KV-class allocation this init makes: the K/V pairs, then a V4
+        // compressed layer's block caches and rings, one entry each.
+        let guarded: Vec<(usize, usize)> = kv_sizes
+            .iter()
+            .copied()
+            .chain(
+                (0..c.n_layer).flat_map(|l| crate::seam::dsv4_comp_allocs(c, l, want_ctx, k_fmt)),
+            )
+            .collect();
         crate::seam::refuse_unallocatable_kv(
             ec,
-            &kv_sizes,
+            &guarded,
             room,
             want_ctx,
             k_fmt,
@@ -1322,6 +1408,7 @@ pub(crate) fn generate_dense_backend_bound(
                     .map_err(|e| anyhow!("{e}"))?,
             );
         }
+        let cbufs = super::weights::alloc_dsv4_comp_bufs(be, c, want_ctx, k_fmt)?;
         // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
         // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
         be.kv_overflow_report();
@@ -1389,6 +1476,7 @@ pub(crate) fn generate_dense_backend_bound(
             stable: std::sync::Arc::clone(&stable),
             kbufs,
             vbufs,
+            cbufs,
             k_fmt,
             v_fmt,
             hidden_buf,
@@ -1417,6 +1505,7 @@ pub(crate) fn generate_dense_backend_bound(
         stable: _,
         kbufs,
         vbufs,
+        cbufs,
         k_fmt: _,
         v_fmt: _,
         hidden_buf,
@@ -1488,9 +1577,10 @@ pub(crate) fn generate_dense_backend_bound(
     //
     // A recurrent layer's state (qwen35's gated DeltaNet, LFM's short convolution) is an
     // APPEND-ONLY summary, not a per-position cache — it can't rewind to an arbitrary shared prefix
-    // the way a real KV cache can. So a turn reuses it ONLY when `prompt` exactly EXTENDS `cached`
-    // (mirrors the old seam's `SeamState` rule); anything else (divergent prompt, identical resend,
-    // first-ever call) zero-resets every recurrent layer's state and re-prefills from scratch.
+    // the way a real KV cache can, and neither can a DeepSeek V4 compressor's ring and block cache
+    // (`Config::has_unrewindable_state` has why). So a turn reuses it ONLY when `prompt` exactly
+    // EXTENDS `cached` (mirrors the old seam's `SeamState` rule); anything else (divergent prompt,
+    // identical resend, first-ever call) zero-resets that state and re-prefills from scratch.
     // Dense/attention models keep the generic longest-common-prefix diff.
     //
     // SWA ring rewind guard: a ring layer RETAINS only its last `rows_l` positions — rows for
@@ -1516,7 +1606,7 @@ pub(crate) fn generate_dense_backend_bound(
         // No-op: a denoise call never touches `cached` (it isn't part of the prompt/generation
         // token stream) — `cached.truncate(start)` below is then a truncate-to-current-length.
         cached.len()
-    } else if c.has_recurrent_state() {
+    } else if c.has_unrewindable_state() {
         let pfx = common_prefix_len(cached, prompt);
         // An EMPTY `cached` never reuses: the buffers can still hold a warmup generation's or a
         // pre-`SeamKv::reset` conversation's state, which `cached` no longer describes. Nor does
@@ -1568,7 +1658,7 @@ pub(crate) fn generate_dense_backend_bound(
             cached.clear();
             *written_end = 0;
             super::weights::invalidate_delta(mtp_delta_ckpt);
-            zero_recurrent_state(be, c, &kbufs[..], &vbufs[..])?;
+            zero_unrewindable_state(be, c, max_ctx, k_fmt, &kbufs[..], &vbufs[..], &cbufs[..])?;
             0
         }
     } else {
@@ -1587,14 +1677,14 @@ pub(crate) fn generate_dense_backend_bound(
         start
     } else {
         debug_assert!(
-            !c.has_recurrent_state(),
+            !c.has_unrewindable_state(),
             "the SWA ring refused a reuse the recurrent-state arm allowed"
         );
-        if c.has_recurrent_state() {
+        if c.has_unrewindable_state() {
             cached.clear();
             *written_end = 0;
             super::weights::invalidate_delta(mtp_delta_ckpt);
-            zero_recurrent_state(be, c, &kbufs[..], &vbufs[..])?;
+            zero_unrewindable_state(be, c, max_ctx, k_fmt, &kbufs[..], &vbufs[..], &cbufs[..])?;
         }
         0
     };
@@ -1610,7 +1700,7 @@ pub(crate) fn generate_dense_backend_bound(
     // what it fed (the verify return and the teardown below) is a deliberate backstop to that.
     // The one effect of its own: with `cached` empty, the next call cannot take the
     // snapshot-resume arm either, so it re-prefills from zero rather than from the snapshot.
-    if c.has_recurrent_state() && denoise_req.is_none() {
+    if c.has_unrewindable_state() && denoise_req.is_none() {
         cached.clear();
     }
 
@@ -1682,33 +1772,26 @@ pub(crate) fn generate_dense_backend_bound(
         && caps.gpu_sample
         && ec.spec.gpu_sample;
 
-    // DeepSeek V4: the `compress_ratio == 0` tier emits (hyper-connections, MQA attention with
-    // sinks and the grouped output projection, MoE with the per-layer SwiGLU clamp under EITHER
+    // DeepSeek V4: the `compress_ratio == 0` tier and the ratio-128 (HCA) tier emit
+    // (hyper-connections, MQA attention with sinks and the grouped output projection, the HCA
+    // compressor and its two-segment attention, MoE with the per-layer SwiGLU clamp under EITHER
     // routing — the router bias, or the `ffn_gate_tid2eid` hash table). What is left below is the
-    // compressed tiers, refused by name rather than approximated because they would otherwise run
-    // and produce plausible wrong numbers, plus the shape facts the emit assumes. Placed after the
-    // weight upload on purpose, exactly as the deepseek32 slice was: a `deepseek4` GGUF still gets
-    // every tensor it declares validated end to end. See docs/deepseek.md § Stage 4.
+    // CSA tier and the compressed tiers on a GPU, refused by name rather than approximated because
+    // they would otherwise run and produce plausible wrong numbers, plus the shape facts the emit
+    // assumes. Placed after the weight upload on purpose, exactly as the deepseek32 slice was: a
+    // `deepseek4` GGUF still gets every tensor it declares validated end to end. See
+    // docs/deepseek.md § Stage 4.
     if c.deepseek4 {
-        // Ratios 4 and 128. Their compressed caches, the three compressor states, the per-channel
-        // softmax pooling op and the block-counting lightning indexer are all still missing — see
-        // docs/backlog.md § B-DSV4-WIRING slice B. Naming the layer AND its ratio, because a real
-        // V4 file mixes tiers and "which layer" is the first thing to know.
-        if let Some((l, r)) = (0..c.n_layer)
-            .map(|l| (l, c.layer_compress_ratio(l)))
-            .find(|&(_, r)| r != 0)
-        {
+        // Ratio 4: the overlapping CSA compressor, the lightning indexer and its LID cache are not
+        // emitted yet (docs/plan/09-deepseek-v4-compressed.md slice S7). Naming the layer, because
+        // a real V4 file mixes tiers and "which layer" is the first thing to know.
+        if let Some(l) = (0..c.n_layer).find(|&l| c.layer_compress_ratio(l) == 4) {
             return Err(anyhow!(
-                "arch=deepseek4 (DeepSeek V4) layer {l} has compress_ratio {r}: only the ratio-0 \
-                 tier (pure sliding window) generates. A compressed layer needs the {} compressor \
-                 over blocks of {r} tokens, its persistent compressor state, the CSA/HCA block \
-                 cache{} — none of which is implemented. See docs/deepseek.md § Stage 4.",
-                if r == 4 { "CSA" } else { "HCA" },
-                if r == 4 {
-                    " and the lightning indexer with its own compressor + LID cache"
-                } else {
-                    ""
-                },
+                "arch=deepseek4 (DeepSeek V4) layer {l} has compress_ratio 4: the CSA tier does \
+                 not generate yet. It needs the overlapping CSA compressor over blocks of 4 \
+                 tokens and the lightning indexer with its own compressor + LID cache; ratio-0 \
+                 and ratio-128 (HCA) layers generate, on the CPU backend. See docs/deepseek.md § \
+                 Stage 4."
             ));
         }
         // Hash-routed layers: `Op::GatherI32` reads the token's row of `ffn_gate_tid2eid` and
@@ -1824,17 +1907,6 @@ pub(crate) fn generate_dense_backend_bound(
         assert!(
             l_first == 0 || !e2b,
             "gemma4-E2B cannot start a layer span past layer 0 (per_layer_inp is prologue-built)"
-        );
-        // Backstop for the `c.deepseek4` refusals above. `wpush` below declares V4's handles in
-        // lockstep with the upload loop, and a compressed (ratio 4/128) layer uploads FOUR to TEN
-        // more tensors than the ratio-0 arm declares — so reaching the builder with one would bind
-        // every later weight in the layer, and every weight of every later layer, one buffer off.
-        // Silently. Fail at the seam instead of somewhere inside a kernel.
-        assert!(
-            !c.deepseek4 || (0..c.n_layer).all(|l| c.layer_compress_ratio(l) == 0),
-            "deepseek4 reached the graph builder with a non-zero compress_ratio: `wpush`'s Dsv4 arm \
-             declares the ratio-0 tensor set only, so the refusal in `generate_dense_backend` must \
-             not be removed until the compressed tiers have handles of their own"
         );
         // The widened `[batch, hc_mult, n_embd]` residual stream lives in graph scratch and is
         // collapsed back to `[batch, n_embd]` only by the model head. A partial layer span carries
@@ -1960,6 +2032,32 @@ pub(crate) fn generate_dense_backend_bound(
                 g.input(vd(crate::seam::kv_side_elems(rows_l * v_row)))
             });
         }
+        // DeepSeek V4 compressed layers' block caches and state rings, declared at the geometry
+        // the session allocated them with (`crate::seam::dsv4_comp_bufs`).
+        let comp: Vec<Vec<TensorId>> = (0..c.n_layer)
+            .map(|l| {
+                crate::seam::dsv4_comp_bufs(c, l, max_ctx, k_fmt)
+                    .iter()
+                    .map(|b| g.input(TensorDesc::new(vec![b.elems], b.dtype)))
+                    .collect()
+            })
+            .collect();
+        // The compressor plan of this graph's positions, per tier, with the per-step inputs it
+        // declares (`super::dsv4_emit::Dsv4Tier`). One per graph: every layer of a tier shares
+        // the positions, so it shares the plan, the inputs and the scratch.
+        let mut step_i32: Vec<(TensorId, Vec<i32>)> = Vec::new();
+        let hca_tier = (l_first..l_end)
+            .find(|&l| c.layer_compress_ratio(l) == super::dsv4_plan::DSV4_HCA_RATIO as usize)
+            .map(|l| {
+                super::dsv4_emit::Dsv4Tier::hca(
+                    &mut g,
+                    c,
+                    start_pos,
+                    batch,
+                    &crate::seam::dsv4_comp_bufs(c, l, max_ctx, k_fmt),
+                    &mut step_i32,
+                )
+            });
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from
         // `wspecs` so each handle carries its native GGUF dtype (the backend dequants on read).
@@ -1981,7 +2079,7 @@ pub(crate) fn generate_dense_backend_bound(
             let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
             let is_sc = c.is_shortconv_layer(l);
             let is_mla = c.deepseek2;
-            let mixer = if c.deepseek4 {
+            let mut mixer = if c.deepseek4 {
                 // EXACT order of `wload`'s `is_dsv4` arm — `wpush` consumes `wspecs` sequentially,
                 // so one handle out of place binds every later weight in the model one buffer off,
                 // silently. The two hyper-connection triples are pushed right after `wo_b` for the
@@ -1995,6 +2093,8 @@ pub(crate) fn generate_dense_backend_bound(
                     wkv_norm: wpush(&mut g, &mut weights),
                     wo_a: wpush(&mut g, &mut weights),
                     wo_b: wpush(&mut g, &mut weights),
+                    // Declared after the hyper-connection triples below, in upload order.
+                    comp: None,
                 })
             } else if is_mla {
                 let (wq_a, q_a_norm) = if c.is_lite {
@@ -2127,6 +2227,30 @@ pub(crate) fn generate_dense_backend_bound(
                     scale: wpush(&mut g, &mut weights),
                 },
             });
+            // A compressed V4 layer's compressor, then a ratio-4 layer's indexer: `wload`'s
+            // `ratio != 0` and `ratio == 4` blocks, which upload right after the two triples.
+            if let MixerW::Dsv4(d) = &mut mixer {
+                let ratio = c.layer_compress_ratio(l);
+                // One compressor's four handles, in `wload`'s `kv, gate, ape, norm` order (a
+                // struct expression evaluates its fields in the order written).
+                fn compressor(mut next: impl FnMut() -> TensorId) -> Dsv4CompressorW {
+                    Dsv4CompressorW {
+                        kv: next(),
+                        gate: next(),
+                        ape: next(),
+                        norm: next(),
+                    }
+                }
+                if ratio != 0 {
+                    let attn = compressor(|| wpush(&mut g, &mut weights));
+                    let indexer = (ratio == 4).then(|| Dsv4IndexerW {
+                        proj: wpush(&mut g, &mut weights),
+                        attn_q_b: wpush(&mut g, &mut weights),
+                        comp: compressor(|| wpush(&mut g, &mut weights)),
+                    });
+                    d.comp = Some(Dsv4CompW { attn, indexer });
+                }
+            }
             // bitnet SubLN attention-output norm — mirrors the `wload` push right after
             // `attn_output.weight` (loaded under the same `c.sub_norm && !is_delta` gate; bitnet
             // has no DeltaNet layers, so `is_delta` is always false there).
@@ -3093,12 +3217,13 @@ pub(crate) fn generate_dense_backend_bound(
                     w_off: 0,
                 });
             } else if let MixerW::Dsv4(mw) = &lw.mixer {
-                // ── DeepSeek V4 attention, `compress_ratio == 0` (pure sliding window) ─────────
-                // `docs/deepseek.md` § Stage 4. Every non-zero ratio was refused before the graph
-                // was built, so this arm is the WHOLE of V4's attention today.
+                // ── DeepSeek V4 attention ─────────────────────────────────────────────────────
+                // `docs/deepseek.md` § Stage 4. A ratio-0 layer is pure sliding window; a ratio-128
+                // (HCA) layer adds its compressor between the raw cache write and the attention,
+                // and attends its compressed cache beside the raw window. Ratio 4 was refused
+                // before the graph was built.
                 let hd4 = c.head_dim as u32; // MQA: one KV head of this width serves every q head
                 let rd = c.rope_dim as u32;
-                let nope4 = hd4 - rd; // the head is [nope | rope]; the ROPED dims are LAST
                 let qrow4 = (nh as u32) * hd4;
                 let qlr = c.q_lora_rank as u32;
                 let ogc = c.o_group_count as u32;
@@ -3106,11 +3231,12 @@ pub(crate) fn generate_dense_backend_bound(
                 let hdg = qrow4 / ogc;
                 // Ratio-0 layers rope PLAIN: `deepseek4.cpp` passes `freq_scale = 1`,
                 // `ext_factor = 0` and both betas 0 there, so there is no YaRN ramp and no mscale
-                // — only the compressed tiers use `compress_rope_theta` with YaRN. That is also
-                // what makes the `backward` de-rope below an exact inverse of the forward rope
-                // (`Op::Rope::backward`'s doc: ggml's forward-then-back scales by mscale², and V4
-                // cancels mscale to 1 at every one of its rope call sites).
-                let theta4 = c.rope_theta;
+                // — only the compressed tiers use `compress_rope_theta` with YaRN, on every rope
+                // of the layer (`Dsv4Rope::for_layer`). Either way the `backward` de-rope below is
+                // an exact inverse of the forward rope (`Op::Rope::backward`'s doc: ggml's
+                // forward-then-back scales by mscale², and V4 cancels mscale to 1 at every one of
+                // its rope call sites).
+                let rope4 = super::dsv4_emit::Dsv4Rope::for_layer(c, l, yarn_ff);
 
                 // Q: wq_a → q_a_norm → wq_b, then a WEIGHTLESS per-head RMS norm (bare
                 // `ggml_rms_norm` after the reshape to [head_dim, n_head, n_tokens] — there is no
@@ -3151,50 +3277,10 @@ pub(crate) fn generate_dense_backend_bound(
                     eps,
                     x_stride: 0,
                 });
-                // Rope the head's TAIL. `Op::Rope` rotates `[0, rope_dim)` of each head and passes
-                // the rest through, so the roped slice is extracted, rotated and written back —
-                // the same dance the MLA arm does for `k_pe`, in ONE `CopyStrided` each way: with
-                // `rows = batch*n_head` and `src_stride = head_dim`, row `b*n_head+h` is exactly
-                // head `h` of token `b`, and `src_off = nope` lands on its rope tail. The packed
-                // `[batch, n_head, rope_dim]` result is then a plain `n_head`-head rope row.
+                // Rope the head's TAIL: `Dsv4Rope::tail` extracts each head's rope slice, rotates
+                // it and writes it back, the same dance the MLA arm does for `k_pe`.
                 let rope_tail = |g: &mut Graph, x: TensorId, pack: TensorId, heads: u32, back| {
-                    g.push(Op::CopyStrided {
-                        src: x,
-                        src_off: nope4,
-                        src_stride: hd4,
-                        dst: pack,
-                        dst_off: 0,
-                        dst_stride: rd,
-                        rows: (batch as u32) * heads,
-                        n: rd,
-                    });
-                    g.push(Op::Rope {
-                        x: pack,
-                        positions,
-                        dst: pack,
-                        rows: batch as u32,
-                        n_head: heads,
-                        head_dim: rd,
-                        rope_dim: rd,
-                        theta: theta4,
-                        freq_factors: None,
-                        x_stride: 0,
-                        // NORM (interleaved pairs) — `llama_model::rope_type` puts DEEPSEEK4 in
-                        // the NORM group, and V4's indexer does NOT inherit V3.2's NEOX override
-                        // (docs/deepseek.md § Stage 4, "Two corrections").
-                        neox: false,
-                        backward: back,
-                    });
-                    g.push(Op::CopyStrided {
-                        src: pack,
-                        src_off: 0,
-                        src_stride: rd,
-                        dst: x,
-                        dst_off: nope4,
-                        dst_stride: hd4,
-                        rows: (batch as u32) * heads,
-                        n: rd,
-                    });
+                    rope4.tail(g, x, pack, batch as u32, heads, positions, back);
                 };
                 if rd > 0 {
                     rope_tail(&mut g, q, d4_rq, nh as u32, false);
@@ -3232,6 +3318,19 @@ pub(crate) fn generate_dense_backend_bound(
                     row_stride: hd4,
                     pos: start_pos as u32,
                 });
+                // An HCA layer's compressor commits every block this graph completes BEFORE the
+                // attention below, so the token that completes a block attends it.
+                let comp_seg = mw.comp.as_ref().and_then(|cw| {
+                    assert!(
+                        cw.indexer.is_none(),
+                        "a ratio-4 V4 layer reached the emit: the CSA tier is refused before the \
+                         graph is built"
+                    );
+                    hca_tier
+                        .as_ref()
+                        .expect("an HCA layer's graph declares the HCA tier")
+                        .emit_hca(&mut g, &cw.attn, hn, ne as u32, &comp[l], rope4, eps)
+                });
                 // The attention kernels read an **f16** q (`q16`), so the normed+roped f32 query is
                 // cast into it exactly as a NoPE layer casts its unroped one — `Op::Copy`,
                 // whose lowering does the f32→f16 conversion. The rope itself has to stay on the
@@ -3260,10 +3359,10 @@ pub(crate) fn generate_dense_backend_bound(
                     mask,
                     pos: start_pos as u32,
                     sinks: Some(mw.sinks),
-                    // CSA's top-k score bias is not wired into this builder yet (see
-                    // `docs/backlog.md`) — landed but unwired, same as `Op::CompressPool` was.
+                    // V4 has no raw-side score bias; CSA's top-k selection rides the compressed
+                    // segment's own `bias`.
                     key_bias: None,
-                    comp: None,
+                    comp: comp_seg,
                 });
                 // DE-ROPE the attention output's rope slice, per head, by the QUERY position —
                 // `ggml_rope_ext_back` at the same theta and layout as the forward q rope. Nothing
@@ -4826,6 +4925,8 @@ pub(crate) fn generate_dense_backend_bound(
                 tok_id,
                 k_cache,
                 v_cache,
+                comp,
+                step_i32,
                 weights,
             },
         )
@@ -5103,6 +5204,7 @@ pub(crate) fn generate_dense_backend_bound(
         .map_err(|e| anyhow!("{e}"))?;
         be.upload(dcache.pos_buf.as_ref(), bytemuck::cast_slice(&dn_positions))
             .map_err(|e| anyhow!("{e}"))?;
+        let step_bufs = upload_step_i32(be, &dcache.dh)?;
         let mut db = Bindings::new();
         db.bind(dcache.dh.hidden, dcache.hidden_buf.as_ref());
         db.bind(dcache.dh.positions, dcache.pos_buf.as_ref());
@@ -5114,6 +5216,8 @@ pub(crate) fn generate_dense_backend_bound(
             yff_buf,
             &kbufs[..],
             &vbufs[..],
+            &cbufs[..],
+            &step_bufs[..],
             &wbufs[..],
         );
         if plan_sc {
@@ -5357,6 +5461,7 @@ pub(crate) fn generate_dense_backend_bound(
         } else {
             None
         };
+        let step_bufs = upload_step_i32(be, &vh)?;
         let mut vb = Bindings::new();
         vb.bind(vh.hidden, vf_hidden_buf.as_ref());
         vb.bind(vh.positions, vf_pos_buf.as_ref());
@@ -5368,6 +5473,8 @@ pub(crate) fn generate_dense_backend_bound(
             yff_buf,
             &kbufs[..],
             &vbufs[..],
+            &cbufs[..],
+            &step_bufs[..],
             &wbufs[..],
         );
         vb.bind(
@@ -5767,6 +5874,7 @@ pub(crate) fn generate_dense_backend_bound(
                 let t_build = pf_t0.elapsed();
                 let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
                 let t_compile = pf_t0.elapsed();
+                let step_bufs = upload_step_i32(be, &pf_h)?;
                 let mut pf_b = Bindings::new();
                 if let Some(ids) = pf_h.tok_ids {
                     pf_b.bind(ids, ch.input.as_ref());
@@ -5790,6 +5898,8 @@ pub(crate) fn generate_dense_backend_bound(
                     yff_buf,
                     &kbufs[..],
                     &vbufs[..],
+                    &cbufs[..],
+                    &step_bufs[..],
                     &wbufs[..],
                 );
                 debug_assert!(
@@ -5922,6 +6032,8 @@ pub(crate) fn generate_dense_backend_bound(
             yff_buf,
             &kbufs[..],
             &vbufs[..],
+            &cbufs[..],
+            &[],
             &wbufs[..],
         );
         b.bind(
@@ -5935,9 +6047,11 @@ pub(crate) fn generate_dense_backend_bound(
             b.bind(uin, u_buf.as_ref());
         }
         // The backend's own answer, not the gate's guess: a plan it will not replay is dropped
-        // here and every token takes the per-token path below, built at its true position.
-        be.decode_replay_ready(plan.as_ref(), &b)
-            .then_some((plan, b))
+        // here and every token takes the per-token path below, built at its true position. So is
+        // a graph with per-step inputs (V4's compressor plan, which the mirror above already
+        // excludes): a replay keeps one position's values for every step, and they are not bound
+        // here at all.
+        (h.step_i32.is_empty() && be.decode_replay_ready(plan.as_ref(), &b)).then_some((plan, b))
     } else {
         None
     };
@@ -6211,6 +6325,7 @@ pub(crate) fn generate_dense_backend_bound(
                 None,  // span: the whole model in one graph
             );
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
+            let step_bufs = upload_step_i32(be, &h)?;
             let mut b = Bindings::new();
             bind_step_input(
                 &mut b,
@@ -6231,6 +6346,8 @@ pub(crate) fn generate_dense_backend_bound(
                 yff_buf,
                 &kbufs[..],
                 &vbufs[..],
+                &cbufs[..],
+                &step_bufs[..],
                 &wbufs[..],
             );
             b.bind(

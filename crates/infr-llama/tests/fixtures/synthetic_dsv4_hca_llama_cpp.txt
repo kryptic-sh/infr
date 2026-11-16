@@ -9,6 +9,12 @@
 # logits at 131 tokens span [-2.7221613, 1.6976748]
 # logits at 300 tokens span [-2.0227432, 2.4540172]
 # logits at 520 tokens span [-3.547915, 3.8499446]
+# infr CPU at 7 tokens: max |logit diff| 1.847744e-6, probability cosine 0.9999999999998963, top-1 agrees
+# infr CPU at 30 tokens: max |logit diff| 5.2452087e-6, probability cosine 0.9999999999986635, top-1 agrees
+# infr CPU at 70 tokens: max |logit diff| 1.9788742e-5, probability cosine 0.9999999999924365, top-1 agrees
+# infr CPU at 131 tokens: max |logit diff| 3.838539e-5, probability cosine 0.9999999999134513, top-1 agrees
+# infr CPU at 300 tokens: max |logit diff| 2.0742416e-5, probability cosine 0.9999999999654294, top-1 agrees
+# infr CPU at 520 tokens: max |logit diff| 4.49121e-5, probability cosine 0.9999999999031617, top-1 agrees
 # tokens: 32 28 44 38 44 21 50
 -1.3774508
 1.1578025

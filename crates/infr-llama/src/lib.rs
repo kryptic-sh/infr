@@ -8,6 +8,11 @@
 //! TODO(next): move host ops to GPU; add a KV cache; fold into the `Model`/`Backend` seams.
 #![allow(clippy::needless_range_loop)]
 
+// The shared V4 test fixture (`tests/dsv4_fixture`) names this crate by its public name; unit
+// tests include it too (`seam::dsv4_emit`'s session tests), so the name must resolve in here.
+#[cfg(test)]
+extern crate self as infr_llama;
+
 pub mod arch;
 pub mod chat;
 mod config;

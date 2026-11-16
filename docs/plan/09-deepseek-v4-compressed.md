@@ -5,8 +5,8 @@ layer but two of the shipped V4-Flash file. Scoped on 2026-11-16 by reading
 llama.cpp at `5676dfbe0` (`src/models/deepseek4.cpp`,
 `src/llama-kv-cache-dsv4.cpp`, `src/llama-graph.cpp`, `src/models/models.h`).
 Statements marked **[I]** were inferred, not read; **[U]** are unknown. Nothing
-here has been built or run yet, except slices S0 to S4b and S5a (marked below).
-Cite functions, not lines: both reference files have grown since the notes in
+here has been built or run yet, except slices S0 to S6 (marked below). Cite
+functions, not lines: both reference files have grown since the notes in
 `docs/deepseek.md` were written.
 
 ## 0. The reference moved past our records
@@ -206,12 +206,13 @@ and the `dsv4_model` fixture.
    compressor and the indexer query are Hadamard-rotated in the reference
    (`attn_rot_k` is forced on for the LID cache); one orthogonal transform on
    both sides, so the emit skips it on both.
-6. **Persistent buffers** per layer, threaded through allocation, graph inputs,
-   reset, `fork`, `seed_from`, `kv_layer_alloc_bytes`, the footprint estimates;
-   V4 becomes not rewindable (audit the callers of `has_recurrent_state()` that
-   mean "cannot truncate").
-7. **`wpush` handles** mirroring `wload`, then drop the build closure's assert.
-8. **Per-step i32 inputs:** compressed-row positions, gather indices, APE rows.
+6. **Persistent buffers:** done in S5 — `seam::dsv4_comp_bufs`, held in
+   `SeamKv::cbufs`; see "S5 and S6" below for where they are threaded and the
+   no-rewind predicate.
+7. **`wpush` handles:** done in S5 — `Dsv4W::comp`, the build closure's assert
+   removed.
+8. **Per-step i32 inputs:** done in S6 — `Dsv4Tier`, bound through
+   `upload_step_i32`.
 9. **Fixtures:** the all-CSA, all-HCA and mixed layouts exist since S5a, as
    llama.cpp oracle cases (`synthetic_deepseek4_llama_cpp.rs`, section 4), all
    at `hc_mult = 4` and with YaRN keys. A one-layer `hc_mult = 1` variant for
@@ -235,8 +236,8 @@ unchanged.
 | S4a | **Done 2026-11-16.** CPU two-segment attention and the indexer block ratio                                                                             | equals single-segment attention over a concatenated cache with an explicit bias; `None` and ratio 1 bit-identical to today                                                                                                                                                                                   |
 | S4b | **Done 2026-11-16.** Vulkan: the same; Metal refuses the segment, its indexer kernel takes the ratio                                                   | CPU-vs-Vulkan op parity at head dim 48 and 512                                                                                                                                                                                                                                                               |
 | S5a | **Done 2026-11-16.** llama.cpp loads the synthetic V4 file; ratio-0 compared in CI; compressed-case data checked in, every biting indexer point robust | ratio-0 comparison red under a window off by one and under dropped sinks; digest guard red under a one-value change; robustness check red on the near-ties it found; sums parse test red on a dropped line; YaRN ramp test red at original context 65536; compare-only regeneration red on one changed logit |
-| S5  | Persistent buffers, geometry, the no-rewind predicate, `wpush` handles; refusal kept                                                                   | hand-computed V4-Flash footprint; a V4 session refuses a partial rewind                                                                                                                                                                                                                                      |
-| S6  | CPU HCA emit; lift the ratio-128 refusal; score the `hca` oracle case                                                                                  | perturbing `attn_compressor_kv` leaves positions 0..126 bit-identical and moves 127 on; a from-definition cache row on the one-layer fixture; a run split at 150 of 200 tokens equals the unsplit run                                                                                                        |
+| S5  | **Done 2026-11-16.** Persistent buffers, geometry, the no-rewind predicate, `wpush` handles                                                            | hand-computed V4-Flash footprint; a V4 session refuses a partial rewind                                                                                                                                                                                                                                      |
+| S6  | **Done 2026-11-16.** CPU HCA emit; lift the ratio-128 refusal; score the `hca` oracle case                                                             | perturbing `attn_compressor_kv` leaves positions 0..126 bit-identical and moves 127 on; a from-definition cache row on the one-layer fixture; a run split at 150 of 200 tokens equals the unsplit run                                                                                                        |
 | S7  | CPU CSA emit: overlap, LID, indexer, top-k; lift the last refusal; score `csa` and `mixed`                                                             | commit timing at position 3; from-definition rows 0 and 1 (row 1 reads block 0 as its previous half); with `top_k` 5, indexer weights are inert up to position 22 and move logits from 23; `top_k >= n_visible` equals zeroed indexer weights                                                                |
 | S8  | Real-file CPU oracle against llama.cpp                                                                                                                 | `cpu_prefill_matches_llama_debug_dump` on V4-Flash, one prompt under 100 tokens and one over 300 (HCA live); the `deepseek-v3` tokenizer question closed with `llama-tokenize`                                                                                                                               |
 | S9  | Vulkan whole model; then paged MoE with hash routing and the SwiGLU clamp (both refused today; the model exceeds 24 GB)                                | synthetic GPU-vs-CPU; the real-file dump comparison on Vulkan                                                                                                                                                                                                                                                |
@@ -259,6 +260,113 @@ Vulkan1 from the pre-change tree; the changed tree, with `comp: None` and
 `block_ratio: 1`, reproduced every one. Separately, the fifteen existing
 `attention_kv.comp` builds compile to byte-identical SPIR-V before and after
 (compiled with `build.rs`'s `glslc` flags and hashed).
+
+### S5 and S6: what was built, and what breaking it showed (2026-11-16)
+
+**Buffers.** `seam::dsv4_comp_bufs` is the one geometry: per HCA layer the
+compressed cache (`ceil(ctx/128)` rows of `head_dim`) and the ring's kv and
+score halves (f32, 128 rows of `head_dim`); per CSA layer the CSA cache and ring
+(8 rows of `2*head_dim`) and the LID cache and ring at `indexer_head_size`.
+Allocated in `generate_dense_backend`'s cold init and in `SeamKv::fork`
+(`SeamKv::cbufs`, geometry-checked against the source), declared as graph Inputs
+and bound in `bind_layer_io`, priced in `kv_bytes_estimate_fmt` (which the VRAM
+fit, the CPU RAM fit, the `--ctx` clamp and the live re-clamp all read) and
+listed one entry each in the KV allocation guard (`dsv4_comp_allocs`, from the
+runner and `kv_floor_alloc_bytes`). `kv_row_align_ok` holds the compressed rows
+to the 32-element block rule too. Pinned by
+`kv_footprint_of_deepseek4_flash_counts_its_compressed_tiers`: at the V4-Flash
+geometry and 4096 tokens of f16, 223 559 680 bytes, of which 40 386 560 are the
+compressed tiers. Multi-session serving forks slots, so it gets the buffers
+through `fork`.
+
+**Disagreement with section 1's table:** the compressed caches are not always
+f16. `llama_kv_cache_dsv4` builds every tier with the session's `type_k`, and
+infr's `check_attention` requires the compressed segment to share the raw
+cache's dtype, so they take `k_fmt`. infr also skips the 256-row padding.
+
+**No rewind.** `Config::has_unrewindable_state` (recurrent state, or a V4
+compressed layer) replaced `has_recurrent_state` at every caller meaning "cannot
+truncate": the runner's prefix-reuse arm (reuse only an exactly extended prompt,
+else zero and re-prefill from 0), its SWA-ring fallback and debug assertion, the
+`cached.clear()` backstop, and `SeamKv::seed_from` (a no-op, so a forked serve
+slot re-prefills). Audited and left alone: the prefill-boundary snapshot
+(`snapshot_delta` covers recurrent layers only, so a V4 session has no snapshot
+to resume from), `dense_multi_gpu_guard` (V4 is MoE, refused before),
+speculative verify (MoE refused), the batched and layer-major prefill (V4
+excluded by name) and the record-once tape (V4 excluded; a graph with per-step
+inputs is now also never replayed). The invariant it keeps: every ring row and
+compressed row a graph reads was written since the last reset by the one
+contiguous sequence the session holds — an extending turn reads rows earlier
+turns wrote (a block straddling two turns pools ring rows the first persisted),
+every other turn resets first; a compressed row is read only once committed
+(`len` is the widest visible count, the attention masks each row to
+`(pos+1)/ratio`); HCA reads no position below 0, so the gather fill is unused.
+So the reset zeroes the rings, not the compressed caches, where the reference's
+`clear_compressed` zeroes both.
+
+**The emit** (`seam/dsv4_emit.rs`): section 1's "Shared prologue" and "HCA
+layer", with the compressed-layer rope on all four ropes, the APE row by
+`Op::EmbedGather`, the source assembled by copies, `Op::GatherRows`,
+`Op::CompressPool` at window 128, the norm, the rope at `state_write_pos`, one
+`WriteKv` for the real commits, the ring persisted after, and the segment handed
+to the attention. A step that commits nothing skips the whole compress path: the
+reference's dummy commit lands in row `kv_size-1`, which no token sees before a
+real commit overwrites it, so skipping it changes no number. Written for any
+number of tokens per graph; the runner feeds one, since V4 prefill is per token.
+
+**Oracle result: infr's CPU matches llama.cpp on `hca` with no bisect needed.**
+Max |logit diff| at 7 / 30 / 70 / 131 / 300 / 520 tokens: 1.847744e-6 /
+5.2452087e-6 / 1.9788742e-5 / 3.838539e-5 / 2.0742416e-5 / 4.49121e-5;
+probability cosine at least 0.9999999999031617; top-1 agrees at every length.
+`synthetic_dsv4_hca_cpu_matches_llama_cpp` holds it at 2e-3 in CI, and the
+regenerator in compare mode reproduced every fixture with the new header lines.
+The sums file was not needed.
+
+**Breaks** (each applied alone, then reverted). "oracle" is the test above;
+"definition" is `hca_compressor_rows_match_their_definition_in_any_graphs` (one
+HCA compressor's ops, 300 positions token by token and in graphs of 100, 50 and
+150 tokens, against a host computation of each block row); "inert", "split",
+"reset" and "rewind" are the session tests beside it in `dsv4_emit.rs`, which
+also assert how many positions each turn took from the session (an extending
+turn its whole previous prompt, a non-extending one none), since a turn that
+re-prefilled from 0 ends on the same logits.
+
+| break                                              | caught by                                                         |
+| -------------------------------------------------- | ----------------------------------------------------------------- |
+| plain rope on the query                            | oracle (1.51 at 7 tokens, 4.58 at 520)                            |
+| plain rope on the compressed rows                  | definition; oracle from 300 tokens only (0.109, 1.02)             |
+| APE added after persisting                         | definition; oracle from 131 (2.0e-2 to 7.9e-2)                    |
+| persist before compress                            | definition only                                                   |
+| commit after attention                             | inert, rewind; oracle from 131 (4.0e-3 to 6.7e-3)                 |
+| `(pos+1)/ratio` as `pos/ratio` (plan)              | inert; oracle from 131 (4.2e-3 to 6.6e-3)                         |
+| block roped at its last position                   | definition; oracle from 131 (0.162 to 0.402)                      |
+| rings not zeroed on reset                          | reset (byte comparison of the rings; no logit moves)              |
+| V4 treated as rewindable                           | reset, rewind                                                     |
+| extending turn re-prefilled from 0 (reuse arm off) | inert, split (the turn's `GenStats::n_cached`; logits stay equal) |
+| non-extending turn rewound without a reset         | reset (rings), rewind (`n_cached`)                                |
+
+Two of these are blind spots of the oracle, both by construction. A rope at
+position 0 is the identity, so a wrong rope on compressed rows shows only from
+block 1 (position 255 on). And with one token per graph, every ring row a block
+reads was written at least one step earlier and is not the row this step
+persists over, so persisting first changes nothing; only a graph of several
+tokens can show it, which is why the definition test runs some. Unzeroed rings
+move no logit either: by the invariant above, every ring row a turn reads was
+written since the reset by the sequence it belongs to. "reset" therefore
+compares the rings themselves with a fresh session's.
+
+**Not done here:** the one-layer `hc_mult = 1` file (section 2 item 9); the
+from-definition row is checked on the compressor's ops alone instead.
+
+**The reference's Hadamard rotation on the raw and HCA caches** (settled in
+review, re-read at the pin): `llama_kv_cache`'s constructor rotates K only for a
+quantized `type_k` with a head width divisible by 64, or when the cache's head
+width equals `indexer_head_size` (true only for the LID cache). At f16 neither
+the raw nor the HCA cache is rotated (V4-Flash 512 vs 128; the fixture 48 vs
+128), so infr's unrotated f16 caches are exact. At q8_0 or q4_0 on a
+64-divisible head the reference rotates q, the raw row, the compressed row and
+the output and infr does not: equal in exact arithmetic, different quantization
+error. Unmeasured; in the backlog.
 
 ### Notes for S6 and S7: before the first block
 
@@ -464,9 +572,10 @@ only the longer prompts could have caught a YaRN error; at 512 it is at least
 choosing other blocks under the other rope.) `ratio0` moving by exactly 0
 confirms that llama.cpp leaves ratio-0 layers unscaled.
 
-`synthetic_dsv4_compressed_cases_are_still_refused` asserts the three compressed
-cases still hit the ratio-0-only refusal; it goes red the moment S6 or S7 lets
-one through, and the fix is to score that case with `cpu_matches_llama_cpp`.
+`synthetic_dsv4_compressed_cases_are_still_refused` asserts the two cases with a
+ratio-4 layer (`mixed`, `csa`) still hit the CSA refusal; it goes red the moment
+S7 lets one through, and the fix is to score that case with
+`cpu_matches_llama_cpp`. `hca` is scored since S6.
 
 The sums files keep every intermediate `build_overlap_compressed_kv_from_state`
 and `build_hca_compressed_kv_from_state` name with `cb` (`csa_state_compress`,

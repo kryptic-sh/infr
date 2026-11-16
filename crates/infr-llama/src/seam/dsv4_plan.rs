@@ -6,8 +6,8 @@
 //! that first, it names the traps this file guards against.
 //!
 //! This is a PURE function: no graph emission, no backend calls, no I/O. It only computes index
-//! and position vectors; nothing here consumes them yet (that is the wiring of
-//! `Op::CompressPool` into the V4 graph), so this module has no caller outside its own tests.
+//! and position vectors; `super::dsv4_emit` turns them into the HCA layer's per-step inputs and
+//! ops.
 //!
 //! Scope, deliberately narrower than the reference:
 //! - **Single stream only.** infr's V4 is single-stream today, so `dsv4_stream_offset` (which is
@@ -22,11 +22,6 @@
 //! - **No graph-width padding.** The reference pads its `n_kv` to a 256-row multiple with a floor
 //!   of 256; this port reports the unpadded width instead — see
 //!   [`Dsv4CompPlan::n_visible_max`] for why that loses nothing.
-//!
-//! Landed but unwired, same as `Op::CompressPool` itself was before this slice: the public items
-//! below have no caller outside `#[cfg(test)]`, so `dead_code` is silenced deliberately rather
-//! than by exporting them somewhere that isn't ready to call them.
-#![allow(dead_code)]
 
 use anyhow::{anyhow, bail, Result as AResult};
 use std::collections::HashMap;

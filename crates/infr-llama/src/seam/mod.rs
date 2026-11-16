@@ -17,6 +17,7 @@ use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
 use infr_gguf::{Gguf, TensorBytes};
 
+mod dsv4_emit;
 mod dsv4_plan;
 pub mod model;
 mod runner;
@@ -1216,11 +1217,9 @@ pub(crate) fn kv_v_fmt(cfg: &Config, k_fmt: DType, v_fmt: DType) -> DType {
 /// the K cache's) and the session's V buffer is an unbound placeholder. Its format follows K
 /// ([`kv_v_follows_k`]).
 ///
-/// The compressed caches (CSA/HCA/LID) and the three compressor states a ratio-4 / ratio-128 layer
-/// owns are NOT modelled here. They cannot be: they are per-layer (a ratio-0 layer has none) and
-/// the states are fixed-size recurrent buffers, not per-token rows. `generate_dense_backend`
-/// refuses any non-zero ratio before a graph is built, so nothing reads a geometry that does not
-/// exist yet.
+/// The compressed caches (CSA/HCA/LID) and the compressor state rings a ratio-4 / ratio-128 layer
+/// owns are NOT modelled here: they are per-layer (a ratio-0 layer has none), one row per BLOCK
+/// rather than per token, and the rings are fixed-size. [`dsv4_comp_bufs`] owns their geometry.
 pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
     if cfg.deepseek2 {
         return (cfg.kv_lora_rank + cfg.qk_rope_dim, cfg.indexer_head_size);
@@ -1234,6 +1233,96 @@ pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
     }
     let row = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
     (row, row)
+}
+
+/// One persistent buffer a DeepSeek V4 compressed layer owns beside its raw cache: a compressed
+/// cache (`kv_hca`, `kv_csa`, `kv_lid` in `llama_kv_cache_dsv4`) or one half of a compressor's
+/// state ring (`llama_dsv4_comp_state`'s kv or score tensor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Dsv4CompBuf {
+    pub(crate) dtype: DType,
+    pub(crate) elems: usize,
+    /// A state ring (f32, fixed size, reset with the session); `false` for a compressed cache.
+    pub(crate) ring: bool,
+}
+
+impl Dsv4CompBuf {
+    /// Bytes the session allocates for it.
+    pub(crate) fn bytes(&self) -> usize {
+        kv_side_bytes(self.dtype, self.elems)
+    }
+}
+
+/// Buffers per compressor tier in [`dsv4_comp_bufs`]: the compressed cache, then the ring's kv
+/// half, then its score half.
+pub(crate) const DSV4_TIER_BUFS: usize = 3;
+
+/// Layer `l`'s compressed-tier buffers for a `want_ctx`-token session whose raw cache is `k_fmt`,
+/// in the order the graph declares and the session allocates them; empty for a ratio-0 layer and
+/// for every other arch. The ONE answer to their geometry, shared by the allocation, the graph
+/// declaration, `SeamKv::fork`, the reset and every footprint estimate.
+///
+/// Each compressor tier contributes [`DSV4_TIER_BUFS`] buffers:
+/// - its compressed cache, one `width`-wide row per block of `ratio` positions,
+///   `ceil(want_ctx / ratio)` rows (`dsv4_comp_size`), in `k_fmt`: the CPU attention's compressed
+///   segment shares the raw cache's dtype (`check_attention`), as `llama_kv_cache_dsv4` builds
+///   every tier with the same `type_k`. infr skips the reference's 256-row padding, which only
+///   widens a masked view;
+/// - the ring's kv and score halves, f32 `[state_rows, state_width]` each: `ratio` rows of `width`
+///   for the non-overlapping HCA compressor, `2*ratio` rows of `2*width` for the overlapping
+///   CSA and LID ones (`llama_kv_cache_dsv4`'s `csa_state` / `hca_state` / `lid_state`).
+///
+/// An HCA layer (ratio 128) has one tier at `head_dim`. A CSA layer (ratio 4) has two: its own at
+/// `head_dim`, then the lightning indexer's at `indexer_head_size`.
+pub(crate) fn dsv4_comp_bufs(
+    cfg: &Config,
+    l: usize,
+    want_ctx: usize,
+    k_fmt: DType,
+) -> Vec<Dsv4CompBuf> {
+    if !cfg.deepseek4 {
+        return Vec::new();
+    }
+    let ratio = cfg.layer_compress_ratio(l);
+    let tier = |ratio: usize, width: usize, overlap: bool| {
+        let (state_rows, state_width) = if overlap {
+            (2 * ratio, 2 * width)
+        } else {
+            (ratio, width)
+        };
+        let ring = Dsv4CompBuf {
+            dtype: DType::F32,
+            elems: state_rows * state_width,
+            ring: true,
+        };
+        [
+            Dsv4CompBuf {
+                dtype: k_fmt,
+                elems: want_ctx.div_ceil(ratio).max(1) * width,
+                ring: false,
+            },
+            ring,
+            ring,
+        ]
+    };
+    match ratio as u32 {
+        0 => Vec::new(),
+        dsv4_plan::DSV4_HCA_RATIO => tier(ratio, cfg.head_dim, false).to_vec(),
+        dsv4_plan::DSV4_CSA_RATIO => [
+            tier(ratio, cfg.head_dim, true),
+            tier(ratio, cfg.indexer_head_size, true),
+        ]
+        .concat(),
+        _ => unreachable!("Config::from_gguf accepts compress ratios 0, 4 and 128 only"),
+    }
+}
+
+/// Bytes all of layer `l`'s [`dsv4_comp_bufs`] allocate.
+pub(crate) fn dsv4_comp_bytes(cfg: &Config, l: usize, want_ctx: usize, k_fmt: DType) -> usize {
+    dsv4_comp_bufs(cfg, l, want_ctx, k_fmt)
+        .iter()
+        .map(Dsv4CompBuf::bytes)
+        .sum()
 }
 
 /// Elements a KV side that the arch does NOT cache still allocates: MLA's V and deepseek4's V,
@@ -1274,7 +1363,13 @@ pub(crate) fn kv_side_bytes(fmt: DType, elems: usize) -> usize {
 pub(crate) fn kv_row_align_ok(cfg: &Config) -> bool {
     (0..cfg.n_layer).all(|l| {
         let (k, v) = kv_row_elems(cfg, l);
-        k.is_multiple_of(32) && v.is_multiple_of(32)
+        // A V4 compressed cache takes the raw cache's format, so its rows are held to it too; at
+        // a one-token context each compressed cache is exactly one row.
+        let comp_ok = dsv4_comp_bufs(cfg, l, 1, DType::F32)
+            .iter()
+            .filter(|b| !b.ring)
+            .all(|b| b.elems.is_multiple_of(32));
+        k.is_multiple_of(32) && v.is_multiple_of(32) && comp_ok
     })
 }
 
@@ -1433,7 +1528,10 @@ pub(crate) fn kv_bytes_estimate_fmt(
             // Per-side widths, NOT one shared width: MLA's K row is `kv_lora_rank + qk_rope_dim`
             // and it has no V side (see `kv_row_elems`).
             let (k_row, v_row) = kv_row_elems(cfg, l);
+            // A V4 compressed layer's block caches and rings, priced at exactly what the session
+            // allocates for them (`dsv4_comp_bufs`).
             kv_pair_bytes(k_row * rows, v_row * rows, k_fmt, v_fmt)
+                + dsv4_comp_bytes(cfg, l, want_ctx, k_fmt) as u64
         })
         .sum()
 }
@@ -1928,9 +2026,28 @@ pub(crate) fn kv_floor_alloc_bytes(
         .min()
         .expect("ubatch_candidates is never empty");
     let one: Vec<(usize, usize)> = (0..cfg.n_layer)
-        .map(|l| kv_layer_alloc_bytes(cfg, l, want_ctx, ring, ubatch, 1, k_fmt, v_fmt))
+        .flat_map(|l| {
+            std::iter::once(kv_layer_alloc_bytes(
+                cfg, l, want_ctx, ring, ubatch, 1, k_fmt, v_fmt,
+            ))
+            .chain(dsv4_comp_allocs(cfg, l, want_ctx, k_fmt))
+        })
         .collect();
     std::iter::repeat_n(one, n_slots.max(1)).flatten().collect()
+}
+
+/// Layer `l`'s [`dsv4_comp_bufs`] as allocation entries in the `(bytes, bytes)` form the KV guard
+/// reads ([`refuse_unallocatable_kv`]): one `(bytes, 0)` per buffer, since each is its own
+/// allocation.
+pub(crate) fn dsv4_comp_allocs(
+    cfg: &Config,
+    l: usize,
+    want_ctx: usize,
+    k_fmt: DType,
+) -> impl Iterator<Item = (usize, usize)> {
+    dsv4_comp_bufs(cfg, l, want_ctx, k_fmt)
+        .into_iter()
+        .map(|b| (b.bytes(), 0))
 }
 
 /// The KV allocations of `sizes` the Vulkan VRAM guard will check, summed — `None` when nothing
@@ -4463,6 +4580,64 @@ mod seam_helper_tests {
         let alloc =
             super::kv_layer_alloc_bytes(&cfg, 0, 4096, false, 512, 1, DType::F16, DType::F16);
         assert_eq!(alloc, (4_194_304, 8));
+    }
+
+    /// The V4-Flash footprint with its compressed tiers, from hand-computed byte counts at the
+    /// real file's geometry (`compress_ratios` `[0, 0, 4, 128, 4, 128, …, 4]` over 43 layers: 21
+    /// CSA, 20 HCA, 2 ratio-0; head dim 512, indexer key width 128, window 128) at a 4096-token
+    /// f16 context with full-context raw caches. A compressed buffer left out of the estimate,
+    /// sized at another row count or ring height, or priced in another dtype changes the total.
+    #[test]
+    fn kv_footprint_of_deepseek4_flash_counts_its_compressed_tiers() {
+        let ratios: Vec<usize> = (0..43)
+            .map(|l| match l {
+                0 | 1 => 0,
+                l if l % 2 == 0 => 4,
+                _ => 128,
+            })
+            .collect();
+        let cfg = Config {
+            n_layer: 43,
+            n_embd: 4096,
+            n_head: 64,
+            n_kv: 1,
+            head_dim: 512,
+            swa_window: 128,
+            indexer_head_size: 128,
+            compress_ratios: ratios,
+            deepseek4: true,
+            ..Default::default()
+        };
+        // An HCA layer: 4096/128 = 32 rows x 512 x 2 bytes of cache, and a ring of 128 rows x 512
+        // f32, kv and score.
+        let hca: Vec<usize> = super::dsv4_comp_bufs(&cfg, 3, 4096, DType::F16)
+            .iter()
+            .map(super::Dsv4CompBuf::bytes)
+            .collect();
+        assert_eq!(hca, [32_768, 262_144, 262_144]);
+        // A CSA layer: 4096/4 = 1024 rows x 512 x 2 bytes, a ring of 8 rows x 1024 f32 (kv,
+        // score); then the indexer's 1024 rows x 128 x 2 bytes and its ring of 8 rows x 256 f32.
+        let csa: Vec<usize> = super::dsv4_comp_bufs(&cfg, 2, 4096, DType::F16)
+            .iter()
+            .map(super::Dsv4CompBuf::bytes)
+            .collect();
+        assert_eq!(csa, [1_048_576, 32_768, 32_768, 262_144, 8_192, 8_192]);
+        assert!(super::dsv4_comp_bufs(&cfg, 1, 4096, DType::F16).is_empty());
+        // The raw caches as before (`kv_footprint_of_deepseek4_is_the_k_side_alone`: 183_173_120),
+        // plus 20 HCA layers x 557_056 = 11_141_120 and 21 CSA layers x 1_392_640 = 29_245_440.
+        let full = super::kv_bytes_estimate_fmt(&cfg, 4096, false, 512, DType::F16, DType::F16);
+        assert_eq!(full, 223_559_680);
+        // The pre-load floor lists each compressed buffer as an allocation of its own beside the
+        // layer's K/V pair: 43 pairs, 20 x 3 HCA buffers and 21 x 6 CSA ones.
+        let floor = super::kv_floor_alloc_bytes(
+            &cfg,
+            &EngineConfig::default(),
+            4096,
+            1,
+            DType::F16,
+            DType::F16,
+        );
+        assert_eq!(floor.len(), 43 + 20 * 3 + 21 * 6);
     }
 
     /// deepseek4 has no V cache, so a V format setting must not gate anything for it: not the SWA

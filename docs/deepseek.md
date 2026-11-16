@@ -740,12 +740,15 @@ row's softmax max is finite and `exp(-inf - max)` is 0 exactly.
 
 ## Stage 4 — `deepseek4` (V4-Flash / V4-Pro)
 
-**Progress: a V4 model whose `compress_ratios` are ALL ZERO generates, under
+**Progress: a V4 model whose `compress_ratios` are 0 or 128 generates, under
 either routing.** The ratio-0 tier is emitted end to end and runs on CPU and
-Vulkan; ratios 4 and 128 are refused by name. See "Slice A — ratio 0" below for
+Vulkan; the ratio-128 (HCA) tier runs on the CPU and matches llama.cpp there
+(see "The HCA tier" below); a compressed layer on a GPU backend, and ratio 4 on
+any backend, are refused by name. The shipped V4-Flash file therefore still
+stops at its first ratio-4 layer (layer 2). See "Slice A — ratio 0" below for
 what that covers, "Slice A2 — hash routing" for the `ffn_gate_tid2eid` gather,
-and `docs/backlog.md` § B-DSV4-WIRING for what slice B owes. Note that no layer
-of the SHIPPED V4-Flash file is both ratio-0 and bias-routed — see
+and `docs/backlog.md` § B-DSV4-WIRING for what slice B still owes. Note that no
+layer of the SHIPPED V4-Flash file is both ratio-0 and bias-routed — see
 `docs/backlog.md` § B-DSV4-REAL.
 
 The 2026-08-10 read slice that preceded it was a read, not a port:
@@ -815,8 +818,9 @@ Two things outside the emit had to move with it:
   while a `sliding_window = 1` model (where attending only your own row IS
   correct) stayed exact and hid it.
 
-What ratio 0 does NOT cover, and is refused rather than approximated: compressed
-layers (ratios 4/128).
+What ratio 0 does NOT cover: compressed layers. Ratio 128 has generated on the
+CPU since plan 09 S6 ("The HCA tier" below); ratio 4 is still refused rather
+than approximated.
 
 ### Slice A2 — hash routing end to end (2026-08-13)
 
@@ -904,13 +908,14 @@ B-DSV4) for exactly which shapes are refused and what a perf pass would need.
 clamps and the mandatory sqrt-softplus gating — and loads every tensor, with
 each layer's set chosen by its ratio and its hash/bias routing.
 `Config::deepseek2` is FALSE for V4 (unlike V3.2, which genuinely is V2 plus an
-indexer); every reader of that flag was enumerated and is MLA-specific. A model
-with any non-zero ratio is then refused by name, with an `assert!` at the top of
-the build closure as the backstop — `wpush`'s Dsv4 arm declares the ratio-0
-tensor set only, so a compressed layer reaching the builder would bind every
-later weight one buffer off. Hash-routed layers are no longer refused: their
-`ffn_gate_tid2eid` occupies the SAME slot of the upload order that a bias-routed
-layer's `exp_probs_b` does, and `wpush` pushes exactly one of the two.
+indexer); every reader of that flag was enumerated and is MLA-specific. `wpush`
+declares every tensor `wload` uploads, the compressor's and the indexer's
+included (`Dsv4W::comp`, after the hyper-connection triples, in upload order),
+so the build closure's old ratio-0-only `assert!` is gone; a ratio-4 layer is
+refused by name before the build. Hash-routed layers are no longer refused:
+their `ffn_gate_tid2eid` occupies the SAME slot of the upload order that a
+bias-routed layer's `exp_probs_b` does, and `wpush` pushes exactly one of the
+two.
 
 A genuinely different architecture, not an increment. Sharing with stage 2 is
 limited to the MoE block, the FFN, norms, and generic rope/embedding plumbing.
@@ -1010,6 +1015,80 @@ llama.cpp crash on any V4 file without a ratio-4 layer;
 the indexer-precision note for S7 and the regeneration command. The fixture
 builder is `crates/infr-llama/tests/dsv4_fixture/mod.rs`, shared by both test
 binaries.
+
+### The HCA tier (2026-11-16, plan 09 S5 and S6)
+
+A ratio-128 layer now runs on the CPU, and the synthetic all-HCA file matches
+llama.cpp at every stored length (max |logit diff| 1.85e-6 to 4.49e-5 from 7 to
+520 tokens, top-1 agreeing everywhere; plan 09 § S6 has the table).
+`synthetic_dsv4_hca_cpu_matches_llama_cpp` holds it at the ratio-0 bound in CI.
+
+**The emit** (`seam/dsv4_emit.rs`, called by the runner's V4 arm between the raw
+cache write and the attention) follows `build_attention_impl`:
+
+- every rope of a compressed layer — query, raw kv row, the backward de-rope and
+  each compressed row — runs at `compress_rope_theta` with the YaRN divisors
+  (`Dsv4Rope::for_layer`; the divisors ride the `yarn_ff` Input, which V4 has no
+  other use for), while ratio-0 layers keep the plain rope;
+- `kv = attn_compressor_kv·x` and
+  `score = attn_compressor_gate·x + ape[pos % 128]`, the APE row gathered with
+  `Op::EmbedGather` by a per-step id input, so the scores carry it before
+  anything reads or persists them;
+- when the graph's positions complete a block: the source
+  `[ring | this graph's rows]` is assembled with two copies per half (the ring
+  is an f32 Input, and `Op::GatherRows` must read an op-produced tensor), each
+  block's 128 rows are gathered with the plan port's `gather_read_idxs()`,
+  pooled by `Op::CompressPool` (window 128), RMS-normed by
+  `attn_compressor_norm`, roped at the block's FIRST position
+  (`state_write_pos`) and written with ONE `WriteKv` (a contiguous sequence
+  commits consecutive rows). Real commits only: a step that completes no block
+  emits none of this, which changes no number, because the reference's dummy
+  commit writes a row no token can see before a real commit overwrites it;
+- the step's rows are then persisted into the ring (`state_persist_*`, in runs
+  consecutive on both sides), AFTER the commit has read it;
+- the attention gets `comp: Some { cache, len: n_visible_max, ratio: 128 }`, or
+  `None` while no block is visible to any row.
+
+The commit lands before the attention, so the token that completes a block
+attends it. Per-step i32 inputs (APE ids, gather indices, block positions) are
+declared by `Dsv4Tier` once per graph and uploaded at each bind site
+(`upload_step_i32`); the record-once decode tape never takes a graph that has
+any.
+
+**Buffers** (`seam::dsv4_comp_bufs`, one answer for allocation, declaration,
+fork, reset and every estimate): per HCA layer the compressed cache
+(`ceil(ctx/128)` rows of `head_dim`, in the raw cache's format, which the CPU
+attention requires) and the ring (128 rows of `head_dim`, f32, kv and score);
+per CSA layer the CSA and LID caches and rings (8 rows of twice the width),
+allocated and declared already though nothing emits them. They live in
+`SeamKv::cbufs`, are forked with the slot, are priced in `kv_bytes_estimate_fmt`
+(so the VRAM/RAM fits and the `--ctx` clamp see them) and in the KV allocation
+guard, one entry each.
+
+**No partial rewind.** `Config::has_unrewindable_state` is true for a V4 file
+with a compressed layer, as for qwen35 and LFM3, and every caller that would
+truncate a session reads it: the runner's prefix reuse (a turn reuses the
+session only when its prompt extends exactly what the session holds, and
+otherwise zeroes the rings and re-prefills from position 0), `SeamKv::seed_from`
+(a no-op) and the SWA-ring fallback. The invariant this keeps: every ring row
+and compressed row a graph reads was written since the last reset by the one
+contiguous sequence the session holds. An extending turn does read rows earlier
+turns wrote — a block that straddles two turns pools ring rows the first one
+persisted — but every other turn resets first. Within the sequence a compressed
+row is read only once its block is committed (the segment's `len` is the graph's
+widest visible count, and the attention masks each row to its own
+`(pos+1)/ratio`), a block pools only positions from its first to the one that
+completes it, and HCA reads no position below 0, so the gather's fill is never
+used. That is why the reset zeroes the rings but not the compressed caches.
+Speculative verify, batched and layer-major prefill and the record-once tape
+never see V4 (MoE, or excluded by name).
+
+What the tests found when the code was broken on purpose (plan 09 § S6 has the
+full table): ropes at position 0 are the identity, so a wrong rope on compressed
+rows is invisible until block 1 (the oracle catches it from 300 tokens, the
+compressor's from-definition test at once), and persisting before compressing is
+invisible when every graph holds one token — only the compressor test that feeds
+50- and 150-token graphs catches it.
 
 ### `compress_ratio` is the master per-layer switch
 
@@ -1190,7 +1269,7 @@ permuted so the window index becomes the fast axis, `soft_max` runs, and
 `sum_rows` collapses it. Then RMS-norm by `attn_comp_norm`, rope the
 `[nope | rope]` tail at `compress_rope_base`, and write.
 
-#### ✓ LANDED at the op level (2026-08-13) — nothing emits it yet
+#### ✓ LANDED at the op level (2026-08-13), emitted for HCA since plan 09 S6
 
 `Op::CompressPool` on CPU + Vulkan + Metal, one op for the four ggml nodes both
 compressor variants share once their gathers have diverged (the pair of
@@ -1307,6 +1386,23 @@ non-null (`deepseek4.cpp:1053`): the guard passes for the reason above, but it
 is keyed on a quantisation artifact rather than on anything semantic. The
 rotation itself is orthogonal and applied to both sides of every dot product, so
 an unquantised port skips it entirely — as stage 3 already does.
+
+**Re-read at `5676dfbe0` for the HCA tier (plan 09 S6).** The rule now lives in
+`llama_kv_cache`'s constructor (the `attn_rot_k` / `n_rot_k` block before
+`init_rotation`): K is rotated when rotation is not disabled
+(`LLAMA_ATTN_ROT_DISABLE`, `llama_model_set_attn_rot`), the cache has heads,
+`type_k` is quantized and `n_embd_head_k() % 64 == 0`; or, for these DeepSeek
+arches, when the cache's `n_embd_head_k_full` equals `indexer_head_size`. Each
+V4 tier is its own `llama_kv_cache` with its own hparams, and only the LID cache
+sets its head width to the indexer's. So at f16 neither the raw nor the HCA
+cache is rotated — V4-Flash's head is 512 against an indexer width of 128, the
+oracle fixture's 48 against 128 — and infr's unrotated f16 caches compute the
+reference's function exactly. At a quantized `type_k` whose head width is a
+multiple of 64 (q8_0 or q4_0 on V4-Flash's 512; never the fixture's 48) the
+reference rotates the query, the raw row, the compressed row and the attention
+output, and infr does not: the same function in exact arithmetic, but the
+quantization error lands on rotated values there and on raw ones here. That
+precision difference is unmeasured (`docs/backlog.md` § B-DSV4-WIRING).
 
 Budget stage 4 accordingly, and do not start it until stages 2–3 are solid.
 

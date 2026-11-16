@@ -193,17 +193,12 @@ pub(super) struct IndexerW {
     pub(super) attn_q_b: TensorId,
 }
 
-/// DeepSeek V4's attention-mixer weights — the `compress_ratio == 0` (pure sliding-window) tier.
-/// See `docs/deepseek.md` § Stage 4.
+/// DeepSeek V4's attention-mixer weights. See `docs/deepseek.md` § Stage 4.
 ///
 /// V4 is NOT MLA: there is no `kv_lora_rank`, no `wk_b`/`wv_b`, and one MQA KV head serves every
 /// query head. What it keeps from deepseek2 is the Q-LoRA triple; everything after it is its own.
-///
-/// The compressor / lightning-indexer tensors a ratio-4 or ratio-128 layer additionally carries
-/// (`attn_compressor_*`, `indexer*`) have NO handles here: `generate_dense_backend` refuses a model
-/// with any non-zero ratio before the graph is built, so a layer that owns them never reaches the
-/// emit. Adding them means adding the compressed-KV state machine at the same time — see
-/// `docs/backlog.md` § B-DSV4-WIRING slice B.
+/// A compressed layer (ratio 4 or 128) also carries its compressor, and a ratio-4 layer the
+/// lightning indexer: [`Dsv4W::comp`].
 pub(super) struct Dsv4W {
     /// `attn_sinks.weight` `[n_head]` — one learned logit per query head, joining the softmax MAX
     /// and DENOMINATOR and never the numerator (`Op::Attention::sinks`).
@@ -226,6 +221,51 @@ pub(super) struct Dsv4W {
     /// `attn_output_b` `[o_group_count*o_lora_rank, n_embd]`.
     pub(super) wo_a: TensorId,
     pub(super) wo_b: TensorId,
+    /// The compressor of a ratio-4 or ratio-128 layer; `None` on a ratio-0 layer. Uploaded AFTER
+    /// the layer's hyper-connection triples (`deepseek4.cpp::load_arch_tensors`' order), so it is
+    /// declared after them too.
+    pub(super) comp: Option<Dsv4CompW>,
+}
+
+/// One V4 compressor's four tensors (`attn_compressor_*`, or the indexer's own
+/// `indexer_compressor_*`). `coff` below is 2 for the overlapping CSA/LID compressors and 1 for
+/// HCA.
+pub(super) struct Dsv4CompressorW {
+    /// `*_kv.weight` `[n_embd, coff*width]`: the rows a block pools.
+    pub(super) kv: TensorId,
+    /// `*_gate.weight` `[n_embd, coff*width]`: their pooling scores, before the APE row.
+    pub(super) gate: TensorId,
+    /// `*_ape.weight` `[coff*width, ratio]`: one score row per position within a block, added by
+    /// `pos % ratio`.
+    pub(super) ape: TensorId,
+    /// `*_norm.weight` `[width]`: the RMSNorm gain on each pooled row.
+    pub(super) norm: TensorId,
+}
+
+/// A compressed V4 layer's compressor, and on a ratio-4 layer its lightning indexer.
+pub(super) struct Dsv4CompW {
+    pub(super) attn: Dsv4CompressorW,
+    /// The ratio-4 layer's indexer; `None` on HCA layers.
+    pub(super) indexer: Option<Dsv4IndexerW>,
+}
+
+/// A ratio-4 V4 layer's lightning indexer: its query and weight projections, and the compressor
+/// that writes its key cache (`kv_lid`). V4's indexer has no `attn_k` and no `k_norm`, unlike
+/// V3.2's [`IndexerW`].
+///
+/// Declared so the graph builder consumes a ratio-4 layer's upload slots in `wload`'s order; the
+/// CSA emit (plan 09 S7) is its first reader. Until then `generate_dense_backend` refuses a
+/// ratio-4 layer before any graph is built, and the `expect` fails the build once S7 reads it.
+#[expect(
+    dead_code,
+    reason = "the CSA emit (plan 09 S7) is the first reader; ratio 4 is refused until then"
+)]
+pub(super) struct Dsv4IndexerW {
+    /// `indexer.proj.weight` `[n_embd, indexer_n_head]`.
+    pub(super) proj: TensorId,
+    /// `indexer.attn_q_b.weight` `[q_lora_rank, indexer_n_head * indexer_head_size]`.
+    pub(super) attn_q_b: TensorId,
+    pub(super) comp: Dsv4CompressorW,
 }
 
 /// One hyper-connection block's `(fn, base, scale)` triple. `w_fn` is the mixing matmul's weight
@@ -295,7 +335,8 @@ pub(crate) struct SessionStable {
     /// applies them (`Config::rope_freq_factors`) and a file that carries the tensor.
     pub(super) rope_freqs: Option<Vec<f32>>,
     /// DeepSeek V2+ YaRN per-pair frequency divisors (`qk_rope_dim/2` floats), computed from
-    /// `rope_scaling_factor`/`n_ctx_train`/`rope_theta` — see `runner::session_stable`.
+    /// `rope_scaling_factor`/`n_ctx_train`/`rope_theta` — see `runner::session_stable`. On
+    /// DeepSeek V4, the divisors of its compressed layers' ropes instead.
     pub(super) yarn_ff: Option<Vec<f32>>,
     /// Combined gate+up FFN upload decision.
     pub(super) fuse_gu: bool,
@@ -313,6 +354,10 @@ pub(crate) struct SeamKv {
     pub(super) stable: std::sync::Arc<SessionStable>,
     pub(super) kbufs: Vec<Box<dyn Buffer>>,
     pub(super) vbufs: Vec<Box<dyn Buffer>>,
+    /// Per layer, a DeepSeek V4 compressed layer's block caches and compressor state rings, in
+    /// `crate::seam::dsv4_comp_bufs` order; empty for every other layer and arch. The rings are
+    /// session state like a recurrent layer's (`Config::has_unrewindable_state`).
+    pub(super) cbufs: Vec<Vec<Box<dyn Buffer>>>,
     /// KV cache element dtypes, chosen per-side (K and V independent). Fork/seed reuse them so a
     /// forked slot sizes + copies its buffers to match this slot's layout.
     pub(super) k_fmt: DType,
@@ -510,6 +555,29 @@ pub(super) fn invalidate_delta(ckpt: &mut Option<MtpDeltaCkpt>) {
     }
 }
 
+/// Allocate every layer's DeepSeek V4 compressed-tier buffers (`crate::seam::dsv4_comp_bufs`) for
+/// a `max_ctx`-token session whose raw cache is `k_fmt`: one list per layer, empty for a layer
+/// that has none. Their contents are not read before the session's first turn resets the rings
+/// and commits the blocks it attends (`runner::zero_unrewindable_state` has the invariant).
+pub(super) fn alloc_dsv4_comp_bufs(
+    be: &dyn Backend,
+    cfg: &Config,
+    max_ctx: usize,
+    k_fmt: DType,
+) -> AResult<Vec<Vec<Box<dyn Buffer>>>> {
+    (0..cfg.n_layer)
+        .map(|l| {
+            crate::seam::dsv4_comp_bufs(cfg, l, max_ctx, k_fmt)
+                .iter()
+                .map(|b| {
+                    be.alloc(b.bytes(), BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
 /// the rope_freqs constant. Shared across conversation slots via `Arc`.
 pub(crate) struct SeamWeights {
@@ -685,11 +753,23 @@ impl SeamKv {
                 .map_err(|e| anyhow!("{e}"))?,
             );
         }
+        let cbufs = alloc_dsv4_comp_bufs(be, cfg, self.max_ctx, self.k_fmt)?;
         // A fork is only usable if its buffers have the SAME geometry as the slot it forked from,
         // and the source's own sizes are right here — so check them instead of trusting two call
         // sites to derive the same width. They did not: the MLA row width was missing from this
         // one, which allocated a third of what the kernels index (docs/backlog.md B41).
         for l in 0..cfg.n_layer {
+            let comp = |bufs: &[Box<dyn Buffer>]| -> Vec<usize> {
+                bufs.iter().map(|b| b.len_bytes()).collect()
+            };
+            if comp(&cbufs[l]) != comp(&self.cbufs[l]) {
+                return Err(anyhow!(
+                    "forked KV slot geometry differs from its source at layer {l}: compressed \
+                     buffers {:?} vs {:?}",
+                    comp(&cbufs[l]),
+                    comp(&self.cbufs[l])
+                ));
+            }
             for (side, forked, src) in [
                 ("k", kbufs[l].len_bytes(), self.kbufs[l].len_bytes()),
                 ("v", vbufs[l].len_bytes(), self.vbufs[l].len_bytes()),
@@ -708,6 +788,7 @@ impl SeamKv {
             stable: std::sync::Arc::clone(&self.stable),
             kbufs,
             vbufs,
+            cbufs,
             k_fmt: self.k_fmt,
             v_fmt: self.v_fmt,
             hidden_buf: be
@@ -755,12 +836,14 @@ impl SeamKv {
     /// prefix — e.g. the system prompt) via a device-side buffer copy, so the new conversation
     /// skips re-prefilling it. `p` must be ≤ src's materialized length.
     ///
-    /// A model with a recurrent state (qwen35, LFM3): a no-op. That state is a single fixed-size
-    /// summary of EVERY token fed so far — there's no "first `p` tokens' worth" of it to slice out and copy
-    /// the way a real per-position KV cache allows (see `docs/qwen35.md` and the no-rewind rule in
-    /// `generate_dense_backend`). Leaving `self.cached` empty (this slot's `fork()` already zeroed
-    /// its state) is the CORRECT fallback: the next call on this slot fully re-prefills, exactly
-    /// like the single-slot session's divergent-prompt reset.
+    /// A model whose session cannot be rewound (`Config::has_unrewindable_state`: qwen35, LFM3,
+    /// a DeepSeek V4 file with compressed layers): a no-op. A recurrent state is a single
+    /// fixed-size summary of EVERY token fed so far, and a V4 compressor ring holds the source's
+    /// latest rows whatever position they were for — there's no "first `p` tokens' worth" of
+    /// either to slice out and copy the way a real per-position KV cache allows (see
+    /// `docs/qwen35.md` and the no-rewind rule in `generate_dense_backend`). Leaving
+    /// `self.cached` empty is the CORRECT fallback: the next call on this slot fully re-prefills
+    /// from a reset state, exactly like the single-slot session's divergent-prompt reset.
     pub(crate) fn seed_from(
         &mut self,
         be: &dyn Backend,
@@ -768,7 +851,7 @@ impl SeamKv {
         src: &SeamKv,
         p: usize,
     ) -> AResult<()> {
-        if cfg.has_recurrent_state() {
+        if cfg.has_unrewindable_state() {
             return Ok(());
         }
         let p = p.min(src.cached.len()).min(self.max_ctx);

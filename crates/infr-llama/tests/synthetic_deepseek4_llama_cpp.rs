@@ -71,11 +71,16 @@ impl OracleCase {
         !self.ratios.contains(&4)
     }
 
-    /// Whether infr generates this case today. The compressed tiers are refused until slices S6
-    /// (ratio 128) and S7 (ratio 4) land; a case's infr file has only its own ratios, because the
-    /// null tail is ratio 0 there.
+    /// Whether infr generates this case today: ratio 0 and ratio 128 do (the HCA tier since plan
+    /// 09 slice S6), ratio 4 is refused until slice S7. A case's infr file has only its own
+    /// ratios, because the null tail is ratio 0 there.
     fn infr_generates(&self) -> bool {
-        self.ratios.iter().all(|&r| r == 0)
+        !self.ratios.contains(&4)
+    }
+
+    /// Whether the case has a compressed layer of its own, and so a sums file to bisect with.
+    fn compressed(&self) -> bool {
+        self.ratios.iter().any(|&r| r != 0)
     }
 
     /// Whether the indexer's top-k drops blocks anywhere in a `len`-token prompt and that changes
@@ -582,10 +587,29 @@ fn synthetic_dsv4_ratio0_cpu_matches_llama_cpp() {
     }
 }
 
-/// **The compressed cases are refused until S6 and S7 lift the refusal, and then this test must
-/// become a comparison.** Each compressed case's llama.cpp data is checked in already; when infr
+/// **The HCA tier against llama.cpp, in CI.** infr's CPU prefill of the all-ratio-128 case (four
+/// HCA layers and the null tail) at every stored length: before the first block completes (7, 30
+/// and 70 tokens, where the compressor only fills its ring), past the first block (131), across
+/// two (300) and four (520) blocks and past the raw window, at the bound the ratio-0 tier is held
+/// to. Plan 09 § S6 records the measured scores and the breaks this bound separates.
+#[test]
+fn synthetic_dsv4_hca_cpu_matches_llama_cpp() {
+    let case = &CASES[3];
+    assert_eq!(case.name, "hca");
+    assert!(case.infr_generates() && case.null_tail());
+    for (len, s) in cpu_matches_llama_cpp(case) {
+        assert!(
+            s.max_abs < ORACLE_MAX_ABS,
+            "infr's CPU misses llama.cpp by {} at {len} tokens on the synthetic HCA V4",
+            s.max_abs
+        );
+    }
+}
+
+/// **The cases with a ratio-4 layer are refused until S7 lifts the refusal, and then this test
+/// must become a comparison.** Each such case's llama.cpp data is checked in already; when infr
 /// generates a case, this test fails for it, and the fix is to score it with
-/// [`cpu_matches_llama_cpp`] as [`synthetic_dsv4_ratio0_cpu_matches_llama_cpp`] does.
+/// [`cpu_matches_llama_cpp`] as [`synthetic_dsv4_hca_cpu_matches_llama_cpp`] does.
 #[test]
 fn synthetic_dsv4_compressed_cases_are_still_refused() {
     for case in CASES.iter().filter(|c| !c.infr_generates()) {
@@ -601,7 +625,7 @@ fn synthetic_dsv4_compressed_cases_are_still_refused() {
             Err(e) => format!("{e:#}"),
         };
         assert!(
-            err.contains("only the ratio-0 tier (pure sliding window) generates"),
+            err.contains("has compress_ratio 4: the CSA tier does not generate yet"),
             "the {} case failed some other way: {err}",
             case.name
         );
@@ -649,7 +673,7 @@ fn synthetic_dsv4_llama_cpp_fixtures_match_their_gguf() {
     for case in &CASES {
         let want = gguf_identity(&oracle_model(case, true));
         let mut files = vec![case.fixture_path("")];
-        if !case.infr_generates() {
+        if case.compressed() {
             files.push(case.fixture_path("_sums"));
         }
         for path in files {
@@ -671,7 +695,7 @@ fn synthetic_dsv4_llama_cpp_fixtures_match_their_gguf() {
 /// positions back to the file's own data lines, so the reader and the writer cannot drift.
 #[test]
 fn synthetic_dsv4_llama_cpp_sums_files_parse() {
-    for case in CASES.iter().filter(|c| !c.infr_generates()) {
+    for case in CASES.iter().filter(|c| c.compressed()) {
         let path = case.fixture_path("_sums");
         let positions = read_sums_fixture(&path);
         let got: Vec<usize> = positions.iter().map(|p| p.0).collect();
@@ -931,7 +955,7 @@ fn synthetic_dsv4_regenerate_llama_cpp_fixtures() {
             println!("wrote {}", written.display());
         }
 
-        if case.infr_generates() {
+        if !case.compressed() {
             continue;
         }
         let tmp = TempGguf::write(&format!("dsv4-sums-{}", case.name), &model);

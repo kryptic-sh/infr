@@ -1200,76 +1200,71 @@ llama.cpp to bless the synthetic file, per `docs/synthetic-models.md` rule 2.
 **Slice A (ratio 0) is DONE and generates** — see `docs/deepseek.md` § Stage 4,
 "Slice A". What is left:
 
-**Slice B — ratios 4 and 128.** Needs new ops, not just wiring:
+**Slice B — ratios 4 and 128.** Ratio 128 (HCA) is DONE on the CPU (plan 09
+S5/S6, 2026-11-16): the compressor emit (`seam/dsv4_emit.rs`), the persistent
+caches and rings (`seam::dsv4_comp_bufs`, `SeamKv::cbufs`), the `wpush` handles
+and the no-rewind predicate (`Config::has_unrewindable_state`), matched to
+llama.cpp's logits on the synthetic all-HCA file (`docs/deepseek.md` § "The HCA
+tier", plan 09 § "S5 and S6" for the numbers and the breaks). What is left:
 
-- **The plan half of `dsv4_build_comp_plan` is ported, re-synced with llama.cpp
-  `5676dfbe0` (2026-11-16); the buffer half is not.** `build_dsv4_comp_plan` in
-  `crates/infr-llama/src/seam/dsv4_plan.rs` is a pure Rust function — no graph
-  emission, no backend calls — that computes the reference's
-  `n_visible`/`state_pos`/`state_read_idxs`/`state_write_idxs`/
-  `state_write_pos`/`state_persist_{src,dst}_idxs` vectors, including the
-  `[persistent | scratch | sentinel]` gather layout, the two-contiguous-halves
-  read order for the overlapping compressors, both dummy rules (CSA/LID pad
-  their commits up to `ceil(n_tokens/4)` blocks, at most one dummy, and refuse a
-  non-contiguous ubatch; HCA adds one dummy when nothing commits) and a count of
-  the real commits, which come first. It reports the unpadded compressed width
-  (`n_visible_max`) where the reference pads `n_kv` to a 256 multiple with a
-  floor of 256, a width-only padding whose columns are masked. Covered by
-  hand-derived literal-vector tests and red/green fault injection. **Nothing
-  calls it yet** — no persistent compressor state buffers, no `Op::CompressPool`
-  wiring, not referenced from `runner.rs`. Narrower than the reference,
-  deliberately: single stream only (refuses `n_seqs > 1`, mirroring the
-  reference's throw), no rollback/`n_rs_seq` planes (no speculative-decode
-  consumer), and no coupled-ubatch branch (one sequence is never coupled). A
-  multi-stream slice must add the per-sequence ring and cache offsets and the
-  per-sequence block padding.
-- **Two-segment attention landed on CPU and Vulkan (2026-11-16, plan 09 S4),
-  unwired.** `Op::Attention::comp` (`CompSegment { cache, len, ratio, bias }`)
-  attends the compressed cache beside the raw window in one softmax with the
-  sink, so there is no `[raw | compressed]` concatenation to build: the CSA emit
-  passes `kv_csa` as `cache`, `n_visible_max` as `len`, ratio 4 and
-  `Op::TopkMask`'s output (at `kv_len = len`) as `bias`; HCA passes `kv_hca`,
-  ratio 128 and no bias. `key_bias` stays the V3.2/raw-side field and is refused
-  together with `comp`. Tests: `seam_op_parity.rs`'s `attention_comp_segment_*`
-  and `indexer_topk_mask_two_segment_chain`.
-- **`Op::LightningIndexer` takes V4's block cache (2026-11-16):** `block_ratio`
-  makes key `j` eligible iff `j < (abs+1)/block_ratio` (1 is V3.2, bit for bit).
-  The emit passes `kv_lid` as `k_cache`, `kv_len = n_visible_max` and
-  `top_k = min(kv_len, index_topk)`; the `cap_rows >= kv_len` rule holds because
-  the block cache never wraps. The scoring matches ggml's
-  `GGML_OP_LIGHTNING_INDEXER` (`w` pre-scaled by `1/sqrt(head·heads)`); the
-  reference's Hadamard rotation of the LID query and keys is skipped on both
-  sides, as on V3.2. A selected index past a row's visible count (the indexer
-  fills its tail with those when fewer than `top_k` blocks are visible) gets a 0
-  from `Op::TopkMask` and stays masked by the segment's own visibility rule,
-  which is the reference's `top-k mask + causal mask` sum.
-- **The raw cache is one K=V cache (2026-11-16):** `seam::kv_row_elems` gives V4
-  `(head_dim, 0)`, the emit writes the row once and binds the K cache to both
-  `Op::Attention` sides. The compressed caches and the three compressor states
-  are not modelled yet: they are per-layer (a ratio-0 layer has none) and the
-  states are fixed-size recurrent buffers, so `kv_row_elems` cannot carry them;
-  the precedent is `MixerW::DeltaNet`'s state allocation, and the sizes are in
-  `docs/plan/09-deepseek-v4-compressed.md` section 1 (its slice S5). Nor are the
-  `wpush` handles for their tensors, which the ratio-0 arm deliberately does not
-  declare — the `assert!` at the top of the build closure is what keeps that
-  honest.
-- **`Op::GatherRows` landed on CPU and Vulkan, Metal written (2026-11-16),
-  unwired.** It assembles the compressor's pooling window (its doc maps the HCA
-  gather and the two overlap halves onto it). The emit takes its indices from
-  `Dsv4CompPlan::gather_read_idxs` (the sentinel already `-1`; the raw
-  `state_read_idxs` name it `state rows + tokens`, which the gather refuses on
-  CPU), and assembles `[persistent state | this step's rows]` into one INTERNAL
-  source tensor: the CPU executor never loads a KV cache operand into its store,
-  so a gather reading one would find it empty. Its Metal kernel and the Metal
-  aliased-attention test have not run anywhere yet; the macOS CI job runs them.
-- **The oracle for slice B is checked in (2026-11-16, plan 09 S5a).**
-  llama.cpp's logits for three synthetic compressed layouts (`mixed`, `csa`,
-  `hca`) at prompts up to 520 tokens (131 for `csa`, the only one whose top-k
-  drops blocks), and its per-tensor sums at chosen positions, are in
-  `crates/infr-llama/tests/fixtures/`;
-  `synthetic_dsv4_compressed_cases_are_still_refused` goes red when a case
-  starts generating, and that case then gets scored like `ratio0` (§
-  B-DSV4-ORACLE).
+- **The CSA tier (plan 09 S7).** The overlapping compressor (two gathers into
+  one window, the sentinel fill), the LID compressor, `Op::LightningIndexer`
+  with `block_ratio` 4 and `Op::TopkMask` into the segment's `bias`. The CSA and
+  LID caches and rings are already allocated, declared, forked, reset and
+  priced, and the indexer's handles declared (`Dsv4IndexerW`, an
+  `#[expect(dead_code)]` that fails the build once S7 reads it); the
+  `generate_dense_backend` refusal names the first ratio-4 layer. `Dsv4Tier`
+  holds one tier's plan, inputs and scratch, so S7 adds a `csa` constructor (two
+  tiers: CSA and LID) beside `hca`.
+- **The LID cache's width under the KV formats.** The compressed caches take the
+  raw cache's format (`check_attention` demands one dtype across segments).
+  `kv_row_align_ok` now holds every compressed row to the 32-element blocks, but
+  `kv_turbo_ok` in `generate_dense_backend` checks only `layer_head_dim` for the
+  128-element TurboQuant blocks, which the canonical fixture's 24-wide LID cache
+  would not meet (the real file's 128 does). S7 must gate it, or keep the LID
+  cache f16 and give `LightningIndexer` its own dtype.
+- **GPU backends.** A compressed layer on Vulkan or Metal is refused by name
+  (`gpu_synthetic_deepseek4_refuses_a_compressed_layer_on_vulkan`). Nothing in
+  the HCA graph has been run on a GPU: `Op::GatherRows`, `Op::CompressPool`,
+  `Op::EmbedGather` over an f32 APE table, the ring persisted by `Op::Copy` into
+  an f32 Input, and the two-segment attention all exist on Vulkan, but no
+  GPU-vs-CPU test of the whole tier exists (plan 09 S9).
+- **More than one token per graph.** The emit is written for any token count and
+  `hca_compressor_rows_match_their_definition_in_any_graphs` runs it at 50 and
+  150 tokens per graph on the compressor alone, but the runner feeds V4 one
+  token per graph (batched prefill excludes it), so a multi-token V4 graph has
+  never run end to end.
+- **Quantized KV caches round differently from llama.cpp's.** At a quantized
+  `type_k` with a head width divisible by 64 (q8_0, q4_0 on V4-Flash's 512),
+  llama.cpp's `llama_kv_cache` rotates q, the raw row, the compressed row and
+  the attention output by a Hadamard matrix (`attn_rot_k`); infr quantizes the
+  unrotated rows. Exact at f16 (neither cache is rotated there), equal in exact
+  arithmetic otherwise, but the quantization error differs. To measure: the
+  `hca` oracle case at `INFR_KV_TYPE_K=q8_0` against llama.cpp at
+  `--cache-type-k q8_0`, which needs a fixture head width divisible by 64 (the
+  oracle fixture's is 48). Not attempted.
+- **One sequence per session.** `build_dsv4_comp_plan` refuses a ubatch of
+  several sequences (as the reference does for one stream) and ports none of the
+  rollback (`n_rs_seq`) planes, so a V4 session cannot roll back a speculative
+  draft; it re-prefills instead. Parallel serving forks one session per slot,
+  which this covers. A multi-stream graph would need per-sequence ring and cache
+  offsets and the per-sequence block padding.
+- **The rings round-trip through the CPU interpreter's store every step.** A
+  ring is an f32 Input mutated by `Op::Copy`, so the interpreter loads it whole
+  and writes it back after each graph (`infr_core::exec::writes_back`): 512 KiB
+  per HCA layer at V4-Flash's head width, both ways, per token. Not measured
+  against the rest of a V4 decode step.
+- **Per-step inputs are allocated per step.** `upload_step_i32` allocates and
+  uploads one small staging buffer per V4 compressor input per graph; a decode
+  that kept them across steps would save the allocations. Not measured.
+- **The reset does not zero the compressed caches**, where llama.cpp's
+  `clear_compressed` does. Every row a graph reads was written since the last
+  reset by the one contiguous sequence the session holds (an extending turn
+  reads the rows earlier turns wrote; every other turn resets), a compressed row
+  is read only once committed, and zeroing a CSA cache costs a context-sized
+  upload per new prompt (`runner::zero_unrewindable_state` has the argument).
+  Decided, not an oversight; revisit if a path ever reads a compressed row past
+  a row's own `(pos+1)/ratio`, or resumes a session without that reset.
 
 **What slice A left unverified, in its own right:**
 
@@ -1550,9 +1545,10 @@ are hash-routed; layers 2..42 are all compressed (alternating 4/128), and layer
 
 Hash routing landed on 2026-08-13 (§ B-DSV4-HASH), so layers 0 and 1 — 2 of the
 43 — are now fully covered, and **the only thing between this checkpoint and a
-forward pass is B-DSV4-WIRING slice B**, the compressed (ratio 4/128) tiers.
-That is also the only refusal left in `generate_dense_backend` for this file:
-`arch=deepseek4 … layer 2 has compress_ratio 4`.
+forward pass is B-DSV4-WIRING slice B**, the compressed (ratio 4/128) tiers, of
+which ratio 128 runs on the CPU since plan 09 S6 and ratio 4 (S7) is left. That
+is also the only refusal left in `generate_dense_backend` for this file on the
+CPU: `arch=deepseek4 … layer 2 has compress_ratio 4`.
 
 What is NOT established by this entry: any NUMBER the graph computes on a real
 file. The refusal still fires before the first forward pass, so what has been
@@ -1564,8 +1560,12 @@ is the synthetic fixture and the op-level parity tests, on CPU and Vulkan.
 
 Verified by running `infr run` against the file on the CPU backend (2026-08-12):
 config parses, `wload` resolves every tensor, and the refusal is reached. NOT
-re-run after the hash slice — the compressed-layer refusal is ordered first and
-fires at layer 2 regardless, so the observable would not have moved.
+re-run after the hash slice or after the HCA tier (plan 09 S6, 2026-11-16): the
+refusal still fires at layer 2, now as
+`layer 2 has compress_ratio 4: the CSA tier does not generate yet`, so the
+observable would not have moved. Since S6 the file's 20 HCA layers would
+generate on the CPU; its 21 CSA layers are the whole of what stands between it
+and a forward pass.
 
 Since 2026-11-16 the ratio-0 graph's numbers ARE established against llama.cpp,
 on a synthetic file (§ B-DSV4-ORACLE), at the real file's hyper-connection count
@@ -1588,6 +1588,10 @@ numbers. Open items:
   Reporting them is the user's call; the oracle works around the first with a
   null ratio-4 tail layer (`OracleCase::null_tail`), which is exact only while
   `attn_output_b` multiplies a finite attention output.
+- **`hca` is scored in CI since plan 09 S6**
+  (`synthetic_dsv4_hca_cpu_matches_llama_cpp`, max |logit diff| 4.49e-5 at 520
+  tokens), with no bisect needed; its sums file stayed unused. `mixed` and `csa`
+  wait for S7.
 - **Only the CPU backend is scored against llama.cpp.** Vulkan's ratio-0 emit is
   checked against infr's own CPU (`gpu_synthetic_deepseek4_ratio0_matches_cpu`,
   at `hc_mult = 2`), not against the oracle data; a `prefill_logits_vulkan` twin

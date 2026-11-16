@@ -270,8 +270,8 @@ pub struct Config {
     /// is_swa_layer`] special-cases this arch for that reason: `swa_pattern` encodes "every p-th
     /// layer is FULL", and V4 has no full layers to point at.
     ///
-    /// Nothing emits a V4 graph yet: `seam::runner::generate_dense_backend` loads every tensor and
-    /// then refuses by name.
+    /// `seam::runner::generate_dense_backend` emits ratio-0 and ratio-128 layers and refuses a
+    /// ratio-4 layer by name.
     pub deepseek4: bool,
     /// DeepSeek V4 (`{arch}.attention.compress_ratios`): the per-layer compression ratio, and the
     /// MASTER per-layer switch — which caches a layer keeps and which tensors it carries both hang
@@ -477,9 +477,9 @@ impl Config {
 
     /// deepseek4: the per-pair rope frequency divisors (`rope_dim / 2` floats) of every rope on a
     /// COMPRESSED layer (ratio 4 or 128), at base [`Config::compress_rope_theta`]. `None` for
-    /// every other arch. Nothing applies it yet: the compressed tiers are refused before a graph
-    /// is built, and ratio-0 layers rope plain at [`Config::rope_theta`] (`deepseek4.cpp` passes
-    /// them `freq_scale = 1` and `ext_factor = 0`).
+    /// every other arch. The HCA emit applies it through `Op::Rope::freq_factors` (the runner's
+    /// `yarn_ff` Input); ratio-0 layers rope plain at [`Config::rope_theta`] (`deepseek4.cpp`
+    /// passes them `freq_scale = 1` and `ext_factor = 0`).
     ///
     /// How the reference's rope maps onto `Op::Rope`. `deepseek4.cpp` ropes the query, the kv
     /// row, the attention output's de-rope, each compressed row and the indexer query of a
@@ -664,6 +664,23 @@ impl Config {
     /// Whether any layer keeps a recurrent state ([`Config::is_recurrent_layer`]).
     pub fn has_recurrent_state(&self) -> bool {
         (0..self.n_layer).any(|il| self.is_recurrent_layer(il))
+    }
+
+    /// Whether a session of this model can only be continued, never rewound: some layer keeps
+    /// state that truncating the token list cannot take back. A recurrent layer
+    /// ([`Config::has_recurrent_state`]) is one; a DeepSeek V4 compressed layer
+    /// ([`Config::layer_compress_ratio`] non-zero) is the other. Its compressor ring holds the
+    /// rows of the last `ratio` (HCA) or `2*ratio` (CSA) positions written, whichever turn wrote
+    /// them, and its compressed cache holds blocks committed from those rows, so a turn that
+    /// rewound to a shared prefix would pool another turn's rows into its next block. llama.cpp
+    /// clears the whole cache on such a rewind unless it keeps rollback planes
+    /// (`llama_kv_cache_dsv4`'s `n_rs_seq`), which infr does not port.
+    ///
+    /// Every session path that would truncate a cache reads this: such a session re-prefills from
+    /// position 0 instead, and is reused only by a prompt that extends exactly what it holds.
+    pub fn has_unrewindable_state(&self) -> bool {
+        self.has_recurrent_state()
+            || (self.deepseek4 && (0..self.n_layer).any(|il| self.layer_compress_ratio(il) != 0))
     }
 
     /// f32 element counts of a recurrent layer's two state buffers, held in its K and V cache

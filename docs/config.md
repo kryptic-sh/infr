@@ -214,13 +214,14 @@ and these exist to force one off when bisecting a correctness or perf problem.
 
 - **`[kernels.vulkan]`** (the biggest section): capability masks (`coopmat`,
   `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), the `force_wave64` testing knob
-  (runs the wave64 path that AMD GCN takes on a device that can pin 32), GEMM/GEMV tiers (`gemm_warp`,
-  `mmq`, `mmv`, `mrow`, `moe_small_m`, the `[kernels.vulkan.gemv]` sub-table),
-  attention (`flash_warp`, `flash_splits`, `flash_min_rows`, `pv_splits`),
-  DeltaNet (`dn_chunk_scan`, `dn_chunk`, `dn_split`), and the plumbing switches
-  (`push_desc`, `pipeline_cache_disk`, `no_replay`, `no_vram_guard`, the BDA
-  chunk caps). Note `f16 = false` also disables coopmat regardless of `coopmat`,
-  matching `INFR_NO_F16`'s effect today.
+  (runs the wave64 path that AMD GCN takes on a device that can pin 32),
+  GEMM/GEMV tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, the
+  `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
+  `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
+  `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
+  `no_replay`, `no_vram_guard`, the BDA chunk caps). Note `f16 = false` also
+  disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
+  today.
 - **`[kernels.metal]`** — the Apple backend's native/CMM/RT kernel families per
   dtype, plus `deltanet`, `moe` and `pipeline_cache` (persist the compiled
   `MTLComputePipelineState`s as an `MTLBinaryArchive` under `~/.cache/infr`, so

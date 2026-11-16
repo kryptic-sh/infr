@@ -1995,6 +1995,47 @@ with `INFR_BF16_COOPMAT=1` — enabling a feature the device reports false is a
 device create FAILURE, and `ShaderBfloat16Features::enable` only asks for bits
 the query returned, which is exactly the code path nobody has run.
 
+### B-WAVE64-GCN-UNVERIFIED — the wave64 path has never run on GCN hardware here (2026-11-16)
+
+**Tag:** vulkan · amd · **Blocked on:** a GCN card (Polaris, Vega), issue #94
+
+Wave64-only devices run the wave32 kernels through `shaders/wave64.glsl` (ported
+from the KessokuNet fork, commit `b108ff42f` by korewaChino): every pipeline
+pins subgroup 64 and sets the `W64` specialization constant, and the subgroup
+builtins and reductions act on 32-lane halves. Cooperative matrix is off on that
+path (`caps::subgroup_mode`, the `!wave64` filter on `coopmat_f16`).
+
+- **Verified here (2026-11-16):** the same path on RDNA, forced with
+  `kernels.vulkan.force_wave64` (`INFR_FORCE_WAVE64=1`), under AMD's Windows
+  driver: the GPU gate (op parity, `infr-vulkan` lib, the `cpu_backend`
+  whole-model GPU-vs-CPU and golden tests, which honour the variable) passed on
+  the RX 7900 XTX except `gpu_seam_int8_prefill_tracks_cpu`, which asserts the
+  int8 coopmat GEMM ran and so cannot pass with coopmat off, and passed whole on
+  the RDNA2 iGPU (MoE tests left out there). Both drivers report a subgroup
+  range of [32, 64]. `ops::tests::subgroup_kernels_are_wave64_safe` checks every
+  built module statically.
+- **Observed once, not explained:** one forced run of `gpu_seam_golden_qwen3moe`
+  on the RX 7900 XTX failed with a KV capacity of 0, and one of four forced
+  `infr run`s of Qwen3-30B-A3B exceeded the VRAM budget after the measured
+  context clamp chose 6634 tokens against 0.96 GiB free. Both passed on rerun;
+  the free VRAM the clamp measures moved between 0.54 and 1.09 GiB across runs.
+  Two `INFR_NO_COOPMAT` runs did not fail, which is too few to say the wave64
+  path is or is not involved.
+- **Not verified by us:** GCN itself. The fork author reports two GPU-vs-CPU
+  model tests passing on an RX 580 (RADV, Mesa 26.2.5), on the original commit,
+  before our changes. GCN under AMD's Windows driver has not been run by anyone
+  we know of.
+- **Relies on, not guaranteed by the spec:** a 64-lane subgroup holds
+  `gl_LocalInvocationIndex` 64s..64s+63 in order, so its halves are the two
+  32-lane groups a wave32 device would form. The wave32 kernels already rely on
+  the same linear packing; RADV and AMD's drivers both pack that way.
+- **Integer inclusive scan:** `vw_inclusive_add` is float-only; an integer
+  `subgroupInclusiveAdd` in a kernel would convert through float on every
+  device. No kernel has one today.
+- **Possible later optimization:** the fork's wave64-native decode GEMV
+  (`a1f58563b` and follow-ups) uses all 64 lanes instead of two halves. A
+  32-wide workgroup on this path leaves half of each wave idle.
+
 ### B-HWDET-NO-ARCH-BUCKET — the per-op subgroup-width table is still not representable, and is still a guess (2026-08-11)
 
 **Tag:** vulkan · detection · **Blocked on:** a measurement nobody can take here
@@ -2011,10 +2052,10 @@ unjustified:
   change to the kernel-cache key, and the evidence for it is upstream's tuning
   of DIFFERENT kernels on hardware that is not here. Still a guess, deliberately
   not built.
-- **Wave64-only hardware stays unsupported by rule**: the backend hard-refuses
-  any device that cannot pin subgroup 32, before the bucket is ever consulted.
-  Recorded as a decision, not a gap. `DeviceArch::AmdGcn` exists only so such a
-  part is classified as known-unsupported rather than unknown.
+- **Wave64-only hardware runs through an emulation, not a per-op table**: a
+  device that cannot pin 32 but can pin 64 (AMD GCN) takes the wave64 path,
+  which is decided from the subgroup range (`caps::subgroup_mode`), not from the
+  bucket. See B-WAVE64-GCN-UNVERIFIED for what is and is not verified.
 
 ### B-NVSHAPE-COOPMAT2 — `VK_NV_cooperative_matrix2` is gated and researched; the kernel path does not exist (2026-08-11)
 
@@ -3581,8 +3622,9 @@ Not verified, because no device here can show it:
   already have a minimum of 32, so no test fails without the pin; it needs a
   device whose default subgroup is narrower (Intel ANV at SIMD16).
 - A device missing `shaderInt8` or `computeFullSubgroups` is refused at backend
-  creation with the feature named, after the wave32 check. The check itself has
-  a unit test; the call site has never run against a device that lacks either.
+  creation with the feature named, after the subgroup check. The check itself
+  has a unit test; the call site has never run against a device that lacks
+  either.
 - An `Activations` or `KvCache` buffer larger than `maxStorageBufferRange` is
   refused at creation, since both are bound whole. On RADV no buffer can be
   created that large. On a driver with a lower limit, an over-size KV cache

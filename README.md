@@ -234,12 +234,15 @@ is indexed at [`docs/perf/`](docs/perf/README.md).
   GPU by default via the paged expert cache, 37 GB Q2_K on a 24 GB card; pure
   CPU under `--dev cpu`); BitNet b1.58 (`bitnet` and Microsoft's `bitnet-b1.58`,
   ternary weights, CPU + GPU)
-- **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple
-  via a native **Metal backend** (`--dev metal`) covering every op the CPU
-  reference does — dense, MoE (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is
-  optimized (simdgroup-matrix GEMM + flash attention, raw-block quant decode;
-  decode at parity with llama.cpp Metal on M3 Pro, prefill 0.80–0.92× of it —
-  architecture and numbers in [`docs/metal.md`](docs/metal.md))
+- **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul; older
+  wave64-only AMD GCN cards such as Polaris and Vega run the same kernels as
+  32-lane halves of each 64-lane wave, without coopmat, community-tested on an
+  RX 580 only); Apple via a native **Metal backend** (`--dev metal`) covering
+  every op the CPU reference does — dense, MoE (`qwen3moe`) and Qwen3.5
+  (`qwen35`). Dense is optimized (simdgroup-matrix GEMM + flash attention,
+  raw-block quant decode; decode at parity with llama.cpp Metal on M3 Pro,
+  prefill 0.80–0.92× of it — architecture and numbers in
+  [`docs/metal.md`](docs/metal.md))
 - **Store:** the shared **HuggingFace Hub cache** — located via `$HF_HUB_CACHE`,
   else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`, in HF's own
   `models--<org>--<repo>/{blobs,snapshots,refs}` layout. A model pulled by

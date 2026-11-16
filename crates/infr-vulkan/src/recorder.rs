@@ -132,30 +132,28 @@ const MAX_DISPATCH_BINDINGS: usize = 16;
 /// wave) to feed enough MLP at low `out_f`, where the RM=1 grid (out_f workgroups) is too shallow
 /// to hide DRAM latency — the big GEMVs (lm_head/gate+up, out_f ≥ ~16k) already saturate on RM=1
 /// so they stay there. Only Q4_K/Q6_K have RM builds ([`crate::gemm::native_rm_streamed_build_spv`]).
-/// Tunable for A/B: `INFR_NO_GEMV_RM` forces the RM=1 path; `INFR_GEMV_RM`=2|4 forces the factor;
-/// `INFR_GEMV_RM_MAXOUT` overrides the out_f gate.
+/// Tunable for A/B through the `gemv_rm.*` tuning parameters (`gemv_rm.enabled = false` forces
+/// the RM=1 path, `gemv_rm.rows` = 2|4 the factor, `gemv_rm.min_out`/`max_out` the out_f gate;
+/// `INFR_NO_GEMV_RM`, `INFR_GEMV_RM`, `INFR_GEMV_RM_MINOUT`/`_MAXOUT` are their aliases).
 ///
-/// `k` is [`GemvCfg`](infr_core::config::GemvCfg) off the backend's `Config` — borrowed from the
-/// recorder, never re-resolved. It replaced a `OnceLock<GemvKnobs>` that re-read ~10 env vars
-/// process-once: the memo is gone AND the value is now settable per backend, at the same per-GEMV
-/// cost (a field read off a reference).
+/// `t` is the backend's resolved tuning set, borrowed — a field read per GEMV, never a lookup.
 fn native_rm_choice(
     dtype: infr_core::DType,
     out_f: usize,
-    k: &infr_core::config::GemvCfg,
+    t: &crate::tuning::Tuning,
 ) -> Option<u32> {
     use infr_core::DType::*;
-    if !matches!(dtype, Q4K | Q6K) || k.no_rm {
+    if !matches!(dtype, Q4K | Q6K) || !t.gemv_rm_enabled {
         return None;
     }
-    let max_out = k.rm_maxout;
+    let max_out = t.gemv_rm_max_out;
     // Below ~2k outputs the RM=1 grid is already shallow; halving it starves the machine (k/v,
     // out_f=1024, regressed in the cold A/B), so those stay on RM=1.
-    let min_out = k.rm_minout;
+    let min_out = t.gemv_rm_min_out;
     if out_f > max_out || out_f < min_out {
         return None;
     }
-    let rm = k.rm;
+    let rm = t.gemv_rm_rows;
     (rm == 2 || rm == 4).then_some(rm)
 }
 
@@ -166,13 +164,14 @@ fn native_rm_choice(
 /// bit-identical), so it is gated to the latency-starved projection BAND ONLY: the big lm_head /
 /// gate+up GEMVs (out_f ≥ ~16k) already saturate on the tree kernel and subgroupAdd measured a ~20%
 /// occupancy regression there. Q6_K ONLY (see below) — no Q4_K SG build exists.
-/// Env: `INFR_NO_GEMV_SG` forces the tree/RM path; `INFR_GEMV_SG_NR`=2|4|8 overrides NR;
-/// `INFR_GEMV_SG_MINOUT`/`INFR_GEMV_SG_MAXOUT` override the band.
+/// Tuning: `gemv_sg.enabled = false` forces the tree/RM path; `gemv_sg.rows`=2|4|8 sets NR;
+/// `gemv_sg.min_out`/`max_out` set the band (aliases `INFR_NO_GEMV_SG`, `INFR_GEMV_SG_NR`,
+/// `INFR_GEMV_SG_MINOUT`/`_MAXOUT`).
 fn native_sg_choice(
     dtype: infr_core::DType,
     in_f: usize,
     out_f: usize,
-    k: &infr_core::config::GemvCfg,
+    t: &crate::tuning::Tuning,
 ) -> Option<u32> {
     use infr_core::DType::*;
     // Q6_K ONLY: the heavier Q6_K decode (210-byte super-blocks, more unpack ALU) is where wave32 +
@@ -181,19 +180,19 @@ fn native_sg_choice(
     // out_f≈2048 (attn_v, out_f=1024: grid too shallow) and above the band (lm_head, out_f=151936:
     // already peak on the tree kernel + subgroupAdd occupancy regression) — so the band is the
     // out_f≈4096 Q6_K projections (ffn_down / o). Default NR=2 (best at every winning shape).
-    if !matches!(dtype, Q6K) || k.no_sg {
+    if !matches!(dtype, Q6K) || !t.gemv_sg_enabled {
         return None;
     }
     // wave32 lanes stride 32-elem sub-blocks; in_f must be a multiple of 32 (all projections are).
     if !in_f.is_multiple_of(32) {
         return None;
     }
-    let min_out = k.sg_minout;
-    let max_out = k.sg_maxout;
+    let min_out = t.gemv_sg_min_out;
+    let max_out = t.gemv_sg_max_out;
     if out_f < min_out || out_f > max_out {
         return None;
     }
-    let nr = k.sg_nr;
+    let nr = t.gemv_sg_rows;
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
@@ -203,16 +202,17 @@ fn native_sg_choice(
 /// largest SG win of all decode shapes) AND Q5_K (Qwen3.6-A3B UD-quant stores most expert downs as
 /// Q5_K at the same out_f≈2048 shape; A/B-confirmed a win — Q4_K idm already saturates and stays on
 /// the tree). Kept independent of `native_sg_choice` so the byte-identical dense SG path is untouched.
-/// Env: `INFR_NO_GEMV_ID_SG` forces the tree id path (id-only escape); `INFR_NO_GEMV_SG` disables BOTH
-/// the dense and id SG routes; `INFR_GEMV_SG_MINOUT`/`MAXOUT`/`INFR_GEMV_SG_NR` are the shared knobs.
+/// Tuning: `gemv_id_sg.enabled = false` forces the tree id path (id-only escape, alias
+/// `INFR_NO_GEMV_ID_SG`); `gemv_sg.enabled = false` (`INFR_NO_GEMV_SG`) disables BOTH the dense and
+/// id SG routes; `gemv_sg.min_out`/`max_out`/`rows` are the shared knobs.
 fn native_id_sg_choice(
     dtype: infr_core::DType,
     in_f: usize,
     out_f: usize,
-    k: &infr_core::config::GemvCfg,
+    t: &crate::tuning::Tuning,
 ) -> Option<u32> {
     use infr_core::DType::*;
-    if k.no_id_sg || k.no_sg {
+    if !t.gemv_id_sg_enabled || !t.gemv_sg_enabled {
         return None;
     }
     // Heavy K-quant decodes only (Q6_K/Q5_K): the extra unpack ALU is where wave32 + subgroupAdd's
@@ -240,12 +240,12 @@ fn native_id_sg_choice(
     if !in_f.is_multiple_of(32) {
         return None;
     }
-    let min_out = k.sg_minout;
-    let max_out = k.sg_maxout;
+    let min_out = t.gemv_sg_min_out;
+    let max_out = t.gemv_sg_max_out;
     if out_f < min_out || out_f > max_out {
         return None;
     }
-    let nr = k.sg_nr;
+    let nr = t.gemv_sg_rows;
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
@@ -306,7 +306,7 @@ fn assert_native_k(kernel: &str, in_f: usize) {
 
 /// 32-element blocks `quant_q8.comp` quantizes per workgroup, one subgroup each. MIRRORS the
 /// shader's `QUANT_Q8_BLOCKS_PER_WG`; `quant_q8_blocks_per_wg_matches_shader` fails on a drift.
-const QUANT_Q8_BLOCKS_PER_WG: usize = 8;
+pub(crate) const QUANT_Q8_BLOCKS_PER_WG: usize = 8;
 
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
@@ -683,8 +683,27 @@ const BDA_CHUNK_UNIT_MAX: u64 = 1 << 32;
 /// two-output layout leaves lanes of the workgroup idle; an integrated GPU at every width, where
 /// it measured faster at every LFM3-1.7B decode shape on the RDNA2 iGPU (the per-op timings are
 /// in the CHANGELOG and backlog B188).
-fn mmv_o4(vk: &infr_core::config::VulkanCfg, in_f: usize, integrated: bool) -> bool {
-    vk.mmv_o4 && (in_f < 2048 || integrated)
+fn mmv_o4(vk: &infr_core::config::VulkanCfg, in_f: usize, o4: MmvO4) -> bool {
+    vk.mmv_o4 && (in_f < o4.max_in_f || o4.all_widths)
+}
+
+/// When [`mmv_o4`] takes the four-outputs build: the `mmv_mrow.o4_max_in_f` and
+/// `mmv_mrow.o4_all_widths` tuning parameters (the latter on by default on an integrated GPU).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MmvO4 {
+    /// Below this input width.
+    pub max_in_f: usize,
+    /// At every width.
+    pub all_widths: bool,
+}
+
+impl MmvO4 {
+    pub(crate) fn of(t: &crate::tuning::Tuning) -> Self {
+        Self {
+            max_in_f: t.mmv_o4_max_in_f,
+            all_widths: t.mmv_o4_all_widths,
+        }
+    }
 }
 
 /// The int8 dp4a multi-row GEMV build [`Recorder::linear_mmv_mrow_at`] dispatches for `rows`
@@ -700,7 +719,7 @@ pub(crate) fn mmv_mrow_variant(
     rows: usize,
     in_f: usize,
     res: bool,
-    integrated: bool,
+    o4: MmvO4,
 ) -> Option<(&'static str, &'static [u32], u32)> {
     if rows > 8 {
         if res {
@@ -708,7 +727,7 @@ pub(crate) fn mmv_mrow_variant(
         }
         return crate::gemm::native_mmv_mrow_m16_spv(dtype).map(|(n, s)| (n, s, 2));
     }
-    let o4 = mmv_o4(vk, in_f, integrated);
+    let o4 = mmv_o4(vk, in_f, o4);
     let m4 = rows <= 4 && vk.mmv_m4;
     crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
         .map(|(n, s)| (n, s, if o4 { 4 } else { 2 }))
@@ -722,9 +741,9 @@ pub(crate) fn mmv_mrow_fuseq_variant(
     dtype: infr_core::DType,
     in_f: usize,
     res: bool,
-    integrated: bool,
+    o4: MmvO4,
 ) -> Option<(&'static str, &'static [u32], u32)> {
-    let o4 = mmv_o4(vk, in_f, integrated);
+    let o4 = mmv_o4(vk, in_f, o4);
     crate::gemm::native_mmv_mrow_variant_fuseq_spv(dtype, o4, true, res)
         .map(|(n, s)| (n, s, if o4 { 4 } else { 2 }))
 }
@@ -1186,10 +1205,10 @@ impl<'a> Recorder<'a> {
         &self.be.cfg().kernels.vulkan
     }
 
-    /// The native-GEMV routing sub-config (`INFR_GEMV_*` / `INFR_NO_GEMV_*`), borrowed.
+    /// The backend's resolved tuning set (the native-GEMV routing among it), borrowed.
     #[inline]
-    fn gemv(&self) -> &infr_core::config::GemvCfg {
-        &self.vk().gemv
+    fn tuning(&self) -> &crate::tuning::Tuning {
+        self.be.tuning()
     }
 
     /// The `(elem, byte)` u32 addressing caps for chunked dense GEMV dispatch — the two values
@@ -3472,7 +3491,7 @@ impl<'a> Recorder<'a> {
         // `_streamed` twin (the build tables are 1:1 mirrored — see `linear_native`'s doc). Every
         // branch reachable here has a streamed kernel to route to.
         if rows == 1 {
-            if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
+            if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.tuning()) {
                 if crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
                     .is_some()
                 {
@@ -3480,13 +3499,13 @@ impl<'a> Recorder<'a> {
                     return;
                 }
             }
-            if let Some(v) = &self.gemv().variant {
+            if let Some(v) = &self.tuning().gemv_variant {
                 if crate::gemm::native_rm_v2_streamed_build_spv(v, dtype, false).is_some() {
                     self.linear_native_rm_v2_at(v, dtype, arena_addr, w_base, x, y, in_f, out_f);
                     return;
                 }
             }
-            if let Some(rm) = native_rm_choice(dtype, out_f, self.gemv()) {
+            if let Some(rm) = native_rm_choice(dtype, out_f, self.tuning()) {
                 if crate::gemm::native_rm_streamed_build_spv(dtype, false, rm).is_some() {
                     self.linear_native_rm_at(dtype, arena_addr, w_base, x, y, in_f, out_f, rm);
                     return;
@@ -3881,14 +3900,20 @@ impl<'a> Recorder<'a> {
         }
         let res = residual.is_some();
         // Callers gate on this same lookup (`mmv_mrow_variant`), so a miss is a caller bug.
-        let (name, spv, outs) =
-            mmv_mrow_variant(self.vk(), dtype, rows, in_f, res, self.be.caps().integrated)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "linear_mmv_mrow_at: no int8 mrow build for {dtype:?} rows={rows} \
+        let (name, spv, outs) = mmv_mrow_variant(
+            self.vk(),
+            dtype,
+            rows,
+            in_f,
+            res,
+            MmvO4::of(self.be.tuning()),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "linear_mmv_mrow_at: no int8 mrow build for {dtype:?} rows={rows} \
                      in_f={in_f} residual={res} under the mmv_o4/mmv_m4 knobs"
-                    )
-                });
+            )
+        });
         let groups = (out_f as u32).div_ceil(outs);
         let nbind = if res { 6 } else { 5 };
         let k = self.be.kernel(name, spv, nbind, 24);
@@ -4051,7 +4076,7 @@ impl<'a> Recorder<'a> {
         let res = residual.is_some();
         // Callers gate on this same lookup (`mmv_mrow_fuseq_variant`), so a miss is a caller bug.
         let (name, spv, outs) =
-            mmv_mrow_fuseq_variant(self.vk(), dtype, in_f, res, self.be.caps().integrated)
+            mmv_mrow_fuseq_variant(self.vk(), dtype, in_f, res, MmvO4::of(self.be.tuning()))
                 .unwrap_or_else(|| {
                     panic!(
                         "linear_mmv_mrow_fuseq: no FUSE_QUANT build for {dtype:?} residual={res}"
@@ -4134,7 +4159,7 @@ impl<'a> Recorder<'a> {
         ];
         // Reassociation-tolerant subgroup route — precedence over RM, mirrors linear_add_native.
         if rows == 1 {
-            if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
+            if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.tuning()) {
                 if let Some((name, spv)) =
                     crate::gemm::native_sg_streamed_build_spv(dtype, true, nr, self.sg16())
                 {
@@ -4146,7 +4171,7 @@ impl<'a> Recorder<'a> {
         }
         // Multi-output-row route — mirrors linear_add_native's variant-then-RM fallback.
         if rows == 1 {
-            if let Some(v) = &self.gemv().variant {
+            if let Some(v) = &self.tuning().gemv_variant {
                 if let Some((name, spv)) =
                     crate::gemm::native_rm_v2_streamed_build_spv(v, dtype, true)
                 {
@@ -4156,7 +4181,7 @@ impl<'a> Recorder<'a> {
                     return;
                 }
             }
-            if let Some(rm) = native_rm_choice(dtype, out_f, self.gemv()) {
+            if let Some(rm) = native_rm_choice(dtype, out_f, self.tuning()) {
                 if let Some((name, spv)) =
                     crate::gemm::native_rm_streamed_build_spv(dtype, true, rm)
                 {
@@ -4856,7 +4881,8 @@ impl<'a> Recorder<'a> {
         // limits cannot hold the 1024-wide workgroup decodes on the 256-thread build too: same
         // bindings, same push block, same result.
         let wide = rows == 1
-            && dim >= 2048
+            && self.be.tuning().rmsnorm_wide
+            && dim >= self.be.tuning().rmsnorm_wide_min_dim
             && dim.is_multiple_of(4)
             && self
                 .be
@@ -5671,27 +5697,10 @@ impl<'a> Recorder<'a> {
         // capacity while each grinds a huge kv reduction → split the kv dim across gl_WorkGroupID.y
         // into partials, then sum them.
         let pv_base_wg = (mpad / 64) * (hdu / 64) * nh as u32;
-        // `pv_splits` is `Option<usize>` in the config; the dispatch count is a u32, so an
-        // out-of-range override falls back to the adaptive policy exactly as `.parse::<u32>().ok()`
-        // did at the old env read. Zero is out of range too: it is the `ksplit` divisor below.
-        let n_splits = match self
-            .vk()
-            .pv_splits
-            .and_then(|v| u32::try_from(v).ok())
-            .filter(|&v| v > 0)
-        {
-            Some(v) => v,
-            None => {
-                if pv_base_wg >= 1024 || kv_pad < 4096 {
-                    1u32
-                } else {
-                    (2048 / pv_base_wg.max(1))
-                        .clamp(2, 8)
-                        .min(kv_pad / 2048)
-                        .max(1)
-                }
-            }
-        };
+        // The `attn_pv.*` tuning parameters: a fixed count (`attn_pv.splits`, alias
+        // `INFR_PV_SPLITS`, never 0 here — 0 selects the policy, and the `pv_splits` alias maps
+        // 0 and a value past u32 to it, as the old env read did), else the adaptive policy.
+        let n_splits = self.be.tuning().pv.count(pv_base_wg, kv_pad);
         let ksplit = kv_pad.div_ceil(n_splits).div_ceil(32) * 32;
         // 8-warp/256-thread PV warptile (BN=128=hd, matches ollama's mul_mm) when hd%128; else the
         // 4-warp/2×2 attn_pv (also handles hd<128, e.g. hd=64). INFR_NO_PV_WARP forces the 4-warp.
@@ -5800,24 +5809,8 @@ impl<'a> Recorder<'a> {
             );
         }
         let base_wg = (mpad / 64) * nh as u32;
-        // A zero override falls back like an out-of-range one (see `attention_prefill_nonfa`).
-        let n_splits = match self
-            .vk()
-            .flash_splits
-            .and_then(|v| u32::try_from(v).ok())
-            .filter(|&v| v > 0)
-        {
-            Some(v) => v,
-            None => {
-                if base_wg >= 1024 || kv_len < 4096 {
-                    1u32
-                } else {
-                    (2048 / base_wg.max(1))
-                        .clamp(2, 8)
-                        .min((kv_len / 2048).max(1) as u32)
-                }
-            }
-        };
+        // `attn_flash.splits` (alias `INFR_FLASH_SPLITS`), else the `attn_flash.*` policy.
+        let n_splits = self.be.tuning().flash.count(base_wg, kv_len as u32);
         // hd=128 → register-blocked partial (always via partial+combine). Other hd → the
         // 4-subgroup path: single fused kernel for n_splits==1, else the scalar partial.
         //
@@ -5830,7 +5823,7 @@ impl<'a> Recorder<'a> {
                                                             // `INFR_FLASH_BM=32` (`kernels.vulkan.flash_bm32` — compared to the LITERAL "32")
                                                             // forces the small (29056 B) tile even on a 64 KB device, so the bm=32 shaders get
                                                             // numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
-        let force_bm32 = self.vk().flash_bm32;
+        let force_bm32 = self.be.tuning().flash_force_bm32;
         // Partial tiles (rows < 64, the small-m deep-kv tier) take BM=32: half the padded-row
         // waste and half the shared scratch (2x resident workgroups). Measured @d16384 on a
         // 7900 XTX: pp24 1122 -> 1312 t/s, pp32 1510 -> 1734 (llama.cpp: 1313/1933). Full
@@ -6056,24 +6049,8 @@ impl<'a> Recorder<'a> {
             64
         };
         let base_wg = (mpad / br) * nh as u32;
-        // A zero override falls back like an out-of-range one (see `attention_prefill_nonfa`).
-        let n_splits = match self
-            .vk()
-            .flash_splits
-            .and_then(|v| u32::try_from(v).ok())
-            .filter(|&v| v > 0)
-        {
-            Some(v) => v,
-            None => {
-                if base_wg >= 1024 || kv_len < 4096 {
-                    1u32
-                } else {
-                    (2048 / base_wg.max(1))
-                        .clamp(2, 8)
-                        .min((kv_len / 2048).max(1) as u32)
-                }
-            }
-        };
+        // `attn_flash.splits` (alias `INFR_FLASH_SPLITS`), else the `attn_flash.*` policy.
+        let n_splits = self.be.tuning().flash.count(base_wg, kv_len as u32);
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
         let bda = kv_addr.is_some();
         let (rname, rspv): (&'static str, &[u32]) = match (br == 64, bda) {
@@ -10209,7 +10186,7 @@ impl<'a> Recorder<'a> {
         push[28..32].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let bufs = [Self::vkb(x), Self::vkb(x), Self::vkb(ids), Self::vkb(y)];
         if rows == 1 {
-            if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f, self.gemv()) {
+            if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f, self.tuning()) {
                 if let Some((name, spv)) =
                     crate::gemm::native_idm_sg_build_spv(dtype, nr, self.sg16())
                 {

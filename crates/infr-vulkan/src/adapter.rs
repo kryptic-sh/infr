@@ -158,23 +158,17 @@ fn is_kv_inline_decode(dt: infr_core::DType) -> bool {
 /// path re-reads a shared expert's weight once per occurrence, so it degrades faster). `8` sits
 /// right at the edge of the small path's win region with headroom to spare.
 ///
-/// `INFR_MOE_SMALL_M` overrides the threshold for experimentation, clamped to the knob's `max`:
-/// the small path's GEMV dispatches one workgroup PER (row, slot, out-column) with no row-tile
-/// batching, so at the seam's normal prefill chunk size (`INFR_UBATCH`, 1024 rows by default) an
-/// UNCLAMPED override turns every prefill chunk into a multi-second single dispatch — this isn't
-/// just slow, it trips the amdgpu ring watchdog and device-losts the whole process (reproduced:
-/// `INFR_MOE_SMALL_M=100000` on a 1024-row chunk hangs the GPU; see `runner.rs`'s UBATCH doc for
-/// the same failure class with an unchunked prefill).
-const MOE_SMALL_M: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
-    env: "INFR_MOE_SMALL_M",
-    default: 8,
-    min: 0,
-    max: 64,
-};
-
+/// The threshold is the `moe.small_m` tuning parameter (alias `INFR_MOE_SMALL_M`), whose range
+/// stops at 64: the small path's GEMV dispatches one workgroup PER (row, slot, out-column) with no
+/// row-tile batching, so at the seam's normal prefill chunk size (`INFR_UBATCH`, 1024 rows by
+/// default) an UNBOUNDED value turns every prefill chunk into a multi-second single dispatch — this
+/// isn't just slow, it trips the amdgpu ring watchdog and device-losts the whole process
+/// (reproduced: `INFR_MOE_SMALL_M=100000` on a 1024-row chunk hangs the GPU; see `runner.rs`'s
+/// UBATCH doc for the same failure class with an unchunked prefill). The alias still clamps an
+/// over-range value to 64, as the old read site did.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn moe_small_m_threshold(be_: &VulkanBackend) -> usize {
-    MOE_SMALL_M.clamped(be_.cfg().kernels.vulkan.moe_small_m)
+    be_.tuning().moe_small_m
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -838,6 +832,7 @@ fn unified_mmv_row1(_caps: &infr_core::backend::Capabilities) -> bool {
 fn mmv_mw_choice(
     caps: &infr_core::backend::Capabilities,
     vk: &infr_core::config::VulkanCfg,
+    t: &crate::tuning::Tuning,
     dt: infr_core::DType,
     in_f: usize,
     out_f: usize,
@@ -851,24 +846,18 @@ fn mmv_mw_choice(
     if !in_f.is_multiple_of(32) || in_f * out_f < (2usize << 20) {
         return None;
     }
-    // Default WARPS is per-dtype: Q4_K defaults to 1 (llama.cpp's rm_kq_int=1 shape — one output
-    // row per workgroup / single-subgroup reduce, the dispatch-shape sweep winner on AMD). Every
-    // other dtype defaults to 8. Q4_K warps=1 beats {4,8} and beats the f32 path. Overrideable
-    // via INFR_MMV_MW_WARPS for A/B.
-    let default_warps = if dt == infr_core::DType::Q4K {
-        1u32
-    } else {
-        8u32
-    };
-    let warps = vk
-        .mmv_mw_warps
-        .and_then(|w| u32::try_from(w).ok())
-        .unwrap_or(default_warps);
+    // WARPS is the per-dtype `mmv_mw.warps` tuning parameter: Q4_K defaults to 1 (llama.cpp's
+    // rm_kq_int=1 shape — one output row per workgroup / single-subgroup reduce, the
+    // dispatch-shape sweep winner on AMD), every other dtype to 8. Q4_K warps=1 beats {4,8} and
+    // beats the f32 path. `INFR_MMV_MW_WARPS` is its alias (every dtype at once). Every dtype the
+    // decode set can hold has a qualifier (`mmv_mw_dtypes_have_a_warps_qualifier`).
+    let warps = t.mmv_mw_warps(dt)?;
     // SPIR-V existence gate: the unified rows=1 path dispatches exactly the build this lookup
     // names (same knobs, same residual flag), so a `Some` here can never reach a variant the
     // recorder lacks — the residual builds exist only under `mmv_m4`, and not for every dtype.
     let have_spv =
-        crate::recorder::mmv_mrow_variant(vk, dt, 1, in_f, res, caps.integrated).is_some();
+        crate::recorder::mmv_mrow_variant(vk, dt, 1, in_f, res, crate::recorder::MmvO4::of(t))
+            .is_some();
     have_spv.then_some(warps)
 }
 
@@ -1022,21 +1011,11 @@ const ATTN_MROWS_CHUNK: usize = 256;
 /// Flash-decoding split-K chunk policy: ~32 chunks/head, each 64..512 keys, floor-rounded (the
 /// measured Vulkan `attn_partial` shape — see [`infr_core::tier::ChunkRounding`] for why the
 /// rounding is config and not a shared constant).
-const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
+pub(crate) const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
     target_chunks: 32,
     min_chunk: 64,
     max_chunk: 512,
     rounding: infr_core::tier::ChunkRounding::Down,
-};
-
-/// Canvas-mask (`AttnMask::Canvas`) chunk DIVISOR: the canvas span is cut into ~this many chunks
-/// rather than sized adaptively (the fixed `lo` override makes the span short and known). The
-/// floor of 1 keeps the `kv_len.div_ceil(n)` below from dividing by zero.
-const CANVAS_CHUNK_N: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
-    env: "INFR_CANVAS_CHUNK_N",
-    default: 3,
-    min: 1,
-    max: usize::MAX,
 };
 
 /// Whether static attention takes the rows-batched split-K tier (`attn_partial_mrows_c256`; see
@@ -1064,8 +1043,8 @@ fn batched_attn_ok(
         && ((rows >= 12 && kv_len >= 8192) || mrows_attn == Some(true))
 }
 
-/// The DiffusionGemma canvas split-K chunk: the canvas span cut into ~`n` chunks (see
-/// [`CANVAS_CHUNK_N`]), below `kv_len` so the split has at least two chunks, and never past the
+/// The DiffusionGemma canvas split-K chunk: the canvas span cut into ~`n` chunks (the
+/// `attn_canvas.chunks` tuning parameter, at least 1, so the division is safe), below `kv_len` so the split has at least two chunks, and never past the
 /// `attn_partial` bound — a longer canvas takes more chunks, not longer ones.
 fn canvas_chunk(kv_len: usize, n: usize) -> usize {
     kv_len
@@ -1089,12 +1068,11 @@ fn split_k_chunk_count_cap(span: usize, chunk: usize) -> usize {
 /// Shared by `quant_linear`'s coopmat warp tile and `float_linear`'s F16 split-K arm, resident
 /// and streamed alike.
 ///
-/// The window is `max(SPLIT_K_FIXED_GRID, SPLIT_K_FILL_PER_CU · compute_units)`: a CU count can
-/// only widen it, never shrink it below the fixed window every device ran before. Callers pass
-/// [`split_k_compute_units`], which is 0 (the fixed window) wherever the scaling is unmeasured.
-fn split_k_plan(m: usize, in_f: usize, out_f: usize, compute_units: u32) -> usize {
+/// `window` is [`split_k_window`]: a GEMM whose plain tile grid is below that many workgroups
+/// splits, aiming at twice it.
+fn split_k_plan(m: usize, in_f: usize, out_f: usize, window: usize) -> usize {
     let narrow_grid = m.div_ceil(64) * (out_f / 128).max(1);
-    let below = SPLIT_K_FIXED_GRID.max(SPLIT_K_FILL_PER_CU * compute_units as usize);
+    let below = window;
     if out_f.is_multiple_of(128) && in_f >= 1024 && narrow_grid < below {
         (2 * below / narrow_grid).next_power_of_two().clamp(1, 8)
     } else {
@@ -1102,12 +1080,26 @@ fn split_k_plan(m: usize, in_f: usize, out_f: usize, compute_units: u32) -> usiz
     }
 }
 
-/// The compute-unit count [`split_k_plan`] scales its window by: the device's on the AMD
-/// proprietary driver, the only driver the scaled window was measured on, and 0 (the fixed
-/// window) on every other driver — RADV (where the fixed window was tuned), NVIDIA, Intel —
-/// until someone measures them (docs/backlog.md B-NVSHAPE-CORECOUNT says what to run).
-fn split_k_compute_units(be_: &VulkanBackend) -> u32 {
-    split_k_cu_for_driver(be_.amd_proprietary_driver(), be_.caps().compute_units)
+/// [`split_k_plan`]'s window: `max(split_k.fixed_grid, split_k.fill_per_cu · compute_units)`
+/// with `split_k.scale_by_cu` on, else the fixed window alone — so a CU count can only widen it,
+/// never shrink it below the fixed window every device ran before. `scale_by_cu` is off by
+/// default and on only where the table's `amd-proprietary-split-k` row matches: the AMD
+/// proprietary driver, the only driver the scaled window was measured on. RADV (where the fixed
+/// window was tuned), NVIDIA and Intel stay on the fixed window until someone measures them
+/// (docs/backlog.md B-NVSHAPE-CORECOUNT says what to run).
+fn split_k_window(t: &crate::tuning::Tuning, compute_units: u32) -> usize {
+    let cu = if t.split_k_scale_by_cu {
+        compute_units as usize
+    } else {
+        0
+    };
+    t.split_k_fixed_grid
+        .max(t.split_k_fill_per_cu.saturating_mul(cu))
+}
+
+/// [`split_k_window`] on `be_`'s device.
+fn split_k_device_window(be_: &VulkanBackend) -> usize {
+    split_k_window(be_.tuning(), be_.caps().compute_units)
 }
 
 impl VulkanBackend {
@@ -1115,31 +1107,9 @@ impl VulkanBackend {
     /// this device (1 = none): `split_k_plan` at this device's compute-unit window, the decision
     /// the `Op::Linear` dispatch consults. Public so a route test reads it instead of restating it.
     pub fn split_k_splits(&self, m: usize, in_f: usize, out_f: usize) -> usize {
-        split_k_plan(m, in_f, out_f, split_k_compute_units(self))
+        split_k_plan(m, in_f, out_f, split_k_device_window(self))
     }
 }
-
-/// [`split_k_compute_units`]'s rule, pure for its unit test.
-fn split_k_cu_for_driver(amd_proprietary: bool, compute_units: u32) -> u32 {
-    if amd_proprietary {
-        compute_units
-    } else {
-        0
-    }
-}
-
-/// [`split_k_plan`]'s window floor: split a GEMM whose plain tile grid is below this many
-/// workgroups, aiming at twice it — the whole window when the CU count is 0 or small.
-const SPLIT_K_FIXED_GRID: usize = 128;
-
-/// [`split_k_plan`]'s window per compute unit: split a GEMM whose plain tile grid is below this
-/// many workgroups per CU, aiming at twice it. Measured on the RX 7900 XTX (96 CUs, AMD Windows
-/// driver) with `INFR_PROF_OPS` at pp512, plain tile vs split: Qwen3-30B-A3B `attn_output`
-/// (k=4096, n=2048, 128 wgs) 458 → 302 us, SmolLM3-3B `ffn_down` (k=11008, n=2048) 1392 → 962
-/// us; the fixed 128-wg window left those shapes on the plain tile. 4 and 5.3 per CU measured
-/// alike; 2.7 per CU slowed ERNIE-4.5's k=2560 n=3072 projection (349 → 404 us, two splits)
-/// where 4 per CU picks four (354 us). Below 32 CUs the fixed floor is the larger term.
-const SPLIT_K_FILL_PER_CU: usize = 4;
 
 /// The int8 cooperative-matrix K-quant prefill GEMM tile for a Linear (`native_gemm_i8cm_kq.comp`),
 /// or `None` when the shape is off every tile and the f16 coopmat GEMM takes it. The caller has
@@ -1153,6 +1123,7 @@ fn i8cm_kq_choice(
     out_f: usize,
     w_off: usize,
     compute_units: u32,
+    l_fill_per_cu: usize,
 ) -> Option<crate::gemm::I8cmTile> {
     use crate::gemm::I8cmTile;
     use infr_core::DType::{Q4K, Q5K, Q6K};
@@ -1161,7 +1132,7 @@ fn i8cm_kq_choice(
     }
     let grid = |t: I8cmTile| m.div_ceil(t.tokens()) * (out_f / t.rows());
     let tile = if out_f.is_multiple_of(I8cmTile::L.rows())
-        && grid(I8cmTile::L) >= I8CM_L_FILL_PER_CU * compute_units as usize
+        && grid(I8cmTile::L) >= l_fill_per_cu.saturating_mul(compute_units as usize)
     {
         I8cmTile::L
     } else if out_f.is_multiple_of(I8cmTile::M.rows()) {
@@ -1173,9 +1144,6 @@ fn i8cm_kq_choice(
     // `maxComputeWorkGroupCount[0]` stays on the f16 GEMM rather than truncate.
     (grid(tile) <= Recorder::MAX_GROUP_COUNT_X as usize).then_some(tile)
 }
-
-/// [`i8cm_kq_choice`]'s large-tile threshold: workgroups of the large tile per compute unit.
-const I8CM_L_FILL_PER_CU: usize = 2;
 
 /// The coopmat-warp prefill GEMM tile selection of `quant_linear`'s coopmat tier: the A_GLOBAL
 /// f16-A cast, the narrow-n split-K (`split_k_plan`), or the direct tile — reading the weight from
@@ -1223,7 +1191,7 @@ fn native_warp_gemm(
     } else {
         None
     };
-    let splits = split_k_plan(m, in_f, out_f, split_k_compute_units(be_));
+    let splits = split_k_plan(m, in_f, out_f, split_k_device_window(be_));
     if splits > 1 && k64 && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some() {
         let mpad = m.div_ceil(64) * 64;
         let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
@@ -1560,9 +1528,15 @@ fn lower_op(
                 if native_dense_supported(dt) {
                     // Multi-warp dp4a decode GEMV (wave32-native GPUs) takes precedence — see
                     // `mmv_mw_choice`. AMD returns None here and falls to the scalar/old-mmv path.
-                    if let Some(warps) =
-                        mmv_mw_choice(be_.caps(), &be_.cfg().kernels.vulkan, dt, in_f, out_f, true)
-                    {
+                    if let Some(warps) = mmv_mw_choice(
+                        be_.caps(),
+                        &be_.cfg().kernels.vulkan,
+                        be_.tuning(),
+                        dt,
+                        in_f,
+                        out_f,
+                        true,
+                    ) {
                         // FUSE_QUANT opt-in: inline activation quantization, skip the
                         // separate quant_q8 dispatch. Only some dtypes have that build.
                         if be_.cfg().kernels.vulkan.mmv_fuse_quant
@@ -1571,7 +1545,7 @@ fn lower_op(
                                 dt,
                                 in_f,
                                 true,
-                                be_.caps().integrated,
+                                crate::recorder::MmvO4::of(be_.tuning()),
                             )
                             .is_some()
                         {
@@ -2787,7 +2761,7 @@ fn lower_op(
                 // below, flash_ok reduces to `flash_geom`, so the flash arm is guaranteed taken.
                 // Read ONCE and share: `flash_geom` (below) and `nc_fa_ok` (further down) both floor
                 // on this row count and MUST agree — two reads risked a divergence trap.
-                let flash_min_rows: usize = be_.cfg().kernels.vulkan.flash_min_rows;
+                let flash_min_rows: usize = be_.tuning().flash_min_rows;
                 // How far past kv_len each coopmat prefill tier reads K/V: shared by its gate below
                 // and by the dequant scratch sizing, so the two cannot disagree.
                 let flash_read_rows = kv_len.div_ceil(FLASH_KV_TILE) * FLASH_KV_TILE;
@@ -3078,10 +3052,7 @@ fn lower_op(
                 // correct (identity, since kv_len < att_cap_rows always holds) row mapping.
                 let cap_short = nonfa_read_rows > att_cap_rows;
                 let chunk = if canvas_lo.is_some() && kv_len >= 2 {
-                    canvas_chunk(
-                        kv_len,
-                        CANVAS_CHUNK_N.clamped(be_.cfg().kernels.vulkan.canvas_chunk_n),
-                    )
+                    canvas_chunk(kv_len, be_.tuning().canvas_chunks)
                 } else if batched_attn {
                     ATTN_MROWS_CHUNK
                 } else if (ring_past || cap_short) && rows >= 64 {
@@ -6353,7 +6324,15 @@ fn quant_linear(
                 && (bf16cm_wide || bf16cm_narrow)
                 && be_.cfg().kernels.vulkan.bf16_coopmat;
             let i8cm_kq_tile = if be_.i8cm_kq_ready() {
-                i8cm_kq_choice(dt, m, in_f, out_f, w_off, be_.caps().compute_units)
+                i8cm_kq_choice(
+                    dt,
+                    m,
+                    in_f,
+                    out_f,
+                    w_off,
+                    be_.caps().compute_units,
+                    be_.tuning().i8cm_kq_l_fill_per_cu,
+                )
             } else {
                 None
             };
@@ -6571,6 +6550,7 @@ fn quant_linear(
             mmv_mw_choice(
                 be_.caps(),
                 &be_.cfg().kernels.vulkan,
+                be_.tuning(),
                 dt,
                 in_f,
                 out_f,
@@ -6588,7 +6568,7 @@ fn quant_linear(
                     dt,
                     in_f,
                     false,
-                    be_.caps().integrated,
+                    crate::recorder::MmvO4::of(be_.tuning()),
                 )
                 .is_some()
             {
@@ -6903,7 +6883,7 @@ fn float_linear(
     if is_gemm {
         // Same padded-dst dance as every other tiled GEMM (`with_padded_dst`).
         with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
-            let splits = split_k_plan(m, in_f, out_f, split_k_compute_units(be_));
+            let splits = split_k_plan(m, in_f, out_f, split_k_device_window(be_));
             if splits > 1
                 && in_f.is_multiple_of(64)
                 && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some()
@@ -8229,7 +8209,7 @@ mod tests {
     #[test]
     fn canvas_chunk_stays_within_the_partial_kernel() {
         let old = |kv_len: usize, n: usize| kv_len.div_ceil(n).min(kv_len - 1).max(1);
-        let n = CANVAS_CHUNK_N.default;
+        let n = crate::tuning::tests::fixture_tuning("unknown").canvas_chunks;
         for kv_len in (2..=ATTN_PARTIAL_MAX_CHUNK * ATTN_MAX_CHUNKS).step_by(997) {
             let chunk = canvas_chunk(kv_len, n);
             assert!(
@@ -8286,7 +8266,7 @@ mod tests {
                 "{dt:?}"
             );
             assert!(
-                i8cm_kq_choice(dt, 512, 4096, 4096, 0, 96).is_none(),
+                i8cm_kq_choice(dt, 512, 4096, 4096, 0, 96, 2).is_none(),
                 "{dt:?}"
             );
             assert!(crate::linear::dense_stream_supported(dt), "{dt:?}");
@@ -8301,21 +8281,23 @@ mod tests {
         use crate::gemm::I8cmTile::{L, M};
         use infr_core::DType::{Q4K, Q5K, Q6K, Q8_0};
         const CU: u32 = 96;
+        // The large tile's fill per CU, as the 7900 XTX resolves it.
+        let l = crate::tuning::tests::fixture_tuning("rx7900xtx-amdwin").i8cm_kq_l_fill_per_cu;
         // Qwen3-1.7B at pp512: the fused gate/up fills the device with the large tile; the
         // 2048-wide projections and the narrow K/V ones do not.
-        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 12288, 0, CU), Some(L));
-        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 0, CU), Some(M));
-        assert_eq!(i8cm_kq_choice(Q6K, 512, 6144, 2048, 0, CU), Some(M));
-        assert_eq!(i8cm_kq_choice(Q5K, 512, 2048, 1024, 0, CU), Some(M));
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 12288, 0, CU, l), Some(L));
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 0, CU, l), Some(M));
+        assert_eq!(i8cm_kq_choice(Q6K, 512, 6144, 2048, 0, CU, l), Some(M));
+        assert_eq!(i8cm_kq_choice(Q5K, 512, 2048, 1024, 0, CU, l), Some(M));
         // The threshold scales with the device.
-        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 0, 32), Some(L));
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 0, 32, l), Some(L));
         // A width the large tile cannot cover takes the medium one even when it would fill.
-        assert_eq!(i8cm_kq_choice(Q4K, 4096, 2048, 64 * 401, 0, CU), Some(M));
-        assert_eq!(i8cm_kq_choice(Q8_0, 512, 2048, 2048, 0, CU), None);
-        assert_eq!(i8cm_kq_choice(Q4K, 512, 2080, 2048, 0, CU), None);
-        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 128, CU), None);
-        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2016, 0, CU), None);
-        assert_eq!(i8cm_kq_choice(Q4K, 8192, 2048, 151_936, 0, CU), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 4096, 2048, 64 * 401, 0, CU, l), Some(M));
+        assert_eq!(i8cm_kq_choice(Q8_0, 512, 2048, 2048, 0, CU, l), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2080, 2048, 0, CU, l), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 128, CU, l), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2016, 0, CU, l), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 8192, 2048, 151_936, 0, CU, l), None);
     }
 
     /// The dp4a K-quant GEMM takes a K-quant Linear past one half token tile whose k, weight
@@ -8342,6 +8324,14 @@ mod tests {
         assert!(!dp4a_kq_ok(&off, Q4K, 128, 2048, 12288, 0));
     }
 
+    /// [`split_k_window`] for `cu` compute units at the defaults, with the CU scaling on (`true`,
+    /// as the `amd-proprietary-split-k` row sets it) or off (every other driver).
+    fn window(cu: u32, scale: bool) -> usize {
+        let mut t = crate::tuning::tests::fixture_tuning("unknown");
+        t.split_k_scale_by_cu = scale;
+        split_k_window(&t, cu)
+    }
+
     /// With the compute-unit count known, the window scales with it: on a 96-CU part the
     /// 128-wg pp512 projections the fixed window left on the plain tile now split, and a filled
     /// grid still does not.
@@ -8349,12 +8339,12 @@ mod tests {
     fn split_k_plan_scales_with_compute_units() {
         // (m, in_f, out_f) → splits on 96 CUs: Qwen3-30B-A3B attn_output, SmolLM3 ffn_down,
         // ERNIE-4.5 shared-expert up (192 wgs), and a filled 384-wg grid.
-        assert_eq!(split_k_plan(512, 4096, 2048, 96), 8);
-        assert_eq!(split_k_plan(512, 11008, 2048, 96), 8);
-        assert_eq!(split_k_plan(512, 2560, 3072, 96), 4);
-        assert_eq!(split_k_plan(512, 2048, 6144, 96), 1);
+        assert_eq!(split_k_plan(512, 4096, 2048, window(96, true)), 8);
+        assert_eq!(split_k_plan(512, 11008, 2048, window(96, true)), 8);
+        assert_eq!(split_k_plan(512, 2560, 3072, window(96, true)), 4);
+        assert_eq!(split_k_plan(512, 2048, 6144, window(96, true)), 1);
         // The fixed window leaves the 128-wg shape whole.
-        assert_eq!(split_k_plan(512, 4096, 2048, 0), 1);
+        assert_eq!(split_k_plan(512, 4096, 2048, window(0, true)), 1);
     }
 
     /// A small or unknown CU count never narrows the window below the fixed one: every shape
@@ -8366,8 +8356,8 @@ mod tests {
             for &m in &[1usize, 16, 64, 256, 512, 1024] {
                 for &(in_f, out_f) in &[(4096usize, 2048usize), (2048, 512), (262144, 2816)] {
                     assert_eq!(
-                        split_k_plan(m, in_f, out_f, cu),
-                        split_k_plan(m, in_f, out_f, 0),
+                        split_k_plan(m, in_f, out_f, window(cu, true)),
+                        split_k_plan(m, in_f, out_f, window(0, true)),
                         "cu={cu} m={m} in_f={in_f} out_f={out_f}"
                     );
                 }
@@ -8375,20 +8365,32 @@ mod tests {
         }
         // The DiffusionGemma soft-embedding shape (m=256, k=262144, n=2816 → 88 wgs) keeps its
         // split on 2 CUs — a narrower window would drop it to the slow `matmul_proj` tile.
-        assert_eq!(split_k_plan(256, 262144, 2816, 2), 2);
+        assert_eq!(split_k_plan(256, 262144, 2816, window(2, true)), 2);
     }
 
-    /// Only the measured driver gets the scaled window; every other driver reports 0 (the fixed
-    /// window) whatever its CU count.
+    /// Only the measured driver gets the scaled window: with `split_k.scale_by_cu` off (every
+    /// driver but the AMD proprietary one) the CU count is ignored, and the two local devices
+    /// resolve the scaling exactly as the old driver rule did.
     #[test]
     fn split_k_scaling_is_limited_to_the_measured_driver() {
-        assert_eq!(split_k_cu_for_driver(true, 96), 96);
-        assert_eq!(split_k_cu_for_driver(false, 96), 0);
+        assert_eq!(window(96, true), 384);
+        assert_eq!(window(96, false), 128);
         assert_eq!(
-            split_k_plan(512, 4096, 2048, split_k_cu_for_driver(false, 96)),
+            split_k_plan(512, 4096, 2048, window(96, false)),
             1,
             "an unmeasured driver must keep the fixed window"
         );
+        for (fixture, scaled) in [
+            ("rx7900xtx-amdwin", true),
+            ("raphael-igpu-amdwin", true),
+            ("rx7900xtx-radv", false),
+            ("nvidia-rtx2080ti", false),
+            ("intel-arc-a770-anv", false),
+            ("unknown", false),
+        ] {
+            let t = crate::tuning::tests::fixture_tuning(fixture);
+            assert_eq!(t.split_k_scale_by_cu, scaled, "{fixture}");
+        }
     }
 
     /// #6: the extracted `split_k_plan` must reproduce the copy-pasted narrow-grid/splits formula
@@ -8408,7 +8410,7 @@ mod tests {
             for &in_f in &[256usize, 512, 1024, 2048, 4096, 6144, 262144] {
                 for &out_f in &[128usize, 256, 512, 1024, 1152, 2048, 2816, 4096, 6144, 8192] {
                     assert_eq!(
-                        split_k_plan(m, in_f, out_f, 0),
+                        split_k_plan(m, in_f, out_f, window(0, true)),
                         inline(m, in_f, out_f),
                         "split_k_plan mismatch at m={m} in_f={in_f} out_f={out_f}"
                     );
@@ -8455,21 +8457,21 @@ mod tests {
     #[test]
     fn tier_knob_defaults_and_clamps() {
         let d = infr_core::config::Config::default();
-        // `INFR_MOE_SMALL_M`: measured crossover 8, hard ceiling 64 (past it a prefill chunk
-        // becomes one multi-second dispatch and trips the amdgpu watchdog).
-        assert_eq!(MOE_SMALL_M.env, "INFR_MOE_SMALL_M");
-        assert_eq!(MOE_SMALL_M.default, 8);
-        assert_eq!(d.kernels.vulkan.moe_small_m, MOE_SMALL_M.default);
-        assert_eq!((MOE_SMALL_M.min, MOE_SMALL_M.max), (0, 64));
-        // A config value past the ceiling is clamped at the read site, exactly as the env override
-        // always was — `INFR_MOE_SMALL_M=100000` must not reach a dispatch.
-        assert_eq!(MOE_SMALL_M.clamped(100_000), 64);
-        // `INFR_CANVAS_CHUNK_N`: a divisor, so it floors at 1 rather than capping.
-        assert_eq!(CANVAS_CHUNK_N.env, "INFR_CANVAS_CHUNK_N");
-        assert_eq!(CANVAS_CHUNK_N.default, 3);
-        assert_eq!(d.kernels.vulkan.canvas_chunk_n, CANVAS_CHUNK_N.default);
-        assert_eq!(CANVAS_CHUNK_N.min, 1);
-        assert_eq!(CANVAS_CHUNK_N.clamped(0), 1);
+        // `moe.small_m` (alias `INFR_MOE_SMALL_M`): measured crossover 8, hard ceiling 64 (past
+        // it a prefill chunk becomes one multi-second dispatch and trips the amdgpu watchdog).
+        // `attn_canvas.chunks` (alias `INFR_CANVAS_CHUNK_N`): a divisor, so it floors at 1. The
+        // aliases' clamps are `tuning::tests::every_alias_writes_the_old_value`'s.
+        let t = crate::tuning::tests::fixture_tuning("unknown");
+        assert_eq!((t.moe_small_m, d.kernels.vulkan.moe_small_m), (8, 8));
+        assert_eq!((t.canvas_chunks, d.kernels.vulkan.canvas_chunk_n), (3, 3));
+        let range = |key: &str| {
+            crate::tuning::families::find(key)
+                .expect("a parameter")
+                .ty
+                .describe()
+        };
+        assert_eq!(range("moe.small_m"), "0..=64");
+        assert_eq!(range("attn_canvas.chunks"), "1..=max");
         // The fusion hatch is a POSITIVE field: fused by default, `INFR_NO_FUSE_ADD` clears it.
         assert!(d.kernels.vulkan.fuse_add);
         // The split-K policy the attention lowering is configured with.
@@ -8711,16 +8713,18 @@ mod tests {
         // same build for every decode dtype, and the device without dp4a is offered none — the
         // f32 path — even though the dtype is on the decode list.
         let (in_f, out_f) = (4096, 4096);
+        // The per-dtype WARPS default is the same tuning parameter on every vendor.
+        let tuned = crate::tuning::tests::fixture_tuning("unknown");
         let mut offered = 0;
         for dt in POLICY_DTYPES {
-            let pick = mmv_mw_choice(&amd, &vk, dt, in_f, out_f, false);
+            let pick = mmv_mw_choice(&amd, &vk, &tuned, dt, in_f, out_f, false);
             assert_eq!(
                 pick,
-                mmv_mw_choice(&intel, &vk, dt, in_f, out_f, false),
+                mmv_mw_choice(&intel, &vk, &tuned, dt, in_f, out_f, false),
                 "{dt:?}: the mmv_mw tier differs by vendor"
             );
             assert_eq!(
-                mmv_mw_choice(&no_dp4a, &vk, dt, in_f, out_f, false),
+                mmv_mw_choice(&no_dp4a, &vk, &tuned, dt, in_f, out_f, false),
                 None,
                 "{dt:?}: an int8 GEMV offered to a device without packed int8 dot"
             );
@@ -8732,7 +8736,7 @@ mod tests {
         );
         // Q4_K takes its single-subgroup shape on both vendors.
         assert_eq!(
-            mmv_mw_choice(&intel, &vk, DType::Q4K, in_f, out_f, false),
+            mmv_mw_choice(&intel, &vk, &tuned, DType::Q4K, in_f, out_f, false),
             Some(1)
         );
     }
@@ -9930,7 +9934,7 @@ mod tests {
             return;
         };
         let (nh, nkv, hd, rows) = (2usize, 1usize, 64usize, 4usize);
-        let kv_len = ATTN_PARTIAL_MAX_CHUNK * CANVAS_CHUNK_N.default + 128;
+        let kv_len = ATTN_PARTIAL_MAX_CHUNK * be_.tuning().canvas_chunks + 128;
         let lo = 40usize;
         let scale = 1.0 / (hd as f32).sqrt();
         let to_f16 = |v: &[f32]| -> Vec<u8> {
@@ -12882,6 +12886,20 @@ mod tests {
         );
     }
 
+    /// The resolved tuning set of the local integrated GPU (`true`) or the local discrete one.
+    fn tuned_for(integrated: bool) -> crate::tuning::Tuning {
+        crate::tuning::tests::fixture_tuning(if integrated {
+            "raphael-igpu-amdwin"
+        } else {
+            "rx7900xtx-amdwin"
+        })
+    }
+
+    /// [`crate::recorder::MmvO4`] on the local integrated GPU (`true`) or the discrete one.
+    fn o4_of(integrated: bool) -> crate::recorder::MmvO4 {
+        crate::recorder::MmvO4::of(&tuned_for(integrated))
+    }
+
     /// The decode tier offers the int8 mrow kernel only when the EXACT build the recorder will
     /// request exists: for every int8 decode dtype, layout knob and residual flag, on a discrete
     /// and an integrated device, a `Some` from `mmv_mw_choice` must name a variant
@@ -12908,9 +12926,15 @@ mod tests {
                                     ..Default::default()
                                 };
                                 let out_f = 4096;
-                                let offered = mmv_mw_choice(&caps, &vk, dt, in_f, out_f, res);
+                                let t = tuned_for(integrated);
+                                let offered = mmv_mw_choice(&caps, &vk, &t, dt, in_f, out_f, res);
                                 let built = crate::recorder::mmv_mrow_variant(
-                                    &vk, dt, 1, in_f, res, integrated,
+                                    &vk,
+                                    dt,
+                                    1,
+                                    in_f,
+                                    res,
+                                    crate::recorder::MmvO4::of(&t),
                                 )
                                 .is_some();
                                 if offered.is_some() {
@@ -12962,7 +12986,7 @@ mod tests {
                     for in_f in [1024usize, 2048, 4096] {
                         for rows in 1..=16 {
                             let Some((name, _, outs)) =
-                                mmv_mrow_variant(&vk, dt, rows, in_f, false, true)
+                                mmv_mrow_variant(&vk, dt, rows, in_f, false, o4_of(true))
                             else {
                                 panic!(
                                     "{dt:?} m4={m4} o4={o4} in_f={in_f} rows={rows}: no int8 \
@@ -12975,9 +12999,9 @@ mod tests {
                             }
                         }
                         let res_integrated =
-                            mmv_mrow_variant(&vk, dt, 1, in_f, true, true).is_some();
+                            mmv_mrow_variant(&vk, dt, 1, in_f, true, o4_of(true)).is_some();
                         let res_discrete =
-                            mmv_mrow_variant(&vk, dt, 1, in_f, true, false).is_some();
+                            mmv_mrow_variant(&vk, dt, 1, in_f, true, o4_of(false)).is_some();
                         assert_eq!(
                             res_integrated, res_discrete,
                             "{dt:?} m4={m4} o4={o4} in_f={in_f}: the fused-residual build \
@@ -12988,7 +13012,8 @@ mod tests {
                                 .is_some()
                             {
                                 assert!(
-                                    mmv_mrow_fuseq_variant(&vk, dt, in_f, res, true).is_some(),
+                                    mmv_mrow_fuseq_variant(&vk, dt, in_f, res, o4_of(true))
+                                        .is_some(),
                                     "{dt:?} o4={o4} in_f={in_f} res={res}: no FUSE_QUANT build \
                                      for an integrated device"
                                 );

@@ -34,6 +34,7 @@ libc.workspace = true
 # element-space expert strides to the per-expert BYTE stride the STREAMED shaders' pointer
 # arithmetic needs; single source of truth with the GGUF loader instead of a second hand-kept table.
 infr-gguf.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 memmap2.workspace = true

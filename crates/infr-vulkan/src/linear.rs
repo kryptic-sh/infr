@@ -531,18 +531,20 @@ mod tests {
         use crate::gemm;
         use infr_core::DType::{Iq4Xs, Q4K};
         let vk = infr_core::config::VulkanCfg::default();
+        let o4 =
+            crate::recorder::MmvO4::of(&crate::tuning::tests::fixture_tuning("rx7900xtx-amdwin"));
         assert!(
             gemm::native_mmv_mrow_kernel_name(Iq4Xs).is_some(),
             "Iq4Xs should still be plain-mrow eligible"
         );
         for in_f in [1024, 4096] {
             assert!(
-                crate::recorder::mmv_mrow_variant(&vk, Iq4Xs, 1, in_f, true, false).is_none(),
+                crate::recorder::mmv_mrow_variant(&vk, Iq4Xs, 1, in_f, true, o4).is_none(),
                 "Iq4Xs has no _res mrow build — the lookup must say so (in_f={in_f})"
             );
             // A dtype that DOES have the residual build reports it, so the lookup isn't vacuously
             // empty for everyone.
-            assert!(crate::recorder::mmv_mrow_variant(&vk, Q4K, 1, in_f, true, false).is_some());
+            assert!(crate::recorder::mmv_mrow_variant(&vk, Q4K, 1, in_f, true, o4).is_some());
         }
     }
 

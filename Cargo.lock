@@ -1400,6 +1400,7 @@ dependencies = [
  "memmap2",
  "rayon",
  "thiserror 2.0.21",
+ "toml",
  "tracing",
 ]
 

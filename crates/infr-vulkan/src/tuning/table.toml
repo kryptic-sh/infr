@@ -1,0 +1,34 @@
+# The built-in Vulkan tuning table: values tuned for a device class or a specific device, each row
+# with where its numbers came from. `crates/infr-vulkan/src/tuning/table.rs` documents the schema;
+# `infr tune show` prints which rows match this machine, and `infr tune list` names every
+# parameter. A row sets only the parameters it names; everything else falls through to the
+# generic default. Every row must name a vendor plus at least one more match field, and cite its
+# source.
+
+[[row]]
+id = "amd-proprietary-split-k"
+match = { vendor = "amd", driver = "AMD_PROPRIETARY" }
+verified = "maintainer"
+params = { "split_k.scale_by_cu" = true }
+
+[row.source]
+by = "infr maintainers"
+device = "AMD Radeon RX 7900 XTX (96 CUs)"
+driver = "AMD Windows driver (AMD_PROPRIETARY)"
+date = "2026-11-14"
+command = "INFR_PROF_OPS=1 INFR_PROF_OP_SHAPES=1 infr bench <model> -p 512 -n 0, plain tile vs split"
+evidence = "Qwen3-30B-A3B attn_output (k=4096, n=2048) 458 -> 302 us; SmolLM3-3B ffn_down (k=11008, n=2048) 1392 -> 962 us; 4 per CU measured like 5.3, 2.7 slowed ERNIE-4.5 (commit 2908e528, docs/backlog.md B-NVSHAPE-CORECOUNT)"
+
+[[row]]
+id = "amd-proprietary-i8cm-kq"
+match = { vendor = "amd", driver = "AMD_PROPRIETARY" }
+verified = "maintainer"
+params = { "gemm_i8cm_kq.enabled" = true }
+
+[row.source]
+by = "infr maintainers"
+device = "AMD Radeon RX 7900 XTX"
+driver = "AMD Windows driver (AMD_PROPRIETARY); RADV unmeasured (int8 coopmat hung an older Mesa, commit ad82a77)"
+date = "2026-11-15"
+command = "infr bench <model> -p 512 -n 0 -r 3, two interleaved runs against the previous build"
+evidence = "pp512 Qwen3-1.7B Q4_K_M 7580.6/7504.5 -> 11901.5/11869.9 t/s; LFM3-1.7B 7165.3/7045.8 -> 12098.1/12075.9; SmolLM3-3B 4000.9/3994.2 -> 6258.9/6253.3 (commit 9d197bb1, CHANGELOG)"

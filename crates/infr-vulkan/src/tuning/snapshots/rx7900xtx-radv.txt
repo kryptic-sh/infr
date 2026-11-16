@@ -1,0 +1,57 @@
+device:  AMD Radeon RX 7900 XTX (RADV NAVI31) (AmdRdna3, MESA_RADV)
+match:   vendor=amd arch=AmdRdna3 driver=MESA_RADV integrated=false device_id=0x744c cu=96 subgroup=32-64 driver_version=0x0
+hash:    acf45de8
+rows: none
+
+device.sg_pref              32     default
+gemv.variant                reg    default
+gemv_rm.enabled             true   default
+gemv_rm.rows                2      default
+gemv_rm.min_out             2048   default
+gemv_rm.max_out             max    default
+gemv_sg.enabled             true   default
+gemv_sg.rows                2      default
+gemv_sg.min_out             2048   default
+gemv_sg.max_out             8192   default
+gemv_id_sg.enabled          true   default
+mmv_mw.warps@q4_k           1      default
+mmv_mw.warps@q6_k           8      default
+mmv_mw.warps@q2_k           8      default
+mmv_mw.warps@q3_k           8      default
+mmv_mw.warps@q5_k           8      default
+mmv_mw.warps@q8_0           8      default
+mmv_mw.warps@q4_0           8      default
+mmv_mw.warps@q5_0           8      default
+mmv_mw.warps@q4_1           8      default
+mmv_mw.warps@q5_1           8      default
+mmv_mw.warps@iq4_nl         8      default
+mmv_mrow.o4_max_in_f        2048   default
+mmv_mrow.o4_all_widths      false  default
+attn_flash.min_rows         24     default
+attn_flash.force_bm32       false  default
+attn_flash.splits           0      default
+attn_flash.full_wg          1024   default
+attn_flash.target_wg        2048   default
+attn_flash.max_splits       8      default
+attn_flash.min_kv           4096   default
+attn_flash.kv_per_split     2048   default
+attn_pv.splits              0      default
+attn_pv.full_wg             1024   default
+attn_pv.target_wg           2048   default
+attn_pv.max_splits          8      default
+attn_pv.min_kv              4096   default
+attn_pv.kv_per_split        2048   default
+attn_canvas.chunks          3      default
+attn_split.target_chunks    32     fixed
+attn_split.min_chunk        64     fixed
+attn_split.max_chunk        512    fixed
+mla.sg_width                32     fixed
+moe.small_m                 8      default
+split_k.fixed_grid          128    default
+split_k.fill_per_cu         4      default
+split_k.scale_by_cu         false  default
+gemm_i8cm_kq.enabled        false  default
+gemm_i8cm_kq.l_fill_per_cu  2      default
+rmsnorm.wide                true   default
+rmsnorm.wide_min_dim        2048   default
+quant_q8.blocks_per_wg      8      fixed

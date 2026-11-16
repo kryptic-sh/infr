@@ -28,6 +28,7 @@ mod spirv;
 pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
+pub mod tuning;
 mod vkext;
 
 pub use ep::{EpBuffer, ExpertParallelBackend};
@@ -444,10 +445,11 @@ struct VulkanShared {
     /// Segments a forward closed and submitted before its recording ended, by cause — see
     /// [`SegmentCuts`].
     segment_cuts: [AtomicU64; SegmentCut::COUNT],
-    /// The device runs the AMD proprietary driver (`driverID == AMD_PROPRIETARY`, the AMD Windows
-    /// driver this box runs) — the one driver the CU-scaled split-K window was measured on. See
-    /// `adapter::split_k_compute_units`.
-    amd_proprietary_driver: bool,
+    /// The per-device kernel parameters, resolved once at creation (`tuning::resolve`). Every
+    /// kernel choice reads its field here; nothing looks a parameter up by name.
+    tuning: tuning::Tuning,
+    /// Where each of [`Self::tuning`]'s values came from, for `infr tune show`.
+    tuning_report: tuning::TuningReport,
     /// UNIFIED-MEMORY parts only (`None` on every discrete GPU): the host-visible memory type on
     /// the non-device-local heap that `GpuOnly` allocations SPILL into once the device-local heap
     /// is full. See [`probe_uma_overflow_type`] for why counting that heap in the budget is not
@@ -1320,6 +1322,18 @@ impl VulkanBackend {
         }
         let b = self.alloc(4, BufferUsage::Activations)?;
         Ok(self.unused_binding.get_or_init(|| b).as_ref())
+    }
+
+    /// The resolved per-device kernel parameters (see the `tuning` module).
+    #[inline]
+    pub(crate) fn tuning(&self) -> &tuning::Tuning {
+        &self.shared.tuning
+    }
+
+    /// Every tuning parameter's value on this device and the level it came from — what `infr tune
+    /// show` prints. Its [`tuning::TuningReport::hash`] is in the device banner.
+    pub fn tuning_report(&self) -> &tuning::TuningReport {
+        &self.shared.tuning_report
     }
 
     /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
@@ -2497,48 +2511,6 @@ impl VulkanBackend {
             ),
         }
 
-        // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────
-        // Capability-driven: any device whose smallest pinnable subgroup is ≤16 likely has
-        // SIMD8/SIMD16 EUs (Intel Arc, future small-subgroup GPUs) where pinning the decode
-        // GEMV family at 32 starves per-lane registers (llama.cpp pins 16 for mul_mat_vec
-        // on Intel for exactly this). `max(16, subgroup_min)` keeps this Battlemage-proof
-        // (min=8 SKUs still get 16, never 8 — the kernels' lane math is only built for 16/32).
-        // Everything else (RADV 32-64, NVIDIA 32) keeps 32, so the default kernel/pipeline
-        // set there is byte-identical to before this field existed.
-        let sg_default = if subgroup_min <= 16 {
-            16u32.max(subgroup_min)
-        } else {
-            32
-        };
-        // `device.subgroup_pref` (`INFR_SG=16|32`): A/B override (Intel testers; inert on devices
-        // that can't pin the value). The env layer already rejects anything but "16"/"32", as it
-        // always has, but the field is now also reachable from the TOML file and `--set`, so
-        // the "only 16 and 32 have builds" POLICY stays here at the consumer (R5) and still refuses
-        // a value it has no kernels for.
-        let sg_pref = match cfg.device.subgroup_pref {
-            Some(16) => 16,
-            Some(32) => 32,
-            Some(other) => {
-                return Err(be(format!(
-                    "device.subgroup_pref (INFR_SG) must be 16 or 32 (got {other}) — the decode \
-                     GEMV family only has subgroup-16 and subgroup-32 builds"
-                )))
-            }
-            None => sg_default,
-        };
-        // A 16 request/default is only usable where 16 is pinnable; otherwise CLEANLY fall back
-        // to 32 (e.g. INFR_SG=16 on RADV wave32: subgroup_min == 32 → stays 32, path set
-        // unchanged). 32 is always pinnable here (hard-required above).
-        let sg_pref = if sg_pref == 16 && !(subgroup_min <= 16 && 16 <= subgroup_max) {
-            tracing::warn!(
-                "[infr] INFR_SG=16 requested but this device's subgroup range \
-                 [{subgroup_min}, {subgroup_max}] cannot pin 16 — keeping 32"
-            );
-            32
-        } else {
-            sg_pref
-        };
-
         // ── integrated GPU + compute-unit count ───────────────────────────────────────────────
         // An iGPU/APU is NOT just "a slow discrete card": it is forced onto the non-coopmat kernel
         // tier (RDNA2/Raphael enumerates no cooperative matrix at all) AND carries ~1/50th the
@@ -2551,6 +2523,49 @@ impl VulkanBackend {
         // property structs it reads were already chained by `probe_device_facts` above; nothing here
         // queries the device again.
         let compute_units = crate::caps::shader_core_count(&device_probe);
+
+        // ── tuning: every per-device kernel parameter, resolved once ──────────────────────────
+        // The table's generic defaults, its matching rows, then the user's tuning file, config,
+        // environment and command line (`tuning::resolve`). A value the user wrote that fails
+        // validation refuses the device here, naming where it came from.
+        let facts = tuning::DeviceFacts {
+            name: device_name.clone(),
+            vendor_id: device_probe.vendor_id,
+            device_id: device_probe.device_id,
+            driver: device_probe
+                .driver_id_reported
+                .then(|| tuning::driver_name(device_probe.driver_id)),
+            driver_version: props.driver_version,
+            arch: tuning::arch_name(device_arch),
+            integrated,
+            compute_units,
+            subgroup_min,
+            subgroup_max,
+            wave64: matches!(sg_mode, crate::caps::SubgroupMode::Wave64 { .. }),
+            max_shared_memory: props.limits.max_compute_shared_memory_size,
+        };
+        let tuning::resolve::Resolved {
+            tuning: tuned,
+            report: tuning_report,
+        } = tuning::resolve::resolve(&facts, &cfg).map_err(be)?;
+
+        // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────
+        // `device.sg_pref`: its generic default is the capability rule in `tuning::families`, and
+        // `device.subgroup_pref` (`INFR_SG`) is its alias; a value other than 16 or 32 was refused
+        // by the resolver above, which names the setting.
+        let sg_pref = tuned.sg_pref;
+        // A 16 request/default is only usable where 16 is pinnable; otherwise CLEANLY fall back
+        // to 32 (e.g. INFR_SG=16 on RADV wave32: subgroup_min == 32 → stays 32, path set
+        // unchanged). 32 is always pinnable here (hard-required above).
+        let sg_pref = if sg_pref == 16 && !(subgroup_min <= 16 && 16 <= subgroup_max) {
+            tracing::warn!(
+                "[infr] INFR_SG=16 requested but this device's subgroup range \
+                 [{subgroup_min}, {subgroup_max}] cannot pin 16 — keeping 32"
+            );
+            32
+        } else {
+            sg_pref
+        };
 
         let caps = Capabilities {
             name: device_name,
@@ -2625,7 +2640,7 @@ impl VulkanBackend {
         let yn = |b: bool| if b { "y" } else { "n" };
         tracing::info!(
             "[infr] GPU: {} | {:?}/{} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} \
-             i8dot:{} i8cm:{} cm2:{} subgroup:{}-{} sgp:{} cores:{} shared:{}KB",
+             i8dot:{} i8cm:{} cm2:{} subgroup:{}-{} sgp:{} cores:{} shared:{}KB tune:{}",
             caps.name,
             device_arch,
             driver_label,
@@ -2650,6 +2665,7 @@ impl VulkanBackend {
                 "?".to_string()
             },
             caps.max_shared_memory_bytes / 1024,
+            tuning_report.hash(),
         );
         // The fp8 tier is opt-in and unvalidated (see `native_gemm_f8cm_q8_0.comp`): say so where
         // the flag is read, so its output is never mistaken for a supported path's.
@@ -2816,8 +2832,8 @@ impl VulkanBackend {
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
                 submit_split_disabled,
                 segment_ts_period,
-                amd_proprietary_driver: device_probe.driver_id_reported
-                    && device_probe.driver_id == vk::DriverId::AMD_PROPRIETARY,
+                tuning: tuned,
+                tuning_report,
                 segment_gpu_ns: AtomicU64::new(0),
                 untimed_segments: AtomicU64::new(0),
                 segment_cuts: [const { AtomicU64::new(0) }; SegmentCut::COUNT],
@@ -2991,19 +3007,20 @@ impl VulkanBackend {
 
     /// The int8 cooperative-matrix K-quant prefill GEMM (`native_gemm_i8cm_kq.comp`) may be
     /// dispatched: the accumulator-layout probe passed (the kernel descales in-fragment exactly
-    /// like the Q8_0 one), it is not switched off (`INFR_NO_I8CM_KQ`), and the device runs the
-    /// AMD proprietary driver (`DriverId::AMD_PROPRIETARY`, which Linux AMDGPU-PRO reports as well
-    /// as the Windows driver; only the Windows driver was measured, CHANGELOG). RADV stays on the f16
-    /// coopmat GEMM until someone measures it there: int8 coopmat hung an older Mesa (commit
-    /// ad82a77), and the earlier Q8_0 int8 coopmat kernel lost to f16 on RDNA4 RADV
-    /// (docs/perf/playbook.md).
+    /// like the Q8_0 one), and the `gemm_i8cm_kq.enabled` tuning parameter is on. Its generic
+    /// default is off; the built-in table's `amd-proprietary-i8cm-kq` row turns it on under the AMD
+    /// proprietary driver (`DriverId::AMD_PROPRIETARY`, which Linux AMDGPU-PRO reports as well as
+    /// the Windows driver; only the Windows driver was measured, CHANGELOG), and `INFR_NO_I8CM_KQ`
+    /// (`kernels.vulkan.i8cm_kq = false`) is its alias for off. RADV stays on the f16 coopmat GEMM
+    /// until someone measures it there: int8 coopmat hung an older Mesa (commit ad82a77), and the
+    /// earlier Q8_0 int8 coopmat kernel lost to f16 on RDNA4 RADV (docs/perf/playbook.md).
     pub(crate) fn i8cm_kq_ready(&self) -> bool {
         self.i8cm_kq_wanted() && self.shared.i8cm_layout_ok.get() == Some(&true)
     }
 
     /// Whether this run could dispatch the K-quant int8 coopmat GEMM, before the layout probe.
     fn i8cm_kq_wanted(&self) -> bool {
-        self.cfg.kernels.vulkan.i8cm_kq && self.amd_proprietary_driver()
+        self.tuning().i8cm_kq_enabled
     }
 
     /// Known-answer check of this driver's int8 coopmat accumulator fragment layout, run once at
@@ -3110,11 +3127,6 @@ impl VulkanBackend {
     /// unlimited (record the whole forward into one command buffer, the discrete default).
     pub(crate) fn submit_dispatch_cap(&self) -> usize {
         self.shared.submit_dispatch_cap.load(Ordering::Relaxed)
-    }
-
-    /// Whether this device runs the AMD proprietary driver (see the shared field's doc).
-    pub(crate) fn amd_proprietary_driver(&self) -> bool {
-        self.shared.amd_proprietary_driver
     }
 
     /// Start timing one forward for the submit splitter — see [`ForwardClock`].

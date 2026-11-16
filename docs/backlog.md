@@ -2000,38 +2000,59 @@ the query returned, which is exactly the code path nobody has run.
 **Tag:** vulkan · amd · **Blocked on:** a GCN card (Polaris, Vega), issue #94
 
 Wave64-only devices run the wave32 kernels through `shaders/wave64.glsl` (ported
-from the KessokuNet fork, commit `b108ff42f` by korewaChino): every pipeline
-pins subgroup 64 and sets the `W64` specialization constant, and the subgroup
-builtins and reductions act on 32-lane halves. Cooperative matrix is off on that
-path (`caps::subgroup_mode`, the `!wave64` filter on `coopmat_f16`).
+from the KessokuNet fork, commit `b108ff42f` by korewaChino, then reworked
+here): every pipeline pins subgroup 64 and sets the `W64` specialization
+constant. A workgroup of at most 32 invocations runs as one subgroup (id 0, lane
+= `gl_LocalInvocationIndex`, plain subgroup operations over exactly its own
+lanes); every larger one is 64-aligned in x, asks for full subgroups, and runs
+each 64-lane subgroup as two 32-lane halves with cluster-32 operations.
+Cooperative matrix is off on that path (`caps::subgroup_mode`, the `!wave64`
+filter on `coopmat_f16`).
 
-- **Verified here (2026-11-16):** the same path on RDNA, forced with
+- **Verified here (2026-11-16/17):** the same path on RDNA, forced with
   `kernels.vulkan.force_wave64` (`INFR_FORCE_WAVE64=1`), under AMD's Windows
-  driver: the GPU gate (op parity, `infr-vulkan` lib, the `cpu_backend`
-  whole-model GPU-vs-CPU and golden tests, which honour the variable) passed on
-  the RX 7900 XTX except `gpu_seam_int8_prefill_tracks_cpu`, which asserts the
-  int8 coopmat GEMM ran and so cannot pass with coopmat off, and passed whole on
-  the RDNA2 iGPU (MoE tests left out there). Both drivers report a subgroup
-  range of [32, 64]. `ops::tests::subgroup_kernels_are_wave64_safe` checks every
-  built module statically.
-- **Observed once, not explained:** one forced run of `gpu_seam_golden_qwen3moe`
-  on the RX 7900 XTX failed with a KV capacity of 0, and one of four forced
-  `infr run`s of Qwen3-30B-A3B exceeded the VRAM budget after the measured
-  context clamp chose 6634 tokens against 0.96 GiB free. Both passed on rerun;
-  the free VRAM the clamp measures moved between 0.54 and 1.09 GiB across runs.
-  Two `INFR_NO_COOPMAT` runs did not fail, which is too few to say the wave64
-  path is or is not involved.
+  driver on the RX 7900 XTX and the RDNA2 iGPU: the GPU gate (op parity, the
+  `infr-vulkan` lib, the whole-model GPU-vs-CPU and golden tests) and
+  `mmv_mw_parity`; results are in the PR that landed it. Both drivers report a
+  subgroup range of [32, 64]. `ops::tests::subgroup_kernels_are_wave64_safe`
+  checks every built module statically.
 - **Not verified by us:** GCN itself. The fork author reports two GPU-vs-CPU
-  model tests passing on an RX 580 (RADV, Mesa 26.2.5), on the original commit,
-  before our changes. GCN under AMD's Windows driver has not been run by anyone
-  we know of.
-- **Relies on, not guaranteed by the spec:** a 64-lane subgroup holds
-  `gl_LocalInvocationIndex` 64s..64s+63 in order, so its halves are the two
-  32-lane groups a wave32 device would form. The wave32 kernels already rely on
-  the same linear packing; RADV and AMD's drivers both pack that way.
-- **Integer inclusive scan:** `vw_inclusive_add` is float-only; an integer
-  `subgroupInclusiveAdd` in a kernel would convert through float on every
-  device. No kernel has one today.
+  model tests passing on an RX 580 (RADV, Mesa 26.2.5) with the fork's ORIGINAL
+  commit, before our changes (include placement, the one-subgroup mode for small
+  workgroups, the scan rewrite, full subgroups, coopmat off). GCN under AMD's
+  Windows driver has not been run by anyone we know of.
+- **Still assumed, and checked at startup:** a workgroup of at most 32
+  invocations on a 64-pinned pipeline is ONE subgroup (wherever its lanes sit in
+  the wave), and its inclusive scan runs in `gl_LocalInvocationIndex` order —
+  the second only `deltanet_gates.comp` needs. `wave64_probe.comp` measures both
+  on every device that takes the wave64 path (`caps::check_wave64_layout`), and
+  a driver that breaks either is refused. The probe is one 32-wide workgroup; a
+  driver that treated some other pipeline differently would not be caught.
+- **No ordering assumption otherwise:** the 64-aligned workgroups use virtual
+  subgroup ids and lanes only relative to each other, and full subgroups make
+  the halves dense. The earlier note that the wave32 kernels all rely on
+  in-order lane packing was wrong; only `deltanet_gates` mixes the subgroup lane
+  with the invocation index.
+- **Unreachable builds:** the `_sg16` decode builds include `wave64.glsl` but
+  are never dispatched on the wave64 path: `sg_pref` stays 32 there, since 16 is
+  outside the [64, 64] range the path reports.
+- **Not checked:** `requiredSubgroupSizeStages` containing COMPUTE, for the 64
+  pin and for the existing 32 pin alike. Both drivers here report it.
+- **Unexplained flake, Qwen3-30B-A3B on the RX 7900 XTX:** "prompt 18 + gen 8
+  exceeds the session KV capacity 0" from `gpu_seam_golden_qwen3moe` (one forced
+  run) and `gpu_seam_paged_moe_matches_resident_and_cpu` (one forced gate run,
+  one of two forced reruns, and one of four NATIVE runs of this branch), and one
+  of four forced `infr run`s exceeding the VRAM budget after the measured
+  context clamp chose 6634 tokens against 0.96 GiB free. `origin/main` passed
+  that test in all five runs tried, interleaved with the branch's. The free VRAM
+  the clamp measures moved between 0.54 and 1.09 GiB across runs; coopmat off
+  selects different GEMM kernels whose scratch footprint may differ. It always
+  failed cleanly, never with a wrong result. Too few runs to say whether the
+  branch, the wave64 path, or the free VRAM at the time is the cause.
+- **Integer inclusive scan:** `vw_half_inclusive_add` is float-only, so an
+  integer `subgroupInclusiveAdd` under the header fails to compile (glslc: the
+  macro's float arm cannot be assigned to a `uint`). No kernel has one; a kernel
+  that needs one needs an integer twin added first.
 - **Possible later optimization:** the fork's wave64-native decode GEMV
   (`a1f58563b` and follow-ups) uses all 64 lanes instead of two halves. A
   32-wide workgroup on this path leaves half of each wave idle.

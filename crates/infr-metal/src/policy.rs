@@ -258,6 +258,7 @@ pub(crate) fn static_walk_live_positions(
                 return Err("LightningIndexer keeps its baked position and length")
             }
             Op::CompressPool { .. } => return Err("CompressPool pools a baked number of rows"),
+            Op::GatherRows { .. } => return Err("GatherRows gathers a baked number of rows"),
             // No position: elementwise, norms, projections, sampling, gathers, copies, MoE and
             // the recurrent ops (whose state is the bound buffer, read and written in place).
             Op::RmsNorm { .. }

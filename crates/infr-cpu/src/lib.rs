@@ -1893,8 +1893,6 @@ impl Backend for CpuBackend {
                     // the first `kv_len` rows, never the whole `max_ctx` cache.
                     let kbuf = bindings.get(k_cache).expect("cpu backend: unbound k_cache");
                     let vbuf = bindings.get(v_cache).expect("cpu backend: unbound v_cache");
-                    let kguard = cpu_buf(kbuf).read();
-                    let vguard = cpu_buf(vbuf).read();
                     // Materialize the valid KV rows as f32. K and V pick their cache dtype
                     // INDEPENDENTLY (f16 matches the GPU's f16 KV; Q8_0 blocks dequant via
                     // y = d*q) — the inner dot then runs in f32 either way.
@@ -1948,8 +1946,13 @@ impl Backend for CpuBackend {
                             _ => bytemuck::cast_slice::<u8, f32>(b)[..need].to_vec(),
                         }
                     };
-                    let ks = deq(&kguard, g.desc(k_cache).dtype);
-                    let vs = deq(&vguard, g.desc(v_cache).dtype);
+                    // One guard at a time: an owned buffer's guard is a non-reentrant mutex, and a
+                    // cache that serves as both K and V (deepseek4, whose attention reads its K
+                    // rows as V) binds one buffer to both sides. That pair is dequantized once.
+                    let ks = deq(&cpu_buf(kbuf).read(), g.desc(k_cache).dtype);
+                    let vs_own = (v_cache != k_cache)
+                        .then(|| deq(&cpu_buf(vbuf).read(), g.desc(v_cache).dtype));
+                    let vs: &[f32] = vs_own.as_deref().unwrap_or(&ks);
                     // Per-head attention sinks (V4's `attn_sinks`, `None` everywhere else): one
                     // extra logit per head in the max AND the denominator, never in the numerator.
                     // See `Op::Attention::sinks`.
@@ -2089,7 +2092,9 @@ impl Backend for CpuBackend {
                         }
                     });
                     rc.give(ks);
-                    rc.give(vs);
+                    if let Some(vs) = vs_own {
+                        rc.give(vs);
+                    }
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::GatedAct {
@@ -2374,6 +2379,58 @@ impl Backend for CpuBackend {
                         out[r * ne..(r + 1) * ne].copy_from_slice(&row);
                     }
                     rc.set(&mut vals, dst.0 as usize, out);
+                }
+                Op::GatherRows {
+                    src,
+                    idx,
+                    dst,
+                    rows,
+                    idx_off,
+                    src_stride,
+                    src_col,
+                    n,
+                    group,
+                    dst_group_stride,
+                    dst_row_off,
+                    fill,
+                } => {
+                    let n_src = infr_core::graph::check_gather_rows(g, op)
+                        .unwrap_or_else(|e| panic!("cpu {e}"));
+                    let (rows, idx_off, ss, sc, n) = (
+                        rows as usize,
+                        idx_off as usize,
+                        src_stride as usize,
+                        src_col as usize,
+                        n as usize,
+                    );
+                    let (group, dgs, dro) = (
+                        group as usize,
+                        dst_group_stride as usize,
+                        dst_row_off as usize,
+                    );
+                    // `idx` is an I32 handle, carried here as f32-widened integers. The dtype
+                    // check makes it a third tensor, so it is set aside while `src` and `dst` are
+                    // borrowed and put back after.
+                    let ids = std::mem::take(&mut vals[idx.0 as usize]);
+                    let (s, d) = borrow_two_mut(&mut vals, src.0 as usize, dst.0 as usize);
+                    for r in 0..rows {
+                        let i = ids[idx_off + r];
+                        let row = (r / group) * dgs + dro + r % group;
+                        let out = &mut d[row * n..(row + 1) * n];
+                        if i < 0.0 {
+                            out.fill(fill);
+                        } else {
+                            let i = i as usize;
+                            assert!(
+                                i < n_src,
+                                "cpu Op::GatherRows: index {i} at entry {} is past the {n_src} \
+                                 source rows",
+                                idx_off + r
+                            );
+                            out.copy_from_slice(&s[i * ss + sc..i * ss + sc + n]);
+                        }
+                    }
+                    vals[idx.0 as usize] = ids;
                 }
                 Op::Sample {
                     x,

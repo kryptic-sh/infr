@@ -132,7 +132,11 @@ fn bind_layer_io<'a>(
     }
     for l in 0..n_layer {
         b.bind(h.k_cache[l], kbufs[l].as_ref());
-        b.bind(h.v_cache[l], vbufs[l].as_ref());
+        // A layer whose V handle IS its K cache (deepseek4) has no V tensor to bind; binding the
+        // placeholder there would rebind the K cache to it.
+        if h.v_cache[l] != h.k_cache[l] {
+            b.bind(h.v_cache[l], vbufs[l].as_ref());
+        }
     }
     for (i, wid) in h.weights.iter().enumerate() {
         b.bind(*wid, wbufs[i].as_ref());
@@ -655,7 +659,9 @@ pub(crate) fn generate_dense_backend_bound(
         }
     };
     let mut k_fmt = parse_kv_fmt(ec.kv.type_k);
-    let mut v_fmt = parse_kv_fmt(ec.kv.type_v);
+    // deepseek4 has no V cache, so its V format follows K before anything below reads it (the
+    // ring gate, Metal's clamp, the allocation): `crate::seam::kv_v_follows_k`.
+    let mut v_fmt = crate::seam::kv_v_fmt(c, k_fmt, parse_kv_fmt(ec.kv.type_v));
     // Metal's Q8 and F32 KV use native-read attention that reads BOTH sides as one dtype, so a
     // mixed request with q8/f32 on one side would misread the other — clamp those to coupled f16.
     // The prepass formats (block quants / bf16 / turbo) expand each side to its own f16 scratch, so
@@ -1944,8 +1950,15 @@ pub(crate) fn generate_dense_backend_bound(
             let (k_row, v_row) = crate::seam::kv_row_elems(c, l);
             let rows_l =
                 crate::seam::kv_rows_at(c, l, max_ctx, kv_ring, ring_ubatch, be.kv_row_align());
-            k_cache.push(g.input(kd(crate::seam::kv_side_elems(rows_l * k_row))));
-            v_cache.push(g.input(vd(crate::seam::kv_side_elems(rows_l * v_row))));
+            let k = g.input(kd(crate::seam::kv_side_elems(rows_l * k_row)));
+            k_cache.push(k);
+            // deepseek4 has no V cache: its V handle is the K cache, so no dead placeholder Input
+            // exists for an executor to load each step (`crate::seam::kv_row_elems`).
+            v_cache.push(if c.deepseek4 {
+                k
+            } else {
+                g.input(vd(crate::seam::kv_side_elems(rows_l * v_row)))
+            });
         }
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from
@@ -3188,9 +3201,10 @@ pub(crate) fn generate_dense_backend_bound(
                 }
 
                 // KV: ONE head for the whole layer (`attn_kv` is `[n_embd, head_dim]`), RMS-normed
-                // over the full row, then roped on the same tail. Written to BOTH cache sides —
-                // V4's attention is `build_attn_mha(q, k_all, k_all, …)`, so V IS K; see
-                // `crate::seam::kv_row_elems` for why they are two buffers here rather than one.
+                // over the full row, then roped on the same tail. Written ONCE, to the K cache:
+                // V4's attention is `build_attn_mha(q, k_all, k_all, …)`, so V IS K and the
+                // attention below reads that one cache as both sides (`crate::seam::kv_row_elems`
+                // gives the V side no rows).
                 g.push(Op::Linear {
                     x: hn,
                     weight: mw.wkv,
@@ -3211,15 +3225,13 @@ pub(crate) fn generate_dense_backend_bound(
                 if rd > 0 {
                     rope_tail(&mut g, d4_kv, d4_rkv, 1, false);
                 }
-                for cache in [k_cache[l], v_cache[l]] {
-                    g.push(Op::WriteKv {
-                        src: d4_kv,
-                        cache,
-                        rows: batch as u32,
-                        row_stride: hd4,
-                        pos: start_pos as u32,
-                    });
-                }
+                g.push(Op::WriteKv {
+                    src: d4_kv,
+                    cache: k_cache[l],
+                    rows: batch as u32,
+                    row_stride: hd4,
+                    pos: start_pos as u32,
+                });
                 // The attention kernels read an **f16** q (`q16`), so the normed+roped f32 query is
                 // cast into it exactly as a NoPE layer casts its unroped one — `Op::Copy`,
                 // whose lowering does the f32→f16 conversion. The rope itself has to stay on the
@@ -3235,7 +3247,7 @@ pub(crate) fn generate_dense_backend_bound(
                 g.push(Op::Attention {
                     q: q16,
                     k_cache: k_cache[l],
-                    v_cache: v_cache[l],
+                    v_cache: k_cache[l],
                     dst: attn,
                     rows: batch as u32,
                     kv_len: (start_pos + batch) as u32,

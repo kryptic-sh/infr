@@ -1539,6 +1539,7 @@ fn op_name(op: &Op) -> &'static str {
         Op::Sample { .. } => "Sample",
         Op::EmbedGather { .. } => "EmbedGather",
         Op::GatherI32 { .. } => "GatherI32",
+        Op::GatherRows { .. } => "GatherRows",
         Op::Copy { .. } => "Copy",
         Op::CopyStrided { .. } => "CopyStrided",
         Op::MoeFfn { .. } => "MoeFfn",
@@ -6184,6 +6185,62 @@ impl MetalBackend {
                     1 << 2,
                     &p,
                     total,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::GatherRows {
+                src,
+                idx,
+                dst,
+                rows,
+                idx_off,
+                src_stride,
+                src_col,
+                n,
+                group,
+                dst_group_stride,
+                dst_row_off,
+                fill,
+            } => {
+                let n_src = infr_core::graph::check_gather_rows(g, op)
+                    .map_err(|e| Error::Unsupported(format!("metal {e}")))?;
+                let total = rows.checked_mul(n).ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "metal Op::GatherRows: {rows} rows of {n} overflow the kernel's u32 index"
+                    ))
+                })?;
+                let bs = self.ensure_device(r, src)?;
+                // The indices are read as the raw i32 the caller bound, as `Op::EmbedGather`
+                // reads its ids: the host mirror holds them widened to f32.
+                let bi = metal_buf(bindings.get(idx).ok_or_else(|| {
+                    Error::Unsupported("metal Op::GatherRows: idx must be a bound i32 input".into())
+                })?);
+                // `ensure_device`, not `dev_dst`: rows no index maps to keep what an earlier
+                // gather wrote there.
+                let bd = self.ensure_device(r, dst)?;
+                let mut p = Vec::with_capacity(40);
+                for v in [
+                    rows,
+                    idx_off,
+                    src_stride,
+                    src_col,
+                    n,
+                    group,
+                    dst_group_stride,
+                    dst_row_off,
+                    u32::try_from(n_src).unwrap_or(u32::MAX),
+                    fill.to_bits(),
+                ] {
+                    p.extend_from_slice(&v.to_ne_bytes());
+                }
+                let pso = self.pipelines.get("gather_rows_f32")?;
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[bs.as_ref(), &bi.raw, bd.as_ref()],
+                    1 << 2,
+                    &p,
+                    total as usize,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

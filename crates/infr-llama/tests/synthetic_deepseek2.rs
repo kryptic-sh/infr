@@ -3112,6 +3112,56 @@ fn synthetic_deepseek4_ratio0_prefill_is_finite() {
     );
 }
 
+/// **The V KV-cache type does not reach deepseek4.** V4 has no V cache (its attention reads the
+/// K cache as V), so `INFR_KV_TYPE_V` must change nothing: these runs set it to formats the CPU
+/// backend accepts at this head width — `turbo3` (a 128-wide WHT group), `q4_0` (32-blocks) and
+/// `f32` — and each must reproduce the default run bit for bit. Head dim 128 so every one of
+/// them passes the runner's format gates and is really requested, not quietly downgraded.
+///
+/// Before the V side followed K, a V format still declared a per-layer placeholder Input in
+/// that dtype, which the CPU executor loaded and dequantized each step: `turbo3` panicked in
+/// the host dequant.
+#[test]
+fn synthetic_deepseek4_v_kv_type_is_ignored() {
+    let d = Dsv4Dims {
+        head_dim: 128,
+        ..dsv4_ratio0_dims()
+    };
+    let tmp = TempGguf::write("ds4-vtype", &dsv4_model(&d));
+    let run = |v: Option<infr_core::DType>| {
+        let ec = infr_llama::EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_v: v,
+                type_v_specified: v.is_some(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        infr_llama::SeamModel::load_with(tmp.path(), None, std::sync::Arc::new(ec))
+            .expect("synthetic model load")
+            .prefill_logits_cpu(PROMPT)
+            .expect("cpu prefill")
+    };
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let base = run(None);
+    assert!(
+        rms(&base) > 1e-3,
+        "degenerate logits (rms {:e})",
+        rms(&base)
+    );
+    for dt in [
+        infr_core::DType::Turbo3,
+        infr_core::DType::Q4_0,
+        infr_core::DType::F32,
+    ] {
+        assert_eq!(
+            bits(&run(Some(dt))),
+            bits(&base),
+            "INFR_KV_TYPE_V={dt:?} changed deepseek4's logits"
+        );
+    }
+}
+
 /// **The cross-stream Sinkhorn mixing is load-bearing.** Two files identical in every tensor except
 /// the `comb` chunk of the per-layer hyper-connection `base` vectors, which is the ONLY part of the
 /// wrap that has anything to mix: with the residual stream collapsed to one, `comb` is a 1x1 matrix

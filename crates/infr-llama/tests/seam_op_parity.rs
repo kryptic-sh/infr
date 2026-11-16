@@ -4020,6 +4020,264 @@ fn attention_key_bias_indexed_by_key_position_not_ring_row() {
     }
 }
 
+// ── One cache as both K and V (deepseek4's `build_attn_mha(q, k_all, k_all, …)`) ──────────────
+
+/// One `Op::Attention` shape for [`attention_one_cache_as_k_and_v`]: the caches are written by
+/// `Op::WriteKv` inside the graph, so each backend quantizes them in its own layout (Vulkan's Q8_0
+/// is planar), and the query rows are the last `rows` of `kv_len`.
+struct AliasCase {
+    name: &'static str,
+    dtype: DType,
+    rows: usize,
+    kv_len: usize,
+    n_head: usize,
+    hd: usize,
+    sinks: bool,
+}
+
+/// How [`attention_alias_run`] binds the caches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AliasMode {
+    /// One cache, holding the K rows, bound to both sides.
+    OneCache,
+    /// Two caches, both written from the K rows.
+    TwoEqual,
+    /// Two caches: K rows in one, DIFFERENT V rows in the other.
+    TwoDistinct,
+}
+
+/// The f16-rounded query of a case.
+fn alias_q(case: &AliasCase) -> Vec<f32> {
+    gen(case.rows * case.n_head * case.hd, 41)
+        .iter()
+        .map(|&x| half::f16::from_f32(x).to_f32())
+        .collect()
+}
+
+/// Cache rows of a case: distinct per position and channel, `salt` picking the K or the V set.
+fn alias_rows(case: &AliasCase, salt: usize) -> Vec<f32> {
+    (0..case.kv_len * case.hd)
+        .map(|i| ((i * 37 + 11 + salt * 23) % 61) as f32 / 30.0 - 1.0)
+        .collect()
+}
+
+fn alias_sinks(case: &AliasCase) -> Vec<f32> {
+    (0..case.n_head).map(|h| 0.5 + h as f32).collect()
+}
+
+/// Run `case` with its caches bound as `mode` says. Returns the attention output.
+fn attention_alias_run(be: &dyn Backend, case: &AliasCase, mode: AliasMode) -> Vec<f32> {
+    let (rows, kv_len, nh, hd) = (case.rows, case.kv_len, case.n_head, case.hd);
+    let n_out = rows * nh * hd;
+    let cache_elems = kv_len * hd;
+    let alias = mode == AliasMode::OneCache;
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows * nh * hd], DType::F16));
+    let ksrc = g.input(f32d(cache_elems));
+    let vsrc = g.input(f32d(cache_elems));
+    let kc = g.input(TensorDesc::new(vec![cache_elems], case.dtype));
+    let vc = if alias {
+        kc
+    } else {
+        g.input(TensorDesc::new(vec![cache_elems], case.dtype))
+    };
+    let sk = g.weight(f32d(nh));
+    let dst = g.output(f32d(n_out));
+    let writes = match mode {
+        AliasMode::OneCache => vec![(ksrc, kc)],
+        AliasMode::TwoEqual => vec![(ksrc, kc), (ksrc, vc)],
+        AliasMode::TwoDistinct => vec![(ksrc, kc), (vsrc, vc)],
+    };
+    for (src, cache) in writes {
+        g.push(Op::WriteKv {
+            src,
+            cache,
+            rows: kv_len as u32,
+            row_stride: hd as u32,
+            pos: 0,
+        });
+    }
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: 1,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: AttnMask::Causal,
+        pos: (kv_len - rows) as u32,
+        sinks: case.sinks.then_some(sk),
+        key_bias: None,
+    });
+    let plan = be.compile(&g).expect("compile");
+    let up = |bytes: &[u8], usage| {
+        let b = be.alloc(bytes.len(), usage).unwrap();
+        be.upload(b.as_ref(), bytes).unwrap();
+        b
+    };
+    let qf: Vec<u8> = alias_q(case)
+        .iter()
+        .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+        .collect();
+    let qb = up(&qf, BufferUsage::Activations);
+    let kb_src = up(
+        bytemuck::cast_slice(&alias_rows(case, 0)),
+        BufferUsage::Activations,
+    );
+    let vb_src = up(
+        bytemuck::cast_slice(&alias_rows(case, 1)),
+        BufferUsage::Activations,
+    );
+    let cache_bytes = match case.dtype {
+        DType::Q8_0 => cache_elems / 32 * 34,
+        DType::F16 => cache_elems * 2,
+        _ => cache_elems * 4,
+    };
+    let kb = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
+    let vb = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
+    let skb = up(
+        bytemuck::cast_slice(&alias_sinks(case)),
+        BufferUsage::Weights,
+    );
+    let ob = be.alloc(n_out * 4, BufferUsage::Readback).unwrap();
+    let mut b = Bindings::new();
+    b.bind(q, qb.as_ref());
+    b.bind(ksrc, kb_src.as_ref());
+    b.bind(vsrc, vb_src.as_ref());
+    b.bind(kc, kb.as_ref());
+    if !alias {
+        b.bind(vc, vb.as_ref());
+    }
+    b.bind(sk, skb.as_ref());
+    b.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let mut o = vec![0f32; n_out];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// **`Op::Attention` with `k_cache == v_cache`**, which is how deepseek4 stores its K=V row once.
+/// Each case runs three ways on every backend:
+///
+/// * one cache bound to both sides, and two caches written from the same rows — BIT-identical,
+///   since the values read are the same and only the binding differs;
+/// * two caches holding DIFFERENT K and V rows — compared with an f64 reference over the f32
+///   rows written (`attention_sinks_ref`), and required to differ from the aliased output. This
+///   is the arm that catches a backend that reads its K cache as V whenever it can (the CPU
+///   reusing K's values, the Vulkan prepass reusing K's scratch) without checking the two are
+///   the same tensor.
+///
+/// The cases cover the shapes that take different paths: the sinks family (V4's own), a decode
+/// row and a prefill block without sinks, and a Q8_0 prefill, which the Vulkan adapter expands
+/// through its dequant prepass. The reference tolerance covers the f16 and Q8_0 rounding of the
+/// cache; reading the wrong rows as V moves the output far past it.
+///
+/// A CPU arm that took a second guard on the aliased buffer deadlocks here instead of failing; the
+/// timeout is the signal.
+#[test]
+fn attention_one_cache_as_k_and_v() {
+    let cases = [
+        AliasCase {
+            name: "f16 sinks prefill (deepseek4)",
+            dtype: DType::F16,
+            rows: 3,
+            kv_len: 7,
+            n_head: 2,
+            hd: 48,
+            sinks: true,
+        },
+        AliasCase {
+            name: "f16 decode",
+            dtype: DType::F16,
+            rows: 1,
+            kv_len: 40,
+            n_head: 4,
+            hd: 64,
+            sinks: false,
+        },
+        AliasCase {
+            name: "f16 prefill",
+            dtype: DType::F16,
+            rows: 9,
+            kv_len: 24,
+            n_head: 2,
+            hd: 64,
+            sinks: false,
+        },
+        AliasCase {
+            name: "q8_0 prefill (dequant prepass)",
+            dtype: DType::Q8_0,
+            rows: 6,
+            kv_len: 20,
+            n_head: 2,
+            hd: 64,
+            sinks: false,
+        },
+    ];
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let cpu = infr_cpu::CpuBackend::new();
+    let vk = gpu();
+    let mut backends: Vec<(&str, &dyn Backend)> = vec![("cpu", &cpu)];
+    if let Some(vk) = &vk {
+        backends.push(("vulkan", vk));
+    }
+    for case in &cases {
+        let sinks = alias_sinks(case);
+        let want = attention_sinks_ref(
+            &alias_q(case),
+            &alias_rows(case, 0),
+            &alias_rows(case, 1),
+            case.rows,
+            case.kv_len,
+            case.n_head,
+            1,
+            case.hd,
+            1.0 / (case.hd as f32).sqrt(),
+            case.kv_len - case.rows,
+            case.sinks.then_some((sinks.as_slice(), None)),
+        );
+        for &(be_name, be) in &backends {
+            let name = format!("{be_name} {}", case.name);
+            let one = attention_alias_run(be, case, AliasMode::OneCache);
+            let two = attention_alias_run(be, case, AliasMode::TwoEqual);
+            let distinct = attention_alias_run(be, case, AliasMode::TwoDistinct);
+            assert!(
+                one.iter().all(|v| v.is_finite()) && one.iter().any(|&v| v != 0.0),
+                "{name}: degenerate output {one:?}"
+            );
+            assert_eq!(
+                bits(&one),
+                bits(&two),
+                "{name}: one cache bound to both sides differs from two equal caches"
+            );
+            let e = maxerr(&distinct, &want);
+            let gap = maxerr(&distinct, &one);
+            println!("Attention K!=V ({name}) vs reference max_err={e:e}, vs K=V gap={gap:e}");
+            assert!(
+                e < 5e-3,
+                "{name}: distinct K and V caches diverge from the reference ({e:e})"
+            );
+            assert!(
+                gap > 0.1,
+                "{name}: distinct V rows gave the K=V output (gap {gap:e}) — V was read from K"
+            );
+        }
+        if let Some(vk) = &vk {
+            let e = maxerr(
+                &attention_alias_run(vk, case, AliasMode::OneCache),
+                &attention_alias_run(&cpu, case, AliasMode::OneCache),
+            );
+            println!("Attention K=V ({}) cpu-vs-vulkan max_err={e:e}", case.name);
+            assert!(e < 2e-3, "{}: cpu vs vulkan max_err={e:e}", case.name);
+        }
+    }
+}
+
 // ── Op::Rope { backward } (deepseek4's attention-output de-rope) ──────────────────────────────
 
 /// De-roping is the exact inverse of roping: `Rope { backward: false }` then
@@ -6582,6 +6840,497 @@ fn compress_pool_all_neg_inf_window_is_zero() {
         assert!(
             e < CP_TOL,
             "{be}: the sentinel blocks disturbed the neighbouring block's average ({e:e})"
+        );
+    }
+}
+
+// ── DeepSeek V4 compressor source gather (`Op::GatherRows`) ──────────────────────────────────
+
+/// The scalar fields of one `Op::GatherRows`.
+#[derive(Clone, Copy)]
+struct GrParams {
+    rows: usize,
+    idx_off: usize,
+    src_stride: usize,
+    src_col: usize,
+    n: usize,
+    group: usize,
+    dst_group_stride: usize,
+    dst_row_off: usize,
+    fill: f32,
+}
+
+impl GrParams {
+    /// Entry `r` to destination row `r`, `n` columns from column 0: the HCA shape.
+    fn plain(rows: usize, n: usize) -> Self {
+        GrParams {
+            rows,
+            idx_off: 0,
+            src_stride: n,
+            src_col: 0,
+            n,
+            group: 1,
+            dst_group_stride: 1,
+            dst_row_off: 0,
+            fill: 0.0,
+        }
+    }
+
+    /// The two CSA/LID overlap halves for `blocks` blocks of ratio `ratio` over `2*d`-wide state
+    /// rows, as `Op::GatherRows`' doc spells them: previous windows from columns `[0, d)` into
+    /// each block's first `ratio` slots, current windows from `[d, 2d)` into its last `ratio`.
+    fn overlap(blocks: usize, ratio: usize, d: usize, fill: f32) -> [Self; 2] {
+        let half = |idx_off, src_col, dst_row_off| GrParams {
+            rows: ratio * blocks,
+            idx_off,
+            src_stride: 2 * d,
+            src_col,
+            n: d,
+            group: ratio,
+            dst_group_stride: 2 * ratio,
+            dst_row_off,
+            fill,
+        };
+        [half(0, 0, 0), half(ratio * blocks, d, ratio)]
+    }
+
+    fn op(&self, src: TensorId, idx: TensorId, dst: TensorId) -> Op {
+        Op::GatherRows {
+            src,
+            idx,
+            dst,
+            rows: self.rows as u32,
+            idx_off: self.idx_off as u32,
+            src_stride: self.src_stride as u32,
+            src_col: self.src_col as u32,
+            n: self.n as u32,
+            group: self.group as u32,
+            dst_group_stride: self.dst_group_stride as u32,
+            dst_row_off: self.dst_row_off as u32,
+            fill: self.fill,
+        }
+    }
+}
+
+/// From-definition reference for a sequence of gathers into one destination of `dst_len`
+/// elements, starting from zeros (what both backends allocate an output as). Written from the
+/// op's formula, in f64, without anything the kernels call.
+fn gr_ref(src: &[f32], idx: &[i32], dst_len: usize, gathers: &[GrParams]) -> Vec<f64> {
+    let mut dst = vec![0f64; dst_len];
+    for p in gathers {
+        for r in 0..p.rows {
+            let i = idx[p.idx_off + r];
+            let row = (r / p.group) * p.dst_group_stride + p.dst_row_off + r % p.group;
+            for c in 0..p.n {
+                dst[row * p.n + c] = if i < 0 {
+                    p.fill as f64
+                } else {
+                    src[i as usize * p.src_stride + p.src_col + c] as f64
+                };
+            }
+        }
+    }
+    dst
+}
+
+/// The i32 index handle rides `run`'s f32 wire type as its bit pattern.
+fn gr_wire(idx: &[i32]) -> Vec<f32> {
+    idx.iter().map(|&e| f32::from_bits(e as u32)).collect()
+}
+
+/// One graph running `gathers` in order into one `dst_len`-element output.
+fn gr_run(
+    be: &dyn Backend,
+    src: &[f32],
+    idx: &[i32],
+    dst_len: usize,
+    gathers: &[GrParams],
+) -> Vec<f32> {
+    let mut g = Graph::new();
+    let si = g.input(f32d(src.len()));
+    let ii = g.input(TensorDesc::new(vec![idx.len()], DType::I32));
+    let dst = g.output(f32d(dst_len));
+    for p in gathers {
+        g.push(p.op(si, ii, dst));
+    }
+    run(be, &g, &[(si, src), (ii, &gr_wire(idx))], &[], dst, dst_len)
+}
+
+/// A gather moves bits; it never computes. So the backends must equal the reference BIT for bit,
+/// `-inf` fills included (where an absolute difference would be NaN and pass a tolerance).
+fn gr_assert_exact(what: &str, got: &[f32], want: &[f64]) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    for (k, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            (w as f32).to_bits(),
+            "{what}: element {k} is {g}, the definition gives {w}"
+        );
+    }
+}
+
+/// Distinct values per (row, column), so a wrong row or a wrong column offset is a wrong value.
+fn gr_src(rows: usize, stride: usize) -> Vec<f32> {
+    (0..rows * stride)
+        .map(|i| (i / stride) as f32 * 100.0 + (i % stride) as f32 + 0.25)
+        .collect()
+}
+
+/// Each case on CPU and, when present, Vulkan, against [`gr_ref`].
+fn gr_check(name: &str, src: &[f32], idx: &[i32], dst_len: usize, gathers: &[GrParams]) {
+    let want = gr_ref(src, idx, dst_len, gathers);
+    let cpu = infr_cpu::CpuBackend::new();
+    gr_assert_exact(
+        &format!("{name} (cpu)"),
+        &gr_run(&cpu, src, idx, dst_len, gathers),
+        &want,
+    );
+    if let Some(vk) = gpu() {
+        gr_assert_exact(
+            &format!("{name} (vulkan)"),
+            &gr_run(&vk, src, idx, dst_len, gathers),
+            &want,
+        );
+        println!("GatherRows {name}: cpu and vulkan exact");
+    } else {
+        println!("GatherRows {name}: cpu exact (no Vulkan device)");
+    }
+}
+
+/// The identity gather returns its source, and a permutation permutes it — the identity checked
+/// against the source directly as well as against the reference.
+#[test]
+fn gather_rows_identity_and_permutation() {
+    let (rows, n) = (6usize, 5usize);
+    let src = gr_src(rows, n);
+    let ident: Vec<i32> = (0..rows as i32).collect();
+    let p = GrParams::plain(rows, n);
+    let src64: Vec<f64> = src.iter().map(|&v| v as f64).collect();
+    assert_eq!(gr_ref(&src, &ident, rows * n, &[p]), src64);
+    gr_check("identity", &src, &ident, rows * n, &[p]);
+    gr_check("permutation", &src, &[4, 0, 5, 5, 2, 1], rows * n, &[p]);
+}
+
+/// A negative index writes `fill` across the row: `0.0` (the sentinel's values) and `-inf` (its
+/// scores). Mixed with real rows, so a fill that leaked into a neighbour shows.
+#[test]
+fn gather_rows_negative_index_fills() {
+    let src = gr_src(4, 3);
+    let idx = [-1, 3, -1, 0, 2];
+    for fill in [0.0, f32::NEG_INFINITY] {
+        let p = GrParams {
+            fill,
+            ..GrParams::plain(idx.len(), 3)
+        };
+        gr_check(&format!("fill {fill}"), &src, &idx, idx.len() * 3, &[p]);
+    }
+}
+
+/// A column window of a wider source row: `n` columns from `src_col`.
+#[test]
+fn gather_rows_source_column_offset() {
+    let src = gr_src(5, 10);
+    let p = GrParams {
+        src_stride: 10,
+        src_col: 3,
+        ..GrParams::plain(4, 4)
+    };
+    gr_check("column offset", &src, &[2, 4, 0, 3], 16, &[p]);
+}
+
+/// The plan's overlap index vector for [`gather_rows_overlap_halves_into_one_destination`] and
+/// [`gather_rows_feeds_compress_pool`]: three blocks of ratio 4 over a `[ring of 8 | 5 step
+/// rows]` source, every block's previous window then every block's current window, block 0's
+/// previous window the sentinel.
+const GR_PREV: [i32; 12] = [-1, -1, -1, -1, 8, 9, 10, 11, 1, 2, 3, 4];
+const GR_CUR: [i32; 12] = [8, 9, 10, 11, 12, 0, 7, 6, 5, 4, 12, 3];
+
+/// The CSA overlap layout: two gathers into one destination, block `b`'s window holding its
+/// previous-window rows (columns `[0, d)`) in slots `[0, ratio)` and its current-window rows
+/// (columns `[d, 2d)`) in `[ratio, 2*ratio)`, for both the value fill and the score fill.
+#[test]
+fn gather_rows_overlap_halves_into_one_destination() {
+    let (blocks, ratio, d) = (3usize, 4usize, 6usize);
+    let src = gr_src(2 * ratio + 5, 2 * d);
+    let idx: Vec<i32> = GR_PREV.iter().chain(&GR_CUR).copied().collect();
+    let dst_len = blocks * 2 * ratio * d;
+    for fill in [0.0, f32::NEG_INFINITY] {
+        let halves = GrParams::overlap(blocks, ratio, d, fill);
+        gr_check(
+            &format!("overlap fill {fill}"),
+            &src,
+            &idx,
+            dst_len,
+            &halves,
+        );
+    }
+    // The layout spelled out for one slot of each half, independently of `gr_ref`: block 1, slot
+    // 1 is the previous half's entry 5 (row 9, columns [0, d)); block 1, slot ratio + 2 is the
+    // current half's entry 6 (row 7, columns [d, 2d)); block 0's previous slots are the fill.
+    let out = gr_run(
+        &infr_cpu::CpuBackend::new(),
+        &src,
+        &idx,
+        dst_len,
+        &GrParams::overlap(blocks, ratio, d, 0.0),
+    );
+    let slot = |b: usize, w: usize| &out[(b * 2 * ratio + w) * d..][..d];
+    assert_eq!(slot(1, 1), &src[9 * 2 * d..][..d]);
+    assert_eq!(slot(1, ratio + 2), &src[7 * 2 * d + d..][..d]);
+    assert!(slot(0, 0).iter().all(|&v| v == 0.0));
+}
+
+/// The HCA layout at its real window: every block reads its own `DSV4_HCA_RATIO` rows in index
+/// order, enough output elements that the Vulkan dispatch spans many workgroups.
+#[test]
+fn gather_rows_hca_layout() {
+    let (blocks, window, d) = (2usize, 128usize, 5usize);
+    let src_rows = window + 40;
+    let src = gr_src(src_rows, d);
+    let idx: Vec<i32> = (0..blocks * window)
+        .map(|r| ((r * 37 + 11) % src_rows) as i32)
+        .collect();
+    gr_check(
+        "hca",
+        &src,
+        &idx,
+        blocks * window * d,
+        &[GrParams::plain(blocks * window, d)],
+    );
+}
+
+/// An index past the source's rows: the CPU refuses it, and the Vulkan kernel, which cannot see
+/// index values when the host records it, writes the fill instead of reading past the buffer.
+#[test]
+fn gather_rows_out_of_range_index() {
+    let src = gr_src(3, 2);
+    let idx = [0, 3];
+    let p = GrParams {
+        fill: -7.0,
+        ..GrParams::plain(2, 2)
+    };
+    let cpu = std::panic::catch_unwind(|| {
+        gr_run(&infr_cpu::CpuBackend::new(), &src, &idx, 4, &[p]);
+    });
+    assert!(cpu.is_err(), "cpu gathered an index past the source rows");
+    if let Some(vk) = gpu() {
+        let out = gr_run(&vk, &src, &idx, 4, &[p]);
+        assert_eq!(out, vec![src[0], src[1], -7.0, -7.0]);
+    }
+}
+
+/// What the host check refuses, one guard per case: wrong dtypes, `src == dst`, `n` or `group` 0,
+/// a column window past the row, groups that overlap, an index shorter than the entries read, a
+/// destination too small. Every case is valid in every OTHER respect, and each must be refused by
+/// its own guard (the message names it), so deleting any one guard turns exactly its case red.
+#[test]
+fn gather_rows_geometry_is_checked() {
+    /// One graph for the check: dtypes of src/idx/dst, and whether dst is the src tensor itself.
+    struct Shape {
+        idx_len: usize,
+        dst_len: usize,
+        dtypes: [DType; 3],
+        dst_is_src: bool,
+    }
+    let check = |p: GrParams, s: &Shape| {
+        let mut g = Graph::new();
+        let src = g.input(TensorDesc::new(vec![40], s.dtypes[0]));
+        let idx = g.input(TensorDesc::new(vec![s.idx_len], s.dtypes[1]));
+        let dst = if s.dst_is_src {
+            src
+        } else {
+            g.output(TensorDesc::new(vec![s.dst_len], s.dtypes[2]))
+        };
+        infr_core::graph::check_gather_rows(&g, &p.op(src, idx, dst))
+    };
+    let shape = Shape {
+        idx_len: 8,
+        dst_len: 32,
+        dtypes: [DType::F32, DType::I32, DType::F32],
+        dst_is_src: false,
+    };
+    // The current half of two ratio-2 blocks over 8-wide rows: entries [4, 8), destination rows
+    // 2, 3, 6, 7 of 4 columns.
+    let ok = GrParams::overlap(2, 2, 4, 0.0)[1];
+    assert_eq!(check(ok, &shape), Ok(5));
+    let with = |f: fn(&mut Shape)| {
+        let mut s = Shape { ..shape };
+        f(&mut s);
+        s
+    };
+    // Groups of 2 rows one group apart, the first entry at row 1: group 0 covers rows 1-2 and
+    // group 1 rows 3-4, inside a 40-element destination, so only the overlap guard sees that
+    // each group spills into the next one's first row.
+    let overlap = GrParams {
+        idx_off: 0,
+        src_col: 0,
+        group: 2,
+        dst_group_stride: 2,
+        dst_row_off: 1,
+        ..ok
+    };
+    let cases: [(&str, GrParams, Shape, &str); 10] = [
+        (
+            "f16 src",
+            ok,
+            with(|s| s.dtypes[0] = DType::F16),
+            "src must be",
+        ),
+        (
+            "f32 idx",
+            ok,
+            with(|s| s.dtypes[1] = DType::F32),
+            "idx must be",
+        ),
+        (
+            "f16 dst",
+            ok,
+            with(|s| s.dtypes[2] = DType::F16),
+            "dst must be",
+        ),
+        (
+            "src == dst",
+            ok,
+            with(|s| s.dst_is_src = true),
+            "same tensor",
+        ),
+        (
+            "n 0",
+            GrParams { n: 0, ..ok },
+            with(|_| {}),
+            "at least one column",
+        ),
+        (
+            "group 0",
+            GrParams { group: 0, ..ok },
+            with(|_| {}),
+            "at least one column",
+        ),
+        (
+            "column window",
+            GrParams { src_col: 5, ..ok },
+            with(|_| {}),
+            "source row",
+        ),
+        (
+            "overlapping groups",
+            overlap,
+            with(|s| s.dst_len = 40),
+            "into the next group",
+        ),
+        ("short index", ok, with(|s| s.idx_len = 7), "index"),
+        (
+            "short destination",
+            ok,
+            with(|s| s.dst_len = 31),
+            "-element dst",
+        ),
+    ];
+    for (what, p, s, guard) in cases {
+        match check(p, &s) {
+            Ok(_) => panic!("{what} was accepted"),
+            Err(e) => assert!(
+                e.contains(guard),
+                "{what} was refused by another guard: {e}"
+            ),
+        }
+    }
+}
+
+/// **Gather into `Op::CompressPool`, end to end.** The CSA overlap's value and score gathers feed
+/// the pool in one graph, and the pooled rows are compared with a from-definition row computed
+/// straight from the state rows and the plan's index vector: block `b`, channel `c` softmaxes over
+/// its previous-window scores at column `c` and current-window scores at column `d + c` (the
+/// sentinel contributing a zero value at `-inf`), and averages the values at the same places.
+#[test]
+fn gather_rows_feeds_compress_pool() {
+    let (blocks, ratio, d) = (3usize, 4usize, 6usize);
+    let n_src = 2 * ratio + 5;
+    let kv: Vec<f32> = gr_src(n_src, 2 * d)
+        .iter()
+        .map(|v| (v * 0.37).sin())
+        .collect();
+    let sc: Vec<f32> = (0..n_src * 2 * d)
+        .map(|i| (((i * 23 + 5) % 37) as f32 - 18.0) * 0.21)
+        .collect();
+    let idx: Vec<i32> = GR_PREV.iter().chain(&GR_CUR).copied().collect();
+    let window = 2 * ratio;
+
+    let mut want = vec![0f64; blocks * d];
+    for b in 0..blocks {
+        for c in 0..d {
+            // (value, score) of each window slot, previous half then current half.
+            let slot = |w: usize| -> (f64, f64) {
+                let (i, col) = if w < ratio {
+                    (GR_PREV[b * ratio + w], c)
+                } else {
+                    (GR_CUR[b * ratio + w - ratio], d + c)
+                };
+                if i < 0 {
+                    (0.0, f64::NEG_INFINITY)
+                } else {
+                    let at = i as usize * 2 * d + col;
+                    (kv[at] as f64, sc[at] as f64)
+                }
+            };
+            let m = (0..window)
+                .map(|w| slot(w).1)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let (mut num, mut den) = (0f64, 0f64);
+            for w in 0..window {
+                let (v, s) = slot(w);
+                let e = (s - m).exp();
+                num += v * e;
+                den += e;
+            }
+            want[b * d + c] = num / den;
+        }
+    }
+
+    let go = |be: &dyn Backend| -> Vec<f32> {
+        let mut g = Graph::new();
+        let kvi = g.input(f32d(kv.len()));
+        let sci = g.input(f32d(sc.len()));
+        let ii = g.input(TensorDesc::new(vec![idx.len()], DType::I32));
+        let values = g.internal(f32d(blocks * window * d));
+        let scores = g.internal(f32d(blocks * window * d));
+        let dst = g.output(f32d(blocks * d));
+        for (src, gathered, fill) in [(kvi, values, 0.0), (sci, scores, f32::NEG_INFINITY)] {
+            for p in GrParams::overlap(blocks, ratio, d, fill) {
+                g.push(p.op(src, ii, gathered));
+            }
+        }
+        g.push(Op::CompressPool {
+            values,
+            scores,
+            dst,
+            blocks: blocks as u32,
+            window: window as u32,
+            n_embd: d as u32,
+        });
+        run(
+            be,
+            &g,
+            &[(kvi, &kv), (sci, &sc), (ii, &gr_wire(&idx))],
+            &[],
+            dst,
+            blocks * d,
+        )
+    };
+    let cpu = go(&infr_cpu::CpuBackend::new());
+    let e = maxerr64(&cpu, &want);
+    println!("GatherRows -> CompressPool: cpu vs definition max_err={e:e}");
+    assert!(
+        e < 1e-5,
+        "cpu gathered pool diverges from the definition ({e:e})"
+    );
+    if let Some(vk) = gpu() {
+        let v = go(&vk);
+        let e = maxerr64(&v, &want);
+        println!("GatherRows -> CompressPool: vulkan vs definition max_err={e:e}");
+        assert!(
+            e < 1e-5,
+            "vulkan gathered pool diverges from the definition ({e:e})"
         );
     }
 }

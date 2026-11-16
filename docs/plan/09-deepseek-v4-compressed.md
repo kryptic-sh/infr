@@ -5,7 +5,7 @@ layer but two of the shipped V4-Flash file. Scoped on 2026-11-16 by reading
 llama.cpp at `5676dfbe0` (`src/models/deepseek4.cpp`,
 `src/llama-kv-cache-dsv4.cpp`, `src/llama-graph.cpp`, `src/models/models.h`).
 Statements marked **[I]** were inferred, not read; **[U]** are unknown. Nothing
-here has been built or run yet, except slices S0 and S1 (marked below). Cite
+here has been built or run yet, except slices S0 to S3 (marked below). Cite
 functions, not lines: both reference files have grown since the notes in
 `docs/deepseek.md` were written.
 
@@ -159,9 +159,25 @@ and the `dsv4_model` fixture.
 1. **YaRN for compressed layers:** done in S1 —
    `Config::dsv4_compressed_rope_divisors`, built by the `yarn_freq_divisors`
    helper the deepseek2 `yarn_ff` now calls too. Not applied anywhere yet.
-2. **A row gather** (`Op::GatherRows`): f32 rows by i32 index, with a source
-   column offset, a grouped destination layout (for the two overlap halves) and
-   a fill value for index `-1` (the sentinel).
+2. **A row gather:** done in S3 — `Op::GatherRows` on CPU and Vulkan, Metal
+   written. Its doc spells out the HCA gather and the two overlap halves; any
+   negative index writes the fill. **The sentinel is not `-1` in the
+   reference:** `dsv4_append_zero_row` appends a row to the source and
+   `state_read_idxs` names it by position (`state rows + tokens`), which
+   `dsv4_plan.rs` reproduces. That position equals the gather's source row
+   count, so the gather treats it as out of range: decided contract, a negative
+   index is the fill and an index at or past the source rows is an error, which
+   the CPU refuses and the GPU kernels (which cannot see index values when
+   recording) write as the fill. `Dsv4CompPlan::gather_read_idxs` hands the emit
+   the reads with the sentinel already `DSV4_GATHER_SENTINEL` (`-1`), so no
+   translation is left to the emit. Declined: "index == source rows is the
+   sentinel" everywhere, because a source declared with spare rows would then
+   read a real row where the sentinel was meant, and the out-of-range check
+   would lose the one value it can catch on the CPU. The op reads one source
+   tensor, which must be an internal tensor (the CPU executor does not load KV
+   cache operands into its store), so the emit assembles
+   `[persistent state | this step's rows]` with copies, as the reference's own
+   `ggml_concat` does.
 3. **No scatter is needed [I]:** for one stream the committed rows are
    consecutive (one `WriteKv` per tier, real commits only, never the dummies),
    and the persisted ring rows are at most two contiguous runs (copies).
@@ -191,8 +207,8 @@ unchanged.
 | --- | ----------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | S0  | **Done 2026-11-16.** Re-sync `dsv4_plan.rs` with section 0, add a count of real commits; fix the docs                   | literal-vector tests: an HCA decode step gets one dummy at the last row; a 9-token CSA ubatch with no commit is refused (one block short gets one dummy); the commit count excludes dummies                                                   |
 | S1  | **Done 2026-11-16.** `deepseek4` YaRN config and the compressed-tier `ff` vector (unused yet)                           | `ff` against a closed form at chosen positions; a file with no scaling keys gives 1; a factor without a type is "linear", a uniform divisor                                                                                                   |
-| S2  | B53: one cache as K and V (`kv_row_elems` → `(hd, 0)`, CPU attention takes one guard)                                   | an op-parity case binding one id to both sides; ratio-0 logits bit-identical                                                                                                                                                                  |
-| S3  | `Op::GatherRows` on CPU and Vulkan; Metal arm written                                                                   | from-definition parity with fill, grouping and column offset; a swapped column offset goes red                                                                                                                                                |
+| S2  | **Done 2026-11-16.** B53: one cache as K and V (`kv_row_elems` → `(hd, 0)`, CPU attention takes one guard at a time)    | an op-parity case binding one id to both sides; ratio-0 logits bit-identical, checked ONCE by hand (no test in the tree locks them; see below)                                                                                                |
+| S3  | **Done 2026-11-16.** `Op::GatherRows` on CPU and Vulkan; Metal arm written                                              | from-definition parity with fill, grouping and column offset; a swapped column offset goes red                                                                                                                                                |
 | S4a | CPU two-segment attention and the indexer block ratio                                                                   | equals single-segment attention over a concatenated cache with an explicit bias; `None` and ratio 1 bit-identical to today                                                                                                                    |
 | S4b | Vulkan: the same                                                                                                        | CPU-vs-Vulkan op parity at head dim 48 and 512                                                                                                                                                                                                |
 | S5  | Persistent buffers, geometry, the no-rewind predicate, `wpush` handles; refusal kept                                    | hand-computed V4-Flash footprint; a V4 session refuses a partial rewind                                                                                                                                                                       |
@@ -201,6 +217,15 @@ unchanged.
 | S8  | Real-file CPU oracle against llama.cpp                                                                                  | `cpu_prefill_matches_llama_debug_dump` on V4-Flash, one prompt under 100 tokens and one over 300 (HCA live); the `deepseek-v3` tokenizer question closed with `llama-tokenize`                                                                |
 | S9  | Vulkan whole model; then paged MoE with hash routing and the SwiGLU clamp (both refused today; the model exceeds 24 GB) | synthetic GPU-vs-CPU; the real-file dump comparison on Vulkan                                                                                                                                                                                 |
 | S10 | Metal: gather, two-segment attention, indexer field, sqrt-softplus router, `GatherI32`                                  | macOS CI only                                                                                                                                                                                                                                 |
+
+S2's logits check was a one-off: a temporary test wrote the bit patterns of four
+ratio-0 fixtures (`PROMPT`; windows 1 and 3 at a 40-token prompt; hash-routed)
+on CPU, Vulkan0 and Vulkan1 from the pre-change tree, and the changed tree
+reproduced all twelve exactly; the test was then deleted. No permanent lock was
+added, because `docs/synthetic-models.md` rule 2 allows a synthetic golden only
+when it is blessed against an external oracle, and these values would be
+self-blessed. An oracle-blessed V4 lock (llama.cpp over the synthetic file) is
+backlog work.
 
 Prefill one-batch against token-by-token equality is the best single test of the
 plan, state and sentinel logic; it arrives with batched V4 prefill (section 5).

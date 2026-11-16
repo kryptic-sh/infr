@@ -5841,3 +5841,173 @@ fn compress_pool_all_neg_inf_window_is_zero() {
     }
     assert_parity(&g, &bound, dst, blocks * ne, 1e-5);
 }
+
+/// `Op::Attention` with ONE cache bound to both `k_cache` and `v_cache` — how deepseek4 stores its
+/// K=V row (`build_attn_mha(q, k_all, k_all, …)`). The Metal run must match the CPU oracle on the
+/// same aliased graph, and must equal its own two-cache run bit for bit, since the bytes read are
+/// the same. The sinks build is the family V4 takes; `infr-llama`'s
+/// `attention_one_cache_as_k_and_v` covers the other tiers on CPU and Vulkan.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_one_cache_as_k_and_v_parity() {
+    let (rows, nh, hd) = (3usize, 2usize, 64usize);
+    let kv_len = rows;
+    let n_out = rows * nh * hd;
+    let qi = rand_f32(n_out, 4301);
+    let kvi = rand_f32(kv_len * hd, 4302);
+    let sinks = vec![0.5f32, 1.5];
+    let build = |alias: bool| {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![kv_len, 1, hd], DType::F32));
+        let vc = if alias {
+            kc
+        } else {
+            g.input(TensorDesc::new(vec![kv_len, 1, hd], DType::F32))
+        };
+        let sk = g.weight(TensorDesc::new(vec![nh], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: 1,
+            head_dim: hd as u32,
+            scale: 1.0 / (hd as f32).sqrt(),
+            mask: infr_core::graph::AttnMask::Causal,
+            pos: 0,
+            sinks: Some(sk),
+            key_bias: None,
+        });
+        let mut bound = vec![
+            (q, f32_bytes(&qi)),
+            (kc, f32_bytes(&kvi)),
+            (sk, f32_bytes(&sinks)),
+        ];
+        if !alias {
+            bound.push((vc, f32_bytes(&kvi)));
+        }
+        (g, bound, dst)
+    };
+    let (g, bound, dst) = build(true);
+    assert_parity(&g, &bound, dst, n_out, 1e-4);
+    let mtl_be = MetalBackend::new().expect("metal backend");
+    let one = run(&mtl_be, &g, &bound, dst, n_out);
+    let (g2, bound2, dst2) = build(false);
+    let two = run(&mtl_be, &g2, &bound2, dst2, n_out);
+    assert_eq!(
+        one.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        two.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "metal: one cache bound to both sides differs from two equal caches"
+    );
+}
+
+// ---- DeepSeek V4 compressor source gather: `Op::GatherRows` (`gather_rows_f32`).
+//
+// `infr-llama`'s `gather_rows_*` tests pin the layout against a from-definition reference; this
+// one asks whether the Metal kernel reproduces the CPU oracle BIT for bit (a gather computes
+// nothing, and its `-inf` fill would defeat a tolerance), on the HCA shape, a column window, and
+// the CSA overlap's two halves into one destination with the sentinel fill, and that an index past
+// the source writes the fill.
+
+/// One `Op::GatherRows`: `(rows, idx_off, src_stride, src_col, n, group, dst_group_stride,
+/// dst_row_off, fill)`.
+type GrOp = (u32, u32, u32, u32, u32, u32, u32, u32, f32);
+
+/// A parity case: `(name, source elements, indices, destination elements, gathers)`.
+type GrCase = (&'static str, usize, Vec<i32>, usize, Vec<GrOp>);
+
+fn gr_graph(src_n: usize, idx_n: usize, dst_n: usize, ops: &[GrOp]) -> (Graph, [TensorId; 3]) {
+    let mut g = Graph::new();
+    let src = g.input(TensorDesc::new(vec![src_n], DType::F32));
+    let idx = g.input(TensorDesc::new(vec![idx_n], DType::I32));
+    let dst = g.output(TensorDesc::new(vec![dst_n], DType::F32));
+    for &(rows, idx_off, src_stride, src_col, n, group, dst_group_stride, dst_row_off, fill) in ops
+    {
+        g.push(Op::GatherRows {
+            src,
+            idx,
+            dst,
+            rows,
+            idx_off,
+            src_stride,
+            src_col,
+            n,
+            group,
+            dst_group_stride,
+            dst_row_off,
+            fill,
+        });
+    }
+    (g, [src, idx, dst])
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn gather_rows_parity() {
+    let (blocks, ratio, d) = (3u32, 4u32, 6u32);
+    let overlap = |fill| -> [GrOp; 2] {
+        let rb = ratio * blocks;
+        [
+            (rb, 0, 2 * d, 0, d, ratio, 2 * ratio, 0, fill),
+            (rb, rb, 2 * d, d, d, ratio, 2 * ratio, ratio, fill),
+        ]
+    };
+    let ov_idx: Vec<i32> = vec![
+        -1, -1, -1, -1, 8, 9, 10, 11, 1, 2, 3, 4, 8, 9, 10, 11, 12, 0, 7, 6, 5, 4, 12, 3,
+    ];
+    let hca_idx: Vec<i32> = (0..256).map(|r| (r * 37 + 11) % 168).collect();
+    let cases: Vec<GrCase> = vec![
+        (
+            "overlap fill -inf",
+            13 * 12,
+            ov_idx.clone(),
+            (blocks * 2 * ratio * d) as usize,
+            overlap(f32::NEG_INFINITY).to_vec(),
+        ),
+        (
+            "overlap fill 0",
+            13 * 12,
+            ov_idx,
+            (blocks * 2 * ratio * d) as usize,
+            overlap(0.0).to_vec(),
+        ),
+        (
+            "hca window 128",
+            168 * 5,
+            hca_idx,
+            256 * 5,
+            vec![(256, 0, 5, 0, 5, 1, 1, 0, 0.0)],
+        ),
+        (
+            "column window",
+            5 * 10,
+            vec![2, 4, 0, 3],
+            16,
+            vec![(4, 0, 10, 3, 4, 1, 1, 0, 0.0)],
+        ),
+    ];
+    let mtl_be = MetalBackend::new().expect("metal backend");
+    for (name, src_n, idx, dst_n, ops) in cases {
+        let src: Vec<f32> = (0..src_n).map(|i| i as f32 + 0.25).collect();
+        let (g, [s, i, dst]) = gr_graph(src_n, idx.len(), dst_n, &ops);
+        let bound = vec![(s, f32_bytes(&src)), (i, i32_bytes(&idx))];
+        let cpu = run(&CpuBackend::new(), &g, &bound, dst, dst_n);
+        let mtl = run(&mtl_be, &g, &bound, dst, dst_n);
+        assert_eq!(
+            cpu.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            mtl.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "GatherRows {name}: metal differs from the CPU oracle"
+        );
+    }
+    // An index past the source's three rows writes the fill rather than reading past the buffer.
+    let src = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let (g, [s, i, dst]) = gr_graph(6, 2, 4, &[(2, 0, 2, 0, 2, 1, 1, 0, -7.0)]);
+    let bound = vec![(s, f32_bytes(&src)), (i, i32_bytes(&[0, 3]))];
+    let mtl = run(&mtl_be, &g, &bound, dst, 4);
+    assert_eq!(mtl, vec![1.0, 2.0, -7.0, -7.0]);
+}

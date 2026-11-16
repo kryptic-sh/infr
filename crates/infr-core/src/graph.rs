@@ -955,6 +955,84 @@ pub enum Op {
         rows: u32,
         ne: u32,
     },
+    /// Gather f32 rows by **i32 index**, a column window of each, into a grouped destination — the
+    /// DeepSeek V4 compressor's source assembly (`ggml_get_rows` on the compressor state, then the
+    /// views, `ggml_concat`s and `ggml_cont`s of `deepseek4.cpp`'s
+    /// `build_hca_compressed_kv_from_state` and `build_overlap_compressed_kv_from_state`), laid out
+    /// for [`Op::CompressPool`]. For `r` in `0..rows`:
+    ///
+    /// ```text
+    /// i      = idx[idx_off + r]
+    /// d      = (r / group) * dst_group_stride + dst_row_off + r % group
+    /// dst[d*n .. d*n + n] = i < 0 ? fill : src[i*src_stride + src_col .. + n]
+    /// ```
+    ///
+    /// Destination rows no `r` maps to are left as they are, so two gathers can fill one
+    /// destination: `dst` is read as well as written.
+    ///
+    /// **How the compressors express it.** `D` is the compressor's head width (`n_embd_head`), `B`
+    /// the committed block count, and `idx` the per-step i32 input holding the plan's
+    /// `state_read_idxs` (`seam::dsv4_plan`). `src` is the `[persistent state | this step's rows]`
+    /// source the reference concatenates, assembled by the emit, once for values and once for
+    /// scores; each gather below runs once per pair with `fill` 0 for values and `-inf` for scores.
+    ///
+    /// * **HCA** (window `DSV4_HCA_RATIO`, `W` here): state rows are `D` wide and every block reads
+    ///   its own `W` rows, so the destination is the index order itself:
+    ///   `{ rows: W*B, idx_off: 0, src_stride: D, src_col: 0, n: D, group: 1,
+    ///   dst_group_stride: 1, dst_row_off: 0 }`. No index is negative.
+    /// * **CSA / LID overlap** (ratio `R`): state rows are `2*D` wide and `idx` holds every block's
+    ///   `R` previous-window reads, then every block's `R` current-window reads. Two gathers into
+    ///   one destination, each block's window holding its previous rows then its current ones:
+    ///   - previous half `{ rows: R*B, idx_off: 0, src_stride: 2*D, src_col: 0, n: D, group: R,
+    ///     dst_group_stride: 2*R, dst_row_off: 0 }`;
+    ///   - current half `{ rows: R*B, idx_off: R*B, src_stride: 2*D, src_col: D, n: D, group: R,
+    ///     dst_group_stride: 2*R, dst_row_off: R }`.
+    ///
+    ///   A read before the sequence start is the sentinel row (`dsv4_append_zero_row`: zero
+    ///   values, `-inf` scores), which this op produces from `fill` for a NEGATIVE index. The
+    ///   reference names that row by its position past the source (`state rows + tokens`), which
+    ///   is out of range here; the plan's `gather_read_idxs` (`seam::dsv4_plan`) hands the emit
+    ///   the reads with it already `-1`.
+    ///
+    /// Either way `dst` is `[B, window, D]` with `D` fastest, which is [`Op::CompressPool`]'s
+    /// `values`/`scores` layout with `blocks: B` and `n_embd: D`.
+    ///
+    /// **The index contract.** A negative index is the fill. An index at or past the source's row
+    /// count (`src` numel / `src_stride`) is an ERROR, never a second spelling of the sentinel:
+    /// the CPU backend refuses it, and the GPU backends, which cannot see index values when
+    /// recording, write `fill` for it instead of reading past the buffer (the `Op::GatherI32`
+    /// rule). Geometry is checked on the host by [`check_gather_rows`].
+    ///
+    /// **`src` must be an op-produced or bound f32 tensor the executors load, not a KV cache
+    /// operand**: the CPU executor reads a KV cache straight from its bound buffer and never
+    /// mirrors it into its working store (`Graph::in_place_inputs`), so a gather reading one
+    /// would find nothing there.
+    GatherRows {
+        /// Source rows `[n_src, src_stride]` f32.
+        src: TensorId,
+        /// Row indices, [`crate::DType::I32`]; at least `idx_off + rows` of them.
+        idx: TensorId,
+        /// Destination rows `n` wide, f32; read and written.
+        dst: TensorId,
+        /// Index entries gathered.
+        rows: u32,
+        /// First index entry read.
+        idx_off: u32,
+        /// Elements per source row.
+        src_stride: u32,
+        /// First source column copied.
+        src_col: u32,
+        /// Columns copied per row, and the destination's row width.
+        n: u32,
+        /// Consecutive index entries that land in one destination group.
+        group: u32,
+        /// Destination rows from one group's start to the next.
+        dst_group_stride: u32,
+        /// Destination row, within its group, of the group's first entry.
+        dst_row_off: u32,
+        /// Written for a negative index.
+        fill: f32,
+    },
     /// Copy `n` elements `src[src_off..] -> dst[dst_off..]` (extract last row, gather a slice).
     Copy {
         src: TensorId,
@@ -1207,6 +1285,7 @@ impl Op {
             Op::Sample { .. } => "Sample",
             Op::EmbedGather { .. } => "EmbedGather",
             Op::GatherI32 { .. } => "GatherI32",
+            Op::GatherRows { .. } => "GatherRows",
             Op::Copy { .. } => "Copy",
             Op::CopyStrided { .. } => "CopyStrided",
             Op::MoeFfn { .. } => "MoeFfn",
@@ -1369,6 +1448,8 @@ impl Op {
             Op::GatherI32 {
                 ids, table, dst, ..
             } => (vec![ids, table], vec![dst]),
+            // `dst` is read too: rows no index maps to keep their value (two gathers share one).
+            Op::GatherRows { src, idx, dst, .. } => (vec![src, idx, dst], vec![dst]),
             Op::Copy { src, dst, .. } => (vec![src], vec![dst]),
             Op::CopyStrided { src, dst, .. } => (vec![src], vec![dst]),
             Op::MoeFfn {
@@ -1429,6 +1510,82 @@ impl Op {
             } => (vec![moe, shexp, gate], vec![dst]),
         }
     }
+}
+
+/// The host-side geometry check every backend runs before an [`Op::GatherRows`]: dtypes, the
+/// column window inside a source row, groups that cannot overlap, and an `idx` and `dst` large
+/// enough for every entry the op touches. Returns the source's row count, the bound past which an
+/// index is out of range. Index VALUES are not checked here; see the op's doc.
+pub fn check_gather_rows(g: &Graph, op: &Op) -> Result<usize, String> {
+    let Op::GatherRows {
+        src,
+        idx,
+        dst,
+        rows,
+        idx_off,
+        src_stride,
+        src_col,
+        n,
+        group,
+        dst_group_stride,
+        dst_row_off,
+        ..
+    } = *op
+    else {
+        return Err(format!("check_gather_rows: got {}", op.kind()));
+    };
+    for (what, t, want) in [
+        ("src", src, crate::DType::F32),
+        ("idx", idx, crate::DType::I32),
+        ("dst", dst, crate::DType::F32),
+    ] {
+        let got = g.desc(t).dtype;
+        if got != want {
+            return Err(format!(
+                "Op::GatherRows: {what} must be {want:?}, got {got:?}"
+            ));
+        }
+    }
+    if src == dst {
+        return Err("Op::GatherRows: src and dst are the same tensor".into());
+    }
+    if n == 0 || group == 0 {
+        return Err(format!(
+            "Op::GatherRows: n {n} / group {group} — a gather copies at least one column of at \
+             least one row per group"
+        ));
+    }
+    if u64::from(src_col) + u64::from(n) > u64::from(src_stride) {
+        return Err(format!(
+            "Op::GatherRows: columns [{src_col}, {src_col} + {n}) leave a {src_stride}-wide \
+             source row"
+        ));
+    }
+    if u64::from(dst_row_off) + u64::from(group) > u64::from(dst_group_stride) {
+        return Err(format!(
+            "Op::GatherRows: a group of {group} rows at offset {dst_row_off} overruns its \
+             {dst_group_stride}-row stride into the next group"
+        ));
+    }
+    let idx_len = g.desc(idx).numel() as u64;
+    if u64::from(idx_off) + u64::from(rows) > idx_len {
+        return Err(format!(
+            "Op::GatherRows: entries [{idx_off}, {idx_off} + {rows}) leave the {idx_len}-entry \
+             index"
+        ));
+    }
+    if rows > 0 {
+        let last = u64::from(rows - 1);
+        let (grp, g64) = (last / u64::from(group), u64::from(group));
+        let dst_rows = grp * u64::from(dst_group_stride) + u64::from(dst_row_off) + last % g64 + 1;
+        let dst_len = g.desc(dst).numel() as u64;
+        if dst_rows * u64::from(n) > dst_len {
+            return Err(format!(
+                "Op::GatherRows: writes {dst_rows} rows of {n} into a {dst_len}-element dst"
+            ));
+        }
+    }
+    Ok(g.desc(src).numel() / src_stride as usize)
 }
 
 /// An ordered op-list over declared tensor handles. Node index in `tensors` == [`TensorId`].

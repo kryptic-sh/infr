@@ -2381,6 +2381,13 @@ pub(crate) fn hyper_post_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/hyper_post.spv"))))
 }
+/// SPIR-V for the DeepSeek V4 compressor source gather (`gather_rows.comp`, `Op::GatherRows`).
+/// Used by the recorder's `gather_rows`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn gather_rows_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/gather_rows.spv"))))
+}
 /// SPIR-V for the DeepSeek V4 compressor pooling (`compress_pool.comp`, `Op::CompressPool`). Used
 /// by the recorder's `compress_pool`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]

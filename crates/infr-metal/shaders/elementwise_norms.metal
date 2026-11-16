@@ -788,6 +788,35 @@ kernel void hyper_post_f32(device const float* x    [[buffer(0)]],
     dst[i] = acc;
 }
 
+// `Op::GatherRows` (DeepSeek V4 compressor source assembly): f32 rows by i32 index, a column
+// window of each, into the grouped destination `compress_pool_f32` reads. For entry r:
+//
+//   i = idx[idx_off + r]
+//   d = (r / group) * dst_group_stride + dst_row_off + r % group
+//   dst[d*n + c] = i < 0 ? fill : src[i*src_stride + src_col + c]
+//
+// An index at or past `n_src` writes `fill` as well, so no read leaves the source (the host
+// checks the geometry, not the index values). One thread per output element (`rows * n`).
+struct GatherRowsParams {
+    uint rows; uint idx_off; uint src_stride; uint src_col; uint n;
+    uint group; uint dst_group_stride; uint dst_row_off; uint n_src; float fill;
+};
+
+kernel void gather_rows_f32(device const float* src [[buffer(0)]],
+                            device const int*   idx [[buffer(1)]],
+                            device float*       dst [[buffer(2)]],
+                            constant GatherRowsParams& p [[buffer(3)]],
+                            uint t [[thread_position_in_grid]]) {
+    if (t >= p.rows * p.n) return;
+    uint r = t / p.n;
+    uint c = t - r * p.n;
+    uint d = (r / p.group) * p.dst_group_stride + p.dst_row_off + r % p.group;
+    int i = idx[p.idx_off + r];
+    dst[d * p.n + c] = (i < 0 || uint(i) >= p.n_src)
+        ? p.fill
+        : src[uint(i) * p.src_stride + p.src_col + c];
+}
+
 // `Op::CompressPool` (DeepSeek V4 compressor pooling): per channel, softmax `scores` over the
 // WINDOW axis — not over n_embd — then average `values` under those weights.
 //

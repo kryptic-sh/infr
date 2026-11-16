@@ -556,6 +556,9 @@ fn main() {
         // DeepSeek V4 compressor pooling (Op::CompressPool) — per-channel softmax over the window
         // axis, then the weighted average.
         ("compress_pool", "compress_pool", &[]),
+        // DeepSeek V4 compressor source gather (Op::GatherRows) — f32 rows by i32 index, a column
+        // window of each, into the grouped `[blocks, window, n]` layout compress_pool reads.
+        ("gather_rows", "gather_rows", &[]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).

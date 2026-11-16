@@ -20,6 +20,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`Op::GatherRows` — DeepSeek V4's compressor source gather — on CPU and
+  Vulkan, with a Metal kernel.** Gathers f32 rows by i32 index, a column window
+  of each, into a grouped destination, so the overlapping compressor's previous
+  and current windows (columns `[0, d)` and `[d, 2d)` of a `2d`-wide state row)
+  land as one `[blocks, window, d]` slab `Op::CompressPool` reads; the HCA
+  compressor's gather is the plain case. A negative index writes the op's `fill`
+  (`0` for values, `-inf` for scores: the reference's sentinel row). An index
+  past the source is refused on CPU and written as `fill` by the GPU kernels,
+  which cannot see index values when recording. Nothing emits the op yet; the
+  Metal kernel runs only on the macOS CI job.
+
 - **`infr serve` honours `logit_bias` and `min_p`.** `logit_bias` (OpenAI: token
   id to a bias in -100..=100) is added to the logits before the penalties, as
   llama.cpp's chain does, on every path of the dense seam decode loop (Vulkan,
@@ -133,6 +144,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the slot alignment each needs.
 
 ### Changed
+
+- **DeepSeek V4 (`deepseek4`) stores its attention row once.** V4's attention
+  reads the same row as K and V (`build_attn_mha(q, k_all, k_all, …)`), and the
+  KV cache kept a second, identical copy for V. That copy is gone: a ratio-0 V4
+  layer writes one cache and attends over it as both sides, so the KV cache, the
+  context-fit math and the default-context clamp that size it are half what they
+  were for V4, and a fitted context grows to match. Output is bit-identical.
+  `INFR_KV_TYPE_V` no longer applies to deepseek4: its one cache takes
+  `INFR_KV_TYPE_K`'s format, and a V setting no longer blocks the SWA ring, the
+  Metal mixed-format clamp or auto-q8 for it.
 
 - **`infr serve` answers `n > 1`, `logprobs: true` and `top_logprobs > 0` with a
   `400`** saying the feature is not supported, instead of returning one choice

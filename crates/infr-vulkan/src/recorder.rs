@@ -4692,6 +4692,58 @@ impl<'a> Recorder<'a> {
         );
     }
 
+    /// DeepSeek V4 compressor source gather (`gather_rows.comp`, `Op::GatherRows`): f32 rows by
+    /// i32 index, `n` columns from `src_col`, into the grouped destination rows the op's doc
+    /// defines. One thread per output element. `n_src` is the source's logical row count; an index
+    /// at or past it, or a negative one, writes `fill`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_rows(
+        &self,
+        src: &dyn Buffer,
+        idx: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        idx_off: u32,
+        src_stride: u32,
+        src_col: u32,
+        n: u32,
+        group: u32,
+        dst_group_stride: u32,
+        dst_row_off: u32,
+        n_src: u32,
+        fill: f32,
+    ) {
+        let total = rows * n;
+        let k = self
+            .be
+            .kernel("gather_rows", crate::gemm::gather_rows_spv(), 3, 40);
+        let mut push = [0u8; 40];
+        for (i, v) in [
+            rows,
+            idx_off,
+            src_stride,
+            src_col,
+            n,
+            group,
+            dst_group_stride,
+            dst_row_off,
+            n_src,
+            fill.to_bits(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            push[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+        }
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(src), Self::vkb(idx), Self::vkb(dst)],
+            1,
+            &push,
+            total.div_ceil(64),
+        );
+    }
+
     /// DeepSeek V4 compressor pooling (`compress_pool.comp`, `Op::CompressPool`): per channel,
     /// softmax `scores` over the `window` axis and average `values` under it. One thread per
     /// output element (`blocks * n_embd`), each walking its own window.

@@ -815,7 +815,7 @@ impl SeamModel {
     fn may_auto_q8(&self) -> bool {
         self.cfg.moe.is_none()
             && !crate::seam::kv_auto_q8()
-            && crate::seam::kv_unset(&self.ecfg)
+            && crate::seam::kv_unset(&self.cfg, &self.ecfg)
             && crate::seam::kv_q8_layout_ok(&self.cfg)
     }
 
@@ -928,7 +928,11 @@ impl SeamModel {
             None if self.ecfg.kv.force_q8 || auto_q8 => DType::Q8_0,
             None => DType::F16,
         };
-        (side(self.ecfg.kv.type_k), side(self.ecfg.kv.type_v))
+        let k = side(self.ecfg.kv.type_k);
+        (
+            k,
+            crate::seam::kv_v_fmt(&self.cfg, k, side(self.ecfg.kv.type_v)),
+        )
     }
 
     /// Greedy generation on the Vulkan seam through a persistent session (see

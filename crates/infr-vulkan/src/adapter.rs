@@ -2879,7 +2879,11 @@ fn lower_op(
                 } else {
                     None
                 };
-                let vc_key = if deq_v {
+                // A cache serving as both K and V (deepseek4) has one dtype and was just expanded
+                // into the K scratch, which then serves as V too.
+                let vc_key = if deq_v && k_cache == v_cache && kc_key.is_some() {
+                    kc_key
+                } else if deq_v {
                     let k = pooled(pool, be_, "kvdeq_v", ne * 2)?;
                     let sc = pool[&k].as_ref();
                     let src = r(*v_cache)?;
@@ -4751,6 +4755,44 @@ fn lower_op(
                 *blocks,
                 *window,
                 *n_embd,
+            );
+        }
+        Op::GatherRows {
+            src,
+            idx,
+            dst,
+            rows,
+            idx_off,
+            src_stride,
+            src_col,
+            n,
+            group,
+            dst_group_stride,
+            dst_row_off,
+            fill,
+        } => {
+            let n_src = infr_core::graph::check_gather_rows(graph, op)
+                .map_err(|e| be(format!("vulkan {e}")))?;
+            // The shader's flat element index and the row bound are u32.
+            if rows.checked_mul(*n).is_none() {
+                return Err(be(format!(
+                    "vulkan Op::GatherRows: {rows} rows of {n} overflow the kernel's u32 index"
+                )));
+            }
+            rec.gather_rows(
+                r(*src)?,
+                r(*idx)?,
+                r(*dst)?,
+                *rows,
+                *idx_off,
+                *src_stride,
+                *src_col,
+                *n,
+                *group,
+                *dst_group_stride,
+                *dst_row_off,
+                u32::try_from(n_src).unwrap_or(u32::MAX),
+                *fill,
             );
         }
     }

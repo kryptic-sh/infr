@@ -1021,44 +1021,6 @@ confidence or the loader does not go through `wload`:
   vocabulary check rather than by `wshape.rs`.
 - A LEADING size-1 dim is not ignored; no GGUF writer is known to emit one.
 
-### B53 — V4's KV geometry duplicates the V side (2026-08-10)
-
-**Tag:** CR-2026-08-09 deepseek · **Blocked on:** a one-line change in
-`crates/infr-cpu`, which the wiring slice did not own
-
-`seam::kv_row_elems` now has a `deepseek4` branch and it returns
-`(head_dim, head_dim)` — one MQA row per side per token. **The V side is a
-DUPLICATE of the K side, written by a second `Op::WriteKv` from the same source
-row**, and that is not what the arithmetic wants.
-
-V4's raw attention is `build_attn_mha(q, k_all, k_all, …)`: K and V really are
-the same rows, so `(head_dim, 0)` — MLA's aliasing, with `kv_side_elems`
-supplying the placeholder and `Op::Attention` pointed at one buffer for both
-sides — is the correct shape. It is not the shape this codebase can execute. The
-CPU backend's `Op::Attention` arm takes `cpu_buf(kbuf).read()` and
-`cpu_buf(vbuf).read()` as two simultaneously-live guards, and a KV buffer is
-`CpuStore::Owned(Mutex<Vec<u8>>)` — a non-reentrant `std::sync::Mutex`. One id
-bound to both sides therefore self-deadlocks on the first V4 attention op. (The
-CPU MLA arm and `Op::LightningIndexer` both already take exactly ONE guard,
-which is the shape to copy; Vulkan is fine with the aliasing — both bindings are
-`readonly` and `Recorder::sync`'s dirty-set tracking de-dupes.)
-
-**To close it:** make the CPU arm take one guard when `k_cache == v_cache` (or
-take one guard and dequant twice from it), then flip the branch to
-`(head_dim, 0)` and drop the second `Op::WriteKv` in the `MixerW::Dsv4` emit.
-Add a CPU parity test that binds one id to both sides — there is none today.
-Worth roughly half of a V4 session's KV bytes. Also worth a `k_cache == v_cache`
-short-circuit in the Vulkan adapter's dequant prepass, which would otherwise
-dequant the same cache twice into two pooled scratch buffers (`kvdeq_k` /
-`kvdeq_v`); harmless for V4's f16 cache, live if a quantized V4 KV ever lands.
-
-**The compressed caches and compressor states are still unmodelled**, and cannot
-be modelled by this helper: they are per-layer (a ratio-0 layer has none) and
-the three compressor states are fixed-size recurrent buffers rather than
-per-token rows, so the precedent is `MixerW::DeltaNet`'s conv/S-state
-allocation. Sizes are tabulated in `docs/deepseek.md` § Stage 4. Nothing reads
-them: `generate_dense_backend` refuses a non-zero ratio before a graph is built.
-
 ### B58 — what the concurrent-pull slice did NOT verify (2026-08-10)
 
 **Tag:** concurrent-pull slice coverage · **Blocked on:** nothing; each line is
@@ -1209,6 +1171,28 @@ Only the GEMM tiles are near today's shapes. `decode_gemv_bw` (a bench) stays on
 the default device whatever `INFR_DEV` says: its single-submit loop reset the
 iGPU when pointed at it.
 
+### B-SYNTH-GPU-DEVICE — whole-model synthetic GPU tests ignore `INFR_DEV` (2026-11-16)
+
+**Tag:** test coverage · **Blocked on:** nothing
+
+`crates/infr-llama/tests/synthetic_deepseek2.rs` loads every model through its
+`load` helper with `EngineConfig::default()`, and
+`SeamModel::prefill_logits_vulkan` builds its backend from that config, so
+`INFR_DEV` is never read: the whole-model GPU tests there
+(`gpu_synthetic_deepseek4_*`, `gpu_synthetic_deepseek2_*` and the rest) have
+only ever run on the default device (the discrete GPU here), never on the
+integrated GPU, whatever the run was told. The op-level tests in
+`seam_op_parity.rs` do honour it (they build `VulkanBackend::new()`, which reads
+the environment). Verified 2026-11-16: a capture run with `INFR_DEV=Vulkan1`
+produced logits bit-identical to Vulkan0 through `load`, and different ones once
+the config came from `EngineConfig::load_from_env()`. Fix: build the test config
+with `EngineConfig::load_from_env()` (or copy just the device field from it) in
+`load`, and check the other synthetic test files for the same helper.
+
+**Also open:** S2's ratio-0 logits check was done once by hand (see
+`docs/plan/09-deepseek-v4-compressed.md` § 3); a permanent V4 lock needs
+llama.cpp to bless the synthetic file, per `docs/synthetic-models.md` rule 2.
+
 ### B-DSV4-WIRING — what the V4 graph slice still owes (2026-08-10)
 
 **Tag:** CR-2026-08-09 deepseek · **Blocked on:** nothing
@@ -1254,9 +1238,25 @@ iGPU when pointed at it.
 - **`Op::LightningIndexer`'s contract is written for V3.2's per-token key
   cache.** V4's keys come out of the compressor, so `top_k` counts compressed
   blocks; re-read the op's `k_cache`/`kv_len` meaning before reusing it.
-- The per-layer KV geometry those tiers need (§ B53) and the `wpush` handles for
-  their tensors, which the ratio-0 arm deliberately does not declare — the
-  `assert!` at the top of the build closure is what keeps that honest.
+- **The raw cache is one K=V cache (2026-11-16):** `seam::kv_row_elems` gives V4
+  `(head_dim, 0)`, the emit writes the row once and binds the K cache to both
+  `Op::Attention` sides. The compressed caches and the three compressor states
+  are not modelled yet: they are per-layer (a ratio-0 layer has none) and the
+  states are fixed-size recurrent buffers, so `kv_row_elems` cannot carry them;
+  the precedent is `MixerW::DeltaNet`'s state allocation, and the sizes are in
+  `docs/plan/09-deepseek-v4-compressed.md` section 1 (its slice S5). Nor are the
+  `wpush` handles for their tensors, which the ratio-0 arm deliberately does not
+  declare — the `assert!` at the top of the build closure is what keeps that
+  honest.
+- **`Op::GatherRows` landed on CPU and Vulkan, Metal written (2026-11-16),
+  unwired.** It assembles the compressor's pooling window (its doc maps the HCA
+  gather and the two overlap halves onto it). The emit takes its indices from
+  `Dsv4CompPlan::gather_read_idxs` (the sentinel already `-1`; the raw
+  `state_read_idxs` name it `state rows + tokens`, which the gather refuses on
+  CPU), and assembles `[persistent state | this step's rows]` into one INTERNAL
+  source tensor: the CPU executor never loads a KV cache operand into its store,
+  so a gather reading one would find it empty. Its Metal kernel and the Metal
+  aliased-attention test have not run anywhere yet; the macOS CI job runs them.
 
 **What slice A left unverified, in its own right:**
 

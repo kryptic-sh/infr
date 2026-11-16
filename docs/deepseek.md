@@ -765,8 +765,8 @@ hc wrap (attn) : rmsnorm(res, ones) -> Linear(hc_attn_fn) -> HyperConnectMix
                  -> HyperConnectPre -> RmsNorm(attn_norm)
 attention      : wq_a -> q_a_norm -> wq_b -> QkNorm{weight:None}
                  -> rope the [nope|rope] TAIL -> Copy to f16 q
-                 wkv -> attn_kv_a_norm -> rope the tail -> WriteKv (K and V)
-                 Attention{ n_kv:1, sinks, SlidingWindow(swa) }
+                 wkv -> attn_kv_a_norm -> rope the tail -> WriteKv (K only)
+                 Attention{ k_cache = v_cache, n_kv:1, sinks, SlidingWindow(swa) }
                  -> rope BACKWARD (de-rope) -> per-group Linear(wo_a, w_off)
                  -> Linear(wo_b)
 hc post (attn) : HyperConnectPost  res[0] -> res[1]

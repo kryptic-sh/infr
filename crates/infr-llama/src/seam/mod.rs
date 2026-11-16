@@ -1149,9 +1149,30 @@ pub(crate) fn pin_kv_auto_q8() {
 /// Use the `*_specified` flags, NOT `type_k.is_some()`. An unrecognized format name
 /// (`INFR_KV_TYPE_K=nonsense`) parses to no dtype, so the runner falls through to f16 — but it was
 /// still SUPPLIED, and today's `is_err()` reads it as "the user chose", suppressing auto-q8. Both
-/// halves of that asymmetry are preserved.
-pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
-    !ec.kv.type_k_specified && !ec.kv.type_v_specified && !ec.kv.force_q8
+/// halves of that asymmetry are preserved. A model whose V follows K ([`kv_v_follows_k`]) has no V
+/// setting to supply.
+pub(crate) fn kv_unset(cfg: &Config, ec: &EngineConfig) -> bool {
+    !ec.kv.type_k_specified && (kv_v_follows_k(cfg) || !ec.kv.type_v_specified) && !ec.kv.force_q8
+}
+
+/// Does this model's V cache format follow its K format, whatever `INFR_KV_TYPE_V` says?
+///
+/// True for deepseek4: it has no V cache at all (its attention reads the K cache as V, see
+/// [`kv_row_elems`]), so a V format would describe nothing. Every place a V format is chosen or
+/// gates something — the runner's format pick, the SWA ring gate, Metal's mixed-format clamp, the
+/// fit estimates and auto-q8 — reads it through [`kv_v_fmt`] or this predicate, so the setting is
+/// ignored the same way everywhere rather than half-honoured.
+pub(crate) fn kv_v_follows_k(cfg: &Config) -> bool {
+    cfg.deepseek4
+}
+
+/// The format the V side takes for `cfg`: `k_fmt` when [`kv_v_follows_k`], else `v_fmt`.
+pub(crate) fn kv_v_fmt(cfg: &Config, k_fmt: DType, v_fmt: DType) -> DType {
+    if kv_v_follows_k(cfg) {
+        k_fmt
+    } else {
+        v_fmt
+    }
 }
 
 /// Per-token (K, V) ELEMENT counts for layer `l` — the one answer to "how wide is a row of this
@@ -1186,20 +1207,14 @@ pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
 /// Recurrent-state layers (qwen35 DeltaNet, LFM short convolution) have no per-token cache to
 /// size; every caller branches to their fixed state ([`Config::recurrent_state_elems`]) before
 /// reaching here.
-/// **deepseek4 (V4) caches ONE `head_dim`-wide MQA row per side per token**, and the V side is a
-/// DUPLICATE of the K side rather than the MLA-style 0-width placeholder (docs/backlog.md B53).
 ///
-/// V4's raw attention is `build_attn_mha(q, k_all, k_all, …)` — K and V really are the same rows —
-/// so `(head_dim, 0)` with `Op::Attention` pointed at one buffer for both sides is the shape the
-/// arithmetic wants. It is not the shape this codebase can execute: the CPU backend's
-/// `Op::Attention` arm takes `cpu_buf(kbuf).read()` and `cpu_buf(vbuf).read()` as two
-/// SIMULTANEOUSLY-LIVE guards (`crates/infr-cpu/src/lib.rs`), and a KV buffer is
-/// `CpuStore::Owned(Mutex<Vec<u8>>)` — a non-reentrant `std::sync::Mutex`, so one id bound to both
-/// sides self-deadlocks the moment the first V4 attention op runs. (Vulkan is fine with it: both
-/// bindings are `readonly` and the hazard tracker de-dupes.) Aliasing therefore costs a one-line
-/// change in a crate the V4 wiring slice does not own, in exchange for halving a cache that, at
-/// V4's MQA width, is `head_dim` floats per token per layer. The emit writes the same normed+roped
-/// row to BOTH caches with two `Op::WriteKv`s instead — see `docs/backlog.md` § B53.
+/// **deepseek4 (V4) caches ONE `head_dim`-wide MQA row per token and has no V cache**: its raw
+/// attention is `build_attn_mha(q, k_all, k_all, …)`, so K and V are the same rows. The emit writes
+/// the row once and points `Op::Attention`'s `k_cache` and `v_cache` at the same tensor, which every
+/// backend accepts (the CPU arm reads an aliased pair through one guard and dequantizes it once).
+/// The V side has no rows: the graph declares no V tensor for a V4 layer (its `v_cache` handle IS
+/// the K cache's) and the session's V buffer is an unbound placeholder. Its format follows K
+/// ([`kv_v_follows_k`]).
 ///
 /// The compressed caches (CSA/HCA/LID) and the three compressor states a ratio-4 / ratio-128 layer
 /// owns are NOT modelled here. They cannot be: they are per-layer (a ratio-0 layer has none) and
@@ -1215,18 +1230,18 @@ pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
         // route via `is_swa_layer`, which is TRUE for every V4 layer, and so would answer with
         // gemma4's `head_dim_swa`/`n_kv_swa` fields. They happen to equal `head_dim`/`n_kv` for
         // every non-gemma4 model, which is an accident this arch should not depend on.
-        let row = cfg.head_dim;
-        return (row, row);
+        return (cfg.head_dim, 0);
     }
     let row = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
     (row, row)
 }
 
-/// Elements a KV side that the arch does NOT cache still declares and allocates: MLA's V, whose
-/// [`kv_row_elems`] count is 0. No backend ever indexes it (the MLA kernels read V as a prefix of
-/// the K row), but every backend still binds a buffer and a graph Input for the side, and a
-/// zero-size allocation is not portable — so the placeholder is a handful of elements, sized
-/// identically at the allocation and the declaration.
+/// Elements a KV side that the arch does NOT cache still allocates: MLA's V and deepseek4's V,
+/// whose [`kv_row_elems`] count is 0. No backend ever indexes it (the MLA kernels read V as a
+/// prefix of the K row; deepseek4's attention reads its K cache as V). MLA still declares and binds
+/// a graph Input for the side; deepseek4 declares none (its layer's `v_cache` handle is the K
+/// cache's) and leaves the buffer unbound. A zero-size allocation is not portable, so the
+/// placeholder is a handful of elements, sized identically at the allocation and any declaration.
 pub(crate) const KV_PLACEHOLDER_ELEMS: usize = 4;
 
 /// A KV side's element count as DECLARED in the graph: `elems`, or the placeholder when the arch
@@ -1462,7 +1477,7 @@ pub(crate) fn kv_ring_wanted(cfg: &Config, ec: &EngineConfig) -> bool {
         && !cfg.diffusion_gemma
         && ec.kv.ring
         && fmt_ok(ec.kv.type_k_specified, ec.kv.type_k)
-        && fmt_ok(ec.kv.type_v_specified, ec.kv.type_v)
+        && (kv_v_follows_k(cfg) || fmt_ok(ec.kv.type_v_specified, ec.kv.type_v))
 }
 
 /// The smallest context a session is worth opening with. A window below this is useless for any
@@ -1488,7 +1503,7 @@ pub(crate) const MIN_SESSION_CTX: usize = 1024;
 pub(crate) fn placement_ring(cfg: &Config, ec: &EngineConfig, k_fmt: DType, v_fmt: DType) -> bool {
     kv_ring_wanted(cfg, ec)
         && matches!(k_fmt, DType::F16 | DType::Q8_0)
-        && matches!(v_fmt, DType::F16 | DType::Q8_0)
+        && matches!(kv_v_fmt(cfg, k_fmt, v_fmt), DType::F16 | DType::Q8_0)
 }
 
 /// Bytes a FULLY-RESIDENT dense session needs at one EXPLICIT prefill chunk height and KV format
@@ -2461,7 +2476,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if !resident
             && cache_override.is_none()
             && !kv_auto_q8()
-            && kv_unset(ec)
+            && kv_unset(cfg, ec)
             && kv_q8_layout_ok(cfg)
         {
             let (k, v) = kv_fmts(true);
@@ -4296,7 +4311,7 @@ mod seam_helper_tests {
     fn kv_specified_beats_a_parsed_dtype() {
         let unset = EngineConfig::default();
         assert!(
-            super::kv_unset(&unset),
+            super::kv_unset(&Config::default(), &unset),
             "nothing supplied ⇒ auto-q8 may fill"
         );
 
@@ -4310,7 +4325,7 @@ mod seam_helper_tests {
             ..Default::default()
         };
         assert!(
-            !super::kv_unset(&nonsense),
+            !super::kv_unset(&Config::default(), &nonsense),
             "an unparseable name still counts as an explicit choice"
         );
 
@@ -4322,7 +4337,7 @@ mod seam_helper_tests {
             },
             ..Default::default()
         };
-        assert!(!super::kv_unset(&q8));
+        assert!(!super::kv_unset(&Config::default(), &q8));
     }
 
     #[test]
@@ -4419,6 +4434,77 @@ mod seam_helper_tests {
         // The pre-fix pricing, spelled out: K+V at the head-dim product.
         let old = (cfg.n_layer * rows * 2 * (cfg.n_kv * cfg.head_dim) * 2) as u64;
         assert_eq!(est, old * 3 / 2, "the estimate was 1.5x short");
+    }
+
+    /// deepseek4 stores its K=V row once (`build_attn_mha(q, k_all, k_all, …)`), so the footprint
+    /// is the K side alone and the V side is the bindable placeholder. Pinned at the V4-Flash
+    /// geometry (`deepseek-ai/DeepSeek-V4-Flash` `config.json`: 43 layers, head dim 512, MQA,
+    /// window 128) from hand-computed byte counts; a V side priced like K doubles every figure.
+    #[test]
+    fn kv_footprint_of_deepseek4_is_the_k_side_alone() {
+        let cfg = Config {
+            n_layer: 43,
+            n_embd: 4096,
+            n_head: 64,
+            n_kv: 1,
+            head_dim: 512,
+            swa_window: 128,
+            deepseek4: true,
+            ..Default::default()
+        };
+        assert_eq!(super::kv_row_elems(&cfg, 0), (512, 0));
+        // Full context 4096: (4096 + 64 slop) rows x 512 elements x 2 bytes (f16) x 43 layers.
+        let full = super::kv_bytes_estimate_fmt(&cfg, 4096, false, 512, DType::F16, DType::F16);
+        assert_eq!(full, 183_173_120);
+        // Ring: min(4096, (128 + 512) rounded up to 64) + 64 = 704 rows per layer.
+        let ring = super::kv_bytes_estimate_fmt(&cfg, 4096, true, 512, DType::F16, DType::F16);
+        assert_eq!(ring, 30_998_528);
+        // The allocation: 4096 x 512 x 2 bytes of K, and the placeholder V (4 f16 elements).
+        let alloc =
+            super::kv_layer_alloc_bytes(&cfg, 0, 4096, false, 512, 1, DType::F16, DType::F16);
+        assert_eq!(alloc, (4_194_304, 8));
+    }
+
+    /// deepseek4 has no V cache, so a V format setting must not gate anything for it: not the SWA
+    /// ring (`kv_ring_wanted`, `placement_ring`), not auto-q8 (`kv_unset`). The same settings on a
+    /// model with a real V cache keep gating, which is what shows the predicate is doing the work.
+    #[test]
+    fn v_kv_type_gates_nothing_for_deepseek4() {
+        let dsv4 = Config {
+            n_layer: 2,
+            n_kv: 1,
+            head_dim: 128,
+            swa_window: 128,
+            deepseek4: true,
+            ..Default::default()
+        };
+        let swa = Config {
+            deepseek4: false,
+            ..dsv4.clone()
+        };
+        let v_only = |dt| EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_v: Some(dt),
+                type_v_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for dt in [DType::Turbo3, DType::Q4_0, DType::F32] {
+            let ec = v_only(dt);
+            assert!(super::kv_ring_wanted(&dsv4, &ec), "{dt:?}: ring gated");
+            assert!(
+                super::placement_ring(&dsv4, &ec, DType::F16, dt),
+                "{dt:?}: placement ring gated"
+            );
+            assert_eq!(super::kv_v_fmt(&dsv4, DType::F16, dt), DType::F16);
+            assert!(super::kv_unset(&dsv4, &ec), "{dt:?}: auto-q8 suppressed");
+            // The control: a V cache that exists is gated by its format.
+            assert!(!super::kv_ring_wanted(&swa, &ec), "{dt:?}: control ring");
+            assert!(!super::placement_ring(&swa, &ec, DType::F16, dt));
+            assert_eq!(super::kv_v_fmt(&swa, DType::F16, dt), dt);
+            assert!(!super::kv_unset(&swa, &ec));
+        }
     }
 
     /// A recurrent layer's state does not grow with the context, so the estimate prices it at the

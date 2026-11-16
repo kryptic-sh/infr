@@ -38,6 +38,12 @@ pub const DSV4_CSA_RATIO: u32 = 4;
 /// Ratio at which the HCA compressor pools rows. Mirrors `DSV4_HCA_RATIO`.
 pub const DSV4_HCA_RATIO: u32 = 128;
 
+/// The index `Op::GatherRows` fills from its `fill` value: the sentinel row's entry in
+/// [`Dsv4CompPlan::gather_read_idxs`]. The reference names that row by its position past the
+/// source ([`Dsv4CompPlan::sentinel_row`]), which the gather treats as out of range, so the emit
+/// takes this form rather than translating.
+pub const DSV4_GATHER_SENTINEL: i32 = -1;
+
 /// The per-ubatch compressor-state recipe: which compressor-state rows this ubatch reads to
 /// build compressed rows, which cache rows it commits, and which persistent-state ring rows it
 /// overwrites. See `docs/deepseek.md`'s "The per-ubatch plan" for the derivation this mirrors.
@@ -79,6 +85,11 @@ pub struct Dsv4CompPlan {
     /// one `ratio`-sized run per committed block, current-window only.
     pub state_read_idxs: Vec<i32>,
 
+    /// The sentinel row's id in [`Self::state_read_idxs`]: `state rows + tokens`, one past the
+    /// `[persistent_state | current_ubatch_scratch]` rows, where the reference appends its
+    /// zero/`-inf` row (`dsv4_append_zero_row`). It is also that source's row count.
+    pub sentinel_row: i32,
+
     /// Compressed-cache row ids written by state-backed commits, one per committed block: the
     /// real commits, then any dummy commit, which targets the cache's last row.
     pub state_write_idxs: Vec<i32>,
@@ -101,6 +112,25 @@ pub struct Dsv4CompPlan {
     /// when several tokens in the ubatch land on the same ring row, only the entry for the
     /// HIGHEST `pos` survives — and sorted ascending so the write order is deterministic.
     pub state_persist_dst_idxs: Vec<i32>,
+}
+
+impl Dsv4CompPlan {
+    /// [`Self::state_read_idxs`] in the form `Op::GatherRows` takes: every sentinel entry
+    /// ([`Self::sentinel_row`]) becomes [`DSV4_GATHER_SENTINEL`], so the gather writes its fill
+    /// there, and every other entry is a row of the `[persistent_state | current_ubatch_scratch]`
+    /// source, below its row count.
+    pub fn gather_read_idxs(&self) -> Vec<i32> {
+        self.state_read_idxs
+            .iter()
+            .map(|&i| {
+                if i == self.sentinel_row {
+                    DSV4_GATHER_SENTINEL
+                } else {
+                    i
+                }
+            })
+            .collect()
+    }
 }
 
 struct PersistRow {
@@ -321,6 +351,7 @@ pub fn build_dsv4_comp_plan(
         n_visible_max: n_visible_max as usize,
         state_pos,
         state_read_idxs,
+        sentinel_row: (state_rows + n_tokens as i64) as i32,
         state_write_idxs,
         state_write_pos,
         n_real_commits,
@@ -518,6 +549,32 @@ mod tests {
         // cur half: pos 0..3 are this ubatch's own tokens i=0..3 -> state_size + i.
         let s = CSA_STATE as i32;
         assert_eq!(plan.state_read_idxs[4..8], vec![s, s + 1, s + 2, s + 3]);
+    }
+
+    /// What the emit hands `Op::GatherRows`: the sentinel entries as [`DSV4_GATHER_SENTINEL`],
+    /// everything else unchanged and inside the `[state | scratch]` source, whose row count is
+    /// `sentinel_row`. Checked on a prefill whose first block reads the sentinel and whose later
+    /// blocks read the ring and this ubatch's own rows.
+    #[test]
+    fn gather_read_idxs_names_the_sentinel_as_minus_one() {
+        let positions: Vec<i32> = (0..12).collect();
+        let plan = csa(&positions, 16).unwrap();
+        let sentinel = CSA_STATE as i32 + positions.len() as i32;
+        assert_eq!(plan.sentinel_row, sentinel);
+        let g = plan.gather_read_idxs();
+        assert_eq!(g.len(), plan.state_read_idxs.len());
+        assert_eq!(g[0..4], [DSV4_GATHER_SENTINEL; 4]);
+        for (k, (&got, &raw)) in g.iter().zip(&plan.state_read_idxs).enumerate() {
+            if raw == sentinel {
+                assert_eq!(got, DSV4_GATHER_SENTINEL, "entry {k}");
+            } else {
+                assert_eq!(got, raw, "entry {k}");
+                assert!(
+                    (0..sentinel).contains(&got),
+                    "entry {k} = {got} leaves the source"
+                );
+            }
+        }
     }
 
     /// A single-token CSA decode step off a block boundary: no real commit (pos=13,

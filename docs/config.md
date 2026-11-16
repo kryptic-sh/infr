@@ -100,9 +100,10 @@ Error: config `device.ctx`: expected a size/count like 8192, 256k or 50% (got "b
 
 Note the asymmetry with the environment, which is frozen at today's behaviour:
 `ctx = "banana"` in a file fails to load, while `INFR_CTX=banana` is silently
-ignored and falls back. Five environment keys do reject a bad value loudly, at
+ignored and falls back. Six environment keys do reject a bad value loudly, at
 startup, on every subcommand: `INFR_SG`, `INFR_SUBMIT_DISPATCHES`,
-`INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`, `INFR_EXPERT_PARALLEL`.
+`INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`, `INFR_EXPERT_PARALLEL`, and `INFR_TUNE`
+(see [Vulkan kernel tuning](#vulkan-kernel-tuning)).
 
 ### Diagnostics announce themselves
 
@@ -221,7 +222,9 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
   `no_replay`, `no_vram_guard`, the BDA chunk caps). Note `f16 = false` also
   disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
-  today.
+  today. The hardware-shaped numbers (split counts, thresholds, rows per
+  workgroup, subgroup pins) are per-device tuning parameters, set under
+  `[kernels.vulkan.tune]`; see the next section.
 - **`[kernels.metal]`** — the Apple backend's native/CMM/RT kernel families per
   dtype, plus `deltanet`, `moe` and `pipeline_cache` (persist the compiled
   `MTLComputePipelineState`s as an `MTLBinaryArchive` under `~/.cache/infr`, so
@@ -234,6 +237,72 @@ and these exist to force one off when bisecting a correctness or perf problem.
   the thread running the graph, on one logical processor per allowed core so no
   two share a core's SMT siblings; only when the threads fit one per allowed
   core; Windows only, no `INFR_*` twin).
+
+### Vulkan kernel tuning
+
+Every hardware-shaped number a Vulkan kernel choice depends on — a split count,
+a size threshold, rows per workgroup, a pinned subgroup width — is a **tuning
+parameter**, named `family.param` (and `family.param@qualifier` where it varies
+by quant format, e.g. `mmv_mw.warps@q4_k`). `infr tune list` names every one,
+with its range, its default rule and its value on your device; `infr tune show`
+prints the device, the key the table matched it by, the matched table rows, and
+each value with the level it came from:
+
+```
+$ infr tune show --dev Vulkan0
+device:  AMD Radeon RX 7900 XTX (AmdRdna3, AMD_PROPRIETARY)
+match:   vendor=amd arch=AmdRdna3 driver=AMD_PROPRIETARY integrated=false device_id=0x744c cu=96 subgroup=32-64 driver_version=0x800161
+hash:    5715f12d
+rows:
+  amd-proprietary-split-k [class row, maintainer] sets split_k.scale_by_cu
+  amd-proprietary-i8cm-kq [class row, maintainer] sets gemm_i8cm_kq.enabled
+
+device.sg_pref              32     default
+gemv_sg.rows                2      default
+...
+```
+
+`--json` prints the same as a document. The `hash` is also in the device banner
+(`tune:5715f12d`), so a log says whether two runs tuned alike.
+
+Each value is resolved once, when the backend is created, from these levels —
+the last one that sets a parameter wins, per parameter:
+
+1. the **generic default**, derived from the device's facts;
+2. **class rows** of the built-in table
+   (`crates/infr-vulkan/src/tuning/table.toml`) — a vendor plus an architecture,
+   driver, integrated flag, subgroup range or compute-unit range;
+3. **device rows** of that table (PCI device ids, or a name);
+4. your **tuning file**, `kernels.vulkan.tuning.file` / `INFR_TUNE_FILE`: rows
+   in the same schema, so a row can be tried without rebuilding;
+5. the **config file**, `[kernels.vulkan.tune]`;
+6. the **environment**, `INFR_TUNE="family.param=value,…"`;
+7. the **command line**, `--set kernels.vulkan.tune.family.param=value`.
+
+```toml
+[kernels.vulkan.tune]
+"gemv_sg.rows" = 4
+"mmv_mw.warps@q4_k" = 2
+
+[kernels.vulkan.tuning]
+rows = false              # INFR_TUNE_NO_ROWS: generic defaults only, no table rows
+disable = ["amd-proprietary-split-k"]   # INFR_TUNE_DISABLE: drop rows by id
+```
+
+A value you set that is not a parameter, is out of range, or targets a `fixed`
+parameter (one that must equal a literal compiled into a shader) refuses the
+device with an error naming where it came from. A built-in row value that fails
+validation is dropped with a warning instead, so a bad row cannot brick a
+device. Within one level a qualified setting (`@q4_k`) beats an unqualified one.
+
+**The older knobs are aliases.** `device.subgroup_pref` (`INFR_SG`),
+`kernels.vulkan.flash_splits`, `pv_splits`, `flash_min_rows`, `flash_bm32`,
+`mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`, `i8cm_kq` (`INFR_NO_I8CM_KQ`)
+and the whole `[kernels.vulkan.gemv]` group keep their names, grammars and
+meanings — including their old clamps and fallbacks — and write the matching
+parameter at the level that set them (`infr tune show` labels it, e.g.
+`env alias INFR_FLASH_SPLITS`). At the same level the new `tune` key wins over
+the alias; across levels the higher level wins whichever spelling it uses.
 
 **`[spec]`** — MTP / speculative decode: `mtp`, `k`, `decode_chain`, `draft` (a
 draft-model path), the GPU-side sampling steps (`gpu_argmax`, `gpu_sample`,

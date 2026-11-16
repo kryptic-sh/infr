@@ -60,6 +60,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   decode (the first decode pass after that prompt hit 470 of its 774 expert
   pins). Other families are unchanged on the CPU. `INFR_PAGER_STATS` now also
   prints each pool's re-reads and their read time.
+- **One table for the Vulkan kernels' per-device tuning, and `infr tune`.**
+  Every hardware-shaped number a Vulkan kernel choice depends on (split counts,
+  size bands, rows per workgroup, the decode subgroup pin, which build runs) is
+  now a named parameter, `family.param`, resolved once per device from a generic
+  default, rows of a built-in table for device classes and specific cards, an
+  optional tuning file (`kernels.vulkan.tuning.file` / `INFR_TUNE_FILE`), and
+  `[kernels.vulkan.tune]` / `INFR_TUNE=family.param=value,…` /
+  `--set kernels.vulkan.tune.family.param=value`, each later level winning per
+  parameter. `kernels.vulkan.tuning.rows = false` (`INFR_TUNE_NO_ROWS`) uses the
+  defaults alone and `kernels.vulkan.tuning.disable` (`INFR_TUNE_DISABLE`) drops
+  rows by id. `infr tune show [--dev VulkanN] [--json]` prints each value and
+  the level it came from; `infr tune list [family]` prints every parameter's
+  range, default rule and value on the device; the device banner carries a short
+  hash of the set (`tune:…`). A value you set that is unknown or out of range
+  refuses the device naming its source. **No default changed on any device**:
+  the defaults are the previous rules verbatim (the kernel set dispatched for
+  prefill and decode is identical on the RX 7900 XTX and the Raphael iGPU), and
+  the older knobs — `INFR_SG`, `INFR_FLASH_SPLITS`, `INFR_PV_SPLITS`,
+  `INFR_FLASH_MIN_ROWS`, `INFR_FLASH_BM`, `INFR_MMV_MW_WARPS`,
+  `INFR_MOE_SMALL_M`, `INFR_CANVAS_CHUNK_N`, `INFR_NO_I8CM_KQ` and the
+  `INFR_GEMV_*` group with their config paths — keep working as aliases with
+  their old meanings.
 
 - **Wave64-only AMD GPUs (GCN: Polaris, Vega) run on the Vulkan backend** (issue
   #94), ported from korewaChino's KessokuNet fork. A device that cannot pin a

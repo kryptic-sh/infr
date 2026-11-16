@@ -8,7 +8,12 @@ can sweep the values on their card and send the result as a small data change.
 
 Scoped on 2026-11-17 by reading every shader and its host dispatch, with a few
 throwaway `glslc`/`spirv-opt` experiments (shaderc 2026.3). Tags: **[R]** read
-or run, **[I]** inferred, **[U]** unknown until measured. Nothing is built yet.
+or run, **[I]** inferred, **[U]** unknown until measured.
+
+**S1 is done (2026-11-17):** the table, the resolver, `infr tune show/list`, the
+aliases and the fixtures exist (`crates/infr-vulkan/src/tuning/`), and every
+existing runtime value reads through them; §0 below describes the tree as it was
+scoped, and S1's section in §5 says what it found that differs.
 
 ## 0. Where things stand
 
@@ -64,6 +69,21 @@ or run, **[I]** inferred, **[U]** unknown until measured. Nothing is built yet.
 
 Many literal 32s are quant block sizes (Q8_0, Q4_K sub-blocks), not lane counts,
 and must not be parameterized.
+
+The authority is now `crates/infr-vulkan/src/tuning/classes.rs`: every `.comp`
+source has a class there, and a test fails when one is missing or when an
+assignment disagrees with what the source uses (class 4 exactly the
+cooperative-matrix kernels, class 2 only kernels with subgroup operations, class
+5 none with any). Corrections S1 made to the lists below: `attn_pv_reduce` and
+`attn_flash_combine` use no cooperative matrix (class 5a, not 4: the `attn_pv*`
+and `attn_flash*` globs were too wide; `attn_flash_combine` only enables the
+subgroup extension); `native_gemm*` in class 4 means the coopmat builds only
+(`native_gemm`, `native_gemm_warp`, `native_gemm_f8cm_q8_0`,
+`native_gemm_i8cm_q8_0`, `native_gemm_i8cm_kq`), the mmq/dp4a/fma ones are 5b;
+`attn_combine` was unclassified and is class 3 (its `wexp[1024]` is the host's
+`ATTN_MAX_CHUNKS`); `attn_ktile` uses no subgroup operation at all (still class
+1). `moe_topk`, `wave64_probe` and `native_gemm_i8cm_kq` use subgroup operations
+without including `wave64.glsl`.
 
 - **Class 1 — already parameterized or width-agnostic:** `native_gemv_sg`
   (`-DSG`, `-DNR`), `native_gemv_id_multi_sg`, `native_mmv_mw` (`WARPS*SG`),
@@ -259,23 +279,60 @@ hardware it does not name", made mechanical.
 
 Each is green on Linux and Windows CI and needs no macOS verification.
 
-| #   | Slice                                                                                                                                                                                                      | Verification                                                                                                                |
-| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
-| S1  | The central table, resolver and `infr tune show/list`; every EXISTING runtime value migrated verbatim as the default; config aliases; snapshot fixtures; every shader assigned a class. No kernel changes. | unit and snapshot tests; identical kernel-name lists, GPU gate and goldens on both GPUs                                     |
-| S2  | Contributor doc v0 (`docs/kernel-tuning.md`) and an issue form for tuning reports; links from the README and perf docs                                                                                     | reads true against S1                                                                                                       |
-| S3  | The spec-constant mechanism: `params.glsl`, `kernel_p`, `LocalSizeId` and `SpecId` readers, the new limit checks, a probe that reports the real subgroup and workgroup sizes per specialization            | the probe across workgroup sizes and pins on both GPUs; GPU gate unchanged                                                  |
-| S4  | First kernel end to end and the GCN win: `native_gemv_sg` on `P_SG`/`P_ROWS`, with a native 64-lane value (the community fork's commit `a1f58563b` is the reference)                                       | equivalence at 32 and 16; on both GPUs native 64 against the CPU, and its speed against native 32 and the 32-lane emulation |
-| S5  | `infr tune sweep` and `check`, the parity and microbench harness, the report and row generator; doc v1                                                                                                     | a sweep on both GPUs; a deliberately bad value shows FAIL and is never ranked                                               |
-| S6  | Class 2 batch A: the decode GEMVs (`native_mmv_mrow`, `native_gemv_mrow`, `native_gemv_id*`, `native_gemv_rm_v2`, `native_mmv_mw`) with a pin parameter                                                    | equivalence; bit-identity at defaults; tolerance across pins; the decode-verify contract per pin; perf guard                |
-| S7  | Class 2 batch B: norms, softmax, quantization (`quant_q8`'s blocks per workgroup as the one-source group-count exemplar)                                                                                   | as S6                                                                                                                       |
-| S8  | Class 2 batch C: the small-workgroup DeltaNet kernels                                                                                                                                                      | Qwen3.5-0.8B; GCN gated                                                                                                     |
-| S9  | Rows for the two local GPUs from sweeps of everything converted so far, native 32 against native 64 against unpinned included                                                                              | the protocol below                                                                                                          |
-| S10 | Split today's tuned values from the generic defaults (the only slice that changes behaviour, and only for hardware no row matches)                                                                         | snapshots for the two local GPUs byte-unchanged; `infr tune show --json` and kernel-name lists identical on both            |
-| S11 | Class 3: the attention split family (chunk policy as push constants read by `attn_live`, `SC_MAX`, workgroup size, the per-key reduction width)                                                            | parity; the deep-context shapes of B15                                                                                      |
-| S12 | Class 5b in batches, as Intel or NVIDIA numbers ask for it                                                                                                                                                 | parity; perf guard                                                                                                          |
+| #   | Slice                                                                                                                                                                                                                | Verification                                                                                                                |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| S1  | **Done.** The central table, resolver and `infr tune show/list`; every EXISTING runtime value migrated verbatim as the default; config aliases; snapshot fixtures; every shader assigned a class. No kernel changes. | unit and snapshot tests; identical kernel-name lists, GPU gate and goldens on both GPUs                                     |
+| S2  | Contributor doc v0 (`docs/kernel-tuning.md`) and an issue form for tuning reports; links from the README and perf docs                                                                                               | reads true against S1                                                                                                       |
+| S3  | The spec-constant mechanism: `params.glsl`, `kernel_p`, `LocalSizeId` and `SpecId` readers, the new limit checks, a probe that reports the real subgroup and workgroup sizes per specialization                      | the probe across workgroup sizes and pins on both GPUs; GPU gate unchanged                                                  |
+| S4  | First kernel end to end and the GCN win: `native_gemv_sg` on `P_SG`/`P_ROWS`, with a native 64-lane value (the community fork's commit `a1f58563b` is the reference)                                                 | equivalence at 32 and 16; on both GPUs native 64 against the CPU, and its speed against native 32 and the 32-lane emulation |
+| S5  | `infr tune sweep` and `check`, the parity and microbench harness, the report and row generator; doc v1                                                                                                               | a sweep on both GPUs; a deliberately bad value shows FAIL and is never ranked                                               |
+| S6  | Class 2 batch A: the decode GEMVs (`native_mmv_mrow`, `native_gemv_mrow`, `native_gemv_id*`, `native_gemv_rm_v2`, `native_mmv_mw`) with a pin parameter                                                              | equivalence; bit-identity at defaults; tolerance across pins; the decode-verify contract per pin; perf guard                |
+| S7  | Class 2 batch B: norms, softmax, quantization (`quant_q8`'s blocks per workgroup as the one-source group-count exemplar)                                                                                             | as S6                                                                                                                       |
+| S8  | Class 2 batch C: the small-workgroup DeltaNet kernels                                                                                                                                                                | Qwen3.5-0.8B; GCN gated                                                                                                     |
+| S9  | Rows for the two local GPUs from sweeps of everything converted so far, native 32 against native 64 against unpinned included                                                                                        | the protocol below                                                                                                          |
+| S10 | Split today's tuned values from the generic defaults (the only slice that changes behaviour, and only for hardware no row matches)                                                                                   | snapshots for the two local GPUs byte-unchanged; `infr tune show --json` and kernel-name lists identical on both            |
+| S11 | Class 3: the attention split family (chunk policy as push constants read by `attn_live`, `SC_MAX`, workgroup size, the per-key reduction width)                                                                      | parity; the deep-context shapes of B15                                                                                      |
+| S12 | Class 5b in batches, as Intel or NVIDIA numbers ask for it                                                                                                                                                           | parity; perf guard                                                                                                          |
 
 Class 4 gets no slice: its tile shapes stay builds, and the host's choice among
 them becomes a variant parameter in the table (S1, S10).
+
+**What S1 found.** Values migrated (`tuning::families`, `infr tune list`):
+`device.sg_pref` (the capability rule; alias `INFR_SG`); `gemv.variant`,
+`gemv_rm.*`, `gemv_sg.*`, `gemv_id_sg.enabled` (the `[kernels.vulkan.gemv]`
+group); `mmv_mw.warps@dtype` (per-format default, alias `mmv_mw_warps`);
+`mmv_mrow.o4_max_in_f` / `o4_all_widths` (the four-outputs GEMV rule: below 2048
+wide, or every width on an integrated GPU — not in the plan's list);
+`attn_flash.*` and `attn_pv.*` (the fixed count, `flash_min_rows`, `flash_bm32`
+and the split policy's five constants, one policy for the two flash sites and
+the PV site, which compute the same function); `attn_canvas.chunks`;
+`moe.small_m`; `split_k.fixed_grid` / `fill_per_cu` / `scale_by_cu`;
+`gemm_i8cm_kq.enabled` and `l_fill_per_cu` (the large-tile fill, not in the
+plan's list); `rmsnorm.wide` / `wide_min_dim`. Reported as `fixed`:
+`attn_split.*` (`ATTN_SPLIT`, which `attn_live.comp` computes too),
+`mla.sg_width`, `quant_q8.blocks_per_wg`. The two rules measured on one driver
+(the split-K CU scaling and the int8 coopmat K-quant GEMM, both
+`AMD_PROPRIETARY`) are ROWS with their measurements as provenance, their generic
+defaults off — which is what S10 asks of them, reached here without a behaviour
+change because the rows match exactly the devices the old driver check did.
+Everything else is a derive function, because it follows from a capability
+(`sg_pref`, the integrated-GPU `o4` rule) or is a plain constant.
+
+Differences from the plan as written: `mmv_mw.warps` reaches no dispatch today
+(`adapter::unified_mmv_row1` is always true, so the decode takes
+`native_mmv_mrow` at rows=1 and `native_mmv_mw` is never dispatched; the plan
+and the old docs said WARPS still affected Intel). The device facts S1 gathers
+omit the required-subgroup-size stages, the compute workgroup limits,
+`maxComputeWorkgroupSubgroups` and the cooperative-matrix shapes: no S1 rule
+reads them, and S3's validation is where they are needed. Feature switches that
+pick a tier on or off for A/B (`gemm_warp`, `mmv_o4`, `mrow`, `mla_sg`, …) stay
+config switches, not parameters. Inline thresholds S1 did NOT migrate, because
+no device rule chooses them today and each is a measurement away from mattering:
+`MMV_MIN_ELEMS`, the `2 << 20` mmv_mw floor, `WIDE_GRID_MIN` (an occupancy
+number like split-K's window), the `DENSE_SMALL_TILE_*` bands,
+`DP4A_KQ_MIN_ROWS`, the split-K clamp of 8, and the integrated ubatch rows and
+submit splitter (not kernel parameters); the flash tile's shared-memory pick is
+a limit, not a choice. `docs/backlog.md` B-HWDET-NO-ARCH-BUCKET lists them.
 
 **S9 protocol.** Quiet machine: run the baseline five times interleaved first
 and abort if its spread exceeds 3%. Warm pipeline cache; discard the first

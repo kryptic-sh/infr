@@ -144,7 +144,7 @@ force_wave64 = false # testing only: run the wave64 (AMD GCN) path on a wave32 d
 gemm_warp = true
 mmv = true
 mrow = true
-moe_small_m = 8 # clamped to 0..=64 by the accessor
+moe_small_m = 8 # alias of the moe.small_m tuning parameter; clamped to 0..=64
 
 # Attention.
 flash_warp = true
@@ -158,6 +158,18 @@ pipeline_cache_disk = true
 gpu_pos = true
 fuse_add = true
 no_replay = false # sanctioned negative: true DISABLES the decode replay tape
+
+# Per-device tuning parameters: `infr tune list` names every one, `infr tune show`
+# says where each value on a device comes from. A value here beats the built-in
+# table's rows; INFR_TUNE and --set kernels.vulkan.tune.<key>=<value> beat it.
+# [kernels.vulkan.tune]
+# "gemv_sg.rows" = 4
+# "mmv_mw.warps@q4_k" = 1
+#
+# [kernels.vulkan.tuning]
+# rows = true            # false: generic defaults only, no table rows
+# disable = []           # ids of table rows to ignore
+# file = "my-tune.toml"  # rows in the table's schema, tried without a rebuild
 
 [kernels.cpu]
 spin = 32768 # spin-pool idle ceiling

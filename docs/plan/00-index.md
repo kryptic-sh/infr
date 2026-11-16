@@ -43,9 +43,9 @@ reference to judge tuned values against.
 
 ## Vulkan backend
 
-| Phase | What                                                                                  | Status |
-| ----- | ------------------------------------------------------------------------------------- | ------ |
-| 10    | [Kernels with per-device tunable parameters](10-tunable-kernels.md), one tuning table | scoped |
+| Phase | What                                                                                  | Status  |
+| ----- | ------------------------------------------------------------------------------------- | ------- |
+| 10    | [Kernels with per-device tunable parameters](10-tunable-kernels.md), one tuning table | S1 done |
 
 ## Notes on the model phases
 

@@ -2154,22 +2154,32 @@ filter on `coopmat_f16`).
   (`a1f58563b` and follow-ups) uses all 64 lanes instead of two halves. A
   32-wide workgroup on this path leaves half of each wave idle.
 
-### B-HWDET-NO-ARCH-BUCKET — the per-op subgroup-width table is still not representable, and is still a guess (2026-08-11)
+### B-HWDET-NO-ARCH-BUCKET — values can now be tuned per architecture; a per-kernel subgroup width still cannot (2026-11-17)
 
-**Tag:** vulkan · detection · **Blocked on:** a measurement nobody can take here
+**Tag:** vulkan · detection · tuning · **Blocked on:** plan 10's S3/S6 for
+per-kernel pins; measurements for everything else
 
-The architecture bucket itself now exists (`caps::DeviceArch`, see
-B-HWDET-VENDOR-RULES) and has exactly one consumer: coopmat trust. What the
-audit listed as the thing a bucket would BUY is still absent and still
-unjustified:
+The architecture bucket (`caps::DeviceArch`, see B-HWDET-VENDOR-RULES) now has a
+second consumer: the tuning table (`crates/infr-vulkan/src/tuning/`, plan 10
+S1). A row can match `vendor`, `arch`, `driver`, `integrated`, the subgroup
+range, a compute-unit range or PCI ids, and set any HOST or VARIANT parameter
+for that class — split counts, size bands, rows per workgroup, which build runs.
+`infr tune list` names every parameter; `infr tune show` prints which value a
+device runs with and why. What a bucket was meant to buy is therefore
+representable for those values. Still absent:
 
-- **A per-architecture, per-pipeline subgroup-size table** (upstream's
-  `gpu_pipeline_configs` / `rdna1_pipelines` / `rdna2_pipelines`). `infr` has
-  two pinned widths — a global 32 and `sg_pref` for one curated decode family —
-  so a per-op width cannot be expressed at all. Adding the table is a real
-  change to the kernel-cache key, and the evidence for it is upstream's tuning
-  of DIFFERENT kernels on hardware that is not here. Still a guess, deliberately
-  not built.
+- **A per-kernel subgroup width.** The only pin parameter is `device.sg_pref`
+  (one width for the curated decode family); every other subgroup kernel pins
+  32, `MLA_SG_WIDTH` (reported as `mla.sg_width`, fixed) or the driver's choice.
+  A per-kernel pin needs the spec-constant mechanism (plan 10 S3) and is the
+  per-architecture table upstream has (`gpu_pipeline_configs`). Still not
+  justified by a measurement here.
+- **Thresholds not yet migrated** (S1 kept them inline because no device rule
+  chooses them today): `adapter::MMV_MIN_ELEMS`, the `2 << 20` floor in
+  `mmv_mw_choice`, `recorder`'s `WIDE_GRID_MIN` (an occupancy number like the
+  split-K window), the `DENSE_SMALL_TILE_*` bands, `DP4A_KQ_MIN_ROWS`, and
+  `split_k_plan`'s clamp of 8. Each becomes a parameter when a measurement on
+  some device wants a different value.
 - **Wave64-only hardware runs through an emulation, not a per-op table**: a
   device that cannot pin 32 but can pin 64 (AMD GCN) takes the wave64 path,
   which is decided from the subgroup range (`caps::subgroup_mode`), not from the
@@ -2220,27 +2230,27 @@ only `coopMatPerElementNV`, not flexible dimensions / tensor addressing / block
 loads, so the full gate would make it skip on hardware where its own experiment
 would run.
 
-### B-NVSHAPE-CORECOUNT — the shader-core count exists on every vendor; of the occupancy constants, only the prefill GEMM split-K uses it (2026-08-11)
+### B-NVSHAPE-CORECOUNT — the shader-core count exists on every vendor; of the occupancy constants, only the prefill GEMM split-K uses it (2026-11-17)
 
 **Tag:** vulkan · nvidia · intel · **Blocked on:** NVIDIA/Intel hardware to
 validate; a RADV re-measure of the GEMM split-K window; per-site measurements
 for the attention split-K constants
 
-`caps::shader_core_count` now sources the count the way llama.cpp does —
+`caps::shader_core_count` sources the count the way llama.cpp does —
 `VK_NV_shader_sm_builtins`' `shaderSMCount` on NVIDIA,
 `VK_AMD_shader_core_properties2`' `activeComputeUnitCount` on AMD, and a PCI
 device-id table on Intel transcribed verbatim from
 `ggml_vk_intel_shader_core_count` — with the old `VK_AMD_shader_core_properties`
 (v1) product kept as a fourth fallback so an AMD driver advertising only v1 does
-not regress to 0. It lands in the existing `Capabilities::compute_units` (0 =
-unknown), so the field name and every consumer are unchanged.
+not regress to 0. It lands in `Capabilities::compute_units` (0 = unknown) and in
+the tuning table's device facts (`cu=` in `infr tune show`'s match key).
 
 Verified on this box: both AMD devices report the same number through v2 as they
 did through the v1 product (RX 7900 XTX 96, Raphael iGPU 2), so preferring v2 is
 a no-op here. **The NVIDIA and Intel branches have never executed** — no such
 part exists on this machine.
 
-**Consequence nobody has watched run:** besides `split_k_plan` (below), the
+**Consequence nobody has watched run:** besides the split-K window (below), the
 consumer is `infr_core::integrated_ubatch_rows` via
 `infr_llama::seam::default_ubatch_rows`, which scales the integrated prefill
 chunk from the count. An Intel iGPU in the table (0xB080, Panther Lake Xe3
@@ -2249,13 +2259,14 @@ is what the scaling function means, but it is a 6x larger per-submit chunk on a
 watchdog-sensitive part, unvalidated. If an Intel iGPU ever hangs in prefill,
 this is the first thing to look at; `INFR_UBATCH` overrides it.
 
-**Wired into ONE split-K site since (2026-11-14): `split_k_plan`, on ONE
-driver.** The prefill GEMM's narrow-grid split-K window is now
-`max(SPLIT_K_FIXED_GRID, SPLIT_K_FILL_PER_CU · CUs)` (128, and 4 per CU), so a
-CU count can only widen it, and only on the AMD proprietary driver
-(`driverID == AMD_PROPRIETARY`, `split_k_compute_units`) — the one it was
-measured on, an RX 7900 XTX (96 CUs) under the AMD Windows driver. There the
-128-wg pp512 projections the fixed window left unsplit got faster (Qwen3-30B-A3B
+**The split-K window scales with the count on ONE driver.** The coopmat prefill
+GEMM splits K when its plain tile grid is under
+`max(split_k.fixed_grid, split_k.fill_per_cu · CUs)` (128, and 4 per CU) with
+`split_k.scale_by_cu` on, else under the fixed 128 alone. The generic default is
+off; the built-in table's `amd-proprietary-split-k` row (vendor `amd`, driver
+`AMD_PROPRIETARY`) turns it on, because that is the one driver it was measured
+on: an RX 7900 XTX (96 CUs) under the AMD Windows driver, where the 128-wg pp512
+projections the fixed window left unsplit got faster (Qwen3-30B-A3B
 `attn_output` 458 → 302 us, SmolLM3-3B `ffn_down` 1392 → 962 us). Below 32 CUs
 the floor is the larger term, so the integrated GPU behaves as before.
 
@@ -2263,21 +2274,27 @@ the floor is the larger term, so the integrated GPU behaves as before.
 `docs/perf/results.md` benchmarks ran on, and where the fixed window was tuned),
 AMDVLK, NVIDIA and Intel. To extend it to one of them: run
 `infr bench -p 512 -n 0` on a dense model (SmolLM3-3B) and an MoE one
-(Qwen3-30B-A3B) with `INFR_PROF_OPS=1 INFR_PROF_OP_SHAPES=1`, once with the
-driver allowed in `split_k_cu_for_driver` and once without, interleaved, and
-compare the `native_gemm_warp_*` rows at 128-384 workgroups; widen the rule only
-for a driver where they win.
+(Qwen3-30B-A3B) with `INFR_PROF_OPS=1 INFR_PROF_OP_SHAPES=1`, once as is and
+once with `INFR_TUNE=split_k.scale_by_cu=true`, interleaved, and compare the
+`native_gemm_warp_*` rows at 128-384 workgroups; where they win, add a row for
+that driver to `table.toml` with the numbers as its `source`.
 
-The other sites are still hardcoded, for the reason this entry gave:
+The other occupancy constants are tuning parameters now but still constants, not
+derived from the count:
 
-- the two flash split-K formulas and the PV split-K formula (`recorder.rs`,
-  threshold 1024 / target 2048), plus the `wide_grid >= 128` wide-tile gates and
-  `ATTN_SPLIT.target_chunks = 32`. Their implied workgroups-per-core ratio
-  (2048/96 ≈ 21 for attention) is a different per-kernel occupancy factor from
-  the GEMM's, so each needs its own measurement, not the GEMM's constant.
-- The attention chunk policy is **duplicated in GLSL** (`attn_live.comp`
-  recomputes it on the GPU), so a device-derived target there needs a new push
-  constant.
+- the flash and PV split-K policies (`attn_flash.*`, `attn_pv.*`: no split at
+  1024+ workgroups, a target of 2048, at most 8). Their implied
+  workgroups-per-core ratio (2048/96 ≈ 21 for attention) is a different
+  per-kernel occupancy factor from the GEMM's, so each needs its own
+  measurement, not the GEMM's constant; a row or `INFR_TUNE` can now try one
+  without a rebuild.
+- `gemm_i8cm_kq.l_fill_per_cu` (2) does scale with the count, on the one driver
+  where that GEMM runs.
+- the `wide_grid >= 128` wide-tile gates (`WIDE_GRID_MIN`, not migrated; see
+  B-HWDET-NO-ARCH-BUCKET).
+- The decode attention chunk policy (`attn_split.*`, reported `fixed`) is
+  **duplicated in GLSL** (`attn_live.comp` recomputes it on the GPU), so a
+  device-derived target there needs a new push constant first (plan 10 S11).
 
 ### B-NVSHAPE-MMQ-PER-ARCH — upstream tunes quantized-GEMM tile shape per microarchitecture; infr has one shape (2026-08-11)
 
@@ -4151,8 +4168,11 @@ cache dtype). Left:
   wrap); `Op::Copy` between dtypes other than identity and F32→F16. A same-dtype
   `Op::Copy` of a block-quantised dtype still sizes its bytes from
   `dense_bytes(1).unwrap_or(4)`, which is wrong; nothing emits it.
-- `linear_mmv_mw_at` is unreachable while `unified_mmv_row1` is hard-coded true;
-  if it is re-enabled, an `INFR_MMV_MW_WARPS` value with no build panics.
+- `linear_mmv_mw_at` is unreachable while `unified_mmv_row1` is hard-coded true,
+  so the `mmv_mw.warps` tuning parameter (alias `INFR_MMV_MW_WARPS`) reaches no
+  dispatch; if the path is re-enabled, a `mmv_mw.warps` value with no build
+  panics. Its range should then shrink, per format, to the warps counts
+  `gemm::native_mmv_mw_spv` has builds for.
 - Two tests hold by construction and prove little:
   `mmv_choice_offers_only_built_variants`' "offered ⇒ built" half, and the new
   gate-vs-table asserts for `native_mrow` / `native_gemm_fma` in `linear.rs`.

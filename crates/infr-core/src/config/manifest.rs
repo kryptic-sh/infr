@@ -329,6 +329,7 @@ knobs! {
     "INFR_POISON_UNINIT"       => "debug.poison_uninit",   Presence, Ignored, "1", migrated;
     "INFR_NOBARRIER"           => "debug.no_barrier",      Presence, Ignored, "1", migrated;
     "INFR_FULLBARRIER"         => "debug.full_barrier",    Presence, Ignored, "1", migrated;
+    "INFR_CPU_OP_HASH"         => "debug.cpu_op_hash",     Path,     Ignored, "/tmp/h.txt", migrated;
 
     // ── serve ────────────────────────────────────────────────────────────────
     "INFR_API_KEY"        => "serve.api_key",        Text, Ignored, "hunter2", migrated;

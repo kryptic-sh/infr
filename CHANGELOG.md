@@ -42,6 +42,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`INFR_CPU_OP_HASH=<path>`** (`debug.cpu_op_hash`), a debugging aid: the CPU
+  backend appends one line per tensor each op reads and writes (graph and op
+  number, the op's profiler label, element count, an FNV-1a hash of the bits),
+  so two runs that should agree, such as one model on two operating systems, can
+  be diffed to the first op that does not. The CPU golden tests in
+  `infr-llama/tests/cpu_backend.rs` honour it.
+
 - **DeepSeek V4 prefills layer-major on the CPU when its experts stream from
   disk.** A sole request's prompt of more than one chunk, the first at least 256
   rows, over a host arena (`paging.dram`, `INFR_DRAM_CACHE`) that cannot hold

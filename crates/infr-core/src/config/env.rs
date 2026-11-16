@@ -401,6 +401,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.debug.chat = presence(get, "INFR_DEBUG_CHAT");
     p.debug.moe_counts = presence(get, "INFR_MOE_COUNTS_DEBUG");
     p.debug.moe_counts_dump = presence(get, "INFR_MOE_COUNTS_DUMP");
+    p.debug.cpu_op_hash = opt_path(get, "INFR_CPU_OP_HASH");
     p.debug.poison_uninit = presence(get, "INFR_POISON_UNINIT");
     p.debug.no_barrier = presence(get, "INFR_NOBARRIER");
     p.debug.full_barrier = presence(get, "INFR_FULLBARRIER");

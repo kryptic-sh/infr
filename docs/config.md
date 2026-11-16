@@ -411,7 +411,9 @@ several connections from one client.
 **`[debug]`** — poison/barrier/dump switches: `coopmat` (print the enumerated
 and chosen coopmat shapes — useful on Intel Arc), `bda_chunk`, `wide_dispatch`,
 `chat`, `moe_counts`, `moe_counts_dump`, `poison_uninit`, `no_barrier`,
-`full_barrier`.
+`full_barrier`, `cpu_op_hash` (`INFR_CPU_OP_HASH=<path>`: the CPU interpreter
+appends a hash of every tensor each op reads and writes, for diffing two runs to
+the first op that differs).
 
 ## The `INFR_*` keys that are deliberately NOT config
 

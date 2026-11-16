@@ -14,6 +14,7 @@ mod indexer;
 #[doc(hidden)]
 pub mod indexer_tap;
 pub mod kvquant;
+mod op_hash;
 pub mod op_tap;
 pub mod paged;
 #[cfg(test)]
@@ -310,7 +311,7 @@ pub struct CpuBackend {
     /// The engine configuration this backend reads its knobs from — one value, held for the
     /// backend's whole life, borrowed (never cloned) at every read site. The knobs it reads are
     /// the `kernels.cpu` ones ([`infr_core::config::CpuCfg`]), `prof.prof_ops` and
-    /// `debug.moe_counts{,_dump}`.
+    /// `debug.moe_counts{,_dump}` and `debug.cpu_op_hash`.
     ///
     /// Every construction site inside this repo goes through [`CpuBackend::new_with`] (the seam
     /// threads its `Arc<Config>` into them). [`CpuBackend::new`] survives as the ENV-SOURCED twin
@@ -322,6 +323,9 @@ pub struct CpuBackend {
     /// Query rows one `Op::Attention` task runs for one head: [`ATTN_QUERY_BLOCK`]. A field so a
     /// test can set 1, the one-pair-per-task decomposition the blocking replaced.
     attn_query_block: usize,
+    /// How many graphs the per-op hash tap (`debug.cpu_op_hash`, [`op_hash`]) has numbered, so
+    /// each `execute` it records gets the next graph ordinal.
+    op_hash_graphs: std::sync::atomic::AtomicU64,
     /// A test's deliberate fault: `Op::MoeFfn` reads a bank held whole at twice its expert
     /// stride, so its upper experts slice past the bank's end inside the pool's tasks.
     #[cfg(test)]
@@ -355,6 +359,7 @@ impl CpuBackend {
             pool: std::sync::OnceLock::new(),
             cfg,
             attn_query_block: ATTN_QUERY_BLOCK,
+            op_hash_graphs: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             double_whole_bank_stride: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1150,7 +1155,37 @@ impl Backend for CpuBackend {
         // `WeightReuse::Done`: the experts each paged bank keeps out of the demotion, by the bank
         // buffer's uid ([`paged::done_keep`]).
         let mut kept_experts: HashMap<u64, Vec<usize>> = HashMap::new();
-        for op in &g.ops {
+        // The per-op hash tap: `None` unless `debug.cpu_op_hash` is set. An op's writes are
+        // recorded at the top of the NEXT iteration (and after the loop for the last op), so an
+        // arm that `continue`s out of the match is still covered.
+        let mut hash_tap = match &self.cfg.debug.cpu_op_hash {
+            Some(path) => Some(op_hash::OpHashTap::open(
+                path,
+                self.op_hash_graphs
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )?),
+            None => None,
+        };
+        let tap_hash = |vals: &[Vec<f32>], id: TensorId| -> (usize, u64) {
+            if g.in_place_inputs().contains(&id) {
+                match bindings.get(id) {
+                    Some(b) => (
+                        g.desc(id).numel(),
+                        infr_core::kernel_cache::fnv1a(&cpu_buf(b).read()),
+                    ),
+                    None => (0, infr_core::kernel_cache::fnv1a(&[])),
+                }
+            } else {
+                op_hash::hash_f32(&vals[id.0 as usize])
+            }
+        };
+        for (op_idx, op) in g.ops.iter().enumerate() {
+            if let Some(tap) = hash_tap.as_mut() {
+                if let Some(prev) = op_idx.checked_sub(1) {
+                    tap.record(g, prev, &g.ops[prev], true, |id| tap_hash(&vals, id))?;
+                }
+                tap.record(g, op_idx, op, false, |id| tap_hash(&vals, id))?;
+            }
             // Make every PAGED weight this op reads resident, and hold it resident for the op's
             // whole body. This is the one fallible point in the interpreter, which is exactly why
             // it is here and not inside `CpuBuffer::read`: that returns a view, not a `Result`, so
@@ -4246,6 +4281,12 @@ impl Backend for CpuBackend {
                 e.1 += t0.elapsed().as_secs_f64();
             }
         }
+        if let Some(mut tap) = hash_tap {
+            if let Some(last) = g.ops.len().checked_sub(1) {
+                tap.record(g, last, &g.ops[last], true, |id| tap_hash(&vals, id))?;
+            }
+            tap.finish()?;
+        }
         if prof_ops {
             // `Unit::Device`: on a host backend the wall time IS the execution time, so these rows
             // are directly comparable to a GPU backend's and belong in the same exit aggregate.
@@ -5767,5 +5808,121 @@ mod tests {
     fn strided_rope_is_refused() {
         let (g, bound, dst) = strided_head_op(true);
         run_graph(&g, &bound, dst);
+    }
+
+    /// Run RmsNorm → Linear → WriteKv (into a bound f32 cache) twice under the per-op hash tap,
+    /// with the Linear weight's first element set to `w0`, and return the tap's lines.
+    fn op_hash_lines(path: &std::path::Path, w0: f32) -> Vec<String> {
+        let (dim, out_f, ctx) = (8usize, 4usize, 3usize);
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![dim], DType::F32));
+        let wn = g.weight(TensorDesc::new(vec![dim], DType::F32));
+        let wl = g.weight(TensorDesc::new(vec![out_f, dim], DType::F32));
+        let cache = g.input(TensorDesc::new(vec![ctx, out_f], DType::F32));
+        let h = g.internal(TensorDesc::new(vec![dim], DType::F32));
+        let y = g.output(TensorDesc::new(vec![out_f], DType::F32));
+        g.push(Op::RmsNorm {
+            x,
+            weight: wn,
+            dst: h,
+            rows: 1,
+            dim: dim as u32,
+            eps: 1e-6,
+        });
+        g.push(Op::Linear {
+            x: h,
+            weight: wl,
+            dst: y,
+            m: 1,
+            in_f: dim as u32,
+            out_f: out_f as u32,
+            w_off: 0,
+        });
+        g.push(Op::WriteKv {
+            src: y,
+            cache,
+            rows: 1,
+            row_stride: out_f as u32,
+            pos: 1,
+        });
+        let mut cfg = Config::default();
+        cfg.debug.cpu_op_hash = Some(path.to_path_buf());
+        let be = CpuBackend::new_with(Arc::new(cfg));
+        let up = |bytes: &[u8]| {
+            let b = be.alloc(bytes.len(), BufferUsage::Activations).unwrap();
+            be.upload(b.as_ref(), bytes).unwrap();
+            b
+        };
+        let xs: Vec<f32> = (0..dim).map(|i| i as f32 * 0.25 - 1.0).collect();
+        let mut wls: Vec<f32> = (0..out_f * dim)
+            .map(|i| (i % 7) as f32 * 0.5 - 1.5)
+            .collect();
+        wls[0] = w0;
+        let (xb, wnb, wlb) = (
+            up(&f32_bytes(&xs)),
+            up(&f32_bytes(&vec![1.5; dim])),
+            up(&f32_bytes(&wls)),
+        );
+        let cb = up(&vec![0u8; ctx * out_f * 4]);
+        let yb = be.alloc(out_f * 4, BufferUsage::Activations).unwrap();
+        let mut b = Bindings::new();
+        for (id, buf) in [(x, &xb), (wn, &wnb), (wl, &wlb), (cache, &cb), (y, &yb)] {
+            b.bind(id, buf.as_ref());
+        }
+        let plan = be.compile(&g).unwrap();
+        // Two executes: the tap numbers the graphs, and the second one reads the cache row the
+        // first one wrote.
+        be.execute(plan.as_ref(), &b).unwrap();
+        be.execute(plan.as_ref(), &b).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        text.lines().map(str::to_owned).collect()
+    }
+
+    /// The per-op hash tap (`debug.cpu_op_hash`) is reproducible run to run, records every op's
+    /// non-weight reads and its writes (an in-place cache as both), and a perturbed weight moves
+    /// the hashes from the first op that reads it on while leaving the ops before it alone.
+    #[test]
+    fn op_hash_tap_pins_the_first_differing_op() {
+        let dir = std::env::temp_dir();
+        let path = |tag: &str| dir.join(format!("infr-op-hash-{}-{tag}.txt", std::process::id()));
+        let a = op_hash_lines(&path("a"), -1.5);
+        let b = op_hash_lines(&path("b"), -1.5);
+        assert_eq!(a, b, "two runs of one graph must hash identically");
+        // Per graph: RmsNorm reads x and writes h; Linear reads h and writes y; WriteKv reads y
+        // and the cache and writes the cache.
+        let shape: Vec<(String, String)> = a
+            .iter()
+            .map(|l| {
+                let f: Vec<&str> = l.split(' ').collect();
+                (format!("{} {} {}", f[0], f[1], f[2]), f[6].to_owned())
+            })
+            .collect();
+        let want = |g: u32| {
+            [
+                ("op0 R", "RmsNorm"),
+                ("op0 W", "RmsNorm"),
+                ("op1 R", "Linear"),
+                ("op1 W", "Linear"),
+                ("op2 R", "WriteKv"),
+                ("op2 R", "WriteKv"),
+                ("op2 W", "WriteKv"),
+            ]
+            .map(|(o, k)| (format!("g{g} {o}"), k.to_owned()))
+        };
+        let expect: Vec<_> = want(0).into_iter().chain(want(1)).collect();
+        assert_eq!(shape, expect, "{a:#?}");
+        // The first graph reads the zeroed cache, the second the row the first wrote.
+        assert_ne!(a[5].split(' ').nth(5), a[12].split(' ').nth(5), "{a:#?}");
+
+        let c = op_hash_lines(&path("c"), -1.25);
+        let first_diff = a.iter().zip(&c).position(|(x, y)| x != y);
+        // RmsNorm and Linear's read agree; Linear's write is the first line to differ.
+        assert_eq!(first_diff, Some(3), "{a:#?}\n{c:#?}");
+        assert!(c[3].contains(" op1 W "), "{c:#?}");
+        // Everything downstream of it moves: WriteKv's read of `y` and the cache it wrote.
+        for i in [4, 6] {
+            assert_ne!(a[i], c[i], "line {i}");
+        }
     }
 }

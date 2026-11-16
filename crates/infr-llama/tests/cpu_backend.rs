@@ -169,11 +169,13 @@ fn model_cfg(
 
 /// The shipped defaults plus the environment knobs these tests honour: WHICH GPU they run on
 /// (`INFR_DEV`), so a box with more than one (a dGPU beside an iGPU) can test either (unset keeps
-/// the first-discrete default); and `INFR_FORCE_WAVE64`, so the wave64 path AMD GCN takes can be
-/// scored on an RDNA card.
+/// the first-discrete default); `INFR_FORCE_WAVE64`, so the wave64 path AMD GCN takes can be
+/// scored on an RDNA card; and `INFR_CPU_OP_HASH`, so a CPU golden that differs between two
+/// systems can be diffed op by op (`debug.cpu_op_hash`).
 fn env_cfg() -> infr_llama::EngineConfig {
     let mut cfg = infr_llama::EngineConfig::default();
     cfg.device.dev = std::env::var("INFR_DEV").ok();
+    cfg.debug.cpu_op_hash = std::env::var_os("INFR_CPU_OP_HASH").map(PathBuf::from);
     infr_testkit::honour_env(&mut cfg);
     cfg
 }

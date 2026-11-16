@@ -785,6 +785,11 @@ cfg_struct! {
         no_barrier: bool = false,
         /// `INFR_FULLBARRIER`.
         full_barrier: bool = false,
+        /// `INFR_CPU_OP_HASH`: the CPU interpreter appends one line per tensor each op reads and
+        /// writes to this file (graph and op ordinals, the op's profiler label, the tensor's
+        /// element count and an FNV-1a hash of its bits), so two runs that should agree can be
+        /// diffed to the first op that does not. A bisecting aid; unset costs one branch per op.
+        cpu_op_hash: Option<PathBuf> = None,
     }
 }
 

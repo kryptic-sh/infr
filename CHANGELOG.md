@@ -90,6 +90,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `INFR_GEMV_*` group with their config paths — keep working as aliases with
   their old meanings.
 
+- **`infr_core::math`**: correctly rounded binary32 `exp`, `ln`, `ln_1p`,
+  `tanh`, `sin`, `cos`, `sin_cos` and `powf`, plus `sigmoid`, `silu`,
+  `gelu_tanh` and `softplus` written as the CPU backend's call sites write them.
+  Built from IEEE basic operations only (no FMA, no C runtime), so they give the
+  same bits on every operating system, CPU tier and architecture, unlike the
+  `f32` methods, which lower to the C runtime and differ in the last bit between
+  UCRT and glibc. The unary functions are verified on all 2^32 inputs against an
+  independent reference; see `docs/math.md`. Nothing uses them yet, so no output
+  changes: moving the call sites (and the one-time re-bless of the CPU goldens)
+  is the next slice of `docs/plan/11-cpu-bit-identical.md`. A new lint,
+  `crates/infr-core/tests/no_platform_libm.rs`, lists the call sites still on
+  the platform functions.
+
 - **Wave64-only AMD GPUs (GCN: Polaris, Vega) run on the Vulkan backend** (issue
   #94), ported from korewaChino's KessokuNet fork. A device that cannot pin a
   32-wide subgroup but can pin 64 used to be refused at startup; it now runs the

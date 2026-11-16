@@ -24,6 +24,7 @@ pub mod iquant_grids;
 /// envelope, durability, and the poisoned-blob tripwire, once.
 pub mod kernel_cache;
 pub mod loader;
+pub mod math;
 pub mod pager;
 /// The per-op profiling seam every backend reports through — one collector, one label grammar,
 /// one report, one on/off predicate (`prof.per_op()` ANDed with the warmup-suppression flag).

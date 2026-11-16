@@ -4170,9 +4170,11 @@ cache dtype). Left:
   `dense_bytes(1).unwrap_or(4)`, which is wrong; nothing emits it.
 - `linear_mmv_mw_at` is unreachable while `unified_mmv_row1` is hard-coded true,
   so the `mmv_mw.warps` tuning parameter (alias `INFR_MMV_MW_WARPS`) reaches no
-  dispatch; if the path is re-enabled, a `mmv_mw.warps` value with no build
-  panics. Its range should then shrink, per format, to the warps counts
-  `gemm::native_mmv_mw_spv` has builds for.
+  dispatch. Its range is the UNION of the built warps counts (1, 2, 4, 8, 16),
+  but `gemm::native_mmv_mw_spv` builds only some per format (Q4_K all five;
+  Q6_K, Q5_K, Q2_K, Q3_K 4 and 8; the 32-block formats none), so if the path is
+  re-enabled a per-format value with no build panics: validate per qualifier
+  against that table first.
 - Two tests hold by construction and prove little:
   `mmv_choice_offers_only_built_variants`' "offered ⇒ built" half, and the new
   gate-vs-table asserts for `native_mrow` / `native_gemm_fma` in `linear.rs`.

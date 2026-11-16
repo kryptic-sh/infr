@@ -291,9 +291,30 @@ disable = ["amd-proprietary-split-k"]   # INFR_TUNE_DISABLE: drop rows by id
 
 A value you set that is not a parameter, is out of range, or targets a `fixed`
 parameter (one that must equal a literal compiled into a shader) refuses the
-device with an error naming where it came from. A built-in row value that fails
-validation is dropped with a warning instead, so a bad row cannot brick a
-device. Within one level a qualified setting (`@q4_k`) beats an unqualified one.
+device with an error naming where it came from. A range is what the code after
+it can hold: the attention split counts stop at 8 because the partials scratch
+holds 8, `gemv.variant` takes only the names that have a build (`infr tune list`
+prints them). A built-in row value that fails validation is dropped with a
+warning instead, so a bad row cannot brick a device. Within one level a
+qualified setting (`@q4_k`) beats an unqualified one. A tuning-file row whose
+`driver`, `arch` or `vendor` is not a known name is an error (a typo would
+otherwise match nothing); `name` is a free substring and cannot be checked.
+
+**`rows = false` means generic defaults only, everywhere.** It drops every
+built-in row, including the two the AMD proprietary driver's GEMM choices come
+from: on that driver it turns off the int8 cooperative-matrix K-quant prefill
+GEMM and the compute-unit-scaled split-K window, so prefill takes the f16
+coopmat GEMM — about a third slower pp512 on the RX 7900 XTX (11.9k against 7.5k
+t/s on Qwen3-1.7B Q4_K_M when that GEMM landed). `infr tune show` says
+`rows: off` when it is set. To drop just one row, use `disable` with its id.
+
+**`tuning.file` paths.** A relative path in a config file is relative to that
+config file's folder; from `INFR_TUNE_FILE` or `--set` it is relative to the
+working directory.
+
+**What the device can use wins over what was asked.** A `device.sg_pref` of 16
+on a device that cannot pin a 16-wide subgroup runs at 32, as it always has;
+`infr tune show` reports 32 with the reason, and the banner hash is of 32.
 
 **The older knobs are aliases.** `device.subgroup_pref` (`INFR_SG`),
 `kernels.vulkan.flash_splits`, `pv_splits`, `flash_min_rows`, `flash_bm32`,
@@ -302,7 +323,20 @@ and the whole `[kernels.vulkan.gemv]` group keep their names, grammars and
 meanings — including their old clamps and fallbacks — and write the matching
 parameter at the level that set them (`infr tune show` labels it, e.g.
 `env alias INFR_FLASH_SPLITS`). At the same level the new `tune` key wins over
-the alias; across levels the higher level wins whichever spelling it uses.
+the alias; across levels the higher level wins whichever spelling it uses. An
+alias set to a value that has no effect — its unset spelling
+(`--set kernels.vulkan.mmv_mw_warps=none`), `i8cm_kq = true`, `no_rm = false`, a
+`gemv.variant` name with no build — resets the parameter at its level to what
+the defaults, rows and tuning file give, so it still beats a lower level's
+`tune` key. Two changes to old spellings, both where the old value was unsafe or
+meaningless: `INFR_FLASH_SPLITS` / `INFR_PV_SPLITS` above 8 are now refused
+(they wrote split partials past the end of an 8-split scratch buffer); 0, an
+unparseable value and one past 2³²−1 still mean "the policy", as before. And an
+`INFR_GEMV_VARIANT` naming no build, the empty value included, still takes the
+RM path, now shown as `none`. A `Config` built in code (no layers) cannot say
+whether an alias field equal to its default was set, so such a field counts as
+unset; through the file, environment or command line, setting a knob to its
+default value counts as set.
 
 **`[spec]`** — MTP / speculative decode: `mtp`, `k`, `decode_chain`, `draft` (a
 draft-model path), the GPU-side sampling steps (`gpu_argmax`, `gpu_sample`,

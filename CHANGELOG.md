@@ -714,6 +714,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`INFR_FLASH_SPLITS` / `INFR_PV_SPLITS` above 8 are refused** instead of
+  dispatched: the coopmat attention prefill sizes its split partials for 8
+  splits, so a larger count wrote past the end of that buffer. The startup error
+  names the variable; 0, unparseable values and values past 2³²−1 still select
+  the split policy, as before. The new `attn_flash.splits`, `attn_pv.splits` and
+  `*.max_splits` tuning parameters carry the same bound.
+
 - **Q5_0 weights give the same result on the CPU at one row as at several.** A
   one-row `Op::Linear` on a Q5_0 weight (every decode step, and the prompt's
   last token, whose logits pick the first generated token) dequantized the row

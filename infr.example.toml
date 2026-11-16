@@ -167,7 +167,11 @@ no_replay = false # sanctioned negative: true DISABLES the decode replay tape
 # "mmv_mw.warps@q4_k" = 1
 #
 # [kernels.vulkan.tuning]
-# rows = true            # false: generic defaults only, no table rows
+# rows = true            # false: generic defaults only, no table rows. On AMD's
+#                        # proprietary driver that also turns off the int8 coopmat
+#                        # prefill GEMM and the CU-scaled split-K (slower prefill);
+#                        # drop one row with `disable` instead.
+# file is relative to THIS file's folder (INFR_TUNE_FILE: to the working directory).
 # disable = []           # ids of table rows to ignore
 # file = "my-tune.toml"  # rows in the table's schema, tried without a rebuild
 

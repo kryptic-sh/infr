@@ -5754,9 +5754,10 @@ pub(crate) fn generate_dense_backend_bound(
         };
         // The weights stream either through a device pager (`dense_paged`) or, on the CPU, through
         // the host arena (`host_paged`). Layer-major over the host arena is DeepSeek V4's alone,
-        // the family it was built and checked for; every other family keeps its chunk-major
-        // prefill there (`crate::seam::host_layer_major`).
-        let host_stream = crate::seam::host_layer_major(c) && be.host_paged();
+        // and only at chunk heights where it was measured to pay
+        // (`crate::seam::host_layer_major`).
+        let first_rows = chunks.first().map_or(0, |&(s, e)| e - s);
+        let host_stream = crate::seam::host_layer_major(c, first_rows) && be.host_paged();
         let layer_major = crate::seam::layer_major_this_prompt(
             ec,
             crate::seam::layer_major_prefill(ec, &caps, be.dense_paged() || host_stream, !e2b),

@@ -254,7 +254,7 @@ fn cpu_committed_bytes(ec: &EngineConfig, g: &Gguf, cfg: &Config) -> u64 {
         .sum();
     // A layer-major prefill's carried residual streams (`layer_major_segment_rows`), up to one
     // segment of the context.
-    let carry = if host_layer_major(cfg) {
+    let carry = if host_layer_major(cfg, usize::MAX) {
         LAYER_MAJOR_CARRY_BYTES.min(ctx as u64 * layer_major_row_bytes(cfg))
     } else {
         0
@@ -701,7 +701,7 @@ fn report_host_paging(store: &infr_cpu::paged::PagedWeights) {
         let what = if p.experts { "expert" } else { "whole" };
         tracing::info!(
             "[host pager] {what} {:.1}MB x {} slots: {} hits, {} misses ({:.1}% hit), {} \
-             evictions, {} reads, {:.2} GB from disk in {:.1}s of reads",
+             evictions, {} reads, {:.2} GB from disk in {:.1}s of reads ({} re-reads in {:.1}s)",
             p.slot_bytes as f64 / 1e6,
             p.n_slots,
             s.pager.hits,
@@ -711,6 +711,8 @@ fn report_host_paging(store: &infr_cpu::paged::PagedWeights) {
             s.reads,
             s.bytes_read as f64 / 1e9,
             s.read_ns as f64 / 1e9,
+            s.rereads,
+            s.reread_ns as f64 / 1e9,
         );
     }
     tracing::info!(
@@ -990,18 +992,30 @@ pub(crate) fn layer_major_this_prompt(
     wanted && (ec.paging.layer_major == Some(true) || (n_chunks > 1 && !holds_every_block))
 }
 
-/// Whether `cfg`'s family prefills layer-major when its weights stream through the CPU's host
-/// arena (`Backend::host_paged`), as every family does over a device pager.
+/// Whether a prompt cut into chunks of `chunk_rows` (its first, tallest chunk) prefills
+/// layer-major when `cfg`'s weights stream through the CPU's host arena (`Backend::host_paged`);
+/// [`layer_major_this_prompt`] still asks for more than one chunk over an arena that cannot hold
+/// every block. `paging.layer_major` overrides it either way.
 ///
-/// DeepSeek V4 only, deliberately. It is the family this was built and measured for: its
-/// V4-Flash file pages its experts from disk, and a chunk-major prompt of several chunks re-reads
-/// most of 90.9 GB of expert banks per chunk (`docs/deepseek.md` § "Layer-major prefill on the
-/// CPU"). The order is generic and `paging.layer_major = true` already forces it on any family,
-/// but no other family has been checked bit for bit against its chunk-major prefill on the CPU,
-/// so none gets it by default.
-pub(crate) fn host_layer_major(cfg: &Config) -> bool {
-    cfg.deepseek4
+/// **DeepSeek V4 only, deliberately.** It is the family this was built and measured for, and no
+/// other family has been checked bit for bit against its chunk-major prefill on the CPU.
+///
+/// **Chunks of at least [`HOST_LAYER_MAJOR_MIN_ROWS`] only.** Measured on V4-Flash with a 12 GB
+/// arena (`docs/deepseek.md` § "Layer-major prefill on the CPU"): at the default 1024-row chunk a
+/// 1443-token prompt prefilled in 206.8 s layer-major, where chunk-major had spent 209.5 s on its
+/// first chunk alone; in 32-row chunks a 69-token prompt was SLOWER layer-major (98.96 and 114.89
+/// s against 91.59 s). A small chunk routes to a small part of each bank, so chunk-major re-reads
+/// little per chunk, and what it re-reads it had read seconds before, which the OS file cache
+/// largely still holds; layer-major's reads are all first reads.
+pub(crate) fn host_layer_major(cfg: &Config, chunk_rows: usize) -> bool {
+    cfg.deepseek4 && chunk_rows >= HOST_LAYER_MAJOR_MIN_ROWS
 }
+
+/// The shortest prefill chunk [`host_layer_major`] runs layer-major. The two measured heights are
+/// 32 rows (slower) and 1024 (faster); this sits between them, low enough that the long-context
+/// shrink of V4's chunk (`dsv4_emit::prefill_chunk_rows`, which only drops below 1024 rows past
+/// 64k positions) keeps the order up to about 400k positions. Nothing between the two was run.
+pub(crate) const HOST_LAYER_MAJOR_MIN_ROWS: usize = 256;
 
 /// What a layer-major prefill may hold between layers for its whole segment of the prompt: the
 /// residual stream (DeepSeek V4's `hc_mult` streams wide) and the chunk's embedded input rows.
@@ -5549,7 +5563,10 @@ mod seam_helper_tests {
         capped.paging.layer_major_rows = Some(512);
         assert_eq!(super::layer_major_segment_rows(&capped, &v4), 512);
         assert_eq!(super::layer_major_segment_rows(&capped, &dense), 512);
-        assert!(super::host_layer_major(&v4) && !super::host_layer_major(&dense));
+        let min = super::HOST_LAYER_MAJOR_MIN_ROWS;
+        assert!(super::host_layer_major(&v4, min) && super::host_layer_major(&v4, 1024));
+        assert!(!super::host_layer_major(&v4, min - 1) && !super::host_layer_major(&v4, 32));
+        assert!(!super::host_layer_major(&dense, 1024));
     }
 
     /// The per-prompt half of the layer-major gate: auto runs it only where it can save a read

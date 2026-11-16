@@ -98,10 +98,11 @@ measurement in a quiet window before and after.
 7. **Prefill order on the CPU's host arena.** DeepSeek V4 prefills layer-major
    there since 2026-11-17, reading each routed expert once per prompt (each once
    by the pager trace on the real file); every other family still sweeps the
-   arena once per chunk. Not yet a wall-time win on the short prompts run,
-   likely because buffered reads let the OS file cache serve chunk-major's
-   re-reads (item 4 would settle it); the decode after starts with a cold expert
-   pool. Both in `backlog.md` § B-CPU-EXPERT-PAGING.
+   arena once per chunk. A win at the default chunk height (a 1443-token prompt:
+   195 to 207 s against more than 235 s chunk-major); slower in 32-row chunks,
+   which therefore keep chunk-major, likely because buffered reads let the OS
+   file cache serve chunk-major's re-reads there (item 4 would settle it).
+   `backlog.md` § B-CPU-EXPERT-PAGING.
 
 ## D. Safety
 

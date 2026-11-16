@@ -1478,12 +1478,14 @@ also taken by V4 on the CPU:
   every op the same rows. A row's block visibility (`comp_visible`), the
   indexer's per-row top-k and the ring persists are per graph and unchanged.
 - **When.** `seam::layer_major_prefill`'s automatic rule (on when the weights
-  stream) now counts the CPU's host arena for V4 (`Backend::host_paged`,
-  `seam::host_layer_major`), and `layer_major_this_prompt` still runs it only
-  for a prompt of more than one chunk over an arena that cannot hold every block
+  stream) now counts the CPU's host arena for V4 (`Backend::host_paged`), but
+  only for chunks of at least `seam::HOST_LAYER_MAJOR_MIN_ROWS` (256) rows
+  (`seam::host_layer_major`; the measurements below are why), and
+  `layer_major_this_prompt` still runs it only for a prompt of more than one
+  chunk over an arena that cannot hold every block
   (`Backend::host_holds_every_block`). Other families keep chunk-major on the
-  host arena (none was checked bit for bit there); `paging.layer_major = true`
-  forces the order on any family, as before.
+  host arena (none was checked bit for bit there); `paging.layer_major` forces
+  either order on any family, as before (`INFR_LAYER_MAJOR=0` / `1`).
 - **Bounded memory.** Layer-major holds every chunk's residual between layers:
   `seam::layer_major_row_bytes` per row, the four streams and the embedded input
   row in f32 plus id and position (81 928 bytes at V4-Flash's geometry). A
@@ -1500,9 +1502,10 @@ also taken by V4 on the CPU:
   an ordinary chunk's sweep, would make a chunk's misses evict the experts the
   chunk before brought in — and after a `Done` graph every paged weight it read
   is demoted to the cold end (`HostPager::demote`, `Pager::demote`), so the next
-  layer's misses take a finished layer before anything older (a previous turn's
-  residents, or the first layers of this prompt, which then survive for the
-  decode).
+  layer's misses take a finished layer before anything older — except, per bank,
+  the experts the layer's last row routed to and then its most-routed ones, up
+  to `paged::DONE_KEEP_EXPERTS` (8; `paged::done_keep`), which stay at the hot
+  end for the decode that follows (its first token continues from that row).
 
 **Verified** (`seam/dsv4_emit/tests/prefill.rs`, bit for bit): on the five
 layouts, at every prompt length of the chunked tests, layer-major in one segment
@@ -1532,10 +1535,14 @@ exactly the blocks routed to, against 889 with sweep hints and 2177 chunk-major;
 `a_finished_layer_is_evicted_before_older_residents` reads 354 instead of 546 on
 a second prefill with the demotions. Through the runner
 (`dsv4_emit/tests/paging.rs`: the canonical layout with 32 experts of 32 KiB a
-bank, 480 expert blocks, a 300-token prompt in nine chunks of 37): 444 reads
-with an arena holding every block, 495 layer-major with 120 slots (the prompt's
-reads plus at most the decode step's 60 misses), about 2880 chunk-major with the
-same 120 slots; the logits are bit-identical.
+bank, 480 expert blocks, a 600-token prompt in three chunks of 256): 456 reads
+with an arena holding every block, 502 layer-major with 120 slots (the prompt's
+reads plus at most the decode step's 60 misses), 1293 chunk-major with the same
+120 slots, and in chunks of 37 the automatic rule keeps chunk-major (5622
+reads); the logits are bit-identical.
+`the_last_rows_experts_survive_a_layer_major_prefill` (`infr_cpu`) replays the
+prompt's last row alone after a layer-major prefill and reads nothing (red with
+nothing kept).
 
 **Reads and time, real file** (V4-Flash Q2_K_S, `--dev cpu`,
 `INFR_DRAM_CACHE=12g` — 1904 expert slots of 2.75 MB, 5.24 GB, of 33 024 expert
@@ -1563,21 +1570,63 @@ model of the pool, predicted 19 983 prefill reads (24 741 for run 1's prompt:
 68.1 GB, unrun); run 3 read 20 342 including the last prompt position's pass
 (774 pins), so the model holds: 1.55 times run 2's reads.
 
-**But it was not faster on these prompts.** Chunk-major took 91.6 s against 99.0
-and 114.9 s layer-major. Per read (2.75 MB, four lanes), chunk-major spent 13.7
-ms of read time and layer-major 22.2 ms (run 4: 307.5 s for 13 851 reads; run 3:
-278.5 s for 20 342). The likely reason, not established: reads are buffered, and
-chunk-major's second and third chunks re-read blocks it read seconds before,
-which the OS file cache (about 27 GB of standby between runs) still held, while
-every layer-major read is a block's first. Its non-wait time was also higher,
-16.0 s against 8.8 s (129 span graphs against 3), not profiled. At the default
-chunk height (1024) the order only runs for a prompt of more than one chunk,
-where each chunk-major sweep reads most of the 90.9 GB and no file cache holds
-it; that case was not run (one 1024-row chunk is about 85 GB of reads, so two
-chunks were estimated at roughly 170 GB against about 90). The first decode-loop
-pass after a layer-major prefill missed 729 of its 774 expert pins (run 4): the
-demotions leave the first and last layers resident, not the experts a decode
-uses most. Decode after run 2's prefill: 6 tokens in 11.08 s.
+**But it was not faster on these short prompts.** Chunk-major took 91.6 s
+against 99.0 and 114.9 s layer-major. Per read (2.75 MB, four lanes),
+chunk-major spent 13.7 ms of read time and layer-major 22.2 ms (run 4: 307.5 s
+for 13 851 reads; run 3: 278.5 s for 20 342). The likely reason, not
+established: reads are buffered, and chunk-major's second and third chunks
+re-read blocks it read seconds before, which the OS file cache (about 27 GB of
+standby between runs) still held, while every layer-major read is a block's
+first. Its non-wait time was also higher, 16.0 s against 8.8 s (129 span graphs
+against 3), not profiled. At the default chunk height (1024) the order only runs
+for a prompt of more than one chunk, which runs 5 to 7 below measured. The first
+decode-loop pass after runs 2 to 4's layer-major prefill missed 729 of its 774
+expert pins (run 4), before the last-row experts were kept (below). Decode after
+run 2's prefill: 6 tokens in 11.08 s.
+
+**The decisive case: a prompt of two default-height chunks** (same setup, with
+the last-row keep; a fixed 66-token English passage repeated 21 times and a
+question, 1443 tokens, so chunks of 1024 and 418; `--max-new 4 --ctx 2048`;
+`INFR_LAYER_MAJOR=0` for chunk-major). Predicted before each run: layer-major 20
+000 to 32 000 expert reads (55 to 88 GB) and 190 to 280 s, from runs 1 and 2's
+routed share and per-read wall time; chunk-major, from run 5's trace replayed
+chunk-major, 39 314 prefill reads (108.2 GB) and about 280 to 310 s.
+
+| run | order                | expert reads in the prefill | prefill             | min available |
+| --- | -------------------- | --------------------------- | ------------------- | ------------- |
+| 5   | layer-major          | 23 292 (64.1 GB), 1 each    | 206.83 s            | 20 295 MB     |
+| 6   | chunk-major          | 24 524 when stopped         | over 235 s, stopped | 11 501 MB     |
+| 7   | layer-major, after 6 | 23 292 (64.1 GB), 1 each    | 195.16 s            | 20 153 MB     |
+
+Run 6's watchdog stopped it at 11.5 GB available, 235 s in, with its first chunk
+done (209.5 s, more than either layer-major run's whole prefill) and 11 of the
+second chunk's 43 layers; at the rate of those 11 the rest would have taken
+about 75 s more, about 310 s in all, as predicted. So layer-major is at least
+12% faster on a measured lower bound, about 1.5 times by the estimate: the order
+stays on for chunks this tall. Read time against waiting: run 5 waited 113.2 s
+of 214.9 (prefill and decode), run 7 100.5 s of 207.6; the rest, about 100 s, is
+compute, mostly the 1443 rows' expert GEMMs (`INFR_PROF_OPS`: `Op::MoeFfn` 81%
+of a 1024-row span's time, its wave of pins included). The first decode-loop
+pass hit 470 of its 774 expert pins in both (304 misses, against 729 before the
+keep). Decode: 4 tokens in 8.09 s (run 5) and 12.45 s (run 7).
+
+**What the slowness of the short prompts was.** Not the span graphs: the
+synthetic file prefills 512 tokens in 229.3 ms chunk-major and 230.8 ms
+layer-major in 32-row chunks (16 graphs against 80, `dsv4_cpu_fixture_bench`,
+release), so a span's build, compile and execute setup cost about nothing, and
+nothing was changed there; the 16.0 s against 8.8 s of non-wait time in runs 4
+and 3 stays unexplained (the box was shared). The file-cache explanation was
+tested only indirectly: the pager now counts re-reads (`HostPagerStats::rereads`
+and `reread_ns`, printed by `INFR_PAGER_STATS`), but the only re-reads in runs 5
+and 7 are the decode's (1205, at 10.8 and 18.2 ms each against 15.8 and 13.5 ms
+for first reads: no signal), and run 6 was stopped before printing. At the
+default height chunk-major's second chunk took about 2.3 s a layer for about 300
+reads (run 6's trace holds its first 7 layers: 2069 reads of 3339 pins), about 5
+ms of wall time per read once a layer's compute (0.8 s at 418 rows) is taken
+off, against layer-major's 4.6 ms of waiting per read: a sweep of most of the
+experts does not fit the file cache, so its re-reads cost disk reads, which the
+32-row chunks' sweeps (about 20 GB each) did not need to be. Inferred from those
+timings, not measured per read.
 
 ### `compress_ratio` is the master per-layer switch
 

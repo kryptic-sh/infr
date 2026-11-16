@@ -24,8 +24,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   exhaustive match on it must handle one. New: `Graph::weight_reuse`,
   `Graph::touched`, `Pager::demote`, `HostPager::demote`,
   `PagedWeights::{pin_as, demote, demote_experts, holds_every_block}`,
-  `paged::whole_insert`, `Backend::{host_paged, host_holds_every_block}`
-  (default `false`) and `sim::Policy::demote` (default no-op).
+  `paged::{whole_insert, done_keep, DONE_KEEP_EXPERTS}`,
+  `Backend::{host_paged, host_holds_every_block}` (default `false`) and
+  `sim::Policy::demote` (default no-op). `HostPagerStats` gains `rereads` and
+  `reread_ns`, so struct literals of it must set them.
 
 - **`infr_server::ChatGenerator::vocab_size`** is a new required method: the
   length of the logits row a `logit_bias` is applied to. The server checks a
@@ -40,19 +42,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - **DeepSeek V4 prefills layer-major on the CPU when its experts stream from
-  disk.** A prompt of more than one chunk over a host arena (`paging.dram`,
-  `INFR_DRAM_CACHE`) that cannot hold every block runs every chunk through a
-  layer before the next, so each routed expert is read once per prompt instead
-  of once per chunk: on DeepSeek-V4-Flash Q2_K_S with a 12 GB arena a 69-token
-  prompt in three chunks read 36.1 GB of experts, each once, against 56.0 GB
-  chunk-major. It was not faster there (98.96 s against 91.59 s; chunk-major's
-  re-reads likely come from the OS file cache); the order is for prompts longer
-  than one 1024-row chunk, where a chunk-major sweep reads most of the 90.9 GB
-  of experts. Bit-identical to the chunk-major prefill. The span graphs carry
-  V4's widened residual between layers, a prompt longer than 1 GiB of carried
-  rows runs in segments (`paging.layer_major_rows`, config only, sets the cap),
-  and the CPU arena keeps a layer's weights hot across its chunks and lets them
-  go first after its last. Other families are unchanged on the CPU.
+  disk.** A prompt of more than one chunk of at least 256 rows over a host arena
+  (`paging.dram`, `INFR_DRAM_CACHE`) that cannot hold every block runs every
+  chunk through a layer before the next, so each routed expert is read once per
+  prompt instead of once per chunk: on DeepSeek-V4-Flash Q2_K_S with a 12 GB
+  arena a 1443-token prompt in two default chunks read 64.1 GB of experts, each
+  once, and prefilled in 195 to 207 s, where chunk-major had taken 209.5 s on
+  its first chunk alone. In 32-row chunks it measured slower (98.96 s against
+  91.59 s on a 69-token prompt), so shorter chunks keep chunk-major by default;
+  `INFR_LAYER_MAJOR` / `paging.layer_major` forces either order. Bit-identical
+  to the chunk-major prefill. The span graphs carry V4's widened residual
+  between layers, a prompt longer than 1 GiB of carried rows runs in segments
+  (`paging.layer_major_rows`, config only, sets the cap), and the CPU arena
+  keeps a layer's weights hot across its chunks, lets them go first after its
+  last, and keeps the experts the prompt's last row used for the decode (the
+  first decode pass after that prompt hit 470 of its 774 expert pins). Other
+  families are unchanged on the CPU. `INFR_PAGER_STATS` now also prints each
+  pool's re-reads and their read time.
 
 - **Wave64-only AMD GPUs (GCN: Polaris, Vega) run on the Vulkan backend** (issue
   #94), ported from korewaChino's KessokuNet fork. A device that cannot pin a

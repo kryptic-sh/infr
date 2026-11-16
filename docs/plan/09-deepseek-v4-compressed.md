@@ -870,10 +870,11 @@ state needed nothing, being per layer and still written in position order; a
 prompt longer than 1 GiB of carried rows runs in segments
 (`seam::layer_major_segments`). Bit-exact against one position per graph on
 every layout, segmented and not, with the session lifecycle and the llama.cpp
-oracle cases; the real file read each expert once (pager trace) but was not
-faster on a 69-token prompt in three chunks. `docs/deepseek.md` § "Layer-major
-prefill on the CPU" has the details and the numbers; `backlog.md` §
-B-CPU-EXPERT-PAGING what is left.
+oracle cases; the real file read each expert once (pager trace), prefilling a
+1443-token prompt in two default chunks in 195 to 207 s against more than 235 s
+chunk-major; in 32-row chunks it was slower, so the default needs chunks of 256
+rows or more. `docs/deepseek.md` § "Layer-major prefill on the CPU" has the
+details and the numbers; `backlog.md` § B-CPU-EXPERT-PAGING what is left.
 
 `deepseek2` / V3: an `Op::Mla` split-K decode arm and a prefill tier
 (B-DSHW-MLA-SCALAR-TIER has the gaps); B108 on CPU at depth. Do not reopen

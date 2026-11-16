@@ -1705,8 +1705,8 @@ and Metal refuse the file's first compressed layer by name.
   classes, 4.8 s of summed read time at 12g) before the experts; 16 s for five
   tokens. Not optimized.
 - **A long prompt prefills layer-major since 2026-11-17** and reads each routed
-  expert once (§ B-CPU-EXPERT-PAGING has the runs and what is left); a 69-token
-  prompt in three 32-row chunks prefilled in 98.96 s.
+  expert once (§ B-CPU-EXPERT-PAGING has the runs and what is left); a
+  1443-token prompt in two default chunks prefilled in 195 to 207 s.
 - **Buffered reads grow the system file cache's working set.** On the 48-token
   default run `\Memory\Cache Bytes` rose from 245 MiB to 3701 MiB, which counts
   as in use, not available; available memory bottomed at 19154 MiB against the
@@ -1762,31 +1762,33 @@ only its routed experts (`CpuBackend::moe_banks`). Left:
 - **A V4 prompt of several chunks now prefills layer-major and reads each routed
   expert once (2026-11-17); what that left.** `docs/deepseek.md` § "Layer-major
   prefill on the CPU" has the design, the tests and the runs. On the real file a
-  69-token prompt in three chunks read 13 122 expert blocks (36.1 GB), each
-  exactly once by the pager trace, against 20 342 (56.0 GB) chunk-major. Left:
-  - **It was slower in wall time on every prompt run:** 98.96 and 114.89 s
-    against 91.59 s chunk-major (one run each order, a shared box). Per 2.75 MB
-    read layer-major spent 22.2 ms of lane time and chunk-major 13.7 ms; the
-    likely cause is that chunk-major's re-reads come from the OS file cache
-    (buffered reads; about 27 GB of standby between runs), not checked. The case
-    the order is for — a prompt of more than one 1024-row chunk, where a
-    chunk-major sweep is about 85 GB and no file cache holds it — was estimated
-    (about 170 GB against 90 for two chunks), not run: two such sweeps take
-    minutes and push the box's available memory under the run guard's floor (run
-    1 here, 46.5 GB read plus a decode, did). Unbuffered reads (B-DSV4-REAL)
-    would remove the confound and the double caching both.
-  - **Non-wait time was higher layer-major** (16.0 s against 8.8 s, 129 span
-    graphs against 3, run 4 against run 3). Not profiled: per-execute setup
-    (scratch, the pool's wake), the graph build for the whole model per span, or
-    noise from the other session.
-  - **The decode after a layer-major prefill starts cold.** The demotions
-    (`WeightReuse::Done`) make each finished layer the next victims, so the pool
-    ends holding the first and last layers' experts; the first decode-loop pass
-    missed 729 of 774 pins (run 4). A pool of 1904 slots holds about 26 a layer
-    beyond one layer's floor of 768: keeping each layer's most-routed experts
-    (by rows, counted over its chunks) out of the demotion, up to that share,
-    would hand the decode a warm set. Needs per-bank routing counts kept across
-    a layer's graphs in the CPU backend. Not built.
+  1443-token prompt in two default chunks (1024 + 418) read 23 292 expert blocks
+  (64.1 GB), each exactly once by the pager trace, and prefilled in 206.83 and
+  195.16 s; chunk-major had spent 209.5 s on its first chunk alone when the run
+  guard stopped it at 235 s. Left:
+  - **Small chunks stay chunk-major, by measurement only.** In 32-row chunks a
+    69-token prompt was slower layer-major (98.96 and 114.89 s against 91.59 s),
+    so the default needs chunks of `seam::HOST_LAYER_MAJOR_MIN_ROWS` (256);
+    nothing between 32 and 1024 rows was run, so the threshold is a choice
+    between two points. The likely cause is that a small chunk's sweep (about 20
+    GB) stays in the OS file cache, so chunk-major's re-reads are copies; that
+    was inferred from timings, not measured per read (the re-read counters
+    `HostPagerStats::rereads` now exist; no chunk-major run printed them).
+    Unbuffered reads (B-DSV4-REAL) would remove the confound and the double
+    caching both, and might let the order pay at any height.
+  - **The chunk-major arm of the decisive comparison did not finish**: the run
+    guard stopped it at 11.5 GB available (the box's buffered reads grow the
+    system cache; another session held memory too). Its total is an estimate
+    from the rate of its last 11 layers (about 310 s).
+  - **Non-wait time of the 32-row runs** (16.0 s layer-major against 8.8 s) is
+    unexplained: the synthetic bench shows no per-span cost (229.3 against 230.8
+    ms for 16 graphs against 80), so it was not the span graphs.
+  - **The decode warm start keeps only the last row's experts and the most
+    routed of the last chunk** (`paged::done_keep`, 8 a bank): the first
+    decode-loop pass hit 470 of 774 expert pins after a 1443-token prompt (729
+    misses of 774 without it). Counting routed rows over all of a layer's
+    chunks, not just its last, and sizing the share from the pool, were not
+    tried.
   - **The pool still needs one layer's every expert** (768 slots, 2.1 GB on
     V4-Flash): layer-major reads each expert once only while a layer's union
     fits beside what is pinned, which the floor guarantees.

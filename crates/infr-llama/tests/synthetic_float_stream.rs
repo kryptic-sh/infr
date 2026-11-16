@@ -122,6 +122,7 @@ impl Float {
 
 fn load(tmp: &TempGguf, edit: impl FnOnce(&mut infr_llama::EngineConfig)) -> infr_llama::SeamModel {
     let mut cfg = infr_llama::EngineConfig::default();
+    infr_testkit::honour_env(&mut cfg);
     edit(&mut cfg);
     infr_llama::SeamModel::load_with(tmp.path(), None, std::sync::Arc::new(cfg))
         .expect("synthetic model load")

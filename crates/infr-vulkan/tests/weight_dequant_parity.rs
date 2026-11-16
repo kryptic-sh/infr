@@ -181,7 +181,7 @@ impl Diff {
 #[test]
 #[ignore = "requires a Vulkan GPU and the DeepSeek-V2-Lite GGUF in the HF cache"]
 fn q4k_weight_dequant_matches_host_on_deepseek_v2_lite() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -233,7 +233,7 @@ fn probe_ids(vocab: usize, n: usize) -> Vec<i32> {
 #[test]
 #[ignore = "requires a Vulkan GPU and the DeepSeek-V2-Lite GGUF in the HF cache"]
 fn embed_gather_matches_host_dequant_on_deepseek_v2_lite() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -341,7 +341,7 @@ fn rmsnorm_f64(x: &[f32], w: &[f32], dim: usize, eps: f32) -> Vec<f32> {
 #[test]
 #[ignore = "requires a Vulkan GPU and the DeepSeek-V2-Lite GGUF in the HF cache"]
 fn rmsnorm_matches_f64_reference_on_deepseek_v2_lite_layer0() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -469,7 +469,7 @@ fn err_stats(got: &[f32], want: &[f32]) -> (f64, f64) {
 #[test]
 #[ignore = "requires a Vulkan GPU and the DeepSeek-V2-Lite GGUF in the HF cache"]
 fn layer0_kv_a_mqa_error_is_the_int8_activation_prepass() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

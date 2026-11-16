@@ -20,13 +20,11 @@ use infr_vulkan::VulkanBackend;
 fn backend(no_replay: bool) -> Option<VulkanBackend> {
     let mut cfg = Config::load_from_layers(&[ConfigLayer::env().expect("environment config")]);
     cfg.kernels.vulkan.no_replay = no_replay;
-    match VulkanBackend::new_with(Arc::new(cfg)) {
-        Ok(be) => Some(be),
-        Err(e) => {
-            eprintln!("skip: no Vulkan device ({e})");
-            None
-        }
+    let be = infr_testkit::gpu_or_skip(VulkanBackend::new_with(Arc::new(cfg)));
+    if be.is_none() {
+        eprintln!("skip: no Vulkan device");
     }
+    be
 }
 
 /// The single-token decode shape the replay path takes (rope + one attention row over an f16

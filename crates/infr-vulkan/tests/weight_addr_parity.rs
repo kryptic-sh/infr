@@ -285,7 +285,7 @@ fn assert_offset_invariant(c: &OffsetCase) {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn mrow_offset_invariant() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -312,7 +312,7 @@ fn mrow_offset_invariant() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn rm_offset_invariant() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -337,7 +337,7 @@ fn rm_offset_invariant() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn sg_offset_invariant() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -361,7 +361,7 @@ fn sg_offset_invariant() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn rm_v2_offset_invariant() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -399,7 +399,7 @@ fn rm_v2_offset_invariant() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn w_base_composes_with_arena_offset() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -612,7 +612,7 @@ fn run_mmv_case_offset_invariant(
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn mmv_offset_invariant() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -649,7 +649,7 @@ fn mmv_offset_invariant() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn mmv_mrow_offset_invariant() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -695,7 +695,7 @@ fn mmv_mrow_offset_invariant() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn mmv_mw_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -758,7 +758,7 @@ fn mmv_mw_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn mmq_dense_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -864,7 +864,7 @@ fn synth_bank(dtype: DType, in_f: usize, out_f: usize, n_expert: usize) -> Bank 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn id_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -946,7 +946,7 @@ fn id_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn idm_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1032,7 +1032,7 @@ fn idm_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn mmv_id_q4k_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1117,7 +1117,7 @@ fn mmv_id_q4k_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn float_linear_offset_invariant() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1153,7 +1153,7 @@ fn float_linear_offset_invariant() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn f16_noext_and_res_match_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1198,7 +1198,7 @@ fn f16_noext_and_res_match_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn fma_gemm_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1242,7 +1242,7 @@ fn fma_gemm_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn embed_gather_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1357,7 +1357,7 @@ fn embed_gather_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn embed_gather_zeroes_an_out_of_range_id() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1416,7 +1416,7 @@ fn embed_gather_zeroes_an_out_of_range_id() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn gather_i32_zeroes_an_out_of_range_id() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1485,7 +1485,7 @@ fn gather_i32_zeroes_an_out_of_range_id() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn conv1d_silu_offset_invariant() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1634,7 +1634,7 @@ fn conv1d_silu_offset_invariant() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn e2b_gate_offset_invariant() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1685,7 +1685,7 @@ fn e2b_gate_offset_invariant() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn gemm_proj_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1765,7 +1765,7 @@ fn gemm_proj_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn i8cm_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1867,7 +1867,7 @@ fn i8cm_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn repack_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1948,7 +1948,7 @@ fn synth_residual(n: usize) -> Vec<f32> {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn linear_add_native_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1983,7 +1983,7 @@ fn linear_add_native_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn linear_add_mmv_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -2037,7 +2037,7 @@ fn linear_add_mmv_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn linear_mmv_mrow_residual_matches_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -2109,7 +2109,7 @@ fn linear_mmv_mrow_residual_matches_resident() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn resident_bda_linear_route_dispatches() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -2387,7 +2387,7 @@ fn resident_bda_linear_route_dispatches() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn resident_bda_bound_subrange_bind() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -2475,7 +2475,7 @@ fn resident_bda_bound_subrange_bind() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn resident_bda_id_route_dispatches() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -2659,7 +2659,7 @@ struct MmqVariant {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn resident_bda_mmq_experts_route_dispatches() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

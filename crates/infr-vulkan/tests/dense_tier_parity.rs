@@ -186,7 +186,7 @@ fn sweep(
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn the_host_tier_stages_the_same_bytes_the_mmap_source_does() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -422,7 +422,7 @@ fn the_host_tier_stages_the_same_bytes_the_mmap_source_does() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn a_host_block_missing_from_the_tier_below_is_refused_at_load() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -493,7 +493,7 @@ impl BlockIo for FaultIo {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn a_failed_read_leaves_nothing_resident() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

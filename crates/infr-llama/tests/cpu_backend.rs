@@ -108,8 +108,7 @@ fn device_room(dev: &infr_vulkan::DeviceInfo, model_bytes: u64) -> Result<(), St
 /// default pick). A device listing that fails decides nothing: the load reports that failure
 /// itself, as it did before this check.
 fn resident_room(path: &std::path::Path) -> Result<(), String> {
-    let mut cfg = infr_llama::EngineConfig::default();
-    cfg.device.dev = std::env::var("INFR_DEV").ok();
+    let cfg = env_cfg();
     let Some(dev) = infr_vulkan::VulkanBackend::enumerate_devices(&cfg)
         .ok()
         .and_then(|devs| devs.into_iter().find(|d| d.is_default_pick))
@@ -163,14 +162,20 @@ fn model_cfg(
     path: &std::path::Path,
     f: impl FnOnce(&mut infr_llama::EngineConfig),
 ) -> infr_llama::SeamModel {
-    let mut cfg = infr_llama::EngineConfig::default();
-    // The environment knobs these tests honour: WHICH GPU they run on, so a box with more than
-    // one (a dGPU beside an iGPU) can test either (unset keeps the first-discrete default); and
-    // `INFR_FORCE_WAVE64`, so the wave64 path AMD GCN takes can be scored on an RDNA card.
-    cfg.device.dev = std::env::var("INFR_DEV").ok();
-    cfg.kernels.vulkan.force_wave64 = std::env::var_os("INFR_FORCE_WAVE64").is_some();
+    let mut cfg = env_cfg();
     f(&mut cfg);
     infr_llama::SeamModel::load_with(path, None, std::sync::Arc::new(cfg)).expect("model load")
+}
+
+/// The shipped defaults plus the environment knobs these tests honour: WHICH GPU they run on
+/// (`INFR_DEV`), so a box with more than one (a dGPU beside an iGPU) can test either (unset keeps
+/// the first-discrete default); and `INFR_FORCE_WAVE64`, so the wave64 path AMD GCN takes can be
+/// scored on an RDNA card.
+fn env_cfg() -> infr_llama::EngineConfig {
+    let mut cfg = infr_llama::EngineConfig::default();
+    cfg.device.dev = std::env::var("INFR_DEV").ok();
+    infr_testkit::honour_env(&mut cfg);
+    cfg
 }
 
 /// [`model_cfg`] on the shipped defaults — greedy sampling (`SamplingCfg::default()`), f16 KV, no
@@ -1170,11 +1175,11 @@ const VULKAN_INT8_PREFILL_COSINE_MIN: f64 = 0.995;
 fn gpu_seam_int8_prefill_tracks_cpu() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let mut _tlk = test_serial_lock();
-    let mut cfg = infr_llama::EngineConfig::default();
-    cfg.device.dev = std::env::var("INFR_DEV").ok();
-    let armed = infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(cfg))
-        .map(|vk| vk.int8_coopmat_prefill())
-        .unwrap_or(false);
+    // The same config the model below loads with, so a forced wave64 run (no coopmat) skips here.
+    let armed = infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new_with(
+        std::sync::Arc::new(env_cfg()),
+    ))
+    .is_some_and(|vk| vk.int8_coopmat_prefill());
     if !armed {
         eprintln!(
             "gpu_seam_int8_prefill_tracks_cpu: no int8 coopmat prefill GEMM on this device — skipped"

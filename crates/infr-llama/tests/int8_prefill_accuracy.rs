@@ -213,6 +213,7 @@ impl Score {
 fn model(path: &Path, f: impl FnOnce(&mut infr_llama::EngineConfig)) -> infr_llama::SeamModel {
     let mut cfg = infr_llama::EngineConfig::default();
     cfg.device.dev = std::env::var("INFR_DEV").ok();
+    infr_testkit::honour_env(&mut cfg);
     f(&mut cfg);
     infr_llama::SeamModel::load_with(path, None, std::sync::Arc::new(cfg)).expect("model load")
 }

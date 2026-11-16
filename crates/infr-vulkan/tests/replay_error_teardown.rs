@@ -29,7 +29,7 @@ fn failed_replay_recording_frees_its_segment() {
     // The leak under test is the replay path's; `INFR_SEAM_NO_REPLAY` in the environment would
     // quietly route the execute through the static path instead.
     cfg.kernels.vulkan.no_replay = false;
-    let Ok(be) = VulkanBackend::new_with(Arc::new(cfg)) else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new_with(Arc::new(cfg))) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

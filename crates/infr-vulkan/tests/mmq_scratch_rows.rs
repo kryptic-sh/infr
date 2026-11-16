@@ -21,7 +21,7 @@ use infr_vulkan::VulkanBackend;
 #[ignore = "requires a Vulkan GPU"]
 fn mmq_gemm_reads_no_activation_rows_past_m() {
     let log = gpuav_support::enable("mmq-scratch");
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

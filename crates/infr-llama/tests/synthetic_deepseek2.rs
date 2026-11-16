@@ -482,12 +482,10 @@ fn gpu_serial_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn load(tmp: &TempGguf) -> infr_llama::SeamModel {
-    infr_llama::SeamModel::load_with(
-        tmp.path(),
-        None,
-        std::sync::Arc::new(infr_llama::EngineConfig::default()),
-    )
-    .expect("synthetic model load")
+    let mut cfg = infr_llama::EngineConfig::default();
+    infr_testkit::honour_env(&mut cfg);
+    infr_llama::SeamModel::load_with(tmp.path(), None, std::sync::Arc::new(cfg))
+        .expect("synthetic model load")
 }
 
 /// Prefill `prompt` on the CPU reference backend and return the last row's logits.

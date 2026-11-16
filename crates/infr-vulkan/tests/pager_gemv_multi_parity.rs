@@ -59,7 +59,7 @@ fn host_silu(x: f32) -> f32 {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn multi_paged_gemv_chained_in_one_recorder_matches_host() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

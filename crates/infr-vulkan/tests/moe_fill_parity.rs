@@ -198,7 +198,7 @@ fn check_every_expert(
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn fills_land_every_experts_own_bytes_from_every_tier() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -289,7 +289,7 @@ fn fills_land_every_experts_own_bytes_from_every_tier() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn a_pool_that_cannot_hold_every_expert_does_not_fill() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -319,7 +319,7 @@ fn a_pool_that_cannot_hold_every_expert_does_not_fill() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn a_failed_fill_read_turns_fills_off_without_failing_the_forward() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -440,7 +440,7 @@ impl AsRef<[u8]> for Gate {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn a_demand_miss_takes_back_queued_fills_and_rewinds_the_layer() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

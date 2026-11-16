@@ -448,7 +448,7 @@ fn run_fma(be: &VulkanBackend, dt: DType, w_base: usize) {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn nc_mmq_dense_gemm_parity_and_determinism() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -461,7 +461,7 @@ fn nc_mmq_dense_gemm_parity_and_determinism() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn nc_fma_gemm_parity_and_determinism() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

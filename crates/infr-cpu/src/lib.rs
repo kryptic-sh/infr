@@ -14,6 +14,7 @@ mod indexer;
 #[doc(hidden)]
 pub mod indexer_tap;
 pub mod kvquant;
+pub mod op_tap;
 pub mod paged;
 mod pool;
 pub mod turbo;
@@ -1884,6 +1885,7 @@ impl Backend for CpuBackend {
                     if let Err(e) = infr_core::graph::check_attention(g, op) {
                         panic!("cpu backend: {e}");
                     }
+                    op_tap::record(op_tap::TappedOp::Attention { rows });
                     let (rows, kv_len, nh, nkv, hd) = (
                         rows as usize,
                         kv_len as usize,
@@ -2363,6 +2365,10 @@ impl Backend for CpuBackend {
                     // Dequantize the selected rows straight from the raw (mmap'd) table bytes —
                     // identical math to the load-time dequant that used to build the host f32
                     // table, so outputs are bit-equal to the old host-embed path.
+                    op_tap::record(op_tap::TappedOp::EmbedGather {
+                        rows,
+                        table: g.desc(table).dtype,
+                    });
                     let (rows, ne) = (rows as usize, ne as usize);
                     let buf = bindings.get(table).expect("cpu backend: unbound Weight");
                     let bytes = cpu_buf(buf).read();
@@ -3663,7 +3669,10 @@ impl Backend for CpuBackend {
                         indexer::Keys::F32(&wide_keys)
                     };
                     // Split across the pool by keys, so that one decode row scores on every core.
-                    let sc = indexer::score(self.pool(), qs, ws, keys, nh, hd, scale, &his);
+                    // `rows × keys` f32, in a buffer an earlier op of this execute freed when one
+                    // fits (the previous CSA layer's scores, given back below).
+                    let buf = rc.for_overwrite(his.iter().copied().max().unwrap_or(0) * rows);
+                    let sc = indexer::score(self.pool(), buf, qs, ws, keys, nh, hd, scale, &his);
                     let mut out = vec![0f32; rows * top_k];
                     let tap = indexer_tap::active().then(|| std::sync::Mutex::new(Vec::new()));
                     self.pool()
@@ -3677,17 +3686,22 @@ impl Backend for CpuBackend {
                     if let Some(tap) = tap {
                         let mut scored = tap.into_inner().expect("indexer tap lock");
                         scored.sort_by_key(|&(ti, _)| ti);
-                        indexer_tap::record(scored.into_iter().map(|(ti, scores)| {
-                            indexer_tap::IndexerRow {
-                                pos: pos + ti,
-                                kept: out[ti * top_k..(ti + 1) * top_k]
-                                    .iter()
-                                    .map(|v| v.to_bits())
-                                    .collect(),
-                                scores,
-                            }
-                        }));
+                        let out = &out;
+                        indexer_tap::record(|op| {
+                            scored
+                                .into_iter()
+                                .map(move |(ti, scores)| indexer_tap::IndexerRow {
+                                    op,
+                                    pos: pos + ti,
+                                    kept: out[ti * top_k..(ti + 1) * top_k]
+                                        .iter()
+                                        .map(|v| v.to_bits())
+                                        .collect(),
+                                    scores,
+                                })
+                        });
                     }
+                    rc.give(sc);
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::TopkMask {
@@ -3704,7 +3718,9 @@ impl Backend for CpuBackend {
                     );
                     let (rows, kv_len, top_k) = (rows as usize, kv_len as usize, top_k as usize);
                     let ids = &vals[idx.0 as usize];
-                    let mut out = vec![f32::NEG_INFINITY; rows * kv_len];
+                    // `rows × kv_len`: the previous CSA layer's mask buffer when one is free.
+                    let mut out = rc.for_overwrite(rows * kv_len);
+                    out.fill(f32::NEG_INFINITY);
                     for (t, row) in out.chunks_exact_mut(kv_len).enumerate() {
                         for s in 0..top_k {
                             // i32 index carried as a u32 bit pattern in the f32 slot — the

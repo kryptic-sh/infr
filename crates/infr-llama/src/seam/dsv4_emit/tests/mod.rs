@@ -1,8 +1,10 @@
 //! The compressed tiers' tests: each compressor's ops alone against a host computation of its
-//! definition (`compressor`), and the synthetic V4 file through the runner's sessions
-//! (`session`). llama.cpp scores the whole model in `tests/synthetic_deepseek4_llama_cpp.rs`.
+//! definition (`compressor`), the synthetic V4 file through the runner's sessions (`session`),
+//! and its batched prefill against one position per graph (`prefill`). llama.cpp scores the whole
+//! model in `tests/synthetic_deepseek4_llama_cpp.rs`.
 
 mod compressor;
+mod prefill;
 mod session;
 
 use infr_core::backend::{Backend, Buffer, BufferUsage};

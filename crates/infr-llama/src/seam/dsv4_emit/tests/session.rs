@@ -1,7 +1,7 @@
 //! The synthetic V4 file through the runner's sessions: which weights move which logits, prefix
 //! reuse across turns, and the reset a turn that does not extend the session takes.
 
-use super::super::dsv4_fixture::{dsv4_dims, dsv4_model};
+use super::super::dsv4_fixture::{dsv4_dims, dsv4_model, Dsv4Dims};
 use super::rand_vals;
 use crate::seam::weights::SeamKv;
 use crate::seam::TokenEmbd;
@@ -16,7 +16,7 @@ const HCA: usize = crate::seam::dsv4_plan::DSV4_HCA_RATIO as usize;
 const CSA: usize = crate::seam::dsv4_plan::DSV4_CSA_RATIO as usize;
 
 /// The session tests' context: room for every prompt below.
-const SESSION_CTX: usize = 640;
+pub(super) const SESSION_CTX: usize = 640;
 
 /// A two-layer V4 file: a compressed layer at `ratio`, then a ratio-0 one, with the oracle files'
 /// YaRN keys so the compressed layer's rope differs from the plain one, and the canonical
@@ -29,7 +29,14 @@ fn v4_model(ratio: usize, top_k: Option<usize>, edit: impl Fn(&mut TensorSpec)) 
     if let Some(k) = top_k {
         d.indexer.top_k = k;
     }
-    let mut m = dsv4_model(&d);
+    let mut m = session_model(&d);
+    m.tensors.iter_mut().for_each(edit);
+    m
+}
+
+/// `d`'s file with a [`SESSION_CTX`] context and the oracle files' YaRN keys.
+pub(super) fn session_model(d: &Dsv4Dims) -> SyntheticModel {
+    let mut m = dsv4_model(d);
     for (k, v) in m.meta.iter_mut() {
         if k == "deepseek4.context_length" {
             *v = Meta::U32(SESSION_CTX as u32);
@@ -47,7 +54,6 @@ fn v4_model(ratio: usize, top_k: Option<usize>, edit: impl Fn(&mut TensorSpec)) 
         ),
     ]);
     m.meta.sort_by(|a, b| a.0.cmp(&b.0));
-    m.tensors.iter_mut().for_each(edit);
     m
 }
 
@@ -80,29 +86,39 @@ fn is_indexer(t: &TensorSpec) -> bool {
 }
 
 /// One loaded synthetic V4 file on the CPU backend.
-struct Model {
+pub(super) struct Model {
     g: Gguf,
-    cfg: Config,
+    pub(super) cfg: Config,
     embd: std::sync::OnceLock<Vec<f32>>,
     be: CpuBackend,
     ec: EngineConfig,
 }
 
+/// What one generation returned: the ids it generated, the logits its first one was sampled
+/// from (the prompt's last position), and how many of the prompt's positions it took from the
+/// session (`GenStats::n_cached`).
+pub(super) struct Gen {
+    pub(super) ids: Vec<u32>,
+    pub(super) logits: Vec<f32>,
+    pub(super) n_cached: usize,
+}
+
 impl Model {
     fn open(tag: &str, m: &SyntheticModel) -> Self {
-        Self::open_with(tag, m, EngineConfig::default())
+        let m = Self::open_with(tag, m, EngineConfig::default());
+        assert!(m.cfg.has_unrewindable_state());
+        m
     }
 
-    fn open_with(tag: &str, m: &SyntheticModel, ec: EngineConfig) -> Self {
+    pub(super) fn open_with(tag: &str, m: &SyntheticModel, ec: EngineConfig) -> Self {
         let tmp = TempGguf::write(tag, m);
         let g = Gguf::open(tmp.path()).expect("open synthetic GGUF");
         let cfg = Config::from_gguf(&g).expect("synthetic config");
-        assert!(cfg.has_unrewindable_state());
         Model {
             g,
             cfg,
             embd: std::sync::OnceLock::new(),
-            be: CpuBackend::new(),
+            be: CpuBackend::new_with(std::sync::Arc::new(ec.clone())),
             ec,
         }
     }
@@ -115,8 +131,22 @@ impl Model {
     /// [`Self::logits`] and how many of `prompt`'s positions the turn took from the session
     /// instead of prefilling them (`GenStats::n_cached`): what tells a reuse from a re-prefill.
     fn turn(&self, prompt: &[u32], state: &mut Option<SeamKv>) -> (Vec<f32>, usize) {
-        let mut out = Vec::new();
-        let (_, stats) = crate::seam::generate_dense_backend(
+        let r = self
+            .generate(prompt, 1, state, None)
+            .expect("synthetic V4 generation");
+        (r.logits, r.n_cached)
+    }
+
+    /// Generate up to `max_new` greedy ids after `prompt` on `state`, under `req` when given.
+    pub(super) fn generate(
+        &self,
+        prompt: &[u32],
+        max_new: usize,
+        state: &mut Option<SeamKv>,
+        req: Option<&crate::sampling::RequestCtx>,
+    ) -> anyhow::Result<Gen> {
+        let mut logits = Vec::new();
+        let (ids, stats) = crate::seam::generate_dense_backend(
             &self.be,
             &crate::seam::cpu_upload_bind(&self.be),
             &self.g,
@@ -125,21 +155,24 @@ impl Model {
             TokenEmbd::new(&self.embd, &self.g),
             None,
             prompt,
-            1,
+            max_new,
             |_| {},
             state,
             SESSION_CTX,
             None,
             None,
             None,
-            Some(&mut out),
+            Some(&mut logits),
             None,
             None,
-            None,
-        )
-        .expect("synthetic V4 generation");
-        assert_eq!(out.len(), self.cfg.vocab);
-        (out, stats.n_cached)
+            req,
+        )?;
+        assert_eq!(logits.len(), self.cfg.vocab);
+        Ok(Gen {
+            ids,
+            logits,
+            n_cached: stats.n_cached,
+        })
     }
 
     fn fresh(&self, prompt: &[u32]) -> Vec<f32> {
@@ -148,25 +181,33 @@ impl Model {
 
     /// The bytes of every compressor ring a session holds.
     fn rings(&self, state: &Option<SeamKv>) -> Vec<Vec<u8>> {
+        let out = self.comp_state(state, true);
+        assert!(!out.is_empty(), "the session holds no ring");
+        out
+    }
+
+    /// The bytes of the compressed-tier buffers a session holds, layer by layer in
+    /// `crate::seam::dsv4_comp_bufs` order: the rings only when `rings_only`, else the block
+    /// caches too.
+    pub(super) fn comp_state(&self, state: &Option<SeamKv>, rings_only: bool) -> Vec<Vec<u8>> {
         let kv = state.as_ref().expect("a session");
         let mut out = Vec::new();
         for l in 0..self.cfg.n_layer {
             let geometry = crate::seam::dsv4_comp_bufs(&self.cfg, l, kv.max_ctx, kv.k_fmt);
             for (b, buf) in geometry.iter().zip(&kv.cbufs[l]) {
-                if b.ring {
+                if b.ring || !rings_only {
                     let mut v = vec![0u8; buf.len_bytes()];
                     self.be.download(buf.as_ref(), &mut v).expect("download");
                     out.push(v);
                 }
             }
         }
-        assert!(!out.is_empty(), "the session holds no ring");
         out
     }
 }
 
 /// `n` prompt ids drawn from `salt`.
-fn ids(n: usize, salt: u64) -> Vec<u32> {
+pub(super) fn ids(n: usize, salt: u64) -> Vec<u32> {
     let vocab = dsv4_dims().vocab as u64;
     (0..n as u64)
         .map(|i| (splitmix64(i ^ (salt << 32)) % vocab) as u32)

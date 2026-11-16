@@ -6,10 +6,16 @@
 //! the CSA layer's lightning indexer, its top-k mask and its two-segment attention, and the HCA
 //! layer's attention. [`dsv4_cpu_fixture_bench`] times the synthetic V4 file end to end, a few
 //! hundred tokens of prefill, so that the small case is watched too, and prints a digest of the
-//! logits, so that a change meant to keep every bit can be checked against the commit before it.
+//! logits, so that a change meant to keep every bit can be checked against the commit before it;
+//! `INFR_UBATCH=1` there prefills one position per graph, for comparison with the batched default.
+//! [`dsv4_cpu_moe_prefill_bench`] runs one V4-Flash routed-expert layer over a prefill chunk
+//! against the same rows one at a time: what batched prefill saves where the real model spends
+//! most of its bytes; it allocates real-size banks, so it runs only with `INFR_DSV4_MOE_BENCH`
+//! set.
 //!
 //! ```text
-//! cargo test -p infr-llama --release --test dsv4_cpu_bench -- --ignored --nocapture --test-threads=1
+//! [INFR_DSV4_MOE_BENCH=1] cargo test -p infr-llama --release --test dsv4_cpu_bench -- --ignored \
+//!   --nocapture --test-threads=1
 //! ```
 //!
 //! Nothing else should be running: every op here spreads over the whole CPU pool.
@@ -317,6 +323,155 @@ fn dsv4_cpu_fixture_bench() {
             "{n:>4} tokens: {:.1} ms, {:.0} tokens/s (median of 3), logits digest {digest:016x}",
             t[1] * 1e3,
             n as f64 / t[1]
+        );
+    }
+}
+
+/// One routed-expert layer of V4-Flash as `Op::MoeFfn` sees it: the model width, the expert count,
+/// the experts a token uses and an expert's width, with sqrt-softplus gating. The banks are Q2_K,
+/// as in the shipped `Q2_K_S` file, with random codes and fixed block scales; the router is f32
+/// (the file's is BF16).
+const MOE_NE: usize = 4096;
+const MOE_EXPERTS: usize = 256;
+const MOE_USED: usize = 6;
+const MOE_FF: usize = 2048;
+
+/// The row counts the expert layer runs at: one decode row, and prefill chunks up to the default
+/// prefill chunk height on a discrete GPU's host or a CPU-only one (`seam::ubatch_rows`'s
+/// fallback; an integrated GPU's default is lower).
+const MOE_ROWS: [usize; 6] = [1, 16, 64, 256, 512, 1024];
+
+/// Set to run [`dsv4_cpu_moe_prefill_bench`]; without it the bench returns at once, so a run of
+/// every ignored test (the GPU gate's `--run-ignored all`) does not allocate its banks.
+const MOE_BENCH_ENV: &str = "INFR_DSV4_MOE_BENCH";
+
+/// A Q2_K bank of `elems` values: every block's scale and code bytes from a multiplicative hash of
+/// `salt`, its `d` and `dmin` fixed, so every value is finite.
+fn q2k_bank(elems: usize, salt: u64) -> Vec<u8> {
+    // ggml's `block_q2_K`: the scale and code bytes of its values, then `d` and `dmin` as f16.
+    const VALUES: usize = 256;
+    const CODES: usize = VALUES / 16 + VALUES / 4;
+    const BYTES: usize = CODES + 4;
+    let mut out = vec![0u8; elems / VALUES * BYTES];
+    let d = half::f16::from_f32(0.01).to_le_bytes();
+    let dmin = half::f16::from_f32(0.005).to_le_bytes();
+    for (b, blk) in out.as_chunks_mut::<BYTES>().0.iter_mut().enumerate() {
+        let (codes, scales) = blk.split_at_mut(CODES);
+        for (i, w) in codes.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+            let x = ((b * CODES / 8 + i) as u64 ^ (salt << 48)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            *w = x.to_le_bytes();
+        }
+        scales[..2].copy_from_slice(&d);
+        scales[2..].copy_from_slice(&dmin);
+    }
+    out
+}
+
+/// **What a prefill chunk saves on V4's routed experts**: one V4-Flash expert layer
+/// ([`MOE_NE`] and the rest) executed over `rows` positions in one op, against `rows` one-row
+/// executes, which is what a prefill of one position per graph pays. Each one-row execute reads the
+/// banks of the [`MOE_USED`] experts its token routes to; a chunk reads each expert any of its rows
+/// routes to once, for all of those rows. The banks stay in RAM between executes, so this measures
+/// the arithmetic and memory traffic a chunk saves, not the file reads a streamed model saves. The
+/// one-row baseline executes the same row again and again, so its experts stay warm in L3 between
+/// repetitions, which no prefill of distinct tokens enjoys: the ratio it prints is conservative.
+///
+/// Three real-size banks: about 2.1 GB resident, plus one bank's bytes while each is generated.
+/// Runs only with [`MOE_BENCH_ENV`] set.
+#[test]
+#[ignore = "perf measurement; run in release with --nocapture and INFR_DSV4_MOE_BENCH=1 on a quiet \
+            machine"]
+fn dsv4_cpu_moe_prefill_bench() {
+    use infr_core::graph::{Activation, MoeGating};
+    if std::env::var_os(MOE_BENCH_ENV).is_none() {
+        eprintln!("{MOE_BENCH_ENV} is not set: skipping the expert-layer bench");
+        return;
+    }
+    let be = infr_cpu::CpuBackend::new();
+    let upload = |bytes: &[u8]| {
+        let b = be.alloc(bytes.len(), BufferUsage::Weights).expect("alloc");
+        be.upload(b.as_ref(), bytes).expect("upload");
+        b
+    };
+    let bank = |salt| upload(&q2k_bank(MOE_EXPERTS * MOE_FF * MOE_NE, salt));
+    let (gate, up, down) = (bank(1), bank(2), bank(3));
+    let router = upload(&f32_bytes(&noise(MOE_EXPERTS * MOE_NE, 4)));
+    println!(
+        "dsv4 cpu moe prefill bench: {} threads, n_embd {MOE_NE}, {MOE_EXPERTS} experts, \
+         {MOE_USED} used, {MOE_FF} wide, Q2_K banks; ms (median)",
+        rayon::current_num_threads()
+    );
+    println!(
+        "{:>5} {:>12} {:>14} {:>14} {:>8}",
+        "rows", "chunk ms", "chunk ms/row", "1-row ms/row", "ratio"
+    );
+    let mut one_row_ms = 0.0;
+    for rows in MOE_ROWS {
+        let mut g = Graph::new();
+        let x = g.input(f32d(rows * MOE_NE));
+        let wr = g.weight(TensorDesc::new(vec![MOE_EXPERTS, MOE_NE], DType::F32));
+        let wd = |g: &mut Graph, shape: Vec<usize>| g.weight(TensorDesc::new(shape, DType::Q2K));
+        let wg = wd(&mut g, vec![MOE_EXPERTS, MOE_FF, MOE_NE]);
+        let wu = wd(&mut g, vec![MOE_EXPERTS, MOE_FF, MOE_NE]);
+        let wdn = wd(&mut g, vec![MOE_EXPERTS, MOE_NE, MOE_FF]);
+        let dst = g.output(f32d(rows * MOE_NE));
+        g.push(Op::MoeFfn {
+            x,
+            router_x: x,
+            router: wr,
+            gate_exps: wg,
+            up_exps: wu,
+            down_exps: wdn,
+            down_scale: None,
+            fused_gate_up: false,
+            dst,
+            ne: MOE_NE as u32,
+            n_expert: MOE_EXPERTS as u32,
+            n_used: MOE_USED as u32,
+            n_ff_exp: MOE_FF as u32,
+            scale: 1.0,
+            act: Activation::Silu,
+            gating: MoeGating::SqrtSoftplus,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 1,
+            n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
+        });
+        let plan = be.compile(&g).expect("compile");
+        let xb = upload(&f32_bytes(&noise(rows * MOE_NE, 5)));
+        let ob = be
+            .alloc(rows * MOE_NE * 4, BufferUsage::Readback)
+            .expect("alloc");
+        let mut b = Bindings::new();
+        b.bind(x, xb.as_ref());
+        b.bind(wr, router.as_ref());
+        b.bind(wg, gate.as_ref());
+        b.bind(wu, up.as_ref());
+        b.bind(wdn, down.as_ref());
+        b.bind(dst, ob.as_ref());
+        let exec = || be.execute(plan.as_ref(), &b).expect("execute");
+        exec();
+        let reps = 5;
+        let mut t: Vec<f64> = (0..reps)
+            .map(|_| {
+                let t0 = Instant::now();
+                exec();
+                t0.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        t.sort_by(f64::total_cmp);
+        let ms = t[reps / 2];
+        if rows == 1 {
+            one_row_ms = ms;
+        }
+        println!(
+            "{rows:>5} {ms:>12.2} {:>14.3} {one_row_ms:>14.3} {:>8.1}",
+            ms / rows as f64,
+            one_row_ms * rows as f64 / ms
         );
     }
 }

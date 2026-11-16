@@ -46,10 +46,13 @@ fn task_keys(threads: usize, n: usize, rows: usize, n_head: usize, head_dim: usi
 /// `ggml_sum_rows` sums the contiguous head axis.
 ///
 /// Returned KEY-major, `[max(his), rows]`, so that each task owns a contiguous run of keys for
-/// every row; an entry at or past its row's `his[t]` is never computed and reads 0.
+/// every row; an entry at or past its row's `his[t]` is never computed and reads 0. The result is
+/// built in `buf`'s storage, so a caller that hands back the previous op's score buffer (the
+/// executor's `Recycler`) does not map a fresh `rows × keys` allocation per op.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn score(
     pool: &SpinPool,
+    buf: Vec<f32>,
     q: &[f32],
     ws: &[f32],
     keys: Keys<'_>,
@@ -60,7 +63,9 @@ pub(crate) fn score(
 ) -> Vec<f32> {
     let (rows, nh, hd) = (his.len(), n_head, head_dim);
     let n = his.iter().copied().max().unwrap_or(0);
-    let mut sc = vec![0f32; n * rows];
+    let mut sc = buf;
+    sc.clear();
+    sc.resize(n * rows, 0.0);
     let per = task_keys(pool.threads(), n, rows, nh, hd);
     pool.for_chunks_mut(&mut sc, per * rows, 1, &|c, piece| {
         let (j0, nk) = (c * per, piece.len() / rows);
@@ -356,7 +361,7 @@ mod tests {
                 .collect();
             let k32: Vec<f32> = k16.iter().map(|x| x.to_f32()).collect();
             for keys in [Keys::F16(&k16), Keys::F32(&k32)] {
-                let sc = score(&pool, &q, &ws, keys, nh, hd, scale, &his);
+                let sc = score(&pool, Vec::new(), &q, &ws, keys, nh, hd, scale, &his);
                 let n = *his.iter().max().unwrap();
                 assert_eq!(sc.len(), n * rows);
                 for (t, &hi) in his.iter().enumerate() {

@@ -25,6 +25,60 @@ use crate::Config;
 use infr_core::graph::{CompSegment, Graph, Op};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 
+/// Whether a V4 prompt prefills in chunks of several positions per graph on the backend named
+/// `backend`, as other models do, rather than one position per graph.
+///
+/// Every V4 emit is written for any row count, and a chunk's rows see what one position per
+/// graph would show them: the compressors commit every block the chunk completes before the
+/// attention, whose segment shows row `t` only the blocks `(pos + t + 1) / ratio` counts, so a
+/// row sees the blocks earlier rows completed and none a later row completes; the indexer scores
+/// each row over its own visible blocks only and fills a short top-k with blocks that segment
+/// masks; a hash-routed layer gathers each row's experts by that row's token id; the
+/// hyper-connection ops mix each row's streams alone. `tests/prefill.rs` holds every layout to
+/// the one-position run.
+///
+/// The CPU only: its `Op::MoeFfn` routes any expert dtype at any row count, where the other
+/// backends' batched expert path needs `MOE_MMQ_DTYPES` banks, and a GPU backend refuses the
+/// compressed layers, so only a ratio-0 V4 file runs there, and its multi-row graph has not been
+/// run on a GPU.
+pub(super) fn batched_prefill_ok(backend: &str) -> bool {
+    backend == "cpu"
+}
+
+/// The bytes one `rows × blocks` f32 buffer of a CSA layer may take in a prefill chunk.
+///
+/// A CSA layer's indexer scores every row of the chunk against every block the chunk's last row
+/// sees (`Op::LightningIndexer`'s score buffer), and its `Op::TopkMask` writes a bias of the same
+/// shape: two buffers of `rows × (start + rows) / ratio` f32 per CSA layer per chunk, which grow
+/// with the context while the chunk height stays fixed. [`prefill_chunk_rows`] shrinks the chunk
+/// so that each stays within this budget; the CPU executor recycles both from one CSA layer to
+/// the next.
+pub(super) const DSV4_PREFILL_SCORE_BYTES: usize = 64 << 20;
+
+/// The rows of a V4 prefill chunk starting at position `start`, at most `max_rows` (the session's
+/// chunk height): the tallest chunk whose CSA score buffer and bias each fit
+/// [`DSV4_PREFILL_SCORE_BYTES`], and never less than one row. A file without a CSA layer has
+/// neither buffer and keeps `max_rows`. The chunk height changes no number: the batched prefill
+/// equals one position per graph at any height.
+pub(super) fn prefill_chunk_rows(c: &Config, start: usize, max_rows: usize) -> usize {
+    let ratio = DSV4_CSA_RATIO as usize;
+    if !(0..c.n_layer).any(|l| c.layer_compress_ratio(l) == ratio) {
+        return max_rows;
+    }
+    let bytes = |rows: usize| rows * ((start + rows) / ratio) * std::mem::size_of::<f32>();
+    // `bytes` grows with `rows`, so the tallest chunk that fits is a binary search away.
+    let (mut lo, mut hi) = (1, max_rows.max(1));
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if bytes(mid) <= DSV4_PREFILL_SCORE_BYTES {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 /// How one V4 layer ropes the `[nope | rope]` tail of its heads.
 ///
 /// `build_attention_impl` picks the parameters per layer: a ratio-0 layer ropes plain at

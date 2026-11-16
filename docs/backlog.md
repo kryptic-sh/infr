@@ -1229,12 +1229,32 @@ the breaks). What is left:
   `Op::EmbedGather` over an f32 APE table, the ring persisted by `Op::Copy` into
   an f32 Input, and the two-segment attention all exist on Vulkan, but no
   GPU-vs-CPU test of the whole tier exists (plan 09 S9).
-- **More than one token per graph.** The emit is written for any token count,
-  and the stand-alone tests in `seam/dsv4_emit/tests/compressor.rs` run both
-  tiers' compressors and the CSA indexer in graphs of up to 150 tokens, but the
-  runner feeds V4 one token per graph (batched prefill excludes it), so a
-  multi-token V4 graph has never run end to end, and no prefill-in-one-graph
-  against token-by-token comparison exists (plan 09 "Notes for S6 and S7").
+- **Batched prefill is the CPU's only.** Since 2026-11-16 the CPU prefills a V4
+  prompt in chunks (`dsv4_emit::batched_prefill_ok`; plan 09 § 5 "Batched
+  prefill"), bit-identical to one position per graph on every synthetic layout.
+  A GPU backend still prefills one position per graph: the compressed tiers are
+  refused there anyway, and a multi-row ratio-0 V4 graph (the hyper-connection
+  ops, `Op::GatherI32`, the sinks attention at `rows > 1`) has never run on
+  Vulkan. Lifting it there is part of plan 09 S9, with a GPU-vs-CPU test of the
+  chunked graph.
+- **Chunked and one-position prefill differ on int8-path expert banks.** The
+  CPU's `Op::MoeFfn` sets `int8_ok = rows >= 2 && !reference`, so a chunk feeds
+  Q4_K, Q5_K, Q6_K and Q8_0 expert banks int8-quantized activations
+  (`expert_acts_kind`) where a one-row graph (one position per graph, and every
+  decode step) feeds them f32; the difference reaches the routers, the indexer's
+  selections at near-ties and the logits. Measured on the synthetic file with
+  Q8_0 banks
+  (`quantized_banks_chunked_prefill_is_close_and_reference_is_exact`): 1.71e-4
+  at the prompt's end, 2.37e-4 at the first decoded position, 87 of 594
+  selections flipped; bit-identical in reference mode. Every MoE model's CPU
+  batched prefill makes this trade; it is recorded, not a defect. The shipped
+  V4-Flash file's routed banks are all Q2_K (read from its tensor-info header),
+  which stays on f32 activations at any row count, so it does not reach that
+  file's experts. What is unverified there: Q8_0 `Op::Linear` at several rows
+  against one row (the shipped attention, compressors, indexers, shared experts
+  and hyper-connection matmuls are Q8_0;
+  `linear_prefill_matches_the_single_token_kernels_bitwise` covers Q4_K, Q5_K
+  and Q6_K only). A Q8_0 case in that test would settle it.
 - **Quantized KV caches round differently from llama.cpp's.** At a quantized
   `type_k` with a head width divisible by 64 (q8_0, q4_0 on V4-Flash's 512),
   llama.cpp's `llama_kv_cache` rotates q, the raw row, the compressed row and
@@ -1270,13 +1290,10 @@ the breaks). What is left:
 
 **What slice A left unverified, in its own right:**
 
-- **`batch > 1` has never been EXECUTED for V4 on any backend.** The only V4
-  fixture that exists (`crates/infr-llama/tests/dsv4_fixture/mod.rs`'s
-  `dsv4_model`) writes f32 expert banks, so `moe_batched_ok` is false and the
-  chunked batched prefill is unreachable from it — and `generate_dense_backend`
-  now excludes V4 from that path outright rather than leave an untested shape
-  live. Every V4 graph the tests build is `batch == 1`. Re-enabling it means a
-  quantized-expert fixture (or a real GGUF) plus the layer-span question below.
+- **`batch > 1` runs on the CPU only** (see "Batched prefill is the CPU's only"
+  above). The fixture's f32 expert banks fail `moe_batched_ok`, which the V4
+  gate does not consult on the CPU, whose `Op::MoeFfn` takes any dtype at any
+  row count.
 - **A partial layer span is refused** (the assert beside the compress-ratio
   one): the widened residual is `hc_mult` streams wide and a span hands over one
   `n_embd`-wide `hidden` buffer. Layer-major prefill therefore cannot serve V4
@@ -1463,13 +1480,31 @@ geometry over random f16 caches, 32 threads, a quiet Ryzen 9 9950X3D):
   keys, 32 threads, old against new with equal output digests: 512 rows × 4096
   keys 462-464 → 39.9 ms; 512 × 16384 2030-2037 → 149-151 ms; 32 × 16384 134-143
   → 9.5 ms; 1 × 16384 61 → 0.37 ms. Not in the tree's bench, and no V3.2 model
-  was run. The score buffer is now `rows × keys` f32, zeroed per op and not
-  recycled (32 MiB for 512 rows at 16k keys; about 335 MiB at a 160k context by
-  arithmetic), where the old code held one row per task: fine for time, a cost
-  in headroom at long-context prefill. The runner feeds V4 one token per graph.
-  The key-split scoring and the per-row selection are written for any row count
-  and tested at several (`indexer::tests`), and the attention converts the union
-  of the rows' kept sets, which for a long prefill approaches `len`.
+  was run. The score buffer is `rows × keys` f32 (32 MiB for 512 rows at 16k
+  keys). This entry used to say "about 335 MiB at a 160k context": that is 512
+  rows × 163 840 keys × 4 bytes, V3.2's block ratio 1 (one key per token), and
+  is 335.5 MB, i.e. 320 MiB, not 335 MiB. On V4 the keys are blocks of 4, so 512
+  rows at 160k take 80 MiB and a 1024-row chunk 160 MiB, plus a top-k bias of
+  the same shape. V4's prefill now shrinks its chunk to keep each within 64 MiB
+  (`dsv4_emit::prefill_chunk_rows`, `DSV4_PREFILL_SCORE_BYTES`: 1008 rows at
+  64k, 408 at 160k, 63 at 1M) and the CPU executor recycles both buffers across
+  CSA layers; V3.2's prefill has no such bound and is not run on this box. The
+  attention converts the union of the rows' kept sets, at most
+  `min(blocks, rows × top_k)` rows (on V4-Flash 32 MiB at 64k, 80 MiB at 160k),
+  not bounded further. None of it was timed on a V4 chunk at V4-Flash's
+  geometry; `dsv4_cpu_op_bench` times one decode row.
+- **Batched prefill: measured on the synthetic file and on one expert layer, not
+  on the real file.** `dsv4_cpu_fixture_bench` (synthetic, 512 tokens): 1589.1 /
+  1620.2 ms one position per graph against 27.9 / 27.5 ms batched, nearly all
+  per-graph fixed cost. `dsv4_cpu_moe_prefill_bench` (one V4-Flash routed-expert
+  layer, Q2_K banks in RAM, `INFR_DSV4_MOE_BENCH=1`): 0.63 / 0.62 ms per row in
+  a 1024-row chunk (the default height) and 0.81 in a 512-row one, against 5.73
+  / 5.70 ms one row at a time; 2.8 at 64 rows, barely any gain at 16 (each row's
+  experts are mostly distinct). The one-row baseline repeats one row, so its
+  experts stay warm in L3: conservative. The real file streams its banks from
+  disk, where a chunk reads each routed expert once for all its rows; how much
+  that saves per token, and whether the default chunk height is the right one
+  for it, needs the real file (§ B-DSV4-REAL).
 - **The rings' round trip** (§ B-DSV4-WIRING) is per token but not O(context):
   it was not measured here.
 
@@ -1564,13 +1599,13 @@ is left:
   because it would have to be undone the moment V4 gets a GPU-resident decode —
   where the sampled id never reaches the host. The device gather costs one small
   shader and reuses the ids Input that already exists.
-- **Only `batch == 1` has been executed.** `Op::GatherI32` is written for any
-  `rows` and the op-level parity test drives `rows = 2`, but the WHOLE-MODEL
-  path is per-token: V4 is excluded from batched prefill (§ B-DSV4-WIRING), and
-  `build` asserts a hash-routed span cannot be built without the ids Input,
-  which the chunked prefill has nowhere to bind. Re-enabling batched V4 prefill
-  means giving `PfChunk` an ids buffer that is separate from its host-embedded
-  rows.
+- **`batch > 1` runs on the CPU only.** The CPU's batched V4 prefill gathers
+  each row's experts by its own token id, from the chunk's ids (`PfChunk::ids`
+  when the embedding is gathered on the host, the chunk's input when it is
+  gathered in the graph); `seam/dsv4_emit/tests/prefill.rs` holds both to one
+  position per graph. On Vulkan V4 still prefills one position per graph (§
+  B-DSV4-WIRING), so `gather_i32.comp` has run at `rows > 1` only in the
+  op-level parity test.
 
 - **The Vulkan PAGED MoE path refuses both features.** `execute_paged_moe`
   returns an error for `expert_ids` and for a clamp with
@@ -1678,8 +1713,10 @@ numbers. Open items:
   own tests, so those paths stay checked only by infr's mechanism tests.
 - **What the synthetic oracle cannot reach:** quantized weights (every tensor is
   f32 but the i32 routing table, so the BF16 routers and Q8_0/Q2_K paths of the
-  real file are untouched), batched prefill (infr's V4 prefill is per token),
-  the `deepseek-v3` tokenizer, and decode past the prompt.
+  real file are untouched), the `deepseek-v3` tokenizer, and decode past the
+  prompt. infr's side of every comparison is now its batched CPU prefill; it
+  gives the numbers the one-position runs gave, to the last digit printed, and
+  is held bit-identical to them by `seam/dsv4_emit/tests/prefill.rs`.
 - **The sums files are 52 to 66 KB each**, mostly the compressors' intermediate
   rows at 7 positions. Trimming to the final roped rows would halve them; kept
   whole because S6/S7 bisect on the intermediates.

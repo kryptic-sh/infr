@@ -1915,8 +1915,9 @@ pub(crate) fn generate_dense_backend_bound(
         // The widened `[batch, hc_mult, n_embd]` residual stream lives in graph scratch and is
         // collapsed back to `[batch, n_embd]` only by the model head. A partial layer span carries
         // its residual in the caller's `hidden` buffer, which is `n_embd` wide — there is nowhere
-        // to hand the other `hc_mult - 1` streams over. `decode_start`'s batched-prefill gate keeps
-        // V4 off that path entirely (see it); this is the backstop.
+        // to hand the other `hc_mult - 1` streams over. V4's batched prefill is chunk-major, one
+        // whole-model span per chunk (`layer_major_prefill` is told V4 cannot be split); this is
+        // the backstop.
         assert!(
             !c.deepseek4 || (l_first == 0 && l_end == c.n_layer),
             "deepseek4 cannot be built as a partial layer span ({l_first}..{l_end} of {}): the \
@@ -1949,15 +1950,9 @@ pub(crate) fn generate_dense_backend_bound(
         // EMBEDDING is gathered on-device — `gpu_embed` gates on a `token_embd` dtype the gather
         // kernels cover, which a model can fail while still being hash-routed. The ids Input is
         // therefore declared for either reason; only `use_ids` also makes `hidden` an Internal.
+        // On a host-embedded span (`use_ids == false`) the chunked prefill binds these ids from a
+        // buffer of their own (`PfChunk::ids`), since its `input` then holds the f32 rows.
         let hash_gather = c.deepseek4 && (l_first..l_end).any(|l| c.is_hash_moe_layer(l));
-        // A chunked batched prefill uploads HOST-EMBEDDED f32 rows into the buffer it would
-        // otherwise bind to the ids (see the `PfChunk::input` bind), so there is nowhere to put
-        // them on a `use_ids == false` span. `batched_prefill_ok` excludes V4 outright; this names
-        // the reason at the point that depends on it.
-        assert!(
-            !hash_gather || use_ids || span.is_none(),
-            "a hash-routed deepseek4 layer span cannot be built without the token-id input"
-        );
         // GPU embed gather: `hidden` becomes an Internal computed by the Op::EmbedGather pushed
         // just before the first layer op (after the table weight handle is declared) — unless a
         // layer span asked for it in a caller-owned buffer, where the gather writes the Input.
@@ -5677,12 +5672,14 @@ pub(crate) fn generate_dense_backend_bound(
     // re-reads than it saves in readbacks.)
     // `moe_batched_ok` (this `MOE_MMQ_DTYPES` eligibility scan) is a session-stable derivation —
     // computed once in `session_stable` and read here off `stable`.
-    // DeepSeek V4 is excluded from the batched path outright. Two reasons, both current: a
-    // layer-major span cannot carry its `hc_mult`-wide residual across spans (see the assert in
-    // `build`), and no `batch > 1` V4 graph has ever been EXECUTED — the only V4 fixture that
-    // exists writes f32 expert banks, so `moe_batched_ok` is false for it and nothing here could
-    // have exercised the chunked shape. Per-token prefill is slower and is what the tests run.
-    let batched_prefill_ok = (c.moe.is_none() || moe_batched_ok) && !c.deepseek4;
+    // DeepSeek V4 takes its own gate (`dsv4_emit::batched_prefill_ok`), and always prefills
+    // chunk-major: a layer-major span cannot carry its `hc_mult`-wide residual across spans (see
+    // the assert in `build`).
+    let batched_prefill_ok = if c.deepseek4 {
+        super::dsv4_emit::batched_prefill_ok(be.name())
+    } else {
+        c.moe.is_none() || moe_batched_ok
+    };
     let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
         // start..plen-1; rows 0..start are reused from the session cache) — in UBATCH CHUNKS.
@@ -5706,6 +5703,15 @@ pub(crate) fn generate_dense_backend_bound(
         } else {
             crate::seam::ubatch_rows(ec)
         };
+        // A sliding-window layer's ring holds `window + ring_ubatch` rows (`kv_rows_at`), so a
+        // chunk taller than the height the session was sized with would overwrite rows its own
+        // earlier rows still attend. `ubatch_rows` answers for the placement scope current NOW,
+        // which need not be the one the slot was made in.
+        let ubatch = if kv_ring && (0..c.n_layer).any(|l| c.is_swa_layer(l)) {
+            ubatch.min(ring_ubatch)
+        } else {
+            ubatch
+        };
         let pf_end = prompt.len() - 1;
         // ── prefill work list: (layer span, chunk), in EXECUTION order ───────────────────────
         // Chunk-major is one whole-model span per chunk, so every chunk drags the entire weight
@@ -5728,7 +5734,14 @@ pub(crate) fn generate_dense_backend_bound(
             let mut v = Vec::new();
             let mut cs = start;
             while cs < pf_end {
-                let ce = (cs + ubatch).min(pf_end);
+                // DeepSeek V4 shortens its chunks as the context grows, to bound the CSA layers'
+                // `rows × blocks` buffers (`dsv4_emit::prefill_chunk_rows`).
+                let rows = if c.deepseek4 {
+                    super::dsv4_emit::prefill_chunk_rows(c, cs, ubatch)
+                } else {
+                    ubatch
+                };
+                let ce = (cs + rows).min(pf_end);
                 v.push((cs, ce));
                 cs = ce;
             }
@@ -5736,7 +5749,7 @@ pub(crate) fn generate_dense_backend_bound(
         };
         let layer_major = crate::seam::layer_major_this_prompt(
             ec,
-            crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b),
+            crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b && !c.deepseek4),
             chunks.len(),
             be.dense_holds_every_block(),
         );
@@ -5753,6 +5766,9 @@ pub(crate) fn generate_dense_backend_bound(
             m: usize,
             /// Token ids (gpu_embed) or the host-embedded f32 rows.
             input: Box<dyn Buffer>,
+            /// The token ids when `input` holds the f32 rows and the graph still reads ids: a
+            /// DeepSeek V4 hash-routed layer selects its experts by token id (`hash_ids`).
+            ids: Option<Box<dyn Buffer>>,
             /// The residual stream, when `input` holds ids and cannot serve as one.
             resid: Option<Box<dyn Buffer>>,
             pos: Box<dyn Buffer>,
@@ -5782,7 +5798,7 @@ pub(crate) fn generate_dense_backend_bound(
                     // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
                     // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
                     // the old f32 rows upload (4*n_embd*pf_m bytes).
-                    let input = if gpu_embed {
+                    let upload_ids = || -> AResult<Box<dyn Buffer>> {
                         let ids: Vec<i32> =
                             prompt[cstart..cend].iter().map(|&t| t as i32).collect();
                         let b = be
@@ -5790,7 +5806,15 @@ pub(crate) fn generate_dense_backend_bound(
                             .map_err(|e| anyhow!("{e}"))?;
                         be.upload(b.as_ref(), bytemuck::cast_slice(&ids))
                             .map_err(|e| anyhow!("{e}"))?;
-                        b
+                        Ok(b)
+                    };
+                    let ids = if hash_ids && !gpu_embed {
+                        Some(upload_ids()?)
+                    } else {
+                        None
+                    };
+                    let input = if gpu_embed {
+                        upload_ids()?
                     } else {
                         let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
                         let token_embd = token_embd.get()?; // host embed gather → materialize
@@ -5847,6 +5871,7 @@ pub(crate) fn generate_dense_backend_bound(
                     live[ci] = Some(PfChunk {
                         m: pf_m,
                         input,
+                        ids,
                         resid,
                         pos,
                         ipl,
@@ -5888,7 +5913,7 @@ pub(crate) fn generate_dense_backend_bound(
                 let step_bufs = upload_step_i32(be, &pf_h)?;
                 let mut pf_b = Bindings::new();
                 if let Some(ids) = pf_h.tok_ids {
-                    pf_b.bind(ids, ch.input.as_ref());
+                    pf_b.bind(ids, ch.ids.as_deref().unwrap_or(ch.input.as_ref()));
                 }
                 pf_b.bind(
                     pf_h.hidden,

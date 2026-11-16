@@ -747,14 +747,16 @@ there on synthetic files (see "The HCA tier" and "The CSA tier" below); a
 compressed layer on a GPU backend is refused by name. **What a V4 file needs to
 run now:** the CPU backend (`--dev cpu`), RAM for its weights (the shipped
 V4-Flash Q2_K_S is 98.6 GB, which this machine's 64 GB cannot hold; a run pages
-it from disk), and the patience for a per-token prefill. The shipped file has
-not been run: that it gets past every refusal on the CPU is inferred from its
-metadata and the synthetic fixtures, not run: some refusals sit after the weight
-upload and depend on the file's tensors, and no number it computes has been
-checked by any oracle. The compressed caches default to f16 (what the oracle
-checks); a quantized KV format is an explicit opt-in, unverified against the
-reference, which Hadamard-rotates those rows before quantizing them. See "Slice
-A — ratio 0" below for what that covers, "Slice A2 — hash routing" for the
+it from disk). The CPU prefills a V4 prompt in chunks of many positions per
+graph, as it does every other model (see "Batched prefill" below); the GPU
+backends prefill one position per graph. The shipped file has not been run: that
+it gets past every refusal on the CPU is inferred from its metadata and the
+synthetic fixtures, not run: some refusals sit after the weight upload and
+depend on the file's tensors, and no number it computes has been checked by any
+oracle. The compressed caches default to f16 (what the oracle checks); a
+quantized KV format is an explicit opt-in, unverified against the reference,
+which Hadamard-rotates those rows before quantizing them. See "Slice A — ratio
+0" below for what that covers, "Slice A2 — hash routing" for the
 `ffn_gate_tid2eid` gather, and `docs/backlog.md` § B-DSV4-WIRING for what is
 left. Note that no layer of the SHIPPED V4-Flash file is both ratio-0 and
 bias-routed — see `docs/backlog.md` § B-DSV4-REAL.
@@ -1088,8 +1090,9 @@ completes it, and a position below 0 is never read from a buffer (HCA reads
 none; the CSA and LID compressors read block 0's previous window as the
 sentinel, which the gather writes from its fill: value 0, score `-inf`). That is
 why the reset zeroes the rings but not the compressed caches. Speculative
-verify, batched and layer-major prefill and the record-once tape never see V4
-(MoE, or excluded by name).
+verify, layer-major prefill and the record-once tape never see V4 (MoE, or
+excluded by name); batched prefill does since "Batched prefill" below, on the
+CPU.
 
 What the tests found when the code was broken on purpose (plan 09 § S6 has the
 full table): ropes at position 0 are the identity, so a wrong rope on compressed
@@ -1230,6 +1233,195 @@ token by token) is unchanged within noise: 512 tokens in 1724 / 1699 ms before
 and 1683 / 1702 ms after. Its indexer took 16.4 ms of the run before and 0.8 ms
 after (`INFR_PROF_OPS=1`); a first cut split its tiny keys over the pool and
 took 223 ms, which is why a scoring task now has a minimum amount of work.
+
+### Batched prefill (2026-11-16)
+
+The CPU prefills a V4 prompt in chunks: every position but the last in graphs of
+`INFR_UBATCH` rows (`crate::seam::ubatch_rows`, the height every model's batched
+prefill uses: 1024 unless the first Vulkan device is an integrated GPU,
+`default_ubatch_rows_for`), the last in the decode loop, as on every other
+model. Two caps apply: no model's chunk is taller than the height its session's
+sliding-window rings were sized for (below), and on a file with a CSA layer the
+chunk shrinks as the context grows (`dsv4_emit::prefill_chunk_rows`, below).
+Chunk boundaries need not align to blocks of either tier. `INFR_UBATCH=1` keeps
+one position per graph, which is what the comparison tests use as the reference.
+Decode stays one token per graph. The gate is `dsv4_emit::batched_prefill_ok`:
+the CPU only, since a GPU backend refuses the compressed layers and a ratio-0 V4
+graph of several rows has not run on one, and the CPU's `Op::MoeFfn` routes any
+expert dtype at any row count (the other backends' batched expert path needs
+`MOE_MMQ_DTYPES` banks, which the synthetic file's f32 banks are not). Always
+chunk-major: a layer-major span cannot hand over the `hc_mult`-wide residual, so
+`layer_major_prefill` is told V4 cannot be split.
+
+**Why a chunk's rows see exactly what one position per graph shows them.** The
+emits were already written for any row count; the runner only fed one row.
+
+- Compressed blocks: every compressor of the graph commits every block the chunk
+  completes before the layer's attention runs, and the attention's segment shows
+  row `t` only key `j < (pos + t + 1) / ratio` (`comp_visible`). A block
+  completed by row `t` has index `(pos + t + 1) / ratio - 1`, so row `t` and
+  every later row see it; an earlier row `u < t` sees at most
+  `(pos + u + 1) / ratio` blocks, which excludes it. A block completed by a
+  later row can therefore never be read, even though it is in the cache when the
+  attention runs.
+- Rings: the compressor's source is `[ring | this chunk's rows]`, so a block
+  pools ring rows earlier graphs persisted and this chunk's own rows in one
+  gather; the ring is written after the commit has read it, and when several of
+  the chunk's rows land on one ring row the latest wins
+  (`build_dsv4_comp_plan`'s persist dedup), which is what one position per graph
+  leaves there.
+- Indexer: `Op::LightningIndexer` scores each row over its own visible blocks
+  only (`(pos + t + 1) / ratio`, the `block_ratio` S7 added) and keeps
+  `top_k = min(n_visible_max, index_topk)` per row, filling a row that sees
+  fewer blocks than that with indices past its visible count, which
+  `Op::TopkMask` marks kept and the segment's own rule masks. A row that sees at
+  most `top_k` blocks therefore keeps all of them, as one position per graph
+  does with its own `min(visible, index_topk)`; a row that sees more keeps its
+  own best `top_k`, the same count. The reference pads the width for the whole
+  ubatch the same way (`build_lid_top_k`, `build_top_k_mask`). A row that sees
+  no block yet in a chunk whose later rows do is scored over nothing and attends
+  its raw window and the sink.
+- Hash routing reads each row's own token id (`Op::GatherI32` over the chunk's
+  ids). When the embedding is gathered on the host (a `token_embd` dtype with no
+  gather kernel, such as the fixture's f32), the chunk uploads the ids into a
+  buffer of their own (`PfChunk::ids`), since its main input then holds the
+  embedded rows.
+- The hyper-connection ops mix each row's streams alone; the model head runs on
+  the last position only, in the decode loop.
+
+**Verified** (`seam/dsv4_emit/tests/prefill.rs`), bit for bit, not to a
+tolerance: on the four oracle layouts (`ratio0`, `hca`, `csa`, `mixed`, at four
+streams and the oracle's indexer) and the canonical two-stream file, prompts of
+70 and 300 tokens (and 520 with an HCA tier, 200 on `csa`, past where the top-k
+drops blocks) prefilled at chunk heights 3, 37, 150 and the whole prompt give
+the same last-position logits, the same kept blocks at every (position, layer)
+row (`infr_cpu::indexer_tap`, which now numbers the ops so rows of one graph can
+be told apart by layer), the same bytes in every compressed cache and ring, and
+the same greedy decode after, with its logits and buffers, as one position per
+graph; also with the embedding gathered in the graph (an f16 table) at
+height 37. Every run also checks how it ran, through `infr_cpu::op_tap` (each
+`Op::Attention`'s row count and each `Op::EmbedGather`'s table dtype): every
+layer's attention at each expected graph height, and the f16 table gathered in
+the graph exactly in the gathered case, so a run that fell back to one position
+per graph, on any layout, cannot pass. Bit-exact because the CPU computes a row
+the same way whatever the row count for every op this f32 file runs. One
+position per graph through the batched prefill equals the decode loop fed one
+turn per token. Session tests: an extending turn prefills only its suffix in
+chunks, completing an HCA block from ring rows the turn before persisted; a turn
+sharing nothing resets the rings; a prefill cancelled between chunks is not
+reused, and the state the cancel leaves is asserted for each of the two
+deliberately redundant guards (the session records no prompt while a turn runs;
+`written_end` is raised before each chunk executes). The CPU's execute has no
+abort check, so a cancel always lands between chunks; an execute that failed
+part way would leave the same state.
+
+**Quantized expert banks: chunked prefill is close, not equal.** `Op::MoeFfn` on
+the CPU feeds a Q4_K, Q5_K, Q6_K or Q8_0 expert bank int8-quantized activations
+once the op has two rows or more (`int8_ok = rows >= 2 && !reference`, then
+`expert_acts_kind`), and f32 activations at one row; Q2_K, Q3_K and every other
+bank dtype stay on f32 activations at any row count. So on a file with such
+banks a chunked prefill and one position per graph differ by the int8 rounding
+of the expert activations, which reaches everything downstream: the router of
+the next layer, the indexer's scores (a selection at a near-tie can flip between
+`INFR_UBATCH=1` and the default) and the logits. Every MoE model's CPU batched
+prefill makes the same trade. `Op::Linear` is not part of it: it quantizes the
+activations of a quantized weight at one row too, and its batched kernels equal
+its one-row ones bit for bit
+(`linear_prefill_matches_the_single_token_kernels_bitwise` checks Q4_K, Q5_K and
+Q6_K; Q8_0, the shipped file's attention dtype, is not in that test).
+`quantized_banks_chunked_prefill_is_close_and_reference_is_exact` gives the
+canonical file Q8_0 expert banks (`infr_testkit`'s new `Fill::Quant`) and pins
+it at 300 tokens: chunked against one position per graph, max |logit diff|
+1.71e-4 at the prompt's last position and 2.37e-4 at the first decoded one (held
+at 1e-3), 87 of 594 indexer selections different (the canonical indexer's four
+heads leave many near-ties), every chunk height bit-identical to every other
+(each row is quantized alone); in reference mode (`kernels.cpu.reference`)
+chunked and one-position prefill are bit-identical again, and its one-position
+run equals the production one.
+
+**The shipped file's dtypes** (`ggml-org/DeepSeek-V4-Flash-0731-GGUF` Q2_K_S,
+read from the tensor-info header of its second shard, which holds every tensor;
+the first holds metadata only): the routed expert banks are all Q2_K (43 each of
+`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`), so they keep f32 activations
+at every row count and the int8 trade above does not reach them; the shared
+experts are Q8_0 (129), the routers BF16 (43; the three hash tables I32, the 40
+`exp_probs_b` F32), attention 215 Q8_0 and 172 F32, the compressors 123 Q8_0
+(the APE tables among them) and 41 F32, the indexers 105 Q8_0 and 21 F32, the
+hyper-connections 86 Q8_0 and 172 F32, the norms F32, `token_embd` Q8_0,
+`output` Q6_K, `output_hc_fn` Q8_0 and the other head tensors F32. Every Q8_0
+tensor is an `Op::Linear` weight except `token_embd` and the APE tables, which
+are gathered a row at a time and so cannot depend on the row count. Whether
+chunked and one-position prefill are bit-identical on that file therefore rests
+on Q8_0 `Op::Linear` (and the BF16 router GEMM inside `Op::MoeFfn`, which stays
+on f32 activations), and no test checks Q8_0 `Op::Linear` at several rows
+against one row.
+
+**Memory per chunk.** A CSA layer's indexer scores every row of the chunk
+against every block its last row sees, and its top-k mask is a bias of the same
+shape: two `rows × (start + rows) / 4` f32 buffers per CSA layer per chunk. At a
+fixed 1024-row chunk that is 64 MiB each at 64k context, 160 MiB at 160k and 1
+GiB at 1M. `dsv4_emit::prefill_chunk_rows` shrinks the chunk until each fits
+`DSV4_PREFILL_SCORE_BYTES` (64 MiB): on any V4 file with a CSA layer (V4-Flash
+included; the bound depends only on the ratio) a chunk starting at 8k keeps 1024
+rows, at 64k 1008, at 160k 408 and at 1M 63
+(`prefill_chunk_rows_bound_the_csa_buffers` pins them, worked by hand). The CPU
+executor now recycles both buffers from one CSA layer to the next within a chunk
+(the indexer builds its scores in a buffer the executor's `Recycler` hands it,
+and `Op::TopkMask` takes its output from the same pool) instead of mapping fresh
+ones per layer. The attention's converted kept rows are at most
+`min(blocks, rows × top_k)` rows of the head width in f32, twice the f16
+compressed cache it reads at most (32 MiB at 64k on V4-Flash's 512-wide head, 80
+MiB at 160k), not bounded further.
+
+**The sliding-window ring caps every model's chunk.** A window layer's ring
+holds `window + chunk` rows for the chunk height the session was made with
+(`kv_rows_at`), but the prefill loop read `ubatch_rows` at call time, which
+answers for the placement scope current then; a session made under a pinned
+short chunk and extended outside that scope prefilled in taller chunks than its
+ring holds, overwriting rows its own earlier rows still attend — on every model
+with a window layer, before V4 too. The prefill chunk is now capped at the
+session's own height when it has a window ring;
+`prefill_chunk_never_outgrows_the_window_ring` (V4's window layers, a session
+made at an 8-row pin and extended at the default height) is red without the cap.
+The llama.cpp comparisons run on batched prefill and give the same numbers as
+the one-position runs, to the last digit printed.
+
+What breaking it on purpose showed (each alone, then reverted): a row seeing the
+blocks of the chunk's last row, or only those of its first, turned the chunked
+comparison, the extending-turn test, `split_prefill_equals_one_prefill`, the
+selection test and the `csa`, `hca` and `mixed` oracle cases red; ring rows
+persisted from the first row landing on them instead of the last turned the
+plan's literal tests, both compressor definition tests, the split session test,
+the chunked comparisons and the `mixed` oracle red; persisting before
+compressing turned the compressor definition tests, the split session test and
+the chunked comparisons red, but no oracle case (a prompt in one chunk never
+reads a ring row it persisted); every row scoring the graph's widest visible
+count turned the indexer definition test, the chunked comparisons, the split
+session test, the selection test and the `csa` oracle red; hash routing by row
+0's token and the hyper-connection pre-mix by row 0's weights turned every
+chunked comparison and every oracle case red; binding the host-embedded rows as
+the token ids failed every hash-routed run.
+
+**Measured** (32 threads, Ryzen 9 9950X3D, CPU load about 1% before,
+`crates/infr-llama/tests/dsv4_cpu_bench.rs`, two interleaved rounds, the same
+binary with `INFR_UBATCH=1` and without): the synthetic canonical file
+(`dsv4_cpu_fixture_bench`) prefills 64 / 256 / 512 tokens in 198.9 / 809.4 /
+1589.1 ms and 192.5 / 824.4 / 1620.2 ms one position per graph, and in 19.0 /
+22.7 / 27.9 ms and 17.6 / 21.8 / 27.5 ms batched (322 → 18 337 tokens/s at 512),
+with the same logits digests. That gain is almost all per-graph fixed cost (a
+build, a compile and an execute per position on a file whose weights are a few
+megabytes); it predicts nothing about the real file (those prompts fit in one
+chunk at the default height, so 512 or 1024 makes no difference to them). What
+does is one V4-Flash routed-expert layer (`dsv4_cpu_moe_prefill_bench`, run with
+`INFR_DSV4_MOE_BENCH=1`: `n_embd` 4096, 256 experts, 6 used, 2048 wide, Q2_K
+banks held in RAM; two rounds): one row costs 5.73 / 5.70 ms, a chunk of 64 rows
+2.81 / 2.82 ms per row, of 256 1.21 / 1.21, of 512 0.81 / 0.81 and of 1024, the
+default height, 0.63 / 0.62, so 9.1 / 9.2 times less per position at the default
+chunk. The one-row baseline repeats the same row, so its experts stay warm in
+L3, which a real prompt's distinct tokens do not: the ratio is conservative. On
+the real file the banks do not fit in RAM and stream from disk, where a chunk
+reads each routed expert once for all the rows that route to it instead of once
+per token; that saving is the larger one and has not been measured.
 
 ### `compress_ratio` is the master per-layer switch
 

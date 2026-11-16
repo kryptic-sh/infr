@@ -5,6 +5,7 @@
 //! A tensor's pseudo-random fill is seeded by its NAME, not by its position in the file, so two
 //! variants of a model that add or remove one tensor differ only in that tensor.
 
+use infr_core::DType;
 use std::path::{Path, PathBuf};
 
 // ─── GGUF metadata values ────────────────────────────────────────────────────────
@@ -168,6 +169,12 @@ pub enum Fill {
     /// hash-routing tests build a `ffn_gate_tid2eid` with when WHICH expert each token names is
     /// the thing under test.
     ExactIds(Vec<i32>),
+    /// A block-quantized tensor in the given dtype, its blocks from [`crate::synth_weight`]
+    /// seeded by the tensor's name, so every value is finite. For a test of what a quantized
+    /// weight changes in the kernels that READ it (int8 activations, say), not of the
+    /// dequantizers. [`TensorSpec::values`] is the host dequantization of those bytes. Each row
+    /// (`shape[0]` values) must be a whole number of blocks.
+    Quant(DType),
 }
 
 /// One tensor of the synthetic model. `shape` is in GGUF/ggml order — `ne0` (the fastest,
@@ -211,6 +218,7 @@ impl TensorSpec {
                 assert_eq!(v.len(), self.numel(), "{}: ExactIds fill length", self.name);
                 v.iter().map(|&e| e as f32).collect()
             }
+            Fill::Quant(dt) => crate::dequant_oracle(*dt, &self.bytes()),
         }
     }
 
@@ -222,6 +230,16 @@ impl TensorSpec {
             Fill::ExpertIds(_) | Fill::ExactIds(_) => 26,
             Fill::ExactF16(_) => 1,
             Fill::ExactBf16(_) => 30,
+            // ggml's `GGML_TYPE_*` numbering.
+            Fill::Quant(dt) => match dt {
+                DType::Q8_0 => 8,
+                DType::Q2K => 10,
+                DType::Q3K => 11,
+                DType::Q4K => 12,
+                DType::Q5K => 13,
+                DType::Q6K => 14,
+                _ => panic!("{}: no GGML_TYPE number for {dt:?} here", self.name),
+            },
             _ => 0,
         }
     }
@@ -230,6 +248,7 @@ impl TensorSpec {
     pub fn byte_len(&self) -> usize {
         match self.fill {
             Fill::ExactF16(_) | Fill::ExactBf16(_) => self.numel() * 2,
+            Fill::Quant(dt) => infr_gguf::nbytes(dt, self.numel()),
             _ => self.numel() * 4,
         }
     }
@@ -238,6 +257,18 @@ impl TensorSpec {
     /// separate so the differential tests can compare LOGICAL values across variants without
     /// caring which encoding each tensor landed in.
     pub fn bytes(&self) -> Vec<u8> {
+        if let Fill::Quant(dt) = self.fill {
+            assert!(
+                self.shape.first().is_some_and(|&row| {
+                    row.is_multiple_of(infr_core::decode_spec::block_spec(dt).block_elems)
+                }),
+                "{}: a {dt:?} row of {:?} is not a whole number of blocks",
+                self.name,
+                self.shape
+            );
+            let seed = fnv1a64(self.name.as_bytes()) as u32;
+            return crate::synth_weight(dt, self.numel(), seed);
+        }
         let v = self.values();
         match self.fill {
             Fill::ExpertIds(_) | Fill::ExactIds(_) => {
@@ -269,8 +300,8 @@ pub struct SyntheticModel {
 
 impl SyntheticModel {
     /// Serialize to GGUF v3 bytes, each tensor in its [`TensorSpec::ggml_type`]. Nothing is
-    /// quantized: a quantized fixture would test the dequantizers rather than whatever the model
-    /// was built to test.
+    /// quantized unless a tensor asks for it ([`Fill::Quant`]): a quantized fixture would test the
+    /// dequantizers rather than whatever the model was built to test.
     pub fn to_gguf_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
         push_u32(&mut b, 0x4655_4747); // "GGUF"

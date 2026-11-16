@@ -809,12 +809,14 @@ pub(crate) fn layer_major_prefill(
     let want = ec.paging.layer_major.unwrap_or(streaming);
     if want && !spannable {
         // gemma4-E2B: its layer stack reads `per_layer_inp`, which the graph PROLOGUE builds, so a
-        // span starting past layer 0 would read an unbound tensor. This is the gate for it — the
-        // matching `assert!` in `build` is an internal invariant, and a streamed E2B model reached
-        // it as a PANIC on an ordinary `bench`/`run` until this arm existed.
+        // span starting past layer 0 would read an unbound tensor. DeepSeek V4: its residual is
+        // `hc_mult` streams wide and a span hands over one. This is the gate for both — the
+        // matching `assert!`s in `build` are internal invariants, and a streamed E2B model reached
+        // its as a PANIC on an ordinary `bench`/`run` until this arm existed.
         tracing::warn!(
-            "layer-major prefill cannot split this architecture's layer stack (per-layer inputs \
-             are built by the graph prologue) — prefilling chunk-major"
+            "layer-major prefill cannot split this architecture's layer stack (gemma4-E2B's \
+             per-layer inputs are built by the graph prologue; DeepSeek V4's residual is several \
+             streams wide) — prefilling chunk-major"
         );
         return false;
     }

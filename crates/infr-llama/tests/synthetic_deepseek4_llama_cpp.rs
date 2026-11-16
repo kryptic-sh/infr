@@ -1281,9 +1281,11 @@ struct InfrSelection {
     margin: Option<f64>,
 }
 
-/// infr's CPU selection at every row of the one-token-per-step run of `case`'s sums prompt, read
-/// through `infr_cpu::indexer_tap`. Each step's graph runs one indexer per ratio-4 layer, in layer
-/// order.
+/// infr's CPU selection at every row of a prefill of `case`'s sums prompt, read through
+/// `infr_cpu::indexer_tap`, ordered as the fixture is: by position, then layer. The prefill runs
+/// in chunks of several positions per graph; each graph that scores runs one indexer per ratio-4
+/// layer, in layer order, over every row of the graph, so an op's ordinal names its layer. A row
+/// that sees no block is scored over nothing, and the fixture has no line for it.
 fn infr_selections(case: &OracleCase) -> Vec<InfrSelection> {
     let tmp = TempGguf::write(
         &format!("dsv4-selection-{}", case.name),
@@ -1297,36 +1299,37 @@ fn infr_selections(case: &OracleCase) -> Vec<InfrSelection> {
     let layers: Vec<usize> = (0..case.ratios.len())
         .filter(|&l| case.ratios[l] == 4)
         .collect();
-    let rows: Vec<InfrSelection> = tapped
-        .chunks(layers.len())
-        .flat_map(|step| {
-            assert!(
-                step.iter().all(|r| r.pos == step[0].pos),
-                "a step ran another number of indexers than the case has ratio-4 layers"
-            );
-            step.iter().zip(&layers).map(|(r, &layer)| {
-                let mut sorted = r.scores.clone();
-                sorted.sort_by(|a, b| b.total_cmp(a));
-                let k = case.top_k.min(sorted.len());
-                let margin = (sorted.len() > k).then(|| {
-                    let (kept, dropped) = (f64::from(sorted[k - 1]), f64::from(sorted[k]));
-                    if kept == dropped {
-                        0.0
-                    } else {
-                        (kept - dropped) / kept.abs().max(dropped.abs())
-                    }
-                });
-                InfrSelection {
-                    row: SelectionRow {
-                        pos: r.pos,
-                        layer,
-                        kept: selection_of(r.pos, r.kept.iter().copied()),
-                    },
-                    margin,
+    let ops = tapped.last().map_or(0, |r| r.op + 1);
+    assert!(
+        ops.is_multiple_of(layers.len()),
+        "the graphs ran {ops} indexers, not a whole number per ratio-4 layer"
+    );
+    let mut rows: Vec<InfrSelection> = tapped
+        .iter()
+        .filter(|r| visible_blocks(r.pos) > 0)
+        .map(|r| {
+            let mut sorted = r.scores.clone();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let k = case.top_k.min(sorted.len());
+            let margin = (sorted.len() > k).then(|| {
+                let (kept, dropped) = (f64::from(sorted[k - 1]), f64::from(sorted[k]));
+                if kept == dropped {
+                    0.0
+                } else {
+                    (kept - dropped) / kept.abs().max(dropped.abs())
                 }
-            })
+            });
+            InfrSelection {
+                row: SelectionRow {
+                    pos: r.pos,
+                    layer: layers[r.op % layers.len()],
+                    kept: selection_of(r.pos, r.kept.iter().copied()),
+                },
+                margin,
+            }
         })
         .collect();
+    rows.sort_by_key(|s| (s.row.pos, s.row.layer));
     assert_eq!(
         rows.len(),
         selection_rows(case),

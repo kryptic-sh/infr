@@ -5,9 +5,9 @@ layer but two of the shipped V4-Flash file. Scoped on 2026-11-16 by reading
 llama.cpp at `5676dfbe0` (`src/models/deepseek4.cpp`,
 `src/llama-kv-cache-dsv4.cpp`, `src/llama-graph.cpp`, `src/models/models.h`).
 Statements marked **[I]** were inferred, not read; **[U]** are unknown. Nothing
-here has been built or run yet, except slices S0 to S7 (marked below). Cite
-functions, not lines: both reference files have grown since the notes in
-`docs/deepseek.md` were written.
+here has been built or run yet, except slices S0 to S7 (marked below) and the
+struck-through performance items of section 5. Cite functions, not lines: both
+reference files have grown since the notes in `docs/deepseek.md` were written.
 
 ## 0. The reference moved past our records
 
@@ -536,7 +536,8 @@ to skip it:
   segment's ordinary case (tested); their max is finite through the raw keys.
 
 Prefill one-batch against token-by-token equality is the best single test of the
-plan, state and sentinel logic; it arrives with batched V4 prefill (section 5).
+plan, state and sentinel logic; it arrived with batched V4 prefill (section 5,
+"Batched prefill"), and holds bit for bit.
 
 ## 4. Oracle
 
@@ -749,14 +750,113 @@ partially, bit-identical output; one CSA layer at V4-Flash's geometry and 64k
 context went from about 57 ms to about 1.1 ms per decode token (op-level,
 synthetic; `docs/deepseek.md` § "The CSA tier's CPU cost"). What is left of it
 is `docs/backlog.md` § B-DSV4-CPU-PERF, first the attention reading the kept
-rows once per head; then batched prefill (per-token today, which multiplies
-expert I/O by the prompt length; needs an ids buffer per chunk for hash layers);
-a span-carried hyper-connection stream so layer-major and streamed prefill serve
-V4; paged MoE with hash routing and the clamp, then B184; the sinks and
-compressed attention tiers on Vulkan, gathering the CSA top-k at long context
-instead of masking; the indexer's cost per CSA layer; `CompressPool` and
+rows once per head; ~~then batched prefill~~ — done on the CPU (2026-11-16,
+below); a span-carried hyper-connection stream so layer-major and streamed
+prefill serve V4; paged MoE with hash routing and the clamp, then B184; the
+sinks and compressed attention tiers on Vulkan, gathering the CSA top-k at long
+context instead of masking; the indexer's cost per CSA layer; `CompressPool` and
 hyper-connection kernels (B-DSV4-POOL, B-DSV4-HC); decode replay, measured
 first.
+
+### Batched prefill (2026-11-16)
+
+**Built.** On the CPU a V4 prompt prefills like every other model's: all but the
+last position in chunks of `INFR_UBATCH` rows, chunk-major, the last in the
+decode loop; `INFR_UBATCH=1` keeps one position per graph. The emits needed no
+change: `Dsv4Tiers`, the plan, the indexer and the two-segment attention were
+already written for any row count. The runner change is wiring:
+`dsv4_emit::batched_prefill_ok` (the CPU only: the GPU backends refuse the
+compressed tiers, and the CPU's `Op::MoeFfn` takes any expert dtype at any row
+count, where `moe_batched_ok` asks for `MOE_MMQ_DTYPES` banks the f32 fixture
+does not have), V4 marked unsplittable for `layer_major_prefill`, and
+`PfChunk::ids`, the chunk's token ids in their own buffer when its input holds
+host-embedded rows, which the hash-routed layers read (the build's assert that
+refused a hash-routed span without ids is gone). Chunk boundaries need not align
+to blocks: the tested heights are multiples of neither block length.
+
+**Per-row visibility.** All of a graph's commits are written before its
+attention, and the segment shows row `t` key `j` iff `j < (pos+t+1)/ratio`. A
+block committed by row `t` is block `(pos+t+1)/ratio - 1`: visible to `t` and
+every later row, invisible to every earlier one, since `(pos+u+1)/ratio` for
+`u < t` does not exceed that index. So a block committed by a later row of the
+same graph cannot be read although it is already in the cache. The indexer's
+eligible keys are per row by the same rule (`block_ratio`), and its graph-wide
+`top_k = min(n_visible_max, index_topk)` fills a short row with ineligible
+indices that the segment masks, so every row keeps what one position per graph
+keeps (`docs/deepseek.md` § "Batched prefill" has the argument per op).
+
+**Verified, bit for bit** (`seam/dsv4_emit/tests/prefill.rs`): the four oracle
+layouts and the canonical two-stream file, at 70 to 520 tokens, chunk heights 3,
+37, 150 and the whole prompt, against one position per graph: last-position
+logits, the kept blocks at every (position, layer) row, every compressed cache
+and ring, and the greedy decode after with its logits and buffers; also with the
+embedding gathered in the graph. One position per graph through the batched path
+equals the decode loop fed one turn per token. Session tests in chunks: an
+extending turn prefills only its suffix across an HCA block boundary from the
+ring the turn before persisted; a non-extending turn resets; a prefill cancelled
+between chunks is not reused. The oracle tests now run batched and print the
+same max |logit diff| as section 4 and S7 record for the one-position runs:
+`ratio0` 3.4570694e-6 / 5.376339e-5 / 2.771616e-5 / 8.420646e-5 / 4.518032e-5 /
+1.5926361e-4, `hca` 1.847744e-6 / 5.2452087e-6 / 1.9788742e-5 / 3.838539e-5 /
+2.0742416e-5 / 4.49121e-5, `mixed` 2.6226044e-6 / 3.0219555e-5 / 6.234646e-5 /
+8.493662e-5 / 4.1604042e-5 / 9.346008e-5 (7 to 520 tokens), `csa` 7.9512596e-5 /
+5.173683e-5 / 6.979704e-5 / 4.285574e-5 (7 to 131); the selection test holds
+too, its tap rows now told apart by an op ordinal (`IndexerRow::op`) since a
+graph holds many positions. Before the change, a one-off digest of each layout's
+logits, selections, buffers and decode under the old per-token prefill matched
+the new `ubatch = 1` run exactly.
+
+**Breaks** (each alone, reverted). "chunked" is the chunk-height comparison and
+the extending-turn test; "split" `split_prefill_equals_one_prefill`; "rows" and
+"selects" the compressor and indexer definition tests; "oracle" the cases named;
+"selection" `synthetic_dsv4_indexer_keeps_what_llama_cpp_keeps`.
+
+| break                                                      | caught by                                                      |
+| ---------------------------------------------------------- | -------------------------------------------------------------- |
+| a row sees the blocks of the graph's last row              | chunked, split, selection; oracle `csa`, `hca`, `mixed`        |
+| a row sees only the blocks of the graph's first row        | chunked, split, selection; oracle `csa`, `hca`, `mixed`        |
+| a ring row keeps the first row landing on it, not the last | the plan's literal tests, rows, chunked, split; oracle `mixed` |
+| persist before compress                                    | rows, chunked, split; no oracle case                           |
+| every indexer row eligible up to the graph's widest count  | selects, chunked, split, selection; oracle `csa`               |
+| hash routing by row 0's token id                           | chunked, split, selection; every oracle case                   |
+| hyper-connection pre-mix by row 0's weights                | chunked, split, selection; every oracle case                   |
+| host-embedded rows bound as the token ids                  | every hash-routed run (an id past the table)                   |
+
+Persist-before-compress is still invisible to the oracle: a prompt in one chunk
+never reads a ring row it persisted, so only graphs that start mid-prompt show
+it, which the chunked tests have.
+
+**Measured** (`docs/deepseek.md` § "Batched prefill" has the tables): the
+synthetic file prefills 512 tokens in 27.9 / 27.5 ms batched against 1589.1 /
+1620.2 ms one position per graph, nearly all per-graph fixed cost; one V4-Flash
+routed-expert layer with Q2_K banks in RAM costs 0.63 / 0.62 ms per row in a
+1024-row chunk, the default height, against 5.73 / 5.70 ms for one row at a
+time.
+
+**Review follow-up (same day).** The chunk height is bounded so a CSA layer's
+`rows × blocks` score buffer and top-k bias each fit 64 MiB
+(`dsv4_emit::prefill_chunk_rows`: 1024 rows at 8k, 1008 at 64k, 408 at 160k, 63
+at 1M), and the CPU recycles both across CSA layers. Every model's chunk is now
+capped at the height its session's sliding-window ring was sized for (a session
+made under one placement pin and extended outside it used to prefill in taller
+chunks than its ring holds; `prefill_chunk_never_outgrows_the_window_ring`). On
+quantized expert banks of the int8 family (Q4_K, Q5_K, Q6_K, Q8_0) chunked and
+one-position prefill differ by `Op::MoeFfn`'s int8 activations (`int8_ok`):
+1.71e-4 on the synthetic file with Q8_0 banks, bit-identical in reference mode;
+the shipped file's banks are Q2_K, which keeps f32 activations.
+`infr_cpu::op_tap` now shows every chunked run's graph heights and its in-graph
+embedding gather, so a run on any layout that fell back to one position per
+graph fails. The breaks below were joined by: no ring cap (the ring test), each
+cancel guard alone (its own assertion in the cancel test), the V4 gate off
+(every layout's chunked test, by its graph heights), no in-graph gather (the
+gathered-embedding case), no memory bound (the bound test), no int8 activations
+(the quantized-bank test, which requires a difference). The real file's gain is
+the expert banks streamed once per chunk instead of once per routing token; not
+measured, since the file has not been run.
+
+**Left on one position per graph:** every GPU backend (a ratio-0 V4 file on
+Vulkan; the compressed tiers are refused there), decode, and a suffix of at most
+two positions (as on every model).
 
 `deepseek2` / V3: an `Op::Mla` split-K decode arm and a prefill tier
 (B-DSHW-MLA-SCALAR-TIER has the gaps); B108 on CPU at depth. Do not reopen

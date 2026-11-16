@@ -191,6 +191,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **DeepSeek V4 prefills in chunks on the CPU backend.** A `deepseek4` prompt
+  used to prefill one position per graph, walking every layer's weights (and on
+  the real model every routed expert a token picks) once per prompt token; it
+  now prefills like every other model, in chunks of `INFR_UBATCH` rows, through
+  every layer tier (the sliding window, the HCA and CSA compressors, the
+  lightning indexer), hash- and bias-routed layers and the hyper-connection
+  streams. Output is bit-identical to one position per graph on the synthetic V4
+  files at every chunk height tried (logits, every indexer selection, every
+  compressed cache and ring, and the decode after), and the llama.cpp
+  comparisons are unchanged. `INFR_UBATCH=1` keeps one position per graph; the
+  GPU backends still prefill V4 that way. On a file whose expert banks take the
+  CPU's int8-activation path (Q4_K, Q5_K, Q6_K, Q8_0) chunked prefill differs
+  from one position per graph by that rounding, as on every MoE model (1.7e-4 on
+  a synthetic Q8_0-bank file); the shipped file's banks are Q2_K, which do not.
+  The chunk shrinks as the context grows on a file with ratio-4 layers, so each
+  of a layer's two `rows × blocks` buffers stays within 64 MiB (1008 rows at
+  64k, 408 at 160k, 63 at 1M). Measured on a Ryzen 9 9950X3D (32 threads): the
+  synthetic file's 512-token prefill went from 1589 / 1620 ms to 27.9 / 27.5 ms
+  (per-graph overhead, nearly all of it), and one V4-Flash routed-expert layer
+  with Q2_K banks costs 0.62-0.63 ms per position in a 1024-row chunk, the
+  default height, against 5.7 ms one position at a time. The shipped file has
+  not been run, so its own gain, mostly expert banks read from disk once per
+  chunk instead of once per token, is not measured.
+  `infr_cpu::indexer_tap::IndexerRow` gains `op`, the ordinal of the indexer op
+  that scored the row; the new `infr_cpu::op_tap` records each graph's attention
+  row counts and embedding gathers for tests, and
+  `infr_testkit::gguf::Fill::Quant` writes a quantized tensor into a synthetic
+  GGUF.
+
 - **DeepSeek V4's compressed layers cost the CPU what they use.**
   `Op::Attention` attends only the compressed blocks the top-k keeps, skipping a
   masked one before its dot as llama.cpp does, and converts only the cache rows
@@ -579,6 +608,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   conversation with tools, and every conversation, respectively, and now render.
 
 ### Fixed
+
+- **A prefill chunk is never taller than the session's sliding-window ring.** A
+  window layer's ring holds the window plus the prefill chunk height the session
+  was created with, but the prefill read the chunk height again on every call,
+  from whatever placement pin was current then. A session created under a
+  shorter pinned chunk and extended outside that pin prefilled in taller chunks
+  than its ring holds, overwriting rows the chunk's own earlier positions still
+  attend, on every model with sliding-window layers. The chunk is now capped at
+  the session's own height.
 
 - **A uniform draw of exactly 0 no longer picks an arbitrary low-id token** when
   sampling with `top_k` 0 and `top_p` 1. That support is kept in id order, so a

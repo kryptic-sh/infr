@@ -1200,40 +1200,41 @@ llama.cpp to bless the synthetic file, per `docs/synthetic-models.md` rule 2.
 **Slice A (ratio 0) is DONE and generates** — see `docs/deepseek.md` § Stage 4,
 "Slice A". What is left:
 
-**Slice B — ratios 4 and 128.** Ratio 128 (HCA) is DONE on the CPU (plan 09
-S5/S6, 2026-11-16): the compressor emit (`seam/dsv4_emit.rs`), the persistent
-caches and rings (`seam::dsv4_comp_bufs`, `SeamKv::cbufs`), the `wpush` handles
-and the no-rewind predicate (`Config::has_unrewindable_state`), matched to
-llama.cpp's logits on the synthetic all-HCA file (`docs/deepseek.md` § "The HCA
-tier", plan 09 § "S5 and S6" for the numbers and the breaks). What is left:
+**Slice B — ratios 4 and 128.** Both compressed tiers are DONE on the CPU (plan
+09 S5 to S7, 2026-11-16): the compressor emit (`seam/dsv4_emit/`), the CSA
+tier's lightning indexer, the persistent caches and rings
+(`seam::dsv4_comp_bufs`, `SeamKv::cbufs`), the `wpush` handles and the no-rewind
+predicate (`Config::has_unrewindable_state`), matched to llama.cpp's logits on
+the synthetic all-HCA, all-CSA and every-tier files (`docs/deepseek.md` § "The
+HCA tier" and "The CSA tier", plan 09 § "S5 and S6" and § S7 for the numbers and
+the breaks). What is left:
 
-- **The CSA tier (plan 09 S7).** The overlapping compressor (two gathers into
-  one window, the sentinel fill), the LID compressor, `Op::LightningIndexer`
-  with `block_ratio` 4 and `Op::TopkMask` into the segment's `bias`. The CSA and
-  LID caches and rings are already allocated, declared, forked, reset and
-  priced, and the indexer's handles declared (`Dsv4IndexerW`, an
-  `#[expect(dead_code)]` that fails the build once S7 reads it); the
-  `generate_dense_backend` refusal names the first ratio-4 layer. `Dsv4Tier`
-  holds one tier's plan, inputs and scratch, so S7 adds a `csa` constructor (two
-  tiers: CSA and LID) beside `hca`.
+- **The shipped V4-Flash file's numbers.** It has never been run. That it gets
+  past every refusal on the CPU is inferred from its metadata and the synthetic
+  fixtures, not run: some refusals sit after the weight upload and depend on the
+  file's tensors. Its geometry (43 layers: 2 ratio-0, 21 CSA, 20 HCA; head 512
+  with a 64-dim rope; indexer 64 heads × 128, `top_k` 512; window 128) was
+  re-read off the first shard's metadata for S7, but no forward pass has run on
+  it: it is 98.6 GB on a 64 GB machine. The run, under a watchdog, and its
+  comparison are plan 09 S8 (§ B-DSV4-REAL).
 - **The LID cache's width under the KV formats.** The compressed caches take the
   raw cache's format (`check_attention` demands one dtype across segments).
-  `kv_row_align_ok` now holds every compressed row to the 32-element blocks, but
-  `kv_turbo_ok` in `generate_dense_backend` checks only `layer_head_dim` for the
-  128-element TurboQuant blocks, which the canonical fixture's 24-wide LID cache
-  would not meet (the real file's 128 does). S7 must gate it, or keep the LID
-  cache f16 and give `LightningIndexer` its own dtype.
+  `kv_row_align_ok` holds every compressed row to the 32-element blocks, and
+  TurboQuant's 128-element groups are now held to every compressed row too
+  (`kv_turbo_align_ok`). No quantized KV format has been run on a V4 file (§
+  below on the rotation).
 - **GPU backends.** A compressed layer on Vulkan or Metal is refused by name
   (`gpu_synthetic_deepseek4_refuses_a_compressed_layer_on_vulkan`). Nothing in
   the HCA graph has been run on a GPU: `Op::GatherRows`, `Op::CompressPool`,
   `Op::EmbedGather` over an f32 APE table, the ring persisted by `Op::Copy` into
   an f32 Input, and the two-segment attention all exist on Vulkan, but no
   GPU-vs-CPU test of the whole tier exists (plan 09 S9).
-- **More than one token per graph.** The emit is written for any token count and
-  `hca_compressor_rows_match_their_definition_in_any_graphs` runs it at 50 and
-  150 tokens per graph on the compressor alone, but the runner feeds V4 one
-  token per graph (batched prefill excludes it), so a multi-token V4 graph has
-  never run end to end.
+- **More than one token per graph.** The emit is written for any token count,
+  and the stand-alone tests in `seam/dsv4_emit/tests/compressor.rs` run both
+  tiers' compressors and the CSA indexer in graphs of up to 150 tokens, but the
+  runner feeds V4 one token per graph (batched prefill excludes it), so a
+  multi-token V4 graph has never run end to end, and no prefill-in-one-graph
+  against token-by-token comparison exists (plan 09 "Notes for S6 and S7").
 - **Quantized KV caches round differently from llama.cpp's.** At a quantized
   `type_k` with a head width divisible by 64 (q8_0, q4_0 on V4-Flash's 512),
   llama.cpp's `llama_kv_cache` rotates q, the raw row, the compressed row and
@@ -1253,7 +1254,8 @@ tier", plan 09 § "S5 and S6" for the numbers and the breaks). What is left:
   ring is an f32 Input mutated by `Op::Copy`, so the interpreter loads it whole
   and writes it back after each graph (`infr_core::exec::writes_back`): 512 KiB
   per HCA layer at V4-Flash's head width, both ways, per token. Not measured
-  against the rest of a V4 decode step.
+  against the rest of a V4 decode step. A CSA layer has two rings (8 rows of
+  1024 and of 256 f32 on V4-Flash, kv and score), a far smaller round trip.
 - **Per-step inputs are allocated per step.** `upload_step_i32` allocates and
   uploads one small staging buffer per V4 compressor input per graph; a decode
   that kept them across steps would save the allocations. Not measured.
@@ -1417,6 +1419,40 @@ and parity-tested on CPU + Vulkan (and typechecked on Metal). What is left:
   a real V4 GGUF turns out to use a small eps, a backend that dropped the
   over-dst eps would pass every test here. Same blocker: the real file's eps.
 
+### B-DSV4-CPU-PERF — the CPU CSA tier computes what the top-k throws away (2026-11-16)
+
+**Tag:** deepseek · performance · **Blocked on:** nothing; the next slice after
+plan 09 S7 (plan 09 § 5)
+
+Two findings of the S7 review, read in the code, **not measured**. The numbers
+are arithmetic at V4-Flash's geometry (21 CSA layers, 64 heads of 512, indexer
+64 heads × 128, `top_k` 512) at a 64k context, so 16 384 visible blocks per CSA
+layer:
+
+- **`Op::Attention` with `comp` scores every visible block, then masks.** The
+  CPU arm (`infr-cpu`'s `Op::Attention`, the `comp` branch) takes a full `q·k`
+  dot and a full value accumulate for every one of the segment's `len` blocks
+  and adds the top-k bias afterwards, so a block the bias sets to `-inf` still
+  costs both. Per token that is about 64 × 16 384 × (512 + 512) × 21 ≈ 22 G
+  multiply-adds, against about 0.7 G for the 512 kept blocks alone, and it grows
+  linearly with the context. It also dequantizes the whole `len × head_dim`
+  compressed prefix into a fresh f32 `Vec` per layer per step (8.4 M values per
+  CSA layer here). llama.cpp's CPU flash attention skips a `-inf` mask entry
+  before the dot (`ggml_compute_forward_flash_attn_ext_f16_one_chunk`). Fix
+  candidates: skip `-inf` bias entries in the dot and the accumulate, or gather
+  the kept blocks (the indexer's indices) and attend those only; convert per key
+  rather than the whole prefix.
+- **`Op::LightningIndexer` on the CPU is one task per query row**
+  (`for_chunks_mut` over the `[rows, top_k]` output), so a decode step (one row)
+  scores all 16 384 blocks × 64 heads × 128 on one core, and it selects by
+  repeated linear scan, O(`top_k` · `kv_len`) per row (512 × 16 384 ≈ 8.4 M
+  comparisons per CSA layer per token). Fix candidates: split the scoring of one
+  row across keys; select with a partial sort or a heap, keeping the lower-index
+  tie rule.
+
+Measure both against `llama-bench` before and after, at a long context, on a
+file that fits (the synthetic one scaled up, or the real file under a watchdog).
+
 ### B-DSV4-POOL — what `Op::CompressPool` does NOT cover yet (2026-08-13)
 
 **Tag:** deepseek · vulkan · metal · **Blocked on:** nothing; scoped out of the
@@ -1532,9 +1568,9 @@ is left:
   reduction with an `n_used`-element copy, so it can only be faster; also not
   measured.
 
-### B-DSV4-REAL — the shipped V4 file now needs ONLY the compressed tiers (2026-08-13)
+### B-DSV4-REAL — the shipped V4 file has not been run; its numbers are unverified (2026-08-13)
 
-**Tag:** deepseek · **Blocked on:** B-DSV4-WIRING slice B
+**Tag:** deepseek · **Blocked on:** a run that fits this machine (plan 09 S8)
 
 Measured from `ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S` (`block_count = 43`,
 `hash_layer_count = 3`, `compress_ratios` = `[0, 0, 4, 128, 4, 128, …, 4]` over
@@ -1543,35 +1579,25 @@ ratio-0 and bias-routed.** Layers 0 and 1 are the only ratio-0 layers and both
 are hash-routed; layers 2..42 are all compressed (alternating 4/128), and layer
 2 is compressed AND hash-routed.
 
-Hash routing landed on 2026-08-13 (§ B-DSV4-HASH), so layers 0 and 1 — 2 of the
-43 — are now fully covered, and **the only thing between this checkpoint and a
-forward pass is B-DSV4-WIRING slice B**, the compressed (ratio 4/128) tiers, of
-which ratio 128 runs on the CPU since plan 09 S6 and ratio 4 (S7) is left. That
-is also the only refusal left in `generate_dense_backend` for this file on the
-CPU: `arch=deepseek4 … layer 2 has compress_ratio 4`.
+Since plan 09 S7 (2026-11-16) every tier this file uses generates on the CPU, so
+`generate_dense_backend` should no longer refuse it there; that is inferred from
+its metadata and the synthetic fixtures, not run, and some refusals sit after
+the weight upload and depend on the file's tensors. On Vulkan and Metal its
+first compressed layer is refused by name. **The file has not been run since the
+CSA refusal was lifted:** a forward pass pages 98.6 GB of weights through a 64
+GB machine, which is left to a run under a watchdog. Its metadata was re-read
+for S7 (from the 5 MB first shard only) and gives the geometry
+`kv_footprint_of_deepseek4_flash_counts_its_compressed_tiers` prices: head 512
+with a 64-dim rope, indexer 64 heads × 128 with `top_k` 512, window 128,
+`compress_rope_freq_base` 160000, YaRN factor 16 over 65536.
 
-What is NOT established by this entry: any NUMBER the graph computes on a real
-file. The refusal still fires before the first forward pass, so what has been
-verified against the real GGUF is names, shapes and the two hash-routing
-prerequisites (an i32 `blk.{0,1,2}.ffn_gate_tid2eid.weight` of shape
-`[6, 129280]` = `[n_expert_used, vocab]`, which is exactly what the new shape
-check demands) — nothing about its logits. The hash-routing correctness evidence
-is the synthetic fixture and the op-level parity tests, on CPU and Vulkan.
-
-Verified by running `infr run` against the file on the CPU backend (2026-08-12):
-config parses, `wload` resolves every tensor, and the refusal is reached. NOT
-re-run after the hash slice or after the HCA tier (plan 09 S6, 2026-11-16): the
-refusal still fires at layer 2, now as
-`layer 2 has compress_ratio 4: the CSA tier does not generate yet`, so the
-observable would not have moved. Since S6 the file's 20 HCA layers would
-generate on the CPU; its 21 CSA layers are the whole of what stands between it
-and a forward pass.
-
-Since 2026-11-16 the ratio-0 graph's numbers ARE established against llama.cpp,
-on a synthetic file (§ B-DSV4-ORACLE), at the real file's hyper-connection count
-and with its YaRN keys. That says the emit computes what the reference computes;
-it still says nothing about this file's logits, which need the compressed tiers
-and a machine (or a smaller quant) llama.cpp can load it on.
+What is NOT established: any NUMBER the graph computes on this file. The
+synthetic oracle (§ B-DSV4-ORACLE) says the emit computes what llama.cpp
+computes on small files at this file's hyper-connection count and YaRN keys; it
+says nothing about the quantized weights, the 64-head indexer at `top_k` 512
+past 2051 tokens, or long-context top-k selection, and llama.cpp cannot load
+this file on this machine (plan 09 § 4). Verified earlier against the real file:
+names, shapes, `Config::from_gguf`, `wload` and the hash-routing table's shape.
 
 ### B-DSV4-ORACLE — llama.cpp over the synthetic V4 file: what it covers and what it does not (2026-11-16)
 
@@ -1588,10 +1614,32 @@ numbers. Open items:
   Reporting them is the user's call; the oracle works around the first with a
   null ratio-4 tail layer (`OracleCase::null_tail`), which is exact only while
   `attn_output_b` multiplies a finite attention output.
-- **`hca` is scored in CI since plan 09 S6**
-  (`synthetic_dsv4_hca_cpu_matches_llama_cpp`, max |logit diff| 4.49e-5 at 520
-  tokens), with no bisect needed; its sums file stayed unused. `mixed` and `csa`
-  wait for S7.
+- **Every case is scored in CI** since plan 09 S7 (`ratio0`, `hca`, `mixed`,
+  `csa`; max |logit diff| at most 1.6e-4 at any stored length). `csa`'s first
+  data (4 indexer heads) missed by 3.4e-3 at 131 tokens; the bisect found exact
+  zero-score ties at the top-k boundary, broken differently by llama.cpp's
+  `std::partial_sort` and infr's lower-index rule, which no weight noise can
+  expose. `csa` now has 16 indexer heads and another prompt (`prompt_salt` 6).
+  The robustness check still cannot see an exact tie; the 16 heads make one
+  improbable (all 16 dots negative), and for the checked-in data infr's own
+  scores showed none, measured once by hand with a temporary dump.
+- **Skipping the Hadamard rotation of the LID keys flips 2 of 432 selections**
+  on the `csa` run (positions 111 and 122, last layer, margins 1.2e-4 and 1.8e-4
+  in infr's scores; a temporary rotation in infr made every selection agree).
+  Neither reaches a stored logit. On V4-Flash, f16-scale near-ties will choose
+  differently from llama.cpp at a comparable rate. **Decision for the user:**
+  port the rotation (a 128 × 128 orthonormal multiply on each LID row and each
+  indexer query head, 64 heads × 128² multiply-adds per token per CSA layer on
+  V4-Flash) for selection-level agreement, or keep the unrotated keys, which are
+  equally correct in exact arithmetic. Not done: S7 kept the plan's choice.
+- **Selection agreement is checked in CI only on the stored runs**
+  (`synthetic_dsv4_indexer_keeps_what_llama_cpp_keeps`: every row of the `csa`
+  131-token and `mixed` 300-token one-token-per-step runs). The near-tie guard
+  reads infr's scores, not llama.cpp's, because llama-debug prints only six
+  values of a score row; where the engines keep the same blocks the two agree to
+  f32 rounding, but a near-tie llama.cpp has and infr does not would pass it.
+  `mixed`'s selection is `all` at every row by construction (its `top_k` is at
+  least the padded width), so it checks only that infr keeps every block there.
 - **Only the CPU backend is scored against llama.cpp.** Vulkan's ratio-0 emit is
   checked against infr's own CPU (`gpu_synthetic_deepseek4_ratio0_matches_cpu`,
   at `hc_mult = 2`), not against the oracle data; a `prefill_logits_vulkan` twin
@@ -1610,16 +1658,12 @@ numbers. Open items:
 - **The indexer's top-k is oracle-checked only up to 131 tokens, on one case
   (`csa`).** Longer prompts with a biting `top_k` always held a near-tie that
   ±1e-3 noise on the indexer weights flips (40 prompt sequences tried at 300
-  tokens, 30 at 520; plan 09 section 4). Covering long-context selection needs a
-  fixture whose indexer scores are decisive by construction (for example keys
-  with a few strongly separated levels) rather than random; not attempted. The
-  robustness check is by perturbation, not by reading the score gaps, which
-  `llama-debug` prints only as the first and last three values of each row.
-- **S7's indexer precision is argued, not measured:** infr's planned unrotated
-  f16 LID keys round differently from llama.cpp's Hadamard-rotated ones (plan 09
-  section 4). The stored biting points survive ±1e-3 weight noise, so they are
-  expected to keep their selection under that difference; S7's comparison is the
-  measurement.
+  tokens, 30 at 520; plan 09 section 4; at 4 indexer heads). Covering
+  long-context selection needs a fixture whose indexer scores are decisive by
+  construction (for example keys with a few strongly separated levels) rather
+  than random; not attempted. The robustness check is by perturbation, not by
+  reading the score gaps, which `llama-debug` prints only as the first and last
+  three values of each row.
 
 ### B-GGUF-META-IGNORED — GGUF keys infr still does not apply (2026-11-12)
 

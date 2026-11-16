@@ -270,8 +270,8 @@ pub struct Config {
     /// is_swa_layer`] special-cases this arch for that reason: `swa_pattern` encodes "every p-th
     /// layer is FULL", and V4 has no full layers to point at.
     ///
-    /// `seam::runner::generate_dense_backend` emits ratio-0 and ratio-128 layers and refuses a
-    /// ratio-4 layer by name.
+    /// `seam::runner::generate_dense_backend` emits every tier; the compressed ones (ratio 4 and
+    /// 128) on the CPU backend only.
     pub deepseek4: bool,
     /// DeepSeek V4 (`{arch}.attention.compress_ratios`): the per-layer compression ratio, and the
     /// MASTER per-layer switch — which caches a layer keeps and which tensors it carries both hang
@@ -477,7 +477,7 @@ impl Config {
 
     /// deepseek4: the per-pair rope frequency divisors (`rope_dim / 2` floats) of every rope on a
     /// COMPRESSED layer (ratio 4 or 128), at base [`Config::compress_rope_theta`]. `None` for
-    /// every other arch. The HCA emit applies it through `Op::Rope::freq_factors` (the runner's
+    /// every other arch. The compressed-layer emit applies it through `Op::Rope::freq_factors` (the runner's
     /// `yarn_ff` Input); ratio-0 layers rope plain at [`Config::rope_theta`] (`deepseek4.cpp`
     /// passes them `freq_scale = 1` and `ext_factor = 0`).
     ///

@@ -251,15 +251,7 @@ pub(super) struct Dsv4CompW {
 
 /// A ratio-4 V4 layer's lightning indexer: its query and weight projections, and the compressor
 /// that writes its key cache (`kv_lid`). V4's indexer has no `attn_k` and no `k_norm`, unlike
-/// V3.2's [`IndexerW`].
-///
-/// Declared so the graph builder consumes a ratio-4 layer's upload slots in `wload`'s order; the
-/// CSA emit (plan 09 S7) is its first reader. Until then `generate_dense_backend` refuses a
-/// ratio-4 layer before any graph is built, and the `expect` fails the build once S7 reads it.
-#[expect(
-    dead_code,
-    reason = "the CSA emit (plan 09 S7) is the first reader; ratio 4 is refused until then"
-)]
+/// V3.2's [`IndexerW`]. The CSA emit (`super::dsv4_emit`) reads it.
 pub(super) struct Dsv4IndexerW {
     /// `indexer.proj.weight` `[n_embd, indexer_n_head]`.
     pub(super) proj: TensorId,

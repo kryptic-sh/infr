@@ -119,10 +119,9 @@ pub const DEEPSEEK32: &str = "deepseek32";
 /// Every layer is sliding-window (`set_swa_pattern(0)`), and there are no dense-lead layers and no
 /// NextN. llama.cpp keeps it in its own model class (`src/models/deepseek4.cpp`).
 ///
-/// The load path is complete — config, every tensor. A file whose `attention.compress_ratios` are
-/// all 0 or 128 (the pure sliding-window tier and the HCA tier) generates, the HCA tier on the CPU
-/// backend only; a layer with ratio 4 is refused by name in `generate_dense_backend`, since the
-/// CSA tier is not implemented. See docs/deepseek.md § Stage 4.
+/// The load path is complete — config, every tensor — and every tier generates: the pure
+/// sliding-window one on CPU and Vulkan, the compressed ones (ratio 4, CSA with the lightning
+/// indexer; ratio 128, HCA) on the CPU backend only. See docs/deepseek.md § Stage 4.
 pub const DEEPSEEK4: &str = "deepseek4";
 /// Microsoft's official BitNet-b1.58 GGUFs (`microsoft/bitnet-b1.58-2B-4T-gguf`) declare
 /// `general.architecture = "bitnet-b1.58"` and prefix EVERY metadata key with it

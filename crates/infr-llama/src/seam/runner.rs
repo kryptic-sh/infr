@@ -412,9 +412,12 @@ fn upload_step_i32(be: &dyn Backend, h: &DecodeHandles) -> AResult<Vec<Box<dyn B
 /// only once its block is committed — the segment's `len` is the graph's widest visible count and
 /// the attention masks each query row to its own `(pos+1)/ratio` — and a block pools only the
 /// positions from its first to the one that completes it, every one written earlier in the
-/// sequence (through the ring) or by this graph (its own rows). HCA reads no position below 0, so
-/// the gather fill is never used. Zeroing a cache would cost a context-sized upload for
-/// nothing; zeroing the rings is cheap and makes a reset session's state equal a fresh one's.
+/// sequence (through the ring) or by this graph (its own rows). A position below 0 is not read
+/// from any buffer: HCA reads none, and the overlapping CSA and LID compressors read block 0's
+/// previous window as the sentinel, which `Op::GatherRows` writes from its fill (value 0, score
+/// `-inf`) for a negative index, so no ring row stands in for it. Zeroing a cache would cost a
+/// context-sized upload for nothing; zeroing the rings is cheap and makes a reset session's state
+/// equal a fresh one's.
 fn zero_unrewindable_state(
     be: &dyn Backend,
     c: &Config,
@@ -673,9 +676,9 @@ pub(crate) fn generate_dense_backend_bound(
     let kv_align_ok = crate::seam::kv_row_align_ok(c);
     let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
     // TurboQuant (turbo2/3/4): CPU + Vulkan + Metal (both GPUs use a dequant→f16 prepass); needs
-    // head_dim % 128 (a WHT group is a 128-elem head_dim slice).
-    let kv_turbo_ok = matches!(be.name(), "cpu" | "vulkan" | "metal")
-        && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
+    // whole 128-element WHT groups in every cache row (`crate::seam::kv_turbo_align_ok`).
+    let kv_turbo_ok =
+        matches!(be.name(), "cpu" | "vulkan" | "metal") && crate::seam::kv_turbo_align_ok(c);
     // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan + Metal; need 32-block alignment.
     let blk_ok = matches!(be.name(), "cpu" | "vulkan" | "metal") && kv_align_ok;
     // Dense f32/bf16 KV: CPU + Vulkan + Metal. Metal reads f32 natively (see the mixed-format clamp
@@ -1772,27 +1775,28 @@ pub(crate) fn generate_dense_backend_bound(
         && caps.gpu_sample
         && ec.spec.gpu_sample;
 
-    // DeepSeek V4: the `compress_ratio == 0` tier and the ratio-128 (HCA) tier emit
-    // (hyper-connections, MQA attention with sinks and the grouped output projection, the HCA
-    // compressor and its two-segment attention, MoE with the per-layer SwiGLU clamp under EITHER
-    // routing — the router bias, or the `ffn_gate_tid2eid` hash table). What is left below is the
-    // CSA tier and the compressed tiers on a GPU, refused by name rather than approximated because
-    // they would otherwise run and produce plausible wrong numbers, plus the shape facts the emit
-    // assumes. Placed after the weight upload on purpose, exactly as the deepseek32 slice was: a
-    // `deepseek4` GGUF still gets every tensor it declares validated end to end. See
+    // DeepSeek V4: every tier emits (hyper-connections, MQA attention with sinks and the grouped
+    // output projection, the HCA and CSA compressors with the CSA tier's lightning indexer and the
+    // two-segment attention, MoE with the per-layer SwiGLU clamp under EITHER routing — the router
+    // bias, or the `ffn_gate_tid2eid` hash table); a compressed layer on a GPU is refused above.
+    // What is left below is the shape facts the emit assumes, refused by name rather than run into
+    // plausible wrong numbers. Placed after the weight upload on purpose, exactly as the deepseek32
+    // slice was: a `deepseek4` GGUF still gets every tensor it declares validated end to end. See
     // docs/deepseek.md § Stage 4.
     if c.deepseek4 {
-        // Ratio 4: the overlapping CSA compressor, the lightning indexer and its LID cache are not
-        // emitted yet (docs/plan/09-deepseek-v4-compressed.md slice S7). Naming the layer, because
-        // a real V4 file mixes tiers and "which layer" is the first thing to know.
+        // The lightning indexer of a ratio-4 layer ropes the same `rope_dim` tail of its heads as
+        // every other head of the layer (`build_lid_top_k`'s `n_rot()`), so its key must be at
+        // least that wide. (`Config::from_gguf` refuses a zero head count, key width or top_k.)
         if let Some(l) = (0..c.n_layer).find(|&l| c.layer_compress_ratio(l) == 4) {
-            return Err(anyhow!(
-                "arch=deepseek4 (DeepSeek V4) layer {l} has compress_ratio 4: the CSA tier does \
-                 not generate yet. It needs the overlapping CSA compressor over blocks of 4 \
-                 tokens and the lightning indexer with its own compressor + LID cache; ratio-0 \
-                 and ratio-128 (HCA) layers generate, on the CPU backend. See docs/deepseek.md § \
-                 Stage 4."
-            ));
+            if c.indexer_head_size < c.rope_dim {
+                return Err(anyhow!(
+                    "arch=deepseek4 (DeepSeek V4) layer {l} has compress_ratio 4, but the \
+                     lightning indexer's attention.indexer.key_length {} is narrower than \
+                     rope.dimension_count {}, the tail every head of a compressed layer ropes.",
+                    c.indexer_head_size,
+                    c.rope_dim,
+                ));
+            }
         }
         // Hash-routed layers: `Op::GatherI32` reads the token's row of `ffn_gate_tid2eid` and
         // `Op::MoeFfn::expert_ids` runs those experts. Two things the emit assumes and the file
@@ -2043,21 +2047,20 @@ pub(crate) fn generate_dense_backend_bound(
             })
             .collect();
         // The compressor plan of this graph's positions, per tier, with the per-step inputs it
-        // declares (`super::dsv4_emit::Dsv4Tier`). One per graph: every layer of a tier shares
-        // the positions, so it shares the plan, the inputs and the scratch.
+        // declares (`super::dsv4_emit::Dsv4Tiers`).
         let mut step_i32: Vec<(TensorId, Vec<i32>)> = Vec::new();
-        let hca_tier = (l_first..l_end)
-            .find(|&l| c.layer_compress_ratio(l) == super::dsv4_plan::DSV4_HCA_RATIO as usize)
-            .map(|l| {
-                super::dsv4_emit::Dsv4Tier::hca(
-                    &mut g,
-                    c,
-                    start_pos,
-                    batch,
-                    &crate::seam::dsv4_comp_bufs(c, l, max_ctx, k_fmt),
-                    &mut step_i32,
-                )
-            });
+        let dsv4_tiers = c.deepseek4.then(|| {
+            super::dsv4_emit::Dsv4Tiers::new(
+                &mut g,
+                c,
+                l_first..l_end,
+                start_pos,
+                batch,
+                max_ctx,
+                k_fmt,
+                &mut step_i32,
+            )
+        });
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from
         // `wspecs` so each handle carries its native GGUF dtype (the backend dequants on read).
@@ -3220,8 +3223,9 @@ pub(crate) fn generate_dense_backend_bound(
                 // ── DeepSeek V4 attention ─────────────────────────────────────────────────────
                 // `docs/deepseek.md` § Stage 4. A ratio-0 layer is pure sliding window; a ratio-128
                 // (HCA) layer adds its compressor between the raw cache write and the attention,
-                // and attends its compressed cache beside the raw window. Ratio 4 was refused
-                // before the graph was built.
+                // and attends its compressed cache beside the raw window; a ratio-4 (CSA) layer
+                // adds two compressors and the lightning indexer, and attends the CSA rows the
+                // indexer keeps.
                 let hd4 = c.head_dim as u32; // MQA: one KV head of this width serves every q head
                 let rd = c.rope_dim as u32;
                 let qrow4 = (nh as u32) * hd4;
@@ -3318,18 +3322,25 @@ pub(crate) fn generate_dense_backend_bound(
                     row_stride: hd4,
                     pos: start_pos as u32,
                 });
-                // An HCA layer's compressor commits every block this graph completes BEFORE the
-                // attention below, so the token that completes a block attends it.
+                // A compressed layer's compressors commit every block this graph completes BEFORE
+                // the attention below, so the token that completes a block attends it.
                 let comp_seg = mw.comp.as_ref().and_then(|cw| {
-                    assert!(
-                        cw.indexer.is_none(),
-                        "a ratio-4 V4 layer reached the emit: the CSA tier is refused before the \
-                         graph is built"
-                    );
-                    hca_tier
+                    dsv4_tiers
                         .as_ref()
-                        .expect("an HCA layer's graph declares the HCA tier")
-                        .emit_hca(&mut g, &cw.attn, hn, ne as u32, &comp[l], rope4, eps)
+                        .expect("a V4 graph declares its compressed tiers")
+                        .emit(
+                            &mut g,
+                            c,
+                            cw,
+                            super::dsv4_emit::Dsv4LayerIn {
+                                x: hn,
+                                qr: d4_qa,
+                                positions,
+                            },
+                            &comp[l],
+                            rope4,
+                            eps,
+                        )
                 });
                 // The attention kernels read an **f16** q (`q16`), so the normed+roped f32 query is
                 // cast into it exactly as a NoPE layer casts its unroped one — `Op::Copy`,

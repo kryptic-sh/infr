@@ -20,18 +20,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- **DeepSeek V4's ratio-128 (HCA) layers generate on the CPU backend.** A
-  `deepseek4` file whose `compress_ratios` hold only 0 and 128 now runs: each
-  HCA layer pools every completed block of 128 positions into its compressed
-  cache (`attn_compressor_*`, a softmax over the block per channel, the norm,
-  the compressed-layer YaRN rope) and attends it beside the sliding window. On a
-  synthetic all-HCA file infr's CPU logits match llama.cpp's to within 4.5e-5
-  from 7 to 520 tokens. Such a session cannot rewind: a prompt that does not
-  extend the previous one exactly re-prefills from the start, as on qwen35. The
-  shipped DeepSeek-V4-Flash file is still refused, at its first ratio-4 (CSA)
-  layer, layer 2; a compressed V4 layer on Vulkan or Metal is refused by name.
-  Its compressed caches and compressor state are counted in the KV footprint,
-  the context fit and the `--ctx` clamp.
+- **DeepSeek V4 with compressed layers generates on the CPU backend.** Every
+  `deepseek4` layer tier now runs: a ratio-128 (HCA) layer pools every completed
+  block of 128 positions into its compressed cache (`attn_compressor_*`, a
+  softmax over the block per channel, the norm, the compressed-layer YaRN rope)
+  and attends it beside the sliding window; a ratio-4 (CSA) layer pools
+  overlapping windows of 8 positions into its own cache and, with
+  `indexer_compressor_*`, into the lightning indexer's key cache, and its
+  attention output weighs only the `attention.indexer.top_k` blocks the indexer
+  scores highest (the CPU still scores every visible block and masks the rest;
+  `docs/backlog.md` § B-DSV4-CPU-PERF). On synthetic files llama.cpp also runs,
+  infr's CPU logits match llama.cpp's to within 9.4e-5 at every stored length:
+  all-HCA and every-tier files from 7 to 520 tokens, and an all-CSA file from 7
+  to 131 tokens with a `top_k` of 5, so the top-k drops blocks; at every row of
+  those runs infr's indexer keeps the blocks llama.cpp keeps, but for two listed
+  f16-rounding near-ties. Not verified: the shipped DeepSeek-V4-Flash file has
+  never been run (it is larger than this machine's RAM); that it gets past every
+  refusal on the CPU is inferred from its metadata and the synthetic fixtures,
+  not run: some refusals sit after the weight upload and depend on the file's
+  tensors, and no oracle has checked its numbers; nor the top-k selection past
+  131 tokens. The compressed caches default to f16 on the CPU; a quantized KV
+  format applies only when asked for by name and is unverified against the
+  reference, which rotates those rows before quantizing them. Such a session
+  cannot rewind: a prompt that does not extend the previous one exactly
+  re-prefills from the start, as on qwen35. A compressed V4 layer on Vulkan or
+  Metal is refused by name, and V4's prefill runs one token per step. Its
+  compressed caches and compressor state are counted in the KV footprint, the
+  context fit and the `--ctx` clamp.
 
 - **`Op::GatherRows` — DeepSeek V4's compressor source gather — on CPU and
   Vulkan, with a Metal kernel.** Gathers f32 rows by i32 index, a column window
@@ -56,12 +71,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   decode replay); Metal refuses it. The indexer's `block_ratio` makes key `j`
   eligible iff `j < (p + 1) / block_ratio`, so it scores V4's LID blocks; 1 is
   V3.2's per-token rule. Every existing graph passes `comp: None` and
-  `block_ratio: 1` and computes the same bits. The HCA layer emits `comp`;
-  nothing emits a `block_ratio` other than 1 yet. `Op::Attention::key_bias` and
-  `Op::Mla::key_bias` must now be exactly `[rows, kv_len]` f32
-  (`infr_core::graph::check_score_bias`): a longer one was read at the wrong row
-  offset. `Op::LightningIndexer` and `Op::TopkMask` refuse `kv_len` or
-  `top_k` 0.
+  `block_ratio: 1` and computes the same bits. V4's compressed layers emit
+  `comp`, and its CSA layers the indexer at `block_ratio` 4.
+  `Op::Attention::key_bias` and `Op::Mla::key_bias` must now be exactly
+  `[rows, kv_len]` f32 (`infr_core::graph::check_score_bias`): a longer one was
+  read at the wrong row offset. `Op::LightningIndexer` and `Op::TopkMask` refuse
+  `kv_len` or `top_k` 0.
 
 - **`infr serve` honours `logit_bias` and `min_p`.** `logit_bias` (OpenAI: token
   id to a bias in -100..=100) is added to the logits before the penalties, as

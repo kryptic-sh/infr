@@ -1373,6 +1373,19 @@ pub(crate) fn kv_row_align_ok(cfg: &Config) -> bool {
     })
 }
 
+/// Layout half of the TurboQuant KV gate: every layer's cache row is whole 128-element groups
+/// (a WHT group is a 128-element slice of the row). A V4 compressed cache takes the raw cache's
+/// format, so its rows are held to it too, the LID cache's indexer-wide row among them.
+pub(crate) fn kv_turbo_align_ok(cfg: &Config) -> bool {
+    (0..cfg.n_layer).all(|l| {
+        let comp_ok = dsv4_comp_bufs(cfg, l, 1, DType::F32)
+            .iter()
+            .filter(|b| !b.ring)
+            .all(|b| b.elems.is_multiple_of(128));
+        cfg.layer_head_dim(l).is_multiple_of(128) && comp_ok
+    })
+}
+
 /// Whether a Q8_0 KV cache may be CHOSEN for this model: the rows are 32-block aligned
 /// ([`kv_row_align_ok`]) **and** the model is not MLA.
 ///
@@ -4638,6 +4651,28 @@ mod seam_helper_tests {
             DType::F16,
         );
         assert_eq!(floor.len(), 43 + 20 * 3 + 21 * 6);
+    }
+
+    /// TurboQuant's 128-element groups must tile every V4 cache row, the compressed ones too: a
+    /// V4-Flash geometry passes, and the same geometry with a 64-wide indexer (an LID row of half a
+    /// group) does not, though its raw head would.
+    #[test]
+    fn kv_turbo_layout_holds_deepseek4_compressed_rows() {
+        let cfg = |indexer_head_size| Config {
+            n_layer: 3,
+            head_dim: 512,
+            indexer_head_size,
+            compress_ratios: vec![0, 4, 128],
+            deepseek4: true,
+            ..Default::default()
+        };
+        assert!(super::kv_turbo_align_ok(&cfg(128)));
+        assert!(!super::kv_turbo_align_ok(&cfg(64)));
+        let ratio0 = Config {
+            compress_ratios: vec![0, 0, 0],
+            ..cfg(64)
+        };
+        assert!(super::kv_turbo_align_ok(&ratio0));
     }
 
     /// deepseek4 has no V cache, so a V format setting must not gate anything for it: not the SWA

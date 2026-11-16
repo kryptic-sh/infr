@@ -740,16 +740,24 @@ row's softmax max is finite and `exp(-inf - max)` is 0 exactly.
 
 ## Stage 4 — `deepseek4` (V4-Flash / V4-Pro)
 
-**Progress: a V4 model whose `compress_ratios` are 0 or 128 generates, under
-either routing.** The ratio-0 tier is emitted end to end and runs on CPU and
-Vulkan; the ratio-128 (HCA) tier runs on the CPU and matches llama.cpp there
-(see "The HCA tier" below); a compressed layer on a GPU backend, and ratio 4 on
-any backend, are refused by name. The shipped V4-Flash file therefore still
-stops at its first ratio-4 layer (layer 2). See "Slice A — ratio 0" below for
-what that covers, "Slice A2 — hash routing" for the `ffn_gate_tid2eid` gather,
-and `docs/backlog.md` § B-DSV4-WIRING for what slice B still owes. Note that no
-layer of the SHIPPED V4-Flash file is both ratio-0 and bias-routed — see
-`docs/backlog.md` § B-DSV4-REAL.
+**Progress: every V4 layer tier generates on the CPU backend, under either
+routing.** The ratio-0 tier is emitted end to end and runs on CPU and Vulkan;
+the ratio-128 (HCA) and ratio-4 (CSA) tiers run on the CPU and match llama.cpp
+there on synthetic files (see "The HCA tier" and "The CSA tier" below); a
+compressed layer on a GPU backend is refused by name. **What a V4 file needs to
+run now:** the CPU backend (`--dev cpu`), RAM for its weights (the shipped
+V4-Flash Q2_K_S is 98.6 GB, which this machine's 64 GB cannot hold; a run pages
+it from disk), and the patience for a per-token prefill. The shipped file has
+not been run: that it gets past every refusal on the CPU is inferred from its
+metadata and the synthetic fixtures, not run: some refusals sit after the weight
+upload and depend on the file's tensors, and no number it computes has been
+checked by any oracle. The compressed caches default to f16 (what the oracle
+checks); a quantized KV format is an explicit opt-in, unverified against the
+reference, which Hadamard-rotates those rows before quantizing them. See "Slice
+A — ratio 0" below for what that covers, "Slice A2 — hash routing" for the
+`ffn_gate_tid2eid` gather, and `docs/backlog.md` § B-DSV4-WIRING for what is
+left. Note that no layer of the SHIPPED V4-Flash file is both ratio-0 and
+bias-routed — see `docs/backlog.md` § B-DSV4-REAL.
 
 The 2026-08-10 read slice that preceded it was a read, not a port:
 `llama-kv-cache-dsv4.cpp` had never been read in full, which made this section's
@@ -819,8 +827,7 @@ Two things outside the emit had to move with it:
   correct) stayed exact and hid it.
 
 What ratio 0 does NOT cover: compressed layers. Ratio 128 has generated on the
-CPU since plan 09 S6 ("The HCA tier" below); ratio 4 is still refused rather
-than approximated.
+CPU since plan 09 S6 ("The HCA tier" below), ratio 4 since S7 ("The CSA tier").
 
 ### Slice A2 — hash routing end to end (2026-08-13)
 
@@ -1023,7 +1030,7 @@ llama.cpp at every stored length (max |logit diff| 1.85e-6 to 4.49e-5 from 7 to
 520 tokens, top-1 agreeing everywhere; plan 09 § S6 has the table).
 `synthetic_dsv4_hca_cpu_matches_llama_cpp` holds it at the ratio-0 bound in CI.
 
-**The emit** (`seam/dsv4_emit.rs`, called by the runner's V4 arm between the raw
+**The emit** (`seam/dsv4_emit/`, called by the runner's V4 arm between the raw
 cache write and the attention) follows `build_attention_impl`:
 
 - every rope of a compressed layer — query, raw kv row, the backward de-rope and
@@ -1059,11 +1066,10 @@ any.
 fork, reset and every estimate): per HCA layer the compressed cache
 (`ceil(ctx/128)` rows of `head_dim`, in the raw cache's format, which the CPU
 attention requires) and the ring (128 rows of `head_dim`, f32, kv and score);
-per CSA layer the CSA and LID caches and rings (8 rows of twice the width),
-allocated and declared already though nothing emits them. They live in
-`SeamKv::cbufs`, are forked with the slot, are priced in `kv_bytes_estimate_fmt`
-(so the VRAM/RAM fits and the `--ctx` clamp see them) and in the KV allocation
-guard, one entry each.
+per CSA layer the CSA and LID caches and rings (8 rows of twice the width). They
+live in `SeamKv::cbufs`, are forked with the slot, are priced in
+`kv_bytes_estimate_fmt` (so the VRAM/RAM fits and the `--ctx` clamp see them)
+and in the KV allocation guard, one entry each.
 
 **No partial rewind.** `Config::has_unrewindable_state` is true for a V4 file
 with a compressed layer, as for qwen35 and LFM3, and every caller that would
@@ -1078,10 +1084,12 @@ persisted — but every other turn resets first. Within the sequence a compresse
 row is read only once its block is committed (the segment's `len` is the graph's
 widest visible count, and the attention masks each row to its own
 `(pos+1)/ratio`), a block pools only positions from its first to the one that
-completes it, and HCA reads no position below 0, so the gather's fill is never
-used. That is why the reset zeroes the rings but not the compressed caches.
-Speculative verify, batched and layer-major prefill and the record-once tape
-never see V4 (MoE, or excluded by name).
+completes it, and a position below 0 is never read from a buffer (HCA reads
+none; the CSA and LID compressors read block 0's previous window as the
+sentinel, which the gather writes from its fill: value 0, score `-inf`). That is
+why the reset zeroes the rings but not the compressed caches. Speculative
+verify, batched and layer-major prefill and the record-once tape never see V4
+(MoE, or excluded by name).
 
 What the tests found when the code was broken on purpose (plan 09 § S6 has the
 full table): ropes at position 0 are the identity, so a wrong rope on compressed
@@ -1089,6 +1097,90 @@ rows is invisible until block 1 (the oracle catches it from 300 tokens, the
 compressor's from-definition test at once), and persisting before compressing is
 invisible when every graph holds one token — only the compressor test that feeds
 50- and 150-token graphs catches it.
+
+### The CSA tier (2026-11-16, plan 09 S7)
+
+A ratio-4 layer now runs on the CPU. On synthetic files llama.cpp runs, infr's
+CPU logits match llama.cpp's at every stored length: the every-tier `mixed` file
+from 7 to 520 tokens (at most 9.35e-5) and the all-CSA `csa` file from 7 to 131
+tokens at `top_k` 5 (at most 7.95e-5), where the indexer's top-k drops blocks
+from 24 tokens on. `synthetic_dsv4_csa_cpu_matches_llama_cpp` and
+`synthetic_dsv4_mixed_cpu_matches_llama_cpp` hold both at the ratio-0 bound in
+CI; plan 09 § S7 has the tables.
+
+**The emit** (`seam/dsv4_emit/`) shares the HCA tier's compressor
+(`Dsv4Tier::compress`) and runs it twice per CSA layer, with the overlapping
+window:
+
+- the CSA compressor at `head_dim` with `attn_compressor_*`, and the LID
+  compressor at `indexer_head_size` with `indexer_compressor_*`, each into its
+  own cache and ring, from one plan (the reference builds the two plans with
+  identical parameters, and the caches and rings have equal row counts);
+- a state row is twice the compressor's width: kv and score rows `kv·x` /
+  `gate·x + ape[pos % 4]`, both `2·width` wide, the APE added before anything
+  reads or persists them;
+- each block pools a window of 8 slots: its previous 4 positions' FIRST halves
+  (channels `[0, width)`), then its own 4 positions' SECOND halves (channels
+  `[width, 2·width)`), gathered by two `Op::GatherRows` into one window; a
+  position before the sequence start reads the sentinel (value 0, score `-inf`,
+  the gather's fill for the `-1` that `gather_read_idxs()` writes), so block 0
+  pools its own positions alone;
+- `Op::CompressPool` at window 8, the norm, the rope of the row's last
+  `rope_dim` dims at the block's first position (the reference's `n_rot()` is
+  the model's rope width for every head, the LID row's included: 64 of 128 on
+  V4-Flash, 16 of 128 on the oracle files), one `WriteKv` per cache;
+- the ring of 8 rows persisted after the commit has read it.
+
+Then, once some row of the graph sees a block (`n_visible_max > 0`):
+
+- the indexer query `indexer.attn_q_b · qr` (`qr` the normed low-rank query), no
+  norm, each head's tail roped at the token's position with the compressed-layer
+  rope; the per-head weights `indexer.proj · x`, scaled by
+  `1/sqrt(indexer_head_size · indexer_n_head)` inside `Op::LightningIndexer`;
+- `Op::LightningIndexer` over the LID cache with `block_ratio` 4,
+  `kv_len = n_visible_max` and `top_k = min(n_visible_max, index_topk)`, then
+  `Op::TopkMask` into the `[rows, len]` bias of the segment
+  `comp: Some { cache: CSA cache, len, ratio: 4, bias }`.
+
+While no block is visible the indexer, the mask and the segment are skipped (an
+all-masked compressed half adds nothing, and both ops refuse zero keys).
+
+**The Hadamard rotation is not ported.** llama.cpp rotates the LID row before
+storing it as f16, and the indexer query, by one orthonormal Walsh-Hadamard
+matrix (`llama_kv_cache` forces it on the LID cache, whose head width is the
+indexer's). In exact arithmetic it changes no score; it changes where the f16
+rounding of the stored row lands. Measured on the `csa` file over 131 tokens:
+with the rotation skipped, 2 of the 432 rows where the top-k drops blocks keep a
+different block than llama.cpp (both in the last layer, at positions 111 and
+122, with infr's kept-versus-dropped margins 1.2e-4 and 1.8e-4); a temporary
+rotation in infr made all 432 agree. Neither flip reaches the stored logits (a
+last-layer selection at an earlier position feeds nothing the last position
+reads). Porting the rotation is in `docs/backlog.md` § B-DSV4-ORACLE. Every
+row's selection is compared with llama.cpp's in CI
+(`synthetic_dsv4_indexer_keeps_what_llama_cpp_keeps`, reading infr's through
+`infr_cpu::indexer_tap`), those two rows listed as near-ties with their margins;
+the regenerator refuses data with any other row whose kept and dropped scores
+tie or come within 1e-3 relative.
+
+**Exact-zero indexer scores are an implementation-defined tie.** A block scores
+exactly 0 when every indexer head's dot with it is negative (the ReLU), which
+with the canonical fixture's 4 indexer heads happens to one block in sixteen;
+two such blocks competing for the last kept slot are a tie that llama.cpp breaks
+by `std::partial_sort`'s order and infr toward the lower index. On the first
+`csa` file this moved 9 selections in 131 tokens and, through them, the logits
+by 3.4e-3. No weight noise can expose it (a negative dot stays negative), so the
+regenerator's robustness check could not see it. The `csa` oracle file now has
+16 indexer heads (the real file has 64), which left no exact zero among the
+scores that decide a selection over the whole run.
+
+**What breaking it showed** (plan 09 § S7 has the full table): every break of
+the emit turned a test red except three that are equivalent to the correct code
+by construction (the window's slot order, which the per-channel softmax ignores;
+a nonzero sentinel value, which a `-inf` score weighs 0; the indexer weight
+scale, which keeps the order). Two are visible only in graphs of several tokens,
+which the runner never builds for V4 (`block_ratio` 1 in the indexer, and
+persisting before compressing); the stand-alone tests in
+`seam/dsv4_emit/tests/compressor.rs` hold them.
 
 ### `compress_ratio` is the master per-layer switch
 

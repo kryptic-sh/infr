@@ -1640,40 +1640,49 @@ fn argmax(v: &[f32]) -> usize {
 // to develop against and this is the only place the arch is exercised at all: `Config::from_gguf`'s
 // `deepseek4` block and `wload`'s `is_dsv4` arm, driven off a real file through the real loader.
 //
-// Every run below ends at `generate_dense_backend`'s refusal rather than in logits — which is what
-// makes the refusal itself testable, and what makes the load path testable THROUGH it: `wload`
-// walks every tensor before the refusal fires, so "the complete fixture reaches the refusal" and
-// "the fixture minus any one tensor does not" together say the loader consumed all of them.
+// The canonical fixture covers every tier, and every tier generates on the CPU, so "the complete
+// fixture generates" and "the fixture minus any one tensor is refused naming it" together say the
+// loader consumed all of them.
 
 /// The canonical `deepseek4` fixture.
 fn deepseek4_model() -> SyntheticModel {
     dsv4_model(&dsv4_dims())
 }
 
-/// The refusal `generate_dense_backend` returns for a V4 model with a ratio-4 (CSA) layer — the
-/// canonical fixture's first blocker. Keyed on the invariant half of the message: which tier does
-/// not generate. The layer index is in the other half, and the tests that care about it assert it
-/// separately.
-const DSV4_REFUSAL: &str = "has compress_ratio 4: the CSA tier does not generate yet";
-
-/// The error a `deepseek4` fixture fails with, from EITHER the model load or the prefill, as a full
-/// `{:#}` chain. Both are damage sites for this arch — a missing `token_embd` is refused by
-/// `SeamModel::load_with` and a missing `blk.2.attn_kv` by `wload` inside the prefill — and a sweep
-/// over "remove any one tensor" has to catch both without pre-judging which.
-fn dsv4_err(tag: &str, m: &SyntheticModel) -> String {
+/// What a `deepseek4` fixture's CPU prefill of [`PROMPT`] comes to: its logits, or the error it
+/// fails with, from EITHER the model load or the prefill, as a full `{:#}` chain. Both are damage
+/// sites for this arch — a missing `token_embd` is refused by `SeamModel::load_with` and a missing
+/// `blk.2.attn_kv` by `wload` inside the prefill — and a sweep over "remove any one tensor" has to
+/// catch both without pre-judging which.
+fn dsv4_run(tag: &str, m: &SyntheticModel) -> Result<Vec<f32>, String> {
     let tmp = TempGguf::write(tag, m);
-    let model = match infr_llama::SeamModel::load_with(
+    let model = infr_llama::SeamModel::load_with(
         tmp.path(),
         None,
         std::sync::Arc::new(infr_llama::EngineConfig::default()),
-    ) {
-        Ok(model) => model,
-        Err(e) => return format!("{e:#}"),
-    };
-    match model.prefill_logits_cpu(PROMPT) {
+    )
+    .map_err(|e| format!("{e:#}"))?;
+    model
+        .prefill_logits_cpu(PROMPT)
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// [`dsv4_run`]'s error, for a fixture that must be refused.
+fn dsv4_err(tag: &str, m: &SyntheticModel) -> String {
+    match dsv4_run(tag, m) {
         Ok(logits) => panic!("this fixture must be refused, but it produced logits: {logits:?}"),
-        Err(e) => format!("{e:#}"),
+        Err(e) => e,
     }
+}
+
+/// [`dsv4_run`]'s logits, for a fixture that must generate: finite ones.
+fn dsv4_generates(tag: &str, m: &SyntheticModel) -> Vec<f32> {
+    let logits = dsv4_run(tag, m).unwrap_or_else(|e| panic!("this fixture must generate: {e}"));
+    assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "non-finite logits: {logits:?}"
+    );
+    logits
 }
 
 /// Every gate boolean and every derived value of a `deepseek4` config — including, first, the three
@@ -1873,21 +1882,14 @@ fn synthetic_deepseek4_routing_table_is_i32_on_disk() {
 ///
 /// Not "every tensor of a list written down twice": the sweep is over the FIXTURE's own tensor
 /// list, so a tensor the builder emits and `wload` never asks for fails here, and so does the
-/// reverse. Because `wload` runs to completion before the graph-build refusal, the complete model's
-/// error IS the refusal — anything else means the load stopped early.
+/// reverse. The complete model generates; with any tensor removed the load must fail naming it.
 ///
 /// The fixture's five layers cover every (compress_ratio, routing) pair (see [`dsv4_dims`]), so the
 /// per-layer switch is exercised in both directions: a loader that skipped the ratio-4 indexer set
 /// or that asked for `exp_probs_b` on a hash layer fails on those layers' tensors specifically.
 #[test]
 fn synthetic_deepseek4_load_consumes_every_tensor() {
-    let complete = dsv4_err("ds4-complete", &deepseek4_model());
-    println!("deepseek4 complete: {complete}");
-    assert!(
-        complete.contains(DSV4_REFUSAL),
-        "a complete deepseek4 model must load every tensor and then refuse at the graph build, \
-         got: {complete}"
-    );
+    dsv4_generates("ds4-complete", &deepseek4_model());
 
     let names: Vec<String> = deepseek4_model()
         .tensors
@@ -1902,24 +1904,21 @@ fn synthetic_deepseek4_load_consumes_every_tensor() {
     for name in &names {
         // `output.weight` is the one tensor whose absence is not damage: `wload` falls back to the
         // (tied) `token_embd.weight` for the LM head, exactly as it does for every tied model. Its
-        // removal must therefore still reach the refusal — asserting that, rather than skipping it,
-        // keeps the sweep exhaustive.
+        // removal must therefore still generate — asserting that, rather than skipping it, keeps
+        // the sweep exhaustive.
         let tag = format!("ds4-no-{}", name.replace('.', "-"));
-        let err = dsv4_err(&tag, &without_tensor(deepseek4_model(), name));
+        let m = without_tensor(deepseek4_model(), name);
         if name == "output.weight" {
-            assert!(
-                err.contains(DSV4_REFUSAL),
-                "an untied lm_head is optional (tied fallback), got: {err}"
-            );
+            dsv4_generates(&tag, &m);
             continue;
         }
+        let err = match dsv4_run(&tag, &m) {
+            Ok(_) => panic!("removing {name} still generated: nothing asked for it"),
+            Err(e) => e,
+        };
         assert!(
             err.contains(name.as_str()),
             "removing {name} must fail the load naming it, got: {err}"
-        );
-        assert!(
-            !err.contains(DSV4_REFUSAL),
-            "removing {name} reached the graph-build refusal — nothing asked for it: {err}"
         );
     }
 }
@@ -2013,10 +2012,10 @@ fn synthetic_deepseek4_accepts_a_three_d_output_projection() {
             ];
         }
     }
-    let err = dsv4_err("ds4-wo-a-3d", &m);
-    assert!(
-        err.contains(DSV4_REFUSAL),
-        "a 3-D attn_output_a must load and reach the graph-build refusal, got: {err}"
+    // The same bytes, so the same logits as the 2-D form.
+    assert_eq!(
+        dsv4_generates("ds4-wo-a-3d", &m),
+        dsv4_generates("ds4-wo-a-2d", &deepseek4_model())
     );
 }
 
@@ -2089,7 +2088,7 @@ fn synthetic_deepseek4_compress_ratio_picks_the_layer_tensor_set() {
         "a ratio-128 compressor under a ratio-4 label must be refused at its width, got: {err}"
     );
     // And the converse: relabel a ratio-4 layer as 0 and its indexer set is no longer asked for, so
-    // the load runs to the refusal even though those tensors are still sitting in the file unread.
+    // the model generates even though those tensors are still sitting in the file unread.
     let mut ratios = base.compress_ratios.clone();
     ratios[1] = 0;
     let mut m = deepseek4_model();
@@ -2098,12 +2097,7 @@ fn synthetic_deepseek4_compress_ratio_picks_the_layer_tensor_set() {
             *v = Meta::I32Arr(ratios.iter().map(|r| *r as i32).collect());
         }
     }
-    let err = dsv4_err("ds4-ratio4-as-0", &m);
-    println!("deepseek4 layer 1 relabelled ratio 0: {err}");
-    assert!(
-        err.contains(DSV4_REFUSAL),
-        "a ratio-0 layer must not demand any compressor or indexer tensor, got: {err}"
-    );
+    dsv4_generates("ds4-ratio4-as-0", &m);
 }
 
 /// `hash_layer_count` decides `ffn_gate_tid2eid` vs `exp_probs_b`, per layer and exclusively.
@@ -2339,60 +2333,68 @@ fn synthetic_deepseek4_rope_scaling_keys_are_read() {
     );
 }
 
-/// **A CSA (ratio 4) layer is still refused, by name, and the message says which layer.** Ratios 0
-/// and 128 generate on the CPU; ratio 4 needs the overlapping compressor and the lightning
-/// indexer, which are not emitted yet — and running it through the ratio-0 graph would silently
-/// drop every long-range key, not fail.
-///
-/// The canonical fixture's layer 1 is the first ratio-4 layer, so that is the layer named. Its
-/// ratio-128 layer 2 is not what refuses: a model whose only compressed layer is ratio 128
-/// generates, here on the CPU (`synthetic_deepseek4_llama_cpp.rs` scores that tier against
-/// llama.cpp).
+/// **Every tier generates on the CPU, and a CSA layer whose indexer cannot rope is refused by
+/// name.** The canonical fixture (ratios 0, 4, 128, 4, 0) generates; `synthetic_deepseek4_llama_cpp.rs`
+/// scores every tier against llama.cpp. An indexer head narrower than the rope tail every head of
+/// a compressed layer rotates would otherwise reach a rope that asserts, so it is refused at the
+/// graph build, naming the first ratio-4 layer.
 #[test]
-fn synthetic_deepseek4_refuses_a_csa_layer() {
-    let err = dsv4_err("ds4-refusal", &deepseek4_model());
-    println!("deepseek4 graph build: {err}");
+fn synthetic_deepseek4_csa_layer_generates_unless_its_indexer_cannot_rope() {
+    dsv4_generates("ds4-csa", &deepseek4_model());
+    let d = dsv4_dims();
+    let err = dsv4_err(
+        "ds4-indexer-narrow",
+        &dsv4_model(&Dsv4Dims {
+            indexer: IndexerDims {
+                head_size: d.rope_dim / 2,
+                ..dsv4_indexer()
+            },
+            ..dsv4_dims()
+        }),
+    );
+    println!("deepseek4 narrow indexer: {err}");
     assert_eq!(
         err,
-        "arch=deepseek4 (DeepSeek V4) layer 1 has compress_ratio 4: the CSA tier does not \
-         generate yet. It needs the overlapping CSA compressor over blocks of 4 tokens and the \
-         lightning indexer with its own compressor + LID cache; ratio-0 and ratio-128 (HCA) \
-         layers generate, on the CPU backend. See docs/deepseek.md § Stage 4."
-    );
-
-    let mut d = dsv4_dims();
-    d.compress_ratios = vec![0, 0, 128, 0, 0];
-    d.hash_layer_count = 0;
-    let logits = cpu_logits("ds4-hca-only", &dsv4_model(&d));
-    assert!(
-        logits.iter().all(|v| v.is_finite()),
-        "a ratio-128-only V4 model must generate on the CPU, got {logits:?}"
+        format!(
+            "arch=deepseek4 (DeepSeek V4) layer 1 has compress_ratio 4, but the lightning \
+             indexer's attention.indexer.key_length {} is narrower than rope.dimension_count {}, \
+             the tail every head of a compressed layer ropes.",
+            d.rope_dim / 2,
+            d.rope_dim
+        )
     );
 }
 
-/// **A compressed V4 layer is refused on Vulkan, loudly.** The HCA emit's graph has been checked
-/// against llama.cpp on the CPU only; until a GPU run is checked against it (plan 09 S9) a GPU
-/// backend must refuse the model by name rather than run it unverified, and say how to select the
-/// CPU. The refusal comes before the weight upload, which the GPU binder would otherwise run.
+/// **A compressed V4 layer is refused on Vulkan, loudly.** The compressed tiers' graphs have been
+/// checked against llama.cpp on the CPU only; until a GPU run is checked against them (plan 09 S9)
+/// a GPU backend must refuse the model by name rather than run it unverified, and say how to
+/// select the CPU. The refusal comes before the weight upload, which the GPU binder would
+/// otherwise run. Both tiers: an HCA-only file, and the canonical one, whose first compressed
+/// layer is a CSA layer.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_synthetic_deepseek4_refuses_a_compressed_layer_on_vulkan() {
     let _lk = gpu_serial_lock();
-    let mut d = dsv4_dims();
-    d.compress_ratios = vec![0, 0, 128, 0, 0];
-    d.hash_layer_count = 0;
-    let tmp = TempGguf::write("ds4-hca-vk", &dsv4_model(&d));
-    let err = match load(&tmp).prefill_logits_vulkan(PROMPT) {
-        Ok(logits) => panic!("Vulkan ran a compressed V4 layer: {logits:?}"),
-        Err(e) => format!("{e:#}"),
-    };
-    println!("deepseek4 hca on vulkan: {err}");
-    assert!(
-        err.contains("layer 2 has compress_ratio 128: the compressed tiers run on the CPU")
-            && err.contains("this is the vulkan backend")
-            && err.contains("`--dev cpu`, `INFR_DEV=cpu`"),
-        "the Vulkan refusal must name the layer and the backend, got: {err}"
-    );
+    let mut hca = dsv4_dims();
+    hca.compress_ratios = vec![0, 0, 128, 0, 0];
+    hca.hash_layer_count = 0;
+    for (tag, d, want) in [
+        ("ds4-hca-vk", hca, "layer 2 has compress_ratio 128"),
+        ("ds4-csa-vk", dsv4_dims(), "layer 1 has compress_ratio 4"),
+    ] {
+        let tmp = TempGguf::write(tag, &dsv4_model(&d));
+        let err = match load(&tmp).prefill_logits_vulkan(PROMPT) {
+            Ok(logits) => panic!("Vulkan ran a compressed V4 layer: {logits:?}"),
+            Err(e) => format!("{e:#}"),
+        };
+        println!("deepseek4 {tag}: {err}");
+        assert!(
+            err.contains(&format!("{want}: the compressed tiers run on the CPU"))
+                && err.contains("this is the vulkan backend")
+                && err.contains("`--dev cpu`, `INFR_DEV=cpu`"),
+            "the Vulkan refusal must name the layer and the backend, got: {err}"
+        );
+    }
 }
 
 /// **A `ffn_gate_tid2eid` that is not one row per vocabulary entry is refused.** The gather indexes

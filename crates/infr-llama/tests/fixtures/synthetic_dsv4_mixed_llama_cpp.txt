@@ -15,6 +15,12 @@
 # indexer at 300 tokens: top_k 512 keeps every visible block
 # logits at 520 tokens span [-3.968505, 1.9655391]
 # indexer at 520 tokens: top_k 512 keeps every visible block
+# infr CPU at 7 tokens: max |logit diff| 2.6226044e-6, probability cosine 0.9999999999996131, top-1 agrees
+# infr CPU at 30 tokens: max |logit diff| 3.0219555e-5, probability cosine 0.9999999999381622, top-1 agrees
+# infr CPU at 70 tokens: max |logit diff| 6.234646e-5, probability cosine 0.9999999996269268, top-1 agrees
+# infr CPU at 131 tokens: max |logit diff| 8.493662e-5, probability cosine 0.9999999995723693, top-1 agrees
+# infr CPU at 300 tokens: max |logit diff| 4.1604042e-5, probability cosine 0.9999999999401185, top-1 agrees
+# infr CPU at 520 tokens: max |logit diff| 9.346008e-5, probability cosine 0.999999999335048, top-1 agrees
 # tokens: 32 28 44 38 44 21 50
 -0.2538172
 2.765926

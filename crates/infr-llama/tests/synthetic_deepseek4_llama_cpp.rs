@@ -62,6 +62,8 @@ struct OracleCase {
     /// stored point sits on an indexer near-tie (the module doc); 0 for a case the indexer does not
     /// select for.
     prompt_salt: u64,
+    /// `attention.indexer.head_count`, when not the canonical fixture's (`dsv4_indexer`).
+    indexer_heads: Option<usize>,
 }
 
 impl OracleCase {
@@ -71,16 +73,15 @@ impl OracleCase {
         !self.ratios.contains(&4)
     }
 
-    /// Whether infr generates this case today: ratio 0 and ratio 128 do (the HCA tier since plan
-    /// 09 slice S6), ratio 4 is refused until slice S7. A case's infr file has only its own
-    /// ratios, because the null tail is ratio 0 there.
-    fn infr_generates(&self) -> bool {
-        !self.ratios.contains(&4)
-    }
-
     /// Whether the case has a compressed layer of its own, and so a sums file to bisect with.
     fn compressed(&self) -> bool {
         self.ratios.iter().any(|&r| r != 0)
+    }
+
+    /// Whether the case has a ratio-4 layer of its own, and so a selection fixture
+    /// ([`read_selection_fixture`]).
+    fn selects(&self) -> bool {
+        self.ratios.contains(&4)
     }
 
     /// Whether the indexer's top-k drops blocks anywhere in a `len`-token prompt and that changes
@@ -113,14 +114,16 @@ impl OracleCase {
     }
 }
 
-/// Every case. `ratio0` is the tier infr already computes, compared in CI; `mixed` is the canonical
+/// Every case, each compared in CI. `ratio0` is the plain tier; `mixed` is the canonical
 /// fixture's layer pattern; `csa` and `hca` put every layer on one compressed tier. Hash routing
 /// covers the first layers of each, as on the real file.
 ///
 /// Only `csa` lets the indexer's top-k drop blocks (`top_k` [`BITING_TOP_K`]), and only up to 131
 /// tokens: past that some row of some layer always sat on a near-tie (module doc). Measured with
-/// llama.cpp over 40 prompt sequences: none kept its selection under the noise at 300 tokens, and
-/// 30 sequences none at 520, while the first one tried held at 30, 70 and 131. The other compressed
+/// llama.cpp (at 4 indexer heads) over 40 prompt sequences: none kept its selection under the noise
+/// at 300 tokens, and 30 sequences none at 520. At [`BITING_INDEXER_HEADS`], salts 0 to 4 each sat
+/// on a near-tie at 70 or 131 tokens and salt 5 moved by 6.4e-5 under the noise; salt 6 moves by
+/// exactly 0 at 30, 70 and 131. The other compressed
 /// cases keep every visible block (`top_k` [`REAL_TOP_K`], the real file's), which is what lets
 /// them reach 520 tokens: past two blocks of 128 and llama.cpp's ubatch boundary.
 const CASES: [OracleCase; 4] = [
@@ -131,6 +134,7 @@ const CASES: [OracleCase; 4] = [
         top_k: REAL_TOP_K,
         prompt_lens: &PROMPT_LENS,
         prompt_salt: 0,
+        indexer_heads: None,
     },
     OracleCase {
         name: "mixed",
@@ -139,6 +143,7 @@ const CASES: [OracleCase; 4] = [
         top_k: REAL_TOP_K,
         prompt_lens: &PROMPT_LENS,
         prompt_salt: 0,
+        indexer_heads: None,
     },
     OracleCase {
         name: "csa",
@@ -146,7 +151,8 @@ const CASES: [OracleCase; 4] = [
         hash_layer_count: 1,
         top_k: BITING_TOP_K,
         prompt_lens: &[7, 30, 70, 131],
-        prompt_salt: 0,
+        prompt_salt: 6,
+        indexer_heads: Some(BITING_INDEXER_HEADS),
     },
     OracleCase {
         name: "hca",
@@ -155,6 +161,7 @@ const CASES: [OracleCase; 4] = [
         top_k: REAL_TOP_K,
         prompt_lens: &PROMPT_LENS,
         prompt_salt: 0,
+        indexer_heads: None,
     },
 ];
 
@@ -165,6 +172,16 @@ const REAL_TOP_K: usize = 512;
 /// The canonical fixture's `top_k` (`dsv4_indexer`), which the indexer exceeds from the 24th token
 /// on.
 const BITING_TOP_K: usize = 5;
+
+/// The indexer head count of the case whose top-k drops blocks: enough heads that no block's score
+/// is exactly 0. A score is `Σ_h w·relu(q_h·k)`, so it is exactly 0 whenever every head's dot is
+/// negative, which with the canonical fixture's four heads happens to one block in sixteen; two
+/// such blocks competing for the last kept slot are an exact tie, which llama.cpp breaks by
+/// `std::partial_sort`'s order (unspecified, and not infr's lower-index rule), and no noise on the
+/// weights can show it, since a negative dot stays negative. Four heads gave nine exact ties at
+/// the boundary over 131 tokens, which moved llama.cpp's selection away from infr's at those rows
+/// and, through them, later ones (plan 09 § S7). The real file has 64 heads.
+const BITING_INDEXER_HEADS: usize = 16;
 
 /// The only hyper-connection count llama.cpp's `build_hc_mixes` accepts.
 const LLAMA_CPP_HC_MULT: usize = 4;
@@ -260,8 +277,8 @@ fn oracle_dims(case: &OracleCase, for_llama: bool) -> Dsv4Dims {
         hc_mult: LLAMA_CPP_HC_MULT,
         indexer: IndexerDims {
             head_size: ORACLE_INDEXER_WIDTH,
+            n_head: case.indexer_heads.unwrap_or(dsv4_indexer().n_head),
             top_k: case.top_k,
-            ..dsv4_indexer()
         },
         ..dsv4_dims()
     }
@@ -520,7 +537,7 @@ impl std::fmt::Display for Score {
     }
 }
 
-/// The bound on infr's CPU logits against llama.cpp's on a case infr generates. The scores
+/// The bound on infr's CPU logits against llama.cpp's. The scores
 /// measured when the data was generated are recorded, as generated lines, in the case's fixture
 /// header (`# infr CPU at ...`); docs/plan/09-deepseek-v4-compressed.md § S5a records them with
 /// the gaps a window off by one and dropped attention sinks give, which this bound separates.
@@ -570,14 +587,14 @@ fn cpu_matches_llama_cpp(case: &OracleCase) -> Vec<(usize, Score)> {
     scores
 }
 
-/// **The external oracle on the tier infr generates, in CI.** infr's CPU prefill of the ratio-0
+/// **The external oracle on the plain tier, in CI.** infr's CPU prefill of the ratio-0
 /// case (hash- and bias-routed layers, hyper-connections at the real stream count, sinks, the
 /// grouped output projection, the de-rope, YaRN keys that ratio-0 layers must ignore) against
 /// llama.cpp's logits at every prompt length, below and past the sliding window.
 #[test]
 fn synthetic_dsv4_ratio0_cpu_matches_llama_cpp() {
     let case = &CASES[0];
-    assert!(case.infr_generates() && case.null_tail());
+    assert!(case.null_tail());
     for (len, s) in cpu_matches_llama_cpp(case) {
         assert!(
             s.max_abs < ORACLE_MAX_ABS,
@@ -596,7 +613,7 @@ fn synthetic_dsv4_ratio0_cpu_matches_llama_cpp() {
 fn synthetic_dsv4_hca_cpu_matches_llama_cpp() {
     let case = &CASES[3];
     assert_eq!(case.name, "hca");
-    assert!(case.infr_generates() && case.null_tail());
+    assert!(case.null_tail());
     for (len, s) in cpu_matches_llama_cpp(case) {
         assert!(
             s.max_abs < ORACLE_MAX_ABS,
@@ -606,28 +623,41 @@ fn synthetic_dsv4_hca_cpu_matches_llama_cpp() {
     }
 }
 
-/// **The cases with a ratio-4 layer are refused until S7 lifts the refusal, and then this test
-/// must become a comparison.** Each such case's llama.cpp data is checked in already; when infr
-/// generates a case, this test fails for it, and the fix is to score it with
-/// [`cpu_matches_llama_cpp`] as [`synthetic_dsv4_hca_cpu_matches_llama_cpp`] does.
+/// **The CSA tier against llama.cpp, in CI, with the indexer's top-k dropping blocks.** infr's
+/// CPU prefill of the all-ratio-4 case at `top_k` [`BITING_TOP_K`]: before the first block (7
+/// tokens), while every visible block is kept (30 tokens, under the top-k's six blocks), and where
+/// the top-k drops blocks (70 and 131 tokens), at the bound the ratio-0 tier is held to. A point
+/// where the top-k drops blocks was checked at generation to keep llama.cpp's selection under
+/// noise twice the f16 rounding of the indexer keys, so a flipped selection is infr's, not a
+/// near-tie. Plan 09 § S7 records the measured scores and the breaks this bound separates.
 #[test]
-fn synthetic_dsv4_compressed_cases_are_still_refused() {
-    for case in CASES.iter().filter(|c| !c.infr_generates()) {
-        let tmp = TempGguf::write(
-            &format!("dsv4-refused-{}", case.name),
-            &oracle_model(case, false),
-        );
-        let err = match load(&tmp).prefill_logits_cpu(&oracle_prompt(case, case.prompt_lens[0])) {
-            Ok(_) => panic!(
-                "infr now generates the {} case: score it against its llama.cpp fixture",
-                case.name
-            ),
-            Err(e) => format!("{e:#}"),
-        };
+fn synthetic_dsv4_csa_cpu_matches_llama_cpp() {
+    let case = &CASES[2];
+    assert_eq!(case.name, "csa");
+    assert!(!case.null_tail() && case.top_k_bites(*case.prompt_lens.last().expect("lengths")));
+    for (len, s) in cpu_matches_llama_cpp(case) {
         assert!(
-            err.contains("has compress_ratio 4: the CSA tier does not generate yet"),
-            "the {} case failed some other way: {err}",
-            case.name
+            s.max_abs < ORACLE_MAX_ABS,
+            "infr's CPU misses llama.cpp by {} at {len} tokens on the synthetic CSA V4",
+            s.max_abs
+        );
+    }
+}
+
+/// **Every tier in one model against llama.cpp, in CI.** infr's CPU prefill of the canonical
+/// fixture's layer pattern (ratio 0, 4, 128, 4, 0, hash routing on the first two) at the real
+/// file's `top_k` at every stored length, past the raw window and four HCA blocks: the CSA tier
+/// beside the HCA one, at the bound the ratio-0 tier is held to.
+#[test]
+fn synthetic_dsv4_mixed_cpu_matches_llama_cpp() {
+    let case = &CASES[1];
+    assert_eq!(case.name, "mixed");
+    assert!(!case.null_tail());
+    for (len, s) in cpu_matches_llama_cpp(case) {
+        assert!(
+            s.max_abs < ORACLE_MAX_ABS,
+            "infr's CPU misses llama.cpp by {} at {len} tokens on the synthetic mixed V4",
+            s.max_abs
         );
     }
 }
@@ -675,6 +705,9 @@ fn synthetic_dsv4_llama_cpp_fixtures_match_their_gguf() {
         let mut files = vec![case.fixture_path("")];
         if case.compressed() {
             files.push(case.fixture_path("_sums"));
+        }
+        if case.selects() {
+            files.push(case.fixture_path("_top_k"));
         }
         for path in files {
             assert_eq!(
@@ -781,6 +814,54 @@ common_debug_cb_eval:           result_norm = (f32)        MUL(norm{2, 1, 1, 1},
     );
 }
 
+/// [`llama_selections`] and [`format_selections`] on a hand-written log in llama-debug's format:
+/// eight one-token steps with a selection at positions 0 (no block visible yet: dropped), 3 (values
+/// elided, so `all`) and 7 (a short top-k filled with a masked block), each beside the
+/// `(reshaped)` view llama-debug prints too, which is ignored.
+#[test]
+fn synthetic_dsv4_selection_log_parses() {
+    let row = |name: &str, vals: &str| {
+        format!(
+            "common_debug_cb_eval:   {name} = (i32)       CONT(node_1{{2, 1, 1, 1}}, }}) = \
+             {{2, 1, 1, 1}}\n    [\n        [\n            [ {vals} ],\n        ],\n    ]\n    \
+             sum = 1.000000\n"
+        )
+    };
+    let norm = "common_debug_cb_eval:   result_norm = (f32) MUL(norm{2, 1, 1, 1}, \
+                w{2, 1, 1, 1}}) = {2, 1, 1, 1}\n    sum = 0.000000\n";
+    let mut log = String::new();
+    for pos in 0..8 {
+        let vals = match pos {
+            0 => Some("0.0000, 1.0000"),
+            3 => Some("0.0000,    ...,  1.0000"),
+            7 => Some("1.0000, 3.0000"),
+            _ => None,
+        };
+        if let Some(vals) = vals {
+            log.push_str(&row("lid_top_k-2", vals));
+            log.push_str(&row("lid_top_k-2 (reshaped)", vals));
+        }
+        log.push_str(norm);
+    }
+    let rows = llama_selections(&log, 2);
+    assert_eq!(
+        rows,
+        vec![
+            SelectionRow {
+                pos: 3,
+                layer: 2,
+                kept: None
+            },
+            SelectionRow {
+                pos: 7,
+                layer: 2,
+                kept: Some(vec![1])
+            },
+        ]
+    );
+    assert_eq!(format_selections(&rows), "3 2 all\n7 2 1\n");
+}
+
 /// The text a prompt of `ids` is typed as.
 fn prompt_text(ids: &[u32]) -> String {
     ids.iter().map(|&id| dsv4_token_text(id)).collect()
@@ -851,7 +932,7 @@ fn indexer_robustness(
 /// step infr's prefill takes). At every point where the top-k drops blocks it also re-measures
 /// [`indexer_robustness`] and fails on a near-tie or an inert indexer, so a regeneration cannot
 /// bring one back silently. The headers record the build, the commands, the GGUF's identity, the
-/// measured robustness, and for a case infr generates infr's own scores against the new data.
+/// measured robustness, and infr's own scores against the new data.
 ///
 /// The files are compared with the checked-in ones and written only into the directory
 /// `INFR_LLAMA_FIXTURE_OUT` names (`write_or_compare_fixture`), so running every ignored test with
@@ -930,10 +1011,8 @@ fn synthetic_dsv4_regenerate_llama_cpp_fixtures() {
                 logits,
             });
         }
-        if case.infr_generates() {
-            for (len, s) in infr_scores(case, &runs) {
-                notes.push_str(&format!("# infr CPU at {len} tokens: {s}\n"));
-            }
+        for (len, s) in infr_scores(case, &runs) {
+            notes.push_str(&format!("# infr CPU at {len} tokens: {s}\n"));
         }
 
         let mut text = header(
@@ -985,14 +1064,41 @@ fn synthetic_dsv4_regenerate_llama_cpp_fixtures() {
             .iter()
             .flat_map(|t| ["--tensor-filter".to_string(), (*t).to_string()])
             .collect();
+        let sums_cmd = format!(
+            "llama-debug -m <synthetic gguf> -p <the first {} prompt ids as text> -c {ctx} -ub 1 \
+             --no-warmup {}",
+            case.sums_len(),
+            filters.join(" ")
+        );
+        if case.selects() {
+            // The gap between the last kept and first dropped score is read off infr's own
+            // scores: llama-debug prints only six values of a row of scores, and where the two
+            // engines keep the same blocks their scores agree to f32 rounding.
+            if let Err(e) = check_near_ties(case, &infr_selections(case)) {
+                panic!("{e}");
+            }
+            let mut text = header(
+                "llama.cpp's lightning-indexer selection, one ubatch per token, at every row",
+                &sums_cmd,
+            );
+            text.push_str(SELECTION_HEADER);
+            if !case.top_k_bites(case.sums_len()) {
+                text.push_str(SELECTION_ALL_HEADER);
+            }
+            let rows = llama_selections(&log, case.top_k);
+            assert_eq!(
+                rows.len(),
+                selection_rows(case),
+                "the run printed another number of selections"
+            );
+            text.push_str(&format_selections(&rows));
+            if let Some(written) = write_or_compare_fixture(&case.fixture_path("_top_k"), &text) {
+                println!("wrote {}", written.display());
+            }
+        }
         let mut text = header(
             "llama.cpp per-tensor sums, one ubatch per token, at the positions below",
-            &format!(
-                "llama-debug -m <synthetic gguf> -p <the first {} prompt ids as text> -c \
-                 {ctx} -ub 1 --no-warmup {}",
-                case.sums_len(),
-                filters.join(" ")
-            ),
+            &sums_cmd,
         );
         text.push_str(
             "# `# position: p` starts the lines for 0-based position p (the step that feeds the\n\
@@ -1023,6 +1129,318 @@ fn synthetic_dsv4_regenerate_llama_cpp_fixtures() {
     }
     println!("recomputed the deepseek4 llama.cpp fixtures ({version})");
 }
+
+/// One row's selection in a selection fixture: its position, its layer, and the visible blocks it
+/// kept, ascending; `None` is every visible block.
+#[derive(Debug, PartialEq)]
+struct SelectionRow {
+    pos: usize,
+    layer: usize,
+    kept: Option<Vec<u32>>,
+}
+
+/// The visible-block count of the row at `pos`: a block completes at the token that ends it.
+fn visible_blocks(pos: usize) -> usize {
+    (pos + 1) / CSA_RATIO
+}
+
+/// `kept`, restricted to the row's visible blocks and sorted, or `None` when that is all of them.
+fn selection_of(pos: usize, kept: impl Iterator<Item = u32>) -> Option<Vec<u32>> {
+    let vis = visible_blocks(pos);
+    let mut v: Vec<u32> = kept.filter(|&j| (j as usize) < vis).collect();
+    v.sort_unstable();
+    v.dedup();
+    (v.len() != vis).then_some(v)
+}
+
+fn format_selections(rows: &[SelectionRow]) -> String {
+    rows.iter()
+        .map(|r| {
+            let kept = r.kept.as_ref().map_or_else(
+                || "all".to_string(),
+                |k| k.iter().map(u32::to_string).collect::<Vec<_>>().join(" "),
+            );
+            format!("{} {} {kept}\n", r.pos, r.layer)
+        })
+        .collect()
+}
+
+/// `case`'s checked-in selection fixture, the inverse of [`format_selections`].
+fn read_selection_fixture(case: &OracleCase) -> Vec<SelectionRow> {
+    let path = case.fixture_path("_top_k");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    text.lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let num = |i: usize| -> usize {
+                f.get(i)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| panic!("{}: bad line {l:?}", path.display()))
+            };
+            let kept = (f[2..] != ["all"]).then(|| {
+                f[2..]
+                    .iter()
+                    .map(|v| v.parse().expect("a block index"))
+                    .collect()
+            });
+            SelectionRow {
+                pos: num(0),
+                layer: num(1),
+                kept,
+            }
+        })
+        .collect()
+}
+
+/// The row count of `case`'s one-token-per-step run that score blocks: every position that sees
+/// one, once per ratio-4 layer.
+fn selection_rows(case: &OracleCase) -> usize {
+    let layers = case.ratios.iter().filter(|&&r| r == 4).count();
+    (0..case.sums_len())
+        .filter(|&p| visible_blocks(p) > 0)
+        .count()
+        * layers
+}
+
+/// llama.cpp's selection at every row of the one-token-per-ubatch run whose `log` holds the
+/// `lid_top_k-<layer>` values (`--tensor-filter lid_top_k`), for the rows that see a block. Where
+/// llama-debug elides values (more than six), the row must keep every visible block by
+/// construction (`top_k` at least the visible count), and is recorded as `all`.
+fn llama_selections(log: &str, top_k: usize) -> Vec<SelectionRow> {
+    const TAG: &str = "common_debug_cb_eval: ";
+    let mut rows = Vec::new();
+    let mut pos = 0;
+    let mut values_of: Option<usize> = None;
+    for line in log.lines() {
+        if let Some(h) = line.split_once(TAG).map(|(_, h)| h.trim()) {
+            values_of = h
+                .strip_prefix("lid_top_k-")
+                .and_then(|r| r.split_once(" = "))
+                .and_then(|(layer, _)| layer.parse().ok());
+            if h.starts_with("result_norm") {
+                pos += 1;
+            }
+            continue;
+        }
+        let Some(layer) = values_of else { continue };
+        let t = line
+            .trim()
+            .trim_matches(|c| c == '[' || c == ']' || c == ',')
+            .trim();
+        if t.is_empty() {
+            continue;
+        }
+        values_of = None;
+        if visible_blocks(pos) == 0 {
+            continue;
+        }
+        let kept = if t.contains("...") {
+            assert!(
+                top_k >= visible_blocks(pos),
+                "llama-debug elided the selection of a row whose top-k drops blocks (position \
+                 {pos}, layer {layer})"
+            );
+            None
+        } else {
+            selection_of(
+                pos,
+                t.split(',')
+                    .map(|v| v.trim().parse::<f32>().expect("an index") as u32),
+            )
+        };
+        rows.push(SelectionRow { pos, layer, kept });
+    }
+    rows
+}
+
+/// The relative gap between a row's last kept and first dropped score under which the row is a
+/// near-tie. The f16 rounding of an indexer key moves a score by about 2^-11 relative, and the
+/// reference rounds Hadamard-rotated keys where infr rounds unrotated ones (docs/deepseek.md §
+/// "The CSA tier"), so under this gap the two engines may keep different blocks without either
+/// being wrong.
+const SELECTION_MARGIN: f64 = 1e-3;
+
+/// The near-ties of the checked-in data ([`SELECTION_MARGIN`]), each with the relative margin infr
+/// measured there when it was listed: `(case, position, layer, margin)`. On these rows infr may
+/// keep other blocks than llama.cpp; on every other row it must keep the same ones.
+///
+/// The `csa` rows below are the last layer at earlier positions, so no stored logit reads them.
+/// llama.cpp keeps another block at both; a temporary Hadamard rotation of infr's LID keys and
+/// queries made both agree (plan 09 § S7).
+const NEAR_TIES: &[(&str, usize, usize, f64)] = &[
+    ("csa", 111, 3, 3.6955584767615923e-4),
+    ("csa", 122, 3, 4.0974090716636846e-4),
+];
+
+/// One row infr's CPU indexer scored: the selection, and the relative gap between its last kept
+/// and first dropped score (`None` when it keeps every visible block; 0 for a tie).
+struct InfrSelection {
+    row: SelectionRow,
+    margin: Option<f64>,
+}
+
+/// infr's CPU selection at every row of the one-token-per-step run of `case`'s sums prompt, read
+/// through `infr_cpu::indexer_tap`. Each step's graph runs one indexer per ratio-4 layer, in layer
+/// order.
+fn infr_selections(case: &OracleCase) -> Vec<InfrSelection> {
+    let tmp = TempGguf::write(
+        &format!("dsv4-selection-{}", case.name),
+        &oracle_model(case, false),
+    );
+    let model = load(&tmp);
+    infr_cpu::indexer_tap::start();
+    let run = model.prefill_logits_cpu(&oracle_prompt(case, case.sums_len()));
+    let tapped = infr_cpu::indexer_tap::take();
+    run.expect("cpu prefill");
+    let layers: Vec<usize> = (0..case.ratios.len())
+        .filter(|&l| case.ratios[l] == 4)
+        .collect();
+    let rows: Vec<InfrSelection> = tapped
+        .chunks(layers.len())
+        .flat_map(|step| {
+            assert!(
+                step.iter().all(|r| r.pos == step[0].pos),
+                "a step ran another number of indexers than the case has ratio-4 layers"
+            );
+            step.iter().zip(&layers).map(|(r, &layer)| {
+                let mut sorted = r.scores.clone();
+                sorted.sort_by(|a, b| b.total_cmp(a));
+                let k = case.top_k.min(sorted.len());
+                let margin = (sorted.len() > k).then(|| {
+                    let (kept, dropped) = (f64::from(sorted[k - 1]), f64::from(sorted[k]));
+                    if kept == dropped {
+                        0.0
+                    } else {
+                        (kept - dropped) / kept.abs().max(dropped.abs())
+                    }
+                });
+                InfrSelection {
+                    row: SelectionRow {
+                        pos: r.pos,
+                        layer,
+                        kept: selection_of(r.pos, r.kept.iter().copied()),
+                    },
+                    margin,
+                }
+            })
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        selection_rows(case),
+        "infr's indexer scored another number of rows"
+    );
+    rows
+}
+
+/// Every row of `infr` whose kept-versus-dropped margin is under [`SELECTION_MARGIN`] (an exact
+/// tie among them) must be listed in [`NEAR_TIES`], and every entry of `case` there must still be
+/// such a row.
+fn check_near_ties(case: &OracleCase, infr: &[InfrSelection]) -> Result<(), String> {
+    let listed: Vec<(usize, usize)> = NEAR_TIES
+        .iter()
+        .filter(|t| t.0 == case.name)
+        .map(|t| (t.1, t.2))
+        .collect();
+    let mut errors = Vec::new();
+    for s in infr {
+        let at = (s.row.pos, s.row.layer);
+        let Some(m) = s.margin else {
+            if listed.contains(&at) {
+                errors.push(format!("{at:?} is listed but keeps every visible block"));
+            }
+            continue;
+        };
+        match (m < SELECTION_MARGIN, listed.contains(&at)) {
+            (true, false) if m == 0.0 => errors.push(format!(
+                "position {} layer {}: its last kept and first dropped scores tie exactly",
+                at.0, at.1
+            )),
+            (true, false) => errors.push(format!(
+                "position {} layer {}: relative margin {m:e}",
+                at.0, at.1
+            )),
+            (false, true) => errors.push(format!(
+                "position {} layer {} is listed but its margin is {m:e}",
+                at.0, at.1
+            )),
+            _ => {}
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: indexer near-ties among the stored rows (an exact tie llama.cpp's \
+             `std::partial_sort` breaks in no defined order, or a gap under {SELECTION_MARGIN} \
+             that f16 rounding can flip). Pick another prompt_salt, or list a measured f16-scale \
+             near-tie in NEAR_TIES:\n{}",
+            case.name,
+            errors.join("\n")
+        ))
+    }
+}
+
+/// **infr's CPU indexer keeps, at every row, the blocks llama.cpp keeps**, on the cases with a
+/// ratio-4 layer: every (position, layer) of the one-token-per-step run, against the checked-in
+/// selection. The logits cannot show this: a selection at a row nothing later reads (the last
+/// layer, at an earlier position) moves no logit. A row in [`NEAR_TIES`] may differ and must still
+/// be a near-tie; no other row may differ, or come within [`SELECTION_MARGIN`] of a tie.
+#[test]
+fn synthetic_dsv4_indexer_keeps_what_llama_cpp_keeps() {
+    for case in CASES.iter().filter(|c| c.selects()) {
+        let want = read_selection_fixture(case);
+        let got = infr_selections(case);
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "{}: the fixture is for another run",
+            case.name
+        );
+        if let Err(e) = check_near_ties(case, &got) {
+            panic!("{e}");
+        }
+        let mut differ = Vec::new();
+        for (g, w) in got.iter().zip(&want) {
+            assert_eq!(
+                (g.row.pos, g.row.layer),
+                (w.pos, w.layer),
+                "{}: rows out of step",
+                case.name
+            );
+            let listed = NEAR_TIES
+                .iter()
+                .any(|t| (t.0, t.1, t.2) == (case.name, w.pos, w.layer));
+            if g.row.kept != w.kept && !listed {
+                differ.push(format!(
+                    "position {} layer {}: infr keeps {:?}, llama.cpp {:?} (margin {:?})",
+                    w.pos, w.layer, g.row.kept, w.kept, g.margin
+                ));
+            }
+        }
+        assert!(
+            differ.is_empty(),
+            "{}: infr's indexer keeps other blocks than llama.cpp's:\n{}",
+            case.name,
+            differ.join("\n")
+        );
+    }
+}
+
+/// The selection fixture's format, under its header.
+const SELECTION_HEADER: &str = "\
+# One line per (position, layer) whose row sees a block: `<position> <layer> <kept blocks>`,
+# ascending, or `all` when every visible block is kept. Read off the `lid_top_k-<layer>` values
+# llama-debug prints, restricted to the visible blocks (a short top-k is filled with masked ones).
+";
+
+/// Added when the case's `top_k` never drops a block.
+const SELECTION_ALL_HEADER: &str = "\
+# Here `top_k` is at least the padded width llama.cpp selects from, so every row keeps every
+# visible block by construction; llama-debug prints only six of the selected indices.
+";
 
 /// Split a `llama-debug --tensor-filter` log of a one-token-per-ubatch run into one list per
 /// position of `<tensor header> sum <sum>` lines. A position opens at the first tensor after the

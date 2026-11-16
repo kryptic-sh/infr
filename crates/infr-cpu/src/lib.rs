@@ -9,6 +9,8 @@
 //! the GPU backends are validated against.
 #![allow(clippy::needless_range_loop)]
 
+#[doc(hidden)]
+pub mod indexer_tap;
 pub mod kvquant;
 pub mod paged;
 mod pool;
@@ -3666,6 +3668,7 @@ impl Backend for CpuBackend {
                     let need = kv_len * hd;
                     let ks = dequant_cache_prefix(&kguard, g.desc(k_cache).dtype, need);
                     let mut out = vec![0f32; rows * top_k];
+                    let tap = indexer_tap::active().then(|| std::sync::Mutex::new(Vec::new()));
                     self.pool()
                         .for_chunks_mut(&mut out, top_k, 1, &|ti, slots| {
                             // Causal: a key whose block the query has not completed is not
@@ -3717,7 +3720,24 @@ impl Backend for CpuBackend {
                                 // convention `Op::Argmax` uses for a token id.
                                 *slot = f32::from_bits(bi as u32);
                             }
+                            if let Some(tap) = &tap {
+                                tap.lock().expect("indexer tap lock").push((ti, sc));
+                            }
                         });
+                    if let Some(tap) = tap {
+                        let mut scored = tap.into_inner().expect("indexer tap lock");
+                        scored.sort_by_key(|&(ti, _)| ti);
+                        indexer_tap::record(scored.into_iter().map(|(ti, scores)| {
+                            indexer_tap::IndexerRow {
+                                pos: pos + ti,
+                                kept: out[ti * top_k..(ti + 1) * top_k]
+                                    .iter()
+                                    .map(|v| v.to_bits())
+                                    .collect(),
+                                scores,
+                            }
+                        }));
+                    }
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
                 Op::TopkMask {

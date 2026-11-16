@@ -68,7 +68,7 @@ system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 | DeepSeek V1       | `deepseek`        | softmax MoE + shared expert; CPU-tested on MoE-16B only                    |
 | DeepSeek V2 / V3  | `deepseek2`       | MLA + YaRN + group-limited MoE; validated on V2-Lite; V3.2 files run here  |
 | DeepSeek V3.2     | `deepseek32`      | + lightning indexer; synthetic only, published files too big to test here  |
-| DeepSeek V4       | `deepseek4`       | loads; the shipped V4-Flash is still refused (compressed-KV tiers unbuilt) |
+| DeepSeek V4       | `deepseek4`       | every tier runs on CPU; synthetic files match llama.cpp; V4-Flash: not run |
 
 DeepSeek status and what each stage is verified against:
 [`docs/deepseek.md`](docs/deepseek.md).

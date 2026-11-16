@@ -327,6 +327,31 @@ impl SamplingOpts {
     }
 }
 
+/// `infr tune` actions.
+#[derive(Subcommand)]
+enum TuneCmd {
+    /// The device, the key the tuning table matches it by, the rows that matched, then every
+    /// parameter's value and the level it came from (default, a table row, the tuning file, or a
+    /// config / environment / command-line setting).
+    Show {
+        /// Vulkan device (`Vulkan0`, `Vulkan1`, …). Unset = the default device.
+        #[arg(long)]
+        dev: Option<String>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Every tunable parameter (of `family`, if given): kind, declared range, qualifier axis, the
+    /// default rule, and its value on the device.
+    List {
+        /// Only this family (`gemv_sg`, `attn_flash`, …).
+        family: Option<String>,
+        /// Vulkan device (`Vulkan0`, `Vulkan1`, …). Unset = the default device.
+        #[arg(long)]
+        dev: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Download + cache a model (`org/repo[:quant]` from HuggingFace, or a path to a `.gguf`).
@@ -335,6 +360,12 @@ enum Cmd {
     /// device the default (no `--dev`) path binds. The index is the `--dev VulkanN` / `INFR_DEV`
     /// handle. Reports each device's external-memory extensions (GPU↔GPU / dma-buf feasibility).
     Devices,
+    /// The per-device Vulkan kernel tuning parameters: which value each one has on a device and
+    /// where it came from (`show`), or every parameter with its range and default rule (`list`).
+    Tune {
+        #[command(subcommand)]
+        action: TuneCmd,
+    },
     /// Interactive terminal chat (auto-pulls if missing).
     Run {
         model: String,
@@ -646,6 +677,17 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
                 layer.device.ctx = Some(Some(parse_ctx_flag(c)?));
             }
         }
+        Cmd::Tune { action } => {
+            let (TuneCmd::Show { dev, .. } | TuneCmd::List { dev, .. }) = action;
+            if let Some(d) = dev.as_deref() {
+                match parse_dev_spec(d).with_context(|| format!("invalid --dev `{d}`"))? {
+                    backend @ Backend::Vulkan(_) => {
+                        layer.device.dev = Some(Some(dev_spec_of(&backend)));
+                    }
+                    _ => anyhow::bail!("`infr tune` tunes Vulkan devices; `--dev {d}` is not one"),
+                }
+            }
+        }
         Cmd::Pull { .. } | Cmd::Devices | Cmd::Compare { .. } => {}
     }
     Ok(layer)
@@ -667,6 +709,7 @@ fn dispatch(
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model, cfg),
         Cmd::Devices => cmd_devices(cfg),
+        Cmd::Tune { action } => cmd_tune(&action, cfg),
         Cmd::Run {
             model,
             message,
@@ -949,6 +992,82 @@ fn cmd_devices(cfg: &Config) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// `infr tune show|list` — the tuning parameter set of one Vulkan device, resolved exactly as a
+/// run on it would resolve it (the same config, environment and command line), by creating the
+/// backend.
+fn cmd_tune(action: &TuneCmd, cfg: &Arc<Config>) -> anyhow::Result<()> {
+    let be = infr_vulkan::VulkanBackend::new_with(Arc::clone(cfg)).map_err(|e| anyhow!("{e}"))?;
+    let report = be.tuning_report();
+    match action {
+        TuneCmd::Show { json: false, .. } => {
+            // print-ok: program OUTPUT — the `infr tune show` listing users pipe and paste.
+            print!("{}", report.show());
+        }
+        TuneCmd::Show { json: true, .. } => {
+            // print-ok: program OUTPUT — the `infr tune show --json` document.
+            println!("{}", serde_json::to_string_pretty(&tune_json(report))?);
+        }
+        TuneCmd::List { family, .. } => {
+            if let Some(f) = family.as_deref() {
+                let known = report
+                    .params
+                    .iter()
+                    .any(|p| p.key.split('.').next() == Some(f));
+                if !known {
+                    let mut families: Vec<&str> = report
+                        .params
+                        .iter()
+                        .filter_map(|p| p.key.split('.').next())
+                        .collect();
+                    families.dedup();
+                    anyhow::bail!("no tuning family `{f}` (families: {})", families.join(", "));
+                }
+            }
+            // print-ok: program OUTPUT — the `infr tune list` listing.
+            print!("{}", report.list(family.as_deref()));
+        }
+    }
+    Ok(())
+}
+
+/// `infr tune show --json`'s document.
+fn tune_json(r: &infr_vulkan::tuning::TuningReport) -> serde_json::Value {
+    let d = &r.device;
+    serde_json::json!({
+        "device": {
+            "name": d.name,
+            "vendor": d.vendor(),
+            "vendor_id": format!("{:#06x}", d.vendor_id),
+            "device_id": format!("{:#06x}", d.device_id),
+            "driver": d.driver,
+            "driver_version": format!("{:#x}", d.driver_version),
+            "arch": d.arch,
+            "integrated": d.integrated,
+            "compute_units": d.compute_units,
+            "subgroup_min": d.subgroup_min,
+            "subgroup_max": d.subgroup_max,
+            "wave64": d.wave64,
+            "max_shared_memory": d.max_shared_memory,
+        },
+        "match": r.match_key(),
+        "hash": r.hash(),
+        "rows": r.rows.iter().map(|row| serde_json::json!({
+            "id": row.id,
+            "level": row.level,
+            "verified": row.verified,
+            "params": row.params,
+        })).collect::<Vec<_>>(),
+        "params": r.params.iter().map(|p| serde_json::json!({
+            "key": p.key,
+            "value": p.value,
+            "source": p.source,
+            "kind": p.kind,
+            "range": p.range,
+            "axis": p.axis,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn cmd_pull(model: &str, cfg: &Config) -> anyhow::Result<()> {

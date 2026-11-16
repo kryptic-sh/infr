@@ -6358,3 +6358,31 @@ setup-zig with `use-cache: false`. The rest of `ci.yml` was left as it was:
   off with `use-cache: false` is safe for what a release contains, since the
   cache only speeds up zig's own builds, but would cost link time on both Linux
   legs, unmeasured. Left alone because it touches the release job.
+
+### B198 — `unquantised_numel_is_never_rejected` failed once, cause unknown (2026-11-17)
+
+**Tag:** tests · infr-gguf · **Kind:** observed once, not reproduced
+
+`infr-gguf`'s `tests::unquantised_numel_is_never_rejected` failed once in a full
+workspace `nextest` run (585 of 586 passed before the run stopped) while other
+builds and GPU tests were running on the same machine from other worktrees. Its
+failure message was not captured. It passed alone, in the full rerun, and in 40
+repeats of the whole `infr-gguf` test binary at 8 threads afterwards. The test
+writes a fixture to a uniquely named `tempfile::NamedTempFile` and opens it with
+`Gguf::open`, so two runs colliding on one path is ruled out. Unchecked guesses:
+something else on Windows holding the new file briefly (antivirus, the indexer)
+when it is opened or mapped, or memory pressure during the mapping. If it shows
+again, capture the message first.
+
+### B199 — llama.cpp divides by zero on a `deepseek4` file with no ratio-4 layer: reported (2026-11-17)
+
+**Tag:** reference · **Kind:** upstream bug, filed
+
+Filed as ggml-org/llama.cpp issue 32424. In the `llama_kv_cache` constructor the
+DeepSeek branch sets `attn_rot_k` without the `n_embd_head_k_all > 0` check the
+general condition has; for a model with no ratio-4 layer the indexer cache has
+no layers and a head width of 0, the
+`while (n_embd_head_k_all % (2*n_rot_k) == 0)` loop doubles `n_rot_k` until it
+wraps to 0, and the next test divides by zero. The synthetic oracle files keep
+their null tail layer (B-DSV4-ORACLE) until a llama.cpp with the fix is the
+pinned reference; then that layer can go.

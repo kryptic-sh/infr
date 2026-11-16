@@ -618,6 +618,45 @@ fn a_finished_layer_is_evicted_before_older_residents() {
     assert!(demoted < kept_by_recency, "{counts}");
 }
 
+/// **The decode after a layer-major prefill starts warm.** A layer's last chunk keeps the experts
+/// its last row routed to out of the demotion (`paged::done_keep`), so that row run again alone
+/// through the whole stack — it routes exactly as it did in its chunk, every op computing a row
+/// on its own — finds every expert resident: no read. With a pool of three layers' experts.
+#[test]
+fn the_last_rows_experts_survive_a_layer_major_prefill() {
+    let moe = Moe {
+        dt: DType::F32,
+        fused: false,
+        layers: 6,
+        ne: 128,
+        nff: 128,
+        n_expert: 32,
+        n_used: 4,
+        rows: 8,
+    };
+    let built = moe.build();
+    let be = CpuBackend::new();
+    let budget = 3 * built.floor_bytes();
+    let (io, _store, paged) = built.paged(&be, moe.n_expert, moe.n_used, budget, Duration::ZERO);
+    let mut layer = Moe { layers: 1, ..moe }.build();
+    let out = layer_major(&built, &mut layer, &be, &paged, prefill_hints);
+    let reads = io.reads();
+    let one = Moe { rows: 1, ..moe }.build();
+    let n = built.g.desc(built.x).numel();
+    let last_row = &rng(50 + CHUNKS - 1, n)[n - moe.ne..];
+    let y = one.run(&be, &refs(&paged), last_row);
+    assert_eq!(
+        bits(&y),
+        bits(&out[CHUNKS as usize - 1][n - moe.ne..]),
+        "the row alone computed other bits"
+    );
+    assert_eq!(
+        io.reads(),
+        reads,
+        "the last row's experts were evicted by the prefill"
+    );
+}
+
 /// The insert rule itself: decode-shaped ops recency, sweeps the cold end.
 #[test]
 fn a_decode_step_inserts_by_recency_and_a_sweep_at_the_cold_end() {

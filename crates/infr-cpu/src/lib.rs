@@ -1160,6 +1160,9 @@ impl Backend for CpuBackend {
         // comparison lines up row for row instead of comparing a bare `Linear` against
         // `Linear m=512 1536x1536 Q4K`.
         let mut op_times: HashMap<String, (u64, f64)> = HashMap::new();
+        // `WeightReuse::Done`: the experts each paged bank keeps out of the demotion, by the bank
+        // buffer's uid ([`paged::done_keep`]).
+        let mut kept_experts: HashMap<u64, Vec<usize>> = HashMap::new();
         for op in &g.ops {
             // Make every PAGED weight this op reads resident, and hold it resident for the op's
             // whole body. This is the one fallible point in the interpreter, which is exactly why
@@ -3206,6 +3209,15 @@ impl Backend for CpuBackend {
                     let routed: Vec<usize> = buckets.iter().map(|&(e, _, _)| e).collect();
                     let mut bank_bufs = vec![cpu_buf(gbuf), cpu_buf(dbuf)];
                     bank_bufs.extend(ubuf);
+                    if g.weight_reuse == infr_core::graph::WeightReuse::Done {
+                        let by_count: Vec<(usize, usize)> =
+                            buckets.iter().map(|&(e, _, n)| (e, n)).collect();
+                        let last = routes.last().map_or(&[][..], |r| &r.idx[..]);
+                        let keep = paged::done_keep(last, &by_count);
+                        for b in &bank_bufs {
+                            kept_experts.insert(b.uid, keep.clone());
+                        }
+                    }
                     let mut banks = self
                         .moe_banks(&bank_bufs, n_expert, &routed, g.weight_reuse)?
                         .into_iter();
@@ -4255,7 +4267,7 @@ impl Backend for CpuBackend {
         }
 
         if g.weight_reuse == infr_core::graph::WeightReuse::Done {
-            demote_paged_reads(g, bindings);
+            demote_paged_reads(g, bindings, &kept_experts);
         }
 
         // Write back the buffers the model reads after execute: Outputs (logits) and mutated f32
@@ -4289,9 +4301,10 @@ impl Backend for CpuBackend {
 }
 
 /// [`infr_core::graph::WeightReuse::Done`]: make every paged weight some op of `g` read the next
-/// victim of its pool — a whole weight, and every expert of a bank paged per expert — so the
-/// reads that follow evict what this graph was the last to need before anything still live.
-fn demote_paged_reads(g: &Graph, bindings: &Bindings) {
+/// victim of its pool — a whole weight, and every expert of a bank paged per expert but those
+/// `keep` names for that bank ([`paged::done_keep`]) — so the reads that follow evict what this
+/// graph was the last to need before anything still live.
+fn demote_paged_reads(g: &Graph, bindings: &Bindings, keep: &HashMap<u64, Vec<usize>>) {
     let mut seen = std::collections::HashSet::new();
     for op in &g.ops {
         for id in op.io().0 {
@@ -4306,7 +4319,9 @@ fn demote_paged_reads(g: &Graph, bindings: &Bindings) {
             }
             match &cb.store {
                 CpuStore::Paged { store, id, .. } => store.demote(*id),
-                CpuStore::PagedExperts { store, bank, .. } => store.demote_experts(*bank),
+                CpuStore::PagedExperts { store, bank, .. } => {
+                    store.demote_experts(*bank, keep.get(&cb.uid).map_or(&[][..], |k| &k[..]))
+                }
                 CpuStore::Owned(_) | CpuStore::Mapped(_) => {}
             }
         }

@@ -167,6 +167,9 @@ struct Inner {
     /// the blocks that do keep coming back. Bounded by the pool's block count (one bit of interest
     /// per registered block), not by traffic.
     missed_once: HashSet<BlockId>,
+    /// Blocks [`HostPager::pin`] has read from the tier below at least once, so a later read of
+    /// one counts as a re-read ([`HostPagerStats::rereads`]).
+    read_once: HashSet<BlockId>,
 }
 
 /// What [`HostPager::fill`] did with one block.
@@ -197,6 +200,12 @@ pub struct HostPagerStats {
     /// overlap each count in full, so this over-states wall time; `bytes_read` over it is the rate
     /// one read sees, not the device's.
     pub read_ns: u64,
+    /// Of the reads [`HostPager::pin`] made, how many were of a block it had read before (evicted
+    /// since), and the time they took (part of `read_ns`). A file read the OS still caches costs a
+    /// copy, not a disk read, so the time per first read against the time per re-read says how
+    /// much of a run's re-reading the OS file cache absorbed.
+    pub rereads: u64,
+    pub reread_ns: u64,
 }
 
 /// A fixed-budget host cache of uniform `slot_bytes` blocks, read in place.
@@ -215,6 +224,8 @@ pub struct HostPager {
     bytes_read: AtomicU64,
     streamed: AtomicU64,
     read_ns: AtomicU64,
+    rereads: AtomicU64,
+    reread_ns: AtomicU64,
 }
 
 impl HostPager {
@@ -238,6 +249,7 @@ impl HostPager {
                 state: HashMap::new(),
                 descs: HashMap::new(),
                 missed_once: HashSet::new(),
+                read_once: HashSet::new(),
             }),
             ready: Condvar::new(),
             arena: Arena::new(n_slots, slot_bytes),
@@ -248,6 +260,8 @@ impl HostPager {
             bytes_read: AtomicU64::new(0),
             streamed: AtomicU64::new(0),
             read_ns: AtomicU64::new(0),
+            rereads: AtomicU64::new(0),
+            reread_ns: AtomicU64::new(0),
         })
     }
 
@@ -284,6 +298,7 @@ impl HostPager {
                 state: HashMap::new(),
                 descs: HashMap::new(),
                 missed_once: HashSet::new(),
+                read_once: HashSet::new(),
             }),
             ready: Condvar::new(),
             arena: Arena::new(0, slot_bytes),
@@ -294,6 +309,8 @@ impl HostPager {
             bytes_read: AtomicU64::new(0),
             streamed: AtomicU64::new(0),
             read_ns: AtomicU64::new(0),
+            rereads: AtomicU64::new(0),
+            reread_ns: AtomicU64::new(0),
         })
     }
 
@@ -365,16 +382,18 @@ impl HostPager {
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
             streamed: self.streamed.load(Ordering::Relaxed),
             read_ns: self.read_ns.load(Ordering::Relaxed),
+            rereads: self.rereads.load(Ordering::Relaxed),
+            reread_ns: self.reread_ns.load(Ordering::Relaxed),
         }
     }
 
-    /// Read `desc` from the tier below into `dst`, timing it into `read_ns`.
-    fn read_below(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+    /// Read `desc` from the tier below into `dst`, timing it into `read_ns`. Returns the time.
+    fn read_below(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<u64> {
         let t = std::time::Instant::now();
         let r = self.io.read_block(desc, dst);
         let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
         self.read_ns.fetch_add(ns, Ordering::Relaxed);
-        r
+        r.map(|()| ns)
     }
 
     /// Bytes this tier's arena occupies.
@@ -468,10 +487,14 @@ impl HostPager {
         // reading. That makes this `&mut` the only reference to these bytes for its whole life,
         // which ends before the state flips to `Ready` below. `len <= slot_bytes` per `register`.
         let dst = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, len), len) };
-        self.read_below(&desc, dst)?;
+        let ns = self.read_below(&desc, dst)?;
         std::mem::forget(claim);
         let mut inner = self.inner.lock().unwrap();
         inner.state.insert(id, SlotState::Ready);
+        if !inner.read_once.insert(id) {
+            self.rereads.fetch_add(1, Ordering::Relaxed);
+            self.reread_ns.fetch_add(ns, Ordering::Relaxed);
+        }
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
         let pin = self.pinned(id, slot, &inner);
@@ -957,6 +980,22 @@ mod tests {
             p.try_pin(2).is_none(),
             "the least recently used block survived"
         );
+    }
+
+    /// A read of a block the pager read before, and evicted since, counts as a re-read; a first
+    /// read and a hit do not.
+    #[test]
+    fn a_block_read_again_after_eviction_is_a_reread() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(1, 16, io, &[1, 2]);
+        drop(p.pin(1, Insert::Mru).expect("pin"));
+        drop(p.pin(1, Insert::Mru).expect("pin")); // a hit
+        drop(p.pin(2, Insert::Mru).expect("pin")); // evicts 1
+        assert_eq!((p.stats().reads, p.stats().rereads), (2, 0));
+        drop(p.pin(1, Insert::Mru).expect("pin"));
+        let s = p.stats();
+        assert_eq!((s.reads, s.rereads), (3, 1));
+        assert!(s.reread_ns <= s.read_ns);
     }
 
     /// A demoted block is the next victim however recently it was used, and still a hit until

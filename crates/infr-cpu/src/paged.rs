@@ -159,6 +159,37 @@ pub fn expert_insert(routed: usize, n_expert: usize, reuse: WeightReuse) -> Inse
     }
 }
 
+/// How many experts of each bank a layer's last layer-major chunk keeps out of its demotion
+/// ([`done_keep`]). The decode after the prompt routes a few experts per layer (six on V4-Flash).
+/// Sized so every layer's kept share of V4-Flash fits the slots a 12 GB arena has beyond one
+/// layer's floor, and so survives the prefill (`the_done_share_fits_a_12g_arena` checks it).
+pub const DONE_KEEP_EXPERTS: usize = 8;
+
+/// The experts a layer-major layer's last chunk ([`WeightReuse::Done`]) keeps resident for the
+/// decode that follows: the ones its LAST row routed to (the decode's first token continues
+/// from that row), then the ones most of its rows routed to (`by_count`, expert and row count),
+/// up to [`DONE_KEEP_EXPERTS`]. Without it the demotions leave whatever layers happened to be
+/// demoted last, and the first decode pass reads most of its experts from disk again.
+pub fn done_keep(last_row: &[usize], by_count: &[(usize, usize)]) -> Vec<usize> {
+    let mut keep: Vec<usize> = Vec::with_capacity(DONE_KEEP_EXPERTS);
+    for &e in last_row {
+        if keep.len() < DONE_KEEP_EXPERTS && !keep.contains(&e) {
+            keep.push(e);
+        }
+    }
+    let mut ranked = by_count.to_vec();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    for (e, _) in ranked {
+        if keep.len() >= DONE_KEEP_EXPERTS {
+            break;
+        }
+        if !keep.contains(&e) {
+            keep.push(e);
+        }
+    }
+    keep
+}
+
 /// Where a whole weight a graph pins goes in the recency order: the cold end for an ordinary
 /// forward pass (see [`PagedWeights::pin`]), the hot end when the next graphs read it again
 /// ([`WeightReuse::Again`], [`WeightReuse::Done`]) — the same reasoning as [`expert_insert`].
@@ -433,10 +464,12 @@ impl PagedWeights {
         self.pools[id.pool].demote(id.block);
     }
 
-    /// [`Self::demote`] every resident expert of `bank`.
-    pub fn demote_experts(&self, bank: PagedExperts) {
+    /// [`Self::demote`] every resident expert of `bank` but those in `keep`.
+    pub fn demote_experts(&self, bank: PagedExperts, keep: &[usize]) {
         for e in 0..bank.n_expert {
-            self.pools[bank.pool].demote(bank.first + e);
+            if !keep.contains(&(e as usize)) {
+                self.pools[bank.pool].demote(bank.first + e);
+            }
         }
     }
 
@@ -906,6 +939,35 @@ mod tests {
                 "expert traffic evicted a whole weight"
             );
         }
+    }
+
+    #[test]
+    fn the_done_share_fits_a_12g_arena() {
+        // V4-Flash at `INFR_DRAM_CACHE=12g`: 1904 expert slots, a layer's floor of 3 x 256, 43
+        // layers of three banks (`docs/deepseek.md` § "Layer-major prefill on the CPU").
+        let (slots, floor, layers, banks) = (1904usize, 3 * 256usize, 43usize, 3usize);
+        assert!(DONE_KEEP_EXPERTS * banks * layers <= slots - floor);
+    }
+
+    /// The last row's experts first, then the most-routed, up to the share, without repeats; ties
+    /// by expert id.
+    #[test]
+    fn done_keep_takes_the_last_row_then_the_most_routed() {
+        let by_count = [
+            (0, 1),
+            (3, 9),
+            (5, 2),
+            (7, 9),
+            (9, 4),
+            (11, 1),
+            (12, 3),
+            (13, 5),
+        ];
+        assert_eq!(
+            done_keep(&[5, 0], &by_count),
+            vec![5, 0, 3, 7, 13, 9, 12, 11][..DONE_KEEP_EXPERTS].to_vec()
+        );
+        assert_eq!(done_keep(&[], &[(4, 1)]), vec![4]);
     }
 
     #[test]

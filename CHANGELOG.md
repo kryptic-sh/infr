@@ -609,6 +609,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A shader that fails to compile now stops the build with one clear message**
+  (#93). A `glslc` too old for infr's shaders used to surface as a bare
+  `glslc failed for shaders/...` panic per worker thread, with the real
+  diagnostic buried above it (shaderc 2023.8, Ubuntu 24.04's package, failed
+  inside its optimizer on `deltanet_prep.comp`). `infr-vulkan`'s build script
+  now reports the first failure only, naming the shader and its defines, the
+  `glslc` that ran and its version, and what `glslc` printed, with what is
+  known: shaderc 2026.1, 2026.3 and 2026.4 build every shader, 2023.8 does not.
+  A `glslc` that printed nothing or could not be started is reported as that,
+  not as a too-old toolchain. The shaders most likely to trip an old `glslc`
+  (`deltanet_prep` and one each for E4M3, bf16 and int8 cooperative matrices,
+  packed integer dot products, buffer references and clustered subgroups)
+  compile first, so such a toolchain fails within seconds.
 - **A prefill chunk is never taller than the session's sliding-window ring.** A
   window layer's ring holds the window plus the prefill chunk height the session
   was created with, but the prefill read the chunk height again on every call,

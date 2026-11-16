@@ -10,11 +10,17 @@ with `fail-fast: false`, so one platform's failure never hides another's.
 
 Every runner needs `glslc`: `infr-vulkan/build.rs` shells out to it once per
 compute shader and has no prebuilt-SPIR-V fallback, so it is a hard build
-requirement rather than a Vulkan-runtime concern. The per-platform recipe (apt,
+requirement rather than a Vulkan-runtime concern. Ubuntu 24.04's shaderc 2023.8
+is known not to compile the shaders (#93). The versions CI installs are not
+pinned; a run on 2026-11-16 got shaderc 2026.1 from `ubuntu-26.04`'s apt, 2026.4
+from Homebrew and 2026.4 from the Windows Vulkan SDK, all of which build every
+shader. `build.rs` compiles a few of the shaders most likely to trip an old
+`glslc` before the rest, and any failed compile stops the build with one message
+naming the shader, the `glslc` and its version. The per-platform recipe (apt,
 Homebrew, and the Vulkan SDK on Windows, whose installer leaves its `Bin`
 directory off `PATH`) lives in `.github/actions/install-glslc`, which ends by
 running `glslc --version` — an install step that silently no-ops would otherwise
-surface minutes later as a `build.rs` panic on whichever job reached
+surface minutes later as a `build.rs` error on whichever job reached
 `infr-vulkan` first.
 
 The action retries each install, and on Linux and Windows it caches the result

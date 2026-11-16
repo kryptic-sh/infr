@@ -6269,3 +6269,59 @@ ranges, and no sampler plan is cached across requests. Not read: MTP and
 Diffusion-Gemma sampling, `moe_sample.comp` and the argmax shaders, the
 recorder's sampling dispatch, CLI flag validation, and the tokenizer beyond the
 streaming detokenizer.
+
+### B196 — pull requests compile nothing for x86_64 macOS (2026-11-16)
+
+**Tag:** ci coverage · **Blocked on:** a decision on runner cost
+
+`dist` packages five targets but skips pull requests, and the table in
+`docs/ci-matrix.md` (§ Release targets on pull requests) lists what compiles
+each one there instead. `x86_64-apple-darwin` is the one with nothing: the
+`macos-15` runners are Apple Silicon, so `clippy`, `test` and `test-macos` all
+build `aarch64-apple-darwin`, and `metal-check` cross-lints that same triple
+from Linux. A break confined to x86_64 macOS (an x86_64 SIMD arm gated on
+`target_os = "macos"`, a `MACOSX_DEPLOYMENT_TARGET = 10.15` API floor) is found
+by the packaging leg on `main` after merge, as issue #93 was on aarch64 Linux
+before `linux-arm-check`.
+
+Options, none tried:
+
+- **`cargo check --target x86_64-apple-darwin` on a `macos-15` runner.** Xcode's
+  clang builds both arches, so the C/C++ build scripts (`ring`, `esaxx-rs`,
+  `onig_sys`) should work with no extra toolchain; this is a guess, not run.
+  Costs a macOS runner, the highest billing multiplier, for one check step.
+- **Add `x86_64-apple-darwin` to `metal-check`'s Linux cross-lint.** Cheap, and
+  the nine crates it covers include `infr-cpu`, which holds most of the
+  `target_arch` code, but it leaves out `infr-llama`, `infr-hub`, `infr-chat`,
+  `infr-engine`, `infr-server` and `infr-cli`, whose C/C++ dependencies need an
+  Apple SDK.
+- **Leave it.** x86_64 macOS shares `c_char` signedness with x86_64 Linux, which
+  `clippy` and `test` cover, and no `cfg` in `crates/` combines
+  `target_os = "macos"` with `x86_64` today, so the class of break this misses
+  is narrower than the aarch64 Linux one was.
+
+Separately, `linux-arm-check` runs `check`, not `clippy`. Nothing is lost by
+that today: `crates/` has no `target_arch = "aarch64"` cfg, so aarch64 Linux
+compiles the same code paths that `clippy` lints on x86_64 Linux and aarch64
+macOS. The first aarch64-only arm would be linted nowhere; switching the job to
+`cargo-zigbuild clippy` would then cover it at about the same cost.
+
+### B197 — Actions cache pressure: pull-request saves and per-run Zig entries (2026-11-16)
+
+**Tag:** ci cost · **Blocked on:** a decision; nothing is failing
+
+The repo's Actions cache was observed at about 10.43 GB in 35 entries, all on
+`main`, against GitHub's default 10 GB limit, so new entries evict old ones.
+`linux-arm-check` saves its Rust cache only on `main` (`save-if`) and runs
+setup-zig with `use-cache: false`. The rest of `ci.yml` was left as it was:
+
+- **Every other `Swatinem/rust-cache` step saves on pull requests too.** A pull
+  request's entry is readable only by that pull request, so each one can evict a
+  `main` entry that every later run would have used. The same
+  `save-if: ${{ github.ref == 'refs/heads/main' }}` would stop that, at the cost
+  of a cold second run within a long-lived pull request.
+- **`dist`'s setup-zig saves a new Zig cache entry on every run,** about 21 MB
+  each: the pinned action (v2.2.2) keys it on the run id and attempt. Turning it
+  off with `use-cache: false` is safe for what a release contains, since the
+  cache only speeds up zig's own builds, but would cost link time on both Linux
+  legs, unmeasured. Left alone because it touches the release job.

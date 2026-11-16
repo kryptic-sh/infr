@@ -284,9 +284,13 @@ cargo build --release -p infr-cli   # → target/release/infr
 ```
 
 Needs a stable Rust toolchain and `glslc` (shaderc; ships with the Vulkan SDK),
-which compiles the compute shaders at build time. At runtime only a GPU driver
-with Vulkan is required. Windows setup, step by step:
-[`docs/windows.md`](docs/windows.md).
+which compiles the compute shaders at build time. Use a current Vulkan SDK or
+shaderc 2026 or newer: shaderc 2026.1, 2026.3 and 2026.4 are known to build
+every shader, while 2023.8 (Ubuntu 24.04's package) is known not to. The build
+runs the `glslc` on `PATH`, else `$VULKAN_SDK/Bin`, and if a shader fails to
+compile it stops with one message naming the shader, the `glslc` and its
+version. At runtime only a GPU driver with Vulkan is required. Windows setup,
+step by step: [`docs/windows.md`](docs/windows.md).
 
 ## Documentation
 

@@ -738,8 +738,8 @@ pub(crate) enum SubgroupMode {
     /// Kernels that ask for a pinned width get it (32, or 16 for the Intel builds), and
     /// `shaders/wave64.glsl`'s `W64` stays false.
     Native,
-    /// Every pipeline pins 64 and sets `W64`, so `wave64.glsl` runs each 64-lane subgroup as two
-    /// 32-lane halves. `forced` = the device could pin 32, and `kernels.vulkan.force_wave64` (a
+    /// Every pipeline pins 64 and sets `W64`, so `wave64.glsl` gives each kernel 32-lane virtual
+    /// subgroups (see the header's own notes). `forced` = the device could pin 32, and `kernels.vulkan.force_wave64` (a
     /// testing knob) asked for this path anyway.
     Wave64 { forced: bool },
 }
@@ -790,6 +790,34 @@ pub(crate) fn subgroup_mode(p: &SubgroupProbe, force_wave64: bool) -> Result<Sub
         ));
     }
     Ok(mode)
+}
+
+/// Invocations in `wave64_probe.comp`'s one workgroup (its `local_size_x`).
+pub(crate) const WAVE64_PROBE_INVOCATIONS: usize = 32;
+
+/// Judge `wave64_probe.comp`'s readback: three words per invocation — the number of subgroups, the
+/// lanes in its subgroup, its inclusive-scan rank — which must read `(1, 32, index + 1)` for the
+/// wave64 path's assumptions to hold on this driver: a workgroup of at most 32 invocations is one
+/// subgroup (so `wave64.glsl` may use the plain subgroup operations for it, wherever its lanes sit
+/// in the wave), and the scan runs in invocation order (which `deltanet_gates.comp` reads).
+pub(crate) fn check_wave64_layout(out: &[u32]) -> Result<(), String> {
+    if out.len() != WAVE64_PROBE_INVOCATIONS * 3 {
+        return Err(format!(
+            "the wave64 probe returned {} words, expected {}",
+            out.len(),
+            WAVE64_PROBE_INVOCATIONS * 3
+        ));
+    }
+    for (i, w) in out.as_chunks::<3>().0.iter().enumerate() {
+        let want = [1, WAVE64_PROBE_INVOCATIONS as u32, i as u32 + 1];
+        if *w != want {
+            return Err(format!(
+                "a {WAVE64_PROBE_INVOCATIONS}-wide workgroup at subgroup 64: invocation {i} saw \
+                 (subgroups, lanes in its subgroup, scan rank) = {w:?}, expected {want:?}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────────────────────────
@@ -1545,5 +1573,23 @@ mod tests {
             subgroup_mode(&p, false),
             Ok(SubgroupMode::Wave64 { forced: false })
         );
+    }
+
+    #[test]
+    fn wave64_layout_check_accepts_only_one_ordered_subgroup() {
+        let good: Vec<u32> = (0..WAVE64_PROBE_INVOCATIONS as u32)
+            .flat_map(|i| [1, WAVE64_PROBE_INVOCATIONS as u32, i + 1])
+            .collect();
+        assert_eq!(check_wave64_layout(&good), Ok(()));
+        // Split into two subgroups of 16, scanned out of order, or truncated: each refused.
+        let mut split = good.clone();
+        for (i, w) in split.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            *w = [2, 16, (i % 16) as u32 + 1];
+        }
+        let mut reordered = good.clone();
+        reordered.swap(2, 5);
+        for bad in [split, reordered, good[..3].to_vec()] {
+            assert!(check_wave64_layout(&bad).is_err(), "{bad:?}");
+        }
     }
 }

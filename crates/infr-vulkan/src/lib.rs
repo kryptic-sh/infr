@@ -339,7 +339,7 @@ struct VulkanShared {
     rte_f16: AtomicBool,
     /// The wave64 path ([`crate::caps::SubgroupMode::Wave64`]): a wave64-only device (GCN), or one
     /// forced onto it by `kernels.vulkan.force_wave64`. Every pipeline pins subgroup 64 and sets
-    /// `shaders/wave64.glsl`'s `W64`, which runs the wave32 kernels as 32-lane halves.
+    /// `shaders/wave64.glsl`'s `W64`, which gives the wave32 kernels 32-lane virtual subgroups.
     wave64: bool,
     /// Set once the int8 coopmat accumulator-layout known-answer probe has run on this device:
     /// `true` = this driver lays the fragment out the way `native_gemm_i8cm_q8_0.comp` reads it.
@@ -2488,8 +2488,8 @@ impl VulkanBackend {
         match sg_mode {
             crate::caps::SubgroupMode::Native => {}
             crate::caps::SubgroupMode::Wave64 { forced: false } => tracing::info!(
-                "[infr] wave64-only device: running the wave32 kernels as 32-lane halves of each \
-                 64-wide subgroup; cooperative-matrix tiers off"
+                "[infr] wave64-only device: running the wave32 kernels on 32-lane virtual \
+                 subgroups; cooperative-matrix tiers off"
             ),
             crate::caps::SubgroupMode::Wave64 { forced: true } => tracing::warn!(
                 "[infr] kernels.vulkan.force_wave64: running the wave64 emulation on a device that \
@@ -2834,8 +2834,60 @@ impl VulkanBackend {
         // The int8 coopmat tier's accumulator-layout check — a real dispatch, so it can only run
         // once the backend exists. No-op unless that tier is actually asked for.
         backend.verify_i8_coopmat_layout();
+        // The wave64 path's one assumption about the driver, measured before any kernel relies on
+        // it: a failure refuses the device (or the forced path) instead of computing wrong.
+        if backend.shared.wave64 {
+            let layout = backend
+                .run_wave64_probe()
+                .and_then(|out| crate::caps::check_wave64_layout(&out).map_err(be));
+            if let Err(e) = layout {
+                return Err(be(format!(
+                    "the wave64 path is unsafe on this driver ({e}) — falling back to another \
+                     backend"
+                )));
+            }
+        }
 
         Ok(backend)
+    }
+
+    /// Dispatch `wave64_probe.comp` once and return its readback (see
+    /// [`crate::caps::check_wave64_layout`] for what the words mean). Built through the fallible
+    /// kernel path, outside the kernel cache, and torn down immediately.
+    fn run_wave64_probe(&self) -> Result<Vec<u32>> {
+        let k = crate::ops::try_make_compute_kernel(
+            &self.shared.device,
+            self.shared.pipeline_cache,
+            "wave64_probe",
+            crate::gemm::wave64_probe_spv(),
+            1,
+            0,
+            None,
+            self.shared.push_descriptor.is_some(),
+            self.kernel_limits(),
+            false,
+            self.shared.wave64,
+        )?;
+        let words = crate::caps::WAVE64_PROBE_INVOCATIONS * 3;
+        let run = || -> Result<Vec<u32>> {
+            let dst = self.alloc(words * 4, BufferUsage::Readback)?;
+            let vk_bufs = [as_vk_buf(dst.as_ref())?.buffer];
+            let binding = self.eager_bind(&k, &vk_bufs)?;
+            let shared = &self.shared;
+            self.one_shot(|cmd| unsafe {
+                shared
+                    .device
+                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+                binding.bind(shared, cmd, k.pipeline_layout);
+                shared.device.cmd_dispatch(cmd, 1, 1, 1);
+            })?;
+            let mut got = vec![0u8; words * 4];
+            self.download(dst.as_ref(), &mut got)?;
+            Ok(bytemuck::cast_slice(&got).to_vec())
+        };
+        let res = run();
+        crate::ops::destroy_compute_kernel(&self.shared.device, &k);
+        res
     }
 
     /// Declare round-to-nearest-even on f16 kernels only where the driver does not already do it.

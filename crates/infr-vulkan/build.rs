@@ -3397,6 +3397,10 @@ fn main() {
         // its `csub[i]` elements with — dispatched at init when that tier is opted into, and the
         // tier is REFUSED when the readback disagrees (see caps.rs `check_i8_coopmat_layout`).
         ("coopmat_i8_layout", "coopmat_i8_layout", &[]),
+        // Known-answer probe for the wave64 path's one-subgroup-per-small-workgroup assumption —
+        // dispatched at init on a device that takes that path, which is REFUSED when it fails
+        // (see caps.rs `check_wave64_layout`).
+        ("wave64_probe", "wave64_probe", &[]),
         ("native_gemm", "native_gemm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemm", "native_gemm_bf16", &["-DFMT_BF16"]),
         ("native_gemm", "native_gemm_q4_0", &["-DFMT_Q4_0"]),

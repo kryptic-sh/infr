@@ -2276,6 +2276,19 @@ pub(crate) fn coopmat_i8_layout_spv() -> &'static [u32] {
         )))
     })
 }
+/// SPIR-V for the wave64 path's known-answer probe (`wave64_probe.comp`) — dispatched once at init
+/// on a device that takes that path, to check that a 32-wide workgroup is one subgroup scanned in
+/// invocation order.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn wave64_probe_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/wave64_probe.spv"
+        )))
+    })
+}
 /// SPIR-V for the 256-thread subgroup RMSNorm (`y=rmsnorm(x,w)`). Used by the recorder's `rmsnorm`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn rmsnorm_spv() -> &'static [u32] {

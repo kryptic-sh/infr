@@ -2048,6 +2048,7 @@ fn top1_softmax(logits: &[f32]) -> (u32, f32) {
             amax = i;
         }
     }
+    // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
     let z: f32 = logits.iter().map(|&v| (v - m).exp()).sum();
     (amax as u32, 1.0 / z)
 }

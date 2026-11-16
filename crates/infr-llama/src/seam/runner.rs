@@ -3754,6 +3754,7 @@ pub(crate) fn generate_dense_backend_bound(
                 let mla_scale = if c.rope_scaling_yarn {
                     // fs_inv = ln(1/freq_scale) = ln(factor) — NOT ln(1/factor) (that is the
                     // negative; the GGUF's factor=40 gives +ln 40 = +3.6889).
+                    // libm-ok(S2): platform `ln`, moves to `infr_core::math` in S2
                     let fs_inv = c.rope_scaling_factor.ln();
                     let yarn_attn_factor = if c.rope_yarn_log_mul != 0.0 {
                         1.0 / (1.0 + 0.1 * fs_inv)

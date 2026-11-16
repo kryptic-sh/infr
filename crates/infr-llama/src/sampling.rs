@@ -637,6 +637,7 @@ fn truncated_softmax(
 ) -> (Vec<usize>, Vec<f32>) {
     let n = logits.len();
     let temp = if temp > 0.0 { temp } else { 1.0 };
+    // libm-ok(S2): platform `ln`, moves to `infr_core::math` in S2
     let min_logit = |maxl: f32| (min_p > 0.0).then(|| maxl + min_p.ln());
     let k = if top_k == 0 { n } else { top_k.min(n) };
     if k < n {
@@ -653,6 +654,7 @@ fn truncated_softmax(
         let maxl = logits[idx[0]];
         let mut probs: Vec<f32> = idx
             .iter()
+            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
             .map(|&i| ((logits[i] - maxl) / temp).exp())
             .collect();
         let sum: f32 = probs.iter().sum();
@@ -692,6 +694,7 @@ fn truncated_softmax(
         // sampled token, and `truncated_dist`'s MTP accept ratios). Note the index-order summation
         // is also what makes this arm bit-identical to what shipped before.
         let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
         let sum: f32 = logits.iter().map(|&l| ((l - maxl) / temp).exp()).sum();
         let min_logit = min_logit(maxl);
 
@@ -711,6 +714,7 @@ fn truncated_softmax(
             let mut idx = Vec::with_capacity(n);
             let mut probs = Vec::with_capacity(n);
             for (i, &l) in logits.iter().enumerate() {
+                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                 let p = ((l - maxl) / temp).exp() / sum;
                 if p > 0.0 && min_logit.is_none_or(|m| l >= m) {
                     idx.push(i);
@@ -752,6 +756,7 @@ fn truncated_softmax(
                     reached = true;
                     break;
                 }
+                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                 let p = ((logits[i] - maxl) / temp).exp() / sum;
                 probs.push(p);
                 cum += p;

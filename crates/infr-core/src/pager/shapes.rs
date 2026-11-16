@@ -59,6 +59,7 @@ impl Zipf {
         let mut acc = 0.0;
         let mut cdf: Vec<f64> = (0..n)
             .map(|k| {
+                // libm-ok(S2): an f64 pager workload shape, not inference output; S2 decides
                 acc += 1.0 / ((k + 1) as f64).powf(s);
                 acc
             })

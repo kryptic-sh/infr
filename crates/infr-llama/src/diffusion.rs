@@ -388,6 +388,7 @@ fn denoise_block(
                             }
                             let mut z_sum = 0f32;
                             for (v, &raw) in row.iter().enumerate() {
+                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                                 let e = (raw * temp_inv - m).exp();
                                 escratch[v] = e;
                                 z_sum += e;
@@ -400,6 +401,7 @@ fn denoise_block(
                             for (v, &e) in escratch.iter().enumerate() {
                                 let p = e / z_sum;
                                 if p > 0.0 {
+                                    // libm-ok(S2): platform `ln`, moves to `infr_core::math` in S2
                                     h -= p * p.ln();
                                 }
                                 cum += e;

@@ -122,6 +122,7 @@ pub(super) fn diffusion_self_cond(
                 .fold(f32::NEG_INFINITY, |m, &v| m.max(v * temp_inv));
             let mut denom = 0f32;
             for (p, &v) in pr.iter_mut().zip(logits_row) {
+                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                 *p = (v * temp_inv - mx).exp();
                 denom += *p;
             }
@@ -194,6 +195,7 @@ pub(super) fn diffusion_self_cond(
             let gd: f32 = grow.iter().zip(normed).map(|(&w, &x)| w * x).sum();
             let ud: f32 = urow.iter().zip(normed).map(|(&w, &x)| w * x).sum();
             // gelu_pytorch_tanh, matching `infr_cpu::act_fn(Activation::Gelu, ..)` exactly.
+            // libm-ok(S2): platform `tanh`, moves to `infr_core::math` in S2
             let gelu = 0.5 * gd * (1.0 + (0.797_884_6 * (gd + 0.044715 * gd * gd * gd)).tanh());
             *a = gelu * ud;
         }

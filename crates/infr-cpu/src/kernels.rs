@@ -6483,9 +6483,12 @@ pub(crate) fn dot_mn<const M: usize, const N: usize>(
 #[cfg_attr(infr_profile, infr_prof::skip)]
 pub(crate) fn act_fn(act: Activation, g: f32) -> f32 {
     match act {
+        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
         Activation::Silu => g / (1.0 + (-g).exp()),
         // gelu_pytorch_tanh: 0.5 g (1 + tanh(√(2/π)·(g + 0.044715 g³)))
+        // libm-ok(S2): platform `tanh`, moves to `infr_core::math` in S2
         Activation::Gelu => 0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh()),
+        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
         Activation::Sigmoid => 1.0 / (1.0 + (-g).exp()),
     }
 }

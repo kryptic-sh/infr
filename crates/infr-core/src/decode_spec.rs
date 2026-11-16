@@ -214,6 +214,7 @@ impl BlockSpec {
 /// Nearest E8M0 byte for a positive `v`: the exponent `e` such that `2^(e-127)` is closest to `v`
 /// in log space, clamped to the finite band. (MXFP4's shared exponent.)
 fn e8m0_from_f32(v: f32) -> u8 {
+    // libm-ok(S2): an E8M0 exponent from `log2`; S2 takes it from the bits
     let e = (v.abs().max(f32::MIN_POSITIVE).log2().round() as i32) + 127;
     e.clamp(1, 254) as u8
 }

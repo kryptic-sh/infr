@@ -1589,6 +1589,7 @@ fn host_causal_conv(
             }
             acc += xt[ch] * ws[ch * kk + (kk - 1)];
             out[t * cc + ch] = if silu {
+                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                 acc / (1.0 + (-acc).exp())
             } else {
                 acc
@@ -1610,8 +1611,11 @@ fn host_causal_conv(
 fn act_fn(act: infr_core::graph::Activation, g: f32) -> f32 {
     use infr_core::graph::Activation;
     match act {
+        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
         Activation::Silu => g / (1.0 + (-g).exp()),
+        // libm-ok(S2): platform `tanh`, moves to `infr_core::math` in S2
         Activation::Gelu => 0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh()),
+        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
         Activation::Sigmoid => 1.0 / (1.0 + (-g).exp()),
     }
 }
@@ -2873,6 +2877,7 @@ impl MetalBackend {
                         }
                         let mut sum = 0.0f32;
                         for i in 0..dim {
+                            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                             let e = (xrow[i] * scale - m0).exp();
                             ds[ri * dim + i] = e;
                             sum += e;
@@ -5257,6 +5262,7 @@ impl MetalBackend {
                         .map(|e| (0..ne).map(|i| rw[e * ne + i] * xrr[i]).sum::<f32>())
                         .collect();
                     let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                     let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
                     let psum: f32 = probs.iter().sum();
                     for p in probs.iter_mut() {
@@ -5714,11 +5720,14 @@ impl MetalBackend {
                         for x in kh.iter_mut() {
                             *x /= kn;
                         }
+                        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                         let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
                         let sp = {
                             let z = af[bb + h] + dtb[h];
+                            // libm-ok(S2): platform `exp`, `ln_1p`, moves to `infr_core::math` in S2
                             z.max(0.0) + (-z.abs()).exp().ln_1p()
                         };
+                        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                         let decay = (acoef[h] * sp).exp();
                         let sh = &mut st[h * kd * vd..(h + 1) * kd * vd]; // [kd, vd]
                         for x in sh.iter_mut() {

@@ -40,9 +40,10 @@ What it does not do, and the reasons:
   goes for the recurrent (DeltaNet), MLA and diffusion layers, which have no
   row-addressed cache at all. On Gemma 4 E4B that is 35 of 42 layers, so paging
   buys little there and a great deal on a full-attention model.
-- **A paged slot skips the host store.** `kv.store_mb` would upload into row 0 of
-  a slot whose rows start at its block; the pool already shares prefixes between
-  live slots, so the keys are simply not used. The two knobs are independent.
+- **A paged slot composes with the host store.** `kv.store_mb`'s capture and
+  restore offset every layer by the slot's row base, so a recycled slot restores
+  into its block (and copies a page it shares before it writes).
+  `tests/kv_paged_session.rs` runs both knobs together.
 - **The gemma4 MTP draft refuses a paged trunk**, because it reads the trunk's
   cache rows by position.
 

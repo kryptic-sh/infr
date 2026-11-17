@@ -1073,6 +1073,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// gates. (`kernels.cpu.reference` is on the same struct but has no env key — it was never a
     /// variable, so it is not in `KEYS`.)
     const S3: &[&str] = &[
+        "INFR_CPU_MATH_TIER",
         "INFR_CPU_NO_SPINPOOL",
         "INFR_CPU_OP_HASH",
         "INFR_CPU_REPACK_MB",

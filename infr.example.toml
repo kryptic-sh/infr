@@ -181,6 +181,7 @@ spinpool = true
 repack_mb = 4096 # repack-cache budget, MiB
 reference = false # bit-reference kernels (no env twin)
 core_spread = true # pool threads off each other's SMT siblings (Windows; no env twin)
+# math_tier = "baseline" # force the math slices' SIMD tier (baseline/avx2/avx512); debug only
 
 # ── Profiling ──────────────────────────────────────────────────────────────────
 # wmma_tile = "2x2"   # exactly 1x1 / 2x1 / 2x2; default: unset = shape-driven

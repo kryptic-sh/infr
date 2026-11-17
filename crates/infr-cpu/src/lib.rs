@@ -34,6 +34,7 @@ use infr_core::config::Config;
 use infr_core::error::Result;
 use infr_core::exec::Provision;
 use infr_core::graph::{Activation, AttnMask, Graph, MoeGating, Op};
+use infr_core::math;
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant::dequant_block;
 use infr_gguf::TensorBytes;
@@ -352,7 +353,19 @@ impl CpuBackend {
     /// A backend that reads its knobs from `cfg`. This is the constructor the campaign is heading
     /// for: no environment, no globals, no process-wide ordering hazard — two backends with
     /// different configurations can coexist in one test.
+    ///
+    /// # Panics
+    /// If `kernels.cpu.math_tier` names a tier that does not exist or that this CPU cannot run:
+    /// a debug switch that silently ran another tier would measure the wrong thing.
     pub fn new_with(cfg: Arc<Config>) -> Self {
+        if let Some(name) = &cfg.kernels.cpu.math_tier {
+            let tier = math::Tier::parse(name).unwrap_or_else(|| {
+                panic!("kernels.cpu.math_tier: unknown tier `{name}` (baseline, avx2 or avx512)")
+            });
+            if let Err(e) = math::force_tier(tier) {
+                panic!("kernels.cpu.math_tier: {e}");
+            }
+        }
         Self {
             weight_cache: Mutex::default(),
             repack_cache: Mutex::default(),

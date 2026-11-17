@@ -5,14 +5,21 @@
 //! `x = k*ln(2)/64 + r` with `k = round(64x/ln 2)` and `|r| <= ln(2)/128 + 2^-60`, so that
 //! `e^x = 2^(k>>6) * 2^((k&63)/64) * e^r`. The 64 values `2^(j/64)` are a double-double table;
 //! `ln(2)/64` is split into three parts whose first two have 39 bits, so `k*part` is exact for
-//! the `|k| < 2^14` every caller produces. `e^r - 1` is its Taylor polynomial.
+//! the `|k| < 2^14` every caller produces. `e^r - 1` is its Taylor polynomial. `tanh`, `powf`
+//! and the double-double paths use this form.
 //!
-//! **The binary64 value's error.** `x - k*C1` is exact (`k*C1` is exact and within a factor 2
-//! of `x` when `k != 0`); subtracting `k*C2` rounds once (relative `2^-53` of `|r|`); `k*C3`,
-//! omitted, is below `2^-70`. The degree-6 Taylor polynomial of `e^r - 1` leaves
-//! `|r|^7/7! < 2^-65`, and evaluating it costs at most `2.1 * 2^-53` relative of `|q| < 0.0055`.
-//! `T + (T*q + T_lo)` then rounds once more (`2^-53` relative), and `2^(k>>6)` is exact. The
-//! total relative error is below `1.1 * 2^-53`.
+//! **`exp`'s binary64 value** ([`exp_fast`], the hot path of every softmax and SiLU) uses the
+//! same reduction with 256 table entries, which shortens the polynomial: `x = k*ln(2)/256 + r`,
+//! `|r| <= ln(2)/512 + 2^-60`, `ln(2)/256` in two parts (the first with 37 bits, so `k*C1` is
+//! exact for the `|k| < 2^16` the clamped input gives). `2^(k>>8) * T_hi` is built by one
+//! integer addition to the table entry's bits rather than a multiply by a constructed power of
+//! two, and `T_lo` enters as `T_lo/T_hi` (see [`EXP2_J256_BITS`]); `e^r - 1` is the degree-4
+//! Taylor polynomial by Estrin's scheme. Its error: `x - k*C1` is exact (Sterbenz), subtracting
+//! `k*C2` rounds once (`2^-53` of `|r| < 0.0014`); the omitted `k*C3` is below `2^-80`; the
+//! polynomial leaves `|r|^5/5! < 2^-54.6` and its evaluation costs below `2^-62` relative of the
+//! result; `T_lo/T_hi` is off by `2^-106`; `s*(q + T_lo/T_hi)` rounds within `2^-62` of the
+//! result and the final `s + ...` once (`2^-53`). The total relative error is below
+//! `1.4 * 2^-53`.
 //!
 //! **Why `exp` and `tanh` round that value directly.** The CORE-MATH structure checks whether
 //! every real number within the error bound rounds to the same binary32 and otherwise takes a
@@ -40,7 +47,10 @@
 #[cfg(test)]
 use super::dd::{dd_to_f32, exp2i};
 use super::dd::{horner, horner_dd, pow2, two_sum, Dd};
-use super::tables::{EXP2_J64, INV_FACT, INV_LN2_64, LN2_64_1, LN2_64_2, LN2_64_3};
+use super::tables::{
+    EXP2_J256, EXP2_J64, INV_FACT, INV_LN2_256, INV_LN2_64, LN2_256_1, LN2_256_2, LN2_64_1,
+    LN2_64_2, LN2_64_3,
+};
 use super::NAN;
 
 /// `1.5 * 2^52`: adding and subtracting it rounds a binary64 of magnitude below `2^51` to the
@@ -108,10 +118,45 @@ pub(super) fn exp_lane(x: f32) -> f32 {
 /// `exp`'s binary64 value for `EXP_UNDERFLOW <= x <= EXP_OVERFLOW`.
 #[inline(always)]
 pub(super) fn exp_fast(x: f64) -> f64 {
-    let (k, r) = reduce(x);
-    let (th, tl) = EXP2_J64[(k & 63) as usize];
-    (th + (th * expm1_poly(r) + tl)) * pow2(k >> 6)
+    let t = x * INV_LN2_256 + SHIFT;
+    let kf = t - SHIFT;
+    let r = (x - kf * LN2_256_1) - kf * LN2_256_2;
+    let ki = t.to_bits();
+    let j = (ki & 255) as usize;
+    let s = f64::from_bits(EXP2_J256_BITS[j].wrapping_add(ki << 44));
+    let tr = EXP2_J256_REL[j];
+    let r2 = r * r;
+    let q = r + r2 * ((INV_FACT[2].0 + r * INV_FACT[3].0) + r2 * INV_FACT[4].0);
+    s + s * (q + tr)
 }
+
+/// [`EXP2_J256`] for building `2^(k/256)` by one integer addition: entry `j` holds the bits of
+/// `T_j = 2^(j/256)`'s high part minus `j << 44`. Adding `k << 44` (from the reduction's
+/// shifted value, whose low bits are `k`) gives the bits of `2^(k>>8) * T_hi`, exactly:
+/// `k << 44 = ((k>>8) << 52) + ((k&255) << 44)` modulo `2^64`, and the exponent stays in range
+/// for every `k` [`exp_lane`]'s clamped input produces. Computed at compile time from the
+/// generated table by exact bit arithmetic.
+const EXP2_J256_BITS: [u64; 256] = {
+    let mut t = [0u64; 256];
+    let mut j = 0;
+    while j < 256 {
+        t[j] = EXP2_J256[j].0.to_bits().wrapping_sub((j as u64) << 44);
+        j += 1;
+    }
+    t
+};
+
+/// `T_lo/T_hi` for each entry of [`EXP2_J256`].
+const EXP2_J256_REL: [f64; 256] = {
+    let mut t = [0f64; 256];
+    let mut j = 0;
+    while j < 256 {
+        let (hi, lo) = EXP2_J256[j];
+        t[j] = lo / hi;
+        j += 1;
+    }
+    t
+};
 
 /// `exp`'s double-double path: the correctly rounded result the exhaustive test compares the
 /// binary64 value against.

@@ -768,7 +768,7 @@ fn helper_special_values() {
 
 type Slice = fn(&mut [f32]);
 
-/// Every in-place slice function, by the name of its scalar function.
+/// Every in-place slice function, by the name of its scalar function, at the active tier.
 const SLICES: &[(&str, Slice)] = &[
     ("exp", math::exp_slice),
     ("tanh", math::tanh_slice),
@@ -790,6 +790,70 @@ fn exp_to_copy(xs: &mut [f32]) {
     math::exp_slice_to(&src, xs);
 }
 
+/// A slice function as a value: one tier's, or the active tier's.
+type DynSlice = Box<dyn Fn(&mut [f32]) + Sync>;
+
+/// The same functions as [`SLICES`], taken from one tier's table.
+fn tier_slices(f: &'static math::SliceFns) -> Vec<(&'static str, DynSlice)> {
+    vec![
+        ("exp", Box::new(f.exp)),
+        ("tanh", Box::new(f.tanh)),
+        ("sigmoid", Box::new(f.sigmoid)),
+        ("silu", Box::new(f.silu)),
+        ("gelu_tanh", Box::new(f.gelu_tanh)),
+        ("exp_sub", Box::new(|xs: &mut [f32]| (f.exp_sub)(xs, 3.0))),
+        (
+            "exp_to",
+            Box::new(|xs: &mut [f32]| {
+                let src = xs.to_vec();
+                (f.exp_to)(&src, xs)
+            }),
+        ),
+    ]
+}
+
+/// The tiers this CPU supports, found WITHOUT `math::Tier::supported` (the code under test), so
+/// a tier the test skips is one the CPU really lacks.
+fn host_tiers() -> Vec<math::Tier> {
+    #[allow(unused_mut)]
+    let mut v = vec![math::Tier::Baseline];
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::is_x86_feature_detected as has;
+        if has!("avx2") {
+            v.push(math::Tier::Avx2);
+        }
+        if has!("avx512f") && has!("avx512dq") && has!("avx512vl") && has!("avx512bw") {
+            v.push(math::Tier::Avx512);
+        }
+    }
+    v
+}
+
+/// Each tier's table for every tier this CPU has, asserting the module agrees on which those
+/// are; prints the tiers it skips.
+fn tiers_to_test() -> Vec<&'static math::SliceFns> {
+    let host = host_tiers();
+    let mut out = Vec::new();
+    for t in math::Tier::ALL {
+        match math::slice_fns(t) {
+            Some(f) => {
+                assert!(host.contains(&t), "{t:?} offered but the CPU lacks it");
+                assert_eq!(f.tier, t, "{t:?}: table of the wrong tier");
+                out.push(f);
+            }
+            None => {
+                assert!(
+                    !host.contains(&t),
+                    "{t:?}: the CPU has it, the module refuses it"
+                );
+                println!("tier {}: SKIPPED, not supported by this CPU", t.name());
+            }
+        }
+    }
+    out
+}
+
 const SLICE_SCALAR: &[(&str, Unary)] = &[
     ("exp", math::exp),
     ("tanh", math::tanh),
@@ -800,90 +864,144 @@ const SLICE_SCALAR: &[(&str, Unary)] = &[
     ("exp_to", math::exp),
 ];
 
-/// Each slice function equals its scalar function element for element on a dense grid, for
-/// awkward lengths and unaligned starts (the vectorized loop's head, body and tail).
+/// Each slice function, at every tier this CPU supports and at the active tier, equals its
+/// scalar function element for element on a dense grid, for awkward lengths and unaligned
+/// starts (the vectorized loop's head, body and tail). It asserts it ran every tier the CPU
+/// has, and prints the ones it skipped.
 #[test]
 fn slices_equal_scalars() {
     let mut xs = grid("silu");
     xs.extend(grid("exp"));
-    let lens = [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64, 65, 1000];
-    for (name, slice) in SLICES {
-        let scalar = SLICE_SCALAR.iter().find(|(n, _)| n == name).unwrap().1;
-        // The whole grid in one call.
-        let mut v = xs.clone();
-        slice(&mut v);
-        for (x, y) in xs.iter().zip(&v) {
-            assert_eq!(
-                y.to_bits(),
-                scalar(*x).to_bits(),
-                "{name}({:08x})",
-                x.to_bits()
-            );
-        }
-        // Short slices at every start offset 0..4 (alignment) into a buffer.
-        for &n in &lens {
-            for start in 0..4 {
-                let src = &xs[1000 + start..1000 + start + n];
-                let mut buf = vec![0f32; n + 4];
-                buf[start..start + n].copy_from_slice(src);
-                slice(&mut buf[start..start + n]);
-                for (x, y) in src.iter().zip(&buf[start..start + n]) {
-                    assert_eq!(
-                        y.to_bits(),
-                        scalar(*x).to_bits(),
-                        "{name} len {n} at {start}"
-                    );
+    let lens = [0usize, 1, 3, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64, 65, 1000];
+    let mut cases: Vec<(String, Vec<(&str, DynSlice)>)> = tiers_to_test()
+        .into_iter()
+        .map(|f| (f.tier.name().to_string(), tier_slices(f)))
+        .collect();
+    cases.push((
+        "active".to_string(),
+        SLICES
+            .iter()
+            .map(|&(n, s)| (n, Box::new(s) as DynSlice))
+            .collect(),
+    ));
+    let mut ran = Vec::new();
+    for (tier, slices) in &cases {
+        for (name, slice) in slices {
+            let scalar = SLICE_SCALAR.iter().find(|(n, _)| n == name).unwrap().1;
+            // The whole grid in one call.
+            let mut v = xs.clone();
+            slice(&mut v);
+            for (x, y) in xs.iter().zip(&v) {
+                assert_eq!(
+                    y.to_bits(),
+                    scalar(*x).to_bits(),
+                    "{tier} {name}({:08x})",
+                    x.to_bits()
+                );
+            }
+            // Short slices at every start offset 0..4 (alignment) into a buffer.
+            for &n in &lens {
+                for start in 0..4 {
+                    let src = &xs[1000 + start..1000 + start + n];
+                    let mut buf = vec![0f32; n + 4];
+                    buf[start..start + n].copy_from_slice(src);
+                    slice(&mut buf[start..start + n]);
+                    for (x, y) in src.iter().zip(&buf[start..start + n]) {
+                        assert_eq!(
+                            y.to_bits(),
+                            scalar(*x).to_bits(),
+                            "{tier} {name} len {n} at {start}"
+                        );
+                    }
                 }
             }
         }
+        ran.push(tier.clone());
     }
+    let want: Vec<String> = host_tiers()
+        .iter()
+        .map(|t| t.name().to_string())
+        .chain(["active".to_string()])
+        .collect();
+    assert_eq!(ran, want, "tiers checked");
+    println!("tiers checked: {ran:?}");
     // A mismatched destination is refused.
     let r = std::panic::catch_unwind(|| math::exp_slice_to(&[1.0, 2.0], &mut [0.0]));
     assert!(r.is_err());
 }
 
-/// Each slice function equals its scalar function on every binary32 input, in batches.
+/// The tier switch: names round-trip, an unsupported tier is refused, and a forced tier is the
+/// one the slice functions then run. (Process-wide: the other tests take each tier's table
+/// directly and do not depend on which tier is active.)
 #[test]
-#[ignore = "exhaustive: all 2^32 inputs per slice function; run in release"]
-fn exhaustive_slices_equal_scalars() {
-    for (name, slice) in SLICES {
-        let scalar = SLICE_SCALAR.iter().find(|(n, _)| n == name).unwrap().1;
-        let t0 = Instant::now();
-        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()) as u64;
-        let chunk = (1u64 << 32).div_ceil(threads);
-        let bad: u64 = std::thread::scope(|s| {
-            let hs: Vec<_> = (0..threads)
-                .map(|t| {
-                    s.spawn(move || {
-                        const BATCH: u64 = 1 << 16;
-                        let mut buf = vec![0f32; BATCH as usize];
-                        let mut bad = 0u64;
-                        let end = ((t + 1) * chunk).min(1 << 32);
-                        let mut b = t * chunk;
-                        while b < end {
-                            let n = BATCH.min(end - b) as usize;
-                            for (i, v) in buf[..n].iter_mut().enumerate() {
-                                *v = f32::from_bits((b + i as u64) as u32);
-                            }
-                            slice(&mut buf[..n]);
-                            for (i, y) in buf[..n].iter().enumerate() {
-                                let x = f32::from_bits((b + i as u64) as u32);
-                                bad += (y.to_bits() != scalar(x).to_bits()) as u64;
-                            }
-                            b += n as u64;
-                        }
-                        bad
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().unwrap()).sum()
-        });
-        println!(
-            "{name}_slice: {bad} of 2^32 inputs differ from the scalar function, {:.1} s",
-            t0.elapsed().as_secs_f64()
-        );
-        assert_eq!(bad, 0, "{name}");
+fn tier_switch() {
+    for t in math::Tier::ALL {
+        assert_eq!(math::Tier::parse(t.name()), Some(t));
+        assert_eq!(math::Tier::parse(&t.name().to_uppercase()), Some(t));
     }
+    assert_eq!(math::Tier::parse("sse9"), None);
+    let host = host_tiers();
+    assert_eq!(math::Tier::best(), *host.last().unwrap());
+    for t in math::Tier::ALL {
+        let r = math::force_tier(t);
+        assert_eq!(r.is_ok(), host.contains(&t), "{t:?}: {r:?}");
+        if r.is_ok() {
+            assert_eq!(math::tier(), t);
+        }
+    }
+    math::force_tier(math::Tier::best()).unwrap();
+}
+
+/// Each slice function equals its scalar function on every binary32 input, in batches, at
+/// every tier this CPU supports.
+#[test]
+#[ignore = "exhaustive: all 2^32 inputs per slice function and tier; run in release"]
+fn exhaustive_slices_equal_scalars() {
+    let mut ran = Vec::new();
+    for f in tiers_to_test() {
+        for (name, slice) in tier_slices(f) {
+            let scalar = SLICE_SCALAR.iter().find(|(n, _)| *n == name).unwrap().1;
+            let slice = &slice;
+            let t0 = Instant::now();
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get()) as u64;
+            let chunk = (1u64 << 32).div_ceil(threads);
+            let bad: u64 = std::thread::scope(|s| {
+                let hs: Vec<_> = (0..threads)
+                    .map(|t| {
+                        s.spawn(move || {
+                            const BATCH: u64 = 1 << 16;
+                            let mut buf = vec![0f32; BATCH as usize];
+                            let mut bad = 0u64;
+                            let end = ((t + 1) * chunk).min(1 << 32);
+                            let mut b = t * chunk;
+                            while b < end {
+                                let n = BATCH.min(end - b) as usize;
+                                for (i, v) in buf[..n].iter_mut().enumerate() {
+                                    *v = f32::from_bits((b + i as u64) as u32);
+                                }
+                                slice(&mut buf[..n]);
+                                for (i, y) in buf[..n].iter().enumerate() {
+                                    let x = f32::from_bits((b + i as u64) as u32);
+                                    bad += (y.to_bits() != scalar(x).to_bits()) as u64;
+                                }
+                                b += n as u64;
+                            }
+                            bad
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).sum()
+            });
+            println!(
+                "{} {name}_slice: {bad} of 2^32 inputs differ from the scalar function, {:.1} s",
+                f.tier.name(),
+                t0.elapsed().as_secs_f64()
+            );
+            assert_eq!(bad, 0, "{} {name}", f.tier.name());
+        }
+        ran.push(f.tier);
+    }
+    assert_eq!(ran, host_tiers(), "tiers checked");
 }
 
 // ── speed, for information ───────────────────────────────────────────────────────────────────
@@ -945,28 +1063,44 @@ fn bench_against_std() {
         let (a, b) = (median(a), median(b));
         println!("{name:<24} {a:>10.2} {b:>10.2} {:>7.2}", a / b);
     }
-    // Slices, per element, against a plain loop of the platform's scalar function writing the
-    // same expression (which is what today's call sites do).
-    let slice_cases: Vec<(&str, Vec<f32>, Slice, Slice)> = vec![
-        ("exp_slice", lin(-20.0, 0.0), math::exp_slice, |v| {
-            v.iter_mut().for_each(|x| *x = x.exp())
-        }),
-        ("exp_sub_slice", lin(-10.0, 10.0), exp_sub_3, |v| {
-            v.iter_mut().for_each(|x| *x = (*x - 3.0).exp())
-        }),
-        ("tanh_slice", lin(-6.0, 6.0), math::tanh_slice, |v| {
-            v.iter_mut().for_each(|x| *x = x.tanh())
-        }),
-        ("sigmoid_slice", lin(-6.0, 6.0), math::sigmoid_slice, |v| {
-            v.iter_mut().for_each(|x| *x = 1.0 / (1.0 + (-*x).exp()))
-        }),
-        ("silu_slice", lin(-6.0, 6.0), math::silu_slice, |v| {
-            v.iter_mut().for_each(|x| *x = *x / (1.0 + (-*x).exp()))
-        }),
+    // Slices, per element, at every tier this CPU has, against a plain loop of the platform's
+    // scalar function writing the same expression (which is what the call sites did before).
+    type Pick = fn(&'static math::SliceFns) -> DynSlice;
+    let slice_cases: Vec<(&str, Vec<f32>, Pick, Slice)> = vec![
+        (
+            "exp_slice",
+            lin(-20.0, 0.0),
+            |f| Box::new(f.exp),
+            |v| v.iter_mut().for_each(|x| *x = x.exp()),
+        ),
+        (
+            "exp_sub_slice",
+            lin(-10.0, 10.0),
+            |f| Box::new(move |v: &mut [f32]| (f.exp_sub)(v, 3.0)),
+            |v| v.iter_mut().for_each(|x| *x = (*x - 3.0).exp()),
+        ),
+        (
+            "tanh_slice",
+            lin(-6.0, 6.0),
+            |f| Box::new(f.tanh),
+            |v| v.iter_mut().for_each(|x| *x = x.tanh()),
+        ),
+        (
+            "sigmoid_slice",
+            lin(-6.0, 6.0),
+            |f| Box::new(f.sigmoid),
+            |v| v.iter_mut().for_each(|x| *x = 1.0 / (1.0 + (-*x).exp())),
+        ),
+        (
+            "silu_slice",
+            lin(-6.0, 6.0),
+            |f| Box::new(f.silu),
+            |v| v.iter_mut().for_each(|x| *x = *x / (1.0 + (-*x).exp())),
+        ),
         (
             "gelu_tanh_slice",
             lin(-6.0, 6.0),
-            math::gelu_tanh_slice,
+            |f| Box::new(f.gelu_tanh),
             |v| {
                 v.iter_mut().for_each(|x| {
                     let g = *x;
@@ -975,25 +1109,35 @@ fn bench_against_std() {
             },
         ),
     ];
-    let time_slice = |xs: &[f32], f: Slice| -> f64 {
+    let time_slice = |xs: &[f32], f: &dyn Fn(&mut [f32])| -> f64 {
         let mut v = xs.to_vec();
         let t = Instant::now();
         f(std::hint::black_box(&mut v));
         std::hint::black_box(&v);
         t.elapsed().as_nanos() as f64 / xs.len() as f64
     };
-    println!(
-        "{:<24} {:>10} {:>10} {:>7}",
-        "slice (per element)", "math ns", "std ns", "ratio"
-    );
-    for (name, xs, ours, theirs) in &slice_cases {
-        let (mut a, mut b) = (Vec::new(), Vec::new());
+    let tiers = tiers_to_test();
+    print!("{:<24} {:>10}", "slice (ns per element)", "std");
+    for f in &tiers {
+        print!(" {:>10}", f.tier.name());
+    }
+    println!();
+    for (name, xs, pick, theirs) in &slice_cases {
+        let ours: Vec<DynSlice> = tiers.iter().map(|f| pick(f)).collect();
+        let mut b = Vec::new();
+        let mut a: Vec<Vec<f64>> = vec![Vec::new(); ours.len()];
+        // Interleaved: each round times the platform loop and every tier once.
         for _ in 0..ROUNDS {
-            a.push(time_slice(xs, *ours));
-            b.push(time_slice(xs, *theirs));
+            b.push(time_slice(xs, theirs));
+            for (o, t) in ours.iter().zip(&mut a) {
+                t.push(time_slice(xs, o.as_ref()));
+            }
         }
-        let (a, b) = (median(a), median(b));
-        println!("{name:<24} {a:>10.2} {b:>10.2} {:>7.2}", a / b);
+        print!("{name:<24} {:>10.2}", median(b));
+        for t in a {
+            print!(" {:>10.2}", median(t));
+        }
+        println!();
     }
     let pairs: Vec<(f32, f32)> = (0..N)
         .map(|i| (1_000_000.0f32, -2.0 * (i % 64) as f32 / 128.0))

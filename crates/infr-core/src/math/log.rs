@@ -160,9 +160,19 @@ pub(super) fn ln_1p_fast(x: f32) -> f64 {
     } else if x < LN1P_BIG {
         ln_fast(1.0 + xd, 0.0)
     } else {
-        let c = 1.0 / xd;
-        ln_fast(xd, c - 0.5 * c * c)
+        ln_1p_big(xd)
     }
+}
+
+/// [`ln_1p_fast`] from `LN1P_BIG` up, kept out of line. Inlined, a baseline x86-64 build of
+/// `ln_1p` took about 2.5 times as long per call as a native one on inputs that never reach this
+/// branch, and out of line the two are level (docs/math.md); the compiler presumably computed
+/// the branch's division speculatively.
+#[cold]
+#[inline(never)]
+fn ln_1p_big(xd: f64) -> f64 {
+    let c = 1.0 / xd;
+    ln_fast(xd, c - 0.5 * c * c)
 }
 
 /// [`ln`]'s accurate path, kept out of line.

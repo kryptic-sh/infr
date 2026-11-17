@@ -58,16 +58,19 @@
 //! [`silu_slice`] and [`gelu_tanh_slice`] apply the scalar functions to every element. Each
 //! element goes through the SAME branch-free lane function the scalar version is (only
 //! `+ - * /`, conversions, comparisons used as selects and table lookups by integer index), in
-//! a plain loop the compiler vectorizes for whatever SIMD the build targets; there are no
-//! intrinsics and no `std::simd`. So each slice function equals its scalar function element
-//! for element by construction, on every target; the tests check it on every binary32 input.
-//! `ln`, `ln_1p`, `sin`/`cos` and `powf` have no slice form: they are not per-element hot paths
-//! (RoPE's `powf(theta, -2p/d)` depends only on the op's shape and the caller can hoist it).
+//! a loop the compiler vectorizes; there are no intrinsics and no `std::simd`. The loops are
+//! compiled once per SIMD [`Tier`] and the widest the CPU supports is chosen at run time (see
+//! `slices.rs`), so a baseline build still runs AVX2 or AVX-512 where the CPU has it. Each slice
+//! function equals its scalar function element for element by construction, at every tier and
+//! on every target; the tests check it on every binary32 input. `ln`, `ln_1p`, `sin`/`cos` and
+//! `powf` have no slice form: they are not per-element hot paths (RoPE's `powf(theta, -2p/d)`
+//! depends only on the op's shape and the caller can hoist it).
 
 mod dd;
 mod exp;
 mod log;
 mod pow;
+mod slices;
 mod tables;
 mod trig;
 
@@ -77,6 +80,10 @@ mod fast_path_tests;
 pub use exp::{exp, tanh};
 pub use log::{ln, ln_1p};
 pub use pow::powf;
+pub use slices::{
+    exp_slice, exp_slice_to, exp_sub_slice, force_tier, gelu_tanh_slice, sigmoid_slice, silu_slice,
+    slice_fns, tanh_slice, tier, SliceFns, Tier,
+};
 pub use trig::{cos, sin, sin_cos};
 
 use exp::{exp_lane, tanh_lane};
@@ -94,29 +101,72 @@ fn canon(v: f32) -> f32 {
     }
 }
 
-/// `1 / (1 + e^-x)`, as `kernels.rs`'s `act_fn` and the gating call sites write it.
+/// `1 / (1 + e^-x)`, as the CPU backend's gated activation and gating call sites wrote it.
 #[inline]
 pub fn sigmoid(x: f32) -> f32 {
-    canon(1.0 / (1.0 + exp_lane(-x)))
+    sigmoid_lane(x)
 }
 
-/// `x / (1 + e^-x)`, as `act_fn`'s SiLU and the gated norms write it. At `-inf` that
+/// [`sigmoid`], for inlining into the slice loops.
+#[inline(always)]
+fn sigmoid_lane(x: f32) -> f32 {
+    sigmoid_finish(exp_lane(-x))
+}
+
+/// [`sigmoid`] from `e = exp(-x)`.
+#[inline(always)]
+fn sigmoid_finish(e: f32) -> f32 {
+    canon(1.0 / (1.0 + e))
+}
+
+/// `x / (1 + e^-x)`, as the CPU backend's SiLU and gated norms wrote it. At `-inf` that
 /// expression is `-inf/inf`, NaN, which is what today's call sites compute too (see
 /// `docs/math.md`); it is returned as [`NAN`].
 #[inline]
 pub fn silu(x: f32) -> f32 {
-    canon(x / (1.0 + exp_lane(-x)))
+    silu_lane(x)
+}
+
+/// [`silu`], for inlining into the slice loops.
+#[inline(always)]
+fn silu_lane(x: f32) -> f32 {
+    silu_finish(x, exp_lane(-x))
+}
+
+/// [`silu`] from `x` and `e = exp(-x)`.
+#[inline(always)]
+fn silu_finish(x: f32, e: f32) -> f32 {
+    canon(x / (1.0 + e))
 }
 
 /// GELU's tanh approximation, `0.5 * x * (1 + tanh(0.7978846 * (x + 0.044715 * x^3)))`, with
-/// `x^3` as `x * x * x` evaluated left to right, as `act_fn` writes it. At `-inf` the expression
-/// is `-inf * 0`, NaN, as at today's call sites; it is returned as [`NAN`].
+/// `x^3` as `x * x * x` evaluated left to right, as the CPU backend's gated GELU wrote it. At
+/// `-inf` the expression is `-inf * 0`, NaN, as at the call sites before; it is returned as
+/// [`NAN`].
 #[inline]
 pub fn gelu_tanh(x: f32) -> f32 {
-    canon(0.5 * x * (1.0 + tanh_lane(GELU_SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x))))
+    gelu_tanh_lane(x)
 }
 
-/// The constant `act_fn` writes for `sqrt(2/pi)`, kept as written there (`0.797_884_6`).
+/// [`gelu_tanh`], for inlining into the slice loops.
+#[inline(always)]
+fn gelu_tanh_lane(x: f32) -> f32 {
+    gelu_tanh_finish(x, tanh_lane(gelu_tanh_arg(x)))
+}
+
+/// The argument of [`gelu_tanh`]'s `tanh`.
+#[inline(always)]
+fn gelu_tanh_arg(x: f32) -> f32 {
+    GELU_SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x)
+}
+
+/// [`gelu_tanh`] from `x` and `t = tanh(gelu_tanh_arg(x))`.
+#[inline(always)]
+fn gelu_tanh_finish(x: f32, t: f32) -> f32 {
+    canon(0.5 * x * (1.0 + t))
+}
+
+/// The constant the gated GELU writes for `sqrt(2/pi)`, kept as written (`0.797_884_6`).
 const GELU_SQRT_2_OVER_PI: f32 = 0.797_884_6;
 /// GELU's cubic coefficient.
 const GELU_CUBIC: f32 = 0.044715;
@@ -129,58 +179,4 @@ pub fn softplus(x: f32) -> f32 {
     let ax = f32::from_bits(x.to_bits() & 0x7fff_ffff);
     let pos = if x > 0.0 { x } else { 0.0 };
     canon(pos + ln_1p(exp_lane(-ax)))
-}
-
-/// `xs[i] = exp(xs[i])` for every element.
-pub fn exp_slice(xs: &mut [f32]) {
-    for x in xs {
-        *x = exp_lane(*x);
-    }
-}
-
-/// `dst[i] = exp(src[i])`.
-///
-/// # Panics
-/// If the two slices differ in length.
-pub fn exp_slice_to(src: &[f32], dst: &mut [f32]) {
-    assert_eq!(src.len(), dst.len(), "exp_slice_to: length mismatch");
-    for (d, &s) in dst.iter_mut().zip(src) {
-        *d = exp_lane(s);
-    }
-}
-
-/// `xs[i] = exp(xs[i] - m)`, the subtraction rounded to binary32 first, as a softmax over a
-/// row writes `(x - max).exp()`.
-pub fn exp_sub_slice(xs: &mut [f32], m: f32) {
-    for x in xs {
-        *x = exp_lane(*x - m);
-    }
-}
-
-/// `xs[i] = tanh(xs[i])`.
-pub fn tanh_slice(xs: &mut [f32]) {
-    for x in xs {
-        *x = tanh_lane(*x);
-    }
-}
-
-/// `xs[i] = sigmoid(xs[i])`.
-pub fn sigmoid_slice(xs: &mut [f32]) {
-    for x in xs {
-        *x = sigmoid(*x);
-    }
-}
-
-/// `xs[i] = silu(xs[i])`.
-pub fn silu_slice(xs: &mut [f32]) {
-    for x in xs {
-        *x = silu(*x);
-    }
-}
-
-/// `xs[i] = gelu_tanh(xs[i])`.
-pub fn gelu_tanh_slice(xs: &mut [f32]) {
-    for x in xs {
-        *x = gelu_tanh(*x);
-    }
 }

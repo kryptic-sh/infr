@@ -5724,7 +5724,7 @@ impl MetalBackend {
                         let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
                         let sp = {
                             let z = af[bb + h] + dtb[h];
-                            // libm-ok(S2): platform `exp`, `ln_1p`, moves to `infr_core::math` in S2
+                            // libm-ok(S2) x2: platform `exp`, `ln_1p`, moves to `infr_core::math` in S2
                             z.max(0.0) + (-z.abs()).exp().ln_1p()
                         };
                         // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2

@@ -2125,7 +2125,7 @@ pub(crate) fn yarn_freq_divisors(
     let freq_scale = 1.0 / factor;
     // corr_dim(n_rot): the dim below which the ramp is fully active — `ggml_rope_yarn_corr_dim`.
     let corr =
-        // libm-ok(S2): platform `ln`, moves to `infr_core::math` in S2
+        // libm-ok(S2) x2: platform `ln` twice, moves to `infr_core::math` in S2
         |nr: f32| n_rot * (n_ctx_orig / (nr * std::f32::consts::TAU)).ln() / (2.0 * base.ln());
     let start = (corr(beta_fast).floor() as i64).clamp(0, (n_rot as i64) - 1);
     let end = (corr(beta_slow).ceil() as i64).clamp(0, (n_rot as i64) - 1);

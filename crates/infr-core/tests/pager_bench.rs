@@ -274,7 +274,7 @@ fn generated_traces() {
         n_layers: 43,
         n_expert: 256,
         top_k: 8,
-        zipf_s: 1.0,
+        zipf_s: 1,
     };
     let mut resident_per_token = Vec::new();
     for m in [qwen, deep] {

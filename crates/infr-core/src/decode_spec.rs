@@ -218,7 +218,11 @@ impl BlockSpec {
 /// Exact, from the bits: `|v| = m * 2^E` with `m` in `[1, 2)`, and `log2|v| = E + log2 m` is
 /// nearer `E + 1` than `E` exactly when `m > sqrt 2` (never equal: `sqrt 2` is irrational), that
 /// is when the fraction bits are at least those of the least binary32 above `sqrt 2`. The
-/// biased exponent field is `E + 127` already.
+/// biased exponent field is `E + 127` already. This differs from the `log2(v).round()` it
+/// replaced just below `sqrt 2 * 2^E` for large `|E|`, where the rounded `log2` has too few
+/// fraction bits left to place `E + 0.5` and rounded some of those values up. Only test block
+/// synthesis ([`BlockSpec::write_scales`], called from `infr-testkit`) uses it; no inference
+/// path encodes an E8M0 scale.
 fn e8m0_from_f32(v: f32) -> u8 {
     let bits = v.abs().max(f32::MIN_POSITIVE).to_bits();
     let biased = (bits >> 23) as i32;

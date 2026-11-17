@@ -286,6 +286,41 @@ at rising precision until it lies clearly on one side of every rounding boundary
 (the script refuses rather than guess). Making it robust left the checked-in
 table unchanged.
 
+## What the migration changed in the CPU goldens
+
+S2 re-blessed every cached CPU golden in
+`crates/infr-llama/tests/cpu_backend.rs` once. Each case now has one hash, the
+same natively on Windows and under WSL. Before, a case either had one hash or
+one per operating system ("Win / Linux" below). Five of the 17 cases changed
+text on each system, every one at a near tie, and each new text is still
+coherent.
+
+| Test, case                                            | Before (Win / Linux)                      | After                |
+| ----------------------------------------------------- | ----------------------------------------- | -------------------- |
+| `cpu_golden_qwen3` (Qwen3-0.6B), France               | `0xfd63781ea3bfa785`                      | unchanged            |
+| `cpu_golden_qwen3`, explain a computer                | `0xec2b171ab4126f09 / 0xcf56ba8c4bb5c455` | `0xcf56ba8c4bb5c455` |
+| `cpu_golden_qwen3`, ocean                             | `0xfb31f388412112f1 / 0x29f45fb169b84b9a` | `0x92ef4b86905d27dc` |
+| `cpu_golden_qwen3_quants`, Q4_K_M (the cached quant)  | `0xfd63781ea3bfa785`                      | unchanged            |
+| `cpu_golden_gemma3` (gemma-3-1b), France              | `0xe5a37ab078db3a2c`                      | unchanged            |
+| `cpu_golden_gemma3`, knight                           | `0x5147de9a0ddfae50`                      | `0x4f1efdec82f477e5` |
+| `cpu_golden_smollm3` (SmolLM3-3B), France             | `0x8bfd779284f134df`                      | unchanged            |
+| `cpu_golden_smollm3`, ocean                           | `0x44563169e114b778`                      | unchanged            |
+| `cpu_golden_ernie4_5` (ERNIE-4.5-0.3B), France        | `0xfd644a0cebde4e73`                      | unchanged            |
+| `cpu_golden_ernie4_5`, ocean                          | `0x1a643a859ae6ff58`                      | `0x055f6196af273214` |
+| `cpu_golden_ernie4_5_moe` (ERNIE-4.5-21B-A3B), France | `0x2bdcaa6640a6c155`                      | unchanged            |
+| `cpu_golden_ernie4_5_moe`, count to twenty            | `0x181422562a27a9dd`                      | unchanged            |
+| `cpu_golden_qwen35` (Qwen3.5-0.8B), France            | `0x542a9dd055c58884`                      | unchanged            |
+| `cpu_golden_qwen35`, knight                           | `0xbe06c5580ea33d78`                      | unchanged            |
+| `cpu_golden_lfm3` (LFM3-1.7B), France                 | `0x8d3a3dd9844d239f`                      | `0xcaeef40f04920074` |
+| `cpu_golden_lfm3`, lighthouse keeper                  | `0x6e5098d3a5bec173`                      | unchanged            |
+| `cpu_golden_qwen3moe` (Qwen3-30B-A3B), France         | `0xe1a4ed6cecc5eb14 / 0xbc4f22b22d3e3c1d` | `0xe1a4ed6cecc5eb14` |
+
+How the changed texts fork, for example: Qwen3-0.6B's ocean paragraph went from
+"brainstorming the key elements … Maybe use words like" to "brainstorming key
+elements … Maybe compare it to"; gemma's knight story keeps its opening line;
+LFM3's answer opens "We need to answer the question:" where it opened "The user
+asks:".
+
 ## Measured (2026-11-17, Ryzen 9 9950X3D, AVX-512)
 
 **Exhaustive**, Windows, release build, 32 threads: for each function every one
@@ -411,10 +446,15 @@ same binaries interleaved; "forced" is the baseline build with
 `Attention` did not move measurably (Qwen3 80.8-85.9 ms native before and after;
 its `exp` was about 5% of it). The baseline build is three times slower than
 native for reasons outside this module (attention's dots and the other
-autovectorized loops). `infr bench` pp512 on Qwen3-1.7B native, six interleaved
-rounds of three reps with no other build or test running: 976-1143 t/s before,
-1124-1159 after. Decode (tg128) moved within its noise on both models:
-gemma-3-1b native 37.9-39.4 before, 37.2-39.4 after, six interleaved rounds.
+autovectorized loops). Whole-prefill throughput on Qwen3-1.7B did not change
+measurably: `infr bench` pp512, six interleaved rounds of three reps, gave
+976-1143 t/s before and 1124-1159 after, and the S2 reviewer's nine interleaved
+rounds gave 1075-1152 before and 960-1138 after. The reviewer measured
+gemma-3-1b decode at 39.4-40.8 t/s before and 43.5-44.7 after, with its
+`GatedAct` going from about 1.8 to 0.73 ms per call in prefill and from 52 to
+11.7 µs in decode. (An earlier six-round tg128 run on gemma saw 37.9-39.4 before
+and 37.2-39.4 after; it was a different window, so its figures do not compare
+with the reviewer's.)
 
 **Decode RoPE, and the RoPE frequency cache.** S2 first computed the RoPE
 frequencies (one correctly rounded `powf` per pair, about 22 ns against the C

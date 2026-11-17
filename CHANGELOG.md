@@ -330,11 +330,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   each): gemma-3-1b's `GatedAct` from 46.5-47.8 to 18.5-19.0 ms and `QkNormRope`
   from 7.1 to 4.0-4.2 ms; Qwen3-1.7B's `GatedAct` from 17.4-18.1 to 16.3-16.6 ms
   and `QkNormRope` from 9.1-9.4 to 7.9-8.6 ms; whole forwards 845-867 to 832-847
-  ms and 450-455 to 443-448 ms. Qwen3-1.7B pp512 over six interleaved rounds:
-  976-1143 t/s before, 1124-1159 after. A build for baseline x86-64 gets the
-  same: its gemma `GatedAct` went from 47.9-48.4 to 18.4-18.8 ms. RoPE frequency
-  tables are built once per backend, so a decode `QkNormRope` call went from
-  4.0-4.1 to 2.3-2.4 µs on gemma-3-1b and from 3.3 to 2.5 µs on Qwen3-0.6B.
+  ms and 450-455 to 443-448 ms. Whole-prefill throughput (pp512) on Qwen3-1.7B
+  did not change measurably. A second, independent measurement saw gemma-3-1b
+  decode go from 39.4-40.8 to 43.5-44.7 t/s, with `GatedAct` at about 1.8 to
+  0.73 ms per call in prefill and 52 to 11.7 µs in decode. A build for baseline
+  x86-64 gets the same: its gemma `GatedAct` went from 47.9-48.4 to 18.4-18.8
+  ms. RoPE frequency tables are built once per backend, so a decode `QkNormRope`
+  call went from 4.0-4.1 to 2.3-2.4 µs on gemma-3-1b and from 3.3 to 2.5 µs on
+  Qwen3-0.6B.
 
 - **Qwen3.5 decodes about 15% faster on the CPU.** The DeltaNet scan updates
   each head's recurrent state in place instead of scanning a copy and copying

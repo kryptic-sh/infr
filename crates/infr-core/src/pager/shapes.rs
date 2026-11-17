@@ -13,7 +13,6 @@
 
 use super::trace::{Call, PoolTrace};
 use super::{BlockId, Insert};
-use crate::math;
 
 /// xorshift64 (G. Marsaglia, "Xorshift RNGs", 2003, the `<<13 >>7 <<17` triple).
 #[derive(Debug, Clone)]
@@ -50,19 +49,22 @@ impl XorShift64 {
 }
 
 /// Zipf(`s`) over `0..n`: rank `k` drawn with probability proportional to `1 / (k + 1)^s`.
+///
+/// The exponent is a whole number so the weights need no `powf`: `(k + 1)^s` is `s` binary64
+/// multiplications in a fixed order, the same bits on every platform (and exact while the
+/// power stays below `2^53`, as it does at the `s = 1` every shape uses).
 #[derive(Debug, Clone)]
 pub struct Zipf {
     cdf: Vec<f64>,
 }
 
 impl Zipf {
-    pub fn new(n: usize, s: f64) -> Self {
+    pub fn new(n: usize, s: u32) -> Self {
         let mut acc = 0.0;
         let mut cdf: Vec<f64> = (0..n)
             .map(|k| {
-                // The correctly rounded binary32 power: the same shape on every platform, and
-                // exact (`(k+1)^1 = k+1`) at the `s = 1` every shape uses today.
-                acc += 1.0 / math::powf((k + 1) as f32, s as f32) as f64;
+                let rank = (k + 1) as f64;
+                acc += 1.0 / (0..s).fold(1.0, |w, _| w * rank);
                 acc
             })
             .collect();
@@ -107,7 +109,7 @@ pub struct Moe {
     pub top_k: u32,
     /// Zipf exponent of each layer's expert popularity — an assumption, not a measurement; the
     /// recorded traces are what say how skewed real routing is.
-    pub zipf_s: f64,
+    pub zipf_s: u32,
 }
 
 impl Moe {
@@ -116,7 +118,7 @@ impl Moe {
         n_layers: 48,
         n_expert: 128,
         top_k: 8,
-        zipf_s: 1.0,
+        zipf_s: 1,
     };
 
     pub fn n_blocks(&self) -> usize {
@@ -340,7 +342,7 @@ mod tests {
 
     #[test]
     fn zipf_ranks_are_ordered_by_frequency() {
-        let z = Zipf::new(16, 1.0);
+        let z = Zipf::new(16, 1);
         let mut rng = XorShift64::new(7);
         let mut hist = [0u32; 16];
         for _ in 0..200_000 {
@@ -350,6 +352,31 @@ mod tests {
         let ratio = hist[0] as f64 / hist[1] as f64;
         assert!((ratio - 2.0).abs() < 0.1, "ratio {ratio}");
         assert!(hist[0] > hist[7] && hist[7] > hist[15]);
+    }
+
+    /// The weights are the exact powers: `1/(k+1)` at `s = 1`, `1/(k+1)^2` at `s = 2`, and
+    /// uniform at `s = 0`.
+    #[test]
+    fn zipf_weights_are_the_exact_powers() {
+        let cdf = |w: &[f64]| {
+            let total: f64 = w.iter().sum();
+            let mut acc = 0.0;
+            w.iter()
+                .map(|x| {
+                    acc += x;
+                    acc / total
+                })
+                .collect::<Vec<f64>>()
+        };
+        assert_eq!(
+            Zipf::new(4, 1).cdf,
+            cdf(&[1.0, 1.0 / 2.0, 1.0 / 3.0, 1.0 / 4.0])
+        );
+        assert_eq!(
+            Zipf::new(4, 2).cdf,
+            cdf(&[1.0, 1.0 / 4.0, 1.0 / 9.0, 1.0 / 16.0])
+        );
+        assert_eq!(Zipf::new(4, 0).cdf, cdf(&[1.0; 4]));
     }
 
     #[test]

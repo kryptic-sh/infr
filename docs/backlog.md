@@ -6577,11 +6577,37 @@ every other dtype. The options as weighed:
   `is_x86_feature_detected!` per call, so a baseline build on this machine runs
   their AVX-512 code. The tier-against-scalar proof for them is plan 11's S4.
 - **Not migrated to slices (scalar `math` calls, not hot):** the MoE router's
-  sqrt-softplus, the hyper-connection sigmoids and Sinkhorn, DeltaNet's per-head
-  gates, `Op::HeadGate` and `MoeSharedExpertAdd` (one sigmoid per head or row),
-  the MLA rope (per query, head and pair) and the Metal backend's host
-  fallbacks.
+  sqrt-softplus, the hyper-connection sigmoids, DeltaNet's per-head gates,
+  `Op::HeadGate` and `MoeSharedExpertAdd` (one sigmoid per head or row), the MLA
+  rope's sines and cosines (per query, head and pair) and the Metal backend's
+  host fallbacks. (Sinkhorn's softmax does use `exp_sub_slice`.)
 - **`docs/synthetic-models.md` still says exact-token goldens are not
   portable**, which remains true across CPU microarchitectures (and for the
   matmul tiers until S4) but no longer across operating systems; its Qwen3.5 row
   ("not CI-portable") predates the migration and was not re-checked on CI.
+- **What the S2 review checked only by reading.** The reviewer compared the
+  branch op hash for op hash against a control (`origin/main` with every
+  platform call rewritten one for one to scalar `infr_core::math`) across seven
+  model families and the synthetic oracles. These paths were read but no run
+  exercised them: `Op::Softcap`, the `Op::Softmax` op, `ArgmaxProb` and MTP,
+  `MoeSharedExpertAdd`, diffusion and self-conditioning. The Metal backend's
+  host math was compiled for aarch64, never run.
+- **A decode `Linear` kernel's per-call time moves between builds that do not
+  touch it.** gemma-3-1b's `Linear m=1 1152x6912 Q5_0` took 249-259 µs per call
+  in two builds and 280-282 µs in a third (`INFR_PROF_OPS=1`, tg64, two
+  interleaved rounds each, 2026-11-17), whose source differed from the second
+  only in the math tier switch and its config type, `deltanet_scan` and the
+  pager's Zipf shape: enough to move gemma's whole decode about 5%. Presumed to
+  be code placement (alignment of the hot loop), not confirmed. It means a
+  decode A/B on this machine can show a few percent that belongs to neither
+  side; a per-op profile shows where it lands.
+- **Worth understanding: the int8 path amplifies last-bit differences.** Old
+  against new decode logits on Qwen3-0.6B differ by up to about 1.2 absolute (KL
+  up to 6e-2), from RoPE values that changed only in the last bit. The presumed
+  mechanism is the int8 re-quantization of activations before each `Op::Linear`
+  (a last-bit change moves a value across a rounding boundary of the int8 grid,
+  a jump of one int8 step), but that is not confirmed. If it is the mechanism,
+  it says how numerically sensitive the production int8 path is compared with
+  `CpuBackend::reference()`, and a test that measures the amplification (one
+  last-bit perturbation, logits distance on both paths) would put a number on
+  it.

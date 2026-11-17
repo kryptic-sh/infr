@@ -683,7 +683,7 @@ mod tests {
             n_layers: 4,
             n_expert: 16,
             top_k: 4,
-            zipf_s: 1.0,
+            zipf_s: 1,
         }
         .session(24, 20, 9);
         let whole = simulate(t.n_slots, &t.calls, &mut Belady::default());
@@ -704,7 +704,7 @@ mod tests {
             n_layers: 6,
             n_expert: 16,
             top_k: 4,
-            zipf_s: 1.0,
+            zipf_s: 1,
         };
         let mut out = vec![cyclic_sweep(10, 4, 5), cyclic_sweep(40, 8, 4)];
         for slots in [16, 40, 72] {

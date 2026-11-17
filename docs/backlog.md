@@ -6718,16 +6718,3 @@ Options:
 - **No NEON kernels.** aarch64 runs every family's scalar kernel. A NEON tier
   must compute the scalar expression; `kernels/tier_tests.rs` will hold it to
   that once it is a tier `crate::simd` dispatches.
-
-### B205 — make the macOS CPU-golden step required after its first green run (2026-11-17)
-
-**Tag:** ci · **Kind:** follow-up with a trigger
-
-The `test` matrix's "CPU goldens (Qwen3-0.6B, Qwen3.5-0.8B)" step runs on
-Windows and macOS (`.github/workflows/ci.yml`). On macOS it carries
-`continue-on-error: ${{ runner.os == 'macOS' }}`, because it is the first
-whole-model CPU run on aarch64 and plan 11's L3 claim is unproven there. **When
-it first passes on `main`, delete that line** so a later aarch64 difference
-fails the workflow. If it fails instead, the step's log names the differing
-hash; that is an L3 finding for plan 11 (bisect with `INFR_CPU_OP_HASH` against
-Windows or Linux), not a reason to keep the step optional.

@@ -186,11 +186,15 @@ rounded `sin`/`cos` for RoPE at long context.
 tier was run on **[ran]**: every kernel family and the op suite at each tier,
 thread counts 1 to 33, prefill chunk heights for six cached dense families. Its
 listed exception is `Op::MoeFfn` across row counts (B203, a decision for the
-owner). L3: aarch64 has been compiled, never run; the op suite and the goldens
-subset run there the first time CI's macOS jobs do, and the `f32::min`/`max`
-audit (`docs/math.md`, "Identity across tiers, …") found one zero-sign site
-reaching stored bits (fixed). `powf` is correctly rounded on every input tested,
-not proven. S6 (FMA for the f32 dots on baseline builds) is still open.
+owner). L3 **[ran, CI 2026-11-17]**: on `macos-15` (aarch64) the op suite, the
+math grid hashes and `mul_add_exact` passed in the normal test job, and the
+goldens subset (Qwen3-0.6B, Qwen3.5-0.8B) reproduced the same hashes as Linux
+and Windows; that step is now required. Not run there: the other goldens, the
+exhaustive math tests and the row-identity tests on real models. The
+`f32::min`/`max` audit (`docs/math.md`, "Identity across tiers, …") found one
+zero-sign site reaching stored bits (fixed). `powf` is correctly rounded on
+every input tested, not proven. S6 (FMA for the f32 dots on baseline builds) is
+still open.
 
 ## 6. GPUs against the one CPU reference
 

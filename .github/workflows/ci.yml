@@ -171,7 +171,6 @@ jobs:
       # would otherwise pass.
       - name: CPU goldens (Qwen3-0.6B, Qwen3.5-0.8B)
         if: runner.os != 'Linux'
-        continue-on-error: ${{ runner.os == 'macOS' }}
         shell: bash
         env:
           HF_HUB_CACHE: ${{ runner.temp }}/hf-goldens

@@ -471,7 +471,7 @@ impl CpuBackend {
     /// `out_f % 8` tail rows take the per-row batch kernels. Every kernel here is bit-identical
     /// to the single-token one, so the result does not depend on the route.
     #[cfg(target_arch = "x86_64")]
-    fn linear_packed(
+    fn linear_packed<const CAP: bool>(
         &self,
         dt: DType,
         wbytes: &[u8],
@@ -506,9 +506,9 @@ impl CpuBackend {
                 let o = 8 * groups + i;
                 let row = &wbytes[o * bpr..(o + 1) * bpr];
                 match dt {
-                    DType::Q4K => vec_dot_q4k_batch(row, q8s, in_f, col),
-                    DType::Q5K => vec_dot_q5k_batch(row, q8s, in_f, col),
-                    _ => vec_dot_q6k_batch(row, q8s, in_f, col),
+                    DType::Q4K => vec_dot_q4k_batch::<CAP>(row, q8s, in_f, col),
+                    DType::Q5K => vec_dot_q5k_batch::<CAP>(row, q8s, in_f, col),
+                    _ => vec_dot_q6k_batch::<CAP>(row, q8s, in_f, col),
                 }
             });
             for (i, col) in cols.chunks(m).enumerate() {
@@ -766,17 +766,22 @@ const ATTN_QUERY_BLOCK: usize = 16;
 /// [`CpuBackend::linear_packed`]: Q4_K, Q5_K or Q6_K with at least one full 8-row group, at
 /// least [`repack::packed_min_tokens`] tokens, at the AVX-512 VNNI tier.
 #[cfg(target_arch = "x86_64")]
-fn linear_packed_ok(dt: DType, in_f: usize, out_f: usize, m: usize) -> bool {
+fn linear_packed_ok<const CAP: bool>(dt: DType, in_f: usize, out_f: usize, m: usize) -> bool {
     matches!(dt, DType::Q4K | DType::Q5K | DType::Q6K)
         && out_f >= 8
         && in_f.is_multiple_of(256)
         && m >= repack::packed_min_tokens(dt)
-        && simd::vnni()
+        && simd::vnni::<CAP>()
 }
 
 /// The packed GEMM is x86_64-only, so off it no Linear takes that route.
 #[cfg(not(target_arch = "x86_64"))]
-const fn linear_packed_ok(_dt: DType, _in_f: usize, _out_f: usize, _m: usize) -> bool {
+const fn linear_packed_ok<const CAP: bool>(
+    _dt: DType,
+    _in_f: usize,
+    _out_f: usize,
+    _m: usize,
+) -> bool {
     false
 }
 
@@ -813,7 +818,7 @@ fn borrow_two_mut<T>(v: &mut [T], a: usize, b: usize) -> (&T, &mut T) {
 pub fn q4k_expert_repack_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        simd::vnni()
+        simd::vnni::<true>()
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -1107,7 +1112,46 @@ impl Backend for CpuBackend {
         Ok(GraphPlan::boxed(graph))
     }
 
+    /// Runs the graph through `CpuBackend::execute_with`'s uncapped compilation unless a
+    /// `kernels.cpu.max_tier` ceiling is in force (`crate::simd`): the one place the ceiling is
+    /// consulted for a whole graph.
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
+        if simd::capped() {
+            self.execute_with::<true>(plan, bindings)
+        } else {
+            self.execute_with::<false>(plan, bindings)
+        }
+    }
+
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The arena the first paged buffer among `weights` reads from: a model's paged weights all
+    /// share one ([`paged::PagedWeights::streams`] says whether it streams).
+    fn host_streams(&self, weights: &mut dyn Iterator<Item = &dyn Buffer>) -> bool {
+        for b in weights {
+            let Some(cb) = b.as_any().downcast_ref::<CpuBuffer>() else {
+                continue;
+            };
+            match &cb.store {
+                CpuStore::Paged { store, .. } | CpuStore::PagedExperts { store, .. } => {
+                    return store.streams();
+                }
+                CpuStore::Owned(_) | CpuStore::Mapped(_) => {}
+            }
+        }
+        false
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl CpuBackend {
+    /// The graph interpreter, compiled once per `CAP` (`crate::simd`): every SIMD dispatch in it
+    /// takes `::<CAP>`, so the uncapped compilation decides the kernel tier from the CPU's
+    /// features alone (a constant on a build that has them) and the capped one asks the
+    /// `kernels.cpu.max_tier` ceiling at every dispatch, on every thread.
+    fn execute_with<const CAP: bool>(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
         let g = &plan
             .as_any()
             .downcast_ref::<GraphPlan>()
@@ -1525,11 +1569,11 @@ impl Backend for CpuBackend {
                         self.pool().for_chunks_mut(&mut out, 1, grain, &|o, dst_o| {
                             let row = &wbytes[o * bpr..o * bpr + bpr];
                             dst_o[0] = match dt {
-                                DType::Q4K => vec_dot_q4k(row, q8.as_ref().unwrap(), in_f),
-                                DType::Q6K => vec_dot_q6k(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q4K => vec_dot_q4k::<CAP>(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q6K => vec_dot_q6k::<CAP>(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q8_0 => {
                                     if q8_0_blk32 {
-                                        vec_dot_q8_0_32_batch(
+                                        vec_dot_q8_0_32_batch::<CAP>(
                                             row,
                                             q8_32.as_ref().unwrap(),
                                             in_f,
@@ -1537,12 +1581,14 @@ impl Backend for CpuBackend {
                                         );
                                         return;
                                     }
-                                    vec_dot_q8_0(row, q8.as_ref().unwrap(), in_f)
+                                    vec_dot_q8_0::<CAP>(row, q8.as_ref().unwrap(), in_f)
                                 }
-                                DType::Q5K => vec_dot_q5k(row, q8.as_ref().unwrap(), in_f),
-                                DType::Q2K => vec_dot_q2k(row, q8.as_ref().unwrap(), in_f),
-                                DType::Q3K => vec_dot_q3k(row, q8.as_ref().unwrap(), in_f),
-                                DType::Iq4Xs => vec_dot_iq4xs(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q5K => vec_dot_q5k::<CAP>(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q2K => vec_dot_q2k::<CAP>(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q3K => vec_dot_q3k::<CAP>(row, q8.as_ref().unwrap(), in_f),
+                                DType::Iq4Xs => {
+                                    vec_dot_iq4xs::<CAP>(row, q8.as_ref().unwrap(), in_f)
+                                }
                                 DType::Iq2S => vec_dot_iq2s(row, q8.as_ref().unwrap(), in_f),
                                 DType::Iq2Xs => vec_dot_iq2xs(row, q8.as_ref().unwrap(), in_f),
                                 DType::Iq2Xxs => vec_dot_iq2xxs(row, q8.as_ref().unwrap(), in_f),
@@ -1553,7 +1599,7 @@ impl Backend for CpuBackend {
                                 DType::Tq2_0 => vec_dot_tq2_0(row, q8.as_ref().unwrap(), in_f),
                                 DType::Tq1_0 => vec_dot_tq1_0(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q4_0 => {
-                                    vec_dot_q4_0_32_batch(
+                                    vec_dot_q4_0_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1562,7 +1608,7 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Q4_1 => {
-                                    vec_dot_q4_1_32_batch(
+                                    vec_dot_q4_1_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1571,7 +1617,7 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Q5_0 => {
-                                    vec_dot_q5_0_32_batch(
+                                    vec_dot_q5_0_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1580,7 +1626,7 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Q5_1 => {
-                                    vec_dot_q5_1_32_batch(
+                                    vec_dot_q5_1_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1589,7 +1635,7 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Iq4Nl => {
-                                    vec_dot_iq4nl_32_batch(
+                                    vec_dot_iq4nl_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1598,7 +1644,7 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Mxfp4 => {
-                                    vec_dot_mxfp4_32_batch(
+                                    vec_dot_mxfp4_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1607,11 +1653,21 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Q2_0 => {
-                                    vec_dot_q2_0_batch(row, q8_32.as_ref().unwrap(), in_f, dst_o);
+                                    vec_dot_q2_0_batch::<CAP>(
+                                        row,
+                                        q8_32.as_ref().unwrap(),
+                                        in_f,
+                                        dst_o,
+                                    );
                                     return;
                                 }
                                 DType::Nvfp4 => {
-                                    vec_dot_nvfp4_batch(row, q8_32.as_ref().unwrap(), in_f, dst_o);
+                                    vec_dot_nvfp4_batch::<CAP>(
+                                        row,
+                                        q8_32.as_ref().unwrap(),
+                                        in_f,
+                                        dst_o,
+                                    );
                                     return;
                                 }
                                 DType::F32 => dot(&f32_row(row), xrow),
@@ -1665,9 +1721,9 @@ impl Backend for CpuBackend {
                         };
                         // AVX-512 VNNI: Q4_K, Q5_K and Q6_K run the packed 8-row GEMM straight
                         // into the row-major output, with no o-major temp to transpose after.
-                        if linear_packed_ok(dt, in_f, out_f, m) {
+                        if linear_packed_ok::<CAP>(dt, in_f, out_f, m) {
                             #[cfg(target_arch = "x86_64")]
-                            self.linear_packed(dt, wbytes, in_f, out_f, &q8s, &mut out);
+                            self.linear_packed::<CAP>(dt, wbytes, in_f, out_f, &q8s, &mut out);
                             #[cfg(not(target_arch = "x86_64"))]
                             unreachable!("linear_packed_ok is false off x86_64");
                         } else {
@@ -1691,7 +1747,7 @@ impl Backend for CpuBackend {
                                     let (r4, rest) = rest.split_at_mut(m);
                                     let (r5, rest) = rest.split_at_mut(m);
                                     let (r6, r7) = rest.split_at_mut(m);
-                                    vec_dot_q4k_batch8(
+                                    vec_dot_q4k_batch8::<CAP>(
                                         [
                                             &wbytes[o * bpr..o * bpr + bpr],
                                             &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr],
@@ -1716,7 +1772,7 @@ impl Backend for CpuBackend {
                                         let (chunk_a, chunk_b) = dc.split_at_mut(m);
                                         let row_a = &wbytes[o * bpr..o * bpr + bpr];
                                         let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
-                                        vec_dot_q4k_batch2(
+                                        vec_dot_q4k_batch2::<CAP>(
                                             row_a, row_b, &q8s, in_f, chunk_a, chunk_b,
                                         );
                                     });
@@ -1724,7 +1780,7 @@ impl Backend for CpuBackend {
                                 if rem % 2 != 0 {
                                     let o = out_f - 1;
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
+                                    vec_dot_q4k_batch::<CAP>(row, &q8s, in_f, odd_t);
                                 }
                             } else if dt == DType::Q4K && out_f >= 2 {
                                 // Small out_f < 8: fall back to 2-row tile.
@@ -1735,12 +1791,14 @@ impl Backend for CpuBackend {
                                     let (chunk_a, chunk_b) = dc.split_at_mut(m);
                                     let row_a = &wbytes[o * bpr..o * bpr + bpr];
                                     let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
-                                    vec_dot_q4k_batch2(row_a, row_b, &q8s, in_f, chunk_a, chunk_b);
+                                    vec_dot_q4k_batch2::<CAP>(
+                                        row_a, row_b, &q8s, in_f, chunk_a, chunk_b,
+                                    );
                                 });
                                 if out_f % 2 != 0 {
                                     let o = out_f - 1;
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
+                                    vec_dot_q4k_batch::<CAP>(row, &q8s, in_f, odd_t);
                                 }
                             } else if q8_0_blk32 {
                                 // Q8_0 weight with a sub-256 `in_f` (multiple of 32 but not 256): the
@@ -1752,7 +1810,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q8_0_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q8_0_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Q5_0 && in_f.is_multiple_of(32) {
                                 // Dense-layer Q5_0 (DG stores 16 of its 30 dense ffn_down weights as
@@ -1766,7 +1824,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q5_0_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q5_0_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Q5_1 && in_f.is_multiple_of(32) {
                                 // Q5_1 (affine sibling of Q5_0: `y = d·q5 + m`, 5-bit code + f16 `m`
@@ -1778,7 +1836,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q5_1_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q5_1_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Q4_0 && in_f.is_multiple_of(32) {
                                 // Q4_0 (same 32-block int8-activation regime as Q5_0, minus the 5th
@@ -1789,7 +1847,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q4_0_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q4_0_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Q4_1 && in_f.is_multiple_of(32) {
                                 // Q4_1 (affine sibling of Q4_0: `y = d·q4 + m`, block stride 20):
@@ -1800,7 +1858,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q4_1_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q4_1_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Iq4Nl && in_f.is_multiple_of(32) {
                                 // IQ4_NL (flat 32-block codebook cousin of IQ4_XS: ONE f16 `d` per
@@ -1812,7 +1870,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_iq4nl_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_iq4nl_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Mxfp4 && in_f.is_multiple_of(32) {
                                 // MXFP4 (flat 32-block codebook, structurally identical to IQ4_NL but
@@ -1824,7 +1882,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_mxfp4_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_mxfp4_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Q2_0 && in_f.is_multiple_of(64) {
                                 // Q2_0 ("Bonsai ternary", 2-bit linear-offset quant on a 64-weight
@@ -1837,7 +1895,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q2_0_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q2_0_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Nvfp4 && in_f.is_multiple_of(64) {
                                 // NVFP4 (E2M1 codebook + four per-16-element UE4M3 sub-block scales on a
@@ -1851,7 +1909,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_nvfp4_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_nvfp4_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else {
                                 // Grain 8: at lm_head shape this loop is 262k one-row chunks; per-row
@@ -1859,13 +1917,27 @@ impl Backend for CpuBackend {
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
                                     match dt {
-                                        DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, chunk),
-                                        DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, chunk),
-                                        DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, chunk),
-                                        DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, chunk),
-                                        DType::Q2K => vec_dot_q2k_batch(row, &q8s, in_f, chunk),
-                                        DType::Q3K => vec_dot_q3k_batch(row, &q8s, in_f, chunk),
-                                        DType::Iq4Xs => vec_dot_iq4xs_batch(row, &q8s, in_f, chunk),
+                                        DType::Q4K => {
+                                            vec_dot_q4k_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Q6K => {
+                                            vec_dot_q6k_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Q8_0 => {
+                                            vec_dot_q8_0_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Q5K => {
+                                            vec_dot_q5k_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Q2K => {
+                                            vec_dot_q2k_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Q3K => {
+                                            vec_dot_q3k_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Iq4Xs => {
+                                            vec_dot_iq4xs_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
                                         DType::Iq2S => vec_dot_iq2s_batch(row, &q8s, in_f, chunk),
                                         DType::Iq2Xs => vec_dot_iq2xs_batch(row, &q8s, in_f, chunk),
                                         DType::Iq2Xxs => {
@@ -3065,7 +3137,7 @@ impl Backend for CpuBackend {
                         pool.for_chunks_mut(&mut lt, 8 * rows, 1, &|c, dst| {
                             let o0 = c * 8;
                             let o1 = (o0 + 8).min(n_expert);
-                            expert_gemm_range(
+                            expert_gemm_range::<CAP>(
                                 &rbytes, rdt, ne, n_expert, &racts, None, o0, o1, dst,
                             );
                         });
@@ -3488,7 +3560,7 @@ impl Backend for CpuBackend {
                                     (o1 - o0) * count,
                                 )
                             };
-                            expert_gemm_range(
+                            expert_gemm_range::<CAP>(
                                 gb.expert(e),
                                 gdt,
                                 ne,
@@ -3514,7 +3586,7 @@ impl Backend for CpuBackend {
                                         (o1 - o0) * count,
                                     )
                                 };
-                                expert_gemm_range(
+                                expert_gemm_range::<CAP>(
                                     ub.expert(e),
                                     udt,
                                     ne,
@@ -3615,7 +3687,7 @@ impl Backend for CpuBackend {
                             let (e, p0, count) = buckets[b];
                             let s_e = dscale.as_ref().map(|ds| ds[e]);
                             moe::with_block_scratch((o1 - o0) * count, |blk| {
-                                expert_gemm_range(
+                                expert_gemm_range::<CAP>(
                                     db.expert(e),
                                     ddt,
                                     nffx,
@@ -4363,27 +4435,6 @@ impl Backend for CpuBackend {
             }
         }
         Ok(())
-    }
-
-    fn sync(&self) -> Result<()> {
-        Ok(())
-    }
-
-    /// The arena the first paged buffer among `weights` reads from: a model's paged weights all
-    /// share one ([`paged::PagedWeights::streams`] says whether it streams).
-    fn host_streams(&self, weights: &mut dyn Iterator<Item = &dyn Buffer>) -> bool {
-        for b in weights {
-            let Some(cb) = b.as_any().downcast_ref::<CpuBuffer>() else {
-                continue;
-            };
-            match &cb.store {
-                CpuStore::Paged { store, .. } | CpuStore::PagedExperts { store, .. } => {
-                    return store.streams();
-                }
-                CpuStore::Owned(_) | CpuStore::Mapped(_) => {}
-            }
-        }
-        false
     }
 }
 
@@ -5427,7 +5478,7 @@ mod tests {
             (DType::Q5K, 256),
             (DType::Q6K, 512),
         ] {
-            if !linear_packed_ok(dt, in_f, out_f, m) {
+            if !linear_packed_ok::<false>(dt, in_f, out_f, m) {
                 // Only AVX-512 VNNI hosts take this route; others run the per-row kernels,
                 // which `linear_prefill_matches_the_single_token_kernels_bitwise` covers.
                 eprintln!("SKIP linear_packed: this CPU lacks AVX-512BW + AVX-512 VNNI");
@@ -5444,15 +5495,15 @@ mod tests {
                 .collect();
             let q8s: Vec<Q8> = x.chunks(in_f).map(quantize_q8).collect();
             let mut out = vec![f32::NAN; m * out_f];
-            be.linear_packed(dt, &w, in_f, out_f, &q8s, &mut out);
+            be.linear_packed::<false>(dt, &w, in_f, out_f, &q8s, &mut out);
             let bpr = w.len() / out_f;
             for o in 0..out_f {
                 let row = &w[o * bpr..(o + 1) * bpr];
                 for (r, q8) in q8s.iter().enumerate() {
                     let want = match dt {
-                        DType::Q4K => vec_dot_q4k(row, q8, in_f),
-                        DType::Q5K => vec_dot_q5k(row, q8, in_f),
-                        _ => vec_dot_q6k(row, q8, in_f),
+                        DType::Q4K => vec_dot_q4k::<false>(row, q8, in_f),
+                        DType::Q5K => vec_dot_q5k::<false>(row, q8, in_f),
+                        _ => vec_dot_q6k::<false>(row, q8, in_f),
                     };
                     let got = out[r * out_f + o];
                     assert_eq!(
@@ -5767,7 +5818,7 @@ mod tests {
                 counts.push(min - 1);
             }
             for m in counts {
-                let packed = linear_packed_ok(dt, in_f, out_f, m);
+                let packed = linear_packed_ok::<false>(dt, in_f, out_f, m);
                 #[cfg(target_arch = "x86_64")]
                 if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
                     assert_eq!(packed, m >= min, "{dt:?} m={m}: wrong route");
@@ -5784,9 +5835,9 @@ mod tests {
                     for o in 0..out_f {
                         let row = &w[o * bpr..(o + 1) * bpr];
                         let want = match dt {
-                            DType::Q4K => vec_dot_q4k(row, &q8, in_f),
-                            DType::Q5K => vec_dot_q5k(row, &q8, in_f),
-                            _ => vec_dot_q6k(row, &q8, in_f),
+                            DType::Q4K => vec_dot_q4k::<false>(row, &q8, in_f),
+                            DType::Q5K => vec_dot_q5k::<false>(row, &q8, in_f),
+                            _ => vec_dot_q6k::<false>(row, &q8, in_f),
                         };
                         let g = got[r * out_f + o];
                         assert_eq!(

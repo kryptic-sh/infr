@@ -17,7 +17,7 @@
 //! features too, so a code path gated on "the active tier is at least X" may use the features of
 //! X and of every tier below it.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::math;
 
@@ -154,6 +154,19 @@ fn install_first(auto: SimdTier) -> SimdTier {
     }
 }
 
+/// Whether a ceiling below [`SimdTier::best`] is in force: false until [`set_max`] lowers it.
+static CAPPED: AtomicBool = AtomicBool::new(false);
+
+/// Whether [`set_max`] put a ceiling below [`SimdTier::best`] in force. The CPU backend reads it
+/// once per graph to choose between its two compilations of the interpreter: with no ceiling, the
+/// dispatch it compiles from `is_x86_feature_detected!` alone, which a build that already has the
+/// features (`target-cpu=native`) folds to a constant; under one, the dispatch that asks
+/// [`allows`] at every call.
+#[inline]
+pub fn capped() -> bool {
+    CAPPED.load(Ordering::Relaxed)
+}
+
 /// Run at most `max` from now on (`None`: no ceiling, the widest tier the CPU has), and return
 /// the tier that is now active. A ceiling above what the CPU supports is clamped to
 /// [`SimdTier::best`]: it is a ceiling, not a demand. This is the `kernels.cpu.max_tier` debug
@@ -162,6 +175,7 @@ pub fn set_max(max: Option<SimdTier>) -> SimdTier {
     let best = SimdTier::best();
     let tier = max.map_or(best, |m| m.min(best));
     ACTIVE.store(encode(tier), Ordering::Relaxed);
+    CAPPED.store(tier < best, Ordering::Relaxed);
     tier
 }
 
@@ -194,13 +208,16 @@ mod tests {
     fn ceiling_clamps_and_first_use_never_overwrites() {
         assert_eq!(set_max(Some(SimdTier::Avx512Vnni)), SimdTier::best());
         assert_eq!(active(), SimdTier::best());
+        assert!(!capped());
         assert_eq!(set_max(Some(SimdTier::Scalar)), SimdTier::Scalar);
         assert!(allows(SimdTier::Scalar) && !allows(SimdTier::Avx2));
+        assert_eq!(capped(), SimdTier::best() > SimdTier::Scalar);
         assert_eq!(install_first(SimdTier::best()), SimdTier::Scalar);
         assert_eq!(active(), SimdTier::Scalar);
         assert_eq!(math::tier(), math::Tier::Baseline);
         assert_eq!(set_max(None), SimdTier::best());
         assert_eq!(active(), SimdTier::best());
+        assert!(!capped());
         for t in SimdTier::ALL {
             assert_eq!(allows(t), t <= SimdTier::best(), "{t:?}");
         }

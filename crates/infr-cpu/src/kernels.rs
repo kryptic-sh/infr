@@ -136,15 +136,15 @@ unsafe fn load128<T>(s: &[T], off: usize) -> __m128i {
 /// runtime (avx512bw → avx2 → scalar). The `sm` term uses `q8.bsums` (precomputed in `quantize_q8`)
 /// instead of re-summing q8 values per row.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q4k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+pub(crate) fn vec_dot_q4k<const CAP: bool>(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(in_f % 256, 0, "vec_dot_q4k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q4k_avx512bw(row, q8, in_f) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q4k_avx2(row, q8, in_f) };
         }
     }
@@ -326,15 +326,15 @@ unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// activation's per-16 sub-block sums (`q8.bsums16`, not the per-32 `bsums` Q4_K uses). Dispatches
 /// avx512bw → avx2 → scalar.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q2k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+pub(crate) fn vec_dot_q2k<const CAP: bool>(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(in_f % 256, 0, "vec_dot_q2k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q2k_avx512bw(row, q8, in_f) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q2k_avx2(row, q8, in_f) };
         }
     }
@@ -500,15 +500,15 @@ unsafe fn vec_dot_q2k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// available at runtime (avx512bw → avx2 → scalar). Weight value is `d·sc·(q6−32)` over 16
 /// sub-blocks of 16 (int8 scales).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q6k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+pub(crate) fn vec_dot_q6k<const CAP: bool>(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(in_f % 256, 0, "vec_dot_q6k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q6k_avx512bw(row, q8, in_f) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q6k_avx2(row, q8, in_f) };
         }
     }
@@ -806,15 +806,15 @@ fn q3k_scales(scales_raw: &[u8]) -> [i16; 16] {
 /// Q2_K) plus 1 high bit from `hmask`. The `−4·bsum` correction reuses `q8.bsums16` (per-16 sums).
 /// Dispatches avx512bw → avx2 → scalar.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q3k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+pub(crate) fn vec_dot_q3k<const CAP: bool>(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(in_f % 256, 0, "vec_dot_q3k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q3k_avx512bw(row, q8, in_f) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q3k_avx2(row, q8, in_f) };
         }
     }
@@ -992,7 +992,7 @@ unsafe fn vec_dot_q3k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// is a codebook lookup (Q8_0's `abs/sign` maddubs trick) rather than the `q6−32` linear offset, and
 /// the per-sub-block `(ls−32)` scale folds into the SAME i32 integer epilogue Q6_K uses.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_iq4xs(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+pub(crate) fn vec_dot_iq4xs<const CAP: bool>(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(
         in_f % 256,
         0,
@@ -1000,11 +1000,11 @@ pub(crate) fn vec_dot_iq4xs(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_iq4xs_avx512bw(row, q8, in_f) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_iq4xs_avx2(row, q8, in_f) };
         }
     }
@@ -1167,7 +1167,7 @@ unsafe fn vec_dot_iq4xs_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q8_0(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+pub(crate) fn vec_dot_q8_0<const CAP: bool>(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(
         in_f % 256,
         0,
@@ -1175,10 +1175,10 @@ pub(crate) fn vec_dot_q8_0(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             return unsafe { vec_dot_q8_0_avx512bw(row, q8, in_f) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q8_0_avx2(row, q8, in_f) };
         }
     }
@@ -1290,14 +1290,14 @@ unsafe fn vec_dot_q8_0_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q5k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
+pub(crate) fn vec_dot_q5k<const CAP: bool>(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(in_f % 256, 0, "vec_dot_q5k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             return unsafe { vec_dot_q5k_avx512bw(row, q8, in_f) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q5k_avx2(row, q8, in_f) };
         }
     }
@@ -1743,7 +1743,12 @@ unsafe fn vec_dot_q4k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
 /// Batch Q4_K dot: `out[r] = vec_dot_q4k(row, &q8s[r], in_f)` for all r, bit-identical to
 /// the single-token kernel. The weight row is decoded ONCE; per-token work is the integer dot only.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q4k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q4k_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 256,
         0,
@@ -1751,13 +1756,13 @@ pub(crate) fn vec_dot_q4k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             return unsafe { vec_dot_q4k_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             return unsafe { vec_dot_q4k_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q4k_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -2005,7 +2010,7 @@ unsafe fn vec_dot_q4k_batch2_vnni(
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q4k_batch2(
+pub(crate) fn vec_dot_q4k_batch2<const CAP: bool>(
     row_a: &[u8],
     row_b: &[u8],
     q8s: &[Q8],
@@ -2020,16 +2025,16 @@ pub(crate) fn vec_dot_q4k_batch2(
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             return unsafe { vec_dot_q4k_batch2_vnni(row_a, row_b, q8s, in_f, out_a, out_b) };
         }
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             return unsafe { vec_dot_q4k_batch2_avx512bw(row_a, row_b, q8s, in_f, out_a, out_b) };
         }
     }
     // Scalar fallback: call single-row batch twice (still unpack once per row).
-    vec_dot_q4k_batch(row_a, q8s, in_f, out_a);
-    vec_dot_q4k_batch(row_b, q8s, in_f, out_b);
+    vec_dot_q4k_batch::<CAP>(row_a, q8s, in_f, out_a);
+    vec_dot_q4k_batch::<CAP>(row_b, q8s, in_f, out_b);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2158,7 +2163,12 @@ unsafe fn vec_dot_q4k_batch8_avx512bw(
 /// against all 8 weight rows — 8× activation reuse over single-row, 4× over 2-row. Falls back to
 /// 8× `vec_dot_q4k_batch` on older CPUs.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs: [&mut [f32]; 8]) {
+pub(crate) fn vec_dot_q4k_batch8<const CAP: bool>(
+    rows: [&[u8]; 8],
+    q8s: &[Q8],
+    in_f: usize,
+    outs: [&mut [f32]; 8],
+) {
     debug_assert_eq!(
         in_f % 256,
         0,
@@ -2166,21 +2176,21 @@ pub(crate) fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             return unsafe { vec_dot_q4k_batch8_avx512bw(rows, q8s, in_f, outs) };
         }
     }
     // Fallback: call the per-row batch kernel (avx2/scalar dispatch) for each of the 8 rows.
     let [row0, row1, row2, row3, row4, row5, row6, row7] = rows;
     let [out0, out1, out2, out3, out4, out5, out6, out7] = outs;
-    vec_dot_q4k_batch(row0, q8s, in_f, out0);
-    vec_dot_q4k_batch(row1, q8s, in_f, out1);
-    vec_dot_q4k_batch(row2, q8s, in_f, out2);
-    vec_dot_q4k_batch(row3, q8s, in_f, out3);
-    vec_dot_q4k_batch(row4, q8s, in_f, out4);
-    vec_dot_q4k_batch(row5, q8s, in_f, out5);
-    vec_dot_q4k_batch(row6, q8s, in_f, out6);
-    vec_dot_q4k_batch(row7, q8s, in_f, out7);
+    vec_dot_q4k_batch::<CAP>(row0, q8s, in_f, out0);
+    vec_dot_q4k_batch::<CAP>(row1, q8s, in_f, out1);
+    vec_dot_q4k_batch::<CAP>(row2, q8s, in_f, out2);
+    vec_dot_q4k_batch::<CAP>(row3, q8s, in_f, out3);
+    vec_dot_q4k_batch::<CAP>(row4, q8s, in_f, out4);
+    vec_dot_q4k_batch::<CAP>(row5, q8s, in_f, out5);
+    vec_dot_q4k_batch::<CAP>(row6, q8s, in_f, out6);
+    vec_dot_q4k_batch::<CAP>(row7, q8s, in_f, out7);
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -2525,7 +2535,12 @@ unsafe fn vec_dot_q6k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q6k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q6k_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 256,
         0,
@@ -2533,10 +2548,10 @@ pub(crate) fn vec_dot_q6k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             return unsafe { vec_dot_q6k_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q6k_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -2548,7 +2563,12 @@ pub(crate) fn vec_dot_q6k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
 /// `pshufb`) is done ONCE into a flat signed-i8 buffer, then reused across all `m` token
 /// activations — amortising the decode the single-token path would repeat per token.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_iq4xs_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_iq4xs_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 256,
         0,
@@ -2556,7 +2576,7 @@ pub(crate) fn vec_dot_iq4xs_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_iq4xs_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -3926,7 +3946,12 @@ unsafe fn vec_dot_q8_0_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: 
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q8_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q8_0_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 256,
         0,
@@ -3934,10 +3959,10 @@ pub(crate) fn vec_dot_q8_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             return unsafe { vec_dot_q8_0_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q8_0_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -4184,7 +4209,12 @@ unsafe fn vec_dot_q5k_batch_avx512bw(row: &[u8], q8s: &[Q8], in_f: usize, out: &
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q5k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q5k_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 256,
         0,
@@ -4192,10 +4222,10 @@ pub(crate) fn vec_dot_q5k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             return unsafe { vec_dot_q5k_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q5k_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -4440,7 +4470,12 @@ fn q2k_decode_row(row: &[u8], nb: usize) -> (Vec<f32>, Vec<f32>, Vec<i32>, Vec<i
 /// single-token kernel. The weight row is decoded ONCE; per-token work is the integer dot only.
 /// Dispatches VNNI → avx512bw → avx2 → scalar.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q2k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q2k_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 256,
         0,
@@ -4448,13 +4483,13 @@ pub(crate) fn vec_dot_q2k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             return unsafe { vec_dot_q2k_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             return unsafe { vec_dot_q2k_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q2k_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -4694,7 +4729,12 @@ unsafe fn vec_dot_q3k_batch_vnni(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
 /// single-token kernel. The weight row is decoded ONCE; per-token work is the integer dot only.
 /// Dispatches VNNI → avx512bw → avx2 → scalar.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q3k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q3k_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 256,
         0,
@@ -4702,13 +4742,13 @@ pub(crate) fn vec_dot_q3k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             return unsafe { vec_dot_q3k_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             return unsafe { vec_dot_q3k_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q3k_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -4777,7 +4817,12 @@ unsafe fn vec_dot_q8_0_32_batch_vnni(row: &[u8], q8s: &[Q8x32], in_f: usize, out
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q8_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q8_0_32_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8x32],
+    in_f: usize,
+    out: &mut [f32],
+) {
     // Native 32-block weight: `nb = in_f / 32` covers the whole row only when 32-aligned. This
     // guard is the 32-block sibling of the `in_f % 256` asserts on the K-quant kernels — it turns
     // a mis-route (e.g. a non-32-multiple `in_f`, or a wrongly-dispatched dtype) into a loud debug
@@ -4789,15 +4834,15 @@ pub(crate) fn vec_dot_q8_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q8_0_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx512() {
+        if crate::simd::avx512::<CAP>() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q8_0_32_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q8_0_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -4924,7 +4969,12 @@ unsafe fn vec_dot_q8_0_32_batch_avx512bw(row: &[u8], q8s: &[Q8x32], in_f: usize,
 /// bits from `qs` + 1 high bit from `qh`, per `dequant_block`'s Q5_0 case) — so
 /// `Σy·x = d_w·(Σcode·x − 16·Σx) ≈ d_w·d8·(Σcode·q8 − 16·bsum)`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q5_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q5_0_32_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8x32],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 32,
         0,
@@ -4932,11 +4982,11 @@ pub(crate) fn vec_dot_q5_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q5_0_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q5_0_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -5058,7 +5108,7 @@ unsafe fn vec_dot_q32_batch8_ilv_vnni(
 /// 8-row tile dispatcher for the native-32-block dots (Q8_0/Q5_0): the interleaved VNNI kernel
 /// on capable hardware, else 8x the per-row batch kernel.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q32_batch8(
+pub(crate) fn vec_dot_q32_batch8<const CAP: bool>(
     rows: [&[u8]; 8],
     q8s: &[Q8x32],
     in_f: usize,
@@ -5067,7 +5117,7 @@ pub(crate) fn vec_dot_q32_batch8(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             return unsafe { vec_dot_q32_batch8_ilv_vnni(rows, q8s, in_f, outs, q5) };
         }
     }
@@ -5075,9 +5125,9 @@ pub(crate) fn vec_dot_q32_batch8(
     let [mut_o0, mut_o1, mut_o2, mut_o3, mut_o4, mut_o5, mut_o6, mut_o7] = outs;
     let per = |row: &[u8], out: &mut [f32]| {
         if q5 {
-            vec_dot_q5_0_32_batch(row, q8s, in_f, out);
+            vec_dot_q5_0_32_batch::<CAP>(row, q8s, in_f, out);
         } else {
-            vec_dot_q8_0_32_batch(row, q8s, in_f, out);
+            vec_dot_q8_0_32_batch::<CAP>(row, q8s, in_f, out);
         }
     };
     per(r0, mut_o0);
@@ -5216,7 +5266,12 @@ fn vec_dot_q5_0_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
 /// `Σy·x = d_w·(Σcode·x − 8·Σx) ≈ d_w·d8·(Σcode·q8 − 8·bsum)`. Q4_0 is [`vec_dot_q5_0_32_batch`]
 /// without the 5th (`qh`) bit and with offset 8 not 16; block stride is 18 bytes not 22.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q4_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q4_0_32_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8x32],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 32,
         0,
@@ -5224,11 +5279,11 @@ pub(crate) fn vec_dot_q4_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q4_0_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q4_0_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -5360,7 +5415,12 @@ fn vec_dot_q4_0_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
 /// multiple of 64 (⇒ an even sub-block count); the m>1 dispatch guards on `is_multiple_of(64)`.
 /// Block stride is 18 bytes (`[f16 d][u8 qs[16]]`); code `j` is `(qs[j/4] >> ((j%4)*2)) & 3`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q2_0_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q2_0_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8x32],
+    in_f: usize,
+    out: &mut [f32],
+) {
     // Q2_0 is a 64-weight block (two 32-elem activation sub-blocks): `nb = in_f / 64`.
     debug_assert_eq!(
         in_f % 64,
@@ -5369,11 +5429,11 @@ pub(crate) fn vec_dot_q2_0_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &m
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q2_0_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q2_0_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -5505,7 +5565,12 @@ fn vec_dot_q2_0_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [
 /// Block stride is 20 bytes (`[f16 d][f16 m][u8 qs[16]]`), not Q4_0's 18. Reuses the same `Q8x32`
 /// activation as Q4_0 unchanged; `iprod` is the identical `maddubs/dpbusd` unsigned·signed dot.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q4_1_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q4_1_32_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8x32],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 32,
         0,
@@ -5513,11 +5578,11 @@ pub(crate) fn vec_dot_q4_1_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q4_1_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q4_1_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -5653,7 +5718,12 @@ fn vec_dot_q4_1_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
 /// identical to [`vec_dot_q5_0_32_batch`] (per `dequant_block`'s Q5_1 case). Reuses the same `Q8x32`
 /// activation unchanged; `iprod` is the identical `maddubs/dpbusd` unsigned·signed dot.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_q5_1_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_q5_1_32_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8x32],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 32,
         0,
@@ -5661,11 +5731,11 @@ pub(crate) fn vec_dot_q5_1_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q5_1_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q5_1_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -5807,7 +5877,12 @@ fn vec_dot_q5_1_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mu
 /// codebook weight is signed i8 and the activation is int8 → Q8_0's `abs(w)`/`sign(w)·a` maddubs
 /// trick. No `bsum` term (no offset). Dispatches vnni → avx2 → scalar.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_iq4nl_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_iq4nl_32_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8x32],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 32,
         0,
@@ -5815,11 +5890,11 @@ pub(crate) fn vec_dot_iq4nl_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_iq4nl_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_iq4nl_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -5981,7 +6056,12 @@ fn vec_dot_iq4nl_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &m
 /// `d·as·Σ(KV[code_i]·qa_i)` form, and the accumulation order — matches IQ4_NL. Dispatches vnni →
 /// avx2 → scalar.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_mxfp4_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_mxfp4_32_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8x32],
+    in_f: usize,
+    out: &mut [f32],
+) {
     debug_assert_eq!(
         in_f % 32,
         0,
@@ -5989,11 +6069,11 @@ pub(crate) fn vec_dot_mxfp4_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_mxfp4_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_mxfp4_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -6158,7 +6238,12 @@ fn vec_dot_mxfp4_32_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &m
 /// 16-element signed int dot, one f32 multiply, summed over the 4 sub-blocks (no offset/min term).
 /// `in_f` must be a multiple of 64. Dispatches vnni → avx2 → scalar.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn vec_dot_nvfp4_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut [f32]) {
+pub(crate) fn vec_dot_nvfp4_batch<const CAP: bool>(
+    row: &[u8],
+    q8s: &[Q8x32],
+    in_f: usize,
+    out: &mut [f32],
+) {
     // NVFP4 is a 64-weight block (two 32-elem activation sub-blocks): `nb = in_f / 64`.
     debug_assert_eq!(
         in_f % 64,
@@ -6167,11 +6252,11 @@ pub(crate) fn vec_dot_nvfp4_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::simd::vnni() {
+        if crate::simd::vnni::<CAP>() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_nvfp4_batch_vnni(row, q8s, in_f, out) };
         }
-        if crate::simd::avx2() {
+        if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_nvfp4_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -6624,7 +6709,7 @@ mod kernel_tests {
         }
         let wref = dequant_block(DType::Q4K, &w).unwrap();
         let q8 = quantize_q8(&det_x(in_f, 2));
-        let got = vec_dot_q4k(&w, &q8, in_f);
+        let got = vec_dot_q4k::<false>(&w, &q8, in_f);
         let want = dot(&wref, &dequant_q8(&q8));
         assert!(rel_err(got, want) < 1e-3, "q4k: got {got}, want {want}");
     }
@@ -6639,7 +6724,7 @@ mod kernel_tests {
         }
         let wref = dequant_block(DType::Q6K, &w).unwrap();
         let q8 = quantize_q8(&det_x(in_f, 4));
-        let got = vec_dot_q6k(&w, &q8, in_f);
+        let got = vec_dot_q6k::<false>(&w, &q8, in_f);
         let want = dot(&wref, &dequant_q8(&q8));
         assert!(rel_err(got, want) < 1e-3, "q6k: got {got}, want {want}");
     }
@@ -6655,7 +6740,7 @@ mod kernel_tests {
         }
         let wref = dequant_block(DType::Q8_0, &w).unwrap();
         let q8 = quantize_q8(&det_x(in_f, 10));
-        let got = vec_dot_q8_0(&w, &q8, in_f);
+        let got = vec_dot_q8_0::<false>(&w, &q8, in_f);
         let want = dot(&wref, &dequant_q8(&q8));
         assert!(rel_err(got, want) < 1e-3, "q8_0: got {got}, want {want}");
     }
@@ -6672,7 +6757,7 @@ mod kernel_tests {
         }
         let wref = dequant_block(DType::Q5K, &w).unwrap();
         let q8 = quantize_q8(&det_x(in_f, 12));
-        let got = vec_dot_q5k(&w, &q8, in_f);
+        let got = vec_dot_q5k::<false>(&w, &q8, in_f);
         let want = dot(&wref, &dequant_q8(&q8));
         assert!(rel_err(got, want) < 1e-3, "q5k: got {got}, want {want}");
     }
@@ -6693,7 +6778,7 @@ mod kernel_tests {
             let xs: Vec<Vec<f32>> = (0..3).map(|i| det_x(in_f, 21 + i)).collect();
             let q8s: Vec<Q8x32> = xs.iter().map(|x| quantize_q8_32(x)).collect();
             let mut got = vec![0f32; 3];
-            vec_dot_q8_0_32_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_q8_0_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, q8) in q8s.iter().enumerate() {
                 let want = dot(&wref, &dequant_q8_32(q8));
                 assert!(
@@ -6745,7 +6830,7 @@ mod kernel_tests {
                 for i in 0..8 {
                     let o = g * 8 + i;
                     let mut want = vec![0f32; m];
-                    vec_dot_q6k_batch(&w[o * bpr..o * bpr + bpr], &q8s, in_f, &mut want);
+                    vec_dot_q6k_batch::<false>(&w[o * bpr..o * bpr + bpr], &q8s, in_f, &mut want);
                     for r in 0..m {
                         assert_eq!(
                             cols[i * m + r].to_bits(),
@@ -6839,7 +6924,7 @@ mod kernel_tests {
                 let mut it = got.iter_mut();
                 let outs: [&mut [f32]; 8] =
                     std::array::from_fn(|_| it.next().unwrap().as_mut_slice());
-                vec_dot_q32_batch8(rows, &q8s, in_f, outs, q5);
+                vec_dot_q32_batch8::<false>(rows, &q8s, in_f, outs, q5);
             }
             for i in 0..8 {
                 let mut want = vec![0f32; m];
@@ -6874,7 +6959,7 @@ mod kernel_tests {
                 .map(|r| quantize_q8_32(&det_x(in_f, 42 + r as u64)))
                 .collect();
             let mut simd_out = vec![0f32; m];
-            vec_dot_q5_0_32_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_q5_0_32_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_q5_0_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -6902,7 +6987,7 @@ mod kernel_tests {
                 .map(|r| quantize_q8_32(&det_x(in_f, 26 + r as u64)))
                 .collect();
             let mut simd_out = vec![0f32; m];
-            vec_dot_q8_0_32_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_q8_0_32_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_q8_0_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -6931,7 +7016,7 @@ mod kernel_tests {
             let xs: Vec<Vec<f32>> = (0..3).map(|i| det_x(in_f, 31 + i)).collect();
             let q8s: Vec<Q8x32> = xs.iter().map(|x| quantize_q8_32(x)).collect();
             let mut got = vec![0f32; 3];
-            vec_dot_q5_0_32_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_q5_0_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, q8) in q8s.iter().enumerate() {
                 let want = dot(&wref, &dequant_q8_32(q8));
                 assert!(
@@ -6959,7 +7044,7 @@ mod kernel_tests {
                 .map(|r| quantize_q8_32(&det_x(in_f, 73 + r as u64)))
                 .collect();
             let mut simd_out = vec![0f32; m];
-            vec_dot_q4_0_32_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_q4_0_32_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_q4_0_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -6998,7 +7083,7 @@ mod kernel_tests {
             // vs the full-precision activation (absorbs the lossy int8 activation quant; the small
             // in_f=32 single-block case has little sign cancellation, so 1e-2 would be marginal).
             let mut got = vec![0f32; xs.len()];
-            vec_dot_q4_0_32_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_q4_0_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let want_q = dot(&wref, &dequant_q8_32(q8));
                 assert!(
@@ -7016,7 +7101,7 @@ mod kernel_tests {
             // Single-row entry (m=1): one activation block-set, one-element out.
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
-                vec_dot_q4_0_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_q4_0_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 let want = dot(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
@@ -7056,7 +7141,7 @@ mod kernel_tests {
                 .map(|r| quantize_q8_32(&det_x(in_f, 201 + r as u64)))
                 .collect();
             let mut simd_out = vec![0f32; m];
-            vec_dot_q2_0_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_q2_0_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_q2_0_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -7071,7 +7156,7 @@ mod kernel_tests {
             // Single-row (m=1) dispatch must agree too.
             for r in 0..m {
                 let mut one = [0f32; 1];
-                vec_dot_q2_0_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_q2_0_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 assert_eq!(
                     one[0].to_bits(),
                     scalar_out[r].to_bits(),
@@ -7102,7 +7187,7 @@ mod kernel_tests {
 
             // Batch entry (m>1).
             let mut got = vec![0f32; xs.len()];
-            vec_dot_q2_0_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_q2_0_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let want_q = dot(&wref, &dequant_q8_32(q8));
                 assert!(
@@ -7120,7 +7205,7 @@ mod kernel_tests {
             // Single-row entry (m=1).
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
-                vec_dot_q2_0_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_q2_0_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 let want = dot(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
@@ -7156,7 +7241,7 @@ mod kernel_tests {
                 .map(|r| quantize_q8_32(&det_x(in_f, 83 + r as u64)))
                 .collect();
             let mut simd_out = vec![0f32; m];
-            vec_dot_q4_1_32_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_q4_1_32_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_q4_1_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -7171,7 +7256,7 @@ mod kernel_tests {
             // Single-row (m=1) dispatch must agree too.
             for r in 0..m {
                 let mut one = [0f32; 1];
-                vec_dot_q4_1_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_q4_1_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 assert_eq!(
                     one[0].to_bits(),
                     scalar_out[r].to_bits(),
@@ -7202,7 +7287,7 @@ mod kernel_tests {
             // (isolates integer-dot correctness), plus a looser 2e-2 vs the full-precision
             // activation (absorbs the lossy int8 activation quant).
             let mut got = vec![0f32; xs.len()];
-            vec_dot_q4_1_32_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_q4_1_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let want_q = dot(&wref, &dequant_q8_32(q8));
                 assert!(
@@ -7220,7 +7305,7 @@ mod kernel_tests {
             // Single-row entry (m=1): one activation block-set, one-element out.
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
-                vec_dot_q4_1_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_q4_1_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 let want = dot(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
@@ -7281,7 +7366,7 @@ mod kernel_tests {
                 .map(|r| quantize_q8_32(&det_x(in_f, 112 + r as u64)))
                 .collect();
             let mut simd_out = vec![0f32; m];
-            vec_dot_q5_1_32_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_q5_1_32_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_q5_1_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -7296,7 +7381,7 @@ mod kernel_tests {
             // Single-row (m=1) dispatch must agree too.
             for r in 0..m {
                 let mut one = [0f32; 1];
-                vec_dot_q5_1_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_q5_1_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 assert_eq!(
                     one[0].to_bits(),
                     scalar_out[r].to_bits(),
@@ -7332,7 +7417,7 @@ mod kernel_tests {
             // (isolates integer-dot correctness), plus a looser 2e-2 vs the full-precision
             // activation (absorbs the lossy int8 activation quant).
             let mut got = vec![0f32; xs.len()];
-            vec_dot_q5_1_32_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_q5_1_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let want_q = dot(&wref, &dequant_q8_32(q8));
                 assert!(
@@ -7350,7 +7435,7 @@ mod kernel_tests {
             // Single-row entry (m=1): one activation block-set, one-element out.
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
-                vec_dot_q5_1_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_q5_1_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 let want = dot(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
@@ -7384,7 +7469,7 @@ mod kernel_tests {
                 .map(|r| quantize_q8_32(&det_x(in_f, 113 + r as u64)))
                 .collect();
             let mut simd_out = vec![0f32; m];
-            vec_dot_iq4nl_32_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_iq4nl_32_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_iq4nl_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -7399,7 +7484,7 @@ mod kernel_tests {
             // Single-row (m=1) dispatch must agree too.
             for r in 0..m {
                 let mut one = [0f32; 1];
-                vec_dot_iq4nl_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_iq4nl_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 assert_eq!(
                     one[0].to_bits(),
                     scalar_out[r].to_bits(),
@@ -7432,7 +7517,7 @@ mod kernel_tests {
             // (isolates codebook-dot correctness), plus a looser 2e-2 vs the full-precision
             // activation (absorbs the lossy int8 activation quant).
             let mut got = vec![0f32; xs.len()];
-            vec_dot_iq4nl_32_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_iq4nl_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let want_q = dot(&wref, &dequant_q8_32(q8));
                 assert!(
@@ -7450,7 +7535,7 @@ mod kernel_tests {
             // Single-row entry (m=1): one activation block-set, one-element out.
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
-                vec_dot_iq4nl_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_iq4nl_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 let want = dot(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
@@ -7498,7 +7583,7 @@ mod kernel_tests {
                 .map(|r| quantize_q8_32(&det_x(in_f, 213 + r as u64)))
                 .collect();
             let mut simd_out = vec![0f32; m];
-            vec_dot_mxfp4_32_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_mxfp4_32_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_mxfp4_32_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -7513,7 +7598,7 @@ mod kernel_tests {
             // Single-row (m=1) dispatch must agree too.
             for r in 0..m {
                 let mut one = [0f32; 1];
-                vec_dot_mxfp4_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_mxfp4_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 assert_eq!(
                     one[0].to_bits(),
                     scalar_out[r].to_bits(),
@@ -7548,7 +7633,7 @@ mod kernel_tests {
             // (isolates codebook-dot correctness), plus a looser 2e-2 vs the full-precision
             // activation (absorbs the lossy int8 activation quant).
             let mut got = vec![0f32; xs.len()];
-            vec_dot_mxfp4_32_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_mxfp4_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let want_q = dot(&wref, &dequant_q8_32(q8));
                 assert!(
@@ -7566,7 +7651,7 @@ mod kernel_tests {
             // Single-row entry (m=1): one activation block-set, one-element out.
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
-                vec_dot_mxfp4_32_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_mxfp4_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 let want = dot(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
@@ -7617,7 +7702,7 @@ mod kernel_tests {
                 .map(|r| quantize_q8_32(&det_x(in_f, 513 + r as u64)))
                 .collect();
             let mut simd_out = vec![0f32; m];
-            vec_dot_nvfp4_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_nvfp4_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_nvfp4_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -7632,7 +7717,7 @@ mod kernel_tests {
             // Single-row (m=1) dispatch must agree too.
             for r in 0..m {
                 let mut one = [0f32; 1];
-                vec_dot_nvfp4_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_nvfp4_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 assert_eq!(
                     one[0].to_bits(),
                     scalar_out[r].to_bits(),
@@ -7667,7 +7752,7 @@ mod kernel_tests {
             // (isolates codebook-dot correctness), plus a looser 2e-2 vs the full-precision
             // activation (absorbs the lossy int8 activation quant).
             let mut got = vec![0f32; xs.len()];
-            vec_dot_nvfp4_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_nvfp4_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let want_q = dot(&wref, &dequant_q8_32(q8));
                 assert!(
@@ -7685,7 +7770,7 @@ mod kernel_tests {
             // Single-row entry (m=1): one activation block-set, one-element out.
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
-                vec_dot_nvfp4_batch(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
+                vec_dot_nvfp4_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
                 let want = dot(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
@@ -7749,7 +7834,7 @@ mod kernel_tests {
                 .collect();
             // Single-token: SIMD dispatch vs scalar oracle.
             for (r, q8) in q8s.iter().enumerate() {
-                let simd = vec_dot_iq4xs(&w, q8, in_f);
+                let simd = vec_dot_iq4xs::<false>(&w, q8, in_f);
                 let scalar = vec_dot_iq4xs_scalar(&w, q8, in_f);
                 assert_eq!(
                     simd.to_bits(),
@@ -7759,7 +7844,7 @@ mod kernel_tests {
             }
             // Batch: SIMD dispatch vs scalar oracle.
             let mut simd_out = vec![0f32; m];
-            vec_dot_iq4xs_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_iq4xs_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_iq4xs_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -7793,7 +7878,7 @@ mod kernel_tests {
 
             // Batch (m>1).
             let mut got = vec![0f32; xs.len()];
-            vec_dot_iq4xs_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_iq4xs_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let want_q = dot(&wref, &dequant_q8(q8));
                 assert!(
@@ -7810,7 +7895,7 @@ mod kernel_tests {
             }
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let got1 = vec_dot_iq4xs(&w, q8, in_f);
+                let got1 = vec_dot_iq4xs::<false>(&w, q8, in_f);
                 let want_q = dot(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
@@ -8897,7 +8982,7 @@ mod kernel_tests {
                 .collect();
             // Single-token: SIMD dispatch vs scalar oracle.
             for (r, q8) in q8s.iter().enumerate() {
-                let simd = vec_dot_q2k(&w, q8, in_f);
+                let simd = vec_dot_q2k::<false>(&w, q8, in_f);
                 let scalar = vec_dot_q2k_scalar(&w, q8, in_f);
                 assert_eq!(
                     simd.to_bits(),
@@ -8907,7 +8992,7 @@ mod kernel_tests {
             }
             // Batch: SIMD dispatch vs scalar oracle.
             let mut simd_out = vec![0f32; m];
-            vec_dot_q2k_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_q2k_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_q2k_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -8941,7 +9026,7 @@ mod kernel_tests {
 
             // Batch (m>1).
             let mut got = vec![0f32; xs.len()];
-            vec_dot_q2k_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_q2k_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let want_q = dot(&wref, &dequant_q8(q8));
                 assert!(
@@ -8958,7 +9043,7 @@ mod kernel_tests {
             }
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let got1 = vec_dot_q2k(&w, q8, in_f);
+                let got1 = vec_dot_q2k::<false>(&w, q8, in_f);
                 let want_q = dot(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
@@ -9036,7 +9121,7 @@ mod kernel_tests {
                 .collect();
             // Single-token: SIMD dispatch vs scalar oracle.
             for (r, q8) in q8s.iter().enumerate() {
-                let simd = vec_dot_q3k(&w, q8, in_f);
+                let simd = vec_dot_q3k::<false>(&w, q8, in_f);
                 let scalar = vec_dot_q3k_scalar(&w, q8, in_f);
                 assert_eq!(
                     simd.to_bits(),
@@ -9046,7 +9131,7 @@ mod kernel_tests {
             }
             // Batch: SIMD dispatch vs scalar oracle.
             let mut simd_out = vec![0f32; m];
-            vec_dot_q3k_batch(&w, &q8s, in_f, &mut simd_out);
+            vec_dot_q3k_batch::<false>(&w, &q8s, in_f, &mut simd_out);
             let mut scalar_out = vec![0f32; m];
             vec_dot_q3k_batch_scalar(&w, &q8s, in_f, &mut scalar_out);
             for r in 0..m {
@@ -9080,7 +9165,7 @@ mod kernel_tests {
 
             // Batch (m>1).
             let mut got = vec![0f32; xs.len()];
-            vec_dot_q3k_batch(&w, &q8s, in_f, &mut got);
+            vec_dot_q3k_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let want_q = dot(&wref, &dequant_q8(q8));
                 assert!(
@@ -9097,7 +9182,7 @@ mod kernel_tests {
             }
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let got1 = vec_dot_q3k(&w, q8, in_f);
+                let got1 = vec_dot_q3k::<false>(&w, q8, in_f);
                 let want_q = dot(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
@@ -9206,7 +9291,7 @@ mod kernel_tests {
     fn q4k_non_multiple_of_256_debug_asserts() {
         let q8 = quantize_q8(&det_x(256, 1));
         let w = det_bytes(144, 2);
-        let _ = vec_dot_q4k(&w, &q8, 200); // 200 % 256 != 0
+        let _ = vec_dot_q4k::<false>(&w, &q8, 200); // 200 % 256 != 0
     }
 
     // #4: q4k_decode_row reproduces the inline scalar decode bit-for-bit on a sample row.
@@ -9282,9 +9367,9 @@ mod kernel_tests {
             .map(|r| quantize_q8(&det_x(in_f, 30 + r as u64)))
             .collect();
         let mut batch_out = vec![0f32; m];
-        vec_dot_q4k_batch(&w, &q8s, in_f, &mut batch_out);
+        vec_dot_q4k_batch::<false>(&w, &q8s, in_f, &mut batch_out);
         for r in 0..m {
-            let want = vec_dot_q4k(&w, &q8s[r], in_f);
+            let want = vec_dot_q4k::<false>(&w, &q8s[r], in_f);
             assert_eq!(
                 batch_out[r].to_bits(),
                 want.to_bits(),
@@ -9308,9 +9393,9 @@ mod kernel_tests {
             .map(|r| quantize_q8(&det_x(in_f, 40 + r as u64)))
             .collect();
         let mut batch_out = vec![0f32; m];
-        vec_dot_q6k_batch(&w, &q8s, in_f, &mut batch_out);
+        vec_dot_q6k_batch::<false>(&w, &q8s, in_f, &mut batch_out);
         for r in 0..m {
-            let want = vec_dot_q6k(&w, &q8s[r], in_f);
+            let want = vec_dot_q6k::<false>(&w, &q8s[r], in_f);
             assert_eq!(
                 batch_out[r].to_bits(),
                 want.to_bits(),
@@ -9334,9 +9419,9 @@ mod kernel_tests {
             .map(|r| quantize_q8(&det_x(in_f, 50 + r as u64)))
             .collect();
         let mut batch_out = vec![0f32; m];
-        vec_dot_q8_0_batch(&w, &q8s, in_f, &mut batch_out);
+        vec_dot_q8_0_batch::<false>(&w, &q8s, in_f, &mut batch_out);
         for r in 0..m {
-            let want = vec_dot_q8_0(&w, &q8s[r], in_f);
+            let want = vec_dot_q8_0::<false>(&w, &q8s[r], in_f);
             assert_eq!(
                 batch_out[r].to_bits(),
                 want.to_bits(),
@@ -9361,9 +9446,9 @@ mod kernel_tests {
             .map(|r| quantize_q8(&det_x(in_f, 60 + r as u64)))
             .collect();
         let mut batch_out = vec![0f32; m];
-        vec_dot_q5k_batch(&w, &q8s, in_f, &mut batch_out);
+        vec_dot_q5k_batch::<false>(&w, &q8s, in_f, &mut batch_out);
         for r in 0..m {
-            let want = vec_dot_q5k(&w, &q8s[r], in_f);
+            let want = vec_dot_q5k::<false>(&w, &q8s[r], in_f);
             assert_eq!(
                 batch_out[r].to_bits(),
                 want.to_bits(),
@@ -9401,7 +9486,11 @@ mod kernel_tests {
 
         // Reference: vec_dot_q4k per (row, token) — the scalar single-token oracle.
         let want: Vec<Vec<f32>> = (0..n_rows)
-            .map(|i| (0..m).map(|r| vec_dot_q4k(&ws[i], &q8s[r], in_f)).collect())
+            .map(|i| {
+                (0..m)
+                    .map(|r| vec_dot_q4k::<false>(&ws[i], &q8s[r], in_f))
+                    .collect()
+            })
             .collect();
 
         // Test the 8-row tile for rows 0..8.
@@ -9413,7 +9502,7 @@ mod kernel_tests {
         let mut got5 = vec![0f32; m];
         let mut got6 = vec![0f32; m];
         let mut got7 = vec![0f32; m];
-        vec_dot_q4k_batch8(
+        vec_dot_q4k_batch8::<false>(
             [
                 &ws[0], &ws[1], &ws[2], &ws[3], &ws[4], &ws[5], &ws[6], &ws[7],
             ],
@@ -9428,11 +9517,11 @@ mod kernel_tests {
         // Test 2-row remainder (rows 8..10) — same path as the dispatch remainder.
         let mut got8 = vec![0f32; m];
         let mut got9 = vec![0f32; m];
-        vec_dot_q4k_batch2(&ws[8], &ws[9], &q8s, in_f, &mut got8, &mut got9);
+        vec_dot_q4k_batch2::<false>(&ws[8], &ws[9], &q8s, in_f, &mut got8, &mut got9);
 
         // Test 1-row tail (row 10).
         let mut got10 = vec![0f32; m];
-        vec_dot_q4k_batch(&ws[10], &q8s, in_f, &mut got10);
+        vec_dot_q4k_batch::<false>(&ws[10], &q8s, in_f, &mut got10);
 
         let got_all: [&Vec<f32>; 11] = [
             &got0, &got1, &got2, &got3, &got4, &got5, &got6, &got7, &got8, &got9, &got10,
@@ -9477,7 +9566,7 @@ mod kernel_tests {
 
             // m>1 batch entry: the arm the dispatch's `else if q8_0_blk32` branch calls.
             let mut got_batch = vec![0f32; m];
-            vec_dot_q8_0_32_batch(&w, &q8s, in_f, &mut got_batch);
+            vec_dot_q8_0_32_batch::<false>(&w, &q8s, in_f, &mut got_batch);
 
             for (r, q8) in q8s.iter().enumerate() {
                 // full-precision weight · the int8 activation the kernel actually sees.
@@ -9491,7 +9580,7 @@ mod kernel_tests {
                 // m==1 entry: the dispatch quantizes a single row and passes a 1-element slice —
                 // must equal the batch result for that row (same kernel, one token).
                 let mut got1 = [0f32];
-                vec_dot_q8_0_32_batch(&w, std::slice::from_ref(q8), in_f, &mut got1);
+                vec_dot_q8_0_32_batch::<false>(&w, std::slice::from_ref(q8), in_f, &mut got1);
                 assert_eq!(
                     got1[0].to_bits(),
                     got_batch[r].to_bits(),

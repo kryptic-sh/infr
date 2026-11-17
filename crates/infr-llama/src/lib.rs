@@ -27,6 +27,7 @@ pub mod grammar;
 /// N-slot concurrent generation (`infr serve --parallel N`) — see [`parallel::ParallelSeam`].
 pub mod parallel;
 pub mod sampling;
+pub mod tolerance;
 pub use config::Config;
 
 /// The ENGINE configuration ([`infr_core::config::Config`]), re-exported under a name that cannot

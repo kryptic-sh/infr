@@ -423,6 +423,13 @@ impl CpuBackend {
         self.pool = std::sync::OnceLock::new();
     }
 
+    /// The number of threads a job on this backend's pool runs on (the caller and the workers),
+    /// once an [`Backend::execute`] has built it: the rayon pool size of the thread that built
+    /// it. `None` before. Lets a test confirm the thread count it asked for is the one it got.
+    pub fn pool_threads(&self) -> Option<usize> {
+        self.pool.get().map(pool::SpinPool::threads)
+    }
+
     fn pool(&self) -> &pool::SpinPool {
         self.pool
             .get_or_init(|| pool::SpinPool::new(&self.cfg.kernels.cpu))

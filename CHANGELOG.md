@@ -58,6 +58,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   forced only the math slices: one ceiling covers both, and the old key is no
   longer read. New: `infr_core::simd` (`SimdTier`, `active`, `set_max`).
 
+- **`CpuBackend::pool_threads`**: the size of the backend's thread pool once a
+  graph has built it. `crates/infr-cpu/tests/op_hashes.rs` uses it: every `Op`
+  variant's CPU result is hashed against one checked-in value at every SIMD tier
+  the host has and at 1, 2, 3, 7, 33 and the machine's thread count, in the
+  normal test job on Linux, Windows and macOS.
+
 - **`INFR_CPU_OP_HASH=<path>`** (`debug.cpu_op_hash`), a debugging aid: the CPU
   backend appends one line per tensor each op reads and writes (backend, graph
   and op number, the op's profiler label, element count, an FNV-1a hash of the

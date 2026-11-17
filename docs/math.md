@@ -212,6 +212,33 @@ backend. What is proven, and how:
 - **Windows and Linux** reproduce all of the above with the same values. aarch64
   runs the scalar kernels and is the first thing CI's macOS jobs check.
 
+**What "L2 proven" covers, exactly.** Run on one AVX-512 VNNI machine (Ryzen 9
+9950X3D), Windows and Linux under WSL:
+
+- every quantized kernel family's dispatcher at every x86 tier, both of its
+  compilations, against the scalar kernel bit for bit (`tier_tests`);
+- every `Op` variant at every tier and at 1, 2, 3, 7, 33 and 32 threads
+  (`op_hashes`), including every KV cache format the CPU backend implements
+  (F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, Turbo2/3/4) written and
+  read back, and one shape past each pool size threshold (a decode `Op::Linear`
+  whose rows per task range over `DECODE_ROWS_MIN..=MAX`, a decode attention
+  whose f16 prefix widens in several `KV_WIDEN_CHUNK` pieces, a lightning
+  indexer with several score tasks);
+- prefill chunk heights 512, 7, 3 and 1 on six cached dense models, and in CI on
+  the synthetic LFM3 with f32 weights and with Q4_K, Q5_0 and Q8_0 weights;
+- `f32::mul_add` correctly rounded on native and baseline builds
+  (`tests/mul_add_exact.rs`), which the f32 dots' identity across builds rests
+  on.
+
+**By reading only:** that no parallel split reduces across tasks for shapes
+larger than the suite's (the threshold cases cross each threshold once, not
+every chunk count); that `Op::MoeFfn`'s expert tiles are identical across thread
+counts at real model sizes (the suite's MoE cases are small); the packed VNNI
+GEMMs against the per-row kernels on shapes other than the suite's. **Not
+covered:** other x86 microarchitectures (the tiers are the same code on any of
+them; a CPU whose `fmaf` or hardware FMA were incorrect would not be), and
+aarch64, whose first runs are CI's macOS jobs.
+
 **The architecture audit (L3).** Float `min`/`max` return either zero when given
 `+0` and `-0`, and x86 and AArch64 lower them differently; NaN handling is
 specified (the other operand). Every production use in the CPU backend and
@@ -235,31 +262,53 @@ the standard library's unstable sort rather than on the input: `Op::Sample` and
 the host sampler's top-k path ordered equal logits arbitrarily. Both now break
 ties by token id.
 
-**Speed** (2026-11-17, Windows, native release builds of `origin/main` and the
-branch, `infr bench --dev cpu`, three interleaved rounds of three reps each, no
-other build or test running; t/s, the per-round medians):
+**Speed: what the ceiling costs when it is not set.** The first version of the
+switch asked the ceiling at every dispatch (`simd::allows`, one load and a
+compare). On a `target-cpu=native` build that was a real cost: `origin/main`'s
+`is_x86_feature_detected!` is a compile-time constant there, so its dispatchers
+were bare calls to the widest kernel. gemma-3-1b's pp512 fell 3-8%
+(`Linear m=511 1152x6912 Q5_0`: medians of 16 per-call times 11.81 ms on main,
+12.38 with the check, 11.71 with the check put back to the constant). Hoisting
+the check to once per op, or keeping the narrow tiers out of line, recovered
+part of it, not all. What did: two compilations of the whole interpreter
+(`CpuBackend::execute_with::<CAP>`), chosen once per graph from
+`infr_core::simd::capped()`. With no ceiling the interpreter is `main`'s code
+with every dispatch the constant; under a ceiling every dispatch asks it, on
+every thread (`crate::simd` in `infr-cpu`).
 
-| Model, run                 | `origin/main`          | branch                 |
-| -------------------------- | ---------------------- | ---------------------- |
-| Qwen3-1.7B Q4_K_M, pp512   | 1125.9, 1128.1, 1137.0 | 1123.5, 1153.4, 1142.2 |
-| Qwen3-1.7B Q4_K_M, tg64    | 58.6, 56.2, 59.3       | 58.5, 56.7, 57.2       |
-| Qwen3.5-0.8B Q4_K_M, pp512 | 1116.7, 1094.2, 978.4  | 1123.2, 1079.1, 1060.3 |
-| Qwen3.5-0.8B Q4_K_M, tg64  | 72.6, 71.6, 72.3       | 69.2, 71.0, 72.1       |
-| gemma-3-1b Q4_K_M, pp512   | 607.7, 618.2, 595.3    | 591.5, 588.8, 567.2    |
-| gemma-3-1b Q4_K_M, tg64    | 42.2, 41.9, 42.2       | 47.8, 48.4, 46.4       |
+Measured 2026-11-17 on Windows, `infr bench --dev cpu`, three binaries
+interleaved per round (`main` = `origin/main`, `head` = the branch with the
+per-dispatch check, `after5` = the branch as committed), eight rounds of three
+reps each, per-round medians in t/s, native builds; no other build, test or GPU
+job running (`tasklist`), desktop apps idle:
 
-Qwen3 and Qwen3.5 are unchanged within the spread of the rounds. gemma-3-1b's
-prefill is 3-5% slower and its decode 10-15% faster, all of it in its Q5_0
-`Linear` kernels (`INFR_PROF_OPS`: `Linear m=511 1152x6912 Q5_0` 11.3-11.8 ms
-per call against 12.0-12.2), whose code did not change. A control build of the
-branch with the tier check put back to `is_x86_feature_detected!` gave main's
-prefill (607-617 t/s) and the branch's decode (47.6-47.9), and a build with the
-leaner check (`simd::allows`, committed) 590-596 against main's 614-622 in the
-same rounds; in one binary, the Q5_0 batch dispatcher and a direct call to its
-VNNI kernel take the same 19.0 µs per row (gemma's shape, 511 rows, one thread).
-So the check costs nothing measurable, and the gap follows where the kernels
-land in the binary, as gemma's Q5_0 decode time already did between builds that
-did not touch it (docs/backlog.md, B202 and B204).
+| Model, run           | `main`                                                         | `head`                                                         | `after5`                                                       |
+| -------------------- | -------------------------------------------------------------- | -------------------------------------------------------------- | -------------------------------------------------------------- |
+| gemma-3-1b-it, pp512 | 545.6, 579.3, 568.2, 600.5, 575.3, 563.7, 564.5, 559.7         | 560.8, 559.0, 557.2, 583.2, 556.9, 538.5, 560.7, 544.0         | 558.0, 572.1, 593.5, 594.1, 549.5, 561.4, 550.8, 590.4         |
+| gemma-3-1b-it, tg64  | 41.0, 41.1, 41.2, 39.2, 41.6, 40.4, 41.2, 41.4                 | 44.9, 45.1, 44.1, 46.2, 43.9, 42.6, 44.9, 46.1                 | 46.4, 46.5, 45.4, 46.3, 46.2, 45.3, 46.0, 46.6                 |
+| Qwen3-1.7B, pp512    | 1112.7, 1106.5, 1102.6, 1098.2, 1110.1, 1114.1, 1114.2, 1110.6 | 1100.5, 1108.6, 1139.5, 1097.2, 1129.3, 1126.4, 1079.6, 1076.5 | 1142.1, 1142.2, 1099.1, 1052.8, 1131.6, 1126.9, 1115.1, 1112.8 |
+| Qwen3-1.7B, tg64     | 55.8, 55.9, 57.4, 53.6, 56.6, 53.7, 54.3, 55.2                 | 54.3, 56.4, 56.4, 56.9, 56.0, 55.6, 50.5, 55.5                 | 55.0, 57.2, 57.3, 54.9, 57.8, 55.0, 54.2, 54.5                 |
+
+The criterion for "indistinguishable from `main`": the after-fix build's middle
+value (the mean of the 4th and 5th of the 8 per-round values) within `main`'s
+round-to-round range, and its difference from `main`'s middle value smaller than
+that range's width. gemma-3-1b pp512: above main in 3 of 8 rounds (head in 1 of
+8), the middle values (the mean of the 4th and 5th of 8) 566.8 against 566.4;
+Qwen3-1.7B pp512 above in 6 of 8; decode the same on Qwen3 and faster on gemma
+in every round (from an earlier change on the branch; not traced). The baseline
+builds (`-C target-cpu=x86-64`, where `main`'s check was a run-time load
+already), main against after, same protocol:
+
+| Model, run           | `mainbase`                                             | `afterbase`                                            |
+| -------------------- | ------------------------------------------------------ | ------------------------------------------------------ |
+| gemma-3-1b-it, pp512 | 387.2, 375.6, 374.5, 369.9, 379.0, 382.4, 370.6, 382.8 | 380.1, 374.4, 376.3, 367.7, 379.4, 371.3, 371.2, 369.7 |
+| gemma-3-1b-it, tg64  | 40.4, 40.6, 42.1, 38.7, 40.9, 39.6, 41.6, 41.0         | 40.5, 42.0, 40.2, 40.8, 39.9, 41.3, 41.3, 39.5         |
+| Qwen3-1.7B, pp512    | 330.3, 335.0, 335.8, 333.1, 329.6, 328.5, 317.7, 322.1 | 329.8, 327.0, 334.3, 331.1, 330.3, 327.9, 318.5, 321.4 |
+| Qwen3-1.7B, tg64     | 47.3, 49.6, 50.9, 51.0, 49.7, 51.1, 49.2, 50.0         | 50.4, 46.7, 47.2, 50.4, 50.1, 51.0, 50.1, 46.7         |
+
+Within the spread there too: the middle values 372.9 against 377.3 on gemma-3-1b
+pp512 (below main in 5 of 8 rounds, at most 3.4% in one; main's own rounds span
+4.6%) and 328.9 against 329.9 on Qwen3-1.7B pp512; decode level.
 
 ## The determinism rule
 
@@ -413,8 +462,12 @@ tie:
 France: "**Analyze the Request:** The user is asking for the capital of France."
 became "**Analyze the Request:**\n \* Question: …"; knight: "**Topic:** A short
 story about a brave knight." became "**Topic:** A brave knight.". The new knight
-hash is the one CI's (AVX2) runner computed when the golden was dropped from CI
-as not portable (`docs/synthetic-models.md`).
+hash is the value a CI runner printed when the golden was dropped from CI as not
+portable (`docs/synthetic-models.md`). The France hash does not match that run:
+France passed there with the old value, so a July runner and this code disagree
+on it (much else has changed since, the math migration and RoPE among it), and
+the Q8_0 association is not established as the July cause. The golden's first
+Linux CI run after this change is the real test.
 
 How the changed texts fork, for example: Qwen3-0.6B's ocean paragraph went from
 "brainstorming the key elements … Maybe use words like" to "brainstorming key

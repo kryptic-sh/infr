@@ -6620,7 +6620,15 @@ every other dtype. The options as weighed:
   it says how numerically sensitive the production int8 path is compared with
   `CpuBackend::reference()`, and a test that measures the amplification (one
   last-bit perturbation, logits distance on both paths) would put a number on
-  it.
+  it. Plan 11's Q8_0 fix (a last-bit change in one kernel's summation order)
+  gave the same picture on Qwen3.5-0.8B (measured by the S3/S4 review,
+  2026-11-17): before either golden forks, the top logit already differs by 0.07
+  to 0.79 between `origin/main` and the branch; France forks at step 13 with
+  top-two margins 0.62 and 0.22 on the two sides, the knight story at step 31
+  with 0.034 and 0.099. This bears directly on plan 11's section 6: a GPU scored
+  against the CPU reference must be teacher-forced and judged by
+  distribution-level metrics, not by logit differences, which move this much
+  from a last-bit change on the CPU alone.
 
 ### B203 — `Op::MoeFfn` is not row-count identical: one row f32, several int8 (2026-11-17)
 
@@ -6683,16 +6691,19 @@ Options:
   `dot_bf16`, attention's value accumulation, `dequant_row`) is a call to the C
   runtime's `fma`: exact, so the bits match a native build, but slow. A run-time
   FMA tier behind `crate::simd` would keep the bits and the speed.
-- **gemma-3-1b's Q5_0 kernels move with code placement.** Plan 11's branch
-  measured gemma-3-1b pp512 3-5% slower and tg64 10-15% faster than
-  `origin/main`, all in `Linear ... Q5_0`, a kernel it did not change; a control
-  build that differed only in the tier check matched main's prefill, while the
-  same-binary microbenchmark of dispatcher against direct call showed no cost
-  (`docs/math.md`, "Identity across tiers …", for the numbers). The same kernel
-  moved 249-282 µs per decode call between unrelated builds before (B202). What
-  in the layout decides it was not found; aligning or splitting the Q5_0 batch
-  kernels' hot loop, or `#[inline(never)]` on the per-tier kernels, are the
-  obvious experiments.
 - **No NEON kernels.** aarch64 runs every family's scalar kernel. A NEON tier
   must compute the scalar expression; `kernels/tier_tests.rs` will hold it to
   that once it is a tier `crate::simd` dispatches.
+
+### B205 — make the macOS CPU-golden step required after its first green run (2026-11-17)
+
+**Tag:** ci · **Kind:** follow-up with a trigger
+
+The `test` matrix's "CPU goldens (Qwen3-0.6B, Qwen3.5-0.8B)" step runs on
+Windows and macOS (`.github/workflows/ci.yml`). On macOS it carries
+`continue-on-error: ${{ runner.os == 'macOS' }}`, because it is the first
+whole-model CPU run on aarch64 and plan 11's L3 claim is unproven there. **When
+it first passes on `main`, delete that line** so a later aarch64 difference
+fails the workflow. If it fails instead, the step's log names the differing
+hash; that is an L3 finding for plan 11 (bisect with `INFR_CPU_OP_HASH` against
+Windows or Linux), not a reason to keep the step optional.

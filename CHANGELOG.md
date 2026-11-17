@@ -48,15 +48,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   expert tiles, the int8 path's routes) and `infr_core::math`'s slice functions
   ask one process-wide tier, `infr_core::simd::active`: the widest the CPU has,
   or the ceiling when it is lower; a ceiling above what the CPU has runs the
-  CPU's widest. So a capped run executes the code an older x86 CPU, or an
-  aarch64 machine at `scalar`, would. A debug and testing switch: every tier
-  gives the same bits, so it changes only speed. It is process-wide: each CPU
-  backend applies its value when built, unset meaning no ceiling, so the last
-  backend built decides. A misspelt tier is a config error at load in the file,
-  `--set` and the environment alike. It replaces the unreleased
-  `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER` (and `math::set_tier`), which
-  forced only the math slices: one ceiling covers both, and the old key is no
-  longer read. New: `infr_core::simd` (`SimdTier`, `active`, `set_max`).
+  CPU's widest. The ceiling selects which hand-written kernel of a family runs
+  (the scalar, AVX2, AVX-512 or VNNI one); it does not change the instruction
+  set the compiler may use, so on a `target-cpu=native` build the scalar kernels
+  are still compiled for, and auto-vectorized with, the machine's features. A
+  debug and testing switch: every tier gives the same bits, so it changes only
+  speed. With no ceiling set it costs nothing: the CPU backend's graph
+  interpreter is compiled twice and picks once per graph, and the uncapped copy
+  dispatches exactly as before (a compile-time constant on a native build). It
+  is process-wide: each CPU backend applies its value when built, unset meaning
+  no ceiling, so the last backend built decides. A misspelt tier is a config
+  error at load in the file, `--set` and the environment alike. It replaces the
+  unreleased `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER` (and
+  `math::set_tier`), which forced only the math slices: one ceiling covers both,
+  and the old key is no longer read. New: `infr_core::simd` (`SimdTier`,
+  `active`, `allows`, `capped`, `set_max`); `infr_cpu::turbo::QK` is public.
 
 - **`CpuBackend::pool_threads`**: the size of the backend's thread pool once a
   graph has built it. `crates/infr-cpu/tests/op_hashes.rs` uses it: every `Op`
@@ -826,10 +832,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   whose Q8_0 tensors take it, prefills and decodes on the CPU at the same speed
   within run-to-run noise. Upgrade note: CPU output on AVX-512 machines changes
   wherever a model has such Q8_0 tensors; of the cached CPU goldens only
-  Qwen3.5-0.8B Q4_K_M changed (both cases, re-blessed; the old knight hash was
-  the one CI's AVX2 runner produced, which is why that golden was "not portable"
-  and left out of CI). Every kernel family is now held to its scalar kernel's
-  bits at every tier the host has (`kernels/tier_tests.rs`).
+  Qwen3.5-0.8B Q4_K_M changed (both cases, re-blessed). Its new knight hash is
+  the value a CI runner printed in July when that golden was dropped from CI as
+  "not portable"; its new France hash is not (that run passed France with the
+  old value), so the cause of the July difference is not settled, and the
+  golden's first Linux CI run after this change is the real test. Every kernel
+  family is now held to its scalar kernel's bits at every tier the host has
+  (`kernels/tier_tests.rs`).
 
 - **`INFR_FLASH_SPLITS` / `INFR_PV_SPLITS` above 8 are refused** instead of
   dispatched: the coopmat attention prefill sizes its split partials for 8

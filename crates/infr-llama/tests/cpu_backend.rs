@@ -2472,9 +2472,9 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
 /// `seam::generate_dense_cpu` with the `MixerW::DeltaNet` branch) — the same runner every other
 /// arch's `cpu_golden_*` test above locks. (Historically this ran through a bespoke qwen35-only
 /// seam that lived in `qwen35.rs`; that seam was proven token-identical to this unified path
-/// during the cutover and has since been deleted — issue #30.)
+/// during the cutover and has since been deleted — issue #30.) The `cpu-goldens` CI jobs download
+/// the model, so it runs by default and self-skips where the GGUF is absent.
 #[test]
-#[ignore = "needs Qwen3.5-0.8B in the HF cache"]
 fn cpu_golden_qwen35() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     let mut _tlk = test_serial_lock();

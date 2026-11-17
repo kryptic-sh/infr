@@ -26,10 +26,13 @@ env:
 # libvulkan is needed to BUILD, and the GPU integration tests are `#[ignore]`d
 # (they need a real device) — CI runs the CPU suite.
 #
-# What stays single-platform, and why: `cpu-goldens` asserts exact-token hashes
-# that are not reproducible across CPU microarchitectures (commit 273f8d4), so
-# fanning it out would multiply a known-flaky check; `build` is a release-profile
-# smoke test the matrix already covers in debug; `test-macos` runs the Metal
+# The CPU output is the same bits on every OS, SIMD tier and thread count
+# (`docs/plan/11-cpu-bit-identical.md`), so the exact-token goldens run on all
+# three: `cpu-goldens` runs the whole golden file on Linux, and
+# `cpu-goldens-os` a short subset of it on Windows and macOS (aarch64, whose
+# leg is informational until it has passed once). What stays single-platform,
+# and why: `build` is a release-profile smoke test the matrix already covers in
+# debug; `test-macos` runs the Metal
 # parity suite, which needs a real Metal device and `--include-ignored`;
 # `windows-smoke` is a Windows-only gap-filler, since Linux and macOS already
 # download and run models in other jobs.
@@ -132,11 +135,11 @@ jobs:
   #                                          non-256-in_f arch that caught Q8_0
   #   unsloth/Qwen3-0.6B-GGUF     (379 MB) — dense; also drives the cpu_kv_*
   #                                          coherence + quant-sweep tests
-  # Qwen3.5-0.8B (gated-DeltaNet) is intentionally NOT downloaded: its longer
-  # greedy generation is FP-sensitive, so the exact-token golden hash is not
-  # portable across CPU microarchitectures (coherent but different tokens on the
-  # runner vs the dev box). gemma3/qwen3 are short + stable enough to reproduce
-  # bit-for-bit; with the model absent, cpu_golden_qwen35 self-skips (need_model!).
+  #   unsloth/Qwen3.5-0.8B-GGUF   (508 MB) — gated DeltaNet. It was left out as
+  #                                          "not portable" (273f8d4): the AVX-512
+  #                                          Q8_0 kernels rounded differently from
+  #                                          the AVX2 ones the runner ran, which
+  #                                          plan 11's S4 fixed.
   cpu-goldens:
     name: cargo test (CPU goldens, real models)
     runs-on: ubuntu-26.04
@@ -157,7 +160,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-cpu-goldens-gemma3-1b_qwen3-06b-q4km-v2
+          key: hf-cpu-goldens-gemma3-1b_qwen3-06b_qwen35-08b-q4km-v3
       # Skipped on a cache hit: the cache is only saved by a job that passed,
       # so a hit holds both files, and `hf download` would still ask the hub
       # about them — which turns a hub outage into a failed run for nothing.
@@ -178,6 +181,7 @@ jobs:
           fetch pipx install huggingface_hub
           fetch hf download unsloth/gemma-3-1b-it-GGUF gemma-3-1b-it-Q4_K_M.gguf
           fetch hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-Q4_K_M.gguf
+          fetch hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf
       # Release build: these run real CPU inference (the f32 reference backend),
       # which is far too slow to time out in debug. Single-threaded because the
       # goldens mutate process-global generation env under a shared lock.
@@ -186,6 +190,61 @@ jobs:
       # handling in user text) return early without a model, so the model-less
       # matrix reports them as passed; this job has the models.
       - run: cargo test --release -p infr-llama --lib --locked
+
+  # The same three models' goldens on Windows and on macOS (aarch64): the
+  # checked-in hashes are the Linux ones, and one CPU output on every system is
+  # the point (plan 11). Only the golden tests, not the rest of the file. The
+  # macOS leg is the first whole-model run on another architecture; it does not
+  # fail the workflow until it has passed once, after which drop
+  # `continue-on-error`.
+  cpu-goldens-os:
+    name: cargo test (CPU goldens, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.os == 'macos-15' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-15]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/install-glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+      - uses: Swatinem/rust-cache@v2
+      # Same models and key rule as `cpu-goldens`; a cache does not cross
+      # operating systems, so each leg keeps its own copy.
+      - name: Cache golden model GGUFs
+        id: models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-cpu-goldens-gemma3-1b_qwen3-06b_qwen35-08b-q4km-v3
+      - name: Download golden GGUFs (single file per repo)
+        if: steps.models.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          fetch() {
+            local attempt
+            for attempt in 1 2 3; do
+              if "$@"; then return 0; fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::'$*' failed (attempt $attempt); retrying in 30s"
+                sleep 30
+              fi
+            done
+            return 1
+          }
+          fetch pipx install huggingface_hub
+          fetch hf download unsloth/gemma-3-1b-it-GGUF gemma-3-1b-it-Q4_K_M.gguf
+          fetch hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-Q4_K_M.gguf
+          fetch hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf
+      - run: >-
+          cargo test --release -p infr-llama --test cpu_backend --locked --
+          --exact --test-threads=1
+          cpu_golden_qwen3 cpu_golden_gemma3 cpu_golden_qwen35
 
   build:
     name: cargo build --release

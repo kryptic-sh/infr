@@ -22,6 +22,9 @@
 //!   cargo test -p infr-llama --test synthetic_lfm3 -- --ignored synthetic_lfm3_regenerate_llama_cpp_fixture
 //! ```
 
+#[path = "support/row_identity.rs"]
+mod row_identity;
+
 use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
 use infr_testkit::llama_cpp::{llama_cpp_version, llama_debug_logits, write_or_compare_fixture};
 
@@ -274,6 +277,27 @@ fn synthetic_lfm3_cpu_prefill_reads_every_mixer() {
             "zeroing {what} ({name}) moved the logits by only {moved}"
         );
     }
+}
+
+/// The prompt prefilled in one chunk, in chunks of 5 and 3, and one row at a time gives the same
+/// ids and the same bits in every tensor the final position and the decode steps write: the
+/// short convolution's carried state, the window layer's ring and the full layers' caches are
+/// filled identically whatever the chunk height. Turns red when an op's result depends on how
+/// many rows it ran together.
+#[test]
+fn synthetic_lfm3_cpu_rows_give_the_same_bits_in_any_chunks() {
+    let tmp = TempGguf::write("lfm3-rows", &lfm3_model());
+    let load = |cfg| {
+        infr_llama::SeamModel::load_with(tmp.path(), None, cfg).expect("synthetic model load")
+    };
+    row_identity::assert_row_count_identity(
+        "synthetic lfm3",
+        &load,
+        &infr_llama::EngineConfig::default(),
+        ORACLE_PROMPT,
+        6,
+        &[64, 5, 3, 1],
+    );
 }
 
 /// The Vulkan seam against the CPU on the synthetic model: both mixers, the window mask past four

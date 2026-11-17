@@ -24,12 +24,20 @@ fn find_gguf(repo: &str, file: &str) -> Option<PathBuf> {
     infr_hub::Store::discover().ok()?.snapshot_file(repo, file)
 }
 
-/// Resolve a model path or self-skip the test (it runs only when the GGUF is present).
+/// Resolve a model path or self-skip the test (it runs only when the GGUF is present). With
+/// `INFR_TEST_REQUIRE_MODELS` set (the CI golden jobs set it), a missing model FAILS the test
+/// instead, naming it: a skip passes, so a wrong cache path or a failed download would otherwise
+/// report green without running anything.
 macro_rules! need_model {
     ($opt:expr, $what:expr) => {
         match $opt {
             Some(p) => p,
             None => {
+                assert!(
+                    std::env::var_os("INFR_TEST_REQUIRE_MODELS").is_none(),
+                    "{} is not in the HF cache, and INFR_TEST_REQUIRE_MODELS requires it",
+                    $what
+                );
                 eprintln!("skip: {} not in the HF cache", $what);
                 return;
             }

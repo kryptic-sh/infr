@@ -384,4 +384,13 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
 /// - `INFR_CPU` / `INFR_METAL` — DEAD. Removed as backend selectors; the only references left are
 ///   `cli/main.rs`'s `legacy_metal_cpu_flags_are_no_longer_read` regression test and doc comments.
 ///   Do not add them to `Config`; do not remove that test.
-pub const NOT_KNOBS: &[&str] = &["INFR_TP", "INFR_EP", "INFR_CPU", "INFR_METAL"];
+/// - `INFR_CPU_MATH_TIER` — DEAD, never released: `kernels.cpu.max_tier` (`INFR_CPU_MAX_TIER`)
+///   replaced it. The only reference left is `config::tests::removed_math_tier_env_is_not_read`,
+///   which holds it unread. Do not add it to `Config`.
+pub const NOT_KNOBS: &[&str] = &[
+    "INFR_TP",
+    "INFR_EP",
+    "INFR_CPU",
+    "INFR_METAL",
+    "INFR_CPU_MATH_TIER",
+];

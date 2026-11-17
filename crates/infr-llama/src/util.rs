@@ -231,10 +231,18 @@ pub(crate) fn test_qwen3_06b() -> Option<std::path::PathBuf> {
 
 /// `file` from `repo` in the HF Hub cache, resolved exactly as `infr` itself finds the cache
 /// (`HF_HUB_CACHE`, `HF_HOME`, `XDG_CACHE_HOME`, the home directory on every platform), or `None`
-/// when it is not downloaded.
+/// when it is not downloaded, which the tests treat as a skip. With `INFR_TEST_REQUIRE_MODELS`
+/// set (the CI golden jobs set it) a missing file panics instead, naming it.
 #[cfg(test)]
 pub(crate) fn test_hub_gguf(repo: &str, file: &str) -> Option<std::path::PathBuf> {
-    infr_hub::Store::discover().ok()?.snapshot_file(repo, file)
+    let found = infr_hub::Store::discover()
+        .ok()
+        .and_then(|s| s.snapshot_file(repo, file));
+    assert!(
+        found.is_some() || std::env::var_os("INFR_TEST_REQUIRE_MODELS").is_none(),
+        "{repo}/{file} is not in the HF cache, and INFR_TEST_REQUIRE_MODELS requires it"
+    );
+    found
 }
 
 /// The token texts llama.cpp treats as end-of-generation wherever a vocabulary has them

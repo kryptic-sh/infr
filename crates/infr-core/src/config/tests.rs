@@ -749,7 +749,8 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
 /// * `INFR_PROFILE` in the five `build.rs` — a BUILD-time input; a runtime `Config` cannot exist
 ///   when it is read.
 /// * `INFR_TEST_GGUF` / `INFR_TEST_MODEL` / `INFR_LLAMA_DIFFUSION_CLI` — test/dev fixtures that
-///   point at files on disk, deliberately left on the environment.
+///   point at files on disk, deliberately left on the environment; `INFR_TEST_REQUIRE_MODELS`,
+///   which makes a test whose model is missing fail instead of skip (CI's golden jobs).
 ///
 /// `RAYON_NUM_THREADS` is not an `INFR_*` knob and is not in scope: `infr-cli` still PUBLISHES it,
 /// because rayon's global pool has no other input.
@@ -759,6 +760,7 @@ fn no_infr_env_reads_outside_the_config_layer() {
     const FIXTURE_KEYS: &[&str] = &[
         "INFR_TEST_GGUF",
         "INFR_TEST_MODEL",
+        "INFR_TEST_REQUIRE_MODELS",
         "INFR_LLAMA_DIFFUSION_CLI",
     ];
 
@@ -1386,6 +1388,19 @@ fn tune_map_reaches_every_layer_with_its_level() {
             ("attn_canvas.chunks", "5", TuneLevel::Cli),
         ]
     );
+}
+
+/// The removed `INFR_CPU_MATH_TIER` (never released; `kernels.cpu.max_tier` replaced it) is not
+/// read, as no removed `INFR_*` key is (the env policy: no aliases, no warnings): setting it,
+/// even to a valid tier, specifies nothing. Turns red if an alias for it reappears.
+#[test]
+fn removed_math_tier_env_is_not_read() {
+    for v in ["baseline", "avx2", "nonsense"] {
+        assert!(
+            env_layer(&[("INFR_CPU_MATH_TIER", v)]).is_empty(),
+            "INFR_CPU_MATH_TIER={v} was read"
+        );
+    }
 }
 
 /// `kernels.cpu.max_tier` takes a tier name in every layer and refuses anything else at load

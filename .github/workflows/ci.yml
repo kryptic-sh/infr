@@ -127,6 +127,10 @@ jobs:
       # step reads, and the cache is saved from `main` only (pull requests
       # restore it). macOS is the first whole-model run on aarch64; until it has
       # passed once the step cannot fail the job (B205 says when to flip it).
+      # Cache cost: one models entry per OS, 379 + 508 MB, about 0.9 GB each, and
+      # no rust-cache entry of its own. With the Linux models entry's change to
+      # `-v3` (1.66 GB, replacing the 1.1 GB `-v2`, which is no longer written and
+      # ages out), these steps add about 2.3 GB to the repository's cache.
       - name: Restore the golden models
         if: runner.os != 'Linux'
         id: os-models

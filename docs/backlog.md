@@ -6632,7 +6632,14 @@ every other dtype. The options as weighed:
 
 ### B203 — `Op::MoeFfn` is not row-count identical: one row f32, several int8 (2026-11-17)
 
-**Tag:** cpu · determinism · **Kind:** decision for the owner
+**Tag:** cpu · determinism · **Kind:** approved, not started
+
+**Decided 2026-11-18: the owner approved the first option below, int8
+activations at one row too.** To do: route one-row `Op::MoeFfn` through the int8
+expert kernels, drop the MoE exclusion from the row-count tests, re-bless the
+MoE goldens once (Windows and Linux agreeing before a value is committed, with
+the old and new text compared), and measure MoE decode before and after, since
+the speed gain is expected and not yet measured for the expert tiles.
 
 Plan 11's row-count identity (`tests/support/row_identity.rs`) holds every dense
 family bit for bit at prefill chunk heights 512, 7, 3 and 1. The MoE layer
@@ -6661,6 +6668,24 @@ Options:
   the int8 kernels and the packed VNNI tiles (several times slower prefill on
   the expert GEMMs, by B201's measurements of the same trade on `Linear`).
 - **Leave it** (today): documented, tested as an exception.
+
+### B206 — CPU speed from narrower datatypes: what is not int8 yet (2026-11-18)
+
+**Tag:** cpu · perf · **Kind:** queued work, in this order
+
+Quantized weights already run through int8 kernels on x86 (AVX2, AVX-512, VNNI)
+with 8-bit activations. Where that is not yet the case, as reported by plan 11's
+S3/S4 work and not re-read for this entry:
+
+1. **aarch64 has no hand-written kernels.** Every family runs its scalar kernel
+   on Apple Silicon and ARM Linux. NEON int8 dot-product kernels (`dotprod`,
+   `i8mm` where present) are likely the largest CPU gain left. Each must compute
+   the scalar expression, which `kernels/tier_tests.rs` enforces once the tier
+   is one `crate::simd` dispatches. Correctness can run on CI's macOS runner;
+   speed needs a Mac owner (issue 100 collects a baseline first).
+2. **S6 of plan 11:** on baseline x86-64 builds the f32 dots' `mul_add` is a
+   C-runtime call, exact but slow; a run-time FMA tier keeps the bits.
+3. **One-row MoE** (B203, approved).
 
 ### B204 — what plan 11's S3/S4 (tier, thread and row identity) left (2026-11-17)
 

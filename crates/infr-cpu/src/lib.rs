@@ -44,12 +44,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    dot, dot_bf16, dot_f16, dot_n, gated_act_row, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
-    vec_dot_iq1s_batch, vec_dot_iq2s, vec_dot_iq2s_batch, vec_dot_iq2xs, vec_dot_iq2xs_batch,
-    vec_dot_iq2xxs, vec_dot_iq2xxs_batch, vec_dot_iq3s, vec_dot_iq3s_batch, vec_dot_iq3xxs,
-    vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch, vec_dot_iq4xs, vec_dot_iq4xs_batch,
-    vec_dot_mxfp4_32_batch, vec_dot_nvfp4_batch, vec_dot_q2_0_batch, vec_dot_q2k,
-    vec_dot_q2k_batch, vec_dot_q3k, vec_dot_q3k_batch, vec_dot_q4_0_32_batch,
+    axpy, dot, dot_bf16, dot_f16, dot_n, gated_act_row, vec_dot_iq1m, vec_dot_iq1m_batch,
+    vec_dot_iq1s, vec_dot_iq1s_batch, vec_dot_iq2s, vec_dot_iq2s_batch, vec_dot_iq2xs,
+    vec_dot_iq2xs_batch, vec_dot_iq2xxs, vec_dot_iq2xxs_batch, vec_dot_iq3s, vec_dot_iq3s_batch,
+    vec_dot_iq3xxs, vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch, vec_dot_iq4xs,
+    vec_dot_iq4xs_batch, vec_dot_mxfp4_32_batch, vec_dot_nvfp4_batch, vec_dot_q2_0_batch,
+    vec_dot_q2k, vec_dot_q2k_batch, vec_dot_q3k, vec_dot_q3k_batch, vec_dot_q4_0_32_batch,
     vec_dot_q4_1_32_batch, vec_dot_q4k, vec_dot_q4k_batch, vec_dot_q4k_batch2, vec_dot_q4k_batch8,
     vec_dot_q5_0_32_batch, vec_dot_q5_1_32_batch, vec_dot_q5k, vec_dot_q5k_batch, vec_dot_q6k,
     vec_dot_q6k_batch, vec_dot_q8_0, vec_dot_q8_0_32_batch, vec_dot_q8_0_batch, vec_dot_tq1_0,
@@ -1501,7 +1501,7 @@ impl CpuBackend {
                             let row = &wbytes[o * bpr..o * bpr + bpr];
                             let wf = bytes_to_f32(row, dt);
                             for r in 0..m {
-                                chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
+                                chunk[r] = dot::<CAP>(&wf, &xs[r * in_f..r * in_f + in_f]);
                             }
                         });
                         self.pool().for_chunks_mut(&mut out, out_f, 1, &|r, orow| {
@@ -1670,10 +1670,10 @@ impl CpuBackend {
                                     );
                                     return;
                                 }
-                                DType::F32 => dot(&f32_row(row), xrow),
-                                DType::F16 => dot_f16(row, xrow),
-                                DType::Bf16 => dot_bf16(row, xrow),
-                                _ => dot(&bytes_to_f32(row, dt), xrow),
+                                DType::F32 => dot::<CAP>(&f32_row(row), xrow),
+                                DType::F16 => dot_f16::<CAP>(row, xrow),
+                                DType::Bf16 => dot_bf16::<CAP>(row, xrow),
+                                _ => dot::<CAP>(&bytes_to_f32(row, dt), xrow),
                             };
                         });
                     } else {
@@ -1954,27 +1954,34 @@ impl CpuBackend {
                                         DType::F32 => {
                                             let w32 = f32_row(row);
                                             for r in 0..m {
-                                                chunk[r] =
-                                                    dot(&w32, &xs[r * in_f..r * in_f + in_f]);
+                                                chunk[r] = dot::<CAP>(
+                                                    &w32,
+                                                    &xs[r * in_f..r * in_f + in_f],
+                                                );
                                             }
                                         }
                                         DType::F16 => {
                                             for r in 0..m {
-                                                chunk[r] =
-                                                    dot_f16(row, &xs[r * in_f..r * in_f + in_f]);
+                                                chunk[r] = dot_f16::<CAP>(
+                                                    row,
+                                                    &xs[r * in_f..r * in_f + in_f],
+                                                );
                                             }
                                         }
                                         DType::Bf16 => {
                                             for r in 0..m {
-                                                chunk[r] =
-                                                    dot_bf16(row, &xs[r * in_f..r * in_f + in_f]);
+                                                chunk[r] = dot_bf16::<CAP>(
+                                                    row,
+                                                    &xs[r * in_f..r * in_f + in_f],
+                                                );
                                             }
                                         }
                                         _ => {
                                             // Dequant the weight row ONCE, reuse across all m tokens.
                                             let wf = bytes_to_f32(row, dt);
                                             for r in 0..m {
-                                                chunk[r] = dot(&wf, &xs[r * in_f..r * in_f + in_f]);
+                                                chunk[r] =
+                                                    dot::<CAP>(&wf, &xs[r * in_f..r * in_f + in_f]);
                                             }
                                         }
                                     }
@@ -2422,10 +2429,10 @@ impl CpuBackend {
                         for quad in quads {
                             let jr: [usize; KEYS] =
                                 std::array::from_fn(|_| key_rows.next().unwrap());
-                            *quad = dot_n(qrow, jr.map(krow));
+                            *quad = dot_n::<CAP, KEYS>(qrow, jr.map(krow));
                         }
                         for (scj, jr) in tail.iter_mut().zip(key_rows) {
-                            *scj = dot(qrow, krow(jr));
+                            *scj = dot::<CAP>(qrow, krow(jr));
                         }
                         for (jj, scj) in sc_raw.iter_mut().enumerate() {
                             let j = lo + jj;
@@ -2447,10 +2454,10 @@ impl CpuBackend {
                         let (cquads, ctail) = sc_comp.as_chunks_mut::<KEYS>();
                         let (kquads, ktail) = kept_j.as_chunks::<KEYS>();
                         for (quad, js) in cquads.iter_mut().zip(kquads) {
-                            *quad = dot_n(qrow, js.map(crow));
+                            *quad = dot_n::<CAP, KEYS>(qrow, js.map(crow));
                         }
                         for (scj, &j) in ctail.iter_mut().zip(ktail) {
-                            *scj = dot(qrow, crow(j));
+                            *scj = dot::<CAP>(qrow, crow(j));
                         }
                         let cbias = cs.as_ref().and_then(|(_, b, c)| b.map(|b| (b, c.len)));
                         for (scj, &j) in sc_comp.iter_mut().zip(kept_j) {
@@ -2483,16 +2490,12 @@ impl CpuBackend {
                             let p = e / l;
                             let vb = (jr * nkv + kvh) * hd;
                             // Independent lanes — vectorizes to FMA.
-                            for (o, &v) in ob_slice.iter_mut().zip(&vs[vb..vb + hd]) {
-                                *o = v.mul_add(p, *o);
-                            }
+                            axpy::<CAP>(ob_slice, &vs[vb..vb + hd], p);
                         }
                         // A compressed key's value row is its key row.
                         for (&e, &j) in e_comp.iter().zip(kept_j) {
                             let p = e / l;
-                            for (o, &v) in ob_slice.iter_mut().zip(crow(j)) {
-                                *o = v.mul_add(p, *o);
-                            }
+                            axpy::<CAP>(ob_slice, crow(j), p);
                         }
                     };
                     // One task is one head over a block of consecutive query rows, so the block
@@ -4016,7 +4019,8 @@ impl CpuBackend {
                                 let krow = jr * key_len;
                                 // dot(q_full, K row j), plus the optional top-k mask at key j
                                 *scj =
-                                    crate::kernels::dot(&q_full, &ks[krow..krow + key_len]) * scale;
+                                    crate::kernels::dot::<CAP>(&q_full, &ks[krow..krow + key_len])
+                                        * scale;
                                 if let Some(kb) = &kb {
                                     *scj += kb[ti * kv_len + j];
                                 }
@@ -4131,7 +4135,8 @@ impl CpuBackend {
                     // `rows × keys` f32, in a buffer an earlier op of this execute freed when one
                     // fits (the previous CSA layer's scores, given back below).
                     let buf = rc.for_overwrite(his.iter().copied().max().unwrap_or(0) * rows);
-                    let sc = indexer::score(self.pool(), buf, qs, ws, keys, nh, hd, scale, &his);
+                    let sc =
+                        indexer::score::<CAP>(self.pool(), buf, qs, ws, keys, nh, hd, scale, &his);
                     let mut out = vec![0f32; rows * top_k];
                     let tap = indexer_tap::active().then(|| std::sync::Mutex::new(Vec::new()));
                     self.pool()
@@ -4291,9 +4296,7 @@ impl CpuBackend {
                         for h in 0..hc {
                             let w = ws[t * hc + h];
                             let xr = &xs[(t * hc + h) * ne..][..ne];
-                            for (o, &xv) in o.iter_mut().zip(xr) {
-                                *o = xv.mul_add(w, *o);
-                            }
+                            axpy::<CAP>(o, xr, w);
                         }
                     });
                     rc.set(&mut vals, dst.0 as usize, out);
@@ -4328,9 +4331,7 @@ impl CpuBackend {
                             // failure `Op::HyperConnectMix`'s doc warns about.
                             let w = cs[t * hc * hc + d + hc * src];
                             let rr = &rs[(t * hc + src) * ne..][..ne];
-                            for (o, &rv) in o.iter_mut().zip(rr) {
-                                *o = rv.mul_add(w, *o);
-                            }
+                            axpy::<CAP>(o, rr, w);
                         }
                     });
                     rc.set(&mut vals, dst.0 as usize, out);

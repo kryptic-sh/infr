@@ -100,6 +100,17 @@ pub(crate) fn vnni<const CAPPED: bool>() -> bool {
     }
 }
 
+/// May this call run the FMA code of the f32 dots (`kernels::dot` and its family): AVX2 with FMA
+/// and F16C? It sits in the AVX2 tier, but needs FMA and F16C detected as well, so a CPU (or a
+/// VM) that reports AVX2 without them keeps every other AVX2 kernel and runs the dots' scalar
+/// code. Only a build whose target lacks FMA asks: where the target has it (`target-cpu=native`
+/// here), `mul_add` is already the instruction and the dots have no dispatch at all.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+#[inline(always)]
+pub(crate) fn fma<const CAPPED: bool>() -> bool {
+    is_x86_feature_detected!("fma") && is_x86_feature_detected!("f16c") && avx2::<CAPPED>()
+}
+
 #[cfg(test)]
 pub(crate) use testing::with_tier;
 

@@ -9,7 +9,9 @@
 //! [`decode_span`] for which formats share `bytes_to_f32`'s own decode and which have
 //! hand-written copies), and the dot keeps [`dot`]'s lane order.
 use crate::bytes_to_f32;
+#[cfg(doc)]
 use crate::kernels::dot;
+use crate::kernels::{dot_scalar, fma_twin};
 use infr_core::tensor::DType;
 use infr_gguf::dequant::{expand_factored, factor_block, has_factored_form, k4, rdf16};
 
@@ -28,7 +30,10 @@ const SPAN: usize = 256;
 /// Every span here is a whole number of quant blocks (each a multiple of 16 elements), so walking
 /// the spans in order hands each lane the same FMAs in the same order, the lanes are folded by the
 /// same expression, and there is no tail.
-pub(crate) fn dequant_dot_rows(
+///
+/// Like [`dot`] it dispatches to an FMA compilation on builds without FMA
+/// (`crate::simd::fma`): the same expression, so the same bits.
+pub(crate) fn dequant_dot_rows<const CAP: bool>(
     row: &[u8],
     dt: DType,
     xin: &[f32],
@@ -36,53 +41,85 @@ pub(crate) fn dequant_dot_rows(
     col: &mut [f32],
     accs: &mut Vec<[f32; 8]>,
 ) {
-    if col.is_empty() {
-        return;
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    if crate::simd::fma::<CAP>() {
+        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
+        return unsafe { dequant_dot_rows_fma(row, dt, xin, in_f, col, accs) };
     }
-    if !has_factored_form(dt) {
-        let wf = bytes_to_f32(row, dt);
-        for (r, dst) in col.iter_mut().enumerate() {
-            *dst = dot(&wf, &xin[r * in_f..r * in_f + in_f]);
+    dequant_dot_rows_scalar(row, dt, xin, in_f, col, accs)
+}
+
+/// [`dequant_dot_rows`] without its FMA tier, for `kernels::tier_tests`' benchmark.
+#[cfg(test)]
+pub(crate) fn with_scalar_dot(
+    row: &[u8],
+    dt: DType,
+    xin: &[f32],
+    in_f: usize,
+    col: &mut [f32],
+    accs: &mut Vec<[f32; 8]>,
+) {
+    dequant_dot_rows_scalar(row, dt, xin, in_f, col, accs)
+}
+
+fma_twin! {
+    /// [`dequant_dot_rows`]'s definition.
+    fn dequant_dot_rows_scalar / dequant_dot_rows_fma (
+        row: &[u8],
+        dt: DType,
+        xin: &[f32],
+        in_f: usize,
+        col: &mut [f32],
+        accs: &mut Vec<[f32; 8]>,
+    ) {
+        if col.is_empty() {
+            return;
         }
-        return;
-    }
-    let (qpb, bpb) = infr_core::decode_spec::block_layout(dt);
-    assert!(
-        row.len().is_multiple_of(bpb) && row.len() / bpb * qpb == in_f,
-        "dequant_dot_rows: {} bytes of {dt:?} do not hold a row of {in_f} elements",
-        row.len(),
-    );
-    assert!(
-        xin.len() >= col.len() * in_f,
-        "dequant_dot_rows: {} activations for {} rows of {in_f}",
-        xin.len(),
-        col.len()
-    );
-    accs.clear();
-    accs.resize(col.len(), [0f32; 8]);
-    let mut w = [0f32; SPAN];
-    for (si, span) in row.chunks(SPAN / qpb * bpb).enumerate() {
-        let n = span.len() / bpb * qpb;
-        decode_span(span, dt, &mut w[..n]);
-        let e0 = si * SPAN;
-        for (r, acc) in accs.iter_mut().enumerate() {
-            let x = &xin[r * in_f + e0..r * in_f + e0 + n];
-            // `n` is a multiple of 8 (see the doc), so the 8-chunks cover the span exactly. Fixed
-            // `[f32; 8]` chunks index without bounds checks, which keeps this one FMA vector.
-            let (wc, xc) = (w[..n].as_chunks::<8>().0, x.as_chunks::<8>().0);
-            // On a local copy: `acc` lives in caller-owned heap scratch, and accumulating through
-            // the reference left the lanes in memory, a measurably slower decode.
-            let mut a = *acc;
-            for (wv, xv) in wc.iter().zip(xc) {
-                for j in 0..8 {
-                    a[j] = wv[j].mul_add(xv[j], a[j]);
-                }
+        if !has_factored_form(dt) {
+            let wf = bytes_to_f32(row, dt);
+            for (r, dst) in col.iter_mut().enumerate() {
+                *dst = dot_scalar(&wf, &xin[r * in_f..r * in_f + in_f]);
             }
-            *acc = a;
+            return;
         }
-    }
-    for (dst, acc) in col.iter_mut().zip(accs.iter()) {
-        *dst = acc.iter().sum();
+        let (qpb, bpb) = infr_core::decode_spec::block_layout(dt);
+        assert!(
+            row.len().is_multiple_of(bpb) && row.len() / bpb * qpb == in_f,
+            "dequant_dot_rows: {} bytes of {dt:?} do not hold a row of {in_f} elements",
+            row.len(),
+        );
+        assert!(
+            xin.len() >= col.len() * in_f,
+            "dequant_dot_rows: {} activations for {} rows of {in_f}",
+            xin.len(),
+            col.len()
+        );
+        accs.clear();
+        accs.resize(col.len(), [0f32; 8]);
+        let mut w = [0f32; SPAN];
+        for (si, span) in row.chunks(SPAN / qpb * bpb).enumerate() {
+            let n = span.len() / bpb * qpb;
+            decode_span(span, dt, &mut w[..n]);
+            let e0 = si * SPAN;
+            for (r, acc) in accs.iter_mut().enumerate() {
+                let x = &xin[r * in_f + e0..r * in_f + e0 + n];
+                // `n` is a multiple of 8 (see the doc), so the 8-chunks cover the span exactly. Fixed
+                // `[f32; 8]` chunks index without bounds checks, which keeps this one FMA vector.
+                let (wc, xc) = (w[..n].as_chunks::<8>().0, x.as_chunks::<8>().0);
+                // On a local copy: `acc` lives in caller-owned heap scratch, and accumulating through
+                // the reference left the lanes in memory, a measurably slower decode.
+                let mut a = *acc;
+                for (wv, xv) in wc.iter().zip(xc) {
+                    for j in 0..8 {
+                        a[j] = wv[j].mul_add(xv[j], a[j]);
+                    }
+                }
+                *acc = a;
+            }
+        }
+        for (dst, acc) in col.iter_mut().zip(accs.iter()) {
+            *dst = acc.iter().sum();
+        }
     }
 }
 
@@ -334,10 +371,10 @@ mod tests {
         let x = xs(count * in_f, seed);
         let mut got = vec![0f32; count];
         let mut accs = Vec::new();
-        dequant_dot_rows(row, dt, &x, in_f, &mut got, &mut accs);
+        dequant_dot_rows::<false>(row, dt, &x, in_f, &mut got, &mut accs);
         let mut finite = 0;
         for (r, g) in got.iter().enumerate() {
-            let want = dot(&wf, &x[r * in_f..r * in_f + in_f]);
+            let want = dot_scalar(&wf, &x[r * in_f..r * in_f + in_f]);
             assert!(
                 g.to_bits() == want.to_bits() || (g.is_nan() && want.is_nan()),
                 "{dt:?} {label} in_f {in_f} row {r}/{count}: {g} vs reference {want}"
@@ -421,7 +458,7 @@ mod tests {
     #[test]
     fn dequant_dot_rows_with_no_rows_is_a_no_op() {
         let mut accs = vec![[1f32; 8]; 3];
-        dequant_dot_rows(&[0u8; 3], DType::Q4K, &[], 256, &mut [], &mut accs);
+        dequant_dot_rows::<false>(&[0u8; 3], DType::Q4K, &[], 256, &mut [], &mut accs);
         assert_eq!(accs.len(), 3, "scratch untouched");
     }
 }

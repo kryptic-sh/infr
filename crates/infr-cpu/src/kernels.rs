@@ -6400,9 +6400,62 @@ fn vec_dot_nvfp4_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut 
     }
 }
 
-/// `Σ f16_weight·x` (weight is 2 bytes/elem). `target-cpu=native` lowers the f16→f32 to F16C.
+// ─── f32 dots ──────────────────────────────────────────────────────────────────────────────────
+//
+// Every f32 dot below is defined by its `*_scalar` function: 8 lanes, lane `i % 8` accumulating
+// element `i` by `mul_add` in increasing `i`, the lanes folded by `iter().sum()`, an `n % 8` tail
+// finished serially by `mul_add`. Each dispatcher runs exactly that expression. On a build whose
+// target has FMA (`target-cpu=native` here, aarch64 everywhere) `mul_add` is the fused
+// instruction and the dispatcher is the scalar function. On one without it (the baseline x86-64
+// builds CI and the release ship) `mul_add` compiles to a call to the C runtime's `fmaf`: exact,
+// but a call per element. There the dispatcher takes the FMA tier when the CPU has it
+// (`crate::simd::fma`): the same source compiled inside a `#[target_feature]` function, where
+// each `mul_add` is the instruction and the 8 lanes vectorize to one `vfmadd` per chunk. Same
+// operations in the same order, and both fused, so the same bits (`tier_tests` holds every dot to
+// that, with inputs where a fused and an unfused multiply-add differ). Eight lanes fill one ymm
+// register; an AVX-512 form would need 16 accumulators, a different association, so there is
+// none.
+//
+// [`fma_twin!`] writes each body out twice, as the scalar function (with the inlining attribute
+// the dot always had) and as its FMA compilation. Not one `#[inline(always)]` body behind both:
+// rustc then inlines the small scalar wrapper and the body with it into every call site, and on a
+// native build that doubled the time of a prefill's `Attention`, whose closure took `dot_n`'s
+// body in place of a call.
+
+/// `$scalar` with the attributes given, and on a build without FMA `$fma`: the same signature
+/// and body, an `unsafe fn` compiled with AVX2, FMA and F16C (callers must have checked
+/// [`crate::simd::fma`]).
+macro_rules! fma_twin {
+    (
+        $(#[$attr:meta])*
+        fn $scalar:ident / $fma:ident $(<$(const $g:ident: usize),*>)?
+            ($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)? $body:block
+    ) => {
+        $(#[$attr])*
+        pub(crate) fn $scalar $(<$(const $g: usize),*>)? ($($arg: $ty),*) $(-> $ret)? $body
+
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+        #[target_feature(enable = "avx2,fma,f16c")]
+        unsafe fn $fma $(<$(const $g: usize),*>)? ($($arg: $ty),*) $(-> $ret)? $body
+    };
+}
+pub(crate) use fma_twin;
+
+/// `Σ f16_weight·x` (weight is 2 bytes/elem), with [`dot`]'s lane order. Dispatches the FMA tier
+/// on builds without FMA (see the section comment).
+#[inline]
+pub(crate) fn dot_f16<const CAP: bool>(w: &[u8], x: &[f32]) -> f32 {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    if crate::simd::fma::<CAP>() {
+        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
+        return unsafe { dot_f16_fma(w, x) };
+    }
+    dot_f16_scalar(w, x)
+}
+
+/// [`dot_f16`]'s definition. `target-cpu=native` lowers the f16→f32 to F16C.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
+pub(crate) fn dot_f16_scalar(w: &[u8], x: &[f32]) -> f32 {
     let mut acc = [0f32; 8];
     let n = x.len();
     let chunks = n / 8;
@@ -6422,127 +6475,237 @@ pub(crate) fn dot_f16(w: &[u8], x: &[f32]) -> f32 {
     s
 }
 
-/// `Σ bf16_weight·x` (bf16 = top 16 bits of f32). Uses 8 independent accumulators — the same
-/// chunked structure as [`dot`]/[`dot_f16`] — so the reduction isn't a latency-bound FMA chain
-/// (the old single serial accumulator was several× slower on the bf16-weight hot path). NOTE:
-/// the 8-lane summation order differs from that serial chain, so this is NOT bit-identical to the
-/// previous `dot_bf16`; it now matches `dot`/`dot_f16` bit-for-bit for the same bf16-rounded
-/// weights (a legitimate float reorder, not a numeric bug).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn dot_bf16(w: &[u8], x: &[f32]) -> f32 {
-    let mut acc = [0f32; 8];
+/// [`dot_f16_scalar`] with each chunk's 8 weights widened by one F16C conversion. The widening is
+/// exact (every f16 is an f32), so `wv` holds the values `half`'s `to_f32` gives; `half` itself
+/// would test for F16C per element on a build without it, which is most of what this avoids.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn dot_f16_fma(w: &[u8], x: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
     let n = x.len();
     let chunks = n / 8;
+    assert!(
+        w.len() >= 2 * n,
+        "dot_f16: {} weight bytes for {n} elements",
+        w.len()
+    );
+    let mut acc = [0f32; 8];
     for c in 0..chunks {
+        let i0 = c * 8;
+        let mut wv = [0f32; 8];
+        _mm256_storeu_ps(wv.as_mut_ptr(), _mm256_cvtph_ps(load128(w, i0 * 2)));
         for (j, ac) in acc.iter_mut().enumerate() {
-            let i = c * 8 + j;
-            let wv = f32::from_bits((u16::from_le_bytes([w[i * 2], w[i * 2 + 1]]) as u32) << 16);
-            *ac = wv.mul_add(x[i], *ac);
+            *ac = wv[j].mul_add(x[i0 + j], *ac);
         }
     }
     let mut s: f32 = acc.iter().sum();
     for i in chunks * 8..n {
-        let wv = f32::from_bits((u16::from_le_bytes([w[i * 2], w[i * 2 + 1]]) as u32) << 16);
-        s = wv.mul_add(x[i], s);
+        s = half::f16::from_le_bytes([w[i * 2], w[i * 2 + 1]])
+            .to_f32()
+            .mul_add(x[i], s);
     }
     s
 }
 
-/// Dot product with 8 independent accumulators so the reduction isn't latency-bound — lets the
-/// autovectorizer (with `target-cpu=native`) keep several AVX FMA lanes in flight. `mul_add`
-/// fuses each lane's multiply+add into one FMA (numerics policy: llama.cpp's f32 dots are FMA
-/// too) — this fn is attention's QK score and the F32-weight GEMM fallbacks (e.g. DG's router).
+/// `Σ bf16_weight·x` (bf16 = top 16 bits of f32), with [`dot`]'s lane order, so it equals `dot`
+/// bit for bit on the same bf16-rounded weights. Dispatches the FMA tier on builds without FMA.
 #[inline]
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
-    debug_assert_eq!(a.len(), b.len(), "dot: a and b must have equal length");
-    let n = a.len().min(b.len());
-    let chunks = n / 8;
-    let mut acc = [0f32; 8];
-    for c in 0..chunks {
-        let base = c * 8;
-        for (j, ac) in acc.iter_mut().enumerate() {
-            *ac = a[base + j].mul_add(b[base + j], *ac);
+pub(crate) fn dot_bf16<const CAP: bool>(w: &[u8], x: &[f32]) -> f32 {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    if crate::simd::fma::<CAP>() {
+        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
+        return unsafe { dot_bf16_fma(w, x) };
+    }
+    dot_bf16_scalar(w, x)
+}
+
+fma_twin! {
+    /// [`dot_bf16`]'s definition.
+    #[cfg_attr(infr_profile, infr_prof::instrument)]
+    fn dot_bf16_scalar / dot_bf16_fma (w: &[u8], x: &[f32]) -> f32 {
+        let mut acc = [0f32; 8];
+        let n = x.len();
+        let chunks = n / 8;
+        for c in 0..chunks {
+            for (j, ac) in acc.iter_mut().enumerate() {
+                let i = c * 8 + j;
+                let wv =
+                    f32::from_bits((u16::from_le_bytes([w[i * 2], w[i * 2 + 1]]) as u32) << 16);
+                *ac = wv.mul_add(x[i], *ac);
+            }
         }
+        let mut s: f32 = acc.iter().sum();
+        for i in chunks * 8..n {
+            let wv = f32::from_bits((u16::from_le_bytes([w[i * 2], w[i * 2 + 1]]) as u32) << 16);
+            s = wv.mul_add(x[i], s);
+        }
+        s
     }
-    let mut s: f32 = acc.iter().sum();
-    for i in chunks * 8..n {
-        s = a[i].mul_add(b[i], s);
+}
+
+/// Dot product with 8 independent accumulators so the reduction isn't latency-bound — lets the
+/// compiler keep several FMA lanes in flight. `mul_add` fuses each lane's multiply+add into one
+/// FMA (numerics policy: llama.cpp's f32 dots are FMA too) — this fn is attention's QK score and
+/// the F32-weight GEMM fallbacks (e.g. DG's router). Dispatches the FMA tier on builds without FMA.
+#[inline]
+pub(crate) fn dot<const CAP: bool>(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    if crate::simd::fma::<CAP>() {
+        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
+        return unsafe { dot_fma(a, b) };
     }
-    s
+    dot_scalar(a, b)
+}
+
+fma_twin! {
+    /// [`dot`]'s definition.
+    #[inline]
+    #[cfg_attr(infr_profile, infr_prof::instrument)]
+    fn dot_scalar / dot_fma (a: &[f32], b: &[f32]) -> f32 {
+        debug_assert_eq!(a.len(), b.len(), "dot: a and b must have equal length");
+        let n = a.len().min(b.len());
+        let chunks = n / 8;
+        let mut acc = [0f32; 8];
+        for c in 0..chunks {
+            let base = c * 8;
+            for (j, ac) in acc.iter_mut().enumerate() {
+                *ac = a[base + j].mul_add(b[base + j], *ac);
+            }
+        }
+        let mut s: f32 = acc.iter().sum();
+        for i in chunks * 8..n {
+            s = a[i].mul_add(b[i], s);
+        }
+        s
+    }
 }
 
 /// `[dot(a, bs[0]), dot(a, bs[1]), …]`, each bit-identical to [`dot`]: the same per-lane FMA
 /// order and the same lane sum. One `dot` is a chain of dependent FMAs, so a loop of them waits on
 /// FMA latency; computing `N` together gives the core `N` independent chains to overlap.
-// per-call leaf, too small to probe (see docs/perf/playbook.md)
-#[cfg_attr(infr_profile, infr_prof::skip)]
+/// Dispatches the FMA tier on builds without FMA.
 #[inline]
-pub(crate) fn dot_n<const N: usize>(a: &[f32], bs: [&[f32]; N]) -> [f32; N] {
-    let n = a.len();
-    for b in &bs {
-        assert_eq!(b.len(), n, "dot_n: every b must have a's length");
+pub(crate) fn dot_n<const CAP: bool, const N: usize>(a: &[f32], bs: [&[f32]; N]) -> [f32; N] {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    if crate::simd::fma::<CAP>() {
+        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
+        return unsafe { dot_n_fma(a, bs) };
     }
-    let chunks = n / 8;
-    let mut acc = [[0f32; 8]; N];
-    for c in 0..chunks {
-        let base = c * 8;
-        let av = &a[base..base + 8];
-        for (k, b) in bs.iter().enumerate() {
-            let bv = &b[base..base + 8];
-            for (j, ac) in acc[k].iter_mut().enumerate() {
-                *ac = av[j].mul_add(bv[j], *ac);
+    dot_n_scalar(a, bs)
+}
+
+fma_twin! {
+    /// [`dot_n`]'s definition.
+    // per-call leaf, too small to probe (see docs/perf/playbook.md)
+    #[cfg_attr(infr_profile, infr_prof::skip)]
+    #[inline]
+    fn dot_n_scalar / dot_n_fma <const N: usize> (a: &[f32], bs: [&[f32]; N]) -> [f32; N] {
+        let n = a.len();
+        for b in &bs {
+            assert_eq!(b.len(), n, "dot_n: every b must have a's length");
+        }
+        let chunks = n / 8;
+        let mut acc = [[0f32; 8]; N];
+        for c in 0..chunks {
+            let base = c * 8;
+            let av = &a[base..base + 8];
+            for (k, b) in bs.iter().enumerate() {
+                let bv = &b[base..base + 8];
+                for (j, ac) in acc[k].iter_mut().enumerate() {
+                    *ac = av[j].mul_add(bv[j], *ac);
+                }
             }
         }
+        std::array::from_fn(|k| {
+            let mut s: f32 = acc[k].iter().sum();
+            for i in chunks * 8..n {
+                s = a[i].mul_add(bs[k][i], s);
+            }
+            s
+        })
     }
-    std::array::from_fn(|k| {
-        let mut s: f32 = acc[k].iter().sum();
-        for i in chunks * 8..n {
-            s = a[i].mul_add(bs[k][i], s);
-        }
-        s
-    })
 }
 
 /// `[[dot(as[m], bs[n]) for n] for m]`, each bit-identical to [`dot`]. Against [`dot_n`] it also
 /// shares each `bs` chunk across the `M` rows of `as`, so a block of `M × N` products costs
 /// `M + N` loads instead of `M × (1 + N)` — the shape of many queries scored against the same
-/// keys.
-// per-call leaf, too small to probe (see docs/perf/playbook.md)
-#[cfg_attr(infr_profile, infr_prof::skip)]
+/// keys. Dispatches the FMA tier on builds without FMA.
 #[inline]
-pub(crate) fn dot_mn<const M: usize, const N: usize>(
+pub(crate) fn dot_mn<const CAP: bool, const M: usize, const N: usize>(
     a_s: [&[f32]; M],
     bs: [&[f32]; N],
 ) -> [[f32; N]; M] {
-    let n = bs.first().map_or(0, |b| b.len());
-    for v in a_s.iter().chain(&bs) {
-        assert_eq!(v.len(), n, "dot_mn: every vector must have one length");
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    if crate::simd::fma::<CAP>() {
+        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
+        return unsafe { dot_mn_fma(a_s, bs) };
     }
-    let chunks = n / 8;
-    let mut acc = [[[0f32; 8]; N]; M];
-    let a8: [&[[f32; 8]]; M] = a_s.map(|a| a[..chunks * 8].as_chunks::<8>().0);
-    let b8: [&[[f32; 8]]; N] = bs.map(|b| b[..chunks * 8].as_chunks::<8>().0);
-    for c in 0..chunks {
-        let bv: [[f32; 8]; N] = std::array::from_fn(|k| b8[k][c]);
-        for m in 0..M {
-            let av = a8[m][c];
-            for k in 0..N {
-                for j in 0..8 {
-                    acc[m][k][j] = av[j].mul_add(bv[k][j], acc[m][k][j]);
+    dot_mn_scalar(a_s, bs)
+}
+
+fma_twin! {
+    /// [`dot_mn`]'s definition.
+    // per-call leaf, too small to probe (see docs/perf/playbook.md)
+    #[cfg_attr(infr_profile, infr_prof::skip)]
+    #[inline]
+    fn dot_mn_scalar / dot_mn_fma <const M: usize, const N: usize> (
+        a_s: [&[f32]; M],
+        bs: [&[f32]; N],
+    ) -> [[f32; N]; M] {
+        let n = bs.first().map_or(0, |b| b.len());
+        for v in a_s.iter().chain(&bs) {
+            assert_eq!(v.len(), n, "dot_mn: every vector must have one length");
+        }
+        let chunks = n / 8;
+        let mut acc = [[[0f32; 8]; N]; M];
+        let a8: [&[[f32; 8]]; M] = a_s.map(|a| a[..chunks * 8].as_chunks::<8>().0);
+        let b8: [&[[f32; 8]]; N] = bs.map(|b| b[..chunks * 8].as_chunks::<8>().0);
+        for c in 0..chunks {
+            let bv: [[f32; 8]; N] = std::array::from_fn(|k| b8[k][c]);
+            for m in 0..M {
+                let av = a8[m][c];
+                for k in 0..N {
+                    for j in 0..8 {
+                        acc[m][k][j] = av[j].mul_add(bv[k][j], acc[m][k][j]);
+                    }
                 }
             }
         }
-    }
-    std::array::from_fn(|m| {
-        std::array::from_fn(|k| {
-            let mut s: f32 = acc[m][k].iter().sum();
-            for i in chunks * 8..n {
-                s = a_s[m][i].mul_add(bs[k][i], s);
-            }
-            s
+        std::array::from_fn(|m| {
+            std::array::from_fn(|k| {
+                let mut s: f32 = acc[m][k].iter().sum();
+                for i in chunks * 8..n {
+                    s = a_s[m][i].mul_add(bs[k][i], s);
+                }
+                s
+            })
         })
-    })
+    }
+}
+
+/// `o[i] = v[i].mul_add(s, o[i])` for every `i` (`o` and `v` of one length): a weighted row added
+/// into an accumulator, as attention's value sum and the hyper-connections write it. Each element
+/// is one fused multiply-add of its own, so any vector width gives the same bits. Dispatches the
+/// FMA tier on builds without FMA.
+#[inline]
+pub(crate) fn axpy<const CAP: bool>(o: &mut [f32], v: &[f32], s: f32) {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    if crate::simd::fma::<CAP>() {
+        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
+        return unsafe { axpy_fma(o, v, s) };
+    }
+    axpy_scalar(o, v, s)
+}
+
+fma_twin! {
+    /// [`axpy`]'s definition: the loop its call sites used to write in place.
+    #[inline]
+    fn axpy_scalar / axpy_fma (o: &mut [f32], v: &[f32], s: f32) {
+        debug_assert_eq!(o.len(), v.len(), "axpy: o and v must have one length");
+        for (o, &v) in o.iter_mut().zip(v) {
+            *o = v.mul_add(s, *o);
+        }
+    }
 }
 
 /// The gated-FFN activation, applied in place to every gate value of `xs`: SiLU, GELU's tanh
@@ -6636,9 +6799,9 @@ mod kernel_tests {
         for n in [0usize, 1, 7, 8, 9, 64, 128, 133] {
             let a = det_x(n, 5 + n as u64);
             let bs: Vec<Vec<f32>> = (0..4).map(|k| det_x(n, 100 * k + n as u64)).collect();
-            let got = dot_n(&a, [&bs[0][..], &bs[1][..], &bs[2][..], &bs[3][..]]);
+            let got = dot_n::<false, 4>(&a, [&bs[0][..], &bs[1][..], &bs[2][..], &bs[3][..]]);
             for (k, b) in bs.iter().enumerate() {
-                let want = dot(&a, b);
+                let want = dot_scalar(&a, b);
                 assert_eq!(
                     got[k].to_bits(),
                     want.to_bits(),
@@ -6656,13 +6819,13 @@ mod kernel_tests {
         for n in [0usize, 1, 7, 8, 9, 64, 128, 133] {
             let a_s: Vec<Vec<f32>> = (0..3).map(|m| det_x(n, 7 * m + n as u64)).collect();
             let bs: Vec<Vec<f32>> = (0..4).map(|k| det_x(n, 100 * k + n as u64)).collect();
-            let got = dot_mn(
+            let got = dot_mn::<false, _, _>(
                 [&a_s[0][..], &a_s[1][..], &a_s[2][..]],
                 [&bs[0][..], &bs[1][..], &bs[2][..], &bs[3][..]],
             );
             for (m, a) in a_s.iter().enumerate() {
                 for (k, b) in bs.iter().enumerate() {
-                    let want = dot(a, b);
+                    let want = dot_scalar(a, b);
                     assert_eq!(
                         got[m][k].to_bits(),
                         want.to_bits(),
@@ -6710,7 +6873,7 @@ mod kernel_tests {
         let wref = dequant_block(DType::Q4K, &w).unwrap();
         let q8 = quantize_q8(&det_x(in_f, 2));
         let got = vec_dot_q4k::<false>(&w, &q8, in_f);
-        let want = dot(&wref, &dequant_q8(&q8));
+        let want = dot_scalar(&wref, &dequant_q8(&q8));
         assert!(rel_err(got, want) < 1e-3, "q4k: got {got}, want {want}");
     }
 
@@ -6725,7 +6888,7 @@ mod kernel_tests {
         let wref = dequant_block(DType::Q6K, &w).unwrap();
         let q8 = quantize_q8(&det_x(in_f, 4));
         let got = vec_dot_q6k::<false>(&w, &q8, in_f);
-        let want = dot(&wref, &dequant_q8(&q8));
+        let want = dot_scalar(&wref, &dequant_q8(&q8));
         assert!(rel_err(got, want) < 1e-3, "q6k: got {got}, want {want}");
     }
 
@@ -6741,7 +6904,7 @@ mod kernel_tests {
         let wref = dequant_block(DType::Q8_0, &w).unwrap();
         let q8 = quantize_q8(&det_x(in_f, 10));
         let got = vec_dot_q8_0::<false>(&w, &q8, in_f);
-        let want = dot(&wref, &dequant_q8(&q8));
+        let want = dot_scalar(&wref, &dequant_q8(&q8));
         assert!(rel_err(got, want) < 1e-3, "q8_0: got {got}, want {want}");
     }
 
@@ -6758,7 +6921,7 @@ mod kernel_tests {
         let wref = dequant_block(DType::Q5K, &w).unwrap();
         let q8 = quantize_q8(&det_x(in_f, 12));
         let got = vec_dot_q5k::<false>(&w, &q8, in_f);
-        let want = dot(&wref, &dequant_q8(&q8));
+        let want = dot_scalar(&wref, &dequant_q8(&q8));
         assert!(rel_err(got, want) < 1e-3, "q5k: got {got}, want {want}");
     }
 
@@ -6780,7 +6943,7 @@ mod kernel_tests {
             let mut got = vec![0f32; 3];
             vec_dot_q8_0_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, q8) in q8s.iter().enumerate() {
-                let want = dot(&wref, &dequant_q8_32(q8));
+                let want = dot_scalar(&wref, &dequant_q8_32(q8));
                 assert!(
                     rel_err(got[r], want) < 1e-3,
                     "q8_0_32 in_f={in_f} row={r}: got {got_r}, want {want}",
@@ -7018,7 +7181,7 @@ mod kernel_tests {
             let mut got = vec![0f32; 3];
             vec_dot_q5_0_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, q8) in q8s.iter().enumerate() {
-                let want = dot(&wref, &dequant_q8_32(q8));
+                let want = dot_scalar(&wref, &dequant_q8_32(q8));
                 assert!(
                     rel_err(got[r], want) < 1e-3,
                     "q5_0_32 in_f={in_f} row={r}: got {got_r}, want {want}",
@@ -7085,13 +7248,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_q4_0_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8_32(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8_32(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "q4_0_32 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "q4_0_32 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -7102,7 +7265,7 @@ mod kernel_tests {
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
                 vec_dot_q4_0_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
-                let want = dot(&wref, x);
+                let want = dot_scalar(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
                     "q4_0_32 single in_f={in_f} row={r}: got {}, want {want}",
@@ -7189,13 +7352,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_q2_0_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8_32(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8_32(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "q2_0 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "q2_0 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -7206,7 +7369,7 @@ mod kernel_tests {
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
                 vec_dot_q2_0_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
-                let want = dot(&wref, x);
+                let want = dot_scalar(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
                     "q2_0 single in_f={in_f} row={r}: got {}, want {want}",
@@ -7289,13 +7452,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_q4_1_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8_32(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8_32(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "q4_1_32 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "q4_1_32 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -7306,7 +7469,7 @@ mod kernel_tests {
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
                 vec_dot_q4_1_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
-                let want = dot(&wref, x);
+                let want = dot_scalar(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
                     "q4_1_32 single in_f={in_f} row={r}: got {}, want {want}",
@@ -7419,13 +7582,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_q5_1_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8_32(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8_32(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "q5_1_32 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "q5_1_32 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -7436,7 +7599,7 @@ mod kernel_tests {
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
                 vec_dot_q5_1_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
-                let want = dot(&wref, x);
+                let want = dot_scalar(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
                     "q5_1_32 single in_f={in_f} row={r}: got {}, want {want}",
@@ -7519,13 +7682,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_iq4nl_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8_32(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8_32(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "iq4nl_32 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "iq4nl_32 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -7536,7 +7699,7 @@ mod kernel_tests {
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
                 vec_dot_iq4nl_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
-                let want = dot(&wref, x);
+                let want = dot_scalar(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
                     "iq4nl_32 single in_f={in_f} row={r}: got {}, want {want}",
@@ -7635,13 +7798,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_mxfp4_32_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8_32(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8_32(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "mxfp4_32 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "mxfp4_32 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -7652,7 +7815,7 @@ mod kernel_tests {
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
                 vec_dot_mxfp4_32_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
-                let want = dot(&wref, x);
+                let want = dot_scalar(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
                     "mxfp4_32 single in_f={in_f} row={r}: got {}, want {want}",
@@ -7754,13 +7917,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_nvfp4_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8_32(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8_32(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "nvfp4 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "nvfp4 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -7771,7 +7934,7 @@ mod kernel_tests {
             for (r, x) in xs.iter().enumerate() {
                 let mut one = [0f32; 1];
                 vec_dot_nvfp4_batch::<false>(&w, std::slice::from_ref(&q8s[r]), in_f, &mut one);
-                let want = dot(&wref, x);
+                let want = dot_scalar(&wref, x);
                 assert!(
                     rel_err(one[0], want) < 2e-2,
                     "nvfp4 single in_f={in_f} row={r}: got {}, want {want}",
@@ -7880,13 +8043,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_iq4xs_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "iq4xs batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "iq4xs batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -7896,12 +8059,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_iq4xs::<false>(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "iq4xs single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 2e-2,
                     "iq4xs single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -7997,13 +8160,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_iq2s_batch(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "iq2s batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 3e-2,
                     "iq2s batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -8013,12 +8176,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_iq2s(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "iq2s single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 3e-2,
                     "iq2s single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -8118,13 +8281,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_iq2xxs_batch(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "iq2xxs batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 3e-2,
                     "iq2xxs batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -8134,12 +8297,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_iq2xxs(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "iq2xxs single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 3e-2,
                     "iq2xxs single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -8214,13 +8377,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_tq2_0_batch(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "tq2_0 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "tq2_0 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -8230,12 +8393,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_tq2_0(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "tq2_0 single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 2e-2,
                     "tq2_0 single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -8312,13 +8475,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_tq1_0_batch(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "tq1_0 batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "tq1_0 batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -8328,12 +8491,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_tq1_0(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "tq1_0 single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 2e-2,
                     "tq1_0 single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -8422,13 +8585,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_iq1s_batch(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "iq1s batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 3e-2,
                     "iq1s batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -8438,12 +8601,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_iq1s(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "iq1s single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 3e-2,
                     "iq1s single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -8537,13 +8700,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_iq1m_batch(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "iq1m batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 3e-2,
                     "iq1m batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -8553,12 +8716,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_iq1m(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "iq1m single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 3e-2,
                     "iq1m single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -8658,13 +8821,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_iq2xs_batch(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "iq2xs batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 3e-2,
                     "iq2xs batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -8674,12 +8837,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_iq2xs(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "iq2xs single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 3e-2,
                     "iq2xs single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -8778,13 +8941,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_iq3s_batch(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "iq3s batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 3e-2,
                     "iq3s batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -8794,12 +8957,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_iq3s(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "iq3s single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 3e-2,
                     "iq3s single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -8901,13 +9064,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_iq3xxs_batch(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "iq3xxs batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 3e-2,
                     "iq3xxs batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -8917,12 +9080,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_iq3xxs(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "iq3xxs single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 3e-2,
                     "iq3xxs single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -9028,13 +9191,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_q2k_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "q2k batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "q2k batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -9044,12 +9207,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_q2k::<false>(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "q2k single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 2e-2,
                     "q2k single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -9167,13 +9330,13 @@ mod kernel_tests {
             let mut got = vec![0f32; xs.len()];
             vec_dot_q3k_batch::<false>(&w, &q8s, in_f, &mut got);
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got[r], want_q) < 1e-3,
                     "q3k batch(quant-ref) in_f={in_f} row={r}: got {}, want {want_q}",
                     got[r]
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got[r], want_f) < 2e-2,
                     "q3k batch(full-ref) in_f={in_f} row={r}: got {}, want {want_f}",
@@ -9183,12 +9346,12 @@ mod kernel_tests {
             // Single-row (m=1).
             for (r, (x, q8)) in xs.iter().zip(q8s.iter()).enumerate() {
                 let got1 = vec_dot_q3k::<false>(&w, q8, in_f);
-                let want_q = dot(&wref, &dequant_q8(q8));
+                let want_q = dot_scalar(&wref, &dequant_q8(q8));
                 assert!(
                     rel_err(got1, want_q) < 1e-3,
                     "q3k single(quant-ref) in_f={in_f} row={r}: got {got1}, want {want_q}"
                 );
-                let want_f = dot(&wref, x);
+                let want_f = dot_scalar(&wref, x);
                 assert!(
                     rel_err(got1, want_f) < 2e-2,
                     "q3k single(full-ref) in_f={in_f} row={r}: got {got1}, want {want_f}"
@@ -9210,7 +9373,7 @@ mod kernel_tests {
             .iter()
             .map(|&v| half::f16::from_f32(v).to_f32())
             .collect();
-        assert!(rel_err(dot_f16(&wbytes, &x), dot(&wref, &x)) < 1e-4);
+        assert!(rel_err(dot_f16::<false>(&wbytes, &x), dot_scalar(&wref, &x)) < 1e-4);
     }
 
     #[test]
@@ -9229,8 +9392,8 @@ mod kernel_tests {
         // dot_bf16 now uses the same 8-accumulator chunked structure as `dot`, so on the same
         // bf16-rounded weights it is bit-identical to `dot` — not merely close.
         assert_eq!(
-            dot_bf16(&wbytes, &x).to_bits(),
-            dot(&wref, &x).to_bits(),
+            dot_bf16::<false>(&wbytes, &x).to_bits(),
+            dot_scalar(&wref, &x).to_bits(),
             "dot_bf16 must match dot's 8-accumulator reduction bit-for-bit",
         );
     }
@@ -9273,7 +9436,7 @@ mod kernel_tests {
         }
 
         assert_eq!(
-            dot_bf16(&wbytes, &x).to_bits(),
+            dot_bf16::<false>(&wbytes, &x).to_bits(),
             want.to_bits(),
             "dot_bf16 must equal the 8-accumulator reference bit-for-bit",
         );
@@ -9570,7 +9733,7 @@ mod kernel_tests {
 
             for (r, q8) in q8s.iter().enumerate() {
                 // full-precision weight · the int8 activation the kernel actually sees.
-                let want = dot(&wref, &dequant_q8_32(q8));
+                let want = dot_scalar(&wref, &dequant_q8_32(q8));
                 assert!(
                     rel_err(got_batch[r], want) < 1e-3,
                     "q8_0 in_f={in_f} batch row {r}: got {}, want {want}",
@@ -9593,8 +9756,8 @@ mod kernel_tests {
             // by far more than the 1e-3 tolerance above.
             if in_f == 1152 {
                 let x = &xs[0];
-                let full = dot(&wref, x);
-                let trunc = dot(&wref[..1024], &x[..1024]);
+                let full = dot_scalar(&wref, x);
+                let trunc = dot_scalar(&wref[..1024], &x[..1024]);
                 assert!(
                     rel_err(trunc, full) > 1e-2,
                     "expected sub-256 tail to be significant: full {full}, trunc {trunc}",
@@ -9635,7 +9798,7 @@ mod kernel_tests {
             for r in 0..m {
                 for o in 0..out_f {
                     out[r * out_f + o] =
-                        dot(&w[o * in_f..o * in_f + in_f], &x[r * in_f..r * in_f + in_f]);
+                        dot_scalar(&w[o * in_f..o * in_f + in_f], &x[r * in_f..r * in_f + in_f]);
                 }
             }
             out

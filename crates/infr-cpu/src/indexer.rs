@@ -50,7 +50,7 @@ fn task_keys(threads: usize, n: usize, rows: usize, n_head: usize, head_dim: usi
 /// built in `buf`'s storage, so a caller that hands back the previous op's score buffer (the
 /// executor's `Recycler`) does not map a fresh `rows × keys` allocation per op.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn score(
+pub(crate) fn score<const CAP: bool>(
     pool: &SpinPool,
     buf: Vec<f32>,
     q: &[f32],
@@ -98,7 +98,7 @@ pub(crate) fn score(
                     let blocked = nh - nh % HEADS;
                     for h0 in (0..blocked).step_by(HEADS) {
                         let d: [[f32; KEYS]; HEADS] =
-                            dot_mn(std::array::from_fn(|m| qh(h0 + m)), ks);
+                            dot_mn::<CAP, HEADS, KEYS>(std::array::from_fn(|m| qh(h0 + m)), ks);
                         for (m, d) in d.iter().enumerate() {
                             for (a, &d) in acc.iter_mut().zip(d) {
                                 *a += (w[h0 + m] * scale) * d.max(0.0);
@@ -106,7 +106,7 @@ pub(crate) fn score(
                         }
                     }
                     for h in blocked..nh {
-                        let d: [f32; KEYS] = dot_n(qh(h), ks);
+                        let d: [f32; KEYS] = dot_n::<CAP, KEYS>(qh(h), ks);
                         for (a, d) in acc.iter_mut().zip(d) {
                             *a += (w[h] * scale) * d.max(0.0);
                         }
@@ -118,7 +118,7 @@ pub(crate) fn score(
                     for i in 0..m {
                         let mut a = 0f32;
                         for h in 0..nh {
-                            a += (w[h] * scale) * dot(qh(h), key(i)).max(0.0);
+                            a += (w[h] * scale) * dot::<CAP>(qh(h), key(i)).max(0.0);
                         }
                         piece[out(i)] = a;
                     }
@@ -320,7 +320,7 @@ mod tests {
     fn score_ref(q: &[f32], ws: &[f32], k: &[f32], nh: usize, hd: usize, scale: f32) -> f32 {
         let mut a = 0f32;
         for h in 0..nh {
-            a += (ws[h] * scale) * dot(&q[h * hd..(h + 1) * hd], k).max(0.0);
+            a += (ws[h] * scale) * crate::kernels::dot_scalar(&q[h * hd..(h + 1) * hd], k).max(0.0);
         }
         a
     }
@@ -361,7 +361,7 @@ mod tests {
                 .collect();
             let k32: Vec<f32> = k16.iter().map(|x| x.to_f32()).collect();
             for keys in [Keys::F16(&k16), Keys::F32(&k32)] {
-                let sc = score(&pool, Vec::new(), &q, &ws, keys, nh, hd, scale, &his);
+                let sc = score::<false>(&pool, Vec::new(), &q, &ws, keys, nh, hd, scale, &his);
                 let n = *his.iter().max().unwrap();
                 assert_eq!(sc.len(), n * rows);
                 for (t, &hi) in his.iter().enumerate() {

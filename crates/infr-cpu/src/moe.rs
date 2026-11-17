@@ -198,24 +198,24 @@ pub(crate) fn expert_gemm_range<const CAP: bool>(
                         let (quads, tail) = col.as_chunks_mut::<4>();
                         for (q, dst) in quads.iter_mut().enumerate() {
                             let xs: [&[f32]; 4] = std::array::from_fn(|k| x_row(4 * q + k));
-                            *dst = dot_n(&w32, xs);
+                            *dst = dot_n::<CAP, 4>(&w32, xs);
                         }
                         let done = count / 4 * 4;
                         for (k, dst) in tail.iter_mut().enumerate() {
-                            *dst = dot(&w32, x_row(done + k));
+                            *dst = dot::<CAP>(&w32, x_row(done + k));
                         }
                     }
                     DType::F16 => {
                         for (r, dst) in col.iter_mut().enumerate() {
-                            *dst = dot_f16(row, &xin[r * in_f..r * in_f + in_f]);
+                            *dst = dot_f16::<CAP>(row, &xin[r * in_f..r * in_f + in_f]);
                         }
                     }
                     DType::Bf16 => {
                         for (r, dst) in col.iter_mut().enumerate() {
-                            *dst = dot_bf16(row, &xin[r * in_f..r * in_f + in_f]);
+                            *dst = dot_bf16::<CAP>(row, &xin[r * in_f..r * in_f + in_f]);
                         }
                     }
-                    _ => dequant_dot_rows(row, dt, xin, in_f, col, &mut accs),
+                    _ => dequant_dot_rows::<CAP>(row, dt, xin, in_f, col, &mut accs),
                 }
             }
         }

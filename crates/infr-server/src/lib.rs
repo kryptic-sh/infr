@@ -5488,7 +5488,7 @@ mod tests {
     async fn oversized_and_untyped_bodies_keep_their_status() {
         let huge = format!(
             r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
-            "x".repeat(3 << 20)
+            "x".repeat(MAX_BODY_BYTES + 1024)
         );
         let resp = post_chat(router_for(Arc::new(EchoGen("a"))), &huge).await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);

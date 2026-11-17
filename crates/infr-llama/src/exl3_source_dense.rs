@@ -128,7 +128,7 @@ impl Exl3Source {
             let value = match spec.op {
                 DenseOp::Identity => value,
                 DenseOp::AddOne => value + 1.0,
-                DenseOp::NegativeExp => -value.exp(),
+                DenseOp::NegativeExp => -infr_core::math::exp(value),
             };
             ensure!(
                 value.is_finite(),

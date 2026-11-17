@@ -74,13 +74,13 @@ fn linear(w: &Weights<'_>, name: &str, x: &[f32]) -> Vec<f32> {
     weight(w, name).linear(x)
 }
 fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+    1.0 / (1.0 + infr_core::math::exp(-x))
 }
 fn silu(x: f32) -> f32 {
     x * sigmoid(x)
 }
 fn softplus(x: f32) -> f32 {
-    x.max(0.0) + (-x.abs()).exp().ln_1p()
+    x.max(0.0) + infr_core::math::ln_1p(infr_core::math::exp(-x.abs()))
 }
 fn dot(x: &[f32], y: &[f32]) -> f32 {
     x.iter().zip(y).map(|(a, b)| a * b).sum()
@@ -88,7 +88,7 @@ fn dot(x: &[f32], y: &[f32]) -> f32 {
 fn softmax(x: &mut [f32]) {
     let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     for v in x.iter_mut() {
-        *v = (*v - max).exp();
+        *v = infr_core::math::exp(*v - max);
     }
     let sum: f32 = x.iter().sum();
     for v in x {
@@ -624,9 +624,10 @@ fn delta_step(w: &Weights<'_>, b: &str, x: &[f32], c: &Cfg, s: &mut DeltaState) 
         let k = &conv[qk_width + kh * dk..qk_width + (kh + 1) * dk];
         let qscale = (dot(q, q) + 1e-6).sqrt().recip() / (dk as f32).sqrt();
         let kscale = (dot(k, k) + 1e-6).sqrt().recip();
-        let decay = (-weight(w, &format!("{b}.ssm_a")).at(h).exp()
-            * softplus(a[h] + weight(w, &format!("{b}.ssm_dt.bias")).at(h)))
-        .exp();
+        let decay = infr_core::math::exp(
+            -infr_core::math::exp(weight(w, &format!("{b}.ssm_a")).at(h))
+                * softplus(a[h] + weight(w, &format!("{b}.ssm_dt.bias")).at(h)),
+        );
         let state = &mut s.recurrent[h * dk * dv..(h + 1) * dk * dv];
         for v in state.iter_mut() {
             *v *= decay;
@@ -719,8 +720,9 @@ fn rotary(x: &mut [f32], head_dim: usize, position: usize, c: &Cfg) {
     let half = c.rope_dim / 2;
     for head in x.chunks_exact_mut(head_dim) {
         for j in 0..half {
-            let angle = position as f32 / c.rope_theta.powf(2.0 * j as f32 / c.rope_dim as f32);
-            let (sin, cos) = angle.sin_cos();
+            let angle = position as f32
+                / infr_core::math::powf(c.rope_theta, 2.0 * j as f32 / c.rope_dim as f32);
+            let (sin, cos) = infr_core::math::sin_cos(angle);
             let (a, b) = (head[j], head[j + half]);
             head[j] = a * cos - b * sin;
             head[j + half] = b * cos + a * sin;

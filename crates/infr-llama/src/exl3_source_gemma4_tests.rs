@@ -174,7 +174,8 @@ fn embedding(f: &mut Fixture, prefix: &str, width: usize, packed: bool) {
     } else {
         let bytes = (0..width * 256)
             .flat_map(|i| {
-                half::bf16::from_f32(((i * 29 % 257) as f32 * 0.041).sin() * 0.01).to_le_bytes()
+                half::bf16::from_f32(infr_core::math::sin((i * 29 % 257) as f32 * 0.041) * 0.01)
+                    .to_le_bytes()
             })
             .collect();
         f.tensors.push((
@@ -244,7 +245,9 @@ fn maps_gemma4_variants_norms_head_sizes_sharing_and_proportional_rope() {
             }
         );
         assert!(source.native_spec("blk.1.attn_v.weight").is_none());
-        assert_eq!(source.native_spec("blk.3.attn_k.weight").is_some(), !packed);
+        // KV-shared layers have no K of their own in the checkpoint; the loader aliases the own-KV
+        // layer of the same attention kind so every layer uploads in the same order.
+        assert!(source.native_spec("blk.3.attn_k.weight").is_some());
         assert_eq!(
             f32::from_le_bytes(
                 source.tensor_bytes("output_norm.weight").unwrap()[..4]

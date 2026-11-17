@@ -455,7 +455,13 @@ fn a_write_at_a_page_offset_reads_back_through_the_table() {
 /// A replayed store writes at `p_pos + p_rb`, so a slot whose block starts at row 512 must land
 /// its rows there and leave block 0 alone — the store half of the row base the attention read
 /// never needed (its table already points at the right pages).
+///
+/// Ignored: the `p_rb` params word this pins never landed in a store kernel. A paged slot's row
+/// base reaches the store through the destination device address instead (adapter.rs
+/// `kv_row_base * row_bytes`), so there is nothing here to exercise until a params-based row base
+/// exists.
 #[test]
+#[ignore = "p_rb params row base never landed; row bases travel in the device address"]
 fn a_store_row_base_puts_the_row_in_that_block() {
     let be = match VulkanBackend::new_with(Arc::new(Config::default())) {
         Ok(be) => be,

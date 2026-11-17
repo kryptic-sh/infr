@@ -67,6 +67,7 @@ const ALLOWLIST: &[(&str, usize)] = &[
     ("infr-llama/src/diffusion.rs", 2),
     ("infr-llama/src/mtp/mod.rs", 1),
     ("infr-llama/src/sampling.rs", 5),
+    ("infr-llama/src/seam/model.rs", 3),
     ("infr-llama/src/seam/runner.rs", 1),
     ("infr-llama/src/seam/sc.rs", 2),
     ("infr-metal/src/exec.rs", 10),

@@ -57,4 +57,10 @@ float vw_half_inclusive_add(float x) {
 #define subgroupAnd(x) (VW_HALVES ? subgroupClusteredAnd((x), 32u) : subgroupAnd(x))
 #define subgroupOr(x) (VW_HALVES ? subgroupClusteredOr((x), 32u) : subgroupOr(x))
 #define subgroupXor(x) (VW_HALVES ? subgroupClusteredXor((x), 32u) : subgroupXor(x))
+// A shuffle id is relative to the 32-lane cluster: on a wave64 device the hardware shuffle spans
+// 64 lanes, so the id is based on the half it belongs to. Ids outside the caller's half were never
+// legal for a 32-lane subgroup, so this is the same shuffle on both widths.
+#define subgroupShuffle(x, id) \
+    (VW_HALVES ? subgroupShuffle((x), ((gl_SubgroupInvocationID & ~31u) + uint(id))) \
+               : subgroupShuffle((x), uint(id)))
 #endif

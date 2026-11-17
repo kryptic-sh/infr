@@ -21,6 +21,7 @@ pub struct PplReport {
 
 impl PplReport {
     pub fn ppl(&self) -> f64 {
+        // libm-ok(S2): f64 `exp` (perplexity is accumulated in f64; `infr_core::math` is f32)
         (self.nll_sum / self.count.max(1) as f64).exp()
     }
 
@@ -1549,8 +1550,10 @@ impl SeamModel {
                         let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
                         let lse = row
                             .iter()
+                            // libm-ok(S2): f64 `exp` on the log-sum-exp row
                             .map(|&x| (x as f64 - max).exp())
                             .sum::<f64>()
+                            // libm-ok(S2): f64 `ln` of that sum
                             .ln();
                         lse + max - row[window[j + 1] as usize] as f64
                     })

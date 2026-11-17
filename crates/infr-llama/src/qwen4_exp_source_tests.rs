@@ -239,7 +239,7 @@ fn load_with_routes_hf_and_refuses_before_gpu_work() {
         Ok(_) => panic!("missing tokenizer"),
         Err(e) => e,
     };
-    assert!(e.to_string().contains("adjacent HF tokenizer.json"));
+    assert!(e.to_string().contains("adjacent tokenizer.json"));
 }
 
 #[test]

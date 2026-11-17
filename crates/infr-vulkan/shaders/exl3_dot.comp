@@ -9,6 +9,10 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 #endif
+// On a wave64 device a hardware subgroup is 64 lanes; the include virtualizes 32-lane subgroups
+// for the reductions. The SHUFFLE builds are wave32-only and never SELECTED there (recorder's
+// `shuffle` gate), but they are still built, so they carry the include too.
+#include "wave64.glsl"
 #ifndef B_ROWS
 #define B_ROWS 1
 #endif

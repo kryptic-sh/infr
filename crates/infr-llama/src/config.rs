@@ -2058,7 +2058,7 @@ fn check_recurrent_layers(
                 .map(|x| flag(x).with_context(|| format!("{key}: not a bool array")))
                 .collect::<Result<_>>()?
         }
-        v => vec![flag(&v).with_context(|| format!("{key}: not a bool"))?; n_layer_all],
+        v => vec![flag(v).with_context(|| format!("{key}: not a bool"))?; n_layer_all],
     };
     let periodic = |i: usize| {
         i < n_layer && full_attn_interval > 0 && !(i + 1).is_multiple_of(full_attn_interval)

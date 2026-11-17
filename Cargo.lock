@@ -1418,7 +1418,6 @@ version = "0.3.0"
 dependencies = [
  "chrono",
  "infr-core",
- "infr-gguf",
  "minijinja",
  "minijinja-contrib",
  "serde_json",
@@ -1489,10 +1488,8 @@ dependencies = [
 name = "infr-engine"
 version = "0.3.0"
 dependencies = [
- "anyhow",
  "infr-chat",
  "infr-core",
- "infr-gguf",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1635,7 +1632,6 @@ dependencies = [
  "subtle",
  "tokio",
  "tower",
- "tower-http",
  "tracing",
 ]
 
@@ -3225,7 +3221,6 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
- "tracing",
  "url",
 ]
 

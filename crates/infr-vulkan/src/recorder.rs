@@ -701,7 +701,7 @@ fn mmv_o4(vk: &infr_core::config::VulkanCfg, in_f: usize, o4: MmvO4) -> bool {
     if o4.all_widths {
         return vk.mmv_o4;
     }
-    vk.mmv_o4 && (in_f < o4.max_in_f || (in_f / 32) % 64 != 0)
+    vk.mmv_o4 && (in_f < o4.max_in_f || !(in_f / 32).is_multiple_of(64))
 }
 
 /// When [`mmv_o4`] takes the four-outputs build: the `mmv_mrow.o4_max_in_f` and
@@ -2015,7 +2015,10 @@ impl<'a> Recorder<'a> {
         );
         let batch = if rows == 1 { 1 } else { 8 };
         let caps = self.be.caps();
-        let shuffle = caps.subgroup_min >= 32;
+        // The SHUFFLE builds index `subgroupShuffle` by 32-lane ids, which a wave64 device does
+        // not honour; it takes the scalar builds instead. A wave64-only (or forced-wave64) device
+        // reports its subgroup range as (64, 64).
+        let shuffle = caps.subgroup_min >= 32 && caps.subgroup_min < 64;
         let (name, spv) = if rows == 1 {
             match (caps.f16, shuffle) {
                 (true, true) if spec.bits == 4 => {

@@ -55,7 +55,7 @@ fn fixture() -> Fixture {
         "model.language_model.embed_tokens.weight",
         &[256, 256],
         "F16",
-        |i| (i as f32 * 0.11).cos() * 0.1,
+        |i| infr_core::math::cos(i as f32 * 0.11) * 0.1,
     );
     raw_dense(
         &mut f,
@@ -246,7 +246,7 @@ fn dense_preprocessing_and_unequal_value_heads_match_exporter() {
         .0;
     let conv = floats("blk.0.ssm_conv1d.weight");
     for (dest, src) in order.into_iter().enumerate() {
-        assert_eq!(a[dest], -(src as f32 * 0.25).exp());
+        assert_eq!(a[dest], -infr_core::math::exp(src as f32 * 0.25));
         assert_eq!(dt[dest], src as f32 * 0.125);
         for col in [0, 1, 255] {
             let expected = half::f16::from_f32(

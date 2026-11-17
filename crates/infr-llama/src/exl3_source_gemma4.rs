@@ -279,17 +279,10 @@ impl Exl3Source {
         for layer in 0..nl {
             let prefix = format!("model.language_model.layers.{layer}");
             let full = (layer + 1).is_multiple_of(period);
-            let (hd, kv) = if full {
-                (hd_full, nk_full)
-            } else {
-                (hd_swa, nk)
-            };
+            let hd = if full { hd_full } else { hd_swa };
             let qw = nh
                 .checked_mul(hd)
                 .context("exl3: Gemma4 Q dimension overflow")?;
-            let kw = kv
-                .checked_mul(hd)
-                .context("exl3: Gemma4 KV dimension overflow")?;
             for (name, hf, k, n) in [
                 ("attn_q", "self_attn.q_proj", ne, qw),
                 ("attn_output", "self_attn.o_proj", qw, ne),
@@ -304,35 +297,56 @@ impl Exl3Source {
                     n,
                 )?;
             }
-            if layer < nl - shared {
+            // KV-shared layers reuse an earlier layer's cache, so the checkpoint has no K/V of its
+            // own. The loader still uploads a per-layer tensor for every layer (the graph just
+            // never reads it), so those layers alias the own-KV layer of the SAME attention kind
+            // (a shared SWA layer takes the last own SWA layer's K, not a full-attention one's).
+            let kv_layer = if layer < nl - shared {
+                layer
+            } else {
+                (0..nl - shared)
+                    .rev()
+                    .find(|&l| (l + 1).is_multiple_of(period) == full)
+                    .unwrap_or(nl - shared - 1)
+            };
+            let kv_prefix = format!("model.language_model.layers.{kv_layer}");
+            let (hd_kv, kv_kv) = if (kv_layer + 1).is_multiple_of(period) {
+                (hd_full, nk_full)
+            } else {
+                (hd_swa, nk)
+            };
+            let kw_kv = kv_kv
+                .checked_mul(hd_kv)
+                .context("exl3: Gemma4 KV dimension overflow")?;
+            {
                 source.add_linear(
                     &format!("blk.{layer}.attn_k.weight"),
-                    &format!("{prefix}.self_attn.k_proj"),
+                    &format!("{kv_prefix}.self_attn.k_proj"),
                     ne,
-                    kw,
+                    kw_kv,
                 )?;
                 if source
                     .st
                     .tensors()
                     .iter()
-                    .any(|t| t.name == format!("{prefix}.self_attn.v_proj.trellis"))
+                    .any(|t| t.name == format!("{kv_prefix}.self_attn.v_proj.trellis"))
                 {
                     source.add_linear(
                         &format!("blk.{layer}.attn_v.weight"),
-                        &format!("{prefix}.self_attn.v_proj"),
+                        &format!("{kv_prefix}.self_attn.v_proj"),
                         ne,
-                        kw,
+                        kw_kv,
                     )?;
                 } else {
                     ensure!(
-                        full && text["attention_k_eq_v"] == true,
+                        text["attention_k_eq_v"] == true,
                         "exl3: Gemma4 V projection missing"
                     );
                 }
                 source.add_dense_with(
                     &format!("blk.{layer}.attn_k_norm.weight"),
-                    &format!("{prefix}.self_attn.k_norm.weight"),
-                    &[hd],
+                    &format!("{kv_prefix}.self_attn.k_norm.weight"),
+                    &[hd_kv],
                     None,
                     DenseOptions {
                         f32: true,

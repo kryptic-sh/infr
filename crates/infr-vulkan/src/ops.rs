@@ -724,6 +724,9 @@ mod tests {
         const DECORATION_SPEC_ID: u32 = 1;
         const DECORATION_BUILTIN: u32 = 11;
         const OP_ELECT: u32 = 333;
+        // OpGroupNonUniformShuffle — remapped in `shaders/wave64.glsl` by basing the lane id on the
+        // half the caller is in, so it needs no cluster-32 twin opcode.
+        const OP_SHUFFLE: u32 = 345;
         const OP_FADD: u32 = 350;
         const OP_UMIN: u32 = 354;
         const OP_ARITH_FIRST: u32 = 349; // OpGroupNonUniformIAdd
@@ -743,8 +746,9 @@ mod tests {
                                   (a cluster-32 twin under VW_HALVES), then allow its opcode here";
         // Kernels written for any subgroup width, read for it: `moe_topk.comp` reduces with
         // subgroupMax/Min, picks a lane with subgroupElect and walks `gl_NumSubgroups` partials,
-        // none of which assumes 32 lanes; `wave64_probe.comp` reads the real subgroups on purpose.
-        const WIDTH_AGNOSTIC: &[&str] = &["moe_topk", "wave64_probe"];
+        // none of which assumes 32 lanes; `wave64_probe.comp` reads the real subgroups on purpose;
+        // `attn_decode_gqa.comp` requires subgroupSize 64 and addresses its lanes directly.
+        const WIDTH_AGNOSTIC: &[&str] = &["attn_decode_gqa", "moe_topk", "wave64_probe"];
 
         let (mut covered, mut agnostic, mut coopmat) = (0, 0, 0);
         for entry in std::fs::read_dir(env!("OUT_DIR")).expect("OUT_DIR") {
@@ -785,6 +789,7 @@ mod tests {
                         uses = true;
                         elects += 1;
                     }
+                    OP_SHUFFLE => uses = true,
                     OP_ARITH_FIRST..=OP_ARITH_LAST => {
                         uses = true;
                         match ins[4] {

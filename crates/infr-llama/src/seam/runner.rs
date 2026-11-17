@@ -912,6 +912,24 @@ pub(crate) fn generate_dense_backend_bound(
                     }
                     Ok(g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?.to_vec())
                 };
+                // The same tensor as `own_bytes`, but a GGUF keeps its zero-copy mmap view: the
+                // CPU paged store and `PageReleaser` need the file range a view carries, and a
+                // binder that pages a weight never wants the bytes.
+                let view_or_owned = |name: &str| -> AResult<WBytes> {
+                    if let Some(ex) = g.as_any().downcast_ref::<crate::Exl3Source>() {
+                        if let Some(bytes) = ex.take_fold(name)? {
+                            return Ok(WBytes::Owned(bytes));
+                        }
+                    }
+                    match g.as_any().downcast_ref::<infr_gguf::Gguf>() {
+                        Some(gg) => Ok(WBytes::Mmap(
+                            gg.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?,
+                        )),
+                        None => Ok(WBytes::Owned(
+                            g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?.to_vec(),
+                        )),
+                    }
+                };
                 // Found AND the shape the graph will index it as: a mismatch is refused here, naming
                 // both shapes, rather than read out of bounds by the first forward pass.
                 let info = |name: &str| {
@@ -991,14 +1009,21 @@ pub(crate) fn generate_dense_backend_bound(
                         let bytes: Vec<u8> = f32v.iter().flat_map(|&x| x.to_le_bytes()).collect();
                         (WBytes::Owned(bytes), DType::F32, numel)
                     } else {
-                        let tb = own_bytes(name)?;
+                        let tb = view_or_owned(name)?;
                         let numel = i.shape.iter().product();
                         match qk_perm_heads(name) {
                             Some(heads) => {
                                 let rb = row_bytes(name, i.dtype);
-                                (WBytes::Owned(permute_rows(&tb, heads, rb)), i.dtype, numel)
+                                let cat = match &tb {
+                                    WBytes::Owned(v) => permute_rows(v, heads, rb),
+                                    WBytes::Mmap(t) => permute_rows(t, heads, rb),
+                                    WBytes::Concat(_) => {
+                                        unreachable!("a single tensor is no group")
+                                    }
+                                };
+                                (WBytes::Owned(cat), i.dtype, numel)
                             }
-                            None => (WBytes::Owned(tb), i.dtype, numel),
+                            None => (tb, i.dtype, numel),
                         }
                     }
                 } else {
@@ -1371,8 +1396,19 @@ pub(crate) fn generate_dense_backend_bound(
                 wload(&["per_layer_model_proj.weight"])?;
                 wload(&["per_layer_proj_norm.weight"])?;
                 // Sanity-check the two uploads landed with the shapes the GPU prologue assumes
-                // (model_proj is `[n_layer*npl, n_embd]`, proj_norm is `[npl]`).
-                debug_assert_eq!(wspecs[wspecs.len() - 2].1, c.n_layer * npl * ne);
+                // (model_proj is `[n_layer*npl, n_embd]`, proj_norm is `[npl]`). A native EXL3
+                // projection uploads its trellis + two scale vectors instead, so its geometry is
+                // checked from the spec.
+                if let Some(spec) = g
+                    .as_any()
+                    .downcast_ref::<crate::Exl3Source>()
+                    .and_then(|src| src.native_spec("per_layer_model_proj.weight"))
+                {
+                    debug_assert_eq!(spec.in_f as usize, ne);
+                    debug_assert_eq!(spec.out_f as usize, c.n_layer * npl);
+                } else {
+                    debug_assert_eq!(wspecs[wspecs.len() - 2].1, c.n_layer * npl * ne);
+                }
                 debug_assert_eq!(wspecs[wspecs.len() - 1].1, npl);
             }
             // gemma4 weightless per-head V-norm = `QkNorm` with a unit weight (out = x/rms). One ones-vector

@@ -247,7 +247,9 @@ fn native_and_folded_reference_logits_agree() {
         .find(|t| t.0 == "model.embed_tokens.weight")
         .unwrap();
     for (i, pair) in embed.3.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-        pair.copy_from_slice(&half::f16::from_f32((i as f32 * 0.11).cos() * 0.1).to_le_bytes());
+        pair.copy_from_slice(
+            &half::f16::from_f32(infr_core::math::cos(i as f32 * 0.11) * 0.1).to_le_bytes(),
+        );
     }
     for t in fixture
         .tensors
@@ -511,7 +513,9 @@ fn synthetic_qwen_batched_logits_match_causal_prefix_forwards() {
         .find(|t| t.0 == "model.embed_tokens.weight")
         .unwrap();
     for (i, pair) in embed.3.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-        pair.copy_from_slice(&half::f16::from_f32((i as f32 * 0.07).sin() * 0.1).to_le_bytes());
+        pair.copy_from_slice(
+            &half::f16::from_f32(infr_core::math::sin(i as f32 * 0.07) * 0.1).to_le_bytes(),
+        );
     }
     fixture.open().unwrap();
     let model = crate::SeamModel::load_with(
@@ -584,7 +588,9 @@ fn folded_linear_matches_unfused_hadamard_forward_for_every_integer_rate() {
             .collect();
         let suh: Vec<_> = (0..k).map(|i| (i as f32 % 13.0 - 6.0) * 0.017).collect();
         let svh: Vec<_> = (0..n).map(|i| (i as f32 % 7.0 - 3.0) * 0.023).collect();
-        let x: Vec<_> = (0..k).map(|i| (i as f32 * 0.23).sin()).collect();
+        let x: Vec<_> = (0..k)
+            .map(|i| infr_core::math::sin(i as f32 * 0.23))
+            .collect();
         let d = infr_cpu::exl3::decode_matrix(Codebook::from(codebook), bits, &packed, k, n);
         let scaled: Vec<_> = x.iter().zip(&suh).map(|(a, b)| a * b).collect();
         let xh = walsh_reference(&scaled);

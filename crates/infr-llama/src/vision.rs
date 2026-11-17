@@ -736,7 +736,7 @@ impl Gemma4Vision {
         let half = hd / 2; // rotated span per axis
         let pairs = half / 2;
         let inv: Vec<f32> = (0..pairs)
-            .map(|i| self.rope_theta.powf(-2.0 * i as f32 / half as f32))
+            .map(|i| infr_core::math::powf(self.rope_theta, -2.0 * i as f32 / half as f32))
             .collect();
         t.par_chunks_mut(ne)
             .take(n)
@@ -746,7 +746,7 @@ impl Gemma4Vision {
                     for (axis, pos) in [(0usize, pos_x[r]), (1usize, pos_y[r])] {
                         let span = &mut head[axis * half..(axis + 1) * half];
                         for i in 0..pairs {
-                            let (s, c) = (pos as f32 * inv[i]).sin_cos();
+                            let (s, c) = infr_core::math::sin_cos(pos as f32 * inv[i]);
                             let (a, b) = (span[i], span[i + pairs]);
                             span[i] = a * c - b * s;
                             span[i + pairs] = a * s + b * c;
@@ -882,7 +882,7 @@ fn attention(
             let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut sum = 0.0;
             for v in row.iter_mut() {
-                *v = (*v - mx).exp();
+                *v = infr_core::math::exp(*v - mx);
                 sum += *v;
             }
             let inv = 1.0 / sum;
@@ -932,7 +932,7 @@ fn rms_rows(x: &mut [f32], width: usize, w: Option<&[f32]>, eps: f32) {
 /// ggml's `gelu` (tanh approximation), which `ggml_geglu_split` applies to the gate.
 fn gelu_tanh(x: f32) -> f32 {
     const C: f32 = 0.797_884_6; // sqrt(2/pi)
-    0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh())
+    0.5 * x * (1.0 + infr_core::math::tanh(C * (x + 0.044_715 * x * x * x)))
 }
 
 #[cfg(test)]

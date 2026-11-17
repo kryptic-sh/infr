@@ -796,6 +796,19 @@ fn dispatch(
             turns,
             llama_bench,
         } => {
+            // The reference arm's report paths are inherited by every child this comparison
+            // spawns, so two models' runs land in one file and the later overwrites the earlier.
+            if cfg
+                .prof
+                .out
+                .iter()
+                .chain(cfg.prof.trace.iter())
+                .any(|path| !path.as_os_str().is_empty())
+            {
+                tracing::warn!(
+                    "compare reuses profiling output paths; later processes may overwrite reports"
+                );
+            }
             if sweep {
                 cmd_compare_sweep(
                     &models,

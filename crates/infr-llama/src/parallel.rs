@@ -314,7 +314,9 @@ impl ParallelSeam {
             )
             .and_then(|pool| slot0.attach_paged(&self.vk, self.model.config(), &pool));
             if let Err(e) = built {
-                tracing::warn!("kv.paged: could not page this session's KV ({e}); slots stay linear");
+                tracing::warn!(
+                    "kv.paged: could not page this session's KV ({e}); slots stay linear"
+                );
             }
         }
 

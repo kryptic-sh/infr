@@ -258,6 +258,45 @@ pub fn native_dense_supported(dtype: infr_core::DType) -> bool {
     native_dense_dtypes().contains(&dtype)
 }
 
+/// Dtypes whose dense `Op::Linear` weight can live in a dense layer-streaming arena slot (see
+/// [`crate::pager::DensePagerSession`]): every [`native_dense_supported`] format, plus F16 and
+/// F32. A streamed float weight runs the resident float dispatch with the slot's address in place
+/// of the resident buffer's: every float kernel takes its weight's base as a 64-bit address
+/// (`Recorder::linear_at`, `matmul_proj_at`, `linear_f32_at`, `matmul_native_splitk`,
+/// `matmul_fma_at`), so the same kernels read the same bytes, relocated.
+pub fn dense_stream_supported(dtype: infr_core::DType) -> bool {
+    native_dense_supported(dtype) || matches!(dtype, infr_core::DType::F16 | infr_core::DType::F32)
+}
+
+/// The byte alignment a dense-streaming slot of `dtype` must start on, on top of holding a whole
+/// number of quant blocks. The native kernels read u32 words, so 4 is enough for them. The float
+/// kernels are the resident ones, written against the resident arena's `BDA_WEIGHT_ALIGN`
+/// placement (`linear_f32r`'s vec4 build declares a 16-byte `buffer_reference_align`), so a float
+/// slot is aligned the way a resident float weight is.
+pub fn dense_stream_slot_align(dtype: infr_core::DType) -> usize {
+    match dtype {
+        infr_core::DType::F16 | infr_core::DType::F32 => crate::BDA_WEIGHT_ALIGN as usize,
+        _ => 4,
+    }
+}
+
+/// The slot stride a dense-streaming pool of `dtype` uses for a block of `raw_bytes`: rounded up
+/// to whole quant blocks AND to [`dense_stream_slot_align`], so every slot of an aligned arena
+/// starts block- and kernel-aligned. The seam's planner sizes its pools with it, and
+/// [`crate::pager::DensePagerSession::new`] refuses a pool whose stride it would change.
+pub fn dense_stream_slot_stride(dtype: infr_core::DType, raw_bytes: usize) -> usize {
+    let (_, block) = infr_gguf::block_layout(dtype);
+    let align = dense_stream_slot_align(dtype);
+    let gcd = {
+        let (mut x, mut y) = (block, align);
+        while y != 0 {
+            (x, y) = (y, x % y);
+        }
+        x
+    };
+    raw_bytes.next_multiple_of(block / gcd * align)
+}
+
 /// Pad raw GGUF block bytes to the next multiple of 4 for upload as `array<u32>`.
 /// Appends zero bytes; the final u32 word's padding bytes are never read (they
 /// contain only out-of-block data which the shader never accesses for valid g).
@@ -373,8 +412,8 @@ mod tests {
     const ALL_DTYPES: &[infr_core::DType] = {
         use infr_core::DType::*;
         &[
-            F32, F16, Bf16, I32, U32, I16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K,
-            Iq1S, Iq1M, Iq2Xxs, Iq2Xs, Iq2S, Iq3Xxs, Iq3S, Iq4Nl, Iq4Xs, Tq1_0, Tq2_0, Q2_0, Mxfp4,
+            F32, F16, Bf16, I32, U32, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2K, Q3K, Q4K, Q5K, Q6K, Iq1S,
+            Iq1M, Iq2Xxs, Iq2Xs, Iq2S, Iq3Xxs, Iq3S, Iq4Nl, Iq4Xs, Tq1_0, Tq2_0, Q2_0, Mxfp4,
             Nvfp4, I2S, Turbo2, Turbo3, Turbo4,
         ]
     };
@@ -391,13 +430,11 @@ mod tests {
                 // I2S (BitNet i2_s): host-converted to f16 in the runner's wload, so it never
                 // reaches the Vulkan backend as I2S — no native kernel (all *_kernel_name/spv gates
                 // return None), correctly excluded from native_dense_dtypes.
-                // I16 (EXL3 trellis words): decoded on the host by the trellis decoder, never
-                // uploaded as weights — same reasoning as I2S above.
-                | Iq4Xs | Tq1_0 | Tq2_0 | Q2_0 | Mxfp4 | Nvfp4 | I2S | I16 | Turbo2 | Turbo3 | Turbo4 => {}
+                | Iq4Xs | Tq1_0 | Tq2_0 | Q2_0 | Mxfp4 | Nvfp4 | I2S | Turbo2 | Turbo3 | Turbo4 => {}
             }
         }
         // Count sanity: the arm above and ALL_DTYPES must list the same number of variants.
-        assert_eq!(ALL_DTYPES.len(), 34);
+        assert_eq!(ALL_DTYPES.len(), 33);
     }
 
     /// AUDIT #1 drift guard: for EVERY `DType`, each `*_kernel_name` gate the recorder tests with
@@ -456,17 +493,22 @@ mod tests {
                 gemm::native_mmv_mrow_m16_spv(d).map(|(n, _)| n),
                 "native_mmv_mrow_m16 gate vs spv disagree for {d:?}"
             );
-            for o4 in [false, true] {
-                for m4 in [false, true] {
-                    for res in [false, true] {
-                        assert_eq!(
-                            gemm::native_mmv_mrow_variant_kernel_name(d, o4, m4, res),
-                            gemm::native_mmv_mrow_variant_spv(d, o4, m4, res).map(|(n, _)| n),
-                            "native_mmv_mrow_variant gate vs spv disagree {d:?} o4={o4} m4={m4} res={res}"
-                        );
-                    }
-                }
-            }
+            assert_eq!(
+                gemm::native_mrow_kernel_name(d),
+                gemm::native_mrow_spv(d).map(|(n, _)| n),
+                "native_mrow gate vs spv disagree for {d:?}"
+            );
+            assert_eq!(
+                gemm::native_gemm_fma_kernel_name(d),
+                gemm::native_gemm_fma_spv(d).map(|(n, _)| n),
+                "native_gemm_fma gate vs spv disagree for {d:?}"
+            );
+            // The non-coopmat mmq tier gates on `moe_mmq_ok` and loads this table.
+            assert_eq!(
+                infr_core::tensor::moe_mmq_ok(d),
+                gemm::native_gemm_mmq_dense_spv(d).is_some(),
+                "nc_mmq gate vs native_gemm_mmq_dense_spv availability disagree for {d:?}"
+            );
             for &warps in &[1u32, 2, 4, 8, 16] {
                 for res in [false, true] {
                     for sg16 in [false, true] {
@@ -482,29 +524,28 @@ mod tests {
     }
 
     /// AUDIT #2: Iq4Xs is mrow-eligible (`native_mmv_mrow_kernel_name` = Some) but has NO fused-
-    /// residual build — the res-legality predicate must report that, and the variant table must
-    /// agree, so `linear_mmv_mrow_at`'s residual assert catches an illegal residual Iq4Xs decode at
-    /// the boundary instead of panicking in the SPV `expect()`.
+    /// residual build — the variant lookup the decode gate and the recorder share must report
+    /// that, so a residual Iq4Xs decode is never routed onto the int8 mrow kernel.
     #[test]
     fn iq4xs_reports_no_mrow_residual() {
         use crate::gemm;
         use infr_core::DType::{Iq4Xs, Q4K};
+        let vk = infr_core::config::VulkanCfg::default();
+        let o4 =
+            crate::recorder::MmvO4::of(&crate::tuning::tests::fixture_tuning("rx7900xtx-amdwin"));
         assert!(
             gemm::native_mmv_mrow_kernel_name(Iq4Xs).is_some(),
             "Iq4Xs should still be plain-mrow eligible"
         );
-        assert!(
-            !gemm::native_mmv_mrow_res_supported(Iq4Xs),
-            "Iq4Xs has no _res mrow build — predicate must say so"
-        );
-        assert!(
-            gemm::native_mmv_mrow_variant_spv(Iq4Xs, false, true, true).is_none(),
-            "Iq4Xs _res variant must not exist"
-        );
-        // A dtype that DOES have the residual build reports true, so the predicate isn't vacuously
-        // false for everyone.
-        assert!(gemm::native_mmv_mrow_res_supported(Q4K));
-        assert!(gemm::native_mmv_mrow_variant_spv(Q4K, false, true, true).is_some());
+        for in_f in [1024, 4096] {
+            assert!(
+                crate::recorder::mmv_mrow_variant(&vk, Iq4Xs, 1, in_f, true, o4).is_none(),
+                "Iq4Xs has no _res mrow build — the lookup must say so (in_f={in_f})"
+            );
+            // A dtype that DOES have the residual build reports it, so the lookup isn't vacuously
+            // empty for everyone.
+            assert!(crate::recorder::mmv_mrow_variant(&vk, Q4K, 1, in_f, true, o4).is_some());
+        }
     }
 
     #[test]

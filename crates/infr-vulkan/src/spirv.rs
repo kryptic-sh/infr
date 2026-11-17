@@ -30,6 +30,8 @@ const OP_TYPE_FLOAT: u32 = 22;
 const CAPABILITY_ROUNDING_MODE_RTE: u32 = 4467;
 /// `ExecutionMode RoundingModeRTE`, whose one literal is the float width it applies to.
 const EXECUTION_MODE_ROUNDING_MODE_RTE: u32 = 4462;
+/// `ExecutionMode LocalSize`, whose three literals are the workgroup's x, y and z extents.
+const EXECUTION_MODE_LOCAL_SIZE: u32 = 17;
 const F16_WIDTH: u32 = 16;
 
 /// One instruction's first word: word count in the high half, opcode in the low.
@@ -97,6 +99,33 @@ pub(crate) fn with_rte_f16(spv: &[u32]) -> Option<Vec<u32>> {
     Some(out)
 }
 
+/// The workgroup size `spv` declares with a literal `LocalSize` execution mode, or `None` when it
+/// declares none (a size set through specialization constants, which no shader here uses) or is
+/// not well-formed enough to read.
+pub(crate) fn local_size(spv: &[u32]) -> Option<[u32; 3]> {
+    if spv.len() < HEADER_WORDS || spv[0] != MAGIC {
+        return None;
+    }
+    let mut at = HEADER_WORDS;
+    while at < spv.len() {
+        let word_count = (spv[at] >> 16) as usize;
+        if word_count == 0 || at + word_count > spv.len() {
+            return None;
+        }
+        // Operands: entry-point <id>, mode, then the mode's literals.
+        if let [OP_EXECUTION_MODE_WORD, _, EXECUTION_MODE_LOCAL_SIZE, x, y, z] =
+            spv[at..at + word_count]
+        {
+            return Some([x, y, z]);
+        }
+        at += word_count;
+    }
+    None
+}
+
+/// The first word of a `LocalSize` instruction: six words, `OpExecutionMode`.
+const OP_EXECUTION_MODE_WORD: u32 = inst_word(6, OP_EXECUTION_MODE);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +192,42 @@ mod tests {
         let mut not_spirv = module(0x0001_0600, 16);
         not_spirv[0] = 0;
         assert_eq!(with_rte_f16(&not_spirv), None, "bad magic");
+    }
+
+    #[test]
+    fn reads_the_local_size() {
+        assert_eq!(local_size(&module(0x0001_0600, 16)), Some([64, 1, 1]));
+        let mut truncated = module(0x0001_0600, 16);
+        truncated.truncate(20);
+        assert_eq!(local_size(&truncated), None, "LocalSize runs past the end");
+    }
+
+    /// Every shader this crate builds declares its workgroup size as a literal `LocalSize`, so the
+    /// device-limit check in `ops::try_make_compute_kernel` sees every kernel rather than skipping
+    /// the ones it cannot read.
+    #[test]
+    fn every_built_shader_declares_a_readable_local_size() {
+        let (mut n, mut widest) = (0, 0);
+        for entry in std::fs::read_dir(env!("OUT_DIR")).expect("OUT_DIR") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "spv") {
+                continue;
+            }
+            let words = crate::gemm::spv_words(&std::fs::read(&path).expect("read spv"));
+            let local = local_size(&words)
+                .unwrap_or_else(|| panic!("{} declares no readable LocalSize", path.display()));
+            widest = widest.max(local.iter().product::<u32>());
+            n += 1;
+        }
+        assert!(
+            n > 0,
+            "no .spv files in OUT_DIR — the check ran over nothing"
+        );
+        assert_eq!(
+            local_size(crate::gemm::rmsnorm_wide_spv()),
+            Some([widest, 1, 1]),
+            "rmsnorm's -DWIDE build is the widest workgroup here"
+        );
     }
 
     /// A real shader from this crate's build, not just the hand-written module above: the patch

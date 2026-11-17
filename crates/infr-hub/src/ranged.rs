@@ -97,10 +97,37 @@ pub(crate) fn probe(obj: &Object) -> Result<Option<Probe>> {
         debug!("{label}: no length advertised; not splitting");
         return Ok(None);
     };
+    check_total(label, total, obj.size)?;
     Ok(Some(Probe {
         total,
         validator: validator_of(resp.headers()),
     }))
+}
+
+/// Largest object a ranged download will plan — orders of magnitude above the largest single file
+/// this repo has pulled (161 GB), and small enough that its plan is a modest table.
+///
+/// The total comes from a server's `Content-Length` and sizes the plan's per-cell table up front,
+/// so an unchecked one near `u64::MAX` is an allocation that aborts the process before a byte is
+/// fetched.
+const MAX_OBJECT_BYTES: u64 = 1 << 44;
+
+/// Refuse a probed size the plan must not be built from: past [`MAX_OBJECT_BYTES`], or different
+/// from the LFS size (`lfs_size`) the hub's own `HEAD` reported for the same object.
+fn check_total(label: &str, total: u64, lfs_size: Option<u64>) -> Result<()> {
+    if total > MAX_OBJECT_BYTES {
+        return Err(Error::Other(format!(
+            "{label}: the server reports {total} bytes, more than the {MAX_OBJECT_BYTES}-byte \
+             limit for one file; refusing to download it"
+        )));
+    }
+    match lfs_size {
+        Some(size) if size != total => Err(Error::Other(format!(
+            "{label}: the server reports {total} bytes but the hub's LFS size is {size}; \
+             refusing to download it"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// The `If-Range` validator a response offers: the `ETag` if present, else `Last-Modified`.
@@ -176,6 +203,11 @@ pub(crate) fn run(
         .write(true)
         .open(tmp)
         .map_err(|e| RangedError::Fatal(Error::from(e)))?;
+    // The workers write chunks in whatever order they finish. Not fatal when refused: the chunks
+    // still land, a late one first just waits for the filesystem to fill the gap below it.
+    if let Err(e) = infr_plat::fileio::allow_out_of_order_writes(&file) {
+        debug!("{label}: could not prepare the partial for out-of-order writes: {e}");
+    }
     parts::save(tmp, &plan).map_err(RangedError::Fatal)?;
 
     pb.set_position(plan.completed_bytes());
@@ -279,15 +311,18 @@ fn reconcile(
         (Some(had), Some(now)) if !had.eq_ignore_ascii_case(now) => {
             return Err(format!("the LFS sha256 changed ({had} → {now})"));
         }
-        // No oid on either side to compare: fall back to the opaque validator, which is weaker (an
-        // edge that reports a different one costs a restart) but is all a non-LFS object has.
-        (None, None) => match (plan.validator.as_deref(), probe.validator.as_deref()) {
+        (Some(_), Some(_)) => {}
+        // No oid on one side or both, so the oids cannot be compared: fall back to the opaque
+        // validator, which is weaker (an edge that reports a different one costs a restart) but is
+        // all there is. Skipping it when only ONE side lacks an oid — a partial planned while the
+        // HEAD worked, resumed in a run where it reports none — left the resume with no identity
+        // check, and that run's missing oid means no sha256 gate at the end either.
+        _ => match (plan.validator.as_deref(), probe.validator.as_deref()) {
             (Some(had), Some(now)) if had != now => {
                 return Err(format!("the validator changed ({had} → {now})"));
             }
             _ => {}
         },
-        _ => {}
     }
     if plan.oid.is_none() {
         plan.oid = expected_sha.map(str::to_string);
@@ -602,6 +637,42 @@ mod tests {
         }
     }
 
+    /// A server's `Content-Length` sizes the plan's table before a byte is fetched, so an absurd
+    /// one — or one that disagrees with the hub's LFS size for the same object — is an error, not
+    /// an allocation that aborts the process.
+    #[test]
+    fn an_absurd_or_mismatched_length_is_refused() {
+        use crate::testhttp::TestHub;
+        let hub = TestHub::start();
+        let name = hub.add_shards("m-huge", 1, 4096).remove(0);
+        let url = format!("{}/org/repo/resolve/main/{name}", hub.origin());
+        let object = |size| Object {
+            url: &url,
+            label: &name,
+            oid: None,
+            size,
+        };
+
+        let honest = probe(&object(Some(4096)))
+            .unwrap()
+            .expect("ranges advertised");
+        assert_eq!(honest.total, 4096);
+
+        hub.lie_about_length(&name, u64::MAX);
+        let err = probe(&object(None))
+            .err()
+            .expect("u64::MAX must be refused");
+        assert!(err.to_string().contains("refusing"), "{err}");
+
+        hub.lie_about_length(&name, 8192);
+        let err = probe(&object(Some(4096)))
+            .err()
+            .expect("a size mismatch must be refused");
+        assert!(err.to_string().contains("LFS size"), "{err}");
+        // Without an LFS size to compare against, a plausible length is still accepted.
+        assert_eq!(probe(&object(None)).unwrap().unwrap().total, 8192);
+    }
+
     fn probe_of(total: u64, validator: &str) -> Probe {
         Probe {
             total,
@@ -650,6 +721,23 @@ mod tests {
             Some("\"v2\""),
             "validator refreshed"
         );
+    }
+
+    /// An oid on only one side cannot be compared, so the validator decides there too. A partial
+    /// planned with an oid and resumed in a run that has none would otherwise continue with no
+    /// identity check at all, and that run has no digest left to verify the blob against.
+    #[test]
+    fn the_validator_decides_when_one_side_has_no_oid() {
+        let sha = "e".repeat(64);
+        let hashed = Plan::fresh(1000, 100, Some(sha.clone()), Some("\"v1\"".into()));
+        let err = reconcile(Some(hashed), &probe_of(1000, "\"v2\""), None)
+            .expect_err("a changed validator must not resume when this run has no oid");
+        assert!(err.contains("validator changed"), "{err}");
+
+        let unhashed = Plan::fresh(1000, 100, None, Some("\"v1\"".into()));
+        let err = reconcile(Some(unhashed), &probe_of(1000, "\"v2\""), Some(&sha))
+            .expect_err("a changed validator must not resume a partial planned without an oid");
+        assert!(err.contains("validator changed"), "{err}");
     }
 
     /// A fresh plan takes its whole shape from the probe.

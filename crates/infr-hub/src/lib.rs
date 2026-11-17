@@ -7,7 +7,6 @@
 
 mod download;
 mod http;
-mod manage;
 mod model_ref;
 mod parts;
 mod pull;
@@ -16,7 +15,6 @@ mod store;
 #[cfg(test)]
 mod testhttp;
 
-pub use manage::{CachedModel, Removed};
 pub use model_ref::ModelRef;
 pub use pull::{pull, pull_latest};
 pub use store::Store;

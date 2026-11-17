@@ -232,20 +232,59 @@ unsafe fn vec_dot_q4k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     sumf
 }
 
-/// AVX-512BW kernel for `vec_dot_q4k`: processes TWO sub-blocks per iteration (64 elements) with
-/// 512-bit SIMD. For each pair (s=2k even, s=2k+1 odd), the 32-byte nibble chunk is unpacked into
-/// a zmm (low nibbles in lower 256 bits, high nibbles in upper 256 bits) and multiplied against the
-/// corresponding 64 contiguous Q8 bytes. The zmm result is split back to two ymm sums, giving both
-/// `iprod_even` and `iprod_odd` in one pass — half the memory traffic of the avx2 path.
+/// All eight 6-bit `(scale, min)` pairs of a Q4_K/Q5_K super-block's 12 scale bytes at once, as
+/// little-endian byte lanes: byte `s` of the first word is `k4(s, scales).0`, of the second
+/// `k4(s, scales).1`. llama.cpp's `utmp`/`kmask` unpacking, word-wide instead of a field per
+/// call.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn k4_all(scales: &[u8]) -> (u64, u64) {
+    const KMASK1: u32 = 0x3f3f_3f3f;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    const KMASK3: u32 = 0x0303_0303;
+    let w = |i: usize| u32::from_le_bytes(scales[4 * i..4 * i + 4].try_into().unwrap());
+    let (u0, u1, u2) = (w(0), w(1), w(2));
+    let sc_lo = u0 & KMASK1;
+    let sc_hi = (u2 & KMASK2) | (((u0 >> 6) & KMASK3) << 4);
+    let m_lo = u1 & KMASK1;
+    let m_hi = ((u2 >> 4) & KMASK2) | (((u1 >> 6) & KMASK3) << 4);
+    (
+        sc_lo as u64 | (sc_hi as u64) << 32,
+        m_lo as u64 | (m_hi as u64) << 32,
+    )
+}
+
+/// AVX-512BW kernel for `vec_dot_q4k`: two sub-blocks per step, with the scales folded into the
+/// widening multiply so a super-block costs one horizontal sum instead of one per sub-block.
+///
+/// Per step the 32-byte nibble chunk serving sub-blocks `2k` (low nibbles) and `2k + 1` (high)
+/// becomes one zmm against the 64 contiguous Q8 bytes; `maddubs` gives i16 pair sums (at most
+/// `2·15·127`), and `madd` against the sub-blocks' scales broadcast per half (at most 63) widens
+/// them to i32 already scaled. So the accumulator holds `Σ sc·iprod` lane-split, and one
+/// `reduce_add` per super-block gives `sd` — integers, exact in any order, so the f32 expression
+/// and with it the result are the scalar kernel's bit for bit. Decode streams every weight row
+/// through this once per token, which is why the per-sub-block horizontal sums this replaced
+/// mattered (measured in the CHANGELOG).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     use std::arch::x86_64::*;
     let nb = in_f / 256;
+    assert!(
+        row.len() >= nb * 144,
+        "vec_dot_q4k: row shorter than {nb} blocks"
+    );
+    assert!(q8.qs.len() >= nb * 256 && q8.bsums.len() >= nb * 8 && q8.d.len() >= nb);
     let mut sumf = 0f32;
     let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
-    let ones512 = _mm512_set1_epi16(1i16);
+    // i16 lanes 0..16 pick scale 2k, lanes 16..32 scale 2k + 1: the zmm halves' sub-blocks.
+    let pick: [__m512i; 4] = std::array::from_fn(|k| {
+        _mm512_inserti64x4::<1>(
+            _mm512_castsi256_si512(_mm256_set1_epi16(2 * k as i16)),
+            _mm256_set1_epi16(2 * k as i16 + 1),
+        )
+    });
     for b in 0..nb {
         let blk = &row[b * 144..b * 144 + 144];
         let d = rdf16(&blk[0..2]);
@@ -253,33 +292,23 @@ unsafe fn vec_dot_q4k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let scales = &blk[4..16];
         let qs = &blk[16..144];
         let q8b = &q8.qs[b * 256..b * 256 + 256];
-        let (mut sd, mut sm) = (0i32, 0i32);
-        // k=0..4 covers sub-block pairs (0,1), (2,3), (4,5), (6,7).
-        for k in 0..4usize {
-            let (sc_e, m_e) = k4(2 * k, scales);
-            let (sc_o, m_o) = k4(2 * k + 1, scales);
-            // Load 32 nibble bytes serving both sub-blocks 2k (low) and 2k+1 (high).
+        let (sc8, m8) = k4_all(scales);
+        let sc_v = _mm512_castsi128_si512(_mm_cvtepu8_epi16(_mm_cvtsi64_si128(sc8 as i64)));
+        let sm = hadd_i32_ymm(_mm256_mullo_epi32(
+            _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(m8 as i64)),
+            load256(&q8.bsums, b * 8),
+        ));
+        let mut acc = _mm512_setzero_si512();
+        for (k, pick_k) in pick.iter().enumerate() {
             let nibbles = load256(qs, k * 32);
-            let lo_nib = _mm256_and_si256(nibbles, mask_lo); // sub-block 2k  (u8, 0–15)
-            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo); // sub-block 2k+1
-                                                                                   // Pack into zmm: lower 256 = lo_nib (for 2k), upper 256 = hi_nib (for 2k+1).
+            let lo_nib = _mm256_and_si256(nibbles, mask_lo);
+            let hi_nib = _mm256_and_si256(_mm256_srli_epi16(nibbles, 4), mask_lo);
             let q4_zmm = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(lo_nib), hi_nib);
-            // Load 64 Q8 bytes: [2k*32..(2k+1)*32] in lower, [(2k+1)*32..(2k+2)*32] in upper.
-            let q8_zmm = load512(q8b, k * 64);
-            // maddubs 512-bit: u8(q4)×i8(q8) → 32×i16 pair-sums.
-            let prod = _mm512_maddubs_epi16(q4_zmm, q8_zmm);
-            // madd with 1: widen 32×i16 → 16×i32.
-            let sum32 = _mm512_madd_epi16(prod, ones512);
-            // Lower 256 = 8×i32 for sub-block 2k; upper 256 = 8×i32 for sub-block 2k+1.
-            let lo_ymm = _mm512_castsi512_si256(sum32);
-            let hi_ymm = _mm512_extracti64x4_epi64::<1>(sum32);
-            let iprod_e = hadd_i32_ymm(lo_ymm);
-            let iprod_o = hadd_i32_ymm(hi_ymm);
-            let isum_e = q8.bsums[b * 8 + 2 * k];
-            let isum_o = q8.bsums[b * 8 + 2 * k + 1];
-            sd += sc_e as i32 * iprod_e + sc_o as i32 * iprod_o;
-            sm += m_e as i32 * isum_e + m_o as i32 * isum_o;
+            let prod = _mm512_maddubs_epi16(q4_zmm, load512(q8b, k * 64));
+            let scale = _mm512_permutexvar_epi16(*pick_k, sc_v);
+            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(prod, scale));
         }
+        let sd = _mm512_reduce_add_epi32(acc);
         sumf += q8.d[b] * (d * sd as f32 - dmin * sm as f32);
     }
     sumf
@@ -644,8 +673,9 @@ unsafe fn vec_dot_q6k_avx2(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
 /// using zmm registers (512-bit). The two ql half-lo slices are packed into one zmm via
 /// `_mm512_inserti64x4`; qh loads as a single 64-byte zmm (the two halves are contiguous). For
 /// each of the 4 q6 columns, both halves' q8 are also packed into one zmm, so a single
-/// `maddubs512 → madd512` covers 64 elements at once. Results are split back to two ymm
-/// (h0/h1) then two xmm per ymm (per-sub-block) for the scalar scale accumulation.
+/// `maddubs512 → madd512` covers 64 elements at once, the `madd` against the sub-blocks' scales
+/// (see the loop), so one horizontal sum per super-block replaces the sixteen per-sub-block ones
+/// this used to take. Bit-identical to the scalar kernel.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bw")]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -654,11 +684,22 @@ unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     let nb = in_f / 256;
     let mut sumf = 0f32;
 
+    assert!(
+        row.len() >= nb * 210,
+        "vec_dot_q6k: row shorter than {nb} blocks"
+    );
+    assert!(q8.qs.len() >= nb * 256 && q8.bsums16.len() >= nb * 16 && q8.d.len() >= nb);
     let mask_0f_z = _mm512_set1_epi8(0x0F_u8 as i8);
     let mask_30_z = _mm512_set1_epi8(0x30_u8 as i8);
     let mask_03_z = _mm512_set1_epi8(0x03_u8 as i8);
-    let ones_u8_z = _mm512_set1_epi8(1i8);
-    let ones_i16_z = _mm512_set1_epi16(1i16);
+    // i16 lane groups of eight for column `ci`: scales 2ci, 2ci + 1, 8 + 2ci, 9 + 2ci.
+    let pick: [__m512i; 4] = std::array::from_fn(|ci| {
+        let lanes: [i16; 32] = std::array::from_fn(|l| {
+            let sub = 2 * ci + (l / 8) % 2 + 8 * (l / 16);
+            sub as i16
+        });
+        _mm512_loadu_si512(lanes.as_ptr() as *const __m512i)
+    });
 
     for b in 0..nb {
         let blk = &row[b * 210..b * 210 + 210];
@@ -702,55 +743,28 @@ unsafe fn vec_dot_q6k_avx512bw(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
             _mm512_and_si512(_mm512_srli_epi16(qh_z, 2), mask_30_z),
         );
 
-        // Collect per-sub-block i32 values in arrays; accumulate in 0..16 order (scalar-identical).
-        let mut simd_sumi = [0i32; 16];
-        let mut simd_bsum = [0i32; 16];
-
+        // The scales ride the widening multiply: after `maddubs` (pair sums, at most
+        // `2·63·127`) the i16 lanes of column `ci` cover sub-blocks `2ci`, `2ci + 1` (h0) and
+        // `8 + 2ci`, `9 + 2ci` (h1), eight lanes each, and `madd` against those scales leaves
+        // `Σ sc·sumi` lane-split in i32. The `−32·bsum` offset is `Σ sc·bsums16`, taken once per
+        // super-block from the activation's precomputed sums. Integers throughout, exact in any
+        // order, so `isum` and the f32 line below are the scalar kernel's bit for bit.
+        let sc16 = _mm512_castsi256_si512(_mm256_cvtepi8_epi16(load128(scales, 0)));
+        let mut acc = _mm512_setzero_si512();
         for (ci, q6_col_z) in [q6_c0_z, q6_c2_z, q6_c4_z, q6_c6_z].iter().enumerate() {
             // q8 for h0 column ci: q8b[ci*32..ci*32+32]; h1: q8b[128+ci*32..128+ci*32+32].
             let q8_h0 = load256(q8b, ci * 32);
             let q8_h1 = load256(q8b, 128 + ci * 32);
             let q8_z = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(q8_h0), q8_h1);
-
-            // 512-bit dot: maddubs → madd.
             let prod = _mm512_maddubs_epi16(*q6_col_z, q8_z);
-            let sum32_z = _mm512_madd_epi16(prod, ones_i16_z);
-
-            let bsum_i16_z = _mm512_maddubs_epi16(ones_u8_z, q8_z);
-            let bsum_i32_z = _mm512_madd_epi16(bsum_i16_z, ones_i16_z);
-
-            // Lower ymm = h0 (sub-blocks ci*2, ci*2+1); upper ymm = h1 (sub-blocks 8+ci*2, 8+ci*2+1).
-            let sum_h0 = _mm512_castsi512_si256(sum32_z);
-            let sum_h1 = _mm512_extracti64x4_epi64::<1>(sum32_z);
-            let bsum_h0 = _mm512_castsi512_si256(bsum_i32_z);
-            let bsum_h1 = _mm512_extracti64x4_epi64::<1>(bsum_i32_z);
-
-            // Each ymm: lower xmm = first 16 elements (is=0), upper xmm = elements 16..31 (is=1).
-            let s_h0_lo = _mm256_castsi256_si128(sum_h0);
-            let s_h0_hi = _mm256_extracti128_si256::<1>(sum_h0);
-            let s_h1_lo = _mm256_castsi256_si128(sum_h1);
-            let s_h1_hi = _mm256_extracti128_si256::<1>(sum_h1);
-            let b_h0_lo = _mm256_castsi256_si128(bsum_h0);
-            let b_h0_hi = _mm256_extracti128_si256::<1>(bsum_h0);
-            let b_h1_lo = _mm256_castsi256_si128(bsum_h1);
-            let b_h1_hi = _mm256_extracti128_si256::<1>(bsum_h1);
-
-            simd_sumi[ci * 2] = hadd_i32_xmm(s_h0_lo);
-            simd_sumi[ci * 2 + 1] = hadd_i32_xmm(s_h0_hi);
-            simd_sumi[8 + ci * 2] = hadd_i32_xmm(s_h1_lo);
-            simd_sumi[8 + ci * 2 + 1] = hadd_i32_xmm(s_h1_hi);
-
-            simd_bsum[ci * 2] = hadd_i32_xmm(b_h0_lo);
-            simd_bsum[ci * 2 + 1] = hadd_i32_xmm(b_h0_hi);
-            simd_bsum[8 + ci * 2] = hadd_i32_xmm(b_h1_lo);
-            simd_bsum[8 + ci * 2 + 1] = hadd_i32_xmm(b_h1_hi);
+            let scale = _mm512_permutexvar_epi16(pick[ci], sc16);
+            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(prod, scale));
         }
-
-        // Integer epilogue — see `vec_dot_q6k_scalar` (i32 sum is order-free and exact).
-        let mut s = 0i32;
-        for sub in 0..16 {
-            s += scales[sub] as i8 as i32 * (simd_sumi[sub] - 32 * simd_bsum[sub]);
-        }
+        let corr = _mm512_reduce_add_epi32(_mm512_mullo_epi32(
+            _mm512_cvtepi8_epi32(load128(scales, 0)),
+            load512(&q8.bsums16, b * 16),
+        ));
+        let s = _mm512_reduce_add_epi32(acc) - 32 * corr;
         sumf += d * q8.d[b] * s as f32;
     }
     sumf
@@ -2129,191 +2143,12 @@ unsafe fn vec_dot_q4k_batch8_avx512bw(
     }
 }
 
-/// Interleaved-x8 Q4_K GEMM tile (AVX512-VNNI) — the ggml `block_q4_Kx8` idea applied per call:
-/// the 8 weight rows' expanded nibbles are INTERLEAVED per (super-block, sub-block, 8-byte group)
-/// so one contiguous zmm load carries the SAME 8 activation positions of ALL 8 rows (qword lane i
-/// = row i), and the activation qword is broadcast once. Per sub-block that's 4 dpbusd + ONE
-/// hadd + ONE mullo for all 8 rows — vs the flat batch8's 8 dpbusd + 16 mullo + per-row hadds —
-/// and every weight byte the inner loop touches is sequential.
-///
-/// `_mm256_hadd_epi32(lo, hi)` yields per-row sums in the fixed permutation [0,1,4,5,2,3,6,7]
-/// (its 128-bit-lane semantics); scales are pre-permuted to match and lanes un-permute only at
-/// the per-super-block extraction. Bit-identical to the scalar single-row kernel: the integer
-/// sums are exact regardless of association, and the per-(row, super-block) f32 expression and
-/// its accumulation order are unchanged.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512bw,avx512vnni")]
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-unsafe fn vec_dot_q4k_batch8_ilv_vnni(
-    rows: [&[u8]; 8],
-    q8s: &[Q8],
-    in_f: usize,
-    outs: [&mut [f32]; 8],
-) {
-    use std::arch::x86_64::*;
-    let m = q8s.len();
-    let nb = in_f / 256;
-    let mask_lo = _mm256_set1_epi8(0x0F_u8 as i8);
-    // hadd_epi32(lo, hi) sum-position j holds row PERM[j].
-    const PERM: [usize; 8] = [0, 1, 4, 5, 2, 3, 6, 7];
-
-    // ── repack: expand nibbles per row (as the flat kernels do), then interleave ──
-    // ilv[b*2048 + s*256 + g*64 + i*8 .. +8] = row i, sub-block s, byte group g (8 B).
-    let mut d_arr: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0f32; nb]);
-    let mut dmin_arr: [Vec<f32>; 8] = std::array::from_fn(|_| vec![0f32; nb]);
-    let mut m_arr: [Vec<[u32; 8]>; 8] = std::array::from_fn(|_| vec![[0u32; 8]; nb]);
-    // per-(b, s) PAIR-DUPLICATED scale vector in dpbusd lane order (lanes 2i, 2i+1 = row i) —
-    // consumed by the vertical 512-bit mullo; see q4k_gemm_group's sc16.
-    let mut sc16_vec = vec![[_mm512_setzero_si512(); 8]; nb];
-    // PERM-ordered per-(b,s) m-scales and per-b f32 d/dmin vectors: lets the sm accumulation and
-    // the final `q8.d*(d*sd - dmin*sm)` run 8-rows-wide in lane space (un-permuted only at the
-    // very end). No FMA anywhere — each mul/sub/add rounds separately, matching the scalar order.
-    let mut m_vec = vec![[_mm256_setzero_si256(); 8]; nb];
-    let mut d_vec = vec![_mm256_setzero_ps(); nb];
-    let mut dmin_vec = vec![_mm256_setzero_ps(); nb];
-    let mut ilv = vec![0u8; nb * 2048];
-    {
-        let mut sc_rows = [[0u32; 8]; 8]; // [row][s]
-        let mut tmp = [[0u8; 256]; 8]; // expanded nibbles, one superblock, all 8 rows
-        for b in 0..nb {
-            for i in 0..8 {
-                let blk = &rows[i][b * 144..b * 144 + 144];
-                d_arr[i][b] = rdf16(&blk[0..2]);
-                dmin_arr[i][b] = rdf16(&blk[2..4]);
-                let scales = &blk[4..16];
-                let qs = &blk[16..144];
-                for s in 0..8usize {
-                    let (sc, mv) = k4(s, scales);
-                    sc_rows[i][s] = sc;
-                    m_arr[i][b][s] = mv;
-                }
-                for k in 0..4usize {
-                    let nibs = load256(qs, k * 32);
-                    let lo = _mm256_and_si256(nibs, mask_lo);
-                    let hi = _mm256_and_si256(_mm256_srli_epi16(nibs, 4), mask_lo);
-                    _mm256_storeu_si256(tmp[i][k * 64..].as_mut_ptr() as *mut __m256i, lo);
-                    _mm256_storeu_si256(tmp[i][k * 64 + 32..].as_mut_ptr() as *mut __m256i, hi);
-                }
-            }
-            d_vec[b] = _mm256_setr_ps(
-                d_arr[PERM[0]][b],
-                d_arr[PERM[1]][b],
-                d_arr[PERM[2]][b],
-                d_arr[PERM[3]][b],
-                d_arr[PERM[4]][b],
-                d_arr[PERM[5]][b],
-                d_arr[PERM[6]][b],
-                d_arr[PERM[7]][b],
-            );
-            dmin_vec[b] = _mm256_setr_ps(
-                dmin_arr[PERM[0]][b],
-                dmin_arr[PERM[1]][b],
-                dmin_arr[PERM[2]][b],
-                dmin_arr[PERM[3]][b],
-                dmin_arr[PERM[4]][b],
-                dmin_arr[PERM[5]][b],
-                dmin_arr[PERM[6]][b],
-                dmin_arr[PERM[7]][b],
-            );
-            for s in 0..8usize {
-                sc16_vec[b][s] = _mm512_setr_epi32(
-                    sc_rows[0][s] as i32,
-                    sc_rows[0][s] as i32,
-                    sc_rows[1][s] as i32,
-                    sc_rows[1][s] as i32,
-                    sc_rows[2][s] as i32,
-                    sc_rows[2][s] as i32,
-                    sc_rows[3][s] as i32,
-                    sc_rows[3][s] as i32,
-                    sc_rows[4][s] as i32,
-                    sc_rows[4][s] as i32,
-                    sc_rows[5][s] as i32,
-                    sc_rows[5][s] as i32,
-                    sc_rows[6][s] as i32,
-                    sc_rows[6][s] as i32,
-                    sc_rows[7][s] as i32,
-                    sc_rows[7][s] as i32,
-                );
-                m_vec[b][s] = _mm256_setr_epi32(
-                    m_arr[PERM[0]][b][s] as i32,
-                    m_arr[PERM[1]][b][s] as i32,
-                    m_arr[PERM[2]][b][s] as i32,
-                    m_arr[PERM[3]][b][s] as i32,
-                    m_arr[PERM[4]][b][s] as i32,
-                    m_arr[PERM[5]][b][s] as i32,
-                    m_arr[PERM[6]][b][s] as i32,
-                    m_arr[PERM[7]][b][s] as i32,
-                );
-                for g in 0..4usize {
-                    let dst =
-                        &mut ilv[b * 2048 + s * 256 + g * 64..b * 2048 + s * 256 + g * 64 + 64];
-                    for i in 0..8 {
-                        dst[i * 8..i * 8 + 8]
-                            .copy_from_slice(&tmp[i][s * 32 + g * 8..s * 32 + g * 8 + 8]);
-                    }
-                }
-            }
-        }
-    }
-
-    let [o0, o1, o2, o3, o4, o5, o6, o7] = outs;
-    for r in 0..m {
-        let q8 = &q8s[r];
-        // Whole-row f32 accumulator, 8 rows wide in PERM lane order — un-permuted only at the
-        // final store. Every f32 op below is a separate mul/sub/add (NO fma): identical rounding
-        // sequence to the scalar per-row expression.
-        let mut sumf_v = _mm256_setzero_ps();
-        for b in 0..nb {
-            // sd/sm per row: sd vertical in 512-bit pair-lane space, sm in PERM lane order.
-            let mut sd_zmm = _mm512_setzero_si512();
-            let mut sm_ymm = _mm256_setzero_si256();
-            let q8b = &q8.qs[b * 256..b * 256 + 256];
-            for s in 0..8usize {
-                let mut acc = _mm512_setzero_si512();
-                for g in 0..4usize {
-                    let w = load512(&ilv, b * 2048 + s * 256 + g * 64);
-                    // q8b is &[i8]; read the 8 activation bytes as one little-endian qword.
-                    let a = _mm512_set1_epi64(
-                        (q8b[s * 32 + g * 8..].as_ptr() as *const i64).read_unaligned(),
-                    );
-                    acc = _mm512_dpbusd_epi32(acc, w, a);
-                }
-                // Vertical: scale pair lanes in 512-bit space; pair-merge deferred to once per
-                // super-block (integer-exact — see q4k_gemm_group's note).
-                sd_zmm = _mm512_add_epi32(sd_zmm, _mm512_mullo_epi32(acc, sc16_vec[b][s]));
-                let isum = _mm256_set1_epi32(q8.bsums[b * 8 + s]);
-                sm_ymm = _mm256_add_epi32(sm_ymm, _mm256_mullo_epi32(m_vec[b][s], isum));
-            }
-            let sd_lo = _mm512_castsi512_si256(sd_zmm);
-            let sd_hi = _mm512_extracti64x4_epi64::<1>(sd_zmm);
-            let sd_ymm = _mm256_hadd_epi32(sd_lo, sd_hi); // pair-merge -> PERM order
-                                                          // q8.d[b] * (d*sd - dmin*sm), 8 rows at once (cvtepi32→f32 is exact for these
-                                                          // magnitudes; mul/sub/mul/add sequence matches the scalar expression's rounding).
-            let sd_f = _mm256_cvtepi32_ps(sd_ymm);
-            let sm_f = _mm256_cvtepi32_ps(sm_ymm);
-            let t = _mm256_sub_ps(
-                _mm256_mul_ps(d_vec[b], sd_f),
-                _mm256_mul_ps(dmin_vec[b], sm_f),
-            );
-            sumf_v = _mm256_add_ps(sumf_v, _mm256_mul_ps(_mm256_set1_ps(q8.d[b]), t));
-        }
-        let mut lanes = [0f32; 8];
-        _mm256_storeu_ps(lanes.as_mut_ptr(), sumf_v);
-        o0[r] = lanes[0];
-        o1[r] = lanes[1];
-        o4[r] = lanes[2];
-        o5[r] = lanes[3];
-        o2[r] = lanes[4];
-        o3[r] = lanes[5];
-        o6[r] = lanes[6];
-        o7[r] = lanes[7];
-    }
-}
-
 /// Batch Q4_K 8-row tile: `outs[i][r] = vec_dot_q4k(rows[i], &q8s[r], in_f)` for all i,r.
-/// Bit-identical to the single-token kernel. On AVX-512BW machines the Q8 activation is
-/// loaded once per (block, nibble-pair) and dotted against all 8 weight rows — 8× activation
-/// reuse over single-row, 4× over 2-row. Falls back to 8× `vec_dot_q4k_batch` on older CPUs.
+/// Bit-identical to the single-token kernel. This is the 8-row path for CPUs without AVX-512
+/// VNNI; with it, every caller takes the packed GEMM (`repack::q4k_pack_and_gemm_group`). On
+/// AVX-512BW machines the Q8 activation is loaded once per (block, nibble-pair) and dotted
+/// against all 8 weight rows — 8× activation reuse over single-row, 4× over 2-row. Falls back to
+/// 8× `vec_dot_q4k_batch` on older CPUs.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs: [&mut [f32]; 8]) {
     debug_assert_eq!(
@@ -2323,9 +2158,6 @@ pub(crate) fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
-            return unsafe { vec_dot_q4k_batch8_ilv_vnni(rows, q8s, in_f, outs) };
-        }
         if is_x86_feature_detected!("avx512bw") {
             return unsafe { vec_dot_q4k_batch8_avx512bw(rows, q8s, in_f, outs) };
         }
@@ -5109,7 +4941,8 @@ pub(crate) fn vec_dot_q5_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
 }
 
 /// Interleaved-x8 tile over native 32-element blocks (AVX512-VNNI) for the MoE `down`
-/// projections — the [`vec_dot_q4k_batch8_ilv_vnni`] structure at Q8_0/Q5_0's own block size.
+/// projections — the interleaved Q4_K pack's structure (`repack::Q4kPackGroup`) at Q8_0/Q5_0's
+/// own block size.
 /// Weights become UNSIGNED for dpbusd: Q5_0's 5-bit codes already are (0..31; the −16 rides the
 /// `−16·bsum` term); Q8_0's signed bytes are biased `+128` at repack and the exact integer
 /// correction `−128·bsum[b]` is applied per block — both integer-exact, so results stay
@@ -6572,14 +6405,90 @@ pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// `[dot(a, bs[0]), dot(a, bs[1]), …]`, each bit-identical to [`dot`]: the same per-lane FMA
+/// order and the same lane sum. One `dot` is a chain of dependent FMAs, so a loop of them waits on
+/// FMA latency; computing `N` together gives the core `N` independent chains to overlap.
+// per-call leaf, too small to probe (see docs/perf/playbook.md)
+#[cfg_attr(infr_profile, infr_prof::skip)]
+#[inline]
+pub(crate) fn dot_n<const N: usize>(a: &[f32], bs: [&[f32]; N]) -> [f32; N] {
+    let n = a.len();
+    for b in &bs {
+        assert_eq!(b.len(), n, "dot_n: every b must have a's length");
+    }
+    let chunks = n / 8;
+    let mut acc = [[0f32; 8]; N];
+    for c in 0..chunks {
+        let base = c * 8;
+        let av = &a[base..base + 8];
+        for (k, b) in bs.iter().enumerate() {
+            let bv = &b[base..base + 8];
+            for (j, ac) in acc[k].iter_mut().enumerate() {
+                *ac = av[j].mul_add(bv[j], *ac);
+            }
+        }
+    }
+    std::array::from_fn(|k| {
+        let mut s: f32 = acc[k].iter().sum();
+        for i in chunks * 8..n {
+            s = a[i].mul_add(bs[k][i], s);
+        }
+        s
+    })
+}
+
+/// `[[dot(as[m], bs[n]) for n] for m]`, each bit-identical to [`dot`]. Against [`dot_n`] it also
+/// shares each `bs` chunk across the `M` rows of `as`, so a block of `M × N` products costs
+/// `M + N` loads instead of `M × (1 + N)` — the shape of many queries scored against the same
+/// keys.
+// per-call leaf, too small to probe (see docs/perf/playbook.md)
+#[cfg_attr(infr_profile, infr_prof::skip)]
+#[inline]
+pub(crate) fn dot_mn<const M: usize, const N: usize>(
+    a_s: [&[f32]; M],
+    bs: [&[f32]; N],
+) -> [[f32; N]; M] {
+    let n = bs.first().map_or(0, |b| b.len());
+    for v in a_s.iter().chain(&bs) {
+        assert_eq!(v.len(), n, "dot_mn: every vector must have one length");
+    }
+    let chunks = n / 8;
+    let mut acc = [[[0f32; 8]; N]; M];
+    let a8: [&[[f32; 8]]; M] = a_s.map(|a| a[..chunks * 8].as_chunks::<8>().0);
+    let b8: [&[[f32; 8]]; N] = bs.map(|b| b[..chunks * 8].as_chunks::<8>().0);
+    for c in 0..chunks {
+        let bv: [[f32; 8]; N] = std::array::from_fn(|k| b8[k][c]);
+        for m in 0..M {
+            let av = a8[m][c];
+            for k in 0..N {
+                for j in 0..8 {
+                    acc[m][k][j] = av[j].mul_add(bv[k][j], acc[m][k][j]);
+                }
+            }
+        }
+    }
+    std::array::from_fn(|m| {
+        std::array::from_fn(|k| {
+            let mut s: f32 = acc[m][k].iter().sum();
+            for i in chunks * 8..n {
+                s = a_s[m][i].mul_add(bs[k][i], s);
+            }
+            s
+        })
+    })
+}
+
 /// Gated-FFN activation applied to the gate value.
 // per-call leaf, too small to probe (see docs/perf/playbook.md)
 #[cfg_attr(infr_profile, infr_prof::skip)]
 pub(crate) fn act_fn(act: Activation, g: f32) -> f32 {
     match act {
+        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
         Activation::Silu => g / (1.0 + (-g).exp()),
         // gelu_pytorch_tanh: 0.5 g (1 + tanh(√(2/π)·(g + 0.044715 g³)))
+        // libm-ok(S2): platform `tanh`, moves to `infr_core::math` in S2
         Activation::Gelu => 0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh()),
+        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
         Activation::Sigmoid => 1.0 / (1.0 + (-g).exp()),
     }
 }
@@ -6596,6 +6505,9 @@ pub(crate) fn gated_act_fn(act: Activation, clamp: Option<f32>, gate: f32, up: f
     }
 }
 
+#[cfg(all(test, target_arch = "x86_64"))]
+mod batch_tier_tests;
+
 #[cfg(test)]
 mod kernel_tests {
     use super::*;
@@ -6604,7 +6516,9 @@ mod kernel_tests {
     // gate their bodies on the same arch, so the import must be gated too or it fails to resolve
     // on aarch64.
     #[cfg(target_arch = "x86_64")]
-    use crate::repack::{q4k_gemm_group, q4k_pack, q6k_gemm_group, q6k_pack};
+    use crate::repack::{
+        q4k_gemm_group_out, q4k_pack, q6k_pack_and_gemm_group, GemmOut, TILE_TOKENS,
+    };
     use infr_core::tensor::DType;
     use infr_gguf::dequant::{dequant_block, dequant_codebook};
 
@@ -6625,6 +6539,51 @@ mod kernel_tests {
     fn put_f16(b: &mut [u8], v: f32) {
         b.copy_from_slice(&half::f16::from_f32(v).to_le_bytes());
     }
+    /// `dot_n` must give each `dot` bit for bit, including lengths with a sub-8 tail and the
+    /// empty vector.
+    #[test]
+    fn dot_n_matches_dot_bitwise() {
+        for n in [0usize, 1, 7, 8, 9, 64, 128, 133] {
+            let a = det_x(n, 5 + n as u64);
+            let bs: Vec<Vec<f32>> = (0..4).map(|k| det_x(n, 100 * k + n as u64)).collect();
+            let got = dot_n(&a, [&bs[0][..], &bs[1][..], &bs[2][..], &bs[3][..]]);
+            for (k, b) in bs.iter().enumerate() {
+                let want = dot(&a, b);
+                assert_eq!(
+                    got[k].to_bits(),
+                    want.to_bits(),
+                    "n={n} k={k}: {} vs {want}",
+                    got[k]
+                );
+            }
+        }
+    }
+
+    /// `dot_mn` must give each `dot` bit for bit, including lengths with a sub-8 tail and the
+    /// empty vector.
+    #[test]
+    fn dot_mn_matches_dot_bitwise() {
+        for n in [0usize, 1, 7, 8, 9, 64, 128, 133] {
+            let a_s: Vec<Vec<f32>> = (0..3).map(|m| det_x(n, 7 * m + n as u64)).collect();
+            let bs: Vec<Vec<f32>> = (0..4).map(|k| det_x(n, 100 * k + n as u64)).collect();
+            let got = dot_mn(
+                [&a_s[0][..], &a_s[1][..], &a_s[2][..]],
+                [&bs[0][..], &bs[1][..], &bs[2][..], &bs[3][..]],
+            );
+            for (m, a) in a_s.iter().enumerate() {
+                for (k, b) in bs.iter().enumerate() {
+                    let want = dot(a, b);
+                    assert_eq!(
+                        got[m][k].to_bits(),
+                        want.to_bits(),
+                        "n={n} m={m} k={k}: {} vs {want}",
+                        got[m][k]
+                    );
+                }
+            }
+        }
+    }
+
     /// The reference activation the integer kernels actually see: `d8 * q8` per super-block.
     fn dequant_q8(q8: &Q8) -> Vec<f32> {
         let mut x = vec![0f32; q8.qs.len()];
@@ -6751,9 +6710,14 @@ mod kernel_tests {
         #[cfg(target_arch = "x86_64")]
         {
             if !(is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni")) {
-                return; // the pack/gemm pair only exists on the VNNI path
+                // The pack/GEMM pair runs only on the VNNI path; other CPUs take the per-row
+                // kernels, which the route tests in lib.rs and moe.rs check on any host.
+                eprintln!("SKIP: this CPU lacks AVX-512BW + AVX-512 VNNI");
+                return;
             }
-            let (in_f, out_f, m) = (512usize, 16usize, 5usize);
+            let (in_f, out_f, m) = (512usize, 16usize, 11usize);
+            // Several full token tiles of the GEMM and a remainder, so both loops run.
+            assert!(m > 2 * TILE_TOKENS && m % TILE_TOKENS != 0);
             let nb256 = in_f / 256;
             let mut w = det_bytes(out_f * nb256 * 210, 90);
             for o in 0..out_f {
@@ -6767,11 +6731,12 @@ mod kernel_tests {
             let q8s: Vec<Q8> = (0..m)
                 .map(|r| quantize_q8(&det_x(in_f, 91 + r as u64)))
                 .collect();
-            let pack = q6k_pack(&w, in_f, out_f);
             let bpr = w.len() / out_f;
-            for (g, pg) in pack.groups.iter().enumerate() {
+            for g in 0..out_f / 8 {
+                let rows = std::array::from_fn(|i| &w[(8 * g + i) * bpr..(8 * g + i + 1) * bpr]);
                 let mut cols = vec![0f32; 8 * m];
-                unsafe { q6k_gemm_group(pg, pack.nb, &q8s, &mut cols) };
+                let gout = GemmOut::o_major(&mut cols, m);
+                unsafe { q6k_pack_and_gemm_group(rows, nb256, &q8s, gout, 0) };
                 for i in 0..8 {
                     let o = g * 8 + i;
                     let mut want = vec![0f32; m];
@@ -6795,9 +6760,14 @@ mod kernel_tests {
         #[cfg(target_arch = "x86_64")]
         {
             if !(is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni")) {
-                return; // the pack/gemm pair only exists on the VNNI path
+                // The pack/GEMM pair runs only on the VNNI path; other CPUs take the per-row
+                // kernels, which the route tests in lib.rs and moe.rs check on any host.
+                eprintln!("SKIP: this CPU lacks AVX-512BW + AVX-512 VNNI");
+                return;
             }
-            let (in_f, out_f, m) = (512usize, 16usize, 5usize);
+            let (in_f, out_f, m) = (512usize, 16usize, 11usize);
+            // Several full token tiles of the GEMM and a remainder, so both loops run.
+            assert!(m > 2 * TILE_TOKENS && m % TILE_TOKENS != 0);
             let nb256 = in_f / 256;
             let mut w = det_bytes(out_f * nb256 * 144, 80);
             for o in 0..out_f {
@@ -6819,7 +6789,7 @@ mod kernel_tests {
             let bpr = w.len() / out_f;
             for (g, pg) in pack.groups.iter().enumerate() {
                 let mut cols = vec![0f32; 8 * m];
-                unsafe { q4k_gemm_group(pg, pack.nb, &q8s, &mut cols) };
+                unsafe { q4k_gemm_group_out(pg, pack.nb, &q8s, GemmOut::o_major(&mut cols, m), 0) };
                 for i in 0..8 {
                     let o = g * 8 + i;
                     let mut want = vec![0f32; m];
@@ -9775,6 +9745,124 @@ mod kernel_tests {
     #[cfg(target_arch = "x86_64")]
     fn tier_rel(got: f32, want: f32) -> f32 {
         (got - want).abs() / want.abs().max(1e-3)
+    }
+
+    /// The AVX-512BW single-row Q4_K and Q6_K kernels fold the scales into the widening
+    /// multiply but keep the integer sums exact, so they must give the scalar kernels' bits, not
+    /// just a close value: over several rows and widths of one to eight super-blocks, with an
+    /// activation whose first block is zero (`d = 0`) where there are several, and at the edges
+    /// of the scale, code and activation ranges, where an intermediate would saturate first.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q4k_q6k_avx512bw_match_the_scalar_kernels_bitwise() {
+        if !is_x86_feature_detected!("avx512bw") {
+            eprintln!("SKIP q4k_q6k_avx512bw_match_the_scalar_kernels_bitwise: no avx512bw");
+            return;
+        }
+        let mut ran = 0;
+        for nb in [1usize, 3, 8] {
+            let in_f = nb * 256;
+            // A zeroed first block (`d = 0` there) once the row has other blocks to carry it.
+            let mut xs = vec![det_x(in_f, 0x5CA1E + nb as u64)];
+            if nb > 1 {
+                let mut x0 = det_x(in_f, 0xB17 + nb as u64);
+                x0[..256].fill(0.0);
+                xs.push(x0);
+            }
+            for x in xs {
+                let q8 = quantize_q8(&x);
+                for seed in 0..6u32 {
+                    let w4 = infr_testkit::synth_weight(DType::Q4K, in_f, 0x4B + seed);
+                    let w6 = infr_testkit::synth_weight(DType::Q6K, in_f, 0x6B + seed);
+                    let (s4, v4) = (vec_dot_q4k_scalar(&w4, &q8, in_f), unsafe {
+                        vec_dot_q4k_avx512bw(&w4, &q8, in_f)
+                    });
+                    let (s6, v6) = (vec_dot_q6k_scalar(&w6, &q8, in_f), unsafe {
+                        vec_dot_q6k_avx512bw(&w6, &q8, in_f)
+                    });
+                    assert_eq!(
+                        v4.to_bits(),
+                        s4.to_bits(),
+                        "q4k nb={nb} seed={seed}: {v4} vs {s4}"
+                    );
+                    assert_eq!(
+                        v6.to_bits(),
+                        s6.to_bits(),
+                        "q6k nb={nb} seed={seed}: {v6} vs {s6}"
+                    );
+                    assert!(s4 != 0.0 && s6 != 0.0, "vacuous case nb={nb} seed={seed}");
+                    ran += 1;
+                }
+            }
+        }
+        assert_eq!(ran, 30);
+
+        // The ranges' edges: every 6-bit scale and min at 63 (Q4_K), every int8 scale at 127 and
+        // at -128 (Q6_K), codes all at their top (15 / 63), all zero and mixed, against
+        // activations that quantize to +127 everywhere, -127 everywhere and alternating.
+        let nb = 2usize;
+        let in_f = nb * 256;
+        let acts: [Vec<f32>; 3] = [
+            vec![1.0; in_f],
+            vec![-1.0; in_f],
+            (0..in_f)
+                .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+                .collect(),
+        ];
+        let mut edges = 0;
+        for x in &acts {
+            let q8 = quantize_q8(x);
+            assert!(
+                q8.qs.iter().all(|&q| q.abs() == 127),
+                "activation is not at its edge"
+            );
+            for code in [0xFFu8, 0x00, 0xA5] {
+                let mut w4 = vec![code; nb * 144];
+                for b in 0..nb {
+                    put_f16(&mut w4[b * 144..b * 144 + 2], 0.75);
+                    put_f16(&mut w4[b * 144 + 2..b * 144 + 4], 0.5);
+                    w4[b * 144 + 4..b * 144 + 16].fill(0xFF);
+                }
+                let s4 = vec_dot_q4k_scalar(&w4, &q8, in_f);
+                let v4 = unsafe { vec_dot_q4k_avx512bw(&w4, &q8, in_f) };
+                assert_eq!(
+                    v4.to_bits(),
+                    s4.to_bits(),
+                    "q4k code {code:#x}: {v4} vs {s4}"
+                );
+                for scale in [127u8, 0x80] {
+                    let mut w6 = vec![code; nb * 210];
+                    for b in 0..nb {
+                        w6[b * 210 + 192..b * 210 + 208].fill(scale);
+                        put_f16(&mut w6[b * 210 + 208..b * 210 + 210], 0.25);
+                    }
+                    let s6 = vec_dot_q6k_scalar(&w6, &q8, in_f);
+                    let v6 = unsafe { vec_dot_q6k_avx512bw(&w6, &q8, in_f) };
+                    assert_eq!(
+                        v6.to_bits(),
+                        s6.to_bits(),
+                        "q6k code {code:#x} scale {scale:#x}: {v6} vs {s6}"
+                    );
+                    edges += 1;
+                }
+            }
+        }
+        assert_eq!(edges, 18);
+    }
+
+    /// `k4_all` unpacks every scale/min pair `k4` does, for arbitrary scale bytes.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn k4_all_matches_k4() {
+        for seed in 0..64u64 {
+            let scales = det_bytes(12, 0xC0FFEE + seed);
+            let (sc, m) = k4_all(&scales);
+            for s in 0..8 {
+                let want = k4(s, &scales);
+                let got = ((sc >> (8 * s)) as u8 as u32, (m >> (8 * s)) as u8 as u32);
+                assert_eq!(got, want, "seed {seed} sub-block {s}");
+            }
+        }
     }
 
     /// Single-row (`m=1`, Q8 super-block activation) int8 dots: avx2 + avx512bw vs scalar.

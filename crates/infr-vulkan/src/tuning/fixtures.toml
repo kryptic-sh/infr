@@ -1,0 +1,125 @@
+# Device facts the tuning snapshot test resolves against (`tuning::tests`). Each fixture's
+# resolved set is checked in under `snapshots/<id>.txt`.
+#
+# `measured = true` fixtures were dumped from a real device with `infr tune show --dev VulkanN
+# --json` (its `device` object) and cross-checked against `vulkaninfoSDK --summary`. The others
+# are BUILT from what the code's vendor rules and docs/backlog.md record about that hardware —
+# nobody here has run them — and say where each number came from.
+
+[[device]]
+id = "rx7900xtx-amdwin"
+measured = true
+source = "Vulkan0 on the Windows dev box, AMD Windows driver, 2026-11-17"
+name = "AMD Radeon RX 7900 XTX"
+vendor_id = 0x1002
+device_id = 0x744c
+driver = "AMD_PROPRIETARY"
+driver_version = 0x800161
+arch = "AmdRdna3"
+integrated = false
+compute_units = 96
+subgroup_min = 32
+subgroup_max = 64
+wave64 = false
+max_shared_memory = 32768
+
+[[device]]
+id = "rx7900xtx-radv"
+measured = false
+source = "the same card under Mesa RADV: RADV reports 64 KB of shared memory (the flash tile comment in recorder.rs); driver version unknown (0)"
+name = "AMD Radeon RX 7900 XTX (RADV NAVI31)"
+vendor_id = 0x1002
+device_id = 0x744c
+driver = "MESA_RADV"
+driver_version = 0
+arch = "AmdRdna3"
+integrated = false
+compute_units = 96
+subgroup_min = 32
+subgroup_max = 64
+wave64 = false
+max_shared_memory = 65536
+
+[[device]]
+id = "raphael-igpu-amdwin"
+measured = true
+source = "Vulkan1 on the Windows dev box (Ryzen 9 9950X3D integrated RDNA2), AMD Windows driver, 2026-11-17"
+name = "AMD Radeon(TM) Graphics"
+vendor_id = 0x1002
+device_id = 0x13c0
+driver = "AMD_PROPRIETARY"
+driver_version = 0x800161
+arch = "AmdRdna2"
+integrated = true
+compute_units = 2
+subgroup_min = 32
+subgroup_max = 64
+wave64 = false
+max_shared_memory = 32768
+
+[[device]]
+id = "rx580-gcn-radv"
+measured = false
+source = "a GCN (Polaris 20) RX 580 under RADV: wave64-only, so the subgroup range reads [64, 64] and the backend runs the wave64 emulation (caps::subgroup_mode; docs/backlog.md B-WAVE64-GCN-UNVERIFIED); 36 CUs; 64 KB shared memory"
+name = "AMD Radeon RX 580 Series (RADV POLARIS10)"
+vendor_id = 0x1002
+device_id = 0x67df
+driver = "MESA_RADV"
+driver_version = 0
+arch = "AmdGcn"
+integrated = false
+compute_units = 36
+subgroup_min = 64
+subgroup_max = 64
+wave64 = true
+max_shared_memory = 65536
+
+[[device]]
+id = "intel-arc-a770-anv"
+measured = false
+source = "an Intel Arc A770 (Xe1/Alchemist) under Mesa ANV: subgroup range 8-32 (caps.rs's Intel test probe), 32 Xe-cores from the PCI-id table (caps::intel_shader_core_count), 64 KB shared memory"
+name = "Intel(R) Arc(tm) A770 Graphics (DG2)"
+vendor_id = 0x8086
+device_id = 0x56a0
+driver = "INTEL_OPEN_SOURCE_MESA"
+driver_version = 0
+arch = "IntelXe1"
+integrated = false
+compute_units = 32
+subgroup_min = 8
+subgroup_max = 32
+wave64 = false
+max_shared_memory = 65536
+
+[[device]]
+id = "nvidia-rtx2080ti"
+measured = false
+source = "an NVIDIA RTX 2080 Ti (Turing, the card adapter.rs's mmv_mw notes were measured on) under the proprietary driver: subgroup 32 only, 68 SMs, 48 KB shared memory (the flash tile comment in recorder.rs)"
+name = "NVIDIA GeForce RTX 2080 Ti"
+vendor_id = 0x10de
+device_id = 0x1e07
+driver = "NVIDIA_PROPRIETARY"
+driver_version = 0
+arch = "NvidiaTuring"
+integrated = false
+compute_units = 68
+subgroup_min = 32
+subgroup_max = 32
+wave64 = false
+max_shared_memory = 49152
+
+[[device]]
+id = "unknown"
+measured = false
+source = "a device the table knows nothing about: an unlisted vendor, no driver id, no core count; no row may match it"
+name = "Unknown GPU"
+vendor_id = 0x1234
+device_id = 0x0001
+driver_version = 0
+arch = "Other"
+integrated = false
+compute_units = 0
+subgroup_min = 32
+subgroup_max = 32
+wave64 = false
+max_shared_memory = 32768

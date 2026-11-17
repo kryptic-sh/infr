@@ -59,18 +59,14 @@ confidence-threshold = 0.8
 unused-allowed-license = "allow"
 
 [bans]
-# NOT gated, and the reason is a limitation rather than a judgement. A `*` on a
-# REGISTRY crate is worth failing over — it resolves to whatever exists at build
-# time, so a semver-major can land with no diff. But this workspace's own members
-# are declared `{ path = ... }` with no version, which cargo-deny also reads as a
-# wildcard, and `allow-wildcard-paths` does not help: it applies only to crates
-# marked `publish = false`, and only `infr-testkit` is. Marking the other members
-# unpublishable would fix it and is a claim about intent nobody has made yet, so
-# it is a decision in `docs/backlog.md` rather than a change made in passing.
-#
-# The graph has no registry wildcard today (`grep '= "\*"' crates/*/Cargo.toml`),
-# so what is lost is a guard against a future one, not cover for a current one.
-wildcards = "allow"
+# A `*` on a registry crate resolves to whatever exists at build time, so a
+# semver-major can land with no diff. Every internal dependency carries a
+# version except `infr-testkit`, which is only ever a dev-dependency:
+# `cargo publish` strips those, so `allow-wildcard-paths` accepts an
+# unversioned path there even in a published crate. A normal dependency
+# without a version still fails, published crate or not.
+wildcards = "deny"
+allow-wildcard-paths = true
 # NOT gated, deliberately, and this is the one place worth explaining rather
 # than pretending. The duplicate set is dominated by pairs we do not control:
 # `tokenizers` 0.20 and 0.21 are both in the graph because `infr-chat` pins one

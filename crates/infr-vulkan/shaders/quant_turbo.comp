@@ -25,7 +25,10 @@ void wf16(uint bo, float x) {
 }
 
 void main() {
-    uint blk = gl_GlobalInvocationID.x;
+    // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
+    uint blk = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x;
     if (blk * 128u >= pc.n) { return; }
     float x[128];
     float nsq = 0.0;

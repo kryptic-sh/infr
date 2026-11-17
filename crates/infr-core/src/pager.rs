@@ -17,11 +17,38 @@
 //! The second policy reuses the SAME slot bookkeeping for `BlockId = layer_idx` (or a per-tensor
 //! block within a layer) in a dense model whose weights don't fit VRAM: a dense forward visits
 //! layers in a fixed, known order every step, so residency is schedule-driven via
-//! [`Pager::schedule`] (exact cyclic-sweep eviction, Belady-parity — see its doc) rather than
+//! [`Pager::schedule`] (a stable resident prefix, near Belady's optimum — see its doc) rather than
 //! demand/LRU. The PREFETCH side (staging layer `l+1`'s bytes while `l` executes) is the
 //! backend's job — `infr-vulkan`'s `DensePagerSession` records uploads ahead of GPU execution
 //! through its pipelined ring; this module stays pure residency/eviction bookkeeping.
-use std::collections::{HashMap, VecDeque};
+//!
+//! ## Data structure
+//! Everything but the `BlockId → slot` map is indexed by slot: the block there, its batch epoch
+//! and its pin count. Recency is an intrusive doubly linked list over the slots (`lru`), coldest
+//! first: an MRU touch moves a slot to the hot end and a cold-end insert links it at the other,
+//! each a few index writes. The victim is the first slot from the cold end that is not protected
+//! (pinned, or touched by the current batch), so choosing one costs the protected slots it walks
+//! past rather than a scan of the whole cache. A group touch puts one node for the whole group in
+//! the same list (`groups`' module doc says how it ranks the members).
+//!
+//! ## Instruments
+//! [`trace`] records a pool's calls (`paging.trace`) and replays them; [`sim`] replays a trace
+//! under other eviction policies (Belady's optimum among them) without a model; [`shapes`]
+//! generates the access patterns real sessions make, for the simulator and the replay benchmark
+//! (`tests/pager_bench.rs`).
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+mod groups;
+mod lru;
+#[cfg(test)]
+mod reference;
+pub mod shapes;
+pub mod sim;
+pub mod trace;
+
+use lru::{Lru, Node};
+use trace::{Call, Outcome};
 
 /// Opaque identifier for one pageable block. The pager never interprets this — callers pack
 /// whatever key space they need (an expert id, a `(layer, role, expert)` tuple, a layer index for
@@ -67,6 +94,72 @@ impl PagerStats {
     }
 }
 
+/// `BlockId → slot`, keyed by [`FxHasher`]. The keys are caller-packed `BlockId`s, opaque to the
+/// pager but chosen by the engine, not by an adversary, so SipHash's flooding resistance (the
+/// default hasher's) buys nothing here and costs most of a hit.
+type SlotMap = HashMap<BlockId, u32, BuildHasherDefault<FxHasher>>;
+
+/// rustc-hash 1.x's `FxHasher` step for each word — `hash = (hash.rotate_left(5) ^ word) *`
+/// [`FX_SEED`] — finished with a rotate left by [`FX_FINISH_ROTATE`] bits, as rustc-hash 2.x's
+/// `finish` does. The rotate is what keeps ids that differ only in high bits (a packing such as
+/// `layer << 16 | expert`) apart: the map picks a bucket from the hash's LOW bits, and the low `k`
+/// bits of a product depend only on the low `k` bits of the id, so without it every such id would
+/// land in one bucket. In-tree ids are dense from 0 (`layer * n_expert + expert` for the MoE
+/// pools, a per-pool counter for the CPU and dense ones), which never needed it.
+#[derive(Default)]
+struct FxHasher(u64);
+
+/// rustc-hash 1.x's multiplier for 64-bit hashes.
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+/// rustc-hash 2.x's finishing rotate on 64-bit targets.
+const FX_FINISH_ROTATE: u32 = 26;
+
+impl FxHasher {
+    fn add(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    fn finish(&self) -> u64 {
+        self.0.rotate_left(FX_FINISH_ROTATE)
+    }
+
+    /// Byte by byte — not rustc-hash's word-wise `write`; a `u32` key only reaches `write_u32`.
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.add(u64::from(b));
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.add(u64::from(n));
+    }
+}
+
+/// The block resident in one slot. Meaningless while the slot is free.
+#[derive(Debug, Clone, Copy, Default)]
+struct Slot {
+    id: BlockId,
+    /// The [`Pager::begin_batch`] epoch of the block's last touch. Eviction skips blocks touched
+    /// in the CURRENT batch — the explicit form of the within-batch safety invariant (MRU ordering
+    /// used to carry it implicitly; the scan-resistant [`Pager::touch_cold`] path inserts at the
+    /// COLD end, so it needs the epoch guard instead).
+    epoch: u64,
+    /// Outstanding pins, for a block a caller is READING right now ([`Pager::resolve_and_pin`]).
+    /// A pinned block is never an eviction victim — the fallible path skips it, and the infallible
+    /// one panics rather than evict it (`take_slot`). The epoch guard cannot express this, because
+    /// it is scoped to one dispatch batch while a pin lasts as long as the borrow — a CPU kernel
+    /// reads a weight for a whole op, spanning batches.
+    pins: u32,
+}
+
+/// Whether the block in `s` may be evicted: `guard` applies the batch guard, `pins` the pins.
+fn eligible(s: &Slot, guard: bool, pins: bool, cur_epoch: u64) -> bool {
+    !(guard && s.epoch == cur_epoch) && !(pins && s.pins > 0)
+}
+
 /// Fixed-`n_slots` LRU residency map. `n_slots` slots are handed out first-come (no eviction)
 /// until exhausted, then every further miss evicts the least-recently-touched resident block.
 ///
@@ -83,27 +176,23 @@ impl PagerStats {
 pub struct Pager {
     n_slots: usize,
     /// block_id -> slot index for every currently-resident block.
-    resident: HashMap<BlockId, u32>,
-    /// LRU order, oldest (least-recently-used) at the front. A block appears at most once;
-    /// `touch` on an existing entry removes-then-repushes it (O(n_slots), fine at the slot counts
-    /// this cache runs at — tens to low hundreds; an intrusive doubly-linked list is the upgrade
-    /// path if that ever isn't true, per the module doc's SLRU note).
-    lru: VecDeque<BlockId>,
+    resident: SlotMap,
+    /// Per slot: the block resident there, its epoch and its pins.
+    slots: Vec<Slot>,
+    /// The recency order of the resident slots (and of the group touches in force).
+    lru: Lru,
     /// Slot indices never yet handed out (drained before any eviction kicks in).
     free: Vec<u32>,
-    /// block_id -> the [`Self::begin_batch`] epoch of its last touch. Eviction skips blocks
-    /// touched in the CURRENT batch — the explicit form of the within-batch safety invariant
-    /// (MRU ordering used to carry it implicitly; the scan-resistant [`Self::touch_cold`] path
-    /// inserts at the COLD end, so it needs the epoch guard instead).
-    epoch: HashMap<BlockId, u64>,
     cur_epoch: u64,
-    /// block_id -> outstanding pin count, for blocks a caller is READING right now
-    /// ([`Self::resolve_and_pin`]). Only present while non-zero. A pinned block is never an
-    /// eviction victim: the epoch guard above cannot express this, because it is scoped to one
-    /// dispatch batch while a pin lasts as long as the borrow — a CPU kernel reads a weight for a
-    /// whole op, spanning batches.
-    pinned: HashMap<BlockId, u32>,
+    /// How many distinct blocks hold a pin.
+    pinned: usize,
+    /// Equal-size block groups ([`Self::group_by`]), or `None` for a pager that never groups.
+    /// Only the MoE expert pools group; every other consumer pays one test of this field.
+    groups: Option<groups::Groups>,
     stats: PagerStats,
+    /// `paging.trace`: where this pool's calls are recorded, or `None` (the default), in which
+    /// case each entry point pays one test of this field and nothing more.
+    trace: Option<Box<trace::Recorder>>,
 }
 
 /// Where a miss inserts into the LRU order — the two policies this pager already had, named so a
@@ -126,9 +215,9 @@ impl Pager {
     ///
     /// # Panics
     /// If `n_slots == 0`. A zero-slot pager cannot satisfy even a one-block batch, so there is no
-    /// correct behaviour to fall back to: the first `touch` would find `free` empty, scan an empty
-    /// `lru` for a victim, and die inside `Self::take_slot` on an `expect` about a `position()`
-    /// index — a panic that describes the wrong thing entirely, several frames away from the
+    /// correct behaviour to fall back to: the first `touch` would find `free` empty, find no
+    /// resident block to evict, and die inside `Self::take_slot` on an `expect` about that —
+    /// a panic that describes the wrong thing entirely, several frames away from the
     /// mistake. Clamping to 1 instead would be worse than either: it manufactures a pager that
     /// silently misses on EVERY touch and evicts the block the caller resolved a moment ago,
     /// violating the within-batch safety invariant above for any batch wider than one block —
@@ -148,13 +237,55 @@ impl Pager {
         );
         Self {
             n_slots,
-            resident: HashMap::with_capacity(n_slots),
-            lru: VecDeque::with_capacity(n_slots),
+            resident: SlotMap::with_capacity_and_hasher(n_slots, Default::default()),
+            slots: vec![Slot::default(); n_slots],
+            lru: Lru::new(n_slots),
             free: (0..n_slots as u32).rev().collect(), // pop() hands out slot 0 first
-            epoch: HashMap::with_capacity(n_slots),
             cur_epoch: 0,
-            pinned: HashMap::new(),
+            pinned: 0,
+            groups: None,
             stats: PagerStats::default(),
+            trace: None,
+        }
+    }
+
+    /// Record every call this pager serves from now on into `file` (see [`trace`]), under a new
+    /// pool header built from `info` and this pager's slot count.
+    ///
+    /// # Panics
+    /// If this pager has served a call already. A trace has to start from the empty pager its
+    /// replay starts from, or it replays to different outcomes: the recorder is part of
+    /// construction, not something to switch on mid-run.
+    pub fn trace_to(
+        &mut self,
+        file: &std::sync::Arc<trace::TraceFile>,
+        info: trace::PoolInfo,
+    ) -> std::io::Result<()> {
+        let fresh = self.resident.is_empty()
+            && self.cur_epoch == 0
+            && self.free.len() == self.n_slots
+            && (self.stats.hits, self.stats.misses) == (0, 0);
+        assert!(
+            fresh,
+            "pager: a trace must start before the first call to replay"
+        );
+        self.trace = Some(Box::new(trace::Recorder::new(file, &info, self.n_slots)?));
+        Ok(())
+    }
+
+    /// Hand this pool's buffered trace events to its file and flush the file. A no-op without a
+    /// trace. An error means the trace is incomplete (a write failed; recording stopped there).
+    pub fn flush_trace(&mut self) -> std::io::Result<()> {
+        match self.trace.as_mut() {
+            Some(t) => t.flush(),
+            None => Ok(()),
+        }
+    }
+
+    #[inline(always)]
+    fn record(&mut self, call: Call, outcome: Outcome) {
+        if let Some(t) = self.trace.as_mut() {
+            t.record(call, outcome);
         }
     }
 
@@ -164,6 +295,7 @@ impl Pager {
     /// cold-end scan inserts, where LRU position alone no longer protects batch siblings).
     pub fn begin_batch(&mut self) {
         self.cur_epoch += 1;
+        self.record(Call::BeginBatch, Outcome::Done);
     }
 
     pub fn n_slots(&self) -> usize {
@@ -179,24 +311,83 @@ impl Pager {
         self.resident.len()
     }
 
-    /// Number of entries in the `epoch` map — test-only, to assert eviction keeps it bounded by
-    /// `n_slots` rather than growing per distinct BlockId ever touched.
-    #[cfg(test)]
-    pub(crate) fn epoch_len(&self) -> usize {
-        self.epoch.len()
-    }
-
     pub fn slot_of(&self, id: BlockId) -> Option<u32> {
         self.resident.get(&id).copied()
     }
 
-    /// Move `id` to the most-recently-used end without changing residency (internal to `touch`,
-    /// exposed for the doubly-recorded case: a batch that touches the same id twice).
-    fn mark_mru(&mut self, id: BlockId) {
-        if let Some(pos) = self.lru.iter().position(|&x| x == id) {
-            self.lru.remove(pos);
+    /// Move slot `s` to the most-recently-used end without changing residency.
+    fn mark_mru(&mut self, s: u32) {
+        if let Some(g) = self.groups.as_mut() {
+            g.leave_run(s, self.slots[s as usize].id);
         }
-        self.lru.push_back(id);
+        let n = Lru::slot(s);
+        // Unlinked only when just admitted, or while its group's node ranks it (`groups`).
+        if self.lru.is_linked(n) {
+            self.lru.unlink(n);
+        }
+        self.lru.push_hot(n);
+    }
+
+    /// Take a pin on the block in slot `s`.
+    fn pin(&mut self, s: u32) {
+        let slot = &mut self.slots[s as usize];
+        if slot.pins == 0 {
+            self.pinned += 1;
+        }
+        slot.pins += 1;
+    }
+
+    /// The least-recently-used resident block's slot among those not protected: by the batch
+    /// guard when `guard` (a block touched in the current batch, directly or through its group's
+    /// [`Self::touch_group`]), and by its pins when `pins`. Walks from the cold end, so it costs
+    /// the protected blocks it passes.
+    fn coldest(&mut self, guard: bool, pins: bool) -> Option<u32> {
+        let mut n = self.lru.coldest();
+        while n != lru::END {
+            let hotter = self.lru.hotter(n);
+            match self.lru.node(n) {
+                Node::Slot(s) => {
+                    let slot = &self.slots[s as usize];
+                    if self.groups.as_ref().is_some_and(|g| g.in_run(s, slot.id)) {
+                        // A stale position: its group's node ranks it now.
+                        self.lru.unlink(n);
+                    } else if eligible(slot, guard, pins, self.cur_epoch) {
+                        return Some(s);
+                    }
+                }
+                Node::Group(g) => {
+                    if let Some(s) = self.group_victim(g, guard, pins) {
+                        return Some(s);
+                    }
+                }
+            }
+            n = hotter;
+        }
+        None
+    }
+
+    /// `id` becomes resident at `slot` (every miss's admission), touched in the current batch and
+    /// unpinned, but not yet in the recency order.
+    fn admit(&mut self, id: BlockId, slot: u32) {
+        self.group_admit(id, slot);
+        self.resident.insert(id, slot);
+        self.slots[slot as usize] = Slot {
+            id,
+            epoch: self.cur_epoch,
+            pins: 0,
+        };
+    }
+
+    /// Remove the block in slot `s` from the cache, returning its id. The slot is the caller's.
+    fn remove(&mut self, s: u32) -> BlockId {
+        let id = self.slots[s as usize].id;
+        self.resident.remove(&id);
+        let n = Lru::slot(s);
+        if self.lru.is_linked(n) {
+            self.lru.unlink(n);
+        }
+        self.group_removed(id);
+        id
     }
 
     /// Ensure `id` is resident, evicting the least-recently-used unprotected block if the cache
@@ -204,16 +395,22 @@ impl Pager {
     /// paged in (caller must upload the block's bytes into `slot` and write the device LUT entry
     /// `id -> slot` before any dispatch reads it).
     pub fn touch(&mut self, id: BlockId) -> Resolution {
-        self.epoch.insert(id, self.cur_epoch);
+        let r = self.touch_untraced(id);
+        self.record(Call::Touch(id), Outcome::Resolved(r));
+        r
+    }
+
+    fn touch_untraced(&mut self, id: BlockId) -> Resolution {
         if let Some(&slot) = self.resident.get(&id) {
+            self.slots[slot as usize].epoch = self.cur_epoch;
             self.stats.hits += 1;
-            self.mark_mru(id);
+            self.mark_mru(slot);
             return Resolution::Hit { slot };
         }
         self.stats.misses += 1;
         let (slot, evicted) = self.take_slot();
-        self.resident.insert(id, slot);
-        self.lru.push_back(id);
+        self.admit(id, slot);
+        self.mark_mru(slot);
         Resolution::Miss { slot, evicted }
     }
 
@@ -233,24 +430,32 @@ impl Pager {
     /// On a `Miss` the caller must fill the slot before reading it; on a `Hit` it is already valid.
     /// Either way the block comes back pinned exactly once.
     pub fn resolve_and_pin(&mut self, id: BlockId, insert: Insert) -> Option<Resolution> {
+        let r = self.resolve_and_pin_untraced(id, insert);
+        self.record(
+            Call::ResolveAndPin(id, insert),
+            r.map_or(Outcome::Refused, Outcome::Resolved),
+        );
+        r
+    }
+
+    fn resolve_and_pin_untraced(&mut self, id: BlockId, insert: Insert) -> Option<Resolution> {
         if let Some(&slot) = self.resident.get(&id) {
-            self.epoch.insert(id, self.cur_epoch);
+            self.slots[slot as usize].epoch = self.cur_epoch;
             self.stats.hits += 1;
             if insert == Insert::Mru {
-                self.mark_mru(id);
+                self.mark_mru(slot);
             }
-            *self.pinned.entry(id).or_insert(0) += 1;
+            self.pin(slot);
             return Some(Resolution::Hit { slot });
         }
         let (slot, evicted) = self.take_slot_opt()?;
-        self.epoch.insert(id, self.cur_epoch);
         self.stats.misses += 1;
-        self.resident.insert(id, slot);
+        self.admit(id, slot);
         match insert {
-            Insert::Mru => self.lru.push_back(id),
-            Insert::Cold => self.lru.push_front(id),
+            Insert::Mru => self.mark_mru(slot),
+            Insert::Cold => self.lru.push_cold(Lru::slot(slot)),
         }
-        *self.pinned.entry(id).or_insert(0) += 1;
+        self.pin(slot);
         Some(Resolution::Miss { slot, evicted })
     }
 
@@ -262,8 +467,14 @@ impl Pager {
     /// thrashing cache report ~50% and a perfect one report 100%: the two become indistinguishable
     /// where it matters. Returns `None` if `id` is not resident.
     pub fn repin(&mut self, id: BlockId) -> Option<u32> {
+        let slot = self.repin_untraced(id);
+        self.record(Call::Repin(id), Outcome::Slot(slot));
+        slot
+    }
+
+    fn repin_untraced(&mut self, id: BlockId) -> Option<u32> {
         let slot = *self.resident.get(&id)?;
-        *self.pinned.entry(id).or_insert(0) += 1;
+        self.pin(slot);
         Some(slot)
     }
 
@@ -273,10 +484,16 @@ impl Pager {
     /// the tier below". A hit counts as a hit; a miss counts as nothing, because no residency
     /// decision was made.
     pub fn pin_if_resident(&mut self, id: BlockId) -> Option<u32> {
+        let slot = self.pin_if_resident_untraced(id);
+        self.record(Call::PinIfResident(id), Outcome::Slot(slot));
+        slot
+    }
+
+    fn pin_if_resident_untraced(&mut self, id: BlockId) -> Option<u32> {
         let slot = *self.resident.get(&id)?;
-        self.epoch.insert(id, self.cur_epoch);
+        self.slots[slot as usize].epoch = self.cur_epoch;
         self.stats.hits += 1;
-        *self.pinned.entry(id).or_insert(0) += 1;
+        self.pin(slot);
         Some(slot)
     }
 
@@ -287,19 +504,23 @@ impl Pager {
     /// slot be evicted while a reader still holds bytes from it, which is silent wrong output
     /// rather than a failure. The RAII guard in the host tier is what makes this balanced.
     pub fn unpin(&mut self, id: BlockId) {
-        match self.pinned.get_mut(&id) {
-            Some(n) if *n > 1 => *n -= 1,
-            Some(_) => {
-                self.pinned.remove(&id);
-            }
-            None => panic!("pager: unpin of block {id}, which holds no pin"),
+        let slot = self
+            .resident
+            .get(&id)
+            .map(|&s| &mut self.slots[s as usize])
+            .filter(|s| s.pins > 0)
+            .unwrap_or_else(|| panic!("pager: unpin of block {id}, which holds no pin"));
+        slot.pins -= 1;
+        if slot.pins == 0 {
+            self.pinned -= 1;
         }
+        self.record(Call::Unpin(id), Outcome::Done);
     }
 
     /// How many distinct blocks are pinned right now — the number a caller sizes `n_slots`
     /// against (see [`Self::resolve_and_pin`]'s `None`).
     pub fn pinned_blocks(&self) -> usize {
-        self.pinned.len()
+        self.pinned
     }
 
     /// Forget `id` and return its slot to the free list, if it was resident.
@@ -312,16 +533,49 @@ impl Pager {
     /// If `id` is pinned. Removing a block someone is reading is the exact failure pins exist to
     /// prevent, so it is a caller bug, not a recoverable state.
     pub fn evict(&mut self, id: BlockId) -> Option<u32> {
+        let slot = self.evict_untraced(id);
+        self.record(Call::Evict(id), Outcome::Slot(slot));
+        slot
+    }
+
+    fn evict_untraced(&mut self, id: BlockId) -> Option<u32> {
+        let slot = *self.resident.get(&id)?;
         assert!(
-            !self.pinned.contains_key(&id),
+            self.slots[slot as usize].pins == 0,
             "pager: evict of pinned block {id}"
         );
-        let slot = self.resident.remove(&id)?;
-        if let Some(pos) = self.lru.iter().position(|&x| x == id) {
-            self.lru.remove(pos);
-        }
-        self.epoch.remove(&id);
+        self.remove(slot);
         self.free.push(slot);
+        Some(slot)
+    }
+
+    /// Move `id` to the cold end of the recency order, if it is resident: its caller will not read
+    /// it again for a long while, so it should be the next victim. Residency, pins, the batch
+    /// epoch and the counters are unchanged — a pinned or batch-protected block still cannot be
+    /// chosen, and a later hit promotes it as usual. Successive demotions put the last one
+    /// coldest. Returns its slot, or `None` when it was not resident.
+    ///
+    /// # Panics
+    /// On a grouped pager ([`Self::group_by`]): a member of a touched group ranks by its group's
+    /// node, and no caller needs a demotion to override that, so it is refused rather than given
+    /// a meaning nothing checks. The host-arena pools, the one caller, never group.
+    pub fn demote(&mut self, id: BlockId) -> Option<u32> {
+        let slot = self.demote_untraced(id);
+        self.record(Call::Demote(id), Outcome::Slot(slot));
+        slot
+    }
+
+    fn demote_untraced(&mut self, id: BlockId) -> Option<u32> {
+        assert!(
+            self.groups.is_none(),
+            "pager: demote of block {id} on a grouped pager"
+        );
+        let slot = *self.resident.get(&id)?;
+        let n = Lru::slot(slot);
+        if self.lru.is_linked(n) {
+            self.lru.unlink(n);
+        }
+        self.lru.push_cold(n);
         Some(slot)
     }
 
@@ -332,17 +586,22 @@ impl Pager {
     /// end (it won't be needed again until every other block has been visited) and a hit keeps
     /// its position (promotion would let the sweep evict the stable set). The cache converges to
     /// a stable resident prefix of `n_slots - 1` blocks re-hit every pass plus one churn slot the
-    /// remaining blocks cycle through — the same hit count Belady's offline-optimal policy
-    /// achieves on a cyclic sweep (see `schedule_cyclic_sweep_is_belady_optimal`).
+    /// remaining blocks cycle through: `n_slots - 1` hits per pass (see
+    /// `schedule_cyclic_sweep_keeps_a_stable_prefix`). That is close to Belady's offline optimum
+    /// but not equal to it — MIN rotates which blocks it keeps — and in steady state it misses
+    /// about `(n_slots - 1) / (n_blocks - 1)` more blocks per pass than MIN, under one (the
+    /// simulator measures it: `sim`'s `schedule_on_a_sweep_is_within_one_miss_per_pass_of_belady`).
     ///
     /// Mechanically this shares [`Self::touch_cold`]'s cold-end insertion; it is a separate entry
     /// point because the CONTRACT differs: `touch_cold` promises scan-resistance for full-set
     /// sweeps MIXED with recency (`touch`) traffic on the same pager, while `schedule` promises
-    /// Belady-parity for a pager driven EXCLUSIVELY by one fixed cyclic order (dense layer
+    /// the stable prefix for a pager driven EXCLUSIVELY by one fixed cyclic order (dense layer
     /// streaming never mixes policies on a pool). Within-batch safety still rides the batch
     /// epoch ([`Self::begin_batch`]), not insertion order.
     pub fn schedule(&mut self, id: BlockId) -> Resolution {
-        self.touch_cold(id)
+        let r = self.touch_cold_untraced(id);
+        self.record(Call::Schedule(id), Outcome::Resolved(r));
+        r
     }
 
     /// [`Self::touch`]'s SCAN-RESISTANT twin, for full-set sweeps (a batched-prefill layer
@@ -356,15 +615,21 @@ impl Pager {
     /// routed-only path) keep their hot set at the MRU end, out of the sweep's victim zone.
     /// Within-batch safety comes from the batch epoch (see [`Self::begin_batch`]), NOT ordering.
     pub fn touch_cold(&mut self, id: BlockId) -> Resolution {
-        self.epoch.insert(id, self.cur_epoch);
+        let r = self.touch_cold_untraced(id);
+        self.record(Call::TouchCold(id), Outcome::Resolved(r));
+        r
+    }
+
+    fn touch_cold_untraced(&mut self, id: BlockId) -> Resolution {
         if let Some(&slot) = self.resident.get(&id) {
+            self.slots[slot as usize].epoch = self.cur_epoch;
             self.stats.hits += 1;
             return Resolution::Hit { slot };
         }
         self.stats.misses += 1;
         let (slot, evicted) = self.take_slot();
-        self.resident.insert(id, slot);
-        self.lru.push_front(id);
+        self.admit(id, slot);
+        self.lru.push_cold(Lru::slot(slot));
         Resolution::Miss { slot, evicted }
     }
 
@@ -376,85 +641,70 @@ impl Pager {
             return Some((s, None));
         }
         // A block is protected by its PIN always, and by the batch epoch only once batches are in
-        // use: a caller that never opens one leaves `cur_epoch` at 0, which every block's default
-        // epoch also is, so an unconditional epoch test would mark the whole cache as in-batch and
-        // find no victim at all. (The infallible `take_slot` expresses the same exemption as its
-        // `cur_epoch == 0` assert.)
-        let batches = self.cur_epoch != 0;
-        let idx = self.lru.iter().position(|b| {
-            !(batches && self.epoch.get(b) == Some(&self.cur_epoch)) && !self.pinned.contains_key(b)
-        })?;
-        let victim = self.lru.remove(idx).expect("index from position()");
-        let vslot = self
-            .resident
-            .remove(&victim)
-            .expect("every lru entry has a resident mapping");
-        // Drop the victim's epoch entry too — otherwise `epoch` is the one pager structure not
-        // bounded by `n_slots`, accumulating a stale entry per distinct BlockId ever touched. A
-        // stale entry could also mask an id as "current batch" across a `cur_epoch` wraparound.
-        self.epoch.remove(&victim);
+        // use: a caller that never opens one leaves `cur_epoch` at 0, which every block's epoch
+        // also is, so an unconditional epoch test would mark the whole cache as in-batch and find
+        // no victim at all. (The infallible `take_slot` expresses the same exemption.)
+        let victim = self.coldest(self.cur_epoch != 0, true)?;
+        let evicted = self.remove(victim);
         self.stats.evictions += 1;
-        Some((vslot, Some(victim)))
+        Some((victim, Some(evicted)))
     }
 
     /// A free slot, evicting if none remain. The victim is the coldest block NOT touched in the
     /// current batch (epoch guard — see [`Self::begin_batch`]); legacy callers that never open a
-    /// batch share epoch 0 everywhere, for which the guard degrades to plain LRU `pop_front`.
+    /// batch share epoch 0 everywhere, for which the guard degrades to plain LRU.
+    ///
+    /// # Panics
+    /// If the victim is pinned: the infallible entry points do not look at pins, so a caller that
+    /// mixes them with pins on one pager would otherwise have a block evicted under its reader.
     fn take_slot(&mut self) -> (u32, Option<BlockId>) {
-        if self.free.is_empty() {
-            // Only reachable through the infallible entry points, whose callers hold no pins.
-            debug_assert!(
-                self.pinned.is_empty(),
-                "pins are for the fallible resolve_and_pin path; touch/schedule cannot see them"
-            );
-        }
         if let Some(s) = self.free.pop() {
             return (s, None);
         }
-        let idx = self
-            .lru
-            .iter()
-            .position(|b| self.epoch.get(b) != Some(&self.cur_epoch))
+        // Without batches every block's epoch is the current one, 0, so the guard would protect
+        // the whole cache: the legacy caller gets plain LRU.
+        let batches = self.cur_epoch != 0;
+        let victim = self.coldest(batches, false).unwrap_or_else(|| {
             // Every resident block touched by the CURRENT batch means the batch exceeded
             // n_slots — the sizing floor (`Pager::new`'s doc) was violated upstream. Falling
-            // back to pop_front would silently evict a batch sibling mid-flight (the
+            // back to plain LRU would silently evict a batch sibling mid-flight (the
             // coherent-but-wrong class); fail loudly instead when batches are in use.
-            .unwrap_or_else(|| {
-                // Actionable in the voice of the Vulkan VRAM guard (`check_vram_budget`): say what
-                // was asked for, say why it cannot be tolerated rather than degraded, and name the
-                // knob to turn. The knob is `INFR_CACHE` — the paging budget (`paging.cache`) the
-                // seam splits proportionally into per-pool slot counts, so raising it is what makes
-                // `n_slots` clear the batch's width. NOT reachable on a default configuration: the
-                // MoE seam floors every pool at `min(n_expert, n_blocks)` slots (a batch is one
-                // (layer, role) resolution, at most `n_expert` distinct experts) and the dense
-                // streaming path opens a fresh batch around each single `schedule` call, so both
-                // shipping callers satisfy the floor by construction — reaching this means an
-                // explicit `INFR_CACHE` too small for one dispatch, or a new caller that skipped
-                // the floor.
-                assert!(
-                    self.cur_epoch == 0,
-                    "pager: a single dispatch batch touched more distinct blocks than the \
-                     n_slots={} this cache holds — within-batch eviction safety is unsatisfiable. \
-                     Refusing to degrade: evicting a block this same batch already resolved \
-                     doesn't fail cleanly, it feeds the dispatch another block's bytes (silent \
-                     wrong output, not an error). Raise the paging budget (INFR_CACHE) so every \
-                     pool gets at least one slot per block a batch touches, or leave it unset to \
-                     take the auto budget, which is sized to that floor.",
-                    self.n_slots
-                );
-                0 // epoch never used (legacy caller): plain LRU
-            });
-        let victim = self.lru.remove(idx).expect("index from position()");
-        let vslot = self
-            .resident
-            .remove(&victim)
-            .expect("every lru entry has a resident mapping");
-        // Drop the victim's epoch entry too — otherwise `epoch` is the one pager structure not
-        // bounded by `n_slots`, accumulating a stale entry per distinct BlockId ever touched. A
-        // stale entry could also mask an id as "current batch" across a `cur_epoch` wraparound.
-        self.epoch.remove(&victim);
+            //
+            // Actionable in the voice of the Vulkan VRAM guard (`check_vram_budget`): say what
+            // was asked for, say why it cannot be tolerated rather than degraded, and name the
+            // knob to turn. The knob is `INFR_CACHE` — the paging budget (`paging.cache`) the
+            // seam splits proportionally into per-pool slot counts, so raising it is what makes
+            // `n_slots` clear the batch's width. NOT reachable on a default configuration: the
+            // MoE seam floors every pool at `min(n_expert, n_blocks)` slots (a batch is one
+            // (layer, role) resolution, at most `n_expert` distinct experts) and the dense
+            // streaming path opens a fresh batch around each single `schedule` call, so both
+            // shipping callers satisfy the floor by construction — reaching this means an
+            // explicit `INFR_CACHE` too small for one dispatch, or a new caller that skipped
+            // the floor.
+            assert!(
+                !batches,
+                "pager: a single dispatch batch touched more distinct blocks than the \
+                 n_slots={} this cache holds — within-batch eviction safety is unsatisfiable. \
+                 Refusing to degrade: evicting a block this same batch already resolved \
+                 doesn't fail cleanly, it feeds the dispatch another block's bytes (silent \
+                 wrong output, not an error). Raise the paging budget (INFR_CACHE) so every \
+                 pool gets at least one slot per block a batch touches, or leave it unset to \
+                 take the auto budget, which is sized to that floor.",
+                self.n_slots
+            );
+            panic!("pager: a full cache with no resident block to evict")
+        });
+        let slot = &self.slots[victim as usize];
+        assert!(
+            slot.pins == 0,
+            "pager: touch/touch_cold/schedule would evict block {}, which holds a pin — pins \
+             belong to the resolve_and_pin path, which never evicts a pinned block; a pager \
+             must not mix the two",
+            slot.id
+        );
+        let evicted = self.remove(victim);
         self.stats.evictions += 1;
-        (vslot, Some(victim))
+        (victim, Some(evicted))
     }
 }
 
@@ -802,11 +1052,12 @@ mod tests {
     }
 
     #[test]
-    fn schedule_cyclic_sweep_is_belady_optimal() {
+    fn schedule_cyclic_sweep_keeps_a_stable_prefix() {
         // Dense layer streaming's access shape: N blocks visited 0..N in order, repeated every
-        // forward pass, through C < N slots. Belady (evict the furthest-next-use block) yields
-        // exactly C-1 hits per steady-state pass on this trace; `schedule` must match it —
-        // plain LRU would yield ZERO (every block evicted right before its reuse).
+        // forward pass, through C < N slots. `schedule` keeps a stable prefix of C-1 blocks, so
+        // every pass after the first hits exactly C-1 times — plain LRU would hit ZERO times
+        // (every block evicted right before its reuse). Belady does slightly better still by
+        // rotating what it keeps; `sim`'s tests measure that gap.
         let (n_blocks, n_slots, passes) = (10u32, 4usize, 5u64);
         let mut p = Pager::new(n_slots);
         for _ in 0..passes {
@@ -820,7 +1071,7 @@ mod tests {
         assert_eq!(
             p.stats().hits,
             want_hits,
-            "schedule policy fell short of the Belady hit count on a cyclic sweep"
+            "schedule policy fell short of the stable prefix's hit count on a cyclic sweep"
         );
     }
 
@@ -871,36 +1122,30 @@ mod tests {
         }
     }
 
-    /// Eviction must drop the victim's `epoch` entry, so `epoch` stays bounded by `n_slots` (never
-    /// growing an entry per distinct BlockId ever touched). Exercised via the test-only
-    /// `epoch_len()` accessor.
+    /// A slot handed to a new block after an eviction takes the new block's batch epoch, not the
+    /// victim's: here the victim was touched in an earlier batch, so a cold-end insert that kept
+    /// that epoch would be unprotected in its own batch and the next miss would evict it.
     #[test]
-    fn eviction_drops_the_victim_epoch_entry() {
+    fn a_reused_slot_does_not_keep_the_victims_epoch() {
         let mut p = Pager::new(2);
+        p.begin_batch();
         p.touch(1); // slot 0
         p.touch(2); // slot 1, full
-                    // 3 evicts 1 (LRU); 1's epoch entry must go with it.
+        p.begin_batch();
         assert_eq!(
-            p.touch(3),
+            p.touch_cold(3),
             Resolution::Miss {
                 slot: 0,
                 evicted: Some(1)
             }
         );
-        assert!(p.slot_of(1).is_none());
-        // epoch tracks only the two currently-resident blocks (2 and 3), not the evicted 1.
-        assert_eq!(p.epoch_len(), 2);
-        assert!(p.epoch_len() <= p.n_slots());
-        // Churn many more distinct ids through the 2-slot cache: epoch stays bounded, not linear
-        // in the number of distinct ids ever seen.
-        for id in 100..200u32 {
-            p.touch(id);
-        }
-        assert!(
-            p.epoch_len() <= p.n_slots(),
-            "epoch grew past n_slots ({} > {})",
-            p.epoch_len(),
-            p.n_slots()
+        assert_eq!(
+            p.touch_cold(4),
+            Resolution::Miss {
+                slot: 1,
+                evicted: Some(2)
+            },
+            "block 3 lost the protection of the batch that admitted it"
         );
     }
 
@@ -1014,6 +1259,58 @@ mod tests {
         let mut p = Pager::new(1);
         p.touch(1);
         p.unpin(1);
+    }
+
+    /// The infallible entry points do not look at pins, so a pinned victim is a caller mixing the
+    /// two paths on one pager: a panic, not an eviction under a live reader.
+    #[test]
+    #[should_panic(expected = "which holds a pin")]
+    fn an_infallible_miss_never_evicts_a_pinned_block() {
+        let mut p = Pager::new(1);
+        p.resolve_and_pin(1, Insert::Mru).expect("a free slot");
+        p.touch(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "evict of pinned block 1")]
+    fn evicting_a_pinned_block_panics() {
+        let mut p = Pager::new(1);
+        p.resolve_and_pin(1, Insert::Mru).expect("a free slot");
+        p.evict(1);
+    }
+
+    /// rustc-hash 1.x's step on one word is a multiply by its seed (from a zero state), and the
+    /// finish rotates as rustc-hash 2.x's does.
+    #[test]
+    fn the_slot_map_hash_is_fxhash_with_a_finishing_rotate() {
+        use std::hash::Hasher as _;
+        let hash = |n: u32| {
+            let mut h = FxHasher::default();
+            h.write_u32(n);
+            h.finish()
+        };
+        assert_eq!(hash(0), 0);
+        // Worked out apart from this code: (1 * 0x517cc1b727220a95).rotate_left(26).
+        assert_eq!(hash(1), 0xdc9c_882a_5545_f306);
+    }
+
+    /// Ids that differ only in high bits (`layer << 16 | expert`) must not share the low bits a
+    /// hash table picks its bucket from.
+    #[test]
+    fn ids_differing_in_high_bits_spread_over_buckets() {
+        use std::hash::Hasher as _;
+        let low_bits: std::collections::HashSet<u64> = (0..64u32)
+            .map(|layer| {
+                let mut h = FxHasher::default();
+                h.write_u32(layer << 16);
+                h.finish() & 63
+            })
+            .collect();
+        assert!(
+            low_bits.len() >= 32,
+            "64 ids differing above bit 16 fell into {} of 64 buckets",
+            low_bits.len()
+        );
     }
 
     #[test]

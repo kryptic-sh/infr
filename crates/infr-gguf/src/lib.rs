@@ -146,22 +146,26 @@ impl TensorBytes {
         (self.file_base + self.off as u64, self.len)
     }
 
-    /// Drop this view's pages from the process's mapping (`MADV_DONTNEED`), for bytes already
-    /// copied elsewhere (e.g. uploaded to VRAM). Best-effort and no-op off Unix; a later read
-    /// faults the pages back in from the file, so the view stays valid.
-    pub fn release_pages(&self) {
-        #[cfg(unix)]
-        {
-            // SAFETY: the mapping is read-only and file-backed (`MAP_SHARED`), so DONTNEED only
-            // unmaps pages; any later access re-reads identical bytes from the file.
-            let _ = unsafe {
-                self.mmap.unchecked_advise_range(
-                    memmap2::UncheckedAdvice::DontNeed,
-                    self.off,
-                    self.len,
-                )
-            };
-        }
+    /// Drop this view's pages from the process's resident set, leaving the mapping valid: a later
+    /// read faults them back in from the OS file cache, or from disk. For a weight whose bytes
+    /// were copied somewhere else (a discrete GPU's VRAM) and are not read through the mapping
+    /// again, so the host stops holding a second copy. Pages shared with a neighbouring tensor go
+    /// too and come back on their next read.
+    ///
+    /// `Err` with [`std::io::ErrorKind::Unsupported`] on a platform with no release call
+    /// ([`infr_plat::mem::release_mapped`] names them); nothing is released then.
+    pub fn release_resident(&self) -> std::io::Result<()> {
+        // SAFETY: a `TensorBytes` is only built by `Gguf::tensor_bytes_arc`, over a shard mapping
+        // `map_and_parse` made with `Mmap::map` from a file opened read-only: shared, read-only
+        // and file-backed, which is the contract `release_mapped` asks for.
+        unsafe { infr_plat::mem::release_mapped(self) }
+    }
+
+    /// Bytes of this view's pages in the process's resident set right now (whole pages, so up to
+    /// a page more at each end than the view's length). What
+    /// [`Self::release_resident`] is observed through.
+    pub fn resident_bytes(&self) -> std::io::Result<u64> {
+        infr_plat::mem::resident_bytes(self)
     }
 }
 
@@ -841,6 +845,16 @@ impl Gguf {
             let mut tensors: Vec<TensorInfo> = Vec::with_capacity(raw.len());
             for (name, shape, ggml_type, offset) in raw {
                 let dtype = ggml_type_to_dtype(ggml_type)?;
+                // GGUF places every tensor on an `alignment` boundary, and llama.cpp refuses a file
+                // that does not. That is all this guarantees: `general.alignment` may be any power
+                // of two, 1 and 2 included, so a reader still cannot assume a tensor's bytes are
+                // aligned for its element type.
+                if !offset.is_multiple_of(alignment as u64) {
+                    return Err(Error::Loader(format!(
+                        "GGUF: tensor '{name}' offset {offset} is not a multiple of the \
+                         {alignment}-byte alignment"
+                    )));
+                }
                 // `checked_mul`: a crafted shape must error, not overflow the product.
                 let numel: usize = shape
                     .iter()
@@ -861,13 +875,14 @@ impl Gguf {
                 // as an unexplained out-of-range panic (or worse, plausible-looking garbage) deep
                 // in a backend.
                 if dtype == DType::I2S {
-                    // i2_s packs 4 ternary codes per byte and carries a single trailing f32 scale;
-                    // a numel that isn't a multiple of 4 has no whole-byte code layout at all
-                    // (numel = 3 would size to 4 bytes: all scale, no codes).
-                    if !numel.is_multiple_of(4) {
+                    // i2_s interleaves its 2-bit codes across whole groups (see
+                    // `dequant::I2S_GROUP_ELEMS`) and carries a single trailing f32 scale; a tail
+                    // group would address codes past the packed bytes.
+                    if !numel.is_multiple_of(dequant::I2S_GROUP_ELEMS) {
                         return Err(Error::Loader(format!(
                             "GGUF: tensor '{name}' shape {shape:?} has {numel} elements, not a \
-                             multiple of 4 (i2_s packs 4 2-bit codes per byte)"
+                             multiple of {} (i2_s packs codes in interleaved groups)",
+                            dequant::I2S_GROUP_ELEMS
                         )));
                     }
                 } else {
@@ -1022,10 +1037,6 @@ impl WeightSource for Gguf {
 
     fn chat_template(&self) -> Option<&str> {
         self.metadata.str("tokenizer.chat_template")
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
     }
 }
 
@@ -1186,6 +1197,32 @@ mod tests {
         );
         // And it really is a file offset: the same bytes are there when read through the file.
         assert_eq!(&bytes[off as usize..off as usize + len], &view[..]);
+    }
+
+    /// A released view leaves the resident set and still reads the file's bytes. The platform
+    /// helper's own tests cover a multi-page range; this one covers the path through a `Gguf`.
+    #[test]
+    fn a_released_view_reads_back_the_same() {
+        let bytes = build_fixture();
+        let tmp = write_temp_gguf(&bytes);
+        let gguf = Gguf::open(tmp.path()).expect("open fixture");
+        let view = gguf.tensor_bytes_arc("tensor0").expect("view");
+        let expected = &bytes[bytes.len() - 16..];
+        assert_eq!(&view[..], expected);
+        match view.release_resident() {
+            Ok(()) => {
+                assert_eq!(view.resident_bytes().expect("residency"), 0);
+                assert_eq!(
+                    &view[..],
+                    expected,
+                    "a released view must read back the file"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                eprintln!("skip: mapped-page release is not implemented on this platform");
+            }
+            Err(e) => panic!("release failed: {e}"),
+        }
     }
 
     /// The pager's disk tier reads a tensor by `(offset, len)` taken from
@@ -1365,7 +1402,7 @@ mod tests {
         push_u32(&mut b, 3);
         push_u64(&mut b, 2); // tensor_count = 2
         push_u64(&mut b, 0); // kv_count = 0
-        for offset in [0u64, 16] {
+        for offset in [0u64, 32] {
             push_gguf_str(&mut b, "tensor0"); // same name twice
             push_u32(&mut b, 1); // n_dims
             push_u64(&mut b, 4); // dim[0]
@@ -1375,7 +1412,7 @@ mod tests {
         while !b.len().is_multiple_of(32) {
             b.push(0);
         }
-        b.extend_from_slice(&[0u8; 32]);
+        b.extend_from_slice(&[0u8; 64]);
         let tmp = write_temp_gguf(&b);
         let err = Gguf::open(tmp.path()).map(|_| ());
         let Err(Error::Loader(msg)) = err else {
@@ -1502,6 +1539,11 @@ mod tests {
     /// it structurally cannot express a misaligned element count — this builder takes the ggml type
     /// so a quantised one can.
     fn build_typed_fixture(ggml_type: u32, dim0: u64, data_len: usize) -> Vec<u8> {
+        build_typed_fixture_at(ggml_type, dim0, 0, data_len)
+    }
+
+    /// [`build_typed_fixture`] with the tensor at data offset `offset`.
+    fn build_typed_fixture_at(ggml_type: u32, dim0: u64, offset: u64, data_len: usize) -> Vec<u8> {
         let mut b: Vec<u8> = Vec::new();
         push_u32(&mut b, GGUF_MAGIC);
         push_u32(&mut b, 3); // version
@@ -1511,7 +1553,7 @@ mod tests {
         push_u32(&mut b, 1); // n_dims
         push_u64(&mut b, dim0);
         push_u32(&mut b, ggml_type);
-        push_u64(&mut b, 0); // offset = 0
+        push_u64(&mut b, offset);
         while !b.len().is_multiple_of(32) {
             b.push(0);
         }
@@ -1568,6 +1610,52 @@ mod tests {
                 "error should name the tensor and the i2_s packing: {msg}"
             ),
             other => panic!("misaligned i2_s numel should be Error::Loader, got {other:?}"),
+        }
+    }
+
+    /// B133: the I2S dequant addresses whole interleaved code groups, so `Gguf::open` rejects a
+    /// numel that packs into whole bytes but leaves a partial group — the decoder would index past
+    /// the packed codes and panic.
+    #[test]
+    fn partial_group_i2s_numel_errors() {
+        let numel = dequant::I2S_GROUP_ELEMS / 2;
+        let b = build_typed_fixture(36, numel as u64, 64);
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        match err {
+            Err(Error::Loader(msg)) => assert!(
+                msg.contains("tensor0") && msg.contains("i2_s"),
+                "error should name the tensor and the i2_s packing: {msg}"
+            ),
+            other => panic!("partial-group i2_s numel should be Error::Loader, got {other:?}"),
+        }
+
+        // One whole group still opens and dequantises to its full length.
+        let numel = dequant::I2S_GROUP_ELEMS;
+        let b = build_typed_fixture(36, numel as u64, 64);
+        let tmp = write_temp_gguf(&b);
+        let gguf = Gguf::open(tmp.path()).expect("one whole i2_s group must open");
+        let bytes = gguf.tensor_bytes("tensor0").expect("bytes");
+        assert_eq!(
+            dequant::dequant_block(DType::I2S, bytes).unwrap().len(),
+            numel
+        );
+    }
+
+    /// B133: a tensor offset off the file's alignment would hand readers a misaligned slice,
+    /// and a typed cast of one panics.
+    #[test]
+    fn misaligned_tensor_offset_errors() {
+        // ggml type 0 = F32; offset 2 is not 4-aligned, let alone 32-aligned.
+        let b = build_typed_fixture_at(0, 4, 2, 64);
+        let tmp = write_temp_gguf(&b);
+        let err = Gguf::open(tmp.path()).map(|_| ());
+        match err {
+            Err(Error::Loader(msg)) => assert!(
+                msg.contains("tensor0") && msg.contains("offset 2"),
+                "error should name the tensor and its offset: {msg}"
+            ),
+            other => panic!("misaligned tensor offset should be Error::Loader, got {other:?}"),
         }
     }
 

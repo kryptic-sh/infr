@@ -38,6 +38,7 @@ mod exec;
 mod idcache;
 mod pcache;
 mod pcache_blob;
+mod policy;
 mod profile;
 mod shaders;
 
@@ -169,11 +170,12 @@ pub struct MetalBackend {
     /// single slot, same single-generation lifetime as the weight caches (one backend per
     /// generation, bindings stable across the decode loop).
     pub(crate) replay: std::sync::Mutex<Option<exec::Tape>>,
-    /// Op-scratch buffers reused across ops/executes (keyed by (f32 count, tag) — distinct tags
-    /// for same-size buffers alive in one op). Reuse across layers is safe: the batch's hazard
-    /// tracking orders each layer's writes after the previous layer's reads.
+    /// Op-scratch buffers reused across ops/executes: one per tag (distinct tags for buffers alive
+    /// at once in one op), with its capacity in f32s, grown per [`policy::scratch_capacity`] and
+    /// never shrunk. Reuse across layers is safe: the batch's hazard tracking orders each layer's
+    /// writes after the previous layer's reads.
     pub(crate) scratch:
-        std::sync::Mutex<std::collections::HashMap<(usize, u8), std::sync::Arc<metal::Buffer>>>,
+        std::sync::Mutex<std::collections::HashMap<u8, (usize, std::sync::Arc<metal::Buffer>)>>,
     /// The engine configuration this backend reads its knobs from — HANDED IN by the caller
     /// ([`MetalBackend::new_with`]), held for the backend's whole life, and borrowed (never
     /// cloned) at every read site, including the per-forward exec walk. The 15
@@ -346,7 +348,6 @@ impl Backend for MetalBackend {
             coopmat_f8: None,
             i8: true,
             i8_dot: false,
-            i8_dot_fast: false,
             coopmat_i8: None,
             bf16: false,
             coopmat_bf16: None,
@@ -393,7 +394,6 @@ impl Backend for MetalBackend {
             // Metal's KV kernels index rows directly by position — no ring mapping; the runner
             // keeps full-context KV allocations for SWA layers here.
             kv_swa_ring: false,
-            kv_paging: false,
             // Same write-back set as the CPU reference (`infr_core::exec::writes_back`): a mutated
             // f32 `Input` is copied back into its bound buffer at the end of the call.
             graph_input_inplace: true,
@@ -406,9 +406,7 @@ impl Backend for MetalBackend {
         usage: BufferUsage,
     ) -> Result<Box<dyn infr_core::backend::Buffer>> {
         let len = bytes.max(4);
-        let raw = self
-            .device
-            .new_buffer(len as u64, metal::MTLResourceOptions::StorageModeShared);
+        let raw = new_shared_buffer(&self.device, len)?;
         // calloc contract: MTL buffers are not guaranteed zeroed; memset the (host-visible) contents.
         unsafe { std::ptr::write_bytes(raw.contents() as *mut u8, 0u8, len) };
         // Advance the weight-load progress bar (if a scope is open) — the single funnel every
@@ -433,9 +431,7 @@ impl Backend for MetalBackend {
         // Opt-out: skip the zero-fill. Debug builds poison with 0xFF (= NaN as f32) so a misuse
         // (read-before-write) surfaces loudly in tests instead of relying on lucky zeros.
         let len = bytes.max(4);
-        let raw = self
-            .device
-            .new_buffer(len as u64, metal::MTLResourceOptions::StorageModeShared);
+        let raw = new_shared_buffer(&self.device, len)?;
         #[cfg(debug_assertions)]
         unsafe {
             std::ptr::write_bytes(raw.contents() as *mut u8, 0xFFu8, len)
@@ -479,11 +475,12 @@ impl Backend for MetalBackend {
 
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
         // Invalidate any recorded decode-replay tape: it belongs to the PREVIOUSLY compiled
-        // plan, and the tape only matches on a (op-sequence, bound-buffer-address) fingerprint —
-        // which can COLLIDE across independent compile+execute calls once the allocator reuses a
-        // freed buffer's address, replaying a structurally-stale tape (observed: the MTP head
-        // forward, which recompiles a decode-shaped graph every draft step with fresh IO buffers,
-        // intermittently got a garbage/zeroed replay of an earlier forward). The seam's decode
+        // plan. Its fingerprint used to hash bound-buffer addresses, which COLLIDED across
+        // independent compile+execute calls once the allocator reused a freed buffer's address,
+        // replaying a structurally-stale tape (observed: the MTP head forward, which recompiles a
+        // decode-shaped graph every draft step with fresh IO buffers, intermittently got a
+        // garbage/zeroed replay of an earlier forward); it hashes allocation uids now, and
+        // clearing here still keeps a tape from outliving its plan. The seam's decode
         // loop — the ONLY intended replay user — compiles its plan ONCE and executes it per
         // token, so its tape survives and still replays; anything that recompiles gets a clean
         // slate and records afresh.
@@ -504,9 +501,50 @@ impl Backend for MetalBackend {
         self.execute_graph_chain(plan, bindings, n)
     }
 
+    /// `true` when `execute` either replays the recorded tape for this graph over these bindings
+    /// (`replay_capable`: the graph's shape, the bound buffers, the profiling mode and the
+    /// device's pipeline limits decide it) or walks it statically with every position taken
+    /// from the bound positions buffer (`policy::static_walk_live_positions`).
+    fn decode_replay_ready(&self, plan: &dyn Plan, bindings: &Bindings) -> bool {
+        self.plan_replays(plan, bindings)
+    }
+
     fn sync(&self) -> Result<()> {
         Ok(())
     }
+
+    /// The f16 flash prefill kernels read whole KV blocks; a cache padded to their block holds
+    /// every row they read, so the read-fit gate in the attention arm admits them for an ordinary
+    /// prefill (see `policy::KV_ROW_ALIGN`).
+    fn kv_row_align(&self) -> usize {
+        policy::KV_ROW_ALIGN
+    }
+}
+
+/// A new shared-storage buffer of `len` bytes, or an error naming the size.
+///
+/// Metal answers a request it cannot meet (longer than the device's maximum buffer length, or out
+/// of memory) with nil rather than an error, and `metal::Buffer` wraps a non-null pointer, so the
+/// nil has to be caught on the raw return before anything wraps or writes through it.
+fn new_shared_buffer(device: &metal::DeviceRef, len: usize) -> Result<MtlBuffer> {
+    use metal::foreign_types::ForeignType;
+    use objc::{msg_send, sel, sel_impl};
+    let max = device.max_buffer_length();
+    if len as u64 > max {
+        return Err(be(format!(
+            "Metal buffer of {len} bytes exceeds this device's maximum buffer length ({max} bytes)"
+        )));
+    }
+    let options = metal::MTLResourceOptions::StorageModeShared.bits();
+    // `new…` returns a +1 object, owned by the `MtlBuffer` that releases it on drop.
+    let raw: *mut metal::MTLBuffer =
+        unsafe { msg_send![device, newBufferWithLength: len as u64 options: options] };
+    if raw.is_null() {
+        return Err(be(format!(
+            "Metal could not allocate a {len}-byte buffer (device memory exhausted)"
+        )));
+    }
+    Ok(unsafe { MtlBuffer::from_ptr(raw) })
 }
 
 fn metal_buf(b: &dyn infr_core::backend::Buffer) -> &MetalBuffer {

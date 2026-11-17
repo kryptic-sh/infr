@@ -4,7 +4,7 @@
 // the KEY axis (not the head axis: a key's score needs every head summed, so heads stay serial
 // inside a lane, which is also what keeps the sum in `ggml_sum_rows`' ascending-h order).
 //
-//   score[t, j] = Sum_h (w[t, h] * scale) * relu( q[t, h] . k[j] )     for j <= pos + t
+//   score[t, j] = Sum_h (w[t, h] * scale) * relu( q[t, h] . k[j] )     for j < (pos + t + 1) / block_ratio
 //   dst[t, :]   = the top_k key positions by (score DESC, index ASC)
 //
 // The ReLU is INSIDE the head-weighted sum and `scale` multiplies the WEIGHT, never the score —
@@ -31,6 +31,7 @@ layout(push_constant) uniform PC {
     uint top_k;
     float scale;           // 1/sqrt(head_dim * n_head) — applied to the WEIGHT
     uint pos;              // absolute position of the first query row
+    uint block_ratio;      // positions per key: 1 for V3.2's per-token keys, V4's LID block size
 } pc;
 
 // q: [rows, n_head, head_dim] — f32, already roped
@@ -86,9 +87,9 @@ void main() {
     if (row >= pc.rows) { return; }
     uint t = gl_LocalInvocationID.x;
 
-    // Causal bound: a key at an absolute position past the query's is not eligible, and only
-    // `kv_len` positions are cached.
-    uint hi = min(pc.pos + row + 1u, pc.kv_len);
+    // Causal bound: a key whose block the query has not completed is not eligible (with one
+    // position per key, any key past the query's own position), and only `kv_len` keys are cached.
+    uint hi = min((pc.pos + row + 1u) / pc.block_ratio, pc.kv_len);
     uint sbase = row * pc.kv_len;
 
     // ── Phase 1: score every key ──

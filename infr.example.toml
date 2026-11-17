@@ -93,14 +93,6 @@ slots = 4
 # The sliding-window ring cache (INFR_NO_KV_RING inverted).
 ring = true
 
-# Host-RAM budget (MiB) for the cross-conversation KV prefix store — reverse
-# PagedAttention: a prompt's K/V rows are kept after the slot is recycled, so a
-# later chat that starts with the same tokens uploads them instead of
-# re-prefilling. Unrelated to forward PagedAttention (slots sharing pages
-# inside one pool), which has its own knob. Off by default — the store holds
-# prompt-derived data, so enabling it is a deliberate choice.
-# store_mb = 1024
-
 # Decode-time inline KV write, and the coopmat/BDA KV path.
 inline_decode = false
 coopmat_bda = false
@@ -146,22 +138,13 @@ i8_dot = true
 coopmat_8x8 = false # Intel Arc XMX 8x8x16 opt-in
 i8_coopmat = false
 bf16_coopmat = false
+force_wave64 = false # testing only: run the wave64 (AMD GCN) path on a wave32 device
 
 # GEMM / GEMV tiers.
 gemm_warp = true
 mmv = true
 mrow = true
-# K-quant/Q4_0 FMA tier for older Vulkan GPUs (GCN4/Polaris and other pre-coopmat
-# parts without fast int8 dot). Unset = auto (on when int8 dot is emulated).
-# kq_fma_tier = true
-# Wave64-native subgroup decode GEMV (GCN4/Polaris wave64-only devices run one full
-# wave64 per workgroup with plain subgroup ops instead of emulated 32-lane halves).
-# Unset = auto (on for wave64-only devices, inert elsewhere).
-wave64_native = true
-# Bind decode-GEMV weights as storage buffers instead of 64-bit device addresses.
-# May help GPUs without a scalar-base global load (e.g. GFX8/Polaris). Default off.
-# weights_as_ssbo = false
-moe_small_m = 8 # clamped to 0..=64 by the accessor
+moe_small_m = 8 # alias of the moe.small_m tuning parameter; clamped to 0..=64
 
 # Attention.
 flash_warp = true
@@ -176,11 +159,28 @@ gpu_pos = true
 fuse_add = true
 no_replay = false # sanctioned negative: true DISABLES the decode replay tape
 
+# Per-device tuning parameters: `infr tune list` names every one, `infr tune show`
+# says where each value on a device comes from. A value here beats the built-in
+# table's rows; INFR_TUNE and --set kernels.vulkan.tune.<key>=<value> beat it.
+# [kernels.vulkan.tune]
+# "gemv_sg.rows" = 4
+# "mmv_mw.warps@q4_k" = 1
+#
+# [kernels.vulkan.tuning]
+# rows = true            # false: generic defaults only, no table rows. On AMD's
+#                        # proprietary driver that also turns off the int8 coopmat
+#                        # prefill GEMM and the CU-scaled split-K (slower prefill);
+#                        # drop one row with `disable` instead.
+# file is relative to THIS file's folder (INFR_TUNE_FILE: to the working directory).
+# disable = []           # ids of table rows to ignore
+# file = "my-tune.toml"  # rows in the table's schema, tried without a rebuild
+
 [kernels.cpu]
 spin = 32768 # spin-pool idle ceiling
 spinpool = true
 repack_mb = 4096 # repack-cache budget, MiB
 reference = false # bit-reference kernels (no env twin)
+core_spread = true # pool threads off each other's SMT siblings (Windows; no env twin)
 
 # ── Profiling ──────────────────────────────────────────────────────────────────
 # wmma_tile = "2x2"   # exactly 1x1 / 2x1 / 2x2; default: unset = shape-driven
@@ -258,9 +258,6 @@ max_tokens_cap = 131072
 # Per-request wall-clock deadline, in seconds. 0 (the default) means NO deadline
 # — a deadline truncates a legitimate slow reply, so it is opt-in.
 request_timeout_secs = 0
-
-# Exit after this many seconds without requests or unfinished work; 0 disables idle exit.
-idle_timeout_secs = 0
 
 # How often the server logs its throughput line, in seconds. 0 switches the line
 # off. The line is ACTIVITY-ONLY: an interval in which nothing happened emits

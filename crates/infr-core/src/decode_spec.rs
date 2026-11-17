@@ -214,6 +214,7 @@ impl BlockSpec {
 /// Nearest E8M0 byte for a positive `v`: the exponent `e` such that `2^(e-127)` is closest to `v`
 /// in log space, clamped to the finite band. (MXFP4's shared exponent.)
 fn e8m0_from_f32(v: f32) -> u8 {
+    // libm-ok(S2): an E8M0 exponent from `log2`; S2 takes it from the bits
     let e = (v.abs().max(f32::MIN_POSITIVE).log2().round() as i32) + 127;
     e.clamp(1, 254) as u8
 }
@@ -307,7 +308,6 @@ pub const fn block_spec(dtype: DType) -> BlockSpec {
         DType::Bf16 => spec!(1, 2, NO_SCALE, "bf16"),
         DType::I32 => spec!(1, 4, NO_SCALE, "i32"),
         DType::U32 => spec!(1, 4, NO_SCALE, "u32"),
-        DType::I16 => spec!(1, 2, NO_SCALE, "i16"),
         // ── legacy round quants (QK=32) ──
         // block_q4_0: [half d][u8 qs[16]]
         DType::Q4_0 => spec!(32, 18, D_AT_0, "q4_0"),

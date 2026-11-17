@@ -15,9 +15,11 @@
 //! (A/B + escape hatch).
 
 use infr_core::config::CpuCfg;
+use std::any::Any;
 use std::cell::UnsafeCell;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// One in-flight job: an index-space of `n_tasks`, claimed dynamically by all threads.
 type Job = &'static (dyn Fn(usize) + Sync);
@@ -33,10 +35,14 @@ struct Shared {
     /// Dynamic task cursor (`fetch_add` claim), reset per job.
     cursor: AtomicUsize,
     n_tasks: AtomicUsize,
-    /// Workers that finished the current job (drained the cursor).
+    /// Workers that finished the current job (drained the cursor, or stopped at a panic).
     done: AtomicUsize,
-    /// A task panicked (caught per-task so `done` still advances; `run` re-panics).
+    /// A task of the current job panicked and its payload is in `payload`. The caller reads this
+    /// once per job, so a job that did not panic never touches the mutex.
     panicked: AtomicBool,
+    /// The FIRST panic payload of the current job, which `run` resumes on its caller. Later
+    /// panics of the same job are dropped (see [`Shared::record_panic`]).
+    payload: Mutex<Option<Box<dyn Any + Send>>>,
     shutdown: AtomicBool,
     /// Ceiling for the adaptive spin budget (constant `SpinPool::spin_limit` since phase 3 removed
     /// the last rayon section from the interpreter; kept a field for future per-graph tuning).
@@ -50,9 +56,67 @@ struct Shared {
 // happens-before (SeqCst bump).
 unsafe impl Sync for Shared {}
 
+impl Shared {
+    /// Claim and run tasks of the current job until the cursor passes `n`: the loop every thread
+    /// of a job runs, the caller included.
+    fn drain(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
+        loop {
+            let t = self.cursor.fetch_add(1, Ordering::Relaxed);
+            if t >= n {
+                break;
+            }
+            job(t);
+        }
+    }
+
+    /// Run [`Shared::drain`], and turn a panic out of it into the job's recorded outcome instead
+    /// of an unwind: the thread that panicked keeps going, so a worker survives to serve the next
+    /// job and the caller still reaches its wait for the workers.
+    ///
+    /// A panic also ends the job early. Pushing the cursor to `n` makes every thread's next claim
+    /// its last, so tasks no thread has claimed yet are skipped; tasks already running finish. A
+    /// task that panics usually fails the same way on every other input (a bad stride, a wrong
+    /// length), and running the rest only to panic in them too would take the panic hook — and,
+    /// with `RUST_BACKTRACE` set, a backtrace capture — once per task.
+    fn drain_catching(&self, n: usize, job: &(dyn Fn(usize) + Sync)) {
+        if let Err(p) = catch_unwind(AssertUnwindSafe(|| self.drain(n, job))) {
+            self.cursor.fetch_max(n, Ordering::Relaxed);
+            self.record_panic(p);
+        }
+    }
+
+    /// Keep `p` as the job's panic unless an earlier one is already kept.
+    fn record_panic(&self, p: Box<dyn Any + Send>) {
+        // Poison cannot carry a broken invariant here: the slot is one `Option` assignment.
+        let mut slot = self.payload.lock().unwrap_or_else(PoisonError::into_inner);
+        let extra = match *slot {
+            None => {
+                *slot = Some(p);
+                None
+            }
+            Some(_) => Some(p),
+        };
+        self.panicked.store(true, Ordering::Release);
+        drop(slot);
+        if let Some(extra) = extra {
+            // A payload's destructor is arbitrary code and may itself panic; unwinding out of
+            // here would end a worker before its check-in and hang the caller. Such a payload is
+            // leaked rather than dropped.
+            if let Err(again) = catch_unwind(AssertUnwindSafe(move || drop(extra))) {
+                std::mem::forget(again);
+            }
+        }
+    }
+}
+
 pub(crate) struct SpinPool {
     shared: Arc<Shared>,
     handles: Vec<std::thread::JoinHandle<()>>,
+    /// The placement every worker took and the caller takes during [`SpinPool::place_caller`]:
+    /// [`infr_plat::cpu::spread_placement`] for this pool's threads, read once on the thread that
+    /// built the pool, when `kernels.cpu.core_spread` is set. An affinity change after that is
+    /// not picked up by this pool.
+    pub(crate) placement: Option<infr_plat::cpu::Placement>,
     /// Worker thread count (callers participate too, so parallelism = workers + 1).
     workers: usize,
     /// `!kernels.cpu.spinpool`: run jobs through rayon instead.
@@ -138,17 +202,14 @@ fn worker_loop(me: usize, shared: Arc<Shared>) {
         // ── Drain the task cursor ────────────────────────────────────────────────────
         // SAFETY: `job` was written before the observed `seq` bump and stays alive until this
         // worker (and all others) increment `done` — see `Shared::job`'s doc.
-        let job = unsafe { (*shared.job.get()).expect("spin-pool: seq bumped without a job") };
+        let job = unsafe { *shared.job.get() };
         let n = shared.n_tasks.load(Ordering::Acquire);
-        loop {
-            let t = shared.cursor.fetch_add(1, Ordering::Relaxed);
-            if t >= n {
-                break;
-            }
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(t))).is_err() {
-                shared.panicked.store(true, Ordering::Release);
-            }
+        match job {
+            Some(job) => shared.drain_catching(n, job),
+            None => shared.record_panic(Box::new("spin-pool: seq bumped without a job")),
         }
+        // Reached on every path, since a panic in a task was caught above: a worker that skipped
+        // this check-in would leave `run` waiting on `done` forever.
         shared.done.fetch_add(1, Ordering::Release);
     }
 }
@@ -176,7 +237,14 @@ impl SpinPool {
     /// both pools identically. Both knobs (`spin`, `spinpool`) are read out of `cfg` HERE and
     /// never again — see [`SpinPool::spin_limit`].
     pub(crate) fn new(cfg: &CpuCfg) -> Self {
-        let n_threads = rayon::current_num_threads().max(1);
+        Self::with_threads(cfg, rayon::current_num_threads())
+    }
+
+    /// [`SpinPool::new`] with `n_threads` threads (the caller and `n_threads - 1` workers; at
+    /// least one) instead of rayon's count, for a test that needs workers whatever the machine
+    /// (miri reports one CPU).
+    pub(crate) fn with_threads(cfg: &CpuCfg, n_threads: usize) -> Self {
+        let n_threads = n_threads.max(1);
         let workers = n_threads - 1;
         let rayon_fallback = !cfg.spinpool;
         let spin_limit = cfg.spin;
@@ -187,22 +255,39 @@ impl SpinPool {
             n_tasks: AtomicUsize::new(0),
             done: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
+            payload: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             budget_cap: AtomicU32::new(spin_limit),
             sleeping: (0..workers).map(|_| AtomicBool::new(false)).collect(),
         });
+        // Built on the thread constructing the pool, which is the thread that will dispatch to it,
+        // so the placement also respects that thread's own affinity; a worker's is the process's,
+        // never narrower than that.
+        let placement = cfg
+            .core_spread
+            .then(|| infr_plat::cpu::spread_placement(n_threads))
+            .flatten();
         let handles = (0..workers)
             .map(|me| {
                 let sh = shared.clone();
+                let placement = placement.clone();
                 std::thread::Builder::new()
                     .name(format!("infr-spin-{me}"))
-                    .spawn(move || worker_loop(me, sh))
+                    .spawn(move || {
+                        // The worker lives as long as the pool, so its placement is never
+                        // cleared; the thread exits with it.
+                        if let Some(p) = &placement {
+                            apply_or_warn(p);
+                        }
+                        worker_loop(me, sh)
+                    })
                     .expect("spin-pool: spawn failed")
             })
             .collect();
         SpinPool {
             shared,
             handles,
+            placement,
             workers,
             rayon_fallback,
             spin_limit,
@@ -210,9 +295,33 @@ impl SpinPool {
         }
     }
 
+    /// Threads a job runs on: the workers and the caller.
+    pub(crate) fn threads(&self) -> usize {
+        self.workers + 1
+    }
+
+    /// Give the calling thread the pool's placement until the returned guard drops, which clears
+    /// it again; `None` when the pool has no placement or the thread already has one of its own
+    /// (an outer call's, or someone else's: that one stays in force). Two system calls here and
+    /// one at the drop: the placement itself was worked out when the pool was built.
+    pub(crate) fn place_caller(&self) -> Option<CallerPlacement> {
+        let p = self.placement.as_ref()?;
+        // `then`, not `then_some`: a guard built eagerly and discarded would clear the thread's
+        // existing placement in its drop.
+        apply_or_warn(p).then(|| CallerPlacement {
+            _not_send: std::marker::PhantomData,
+        })
+    }
+
     /// Run `f(0..n_tasks)` across the pool (caller participates). Dynamic task claim; returns
     /// once every task ran AND every worker checked in (the check-in is what makes the borrowed
     /// closure's lifetime sound — see `Shared::job`).
+    ///
+    /// # Panics
+    /// With the first panic payload of any task, on whichever thread it ran, once every thread
+    /// has stopped running tasks. Tasks not started when that panic was caught are skipped (see
+    /// [`Shared::drain_catching`]), so the job's outputs are left partly written. The pool stays
+    /// usable.
     pub(crate) fn run(&self, n_tasks: usize, f: &(dyn Fn(usize) + Sync)) {
         if n_tasks == 0 {
             return;
@@ -253,15 +362,13 @@ impl SpinPool {
             }
         }
         // Participate.
-        loop {
-            let t = sh.cursor.fetch_add(1, Ordering::Relaxed);
-            if t >= n_tasks {
-                break;
-            }
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(t))).is_err() {
-                sh.panicked.store(true, Ordering::Release);
-            }
-        }
+        //
+        // NOTHING from the `seq` bump above to the end of the wait below may unwind. Workers run
+        // `f`, which borrows the caller's frame through the lifetime-erased `job` slot, so
+        // unwinding out of `run` before every worker has checked in would free that frame under
+        // them. The caller's own share is therefore caught exactly as a worker's is, and its
+        // panic is resumed only after the wait.
+        sh.drain_catching(n_tasks, f);
         // Wait for every worker's check-in (they may still be draining the cursor's tail).
         // Periodic yield: under thread oversubscription (tests spawning several pools, a busy
         // rayon pool alongside) a pure spin here can starve the very workers it waits on.
@@ -277,7 +384,8 @@ impl SpinPool {
         unsafe {
             *sh.job.get() = None;
         }
-        // Consume `panicked` BEFORE releasing the job slot, and release it either way.
+        // Consume `panicked` (and its payload) BEFORE releasing the job slot, and release it
+        // either way.
         //
         // The flag is pool-GLOBAL (it lives on `Shared`, written by this caller and by every
         // `worker_loop`), while `in_run` is what makes the pool single-job. Releasing first opens a
@@ -286,13 +394,21 @@ impl SpinPool {
         // they would return normally with incomplete task state (backlog B25).
         //
         // Reading it while still holding `in_run` closes that window — no second job can have
-        // started, so the flag can only be ours. The store must still happen before the `panic!`,
+        // started, so the flag can only be ours. The store must still happen before the unwind,
         // or an unwinding caller would leave `in_run` latched `true` and every later `run` would
         // silently take the rayon fallback for the life of the process.
-        let panicked = sh.panicked.swap(false, Ordering::AcqRel);
+        let payload = if sh.panicked.load(Ordering::Acquire) {
+            sh.panicked.store(false, Ordering::Relaxed);
+            sh.payload
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        } else {
+            None
+        };
         self.in_run.store(false, Ordering::Release);
-        if panicked {
-            panic!("spin-pool: a task panicked (caught per-task; state may be incomplete)");
+        if let Some(p) = payload {
+            resume_unwind(p);
         }
     }
 
@@ -369,6 +485,42 @@ impl SpinPool {
         // size and alignment as `T`, and all `len` elements are initialized per the argument
         // above — so the allocation is valid to reinterpret as a `Vec<T>` of the same capacity.
         unsafe { Vec::from_raw_parts(ptr as *mut T, len, cap) }
+    }
+}
+
+/// Put the calling thread on the pool's placement, so the pool's threads stay off each other's
+/// SMT siblings while the OS still places them. Left to the OS, Windows put the spin pool's
+/// threads on SMT siblings of each other, which cost dense prefill a large share of its rate (see
+/// the CHANGELOG). Returns whether the placement was applied (`false` when the thread already
+/// had one). A failure only costs speed, so it is reported once per process and not again.
+fn apply_or_warn(p: &infr_plat::cpu::Placement) -> bool {
+    match infr_plat::cpu::apply_placement(p) {
+        Ok(applied) => applied,
+        Err(e) => {
+            warn_placement_once(&e);
+            false
+        }
+    }
+}
+
+fn warn_placement_once(e: &std::io::Error) {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!("spin-pool: thread placement failed, left to the OS: {e}");
+    }
+}
+
+/// The caller's placement from [`SpinPool::place_caller`]; dropping it clears the placement on
+/// the thread that drops it, so it is not `Send`.
+pub(crate) struct CallerPlacement {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for CallerPlacement {
+    fn drop(&mut self) {
+        if let Err(e) = infr_plat::cpu::clear_placement() {
+            warn_placement_once(&e);
+        }
     }
 }
 
@@ -570,5 +722,173 @@ mod tests {
             hits[t].fetch_add(1, Ordering::Relaxed);
         });
         assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
+    }
+
+    // ── A panicking task ─────────────────────────────────────────────────────────────────────
+    //
+    // Each test runs its body through `within`, so a pool that hangs on a panic fails the test
+    // instead of stalling the run, and builds its pool with `PANIC_THREADS` threads so it has
+    // workers under miri too, which reports one CPU.
+
+    use crate::test_util::{panic_of, within};
+
+    const PANIC_THREADS: usize = 4;
+
+    fn on_worker() -> bool {
+        std::thread::current()
+            .name()
+            .is_some_and(|n| n.starts_with("infr-spin-"))
+    }
+
+    /// Spin, yielding, until `flag` is set.
+    fn wait_for(flag: &AtomicBool) {
+        while !flag.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+    }
+
+    /// The pool is still a whole pool: the next job runs every task once, and every worker takes a
+    /// share of it, so none of them died. Every thread holds its first task until each worker has
+    /// one; otherwise a fast worker could drain the job before a slow one woke.
+    fn assert_whole(pool: &SpinPool) {
+        assert!(
+            !pool.in_run.load(Ordering::Acquire),
+            "the job slot was left taken"
+        );
+        let n = 8 * pool.threads();
+        let hits: Vec<AtomicU64> = (0..n).map(|_| AtomicU64::new(0)).collect();
+        let workers_seen = Mutex::new(std::collections::HashSet::new());
+        let all_seen = AtomicBool::new(false);
+        pool.run(n, &|t| {
+            if on_worker() {
+                let mut seen = workers_seen.lock().unwrap();
+                seen.insert(std::thread::current().id());
+                if seen.len() == pool.workers {
+                    all_seen.store(true, Ordering::Release);
+                }
+            }
+            wait_for(&all_seen);
+            hits[t].fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
+    }
+
+    /// A task panicking on a WORKER reaches the caller as that panic, with its own message.
+    #[test]
+    fn a_worker_panic_reaches_the_caller_with_its_payload() {
+        within(|| {
+            let pool = SpinPool::with_threads(&CpuCfg::default(), PANIC_THREADS);
+            let worker_failed = AtomicBool::new(false);
+            let msg = panic_of(|| {
+                pool.run(4 * PANIC_THREADS, &|t| {
+                    if on_worker() {
+                        worker_failed.store(true, Ordering::Release);
+                        panic!("worker task {t} failed");
+                    }
+                    // The caller holds its first task until a worker has failed, so the failure
+                    // is a worker's whatever the scheduling.
+                    wait_for(&worker_failed);
+                });
+            });
+            let msg = msg.expect("the worker's panic did not reach the caller");
+            assert!(msg.starts_with("worker task "), "payload lost: {msg:?}");
+            assert_whole(&pool);
+        })
+    }
+
+    /// A panic in the CALLER's own share propagates only after every worker has finished the task
+    /// it was running: those tasks borrow the caller's frame, which the unwind frees.
+    #[test]
+    fn a_panic_in_the_callers_share_waits_for_the_workers() {
+        within(|| {
+            let pool = SpinPool::with_threads(&CpuCfg::default(), PANIC_THREADS);
+            let caller_failing = AtomicBool::new(false);
+            let started = AtomicUsize::new(0);
+            let finished = AtomicUsize::new(0);
+            let msg = panic_of(|| {
+                pool.run(4 * PANIC_THREADS, &|t| {
+                    if on_worker() {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        wait_for(&caller_failing);
+                        // Still running well after the caller's task has panicked.
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        finished.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        caller_failing.store(true, Ordering::Release);
+                        panic!("caller task {t} failed");
+                    }
+                });
+            });
+            let msg = msg.expect("the caller's panic was lost");
+            assert!(msg.starts_with("caller task "), "payload lost: {msg:?}");
+            assert_eq!(
+                finished.load(Ordering::SeqCst),
+                started.load(Ordering::SeqCst),
+                "run() unwound while workers were still running tasks that borrow its frame"
+            );
+            assert_whole(&pool);
+        })
+    }
+
+    /// When every task panics, a thread stops at its first one: tasks nobody has started are
+    /// skipped, so a job that fails everywhere costs a panic per thread, not one per task.
+    #[test]
+    fn a_panic_skips_the_tasks_nobody_started() {
+        within(|| {
+            let pool = SpinPool::with_threads(&CpuCfg::default(), PANIC_THREADS);
+            let n = if cfg!(miri) { 64 } else { 10_000 };
+            let started = AtomicUsize::new(0);
+            let msg = panic_of(|| {
+                pool.run(n, &|t| {
+                    started.fetch_add(1, Ordering::Relaxed);
+                    panic!("task {t} failed");
+                });
+            });
+            let msg = msg.expect("no panic reached the caller");
+            assert!(msg.starts_with("task "), "payload lost: {msg:?}");
+            let started = started.load(Ordering::Relaxed);
+            assert!(
+                started <= pool.threads(),
+                "{started} of {n} tasks ran after the first panic on {} threads",
+                pool.threads()
+            );
+            assert_whole(&pool);
+        })
+    }
+
+    /// The pool serves job after job with failures among them, including a failure in a nested
+    /// `run` (which goes through rayon while this pool is busy) inside one of its tasks.
+    #[test]
+    fn the_pool_keeps_serving_after_panics() {
+        within(|| {
+            let pool = SpinPool::with_threads(&CpuCfg::default(), PANIC_THREADS);
+            for round in 0..if cfg!(miri) { 2 } else { 20 } {
+                let msg = panic_of(|| {
+                    pool.run(2 * PANIC_THREADS, &|t| {
+                        if t == round % (2 * PANIC_THREADS) {
+                            panic!("round {round} failed");
+                        }
+                    });
+                });
+                assert_eq!(
+                    msg.as_deref(),
+                    Some(format!("round {round} failed").as_str())
+                );
+                assert_whole(&pool);
+            }
+            let msg = panic_of(|| {
+                pool.run(PANIC_THREADS, &|t| {
+                    if t == 1 {
+                        pool.run(8, &|u| {
+                            if u == 5 {
+                                panic!("nested task {u} failed");
+                            }
+                        });
+                    }
+                });
+            });
+            assert_eq!(msg.as_deref(), Some("nested task 5 failed"));
+            assert_whole(&pool);
+        })
     }
 }

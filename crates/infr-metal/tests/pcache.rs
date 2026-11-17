@@ -294,9 +294,19 @@ fn pipelines_round_trip_through_the_persisted_binary_archive() {
     let blob = match cold.blob.clone() {
         Some(p) => p,
         // A device with no binary-archive support is a legitimate configuration, not a failure —
-        // the backend just runs uncached. Nothing below is meaningful there.
+        // the backend just runs uncached. The archive half below is meaningless there, so it is
+        // reported as skipped in the log; what still holds is that an uncached backend never
+        // claims a cache hit and computes the same answer every launch.
         None => {
-            eprintln!("no pipeline archive on this device — nothing to test");
+            eprintln!("skip: no pipeline archive on this device — archive round trip not tested");
+            assert!(!cold.seeded, "an uncached run cannot be seeded");
+            assert_eq!(cold.hits, 0, "an uncached run cannot hit");
+            let (again_out, again) = run_once(Config::default());
+            assert!(
+                again.blob.is_none() && !again.seeded && again.hits == 0,
+                "a second uncached run must not find a cache: {again:?}"
+            );
+            assert_bit_identical("a second uncached run", &cold_out, &again_out);
             std::env::remove_var("XDG_CACHE_HOME");
             return;
         }

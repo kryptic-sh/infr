@@ -1,7 +1,8 @@
 //! Weight-footprint accounting: how many VRAM bytes a model's weights will occupy once resident
-//! (dense vs MoE-expert), mirroring the native-quant/f16 upload policy used by the production
+//! (dense vs MoE-expert), mirroring the native-dtype upload policy used by the production
 //! agnostic-seam loaders.
 use infr_core::WeightSource;
+use infr_gguf::Gguf;
 
 /// VRAM the model's weights will occupy once resident, split dense vs MoE-expert. Experts are
 /// tracked separately so a future expert-streaming / partial-offload mode can budget them apart
@@ -29,15 +30,19 @@ impl WeightFootprint {
     }
 }
 
-/// Resident VRAM bytes for one tensor, mirroring [`upload_wt`]'s path so the estimate matches what
-/// actually gets allocated: native raw blocks (padded to u32) for every quant format, else f16
-/// (float/norms dequanted to half).
+/// Resident VRAM bytes for one tensor, by its file dtype alone: the file's raw bytes, padded to
+/// u32, for every dtype — quant blocks, f16 and f32 alike, as `seam::vulkan_moe_binder` uploads
+/// them — except BitNet `I2S`, which the runner's `wload` host-dequantizes to f16 at load.
+///
+/// Not priced: `wload` also widens a few tensors to f32 by NAME (an f16/bf16 `ssm_conv1d` or
+/// `shortconv.conv` kernel, deepseek2's quantised `attn_k_b`/`attn_v_b`), and those still count
+/// at their file size here — small tensors; see `docs/backlog.md` B193.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn tensor_resident_bytes(dtype: infr_core::DType, numel: usize, nbytes: usize) -> u64 {
-    if infr_vulkan::linear::native_dense_supported(dtype) {
-        ((nbytes + 3) & !3) as u64 // raw blocks, padded to u32 alignment
+    if dtype == infr_core::DType::I2S {
+        (numel * 2) as u64 // dequantized to f16
     } else {
-        (numel * 2) as u64 // f16
+        ((nbytes + 3) & !3) as u64 // raw, padded to u32 alignment
     }
 }
 
@@ -51,23 +56,12 @@ pub(crate) fn tensor_resident_bytes(dtype: infr_core::DType, numel: usize, nbyte
 /// whose weights fit resident. (The rare host-embed fallback paths keep the table off-VRAM, so
 /// counting it is the safe over-estimate direction there.)
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn weight_footprint(g: &dyn WeightSource) -> WeightFootprint {
+pub fn weight_footprint(g: &Gguf) -> WeightFootprint {
     let mut dense = 0u64;
     let mut expert = 0u64;
-    let raw_exl3 = g
-        .as_any()
-        .downcast_ref::<crate::Exl3Source>()
-        .is_some_and(|source| source.is_native());
     for t in g.tensors() {
-        if matches!(g.tensor_rows(&t.name, &[]), Ok(Some(_))) {
-            continue;
-        }
         let numel: usize = t.shape.iter().product();
-        let bytes = if raw_exl3 {
-            ((t.nbytes + 3) & !3) as u64
-        } else {
-            tensor_resident_bytes(t.dtype, numel, t.nbytes)
-        };
+        let bytes = tensor_resident_bytes(t.dtype, numel, t.nbytes);
         if t.name.contains("_exps") {
             expert += bytes;
         } else {
@@ -75,4 +69,25 @@ pub fn weight_footprint(g: &dyn WeightSource) -> WeightFootprint {
         }
     }
     WeightFootprint { dense, expert }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tensor_resident_bytes;
+    use infr_core::DType;
+
+    /// Each dtype is priced at the bytes the seam uploads a tensor of that dtype as (the by-name
+    /// f32 widenings are outside this function, see its doc). An f32 weight is uploaded as f32, so
+    /// pricing it as f16 halved an all-f32 model's footprint: placement then declared it resident
+    /// on a device it does not fit.
+    #[test]
+    fn resident_bytes_follow_the_file_dtype() {
+        assert_eq!(tensor_resident_bytes(DType::F32, 1000, 4000), 4000);
+        assert_eq!(tensor_resident_bytes(DType::F16, 1000, 2000), 2000);
+        assert_eq!(tensor_resident_bytes(DType::Q8_0, 64, 68), 68);
+        // Padded to whole u32 words, as `pad_to_u32_align` uploads it.
+        assert_eq!(tensor_resident_bytes(DType::F16, 3, 6), 8);
+        // BitNet's packed ternary is widened to f16 at load.
+        assert_eq!(tensor_resident_bytes(DType::I2S, 256, 68), 512);
+    }
 }

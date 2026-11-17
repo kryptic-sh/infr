@@ -7,6 +7,9 @@ layout(push_constant) uniform PC { uint n_pairs; } pc;
 layout(binding = 0) readonly buffer TB { uint tok_ids[]; };
 layout(binding = 1) buffer CB { uint counts[]; };
 void main() {
-    uint p = gl_GlobalInvocationID.x;
+    // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
+    uint p = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x;
     if (p < pc.n_pairs) { atomicAdd(counts[tok_ids[p]], 1u); }
 }

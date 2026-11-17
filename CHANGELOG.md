@@ -6,6 +6,1361 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Breaking
+
+- **Host paging API.** `infr_cpu::paged::plan_pools` takes the model's weights
+  as `Pageable`s (size and read pattern, an expert bank's with its layer)
+  instead of `TensorInfo`s; `PoolPlan` gains a public `experts` field, so struct
+  literals of it must set one; `PagedWeights::pool_stats` returns `PoolReport`s;
+  `infr_core::hostmem::cpu_arena_plan` takes the run's `committed` host bytes;
+  `HostPagerStats` gains `read_ns`. New: `PagedWeights::register_experts` /
+  `pin_expert`, `CpuBackend::paged_experts_weight`,
+  `infr_cpu::q4k_expert_repack_available`, `infr_core::blockio::IO_FANOUT` and
+  `HANDLES_PER_FILE` are public.
+
+- **Weight-residency hints and demotion.** `infr_cpu::paged::expert_insert`
+  takes the graph's `infr_core::graph::WeightReuse` as a third argument;
+  `infr_core::pager::trace::Call` gains a `Demote` variant (trace op `d`), so an
+  exhaustive match on it must handle one. New: `Graph::weight_reuse`,
+  `Graph::touched`, `Pager::demote`, `HostPager::demote`,
+  `PagedWeights::{pin_as, demote, demote_experts, streams, done_keep_share}`,
+  `paged::{whole_insert, done_keep, DONE_KEEP_EXPERTS}`, `Backend::host_streams`
+  (default `false`) and `sim::Policy::demote` (default no-op). `HostPagerStats`
+  gains `rereads` and `reread_ns`, so struct literals of it must set them. A
+  cloned `Graph` no longer carries its memoized handle sets, `Graph::push`
+  resets them, and a query after the public `ops` changed length panics.
+
+- **`infr_server::ChatGenerator::vocab_size`** is a new required method: the
+  length of the logits row a `logit_bias` is applied to. The server checks a
+  request's `logit_bias` ids against it before generation, so a streaming
+  request gets the `400` too; it asks only when the request carries a bias.
+  **`infr_llama::sampling::Sampler`** gains a `min_p` field and
+  **`RequestSampling`** gains `min_p` and `logit_bias`, so struct literals of
+  `Sampler` must set it. **`ChatRequest`**'s `logit_bias` is a `LogitBiasArg`,
+  and its `n` and `top_logprobs` are raw JSON values validated by
+  `GenParams::from_request`.
+
+### Added
+
+- **`INFR_CPU_OP_HASH=<path>`** (`debug.cpu_op_hash`), a debugging aid: the CPU
+  backend appends one line per tensor each op reads and writes (backend, graph
+  and op number, the op's profiler label, element count, an FNV-1a hash of the
+  bits), so two runs that should agree, such as one model on two operating
+  systems, can be diffed to the first op that does not. Each execute's lines are
+  appended in one write under a process-wide lock, so backends sharing a file
+  never splice lines; separate processes must not share one. The CPU golden
+  tests in `infr-llama/tests/cpu_backend.rs` honour it.
+
+- **DeepSeek V4 prefills layer-major on the CPU when its experts stream from
+  disk.** A sole request's prompt of more than one chunk, the first at least 256
+  rows, over a host arena (`paging.dram`, `INFR_DRAM_CACHE`) that cannot hold
+  every block runs every chunk through a layer before the next, so each routed
+  expert is read once per prompt instead of once per chunk: on DeepSeek-V4-Flash
+  Q2_K_S with a 12 GB arena a 1443-token prompt in two default chunks read 64.1
+  GB of experts, each once, and prefilled in 195 to 207 s, where chunk-major had
+  taken 209.5 s on its first chunk alone. In 32-row chunks it measured slower
+  (98.96 s against 91.59 s on a 69-token prompt), so shorter chunks keep
+  chunk-major by default; `INFR_LAYER_MAJOR` / `paging.layer_major` forces
+  either order. Bit-identical to the chunk-major prefill. The span graphs carry
+  V4's widened residual between layers, a prompt longer than 1 GiB of carried
+  rows runs in segments (`paging.layer_major_rows`, config only, sets the cap),
+  and the CPU arena keeps a layer's weights hot across its chunks, lets them go
+  first after its last, and keeps the experts the prompt's last row used for the
+  decode (the first decode pass after that prompt hit 470 of its 774 expert
+  pins). Other families are unchanged on the CPU. `INFR_PAGER_STATS` now also
+  prints each pool's re-reads and their read time.
+- **One table for the Vulkan kernels' per-device tuning, and `infr tune`.**
+  Every hardware-shaped number a Vulkan kernel choice depends on (split counts,
+  size bands, rows per workgroup, the decode subgroup pin, which build runs) is
+  now a named parameter, `family.param`, resolved once per device from a generic
+  default, rows of a built-in table for device classes and specific cards, an
+  optional tuning file (`kernels.vulkan.tuning.file` / `INFR_TUNE_FILE`), and
+  `[kernels.vulkan.tune]` / `INFR_TUNE=family.param=value,…` /
+  `--set kernels.vulkan.tune.family.param=value`, each later level winning per
+  parameter. `kernels.vulkan.tuning.rows = false` (`INFR_TUNE_NO_ROWS`) uses the
+  defaults alone and `kernels.vulkan.tuning.disable` (`INFR_TUNE_DISABLE`) drops
+  rows by id. `infr tune show [--dev VulkanN] [--json]` prints each value and
+  the level it came from; `infr tune list [family]` prints every parameter's
+  range, default rule and value on the device; the device banner carries a short
+  hash of the set (`tune:…`). A value you set that is unknown or out of range
+  refuses the device naming its source. **No default changed on any device**:
+  the defaults are the previous rules verbatim (the kernel set dispatched for
+  prefill and decode is identical on the RX 7900 XTX and the Raphael iGPU), and
+  the older knobs — `INFR_SG`, `INFR_FLASH_SPLITS`, `INFR_PV_SPLITS`,
+  `INFR_FLASH_MIN_ROWS`, `INFR_FLASH_BM`, `INFR_MMV_MW_WARPS`,
+  `INFR_MOE_SMALL_M`, `INFR_CANVAS_CHUNK_N`, `INFR_NO_I8CM_KQ` and the
+  `INFR_GEMV_*` group with their config paths — keep working as aliases with
+  their old meanings.
+
+- **`infr_core::math`**: binary32 `exp`, `ln`, `ln_1p`, `tanh`, `sin`, `cos` and
+  `sin_cos`, correctly rounded on every input (each checked on all 2^32 against
+  an independent reference), and `powf`, correctly rounded on every input tested
+  (the known-answer table, a grid, and in review the whole RoPE domain and three
+  sets of 2^32 random pairs) but not proven so; plus `sigmoid`, `silu`,
+  `gelu_tanh` and `softplus` written as the CPU backend's call sites write them,
+  and slice forms (`exp_slice`, `exp_slice_to`, `exp_sub_slice`, `tanh_slice`,
+  `sigmoid_slice`, `silu_slice`, `gelu_tanh_slice`) that vectorize and equal the
+  scalar functions element for element. Every NaN result is the one `math::NAN`.
+  Built from IEEE basic operations only (no FMA, no C runtime), so the bits do
+  not depend on the C library, unlike the `f32` methods, which differ in the
+  last bit between UCRT and glibc: the grid hashes are identical on Windows
+  (native and baseline x86-64 builds) and Linux under WSL; aarch64 has been
+  compiled, and CI's macOS job is the first run there. See `docs/math.md`.
+  Nothing uses the module yet, so no output changes: moving the call sites (and
+  the one-time re-bless of the CPU goldens) is the next slice of
+  `docs/plan/11-cpu-bit-identical.md`. A new lint,
+  `crates/infr-core/tests/no_platform_libm.rs`, counts the call sites still on
+  the platform functions.
+
+- **Wave64-only AMD GPUs (GCN: Polaris, Vega) run on the Vulkan backend** (issue
+  #94), ported from korewaChino's KessokuNet fork. A device that cannot pin a
+  32-wide subgroup but can pin 64 used to be refused at startup; it now runs the
+  same kernels on 64-lane subgroups (`shaders/wave64.glsl`, behind a
+  specialization constant: a workgroup of up to 32 invocations is one subgroup,
+  a larger one is split into 32-lane halves), with the cooperative-matrix tiers
+  off, after a startup known-answer dispatch confirms the driver lays small
+  workgroups out the way that needs. A device must now report the clustered
+  subgroup operations (both AMD drivers on this project's RDNA GPUs do).
+  Verified on this project's hardware only through the new
+  `kernels.vulkan.force_wave64` testing knob (`INFR_FORCE_WAVE64`), which runs
+  the same path on an RDNA GPU. GCN itself has not run this version: the fork's
+  author tested the fork's original commit on an RX 580 (RADV), before the
+  changes made here. Wave32 devices run the same kernels as before, but the
+  SPIR-V of every shader that uses subgroups changed, so the on-disk pipeline
+  cache is rebuilt once.
+
+- **DeepSeek V4 with compressed layers generates on the CPU backend.** Every
+  `deepseek4` layer tier now runs: a ratio-128 (HCA) layer pools every completed
+  block of 128 positions into its compressed cache (`attn_compressor_*`, a
+  softmax over the block per channel, the norm, the compressed-layer YaRN rope)
+  and attends it beside the sliding window; a ratio-4 (CSA) layer pools
+  overlapping windows of 8 positions into its own cache and, with
+  `indexer_compressor_*`, into the lightning indexer's key cache, and its
+  attention output weighs only the `attention.indexer.top_k` blocks the indexer
+  scores highest. On synthetic files llama.cpp also runs, infr's CPU logits
+  match llama.cpp's to within 9.4e-5 at every stored length: all-HCA and
+  every-tier files from 7 to 520 tokens, and an all-CSA file from 7 to 131
+  tokens with a `top_k` of 5, so the top-k drops blocks; at every row of those
+  runs infr's indexer keeps the blocks llama.cpp keeps, but for two listed
+  f16-rounding near-ties. The shipped DeepSeek-V4-Flash file (98.6 GB) now runs
+  on the CPU of a 64 GB machine through the host weight arena and generated
+  coherent text for two prompts, but no oracle has checked its numbers
+  (llama.cpp cannot load it there); nor is the top-k selection checked past 131
+  tokens. The compressed caches default to f16 on the CPU; a quantized KV format
+  applies only when asked for by name and is unverified against the reference,
+  which rotates those rows before quantizing them. Such a session cannot rewind:
+  a prompt that does not extend the previous one exactly re-prefills from the
+  start, as on qwen35. A compressed V4 layer on Vulkan or Metal is refused by
+  name, and V4's prefill runs one token per step. Its compressed caches and
+  compressor state are counted in the KV footprint, the context fit and the
+  `--ctx` clamp.
+
+- **`Op::GatherRows` — DeepSeek V4's compressor source gather — on CPU and
+  Vulkan, with a Metal kernel.** Gathers f32 rows by i32 index, a column window
+  of each, into a grouped destination, so the overlapping compressor's previous
+  and current windows (columns `[0, d)` and `[d, 2d)` of a `2d`-wide state row)
+  land as one `[blocks, window, d]` slab `Op::CompressPool` reads; the HCA
+  compressor's gather is the plain case. A negative index writes the op's `fill`
+  (`0` for values, `-inf` for scores: the reference's sentinel row). An index
+  past the source is refused on CPU and written as `fill` by the GPU kernels,
+  which cannot see index values when recording. The HCA compressor emits it; the
+  Metal kernel runs only on the macOS CI job.
+
+- **`Op::Attention::comp` — DeepSeek V4's compressed key segment — on CPU and
+  Vulkan, and `Op::LightningIndexer::block_ratio`.** A `CompSegment` attends a
+  compressed cache beside the raw window in the same softmax as the per-head
+  sink: block `j` is visible to the query at position `p` once
+  `j < (p + 1) / ratio`, scores `q·c[j]·scale` plus an optional `[rows, len]`
+  bias (the indexer's top-k mask, as `Op::TopkMask` writes it) and is its own
+  value. This is the reference's attention over a concatenated
+  `[raw | compressed]` cache without the copy. Vulkan serves it with `-DCOMP`
+  builds of the scalar `attention_kv` kernel (f16 caches, head dim up to 512, no
+  decode replay); Metal refuses it. The indexer's `block_ratio` makes key `j`
+  eligible iff `j < (p + 1) / block_ratio`, so it scores V4's LID blocks; 1 is
+  V3.2's per-token rule. Every existing graph passes `comp: None` and
+  `block_ratio: 1` and computes the same bits. V4's compressed layers emit
+  `comp`, and its CSA layers the indexer at `block_ratio` 4.
+  `Op::Attention::key_bias` and `Op::Mla::key_bias` must now be exactly
+  `[rows, kv_len]` f32 (`infr_core::graph::check_score_bias`): a longer one was
+  read at the wrong row offset. `Op::LightningIndexer` and `Op::TopkMask` refuse
+  `kv_len` or `top_k` 0.
+
+- **`infr serve` honours `logit_bias` and `min_p`.** `logit_bias` (OpenAI: token
+  id to a bias in -100..=100) is added to the logits before the penalties, as
+  llama.cpp's chain does, on every path of the dense seam decode loop (Vulkan,
+  CPU and Metal): host sampling, greedy (a biased argmax, so a -100 ban holds at
+  temperature 0) and grammar-constrained tool calls, where a bias reorders the
+  tokens the grammar allows and never unmasks one. `min_p` (llama.cpp's rule:
+  drop tokens whose probability is below `min_p` times the top token's, on the
+  raw logits) cuts beside top-k and top-p; `0` is bit-identical to before. Both
+  take the sequence off device sampling and chained decode the way a penalty
+  does — a `logit_bias`, at any temperature; `min_p`, when the device sampler
+  would otherwise run, since it has no min-p cut (greedy keeps device argmax,
+  which min-p cannot change). A key that is not a token id in canonical decimal
+  (`"5"`, not `"+5"` or `"05"`) below the model's vocabulary, an id given twice,
+  a bias outside -100..=100 or a `min_p` outside 0..=1 is a `400` naming the
+  parameter. DiffusionGemma and Metal speculative decoding, whose samplers read
+  neither field, refuse a request carrying a `logit_bias` or a non-zero `min_p`
+  with a `400` naming it (`UnsupportedSampling`, which serve maps to
+  `infr_server::ParamError`; a generator returning a `ParamError` is now
+  answered `400`, or a terminal error frame naming the parameter when
+  streaming). `infr run` has no `--min-p`.
+
+- **`paging.release_uploaded`** (config only, default on): once a resident
+  weight is uploaded to a discrete GPU, its mapped file pages are released from
+  the process's resident set on a background thread; the mapping stays valid and
+  a later host read faults them back in. Before, the whole model stayed in the
+  working set beside its VRAM copy for as long as it was loaded, which on
+  Windows counts as memory in use. Measured on an RX 7900 XTX under
+  `infr serve`, available host memory fell by 0.33 GB instead of 3.6 GB for
+  LFM3-1.7B F16 (3.47 GB), 0.31 instead of 2.1 for SmolLM3-3B Q4_K_M and 0.29
+  instead of 1.34 for Qwen3-1.7B Q4_K_M, with identical output and no change in
+  load time, pp512 or tg128. Not applied on unified-memory devices, the CPU
+  backend, or paged and streamed weights.
+- **`infr_plat::mem::release_mapped` / `resident_bytes`** and
+  **`infr_gguf::TensorBytes::release_resident` / `resident_bytes`**: release a
+  file mapping's pages from the resident set and count those still in it.
+  Implemented on Windows and Linux; other platforms return
+  `ErrorKind::Unsupported`.
+- **`VulkanBackend::linear_tier_counts`** (`LinearTierCounts`): how many int8
+  and dequant multi-row GEMVs and dp4a K-quant GEMMs a backend has recorded,
+  beside `i8cm_kq_counts`, so a test can see which Linear kernel ran.
+- **LFM3 (`lfm3`).** Liquid AI's LFM3-1.7B runs on the CPU and Vulkan backends
+  and decodes on the record-once replay: gated short-convolution layers (`B ⊙ X`
+  through a causal depthwise conv, then `C ⊙`) between QK-normed attention
+  layers that mix full and sliding-window attention by a per-layer pattern and
+  scale each head by a sigmoid gate, with sandwich norms on every layer. Its CPU
+  prefill logits match llama.cpp's to within 0.004 on the F16 file, including a
+  1092-token prompt past the 256-token window, and greedy continuations of a
+  multi-turn chat and of that long prompt are token-identical. A session that
+  extends the previous turn keeps the convolution history, and one that resumes
+  at the previous turn's prefill boundary restores the snapshot taken there; any
+  other turn starts it from zero, as for qwen35. A file declaring the non-causal
+  variant (`attention.causal = false`) is refused, and so, as in llama.cpp, is a
+  file without `attention.layer_norm_rms_epsilon` or, when it has a
+  full-attention layer, without `rope_freqs.weight`. The Metal backend has the
+  two new ops too; that path has not been run on Apple hardware.
+- **`Op::ShortConv` and `Op::HeadGate`** (`infr_core::graph`): LFM's gated short
+  convolution and a per-head sigmoid output gate, on the CPU, Vulkan and Metal
+  backends.
+- **`infr_llama::Config`**: `lfm3`, `shortconv_layers`, `shortconv_l_cache`,
+  `swa_layers` (a per-layer window pattern `is_swa_layer` answers from) and
+  `sandwich_norm`, with `is_shortconv_layer`, `is_recurrent_layer`,
+  `has_recurrent_state` and `recurrent_state_elems`.
+- **`infr_llama::seam::window_ring_rows`**: the rows a session's shortest
+  sliding-window ring holds at a given context and prefill chunk.
+- **`paging.early_submit`** (config only, default 8; `0` = off): on Vulkan, a
+  paged forward (MoE experts or dense layers streamed through the VRAM cache) is
+  cut into segments that the GPU starts on while the host records the rest. The
+  first segment closes at this many dispatches and each later one at twice the
+  last. It starts over each time a paged MoE layer drains the queue for its
+  router ids and each time the staging ring rotates, so a forward takes a
+  logarithmic number of cuts between two of those, not in all. Separate from the
+  submit splitter (`device.submit_dispatches`), whose watchdog cap is still
+  checked first, so it never lengthens a submit.
+  `infr_vulkan::VulkanBackend::segment_cuts` counts that backend's watchdog
+  cuts, early cuts and ring rotations, and (`SegmentCuts::drain`) the blocking
+  router-id readbacks of paged MoE layers that were not wholly resident.
+- **ERNIE 4.5 MoE (`ernie4_5-moe`).** Baidu's ERNIE-4.5-21B-A3B runs on the CPU
+  and Vulkan backends, with its experts resident or paged, and decodes on the
+  record-once replay: the dense `ernie4_5` attention, a routed FFN (6 of 64
+  experts) on every layer past the leading dense one and on the interleave step,
+  a softmax router whose `exp_probs_b` bias picks the experts while the unbiased
+  probabilities weight them, and a shared expert summed in. Its prefill logits
+  share llama.cpp's top-5, and a chat answer's 64 greedy tokens are the same
+  text as llama.cpp's, CPU against CPU and Vulkan against Vulkan. A file missing
+  a tensor this layout needs, or carrying one it does not use, is refused naming
+  it. The Metal backend applies the router bias too, on the same rule; that path
+  has not been run on Apple hardware.
+- **`infr_gguf::dequant::{factor_block, expand_factored, has_factored_form}`**:
+  one affine quant block decoded into its factored parts, and their expansion to
+  f32 — the two halves `dequant_factored` and `dequant_block` are now built
+  from, for a caller that wants a block at a time.
+- **`infr_core::hostpager::HostPager::read`**: a block's bytes into the caller's
+  buffer without taking a slot or a pin, so a background reader beside the
+  tier's pinning callers can never make a `pin` fail. It comes with the paged
+  MoE session's filling API (`MoePagerSession`'s `request_fills`,
+  `stage_ready_fills`, `fills_copied`, `end_forward` returning a
+  `StoppedFillReader`, `fills_layer`, `fill_reader_active`, `fill_slots_held`,
+  `fills_pending` and `fills`; `GpuPager::fill_staged` and `GpuPager::fills`;
+  `infr_vulkan::pager::FILL_AHEAD_BYTES`), with
+  `VulkanBackend::moe_pager_totals`, and with `segment_cuts` and
+  `moe_pager_totals` on `infr_llama`'s `DenseVulkanSession`.
+- **`infr_llama::Config::optional_router_bias`**: whether the arch's reference
+  loads `blk.N.exp_probs_b.bias` as optional on its MoE layers (deepseek2 and
+  ernie4_5-moe).
+- **`VulkanBackend::dense_pager_totals`** (and `dense_pager_totals` on
+  `infr_llama`'s `DenseVulkanSession`): the dense streaming cache's VRAM
+  counters, the blocks its host tier read off the model file, and how many
+  weight groups stream, as an `infr_vulkan::pager::DenseTotals`; `None` when
+  nothing streams. With `infr_vulkan::linear::dense_stream_supported` and
+  `dense_stream_slot_align`, the dtypes the dense streaming planner accepts and
+  the slot alignment each needs.
+
+### Changed
+
+- **A GPU session with no room left for any context fails with the numbers.**
+  When the device's free memory after the weights cannot hold even a one-token
+  context (another application took the room, or the model is too large), the
+  session now refuses at load with the allocatable memory measured and what a
+  one-token context needs, instead of failing each request with "prompt N + gen
+  M exceeds the session KV capacity 0".
+
+- **The CPU backend pages MoE expert banks per expert, and DeepSeek V4-Flash
+  decodes about 100 times faster from disk.** With a host weight arena
+  (`paging.dram`, or the automatic one when a model does not fit memory) an
+  expert bank is one block per expert, and `Op::MoeFfn` pins only the experts
+  its router picked, all banks' reads in flight at once on threads of their own.
+  A bank used to be one block, so a routed expert read the whole bank. The arena
+  now goes first to the weights every token reads (attention, shared experts,
+  the output head), then to experts; it used to be split by file size, which
+  left most dense weights to be re-read every token. Experts a decode step reads
+  are kept by recency; a prefill chunk that routes to half or more of a bank is
+  inserted at the cold end instead, so a long prompt's chunks keep the resident
+  set rather than each evicting what the next needs (synthetic: 0 hits a chunk
+  before, about 135 of 576 after). On Windows each model file is opened once per
+  concurrent read, because Windows runs a handle's reads one at a time. Measured
+  on `ggml-org/DeepSeek-V4-Flash-0731-GGUF:Q2_K_S` (98.6 GB, CPU, 12 GB arena,
+  "Hi", 64 GB Windows box): prefill of 5 tokens 147.1 s → 16.2 s, decode 123.3 s
+  → 1.28 s a token; tokens unchanged.
+
+- **DeepSeek V4 prefills in chunks on the CPU backend.** A `deepseek4` prompt
+  used to prefill one position per graph, walking every layer's weights (and on
+  the real model every routed expert a token picks) once per prompt token; it
+  now prefills like every other model, in chunks of `INFR_UBATCH` rows, through
+  every layer tier (the sliding window, the HCA and CSA compressors, the
+  lightning indexer), hash- and bias-routed layers and the hyper-connection
+  streams. Output is bit-identical to one position per graph on the synthetic V4
+  files at every chunk height tried (logits, every indexer selection, every
+  compressed cache and ring, and the decode after), and the llama.cpp
+  comparisons are unchanged. `INFR_UBATCH=1` keeps one position per graph; the
+  GPU backends still prefill V4 that way. On a file whose expert banks take the
+  CPU's int8-activation path (Q4_K, Q5_K, Q6_K, Q8_0) chunked prefill differs
+  from one position per graph by that rounding, as on every MoE model (1.7e-4 on
+  a synthetic Q8_0-bank file); the shipped file's banks are Q2_K, which do not.
+  The chunk shrinks as the context grows on a file with ratio-4 layers, so each
+  of a layer's two `rows × blocks` buffers stays within 64 MiB (1008 rows at
+  64k, 408 at 160k, 63 at 1M). Measured on a Ryzen 9 9950X3D (32 threads): the
+  synthetic file's 512-token prefill went from 1589 / 1620 ms to 27.9 / 27.5 ms
+  (per-graph overhead, nearly all of it), and one V4-Flash routed-expert layer
+  with Q2_K banks costs 0.62-0.63 ms per position in a 1024-row chunk, the
+  default height, against 5.7 ms one position at a time. On the shipped file a
+  5-token prompt prefills in 16.2 s at a 12 GB host arena, most of it the first
+  read of every dense weight; a long prompt's gain there was not measured.
+  `infr_cpu::indexer_tap::IndexerRow` gains `op`, the ordinal of the indexer op
+  that scored the row; the new `infr_cpu::op_tap` records each graph's attention
+  row counts and embedding gathers for tests, and
+  `infr_testkit::gguf::Fill::Quant` writes a quantized tensor into a synthetic
+  GGUF.
+
+- **DeepSeek V4's compressed layers cost the CPU what they use.**
+  `Op::Attention` attends only the compressed blocks the top-k keeps, skipping a
+  masked one before its dot as llama.cpp does, and converts only the cache rows
+  it reads instead of the whole committed prefix; `Op::LightningIndexer` scores
+  a decode row's blocks across every core and keeps its top-k by a partial
+  selection instead of a linear scan per slot. Output is bit-identical (the
+  synthetic V4 file's logits keep their digest). Measured op-level on synthetic
+  caches at V4-Flash's geometry, one decode row, 32 threads on a Ryzen 9
+  9950X3D: a ratio-4 (CSA) layer at a 64k context went from 57.5 / 57.2 ms to
+  1.15 / 1.05 ms per token (indexer 38.8 → 0.39 ms, attention 18.8 → 0.77 ms),
+  and at 8k from 7.3 / 7.1 to 0.77 / 0.76 ms; ratio-128 layers and the synthetic
+  file end to end are unchanged within noise. On the shipped file a decode token
+  costs 1.28 s with a 12 GB host arena, nearly all of it expert reads from disk.
+  DeepSeek V3.2 emits the same indexer op over whole batches, so its prefill and
+  decode take the new scoring and selection too; no V3.2 model was timed.
+
+- **DeepSeek V4 (`deepseek4`) stores its attention row once.** V4's attention
+  reads the same row as K and V (`build_attn_mha(q, k_all, k_all, …)`), and the
+  KV cache kept a second, identical copy for V. That copy is gone: a ratio-0 V4
+  layer writes one cache and attends over it as both sides, so the KV cache, the
+  context-fit math and the default-context clamp that size it are half what they
+  were for V4, and a fitted context grows to match. Output is bit-identical.
+  `INFR_KV_TYPE_V` no longer applies to deepseek4: its one cache takes
+  `INFR_KV_TYPE_K`'s format, and a V setting no longer blocks the SWA ring, the
+  Metal mixed-format clamp or auto-q8 for it.
+
+- **`infr serve` answers `n > 1`, `logprobs: true` and `top_logprobs > 0` with a
+  `400`** saying the feature is not supported, instead of returning one choice
+  and no log probabilities as if the request had been honoured. `n: 1`,
+  `logprobs: false`, `top_logprobs: 0` and `null` are accepted as before, and a
+  whole-number float (`n: 1.0`) reads as that integer; any other non-integer `n`
+  or `top_logprobs` is a `400` naming the parameter.
+
+- **A streamed dense model whose cache holds every block decodes through the
+  record-once replay and the decode chain** (Vulkan), as a resident one does,
+  instead of re-recording and waiting on every token. The recording bakes each
+  streamed weight's slot address and is recorded again whenever the dense
+  pager's new placement epoch (`DensePagerSession::placement_epoch`) moves; a
+  decode that starts on an empty cache stages its weights in a pass of its own
+  first. A cache that cannot hold every block keeps the per-token path. On the
+  RX 7900 XTX, two interleaved rounds, host CPU load 0-4% at all but one start:
+  Qwen3-1.7B Q4_K_M at `INFR_CACHE=2G` went from tg128 386.4 / 385.5 to 469.4 /
+  469.1 t/s (resident: 479.0 / 478.8), and ERNIE-4.5-0.3B F16 at `INFR_CACHE=1G`
+  from 384.7 / 384.8 to 444.3 / 444.2 (resident: 449.7 / 449.9); on the
+  integrated GPU (one round) Qwen3 went from 26.81 to 27.54 (resident 27.42).
+  Prefill, the evicting budgets and SmolLM3-3B (which does not replay) are
+  unchanged within noise. A replayed step stages nothing, so `paging.stats` and
+  `dense_pager_totals` no longer count hits for it. New
+  `VulkanBackend::force_dense_epoch_move_after` (a test hook) and
+  `ParallelSeam::backend`.
+- **A streamed quantised Linear runs the kernel its resident twin would**
+  (Vulkan). Streamed dense weights had a routing of their own that left out the
+  int8 K-quant coopmat GEMM, the multi-row GEMVs and every decode GEMV but the
+  plain one; resident and streamed now share one decision, reading a streamed
+  weight from its arena slot. On the RX 7900 XTX, two interleaved rounds, host
+  CPU load 0-9%: Qwen3-1.7B Q4_K_M at `INFR_CACHE=2G` went from pp512 7659 /
+  7576 to 12122 / 12037 t/s (resident: 11841 / 11798) and tg128 from 308.3 /
+  308.0 to 387.4 / 387.5; SmolLM3-3B Q4_K_M at `INFR_CACHE=2G` from pp512 4033 /
+  4042 to 6344 / 6320 (resident: 6299 / 6260) and tg128 from 172.2 / 172.1 to
+  251.6 / 250.7. An evicting cache prefills at the same rate (Qwen3 at 800M:
+  7508 / 7480 to 11893 / 11889); evicting decode is unchanged within noise. On
+  the integrated GPU (one round) streamed decode holding every block went from
+  9.28 to 26.85 t/s for Qwen3 (resident 27.45) and from 4.64 to 12.68 for
+  SmolLM3 (resident 12.66); prefill there already took the resident GEMMs. On
+  the default configuration streamed output is now bit-identical to resident
+  where it used to differ by the int8 activation rounding; with `INFR_CM_8X8`,
+  `INFR_F8_COOPMAT`, `INFR_I8_COOPMAT` or `INFR_BF16_COOPMAT` a streamed Linear
+  still skips that opt-in tier and runs a different-precision kernel than
+  resident. A weight past the u32 addressing cap at 2 to 16 rows now takes the
+  chunked per-row GEMV, resident and streamed: the multi-row GEMVs used to take
+  it unchunked. At more rows a streamed one takes that GEMV too, and a resident
+  one still fails loudly.
+- **A streamed dense model whose cache holds every block no longer pays for
+  streaming it does not do** (Vulkan). Layer-major prefill now runs only for a
+  prompt of more than one chunk on a cache that cannot hold every block
+  (`paging.layer_major` still forces it either way; new
+  `Backend::dense_holds_every_block`), and the two arena barriers around a
+  streamed Linear's staging copy are recorded only when a copy is, not on every
+  hit. On the RX 7900 XTX, two interleaved rounds, host CPU load 0-7%:
+  ERNIE-4.5-0.3B F16 at `INFR_CACHE=1G` went from pp512 8505 / 8236 to 22614 /
+  22707 t/s (resident: 22763 / 22134) and tg128 from 357.5 / 358.3 to 385.3 /
+  383.4 (resident: 449.8 / 449.6); Qwen3-1.7B Q4_K_M at `INFR_CACHE=2G` from
+  pp512 4148 / 4226 to 7711 / 7666 and tg128 from 292.3 / 291.9 to 307.7 /
+  307.8. A 512-token prompt on an evicting cache, one chunk, gains the same way
+  (ERNIE at 512M: 6533 / 6676 to 21733 / 21903); evicting decode is unchanged.
+  Tokens are unchanged. New counters `VulkanBackend::static_executes` and
+  `arena_barriers` (also on the Vulkan session) show which path ran.
+- **A CPU model keeps its backend and bound weights between requests.**
+  `SeamModel::generate_cpu`, `generate_cpu_constrained`, `generate_cpu_ids` and
+  `bench` (so `infr run`/`infr serve`/`infr bench` with `--ngl 0`) used to build
+  a new `CpuBackend`, bind every weight and, with `paging.dram` set, open a new
+  host arena on every call, so the arena re-read the whole model from disk per
+  request. They now share one per model: the weights are bound once, the
+  backend's derived-weight caches (and the fused-MoE repack cache, up to
+  `kernels.cpu.repack_mb`) and the paged arena last as long as the model. With
+  `INFR_DRAM_CACHE` set, warm-request time to first token went from 245.3-289.7
+  to 79.6-88.0 ms on Qwen3-1.7B Q4_K_M (2 GB arena) and from 2253.9-2398.7 to
+  242.8-258.9 ms on ERNIE-4.5-21B-A3B Q4_K_M (16 GB), 16 threads, two
+  interleaved rounds of five warm requests with 2-6% of the box busy elsewhere;
+  without paging nothing measurable changed (ERNIE warm prefill 202.4 ms before,
+  203.5 ms after, averaged over 24 requests each). Every generation's tokens are
+  unchanged. The spin pool is still built per generation: kept, it prefilled
+  ERNIE about 10% slower (new `CpuBackend::release_pool`, called after each
+  generation). A second generation running while another holds the model's
+  backend gets one of its own, as before, and drops it at the end: it never
+  replaces the model's. Weights the loader rewrote into owned memory, the
+  backend's caches and the paged arena are now held while the model is idle.
+  `paging.stats` now counts since the model's first CPU generation.
+- **`infr bench --ngl 0` warms up with a whole timed rep.** The warmup used to
+  be shorter than a rep for tg (one generated token) and pg (`p` prompt tokens
+  and one generated); pp already prefilled the timed prompt. A MoE model's first
+  tg rep no longer reads experts the warmup never routed to: Qwen3-30B-A3B
+  Q4_K_M tg64 reps 3.68, 26.24, 25.24 before, 26.53, 27.02, 27.20 after. With
+  `paging.dram` set, every rep now runs on the arena the warmup already filled,
+  where each rep used to fill its own, so CPU bench numbers under paging (such
+  as those in `docs/perf/results.md`) do not compare with earlier ones.
+- **CPU prefill of dense K-quant models is level with llama.cpp's CPU on
+  Windows, and decode within about 6%** (Ryzen 9 9950X3D, 16 threads; two
+  interleaved rounds of four reps against the previous build and
+  `llama-bench -ngl 0 -t 16` on the same files, taken with an intermediate
+  version that pinned each pool thread to a core of its own; the placement that
+  shipped matched it within noise, see below). pp512 warm reps: Qwen3-1.7B
+  Q4_K_M 692.96-709.05 and 628.43-733.11 t/s to 1078.38-1111.61 and
+  1026.68-1143.06 (llama.cpp 1128.14-1141.88 and 1120.53-1151.13); LFM3-1.7B
+  Q4_K_M 828.63-858.74 and 876.27-877.32 to 1226.86-1251.96 and 1069.51-1206.10
+  (llama.cpp 1135.79-1193.56 and 1112.89-1159.61). tg128: Qwen3-1.7B 51.11 and
+  51.12 to 56.83 and 56.72 (llama.cpp 59.88-60.24); LFM3-1.7B 52.62 and 52.43 to
+  59.36 and 59.62 (llama.cpp 53.95-61.40). Every result is bit-identical to
+  before; the CPU goldens are unchanged. Also measured, one run each: SmolLM3-3B
+  Q4_K_M pp512 warm reps 435.77-436.57 to 654.70-680.70, tg64 30.71 to 33.06;
+  Qwen3-30B-A3B Q4_K_M pp512 warm reps 285.90-288.06 to 414.52-418.84, tg64 warm
+  reps 24.03-24.07 to 27.81-27.95. What changed:
+  - **Pool threads keep off each other's SMT siblings on Windows.** Left to the
+    OS, the spin pool's 16 threads ended up on SMT siblings of each other: a
+    process restricted to one logical processor per core ran Qwen3-1.7B pp512 at
+    1120.55-1154.06 t/s against 725.65-746.13 unrestricted, and an unrestricted
+    run started near 1072 and fell to about 750 within four reps. When a pool's
+    threads (workers and the dispatching thread) fit one per allowed core, each
+    pool thread, and the thread running the graph for the length of the walk,
+    now selects CPU sets naming one logical processor of every such core, the OS
+    still placing the threads among those; with more threads than cores (`-t 32`
+    here) nothing is selected and the OS keeps every allowed logical processor.
+    It never widens an affinity: only cores inside the process's affinity (and
+    the pool-building thread's own, when narrower) are named, a thread that
+    already has CPU sets keeps them, and a process with default CPU sets is left
+    alone. The placement is worked out once per pool, so an affinity change
+    after that is not picked up by it. Several processes or sessions share the
+    whole set, so they do not stack: two concurrent `infr bench --ngl 0 -t 4`
+    runs of Qwen3-1.7B pp512 measured 399.21-413.06 t/s each, against
+    230.22-240.99 left to the OS (and 218.77-225.92, in an earlier window, with
+    one fixed core per thread, an intermediate version of this change). Single
+    process, two interleaved rounds against `kernels.cpu.core_spread = false`:
+    Qwen3-1.7B pp512 1109.62-1135.26 against 743.41-753.98, LFM3-1.7B
+    1217.95-1270.19 against 862.84-891.19; three rounds of tg128: Qwen3-1.7B
+    55.60, 55.81 and 55.82 against 53.95, 54.02 and 54.07, LFM3-1.7B 56.93-58.02
+    against 52.47-53.79; `-t 32` pp512 1025.83-1055.54 against 1027.26-1062.36
+    (no placement either way). In an earlier window, fixed per-core pins
+    measured the same as the CPU-set placement within noise.
+    `kernels.cpu.core_spread = false` turns it off. The default thread count
+    (one per physical core) now counts only the cores inside the process's
+    affinity, of every efficiency class. Platforms other than Windows have no
+    placement yet and keep the OS's.
+    `infr_plat::cpu::{spread_placement, apply_placement, clear_placement, current_placement, Placement}`
+    are new.
+  - **Decode's Q4_K and Q6_K dots fold the scales into the widening multiply**
+    (`vec_dot_q4k`, `vec_dot_q6k` on AVX-512BW) and take one horizontal sum per
+    super-block instead of one per sub-block (Q4_K) or per 16 elements (Q6_K);
+    the Q4_K scales unpack eight at a time. Single-thread throughput over a 64
+    MB weight matrix: Q6_K 14.7-14.9 to 40.0-45.5 GB/s, Q4_K 26.4-27.2 (after
+    the scale fold alone) to 34.2-37.4. Qwen3-1.7B tg32 on one thread: 11.11 to
+    31.66 t/s (llama.cpp 31.82).
+  - **A single-token Linear claims up to 128 weight rows per pool task**
+    (`out_f / (2 · threads)`, at least 16) instead of always 16: Qwen3-1.7B
+    tg128 54.96 and 55.20 to 56.34 and 56.77; LFM3-1.7B unchanged within noise.
+  - **Prefill attention runs a block of 16 query rows per task for one head**,
+    latest block first, so the rows of a block share that head's K/V rows in
+    their core's cache: 3.56-3.64 to 2.84-2.91 ms per Qwen3-1.7B layer at pp512.
+    The f16 KV prefix is widened to f32 across the pool instead of on the
+    dispatching thread.
+- **Vulkan prefill and decode on GPUs without a cooperative matrix are faster,
+  and ahead of llama.cpp on the integrated GPU measured** (RDNA2 iGPU, AMD
+  Windows driver; two interleaved runs of three reps each against the previous
+  build): Qwen3-1.7B Q4_K_M pp512 126.2 and 126.2 t/s to 231.9 and 232.0, tg128
+  23.8 and 23.8 to 27.5 and 27.4; LFM3-1.7B Q4_K_M pp512 138.2 and 138.3 to
+  236.7 and 236.8, tg128 23.7 and 23.6 to 26.7 and 26.7 (llama.cpp on the same
+  files and device: 187.04 / 25.46 and 195.95 / 25.27). What changed:
+  - **K-quant prefill GEMM.** Q4_K, Q5_K and Q6_K Linears past 64 rows take a
+    new register-blocked int8-dot GEMM (`native_gemm_dp4a_kq.comp`: 128 tokens
+    by 64 weight rows per workgroup, 8 by 8 outputs per thread, two 32-element k
+    blocks per barrier pair, on the int8 coopmat GEMM's staging) where the
+    per-dtype `native_gemm_mmq_*` tile computed 4 by 4 outputs per thread and
+    synchronized every k block. The integer sums are the old kernel's; only the
+    float association of the per-block scaling moved. Per call on Qwen3-1.7B
+    pp512: the fused gate/up 13.6 to 8.0 ms, the Q6_K `ffn_down` 8.0 to 4.1 ms,
+    the 2048-wide projections 2.3 to 1.3 ms. Turn it off with
+    `INFR_NO_DP4A_KQ=1` (`kernels.vulkan.dp4a_kq = false`).
+  - **Non-coopmat prefill attention (`attn_nc_fa.comp`)** register-blocks the
+    score and output tiles, runs the softmax on every thread and keeps the
+    output accumulator in registers: 6.5 to 2.3 ms per call on Qwen3-1.7B pp512.
+    It now fits the 32768 bytes of shared memory every Vulkan device guarantees;
+    it used to ask for 37632 (hd 128), 54016 (hd 256) and 47616 (hd 512).
+  - **The int8 decode GEMV on an integrated GPU** computes four outputs per
+    workgroup at every width (a discrete GPU keeps that below 2048 wide): on
+    LFM3-1.7B the fused gate/up 628.6 to 544.4 us, `ffn_down` 403.6 to 363.1 us,
+    the lm_head 8.7 to 7.6 ms per token.
+  - **Sibling Linears share one quantized input** on the non-coopmat GEMMs and
+    on the m=1 int8 GEMV, and the Q6_K int8 GEMV reads a block's `d` and its two
+    scales with one load each. On the RX 7900 XTX this is the only change that
+    runs: Qwen3-1.7B tg128 447.5 and 447.3 to 479.6 and 479.1 t/s (the k and v
+    GEMVs reuse the q projection's quantized input: 5376 to 3584 quant passes
+    over 32 tokens); LFM3-1.7B tg128 and both pp512 are unchanged within noise.
+- **Vulkan prefill of Q4_K, Q5_K and Q6_K weights now quantizes the activations
+  to int8, as llama.cpp's Vulkan backend does, on devices running the AMD
+  proprietary driver** (`DriverId::AMD_PROPRIETARY`; measured on the Windows
+  driver only). Each 32-element block of activations is quantized to int8 once
+  (shared by sibling projections that read the same input) and an integer
+  cooperative-matrix GEMM (`native_gemm_i8cm_kq.comp`) reads the weight blocks
+  raw, where the f16 coopmat GEMM rounded activations to f16 and dequantized
+  every weight. The device must also pass the int8 accumulator-layout check at
+  init, which now runs by default there. RADV and every other device keep their
+  GEMMs. Turn it off with `INFR_NO_I8CM_KQ=1`
+  (`kernels.vulkan.i8cm_kq = false`). pp512 on the RX 7900 XTX, two interleaved
+  runs of three reps each against the previous build: Qwen3-1.7B Q4_K_M 7580.6
+  and 7504.5 t/s to 11901.5 and 11869.9; LFM3-1.7B Q4_K_M 7165.3 and 7045.8 to
+  12098.1 and 12075.9; SmolLM3-3B Q4_K_M 4000.9 and 3994.2 to 6258.9 and 6253.3
+  (llama.cpp on the same files: 9612.77, 10172.32, 5437.08). Per call on LFM3
+  the fused gate/up went from 1.1 ms to 576.2 us and `ffn_down` from 794.7 /
+  820.5 us (Q4_K / Q6_K) to 397.6 / 457.4 us. Decode and the integrated GPU are
+  unchanged (Qwen3-1.7B there: 126.2 t/s pp512 before and after). **What it
+  costs in accuracy**, over 1530 positions of wikitext-2 against the f32 CPU
+  reference: next-token top-1 agreement falls from 0.9987 to 0.9765 (Qwen3-1.7B)
+  and from 0.9987 to 0.9863 (SmolLM3-3B), mean KL divergence rises from 0.000003
+  to 0.001722 and from 0.000002 to 0.000730, and perplexity from 16.3126 to
+  16.3407 (+0.17%) and from 8.2475 to 8.2575 (+0.12%). llama.cpp's Vulkan
+  backend on the same tokens: top-1 0.9824 and 0.9863, KL divergence 0.001792
+  and 0.000328 as scored from its `--kl-divergence-base` dump, whose 16-nat
+  floor biases that score low; infr's logits scored through the same encoding
+  give 0.001479 and 0.000335. Details in `docs/backlog.md` B192.
+- **`quant_q8` quantizes eight blocks per workgroup** instead of one, with the
+  same per-block arithmetic, so its results are unchanged. On a Qwen3-1.7B pp512
+  forward on the RX 7900 XTX the quant passes took 3.35 ms over six per layer
+  and now take 1.5 ms over four (the two repeats on the K and V inputs reuse the
+  Q projection's).
+- **CPU prefill of the causal convolutions is several times faster.** qwen35's
+  `Op::Conv1dSilu` and LFM3's `Op::ShortConv` now share one convolution that
+  runs each tap across a whole row against a transposed kernel, and the short
+  convolution forms `B ⊙ X` as it reads it instead of in a serial pass of its
+  own; the results are bit-identical to before. Per layer on a 512-token chunk
+  (`INFR_PROF_OPS`, 16 threads, warm reps): `Conv1dSilu` 4137.6-4237.1 us to
+  690.4-698.2 us on Qwen3.5-0.8B, `ShortConv` 4130.8-4279.0 us to 389.8-435.3 us
+  on LFM3-1.7B. pp512 on the Windows box, two interleaved runs of four reps
+  each: Qwen3.5-0.8B Q4_K_M 913.6 and 882.6 t/s to 1052.8 and 1022.6; LFM3-1.7B
+  Q4_K_M 610.0 and 620.9 to 680.6 and 672.1 (the LFM3 means include a cold first
+  rep near 160 t/s; the warm reps reached 774.2 and 790.4 before, 863.5 and
+  865.5 after). Decode is unchanged.
+- **The KV-cache estimate prices a recurrent layer at its fixed state size.**
+  The context fit and the placement sweep used to price a qwen35 DeltaNet layer
+  as if it cached K and V per token, so a qwen35 session's default context was
+  sized against memory the runner never allocates. They now price its conv and
+  `S` state (and LFM3's convolution history) at what is allocated, twice over:
+  the live state and the one snapshot of it a slot keeps for MTP rollback and
+  for resuming at a prefill boundary. The snapshot's allocation fails the
+  request when refused, so the fit now keeps room for it.
+- **Paged MoE decode on Vulkan reaches its no-readback path from a short prompt
+  when the expert cache can hold the whole model.** A MoE layer decodes without
+  reading its router ids back only once every one of its experts is in VRAM, and
+  until now only a long prefill put the experts no token routes to there:
+  decoding from a short prompt read router ids back on every layer of every
+  token for as long as it ran. Now, when every expert pool has a slot for every
+  expert, a background thread reads the experts no token has routed to (from
+  wherever a miss reads them, straight into a host staging buffer) while the
+  decode runs, and the decode copies them into free slots — never evicting —
+  until each layer is wholly resident; the thread stops once nothing is left to
+  fill. Reads start only after a whole forward without a miss, so they do not
+  compete with the experts a decode is still routing to; a cache that cannot
+  hold the model never fills. A fill whose read fails turns filling off for the
+  session with a warning instead of failing the decode; only a token that routes
+  to that expert fails, as before. On the RX 7900 XTX at `paging.cache=20g` with
+  no prefill, interleaved runs: tg2048 Qwen3-30B-A3B 123.7, 123.8 to 167.6,
+  168.6 t/s, ERNIE-4.5-21B-A3B 141.1, 140.6 to 174.4, 174.5 (the bench's untimed
+  warm-up run of the same length is where the fills land). The reads still cost
+  a short decode a little before it gains: tg128 there goes from 121.4, 119.8 to
+  117.0, 117.7 (Qwen3) and 139.1, 139.9 to 136.6, 135.9 (ERNIE). After a
+  365-token prefill, at `paging.cache=4g paging.dram=12g`, and resident,
+  throughput is unchanged. `paging.stats` prints each pool's `fills`.
+- **Paged MoE decode on Vulkan is up to 11% faster** where the expert cache
+  holds every layer: a paged decode token is re-recorded each time, and the GPU
+  used to wait for the whole recording before starting. On the RX 7900 XTX,
+  interleaved with the previous build, tg128 after a 365-token prefill at
+  `paging.cache=20g`: Qwen3-30B-A3B 160.4, 158.7 to 176.8, 177.1 t/s,
+  ERNIE-4.5-21B-A3B 166.2, 165.8 to 177.9, 178.1 (resident: 186.4 and 184.4). At
+  `paging.cache=4g paging.dram=12g` Qwen3-30B-A3B goes from 76.7, 79.8 to 82.5,
+  82.1; ERNIE there is unchanged, and ERNIE decoding with no prefill at
+  `paging.cache=20g` is about 1.5% slower (141.6, 141.5 to 139.8, 139.1).
+  Streamed dense prefill on the integrated GPU gains too (Qwen3-1.7B pp128 at
+  `paging.cache=200m`: 117.3, 117.2 to 130.5, 130.2). Resident runs take no
+  early cut.
+- **Prefill on the CPU backend is 2.6-6.1× faster, and ahead of llama.cpp's CPU
+  at 512 tokens.** Warm pp512 on a Ryzen 9 9950X3D, 16 threads, interleaved with
+  the previous build: SmolLM3-3B Q4_K_M from 175-184 to 622-636 tok/s
+  (llama.cpp: 579), ERNIE-4.5-21B-A3B Q4_K_M from 73-81 to 374-449 (llama.cpp:
+  246), Qwen3-30B-A3B Q4_K_M from 147-151 to 395-400 (llama.cpp: 231). Short
+  prompts gain too: pp16 SmolLM3 54-68 to 292-309 (llama.cpp: 381), ERNIE 13-20
+  to 101-121 (llama.cpp: 111), Qwen3-30B-A3B 54-63 to 155-160 (llama.cpp: 120).
+  Every result is bit-identical to before and every CPU golden is unchanged. The
+  causes, in order of size: each op wrote a fresh multi-megabyte buffer, so the
+  forward spent much of its time faulting in zeroed pages (`execute` now reuses
+  the buffers the previous layer freed); Q4_K, Q5_K and Q6_K prefill Linears and
+  MoE expert GEMMs run a packed AVX-512 VNNI GEMM that carries four tokens per
+  pass over an 8-row weight group (Q6_K from three tokens up, below which its
+  per-row kernels are as fast), packs each group into per-thread scratch instead
+  of allocating per call, and writes the row-major output directly instead of
+  through a transposed temporary (Q5_K had no packed path at all; the dense Q6_K
+  path rebuilt its whole-weight pack on every request); `Rope` ran on one thread
+  and recomputed its angles per head; attention's q·k dots, and an f32 MoE
+  router's, waited on one FMA chain at a time; and the MoE down stage
+  un-transposed a whole layer's output with a cache line per element. The dense
+  Q6_K pack cache is gone, so `kernels.cpu.repack_mb` now bounds only the
+  fused-gate/up MoE Q4_K packs. Decode is unchanged.
+- **MoE decode on the CPU backend is 3.4-3.5× faster.** A single-token MoE step
+  runs its routed experts on f32 activations, and dequantized every expert
+  weight row through the general host dequant first: four allocations and two
+  passes per row. Expert rows in every affine quant (Q4_0, Q4_1, Q5_0, Q5_1,
+  Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K) are now decoded 256 elements at a time on
+  the stack and fed straight into the dot, with the same bits as before, so
+  every output is unchanged. The codebook and fp4 formats (the IQ and TQ quants,
+  MXFP4 as gpt-oss's experts use, NVFP4, Q2_0) still take the old path. Warm
+  decode on a Ryzen 9 9950X3D, 16 threads: ERNIE-4.5-21B-A3B Q4_K_M from 7.4 to
+  25.2 tok/s (llama.cpp's CPU: 29.70), Qwen3-30B-A3B Q4_K_M from 7.5 to 26.1
+  tok/s (llama.cpp: 31.01). Prefill is unchanged.
+- **Vulkan MoE prefill and decode are faster, and so is dense prefill on the AMD
+  Windows driver.** Interleaved with the previous build on an RX 7900 XTX (AMD
+  Windows driver, idle machine), pp512 / tg128 tok/s: ERNIE-4.5-21B-A3B Q4_K_M
+  2618-2620 → 3021-3043 and 178.1-178.2 → 187.5-187.6 (llama.cpp Vulkan: 4032 /
+  213.3); Qwen3-30B-A3B Q4_K_M 2855-2858 → 3118-3131 and 173.8 → 191.7
+  (llama.cpp: 3798 / 202.8); SmolLM3-3B Q4_K_M 3615-3640 → 4020-4022 prefill,
+  decode unchanged (229.9-230.1 → 229.4-229.6; llama.cpp: 5462 / 256.6). The
+  Q6_K int8 GEMM (most Q4_K_M MoE quants' `ffn_down_exps`, and dense Q6_K
+  prefill on GPUs without f16 coopmat) stepped through k 16 elements per barrier
+  pair and decoded every weight byte with its own load, running 3.7× slower than
+  the Q4_K one on ERNIE's down shape; it now stages 32 elements per step from
+  word loads (3309 → 1080 us per layer at pp512; on the Raphael iGPU
+  Qwen3-0.6B's Q6_K GEMMs 152.5 → 113.9 ms per pp512, prefill 273.5-273.6 →
+  280.5-280.6). Its outputs move at ulp level against the old kernel (float
+  accumulation order; the integer sums are unchanged). On the AMD proprietary
+  driver only, the prefill GEMM's narrow-grid split-K window also scales with
+  the compute-unit count (never below the old 128 workgroups), so
+  128-192-workgroup projections on a 96-CU GPU split too (`attn_output` 458 →
+  302 us on Qwen3-30B-A3B); every other driver, RADV included, keeps the old
+  window. The router top-k picks each expert with subgroup operations instead of
+  a seven-step shared-memory tree and reads the row from shared memory (13.1 →
+  8.8 us per layer on ERNIE decode), and the one-row f32 router GEMV streams
+  vec4 (12.0 → 4.5 us). Router logits and the reordered split-K sums move
+  results within the existing GPU-vs-CPU parity tolerances; the top-k picks
+  experts by the same rule (highest score, then lowest id).
+- **Chat templates turn non-strings into text as Python's Jinja2 does**, which
+  is what Hugging Face's `apply_chat_template` renders with and so what models
+  were trained on: `True`, `False`, `None`; floats as Python's `repr` (`1e-07`,
+  `1e+16`, `2.0`, `0.30000000000000004`); lists and dicts as Python's `repr`
+  (`{'a': [1, 'x', True]}`). This covers bare `{{ }}`, `| string`, `| join`,
+  `upper` / `lower` / `capitalize` / `title` / `trim` / `replace`, `%s` and
+  spec-less `{}` fields of `| format` and `str.format`, and `~` on a list or
+  dict from the request. They used to print `true`, `none`, `0.0000001` and
+  JSON-style containers. Prompts that change where a template prints such a
+  value: Qwen3.5, StepFun 3.5, ByteDance Seed-OSS, MiniCPM5 and MiniMax-M3 in a
+  replayed tool call's arguments (a bool, null or exponent-range float now reads
+  `True`, `None`, `1e-07`); Apriel 1.5 and 1.6 in their tool block
+  (`tool | string`); Gemma 4 for a parameter typed `["string", "null"]`
+  (`['STRING', 'NULL']`); functionary v3.2 for a bool default (`False`) and
+  GigaChat3 for a list default. Plain chat renders as before for every cached
+  template. `~` on a float still writes Rust's digits (`0.000001`,
+  `10000000000000000.0`), which GigaChat3 and functionary v3.2 print for a float
+  default or bound.
+- **`tojson` and every other float print break ties as Python does.** When two
+  shortest digit strings are equally close, Python's `repr` and `json.dumps`
+  keep the even one (`1125899906842624.25` prints `1125899906842624.2`); infr
+  printed the odd one (`…4.3`). Other floats print as before.
+- **`minijinja` and `minijinja-contrib` move to 2.24.0**, which also changes how
+  templates run: `{% set %}` inside a `for` loop no longer leaks into the next
+  iteration; `.items()`, `.get()` and `.keys()` on a mapping with a key of the
+  same name call the method (2.21 refused "object is not callable" on any tool
+  schema with an `items` key, which is every array parameter, wherever a
+  template iterated it with `.items()`); a keyword argument takes an inline `if`
+  (`tojson(indent=2 if x else none)`); a string repeated past 100,000,000 bytes
+  is refused. GigaChat3 and 3.1 (`.items()` on a tool's parameters) and
+  muse-glimmer and muse-spark (the inline `if`) were refused for every
+  conversation with tools, and every conversation, respectively, and now render.
+
+### Fixed
+
+- **`INFR_FLASH_SPLITS` / `INFR_PV_SPLITS` above 8 are refused** instead of
+  dispatched: the coopmat attention prefill sizes its split partials for 8
+  splits, so a larger count wrote past the end of that buffer. The startup error
+  names the variable; 0, unparseable values and values past 2³²−1 still select
+  the split policy, as before. The new `attn_flash.splits`, `attn_pv.splits` and
+  `*.max_splits` tuning parameters carry the same bound.
+
+- **Q5_0 weights give the same result on the CPU at one row as at several.** A
+  one-row `Op::Linear` on a Q5_0 weight (every decode step, and the prompt's
+  last token, whose logits pick the first generated token) dequantized the row
+  and took an f32 dot, while prefill quantized the activations to int8 and ran
+  `vec_dot_q5_0_32_batch`, so a token's projection depended on how many tokens
+  shared its graph, and a chunked prefill differed from one token at a time. One
+  row now runs the same int8 kernel, as Q4_0, Q4_1 and Q5_1 already did.
+  **Output changes on every model with Q5_0 tensors**, among the cached ones
+  gemma-3-1b Q4_K_M (its `attn_q`, `attn_k`, `ffn_gate`, `ffn_up`) and
+  Qwen2.5-0.5B q4_k_m (including its tied embedding and output head). The cost
+  is accuracy: on gemma-3-1b Q4_K_M against llama.cpp's CPU logits (50 prompt
+  lengths) mean KL rose from 7.04e-3 to 8.64e-3 and top-1 agreement fell from
+  48/50 to 45/50. The gain is decode speed, 2.2 to 8.8 times on the measured
+  shapes (one-row `Op::Linear`, median per shape of each round, three rounds
+  interleaved with the previous build while other builds shared the machine, in
+  × out: 4096×4096 1.03-1.10 ms to 0.39 ms, 4096×14336 3.22-3.56 ms to 1.15-1.48
+  ms, 14336×4096 9.9-11.9 ms to 1.33-1.63 ms). `docs/backlog.md` B201 records
+  the trade and the f32 alternative declined.
+- **`Op::Mla`'s `io()` now lists its `freq_factors`**, which the CPU arm reads.
+  Since the CPU and Metal interpreters load only the inputs some op's `io()`
+  names, an MLA layer whose YaRN divisors no `Op::Rope` of the same graph also
+  read would have read an empty vector. A test now holds every op's `io()` to
+  every tensor field it has (`io_names_every_tensor_an_op_holds`).
+
+- **A panic inside a CPU kernel now fails the forward with its own message.**
+  The CPU thread pool replaced a task's panic with a generic
+  `spin-pool: a task panicked`, and kept running every remaining task of the
+  job, each of which usually panicked the same way and paid the panic hook
+  again. It now re-raises the first task's own panic on the calling thread (an
+  out-of-bounds slice reports its index and length) once every thread has
+  stopped, and skips the tasks no thread had started. The expert read lanes and
+  multi-shard block reads re-raise their thread's own panic as well.
+- **A `CpuBackend` can be reused after a forward panicked.** The panic left
+  every owned buffer the op held poisoned, so a library caller that caught it
+  and ran the same backend again failed on the first lock. The locks now
+  recover; the buffers' contents after a panic are unspecified, so such a caller
+  must discard or rewind its session state. Nothing changes for `infr serve`: it
+  never reused a CPU backend after a panic (the resident is dropped, and each
+  dense generation allocates its own KV cache).
+- **The CPU backend refuses a graph that binds one owned buffer to two operands
+  `Op::MoeFfn` or `Op::Mla` holds locked at once** (two expert banks, the router
+  and a bank, the MLA cache and `wk_b`/`wv_b`). Such a graph used to hang the
+  forward with no message; it now panics naming the op and both operands.
+- **A shader that fails to compile now stops the build with one clear message**
+  (#93). A `glslc` too old for infr's shaders used to surface as a bare
+  `glslc failed for shaders/...` panic per worker thread, with the real
+  diagnostic buried above it (shaderc 2023.8, Ubuntu 24.04's package, failed
+  inside its optimizer on `deltanet_prep.comp`). `infr-vulkan`'s build script
+  now reports the first failure only, naming the shader and its defines, the
+  `glslc` that ran and its version, and what `glslc` printed, with what is
+  known: shaderc 2026.1, 2026.3 and 2026.4 build every shader, 2023.8 does not.
+  A `glslc` that printed nothing or could not be started is reported as that,
+  not as a too-old toolchain. The shaders most likely to trip an old `glslc`
+  (`deltanet_prep` and one each for E4M3, bf16 and int8 cooperative matrices,
+  packed integer dot products, buffer references and clustered subgroups)
+  compile first, so such a toolchain fails within seconds.
+- **The automatic host weight arena no longer starves the machine.** It left an
+  eighth of available memory, so a 98.6 GB model on a box with 43.97 GB
+  available got a 38.47 GB arena and available memory fell to 10957 MB within a
+  minute. It now leaves half of what is available. On the CPU it first prices
+  the run's KV cache, the weights too small to page, an activation reserve and,
+  where the fused Q4_K expert path can fill it, the repack cache
+  (`kernels.cpu.repack_mb`); and a model counts as fitting memory, keeping the
+  mapping, only when its weights fit beside that same run memory. The same
+  V4-Flash run now takes a 21.6 GB arena; available memory stayed above 19 GB
+  over a 48-token generation. `INFR_DRAM_CACHE` still names a size outright.
+- **The GPU backends' automatic host tier is smaller on a machine short of
+  memory.** The same half rule sizes the DRAM tier under Vulkan dense streaming
+  and the paged MoE cache (`paging.dram` unset), so where little memory is
+  available that tier is about half the size it was: on a 16 GB machine with 9
+  GB available, about 4.5 GB instead of about 7.9 GB. Measured with those two
+  budgets forced on Qwen3-30B-A3B Q4_K_M (RX 7900 XTX, `paging.cache` 2 GiB, 41
+  tokens): decode 7.96 → 7.53 tokens/s, host-tier hit rate 53-55% → 37-39%.
+  Where the model's expert banks fit within half of what is available (this 64
+  GB box), nothing changes.
+- **DeepSeek V4's tokenizer matches llama.cpp.**
+  `tokenizer.ggml.pre = "joyai-llm"` had no mapping, so infr warned and split
+  with the GPT-2 regex; it now uses the DeepSeek V3 regex list llama.cpp gives
+  it, and twelve adversarial strings tokenize to `llama-tokenize`'s ids.
+
+- **A prefill chunk is never taller than the session's sliding-window ring.** A
+  window layer's ring holds the window plus the prefill chunk height the session
+  was created with, but the prefill read the chunk height again on every call,
+  from whatever placement pin was current then. A session created under a
+  shorter pinned chunk and extended outside that pin prefilled in taller chunks
+  than its ring holds, overwriting rows the chunk's own earlier positions still
+  attend, on every model with sliding-window layers. The chunk is now capped at
+  the session's own height.
+
+- **A uniform draw of exactly 0 no longer picks an arbitrary low-id token** when
+  sampling with `top_k` 0 and `top_p` 1. That support is kept in id order, so a
+  zero draw (one in 2^24) took the lowest id with any probability at all — for
+  example a token pushed 100 below the top, whose probability only fails to
+  underflow. It now takes the most likely token, as the sorted paths already
+  did.
+
+- **Penalties apply under a forced tool call.** With `tool_choice` set to
+  `"required"` or a named function, `frequency_penalty`, `presence_penalty` and
+  `repeat_penalty` were silently ignored: the grammar-constrained step neither
+  applied them to the logits nor recorded the tokens it emitted. It now does
+  both, forced tokens included, as llama.cpp does. A penalty extreme enough to
+  overflow a logit (a `repeat_penalty` near zero passes validation) now
+  saturates it instead of turning it to ±inf, which made every probability NaN
+  so the draw fell through to the least likely token.
+- **`top_p: 1` with top-k off no longer sorts the vocabulary every token.** With
+  no top-k cut (the default for Llama-3.x, Llama-4 and SmolLM3) and `top_p` of
+  1, the host sampler sorted the whole vocabulary on each token to build a
+  nucleus that keeps everything. It now takes the whole distribution in one
+  pass, as llama.cpp does. The sampling distribution is the same up to tail
+  tokens whose mass is below f32 resolution, which the sorted pass could cut and
+  this one keeps; the token drawn for a given `seed` changes in this case.
+- **F16 and F32 dense weights stream on Vulkan.** The dense streaming planner
+  took only the native quant and bf16 formats, so an f16 or f32 checkpoint had
+  no streamable weights: a capped `paging.cache` (`INFR_CACHE`) was silently
+  ignored and the whole model loaded resident, and a model larger than VRAM had
+  nowhere to go but resident. Their per-layer projections now stream like a
+  quant model's, through the VRAM arena and the host tier, and run the resident
+  float kernels at the arena slot's address, so the output is token-identical to
+  the resident run (ERNIE-4.5-0.3B and LFM3-1.7B F16, synthetic f16 and f32
+  llamas, on the RX 7900 XTX and the integrated GPU). Resident throughput is
+  unchanged: pp512/tg128 on the RX 7900 XTX, interleaved, before 22609/449.9 and
+  22278/449.7 t/s, after 22508/449.7 and 22046/450.0 for ERNIE-4.5-0.3B F16;
+  before 5673/160.6 and 5697/160.5, after 5706/160.6 and 5716/160.5 for
+  LFM3-1.7B F16 (host CPU 3% busy). Streamed at `paging.cache=200m`,
+  ERNIE-4.5-0.3B F16 runs pp512 5751 t/s and tg128 42.7 t/s, LFM3-1.7B F16 1982
+  and 9.1.
+- **An f32 weight is priced at f32 in the VRAM placement.** The weight footprint
+  (`weight_footprint`) counted every non-quant tensor at two bytes an element,
+  but f32 tensors upload as f32, so an all-f32 model was priced at half its size
+  and placed resident on a device it does not fit. The fix reaches every model
+  with f32 tensors — norms, biases, f32 MoE routers, SSM tensors, gemma E2B's
+  per-layer projections — so placement now sees slightly more weight bytes than
+  before: a clamped default context can come out a little shorter, and a model
+  on the edge of fitting can now stream where it went resident. Measured with
+  the same formula over the cached files: Qwen3-1.7B Q4_K_M +0.25 MB (1.1012 →
+  1.1015 GB), Qwen3-30B-A3B Q4_K_M +25.59 MB (18.5251 → 18.5507 GB, its f32
+  routers), ERNIE-4.5-21B-A3B Q4_K_M +9.14 MB.
+- **`infr bench --ngl 0` warms up before a pp measurement.** The untimed warmup
+  was a one-token prompt with nothing to generate, which runs no forward, so the
+  first timed rep paid the whole page-in of the weight mapping (Qwen3-1.7B pp512
+  first reps of 156.74 and 140.11 t/s against 628.43-733.11 warm on the previous
+  build) and dragged the mean. A pp run now warms up with its own prompt, as
+  `llama-bench`'s warmup prompt run does; Qwen3-30B-A3B's first pp512 rep is
+  warm too (417.37 against 415.36-418.04). A pg run warms up with its prompt and
+  one generated token, and a tg run, as before, with one generated token, so a
+  MoE model's first tg rep still pays for the experts it had not routed to
+  (Qwen3-30B-A3B tg64 3.90 against 27.99-28.08). A fresh process's first real
+  request still pays the page-in (backlog B173).
+- **A qwen35 file that stores `ssm_conv1d` in f16 or bf16 is widened to f32 at
+  load.** The Vulkan conv shaders read the kernel as f32 whatever the file's
+  dtype, so such a file read half-precision bits as floats there. LFM3's
+  `shortconv.conv` takes the same path.
+- **A paged model's first forward no longer cuts every later Vulkan forward into
+  16-dispatch submits.** The submit splitter, which keeps each submit under the
+  driver's GPU hang timeout, judged a forward by its wall time, so the seconds a
+  cold paged forward spends reading weights in (8 s over 75 dispatches for
+  ERNIE-4.5-21B-A3B with `paging.cache=4g`) armed it on a discrete GPU for the
+  rest of the process. It now judges the GPU time each submit actually ran,
+  timed with two timestamps per command buffer (wall time only where the queue
+  writes none). Paged ERNIE-4.5-21B-A3B on the RX 7900 XTX: pp512 1169-1174 →
+  1185-1189, tg128 123.2-123.5 → 126.6; paged Qwen3-30B-A3B: pp512 483-485 →
+  482-487, but tg128 53.4-53.7 → 51.2-51.3, because its paged decode had been
+  profiting from the accidental split (see docs/backlog.md B184).
+  `INFR_SUBMIT_DISPATCHES=0` now disables the splitter for good, as documented;
+  before, the first slow forward re-armed it.
+- **Vulkan MoE routing ranks softmax probabilities, as llama.cpp does, when a
+  router bias or expert groups take part.** `moe_topk.comp` ranked a
+  softmax-gated router by raw logit and then added the `exp_probs_b` bias, and
+  scored expert groups by summing logits; the reference adds the bias to, and
+  sums, the full-row softmax probabilities, which can select different experts.
+  The resident and paged paths both route through this kernel and were run with
+  the fix; expert-parallel calls the same kernel by reading the code, but was
+  not run. No file infr ran before reaches the changed rule: the bias-carrying
+  `deepseek2` / `deepseek32` / `deepseek4` files it runs are sigmoid or
+  sqrt-softplus gated, and softmax routing without a bias or groups is
+  unchanged. A softmax-gated `deepseek2` file carrying `expert_group_count` > 1
+  would have routed differently on Vulkan; none was run. ERNIE 4.5 MoE is the
+  first model that needs the rule.
+- **`{% break %}` and `{% continue %}` work in chat templates** (minijinja's
+  `loop_controls` feature; Hugging Face loads `jinja2.ext.loopcontrols`).
+  Cohere2MoE, Cohere's command-r7b tool-use template, Kimi-K3 and Reka-Edge were
+  refused for every conversation.
+- **Chat templates that use Hugging Face's `{% generation %}` tag render.**
+  transformers registers the tag (`AssistantTracker`) and renders its body
+  unchanged, in a scope of its own; minijinja has no custom tags, so infr
+  refused every such template. Each tag is now compiled as a `{% with %}` block,
+  which scopes a `{% set %}` in its body the same way, with its whitespace
+  control kept, and a misused one (unclosed, closing nothing, crossed with
+  another block, given arguments) is refused as Jinja2 refuses it.
+  IFM-K2-Horizon, LFM2.5-8B-A1B, LFM3 and poolside's Laguna S 2.1 / XS 2.1 /
+  XS.2 templates now render each conversation checked as Hugging Face renders
+  it.
+- **`is iterable` and `is sequence` answer as Jinja2 does**: none is not
+  iterable, and a string, a dict and an undefined value are sequences. Nemotron
+  3 Nano and Qwen3-Coder ask `tools is iterable and tools | length > 0` and were
+  refused for every conversation without tools.
+- **`trim`, `title` and `capitalize` follow Python's string methods**: `trim`
+  strips what `str.strip()` strips (U+001C–U+001F too), and a final `Σ` is
+  lower-cased to `ς` (`'ΟΔΟΣ' | title` is `Οδος`). `is sequence` is false for
+  `reverse`'s result, as for Python's iterators. `'%s' | format(a=0)` formats
+  the whole mapping (`{'a': 0}`), and positional and keyword arguments together
+  are refused, as Jinja2 refuses them.
+- **A float in a request reaches the chat template exactly.** serde_json now
+  parses with `float_roundtrip`; a replayed tool-call argument such as `1e-25`
+  had been read one ulp off and printed back as `9.999999999999999e-26`.
+- **`str.format` fields that look up an attribute or an index**
+  (`'{a.b}'.format(a=…)`) get their argument unconverted, and a non-empty spec
+  on none, a list or a dict is refused as Python refuses it. `| format` with
+  more or fewer positional arguments than conversions is refused, and `%.3s`
+  cuts Python's `str()` of a bool or a container.
+
+## [0.3.0] - 2026-11-13
+
+### Breaking
+
+- **`infr_server::ChatOutcome` has a new field, `cached_tokens`.** An
+  out-of-tree `ChatGenerator` that builds it with a struct literal must set it
+  (0 when no KV prefix was reused). `UsageInfo`, `ChatCompletionChunk` and
+  `ChatRequest` also gained fields (`prompt_tokens_details`, `usage`,
+  `stream_options`), and `infr_llama::GenStats` gained `n_cached`, `ctx_full`
+  and `natural_stop`; `GenStats` has a `Default`, the others do not.
+- **`infr_chat::ToolCall` has a new field, `id`**; `infr_plat::link::link_blob`
+  returns the kind of link it made; `infr_hub::Store::repo_dir` returns a
+  `Result`.
+- **`infr_core::fusion` loses two patterns no backend planned**:
+  `RmsNormLinearCfg`, `MoeAddCfg`, `ExpertsOk`, and the `rmsnorm_linear` /
+  `moe_add` fields of `FusionCfg` and `FusionPlan`.
+- **`infr_vulkan::pager`: `GpuPager::touch_staged` takes the block's bytes as a
+  fill closure that runs only on a miss**, and replaces `touch_staged_read`.
+  `MoePagerSession::touch_role`, which nothing in the engine called, is gone;
+  `stage_role` is the MoE session's entry point.
+- **`infr_cpu::paged::PagedWeights::new` takes a third argument**, the
+  `paging.trace` file its pools record into (`None` for no trace).
+- **`infr_core::Backend` has a new method, `decode_replay_ready`, and `Graph` a
+  new field, `replay_only`.** The seam runner now asks the backend, after
+  compiling the position-0 decode plan, whether executing that one plan per
+  token with the bound positions advanced decodes every position correctly (by a
+  recorded replay, or by a static walk that takes every position from live
+  state), instead of trusting its own copy of the backend's rules. It marks the
+  plan `replay_only`, which a backend must refuse to run any other way. The
+  method defaults to `false`: an out-of-tree backend that sets
+  `Capabilities::decode_replay` must override it or its decode takes the
+  per-token path, and must return an error for a `replay_only` graph it would
+  run at the baked positions.
+- **`infr_core::pager::trace::Call` has a new variant, `TouchGroup`, and
+  `Outcome` a new variant, `Grouped`** (a pager's group touch, written `g` in a
+  trace); an exhaustive match on either must handle them, and a trace reader
+  built before this rejects traces that contain one.
+- **`infr_vulkan::pager::MoePagerSession::register` now refuses a layer whose
+  `layer_base` is not a multiple of its expert count, or whose expert count
+  differs from another layer's in the same pool.** Each layer is one block group
+  of its pool.
+
+### Added
+
+- **`paging.trace` (`INFR_PAGER_TRACE`): a pager touch trace.** Set it to a file
+  path and every pager pool of the run (the VRAM expert and streaming arenas,
+  the DRAM tier under them, the CPU backend's host pools) records each call it
+  serves there: the entry point, the block, batch boundaries and the outcome
+  (hit, or miss and the block it evicted). The format is documented in
+  `infr_core::pager::trace`; a pool's trace replays to exactly the hit, miss and
+  eviction counts `paging.stats` prints. Unset, it costs one test per pager
+  call. For developers, `infr_core::pager::sim` replays a trace under other
+  eviction policies (Belady's among them, a lower bound on traces without
+  probes), `infr_core::pager::shapes` generates the access patterns real
+  sessions make, and `infr-core`'s `pager_bench` test times the pager on both.
+- **SmolLM3 (`smollm3`).** Hugging Face's SmolLM3-3B runs on the CPU and Vulkan
+  backends: the llama block with rope skipped on every fourth layer, as
+  llama.cpp hardcodes it. Its NoPE layers keep it off the Vulkan record-once
+  decode replay, so decode re-records each token. The template's `/think` and
+  `/no_think` modes follow `--think` / `--no-think`; its tool definitions
+  (`xml_tools`) are not passed yet.
+- **ERNIE 4.5 dense (`ernie4_5`).** Baidu's ERNIE-4.5-0.3B runs on the CPU and
+  Vulkan backends, including the record-once decode replay: the llama block with
+  heads wider than `n_embd / n_head`, its SentencePiece vocabulary and its chat
+  template. Its logits match llama.cpp's on the F16 file. The MoE sibling
+  `ernie4_5-moe` (21B-A3B) is not supported yet.
+- **`VulkanBackend::decode_recordings` and
+  `DenseVulkanSession::decode_recordings`**: how many record-once decode
+  recordings the backend has made, which tells a decode replayed from one
+  recording from one recorded per token.
+- **`stream_options.include_usage` on `infr serve`.** A streaming request that
+  sets it gets one more chunk before `[DONE]`, with an empty `choices` and the
+  request's `usage`.
+- **`usage.prompt_tokens_details.cached_tokens`**: the part of the prompt served
+  from the KV prefix cache.
+- **A GGUF's own sampling recommendation is honoured.** `infr run` and
+  `infr serve` take `general.sampling.temp`, `top_k` and `top_p` from the file
+  for any of those you did not set yourself, above the built-in per-family
+  defaults and a `generation_config.json`, as llama.cpp does. The startup banner
+  shows `+gguf` when they apply. Other `general.sampling.*` keys (`min_p`,
+  repeat penalties, mirostat) are not applied, and are named in a warning at
+  load. A `top_k` of `-1` in `generation_config.json` now means "keep all", as
+  it does in the GGUF.
+- **`seed: -1` and `max_tokens: -1` are accepted** and mean "not set", for
+  clients written against llama.cpp. `max_tokens: -1` therefore takes the
+  server's default budget; it does not mean "until the context is full".
+
+### Changed
+
+- **The pager no longer scans its whole cache to pick an eviction victim.**
+  `infr_core::pager::Pager` keeps its state by slot, with recency as a linked
+  list, so a miss costs the protected blocks it walks past instead of every
+  resident block, and a hit costs about half what it did. Every eviction
+  decision is unchanged (checked call by call against the old implementation).
+  Measured on Qwen3-30B-A3B with `paging.cache=4g` and `paging.dram=12g` on an
+  RX 7900 XTX: decode 75.1–76.1 → 82.5–82.7 tok/s.
+- **Decoding a paged MoE model does far less pager bookkeeping for layers whose
+  experts are all in VRAM.** Each such layer used to check and touch every one
+  of its experts, for each of its roles, on every token; it is now one check and
+  one touch per layer and role, through a new block-group mechanism in
+  `infr_core::pager::Pager` (`group_by`, `group_is_resident`, `touch_group`).
+  Eviction decisions are unchanged: on Qwen3-30B-A3B with `paging.cache=18g`,
+  which keeps most layers wholly resident, the VRAM pools' pager calls per
+  decode token fell from 16,905 to 522 with identical output and identical
+  `paging.stats` counters. Decode throughput on an RX 7900 XTX did not change
+  measurably.
+- **Tokenization now follows llama.cpp for more models, so their prompt token
+  ids change.** Llama 3 (`llama-bpe` and its aliases) and Qwen3.5 / Qwen3.6
+  (`qwen35`) GGUFs were split with the GPT-2 regex; they now use their own, and
+  Llama 3 also ignores merges for whole-vocabulary words. Runs of spaces
+  (indented code) in a SentencePiece-style GGUF without a `tokenizer.json` now
+  reach the multi-space tokens. Several more `tokenizer.ggml.pre` names are
+  mapped, and an unknown one logs a warning instead of silently getting the
+  GPT-2 regex. Qwen3 and Gemma 3 prompts are unchanged.
+- **Llama 3.1, 3.2, 3.3 and Llama 4 output changes: their RoPE frequency factors
+  are now applied.** These files carry a `rope_freqs.weight` tensor that
+  llama.cpp divides each rotary angle by; infr applied it only for Gemma 4, so
+  many rotary pairs turned too fast and the error grew with position. Llama 3.0
+  has no such tensor and is unchanged.
+- **Llama 4's context is capped at 8191 tokens, and Mistral-Large-3's at its
+  temperature length.** Past those points the reference changes its attention
+  (chunking, and a position-dependent temperature) in ways infr does not
+  implement, so a longer context computed something else. A larger `--ctx` is
+  lowered with a warning.
+- **Models infr would compute wrongly are refused at load, by name**: a GGUF
+  with a per-tensor `.scale` that the reference applies (NVFP4 / ModelOpt
+  conversions); a DeepSeek-family file whose YaRN magnitude is not 1; a Qwen3.5
+  file with a non-periodic recurrent-layer layout. A `.scale` the reference
+  ignores still loads.
+- **SentencePiece GGUFs without a `tokenizer.ggml.add_space_prefix` key — Llama
+  2-style, Mistral v0.x, Phi-3 — now get the leading-space prefix, as in
+  llama.cpp**, before the text and after every special token, and Phi-3 drops
+  the whitespace that follows its special tokens. Their prompt token ids change.
+  A file that set the key to `true` used to decode with every space removed; it
+  now decodes correctly.
+- **Generation stops on more end-of-turn tokens.** The stop set was the declared
+  EOS plus three fixed names; it now follows llama.cpp's list (`<end_of_turn>`,
+  `<|end|>`, `<|eom_id|>`, `<turn|>` and the rest) and the GGUF's `eot` / `eom`
+  ids. A listed name counts only where the vocabulary marks it as a control or
+  user-defined token, so a literal `</s>` in a Qwen reply still prints.
+- **Tool-call ids on `infr serve` are nine alphanumeric characters** (they were
+  `call_…`), and an id the client sends back with a tool result now reaches the
+  chat template. Templates that pair calls with results by id, Mistral's among
+  them, need both.
+- **The model cache works on filesystems without symlinks**: a snapshot entry
+  falls back to a hard link, then a copy. A copy doubles the disk space that
+  model takes, and says so once.
+- **`infr pull` refuses a model file it cannot verify.** If the request that
+  fetches a file's sha256 keeps failing, the pull stops instead of downloading
+  unchecked; a definitive answer (401, 403, 404) fails at once and says why. An
+  empty `HF_TOKEN=` is treated as unset.
+- **A `tokenizer.json` beside the GGUF that does not match the model's
+  vocabulary now logs a warning.** It is still used.
+- **A GGUF whose weight shapes disagree with its own metadata is refused at
+  load**, with the tensor's name and both shapes. Such a file used to load and
+  then compute garbage or read out of bounds. DeepSeek V4's tensors are covered;
+  not every tensor of every architecture is yet.
+- **Vulkan: a kernel whose workgroup is larger than the device allows is refused
+  by name**, and the wide RMS-norm kernel is chosen only on a device that can
+  run it; a smaller device uses the narrow one.
+- **DiffusionGemma: even seeds no longer repeat the next odd seed.** The seeded
+  RNG forced its state odd, so `--seed 2` and `--seed 3` gave the same output.
+  Every even seed and seed 0 now draw a different stream — including the default
+  seed, 42, so default DiffusionGemma output changes. Odd seeds are unchanged.
+- **Memory headroom inside a cgroup no longer counts reclaimable file cache as
+  used.** A container that had read a lot of files looked nearly full, and infr
+  sized its host weight cache too small.
+- **Vulkan: prefill of a streamed dense model uses the tiled GEMM on a device
+  without f16 cooperative matrix** (integrated GPUs, Intel Arc). A weight
+  streamed through `paging.cache` took the per-row GEMV for every prefill chunk,
+  re-reading the whole weight once per prompt row; it now takes the same dp4a or
+  fma GEMM the weight would take resident, and its output matches the resident
+  run's. On a cooperative-matrix device with int8 dot, a streamed Q4_K weight
+  now takes the dp4a GEMM wherever the resident one does — an output width that
+  is a multiple of 64 but not of 128, or any width under `INFR_NO_GEMM_WARP` —
+  instead of the GEMV. A weight too large for the tiled GEMM's addressing (a
+  big-vocab output projection) keeps the chunked GEMV, as before.
+- **The host (DRAM) weight tier evicts by last use.** A hit did not refresh a
+  block's position, so eviction followed load order. Output is unchanged; MoE
+  models paged from disk should re-read fewer blocks.
+
+### Removed
+
+- **`infr_llama::grammar::tool_constraint_for`.** `ToolConstrainer`, which
+  `OaiRenderer` holds, does the same and builds the grammar tokenizer once per
+  model instead of once per request.
+
+### Fixed
+
+- **Attention q/k/v projection biases are added on every arch that carries them,
+  not only `qwen2`.** llama.cpp loads `attn_q.bias` / `attn_k.bias` /
+  `attn_v.bias` as optional for the llama-shaped families (`llama`, `llama4`,
+  `qwen2`, `qwen3`, `qwen3moe`, `gemma3`, `deepseek`, `smollm3`, `ernie4_5`) and
+  adds whichever are present; infr read them for `qwen2` only and ran any other
+  file that carried them without them. They are now added when every layer
+  carries all three; a file with only some of them is refused naming the first
+  missing one, and `qwen35` / `qwen35moe` refuse them. A `qwen2` file without
+  biases now loads instead of failing.
+- **Chat templates render their whitespace the way llama.cpp renders it.** The
+  newline after a `{% %}` or `{# #}` tag and the indentation before one are now
+  dropped (Jinja's `trim_blocks` and `lstrip_blocks`, which llama.cpp's template
+  engine always applies). Of the templates checked, only SmolLM3's prompt
+  changes: it no longer starts with a stray newline token, so SmolLM3's output
+  can differ from earlier infr versions. Qwen2.5, Qwen3, Qwen3.5, Gemma 3 and
+  Llama 3.2 render as before for the conversations checked. The prompt of any
+  other model whose template leaves a newline after a tag, or indents a tag,
+  changes too.
+- **Tool definitions and replayed tool calls reach the model in llama.cpp's JSON
+  layout.** A chat template's `tojson` now writes what llama.cpp's writes
+  (Python's `json.dumps` with `ensure_ascii=False`): `", "` and `": "`
+  separators where infr wrote compact JSON, floats as Python writes them
+  (`1e-05`, `1e+16`), and the `ensure_ascii`, `separators` and positional
+  arguments templates may pass, which used to be a render error. The tools
+  prompt of Qwen2.5, Qwen3, Qwen3.5 and Llama 3.2 changes (for Llama 3.2, whose
+  tool definitions were already indented, in a replayed tool call's arguments
+  and in any float written in exponent form), so tool-calling output can differ
+  from earlier infr versions; prompts without tools are unchanged.
+- **DeepSeek V2/V3.2 GGUFs route and rope the way llama.cpp loads them.** A
+  `deepseek2` file without `expert_gating_func` and GLM 4.7 Lite's shape (47 or
+  48 layers, a 154880-token vocabulary) now routes its experts with sigmoid, as
+  llama.cpp chooses, instead of softmax. `rope.scaling.yarn_beta_fast` / `_slow`
+  are no longer read for `deepseek2` and `deepseek32`: llama.cpp ignores them on
+  those architectures, so a file declaring other values now ropes as it does
+  there. A `deepseek32` file with `expert_gating_func = 0` (no gating function)
+  is refused at load instead of routing as softmax; llama.cpp aborts on it.
+- **Paging an MoE model through the host RAM tier no longer reads experts the
+  GPU already holds.** Every routed expert used to be looked up in the host tier
+  before the GPU cache was checked, so an expert resident on the GPU but not in
+  host RAM was read from disk and thrown away, possibly evicting one host RAM
+  needed, and the host tier's hit and miss counts in `paging.stats` tracked GPU
+  traffic rather than its own. The host tier is now asked only on a GPU cache
+  miss, as it already was for dense models.
+- **Streaming no longer re-decodes the whole reply for every token.** Output is
+  byte-identical; the work per token no longer grows with the reply's length.
+- **A tool call quoted inside a model's reasoning is no longer run as a call,
+  and no longer hides the real call from the stream.**
+- **`infr serve` with tools: a plain JSON answer streams as it is generated**
+  (it was held until the end in case it was a tool call), text before a late
+  `<think>` block is no longer dropped, and a tool call that follows such text
+  now runs. A tool-call block that cannot be parsed, for instance one cut off by
+  `max_tokens`, is shown as content instead of disappearing. Text and reasoning
+  around a tool call arrive in the order the model wrote them, and removing a
+  call no longer leaves stray blank lines or joins the paragraphs on either side
+  of it.
+- **Forced tool calls on SentencePiece models (Llama 2, Mistral, Phi-3, Gemma
+  3): the grammar now sees spaces.** It saw the `▁` marker instead, so it could
+  not accept a space before or inside the JSON.
+- **`infr serve --parallel`: a panic while seeding a slot from another no longer
+  leaves both slots busy forever.**
+- **Qwen3.5 / Qwen3.6 on Vulkan: a multi-turn chat no longer continues from
+  recurrent state that ran ahead of the conversation.** Chained decode feeds
+  several tokens per submit, so a reply that ended part-way through a chain left
+  the state past the stop; the next turn reused it. The engine now tracks how
+  far the state was written and, when it is ahead, restores a snapshot taken at
+  the previous turn's prompt and prefills from there. The snapshot is one more
+  copy of the recurrent state per slot (about 19 MiB for Qwen3.5-0.8B).
+- **Sliding-window models (Gemma 3 / 4): a turn that rewinds after a longer
+  earlier one no longer reads window rows that have been recycled.**
+- **A NaN logit or router score no longer panics the sampler or the CPU MoE
+  routing.** The output is still NaN.
+- **Qwen3.5 / Qwen3.6: a snapshot restore that fails part-way can no longer be
+  followed by a turn that reuses the half-restored state.**
+- **DeepSeek on the CPU with paged weights, and on multi-GPU: the MoE router
+  bias is now pinned and bound like the other weights.** It was missing from the
+  list of tensors an MoE layer reads.
+- **The pipeline-cache crash tripwire no longer trusts a process id alone.** In
+  a container every run can be pid 1, so a crashed run looked alive and its
+  poisoned cache was kept. Each run now holds a file lock on its marker.
+- **Metal: temperature sampling on llama-family models was close to greedy.**
+  The sampler read a random draw that was refreshed only once every 64 tokens
+  and started at zero.
+- **Metal: memory no longer grows with the square of the reply length** for
+  quantised KV formats. A scratch pool kept one buffer per size requested, and
+  the size grew every token.
+- **Metal: a failed buffer allocation is an error naming the size** instead of a
+  crash, and a large `max_tokens` on a small context truncates the reply (and
+  reports `finish_reason: "length"`) instead of failing the request.
+- **Metal: a DeltaNet key-head width other than 32, 64, 128 or 256 no longer
+  reads into the neighbouring head's state.**
+- **Vulkan: compute grids no longer exceed the device's workgroup limit on wide
+  layers.** At the default 1024-row prefill chunk, an elementwise kernel over a
+  4096-wide layer needed one workgroup more than the 65,535 the spec guarantees,
+  which RADV tolerated and other drivers need not. The elementwise, KV-store,
+  rope and attention kernels now split such a grid in two dimensions.
+- **Vulkan: three crashes behind configuration.** An F16-weight model on a GPU
+  without `shaderFloat16` (or with `INFR_NO_F16`) ran a float16 shader for its
+  fused residual add; `INFR_MMV_FUSE_QUANT=1` panicked on any quant but Q4_K and
+  Q6_K; `INFR_NO_MMV_M4` panicked on decode. Each now takes a kernel that
+  exists.
+- **Vulkan: shapes a kernel cannot hold are refused by name** in release builds
+  too (DeltaNet head width, QK-norm head size, sampler top-k range, a Q8 KV row
+  that is not a whole number of blocks). They were debug-only assertions.
+- **`INFR_DELTA_STRIDED=1` computed garbage** on Vulkan (the kernel wrote its
+  output at the wrong offset) and on the CPU (which does not implement the mode
+  and was handed its input layout anyway).
+- **Sliding-window models under `serve --parallel`: a slot forked or seeded from
+  another could size its KV ring from the wrong prefill chunk**, losing the
+  extra slot or seeding stale rows.
+- **Vulkan sampling: an exact tie at the top-k boundary could drop a token that
+  belonged in the top-k**, and which tied tokens survived depended on thread
+  scheduling. The strictly greater values are taken first now and ties go to the
+  lowest token id. Output with no exact ties is unchanged.
+- **Vulkan: attention over a very long span no longer overruns a kernel's shared
+  memory** (a DiffusionGemma canvas past a few thousand keys; batched attention
+  past 262,144 keys).
+- **Multi-GPU: `INFR_EXPERT_PARALLEL` refuses gemma-4-26B-A4B**, which it
+  computed wrongly (the dense FFN branch was dropped at each cut). A mixed
+  integrated + discrete world now sizes prefill for the integrated GPU, and any
+  graph that would read a scratch tensor across a device cut is refused by name.
+- **A chat template inside a GGUF can no longer crash infr** through
+  `strftime_now` with a bad format, or ask for a multi-gigabyte pad through a
+  helper's width argument; both are template errors. (String repetition inside a
+  template is still unbounded.)
+- **`infr pull`: a moved or renamed repo is still verified**, a download is
+  flushed to disk before it is renamed into the cache, a cached file whose size
+  disagrees with the hub is fetched again, and two pulls of the same model at
+  once both succeed.
+- **`infr pull` on Windows no longer stalls when a late part of a large file
+  arrives first.** NTFS filled everything below such a write with zeros before
+  it returned, which for the last chunk of a model meant writing the whole file
+  once just to place it. The partial download is now a sparse file.
+- **A repo id with a backslash, `..` or a drive prefix is refused**; on Windows
+  it could write outside the cache.
+- **`generation_config.json` is found for a GGUF in a subdirectory** of its
+  repo, so those models get their recommended sampling again.
+- **`infr compare` passes `--config` and `--set` to the runs it starts**, and a
+  failing run reports its error; `infr multi` honours `INFR_CTX` and
+  `[device] ctx`.
+- **Metal: out-of-bounds reads.** The flash attention kernels read whole blocks
+  of keys past the newest one with nothing guaranteeing those rows existed; the
+  two-row Q4_K / Q6_K kernels read a weight row past the end for an odd output
+  width; and the MoE router used an invalid expert index when no router logit
+  was finite. KV caches on Metal are now padded to the attention block, and a
+  kernel is chosen only when the rows it reads exist.
+- **Metal: ties.** `argmax` returns the lowest tied token id, and the Q4_0 /
+  Q5_0 KV cache picks its block scale the way the CPU does when two values tie
+  for largest.
+- **`infr serve`: `usage.prompt_tokens` counts the whole prompt.** It reported
+  only the tokens prefilled for this request, so a KV prefix cache hit made a
+  long prompt look short. `/metrics` still counts prefilled tokens only.
+- **`infr serve`: a reply cut off because the context window filled finishes
+  with `finish_reason: "length"`**, not `"stop"`; and a reply whose end token
+  lands exactly on the `max_tokens` limit now says `"stop"`, not `"length"`.
+- **`infr serve`: an over-long prompt is `400 context_length_exceeded`**, with
+  `type: "invalid_request_error"`, instead of a 500. On a streaming request the
+  same error arrives as a typed error frame. An oversized body is a 413 and a
+  missing JSON content type a 415; both were 400.
+- **`infr serve`: a client that disconnects stops its generation**, during
+  prefill too, and frees its `--parallel` slot. It used to run to completion.
+- **`infr serve` on CPU, Metal or DiffusionGemma: one panicking generation no
+  longer makes every later request fail.** The model lock stayed poisoned.
+- **`infr serve`: the API key is checked before the request body is read**, and
+  a 401 body now has `type: "invalid_request_error"` and
+  `code: "invalid_api_key"` (it said `server_error`).
+
+- **Qwen3.5 / Qwen3.6: the first prompt after a reset no longer inherits the
+  previous generation's state.** The gated-DeltaNet recurrent state was only
+  zeroed when the slot's token list was non-empty, so the prompt after a KV
+  reset, or after the GPU warmup generation, ran on top of stale state. A
+  prefill that fails or is cancelled part-way now also forces the state to be
+  rebuilt on the next request.
+- **Vulkan with a Q8_0 KV cache: a conversation seeded from another slot's
+  shared prefix decoded that prefix wrongly.** The seed copied the int8 codes
+  but not their scales, which Vulkan stores separately. This is the shared
+  system prompt case under `infr serve --parallel` with `Q8_0` KV. The backend
+  trait gains `Backend::copy_kv_prefix`, with a default that out-of-tree
+  backends inherit.
+- **Malformed GGUF files now fail with an error instead of a panic**: a tensor
+  offset that is not a multiple of `general.alignment`, an F32 tensor that is
+  not 4-byte aligned (legal with an alignment of 1 or 2, and now read
+  correctly), an i2_s tensor with a partial code group, a zero
+  `qwen35.ssm.conv_kernel`, and a Gemma 4 `shared_kv_layers` that leaves fewer
+  than two layers with their own KV.
+- **DeepSeek and Llama 4 files with `expert_weights_scale` absent or 0 no longer
+  lose their routed experts.** infr multiplied by the raw value; llama.cpp
+  treats 0 as "unscaled", and infr now does the same.
+- **A panic while reading a paged weight block no longer hangs later requests
+  for that block.** The block was left marked as loading for good; it is now
+  released, and only the request that hit the panic fails.
+- **Vulkan with a quantised KV cache: prefill attention read past its scratch
+  buffer** when the context length was not a multiple of the kernel's tile. The
+  scratch now covers the rows the selected kernel reads.
+- **Vulkan MoE models without an expert bias no longer grow the weight arena on
+  every graph lowering**, and no longer bind a buffer that is destroyed before
+  the command buffer runs.
+- **Vulkan weight paging: a request that fails part-way no longer leaves the
+  pager believing weights were uploaded.** The next request used whatever the
+  slot held before; it now re-uploads them.
+- **Vulkan: models with a very large vocabulary and a narrow embedding (the
+  small Gemma 3 files) no longer read past the output weight on every decoded
+  token**, which also roughly doubled the work of the final projection.
+- **Vulkan: a weight whose input width is an odd multiple of 32 gave wrong
+  prefill results** on GPUs with the f16 cooperative-matrix tier, for the
+  32-element-block quants (Q4_0, Q5_0, Q5_1, Q8_0, IQ4_NL) and BF16 / F16. Those
+  shapes now use a kernel that handles the width.
+- **Vulkan: a GPU missing `shaderInt8` or `computeFullSubgroups` is refused at
+  startup with the feature named**, instead of an unnamed device-creation error.
+- **`kernels.vulkan.pv_splits = 0` or `kernels.vulkan.flash_splits = 0` no
+  longer panics with a division by zero**; zero now means the adaptive default.
+
 ## [0.2.0] - 2026-10-29
 
 ### Breaking
@@ -863,6 +2218,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   pointer dereference in the `fmt::Pointer` impl for `Atomic`/`Shared`). Reached
   through `rayon`, so it applies to every CPU-backend build.
 
-[Unreleased]: https://github.com/kryptic-sh/infr/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/kryptic-sh/infr/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/kryptic-sh/infr/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/kryptic-sh/infr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/kryptic-sh/infr/releases/tag/v0.1.0

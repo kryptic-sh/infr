@@ -39,6 +39,18 @@ pub trait ConfigValue: Sized {
     fn parse_set(raw: &str) -> Result<Self, String>;
     /// Render for `get_path` (diagnostics + the polarity tests).
     fn to_display(&self) -> String;
+    /// Set a path BELOW this leaf (`leaf.rest`). Only an open map (a leaf whose keys are not
+    /// fixed by the schema, like `kernels.vulkan.tune`) accepts one; every other type refuses.
+    fn set_below(slot: &mut Option<Self>, rest: &str, raw: &str) -> Result<(), SetPathError> {
+        let _ = (slot, rest, raw);
+        Err(SetPathError::Unknown)
+    }
+    /// Fold a HIGHER-precedence layer's value over this layer's. A plain value replaces; an open
+    /// map keeps both layers' entries, so a later layer adds to an earlier one instead of
+    /// erasing it.
+    fn fold(slot: &mut Option<Self>, other: Self) {
+        *slot = Some(other);
+    }
 }
 
 macro_rules! impl_config_value_fromstr {
@@ -126,6 +138,22 @@ impl ConfigValue for super::MetalDeviceTime {
     }
     fn to_display(&self) -> String {
         self.to_string()
+    }
+}
+
+impl ConfigValue for Vec<String> {
+    /// A comma-separated list of names (a TOML array arrives joined with commas). Empty items are
+    /// skipped, so `""` is the empty list.
+    fn parse_set(raw: &str) -> Result<Self, String> {
+        Ok(raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+    fn to_display(&self) -> String {
+        self.join(",")
     }
 }
 
@@ -260,7 +288,11 @@ macro_rules! cfg_struct {
             /// Fold `other` (a HIGHER-precedence layer) over `self`. A `None` never clobbers.
             pub fn merge(&mut self, other: Self) {
                 $( self.$sf.merge(other.$sf); )*
-                $( if other.$lf.is_some() { self.$lf = other.$lf; } )*
+                $(
+                    if let ::core::option::Option::Some(v) = other.$lf {
+                        <$LT as $crate::config::partial::ConfigValue>::fold(&mut self.$lf, v);
+                    }
+                )*
             }
 
             /// Write whatever this layer specified onto an already-defaulted section.
@@ -287,11 +319,19 @@ macro_rules! cfg_struct {
                     }
                 )*
                 $(
-                    if head == stringify!($lf) && tail.is_none() {
-                        let v = <$LT as $crate::config::partial::ConfigValue>::parse_set(raw)
-                            .map_err($crate::config::SetPathError::Value)?;
-                        self.$lf = ::core::option::Option::Some(v);
-                        return ::core::result::Result::Ok(());
+                    if head == stringify!($lf) {
+                        let ::core::option::Option::Some(t) = tail else {
+                            let v = <$LT as $crate::config::partial::ConfigValue>::parse_set(raw)
+                                .map_err($crate::config::SetPathError::Value)?;
+                            // Within a layer, too, an open map keeps what it already holds.
+                            <$LT as $crate::config::partial::ConfigValue>::fold(&mut self.$lf, v);
+                            return ::core::result::Result::Ok(());
+                        };
+                        return <$LT as $crate::config::partial::ConfigValue>::set_below(
+                            &mut self.$lf,
+                            t,
+                            raw,
+                        );
                     }
                 )*
                 ::core::result::Result::Err($crate::config::SetPathError::Unknown)

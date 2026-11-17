@@ -34,7 +34,7 @@ build script falls back to `%VULKAN_SDK%\Bin\glslc.exe` when `glslc` is not on
 `PATH`, so an old shell still builds. Check the install with:
 
 ```powershell
-glslc --version          # shaderc — any 2025+ release (needs GL_EXT_integer_dot_product)
+glslc --version          # shaderc — 2026.1 or newer is known to work; 2023.8 is known not to
 vulkaninfo --summary     # lists the GPUs the driver exposes to Vulkan
 ```
 
@@ -118,6 +118,25 @@ cargo test --release -p infr-vulkan -p infr-llama -- --include-ignored --test-th
 `cargo test` builds at `-O0` apart from the compute crates, so the model tests
 are much faster with `--release`. `--test-threads 1` keeps the GPU tests from
 contending for one device's memory.
+
+On an integrated GPU the device's memory is the host's, and a model held
+resident there costs more host RAM than its file size: the device copy plus the
+mapped file pages the upload read, priced at `UNIFIED_RESIDENT_FACTOR` per file
+byte. The `cpu_backend` tests that hold a multi-GB model resident check this
+first (`resident_room`): where the load would leave less than
+`UNIFIED_HOST_MARGIN` of host memory available, they print a `skip:` line naming
+the device, the model size and the memory found, and do not run.
+`gpu_seam_paged_moe_matches_resident_and_cpu` skips only its resident leg and
+still holds the paged run to the CPU reference. On a discrete GPU every one of
+them runs.
+
+On a discrete GPU the mapped pages a resident upload read are released from the
+working set after each weight's upload (`paging.release_uploaded`), so they sit
+on the standby list and count as available; before that they stayed in the
+working set, counted as in use, for as long as the model was loaded. A test with
+a CPU leg still holds the whole file there, because the CPU backend reads its
+weights through the mapping. The process's `Private Bytes` (commit) stays near
+the model's size either way without being resident; see backlog B194.
 
 On a small iGPU, do **not** enable the whole ignored suite. `bandwidth_probe`
 retains large allocations, `decode_gemv_bw` retains cache-busting workloads and
@@ -276,8 +295,13 @@ Win32 API contracts.
 
 ## Troubleshooting
 
-- **`failed to run glslc`** — the Vulkan SDK is missing, or neither `PATH` nor
+- **`cannot run glslc`** — the Vulkan SDK is missing, or neither `PATH` nor
   `VULKAN_SDK` reaches it. Open a new shell after installing the SDK.
+- **`glslc failed to compile shaders/...`** — the message names the shader, the
+  `glslc` that ran and its version, and what `glslc` printed. A diagnostic
+  usually means a shaderc too old for the shaders; install a current Vulkan SDK,
+  or put a newer `glslc` earlier on `PATH`. If it printed nothing, the `glslc`
+  install itself is broken.
 - **`LNK1104: cannot open file 'target\release\infr.exe'`** or
   `Access is denied. (os error 5)` during a build — an `infr.exe` from that
   target directory is still running (a `serve` left in another window). Stop it

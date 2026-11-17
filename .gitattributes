@@ -3,3 +3,8 @@
 # Linguist doesn't classify it, so ~312 KB of shader code fell out of the language
 # stats — making Metal look larger than the Vulkan shaders when the reverse is true.
 *.comp linguist-language=GLSL
+
+# Chat-template fixtures are compared byte for byte (`include_str!`) with renders
+# that use LF; a CRLF checkout (core.autocrlf=true, the Windows runners' default)
+# would turn those tests red.
+crates/infr-chat/tests/fixtures/** text eol=lf

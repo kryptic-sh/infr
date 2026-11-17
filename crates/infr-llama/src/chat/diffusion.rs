@@ -173,6 +173,14 @@ impl ChatModel for DiffusionGemmaChat {
         &self.model
     }
 
+    /// Drops the whole session — its cached prefix along with its buffers — because the DG
+    /// sessions have no token-only reset. The next turn reopens it lazily (`ensure_sess`)
+    /// and re-prefills from scratch, paying the session open again.
+    fn reset_kv(&mut self) {
+        self.sess = None;
+        self.max_ctx = 0;
+    }
+
     fn warmup(&mut self) -> Result<()> {
         use crate::diffusion::DiffusionSession;
         // A tiny PREFILL-only forward compiles the lazily-built pipelines (GEMM/attention/batched
@@ -203,7 +211,10 @@ impl ChatModel for DiffusionGemmaChat {
     /// which has its OWN sampler and never consults `Sampler::resolve`. So the old thread-local
     /// never reached it either — a `temperature`/`seed`/`stop` on a DG serve request was already a
     /// no-op. Wiring per-request sampling (and the stop-sequence abort latch) into the denoise loop
-    /// is a separate piece of work; it is reported, not silently papered over.
+    /// is a separate piece of work; it is reported, not silently papered over. The two request
+    /// fields a client relies on to exclude or restrict tokens, `logit_bias` and `min_p`, are
+    /// refused instead ([`crate::sampling::UnsupportedSampling`]): generating without them is not
+    /// a reply the request asked for.
     fn generate(
         &mut self,
         prompt: &str,
@@ -248,6 +259,10 @@ impl DiffusionGemmaChat {
         on_piece: &mut dyn FnMut(&str),
         on_step: Option<&mut dyn FnMut(crate::diffusion::StepView)>,
     ) -> Result<GenStats> {
+        // The denoise sampler reads no logit bias and has no min-p cut (see `generate`).
+        if let Some(r) = req {
+            r.sampling().refuse_seam_only_fields("diffusion-gemma")?;
+        }
         let enc = self
             .model
             .tokenizer()
@@ -294,7 +309,7 @@ impl DiffusionGemmaChat {
         // held back exactly like one split across two tokens of the same block.
         let tokenizer = self.model.tokenizer();
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let mut on_block = |committed: &[u32]| {
             // The whole block's ids are in hand, so decode the committed span in ONE pass through
             // the shared incremental UTF-8-safe detok — NOT once per id over the growing `acc`

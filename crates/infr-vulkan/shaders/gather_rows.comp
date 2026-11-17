@@ -1,0 +1,47 @@
+#version 460
+// f32 row gather by i32 index into a grouped destination (`Op::GatherRows`): the DeepSeek V4
+// compressor's source assembly, laid out for `compress_pool.comp`. For entry r:
+//
+//   i = idx[idx_off + r]
+//   d = (r / group) * dst_group_stride + dst_row_off + r % group
+//   dst[d*n + c] = i < 0 ? fill : src[i*src_stride + src_col + c]      for c in [0, n)
+//
+// A negative index is the sentinel row (`dsv4_append_zero_row`). An index at or past the source's
+// row count writes `fill` too: the host cannot see the index values when it records, so the
+// kernel bounds the read itself (the `gather_i32.comp` rule). The geometry is checked on the host
+// (`infr_core::graph::check_gather_rows`), so every write lands inside `dst`.
+//
+// One thread per OUTPUT element (`rows * n`). A real context gathers `blocks * window` rows of a
+// head width, which can pass `MAX_GROUP_COUNT_X` workgroups, so the flat index is recovered across
+// `Recorder::dispatch_wide`'s 2-D split.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC {
+    uint rows;
+    uint idx_off;
+    uint src_stride;
+    uint src_col;
+    uint n;
+    uint group;
+    uint dst_group_stride;
+    uint dst_row_off;
+    // Logical source rows, from the graph: the bound range can be larger (the allocator rounds
+    // up), so `src.length()` would let an index into the padding.
+    uint n_src;
+    float fill;
+} pc;
+layout(binding = 0) readonly buffer SB { float src[]; };
+layout(binding = 1) readonly buffer IB { int idx[]; };
+layout(binding = 2) writeonly buffer DB { float dst[]; };
+
+void main() {
+    uint t = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x;
+    if (t >= pc.rows * pc.n) { return; }
+    uint r = t / pc.n;
+    uint c = t - r * pc.n;
+    uint d = (r / pc.group) * pc.dst_group_stride + pc.dst_row_off + r % pc.group;
+    int i = idx[pc.idx_off + r];
+    dst[d * pc.n + c] = (i < 0 || uint(i) >= pc.n_src)
+        ? pc.fill
+        : src[uint(i) * pc.src_stride + pc.src_col + c];
+}

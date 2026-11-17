@@ -163,8 +163,9 @@ fn run_case_with(
 }
 
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn dg_eb_sample_matches_host_reference() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

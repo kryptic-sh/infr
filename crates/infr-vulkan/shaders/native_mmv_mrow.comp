@@ -165,25 +165,9 @@ uvec2 k4(uint i, uint sb) {
 void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint bd = (gelem / 256u) * 144u; // super-block byte base
     uint sub = (gelem / 32u) & 7u;   // sub-block 0..7
-#ifdef Q4K_PACKED_META
-    // The 16-byte header is aligned (144-byte block stride): one wide load replaces
-    // repeated byte/half loads of d, dmin and the twelve packed scale/min bytes.
-    // Extract the exact same six-bit fields as k4(), including sub-blocks 4..7.
-    uvec4 meta = NW4(bd >> 2u);
-    vec2 dm = unpackHalf2x16(meta.x);
-    float d = dm.x;
-    float dmin = dm.y;
-    uint sh = (sub & 3u) * 8u;
-    uint sc = (meta.y >> sh) & 255u;
-    uint mn = (meta.z >> sh) & 255u;
-    uint hi = (meta.w >> sh) & 255u;
-    uvec2 km = sub < 4u ? uvec2(sc & 63u, mn & 63u)
-        : uvec2((hi & 15u) | ((sc >> 6u) << 4u), (hi >> 4u) | ((mn >> 6u) << 4u));
-#else
     float d = f16tof32(ru16(bd));
     float dmin = f16tof32(ru16(bd + 2u));
     uvec2 km = k4(sub, bd + 4u);
-#endif
     f0 = d * float(km.x);
     f1 = dmin * float(km.y);
     // qbase is always word-aligned (bd = sb·144, 144 % 4 == 0; +16 +32·k) — load each 4-byte
@@ -262,7 +246,10 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
 void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
     uint bd = (gelem / 256u) * 210u;
     uint p0 = gelem % 256u;
-    float d = f16tof32(ru16(bd + 208u));
+    // `d` (bytes 208..209) and this group's two scale bytes sit at even offsets, so each pair is
+    // one half of one word: one load apiece instead of a load per byte.
+    uint dbyte = bd + 208u;
+    float d = f16tof32(NW(dbyte >> 2u) >> ((dbyte & 2u) * 8u));
     uint hf = p0 / 128u; uint og = (p0 % 128u) / 32u;
     uint qho = hf * 32u; uint scbase = bd + 192u + hf * 8u + 2u * og;
     bool high = og >= 2u; uint qshift = og * 2u;
@@ -301,8 +288,9 @@ void wdec(uint gelem, out uint qp[8], out float f0, out float f1) {
             qp[j] = (q + 0x60606060u) ^ 0x80808080u;
         }
     }
-    f0 = d * float(sgn8(rb(scbase)));
-    f1 = d * float(sgn8(rb(scbase + 1u)));
+    uint scw = NW(scbase >> 2u) >> ((scbase & 2u) * 8u);
+    f0 = d * float(sgn8(scw & 0xFFu));
+    f1 = d * float(sgn8((scw >> 8u) & 0xFFu));
 }
 #endif
 
@@ -585,8 +573,11 @@ void wdec2k(uint gelem, out uint qp[8], out float dl0, out float ml0, out float 
 
 #ifdef FUSE_QUANT
 // Inline per-32-block symmetric int8 activation quantization: read 32 f32 elements, compute amax,
-// quantize to int8, output packed words aw[8] and per-block da/sa. Same numerics as quant_q8.comp
-// (amax/127 scale, round-to-nearest, clamp [−127,127], sa = Σ(d·q)). Shared by OUTS4 and non-OUTS4.
+// quantize to int8, output packed words aw[8] and per-block da/sa. The quantization matches
+// quant_q8.comp (amax/127 scale, round-to-nearest, clamp [−127,127], sa = Σ(d·q)), but da/sa stay
+// f32 here where quant_q8 stores them as f16, and sa sums serially rather than by subgroupAdd —
+// so the fused path is close to, not bit-identical with, the separate quant_q8 + mmv route.
+// Shared by OUTS4 and non-OUTS4.
 void fuse_quant(uint row, uint s, out int aw[8], out float da, out float sa) {
     float amax = 0.0;
     float vals[32];
@@ -617,13 +608,11 @@ void fuse_quant(uint row, uint s, out int aw[8], out float da, out float sa) {
 shared float part4[4u * MR * 16u];   // [out, row, lane]
 
 void main() {
-    // Flat-index recovery for a possibly-2-D dispatch grid — see native_gemv_rm.comp's main() for
-    // why no extra bounds check is needed here (the existing `live` guard below already covers a
-    // padding workgroup's out-of-range o0 for every lane).
+    // Flat-index recovery for a possibly-2-D dispatch grid. `live` below only gates the writes, and
+    // the weight row is still decoded through the 64-bit pointer, so a padding workgroup must return
+    // before it reads past the tensor. o0 is workgroup-uniform, so no barrier is skipped unevenly.
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 4u;
-    if (o0 >= pc.out_f) { return; } // fully-past-the-tail padding workgroup (2-D split
-    // rounding can land whole groups past out_f) — the per-output `live` guard below covers a
-    // PARTIAL tail group; without this, padding groups pay the full K-loop for nothing.
+    if (o0 >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;
     w_addr = arena_base(pc.arena_lo, pc.arena_hi); // resident slot base byte address; NO slot multiply
     uint ot = t >> 4u;               // which of the 4 outputs this lane serves
@@ -730,9 +719,9 @@ void main() {
 }
 #else
 void main() {
-    // Flat-index recovery for a possibly-2-D dispatch grid — see native_mmv.comp's main() for why
-    // an explicit early return is needed here (the final `y_buf[t*pc.out_f + o0]` write below is
-    // unconditional on o0, unlike the OUTS4 variant above).
+    // Flat-index recovery for a possibly-2-D dispatch grid — see native_mmv.comp's main(). The
+    // early return keeps a padding workgroup from decoding a weight row past the tensor and from
+    // the final `y_buf[t*pc.out_f + o0]` write below, which is unconditional on o0.
     uint o0 = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * 2u;
     if (o0 >= pc.out_f) { return; }
     uint t = gl_LocalInvocationID.x;

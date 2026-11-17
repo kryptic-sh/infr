@@ -3,6 +3,30 @@ use crate::{meta_f64, meta_u64, MoeConfig};
 use anyhow::{bail, Context, Result};
 use infr_core::loader::MetaValue;
 use infr_core::WeightSource;
+use infr_gguf::Gguf;
+
+/// llama4's attention chunk: the `n_swa` its rope layers attend within and the
+/// `n_attn_temp_floor_scale` of its NoPE temperature — both hardcoded in
+/// `llama_model_llama4::load_arch_hparams` (`llama.cpp/src/models/llama4.cpp`), not read from the
+/// file. See [`Config::faithful_ctx_limit`].
+pub(crate) const LLAMA4_ATTN_CHUNK: usize = 8192;
+
+/// smollm3's `n_no_rope_layer_step`: hardcoded in `llama_model_smollm3::load_arch_hparams`
+/// (`llama.cpp/src/models/smollm3.cpp`), not read from the file, so it lives here rather than in
+/// the metadata parse. See [`Config::no_rope_step`].
+pub(crate) const SMOLLM3_NO_ROPE_STEP: usize = 4;
+
+/// The YaRN ramp corners deepseek2 and deepseek32 run with: the `llama_hparams::yarn_beta_fast` /
+/// `yarn_beta_slow` initializers (`llama.cpp/src/llama-hparams.h`), which those archs' loaders
+/// never overwrite from `rope.scaling.yarn_beta_fast` / `_slow`.
+const YARN_BETA_FAST: f32 = 32.0;
+const YARN_BETA_SLOW: f32 = 1.0;
+
+/// GLM 4.7 Lite's shape, which `llama_model_deepseek2::load_arch_hparams`
+/// (`llama.cpp/src/models/deepseek2.cpp`) gives SIGMOID routing when the file has no
+/// `expert_gating_func`: either trunk depth, and this vocabulary size.
+const GLM47_LITE_N_LAYER: [usize; 2] = [47, 48];
+const GLM47_LITE_N_VOCAB: u64 = 154_880;
 
 /// `Default` is an ALL-ZERO placeholder, not a runnable model: [`Config::from_gguf`] is the only
 /// source of a real one. It exists so a test can name the two or three fields the arithmetic it is
@@ -38,8 +62,10 @@ pub struct Config {
     pub eos_ids: Vec<u32>,
     /// Qwen3-style per-head RMSNorm on Q and K before RoPE.
     pub qk_norm: bool,
-    /// Qwen2/2.5 add a learned bias to the q/k/v projections (`Wx + b`); Qwen3 dropped them. o-proj
-    /// and FFN stay bias-free. `true` only for `arch == "qwen2"`.
+    /// The file carries a learned bias on every layer's q/k/v projections (`Wx + b`), which the
+    /// seam adds; o-proj and FFN stay bias-free. Decided by the tensors, as llama.cpp decides it,
+    /// for every arch whose reference builds through `build_qkv` — see `qkv_projection_biases`.
+    /// Qwen2/2.5 are the files that ship them.
     pub qkv_bias: bool,
     /// qwen2 needs the NEOX (rotate-half) RoPE but rides the no-qknorm path, whose `Op::Rope` is the
     /// INTERLEAVED (NORM) rotation — llama-arch GGUFs get that layout from the converter's q/k row
@@ -49,6 +75,13 @@ pub struct Config {
     /// dots are permutation-invariant (K cached permuted, Q permuted identically; V untouched).
     /// qwen3/gemma rotate NEOX inside QkNormRope directly — no permute.
     pub permute_qk_neox: bool,
+    /// Whether the arch divides its rope angles by `rope_freqs.weight` when the file carries one —
+    /// the archs whose llama.cpp builder passes `get_rope_factors` into `ggml_rope_ext` AND whose
+    /// loader creates the tensor: llama (Llama 3.1+, written for every `rope_type: llama3`
+    /// checkpoint), llama4 (rope layers only; NoPE layers do not rope), and gemma4 (full-attention
+    /// layers only). `deepseek` passes `get_rope_factors` too but never loads the tensor, so it
+    /// is not here.
+    pub rope_freq_factors: bool,
     /// gemma family: scale input embeddings by √n_embd, sandwich norms (post-attn / post-ffw RMSNorm
     /// before the residual add), and a GeGLU (GELU) FFN instead of SwiGLU.
     pub gemma: bool,
@@ -108,15 +141,14 @@ pub struct Config {
     pub moe: Option<MoeConfig>,
     /// The model's trained/default maximum context length (`<arch>.context_length`). Used as the
     /// default KV-cache size when the caller doesn't request a custom context (overridable). Falls
-    /// back to 8192 if the GGUF omits it.
+    /// back to 8192 if the GGUF omits it. This is the FILE's value: a session never opens past
+    /// [`Config::faithful_ctx_limit`], whichever way its context was asked for
+    /// (`SeamModel::session_ctx`).
     pub n_ctx_train: usize,
     /// qwen35 (Qwen3.5/3.6 gated-DeltaNet hybrid): `true` only for `arch == "qwen35"`. Gates every
     /// field below plus the `MixerW::DeltaNet` mixer branch in `seam`'s layer loop — the same
     /// shared transformer skeleton every other architecture runs through.
     pub qwen35: bool,
-    /// HF Qwen4-Exp config. Shares hybrid dimensions with qwen35, but NOT its forward:
-    /// HC, PLE, QSA and the output gate require separate emission. Inference is refused.
-    pub qwen4_exp: Option<crate::qwen4_exp::Cfg>,
     /// qwen35: attention layers sit at `i` where `(i+1) % full_attn_interval == 0`; every other
     /// layer is gated-DeltaNet linear attention. `0` for every non-qwen35 model (never read).
     pub full_attn_interval: usize,
@@ -136,6 +168,25 @@ pub struct Config {
     /// `attn_q` (`[h0 q(hd) | h0 gate(hd) | h1 q | h1 gate | …]`, NOT two contiguous blocks) —
     /// the one real trap in `docs/qwen35.md`. `true` only for qwen35.
     pub attn_out_gate: bool,
+    /// LFM3 (`arch == "lfm3"`): gated short-convolution layers ([`Config::is_shortconv_layer`])
+    /// interleaved with attention layers that carry QK-norm and a per-head sigmoid output gate
+    /// (`attn_gate`), sandwich norms, and a per-layer sliding-window pattern
+    /// ([`Config::swa_layers`]). `false` for every other arch.
+    pub lfm3: bool,
+    /// LFM3: which layers are short-convolution layers (`attention.head_count_kv[il] == 0`, as
+    /// `lfm3.cpp::load_arch_hparams` decides). Empty for every other arch.
+    pub shortconv_layers: Vec<bool>,
+    /// LFM3: the short convolution's kernel width (`shortconv.l_cache`); its rolling history holds
+    /// one fewer row. `0` for every other arch.
+    pub shortconv_l_cache: usize,
+    /// LFM3: the per-layer sliding-window flags (`attention.sliding_window_pattern`, read as an
+    /// array the way `lfm3.cpp` reads it), which [`Config::is_swa_layer`] answers from when it is
+    /// non-empty. Empty for every other arch, whose window layers follow `swa_pattern`.
+    pub swa_layers: Vec<bool>,
+    /// The file carries a post-mixer and a post-FFN RMSNorm on every layer (`post_attention_norm`,
+    /// `post_ffw_norm`), applied to the sublayer output before its residual add: every gemma, and
+    /// an LFM3 file that ships them.
+    pub sandwich_norm: bool,
     /// MTP/NextN (Qwen3.5/3.6, issue #33 — see `docs/mtp.md`): the number of extra decoder blocks
     /// `{arch}.block_count` includes BEYOND the trunk (`{arch}.nextn_predict_layers`). `n_layer`
     /// above is already the TRUNK count (`block_count - n_layer_nextn`) — every existing field/
@@ -154,14 +205,19 @@ pub struct Config {
     /// llama4 (Scout etc.): `true` only for `arch == "llama4"`. Gates every field below plus the
     /// per-layer NoPE / weightless-L2-norm attention wiring and the sigmoid-gated MoE in `seam`.
     pub llama4: bool,
-    /// llama4 `interleave_moe_layer_step`: layer `il` is a MoE layer iff `(il+1) % step == 0`
-    /// (`step == 1` on Scout → every layer). Other layers are dense FFN. `0` for every non-llama4
-    /// model (whose MoE archs — qwen3moe etc. — are MoE on ALL layers; see [`Config::is_moe_layer`]).
+    /// `interleave_moe_layer_step` (llama4, ernie4_5-moe): a MoE layer must satisfy
+    /// `(il+1) % step == 0` (`step == 1` on Scout and ERNIE 4.5 21B-A3B → every layer). Other
+    /// layers are dense FFN. `0` for every other model (no step condition; see
+    /// [`Config::is_moe_layer`]).
     pub moe_interleave_step: usize,
-    /// llama4 iRoPE `no_rope_layer_step`: layer `il` SKIPS rope (NoPE / global attention) iff
-    /// `(il+1) % step == 0` (4 on Scout — pattern "3 local-rope, 1 global-NoPE"). `0` = every layer
-    /// uses rope (every non-llama4 model, and a llama4 checkpoint with `attention.sliding_window==0`).
+    /// The NoPE layer step: layer `il` SKIPS rope iff `(il+1) % step == 0`. llama4 iRoPE's
+    /// `no_rope_layer_step` (4 on Scout — pattern "3 local-rope, 1 global-NoPE"), where the NoPE
+    /// layers are also global attention, and smollm3's `SMOLLM3_NO_ROPE_STEP`, where skipping rope
+    /// is the only difference. `0` = every layer uses rope (every other model, and a llama4
+    /// checkpoint with `attention.sliding_window==0`).
     pub no_rope_step: usize,
+    /// See [`Config::faithful_ctx_limit`], which reads it.
+    pub ctx_limit: Option<usize>,
     /// llama4 `Llama4TextL2Norm`: a WEIGHTLESS per-head RMS/L2-norm applied to Q and K AFTER rope,
     /// on the rope (non-NoPE) layers only. `use_kq_norm = n_expert != 128` in the reference (`true`
     /// for Scout 16E). `false` for every non-llama4 model.
@@ -180,11 +236,16 @@ pub struct Config {
     /// no-renormalization softmax gating, threshold-mode `is_moe_layer`, and an ungated
     /// shared expert (summed in plain, like llama4). See docs/deepseek.md § Stage 1.
     pub deepseek: bool,
-    /// DeepSeek: the first `n_layer_dense_lead` layers use a DENSE FFN; the rest are MoE
-    /// (unless the model has no MoE — `Config::moe` is `None` — in which case every layer
-    /// is dense regardless). `0` = every layer MoE (not used today). Non-DeepSeek models
-    /// ignore this field.
+    /// DeepSeek V1/V2/V3.2 and ernie4_5-moe (`leading_dense_block_count`): the first
+    /// `n_layer_dense_lead` layers use a DENSE FFN; the rest are MoE where the interleave step
+    /// allows (see [`Config::is_moe_layer`]), unless the model has no MoE (`Config::moe` is
+    /// `None`), in which case every layer is dense regardless. `0` for every other model.
     pub n_layer_dense_lead: usize,
+    /// The arch's reference loads `blk.N.exp_probs_b.bias` (the MoE router's selection bias) as
+    /// OPTIONAL on each MoE layer and applies it where present: deepseek2 (whose pre-V3 files have
+    /// none) and ernie4_5-moe. deepseek4 requires it per layer and is handled on its own; every
+    /// other arch's reference never loads it.
+    pub optional_router_bias: bool,
     /// DeepSeek V2+: `true` for `arch == "deepseek2"` AND for `arch == "deepseek32"` (V3.2 is the
     /// same skeleton plus an indexer — see [`Config::deepseek32`]). Gates MLA attention (absorbed
     /// form with asymmetric K/V dims + single K row), YaRN rope scaling, and group-limited MoE
@@ -209,8 +270,8 @@ pub struct Config {
     /// is_swa_layer`] special-cases this arch for that reason: `swa_pattern` encodes "every p-th
     /// layer is FULL", and V4 has no full layers to point at.
     ///
-    /// Nothing emits a V4 graph yet: `seam::runner::generate_dense_backend` loads every tensor and
-    /// then refuses by name.
+    /// `seam::runner::generate_dense_backend` emits every tier; the compressed ones (ratio 4 and
+    /// 128) on the CPU backend only.
     pub deepseek4: bool,
     /// DeepSeek V4 (`{arch}.attention.compress_ratios`): the per-layer compression ratio, and the
     /// MASTER per-layer switch — which caches a layer keeps and which tensors it carries both hang
@@ -320,28 +381,36 @@ pub struct Config {
     /// divisors and the constant mscale² attention boost — see `docs/deepseek.md` § YaRN.
     /// llama.cpp activates the full ramp whenever this flag is set (`yarn_ext_factor = 1.0` in
     /// `llama-context.cpp`), regardless of the current context length.
+    ///
+    /// Also read for `deepseek4`, where it gates the same ramp on the COMPRESSED layers' ropes
+    /// only ([`Config::dsv4_compressed_rope_divisors`]); V4 has no MLA score boost.
     pub rope_scaling_yarn: bool,
     /// DeepSeek V2+ YaRN: `rope.scaling.factor` — the long-context interpolate factor (40 for
     /// V2-Lite). `1.0` when the GGUF omits it. The per-pair divisor is `freq_scale = 1/factor`
     /// ramped toward 1.0 below `corr_dim` (see `docs/deepseek.md`).
+    ///
+    /// On `deepseek4` it is also the uniform divisor of a `"linear"` file, and it
+    /// is forced to `1.0` when the file declares `rope.scaling.type = "none"`.
     pub rope_scaling_factor: f32,
     /// DeepSeek V2+ YaRN: `rope.scaling.original_context_length` — the context the model was
     /// TRAINED at, the `n_ctx_orig` of the corr_dim ramp (4096 for V2-Lite). Defaults to
     /// `context_length` when the GGUF omits it (llama.cpp's `n_ctx_orig_yarn` fallback). NOT
     /// `n_ctx_train`: this GGUF sets `context_length = 163840` while the yarn ramp must use 4096.
+    /// Read for `deepseek4` too.
     pub rope_scaling_orig_ctx: usize,
     /// DeepSeek V2+ YaRN: `rope.scaling.attn_factor` — llama.cpp's `hparams.rope_attn_factor`,
     /// folded into `cparams.yarn_attn_factor` (`llama-context.cpp`) BEFORE the deepseek2 builder
     /// recovers `attn_factor_org` from it, so it lands inside the squared mscale of the MLA score
-    /// scale. `1.0` (llama.cpp's default) when the GGUF omits it.
+    /// scale. `1.0` (llama.cpp's default) when the GGUF omits it. Always `1.0` on `deepseek4`,
+    /// whose ropes take `dsv4_rope_attn_factor` in place of `cparams.yarn_attn_factor`.
     pub rope_attn_factor: f32,
-    /// DeepSeek V2+ YaRN: `rope.scaling.yarn_beta_fast` — the ramp's high-frequency corner, the
-    /// `beta_fast` of `ggml_rope_yarn_corr_dims`'s START dim. Defaults to llama.cpp's
-    /// `llama_hparams::yarn_beta_fast`.
+    /// DeepSeek V2+ YaRN: the ramp's high-frequency corner, the `beta_fast` of
+    /// `ggml_rope_yarn_corr_dims`'s START dim. Always `YARN_BETA_FAST`: the reference's
+    /// deepseek2 and deepseek4 loaders do not read `rope.scaling.yarn_beta_fast`.
     pub rope_yarn_beta_fast: f32,
-    /// DeepSeek V2+ YaRN: `rope.scaling.yarn_beta_slow` — the ramp's low-frequency corner, the
-    /// `beta_slow` of `ggml_rope_yarn_corr_dims`'s END dim. Defaults to llama.cpp's
-    /// `llama_hparams::yarn_beta_slow`.
+    /// DeepSeek V2+ YaRN: the ramp's low-frequency corner, the `beta_slow` of
+    /// `ggml_rope_yarn_corr_dims`'s END dim. Always `YARN_BETA_SLOW`: the reference's deepseek2
+    /// and deepseek4 loaders do not read `rope.scaling.yarn_beta_slow`.
     pub rope_yarn_beta_slow: f32,
     /// DeepSeek V2+ "lite" variant: `wq` present ⇒ lite (no wq_a/q_a_norm/wq_b). Detected by
     /// tensor presence, not GGUF key.
@@ -373,7 +442,8 @@ fn positive_array_model_dimension(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Config {
     /// Whether layer `il` uses sliding-window (vs full) attention. gemma interleaves SWA with full
-    /// attention on a fixed period; non-gemma models are always full.
+    /// attention on a fixed period, LFM3 names each layer in [`Config::swa_layers`]; every other
+    /// model is always full.
     ///
     /// deepseek4 is neither: `deepseek4.cpp::load_arch_hparams` calls `set_swa_pattern(0)`, whose
     /// `n_pattern == 0 || …` arm marks EVERY layer sliding-window. `swa_pattern` cannot express
@@ -383,6 +453,9 @@ impl Config {
     pub fn is_swa_layer(&self, il: usize) -> bool {
         if self.deepseek4 {
             return self.swa_window > 0;
+        }
+        if !self.swa_layers.is_empty() {
+            return self.swa_window > 0 && self.swa_layers[il];
         }
         self.swa_window > 0 && self.swa_pattern > 1 && !(il + 1).is_multiple_of(self.swa_pattern)
     }
@@ -400,6 +473,55 @@ impl Config {
     /// arch (`hash_layer_count == 0`).
     pub fn is_hash_moe_layer(&self, il: usize) -> bool {
         il < self.hash_layer_count
+    }
+
+    /// deepseek4: the per-pair rope frequency divisors (`rope_dim / 2` floats) of every rope on a
+    /// COMPRESSED layer (ratio 4 or 128), at base [`Config::compress_rope_theta`]. `None` for
+    /// every other arch. The compressed-layer emit applies it through `Op::Rope::freq_factors` (the runner's
+    /// `yarn_ff` Input); ratio-0 layers rope plain at [`Config::rope_theta`] (`deepseek4.cpp`
+    /// passes them `freq_scale = 1` and `ext_factor = 0`).
+    ///
+    /// How the reference's rope maps onto `Op::Rope`. `deepseek4.cpp` ropes the query, the kv
+    /// row, the attention output's de-rope, each compressed row and the indexer query of a
+    /// compressed layer with `ggml_rope_ext(…, n_rot, rope_type, n_ctx_orig,
+    /// compress_rope_base, freq_scale, ext_factor, dsv4_rope_attn_factor(freq_scale, ext_factor),
+    /// beta_fast, beta_slow)` and no `freq_factors` tensor, then `ggml_rope_set_offset(…, nope)`:
+    /// - **Angle.** `freq_scale = 1/rope.scaling.factor`; `ext_factor` is 1 for a `"yarn"` file
+    ///   and 0 otherwise; the betas are `llama_hparams`' defaults. With `ext_factor = 1`, ggml's
+    ///   `rope_yarn` angle is the plain angle divided by `yarn_freq_divisors`' entry (the same
+    ///   real number; the f32 roundings differ), which is what `Op::Rope::freq_factors` divides
+    ///   by (pair `p`, angle `pos · theta^(-2p/rope_dim) / ff[p]`), with
+    ///   `theta = compress_rope_theta`. With `ext_factor = 0` the angle is `freq_scale · θe`, a
+    ///   uniform divisor of `1/freq_scale`. The divisor is the whole of what `freq_factors`
+    ///   expects: the reference passes no `freq_factors` tensor of its own to multiply in.
+    /// - **Magnitude.** None is left over: ggml multiplies cos and sin by `attn_factor`, and by
+    ///   `1 + 0.1·ln(1/freq_scale)` when `ext_factor != 0`; `dsv4_rope_attn_factor` is the
+    ///   reciprocal of that second factor (or 1 when `ext_factor == 0`), so the product is 1 up
+    ///   to one f32 rounding — and `Op::Rope` applies no magnitude at all.
+    /// - **Pairing and span.** `llama_model::rope_type` puts DEEPSEEK4 in the NORM group, so
+    ///   `Op::Rope { neox: false }` (adjacent pairs). `ggml_rope_set_offset(nope)` rotates the
+    ///   LAST `n_rot` dims of each head (`[nope, nope + n_rot)`), so the head's tail is gathered
+    ///   to a packed `rope_dim`-wide row first, as the ratio-0 arm already does.
+    /// - **Width.** Every one of those ropes rotates `hparams.n_rot()` dims, the indexer's too, so
+    ///   one vector of `rope_dim / 2` divisors serves all of them.
+    pub fn dsv4_compressed_rope_divisors(&self) -> Option<Vec<f32>> {
+        if !self.deepseek4 {
+            return None;
+        }
+        let pairs = self.rope_dim / 2;
+        Some(if self.rope_scaling_yarn {
+            yarn_freq_divisors(
+                self.rope_dim,
+                self.compress_rope_theta,
+                self.rope_scaling_orig_ctx,
+                self.rope_scaling_factor,
+                self.rope_yarn_beta_fast,
+                self.rope_yarn_beta_slow,
+            )
+        } else {
+            let freq_scale = 1.0 / self.rope_scaling_factor;
+            vec![1.0 / freq_scale; pairs]
+        })
     }
 
     /// RoPE base for layer `il`: gemma3 SWA (local) layers use the smaller `swa_rope_theta`, full
@@ -479,38 +601,105 @@ impl Config {
         self.diffusion_gemma || self.gemma4_moe
     }
 
-    /// Whether layer `il` uses the routed-expert (MoE) FFN. For every MoE arch except llama4 and
-    /// deepseek that's EVERY layer (`moe_interleave_step == 0`). llama4 interleaves MoE with dense
-    /// layers on a fixed step (`(il+1) % step == 0`). DeepSeek V1/V2/V3.2 use a threshold: the first
-    /// `n_layer_dense_lead` layers are dense, the rest are MoE — V4 has no dense-lead layers at all
-    /// and rides the every-layer branch. `false` for dense models (`self.moe` is `None`).
+    /// Whether layer `il` uses the routed-expert (MoE) FFN: past the `n_layer_dense_lead` leading
+    /// dense layers AND on the `moe_interleave_step` (when one is set), as `ernie4-5-moe.cpp`
+    /// tests both. Each other arch sets at most one of the two: DeepSeek V1/V2/V3.2 a dense lead,
+    /// llama4 a step, and every other MoE arch (V4 included) neither, which makes every layer MoE.
+    /// `false` for dense models (`self.moe` is `None`).
     pub fn is_moe_layer(&self, il: usize) -> bool {
         self.moe.is_some()
-            && if self.deepseek || self.deepseek2 {
-                il >= self.n_layer_dense_lead
-            } else if self.moe_interleave_step > 0 {
-                (il + 1).is_multiple_of(self.moe_interleave_step)
-            } else {
-                true
-            }
+            && il >= self.n_layer_dense_lead
+            && (self.moe_interleave_step == 0 || (il + 1).is_multiple_of(self.moe_interleave_step))
     }
 
-    /// llama4 iRoPE: whether layer `il` SKIPS rope (a NoPE / global-attention layer). `false` for
-    /// every non-llama4 model (`no_rope_step == 0`).
+    /// Whether layer `il` SKIPS rope (a NoPE layer: llama4 iRoPE's global-attention layers, or
+    /// smollm3's). `false` for every model with `no_rope_step == 0`.
     pub fn is_nope_layer(&self, il: usize) -> bool {
         self.no_rope_step > 0 && (il + 1).is_multiple_of(self.no_rope_step)
+    }
+
+    /// The longest context this model's output matches the reference over, when the reference
+    /// changes its attention past some position in a way infr does not implement; `None` for
+    /// every model infr runs at any length. Every session's context is capped here where it is
+    /// resolved (`SeamModel::session_ctx`), and the runner caps a one-shot `want_ctx` the same
+    /// way.
+    ///
+    /// Both cases are llama.cpp's attention temperature (`llm_graph_input_attn_temp`), which
+    /// multiplies Q at position `p` by `log(floor((p + offset) / floor_scale) + 1) * scale + 1` —
+    /// exactly 1 until `p + offset` reaches `floor_scale`:
+    ///
+    /// * llama4's iRoPE branch (`no_rope_step > 0`): `llama4.cpp` hardcodes the temperature on
+    ///   its NoPE layers with `offset = 1`, `floor_scale = LLAMA4_ATTN_CHUNK`, and also gives its
+    ///   rope layers CHUNKED attention (`LLAMA_SWA_TYPE_CHUNKED`: a query at `p` sees only keys
+    ///   from `(p / LLAMA4_ATTN_CHUNK) * LLAMA4_ATTN_CHUNK` on). The temperature diverges first,
+    ///   at `p = LLAMA4_ATTN_CHUNK - 1`, so the limit is `LLAMA4_ATTN_CHUNK - 1` tokens.
+    /// * deepseek2 with a non-zero `attention.temperature_scale` (Mistral-Large-3): `deepseek2.cpp`
+    ///   applies it to Q on every layer with `offset = 0` and `floor_scale =
+    ///   attention.temperature_length`, so the limit is `temperature_length` tokens.
+    pub fn faithful_ctx_limit(&self) -> Option<usize> {
+        self.ctx_limit
     }
 
     /// qwen35: whether layer `il` is one of the FULL-attention layers (vs gated-DeltaNet linear
     /// attention). `false` for every non-qwen35 model. Mirrors the old seam's `Cfg::is_attn_layer`.
     pub fn is_qwen35_attn_layer(&self, il: usize) -> bool {
-        if let Some(c) = &self.qwen4_exp {
-            return c.layer_types.get(il) == Some(&crate::qwen4_exp::LayerType::IndexedAttention);
-        }
         self.qwen35
             && self.full_attn_interval > 0
             && (il + 1).is_multiple_of(self.full_attn_interval)
     }
+    /// LFM3: whether layer `il` is a gated short-convolution layer (vs attention). `false` for
+    /// every layer of every other arch.
+    pub fn is_shortconv_layer(&self, il: usize) -> bool {
+        self.shortconv_layers.get(il).copied().unwrap_or(false)
+    }
+
+    /// Whether layer `il` keeps a fixed-size recurrent state instead of a per-token KV cache: a
+    /// qwen35 gated-DeltaNet layer or an LFM3 short-convolution layer. That state lives in the
+    /// layer's two cache slots ([`Config::recurrent_state_elems`]), cannot be rewound to a shorter
+    /// prefix, and is what every session path that reuses or rewinds a cache must reset instead.
+    pub fn is_recurrent_layer(&self, il: usize) -> bool {
+        (self.qwen35 && !self.is_qwen35_attn_layer(il)) || self.is_shortconv_layer(il)
+    }
+
+    /// Whether any layer keeps a recurrent state ([`Config::is_recurrent_layer`]).
+    pub fn has_recurrent_state(&self) -> bool {
+        (0..self.n_layer).any(|il| self.is_recurrent_layer(il))
+    }
+
+    /// Whether a session of this model can only be continued, never rewound: some layer keeps
+    /// state that truncating the token list cannot take back. A recurrent layer
+    /// ([`Config::has_recurrent_state`]) is one; a DeepSeek V4 compressed layer
+    /// ([`Config::layer_compress_ratio`] non-zero) is the other. Its compressor ring holds the
+    /// rows of the last `ratio` (HCA) or `2*ratio` (CSA) positions written, whichever turn wrote
+    /// them, and its compressed cache holds blocks committed from those rows, so a turn that
+    /// rewound to a shared prefix would pool another turn's rows into its next block. llama.cpp
+    /// clears the whole cache on such a rewind unless it keeps rollback planes
+    /// (`llama_kv_cache_dsv4`'s `n_rs_seq`), which infr does not port.
+    ///
+    /// Every session path that would truncate a cache reads this: such a session re-prefills from
+    /// position 0 instead, and is reused only by a prompt that extends exactly what it holds.
+    pub fn has_unrewindable_state(&self) -> bool {
+        self.has_recurrent_state()
+            || (self.deepseek4 && (0..self.n_layer).any(|il| self.layer_compress_ratio(il) != 0))
+    }
+
+    /// f32 element counts of a recurrent layer's two state buffers, held in its K and V cache
+    /// slots: qwen35's conv history and DeltaNet `S` matrix, or LFM3's short-convolution history
+    /// and a one-element placeholder (the short convolution has no second state, and the slot is
+    /// still bound). `None` for a layer that caches K/V per token.
+    pub fn recurrent_state_elems(&self, il: usize) -> Option<(usize, usize)> {
+        if self.is_shortconv_layer(il) {
+            Some(((self.shortconv_l_cache - 1) * self.n_embd, 1))
+        } else if self.is_recurrent_layer(il) {
+            Some((
+                (self.ssm_d_conv - 1) * self.q35_conv_channels(),
+                self.q35_num_v_heads() * self.q35_head_k_dim() * self.q35_head_v_dim(),
+            ))
+        } else {
+            None
+        }
+    }
+
     /// qwen35 gated-DeltaNet derived dims (see `docs/qwen35.md`) — ports of the old seam's `Cfg`
     /// helpers of the same name, now living on the shared `Config`.
     pub fn q35_num_k_heads(&self) -> usize {
@@ -533,19 +722,12 @@ impl Config {
     /// upload. The single source of truth for both the GPU loader (`Llama::load_opt`) and the
     /// CPU-only loader (`SeamModel::load`). `eos_ids` holds only the GGUF `eos` here; chat-end
     /// markers (`<|im_end|>` …) are appended once a tokenizer exists (see `add_chat_eos`).
-    pub fn from_gguf(g: &dyn WeightSource) -> Result<Config> {
+    pub fn from_gguf(g: &Gguf) -> Result<Config> {
         let arch = g
             .metadata()
             .str("general.architecture")
             .unwrap_or("")
             .to_string();
-        if arch == crate::arch::QWEN4_EXP {
-            // No canonical GGUF schema exists here yet. Only the validated HF adapter may
-            // construct this config; never guess it from a GGUF bearing a similar string.
-            let source = g.as_any().downcast_ref::<crate::qwen4_exp_source::Qwen4ExpSource>()
-                .context("qwen4_exp requires a dense HF safetensors checkpoint with adjacent config.json")?;
-            return Ok(source.cfg.clone().shared_config());
-        }
         let qk_norm = match arch.as_str() {
             // llama4 has no LEARNED q/k-norm weights; its weightless per-head L2-norm on Q/K is
             // applied AFTER rope (see `kq_l2norm` below), not via the qwen3-style QkNormRope.
@@ -559,12 +741,16 @@ impl Config {
             | crate::arch::DEEPSEEK32
             | crate::arch::DEEPSEEK4
             | crate::arch::BITNET
-            | crate::arch::BITNET_B158 => false,
+            | crate::arch::BITNET_B158
+            | crate::arch::SMOLLM3
+            | crate::arch::ERNIE4_5
+            | crate::arch::ERNIE4_5_MOE => false,
             crate::arch::QWEN3
             | crate::arch::QWEN3_MOE
             | crate::arch::GEMMA3
             | crate::arch::GEMMA4
-            | crate::arch::DIFFUSION_GEMMA => true,
+            | crate::arch::DIFFUSION_GEMMA
+            | crate::arch::LFM3 => true,
             // qwen35's full-attention layers are qk-normed like qwen3/gemma (see `docs/qwen35.md`).
             // Kept as its own match arm (rather than folded into `arch::TRANSFORMER` above) because
             // `is_qwen35` gates a handful of qwen35-only fields below it; the error message renders
@@ -579,10 +765,9 @@ impl Config {
                 crate::arch::QWEN35_MOE,
             ),
         };
-        // Qwen2/2.5 bias their q/k/v projections (Qwen3 removed them); every other supported arch is
-        // bias-free on attention. They also keep the HF rotate-half q/k row order (see the
-        // `permute_qk_neox` field doc).
-        let qkv_bias = arch == crate::arch::QWEN2;
+        // Qwen2/2.5 keep the HF rotate-half q/k row order (see the `permute_qk_neox` field doc).
+        // Their q/k/v projection biases are found by `qkv_projection_biases` below, as every
+        // arch's are.
         // bitnet, like qwen2, uses NEOX rope (llama.cpp maps LLM_ARCH_BITNET to LLAMA_ROPE_TYPE_NEOX)
         // and its GGUF keeps attn_q/attn_k in HF rotate-half order — permute the rows at load so the
         // no-qknorm interleaved `Op::Rope` reproduces NEOX (see the `permute_qk_neox` field doc).
@@ -615,6 +800,13 @@ impl Config {
         // a weightless post-rope Q/K L2-norm. All the divergent semantics are HARDCODED for `llama4`
         // in the reference loader (`models/llama4.cpp`), not metadata-driven.
         let llama4 = arch == crate::arch::LLAMA4;
+        // smollm3 is the llama block with a hardcoded NoPE step and nothing else (see
+        // `arch::SMOLLM3`), so it gates only `no_rope_step` below; every llama4 gate stays off.
+        let smollm3 = arch == crate::arch::SMOLLM3;
+        // ernie4_5-moe is the dense ernie4_5 (llama) block with an FFN swapped in on its MoE
+        // layers; it gates only the MoE parses below (`moe`, `n_layer_dense_lead`,
+        // `moe_interleave_step`, `shexp_ff`, `optional_router_bias`).
+        let ernie4_5_moe = arch == crate::arch::ERNIE4_5_MOE;
         let diffusion_gemma = arch == crate::arch::DIFFUSION_GEMMA;
         // diffusion-gemma's backbone IS gemma4's (heterogeneous per-layer dims, V-norm,
         // freq_factors, softcap) verbatim — see docs/diffusion-gemma.md — so it folds into the same
@@ -635,6 +827,9 @@ impl Config {
         // shape (routed-expert bank + shared expert vs plain dense).
         let qwen35_moe = arch == crate::arch::QWEN35_MOE;
         let qwen35 = arch == crate::arch::QWEN35 || qwen35_moe;
+        // LFM3 is its own skeleton (short-convolution layers between QK-normed, head-gated
+        // attention layers); it gates only its own parses below and shares no other arch's flag.
+        let lfm3 = arch == crate::arch::LFM3;
         let mk = |k: &str| format!("{arch}.{k}");
         // DeepSeek2-specific metadata: MLA dims, MoE gating function, YaRN (everything EXCEPT
         // "lite" detection, which needs n_layer — added after `n_layer` below).
@@ -688,13 +883,21 @@ impl Config {
             };
         let (expert_gating_func, expert_weights_norm, rope_yarn_log_mul) = if deepseek2 || deepseek4
         {
-            // deepseek2 tolerates the key's absence (llama.cpp documents 0 as "softmax", the
-            // pre-`expert_gating_func` V2/V2.5 files); `deepseek32.cpp` and `deepseek4.cpp` read it
-            // with no such fallback, and neither arch's real value is softmax — defaulting it would
-            // silently re-route.
+            // deepseek2 tolerates the key's absence (0), which the MoE mapping below fills in by
+            // `deepseek2.cpp`'s rule for files written before the key existed. `deepseek32.cpp`
+            // and `deepseek4.cpp` read it with no such fallback, and neither arch's real value is
+            // softmax — defaulting it would silently re-route.
             let gf = if deepseek32 || deepseek4 {
                 let key = mk("expert_gating_func");
-                meta_u64(g, &key).with_context(|| format!("{key} missing"))? as u8
+                let gf = meta_u64(g, &key).with_context(|| format!("{key} missing"))? as u8;
+                // An explicit 0 is "no gating function": the reference keeps it, and
+                // `build_moe_ffn` (`llama-graph.cpp`) aborts on it at the first MoE layer, so
+                // llama.cpp cannot run the file. (deepseek4 refuses every value but
+                // sqrt-softplus further down.)
+                if deepseek32 && gf == 0 {
+                    bail!("{key} = 0 names no gating function (llama.cpp aborts on it)");
+                }
+                gf
             } else {
                 meta_u64(g, &mk("expert_gating_func")).unwrap_or(0) as u8
             };
@@ -725,9 +928,12 @@ impl Config {
         // ramp), `rope.scaling.factor` (the interpolate factor; llama.cpp defaults it to 1.0 when
         // the GGUF omits it), and `rope.scaling.original_context_length` (the corr_dim ramp's
         // `n_ctx_orig`; falls back to `context_length` like llama.cpp's `n_ctx_orig_yarn`).
-        // `rope.scaling.attn_factor` and the two `yarn_beta_*` ramp corners come along here: all
-        // three feed the same YaRN arithmetic (`seam::runner`'s `yarn_ff` ramp and `mla_scale`),
-        // and their defaults are llama.cpp's `llama_hparams` initializers.
+        // `rope.scaling.attn_factor` and the two ramp corners come along here: all three feed the
+        // same YaRN arithmetic (`seam::runner`'s `yarn_ff` ramp and `mla_scale`), and their
+        // defaults are llama.cpp's `llama_hparams` initializers. The corners are never read from
+        // the file: `deepseek2.cpp` and `deepseek32.cpp` do not read `rope.scaling.yarn_beta_fast`
+        // / `_slow` (only grok, k2-horizon, laguna and mistral3 do), so the reference ramps every
+        // deepseek2 file between its defaults whatever it declares.
         let (
             rope_scaling_yarn,
             rope_scaling_factor,
@@ -746,12 +952,93 @@ impl Config {
                 .or_else(|| meta_u64(g, &mk("context_length")))
                 .unwrap_or(8192) as usize;
             let attn_factor = meta_f64(g, &mk("rope.scaling.attn_factor")).unwrap_or(1.0) as f32;
-            let beta_fast = meta_f64(g, &mk("rope.scaling.yarn_beta_fast")).unwrap_or(32.0) as f32;
-            let beta_slow = meta_f64(g, &mk("rope.scaling.yarn_beta_slow")).unwrap_or(1.0) as f32;
-            (yarn, factor, orig_ctx, attn_factor, beta_fast, beta_slow)
+            (
+                yarn,
+                factor,
+                orig_ctx,
+                attn_factor,
+                YARN_BETA_FAST,
+                YARN_BETA_SLOW,
+            )
+        } else if deepseek4 {
+            // V4 reads only what the generic `llama_model::load_hparams` reads — no deepseek4
+            // loader key touches rope scaling — and applies it on the compressed tiers alone
+            // (`Config::dsv4_compressed_rope_divisors`). Absent, the type is `"linear"` and the
+            // factor 0, i.e. no scaling; `"none"` forces `freq_scale = 1` whatever the factor
+            // (`llama-context.cpp`); an unknown string trips the reference's
+            // `GGML_ASSERT(rope_scaling_type_train != UNSPECIFIED)`. `longrope` is a type the
+            // reference knows and V4 does not use, so it is refused here rather than given a
+            // meaning no file has been checked against.
+            let type_key = mk("rope.scaling.type");
+            let ty = g
+                .metadata()
+                .get(&type_key)
+                .and_then(MetaValue::as_str)
+                .unwrap_or("linear");
+            let factor = meta_f64(g, &mk("rope.scaling.factor"))
+                .or_else(|| meta_f64(g, &mk("rope.scale_linear")))
+                .unwrap_or(0.0) as f32;
+            let factor = if factor == 0.0 { 1.0 } else { factor };
+            let (yarn, factor) = match ty {
+                "yarn" => (true, factor),
+                "linear" => (false, factor),
+                "none" => (false, 1.0),
+                other => bail!("{type_key} = {other:?}: deepseek4 supports none, linear and yarn"),
+            };
+            let orig_ctx = meta_u64(g, &mk("rope.scaling.original_context_length"))
+                .or_else(|| meta_u64(g, &mk("context_length")))
+                .unwrap_or(8192) as usize;
+            // `rope.scaling.attn_factor` is not read: `deepseek4.cpp` passes its own
+            // `dsv4_rope_attn_factor` to every rope instead of `cparams.yarn_attn_factor`, the
+            // only place that key lands. Nor are the beta keys, as for deepseek2.
+            (yarn, factor, orig_ctx, 1.0, YARN_BETA_FAST, YARN_BETA_SLOW)
         } else {
-            (false, 1.0, 0, 1.0, 32.0, 1.0)
+            (false, 1.0, 0, 1.0, YARN_BETA_FAST, YARN_BETA_SLOW)
         };
+        // KNOWN DIVERGENCE, left for the owner to decide: on `deepseek32` a multiplier the two
+        // rules disagree on makes llama.cpp's attention factor differ from the `deepseek2` value
+        // infr uses (`deepseek32_yarn_rules_agree`), so the MLA score scale — and the q_pe/k_pe
+        // magnitude — may differ from the reference. The file still loads, as it always did; a
+        // later decision only has to turn this warning into a refusal.
+        if deepseek32
+            && !deepseek32_yarn_rules_agree(
+                rope_scaling_yarn,
+                rope_scaling_factor,
+                rope_yarn_log_mul,
+            )
+        {
+            tracing::warn!(
+                "{arch} YaRN: {} = {} (mscale_all_dim {rope_yarn_log_mul}) with {} = \
+                 {rope_scaling_factor}: llama.cpp gives deepseek32 a YaRN attention factor of \
+                 get_mscale(factor, 1) / get_mscale(factor, mscale_all_dim), without the deepseek2 \
+                 special case that makes it 1, and infr uses the deepseek2 value — the attention \
+                 scale may differ from the reference",
+                mk("rope.scaling.yarn_log_multiplier"),
+                rope_yarn_log_mul * 0.1,
+                mk("rope.scaling.factor"),
+            );
+        }
+        if deepseek2 {
+            let m = mla_rope_mscale(
+                rope_scaling_yarn,
+                rope_scaling_factor,
+                rope_yarn_log_mul,
+                rope_attn_factor,
+            );
+            // NaN refuses too.
+            if (m - 1.0).abs() > 1e-6 || m.is_nan() {
+                bail!(
+                    "{arch} MLA rope: ggml_rope_ext would scale the rotary halves of Q and K by \
+                     {m} ({} = {rope_attn_factor}, {} = {}, {} = {rope_scaling_factor}, YaRN {}), \
+                     which infr's MLA rope does not apply",
+                    mk("rope.scaling.attn_factor"),
+                    mk("rope.scaling.yarn_log_multiplier"),
+                    rope_yarn_log_mul * 0.1,
+                    mk("rope.scaling.factor"),
+                    if rope_scaling_yarn { "on" } else { "off" },
+                );
+            }
+        }
         // MLA per-head dims, derived exactly as the reference does (`src/models/deepseek2.cpp`
         // and `llama_hparams::n_embd_head_v_mla`): the NOPE width is the full per-head key width
         // minus the rotary part, and the V width is the GGUF key verbatim.
@@ -976,9 +1263,9 @@ impl Config {
             }
             // Keys the reference requires that the SHARED parses further down would otherwise
             // default silently — and each default is wrong in a way nothing downstream can detect:
-            // `expert_weights_scale` falls back to 0, which zeroes every routed expert's
-            // contribution, `expert_feed_forward_length` falls back to `n_ff / n_used`, and
-            // `attention.layer_norm_rms_epsilon` falls back to the generic 1e-5.
+            // `expert_weights_scale` falls back to unscaled, `expert_feed_forward_length` falls
+            // back to `n_ff / n_used`, and `attention.layer_norm_rms_epsilon` falls back to the
+            // generic 1e-5.
             for key in [
                 "attention.layer_norm_rms_epsilon",
                 "expert_feed_forward_length",
@@ -1025,6 +1312,14 @@ impl Config {
                 Some(value) => positive_model_dimension(&mk("attention.head_count_kv"), value)?,
                 None => n_head,
             }
+        };
+        // LFM3's `attention.head_count_kv` is a per-layer array whose zeros are the
+        // short-convolution layers (`lfm3.cpp`: `is_recr = n_head_kv(il) == 0`); the attention
+        // layers' shared count is the model's `n_kv`.
+        let (n_kv, shortconv_layers) = if lfm3 {
+            lfm3_layer_kinds(g, &mk("attention.head_count_kv"), n_layer)?
+        } else {
+            (n_kv, Vec::new())
         };
         let n_ff_layers: Vec<usize> = if let Some(arr) = g
             .metadata()
@@ -1077,33 +1372,62 @@ impl Config {
             || deepseek
             || deepseek2
             || deepseek4
+            || ernie4_5_moe
         {
             let n_expert = meta_u64(g, &mk("expert_count")).context("expert_count")? as usize;
             let n_used =
                 meta_u64(g, &mk("expert_used_count")).context("expert_used_count")? as usize;
-            let n_ff_exp = meta_u64(g, &mk("expert_feed_forward_length"))
-                .map(|v| v as usize)
-                .unwrap_or(n_ff / n_used.max(1));
+            let n_ff_exp = if ernie4_5_moe {
+                ernie4_5_moe_expert_ff(g, &mk("expert_feed_forward_length"), n_layer)?
+            } else {
+                meta_u64(g, &mk("expert_feed_forward_length"))
+                    .map(|v| v as usize)
+                    .unwrap_or(n_ff / n_used.max(1))
+            };
             // llama4 hardcodes SIGMOID gating, NO top-k renormalization, and weight-before-FFN
             // (`models/llama4.cpp::build_arch_graph` → `build_moe_ffn(.., norm_w=false, ..,
             // LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID)` with `weight_before_ffn = arch == LLAMA4`).
-            // Its routed-weight scale is `expert_weights_scale` (absent on Scout → 1.0).
+            // Its routed-weight scale is `expert_weights_scale` (absent on Scout → unscaled).
             // DeepSeek V1 hardcodes SOFTMAX gating, NO top-k renormalization, weight-after-FFN,
-            // and scale from `expert_weights_scale` (default 0) — matching the reference's
+            // and scale from `expert_weights_scale` — matching the reference's
             // `build_deepseek` (`src/models/deepseek.cpp`). Every other MoE arch here is softmax
             // + renormalized top-k, output-weighted, scale 1.0.
+            // llama4's and DeepSeek's scale both reach llama.cpp's `build_moe_ffn`, which applies
+            // it only when it is neither 0 nor 1, so an absent or zero key means "unscaled".
+            // Multiplying by the raw 0 instead silently zeroes every routed expert.
+            let routed_weights_scale = || {
+                meta_f64(g, &mk("expert_weights_scale"))
+                    .filter(|&s| s != 0.0)
+                    .unwrap_or(1.0) as f32
+            };
             let (gating, norm_w, weight_before, scale) = if llama4 {
                 (
                     infr_core::graph::MoeGating::Sigmoid,
                     false,
                     true,
-                    meta_f64(g, &mk("expert_weights_scale")).unwrap_or(1.0) as f32,
+                    routed_weights_scale(),
                 )
             } else if deepseek2 || deepseek4 {
+                // For the GLM 4.7 Lite test below, `deepseek2.cpp::load_arch_hparams` sizes the
+                // vocabulary from `{arch}.vocab_size`, else the token list (not the embedding rows
+                // `vocab` is read from).
+                let glm47_lite = || {
+                    let n_vocab = meta_u64(g, &mk("vocab_size")).or_else(|| {
+                        g.metadata()
+                            .get("tokenizer.ggml.tokens")
+                            .and_then(MetaValue::as_arr)
+                            .map(|tokens| tokens.len() as u64)
+                    });
+                    GLM47_LITE_N_LAYER.contains(&n_layer) && n_vocab == Some(GLM47_LITE_N_VOCAB)
+                };
                 let gating = match expert_gating_func {
-                    // 0 = the key is absent, which llama.cpp documents as softmax for the old
-                    // V2/V2.5 GGUFs written before `expert_gating_func` existed
-                    // (`deepseek2.cpp::load_arch_hparams`).
+                    // 0 = the key is absent. `deepseek2.cpp::load_arch_hparams` fills it in for
+                    // the GGUFs written before `expert_gating_func` existed: sigmoid for GLM 4.7
+                    // Lite's shape, softmax (the old V2/V2.5 files) otherwise. `deepseek32` and
+                    // `deepseek4` require the key, so their 0 is never filled in this way.
+                    0 if deepseek2 && !deepseek32 && glm47_lite() => {
+                        infr_core::graph::MoeGating::Sigmoid
+                    }
                     0 | 1 => infr_core::graph::MoeGating::Softmax,
                     2 => infr_core::graph::MoeGating::Sigmoid,
                     4 => infr_core::graph::MoeGating::SqrtSoftplus,
@@ -1116,16 +1440,19 @@ impl Config {
                     gating,
                     expert_weights_norm,
                     false, // weight-before-FFN: always false for deepseek2
-                    meta_f64(g, &mk("expert_weights_scale")).unwrap_or(0.0) as f32,
+                    routed_weights_scale(),
                 )
             } else if deepseek {
                 (
                     infr_core::graph::MoeGating::Softmax,
                     false,
                     false,
-                    meta_f64(g, &mk("expert_weights_scale")).unwrap_or(0.0) as f32,
+                    routed_weights_scale(),
                 )
             } else {
+                // qwen3moe, qwen35moe, gemma4 MoE, diffusion-gemma and ernie4_5-moe (whose builder
+                // passes `hparams.expert_weights_scale`, a key its loader never reads, so it stays
+                // at 0 = unscaled).
                 (infr_core::graph::MoeGating::Softmax, true, false, 1.0)
             };
             Some(MoeConfig {
@@ -1170,12 +1497,17 @@ impl Config {
             .and_then(|v| match v {
                 MetaValue::F64(f) => Some(*f as f32),
                 _ => None,
-            })
-            // qwen35's old seam (`Cfg::from_gguf`) defaults this to 1e-6, not the generic 1e-5.
-            .unwrap_or(if qwen35 { 1e-6 } else { 1e-5 });
+            });
+        // `lfm3.cpp::load_arch_hparams` reads the epsilon with a plain `get_key`: required there.
+        if lfm3 && rms_eps.is_none() {
+            bail!("{} missing", mk("attention.layer_norm_rms_epsilon"));
+        }
+        // qwen35's old seam (`Cfg::from_gguf`) defaults this to 1e-6, not the generic 1e-5.
+        let rms_eps = rms_eps.unwrap_or(if qwen35 { 1e-6 } else { 1e-5 });
         // deepseek4 reads `attention.sliding_window` with a plain `get_key` — its raw attention is
         // sliding-window on EVERY layer, so the window is not optional decoration there.
-        let swa_window = if deepseek4 {
+        // LFM3 reads it with a plain `get_key` too: every LFM3 mixes window and full layers.
+        let swa_window = if deepseek4 || lfm3 {
             req_dim("attention.sliding_window")?
         } else if gemma {
             meta_u64(g, &mk("attention.sliding_window")).unwrap_or(0) as usize
@@ -1186,7 +1518,8 @@ impl Config {
         // has no full layers (`set_swa_pattern(0)`). `Config::is_swa_layer` special-cases the arch
         // instead — reading `attention.sliding_window_pattern` here would invent a period the file
         // does not declare and make five layers in six look full.
-        let swa_pattern = if swa_window == 0 || deepseek4 {
+        // LFM3 names each layer instead (`swa_layers` below), so it has no period either.
+        let swa_pattern = if swa_window == 0 || deepseek4 || lfm3 {
             0
         } else if let Some(arr) = g
             .metadata()
@@ -1204,7 +1537,12 @@ impl Config {
         // field is for. deepseek4's sliding-window layers do not: a ratio-0 layer ropes at the
         // plain `rope_theta`, and the compressed tiers use `compress_rope_theta` (a separate field)
         // — so V4 keeps them equal rather than picking up gemma's 10000 fallback.
-        let swa_rope_theta = if swa_window > 0 && !deepseek4 {
+        let swa_rope_theta = if lfm3 {
+            // Required, as `lfm3.cpp` reads it with a plain `get_key`.
+            meta_f64(g, &mk("rope.freq_base_swa"))
+                .with_context(|| format!("{} missing", mk("rope.freq_base_swa")))?
+                as f32
+        } else if swa_window > 0 && !deepseek4 {
             g.metadata()
                 .get(&mk("rope.freq_base_swa"))
                 .and_then(|v| match v {
@@ -1253,8 +1591,15 @@ impl Config {
             0
         };
         let n_layer_kv_from_start = if gemma4 {
-            let shared = meta_u64(g, &mk("attention.shared_kv_layers")).unwrap_or(0) as usize;
-            n_layer.saturating_sub(shared)
+            let key = mk("attention.shared_kv_layers");
+            let shared = meta_u64(g, &key).unwrap_or(0) as usize;
+            let own = n_layer.saturating_sub(shared);
+            // `kv_src_layer` points an SWA shared layer at the own-KV layer BEFORE the last one,
+            // so any sharing needs at least that many own-KV layers or the index underflows.
+            if shared > 0 && own < 2 {
+                bail!("{key} = {shared} leaves {own} of {n_layer} layers with their own KV");
+            }
+            own
         } else {
             n_layer
         };
@@ -1266,23 +1611,6 @@ impl Config {
             .find(|t| t.name == "token_embd.weight")
             .and_then(|t| t.shape.last().copied())
             .context("token_embd.weight shape")?;
-        let mut eos_ids = vec![eos];
-        if let Some(ids) = g
-            .metadata()
-            .get("tokenizer.ggml.eos_token_ids")
-            .and_then(MetaValue::as_arr)
-        {
-            for id in ids {
-                let id = id
-                    .as_u64()
-                    .filter(|&id| id < vocab as u64 && id <= u32::MAX as u64)
-                    .context("invalid tokenizer.ggml.eos_token_ids entry")?
-                    as u32;
-                if !eos_ids.contains(&id) {
-                    eos_ids.push(id);
-                }
-            }
-        }
         // qwen35 (gated-DeltaNet hybrid) extras — ports of the old seam's `qwen35::Cfg::from_gguf`.
         // These metadata keys sit directly under `qwen35.*` (NOT `qwen35.attention.*`), matching the
         // old seam's parser exactly.
@@ -1291,9 +1619,22 @@ impl Config {
         } else {
             0
         };
+        if qwen35 {
+            check_recurrent_layers(
+                g,
+                &mk("attention.recurrent_layers"),
+                n_layer_all,
+                n_layer,
+                full_attn_interval,
+            )?;
+        }
         let (ssm_d_conv, ssm_d_state, ssm_d_inner, ssm_n_group, ssm_dt_rank) = if qwen35 {
             (
-                meta_u64(g, &mk("ssm.conv_kernel")).context("qwen35 ssm.conv_kernel")? as usize,
+                // Positive: the conv state keeps `ssm_d_conv - 1` past steps.
+                positive_model_dimension(
+                    &mk("ssm.conv_kernel"),
+                    meta_u64(g, &mk("ssm.conv_kernel")).context("qwen35 ssm.conv_kernel")?,
+                )?,
                 meta_u64(g, &mk("ssm.state_size")).context("qwen35 ssm.state_size")? as usize,
                 meta_u64(g, &mk("ssm.inner_size")).context("qwen35 ssm.inner_size")? as usize,
                 meta_u64(g, &mk("ssm.group_count")).context("qwen35 ssm.group_count")? as usize,
@@ -1319,8 +1660,61 @@ impl Config {
             [0u32; 4]
         };
         let attn_out_gate = qwen35;
+        // LFM3 extras, read as `lfm3.cpp::load_arch_hparams` reads them.
+        let (swa_layers, shortconv_l_cache) = if lfm3 {
+            // A file declaring `attention.causal = false` is the non-causal "d1" variant, whose
+            // full-attention layers read the prompt both ways with no cache at all — a different
+            // model from the causal one this port runs.
+            if let Some(MetaValue::Bool(false)) = g.metadata().get(&mk("attention.causal")) {
+                bail!(
+                    "{} = false (the non-causal LFM3 variant) is not supported",
+                    mk("attention.causal")
+                );
+            }
+            let key = mk("attention.sliding_window_pattern");
+            let swa: Vec<bool> = g
+                .metadata()
+                .get(&key)
+                .and_then(MetaValue::as_arr)
+                .with_context(|| format!("{key} missing or not an array"))?
+                .iter()
+                .map(|v| match v {
+                    MetaValue::Bool(b) => Ok(*b),
+                    other => bail!("{key} holds {other:?}, not a bool"),
+                })
+                .collect::<Result<_>>()?;
+            if swa.len() != n_layer {
+                bail!("{key} has {} entries for {n_layer} layers", swa.len());
+            }
+            if !swa.iter().any(|&w| w) {
+                bail!("LFM3 requires sliding window attention layers; {key} marks none");
+            }
+            // `lfm3.cpp::load_arch_tensors` creates `rope_freqs` as a required tensor on the
+            // first full-attention layer (window layers take none), so a file with a full layer
+            // and no divisors is refused there rather than roped without them.
+            let full_layer = (0..n_layer).find(|&l| !shortconv_layers[l] && !swa[l]);
+            if let Some(l) = full_layer {
+                if !g.tensors().iter().any(|t| t.name == "rope_freqs.weight") {
+                    bail!(
+                        "LFM3 full-attention layer {l} needs rope_freqs.weight, which is missing"
+                    );
+                }
+            }
+            let l_cache = req_dim("shortconv.l_cache")?;
+            if l_cache < 2 {
+                bail!(
+                    "{} = {l_cache}: the short convolution needs a history",
+                    mk("shortconv.l_cache")
+                );
+            }
+            (swa, l_cache)
+        } else {
+            (Vec::new(), 0)
+        };
+        let sandwich_norm = gemma || (lfm3 && lfm3_sandwich_norm(g, n_layer)?);
         // DeepSeek: first N layers are dense FFN, the rest are MoE.
-        let n_layer_dense_lead = if deepseek || deepseek2 {
+        // ernie4_5-moe reads the same key, optional (`ernie4-5.cpp::load_arch_hparams`).
+        let n_layer_dense_lead = if deepseek || deepseek2 || ernie4_5_moe {
             meta_u64(g, &mk("leading_dense_block_count")).unwrap_or(0) as usize
         } else {
             0
@@ -1330,7 +1724,9 @@ impl Config {
         // (`models/llama4.cpp`: `n_ff_shexp = n_ff_exp`). DeepSeek's shared expert is
         // `n_ff_exp * n_expert_shared` wide (llama.cpp fuses `n_expert_shared` experts into one
         // wider branch — see docs/deepseek.md § Stage 1). `0` = no shared expert.
-        let shexp_ff = if qwen35_moe {
+        // ernie4_5-moe reads `expert_shared_feed_forward_length` as qwen35moe does (optional, 0 = no
+        // shared expert) and sums the branch in with no gate.
+        let shexp_ff = if qwen35_moe || ernie4_5_moe {
             meta_u64(g, &mk("expert_shared_feed_forward_length")).unwrap_or(0) as usize
         } else if llama4 {
             moe.map(|m| m.n_ff_exp).unwrap_or(0)
@@ -1347,10 +1743,9 @@ impl Config {
         // as on Scout). The NoPE step: the reference forces the chunked-attention branch whenever
         // `attention.sliding_window` is absent or nonzero, in which case `n_no_rope_layer_step`
         // stays its default 4; only an explicit `sliding_window == 0` disables NoPE (all-rope). The
-        // attention temperature params (floor 8192, scale 0.1, offset 1.0) and the 8192 chunk size
-        // are likewise hardcoded there — both are exact no-ops below 8192 tokens, so infr's CPU
-        // path (which can't reach that length on a 109B model) leaves them unimplemented; see the
-        // arch doc.
+        // chunk size and the NoPE attention temperature are hardcoded on that branch too; infr
+        // implements neither, so the context is capped where they start to matter — see
+        // `Config::faithful_ctx_limit`.
         let (moe_interleave_step, no_rope_step, kq_l2norm) = if llama4 {
             let step = meta_u64(g, &mk("interleave_moe_layer_step")).unwrap_or(1) as usize;
             let no_rope = match meta_u64(g, &mk("attention.sliding_window")) {
@@ -1360,6 +1755,16 @@ impl Config {
             // `use_kq_norm = type != LLM_TYPE_17B_128E` (i.e. n_expert != 128).
             let l2 = moe.map(|m| m.n_expert != 128).unwrap_or(true);
             (step, no_rope, l2)
+        } else if smollm3 {
+            (0, SMOLLM3_NO_ROPE_STEP, false)
+        } else if ernie4_5_moe {
+            // Required, and asserted positive by the graph builder (`ernie4-5-moe.cpp`).
+            let key = mk("interleave_moe_layer_step");
+            let step = meta_u64(g, &key).with_context(|| format!("{key} missing"))? as usize;
+            if step == 0 {
+                bail!("{key} must be positive");
+            }
+            (step, 0, false)
         } else {
             (0, 0, false)
         };
@@ -1402,7 +1807,32 @@ impl Config {
         } else {
             (0, 0.0, 0.0, 0.0, 0, 0.0)
         };
-        Ok(Config {
+        refuse_unapplied_weight_scales(g, &arch, gemma4_moe || diffusion_gemma)?;
+        let qkv_bias = qkv_projection_biases(g, &arch, n_layer)?;
+        // See `Config::faithful_ctx_limit`. deepseek32's builder reads neither temperature key,
+        // so only the deepseek2 string is checked.
+        let ctx_limit = if llama4 && no_rope_step > 0 {
+            Some(LLAMA4_ATTN_CHUNK - 1)
+        } else if deepseek2 && !deepseek32 {
+            let scale_key = mk("attention.temperature_scale");
+            match meta_f64(g, &scale_key) {
+                Some(scale) if scale != 0.0 => {
+                    let len_key = mk("attention.temperature_length");
+                    let len = meta_u64(g, &len_key).unwrap_or(0) as usize;
+                    if len == 0 {
+                        bail!(
+                            "{scale_key} = {scale} needs a positive {len_key} (the position the \
+                             attention temperature starts from); the file has none"
+                        );
+                    }
+                    Some(len)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let cfg = Config {
             n_layer,
             n_head,
             n_kv,
@@ -1417,10 +1847,11 @@ impl Config {
             rms_eps,
             vocab,
             eos,
-            eos_ids,
+            eos_ids: vec![eos],
             qk_norm,
             qkv_bias,
             permute_qk_neox,
+            rope_freq_factors: arch == crate::arch::LLAMA || llama4 || gemma4 || lfm3,
             gemma,
             gemma4,
             diffusion_gemma,
@@ -1444,7 +1875,6 @@ impl Config {
             n_ctx_train,
             qwen35,
             full_attn_interval,
-            qwen4_exp: None,
             ssm_d_conv,
             ssm_d_state,
             ssm_d_inner,
@@ -1452,16 +1882,23 @@ impl Config {
             ssm_dt_rank,
             rope_sections,
             attn_out_gate,
+            lfm3,
+            shortconv_layers,
+            shortconv_l_cache,
+            swa_layers,
+            sandwich_norm,
             n_layer_nextn,
             shexp_ff,
             llama4,
             moe_interleave_step,
             no_rope_step,
+            ctx_limit,
             kq_l2norm,
             shexp_gated,
             sub_norm,
             deepseek,
             n_layer_dense_lead,
+            optional_router_bias: deepseek2 || ernie4_5_moe,
             deepseek2,
             deepseek32,
             deepseek4,
@@ -1496,106 +1933,581 @@ impl Config {
             rope_yarn_beta_fast,
             rope_yarn_beta_slow,
             is_lite,
-        })
+        };
+        if ernie4_5_moe {
+            ernie4_5_moe_tensors(g, &cfg)?;
+        }
+        Ok(cfg)
     }
+}
+
+/// LFM3's per-layer `attention.head_count_kv` (`key`): `0` marks a short-convolution layer, and
+/// every attention layer must carry the same positive count, which is returned as the model's
+/// `n_kv` beside the per-layer short-convolution flags.
+fn lfm3_layer_kinds(g: &Gguf, key: &str, n_layer: usize) -> Result<(usize, Vec<bool>)> {
+    let counts: Vec<u64> = g
+        .metadata()
+        .get(key)
+        .and_then(MetaValue::as_arr)
+        .with_context(|| format!("{key} missing or not a per-layer array"))?
+        .iter()
+        .map(|v| v.as_u64().with_context(|| format!("{key} holds {v:?}")))
+        .collect::<Result<_>>()?;
+    if counts.len() != n_layer {
+        bail!("{key} has {} entries for {n_layer} layers", counts.len());
+    }
+    let mut attn = counts.iter().copied().filter(|&c| c > 0);
+    let n_kv = attn
+        .next()
+        .with_context(|| format!("{key}: no attention layer"))?;
+    if let Some(other) = attn.find(|&c| c != n_kv) {
+        bail!("{key}: attention layers with {n_kv} and {other} KV heads are not supported");
+    }
+    Ok((n_kv as usize, counts.iter().map(|&c| c == 0).collect()))
+}
+
+/// Whether an LFM3 file carries sandwich norms. `lfm3.cpp` loads `attn_post_norm` and
+/// `ffn_post_norm` as optional, but refuses a layer with only one of them; infr also refuses a
+/// file whose layers disagree, since the norms are loaded under one flag.
+fn lfm3_sandwich_norm(g: &Gguf, n_layer: usize) -> Result<bool> {
+    let has = |l: usize, s: &str| {
+        let name = format!("blk.{l}.{s}");
+        g.tensors().iter().any(|t| t.name == name)
+    };
+    let per_layer: Vec<(bool, bool)> = (0..n_layer)
+        .map(|l| {
+            (
+                has(l, "post_attention_norm.weight"),
+                has(l, "post_ffw_norm.weight"),
+            )
+        })
+        .collect();
+    if let Some(l) = per_layer.iter().position(|&(a, f)| a != f) {
+        bail!("LFM3 layer {l} carries only one of post_attention_norm / post_ffw_norm");
+    }
+    let first = per_layer.first().is_some_and(|&(a, _)| a);
+    if per_layer.iter().any(|&(a, _)| a != first) {
+        bail!("LFM3 layers disagree on carrying sandwich norms");
+    }
+    Ok(first)
+}
+
+/// qwen35's `{arch}.attention.recurrent_layers`: which of the `n_layer_all` blocks are
+/// gated-DeltaNet (recurrent) rather than full attention.
+///
+/// `qwen35.cpp`/`qwen35moe.cpp` read this key FIRST (`get_key_or_arr`: a per-block bool array of
+/// length `n_layer_all`, or one scalar for every block) and fall back to the periodic
+/// `full_attention_interval` rule — block `i` is recurrent iff `i < n_layer` and
+/// `(i + 1) % full_attention_interval != 0`, the trailing NextN blocks never — only when it is
+/// absent. infr places its layers by that periodic rule alone, so a file carrying the key is
+/// accepted only if the key says exactly what the rule would; any other layout is refused by
+/// name.
+fn check_recurrent_layers(
+    g: &Gguf,
+    key: &str,
+    n_layer_all: usize,
+    n_layer: usize,
+    full_attn_interval: usize,
+) -> Result<()> {
+    let Some(v) = g.metadata().get(key) else {
+        return Ok(());
+    };
+    let flag = |v: &MetaValue| match v {
+        MetaValue::Bool(b) => Some(*b),
+        v => v.as_u64().map(|x| x != 0),
+    };
+    let declared: Vec<bool> = match v {
+        MetaValue::Arr(a) => {
+            if a.len() != n_layer_all {
+                bail!(
+                    "{key} has {} entries; block_count is {n_layer_all}",
+                    a.len()
+                );
+            }
+            a.iter()
+                .map(|x| flag(x).with_context(|| format!("{key}: not a bool array")))
+                .collect::<Result<_>>()?
+        }
+        v => vec![flag(v).with_context(|| format!("{key}: not a bool"))?; n_layer_all],
+    };
+    let periodic = |i: usize| {
+        i < n_layer && full_attn_interval > 0 && !(i + 1).is_multiple_of(full_attn_interval)
+    };
+    if let Some(i) = (0..n_layer_all).find(|&i| declared[i] != periodic(i)) {
+        bail!(
+            "{key} marks block {i} {} but infr places qwen35 layers by \
+             full_attention_interval = {full_attn_interval}, which makes it {}; only that \
+             periodic layout is supported",
+            if declared[i] {
+                "recurrent"
+            } else {
+                "full attention"
+            },
+            if periodic(i) {
+                "recurrent"
+            } else {
+                "full attention"
+            },
+        );
+    }
+    Ok(())
+}
+
+/// The magnitude ggml's rope gives a DeepSeek MLA model's `q_pe`/`k_pe` (and V3.2's indexer
+/// q/k): llama.cpp's `attn_factor_org`.
+///
+/// `ggml_rope_ext` multiplies both `cos` and `sin` by `mscale = attn_factor`, times
+/// `1 + 0.1·ln(1/freq_scale)` when `ext_factor != 0` (`rope_yarn`). `llama-context.cpp` sets
+/// `attn_factor` (`cparams.yarn_attn_factor`) for YaRN to `get_mscale(f, mscale) /
+/// get_mscale(f, mscale_all_dims)` — `get_mscale(f, 1)` when there is no
+/// `yarn_log_multiplier` — divided by that same `1 + 0.1·ln(f)` and times
+/// `rope.scaling.attn_factor`; without YaRN it is `rope.scaling.attn_factor` alone. The two
+/// `1 + 0.1·ln(f)` cancel, leaving the ratio times `rope.scaling.attn_factor`.
+/// `get_mscale(f, m) = 1 + 0.1·m·ln(f)` for `f > 1`, else 1; `mscale_all_dims` is the
+/// multiplier, and on the `deepseek2` string `mscale` is set equal to it, so a multiplier makes
+/// the ratio exactly 1.
+///
+/// That `mscale = mscale_all_dims` special case is keyed on `LLM_ARCH_DEEPSEEK2` only, so on
+/// `deepseek32` a multiplier other than 1 leaves a ratio — in this magnitude AND in the MLA score
+/// scale the runner derives the same way. This computes the `deepseek2` rule, which is exact for
+/// `deepseek32` only where the two rules agree ([`deepseek32_yarn_rules_agree`]); where they do
+/// not, `from_gguf` loads the file anyway and warns — a known divergence left for the owner. V3.2
+/// itself declares `mscale_all_dim = 1.0`, where they agree.
+/// Whether `llama-context.cpp`'s YaRN `attn_factor` comes out the same for `deepseek32` as under
+/// the `deepseek2` rule [`mla_rope_mscale`] (and the runner's MLA score scale) implement: true
+/// unless YaRN stretches (`factor > 1`) with a multiplier that is neither absent nor 1.
+fn deepseek32_yarn_rules_agree(yarn: bool, factor: f32, log_mul: f32) -> bool {
+    !yarn || factor <= 1.0 || log_mul == 0.0 || log_mul == 1.0
+}
+
+fn mla_rope_mscale(yarn: bool, factor: f32, log_mul: f32, attn_factor: f32) -> f32 {
+    if !yarn {
+        return attn_factor;
+    }
+    let ratio = if log_mul != 0.0 {
+        1.0
+    } else if factor > 1.0 {
+        // `get_mscale(f, 1)`.
+        // libm-ok(S2): platform `ln`, moves to `infr_core::math` in S2
+        0.1 * factor.ln() + 1.0
+    } else {
+        1.0
+    };
+    ratio * attn_factor
+}
+
+/// The YaRN per-pair rope frequency DIVISORS (`n_rot / 2` floats) for an `Op::Rope`'s
+/// `freq_factors`: pair `p`'s angle is the plain `pos · base^(-2p/n_rot)` divided by entry `p`.
+///
+/// Ported from ggml's `rope_yarn` (`ggml/src/ggml-cpu/ops.cpp`) with `ext_factor = 1`, which is
+/// what `llama-context.cpp` resolves for a file whose `rope.scaling.type` is `"yarn"`. ggml blends
+/// the interpolated and extrapolated angles, `θ = fs·θe·(1 − r) + θe·r` with
+/// `fs = freq_scale = 1/factor` and `r = rope_yarn_ramp(corr_dims, 2p)`, which is
+/// `θe / (1 / (fs + (1 − fs)·r))` — so the divisor is `1 / (fs + (1 − fs)·r)`: 1 on the
+/// high-frequency pairs below the ramp, `factor` past it. `corr_dims` is
+/// `ggml_rope_yarn_corr_dims` with ggml's default truncation (start floored, end ceiled), and
+/// `n_ctx_orig` is the ramp's original context. Both corners are clamped into `[0, n_rot)`, where
+/// ggml clamps only the start's floor and the end's ceiling; the two agree unless the corrected
+/// start lies past the last pair or the end before the first.
+///
+/// This is only the ANGLE half of `rope_yarn`: its magnitude factor `mscale` is not represented,
+/// and each caller says why it is 1 for its arch.
+pub(crate) fn yarn_freq_divisors(
+    n_rot: usize,
+    base: f32,
+    n_ctx_orig: usize,
+    factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Vec<f32> {
+    let n_rot = n_rot as f32;
+    let n_ctx_orig = n_ctx_orig as f32;
+    let freq_scale = 1.0 / factor;
+    // corr_dim(n_rot): the dim below which the ramp is fully active — `ggml_rope_yarn_corr_dim`.
+    let corr =
+        // libm-ok(S2) x2: platform `ln` twice, moves to `infr_core::math` in S2
+        |nr: f32| n_rot * (n_ctx_orig / (nr * std::f32::consts::TAU)).ln() / (2.0 * base.ln());
+    let start = (corr(beta_fast).floor() as i64).clamp(0, (n_rot as i64) - 1);
+    let end = (corr(beta_slow).ceil() as i64).clamp(0, (n_rot as i64) - 1);
+    let span = ((end - start) as f32).max(0.001);
+    (0..(n_rot as usize / 2))
+        .map(|p| {
+            let ramp = 1.0 - (((p as f32) - start as f32) / span).clamp(0.0, 1.0);
+            let s = freq_scale + (1.0 - freq_scale) * ramp;
+            1.0 / s
+        })
+        .collect()
+}
+
+/// `build_qkv` (`llama-graph.cpp`): the separate or fused q/k/v projections, each through
+/// `build_lora_mm` with its `.scale`.
+const QKV_SCALES: [&str; 4] = ["attn_q", "attn_k", "attn_v", "attn_qkv"];
+const FFN_SCALES: [&str; 3] = ["ffn_up", "ffn_gate", "ffn_down"];
+const EXPS_SCALES: [&str; 3] = ["ffn_up_exps", "ffn_gate_exps", "ffn_down_exps"];
+const SHEXP_SCALES: [&str; 3] = ["ffn_up_shexp", "ffn_gate_shexp", "ffn_down_shexp"];
+
+/// The per-tensor `.scale` weights llama.cpp APPLIES for `arch` on the path infr runs — the
+/// projections (named as in `blk.N.<projection>.scale`) plus `output` for the LM head.
+///
+/// llama.cpp's loader creates an optional `.scale` beside EVERY projection generically (the
+/// "generic pass" in `llama_model::load_tensors`), but a scale only takes effect where the arch's
+/// builder hands it to `build_lora_mm`/`build_lora_mm_id`, `build_attn` (its `wo_s`), `build_ffn`
+/// or `build_moe_ffn`; everywhere else the builder passes NULL and the scale is loaded and
+/// ignored. Each row transcribes one builder in `src/models/`. NextN/MTP heads (`nextn.eh_proj`,
+/// `nextn.shared_head_head`) are left out of every row: they only feed the draft head, never the
+/// output infr verifies.
+fn applied_weight_scales(arch: &str) -> Vec<&'static str> {
+    use crate::arch;
+    let mut v: Vec<&'static str> = Vec::new();
+    let mut add = |names: &[&'static str]| v.extend_from_slice(names);
+    match arch {
+        // `llama_model_llama::graph`: build_qkv, build_attn(wo_s), build_ffn(up/gate/down_s),
+        // build_moe_ffn(*_exps_s), output_s.
+        arch::LLAMA => {
+            add(&QKV_SCALES);
+            add(&["attn_output", "output"]);
+            add(&FFN_SCALES);
+            add(&EXPS_SCALES);
+        }
+        // `llama_model_llama4::graph`, `llama_model_qwen2::graph`, `llama_model_gemma3::graph`,
+        // `llama_model_deepseek::graph`, `llama_model_smollm3::graph`, `llama_model_ernie4_5::graph`,
+        // `llama_model_ernie4_5_moe::graph`: build_qkv, build_attn(wo_s), output_s; every FFN
+        // scale NULL (ernie4_5-moe calls the `build_moe_ffn` overload without `*_exps_s`).
+        arch::LLAMA4
+        | arch::QWEN2
+        | arch::GEMMA3
+        | arch::DEEPSEEK
+        | arch::SMOLLM3
+        | arch::ERNIE4_5
+        | arch::ERNIE4_5_MOE => {
+            add(&QKV_SCALES);
+            add(&["attn_output", "output"]);
+        }
+        // `llama_model_qwen3::graph`: build_qkv, build_attn(wo_s), build_ffn(up/gate/down_s), output_s.
+        arch::QWEN3 => {
+            add(&QKV_SCALES);
+            add(&["attn_output", "output"]);
+            add(&FFN_SCALES);
+        }
+        // `llama_model_qwen3moe::graph`: build_qkv, build_attn(wo_s), build_moe_ffn(*_exps_s), output_s.
+        arch::QWEN3_MOE => {
+            add(&QKV_SCALES);
+            add(&["attn_output", "output"]);
+            add(&EXPS_SCALES);
+        }
+        // `llama_model_gemma4::graph` (diffusion-gemma shares its backbone; the checkout has no
+        // builder of its own): q/k/v/o through build_lora_mm/build_attn, the dense build_ffn, the
+        // MoE's build_moe_ffn(*_exps_s), output_s. Its router-input `ffn_gate_inp.scale` is a
+        // ggml_mul on the router input, applied by infr, so not listed.
+        arch::GEMMA4 | arch::DIFFUSION_GEMMA => {
+            add(&["attn_q", "attn_k", "attn_v", "attn_output", "output"]);
+            add(&FFN_SCALES);
+            add(&EXPS_SCALES);
+        }
+        // `llama_model_bitnet::graph` (`bitnet-b1.58` is the same arch under another name): build_qkv, wo_s, build_ffn(up/gate_s), the ffn_down build_lora_mm;
+        // its LM head takes no scale.
+        arch::BITNET | arch::BITNET_B158 => {
+            add(&QKV_SCALES);
+            add(&["attn_output"]);
+            add(&FFN_SCALES);
+        }
+        // `llama_model_deepseek2::graph`: build_attn(wo_s) and output_s only — the MLA projections
+        // and both FFN shapes take no scale.
+        arch::DEEPSEEK2 => add(&["attn_output", "output"]),
+        // `llama_model_deepseek32::graph`: build_attn(wo_s), the dense build_ffn, build_moe_ffn
+        // (*_exps_s), the shared expert's build_ffn(*_shexp_s), output_s.
+        arch::DEEPSEEK32 => {
+            add(&["attn_output", "output"]);
+            add(&FFN_SCALES);
+            add(&EXPS_SCALES);
+            add(&SHEXP_SCALES);
+        }
+        // `llama_model_qwen35::graph` / `llama_model_qwen35moe::graph`: the DeltaNet in-proj (`attn_qkv`), its z gate
+        // (`attn_gate`), `ssm_alpha`/`ssm_beta`/`ssm_out`, the gated attention's q/k/v/o, output_s,
+        // and the dense FFN (qwen35) or routed + shared experts (qwen35moe).
+        arch::QWEN35 | arch::QWEN35_MOE => {
+            add(&["attn_qkv", "attn_gate", "ssm_alpha", "ssm_beta", "ssm_out"]);
+            add(&["attn_q", "attn_k", "attn_v", "attn_output", "output"]);
+            if arch == arch::QWEN35 {
+                add(&FFN_SCALES);
+            } else {
+                add(&EXPS_SCALES);
+                add(&SHEXP_SCALES);
+            }
+        }
+        // `llama_model_deepseek4::graph` applies none (its only scale use is the NextN head), and
+        // an arch without a row is one infr does not load.
+        _ => {}
+    }
+    v
+}
+
+/// Refuse a file carrying a per-tensor `.scale` weight scale that llama.cpp applies for this
+/// arch and infr does not (see [`applied_weight_scales`] for which ones apply where). The
+/// converter writes them for NVFP4 (ModelOpt) checkpoints whose second-level scale is not 1.
+/// infr applies only the two the dual-FFN gemma4 block consumes (`dual_moe`): the router input
+/// scale `ffn_gate_inp.scale` and the per-expert `ffn_down_exps.scale`. A scale the reference
+/// IGNORES for this arch loads exactly as it always did — ignoring it is what the reference does.
+///
+/// `.input_scale` (an activation-quantization scale) is never refused: llama.cpp loads it but no
+/// graph reads it.
+fn refuse_unapplied_weight_scales(g: &Gguf, arch: &str, dual_moe: bool) -> Result<()> {
+    let reference = applied_weight_scales(arch);
+    let projection = |name: &str| -> Option<String> {
+        let stem = name.strip_suffix(".scale")?;
+        if stem == "output" {
+            return Some(stem.to_string());
+        }
+        let (layer, proj) = stem.strip_prefix("blk.")?.split_once('.')?;
+        layer.parse::<usize>().ok()?;
+        Some(proj.to_string())
+    };
+    let infr_applies = |proj: &str| dual_moe && matches!(proj, "ffn_gate_inp" | "ffn_down_exps");
+    let unapplied: Vec<&str> = g
+        .tensors()
+        .iter()
+        .map(|t| t.name.as_str())
+        .filter(|name| {
+            projection(name).is_some_and(|p| reference.contains(&p.as_str()) && !infr_applies(&p))
+        })
+        .collect();
+    if let Some(first) = unapplied.first() {
+        bail!(
+            "{first}: this {arch} model carries per-tensor weight scales ({} `.scale` tensors) \
+             that llama.cpp multiplies into their matmuls and infr does not apply — it would run \
+             with those weights off by their scale",
+            unapplied.len()
+        );
+    }
+    Ok(())
+}
+
+/// The archs whose llama.cpp builder loads q/k/v through `create_tensor_qkv` and projects them
+/// through `build_qkv` on the attention path infr runs for them: the loader takes
+/// `attn_q.bias` / `attn_k.bias` / `attn_v.bias` as optional, and `build_qkv` adds each one the
+/// file carries, whatever the arch. Qwen2/2.5 are the files that ship them.
+const QKV_BIAS_ARCHS: [&str; 10] = [
+    crate::arch::LLAMA,
+    crate::arch::LLAMA4,
+    crate::arch::QWEN2,
+    crate::arch::QWEN3,
+    crate::arch::QWEN3_MOE,
+    crate::arch::GEMMA3,
+    crate::arch::DEEPSEEK,
+    crate::arch::SMOLLM3,
+    crate::arch::ERNIE4_5,
+    crate::arch::ERNIE4_5_MOE,
+];
+
+/// ernie4_5-moe's routed-expert width from `key` (`expert_feed_forward_length`). The reference
+/// reads it per layer (`get_key_or_arr` into `n_ff_exp_arr`, one entry per block) but sizes every
+/// layer's expert tensors from the FIRST entry alone (`hparams.n_ff_exp()`), ignoring the rest.
+/// infr's single `MoeConfig::n_ff_exp` takes a scalar or an array whose entries all agree, and
+/// refuses an array whose entries differ: what such a file means is unclear (the reference's
+/// reading of it disagrees with its own metadata), so infr does not pick an entry for it.
+fn ernie4_5_moe_expert_ff(g: &Gguf, key: &str, n_layer: usize) -> Result<usize> {
+    let value = g
+        .metadata()
+        .get(key)
+        .with_context(|| format!("{key} missing"))?;
+    if let Some(arr) = value.as_arr() {
+        if arr.len() != n_layer {
+            bail!("{key} has {} entries for {n_layer} layers", arr.len());
+        }
+        let widths: Vec<u64> = arr.iter().filter_map(MetaValue::as_u64).collect();
+        if widths.len() != arr.len() || widths.iter().any(|&w| w != widths[0]) {
+            bail!(
+                "{key} = {widths:?}: infr runs one expert width for every layer, and the \
+                 reference sizes every layer's experts from the first entry"
+            );
+        }
+        return Ok(widths[0] as usize);
+    }
+    value
+        .as_u64()
+        .map(|w| w as usize)
+        .with_context(|| format!("{key} is not an integer"))
+}
+
+/// Every tensor an ernie4_5-moe file must carry is there, and it carries nothing else, layer kinds
+/// taken from [`Config::is_moe_layer`] — the graph's rule (`ernie4-5-moe.cpp` tests the dense lead
+/// AND the interleave step). llama.cpp's loader
+/// (`llama_model_ernie4_5::load_arch_tensors`) differs for a step above 1: it creates MoE tensors
+/// on every layer past the lead whatever the step, so such a file cannot satisfy both its loader
+/// and its graph; infr follows the graph (B175). Like llama.cpp, infr refuses a file carrying
+/// tensors it does not use. Dense layers (`!cfg.is_moe_layer(l)`) take
+/// `ffn_gate`/`ffn_up`/`ffn_down`; MoE layers take the router, the three expert banks, the shared
+/// expert's three when `cfg.shexp_ff > 0`, and an optional `exp_probs_b.bias`. The optional
+/// tensors are `output.weight` (else tied to the embedding), `attn_output.bias` (loaded and never
+/// applied by the reference, nor by infr) and `attn_q/k/v.bias` (all or none, which
+/// `qkv_projection_biases` has already enforced). `.scale` / `.input_scale` siblings are left to
+/// `refuse_unapplied_weight_scales`. The reference treats `ffn_gate_exps` as optional (an
+/// ungated expert FFN); infr has no ungated expert path, so it is required here. The missing
+/// tensor, or the unexpected one, is named in the error.
+fn ernie4_5_moe_tensors(g: &Gguf, cfg: &Config) -> Result<()> {
+    let present: std::collections::HashSet<&str> =
+        g.tensors().iter().map(|t| t.name.as_str()).collect();
+    let mut required: Vec<String> = vec!["token_embd.weight".into(), "output_norm.weight".into()];
+    let mut optional: Vec<String> = vec!["output.weight".into()];
+    for l in 0..cfg.n_layer {
+        let p = |n: &str| format!("blk.{l}.{n}");
+        for n in [
+            "attn_norm.weight",
+            "attn_q.weight",
+            "attn_k.weight",
+            "attn_v.weight",
+            "attn_output.weight",
+            "ffn_norm.weight",
+        ] {
+            required.push(p(n));
+        }
+        optional.push(p("attn_output.bias"));
+        if cfg.qkv_bias {
+            for n in ["attn_q.bias", "attn_k.bias", "attn_v.bias"] {
+                required.push(p(n));
+            }
+        }
+        if cfg.is_moe_layer(l) {
+            for n in [
+                "ffn_gate_inp.weight",
+                "ffn_gate_exps.weight",
+                "ffn_up_exps.weight",
+                "ffn_down_exps.weight",
+            ] {
+                required.push(p(n));
+            }
+            if cfg.shexp_ff > 0 {
+                for n in [
+                    "ffn_gate_shexp.weight",
+                    "ffn_up_shexp.weight",
+                    "ffn_down_shexp.weight",
+                ] {
+                    required.push(p(n));
+                }
+            }
+            optional.push(p("exp_probs_b.bias"));
+        } else {
+            for n in ["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"] {
+                required.push(p(n));
+            }
+        }
+    }
+    if let Some(missing) = required.iter().find(|n| !present.contains(n.as_str())) {
+        bail!("ernie4_5-moe: {missing} is missing");
+    }
+    let known: std::collections::HashSet<&str> = required
+        .iter()
+        .chain(&optional)
+        .map(String::as_str)
+        .collect();
+    let mut extra: Vec<&str> = present
+        .iter()
+        .copied()
+        .filter(|n| !known.contains(n) && !n.ends_with(".scale") && !n.ends_with(".input_scale"))
+        .collect();
+    extra.sort_unstable();
+    if let Some(first) = extra.first() {
+        bail!(
+            "ernie4_5-moe: {first} is not a tensor this layer layout uses ({} unexpected) — \
+             llama.cpp refuses such a file too",
+            extra.len()
+        );
+    }
+    Ok(())
+}
+
+/// Whether this file's attention layers carry q/k/v projection biases that infr must add
+/// (`Config::qkv_bias`). For a [`QKV_BIAS_ARCHS`] arch that is decided by the tensors, as the
+/// reference decides it: all three on every layer turns the bias path on, none leaves it off, and
+/// anything in between — which the reference would apply bias by bias and layer by layer, and
+/// infr's single flag cannot — is refused naming the first missing tensor. qwen35/qwen35moe also
+/// build through `build_qkv`, but infr's gated-Q attention takes no bias, so a file carrying one
+/// is refused. The other archs' builders never load these tensors, so they are left unread as the
+/// reference leaves them.
+fn qkv_projection_biases(g: &Gguf, arch: &str, n_layer: usize) -> Result<bool> {
+    const BIASES: [&str; 3] = ["attn_q.bias", "attn_k.bias", "attn_v.bias"];
+    let names: std::collections::HashSet<&str> =
+        g.tensors().iter().map(|t| t.name.as_str()).collect();
+    let wanted = (0..n_layer).flat_map(|l| BIASES.map(|b| format!("blk.{l}.{b}")));
+    let (present, missing): (Vec<String>, Vec<String>) =
+        wanted.partition(|n| names.contains(n.as_str()));
+    if present.is_empty() {
+        return Ok(false);
+    }
+    if !QKV_BIAS_ARCHS.contains(&arch) {
+        if matches!(arch, crate::arch::QWEN35 | crate::arch::QWEN35_MOE) {
+            bail!(
+                "{}: this {arch} model carries attention projection biases, which llama.cpp \
+                 adds and infr's {arch} attention does not",
+                present[0]
+            );
+        }
+        return Ok(false);
+    }
+    if let Some(first) = missing.first() {
+        bail!(
+            "{first} is missing while {} is present: infr adds q/k/v projection biases only when \
+             every layer carries all three ({} of {} found)",
+            present[0],
+            present.len(),
+            present.len() + missing.len()
+        );
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infr_gguf::Gguf;
-
-    fn push_u32(bytes: &mut Vec<u8>, value: u32) {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn push_u64(bytes: &mut Vec<u8>, value: u64) {
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn push_str(bytes: &mut Vec<u8>, value: &str) {
-        push_u64(bytes, value.len() as u64);
-        bytes.extend_from_slice(value.as_bytes());
-    }
-
-    fn push_u32_metadata(bytes: &mut Vec<u8>, key: &str, value: u32) {
-        push_str(bytes, key);
-        push_u32(bytes, 4); // GGUF_TYPE_UINT32
-        push_u32(bytes, value);
-    }
+    use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
 
     /// Minimal `deepseek2` GGUF carrying exactly `keys` (each prefixed with `deepseek2.`) plus a
     /// single dummy tensor — enough for `Config::from_gguf` to reach the MLA and MoE parses.
-    fn deepseek2_fixture(keys: &[(&str, u32)]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        push_u32(&mut bytes, 0x4655_4747); // GGUF magic
-        push_u32(&mut bytes, 3);
-        push_u64(&mut bytes, 1); // tensor count
-        push_u64(&mut bytes, 1 + keys.len() as u64);
+    fn deepseek2_fixture(keys: &[(&str, u32)]) -> SyntheticModel {
+        arch_fixture("deepseek2", keys)
+    }
 
-        push_str(&mut bytes, "general.architecture");
-        push_u32(&mut bytes, 8); // GGUF_TYPE_STRING
-        push_str(&mut bytes, "deepseek2");
-        for (key, value) in keys {
-            push_u32_metadata(&mut bytes, &format!("deepseek2.{key}"), *value);
+    /// Minimal `arch` GGUF carrying exactly `keys` (each prefixed with `{arch}.`) plus a single
+    /// dummy tensor.
+    fn arch_fixture(arch: &str, keys: &[(&str, u32)]) -> SyntheticModel {
+        let mut meta = vec![("general.architecture".to_string(), Meta::Str(arch.into()))];
+        meta.extend(
+            keys.iter()
+                .map(|(key, value)| (format!("{arch}.{key}"), Meta::U32(*value))),
+        );
+        SyntheticModel {
+            meta,
+            tensors: vec![dummy_embd()],
         }
+    }
 
-        push_str(&mut bytes, "token_embd.weight");
-        push_u32(&mut bytes, 2);
-        push_u64(&mut bytes, 8);
-        push_u64(&mut bytes, 1);
-        push_u32(&mut bytes, 0); // F32
-        push_u64(&mut bytes, 0);
-        while !bytes.len().is_multiple_of(32) {
-            bytes.push(0);
-        }
-        bytes.extend_from_slice(&[0; 32]);
-        bytes
+    /// The one tensor every fixture carries: a zero `token_embd.weight`.
+    fn dummy_embd() -> TensorSpec {
+        TensorSpec::new("token_embd.weight", vec![8, 1], Fill::Exact(vec![0.0; 8]))
     }
 
     /// Write a fixture to a uniquely-named temp file, parse it, and clean up.
-    fn config_from_fixture(name: &str, bytes: &[u8]) -> Result<Config> {
-        let path =
-            std::env::temp_dir().join(format!("infr-llama-{name}-{}.gguf", std::process::id()));
-        std::fs::write(&path, bytes).expect("write GGUF fixture");
-        let gguf = Gguf::open(&path).expect("open GGUF fixture");
-        let parsed = Config::from_gguf(&gguf);
-        std::fs::remove_file(path).expect("remove GGUF fixture");
-        parsed
+    fn config_from_fixture(name: &str, model: &SyntheticModel) -> Result<Config> {
+        let tmp = TempGguf::write(name, model);
+        let gguf = Gguf::open(tmp.path()).expect("open GGUF fixture");
+        Config::from_gguf(&gguf)
     }
 
-    fn gemma4_zero_kv_heads_fixture() -> Vec<u8> {
-        let mut bytes = Vec::new();
-        push_u32(&mut bytes, 0x4655_4747); // GGUF magic
-        push_u32(&mut bytes, 3);
-        push_u64(&mut bytes, 1); // tensor count
-        push_u64(&mut bytes, 6); // metadata count
-
-        push_str(&mut bytes, "general.architecture");
-        push_u32(&mut bytes, 8); // GGUF_TYPE_STRING
-        push_str(&mut bytes, "gemma4");
-        push_u32_metadata(&mut bytes, "gemma4.block_count", 1);
-        push_u32_metadata(&mut bytes, "gemma4.embedding_length", 8);
-        push_u32_metadata(&mut bytes, "gemma4.attention.head_count", 8);
-        push_u32_metadata(&mut bytes, "gemma4.feed_forward_length", 16);
-
-        push_str(&mut bytes, "gemma4.attention.head_count_kv");
-        push_u32(&mut bytes, 9); // GGUF_TYPE_ARRAY
-        push_u32(&mut bytes, 4); // GGUF_TYPE_UINT32
-        push_u64(&mut bytes, 1);
-        push_u32(&mut bytes, 0);
-
-        push_str(&mut bytes, "token_embd.weight");
-        push_u32(&mut bytes, 2);
-        push_u64(&mut bytes, 8);
-        push_u64(&mut bytes, 1);
-        push_u32(&mut bytes, 0); // F32
-        push_u64(&mut bytes, 0);
-        while !bytes.len().is_multiple_of(32) {
-            bytes.push(0);
-        }
-        bytes.extend_from_slice(&[0; 32]);
-        bytes
+    fn gemma4_zero_kv_heads_fixture() -> SyntheticModel {
+        let mut model = arch_fixture(
+            "gemma4",
+            &[
+                ("block_count", 1),
+                ("embedding_length", 8),
+                ("attention.head_count", 8),
+                ("feed_forward_length", 16),
+            ],
+        );
+        model.meta.push((
+            "gemma4.attention.head_count_kv".to_string(),
+            Meta::U32Arr(vec![0]),
+        ));
+        model
     }
 
     #[test]
@@ -1606,13 +2518,9 @@ mod tests {
 
     #[test]
     fn gemma4_array_kv_heads_must_be_positive() {
-        let path = std::env::temp_dir().join(format!(
-            "infr-llama-gemma4-zero-kv-heads-{}.gguf",
-            std::process::id()
-        ));
-        std::fs::write(&path, gemma4_zero_kv_heads_fixture()).expect("write GGUF fixture");
-        let gguf = Gguf::open(&path).expect("open GGUF fixture");
-        std::fs::remove_file(path).expect("remove GGUF fixture");
+        let tmp = TempGguf::write("gemma4-zero-kv-heads", &gemma4_zero_kv_heads_fixture());
+        let gguf = Gguf::open(tmp.path()).expect("open GGUF fixture");
+        drop(tmp);
 
         let Err(err) = Config::from_gguf(&gguf) else {
             panic!("zero KV heads must fail");
@@ -1741,10 +2649,108 @@ mod tests {
         );
     }
 
-    /// B44: the YaRN knobs the loader used to drop. Absent keys must land on llama.cpp's own
-    /// `llama_hparams` defaults, present ones must be read.
+    /// `deepseek2.cpp::load_arch_hparams` fills an absent `expert_gating_func` with SIGMOID for
+    /// GLM 4.7 Lite's shape ([`GLM47_LITE_N_LAYER`] trunk layers and a [`GLM47_LITE_N_VOCAB`]
+    /// vocabulary, its size taken from `{arch}.vocab_size` or else the token list), with softmax
+    /// for every other shape; a key that is present is used as written.
     #[test]
-    fn deepseek2_yarn_knobs_are_read() {
+    fn deepseek2_absent_gating_follows_the_reference_rule() {
+        use infr_core::graph::MoeGating;
+        // `vocab` holds `{arch}.vocab_size` (a `U32`) and/or the token list (a `StrArr`).
+        let gating = |tag: &str, block_count: u32, vocab: &[Meta], func: Option<u32>| {
+            let mut keys = deepseek2_keys_with(&[("block_count", block_count)]);
+            if let Some(f) = func {
+                keys.push(("expert_gating_func", f));
+            }
+            let mut model = deepseek2_fixture(&keys);
+            for v in vocab {
+                let key = match v {
+                    Meta::U32(_) => "deepseek2.vocab_size",
+                    _ => "tokenizer.ggml.tokens",
+                };
+                model.meta.push((key.into(), v.clone()));
+            }
+            config_from_fixture(tag, &model)
+                .unwrap_or_else(|e| panic!("{tag}: {e:#}"))
+                .moe
+                .expect("deepseek2 fixture has experts")
+                .gating
+        };
+        let tokens = |n: usize| Meta::StrArr((0..n).map(|i| format!("t{i}")).collect());
+        let glm = [Meta::U32(154_880)];
+        assert_eq!(gating("ds2-glm47", 47, &glm, None), MoeGating::Sigmoid);
+        assert_eq!(gating("ds2-glm48", 48, &glm, None), MoeGating::Sigmoid);
+        assert_eq!(
+            gating("ds2-glm-tokens", 47, &[tokens(154_880)], None),
+            MoeGating::Sigmoid
+        );
+        // `vocab_size` wins over the token list when both are there and disagree.
+        assert_eq!(
+            gating(
+                "ds2-size-wins",
+                47,
+                &[Meta::U32(154_880), tokens(1000)],
+                None
+            ),
+            MoeGating::Sigmoid
+        );
+        assert_eq!(
+            gating(
+                "ds2-size-wins-not",
+                47,
+                &[Meta::U32(1000), tokens(154_880)],
+                None
+            ),
+            MoeGating::Softmax
+        );
+        // Any other shape, or no vocabulary size at all, stays softmax.
+        assert_eq!(gating("ds2-46", 46, &glm, None), MoeGating::Softmax);
+        assert_eq!(
+            gating("ds2-vocab", 47, &[Meta::U32(154_881)], None),
+            MoeGating::Softmax
+        );
+        assert_eq!(
+            gating("ds2-tokens", 48, &[tokens(1000)], None),
+            MoeGating::Softmax
+        );
+        assert_eq!(gating("ds2-novocab", 47, &[], None), MoeGating::Softmax);
+        // The key wins when it is there.
+        assert_eq!(
+            gating("ds2-glm-key1", 47, &glm, Some(1)),
+            MoeGating::Softmax
+        );
+        assert_eq!(gating("ds2-key2", 27, &[], Some(2)), MoeGating::Sigmoid);
+    }
+
+    /// An explicit `expert_gating_func = 0` names no gating function. `deepseek32.cpp` keeps it
+    /// and llama.cpp's `build_moe_ffn` then aborts, so the file is refused at load. (`deepseek4`
+    /// refuses every value but sqrt-softplus: `synthetic_deepseek4_requires_sqrt_softplus_gating`.)
+    #[test]
+    fn explicit_zero_gating_is_refused_where_the_reference_cannot_run_it() {
+        let keys = deepseek2_keys_with(&[]);
+        let mut ds32 = keys.clone();
+        ds32.extend([
+            ("expert_gating_func", 0),
+            ("attention.q_lora_rank", 1536),
+            ("attention.indexer.head_count", 64),
+            ("attention.indexer.key_length", 128),
+            ("attention.indexer.top_k", 2048),
+        ]);
+        let Err(err) = config_from_fixture("ds32-gating0", &arch_fixture("deepseek32", &ds32))
+        else {
+            panic!("deepseek32 with expert_gating_func = 0 must fail");
+        };
+        assert_eq!(
+            err.to_string(),
+            "deepseek32.expert_gating_func = 0 names no gating function (llama.cpp aborts on it)"
+        );
+    }
+
+    /// The YaRN knobs: `rope.scaling.attn_factor` is read, while the ramp corners stay at
+    /// llama.cpp's `llama_hparams` defaults even when the file declares others, because
+    /// `deepseek2.cpp` and `deepseek32.cpp` never read `rope.scaling.yarn_beta_fast` / `_slow`.
+    #[test]
+    fn deepseek2_yarn_knobs_match_the_reference() {
         let cfg = config_from_fixture("ds2-yarn-default", &deepseek2_fixture(DEEPSEEK2_BASE_KEYS))
             .expect("base deepseek2 fixture must parse");
         assert_eq!(cfg.rope_attn_factor, 1.0);
@@ -1754,11 +2760,829 @@ mod tests {
         let mut keys = DEEPSEEK2_BASE_KEYS.to_vec();
         keys.push(("rope.scaling.yarn_beta_fast", 16));
         keys.push(("rope.scaling.yarn_beta_slow", 2));
+        for arch in ["deepseek2", "deepseek32"] {
+            let mut arch_keys = keys.clone();
+            if arch == "deepseek32" {
+                // deepseek32 requires the keys deepseek2 tolerates the absence of.
+                arch_keys.extend([
+                    ("expert_gating_func", 2),
+                    ("attention.q_lora_rank", 1536),
+                    ("attention.indexer.head_count", 64),
+                    ("attention.indexer.key_length", 128),
+                    ("attention.indexer.top_k", 2048),
+                ]);
+            }
+            let cfg =
+                config_from_fixture(&format!("{arch}-yarn-set"), &arch_fixture(arch, &arch_keys))
+                    .unwrap_or_else(|e| panic!("{arch} fixture with YaRN betas must parse: {e:#}"));
+            assert_eq!(cfg.rope_yarn_beta_fast, 32.0, "{arch}");
+            assert_eq!(cfg.rope_yarn_beta_slow, 1.0, "{arch}");
+        }
+
+        // A non-unit `rope.scaling.attn_factor` scales the rotary halves of Q and K
+        // (`deepseek2_mla_rope_magnitude_must_be_one`), so it is read only to be refused.
         keys.push(("rope.scaling.attn_factor", 3));
-        let cfg = config_from_fixture("ds2-yarn-set", &deepseek2_fixture(&keys))
-            .expect("deepseek2 fixture with YaRN knobs must parse");
-        assert_eq!(cfg.rope_yarn_beta_fast, 16.0);
-        assert_eq!(cfg.rope_yarn_beta_slow, 2.0);
-        assert_eq!(cfg.rope_attn_factor, 3.0);
+        let Err(err) = config_from_fixture("ds2-yarn-af3", &deepseek2_fixture(&keys)) else {
+            panic!("rope.scaling.attn_factor = 3 must fail");
+        };
+        assert!(
+            err.to_string()
+                .contains("deepseek2.rope.scaling.attn_factor = 3"),
+            "{err}"
+        );
+    }
+
+    /// ggml's rope multiplies MLA's `q_pe`/`k_pe` by llama.cpp's `attn_factor_org`, which reaches
+    /// only the rotary half of the score — infr's MLA cannot fold it into the score scale, so a
+    /// file where it is not 1 is refused. Every DeepSeek conversion writes
+    /// `yarn_log_multiplier` with YaRN, which makes it exactly 1 on the `deepseek2` string; YaRN
+    /// WITHOUT the multiplier leaves `1 + 0.1·ln(factor)`.
+    #[test]
+    fn deepseek2_mla_rope_magnitude_must_be_one() {
+        let yarn = |tag: &str, log_mul: Option<f32>| {
+            let mut keys = DEEPSEEK2_BASE_KEYS.to_vec();
+            keys.push(("rope.scaling.factor", 40));
+            keys.push(("rope.scaling.original_context_length", 4096));
+            let mut m = deepseek2_fixture(&keys);
+            m.meta.push((
+                "deepseek2.rope.scaling.type".into(),
+                Meta::Str("yarn".into()),
+            ));
+            if let Some(v) = log_mul {
+                m.meta.push((
+                    "deepseek2.rope.scaling.yarn_log_multiplier".into(),
+                    Meta::F32(v),
+                ));
+            }
+            config_from_fixture(tag, &m)
+        };
+        // V2-Lite's own metadata (`0.1 * mscale_all_dim`, mscale_all_dim 0.707).
+        let cfg = yarn("ds2-yarn-v2lite", Some(0.0707)).expect("V2-Lite's YaRN must parse");
+        assert!(cfg.rope_scaling_yarn && cfg.rope_yarn_log_mul != 0.0);
+        let Err(err) = yarn("ds2-yarn-nolm", None) else {
+            panic!("YaRN without yarn_log_multiplier must fail");
+        };
+        let want = 1.0 + 0.1 * 40f32.ln();
+        assert!(
+            err.to_string()
+                .starts_with(&format!("deepseek2 MLA rope: ggml_rope_ext would scale the rotary halves of Q and K by {want}")),
+            "{err}"
+        );
+
+        assert_eq!(mla_rope_mscale(true, 40.0, 0.707, 1.0), 1.0);
+        assert_eq!(
+            mla_rope_mscale(true, 1.0, 0.0, 1.0),
+            1.0,
+            "no stretch, no magnitude"
+        );
+        assert_eq!(mla_rope_mscale(false, 40.0, 0.0, 2.0), 2.0);
+
+        // deepseek32 lacks the special case: only a multiplier of 1 (or none) agrees. V3.2's own
+        // `mscale_all_dim` (1.0, written as 0.1) gets no warning; the synthetic deepseek32
+        // fixture's V2-Lite values (0.707 at factor 40) do.
+        assert!(deepseek32_yarn_rules_agree(true, 40.0, 1.0), "V3.2");
+        assert!(
+            !deepseek32_yarn_rules_agree(true, 40.0, 0.707),
+            "the fixture"
+        );
+        assert!(deepseek32_yarn_rules_agree(true, 40.0, 0.0));
+        assert!(deepseek32_yarn_rules_agree(true, 1.0, 0.707));
+        assert!(deepseek32_yarn_rules_agree(false, 40.0, 0.707));
+    }
+
+    /// deepseek2's `attention.temperature_scale` (Mistral-Large-3) scales Q from
+    /// `attention.temperature_length` on; the context stops there. A zero scale is the
+    /// reference's "off", and a scale with no length is refused by name (llama.cpp asserts it).
+    #[test]
+    fn deepseek2_attention_temperature_caps_the_context() {
+        let with = |extra: &[(&'static str, u32)]| {
+            let mut keys = DEEPSEEK2_BASE_KEYS.to_vec();
+            keys.extend_from_slice(extra);
+            keys
+        };
+        let cfg = config_from_fixture("ds2-temp-none", &deepseek2_fixture(&with(&[])))
+            .expect("base deepseek2 fixture must parse");
+        assert_eq!(cfg.faithful_ctx_limit(), None);
+        let base_ctx = cfg.n_ctx_train;
+
+        let cfg = config_from_fixture(
+            "ds2-temp-off",
+            &deepseek2_fixture(&with(&[("attention.temperature_scale", 0)])),
+        )
+        .expect("a zero temperature scale must parse");
+        assert_eq!(cfg.faithful_ctx_limit(), None);
+
+        let len = 4096;
+        assert!(len < base_ctx, "the fixture must have room to cap");
+        let cfg = config_from_fixture(
+            "ds2-temp-on",
+            &deepseek2_fixture(&with(&[
+                ("attention.temperature_scale", 1),
+                ("attention.temperature_length", len as u32),
+            ])),
+        )
+        .expect("a temperature with its length must parse");
+        assert_eq!(cfg.faithful_ctx_limit(), Some(len));
+        assert_eq!(
+            cfg.n_ctx_train, base_ctx,
+            "the file's context stays; sessions are capped"
+        );
+
+        let Err(err) = config_from_fixture(
+            "ds2-temp-nolen",
+            &deepseek2_fixture(&with(&[("attention.temperature_scale", 1)])),
+        ) else {
+            panic!("a temperature scale without its length must fail");
+        };
+        assert_eq!(
+            err.to_string(),
+            "deepseek2.attention.temperature_scale = 1 needs a positive \
+             deepseek2.attention.temperature_length (the position the attention temperature \
+             starts from); the file has none"
+        );
+    }
+
+    /// llama4 shares DeepSeek's reading of `expert_weights_scale`: an explicit 0 is unscaled.
+    #[test]
+    fn llama4_zero_expert_weights_scale_is_unscaled() {
+        let keys = |scale: u32| {
+            [
+                ("block_count", 1),
+                ("embedding_length", 8),
+                ("attention.head_count", 2),
+                ("feed_forward_length", 16),
+                ("expert_count", 4),
+                ("expert_used_count", 1),
+                ("expert_weights_scale", scale),
+            ]
+        };
+        let scale = |name: &str, s: u32| {
+            config_from_fixture(name, &arch_fixture("llama4", &keys(s)))
+                .expect("llama4 fixture must parse")
+                .moe
+                .expect("llama4 fixture has experts")
+                .scale
+        };
+        assert_eq!(scale("l4-scale-zero", 0), 1.0);
+        assert_eq!(scale("l4-scale-two", 2), 2.0);
+    }
+
+    /// llama4's chunked attention and NoPE temperature are unimplemented, so its faithful context
+    /// stops one position short of where the temperature first leaves 1; an explicit
+    /// `sliding_window = 0` (the reference's all-rope branch, which has neither) and every other
+    /// arch have no cap. `n_ctx_train` stays the file's `context_length` throughout — sessions
+    /// apply the cap (`llama4_session_ctx_resolves_to_the_cap`).
+    #[test]
+    fn llama4_context_stops_before_the_attention_chunk() {
+        let keys = |sliding: Option<u32>| {
+            let mut k = vec![
+                ("block_count", 1),
+                ("embedding_length", 8),
+                ("attention.head_count", 2),
+                ("feed_forward_length", 16),
+                ("expert_count", 4),
+                ("expert_used_count", 1),
+                ("context_length", 10_485_760),
+            ];
+            k.extend(sliding.map(|w| ("attention.sliding_window", w)));
+            k
+        };
+        // The temperature `log(floor((p + 1) / chunk) + 1) * 0.1 + 1` (llama-graph.cpp's
+        // `llm_graph_input_attn_temp`) at the last position the capped context reaches, and at
+        // the next one.
+        let temp = |p: usize| ((((p + 1) / LLAMA4_ATTN_CHUNK) as f64 + 1.0).ln() * 0.1) + 1.0;
+        let cfg = config_from_fixture("l4-ctx", &arch_fixture("llama4", &keys(None)))
+            .expect("llama4 fixture must parse");
+        let limit = cfg.faithful_ctx_limit().expect("chunked llama4 is capped");
+        assert_eq!(cfg.n_ctx_train, 10_485_760);
+        assert_eq!(
+            temp(limit - 1),
+            1.0,
+            "the last position kept must be untouched"
+        );
+        assert!(
+            temp(limit) > 1.0,
+            "the first position cut must be one that differs"
+        );
+
+        let cfg = config_from_fixture("l4-ctx-8192", &arch_fixture("llama4", &keys(Some(8192))))
+            .expect("llama4 fixture must parse");
+        assert_eq!(
+            cfg.faithful_ctx_limit(),
+            Some(limit),
+            "a non-zero window is the chunked branch too"
+        );
+
+        let cfg = config_from_fixture("l4-ctx-norope", &arch_fixture("llama4", &keys(Some(0))))
+            .expect("llama4 fixture must parse");
+        assert_eq!(cfg.faithful_ctx_limit(), None);
+        assert_eq!(cfg.n_ctx_train, 10_485_760);
+
+        let cfg = config_from_fixture("llama-ctx", &arch_fixture("llama", &keys(None)[..4]))
+            .expect("llama fixture must parse");
+        assert_eq!(cfg.faithful_ctx_limit(), None);
+    }
+
+    /// smollm3 takes its NoPE step from the arch (the reference hardcodes it; the file carries no
+    /// key), so layers 3, 7, … skip rope; that is ALL it takes from llama4's iRoPE — no context
+    /// cap, no L2-norm, no MoE interleave. The llama arch it otherwise matches ropes every layer.
+    #[test]
+    fn smollm3_skips_rope_on_every_fourth_layer() {
+        let keys = [
+            ("block_count", 8),
+            ("embedding_length", 8),
+            ("attention.head_count", 2),
+            ("feed_forward_length", 16),
+        ];
+        let cfg = config_from_fixture("smollm3-nope", &arch_fixture("smollm3", &keys))
+            .expect("smollm3 fixture must parse");
+        assert_eq!(cfg.no_rope_step, SMOLLM3_NO_ROPE_STEP);
+        let nope: Vec<usize> = (0..cfg.n_layer).filter(|&l| cfg.is_nope_layer(l)).collect();
+        assert_eq!(nope, [3, 7]);
+        assert!(!cfg.llama4 && !cfg.kq_l2norm && !cfg.qk_norm);
+        assert_eq!(cfg.moe_interleave_step, 0);
+        assert_eq!(cfg.faithful_ctx_limit(), None);
+
+        let cfg = config_from_fixture("smollm3-llama", &arch_fixture("llama", &keys))
+            .expect("llama fixture must parse");
+        assert_eq!(cfg.no_rope_step, 0);
+        assert!((0..cfg.n_layer).all(|l| !cfg.is_nope_layer(l)));
+    }
+
+    /// The `ernie4_5-moe` keys of a six-layer fixture: two leading dense layers and an interleave
+    /// step of 2, so the reference's rule (`il >= lead && (il + 1) % step == 0`) makes layers 3
+    /// and 5 MoE, where the dense lead alone would give 2–5 and the step alone 1, 3, 5.
+    const ERNIE_MOE_KEYS: &[(&str, u32)] = &[
+        ("block_count", 6),
+        ("embedding_length", 8),
+        ("attention.head_count", 2),
+        ("attention.head_count_kv", 1),
+        ("feed_forward_length", 16),
+        ("expert_count", 4),
+        ("expert_used_count", 2),
+        ("expert_feed_forward_length", 8),
+        ("expert_shared_feed_forward_length", 8),
+        ("leading_dense_block_count", 2),
+        ("interleave_moe_layer_step", 2),
+    ];
+    const ERNIE_MOE_LAYERS: [usize; 2] = [3, 5];
+
+    /// The tensor names an `ernie4_5-moe` file with `ERNIE_MOE_KEYS` carries when `moe_layers` are
+    /// its MoE layers: attention and norms everywhere, the dense trio elsewhere, and the router,
+    /// expert banks and shared expert on the MoE layers. Listed here rather than derived from the
+    /// code under test, so the fixture says what the file looks like independently of it.
+    fn ernie_moe_tensor_names(moe_layers: &[usize]) -> Vec<String> {
+        let mut names = vec!["output_norm.weight".to_string()];
+        for l in 0..6 {
+            let mut layer = vec![
+                "attn_norm.weight",
+                "attn_q.weight",
+                "attn_k.weight",
+                "attn_v.weight",
+                "attn_output.weight",
+                "ffn_norm.weight",
+            ];
+            if moe_layers.contains(&l) {
+                layer.extend([
+                    "ffn_gate_inp.weight",
+                    "ffn_gate_exps.weight",
+                    "ffn_up_exps.weight",
+                    "ffn_down_exps.weight",
+                    "ffn_gate_shexp.weight",
+                    "ffn_up_shexp.weight",
+                    "ffn_down_shexp.weight",
+                ]);
+            } else {
+                layer.extend(["ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"]);
+            }
+            names.extend(layer.into_iter().map(|n| format!("blk.{l}.{n}")));
+        }
+        names
+    }
+
+    /// An `ernie4_5-moe` fixture with `keys` and exactly the tensors `names` (plus the dummy
+    /// embedding every fixture carries). Shapes are placeholders: the parse reads names only.
+    fn ernie_moe_fixture(keys: &[(&str, u32)], names: &[String]) -> SyntheticModel {
+        let mut m = arch_fixture("ernie4_5-moe", keys);
+        m.tensors.extend(
+            names
+                .iter()
+                .map(|n| TensorSpec::new(n.clone(), vec![8], Fill::Exact(vec![0.0; 8]))),
+        );
+        m
+    }
+
+    /// ernie4_5-moe's layer kinds need BOTH of the reference's conditions, and its router is the
+    /// softmax / renormalized / unscaled one with an optional bias and an ungated shared expert.
+    #[test]
+    fn ernie4_5_moe_layer_kind_needs_lead_and_step() {
+        let names = ernie_moe_tensor_names(&ERNIE_MOE_LAYERS);
+        let cfg = config_from_fixture("ernie-moe", &ernie_moe_fixture(ERNIE_MOE_KEYS, &names))
+            .expect("ernie4_5-moe fixture must parse");
+        let moe: Vec<usize> = (0..cfg.n_layer).filter(|&l| cfg.is_moe_layer(l)).collect();
+        assert_eq!(moe, ERNIE_MOE_LAYERS);
+        let mc = cfg.moe.expect("ernie4_5-moe is MoE");
+        assert_eq!(mc.gating, infr_core::graph::MoeGating::Softmax);
+        assert!(mc.norm_w && !mc.weight_before);
+        assert_eq!((mc.scale, mc.n_ff_exp), (1.0, 8));
+        assert_eq!((mc.n_expert_groups, mc.n_expert_groups_used), (0, 0));
+        assert_eq!((cfg.shexp_ff, cfg.shexp_gated), (8, false));
+        assert!(cfg.optional_router_bias);
+        assert!(!cfg.deepseek && !cfg.deepseek2 && !cfg.llama4 && !cfg.qk_norm);
+        assert!(!cfg.permute_qk_neox && !cfg.qkv_bias);
+    }
+
+    /// Every tensor the layout needs is required and anything else is refused, each by name; the
+    /// router bias is optional per MoE layer and refused on a dense one.
+    #[test]
+    fn ernie4_5_moe_tensors_are_checked_by_name() {
+        let names = ernie_moe_tensor_names(&ERNIE_MOE_LAYERS);
+        let parse = |tag: &str, names: &[String]| {
+            config_from_fixture(tag, &ernie_moe_fixture(ERNIE_MOE_KEYS, names))
+        };
+        let refused = |tag: &str, names: &[String]| match parse(tag, names) {
+            Ok(_) => panic!("{tag}: must be refused"),
+            Err(e) => e.to_string(),
+        };
+
+        let mut with_bias = names.clone();
+        with_bias.push("blk.3.exp_probs_b.bias".into());
+        parse("ernie-moe-bias", &with_bias).expect("a router bias on a MoE layer is optional");
+
+        let missing: Vec<String> = names
+            .iter()
+            .filter(|n| *n != "blk.5.ffn_up_shexp.weight")
+            .cloned()
+            .collect();
+        let err = refused("ernie-moe-missing", &missing);
+        assert_eq!(err, "ernie4_5-moe: blk.5.ffn_up_shexp.weight is missing");
+
+        for extra in [
+            "blk.2.exp_probs_b.bias",          // a bias on a dense layer
+            "blk.1.ffn_gate_inp.weight",       // a router on the step but inside the dense lead
+            "blk.4.ffn_gate_inp.weight",       // a router past the dense lead but off the step
+            "blk.3.ffn_gate_inp_shexp.weight", // a shared-expert gate this arch never reads
+        ] {
+            let mut more = names.clone();
+            more.push(extra.into());
+            let err = refused(&format!("ernie-moe-extra-{extra}"), &more);
+            assert!(
+                err.starts_with(&format!("ernie4_5-moe: {extra} is not a tensor")),
+                "{err}"
+            );
+        }
+    }
+
+    /// The reference requires `interleave_moe_layer_step` (and asserts it positive) and sizes
+    /// every layer's experts from the first `expert_feed_forward_length` entry, so infr takes a
+    /// scalar or a uniform array and refuses the rest.
+    #[test]
+    fn ernie4_5_moe_refuses_what_the_reference_cannot_load() {
+        let names = ernie_moe_tensor_names(&ERNIE_MOE_LAYERS);
+        let keys_without = |drop: &str| -> Vec<(&str, u32)> {
+            ERNIE_MOE_KEYS
+                .iter()
+                .copied()
+                .filter(|(k, _)| *k != drop)
+                .collect()
+        };
+        let parse = |tag: &str, m: &SyntheticModel| config_from_fixture(tag, m);
+
+        let m = ernie_moe_fixture(&keys_without("interleave_moe_layer_step"), &names);
+        let err = parse("ernie-moe-nostep", &m).expect_err("the step is required");
+        assert_eq!(
+            err.to_string(),
+            "ernie4_5-moe.interleave_moe_layer_step missing"
+        );
+
+        let mut zero = keys_without("interleave_moe_layer_step");
+        zero.push(("interleave_moe_layer_step", 0));
+        let err = parse("ernie-moe-step0", &ernie_moe_fixture(&zero, &names))
+            .expect_err("a zero step is refused");
+        assert!(err.to_string().ends_with("must be positive"), "{err}");
+
+        let with_widths = |widths: Vec<u32>| {
+            let mut m = ernie_moe_fixture(&keys_without("expert_feed_forward_length"), &names);
+            m.meta.push((
+                "ernie4_5-moe.expert_feed_forward_length".into(),
+                Meta::U32Arr(widths),
+            ));
+            m
+        };
+        let cfg = parse("ernie-moe-ffarr", &with_widths(vec![8; 6]))
+            .expect("a uniform per-layer width parses");
+        assert_eq!(cfg.moe.map(|m| m.n_ff_exp), Some(8));
+        let err = parse(
+            "ernie-moe-ffarr-mixed",
+            &with_widths(vec![8, 8, 8, 8, 8, 16]),
+        )
+        .expect_err("differing per-layer widths are refused");
+        assert!(
+            err.to_string()
+                .starts_with("ernie4_5-moe.expert_feed_forward_length = [8, 8, 8, 8, 8, 16]"),
+            "{err}"
+        );
+    }
+
+    /// ernie4_5 is the llama block parsed as written: the head width comes from
+    /// `attention.key_length` (wider than `n_embd / n_head` in the 0.3B file), Q/K stay in the
+    /// file's row order (its converter does not permute them and the reference ropes them NORM),
+    /// and none of the attention extras another arch hangs on this path is switched on.
+    #[test]
+    fn ernie4_5_parses_as_the_llama_block() {
+        let keys = [
+            ("block_count", 2),
+            ("embedding_length", 8),
+            ("attention.head_count", 2),
+            ("attention.head_count_kv", 1),
+            ("attention.key_length", 8),
+            ("attention.value_length", 8),
+            ("feed_forward_length", 16),
+        ];
+        let cfg = config_from_fixture("ernie4_5", &arch_fixture("ernie4_5", &keys))
+            .expect("ernie4_5 fixture must parse");
+        assert_eq!(cfg.n_embd / cfg.n_head, 4);
+        assert_eq!((cfg.head_dim, cfg.rope_dim), (8, 8));
+        assert!(!cfg.permute_qk_neox && !cfg.qkv_bias && !cfg.qk_norm);
+        assert!(!cfg.sub_norm && !cfg.llama4 && !cfg.kq_l2norm && !cfg.rope_freq_factors);
+        assert!((0..cfg.n_layer).all(|l| !cfg.is_nope_layer(l)));
+    }
+
+    /// q/k/v projection biases follow the tensors on every arch whose reference builds through
+    /// `build_qkv` (`qkv_projection_biases`): all three on every layer turn the path on, a partial
+    /// set is refused naming the missing tensor, qwen35's attention refuses them, and an arch whose
+    /// reference never loads them (bitnet) leaves them unread.
+    #[test]
+    fn qkv_biases_follow_the_tensors() {
+        const KEYS: &[(&str, u32)] = &[
+            ("block_count", 2),
+            ("embedding_length", 8),
+            ("attention.head_count", 2),
+            ("feed_forward_length", 16),
+        ];
+        let bias = |name: String| TensorSpec::new(name, vec![8], Fill::Exact(vec![0.0; 8]));
+        let with = |arch: &str, keys: &[(&str, u32)], names: &[String]| {
+            let mut m = arch_fixture(arch, keys);
+            m.tensors.extend(names.iter().cloned().map(bias));
+            m
+        };
+        let all: Vec<String> = (0..2)
+            .flat_map(|l| ["q", "k", "v"].map(|p| format!("blk.{l}.attn_{p}.bias")))
+            .collect();
+
+        for arch in ["ernie4_5", "llama", "qwen2"] {
+            let cfg = config_from_fixture(&format!("qkvb-{arch}"), &with(arch, KEYS, &all))
+                .expect("a full set of biases must parse");
+            assert!(cfg.qkv_bias, "{arch}: biases present but not applied");
+            let cfg = config_from_fixture(&format!("qkvb-none-{arch}"), &arch_fixture(arch, KEYS))
+                .expect("no biases must parse");
+            assert!(!cfg.qkv_bias, "{arch}: no biases but the path is on");
+        }
+
+        // Layer 1 lacks its v bias.
+        let Err(err) = config_from_fixture("qkvb-partial", &with("ernie4_5", KEYS, &all[..5]))
+        else {
+            panic!("a partial set of biases must be refused");
+        };
+        assert!(
+            err.to_string().starts_with("blk.1.attn_v.bias is missing"),
+            "{err}"
+        );
+
+        let mut qwen35_keys = QWEN35_BASE_KEYS.to_vec();
+        qwen35_keys.push(("ssm.conv_kernel", 4));
+        let q_bias = ["blk.0.attn_q.bias".to_string()];
+        let Err(err) = config_from_fixture("qkvb-qwen35", &with("qwen35", &qwen35_keys, &q_bias))
+        else {
+            panic!("qwen35 must refuse an attention bias");
+        };
+        assert!(err.to_string().starts_with(&q_bias[0]), "{err}");
+
+        let cfg = config_from_fixture("qkvb-bitnet", &with("bitnet", KEYS, &all))
+            .expect("bitnet's reference never loads these biases");
+        assert!(!cfg.qkv_bias);
+    }
+
+    /// A `.scale` weight scale is refused only where the arch's llama.cpp builder APPLIES it and
+    /// infr does not. One the builder ignores (passes NULL for) loads as before — one accepted
+    /// case per arch family below, each a scale the converter really writes for NVFP4 files —
+    /// as do `.input_scale` (never read) and the two scales the dual-FFN gemma4 block applies.
+    #[test]
+    fn unapplied_weight_scales_are_refused() {
+        let scalar = |name: &str| TensorSpec::new(name, vec![1], Fill::Exact(vec![0.5]));
+        let model = |arch: &str, keys: &[(&str, u32)], extra: &[&str]| {
+            let mut m = arch_fixture(arch, keys);
+            m.tensors.extend(extra.iter().map(|n| scalar(n)));
+            m
+        };
+        const DENSE: &[(&str, u32)] = &[
+            ("block_count", 1),
+            ("embedding_length", 8),
+            ("attention.head_count", 2),
+            ("feed_forward_length", 16),
+        ];
+        let mut llama4_keys = DENSE.to_vec();
+        llama4_keys.extend([("expert_count", 4), ("expert_used_count", 1)]);
+        let mut qwen35_keys = QWEN35_BASE_KEYS.to_vec();
+        qwen35_keys.push(("ssm.conv_kernel", 4));
+        let deepseek2_keys = DEEPSEEK2_BASE_KEYS.to_vec();
+        let parses = |tag: &str, arch: &str, keys: &[(&str, u32)], extra: &[&str]| {
+            config_from_fixture(tag, &model(arch, keys, extra)).map(|_| ())
+        };
+
+        parses("scale-none", "llama", DENSE, &[]).expect("no scales must parse");
+        parses("scale-input", "llama", DENSE, &["blk.0.attn_q.input_scale"])
+            .expect("an unread input_scale must parse");
+
+        // Ignored by the reference, so accepted: (arch, keys, scale, the builder that drops it).
+        for (arch, keys, name) in [
+            // `llama_model_llama4::graph`: every FFN scale NULL.
+            ("llama4", &llama4_keys[..], "blk.0.ffn_up_exps.scale"),
+            // `llama_model_qwen2::graph`: build_ffn's scales NULL.
+            ("qwen2", DENSE, "blk.0.ffn_down.scale"),
+            // `llama_model_smollm3::graph`: build_ffn's scales NULL.
+            ("smollm3", DENSE, "blk.0.ffn_down.scale"),
+            // `llama_model_ernie4_5::graph`: build_ffn's scales NULL.
+            ("ernie4_5", DENSE, "blk.0.ffn_up.scale"),
+            // `llama_model_gemma3::graph`: build_ffn's scales NULL.
+            ("gemma3", DENSE, "blk.0.ffn_gate.scale"),
+            // `llama_model_deepseek2::graph`: build_moe_ffn without the `*_exps_s` arguments —
+            // the NVFP4 DeepSeek-V3 case.
+            (
+                "deepseek2",
+                &deepseek2_keys[..],
+                "blk.0.ffn_down_exps.scale",
+            ),
+            // `llama_model_bitnet::graph`: its LM head takes no scale.
+            ("bitnet", DENSE, "output.scale"),
+            // `llama_model_qwen35::graph`: no `ssm_in` projection reads a scale.
+            ("qwen35", &qwen35_keys[..], "blk.0.ssm_in.scale"),
+        ] {
+            parses(&format!("scale-ignored-{arch}"), arch, keys, &[name])
+                .unwrap_or_else(|e| panic!("{arch}: {name} is ignored by the reference: {e}"));
+        }
+
+        // Applied by the reference and not by infr, so refused by name.
+        for (arch, keys, name) in [
+            ("llama", DENSE, "blk.0.attn_q.scale"),
+            ("llama", DENSE, "blk.0.ffn_down.scale"),
+            ("llama", DENSE, "output.scale"),
+            ("llama4", &llama4_keys[..], "blk.0.attn_output.scale"),
+            ("smollm3", DENSE, "blk.0.attn_q.scale"),
+            ("ernie4_5", DENSE, "blk.0.attn_output.scale"),
+            ("deepseek2", &deepseek2_keys[..], "blk.0.attn_output.scale"),
+            ("qwen35", &qwen35_keys[..], "blk.0.ssm_out.scale"),
+        ] {
+            let Err(err) = parses(&format!("scale-refused-{arch}"), arch, keys, &[name]) else {
+                panic!("{arch}: {name} must be refused");
+            };
+            assert!(
+                err.to_string()
+                    .starts_with(&format!("{name}: this {arch} model")),
+                "{arch} {name}: {err}"
+            );
+        }
+
+        let gemma4_moe: &[(&str, u32)] = &[
+            ("block_count", 1),
+            ("embedding_length", 8),
+            ("attention.head_count", 2),
+            ("attention.head_count_kv", 1),
+            ("feed_forward_length", 16),
+            ("attention.sliding_window", 4),
+            ("expert_count", 4),
+            ("expert_used_count", 1),
+        ];
+        let cfg = config_from_fixture(
+            "scale-dual",
+            &model(
+                "gemma4",
+                gemma4_moe,
+                &["blk.0.ffn_gate_inp.scale", "blk.0.ffn_down_exps.scale"],
+            ),
+        )
+        .expect("the dual-FFN block's own scales must parse");
+        assert!(cfg.dual_moe());
+        assert!(
+            parses(
+                "scale-dual-up",
+                "gemma4",
+                gemma4_moe,
+                &["blk.0.ffn_up.scale"]
+            )
+            .is_err(),
+            "gemma4's dense build_ffn applies ffn_up.scale"
+        );
+    }
+
+    /// B133: llama.cpp defaults `expert_weights_scale` to 0 and skips the multiply for 0, so an
+    /// absent or zero key routes UNSCALED. Taking the raw 0 zeroed every routed expert.
+    #[test]
+    fn deepseek_absent_or_zero_expert_weights_scale_is_unscaled() {
+        let scale = |name: &str, keys: &[(&str, u32)]| {
+            config_from_fixture(name, &deepseek2_fixture(keys))
+                .expect("deepseek2 fixture must parse")
+                .moe
+                .expect("deepseek2 fixture has experts")
+                .scale
+        };
+        assert_eq!(scale("ds2-scale-absent", DEEPSEEK2_BASE_KEYS), 1.0);
+        let mut keys = DEEPSEEK2_BASE_KEYS.to_vec();
+        keys.push(("expert_weights_scale", 0));
+        assert_eq!(scale("ds2-scale-zero", &keys), 1.0);
+        keys.last_mut().unwrap().1 = 2;
+        assert_eq!(scale("ds2-scale-two", &keys), 2.0);
+    }
+
+    /// The smallest dense qwen35 geometry `Config::from_gguf` accepts, minus `ssm.conv_kernel`.
+    const QWEN35_BASE_KEYS: &[(&str, u32)] = &[
+        ("block_count", 1),
+        ("embedding_length", 8),
+        ("attention.head_count", 2),
+        ("feed_forward_length", 16),
+        ("ssm.state_size", 4),
+        ("ssm.inner_size", 8),
+        ("ssm.group_count", 1),
+        ("ssm.time_step_rank", 2),
+    ];
+
+    /// B133: the conv state keeps `ssm_d_conv - 1` past steps, so a zero kernel underflowed in
+    /// the seam instead of failing here.
+    #[test]
+    fn qwen35_zero_conv_kernel_is_refused() {
+        let mut keys = QWEN35_BASE_KEYS.to_vec();
+        keys.push(("ssm.conv_kernel", 4));
+        let cfg = config_from_fixture("q35-conv4", &arch_fixture("qwen35", &keys))
+            .expect("qwen35 fixture must parse");
+        assert_eq!(cfg.ssm_d_conv, 4);
+
+        keys.last_mut().unwrap().1 = 0;
+        let Err(err) = config_from_fixture("q35-conv0", &arch_fixture("qwen35", &keys)) else {
+            panic!("ssm.conv_kernel = 0 must fail");
+        };
+        assert_eq!(err.to_string(), "qwen35.ssm.conv_kernel must be positive");
+    }
+
+    /// qwen35's reference reads `attention.recurrent_layers` before `full_attention_interval`;
+    /// infr places layers by the interval alone, so the key is accepted only when it says the
+    /// same thing, and a different layout (or a wrong-length array) is refused by name.
+    #[test]
+    fn qwen35_recurrent_layers_must_match_the_interval() {
+        let with = |tag: &str, layers: Meta| {
+            let mut keys = QWEN35_BASE_KEYS.to_vec();
+            keys.retain(|(k, _)| *k != "block_count");
+            keys.push(("block_count", 4));
+            keys.push(("ssm.conv_kernel", 4));
+            keys.push(("full_attention_interval", 2));
+            let mut m = arch_fixture("qwen35", &keys);
+            m.meta
+                .push(("qwen35.attention.recurrent_layers".into(), layers));
+            config_from_fixture(tag, &m)
+        };
+        let cfg = with(
+            "q35-recr-periodic",
+            Meta::BoolArr(vec![true, false, true, false]),
+        )
+        .expect("the interval's own layout must parse");
+        assert!(cfg.is_qwen35_attn_layer(1) && !cfg.is_qwen35_attn_layer(0));
+
+        let Err(err) = with(
+            "q35-recr-other",
+            Meta::BoolArr(vec![true, true, false, false]),
+        ) else {
+            panic!("a non-periodic layout must be refused");
+        };
+        assert!(
+            err.to_string().starts_with(
+                "qwen35.attention.recurrent_layers marks block 1 recurrent but infr places"
+            ),
+            "{err}"
+        );
+        let Err(err) = with("q35-recr-short", Meta::BoolArr(vec![true, false])) else {
+            panic!("a wrong-length array must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "qwen35.attention.recurrent_layers has 2 entries; block_count is 4"
+        );
+        // One scalar for every block: all-recurrent is not the interval's layout.
+        assert!(with("q35-recr-scalar", Meta::Bool(true)).is_err());
+    }
+
+    /// B133: a shared gemma4 layer reads its K/V from an earlier own-KV layer
+    /// (`kv_src_layer`), so `shared_kv_layers` must leave enough own-KV layers to point at.
+    #[test]
+    fn gemma4_shared_kv_layers_must_leave_own_kv_layers() {
+        let keys = |shared: u32| {
+            [
+                ("block_count", 4),
+                ("embedding_length", 8),
+                ("attention.head_count", 2),
+                ("attention.head_count_kv", 1),
+                ("feed_forward_length", 16),
+                ("attention.sliding_window", 4),
+                ("attention.shared_kv_layers", shared),
+            ]
+        };
+        let cfg = config_from_fixture("g4-shared2", &arch_fixture("gemma4", &keys(2)))
+            .expect("two own-KV layers must parse");
+        assert_eq!(cfg.n_layer_kv_from_start, 2);
+        for il in 0..cfg.n_layer {
+            assert!(cfg.kv_src_layer(il) < cfg.n_layer_kv_from_start);
+        }
+
+        for shared in [3, 4, 5] {
+            let name = format!("g4-shared{shared}");
+            let Err(err) = config_from_fixture(&name, &arch_fixture("gemma4", &keys(shared)))
+            else {
+                panic!("shared_kv_layers = {shared} of 4 must fail");
+            };
+            assert!(
+                err.to_string().starts_with(&format!(
+                    "gemma4.attention.shared_kv_layers = {shared} leaves"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    /// The compressed-tier rope divisors of a V4-Flash-shaped config (compress base 160000,
+    /// `n_rot` 64, YaRN factor 16 over an original context of 65536), against ggml's formulas
+    /// written out here in f64 rather than through `yarn_freq_divisors`:
+    ///
+    /// - `ggml_rope_yarn_corr_dim(n_dims, n_ctx_orig, beta, base)
+    ///   = n_dims · ln(n_ctx_orig / (2π·beta)) / (2·ln base)`, truncated to
+    ///   `[floor(corr(beta_fast = 32)), ceil(corr(beta_slow = 1))]` = `[15, 25]`
+    ///   (15.45… and 24.70… before truncation).
+    /// - `rope_yarn_ramp(15, 25, 2p) = 1 − clamp((p − 15) / 10, 0, 1)`, and with `ext_factor = 1`
+    ///   the angle is `θe·(fs·(1 − ramp) + ramp)` with `fs = 1/16`, so the divisor is
+    ///   `1 / (fs + (1 − fs)·ramp)`.
+    ///
+    /// Pair 0 and the start corner (pair 15) are unscaled (1), the end corner (pair 25) and the
+    /// last pair are fully interpolated (16), and the ramp's interior is checked at three pairs.
+    #[test]
+    fn dsv4_compressed_rope_divisors_match_ggml_yarn_closed_form() {
+        let cfg = Config {
+            deepseek4: true,
+            rope_dim: 64,
+            compress_rope_theta: 160000.0,
+            rope_theta: 10000.0,
+            rope_scaling_yarn: true,
+            rope_scaling_factor: 16.0,
+            rope_scaling_orig_ctx: 65536,
+            rope_yarn_beta_fast: 32.0,
+            rope_yarn_beta_slow: 1.0,
+            ..Default::default()
+        };
+        let corr = |beta: f64| {
+            64.0 * (65536.0 / (2.0 * std::f64::consts::PI * beta)).ln() / (2.0 * 160000f64.ln())
+        };
+        assert_eq!((corr(32.0).floor(), corr(1.0).ceil()), (15.0, 25.0));
+
+        let ff = cfg.dsv4_compressed_rope_divisors().expect("deepseek4");
+        assert_eq!(ff.len(), 32);
+        let fs = 1.0 / 16.0;
+        let closed = |p: f64| {
+            let ramp = 1.0 - ((p - 15.0) / 10.0).clamp(0.0, 1.0);
+            1.0 / (fs + (1.0 - fs) * ramp)
+        };
+        for (p, want) in [
+            (0, 1.0),
+            (15, 1.0),
+            (16, 1.0 / 0.90625),
+            (20, 1.0 / 0.53125),
+            (24, 6.4),
+            (25, 16.0),
+            (31, 16.0),
+        ] {
+            assert!(
+                (closed(p as f64) - want).abs() < 1e-12,
+                "closed form at pair {p}"
+            );
+            let got = ff[p] as f64;
+            assert!(
+                (got - want).abs() <= 1e-6 * want,
+                "pair {p}: got {got}, want {want}"
+            );
+        }
+
+        // Without YaRN the same config has no ramp: a factor of 1 leaves every pair unscaled, and a
+        // "linear" factor divides every pair alike. Neither arch nor base matters to that.
+        let plain = Config {
+            rope_scaling_yarn: false,
+            rope_scaling_factor: 1.0,
+            ..cfg.clone()
+        };
+        assert_eq!(plain.dsv4_compressed_rope_divisors(), Some(vec![1.0; 32]));
+        let linear = Config {
+            rope_scaling_yarn: false,
+            ..cfg.clone()
+        };
+        assert_eq!(linear.dsv4_compressed_rope_divisors(), Some(vec![16.0; 32]));
+        let not_v4 = Config {
+            deepseek4: false,
+            ..cfg
+        };
+        assert_eq!(not_v4.dsv4_compressed_rope_divisors(), None);
     }
 }

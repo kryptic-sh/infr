@@ -1,7 +1,7 @@
 //! Per-layer weight handles + the persistent seam session state ([`SeamKv`]/[`SeamWeights`]).
 //! Pure-move split of `seam.rs` — see `super` for the module overview.
+use super::common_prefix_len;
 use super::sc::{DenoiseCache, SelfCondWeights};
-use super::{common_prefix_len, kv_fmt_bytes};
 use crate::Config;
 use anyhow::{anyhow, Result as AResult};
 use infr_core::backend::{Backend, Buffer, BufferUsage};
@@ -101,15 +101,29 @@ pub(super) struct MoeSharedW {
 /// per-layer embeddings) stays on [`LayerW`].
 pub(super) struct AttnW {
     pub(super) wq: TensorId,
-    pub(super) wk: Option<TensorId>,
+    pub(super) wk: TensorId,
     pub(super) wv: Option<TensorId>,
-    // Qwen2/2.5 q/k/v projection biases (`Config::qkv_bias`); `None` on every bias-free arch.
+    // q/k/v projection biases (`Config::qkv_bias`, e.g. Qwen2/2.5); `None` on a bias-free file.
     pub(super) qb: Option<TensorId>,
     pub(super) kb: Option<TensorId>,
     pub(super) vb: Option<TensorId>,
     pub(super) q_norm: Option<TensorId>,
     pub(super) k_norm: Option<TensorId>,
     pub(super) wo: TensorId,
+    /// LFM3's `attn_gate.weight` `[n_embd, n_head]`: one sigmoid gate logit per head, projected
+    /// from the attention input and applied to that head's output before `wo` (`Op::HeadGate`).
+    /// `None` on every other arch.
+    pub(super) head_gate: Option<TensorId>,
+}
+
+/// LFM's gated short-convolution mixer (`build_lfm_shortconv`): `in_proj` to B | C | X, the
+/// depthwise causal conv over `B ⊙ X` (`Op::ShortConv`), `out_proj`. Like [`DeltaW`] it owns no
+/// KV cache — its conv history is session state held in the layer's `kbufs` slot (see
+/// `Config::recurrent_state_elems`).
+pub(super) struct ShortConvW {
+    pub(super) in_proj: TensorId,
+    pub(super) conv: TensorId,
+    pub(super) out_proj: TensorId,
 }
 
 /// qwen35 gated-DeltaNet linear-attention mixer weights (see `docs/qwen35.md`). Unlike `AttnW` this
@@ -179,17 +193,12 @@ pub(super) struct IndexerW {
     pub(super) attn_q_b: TensorId,
 }
 
-/// DeepSeek V4's attention-mixer weights — the `compress_ratio == 0` (pure sliding-window) tier.
-/// See `docs/deepseek.md` § Stage 4.
+/// DeepSeek V4's attention-mixer weights. See `docs/deepseek.md` § Stage 4.
 ///
 /// V4 is NOT MLA: there is no `kv_lora_rank`, no `wk_b`/`wv_b`, and one MQA KV head serves every
 /// query head. What it keeps from deepseek2 is the Q-LoRA triple; everything after it is its own.
-///
-/// The compressor / lightning-indexer tensors a ratio-4 or ratio-128 layer additionally carries
-/// (`attn_compressor_*`, `indexer*`) have NO handles here: `generate_dense_backend` refuses a model
-/// with any non-zero ratio before the graph is built, so a layer that owns them never reaches the
-/// emit. Adding them means adding the compressed-KV state machine at the same time — see
-/// `docs/backlog.md` § B-DSV4-WIRING slice B.
+/// A compressed layer (ratio 4 or 128) also carries its compressor, and a ratio-4 layer the
+/// lightning indexer: [`Dsv4W::comp`].
 pub(super) struct Dsv4W {
     /// `attn_sinks.weight` `[n_head]` — one learned logit per query head, joining the softmax MAX
     /// and DENOMINATOR and never the numerator (`Op::Attention::sinks`).
@@ -212,6 +221,43 @@ pub(super) struct Dsv4W {
     /// `attn_output_b` `[o_group_count*o_lora_rank, n_embd]`.
     pub(super) wo_a: TensorId,
     pub(super) wo_b: TensorId,
+    /// The compressor of a ratio-4 or ratio-128 layer; `None` on a ratio-0 layer. Uploaded AFTER
+    /// the layer's hyper-connection triples (`deepseek4.cpp::load_arch_tensors`' order), so it is
+    /// declared after them too.
+    pub(super) comp: Option<Dsv4CompW>,
+}
+
+/// One V4 compressor's four tensors (`attn_compressor_*`, or the indexer's own
+/// `indexer_compressor_*`). `coff` below is 2 for the overlapping CSA/LID compressors and 1 for
+/// HCA.
+pub(super) struct Dsv4CompressorW {
+    /// `*_kv.weight` `[n_embd, coff*width]`: the rows a block pools.
+    pub(super) kv: TensorId,
+    /// `*_gate.weight` `[n_embd, coff*width]`: their pooling scores, before the APE row.
+    pub(super) gate: TensorId,
+    /// `*_ape.weight` `[coff*width, ratio]`: one score row per position within a block, added by
+    /// `pos % ratio`.
+    pub(super) ape: TensorId,
+    /// `*_norm.weight` `[width]`: the RMSNorm gain on each pooled row.
+    pub(super) norm: TensorId,
+}
+
+/// A compressed V4 layer's compressor, and on a ratio-4 layer its lightning indexer.
+pub(super) struct Dsv4CompW {
+    pub(super) attn: Dsv4CompressorW,
+    /// The ratio-4 layer's indexer; `None` on HCA layers.
+    pub(super) indexer: Option<Dsv4IndexerW>,
+}
+
+/// A ratio-4 V4 layer's lightning indexer: its query and weight projections, and the compressor
+/// that writes its key cache (`kv_lid`). V4's indexer has no `attn_k` and no `k_norm`, unlike
+/// V3.2's [`IndexerW`]. The CSA emit (`super::dsv4_emit`) reads it.
+pub(super) struct Dsv4IndexerW {
+    /// `indexer.proj.weight` `[n_embd, indexer_n_head]`.
+    pub(super) proj: TensorId,
+    /// `indexer.attn_q_b.weight` `[q_lora_rank, indexer_n_head * indexer_head_size]`.
+    pub(super) attn_q_b: TensorId,
+    pub(super) comp: Dsv4CompressorW,
 }
 
 /// One hyper-connection block's `(fn, base, scale)` triple. `w_fn` is the mixing matmul's weight
@@ -231,10 +277,12 @@ pub(super) struct LayerHcW {
     pub(super) ffn: HcTriple,
 }
 
-/// The layer's token mixer: classic attention, qwen35 gated-DeltaNet, DeepSeek MLA, or DeepSeek V4.
+/// The layer's token mixer: classic attention, qwen35 gated-DeltaNet, LFM short convolution,
+/// DeepSeek MLA, or DeepSeek V4.
 pub(super) enum MixerW {
     Attn(AttnW),
     DeltaNet(DeltaW),
+    ShortConv(ShortConvW),
     Mla(MlaW),
     Dsv4(Dsv4W),
 }
@@ -271,17 +319,16 @@ pub(super) struct LayerW {
 pub(crate) struct SessionStable {
     /// Per-layer presence of an explicit V projection (gemma4 full-attention layers omit it).
     pub(super) has_wv: Vec<bool>,
-    /// Per-layer presence of the K projection and K norm (gemma4 KV-shared layers may omit both).
-    pub(super) has_wk: Vec<bool>,
-    pub(super) has_k_norm: Vec<bool>,
     /// gemma4 per-layer output scalar (`layer_output_scale` / `enc_layer_output_scale`), dequanted.
     pub(super) out_scale: Vec<Option<f32>>,
     /// diffusion-gemma DECODER per-layer output scalar (`layer_output_scale`), dequanted.
     pub(super) dec_out_scale: Vec<Option<f32>>,
-    /// gemma4 proportional-RoPE frequency divisors (`rope_freqs.weight`), dequanted.
+    /// Rope frequency divisors (`rope_freqs.weight`), dequanted — `Some` only on an arch that
+    /// applies them (`Config::rope_freq_factors`) and a file that carries the tensor.
     pub(super) rope_freqs: Option<Vec<f32>>,
     /// DeepSeek V2+ YaRN per-pair frequency divisors (`qk_rope_dim/2` floats), computed from
-    /// `rope_scaling_factor`/`n_ctx_train`/`rope_theta` — see `runner::session_stable`.
+    /// `rope_scaling_factor`/`n_ctx_train`/`rope_theta` — see `runner::session_stable`. On
+    /// DeepSeek V4, the divisors of its compressed layers' ropes instead.
     pub(super) yarn_ff: Option<Vec<f32>>,
     /// Combined gate+up FFN upload decision.
     pub(super) fuse_gu: bool,
@@ -297,14 +344,12 @@ pub(crate) struct SeamKv {
     pub(super) weights: std::sync::Arc<SeamWeights>,
     /// Session-stable pure derivations (see [`SessionStable`]) — shared across warm calls + forks.
     pub(super) stable: std::sync::Arc<SessionStable>,
-    /// Per-layer KV cache buffers. `Arc` so a pooled layer can point every slot of a session at
-    /// the one buffer that holds that layer's pages (see [`crate::seam::KvPool`]); a linearly
-    /// cached layer still owns its buffer outright.
-    pub(super) kbufs: Vec<std::sync::Arc<dyn Buffer>>,
-    pub(super) vbufs: Vec<std::sync::Arc<dyn Buffer>>,
-    /// This slot's pages, when the session runs `kv.paged`: its blocks in the pool plus the table
-    /// every attention read of a pooled layer goes through. `None` for a linear slot.
-    pub(super) paged: Option<crate::seam::PagedSlot>,
+    pub(super) kbufs: Vec<Box<dyn Buffer>>,
+    pub(super) vbufs: Vec<Box<dyn Buffer>>,
+    /// Per layer, a DeepSeek V4 compressed layer's block caches and compressor state rings, in
+    /// `crate::seam::dsv4_comp_bufs` order; empty for every other layer and arch. The rings are
+    /// session state like a recurrent layer's (`Config::has_unrewindable_state`).
+    pub(super) cbufs: Vec<Vec<Box<dyn Buffer>>>,
     /// KV cache element dtypes, chosen per-side (K and V independent). Fork/seed reuse them so a
     /// forked slot sizes + copies its buffers to match this slot's layout.
     pub(super) k_fmt: DType,
@@ -319,11 +364,25 @@ pub(crate) struct SeamKv {
     /// their own read it back from here ([`SeamKv::max_ctx`]) once the first generation returns.
     pub(super) max_ctx: usize,
     /// Whether this session's SWA layers were allocated as window-sized RINGS (see
-    /// `crate::seam::kv_rows`): fork must size its buffers identically, and seed must respect
+    /// `crate::seam::kv_rows_at`): fork must size its buffers identically, and seed must respect
     /// that a wrapped ring no longer retains the early prefix rows a seed would copy.
     pub(super) kv_ring: bool,
+    /// The prefill chunk height the ring rows were sized with (`crate::seam::kv_rows_at`'s
+    /// `ubatch`). Recorded rather than re-read because `crate::seam::ubatch_rows` answers for
+    /// whatever placement scope is current, and the conversation-slot pickers fork and seed
+    /// before the session's scope is entered — with the process fallback, a session whose
+    /// placement pinned a shorter chunk would size a fork's rings, and judge a seed's wrap, on a
+    /// height its buffers never had.
+    pub(super) ubatch: usize,
     /// Token ids whose KV rows are materialized (prompt + generated of the last turn).
     pub(super) cached: Vec<u32>,
+    /// One past the highest position any execute on this slot may have written since it last
+    /// started from position 0 — at or past `cached.len()`, because an aborted prefill, a chained
+    /// decode that stopped early and an earlier longer turn all wrote positions `cached` does not
+    /// record. Two readers need it where `cached` would mislead: an SWA ring row holds position
+    /// `p` only while nothing at or past `p + rows` has been written, and qwen35's recurrent state
+    /// has consumed exactly this many tokens, so it matches `cached` only when the two are equal.
+    pub(super) written_end: usize,
     /// Phase-A perf: DiffusionGemma canvas-denoise plan + staging buffers, `None` for every
     /// non-diffusion-gemma caller (never populated). Reset to `None` whenever the (cc, p) key
     /// changes (see `DenoiseCache`).
@@ -341,9 +400,9 @@ pub(crate) struct SeamKv {
     /// Perf (Vulkan only — see docs/diffusion-gemma.md's Phase-B "sc round-trip" elimination):
     /// ping-pong pair of persistent `[cc*vocab]` device buffers backing the denoise loop's canvas
     /// logits, so the previous step's raw output is already GPU-resident for this step's
-    /// self-conditioning softmax input — no host download+reupload. Session-lifetime: `cc`/vocab
-    /// are fixed for the whole session, so this pair survives every `denoise_cache` rebuild
-    /// (block boundaries, the sc off→on plan-shape transition). `None` until the first Vulkan
+    /// self-conditioning softmax input — no host download+reupload. Kept across `denoise_cache`
+    /// rebuilds (block boundaries, the sc off→on plan-shape transition) and reallocated only when
+    /// the canvas length changes (`sc::ensure_sc_ping`). `None` until the first Vulkan
     /// denoise call; stays `None` forever on Metal/CPU (they keep the original per-plan-owned
     /// `DenoiseCache::logits_buf`/`sc_logits_buf`).
     pub(super) sc_ping: Option<[Box<dyn Buffer>; 2]>,
@@ -355,25 +414,160 @@ pub(crate) struct SeamKv {
     /// dynamic-scale softmax (`Op::Softmax::scale_buf`) instead of a per-step host premultiply of
     /// the whole `[cc, vocab]` logits buffer. Lazily allocated alongside `sc_ping`.
     pub(super) sc_temp_inv_buf: Option<Box<dyn Buffer>>,
-    /// MTP spec-decode rollback checkpoint (`mtp_snapshot_delta`/`mtp_restore_delta`): a device-
-    /// resident copy of every qwen35 DeltaNet layer's recurrent state at the last CLEAN committed
-    /// boundary, plus the cached-token length there. Lets a partial-accept cycle roll the trunk's
-    /// draft-polluted state back to a committed prefix and re-prefill only the short accepted suffix,
-    /// instead of qwen35's default full re-prefill-from-zero (its append-only DeltaNet state can't
-    /// rewind by cache truncation the way a per-position KV cache can — see the `c.qwen35` branch in
-    /// `generate_dense_backend`'s `start` computation). `None` for every non-MTP caller.
+    /// qwen35 rollback checkpoint (`mtp_snapshot_delta`/`mtp_restore_delta`, and the
+    /// `snapshot_delta`/`restore_delta` they wrap): a device-resident copy of every DeltaNet
+    /// layer's recurrent state at the last CLEAN committed boundary, plus the cached-token length
+    /// there. Its append-only state can't rewind by cache truncation the way a per-position KV
+    /// cache can (see the recurrent-state branch in `generate_dense_backend`'s `start`), so
+    /// this is what lets a turn resume from that boundary instead of re-prefilling from zero. Two
+    /// writers: MTP spec decode (a partial-accept cycle rolls back to the committed prefix) and
+    /// the decode loop, which snapshots the prefill boundary before a chained decode that may run
+    /// past its stop. `None` until one of them first needs it.
     pub(super) mtp_delta_ckpt: Option<MtpDeltaCkpt>,
+    /// The decode loop's prefill-boundary snapshot failed once on this slot (no room for a second
+    /// copy of the state), so it is not attempted again.
+    pub(super) delta_snapshot_refused: bool,
 }
 
-/// The device-resident DeltaNet-state snapshot backing [`SeamKv::mtp_snapshot_delta`] — one
-/// conv-state + one S-state buffer per qwen35 DeltaNet layer (parallel to `layers`), plus the
-/// cached-token length the snapshot corresponds to. Allocated once (lazily) and reused every cycle.
+/// The device-resident recurrent-state snapshot backing [`snapshot_delta`] — a copy of both state
+/// buffers of every recurrent layer (`Config::is_recurrent_layer`: qwen35 DeltaNet, LFM short
+/// convolution; parallel to `layers`), plus the cached-token length the snapshot corresponds to.
+/// Allocated once (lazily) and reused every cycle. Its size is the live recurrent state's
+/// (`Config::recurrent_state_elems`).
 pub(super) struct MtpDeltaCkpt {
     kbufs: Vec<Box<dyn Buffer>>,
     vbufs: Vec<Box<dyn Buffer>>,
-    /// The layer indices (into `SeamKv::kbufs`/`vbufs`) that are DeltaNet mixers.
+    /// The layer indices (into `SeamKv::kbufs`/`vbufs`) that are recurrent.
     layers: Vec<usize>,
     cached_len: usize,
+    /// False once the slot's tokens no longer start with the ones the snapshot consumed (a reset
+    /// or a zeroed state): restoring it then would resume from a prefix that is not there.
+    valid: bool,
+}
+
+/// Snapshot the recurrent state in `kbufs`/`vbufs` into `ckpt` (allocated on first use, through
+/// the same `KvCache` allocation as the state itself), recording that it has consumed
+/// `cached_len` tokens: one `Backend::copy_buffer` per state buffer. A no-op on a model with no
+/// recurrent layers.
+pub(super) fn snapshot_delta(
+    be: &dyn Backend,
+    cfg: &Config,
+    kbufs: &[Box<dyn Buffer>],
+    vbufs: &[Box<dyn Buffer>],
+    ckpt: &mut Option<MtpDeltaCkpt>,
+    cached_len: usize,
+) -> AResult<()> {
+    if ckpt.is_none() {
+        let layers: Vec<usize> = (0..cfg.n_layer)
+            .filter(|&l| cfg.is_recurrent_layer(l))
+            .collect();
+        if layers.is_empty() {
+            return Ok(());
+        }
+        let mut ck_k = Vec::with_capacity(layers.len());
+        let mut ck_v = Vec::with_capacity(layers.len());
+        for &l in &layers {
+            ck_k.push(
+                be.alloc(kbufs[l].len_bytes().max(1), BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+            ck_v.push(
+                be.alloc(vbufs[l].len_bytes().max(1), BufferUsage::KvCache)
+                    .map_err(|e| anyhow!("{e}"))?,
+            );
+        }
+        *ckpt = Some(MtpDeltaCkpt {
+            kbufs: ck_k,
+            vbufs: ck_v,
+            layers,
+            cached_len: 0,
+            valid: false,
+        });
+    }
+    let ck = ckpt.as_mut().expect("just ensured Some");
+    // Invalid until every copy has landed, so a failed copy cannot leave a half-written snapshot
+    // that claims to be restorable.
+    ck.valid = false;
+    for (i, &l) in ck.layers.iter().enumerate() {
+        be.copy_buffer(
+            kbufs[l].as_ref(),
+            ck.kbufs[i].as_ref(),
+            kbufs[l].len_bytes(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        be.copy_buffer(
+            vbufs[l].as_ref(),
+            ck.vbufs[i].as_ref(),
+            vbufs[l].len_bytes(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+    }
+    ck.cached_len = cached_len;
+    ck.valid = true;
+    Ok(())
+}
+
+/// Copy a valid `ckpt` back over the live DeltaNet state and return the token count it consumed,
+/// or `None` (nothing copied) when there is no valid snapshot.
+pub(super) fn restore_delta(
+    be: &dyn Backend,
+    kbufs: &[Box<dyn Buffer>],
+    vbufs: &[Box<dyn Buffer>],
+    ckpt: &Option<MtpDeltaCkpt>,
+) -> AResult<Option<usize>> {
+    let Some(ck) = ckpt.as_ref().filter(|ck| ck.valid) else {
+        return Ok(None);
+    };
+    for (i, &l) in ck.layers.iter().enumerate() {
+        be.copy_buffer(
+            ck.kbufs[i].as_ref(),
+            kbufs[l].as_ref(),
+            ck.kbufs[i].len_bytes(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+        be.copy_buffer(
+            ck.vbufs[i].as_ref(),
+            vbufs[l].as_ref(),
+            ck.vbufs[i].len_bytes(),
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+    }
+    Ok(Some(ck.cached_len))
+}
+
+/// The token count a valid `ckpt` has consumed, or `None` when there is nothing to restore.
+pub(super) fn delta_snapshot_len(ckpt: &Option<MtpDeltaCkpt>) -> Option<usize> {
+    ckpt.as_ref().filter(|ck| ck.valid).map(|ck| ck.cached_len)
+}
+
+/// Mark `ckpt` unusable: the tokens it consumed are no longer the slot's prefix.
+pub(super) fn invalidate_delta(ckpt: &mut Option<MtpDeltaCkpt>) {
+    if let Some(ck) = ckpt.as_mut() {
+        ck.valid = false;
+    }
+}
+
+/// Allocate every layer's DeepSeek V4 compressed-tier buffers (`crate::seam::dsv4_comp_bufs`) for
+/// a `max_ctx`-token session whose raw cache is `k_fmt`: one list per layer, empty for a layer
+/// that has none. Their contents are not read before the session's first turn resets the rings
+/// and commits the blocks it attends (`runner::zero_unrewindable_state` has the invariant).
+pub(super) fn alloc_dsv4_comp_bufs(
+    be: &dyn Backend,
+    cfg: &Config,
+    max_ctx: usize,
+    k_fmt: DType,
+) -> AResult<Vec<Vec<Box<dyn Buffer>>>> {
+    (0..cfg.n_layer)
+        .map(|l| {
+            crate::seam::dsv4_comp_bufs(cfg, l, max_ctx, k_fmt)
+                .iter()
+                .map(|b| {
+                    be.alloc(b.bytes(), BufferUsage::KvCache)
+                        .map_err(|e| anyhow!("{e}"))
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// The upload-once half of a [`SeamKv`]: weight buffers + their declared (dtype, numel) specs and
@@ -381,7 +575,6 @@ pub(super) struct MtpDeltaCkpt {
 pub(crate) struct SeamWeights {
     pub(super) wbufs: Vec<Box<dyn Buffer>>,
     pub(super) wspecs: Vec<(DType, usize)>,
-    pub(super) exl3_specs: std::collections::HashMap<usize, infr_core::Exl3Spec>,
     pub(super) rf_buf: Option<(Box<dyn Buffer>, usize)>,
     /// DeepSeek V2+ YaRN per-pair frequency divisors (`yarn_ff`), uploaded once like `rf_buf`.
     pub(super) yff_buf: Option<(Box<dyn Buffer>, usize)>,
@@ -389,16 +582,26 @@ pub(crate) struct SeamWeights {
     pub(super) layer_has_epb: Vec<bool>,
 }
 
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-/// A borrowed view of one layer's KV cache (see [`SeamKv::kv_layer`]).
-pub(crate) struct KvLayerView<'a> {
-    pub(crate) k: &'a dyn Buffer,
-    pub(crate) v: &'a dyn Buffer,
-    pub(crate) k_fmt: DType,
-    pub(crate) v_fmt: DType,
-    pub(crate) ring: bool,
+/// What a cold init bound for one backend and derived from the model: the weights and the
+/// session-stable derivations, without any KV. A caller that keeps its backend across generations
+/// hands this back (`runner::generate_dense_backend_bound`), so the next cold init allocates only
+/// its KV and IO buffers. Valid only on the backend that bound it, which is why the CPU path keeps
+/// the two together in one `crate::seam::CpuResident`.
+pub(crate) struct BoundWeights {
+    pub(super) weights: std::sync::Arc<SeamWeights>,
+    pub(super) stable: std::sync::Arc<SessionStable>,
 }
 
+impl BoundWeights {
+    /// The bound weights' identity: equal across two generations exactly when the second reused
+    /// the first's.
+    #[cfg(test)]
+    pub(crate) fn weights_ptr(&self) -> *const SeamWeights {
+        std::sync::Arc::as_ptr(&self.weights)
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
 impl SeamKv {
     /// The context this slot's KV cache was allocated for — the AUTHORITY on a session's window,
     /// because the cold init may have re-clamped the caller's `want_ctx` against the device's live
@@ -422,6 +625,17 @@ impl SeamKv {
     #[cfg(target_os = "macos")]
     pub(crate) fn reset_tokens(&mut self) {
         self.cached.clear();
+        invalidate_delta(&mut self.mtp_delta_ckpt);
+    }
+
+    /// The rows the shortest sliding-window ring of this slot holds, or `None` when its window
+    /// layers keep full-context caches (no ring, or no window layer). A slot that has written
+    /// past that many positions has wrapped the ring and recycled its earliest rows.
+    pub(crate) fn window_ring_rows(&self, be: &dyn Backend, cfg: &Config) -> Option<usize> {
+        if !self.kv_ring {
+            return None;
+        }
+        crate::seam::window_ring_rows(cfg, self.max_ctx, self.ubatch, be.kv_row_align())
     }
 
     /// Number of token ids materialized in this slot's KV cache.
@@ -429,251 +643,135 @@ impl SeamKv {
         self.cached.len()
     }
 
-    /// Layer `l`'s K and V cache buffers, their formats, and whether SWA layers use ring rows —
-    /// what a draft model that attends this cache must declare to read it.
-    pub(crate) fn kv_layer(&self, l: usize) -> KvLayerView<'_> {
-        KvLayerView {
-            k: self.kbufs[l].as_ref(),
-            v: self.vbufs[l].as_ref(),
-            k_fmt: self.k_fmt,
-            v_fmt: self.v_fmt,
-            ring: self.kv_ring,
+    /// This slot's weights and session-stable derivations, shared (`Arc`) rather than copied.
+    pub(crate) fn bound(&self) -> BoundWeights {
+        BoundWeights {
+            weights: std::sync::Arc::clone(&self.weights),
+            stable: std::sync::Arc::clone(&self.stable),
         }
+    }
+
+    /// Whether this slot runs on `bound`'s weights (the same allocation, not an equal copy).
+    pub(crate) fn shares(&self, bound: &BoundWeights) -> bool {
+        std::sync::Arc::ptr_eq(&self.weights, &bound.weights)
     }
 
     /// Forget the materialized tokens (the KV rows become dead; the next prompt prefills from
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
-        if let Some(p) = &mut self.paged {
-            p.release_pages();
-        }
+        invalidate_delta(&mut self.mtp_delta_ckpt);
     }
 
-    /// The (K, V) dtypes this slot's cache uses — what a session pool must be built with.
-    pub(crate) fn kv_fmts(&self) -> (DType, DType) {
-        (self.k_fmt, self.v_fmt)
-    }
-
-    /// Whether this slot serves its pooled layers out of a page pool.
-    pub(crate) fn is_paged(&self) -> bool {
-        self.paged.is_some()
-    }
-
-    /// The store bias for ONE layer: its block's first row when that layer is pooled, else 0 — a
-    /// slot's sliding-window, recurrent and compressed layers keep private buffers that still start
-    /// at row 0.
-    pub(crate) fn paged_row_base_at(&self, cfg: &Config, l: usize) -> usize {
-        match &self.paged {
-            Some(p) if crate::seam::paged_layer(cfg, l) => p.row_base(),
-            _ => 0,
-        }
-    }
-
-    /// Turn this slot's pooled layers into blocks of `pool`: move the rows it already holds into
-    /// its block, point the layer buffers at the pool, and materialize the table. Linear layers
-    /// keep their private buffers.
-    pub(crate) fn attach_paged(
-        &mut self,
-        be: &dyn Backend,
-        cfg: &Config,
-        pool: &std::sync::Arc<crate::seam::KvPool>,
-    ) -> AResult<()> {
-        let slot = crate::seam::PagedSlot::new(pool, be)?;
-        let block = slot.map.block();
-        let rows = self.cached.len().min(pool.slot_rows());
-        for l in 0..cfg.n_layer {
-            let Some(dst) = pool.k(l) else { continue };
-            if rows > 0 {
-                pool.import_rows(
-                    be,
-                    l,
-                    block,
-                    rows,
-                    self.kbufs[l].as_ref(),
-                    self.vbufs[l].as_ref(),
-                )?;
-            }
-            self.kbufs[l] = std::sync::Arc::clone(dst);
-            self.vbufs[l] = std::sync::Arc::clone(pool.v(l).expect("pooled layer has both sides"));
-        }
-        self.paged = Some(slot);
-        let layers = (0..cfg.n_layer).filter(|&l| pool.k(l).is_some()).count();
-        tracing::info!(
-            "kv.paged: {} of {} layers in {} pool blocks of {} rows; this slot's block starts at \
-             row {}",
-            layers,
-            cfg.n_layer,
-            pool.blocks(),
-            pool.slot_rows(),
-            self.paged.as_ref().expect("just set").row_base(),
-        );
-        Ok(())
-    }
-
-    /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
-    /// Snapshot the qwen35 DeltaNet recurrent state (every DeltaNet layer's conv + S buffers) plus
-    /// the current `cached` length into the device-resident [`MtpDeltaCkpt`] (allocated once on the
-    /// first call). The MTP spec-decode loop calls this at a CLEAN committed boundary (after the
-    /// prime prefill and after every fully-accepted cycle) so a later partial-accept cycle can roll
-    /// back to it via [`mtp_restore_delta`]. A no-op on a non-qwen35 model (no DeltaNet layers). The
-    /// snapshot is a pure device→device buffer copy (`Backend::copy_buffer`), never a host bounce.
+    /// Snapshot the recurrent state (both state buffers of every recurrent layer:
+    /// `Config::is_recurrent_layer`) plus the current `cached` length into the device-resident
+    /// [`MtpDeltaCkpt`] (allocated once on the first call). The MTP spec-decode loop calls this at
+    /// a CLEAN committed boundary (after the prime prefill and after every fully-accepted cycle) so
+    /// a later partial-accept cycle can roll back to it via [`mtp_restore_delta`]. A no-op on a
+    /// model with no recurrent layers. The snapshot is a pure device→device buffer copy
+    /// (`Backend::copy_buffer`), never a host bounce.
     pub(crate) fn mtp_snapshot_delta(&mut self, be: &dyn Backend, cfg: &Config) -> AResult<()> {
-        if self.mtp_delta_ckpt.is_none() {
-            let layers: Vec<usize> = (0..cfg.n_layer)
-                .filter(|&l| cfg.qwen35 && !cfg.is_qwen35_attn_layer(l))
-                .collect();
-            if layers.is_empty() {
-                return Ok(());
-            }
-            let mut kbufs = Vec::with_capacity(layers.len());
-            let mut vbufs = Vec::with_capacity(layers.len());
-            for &l in &layers {
-                kbufs.push(
-                    be.alloc(self.kbufs[l].len_bytes().max(1), BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-                vbufs.push(
-                    be.alloc(self.vbufs[l].len_bytes().max(1), BufferUsage::KvCache)
-                        .map_err(|e| anyhow!("{e}"))?,
-                );
-            }
-            self.mtp_delta_ckpt = Some(MtpDeltaCkpt {
-                kbufs,
-                vbufs,
-                layers,
-                cached_len: 0,
-            });
-        }
-        let cached_len = self.cached.len();
-        let ck = self.mtp_delta_ckpt.as_ref().expect("just ensured Some");
-        for (i, &l) in ck.layers.iter().enumerate() {
-            be.copy_buffer(
-                self.kbufs[l].as_ref(),
-                ck.kbufs[i].as_ref(),
-                self.kbufs[l].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(
-                self.vbufs[l].as_ref(),
-                ck.vbufs[i].as_ref(),
-                self.vbufs[l].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-        }
-        self.mtp_delta_ckpt
-            .as_mut()
-            .expect("just ensured Some")
-            .cached_len = cached_len;
-        Ok(())
+        snapshot_delta(
+            be,
+            cfg,
+            &self.kbufs,
+            &self.vbufs,
+            &mut self.mtp_delta_ckpt,
+            self.cached.len(),
+        )
     }
 
     /// Restore the DeltaNet state captured by the last [`mtp_snapshot_delta`] and truncate `cached`
     /// back to the snapshot's token length — the MTP loop's rollback after a partial-accept cycle
     /// (drops the rejected drafts the verify forward absorbed into the recurrent state). A no-op
-    /// when no snapshot has been taken yet.
+    /// when there is no valid snapshot.
     pub(crate) fn mtp_restore_delta(&mut self, be: &dyn Backend) -> AResult<()> {
-        let Some(ck) = self.mtp_delta_ckpt.as_ref() else {
+        let Some(len) = restore_delta(be, &self.kbufs, &self.vbufs, &self.mtp_delta_ckpt)? else {
             return Ok(());
         };
-        for (i, &l) in ck.layers.iter().enumerate() {
-            be.copy_buffer(
-                ck.kbufs[i].as_ref(),
-                self.kbufs[l].as_ref(),
-                ck.kbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-            be.copy_buffer(
-                ck.vbufs[i].as_ref(),
-                self.vbufs[l].as_ref(),
-                ck.vbufs[i].len_bytes(),
-            )
-            .map_err(|e| anyhow!("{e}"))?;
-        }
-        self.cached.truncate(ck.cached_len);
+        self.cached.truncate(len);
+        // The restored state has consumed exactly the snapshot's tokens. qwen35 has no SWA ring,
+        // so no row past them is ever read.
+        self.written_end = len;
         Ok(())
     }
 
-    pub(crate) fn fork(
-        &self,
-        be: &dyn Backend,
-        cfg: &Config,
-        ec: &crate::EngineConfig,
-    ) -> AResult<SeamKv> {
+    /// Fork a fresh conversation slot: same (Arc-shared) weights, its own zero KV + IO buffers.
+    pub(crate) fn fork(&self, be: &dyn Backend, cfg: &Config) -> AResult<SeamKv> {
         let e2b = self.ipl_buf.is_some();
         let npl = cfg.n_embd_per_layer.max(1);
-        // A paged slot's forks share its pool: their pooled layers point at the same per-layer
-        // pool buffers and only their page maps differ (see [`crate::seam::KvPool`]).
-        let pool = self
-            .paged
-            .as_ref()
-            .map(|p| std::sync::Arc::clone(p.map.pool()));
-        let mut kbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
-        let mut vbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
+        let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for l in 0..cfg.n_layer {
-            // qwen35 DeltaNet layers: fixed-size conv/S state, NOT a `max_ctx`-scaled KV cache (see
-            // the matching alloc in `generate_dense_backend`'s state init and `MixerW::DeltaNet`).
-            if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
-                let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
-                let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
-                kbufs.push(std::sync::Arc::from(
-                    be.alloc(conv_elems * 4, BufferUsage::KvCache)
+            // Recurrent layers (qwen35 DeltaNet, LFM short convolution): fixed-size state, NOT a
+            // `max_ctx`-scaled KV cache (see the matching alloc in `generate_dense_backend`'s state
+            // init and `Config::recurrent_state_elems`).
+            if let Some((k_elems, v_elems)) = cfg.recurrent_state_elems(l) {
+                kbufs.push(
+                    be.alloc(k_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
-                ));
-                vbufs.push(std::sync::Arc::from(
-                    be.alloc(s_elems * 4, BufferUsage::KvCache)
+                );
+                vbufs.push(
+                    be.alloc(v_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
-                ));
-                continue;
-            }
-            if let Some(pk) = pool.as_ref().and_then(|p| p.k(l)) {
-                kbufs.push(std::sync::Arc::clone(pk));
-                vbufs.push(std::sync::Arc::clone(
-                    pool.as_ref()
-                        .and_then(|p| p.v(l))
-                        .expect("pooled layer has both sides"),
-                ));
+                );
                 continue;
             }
             // Same per-layer geometry as the original allocation — same widths from the same
             // helper (`crate::seam::kv_row_elems`, MLA's compressed K row and placeholder V side
             // included), and SWA layers ring at window+ubatch rows when this session was
-            // ring-sized (see `crate::seam::kv_rows`).
+            // ring-sized (see `crate::seam::kv_rows_at`).
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            let rows_l = crate::seam::kv_rows(cfg, l, self.max_ctx, self.kv_ring, ec);
-            kbufs.push(std::sync::Arc::from(
+            let rows_l = crate::seam::kv_rows_at(
+                cfg,
+                l,
+                self.max_ctx,
+                self.kv_ring,
+                self.ubatch,
+                be.kv_row_align(),
+            );
+            kbufs.push(
                 be.alloc(
                     crate::seam::kv_side_bytes(self.k_fmt, rows_l * k_row),
                     BufferUsage::KvCache,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
-            ));
-            vbufs.push(std::sync::Arc::from(
+            );
+            vbufs.push(
                 be.alloc(
                     crate::seam::kv_side_bytes(self.v_fmt, rows_l * v_row),
                     BufferUsage::KvCache,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
-            ));
+            );
         }
+        let cbufs = alloc_dsv4_comp_bufs(be, cfg, self.max_ctx, self.k_fmt)?;
         // A fork is only usable if its buffers have the SAME geometry as the slot it forked from,
         // and the source's own sizes are right here — so check them instead of trusting two call
         // sites to derive the same width. They did not: the MLA row width was missing from this
-        // one, which allocated a third of what the kernels index (docs/backlog.md B41). Pool
-        // buffers are shared wholesale, so a paged fork has no geometry of its own to check.
-        if pool.is_none() {
-            for l in 0..cfg.n_layer {
-                for (side, forked, src) in [
-                    ("k", kbufs[l].len_bytes(), self.kbufs[l].len_bytes()),
-                    ("v", vbufs[l].len_bytes(), self.vbufs[l].len_bytes()),
-                ] {
-                    if forked != src {
-                        return Err(anyhow!(
-                            "forked KV slot geometry differs from its source at layer {l} ({side}): \
-                             {forked} bytes vs {src} — the fork and the original allocation disagree \
-                             about this layer's cache row"
-                        ));
-                    }
+        // one, which allocated a third of what the kernels index (docs/backlog.md B41).
+        for l in 0..cfg.n_layer {
+            let comp = |bufs: &[Box<dyn Buffer>]| -> Vec<usize> {
+                bufs.iter().map(|b| b.len_bytes()).collect()
+            };
+            if comp(&cbufs[l]) != comp(&self.cbufs[l]) {
+                return Err(anyhow!(
+                    "forked KV slot geometry differs from its source at layer {l}: compressed \
+                     buffers {:?} vs {:?}",
+                    comp(&cbufs[l]),
+                    comp(&self.cbufs[l])
+                ));
+            }
+            for (side, forked, src) in [
+                ("k", kbufs[l].len_bytes(), self.kbufs[l].len_bytes()),
+                ("v", vbufs[l].len_bytes(), self.vbufs[l].len_bytes()),
+            ] {
+                if forked != src {
+                    return Err(anyhow!(
+                        "forked KV slot geometry differs from its source at layer {l} ({side}): \
+                         {forked} bytes vs {src} — the fork and the original allocation disagree \
+                         about this layer's cache row"
+                    ));
                 }
             }
         }
@@ -682,6 +780,7 @@ impl SeamKv {
             stable: std::sync::Arc::clone(&self.stable),
             kbufs,
             vbufs,
+            cbufs,
             k_fmt: self.k_fmt,
             v_fmt: self.v_fmt,
             hidden_buf: be
@@ -703,11 +802,9 @@ impl SeamKv {
                 .map_err(|e| anyhow!("{e}"))?,
             max_ctx: self.max_ctx,
             kv_ring: self.kv_ring,
+            ubatch: self.ubatch,
             cached: Vec::new(),
-            paged: match (&pool, self.paged.as_ref()) {
-                (Some(p), Some(src)) => Some(crate::seam::PagedSlot::fork(p, be, &src.map, 0)?),
-                _ => None,
-            },
+            written_end: 0,
             // The forked slot's KV/weight buffers are new objects, so a cached plan's bindings
             // (which point at the OLD slot's buffers) don't carry over — rebuild lazily on this
             // slot's first denoise call. `self_cond_w`/`sc_embt` are model-derived (not
@@ -723,6 +820,7 @@ impl SeamKv {
             sc_ping_write: 0,
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
+            delta_snapshot_refused: false,
         })
     }
 
@@ -730,21 +828,22 @@ impl SeamKv {
     /// prefix — e.g. the system prompt) via a device-side buffer copy, so the new conversation
     /// skips re-prefilling it. `p` must be ≤ src's materialized length.
     ///
-    /// qwen35: a no-op. The gated-DeltaNet recurrent state is a single fixed-size summary of
-    /// EVERY token fed so far — there's no "first `p` tokens' worth" of it to slice out and copy
-    /// the way a real per-position KV cache allows (see `docs/qwen35.md` and the no-rewind rule in
-    /// `generate_dense_backend`). Leaving `self.cached` empty (this slot's `fork()` already zeroed
-    /// its state) is the CORRECT fallback: the next call on this slot fully re-prefills, exactly
-    /// like the single-slot session's divergent-prompt reset.
+    /// A model whose session cannot be rewound (`Config::has_unrewindable_state`: qwen35, LFM3,
+    /// a DeepSeek V4 file with compressed layers): a no-op. A recurrent state is a single
+    /// fixed-size summary of EVERY token fed so far, and a V4 compressor ring holds the source's
+    /// latest rows whatever position they were for — there's no "first `p` tokens' worth" of
+    /// either to slice out and copy the way a real per-position KV cache allows (see
+    /// `docs/qwen35.md` and the no-rewind rule in `generate_dense_backend`). Leaving
+    /// `self.cached` empty is the CORRECT fallback: the next call on this slot fully re-prefills
+    /// from a reset state, exactly like the single-slot session's divergent-prompt reset.
     pub(crate) fn seed_from(
         &mut self,
         be: &dyn Backend,
         cfg: &Config,
-        ec: &crate::EngineConfig,
         src: &SeamKv,
         p: usize,
     ) -> AResult<()> {
-        if cfg.qwen35 {
+        if cfg.has_unrewindable_state() {
             return Ok(());
         }
         let p = p.min(src.cached.len()).min(self.max_ctx);
@@ -752,73 +851,294 @@ impl SeamKv {
             return Ok(());
         }
         // SWA ring caches: positions [0, p) sit at rows [0, p) ONLY while the source hasn't
-        // wrapped (cached_len <= ring rows) — a wrapped ring recycled exactly those early rows,
+        // wrapped (written_end <= ring rows) — a wrapped ring recycled exactly those early rows,
         // so the plain prefix copy below would seed stale data. Skipping the seed is the CORRECT
         // fallback (the slot just re-prefills the shared prefix); only cross-conversation KV
         // reuse on long conversations is lost. (Seeding a wrapped source's window TAIL would be
         // exact too, but needs two-segment copies per side per layer + a tail-only `cached`
         // semantics — deferred until serve traffic shows it matters.)
-        if self.kv_ring {
-            let wrapped = (0..cfg.n_layer)
-                .filter(|&l| cfg.is_swa_layer(l))
-                .map(|l| crate::seam::kv_rows(cfg, l, self.max_ctx, true, ec))
-                .any(|rows_l| src.cached.len() > rows_l);
-            if wrapped {
-                return Ok(());
-            }
-        }
-        // Paged slots share whole pages: the prefix's pages become the same physical pages in both
-        // slots, and only the partial page at the end is copied.
-        if let (Some(dst), Some(src_paged)) = (self.paged.as_mut(), src.paged.as_ref()) {
-            let page_rows = infr_vulkan::paged::PAGE_ROWS;
-            let pages = p / page_rows;
-            if pages > 0 {
-                dst.map.share_prefix(&src_paged.map, pages);
-                dst.upload_table(be)?;
-                tracing::info!(
-                    "kv.paged: forked slot shares {} pages ({} rows) of the prefix",
-                    pages,
-                    pages * page_rows,
-                );
-            }
-            // The prefix ends inside a page more often than not; the linear path copies those rows,
-            // so a fork that shared nothing (a prefix under one page) must not be worse than it.
-            let tail = p - pages * page_rows;
-            if tail > 0 {
-                dst.copy_tail(be, &src_paged.map, pages, tail)?;
-            }
-            self.cached = src.cached[..p].to_vec();
+        if self
+            .window_ring_rows(be, cfg)
+            .is_some_and(|rows| src.written_end > rows)
+        {
             return Ok(());
         }
         for l in 0..cfg.n_layer {
             // One prefix position is `k_row`/`v_row` elements per side — MLA's compressed row is
             // three times `n_kv * head_dim` wide and has no V side at all, so both widths come
             // from the shared `crate::seam::kv_row_elems` (docs/backlog.md B41).
+            // The backend owns its cache layout (Vulkan's Q8_0 is planar — its scales do not sit
+            // in a byte prefix), so it does the copy; `rows_l * row` is the side's capacity.
             let (k_row, v_row) = crate::seam::kv_row_elems(cfg, l);
-            // A paged slot's pooled rows start at its block's first row, so the copy lands there.
-            let bias = kv_fmt_bytes(self.k_fmt, self.paged_row_base_at(cfg, l) * k_row);
-            be.copy_buffer_at(
+            let rows_l = crate::seam::kv_rows_at(
+                cfg,
+                l,
+                self.max_ctx,
+                self.kv_ring,
+                self.ubatch,
+                be.kv_row_align(),
+            );
+            be.copy_kv_prefix(
                 src.kbufs[l].as_ref(),
-                0,
                 self.kbufs[l].as_ref(),
-                bias,
-                kv_fmt_bytes(self.k_fmt, p * k_row),
+                self.k_fmt,
+                p * k_row,
+                rows_l * k_row,
             )
             .map_err(|e| anyhow!("{e}"))?;
             // `v_row == 0`: this arch caches no V (MLA) and `vbufs[l]` is the placeholder — there
             // is nothing to seed.
             if v_row > 0 {
-                be.copy_buffer_at(
+                be.copy_kv_prefix(
                     src.vbufs[l].as_ref(),
-                    0,
                     self.vbufs[l].as_ref(),
-                    kv_fmt_bytes(self.v_fmt, self.paged_row_base_at(cfg, l) * v_row),
-                    kv_fmt_bytes(self.v_fmt, p * v_row),
+                    self.v_fmt,
+                    p * v_row,
+                    rows_l * v_row,
                 )
                 .map_err(|e| anyhow!("{e}"))?;
             }
         }
         self.cached = src.cached[..p].to_vec();
+        // Rows [0, p) now hold positions [0, p); any older rows hold positions past `p` that
+        // nothing reads before they are rewritten.
+        self.written_end = p;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::seam::{kv_fmt_bytes, kv_side_bytes};
+    use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
+    use infr_core::graph::{AttnMask, Graph, Op};
+    use infr_core::tensor::{DType, TensorDesc};
+
+    const N_HEAD: usize = 2;
+    const N_KV: usize = 2;
+    const HEAD_DIM: usize = 64;
+    /// One cache row: `N_KV * HEAD_DIM`, a whole 128-element turbo block.
+    const ROW: usize = N_KV * HEAD_DIM;
+    /// Rows the cache is sized for, and the shared prefix seeded out of it.
+    const CAP_ROWS: usize = 8;
+    const PREFIX: usize = 3;
+
+    /// Every KV cache format a session can run with.
+    const KV_FORMATS: [DType; 12] = [
+        DType::F32,
+        DType::F16,
+        DType::Bf16,
+        DType::Q8_0,
+        DType::Q4_0,
+        DType::Q4_1,
+        DType::Q5_0,
+        DType::Q5_1,
+        DType::Iq4Nl,
+        DType::Turbo2,
+        DType::Turbo3,
+        DType::Turbo4,
+    ];
+
+    fn values(n: usize, salt: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| (((i * 7 + salt * 13) % 23) as f32 - 11.0) * 0.1 * (1.0 + salt as f32))
+            .collect()
+    }
+
+    fn cache(be: &dyn Backend, fmt: DType) -> Box<dyn Buffer> {
+        be.alloc(kv_side_bytes(fmt, CAP_ROWS * ROW), BufferUsage::KvCache)
+            .expect("alloc KV side")
+    }
+
+    /// Write `rows` rows of `src` into `cache` from row 0 with the backend's own `WriteKv`.
+    fn write_rows(be: &dyn Backend, fmt: DType, cache: &dyn Buffer, src: &[f32], rows: usize) {
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![rows * ROW], DType::F32));
+        let c = g.input(TensorDesc::new(vec![CAP_ROWS * ROW], fmt));
+        g.push(Op::WriteKv {
+            src: x,
+            cache: c,
+            rows: rows as u32,
+            row_stride: ROW as u32,
+            pos: 0,
+        });
+        let plan = be.compile(&g).expect("compile WriteKv");
+        let xb = be
+            .alloc(src.len() * 4, BufferUsage::Activations)
+            .expect("alloc src");
+        be.upload(xb.as_ref(), bytemuck::cast_slice(src))
+            .expect("upload src");
+        let mut b = Bindings::new();
+        b.bind(x, xb.as_ref()).bind(c, cache);
+        be.execute(plan.as_ref(), &b).expect("execute WriteKv");
+    }
+
+    /// One decode row of attention over the first `PREFIX` rows of `k`/`v`, as the backend
+    /// decodes them.
+    fn attend(be: &dyn Backend, fmt: DType, k: &dyn Buffer, v: &dyn Buffer) -> Vec<f32> {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![N_HEAD * HEAD_DIM], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![CAP_ROWS * ROW], fmt));
+        let vc = g.input(TensorDesc::new(vec![CAP_ROWS * ROW], fmt));
+        let dst = g.output(TensorDesc::new(vec![N_HEAD * HEAD_DIM], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: 1,
+            kv_len: PREFIX as u32,
+            n_head: N_HEAD as u32,
+            n_kv: N_KV as u32,
+            head_dim: HEAD_DIM as u32,
+            scale: 1.0 / (HEAD_DIM as f32).sqrt(),
+            mask: AttnMask::Causal,
+            pos: (PREFIX - 1) as u32,
+            sinks: None,
+            key_bias: None,
+            comp: None,
+        });
+        let plan = be.compile(&g).expect("compile Attention");
+        let qb = be
+            .alloc(N_HEAD * HEAD_DIM * 4, BufferUsage::Activations)
+            .expect("alloc q");
+        be.upload(
+            qb.as_ref(),
+            bytemuck::cast_slice(&values(N_HEAD * HEAD_DIM, 5)),
+        )
+        .expect("upload q");
+        let ob = be
+            .alloc(N_HEAD * HEAD_DIM * 4, BufferUsage::Readback)
+            .expect("alloc out");
+        let mut b = Bindings::new();
+        b.bind(q, qb.as_ref())
+            .bind(kc, k)
+            .bind(vc, v)
+            .bind(dst, ob.as_ref());
+        be.execute(plan.as_ref(), &b).expect("execute Attention");
+        let mut out = vec![0f32; N_HEAD * HEAD_DIM];
+        be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut out))
+            .expect("download out");
+        out
+    }
+
+    /// For every KV format: seed a slot that holds another conversation's rows (different values,
+    /// so different block scales) from a source slot's `PREFIX` rows, and check attention over the
+    /// prefix reads the same thing from both. Returns the formats that differ.
+    fn seeded_prefix_mismatches(be: &dyn Backend) -> Vec<String> {
+        let mut bad = Vec::new();
+        for fmt in KV_FORMATS {
+            let (src_k, src_v, dst_k, dst_v) = (
+                cache(be, fmt),
+                cache(be, fmt),
+                cache(be, fmt),
+                cache(be, fmt),
+            );
+            write_rows(be, fmt, src_k.as_ref(), &values(PREFIX * ROW, 1), PREFIX);
+            write_rows(be, fmt, src_v.as_ref(), &values(PREFIX * ROW, 2), PREFIX);
+            write_rows(
+                be,
+                fmt,
+                dst_k.as_ref(),
+                &values(CAP_ROWS * ROW, 3),
+                CAP_ROWS,
+            );
+            write_rows(
+                be,
+                fmt,
+                dst_v.as_ref(),
+                &values(CAP_ROWS * ROW, 4),
+                CAP_ROWS,
+            );
+            let before = attend(be, fmt, dst_k.as_ref(), dst_v.as_ref());
+            for (src, dst) in [(&src_k, &dst_k), (&src_v, &dst_v)] {
+                be.copy_kv_prefix(
+                    src.as_ref(),
+                    dst.as_ref(),
+                    fmt,
+                    PREFIX * ROW,
+                    CAP_ROWS * ROW,
+                )
+                .expect("seed KV side");
+            }
+            let want = attend(be, fmt, src_k.as_ref(), src_v.as_ref());
+            let got = attend(be, fmt, dst_k.as_ref(), dst_v.as_ref());
+            assert_ne!(
+                want, before,
+                "{fmt:?}: the two conversations attend alike, so a missed copy would not show"
+            );
+            if got != want {
+                let err = want
+                    .iter()
+                    .zip(&got)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                bad.push(format!("{fmt:?} (max abs diff {err})"));
+            }
+        }
+        bad
+    }
+
+    /// The CPU cache stores every format in element order, so a seed moves the byte prefix
+    /// [`kv_fmt_bytes`] covers and not one byte more.
+    #[test]
+    fn cpu_kv_seed_copies_only_the_byte_prefix() {
+        let be = infr_cpu::CpuBackend::new();
+        for fmt in KV_FORMATS {
+            let (src, dst) = (cache(&be, fmt), cache(&be, fmt));
+            write_rows(&be, fmt, src.as_ref(), &values(CAP_ROWS * ROW, 1), CAP_ROWS);
+            write_rows(&be, fmt, dst.as_ref(), &values(CAP_ROWS * ROW, 2), CAP_ROWS);
+            let read = |b: &dyn Buffer| {
+                let mut v = vec![0u8; b.len_bytes()];
+                be.download(b, &mut v).expect("download KV side");
+                v
+            };
+            let (src_bytes, dst_before) = (read(src.as_ref()), read(dst.as_ref()));
+            be.copy_kv_prefix(
+                src.as_ref(),
+                dst.as_ref(),
+                fmt,
+                PREFIX * ROW,
+                CAP_ROWS * ROW,
+            )
+            .expect("seed KV side");
+            let dst_after = read(dst.as_ref());
+            let n = kv_fmt_bytes(fmt, PREFIX * ROW);
+            assert_eq!(dst_after[..n], src_bytes[..n], "{fmt:?}: prefix not copied");
+            assert_ne!(
+                dst_before[n..],
+                src_bytes[n..],
+                "{fmt:?}: the two caches agree past the prefix, so an over-copy would not show"
+            );
+            assert_eq!(
+                dst_after[n..],
+                dst_before[n..],
+                "{fmt:?}: the seed copied past the {n}-byte prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn seeded_kv_prefix_decodes_like_its_source_cpu() {
+        let bad = seeded_prefix_mismatches(&infr_cpu::CpuBackend::new());
+        assert!(
+            bad.is_empty(),
+            "seeded prefix differs from the source: {bad:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn seeded_kv_prefix_decodes_like_its_source_vulkan() {
+        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        eprintln!("vulkan device: {}", vk.capabilities().name);
+        let bad = seeded_prefix_mismatches(&vk);
+        assert!(
+            bad.is_empty(),
+            "seeded prefix differs from the source: {bad:?}"
+        );
     }
 }

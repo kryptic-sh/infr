@@ -84,9 +84,6 @@ pub struct Capabilities {
     /// SEPARATE primitive from coopmat (hence not `coopmat_i8`). False = route to the scalar
     /// dequant GEMV (needs no extension). Independent of `f16`/`coopmat_f16`.
     pub i8_dot: bool,
-    /// `i8_dot` and the driver reports the packed signed 4x8 dot as hardware-accelerated. False
-    /// on GPUs that emulate dp4a in ALU (AMD GCN), where fp32 FMA kernels beat it.
-    pub i8_dot_fast: bool,
     /// The (M,N,K) tile the cooperative-matrix unit accepts for SINT8×SINT8→SINT32 components
     /// (enumerated from the device's coopmat config list, same discipline as `coopmat_f16`; only
     /// [`COOPMAT_TILE_16`] is ever selected — the shape every int8 coopmat shader is hardcoded
@@ -112,6 +109,8 @@ pub struct Capabilities {
     /// GEMM pins `requiredSubgroupSize = 32` (RDNA3 wave32); a device whose range excludes 32 can't
     /// run the pinned kernel and must fall back to a non-pinned variant. `(0, 0)` =
     /// subgroup-size-control unsupported (can't pin at all — use the driver's default subgroup).
+    /// A wave64-only device (AMD GCN) reports `(64, 64)`, and so does any device run with the
+    /// `kernels.vulkan.force_wave64` testing knob.
     pub subgroup_min: u32,
     pub subgroup_max: u32,
     /// PREFERRED pinned subgroup size for the bandwidth-critical decode GEMV/reduction kernel
@@ -158,7 +157,9 @@ pub struct Capabilities {
     /// The backend records a single-token decode graph ONCE and replays it per token, reading the
     /// position from a device-side params buffer (Vulkan seam) instead of the graph's baked `pos`.
     /// When set, the runner may compile the decode graph once (pos=0) and reuse it across the whole
-    /// decode loop. Backends that read the baked `pos`/`kv_len` (CPU interpreter) leave this false.
+    /// decode loop, if [`Backend::decode_replay_ready`] confirms the compiled plan decodes every
+    /// position that way.
+    /// Backends that read the baked `pos`/`kv_len` (CPU interpreter) leave this false.
     pub decode_replay: bool,
     /// The backend prefers the dense FFN's gate+up weights CONCATENATED into one `[2*nff, ne]`
     /// tensor (one GEMV/GEMM + `Op::GatedActFused` instead of two Linears + `Op::GatedAct`).
@@ -199,11 +200,6 @@ pub struct Capabilities {
     /// full context (see the seam's SWA ring sizing). Backends whose kernels index rows directly
     /// by position (Metal) leave this false and get full-context allocations for every layer.
     pub kv_swa_ring: bool,
-    /// The backend reads a KV cache through a page table (`TensorDesc::pages`): `WriteKv` lands a
-    /// row at `(pos + row_base) % cap_rows` and `Attention` resolves key/value position `j` through
-    /// `table[j / page_rows]`. Backends without it index rows by position and ignore `pages`
-    /// outright, so a paged cache never reaches them.
-    pub kv_paging: bool,
     /// What the ops write into a bound f32 [`crate::graph::TensorKind::Input`] is visible to the NEXT `execute`
     /// that binds the same buffer — either because the backend dispatches straight against the
     /// caller's buffer (Vulkan: only `Internal` handles get backend scratch) or because the
@@ -270,7 +266,7 @@ pub const SUBMIT_BUDGET_NS: u64 = 250_000_000;
 /// Discrete GPUs get 0: a whole forward there is tens of milliseconds, two orders of magnitude
 /// inside any watchdog, and splitting it would only add barriers and submit overhead to the tuned
 /// path. Integrated GPUs get a real cap, because they are the parts whose forward is measured in
-/// SECONDS. So do `slow` discrete GPUs (no matrix units and no fast int8 dot, e.g. GCN).
+/// SECONDS.
 ///
 /// 128 comes from the surveyed 2-CU part: 757 dispatches ≈ 2.05 s ⇒ ~2.7 ms/dispatch ⇒ 128
 /// dispatches ≈ 0.35 s, inside [`SUBMIT_BUDGET_NS`] with room to spare. It is deliberately NOT
@@ -289,11 +285,9 @@ pub const SUBMIT_BUDGET_NS: u64 = 250_000_000;
 /// and would also stay correct if a caller forced a much larger `INFR_UBATCH` on an iGPU (each
 /// dispatch then gets heavier while the count stays put); today that case is caught one forward
 /// late by the measured loop instead. Worth adopting if this ever needs to be tighter.
-pub fn initial_submit_dispatch_cap(integrated: bool, slow: bool) -> usize {
+pub fn initial_submit_dispatch_cap(integrated: bool) -> usize {
     if integrated {
         128
-    } else if slow {
-        64
     } else {
         0
     }
@@ -515,37 +509,6 @@ pub trait Backend: Send + Sync {
     }
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()>;
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()>;
-    /// [`upload`](Self::upload) into `dst` starting at byte `offset`. The default bounces the whole
-    /// buffer through the host, which is correct but costs `len_bytes()` of traffic; a backend that
-    /// can address the range directly should override.
-    fn upload_at(&self, dst: &dyn Buffer, offset: usize, src: &[u8]) -> Result<()> {
-        if offset == 0 {
-            return self.upload(dst, src);
-        }
-        let end = offset
-            .checked_add(src.len())
-            .filter(|end| *end <= dst.len_bytes())
-            .ok_or_else(|| Error::backend("upload_at: range runs out of the buffer"))?;
-        let mut whole = vec![0u8; dst.len_bytes()];
-        self.download(dst, &mut whole)?;
-        whole[offset..end].copy_from_slice(src);
-        self.upload(dst, &whole)
-    }
-    /// [`download`](Self::download) from `src` starting at byte `offset`. Same default caveat as
-    /// [`upload_at`](Self::upload_at).
-    fn download_at(&self, src: &dyn Buffer, offset: usize, dst: &mut [u8]) -> Result<()> {
-        if offset == 0 {
-            return self.download(src, dst);
-        }
-        let end = offset
-            .checked_add(dst.len())
-            .filter(|end| *end <= src.len_bytes())
-            .ok_or_else(|| Error::backend("download_at: range runs out of the buffer"))?;
-        let mut whole = vec![0u8; src.len_bytes()];
-        self.download(src, &mut whole)?;
-        dst.copy_from_slice(&whole[offset..end]);
-        Ok(())
-    }
     /// Emit the one-shot KV-cache placement summary for a VRAM-first spill backend (the Vulkan
     /// `INFR_KV_OVERFLOW` path): how many `BufferUsage::KvCache` buffers landed in device-local VRAM
     /// vs spilled to system RAM. The runner calls this ONCE, right after the per-layer KV allocation
@@ -591,38 +554,27 @@ pub trait Backend: Send + Sync {
     /// prefix, then upload it) — correct everywhere; backends override with a device-side copy.
     /// Errors (rather than panics) if `bytes` exceeds `src`'s length.
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
-        self.copy_buffer_at(src, 0, dst, 0, bytes)
+        check_copy_bytes(bytes, src.len_bytes())?;
+        // Only the prefix crosses the bus — NOT the whole (potentially `max_ctx`) `src` buffer.
+        let mut tmp = vec![0u8; bytes];
+        self.download(src, &mut tmp)?;
+        self.upload(dst, &tmp)
     }
-    /// Copy `bytes` from `src` at `src_offset` into `dst` at `dst_offset` — the primitive a page pool
-    /// needs, where every slot's rows live somewhere inside one shared buffer.
-    /// The default bounces through the host, copying only the requested range.
-    fn copy_buffer_at(
+    /// Copy the first `elems` elements of one KV cache side, a cache of `_cap` elements stored as
+    /// `dtype`, from `src` into `dst` (same geometry), so they decode in `dst` as they do in `src`
+    /// — the KV prefix-sharing seed. The default is the byte prefix [`copy_buffer`](Self::copy_buffer)
+    /// of [`kv_fmt_bytes`](crate::budget::kv_fmt_bytes), right for every layout that stores the
+    /// elements (or their GGUF blocks) in order. A backend whose cache layout puts part of a row
+    /// elsewhere overrides this; `_cap` is what locates that part.
+    fn copy_kv_prefix(
         &self,
         src: &dyn Buffer,
-        src_offset: usize,
         dst: &dyn Buffer,
-        dst_offset: usize,
-        bytes: usize,
+        dtype: crate::tensor::DType,
+        elems: usize,
+        _cap: usize,
     ) -> Result<()> {
-        let src_end = src_offset
-            .checked_add(bytes)
-            .filter(|end| *end <= src.len_bytes())
-            .ok_or_else(|| Error::backend("copy_buffer_at: range runs out of the source"))?;
-        let dst_end = dst_offset
-            .checked_add(bytes)
-            .filter(|end| *end <= dst.len_bytes())
-            .ok_or_else(|| Error::backend("copy_buffer_at: range runs out of the destination"))?;
-        debug_assert!(src_end > src_offset || bytes == 0);
-        debug_assert!(dst_end > dst_offset || bytes == 0);
-        if src_offset == 0 && dst_offset == 0 {
-            // Only the requested prefix crosses the bus, as `copy_buffer` always did.
-            let mut tmp = vec![0u8; bytes];
-            self.download(src, &mut tmp)?;
-            return self.upload(dst, &tmp);
-        }
-        let mut whole = vec![0u8; src.len_bytes()];
-        self.download(src, &mut whole)?;
-        self.upload_at(dst, dst_offset, &whole[src_offset..src_end])
+        self.copy_buffer(src, dst, crate::budget::kv_fmt_bytes(dtype, elems))
     }
 
     // ---- execution (compile once per shape, execute per token/step) ----
@@ -635,6 +587,10 @@ pub trait Backend: Send + Sync {
     /// the `n` sampled ids, or `None` when this backend/plan can't chain (the caller falls back
     /// to per-token `execute`). Positions/params self-advance (a chaining backend implies the
     /// device-side pos increment).
+    ///
+    /// `None` means no step ran: the caller feeds the same position again, which a step that did
+    /// run would make a second advance of any recurrent state. A backend that stops after running
+    /// some steps returns the ids of those it ran instead, fewer than `n`.
     fn execute_chain(
         &self,
         _plan: &dyn Plan,
@@ -661,6 +617,30 @@ pub trait Backend: Send + Sync {
         usize::MAX
     }
 
+    /// Does `plan`, executed once per token with the bound positions advanced, decode each
+    /// position correctly? `plan` was compiled from a graph built for record-once decode replay
+    /// ([`Graph::replay_only`]): positions and KV lengths baked for the first token, the one plan
+    /// executed for every later token with `bindings` and only the bound positions changing.
+    ///
+    /// `true` is a promise about the result, not about the mechanism: the backend may replay a
+    /// recorded tape, or walk the plan statically taking every position and length from live
+    /// state rather than from the graph. `false` means neither holds, and the caller must build
+    /// and compile a graph per token instead; executing the plan anyway is an error
+    /// ([`Graph::replay_only`]).
+    ///
+    /// This is the backend's own decision, read off the compiled plan, so callers do not have to
+    /// keep a copy of the backend's rules. Asked once, right after `compile`, with the bindings
+    /// every later execute will use.
+    ///
+    /// Default `false`, the answer that is right for every backend that reads the baked positions
+    /// (the CPU interpreter). A backend that can honour the contract overrides it; one that sets
+    /// [`Capabilities::decode_replay`] and forgets to costs itself the fast decode path, never the
+    /// right answer, where a default of `true` would turn the same omission into every token
+    /// decoded at the baked position.
+    fn decode_replay_ready(&self, _plan: &dyn Plan, _bindings: &Bindings) -> bool {
+        false
+    }
+
     fn sync(&self) -> Result<()>;
 
     /// Whether the currently loaded model is running any MoE expert layer through a paged VRAM
@@ -681,13 +661,51 @@ pub trait Backend: Send + Sync {
     /// VRAM cache (dense layer streaming — the `crate::pager::Pager::schedule` policy; see
     /// `infr_vulkan::pager`'s dense session). Unlike [`Backend::moe_paged`] no host readback is
     /// ever needed (dense layer order is deterministic, every "miss" is known in advance), but
-    /// the record-once decode replay still can't express the per-token ring staging +
-    /// arena-offset rebinding, so the same gates that force a paged-MoE model onto the
-    /// per-execute static path check this too. `false` for every backend but Vulkan, and for
+    /// the record-once decode replay can't follow blocks that are re-staged into recycled slots
+    /// every token, so the gates that force a paged-MoE model onto the per-execute static path
+    /// check this too, unless [`Backend::dense_holds_every_block`] (no block then moves once
+    /// placed, and Vulkan replays). `false` for every backend but Vulkan, and for
     /// Vulkan whenever the loaded model's dense weights fit VRAM (the overwhelming common case —
     /// zero change there).
     fn dense_paged(&self) -> bool {
         false
+    }
+
+    /// Whether every dense streaming pool has a slot for each of its blocks, so the cache, once
+    /// filled, never evicts and each block is read off the tier below at most once per session.
+    /// A runner keys read-saving reorderings off this (layer-major prefill saves nothing then),
+    /// and admits such a session to the record-once decode replay.
+    /// `false` whenever [`Backend::dense_paged`] is `false`.
+    fn dense_holds_every_block(&self) -> bool {
+        false
+    }
+
+    /// Whether the model whose bound weight buffers are `weights` reads them from the model file
+    /// into a host cache that cannot hold them all (`paging.dram` on the CPU backend), so that a
+    /// pass over every weight costs disk reads, and that cache has slots to keep a block in
+    /// between two of its reads. The host-memory sibling of [`Backend::dense_paged`]; a runner
+    /// keys the same read-saving reorderings off it. Asked about the run's own weights, not the
+    /// backend, because one backend may serve several models. `false` unless a backend says
+    /// otherwise.
+    fn host_streams(&self, _weights: &mut dyn Iterator<Item = &dyn Buffer>) -> bool {
+        false
+    }
+
+    /// Whether this backend honours [`crate::Op::DeltaNet`]'s `src_stride`: q/k/v read as
+    /// per-row slices of ONE buffer instead of three packed ones. A runner emits the strided form
+    /// only where this is true; a backend that ignored the stride would read k and v from q's
+    /// prefix. `false` unless a backend says otherwise.
+    fn deltanet_strided(&self) -> bool {
+        false
+    }
+
+    /// The multiple a runner rounds every KV cache's row capacity up to. A backend whose prefill
+    /// attention loads KV in fixed-size row blocks reads past the newest key to the next block
+    /// boundary; padding the cache makes those rows exist (zeroed, as `alloc` guarantees) rather
+    /// than leaving the backend to send such launches to slower kernels. The padding is capacity
+    /// only — it never raises the context a session accepts. `1` unless a backend says otherwise.
+    fn kv_row_align(&self) -> usize {
+        1
     }
 
     /// Perf (DiffusionGemma denoise, perf slice 3 — docs/diffusion-gemma.md): fused per-canvas-row
@@ -770,14 +788,13 @@ mod tests {
         }
     }
 
-    /// The submit splitter's pre-measurement default. The load-bearing property is that a fast
-    /// DISCRETE GPU never splits: a dGPU forward is tens of milliseconds, nowhere near a hang
-    /// watchdog, and splitting it would only add barriers and submits to a tuned path.
+    /// The submit splitter's pre-measurement default. The load-bearing property is that a DISCRETE
+    /// GPU never splits: a dGPU forward is tens of milliseconds, nowhere near a hang watchdog, and
+    /// splitting it would only add barriers and submits to a tuned path.
     #[test]
-    fn initial_submit_cap_splits_integrated_and_slow_discrete() {
-        assert_eq!(initial_submit_dispatch_cap(false, false), 0); // discrete: never split
-        assert_eq!(initial_submit_dispatch_cap(true, false), 128); // integrated: the measured default
-        assert_eq!(initial_submit_dispatch_cap(false, true), 64); // slow discrete (RX 580)
+    fn initial_submit_cap_splits_only_integrated() {
+        assert_eq!(initial_submit_dispatch_cap(false), 0); // discrete: never split
+        assert_eq!(initial_submit_dispatch_cap(true), 128); // integrated: the measured default
     }
 
     /// The measured feedback loop. The property that matters is that the cap it returns puts a

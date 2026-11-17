@@ -1,4 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Compile GLSL compute shaders (which need features WGSL/naga can't express, e.g.
 /// cooperative matrix) to SPIR-V via `glslc` at build time. Output to OUT_DIR.
@@ -16,31 +19,6 @@ fn main() {
     gen_grids(&out);
     // (source stem, output stem, extra glslc defines)
     let builds: &[(&str, &str, &[&str])] = &[
-        ("exl3_hadamard", "exl3_hadamard_in", &[]),
-        (
-            "exl3_hadamard",
-            "exl3_hadamard_out",
-            &["-DOUTPUT_TRANSFORM"],
-        ),
-        ("exl3_dot", "exl3_gemv", &["-DK_SLICES=16"]),
-        ("exl3_dot", "exl3_gemv_f16", &["-DK_SLICES=16", "-DUSE_F16"]),
-        ("exl3_dot", "exl3_gemv_sh", &["-DK_SLICES=16", "-DSHUFFLE"]),
-        (
-            "exl3_dot",
-            "exl3_gemv_f16_sh",
-            &["-DK_SLICES=16", "-DUSE_F16", "-DSHUFFLE"],
-        ),
-        (
-            "exl3_dot",
-            "exl3_gemv_sh_b4",
-            &["-DK_SLICES=16", "-DSHUFFLE", "-DBITS=4"],
-        ),
-        (
-            "exl3_dot",
-            "exl3_gemv_f16_sh_b4",
-            &["-DK_SLICES=16", "-DUSE_F16", "-DSHUFFLE", "-DBITS=4"],
-        ),
-        ("exl3_dot", "exl3_prefill", &["-DB_ROWS=8"]),
         ("gemm_coopmat_tiled", "gemm_coopmat_tiled", &[]),
         ("gemm_warp", "gemm_warp", &[]),
         ("quant_q8", "quant_q8", &[]),
@@ -279,33 +257,6 @@ fn main() {
                 "-DUSE_PARAMS",
                 "-DSELF_CHUNK",
             ],
-        ),
-        // Static small-row variants retain literal head dimensions without changing replay builds.
-        ("attn_decode", "attn_small_m_hd128", &["-DMULTI_ROWS"]),
-        (
-            "attn_decode",
-            "attn_small_m_hd128_swa",
-            &["-DMULTI_ROWS", "-DSWA", "-DRING"],
-        ),
-        (
-            "attn_decode",
-            "attn_small_m_hd256",
-            &["-DMULTI_ROWS", "-DDHD4=64"],
-        ),
-        (
-            "attn_decode",
-            "attn_small_m_hd256_swa",
-            &["-DMULTI_ROWS", "-DDHD4=64", "-DSWA", "-DRING"],
-        ),
-        (
-            "attn_decode",
-            "attn_small_m_hd512",
-            &["-DMULTI_ROWS", "-DDHD4=128"],
-        ),
-        (
-            "attn_decode",
-            "attn_small_m_hd512_swa",
-            &["-DMULTI_ROWS", "-DDHD4=128", "-DSWA", "-DRING"],
         ),
         // Lever 1 (kv-decode-perf-levers #1): mainline low-bit KV decode reads the compact GGUF
         // block format INLINE (native_decode `dq()` on the cache via `dq_addr`=k_addr/v_addr), so
@@ -606,6 +557,9 @@ fn main() {
         // DeepSeek V4 compressor pooling (Op::CompressPool) — per-channel softmax over the window
         // axis, then the weighted average.
         ("compress_pool", "compress_pool", &[]),
+        // DeepSeek V4 compressor source gather (Op::GatherRows) — f32 rows by i32 index, a column
+        // window of each, into the grouped `[blocks, window, n]` layout compress_pool reads.
+        ("gather_rows", "gather_rows", &[]),
         ("softmax", "softmax", &[]),
         // DiffusionGemma denoise self-conditioning perf: scale read from a device buffer instead
         // of a push constant (see `Op::Softmax::scale_buf`'s doc + `Recorder::softmax_dyn`).
@@ -625,6 +579,13 @@ fn main() {
         ("conv1d_silu", "conv1d_silu", &[]),
         ("conv1d_silu_par", "conv1d_silu_par", &[]),
         ("conv1d_shift", "conv1d_shift", &[]),
+        // LFM's gated short convolution (Op::ShortConv): the same three conv sources, reading
+        // B ⊙ X from the [rows, 3*cc] in-projection and writing C ⊙ conv (no SiLU).
+        ("conv1d_silu", "shortconv", &["-DSHORTCONV"]),
+        ("conv1d_silu_par", "shortconv_par", &["-DSHORTCONV"]),
+        ("conv1d_shift", "shortconv_shift", &["-DSHORTCONV"]),
+        // LFM3 attention output gate (Op::HeadGate): one sigmoid per (row, head).
+        ("head_gate", "head_gate", &[]),
         ("copy_strided", "copy_strided", &[]),
         ("mul_sigmoid", "mul_sigmoid", &[]),
         ("add", "add", &[]),
@@ -745,6 +706,14 @@ fn main() {
         ("rope", "rope_ff_back", &["-DFREQ_FACTORS", "-DBACKWARD"]),
         ("rope", "rope_f16", &["-DOUT_F16"]),
         ("rope", "rope_f16_dyn", &["-DOUT_F16", "-DUSE_PARAMS"]),
+        // The llama/llama4 q/k rope with the llama3 `rope_freqs.weight` divisors: the f16-out
+        // and record-once forms above, each with the ff binding (see `Recorder::rope_f16`).
+        ("rope", "rope_f16_ff", &["-DOUT_F16", "-DFREQ_FACTORS"]),
+        (
+            "rope",
+            "rope_f16_dyn_ff",
+            &["-DOUT_F16", "-DUSE_PARAMS", "-DFREQ_FACTORS"],
+        ),
         ("linear_f16", "linear_f16", &[]),
         // !caps.f16 fallback (no shaderFloat16 ext): reads the f16 weight buffer as packed u32 +
         // unpackHalf2x16 (core GLSL) instead of a float16_t SSBO read.
@@ -758,113 +727,10 @@ fn main() {
         // `linear_f32`'s builds were dead — same as `e2b_proj` below, just not called out in the
         // audit by name.
         ("linear_f32r", "linear_f32r", &[]),
-        ("linear_f32_mo", "linear_f32_mo", &[]),
-        // Decode K-quant GEMV on f32 activations for GPUs without fast int8 dot (GCN).
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q4k",
-            &["-DFMT_Q4K"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q4k_res",
-            &["-DFMT_Q4K", "-DUSE_RES"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q6k",
-            &["-DFMT_Q6K"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q6k_res",
-            &["-DFMT_Q6K", "-DUSE_RES"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q4k_nr4",
-            &["-DFMT_Q4K", "-DNR=4"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q4k_res_nr4",
-            &["-DFMT_Q4K", "-DUSE_RES", "-DNR=4"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q6k_nr4",
-            &["-DFMT_Q6K", "-DNR=4"],
-        ),
-        // Multi-row (verify) twin of the kq_fma decode GEMV above (MR=4 rows per workgroup
-        // sharing each superblock's weight-word load — see native_gemv_kq_fma_mrow.comp). No
-        // USE_RES builds: the fused residual is a decode-only (m=1) shape.
-        (
-            "native_gemv_kq_fma_mrow",
-            "native_gemv_kq_fma_mrow_q4k",
-            &["-DFMT_Q4K"],
-        ),
-        (
-            "native_gemv_kq_fma_mrow",
-            "native_gemv_kq_fma_mrow_q6k",
-            &["-DFMT_Q6K"],
-        ),
-        (
-            "native_gemv_kq_fma_mrow",
-            "native_gemv_kq_fma_mrow_q4k_nr4",
-            &["-DFMT_Q4K", "-DNR=4"],
-        ),
-        (
-            "native_gemv_kq_fma_mrow",
-            "native_gemv_kq_fma_mrow_q6k_nr4",
-            &["-DFMT_Q6K", "-DNR=4"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q6k_res_nr4",
-            &["-DFMT_Q6K", "-DUSE_RES", "-DNR=4"],
-        ),
-        // `kernels.vulkan.weights_as_ssbo` twins: the weight bound as a storage buffer.
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q4k_ssbo",
-            &["-DFMT_Q4K", "-DWEIGHTS_SSBO"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q4k_res_ssbo",
-            &["-DFMT_Q4K", "-DUSE_RES", "-DWEIGHTS_SSBO"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q6k_ssbo",
-            &["-DFMT_Q6K", "-DWEIGHTS_SSBO"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q6k_res_ssbo",
-            &["-DFMT_Q6K", "-DUSE_RES", "-DWEIGHTS_SSBO"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q4k_nr4_ssbo",
-            &["-DFMT_Q4K", "-DNR=4", "-DWEIGHTS_SSBO"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q4k_res_nr4_ssbo",
-            &["-DFMT_Q4K", "-DUSE_RES", "-DNR=4", "-DWEIGHTS_SSBO"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q6k_nr4_ssbo",
-            &["-DFMT_Q6K", "-DNR=4", "-DWEIGHTS_SSBO"],
-        ),
-        (
-            "native_gemv_kq_fma",
-            "native_gemv_kq_fma_q6k_res_nr4_ssbo",
-            &["-DFMT_Q6K", "-DUSE_RES", "-DNR=4", "-DWEIGHTS_SSBO"],
-        ),
         ("linear_f32r", "linear_f32r_mrow8", &["-DMROW=8"]),
+        // One row, vec4 K stream: the decode-hot router GEMV (ERNIE-4.5 2560→64, qwen3moe
+        // 2048→128) — see `Recorder::linear_f32_at`.
+        ("linear_f32r", "linear_f32r_v4", &["-DMROW=1", "-DVEC4"]),
         (
             "linear_f32r",
             "linear_f32r_mrow4_v4",
@@ -903,6 +769,25 @@ fn main() {
             "attention_kv",
             "attention_kv_sinks_bias",
             &["-DSINKS", "-DBIAS"],
+        ),
+        // `Op::Attention::comp` (deepseek4's compressed CSA/HCA keys): the same ONE-build rule,
+        // on the sinks and segment-bias axes V4 actually combines it with (HCA: sinks; CSA: sinks
+        // and the top-k bias). The raw-side `-DBIAS` never combines with it.
+        ("attention_kv", "attention_kv_comp", &["-DCOMP"]),
+        (
+            "attention_kv",
+            "attention_kv_comp_bias",
+            &["-DCOMP", "-DCOMP_BIAS"],
+        ),
+        (
+            "attention_kv",
+            "attention_kv_comp_sinks",
+            &["-DCOMP", "-DSINKS"],
+        ),
+        (
+            "attention_kv",
+            "attention_kv_comp_sinks_bias",
+            &["-DCOMP", "-DSINKS", "-DCOMP_BIAS"],
         ),
         // Planar Q8_0 KV cache: scalar dequant-on-read variants. K/V decouple (-DKQ8 / -DVQ8) → 3
         // quant combos for the STATIC scalar path; coupled-only for the record-once (dead for Q8).
@@ -984,6 +869,16 @@ fn main() {
             "rope",
             "rope_f16_dyn_bda",
             &["-DOUT_F16", "-DUSE_PARAMS", "-DKV_BDA"],
+        ),
+        (
+            "rope",
+            "rope_f16_ff_bda",
+            &["-DOUT_F16", "-DFREQ_FACTORS", "-DKV_BDA"],
+        ),
+        (
+            "rope",
+            "rope_f16_dyn_ff_bda",
+            &["-DOUT_F16", "-DUSE_PARAMS", "-DFREQ_FACTORS", "-DKV_BDA"],
         ),
         ("qk_norm_rope", "qk_norm_rope_bda", &["-DKV_BDA"]),
         (
@@ -2393,37 +2288,6 @@ fn main() {
         ("native_gemm_fma", "native_gemm_fma_f16", &["-DFMT_F16"]),
         ("native_gemm_fma", "native_gemm_fma_bf16", &["-DFMT_BF16"]),
         ("native_gemm_fma", "native_gemm_fma_f32", &["-DFMT_F32"]),
-        // fp32 K-quant prefill GEMM for GPUs without fast int8 dot, see native_gemm_kq_fma.comp.
-        (
-            "native_gemm_kq_fma",
-            "native_gemm_kq_fma_q4_0_t64",
-            &["-DFMT_Q4_0", "-DBN=64"],
-        ),
-        (
-            "native_gemm_kq_fma",
-            "native_gemm_kq_fma_q4_0_t128",
-            &["-DFMT_Q4_0", "-DBN=128"],
-        ),
-        (
-            "native_gemm_kq_fma",
-            "native_gemm_kq_fma_q4k_t64",
-            &["-DFMT_Q4K", "-DBN=64"],
-        ),
-        (
-            "native_gemm_kq_fma",
-            "native_gemm_kq_fma_q4k_t128",
-            &["-DFMT_Q4K", "-DBN=128"],
-        ),
-        (
-            "native_gemm_kq_fma",
-            "native_gemm_kq_fma_q6k_t64",
-            &["-DFMT_Q6K", "-DBN=64"],
-        ),
-        (
-            "native_gemm_kq_fma",
-            "native_gemm_kq_fma_q6k_t128",
-            &["-DFMT_Q6K", "-DBN=128"],
-        ),
         // Non-coopmat shared-memory fma flash-attention prefill (adapter.rs `nc_fa_ok`, see
         // attn_nc_fa.comp): the attention companion of the fma GEMM tier above. No subgroup ops.
         // One build per shared-Os ceiling: hd<=128 (37.6 KB), hd<=256 (54.0 KB), hd<=512 (BM=16,
@@ -2442,6 +2306,109 @@ fn main() {
             "native_gemm_i8cm_q8_0",
             "native_gemm_i8cm_q8_0_rowscale",
             &["-DROW_SCALE"],
+        ),
+        // int8 coopmat (WMMA) prefill GEMM for the K-quants, weight read by device address
+        // (native_gemm_i8cm_kq.comp; adapter.rs `i8cm_kq_ok`). Two tiles per format: `_l`
+        // (128 tokens x 128 rows, 512 threads) for grids that fill the device, `_m` (64 x 64,
+        // 128 threads) for the narrower ones.
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q4k_l",
+            &[
+                "-DFMT_Q4K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=128u",
+                "-DTILE_BKS=2u",
+            ],
+        ),
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q4k_m",
+            &[
+                "-DFMT_Q4K",
+                "-DTILE_BT=64u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=4u",
+            ],
+        ),
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q5k_l",
+            &[
+                "-DFMT_Q5K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=128u",
+                "-DTILE_BKS=2u",
+            ],
+        ),
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q5k_m",
+            &[
+                "-DFMT_Q5K",
+                "-DTILE_BT=64u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=4u",
+            ],
+        ),
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q6k_l",
+            &[
+                "-DFMT_Q6K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=128u",
+                "-DTILE_BKS=2u",
+            ],
+        ),
+        (
+            "native_gemm_i8cm_kq",
+            "native_gemm_i8cm_q6k_m",
+            &[
+                "-DFMT_Q6K",
+                "-DTILE_BT=64u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=4u",
+            ],
+        ),
+        // Packed-int8-dot K-quant prefill GEMM for devices without an int8 cooperative matrix
+        // (native_gemm_dp4a_kq.comp; adapter.rs `dp4a_kq_ok`): BT tokens x BW weight rows per
+        // workgroup, TT x TW outputs per thread. MIRRORS `gemm::DP4A_KQ_TILE`.
+        (
+            "native_gemm_dp4a_kq",
+            "native_gemm_dp4a_q4k",
+            &[
+                "-DFMT_Q4K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=2u",
+                "-DTILE_TT=8u",
+                "-DTILE_TW=8u",
+            ],
+        ),
+        (
+            "native_gemm_dp4a_kq",
+            "native_gemm_dp4a_q5k",
+            &[
+                "-DFMT_Q5K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=2u",
+                "-DTILE_TT=8u",
+                "-DTILE_TW=8u",
+            ],
+        ),
+        (
+            "native_gemm_dp4a_kq",
+            "native_gemm_dp4a_q6k",
+            &[
+                "-DFMT_Q6K",
+                "-DTILE_BT=128u",
+                "-DTILE_BW=64u",
+                "-DTILE_BKS=2u",
+                "-DTILE_TT=8u",
+                "-DTILE_TW=8u",
+            ],
         ),
         // Row-wise activation quant for the int8-coopmat GEMM's "Idea 2" measurement (whole-K
         // scale instead of per-32-block; see quant_q8_row.comp). Gated by INFR_I8_ROW_SCALE=1.
@@ -3427,11 +3394,14 @@ fn main() {
             ],
         ),
         ("splitk_reduce", "splitk_reduce", &[]),
-        ("bw_scan", "bw_scan", &[]),
         // Known-answer probe for the int8 coopmat accumulator fragment layout the i8cm GEMM reads
         // its `csub[i]` elements with — dispatched at init when that tier is opted into, and the
         // tier is REFUSED when the readback disagrees (see caps.rs `check_i8_coopmat_layout`).
         ("coopmat_i8_layout", "coopmat_i8_layout", &[]),
+        // Known-answer probe for the wave64 path's one-subgroup-per-small-workgroup assumption —
+        // dispatched at init on a device that takes that path, which is REFUSED when it fails
+        // (see caps.rs `check_wave64_layout`).
+        ("wave64_probe", "wave64_probe", &[]),
         ("native_gemm", "native_gemm_q8_0", &["-DFMT_Q8_0"]),
         ("native_gemm", "native_gemm_bf16", &["-DFMT_BF16"]),
         ("native_gemm", "native_gemm_q4_0", &["-DFMT_Q4_0"]),
@@ -3498,14 +3468,6 @@ fn main() {
         "native_mmv_mw",
         "quant_q8_row",
     ];
-    // Subgroup-64 NATIVE twins for wave64-only devices (GCN, EXL3 #6): every build of these
-    // SOURCES also gets a `<stem>_sg64` variant compiled with -DSG=64 — one full wave64 per
-    // workgroup with plain (un-emulated) subgroup ops (`W64=false` at pipeline time, so the
-    // wave64.glsl macros fold back to the native builtins). Selected by
-    // `kernels.vulkan.wave64_native` on wave64 devices; never created elsewhere. Tight scope:
-    // only the dense Q6_K decode GEMV — the id/multi and mmv/quant families keep the emulated
-    // path until a measurement says otherwise.
-    const SG64_SOURCES: &[&str] = &["native_gemv_sg"];
     let builds: Vec<(String, String, Vec<String>)> = builds
         .iter()
         .flat_map(|(src_stem, dst_stem, defines)| {
@@ -3514,57 +3476,18 @@ fn main() {
                 dst_stem.to_string(),
                 defines.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
             );
-            let mut out = vec![base.clone()];
-            // Packed Q4_K header loads for the OUTS4 decode/verify layout. Derive
-            // its three row-cap/residual twins; keep scalar builds for exact A/B.
-            if *src_stem == "native_mmv_mrow"
-                && defines.contains(&"-DFMT_Q4K")
-                && defines.contains(&"-DOUTS4")
-                && !defines.contains(&"-DFUSE_QUANT")
-            {
-                let mut meta_defines = base.2.clone();
-                meta_defines.push("-DQ4K_PACKED_META".into());
-                out.push((
-                    src_stem.to_string(),
-                    format!("{dst_stem}_packed_meta"),
-                    meta_defines,
-                ));
-            }
             if SG16_SOURCES.contains(src_stem) {
                 let mut sg_defines = base.2.clone();
                 sg_defines.push("-DSG=16".to_string());
-                out.push((src_stem.to_string(), format!("{dst_stem}_sg16"), sg_defines));
+                vec![
+                    base.clone(),
+                    (src_stem.to_string(), format!("{dst_stem}_sg16"), sg_defines),
+                ]
+            } else {
+                vec![base]
             }
-            if SG64_SOURCES.contains(src_stem) {
-                let mut sg_defines = base.2.clone();
-                sg_defines.push("-DSG=64".to_string());
-                out.push((src_stem.to_string(), format!("{dst_stem}_sg64"), sg_defines));
-            }
-            out
         })
         .collect();
-    // GQA-batched decode pass 1 (`attn_decode_gqa.comp`): every (head dim, heads per kv head,
-    // sliding-window, record-once) combination `gemm::attn_decode_gqa_kernel` can select.
-    let mut builds = builds;
-    for hd in [128u32, 256, 512] {
-        for g in [4u32, 8] {
-            for swa in [false, true] {
-                for dynac in [false, true] {
-                    let mut defines = vec![format!("-DHD={hd}"), format!("-DG={g}")];
-                    let mut name = format!("attn_decode_gqa_hd{hd}_g{g}");
-                    if swa {
-                        defines.extend(["-DSWA".to_string(), "-DRING".to_string()]);
-                        name.push_str("_swa");
-                    }
-                    if dynac {
-                        defines.extend(["-DUSE_PARAMS".to_string(), "-DSELF_CHUNK".to_string()]);
-                        name.push_str("_dynac");
-                    }
-                    builds.push(("attn_decode_gqa".to_string(), name, defines));
-                }
-            }
-        }
-    }
     // STREAMED weight builds (resident-BDA): the `-DSTREAMED` build reads the weight from a
     // `bufferDeviceAddress` arena pool (native_weight_addr.glsl) instead of a bound SSBO, lifting the
     // ~4 GiB `maxStorageBufferRange` cap one SSBO binding imposes. `wants_streamed_twin` marks the
@@ -3597,7 +3520,7 @@ fn main() {
     //     the 8-warp warptile: wide/NARROW_N/A_GLOBAL/SPLIT_K/BM* × every quant format, plus the
     //     opt-in -DBF16CM / `_cm8` (-DCM_M=8) coopmat variants and the -DFMT_F16 split-K build). A
     //     streamed dense prefill Linear routes through the SAME tile the resident path picks, just
-    //     arena-addressed (adapter.rs `streamed_prefill_gemm`). Previously EXCLUDED BF16CM/CM_M=8/
+    //     arena-addressed (adapter.rs `quant_linear`). Previously EXCLUDED BF16CM/CM_M=8/
     //     FMT_F16 as opt-in-only or float-upload-only — re-audited: none of the three change the
     //     weight-READ source. BF16CM/CM_M only retype/resize the coopmat A/B fragment (CMTYPE /
     //     CM_M/CM_N), and FMT_F16's dq/dqblk (native_decode.glsl) route through the exact same
@@ -3636,10 +3559,8 @@ fn main() {
             // eager thread-per-output f32 GEMV) is NOT here — see the base builds list above for why
             // it's gone entirely. linear_res IS the fused-residual f16 GEMV file, included since
             // the resident-BDA endgame deletes every bound-SSBO weight path.
-            "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32r" | "linear_f32_mo"
-            | "native_gemv_kq_fma" | "linear_res" | "native_gemm_fma" | "native_gemm_kq_fma" => {
-                true
-            }
+            "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32r" | "linear_res"
+            | "native_gemm_fma" => true,
             // Model-specific float-weight kernels: qwen35's SSM depthwise conv1d+SiLU (both the
             // sequential and batch-pass-1 variants — conv1d_shift never reads the weight) and
             // gemma4 E2B's per-layer fused inp_gate GEMV. Same typed buffer_reference seam as the
@@ -3738,7 +3659,15 @@ fn main() {
             }
         })
         .collect();
-    compile_shaders(&glslc_path(), &out, &builds);
+    if let Err(msg) = compile_shaders(&glslc_path(), &out, &builds) {
+        // `cargo::error` prints each line once as `error: infr-vulkan@…: <line>` and fails the
+        // build when the script returns. Exiting non-zero instead would make cargo also dump the
+        // script's stdout, printing the whole message a second time.
+        for line in msg.lines() {
+            println!("cargo::error={line}");
+        }
+        return;
+    }
     // Shader-set fingerprint for the on-disk vkPipelineCache (see src/pcache.rs): FNV-1a over
     // every compiled SPIR-V blob in the (stable) build-list order. Any shader edit, new variant,
     // or glslc/define change flips it, and the persisted cache file is discarded wholesale —
@@ -3876,32 +3805,196 @@ fn gen_grids(out: &str) {
     std::fs::write(format!("{out}/native_grids.glsl"), s).expect("write native_grids.glsl");
 }
 
-/// Compile every build to `{out}/{output stem}.spv`, reusing cached outputs keyed by content.
-fn compile_shaders(glslc: &Path, out: &str, builds: &[(String, String, Vec<String>)]) {
+/// The `glslc` flags every shader compiles with.
+const GLSLC_FLAGS: [&str; 3] = ["-fshader-stage=comp", "--target-env=vulkan1.3", "-O"];
+
+/// Output stems of the builds [`compile_shaders`] compiles first, before the rest fan out: the
+/// ones an old `glslc` is most likely to reject. `deltanet_prep` is the cooperative-matrix shader
+/// shaderc 2023.8 failed on (#93); the others each carry one of the newest constructs the shaders
+/// use — E4M3 and bf16 cooperative matrices, int8 cooperative matrices with buffer references,
+/// packed integer dot products, buffer references, clustered subgroup reductions.
+///
+/// They are entries of the real build list rather than a hand-written probe shader, so they
+/// cannot drift from what the build needs, and compiling them first costs nothing: their output
+/// is the real output. They only make a too-old toolchain fail in seconds; a failure anywhere
+/// else gets the same message from [`glslc_failure`].
+const CANARIES: &[&str] = &[
+    "deltanet_prep",
+    "native_gemm_f8cm_q8_0",
+    "native_gemm_warp_bf16cm",
+    "native_gemm_i8cm_q8_0_streamed",
+    "native_gemm_dp4a_q4k",
+    "linear_f16",
+    "attn_flash_warp",
+];
+
+/// What is known about which `glslc` builds the shaders, and which one the build runs (see
+/// [`glslc_path`]). Known-good and known-bad releases only: the first release that compiles
+/// every shader has not been pinned down.
+const GLSLC_HELP: &str = "Known to build every shader: shaderc 2026.1, 2026.3 and 2026.4. \
+Known not to: shaderc 2023.8 (Ubuntu 24.04's package).\n\
+Install a current Vulkan SDK (https://vulkan.lunarg.com/sdk/home), or shaderc 2026 or newer.\n\
+The build runs the glslc on PATH, else the Vulkan SDK's ($VULKAN_SDK/Bin, or bin on Linux and macOS).";
+
+/// Why one `glslc` run did not produce its SPIR-V.
+enum GlslcError {
+    /// The process could not be started at all.
+    Spawn(std::io::Error),
+    /// It ran and exited unsuccessfully, printing `stderr`.
+    Failed {
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+}
+
+type Build = (String, String, Vec<String>);
+
+/// Compile every `(source stem, output stem, defines)` build to `{out}/{output stem}.spv`, the
+/// [`CANARIES`] first, and return the message to stop the build with if any compile fails.
+fn compile_shaders(glslc: &Path, out: &str, builds: &[Build]) -> Result<(), String> {
     for (src_stem, _, _) in builds {
         println!("cargo:rerun-if-changed=shaders/{src_stem}.comp");
     }
-    let out_dir = Path::new(out);
-    let jobs: Vec<spv_hoard::Job> = builds
+    let (canaries, rest): (Vec<&Build>, Vec<&Build>) = builds
         .iter()
-        .map(|(src_stem, dst_stem, defines)| spv_hoard::Job {
-            src: PathBuf::from(format!("shaders/{src_stem}.comp")),
-            defines: defines.clone(),
-            out: out_dir.join(format!("{dst_stem}.spv")),
-        })
-        .collect();
-    let cache = spv_hoard::Cache::new(glslc, spv_hoard::default_cache_dir(out_dir))
-        .expect("failed to run glslc — install shaderc (provides glslc)")
-        .flags(["-fshader-stage=comp", "--target-env=vulkan1.3", "-O"].map(String::from))
-        .include(out_dir);
-    let jobs_limit = std::env::var("NUM_JOBS")
+        .partition(|(_, dst_stem, _)| CANARIES.contains(&dst_stem.as_str()));
+    for name in CANARIES {
+        assert!(
+            canaries.iter().any(|(_, dst_stem, _)| dst_stem == name),
+            "canary build `{name}` is not in the build list; update CANARIES"
+        );
+    }
+    compile_parallel(glslc, out, &canaries)?;
+    compile_parallel(glslc, out, &rest)
+}
+
+/// Compile `builds`, spread over the build script's job allowance (`NUM_JOBS`, which cargo sets
+/// from `-j`).
+///
+/// One `glslc` process per variant, one after another, made every shader edit a multi-minute
+/// rebuild — worst on Windows, where starting a process costs several times what it does on Linux.
+/// The builds are independent (each writes only its own `.spv`), and everything downstream reads
+/// the outputs back in list order, so completion order is irrelevant. The first failure wins:
+/// workers start no new compile once one has failed, and failures already in flight are only
+/// counted, so the build stops with one message rather than one per worker.
+fn compile_parallel(glslc: &Path, out: &str, builds: &[&Build]) -> Result<(), String> {
+    let jobs = std::env::var("NUM_JOBS")
         .ok()
         .and_then(|n| n.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(1);
-    cache
-        .compile_all(&jobs, jobs_limit)
-        .unwrap_or_else(|err| panic!("{err}"));
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let first: Mutex<Option<String>> = Mutex::new(None);
+    let others = AtomicUsize::new(0);
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.min(builds.len()) {
+            scope.spawn(|| {
+                while !failed.load(Ordering::Relaxed) {
+                    let Some((src_stem, dst_stem, defines)) =
+                        builds.get(next.fetch_add(1, Ordering::Relaxed))
+                    else {
+                        break;
+                    };
+                    let src = format!("shaders/{src_stem}.comp");
+                    let run = Command::new(glslc)
+                        .args(GLSLC_FLAGS)
+                        .arg(format!("-I{out}"))
+                        .args(defines)
+                        .arg(&src)
+                        .arg("-o")
+                        .arg(format!("{out}/{dst_stem}.spv"))
+                        .output();
+                    let err = match run {
+                        Ok(o) if o.status.success() => continue,
+                        Ok(o) => GlslcError::Failed {
+                            status: o.status,
+                            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+                        },
+                        Err(e) => GlslcError::Spawn(e),
+                    };
+                    failed.store(true, Ordering::Relaxed);
+                    let mut first = first.lock().unwrap_or_else(|e| e.into_inner());
+                    if first.is_none() {
+                        let what = if defines.is_empty() {
+                            format!("{src} (output {dst_stem}.spv)")
+                        } else {
+                            format!("{src} with {} (output {dst_stem}.spv)", defines.join(" "))
+                        };
+                        *first = Some(glslc_failure(glslc, &what, err));
+                    } else {
+                        others.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    match first.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        None => Ok(()),
+        Some(msg) => match others.into_inner() {
+            0 => Err(msg),
+            n => Err(format!(
+                "{msg}\n({n} more shader(s) failed while this one was being reported.)"
+            )),
+        },
+    }
+}
+
+/// The message a failed `glslc` run stops the build with: which shader, which `glslc` and its
+/// version, what it printed, and what to do about it. The wording follows the evidence — a
+/// diagnostic on stderr usually means a shaderc too old for the shader; silence or a failure to
+/// start means `glslc` itself is broken or missing.
+fn glslc_failure(glslc: &Path, what: &str, err: GlslcError) -> String {
+    let shown = glslc_display(glslc);
+    let (status, stderr) = match err {
+        GlslcError::Spawn(e) => return format!("cannot run {shown}: {e}\n{GLSLC_HELP}"),
+        GlslcError::Failed { status, stderr } => (status, stderr),
+    };
+    let version = Command::new(glslc)
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|v| {
+            let text = String::from_utf8_lossy(&v.stdout).into_owned();
+            text.lines().next().map(|l| l.trim().to_string())
+        })
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let head = format!(
+        "glslc failed to compile {what} ({status})\n  glslc:   {shown}\n  version: {version}\n"
+    );
+    if stderr.trim().is_empty() {
+        return format!(
+            "{head}It printed nothing. A glslc that exits without a diagnostic most likely \
+             crashed or could not load (a missing library, a broken install) rather than \
+             rejecting the shader.\n{GLSLC_HELP}"
+        );
+    }
+    let diagnostic: String = stderr.lines().map(|l| format!("  {l}\n")).collect();
+    format!(
+        "{head}glslc said:\n{diagnostic}\
+         The usual cause is a shaderc too old for infr's shaders.\n{GLSLC_HELP}"
+    )
+}
+
+/// How a failure message names the `glslc` that ran: the path itself when [`glslc_path`] chose
+/// one, else the bare name the OS resolves from `PATH`, with the first `glslc` file there as a
+/// hint. That file is only what is most likely to have run: the OS skips a non-executable file
+/// on Unix, and searches its own directories first on Windows.
+fn glslc_display(glslc: &Path) -> String {
+    if glslc.components().count() > 1 {
+        return glslc.display().to_string();
+    }
+    let exe = format!("glslc{}", std::env::consts::EXE_SUFFIX);
+    let first = std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|dir| dir.join(&exe))
+            .find(|cand| cand.is_file())
+    });
+    match first {
+        Some(found) => format!("glslc (from PATH, first match {})", found.display()),
+        None => "glslc (not found on PATH)".to_string(),
+    }
 }
 
 /// The `glslc` to run: the one on `PATH`, else the Vulkan SDK's (`$VULKAN_SDK/Bin`).

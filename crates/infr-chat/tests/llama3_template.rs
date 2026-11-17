@@ -84,9 +84,9 @@ fn llama3_renders_tool_call_roundtrip() {
         json!({ "role": "tool", "content": "sunny, 24C" }),
     ];
     let out = render(msgs, weather_tools()).expect("tool round-trip must render");
-    // Assistant tool call: {"name": "get_weather", "parameters": {"city":"Paris"}} (bare JSON form).
+    // Assistant tool call: {"name": "get_weather", "parameters": {"city": "Paris"}} (bare JSON form).
     assert!(
-        out.contains("{\"name\": \"get_weather\", \"parameters\": {\"city\":\"Paris\"}}"),
+        out.contains("{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}"),
         "{out}"
     );
     // Tool result comes back under the ipython role header.
@@ -120,10 +120,10 @@ fn llama3_date_string_uses_strftime_now() {
     assert!(!out.contains("26 Jul 2024"), "fallback date used: {out}");
 }
 
-/// `tojson` WITHOUT `indent` stays compact — the exact form the Qwen-family templates render tools
-/// with today (goldens/qwen tool prompts must not change shape).
+/// `tojson` WITHOUT `indent` writes Python's `json.dumps` separators, as llama.cpp does — the form
+/// the Qwen-family templates render tools with.
 #[test]
-fn tojson_without_indent_stays_compact() {
+fn tojson_without_indent_uses_python_separators() {
     let out = render_template(
         "{% set t = {\"a\": 1, \"b\": [1, 2]} %}{{ t | tojson }}",
         vec![],
@@ -133,6 +133,6 @@ fn tojson_without_indent_stays_compact() {
         false,
         false,
     )
-    .expect("compact tojson");
-    assert_eq!(out, "{\"a\":1,\"b\":[1,2]}");
+    .expect("one-line tojson");
+    assert_eq!(out, "{\"a\": 1, \"b\": [1, 2]}");
 }

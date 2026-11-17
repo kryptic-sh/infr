@@ -95,17 +95,23 @@ fn q5_1_block(x: &[f32], dst: &mut [u8]) {
     dst[2..4].copy_from_slice(&h(min));
     let mut qh: u32 = 0;
     for j in 0..QK / 2 {
-        // `.min(31)` matches the clamp its q4_0/q4_1/q5_0 siblings apply. Unreachable in practice
-        // ((x-min)*id ≤ 31, so the +0.5 truncates to ≤ 31), but a stray 32 would otherwise set the
-        // 5th bit with a zero low nibble (decoding to 16, not 31) — the guard keeps that severe
-        // failure mode impossible. Byte-identical for every real block.
-        let xi0 = (((x[j] - min) * id + 0.5) as i32 as u8).min(31);
-        let xi1 = (((x[j + QK / 2] - min) * id + 0.5) as i32 as u8).min(31);
+        let xi0 = q5_1_code(x[j], min, id);
+        let xi1 = q5_1_code(x[j + QK / 2], min, id);
         dst[8 + j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
         qh |= (((xi0 & 0x10) >> 4) as u32) << j;
         qh |= (((xi1 & 0x10) >> 4) as u32) << (j + QK / 2);
     }
     dst[4..8].copy_from_slice(&qh.to_le_bytes());
+}
+
+/// One q5_1 element's 5-bit code. `.min(31)` matches the clamp its q4_0/q4_1/q5_0 siblings apply.
+/// Unreachable in practice ((x-min)*id ≤ 31, so the +0.5 truncates to ≤ 31), but a stray 32 would
+/// otherwise set the 5th bit with a zero low nibble (decoding to 16, not 31). The guard saturates
+/// an index in 32..=255 only: the `as u8` cast runs first, so 256 or more has already wrapped.
+/// Byte-identical for every real block.
+#[inline]
+fn q5_1_code(v: f32, min: f32, id: f32) -> u8 {
+    (((v - min) * id + 0.5) as i32 as u8).min(31)
 }
 
 /// Nearest codebook index (llama.cpp `best_index_int8`, binary search on the sorted values).
@@ -262,11 +268,11 @@ mod tests {
         }
         assert_eq!(code(&blk, QK - 1), 31, "max element must encode to 31");
 
-        // Directly exercise the guard: the pre-mask cast can never legitimately exceed 31, but if it
-        // did, `.min(31)` saturates instead of wrapping into the 5th bit with a zeroed low nibble.
-        let raw = (40.0f32 as i32 as u8).min(31);
+        // Exercise the guard through the encoder's own code path. A real block never reaches an
+        // index above 31 (see `q5_1_code`), so the out-of-range value is fed to it directly.
         assert_eq!(
-            raw, 31,
+            q5_1_code(40.0, 0.0, 1.0),
+            31,
             "overflow must clamp to 31, not wrap to 8 (40 & 0x1F)"
         );
     }

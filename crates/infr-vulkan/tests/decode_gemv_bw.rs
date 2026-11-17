@@ -52,8 +52,11 @@ fn decode_gemv_bw() {
         g
     };
     let be_for = |mode: &str| -> VulkanBackend {
+        // Deliberately the default device, not `INFR_DEV`: this bench's one-submit rep loop runs
+        // past the integrated GPU's watchdog and resets it (`ring gfx_0.0.0 timeout`).
         let mut cfg = infr_core::config::Config::default();
         cfg.kernels.vulkan.gemv = mode_cfg(mode);
+        infr_testkit::honour_env(&mut cfg);
         VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap()
     };
     let modes = ["1", "R2", "R4", "S2", "S4", "S8"];

@@ -1,4 +1,4 @@
-//! Named weight-source metadata and access shared across model formats.
+//! The weight-source seam — formats (GGUF now, safetensors later) implement this.
 
 use crate::error::Result;
 use crate::tensor::DType;
@@ -82,20 +82,14 @@ pub struct TensorInfo {
     pub nbytes: usize,
 }
 
-/// A named model weight source with architecture metadata.
+/// A model weight file. GGUF is the MVP impl (`infr-gguf`).
 pub trait WeightSource: Send + Sync {
     fn metadata(&self) -> &Metadata;
     fn tensors(&self) -> &[TensorInfo];
     /// Raw bytes for a named tensor (quantized blocks returned as-is).
     fn tensor_bytes(&self, name: &str) -> Result<&[u8]>;
-    /// Optional bounded row reconstruction for specialized embedding representations.
-    fn tensor_rows(&self, _name: &str, _ids: &[u32]) -> Result<Option<Vec<f32>>> {
-        Ok(None)
-    }
     /// Embedded jinja chat template, if present.
     fn chat_template(&self) -> Option<&str>;
-    /// Downcast for format-specific mmap and paging fast paths.
-    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 #[cfg(test)]

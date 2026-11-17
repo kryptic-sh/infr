@@ -31,32 +31,17 @@ include!(concat!(env!("OUT_DIR"), "/native_gemm_map.rs"));
 /// build) is loaded via [`native_mrow_spv`].
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_mrow_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
-    use infr_core::DType::*;
-    Some(match dtype {
-        Q8_0 => "native_mrow_q8_0",
-        Bf16 => "native_mrow_bf16",
-        Q4_0 => "native_mrow_q4_0",
-        Q4_1 => "native_mrow_q4_1",
-        Q5_0 => "native_mrow_q5_0",
-        Q5_1 => "native_mrow_q5_1",
-        Q2K => "native_mrow_q2k",
-        Q3K => "native_mrow_q3k",
-        Q4K => "native_mrow_q4k",
-        Q5K => "native_mrow_q5k",
-        Q6K => "native_mrow_q6k",
-        Iq4Nl => "native_mrow_iq4nl",
-        Iq4Xs => "native_mrow_iq4xs",
-        Q2_0 => "native_mrow_q2_0",
-        _ => return None,
-    })
+    // Delegate to the SPIR-V table the recorder loads, so the gate cannot name a missing build.
+    native_mrow_spv(dtype).map(|(name, _)| name)
 }
 
 /// The dense layer-streaming decode GEMV (kernel-cache name + SPIR-V): reads the weight from a
 /// `bufferDeviceAddress` arena pool by 64-bit address (native_weight_addr.glsl) instead of a bound
 /// SSBO — the ONLY weight build for this family (the bound-SSBO resident build died with the eager
 /// `VulkanBackend::linear_native` / `Recorder::linear_native_{sg,rm,rm_v2}` callers that were its
-/// sole consumers). All streamed dense Linears (any m) route through this one kernel's rows loop —
-/// see [`crate::recorder::Recorder::linear_native_at`] and [`crate::pager::DensePagerSession`].
+/// sole consumers). The plain dequant GEMV of `Recorder::linear_native_routed_at`, resident and
+/// streamed, and the per-row fallback a breaching weight takes — see
+/// [`crate::recorder::Recorder::linear_native_at`] and [`crate::pager::DensePagerSession`].
 /// `res`: production dispatches fused-residual GEMVs too (the decode Linear+Add fusion,
 /// [`crate::recorder::Recorder::linear_add_native`]), so both arms are load-bearing. `None` for a
 /// dtype without a native GEMV build.
@@ -210,6 +195,11 @@ pub(crate) fn native_rm_streamed_build_spv(
     }
 }
 
+/// Every variant name [`native_rm_v2_streamed_build_spv`] has a build for (for some dtype) —
+/// the values the `gemv.variant` tuning parameter accepts besides `none`.
+/// `gemv_variants_all_have_a_build` holds the two together.
+pub(crate) const GEMV_RM_V2_VARIANTS: &[&str] = &["reg", "sg", "dbuf", "wg128"];
+
 /// SPIR-V + kernel name for an experimental RM kernel variant (env-gated, default OFF) — the ONLY
 /// weight build for this family (the bound-SSBO resident build died with the eager
 /// `Recorder::linear_native_rm_v2` caller, its sole consumer). Returns (kernel_name, spv) for the
@@ -293,40 +283,6 @@ pub(crate) fn native_sg_streamed_build_spv(
         (Q6K, true, 4, true) => v!("native_q6k_sg4_res_sg16"),
         (Q6K, false, 8, true) => v!("native_q6k_sg8_sg16"),
         (Q6K, true, 8, true) => v!("native_q6k_sg8_res_sg16"),
-        _ => None,
-    }
-}
-
-/// Wave64-NATIVE twin of [`native_sg_streamed_build_spv`] (`-DSG=64` builds): one full wave64
-/// per workgroup, plain subgroup ops (`W64=false` at pipeline time). Same (dtype, res, nr)
-/// coverage — Q6_K × {2,4,8} × {plain,res} — and the same reassociation-tolerant (NOT
-/// bit-identical) accumulation-order caveat. Selected by `Recorder::sg64`
-/// (`kernels.vulkan.wave64_native` on wave64 devices); `None` for everything else.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_sg64_streamed_build_spv(
-    dtype: infr_core::DType,
-    res: bool,
-    nr: u32,
-) -> Option<(&'static str, &'static [u32])> {
-    use infr_core::DType::*;
-    macro_rules! v {
-        ($name:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            let s = S
-                .get_or_init(|| {
-                    spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv")))
-                })
-                .as_slice();
-            Some(($name, s))
-        }};
-    }
-    match (dtype, res, nr) {
-        (Q6K, false, 2) => v!("native_q6k_sg2_sg64"),
-        (Q6K, true, 2) => v!("native_q6k_sg2_res_sg64"),
-        (Q6K, false, 4) => v!("native_q6k_sg4_sg64"),
-        (Q6K, true, 4) => v!("native_q6k_sg4_res_sg64"),
-        (Q6K, false, 8) => v!("native_q6k_sg8_sg64"),
-        (Q6K, true, 8) => v!("native_q6k_sg8_res_sg64"),
         _ => None,
     }
 }
@@ -609,30 +565,6 @@ pub(crate) fn native_mmv_mrow_kernel_name(dtype: infr_core::DType) -> Option<&'s
     // SPIR-V source of truth so the availability gate can never drift from the shader (AUDIT #1).
     native_mmv_mrow_variant_spv(dtype, false, false, false).map(|(name, _)| name)
 }
-/// Whether the multi-row int8 dp4a GEMV family has a fused-residual (`-DUSE_RES`) build for `dtype`.
-/// The residual arm is only ever declared at `m4 = true` (decode is always `rows == 1`), so this
-/// probes exactly that build. Iq4Xs is the sole mrow-eligible dtype WITHOUT a `_res` twin, which is
-/// why `linear_mmv_mrow_at` and the adapter must consult this predicate before dispatching a
-/// residual mrow decode (AUDIT #2) rather than assuming a plain build implies a res build.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_res_supported(dtype: infr_core::DType) -> bool {
-    native_mmv_mrow_variant_spv(dtype, false, true, true).is_some()
-}
-/// SPIR-V for a multi-row int8 dp4a GEMV layout variant: `o4` = the small-in_f 4-outputs ×
-/// 16-K-lanes workgroup split (-DOUTS4), `m4` = the rows<=4 MR specialization (-DMRV=4), `res` =
-/// the fused-residual decode build (-DUSE_RES, only ever paired with rows=1, hence requires
-/// `m4=true`; see `Recorder::linear_mmv_mrow`'s gates and its doc on the rows=1 decode/verify
-/// unification).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_variant_kernel_name(
-    dtype: infr_core::DType,
-    o4: bool,
-    m4: bool,
-    res: bool,
-) -> Option<&'static str> {
-    // Delegate to the SPIR-V source of truth so gate and shader can never drift (AUDIT #1).
-    native_mmv_mrow_variant_spv(dtype, o4, m4, res).map(|(name, _)| name)
-}
 /// Kernel-cache NAME for the rows 9..=16 multi-row int8 dp4a GEMV tier (`-DMRV=16`, 2-output layout
 /// — no OUTS4 twin: the tier is gated to >= 8M-element weights, whose in_f is comfortably >= 2048);
 /// the SPIR-V lives in [`native_mmv_mrow_m16_spv`]. `None` = format not covered (same coverage as
@@ -675,43 +607,13 @@ pub(crate) fn native_mmv_spv(
         _ => None,
     }
 }
-/// Packed-header twins for Q4_K OUTS4. Only metadata loads/unpacking differ;
-/// the dot products, row/K lane layout and reduction tree stay unchanged.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_mmv_mrow_q4k_meta_spv(
-    m4: bool,
-    res: bool,
-) -> Option<(&'static str, &'static [u32])> {
-    macro_rules! v {
-        ($suffix:literal) => {{
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            Some((
-                concat!("native_mmv_mrow_q4k", $suffix, "_packed_meta"),
-                S.get_or_init(|| {
-                    spv_words(include_bytes!(concat!(
-                        env!("OUT_DIR"),
-                        "/native_mmv_mrow_q4k",
-                        $suffix,
-                        "_packed_meta.spv"
-                    )))
-                })
-                .as_slice(),
-            ))
-        }};
-    }
-    match (m4, res) {
-        (false, false) => v!("_o4"),
-        (true, false) => v!("_o4_m4"),
-        (true, true) => v!("_o4_m4_res"),
-        (false, true) => None,
-    }
-}
-
-/// `-DSTREAMED` twin of [`native_mmv_mrow_variant_kernel_name`] (kernel-cache name + SPIR-V), covering the
-/// rows<=8 layout matrix (`o4`/`m4`/`res`). `res` mirrors [`native_mmv_mrow_variant_kernel_name`]'s residual
-/// arm — build-declared ONLY at `m4 = true` (the decode Linear+Add fusion always dispatches this
-/// shader at `rows = 1`, which forces `m4 = true`; see [`crate::recorder::Recorder::linear_mmv_mrow`]'s
-/// doc) and NEVER for `Iq4Xs` (no `-DUSE_RES` build exists for that dtype in this family). `res =
+/// SPIR-V (kernel-cache name + words) for a multi-row int8 dp4a GEMV layout variant, covering the
+/// rows<=8 layout matrix: `o4` = the small-in_f 4-outputs × 16-K-lanes workgroup split
+/// (-DOUTS4), `m4` = the rows<=4 MR specialization (-DMRV=4), `res` = the fused-residual decode
+/// build (-DUSE_RES) — build-declared ONLY at `m4 = true` (the decode Linear+Add fusion always
+/// dispatches this shader at `rows = 1`; see [`crate::recorder::Recorder::linear_mmv_mrow`]'s
+/// doc) and NEVER for `Iq4Xs` (no `-DUSE_RES` build exists for that dtype in this family). Callers
+/// select through [`crate::recorder::mmv_mrow_variant`], which applies the layout knobs. `res =
 /// true` is load-bearing for [`crate::recorder::Recorder::linear_mmv_mrow_at`]'s residual
 /// path, not just a parity-test convenience.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -806,28 +708,6 @@ pub(crate) fn native_mmv_mrow_variant_spv(
         (Iq4Nl, true, true, true) => v!("native_mmv_mrow_iq4nl_o4_m4_res"),
         _ => None,
     }
-}
-
-/// FUSE_QUANT twin of [`native_mmv_mrow_variant_kernel_name`] — inline activation quantization,
-/// opt-in behind INFR_MMV_FUSE_QUANT=1. Q4_K/Q6_K only, m4=true + res combos only (decode).
-pub(crate) fn native_mmv_mrow_variant_fuseq_kernel_name(
-    dtype: infr_core::DType,
-    o4: bool,
-    _m4: bool,
-    res: bool,
-) -> Option<&'static str> {
-    use infr_core::DType::*;
-    Some(match (dtype, o4, res) {
-        (Q4K, false, false) => "native_mmv_mrow_q4k_m4_fuseq",
-        (Q4K, true, false) => "native_mmv_mrow_q4k_o4_m4_fuseq",
-        (Q4K, false, true) => "native_mmv_mrow_q4k_m4_res_fuseq",
-        (Q4K, true, true) => "native_mmv_mrow_q4k_o4_m4_res_fuseq",
-        (Q6K, false, false) => "native_mmv_mrow_q6k_m4_fuseq",
-        (Q6K, true, false) => "native_mmv_mrow_q6k_o4_m4_fuseq",
-        (Q6K, false, true) => "native_mmv_mrow_q6k_m4_res_fuseq",
-        (Q6K, true, true) => "native_mmv_mrow_q6k_o4_m4_res_fuseq",
-        _ => return None,
-    })
 }
 
 /// FUSE_QUANT twin of [`native_mmv_mrow_variant_spv`] — kernel-cache name + SPIR-V for the
@@ -984,8 +864,9 @@ pub(crate) fn native_gemm_mmq_q6k_spv() -> &'static [u32] {
 }
 /// The `-DSTREAMED` dense tiled dp4a (mmq) GEMM (kernel-cache name + SPIR-V) — the weight read from
 /// a `bufferDeviceAddress` arena; the sole weight build for the dense mmq set. Production
-/// dispatches it via [`crate::recorder::Recorder::matmul_mmq`]; parity tests call
-/// [`crate::recorder::Recorder::matmul_mmq_at`] directly with an explicit arena address. The `_xp*` EXPERT_GRID twins are also emitted (same gate in build.rs) but get their lookup
+/// dispatches it via [`crate::recorder::Recorder::matmul_mmq_at`] (the adapter's
+/// `nc_prefill_gemm`, with a resident weight's BDA or a streamed slot's arena base);
+/// [`crate::recorder::Recorder::matmul_mmq`] is the bound-buffer wrapper the parity tests use. The `_xp*` EXPERT_GRID twins are also emitted (same gate in build.rs) but get their lookup
 /// when the expert router grows an `arena: Option<u64>` arm at integration time.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_mmq_dense_spv(
@@ -1064,6 +945,14 @@ pub(crate) fn linear_f32r_mrow8_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// `-DSTREAMED` twin SPIR-V of `linear_f32r_v4` (one row, vec4 K stream; see the shader's
+/// `MROW && VEC4` arm).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn linear_f32r_v4_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/linear_f32r_v4.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// `-DSTREAMED` twin SPIR-V of `linear_f32r_mrow4_v4` (slice A4; see the shader's
 /// STREAMED doc — weight read through a typed 64-bit buffer_reference). Parity-test entry.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1089,7 +978,9 @@ pub(crate) fn linear_res_spv() -> &'static [u32] {
     S.get_or_init(|| spv_words(BYTES))
 }
 /// SPIR-V (kernel-cache name + words) for [`native_gemm_fma_kernel_name`]'s pick; the sole weight
-/// build — production dispatches it via [`crate::recorder::Recorder::matmul_fma`].
+/// build — production dispatches it via [`crate::recorder::Recorder::matmul_fma_at`] (the
+/// adapter's `nc_prefill_gemm`, resident or streamed); [`crate::recorder::Recorder::matmul_fma`]
+/// is the bound-buffer wrapper the parity tests use.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_fma_spv(
     dtype: infr_core::DType,
@@ -1109,103 +1000,6 @@ pub(crate) fn native_gemm_fma_spv(
         _ => return None,
     })
 }
-/// SPIR-V (kernel-cache name + words) for the fp32 K-quant prefill GEMM (`native_gemm_kq_fma.comp`)
-/// at column tile `bn` (64 or 128); `None` for dtypes or tiles without a build. One build serves
-/// both the direct tile (`splits = 1`) and split-K (`splits > 1`) — the shader takes the slice
-/// bounds from its push constants.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemm_kq_fma_spv(
-    dtype: infr_core::DType,
-    bn: usize,
-) -> Option<(&'static str, &'static [u32])> {
-    macro_rules! spv {
-        ($name:literal) => {{
-            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
-        }};
-    }
-    use infr_core::DType::*;
-    Some(match (dtype, bn) {
-        (Q4_0, 64) => spv!("native_gemm_kq_fma_q4_0_t64"),
-        (Q4_0, 128) => spv!("native_gemm_kq_fma_q4_0_t128"),
-        (Q4K, 64) => spv!("native_gemm_kq_fma_q4k_t64"),
-        (Q4K, 128) => spv!("native_gemm_kq_fma_q4k_t128"),
-        (Q6K, 64) => spv!("native_gemm_kq_fma_q6k_t64"),
-        (Q6K, 128) => spv!("native_gemm_kq_fma_q6k_t128"),
-        _ => return None,
-    })
-}
-/// SPIR-V (kernel-cache name + words) for the fp32 K-quant decode GEMV (`native_gemv_kq_fma.comp`),
-/// with or without the fused residual add, at `nr` (4 or 8) rows per workgroup, reading the weight
-/// by device address or (`ssbo`) from binding 3; `None` for dtypes without a build.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemv_kq_fma_spv(
-    dtype: infr_core::DType,
-    res: bool,
-    nr: usize,
-    ssbo: bool,
-) -> Option<(&'static str, &'static [u32])> {
-    macro_rules! spv {
-        ($name:literal) => {{
-            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
-        }};
-    }
-    use infr_core::DType::*;
-    Some(match (dtype, res, nr, ssbo) {
-        (Q4K, false, 8, false) => spv!("native_gemv_kq_fma_q4k"),
-        (Q4K, true, 8, false) => spv!("native_gemv_kq_fma_q4k_res"),
-        (Q6K, false, 8, false) => spv!("native_gemv_kq_fma_q6k"),
-        (Q6K, true, 8, false) => spv!("native_gemv_kq_fma_q6k_res"),
-        (Q4K, false, 4, false) => spv!("native_gemv_kq_fma_q4k_nr4"),
-        (Q4K, true, 4, false) => spv!("native_gemv_kq_fma_q4k_res_nr4"),
-        (Q6K, false, 4, false) => spv!("native_gemv_kq_fma_q6k_nr4"),
-        (Q6K, true, 4, false) => spv!("native_gemv_kq_fma_q6k_res_nr4"),
-        (Q4K, false, 8, true) => spv!("native_gemv_kq_fma_q4k_ssbo"),
-        (Q4K, true, 8, true) => spv!("native_gemv_kq_fma_q4k_res_ssbo"),
-        (Q6K, false, 8, true) => spv!("native_gemv_kq_fma_q6k_ssbo"),
-        (Q6K, true, 8, true) => spv!("native_gemv_kq_fma_q6k_res_ssbo"),
-        (Q4K, false, 4, true) => spv!("native_gemv_kq_fma_q4k_nr4_ssbo"),
-        (Q4K, true, 4, true) => spv!("native_gemv_kq_fma_q4k_res_nr4_ssbo"),
-        (Q6K, false, 4, true) => spv!("native_gemv_kq_fma_q6k_nr4_ssbo"),
-        (Q6K, true, 4, true) => spv!("native_gemv_kq_fma_q6k_res_nr4_ssbo"),
-        _ => return None,
-    })
-}
-/// Multi-row fp32 K-quant GEMV SPIR-V at 4 or 8 output columns per workgroup.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn native_gemv_kq_fma_mrow_spv(
-    dtype: infr_core::DType,
-    nr: usize,
-) -> Option<(&'static str, &'static [u32])> {
-    macro_rules! spv {
-        ($name:literal) => {{
-            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
-        }};
-    }
-    use infr_core::DType::*;
-    Some(match (dtype, nr) {
-        (Q4K, 8) => spv!("native_gemv_kq_fma_mrow_q4k"),
-        (Q6K, 8) => spv!("native_gemv_kq_fma_mrow_q6k"),
-        (Q4K, 4) => spv!("native_gemv_kq_fma_mrow_q4k_nr4"),
-        (Q6K, 4) => spv!("native_gemv_kq_fma_mrow_q6k_nr4"),
-        _ => return None,
-    })
-}
-/// Whether `native_gemm_kq_fma` has a build for `dtype`.
-///
-/// Q4_0 rides the same tier: its dequant is cheaper than the K-quants' and the
-/// emulated-dp4a MMQ path loses to fp32 FMA on it by the same margin.
-pub(crate) fn native_gemm_kq_fma_supported(dtype: infr_core::DType) -> bool {
-    matches!(
-        dtype,
-        infr_core::DType::Q4_0 | infr_core::DType::Q4K | infr_core::DType::Q6K
-    )
-}
 /// SPIR-V for the non-coopmat float-weight prefill GEMM (the "fma-warp" tier, see
 /// `native_gemm_fma.comp`): shared-memory fma warptile for f16/bf16/f32 weights on devices
 /// without a usable f16 coopmat (adapter.rs `nc_fma`). Returns the kernel-cache NAME (SPIR-V via
@@ -1213,17 +1007,12 @@ pub(crate) fn native_gemm_kq_fma_supported(dtype: infr_core::DType) -> bool {
 /// `None` for any other dtype.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn native_gemm_fma_kernel_name(dtype: infr_core::DType) -> Option<&'static str> {
-    use infr_core::DType::*;
-    Some(match dtype {
-        F16 => "native_gemm_fma_f16",
-        Bf16 => "native_gemm_fma_bf16",
-        F32 => "native_gemm_fma_f32",
-        _ => return None,
-    })
+    // Delegate to the SPIR-V table the recorder loads, so the gate cannot name a missing build.
+    native_gemm_fma_spv(dtype).map(|(name, _)| name)
 }
 /// SPIR-V for the non-coopmat shared-memory fma flash-attention prefill (the "nc_fa" tier, see
 /// `attn_nc_fa.comp`): fused QK^T → online softmax → PV for devices without a usable f16 coopmat
-/// (adapter.rs `nc_fa_ok`). Three shared-Os builds; returns the smallest that fits `hd` as
+/// (adapter.rs `nc_fa_ok`). Three builds by widest head; returns the smallest that fits `hd` as
 /// `(kernel_cache_name, spv, BM row tile)`, or `None` for hd > 512.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn attn_nc_fa_spv(hd: usize) -> Option<(&'static str, &'static [u32], usize)> {
@@ -1374,6 +1163,115 @@ pub(crate) fn repack_q8_to_f8_streamed_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// Workgroup tile of the int8 cooperative-matrix K-quant prefill GEMM
+/// (`native_gemm_i8cm_kq.comp`). The extents MIRROR the `-DTILE_*` defines of the matching
+/// builds in `build.rs`; `i8cm_kq_tiles_match_build` fails if they drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum I8cmTile {
+    /// 128 tokens x 128 weight rows, two k blocks per stage, 512 threads.
+    L,
+    /// 64 tokens x 64 weight rows, four k blocks per stage, 128 threads.
+    M,
+}
+
+impl I8cmTile {
+    /// Tokens (output rows) per workgroup.
+    pub(crate) fn tokens(self) -> usize {
+        match self {
+            I8cmTile::L => 128,
+            I8cmTile::M => 64,
+        }
+    }
+    /// Weight rows (output columns) per workgroup.
+    pub(crate) fn rows(self) -> usize {
+        match self {
+            I8cmTile::L => 128,
+            I8cmTile::M => 64,
+        }
+    }
+    /// 32-element k blocks staged per step; `k / 32` must be a multiple of it.
+    pub(crate) fn k_blocks(self) -> usize {
+        match self {
+            I8cmTile::L => 2,
+            I8cmTile::M => 4,
+        }
+    }
+}
+
+/// SPIR-V for the int8 cooperative-matrix K-quant prefill GEMM (`native_gemm_i8cm_kq.comp`):
+/// `(kernel cache name, spv)` for `dtype` at `tile`, `None` for a dtype it has no build for.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_i8cm_kq_spv(
+    dtype: infr_core::DType,
+    tile: I8cmTile,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    use infr_core::DType::*;
+    Some(match (dtype, tile) {
+        (Q4K, I8cmTile::L) => spv!("native_gemm_i8cm_q4k_l"),
+        (Q4K, I8cmTile::M) => spv!("native_gemm_i8cm_q4k_m"),
+        (Q5K, I8cmTile::L) => spv!("native_gemm_i8cm_q5k_l"),
+        (Q5K, I8cmTile::M) => spv!("native_gemm_i8cm_q5k_m"),
+        (Q6K, I8cmTile::L) => spv!("native_gemm_i8cm_q6k_l"),
+        (Q6K, I8cmTile::M) => spv!("native_gemm_i8cm_q6k_m"),
+        _ => return None,
+    })
+}
+
+/// Workgroup and thread tile of the packed-int8-dot K-quant prefill GEMM
+/// (`native_gemm_dp4a_kq.comp`). The extents MIRROR the `-DTILE_*` defines of its builds in
+/// `build.rs`; `dp4a_kq_tile_matches_build` fails if they drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Dp4aKqTile {
+    /// Tokens (output rows) per workgroup.
+    pub(crate) tokens: usize,
+    /// Weight rows (output columns) per workgroup.
+    pub(crate) rows: usize,
+    /// 32-element k blocks staged per step; `k / 32` must be a multiple of it.
+    pub(crate) k_blocks: usize,
+    /// Tokens per thread.
+    pub(crate) thread_tokens: usize,
+    /// Weight rows per thread.
+    pub(crate) thread_rows: usize,
+}
+
+/// The one tile every `native_gemm_dp4a_*` build uses.
+pub(crate) const DP4A_KQ_TILE: Dp4aKqTile = Dp4aKqTile {
+    tokens: 128,
+    rows: 64,
+    k_blocks: 2,
+    thread_tokens: 8,
+    thread_rows: 8,
+};
+
+/// SPIR-V for the packed-int8-dot K-quant prefill GEMM (`native_gemm_dp4a_kq.comp`):
+/// `(kernel cache name, spv)` for `dtype`, `None` for a dtype it has no build for.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn native_gemm_dp4a_kq_spv(
+    dtype: infr_core::DType,
+) -> Option<(&'static str, &'static [u32])> {
+    macro_rules! spv {
+        ($name:literal) => {{
+            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
+            static S: OnceLock<Vec<u32>> = OnceLock::new();
+            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
+        }};
+    }
+    use infr_core::DType::*;
+    Some(match dtype {
+        Q4K => spv!("native_gemm_dp4a_q4k"),
+        Q5K => spv!("native_gemm_dp4a_q5k"),
+        Q6K => spv!("native_gemm_dp4a_q6k"),
+        _ => return None,
+    })
+}
+
 /// SPIR-V for the int8-coopmat GEMM's "Idea 2" whole-row-activation-scale measurement variant
 /// (see `native_gemm_i8cm_q8_0.comp` #ifdef ROW_SCALE), gated behind `INFR_I8_ROW_SCALE=1`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1837,13 +1735,6 @@ pub(crate) fn native_gemm_warp_sk_kernel_name(dtype: infr_core::DType) -> Option
 
 /// SPIR-V for the split-K reduce (sum the partials planes).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-/// SPIR-V for the probe-only sequential-read kernel (`bw_scan.comp`); see
-/// `tests/bw_scan.rs`. Nothing in production dispatches it.
-pub fn bw_scan_spv() -> &'static [u32] {
-    static S: OnceLock<Vec<u32>> = OnceLock::new();
-    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/bw_scan.spv"))))
-}
-
 pub(crate) fn splitk_reduce_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| {
@@ -2390,6 +2281,19 @@ pub(crate) fn coopmat_i8_layout_spv() -> &'static [u32] {
         )))
     })
 }
+/// SPIR-V for the wave64 path's known-answer probe (`wave64_probe.comp`) — dispatched once at init
+/// on a device that takes that path, to check that a 32-wide workgroup is one subgroup scanned in
+/// invocation order.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn wave64_probe_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| {
+        spv_words(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/wave64_probe.spv"
+        )))
+    })
+}
 /// SPIR-V for the 256-thread subgroup RMSNorm (`y=rmsnorm(x,w)`). Used by the recorder's `rmsnorm`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn rmsnorm_spv() -> &'static [u32] {
@@ -2494,6 +2398,13 @@ pub(crate) fn hyper_pre_spv() -> &'static [u32] {
 pub(crate) fn hyper_post_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/hyper_post.spv"))))
+}
+/// SPIR-V for the DeepSeek V4 compressor source gather (`gather_rows.comp`, `Op::GatherRows`).
+/// Used by the recorder's `gather_rows`.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn gather_rows_spv() -> &'static [u32] {
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(include_bytes!(concat!(env!("OUT_DIR"), "/gather_rows.spv"))))
 }
 /// SPIR-V for the DeepSeek V4 compressor pooling (`compress_pool.comp`, `Op::CompressPool`). Used
 /// by the recorder's `compress_pool`.
@@ -3160,6 +3071,35 @@ pub(crate) fn conv1d_silu_par_spv() -> &'static [u32] {
     static S: OnceLock<Vec<u32>> = OnceLock::new();
     S.get_or_init(|| spv_words(BYTES))
 }
+/// The `-DSHORTCONV` builds of `conv1d_silu.comp`, `conv1d_silu_par.comp` and `conv1d_shift.comp`:
+/// LFM's gated short convolution (`Op::ShortConv`), token-serial, batch pass 1 and the batch history
+/// rebuild. Production entries: [`crate::recorder::Recorder::shortconv`] and
+/// [`crate::recorder::Recorder::shortconv_batch`].
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn shortconv_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shortconv.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn shortconv_par_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shortconv_par.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn shortconv_shift_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shortconv_shift.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
+/// SPIR-V for the per-head sigmoid output gate (`Op::HeadGate`, LFM3 attention).
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn head_gate_spv() -> &'static [u32] {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/head_gate.spv"));
+    static S: OnceLock<Vec<u32>> = OnceLock::new();
+    S.get_or_init(|| spv_words(BYTES))
+}
 /// SPIR-V for the batched strided row copy (Op::CopyStrided in one dispatch).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn copy_strided_spv() -> &'static [u32] {
@@ -3331,6 +3271,8 @@ dyn_spv!(qk_norm_rope_dyn_ff_spv, "qk_norm_rope_dyn_ff");
 dyn_spv!(softmax_dyn_spv, "softmax_dyn");
 dyn_spv!(rope_f16_spv, "rope_f16");
 dyn_spv!(rope_f16_dyn_spv, "rope_f16_dyn");
+dyn_spv!(rope_f16_ff_spv, "rope_f16_ff");
+dyn_spv!(rope_f16_dyn_ff_spv, "rope_f16_dyn_ff");
 dyn_spv!(store_f16_dyn_spv, "store_f16_dyn");
 dyn_spv!(attention_kv_dyn_spv, "attention_kv_dyn");
 dyn_spv!(attn_partial_dyn_spv, "attn_partial_dyn");
@@ -3365,11 +3307,19 @@ dyn_spv!(attention_kv_sinks_spv, "attention_kv_sinks");
 // same way it does for sinks.
 dyn_spv!(attention_kv_bias_spv, "attention_kv_bias");
 dyn_spv!(attention_kv_sinks_bias_spv, "attention_kv_sinks_bias");
+// `Op::Attention::comp` (deepseek4's compressed key segment), with and without sinks and the
+// segment's own top-k bias — the adapter routes a comp op onto this scalar f16 path.
+dyn_spv!(attention_kv_comp_spv, "attention_kv_comp");
+dyn_spv!(attention_kv_comp_bias_spv, "attention_kv_comp_bias");
+dyn_spv!(attention_kv_comp_sinks_spv, "attention_kv_comp_sinks");
+dyn_spv!(
+    attention_kv_comp_sinks_bias_spv,
+    "attention_kv_comp_sinks_bias"
+);
 // KV-cache u64/BDA twins (#74, slice 1): the `-DKV_BDA` builds of the scalar attention_kv family —
 // K/V read by 64-bit device address (kv_addr.glsl) instead of bound SSBOs. Bound twins above stay
 // for kv_addr_parity.rs; production forks here via Recorder::attention_kv_at / attention_kv_dyn_at.
 dyn_spv!(attention_kv_bda_spv, "attention_kv_bda");
-dyn_spv!(linear_f32_mo_spv, "linear_f32_mo");
 dyn_spv!(attention_kv_dyn_bda_spv, "attention_kv_dyn_bda");
 dyn_spv!(attention_kv_q8_bda_spv, "attention_kv_q8_bda");
 dyn_spv!(attention_kv_kq8_bda_spv, "attention_kv_kq8_bda");
@@ -3413,6 +3363,8 @@ dyn_spv!(store_f16_bda_spv, "store_f16_bda");
 dyn_spv!(store_f16_dyn_bda_spv, "store_f16_dyn_bda");
 dyn_spv!(rope_f16_bda_spv, "rope_f16_bda");
 dyn_spv!(rope_f16_dyn_bda_spv, "rope_f16_dyn_bda");
+dyn_spv!(rope_f16_ff_bda_spv, "rope_f16_ff_bda");
+dyn_spv!(rope_f16_dyn_ff_bda_spv, "rope_f16_dyn_ff_bda");
 dyn_spv!(qk_norm_rope_bda_spv, "qk_norm_rope_bda");
 dyn_spv!(qk_norm_rope_dyn_bda_spv, "qk_norm_rope_dyn_bda");
 dyn_spv!(qk_norm_rope_ff_bda_spv, "qk_norm_rope_ff_bda");
@@ -3575,7 +3527,9 @@ dyn_spv!(
     attn_decode_hd512_swa_dynac_spv,
     "attn_decode_hd512_swa_dynac"
 );
-/// Disable fixed-head split-K pass 1 for decode and small static batches.
+/// `INFR_NO_ATTN_DECODE=1` (`kernels.vulkan.attn_decode` = false) — keep the general
+/// `attn_partial` builds on the decode fast path so the specialization can be A/B'd against the
+/// kernel it replaces with one env var and one binary.
 pub(crate) fn attn_decode_disabled(vk: &infr_core::config::VulkanCfg) -> bool {
     !vk.attn_decode
 }
@@ -3610,61 +3564,6 @@ pub(crate) fn attn_decode_kernel(
             "attn_decode_hd512_swa_dynac",
             attn_decode_hd512_swa_dynac_spv(),
         ),
-        _ => return None,
-    })
-}
-/// Fixed-head split-K pass 1 for static small-row batches, including sliding-window rings.
-pub(crate) fn attn_small_m_kernel(hd: usize, swa: bool) -> Option<(&'static str, &'static [u32])> {
-    macro_rules! spv {
-        ($name:literal) => {{
-            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
-        }};
-    }
-    Some(match (hd, swa) {
-        (128, false) => spv!("attn_small_m_hd128"),
-        (128, true) => spv!("attn_small_m_hd128_swa"),
-        (256, false) => spv!("attn_small_m_hd256"),
-        (256, true) => spv!("attn_small_m_hd256_swa"),
-        (512, false) => spv!("attn_small_m_hd512"),
-        (512, true) => spv!("attn_small_m_hd512_swa"),
-        _ => return None,
-    })
-}
-
-/// The GQA-batched decode pass-1 build (`attn_decode_gqa.comp`) for `(hd, g, swa, dynac)`, where
-/// `g` is query heads per kv head, or `None` when no build covers the shape.
-pub(crate) fn attn_decode_gqa_kernel(
-    hd: usize,
-    g: usize,
-    swa: bool,
-    dynac: bool,
-) -> Option<(&'static str, &'static [u32])> {
-    macro_rules! spv {
-        ($name:expr) => {{
-            const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/", $name, ".spv"));
-            static S: OnceLock<Vec<u32>> = OnceLock::new();
-            ($name, S.get_or_init(|| spv_words(BYTES)).as_slice())
-        }};
-    }
-    macro_rules! variants {
-        ($hd:literal, $g:literal) => {
-            match (swa, dynac) {
-                (false, false) => spv!(concat!("attn_decode_gqa_hd", $hd, "_g", $g)),
-                (false, true) => spv!(concat!("attn_decode_gqa_hd", $hd, "_g", $g, "_dynac")),
-                (true, false) => spv!(concat!("attn_decode_gqa_hd", $hd, "_g", $g, "_swa")),
-                (true, true) => spv!(concat!("attn_decode_gqa_hd", $hd, "_g", $g, "_swa_dynac")),
-            }
-        };
-    }
-    Some(match (hd, g) {
-        (128, 4) => variants!(128, 4),
-        (128, 8) => variants!(128, 8),
-        (256, 4) => variants!(256, 4),
-        (256, 8) => variants!(256, 8),
-        (512, 4) => variants!(512, 4),
-        (512, 8) => variants!(512, 8),
         _ => return None,
     })
 }
@@ -3985,6 +3884,88 @@ impl VulkanBackend {
 mod tests {
     use super::*;
 
+    /// Every name the `gemv.variant` tuning parameter accepts has a build, and no build is
+    /// missing from the list (a name probed over every dtype the family covers).
+    #[test]
+    fn gemv_variants_all_have_a_build() {
+        use infr_core::DType::{Q4K, Q6K};
+        for v in GEMV_RM_V2_VARIANTS {
+            assert!(
+                [Q4K, Q6K]
+                    .iter()
+                    .any(|&dt| native_rm_v2_streamed_build_spv(v, dt, false).is_some()),
+                "gemv variant `{v}` has no build"
+            );
+        }
+        for bogus in ["", " ", "none", "o4", "REG"] {
+            assert!(native_rm_v2_streamed_build_spv(bogus, Q4K, false).is_none());
+        }
+    }
+
+    /// [`I8cmTile`]'s extents are what the recorder sizes the grid and the adapter gates shapes
+    /// by; the shader only knows the `-DTILE_*` defines `build.rs` hands each build. A drift
+    /// would dispatch the wrong grid (rows never written) or admit shapes the tile cannot stage.
+    #[test]
+    fn i8cm_kq_tiles_match_build() {
+        let build = include_str!("../build.rs");
+        for (dtype, fmt) in [
+            (infr_core::DType::Q4K, "Q4K"),
+            (infr_core::DType::Q5K, "Q5K"),
+            (infr_core::DType::Q6K, "Q6K"),
+        ] {
+            for tile in [I8cmTile::L, I8cmTile::M] {
+                let (name, _) = native_gemm_i8cm_kq_spv(dtype, tile).expect("i8cm build");
+                let at = build
+                    .find(&format!("\"{name}\""))
+                    .unwrap_or_else(|| panic!("{name} not in build.rs"));
+                let entry = &build[at..at + build[at..].find(')').expect("entry end")];
+                for want in [
+                    format!("\"-DFMT_{fmt}\""),
+                    format!("\"-DTILE_BT={}u\"", tile.tokens()),
+                    format!("\"-DTILE_BW={}u\"", tile.rows()),
+                    format!("\"-DTILE_BKS={}u\"", tile.k_blocks()),
+                ] {
+                    assert!(entry.contains(&want), "{name}: {entry} lacks {want}");
+                }
+            }
+        }
+    }
+
+    /// [`DP4A_KQ_TILE`] is what the recorder sizes the grid and the adapter gates shapes by; the
+    /// shader only knows the `-DTILE_*` defines `build.rs` hands each build. Also holds the
+    /// staging's exact-division requirement (kq_stage.glsl: every thread moves the same number of
+    /// activation halves and weight quarters per step).
+    #[test]
+    fn dp4a_kq_tile_matches_build() {
+        let build = include_str!("../build.rs");
+        let t = DP4A_KQ_TILE;
+        let threads = (t.tokens / t.thread_tokens) * (t.rows / t.thread_rows);
+        assert_eq!(threads * t.thread_tokens * t.thread_rows, t.tokens * t.rows);
+        assert_eq!((t.tokens * t.k_blocks * 2) % threads, 0);
+        assert_eq!((t.rows * t.k_blocks * 4) % threads, 0);
+        for (dtype, fmt) in [
+            (infr_core::DType::Q4K, "Q4K"),
+            (infr_core::DType::Q5K, "Q5K"),
+            (infr_core::DType::Q6K, "Q6K"),
+        ] {
+            let (name, _) = native_gemm_dp4a_kq_spv(dtype).expect("dp4a build");
+            let at = build
+                .find(&format!("\"{name}\""))
+                .unwrap_or_else(|| panic!("{name} not in build.rs"));
+            let entry = &build[at..at + build[at..].find(')').expect("entry end")];
+            for want in [
+                format!("\"-DFMT_{fmt}\""),
+                format!("\"-DTILE_BT={}u\"", t.tokens),
+                format!("\"-DTILE_BW={}u\"", t.rows),
+                format!("\"-DTILE_BKS={}u\"", t.k_blocks),
+                format!("\"-DTILE_TT={}u\"", t.thread_tokens),
+                format!("\"-DTILE_TW={}u\"", t.thread_rows),
+            ] {
+                assert!(entry.contains(&want), "{name}: {entry} lacks {want}");
+            }
+        }
+    }
+
     /// B7 slice 3a — the decode specialization's reduction must be a PLAIN subgroup reduce, never
     /// a clustered one. `attn_partial_dsplit.comp` (the width probe) spells the same width-32
     /// reduction as `subgroupClusteredAdd(., 32)`, and glslang emits `ClusteredReduce` for it;
@@ -4066,7 +4047,7 @@ mod tests {
     fn check(got: &[f32], want: &[f32], label: &str) {
         let mut max_rel = 0f32;
         for (g, w) in got.iter().zip(want.iter()) {
-            max_rel = max_rel.max((g - w).abs() / w.abs().max(1.0));
+            max_rel = infr_testkit::nan_max(max_rel, (g - w).abs() / w.abs().max(1.0));
         }
         println!("{label} max_rel_err = {max_rel:.4e}");
         assert!(max_rel < 2e-2, "{label} rel err {max_rel} too high");
@@ -4076,6 +4057,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU with cooperative matrix"]
     fn coopmat_gemm_tiled_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if !crate::test_has_f16_coopmat(&be, "coopmat_gemm_tiled_matches_cpu") {
+            return;
+        }
         let (m, k, n) = (128usize, 96usize, 64usize); // m,n %64, k %32
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.05).collect();
@@ -4087,6 +4071,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn warp_gemm_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if !crate::test_has_f16_coopmat(&be, "warp_gemm_matches_cpu") {
+            return;
+        }
         for &(m, k, n) in &[
             (128usize, 16usize, 128usize),
             (256, 128, 256),
@@ -4103,6 +4090,9 @@ mod tests {
     #[ignore = "benchmark, requires GPU"]
     fn coopmat_gemm_bench() {
         let be = VulkanBackend::new().unwrap();
+        if !crate::test_has_f16_coopmat(&be, "coopmat_gemm_bench") {
+            return;
+        }
         for s in [1024usize, 2048, 4096] {
             let dt = be.bench_tiled_gemm(s, s, s, 20);
             let flops = 2.0 * (s as f64).powi(3);

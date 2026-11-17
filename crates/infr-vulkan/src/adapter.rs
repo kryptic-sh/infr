@@ -4,7 +4,7 @@
 //! `Graph` runs on either backend. Built incrementally; ops not yet mapped return an error.
 
 use crate::linear::native_dense_supported;
-use crate::recorder::Recorder;
+use crate::recorder::{Recorder, FLASH_KV_TILE, NONFA_KV_TILE};
 use crate::{be, VulkanBackend};
 use infr_core::backend::{Bindings, Buffer, BufferUsage, Plan};
 use infr_core::error::{Error, Result};
@@ -56,8 +56,8 @@ struct DecodeReplay {
     /// Persistent `Internal` scratch (activations), allocated ONCE. The recorded descriptor sets bind
     /// these, so re-allocating per token would leave the recording pointing at freed buffers.
     scratch: Vec<Option<Box<dyn Buffer>>>,
-    /// `[pos, kv_len, table_lo, table_hi, _, _]` (u32×6) SSBO the `_dyn` kernels read.
-    /// When `self_advancing`, a `params_advance` dispatch recorded FIRST increments it every replay
+    /// `[pos, kv_len]` (u32×2) SSBO the `_dyn` kernels read. When `self_advancing`, a
+    /// `params_advance` dispatch recorded FIRST increments it on the device every replay
     /// (initialized to `[pos0-1, pos0]` at record time) — the adapter never touches it again.
     params: Box<dyn Buffer>,
     /// The recording starts with the device-side params increment; `execute` skips the host
@@ -71,11 +71,14 @@ struct DecodeReplay {
     /// The `positions` Input tensor — `execute` downloads element 0 to learn `pos` for `params`.
     positions: TensorId,
     recorded: RecordedCmd,
-    /// Paged K/V: the slot's page table device address and page size, seeded into `params` words
-    /// 2-3 at record time. `None` for a linear cache. ONE table covers every layer of a slot
-    /// (page ids are token-granular and identical across layers) and the buffer is allocated once
-    /// at session setup, so the address stays valid for every replay without a per-token write.
-    page_table: Option<PageInfo>,
+    /// Every tensor the recording took from `bindings`, with the buffer it was bound to then. The
+    /// recorded descriptors still point at those buffers, so a replay with any of them rebound is
+    /// not replayed: the recording is dropped and rebuilt against the new bindings.
+    bound: Vec<(TensorId, BoundId)>,
+    /// The dense streaming session's placement epoch the recording's streamed weight addresses were
+    /// read at ([`StreamedSlots::epoch`]); `None` when no weight streams. A replay checks it first
+    /// (see [`current_replay`]).
+    epoch: Option<u64>,
     /// Transient GEMM/attention scratch the recording references. Empty for an eligible decode (all
     /// ops are GEMV/silu/dyn kernels with no transient), held anyway so a stray one can't dangle.
     _transient: Vec<Box<dyn Buffer>>,
@@ -122,11 +125,6 @@ fn is_kv_prepass(dt: infr_core::DType) -> bool {
     is_kv_quant(dt) || is_kv_dense_alt(dt) || is_turbo(dt)
 }
 
-/// Row offset of a cache's private block inside a shared page pool; 0 for a linear cache.
-fn kv_row_base(graph: &Graph, id: TensorId) -> usize {
-    graph.desc(id).pages.map_or(0, |p| p.row_base)
-}
-
 /// Lever 1 (kv-decode-perf-levers #1): mainline low-bit block quants the DECODE split-K kernel can
 /// dequant INLINE via a coalesced block-amortized decoder (`attn_partial`'s `dqv4`,
 /// `attn_partial_ml_kernel`) — so decode reads the compact cache directly instead of a dequant→f16
@@ -160,40 +158,124 @@ fn is_kv_inline_decode(dt: infr_core::DType) -> bool {
 /// path re-reads a shared expert's weight once per occurrence, so it degrades faster). `8` sits
 /// right at the edge of the small path's win region with headroom to spare.
 ///
-/// `INFR_MOE_SMALL_M` overrides the threshold for experimentation, clamped to the knob's `max`:
-/// the small path's GEMV dispatches one workgroup PER (row, slot, out-column) with no row-tile
-/// batching, so at the seam's normal prefill chunk size (`INFR_UBATCH`, 1024 rows by default) an
-/// UNCLAMPED override turns every prefill chunk into a multi-second single dispatch — this isn't
-/// just slow, it trips the amdgpu ring watchdog and device-losts the whole process (reproduced:
-/// `INFR_MOE_SMALL_M=100000` on a 1024-row chunk hangs the GPU; see `runner.rs`'s UBATCH doc for
-/// the same failure class with an unchunked prefill).
-const MOE_SMALL_M: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
-    env: "INFR_MOE_SMALL_M",
-    default: 8,
-    min: 0,
-    max: 64,
-};
-
+/// The threshold is the `moe.small_m` tuning parameter (alias `INFR_MOE_SMALL_M`), whose range
+/// stops at 64: the small path's GEMV dispatches one workgroup PER (row, slot, out-column) with no
+/// row-tile batching, so at the seam's normal prefill chunk size (`INFR_UBATCH`, 1024 rows by
+/// default) an UNBOUNDED value turns every prefill chunk into a multi-second single dispatch — this
+/// isn't just slow, it trips the amdgpu ring watchdog and device-losts the whole process
+/// (reproduced: `INFR_MOE_SMALL_M=100000` on a 1024-row chunk hangs the GPU; see `runner.rs`'s
+/// UBATCH doc for the same failure class with an unchunked prefill). The alias still clamps an
+/// over-range value to 64, as the old read site did.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn moe_small_m_threshold(be_: &VulkanBackend) -> usize {
-    MOE_SMALL_M.clamped(be_.cfg().kernels.vulkan.moe_small_m)
+    be_.tuning().moe_small_m
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
+    decode_refusal(be_, graph).is_none()
+}
+
+/// Why [`decode_eligible`] refuses a graph. Built on every ineligible compile (each prefill chunk,
+/// each per-token compile of a model that cannot replay), so it holds only `Copy` data; the text is
+/// formatted only for the error a replay-only graph gets (`Graph::replay_only`).
+#[derive(Clone, Copy, Debug)]
+enum DecodeRefusal {
+    NoReplayKnob,
+    GraphOptOut,
+    StandaloneF16WriteKv {
+        op: usize,
+    },
+    NoDynKernel {
+        op: usize,
+        kind: &'static str,
+    },
+    AttentionShape {
+        op: usize,
+        rows: u32,
+        head_dim: u32,
+    },
+    AttentionSinksOrBias {
+        op: usize,
+    },
+    MixedKvLen {
+        op: usize,
+        kv_len: u32,
+        prev: u32,
+    },
+    KvDtype {
+        op: usize,
+        k: infr_core::DType,
+        v: infr_core::DType,
+    },
+    F32Rope {
+        op: usize,
+    },
+    NotADecode,
+}
+
+impl std::fmt::Display for DecodeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::NoReplayKnob => {
+                f.write_str("kernels.vulkan.no_replay (INFR_SEAM_NO_REPLAY) is set")
+            }
+            Self::GraphOptOut => f.write_str("the graph opted out (Graph::no_decode_replay)"),
+            Self::StandaloneF16WriteKv { op } => {
+                write!(
+                    f,
+                    "op {op} (WriteKv): a standalone f16 K write has no dyn kernel"
+                )
+            }
+            Self::NoDynKernel { op, kind } => write!(f, "op {op} ({kind}): no dyn kernel"),
+            Self::AttentionShape { op, rows, head_dim } => write!(
+                f,
+                "op {op} (Attention): rows {rows} / head_dim {head_dim} is not a replayable \
+                 decode shape"
+            ),
+            Self::AttentionSinksOrBias { op } => {
+                write!(
+                    f,
+                    "op {op} (Attention): sinks / key_bias / comp have no dyn kernel"
+                )
+            }
+            Self::MixedKvLen { op, kv_len, prev } => write!(
+                f,
+                "op {op} (Attention): kv_len {kv_len} differs from an earlier attention's {prev}, \
+                 so this is not a single-token decode"
+            ),
+            Self::KvDtype { op, k, v } => {
+                write!(
+                    f,
+                    "op {op} (Attention): KV cache {k:?}/{v:?} has no dyn kernel"
+                )
+            }
+            Self::F32Rope { op } => {
+                write!(f, "op {op} (Rope): only the f16-out rope has a dyn kernel")
+            }
+            Self::NotADecode => {
+                f.write_str("not a single-token decode: it needs a rope op and an attention op")
+            }
+        }
+    }
+}
+
+/// Why [`decode_eligible`] refuses `graph`, or `None` when it replays.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+fn decode_refusal(be_: &VulkanBackend, graph: &Graph) -> Option<DecodeRefusal> {
     // `kernels.vulkan.no_replay` (`INFR_SEAM_NO_REPLAY`) forces the static per-execute path
     // (INFR_PROF_OPS timestamps work there; the replay path can't report them). ONE field read
     // `is_ok()` here and `!no_replay` in the llama runner — both halves now come off the same
     // `Config`.
     if be_.cfg().kernels.vulkan.no_replay {
-        return false;
+        return Some(DecodeRefusal::NoReplayKnob);
     }
     // Producer opt-out (see `Graph::no_decode_replay`): the replay tape's `_dyn` kernels are only
     // reassociation-equivalent to the static recording, and some consumers (DiffusionGemma's
     // entropy-bound denoise, which chaotically amplifies a 1-ULP KV delta on the prefill frontier
     // row into different committed text) need the static path's exact arithmetic every execute.
     if graph.no_decode_replay {
-        return false;
+        return Some(DecodeRefusal::GraphOptOut);
     }
     let mut has_rope = false;
     let mut has_attn = false;
@@ -204,15 +286,42 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
     // NOT a single-token decode — replaying it would collapse every step onto the same KV row + RoPE
     // angle + kv_len. Force those onto the static per-op-position path.
     let mut attn_kv_len: Option<u32> = None;
-    for op in &graph.ops {
+    for (i, op) in graph.ops.iter().enumerate() {
         match op {
+            // An f16 K row reaches an f16 cache under replay only through the kv_write fusion
+            // (`infr_core::fusion`'s `plan_kv_write`: the rope op RIGHT BEFORE the WriteKv writes
+            // the cache itself); a standalone f16→f16 WriteKv has no dyn kernel. llama4 writes its
+            // K that way on both of its layer kinds — L2-normed after the rope, or the raw cast on
+            // a NoPE layer — and so does any other family's NoPE layer (smollm3), so such a graph
+            // stays static.
+            Op::WriteKv { src, cache, .. }
+                if matches!(graph.desc(*src).dtype, infr_core::DType::F16)
+                    && matches!(graph.desc(*cache).dtype, infr_core::DType::F16) =>
+            {
+                let fused = i.checked_sub(1).is_some_and(|j| {
+                    matches!(&graph.ops[j],
+                        Op::Rope { dst, .. } | Op::QkNormRope { dst, .. }
+                            if dst == src
+                                && matches!(graph.tensors[src.0 as usize].kind, TensorKind::Internal))
+                });
+                if !fused {
+                    return Some(DecodeRefusal::StandaloneF16WriteKv { op: i });
+                }
+            }
             // MLA attention (DeepSeek V2/V3) uses its own non-standard kernel — not eligible for
             // the split-K record-once replay pipeline. Nor is the V3.2 lightning indexer, which
             // bakes its causal bound from the `pos` push constant at record time (there is no
             // params-driven `_dyn` twin), so a replayed tape would select keys for the position it
             // was recorded at.
-            Op::Mla { .. } | Op::LightningIndexer { .. } => return false,
-            Op::LinearExl3 { m, .. } if *m != 1 => return false,
+            Op::Mla { .. } => {
+                return Some(DecodeRefusal::NoDynKernel { op: i, kind: "Mla" });
+            }
+            Op::LightningIndexer { .. } => {
+                return Some(DecodeRefusal::NoDynKernel {
+                    op: i,
+                    kind: "LightningIndexer",
+                });
+            }
             // Any mask (SWA windows ride push constants + the window-aware prologue) and any
             // scale (gemma4 uses 1.0) — both are baked per-layer into the recorded dispatch.
             // hd%4 ≤ 512 keeps every layer on the self-chunking split path or the scalar
@@ -225,22 +334,34 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
                 kv_len,
                 sinks,
                 key_bias,
+                comp,
                 ..
             } => {
                 has_attn = true;
                 if *rows != 1 || *head_dim % 4 != 0 || *head_dim > 512 {
-                    return false;
+                    return Some(DecodeRefusal::AttentionShape {
+                        op: i,
+                        rows: *rows,
+                        head_dim: *head_dim,
+                    });
                 }
-                // Attention sinks and key_bias have ONE kernel family (`attention_kv.comp`'s
-                // -DSINKS/-DBIAS static builds) and no params-driven `_dyn` twin, so a replayed
-                // tape would run the sink/bias-free split-K family instead. Force static.
-                if sinks.is_some() || key_bias.is_some() {
-                    return false;
+                // Attention sinks, key_bias and the compressed segment have ONE kernel family
+                // (`attention_kv.comp`'s -DSINKS/-DBIAS/-DCOMP static builds) and no
+                // params-driven `_dyn` twin, so a replayed tape would run the split-K family that
+                // knows none of them. Force static.
+                if sinks.is_some() || key_bias.is_some() || comp.is_some() {
+                    return Some(DecodeRefusal::AttentionSinksOrBias { op: i });
                 }
                 // Multi-position graph (see the comment above `attn_kv_len`): different kv_len across
                 // attention ops ⟹ not a single-token decode ⟹ ineligible for record-once replay.
                 match attn_kv_len {
-                    Some(prev) if prev != *kv_len => return false,
+                    Some(prev) if prev != *kv_len => {
+                        return Some(DecodeRefusal::MixedKvLen {
+                            op: i,
+                            kv_len: *kv_len,
+                            prev,
+                        });
+                    }
                     _ => attn_kv_len = Some(*kv_len),
                 }
                 // A COUPLED Q8_0 KV cache (K==V==Q8) replays: store_q8_dyn writes the row at
@@ -257,20 +378,20 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
                 let k_q8 = matches!(kdt, infr_core::DType::Q8_0);
                 let v_q8 = matches!(vdt, infr_core::DType::Q8_0);
                 if k_q8 != v_q8 || is_kv_prepass(kdt) || is_kv_prepass(vdt) {
-                    return false;
+                    return Some(DecodeRefusal::KvDtype {
+                        op: i,
+                        k: kdt,
+                        v: vdt,
+                    });
                 }
             }
             // freq_factors (gemma4 proportional RoPE) binds via qk_norm_rope_dyn_ff.
             Op::QkNormRope { .. } => has_rope = true,
-            // Standalone llama Rope replays via rope_f16_dyn — needs the f16-out builder shape
-            // (the f32 in-place form has no dyn kernel) and no freq_factors.
-            Op::Rope {
-                dst, freq_factors, ..
-            } => {
-                if freq_factors.is_some()
-                    || !matches!(graph.desc(*dst).dtype, infr_core::DType::F16)
-                {
-                    return false;
+            // Standalone llama Rope replays via rope_f16_dyn (rope_f16_dyn_ff with freq_factors)
+            // — needs the f16-out builder shape (the f32 in-place form has no dyn kernel).
+            Op::Rope { dst, .. } => {
+                if !matches!(graph.desc(*dst).dtype, infr_core::DType::F16) {
+                    return Some(DecodeRefusal::F32Rope { op: i });
                 }
                 has_rope = true;
             }
@@ -283,17 +404,23 @@ fn decode_eligible(be_: &VulkanBackend, graph: &Graph) -> bool {
             // the recorded tape re-reads the live state every replay, and the tape's leading
             // global barrier orders iteration i's state write before i+1's read under replay_n.
             // GatedRmsNorm (qwen35 DeltaNet z-gate) is pos-independent elementwise like QkNorm —
-            // same replay-safety argument.
+            // same replay-safety argument. ShortConv (LFM) is Conv1dSilu's argument again, and
+            // HeadGate (LFM3) is pos-independent elementwise.
             Op::MoeFfn { .. }
             | Op::QkNorm { .. }
             | Op::GatedRmsNorm { .. }
             | Op::Softcap { .. }
             | Op::Conv1dSilu { .. }
+            | Op::ShortConv { .. }
+            | Op::HeadGate { .. }
             | Op::DeltaNet { .. } => {}
             _ => {}
         }
     }
-    has_rope && has_attn
+    match (has_rope, has_attn) {
+        (true, true) => None,
+        _ => Some(DecodeRefusal::NotADecode),
+    }
 }
 
 /// Read `positions[0]` for the record-once decode. The runner writes the position into a host-visible
@@ -316,6 +443,49 @@ fn read_pos0(be_: &VulkanBackend, buf: &dyn Buffer) -> Result<u32> {
     Ok(i32::from_le_bytes(b) as u32)
 }
 
+/// The identity of a bound buffer, as a recording sees it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoundId {
+    /// A plain backend buffer: the `vk::Buffer` handle and the byte offset of the bound range.
+    Vk(ash::vk::Buffer, usize),
+    /// Any other `Buffer` (a multi-GPU wrapper), by object address — no downcast error is built
+    /// per token. Address reuse after a free can hide a rebinding, never invent one.
+    Other(usize),
+}
+
+fn bound_id(b: &dyn Buffer) -> BoundId {
+    match b.as_any().downcast_ref::<crate::VkBuffer>() {
+        Some(v) => BoundId::Vk(v.buffer, v.sub_offset),
+        None => BoundId::Other(b as *const dyn Buffer as *const () as usize),
+    }
+}
+
+/// Every non-`Internal` tensor `bindings` supplies, with its buffer's identity: what a recording
+/// resolves from `bindings` and freezes into its descriptors. Taken once, at record time.
+fn recorded_bindings(
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+) -> Vec<(TensorId, BoundId)> {
+    scratch
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_none())
+        .filter_map(|(i, _)| {
+            let id = TensorId(i as u32);
+            bindings.get(id).map(|b| (id, bound_id(b)))
+        })
+        .collect()
+}
+
+/// Whether `bindings` still binds every tensor `replay` recorded to the same buffer. Allocates
+/// nothing: it runs before every replayed token.
+fn bindings_unchanged(replay: &DecodeReplay, bindings: &Bindings) -> bool {
+    replay
+        .bound
+        .iter()
+        .all(|&(id, want)| bindings.get(id).map(bound_id) == Some(want))
+}
+
 /// Resolve a graph tensor to its device buffer: `Internal` from the scratch, everything else
 /// (`Input`/`Weight`/`Output`) from the model-provided `Bindings`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -329,64 +499,6 @@ fn resolve<'a>(
         None => bindings
             .get(id)
             .ok_or_else(|| be(format!("vulkan adapter: unbound tensor {}", id.0))),
-    }
-}
-
-/// What a paged decode needs from the graph: the page table's `(device address, rows per page)` and
-/// the slot's `row_base`.
-#[derive(Clone, Copy, Debug)]
-struct PageInfo {
-    addr: u64,
-    page_rows: u32,
-    row_base: usize,
-}
-
-/// Paged K/V: the single page table a paged decode reads and writes through.
-/// Page ids are token-granular and identical across layers, so ONE table per slot covers every
-/// layer's K and V caches — a graph whose caches disagree would silently read one layer's rows
-/// through another's pages, so that is a hard error. `None` for a fully linear graph.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-fn replay_page_table(
-    graph: &Graph,
-    scratch: &ScratchSet,
-    bindings: &Bindings,
-) -> Result<Option<PageInfo>> {
-    let mut table: Option<(infr_core::TensorId, u32, usize)> = None;
-    for (i, decl) in graph.tensors.iter().enumerate() {
-        let Some(p) = decl.desc.pages else { continue };
-        match table {
-            Some((t, rows, rb)) if (t, rows, rb) != (p.table, p.page_rows, p.row_base) => {
-                return Err(be(format!(
-                    "vulkan adapter: paged KV cache (tensor {i}) disagrees on the page table: \
-                     table {} with {} rows/page at row base {} against table {} with {} rows/page \
-                     at row base {} elsewhere",
-                    p.table.0, p.page_rows, p.row_base, t.0, rows, rb
-                )))
-            }
-            _ => table = Some((p.table, p.page_rows, p.row_base)),
-        }
-    }
-    let Some((id, page_rows, row_base)) = table else {
-        return Ok(None);
-    };
-    let addr = resolve(scratch, bindings, id)?
-        .device_addr()
-        .ok_or_else(|| be("vulkan adapter: paged KV cache table has no device address"))?;
-    Ok(Some(PageInfo {
-        addr,
-        page_rows,
-        row_base,
-    }))
-}
-
-/// Write the paged decode's params words: 2-3 the page-table address (zero for a linear cache).
-/// The row base is NOT here: one params buffer serves every op of the tape, and a paged plan mixes
-/// pooled caches (rows at their block) with private ring caches (rows at 0), so each store carries
-/// its own row base in its push constant.
-fn write_page_table(pbytes: &mut [u8; 24], table: Option<PageInfo>) {
-    if let Some(p) = table {
-        pbytes[8..12].copy_from_slice(&(p.addr as u32).to_le_bytes());
-        pbytes[12..16].copy_from_slice(&((p.addr >> 32) as u32).to_le_bytes());
     }
 }
 
@@ -717,28 +829,14 @@ fn unified_mmv_row1(_caps: &infr_core::backend::Capabilities) -> bool {
     true
 }
 
-/// Whether fp32 K-quant GEMV is enabled and addressable for this weight.
-fn kq_fma_gemv_ok(
-    be_: &VulkanBackend,
-    dt: infr_core::DType,
-    in_f: usize,
-    out_f: usize,
-    w_off: usize,
-) -> bool {
-    let vk = &be_.cfg().kernels.vulkan;
-    vk.kq_fma_gemv.unwrap_or(!be_.caps().i8_dot_fast)
-        && crate::gemm::native_gemv_kq_fma_spv(dt, false, 8, false).is_some()
-        && in_f.is_multiple_of(256)
-        && w_off.is_multiple_of(256)
-        && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
-}
-
 fn mmv_mw_choice(
     caps: &infr_core::backend::Capabilities,
     vk: &infr_core::config::VulkanCfg,
+    t: &crate::tuning::Tuning,
     dt: infr_core::DType,
     in_f: usize,
     out_f: usize,
+    res: bool,
 ) -> Option<u32> {
     if !caps.i8_dot || !mmv_int8_decode_dtypes(caps, vk).contains(&dt) {
         return None;
@@ -748,26 +846,18 @@ fn mmv_mw_choice(
     if !in_f.is_multiple_of(32) || in_f * out_f < (2usize << 20) {
         return None;
     }
-    // Default WARPS is per-dtype: Q4_K defaults to 1 (llama.cpp's rm_kq_int=1 shape — one output
-    // row per workgroup / single-subgroup reduce, the dispatch-shape sweep winner on AMD). Every
-    // other dtype defaults to 8. Q4_K warps=1 beats {4,8} and beats the f32 path. Overrideable
-    // via INFR_MMV_MW_WARPS for A/B.
-    let default_warps = if dt == infr_core::DType::Q4K {
-        1u32
-    } else {
-        8u32
-    };
-    let warps = vk
-        .mmv_mw_warps
-        .and_then(|w| u32::try_from(w).ok())
-        .unwrap_or(default_warps);
-    // SPIR-V existence gate: unified rows=1 path probes the mrow variant for every dtype. All
-    // dtypes in the unified decode set have an mrow build; the mmv_mw route is retired (Intel
-    // specific dtypes Q3_K/Q5_K that had only mmv_mw builds are no longer in the default set,
-    // and INFR_MMV_MW=1 still force-opt-in them — they just fall through here as None since
-    // they lack mrow builds).
+    // WARPS is the per-dtype `mmv_mw.warps` tuning parameter: Q4_K defaults to 1 (llama.cpp's
+    // rm_kq_int=1 shape — one output row per workgroup / single-subgroup reduce, the
+    // dispatch-shape sweep winner on AMD), every other dtype to 8. Q4_K warps=1 beats {4,8} and
+    // beats the f32 path. `INFR_MMV_MW_WARPS` is its alias (every dtype at once). Every dtype the
+    // decode set can hold has a qualifier (`mmv_mw_dtypes_have_a_warps_qualifier`).
+    let warps = t.mmv_mw_warps(dt)?;
+    // SPIR-V existence gate: the unified rows=1 path dispatches exactly the build this lookup
+    // names (same knobs, same residual flag), so a `Some` here can never reach a variant the
+    // recorder lacks — the residual builds exist only under `mmv_m4`, and not for every dtype.
     let have_spv =
-        crate::gemm::native_mmv_mrow_variant_kernel_name(dt, in_f < 2048, true, false).is_some();
+        crate::recorder::mmv_mrow_variant(vk, dt, 1, in_f, res, crate::recorder::MmvO4::of(t))
+            .is_some();
     have_spv.then_some(warps)
 }
 
@@ -864,23 +954,29 @@ fn linear_add_weight_ok(dt: infr_core::DType) -> bool {
 }
 static LINEAR_ADD_WEIGHT_OK: fn(infr_core::DType) -> bool = linear_add_weight_ok;
 
+/// [`linear_add_weight_ok`] on a device without `shaderFloat16`: the f16 fused-residual GEMV
+/// (`linear_res.comp`) does f16 arithmetic, so an f16 weight stays unfused there and its Linear
+/// takes the `linear_f16_noext` GEMV, followed by the standalone Add.
+fn linear_add_weight_ok_no_f16(dt: infr_core::DType) -> bool {
+    native_dense_supported(dt)
+}
+static LINEAR_ADD_WEIGHT_OK_NO_F16: fn(infr_core::DType) -> bool = linear_add_weight_ok_no_f16;
+
 /// This adapter's [`FusionCfg`](infr_core::fusion::FusionCfg): the `Linear→Add` residual fusion
 /// (`INFR_NO_FUSE_ADD` hatch) and the `Rope/QkNormRope→WriteKv` KV-write fusion. `plan_fusions`
 /// returns the same `(fused, skip)` the two former private peepholes did.
 fn fusion_cfg(be_: &VulkanBackend) -> infr_core::fusion::FusionCfg<'static> {
     infr_core::fusion::FusionCfg {
         linear_add: Some(infr_core::fusion::LinearAddCfg {
-            weight_ok: &LINEAR_ADD_WEIGHT_OK,
+            weight_ok: if be_.caps().f16 {
+                &LINEAR_ADD_WEIGHT_OK
+            } else {
+                &LINEAR_ADD_WEIGHT_OK_NO_F16
+            },
             // `INFR_NO_FUSE_ADD` (config `kernels.vulkan.fuse_add`, positive polarity): PRESENCE
             // of the env key — including `INFR_NO_FUSE_ADD=0` — turns the fold off.
             enabled: be_.cfg().kernels.vulkan.fuse_add,
         }),
-        rmsnorm_linear: None,
-        // F1c's `MoeFfn → Add` fold is un-planned on every live backend: this adapter's MoE lowering accumulates
-        // the experts through its own `moe_accumulate`, which has no residual epilogue, so the
-        // pattern stays un-planned here and Vulkan dispatches the standalone `Add` exactly as
-        // before.
-        moe_add: None,
         kv_write: true,
     }
 }
@@ -901,39 +997,61 @@ enum RopeMode<'a> {
 /// parameterized by.
 const ATTN_MAX_CHUNKS: usize = 1024;
 
-/// Baked split-K chunk floor for DECODE rows. Shallow kv is latency-bound, not bandwidth-bound:
-/// a 64-key floor put one wave64 per (head, chunk) on the device and left a 42-layer chain of
-/// ~40us dispatches at kv < 200. Both decode paths re-derive `max(span/32, floor)` from the live
-/// span, so a lower floor only binds below span 512 and deep decode is unchanged.
-const ATTN_DECODE_MIN_CHUNK: usize = 16;
+/// `attn_partial.comp` stages one chunk's scores in `shared float sc[ATTN_PARTIAL_MAX_CHUNK]`, so a
+/// chunk of more keys is an OOB shared-memory write. Every chunk size the adapter hands that kernel
+/// is capped here first (the count then rises to cover the span); a span past
+/// `ATTN_PARTIAL_MAX_CHUNK * ATTN_MAX_CHUNKS` keys fits neither cap and does not take the split-K
+/// kernel. `attn_partial_chunk_bound_matches_host` keeps the shader's copy in step.
+const ATTN_PARTIAL_MAX_CHUNK: usize = 1024;
 
-/// Decode's [`ATTN_SPLIT`]: the same ~32 chunks/head shape with the decoder's lower floor.
-const ATTN_SPLIT_DECODE: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
-    target_chunks: 32,
-    min_chunk: ATTN_DECODE_MIN_CHUNK,
-    max_chunk: 512,
-    rounding: infr_core::tier::ChunkRounding::Down,
-};
+/// The rows-batched split-K tier (`attn_partial_mrows_c256`) stages its chunk scores in a shared
+/// array sized by its `-DSC_MAX` build define (`build.rs`): its fixed chunk, and its bound.
+const ATTN_MROWS_CHUNK: usize = 256;
 
 /// Flash-decoding split-K chunk policy: ~32 chunks/head, each 64..512 keys, floor-rounded (the
 /// measured Vulkan `attn_partial` shape — see [`infr_core::tier::ChunkRounding`] for why the
 /// rounding is config and not a shared constant).
-const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
+pub(crate) const ATTN_SPLIT: infr_core::tier::AttnSplitCfg = infr_core::tier::AttnSplitCfg {
     target_chunks: 32,
     min_chunk: 64,
     max_chunk: 512,
     rounding: infr_core::tier::ChunkRounding::Down,
 };
 
-/// Canvas-mask (`AttnMask::Canvas`) chunk DIVISOR: the canvas span is cut into ~this many chunks
-/// rather than sized adaptively (the fixed `lo` override makes the span short and known). The
-/// floor of 1 keeps the `kv_len.div_ceil(n)` below from dividing by zero.
-const CANVAS_CHUNK_N: infr_core::tier::EnvRows = infr_core::tier::EnvRows {
-    env: "INFR_CANVAS_CHUNK_N",
-    default: 3,
-    min: 1,
-    max: usize::MAX,
-};
+/// Whether static attention takes the rows-batched split-K tier (`attn_partial_mrows_c256`; see
+/// the adapter's `batched_attn`). `mrows_attn` is the `kernels.vulkan.mrows_attn` tri-state:
+/// `Some(false)` forces it off, `Some(true)` bypasses the rows/kv_len heuristic. The tier's fixed
+/// [`ATTN_MROWS_CHUNK`] covers at most [`ATTN_MAX_CHUNKS`] chunks, so a longer span is left to the
+/// per-row split-K grid, whose chunk grows to its own bound; past that bound too, every tier
+/// declines and the scalar kernel runs.
+fn batched_attn_ok(
+    rows: usize,
+    hd: usize,
+    kv_len: usize,
+    att_cap_rows: usize,
+    canvas: bool,
+    kv_q8: bool,
+    mrows_attn: Option<bool>,
+) -> bool {
+    rows >= 2
+        && hd <= 128
+        && kv_len <= att_cap_rows // the mrows kernel has no ring row mapping
+        && kv_len <= ATTN_MROWS_CHUNK * ATTN_MAX_CHUNKS
+        && !canvas
+        && !kv_q8
+        && mrows_attn != Some(false)
+        && ((rows >= 12 && kv_len >= 8192) || mrows_attn == Some(true))
+}
+
+/// The DiffusionGemma canvas split-K chunk: the canvas span cut into ~`n` chunks (the
+/// `attn_canvas.chunks` tuning parameter, at least 1, so the division is safe), below `kv_len` so the split has at least two chunks, and never past the
+/// `attn_partial` bound — a longer canvas takes more chunks, not longer ones.
+fn canvas_chunk(kv_len: usize, n: usize) -> usize {
+    kv_len
+        .div_ceil(n)
+        .min(kv_len - 1)
+        .clamp(1, ATTN_PARTIAL_MAX_CHUNK)
+}
 
 /// Cap the static split-K attention chunk COUNT so `n_chunks = span.div_ceil(chunk) <= 1024` (see
 /// [`ATTN_MAX_CHUNKS`]). Raises the chunk floor to `span.div_ceil(1024)`; only bites when
@@ -947,46 +1065,93 @@ fn split_k_chunk_count_cap(span: usize, chunk: usize) -> usize {
 /// arm's split-K comment in `lower_op`): a plain tile's grid underfills the device for narrow-n
 /// (`n=1024` → 64 wgs on a 96-wg part), so split k across enough extra workgroups to fill, with a
 /// fixed-order reduce. Returns 1 (direct tile, no partials round-trip) for wide/filled shapes.
-/// Shared by the resident native-quant arm, the F16 split-K arm, and the streamed twin so their
-/// tile decisions can't drift.
-fn split_k_plan(m: usize, in_f: usize, out_f: usize) -> usize {
+/// Shared by `quant_linear`'s coopmat warp tile and `float_linear`'s F16 split-K arm, resident
+/// and streamed alike.
+///
+/// `window` is [`split_k_window`]: a GEMM whose plain tile grid is below that many workgroups
+/// splits, aiming at twice it.
+fn split_k_plan(m: usize, in_f: usize, out_f: usize, window: usize) -> usize {
     let narrow_grid = m.div_ceil(64) * (out_f / 128).max(1);
-    if out_f.is_multiple_of(128) && in_f >= 1024 && narrow_grid < 128 {
-        (256 / narrow_grid).next_power_of_two().clamp(1, 8)
+    let below = window;
+    if out_f.is_multiple_of(128) && in_f >= 1024 && narrow_grid < below {
+        (below.saturating_mul(2) / narrow_grid)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .clamp(1, 8)
     } else {
         1
     }
 }
 
-/// Split-K count for the fp32 K-quant prefill GEMM (`native_gemm_kq_fma.comp`), overridable by
-/// `kernels.vulkan.kq_fma_splitk`. The direct tile's grid is `ceil(m/128) * (n/bn)` workgroups;
-/// below ~8 per CU a tile runs up to 1.8x slower per workgroup (measured on Polaris10: 80 wgs
-/// 32.6us/tile vs 640 wgs 18.1us/tile), and the k cut is the cheap way to add workgroups. Slices
-/// stay K-block-aligned, halving until the k range divides.
-fn kq_fma_split_plan(
+/// [`split_k_plan`]'s window: `max(split_k.fixed_grid, split_k.fill_per_cu · compute_units)`
+/// with `split_k.scale_by_cu` on, else the fixed window alone — so a CU count can only widen it,
+/// never shrink it below the fixed window every device ran before. `scale_by_cu` is off by
+/// default and on only where the table's `amd-proprietary-split-k` row matches: the AMD
+/// proprietary driver, the only driver the scaled window was measured on. RADV (where the fixed
+/// window was tuned), NVIDIA and Intel stay on the fixed window until someone measures them
+/// (docs/backlog.md B-NVSHAPE-CORECOUNT says what to run).
+fn split_k_window(t: &crate::tuning::Tuning, compute_units: u32) -> usize {
+    let cu = if t.split_k_scale_by_cu {
+        compute_units as usize
+    } else {
+        0
+    };
+    t.split_k_fixed_grid
+        .max(t.split_k_fill_per_cu.saturating_mul(cu))
+}
+
+/// [`split_k_window`] on `be_`'s device.
+fn split_k_device_window(be_: &VulkanBackend) -> usize {
+    split_k_window(be_.tuning(), be_.caps().compute_units)
+}
+
+impl VulkanBackend {
+    /// How many K splits the split-K warptile takes for an `m` x `in_f` → `out_f` prefill GEMM on
+    /// this device (1 = none): `split_k_plan` at this device's compute-unit window, the decision
+    /// the `Op::Linear` dispatch consults. Public so a route test reads it instead of restating it.
+    pub fn split_k_splits(&self, m: usize, in_f: usize, out_f: usize) -> usize {
+        split_k_plan(m, in_f, out_f, split_k_device_window(self))
+    }
+}
+
+/// The int8 cooperative-matrix K-quant prefill GEMM tile for a Linear (`native_gemm_i8cm_kq.comp`),
+/// or `None` when the shape is off every tile and the f16 coopmat GEMM takes it. The caller has
+/// already checked the device (`VulkanBackend::i8cm_kq_ready`). The large tile reuses each staged
+/// block across four times the outputs of the medium one, so it wins once its grid alone fills
+/// the device; below that the medium tile's fourfold grid is what keeps the CUs busy.
+fn i8cm_kq_choice(
+    dt: infr_core::DType,
     m: usize,
     in_f: usize,
     out_f: usize,
-    bn: usize,
-    cu: usize,
-    force: Option<usize>,
-) -> usize {
-    let grid = (m.div_ceil(128) * (out_f / bn).max(1)).max(1);
-    let mut splits = match force {
-        Some(n) => n.clamp(1, 8),
-        None => (cu * 8).div_ceil(grid).next_power_of_two().clamp(1, 8),
-    };
-    while splits > 1 && !in_f.is_multiple_of(256 * splits) {
-        splits /= 2;
+    w_off: usize,
+    compute_units: u32,
+    l_fill_per_cu: usize,
+) -> Option<crate::gemm::I8cmTile> {
+    use crate::gemm::I8cmTile;
+    use infr_core::DType::{Q4K, Q5K, Q6K};
+    if !matches!(dt, Q4K | Q5K | Q6K) || !in_f.is_multiple_of(256) || !w_off.is_multiple_of(256) {
+        return None;
     }
-    splits
+    let grid = |t: I8cmTile| m.div_ceil(t.tokens()) * (out_f / t.rows());
+    let tile = if out_f.is_multiple_of(I8cmTile::L.rows())
+        && grid(I8cmTile::L) >= l_fill_per_cu.saturating_mul(compute_units as usize)
+    {
+        I8cmTile::L
+    } else if out_f.is_multiple_of(I8cmTile::M.rows()) {
+        I8cmTile::M
+    } else {
+        return None;
+    };
+    // The kernel reads its tile from a 1-D workgroup id; a grid past the guaranteed
+    // `maxComputeWorkGroupCount[0]` stays on the f16 GEMM rather than truncate.
+    (grid(tile) <= Recorder::MAX_GROUP_COUNT_X as usize).then_some(tile)
 }
 
-/// The coopmat-warp prefill GEMM tile selection shared by the resident native-dense `Op::Linear`
-/// arm and its arena-addressed streamed twin (`streamed_prefill_gemm`): the A_GLOBAL f16-A cast,
-/// the narrow-n split-K (`split_k_plan`), or the direct tile — reading the weight from `w_addr`
-/// (the resident weight's BDA, or the streamed pool-arena base). Callers pass the padded `out`
-/// (see `with_padded_dst`). Extracted so the two paths can't drift ("must track exactly").
+/// The coopmat-warp prefill GEMM tile selection of `quant_linear`'s coopmat tier: the A_GLOBAL
+/// f16-A cast, the narrow-n split-K (`split_k_plan`), or the direct tile — reading the weight from
+/// `w_addr` (the resident weight's BDA, or the streamed pool-arena base). Callers pass the padded
+/// `out` (see `with_padded_dst`).
 #[allow(clippy::too_many_arguments)]
 fn native_warp_gemm(
     be_: &VulkanBackend,
@@ -1007,14 +1172,18 @@ fn native_warp_gemm(
     // INFR_GEMM_DIRECT_A=1: skip the store_f16 pass — the _direct kernel variants read f32
     // activations directly and cast to f16 in As staging (saves one dispatch + barrier per GEMM
     // at the cost of reintroducing As shared memory).
+    // The narrow (BN=128) tiles behind the direct, A_GLOBAL and split-K routes stage k 64 at a
+    // time with no tail guard, so an `in_f` that is only a multiple of 32 must take
+    // `matmul_native_off`, which falls back to a BK=32 tile.
+    let k64 = in_f.is_multiple_of(64);
     let direct_a = be_.cfg().kernels.vulkan.gemm_direct_a;
     let use_direct = direct_a
         && out_f.is_multiple_of(128)
-        && in_f.is_multiple_of(32)
+        && k64
         && crate::gemm::native_gemm_warp_n128_direct_kernel_name(dt).is_some();
     let use_ag = !use_direct
         && out_f.is_multiple_of(128)
-        && in_f.is_multiple_of(32)
+        && k64
         && crate::gemm::native_gemm_warp_ag_kernel_name(dt).is_some()
         && be_.cfg().kernels.vulkan.gemm_warp;
     let a16 = if use_ag {
@@ -1025,8 +1194,8 @@ fn native_warp_gemm(
     } else {
         None
     };
-    let splits = split_k_plan(m, in_f, out_f);
-    if splits > 1 && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some() {
+    let splits = split_k_plan(m, in_f, out_f, split_k_device_window(be_));
+    if splits > 1 && k64 && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some() {
         let mpad = m.div_ceil(64) * 64;
         let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
         let a: &dyn Buffer = match &a16 {
@@ -1056,9 +1225,10 @@ fn native_warp_gemm(
     Ok(())
 }
 
-/// The padded-dst dance shared by every tiled prefill GEMM tier (`is_gemm`, the non-coopmat
-/// `nc_mmq`/`nc_fma` tier, and the streamed twin): the GEMM writes `ceil(m/64)*64` rows, so an
-/// Internal (row-padded) `dst` is written direct, while a non-Internal `dst` (e.g. the lm_head
+/// The padded-dst dance shared by every tiled prefill GEMM tier (the coopmat tier and the
+/// non-coopmat `nc_mmq`/`nc_fma` tier, resident and streamed): a GEMM may write up to `ceil(m/64)*64` rows
+/// (some tiles store their pad rows, the dp4a K-quant GEMM does not), so an Internal (row-padded)
+/// `dst` is written direct, while a non-Internal `dst` (e.g. the lm_head
 /// `logits` Output) gets a padded temp the `record` closure fills, then a copy of the `m` real
 /// rows back into `y`. Extracted so the three tiers stay byte-identical.
 fn with_padded_dst<F>(
@@ -1077,7 +1247,7 @@ where
 {
     let dst_internal = matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
     let eb = graph.desc(*dst).dtype.dense_bytes(1).unwrap_or(4);
-    // alloc_uninit: the GEMM writes all mpad rows before the copy reads m of them.
+    // alloc_uninit: the copy reads only the m real rows, and the GEMM writes every one of them.
     let tmp = if dst_internal {
         None
     } else {
@@ -1108,6 +1278,37 @@ pub(crate) const MLA_MAX_KEY_LEN: u32 = 576;
 /// MIRRORS `#define MLA_MAX_KV_LORA_RANK` in `shaders/mla.comp`; see [`MLA_MAX_KEY_LEN`].
 pub(crate) const MLA_MAX_KV_LORA_RANK: u32 = 512;
 
+/// Capacity of the `shared float xs[]` head buffer in `qk_norm_rope.comp` and
+/// `qk_norm_rope_interleaved.comp`. MIRRORS their `#define QK_NORM_ROPE_MAX_HD`; the
+/// `Op::QkNormRope` arm of [`lower_op`] refuses a wider head, and `qk_norm_rope_bound_matches_host`
+/// fails if the two drift.
+pub(crate) const QK_NORM_ROPE_MAX_HD: u32 = 512;
+
+/// Widest head the scalar `attention_kv.comp` family serves: its `q_sh` shared array, and the
+/// `acc` dims its 64 threads each own. MIRRORS its `#define ATTN_KV_MAX_HD`; the `Op::Attention`
+/// arm of [`lower_op`] refuses a wider head on the compressed-segment route, and
+/// `attention_kv_bound_matches_host` fails if the two drift.
+pub(crate) const ATTN_KV_MAX_HD: usize = 512;
+
+/// Widest DeltaNet key head (`head_k`) the recurrence kernels' shared-memory state and row
+/// buffers hold. MIRRORS `#define DN_MAX_KD` in every `deltanet*.comp` that sizes such a buffer;
+/// `deltanet_bounds_match_host` fails if they drift.
+const DN_MAX_KD: usize = 128;
+
+/// The f16 coopmat fragment K extent `deltanet_prep.comp` steps the key head by — the chunked-
+/// split path needs `head_k` to be a whole number of them. MIRRORS its `#define DN_PREP_KSTEP`.
+const DN_PREP_KSTEP: usize = 16;
+
+/// Can `cache` be a sliding-window RING — fewer rows than positions, written at `pos % rows`? The
+/// runner ring-sizes only caches a sliding-window attention reads (`kv_ring_wanted`), so a cache
+/// no `AttnMask::SlidingWindow` `Op::Attention` reads is always full-context.
+fn may_be_ring_cache(graph: &Graph, cache: TensorId) -> bool {
+    graph.ops.iter().any(|op| {
+        matches!(op, Op::Attention { k_cache, v_cache, mask: AttnMask::SlidingWindow(_), .. }
+            if *k_cache == cache || *v_cache == cache)
+    })
+}
+
 /// Lower ONE graph op into the recorder. Shared by the static (`execute_static`) and record-once
 /// (`record_decode_replay`) paths — only the three pos-dependent ops branch on `mode`.
 #[allow(clippy::too_many_arguments)]
@@ -1120,7 +1321,7 @@ fn lower_op(
     rec: &Recorder<'_>,
     scratch: &[Option<Box<dyn Buffer>>],
     bindings: &Bindings,
-    fused_kv_write: &HashMap<usize, (TensorId, usize, usize)>,
+    fused_kv_write: &HashMap<usize, (TensorId, usize)>,
     fused_add: &HashMap<usize, (TensorId, TensorId)>,
     mode: &RopeMode,
     transient: &mut Vec<Box<dyn Buffer>>,
@@ -1131,32 +1332,34 @@ fn lower_op(
     // holds one entry; gemma's SWA/global alternation (and gemma4-12b's hd 256/512) holds a few.
     dyn_args: &mut Vec<DynAttnCtx>,
     pool: &mut ScratchPool,
-    // Multi-row mmv quantized-activation memo: `Some((x, m, in_f))` when the pooled `mmvr_*`
-    // scratch already holds `quant_q8(x)` for that shape. Consecutive same-x Linears (fused-QKV
-    // offset GEMVs, gate+up) then skip the requant — which not only drops ~40% of the quant
-    // dispatches but, more importantly, removes the WAR hazard (quant rewrites qa → barrier
-    // against the previous mmv's read) that would otherwise serialize the sibling GEMVs.
-    // `take()`n at the top of every call: ONLY the mmv-mrow branch restores it, so any other op
-    // in between (which may rewrite `x` — e.g. next layer's RmsNorm into the same scratch id)
-    // invalidates the memo by construction.
-    mmv_memo: &mut Option<(TensorId, usize, usize)>,
+    // Quantized-activation memo: `Some((x, m, in_f, pool))` when the pooled `{pool}_*` scratch
+    // (`mmvr` for the multi-row mmv, `mmv` for the m=1 int8 decode GEMV, `mmq` for the int8
+    // coopmat GEMM, `mmq_nc` for the non-coopmat tier's dp4a GEMMs, whose `mmq_*` scratch is
+    // padded to whole 64-row tiles) already holds `quant_q8(x)` for that shape. Consecutive same-x
+    // Linears (fused-QKV offset GEMVs, gate+up, separate q/k/v GEMMs) then skip the requant —
+    // which not only drops the repeated quant dispatches but removes the WAR hazard (quant
+    // rewrites qa → barrier against the previous reader) that would otherwise serialize the
+    // sibling Linears. `take()`n at the top of every call: ONLY the branches that fill a pool
+    // restore it, so any other op in between (which may rewrite `x` — e.g. next layer's RmsNorm
+    // into the same scratch id) invalidates the memo by construction, and the pool tag keeps one
+    // branch from trusting the other's scratch.
+    mmv_memo: &mut Option<(TensorId, usize, usize, &'static str)>,
     // Dense layer streaming (see `pager::DensePagerSession`): `Some(arena_addr)` when this op is an
     // `Op::Linear` whose weight is a streamed block — `arena_addr` is the resident slot's arena base
     // BYTE address. The pool arena is a `bufferDeviceAddress` buffer read purely by 64-bit pointer
     // (NOT a bound SSBO), so the ~4 GiB `maxStorageBufferRange` cap is gone entirely (no descriptor
-    // binds it). The op is lowered by an m-split that MIRRORS the resident selection, just
-    // arena-addressed: a genuine prefill chunk (`streamed_gemm_applies`) routes through the SAME
-    // coopmat-warp GEMM tile the resident path would pick (`streamed_prefill_gemm` → the -DSTREAMED
-    // twins of native_gemm/native_gemm_warp), while decode/small-m keep the single streamed GEMV
-    // (`linear_native_at`) — the arena-addressed kernels are the ONLY ones a >4 GiB pool ever
-    // dispatches, which is what makes dropping the caps safe. `w_off` (a fused-QKV slice offset,
-    // usually 0) rides on top as a within-slot element offset in both. The ring→arena copy hazard is
-    // ordered explicitly by `arena_stream_barrier` at the staging site (`stage_dense_linear`) — the
-    // SAME slot/RAW barrier already covers the prefill dispatch. Every other op — and every
-    // non-streamed model — passes `None` (zero change). Only the `Op::Linear` arm reads it; the
-    // seam's placement guarantees a streamed weight's dtype rides the offset-capable native paths
-    // (`native_dense_supported`) and never the fused-residual peephole (filtered by `execute_static`
-    // before the loop).
+    // binds it). A quantised op takes the resident routing (`quant_linear`) with the slot address
+    // in place of the resident weight's, skipping the few tiers whose kernel binds the weight
+    // buffer — the arena-addressed kernels are the ONLY ones a >4 GiB pool ever dispatches, which
+    // is what makes dropping the caps safe. `w_off` (a fused-QKV slice offset, usually 0) rides on
+    // top as a within-slot element offset. The ring→arena copy hazard is
+    // ordered explicitly by `arena_stream_barrier` at the staging site (`DensePagerSession::stage`,
+    // which argues why a hit needs none) — the SAME barrier covers the prefill dispatch. Every
+    // other op — and every non-streamed model — passes `None` (zero change). Only the
+    // `Op::Linear` arm reads it; the seam's placement admits only `linear::dense_stream_supported`
+    // dtypes, and a streamed weight never takes the fused-residual peephole (filtered by
+    // `unfuse_streamed_adds` before the loop, on both paths). An F16/F32 weight runs
+    // `float_linear` — the resident float dispatch — at the slot address.
     wsub: Option<u64>,
 ) -> Result<()> {
     let memo_prev = mmv_memo.take();
@@ -1236,46 +1439,6 @@ fn lower_op(
         // GEMV (or f16 GEMV). Prefill (m>1) with a native-quant weight uses the TILED coopmat GEMM
         // `matmul_native` (decode each weight element ONCE, reuse across the 64-row tile) instead
         // of the GEMV (which re-reads every weight row per output row) — the prefill perf win.
-        Op::LinearExl3 {
-            x,
-            trellis,
-            suh,
-            svh,
-            dst,
-            m,
-            spec,
-        } => {
-            spec.trellis_bytes()?;
-            if graph.desc(*trellis).dtype != infr_core::DType::I16
-                || graph.desc(*suh).dtype != infr_core::DType::F16
-                || graph.desc(*svh).dtype != infr_core::DType::F16
-                || graph.desc(*x).dtype != infr_core::DType::F32
-                || graph.desc(*dst).dtype != infr_core::DType::F32
-            {
-                return Err(be("exl3: unsupported projection dtypes"));
-            }
-            let input_bytes = (*m as usize)
-                .checked_mul(spec.in_f as usize)
-                .and_then(|v| v.checked_mul(4))
-                .ok_or_else(|| be("exl3: input size overflow"))?;
-            let output_bytes = (*m as usize)
-                .checked_mul(spec.out_f as usize)
-                .and_then(|v| v.checked_mul(4))
-                .ok_or_else(|| be("exl3: output size overflow"))?;
-            let xh = pooled(pool, be_, "exl3_xh", input_bytes)?;
-            let z = pooled(pool, be_, "exl3_z", output_bytes)?;
-            rec.linear_exl3(
-                r(*trellis)?,
-                r(*suh)?,
-                r(*svh)?,
-                r(*x)?,
-                pool[&xh].as_ref(),
-                pool[&z].as_ref(),
-                r(*dst)?,
-                *m,
-                *spec,
-            )?;
-        }
         Op::Linear {
             x,
             weight,
@@ -1307,64 +1470,47 @@ fn lower_op(
             // Dense layer streaming: the weight lives in a `bufferDeviceAddress` arena pool (see
             // the `wsub` param doc). The op reads the arena by 64-bit address (`arena_addr`), with
             // the op's own `w_off` (a fused-qkv slice offset, usually 0) riding on top as a
-            // within-slot element offset. A genuine prefill chunk routes to the SAME coopmat-warp
-            // GEMM tile the resident path would pick (arena-addressed) — the prefill perf win;
-            // decode/small-m keep the single streamed GEMV. Both dispatch ONLY arena-addressed
-            // kernels, never an unconverted SSBO one, which is what lets the seam drop the pool caps.
+            // within-slot element offset. Every shape takes the kernel the resident path would pick
+            // (arena-addressed), and ONLY arena-addressed kernels, never an unconverted SSBO one,
+            // which is what lets the seam drop the pool caps.
             if let Some(arena_addr) = wsub {
-                // Placement guarantees an offset-capable native dtype (the f16/f32 fallback arms
-                // take no weight offset) — a violation here would read the wrong arena bytes.
+                // A float weight runs the resident float dispatch with the slot's address in place
+                // of the resident buffer's: the same kernels, the same routing, the same bytes.
+                if matches!(dt, infr_core::DType::F16 | infr_core::DType::F32) {
+                    return float_linear(
+                        be_, graph, dt, arena_addr, w_off, x, xb, y, dst, m, in_f, out_f, rec,
+                        pool, transient, memo_prev, mmv_memo,
+                    );
+                }
+                // Placement admits only `dense_stream_supported` dtypes, and everything past the
+                // float arm above is a native one — anything else here would read the wrong bytes.
                 if !native_dense_supported(dt) {
                     return Err(be("vulkan adapter: streamed Linear weight of a dtype \
-                                   without offset-capable kernels"));
+                                   without arena-addressed kernels"));
                 }
-                if streamed_gemm_applies(be_, dt, m, in_f, out_f) {
-                    // The tiled prefill GEMM can't be output-row chunked (see the resident-GEMM
-                    // guard above) — a breaching streamed lm_head at m>16 fails loudly here.
-                    if crate::recorder::bda_weight_breaches(
-                        dt,
-                        in_f,
-                        out_f,
-                        &be_.cfg().kernels.vulkan,
-                    ) {
-                        return Err(be(format!(
-                            "vulkan adapter: streamed output-projection GEMM (m={m}, in_f={in_f}, \
-                             out_f={out_f}, {dt:?}) reads a >= 2^32-element weight — chunked \
-                             dispatch covers only m=1 decode and the per-row GEMV (issue #77)."
-                        )));
-                    }
-                    streamed_prefill_gemm(
-                        be_, graph, dt, arena_addr, w_off, xb, y, dst, m, in_f, out_f, rec, pool,
-                        transient,
-                    )?;
-                } else {
-                    // GEMV path — chunk-covered inside `linear_native_at` for a breaching weight.
-                    rec.linear_native_at(dt, arena_addr, w_off, xb, y, m, in_f, out_f);
-                }
-                return Ok(());
-            }
-            // `w_off` on a NON-native (float) weight. The native quant/bf16 kernels take the offset
-            // as a push field; the float fallbacks have no such field and index the weight from
-            // element 0 — so an unhandled `w_off` there reads rows 0..out_f and is silently wrong.
-            //
-            // F32 is handled: every float GEMV in this backend already addresses its weight by a
-            // 64-bit `bufferDeviceAddress` (`Recorder::linear_f32` is `linear_f32_at` at
-            // `w.device_addr()`), so a ROW-ALIGNED slice is just a shifted base pointer, which is
-            // what the `w_off != 0` arm at the F32 dispatch below passes. DeepSeek V4's grouped
-            // output projection is the caller (`w_off = g * o_lora_rank * in_f`); an f32 `wo_a` is
-            // what the synthetic V4 fixture writes, and what the CPU-vs-Vulkan parity test runs.
-            //
-            // F16 is NOT, and is refused rather than approximated: its m>1 path is the coopmat
-            // `matmul_proj` and its m=1 path is `linear`/`linear_f16_noext`, three more shifted-
-            // address call sites plus a 4-byte alignment obligation on the two that read the
-            // weight as packed u32 words — and nothing in the tree produces an f16 `w_off` today,
-            // so every line of it would be untested. A real (quantized) V4 GGUF takes the native
-            // path above and never reaches here.
-            if w_off != 0 && !native_dense_supported(dt) && dt != infr_core::DType::F32 {
-                return Err(be(format!(
-                    "vulkan adapter: Linear w_off on a {dt:?} weight — only the native (quant / \
-                     bf16) kernels and the f32 GEMV take a weight offset"
-                )));
+                // The resident routing, reading the slot by address (see `quant_linear`).
+                return quant_linear(
+                    be_,
+                    graph,
+                    dt,
+                    QuantWeight {
+                        addr: arena_addr,
+                        buffer: None,
+                    },
+                    w_off,
+                    x,
+                    xb,
+                    y,
+                    dst,
+                    m,
+                    in_f,
+                    out_f,
+                    rec,
+                    pool,
+                    transient,
+                    memo_prev,
+                    mmv_memo,
+                );
             }
             // Fused Linear+Add (decode residual): one GEMV with the residual added in-kernel —
             // see linear_add_peephole. `y` (the Linear's scratch dst) is never written.
@@ -1383,18 +1529,29 @@ fn lower_op(
                 }
                 let (rr, yf) = (r(*residual)?, r(*final_dst)?);
                 if native_dense_supported(dt) {
-                    if kq_fma_gemv_ok(be_, dt, in_f, out_f, 0) {
-                        rec.linear_kq_fma(dt, w, 0, xb, Some(rr), yf, in_f, out_f);
-                        return Ok(());
-                    }
                     // Multi-warp dp4a decode GEMV (wave32-native GPUs) takes precedence — see
                     // `mmv_mw_choice`. AMD returns None here and falls to the scalar/old-mmv path.
-                    if let Some(warps) =
-                        mmv_mw_choice(be_.caps(), &be_.cfg().kernels.vulkan, dt, in_f, out_f)
-                    {
+                    if let Some(warps) = mmv_mw_choice(
+                        be_.caps(),
+                        &be_.cfg().kernels.vulkan,
+                        be_.tuning(),
+                        dt,
+                        in_f,
+                        out_f,
+                        true,
+                    ) {
                         // FUSE_QUANT opt-in: inline activation quantization, skip the
-                        // separate quant_q8 dispatch.
-                        if be_.cfg().kernels.vulkan.mmv_fuse_quant {
+                        // separate quant_q8 dispatch. Only some dtypes have that build.
+                        if be_.cfg().kernels.vulkan.mmv_fuse_quant
+                            && crate::recorder::mmv_mrow_fuseq_variant(
+                                &be_.cfg().kernels.vulkan,
+                                dt,
+                                in_f,
+                                true,
+                                crate::recorder::MmvO4::of(be_.tuning()),
+                            )
+                            .is_some()
+                        {
                             rec.linear_mmv_mrow_fuseq(dt, w, 0, xb, Some(rr), yf, 1, in_f, out_f);
                             return Ok(());
                         }
@@ -1480,689 +1637,42 @@ fn lower_op(
                 }
                 return Ok(());
             }
-            // Prefill (m>1): a TILED GEMM writes ceil(m/64)*64 rows DIRECTLY into `y` (Internal
-            // buffers are row-padded to 64 up front, so no temp/copy). Needs n%64==0, k%32==0.
-            //  • Q4_K → mmq (dp4a int8): quantize activations once, integer matmul on the raw
-            //    blocks (no per-GEMM weight dequant) — the u4 prefill default.
-            //  • other native quants → coopmat `matmul_native` (in-shader dequant).
-            //  • f16 (float weights are uploaded as f16) → f16 coopmat `matmul_proj`.
-            // Decode (m=1) and non-tileable shapes fall through to the GEMV.
-            // Small multi-row batches (m = 2..8: spec-decode verify rows, a short chat-turn
-            // suffix prefill) take the multi-row GEMV first — the single-M-tile coopmat GEMM
-            // launches only n/64 workgroups (underfills the GPU: measured 51-182 GB/s effective
-            // weight stream vs the GEMV class's 292-651 on a 7900 XTX), and the plain GEMV
-            // re-streams the weight per row. 7900 XTX, 8B Q4_K shapes: m=2 is 5.6-8.3x the GEMM
-            // route, m=4 1.4-4.1x, m=8 1.7-2.6x — EXCEPT very wide n at m>=5 (gate+up n=24576:
-            // 384 tiles fill the GPU and the mrow's per-thread m*32-FMA inner loop turns
-            // ALU-bound), so m=5..8 gates on out_f <= 8192 (<=128 tiles = the GEMM-underfill
-            // regime). Writes exactly m rows (no padded-dst dance). Formats without an mrow
-            // build fall through to the GEMM; INFR_NO_MROW forces the old route (A/B).
-            // The int8 dp4a mrow's own gates (see the block comment below) — hoisted so the
-            // 9..=16 tier can require them UP FRONT: unlike m<=8 there is no dequant-mrow
-            // fallback above 8 rows, so entering the tier is only legal when the int8 kernel is
-            // actually dispatchable.
-            let mmv_gate = be_.caps().i8_dot
-                && in_f * out_f >= 8 << 20
-                && out_f < 65536
-                && crate::gemm::native_mmv_mrow_kernel_name(dt).is_some()
-                && mrow_int8_dtype_ok(be_.caps(), &be_.cfg().kernels.vulkan, dt, graph.mtp_verify)
-                && be_.cfg().kernels.vulkan.mmv;
-            // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
-            // once its rollback window carries a few committed rows on top of the n_max drafts.
-            // These shapes previously fell through to the split-K coopmat tile, which streams the
-            // same weight at 2-4x the per-row cost at this m (9B mtp128 measured: q4k down-proj
-            // m=11 sk_ag 148us vs mmvr m=7 67.5us; q6k 194us). Same out_f <= 8192 wide-n cutoff
-            // as m=5..8 (the GEMM tiles win on gate_up-wide shapes), same formats as the m<=8
-            // int8 tier (others keep the GEMM route — no dequant mrow above 8 rows).
-            // The two bands' SHAPE arithmetic lives in `MROW_BANDS` (shared policy); the
-            // capability half — kernel builds, dtype sets, caps, env hatches — stays here.
-            let mrow_tier = infr_core::tier::linear_tier(m, out_f, &MROW_BANDS);
-            let in_band = |b: usize| mrow_tier == infr_core::tier::LinearTier::MultiRow { band: b };
-            let mrow16 = in_band(MROW16_BAND)
-                && mmv_gate
-                && crate::gemm::native_mmv_mrow_m16_kernel_name(dt).is_some()
-                && be_.cfg().kernels.vulkan.mrow16;
-            if (in_band(MROW_BAND) || mrow16)
-                && in_f % 32 == 0
-                && crate::gemm::native_mrow_kernel_name(dt).is_some()
-                && be_.cfg().kernels.vulkan.mrow
-            {
-                // Preserve the int8 prefill tier; use decode-exact fp32 instead of scalar dequant.
-                if (graph.mtp_verify || m < 3 || !mmv_gate)
-                    && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off)
-                    && crate::gemm::native_gemv_kq_fma_mrow_spv(dt, 8).is_some()
-                {
-                    rec.linear_kq_fma_mrow(dt, w, w_off, xb, y, m, in_f, out_f);
-                    return Ok(());
-                }
-                // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
-                // integer-dot the raw weight blocks against ALL rows — the dequant mrow's
-                // per-sub-block scalar byte-extract dequant is the m-batch GEMV cost on ALU-bound
-                // shapes (E2B pp4@d4096: GEMV class 21.0 → 17.0us/op, pp4 366 → 383 t/s). Dtype
-                // eligibility is `mrow_int8_dtype_ok(caps, dt, graph.mtp_verify)`: an MTP-verify
-                // batch (`Graph::mtp_verify`) is gated to the SAME dtype set as the m=1 decode
-                // tier (`mmv_int8_decode_dtypes`) — int8 in both streams or in neither, never
-                // split (that split IS the Q5_K token-divergence bug; `mmv_mrow_symmetric_q2k_q3k`
-                // proves the two kernels agree once both are on). Ordinary prefill instead reads
-                // `mrow_int8_prefill_dtypes` — every measured win, independent of the decode set.
-                // Gates:
-                //  • m >= 3: m=2 is the single-head MTP spec-verify shape, whose accept loop
-                //    holds a hard output-identical-to-target-greedy bar (`mtp_spec_matches_
-                //    target_only_greedy`) — int8-quantized activations perturb the verify logits
-                //    enough to risk argmax flips vs the m=1 decode GEMV, so that shape keeps the
-                //    f32-dequant mrow.
-                //  • weight >= 8M elements: below that the kernel is dispatch-latency-floor
-                //    bound (the int8 math saves nothing) and the extra quant_q8 bubble is a pure
-                //    loss — qwen3-0.6b (all projections < 8M) measured pp4@d4096 934 → 854 t/s
-                //    ungated, and E2B's own win came from its gu/down (9.4-18.9M elems).
-                //  • out_f < 65536: the vocab-sized lm_head GEMV is pure weight-bandwidth (the
-                //    dequant ALU hides fully behind the stream) — the int8 form measured a hair
-                //    SLOWER there (qwen3-0.6b pp4@d4096 931 vs 916 with lm_head included).
-                // Same INFR_NO_MMV escape as the m=1 mmv (A/B).
-                if m >= 3 && mmv_gate {
-                    let nblk = in_f / 32;
-                    let qa = pooled(pool, be_, "mmvr_qa", m * in_f)?;
-                    let dact = pooled(pool, be_, "mmvr_dact", m * nblk * 2)?;
-                    let sact = pooled(pool, be_, "mmvr_sact", m * nblk * 2)?;
-                    // Same x already quantized by the immediately-preceding Linear(s)? Reuse it
-                    // (see `mmv_memo`'s doc — the take()/restore protocol guarantees nothing
-                    // rewrote x or the pooled qa in between).
-                    if memo_prev != Some((*x, m, in_f)) {
-                        rec.quant_q8(
-                            xb,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            m,
-                            in_f,
-                        );
-                    }
-                    *mmv_memo = Some((*x, m, in_f));
-                    rec.linear_mmv_mrow(
-                        dt,
-                        w,
-                        w_off,
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        pool[&sact].as_ref(),
-                        None,
-                        y,
-                        m,
-                        in_f,
-                        out_f,
-                    );
-                    return Ok(());
-                }
-                rec.linear_native_mrow(dt, w, w_off, xb, y, m, in_f, out_f);
-                return Ok(());
-            }
-            let gemm_ok = m > 1 && out_f % 64 == 0 && in_f % 32 == 0;
-            // The whole GEMM tier below (matmul_native*/matmul_proj, the coopmat tiled prefill
-            // GEMM) dispatches ONLY coopmat SPIR-V — RADV still executes it on hardware without
-            // the feature (silent, no fault), so gating is required, not optional (issue: coopmat
-            // dispatch on a device that lacks VK_KHR_cooperative_matrix segfaults on some
-            // drivers). `!caps.f16_coopmat` routes to the NON-COOPMAT GEMM tier below (`nc_mmq`/
-            // `nc_fma` — real tiled GEMMs with no coopmat SPIR-V), and only past that to the
-            // scalar `else` arms (`linear_native`/`linear`/`linear_f32` — the SAME scalar
-            // dequant-in-shader kernels the m==1 decode GEMV already uses, generalized to
-            // `rows=m`; they dispatch `rows*out_f` (or row-tiled) workgroups with no upper bound
-            // on `rows`, so they are a drop-in, just without any weight-reuse-across-rows win).
-            // Bit-identical to before when caps are all true.
-            // ── 8x8x16 coopmat prefill GEMM tier (Intel Arc/ANV XMX; `caps.f16_coopmat_8x8()` is
-            // Some only when the device enumerates the 8x8x16 f16 shape AND `INFR_CM_8X8=1` —
-            // NEVER on RADV, which enumerates 16x16x16 and keeps the full tier below untouched).
-            // Only `native_gemm_warp`'s `_cm8` builds exist at this shape: one fixed
-            // NARROW_N+BM32 tile (BN=128, BK=64 → n%128, k%64) over the hot k-quants + Q8_0.
-            // Anything it can't cover (dtype without a `_cm8` build, non-dividing shape) keeps
-            // falling to the nc_mmq/nc_fma tier — the Arc default this knob A/Bs against.
-            let cm8_ok = gemm_ok
-                && be_.caps().f16_coopmat_8x8()
-                && out_f % 128 == 0
-                && in_f % 64 == 0
-                && crate::gemm::native_gemm_warp_cm8_build_spv(dt).is_some();
-            let is_gemm = cm8_ok
-                || (gemm_ok
-                    && be_.caps().f16_coopmat()
-                    && (native_dense_supported(dt) || matches!(dt, infr_core::DType::F16)));
-            // ── NON-COOPMAT prefill GEMM tier (never taken when `caps.f16_coopmat` — zero effect
-            // on coopmat-capable defaults). The Intel Arc A770 (Mesa ANV) enumerates f16 coopmat
-            // only at M=8,N=8,K=16 — `caps.f16_coopmat()` is false there (see lib.rs) — but HAS
-            // packed int8 dot, and prefill GEMMs previously fell all the way to the per-row
-            // scalar GEMVs (the field-measured 10-30x prefill gap; decode was already at parity).
-            // This tier remains the Arc DEFAULT; the opt-in `cm8_ok` XMX tier above takes only
-            // the Linears it covers, and only under INFR_CM_8X8=1.
-            // Two arms, same padded-dst convention as `is_gemm`:
-            //  • `nc_mmq`: weight dtype in `infr_core::tensor::MOE_MMQ_DTYPES` + `caps.i8_dot` →
-            //    the DENSE dp4a mmq GEMM family (`matmul_mmq` — the same shader code the batched
-            //    MoE expert path already gates on `i8_dot` alone, base-grid build), fed by the
-            //    same `quant_q8` activation prepass the coopmat tier's Q4_K-mmq arm uses.
-            //  • `nc_fma`: f16/bf16/f32 weights (no integer codes to dp4a) → the shared-memory
-            //    fma warptile (`matmul_fma`, native_gemm_fma.comp — no subgroup ops, no f16
-            //    exts; bf16 reads stay native, no f32 upconvert).
-            // Exercisable on coopmat hardware via INFR_NO_COOPMAT=1 (lib.rs's force-disable test
-            // knob — drops the device feature itself, a faithful simulation). INFR_NO_MMQ_FALLBACK=1
-            // disables the WHOLE tier (both arms) for A/B against the scalar floor.
-            let nc_tier =
-                gemm_ok && !be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.mmq_fallback;
-            // fp32 K-quant GEMM (`matmul_kq_fma`) ahead of mmq where dp4a is emulated.
-            let nc_kq_fma = nc_tier
-                && be_
-                    .cfg()
-                    .kernels
-                    .vulkan
-                    .kq_fma_tier
-                    .unwrap_or(!be_.caps().i8_dot_fast)
-                && crate::gemm::native_gemm_kq_fma_supported(dt)
-                && in_f % 256 == 0
-                && w_off % 256 == 0;
-            let nc_mmq =
-                nc_tier && !nc_kq_fma && be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt);
-            let nc_fma =
-                nc_tier && !nc_mmq && crate::gemm::native_gemm_fma_kernel_name(dt).is_some();
-            // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
-            // (decode m=1, or the per-input-row GEMV) — the tiled coopmat/nc GEMMs below decode a
-            // 64-row weight tile that can't be split into single input rows, so a breach on this
-            // path (a multi-row lm_head: MTP speculative verify or all-position logits) must fail
-            // loudly, never wrap. Issue #77: covered classes chunk; everything else stays loud.
-            if (is_gemm || nc_kq_fma || nc_mmq || nc_fma)
-                && crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
-            {
-                return Err(be(format!(
-                    "vulkan adapter: output-projection tiled GEMM (m={m}, in_f={in_f}, \
-                     out_f={out_f}, {dt:?}) reads a >= 2^32-element weight — chunked dispatch \
-                     covers only m=1 decode and the per-row GEMV (issue #77). This is a multi-row \
-                     lm_head (speculative verify / all-position logits) on a big-vocab model."
-                )));
-            }
-            if is_gemm {
-                // GEMM writes ceil(m/64)*64 rows; `with_padded_dst` writes an Internal (row-padded)
-                // `dst` direct and a non-Internal dst (the lm_head `logits` Output) via a padded
-                // temp + copy of the m real rows. Same dance as the nc tier and the streamed twin.
-                with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
-                    // Q4_K: the 8-warp warptile coopmat GEMM (native_gemm_warp, in-shader dequant)
-                    // beats mmq dp4a at prefill shapes (161 vs 417µs on [512,1024]×[1024,6144] — the
-                    // wide tile amortizes staging; RADV can't use int8 WMMA). mmq stays for shapes NO
-                    // warp tile can cover — n%128≠0 (the NARROW_N tile covers n%128; gemma3-1b's
-                    // ne=1152 projections sat on scalar mmq at ~10 TF under the old n%256 gate).
-                    // INFR_NO_MMQ also skips mmq for A/B.
-                    let warp_ok = out_f % 128 == 0
-                        && crate::gemm::native_gemm_warp_kernel_name(dt).is_some()
-                        && be_.cfg().kernels.vulkan.gemm_warp;
-                    // int8 cooperative-matrix (WMMA) prefill GEMM — MEASUREMENT path, Q8_0 only
-                    // (crates/infr-vulkan/shaders/native_gemm_i8cm_q8_0.comp). `caps.i8_coopmat` is
-                    // hardware detection only (see its doc); this dispatch ALSO requires
-                    // `INFR_I8_COOPMAT=1` (default off) because int8 coopmat hung the GPU on an older
-                    // Mesa despite enumerating fine there too (commit ad82a77) — the toggle keeps that
-                    // regression class opt-in until a Mesa-version-gated default is warranted. Default
-                    // behavior (unset) is completely unaffected: this is a new, additive branch ahead
-                    // of the existing Q4_K-mmq / warp-coopmat / off-tier arms below, which are
-                    // untouched.
-                    // fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM — Q8_0 only
-                    // (crates/infr-vulkan/shaders/native_gemm_f8cm_q8_0.comp). `caps.f8_coopmat` is
-                    // hardware enumeration only (RDNA4/Navi44 confirmed, see lib.rs `has_f8_coopmat`);
-                    // this dispatch ALSO requires `INFR_F8_COOPMAT=1` (default off) because — unlike
-                    // `i8cm_ok` below — this kernel hasn't been run/measured on real fp8-coopmat
-                    // hardware at all yet (this dev box has none), so the opt-in stays until an RDNA4
-                    // pass validates correctness. Checked AHEAD of `i8cm_ok`: both are Q8_0-only
-                    // measurement tiers, so when a caller opts into fp8 it takes priority. Default
-                    // behavior (unset) is completely unaffected — new, additive branch ahead of the
-                    // i8cm / Q4_K-mmq / warp-coopmat / off-tier arms below, which are untouched.
-                    //
-                    // Shape gate mirrors `warp_ok`'s f16 warptile pick: WIDE (BN=256, BK=32) needs
-                    // out_f%256==0 && in_f%32==0; NARROW_N (BN=128, BK=64) needs out_f%128==0 &&
-                    // in_f%64==0 for shapes the wide tile can't cover (n%128 not n%256 — see
-                    // native_gemm_f8cm_q8_0.comp's -DNARROW_N). Neither divides (e.g. out_f%128!=0, or
-                    // out_f%128==0 with in_f%64!=0 so narrow's BK=64 can't stage either) -> f8cm_ok is
-                    // false and the shape falls through to i8cm/mmq/native below, unaffected.
-                    let f8_wide = out_f % 256 == 0 && in_f % 32 == 0;
-                    let f8_narrow = !f8_wide && out_f % 128 == 0 && in_f % 64 == 0;
-                    let f8cm_ok = matches!(dt, infr_core::DType::Q8_0)
-                        && be_.caps().f8_coopmat()
-                        && (f8_wide || f8_narrow)
-                        && be_.cfg().kernels.vulkan.f8_coopmat;
-                    // `i8_coopmat_ready` is `caps.i8_coopmat()` AND the `INFR_I8_COOPMAT=1` opt-in
-                    // AND this driver having PASSED the accumulator-layout known-answer probe at
-                    // init (see `VulkanBackend::verify_i8_coopmat_layout`): the kernel's
-                    // in-fragment descale reads accumulator elements at a mapping that is fixed per
-                    // implementation, so enumeration alone does not make it safe to dispatch.
-                    let i8cm_ok = matches!(dt, infr_core::DType::Q8_0) && be_.i8_coopmat_ready();
-                    // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM — the `-DBF16CM` build of the
-                    // SAME production kernel (crates/infr-vulkan/shaders/native_gemm_warp.comp) that
-                    // `native_gemm_warp_bf16` (the f16-clamped path below) already uses; only the
-                    // coopmat A/B operand type differs, so it should match that kernel's speed while
-                    // keeping bf16's full exponent range. `caps.bf16_coopmat` is hardware enumeration
-                    // only (RDNA4/Navi44 confirmed, see lib.rs `has_bf16_coopmat`); this dispatch ALSO
-                    // requires `INFR_BF16_COOPMAT=1` (default off) because this variant hasn't been
-                    // run/measured on real bf16-coopmat hardware at all yet (this dev box has none), so
-                    // the opt-in stays until an RDNA4 pass validates correctness. Default behavior
-                    // (unset) is completely unaffected: Bf16 keeps routing through the existing
-                    // `native_dense_supported` arm below (`native_gemm_warp_bf16`, the f16-clamped
-                    // path), byte-identical to before this branch existed. Shape gate mirrors
-                    // `f8_wide`/`f8_narrow`: WIDE (BN=256, BK=32) needs out_f%256==0 && in_f%32==0;
-                    // NARROW_N (BN=128, BK=64) needs out_f%128==0 && in_f%64==0.
-                    let bf16cm_wide = out_f % 256 == 0 && in_f % 32 == 0;
-                    let bf16cm_narrow = !bf16cm_wide && out_f % 128 == 0 && in_f % 64 == 0;
-                    let bf16cm_ok = matches!(dt, infr_core::DType::Bf16)
-                        && be_.caps().bf16_coopmat()
-                        && (bf16cm_wide || bf16cm_narrow)
-                        && be_.cfg().kernels.vulkan.bf16_coopmat;
-                    if cm8_ok {
-                        // 8x8x16 `_cm8` warptile (see the `cm8_ok` doc above). First in the chain:
-                        // when it's true, `caps.f16_coopmat()` is false (the shapes are mutually
-                        // exclusive), so every 16x16x16 branch below would mis-dispatch — none of
-                        // their SPIR-V exists at the device's fragment shape.
-                        rec.matmul_native_cm8(dt, xb, w, w_off, out, m, in_f, out_f);
-                    } else if f8cm_ok {
-                        // E4M3's range is tiny (max normal 448) — unscaled f32 activations overflow to
-                        // inf/NaN on cast, which is what produced garbage output on the first RDNA4
-                        // run. `quant_f8_row` pre-scales activations into E4M3's range (one amax/scale
-                        // per row) before the coopmat GEMM, which descales the output by that same
-                        // per-row scale in its epilogue. Q8_0 weights are unscaled (see
-                        // native_gemm_f8cm_q8_0.comp doc — their post-dequant magnitude is expected to
-                        // already fit E4M3).
-                        let qa = pooled(pool, be_, "f8cm_qa", m * in_f)?;
-                        let srow = pooled(pool, be_, "f8cm_srow", m * 4)?;
-                        rec.quant_f8_row(xb, pool[&qa].as_ref(), pool[&srow].as_ref(), m, in_f);
-                        // INFR_F8_PREPACK=1 (requires INFR_F8_COOPMAT=1 too, since it only takes
-                        // effect inside this arm): bakes the Q8_0 block scale into an E4M3 weight
-                        // buffer ONCE via `repack_q8_to_f8`, then the GEMM's Bs staging reads that
-                        // buffer DIRECTLY — no in-shader dqblk. Isolates whether removing the
-                        // dequant-ALU bottleneck (the SAME cost f16 pays; fp8-dqblk measured 0.73x
-                        // f16 on RDNA4) lets fp8's 2x WMMA rate win. The E4M3 buffer is pooled
-                        // per-shape scratch (like every other tier here) and re-repacked on EVERY
-                        // forward call — a real deployment would cache the repack at load time, not
-                        // redo it per Linear; this is a per-op profiling isolation path, not the
-                        // proposed production shape. Unset (default): unchanged dqblk path below,
-                        // byte-identical to before this branch existed.
-                        if be_.cfg().kernels.vulkan.f8_prepack {
-                            let f8_w8 = pooled(pool, be_, "f8_w8", out_f * in_f)?;
-                            rec.repack_q8_to_f8(w, w_off, pool[&f8_w8].as_ref(), out_f, in_f);
-                            rec.matmul_f8cm_q8_0_prepacked(
-                                pool[&qa].as_ref(),
-                                pool[&srow].as_ref(),
-                                pool[&f8_w8].as_ref(),
-                                out,
-                                m,
-                                in_f,
-                                out_f,
-                            );
-                        } else {
-                            rec.matmul_f8cm_q8_0(
-                                pool[&qa].as_ref(),
-                                pool[&srow].as_ref(),
-                                w,
-                                w_off,
-                                out,
-                                m,
-                                in_f,
-                                out_f,
-                            );
-                        }
-                    } else if i8cm_ok {
-                        // "Idea 2" measurement (INFR_I8_ROW_SCALE=1, requires INFR_I8_COOPMAT=1 too):
-                        // whole-row (block-invariant) activation scale instead of quant_q8's
-                        // per-32-block scale — see native_gemm_i8cm_q8_0.comp #ifdef ROW_SCALE /
-                        // quant_q8_row.comp. Separate pool tag (different buffer size/layout) and a
-                        // separate kernel pair, so this can be measured and reverted independently of
-                        // the i8cm baseline path above.
-                        if be_.cfg().kernels.vulkan.i8_row_scale {
-                            let qa = pooled(pool, be_, "i8cm_qa_row", m * in_f)?;
-                            let dact_row = pooled(pool, be_, "i8cm_dact_row", m * 2)?;
-                            rec.quant_q8_row(
-                                xb,
-                                pool[&qa].as_ref(),
-                                pool[&dact_row].as_ref(),
-                                m,
-                                in_f,
-                            );
-                            rec.matmul_i8cm_q8_0_rowscale(
-                                pool[&qa].as_ref(),
-                                pool[&dact_row].as_ref(),
-                                w,
-                                w_off,
-                                out,
-                                m,
-                                in_f,
-                                out_f,
-                            );
-                        } else {
-                            let nblk = in_f / 32;
-                            let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
-                            let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
-                            let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
-                            rec.quant_q8(
-                                xb,
-                                pool[&qa].as_ref(),
-                                pool[&dact].as_ref(),
-                                pool[&sact].as_ref(),
-                                m,
-                                in_f,
-                            );
-                            rec.matmul_i8cm_q8_0(
-                                pool[&qa].as_ref(),
-                                pool[&dact].as_ref(),
-                                w,
-                                w_off,
-                                out,
-                                m,
-                                in_f,
-                                out_f,
-                            );
-                        }
-                    } else if bf16cm_ok {
-                        rec.matmul_bf16cm(xb, w, w_off, out, m, in_f, out_f);
-                    } else if matches!(dt, infr_core::DType::Q4K)
-                        && !warp_ok
-                        && be_.caps().i8_dot
-                        && be_.cfg().kernels.vulkan.mmq
-                    {
-                        // mmq (dp4a int8): quantize activations once, integer matmul on raw blocks.
-                        // Scratch is pooled — every same-shape Linear in the graph reuses one set.
-                        let nblk = in_f / 32;
-                        let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
-                        let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
-                        let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
-                        rec.quant_q8(
-                            xb,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            m,
-                            in_f,
-                        );
-                        rec.matmul_mmq_q4k(
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            w,
-                            w_off,
-                            out,
-                            m,
-                            in_f,
-                            out_f,
-                        );
-                    } else if native_dense_supported(dt) {
-                        // A_GLOBAL f16-A cast / narrow-n split-K / direct tile — the SAME tile selection
-                        // as the streamed twin (`native_warp_gemm`), reading the resident weight by its
-                        // BDA. Occupancy note: dropping the As stage shrinks LDS to Bs-only → ~1.5x on
-                        // the 8B prefill shapes (o proj 29→44 TF). Pool pad rows may hold stale garbage;
-                        // GEMM rows are independent, and dst pad rows are never read.
-                        let w_addr = w
-                            .device_addr()
-                            .expect("resident-BDA weight: dense Linear requires a u64 BDA address");
-                        native_warp_gemm(
-                            be_, dt, w_addr, w_off, xb, out, m, in_f, out_f, rec, pool,
-                        )?;
-                    } else {
-                        // F16 deep-k narrow-n → SPLIT-K warptile (DG slice-7 comparative
-                        // attribution): the SC soft-embedding GEMM (m=canvas=256, k=vocab=262144,
-                        // n=ne=2816, f16 weight) measured 58ms/step at ~6.5 TFLOPS on the legacy
-                        // `gemm_proj` BN=64 tile below (28% of the whole denoise step) vs llama.cpp's
-                        // 14.1ms @ 27 TFLOPS for the IDENTICAL shape — the single biggest
-                        // infr-vs-fork per-stage delta. Same narrow-grid split-K policy as the
-                        // native-quant branch above (out_f%128, deep k, grid < 128 wgs); the F16
-                        // decode is exact (see native_decode.glsl FMT_F16), so numerics match the
-                        // f16 coopmat route up to accumulation order. Everything that doesn't hit
-                        // the split-K window keeps the `matmul_proj` route unchanged.
-                        // Same splits policy as the quant branch above (`split_k_plan`). Probed deeper
-                        // splits at the SC shape (splits=4/8/16 via a temporary env override): the op
-                        // shaved 30.0 -> 25.8-28.4ms but dg-step stayed flat (1100-1107, within noise),
-                        // so the shared formula stays — no bespoke tuning knob.
-                        let splits = split_k_plan(m, in_f, out_f);
-                        if matches!(dt, infr_core::DType::F16)
-                            && splits > 1
-                            && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some()
-                            && be_.cfg().kernels.vulkan.gemm_warp
-                        {
-                            let mpad = m.div_ceil(64) * 64;
-                            let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
-                            let w_addr = w.device_addr().expect(
-                            "resident-BDA weight: F16 split-K Linear requires a u64 BDA address",
-                        );
-                            rec.matmul_native_splitk(
-                                dt,
-                                xb,
-                                w_addr,
-                                w_off,
-                                pool[&pk].as_ref(),
-                                out,
-                                m,
-                                in_f,
-                                out_f,
-                                splits,
-                                false,
-                            );
-                        } else {
-                            // f16 coopmat GEMM. `matmul_proj` internally forks on `wq.device_addr()`
-                            // (see its recorder doc) — no threading needed here.
-                            rec.matmul_proj(xb, w, out, m, in_f, out_f);
-                        }
-                    }
-                    Ok(())
-                })?;
-            } else if nc_kq_fma {
-                // BN=128 only when it still gives every CU a workgroup.
-                let cu = be_.caps().compute_units.max(1) as usize;
-                let bn = if out_f % 128 == 0 && m.div_ceil(128) * (out_f / 128) >= cu {
-                    128
-                } else {
-                    64
-                };
-                let splits = kq_fma_split_plan(
-                    m,
-                    in_f,
-                    out_f,
-                    bn,
-                    cu,
-                    be_.cfg().kernels.vulkan.kq_fma_splitk,
+            // Float weights take their own dispatch, shared with the streamed arm above. None of
+            // the native-only tiers below has a float build (`float_weights_skip_native_tiers`).
+            if matches!(dt, infr_core::DType::F16 | infr_core::DType::F32) {
+                let w_addr = w
+                    .device_addr()
+                    .expect("resident-BDA weight: float Linear requires a u64 BDA address");
+                return float_linear(
+                    be_, graph, dt, w_addr, w_off, x, xb, y, dst, m, in_f, out_f, rec, pool,
+                    transient, memo_prev, mmv_memo,
                 );
-                with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
-                    if splits > 1 {
-                        let mpad = m.div_ceil(64) * 64;
-                        let pk = pooled(pool, be_, "kq_splitk_part", splits * mpad * out_f * 4)?;
-                        rec.matmul_kq_fma_splitk(
-                            dt,
-                            bn,
-                            xb,
-                            w,
-                            w_off,
-                            pool[&pk].as_ref(),
-                            out,
-                            m,
-                            in_f,
-                            out_f,
-                            splits,
-                        );
-                    } else {
-                        rec.matmul_kq_fma(dt, bn, xb, w, w_off, out, m, in_f, out_f);
-                    }
-                    Ok(())
-                })?;
-            } else if nc_mmq || nc_fma {
-                // Non-coopmat prefill GEMM tier (see the `nc_tier` doc above). Same padded-dst
-                // dance as `is_gemm` (`with_padded_dst`): the GEMM writes ceil(m/64)*64 rows.
-                with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
-                    if nc_mmq {
-                        // Same pooled scratch tags/sizes as the coopmat tier's Q4_K-mmq arm — the
-                        // two arms are mutually exclusive per device, so the tags never collide.
-                        let nblk = in_f / 32;
-                        let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
-                        let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
-                        let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
-                        rec.quant_q8(
-                            xb,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            m,
-                            in_f,
-                        );
-                        rec.matmul_mmq(
-                            dt,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            w,
-                            w_off,
-                            out,
-                            m,
-                            in_f,
-                            out_f,
-                        );
-                    } else {
-                        rec.matmul_fma(dt, xb, w, w_off, out, m, in_f, out_f);
-                    }
-                    Ok(())
-                })?;
-            } else if native_dense_supported(dt) {
-                // Decode (m=1) on int-dot-capable K-quants → mmv (see the fused-add branch above).
-                // Wave32-native GPUs take the multi-warp dp4a route first (`mmv_mw_choice`); AMD
-                // falls through to the scalar GEMV (default) or the old mmv (INFR_MMV_DECODE=1).
-                // A `>= 2^32`-element lm_head is chunk-covered on the native dequant GEMV
-                // (`linear_native`, the `else` below) but NOT on this multi-warp int8 dp4a mmv
-                // route — route a breaching weight to the chunked path rather than wrap its u32
-                // index (issue #77). Only lm_head/embed can breach; the tier skipped here matters
-                // only for a 256k-vocab model's single vocab GEMV.
-                if m == 1 && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off) {
-                    rec.linear_kq_fma(dt, w, w_off, xb, None, y, in_f, out_f);
-                    return Ok(());
-                }
-                let mw = if m == 1
-                    && !crate::recorder::bda_weight_breaches(
-                        dt,
-                        in_f,
-                        out_f,
-                        &be_.cfg().kernels.vulkan,
-                    ) {
-                    mmv_mw_choice(be_.caps(), &be_.cfg().kernels.vulkan, dt, in_f, out_f)
-                } else {
-                    None
-                };
-                if let Some(warps) = mw {
-                    // FUSE_QUANT opt-in: inline activation quantization, skip the
-                    // separate quant_q8 dispatch.
-                    if be_.cfg().kernels.vulkan.mmv_fuse_quant {
-                        rec.linear_mmv_mrow_fuseq(dt, w, w_off, xb, None, y, 1, in_f, out_f);
-                        return Ok(());
-                    }
-                    let nblk = in_f / 32;
-                    let qa = pooled(pool, be_, "mmv_qa", in_f)?;
-                    let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
-                    let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
-                    rec.quant_q8(
-                        xb,
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        pool[&sact].as_ref(),
-                        1,
-                        in_f,
-                    );
-                    if unified_mmv_row1(be_.caps()) {
-                        // Same kernel/reduction as the m>=3 verify tier, dispatched at rows=1 — see
-                        // the fused-add branch above and `unified_mmv_row1`'s doc.
-                        rec.linear_mmv_mrow(
-                            dt,
-                            w,
-                            w_off,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            None,
-                            y,
-                            1,
-                            in_f,
-                            out_f,
-                        );
-                    } else {
-                        rec.linear_mmv_mw(
-                            dt,
-                            warps,
-                            w,
-                            w_off,
-                            pool[&qa].as_ref(),
-                            pool[&dact].as_ref(),
-                            pool[&sact].as_ref(),
-                            None,
-                            y,
-                            in_f,
-                            out_f,
-                        );
-                    }
-                } else if m == 1
-                    && mmv_decode_enabled(&be_.cfg().kernels.vulkan)
-                    && be_.caps().i8_dot
-                    && in_f % 32 == 0
-                    && in_f * out_f >= MMV_MIN_ELEMS
-                    && crate::gemm::native_mmv_kernel_name(dt, false).is_some()
-                    // A `>= 2^32`-element lm_head is chunk-covered on the native dequant GEMV
-                    // (`linear_native`, below) but NOT on this int8 dp4a mmv tier — route a
-                    // breaching weight to the chunked path rather than wrap its u32 index (issue
-                    // #77). Only lm_head/embed can breach, and the perf tier they skip here matters
-                    // only for a 256k-vocab model's single vocab GEMV.
-                    && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
-                {
-                    let nblk = in_f / 32;
-                    let qa = pooled(pool, be_, "mmv_qa", in_f)?;
-                    let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
-                    let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
-                    rec.quant_q8(
-                        xb,
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        pool[&sact].as_ref(),
-                        1,
-                        in_f,
-                    );
-                    rec.linear_mmv(
-                        dt,
-                        w,
-                        w_off,
-                        pool[&qa].as_ref(),
-                        pool[&dact].as_ref(),
-                        pool[&sact].as_ref(),
-                        y,
-                        in_f,
-                        out_f,
-                    );
-                } else {
-                    rec.linear_native(dt, w, w_off, xb, y, m, in_f, out_f);
-                }
-            } else if matches!(dt, infr_core::DType::F32) {
-                // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj, DeepSeek
-                // V4's grouped output projection): the seam uploads native dtype, and the f16 GEMV
-                // would read the f32 bytes as f16 garbage.
-                if w_off == 0 {
-                    rec.linear_f32(w, xb, y, m, in_f, out_f);
-                } else {
-                    // Row-aligned slice of the weight (`w_off % in_f == 0`, `Op::Linear::w_off`'s
-                    // contract) expressed as a shifted base ADDRESS, because `linear_f32r.comp` has
-                    // no offset field. Alignment: the vec4 variant declares a 16-byte-aligned
-                    // buffer_reference and is only chosen when `in_f % 4 == 0`, and `w_off` is a
-                    // whole multiple of `in_f`, so `w_off * 4` bytes is a multiple of 16 exactly
-                    // when that variant can run. The scalar variants need 4, which any f32 element
-                    // offset satisfies. Asserted rather than assumed — a violation would read
-                    // misaligned and is not otherwise detectable.
-                    if w_off % in_f != 0 {
-                        return Err(be(format!(
-                            "vulkan adapter: Linear w_off {w_off} is not a whole multiple of \
-                             in_f {in_f} — the f32 GEMV addresses a row-aligned weight slice"
-                        )));
-                    }
-                    let base = w.device_addr().ok_or_else(|| {
-                        be("vulkan adapter: f32 Linear with w_off needs a BDA weight address")
-                    })?;
-                    rec.linear_f32_at(base + (w_off * 4) as u64, xb, y, m, in_f, out_f);
-                }
-            } else if be_.caps().f16 {
-                rec.linear(w, xb, y, m, in_f, out_f);
-            } else {
-                // No shaderFloat16 (implies no coopmat too — f16 is a coopmat prerequisite):
-                // linear_f16.comp's `float16_t` SSBO read needs the Float16 SPIR-V capability the
-                // device lacks. linear_f16_noext.comp is the same dispatch shape reading the f16
-                // weight buffer as packed u32 words and unpacking via the CORE `unpackHalf2x16`
-                // builtin instead — correctness-first, not perf-tuned (no row-tiling).
-                rec.linear_f16_noext(w, xb, y, m, in_f, out_f);
             }
+            let w_addr = w.device_addr().ok_or_else(|| {
+                be("vulkan adapter: a quantised Linear weight without a device address")
+            })?;
+            quant_linear(
+                be_,
+                graph,
+                dt,
+                QuantWeight {
+                    addr: w_addr,
+                    buffer: Some(w),
+                },
+                w_off,
+                x,
+                xb,
+                y,
+                dst,
+                m,
+                in_f,
+                out_f,
+                rec,
+                pool,
+                transient,
+                memo_prev,
+                mmv_memo,
+            )?;
         }
         Op::Add { a, b, dst, n } => rec.add(r(*a)?, r(*b)?, r(*dst)?, *n as usize),
         Op::AddBias {
@@ -2225,6 +1735,13 @@ fn lower_op(
                     ));
                 }
                 rec.store_f16(r(*src)?, r(*dst)?, *n as usize, *dst_off as usize);
+            } else if sdt != ddt {
+                // A byte copy between different dtypes reinterprets bits (an f16 row would land
+                // in an f32 buffer at half width); only F32→F16 has a converting kernel.
+                return Err(be(format!(
+                    "vulkan adapter: Op::Copy {sdt:?}→{ddt:?} has no conversion kernel (only \
+                     F32→F16, or a same-dtype copy)"
+                )));
             } else {
                 // IR offsets/counts are in ELEMENTS; the recorder copy takes BYTES.
                 let eb = sdt.dense_bytes(1).unwrap_or(4);
@@ -2406,8 +1923,6 @@ fn lower_op(
             let src_f16 = matches!(graph.desc(*src).dtype, infr_core::DType::F16);
             // Planar scales region begins at byte `cap` = total cache elements.
             let cap = graph.desc(*cache).numel();
-            // A pooled cache owns one contiguous block of rows; every store is biased into it.
-            let rb = kv_row_base(graph, *cache);
             // SWA ring cache: the write for position p lands at row p % cap_rows — the ring only
             // recycles rows whose positions the window mask already excludes (see the runner's
             // ring sizing). A batched prefill write crossing the wrap splits into two contiguous
@@ -2430,41 +1945,48 @@ fn lower_op(
             // store→(later attention)read barrier survives. store_f16 keeps its bound/BDA fork below
             // (it also has a non-KV scratch caller), so `c_addr` is still computed for it.
             let c_addr = c.device_addr();
+            // `store_q8` quantizes one Q8_0 block per workgroup from a block-aligned offset, so a
+            // row that is not a whole number of blocks would straddle them.
+            let q8_block = infr_core::decode_spec::block_layout(infr_core::DType::Q8_0).0;
+            if cache_q8 && !rs.is_multiple_of(q8_block) {
+                return Err(be(format!(
+                    "vulkan adapter: Op::WriteKv into a Q8_0 cache needs a row width that is a \
+                     multiple of the {q8_block}-element block, got {rs}"
+                )));
+            }
             match mode {
                 RopeMode::Static(_) if cache_q8 => {
                     for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
-                        rec.store_q8(s, c, nr * rs, (dr + rb) * rs, cap, src_f16, sr * rs);
+                        rec.store_q8(s, c, nr * rs, dr * rs, cap, src_f16, sr * rs);
                     }
                 }
                 RopeMode::Dynamic(params) if cache_q8 => {
-                    rec.store_q8_dyn(s, *params, c, n, cap, src_f16, rb)
+                    rec.store_q8_dyn(s, *params, c, n, cap, src_f16)
                 }
                 // Mainline low-bit KV quants: quantize into standard GGUF blocks (static only — a
                 // quantized KV cache forces static decode, so a Dynamic WriteKv never reaches here).
                 RopeMode::Static(_) if is_kv_quant(cache_dt) => {
-                    rec.quant_kv(cache_dt, s, c, n, (pos + rb) * rs, src_f16)
+                    rec.quant_kv(cache_dt, s, c, n, pos * rs, src_f16)
                 }
                 // Dense f32/bf16 cache: cast-store the row (also static-only).
                 RopeMode::Static(_) if is_kv_dense_alt(cache_dt) => {
-                    rec.store_kv_dense(cache_dt, s, c, n, (pos + rb) * rs, src_f16)
+                    rec.store_kv_dense(cache_dt, s, c, n, pos * rs, src_f16)
                 }
                 // TurboQuant cache: WHT-quantize the row (static-only). NOT BDA-migrated (#74 slice 3
                 // deferred turbo — its dequant read is byte-granular, outside the u32-word/f16 read
                 // family; experimental, not in the gate suite).
                 RopeMode::Static(_) if is_turbo(cache_dt) => {
-                    rec.quant_turbo(cache_dt, s, c, n, (pos + rb) * rs, src_f16)
+                    rec.quant_turbo(cache_dt, s, c, n, pos * rs, src_f16)
                 }
                 RopeMode::Static(_) => {
                     for &(sr, dr, nr) in segs.iter().filter(|&&(_, _, nr)| nr > 0) {
                         match graph.desc(*src).dtype {
                             infr_core::DType::F16 => {
-                                rec.copy(s, sr * rs * 2, c, (dr + rb) * rs * 2, nr * rs * 2)
+                                rec.copy(s, sr * rs * 2, c, dr * rs * 2, nr * rs * 2)
                             }
                             _ => match c_addr {
-                                Some(a) => {
-                                    rec.store_f16_off_at(s, c, a, nr * rs, (dr + rb) * rs, sr * rs)
-                                }
-                                None => rec.store_f16_off(s, c, nr * rs, (dr + rb) * rs, sr * rs),
+                                Some(a) => rec.store_f16_off_at(s, c, a, nr * rs, dr * rs, sr * rs),
+                                None => rec.store_f16_off(s, c, nr * rs, dr * rs, sr * rs),
                             },
                         }
                     }
@@ -2476,8 +1998,8 @@ fn lower_op(
                         return Err(be("vulkan adapter: dynamic decode f16 WriteKv unexpected"))
                     }
                     _ => match c_addr {
-                        Some(a) => rec.store_f16_dyn_at(s, *params, c, a, n, cap_rows, rb),
-                        None => rec.store_f16_dyn(s, *params, c, n, cap_rows, rb),
+                        Some(a) => rec.store_f16_dyn_at(s, *params, c, a, n, cap_rows),
+                        None => rec.store_f16_dyn(s, *params, c, n, cap_rows),
                     },
                 },
             }
@@ -2505,27 +2027,33 @@ fn lower_op(
             // see `kv_write_peephole`); `kcap` is the fused cache's row capacity for the DYNAMIC
             // path, where the row must be derived from the live params pos in-kernel (the ring
             // modulo rides the same params channel as the pos itself — never a baked constant).
-            let (out_buf, fused, kcap) =
-                if let Some(&(cache, pos, row)) = fused_kv_write.get(&op_idx) {
-                    (r(cache)?, Some(pos), graph.desc(cache).numel() / row.max(1))
-                } else {
-                    (r(*dst)?, None, 0)
-                };
+            // The strided (interleaved q+gate) kernels have no frequency-factor build and the ff
+            // builds read `x` densely, so the pair has no kernel at all — refuse rather than read
+            // the wrong rows.
+            if *x_stride > 0 && freq_factors.is_some() {
+                return Err(be(
+                    "vulkan adapter: Op::QkNormRope with both x_stride and freq_factors has no \
+                     kernel — the strided builds take no frequency factors",
+                ));
+            }
+            // `qk_norm_rope.comp` stages one head in `shared float xs[QK_NORM_ROPE_MAX_HD]`.
+            if *head_dim > QK_NORM_ROPE_MAX_HD {
+                return Err(be(format!(
+                    "vulkan adapter: Op::QkNormRope head_dim {head_dim} exceeds the kernel's \
+                     {QK_NORM_ROPE_MAX_HD}-element shared head buffer"
+                )));
+            }
+            let (out_buf, fused, kcap) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
+                let row = (*n_head as usize) * (*head_dim as usize);
+                (r(cache)?, Some(pos), graph.desc(cache).numel() / row.max(1))
+            } else {
+                (r(*dst)?, None, 0)
+            };
             // #74: fork to the BDA path ONLY when the fused K write lands in the KV cache (which
             // exposes a device address); the un-fused Q-scratch write (Activations, no address) stays
             // on the bound build. `out_buf` stays bound at its write slot in the `_at` method for the
             // store→read barrier. Bit-identical to the bound dispatch.
-            let k_bias = fused_kv_write.get(&op_idx).map_or(0, |&(cache, _, row)| {
-                kv_row_base(graph, cache) * graph.desc(cache).dtype.dense_bytes(row).unwrap_or(0)
-            });
-            tracing::debug!(
-                op = op_idx,
-                k_bias,
-                fused = fused.is_some(),
-                addr = out_buf.device_addr().is_some(),
-                "fused K write"
-            );
-            let y_addr = out_buf.device_addr().map(|a| a + k_bias as u64);
+            let y_addr = out_buf.device_addr();
             match mode {
                 RopeMode::Static(rope_pos) => {
                     let ff = match freq_factors {
@@ -2610,6 +2138,18 @@ fn lower_op(
                     // by nheads*hd): 1 → write cache row pos, 0 → write row 0 of the Q scratch.
                     let out_base_mul = usize::from(fused.is_some());
                     if *x_stride > 0 && ff.is_none() {
+                        // The interleaved `_dyn` build writes row `pos` with no ring modulo (the
+                        // plain build takes `kcap`), so a replayed fused K write into a ring cache
+                        // would land past the ring once pos outran its rows.
+                        if let Some(&(cache, _)) = fused_kv_write.get(&op_idx) {
+                            if may_be_ring_cache(graph, cache) {
+                                return Err(be(
+                                    "vulkan adapter: record-once Op::QkNormRope with x_stride \
+                                     cannot write a sliding-window ring KV cache — the \
+                                     interleaved dyn kernel has no ring row mapping",
+                                ));
+                            }
+                        }
                         match y_addr {
                             Some(a) => rec.qk_norm_rope_interleaved_dyn_at(
                                 r(*x)?,
@@ -2683,7 +2223,8 @@ fn lower_op(
         // Standalone RoPE (llama: no q/k-norm; INTERLEAVED pairs — llama.cpp's ROPE_TYPE_NORM).
         // An f16 dst takes the same fused shapes as QkNormRope: the kv_write peephole redirects
         // the K write into the cache, and Dynamic mode replays via `rope_f16_dyn` (pos from
-        // `params`). The legacy f32 in-place form stays static-only. No freq_factors kernel.
+        // `params`). The legacy f32 in-place form stays static-only. Every form has a
+        // freq_factors build (`rope_ff` / `rope_f16_ff` / `rope_f16_dyn_ff` and their BDA twins).
         Op::Rope {
             x,
             positions,
@@ -2699,16 +2240,7 @@ fn lower_op(
             ..
         } => {
             let f16_out = matches!(graph.desc(*dst).dtype, infr_core::DType::F16);
-            // YaRN freq_factors (deepseek2 k_pe) are only supported on the STATIC f32 in-place
-            // path (`rec.rope` → the `rope_ff` kernel build). The f16-out forms (`rope_f16`,
-            // fused KV write) and the record-once `_dyn` variants have no ff kernel — reject
-            // rather than silently drop the divisors.
-            if freq_factors.is_some() && (f16_out || !matches!(mode, RopeMode::Static(_))) {
-                return Err(be(
-                    "vulkan adapter: standalone Rope with freq_factors unsupported on this path",
-                ));
-            }
-            // Same for NEOX (deepseek32's indexer): only the static f32 builds carry `-DNEOX`.
+            // NEOX (deepseek32's indexer): only the static f32 builds carry `-DNEOX`.
             // Dropping it silently would rotate the wrong element pairs — fluent nonsense, no
             // error — so refuse instead.
             if *neox && (f16_out || !matches!(mode, RopeMode::Static(_))) {
@@ -2717,7 +2249,7 @@ fn lower_op(
                      record-once decode have no -DNEOX kernel build)",
                 ));
             }
-            // Same again for BACKWARD (deepseek4's attention-output de-rope, `Op::Rope::backward`):
+            // Same for BACKWARD (deepseek4's attention-output de-rope, `Op::Rope::backward`):
             // only the static f32 NORM builds carry `-DBACKWARD`. A dropped sign is the same class
             // of silent-wrong-numbers as a dropped pairing, so refuse.
             if *backward && (f16_out || *neox || !matches!(mode, RopeMode::Static(_))) {
@@ -2727,21 +2259,15 @@ fn lower_op(
                 ));
             }
             let ff = freq_factors.map(r).transpose()?;
-            let (out_buf, fused, fused_cache) =
-                if let Some(&(cache, pos, row)) = fused_kv_write.get(&op_idx) {
-                    (r(cache)?, Some(pos), Some((cache, row)))
-                } else {
-                    (r(*dst)?, None, None)
-                };
+            let (out_buf, fused) = if let Some(&(cache, pos)) = fused_kv_write.get(&op_idx) {
+                (r(cache)?, Some(pos))
+            } else {
+                (r(*dst)?, None)
+            };
             // #74: fork to the BDA path when the fused K write lands in the KV cache (device address
             // present); the un-fused Q-scratch write stays bound. `out_buf` stays bound at its write
-            // slot in the `_at` method for the store→read barrier. A pooled cache's rows start at
-            // its block, so the fused write's row is biased by `row_base` through the address (the
-            // push's fused row is a bare `pos`, or `pos` from the params stream).
-            let k_bias = fused_cache.map_or(0, |(cache, row)| {
-                kv_row_base(graph, cache) * graph.desc(cache).dtype.dense_bytes(row).unwrap_or(0)
-            });
-            let y_addr = out_buf.device_addr().map(|a| a + k_bias as u64);
+            // slot in the `_at` method for the store→read barrier.
+            let y_addr = out_buf.device_addr();
             match mode {
                 RopeMode::Static(rope_pos) => {
                     if f16_out {
@@ -2757,6 +2283,7 @@ fn lower_op(
                                 *theta,
                                 rope_pos[&positions.0],
                                 fused.unwrap_or(0),
+                                ff,
                             ),
                             None => rec.rope_f16(
                                 r(*x)?,
@@ -2768,6 +2295,7 @@ fn lower_op(
                                 *theta,
                                 rope_pos[&positions.0],
                                 fused.unwrap_or(0),
+                                ff,
                             ),
                         }
                     } else {
@@ -2792,6 +2320,15 @@ fn lower_op(
                             "vulkan adapter: dynamic decode f32 in-place Rope unsupported",
                         ));
                     }
+                    // `rope_f16_dyn` writes row `pos` with no ring modulo, so a replayed fused K
+                    // write into a ring cache would land past the ring once pos outran its rows.
+                    if let Some(&(cache, _)) = fused_kv_write.get(&op_idx) {
+                        if may_be_ring_cache(graph, cache) {
+                            return Err(be("vulkan adapter: record-once Op::Rope cannot write a \
+                                 sliding-window ring KV cache — rope_f16_dyn has no ring row \
+                                 mapping"));
+                        }
+                    }
                     match y_addr {
                         Some(a) => rec.rope_f16_dyn_at(
                             r(*x)?,
@@ -2804,6 +2341,7 @@ fn lower_op(
                             *rope_dim as usize,
                             *theta,
                             usize::from(fused.is_some()),
+                            ff,
                         ),
                         None => rec.rope_f16_dyn(
                             r(*x)?,
@@ -2815,6 +2353,7 @@ fn lower_op(
                             *rope_dim as usize,
                             *theta,
                             usize::from(fused.is_some()),
+                            ff,
                         ),
                     }
                 }
@@ -2838,6 +2377,7 @@ fn lower_op(
             pos,
             sinks,
             key_bias,
+            comp,
         } => {
             let (rows, kv_len, nh, nkv, hd, pos) = (
                 *rows as usize,
@@ -2865,6 +2405,58 @@ fn lower_op(
             // kv_len (padded, for nonfa's 256-row tiles) outruns the rows actually present. On a
             // full-context cache kv_len <= att_cap_rows always, so none of these gates move.
             let att_cap_rows = cap / (nkv * hd).max(1);
+            infr_core::graph::check_attention(graph, op).map_err(be)?;
+            // DeepSeek V4's compressed key segment (`Op::Attention::comp`) is served by the
+            // `-DCOMP` builds of the same scalar kernel the sinks route below takes, and nothing
+            // else: no tier of the ladder knows the segment, and one that ignored it would be a
+            // plausible softmax over half the keys.
+            if let Some(c) = comp {
+                let f16 = |t: infr_core::tensor::TensorId| {
+                    matches!(graph.desc(t).dtype, infr_core::DType::F16)
+                };
+                if !f16(*k_cache) || !f16(*v_cache) || !f16(c.cache) {
+                    return Err(be(
+                        "vulkan adapter: Op::Attention with comp needs f16 raw and compressed \
+                         caches — that build has no quant read and no dequant prepass",
+                    ));
+                }
+                // The kernel's per-thread accumulator covers this many output dims, the same
+                // bound every `attention_kv` build has.
+                if hd > ATTN_KV_MAX_HD {
+                    return Err(be(format!(
+                        "vulkan adapter: Op::Attention with comp: head_dim {hd} exceeds the \
+                         attention_kv bound {ATTN_KV_MAX_HD}"
+                    )));
+                }
+                let window = match mask {
+                    AttnMask::SlidingWindow(w) => *w,
+                    // `check_attention` refused a canvas mask.
+                    AttnMask::Causal | AttnMask::Canvas { .. } => 0,
+                };
+                let sk = sinks.map(r).transpose()?;
+                let cb = c.bias.map(r).transpose()?;
+                rec.attention_kv_comp(
+                    r(*q)?,
+                    r(*k_cache)?,
+                    r(*v_cache)?,
+                    sk,
+                    r(c.cache)?,
+                    cb,
+                    r(*dst)?,
+                    rows,
+                    kv_len,
+                    nh,
+                    nkv,
+                    hd,
+                    pos,
+                    window,
+                    *scale,
+                    cap,
+                    c.len,
+                    c.ratio,
+                );
+                return Ok(());
+            }
             // Per-head attention sinks (deepseek4, `Op::Attention::sinks`) and the CSA top-k score
             // bias (`Op::Attention::key_bias`) live in exactly ONE kernel family —
             // `attention_kv.comp`'s -DSINKS/-DBIAS builds, combinable (deepseek4 CSA layers carry
@@ -2978,21 +2570,16 @@ fn lower_op(
                 // planar-Q8 scales-region base push constant): shadowing the latter with the
                 // former here is exactly the bug that garbled Q8 KV under record-once replay.
                 let cap_rows = graph.desc(*k_cache).numel() / (nkv * hd);
-                // Baked MIN chunk, rising only when the capacity would exceed the
-                // ATTN_MAX_CHUNKS scratch/combine cap; the kernel derives the effective adaptive
-                // chunk from the live kv_len each token, so one recorded plan serves every depth.
+                // Baked MIN chunk (the policy's `min_chunk`, rising only when the capacity would
+                // exceed the ATTN_MAX_CHUNKS scratch/combine cap); the kernel derives the effective
+                // adaptive chunk from the live kv_len each token, so one recorded plan serves every
+                // depth.
                 let chunk =
-                    infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_DECODE_MIN_CHUNK);
+                    infr_core::tier::baked_chunk(cap_rows, ATTN_MAX_CHUNKS, ATTN_SPLIT.min_chunk);
                 let n_chunks = infr_core::tier::n_chunks(cap_rows, chunk);
-                let paged_dyn = graph.desc(*k_cache).pages.is_some_and(|p| p.page_rows > 0);
-                tracing::debug!(
-                    paged = paged_dyn,
-                    n_chunks,
-                    chunk,
-                    cap_rows,
-                    "decode replay: attention dispatch"
-                );
-                if hd % 4 == 0 && hd <= 512 && (n_chunks > 1 || paged_dyn) {
+                // A cache past `ATTN_PARTIAL_MAX_CHUNK * ATTN_MAX_CHUNKS` rows bakes a chunk the
+                // partial kernel cannot stage; it takes the scalar decode instead.
+                if hd % 4 == 0 && hd <= 512 && n_chunks > 1 && chunk <= ATTN_PARTIAL_MAX_CHUNK {
                     // ONE prologue + ONE scratch set per (nh, hd, chunk, n_chunks, window) key:
                     // the first Dynamic attention op of a shape records/allocates; every later
                     // same-shape layer reuses (kv_len is per-token, and the layers' attention ops
@@ -3030,10 +2617,6 @@ fn lower_op(
                     // the bound dispatch (kept dual-arm: attn_partial's .comp also serves prefill).
                     let kb = r(*k_cache)?;
                     let vb = r(*v_cache)?;
-                    // Paged K/V: the replay reads rows through a page table whose ADDRESS lives in
-                    // params words 2-3 (seeded once at record time); only the page size is pushed
-                    // here. Every layer of a slot shares one table, so any layer's desc answers.
-                    let page_rows = graph.desc(*k_cache).pages.map_or(0, |p| p.page_rows) as usize;
                     match (kb.device_addr(), vb.device_addr()) {
                         (Some(ka), Some(va)) => rec.attention_kv_split_dynac_at(
                             r(*q)?,
@@ -3056,7 +2639,6 @@ fn lower_op(
                             window,
                             kv_q8,
                             cap,
-                            page_rows,
                         ),
                         _ => rec.attention_kv_split_dynac(
                             r(*q)?,
@@ -3182,7 +2764,11 @@ fn lower_op(
                 // below, flash_ok reduces to `flash_geom`, so the flash arm is guaranteed taken.
                 // Read ONCE and share: `flash_geom` (below) and `nc_fa_ok` (further down) both floor
                 // on this row count and MUST agree — two reads risked a divergence trap.
-                let flash_min_rows: usize = be_.cfg().kernels.vulkan.flash_min_rows;
+                let flash_min_rows: usize = be_.tuning().flash_min_rows;
+                // How far past kv_len each coopmat prefill tier reads K/V: shared by its gate below
+                // and by the dequant scratch sizing, so the two cannot disagree.
+                let flash_read_rows = kv_len.div_ceil(FLASH_KV_TILE) * FLASH_KV_TILE;
+                let nonfa_read_rows = kv_len.div_ceil(NONFA_KV_TILE) * NONFA_KV_TILE;
                 let flash_geom = (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && hd == 128
                     // The flash kernels read K/V in BN=64 column tiles, so the last tile over-reads up
@@ -3193,7 +2779,7 @@ fn lower_op(
                     // is 64-aligned / has >=64 slack (the golden ctx sizes); only a tightly-sized,
                     // non-64-aligned cache (e.g. MTP whole-prompt verify) reroutes to the safe split-K
                     // path instead of over-reading past the allocation.
-                    && kv_len.div_ceil(64) * 64 <= att_cap_rows
+                    && flash_read_rows <= att_cap_rows
                     && matches!(mask, AttnMask::Causal)
                     && (*scale - 1.0 / (hd as f32).sqrt()).abs() < 1e-6
                     && be_.caps().f16_coopmat()
@@ -3221,51 +2807,6 @@ fn lower_op(
                     && ((k_q8 && rows > 1) || (is_kv_prepass(kdt) && !decode_inline));
                 let deq_v = flash_deq_fmt.is_none()
                     && ((v_q8 && rows > 1) || (is_kv_prepass(vdt) && !decode_inline));
-                // Ring cache: only att_cap_rows rows exist — dequant the WHOLE ring (element i →
-                // element i keeps the ring layout, so the f16 scratch is read with the same
-                // row-modulo mapping as the cache itself). Identity on full-context caches.
-                let ne = kv_len.min(att_cap_rows) * nkv * hd;
-                // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
-                // else the shared quant/bf16 dequant (dequant_kv_f16).
-                // #74: the dequant READERS read the SOURCE cache (`r(*k_cache)?`/`r(*v_cache)?`, always
-                // a KvCache with a device address) by pointer. dequant_q8_f16/dequant_kv_f16 are BDA-only
-                // (slice 5) — they read `src.device_addr()` internally; `src` still stays bound at the
-                // read slot so the store→dequant-read barrier survives. The f32 cast (store_f16) writes
-                // the f16 SCRATCH `sc` (Activations, no address) → bound; turbo dequant is deferred/bound.
-                let kc_key = if deq_k {
-                    let k = pooled(pool, be_, "kvdeq_k", ne * 2)?;
-                    let sc = pool[&k].as_ref();
-                    let src = r(*k_cache)?;
-                    if k_q8 {
-                        rec.dequant_q8_f16(src, sc, ne, cap);
-                    } else if matches!(kdt, infr_core::DType::F32) {
-                        rec.store_f16(src, sc, ne, 0);
-                    } else if is_turbo(kdt) {
-                        rec.dequant_turbo_f16(kdt, src, sc, ne);
-                    } else {
-                        rec.dequant_kv_f16(kdt, src, sc, ne);
-                    }
-                    Some(k)
-                } else {
-                    None
-                };
-                let vc_key = if deq_v {
-                    let k = pooled(pool, be_, "kvdeq_v", ne * 2)?;
-                    let sc = pool[&k].as_ref();
-                    let src = r(*v_cache)?;
-                    if v_q8 {
-                        rec.dequant_q8_f16(src, sc, ne, cap);
-                    } else if matches!(vdt, infr_core::DType::F32) {
-                        rec.store_f16(src, sc, ne, 0);
-                    } else if is_turbo(vdt) {
-                        rec.dequant_turbo_f16(vdt, src, sc, ne);
-                    } else {
-                        rec.dequant_kv_f16(vdt, src, sc, ne);
-                    }
-                    Some(k)
-                } else {
-                    None
-                };
                 // A dequanted side reads the f16 scratch; native Q8 read only when not dequanted.
                 // Dequant-in-flash reads the quant cache DIRECTLY (neither f16 scratch nor native-Q8
                 // planar read), so force q8-eff off — flash_ok then reduces to `flash_geom`.
@@ -3289,17 +2830,7 @@ fn lower_op(
                 // through to `split_ok`/the final `else` — `attention_kv_split`/`attention_kv`,
                 // already the scalar decode/short-prefill path, dispatch with no coopmat and no
                 // row-count ceiling, so they're a correct (if slower) fallback for ANY `rows`.
-                // Paged cache (`kv.paged`): only the split-K kernels walk the page table, so every
-                // tier that tiles the cache as one flat run is off the table. A slot's rows start at
-                // `row_base`, so a flat read would attend the pool's zeroed block 0 instead.
-                let paged = graph.desc(*k_cache).pages.filter(|p| p.page_rows > 0);
-                // The table's device address and page geometry, resolved once: the decode-free
-                // prefill tiers below read it whether or not they take the paged arm.
-                let paged_table = match paged {
-                    Some(p) => Some((r(p.table)?.device_addr(), p.page_rows)),
-                    None => None,
-                };
-                let flash_ok = flash_geom && !(k_q8_eff || v_q8_eff) && paged.is_none();
+                let flash_ok = flash_geom && !(k_q8_eff || v_q8_eff);
                 // Coopmat prefill shmem-staging mode (Levers 2 & 5). Dequant wins over the pure-f16
                 // stage; both need the flash geometry. INFR_FLASH_STAGE stages the f16 KV (cache, or
                 // the prepass f16 scratch on a quant model) into shmem — the reuse experiment.
@@ -3333,20 +2864,80 @@ fn lower_op(
                 };
                 let nonfa_ok = !flash_ok
                     && canvas_lo.is_none()
-                    && paged.is_none()
                     && rows >= 64
                     // attn_qk reads K tiles up to ceil(kv_len/256)*256 rows (masked in softmax) —
                     // a ring cache past its wrap has neither those rows nor a direct position →
                     // row mapping the tile loads could use, so fall to the split path (which has
                     // the row-modulo mapping). Full-context caches only hit this within 256 rows
                     // of their very end, where the split path is equally correct.
-                    && kv_len.div_ceil(256) * 256 <= att_cap_rows
+                    && nonfa_read_rows <= att_cap_rows
                     && hd % 64 == 0
                     && hd <= 512
                     && !(k_q8_eff || v_q8_eff)
                     && be_.caps().f16_coopmat()
                     && matches!(graph.tensors[q.0 as usize].kind, TensorKind::Internal)
                     && matches!(graph.tensors[dst.0 as usize].kind, TensorKind::Internal);
+                // Ring cache: only att_cap_rows rows exist — dequant the WHOLE ring (element i →
+                // element i keeps the ring layout, so the f16 scratch is read with the same
+                // row-modulo mapping as the cache itself). Identity on full-context caches.
+                // The coopmat tier picked above reads K/V in whole tiles past kv_len (its gate
+                // bounds that padded read by att_cap_rows), and a non-finite pad row of V turns its
+                // zero softmax weight into a NaN output. So the scratch covers exactly that padded
+                // read, filled from the cache's own rows past kv_len (zero from allocation, or
+                // stale store output). Every other tier reads only up to kv_len.
+                let deq_rows = if flash_ok {
+                    flash_read_rows
+                } else if nonfa_ok {
+                    nonfa_read_rows
+                } else {
+                    kv_len
+                };
+                let ne = deq_rows.min(att_cap_rows) * nkv * hd;
+                // Expand a KV side into the f16 scratch: native Q8 (planar), f32 cast (store_f16),
+                // else the shared quant/bf16 dequant (dequant_kv_f16).
+                // #74: the dequant READERS read the SOURCE cache (`r(*k_cache)?`/`r(*v_cache)?`, always
+                // a KvCache with a device address) by pointer. dequant_q8_f16/dequant_kv_f16 are BDA-only
+                // (slice 5) — they read `src.device_addr()` internally; `src` still stays bound at the
+                // read slot so the store→dequant-read barrier survives. The f32 cast (store_f16) writes
+                // the f16 SCRATCH `sc` (Activations, no address) → bound; turbo dequant is deferred/bound.
+                let kc_key = if deq_k {
+                    let k = pooled(pool, be_, "kvdeq_k", ne * 2)?;
+                    let sc = pool[&k].as_ref();
+                    let src = r(*k_cache)?;
+                    if k_q8 {
+                        rec.dequant_q8_f16(src, sc, ne, cap);
+                    } else if matches!(kdt, infr_core::DType::F32) {
+                        rec.store_f16(src, sc, ne, 0);
+                    } else if is_turbo(kdt) {
+                        rec.dequant_turbo_f16(kdt, src, sc, ne);
+                    } else {
+                        rec.dequant_kv_f16(kdt, src, sc, ne);
+                    }
+                    Some(k)
+                } else {
+                    None
+                };
+                // A cache serving as both K and V (deepseek4) has one dtype and was just expanded
+                // into the K scratch, which then serves as V too.
+                let vc_key = if deq_v && k_cache == v_cache && kc_key.is_some() {
+                    kc_key
+                } else if deq_v {
+                    let k = pooled(pool, be_, "kvdeq_v", ne * 2)?;
+                    let sc = pool[&k].as_ref();
+                    let src = r(*v_cache)?;
+                    if v_q8 {
+                        rec.dequant_q8_f16(src, sc, ne, cap);
+                    } else if matches!(vdt, infr_core::DType::F32) {
+                        rec.store_f16(src, sc, ne, 0);
+                    } else if is_turbo(vdt) {
+                        rec.dequant_turbo_f16(vdt, src, sc, ne);
+                    } else {
+                        rec.dequant_kv_f16(vdt, src, sc, ne);
+                    }
+                    Some(k)
+                } else {
+                    None
+                };
                 // NON-COOPMAT flash tier (`attn_nc_fa.comp`, the attention companion of the
                 // `nc_mmq`/`nc_fma` GEMM tier): flash/nonfa above are coopmat SPIR-V, so a device
                 // without the feature (Intel Arc/ANV) previously ran ALL prefill attention on the
@@ -3362,10 +2953,6 @@ fn lower_op(
                 // against the scalar/split floor).
                 let nc_fa_ok = !flash_ok
                     && !nonfa_ok
-                    // A paged cache is fine here: `attn_nc_fa` shifts each 64-row tile by one table
-                    // word, which needs only the table's device address.
-                    && (paged.is_none()
-                        || paged_table.is_some_and(|(addr, rows)| addr.is_some() && rows > 0))
                     && !be_.caps().f16_coopmat()
                     && (rows >= 64 || (rows >= flash_min_rows && kv_len >= 8192))
                     && canvas_lo.is_none()
@@ -3396,14 +2983,15 @@ fn lower_op(
                 // opt-in, which bypasses the rows/kv_len heuristic; `None` = let the heuristic
                 // decide. Reproduces the old `is_err()`/`is_ok()` pair exactly.
                 let mrows_attn = be_.cfg().kernels.vulkan.mrows_attn;
-                let batched_attn = rows >= 2
-                    && hd <= 128
-                    && kv_len <= att_cap_rows // the mrows kernel has no ring row mapping
-                    && canvas_lo.is_none()
-                    && paged.is_none()
-                    && !(k_q8_eff || v_q8_eff)
-                    && mrows_attn != Some(false)
-                    && ((rows >= 12 && kv_len >= 8192) || mrows_attn == Some(true));
+                let batched_attn = batched_attn_ok(
+                    rows,
+                    hd,
+                    kv_len,
+                    att_cap_rows,
+                    canvas_lo.is_some(),
+                    k_q8_eff || v_q8_eff,
+                    mrows_attn,
+                );
                 // The batched kernel stages chunk scores in 4KB of LDS → chunk 256; the per-row
                 // grid keeps the adaptive ~32-chunks policy.
                 //
@@ -3465,12 +3053,11 @@ fn lower_op(
                 // when this fell through to the scalar `attention_kv` fallback below). Route it to
                 // the split-K path instead: `attn_partial`'s `cap` push constant already carries a
                 // correct (identity, since kv_len < att_cap_rows always holds) row mapping.
-                let cap_short = kv_len.div_ceil(256) * 256 > att_cap_rows;
+                let cap_short = nonfa_read_rows > att_cap_rows;
                 let chunk = if canvas_lo.is_some() && kv_len >= 2 {
-                    let n = CANVAS_CHUNK_N.clamped(be_.cfg().kernels.vulkan.canvas_chunk_n);
-                    kv_len.div_ceil(n).min(kv_len - 1).max(1)
+                    canvas_chunk(kv_len, be_.tuning().canvas_chunks)
                 } else if batched_attn {
-                    256
+                    ATTN_MROWS_CHUNK
                 } else if (ring_past || cap_short) && rows >= 64 {
                     // Large-rows ring/capacity-limited prefill: the pm/pl/pacc partials are [rows,
                     // nh, n_chunks, hd] — the ordinary ~32-chunk policy would balloon them (1024
@@ -3478,10 +3065,6 @@ fn lower_op(
                     // rows for a ring, kv_len itself here), so a few big chunks keep the scratch
                     // ~100s of MB with plenty of workgroups (nh * n_chunks * rows).
                     512
-                } else if rows == 1 {
-                    // Decode: the shuffle-free scalar kernel is the only fallback below the split
-                    // floor, and at kv < 64 it costs more than the whole split pass.
-                    infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT_DECODE)
                 } else {
                     infr_core::tier::adaptive_chunk(span, &ATTN_SPLIT)
                 };
@@ -3493,27 +3076,43 @@ fn lower_op(
                 // span span.div_ceil(1024) <= the branch value above, so `chunk` — and the recorded
                 // dispatch — is byte-identical. (The Dynamic path caps count the same way, ~2531.)
                 let chunk = split_k_chunk_count_cap(span, chunk);
-                // A paged cache may only use the split path, so the span has to be splittable: leave
-                // the live span above one chunk even at a handful of rows (n_chunks 1 is fine).
-                let chunk = match paged {
-                    Some(_) => chunk.min(span.saturating_sub(1).max(1)),
-                    None => chunk,
+                // ...and the chunk SIZE: a span past both caps (more than a million keys) would
+                // need a chunk the partial kernel cannot stage, so it does not take split-K.
+                let chunk_max = if batched_attn {
+                    ATTN_MROWS_CHUNK
+                } else {
+                    ATTN_PARTIAL_MAX_CHUNK
                 };
                 // Canvas forces the split-K tier regardless of row count (see `canvas_lo` above) —
                 // `attn_partial` carries the fixed `lo` override this mask needs; flash/nonfa don't.
-                let split_ok =
-                    (rows < 64 || canvas_lo.is_some() || ring_past || cap_short || paged.is_some())
-                        && span > chunk
-                        && hd % 4 == 0
-                        && hd <= 512
-                        && (rows == 1 || !(k_q8_eff || v_q8_eff));
+                let split_ok = (rows < 64 || canvas_lo.is_some() || ring_past || cap_short)
+                    && chunk <= chunk_max
+                    && span > chunk
+                    && hd % 4 == 0
+                    && hd <= 512
+                    && (rows == 1 || !(k_q8_eff || v_q8_eff));
                 if flash_ok {
                     let mpad = rows.div_ceil(64) * 64;
                     // Pooled split partials (fully written before the combine reads them) — one
                     // set serves every layer instead of n_layer live copies (~1GB each at 8B p8k).
-                    let po = pooled(pool, be_, "flash_po", 8 * mpad * nh * hd * 4)?;
-                    let pm = pooled(pool, be_, "flash_pm", 8 * mpad * nh * 4)?;
-                    let pl = pooled(pool, be_, "flash_pl", 8 * mpad * nh * 4)?;
+                    let po = pooled(
+                        pool,
+                        be_,
+                        "flash_po",
+                        crate::tuning::ATTN_PREFILL_MAX_SPLITS as usize * mpad * nh * hd * 4,
+                    )?;
+                    let pm = pooled(
+                        pool,
+                        be_,
+                        "flash_pm",
+                        crate::tuning::ATTN_PREFILL_MAX_SPLITS as usize * mpad * nh * 4,
+                    )?;
+                    let pl = pooled(
+                        pool,
+                        be_,
+                        "flash_pl",
+                        crate::tuning::ATTN_PREFILL_MAX_SPLITS as usize * mpad * nh * 4,
+                    )?;
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),
                         None => r(*k_cache)?,
@@ -3559,7 +3158,12 @@ fn lower_op(
                     // fills every [mpad, kv_pad] row; PV partials are written per split before
                     // the reduce), and one set serves every same-shape layer.
                     let s = pooled(pool, be_, "nonfa_s", nh * mpad * kv_pad * 2)?;
-                    let pv = pooled(pool, be_, "nonfa_pv", 8 * mpad * nh * hd * 4)?;
+                    let pv = pooled(
+                        pool,
+                        be_,
+                        "nonfa_pv",
+                        crate::tuning::ATTN_PREFILL_MAX_SPLITS as usize * mpad * nh * hd * 4,
+                    )?;
                     let kcb = match &kc_key {
                         Some(k) => pool[k].as_ref(),
                         None => r(*k_cache)?,
@@ -3598,10 +3202,6 @@ fn lower_op(
                         Some(k) => pool[k].as_ref(),
                         None => r(*v_cache)?,
                     };
-                    let nc_fa_pages = match paged_table {
-                        Some((Some(addr), rows)) => Some((addr, rows)),
-                        _ => None,
-                    };
                     rec.attention_prefill_nc_fa(
                         r(*q)?,
                         kcb,
@@ -3616,7 +3216,6 @@ fn lower_op(
                         window,
                         *scale,
                         cap,
-                        nc_fa_pages,
                     );
                 } else if split_ok {
                     // `canvas_lo` (computed above) rides a SEPARATE param into
@@ -3651,35 +3250,13 @@ fn lower_op(
                     // address → the `(Some, Some)` arm). `decode_inline` ⟹ `split_ok` here, so this
                     // is the arm that fires. None for f16/Q8/prefill.
                     let kv_ml = if decode_inline { Some(kdt) } else { None };
-                    // Paged cache: the read side maps logical pages through the table on the cache
-                    // tensor's descriptor. Linear caches (the only kind anything allocates today)
-                    // resolve to None, which is the identity in the kernel.
-                    let pmap = paged;
-                    let row_base = pmap.map_or(0, |p| p.row_base);
-                    let pages = match pmap {
-                        Some(p) => r(p.table)?.device_addr().map(|a| (a, p.page_rows)),
-                        None => None,
-                    };
-                    // A pooled cache that keeps its own pages (the SWA rings) reads linearly from its
-                    // block; a shared prefix reads through the table from the pool base.
-                    let bias = match pages {
-                        Some(_) => 0,
-                        None => {
-                            (row_base
-                                * graph
-                                    .desc(*k_cache)
-                                    .dtype
-                                    .dense_bytes(nkv * hd)
-                                    .unwrap_or(0)) as u64
-                        }
-                    };
                     match (kcb.device_addr(), vcb.device_addr()) {
                         (Some(ka), Some(va)) => rec.attention_kv_split_at(
                             r(*q)?,
                             kcb,
                             vcb,
-                            ka + bias,
-                            va + bias,
+                            ka,
+                            va,
                             r(*dst)?,
                             pool[&pm].as_ref(),
                             pool[&pl].as_ref(),
@@ -3700,7 +3277,6 @@ fn lower_op(
                             cap,
                             batched_attn,
                             kv_ml,
-                            pages,
                         ),
                         _ => rec.attention_kv_split(
                             r(*q)?,
@@ -3872,6 +3448,50 @@ fn lower_op(
                 *kernel as usize,
             );
         }
+        // LFM gated short convolution: the same seq/batch split as Conv1dSilu above, on the
+        // `-DSHORTCONV` builds of its shaders.
+        Op::ShortConv {
+            bcx,
+            weight,
+            state,
+            dst,
+            rows,
+            channels,
+            kernel,
+        } => {
+            let cv = if *rows as usize >= (*kernel as usize).saturating_sub(1).max(2) {
+                Recorder::shortconv_batch
+            } else {
+                Recorder::shortconv
+            };
+            cv(
+                rec,
+                r(*bcx)?,
+                r(*weight)?,
+                r(*state)?,
+                r(*dst)?,
+                *rows as usize,
+                *channels as usize,
+                *kernel as usize,
+            );
+        }
+        // LFM3 attention output gate: one sigmoid per (row, head).
+        Op::HeadGate {
+            x,
+            gate,
+            dst,
+            rows,
+            n_head,
+            head_dim,
+        } => {
+            rec.head_gate(
+                r(*x)?,
+                r(*gate)?,
+                r(*dst)?,
+                (*rows * *n_head * *head_dim) as usize,
+                *head_dim as usize,
+            );
+        }
         // Qwen3-Next gated DeltaNet recurrence (persistent `state` S mutated in place).
         Op::DeltaNet {
             q,
@@ -3889,7 +3509,7 @@ fn lower_op(
             head_k,
             head_v,
             eps,
-            ..
+            src_stride,
         } => {
             // Prefill AND multi-row batches (rows ≥ 2): the chunkwise delta rule processes up to 32
             // tokens per state traversal (matmuls + a triangular solve) instead of the token-serial
@@ -3920,7 +3540,22 @@ fn lower_op(
                 *head_k as usize,
                 *head_v as usize,
             );
+            // Every DeltaNet kernel caches a key head in shared memory sized by `DN_MAX_KD`.
+            if kd_ > DN_MAX_KD {
+                return Err(be(format!(
+                    "vulkan adapter: Op::DeltaNet head_k {kd_} exceeds the kernels' \
+                     {DN_MAX_KD}-wide shared key-head buffers"
+                )));
+            }
             let chunked = rows_ >= 2 && be_.cfg().kernels.vulkan.dn_chunk;
+            // Only the single-row kernel has a strided build; the chunked ones would read k and v
+            // from q's prefix.
+            if *src_stride > 0 && chunked {
+                return Err(be(
+                    "vulkan adapter: Op::DeltaNet src_stride on a multi-row batch has no strided \
+                     chunked kernel",
+                ));
+            }
             // DEFAULT prefill path: the token-serial scan with the state column register-resident
             // (norm + gates + seq). The chunked delta rule was believed to win by doing ⌈rows/32⌉
             // state sweeps instead of `rows`, but counted out it does NOT save arithmetic (~420M vs
@@ -3982,6 +3617,12 @@ fn lower_op(
             // sequential one — chunked math doesn't require coopmat, only this particular prep
             // kernel's implementation does.
             if chunked && be_.caps().f16_coopmat() && be_.cfg().kernels.vulkan.dn_split {
+                if !kd_.is_multiple_of(DN_PREP_KSTEP) {
+                    return Err(be(format!(
+                        "vulkan adapter: Op::DeltaNet head_k {kd_} is not a multiple of the \
+                         chunked-split prep pass's {DN_PREP_KSTEP}-wide coopmat step"
+                    )));
+                }
                 let nchunk = rows_.div_ceil(32);
                 // alloc_uninit: every slot the scan reads is written by prep/gates first.
                 let kn =
@@ -4021,11 +3662,11 @@ fn lower_op(
                 );
                 transient.extend([kn, qn, dk, dq, bg, gg]);
             } else {
-                // Strided DeltaNet (env-gated): when q==k==v (all same source buffer), derive
-                // stride from dimensions: 2*nk*kd + nv*vd.
-                let strided = *q == *k && *k == *v && be_.cfg().kernels.vulkan.delta_strided;
-                if strided {
-                    let stride = 2 * nk_ * kd_ + nv_ * vd_;
+                // Strided DeltaNet: q/k/v are per-row slices of one buffer (`Op::DeltaNet`'s
+                // `src_stride`), which the runner emits only on a backend that reports
+                // `deltanet_strided`.
+                if *src_stride > 0 {
+                    let stride = *src_stride as usize;
                     rec.deltanet_strided(
                         r(*q)?,
                         r(*k)?,
@@ -4092,7 +3733,7 @@ fn lower_op(
                 *rows as usize,
                 *ne as usize,
                 *scale,
-            );
+            )?;
         }
         Op::GatherI32 {
             ids,
@@ -4119,6 +3760,15 @@ fn lower_op(
             temp,
             top_p,
         } => {
+            // `sample_topk.comp` gathers candidates into `shared float gval[KMAX]`; a top_k of 1
+            // is greedy and belongs to `Op::Argmax`.
+            if !(2..=crate::gemm::SAMPLE_KMAX).contains(&(*top_k as usize)) {
+                return Err(be(format!(
+                    "vulkan adapter: Op::Sample top_k {top_k} is outside the GPU sampler's \
+                     2..={} range",
+                    crate::gemm::SAMPLE_KMAX
+                )));
+            }
             let cand = pooled(pool, be_, "sample_cand", 2 * 256 * *top_k as usize * 4)?;
             match mode {
                 // Record-once/self-advancing path (single-shot `execute` OR chained
@@ -4220,13 +3870,13 @@ fn lower_op(
                 infr_core::graph::MoeGating::Sigmoid => 1u32,
                 infr_core::graph::MoeGating::SqrtSoftplus => 2u32,
             };
-            // exp_probs_b: resolve if present, else bind a dummy zero buffer (the shader ignores
-            // it when `has_bias == 0`). One float is enough — the shader reads only indices
-            // < n_expert, which push constants clamp before the bias buffer is touched.
+            // exp_probs_b: resolve if present, else bind the backend's placeholder (the shader
+            // ignores it when `has_bias == 0`). One float is enough — the shader reads only
+            // indices < n_expert, which push constants clamp before the bias buffer is touched.
             let bias_buf: &dyn Buffer = if let Some(epb) = exp_probs_b {
                 r(*epb)?
             } else {
-                &*be_.alloc_uninit(4, BufferUsage::Weights)?
+                be_.unused_binding()?
             };
             let has_bias = exp_probs_b.is_some();
             // DeepSeek V4 hash routing: the selection arrives pre-gathered, so `moe_topk` copies
@@ -4236,7 +3886,7 @@ fn lower_op(
             let hash_buf: &dyn Buffer = if let Some(hid) = expert_ids {
                 r(*hid)?
             } else {
-                &*be_.alloc_uninit(4, BufferUsage::Activations)?
+                be_.unused_binding()?
             };
             let hash = expert_ids.is_some();
             if hash && (has_bias || *n_expert_groups > 1) {
@@ -4928,6 +4578,10 @@ fn lower_op(
             freq_factors,
             key_bias,
         } => {
+            if let Some(b) = key_bias {
+                infr_core::graph::check_score_bias(graph, *b, *rows, *kv_len, "Op::Mla key_bias")
+                    .map_err(be)?;
+            }
             // `mla.comp` holds the absorbed query and the V accumulator in FIXED-size shared
             // arrays, so an over-wide latent would write past them (shared memory is not bounds
             // checked — the symptom is corrupted neighbours or a lost device, not a fault). The
@@ -4941,6 +4595,14 @@ fn lower_op(
                      {kv_lora_rank} + qk_rope_dim {qk_rope_dim} = key_len {} (max \
                      {MLA_MAX_KEY_LEN}), kv_lora_rank max {MLA_MAX_KV_LORA_RANK}",
                     *kv_lora_rank + *qk_rope_dim
+                )));
+            }
+            // `mla.comp` reads the latent cache as packed f16 pairs.
+            let kdt = graph.desc(*k_cache).dtype;
+            if kdt != infr_core::DType::F16 {
+                return Err(be(format!(
+                    "vulkan Op::Mla: the latent cache must be F16 (mla.comp reads packed f16 \
+                     pairs), got {kdt:?}"
                 )));
             }
             let key_len = (*kv_lora_rank + *qk_rope_dim) as usize;
@@ -4993,11 +4655,23 @@ fn lower_op(
             top_k,
             scale,
             pos,
+            block_ratio,
         } => {
+            if *block_ratio == 0 {
+                return Err(be(
+                    "vulkan Op::LightningIndexer: block_ratio 0 — a key covers at least one position",
+                ));
+            }
             // Every output slot must name a key that exists. llama.cpp clamps at graph-build time
             // (`n_top_k = min(indexer_score->ne[0], n_indexer_top_k)`); the kernel cannot refuse
             // the work, so refuse it here with the dims to name rather than emit a duplicated or
             // sentinel index.
+            if *kv_len == 0 || *top_k == 0 {
+                return Err(be(format!(
+                    "vulkan Op::LightningIndexer: kv_len {kv_len} / top_k {top_k} — an indexer \
+                     over no keys selects nothing; the caller skips it (and its TopkMask)"
+                )));
+            }
             if top_k > kv_len {
                 return Err(be(format!(
                     "vulkan Op::LightningIndexer: top_k {top_k} exceeds kv_len {kv_len} — there \
@@ -5044,6 +4718,7 @@ fn lower_op(
                 *top_k,
                 *scale,
                 *pos,
+                *block_ratio,
             );
         }
         Op::TopkMask {
@@ -5056,6 +4731,12 @@ fn lower_op(
             // Every index the scatter writes must land inside the row. The kernel cannot refuse
             // the dispatch and an out-of-range write into an SSBO is undefined, so refuse here —
             // this is the same bound `Op::LightningIndexer` enforces on its own output.
+            if *kv_len == 0 || *top_k == 0 {
+                return Err(be(format!(
+                    "vulkan Op::TopkMask: kv_len {kv_len} / top_k {top_k} — a mask over no keys \
+                     selects nothing; the caller skips it"
+                )));
+            }
             if top_k > kv_len {
                 return Err(be(format!(
                     "vulkan Op::TopkMask: top_k {top_k} exceeds kv_len {kv_len} — the indices \
@@ -5154,6 +4835,44 @@ fn lower_op(
                 *n_embd,
             );
         }
+        Op::GatherRows {
+            src,
+            idx,
+            dst,
+            rows,
+            idx_off,
+            src_stride,
+            src_col,
+            n,
+            group,
+            dst_group_stride,
+            dst_row_off,
+            fill,
+        } => {
+            let n_src = infr_core::graph::check_gather_rows(graph, op)
+                .map_err(|e| be(format!("vulkan {e}")))?;
+            // The shader's flat element index and the row bound are u32.
+            if rows.checked_mul(*n).is_none() {
+                return Err(be(format!(
+                    "vulkan Op::GatherRows: {rows} rows of {n} overflow the kernel's u32 index"
+                )));
+            }
+            rec.gather_rows(
+                r(*src)?,
+                r(*idx)?,
+                r(*dst)?,
+                *rows,
+                *idx_off,
+                *src_stride,
+                *src_col,
+                *n,
+                *group,
+                *dst_group_stride,
+                *dst_row_off,
+                u32::try_from(n_src).unwrap_or(u32::MAX),
+                *fill,
+            );
+        }
     }
     Ok(())
 }
@@ -5173,9 +4892,54 @@ fn hyper_check_hc(hc: u32, what: &str) -> Result<()> {
     Ok(())
 }
 
-fn single_token_forward(ops: &[Op]) -> bool {
-    ops.iter()
-        .all(|op| !matches!(op, Op::Linear { m, .. } | Op::LinearExl3 { m, .. } if *m > 1))
+/// Does `execute` replay `plan`, rather than record it statically each call? The plan's own
+/// eligibility, unless a pager forces the static path (see [`execute`]): a paged MoE model always,
+/// a dense streaming one whose cache cannot hold every block.
+fn replays(be_: &VulkanBackend, plan: &VkDecodePlan) -> bool {
+    plan.eligible
+        && !be_.moe_paged()
+        && be_
+            .dense_pager()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(crate::pager::DensePagerSession::holds_every_block)
+}
+
+/// `Backend::decode_replay_ready`: the decision [`execute`] will make for `plan`, read off the
+/// compiled plan so the caller need not mirror it.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn decode_replay_ready(be_: &VulkanBackend, plan: &dyn Plan) -> bool {
+    plan.as_any()
+        .downcast_ref::<VkDecodePlan>()
+        .is_some_and(|plan| replays(be_, plan))
+}
+
+/// The error for a plan that will not be replayed but was built to be (`Graph::replay_only`):
+/// recording it statically would decode every token at the position baked into it. `Ok` for
+/// every other graph.
+fn refuse_replay_only(be_: &VulkanBackend, plan: &VkDecodePlan) -> Result<()> {
+    if !plan.graph.replay_only {
+        return Ok(());
+    }
+    // The terms of `replays`, in its order: the plan's own eligibility first, so a session that
+    // could replay but holds an ineligible graph is told why the graph is ineligible.
+    let why = if !plan.eligible {
+        decode_refusal(be_, &plan.graph).map_or_else(
+            || "the plan was compiled ineligible".to_string(),
+            |why| why.to_string(),
+        )
+    } else if be_.moe_paged() {
+        "the loaded model pages its MoE experts".to_string()
+    } else {
+        "the loaded model streams its dense layers through a cache that cannot hold every block"
+            .to_string()
+    };
+    Err(be(format!(
+        "vulkan adapter: refusing to run a graph built for record-once decode replay \
+         (Graph::replay_only) statically, which would decode every token at its baked position: \
+         this backend will not replay it ({why})"
+    )))
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -5188,13 +4952,16 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     // execution needs a host readback between a MoE layer's router/top-k and its expert GEMVs
     // (see `execute_static`'s paged branch), which the record-once replay tape — recorded ONCE
     // with no host round-trip built in — can't express. `Backend::moe_paged`'s doc has the full
-    // rationale; the seam's `dyn_replay` gate mirrors this so a paged model never even BUILDS the
-    // (then-unused) replay plan, but this check is what actually guarantees correctness.
+    // rationale. `replays` is also what `decode_replay_ready` answers, so a caller that asked never
+    // hands this a replay-only graph it will not replay; one that did not ask gets the error from
+    // `refuse_replay_only` rather than a static run at the baked position.
     // Dense layer streaming forces the static path for a different reason than MoE (no readback
-    // exists — layer order is deterministic — but the per-token ring staging + per-slot weight
-    // offsets can't live inside a record-once tape whose descriptor sets and push constants are
-    // frozen at record time).
-    if !plan.eligible || be_.moe_paged() || be_.dense_paged() {
+    // exists — layer order is deterministic): a cache that cannot hold every block re-stages
+    // blocks into recycled slots every token, which a record-once tape with its slot addresses
+    // frozen at record time cannot follow. A cache that holds every block never moves a block once
+    // it is placed, so it replays (see `current_replay`).
+    if !replays(be_, plan) {
+        refuse_replay_only(be_, plan)?;
         return execute_static(be_, &plan.graph, bindings);
     }
 
@@ -5202,18 +4969,23 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
     // `params` from `positions[0]` and resubmit. The runner reuses the SAME bound buffers across the
     // whole decode loop, so the recorded descriptor sets stay valid.
     let mut guard = plan.replay.lock().unwrap();
-    if guard.is_none() {
-        *guard = Some(record_decode_replay(be_, &plan.graph, bindings)?);
+    // A rebound buffer makes the recording stale: rebuild it, exactly as a first execute would.
+    if guard
+        .as_ref()
+        .is_some_and(|replay| !bindings_unchanged(replay, bindings))
+    {
+        *guard = None;
     }
+    // Held until the replay below has completed (see `current_replay`).
+    let _placements = current_replay(be_, &plan.graph, bindings, &mut guard)?;
     let replay = guard.as_ref().unwrap();
     if !replay.self_advancing {
         // Host fallback (INFR_NO_GPU_POS): pos from positions[0] (decode rows=1); kv_len = pos+1.
         let pos = read_pos0(be_, resolve(&replay.scratch, bindings, replay.positions)?)?;
         let kv_len = pos + 1;
-        let mut pbytes = [0u8; 24];
+        let mut pbytes = [0u8; 8];
         pbytes[0..4].copy_from_slice(&pos.to_le_bytes());
         pbytes[4..8].copy_from_slice(&kv_len.to_le_bytes());
-        write_page_table(&mut pbytes, replay.page_table);
         be_.upload(replay.params.as_ref(), &pbytes)?;
     }
     replay.recorded.replay().map_err(|e| be(e.to_string()))?;
@@ -5236,13 +5008,28 @@ pub(crate) fn execute_chain(
     let Some(plan) = plan.as_any().downcast_ref::<VkDecodePlan>() else {
         return Ok(None);
     };
-    if !plan.eligible || n == 0 || n > 64 || be_.moe_paged() || be_.dense_paged() {
+    if !replays(be_, plan) {
+        // Declining would hand the caller back to `execute`, which refuses the same plan; say why
+        // here, where the caller asked for the replay.
+        refuse_replay_only(be_, plan)?;
+        return Ok(None);
+    }
+    if n == 0 || n > 64 {
         return Ok(None);
     }
     let mut guard = plan.replay.lock().unwrap();
-    if guard.is_none() {
-        *guard = Some(record_decode_replay(be_, &plan.graph, bindings)?);
+    // A rebound buffer makes the recording stale. Decline (no step runs) and drop it, so the
+    // caller's per-token `execute` rebuilds it against the new bindings.
+    if guard
+        .as_ref()
+        .is_some_and(|replay| !bindings_unchanged(replay, bindings))
+    {
+        *guard = None;
+        return Ok(None);
     }
+    // Held until the chain below has completed (see `current_replay`). A recording made here reads
+    // its first position from the positions buffer, which the caller writes before every chain.
+    let _placements = current_replay(be_, &plan.graph, bindings, &mut guard)?;
     let replay = guard.as_ref().unwrap();
     let (true, Some(ring)) = (replay.self_advancing, replay.ring.as_ref()) else {
         return Ok(None);
@@ -5276,28 +5063,184 @@ pub(crate) fn execute_chain(
     Ok(Some(ids))
 }
 
+/// The slot addresses a decode recording reads its streamed weights at
+/// ([`record_decode_replay`]'s `slots`), and the placement epoch they were taken at.
+struct StreamedSlots {
+    /// `DensePagerSession::placement_epoch` when the addresses were read.
+    epoch: u64,
+    /// `buffer_identity(weight)` → its slot's arena byte address, for every streamed Linear weight
+    /// of the graph.
+    addrs: HashMap<usize, u64>,
+}
+
+/// The dense session's lock, held by a replay from its epoch check until it has completed.
+type PlacementGuard<'a> = std::sync::MutexGuard<'a, Option<crate::pager::DensePagerSession>>;
+
+/// How many times [`current_replay`] re-reads the placements before it gives up: a stale or
+/// missing recording takes a staging pass, a recording, and the check that accepts it.
+const REPLAY_PREPARE_ATTEMPTS: usize = 4;
+
+/// Leave in `guard` a recording of `graph` that is valid for the current weight placements, making
+/// one if there is none, and return the dense session's lock for the caller to hold across the
+/// replay's submit and wait (`None` when no weight streams, and nothing to hold).
+///
+/// A dense streaming session reaches here only while its cache holds every block ([`replays`]).
+/// The recording bakes each streamed weight's slot address, which stays right only while no
+/// placement changes, so it carries the session's placement epoch and is checked against it, under
+/// the session's lock, before every submit: a moved epoch drops it and records again, as a rebound
+/// buffer does. Holding that lock until the replay completes is what keeps any `stage` call, for
+/// this sequence or another, from landing between the check and the replay (the ordering argument
+/// is on `DensePagerSession::stage`). Holding every block, nothing is ever evicted, so the epoch
+/// moves only when a block is first placed or a placement is taken back.
+///
+/// Before recording, every streamed weight of the graph that is not resident yet (a decode that
+/// starts on an empty cache, with no prefill before it) is staged in a forward of its own
+/// ([`stage_for_replay`]); the addresses are then read without touching the pager.
+///
+/// A replayed step calls no `stage`, so it moves no recency and counts no hit. Recency decides
+/// nothing while every block has a slot (there is no victim to choose), and the counters say what
+/// they cover (`DensePagerSession::print_stats_if_enabled`).
+fn current_replay<'a>(
+    be_: &'a VulkanBackend,
+    graph: &Graph,
+    bindings: &Bindings,
+    guard: &mut Option<DecodeReplay>,
+) -> Result<Option<PlacementGuard<'a>>> {
+    if !be_.dense_paged() {
+        if guard.is_none() {
+            *guard = Some(record_decode_replay(be_, graph, bindings, None)?);
+        }
+        return Ok(None);
+    }
+    if be_.take_dense_epoch_move() {
+        if let Some(sess) = be_.dense_pager().lock().unwrap().as_mut() {
+            sess.force_epoch_move();
+        }
+    }
+    for _ in 0..REPLAY_PREPARE_ATTEMPTS {
+        let placements = be_.dense_pager().lock().unwrap();
+        let sess = placements
+            .as_ref()
+            .ok_or_else(|| be("vulkan adapter: the dense streaming session went away"))?;
+        let epoch = sess.placement_epoch();
+        if guard.as_ref().is_some_and(|r| r.epoch == Some(epoch)) {
+            return Ok(Some(placements));
+        }
+        let mut addrs = HashMap::new();
+        let mut missing = Vec::new();
+        for wid in streamed_linear_weights(sess, graph, bindings) {
+            match sess.resident_addr(wid)? {
+                Some(addr) => {
+                    addrs.insert(wid, addr);
+                }
+                None => missing.push(wid),
+            }
+        }
+        // Released before anything below takes it again: staging, and a recording's error path
+        // (`forget_staged`).
+        drop(placements);
+        *guard = None;
+        if missing.is_empty() {
+            *guard = Some(record_decode_replay(
+                be_,
+                graph,
+                bindings,
+                Some(StreamedSlots { epoch, addrs }),
+            )?);
+        } else {
+            stage_for_replay(be_, &missing)?;
+        }
+    }
+    Err(be(format!(
+        "vulkan adapter: the streamed weight placements kept changing over \
+         {REPLAY_PREPARE_ATTEMPTS} attempts to record the decode replay"
+    )))
+}
+
+/// Every streamed Linear weight `graph` reads, by `buffer_identity`, each once, in graph order.
+fn streamed_linear_weights(
+    sess: &crate::pager::DensePagerSession,
+    graph: &Graph,
+    bindings: &Bindings,
+) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    graph
+        .ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::Linear { weight, .. } => bindings.get(*weight),
+            _ => None,
+        })
+        .map(crate::pager::buffer_identity)
+        .filter(|&wid| sess.is_streamed(wid) && seen.insert(wid))
+        .collect()
+}
+
+/// Stage the blocks of `wids` (streamed weights that are not resident) in a forward of their own,
+/// before a decode recording reads them ([`current_replay`]). The copies go through
+/// `DensePagerSession::stage` like a static forward's, with its barriers around each, and the
+/// forward ends with a blocking submit, so they have run before the recording is replayed.
+fn stage_for_replay(be_: &VulkanBackend, wids: &[usize]) -> Result<()> {
+    let mut rec = Some(be_.recorder()?);
+    let mut ps = PagedStream::default();
+    for &wid in wids {
+        if let Err(e) = stage_dense_linear(be_, &mut rec, &mut ps, wid) {
+            return Err(abort_segment(be_, rec.take(), e));
+        }
+    }
+    submit_wait(
+        be_,
+        rec.take().expect("segment always Some between stagings"),
+    )?;
+    ps.drain()
+}
+
+/// Take the Linear+Add fusion back from every pair whose Linear weight `streamed` names (by
+/// `buffer_identity`): the fused kernels bake a zero weight offset, so the pair runs as the
+/// streamed Linear plus the standalone Add (the same arithmetic: the fused kernel only moves the
+/// same add in-kernel). The static path and the decode recording both apply it.
+fn unfuse_streamed_adds(
+    plan: &mut infr_core::fusion::FusionPlan,
+    graph: &Graph,
+    scratch: &[Option<Box<dyn Buffer>>],
+    bindings: &Bindings,
+    streamed: impl Fn(usize) -> bool,
+) -> Result<()> {
+    let mut unfuse: Vec<usize> = Vec::new();
+    for &idx in plan.linear_add.keys() {
+        if let Op::Linear { weight, .. } = &graph.ops[idx] {
+            let w = resolve(scratch, bindings, *weight)?;
+            if streamed(crate::pager::buffer_identity(w)) {
+                unfuse.push(idx);
+            }
+        }
+    }
+    for idx in unfuse {
+        plan.linear_add.remove(&idx);
+        plan.skip.remove(&(idx + 1));
+    }
+    Ok(())
+}
+
 /// Build the record-once decode replay: persistent scratch + params SSBO, one recording via the
 /// `_dyn` (params-driven) kernels for the pos-dependent ops. Only called for a [`decode_eligible`]
 /// graph. The returned recording is replayed (not submitted here) — the caller updates `params` and
 /// calls `replay()`.
+///
+/// `slots` is `Some` exactly when the model streams dense weights: every streamed Linear weight the
+/// graph reads, at the slot address it is resident at (see [`current_replay`]). The Linear reads
+/// the arena there, as `execute_static` does after staging, and no pager state changes. A streamed
+/// weight missing from it is an error, never a read of the placeholder buffer.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn record_decode_replay(
     be_: &VulkanBackend,
     graph: &Graph,
     bindings: &Bindings,
+    slots: Option<StreamedSlots>,
 ) -> Result<DecodeReplay> {
     let scratch = alloc_scratch(be_, graph)?;
-    // `[pos, kv_len, table_lo, table_hi, row_base, _]` — Staging (host-visible mapped) so the
-    // per-token refresh is a plain memcpy. Words 2-3 hold the paged K/V table's device address and
-    // word 4 the slot's row base (0 for a linear cache); `params_advance` only ever writes words
-    // 0-1, so they survive the whole replay.
-    let params = be_.alloc(24, BufferUsage::Staging)?;
-    let page_table = replay_page_table(graph, &scratch, bindings)?;
-    tracing::debug!(
-        table = ?page_table,
-        ops = graph.ops.len(),
-        "decode replay: record-once tape"
-    );
+    // `[pos, kv_len]` — Staging (host-visible mapped) so per-token `upload` is a plain memcpy.
+    let params = be_.alloc(8, BufferUsage::Staging)?;
     let positions = graph
         .ops
         .iter()
@@ -5306,10 +5249,43 @@ fn record_decode_replay(
             _ => None,
         })
         .ok_or_else(|| be("vulkan adapter: eligible decode has no positions tensor"))?;
-    let plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
+    let epoch = slots.as_ref().map(|s| s.epoch);
+    // Every streamed Linear weight the graph reads, taken under the session's lock once: the walk
+    // below checks each Linear against it without locking again.
+    let streamed: std::collections::HashSet<usize> = match &slots {
+        Some(_) => be_
+            .dense_pager()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|sess| streamed_linear_weights(sess, graph, bindings))
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+    let mut plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
+    unfuse_streamed_adds(&mut plan, graph, &scratch, bindings, |wid| {
+        streamed.contains(&wid)
+    })?;
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
     let mut skip_op = plan.skip;
+    // A streamed Linear's slot address; `None` for every other op.
+    let streamed_addr = |op: &Op| -> Result<Option<u64>> {
+        let (Some(slots), Op::Linear { weight, .. }) = (&slots, op) else {
+            return Ok(None);
+        };
+        let wid = crate::pager::buffer_identity(resolve(&scratch, bindings, *weight)?);
+        match slots.addrs.get(&wid) {
+            Some(&addr) => Ok(Some(addr)),
+            None if streamed.contains(&wid) => Err(be(
+                "vulkan adapter: a decode recording reached a streamed weight that was not \
+                 resident when its slot addresses were taken",
+            )),
+            None => Ok(None),
+        }
+    };
 
     let mut transient: Vec<Box<dyn Buffer>> = Vec::new();
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
@@ -5323,7 +5299,7 @@ fn record_decode_replay(
     // instead of one long one. This preserves the `_dyn`/params/ring decode semantics exactly — the
     // identical dispatch stream is just distributed across command buffers, with a seeded global
     // barrier at each continuation segment's head carrying the cross-segment ordering.
-    let cap = be_.decode_submit_cap();
+    let cap = be_.submit_dispatch_cap();
     let mut segments: Vec<crate::recorder::RecordedSegment> = Vec::new();
     let mut rec = be_.recorder_persistent()?;
     // Device-side position stream: seed params to [pos0-1, pos0] and record a one-thread
@@ -5331,148 +5307,175 @@ fn record_decode_replay(
     // (no dyn kernel reads the `positions` buffer; they all read params). INFR_NO_GPU_POS=1
     // keeps the per-replay host read_pos0 + params upload instead (A/B).
     let self_advancing = be_.cfg().kernels.vulkan.gpu_pos;
-    if self_advancing {
-        let pos0 = read_pos0(be_, resolve(&scratch, bindings, positions)?)?;
-        let mut pbytes = [0u8; 24];
-        pbytes[0..4].copy_from_slice(&pos0.wrapping_sub(1).to_le_bytes());
-        pbytes[4..8].copy_from_slice(&pos0.to_le_bytes());
-        write_page_table(&mut pbytes, page_table);
-        be_.upload(params.as_ref(), &pbytes)?;
-        // Cross-iteration fence for the chained decode (replay_n submits this recording n times
-        // back-to-back): orders iteration i's tail writes (sampled id, id_log) before iteration
-        // i+1's head reads (params_advance, EmbedGather). One extra barrier per token — noise.
-        rec.global_barrier();
-        rec.params_advance(params.as_ref());
-    }
-    let mode = RopeMode::Dynamic(params.as_ref());
-    let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
-    for (op_idx, op) in graph.ops.iter().enumerate() {
-        if skip_op.contains(&op_idx) {
-            continue;
+    // `Recorder` has no `Drop`, and a closed segment is only freed once it is inside a
+    // `RecordedCmd`, so every error from here on must tear both down (see `abort_segment`) rather
+    // than leak a command buffer and its descriptor pools. Hence one fallible block.
+    let recorded_ops = (|| -> Result<Option<Box<dyn Buffer>>> {
+        if self_advancing {
+            let pos0 = read_pos0(be_, resolve(&scratch, bindings, positions)?)?;
+            let mut pbytes = [0u8; 8];
+            pbytes[0..4].copy_from_slice(&pos0.wrapping_sub(1).to_le_bytes());
+            pbytes[4..8].copy_from_slice(&pos0.to_le_bytes());
+            be_.upload(params.as_ref(), &pbytes)?;
+            // Cross-iteration fence for the chained decode (replay_n submits this recording n times
+            // back-to-back): orders iteration i's tail writes (sampled id, id_log) before iteration
+            // i+1's head reads (params_advance, EmbedGather). One extra barrier per token — noise.
+            rec.global_barrier();
+            rec.params_advance(params.as_ref());
         }
-        // Split BETWEEN ops, never inside one (a single op can lower to several dispatches sharing
-        // transient scratch whose ordering is per-recorder): once the current segment reaches the
-        // cap, close it and open a fresh persistent recorder. Its leading `seed_barrier` seeds the
-        // cross-segment RAW/WAR ordering that per-recorder hazard tracking (which starts empty)
-        // can't otherwise see — every layer reads the residual stream a prior segment wrote. cap ==
-        // 0 (discrete) never trips this — ONE segment, byte-identical to the record-once fast path.
-        if cap > 0 && rec.dispatches() >= cap {
-            let fresh = be_.recorder_persistent()?;
-            fresh.seed_barrier();
-            segments.push(
-                std::mem::replace(&mut rec, fresh)
-                    .end_segment()
-                    .map_err(|e| be(e.to_string()))?,
-            );
-        }
-        // Peephole: fuse Op::Linear (f32, m<=4) + Op::GatedAct (Gelu, strided up) into one
-        // e2b_gate dispatch for E2B per-layer inp_gate projections.
-        if let Op::Linear {
-            x,
-            weight,
-            dst,
-            m,
-            in_f,
-            out_f,
-            ..
-        } = op
-        {
-            if graph.desc(*weight).dtype == infr_core::DType::F32
-                && *m <= 4
-                && op_idx + 1 < graph.ops.len()
-            {
-                if let Op::GatedAct {
-                    gate: g_gate,
-                    up: g_up,
-                    dst: g_dst,
-                    act: Activation::Gelu,
-                    up_off: g_off,
-                    up_stride: g_stride,
+        let mode = RopeMode::Dynamic(params.as_ref());
+        let mut mmv_memo: Option<(TensorId, usize, usize, &'static str)> = None;
+        for (op_idx, op) in graph.ops.iter().enumerate() {
+            if skip_op.contains(&op_idx) {
+                continue;
+            }
+            // Split BETWEEN ops, never inside one (a single op can lower to several dispatches sharing
+            // transient scratch whose ordering is per-recorder): once the current segment reaches the
+            // cap, close it and open a fresh persistent recorder. Its leading `seed_barrier` seeds the
+            // cross-segment RAW/WAR ordering that per-recorder hazard tracking (which starts empty)
+            // can't otherwise see — every layer reads the residual stream a prior segment wrote. cap ==
+            // 0 (discrete) never trips this — ONE segment, byte-identical to the record-once fast path.
+            if cap > 0 && rec.dispatches() >= cap {
+                let fresh = be_.recorder_persistent()?;
+                fresh.seed_barrier();
+                segments.push(
+                    std::mem::replace(&mut rec, fresh)
+                        .end_segment()
+                        .map_err(|e| be(e.to_string()))?,
+                );
+            }
+            let wsub = streamed_addr(op)?;
+            // Peephole: fuse Op::Linear (f32, m<=4) + Op::GatedAct (Gelu, strided up) into one
+            // e2b_gate dispatch for E2B per-layer inp_gate projections. `e2b_gate` binds a
+            // resident weight, so a streamed one keeps the plain Linear.
+            if let (
+                None,
+                Op::Linear {
+                    x,
+                    weight,
+                    dst,
+                    m,
+                    in_f,
+                    out_f,
                     ..
-                } = &graph.ops[op_idx + 1]
+                },
+            ) = (wsub, op)
+            {
+                if graph.desc(*weight).dtype == infr_core::DType::F32
+                    && *m <= 4
+                    && op_idx + 1 < graph.ops.len()
                 {
-                    if *g_gate == *dst && *g_dst == *dst && *g_stride > 0 {
-                        let (w_, x_, up_, y_) = (
-                            resolve(&scratch, bindings, *weight)?,
-                            resolve(&scratch, bindings, *x)?,
-                            resolve(&scratch, bindings, *g_up)?,
-                            resolve(&scratch, bindings, *dst)?,
-                        );
-                        rec.e2b_gate(
-                            w_,
-                            x_,
-                            up_,
-                            *g_off as usize,
-                            *g_stride as usize,
-                            y_,
-                            *m as usize,
-                            *in_f as usize,
-                            *out_f as usize,
-                        );
-                        skip_op.insert(op_idx + 1);
-                        continue;
+                    if let Op::GatedAct {
+                        gate: g_gate,
+                        up: g_up,
+                        dst: g_dst,
+                        act: Activation::Gelu,
+                        up_off: g_off,
+                        up_stride: g_stride,
+                        ..
+                    } = &graph.ops[op_idx + 1]
+                    {
+                        if *g_gate == *dst && *g_dst == *dst && *g_stride > 0 {
+                            let (w_, x_, up_, y_) = (
+                                resolve(&scratch, bindings, *weight)?,
+                                resolve(&scratch, bindings, *x)?,
+                                resolve(&scratch, bindings, *g_up)?,
+                                resolve(&scratch, bindings, *dst)?,
+                            );
+                            rec.e2b_gate(
+                                w_,
+                                x_,
+                                up_,
+                                *g_off as usize,
+                                *g_stride as usize,
+                                y_,
+                                *m as usize,
+                                *in_f as usize,
+                                *out_f as usize,
+                            );
+                            skip_op.insert(op_idx + 1);
+                            continue;
+                        }
                     }
                 }
             }
+            lower_op(
+                be_,
+                graph,
+                op_idx,
+                op,
+                &rec,
+                &scratch,
+                bindings,
+                &fused_kv_write,
+                &fused_add,
+                &mode,
+                &mut transient,
+                &mut dyn_args,
+                &mut pool,
+                &mut mmv_memo,
+                wsub,
+            )?;
         }
-        lower_op(
-            be_,
-            graph,
-            op_idx,
-            op,
-            &rec,
-            &scratch,
-            bindings,
-            &fused_kv_write,
-            &fused_add,
-            &mode,
-            &mut transient,
-            &mut dyn_args,
-            &mut pool,
-            &mut mmv_memo,
-            None,
-        )?;
-    }
-    for c in dyn_args.drain(..) {
-        transient.extend([c.args, c.pm, c.pl, c.pacc]);
-    }
-    transient.extend(pool.into_values());
-    // Chained decode: when the graph ends in a device-side sampler (Argmax/Sample), log each
-    // iteration's id into a host-visible ring so `execute_chain` reads the whole chunk in one go.
-    let ring = if self_advancing {
-        graph
-            .ops
-            .iter()
-            .find_map(|op| match op {
-                Op::Argmax { dst, .. } | Op::Sample { dst, .. } => Some(*dst),
-                _ => None,
-            })
-            .map(|dst| -> Result<Box<dyn Buffer>> {
-                let rb = be_.alloc(64 * 4, BufferUsage::Readback)?;
-                rec.id_log(
-                    params.as_ref(),
-                    resolve(&scratch, bindings, dst)?,
-                    rb.as_ref(),
-                );
-                Ok(rb)
-            })
-            .transpose()?
-    } else {
-        None
+        for c in dyn_args.drain(..) {
+            transient.extend([c.args, c.pm, c.pl, c.pacc]);
+        }
+        transient.extend(pool.into_values());
+        // Chained decode: when the graph ends in a device-side sampler (Argmax/Sample), log each
+        // iteration's id into a host-visible ring so `execute_chain` reads the whole chunk in one go.
+        Ok(if self_advancing {
+            graph
+                .ops
+                .iter()
+                .find_map(|op| match op {
+                    Op::Argmax { dst, .. } | Op::Sample { dst, .. } => Some(*dst),
+                    _ => None,
+                })
+                .map(|dst| -> Result<Box<dyn Buffer>> {
+                    let rb = be_.alloc(64 * 4, BufferUsage::Readback)?;
+                    rec.id_log(
+                        params.as_ref(),
+                        resolve(&scratch, bindings, dst)?,
+                        rb.as_ref(),
+                    );
+                    Ok(rb)
+                })
+                .transpose()?
+        } else {
+            None
+        })
+    })();
+    let ring = match recorded_ops {
+        Ok(ring) => ring,
+        Err(e) => {
+            drop(crate::recorder::RecordedCmd::from_segments(be_, segments));
+            return Err(abort_segment(be_, Some(rec), e));
+        }
     };
     // Close the final segment (holds the trailing `id_log`) and assemble the recording. A discrete
     // GPU (cap == 0) never split, so `segments` is exactly this one — a single-segment `RecordedCmd`
     // that replays in one submit, unchanged.
-    segments.push(rec.end_segment().map_err(|e| be(e.to_string()))?);
+    match rec.end_segment() {
+        Ok(seg) => segments.push(seg),
+        Err(e) => {
+            drop(crate::recorder::RecordedCmd::from_segments(be_, segments));
+            return Err(be(e.to_string()));
+        }
+    }
     let recorded = crate::recorder::RecordedCmd::from_segments(be_, segments);
+    let bound = recorded_bindings(&scratch, bindings);
+    be_.shared
+        .decode_recordings
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(DecodeReplay {
+        bound,
         scratch,
         params,
         self_advancing,
         ring,
         positions,
-        page_table,
         recorded,
+        epoch,
         _transient: transient,
     })
 }
@@ -5489,11 +5492,58 @@ fn record_decode_replay(
 ///
 /// A teardown failure is folded into the message instead of replacing it — the original error is
 /// why the forward stopped, and it is the one worth reading.
-fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
-    match rec.map(|partial| partial.discard()) {
+fn abort_segment(be_: &VulkanBackend, rec: Option<Recorder<'_>>, e: Error) -> Error {
+    match rec.map(|partial| discard_segment(be_, partial)) {
         Some(Err(de)) => be(format!("{e} (partial segment teardown also failed: {de})")),
         _ => e,
     }
+}
+
+/// Discard an unsubmitted segment. A weight pager has already recorded the blocks whose ring→arena
+/// copies went into it as resident; those copies will now never run, so take the placements back
+/// first, or a later forward would read each slot's previous occupant as the requested weights.
+fn discard_segment(be_: &VulkanBackend, rec: Recorder<'_>) -> Result<()> {
+    forget_staged(be_, rec.serial());
+    rec.discard()
+}
+
+/// Take back every weight-pager placement whose copy went into recording `serial`, and free the
+/// MoE fill staging slots its copies read, because the recording is not known to have run. The
+/// callers: `discard_segment` (it is being discarded), and `submit_wait` / `submit_nowait` when
+/// [`Recorder::finish`] / [`Recorder::finish_nowait`] fails — either the submit failed after
+/// consuming it, or (`finish` only) the wait for the queue after a successful submit failed. In
+/// that last case the copies may have run; taking their placements back then costs only a
+/// re-read, and the failure is in practice a lost device, which runs nothing more.
+fn forget_staged(be_: &VulkanBackend, serial: u64) {
+    if let Some(s) = be_.moe_pager().lock().unwrap().as_mut() {
+        s.forget_unsubmitted(serial);
+    }
+    if let Some(s) = be_.dense_pager().lock().unwrap().as_mut() {
+        s.forget_unsubmitted(serial);
+    }
+}
+
+/// [`Recorder::finish`] (blocking), undoing the recording's staged placements if it fails — see
+/// [`submit_nowait`].
+fn submit_wait(be_: &VulkanBackend, rec: Recorder<'_>) -> Result<()> {
+    let serial = rec.serial();
+    rec.finish().map_err(|e| {
+        forget_staged(be_, serial);
+        be(e.to_string())
+    })
+}
+
+/// [`Recorder::finish_nowait`], undoing the recording's staged placements if the submit fails —
+/// the recorder is consumed either way, so `abort_segment` never sees it.
+fn submit_nowait(
+    be_: &VulkanBackend,
+    rec: Recorder<'_>,
+) -> Result<crate::recorder::PendingSegment> {
+    let serial = rec.serial();
+    rec.finish_nowait().map_err(|e| {
+        forget_staged(be_, serial);
+        be(e.to_string())
+    })
 }
 
 /// Per-execute static recording: allocate `Internal` scratch fresh, record every op via `lower_op`
@@ -5501,6 +5551,7 @@ fn abort_segment(rec: Option<Recorder<'_>>, e: Error) -> Error {
 /// batches and every ineligible decode (gemma/E2B/MoE/qwen35).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Result<()> {
+    be_.note_static_execute();
     let scratch = alloc_scratch(be_, graph)?;
 
     // RoPE position: the static `qk_norm_rope`/`rope` kernels take a scalar `rope_pos`, but the IR
@@ -5522,26 +5573,11 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     }
 
     let mut plan = infr_core::fusion::plan_fusions(graph, &fusion_cfg(be_));
-    // Dense layer streaming: the fused Linear+Add kernels bake a ZERO weight offset, so un-fuse
-    // any pair whose Linear weight is a streamed block — the standalone Add op runs instead
-    // (bit-identical math: the fused kernel only moves the same exact add in-kernel).
-    if be_.dense_paged() {
-        let guard = be_.dense_pager().lock().unwrap();
-        if let Some(sess) = guard.as_ref() {
-            let mut unfuse: Vec<usize> = Vec::new();
-            for &idx in plan.linear_add.keys() {
-                if let Op::Linear { weight, .. } = &graph.ops[idx] {
-                    let w = resolve(&scratch, bindings, *weight)?;
-                    if sess.is_streamed(crate::pager::buffer_identity(w)) {
-                        unfuse.push(idx);
-                    }
-                }
-            }
-            for idx in unfuse {
-                plan.linear_add.remove(&idx);
-                plan.skip.remove(&(idx + 1));
-            }
-        }
+    // Dense layer streaming: no streamed Linear keeps its residual Add fused.
+    if let Some(sess) = be_.dense_pager().lock().unwrap().as_ref() {
+        unfuse_streamed_adds(&mut plan, graph, &scratch, bindings, |wid| {
+            sess.is_streamed(wid)
+        })?;
     }
     let fused_kv_write = plan.kv_write;
     let fused_add = plan.linear_add;
@@ -5561,7 +5597,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     let mode = RopeMode::Static(&rope_pos);
     let mut dyn_args: Vec<DynAttnCtx> = Vec::new();
     let mut pool: ScratchPool = HashMap::new();
-    let mut mmv_memo: Option<(TensorId, usize, usize)> = None;
+    let mut mmv_memo: Option<(TensorId, usize, usize, &'static str)> = None;
     let mut pstream = PagedStream::default();
 
     // ── submit splitter ───────────────────────────────────────────────────────────────────────
@@ -5572,13 +5608,16 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // default) bounds the dispatches per command buffer; segments are submitted WITHOUT waiting
     // and run back-to-back on the queue, so the GPU sees the same uninterrupted stream of work —
     // only the watchdog's view changes, from one long job to several short ones.
-    let single_token = single_token_forward(&graph.ops);
-    let cap = if single_token {
-        be_.decode_submit_cap()
+    let cap = be_.submit_dispatch_cap();
+    // Paged forwards only: see `EarlySubmit`. It reuses the splitter's submit-and-continue
+    // below, so its segments are pipelined, windowed and timed exactly like the watchdog's, and
+    // `crate::segment_cut` checks the watchdog cap first, so it only ever adds cuts.
+    let mut early = EarlySubmit::new(if be_.moe_paged() || be_.dense_paged() {
+        be_.cfg().paging.early_submit
     } else {
-        be_.submit_dispatch_cap()
-    };
-    let t_forward = std::time::Instant::now();
+        0
+    });
+    let clock = be_.forward_clock();
     let mut submitted_dispatches = 0usize;
     /// In-flight segments allowed at once. Each one pins a command buffer plus its descriptor
     /// pools until the GPU is done reading them, and the devices that split are exactly the
@@ -5618,7 +5657,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         //     (`MAX_INFLIGHT`) is the real latency bound.
         if shutdown_requested() {
             let partial = rec.take().expect("segment always Some between ops");
-            partial.discard().map_err(|e| be(e.to_string()))?;
+            discard_segment(be_, partial).map_err(|e| be(e.to_string()))?;
             for seg in segments {
                 seg.wait().map_err(|e| be(e.to_string()))?;
             }
@@ -5629,13 +5668,14 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         }
         // Split BETWEEN ops, never inside one: a single op can lower to several dispatches that
         // share transient scratch, and the hazard tracking that orders them is per-recorder.
-        // Crossing the cap therefore closes the segment at the next op boundary.
-        if cap > 0 && rec.as_ref().is_some_and(|r| r.dispatches() >= cap) {
-            let seg = rec
-                .take()
-                .expect("segment always Some between ops")
-                .finish_nowait()
-                .map_err(|e| be(e.to_string()))?;
+        // Crossing the cap, or the paged early-submit cadence, therefore closes the segment at the
+        // next op boundary.
+        let cut = rec
+            .as_ref()
+            .and_then(|r| crate::segment_cut(r.dispatches(), cap, early.threshold(r.serial())));
+        if let Some(cut) = cut {
+            be_.note_segment_cut(cut);
+            let seg = submit_nowait(be_, rec.take().expect("segment always Some between ops"))?;
             submitted_dispatches += seg.dispatches();
             segments.push_back(seg);
             // Retire the oldest in-flight segment once the window is full. Queue execution is
@@ -5652,6 +5692,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             // order on the queue, so this one barrier orders the whole segment after everything
             // already submitted.
             fresh.seed_barrier();
+            early.cut(fresh.serial());
             rec = Some(fresh);
         }
         // Every error exit below goes through `abort_segment`: the segment being recorded has no
@@ -5659,7 +5700,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         if let Op::MoeFfn { gate_exps, .. } = op {
             let gbuf = match resolve(&scratch, bindings, *gate_exps) {
                 Ok(b) => b,
-                Err(e) => return Err(abort_segment(rec.take(), e)),
+                Err(e) => return Err(abort_segment(be_, rec.take(), e)),
             };
             let paged = be_.moe_pager().lock().unwrap().as_ref().is_some_and(|s| {
                 s.is_paged(
@@ -5678,7 +5719,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                     &mut rec,
                     &mut pstream,
                 ) {
-                    return Err(abort_segment(rec.take(), e));
+                    return Err(abort_segment(be_, rec.take(), e));
                 }
                 continue;
             }
@@ -5694,7 +5735,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             if let Op::Linear { weight, .. } = op {
                 let wid = match resolve(&scratch, bindings, *weight) {
                     Ok(w) => crate::pager::buffer_identity(w),
-                    Err(e) => return Err(abort_segment(rec.take(), e)),
+                    Err(e) => return Err(abort_segment(be_, rec.take(), e)),
                 };
                 let streamed = be_
                     .dense_pager()
@@ -5705,7 +5746,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                 if streamed {
                     let arena_addr = match stage_dense_linear(be_, &mut rec, &mut pstream, wid) {
                         Ok(a) => a,
-                        Err(e) => return Err(abort_segment(rec.take(), e)),
+                        Err(e) => return Err(abort_segment(be_, rec.take(), e)),
                     };
                     if let Err(e) = lower_op(
                         be_,
@@ -5724,7 +5765,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
                         &mut mmv_memo,
                         Some(arena_addr),
                     ) {
-                        return Err(abort_segment(rec.take(), e));
+                        return Err(abort_segment(be_, rec.take(), e));
                     }
                     continue;
                 }
@@ -5747,7 +5788,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             &mut mmv_memo,
             None,
         ) {
-            return Err(abort_segment(rec.take(), e));
+            return Err(abort_segment(be_, rec.take(), e));
         }
     }
     for c in dyn_args.drain(..) {
@@ -5756,7 +5797,8 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     transient.extend(pool.into_values());
     let last = rec.take().expect("segment always Some at loop end");
     submitted_dispatches += last.dispatches();
-    last.finish().map_err(|e| be(e.to_string()))?;
+    let last_serial = last.serial();
+    submit_wait(be_, last)?;
     // The blocking finish above already waited the queue idle — draining just releases the
     // pipelined segments' command buffers/fences (every buffer they referenced outlives this
     // call: pooled scratch in `transient`, ring/tape/arenas on the session).
@@ -5764,10 +5806,73 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         seg.wait().map_err(|e| be(e.to_string()))?;
     }
     pstream.drain()?;
-    // Feed this forward back into the splitter: `finish` waited the queue idle, so the elapsed
-    // time now covers every segment's GPU execution. See `VulkanBackend::observe_forward`.
-    be_.observe_forward(t_forward.elapsed(), submitted_dispatches);
+    if be_.moe_paged() {
+        // The session's lock is released at the end of this statement.
+        let stopped = be_.moe_pager().lock().unwrap().as_mut().map(|sess| {
+            // The queue is idle, so every recording up to `last` has completed.
+            sess.fills_copied(last_serial);
+            sess.end_forward()
+        });
+        // Stopping the reader waits for its read in progress: outside the lock, so no other
+        // forward waits too.
+        drop(stopped);
+    }
+    // Feed this forward back into the splitter: `finish` waited the queue idle and every segment
+    // has been waited, so each one's GPU interval is in the clock's sum. See `ForwardClock` for
+    // why that, and not this forward's wall time, is what the watchdog bound is judged by.
+    clock.observe(be_, submitted_dispatches);
     Ok(())
+}
+
+/// The early-submit cadence of a PAGED forward (`paging.early_submit`): when to close the open
+/// segment and submit it so the GPU starts on it while the host records the rest.
+///
+/// A paged forward is re-recorded every token, and as one command buffer the GPU idles until the
+/// host has recorded all of it. Every cut costs a submit, a fence, a segment timestamp pair and a
+/// full `seed_barrier`, and cutting at a fixed count lost to this cadence on the RX 7900 XTX
+/// (`docs/plan/06-pager-eviction.md`, "A paged decode step, host and GPU"). So the threshold starts
+/// at the configured count and doubles at every cut: the GPU starts after the first few
+/// dispatches, and each segment runs long enough to hide the recording of the next.
+///
+/// The paging paths also replace the open recorder themselves, and the cadence starts over from
+/// the configured count after either. A paged MoE layer that drains the queue for its router
+/// readback (`sync_stream`) leaves the GPU idle, so starting over is what the cadence is for. A
+/// staging-ring rotation (`rotate_stream`) submits without waiting and leaves the GPU busy, but
+/// carrying the cadence on across one instead was measured slower on an evicting paged MoE decode
+/// (same plan section), so it starts over there too. A forward therefore takes a logarithmic
+/// number of early cuts between two such replacements, not in all.
+struct EarlySubmit {
+    /// The configured first threshold, `0` = off.
+    first: usize,
+    /// The open segment's threshold.
+    next: usize,
+    /// Serial of the recorder the last cut opened ([`Recorder::serial`]); any other open recorder
+    /// was opened by the paging paths (`sync_stream`, `rotate_stream`).
+    opened: Option<u64>,
+}
+
+impl EarlySubmit {
+    fn new(first: usize) -> Self {
+        Self {
+            first,
+            next: first,
+            opened: None,
+        }
+    }
+
+    /// The dispatch count at which the open recorder `serial` is cut (`0` = never).
+    fn threshold(&mut self, serial: u64) -> usize {
+        if self.opened != Some(serial) {
+            self.next = self.first;
+        }
+        self.next
+    }
+
+    /// A segment was cut and `fresh_serial` opened in its place.
+    fn cut(&mut self, fresh_serial: u64) {
+        self.next = self.next.saturating_mul(2);
+        self.opened = Some(fresh_serial);
+    }
 }
 
 /// Get-or-alloc a pooled buffer with an explicit `usage` (unlike [`pooled`], which is always
@@ -5830,11 +5935,8 @@ fn rotate_stream<'a>(
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
 ) -> Result<()> {
-    let seg = rec
-        .take()
-        .expect("segment always Some between ops")
-        .finish_nowait()
-        .map_err(|e| be(e.to_string()))?;
+    let seg = submit_nowait(be_, rec.take().expect("segment always Some between ops"))?;
+    be_.note_segment_cut(crate::SegmentCut::Rotation);
     ps.pending[ps.half] = Some(seg);
     ps.half ^= 1;
     ps.cursor = 0;
@@ -5850,71 +5952,117 @@ fn rotate_stream<'a>(
 /// Blocking submit of the ambient segment (queue idle on return) + full stream drain — the ONE
 /// remaining host sync on the paged path, paid only by a small-m layer whose expert set is not
 /// fully resident (its router ids must be read back before its GEMVs can be staged). Both ring
-/// halves and the whole tape are reusable afterwards.
+/// halves and the whole tape are reusable afterwards, and so are the background fills' staging
+/// slots whose copies went into this segment or an earlier one (`MoePagerSession::fills_copied`).
 fn sync_stream<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
     ps: &mut PagedStream,
 ) -> Result<()> {
-    rec.take()
-        .expect("segment always Some between ops")
-        .finish()
-        .map_err(|e| be(e.to_string()))?;
+    let last = rec.take().expect("segment always Some between ops");
+    let serial = last.serial();
+    submit_wait(be_, last)?;
+    be_.note_segment_cut(crate::SegmentCut::Drain);
     ps.drain()?; // fences already signaled (queue idle) — releases their transient objects
     ps.cursor = 0;
     ps.tape_cursor = 0;
+    if let Some(sess) = be_.moe_pager().lock().unwrap().as_mut() {
+        sess.fills_copied(serial); // the queue is idle: every recording up to `last` completed
+    }
     *rec = Some(be_.recorder()?);
     Ok(())
 }
 
-/// Does a streamed dense `Op::Linear` at `(dt, m, in_f, out_f)` route to the arena-addressed
-/// coopmat-warp prefill GEMM (`streamed_prefill_gemm`), or fall back to the streamed GEMV? Mirrors
-/// the RESIDENT `is_gemm && native_dense_supported` gate so the streamed route tracks the resident
-/// route exactly — just arena-addressed. A genuine prefill chunk (m>16, past the resident mrow
-/// window) with a coopmat-warp-eligible native quant takes the GEMM; decode/small-m/verify keep the
-/// GEMV (the task's "small-m keeps the GEMV"). The one native-quant shape the resident path routes
-/// to the dp4a `mmq` GEMM instead of the coopmat-warp arm — Q4_K with out_f%128!=0 (no warp tile) —
-/// is NOT arena-converted (its shader reads the weight outside native_decode's NW chokepoint), so it
-/// too keeps the GEMV; every other native quant reaches the coopmat-warp arm `streamed_prefill_gemm`
-/// mirrors. Also mirrors the resident `warp_ok` gate's `INFR_NO_GEMM_WARP` escape hatch: with it
-/// set, the resident path drops out of the coopmat-warp arm entirely (falling to mmq/off-tier), so
-/// the streamed route must fall back to the GEMV too — otherwise a Q4_K out_f%128==0 shape would
-/// diverge (resident: mmq: streamed: still the coopmat GEMM twin), which can panic the twin-SPV
-/// lookup under that debug knob.
-fn streamed_gemm_applies(
-    be_: &VulkanBackend,
-    dt: infr_core::DType,
-    m: usize,
-    in_f: usize,
-    out_f: usize,
-) -> bool {
-    m > 16
-        && out_f.is_multiple_of(64)
-        && in_f.is_multiple_of(32)
-        && be_.caps().f16_coopmat()
-        && native_dense_supported(dt)
-        && be_.cfg().kernels.vulkan.gemm_warp
-        && !(matches!(dt, infr_core::DType::Q4K)
-            && !out_f.is_multiple_of(128)
-            && be_.caps().i8_dot
-            && be_.cfg().kernels.vulkan.mmq)
+/// The two arms of the non-coopmat tiled prefill GEMM tier (see the NON-COOPMAT doc in
+/// `lower_op`'s `Op::Linear` arm): dp4a mmq for integer-coded weights, the fma warptile for float.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NcGemm {
+    Mmq,
+    Fma,
 }
 
-/// Arena-addressed twin of the resident `Op::Linear` `is_gemm && native_dense_supported` coopmat-
-/// warp prefill arm (see the `is_gemm` block in `lower_op`): the SAME tile selection (A_GLOBAL
-/// f16-A cast, narrow-n split-K, or the direct tile) and the SAME padded-dst dance, but the weight
-/// is read from the pool arena by 64-bit address (`arena_addr`) — the recorder methods pass the
-/// address to whatever tile they pick and bind the activation as the binding-1 filler, so the
-/// arena is NEVER a bound descriptor. `w_off` (a fused-QKV slice offset)
-/// rides on top as a within-slot element offset. The ring→arena copy is already ordered before this
-/// dispatch by `stage_dense_linear`'s RAW `arena_stream_barrier` (same slot, same segment).
+/// Which non-coopmat tiled GEMM serves a `dt` Linear whose shape passed `gemm_ok`, or `None` when
+/// the device has f16 coopmat (the coopmat tier owns it), `INFR_NO_MMQ_FALLBACK` disabled the tier,
+/// or no build covers `dt`. Shared by `quant_linear` and `float_linear`.
+fn nc_gemm_choice(be_: &VulkanBackend, dt: infr_core::DType, gemm_ok: bool) -> Option<NcGemm> {
+    if !gemm_ok || be_.caps().f16_coopmat() || !be_.cfg().kernels.vulkan.mmq_fallback {
+        return None;
+    }
+    if be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt) {
+        Some(NcGemm::Mmq)
+    } else if crate::gemm::native_gemm_fma_kernel_name(dt).is_some() {
+        Some(NcGemm::Fma)
+    } else {
+        None
+    }
+}
+
+/// The nc GEMMs index their tile by `gl_WorkGroupID.x` alone (the mmq builds already spend `.y` on
+/// the expert id of the batched-MoE twin), so their flat tile grid cannot take `dispatch_wide`'s
+/// 2-D split. A grid past the guaranteed x limit would be rejected or truncated by a driver that
+/// enforces it (ANV), so refuse it by name.
+fn check_nc_gemm_grid(dt: infr_core::DType, m: usize, out_f: usize) -> Result<()> {
+    let nc_groups = crate::recorder::nc_gemm_groups(m, out_f);
+    if !nc_gemm_grid_fits(m, out_f, crate::recorder::Recorder::split_point_x()) {
+        return Err(be(format!(
+            "vulkan adapter: non-coopmat prefill GEMM (m={m}, out_f={out_f}, {dt:?}) needs \
+             {nc_groups} workgroups in one grid dimension, past the {} every Vulkan device \
+             guarantees — run prefill in smaller batches",
+            crate::recorder::Recorder::split_point_x()
+        )));
+    }
+    Ok(())
+}
+
+/// Does the nc GEMMs' flat tile grid for `(m, out_f)` fit in `max_groups_x` workgroups (the
+/// device-guaranteed x limit, `Recorder::split_point_x`)? See [`check_nc_gemm_grid`].
+fn nc_gemm_grid_fits(m: usize, out_f: usize, max_groups_x: u32) -> bool {
+    crate::recorder::nc_gemm_groups(m, out_f) <= max_groups_x as usize
+}
+
+/// A quantised `Op::Linear` weight: where its bytes start, and the buffer holding them when it
+/// is resident.
+#[derive(Clone, Copy)]
+struct QuantWeight<'a> {
+    /// The weight's first byte as a 64-bit device address: a resident weight's BDA, or the arena
+    /// slot a dense-streaming pool staged it into.
+    addr: u64,
+    /// The resident weight's buffer, for the few tiers whose kernel binds the weight as a
+    /// descriptor rather than reading it by address; `None` for a streamed slot, which those
+    /// tiers skip.
+    buffer: Option<&'a dyn Buffer>,
+}
+
+/// `Op::Linear` on a native quantised weight (`native_dense_supported`, plus any dtype the
+/// non-coopmat fma tier reads), resident or streamed: the one routing both take, so a streamed
+/// weight runs the kernel its resident twin would for the same shape, device and switches, and
+/// only the weight's address differs. Not reached for F16/F32 (`float_linear`) or a fused
+/// Linear+Add.
+///
+/// Where a streamed weight (`w.buffer` is `None`) cannot follow the resident route:
+///  • the tiers whose kernel binds the weight buffer — every one of them opt-in: the `_cm8`
+///    warptile, the fp8, bf16 and int8 Q8_0 coopmat GEMMs (the last has an arena-addressed build,
+///    compiled for its parity test only) — are skipped, and the Linear takes the next tier down
+///    (the non-coopmat tier where `_cm8` would run);
+///  • the narrow Q4_K dp4a GEMM reads the slot through the arena-addressed build of the same
+///    shader (`matmul_mmq_at`);
+///  • a tiled GEMM it cannot take (a weight past the u32 addressing cap, a non-coopmat grid past
+///    the device's x limit) keeps the per-row GEMV, where the resident Linear fails loudly.
+///
+/// The quantised-activation memo (`mmv_memo`, see `lower_op`) holds `quant_q8(x)` only, keyed by
+/// the activation tensor and shape, so it is independent of the weight and of where it lives.
+/// Staging a streamed weight between two Linears that share `x` records a copy into the arena
+/// and nothing that writes the pooled quant scratch, and a segment cut or ring rotation in
+/// between keeps that scratch (the pool lives for the whole forward) and orders the new
+/// segment after the old with a seeded barrier.
 #[allow(clippy::too_many_arguments)]
-fn streamed_prefill_gemm(
+fn quant_linear(
     be_: &VulkanBackend,
     graph: &Graph,
     dt: infr_core::DType,
-    arena_addr: u64,
+    w: QuantWeight<'_>,
     w_off: usize,
+    x: &TensorId,
     xb: &dyn Buffer,
     y: &dyn Buffer,
     dst: &TensorId,
@@ -5924,24 +6072,912 @@ fn streamed_prefill_gemm(
     rec: &Recorder<'_>,
     pool: &mut ScratchPool,
     transient: &mut Vec<Box<dyn Buffer>>,
+    memo_prev: Option<(TensorId, usize, usize, &'static str)>,
+    mmv_memo: &mut Option<(TensorId, usize, usize, &'static str)>,
 ) -> Result<()> {
-    // Padded-dst dance + tile selection are shared with the resident native-dense arm (the whole
-    // point of this twin is that they track EXACTLY) — read from `arena_addr` instead of a bound
-    // weight. `with_padded_dst` handles the ceil(m/64)*64 row padding; `native_warp_gemm` picks the
-    // A_GLOBAL / split-K / direct tile.
-    with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
-        native_warp_gemm(
-            be_, dt, arena_addr, w_off, xb, out, m, in_f, out_f, rec, pool,
+    // Prefill (m>1): a TILED GEMM writes ceil(m/64)*64 rows DIRECTLY into `y` (Internal
+    // buffers are row-padded to 64 up front, so no temp/copy). Needs n%64==0, k%32==0.
+    //  • Q4_K → mmq (dp4a int8): quantize activations once, integer matmul on the raw
+    //    blocks (no per-GEMM weight dequant) — the u4 prefill default.
+    //  • other native quants → coopmat `matmul_native` (in-shader dequant).
+    //  • f16 (float weights are uploaded as f16) → f16 coopmat `matmul_proj`.
+    // Decode (m=1) and non-tileable shapes fall through to the GEMV.
+    // Small multi-row batches (m = 2..8: spec-decode verify rows, a short chat-turn
+    // suffix prefill) take the multi-row GEMV first — the single-M-tile coopmat GEMM
+    // launches only n/64 workgroups (underfills the GPU: measured 51-182 GB/s effective
+    // weight stream vs the GEMV class's 292-651 on a 7900 XTX), and the plain GEMV
+    // re-streams the weight per row. 7900 XTX, 8B Q4_K shapes: m=2 is 5.6-8.3x the GEMM
+    // route, m=4 1.4-4.1x, m=8 1.7-2.6x — EXCEPT very wide n at m>=5 (gate+up n=24576:
+    // 384 tiles fill the GPU and the mrow's per-thread m*32-FMA inner loop turns
+    // ALU-bound), so m=5..8 gates on out_f <= 8192 (<=128 tiles = the GEMM-underfill
+    // regime). Writes exactly m rows (no padded-dst dance). Formats without an mrow
+    // build fall through to the GEMM; INFR_NO_MROW forces the old route (A/B).
+    // The int8 dp4a mrow's own gates (see the block comment below) — hoisted so the
+    // 9..=16 tier can require them UP FRONT: unlike m<=8 there is no dequant-mrow
+    // fallback above 8 rows, so entering the tier is only legal when the int8 kernel is
+    // actually dispatchable.
+    let mmv_gate = be_.caps().i8_dot
+        && in_f * out_f >= 8 << 20
+        && out_f < 65536
+        && crate::gemm::native_mmv_mrow_kernel_name(dt).is_some()
+        && mrow_int8_dtype_ok(be_.caps(), &be_.cfg().kernels.vulkan, dt, graph.mtp_verify)
+        && be_.cfg().kernels.vulkan.mmv;
+    // rows 9..=16 int8 mrow tier (INFR_NO_MROW16 A/B escape): the MTP spec-verify batch
+    // once its rollback window carries a few committed rows on top of the n_max drafts.
+    // These shapes previously fell through to the split-K coopmat tile, which streams the
+    // same weight at 2-4x the per-row cost at this m (9B mtp128 measured: q4k down-proj
+    // m=11 sk_ag 148us vs mmvr m=7 67.5us; q6k 194us). Same out_f <= 8192 wide-n cutoff
+    // as m=5..8 (the GEMM tiles win on gate_up-wide shapes), same formats as the m<=8
+    // int8 tier (others keep the GEMM route — no dequant mrow above 8 rows).
+    // The two bands' SHAPE arithmetic lives in `MROW_BANDS` (shared policy); the
+    // capability half — kernel builds, dtype sets, caps, env hatches — stays here.
+    let mrow_tier = infr_core::tier::linear_tier(m, out_f, &MROW_BANDS);
+    let in_band = |b: usize| mrow_tier == infr_core::tier::LinearTier::MultiRow { band: b };
+    let mrow16 = in_band(MROW16_BAND)
+        && mmv_gate
+        && crate::gemm::native_mmv_mrow_m16_kernel_name(dt).is_some()
+        && be_.cfg().kernels.vulkan.mrow16;
+    // The multi-row GEMVs index the weight in u32 and are not chunked, so a weight past the
+    // addressing cap leaves this tier for the chunked per-row GEMV (see `tiled_gemm_fits` below).
+    if (in_band(MROW_BAND) || mrow16)
+        && in_f.is_multiple_of(32)
+        && crate::gemm::native_mrow_kernel_name(dt).is_some()
+        && be_.cfg().kernels.vulkan.mrow
+        && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
+    {
+        // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
+        // integer-dot the raw weight blocks against ALL rows — the dequant mrow's
+        // per-sub-block scalar byte-extract dequant is the m-batch GEMV cost on ALU-bound
+        // shapes (E2B pp4@d4096: GEMV class 21.0 → 17.0us/op, pp4 366 → 383 t/s). Dtype
+        // eligibility is `mrow_int8_dtype_ok(caps, dt, graph.mtp_verify)`: an MTP-verify
+        // batch (`Graph::mtp_verify`) is gated to the SAME dtype set as the m=1 decode
+        // tier (`mmv_int8_decode_dtypes`) — int8 in both streams or in neither, never
+        // split (that split IS the Q5_K token-divergence bug; `mmv_mrow_symmetric_q2k_q3k`
+        // proves the two kernels agree once both are on). Ordinary prefill instead reads
+        // `mrow_int8_prefill_dtypes` — every measured win, independent of the decode set.
+        // Gates:
+        //  • m >= 3: m=2 is the single-head MTP spec-verify shape, whose accept loop
+        //    holds a hard output-identical-to-target-greedy bar (`mtp_spec_matches_
+        //    target_only_greedy`) — int8-quantized activations perturb the verify logits
+        //    enough to risk argmax flips vs the m=1 decode GEMV, so that shape keeps the
+        //    f32-dequant mrow.
+        //  • weight >= 8M elements: below that the kernel is dispatch-latency-floor
+        //    bound (the int8 math saves nothing) and the extra quant_q8 bubble is a pure
+        //    loss — qwen3-0.6b (all projections < 8M) measured pp4@d4096 934 → 854 t/s
+        //    ungated, and E2B's own win came from its gu/down (9.4-18.9M elems).
+        //  • out_f < 65536: the vocab-sized lm_head GEMV is pure weight-bandwidth (the
+        //    dequant ALU hides fully behind the stream) — the int8 form measured a hair
+        //    SLOWER there (qwen3-0.6b pp4@d4096 931 vs 916 with lm_head included).
+        // Same INFR_NO_MMV escape as the m=1 mmv (A/B).
+        if m >= 3 && mmv_gate {
+            let nblk = in_f / 32;
+            let qa = pooled(pool, be_, "mmvr_qa", m * in_f)?;
+            let dact = pooled(pool, be_, "mmvr_dact", m * nblk * 2)?;
+            let sact = pooled(pool, be_, "mmvr_sact", m * nblk * 2)?;
+            // Same x already quantized by the immediately-preceding Linear(s)? Reuse it
+            // (see `mmv_memo`'s doc — the take()/restore protocol guarantees nothing
+            // rewrote x or the pooled qa in between).
+            if memo_prev != Some((*x, m, in_f, "mmvr")) {
+                rec.quant_q8(
+                    xb,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    m,
+                    in_f,
+                );
+            }
+            *mmv_memo = Some((*x, m, in_f, "mmvr"));
+            rec.linear_mmv_mrow_at(
+                dt,
+                w.addr,
+                w_off,
+                pool[&qa].as_ref(),
+                pool[&dact].as_ref(),
+                pool[&sact].as_ref(),
+                None,
+                y,
+                m,
+                in_f,
+                out_f,
+            );
+            return Ok(());
+        }
+        rec.linear_native_mrow_at(dt, w.addr, w_off, xb, y, m, in_f, out_f);
+        return Ok(());
+    }
+    let gemm_ok = m > 1 && out_f.is_multiple_of(64) && in_f.is_multiple_of(32);
+    // The whole GEMM tier below (matmul_native*/matmul_proj, the coopmat tiled prefill
+    // GEMM) dispatches ONLY coopmat SPIR-V — RADV still executes it on hardware without
+    // the feature (silent, no fault), so gating is required, not optional (issue: coopmat
+    // dispatch on a device that lacks VK_KHR_cooperative_matrix segfaults on some
+    // drivers). `!caps.f16_coopmat` routes to the NON-COOPMAT GEMM tier below (`nc_mmq`/
+    // `nc_fma` — real tiled GEMMs with no coopmat SPIR-V), and only past that to the
+    // scalar `else` arms (`linear_native`/`linear`/`linear_f32` — the SAME scalar
+    // dequant-in-shader kernels the m==1 decode GEMV already uses, generalized to
+    // `rows=m`; they dispatch `rows*out_f` (or row-tiled) workgroups with no upper bound
+    // on `rows`, so they are a drop-in, just without any weight-reuse-across-rows win).
+    // Bit-identical to before when caps are all true.
+    // ── 8x8x16 coopmat prefill GEMM tier (Intel Arc/ANV XMX; `caps.f16_coopmat_8x8()` is
+    // Some only when the device enumerates the 8x8x16 f16 shape AND `INFR_CM_8X8=1` —
+    // NEVER on RADV, which enumerates 16x16x16 and keeps the full tier below untouched).
+    // Only `native_gemm_warp`'s `_cm8` builds exist at this shape: one fixed
+    // NARROW_N+BM32 tile (BN=128, BK=64 → n%128, k%64) over the hot k-quants + Q8_0.
+    // Anything it can't cover (dtype without a `_cm8` build, non-dividing shape) keeps
+    // falling to the nc_mmq/nc_fma tier — the Arc default this knob A/Bs against.
+    // Its kernel binds the weight as a descriptor, so a streamed slot (no buffer) never takes it.
+    let cm8_ok = gemm_ok
+        && w.buffer.is_some()
+        && be_.caps().f16_coopmat_8x8()
+        && out_f.is_multiple_of(128)
+        && in_f.is_multiple_of(64)
+        && crate::gemm::native_gemm_warp_cm8_build_spv(dt).is_some();
+    let is_gemm = cm8_ok || (gemm_ok && be_.caps().f16_coopmat() && native_dense_supported(dt));
+    // ── NON-COOPMAT prefill GEMM tier (never taken when `caps.f16_coopmat` — zero effect
+    // on coopmat-capable defaults). The Intel Arc A770 (Mesa ANV) enumerates f16 coopmat
+    // only at M=8,N=8,K=16 — `caps.f16_coopmat()` is false there (see lib.rs) — but HAS
+    // packed int8 dot, and prefill GEMMs previously fell all the way to the per-row
+    // scalar GEMVs (the field-measured 10-30x prefill gap; decode was already at parity).
+    // This tier remains the Arc DEFAULT; the opt-in `cm8_ok` XMX tier above takes only
+    // the Linears it covers, and only under INFR_CM_8X8=1.
+    // Two arms (`nc_gemm_choice`), same padded-dst convention as `is_gemm`:
+    //  • `NcGemm::Mmq` (`nc_mmq`): weight dtype in `infr_core::tensor::MOE_MMQ_DTYPES` +
+    //    `caps.i8_dot` → the DENSE dp4a mmq GEMM family (`matmul_mmq_at` — the same shader
+    //    code the batched MoE expert path already gates on `i8_dot` alone, base-grid
+    //    build), fed by the same `quant_q8` activation prepass the coopmat tier's Q4_K-mmq
+    //    arm uses.
+    //  • `NcGemm::Fma` (`nc_fma`): f16/bf16/f32 weights (no integer codes to dp4a) → the
+    //    shared-memory fma warptile (`matmul_fma_at`, native_gemm_fma.comp — no subgroup
+    //    ops, no f16 exts; bf16 reads stay native, no f32 upconvert).
+    // Both read the weight by 64-bit address, so a streamed weight takes the same tier.
+    // Exercisable on coopmat hardware via INFR_NO_COOPMAT=1 (lib.rs's force-disable test
+    // knob — drops the device feature itself, a faithful simulation). INFR_NO_MMQ_FALLBACK=1
+    // disables the WHOLE tier (both arms) for A/B against the scalar floor.
+    let nc = nc_gemm_choice(be_, dt, gemm_ok);
+    // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
+    // (decode m=1, or the per-input-row GEMV) — the tiled coopmat/nc GEMMs below decode a
+    // 64-row weight tile that can't be split into single input rows, so a breach on this
+    // path (a multi-row lm_head: MTP speculative verify or all-position logits) must fail
+    // loudly, never wrap. Issue #77: covered classes chunk; everything else stays loud.
+    // The nc GEMMs' grid is also capped (`check_nc_gemm_grid`).
+    let vk = &be_.cfg().kernels.vulkan;
+    let tiled = is_gemm || nc.is_some();
+    if tiled
+        && !tiled_gemm_fits(
+            dt,
+            m,
+            in_f,
+            out_f,
+            nc.is_some(),
+            vk,
+            Recorder::split_point_x(),
         )
+        && (w.buffer.is_none() || m <= MROW_BANDS[MROW16_BAND].max_m)
+    {
+        // The chunked per-row GEMV instead of failing: it chunks a breaching weight and has no
+        // grid cap. A streamed weight takes it at any row count — the route a streamed prefill
+        // ran on before it took the tiled GEMMs — and a resident one in the multi-row band,
+        // whose own kernels declined the breaching weight above. A resident tiled GEMM past
+        // that band stays loud.
+        rec.linear_native_routed_at(dt, w.addr, w_off, xb, y, m, in_f, out_f);
+        return Ok(());
+    }
+    if nc.is_some() {
+        check_nc_gemm_grid(dt, m, out_f)?;
+    }
+    if tiled && crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk) {
+        return Err(be(format!(
+            "vulkan adapter: output-projection tiled GEMM (m={m}, in_f={in_f}, \
+             out_f={out_f}, {dt:?}) reads a >= 2^32-element weight — chunked dispatch \
+             covers only m=1 decode and the per-row GEMV (issue #77). This is a multi-row \
+             lm_head (speculative verify / all-position logits) on a big-vocab model."
+        )));
+    }
+    if is_gemm {
+        // GEMM writes ceil(m/64)*64 rows; `with_padded_dst` writes an Internal (row-padded)
+        // `dst` direct and a non-Internal dst (the lm_head `logits` Output) via a padded
+        // temp + copy of the m real rows. Same dance as the nc tier.
+        with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
+            // Q4_K: the 8-warp warptile coopmat GEMM (native_gemm_warp, in-shader dequant)
+            // beats mmq dp4a at prefill shapes (161 vs 417µs on [512,1024]×[1024,6144] — the
+            // wide tile amortizes staging; RADV can't use int8 WMMA). mmq stays for shapes NO
+            // warp tile can cover — n%128≠0 (the NARROW_N tile covers n%128; gemma3-1b's
+            // ne=1152 projections sat on scalar mmq at ~10 TF under the old n%256 gate).
+            // INFR_NO_MMQ also skips mmq for A/B.
+            let warp_ok = out_f.is_multiple_of(128)
+                && crate::gemm::native_gemm_warp_kernel_name(dt).is_some()
+                && be_.cfg().kernels.vulkan.gemm_warp;
+            // int8 cooperative-matrix (WMMA) prefill GEMM — MEASUREMENT path, Q8_0 only
+            // (crates/infr-vulkan/shaders/native_gemm_i8cm_q8_0.comp). `caps.i8_coopmat` is
+            // hardware detection only (see its doc); this dispatch ALSO requires
+            // `INFR_I8_COOPMAT=1` (default off) because int8 coopmat hung the GPU on an older
+            // Mesa despite enumerating fine there too (commit ad82a77) — the toggle keeps that
+            // regression class opt-in until a Mesa-version-gated default is warranted. Default
+            // behavior (unset) is completely unaffected: this is a new, additive branch ahead
+            // of the existing Q4_K-mmq / warp-coopmat / off-tier arms below, which are
+            // untouched.
+            // fp8 (E4M3) cooperative-matrix (WMMA) prefill GEMM — Q8_0 only
+            // (crates/infr-vulkan/shaders/native_gemm_f8cm_q8_0.comp). `caps.f8_coopmat` is
+            // hardware enumeration only (RDNA4/Navi44 confirmed, see lib.rs `has_f8_coopmat`);
+            // this dispatch ALSO requires `INFR_F8_COOPMAT=1` (default off) because — unlike
+            // `i8cm_ok` below — this kernel hasn't been run/measured on real fp8-coopmat
+            // hardware at all yet (this dev box has none), so the opt-in stays until an RDNA4
+            // pass validates correctness. Checked AHEAD of `i8cm_ok`: both are Q8_0-only
+            // measurement tiers, so when a caller opts into fp8 it takes priority. Default
+            // behavior (unset) is completely unaffected — new, additive branch ahead of the
+            // i8cm / Q4_K-mmq / warp-coopmat / off-tier arms below, which are untouched.
+            //
+            // Shape gate mirrors `warp_ok`'s f16 warptile pick: WIDE (BN=256, BK=32) needs
+            // out_f%256==0 && in_f%32==0; NARROW_N (BN=128, BK=64) needs out_f%128==0 &&
+            // in_f%64==0 for shapes the wide tile can't cover (n%128 not n%256 — see
+            // native_gemm_f8cm_q8_0.comp's -DNARROW_N). Neither divides (e.g. out_f%128!=0, or
+            // out_f%128==0 with in_f%64!=0 so narrow's BK=64 can't stage either) -> f8cm_ok is
+            // false and the shape falls through to i8cm/mmq/native below, unaffected.
+            let f8_wide = out_f.is_multiple_of(256) && in_f.is_multiple_of(32);
+            let f8_narrow = !f8_wide && out_f.is_multiple_of(128) && in_f.is_multiple_of(64);
+            let f8cm_ok = matches!(dt, infr_core::DType::Q8_0)
+                && be_.caps().f8_coopmat()
+                && (f8_wide || f8_narrow)
+                && be_.cfg().kernels.vulkan.f8_coopmat;
+            // `i8_coopmat_ready` is `caps.i8_coopmat()` AND the `INFR_I8_COOPMAT=1` opt-in
+            // AND this driver having PASSED the accumulator-layout known-answer probe at
+            // init (see `VulkanBackend::verify_i8_coopmat_layout`): the kernel's
+            // in-fragment descale reads accumulator elements at a mapping that is fixed per
+            // implementation, so enumeration alone does not make it safe to dispatch.
+            let i8cm_ok = matches!(dt, infr_core::DType::Q8_0) && be_.i8_coopmat_ready();
+            // NATIVE bf16 cooperative-matrix (WMMA) prefill GEMM — the `-DBF16CM` build of the
+            // SAME production kernel (crates/infr-vulkan/shaders/native_gemm_warp.comp) that
+            // `native_gemm_warp_bf16` (the f16-clamped path below) already uses; only the
+            // coopmat A/B operand type differs, so it should match that kernel's speed while
+            // keeping bf16's full exponent range. `caps.bf16_coopmat` is hardware enumeration
+            // only (RDNA4/Navi44 confirmed, see lib.rs `has_bf16_coopmat`); this dispatch ALSO
+            // requires `INFR_BF16_COOPMAT=1` (default off) because this variant hasn't been
+            // run/measured on real bf16-coopmat hardware at all yet (this dev box has none), so
+            // the opt-in stays until an RDNA4 pass validates correctness. Default behavior
+            // (unset) is completely unaffected: Bf16 keeps routing through the existing
+            // `native_dense_supported` arm below (`native_gemm_warp_bf16`, the f16-clamped
+            // path), byte-identical to before this branch existed. Shape gate mirrors
+            // `f8_wide`/`f8_narrow`: WIDE (BN=256, BK=32) needs out_f%256==0 && in_f%32==0;
+            // NARROW_N (BN=128, BK=64) needs out_f%128==0 && in_f%64==0.
+            let bf16cm_wide = out_f.is_multiple_of(256) && in_f.is_multiple_of(32);
+            let bf16cm_narrow =
+                !bf16cm_wide && out_f.is_multiple_of(128) && in_f.is_multiple_of(64);
+            let bf16cm_ok = matches!(dt, infr_core::DType::Bf16)
+                && be_.caps().bf16_coopmat()
+                && (bf16cm_wide || bf16cm_narrow)
+                && be_.cfg().kernels.vulkan.bf16_coopmat;
+            let i8cm_kq_tile = if be_.i8cm_kq_ready() {
+                i8cm_kq_choice(
+                    dt,
+                    m,
+                    in_f,
+                    out_f,
+                    w_off,
+                    be_.caps().compute_units,
+                    be_.tuning().i8cm_kq_l_fill_per_cu,
+                )
+            } else {
+                None
+            };
+            // The tiers below that bind the weight buffer run only on a resident weight.
+            let bound = |ok: bool| w.buffer.filter(|_| ok);
+            if let Some(wb) = bound(cm8_ok) {
+                // 8x8x16 `_cm8` warptile (see the `cm8_ok` doc above). First in the chain:
+                // when it's true, `caps.f16_coopmat()` is false (the shapes are mutually
+                // exclusive), so every 16x16x16 branch below would mis-dispatch — none of
+                // their SPIR-V exists at the device's fragment shape.
+                rec.matmul_native_cm8(dt, xb, wb, w_off, out, m, in_f, out_f);
+            } else if let Some(wb) = bound(f8cm_ok) {
+                // E4M3's range is tiny (max normal 448) — unscaled f32 activations overflow to
+                // inf/NaN on cast, which is what produced garbage output on the first RDNA4
+                // run. `quant_f8_row` pre-scales activations into E4M3's range (one amax/scale
+                // per row) before the coopmat GEMM, which descales the output by that same
+                // per-row scale in its epilogue. Q8_0 weights are unscaled (see
+                // native_gemm_f8cm_q8_0.comp doc — their post-dequant magnitude is expected to
+                // already fit E4M3).
+                let qa = pooled(pool, be_, "f8cm_qa", m * in_f)?;
+                let srow = pooled(pool, be_, "f8cm_srow", m * 4)?;
+                rec.quant_f8_row(xb, pool[&qa].as_ref(), pool[&srow].as_ref(), m, in_f);
+                // INFR_F8_PREPACK=1 (requires INFR_F8_COOPMAT=1 too, since it only takes
+                // effect inside this arm): bakes the Q8_0 block scale into an E4M3 weight
+                // buffer ONCE via `repack_q8_to_f8`, then the GEMM's Bs staging reads that
+                // buffer DIRECTLY — no in-shader dqblk. Isolates whether removing the
+                // dequant-ALU bottleneck (the SAME cost f16 pays; fp8-dqblk measured 0.73x
+                // f16 on RDNA4) lets fp8's 2x WMMA rate win. The E4M3 buffer is pooled
+                // per-shape scratch (like every other tier here) and re-repacked on EVERY
+                // forward call — a real deployment would cache the repack at load time, not
+                // redo it per Linear; this is a per-op profiling isolation path, not the
+                // proposed production shape. Unset (default): unchanged dqblk path below,
+                // byte-identical to before this branch existed.
+                if be_.cfg().kernels.vulkan.f8_prepack {
+                    let f8_w8 = pooled(pool, be_, "f8_w8", out_f * in_f)?;
+                    rec.repack_q8_to_f8(wb, w_off, pool[&f8_w8].as_ref(), out_f, in_f);
+                    rec.matmul_f8cm_q8_0_prepacked(
+                        pool[&qa].as_ref(),
+                        pool[&srow].as_ref(),
+                        pool[&f8_w8].as_ref(),
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                } else {
+                    rec.matmul_f8cm_q8_0(
+                        pool[&qa].as_ref(),
+                        pool[&srow].as_ref(),
+                        wb,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                }
+            } else if let Some(wb) = bound(i8cm_ok) {
+                // "Idea 2" measurement (INFR_I8_ROW_SCALE=1, requires INFR_I8_COOPMAT=1 too):
+                // whole-row (block-invariant) activation scale instead of quant_q8's
+                // per-32-block scale — see native_gemm_i8cm_q8_0.comp #ifdef ROW_SCALE /
+                // quant_q8_row.comp. Separate pool tag (different buffer size/layout) and a
+                // separate kernel pair, so this can be measured and reverted independently of
+                // the i8cm baseline path above.
+                if be_.cfg().kernels.vulkan.i8_row_scale {
+                    let qa = pooled(pool, be_, "i8cm_qa_row", m * in_f)?;
+                    let dact_row = pooled(pool, be_, "i8cm_dact_row", m * 2)?;
+                    rec.quant_q8_row(xb, pool[&qa].as_ref(), pool[&dact_row].as_ref(), m, in_f);
+                    rec.matmul_i8cm_q8_0_rowscale(
+                        pool[&qa].as_ref(),
+                        pool[&dact_row].as_ref(),
+                        wb,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                } else {
+                    let nblk = in_f / 32;
+                    let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
+                    let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
+                    let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
+                    rec.quant_q8(
+                        xb,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        m,
+                        in_f,
+                    );
+                    rec.matmul_i8cm_q8_0(
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        wb,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                }
+            } else if let Some(wb) = bound(bf16cm_ok) {
+                rec.matmul_bf16cm(xb, wb, w_off, out, m, in_f, out_f);
+            } else if let Some(tile) = i8cm_kq_tile {
+                // int8 cooperative-matrix K-quant GEMM (see `i8cm_kq_choice`): quantize
+                // the activations to int8 per 32-block once, then integer WMMA on the
+                // raw weight blocks.
+                let nblk = in_f / 32;
+                let qa = pooled(pool, be_, "mmq_qa", m * in_f)?;
+                let dact = pooled(pool, be_, "mmq_dact", m * nblk * 2)?;
+                let sact = pooled(pool, be_, "mmq_sact", m * nblk * 2)?;
+                if memo_prev != Some((*x, m, in_f, "mmq")) {
+                    be_.note_i8cm_kq(crate::I8cmKqEvent::QuantPass);
+                    rec.quant_q8(
+                        xb,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        m,
+                        in_f,
+                    );
+                }
+                *mmv_memo = Some((*x, m, in_f, "mmq"));
+                rec.matmul_i8cm_kq(
+                    dt,
+                    tile,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    w.addr,
+                    w_off,
+                    out,
+                    m,
+                    in_f,
+                    out_f,
+                );
+            } else if matches!(dt, infr_core::DType::Q4K)
+                && !warp_ok
+                && be_.caps().i8_dot
+                && be_.cfg().kernels.vulkan.mmq
+            {
+                // mmq (dp4a int8): quantize activations once, integer matmul on raw blocks.
+                // Scratch is pooled — every same-shape Linear in the graph reuses one set.
+                // Sized to whole 64-row tiles: the mmq shaders stage every row of the last
+                // tile, and only the `m` real rows are quantized.
+                let nblk = in_f / 32;
+                let mpad = m.div_ceil(64) * 64;
+                let qa = pooled(pool, be_, "mmq_qa", mpad * in_f)?;
+                let dact = pooled(pool, be_, "mmq_dact", mpad * nblk * 2)?;
+                let sact = pooled(pool, be_, "mmq_sact", mpad * nblk * 2)?;
+                rec.quant_q8(
+                    xb,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    m,
+                    in_f,
+                );
+                // A streamed slot reads through the arena-addressed build of the same shader.
+                match w.buffer {
+                    Some(wb) => rec.matmul_mmq_q4k(
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        wb,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    ),
+                    None => rec.matmul_mmq_at(
+                        dt,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        w.addr,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    ),
+                }
+            } else {
+                // A_GLOBAL f16-A cast / narrow-n split-K / direct tile (`native_warp_gemm`),
+                // reading the weight by address. Occupancy note: dropping the As stage shrinks
+                // LDS to Bs-only → ~1.5x on the 8B prefill shapes (o proj 29→44 TF). Pool pad
+                // rows may hold stale garbage; GEMM rows are independent, and dst pad rows are
+                // never read.
+                native_warp_gemm(be_, dt, w.addr, w_off, xb, out, m, in_f, out_f, rec, pool)?;
+            }
+            Ok(())
+        })?;
+    } else if let Some(kind) = nc {
+        // Non-coopmat prefill GEMM tier (see the NON-COOPMAT doc above), reading the weight by
+        // address.
+        nc_prefill_gemm(
+            be_, graph, kind, dt, w.addr, w_off, x, xb, y, dst, m, in_f, out_f, rec, pool,
+            transient, memo_prev, mmv_memo,
+        )?;
+    } else if native_dense_supported(dt) {
+        // Decode (m=1) on int-dot-capable K-quants → mmv (see the fused-add branch above).
+        // Wave32-native GPUs take the multi-warp dp4a route first (`mmv_mw_choice`); AMD
+        // falls through to the scalar GEMV (default) or the old mmv (INFR_MMV_DECODE=1).
+        // A `>= 2^32`-element lm_head is chunk-covered on the native dequant GEMV
+        // (`linear_native`, the `else` below) but NOT on this multi-warp int8 dp4a mmv
+        // route — route a breaching weight to the chunked path rather than wrap its u32
+        // index (issue #77). Only lm_head/embed can breach; the tier skipped here matters
+        // only for a 256k-vocab model's single vocab GEMV.
+        let mw = if m == 1
+            && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
+        {
+            mmv_mw_choice(
+                be_.caps(),
+                &be_.cfg().kernels.vulkan,
+                be_.tuning(),
+                dt,
+                in_f,
+                out_f,
+                false,
+            )
+        } else {
+            None
+        };
+        if let Some(warps) = mw {
+            // FUSE_QUANT opt-in: inline activation quantization, skip the
+            // separate quant_q8 dispatch. Only some dtypes have that build.
+            if be_.cfg().kernels.vulkan.mmv_fuse_quant
+                && crate::recorder::mmv_mrow_fuseq_variant(
+                    &be_.cfg().kernels.vulkan,
+                    dt,
+                    in_f,
+                    false,
+                    crate::recorder::MmvO4::of(be_.tuning()),
+                )
+                .is_some()
+            {
+                rec.linear_mmv_mrow_fuseq_at(dt, w.addr, w_off, xb, None, y, 1, in_f, out_f);
+                return Ok(());
+            }
+            let nblk = in_f / 32;
+            let qa = pooled(pool, be_, "mmv_qa", in_f)?;
+            let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
+            let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
+            if memo_prev != Some((*x, 1, in_f, "mmv")) {
+                rec.quant_q8(
+                    xb,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    1,
+                    in_f,
+                );
+            }
+            *mmv_memo = Some((*x, 1, in_f, "mmv"));
+            if unified_mmv_row1(be_.caps()) {
+                // Same kernel/reduction as the m>=3 verify tier, dispatched at rows=1 — see
+                // the fused-add branch above and `unified_mmv_row1`'s doc.
+                rec.linear_mmv_mrow_at(
+                    dt,
+                    w.addr,
+                    w_off,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    None,
+                    y,
+                    1,
+                    in_f,
+                    out_f,
+                );
+            } else {
+                rec.linear_mmv_mw_at(
+                    dt,
+                    warps,
+                    w.addr,
+                    w_off,
+                    pool[&qa].as_ref(),
+                    pool[&dact].as_ref(),
+                    pool[&sact].as_ref(),
+                    None,
+                    y,
+                    in_f,
+                    out_f,
+                );
+            }
+        } else if m == 1
+            && mmv_decode_enabled(&be_.cfg().kernels.vulkan)
+            && be_.caps().i8_dot
+            && in_f.is_multiple_of(32)
+            && in_f * out_f >= MMV_MIN_ELEMS
+            && crate::gemm::native_mmv_kernel_name(dt, false).is_some()
+            // A `>= 2^32`-element lm_head is chunk-covered on the native dequant GEMV
+            // (`linear_native`, below) but NOT on this int8 dp4a mmv tier — route a
+            // breaching weight to the chunked path rather than wrap its u32 index (issue
+            // #77). Only lm_head/embed can breach, and the perf tier they skip here matters
+            // only for a 256k-vocab model's single vocab GEMV.
+            && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
+        {
+            let nblk = in_f / 32;
+            let qa = pooled(pool, be_, "mmv_qa", in_f)?;
+            let dact = pooled(pool, be_, "mmv_dact", nblk * 2)?;
+            let sact = pooled(pool, be_, "mmv_sact", nblk * 2)?;
+            rec.quant_q8(
+                xb,
+                pool[&qa].as_ref(),
+                pool[&dact].as_ref(),
+                pool[&sact].as_ref(),
+                1,
+                in_f,
+            );
+            rec.linear_mmv_at(
+                dt,
+                w.addr,
+                w_off,
+                pool[&qa].as_ref(),
+                pool[&dact].as_ref(),
+                pool[&sact].as_ref(),
+                y,
+                in_f,
+                out_f,
+            );
+        } else {
+            rec.linear_native_routed_at(dt, w.addr, w_off, xb, y, m, in_f, out_f);
+        }
+    } else {
+        // F16/F32 returned through `float_linear` above; nothing else has a Linear kernel.
+        return Err(be(format!(
+            "vulkan adapter: no Linear kernel reads a {dt:?} weight"
+        )));
+    }
+    Ok(())
+}
+
+/// Can a prefill Linear at `(dt, m, in_f, out_f)` that `quant_linear` routed to a tiled GEMM take
+/// it? The tiled GEMMs cannot be output-row chunked (a `bda_weight_breaches` weight — a big-vocab
+/// lm_head at m > 1: all-position logits, speculative verify), and the non-coopmat ones (`nc`)
+/// index their grid in one dimension capped at `max_groups_x`. Where it cannot, `quant_linear`
+/// takes the chunked per-row GEMV or fails loudly.
+fn tiled_gemm_fits(
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    nc: bool,
+    vk: &infr_core::config::VulkanCfg,
+    max_groups_x: u32,
+) -> bool {
+    (!nc || nc_gemm_grid_fits(m, out_f, max_groups_x))
+        && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
+}
+
+/// Record one tiled dp4a-mmq or fma-warptile prefill GEMM reading the weight at the 64-bit address
+/// `w_addr` (a resident weight's BDA, or a streamed slot's arena base) plus element offset `w_off`.
+/// Same padded-dst dance as every tiled tier (`with_padded_dst`): the GEMM writes ceil(m/64)*64
+/// rows. The caller has already checked the grid and `bda_weight_breaches` (refusing the op on the
+/// resident path, keeping the GEMV on the streamed one). The dp4a arm quantizes `x` into the
+/// pooled `mmq_*` scratch unless `memo_prev` says that scratch already holds it (the
+/// `mmv_memo` protocol of `lower_op`), and records that it does.
+#[allow(clippy::too_many_arguments)]
+fn nc_prefill_gemm(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    kind: NcGemm,
+    dt: infr_core::DType,
+    w_addr: u64,
+    w_off: usize,
+    x: &TensorId,
+    xb: &dyn Buffer,
+    y: &dyn Buffer,
+    dst: &TensorId,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    rec: &Recorder<'_>,
+    pool: &mut ScratchPool,
+    transient: &mut Vec<Box<dyn Buffer>>,
+    memo_prev: Option<(TensorId, usize, usize, &'static str)>,
+    mmv_memo: &mut Option<(TensorId, usize, usize, &'static str)>,
+) -> Result<()> {
+    with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
+        match kind {
+            NcGemm::Mmq => {
+                // Same pooled scratch tags/sizes as the coopmat tier's Q4_K-mmq arm — one shape's
+                // scratch serves both, and only one of them runs per Linear.
+                let nblk = in_f / 32;
+                let mpad = m.div_ceil(64) * 64;
+                let qa = pooled(pool, be_, "mmq_qa", mpad * in_f)?;
+                let dact = pooled(pool, be_, "mmq_dact", mpad * nblk * 2)?;
+                let sact = pooled(pool, be_, "mmq_sact", mpad * nblk * 2)?;
+                // Its own memo tag: these buffers are sized to whole 64-row tiles, so they are
+                // the int8 coopmat arm's (`"mmq"`) only when m happens to be a multiple of 64.
+                if memo_prev != Some((*x, m, in_f, "mmq_nc")) {
+                    rec.quant_q8(
+                        xb,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        m,
+                        in_f,
+                    );
+                }
+                *mmv_memo = Some((*x, m, in_f, "mmq_nc"));
+                if dp4a_kq_ok(&be_.cfg().kernels.vulkan, dt, m, in_f, out_f, w_off) {
+                    rec.matmul_dp4a_kq(
+                        dt,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        w_addr,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                } else {
+                    rec.matmul_mmq_at(
+                        dt,
+                        pool[&qa].as_ref(),
+                        pool[&dact].as_ref(),
+                        pool[&sact].as_ref(),
+                        w_addr,
+                        w_off,
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                    );
+                }
+            }
+            NcGemm::Fma => rec.matmul_fma_at(dt, xb, w_addr, w_off, out, m, in_f, out_f),
+        }
+        Ok(())
     })
+}
+
+/// Does the non-coopmat tier's dp4a GEMM for `(dt, m, in_f, out_f, w_off)` take the K-quant
+/// register-blocked kernel (`native_gemm_dp4a_kq.comp`) rather than the per-dtype
+/// `native_gemm_mmq_*` tile? Its shape contract is whole superblocks along k, whole tiles along
+/// n, and a 1-D grid inside the guaranteed `maxComputeWorkGroupCount[0]`; at or below
+/// [`DP4A_KQ_MIN_ROWS`] the smaller mmq tile wastes less.
+fn dp4a_kq_ok(
+    vk: &infr_core::config::VulkanCfg,
+    dt: infr_core::DType,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    w_off: usize,
+) -> bool {
+    let tile = crate::gemm::DP4A_KQ_TILE;
+    vk.dp4a_kq
+        && m > DP4A_KQ_MIN_ROWS
+        && crate::gemm::native_gemm_dp4a_kq_spv(dt).is_some()
+        && in_f.is_multiple_of(256)
+        && w_off.is_multiple_of(256)
+        && (in_f / 32).is_multiple_of(tile.k_blocks)
+        && out_f.is_multiple_of(tile.rows)
+        && m.div_ceil(tile.tokens) * (out_f / tile.rows) <= Recorder::MAX_GROUP_COUNT_X as usize
+}
+
+/// Rows at or below which [`dp4a_kq_ok`] keeps the `native_gemm_mmq_*` tile: one half-empty
+/// dp4a token tile costs more than the mmq tile that fits the rows. Measured on the integrated
+/// RDNA2 GPU (Qwen3-1.7B Q4_K_M, dp4a on / off): pp64 139.3 / 145.3 t/s, pp80 162.6 / 93.8.
+const DP4A_KQ_MIN_ROWS: usize = 64;
+
+/// `Op::Linear` on an F16 or F32 weight whose bytes start at `w_addr`: a resident weight's own
+/// BDA address, or the arena slot a dense-streaming pool staged it into. Both callers go through
+/// here, so a streamed float weight runs exactly the kernels its resident twin would, in the same
+/// routing. Every kernel here takes its weight's base as a 64-bit address — which is why the slot
+/// address is all a streamed weight needs — and the split-K warptile and the fma GEMM also take
+/// an element offset (`w_off`) on top of it; the GEMVs and `gemm_proj` take none.
+///
+/// Routing, in order:
+///  • f16 prefill on a coopmat device (`m > 1`, `out_f % 64`, `in_f % 32`): the narrow-grid
+///    split-K warptile where `split_k_plan` asks for it (the DiffusionGemma SC soft-embedding,
+///    m=256, k=262144, n=2816: 58 ms/step on the BN=64 `gemm_proj` tile at ~6.5 TFLOPS against
+///    llama.cpp's 14.1 ms; the F16 decode is exact, see native_decode.glsl FMT_F16), else the
+///    coopmat `matmul_proj`.
+///  • any float prefill without coopmat: the non-coopmat fma warptile (`nc_gemm_choice`).
+///  • everything else: the f32 GEMV (`linear_f32r` family) or the f16 GEMV (`linear_f16`, or
+///    `linear_f16_noext` on a device without `shaderFloat16`).
+///
+/// `w_off` (`Op::Linear::w_off`, a row-aligned slice): F32 shifts the base address (DeepSeek V4's
+/// grouped output projection, `w_off = g * o_lora_rank * in_f`, is the caller; the synthetic V4
+/// fixture's f32 `wo_a` is what the CPU-vs-Vulkan parity test runs). F16 is refused rather than
+/// approximated: nothing in the tree produces an f16 `w_off`. `linear_f16` and `gemm_proj` have no
+/// offset field, so it would be a shifted base address, and `gemm_proj` and `linear_f16_noext`
+/// read the weight as u32 words (4-byte `buffer_reference_align`), which an odd-element shift
+/// breaks — an alignment rule every route would have to carry, with nothing to test it.
+#[allow(clippy::too_many_arguments)]
+fn float_linear(
+    be_: &VulkanBackend,
+    graph: &Graph,
+    dt: infr_core::DType,
+    w_addr: u64,
+    w_off: usize,
+    x: &TensorId,
+    xb: &dyn Buffer,
+    y: &dyn Buffer,
+    dst: &TensorId,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    rec: &Recorder<'_>,
+    pool: &mut ScratchPool,
+    transient: &mut Vec<Box<dyn Buffer>>,
+    memo_prev: Option<(TensorId, usize, usize, &'static str)>,
+    mmv_memo: &mut Option<(TensorId, usize, usize, &'static str)>,
+) -> Result<()> {
+    let is_f16 = match dt {
+        infr_core::DType::F16 => true,
+        infr_core::DType::F32 => false,
+        _ => {
+            return Err(be(format!(
+                "vulkan adapter: float Linear dispatch reached with a {dt:?} weight"
+            )))
+        }
+    };
+    if w_off != 0 && is_f16 {
+        return Err(be(format!(
+            "vulkan adapter: Linear w_off on a {dt:?} weight — the f16 Linear routes take no \
+             weight offset (see `float_linear`)"
+        )));
+    }
+    let gemm_ok = m > 1 && out_f.is_multiple_of(64) && in_f.is_multiple_of(32);
+    // Only f16 has a coopmat GEMM (`gemm_proj` stages the weight as f16 for the matrix cores);
+    // an f32 prefill on a coopmat device keeps the row-tiled f32 GEMV.
+    let is_gemm = is_f16 && gemm_ok && be_.caps().f16_coopmat();
+    let nc = nc_gemm_choice(be_, dt, gemm_ok);
+    if nc.is_some() {
+        check_nc_gemm_grid(dt, m, out_f)?;
+    }
+    // The tiled GEMMs decode a 64-row weight tile that cannot be split into single input rows, so a
+    // `>= 2^32`-element weight fails loudly there rather than wrap (issue #77).
+    if (is_gemm || nc.is_some())
+        && crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
+    {
+        return Err(be(format!(
+            "vulkan adapter: output-projection tiled GEMM (m={m}, in_f={in_f}, out_f={out_f}, \
+             {dt:?}) reads a >= 2^32-element weight — chunked dispatch covers only m=1 decode and \
+             the per-row GEMV (issue #77). This is a multi-row lm_head (speculative verify / \
+             all-position logits) on a big-vocab model."
+        )));
+    }
+    if is_gemm {
+        // Same padded-dst dance as every other tiled GEMM (`with_padded_dst`).
+        with_padded_dst(be_, graph, rec, dst, y, m, out_f, transient, |out| {
+            let splits = split_k_plan(m, in_f, out_f, split_k_device_window(be_));
+            if splits > 1
+                && in_f.is_multiple_of(64)
+                && crate::gemm::native_gemm_warp_sk_kernel_name(dt).is_some()
+                && be_.cfg().kernels.vulkan.gemm_warp
+            {
+                let mpad = m.div_ceil(64) * 64;
+                let pk = pooled(pool, be_, "splitk_part", splits * mpad * out_f * 4)?;
+                rec.matmul_native_splitk(
+                    dt,
+                    xb,
+                    w_addr,
+                    w_off,
+                    pool[&pk].as_ref(),
+                    out,
+                    m,
+                    in_f,
+                    out_f,
+                    splits,
+                    false,
+                );
+            } else {
+                rec.matmul_proj_at(xb, w_addr, out, m, in_f, out_f);
+            }
+            Ok(())
+        })
+    } else if let Some(kind) = nc {
+        nc_prefill_gemm(
+            be_, graph, kind, dt, w_addr, w_off, x, xb, y, dst, m, in_f, out_f, rec, pool,
+            transient, memo_prev, mmv_memo,
+        )
+    } else if !is_f16 {
+        // Full-precision projection weight (gemma4 E2B per-layer inp_gate/proj, DeepSeek V4's
+        // grouped output projection, an all-f32 checkpoint): the f16 GEMV would read the f32 bytes
+        // as f16 garbage.
+        //
+        // A `w_off` is a row-aligned slice of the weight (`w_off % in_f == 0`, `Op::Linear::w_off`'s
+        // contract) expressed as a shifted base ADDRESS, because `linear_f32r.comp` has no offset
+        // field. Alignment: the vec4 variant declares a 16-byte-aligned buffer_reference and is only
+        // chosen when `in_f % 4 == 0`, and `w_off` is a whole multiple of `in_f`, so `w_off * 4`
+        // bytes is a multiple of 16 exactly when that variant can run. The scalar variants need 4,
+        // which any f32 element offset satisfies. Asserted rather than assumed — a violation would
+        // read misaligned and is not otherwise detectable.
+        if !w_off.is_multiple_of(in_f) {
+            return Err(be(format!(
+                "vulkan adapter: Linear w_off {w_off} is not a whole multiple of in_f {in_f} — the \
+                 f32 GEMV addresses a row-aligned weight slice"
+            )));
+        }
+        rec.linear_f32_at(w_addr + (w_off * 4) as u64, xb, y, m, in_f, out_f);
+        Ok(())
+    } else if be_.caps().f16 {
+        rec.linear_at(w_addr, xb, y, m, in_f, out_f);
+        Ok(())
+    } else {
+        // No shaderFloat16 (implies no coopmat too — f16 is a coopmat prerequisite):
+        // linear_f16.comp's `float16_t` read needs the Float16 SPIR-V capability the device lacks.
+        // linear_f16_noext.comp is the same dispatch shape reading the f16 weight as packed u32
+        // words and unpacking via the CORE `unpackHalf2x16` builtin instead — correctness-first,
+        // not perf-tuned (no row-tiling).
+        rec.linear_f16_noext_at(w_addr, xb, y, m, in_f, out_f);
+        Ok(())
+    }
 }
 
 /// Ensure a streamed dense Linear weight (`wid` — see `pager::buffer_identity`) is resident,
 /// staging a miss through the session ring into the ambient segment and rotating the stream
 /// (pipelined `finish_nowait` + fenced ring-half swap, exactly `rotate_stream`'s contract) when
 /// the current half can't hold it. Returns the resident slot's arena base BYTE address for the
-/// streamed dispatch (see `DensePagerSession::stage`). Progress is guaranteed: a ring half holds
-/// at least the largest pool slot (asserted at session construction).
+/// streamed dispatch (see `DensePagerSession::stage`, which also records the arena barriers around
+/// a copy, and only around a copy). Progress is guaranteed: a ring half holds at least the largest
+/// pool slot (asserted at session construction).
 fn stage_dense_linear<'a>(
     be_: &'a VulkanBackend,
     rec: &mut Option<Recorder<'a>>,
@@ -5949,12 +6985,6 @@ fn stage_dense_linear<'a>(
     wid: usize,
 ) -> Result<u64> {
     loop {
-        // WAR: order any prior streamed dispatch's arena read (a 64-bit pointer read, invisible to
-        // the buffer hazard tracker) before the ring→arena copy this `stage` may record into a
-        // re-used slot. Emitted before the copy; harmless on a hit (no copy recorded).
-        rec.as_ref()
-            .expect("segment always Some between ops")
-            .arena_stream_barrier();
         let staged = {
             let mut guard = be_.dense_pager().lock().unwrap();
             let sess = guard
@@ -5969,14 +6999,7 @@ fn stage_dense_linear<'a>(
             )?
         };
         match staged {
-            Some(arena_addr) => {
-                // RAW: order the ring→arena copy just recorded before the streamed dispatch that
-                // reads the slot by pointer (see `Recorder::arena_stream_barrier`).
-                rec.as_ref()
-                    .expect("segment always Some between ops")
-                    .arena_stream_barrier();
-                return Ok(arena_addr);
-            }
+            Some(arena_addr) => return Ok(arena_addr),
             None => rotate_stream(be_, rec, ps)?,
         }
     }
@@ -6040,11 +7063,17 @@ fn stage_and_window<'a>(
 ///     chunk records into one submission; misses ride recorded ring→arena copies whose only
 ///     backpressure is the fenced ring-half rotation (`rotate_stream` — CPU staging overlaps GPU
 ///     execution instead of serializing with it).
-///   - Small-m (decode) layers whose full expert set is resident: `touch_all_hits` (LRU upkeep,
-///     no residency/LUT mutation) + a frozen LUT window, recorded inline — zero host syncs.
+///   - Small-m (decode) layers whose full expert set is resident: `touch_all_hits` (recency
+///     upkeep — one group touch per role, O(1), no residency/LUT mutation) + a frozen LUT window,
+///     recorded inline — zero host syncs. The residency check is O(1) per role too
+///     (`MoePagerSession::all_resident`).
 ///   - Small-m layers with any absent expert: the ONE remaining blocking sync (`sync_stream`) to
 ///     read the router's ids — a mapped memcpy, the ids buffer is `Staging` — then routed-only
-///     staging into the fresh ambient segment (which stays open for the next layer).
+///     staging into the fresh ambient segment (which stays open for the next layer). Where every
+///     role's pool can hold every expert of the model, such a layer also asks the session's
+///     background reader for its experts no token routed to (`MoePagerSession::request_fills`),
+///     and admits what the reader has ready into free slots just before its sync, until every
+///     layer is wholly resident and takes the arm above.
 ///
 /// Every path reads layer-LOCAL expert ids against a frozen per-(layer, role) LUT window in the
 /// session's tape (`lut[window + local_id]` — see `MoePagerSession::lut_window`), never the live
@@ -6137,18 +7166,18 @@ fn execute_paged_moe<'a>(
     let n_slots = rows * n_used;
     let r = |id: TensorId| resolve(scratch, bindings, id);
 
-    // Dummy bias buffer when exp_probs_b is absent (the shader ignores it when has_bias==0).
+    // Placeholder bias binding when exp_probs_b is absent (the shader ignores it when has_bias==0).
     let bias_buf: &dyn Buffer = if let Some(epb) = exp_probs_b {
         r(*epb)?
     } else {
-        &*be_.alloc_uninit(4, BufferUsage::Weights)?
+        be_.unused_binding()?
     };
     let has_bias = exp_probs_b.is_some();
     // Hash routing through the PAGER is unreached: the pager serves an expert bank too big for
     // VRAM (Llama-4-Scout), and DeepSeek V4's hash layers are not that model. Rather than carry a
     // second untested hash path here, bind the dummy and refuse — the resident arms above are
     // where hash routing is implemented and tested.
-    let hash_buf: &dyn Buffer = &*be_.alloc_uninit(4, BufferUsage::Activations)?;
+    let hash_buf: &dyn Buffer = be_.unused_binding()?;
     if expert_ids.is_some() {
         return Err(be(
             "vulkan adapter: paged MoeFfn does not implement hash routing (expert_ids)",
@@ -6219,6 +7248,14 @@ fn execute_paged_moe<'a>(
     let touch_all = rows * n_used >= 3 * n_expert;
     // Layer-LOCAL ids to stage; empty = residency already guaranteed (all-resident inline path).
     let mut stage_ids: Vec<u32> = Vec::new();
+    // Whether this layer fills its experts no token has routed to (see below), and its roles'
+    // tensors (a fused gate_up bank has no Up source).
+    let mut fill = false;
+    let roles: &[usize] = if *fused_gate_up {
+        &[gate_id, down_id]
+    } else {
+        &[gate_id, up_id, down_id]
+    };
     if touch_all {
         stage_ids = (0..n_expert as u32).collect();
     } else {
@@ -6243,6 +7280,22 @@ fn execute_paged_moe<'a>(
             }
             sess.touch_all_hits(down_id, n_expert)?;
         } else {
+            // Fill the layer's other absent experts so that it becomes wholly resident and takes
+            // the inline arm above — but only where every role's pool has a slot for every expert
+            // registered in it: then a fill never evicts, now or later. With any pool short of
+            // that, the layer stays on this arm as before, so a budget that cannot hold the model
+            // never fills. What the background reader has ready (any layer's) is admitted HERE:
+            // one recorded copy per expert from the reader's staging buffer, into the segment
+            // `sync_stream` is about to submit and wait for, so the staging slots are free again
+            // once that wait returns. The forward copies no bytes itself.
+            {
+                let mut guard = be_.moe_pager().lock().unwrap();
+                let sess = guard.as_mut().expect("checked above");
+                fill = sess.fills_layer(roles);
+                if fill {
+                    sess.stage_ready_fills(rec.as_ref().expect("segment always Some between ops"))?;
+                }
+            }
             // Split: the router's routing is host-unknown and some routed expert may be absent —
             // block once, read the ids off the mapped Staging buffer, stage exactly the routed
             // set into the fresh ambient segment (which then stays open for the layers after).
@@ -6269,6 +7322,14 @@ fn execute_paged_moe<'a>(
         stage_and_window(be_, rec, ps, up_id, &stage_ids, n_expert, touch_all)?
     };
     let down_w = stage_and_window(be_, rec, ps, down_id, &stage_ids, n_expert, touch_all)?;
+    if fill {
+        // Ask the reader for this layer's absent experts, now that its routed ones are staged.
+        // The reads run off this thread, and a later readback layer admits them — in this
+        // forward or a later one.
+        let mut guard = be_.moe_pager().lock().unwrap();
+        let sess = guard.as_mut().expect("checked above");
+        sess.request_fills(be_, roles)?;
+    }
     // RAW: order every ring→arena copy this op just staged (gate/up/down, TRANSFER writes
     // invisible to the buffer hazard tracker) before the first dispatch below that reads the
     // arena by pointer — covers both the batched `matmul_mmq_experts_paged` arm and the small-m
@@ -6675,42 +7736,36 @@ mod tests {
     use infr_core::tensor::TensorDesc;
     use infr_core::DType;
 
+    /// The paged early-submit cadence starts at the configured count, doubles at every cut it
+    /// opened the next recorder for, starts over when the paging paths opened the recorder (a
+    /// paged MoE drain or a ring rotation), and never cuts when configured off.
     #[test]
-    fn native_exl3_prefill_uses_prefill_submit_cap() {
-        let id = TensorId(0);
-        let native = |m| Op::LinearExl3 {
-            x: id,
-            trellis: id,
-            suh: id,
-            svh: id,
-            dst: id,
-            m,
-            spec: infr_core::Exl3Spec {
-                in_f: 128,
-                out_f: 128,
-                bits: 4,
-                codebook: infr_core::Exl3Codebook::Cb0,
-                input_layout: infr_core::Exl3OutputLayout::Identity,
-                output_layout: infr_core::Exl3OutputLayout::Identity,
-            },
-        };
-        let dense = |m| Op::Linear {
-            x: id,
-            weight: id,
-            dst: id,
-            m,
-            in_f: 128,
-            out_f: 128,
-            w_off: 0,
-        };
-        assert!(single_token_forward(&[native(1), dense(1)]));
-        assert!(!single_token_forward(&[native(36), native(1)]));
-        assert!(!single_token_forward(&[native(36)]));
-        assert!(!single_token_forward(&[dense(36), native(1)]));
+    fn early_submit_doubles_and_restarts_after_a_foreign_recorder() {
+        let mut e = EarlySubmit::new(8);
+        assert_eq!(e.threshold(10), 8);
+        e.cut(11);
+        assert_eq!(e.threshold(11), 16);
+        e.cut(12);
+        assert_eq!(e.threshold(12), 32);
+        // `sync_stream` or `rotate_stream` replaced the open recorder: back to the configured count.
+        assert_eq!(e.threshold(40), 8);
+        e.cut(41);
+        assert_eq!(e.threshold(41), 16);
+
+        let mut off = EarlySubmit::new(0);
+        assert_eq!(off.threshold(1), 0);
+        off.cut(2);
+        assert_eq!(off.threshold(2), 0);
+        assert_eq!(crate::segment_cut(1_000_000, 0, off.threshold(2)), None);
+
+        let mut big = EarlySubmit::new(usize::MAX / 2 + 1);
+        big.cut(3);
+        assert_eq!(big.threshold(3), usize::MAX, "the doubling saturates");
     }
 
-    /// Read a `#define <name> <integer>` back out of GLSL source. Panics when the define is gone —
-    /// a shader that no longer states its bound is exactly the drift this guards.
+    /// Read a `#define <name> <integer>` back out of GLSL source, with or without GLSL's `u`
+    /// suffix. Panics when the define is gone — a shader that no longer states its bound is exactly
+    /// the drift this guards.
     fn glsl_define_u32(src: &str, name: &str) -> u32 {
         for line in src.lines() {
             let Some(rest) = line.trim_start().strip_prefix("#define ") else {
@@ -6722,6 +7777,8 @@ mod tests {
                     .next()
                     .unwrap_or_else(|| panic!("`#define {name}` has no value"));
                 return v
+                    .strip_suffix('u')
+                    .unwrap_or(v)
                     .parse()
                     .unwrap_or_else(|e| panic!("`#define {name} {v}` is not a u32: {e}"));
             }
@@ -6758,6 +7815,24 @@ mod tests {
         );
     }
 
+    /// `hyper_mix.comp` holds a token's whole `hc x hc` Sinkhorn matrix in a private array of
+    /// `HC_MAX * HC_MAX` floats and cannot bounds-check it; `hyper_check_hc` admits every `hc` up to
+    /// `HYPER_CONNECT_MAX_MULT`. Raise the host bound without the shader's and the widest admitted
+    /// streams write past the array — undefined, not an error.
+    #[test]
+    fn hyper_mix_bound_matches_host() {
+        let src = include_str!("../shaders/hyper_mix.comp");
+        assert_eq!(
+            glsl_define_u32(src, "HC_MAX"),
+            infr_core::graph::HYPER_CONNECT_MAX_MULT,
+            "hyper_mix.comp's HC_MAX drifted from HYPER_CONNECT_MAX_MULT"
+        );
+        assert!(
+            src.contains("float m[HC_MAX*HC_MAX];"),
+            "hyper_mix.comp's matrix is no longer sized by HC_MAX"
+        );
+    }
+
     /// Same drift guard, one axis over: the `-DMLA_SG` builds size their cross-subgroup scratch as
     /// `128 / MLA_SG_WIDTH` and sum exactly that many slots, while the HOST is what actually pins
     /// the pipeline's `requiredSubgroupSize` (`gemm::MLA_SG_WIDTH`, passed to `kernel_sg` by
@@ -6779,7 +7854,7 @@ mod tests {
     }
 
     /// The `-DMLA_SG` tier is capability-gated at the point of use, not just by the backend's
-    /// device-level wave32 refusal: a device whose subgroup range excludes the pinned width must
+    /// device-level subgroup gate: a device whose subgroup range excludes the pinned width must
     /// get the scalar two-pass builds, whose eight-way selector must in turn never hand a `sg`
     /// name a scalar build's SPIR-V (kernels are cached by NAME, so a mismatch would poison the
     /// cache entry for the whole process).
@@ -6839,6 +7914,138 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A record-once decode replay freezes the caller's buffers into its descriptors. Executing the
+    /// plan with a different buffer bound must not replay onto the old one: `execute_chain`
+    /// declines without running a step, and `execute` rebuilds the recording, writing the result
+    /// a fresh plan computes into the newly bound buffer.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn replay_follows_rebound_buffers() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (nh, nkv, hd) = (2usize, 1usize, 128usize);
+        let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
+        let mut g = Graph::new();
+        let x = g.input(f32d(nh * hd));
+        let qw = g.weight(f32d(hd));
+        let pos = g.input(TensorDesc::new(vec![1], DType::I32));
+        let kc = g.input(TensorDesc::new(vec![nkv * hd], DType::F16));
+        let vc = g.input(TensorDesc::new(vec![nkv * hd], DType::F16));
+        let qa = g.internal(f32d(nh * hd));
+        let dst = g.output(f32d(nh * hd));
+        g.push(Op::QkNormRope {
+            x,
+            weight: qw,
+            positions: pos,
+            dst: qa,
+            rows: 1,
+            n_head: nh as u32,
+            head_dim: hd as u32,
+            rope_dim: hd as u32,
+            theta: 1e6,
+            eps: 1e-6,
+            freq_factors: None,
+            x_stride: 0,
+        });
+        g.push(Op::Attention {
+            q: qa,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: 1,
+            kv_len: 1,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale: 1.0 / (hd as f32).sqrt(),
+            mask: AttnMask::Causal,
+            pos: 0,
+            sinks: None,
+            key_bias: None,
+            comp: None,
+        });
+        let plan = be_.compile(&g).unwrap();
+        let vk_plan = plan.as_any().downcast_ref::<VkDecodePlan>().unwrap();
+        assert!(
+            vk_plan.eligible,
+            "the graph must take the record-once replay path"
+        );
+        // Rows the self-advancing replay reaches across the executes below.
+        const ROWS: usize = 4;
+        let buf = |bytes: usize, usage| be_.alloc(bytes, usage).unwrap();
+        let up = |b: &dyn Buffer, bytes: &[u8]| be_.upload(b, bytes).unwrap();
+        let data = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * 7 + salt) % 13) as f32 * 0.1 - 0.6)
+                .collect()
+        };
+        let f16s = |v: Vec<f32>| -> Vec<u8> {
+            v.iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect()
+        };
+        let xb = buf(nh * hd * 4, BufferUsage::Activations);
+        up(xb.as_ref(), bytemuck::cast_slice(&data(nh * hd, 1)));
+        let wb = buf(hd * 4, BufferUsage::Weights);
+        up(wb.as_ref(), bytemuck::cast_slice(&data(hd, 2)));
+        let pb = buf(4, BufferUsage::Staging);
+        let kb = buf(ROWS * nkv * hd * 2, BufferUsage::KvCache);
+        up(kb.as_ref(), &f16s(data(ROWS * nkv * hd, 3)));
+        let vb = buf(ROWS * nkv * hd * 2, BufferUsage::KvCache);
+        up(vb.as_ref(), &f16s(data(ROWS * nkv * hd, 4)));
+        let sentinel = vec![0xA5u8; nh * hd * 4];
+        let out = || {
+            let b = buf(nh * hd * 4, BufferUsage::Activations);
+            up(b.as_ref(), &sentinel);
+            b
+        };
+        let (ob, other, want) = (out(), out(), out());
+        let bind = |out| {
+            let mut b = Bindings::new();
+            b.bind(x, xb.as_ref())
+                .bind(qw, wb.as_ref())
+                .bind(pos, pb.as_ref())
+                .bind(kc, kb.as_ref())
+                .bind(vc, vb.as_ref())
+                .bind(dst, out);
+            b
+        };
+        let read = |b: &dyn Buffer| {
+            let mut v = vec![0u8; nh * hd * 4];
+            be_.download(b, &mut v).unwrap();
+            v
+        };
+        let at = |p: i32| up(pb.as_ref(), bytemuck::cast_slice(&[p]));
+        let (recorded, rebound) = (bind(ob.as_ref()), bind(other.as_ref()));
+        at(0);
+        be_.execute(plan.as_ref(), &recorded).unwrap();
+        assert_eq!(
+            be_.execute_chain(plan.as_ref(), &rebound, 1).unwrap(),
+            None,
+            "a chain over rebound buffers must decline"
+        );
+        assert_eq!(
+            read(other.as_ref()),
+            sentinel,
+            "a declined chain ran a step"
+        );
+        let p = (ROWS - 1) as i32;
+        at(p);
+        be_.execute(plan.as_ref(), &rebound).unwrap();
+        // The reference: a fresh plan's first execute at the same position.
+        let fresh = be_.compile(&g).unwrap();
+        at(p);
+        be_.execute(fresh.as_ref(), &bind(want.as_ref())).unwrap();
+        let got = read(other.as_ref());
+        assert_ne!(got, sentinel, "the rebound output was never written");
+        assert_eq!(
+            got,
+            read(want.as_ref()),
+            "the rebuilt replay disagrees with a fresh plan"
+        );
     }
 
     /// B45 guard: `mla.comp` keeps its whole working state in FIXED-size shared arrays, so an
@@ -6976,6 +8183,77 @@ mod tests {
         }
     }
 
+    /// The partial kernels' score arrays are sized by a define the host copies; read both back
+    /// out of their sources (the rows-batched build's from its `build.rs` define).
+    #[test]
+    fn attn_partial_chunk_bound_matches_host() {
+        let src = include_str!("../shaders/attn_partial.comp");
+        assert_eq!(
+            glsl_define_u32(src, "ATTN_PARTIAL_MAX_CHUNK") as usize,
+            ATTN_PARTIAL_MAX_CHUNK,
+            "attn_partial.comp's ATTN_PARTIAL_MAX_CHUNK drifted from the host cap"
+        );
+        assert!(
+            src.contains("shared float sc[ATTN_PARTIAL_MAX_CHUNK];"),
+            "attn_partial.comp's sc[] is no longer sized by ATTN_PARTIAL_MAX_CHUNK"
+        );
+        assert!(
+            include_str!("../build.rs").contains(&format!("\"-DSC_MAX={ATTN_MROWS_CHUNK}u\"")),
+            "attn_partial_mrows_c256's SC_MAX drifted from ATTN_MROWS_CHUNK"
+        );
+    }
+
+    /// The rows-batched tier covers at most `ATTN_MROWS_CHUNK * ATTN_MAX_CHUNKS` keys; one key
+    /// more leaves it (to per-row split-K), with or without the opt-in, while every other
+    /// condition is held where it admits the tier.
+    #[test]
+    fn batched_attn_stops_at_its_chunk_count_bound() {
+        let bound = ATTN_MROWS_CHUNK * ATTN_MAX_CHUNKS;
+        for opt_in in [None, Some(true)] {
+            let ok = |kv_len| batched_attn_ok(16, 128, kv_len, usize::MAX, false, false, opt_in);
+            assert!(ok(bound), "{opt_in:?}: at the bound");
+            assert!(!ok(bound + 1), "{opt_in:?}: past the bound");
+        }
+        assert!(!batched_attn_ok(
+            16,
+            128,
+            8192,
+            usize::MAX,
+            false,
+            false,
+            Some(false)
+        ));
+    }
+
+    /// The canvas chunk never passes the partial kernel's score array, so a long canvas splits
+    /// into more chunks instead (the old `kv_len / 3` reached a 1025-key chunk at kv_len 3073 and
+    /// wrote past `sc[]`); below that point it is the old chunk exactly, and the count stays within
+    /// the combine's cap up to the span where both caps meet.
+    #[test]
+    fn canvas_chunk_stays_within_the_partial_kernel() {
+        let old = |kv_len: usize, n: usize| kv_len.div_ceil(n).min(kv_len - 1).max(1);
+        let n = crate::tuning::tests::fixture_tuning("unknown").canvas_chunks;
+        for kv_len in (2..=ATTN_PARTIAL_MAX_CHUNK * ATTN_MAX_CHUNKS).step_by(997) {
+            let chunk = canvas_chunk(kv_len, n);
+            assert!(
+                chunk <= ATTN_PARTIAL_MAX_CHUNK,
+                "kv_len {kv_len}: chunk {chunk}"
+            );
+            assert!(kv_len.div_ceil(chunk) <= ATTN_MAX_CHUNKS, "kv_len {kv_len}");
+            assert_eq!(
+                split_k_chunk_count_cap(kv_len, chunk),
+                chunk,
+                "kv_len {kv_len}: the count cap must not raise it back"
+            );
+            if old(kv_len, n) <= ATTN_PARTIAL_MAX_CHUNK {
+                assert_eq!(chunk, old(kv_len, n), "kv_len {kv_len} moved");
+            }
+        }
+        let first = ATTN_PARTIAL_MAX_CHUNK * n + 1;
+        assert!(old(first, n) > ATTN_PARTIAL_MAX_CHUNK);
+        assert_eq!(canvas_chunk(first, n), ATTN_PARTIAL_MAX_CHUNK);
+    }
+
     #[test]
     fn split_k_chunk_count_cap_bounds_huge_spans() {
         // Past the boundary the cap must engage: n_chunks stays <= 1024 for every static base
@@ -6992,8 +8270,155 @@ mod tests {
         }
     }
 
+    /// `lower_op` sends an F16/F32 `Op::Linear` to `float_linear` ahead of the multi-row GEMV, the
+    /// `_cm8` and int8 coopmat tiers and the native GEMV/GEMM arms. That order is only free while
+    /// none of them has a float build: a float build added to one of them would be skipped, not
+    /// taken, and this is where that shows.
+    #[test]
+    fn float_weights_skip_native_tiers() {
+        use infr_core::DType::{F16, F32};
+        for dt in [F16, F32] {
+            assert!(!native_dense_supported(dt), "{dt:?}");
+            assert!(crate::gemm::native_mrow_kernel_name(dt).is_none(), "{dt:?}");
+            assert!(
+                crate::gemm::native_mmv_mrow_kernel_name(dt).is_none(),
+                "{dt:?}"
+            );
+            assert!(
+                crate::gemm::native_gemm_warp_cm8_build_spv(dt).is_none(),
+                "{dt:?}"
+            );
+            assert!(
+                i8cm_kq_choice(dt, 512, 4096, 4096, 0, 96, 2).is_none(),
+                "{dt:?}"
+            );
+            assert!(crate::linear::dense_stream_supported(dt), "{dt:?}");
+        }
+    }
+
+    /// The int8 coopmat K-quant tile: the large tile once its own grid fills the device, the
+    /// medium one below that, and nothing for a dtype, k, weight offset or width off every tile
+    /// or a grid a 1-D workgroup id cannot reach.
+    #[test]
+    fn i8cm_kq_choice_picks_by_fill_and_shape() {
+        use crate::gemm::I8cmTile::{L, M};
+        use infr_core::DType::{Q4K, Q5K, Q6K, Q8_0};
+        const CU: u32 = 96;
+        // The large tile's fill per CU, as the 7900 XTX resolves it.
+        let l = crate::tuning::tests::fixture_tuning("rx7900xtx-amdwin").i8cm_kq_l_fill_per_cu;
+        // Qwen3-1.7B at pp512: the fused gate/up fills the device with the large tile; the
+        // 2048-wide projections and the narrow K/V ones do not.
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 12288, 0, CU, l), Some(L));
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 0, CU, l), Some(M));
+        assert_eq!(i8cm_kq_choice(Q6K, 512, 6144, 2048, 0, CU, l), Some(M));
+        assert_eq!(i8cm_kq_choice(Q5K, 512, 2048, 1024, 0, CU, l), Some(M));
+        // The threshold scales with the device.
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 0, 32, l), Some(L));
+        // A width the large tile cannot cover takes the medium one even when it would fill.
+        assert_eq!(i8cm_kq_choice(Q4K, 4096, 2048, 64 * 401, 0, CU, l), Some(M));
+        assert_eq!(i8cm_kq_choice(Q8_0, 512, 2048, 2048, 0, CU, l), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2080, 2048, 0, CU, l), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2048, 128, CU, l), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 512, 2048, 2016, 0, CU, l), None);
+        assert_eq!(i8cm_kq_choice(Q4K, 8192, 2048, 151_936, 0, CU, l), None);
+    }
+
+    /// The dp4a K-quant GEMM takes a K-quant Linear past one half token tile whose k, weight
+    /// offset and width fit its tile and whose grid a 1-D workgroup id reaches; everything else
+    /// keeps the per-dtype mmq tile, as does every shape with the switch off.
+    #[test]
+    fn dp4a_kq_ok_gates_dtype_shape_and_rows() {
+        use infr_core::DType::{Q4K, Q5K, Q6K, Q8_0};
+        let vk = infr_core::config::VulkanCfg::default();
+        assert!(dp4a_kq_ok(&vk, Q4K, 128, 2048, 12288, 0));
+        assert!(dp4a_kq_ok(&vk, Q5K, 512, 2048, 1024, 0));
+        assert!(dp4a_kq_ok(&vk, Q6K, 128, 6144, 2048, 0));
+        assert!(dp4a_kq_ok(&vk, Q4K, DP4A_KQ_MIN_ROWS + 1, 2048, 2048, 0));
+        assert!(!dp4a_kq_ok(&vk, Q4K, DP4A_KQ_MIN_ROWS, 2048, 2048, 0));
+        assert!(!dp4a_kq_ok(&vk, Q8_0, 128, 2048, 2048, 0));
+        assert!(!dp4a_kq_ok(&vk, Q4K, 128, 2080, 2048, 0));
+        assert!(!dp4a_kq_ok(&vk, Q4K, 128, 2048, 2048, 128));
+        assert!(!dp4a_kq_ok(&vk, Q4K, 128, 2048, 2016, 0));
+        assert!(!dp4a_kq_ok(&vk, Q4K, 128 * 1024, 2048, 151_936, 0));
+        let off = infr_core::config::VulkanCfg {
+            dp4a_kq: false,
+            ..vk
+        };
+        assert!(!dp4a_kq_ok(&off, Q4K, 128, 2048, 12288, 0));
+    }
+
+    /// [`split_k_window`] for `cu` compute units at the defaults, with the CU scaling on (`true`,
+    /// as the `amd-proprietary-split-k` row sets it) or off (every other driver).
+    fn window(cu: u32, scale: bool) -> usize {
+        let mut t = crate::tuning::tests::fixture_tuning("unknown");
+        t.split_k_scale_by_cu = scale;
+        split_k_window(&t, cu)
+    }
+
+    /// With the compute-unit count known, the window scales with it: on a 96-CU part the
+    /// 128-wg pp512 projections the fixed window left on the plain tile now split, and a filled
+    /// grid still does not.
+    #[test]
+    fn split_k_plan_scales_with_compute_units() {
+        // (m, in_f, out_f) → splits on 96 CUs: Qwen3-30B-A3B attn_output, SmolLM3 ffn_down,
+        // ERNIE-4.5 shared-expert up (192 wgs), and a filled 384-wg grid.
+        assert_eq!(split_k_plan(512, 4096, 2048, window(96, true)), 8);
+        assert_eq!(split_k_plan(512, 11008, 2048, window(96, true)), 8);
+        assert_eq!(split_k_plan(512, 2560, 3072, window(96, true)), 4);
+        assert_eq!(split_k_plan(512, 2048, 6144, window(96, true)), 1);
+        // The fixed window leaves the 128-wg shape whole.
+        assert_eq!(split_k_plan(512, 4096, 2048, window(0, true)), 1);
+    }
+
+    /// A small or unknown CU count never narrows the window below the fixed one: every shape
+    /// splits exactly as the fixed window splits it (the 2-CU iGPU and the unknown-count case
+    /// behave as before the count was used).
+    #[test]
+    fn split_k_plan_small_or_unknown_cu_is_the_fixed_window() {
+        for cu in [0u32, 1, 2, 16, 31, 32] {
+            for &m in &[1usize, 16, 64, 256, 512, 1024] {
+                for &(in_f, out_f) in &[(4096usize, 2048usize), (2048, 512), (262144, 2816)] {
+                    assert_eq!(
+                        split_k_plan(m, in_f, out_f, window(cu, true)),
+                        split_k_plan(m, in_f, out_f, window(0, true)),
+                        "cu={cu} m={m} in_f={in_f} out_f={out_f}"
+                    );
+                }
+            }
+        }
+        // The DiffusionGemma soft-embedding shape (m=256, k=262144, n=2816 → 88 wgs) keeps its
+        // split on 2 CUs — a narrower window would drop it to the slow `matmul_proj` tile.
+        assert_eq!(split_k_plan(256, 262144, 2816, window(2, true)), 2);
+    }
+
+    /// Only the measured driver gets the scaled window: with `split_k.scale_by_cu` off (every
+    /// driver but the AMD proprietary one) the CU count is ignored, and the two local devices
+    /// resolve the scaling exactly as the old driver rule did.
+    #[test]
+    fn split_k_scaling_is_limited_to_the_measured_driver() {
+        assert_eq!(window(96, true), 384);
+        assert_eq!(window(96, false), 128);
+        assert_eq!(
+            split_k_plan(512, 4096, 2048, window(96, false)),
+            1,
+            "an unmeasured driver must keep the fixed window"
+        );
+        for (fixture, scaled) in [
+            ("rx7900xtx-amdwin", true),
+            ("raphael-igpu-amdwin", true),
+            ("rx7900xtx-radv", false),
+            ("nvidia-rtx2080ti", false),
+            ("intel-arc-a770-anv", false),
+            ("unknown", false),
+        ] {
+            let t = crate::tuning::tests::fixture_tuning(fixture);
+            assert_eq!(t.split_k_scale_by_cu, scaled, "{fixture}");
+        }
+    }
+
     /// #6: the extracted `split_k_plan` must reproduce the copy-pasted narrow-grid/splits formula
-    /// exactly (it fed the resident native-quant arm, the F16 split-K arm, and the streamed twin).
+    /// exactly (it fed the resident native-quant arm, the F16 split-K arm, and the streamed route)
+    /// when the compute-unit count is unknown.
     #[test]
     fn split_k_plan_matches_inline_formula() {
         let inline = |m: usize, in_f: usize, out_f: usize| -> usize {
@@ -7008,7 +8433,7 @@ mod tests {
             for &in_f in &[256usize, 512, 1024, 2048, 4096, 6144, 262144] {
                 for &out_f in &[128usize, 256, 512, 1024, 1152, 2048, 2816, 4096, 6144, 8192] {
                     assert_eq!(
-                        split_k_plan(m, in_f, out_f),
+                        split_k_plan(m, in_f, out_f, window(0, true)),
                         inline(m, in_f, out_f),
                         "split_k_plan mismatch at m={m} in_f={in_f} out_f={out_f}"
                     );
@@ -7055,21 +8480,21 @@ mod tests {
     #[test]
     fn tier_knob_defaults_and_clamps() {
         let d = infr_core::config::Config::default();
-        // `INFR_MOE_SMALL_M`: measured crossover 8, hard ceiling 64 (past it a prefill chunk
-        // becomes one multi-second dispatch and trips the amdgpu watchdog).
-        assert_eq!(MOE_SMALL_M.env, "INFR_MOE_SMALL_M");
-        assert_eq!(MOE_SMALL_M.default, 8);
-        assert_eq!(d.kernels.vulkan.moe_small_m, MOE_SMALL_M.default);
-        assert_eq!((MOE_SMALL_M.min, MOE_SMALL_M.max), (0, 64));
-        // A config value past the ceiling is clamped at the read site, exactly as the env override
-        // always was — `INFR_MOE_SMALL_M=100000` must not reach a dispatch.
-        assert_eq!(MOE_SMALL_M.clamped(100_000), 64);
-        // `INFR_CANVAS_CHUNK_N`: a divisor, so it floors at 1 rather than capping.
-        assert_eq!(CANVAS_CHUNK_N.env, "INFR_CANVAS_CHUNK_N");
-        assert_eq!(CANVAS_CHUNK_N.default, 3);
-        assert_eq!(d.kernels.vulkan.canvas_chunk_n, CANVAS_CHUNK_N.default);
-        assert_eq!(CANVAS_CHUNK_N.min, 1);
-        assert_eq!(CANVAS_CHUNK_N.clamped(0), 1);
+        // `moe.small_m` (alias `INFR_MOE_SMALL_M`): measured crossover 8, hard ceiling 64 (past
+        // it a prefill chunk becomes one multi-second dispatch and trips the amdgpu watchdog).
+        // `attn_canvas.chunks` (alias `INFR_CANVAS_CHUNK_N`): a divisor, so it floors at 1. The
+        // aliases' clamps are `tuning::tests::every_alias_writes_the_old_value`'s.
+        let t = crate::tuning::tests::fixture_tuning("unknown");
+        assert_eq!((t.moe_small_m, d.kernels.vulkan.moe_small_m), (8, 8));
+        assert_eq!((t.canvas_chunks, d.kernels.vulkan.canvas_chunk_n), (3, 3));
+        let range = |key: &str| {
+            crate::tuning::families::find(key)
+                .expect("a parameter")
+                .ty
+                .describe()
+        };
+        assert_eq!(range("moe.small_m"), "0..=64");
+        assert_eq!(range("attn_canvas.chunks"), "1..=max");
         // The fusion hatch is a POSITIVE field: fused by default, `INFR_NO_FUSE_ADD` clears it.
         assert!(d.kernels.vulkan.fuse_add);
         // The split-K policy the attention lowering is configured with.
@@ -7186,15 +8611,52 @@ mod tests {
         DType::Iq4Nl,
     ];
 
+    /// `mmv_mw_choice` reads WARPS with `?`: a format in the int8 decode set without a
+    /// `mmv_mw.warps` qualifier would silently drop off the tier. Every format any setting of the
+    /// tri-state can put on the decode set must have one.
+    #[test]
+    fn mmv_mw_dtypes_have_a_warps_qualifier() {
+        let caps = infr_core::backend::Capabilities::default();
+        let t = crate::tuning::tests::fixture_tuning("unknown");
+        for mmv_mw in [None, Some(true), Some(false)] {
+            let vk = infr_core::config::VulkanCfg {
+                mmv_mw,
+                ..Default::default()
+            };
+            for &dt in mmv_int8_decode_dtypes(&caps, &vk) {
+                assert!(
+                    t.mmv_mw_warps(dt).is_some(),
+                    "{dt:?} is on the int8 decode set but has no `mmv_mw.warps` qualifier"
+                );
+            }
+        }
+    }
+
     #[test]
     fn int8_decode_and_mrow_tiers_agree_on_policy_dtypes() {
+        // The two vendors differ where the hardware does: wave64 RDNA3 against SIMD8/16 Arc, whose
+        // preferred decode subgroup is 16. Identical literals would make every "intel" assertion
+        // below a repeat of the "amd" one; distinct ones are what show the policy really is
+        // unified rather than keyed, somewhere, off the subgroup.
         let amd = infr_core::backend::Capabilities {
             i8_dot: true,
+            subgroup_min: 32,
+            subgroup_max: 64,
+            sg_pref: 64,
             ..Default::default()
         };
         let intel = infr_core::backend::Capabilities {
             i8_dot: true,
+            subgroup_min: 8,
+            subgroup_max: 32,
+            sg_pref: 16,
+            integrated: true,
             ..Default::default()
+        };
+        // A device without packed int8 dot: the one capability the mmv_mw tier does key off.
+        let no_dp4a = infr_core::backend::Capabilities {
+            i8_dot: false,
+            ..intel.clone()
         };
         // `kernels.vulkan.mmv_mw`, the tri-state: `None` = unset (the shipping default),
         // `Some(true)` = `INFR_MMV_MW=1` (any non-"0" value), `Some(false)` = `INFR_MMV_MW=0`.
@@ -7291,6 +8753,36 @@ mod tests {
         // Intel now takes the same unified rows=1 path (unconditional, part of the
         // capability-first architecture).
         assert!(unified_mmv_row1(&intel));
+        // The int8 mmv_mw tier itself, at a projection-sized GEMV: both vendors are offered the
+        // same build for every decode dtype, and the device without dp4a is offered none — the
+        // f32 path — even though the dtype is on the decode list.
+        let (in_f, out_f) = (4096, 4096);
+        // The per-dtype WARPS default is the same tuning parameter on every vendor.
+        let tuned = crate::tuning::tests::fixture_tuning("unknown");
+        let mut offered = 0;
+        for dt in POLICY_DTYPES {
+            let pick = mmv_mw_choice(&amd, &vk, &tuned, dt, in_f, out_f, false);
+            assert_eq!(
+                pick,
+                mmv_mw_choice(&intel, &vk, &tuned, dt, in_f, out_f, false),
+                "{dt:?}: the mmv_mw tier differs by vendor"
+            );
+            assert_eq!(
+                mmv_mw_choice(&no_dp4a, &vk, &tuned, dt, in_f, out_f, false),
+                None,
+                "{dt:?}: an int8 GEMV offered to a device without packed int8 dot"
+            );
+            offered += usize::from(pick.is_some());
+        }
+        assert!(
+            offered > 0,
+            "no dtype reached the int8 tier — the comparison above proved nothing"
+        );
+        // Q4_K takes its single-subgroup shape on both vendors.
+        assert_eq!(
+            mmv_mw_choice(&intel, &vk, &tuned, DType::Q4K, in_f, out_f, false),
+            Some(1)
+        );
     }
 
     /// The drift guard the SSOT lists promise (`infr_core::tensor::MOE_MMQ_DTYPES`'s doc): every
@@ -7521,6 +9013,86 @@ mod tests {
                 want[o]
             );
         }
+    }
+
+    /// Prefill GEMMs whose `in_f` is a multiple of 32 but not of 64 must match a host reference.
+    /// The narrow warptiles stage k in 64-wide steps with no tail guard, so on such a width the
+    /// last step folds the next row's first 32 elements into every dot. Each shape reaches one of
+    /// the routes that picked such a tile: the A_GLOBAL tile (Q8_0), split-K (`in_f >= 1024`,
+    /// Q8_0 and the F16 arm), and `matmul_native_off`'s narrow pick (Q5_0, BF16 — no A_GLOBAL
+    /// build).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn linear_gemm_k_odd_32_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        if !crate::test_has_f16_coopmat(&be_, "linear_gemm_k_odd_32_matches_host") {
+            return;
+        }
+        let (m, out_f) = (64usize, 128usize);
+        let mut bad = Vec::new();
+        for (dt, in_f) in [
+            (DType::Q8_0, 480usize),
+            (DType::Q8_0, 1056),
+            (DType::Q5_0, 480),
+            (DType::Bf16, 480),
+            (DType::F16, 1056),
+        ] {
+            let (blk_elems, blk_bytes) = infr_gguf::block_layout(dt);
+            // 0x00..=0x3F keeps every f16/bf16 scale or value finite and small.
+            let wb: Vec<u8> = (0..out_f * in_f / blk_elems * blk_bytes)
+                .map(|i| ((i.wrapping_mul(2654435761) >> 7) % 0x40) as u8)
+                .collect();
+            let x: Vec<f32> = (0..m * in_f)
+                .map(|i| ((i % 97) as f32 - 48.0) * 0.021)
+                .collect();
+            let want = infr_testkit::ref_linear(
+                &x,
+                &infr_testkit::dequant_oracle(dt, &wb),
+                m,
+                in_f,
+                out_f,
+            );
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![m, in_f], DType::F32));
+            let wi = g.weight(TensorDesc::new(vec![out_f, in_f], dt));
+            let yi = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+            g.push(Op::Linear {
+                x: xi,
+                weight: wi,
+                dst: yi,
+                m: m as u32,
+                in_f: in_f as u32,
+                out_f: out_f as u32,
+                w_off: 0,
+            });
+            let got = infr_testkit::run_graph(
+                &be_,
+                &g,
+                &[(xi, infr_testkit::f32_bytes(&x)), (wi, wb)],
+                yi,
+                m * out_f,
+            );
+            // Worst deviation against the reference RMS: f16 operands land near 1e-3, a folded
+            // 32-element tail near 1.
+            let rms =
+                (want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
+            let worst = got.iter().zip(&want).fold(0f64, |a, (g, w)| {
+                infr_testkit::nan_max64(a, (*g as f64 - *w as f64).abs())
+            });
+            println!(
+                "{dt:?} m={m} in_f={in_f} out_f={out_f}: {:.2e} of the output RMS",
+                worst / rms
+            );
+            if worst / rms >= 1e-2 {
+                bad.push(format!("{dt:?} in_f={in_f}"));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "GEMMs diverge from the host reference: {bad:?}"
+        );
     }
 
     /// A one-op `GatedAct` (SwiGLU: silu(gate)·up) graph through the seam must match a host loop.
@@ -7776,6 +9348,12 @@ mod tests {
         }
     }
 
+    /// Absolute tolerance for the f16-input `Attention` graphs against their host oracles. Both
+    /// sides read the SAME f16-rounded q/k/v and accumulate in f32, so only reassociation separates
+    /// them. A bound near the outputs' own magnitude passes a halved score scale or a dropped
+    /// causal key; this one fails both on every case these tests run.
+    const ATTN_VS_HOST_TOL: f32 = 1e-4;
+
     /// A one-op `Attention` graph (GQA, causal, f16 q + f16 KV) must match a host softmax-attention.
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
@@ -7849,6 +9427,7 @@ mod tests {
             pos: pos as u32,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
         let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();
@@ -7869,7 +9448,7 @@ mod tests {
             .unwrap();
         for i in 0..nh * hd {
             assert!(
-                (got[i] - want[i]).abs() < 2e-2,
+                (got[i] - want[i]).abs() < ATTN_VS_HOST_TOL,
                 "attention mismatch at {i}: got {} want {}",
                 got[i],
                 want[i]
@@ -8252,6 +9831,7 @@ mod tests {
     /// bound (row r attends keys 0..=pos+r), full-causal and sliding-window. rows=17 also covers
     /// the 9..63 band; kv_len=300 > chunk (=64) forces the split route, not the scalar fallback.
     #[test]
+    #[ignore = "requires a Vulkan GPU"]
     fn attention_small_m_split_matches_host() {
         let Ok(be_) = VulkanBackend::new() else {
             return; // no GPU — self-skip
@@ -8352,6 +9932,7 @@ mod tests {
                 pos: pos as u32,
                 sinks: None,
                 key_bias: None,
+                comp: None,
             });
             let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
             let kb = be_.alloc(kf.len(), BufferUsage::Activations).unwrap();
@@ -8374,9 +9955,266 @@ mod tests {
                 .unwrap();
             for i in 0..rows * nh * hd {
                 assert!(
-                    (got[i] - want[i]).abs() < 2e-2,
+                    (got[i] - want[i]).abs() < ATTN_VS_HOST_TOL,
                     "small-m attention mismatch rows={rows} window={window} at {i} \
                      (row {} head {}): got {} want {}",
+                    i / (nh * hd),
+                    (i / hd) % nh,
+                    got[i],
+                    want[i]
+                );
+            }
+        }
+    }
+
+    /// DiffusionGemma canvas attention (`AttnMask::Canvas`, every row attends `[lo, kv_len)`) at a
+    /// `kv_len` whose old `kv_len / CANVAS_CHUNK_N` chunk passed the partial kernel's score array,
+    /// against the host reference.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_canvas_long_span_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        let (nh, nkv, hd, rows) = (2usize, 1usize, 64usize, 4usize);
+        let kv_len = ATTN_PARTIAL_MAX_CHUNK * be_.tuning().canvas_chunks + 128;
+        let lo = 40usize;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let to_f16 = |v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect()
+        };
+        let deq = |b: &[u8]| -> Vec<f32> {
+            b.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| half::f16::from_le_bytes(c).to_f32())
+                .collect()
+        };
+        let q: Vec<f32> = (0..rows * nh * hd)
+            .map(|i| (i as f32 * 0.03).sin())
+            .collect();
+        let k: Vec<f32> = (0..kv_len * nkv * hd)
+            .map(|i| (i as f32 * 0.011).cos())
+            .collect();
+        let v: Vec<f32> = (0..kv_len * nkv * hd)
+            .map(|i| ((i % 173) as f32) * 0.011 - 0.9)
+            .collect();
+        let (qf, kf, vf) = (to_f16(&q), to_f16(&k), to_f16(&v));
+        let (qd, kd, vd) = (deq(&qf), deq(&kf), deq(&vf));
+        let group = nh / nkv;
+        let mut want = vec![0f32; rows * nh * hd];
+        for r0 in 0..rows {
+            for h in 0..nh {
+                let kvh = h / group;
+                let sc: Vec<f32> = (lo..kv_len)
+                    .map(|j| {
+                        (0..hd)
+                            .map(|x| qd[(r0 * nh + h) * hd + x] * kd[(j * nkv + kvh) * hd + x])
+                            .sum::<f32>()
+                            * scale
+                    })
+                    .collect();
+                let mx = sc.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let l: f32 = sc.iter().map(|s| (s - mx).exp()).sum();
+                for (jj, &s) in sc.iter().enumerate() {
+                    let p = (s - mx).exp() / l;
+                    for x in 0..hd {
+                        want[(r0 * nh + h) * hd + x] += p * vd[((lo + jj) * nkv + kvh) * hd + x];
+                    }
+                }
+            }
+        }
+        let mut g = Graph::new();
+        let qi = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F16));
+        let ki = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+        let vi = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+        let yi = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        g.push(Op::Attention {
+            q: qi,
+            k_cache: ki,
+            v_cache: vi,
+            dst: yi,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale,
+            mask: AttnMask::Canvas { lo },
+            pos: (kv_len - rows) as u32,
+            sinks: None,
+            key_bias: None,
+            comp: None,
+        });
+        let up = |b: &[u8]| {
+            let buf = be_.alloc(b.len(), BufferUsage::Activations).unwrap();
+            be_.upload(buf.as_ref(), b).unwrap();
+            buf
+        };
+        let (qb, kb, vb) = (up(&qf), up(&kf), up(&vf));
+        let yb = be_
+            .alloc(rows * nh * hd * 4, BufferUsage::Activations)
+            .unwrap();
+        let plan = be_.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(qi, qb.as_ref());
+        bind.bind(ki, kb.as_ref());
+        bind.bind(vi, vb.as_ref());
+        bind.bind(yi, yb.as_ref());
+        be_.execute(plan.as_ref(), &bind).unwrap();
+        let mut got = vec![0f32; rows * nh * hd];
+        be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        for i in 0..rows * nh * hd {
+            assert!(
+                (got[i] - want[i]).abs() < ATTN_VS_HOST_TOL,
+                "canvas attention kv_len={kv_len} at {i}: got {} want {}",
+                got[i],
+                want[i]
+            );
+        }
+    }
+
+    /// Prefill attention over a planar Q8_0 KV cache runs on the dequantised f16 scratch, and the
+    /// coopmat tiers read it in whole K/V tiles past `kv_len` (hd=128 takes the flash tier, hd=64
+    /// the non-FA tier). With `kv_len` off every tile boundary, a scratch sized to `kv_len` alone
+    /// is read past its end; the recorder's debug assertions on the K/V extent are what fail
+    /// here. A scratch that covers the tiles but leaves the pad unwritten fails on the output: a
+    /// debug build fills `alloc_uninit` buffers with NaN, and a NaN V row times its zero softmax
+    /// weight is NaN. Both checks need a debug build: in release the out-of-bounds read returns
+    /// whatever the device gives, so the output comparison alone cannot be relied on.
+    #[test]
+    #[ignore = "requires a Vulkan GPU with cooperative matrix"]
+    fn attention_q8_kv_prefill_off_tile_matches_host() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        if !crate::test_has_f16_coopmat(&be_, "attention_q8_kv_prefill_off_tile_matches_host") {
+            return;
+        }
+        let (rows, kv_len, nh, nkv) = (64usize, 300usize, 4usize, 2usize);
+        // Room for the non-FA tier's 256-row padded read, so its gate (and flash's) holds.
+        let cap_rows = kv_len.div_ceil(256) * 256;
+        let pos = kv_len - rows;
+        let group = nh / nkv;
+        for hd in [128usize, 64] {
+            let scale = 1.0 / (hd as f32).sqrt();
+            let q: Vec<f32> = (0..rows * nh * hd)
+                .map(|i| half::f16::from_f32((i as f32 * 0.03).sin()).to_f32())
+                .collect();
+            let qf: Vec<u8> = q
+                .iter()
+                .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+                .collect();
+            // Rows past kv_len stay zero, like a freshly allocated cache.
+            let mut k = vec![0f32; cap_rows * nkv * hd];
+            let mut v = vec![0f32; cap_rows * nkv * hd];
+            for i in 0..kv_len * nkv * hd {
+                k[i] = (i as f32 * 0.011).cos();
+                v[i] = ((i % 173) as f32) * 0.011 - 0.9;
+            }
+            // Planar Q8_0 (store_q8.comp): int8 codes for all `cap` elements, then one f16 scale
+            // per 32-element block.
+            let planar = |x: &[f32]| -> (Vec<u8>, Vec<f32>) {
+                let blocks = q8_0(x);
+                let cap = x.len();
+                let mut out = vec![0u8; cap + cap / 32 * 2];
+                for (b, blk) in blocks.chunks(34).enumerate() {
+                    out[cap + b * 2..cap + b * 2 + 2].copy_from_slice(&blk[..2]);
+                    out[b * 32..b * 32 + 32].copy_from_slice(&blk[2..]);
+                }
+                (out, deq_q8(&blocks))
+            };
+            let (kq, kd) = planar(&k);
+            let (vq, vd) = planar(&v);
+            let mut want = vec![0f32; rows * nh * hd];
+            for r0 in 0..rows {
+                let end = pos + r0 + 1;
+                for h in 0..nh {
+                    let kvh = h / group;
+                    let sc: Vec<f32> = (0..end)
+                        .map(|j| {
+                            (0..hd)
+                                .map(|x| q[(r0 * nh + h) * hd + x] * kd[(j * nkv + kvh) * hd + x])
+                                .sum::<f32>()
+                                * scale
+                        })
+                        .collect();
+                    let mx = sc.iter().fold(f32::NEG_INFINITY, |m, &s| m.max(s));
+                    let l: f32 = sc.iter().map(|s| (s - mx).exp()).sum();
+                    for (j, &s) in sc.iter().enumerate() {
+                        let p = (s - mx).exp() / l;
+                        for x in 0..hd {
+                            want[(r0 * nh + h) * hd + x] += p * vd[(j * nkv + kvh) * hd + x];
+                        }
+                    }
+                }
+            }
+            // The coopmat tiers need row-padded (Internal) q and dst, so route through copies.
+            let n = rows * nh * hd;
+            let mut g = Graph::new();
+            let qin = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F16));
+            let qi = g.internal(TensorDesc::new(vec![rows, nh, hd], DType::F16));
+            let ki = g.input(TensorDesc::new(vec![cap_rows, nkv, hd], DType::Q8_0));
+            let vi = g.input(TensorDesc::new(vec![cap_rows, nkv, hd], DType::Q8_0));
+            let di = g.internal(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+            let yi = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+            g.push(Op::Copy {
+                src: qin,
+                src_off: 0,
+                dst: qi,
+                dst_off: 0,
+                n: n as u32,
+            });
+            g.push(Op::Attention {
+                q: qi,
+                k_cache: ki,
+                v_cache: vi,
+                dst: di,
+                rows: rows as u32,
+                kv_len: kv_len as u32,
+                n_head: nh as u32,
+                n_kv: nkv as u32,
+                head_dim: hd as u32,
+                scale,
+                mask: AttnMask::Causal,
+                pos: pos as u32,
+                sinks: None,
+                key_bias: None,
+                comp: None,
+            });
+            g.push(Op::Copy {
+                src: di,
+                src_off: 0,
+                dst: yi,
+                dst_off: 0,
+                n: n as u32,
+            });
+            let qb = be_.alloc(qf.len(), BufferUsage::Activations).unwrap();
+            let kb = be_.alloc(kq.len(), BufferUsage::KvCache).unwrap();
+            let vb = be_.alloc(vq.len(), BufferUsage::KvCache).unwrap();
+            let yb = be_.alloc(n * 4, BufferUsage::Activations).unwrap();
+            be_.upload(qb.as_ref(), &qf).unwrap();
+            be_.upload(kb.as_ref(), &kq).unwrap();
+            be_.upload(vb.as_ref(), &vq).unwrap();
+            let plan = be_.compile(&g).unwrap();
+            let mut bind = Bindings::new();
+            bind.bind(qin, qb.as_ref());
+            bind.bind(ki, kb.as_ref());
+            bind.bind(vi, vb.as_ref());
+            bind.bind(yi, yb.as_ref());
+            be_.execute(plan.as_ref(), &bind).unwrap();
+            let mut got = vec![0f32; n];
+            be_.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+                .unwrap();
+            for i in 0..n {
+                assert!(
+                    (got[i] - want[i]).abs() < 5e-3,
+                    "q8 KV prefill attention hd={hd} mismatch at {i} (row {} head {}): got {} \
+                     want {}",
                     i / (nh * hd),
                     (i / hd) % nh,
                     got[i],
@@ -8649,7 +10487,85 @@ mod tests {
                     want[i]
                 );
             }
+            // Every execute lowers the MoeFfn again, binding a placeholder in the absent
+            // `exp_probs_b` slot. The weight arena never rewinds, so a placeholder taken from it
+            // would grow it on every pass.
+            let arena_bytes = || -> u64 {
+                be_.bda_weight_arena
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map_or(0, |a| a.blocks.iter().map(|b| b.cursor).sum())
+            };
+            let before = arena_bytes();
+            for _ in 0..3 {
+                be_.execute(plan.as_ref(), &bind).unwrap();
+            }
+            assert_eq!(
+                arena_bytes(),
+                before,
+                "re-executing a MoeFfn plan grew the weight arena (rows={rows})"
+            );
         }
+    }
+
+    /// A staged expert miss records its ring→arena copy into the ambient segment. When a later
+    /// failure discards that segment, the copy never runs, so the expert must be a miss again on
+    /// the next staging — a hit would serve the slot's previous contents as its weights. Ring
+    /// bytes consumed are the observable: a miss stages a full slot, a hit stages nothing.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn discarded_segment_forgets_staged_expert() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (slot_bytes, n_expert, buf_id) = (256usize, 2usize, 1usize);
+        be_.init_moe_pager(crate::pager::MoePagerLayout {
+            n_blocks: n_expert,
+            pools: vec![crate::pager::MoePoolSpec {
+                role: crate::pager::Role::Gate,
+                slot_bytes,
+                n_slots: 1,
+                host: None,
+            }],
+            ring_bytes: 0,
+        })
+        .unwrap();
+        let bank: Vec<u8> = (0..n_expert * slot_bytes).map(|i| i as u8).collect();
+        be_.register_paged_expert(
+            crate::pager::Role::Gate,
+            buf_id,
+            crate::pager::ExpertSource {
+                bytes: crate::pager::ExpertBytes::Mmap(std::sync::Arc::new(bank)),
+                stride_bytes: slot_bytes,
+                layer_base: 0,
+            },
+            n_expert,
+        )
+        .unwrap();
+        // Ring bytes `stage_role` consumes staging expert 0 into `rec`.
+        let stage = |rec: &Recorder<'_>| -> usize {
+            let mut guard = be_.moe_pager().lock().unwrap();
+            let sess = guard.as_mut().unwrap();
+            sess.begin_batch(buf_id).unwrap();
+            let mut cursor = 0usize;
+            assert_eq!(
+                sess.stage_role(rec, 0, &mut cursor, buf_id, &[0], false)
+                    .unwrap(),
+                1
+            );
+            cursor
+        };
+        let rec = be_.recorder().unwrap();
+        assert_eq!(stage(&rec), slot_bytes, "first staging must be a miss");
+        discard_segment(&be_, rec).unwrap();
+        let rec = be_.recorder().unwrap();
+        assert_eq!(
+            stage(&rec),
+            slot_bytes,
+            "expert staged into a discarded segment was still treated as resident"
+        );
+        rec.finish().unwrap();
     }
 
     /// Expert parallelism (`crate::ep::ExpertParallelBackend`): a 2-device EXPERT split of the SAME
@@ -8721,7 +10637,7 @@ mod tests {
                         b
                     })
                     .collect();
-                crate::ep::EpBuffer::wrap(bufs)
+                crate::ep::EpBuffer::shard(bufs)
             };
             // Replicate a buffer (same bytes on every rank) through the EP backend's alloc.
             let repl = |bytes: &[u8], usage| {
@@ -8871,6 +10787,177 @@ mod tests {
             devs[0].name, devs[1].name,
             "the two devices must be distinct physical GPUs"
         );
+    }
+
+    /// The dual dense ∥ MoE FFN's shape (gemma4 MoE): a dense branch written BEFORE the MoeFfn and
+    /// summed with its output AFTER it. Expert parallelism cuts the graph right after each MoeFfn
+    /// and runs each side as its own plan, so the dense branch would read back as zero scratch on
+    /// the far side — a wrong sum with no error. A 1-device world reproduces the cut; the lowering
+    /// must refuse the graph by name rather than run it. A graph whose MoE output alone crosses the
+    /// cut still runs, and matches the plain single-device result.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn ep_refuses_scratch_live_across_the_moe_cut() {
+        let (ne, n_expert, n_used, nff, rows) = (32usize, 4usize, 2usize, 32usize, 2usize);
+        let f = |i: usize, s: f32| (i as f32 * s).sin() * 0.5;
+        let router: Vec<f32> = (0..n_expert * ne)
+            .map(|i| f(i, 0.037) + (i / ne) as f32 * 0.15)
+            .collect();
+        let bank = |s: f32| {
+            q8_0(
+                &(0..n_expert * nff * ne)
+                    .map(|i| f(i, s))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let (rq, gq, uq, dq) = (q8_0(&router), bank(0.017), bank(0.023), bank(0.029));
+        let x: Vec<f32> = (0..rows * ne).map(|i| f(i, 0.11) + 0.05).collect();
+        // y = moe(x) + (dense ? 2x : 0); `dense` adds the branch that crosses the cut as scratch.
+        let graph = |dense: bool| {
+            let mut g = Graph::new();
+            let xi = g.input(TensorDesc::new(vec![rows, ne], DType::F32));
+            let ri = g.weight(TensorDesc::new(vec![n_expert, ne], DType::Q8_0));
+            let gi = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+            let ui = g.weight(TensorDesc::new(vec![n_expert, nff, ne], DType::Q8_0));
+            let di = g.weight(TensorDesc::new(vec![n_expert, ne, nff], DType::Q8_0));
+            let d_out = g.internal(TensorDesc::new(vec![rows, ne], DType::F32));
+            let moe_out = g.internal(TensorDesc::new(vec![rows, ne], DType::F32));
+            let yi = g.output(TensorDesc::new(vec![rows, ne], DType::F32));
+            g.push(Op::Scale {
+                x: xi,
+                dst: d_out,
+                s: if dense { 2.0 } else { 0.0 },
+                n: (rows * ne) as u32,
+            });
+            g.push(Op::MoeFfn {
+                x: xi,
+                router_x: xi,
+                router: ri,
+                gate_exps: gi,
+                up_exps: ui,
+                down_exps: di,
+                down_scale: None,
+                fused_gate_up: false,
+                dst: moe_out,
+                ne: ne as u32,
+                n_expert: n_expert as u32,
+                n_used: n_used as u32,
+                n_ff_exp: nff as u32,
+                scale: 1.0,
+                act: Activation::Silu,
+                gating: infr_core::graph::MoeGating::Softmax,
+                norm_w: true,
+                weight_before: false,
+                ep_band: None,
+                exp_probs_b: None,
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+                swiglu_clamp: None,
+                expert_ids: None,
+            });
+            if dense {
+                g.push(Op::Add {
+                    a: d_out,
+                    b: moe_out,
+                    dst: yi,
+                    n: (rows * ne) as u32,
+                });
+            } else {
+                g.push(Op::Copy {
+                    src: moe_out,
+                    src_off: 0,
+                    dst: yi,
+                    dst_off: 0,
+                    n: (rows * ne) as u32,
+                });
+            }
+            (g, [xi, ri, gi, ui, di, yi])
+        };
+        // Run `g` on `be` with the same weights; the EP world shards the banks (one band here).
+        let run = |be: &dyn Backend,
+                   ep: Option<&crate::ep::ExpertParallelBackend>,
+                   g: &Graph,
+                   ids: [TensorId; 6]| {
+            let up = |bytes: &[u8], usage| {
+                let b = be.alloc(bytes.len(), usage).unwrap();
+                be.upload(b.as_ref(), bytes).unwrap();
+                b
+            };
+            let bank = |bytes: &[u8]| -> Box<dyn Buffer> {
+                if let Some(ep) = ep {
+                    let b = ep
+                        .rank(0)
+                        .alloc_uninit(bytes.len(), BufferUsage::Weights)
+                        .unwrap();
+                    ep.rank(0).upload(b.as_ref(), bytes).unwrap();
+                    crate::ep::EpBuffer::shard(vec![b])
+                } else {
+                    up(bytes, BufferUsage::Weights)
+                }
+            };
+            let bufs = [
+                up(bytemuck::cast_slice(&x), BufferUsage::Activations),
+                up(&rq, BufferUsage::Weights),
+                bank(&gq),
+                bank(&uq),
+                bank(&dq),
+                be.alloc(rows * ne * 4, BufferUsage::Activations).unwrap(),
+            ];
+            let plan = be.compile(g).unwrap();
+            let mut bind = Bindings::new();
+            for (t, b) in ids.iter().zip(&bufs) {
+                bind.bind(*t, b.as_ref());
+            }
+            be.execute(plan.as_ref(), &bind).map(|()| {
+                let mut y = vec![0f32; rows * ne];
+                be.download(bufs[5].as_ref(), bytemuck::cast_slice_mut(&mut y))
+                    .unwrap();
+                y
+            })
+        };
+        let Ok(single) = VulkanBackend::new() else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        let ep = crate::ep::ExpertParallelBackend::new(
+            vec![VulkanBackend::new().expect("vulkan")],
+            n_expert,
+            false,
+        )
+        .expect("1-device EP world");
+
+        let (g, ids) = graph(true);
+        match run(&ep, Some(&ep), &g, ids) {
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("INFR_EXPERT_PARALLEL: op 2 (Add) reads scratch tensor"),
+                    "{msg}"
+                );
+            }
+            Ok(got) => {
+                let want = run(&single, None, &g, ids).expect("single-device run");
+                let drift = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                panic!(
+                    "EP ran a graph whose dense branch crosses its MoE cut as scratch; max |EP - \
+                     single-device| = {drift}"
+                );
+            }
+        }
+
+        let (g, ids) = graph(false);
+        let got = run(&ep, Some(&ep), &g, ids).expect("only the MoE output crosses the cut");
+        let want = run(&single, None, &g, ids).expect("single-device run");
+        for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "EP world=1 vs single at {i}: {a} vs {b}"
+            );
+        }
     }
 
     /// diffusion-gemma's `MoeFfn` shape: a SEPARATE `router_x` (not `x`), a FUSED `gate_up_exps`
@@ -10722,5 +12809,814 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `attention_kv.comp` stages the query and owns its output dims through `ATTN_KV_MAX_HD`,
+    /// which the host bound of the same name must match.
+    #[test]
+    fn attention_kv_bound_matches_host() {
+        let src = include_str!("../shaders/attention_kv.comp");
+        assert_eq!(
+            glsl_define_u32(src, "ATTN_KV_MAX_HD") as usize,
+            ATTN_KV_MAX_HD,
+            "attention_kv.comp's head bound drifted from the host guard"
+        );
+        for sized in [
+            "shared float q_sh[ATTN_KV_MAX_HD];",
+            "#define ATTN_KV_ACC (ATTN_KV_MAX_HD / 64)",
+            "float acc[ATTN_KV_ACC];",
+            "layout(local_size_x = 64,",
+        ] {
+            assert!(
+                src.contains(sized),
+                "attention_kv.comp no longer has `{sized}`, which the bound relies on"
+            );
+        }
+    }
+
+    /// `qk_norm_rope.comp` and `qk_norm_rope_interleaved.comp` stage a head in a shared array the
+    /// host bound `QK_NORM_ROPE_MAX_HD` must match; see `mla_shader_bounds_match_host`.
+    #[test]
+    fn qk_norm_rope_bound_matches_host() {
+        for (name, src) in [
+            (
+                "qk_norm_rope.comp",
+                include_str!("../shaders/qk_norm_rope.comp"),
+            ),
+            (
+                "qk_norm_rope_interleaved.comp",
+                include_str!("../shaders/qk_norm_rope_interleaved.comp"),
+            ),
+        ] {
+            assert_eq!(
+                glsl_define_u32(src, "QK_NORM_ROPE_MAX_HD"),
+                QK_NORM_ROPE_MAX_HD,
+                "{name}'s xs[] capacity drifted from the host guard"
+            );
+            assert!(
+                src.contains("shared float xs[QK_NORM_ROPE_MAX_HD];"),
+                "{name}'s xs[] is no longer sized by QK_NORM_ROPE_MAX_HD"
+            );
+        }
+    }
+
+    /// Every DeltaNet kernel that holds a key head in shared memory sizes it by `DN_MAX_KD`, and
+    /// the chunked-split prep pass steps the head by `DN_PREP_KSTEP`; the host refusals in the
+    /// `Op::DeltaNet` arm are only as good as these two mirrors.
+    #[test]
+    fn deltanet_bounds_match_host() {
+        for (name, src, decl) in [
+            (
+                "deltanet.comp",
+                include_str!("../shaders/deltanet.comp"),
+                "shared float ss[DN_MAX_KD * COL_BLOCK];",
+            ),
+            (
+                "deltanet_strided.comp",
+                include_str!("../shaders/deltanet_strided.comp"),
+                "shared float ss[DN_MAX_KD * COL_BLOCK];",
+            ),
+            (
+                "deltanet_scan.comp",
+                include_str!("../shaders/deltanet_scan.comp"),
+                "shared float ss[DN_MAX_KD * COLS];",
+            ),
+            (
+                "deltanet_chunked.comp",
+                include_str!("../shaders/deltanet_chunked.comp"),
+                "shared float kn[C * DN_MAX_KD];",
+            ),
+            (
+                "deltanet_prep.comp",
+                include_str!("../shaders/deltanet_prep.comp"),
+                "shared float kn[C * DN_MAX_KD];",
+            ),
+        ] {
+            assert_eq!(
+                glsl_define_u32(src, "DN_MAX_KD") as usize,
+                DN_MAX_KD,
+                "{name}'s key-head capacity drifted from the host guard"
+            );
+            assert!(
+                src.contains(decl),
+                "{name}'s shared key-head buffer is no longer sized by DN_MAX_KD"
+            );
+        }
+        let prep = include_str!("../shaders/deltanet_prep.comp");
+        assert_eq!(
+            glsl_define_u32(prep, "DN_PREP_KSTEP") as usize,
+            DN_PREP_KSTEP,
+            "deltanet_prep.comp's coopmat K step drifted from the host guard"
+        );
+        assert!(
+            prep.contains("kf += DN_PREP_KSTEP"),
+            "deltanet_prep.comp no longer steps the key head by DN_PREP_KSTEP"
+        );
+    }
+
+    /// `sample_topk.comp` gathers candidates into `shared float gval[KMAX]`; the `Op::Sample` guard
+    /// admits up to `gemm::SAMPLE_KMAX`.
+    #[test]
+    fn sample_kmax_matches_host() {
+        let src = include_str!("../shaders/sample_topk.comp");
+        assert_eq!(
+            glsl_define_u32(src, "KMAX") as usize,
+            crate::gemm::SAMPLE_KMAX,
+            "sample_topk.comp's KMAX drifted from SAMPLE_KMAX"
+        );
+        assert!(
+            src.contains("shared float gval[KMAX];"),
+            "sample_topk.comp's gval[] is no longer sized by KMAX"
+        );
+    }
+
+    /// The resolved tuning set of the local integrated GPU (`true`) or the local discrete one.
+    fn tuned_for(integrated: bool) -> crate::tuning::Tuning {
+        crate::tuning::tests::fixture_tuning(if integrated {
+            "raphael-igpu-amdwin"
+        } else {
+            "rx7900xtx-amdwin"
+        })
+    }
+
+    /// [`crate::recorder::MmvO4`] on the local integrated GPU (`true`) or the discrete one.
+    fn o4_of(integrated: bool) -> crate::recorder::MmvO4 {
+        crate::recorder::MmvO4::of(&tuned_for(integrated))
+    }
+
+    /// The decode tier offers the int8 mrow kernel only when the EXACT build the recorder will
+    /// request exists: for every int8 decode dtype, layout knob and residual flag, on a discrete
+    /// and an integrated device, a `Some` from `mmv_mw_choice` must name a variant
+    /// `mmv_mrow_variant` can load. The residual builds exist only at `mmv_m4`, so with that knob
+    /// off a fused decode must be declined, not offered.
+    #[test]
+    fn mmv_choice_offers_only_built_variants() {
+        let mut declined_res = 0;
+        for integrated in [false, true] {
+            let caps = infr_core::backend::Capabilities {
+                i8_dot: true,
+                integrated,
+                ..Default::default()
+            };
+            for &dt in &POLICY_DTYPES {
+                for m4 in [false, true] {
+                    for o4 in [false, true] {
+                        for res in [false, true] {
+                            for in_f in [1024usize, 4096] {
+                                let vk = infr_core::config::VulkanCfg {
+                                    mmv_m4: m4,
+                                    mmv_o4: o4,
+                                    mmv_mw: Some(true),
+                                    ..Default::default()
+                                };
+                                let out_f = 4096;
+                                let t = tuned_for(integrated);
+                                let offered = mmv_mw_choice(&caps, &vk, &t, dt, in_f, out_f, res);
+                                let built = crate::recorder::mmv_mrow_variant(
+                                    &vk,
+                                    dt,
+                                    1,
+                                    in_f,
+                                    res,
+                                    crate::recorder::MmvO4::of(&t),
+                                )
+                                .is_some();
+                                if offered.is_some() {
+                                    assert!(
+                                        built,
+                                        "{dt:?} integrated={integrated} m4={m4} o4={o4} \
+                                         res={res} in_f={in_f}: offered a variant the recorder \
+                                         has no build for"
+                                    );
+                                } else if res && !m4 {
+                                    declined_res += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            declined_res > 0,
+            "no fused decode was declined under mmv_m4=false — the check above never ran"
+        );
+    }
+
+    /// An integrated GPU asks for the four-output (`o4`) int8 GEMV builds at every width, where a
+    /// discrete one asks for them only below 2048 wide; the m=2..16 tier gates on the plain build
+    /// alone and `linear_mmv_mrow_at` panics on a missing variant. So for every dtype with an int8
+    /// mrow build, every layout knob, width class and row tier an integrated device can reach, the
+    /// SPIR-V lookup must succeed; a fused-residual build must exist wherever the discrete device
+    /// at the same knobs has one; and the FUSE_QUANT table must cover every dtype it covers at all.
+    #[test]
+    fn integrated_mmv_selection_finds_every_build() {
+        use crate::recorder::{mmv_mrow_fuseq_variant, mmv_mrow_variant};
+        let mut o4_wide = 0;
+        let mut fuseq = 0;
+        for &dt in &POLICY_DTYPES {
+            assert!(
+                crate::gemm::native_mmv_mrow_kernel_name(dt).is_some(),
+                "{dt:?} is listed in POLICY_DTYPES but has no int8 mrow build"
+            );
+            for m4 in [false, true] {
+                for o4 in [false, true] {
+                    let vk = infr_core::config::VulkanCfg {
+                        mmv_m4: m4,
+                        mmv_o4: o4,
+                        ..Default::default()
+                    };
+                    // Below, at and above the width where a discrete GPU drops the `o4` build.
+                    for in_f in [1024usize, 2048, 4096] {
+                        for rows in 1..=16 {
+                            let Some((name, _, outs)) =
+                                mmv_mrow_variant(&vk, dt, rows, in_f, false, o4_of(true))
+                            else {
+                                panic!(
+                                    "{dt:?} m4={m4} o4={o4} in_f={in_f} rows={rows}: no int8 \
+                                     mrow build for an integrated device"
+                                );
+                            };
+                            if o4 && in_f >= 2048 && rows <= 8 {
+                                assert_eq!(outs, 4, "{name}: integrated took a two-output build");
+                                o4_wide += 1;
+                            }
+                        }
+                        let res_integrated =
+                            mmv_mrow_variant(&vk, dt, 1, in_f, true, o4_of(true)).is_some();
+                        let res_discrete =
+                            mmv_mrow_variant(&vk, dt, 1, in_f, true, o4_of(false)).is_some();
+                        assert_eq!(
+                            res_integrated, res_discrete,
+                            "{dt:?} m4={m4} o4={o4} in_f={in_f}: the fused-residual build \
+                             differs between an integrated and a discrete device"
+                        );
+                        for res in [false, true] {
+                            if crate::gemm::native_mmv_mrow_variant_fuseq_spv(dt, false, true, res)
+                                .is_some()
+                            {
+                                assert!(
+                                    mmv_mrow_fuseq_variant(&vk, dt, in_f, res, o4_of(true))
+                                        .is_some(),
+                                    "{dt:?} o4={o4} in_f={in_f} res={res}: no FUSE_QUANT build \
+                                     for an integrated device"
+                                );
+                                fuseq += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(o4_wide > 0, "no wide integrated lookup took the o4 build");
+        assert!(
+            fuseq > 0,
+            "no dtype has a FUSE_QUANT build — that check never ran"
+        );
+    }
+
+    /// Compile and execute `g` once over zero-filled buffers, one per bound (non-Internal) tensor,
+    /// `usage` naming any that need something other than Weights/Activations (KV caches, the
+    /// positions staging buffer). The refusal tests below only need `lower_op` to run.
+    fn run_zeroed(be_: &VulkanBackend, g: &Graph, usage: &[(TensorId, BufferUsage)]) -> Result<()> {
+        let mut bufs = Vec::new();
+        for (i, t) in g.tensors.iter().enumerate() {
+            let id = TensorId(i as u32);
+            let u = match (usage.iter().find(|(u, _)| *u == id), &t.kind) {
+                (_, TensorKind::Internal) => continue,
+                (Some((_, u)), _) => *u,
+                (None, TensorKind::Weight) => BufferUsage::Weights,
+                (None, _) => BufferUsage::Activations,
+            };
+            let d = g.desc(id);
+            let (blk_elems, blk_bytes) = infr_core::decode_spec::block_layout(d.dtype);
+            bufs.push((
+                id,
+                be_.alloc((d.numel() / blk_elems * blk_bytes).max(4), u)?,
+            ));
+        }
+        let mut bind = Bindings::new();
+        for (id, b) in &bufs {
+            bind.bind(*id, b.as_ref());
+        }
+        let plan = be_.compile(g)?;
+        be_.execute(plan.as_ref(), &bind)
+    }
+
+    /// Assert `res` is an error whose text contains `want`.
+    fn refused(res: Result<()>, want: &str) {
+        let e = res
+            .err()
+            .unwrap_or_else(|| panic!("expected a refusal naming `{want}`, but it ran"))
+            .to_string();
+        assert!(e.contains(want), "refused for another reason: {e}");
+    }
+
+    /// Without `shaderFloat16` an f16-weight decode `Linear→Add` must stay unfused: the fused GEMV
+    /// (`linear_res.comp`) does f16 arithmetic the device was not created with. The pair must still
+    /// match the host, and the fused kernel must never have been built.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn f16_linear_add_stays_unfused_without_shader_float16() {
+        let mut cfg = crate::test_config();
+        cfg.kernels.vulkan.f16 = false;
+        let Ok(be_) = VulkanBackend::new_with(std::sync::Arc::new(cfg)) else {
+            return; // no GPU — self-skip
+        };
+        assert!(!be_.caps().f16, "`f16 = false` must clear caps.f16");
+        let (in_f, out_f) = (64usize, 32usize);
+        let x: Vec<f32> = (0..in_f).map(|i| i as f32 * 0.05 - 1.6).collect();
+        let w: Vec<f32> = (0..out_f * in_f).map(|i| (i as f32 * 0.03).sin()).collect();
+        let res: Vec<f32> = (0..out_f).map(|i| i as f32 * 0.25 - 4.0).collect();
+        let wf16 = infr_testkit::f16_bytes(&w);
+        let proj = infr_testkit::ref_linear(
+            &x,
+            &infr_testkit::dequant_oracle(DType::F16, &wf16),
+            1,
+            in_f,
+            out_f,
+        );
+        let mut g = Graph::new();
+        let xi = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+        let wi = g.weight(TensorDesc::new(vec![out_f, in_f], DType::F16));
+        let ri = g.input(TensorDesc::new(vec![1, out_f], DType::F32));
+        let yi = g.internal(TensorDesc::new(vec![1, out_f], DType::F32));
+        let oi = g.output(TensorDesc::new(vec![1, out_f], DType::F32));
+        g.push(Op::Linear {
+            x: xi,
+            weight: wi,
+            dst: yi,
+            m: 1,
+            in_f: in_f as u32,
+            out_f: out_f as u32,
+            w_off: 0,
+        });
+        g.push(Op::Add {
+            a: yi,
+            b: ri,
+            dst: oi,
+            n: out_f as u32,
+        });
+        let got = infr_testkit::run_graph(
+            &be_,
+            &g,
+            &[
+                (xi, infr_testkit::f32_bytes(&x)),
+                (wi, wf16),
+                (ri, infr_testkit::f32_bytes(&res)),
+            ],
+            oi,
+            out_f,
+        );
+        for o in 0..out_f {
+            let want = proj[o] + res[o];
+            assert!(
+                (got[o] - want).abs() < 1e-2,
+                "linear+add mismatch at {o}: got {} want {want}",
+                got[o]
+            );
+        }
+        assert!(
+            !be_.shared
+                .kernels
+                .lock()
+                .unwrap()
+                .contains_key("linear_res"),
+            "the f16 Linear+Add fused onto linear_res.comp on a device without shaderFloat16"
+        );
+    }
+
+    /// The int8 decode GEMV's opt-in knobs must never route a shape onto a build that does not
+    /// exist: `INFR_NO_MMV_M4` (no residual twin outside `m4`) on a fused decode `Linear→Add`, and
+    /// `INFR_MMV_FUSE_QUANT` (Q4_K/Q6_K builds only) on a default-set dtype outside that pair,
+    /// fused and plain. Each must run and match the host.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn int8_decode_knobs_never_request_a_missing_build() {
+        type Knob = fn(&mut infr_core::config::VulkanCfg);
+        let cases: [(&str, Knob, DType); 2] = [
+            ("mmv_m4 off", |v| v.mmv_m4 = false, DType::Q4K),
+            ("mmv_fuse_quant", |v| v.mmv_fuse_quant = true, DType::Q2K),
+        ];
+        // Above `mmv_mw_choice`'s size floor, so the int8 tier is the one taken.
+        let (in_f, out_f) = (2048usize, 1024usize);
+        for (name, knob, dt) in cases {
+            let mut cfg = crate::test_config();
+            knob(&mut cfg.kernels.vulkan);
+            let Ok(be_) = VulkanBackend::new_with(std::sync::Arc::new(cfg)) else {
+                return; // no GPU — self-skip
+            };
+            if !be_.caps().i8_dot {
+                eprintln!("skip {name}: the int8 decode tier needs packed int8 dot");
+                continue;
+            }
+            let (blk_elems, blk_bytes) = infr_core::decode_spec::block_layout(dt);
+            // 0x00..=0x3F keeps every f16 scale finite and small.
+            let wb: Vec<u8> = (0..out_f * in_f / blk_elems * blk_bytes)
+                .map(|i| ((i.wrapping_mul(2654435761) >> 7) % 0x40) as u8)
+                .collect();
+            let x: Vec<f32> = (0..in_f)
+                .map(|i| ((i % 97) as f32 - 48.0) * 0.021)
+                .collect();
+            let res: Vec<f32> = (0..out_f).map(|i| (i % 7) as f32 - 3.0).collect();
+            let proj = infr_testkit::ref_linear(
+                &x,
+                &infr_testkit::dequant_oracle(dt, &wb),
+                1,
+                in_f,
+                out_f,
+            );
+            for fused in [true, false] {
+                let mut g = Graph::new();
+                let xi = g.input(TensorDesc::new(vec![1, in_f], DType::F32));
+                let wi = g.weight(TensorDesc::new(vec![out_f, in_f], dt));
+                let ri = g.input(TensorDesc::new(vec![1, out_f], DType::F32));
+                let oi = g.output(TensorDesc::new(vec![1, out_f], DType::F32));
+                let yi = if fused {
+                    g.internal(TensorDesc::new(vec![1, out_f], DType::F32))
+                } else {
+                    oi
+                };
+                g.push(Op::Linear {
+                    x: xi,
+                    weight: wi,
+                    dst: yi,
+                    m: 1,
+                    in_f: in_f as u32,
+                    out_f: out_f as u32,
+                    w_off: 0,
+                });
+                if fused {
+                    g.push(Op::Add {
+                        a: yi,
+                        b: ri,
+                        dst: oi,
+                        n: out_f as u32,
+                    });
+                }
+                let got = infr_testkit::run_graph(
+                    &be_,
+                    &g,
+                    &[
+                        (xi, infr_testkit::f32_bytes(&x)),
+                        (wi, wb.clone()),
+                        (ri, infr_testkit::f32_bytes(&res)),
+                    ],
+                    oi,
+                    out_f,
+                );
+                let want: Vec<f32> = (0..out_f)
+                    .map(|o| proj[o] + if fused { res[o] } else { 0.0 })
+                    .collect();
+                let rms = (want.iter().map(|v| (*v as f64).powi(2)).sum::<f64>()
+                    / want.len() as f64)
+                    .sqrt();
+                let worst = got.iter().zip(&want).fold(0f64, |a, (g, w)| {
+                    infr_testkit::nan_max64(a, (*g as f64 - *w as f64).abs())
+                });
+                assert!(
+                    worst / rms < 2e-2,
+                    "{name} {dt:?} fused={fused}: {:.2e} of the output RMS off the host",
+                    worst / rms
+                );
+            }
+        }
+    }
+
+    /// `Op::QkNormRope` shapes no kernel serves are refused by name: a strided `x` together with
+    /// frequency factors (the strided builds take none), and a head wider than the kernels'
+    /// shared head buffer. The neighbouring shapes — strided without factors, a head exactly at
+    /// the bound — still run.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn qk_norm_rope_unservable_shapes_are_refused() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let run = |hd: usize, strided: bool, ff: bool| {
+            let nh = 2usize;
+            let x_stride = if strided { 2 * nh * hd } else { 0 };
+            let mut g = Graph::new();
+            let x = g.input(TensorDesc::new(vec![2 * nh * hd], DType::F32));
+            let w = g.weight(TensorDesc::new(vec![hd], DType::F32));
+            let pos = g.input(TensorDesc::new(vec![1], DType::I32));
+            let f = ff.then(|| g.weight(TensorDesc::new(vec![hd / 2], DType::F32)));
+            let dst = g.output(TensorDesc::new(vec![nh * hd], DType::F16));
+            g.push(Op::QkNormRope {
+                x,
+                weight: w,
+                positions: pos,
+                dst,
+                rows: 1,
+                n_head: nh as u32,
+                head_dim: hd as u32,
+                rope_dim: hd as u32,
+                theta: 1e4,
+                eps: 1e-6,
+                freq_factors: f,
+                x_stride: x_stride as u32,
+            });
+            run_zeroed(&be_, &g, &[])
+        };
+        let max = QK_NORM_ROPE_MAX_HD as usize;
+        run(64, true, false).expect("strided x without factors must run");
+        run(64, false, true).expect("factors without a stride must run");
+        run(max, false, false).expect("a head at the bound must run");
+        refused(run(64, true, true), "both x_stride and freq_factors");
+        refused(run(max + 64, false, false), "exceeds the kernel's");
+    }
+
+    /// The record-once `_dyn` rope kernels without a ring row mapping (`rope_f16_dyn`, the
+    /// interleaved `qk_norm_rope`) must not take a fused K write into a cache a sliding-window
+    /// attention reads: once the position outran a ring's rows they would write past it. Refused
+    /// by name; the same graphs over a causal (full-context) cache still record and run.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn record_once_rope_into_a_ring_cache_is_refused() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (nh, nkv, hd, rows) = (2usize, 1usize, 64usize, 4usize);
+        let run = |interleaved: bool, mask: AttnMask| {
+            let f32d = |n: usize| TensorDesc::new(vec![n], DType::F32);
+            let f16d = |n: usize| TensorDesc::new(vec![n], DType::F16);
+            let mut g = Graph::new();
+            let pos = g.input(TensorDesc::new(vec![1], DType::I32));
+            let kc = g.input(f16d(rows * nkv * hd));
+            let vc = g.input(f16d(rows * nkv * hd));
+            let q = g.input(f32d(nh * hd));
+            let q16 = g.internal(f16d(nh * hd));
+            let k16 = g.internal(f16d(nkv * hd));
+            let dst = g.output(f32d(nh * hd));
+            if interleaved {
+                let kx = g.input(f32d(2 * nkv * hd));
+                let kw = g.weight(f32d(hd));
+                g.push(Op::QkNormRope {
+                    x: kx,
+                    weight: kw,
+                    positions: pos,
+                    dst: k16,
+                    rows: 1,
+                    n_head: nkv as u32,
+                    head_dim: hd as u32,
+                    rope_dim: hd as u32,
+                    theta: 1e4,
+                    eps: 1e-6,
+                    freq_factors: None,
+                    x_stride: (2 * nkv * hd) as u32,
+                });
+            } else {
+                let kx = g.input(f32d(nkv * hd));
+                g.push(Op::Rope {
+                    x: kx,
+                    positions: pos,
+                    dst: k16,
+                    rows: 1,
+                    n_head: nkv as u32,
+                    head_dim: hd as u32,
+                    rope_dim: hd as u32,
+                    theta: 1e4,
+                    freq_factors: None,
+                    x_stride: 0,
+                    neox: false,
+                    backward: false,
+                });
+            }
+            g.push(Op::WriteKv {
+                src: k16,
+                cache: kc,
+                rows: 1,
+                row_stride: (nkv * hd) as u32,
+                pos: 0,
+            });
+            g.push(Op::Rope {
+                x: q,
+                positions: pos,
+                dst: q16,
+                rows: 1,
+                n_head: nh as u32,
+                head_dim: hd as u32,
+                rope_dim: hd as u32,
+                theta: 1e4,
+                freq_factors: None,
+                x_stride: 0,
+                neox: false,
+                backward: false,
+            });
+            g.push(Op::Attention {
+                q: q16,
+                k_cache: kc,
+                v_cache: vc,
+                dst,
+                rows: 1,
+                kv_len: 1,
+                n_head: nh as u32,
+                n_kv: nkv as u32,
+                head_dim: hd as u32,
+                scale: 1.0 / (hd as f32).sqrt(),
+                mask,
+                pos: 0,
+                sinks: None,
+                key_bias: None,
+                comp: None,
+            });
+            assert!(
+                decode_eligible(&be_, &g),
+                "the graph must take the record-once replay path"
+            );
+            run_zeroed(
+                &be_,
+                &g,
+                &[
+                    (pos, BufferUsage::Staging),
+                    (kc, BufferUsage::KvCache),
+                    (vc, BufferUsage::KvCache),
+                ],
+            )
+        };
+        for interleaved in [false, true] {
+            run(interleaved, AttnMask::Causal).unwrap_or_else(|e| {
+                panic!("interleaved={interleaved}: a full-context cache must still run: {e}")
+            });
+            refused(
+                run(interleaved, AttnMask::SlidingWindow(2)),
+                "sliding-window ring KV cache",
+            );
+        }
+    }
+
+    /// Kernel limits that used to be debug-only assertions are refused by name from `lower_op`,
+    /// in a release build too: the DeltaNet key head, the chunked-split prep step, the GPU
+    /// sampler's top-k range, a Q8_0 KV row that is not whole blocks, a non-f16 MLA latent cache,
+    /// and a byte copy between dtypes. Each limit's admissible neighbour still runs.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn op_limits_are_refused_by_name() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let f32d = |d: Vec<usize>| TensorDesc::new(d, DType::F32);
+
+        // DeltaNet: key head width.
+        let deltanet = |rows: usize, kd: usize| {
+            let (nv, nk, vd) = (1usize, 1usize, 32usize);
+            let mut g = Graph::new();
+            let q = g.input(f32d(vec![rows, nk * kd]));
+            let k = g.input(f32d(vec![rows, nk * kd]));
+            let v = g.input(f32d(vec![rows, nv * vd]));
+            let b = g.input(f32d(vec![rows, nv]));
+            let a = g.input(f32d(vec![rows, nv]));
+            let a_coef = g.weight(f32d(vec![nv]));
+            let dt_bias = g.weight(f32d(vec![nv]));
+            let state = g.input(f32d(vec![nv * kd * vd]));
+            let dst = g.output(f32d(vec![rows, nv * vd]));
+            g.push(Op::DeltaNet {
+                q,
+                k,
+                v,
+                b,
+                a,
+                a_coef,
+                dt_bias,
+                state,
+                dst,
+                rows: rows as u32,
+                n_vhead: nv as u32,
+                n_khead: nk as u32,
+                head_k: kd as u32,
+                head_v: vd as u32,
+                eps: 1e-6,
+                src_stride: 0,
+            });
+            run_zeroed(&be_, &g, &[])
+        };
+        deltanet(1, DN_MAX_KD).expect("a key head at the bound must run");
+        refused(deltanet(1, DN_MAX_KD + 1), "Op::DeltaNet head_k");
+        // A chunked batch on a key head that is not whole prep steps: the coopmat chunked-split
+        // path refuses it, the other chunked paths serve it.
+        let odd = DN_MAX_KD - DN_PREP_KSTEP / 2;
+        if be_.caps().f16_coopmat() {
+            refused(deltanet(2, odd), "chunked-split prep pass");
+        } else {
+            deltanet(2, odd).expect("no chunked-split path here: the monolithic kernel serves it");
+        }
+
+        // Sample: the GPU sampler's top-k range.
+        let sample = |top_k: u32| {
+            let n = 1024usize;
+            let mut g = Graph::new();
+            let x = g.input(f32d(vec![n]));
+            let u = g.input(f32d(vec![1]));
+            let dst = g.output(TensorDesc::new(vec![1], DType::I32));
+            g.push(Op::Sample {
+                x,
+                u,
+                dst,
+                n: n as u32,
+                top_k,
+                temp: 1.0,
+                top_p: 1.0,
+            });
+            run_zeroed(&be_, &g, &[])
+        };
+        let kmax = crate::gemm::SAMPLE_KMAX as u32;
+        sample(2).expect("top_k 2 must run");
+        sample(kmax).expect("top_k at the bound must run");
+        refused(sample(kmax + 1), "Op::Sample top_k");
+        refused(sample(1), "Op::Sample top_k");
+
+        // WriteKv into a Q8_0 cache: whole blocks per row.
+        let q8_block = infr_core::decode_spec::block_layout(DType::Q8_0).0;
+        let write_q8 = |rs: usize| {
+            let rows_cap = 4usize;
+            let mut g = Graph::new();
+            let src = g.input(f32d(vec![rs]));
+            let cache = g.input(TensorDesc::new(vec![rows_cap * rs], DType::Q8_0));
+            g.push(Op::WriteKv {
+                src,
+                cache,
+                rows: 1,
+                row_stride: rs as u32,
+                pos: 1,
+            });
+            run_zeroed(&be_, &g, &[(cache, BufferUsage::KvCache)])
+        };
+        write_q8(2 * q8_block).expect("a whole-block Q8_0 row must run");
+        refused(write_q8(q8_block + q8_block / 2), "multiple of the");
+
+        // Mla: the latent cache must be f16.
+        let mla = |cache_dt: DType| {
+            let (rows, n_head, kv_lora, rope, nope, vd) = (1usize, 1, 8usize, 4usize, 2usize, 2);
+            let key_len = kv_lora + rope;
+            let mut g = Graph::new();
+            let q = g.input(f32d(vec![rows, n_head, nope + rope]));
+            let k_cache = g.input(TensorDesc::new(vec![rows, key_len], cache_dt));
+            let wk_b = g.weight(f32d(vec![n_head, kv_lora, nope]));
+            let wv_b = g.weight(f32d(vec![n_head, kv_lora, vd]));
+            let dst = g.output(f32d(vec![rows, n_head, vd]));
+            g.push(Op::Mla {
+                q,
+                k_cache,
+                wk_b,
+                wv_b,
+                dst,
+                rows: rows as u32,
+                kv_len: rows as u32,
+                n_head: n_head as u32,
+                q_head_dim: (nope + rope) as u32,
+                kv_lora_rank: kv_lora as u32,
+                qk_nope_dim: nope as u32,
+                qk_rope_dim: rope as u32,
+                v_head_dim: vd as u32,
+                scale: 1.0,
+                mask: AttnMask::Causal,
+                pos: 0,
+                theta: 10000.0,
+                freq_factors: None,
+                key_bias: None,
+            });
+            run_zeroed(&be_, &g, &[])
+        };
+        mla(DType::F16).expect("an f16 latent cache must run");
+        refused(mla(DType::F32), "latent cache must be F16");
+
+        // Copy: only identity copies and F32→F16 convert.
+        let copy = |sdt: DType, ddt: DType| {
+            let mut g = Graph::new();
+            let src = g.input(TensorDesc::new(vec![8], sdt));
+            let dst = g.output(TensorDesc::new(vec![8], ddt));
+            g.push(Op::Copy {
+                src,
+                src_off: 0,
+                dst,
+                dst_off: 0,
+                n: 8,
+            });
+            run_zeroed(&be_, &g, &[])
+        };
+        copy(DType::F16, DType::F16).expect("an identity copy must run");
+        copy(DType::F32, DType::F16).expect("the F32→F16 conversion must run");
+        refused(copy(DType::F16, DType::F32), "Op::Copy F16→F32");
+        refused(copy(DType::I32, DType::F32), "Op::Copy I32→F32");
+    }
+
+    /// `tiled_gemm_fits` refuses exactly the two shapes the tiled GEMMs cannot run — a
+    /// non-coopmat grid past the x limit, a weight past the u32 addressing cap — and accepts the
+    /// rest; the grid cap applies only to the non-coopmat GEMMs.
+    #[test]
+    fn tiled_gemm_fits_refuses_an_oversized_grid_or_a_breaching_weight() {
+        let (dt, m, in_f, out_f) = (DType::Q8_0, 40, 256, 128);
+        let mut vk = infr_core::config::Config::default().kernels.vulkan;
+        let x_limit = crate::recorder::Recorder::split_point_x();
+        assert!(tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, x_limit));
+
+        let groups = crate::recorder::nc_gemm_groups(m, out_f) as u32;
+        assert!(tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, groups));
+        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, groups - 1));
+        assert!(tiled_gemm_fits(dt, m, in_f, out_f, false, &vk, groups - 1));
+
+        vk.bda_chunk_elems = Some((in_f * out_f) as u64);
+        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, true, &vk, x_limit));
+        assert!(!tiled_gemm_fits(dt, m, in_f, out_f, false, &vk, x_limit));
     }
 }

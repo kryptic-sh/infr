@@ -9,6 +9,10 @@ pub struct Sampler {
     pub temp: f32,
     pub top_k: usize,
     pub top_p: f32,
+    /// llama.cpp's `min_p`: drop every token whose probability is below `min_p` times the top
+    /// token's, judged on the RAW logits (llama.cpp's chain runs it before temperature). `0`
+    /// disables it. Inert under greedy, which only ever draws the top token.
+    pub min_p: f32,
 }
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Default for Sampler {
@@ -17,6 +21,7 @@ impl Default for Sampler {
             temp: 0.0,
             top_k: 0,
             top_p: 1.0,
+            min_p: 0.0,
         }
     }
 }
@@ -36,6 +41,8 @@ impl Sampler {
             temp: cfg.temp,
             top_k: cfg.top_k,
             top_p: cfg.top_p,
+            // No `sampling.min_p` config key: off unless a request asks for it.
+            min_p: 0.0,
         }
     }
 
@@ -54,6 +61,9 @@ impl Sampler {
             }
             if let Some(p) = r.top_p {
                 s.top_p = p;
+            }
+            if let Some(m) = r.min_p {
+                s.min_p = m;
             }
         }
         s
@@ -84,7 +94,10 @@ pub struct RequestSampling {
     /// for tokens seen in the last [`repeat_last_n`](Self::repeat_last_n) generated tokens.
     pub repeat_penalty: f32,
     pub repeat_last_n: usize,
-    /// OpenAI `logit_bias`: `(token id, bias)` added to the raw logit; `-inf` bans the token.
+    /// llama.cpp `min_p` (see [`Sampler::min_p`]). `None` = inherit the process default (off).
+    pub min_p: Option<f32>,
+    /// OpenAI `logit_bias`: `(token id, bias)` pairs added to the logits row before the penalties
+    /// and before sampling, as llama.cpp's `logit_bias` sampler does. Empty = none.
     pub logit_bias: Vec<(u32, f32)>,
 }
 
@@ -102,21 +115,69 @@ impl Default for RequestSampling {
             frequency_penalty: 0.0,
             repeat_penalty: 1.0,
             repeat_last_n: 64,
+            min_p: None,
             logit_bias: Vec::new(),
         }
     }
 }
 
 impl RequestSampling {
-    /// Any penalty or logit bias active? Drives the decode loop's host-sampling fallback (both
-    /// mutate the logits row, which the GPU-resident argmax/sample paths never download).
+    /// Any penalty actually active? One half of [`patches_logits`](Self::patches_logits), which
+    /// drives the decode loop's host-sampling fallback (penalties must mutate the logits row, which
+    /// the GPU-resident argmax/sample paths never download).
     pub fn penalties_active(&self) -> bool {
-        !self.logit_bias.is_empty()
-            || self.presence_penalty != 0.0
+        self.presence_penalty != 0.0
             || self.frequency_penalty != 0.0
             || (self.repeat_penalty != 1.0 && self.repeat_last_n > 0)
     }
+
+    /// Does this request rewrite the logits row before sampling — a penalty or a `logit_bias`?
+    /// Either one needs the row on the host, so this is what `Penalties::resolve` keys on, and
+    /// through it the decode loop's GPU-sampling gates.
+    pub fn patches_logits(&self) -> bool {
+        self.penalties_active() || !self.logit_bias.is_empty()
+    }
+
+    /// Refuse the fields only the dense seam decode loop applies — a `logit_bias`, a non-zero
+    /// `min_p` — on a backend whose decode never reads them, rather than generate as if they had
+    /// been applied. `backend` names it in the error.
+    pub fn refuse_seam_only_fields(
+        &self,
+        backend: &'static str,
+    ) -> Result<(), UnsupportedSampling> {
+        let param = if !self.logit_bias.is_empty() {
+            "logit_bias"
+        } else if self.min_p.is_some_and(|m| m > 0.0) {
+            "min_p"
+        } else {
+            return Ok(());
+        };
+        Err(UnsupportedSampling { param, backend })
+    }
 }
+
+/// A request asked for sampling its backend cannot apply (see
+/// [`RequestSampling::refuse_seam_only_fields`]). Typed so `infr serve` can answer it as the
+/// request's fault, a `400` naming `param`, instead of a server error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedSampling {
+    /// The request field that cannot be applied.
+    pub param: &'static str,
+    /// The backend that cannot apply it.
+    pub backend: &'static str,
+}
+
+impl std::fmt::Display for UnsupportedSampling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} is not supported by the {} backend",
+            self.param, self.backend
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedSampling {}
 
 /// EVERYTHING one in-flight sequence owns that is not its KV cache: its sampling config, its abort
 /// latch, and its turn on the GPU.
@@ -147,6 +208,10 @@ pub struct RequestCtx {
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// This sequence's turn-taking baton on the GPU (`None` = sole user, e.g. `infr run`).
     gate: Option<std::sync::Arc<StepGate>>,
+    /// Test-only: [`aborted`](Self::aborted) answers true from this poll on, counting from zero.
+    /// The prefill loop polls once before each chunk, so a test can cancel between two chunks.
+    #[cfg(test)]
+    abort_at_poll: Option<(usize, std::sync::atomic::AtomicUsize)>,
 }
 
 impl RequestCtx {
@@ -157,6 +222,8 @@ impl RequestCtx {
             abort: std::sync::atomic::AtomicBool::new(false),
             cancel: None,
             gate: None,
+            #[cfg(test)]
+            abort_at_poll: None,
         }
     }
 
@@ -168,12 +235,21 @@ impl RequestCtx {
             abort: std::sync::atomic::AtomicBool::new(false),
             cancel: None,
             gate: Some(gate),
+            #[cfg(test)]
+            abort_at_poll: None,
         }
     }
 
     /// Also stop when `cancel` is set, at the same poll sites as [`abort`](Self::abort).
     pub fn with_cancel(mut self, cancel: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    /// Abort from poll `at` on (see the field); `at = k` lets prefill chunks `0..k` run.
+    #[cfg(test)]
+    pub(crate) fn abort_at_poll(mut self, at: usize) -> Self {
+        self.abort_at_poll = Some((at, std::sync::atomic::AtomicUsize::new(0)));
         self
     }
 
@@ -192,6 +268,12 @@ impl RequestCtx {
     /// Polled by the decode loop once per token and the prefill loop once per chunk (relaxed atomic
     /// loads — no allocation, no lock).
     pub fn aborted(&self) -> bool {
+        #[cfg(test)]
+        if let Some((at, polls)) = &self.abort_at_poll {
+            if polls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= *at {
+                return true;
+            }
+        }
         self.abort.load(std::sync::atomic::Ordering::Relaxed)
             || self
                 .cancel
@@ -226,11 +308,6 @@ impl RequestCtx {
 ///
 /// Cost is one relaxed atomic load (plus, for `serve`, a second) per token — nothing against a
 /// multi-millisecond forward.
-/// True when the request patches logits; the MTP decoders ignore that, so callers must skip them.
-pub(crate) fn adjusts_logits(req: Option<&RequestCtx>) -> bool {
-    req.is_some_and(|r| r.sampling().penalties_active())
-}
-
 pub(crate) fn abort_requested(req: Option<&RequestCtx>) -> bool {
     infr_core::shutdown::shutdown_requested() || req.is_some_and(RequestCtx::aborted)
 }
@@ -328,11 +405,11 @@ pub(crate) fn resolve_seed(req: Option<&RequestCtx>, cfg: &infr_core::config::Sa
 /// So only `0` is remapped (to the golden-ratio constant, an arbitrary but well-mixed nonzero
 /// state); every other seed passes through untouched and distinct seeds stay distinct.
 ///
-/// Both seed entry points ([`resolve_seed`]'s per-request seed and [`seed_rng`]'s process-wide
-/// `sampling.seed`/wall-clock seed) MUST route through this one helper — when they each had their
-/// own copy of the policy they drifted, and the process-config path kept the `| 1` collapse long
-/// after the per-request path was fixed.
-fn legal_xorshift_state(seed: u64) -> u64 {
+/// Every seed entry point ([`resolve_seed`]'s per-request seed, [`seed_rng`]'s process-wide
+/// `sampling.seed`/wall-clock seed, and DiffusionGemma's per-block reseed) MUST route through this
+/// one helper — when they each had their own copy of the policy they drifted, and the
+/// process-config path kept the `| 1` collapse long after the per-request path was fixed.
+pub(crate) fn legal_xorshift_state(seed: u64) -> u64 {
     if seed == 0 {
         0x9E37_79B9_7F4A_7C15
     } else {
@@ -347,11 +424,12 @@ fn legal_xorshift_state(seed: u64) -> u64 {
 /// Cost per token is O(distinct generated tokens), NOT O(vocab): the counts map is walked to patch
 /// just the logits of tokens that have actually been produced.
 pub(crate) struct Penalties {
+    /// The request's `logit_bias`, applied before the penalties.
+    bias: Vec<(u32, f32)>,
     presence: f32,
     frequency: f32,
     repeat: f32,
     last_n: usize,
-    logit_bias: Vec<(u32, f32)>,
     /// token id -> times generated so far (presence/frequency).
     counts: std::collections::HashMap<u32, u32>,
     /// The last `last_n` generated ids, in order (llama.cpp's `repeat_penalty` window).
@@ -361,22 +439,24 @@ pub(crate) struct Penalties {
 impl Penalties {
     pub(crate) fn resolve(req: Option<&RequestCtx>) -> Option<Self> {
         let r = req.map(RequestCtx::sampling)?;
-        if !r.penalties_active() {
+        if !r.patches_logits() {
             return None;
         }
         Some(Self {
+            bias: r.logit_bias.clone(),
             presence: r.presence_penalty,
             frequency: r.frequency_penalty,
             repeat: r.repeat_penalty,
             last_n: r.repeat_last_n,
-            logit_bias: r.logit_bias.clone(),
             counts: std::collections::HashMap::new(),
             recent: std::collections::VecDeque::new(),
         })
     }
 
-    /// Patch `logits` in place: logit bias first, then llama.cpp's `penalties` sampler order of
-    /// repeat (multiplicative, sign-aware) then presence/frequency (additive).
+    /// Patch `logits` in place: the request's `logit_bias` first, then the penalties for the tokens
+    /// generated so far. Order matches llama.cpp's chain, whose `logit_bias` sampler runs ahead of
+    /// `penalties`, and within the penalties repeat (multiplicative, sign-aware) then
+    /// presence/frequency (additive).
     ///
     /// Every logits access is CHECKED (`get_mut`), and an id at or past `logits.len()` is skipped.
     /// The row is full-vocab on the trunk decode path, so today no id can be out of range — but the
@@ -386,10 +466,21 @@ impl Penalties {
     /// Skipping is the right failure mode because a penalty is a soft PREFERENCE, not a
     /// correctness constraint: an id outside the row cannot be sampled from that row at all, so
     /// dropping its nudge changes nothing about the outcome, while panicking kills a live request.
+    ///
+    /// A finite logit stays finite and a `-inf` one stays `-inf`: the grammar-constrained step
+    /// relies on that to tell a penalized token from a masked one.
     pub(crate) fn apply(&self, logits: &mut [f32]) {
-        for &(t, b) in &self.logit_bias {
+        for &(t, b) in &self.bias {
+            // Ids are validated against the vocabulary at the server, but the row may still be a
+            // narrower head's (see above), so the same checked access applies.
             if let Some(l) = logits.get_mut(t as usize) {
-                *l += b;
+                // Saturate like the penalties below: a bias is a preference, and under a grammar
+                // an infinite logit would read as masked.
+                *l = if l.is_finite() {
+                    (*l + b).clamp(f32::MIN, f32::MAX)
+                } else {
+                    *l + b
+                };
             }
         }
         if self.repeat != 1.0 && self.last_n > 0 {
@@ -404,17 +495,32 @@ impl Penalties {
                 let Some(l) = logits.get_mut(t as usize) else {
                     continue; // id past the end of this row — unsamplable here, so nothing to bias
                 };
-                *l = if *l > 0.0 {
+                let scaled = if *l > 0.0 {
                     *l / self.repeat
                 } else {
                     *l * self.repeat
+                };
+                // `repeat` is any finite positive value, so an extreme one can overflow a finite
+                // logit to ±inf. Saturate instead: under a grammar an infinite logit reads as
+                // masked (or swamps the softmax), and a penalty must only reorder tokens.
+                *l = if l.is_finite() {
+                    scaled.clamp(f32::MIN, f32::MAX)
+                } else {
+                    scaled
                 };
             }
         }
         if self.presence != 0.0 || self.frequency != 0.0 {
             for (&t, &n) in &self.counts {
                 if let Some(l) = logits.get_mut(t as usize) {
-                    *l -= self.presence + self.frequency * n as f32;
+                    let shifted = *l - (self.presence + self.frequency * n as f32);
+                    // Saturate here too, for the same reason as the repeat scale above: the
+                    // server bounds these two, but a library caller can pass any value.
+                    *l = if l.is_finite() {
+                        shifted.clamp(f32::MIN, f32::MAX)
+                    } else {
+                        shifted
+                    };
                 }
             }
         }
@@ -494,39 +600,53 @@ const NUCLEUS_PROBE_K: usize = 1024;
 
 /// Widening factor when [`NUCLEUS_PROBE_K`] candidates did not reach `top_p`.
 ///
-/// `top_p = 1.0` legitimately wants the WHOLE vocab (and a near-uniform row wants it even at
-/// top_p 0.9), so the widening path is live code, not a defensive branch — it just has to get
-/// there in few passes, because each pass re-runs the O(n) selection. Doubling takes 8 passes to
-/// cross 128256 from 1024; ×8 takes 2 (1024 → 8192 → n, see the `n / 2` snap below). Measured at
-/// n = 128256 / top_p = 1.0: ×2 = 4.54ms per call, ×8 = 3.22ms, old heap = 5.27ms.
+/// A near-uniform row can want the WHOLE vocab even at top_p 0.9, so the widening path is live
+/// code, not a defensive branch — it just has to get there in few passes, because each pass
+/// re-runs the O(n) selection. Doubling takes 8 passes to cross 128256 from 1024; ×8 takes 2
+/// (1024 → 8192 → n, see the `n / 2` snap below). Measured at n = 128256 / top_p = 1.0, back when
+/// that case still came through here: ×2 = 4.54ms per call, ×8 = 3.22ms, old heap = 5.27ms.
+/// `top_p >= 1` now skips the selection entirely (see [`truncated_softmax`]).
 const NUCLEUS_WIDEN: usize = 8;
 
 /// Build the truncated, normalized sampling support shared by [`sample_logits`] and
 /// [`truncated_dist`]: top-k select, temperature softmax, normalize, then the top-p (nucleus)
-/// cutoff. Returns `(idx, probs)` — parallel, descending by logit, ALREADY truncated to the
-/// nucleus, with `probs` normalized over the selected support (so it sums to ≤1, the nucleus mass).
+/// cutoff. Returns `(idx, probs)` — parallel, ALREADY truncated to the nucleus, with `probs`
+/// normalized over the selected support (so it sums to ≤1, the nucleus mass). The pairs are
+/// descending by logit, except with `top_k == 0` and `top_p >= 1`: that support is every token with
+/// nonzero probability, in ascending index order, and no consumer may take `idx[0]` as the most
+/// likely token.
 /// The caller performs the final draw (bit-pinned) or hands the pairs out; keeping the draw OUT of
 /// here is what preserves the existing sampler's exact float ops.
 ///
 /// `temp` is clamped to a positive value (callers only reach this for `temp>0`; the clamp is a
 /// div-by-zero guard). When `top_k==0` the support is the whole vocab, but instead of sorting all
 /// of it only a bounded [`NUCLEUS_PROBE_K`] prefix is selected and sorted, widened on demand.
+///
+/// `min_p > 0` then also drops every token whose RAW logit is below the top logit plus
+/// `ln(min_p)` — llama.cpp's `min_p` test (`p_i >= min_p * p_max` before temperature), in its
+/// float expression. Its kept set and top-p's are both descending prefixes, so their order in the
+/// chain does not matter: the support is the shorter one. The top token is always kept, as
+/// llama.cpp's sorted path keeps it. `min_p <= 0` takes none of these branches, so the result is
+/// bit-identical to the sampler without it.
 fn truncated_softmax(
     logits: &[f32],
     temp: f32,
     top_k: usize,
     top_p: f32,
+    min_p: f32,
 ) -> (Vec<usize>, Vec<f32>) {
     let n = logits.len();
     let temp = if temp > 0.0 { temp } else { 1.0 };
+    // libm-ok(S2): platform `ln`, moves to `infr_core::math` in S2
+    let min_logit = |maxl: f32| (min_p > 0.0).then(|| maxl + min_p.ln());
     let k = if top_k == 0 { n } else { top_k.min(n) };
     if k < n {
-        // Bounded top-k: partition to the top k, then sort only those k (cheap).
-        let cmp = |a: &usize, b: &usize| {
-            logits[*b]
-                .partial_cmp(&logits[*a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        };
+        // Bounded top-k: partition to the top k, then sort only those k (cheap). `total_cmp`, not
+        // `partial_cmp` with an `Equal` fallback: that is not a total order once a NaN is present,
+        // and `select_nth_unstable_by` / `sort_unstable_by` panic on one. On NaN-free logits the
+        // two agree on every pair but `-0.0` / `+0.0`, which `total_cmp` orders. A NaN logit no
+        // longer panics but ranks first, so the probabilities come out NaN as before.
+        let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]);
         let mut idx: Vec<usize> = (0..n).collect();
         idx.select_nth_unstable_by(k - 1, cmp); // top-k at the front (unordered)
         idx.truncate(k);
@@ -534,6 +654,7 @@ fn truncated_softmax(
         let maxl = logits[idx[0]];
         let mut probs: Vec<f32> = idx
             .iter()
+            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
             .map(|&i| ((logits[i] - maxl) / temp).exp())
             .collect();
         let sum: f32 = probs.iter().sum();
@@ -549,6 +670,13 @@ fn truncated_softmax(
                 cutoff = j + 1;
                 break;
             }
+        }
+        if let Some(m) = min_logit(maxl) {
+            let kept = idx[..cutoff]
+                .iter()
+                .take_while(|&&i| logits[i] >= m)
+                .count();
+            cutoff = kept.max(1);
         }
         idx.truncate(cutoff);
         probs.truncate(cutoff);
@@ -566,7 +694,35 @@ fn truncated_softmax(
         // sampled token, and `truncated_dist`'s MTP accept ratios). Note the index-order summation
         // is also what makes this arm bit-identical to what shipped before.
         let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
         let sum: f32 = logits.iter().map(|&l| ((l - maxl) / temp).exp()).sum();
+        let min_logit = min_logit(maxl);
+
+        // `top_p >= 1` with no top-k cut (`top_k` 0, or at least `n`) keeps every token that has
+        // any mass, so no order is needed and none is built: one O(n) pass in index order, where
+        // the widening below would end in a sort of the whole vocab (llama.cpp's top-p returns at
+        // once for `p >= 1` as well). Each kept probability is the same expression over the same
+        // `maxl` and `sum` the widening loop computes, so the distribution is unchanged; only the
+        // ORDER differs, and with it the token a given uniform lands on. Zero-probability tokens
+        // (masked `-inf`, or underflowed) are left out, which the sorted loop gets for free by
+        // putting them last: in index order one in front would take a draw of exactly 0. The
+        // sorted loop can also stop a hair early, once the rounded cumulative sum reaches 1.0;
+        // this pass never drops a token with mass.
+        // A row whose `sum` is not finite (a NaN or `+inf` logit, or every logit `-inf`) has no
+        // distribution to keep and stays on the sorted path, which handles it as before.
+        if top_p >= 1.0 && sum.is_finite() {
+            let mut idx = Vec::with_capacity(n);
+            let mut probs = Vec::with_capacity(n);
+            for (i, &l) in logits.iter().enumerate() {
+                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
+                let p = ((l - maxl) / temp).exp() / sum;
+                if p > 0.0 && min_logit.is_none_or(|m| l >= m) {
+                    idx.push(i);
+                    probs.push(p);
+                }
+            }
+            return (idx, probs);
+        }
 
         // What is NOT load-bearing is materializing an order over the whole vocab. This used to
         // build a `BinaryHeap<HeapItem>` of every entry — 128256 × 16B = 2.0 MiB allocated and
@@ -587,11 +743,20 @@ fn truncated_softmax(
             if k < n {
                 order.select_nth_unstable_by(k - 1, cmp); // top-k at the front (unordered)
             }
+            #[cfg(test)]
+            tests::NUCLEUS_SORTED.with(|s| s.set(s.get() + k));
             order[..k].sort_unstable_by(cmp); // descending by logit, ties by index
             let mut probs: Vec<f32> = Vec::with_capacity(k);
             let mut cum = 0.0f32;
             let mut reached = false;
             for &i in &order[..k] {
+                // `order` is descending, so the first token under the min-p floor ends the
+                // support exactly as reaching `top_p` does — and spares the widening pass.
+                if min_logit.is_some_and(|m| logits[i] < m) && !probs.is_empty() {
+                    reached = true;
+                    break;
+                }
+                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                 let p = ((logits[i] - maxl) / temp).exp() / sum;
                 probs.push(p);
                 cum += p;
@@ -602,7 +767,8 @@ fn truncated_softmax(
             }
             if reached || k == n {
                 // `reached`: `probs` already stops at the cutoff. `k == n`: the nucleus is the
-                // whole vocab (top_p = 1.0, or a flat enough row) and `probs` holds all of it —
+                // whole vocab (a flat enough row, or a `top_p >= 1` row the early return above
+                // left here because its `sum` is not finite) and `probs` holds all of it —
                 // which is exactly what the heap returned when it popped itself empty. Never
                 // truncate the nucleus short of `top_p`; that would drop mass the draw expects.
                 let idx = order[..probs.len()].to_vec();
@@ -642,12 +808,20 @@ pub(crate) fn sample_logits(logits: &[f32], s: Sampler, rng: &mut u64) -> u32 {
     if s.temp <= 0.0 || s.top_k == 1 {
         return argmax(logits) as u32;
     }
-    let (idx, probs) = truncated_softmax(logits, s.temp, s.top_k, s.top_p);
+    let (idx, probs) = truncated_softmax(logits, s.temp, s.top_k, s.top_p, s.min_p);
     // Final bit-pinned draw against the (un-renormalized) nucleus `probs`, scaled by their `total`.
     // Identical arithmetic to the pre-refactor inline draw; the `total` scaling means we never
     // renormalize `probs` a second time here (that footgun stays out of the hot path).
     let total: f32 = probs.iter().sum();
     let r = next_uniform(rng) * total;
+    // A draw of exactly 0 (one uniform in 2^24) lands on the first entry with any mass. The
+    // sorted supports start with the most likely token, but the index-order one (`top_k` 0,
+    // `top_p` 1) starts at the lowest id with nonzero mass — which can be a token whose mass only
+    // failed to underflow, such as one a `logit_bias` of -100 banned. Take the most likely token,
+    // as the sorted paths do; on those `argmax` is entry 0, so their draw is unchanged.
+    if r == 0.0 {
+        return idx[argmax(&probs)] as u32;
+    }
     let mut acc = 0.0;
     for (j, &p) in probs.iter().enumerate() {
         acc += p;
@@ -675,7 +849,7 @@ pub(crate) fn truncated_dist(logits: &[f32], s: Sampler) -> Vec<(u32, f32)> {
     // Same support selection as `sample_logits`, but renormalized to sum to 1 over the nucleus (a
     // proper distribution) rather than collapsed into one draw. The nucleus renorm happens ONCE,
     // here, against the helper's `probs` — no coupled `cutoff`/`total` invariant to keep in sync.
-    let (idx, probs) = truncated_softmax(logits, s.temp, s.top_k, s.top_p);
+    let (idx, probs) = truncated_softmax(logits, s.temp, s.top_k, s.top_p, s.min_p);
     let total: f32 = probs.iter().sum();
     idx.iter()
         .zip(probs.iter())
@@ -714,6 +888,38 @@ pub(crate) fn sample_from_dist(dist: &[(u32, f32)], rng: &mut u64) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    thread_local! {
+        /// Entries the `top_k == 0` arm of [`truncated_softmax`] has sorted on this thread, summed
+        /// over every pass of its widening loop. Per thread, so tests running in parallel cannot
+        /// add to each other's count.
+        pub(super) static NUCLEUS_SORTED: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    /// A NaN logit must not panic the bounded top-k arm: its comparator once called NaN "equal"
+    /// to everything, which is not a total order, and the selection then panicked.
+    #[test]
+    fn bounded_top_k_survives_nan_logits() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for n in [600usize, 1590, 3000] {
+            for every in [2usize, 3, 5] {
+                let logits: Vec<f32> = (0..n)
+                    .map(|i| {
+                        if i % every == 0 {
+                            f32::NAN
+                        } else {
+                            super::next_uniform(&mut state) * 10.0
+                        }
+                    })
+                    .collect();
+                for k in [1usize, 24, 40, 64] {
+                    let (idx, probs) = super::truncated_softmax(&logits, 0.8, k, 0.95, 0.0);
+                    assert!(!idx.is_empty() && idx.len() == probs.len() && idx.len() <= k);
+                }
+            }
+        }
+    }
+
     use super::*;
 
     fn cfg(temp: f32, seed: u64) -> RequestSampling {
@@ -856,6 +1062,7 @@ mod tests {
             temp: 1.0,
             top_k: 8,
             top_p: 0.95,
+            min_p: 0.0,
         };
 
         // Sequence A, alone.
@@ -953,29 +1160,277 @@ mod tests {
         assert_eq!(logits.len(), 4, "the row is not resized");
     }
 
-    #[test]
-    fn logit_bias_shifts_bans_and_precedes_penalties() {
+    /// A request's `logit_bias` alone, as `infr serve` builds it.
+    fn biased(bias: Vec<(u32, f32)>) -> Penalties {
         let ctx = RequestCtx::new(RequestSampling {
-            logit_bias: vec![(0, 3.0), (1, f32::NEG_INFINITY), (2, 4.0), (99, 1.0)],
-            repeat_penalty: 2.0,
+            logit_bias: bias,
             ..Default::default()
         });
-        assert!(ctx.sampling().penalties_active());
-        let mut p = Penalties::resolve(Some(&ctx)).expect("bias active");
-        p.observe(2);
-        let mut logits = vec![1.0f32, 5.0, -2.0, 0.5];
-        p.apply(&mut logits);
-        assert_eq!(logits[0], 4.0);
-        assert_eq!(logits[1], f32::NEG_INFINITY);
-        // Bias before repeat: (-2 + 4) / 2, not -2 * 2 + 4.
-        assert_eq!(logits[2], 1.0);
-        assert_eq!(logits[3], 0.5);
-        let greedy = Sampler {
-            temp: 0.0,
-            ..Sampler::default()
+        Penalties::resolve(Some(&ctx)).expect("a logit_bias must take the host path")
+    }
+
+    /// The samplers the `logit_bias` tests draw with: greedy, the full-vocab paths (index order
+    /// at top_p 1, the sorted widening path below it) and the bounded top-k path, at temperatures
+    /// on both sides of 1.
+    fn bias_samplers() -> [Sampler; 5] {
+        let s = |temp, top_k, top_p| Sampler {
+            temp,
+            top_k,
+            top_p,
+            min_p: 0.0,
         };
-        let mut rng = 1;
-        assert_eq!(sample_logits(&logits, greedy, &mut rng), 0);
+        [
+            s(0.0, 0, 1.0),
+            s(1.0, 0, 1.0),
+            s(2.0, 0, 1.0),
+            s(0.7, 0, 0.95),
+            s(1.5, 4, 0.95),
+        ]
+    }
+
+    /// A row whose raw argmax is token 3 and whose lowest logit is token 5.
+    const BIAS_ROW: [f32; 8] = [1.0, 2.0, 0.5, 6.0, 1.5, 0.0, 3.0, -1.0];
+
+    /// **`logit_bias` -100 bans and +100 forces, at every temperature.** Token 3 is the raw
+    /// argmax, so a bias that did not reach the row would draw it at once under greedy; banned, it
+    /// must never be drawn on any sampling path across many seeds. Token 5 is the least likely
+    /// token, and +100 must make it the only one ever drawn.
+    #[test]
+    fn logit_bias_bans_and_forces_on_every_sampling_path() {
+        assert_eq!(
+            argmax(&BIAS_ROW),
+            3,
+            "the banned token is not the raw argmax"
+        );
+        let mut banned = BIAS_ROW;
+        biased(vec![(3, -100.0)]).apply(&mut banned);
+        let mut forced = BIAS_ROW;
+        biased(vec![(5, 100.0)]).apply(&mut forced);
+        for s in bias_samplers() {
+            for seed in 1..=2_000u64 {
+                let mut rng = legal_xorshift_state(seed);
+                let t = sample_logits(&banned, s, &mut rng);
+                assert_ne!(t, 3, "{s:?} seed {seed}: drew the banned token");
+                let t = sample_logits(&forced, s, &mut rng);
+                assert_eq!(t, 5, "{s:?} seed {seed}: did not draw the forced token");
+            }
+        }
+    }
+
+    /// A uniform of exactly 0 on the index-order support (`top_k` 0, `top_p` 1) draws the most
+    /// likely token, not the lowest id with any mass. Token 0's mass here only fails to underflow
+    /// (it sits 100 below the top, a `logit_bias` ban); the first draw from state 1 is exactly 0.
+    #[test]
+    fn a_zero_draw_takes_the_most_likely_token_in_index_order() {
+        assert_eq!(next_uniform(&mut 1), 0.0, "state 1 no longer draws 0");
+        let row = [-95.0f32, 5.0, 4.0];
+        let s = Sampler {
+            temp: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+        };
+        assert!(
+            truncated_dist(&row, s)[0].1 > 0.0,
+            "token 0's mass underflowed"
+        );
+        assert_eq!(sample_logits(&row, s, &mut 1), 1);
+    }
+
+    /// The backends that never read the request's sampler refuse the fields only the seam decode
+    /// applies, naming the field, and accept a request without them (`min_p: 0` included).
+    #[test]
+    fn seam_only_fields_are_refused_by_name() {
+        let r = |s: RequestSampling| s.refuse_seam_only_fields("test");
+        assert_eq!(r(RequestSampling::default()), Ok(()));
+        let zero = RequestSampling {
+            min_p: Some(0.0),
+            ..Default::default()
+        };
+        assert_eq!(r(zero), Ok(()));
+        let min_p = RequestSampling {
+            min_p: Some(0.1),
+            ..Default::default()
+        };
+        assert_eq!(r(min_p).unwrap_err().param, "min_p");
+        let bias = RequestSampling {
+            logit_bias: vec![(1, -100.0)],
+            ..Default::default()
+        };
+        let e = r(bias).unwrap_err();
+        assert_eq!(e.param, "logit_bias");
+        assert_eq!(
+            e.to_string(),
+            "logit_bias is not supported by the test backend"
+        );
+    }
+
+    /// A `logit_bias` alone sends the sequence to the host path (`resolve` is `Some`, which the
+    /// decode loop's GPU-sampling gates key on); an empty one does not.
+    #[test]
+    fn logit_bias_alone_patches_the_row_on_the_host() {
+        let none = RequestCtx::new(RequestSampling {
+            logit_bias: Vec::new(),
+            ..Default::default()
+        });
+        assert!(Penalties::resolve(Some(&none)).is_none());
+        let p = biased(vec![(1, 2.5)]);
+        let mut row = vec![0.0f32; 4];
+        p.apply(&mut row);
+        assert_eq!(row, [0.0, 2.5, 0.0, 0.0]);
+    }
+
+    /// The bias goes on BEFORE the penalties, as llama.cpp's chain runs `logit_bias` ahead of
+    /// `penalties`; the order shows through the sign-aware repeat scale. Token 1 (logit 2, bias
+    /// +10, seen once, repeat 2, presence 0.5): (2 + 10) / 2 - 0.5 = 5.5, where penalties first
+    /// would give 2 / 2 - 0.5 + 10 = 10.5. A biased id past the end of the row is skipped, and a
+    /// masked token stays masked.
+    #[test]
+    fn logit_bias_applies_before_the_penalties() {
+        let ctx = RequestCtx::new(RequestSampling {
+            repeat_penalty: 2.0,
+            repeat_last_n: 64,
+            presence_penalty: 0.5,
+            logit_bias: vec![(1, 10.0), (2, -100.0), (99, 5.0)],
+            ..Default::default()
+        });
+        let mut p = Penalties::resolve(Some(&ctx)).expect("active");
+        p.observe(1);
+        let mut row = vec![0.0f32, 2.0, f32::NEG_INFINITY, 4.0];
+        p.apply(&mut row);
+        assert_eq!(row, [0.0, 5.5, f32::NEG_INFINITY, 4.0]);
+        // Saturated, not overflowed: a bias keeps a finite logit finite.
+        let mut row = vec![f32::MAX];
+        biased(vec![(0, 100.0)]).apply(&mut row);
+        assert_eq!(row, [f32::MAX]);
+    }
+
+    /// The `min_p` row: max logit 3.0 (token 4). At `min_p` 0.3 llama.cpp keeps `l >= 3 + ln 0.3`
+    /// (= 1.796): tokens 4 (3.0), 5 (2.5) and 0 (2.0), whose probability ratios to the top are
+    /// e^0, e^-0.5 = 0.607 and e^-1 = 0.368; token 1 (2.0 below the top, ratio 0.135) and the rest
+    /// go.
+    const MIN_P_ROW: [f32; 6] = [2.0, 1.0, 0.0, -1.0, 3.0, 2.5];
+
+    /// The sorted support `truncated_dist` keeps for [`MIN_P_ROW`].
+    fn min_p_support(temp: f32, top_k: usize, top_p: f32, min_p: f32) -> Vec<(u32, f32)> {
+        let mut d = truncated_dist(
+            &MIN_P_ROW,
+            Sampler {
+                temp,
+                top_k,
+                top_p,
+                min_p,
+            },
+        );
+        d.sort_by_key(|&(i, _)| i);
+        d
+    }
+
+    /// **`min_p` cuts what llama.cpp's rule cuts**, on every path `truncated_softmax` has (index
+    /// order at top_p 1, the sorted widening path, the bounded top-k path), and on the RAW logits:
+    /// at temperature 0.5 token 0's tempered ratio is e^-2 = 0.135, under 0.3, yet llama.cpp keeps
+    /// it because its temperature runs after min-p. At temperature 1 the kept three renormalize to
+    /// e^{-1, 0, -0.5} / (1 + e^-0.5 + e^-1) = 0.1863, 0.5065, 0.3072.
+    #[test]
+    fn min_p_cuts_what_llama_cpp_cuts() {
+        for (temp, top_k, top_p) in [(1.0, 0, 1.0), (1.0, 0, 0.999), (1.0, 4, 1.0), (0.5, 0, 1.0)] {
+            let ids: Vec<u32> = min_p_support(temp, top_k, top_p, 0.3)
+                .iter()
+                .map(|&(i, _)| i)
+                .collect();
+            assert_eq!(ids, [0, 4, 5], "temp {temp} top_k {top_k} top_p {top_p}");
+        }
+        let probs: Vec<f32> = min_p_support(1.0, 0, 1.0, 0.3)
+            .iter()
+            .map(|&(_, p)| p)
+            .collect();
+        for (got, want) in probs.iter().zip([0.186_323, 0.506_480, 0.307_196]) {
+            assert!((got - want).abs() < 1e-5, "{probs:?}");
+        }
+        // min_p 1 keeps only the top token; the top token is kept at any min_p.
+        let only: Vec<u32> = min_p_support(1.0, 0, 1.0, 1.0)
+            .iter()
+            .map(|&(i, _)| i)
+            .collect();
+        assert_eq!(only, [4]);
+        // The shorter of the two prefixes wins: top_p 0.5 at temperature 1 is already {4, 5}.
+        let both: Vec<u32> = min_p_support(1.0, 0, 0.5, 0.3)
+            .iter()
+            .map(|&(i, _)| i)
+            .collect();
+        assert_eq!(both, [4, 5]);
+    }
+
+    /// A `min_p` that cuts no token leaves every path's support and probabilities bit-identical
+    /// to `min_p = 0`: the floor only truncates, it never touches a kept probability. (This does
+    /// not compare against the sampler before `min_p` existed; the `min_p = 0` path is pinned
+    /// against the full-sort reference by the tests above.)
+    #[test]
+    fn a_min_p_that_cuts_nothing_matches_min_p_zero_bit_for_bit() {
+        for &n in &[7usize, 300, NUCLEUS_PROBE_K * 3] {
+            let logits = seeded_logits(n, 77, 5.0, 0, false);
+            for (temp, top_k, top_p) in [(0.8, 0, 1.0), (0.8, 0, 0.9), (1.2, 16, 0.95)] {
+                let off = truncated_softmax(&logits, temp, top_k, top_p, 0.0);
+                let tiny = truncated_softmax(&logits, temp, top_k, top_p, 1e-30);
+                assert_eq!(
+                    off.0, tiny.0,
+                    "n {n} temp {temp} top_k {top_k} top_p {top_p}"
+                );
+                let bits = |v: &[f32]| v.iter().map(|p| p.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&off.1), bits(&tiny.1));
+            }
+        }
+    }
+
+    /// A penalty only reorders tokens: an extreme (but accepted) `repeat_penalty` saturates a
+    /// finite logit instead of overflowing it to ±inf, and a masked `-inf` logit stays masked.
+    #[test]
+    fn penalties_keep_finite_logits_finite() {
+        for repeat in [f32::MAX, f32::MIN_POSITIVE] {
+            let ctx = RequestCtx::new(RequestSampling {
+                repeat_penalty: repeat,
+                repeat_last_n: 64,
+                frequency_penalty: 2.0,
+                ..Default::default()
+            });
+            let mut p = Penalties::resolve(Some(&ctx)).expect("penalty active");
+            for t in 0..3 {
+                p.observe(t);
+            }
+            let mut logits = vec![-30.0f32, 30.0, f32::NEG_INFINITY, 1.0];
+            p.apply(&mut logits);
+            for (i, l) in logits[..2].iter().enumerate() {
+                assert!(l.is_finite(), "repeat {repeat}: logit {i} became {l}");
+            }
+            assert_eq!(logits[2], f32::NEG_INFINITY, "repeat {repeat}: unmasked");
+            assert_eq!(logits[3], 1.0, "repeat {repeat}: an unseen token moved");
+        }
+        // The additive penalties saturate as well: a frequency penalty no server request can
+        // carry, in either direction, on a token seen twice.
+        for frequency in [-1e38f32, 1e38] {
+            let ctx = RequestCtx::new(RequestSampling {
+                frequency_penalty: frequency,
+                ..Default::default()
+            });
+            let mut p = Penalties::resolve(Some(&ctx)).expect("penalty active");
+            for t in [0, 0, 1, 1, 2] {
+                p.observe(t);
+            }
+            let mut logits = vec![-3e38f32, 3e38, f32::NEG_INFINITY, 1.0];
+            p.apply(&mut logits);
+            for (i, l) in logits[..2].iter().enumerate() {
+                assert!(l.is_finite(), "frequency {frequency}: logit {i} became {l}");
+            }
+            assert_eq!(
+                logits[2],
+                f32::NEG_INFINITY,
+                "frequency {frequency}: unmasked"
+            );
+            assert_eq!(
+                logits[3], 1.0,
+                "frequency {frequency}: an unseen token moved"
+            );
+        }
     }
 
     /// An empty support is "can't happen" (a real vocab is never empty), so the two draw entry
@@ -999,6 +1454,7 @@ mod tests {
                 temp: 0.0,
                 top_k: 1,
                 top_p: 1.0,
+                min_p: 0.0,
             };
             sample_logits(&[], s, &mut rng)
         });
@@ -1008,6 +1464,7 @@ mod tests {
                 temp: 1.0,
                 top_k: 0,
                 top_p: 0.95,
+                min_p: 0.0,
             };
             sample_logits(&[], s, &mut rng)
         });
@@ -1039,6 +1496,7 @@ mod tests {
             temp: 1.0,
             top_k: 8,
             top_p: 0.95,
+            min_p: 0.0,
         };
         let draw = |seed: u64| -> Vec<u32> {
             let ctx = RequestCtx::new(RequestSampling {
@@ -1110,6 +1568,7 @@ mod tests {
             temp: 0.8,
             top_k: 0,
             top_p: 0.9,
+            min_p: 0.0,
         };
         for seed in [1u64, 2, 42, 12345, 99_999] {
             let mut rng = seed;
@@ -1132,6 +1591,7 @@ mod tests {
             temp: 0.7,
             top_k: 20,
             top_p: 0.95,
+            min_p: 0.0,
         };
         for seed in [1u64, 2, 42, 12345, 99_999] {
             let mut rng = seed;
@@ -1231,8 +1691,14 @@ mod tests {
     /// [`reference_full_sort`] — the byte-for-byte pre-refactor algorithm. The two pinned
     /// characterization tests above cover two hand-picked rows; this covers the corners that
     /// actually break a partial-selection rewrite: `n` below the probe size (1, 2, 7 — the clamp),
-    /// `n` far above it (4096), `top_p = 1.0` (the whole vocab, so the widening path must run to
-    /// completion), `top_p = 0.01` (a one-token nucleus), `-inf` masked rows, and heavy ties.
+    /// `n` far above it (4096), `top_p = 0.01` (a one-token nucleus), `-inf` masked rows, and heavy
+    /// ties.
+    ///
+    /// `top_p = 1.0` with no top-k builds no order (see [`truncated_softmax`]), so the token a
+    /// uniform lands on legitimately differs from the reference's there. Those cases are checked
+    /// against [`assert_full_support`] instead: the same support and the same probability per
+    /// token, and the token drawn inside it. A `top_k` at or above `n` cuts nothing and takes the
+    /// same path; with a top-k that cuts, `top_p = 1.0` still gets the token check.
     ///
     /// **Tie caveat — what is and is not asserted.** The old implementation popped a `BinaryHeap`
     /// whose order among EQUAL keys is unspecified, and `reference_full_sort` sorts with
@@ -1252,6 +1718,7 @@ mod tests {
         let mut tied_rows = 0usize;
         let mut tie_swaps = 0usize;
         let mut widened = 0usize;
+        let mut full_rows = 0usize;
         for &n in &[1usize, 2, 7, 17, 64, 255, 1024, 4096] {
             for &seed in &[1u64, 7, 12_345] {
                 for &temp in &[0.05f32, 0.6, 1.0, 2.5] {
@@ -1263,7 +1730,12 @@ mod tests {
                             // rewritten `top_k == 0` arm the majority of the sweep.
                             let top_k = [0usize, 0, 0, 3, 20, 1][cases % 6];
                             let logits = seeded_logits(n, seed, spread, grid, mask);
-                            let s = Sampler { temp, top_k, top_p };
+                            let s = Sampler {
+                                temp,
+                                top_k,
+                                top_p,
+                                min_p: 0.0,
+                            };
                             let mut rng = legal_xorshift_state(seed ^ 0xA5A5_5A5A);
                             let mut rng_ref = rng;
                             let got = sample_logits(&logits, s, &mut rng);
@@ -1275,7 +1747,17 @@ mod tests {
                                 rng, rng_ref,
                                 "{what}: both paths must consume exactly one RNG draw"
                             );
-                            if has_duplicate_logits(&logits) {
+                            if (top_k == 0 || top_k >= n) && top_p >= 1.0 {
+                                // No order is built here, so the token a uniform lands on is not
+                                // the reference's: compare the distribution instead, and check
+                                // the draw came from it.
+                                full_rows += 1;
+                                let support = assert_full_support(&logits, temp, &what);
+                                assert!(
+                                    support.contains(&(got as usize)),
+                                    "{what}: drew {got}, which has no probability"
+                                );
+                            } else if has_duplicate_logits(&logits) {
                                 tied_rows += 1;
                                 assert_eq!(
                                     logits[got as usize].total_cmp(&logits[want as usize]),
@@ -1289,7 +1771,8 @@ mod tests {
                                 assert_eq!(got, want, "{what}: sampled token changed");
                             }
                             if top_k == 0
-                                && truncated_softmax(&logits, temp, 0, top_p).0.len()
+                                && top_p < 1.0
+                                && truncated_softmax(&logits, temp, 0, top_p, 0.0).0.len()
                                     > NUCLEUS_PROBE_K
                             {
                                 widened += 1;
@@ -1307,9 +1790,13 @@ mod tests {
             "no case exceeded the {NUCLEUS_PROBE_K}-candidate probe — the widening path was never \
              exercised by this sweep"
         );
+        assert!(full_rows > 0, "no case took the top_p >= 1 support");
         // Informational, not asserted either way: how often the index tiebreak picked a different
         // (equal-probability) token than the heap's arbitrary order would have.
-        eprintln!("{cases} cases, {tied_rows} tied rows, {tie_swaps} tie swaps, {widened} widened");
+        eprintln!(
+            "{cases} cases, {tied_rows} tied rows, {tie_swaps} tie swaps, {widened} widened, \
+             {full_rows} full support"
+        );
     }
 
     /// The support oracle for the widening path: full sort, no bounded probe, no widening — but
@@ -1334,15 +1821,88 @@ mod tests {
         (idx, probs)
     }
 
-    /// **The widening path, end to end.** `top_p = 1.0` on a flat row needs EVERY entry, so the
-    /// `NUCLEUS_PROBE_K` probe must widen (×`NUCLEUS_WIDEN`, then snap to `n`) rather than hand
+    /// What `truncated_softmax` must return for `top_k == 0` and `top_p >= 1`, checked without
+    /// assuming any order: every token with nonzero probability exactly once, each with exactly
+    /// the probability `reference_support` gives it (same `maxl`, same index-order `sum`, same
+    /// expression, so equality is exact), and no token without one. Returns the support.
+    ///
+    /// Two independent views of "the same distribution": the definition (each token's own
+    /// probability, no order involved) and the sorted oracle. The oracle can stop a hair before
+    /// the end once its rounded cumulative sum reaches 1.0, so it is held to the tokens it keeps,
+    /// and the tokens it cut are held to carrying almost no mass.
+    fn assert_full_support(
+        logits: &[f32],
+        temp: f32,
+        what: &str,
+    ) -> std::collections::HashSet<usize> {
+        let (idx, probs) = truncated_softmax(logits, temp, 0, 1.0, 0.0);
+        assert_eq!(
+            idx.len(),
+            probs.len(),
+            "{what}: idx and probs differ in length"
+        );
+        let got: std::collections::HashMap<usize, f32> =
+            idx.iter().copied().zip(probs.iter().copied()).collect();
+        assert_eq!(got.len(), idx.len(), "{what}: a token appears twice");
+
+        let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = logits.iter().map(|&l| ((l - maxl) / temp).exp()).sum();
+        for (i, &l) in logits.iter().enumerate() {
+            let p = ((l - maxl) / temp).exp() / sum;
+            if p > 0.0 {
+                assert_eq!(
+                    got.get(&i),
+                    Some(&p),
+                    "{what}: token {i} has the wrong mass"
+                );
+            } else {
+                assert!(!got.contains_key(&i), "{what}: token {i} has no mass");
+            }
+        }
+
+        let (ridx, rprobs) = reference_support(logits, temp, 1.0);
+        for (&i, &p) in ridx.iter().zip(&rprobs) {
+            if p > 0.0 {
+                assert_eq!(
+                    got.get(&i),
+                    Some(&p),
+                    "{what}: token {i} differs from the oracle"
+                );
+            }
+        }
+        // The rounding bound of an `n`-term sequential f32 sum: what the oracle's early stop and
+        // the support's total can be off by without anything being wrong.
+        let tol = (logits.len() as f32 * f32::EPSILON).max(1e-3);
+        let kept: std::collections::HashSet<usize> = ridx.into_iter().collect();
+        let cut: f32 = got
+            .iter()
+            .filter(|(i, _)| !kept.contains(i))
+            .map(|(_, &p)| p)
+            .sum();
+        assert!(
+            cut <= tol,
+            "{what}: the oracle cut {cut} of mass, not rounding"
+        );
+
+        let mass: f32 = probs.iter().sum();
+        assert!(
+            (mass - 1.0).abs() <= tol,
+            "{what}: support mass {mass} != 1"
+        );
+        got.into_keys().collect()
+    }
+
+    /// **The widening path, end to end.** A flat row at `top_p` near 1 needs nearly EVERY entry, so
+    /// the `NUCLEUS_PROBE_K` probe must widen (×`NUCLEUS_WIDEN`, then snap to `n`) rather than hand
     /// back a truncated nucleus — silently truncating would drop mass the draw expects and, via
     /// [`truncated_dist`], change MTP's speculative accept ratios. Rows are sized to land on both
-    /// sides of the probe and of one widening step, including exact-boundary sizes.
+    /// sides of the probe and of one widening step, including exact-boundary sizes. `top_p = 1.0`
+    /// takes no order at all, so it is held to [`assert_full_support`] instead of the sorted oracle.
     #[test]
     fn nucleus_widening_reaches_the_full_vocab() {
-        let mut saw_full = false;
+        let mut saw_snap = false;
         let mut saw_widened = false;
+        let mut saw_full_support = false;
         for &n in &[
             NUCLEUS_PROBE_K - 1,
             NUCLEUS_PROBE_K,
@@ -1352,25 +1912,27 @@ mod tests {
         ] {
             for &(temp, top_p) in &[(1.0f32, 1.0f32), (0.6, 0.999), (1.0, 0.9)] {
                 // Perfectly flat: every token carries the same mass, so the nucleus is as deep as
-                // `top_p` demands and nothing about the row lets the probe get lucky.
+                // `top_p` demands and nothing about the row lets the probe get lucky. And a random
+                // row, where the widening lands mid-tail.
                 let flat = vec![0.0f32; n];
-                assert_eq!(
-                    truncated_softmax(&flat, temp, 0, top_p),
-                    reference_support(&flat, temp, top_p),
-                    "flat n={n} temp={temp} top_p={top_p}: bounded probe != full sort"
-                );
-                let got = truncated_softmax(&flat, temp, 0, top_p).0;
-                saw_full |= got.len() == n;
-                saw_widened |= got.len() > NUCLEUS_PROBE_K;
-
-                // And the same on a random row, where the widening lands mid-tail.
                 let rnd = seeded_logits(n, 99, 2.0, 0, false);
-                assert_eq!(
-                    truncated_softmax(&rnd, temp, 0, top_p),
-                    reference_support(&rnd, temp, top_p),
-                    "random n={n} temp={temp} top_p={top_p}: bounded probe != full sort"
-                );
-                saw_widened |= truncated_softmax(&rnd, temp, 0, top_p).0.len() > NUCLEUS_PROBE_K;
+                for (shape, row) in [("flat", &flat), ("random", &rnd)] {
+                    let what = format!("{shape} n={n} temp={temp} top_p={top_p}");
+                    if top_p >= 1.0 {
+                        let support = assert_full_support(row, temp, &what);
+                        saw_full_support |= support.len() == n;
+                        continue;
+                    }
+                    let got = truncated_softmax(row, temp, 0, top_p, 0.0);
+                    assert_eq!(
+                        got,
+                        reference_support(row, temp, top_p),
+                        "{what}: bounded probe != full sort"
+                    );
+                    saw_widened |= got.0.len() > NUCLEUS_PROBE_K;
+                    // Past one widening step's worth, which at these sizes only `k = n` can hold.
+                    saw_snap |= got.0.len() > NUCLEUS_PROBE_K * NUCLEUS_WIDEN;
+                }
             }
         }
         assert!(
@@ -1378,9 +1940,93 @@ mod tests {
             "no row exceeded the {NUCLEUS_PROBE_K}-candidate probe — widening untested"
         );
         assert!(
-            saw_full,
-            "no row pulled in the WHOLE vocab — the snap-to-n leg of the widening is untested"
+            saw_snap,
+            "no row needed more than one widening step — the snap-to-n leg is untested"
         );
+        assert!(
+            saw_full_support,
+            "no top_p = 1.0 row kept the WHOLE vocab — the full support is untested"
+        );
+    }
+
+    /// **`top_p >= 1` with no top-k keeps the whole distribution, and gets it right**, on a row the
+    /// size of a real vocabulary: a large random row, a masked one (the shape a grammar leaves),
+    /// a heavily tied one, and a flat one, at several temperatures. A support that dropped or
+    /// duplicated a token, kept a masked one, or normalized over anything but the full row fails
+    /// [`assert_full_support`]. Draws over many seeds must also land only on tokens with mass,
+    /// through both [`sample_logits`] and [`truncated_dist`]/[`sample_from_dist`].
+    ///
+    /// That the fast path is FASTER is measured, not asserted (timing in a unit test is noise);
+    /// [`top_p_one_without_top_k_sorts_nothing`] asserts the mechanism that makes it so.
+    #[test]
+    fn top_p_one_without_top_k_keeps_the_whole_distribution() {
+        const VOCAB: usize = 128_256;
+        let rows = [
+            ("random", seeded_logits(VOCAB, 5, 8.0, 0, false)),
+            ("masked", seeded_logits(VOCAB, 6, 8.0, 0, true)),
+            ("tied", seeded_logits(VOCAB, 7, 4.0, 2, false)),
+            ("flat", vec![0.0f32; VOCAB]),
+        ];
+        for (shape, row) in &rows {
+            for &temp in &[0.05f32, 0.6, 1.0, 2.5] {
+                let what = format!("{shape} temp={temp}");
+                let support = assert_full_support(row, temp, &what);
+                if *shape == "masked" {
+                    assert!(
+                        support.iter().all(|&i| row[i].is_finite()),
+                        "{what}: a masked token is in the support"
+                    );
+                }
+                let s = Sampler {
+                    temp,
+                    top_k: 0,
+                    top_p: 1.0,
+                    min_p: 0.0,
+                };
+                let dist = truncated_dist(row, s);
+                assert_eq!(dist.len(), support.len(), "{what}: MTP support differs");
+                let mut rng = legal_xorshift_state(0xC0FFEE);
+                for _ in 0..64 {
+                    let t = sample_logits(row, s, &mut rng) as usize;
+                    assert!(support.contains(&t), "{what}: drew {t}, which has no mass");
+                    let t = sample_from_dist(&dist, &mut rng) as usize;
+                    assert!(
+                        support.contains(&t),
+                        "{what}: MTP drew {t}, which has no mass"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **The mechanism: `top_p >= 1` with no top-k sorts nothing.** The widening loop would end in
+    /// a sort of all `n` entries; counted through `NUCLEUS_SORTED`. The `top_p < 1` row is the
+    /// control that shows the counter is live, and the non-finite rows show the degenerate cases
+    /// still take the sorted path they always did.
+    #[test]
+    fn top_p_one_without_top_k_sorts_nothing() {
+        let sorted = |logits: &[f32], top_p: f32| {
+            NUCLEUS_SORTED.with(|s| s.set(0));
+            let _ = truncated_softmax(logits, 0.8, 0, top_p, 0.0);
+            NUCLEUS_SORTED.with(std::cell::Cell::get)
+        };
+        let row = seeded_logits(NUCLEUS_PROBE_K * 16, 11, 2.0, 0, false);
+        assert_eq!(sorted(&row, 1.0), 0, "top_p = 1.0 sorted the vocab");
+        assert!(sorted(&row, 0.9) > 0, "the counter never moved");
+
+        let mut nan = row.clone();
+        nan[3] = f32::NAN;
+        let all_masked = vec![f32::NEG_INFINITY; row.len()];
+        for (what, r) in [("NaN", &nan), ("all -inf", &all_masked)] {
+            assert!(sorted(r, 1.0) > 0, "{what} row left the sorted path");
+            let (idx, probs) = truncated_softmax(r, 0.8, 0, 1.0, 0.0);
+            assert_eq!(
+                idx.len(),
+                r.len(),
+                "{what} row: the sorted path keeps every entry"
+            );
+            assert_eq!(idx.len(), probs.len());
+        }
     }
 
     /// `truncated_dist` shares `truncated_softmax`, and it RENORMALIZES over the returned support —
@@ -1396,9 +2042,29 @@ mod tests {
                     temp,
                     top_k: 0,
                     top_p,
+                    min_p: 0.0,
                 };
-                let (want_idx, want_probs) = reference_support(&logits, temp, top_p);
                 let got = truncated_dist(&logits, s);
+                if top_p >= 1.0 {
+                    // No order here: the same tokens, each renormalized over the support's own
+                    // index-order total, which is what `truncated_dist` divides by.
+                    let what = format!("n={n} temp={temp} top_p={top_p}");
+                    let support = assert_full_support(&logits, temp, &what);
+                    let (idx, probs) = truncated_softmax(&logits, temp, 0, top_p, 0.0);
+                    let total: f32 = probs.iter().sum();
+                    let want: std::collections::HashMap<usize, f32> =
+                        idx.into_iter().zip(probs).collect();
+                    assert_eq!(got.len(), support.len(), "{what}: MTP support drifted");
+                    for &(i, p) in &got {
+                        assert_eq!(
+                            Some(p),
+                            want.get(&(i as usize)).map(|w| w / total),
+                            "{what}: prob of {i} drifted"
+                        );
+                    }
+                    continue;
+                }
+                let (want_idx, want_probs) = reference_support(&logits, temp, top_p);
                 assert_eq!(
                     got.iter().map(|&(i, _)| i as usize).collect::<Vec<_>>(),
                     want_idx,

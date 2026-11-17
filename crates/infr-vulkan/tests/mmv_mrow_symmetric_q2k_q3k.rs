@@ -20,7 +20,7 @@ use infr_vulkan::VulkanBackend;
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn mrow_matches_mmv_mw_q2k_q3k() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

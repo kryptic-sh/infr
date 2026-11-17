@@ -235,7 +235,7 @@ fn mmv_mrow_legacy_formats_match_host_reference() {
                             + mn as f64 * sa_h[r * nblk + s] as f64;
                     }
                     let g = got[r * out_f + o] as f64;
-                    worst_abs = worst_abs.max((g - acc).abs());
+                    worst_abs = infr_testkit::nan_max64(worst_abs, (g - acc).abs());
                     sumsq += acc * acc;
                 }
             }

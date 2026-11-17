@@ -15,6 +15,3 @@ Cargo.lock.bak
 *.swp
 /ref/
 target-prof/
-
-# acceptance artifacts (scripts/accept.sh)
-/.cache/

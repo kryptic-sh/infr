@@ -40,7 +40,7 @@ use crate::sampling::{RequestCtx, StepGate};
 use crate::seam::SeamKv;
 use crate::{Config, GenStats, SeamModel};
 use anyhow::{anyhow, Result};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 /// Pure continuation-slot selection (the "this conversation continuing" case of [`checkout`], and
 /// the twin of `seam::model::SlotPool::pick`'s first arm). Given `(slot_idx, prefix_score,
@@ -107,6 +107,75 @@ impl Drop for SlotGuard<'_> {
     }
 }
 
+/// Two slots reserved across a prefix seed that runs with the pool unlocked (see
+/// [`seed_unlocked`]): `best`'s KV is the source, `target`'s the destination. Dropped before the
+/// seed returned — an unwind out of it — it puts both KVs back and frees both slots, or they would
+/// stay busy with their KV gone and every later checkout could wait on `freed` forever.
+struct SeedReservation<'a> {
+    pool: &'a Mutex<Pool>,
+    freed: &'a Condvar,
+    best: usize,
+    target: usize,
+    src: Option<SeamKv>,
+    dst: Option<SeamKv>,
+    done: bool,
+}
+
+impl Drop for SeedReservation<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        // The copy may have stopped partway: `dst`'s rows no longer match the tokens it claims.
+        if let Some(dst) = self.dst.as_mut() {
+            dst.reset();
+        }
+        let mut p = self
+            .pool
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        p.slots[self.best].kv = self.src.take();
+        p.slots[self.best].busy = false;
+        p.slots[self.target].kv = self.dst.take();
+        p.slots[self.target].busy = false;
+        drop(p);
+        self.freed.notify_all();
+    }
+}
+
+/// Run `seed` on slot `target`'s KV from slot `best`'s with the pool lock released, as the module
+/// doc requires around a GPU submit. Both slots are reserved (busy, KV taken out) meanwhile so no
+/// concurrent checkout selects them. Returns the re-acquired lock with `best` released and
+/// `target` still reserved, and what `seed` returned.
+fn seed_unlocked<'a>(
+    pool: &'a Mutex<Pool>,
+    freed: &'a Condvar,
+    mut p: MutexGuard<'a, Pool>,
+    best: usize,
+    target: usize,
+    seed: impl FnOnce(&mut Option<SeamKv>, &Option<SeamKv>) -> Result<()>,
+) -> (MutexGuard<'a, Pool>, Result<()>) {
+    p.slots[best].busy = true;
+    p.slots[target].busy = true;
+    let mut res = SeedReservation {
+        pool,
+        freed,
+        best,
+        target,
+        src: p.slots[best].kv.take(),
+        dst: p.slots[target].kv.take(),
+        done: false,
+    };
+    drop(p);
+    let r = seed(&mut res.dst, &res.src);
+    let mut p = pool.lock().expect("pool poisoned");
+    p.slots[best].kv = res.src.take();
+    p.slots[best].busy = false;
+    p.slots[target].kv = res.dst.take();
+    res.done = true;
+    (p, r)
+}
+
 /// The concurrent seam engine. `Sync`: `&self` is all a request needs, so N of them run at once.
 pub struct ParallelSeam {
     model: SeamModel,
@@ -117,9 +186,6 @@ pub struct ParallelSeam {
     /// The GPU baton. `None` when `n_slots == 1`: a lone sequence must not pay even a mutex per
     /// token, and single-request decode speed is a hard non-regression requirement.
     gate: Option<Arc<StepGate>>,
-    /// Host-RAM KV prefixes shared by every conversation on this engine (see
-    /// [`crate::seam::KvPrefixStore`]). Empty and inert unless `kv.store_mb` is set.
-    store: Mutex<crate::seam::KvPrefixStore>,
     max_ctx: usize,
     /// This model's OWN placement pins (pinned prefill chunk / auto-q8 KV — see
     /// [`crate::seam::PlacementPins`]). Per-engine so a multi-model host (`infr multi` runs N of
@@ -168,12 +234,6 @@ impl ParallelSeam {
         let pins = Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
         let max_ctx = model.vulkan_slot_ctx(&vk, n_slots, want_ctx)?;
-        let store_bytes = model
-            .cfg()
-            .kv
-            .store_mb
-            .map(|mb| (mb as usize).saturating_mul(1024 * 1024))
-            .unwrap_or(0);
         let mut engine = Self {
             model,
             vk,
@@ -182,7 +242,6 @@ impl ParallelSeam {
                 tick: 0,
             }),
             freed: Condvar::new(),
-            store: Mutex::new(crate::seam::KvPrefixStore::new(store_bytes)),
             // A 1-slot server has nothing to take turns with — keep it on the exact uncontended
             // path `infr run` takes (see `RequestCtx::gate_pass`: `None` constructs nothing).
             gate: (n_slots > 1).then(|| Arc::new(StepGate::new())),
@@ -206,7 +265,7 @@ impl ParallelSeam {
         crate::with_profiling_suppressed(|| {
             crate::seam::generate_dense_vulkan_session(
                 &self.vk,
-                self.model.weights(),
+                self.model.gguf(),
                 self.model.config(),
                 self.model.engine_cfg(),
                 self.model.embd(),
@@ -229,46 +288,19 @@ impl ParallelSeam {
         // Drop the warmup tokens so the first real prompt prefills a clean slot from row 0 instead
         // of forking off a garbage prefix.
         slot0.reset();
-        // `kv.paged`: one page pool for the whole session, so every slot forked below starts from
-        // the SHARED prefix pages instead of a copy of them (docs/perf/kv-prefix.md). Blocks are
-        // one per slot — the same device bytes `--parallel N` already costs — and a pool that does
-        // not fit degrades to the linear slots of old.
-        if n_slots > 1 && self.model.engine_cfg().kv.paged == Some(true) {
-            if !infr_core::backend::Backend::capabilities(&self.vk).kv_paging {
-                tracing::warn!("kv.paged: backend has no page-table KV path; slots stay linear");
-            } else {
-                let (k_fmt, v_fmt) = slot0.kv_fmts();
-                let paged = crate::seam::KvPool::new(
-                    &self.vk,
-                    self.model.config(),
-                    self.max_ctx,
-                    k_fmt,
-                    v_fmt,
-                    n_slots,
-                )
-                .and_then(|pool| slot0.attach_paged(&self.vk, self.model.config(), &pool));
-                if let Err(e) = paged {
-                    tracing::warn!(
-                        "kv.paged: could not page this session's KV ({e}); slots stay linear"
-                    );
-                }
-            }
-        }
 
         let mut slots = Vec::with_capacity(n_slots);
         for i in 1..n_slots {
             // A fork shares the `Arc<SeamWeights>` — it costs only its own KV + IO buffers. If VRAM
             // refuses, say so HERE, at boot, with the two knobs that fix it. Never mid-request.
-            let kv = slot0
-                .fork(&self.vk, self.model.config(), self.model.engine_cfg())
-                .map_err(|e| {
-                    anyhow!(
-                        "could not allocate KV slot {}/{n_slots} at ctx {}: {e}\n\
+            let kv = slot0.fork(&self.vk, self.model.config()).map_err(|e| {
+                anyhow!(
+                    "could not allocate KV slot {}/{n_slots} at ctx {}: {e}\n\
                      lower --parallel, or lower --ctx (each slot owns a full context of KV cache)",
-                        i + 1,
-                        self.max_ctx,
-                    )
-                })?;
+                    i + 1,
+                    self.max_ctx,
+                )
+            })?;
             slots.push(Slot {
                 kv: Some(kv),
                 busy: false,
@@ -317,6 +349,12 @@ impl ParallelSeam {
         &self.model
     }
 
+    /// The backend every slot of this engine runs on — for its counters and test hooks
+    /// (`decode_recordings`, `dense_pager_totals`, `force_dense_epoch_move_after`).
+    pub fn backend(&self) -> &infr_vulkan::VulkanBackend {
+        &self.vk
+    }
+
     /// A fresh per-sequence context wired to this engine's baton — one per request.
     pub fn request_ctx(&self, sampling: crate::sampling::RequestSampling) -> RequestCtx {
         match &self.gate {
@@ -340,7 +378,6 @@ impl ParallelSeam {
         /// Seeding shorter prefixes than this isn't worth the copy submit.
         const MIN_SEED: usize = 16;
         let cfg: &Config = self.model.config();
-        let ec = self.model.engine_cfg();
         let mut p = self.pool.lock().expect("pool poisoned");
         loop {
             let free: Vec<usize> = (0..p.slots.len()).filter(|&i| !p.slots[i].busy).collect();
@@ -389,27 +426,19 @@ impl ParallelSeam {
                         // `seed_from` is a device-side KV copy — it RECORDS, so it takes a turn on
                         // the baton like any other GPU submit. The module doc forbids holding the
                         // pool `Mutex` across a submit (it would serialize every other request's
-                        // checkout/drop behind this copy). So: RESERVE both slots (mark them busy so
-                        // no concurrent checkout can select them), take their KV out, DROP the lock
-                        // across `seed_from`, then re-acquire to put them back.
-                        p.slots[best].busy = true;
-                        p.slots[target].busy = true;
-                        let src = p.slots[best].kv.take().expect("scored slot is Some");
-                        let mut dst = p.slots[target].kv.take();
-                        drop(p);
-                        let r = {
-                            let _gp = req.gate_pass();
-                            match dst.as_mut() {
-                                Some(dst) => dst.seed_from(&self.vk, cfg, ec, &src, best_s),
-                                None => Ok(()),
-                            }
-                        };
-                        p = self.pool.lock().expect("pool poisoned");
-                        // Return the source slot's KV and release its reservation; `target` stays
-                        // reserved (busy) — it is checked out just below.
-                        p.slots[best].kv = Some(src);
-                        p.slots[best].busy = false;
-                        p.slots[target].kv = dst;
+                        // checkout/drop behind this copy), so both slots are reserved and the
+                        // lock dropped across it. `target` comes back still reserved — it is
+                        // checked out just below.
+                        let r;
+                        (p, r) =
+                            seed_unlocked(&self.pool, &self.freed, p, best, target, |dst, src| {
+                                let src = src.as_ref().expect("scored slot is Some");
+                                let _gp = req.gate_pass();
+                                match dst.as_mut() {
+                                    Some(dst) => dst.seed_from(&self.vk, cfg, src, best_s),
+                                    None => Ok(()),
+                                }
+                            });
                         // A failed seed costs only the prefix reuse — the slot re-prefills from
                         // scratch and the answer is identical. Never fail the request for it.
                         if let Err(e) = r {
@@ -450,47 +479,27 @@ impl ParallelSeam {
         req: &RequestCtx,
         mut on_piece: impl FnMut(&str),
     ) -> Result<GenStats> {
-        // Images (if any) become placeholder ids + an embedding override the runner reads; the
-        // guard keeps that override published for exactly this generation.
-        let (prompt_tokens, _media) = self.model.encode_prompt(prompt, self.max_ctx, Some(req))?;
+        let prompt_tokens = self.model.encode(prompt)?;
         let mut guard = self.checkout(&prompt_tokens, req)?;
-        // A prefix this engine already materialized — possibly for another conversation — costs one
-        // upload here and is then skipped by the prefill, exactly like a seed from a sibling slot.
-        if let Some(kv) = guard.kv.as_mut() {
-            let restored = self
-                .store
-                .lock()
-                .map_err(|_| anyhow!("kv store lock poisoned"))?
-                .restore(
-                    &self.vk,
-                    self.model.config(),
-                    self.model.engine_cfg(),
-                    kv,
-                    &prompt_tokens,
-                )?;
-            if restored > 0 {
-                tracing::debug!(tokens = restored, "kv store: restored a stored prefix");
-            }
-        }
         // Cap the reply to the context actually left in THIS slot (a per-slot ctx is smaller than
         // the model's trained window under `-np N`), mirroring the sequential session path: a
         // generation ceiling is a default, not a demand. An over-long PROMPT still errors cleanly
         // in the runner.
-        let max_new = max_new.min(self.max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let budget = crate::seam::model::reply_budget(max_new, self.max_ctx, prompt_tokens.len());
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         // Resolve `ubatch_rows`/`kv_auto_q8` against THIS engine's pins for the decode (warm calls
         // must agree with the buffers placement sized). Concurrent requests share the one cell.
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
-        let (_ids, stats) = crate::seam::generate_dense_vulkan_session(
+        let (_ids, mut stats) = crate::seam::generate_dense_vulkan_session(
             &self.vk,
-            self.model.weights(),
+            self.model.gguf(),
             self.model.config(),
             self.model.engine_cfg(),
             self.model.embd(),
             self.model.per_layer_embd(),
             &prompt_tokens,
-            max_new,
+            budget,
             |id| {
                 crate::stream_token(
                     self.model.tokenizer(),
@@ -505,33 +514,49 @@ impl ParallelSeam {
             constraint,
             Some(req),
         )?;
-        // Keep this prompt's rows for whoever asks the adjacent question next. A failure here is a
-        // cache miss on the next request, never a failed request.
-        if let Some(kv) = guard.kv.as_ref() {
-            match self.store.lock().map(|mut s| {
-                s.capture(
-                    &self.vk,
-                    self.model.config(),
-                    self.model.engine_cfg(),
-                    kv,
-                    prompt_tokens.len(),
-                )
-                .map(|kept| (kept, s.stats()))
-            }) {
-                Ok(Ok((kept, (blocks, bytes)))) if kept > 0 => {
-                    tracing::debug!(tokens = kept, blocks, bytes, "kv store: captured a prefix");
-                }
-                Ok(Err(e)) => tracing::warn!(error = %e, "kv store: capture failed"),
-                _ => {}
-            }
-        }
+        stats.ctx_full = crate::ran_out_of_context(max_new, budget, &stats);
         Ok(stats)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::pick_continuation;
+    use super::{pick_continuation, seed_unlocked, Pool, Slot};
+    use std::sync::{Condvar, Mutex};
+
+    /// A panic inside the unlocked prefix seed frees both reserved slots. It used to unwind past
+    /// the re-lock, leaving them busy with their KV gone, so once every other slot was taken a
+    /// checkout waited on `freed` forever.
+    #[test]
+    fn a_panicking_seed_releases_both_slots() {
+        let slot = || Slot {
+            kv: None,
+            busy: false,
+            tick: 0,
+        };
+        let pool = Mutex::new(Pool {
+            slots: vec![slot(), slot(), slot()],
+            tick: 0,
+        });
+        let freed = Condvar::new();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let p = pool.lock().unwrap();
+            seed_unlocked(&pool, &freed, p, 2, 0, |_, _| panic!("seed_from panicked"))
+        }));
+        assert!(r.is_err(), "the injected panic did not happen");
+        let p = pool
+            .lock()
+            .expect("the pool lock was not held across the seed");
+        let busy: Vec<bool> = p.slots.iter().map(|s| s.busy).collect();
+        assert_eq!(busy, [false, false, false]);
+
+        // The ordinary return: the source is released, the target stays reserved for checkout.
+        drop(p);
+        let (p, r) = seed_unlocked(&pool, &freed, pool.lock().unwrap(), 2, 0, |_, _| Ok(()));
+        assert!(r.is_ok());
+        let busy: Vec<bool> = p.slots.iter().map(|s| s.busy).collect();
+        assert_eq!(busy, [true, false, false]);
+    }
 
     #[test]
     fn continuation_picks_longest_prefix_not_first() {

@@ -42,7 +42,7 @@ The seam is nonetheless an unusually good training substrate:
 Why a sibling crate and not the alternatives:
 
 - **Not in-tree in `infr-llama`:** the forward path is optimized for inference
-  (decode-only n=1 graphs, quant-resident weights, aliasing, KV growth).
+  (one sequence per graph, quant-resident weights, aliasing, KV growth).
   Grafting training in would entangle two regimes and endanger the
   token-for-token CPU/GPU parity guarantees.
 - **Not a separate repo:** training co-evolves the shared crates (new `Op`
@@ -84,10 +84,11 @@ Why a sibling crate and not the alternatives:
    attention-bwd (flash backward needs softmax stats the forward doesn't save
    today), swiglu/gated-act-bwd, fused softmax-cross-entropy, embedding
    scatter-add. Each with a CPU reference first.
-2. **Batched full-sequence forward graphs.** The CPU seam is decode-only (n=1);
-   training needs `[batch, seq]` shapes and **retained activations** — today
-   `Internal` scratch is allocated inside `execute` and freed after. Training
-   graphs declare activations as persistent outputs instead.
+2. **Batched full-sequence forward graphs.** The seam runs one sequence per
+   graph — a prefill ubatch or an n=1 decode step — and keeps nothing; training
+   needs `[batch, seq]` shapes and **retained activations** — today `Internal`
+   scratch is allocated inside `execute` and freed after. Training graphs
+   declare activations as persistent outputs instead.
 3. **Activation checkpointing.** The single most important non-inference
    feature; recompute per layer-block on the backward walk. Without it, 7B
    activations are hopeless; with it, 2–4 GB.

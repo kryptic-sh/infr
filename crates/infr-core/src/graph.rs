@@ -106,6 +106,41 @@ pub struct HyperGates {
     pub comb: TensorId,
 }
 
+/// DeepSeek V4's COMPRESSED key segment on [`Op::Attention`] (`comp`): a CSA or HCA layer's
+/// compressed cache, attended beside the raw sliding window in the same softmax.
+///
+/// The reference concatenates the two caches into one (`build_csa_lid_attention` /
+/// `build_hca_attention`: `ggml_concat(raw_k, comp_k)` with the raw mask and the compressed mask
+/// concatenated the same way) and runs one attention over the result with the per-head sink. This
+/// carries the second half as its own operand instead, which is the same function without the
+/// per-step copy of up to `ctx/ratio` rows.
+///
+/// Key `j` of the compressed cache is visible to query row `t` (absolute position `p = pos + t`)
+/// iff `j < len` and `j < (p + 1) / ratio`, integer FLOOR: a block becomes visible at the token
+/// that completes it, never before (`llama_kv_cache_dsv4`'s plan `n_visible`, written into the
+/// compressed mask by `dsv4_set_kq_mask`). A visible key scores `q·cache[j] * scale + bias[t, j]`
+/// and its value row is `cache[j]` itself: the compressed cache serves as both K and V (V4's
+/// `build_attn_mha(q, k_all, k_all, …)`), `n_kv * head_dim` wide like the raw rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompSegment {
+    /// Compressed rows `[cap_rows, n_kv * head_dim]`, row `j` holding block `j`. A persistent
+    /// buffer like the raw cache, read in place and never written by this op; `cap_rows >= len`.
+    pub cache: TensorId,
+    /// Committed rows: no key at or past `len` is read. The caller passes the ubatch's widest
+    /// visible count (`Dsv4CompPlan::n_visible_max`), so `len` never cuts a visible key.
+    pub len: u32,
+    /// Positions per compressed block, at least 1 (V4 uses `DSV4_CSA_RATIO` and
+    /// `DSV4_HCA_RATIO`).
+    pub ratio: u32,
+    /// Optional additive score bias `[rows, len]` f32, row stride `len`, added before the softmax
+    /// max — exactly [`Op::TopkMask`]'s `dst` laid out with its `kv_len` = `len`, so the CSA emit
+    /// passes the indexer's expanded selection straight in. A key is attended only when it is
+    /// causally visible (above) AND its bias is finite, which is the reference's
+    /// `top-k mask + causal mask` sum: a selected-but-invisible index (the indexer fills its tail
+    /// with those when fewer than `top_k` keys are visible) stays masked. `None` on HCA layers.
+    pub bias: Option<TensorId>,
+}
+
 /// How a tensor handle is provisioned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TensorKind {
@@ -188,16 +223,6 @@ pub enum Op {
         /// runs ONE wide GEMM over the whole tensor while decode keeps per-projection GEMVs into
         /// its slices. Must be row-aligned (`w_off % in_f == 0`) and block-aligned for quants.
         w_off: u32,
-    },
-    /// Native trellis projection with scale-Hadamard transforms on both sides.
-    LinearExl3 {
-        x: TensorId,
-        trellis: TensorId,
-        suh: TensorId,
-        svh: TensorId,
-        dst: TensorId,
-        m: u32,
-        spec: crate::Exl3Spec,
     },
     /// Row-wise softmax: `dst[r, :] = softmax(x[r, :] * scale)` over `dim` columns, `rows` rows.
     /// diffusion-gemma's in-graph self-conditioning (see `docs/diffusion-gemma.md`'s Phase-B and
@@ -422,6 +447,17 @@ pub enum Op {
         /// `None` for every arch in this codebase today, and on that path each backend runs the code
         /// it ran before this field existed — no current model's numerics can move.
         key_bias: Option<TensorId>,
+        /// Optional compressed key segment (DeepSeek V4's CSA/HCA tiers, see [`CompSegment`]),
+        /// attended after the raw keys in ONE softmax: the score max, the denominator and the
+        /// output each run over the visible raw keys, then the visible compressed keys, then the
+        /// sink when `sinks` is set. The raw keys keep `mask` exactly as without it.
+        ///
+        /// Requires `key_bias: None` (the compressed segment carries its own bias, and V4 has no
+        /// raw-side one) and a causal or sliding-window `mask`; [`check_attention`] is the
+        /// host check every backend runs. CPU and Vulkan serve it; Metal refuses it.
+        ///
+        /// `None` leaves every backend on the code it ran before this field existed.
+        comp: Option<CompSegment>,
     },
     /// Multi-head Latent Attention (DeepSeek V2/V3). Absorbed form: one compressed K row per token
     /// (V is an aliased prefix view), `wk_b` absorbs Q nope into the latent space before the dot
@@ -473,8 +509,14 @@ pub enum Op {
         key_bias: Option<TensorId>,
     },
     /// Expand `Op::LightningIndexer`'s `[rows, top_k]` i32 key indices into the additive
-    /// `[rows, kv_len]` f32 score mask `Op::Mla::key_bias` consumes: `0.0` at every selected key,
+    /// `[rows, kv_len]` f32 score mask `Op::Mla::key_bias` (V3.2) and [`CompSegment::bias`] (V4,
+    /// with `kv_len` the segment's `len`) consume: `0.0` at every selected key,
     /// `f32::NEG_INFINITY` everywhere else.
+    ///
+    /// A selected index is not by itself a visible key: when fewer than `top_k` keys are eligible
+    /// the indexer fills the tail with ineligible ones, and the consumer's own causal rule keeps
+    /// them masked — the reference's `build_top_k_mask` likewise ADDS this mask to the causal
+    /// one, so a key is attended only when it is both selected and causally visible.
     ///
     /// This is the whole of "how top-k feeds attention" (`docs/deepseek.md`): llama.cpp materialises
     /// the same `[n_kv, n_tokens]` mask and adds it to the causal one, so the numerics are faithful
@@ -488,7 +530,9 @@ pub enum Op {
     ///
     /// `-inf` (not a large finite negative) is safe because at least one key is always selected:
     /// `top_k >= 1` and the indexer's own order ranks every causally-eligible key above every
-    /// ineligible one, so each row's softmax max is finite and `exp(-inf - max) == 0` exactly.
+    /// ineligible one, so each row's softmax max is finite and `exp(-inf - max) == 0` exactly. On
+    /// V4 a row may see no compressed key at all, and its max stays finite through the raw keys
+    /// the same attention scores first (each row's own key among them).
     /// Indices are read as u32 bit patterns out of the i32 `idx` tensor — [`Op::Argmax`]'s carrier
     /// convention, which is what `Op::LightningIndexer` writes.
     TopkMask {
@@ -681,15 +725,21 @@ pub enum Op {
         /// Channels per row; the compressor's `n_embd_head`, doubled where the tier doubles it.
         n_embd: u32,
     },
-    /// DeepSeek V3.2's **lightning indexer** (`deepseek32.cpp`'s `// lightning indexer` block, the
-    /// non-fused branch): a cheap per-(query row, key) relevance score whose top-`top_k` keys are
-    /// the only ones that layer's real MLA attention may then see. Per query row `t` at absolute
-    /// position `abs = pos + t`:
+    /// DeepSeek's **lightning indexer** (V3.2: `deepseek32.cpp`'s `// lightning indexer` block, the
+    /// non-fused branch; V4: `deepseek4.cpp`'s `build_lid_top_k`, whose fused form is ggml's
+    /// `GGML_OP_LIGHTNING_INDEXER` with the same arithmetic): a cheap per-(query row, key)
+    /// relevance score whose top-`top_k` keys are the only ones that layer's real attention may
+    /// then see. Per query row `t` at absolute position `abs = pos + t`:
     ///
     /// ```text
-    /// score[t, j] = Σ_h  (w[t, h] * scale) * ReLU( q[t, h] · k[j] )     for j <= abs
+    /// score[t, j] = Σ_h  (w[t, h] * scale) * ReLU( q[t, h] · k[j] )     for j < (abs + 1) / block_ratio
     /// dst[t, :]   = the top_k key positions j by (score DESC, j ASC)
     /// ```
+    ///
+    /// With `block_ratio` 1 (V3.2) the bound is `j <= abs`, one key per token. V4's keys are the
+    /// LID compressor's blocks (`kv_lid`, one row per `block_ratio` positions), and a block is
+    /// eligible from the token that completes it on: the integer floor is the compressed mask's
+    /// `n_visible` (`dsv4_set_kq_mask`), so the indexer and [`CompSegment`] agree on every key.
     ///
     /// Four things the reference pins down that a plausible-looking variant gets silently wrong:
     ///
@@ -716,9 +766,11 @@ pub enum Op {
     ///
     /// What the CALLER owes (deepseek32's traps, see `docs/deepseek.md` § "The lightning indexer"):
     /// `q` arrives ALREADY ASSEMBLED and ALREADY ROPE'D — this op does no rope of its own (unlike
-    /// [`Op::Mla`], which ropes its q_pe internally). The indexer head is laid out `[rope | nope]`,
-    /// the OPPOSITE of the MLA head, and its rope is NEOX where the main rope is NORM; both are the
-    /// graph builder's problem, and by the time the head reaches here it is just `head_dim` floats.
+    /// [`Op::Mla`], which ropes its q_pe internally). V3.2's indexer head is laid out
+    /// `[rope | nope]`, the OPPOSITE of the MLA head, and its rope is NEOX where the main rope is
+    /// NORM; V4 ropes the head's tail with the compressed-layer rope instead (`build_lid_top_k`'s
+    /// `ggml_rope_set_offset`). Both are the graph builder's problem, and by the time the head
+    /// reaches here it is just `head_dim` floats.
     /// The **Hadamard rotation** llama.cpp applies to `q` and `k` is deliberately NOT ported: it is
     /// one orthogonal transform applied identically to both sides, so it preserves every dot
     /// product and exists only for quantisation friendliness — nothing to reproduce in an
@@ -731,14 +783,15 @@ pub enum Op {
     /// cap_rows`, and every backend refuses a cache with fewer than `kv_len` rows. A wrapped ring
     /// cannot arise here and could not be served if it did — masking is causal only, so position 0
     /// is eligible for every query row, and a ring that had wrapped would have overwritten row 0
-    /// with a later position before this op ever ran. (V3.2's indexer has no sliding window; the
-    /// caches that wrap in this codebase are the SWA ones.) Emitting indices rather than a `-inf`
+    /// with a later position before this op ever ran. (V3.2's indexer has no sliding window, nor
+    /// does V4's block cache, which holds every block of the context; the caches that wrap in this
+    /// codebase are the SWA ones.) Emitting indices rather than a `-inf`
     /// mask keeps both the mask expansion and a later gather open to the consumer (see
     /// `docs/deepseek.md` § "How top-k feeds attention"): llama.cpp itself expands them back into a
     /// mask and runs dense attention, realising none of the FLOP saving.
     ///
     /// **Ordering is total and identical on every backend**: by score descending, ties broken
-    /// toward the LOWER key index. Keys past the causal bound (`j > abs`) rank below every eligible
+    /// toward the LOWER key index. Keys past the causal bound rank below every eligible
     /// key and among themselves by ascending index, so when fewer than `top_k` keys are eligible
     /// the tail fills with the lowest ineligible positions. That short case is llama.cpp's too —
     /// it clamps only against `n_kv` (`n_top_k = min(indexer_score->ne[0], n_indexer_top_k)`) and
@@ -750,13 +803,13 @@ pub enum Op {
     ///
     /// `top_k <= kv_len` is a precondition (the caller clamps, as llama.cpp's `min` does); each
     /// backend refuses a larger `top_k` rather than naming keys that do not exist. Masking is
-    /// causal only — V3.2's indexer has no sliding window, so there is no [`AttnMask`] here.
+    /// causal only — neither indexer has a sliding window, so there is no [`AttnMask`] here.
     LightningIndexer {
         /// Indexer queries `[rows, n_head, head_dim]`, f32, rope already applied.
         q: TensorId,
-        /// Indexer key cache `[cap_rows, head_dim]` — ONE row per token (MQA). `cap_rows = numel /
-        /// head_dim` must be at least `kv_len`; key `j` is row `j` (see above on why there is no
-        /// ring fold here).
+        /// Indexer key cache `[cap_rows, head_dim]` — ONE row per key (MQA): per token on V3.2, per
+        /// compressed block on V4. `cap_rows = numel / head_dim` must be at least `kv_len`; key `j`
+        /// is row `j` (see above on why there is no ring fold here).
         k_cache: TensorId,
         /// Per-head indexer weights `w` `[rows, n_head]`, f32 — `indexer_proj · x`, UNSCALED (this
         /// op applies `scale`).
@@ -772,6 +825,10 @@ pub enum Op {
         scale: f32,
         /// Absolute position of the first query row (the causal bound is `pos + t`).
         pos: u32,
+        /// Positions per key, at least 1: key `j` is eligible for the row at `abs` iff
+        /// `j < (abs + 1) / block_ratio`. 1 is V3.2's per-token cache; V4's LID cache uses
+        /// `DSV4_CSA_RATIO`.
+        block_ratio: u32,
     },
     /// Gated FFN activation: `dst[r,i] = act(gate[r,i]) * up[r, i + up_off]` (`rows × nff`). `gate`
     /// and `up` are separate handles (a backend may fuse them into one buffer internally). `up_off`
@@ -965,6 +1022,84 @@ pub enum Op {
         rows: u32,
         ne: u32,
     },
+    /// Gather f32 rows by **i32 index**, a column window of each, into a grouped destination — the
+    /// DeepSeek V4 compressor's source assembly (`ggml_get_rows` on the compressor state, then the
+    /// views, `ggml_concat`s and `ggml_cont`s of `deepseek4.cpp`'s
+    /// `build_hca_compressed_kv_from_state` and `build_overlap_compressed_kv_from_state`), laid out
+    /// for [`Op::CompressPool`]. For `r` in `0..rows`:
+    ///
+    /// ```text
+    /// i      = idx[idx_off + r]
+    /// d      = (r / group) * dst_group_stride + dst_row_off + r % group
+    /// dst[d*n .. d*n + n] = i < 0 ? fill : src[i*src_stride + src_col .. + n]
+    /// ```
+    ///
+    /// Destination rows no `r` maps to are left as they are, so two gathers can fill one
+    /// destination: `dst` is read as well as written.
+    ///
+    /// **How the compressors express it.** `D` is the compressor's head width (`n_embd_head`), `B`
+    /// the committed block count, and `idx` the per-step i32 input holding the plan's
+    /// `state_read_idxs` (`seam::dsv4_plan`). `src` is the `[persistent state | this step's rows]`
+    /// source the reference concatenates, assembled by the emit, once for values and once for
+    /// scores; each gather below runs once per pair with `fill` 0 for values and `-inf` for scores.
+    ///
+    /// * **HCA** (window `DSV4_HCA_RATIO`, `W` here): state rows are `D` wide and every block reads
+    ///   its own `W` rows, so the destination is the index order itself:
+    ///   `{ rows: W*B, idx_off: 0, src_stride: D, src_col: 0, n: D, group: 1,
+    ///   dst_group_stride: 1, dst_row_off: 0 }`. No index is negative.
+    /// * **CSA / LID overlap** (ratio `R`): state rows are `2*D` wide and `idx` holds every block's
+    ///   `R` previous-window reads, then every block's `R` current-window reads. Two gathers into
+    ///   one destination, each block's window holding its previous rows then its current ones:
+    ///   - previous half `{ rows: R*B, idx_off: 0, src_stride: 2*D, src_col: 0, n: D, group: R,
+    ///     dst_group_stride: 2*R, dst_row_off: 0 }`;
+    ///   - current half `{ rows: R*B, idx_off: R*B, src_stride: 2*D, src_col: D, n: D, group: R,
+    ///     dst_group_stride: 2*R, dst_row_off: R }`.
+    ///
+    ///   A read before the sequence start is the sentinel row (`dsv4_append_zero_row`: zero
+    ///   values, `-inf` scores), which this op produces from `fill` for a NEGATIVE index. The
+    ///   reference names that row by its position past the source (`state rows + tokens`), which
+    ///   is out of range here; the plan's `gather_read_idxs` (`seam::dsv4_plan`) hands the emit
+    ///   the reads with it already `-1`.
+    ///
+    /// Either way `dst` is `[B, window, D]` with `D` fastest, which is [`Op::CompressPool`]'s
+    /// `values`/`scores` layout with `blocks: B` and `n_embd: D`.
+    ///
+    /// **The index contract.** A negative index is the fill. An index at or past the source's row
+    /// count (`src` numel / `src_stride`) is an ERROR, never a second spelling of the sentinel:
+    /// the CPU backend refuses it, and the GPU backends, which cannot see index values when
+    /// recording, write `fill` for it instead of reading past the buffer (the `Op::GatherI32`
+    /// rule). Geometry is checked on the host by [`check_gather_rows`].
+    ///
+    /// **`src` must be an op-produced or bound f32 tensor the executors load, not a KV cache
+    /// operand**: the CPU executor reads a KV cache straight from its bound buffer and never
+    /// mirrors it into its working store (`Graph::in_place_inputs`), so a gather reading one
+    /// would find nothing there.
+    GatherRows {
+        /// Source rows `[n_src, src_stride]` f32.
+        src: TensorId,
+        /// Row indices, [`crate::DType::I32`]; at least `idx_off + rows` of them.
+        idx: TensorId,
+        /// Destination rows `n` wide, f32; read and written.
+        dst: TensorId,
+        /// Index entries gathered.
+        rows: u32,
+        /// First index entry read.
+        idx_off: u32,
+        /// Elements per source row.
+        src_stride: u32,
+        /// First source column copied.
+        src_col: u32,
+        /// Columns copied per row, and the destination's row width.
+        n: u32,
+        /// Consecutive index entries that land in one destination group.
+        group: u32,
+        /// Destination rows from one group's start to the next.
+        dst_group_stride: u32,
+        /// Destination row, within its group, of the group's first entry.
+        dst_row_off: u32,
+        /// Written for a negative index.
+        fill: f32,
+    },
     /// Copy `n` elements `src[src_off..] -> dst[dst_off..]` (extract last row, gather a slice).
     Copy {
         src: TensorId,
@@ -1055,9 +1190,11 @@ pub enum Op {
         /// `infr_vulkan::ExpertParallelBackend`'s per-rank graph lowering; every model builder and
         /// the CPU/Metal reference interpreters leave it `None` (EP is a Vulkan-only path).
         ep_band: Option<(u32, u32)>,
-        /// DeepSeek V2+: per-layer router bias `[n_expert]` added to logits for SELECTION only;
-        /// the unbias'd probs are still used for the per-expert routing weights. `None` = no bias.
-        /// Must be `None` when [`Op::MoeFfn::expert_ids`] is set — there is no selection to bias.
+        /// DeepSeek V3+ / ERNIE 4.5 MoE: per-layer router bias `[n_expert]` added to the GATED
+        /// probabilities (after `gating`: the full-row softmax, the sigmoid, …) for SELECTION only,
+        /// as llama.cpp's `selection_probs = ggml_add(probs, exp_probs_b)`; the unbiased probs are
+        /// still used for the per-expert routing weights. `None` = no bias. Must be `None` when
+        /// [`Op::MoeFfn::expert_ids`] is set — there is no selection to bias.
         exp_probs_b: Option<TensorId>,
         /// DeepSeek V3+: group-limited routing — number of expert groups (0 = no grouping). Must be
         /// `0`/`1` when [`Op::MoeFfn::expert_ids`] is set (same reason as `exp_probs_b`).
@@ -1102,6 +1239,33 @@ pub enum Op {
         rows: u32,
         channels: u32,
         kernel: u32,
+    },
+    /// LFM's gated short convolution (`build_lfm_shortconv` in llama.cpp's `lfm-base.cpp`), over
+    /// `rows` tokens in order. `bcx` is the `[rows, 3*channels]` in-projection output, each row read
+    /// as three `channels`-wide blocks `B | C | X`. Per token: `bx = B ⊙ X`, then the depthwise
+    /// causal conv `conv[ch] = Σ_{j<kernel-1} state[j,ch]·w[ch,j] + bx[ch]·w[ch,kernel-1]` with NO
+    /// activation, then `dst = C ⊙ conv`; the history then shifts (drop oldest, append `bx`).
+    /// `weight` is `[channels, kernel]` and `state` the rolling `[(kernel-1), channels]` history,
+    /// oldest row first — the layouts [`Op::Conv1dSilu`] uses. `dst` is `[rows, channels]`.
+    ShortConv {
+        bcx: TensorId,
+        weight: TensorId,
+        state: TensorId,
+        dst: TensorId,
+        rows: u32,
+        channels: u32,
+        kernel: u32,
+    },
+    /// Per-head sigmoid output gate (LFM3 attention): `dst[r, h*head_dim + i] =
+    /// x[r, h*head_dim + i] * sigmoid(gate[r, h])`. `x`/`dst` are `[rows, n_head*head_dim]`, `gate`
+    /// is `[rows, n_head]` — one raw logit per head per token. In place when `dst == x`.
+    HeadGate {
+        x: TensorId,
+        gate: TensorId,
+        dst: TensorId,
+        rows: u32,
+        n_head: u32,
+        head_dim: u32,
     },
     /// Gated-DeltaNet linear-attention recurrence step (qwen35), one token. Per VALUE head:
     /// L2-normalize `q`,`k`; scale `q` by `1/√head_k`; `beta = sigmoid(b)`, `decay =
@@ -1163,7 +1327,6 @@ impl Op {
             Op::LayerNorm { .. } => "LayerNorm",
             Op::Softmax { .. } => "Softmax",
             Op::Linear { .. } => "Linear",
-            Op::LinearExl3 { .. } => "LinearExl3",
             Op::QkNorm { .. } => "QkNorm",
             Op::GatedRmsNorm { .. } => "GatedRmsNorm",
             Op::Rope { .. } => "Rope",
@@ -1189,10 +1352,13 @@ impl Op {
             Op::Sample { .. } => "Sample",
             Op::EmbedGather { .. } => "EmbedGather",
             Op::GatherI32 { .. } => "GatherI32",
+            Op::GatherRows { .. } => "GatherRows",
             Op::Copy { .. } => "Copy",
             Op::CopyStrided { .. } => "CopyStrided",
             Op::MoeFfn { .. } => "MoeFfn",
             Op::Conv1dSilu { .. } => "Conv1dSilu",
+            Op::ShortConv { .. } => "ShortConv",
+            Op::HeadGate { .. } => "HeadGate",
             Op::DeltaNet { .. } => "DeltaNet",
             Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
         }
@@ -1225,14 +1391,6 @@ impl Op {
                 (r, vec![dst])
             }
             Op::Linear { x, weight, dst, .. } => (vec![x, weight], vec![dst]),
-            Op::LinearExl3 {
-                x,
-                trellis,
-                suh,
-                svh,
-                dst,
-                ..
-            } => (vec![x, trellis, suh, svh], vec![dst]),
             Op::QkNorm { x, weight, dst, .. } => {
                 let mut r = vec![x];
                 r.extend(weight);
@@ -1276,11 +1434,16 @@ impl Op {
                 dst,
                 sinks,
                 key_bias,
+                comp,
                 ..
             } => {
                 let mut r = vec![q, k_cache, v_cache];
                 r.extend(sinks);
                 r.extend(key_bias);
+                if let Some(c) = comp {
+                    r.push(c.cache);
+                    r.extend(c.bias);
+                }
                 (r, vec![dst])
             }
             Op::Mla {
@@ -1289,10 +1452,12 @@ impl Op {
                 wk_b,
                 wv_b,
                 dst,
+                freq_factors,
                 key_bias,
                 ..
             } => {
                 let mut r = vec![q, k_cache, wk_b, wv_b];
+                r.extend(freq_factors);
                 r.extend(key_bias);
                 (r, vec![dst])
             }
@@ -1357,6 +1522,8 @@ impl Op {
             Op::GatherI32 {
                 ids, table, dst, ..
             } => (vec![ids, table], vec![dst]),
+            // `dst` is read too: rows no index maps to keep their value (two gathers share one).
+            Op::GatherRows { src, idx, dst, .. } => (vec![src, idx, dst], vec![dst]),
             Op::Copy { src, dst, .. } => (vec![src], vec![dst]),
             Op::CopyStrided { src, dst, .. } => (vec![src], vec![dst]),
             Op::MoeFfn {
@@ -1367,12 +1534,14 @@ impl Op {
                 up_exps,
                 down_exps,
                 down_scale,
+                exp_probs_b,
                 expert_ids,
                 dst,
                 ..
             } => {
                 let mut r = vec![x, router_x, router, gate_exps, up_exps, down_exps];
                 r.extend(down_scale);
+                r.extend(exp_probs_b);
                 r.extend(expert_ids);
                 (r, vec![dst])
             }
@@ -1383,6 +1552,14 @@ impl Op {
                 dst,
                 ..
             } => (vec![x, weight, state], vec![state, dst]),
+            Op::ShortConv {
+                bcx,
+                weight,
+                state,
+                dst,
+                ..
+            } => (vec![bcx, weight, state], vec![state, dst]),
+            Op::HeadGate { x, gate, dst, .. } => (vec![x, gate], vec![dst]),
             Op::DeltaNet {
                 q,
                 k,
@@ -1406,6 +1583,221 @@ impl Op {
                 ..
             } => (vec![moe, shexp, gate], vec![dst]),
         }
+    }
+}
+
+/// The host-side geometry check every backend runs before an [`Op::GatherRows`]: dtypes, the
+/// column window inside a source row, groups that cannot overlap, and an `idx` and `dst` large
+/// enough for every entry the op touches. Returns the source's row count, the bound past which an
+/// index is out of range. Index VALUES are not checked here; see the op's doc.
+pub fn check_gather_rows(g: &Graph, op: &Op) -> Result<usize, String> {
+    let Op::GatherRows {
+        src,
+        idx,
+        dst,
+        rows,
+        idx_off,
+        src_stride,
+        src_col,
+        n,
+        group,
+        dst_group_stride,
+        dst_row_off,
+        ..
+    } = *op
+    else {
+        return Err(format!("check_gather_rows: got {}", op.kind()));
+    };
+    for (what, t, want) in [
+        ("src", src, crate::DType::F32),
+        ("idx", idx, crate::DType::I32),
+        ("dst", dst, crate::DType::F32),
+    ] {
+        let got = g.desc(t).dtype;
+        if got != want {
+            return Err(format!(
+                "Op::GatherRows: {what} must be {want:?}, got {got:?}"
+            ));
+        }
+    }
+    if src == dst {
+        return Err("Op::GatherRows: src and dst are the same tensor".into());
+    }
+    if n == 0 || group == 0 {
+        return Err(format!(
+            "Op::GatherRows: n {n} / group {group} — a gather copies at least one column of at \
+             least one row per group"
+        ));
+    }
+    if u64::from(src_col) + u64::from(n) > u64::from(src_stride) {
+        return Err(format!(
+            "Op::GatherRows: columns [{src_col}, {src_col} + {n}) leave a {src_stride}-wide \
+             source row"
+        ));
+    }
+    if u64::from(dst_row_off) + u64::from(group) > u64::from(dst_group_stride) {
+        return Err(format!(
+            "Op::GatherRows: a group of {group} rows at offset {dst_row_off} overruns its \
+             {dst_group_stride}-row stride into the next group"
+        ));
+    }
+    let idx_len = g.desc(idx).numel() as u64;
+    if u64::from(idx_off) + u64::from(rows) > idx_len {
+        return Err(format!(
+            "Op::GatherRows: entries [{idx_off}, {idx_off} + {rows}) leave the {idx_len}-entry \
+             index"
+        ));
+    }
+    if rows > 0 {
+        let last = u64::from(rows - 1);
+        let (grp, g64) = (last / u64::from(group), u64::from(group));
+        let dst_rows = grp * u64::from(dst_group_stride) + u64::from(dst_row_off) + last % g64 + 1;
+        let dst_len = g.desc(dst).numel() as u64;
+        if dst_rows * u64::from(n) > dst_len {
+            return Err(format!(
+                "Op::GatherRows: writes {dst_rows} rows of {n} into a {dst_len}-element dst"
+            ));
+        }
+    }
+    Ok(g.desc(src).numel() / src_stride as usize)
+}
+
+/// The host-side check of an additive score bias read at row stride `cols`: [`Op::Attention`]'s
+/// `key_bias` and its segment's [`CompSegment::bias`], and [`Op::Mla`]'s `key_bias`. The kernels
+/// index it as `bias[row * cols + col]`, so the shape must be EXACTLY `rows * cols` f32: a shorter
+/// one is read past its end, and a longer one (an [`Op::TopkMask`] run at a wider `kv_len`) puts
+/// every row after the first at the wrong offset, which no kernel can notice.
+pub fn check_score_bias(
+    g: &Graph,
+    bias: TensorId,
+    rows: u32,
+    cols: u32,
+    what: &str,
+) -> Result<(), String> {
+    let d = g.desc(bias);
+    if d.dtype != crate::DType::F32 {
+        return Err(format!("{what}: the bias must be F32, got {:?}", d.dtype));
+    }
+    let (have, want) = (d.numel() as u64, u64::from(rows) * u64::from(cols));
+    if have != want {
+        return Err(format!(
+            "{what}: the bias holds {have} elements, not rows {rows} x {cols} — it is read at row \
+             stride {cols}"
+        ));
+    }
+    Ok(())
+}
+
+/// The host-side check every backend runs before an [`Op::Attention`]: the `key_bias` shape
+/// ([`check_score_bias`]) and, when `comp` is set, the segment's contract on [`CompSegment`] and
+/// the field's doc, which a kernel cannot enforce. A zero ratio would divide by zero; a cache whose
+/// rows are not whole, or fewer than `len`, would be read past its end or at the wrong offset; a
+/// cache in another dtype than the raw one is not the reference's layout (`llama_kv_cache_dsv4`
+/// allocates every tier with the same `type_k`). Which dtypes a kernel reads is each backend's
+/// business.
+pub fn check_attention(g: &Graph, op: &Op) -> Result<(), String> {
+    let Op::Attention {
+        k_cache,
+        rows,
+        kv_len,
+        n_kv,
+        head_dim,
+        mask,
+        key_bias,
+        comp,
+        ..
+    } = *op
+    else {
+        return Err(format!("check_attention: got {}", op.kind()));
+    };
+    if let Some(b) = key_bias {
+        check_score_bias(g, b, rows, kv_len, "Op::Attention key_bias")?;
+    }
+    let Some(c) = comp else {
+        return Ok(());
+    };
+    if c.ratio == 0 {
+        return Err("Op::Attention comp: ratio 0 — a block holds at least one position".into());
+    }
+    if key_bias.is_some() {
+        return Err(
+            "Op::Attention comp: key_bias is set too — the compressed segment carries its own \
+             bias and no backend combines a raw-side one with it"
+                .into(),
+        );
+    }
+    if matches!(mask, AttnMask::Canvas { .. }) {
+        return Err(
+            "Op::Attention comp: AttnMask::Canvas — compressed visibility is causal by definition"
+                .into(),
+        );
+    }
+    let (cd, kd) = (g.desc(c.cache).dtype, g.desc(k_cache).dtype);
+    if cd != kd {
+        return Err(format!(
+            "Op::Attention comp: the compressed cache is {cd:?} but the raw cache is {kd:?} — \
+             every tier shares one cache dtype"
+        ));
+    }
+    let row = u64::from(n_kv) * u64::from(head_dim);
+    let numel = g.desc(c.cache).numel() as u64;
+    if row == 0 || !numel.is_multiple_of(row) {
+        return Err(format!(
+            "Op::Attention comp: the compressed cache holds {numel} elements, not whole rows of \
+             n_kv x head_dim = {row}"
+        ));
+    }
+    if numel / row < u64::from(c.len) {
+        return Err(format!(
+            "Op::Attention comp: the compressed cache holds {} rows but len is {}",
+            numel / row,
+            c.len
+        ));
+    }
+    if let Some(b) = c.bias {
+        check_score_bias(g, b, rows, c.len, "Op::Attention comp")?;
+    }
+    Ok(())
+}
+
+/// How many keys of a compressed segment the query at absolute position `abs` sees: blocks
+/// `j < (abs + 1) / ratio` (integer floor, see [`CompSegment`]), never more than the `len`
+/// committed. `ratio` must be non-zero, which [`check_attention`] enforces.
+pub fn comp_visible(abs: u32, ratio: u32, len: u32) -> u32 {
+    ((abs + 1) / ratio).min(len)
+}
+
+/// A set of handles memoized from a [`Graph`]'s `ops`, filled on its first query.
+///
+/// It must never answer for other ops than it was computed from. [`Graph::push`] resets it; a
+/// clone starts empty (a clone's `ops` is commonly replaced by a slice of them, as the Vulkan
+/// pipeline and expert-parallel executors do); and a query after `ops` changed length behind the
+/// memo's back (it is a public field) panics instead of answering stale. An in-place edit of an op
+/// that keeps the count is not caught: a graph's ops are not to be edited once it has been
+/// queried; the in-tree edits (the executors' sub-graphs, the Metal policy tests) edit a fresh
+/// clone or a graph not yet queried.
+#[derive(Default)]
+struct OpsMemo(std::sync::OnceLock<(usize, std::collections::HashSet<TensorId>)>);
+
+impl Clone for OpsMemo {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl OpsMemo {
+    fn get(
+        &self,
+        ops: &[Op],
+        compute: impl FnOnce() -> std::collections::HashSet<TensorId>,
+    ) -> &std::collections::HashSet<TensorId> {
+        let (n, set) = self.0.get_or_init(|| (ops.len(), compute()));
+        assert_eq!(
+            *n,
+            ops.len(),
+            "graph: its ops changed after a memoized query over them (edit a clone instead)"
+        );
+        set
     }
 }
 
@@ -1433,6 +1825,17 @@ pub struct Graph {
     /// execution modes run the SAME (static) kernels bit-identically; everything else keeps the
     /// replay fast path. See `infr-vulkan`'s `decode_eligible`.
     pub no_decode_replay: bool,
+    /// The producer built this graph for record-once decode replay, and it is correct ONLY when
+    /// replayed: its positions and KV lengths are baked for the first decoded token, and the
+    /// caller executes the one compiled plan for every later token, advancing only the bound
+    /// positions. Run statically, each of those tokens would write its KV row at the baked
+    /// position and attend the baked length, which is wrong output with no error.
+    ///
+    /// A backend asked to execute such a plan in a way that would not decode each position
+    /// correctly (it will not replay the plan, and its static walk would read the baked
+    /// positions) returns an error instead. Callers ask [`crate::backend::Backend::decode_replay_ready`] after compiling
+    /// and build per-token graphs when it says no, so the error is a backstop, not a path.
+    pub replay_only: bool,
     /// Set `true` ONLY for an MTP-verify batched forward — the trunk's speculative VERIFY pass
     /// (`crates/infr-llama/src/mtp/mod.rs`'s `run_verify`/`run_verify_full`, driven through
     /// `generate_dense_backend`'s `verify` branch). `false` (the `Graph::default()`/`Graph::new()`
@@ -1452,9 +1855,33 @@ pub struct Graph {
     /// mutate in place), computed lazily on first query and reused. `execute` calls it PER TOKEN;
     /// without this it re-scanned every op and re-allocated a `HashSet` each call. Interior-mutable
     /// (`OnceLock`) so it fills through a shared `&Graph` (the plan holds the graph immutably).
-    /// Not part of the graph's identity — cloning carries a filled cache along if present, and an
-    /// empty one refills once on the clone's first query.
-    in_place_cache: std::sync::OnceLock<std::collections::HashSet<TensorId>>,
+    /// Not part of the graph's identity: see [`OpsMemo`] for when it is refilled.
+    in_place_cache: OpsMemo,
+    /// Memoized [`Self::touched`], on the same terms as `in_place_cache`.
+    touched_cache: OpsMemo,
+    /// How the weights this graph reads will be read next: a residency hint for a backend that
+    /// keeps weights in a cache smaller than the model (the CPU's host arena). A backend without
+    /// such a cache ignores it, and so may one that has its own schedule; it never changes what a
+    /// graph computes. [`WeightReuse::Sweep`] (the default) is every graph but a layer-major
+    /// prefill's.
+    pub weight_reuse: WeightReuse,
+}
+
+/// [`Graph::weight_reuse`]: what the producer knows about the next reads of a graph's weights.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WeightReuse {
+    /// No promise: a forward pass, which reads every weight once and comes back to each only
+    /// after reading all the others. The cache keeps its own policies.
+    #[default]
+    Sweep,
+    /// The graphs right after this one read the same weights again (a layer-major prefill runs
+    /// one layer for every chunk of the prompt in turn), so whatever this graph brings in should
+    /// stay: place it at the hot end of the recency order.
+    Again,
+    /// As [`Self::Again`] while it runs, and this is the LAST graph to read these weights for a
+    /// long while (the last chunk of a layer in a layer-major prefill): once it has run, move
+    /// them to the cold end, so that the next reads evict them before anything still live.
+    Done,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -1473,7 +1900,7 @@ impl Graph {
     /// MEMOIZED — `execute` queries it per token and must not re-scan every op / re-alloc a
     /// `HashSet` each call. Returns a borrow of the cached set.
     pub fn in_place_inputs(&self) -> &std::collections::HashSet<TensorId> {
-        self.in_place_cache.get_or_init(|| {
+        self.in_place_cache.get(&self.ops, || {
             let mut set = std::collections::HashSet::new();
             for op in &self.ops {
                 match op {
@@ -1481,10 +1908,17 @@ impl Graph {
                         set.insert(*cache);
                     }
                     Op::Attention {
-                        k_cache, v_cache, ..
+                        k_cache,
+                        v_cache,
+                        comp,
+                        ..
                     } => {
                         set.insert(*k_cache);
                         set.insert(*v_cache);
+                        // The compressed cache is a persistent buffer read the same way.
+                        if let Some(c) = comp {
+                            set.insert(c.cache);
+                        }
                     }
                     // Both DeepSeek ops read a one-row-per-token cache the same way: straight out
                     // of its BOUND buffer at the op's own dtype, never through the interpreter's
@@ -1495,6 +1929,21 @@ impl Graph {
                     }
                     _ => {}
                 }
+            }
+            set
+        })
+    }
+
+    /// Every handle some op of this graph reads or writes ([`Op::io`]). A declared handle outside
+    /// it is dead in this graph: a layer-span graph declares every layer's caches but runs the
+    /// ops of its own layers only. Memoized like [`Self::in_place_inputs`].
+    pub fn touched(&self) -> &std::collections::HashSet<TensorId> {
+        self.touched_cache.get(&self.ops, || {
+            let mut set = std::collections::HashSet::new();
+            for op in &self.ops {
+                let (reads, writes) = op.io();
+                set.extend(reads);
+                set.extend(writes);
             }
             set
         })
@@ -1545,6 +1994,8 @@ impl Graph {
     /// Append an op to the list.
     pub fn push(&mut self, op: Op) {
         self.ops.push(op);
+        self.in_place_cache = OpsMemo::default();
+        self.touched_cache = OpsMemo::default();
     }
 
     pub fn desc(&self, id: TensorId) -> &TensorDesc {
@@ -1559,6 +2010,925 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every tensor handle `op` holds: each `TensorId` and `Option<TensorId>` field, and the
+    /// handles inside its `CompSegment` and `HyperGates`. An exhaustive match that names every field
+    /// of every variant (no `..` and no wildcard arm), so a new variant, or a new field of any type,
+    /// fails to compile here until it is listed — which is what keeps
+    /// [`io_names_every_tensor_an_op_holds`] complete.
+    fn tensor_fields(op: &Op) -> Vec<TensorId> {
+        match *op {
+            Op::RmsNorm {
+                x,
+                weight,
+                dst,
+                rows: _,
+                dim: _,
+                eps: _,
+            } => vec![x, weight, dst],
+            Op::RmsNormAdd {
+                x,
+                weight,
+                dst,
+                rows: _,
+                dim: _,
+                eps: _,
+            } => vec![x, weight, dst],
+            Op::LayerNorm {
+                x,
+                weight,
+                bias,
+                dst,
+                rows: _,
+                dim: _,
+                eps: _,
+            } => vec![x, weight, bias, dst],
+            Op::Linear {
+                x,
+                weight,
+                dst,
+                m: _,
+                in_f: _,
+                out_f: _,
+                w_off: _,
+            } => vec![x, weight, dst],
+            Op::Softmax {
+                x,
+                dst,
+                rows: _,
+                dim: _,
+                scale: _,
+                scale_buf,
+            } => {
+                let mut v = vec![x, dst];
+                v.extend(scale_buf);
+                v
+            }
+            Op::QkNorm {
+                x,
+                weight,
+                dst,
+                rows: _,
+                n_head: _,
+                head_dim: _,
+                eps: _,
+                x_stride: _,
+            } => {
+                let mut v = vec![x, dst];
+                v.extend(weight);
+                v
+            }
+            Op::GatedRmsNorm {
+                x,
+                weight,
+                gate,
+                dst,
+                rows: _,
+                n_head: _,
+                head_dim: _,
+                eps: _,
+            } => vec![x, weight, gate, dst],
+            Op::Rope {
+                x,
+                positions,
+                dst,
+                rows: _,
+                n_head: _,
+                head_dim: _,
+                rope_dim: _,
+                theta: _,
+                freq_factors,
+                x_stride: _,
+                neox: _,
+                backward: _,
+            } => {
+                let mut v = vec![x, positions, dst];
+                v.extend(freq_factors);
+                v
+            }
+            Op::QkNormRope {
+                x,
+                weight,
+                positions,
+                dst,
+                rows: _,
+                n_head: _,
+                head_dim: _,
+                rope_dim: _,
+                theta: _,
+                eps: _,
+                freq_factors,
+                x_stride: _,
+            } => {
+                let mut v = vec![x, weight, positions, dst];
+                v.extend(freq_factors);
+                v
+            }
+            Op::WriteKv {
+                src,
+                cache,
+                rows: _,
+                row_stride: _,
+                pos: _,
+            } => vec![src, cache],
+            Op::Attention {
+                q,
+                k_cache,
+                v_cache,
+                dst,
+                rows: _,
+                kv_len: _,
+                n_head: _,
+                n_kv: _,
+                head_dim: _,
+                scale: _,
+                mask: _,
+                pos: _,
+                sinks,
+                key_bias,
+                comp,
+            } => {
+                let mut v = vec![q, k_cache, v_cache, dst];
+                v.extend(sinks);
+                v.extend(key_bias);
+                if let Some(CompSegment {
+                    cache,
+                    len: _,
+                    ratio: _,
+                    bias,
+                }) = comp
+                {
+                    v.push(cache);
+                    v.extend(bias);
+                }
+                v
+            }
+            Op::Mla {
+                q,
+                k_cache,
+                wk_b,
+                wv_b,
+                dst,
+                rows: _,
+                kv_len: _,
+                n_head: _,
+                q_head_dim: _,
+                kv_lora_rank: _,
+                qk_nope_dim: _,
+                qk_rope_dim: _,
+                v_head_dim: _,
+                scale: _,
+                mask: _,
+                pos: _,
+                theta: _,
+                freq_factors,
+                key_bias,
+            } => {
+                let mut v = vec![q, k_cache, wk_b, wv_b, dst];
+                v.extend(freq_factors);
+                v.extend(key_bias);
+                v
+            }
+            Op::TopkMask {
+                idx,
+                dst,
+                rows: _,
+                kv_len: _,
+                top_k: _,
+            } => vec![idx, dst],
+            Op::HyperConnectMix {
+                mixes,
+                scale,
+                base,
+                pre,
+                gates,
+                rows: _,
+                hc: _,
+                eps: _,
+                n_iter: _,
+            } => {
+                let mut v = vec![mixes, scale, base, pre];
+                if let Some(HyperGates { post, comb }) = gates {
+                    v.push(post);
+                    v.push(comb);
+                }
+                v
+            }
+            Op::HyperConnectPre {
+                x,
+                weights,
+                dst,
+                rows: _,
+                hc: _,
+                n_embd: _,
+            } => vec![x, weights, dst],
+            Op::HyperConnectPost {
+                x,
+                residual,
+                post,
+                comb,
+                dst,
+                rows: _,
+                hc: _,
+                n_embd: _,
+            } => vec![x, residual, post, comb, dst],
+            Op::CompressPool {
+                values,
+                scores,
+                dst,
+                blocks: _,
+                window: _,
+                n_embd: _,
+            } => vec![values, scores, dst],
+            Op::LightningIndexer {
+                q,
+                k_cache,
+                weights,
+                dst,
+                rows: _,
+                kv_len: _,
+                n_head: _,
+                head_dim: _,
+                top_k: _,
+                scale: _,
+                pos: _,
+                block_ratio: _,
+            } => vec![q, k_cache, weights, dst],
+            Op::GatedAct {
+                gate,
+                up,
+                dst,
+                rows: _,
+                nff: _,
+                act: _,
+                up_off: _,
+                up_stride: _,
+                gate_stride: _,
+                gate_block_width: _,
+                swiglu_clamp: _,
+            } => vec![gate, up, dst],
+            Op::GatedActFused {
+                gu,
+                dst,
+                rows: _,
+                nff: _,
+                act: _,
+                swiglu_clamp: _,
+            } => vec![gu, dst],
+            Op::Add { a, b, dst, n: _ } => vec![a, b, dst],
+            Op::AddBias {
+                x,
+                bias,
+                dst,
+                rows: _,
+                n: _,
+            } => vec![x, bias, dst],
+            Op::Scale { x, dst, s: _, n: _ } => vec![x, dst],
+            Op::MulVec {
+                x,
+                vec,
+                dst,
+                rows: _,
+                n: _,
+            } => vec![x, vec, dst],
+            Op::Softcap {
+                x,
+                dst,
+                cap: _,
+                n: _,
+            } => vec![x, dst],
+            Op::Argmax {
+                x,
+                dst,
+                n: _,
+                rows: _,
+            } => vec![x, dst],
+            Op::ArgmaxProb {
+                x,
+                dst_id,
+                dst_prob,
+                n: _,
+            } => vec![x, dst_id, dst_prob],
+            Op::Sample {
+                x,
+                u,
+                dst,
+                n: _,
+                top_k: _,
+                temp: _,
+                top_p: _,
+            } => vec![x, u, dst],
+            Op::EmbedGather {
+                ids,
+                table,
+                dst,
+                rows: _,
+                ne: _,
+                scale: _,
+            } => vec![ids, table, dst],
+            Op::GatherI32 {
+                ids,
+                table,
+                dst,
+                rows: _,
+                ne: _,
+            } => vec![ids, table, dst],
+            Op::GatherRows {
+                src,
+                idx,
+                dst,
+                rows: _,
+                idx_off: _,
+                src_stride: _,
+                src_col: _,
+                n: _,
+                group: _,
+                dst_group_stride: _,
+                dst_row_off: _,
+                fill: _,
+            } => vec![src, idx, dst],
+            Op::Copy {
+                src,
+                src_off: _,
+                dst,
+                dst_off: _,
+                n: _,
+            } => vec![src, dst],
+            Op::CopyStrided {
+                src,
+                src_off: _,
+                src_stride: _,
+                dst,
+                dst_off: _,
+                dst_stride: _,
+                rows: _,
+                n: _,
+            } => vec![src, dst],
+            Op::MoeFfn {
+                x,
+                router_x,
+                router,
+                gate_exps,
+                up_exps,
+                down_exps,
+                down_scale,
+                fused_gate_up: _,
+                dst,
+                ne: _,
+                n_expert: _,
+                n_used: _,
+                n_ff_exp: _,
+                scale: _,
+                act: _,
+                swiglu_clamp: _,
+                gating: _,
+                norm_w: _,
+                weight_before: _,
+                ep_band: _,
+                exp_probs_b,
+                n_expert_groups: _,
+                n_expert_groups_used: _,
+                expert_ids,
+            } => {
+                let mut v = vec![x, router_x, router, gate_exps, up_exps, down_exps, dst];
+                v.extend(down_scale);
+                v.extend(exp_probs_b);
+                v.extend(expert_ids);
+                v
+            }
+            Op::Conv1dSilu {
+                x,
+                weight,
+                state,
+                dst,
+                rows: _,
+                channels: _,
+                kernel: _,
+            } => vec![x, weight, state, dst],
+            Op::ShortConv {
+                bcx,
+                weight,
+                state,
+                dst,
+                rows: _,
+                channels: _,
+                kernel: _,
+            } => vec![bcx, weight, state, dst],
+            Op::HeadGate {
+                x,
+                gate,
+                dst,
+                rows: _,
+                n_head: _,
+                head_dim: _,
+            } => vec![x, gate, dst],
+            Op::DeltaNet {
+                q,
+                k,
+                v,
+                b,
+                a,
+                a_coef,
+                dt_bias,
+                state,
+                dst,
+                rows: _,
+                n_vhead: _,
+                n_khead: _,
+                head_k: _,
+                head_v: _,
+                eps: _,
+                src_stride: _,
+            } => vec![q, k, v, b, a, a_coef, dt_bias, state, dst],
+            Op::MoeSharedExpertAdd {
+                moe,
+                shexp,
+                gate,
+                dst,
+                rows: _,
+                n: _,
+            } => vec![moe, shexp, gate, dst],
+        }
+    }
+
+    /// One instance of every [`Op`] variant, each tensor field a distinct handle and every optional
+    /// handle present. A struct literal must name every field, so a new field fails to compile here.
+    fn every_op() -> Vec<Op> {
+        let next = std::cell::Cell::new(0u32);
+        let t = || {
+            next.set(next.get() + 1);
+            TensorId(next.get())
+        };
+        vec![
+            Op::RmsNorm {
+                x: t(),
+                weight: t(),
+                dst: t(),
+                rows: 0,
+                dim: 0,
+                eps: 0.0,
+            },
+            Op::RmsNormAdd {
+                x: t(),
+                weight: t(),
+                dst: t(),
+                rows: 0,
+                dim: 0,
+                eps: 0.0,
+            },
+            Op::LayerNorm {
+                x: t(),
+                weight: t(),
+                bias: t(),
+                dst: t(),
+                rows: 0,
+                dim: 0,
+                eps: 0.0,
+            },
+            Op::Linear {
+                x: t(),
+                weight: t(),
+                dst: t(),
+                m: 0,
+                in_f: 0,
+                out_f: 0,
+                w_off: 0,
+            },
+            Op::Softmax {
+                x: t(),
+                dst: t(),
+                rows: 0,
+                dim: 0,
+                scale: 0.0,
+                scale_buf: Some(t()),
+            },
+            Op::QkNorm {
+                x: t(),
+                weight: Some(t()),
+                dst: t(),
+                rows: 0,
+                n_head: 0,
+                head_dim: 0,
+                eps: 0.0,
+                x_stride: 0,
+            },
+            Op::GatedRmsNorm {
+                x: t(),
+                weight: t(),
+                gate: t(),
+                dst: t(),
+                rows: 0,
+                n_head: 0,
+                head_dim: 0,
+                eps: 0.0,
+            },
+            Op::Rope {
+                x: t(),
+                positions: t(),
+                dst: t(),
+                rows: 0,
+                n_head: 0,
+                head_dim: 0,
+                rope_dim: 0,
+                theta: 0.0,
+                freq_factors: Some(t()),
+                x_stride: 0,
+                neox: false,
+                backward: false,
+            },
+            Op::QkNormRope {
+                x: t(),
+                weight: t(),
+                positions: t(),
+                dst: t(),
+                rows: 0,
+                n_head: 0,
+                head_dim: 0,
+                rope_dim: 0,
+                theta: 0.0,
+                eps: 0.0,
+                freq_factors: Some(t()),
+                x_stride: 0,
+            },
+            Op::WriteKv {
+                src: t(),
+                cache: t(),
+                rows: 0,
+                row_stride: 0,
+                pos: 0,
+            },
+            Op::Attention {
+                q: t(),
+                k_cache: t(),
+                v_cache: t(),
+                dst: t(),
+                rows: 0,
+                kv_len: 0,
+                n_head: 0,
+                n_kv: 0,
+                head_dim: 0,
+                scale: 0.0,
+                mask: AttnMask::Causal,
+                pos: 0,
+                sinks: Some(t()),
+                key_bias: Some(t()),
+                comp: Some(CompSegment {
+                    cache: t(),
+                    len: 0,
+                    ratio: 1,
+                    bias: Some(t()),
+                }),
+            },
+            Op::Mla {
+                q: t(),
+                k_cache: t(),
+                wk_b: t(),
+                wv_b: t(),
+                dst: t(),
+                rows: 0,
+                kv_len: 0,
+                n_head: 0,
+                q_head_dim: 0,
+                kv_lora_rank: 0,
+                qk_nope_dim: 0,
+                qk_rope_dim: 0,
+                v_head_dim: 0,
+                scale: 0.0,
+                mask: AttnMask::Causal,
+                pos: 0,
+                theta: 0.0,
+                freq_factors: Some(t()),
+                key_bias: Some(t()),
+            },
+            Op::TopkMask {
+                idx: t(),
+                dst: t(),
+                rows: 0,
+                kv_len: 0,
+                top_k: 0,
+            },
+            Op::HyperConnectMix {
+                mixes: t(),
+                scale: t(),
+                base: t(),
+                pre: t(),
+                gates: Some(HyperGates {
+                    post: t(),
+                    comb: t(),
+                }),
+                rows: 0,
+                hc: 0,
+                eps: 0.0,
+                n_iter: 0,
+            },
+            Op::HyperConnectPre {
+                x: t(),
+                weights: t(),
+                dst: t(),
+                rows: 0,
+                hc: 0,
+                n_embd: 0,
+            },
+            Op::HyperConnectPost {
+                x: t(),
+                residual: t(),
+                post: t(),
+                comb: t(),
+                dst: t(),
+                rows: 0,
+                hc: 0,
+                n_embd: 0,
+            },
+            Op::CompressPool {
+                values: t(),
+                scores: t(),
+                dst: t(),
+                blocks: 0,
+                window: 0,
+                n_embd: 0,
+            },
+            Op::LightningIndexer {
+                q: t(),
+                k_cache: t(),
+                weights: t(),
+                dst: t(),
+                rows: 0,
+                kv_len: 0,
+                n_head: 0,
+                head_dim: 0,
+                top_k: 0,
+                scale: 0.0,
+                pos: 0,
+                block_ratio: 0,
+            },
+            Op::GatedAct {
+                gate: t(),
+                up: t(),
+                dst: t(),
+                rows: 0,
+                nff: 0,
+                act: Activation::Silu,
+                up_off: 0,
+                up_stride: 0,
+                gate_stride: 0,
+                gate_block_width: 0,
+                swiglu_clamp: None,
+            },
+            Op::GatedActFused {
+                gu: t(),
+                dst: t(),
+                rows: 0,
+                nff: 0,
+                act: Activation::Silu,
+                swiglu_clamp: None,
+            },
+            Op::Add {
+                a: t(),
+                b: t(),
+                dst: t(),
+                n: 0,
+            },
+            Op::AddBias {
+                x: t(),
+                bias: t(),
+                dst: t(),
+                rows: 0,
+                n: 0,
+            },
+            Op::Scale {
+                x: t(),
+                dst: t(),
+                s: 0.0,
+                n: 0,
+            },
+            Op::MulVec {
+                x: t(),
+                vec: t(),
+                dst: t(),
+                rows: 0,
+                n: 0,
+            },
+            Op::Softcap {
+                x: t(),
+                dst: t(),
+                cap: 0.0,
+                n: 0,
+            },
+            Op::Argmax {
+                x: t(),
+                dst: t(),
+                n: 0,
+                rows: 0,
+            },
+            Op::ArgmaxProb {
+                x: t(),
+                dst_id: t(),
+                dst_prob: t(),
+                n: 0,
+            },
+            Op::Sample {
+                x: t(),
+                u: t(),
+                dst: t(),
+                n: 0,
+                top_k: 0,
+                temp: 0.0,
+                top_p: 0.0,
+            },
+            Op::EmbedGather {
+                ids: t(),
+                table: t(),
+                dst: t(),
+                rows: 0,
+                ne: 0,
+                scale: 0.0,
+            },
+            Op::GatherI32 {
+                ids: t(),
+                table: t(),
+                dst: t(),
+                rows: 0,
+                ne: 0,
+            },
+            Op::GatherRows {
+                src: t(),
+                idx: t(),
+                dst: t(),
+                rows: 0,
+                idx_off: 0,
+                src_stride: 0,
+                src_col: 0,
+                n: 0,
+                group: 0,
+                dst_group_stride: 0,
+                dst_row_off: 0,
+                fill: 0.0,
+            },
+            Op::Copy {
+                src: t(),
+                src_off: 0,
+                dst: t(),
+                dst_off: 0,
+                n: 0,
+            },
+            Op::CopyStrided {
+                src: t(),
+                src_off: 0,
+                src_stride: 0,
+                dst: t(),
+                dst_off: 0,
+                dst_stride: 0,
+                rows: 0,
+                n: 0,
+            },
+            Op::MoeFfn {
+                x: t(),
+                router_x: t(),
+                router: t(),
+                gate_exps: t(),
+                up_exps: t(),
+                down_exps: t(),
+                down_scale: Some(t()),
+                fused_gate_up: false,
+                dst: t(),
+                ne: 0,
+                n_expert: 0,
+                n_used: 0,
+                n_ff_exp: 0,
+                scale: 0.0,
+                act: Activation::Silu,
+                swiglu_clamp: None,
+                gating: MoeGating::Softmax,
+                norm_w: false,
+                weight_before: false,
+                ep_band: None,
+                exp_probs_b: Some(t()),
+                n_expert_groups: 0,
+                n_expert_groups_used: 0,
+                expert_ids: Some(t()),
+            },
+            Op::Conv1dSilu {
+                x: t(),
+                weight: t(),
+                state: t(),
+                dst: t(),
+                rows: 0,
+                channels: 0,
+                kernel: 0,
+            },
+            Op::ShortConv {
+                bcx: t(),
+                weight: t(),
+                state: t(),
+                dst: t(),
+                rows: 0,
+                channels: 0,
+                kernel: 0,
+            },
+            Op::HeadGate {
+                x: t(),
+                gate: t(),
+                dst: t(),
+                rows: 0,
+                n_head: 0,
+                head_dim: 0,
+            },
+            Op::DeltaNet {
+                q: t(),
+                k: t(),
+                v: t(),
+                b: t(),
+                a: t(),
+                a_coef: t(),
+                dt_bias: t(),
+                state: t(),
+                dst: t(),
+                rows: 0,
+                n_vhead: 0,
+                n_khead: 0,
+                head_k: 0,
+                head_v: 0,
+                eps: 0.0,
+                src_stride: 0,
+            },
+            Op::MoeSharedExpertAdd {
+                moe: t(),
+                shexp: t(),
+                gate: t(),
+                dst: t(),
+                rows: 0,
+                n: 0,
+            },
+        ]
+    }
+
+    /// **The memoized handle sets follow the ops.** A push after a query answers for the new op; a
+    /// clone whose ops are replaced (the executors' sub-graphs) answers for its own ops, not the
+    /// original's; a query after the public `ops` changed length behind the memo panics.
+    #[test]
+    fn memoized_sets_never_answer_for_other_ops() {
+        let mut g = Graph::new();
+        let x = g.input(crate::tensor::TensorDesc::new(
+            vec![4],
+            crate::tensor::DType::F32,
+        ));
+        let c = g.input(crate::tensor::TensorDesc::new(
+            vec![8],
+            crate::tensor::DType::F16,
+        ));
+        let y = g.internal(crate::tensor::TensorDesc::new(
+            vec![4],
+            crate::tensor::DType::F32,
+        ));
+        g.push(Op::Scale {
+            x,
+            dst: y,
+            s: 1.0,
+            n: 4,
+        });
+        assert!(!g.touched().contains(&c) && g.in_place_inputs().is_empty());
+        g.push(Op::WriteKv {
+            src: x,
+            cache: c,
+            rows: 1,
+            row_stride: 4,
+            pos: 0,
+        });
+        assert!(g.touched().contains(&c) && g.in_place_inputs().contains(&c));
+        let mut sub = g.clone();
+        sub.ops.truncate(1);
+        assert!(!sub.touched().contains(&c) && sub.in_place_inputs().is_empty());
+        let stale = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            g.ops.pop();
+            g.touched().len()
+        }));
+        assert!(stale.is_err(), "a query after the ops shrank answered");
+    }
+
+    /// **`Op::io` names every tensor an op holds.** The interpreters (the CPU's and Metal's) load
+    /// and write back only the handles some op's `io()` lists (`crate::exec::provisions`), so a
+    /// tensor an op reads but `io()` omits would reach that op as an empty vector. Checked for every
+    /// variant against [`tensor_fields`]; `Op::Mla`'s `freq_factors` was the one gap found.
+    #[test]
+    fn io_names_every_tensor_an_op_holds() {
+        let ops = every_op();
+        let mut seen = std::collections::HashSet::new();
+        for op in &ops {
+            assert!(seen.insert(op.kind()), "{} listed twice", op.kind());
+            let (r, w) = op.io();
+            let named: std::collections::HashSet<TensorId> = r.into_iter().chain(w).collect();
+            let missing: Vec<TensorId> = tensor_fields(op)
+                .into_iter()
+                .filter(|id| !named.contains(id))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "Op::{}'s io() omits handles {missing:?}",
+                op.kind()
+            );
+        }
+    }
+
     use crate::tensor::{DType, TensorDesc};
 
     /// `Op::io` reports the exact read/write handles — the contract the multi-device pipeline
@@ -1613,8 +2983,56 @@ mod tests {
             pos: 0,
             sinks: None,
             key_bias: None,
+            comp: None,
         };
         assert_eq!(attn.io(), (vec![t(7), t(6), t(8)], vec![t(9)]));
+    }
+
+    /// Every optional `Op::MoeFfn` operand is a read when present — `exp_probs_b` included. The CPU
+    /// interpreter pins paged weights from this list, and the multi-device executors use it to
+    /// decide which device runs an op and which tensors each segment binds, so a router bias
+    /// missing here is a weight none of them knows the op reads.
+    #[test]
+    fn op_io_moe_ffn_optional_reads() {
+        let t = |n: u32| TensorId(n);
+        let moe = |down_scale, exp_probs_b, expert_ids| Op::MoeFfn {
+            x: t(0),
+            router_x: t(1),
+            router: t(2),
+            gate_exps: t(3),
+            up_exps: t(4),
+            down_exps: t(5),
+            down_scale,
+            fused_gate_up: false,
+            dst: t(6),
+            ne: 8,
+            n_expert: 4,
+            n_used: 2,
+            n_ff_exp: 8,
+            scale: 1.0,
+            act: Activation::Silu,
+            swiglu_clamp: None,
+            gating: MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            expert_ids,
+        };
+        let base = vec![t(0), t(1), t(2), t(3), t(4), t(5)];
+        assert_eq!(moe(None, None, None).io(), (base.clone(), vec![t(6)]));
+        for (op, extra) in [
+            (moe(Some(t(7)), None, None), t(7)),
+            (moe(None, Some(t(8)), None), t(8)),
+            (moe(None, None, Some(t(9))), t(9)),
+        ] {
+            let (reads, writes) = op.io();
+            assert_eq!(writes, vec![t(6)]);
+            assert!(reads.contains(&extra), "{extra:?} missing from {reads:?}");
+            assert_eq!(reads.len(), base.len() + 1);
+        }
     }
 
     /// Optional read operands (rope `freq_factors`) appear only when present.
@@ -1671,6 +3089,7 @@ mod tests {
             pos: 0,
             sinks: sk,
             key_bias: kb,
+            comp: None,
         };
         assert_eq!(
             attn(None, None).io(),
@@ -1757,6 +3176,7 @@ mod tests {
             pos: 0,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         // A non-KV op must NOT contribute any in-place input.
         g.push(Op::Add {

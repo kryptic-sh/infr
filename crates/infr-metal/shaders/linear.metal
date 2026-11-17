@@ -1070,6 +1070,9 @@ inline void linear_q4k_mr_body(device const float*  x,
     uint nb = p.in_f >> 8;
     ulong row_b = (ulong)nb * 144ul;
     device const uchar* xr = codes + first_row * row_b;
+    // A tail group with one live row (odd out_f) re-reads that row instead of the one past the
+    // bank end; its second sum is discarded at the write, as with the 4-row bodies' clamp.
+    ulong rstep = (first_row + 1u < p.out_f) ? row_b : 0ul;
 
     const ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
     uint ix = lane >> 3;
@@ -1131,9 +1134,9 @@ inline void linear_q4k_mr_body(device const float*  x,
                                 d1 * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
                                       sumy[2] * sc8[6] + sumy[3] * sc8[7]);
             }
-            q1 += row_b / 2u;
-            sc += row_b / 2u;
-            dh += row_b / 2u;
+            q1 += rstep / 2u;
+            sc += rstep / 2u;
+            dh += rstep / 2u;
         }
     }
     for (uint row = 0; row < 2u && first_row + row < p.out_f; row++) {
@@ -1173,6 +1176,9 @@ inline void linear_q6k_mr_body(device const float*  x,
     uint nb = p.in_f >> 8;
     ulong row_b = (ulong)nb * 210ul;
     device const uchar* xr = codes + first_row * row_b;
+    // A tail group with one live row (odd out_f) re-reads that row instead of the one past the
+    // bank end; its second sum is discarded at the write, as with the 4-row bodies' clamp.
+    ulong rstep = (first_row + 1u < p.out_f) ? row_b : 0ul;
 
     const uchar kmask1 = 0x03, kmask2 = 0x0C, kmask3 = 0x30, kmask4 = 0xC0;
     uint tid2 = lane >> 1;
@@ -1222,11 +1228,11 @@ inline void linear_q6k_mr_body(device const float*  x,
                 sumf[row][t] += d * (sums[0] * scv[0] + sums[1] * scv[1] +
                                      sums[2] * scv[2] + sums[3] * scv[3]);
             }
-            q1 += row_b;
-            q2 += row_b;
-            qh += row_b;
-            sc += row_b;
-            dh += row_b / 2u;
+            q1 += rstep;
+            q2 += rstep;
+            qh += rstep;
+            sc += rstep;
+            dh += rstep / 2u;
         }
     }
     for (uint row = 0; row < 2u && first_row + row < p.out_f; row++) {
@@ -1275,6 +1281,9 @@ inline void linear_q4k_body(device const float*  x,
     uint nb = p.in_f >> 8;                 // 256-element blocks per row
     ulong row_b = (ulong)nb * 144ul;       // row stride in bytes
     device const uchar* xr = codes + first_row * row_b;
+    // A tail group with one live row (odd out_f) re-reads that row instead of the one past the
+    // bank end; its second sum is discarded at the write, as with the 4-row bodies' clamp.
+    ulong rstep = (first_row + 1u < p.out_f) ? row_b : 0ul;
 
     const ushort kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
     uint ix = lane >> 3;                   // 0..3: which of 4 blocks in flight
@@ -1326,9 +1335,9 @@ inline void linear_q4k_body(device const float*  x,
                                          (acc2[2] + 1.0f/256.0f * acc2[3]) * sc8[5] * 1.0f/16.0f) -
                          (float)dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] +
                                          sumy[2] * sc8[6] + sumy[3] * sc8[7]);
-            q1 += row_b / 2u;
-            sc += row_b / 2u;
-            dh += row_b / 2u;
+            q1 += rstep / 2u;
+            sc += rstep / 2u;
+            dh += rstep / 2u;
         }
         y4 += NSG * 4u * 256u;
     }
@@ -1400,6 +1409,9 @@ inline void linear_q6k_body(device const float*  x,
     uint nb = p.in_f >> 8;
     ulong row_b = (ulong)nb * 210ul;
     device const uchar* xr = codes + first_row * row_b;
+    // A tail group with one live row (odd out_f) re-reads that row instead of the one past the
+    // bank end; its second sum is discarded at the write, as with the 4-row bodies' clamp.
+    ulong rstep = (first_row + 1u < p.out_f) ? row_b : 0ul;
 
     const uchar kmask1 = 0x03, kmask2 = 0x0C, kmask3 = 0x30, kmask4 = 0xC0;
     uint tid2 = lane >> 1;
@@ -1440,11 +1452,11 @@ inline void linear_q6k_body(device const float*  x,
             }
             sumf[row] += (float)dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] +
                                          sums[2] * sc[4] + sums[3] * sc[6]);
-            q1 += row_b;
-            q2 += row_b;
-            qh += row_b;
-            sc += row_b;
-            dh += row_b / 2u;
+            q1 += rstep;
+            q2 += rstep;
+            qh += rstep;
+            sc += rstep;
+            dh += rstep / 2u;
         }
     }
     GEMV_EPILOGUE(2u)

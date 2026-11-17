@@ -33,6 +33,17 @@ kernel void mul_vec_f32(device const float* x    [[buffer(0)]],
     if (gid < p.total) dst[gid] = x[gid] * vec_[gid % p.n];
 }
 
+// LFM3 attention output gate (Op::HeadGate): one sigmoid per (row, head), `g` holding one logit
+// per head, broadcast over the head's `head_dim` lanes.
+struct HeadGateParams { uint n; uint head_dim; };
+kernel void head_gate_f32(device const float* x   [[buffer(0)]],
+                          device const float* g   [[buffer(1)]],
+                          device float*       dst [[buffer(2)]],
+                          constant HeadGateParams& p [[buffer(3)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid < p.n) dst[gid] = x[gid] / (1.0f + exp(-g[gid / p.head_dim]));
+}
+
 struct ScaleParams { float s; uint n; };
 kernel void scale_f32(device const float* x   [[buffer(0)]],
                       device float*       dst [[buffer(1)]],
@@ -265,9 +276,11 @@ kernel void gated_rmsnorm_f32(device const float* x    [[buffer(0)]],
 }
 
 // Greedy argmax over `n` logits → token id (one 256-thread threadgroup, strided scan +
-// threadgroup tree-reduce). Strict > keeps the lowest index on ties, matching the host argmax
-// (same contract as the Vulkan argmax.comp). The id is written as a u32 bit-pattern into the
-// f32 output slot — greedy decode reads back 4 bytes instead of the [vocab] logits.
+// threadgroup tree-reduce). Strict > keeps each lane's lowest index on ties and the reduce
+// prefers the lower index on equal values, so the result is the lowest tied index, matching the
+// host argmax, the split stages below and the Vulkan argmax.comp. The id is written as a u32
+// bit-pattern into the f32 output slot — greedy decode reads back 4 bytes instead of the [vocab]
+// logits.
 struct ArgmaxParams { uint n; };
 kernel void argmax_f32(device const float* logits [[buffer(0)]],
                        device uint*        out_id [[buffer(1)]],
@@ -284,9 +297,13 @@ kernel void argmax_f32(device const float* logits [[buffer(0)]],
     sidx[t] = bi;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint s = 128u; s > 0u; s /= 2u) {
-        if (t < s && sval[t + s] > sval[t]) {
-            sval[t] = sval[t + s];
-            sidx[t] = sidx[t + s];
+        if (t < s) {
+            float v = sval[t + s];
+            uint i = sidx[t + s];
+            if (v > sval[t] || (v == sval[t] && i < sidx[t])) {
+                sval[t] = v;
+                sidx[t] = i;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -769,6 +786,35 @@ kernel void hyper_post_f32(device const float* x    [[buffer(0)]],
         acc = fma(res[(t*p.hc + src)*p.n_embd + e], comb[t*p.hc*p.hc + d + p.hc*src], acc);
     }
     dst[i] = acc;
+}
+
+// `Op::GatherRows` (DeepSeek V4 compressor source assembly): f32 rows by i32 index, a column
+// window of each, into the grouped destination `compress_pool_f32` reads. For entry r:
+//
+//   i = idx[idx_off + r]
+//   d = (r / group) * dst_group_stride + dst_row_off + r % group
+//   dst[d*n + c] = i < 0 ? fill : src[i*src_stride + src_col + c]
+//
+// An index at or past `n_src` writes `fill` as well, so no read leaves the source (the host
+// checks the geometry, not the index values). One thread per output element (`rows * n`).
+struct GatherRowsParams {
+    uint rows; uint idx_off; uint src_stride; uint src_col; uint n;
+    uint group; uint dst_group_stride; uint dst_row_off; uint n_src; float fill;
+};
+
+kernel void gather_rows_f32(device const float* src [[buffer(0)]],
+                            device const int*   idx [[buffer(1)]],
+                            device float*       dst [[buffer(2)]],
+                            constant GatherRowsParams& p [[buffer(3)]],
+                            uint t [[thread_position_in_grid]]) {
+    if (t >= p.rows * p.n) return;
+    uint r = t / p.n;
+    uint c = t - r * p.n;
+    uint d = (r / p.group) * p.dst_group_stride + p.dst_row_off + r % p.group;
+    int i = idx[p.idx_off + r];
+    dst[d * p.n + c] = (i < 0 || uint(i) >= p.n_src)
+        ? p.fill
+        : src[uint(i) * p.src_stride + p.src_col + c];
 }
 
 // `Op::CompressPool` (DeepSeek V4 compressor pooling): per channel, softmax `scores` over the

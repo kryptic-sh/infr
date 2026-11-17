@@ -16,6 +16,9 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 #define C 32u
+// Widest head_k_dim the shared-memory state/row buffers hold; the host refuses wider heads
+// (`DN_MAX_KD` in src/adapter.rs mirrors this value).
+#define DN_MAX_KD 128u
 #define COLS 32u
 
 layout(push_constant) uniform PC {
@@ -41,8 +44,8 @@ layout(binding = 6) readonly buffer DTB { float dtbias[]; };  // [nv]
 layout(binding = 7) coherent buffer SB { float state[]; };    // [nv*kd*vd] in/out
 layout(binding = 8) buffer OB { float outp[]; };              // [rows, nv*vd]
 
-shared float kn[C * 128u];   // normalized k̂ chunk [C, kd]      16 KB
-shared float qn[C * 128u];   // normalized q̂ chunk (×1/√kd)     16 KB
+shared float kn[C * DN_MAX_KD];   // normalized k̂ chunk [C, kd]      16 KB
+shared float qn[C * DN_MAX_KD];   // normalized q̂ chunk (×1/√kd)     16 KB
 shared float aa[C * C];      // A (solve), then Wq (output)      4 KB
 shared float dl[C * COLS];   // R → Δ for this column block      4 KB
 shared float gg[C];          // inclusive prefix log-decay
@@ -70,8 +73,8 @@ void main() {
             uint j = p / kd;
             uint kk = p % kd;
             uint src = (base + j) * pc.nk * kd + khid * kd + kk;
-            kn[j * 128u + kk] = k[src];
-            qn[j * 128u + kk] = q[src];
+            kn[j * DN_MAX_KD + kk] = k[src];
+            qn[j * DN_MAX_KD + kk] = q[src];
         }
         barrier();
 
@@ -81,7 +84,7 @@ void main() {
             uint lane = t & 7u;
             float ks = 0.0;
             if (j < c) {
-                for (uint kk = lane; kk < kd; kk += 8u) { float x = kn[j * 128u + kk]; ks += x * x; }
+                for (uint kk = lane; kk < kd; kk += 8u) { float x = kn[j * DN_MAX_KD + kk]; ks += x * x; }
             }
             red[t] = ks;
             barrier();
@@ -95,7 +98,7 @@ void main() {
             barrier(); // nrm reused for q below
             float qs = 0.0;
             if (j < c) {
-                for (uint kk = lane; kk < kd; kk += 8u) { float x = qn[j * 128u + kk]; qs += x * x; }
+                for (uint kk = lane; kk < kd; kk += 8u) { float x = qn[j * DN_MAX_KD + kk]; qs += x * x; }
             }
             red[t] = qs;
             barrier();
@@ -108,8 +111,8 @@ void main() {
             if (j < c) {
                 float qinv = pc.qscale / nrm[j];
                 for (uint kk = lane; kk < kd; kk += 8u) {
-                    kn[j * 128u + kk] *= kinv;
-                    qn[j * 128u + kk] *= qinv;
+                    kn[j * DN_MAX_KD + kk] *= kinv;
+                    qn[j * DN_MAX_KD + kk] *= qinv;
                 }
             }
         }
@@ -137,8 +140,8 @@ void main() {
                 float ks0 = 0.0, qs0 = 0.0;
                 for (uint kk = 0u; kk < kd; kk++) {
                     float sv = state[sbase + kk * pc.vd + d];
-                    ks0 += kn[j * 128u + kk] * sv;
-                    qs0 += qn[j * 128u + kk] * sv;
+                    ks0 += kn[j * DN_MAX_KD + kk] * sv;
+                    qs0 += qn[j * DN_MAX_KD + kk] * sv;
                 }
                 float eg = exp(gg[j]);
                 uint ob = (base + j) * pc.nv * pc.vd + h * pc.vd + d;
@@ -152,7 +155,7 @@ void main() {
             uint l = p & 31u;
             if (j < c && l < j) {
                 float dot = 0.0;
-                for (uint kk = 0u; kk < kd; kk++) { dot += kn[j * 128u + kk] * kn[l * 128u + kk]; }
+                for (uint kk = 0u; kk < kd; kk++) { dot += kn[j * DN_MAX_KD + kk] * kn[l * DN_MAX_KD + kk]; }
                 aa[j * C + l] = bb[j] * exp(gg[j] - gg[l]) * dot;
             }
         }
@@ -174,7 +177,7 @@ void main() {
             uint j = p & 31u;
             if (i < c && j <= i) {
                 float dot = 0.0;
-                for (uint kk = 0u; kk < kd; kk++) { dot += qn[i * 128u + kk] * kn[j * 128u + kk]; }
+                for (uint kk = 0u; kk < kd; kk++) { dot += qn[i * DN_MAX_KD + kk] * kn[j * DN_MAX_KD + kk]; }
                 aa[i * C + j] = exp(gg[i] - gg[j]) * dot;
             }
         }
@@ -200,7 +203,7 @@ void main() {
             uint d = d0 + d2;
             if (d < pc.vd) {
                 float acc = egl * state[sbase + kk * pc.vd + d];
-                for (uint j = 0u; j < c; j++) { acc += wj[j] * kn[j * 128u + kk] * dl[j * COLS + d2]; }
+                for (uint j = 0u; j < c; j++) { acc += wj[j] * kn[j * DN_MAX_KD + kk] * dl[j * COLS + d2]; }
                 state[sbase + kk * pc.vd + d] = acc;
             }
         }

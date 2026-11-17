@@ -21,6 +21,17 @@ uint64_t w_ptr = 0ul;
 layout(binding = 2) buffer SB { float cstate[]; };          // [(kconv-1)*cc] in/out
 layout(binding = 3) writeonly buffer OB { float outp[]; };  // [rows, cc]
 
+// -DSHORTCONV builds LFM's gated short convolution (`Op::ShortConv`) from this same source: binding
+// 0 is then the `[rows, 3*cc]` in-projection output, read per row as B | C | X; the conv input is
+// B ⊙ X and the output C ⊙ conv, with no activation.
+#ifdef SHORTCONV
+#define CONV_IN(t, ch) (qkv[(t) * 3u * pc.cc + (ch)] * qkv[(t) * 3u * pc.cc + 2u * pc.cc + (ch)])
+#define CONV_OUT(t, ch, acc) (qkv[(t) * 3u * pc.cc + pc.cc + (ch)] * (acc))
+#else
+#define CONV_IN(t, ch) qkv[(t) * pc.cc + (ch)]
+#define CONV_OUT(t, ch, acc) ((acc) / (1.0 + exp(-(acc))))
+#endif
+
 void main() {
     uint ch = gl_GlobalInvocationID.x;
     if (ch >= pc.cc) {
@@ -34,9 +45,9 @@ void main() {
         for (uint k = 0u; k < km1; k++) {
             acc += cstate[k * pc.cc + ch] * WV(ch * pc.kconv + k);
         }
-        float cur = qkv[tk * pc.cc + ch];
+        float cur = CONV_IN(tk, ch);
         acc += cur * WV(ch * pc.kconv + km1);
-        outp[tk * pc.cc + ch] = acc / (1.0 + exp(-acc)); // SiLU
+        outp[tk * pc.cc + ch] = CONV_OUT(tk, ch, acc);
 
         // shift history: state[k] = state[k+1] for k in 0..km1-1, then newest slot = cur.
         for (uint k = 0u; k + 1u < km1; k++) {

@@ -24,7 +24,6 @@ use infr_core::{TensorInfo, WeightSource};
 use infr_gguf::Gguf;
 
 mod backends;
-pub mod gemma4;
 pub use backends::*;
 
 /// One resolved-and-shape-checked tensor: its GGUF metadata (name/shape/dtype/offset), kept around
@@ -140,12 +139,12 @@ pub fn has_mtp_head(path: &std::path::Path) -> bool {
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn find<'a>(g: &'a dyn WeightSource, name: &str) -> Option<&'a TensorInfo> {
+fn find<'a>(g: &'a Gguf, name: &str) -> Option<&'a TensorInfo> {
     g.tensors().iter().find(|t| t.name == name)
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn require(g: &dyn WeightSource, name: &str, want: &[usize]) -> Result<MtpTensor> {
+fn require(g: &Gguf, name: &str, want: &[usize]) -> Result<MtpTensor> {
     let t = find(g, name).ok_or_else(|| anyhow!("MTP head: missing tensor {name}"))?;
     if t.shape != want {
         bail!(
@@ -161,7 +160,7 @@ fn require(g: &dyn WeightSource, name: &str, want: &[usize]) -> Result<MtpTensor
 /// fallback tensors (`nextn.embed_tokens`/`shared_head_head`/`shared_head_norm`). A PRESENT tensor
 /// with the wrong shape is still an error (a real corruption, not an intentional omission).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn optional(g: &dyn WeightSource, name: &str, want: &[usize]) -> Result<Option<MtpTensor>> {
+fn optional(g: &Gguf, name: &str, want: &[usize]) -> Result<Option<MtpTensor>> {
     match find(g, name) {
         Some(t) if t.shape == want => Ok(Some(t.clone())),
         Some(t) => bail!(
@@ -177,7 +176,7 @@ fn optional(g: &dyn WeightSource, name: &str, want: &[usize]) -> Result<Option<M
 /// `cfg.n_layer_nextn == 1` (Phase 1's only supported case — `Config::from_gguf` already rejects
 /// anything else) and `cfg.qwen35`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn load_mtp_head(g: &dyn WeightSource, cfg: &crate::Config) -> Result<MtpHeadWeights> {
+pub fn load_mtp_head(g: &Gguf, cfg: &crate::Config) -> Result<MtpHeadWeights> {
     if !cfg.qwen35 || cfg.n_layer_nextn != 1 {
         bail!(
             "load_mtp_head: requires a qwen35 GGUF with nextn_predict_layers==1 (got qwen35={}, \
@@ -234,7 +233,7 @@ type WBufs = (Vec<Box<dyn Buffer>>, Vec<(DType, usize)>);
 /// Resolve a fallback tensor from the MAIN model (the reference's `layer.nextn.X ? layer.nextn.X :
 /// model.Y` — `qwen35.cpp:624-638`) when the head's own `nextn.*` tensor is absent.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn main_output_norm(g: &dyn WeightSource, ne: usize) -> Result<MtpTensor> {
+fn main_output_norm(g: &Gguf, ne: usize) -> Result<MtpTensor> {
     require(g, "output_norm.weight", &[ne])
 }
 
@@ -242,7 +241,7 @@ fn main_output_norm(g: &dyn WeightSource, ne: usize) -> Result<MtpTensor> {
 /// model.output`), mirroring `seam.rs`'s own tied-weight rule (`wload(&["output.weight"])`
 /// vs the `token_embd.weight` fallback right above it in that file).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn main_lm_head(g: &dyn WeightSource, ne: usize, vocab: usize) -> Result<MtpTensor> {
+fn main_lm_head(g: &Gguf, ne: usize, vocab: usize) -> Result<MtpTensor> {
     if find(g, "output.weight").is_some() {
         require(g, "output.weight", &[ne, vocab])
     } else {
@@ -254,7 +253,7 @@ fn main_lm_head(g: &dyn WeightSource, ne: usize, vocab: usize) -> Result<MtpTens
 /// model.tok_embd`) for [`build_embed_chain_buf`]'s device-side table upload, when the head has no
 /// own `nextn.embed_tokens` — mirrors [`main_lm_head`]'s fallback shape.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-fn main_token_embd(g: &dyn WeightSource, ne: usize, vocab: usize) -> Result<MtpTensor> {
+fn main_token_embd(g: &Gguf, ne: usize, vocab: usize) -> Result<MtpTensor> {
     require(g, "token_embd.weight", &[ne, vocab])
 }
 
@@ -263,10 +262,7 @@ fn main_token_embd(g: &dyn WeightSource, ne: usize, vocab: usize) -> Result<MtpT
 /// case the caller passes the main model's already-dequantized `token_embd` straight to
 /// [`MtpHeadSession::new_cpu`]/[`MtpHeadSession::new_vulkan`] instead.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub fn resolve_own_embed_table(
-    g: &dyn WeightSource,
-    head: &MtpHeadWeights,
-) -> Result<Option<Vec<f32>>> {
+pub fn resolve_own_embed_table(g: &Gguf, head: &MtpHeadWeights) -> Result<Option<Vec<f32>>> {
     match &head.embed_tokens {
         Some(t) => Ok(Some(crate::load_tensor_dequant(g, &t.name)?.0)),
         None => Ok(None),
@@ -284,7 +280,7 @@ pub fn resolve_own_embed_table(
 fn upload_mtp_head_bufs(
     be: &dyn Backend,
     bind_weight: &BindWeightFn,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &crate::Config,
     head: &MtpHeadWeights,
 ) -> Result<WBufs> {
@@ -292,19 +288,9 @@ fn upload_mtp_head_bufs(
     let mut bufs = Vec::with_capacity(16);
     let mut specs = Vec::with_capacity(16);
     let mut push = |t: &MtpTensor| -> Result<()> {
-        // Preserve GGUF's zero-copy weight views.
-        let bytes = match g.as_any().downcast_ref::<infr_gguf::Gguf>() {
-            Some(gg) => {
-                crate::seam::WBytes::Mmap(gg.tensor_bytes_arc(&t.name).map_err(|e| anyhow!("{e}"))?)
-            }
-            None => crate::seam::WBytes::Owned(
-                g.tensor_bytes(&t.name)
-                    .map_err(|e| anyhow!("{e}"))?
-                    .to_vec(),
-            ),
-        };
+        let tb = g.tensor_bytes_arc(&t.name).map_err(|e| anyhow!("{e}"))?;
         let numel: usize = t.shape.iter().product();
-        let (buf, dt) = bind_weight(&t.name, bytes, t.dtype, numel)?;
+        let (buf, dt) = bind_weight(&t.name, crate::seam::WBytes::Mmap(tb), t.dtype, numel)?;
         bufs.push(buf);
         specs.push((dt, numel));
         Ok(())
@@ -354,7 +340,7 @@ fn upload_mtp_head_bufs(
 fn build_embed_chain_buf(
     be: &dyn Backend,
     bind_weight: &BindWeightFn,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &crate::Config,
     head: &MtpHeadWeights,
 ) -> Result<(Option<Box<dyn Buffer>>, DType)> {
@@ -379,18 +365,9 @@ fn build_embed_chain_buf(
     if !gate {
         return Ok((None, DType::F32));
     }
-    let bytes = match g.as_any().downcast_ref::<infr_gguf::Gguf>() {
-        Some(gg) => {
-            crate::seam::WBytes::Mmap(gg.tensor_bytes_arc(&t.name).map_err(|e| anyhow!("{e}"))?)
-        }
-        None => crate::seam::WBytes::Owned(
-            g.tensor_bytes(&t.name)
-                .map_err(|e| anyhow!("{e}"))?
-                .to_vec(),
-        ),
-    };
+    let tb = g.tensor_bytes_arc(&t.name).map_err(|e| anyhow!("{e}"))?;
     let numel: usize = t.shape.iter().product();
-    let (buf, dt) = bind_weight(&t.name, bytes, t.dtype, numel)?;
+    let (buf, dt) = bind_weight(&t.name, crate::seam::WBytes::Mmap(tb), t.dtype, numel)?;
     Ok((Some(buf), dt))
 }
 
@@ -746,6 +723,7 @@ fn build_mtp_graph(
         pos: start_pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     // sigmoid out-gate BEFORE the o-projection — seam.rs:2686-2698, qwen35.cpp:602.
     g.push(Op::GatedAct {
@@ -1215,6 +1193,7 @@ fn build_mtp_draft_chain_graph(
             pos: sp as u32,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         g.push(Op::GatedAct {
             gate: gate_a,
@@ -1407,7 +1386,7 @@ impl<'a> MtpHeadSession<'a> {
     /// `seam/model.rs`'s `DiffusionGemmaCpuSession` closures).
     pub fn new_cpu(
         cpu_be: &'a infr_cpu::CpuBackend,
-        g: &dyn WeightSource,
+        g: &Gguf,
         cfg: &crate::Config,
         ec: &'a crate::EngineConfig,
         head: &MtpHeadWeights,
@@ -1442,7 +1421,7 @@ impl<'a> MtpHeadSession<'a> {
     /// `DiffusionGemmaVulkanSession` closures).
     pub fn new_vulkan(
         vk: &'a infr_vulkan::VulkanBackend,
-        g: &dyn WeightSource,
+        g: &Gguf,
         cfg: &crate::Config,
         ec: &'a crate::EngineConfig,
         head: &MtpHeadWeights,
@@ -1475,7 +1454,7 @@ impl<'a> MtpHeadSession<'a> {
     #[cfg(target_os = "macos")]
     pub fn new_metal(
         mtl: &'a infr_metal::MetalBackend,
-        g: &dyn WeightSource,
+        g: &Gguf,
         cfg: &crate::Config,
         ec: &'a crate::EngineConfig,
         head: &MtpHeadWeights,
@@ -1505,7 +1484,7 @@ impl<'a> MtpHeadSession<'a> {
     fn build(
         be: &'a dyn Backend,
         bind_weight: &BindWeightFn,
-        g: &dyn WeightSource,
+        g: &Gguf,
         cfg: &crate::Config,
         ec: &'a crate::EngineConfig,
         head: &MtpHeadWeights,
@@ -2069,6 +2048,7 @@ fn top1_softmax(logits: &[f32]) -> (u32, f32) {
             amax = i;
         }
     }
+    // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
     let z: f32 = logits.iter().map(|&v| (v - m).exp()).sum();
     (amax as u32, 1.0 / z)
 }
@@ -2103,7 +2083,7 @@ pub const DEFAULT_N_MAX: usize = 6;
 fn run_verify(
     be: &dyn Backend,
     bind: &BindWeightFn,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &crate::Config,
     ec: &crate::EngineConfig,
     token_embd: crate::seam::TokenEmbd<'_>,
@@ -2166,7 +2146,7 @@ fn run_verify(
 fn run_verify_full(
     be: &dyn Backend,
     bind: &BindWeightFn,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &crate::Config,
     ec: &crate::EngineConfig,
     token_embd: crate::seam::TokenEmbd<'_>,
@@ -2225,7 +2205,7 @@ fn run_verify_full(
 fn run_prime_last(
     be: &dyn Backend,
     bind: &BindWeightFn,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &crate::Config,
     ec: &crate::EngineConfig,
     token_embd: crate::seam::TokenEmbd<'_>,
@@ -2457,7 +2437,7 @@ fn generate_mtp_spec_core(
         let (logits0, h_rows0) = run_verify_full(
             be,
             bind,
-            model.weights(),
+            model.gguf(),
             cfg,
             ec,
             model.embd(),
@@ -2470,7 +2450,7 @@ fn generate_mtp_spec_core(
         let (ids0, h_rows0) = run_verify(
             be,
             bind,
-            model.weights(),
+            model.gguf(),
             cfg,
             ec,
             model.embd(),
@@ -2528,7 +2508,7 @@ fn generate_mtp_spec_core(
     });
 
     let mut acc: Vec<u32> = Vec::new();
-    let mut printed = 0usize;
+    let mut printed = crate::StreamOffsets::default();
     let mut out: Vec<u32> = Vec::new();
     let mut cycle = 0usize;
     let mut total_drafted = 0usize;
@@ -2592,7 +2572,7 @@ fn generate_mtp_spec_core(
             let (vlogits, h_rows) = run_verify_full(
                 be,
                 bind,
-                model.weights(),
+                model.gguf(),
                 cfg,
                 ec,
                 model.embd(),
@@ -2605,7 +2585,7 @@ fn generate_mtp_spec_core(
             let (vids, h_rows) = run_verify(
                 be,
                 bind,
-                model.weights(),
+                model.gguf(),
                 cfg,
                 ec,
                 model.embd(),
@@ -2790,7 +2770,7 @@ fn generate_mtp_spec_core(
             let (rid, rlogits, rh) = run_prime_last(
                 be,
                 bind,
-                model.weights(),
+                model.gguf(),
                 cfg,
                 ec,
                 model.embd(),
@@ -2848,6 +2828,9 @@ fn generate_mtp_spec_core(
             prompt_secs: prime_verify_secs,
             n_gen: out.len(),
             decode_secs: t_decode.elapsed().as_secs_f64(),
+            n_cached: 0,
+            ctx_full: false,
+            natural_stop: false,
         },
         timing,
     ))

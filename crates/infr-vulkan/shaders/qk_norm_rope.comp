@@ -55,7 +55,10 @@ layout(binding = 2) buffer YB { float16_t y[]; };
 #define KVW(idx, val) y[idx] = float16_t(val)
 #endif
 
-shared float xs[512]; // hd up to 512 (gemma4 full layers); 64 threads each handle hd/64 elements
+// Widest head this kernel stages; the host refuses wider heads (`QK_NORM_ROPE_MAX_HD` in
+// src/adapter.rs mirrors this value). 64 threads each handle hd/64 elements.
+#define QK_NORM_ROPE_MAX_HD 512
+shared float xs[QK_NORM_ROPE_MAX_HD];
 shared float red[64];
 
 void main() {
@@ -63,7 +66,11 @@ void main() {
     k_addr = kv_base(pc.d_lo, pc.d_hi);
 #endif
     uint t = gl_LocalInvocationID.x;
-    uint unit = gl_WorkGroupID.x;
+    // Flat workgroup index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_WorkGroupID.x` when unsplit. A padding
+    // workgroup returns whole, before any barrier or subgroup op, so control flow stays uniform.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.nheads) { return; }
     uint h = unit % pc.nheads;
     uint r = unit / pc.nheads;
     uint in_base = (r * pc.nheads + h) * pc.hd;

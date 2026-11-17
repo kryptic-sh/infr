@@ -269,7 +269,7 @@ const SHAPES: [Shape; 4] = [
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn attention_kv_bda_matches_bound_f16() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -287,7 +287,7 @@ fn attention_kv_bda_matches_bound_f16() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn attention_kv_bda_matches_bound_q8() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -313,7 +313,7 @@ fn attention_kv_bda_matches_bound_q8() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn kv_isa_probe() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -453,7 +453,6 @@ fn run_split(be: &VulkanBackend, c: &SplitCase, k_q8: bool, v_q8: bool) -> Legs 
                 cap,
                 batched,
                 None,
-                None,
             ),
             None => rec.attention_kv_split(
                 q_buf.as_ref(),
@@ -522,7 +521,7 @@ fn run_split(be: &VulkanBackend, c: &SplitCase, k_q8: bool, v_q8: bool) -> Legs 
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn attn_partial_bda_matches_bound_f16() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -574,7 +573,7 @@ fn attn_partial_bda_matches_bound_f16() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn attn_partial_bda_matches_bound_q8() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -771,7 +770,6 @@ fn run_mainline(
             cap,
             false,
             Some(dt),
-            None,
         );
         rec.finish().unwrap();
         let mut out = vec![0u8; o_bytes];
@@ -806,7 +804,7 @@ fn run_mainline(
 #[ignore = "requires a Vulkan GPU"]
 fn attn_partial_mainline_matches_prepass() {
     use infr_core::DType::*;
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -822,7 +820,7 @@ fn attn_partial_mainline_matches_prepass() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn attn_partial_mrows_bda_matches_bound() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -852,7 +850,7 @@ fn attn_partial_mrows_bda_matches_bound() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn attn_partial_isa_probe() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1026,7 +1024,7 @@ fn assert_offinv(name: &str, a: &[u8], b: &[u8]) {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn store_f16_bda_matches_bound() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1046,7 +1044,7 @@ fn store_f16_bda_matches_bound() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn store_q8_bda_matches_bound() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1077,7 +1075,7 @@ fn store_q8_bda_matches_bound() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn quant_kv_bda_matches_bound() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1107,7 +1105,7 @@ fn quant_kv_bda_matches_bound() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn store_kv_dense_bda_matches_bound() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1130,7 +1128,7 @@ fn store_kv_dense_bda_matches_bound() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn dequant_q8_f16_bda_matches_bound() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1148,7 +1146,7 @@ fn dequant_q8_f16_bda_matches_bound() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn dequant_kv_f16_bda_matches_bound() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -1176,7 +1174,7 @@ fn dequant_kv_f16_bda_matches_bound() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn qk_norm_rope_bda_matches_bound() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

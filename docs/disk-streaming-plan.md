@@ -9,12 +9,12 @@ Status: **phases 0–3 landed and the tier now beats mmap on both backends** (CP
 `docs/perf/results.md`), **and turns itself on when a model does not fit**
 (§4.1) rather than waiting for a budget nobody could guess. Phase 4 is not
 built; phase 5 is three levers in — the concurrent reader, the admission
-doorkeeper, and auto-sizing. §5 says what each phase delivered and what it
-deferred; §7 holds the questions still open, including whether phase 4 should be
-attempted at all on a machine that cannot run it. Claims about the tree name the
-file and symbol they came from. Numbers come from a command that was run, not an
-estimate; the one worked example in §2 is labelled as illustrative arithmetic,
-not a prediction.
+doorkeeper, and auto-sizing. §5 lists what shipped; what did not is in
+`backlog.md` § B35/B36, and §7 holds the questions still open, including whether
+phase 4 should be attempted at all on a machine that cannot run it. Claims about
+the tree name the file and symbol they came from. Numbers come from a command
+that was run, not an estimate; the one worked example in §2 is labelled as
+illustrative arithmetic, not a prediction.
 
 ## 1. What exists today
 
@@ -23,8 +23,10 @@ The residency machinery is already block-agnostic and already has two policies:
 - `infr_core::pager::Pager` — pure host-side bookkeeping (`n_slots` slots, a
   `BlockId → slot` map, LRU order, batch epochs). No bytes, no device types.
   Three entry points: `touch` (recency/LRU, MoE decode), `touch_cold`
-  (scan-resistant, prefill sweeps) and `schedule` (exact cyclic sweep,
-  Belady-parity — dense layer streaming). `ring_bytes` prices the staging ring.
+  (scan-resistant, prefill sweeps) and `schedule` (cyclic sweep: a stable
+  resident prefix of `n_slots − 1` blocks, within `(n_slots − 1)/(n_blocks − 1)`
+  misses per pass of Belady's optimum — dense layer streaming). `ring_bytes`
+  prices the staging ring.
 - `infr_vulkan::pager::GpuPager` — a `Pager` plus a VRAM slot arena (BDA), a
   device LUT, and uploads through a reused pinned staging ring.
   `MoePagerSession` drives it with `(layer, role, expert)` blocks;
@@ -60,8 +62,8 @@ feature is **not** "make it possible". It is "make it not thrash":
    case: every page evicted exactly before its next use. Same pathology
    `Pager::touch_cold`/`schedule` exist to fix (that doc records the in-tree
    measurement: 768/768 blocks re-uploaded per rep on Scout pp512 under plain
-   LRU). We can apply Belady-parity policy per tier; the kernel cannot, because
-   it does not know the sweep order.
+   LRU). We can apply a near-optimal sweep policy per tier; the kernel cannot,
+   because it does not know the sweep order.
 2. **No prefetch we control.** Kernel readahead is a sequential heuristic over
    file offsets. Our access order is known for the whole pass on dense, and one
    layer ahead for MoE on CPU (the router runs on the host), so reads can be
@@ -193,9 +195,13 @@ one file, and sharded-GGUF support is deferred (§7).
 **Blocks that cannot be re-read from the file.** The seam rewrites some tensors
 at load — the qwen2 NEOX q/k row permute, the BitNet `I2S` → f16 dequant — and
 the Vulkan dense streaming path already excludes them for that reason. It also
-excludes dtypes whose kernels take no weight offset (`native_dense_supported`;
-F16/F32 are out, so an f16 checkpoint has **no** streamable dense weights on
-Vulkan today). Both exclusions are conditions on the tier planner, not
+excludes dtypes the streamed dispatch cannot read from an arena slot
+(`infr_vulkan::linear::dense_stream_supported`): every native quant format and
+bf16 take an element offset into the slot, and F16/F32 run the resident float
+kernels, which read their weight from a 64-bit base address, at the slot's
+address (a float slot is aligned like a resident weight,
+`dense_stream_slot_align`). So since 2026-11-15 an f16 or f32 checkpoint streams
+like a quantised one. Both exclusions are conditions on the tier planner, not
 afterthoughts: the eligibility predicate moves out of the Vulkan-only
 `dense_plan` block in `seam/mod.rs` and next to `fuse_gu_decision` /
 `fuse_qkv_decision`, where the other shared enumeration rules live, so CPU and
@@ -263,9 +269,10 @@ because weights are mmap'd or uploaded once. A paged slot reuses one address for
 different blocks at identical length, so those keys collide and hand back
 another block's data — plausible garbage, not an error:
 
-- `infr-cpu`'s `repack_cache` / `repack6_cache`: `q4k_pack_for` / `q6k_pack_for`
-  key on `(w.as_ptr() as usize, w.len())`. **Must** be re-keyed on `BlockId`
-  before any CPU paging lands.
+- `infr-cpu`'s `repack_cache`: `q4k_pack_for` now keys on `repack::PackKey` —
+  the `CpuBuffer`'s uid plus the slice's byte offset and length, not its
+  address. Every `CpuBuffer`, a paged weight's included, takes a fresh uid, so a
+  reused address no longer collides.
 - `infr-cpu`'s `weight_cache` is safe as written — it keys on the `CpuBuffer`
   object address, not the slice — but it caches a dequantized f32 copy, so it is
   a budget consumer, not a correctness one.
@@ -325,10 +332,11 @@ in two tiers is waste — a block resident in VRAM never needs a DRAM copy. So
 `TierPlan` assigns each block one home tier at load: VRAM home takes as many
 blocks as its budget holds minus a streaming window, DRAM home takes as many of
 the remainder as its budget holds, and everything left streams from disk each
-pass into those windows under the existing `schedule` (cold-insert,
-Belady-parity) policy. Per-pass disk traffic is then
-`model − VRAM_home − DRAM_home`, which is the minimum any policy achieves on a
-sweep.
+pass into those windows under the existing `schedule` (cold-insert, stable
+prefix) policy. Per-pass disk traffic is then `model − VRAM_home − DRAM_home`,
+which is within a fraction of a block per pass of the minimum any policy
+achieves on a sweep (Belady rotates which blocks it keeps and saves
+`(n_slots − 1)/(n_blocks − 1)` misses per pass more).
 
 **The DRAM half of that partition is LANDED, without `TierPlan`.**
 `HostPager::fill` reaches the same place by first-touch rather than by planning:
@@ -339,16 +347,41 @@ finds the same set resident — and it needs no plan because the sweep order
 supplies one. What a real `TierPlan` would add is choosing WHICH blocks get the
 DRAM home rather than taking whichever came first, which only matters once
 blocks differ in size or in access frequency. Measured as worth 1.6x on the
-Vulkan path over the evict-and-cache shape (§5, phase 3).
+Vulkan path over the evict-and-cache shape (phase 3).
 
 **MoE: cache, and fill from the read path only.** Routing is skewed and
 unpredictable, so both tiers cache with the existing policies (`touch` for
 decode, `touch_cold` for prefill sweeps). The DRAM tier is filled **only** from
 disk reads — never by copying a block back from VRAM, which spends a device→host
 transfer on bytes that can be re-read from disk instead. **LANDED** on the
-Vulkan MoE session: both entry points take `HostPager::pin` (the evicting
-shape), and each hands the tier below the same insertion policy it is using
-itself, so the two tiers cannot disagree about which experts are hot.
+Vulkan MoE session: `stage_role` takes `HostPager::pin` (the evicting shape) on
+a VRAM miss and only then, passing the tier below the insertion policy the arena
+is using for that batch. A VRAM hit never reaches the host tier, as on the dense
+path.
+
+What that means for policy: the DRAM tier's recency is the stream of VRAM
+_misses_, not of every touch, so it holds the experts most recently missed
+rather than a copy of VRAM's hot set. An expert that keeps hitting in VRAM ages
+out of DRAM, which is what frees DRAM for experts VRAM does not hold — closer to
+exclusive placement than to the inclusive mirror of VRAM's recency this tier had
+while it was also consulted on hits (and paid a disk read on such a hit whenever
+DRAM had already evicted the expert). The cost: an expert hot for a long stretch
+and then evicted from VRAM may no longer be in DRAM, because DRAM never saw its
+recent use, so its next miss reads the disk. Which shape misses less depends on
+the routing trace and has not been measured; the two-tier simulator in
+`docs/plan/06-pager-eviction.md` is the instrument for it.
+
+**Prefill order decides what a sweep costs.** A prefill chunk is a sweep: a
+chunk-major prompt of `n` chunks reads the streamed weights `n` times. Every
+streamed model on a device pager prefills layer-major (every chunk through layer
+`l` before any reaches `l+1`; `seam::layer_major_prefill`), so a prompt reads
+each block once. On the CPU's host arena DeepSeek V4 does too since 2026-11-17,
+its expert banks read once per prompt instead of once per chunk, with residency
+hints from the producer: a layer's chunks insert what they pin at the hot end
+(`WeightReuse::Again`), and its last chunk demotes the layer's weights so the
+next layer evicts them first (`WeightReuse::Done`, `Pager::demote`). Measured
+and what is left: `docs/deepseek.md` § "Layer-major prefill on the CPU",
+`backlog.md` § B-CPU-EXPERT-PAGING.
 
 **Prefetch:**
 
@@ -414,14 +447,13 @@ that expert's own file offset inside the bank, under the same global
 `layer_base + local_id` the arena already keys on. That per-expert granularity
 is the whole point — a routed miss reads ONE expert off the file instead of
 faulting in a whole bank through the mapping, which is what §2 means by MoE
-being the tier's best case. Both entry points carry it: the demand path
-(`touch_role`, decode's routed readback) and the recorded path (`stage_role`),
-each passing the tier below the SAME insertion policy it uses itself — cold for
-a full-set prefill sweep, MRU for a routed decode touch — because §3.6 says MoE
-caches rather than partitions, so the two tiers should agree on what "hot"
-means. `register` checks every one of a layer's experts is present below, so a
-bank that was mis-registered fails at load rather than on the first routed miss
-that names the missing id.
+being the tier's best case. `stage_role` is the one entry point, for prefill
+sweeps and decode's routed readback alike: it consults the tier below only on a
+VRAM miss, with the insertion policy the arena uses for that batch — cold for a
+full-set prefill sweep, MRU for a routed decode touch (§3.6 says what that does
+to the DRAM tier's recency). `register` checks every one of a layer's experts is
+present below, so a bank that was mis-registered fails at load rather than on
+the first routed miss that names the missing id.
 
 **Metal (`infr-metal`).** Unified memory collapses the VRAM and DRAM tiers into
 **one**: an arena slot is host memory the GPU reads directly, so a disk read
@@ -538,11 +570,38 @@ testable without a machine that happens to have the right amount of RAM free.
   `/proc/meminfo` is host-wide, and measured on this box an 8 GiB `systemd-run`
   scope still reports 54.6 GB available — sizing an anonymous arena from that is
   an OOM kill in every container. Verified at 53.57 GB unconstrained, 8.59 GB
-  under an 8 GiB cap, 2.15 GB under 2 GiB. Other platforms answer `None`, which
+  under an 8 GiB cap, 2.15 GB under 2 GiB. The probe itself is
+  `infr_plat::mem::available`, which also answers on macOS (host-wide) and
+  Windows (Job-Object-clamped); a platform with no probe answers `None`, which
   callers treat as "do not auto-size" and never as "assume plenty".
-- **`auto_arena_bytes`** — leaves the larger of 1 GiB and an eighth of what is
-  available, never budgets past the pageable bytes (more would buy nothing), and
-  returns 0 below a floor worth having.
+- **`auto_arena_bytes`** — the automatic budget is
+  `min(pageable, available - committed - max(1 GiB, available / 2))`, and 0
+  below a floor worth having. `committed` is what the run holds besides the
+  arena: zero for the GPU tiers (their KV lives in VRAM), and for the CPU
+  backend (`seam::cpu_committed_bytes`) its KV cache at `device.ctx` (else the
+  trained context capped at 8192, priced f16), the weights too small to page, a
+  1 GiB activation reserve, and the repack cache budget where the fused Q4_K
+  expert path can fill it (`seam::cpu_repack_reserve`). Half, not a fixed
+  margin, so it scales: the shared-box test guard's 12 GiB `UNIFIED_HOST_MARGIN`
+  as a floor would turn the tier off on any host with less available, while an
+  eighth (the rule until 2026-11-16) gave DeepSeek V4-Flash a 38.47 GB arena on
+  a host with 43.97 GB available and starved it. Verified on that file with no
+  `INFR_DRAM_CACHE`: 45.48 GB available gave a 21.56 GB arena beside 1.19 GB
+  committed, and the process stayed within it over a 48-token run (private bytes
+  20872 MiB); available memory bottomed at 19154 MiB, under the 21687 MiB half
+  because buffered reads grew the system file cache by about 3.4 GiB (backlog
+  B-DSV4-REAL).
+- **The CPU backend's split of that budget** (`infr_cpu::paged::plan_pools`) —
+  one pool per block size and read pattern; whole weights (read in full every
+  pass) are seated before expert pools (an expert bank paged one block per
+  expert, read only when routed), each class first given its floor (one block,
+  or every expert one `Op::MoeFfn` pins at once).
+- **The CPU's fit test uses the same accounting** — the mapping is kept only
+  when `pageable + committed <= available` (no headroom: page-cache pages are
+  reclaimable). One byte past it the half rule's arena applies, a deliberate
+  step: a recency-evicting page cache short by a little misses on nearly every
+  block of a sweep, so a smaller arena should still win there (inferred, not
+  measured at the boundary).
 - **`cpu_arena_plan` / `streaming_arena_plan`** — the two decisions, differing
   in one rung: the Vulkan tiers are already past the fit decision, while the CPU
   backend has to make it. Both answer with a reason when they decline, because
@@ -551,179 +610,25 @@ testable without a machine that happens to have the right amount of RAM free.
 
 ## 5. Phasing
 
-**Phase 0 — measure the baseline (no code). DONE.** `scripts/paging-baseline.py`
-and its table in `docs/perf/results.md`; headline in §1.1. The bar every later
-phase is judged against, re-run with the same harness.
+Phases 0–3 shipped, and the per-phase build log that used to live here is in
+`git log`
+(`git log -S'Phase 3 — Vulkan third tier' -- docs/disk-streaming-plan.md` finds
+the last copy). In one line each:
 
-**Phase 1 — core, no backend wired. DONE.** `blockio.rs` (`BlockDesc`,
-`FileBlockIo`, the file-replaced stamp), `hostpager.rs` (arena, `Pin`, the
-`Loading`/`Ready` handshake), pins in `Pager`, `Gguf::tensor_file_range` /
-`Gguf::path`, and the address-keyed cache fix from §3.4 (`CpuBuffer::uid`).
-Verified by unit tests over a fake `BlockIo` — content correct after churn, a
-pinned block never evicted, exhaustion surfacing rather than corrupting, failed
-reads leaving nothing resident, extent order deciding the layout, the
-file-change check firing — each shown to fail by breaking what it guards. The
-arena's unsafe is clean under Miri (tree-borrows), now a weekly cron step.
+- **Phase 0** — the mmap baseline, measured by `scripts/paging-baseline.py`.
+- **Phase 1** — `blockio` / `hostpager` / pins in `infr-core`, no backend wired.
+- **Phase 2** — the CPU backend on the DRAM tier (`infr_cpu::paged`).
+- **Phase 3** — the Vulkan third tier under dense streaming and the paged MoE
+  cache, verified by `infr-vulkan/tests/dense_tier_parity.rs` and
+  `gpu_seam_dense_stream_host_tier_matches_resident`.
+- **Phase 5, landed levers** — the concurrent reader (`IO_FANOUT`), the
+  second-miss admission rule, and auto-sizing `paging.dram` (§4.1).
 
-Deferred out of this phase, deliberately: **`TierPlan`** (its only consumer is
-the phase-2 placement decision; a plan type with no caller is machinery shaped
-by a guess) and the **prefetch worker pool** (same reason — the pool's depth and
-thread count are meaningless until something measures them, and `HostPager::pin`
-reads synchronously in the meantime).
-
-**Phase 2 — CPU backend on the DRAM tier. DONE (prefetch deferred).**
-`CpuBuffer::Paged` + `CpuRead::Pinned`, the per-op pin pre-step driven by
-`Op::io()`, `infr_cpu::paged` (one pool per weight-size class, planned up front
-from the GGUF's tensor directory), the `paging.dram` key, and the
-`INFR_PAGER_STATS` per-pool report. Measured against phase 0 in
-`docs/perf/results.md`: decode 1.28x at a 2 GB cap and **2.06x at 1.5 GB**,
-major faults 210-335x lower, and read volume flat as the cap tightens where
-mmap's grows. Prefill costs 3-7.5%.
-
-Prefetch is still not built: the synchronous read is what the numbers above
-already beat, and the pool/depth knobs have no measured values yet.
-
-The ORIGINAL phase-2 verification, for the record: greedy token identity against
-the CPU reference path with the budget forced small enough to churn; hit rates
-matching the policy's predicted `(n_slots − 1) / n_blocks` per sweep; a model
-larger than the budget completing at all; and beating phase 0 on throughput
-**and** major-fault count.
-
-**Phase 3 — Vulkan third tier. DONE (prefetch and the direct-to-ring read
-deferred).** `DenseBytes`, `DensePoolSpec::host`, the three-case
-`schedule_staged`, `DensePagerSession::pool_stats`, and the seam's
-`dense_host_tier` (one host pager per dense pool, budget split by
-`hostpager::plan_slots` — the same function `infr_cpu::paged::plan_pools` now
-calls, so the two tiers cannot drift apart on the rule).
-
-Verified by `infr-vulkan/tests/dense_tier_parity.rs`, which forces all three
-cases in one sweep (VRAM 3 slots, DRAM 5 slots, 8 blocks, 3 passes) and asserts
-each was taken from the counters rather than assuming: 4 VRAM hits, 20 VRAM
-misses, 4 DRAM hits, 16 file reads, across 9 ring-half rotations — the ring
-cursor persists across blocks, so `stage` really does refuse a full half and the
-caller really does swap. Correctness is content-checked through the streamed
-GEMV against the same weight in a plain arena, so a wrong slot decodes to
-visibly different finite floats. It also pins the accounting — the tier below is
-consulted exactly once per VRAM miss, one DRAM miss is one file read, and a read
-moves a whole block — because a probe that fired on hits too would report the
-sweep as warmer than it is. End-to-end, `gpu_seam_dense_stream_host_tier_`
-`matches_resident` (Qwen3-1.7B, 200 MB VRAM and 256 MB DRAM budgets, both far
-under the working set) is token-identical to the all-resident run. Clean under
-the Khronos validation layer, with the loader confirmed to have loaded it.
-
-Each new assertion was shown to go red by breaking what it guards: serving a
-neighbouring block from the host tier (both the unit and the end-to-end test
-fail — which is also what proves the end-to-end test engages the tier at all
-rather than passing vacuously), consulting the tier twice per miss, and dropping
-the registration check that a `Host` block exists below.
-
-The MoE half landed with it: `ExpertBytes`, `MoePoolSpec::host`, per-expert
-blocks in both `touch_role` and `stage_role`, and
-`gpu_seam_paged_moe_host_tier_matches_resident` (Qwen3-30B-A3B, 50 MB VRAM and
-256 MB DRAM budgets) token-identical to the all-resident run — with the same
-break-probe, which diverged the output token-for-token and so proves the tier is
-on the path.
-
-**It now beats the mmap it replaces, and that is measured.**
-`docs/perf/results.md` carries the table: Qwen3-14B Q8_0 streamed under a forced
-2 GB VRAM budget, the tier runs at **2.17x of mmap on decode** under an 8 GB cap
-with a 7 GB arena (0.39 vs 0.18 t/s), 1.41x with a 3 GB one, and at parity
-unlimited — while doing what it targets: 38x fewer major faults under the cap,
-232 to 110 GB read.
-
-Three fixes got it there, and ALL THREE were found by measuring rather than by
-reasoning about the design. The third is not code at all: the arena BUDGET is
-the single biggest lever in the feature (3 GB → 7 GB is worth 1.6x on its own),
-and nothing auto-sizes it — see §5's phase-5 list.
-
-The first was worth 1.6x. The tier originally pinned each block in its arena and
-memcpy'd it into the ring, and measured 0.48x of mmap: on CPU the arena REPLACES
-the mapping so it adds no copy, but on Vulkan the bytes reach the ring either
-way, making `disk -> arena -> ring` one copy more than `page-cache -> ring`.
-`HostPager::fill` now admits only while a slot is free and, once the arena is
-full, reads straight into the ring — which is also the correct residency call
-and is exactly §3.6's "dense: partition, do not cache", arrived at from the
-other direction. Decode 0.83 -> 1.36 t/s, prefill 54.7 -> 85.8.
-
-The third fix was the ADMISSION RULE. This tier sits under one that only calls
-down on its own misses, and on the first pass nothing is resident above — so
-admitting on the first miss filled the arena with exactly the prefix the VRAM
-pager then keeps forever, blocks that never call down again. `INFR_PAGER_STATS`
-showed 9 slots holding 9 blocks of which 5 could ever be hit. Admission now
-requires a SECOND miss, which no block the tier above keeps ever reaches: useful
-hits per pass 5 → 9, bytes read −10.5%, decode 0.22 → 0.24.
-
-That left the tier at 0.79x, and the second fix was the READER, not the policy
-this plan spent its time on. `FileBlockIo::read_block` issued one `pread` per
-extent on one thread. A drive delivers bandwidth on queue depth: measured on
-this NVMe over 16-128 MB blocks, a single positioned read sustains 1.2-1.5 GB/s
-against a 2.2 GB/s device ceiling reached at depth 2-4. So the tier was losing
-to the mapping for a structural reason — the kernel issues readahead faults in
-parallel for free — and a block is now split across `IO_FANOUT` concurrent
-positioned reads. Read volume, fault counts and residency are unchanged across
-that fix; only bandwidth moved. Decode 0.15 -> 0.22 under the cap.
-
-**The lesson worth keeping: this plan's §5 named prefetch as the lever the
-phase-3 result "points at hardest", and that was wrong.** The regime is
-I/O-bound by orders of magnitude, so hiding a read behind compute had nearly
-nothing to hide it behind; the read was not too LATE, it was too SLOW. What is
-left is reading fewer bytes — the double-caching item below — not overlapping
-the reads.
-
-`paging.dram` is **no longer off by default**: the performance case is made, so
-a run that has to stream now builds the tier and sizes it itself (§4.1). What is
-still missing is coverage — one GPU, one drive, Linux only — which is why the
-probe declines rather than guesses on platforms it cannot measure, and why `0`
-exists to turn the whole thing off.
-
-**Phase 4 — Metal / UMA collapse.** Arena, pager, offset binding, the
-`qui_cache` gate. Verification: Metal decode parity against CPU reference under
-a forced-tiny budget, and the first over-RAM model to load on Apple silicon at
-all.
-
-**Phase 5 — levers, each gated on a measurement.** The concurrent reader (see
-phase 3) already landed the one that mattered; what follows is ordered by what
-the measurement now says, which is NOT what this section said before it.
-
-- **Auto-size `paging.dram` — LANDED, and it was the top lever.** The budget
-  alone moves decode 0.24 → 0.29 → 0.39 t/s at 3, 6 and 7 GB under an 8 GB cap
-  (mmap: 0.18), so the value a user used to have to guess was worth **1.6x** —
-  and an unset budget used to disable the tier entirely, on exactly the runs
-  that needed it. §4.1 has the sizing rule and §7's question 3 is answered
-  (Linux probes `MemAvailable` and the cgroup limit; other platforms decline
-  rather than guess). The arena must stay ANONYMOUS memory for a large budget to
-  be safe — the kernel reclaims page cache in its favour, which is why 7 GB
-  under an 8 GB cap does not thrash (major faults flat at ~1 700).
-- **Double-caching: CLOSED, the premise was wrong both ways.** This plan
-  asserted that a buffered `pread` halves the tier's effective budget and that
-  `posix_fadvise(DONTNEED)` **cannot** reclaim the duplicate because
-  `Gguf::open` maps the whole file. A `mincore` probe refutes both. `DONTNEED`
-  DOES reclaim mapped-but-untouched pages (65 536 → 0); a page is exempt only
-  once it is actually faulted into a page table, and this tier never touches
-  paged ranges through the mapping. And the reclaim is not needed anyway: an
-  anonymous arena already wins page-cache reclaim under a cap, which is exactly
-  what the 7 GB row demonstrates. No `O_DIRECT`/`F_NOCACHE` rewrite, no
-  alignment constraints, no work here. Do not reopen without new evidence.
-- **Prefetch — deprioritized, and the reason is worth recording.** The
-  synchronous read does sit on the critical path under the session mutex, and
-  this plan called it "the one the phase-3 result points at hardest". That was
-  wrong. Roughly 12.5 GB is read per token against tens of milliseconds of GPU
-  compute, so overlapping the two hides a read behind almost nothing. Prefetch
-  becomes interesting only once the tier is no longer I/O-bound — e.g. after the
-  arena grows enough that most of a pass hits it.
-
-Still speculative, still gated: frequency-warmed DRAM for MoE-on-GPU; io_uring
-if the reader proves queue-depth bound BEYOND what `IO_FANOUT` concurrent
-`pread`s already reach (measured: they hit the device ceiling on this drive, so
-there may be nothing left here); exclusive VRAM/DRAM placement for MoE;
-multi-GPU and MTP coverage.
-
-Coverage the reader change does NOT have: the concurrent-read speedup is
-measured on Linux/NVMe only. On Windows `seek_read` issues `ReadFile` with an
-`OVERLAPPED` offset and a handle not opened `FILE_FLAG_OVERLAPPED` has its
-concurrent operations serialized, so the fanout may buy nothing there; reads
-stay correct either way. A rotational disk is also untested and is the one case
-where concurrency could plausibly HURT.
+What is NOT built — phase 4 (Metal / UMA collapse), prefetch, and the
+measurement-gated phase-5 levers (io_uring, frequency-warmed DRAM for MoE,
+exclusive VRAM/DRAM placement for MoE, multi-GPU and MTP coverage) — lives in
+`backlog.md` § B35 and § B36, with the reasons each is deferred. The phase-4
+question needing the user's call stays in §7 below.
 
 ## 6. Verification rules specific to this feature
 
@@ -741,32 +646,21 @@ where concurrency could plausibly HURT.
 
 ## 7. Decisions
 
-Made here, changeable by the user:
+Superseded, kept so they are not re-argued:
 
-1. **The dense disk tier is opt-in, not an automatic ladder rung.** At the §2
-   ceiling, silently choosing it for an interactive decode turns a clean "does
-   not fit" into a session that looks hung. `paging.disk` (or an explicit
-   `paging.dram`) engages it; the auto ladder stops where it does today unless
-   asked. MoE is different — skewed routing makes it genuinely fast — so MoE may
-   take the tier automatically.
-2. **Sharded GGUF is out of scope for v1.** `Gguf::open` maps one file; the
-   `-NNNNN-of-MMMMM` set is understood only by `infr-hub`'s downloader. A paged
-   sharded model is rejected at load with that reason, and `BlockExtent` carries
-   no file id until a second file exists to point at.
+1. ~~The dense disk tier is opt-in.~~ Reversed: `paging.disk` was never built
+   (§4), and the tier engages whenever placement rejects residency, sized by
+   §4.1's probe.
+2. ~~Sharded GGUF is out of scope for v1.~~ Shipped:
+   `infr_core::blockio::FileBlockIo::open_shards` serves a `gguf-split` set, and
+   `cpu_paged_store` / `vulkan_host_tier` in `infr-llama/src/seam/mod.rs` open
+   it from `Gguf::shards()`.
+3. ~~Windows host-memory probe.~~ Shipped: `infr_core::hostmem` delegates to
+   `infr_plat::mem::available`, which has Linux (cgroup-clamped), macOS
+   (`host_statistics64`) and Windows (Job-Object-clamped) arms; CI runs all
+   three platforms.
 
 Needing the user's call:
-
-3. **Windows host-memory probe.** `libc` covers Linux and macOS; Windows needs
-   `GlobalMemoryStatusEx`, i.e. a new dependency (`sysinfo` or `windows-sys`).
-   Recommendation: neither — Windows requires an explicit `paging.dram` and says
-   so. CI builds only ubuntu and macos today.
-
-   Note this is not yet load-bearing: nothing probes host memory on ANY
-   platform. `paging.dram` is explicit-only everywhere today (both
-   `cpu_paged_store` and `dense_host_tier` return "no tier" when it is unset),
-   which is the safe default B30 argues for — an anonymous arena sized from a
-   guess is the expensive kind of wrong. The question only becomes live if the
-   tier should ever engage automatically.
 
 4. **Phase 4 (Metal) cannot be verified on this machine.** There is no Apple
    hardware here and `infr-metal` does not compile on this box, so the only

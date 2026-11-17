@@ -20,9 +20,35 @@ pub const LLAMA: &str = "llama";
 /// Qwen2-MoE-style DENSE shared expert summed IN (no per-token gate, unlike qwen35moe), and iRoPE:
 /// every `no_rope_layer_step`-th layer is NoPE (rope skipped, global attention) while rope layers
 /// carry chunked local attention; rope layers also apply a WEIGHTLESS per-head L2-norm to Q/K
-/// AFTER rope (`Llama4TextL2Norm`). Chunked-attention masking + NoPE attention-temperature scaling
-/// (both no-ops below the 8192-token chunk size) are CPU follow-ups — see `Config::from_gguf`.
+/// AFTER rope (`Llama4TextL2Norm`). Chunked-attention masking and the NoPE attention temperature
+/// are not implemented; the context is capped where the first of them would change the output —
+/// see `Config::faithful_ctx_limit`.
 pub const LLAMA4: &str = "llama4";
+/// SmolLM3 (Hugging Face's SmolLM3-3B): the [`LLAMA`] block verbatim (RMS pre-norms, separate
+/// Q/K/V, NORM/interleaved rope, parallel SiLU FFN, output tied to the embedding when
+/// `output.weight` is absent) except that every `Config::no_rope_step`-th layer skips rope (NoPE).
+/// Unlike [`LLAMA4`], the reference hardcodes that step rather than reading it from the file, and
+/// the NoPE layers change nothing else: no chunked attention, no temperature, no L2-norm, no MoE
+/// (`llama_model_smollm3`, `src/models/smollm3.cpp`).
+pub const SMOLLM3: &str = "smollm3";
+/// ERNIE 4.5 dense (Baidu's ERNIE-4.5-0.3B): the [`LLAMA`] block verbatim (RMS pre-norms,
+/// separate Q/K/V, NORM/interleaved rope, parallel SiLU FFN, output tied to the embedding when
+/// `output.weight` is absent). The converter writes Q/K without llama's permute and the reference
+/// ropes them NORM all the same, so no row permute applies here either; the head width
+/// (`attention.key_length`) is not `n_embd / n_head` in the 0.3B file. The reference loads
+/// optional `attn_q/k/v.bias` and adds them when present (so does infr: `Config::qkv_bias` follows
+/// the tensors; the 0.3B file has none), loads an optional `attn_output.bias` it never applies,
+/// and reads `rope.dimension_sections` only for the multimodal rope its text path does not use
+/// (`llama_model_ernie4_5`, `src/models/ernie4-5.cpp`). The MoE sibling is [`ERNIE4_5_MOE`].
+pub const ERNIE4_5: &str = "ernie4_5";
+/// ERNIE 4.5 MoE (Baidu's ERNIE-4.5-21B-A3B): the [`ERNIE4_5`] attention block with a routed FFN
+/// on every layer from `leading_dense_block_count` on that also falls on the
+/// `interleave_moe_layer_step` (both conditions, `Config::is_moe_layer`); the others keep the
+/// dense SiLU FFN. The router is softmax-gated with the selected weights renormalized and no
+/// weight scale, an optional per-layer `exp_probs_b` bias added to the softmax PROBABILITIES for
+/// selection only, and a shared expert summed in with no gate
+/// (`llama_model_ernie4_5_moe`, `src/models/ernie4-5-moe.cpp`).
+pub const ERNIE4_5_MOE: &str = "ernie4_5-moe";
 /// Qwen2/2.5 (incl. Qwen2.5-Coder, R1-Distill-Qwen). Llama path + q/k/v projection biases; ships
 /// HF rotate-half q/k order, so the loader permutes rows (`Config::permute_qk_neox`).
 pub const QWEN2: &str = "qwen2";
@@ -47,11 +73,6 @@ pub const QWEN35: &str = "qwen35";
 /// per-token sigmoid). Shares every `qwen35` field (`Config::from_gguf`'s `qwen35` gate,
 /// `MixerW::DeltaNet`); only the FFN differs (`FfnW::Moe`'s `shexp` branch — see `seam::weights`).
 pub const QWEN35_MOE: &str = "qwen35moe";
-/// HF-only Qwen4-Exp text checkpoint identifier. Unlike the GGUF strings above, this is
-/// Transformers' `model_type`, not a claim about llama.cpp's canonical arch table. The
-/// safetensors adapter and scalar CPU reference support it. It is not in [`ALL`], which
-/// enumerates shared-runner/GGUF families; generic graph and GPU execution still refuse.
-pub const QWEN4_EXP: &str = "qwen4_exp";
 /// DiffusionGemma: block text-diffusion MoE on a Gemma-4 backbone (shares gemma4's heterogeneous
 /// per-layer dims, V-norm, freq_factors, softcap, sandwich norms), plus a per-layer DUAL FFN
 /// (dense GeGLU ∥ 128-expert MoE, summed) and encoder/decoder per-layer output scalars. See
@@ -83,8 +104,8 @@ pub const DEEPSEEK2: &str = "deepseek2";
 /// `attention.q_lora_rank` is mandatory (there is no lite variant), so `Config::deepseek2` — the
 /// MLA/KV-geometry/MoE-shape gate — is TRUE for this string too and `Config::deepseek32` gates only
 /// what is new. llama.cpp keeps it in its own model class (`src/models/deepseek32.cpp`). The
-/// indexer's five per-layer tensors LOAD; nothing emits them yet, so a graph build refuses this
-/// arch. See docs/deepseek.md § Stage 3.
+/// indexer's five per-layer tensors load and the seam emits the indexer, so this arch generates on
+/// the CPU and Vulkan backends. See docs/deepseek.md § Stage 3.
 pub const DEEPSEEK32: &str = "deepseek32";
 /// DeepSeek V4 (V4-Flash / V4-Pro): a genuinely different architecture, NOT an increment on
 /// [`DEEPSEEK2`]. There is no MLA here — no `kv_lora_rank`, no `wk_b`/`wv_b` — so `Config::deepseek2`
@@ -98,8 +119,9 @@ pub const DEEPSEEK32: &str = "deepseek32";
 /// Every layer is sliding-window (`set_swa_pattern(0)`), and there are no dense-lead layers and no
 /// NextN. llama.cpp keeps it in its own model class (`src/models/deepseek4.cpp`).
 ///
-/// The LOAD path is complete — config, every tensor — and nothing emits it yet, so a graph build
-/// refuses this arch. See docs/deepseek.md § Stage 4.
+/// The load path is complete — config, every tensor — and every tier generates: the pure
+/// sliding-window one on CPU and Vulkan, the compressed ones (ratio 4, CSA with the lightning
+/// indexer; ratio 128, HCA) on the CPU backend only. See docs/deepseek.md § Stage 4.
 pub const DEEPSEEK4: &str = "deepseek4";
 /// Microsoft's official BitNet-b1.58 GGUFs (`microsoft/bitnet-b1.58-2B-4T-gguf`) declare
 /// `general.architecture = "bitnet-b1.58"` and prefix EVERY metadata key with it
@@ -108,6 +130,15 @@ pub const DEEPSEEK4: &str = "deepseek4";
 /// file, so `Config::from_gguf` keeps `arch` verbatim for key lookups and treats this as bitnet via
 /// [`is_bitnet`]. These files ship i2_s ternary weights (host-dequant → f16 at load).
 pub const BITNET_B158: &str = "bitnet-b1.58";
+/// LFM3 (Liquid AI): gated short-convolution layers (`in_proj` → `B ⊙ X` → a causal depthwise
+/// conv with no activation → `C ⊙` → `out_proj`, `Op::ShortConv`) between attention layers that
+/// carry QK-norm, NEOX rope and a per-head SIGMOID output gate (`attn_gate`, `Op::HeadGate`).
+/// The attention layers mix full and sliding-window attention by a per-layer array, rope at
+/// `rope.freq_base_swa` on the window layers and with `rope_freqs` divisors on the full ones;
+/// sandwich norms and a SwiGLU FFN on every layer. The short convolution keeps a recurrent state
+/// like qwen35's DeltaNet (`Config::is_recurrent_layer`). llama.cpp: `src/models/lfm3.cpp` and
+/// `lfm-base.cpp`; the non-causal "d1" variant is refused.
+pub const LFM3: &str = "lfm3";
 
 /// True for either BitNet arch string ([`BITNET`] or [`BITNET_B158`]) — the two are behaviorally
 /// identical (llama skeleton + SubLN, NEOX rope); they differ only in the metadata key prefix.
@@ -131,6 +162,10 @@ pub const TRANSFORMER: &[&str] = &[
     BITNET,
     BITNET_B158,
     DEEPSEEK,
+    SMOLLM3,
+    ERNIE4_5,
+    ERNIE4_5_MOE,
+    LFM3,
 ];
 
 /// Read `general.architecture` from a GGUF WITHOUT a full model load (mirrors
@@ -144,6 +179,60 @@ pub fn arch_of(path: &std::path::Path) -> Option<String> {
             .str("general.architecture")
             .map(|s| s.to_string())
     })
+}
+
+/// The `general.sampling.*` keys [`declared_sampling`] applies. llama.cpp also applies the rest of
+/// the family (`min_p`, the penalties, `xtc_*`, `mirostat*`, `sequence`); see
+/// [`unapplied_sampling_keys`].
+pub const APPLIED_SAMPLING_KEYS: [&str; 3] = [
+    "general.sampling.temp",
+    "general.sampling.top_k",
+    "general.sampling.top_p",
+];
+
+/// Every `general.sampling.*` key the GGUF at `path` carries that infr does not apply, sorted;
+/// empty when there are none or the file cannot be opened. A file that pairs a hot temperature
+/// with `min_p` or a repeat penalty gets the temperature without its counterweight, so the caller
+/// warns with this list.
+pub fn unapplied_sampling_keys(path: &std::path::Path) -> Vec<String> {
+    use infr_core::WeightSource;
+    let Ok(g) = infr_gguf::Gguf::open(path) else {
+        return Vec::new();
+    };
+    let mut keys: Vec<String> = g
+        .metadata()
+        .kv
+        .keys()
+        .filter(|k| {
+            k.starts_with("general.sampling.") && !APPLIED_SAMPLING_KEYS.contains(&k.as_str())
+        })
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The sampler the GGUF itself declares: `general.sampling.temp` / `.top_k` / `.top_p`, which
+/// llama.cpp's converter seeds from the source checkout's `generation_config.json` (and which
+/// llama.cpp applies under any value the user set). Each field is independent; an absent or
+/// mistyped one is `None`. A negative `top_k` is llama.cpp's "keep all" and maps to infr's `0`.
+/// Cheap like [`arch_of`]: header only, no model load.
+pub fn declared_sampling(path: &std::path::Path) -> (Option<f32>, Option<usize>, Option<f32>) {
+    use infr_core::loader::MetaValue;
+    use infr_core::WeightSource;
+    let Ok(g) = infr_gguf::Gguf::open(path) else {
+        return (None, None, None);
+    };
+    let meta = g.metadata();
+    let [temp, top_k, top_p] = APPLIED_SAMPLING_KEYS;
+    let float = |key| meta.get(key).and_then(MetaValue::as_f64).map(|x| x as f32);
+    let top_k = match meta.get(top_k) {
+        Some(MetaValue::I64(k)) if *k < 0 => Some(0),
+        v => v
+            .and_then(MetaValue::as_u64)
+            .and_then(|k| usize::try_from(k).ok()),
+    };
+    (float(temp), top_k, float(top_p))
 }
 
 /// Every architecture infr runs, across both paths.
@@ -164,4 +253,8 @@ pub const ALL: &[&str] = &[
     DEEPSEEK4,
     QWEN35,
     QWEN35_MOE,
+    SMOLLM3,
+    ERNIE4_5,
+    ERNIE4_5_MOE,
+    LFM3,
 ];

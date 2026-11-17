@@ -191,8 +191,9 @@ struct Prepared {
     segments: Vec<Segment>,
     /// Boundary tensors promoted to bound Inputs: `tid -> per-rank persistent buffer`.
     boundary: HashMap<TensorId, Vec<Box<dyn Buffer>>>,
-    /// The cross-device all-reduce transport, set up over the (single) boundary tensor size.
-    allreduce: AllReduce,
+    /// The cross-device all-reduce transport, set up over the (single) boundary tensor size;
+    /// `None` when the graph has no row-parallel projection, hence no boundary.
+    allreduce: Option<AllReduce>,
 }
 
 /// A [`TensorParallelBackend`] plan: the full graph + its lazily-built lowering.
@@ -339,11 +340,11 @@ impl TensorParallelBackend {
         let mut cuts: Vec<usize> = Vec::new();
 
         let wu = w as u32;
-        for i in 0..n_ops {
+        for (i, op) in lowered.ops.iter_mut().enumerate() {
             // Read the branch operands + their input shard states up front (immutable), then take a
-            // fresh `&mut lowered.ops[i]` for the dim rewrite, then record the output state. Keeping
+            // fresh `&mut *op` for the dim rewrite, then record the output state. Keeping
             // the reads/writes disjoint avoids aliasing `state` while mutating it.
-            match lowered.ops[i].clone() {
+            match op.clone() {
                 Op::Linear { x, weight, dst, .. } => {
                     let sx = shard_of(&state, x);
                     let role = match bindings.get(weight) {
@@ -357,7 +358,7 @@ impl TensorParallelBackend {
                                 i,
                                 "column-parallel Linear needs a replicated input",
                             )?;
-                            if let Op::Linear { out_f, w_off, .. } = &mut lowered.ops[i] {
+                            if let Op::Linear { out_f, w_off, .. } = &mut *op {
                                 require(
                                     *w_off == 0,
                                     i,
@@ -373,7 +374,7 @@ impl TensorParallelBackend {
                                 i,
                                 "row-parallel Linear needs a sharded input",
                             )?;
-                            if let Op::Linear { in_f, .. } = &mut lowered.ops[i] {
+                            if let Op::Linear { in_f, .. } = &mut *op {
                                 *in_f = shard_dim(*in_f, wu, i, "row-parallel in_f")?;
                             }
                             state.insert(dst, Shard::Rep); // Rep AFTER the all-reduce recorded below
@@ -404,23 +405,30 @@ impl TensorParallelBackend {
                 | Op::GatedRmsNorm { x, dst, .. } => {
                     let sx = shard_of(&state, x);
                     if sx == Shard::Sharded {
-                        shard_n_head(&mut lowered.ops[i], wu, i)?;
+                        shard_n_head(&mut *op, wu, i)?;
                     }
                     state.insert(dst, sx);
                 }
                 Op::WriteKv { src, cache, .. } => {
                     if shard_of(&state, src) == Shard::Sharded {
-                        if let Op::WriteKv { row_stride, .. } = &mut lowered.ops[i] {
+                        if let Op::WriteKv { row_stride, .. } = &mut *op {
                             *row_stride = shard_dim(*row_stride, wu, i, "WriteKv row_stride")?;
                         }
                     }
                     // The cache tensor is a per-rank KV shard (state already Sharded from binding).
                     state.insert(cache, Shard::Sharded);
                 }
-                Op::Attention { q, dst, .. } => {
+                Op::Attention { q, dst, comp, .. } => {
+                    // The compressed cache would need the same per-rank head split as the raw
+                    // one, which nothing allocates.
+                    require(
+                        comp.is_none(),
+                        i,
+                        "an Attention compressed segment is unsupported under TP",
+                    )?;
                     let sq = shard_of(&state, q);
                     if sq == Shard::Sharded {
-                        if let Op::Attention { n_head, n_kv, .. } = &mut lowered.ops[i] {
+                        if let Op::Attention { n_head, n_kv, .. } = &mut *op {
                             *n_head = shard_dim(*n_head, wu, i, "Attention n_head")?;
                             *n_kv = shard_dim(*n_kv, wu, i, "Attention n_kv")?;
                         }
@@ -430,7 +438,7 @@ impl TensorParallelBackend {
                 Op::GatedAct { gate, dst, .. } => {
                     let sg = shard_of(&state, gate);
                     if sg == Shard::Sharded {
-                        if let Op::GatedAct { nff, .. } = &mut lowered.ops[i] {
+                        if let Op::GatedAct { nff, .. } = &mut *op {
                             *nff = shard_dim(*nff, wu, i, "GatedAct nff")?;
                         }
                     }
@@ -439,7 +447,7 @@ impl TensorParallelBackend {
                 Op::GatedActFused { gu, dst, .. } => {
                     let sg = shard_of(&state, gu);
                     if sg == Shard::Sharded {
-                        if let Op::GatedActFused { nff, .. } = &mut lowered.ops[i] {
+                        if let Op::GatedActFused { nff, .. } = &mut *op {
                             *nff = shard_dim(*nff, wu, i, "GatedActFused nff")?;
                         }
                     }
@@ -548,6 +556,7 @@ impl TensorParallelBackend {
         if bounds.last() != Some(&n_ops) {
             bounds.push(n_ops);
         }
+        crate::multi::refuse_scratch_across_cuts(&lowered, &bounds, "INFR_TENSOR_PARALLEL")?;
         let mut segments = Vec::with_capacity(bounds.len());
         let mut lo = 0usize;
         for (si, &hi) in bounds.iter().enumerate() {
@@ -562,8 +571,8 @@ impl TensorParallelBackend {
                 .collect();
             sub.no_decode_replay = true;
             let mut plans = Vec::with_capacity(w);
-            for r in 0..w {
-                plans.push(self.ranks[r].compile(&sub)?);
+            for rank in &self.ranks {
+                plans.push(rank.compile(&sub)?);
             }
             // Tensors this segment must have bound.
             let mut needed: HashSet<TensorId> = HashSet::new();
@@ -604,13 +613,23 @@ impl TensorParallelBackend {
             let bytes = desc.numel() * crate::tp_allreduce::dtype_bytes(desc.dtype);
             sizes.push(bytes);
             let mut bufs = Vec::with_capacity(w);
-            for r in 0..w {
-                bufs.push(self.ranks[r].alloc(bytes, BufferUsage::Activations)?);
+            for rank in &self.ranks {
+                bufs.push(rank.alloc(bytes, BufferUsage::Activations)?);
             }
             boundary_bufs.insert(tid, bufs);
         }
-        let reduce_bytes = crate::tp_allreduce::uniform_boundary_bytes(&sizes)?;
-        let allreduce = AllReduce::new(&self.ranks, reduce_bytes, reduce_dtype, self.use_p2p)?;
+        // A graph with no row-parallel projection (every op replicated) has nothing to reduce.
+        let allreduce = if sizes.is_empty() {
+            None
+        } else {
+            let reduce_bytes = crate::tp_allreduce::uniform_boundary_bytes(&sizes)?;
+            Some(AllReduce::new(
+                &self.ranks,
+                reduce_bytes,
+                reduce_dtype,
+                self.use_p2p,
+            )?)
+        };
 
         Ok(Prepared {
             lowered,
@@ -677,11 +696,12 @@ impl Backend for TensorParallelBackend {
     }
 
     fn capabilities(&self) -> Capabilities {
-        // Rank 0's caps with every fast path the TP lowering does not model turned OFF: the runner
-        // then takes the classic host-embed + host-sample static path over SEPARATE q/k/v/gate/up
-        // projections (combined_gu=false forces fuse_qkv AND fuse_gu off — each projection is a
-        // cleanly sliceable weight + op), which is the only shape TP shards.
-        let mut c = self.ranks[0].capabilities();
+        // The ranks' most conservative caps (see `crate::multi::conservative_capabilities`) with
+        // every fast path the TP lowering does not model turned OFF: the runner then takes the
+        // classic host-embed + host-sample static path over SEPARATE q/k/v/gate/up projections
+        // (combined_gu=false forces fuse_qkv AND fuse_gu off — each projection is a cleanly
+        // sliceable weight + op), which is the only shape TP shards.
+        let mut c = crate::multi::conservative_capabilities(&self.ranks);
         c.decode_replay = false;
         c.embed_gather = false;
         c.gpu_sample = false;
@@ -704,8 +724,8 @@ impl Backend for TensorParallelBackend {
                 let w = self.world();
                 let per = self.shard_bytes(bytes)?;
                 let mut bufs = Vec::with_capacity(w);
-                for r in 0..w {
-                    bufs.push(self.ranks[r].alloc(per, usage)?);
+                for rank in &self.ranks {
+                    bufs.push(rank.alloc(per, usage)?);
                 }
                 Ok(Box::new(TpBuffer {
                     kind: TpKind::Kv,
@@ -724,8 +744,8 @@ impl Backend for TensorParallelBackend {
                 let w = self.world();
                 let per = self.shard_bytes(bytes)?;
                 let mut bufs = Vec::with_capacity(w);
-                for r in 0..w {
-                    bufs.push(self.ranks[r].alloc_uninit(per, usage)?);
+                for rank in &self.ranks {
+                    bufs.push(rank.alloc_uninit(per, usage)?);
                 }
                 Ok(Box::new(TpBuffer {
                     kind: TpKind::Kv,
@@ -803,6 +823,47 @@ impl Backend for TensorParallelBackend {
         Ok(())
     }
 
+    /// Each rank seeds its own buffer through its own [`VulkanBackend::copy_kv_prefix`], so the
+    /// planar Q8_0 layout is handled where it lives. A KV shard holds its heads' `1/W` of every
+    /// row, so its prefix and its capacity are both `1/W` of the logical ones.
+    fn copy_kv_prefix(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dtype: DType,
+        elems: usize,
+        cap: usize,
+    ) -> Result<()> {
+        let (s, d) = (as_tp(src)?, as_tp(dst)?);
+        if s.bufs.len() != d.bufs.len() || s.kind != d.kind {
+            return Err(be(format!(
+                "tp: copy_kv_prefix between mismatched TpBuffers ({:?} → {:?})",
+                s.kind, d.kind
+            )));
+        }
+        let (elems, cap) = match s.kind {
+            TpKind::Replica => (elems, cap),
+            TpKind::Kv => {
+                let w = self.world();
+                if !elems.is_multiple_of(w) || !cap.is_multiple_of(w) {
+                    return Err(be(format!(
+                        "tp: KV prefix of {elems} of {cap} elements not divisible by world {w}"
+                    )));
+                }
+                (elems / w, cap / w)
+            }
+            TpKind::Weight(role) => {
+                return Err(be(format!(
+                    "tp: copy_kv_prefix of a {role:?}-parallel weight shard — weights are not KV"
+                )))
+            }
+        };
+        for (i, b) in self.ranks.iter().enumerate() {
+            b.copy_kv_prefix(s.on(i)?, d.on(i)?, dtype, elems, cap)?;
+        }
+        Ok(())
+    }
+
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
         Ok(Box::new(TpPlan {
             graph: graph.clone(),
@@ -844,7 +905,11 @@ impl Backend for TensorParallelBackend {
                     .get(&tid)
                     .ok_or_else(|| be("tp: reduce tensor has no boundary buffer"))?;
                 let elems = prep.lowered.desc(tid).numel();
-                prep.allreduce.reduce(&self.ranks, bufs, elems)?;
+                let allreduce = prep
+                    .allreduce
+                    .as_ref()
+                    .ok_or_else(|| be("tp: a reduce boundary without an all-reduce transport"))?;
+                allreduce.reduce(&self.ranks, bufs, elems)?;
             }
         }
         Ok(())
@@ -958,5 +1023,40 @@ mod tests {
             assert_eq!(kv.len_bytes(), per * w);
             assert_eq!(shard_kv_bytes(kv.len_bytes(), w).expect("divisible"), per);
         }
+    }
+
+    /// A graph with no row-parallel projection has nothing to all-reduce: every op is replicated,
+    /// and it runs as one segment. It used to fail building a zero-byte all-reduce transport.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn tp_runs_a_graph_without_a_row_parallel_projection() {
+        let tp =
+            TensorParallelBackend::new(vec![VulkanBackend::new().expect("vulkan")], 1, 1, 1, false)
+                .expect("1-rank TP world");
+        let n = 64usize;
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![n], DType::F32));
+        let y = g.output(TensorDesc::new(vec![n], DType::F32));
+        g.push(Op::Add {
+            a: x,
+            b: x,
+            dst: y,
+            n: n as u32,
+        });
+        let xs: Vec<f32> = (0..n).map(|i| i as f32 * 0.5).collect();
+        let xb = tp.alloc(n * 4, BufferUsage::Activations).unwrap();
+        tp.upload(xb.as_ref(), bytemuck::cast_slice(&xs)).unwrap();
+        let yb = tp.alloc(n * 4, BufferUsage::Activations).unwrap();
+        let plan = tp.compile(&g).unwrap();
+        let mut bind = Bindings::new();
+        bind.bind(x, xb.as_ref());
+        bind.bind(y, yb.as_ref());
+        tp.execute(plan.as_ref(), &bind)
+            .expect("a replicated-only graph runs under TP");
+        let mut got = vec![0f32; n];
+        tp.download(yb.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        let want: Vec<f32> = xs.iter().map(|v| v + v).collect();
+        assert_eq!(got, want);
     }
 }

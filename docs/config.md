@@ -100,9 +100,10 @@ Error: config `device.ctx`: expected a size/count like 8192, 256k or 50% (got "b
 
 Note the asymmetry with the environment, which is frozen at today's behaviour:
 `ctx = "banana"` in a file fails to load, while `INFR_CTX=banana` is silently
-ignored and falls back. Five environment keys do reject a bad value loudly, at
+ignored and falls back. Six environment keys do reject a bad value loudly, at
 startup, on every subcommand: `INFR_SG`, `INFR_SUBMIT_DISPATCHES`,
-`INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`, `INFR_EXPERT_PARALLEL`.
+`INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`, `INFR_EXPERT_PARALLEL`, and `INFR_TUNE`
+(see [Vulkan kernel tuning](#vulkan-kernel-tuning)).
 
 ### Diagnostics announce themselves
 
@@ -118,8 +119,8 @@ when the cause is a global config file you forgot about.
 
 ## `--set`
 
-Most of the 156 knobs have no dedicated flag. `--set <config.path>=<value>`
-reaches all of them, using the same path grammar as the TOML file:
+Most knobs have no dedicated flag. `--set <config.path>=<value>` reaches all of
+them, using the same path grammar as the TOML file:
 
 ```bash
 infr bench "$M" -p 512 -n 0 --set kernels.vulkan.flash_splits=2
@@ -184,71 +185,46 @@ to force subgroup 16 or 32).
 **`[sampling]`** — `temp` (0 = greedy), `top_k`, `top_p`, `seed`, `max_new`,
 `ignore_eos`, `no_think`. **Provenance matters here**: `infr run` / `infr serve`
 fill `temp` / `top_k` / `top_p` / `max_new` from the model's own recommended
-sampling (an arch-family table plus any `generation_config.json` beside the
-model) only for knobs that **no layer specified**. Putting `temp` in your config
-file pins it and suppresses that fallback. The `Config` defaults, which library
-callers get, are greedy: `temp = 0.0`, `top_k = 20`, `top_p = 0.95`,
-`max_new = 2048`. On `serve` these are the server defaults — a per-request
-OpenAI `temperature`/`top_p` still overrides them.
+sampling (an arch-family table, then any `generation_config.json` beside the
+model, then the GGUF's own `general.sampling.*` keys, the last one winning) only
+for knobs that **no layer specified**. Putting `temp` in your config file pins
+it and suppresses that fallback. The `Config` defaults, which library callers
+get, are greedy: `temp = 0.0`, `top_k = 20`, `top_p = 0.95`, `max_new = 2048`.
+On `serve` these are the server defaults — a per-request OpenAI
+`temperature`/`top_p` still overrides them.
 
 **`[kv]`** — cache element format (`type_k` / `type_v`, plus the legacy
 `force_q8` alias), prefix-cache `slots`, the sliding-window `ring`, and the
 host-overflow trio (`overflow`, `overflow_vram_mb`, `overflow_reserve_mb`) that
-spills KV to system RAM when VRAM runs out. `store_mb` turns on the
-cross-conversation prefix store (reverse PagedAttention, see
-`docs/perf/kv-prefix.md`): the K/V rows of a prompt stay in host RAM after
-its slot is recycled, and a later request sharing that prefix uploads them
-instead of re-prefilling, with LRU eviction once the budget is full. It is
-off by default because those rows are derived from the prompt. `paged`
-(`INFR_KV_PAGED`) turns on forward PagedAttention instead: the session's slots
-share one page pool, a fork points at its parent's complete pages, and only a
-page a slot writes is copied first. It costs the same device bytes as the slots
-it replaces (one block per slot), is built at the first fork, and helps a
-full-attention model the most — ring, recurrent, MLA and diffusion layers stay
-compact. Only the Vulkan backend walks a page table; elsewhere the knob warns
-and the slots stay linear. The two knobs are independent and compose: the pool
-shares pages between live slots, and the store survives slot recycling.
+spills KV to system RAM when VRAM runs out.
 
 **`[paging]`** — the MoE expert cache and dense layer streaming: `cache` sizes
 the paged VRAM budget (and forces paging even when the weights would have fit),
 `ring` overrides the upload staging ring, `stats` prints per-pool
-hit/miss/eviction counts. `release_uploaded_pages`
-(`INFR_RELEASE_UPLOADED_PAGES=1`) drops a mapped weight's host pages once it is
-copied into VRAM. That lowers the RSS of a long-running `infr serve`. The pages
-are clean file-backed cache the kernel could reclaim anyway, so this mostly
-changes what `top` shows. Host-side tables like Gemma's per-layer embeddings stay
-mapped and fault back in as they are read.
+hit/miss/eviction counts, and `trace` (`INFR_PAGER_TRACE`, a file path) records
+every pool's pager calls to that file, one file for the whole run, in the format
+`infr_core::pager::trace` documents. A trace replays to exactly the counts
+`stats` prints; `infr-core`'s `pager_bench` test replays it, times it and
+compares today's eviction policy with Belady's (a lower bound for that request
+sequence when the trace has no probes). Unset, tracing costs nothing measurable.
 
 **`[kernels]`** — two backend-independent graph-shape gates (`qkv_fuse`,
 `gated_rmsnorm`) plus one sub-section per backend. Everything under them is a
 kernel **tier** override: the engine picks the best tier the device supports,
 and these exist to force one off when bisecting a correctness or perf problem.
 
-- **`[kernels.vulkan]`** (the biggest section): capability
-  masks (`coopmat`, `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), GEMM/GEMV
-  tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, `kq_fma_tier`, `kq_fma_splitk` — the
-  K-quant/Q4_0 FMA tier for older Vulkan GPUs without fast int8 dot, auto-on — the
+- **`[kernels.vulkan]`** (the biggest section): capability masks (`coopmat`,
+  `f16`, `i8_dot`, `coopmat_8x8`, `i8_coopmat`), the `force_wave64` testing knob
+  (runs the wave64 path that AMD GCN takes on a device that can pin 32),
+  GEMM/GEMV tiers (`gemm_warp`, `mmq`, `mmv`, `mrow`, `moe_small_m`, the
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
   `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
-  `no_replay`, `no_vram_guard`, `gfx_queue` — stay on the compositor's graphics
-  ring instead of a compute-only one — the BDA chunk caps). Note `f16 = false` also
+  `no_replay`, `no_vram_guard`, the BDA chunk caps). Note `f16 = false` also
   disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
-  today.
-
-  Some defaults were measured on one GPU and may be wrong for yours. These are
-  worth an A/B with `infr bench` before you trust them. Each one may help, do
-  nothing, or regress on a given device:
-
-  - `mmv_mw` (`INFR_MMV_MW`): `true` routes every dtype with an int8 decode
-    kernel through it, including Q5_K, Q8_0, Q4_1 and Q3_K, which are off by
-    default. On an RX 580, Gemma 4 E4B Q5_K_S decode went from 20.7 to 34.6
-    tok/s, because GCN4's fp32 dequant GEMV is slow. On a 7900 XTX, Q5_K measured
-    about 1.4% slower. Greedy output can drift slightly from the fp32 path, and
-    Q3_K has a known coherence cliff on small mixed Q2_K files. An empty
-    `INFR_MMV_MW=` counts as on; only `0` forces off.
-  - `mmv_o4`, `mmv_m4`: the decode MMV layouts. Both default on; turning `mmv_o4`
-    off was slower on every RX 580 shape measured.
+  today. The hardware-shaped numbers (split counts, thresholds, rows per
+  workgroup, subgroup pins) are per-device tuning parameters, set under
+  `[kernels.vulkan.tune]`; see the next section.
 - **`[kernels.metal]`** — the Apple backend's native/CMM/RT kernel families per
   dtype, plus `deltanet`, `moe` and `pipeline_cache` (persist the compiled
   `MTLComputePipelineState`s as an `MTLBinaryArchive` under `~/.cache/infr`, so
@@ -256,8 +232,111 @@ and these exist to force one off when bisecting a correctness or perf problem.
   the MSL → AIR front end is not cacheable and still runs every launch). Like
   `kernels.cpu.reference` it has no `INFR_*` twin.
 - **`[kernels.cpu]`** — `spin` (spin-pool idle ceiling), `spinpool`,
-  `repack_mb`, and `reference` (the bit-reference kernel path, which has no
-  `INFR_*` twin and never had one).
+  `repack_mb`, `reference` (the bit-reference kernel path, which has no `INFR_*`
+  twin and never had one), and `core_spread` (keep the spin pool's threads, and
+  the thread running the graph, on one logical processor per allowed core so no
+  two share a core's SMT siblings; only when the threads fit one per allowed
+  core; Windows only, no `INFR_*` twin).
+
+### Vulkan kernel tuning
+
+Every hardware-shaped number a Vulkan kernel choice depends on — a split count,
+a size threshold, rows per workgroup, a pinned subgroup width — is a **tuning
+parameter**, named `family.param` (and `family.param@qualifier` where it varies
+by quant format, e.g. `mmv_mw.warps@q4_k`). `infr tune list` names every one,
+with its range, its default rule and its value on your device; `infr tune show`
+prints the device, the key the table matched it by, the matched table rows, and
+each value with the level it came from:
+
+```
+$ infr tune show --dev Vulkan0
+device:  AMD Radeon RX 7900 XTX (AmdRdna3, AMD_PROPRIETARY)
+match:   vendor=amd arch=AmdRdna3 driver=AMD_PROPRIETARY integrated=false device_id=0x744c cu=96 subgroup=32-64 driver_version=0x800161
+hash:    5715f12d
+rows:
+  amd-proprietary-split-k [class row, maintainer] sets split_k.scale_by_cu
+  amd-proprietary-i8cm-kq [class row, maintainer] sets gemm_i8cm_kq.enabled
+
+device.sg_pref              32     default
+gemv_sg.rows                2      default
+...
+```
+
+`--json` prints the same as a document. The `hash` is also in the device banner
+(`tune:5715f12d`), so a log says whether two runs tuned alike.
+
+Each value is resolved once, when the backend is created, from these levels —
+the last one that sets a parameter wins, per parameter:
+
+1. the **generic default**, derived from the device's facts;
+2. **class rows** of the built-in table
+   (`crates/infr-vulkan/src/tuning/table.toml`) — a vendor plus an architecture,
+   driver, integrated flag, subgroup range or compute-unit range;
+3. **device rows** of that table (PCI device ids, or a name);
+4. your **tuning file**, `kernels.vulkan.tuning.file` / `INFR_TUNE_FILE`: rows
+   in the same schema, so a row can be tried without rebuilding;
+5. the **config file**, `[kernels.vulkan.tune]`;
+6. the **environment**, `INFR_TUNE="family.param=value,…"`;
+7. the **command line**, `--set kernels.vulkan.tune.family.param=value`.
+
+```toml
+[kernels.vulkan.tune]
+"gemv_sg.rows" = 4
+"mmv_mw.warps@q4_k" = 2
+
+[kernels.vulkan.tuning]
+rows = false              # INFR_TUNE_NO_ROWS: generic defaults only, no table rows
+disable = ["amd-proprietary-split-k"]   # INFR_TUNE_DISABLE: drop rows by id
+```
+
+A value you set that is not a parameter, is out of range, or targets a `fixed`
+parameter (one that must equal a literal compiled into a shader) refuses the
+device with an error naming where it came from. A range is what the code after
+it can hold: the attention split counts stop at 8 because the partials scratch
+holds 8, `gemv.variant` takes only the names that have a build (`infr tune list`
+prints them). A built-in row value that fails validation is dropped with a
+warning instead, so a bad row cannot brick a device. Within one level a
+qualified setting (`@q4_k`) beats an unqualified one. A tuning-file row whose
+`driver`, `arch` or `vendor` is not a known name is an error (a typo would
+otherwise match nothing); `name` is a free substring and cannot be checked.
+
+**`rows = false` means generic defaults only, everywhere.** It drops every
+built-in row, including the two the AMD proprietary driver's GEMM choices come
+from: on that driver it turns off the int8 cooperative-matrix K-quant prefill
+GEMM and the compute-unit-scaled split-K window, so prefill takes the f16
+coopmat GEMM — about a third slower pp512 on the RX 7900 XTX (11.9k against 7.5k
+t/s on Qwen3-1.7B Q4_K_M when that GEMM landed). `infr tune show` says
+`rows: off` when it is set. To drop just one row, use `disable` with its id.
+
+**`tuning.file` paths.** A relative path in a config file is relative to that
+config file's folder; from `INFR_TUNE_FILE` or `--set` it is relative to the
+working directory.
+
+**What the device can use wins over what was asked.** A `device.sg_pref` of 16
+on a device that cannot pin a 16-wide subgroup runs at 32, as it always has;
+`infr tune show` reports 32 with the reason, and the banner hash is of 32.
+
+**The older knobs are aliases.** `device.subgroup_pref` (`INFR_SG`),
+`kernels.vulkan.flash_splits`, `pv_splits`, `flash_min_rows`, `flash_bm32`,
+`mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`, `i8cm_kq` (`INFR_NO_I8CM_KQ`)
+and the whole `[kernels.vulkan.gemv]` group keep their names, grammars and
+meanings — including their old clamps and fallbacks — and write the matching
+parameter at the level that set them (`infr tune show` labels it, e.g.
+`env alias INFR_FLASH_SPLITS`). At the same level the new `tune` key wins over
+the alias; across levels the higher level wins whichever spelling it uses. An
+alias set to a value that has no effect — its unset spelling
+(`--set kernels.vulkan.mmv_mw_warps=none`), `i8cm_kq = true`, `no_rm = false`, a
+`gemv.variant` name with no build — resets the parameter at its level to what
+the defaults, rows and tuning file give, so it still beats a lower level's
+`tune` key. Two changes to old spellings, both where the old value was unsafe or
+meaningless: `INFR_FLASH_SPLITS` / `INFR_PV_SPLITS` above 8 are now refused
+(they wrote split partials past the end of an 8-split scratch buffer); 0, an
+unparseable value and one past 2³²−1 still mean "the policy", as before. And an
+`INFR_GEMV_VARIANT` naming no build, the empty value included, still takes the
+RM path, now shown as `none`. A `Config` built in code (no layers) cannot say
+whether an alias field equal to its default was set, so such a field counts as
+unset; through the file, environment or command line, setting a knob to its
+default value counts as set.
 
 **`[spec]`** — MTP / speculative decode: `mtp`, `k`, `decode_chain`, `draft` (a
 draft-model path), the GPU-side sampling steps (`gpu_argmax`, `gpu_sample`,
@@ -293,18 +372,10 @@ all `stages`. Old spellings were dropped cleanly and are simply no longer read.
 gates `/v1/chat/completions`, `/v1/models`, `/metrics` and `/status`, never
 `/health`), `max_tokens_cap`, `request_timeout_secs` (per-request wall-clock
 deadline in seconds; `0`, the default, means no deadline — a deadline truncates
-a legitimate slow reply, so it is opt-in), `idle_timeout_secs`
-(`INFR_SERVE_IDLE_SECS` — exit after this many seconds with no requests or
-unfinished work; default `0` disables idle exit), and `stats_interval_secs`
+a legitimate slow reply, so it is opt-in), and `stats_interval_secs`
 (`INFR_SERVE_STATS_SECS` — how often the server logs its throughput line,
 default `5`; `0` switches the line off). Per-request sampling is not here — it
 stays on the request.
-
-Idle exit waits for queued requests, image validation, generation, and response
-streams to finish. Every HTTP request resets the timer, including health and
-metrics probes; periodic polling can keep the server awake. With no socket
-supervisor, idle exit stops the server until you start it again. See
-[systemd socket activation](systemd.md) for automatic wake-up on Linux.
 
 The throughput line is **activity-only**: an interval in which nothing happened
 emits nothing, so an idle server leaves a clean log and there is no heartbeat to
@@ -340,7 +411,9 @@ several connections from one client.
 **`[debug]`** — poison/barrier/dump switches: `coopmat` (print the enumerated
 and chosen coopmat shapes — useful on Intel Arc), `bda_chunk`, `wide_dispatch`,
 `chat`, `moe_counts`, `moe_counts_dump`, `poison_uninit`, `no_barrier`,
-`full_barrier`.
+`full_barrier`, `cpu_op_hash` (`INFR_CPU_OP_HASH=<path>`: the CPU interpreter
+appends a hash of every tensor each op reads and writes, for diffing two runs to
+the first op that differs).
 
 ## The `INFR_*` keys that are deliberately NOT config
 

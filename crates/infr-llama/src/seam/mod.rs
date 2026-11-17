@@ -15,18 +15,16 @@ use infr_core::backend::{Backend, Buffer, BufferUsage};
 use infr_core::tensor::DType;
 use infr_core::WeightSource;
 use infr_cpu::CpuBackend;
-use infr_gguf::TensorBytes;
+use infr_gguf::{Gguf, TensorBytes};
 
+mod dsv4_emit;
 mod dsv4_plan;
-mod kv_store;
 pub mod model;
-mod pool;
 mod runner;
 mod sc;
 mod weights;
+mod wshape;
 
-pub(crate) use kv_store::KvPrefixStore;
-pub(crate) use pool::{paged_layer, KvPool, PagedSlot, POOL_BLOCKS};
 pub(crate) use runner::generate_dense_backend;
 pub(crate) use sc::DenoiseReq;
 pub use sc::{DenoiseOutcome, EbReduced};
@@ -50,27 +48,25 @@ pub(crate) use weights::SeamKv;
 #[derive(Clone, Copy)]
 pub(crate) struct TokenEmbd<'a> {
     cell: &'a std::sync::OnceLock<Vec<f32>>,
-    ws: &'a dyn WeightSource,
+    gguf: &'a Gguf,
 }
 
 impl<'a> TokenEmbd<'a> {
-    pub(crate) fn new(cell: &'a std::sync::OnceLock<Vec<f32>>, ws: &'a dyn WeightSource) -> Self {
-        Self { cell, ws }
+    pub(crate) fn new(cell: &'a std::sync::OnceLock<Vec<f32>>, gguf: &'a Gguf) -> Self {
+        Self { cell, gguf }
     }
 
-    /// Lazily materialize a supported full embedding table; row-only representations reject this.
+    /// The dequantized `[vocab, n_embd]` row-major table — dequantized on first call, cached after.
+    /// `Config::from_gguf` already validated the tensor exists at load, but a truncated/corrupt GGUF
+    /// can still fail the dequant here (the first host gather, lazily). FALLIBLE so that a real
+    /// non-programmer input surfaces a clear error at the call site instead of aborting the process.
     pub(crate) fn get(&self) -> AResult<&'a [f32]> {
-        if self.ws.tensor_rows("token_embd.weight", &[])?.is_some() {
-            return Err(anyhow!(
-                "token_embd.weight: row-only embedding cannot be expanded"
-            ));
-        }
         if let Some(v) = self.cell.get() {
             return Ok(v);
         }
         let (v, _) =
-            crate::quant::load_tensor_dequant(self.ws, "token_embd.weight").map_err(|e| {
-                anyhow!("token_embd.weight: dequant failed (corrupt/truncated file?): {e}")
+            crate::quant::load_tensor_dequant(self.gguf, "token_embd.weight").map_err(|e| {
+                anyhow!("token_embd.weight: dequant failed (corrupt/truncated GGUF?): {e}")
             })?;
         // Race-safe cache fill: another thread may have won the init; `set` drops ours if so, then
         // `get` returns whichever value stuck (get_or_init semantics without a fallible init).
@@ -80,119 +76,6 @@ impl<'a> TokenEmbd<'a> {
             .get()
             .expect("cell was just set or already initialized"))
     }
-
-    pub(crate) fn rows(
-        &self,
-        ids: &[u32],
-        width: usize,
-        scale: f32,
-    ) -> AResult<std::borrow::Cow<'a, [f32]>> {
-        use std::borrow::Cow;
-        anyhow::ensure!(width > 0, "embedding width must be positive");
-        let count = ids
-            .len()
-            .checked_mul(width)
-            .ok_or_else(|| anyhow!("embedding row size overflow"))?;
-        let mut rows = if let Some(rows) = self.ws.tensor_rows("token_embd.weight", ids)? {
-            anyhow::ensure!(
-                rows.len() == count,
-                "embedding lookup returned incorrect row length"
-            );
-            rows
-        } else {
-            let table = self.get()?;
-            if ids.len() == 1 && scale == 1.0 {
-                let start = (ids[0] as usize)
-                    .checked_mul(width)
-                    .ok_or_else(|| anyhow!("embedding row offset overflow"))?;
-                return Ok(Cow::Borrowed(
-                    table
-                        .get(start..start + width)
-                        .ok_or_else(|| anyhow!("embedding token id out of range"))?,
-                ));
-            }
-            let mut rows = Vec::with_capacity(count);
-            for &id in ids {
-                let start = (id as usize)
-                    .checked_mul(width)
-                    .ok_or_else(|| anyhow!("embedding row offset overflow"))?;
-                rows.extend_from_slice(
-                    table
-                        .get(start..start + width)
-                        .ok_or_else(|| anyhow!("embedding token id out of range"))?,
-                );
-            }
-            rows
-        };
-        scale_embedding_rows(self.ws, &mut rows, scale, true)?;
-        Ok(Cow::Owned(rows))
-    }
-
-    /// Gather text through the format's row lookup without ever indexing image placeholder ids.
-    /// Vision rows already have residual-stream scale, so copy them without text scaling or rounding.
-    pub(crate) fn prompt_rows(
-        &self,
-        ids: &[u32],
-        start: usize,
-        width: usize,
-        scale: f32,
-        media: Option<&crate::media::EmbedOverride>,
-    ) -> AResult<std::borrow::Cow<'a, [f32]>> {
-        use std::borrow::Cow;
-        let Some(media) = media else {
-            return self.rows(ids, width, scale);
-        };
-        anyhow::ensure!(width > 0, "embedding width must be positive");
-        let count = ids
-            .len()
-            .checked_mul(width)
-            .ok_or_else(|| anyhow!("embedding row size overflow"))?;
-        let mut rows = Vec::with_capacity(count);
-        let mut i = 0;
-        while i < ids.len() {
-            if let Some(row) = media.row(start + i) {
-                anyhow::ensure!(row.len() == width, "image embedding width mismatch");
-                rows.extend_from_slice(row);
-                i += 1;
-            } else {
-                let begin = i;
-                i += 1;
-                while i < ids.len() && media.row(start + i).is_none() {
-                    i += 1;
-                }
-                rows.extend_from_slice(&self.rows(&ids[begin..i], width, scale)?);
-            }
-        }
-        Ok(Cow::Owned(rows))
-    }
-}
-
-pub(crate) fn scale_embedding_rows(
-    ws: &dyn WeightSource,
-    rows: &mut [f32],
-    scale: f32,
-    main: bool,
-) -> AResult<()> {
-    let half = matches!(
-        ws.metadata().get("infr.exl3.embedding_fp16_scale"),
-        Some(infr_core::loader::MetaValue::Bool(true))
-    );
-    let scale = if half && main {
-        half::bf16::from_f32(scale).to_f32()
-    } else {
-        scale
-    };
-    for value in rows {
-        *value *= scale;
-        if half {
-            *value = half::f16::from_f32(*value).to_f32();
-        }
-        anyhow::ensure!(
-            value.is_finite(),
-            "embedding scaling produced a nonfinite value"
-        );
-    }
-    Ok(())
 }
 
 /// The CPU seam weight binder, hoisted so the CPU runner and every CPU `verify_*` entry share one
@@ -218,25 +101,34 @@ pub(crate) fn scale_embedding_rows(
 ///
 /// Returns `None` — not an error — when nothing seats, so every degraded case falls back to
 /// today's behaviour rather than failing the load.
+///
+/// # What the automatic budget leaves
+/// The arena is taken from what is available only after [`cpu_committed_bytes`] — the run's KV
+/// cache, the weights that stay mapped, its activations — and after the headroom
+/// [`infr_core::hostmem::auto_arena_bytes`] leaves to the rest of the machine, so the budget is
+/// what the process adds on top of everything else it holds.
 fn cpu_paged_store(
     ec: &EngineConfig,
-    g: &dyn WeightSource,
+    g: &Gguf,
+    cfg: &Config,
 ) -> AResult<Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>> {
     // `0` is the explicit OFF switch, not "unset" — so it must reach `Requested` unfiltered.
     let explicit = infr_core::hostmem::Requested::from_config(
         ec.paging.dram.map(|s| s.resolve(0)),
         ec.paging.dram_bypass,
     );
+    let weights = cpu_pageable(g, cfg);
     // Only the weights this backend would actually page count toward "does it fit": the sub-floor
     // tensors stay mapped either way, so counting them could page a model that fits.
-    let pageable: u64 = g
-        .tensors()
+    let pageable: u64 = weights
         .iter()
-        .filter(|t| t.nbytes >= infr_cpu::paged::MIN_PAGED_BYTES)
-        .map(|t| t.nbytes as u64)
+        .filter(|w| w.nbytes >= infr_cpu::paged::MIN_PAGED_BYTES)
+        .map(|w| w.nbytes as u64)
         .sum();
     let available = infr_core::hostmem::available_bytes();
-    let budget = match infr_core::hostmem::cpu_arena_plan(explicit, available, pageable) {
+    let committed = cpu_committed_bytes(ec, g, cfg);
+    let budget = match infr_core::hostmem::cpu_arena_plan(explicit, available, committed, pageable)
+    {
         // Only the GPU tiers can want a reader with no cache under them (their arena IS the cache
         // on unified memory). For the CPU backend this arena is the only tier there is, so a
         // read-through with nothing behind it would be a pure regression on the mapping.
@@ -245,14 +137,24 @@ fn cpu_paged_store(
             return Ok(None);
         }
         infr_core::hostmem::ArenaPlan::Take(n) => {
+            // An automatic arena too small for the weights may serve a layer-major prefill, which
+            // holds its carried rows beside it: that comes out of the arena, and only then. An
+            // explicit budget is the user's, as before.
+            let n = if explicit == infr_core::hostmem::Requested::Auto && n < pageable {
+                n.saturating_sub(layer_major_carry_bytes(ec, cfg))
+            } else {
+                n
+            };
             if explicit == infr_core::hostmem::Requested::Auto {
                 tracing::info!(
                     "host paging: {:.2} GB of weights exceed the {:.2} GB of host memory \
                      available, so they stream from disk through a {:.2} GB arena instead of the \
-                     OS page cache (set INFR_DRAM_CACHE to override)",
+                     OS page cache, leaving half of what is available beside the run's other \
+                     {:.2} GB (set INFR_DRAM_CACHE to override)",
                     pageable as f64 / 1e9,
                     available.unwrap_or(0) as f64 / 1e9,
                     n as f64 / 1e9,
+                    committed as f64 / 1e9,
                 );
             }
             n as usize
@@ -275,7 +177,7 @@ fn cpu_paged_store(
             return Ok(None);
         }
     };
-    let plans = infr_cpu::paged::plan_pools(budget, g.tensors());
+    let plans = infr_cpu::paged::plan_pools(budget, &weights);
     if plans.is_empty() {
         tracing::warn!(
             "host paging: a {:.2} GB budget seats no weight class of this model — keeping the \
@@ -284,23 +186,127 @@ fn cpu_paged_store(
         );
         return Ok(None);
     }
-    // Disk paging requires GGUF shard ranges.
-    let Some(gguf) = g.as_any().downcast_ref::<infr_gguf::Gguf>() else {
-        tracing::warn!("host paging: disk paging needs GGUF shard ranges; using resident weights");
-        return Ok(None);
-    };
     let io = std::sync::Arc::new(
-        infr_core::blockio::FileBlockIo::open_shards(&gguf.shards()).map_err(|e| anyhow!("{e}"))?,
+        infr_core::blockio::FileBlockIo::open_shards(&g.shards()).map_err(|e| anyhow!("{e}"))?,
     );
-    let store = infr_cpu::paged::PagedWeights::new(&plans, io).map_err(|e| anyhow!("{e}"))?;
+    let trace = infr_core::pager::trace::TraceFile::for_config(ec.paging.trace.as_deref())
+        .map_err(|e| anyhow!("{e}"))?;
+    let store = infr_cpu::paged::PagedWeights::new(&plans, io, trace.as_ref())
+        .map_err(|e| anyhow!("{e}"))?;
+    let experts: usize = plans
+        .iter()
+        .filter(|p| p.experts)
+        .map(|p| p.n_slots * p.slot_bytes)
+        .sum();
     tracing::info!(
-        "host paging: {} weight class(es), {:.2} GB arena of a {:.2} GB budget",
+        "host paging: {} weight class(es), {:.2} GB arena of a {:.2} GB budget ({:.2} GB of it \
+         single experts)",
         plans.len(),
         store.arena_bytes() as f64 / 1e9,
         budget as f64 / 1e9,
+        experts as f64 / 1e9,
     );
     Ok(Some(std::sync::Arc::new(store)))
 }
+
+/// Every weight of `g` as the CPU host tier sees it: an expert bank (see [`is_expert_bank`]) of a
+/// MoE model is read `n_used` experts at a time, everything else whole. A bank whose name carries
+/// no layer index is counted as one more bank of a shared layer, which can only raise its class's
+/// floor.
+fn cpu_pageable(g: &Gguf, cfg: &Config) -> Vec<infr_cpu::paged::Pageable> {
+    use infr_cpu::paged::{Pageable, Reads};
+    g.tensors()
+        .iter()
+        .map(|t| Pageable {
+            nbytes: t.nbytes,
+            reads: match &cfg.moe {
+                Some(m) if is_expert_bank(&t.name) => Reads::Experts {
+                    n_expert: m.n_expert,
+                    n_used: m.n_used,
+                    layer: exps_layer(&t.name).unwrap_or(usize::MAX),
+                },
+                _ => Reads::Whole,
+            },
+        })
+        .collect()
+}
+
+/// The layer index of a `blk.{l}.…_exps…` tensor name.
+fn exps_layer(name: &str) -> Option<usize> {
+    if !name.contains("_exps") {
+        return None;
+    }
+    name.strip_prefix("blk.")
+        .and_then(|r| r.split('.').next())
+        .and_then(|l| l.parse::<usize>().ok())
+}
+
+/// Host memory a CPU run holds besides its weight arena, which the automatic arena budget must
+/// leave room for: the KV cache at the context the run will use, the weights too small to page
+/// (mapped, and in the working set once a pass reads them), [`CPU_ACTIVATION_RESERVE`], and the
+/// Q4_K repack cache where the run can fill it ([`cpu_repack_reserve`]).
+///
+/// The context is `device.ctx` when set, else the trained context capped at
+/// [`CPU_BUDGET_CTX`] — a CPU generation sizes its cache to its own prompt and output, which is
+/// unknown when the arena is sized once for every generation the model will serve. The cache is
+/// priced at f16, the CPU default, without the sliding-window ring, which only shrinks it.
+fn cpu_committed_bytes(ec: &EngineConfig, g: &Gguf, cfg: &Config) -> u64 {
+    let ctx = crate::chat::cfg_ctx(ec, cfg.n_ctx_train)
+        .unwrap_or_else(|| cfg.n_ctx_train.min(CPU_BUDGET_CTX));
+    let kv = kv_bytes_estimate(cfg, ctx, false, 1, false);
+    let small: u64 = g
+        .tensors()
+        .iter()
+        .filter(|t| t.nbytes < infr_cpu::paged::MIN_PAGED_BYTES)
+        .map(|t| t.nbytes as u64)
+        .sum();
+    kv + small
+        + CPU_ACTIVATION_RESERVE
+        + cpu_repack_reserve(ec, g.tensors(), infr_cpu::q4k_expert_repack_available())
+}
+
+/// What a layer-major prefill over the CPU's host arena holds between layers at most: one
+/// segment of carried rows (`layer_major_segment_rows`) at the run's context, on a family that
+/// takes the order there ([`host_layer_major`]); 0 for every other family.
+fn layer_major_carry_bytes(ec: &EngineConfig, cfg: &Config) -> u64 {
+    if !host_layer_major(cfg, usize::MAX, false) {
+        return 0;
+    }
+    let ctx = crate::chat::cfg_ctx(ec, cfg.n_ctx_train)
+        .unwrap_or_else(|| cfg.n_ctx_train.min(CPU_BUDGET_CTX));
+    let rows = ctx.min(layer_major_segment_rows(ec, cfg)) as u64;
+    rows * layer_major_row_bytes(cfg)
+}
+
+/// The CPU repack cache's budget (`kernels.cpu.repack_mb`) when this run can fill it, else 0.
+///
+/// The fused Q4_K expert path keeps a pack of every routed expert it multiplies, up to that budget
+/// (`CpuBackend::q4k_pack_for`), on CPUs where `has_path` ([`infr_cpu::q4k_expert_repack_available`])
+/// and for models with a fused Q4_K gate_up bank (qwen35moe, gemma4's MoE). Those packs are
+/// anonymous memory beside the arena, so they are priced at the whole budget: the cache keeps
+/// what it built until the budget is spent.
+fn cpu_repack_reserve(
+    ec: &EngineConfig,
+    tensors: &[infr_core::loader::TensorInfo],
+    has_path: bool,
+) -> u64 {
+    let fused_q4k = tensors
+        .iter()
+        .any(|t| t.name.ends_with("ffn_gate_up_exps.weight") && t.dtype == DType::Q4K);
+    if has_path && fused_q4k {
+        (ec.kernels.cpu.repack_mb as u64) << 20
+    } else {
+        0
+    }
+}
+
+/// The context a CPU run's KV cache is priced at when `device.ctx` does not name one — the same
+/// default the Metal chat opens its sessions at.
+const CPU_BUDGET_CTX: usize = 8192;
+
+/// Host memory set aside for what a CPU forward allocates per pass — activations, the MoE pair
+/// buffers of a prefill chunk, the interpreter's recycled scratch — which nothing prices per model.
+const CPU_ACTIVATION_RESERVE: u64 = 1 << 30;
 
 /// Build the host DRAM tier under a set of Vulkan arena pools — one
 /// [`infr_core::hostpager::HostPager`] per pool, since a pool is already exactly a block-size class,
@@ -339,7 +345,7 @@ fn cpu_paged_store(
 /// user asking for it by name may be working around something this does not model.
 fn vulkan_host_tier(
     ec: &EngineConfig,
-    g: &dyn WeightSource,
+    g: &Gguf,
     what: &str,
     classes: &[(usize, usize)],
     unified: bool,
@@ -358,12 +364,8 @@ fn vulkan_host_tier(
             // to cache down here — but its misses still come from BLOCK reads instead of the
             // mapping, which is what lets a big model run on these machines at all.
             infr_core::hostmem::ArenaPlan::StreamOnly => {
-                // Streaming reads file blocks — GGUF-only; other sources cannot stream.
-                let Some(gguf) = g.as_any().downcast_ref::<infr_gguf::Gguf>() else {
-                    anyhow::bail!("{what} host tier: streaming from disk needs GGUF shard ranges");
-                };
                 let io = std::sync::Arc::new(
-                    infr_core::blockio::FileBlockIo::open_shards(&gguf.shards())
+                    infr_core::blockio::FileBlockIo::open_shards(&g.shards())
                         .map_err(|e| anyhow!("{e}"))?,
                 );
                 tracing::info!(
@@ -429,13 +431,8 @@ fn vulkan_host_tier(
         );
         return Ok(unpaged());
     }
-    // The arena reads file blocks — GGUF-only; other sources (EXL3) stay on the mmap path.
-    let Some(gguf) = g.as_any().downcast_ref::<infr_gguf::Gguf>() else {
-        tracing::warn!("{what} host tier: disk paging needs GGUF shard ranges — unpaged",);
-        return Ok(unpaged());
-    };
     let io = std::sync::Arc::new(
-        infr_core::blockio::FileBlockIo::open_shards(&gguf.shards()).map_err(|e| anyhow!("{e}"))?,
+        infr_core::blockio::FileBlockIo::open_shards(&g.shards()).map_err(|e| anyhow!("{e}"))?,
     );
     let mut arena = 0usize;
     let mut out = Vec::with_capacity(classes.len());
@@ -460,7 +457,7 @@ fn vulkan_host_tier(
 }
 
 fn cpu_upload_bind(be: &CpuBackend) -> Box<BindWeight<'_>> {
-    cpu_bind_with(be, None)
+    cpu_bind_with(be, None, None)
 }
 
 /// The CPU binder. With a `store`, a weight whose bytes come straight off disk (no load-time
@@ -469,12 +466,24 @@ fn cpu_upload_bind(be: &CpuBackend) -> Box<BindWeight<'_>> {
 fn cpu_bind_with<'a>(
     be: &'a CpuBackend,
     store: Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>,
+    n_expert: Option<usize>,
 ) -> Box<BindWeight<'a>> {
-    Box::new(move |_name, tb, dt, _n| {
+    Box::new(move |name, tb, dt, _n| {
         if let Some(store) = &store {
             // `file_ranges` is `None` exactly for bytes the loader REWROTE (the qwen2 q/k permute,
             // the BitNet dequant), which correspond to nothing on disk and so cannot be re-read.
             if let Some(ranges) = tb.file_ranges() {
+                // An expert bank goes to the per-expert pool when there is one, so that a pass
+                // reads only its routed experts; a bank that pool declines is offered whole below.
+                if let Some(n) = n_expert.filter(|_| is_expert_bank(name)) {
+                    if let Some(bank) = store
+                        .register_experts(&ranges, n)
+                        .map_err(|e| anyhow!("{e}"))?
+                    {
+                        let nbytes = ranges.iter().map(|(_, l)| l).sum();
+                        return Ok((be.paged_experts_weight(store.clone(), bank, nbytes), dt));
+                    }
+                }
                 if let Some(id) = store.register(&ranges).map_err(|e| anyhow!("{e}"))? {
                     let nbytes = ranges.iter().map(|(_, l)| l).sum();
                     return Ok((be.paged_weight(store.clone(), id, nbytes), dt));
@@ -490,8 +499,9 @@ fn cpu_bind_with<'a>(
 fn cpu_bind_resident(be: &CpuBackend, tb: WBytes, dt: DType) -> AResult<(Box<dyn Buffer>, DType)> {
     match tb {
         WBytes::Mmap(tb) => Ok((be.map_weight(tb), dt)),
-        // Adopt owned bytes; fused groups materialize only when resident.
-        WBytes::Owned(v) => Ok((be.own_weight(v), dt)),
+        // Owned bytes (a load-time rewrite) and a fused group both become one host buffer here.
+        // The concat is materialized only on this arm — a binder that pages the group never
+        // reaches it.
         other => {
             let v = other.materialize();
             let buf = be
@@ -523,6 +533,65 @@ fn metal_upload_bind(be: &infr_metal::MetalBackend) -> Box<BindWeight<'_>> {
 // prompt ingestion (looped) and generation — so no GEMM/flash prefill kernels are needed on CPU.
 // The KV cache grows one row per step. Validates the agnostic seam end-to-end against the GPU path.
 
+/// A CPU backend kept with what it costs to rebuild: its paged-weight store (`paging.dram`) and the
+/// weights bound for it. A [`crate::SeamModel`] holds one between generations, so the bound
+/// weights, the backend's derived-weight caches (keyed by those buffers' uids, which stay the
+/// same) and the host arena's resident blocks all carry over to the next request instead of being
+/// rebuilt by it. The spin pool does not: each generation releases it
+/// ([`CpuBackend::release_pool`]) and the next builds its own.
+///
+/// One generation at a time: a caller takes the resident out of its model for the whole call and
+/// puts it back afterwards (`SeamModel::with_cpu`), so nothing in it is ever used by two
+/// generations at once. A generation that finds none there opens its own.
+pub(crate) struct CpuResident {
+    be: CpuBackend,
+    store: Option<std::sync::Arc<infr_cpu::paged::PagedWeights>>,
+    /// Set by the first generation whose cold init got as far as binding every weight.
+    bound: Option<weights::BoundWeights>,
+}
+
+impl CpuResident {
+    /// A resident on `be` with nothing bound yet. The paged store is sized here, once, from the
+    /// host memory available now.
+    pub(crate) fn open(be: CpuBackend, ec: &EngineConfig, g: &Gguf, cfg: &Config) -> AResult<Self> {
+        Ok(Self {
+            store: cpu_paged_store(ec, g, cfg)?,
+            be,
+            bound: None,
+        })
+    }
+
+    /// Whether a generation bound the weights. Only then is the resident worth keeping: a cold init
+    /// that failed part of the way may have registered some weights with the paged store, and the
+    /// next attempt would register them again.
+    pub(crate) fn is_bound(&self) -> bool {
+        self.bound.is_some()
+    }
+
+    /// The bound weights' identity, for a test to see that a later generation reused them.
+    #[cfg(test)]
+    pub(crate) fn weights_ptr(&self) -> Option<*const weights::SeamWeights> {
+        self.bound.as_ref().map(|b| b.weights_ptr())
+    }
+
+    /// The paged store's `(hits, bytes read from the model file)` since it opened; `None` without
+    /// one.
+    #[cfg(test)]
+    pub(crate) fn paged_counts(&self) -> Option<(u64, u64)> {
+        self.store.as_ref().map(|st| {
+            st.pool_stats().iter().fold((0, 0), |(h, b), p| {
+                (h + p.stats.pager.hits, b + p.stats.bytes_read)
+            })
+        })
+    }
+
+    /// The paged store's identity; `None` without one.
+    #[cfg(test)]
+    pub(crate) fn store_ptr(&self) -> Option<*const infr_cpu::paged::PagedWeights> {
+        self.store.as_ref().map(std::sync::Arc::as_ptr)
+    }
+}
+
 /// Greedy CPU generation for a decoder (Qwen3 / Llama / Gemma 3 / Gemma 4 dense+E2B / qwen3moe). The
 /// attention block is shared; the FFN is either a dense gated FFN or a routed-expert MoE bank; gemma4
 /// E2B adds per-layer input embeddings + KV-layer sharing. `prompt` is the full token prefix; returns
@@ -530,9 +599,10 @@ fn metal_upload_bind(be: &infr_metal::MetalBackend) -> Box<BindWeight<'_>> {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_cpu(
-    g: &dyn WeightSource,
+    res: &mut CpuResident,
+    g: &Gguf,
     cfg: &Config,
-    ec: &std::sync::Arc<EngineConfig>,
+    ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
@@ -540,33 +610,26 @@ pub(crate) fn generate_dense_cpu(
     req: Option<&crate::sampling::RequestCtx>,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    // The CPU backend takes the config the SEAM was handed instead of
-    // building one from the environment inside `CpuBackend::new` (the old bridge is gone).
     generate_dense_cpu_mode(
-        CpuBackend::new_with(ec.clone()),
-        g,
-        cfg,
-        ec,
-        token_embd,
-        ple,
-        prompt,
-        max_new,
-        None, // constraint
-        req,
-        on_token,
+        res, g, cfg, ec, token_embd, ple, prompt, max_new, None, // constraint
+        req, on_token,
     )
 }
 
-/// [`generate_dense_cpu`] on a caller-supplied `CpuBackend`, so a comparison can pick the
-/// REFERENCE backend ([`CpuBackend::reference`]) instead of the production int8-activation
-/// kernels. The distinction matters at low bit-widths: the int8 activation quant carries ~4e-3
-/// relative error on every quant dtype, which is invisible at Q4_K but flips greedy tokens at
-/// Q2_K — so a backend-vs-backend token comparison must be scored against the reference mode.
+/// [`generate_dense_cpu`] with an optional grammar constraint, on a caller-supplied
+/// [`CpuResident`], so a comparison can pick one on the REFERENCE backend
+/// ([`CpuBackend::reference`]) instead of the production int8-activation kernels. The distinction
+/// matters at low bit-widths: the int8 activation quant carries ~4e-3 relative error on every quant
+/// dtype, which flips greedy tokens at Q2_K and can still flip a near tie at Q4_K — so a
+/// backend-vs-backend token comparison must be scored against the reference mode.
+///
+/// Each call allocates its own KV cache, sized to `prompt + max_new + 1`, and starts it empty: the
+/// resident carries the backend and its weights between calls, never a conversation.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn generate_dense_cpu_mode(
-    cpu_be: CpuBackend,
-    g: &dyn WeightSource,
+    res: &mut CpuResident,
+    g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -577,69 +640,98 @@ pub(crate) fn generate_dense_cpu_mode(
     req: Option<&crate::sampling::RequestCtx>,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
-    if cfg.qwen4_exp.is_some() || g.as_any().is::<crate::qwen4_exp_source::Qwen4ExpSource>() {
-        return crate::qwen4_exp_cpu::generate(
-            g,
-            ec,
-            prompt,
-            max_new,
-            &cfg.eos_ids,
-            constraint,
-            req,
-            on_token,
-        );
-    }
     // Thin CPU wrapper over the backend-generic runner: a CpuBackend + a weight binder that maps
     // each tensor straight from the GGUF mmap (no alloc, no memcpy) — or, when `paging.dram` asks
-    // for a host weight cache, registers the big ones to be read from the file on demand.
-    let store = cpu_paged_store(ec, g)?;
-    let bind = cpu_bind_with(&cpu_be, store.clone());
-    let out = generate_dense_backend(
-        &cpu_be,
-        &bind,
-        g,
-        cfg,
-        ec,
-        token_embd,
-        ple,
-        prompt,
-        max_new,
-        on_token,
-        &mut None,
-        prompt.len() + max_new + 1,
-        constraint,
-        None, // verify
-        None, // verify_ids
-        None, // logits_out
-        None, // h_out
-        None, // denoise_req
-        req,
-    );
-    if let Some(store) = store.filter(|_| ec.paging.stats) {
-        report_host_paging(&store);
+    // for a host weight cache, registers the big ones to be read from the file on demand. Once
+    // the resident holds bound weights the binder is never called.
+    let mut state = None;
+    let out = {
+        let bind = cpu_bind_with(
+            &res.be,
+            res.store.clone(),
+            cfg.moe.as_ref().map(|m| m.n_expert),
+        );
+        runner::generate_dense_backend_bound(
+            res.bound.as_ref(),
+            &res.be,
+            &bind,
+            g,
+            cfg,
+            ec,
+            token_embd,
+            ple,
+            prompt,
+            max_new,
+            on_token,
+            &mut state,
+            prompt.len() + max_new + 1,
+            constraint,
+            None, // verify
+            None, // verify_ids
+            None, // logits_out
+            None, // h_out
+            None, // denoise_req
+            req,
+        )
+    };
+    // A cold init that got as far as building `state` left the bound weights in it, whole, even
+    // when the generation failed after that; they are kept. One that failed earlier (a weight that
+    // would not bind, a refused KV allocation) left `state` empty, so nothing is kept, and
+    // `SeamModel::with_cpu` drops a resident that never got bound weights.
+    match (&res.bound, &state) {
+        (None, _) => res.bound = state.as_ref().map(SeamKv::bound),
+        (Some(b), Some(kv)) => debug_assert!(
+            kv.shares(b),
+            "the generation bound its own weights beside the resident's"
+        ),
+        (Some(_), None) => {}
+    }
+    // Kept: the caches. Not kept: the spin pool, which measured slower across requests than
+    // built per request (`CpuBackend::release_pool`).
+    res.be.release_pool();
+    if let Some(store) = &res.store {
+        // Flushed where the stats are taken, so the trace on disk covers what they report.
+        if let Err(e) = store.flush_trace() {
+            tracing::warn!("[host pager] {e}");
+        }
+        if ec.paging.stats {
+            report_host_paging(store);
+        }
     }
     out
 }
 
-/// `paging.stats` (`INFR_PAGER_STATS=1`): what the host tier actually did, per size class.
+/// `paging.stats` (`INFR_PAGER_STATS=1`): what the host tier actually did, per size class, since
+/// the store opened — on a model's [`CpuResident`], since its first CPU generation, so each
+/// report includes every earlier request's counts.
 ///
 /// The hit rate alone cannot distinguish a tier that is working from one that was never asked, so
 /// the read count and the bytes moved are reported beside it: those are what a run's throughput is
 /// bounded by, and what the mmap baseline in `docs/perf/results.md` is compared against.
 fn report_host_paging(store: &infr_cpu::paged::PagedWeights) {
-    for (slot_bytes, n_slots, s) in store.pool_stats() {
+    for p in store.pool_stats() {
+        let s = p.stats;
+        let what = if p.experts { "expert" } else { "whole" };
         tracing::info!(
-            "[host pager] {:.1}MB x {n_slots} slots: {} hits, {} misses ({:.1}% hit), {} evictions, \
-             {} reads, {:.2} GB from disk",
-            slot_bytes as f64 / 1e6,
+            "[host pager] {what} {:.1}MB x {} slots: {} hits, {} misses ({:.1}% hit), {} \
+             evictions, {} reads, {:.2} GB from disk in {:.1}s of reads ({} re-reads in {:.1}s)",
+            p.slot_bytes as f64 / 1e6,
+            p.n_slots,
             s.pager.hits,
             s.pager.misses,
             s.pager.hit_rate() * 100.0,
             s.pager.evictions,
             s.reads,
             s.bytes_read as f64 / 1e9,
+            s.read_ns as f64 / 1e9,
+            s.rereads,
+            s.reread_ns as f64 / 1e9,
         );
     }
+    tracing::info!(
+        "[host pager] {:.1}s waiting for weights to become resident",
+        store.wait().as_secs_f64()
+    );
 }
 
 /// GPU seam runner: the SAME dense forward as [`generate_dense_cpu`], but on the Vulkan backend
@@ -651,7 +743,7 @@ fn report_host_paging(store: &infr_cpu::paged::PagedWeights) {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_vulkan(
     vk: &infr_vulkan::VulkanBackend,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -684,7 +776,7 @@ pub(crate) fn generate_dense_vulkan(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_vulkan_session(
     vk: &infr_vulkan::VulkanBackend,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -697,7 +789,6 @@ pub(crate) fn generate_dense_vulkan_session(
     constraint: Option<&mut crate::grammar::Constraint>,
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
-    crate::qwen4_exp::ensure_forward_supported(cfg)?;
     // Placement can allocate + upload (the pager arenas, a weight re-bind), i.e. it RECORDS on the
     // Vulkan command pool — so it takes a turn on the baton like any other GPU region. Scoped: the
     // baton is released before the runner starts stepping. See `StepGate`.
@@ -815,7 +906,15 @@ pub(crate) fn dense_act_reserve_at(cfg: &Config, want_ctx: usize, ubatch: usize)
     } else {
         0
     };
-    let per_row = (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet) as u64;
+    // LFM's scratch (the runner's `lfm_scratch`): the B | C | X
+    // in-projection (three n_embd), the conv output (n_embd) and the per-head gate logits.
+    let shortconv = if cfg.lfm3 {
+        4 * (4 * cfg.n_embd + cfg.n_head)
+    } else {
+        0
+    };
+    let per_row =
+        (12 * cfg.n_ff + 96 * cfg.n_embd + attn_pv + attn_s + moe + deltanet + shortconv) as u64;
     rows * per_row * ACT_RESERVE_PAD.0 / ACT_RESERVE_PAD.1
 }
 
@@ -836,8 +935,9 @@ pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize
     ctx.div_ceil(ub) as u64 * ub as u64 * cfg.n_embd as u64 * 4
 }
 
-/// Does this session prefill LAYER-MAJOR — every chunk through layer L before any chunk reaches
-/// L+1 — instead of running the whole model per chunk?
+/// May this session prefill LAYER-MAJOR — every chunk through layer L before any chunk reaches
+/// L+1 — instead of running the whole model per chunk? Whether a given prompt then does is
+/// [`layer_major_this_prompt`].
 ///
 /// The two orders compute the same thing; they differ in what they re-read. Chunk-major sweeps the
 /// entire weight set once PER CHUNK, which is free when the weights are resident and is the whole
@@ -845,7 +945,7 @@ pub(crate) fn layer_major_act_bytes(cfg: &Config, want_ctx: usize, ubatch: usize
 /// 25.26 GB against a single sweep's 6.32 GB, and prefilled 3.08x slower for it. Layer-major reads
 /// one sweep regardless of chunk count, at the cost of holding every chunk's residual stream at once
 /// ([`layer_major_act_bytes`]) — a trade that only pays when there is I/O to save, hence the default
-/// of "on exactly when the weights stream".
+/// of "on exactly when the weights stream" (and, per prompt, only when it can save a read).
 ///
 /// `paging.layer_major` overrides in both directions (A/B, and the only way to put a RESIDENT model
 /// on this path). Either way it needs a backend that carries a bound `Input` from one execute to the
@@ -860,12 +960,13 @@ pub(crate) fn layer_major_prefill(
     let want = ec.paging.layer_major.unwrap_or(streaming);
     if want && !spannable {
         // gemma4-E2B: its layer stack reads `per_layer_inp`, which the graph PROLOGUE builds, so a
-        // span starting past layer 0 would read an unbound tensor. This is the gate for it — the
-        // matching `assert!` in `build` is an internal invariant, and a streamed E2B model reached
-        // it as a PANIC on an ordinary `bench`/`run` until this arm existed.
+        // span starting past layer 0 would read an unbound tensor. This is the gate — the matching
+        // `assert!` in `build` is an internal invariant, and a streamed E2B model reached it as a
+        // PANIC on an ordinary `bench`/`run` until this arm existed. (DeepSeek V4's wider residual
+        // is carried by the spans themselves: `DecodeHandles::hc_resid`.)
         tracing::warn!(
-            "layer-major prefill cannot split this architecture's layer stack (per-layer inputs \
-             are built by the graph prologue) — prefilling chunk-major"
+            "layer-major prefill cannot split this architecture's layer stack (gemma4-E2B's \
+             per-layer inputs are built by the graph prologue) — prefilling chunk-major"
         );
         return false;
     }
@@ -881,6 +982,120 @@ pub(crate) fn layer_major_prefill(
         return false;
     }
     want
+}
+
+/// Does THIS prompt prefill layer-major, given whether the session would
+/// ([`layer_major_prefill`])?
+///
+/// The auto rule runs it only where it can save a read: a prompt of more than one chunk, on a
+/// cache that cannot hold every block. One chunk is one sweep in either order, and a cache with a
+/// slot per block reads each block once per session whatever the order, so layer-major there only
+/// adds a span per layer, each paying its own graph build, compile, scratch and blocking submit.
+/// `paging.layer_major = true` still forces it (the A/B arm); `false` never arrives as wanted.
+///
+/// The activation reserve does not follow this per-prompt answer: it is priced for the session
+/// ([`layer_major_act_bytes`]) because the arenas are sized before any prompt arrives, so a prompt
+/// that runs chunk-major leaves it unused rather than short.
+pub(crate) fn layer_major_this_prompt(
+    ec: &EngineConfig,
+    wanted: bool,
+    n_chunks: usize,
+    holds_every_block: bool,
+) -> bool {
+    wanted && (ec.paging.layer_major == Some(true) || (n_chunks > 1 && !holds_every_block))
+}
+
+/// Whether a prompt whose first prefill chunk is `first_chunk_rows` tall prefills layer-major
+/// when `cfg`'s weights stream through the CPU's host arena (`Backend::host_streams`);
+/// [`layer_major_this_prompt`] still asks for more than one chunk. `paging.layer_major`
+/// overrides it either way.
+///
+/// **DeepSeek V4 only, deliberately.** It is the family this was built and measured for, and no
+/// other family has been checked bit for bit against its chunk-major prefill on the CPU.
+///
+/// **A sole request only** (`shared` is a request that takes turns with others,
+/// `RequestCtx::shares_gpu`, as `infr serve --parallel` makes). Only sole requests were
+/// measured; a shared one prefills in shorter chunks (`device.ubatch_parallel`), and the
+/// layer-major residency hints (hot-end inserts, the demotion of each finished layer) assume one
+/// prefill owns the pool's recency order, where chunk-major's cold-end inserts were chosen to
+/// leave other sessions' decode working sets alone.
+///
+/// **A first chunk of at least [`HOST_LAYER_MAJOR_MIN_ROWS`] only.** The gate reads the FIRST
+/// chunk, whose height `dsv4_emit::prefill_chunk_rows` derives from the session's chunk height
+/// and the prefill's START position: on a file with a CSA layer it shrinks the chunk as the
+/// context grows. So a prompt prefilled from position 0 at the default height qualifies at any
+/// length (its later chunks may shrink below the minimum and still run layer-major), while a turn
+/// that extends a session from deep in its context may get a first chunk below the minimum and
+/// prefill chunk-major (`layer_major_gate_follows_the_first_chunk` pins where). Measured on V4-Flash with a 12 GB
+/// arena (`docs/deepseek.md` § "Layer-major prefill on the CPU"): at the default 1024-row chunk a
+/// 1443-token prompt prefilled in 206.8 s layer-major, where chunk-major had spent 209.5 s on its
+/// first chunk alone; in 32-row chunks a 69-token prompt was SLOWER layer-major (98.96 and 114.89
+/// s against 91.59 s). A small chunk routes to a small part of each bank, so chunk-major re-reads
+/// little per chunk, and what it re-reads it had read seconds before, which the OS file cache
+/// largely still holds; layer-major's reads are all first reads.
+pub(crate) fn host_layer_major(cfg: &Config, first_chunk_rows: usize, shared: bool) -> bool {
+    cfg.deepseek4 && !shared && first_chunk_rows >= HOST_LAYER_MAJOR_MIN_ROWS
+}
+
+/// The shortest first prefill chunk [`host_layer_major`] runs layer-major. The two measured
+/// heights are 32 rows (slower) and 1024 (faster); nothing between them was run, and this sits
+/// between them so that a sole request keeps the order while V4's long-context shrink
+/// (`dsv4_emit::prefill_chunk_rows`) leaves its first chunk at least this tall.
+pub(crate) const HOST_LAYER_MAJOR_MIN_ROWS: usize = 256;
+
+/// What a layer-major prefill may hold between layers for its whole segment of the prompt: the
+/// residual stream (DeepSeek V4's `hc_mult` streams wide) and the chunk's embedded input rows.
+/// Taken out of an automatic CPU arena too small for the weights ([`layer_major_carry_bytes`]);
+/// `layer_major_segments_carry_one_gib_at_v4_flash_geometry` pins the rows it gives V4-Flash.
+pub(crate) const LAYER_MAJOR_CARRY_BYTES: u64 = 1 << 30;
+
+/// The bytes one prompt row costs a layer-major prefill between layers: the f32 residual stream
+/// (`hc_mult` streams of `n_embd` on DeepSeek V4, one elsewhere), the embedded input row the first
+/// span reads, and its token id and position.
+pub(crate) fn layer_major_row_bytes(cfg: &Config) -> u64 {
+    let streams = if cfg.deepseek4 { cfg.hc_mult as u64 } else { 1 };
+    (streams + 1) * cfg.n_embd as u64 * 4 + 8
+}
+
+/// The most prompt rows one layer-major SEGMENT carries ([`layer_major_segments`]):
+/// `paging.layer_major_rows` when set, else, on DeepSeek V4, as many as
+/// [`LAYER_MAJOR_CARRY_BYTES`] holds at [`layer_major_row_bytes`]. Every other family carries the
+/// whole prompt, as it always has (its residual is priced for the whole context by
+/// [`layer_major_act_bytes`]).
+pub(crate) fn layer_major_segment_rows(ec: &EngineConfig, cfg: &Config) -> usize {
+    match ec.paging.layer_major_rows {
+        Some(n) => n.max(1),
+        None if cfg.deepseek4 => {
+            usize::try_from(LAYER_MAJOR_CARRY_BYTES / layer_major_row_bytes(cfg))
+                .unwrap_or(usize::MAX)
+                .max(1)
+        }
+        None => usize::MAX,
+    }
+}
+
+/// Group consecutive prefill `chunks` (`(start, end)` positions) into segments of at most
+/// `max_rows` rows, as ranges of chunk indices; a chunk taller than `max_rows` is a segment alone.
+/// A layer-major prefill runs each segment through every layer before the next segment starts, so
+/// it holds one segment's residual streams at a time and sweeps the weights once per segment.
+pub(crate) fn layer_major_segments(
+    chunks: &[(usize, usize)],
+    max_rows: usize,
+) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let (mut first, mut rows) = (0, 0usize);
+    for (i, &(s, e)) in chunks.iter().enumerate() {
+        let r = e - s;
+        if i > first && rows + r > max_rows {
+            out.push(first..i);
+            (first, rows) = (i, 0);
+        }
+        rows += r;
+    }
+    if first < chunks.len() {
+        out.push(first..chunks.len());
+    }
+    out
 }
 
 /// Safety pad on [`dense_act_reserve_at`]'s per-row terms, as `(numerator, denominator)`.
@@ -989,9 +1204,40 @@ pub(crate) fn ubatch_candidates(ec: &EngineConfig) -> Vec<usize> {
 /// no tuned dGPU shape moves.
 fn default_ubatch_rows() -> usize {
     match infr_vulkan::device_class() {
-        Some(d) if d.integrated => infr_core::integrated_ubatch_rows(d.compute_units),
-        _ => 1024,
+        Some(d) => default_ubatch_rows_for(d.integrated, d.compute_units),
+        None => default_ubatch_rows_for(false, 0),
     }
+}
+
+/// [`default_ubatch_rows`] for a device of the given class (`compute_units` 0 = unknown).
+fn default_ubatch_rows_for(integrated: bool, compute_units: u32) -> usize {
+    if integrated {
+        infr_core::integrated_ubatch_rows(compute_units)
+    } else {
+        1024
+    }
+}
+
+/// Enter a placement scope whose default prefill chunk is the one for `caps`, the backend this
+/// one-shot actually runs on. The multi-device wrappers need it: [`default_ubatch_rows`] reads
+/// the class of whichever Vulkan device the PROCESS opened first, and a world that mixes a
+/// discrete card with an integrated GPU must size every chunk for the integrated one (each
+/// wrapper reports its ranks' most conservative class). An explicit `device.ubatch` still wins
+/// (see [`ubatch_rows`]); a chunk or auto-q8 KV the enclosing scope already pinned carries over,
+/// the chunk lowered to the backend's default when that is smaller.
+fn backend_chunk_scope(caps: &infr_core::backend::Capabilities) -> PlacementScope {
+    use std::sync::atomic::Ordering::Relaxed;
+    let rows = default_ubatch_rows_for(caps.integrated, caps.compute_units);
+    let pins = PlacementPins::default();
+    with_placement_pins(|cur| {
+        let pinned = cur.ubatch.load(Relaxed);
+        pins.ubatch
+            .store(if pinned == 0 { rows } else { pinned.min(rows) }, Relaxed);
+        if cur.kv_q8.get().is_some() {
+            let _ = pins.kv_q8.set(());
+        }
+    });
+    PlacementScope::enter(std::sync::Arc::new(pins))
 }
 
 /// Prefill chunk (rows) for a sequence SHARING the GPU with other in-flight sequences
@@ -1149,9 +1395,30 @@ pub(crate) fn pin_kv_auto_q8() {
 /// Use the `*_specified` flags, NOT `type_k.is_some()`. An unrecognized format name
 /// (`INFR_KV_TYPE_K=nonsense`) parses to no dtype, so the runner falls through to f16 — but it was
 /// still SUPPLIED, and today's `is_err()` reads it as "the user chose", suppressing auto-q8. Both
-/// halves of that asymmetry are preserved.
-pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
-    !ec.kv.type_k_specified && !ec.kv.type_v_specified && !ec.kv.force_q8
+/// halves of that asymmetry are preserved. A model whose V follows K ([`kv_v_follows_k`]) has no V
+/// setting to supply.
+pub(crate) fn kv_unset(cfg: &Config, ec: &EngineConfig) -> bool {
+    !ec.kv.type_k_specified && (kv_v_follows_k(cfg) || !ec.kv.type_v_specified) && !ec.kv.force_q8
+}
+
+/// Does this model's V cache format follow its K format, whatever `INFR_KV_TYPE_V` says?
+///
+/// True for deepseek4: it has no V cache at all (its attention reads the K cache as V, see
+/// [`kv_row_elems`]), so a V format would describe nothing. Every place a V format is chosen or
+/// gates something — the runner's format pick, the SWA ring gate, Metal's mixed-format clamp, the
+/// fit estimates and auto-q8 — reads it through [`kv_v_fmt`] or this predicate, so the setting is
+/// ignored the same way everywhere rather than half-honoured.
+pub(crate) fn kv_v_follows_k(cfg: &Config) -> bool {
+    cfg.deepseek4
+}
+
+/// The format the V side takes for `cfg`: `k_fmt` when [`kv_v_follows_k`], else `v_fmt`.
+pub(crate) fn kv_v_fmt(cfg: &Config, k_fmt: DType, v_fmt: DType) -> DType {
+    if kv_v_follows_k(cfg) {
+        k_fmt
+    } else {
+        v_fmt
+    }
 }
 
 /// Per-token (K, V) ELEMENT counts for layer `l` — the one answer to "how wide is a row of this
@@ -1179,33 +1446,25 @@ pub(crate) fn kv_unset(ec: &EngineConfig) -> bool {
 ///
 /// The indexer cache **must never ring**: `Op::LightningIndexer` masks causally only, so position 0
 /// stays eligible for every query row and every backend refuses a cache holding fewer rows than
-/// `kv_len`. That is why it is sized off [`kv_rows`] like any full-context side — V3.2 has no
-/// sliding-window layer, so `kv_rows` returns the whole context — and why the allocation asserts it
+/// `kv_len`. That is why it is sized off [`kv_rows_at`] like any full-context side — V3.2 has no
+/// sliding-window layer, so `kv_rows_at` returns the whole context — and why the allocation asserts it
 /// (see `generate_dense_backend`'s KV loop).
 ///
-/// Recurrent-state layers (qwen35 DeltaNet) have no per-token cache to size; their callers branch
-/// to the fixed conv/S-state allocation BEFORE reaching here, and the estimates price them with
-/// this attention geometry as they always have.
-/// **deepseek4 (V4) caches ONE `head_dim`-wide MQA row per side per token**, and the V side is a
-/// DUPLICATE of the K side rather than the MLA-style 0-width placeholder (docs/backlog.md B53).
+/// Recurrent-state layers (qwen35 DeltaNet, LFM short convolution) have no per-token cache to
+/// size; every caller branches to their fixed state ([`Config::recurrent_state_elems`]) before
+/// reaching here.
 ///
-/// V4's raw attention is `build_attn_mha(q, k_all, k_all, …)` — K and V really are the same rows —
-/// so `(head_dim, 0)` with `Op::Attention` pointed at one buffer for both sides is the shape the
-/// arithmetic wants. It is not the shape this codebase can execute: the CPU backend's
-/// `Op::Attention` arm takes `cpu_buf(kbuf).read()` and `cpu_buf(vbuf).read()` as two
-/// SIMULTANEOUSLY-LIVE guards (`crates/infr-cpu/src/lib.rs`), and a KV buffer is
-/// `CpuStore::Owned(Mutex<Vec<u8>>)` — a non-reentrant `std::sync::Mutex`, so one id bound to both
-/// sides self-deadlocks the moment the first V4 attention op runs. (Vulkan is fine with it: both
-/// bindings are `readonly` and the hazard tracker de-dupes.) Aliasing therefore costs a one-line
-/// change in a crate the V4 wiring slice does not own, in exchange for halving a cache that, at
-/// V4's MQA width, is `head_dim` floats per token per layer. The emit writes the same normed+roped
-/// row to BOTH caches with two `Op::WriteKv`s instead — see `docs/backlog.md` § B53.
+/// **deepseek4 (V4) caches ONE `head_dim`-wide MQA row per token and has no V cache**: its raw
+/// attention is `build_attn_mha(q, k_all, k_all, …)`, so K and V are the same rows. The emit writes
+/// the row once and points `Op::Attention`'s `k_cache` and `v_cache` at the same tensor, which every
+/// backend accepts (the CPU arm reads an aliased pair through one guard and dequantizes it once).
+/// The V side has no rows: the graph declares no V tensor for a V4 layer (its `v_cache` handle IS
+/// the K cache's) and the session's V buffer is an unbound placeholder. Its format follows K
+/// ([`kv_v_follows_k`]).
 ///
-/// The compressed caches (CSA/HCA/LID) and the three compressor states a ratio-4 / ratio-128 layer
-/// owns are NOT modelled here. They cannot be: they are per-layer (a ratio-0 layer has none) and
-/// the states are fixed-size recurrent buffers, not per-token rows. `generate_dense_backend`
-/// refuses any non-zero ratio before a graph is built, so nothing reads a geometry that does not
-/// exist yet.
+/// The compressed caches (CSA/HCA/LID) and the compressor state rings a ratio-4 / ratio-128 layer
+/// owns are NOT modelled here: they are per-layer (a ratio-0 layer has none), one row per BLOCK
+/// rather than per token, and the rings are fixed-size. [`dsv4_comp_bufs`] owns their geometry.
 pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
     if cfg.deepseek2 {
         return (cfg.kv_lora_rank + cfg.qk_rope_dim, cfg.indexer_head_size);
@@ -1215,18 +1474,108 @@ pub(crate) fn kv_row_elems(cfg: &Config, l: usize) -> (usize, usize) {
         // route via `is_swa_layer`, which is TRUE for every V4 layer, and so would answer with
         // gemma4's `head_dim_swa`/`n_kv_swa` fields. They happen to equal `head_dim`/`n_kv` for
         // every non-gemma4 model, which is an accident this arch should not depend on.
-        let row = cfg.head_dim;
-        return (row, row);
+        return (cfg.head_dim, 0);
     }
     let row = cfg.layer_n_kv(l) * cfg.layer_head_dim(l);
     (row, row)
 }
 
-/// Elements a KV side that the arch does NOT cache still declares and allocates: MLA's V, whose
-/// [`kv_row_elems`] count is 0. No backend ever indexes it (the MLA kernels read V as a prefix of
-/// the K row), but every backend still binds a buffer and a graph Input for the side, and a
-/// zero-size allocation is not portable — so the placeholder is a handful of elements, sized
-/// identically at the allocation and the declaration.
+/// One persistent buffer a DeepSeek V4 compressed layer owns beside its raw cache: a compressed
+/// cache (`kv_hca`, `kv_csa`, `kv_lid` in `llama_kv_cache_dsv4`) or one half of a compressor's
+/// state ring (`llama_dsv4_comp_state`'s kv or score tensor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Dsv4CompBuf {
+    pub(crate) dtype: DType,
+    pub(crate) elems: usize,
+    /// A state ring (f32, fixed size, reset with the session); `false` for a compressed cache.
+    pub(crate) ring: bool,
+}
+
+impl Dsv4CompBuf {
+    /// Bytes the session allocates for it.
+    pub(crate) fn bytes(&self) -> usize {
+        kv_side_bytes(self.dtype, self.elems)
+    }
+}
+
+/// Buffers per compressor tier in [`dsv4_comp_bufs`]: the compressed cache, then the ring's kv
+/// half, then its score half.
+pub(crate) const DSV4_TIER_BUFS: usize = 3;
+
+/// Layer `l`'s compressed-tier buffers for a `want_ctx`-token session whose raw cache is `k_fmt`,
+/// in the order the graph declares and the session allocates them; empty for a ratio-0 layer and
+/// for every other arch. The ONE answer to their geometry, shared by the allocation, the graph
+/// declaration, `SeamKv::fork`, the reset and every footprint estimate.
+///
+/// Each compressor tier contributes [`DSV4_TIER_BUFS`] buffers:
+/// - its compressed cache, one `width`-wide row per block of `ratio` positions,
+///   `ceil(want_ctx / ratio)` rows (`dsv4_comp_size`), in `k_fmt`: the CPU attention's compressed
+///   segment shares the raw cache's dtype (`check_attention`), as `llama_kv_cache_dsv4` builds
+///   every tier with the same `type_k`. infr skips the reference's 256-row padding, which only
+///   widens a masked view;
+/// - the ring's kv and score halves, f32 `[state_rows, state_width]` each: `ratio` rows of `width`
+///   for the non-overlapping HCA compressor, `2*ratio` rows of `2*width` for the overlapping
+///   CSA and LID ones (`llama_kv_cache_dsv4`'s `csa_state` / `hca_state` / `lid_state`).
+///
+/// An HCA layer (ratio 128) has one tier at `head_dim`. A CSA layer (ratio 4) has two: its own at
+/// `head_dim`, then the lightning indexer's at `indexer_head_size`.
+pub(crate) fn dsv4_comp_bufs(
+    cfg: &Config,
+    l: usize,
+    want_ctx: usize,
+    k_fmt: DType,
+) -> Vec<Dsv4CompBuf> {
+    if !cfg.deepseek4 {
+        return Vec::new();
+    }
+    let ratio = cfg.layer_compress_ratio(l);
+    let tier = |ratio: usize, width: usize, overlap: bool| {
+        let (state_rows, state_width) = if overlap {
+            (2 * ratio, 2 * width)
+        } else {
+            (ratio, width)
+        };
+        let ring = Dsv4CompBuf {
+            dtype: DType::F32,
+            elems: state_rows * state_width,
+            ring: true,
+        };
+        [
+            Dsv4CompBuf {
+                dtype: k_fmt,
+                elems: want_ctx.div_ceil(ratio).max(1) * width,
+                ring: false,
+            },
+            ring,
+            ring,
+        ]
+    };
+    match ratio as u32 {
+        0 => Vec::new(),
+        dsv4_plan::DSV4_HCA_RATIO => tier(ratio, cfg.head_dim, false).to_vec(),
+        dsv4_plan::DSV4_CSA_RATIO => [
+            tier(ratio, cfg.head_dim, true),
+            tier(ratio, cfg.indexer_head_size, true),
+        ]
+        .concat(),
+        _ => unreachable!("Config::from_gguf accepts compress ratios 0, 4 and 128 only"),
+    }
+}
+
+/// Bytes all of layer `l`'s [`dsv4_comp_bufs`] allocate.
+pub(crate) fn dsv4_comp_bytes(cfg: &Config, l: usize, want_ctx: usize, k_fmt: DType) -> usize {
+    dsv4_comp_bufs(cfg, l, want_ctx, k_fmt)
+        .iter()
+        .map(Dsv4CompBuf::bytes)
+        .sum()
+}
+
+/// Elements a KV side that the arch does NOT cache still allocates: MLA's V and deepseek4's V,
+/// whose [`kv_row_elems`] count is 0. No backend ever indexes it (the MLA kernels read V as a
+/// prefix of the K row; deepseek4's attention reads its K cache as V). MLA still declares and binds
+/// a graph Input for the side; deepseek4 declares none (its layer's `v_cache` handle is the K
+/// cache's) and leaves the buffer unbound. A zero-size allocation is not portable, so the
+/// placeholder is a handful of elements, sized identically at the allocation and any declaration.
 pub(crate) const KV_PLACEHOLDER_ELEMS: usize = 4;
 
 /// A KV side's element count as DECLARED in the graph: `elems`, or the placeholder when the arch
@@ -1259,7 +1608,26 @@ pub(crate) fn kv_side_bytes(fmt: DType, elems: usize) -> usize {
 pub(crate) fn kv_row_align_ok(cfg: &Config) -> bool {
     (0..cfg.n_layer).all(|l| {
         let (k, v) = kv_row_elems(cfg, l);
-        k.is_multiple_of(32) && v.is_multiple_of(32)
+        // A V4 compressed cache takes the raw cache's format, so its rows are held to it too; at
+        // a one-token context each compressed cache is exactly one row.
+        let comp_ok = dsv4_comp_bufs(cfg, l, 1, DType::F32)
+            .iter()
+            .filter(|b| !b.ring)
+            .all(|b| b.elems.is_multiple_of(32));
+        k.is_multiple_of(32) && v.is_multiple_of(32) && comp_ok
+    })
+}
+
+/// Layout half of the TurboQuant KV gate: every layer's cache row is whole 128-element groups
+/// (a WHT group is a 128-element slice of the row). A V4 compressed cache takes the raw cache's
+/// format, so its rows are held to it too, the LID cache's indexer-wide row among them.
+pub(crate) fn kv_turbo_align_ok(cfg: &Config) -> bool {
+    (0..cfg.n_layer).all(|l| {
+        let comp_ok = dsv4_comp_bufs(cfg, l, 1, DType::F32)
+            .iter()
+            .filter(|b| !b.ring)
+            .all(|b| b.elems.is_multiple_of(128));
+        cfg.layer_head_dim(l).is_multiple_of(128) && comp_ok
     })
 }
 
@@ -1314,26 +1682,11 @@ pub(crate) fn mla_kv_fmt(
     Ok((DType::F16, DType::F16))
 }
 
-/// [`kv_rows`] at an EXPLICIT chunk height (the try-resident sweep prices candidate heights
-/// before pinning one; everyone else goes through `kv_rows`/`ubatch_rows`).
-pub(crate) fn kv_rows_at(
-    cfg: &Config,
-    l: usize,
-    want_ctx: usize,
-    ring: bool,
-    ubatch: usize,
-) -> usize {
-    if ring && cfg.is_swa_layer(l) {
-        want_ctx.min((cfg.swa_window + ubatch).next_multiple_of(64))
-    } else {
-        want_ctx
-    }
-}
-
-/// Row capacity of layer `l`'s K/V cache at context `want_ctx`. With `ring` (SWA ring sizing on
-/// for this session — see [`kv_ring_wanted`] + the backend's `Capabilities::kv_swa_ring`), a
-/// sliding-window layer allocates only `min(want_ctx, round64(window + ubatch))` rows and the
-/// backends write/read position `p` at row `p % rows` (WriteKv/Attention ring semantics).
+/// Row capacity of layer `l`'s K/V cache at context `want_ctx`, for prefill chunk height
+/// `ubatch`. With `ring` (SWA ring sizing on for this session — see [`kv_ring_wanted`] + the
+/// backend's `Capabilities::kv_swa_ring`), a sliding-window layer allocates only
+/// `min(want_ctx, round64(window + ubatch))` rows and the backends write/read position `p` at row
+/// `p % rows` (WriteKv/Attention ring semantics).
 ///
 /// Correctness bound: during one forward of `B <= ubatch` rows starting at position `p0`, the
 /// oldest position any query's window reaches is `p0 + 1 - window` and the newest written is
@@ -1341,14 +1694,45 @@ pub(crate) fn kv_rows_at(
 /// of `window + ubatch` rows never recycles a row the sliding-window mask hasn't ALREADY excluded
 /// (that mask discards everything older than `pos - window`); attention output is therefore
 /// identical to the full-context cache. Global (non-SWA) layers keep full `want_ctx` rows.
-pub(crate) fn kv_rows(
+///
+/// A live slot passes the height its rings were sized with (`SeamKv::ubatch`); placement passes
+/// [`ubatch_rows`] or the candidate height it is pricing.
+///
+/// `row_align` is the backend's `Backend::kv_row_align`: the capacity is rounded up to it, so a
+/// backend whose attention reads whole KV blocks finds every row it reads allocated. The extra
+/// rows are capacity only (the session's context stays `want_ctx`). Pre-load estimates, which have
+/// no backend yet, pass `1`: [`KV_SLOP_ROWS`] covers the padding in the fit estimate, and the
+/// floor stays a floor without it.
+pub(crate) fn kv_rows_at(
     cfg: &Config,
     l: usize,
     want_ctx: usize,
     ring: bool,
-    ec: &EngineConfig,
+    ubatch: usize,
+    row_align: usize,
 ) -> usize {
-    kv_rows_at(cfg, l, want_ctx, ring, ubatch_rows(ec))
+    let rows = if ring && cfg.is_swa_layer(l) {
+        want_ctx.min((cfg.swa_window + ubatch).next_multiple_of(64))
+    } else {
+        want_ctx
+    };
+    rows.next_multiple_of(row_align)
+}
+
+/// The rows the shortest sliding-window ring holds in a slot of `max_ctx` tokens whose prefill
+/// chunk is `ubatch` rows, on a backend whose cache rows align to `row_align`
+/// (`Backend::kv_row_align`), or `None` for a model with no window layer. A slot that has written
+/// past that many positions has wrapped the ring and recycled its earliest rows.
+pub fn window_ring_rows(
+    cfg: &Config,
+    max_ctx: usize,
+    ubatch: usize,
+    row_align: usize,
+) -> Option<usize> {
+    (0..cfg.n_layer)
+        .filter(|&l| cfg.is_swa_layer(l))
+        .map(|l| kv_rows_at(cfg, l, max_ctx, true, ubatch, row_align))
+        .min()
 }
 
 /// KV-cache footprint ESTIMATE summed over all layers at chunk height `ubatch` and side format:
@@ -1370,7 +1754,7 @@ pub(crate) fn kv_bytes_estimate(
 
 /// Rows of headroom every KV footprint estimate adds PER LAYER on top of the context's own rows.
 ///
-/// The runner allocates exactly `kv_rows(..) * kv_row_elems(..)` elements per side (see
+/// The runner allocates exactly `kv_rows_at(..) * kv_row_elems(..)` elements per side (see
 /// `generate_dense_backend`'s KV loop and `SeamKv::fork`) — this is deliberate slop, not a
 /// pad the allocation actually contains, so every estimate that uses it is conservative by a
 /// bounded, layer-proportional amount rather than by an unexplained percentage.
@@ -1390,11 +1774,22 @@ pub(crate) fn kv_bytes_estimate_fmt(
 ) -> u64 {
     (0..cfg.n_layer)
         .map(|l| {
-            let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch) + KV_SLOP_ROWS;
+            // A recurrent layer's state is fixed-size f32 whatever the context, and is priced
+            // twice: the live state and the one snapshot of it a slot can hold
+            // (`SeamKv::mtp_delta_ckpt`, which MTP rollback and the decode loop's prefill-boundary
+            // snapshot share). MTP fails a request whose snapshot cannot be allocated, so a
+            // context fitted to fill the device must leave room for it.
+            if let Some((k_elems, v_elems)) = cfg.recurrent_state_elems(l) {
+                return (2 * (k_elems + v_elems) * 4) as u64;
+            }
+            let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch, 1) + KV_SLOP_ROWS;
             // Per-side widths, NOT one shared width: MLA's K row is `kv_lora_rank + qk_rope_dim`
             // and it has no V side (see `kv_row_elems`).
             let (k_row, v_row) = kv_row_elems(cfg, l);
+            // A V4 compressed layer's block caches and rings, priced at exactly what the session
+            // allocates for them (`dsv4_comp_bufs`).
             kv_pair_bytes(k_row * rows, v_row * rows, k_fmt, v_fmt)
+                + dsv4_comp_bytes(cfg, l, want_ctx, k_fmt) as u64
         })
         .sum()
 }
@@ -1438,7 +1833,7 @@ pub(crate) fn kv_ring_wanted(cfg: &Config, ec: &EngineConfig) -> bool {
         && !cfg.diffusion_gemma
         && ec.kv.ring
         && fmt_ok(ec.kv.type_k_specified, ec.kv.type_k)
-        && fmt_ok(ec.kv.type_v_specified, ec.kv.type_v)
+        && (kv_v_follows_k(cfg) || fmt_ok(ec.kv.type_v_specified, ec.kv.type_v))
 }
 
 /// The smallest context a session is worth opening with. A window below this is useless for any
@@ -1464,7 +1859,7 @@ pub(crate) const MIN_SESSION_CTX: usize = 1024;
 pub(crate) fn placement_ring(cfg: &Config, ec: &EngineConfig, k_fmt: DType, v_fmt: DType) -> bool {
     kv_ring_wanted(cfg, ec)
         && matches!(k_fmt, DType::F16 | DType::Q8_0)
-        && matches!(v_fmt, DType::F16 | DType::Q8_0)
+        && matches!(kv_v_fmt(cfg, k_fmt, v_fmt), DType::F16 | DType::Q8_0)
 }
 
 /// Bytes a FULLY-RESIDENT dense session needs at one EXPLICIT prefill chunk height and KV format
@@ -1747,9 +2142,9 @@ pub(crate) fn reclamp_ctx_to_live_room(
     want_ctx: usize,
     k_fmt: DType,
     v_fmt: DType,
-) -> usize {
+) -> AResult<usize> {
     let Some(room) = be.device_alloc_room() else {
-        return want_ctx;
+        return Ok(want_ctx);
     };
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let budget = room.saturating_sub(POST_KV_DEVICE_RESERVE);
@@ -1765,7 +2160,7 @@ pub(crate) fn reclamp_ctx_to_live_room(
     // is what an MoE forward's activations actually need beside them.
     let at = |ub: usize| kv_fit_ctx_in_budget(cfg, ec, budget, None, &[ub], k_fmt, v_fmt);
     let Some(_) = at(cands[0]) else {
-        return want_ctx; // pure recurrent-state arch: no per-token KV to size.
+        return Ok(want_ctx); // pure recurrent-state arch: no per-token KV to size.
     };
     // The tallest rung that serves the whole window, else the rung that serves the most of it.
     let (chunk, fit) = cands
@@ -1784,8 +2179,20 @@ pub(crate) fn reclamp_ctx_to_live_room(
     if chunk < ubatch_rows(ec) {
         repin_ubatch_lower(chunk);
     }
+    let ubatch = ubatch_rows(ec);
+    let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
+    tracing::debug!(
+        room_bytes = room,
+        post_kv_reserve_bytes = POST_KV_DEVICE_RESERVE,
+        act_reserve_bytes = dense_act_reserve_at(cfg, fit, ubatch),
+        kv_bytes = kv_bytes_estimate_fmt(cfg, fit, ring, ubatch, k_fmt, v_fmt),
+        ubatch,
+        want_ctx,
+        fit,
+        "ctx fit against the live device room"
+    );
     if fit >= want_ctx {
-        return want_ctx;
+        return Ok(want_ctx);
     }
     if ec.device.ctx.is_some() {
         tracing::warn!(
@@ -1797,10 +2204,26 @@ pub(crate) fn reclamp_ctx_to_live_room(
              does.",
             gib(room),
         );
-        return want_ctx;
+        return Ok(want_ctx);
     }
-    let ubatch = ubatch_rows(ec);
-    let ring = placement_ring(cfg, ec, k_fmt, v_fmt);
+    if fit == 0 {
+        // Not one token of context fits: say so with the measured numbers, rather than let the
+        // request fail later as a context overflow against a capacity of 0.
+        let floor = dense_act_reserve_at(cfg, 1, ubatch)
+            + kv_bytes_estimate_fmt(cfg, 1, ring, ubatch, k_fmt, v_fmt);
+        return Err(anyhow!(
+            "this model does not fit the device's free memory: after its weights are resident the \
+             device reports {:.2} GiB allocatable, and even a one-token context needs {:.2} GiB \
+             ({:.2} GiB of KV and activation reserve at a {ubatch}-row chunk, plus {:.2} GiB held \
+             for the driver's own later allocations). Free device memory held by other \
+             applications, cap the expert cache (INFR_CACHE / paging.cache), or use a smaller \
+             quant of the model.",
+            gib(room),
+            gib(floor + POST_KV_DEVICE_RESERVE),
+            gib(floor),
+            gib(POST_KV_DEVICE_RESERVE),
+        ));
+    }
     tracing::warn!(
         requested_ctx = want_ctx,
         fits_ctx = fit,
@@ -1814,27 +2237,26 @@ pub(crate) fn reclamp_ctx_to_live_room(
         gib(dense_act_reserve_at(cfg, fit, ubatch)),
         gib(POST_KV_DEVICE_RESERVE),
     );
-    fit
+    Ok(fit)
 }
 
 /// Bytes layer `l`'s two cache buffers ALLOCATE at `want_ctx` and prefill chunk `ubatch` —
 /// `(K side, V side)`, exactly what the runner hands `Backend::alloc` with `BufferUsage::KvCache`.
-/// A qwen35 DeltaNet layer holds its conv history and recurrent state there instead (fixed-size
-/// f32, not `want_ctx`-scaled); an attention layer holds `kv_rows_at` rows of its own per-side
-/// width.
+/// A recurrent layer (qwen35 DeltaNet, LFM short convolution) holds its fixed-size f32 state there
+/// instead ([`Config::recurrent_state_elems`], not `want_ctx`-scaled); an attention layer holds
+/// `kv_rows_at` rows of its own per-side width.
 pub(crate) fn kv_layer_alloc_bytes(
     cfg: &Config,
     l: usize,
     want_ctx: usize,
     ring: bool,
     ubatch: usize,
+    row_align: usize,
     k_fmt: DType,
     v_fmt: DType,
 ) -> (usize, usize) {
-    if cfg.qwen35 && !cfg.is_qwen35_attn_layer(l) {
-        let conv_elems = (cfg.ssm_d_conv - 1) * cfg.q35_conv_channels();
-        let s_elems = cfg.q35_num_v_heads() * cfg.q35_head_k_dim() * cfg.q35_head_v_dim();
-        return (conv_elems * 4, s_elems * 4);
+    if let Some((k_elems, v_elems)) = cfg.recurrent_state_elems(l) {
+        return (k_elems * 4, v_elems * 4);
     }
     // Per-token row widths, MLA included: DeepSeek2 caches ONE compressed row
     // (kv_lora_rank + qk_rope_dim) per token and has no V side, so `v_row` is 0 and `kv_side_bytes`
@@ -1843,8 +2265,8 @@ pub(crate) fn kv_layer_alloc_bytes(
     // `indexer_head_size` and is reserved like any other side.
     let (k_row, v_row) = kv_row_elems(cfg, l);
     // SWA ring: window layers hold only `window + ubatch` rows (the ring recycles rows the window
-    // mask already excludes — `kv_rows` has the argument).
-    let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch);
+    // mask already excludes — `kv_rows_at` has the argument).
+    let rows = kv_rows_at(cfg, l, want_ctx, ring, ubatch, row_align);
     // The indexer cache MUST hold the whole context: `Op::LightningIndexer` masks causally only, so
     // position 0 stays eligible for every query row and a ring that had wrapped would have
     // overwritten it — every backend refuses `cap_rows < kv_len` rather than score a row holding
@@ -1890,9 +2312,28 @@ pub(crate) fn kv_floor_alloc_bytes(
         .min()
         .expect("ubatch_candidates is never empty");
     let one: Vec<(usize, usize)> = (0..cfg.n_layer)
-        .map(|l| kv_layer_alloc_bytes(cfg, l, want_ctx, ring, ubatch, k_fmt, v_fmt))
+        .flat_map(|l| {
+            std::iter::once(kv_layer_alloc_bytes(
+                cfg, l, want_ctx, ring, ubatch, 1, k_fmt, v_fmt,
+            ))
+            .chain(dsv4_comp_allocs(cfg, l, want_ctx, k_fmt))
+        })
         .collect();
     std::iter::repeat_n(one, n_slots.max(1)).flatten().collect()
+}
+
+/// Layer `l`'s [`dsv4_comp_bufs`] as allocation entries in the `(bytes, bytes)` form the KV guard
+/// reads ([`refuse_unallocatable_kv`]): one `(bytes, 0)` per buffer, since each is its own
+/// allocation.
+pub(crate) fn dsv4_comp_allocs(
+    cfg: &Config,
+    l: usize,
+    want_ctx: usize,
+    k_fmt: DType,
+) -> impl Iterator<Item = (usize, usize)> {
+    dsv4_comp_bufs(cfg, l, want_ctx, k_fmt)
+        .into_iter()
+        .map(|b| (b.bytes(), 0))
 }
 
 /// The KV allocations of `sizes` the Vulkan VRAM guard will check, summed — `None` when nothing
@@ -2011,13 +2452,12 @@ fn chunk_covered_dense_tensor(name: &str) -> bool {
 /// consistent BEFORE the upload (see the double-count note inside).
 pub(crate) fn vulkan_moe_binder<'a>(
     vk: &'a infr_vulkan::VulkanBackend,
-    g: &'a dyn WeightSource,
+    g: &'a Gguf,
     cfg: &'a Config,
     ec: &EngineConfig,
     first_load: bool,
     want_ctx: usize,
 ) -> AResult<Box<BindWeight<'a>>> {
-    crate::qwen4_exp::ensure_forward_supported(cfg)?;
     // ── MoE expert placement ─────────────────────────────────────────────────────────────────
     // The pager (`infr_vulkan::pager`) is the ONLY MoE offload mechanism — the legacy
     // host-visible (HostWeights/GTT) split and its INFR_NCMOE knob are gone. Tiers, in
@@ -2068,7 +2508,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             None => {
                 let fp = crate::weights::weight_footprint(g);
                 let vram = vk.vram();
-                // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows`), so a
+                // Per-layer rows: SWA layers ring at window+ubatch rows (see `kv_rows_at`), so a
                 // mostly-SWA model's KV prices far below n_layer * ctx. +64 rows/layer slop.
                 let ring = kv_ring_wanted(cfg, ec);
                 // Route through the shared q8-aware helper (the dense placement path already does),
@@ -2113,15 +2553,6 @@ pub(crate) fn vulkan_moe_binder<'a>(
             }
         }
     }
-    // The layer index of a `blk.{l}.…_exps…` tensor name.
-    let exps_layer = |name: &str| -> Option<usize> {
-        if !name.contains("_exps") {
-            return None;
-        }
-        name.strip_prefix("blk.")
-            .and_then(|r| r.split('.').next())
-            .and_then(|l| l.parse::<usize>().ok())
-    };
     // A FUSED gate_up bank pages under `Role::Gate` (one double-width slot per expert; the model
     // then has no `Role::Up` sources at all) — see `infr_vulkan::pager`'s MoE-session doc.
     let moe_role_of = |name: &str| -> Option<infr_vulkan::pager::Role> {
@@ -2294,10 +2725,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
     //      VRAM; otherwise stream with budget = remaining VRAM after resident-weights+KV+reserve.
     //      An explicit oversized INFR_CTX whose KV can't sit beside resident weights falls back
     //      to streaming the same way (never clamped here — the ctx the caller asked for is kept).
-    // Streamable = the per-layer Linear projection groups whose dtype has offset-capable native
-    // kernels (`native_dense_supported`, F16/F32 excluded — `matmul_proj`/`linear_f32` take no
-    // weight offset) and whose bytes upload unmodified from the mmap (the qwen2 NEOX q/k row
-    // permute rewrites bytes at load, so those tensors stay resident).
+    // Streamable = the per-layer Linear projection groups whose dtype the streamed dispatch reads
+    // from an arena slot (`dense_stream_supported`: every native format, plus F16/F32, which run
+    // the resident float kernels at the slot's address) and whose bytes upload unmodified from the
+    // mmap (the qwen2 NEOX q/k row permute rewrites bytes at load, so those tensors stay resident).
     let mut dense_plan: std::collections::HashMap<String, (usize, u32, Vec<String>)> =
         std::collections::HashMap::new();
     // The tier BELOW VRAM, one entry per dense pool (empty = none: every miss reads the mmap).
@@ -2338,15 +2769,15 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
         let tinfo = |n: &str| g.tensors().iter().find(|t| t.name == n);
         // Eligible groups with their (dtype, raw bytes, numel) — a group whose tensors are
-        // missing (DeltaNet layers, gemma4 V-less layers) or whose dtype lacks offset-capable
-        // kernels simply stays resident.
+        // missing (DeltaNet layers, gemma4 V-less layers) or whose dtype has no arena-addressed
+        // dispatch simply stays resident.
         let eligible: Vec<(Vec<String>, infr_core::DType, usize, usize)> = groups
             .into_iter()
             .filter_map(|comps| {
                 let infos: Vec<_> = comps.iter().map(|n| tinfo(n)).collect::<Option<_>>()?;
                 let dt = infos[0].dtype;
                 if !infos.iter().all(|t| t.dtype == dt)
-                    || !infr_vulkan::linear::native_dense_supported(dt)
+                    || !infr_vulkan::linear::dense_stream_supported(dt)
                 {
                     return None;
                 }
@@ -2366,7 +2797,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         let vram = vk.vram();
         // The per-side KV formats a chunk/format candidate prices: `q8` = BOTH sides Q8_0 (34
         // bytes / 32 elems), false = f16 (2 B/elem). Per-layer rows ring at window+ubatch rows
-        // (see `kv_rows`) — what lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its
+        // (see `kv_rows_at`) — what lets a mostly-SWA model (gemma-4-31B: 50/60 layers SWA) price its
         // KV small enough to take the try-resident tier at real contexts instead of streaming.
         let kv_fmts = |q8: bool| {
             let side = if q8 { DType::Q8_0 } else { DType::F16 };
@@ -2439,7 +2870,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
         if !resident
             && cache_override.is_none()
             && !kv_auto_q8()
-            && kv_unset(ec)
+            && kv_unset(cfg, ec)
             && kv_q8_layout_ok(cfg)
         {
             let (k, v) = kv_fmts(true);
@@ -2462,24 +2893,14 @@ pub(crate) fn vulkan_moe_binder<'a>(
                 }
             }
         }
-        // Slot stride: the group's raw bytes padded to a whole number of quant blocks AND
-        // u32 words, so every slot base is block-aligned (the kernels' element-offset weight
-        // addressing needs `slot_byte_base = whole blocks`) and the arena binds as
-        // `array<u32>`. Hoisted above the budget decision so the streaming-chunk sweep below
-        // can price the full-arena need with the exact strides the pools use.
-        let lcm = |a: usize, b: usize| {
-            let gcd = {
-                let (mut x, mut y) = (a, b);
-                while y != 0 {
-                    (x, y) = (y, x % y);
-                }
-                x
-            };
-            a / gcd * b
-        };
-        let stride_of = |dt: infr_core::DType, raw: usize| {
-            raw.next_multiple_of(lcm(infr_gguf::block_layout(dt).1, 4))
-        };
+        // Slot stride (`dense_stream_slot_stride`): the group's raw bytes padded to a whole
+        // number of quant blocks AND to the dtype's slot alignment (u32 words for the native
+        // kernels, the resident arena's placement for the float ones), so every slot base is
+        // block-aligned (the kernels' element-offset weight addressing needs `slot_byte_base =
+        // whole blocks`) and the arena reads as `array<u32>`. Hoisted above the budget decision
+        // so the streaming-chunk sweep below can price the full-arena need with the exact
+        // strides the pools use.
+        let stride_of = infr_vulkan::linear::dense_stream_slot_stride;
         let budget = match cache_override {
             Some(spec) => Some(spec.resolve(vram.available)),
             None if resident => None,
@@ -2562,7 +2983,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
             let specs: Vec<infr_vulkan::pager::DensePoolSpec> = pools
                 .iter()
                 .enumerate()
-                .map(|(i, &(_, stride, nb))| {
+                .map(|(i, &(dtype, stride, nb))| {
                     // Proportional budget split (byte share == access share: every block is read
                     // exactly once per sweep). Floor 2 slots so the next block's upload can
                     // overlap the previous block's dispatch instead of serializing on one slot.
@@ -2577,6 +2998,7 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     let floor = 2.min(nb).max(1);
                     let budget_slots = ((share / stride as u64) as usize).clamp(floor, nb);
                     infr_vulkan::pager::DensePoolSpec {
+                        dtype,
                         slot_bytes: stride,
                         n_slots: budget_slots,
                         n_blocks: nb,
@@ -2631,7 +3053,12 @@ pub(crate) fn vulkan_moe_binder<'a>(
         }
     }
 
-    let release_pages = ec.paging.release_uploaded_pages;
+    // A resident weight's mapped pages are released once its bytes are in VRAM. Not on a
+    // unified-memory device: there the "VRAM" is host RAM, and nothing has been measured to say
+    // releasing the source pages is worth a refault there.
+    let releaser =
+        (ec.paging.release_uploaded && !vk.capabilities().unified_memory).then(PageReleaser::new);
+
     Ok(Box::new(move |name, tb, dt, numel| {
         // Raw upload for EVERY dtype — the file's bytes go straight to VRAM (u32-padded) and the
         // kernel reads/dequants the native dtype in-shader. F16 → f16 coopmat GEMM / f16 GEMV;
@@ -2651,6 +3078,9 @@ pub(crate) fn vulkan_moe_binder<'a>(
         // guard between this plan's group enumeration and the runner's actual upload grouping
         // (`fuse_*_decision` keeps them aligned; a mismatch here is a bug, caught loudly).
         if let Some((pool, block_id, comps)) = dense_plan.get(name) {
+            // The same u32 element cap the resident upload below applies: a streamed group runs
+            // the same kernels, and the float ones index their weight in u32 elements.
+            check_bda_element_cap(name, "tensor", numel)?;
             // With a host tier under this pool, the group's bytes are read from the model file on
             // demand instead of faulted in through the mmap. `file_ranges` is `None` exactly for
             // bytes the loader REWROTE, which correspond to nothing on disk — those keep the mmap
@@ -2674,18 +3104,10 @@ pub(crate) fn vulkan_moe_binder<'a>(
                     let segments: Vec<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>> = comps
                         .iter()
                         .map(|c| {
-                            // GGUF preserves zero-copy mmap segments.
-                            if let Some(gg) = g.as_any().downcast_ref::<infr_gguf::Gguf>() {
-                                Ok(std::sync::Arc::new(
-                                    gg.tensor_bytes_arc(c).map_err(|e| anyhow!("{e}"))?,
-                                )
-                                    as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
-                            } else {
-                                Ok(std::sync::Arc::new(
-                                    g.tensor_bytes(c).map_err(|e| anyhow!("{e}"))?.to_vec(),
-                                )
-                                    as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
-                            }
+                            Ok(std::sync::Arc::new(
+                                g.tensor_bytes_arc(c).map_err(|e| anyhow!("{e}"))?,
+                            )
+                                as std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>)
                         })
                         .collect::<AResult<_>>()?;
                     let total = segments.iter().map(|s| s.as_ref().as_ref().len()).sum();
@@ -2816,11 +3238,105 @@ pub(crate) fn vulkan_moe_binder<'a>(
             .map_err(|e| anyhow!("{e}"))?;
         drop(padded);
         drop(bytes);
-        if release_pages {
-            tb.release_pages();
+        if let Some(r) = &releaser {
+            r.release(name, tb);
         }
         Ok((buf, dt))
     }))
+}
+
+/// Hands the mapped pages of weights that now live in VRAM back to the OS file cache
+/// (`paging.release_uploaded`), on a thread of its own so the trim stays off the load's critical
+/// path. Measured on Windows (2026-11-16): about 0.3 s for the 3.46 GB LFM3-1.7B F16 file
+/// inline, against an 8 s load. Dropping it closes the queue and joins the thread, which by then
+/// (the binder lives for the whole first generation) has long finished.
+///
+/// Only the resident upload path sends weights here: a paged or streamed weight is read through
+/// the mapping again on every miss, so its pages are the pager's to keep. `Owned` bytes have
+/// nothing to release: they are a load-time rewrite with no mapped form, and the source pages that
+/// rewrite read are not tracked. A host reader that touches a released weight later (a CPU leg on
+/// the same model, the host embedding gather) faults it back in once and keeps it until a later
+/// binder for the same model uploads, and so releases, that weight again.
+struct PageReleaser {
+    tx: Option<std::sync::mpsc::Sender<(String, Vec<TensorBytes>)>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PageReleaser {
+    /// Start the release thread; if the OS refuses one, releases happen inline on the caller.
+    fn new() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<(String, Vec<TensorBytes>)>();
+        match std::thread::Builder::new()
+            .name("infr-release-mapped".into())
+            .spawn(move || {
+                for (name, views) in rx {
+                    release_mapped_pages(&name, &views);
+                }
+            }) {
+            Ok(thread) => Self {
+                tx: Some(tx),
+                thread: Some(thread),
+            },
+            Err(e) => {
+                tracing::debug!("no thread for releasing mapped pages, releasing inline: {e}");
+                Self {
+                    tx: None,
+                    thread: None,
+                }
+            }
+        }
+    }
+
+    /// Queue `tb`'s mapped views for release (or release them now, without a thread).
+    fn release(&self, name: &str, tb: WBytes) {
+        let views = match tb {
+            WBytes::Mmap(t) => vec![t],
+            WBytes::Concat(parts) => parts,
+            WBytes::Owned(_) => return,
+        };
+        match &self.tx {
+            // A send fails only once the thread is gone, which takes a panic in it; the views come
+            // back in the error and are released here instead.
+            Some(tx) => {
+                if let Err(std::sync::mpsc::SendError((name, views))) =
+                    tx.send((name.to_owned(), views))
+                {
+                    release_mapped_pages(&name, &views);
+                }
+            }
+            None => release_mapped_pages(name, &views),
+        }
+    }
+}
+
+impl Drop for PageReleaser {
+    fn drop(&mut self) {
+        drop(self.tx.take());
+        if let Some(t) = self.thread.take() {
+            if t.join().is_err() {
+                tracing::warn!("the mapped-page release thread panicked");
+            }
+        }
+    }
+}
+
+/// Release one weight's mapped views (see [`PageReleaser`]). A release that fails costs host
+/// memory, never correctness, so it is logged rather than failing the load; an unsupported
+/// platform is logged once per weight at debug level.
+fn release_mapped_pages(name: &str, views: &[TensorBytes]) {
+    for v in views {
+        match v.release_resident() {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                tracing::debug!("{name}: mapped pages kept resident: {e}");
+                return;
+            }
+            Err(e) => {
+                tracing::warn!("{name}: releasing its mapped pages after the upload failed: {e}");
+                return;
+            }
+        }
+    }
 }
 
 /// Open one Vulkan backend per physical device index (the shared front of every multi-GPU
@@ -2853,9 +3369,10 @@ fn dense_multi_gpu_guard(cfg: &Config, label: &str) -> AResult<()> {
             "{label} supports dense models only; this is an MoE model — use INFR_EXPERT_PARALLEL"
         ));
     }
-    if cfg.qwen35 {
+    if cfg.has_recurrent_state() {
         return Err(anyhow!(
-            "{label} does not support qwen35 (DeltaNet recurrent-state placement is a separate slice)"
+            "{label} does not support recurrent-state layers (qwen35 DeltaNet, LFM short \
+             convolution); their placement is a separate slice"
         ));
     }
     if cfg.n_embd_per_layer > 0 {
@@ -2872,11 +3389,12 @@ fn dense_multi_gpu_guard(cfg: &Config, label: &str) -> AResult<()> {
 /// Drive `generate_dense_backend` as a ONE-SHOT (single conversation, no slot pool): fresh `None`
 /// state, `want_ctx = prompt + max_new + 1`, and the eight trailing hooks (constraint / verify /
 /// verify_ids / logits_out / h_out / denoise_req / req) all unused. The shared tail of the
-/// multi-GPU `generate_*` wrappers.
+/// multi-GPU `generate_*` wrappers, run inside [`backend_chunk_scope`] so the prefill chunk is
+/// sized for `be`'s devices.
 fn run_dense_oneshot(
     be: &dyn Backend,
     bind: &BindWeight<'_>,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -2885,6 +3403,7 @@ fn run_dense_oneshot(
     max_new: usize,
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
+    let _chunk = backend_chunk_scope(&be.capabilities());
     generate_dense_backend(
         be,
         bind,
@@ -2957,7 +3476,7 @@ fn pipeline_binder<'a>(pb: &'a infr_vulkan::PipelineBackend) -> Box<BindWeight<'
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_vulkan_pipeline(
     devices: &[usize],
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3030,7 +3549,10 @@ fn tp_weight_role(name: &str, cfg: &Config) -> Option<(infr_vulkan::TpRole, usiz
         .and_then(|r| r.split('.').next())
         .and_then(|s| s.parse::<usize>().ok());
     let l = layer?;
-    let after = name.rsplit('.').nth(1)?; // e.g. "attn_q" from "blk.3.attn_q.weight"
+    // Only a projection MATRIX is sharded. Its bias (qwen2's `attn_q.bias`) shares the projection
+    // name, but it is a 1-D vector the column slicer cannot cut by rows; biases are replicated.
+    // e.g. "attn_q" from "blk.3.attn_q.weight"
+    let after = name.strip_suffix(".weight")?.rsplit('.').next()?;
     let ne = cfg.n_embd;
     let qrow = cfg.n_head * cfg.layer_head_dim(l);
     let nff = cfg.layer_n_ff(l);
@@ -3041,6 +3563,21 @@ fn tp_weight_role(name: &str, cfg: &Config) -> Option<(infr_vulkan::TpRole, usiz
         "ffn_down" => Some((infr_vulkan::TpRole::Row, nff)),
         _ => None, // attn_norm/ffn_norm/q_norm/k_norm/biases → replicated
     }
+}
+
+/// Refuse a model with q/k/v projection biases under tensor parallelism. Each rank computes only
+/// its band of the column-sharded projection, and the TP lowering has no sharded `Op::AddBias`
+/// to add the matching band of a replicated bias (it refuses an elementwise op on a sharded
+/// tensor) — so say which model feature is missing rather than fail in the lowering.
+fn tp_bias_guard(cfg: &Config) -> AResult<()> {
+    if cfg.qkv_bias {
+        return Err(anyhow!(
+            "INFR_TENSOR_PARALLEL does not support attention q/k/v projection biases \
+             (attn_q/attn_k/attn_v.bias, e.g. qwen2): sharding their projections needs a sharded \
+             bias add — run this model on one device or with INFR_PIPELINE"
+        ));
+    }
+    Ok(())
 }
 
 /// Column slice: rank `r` of `world` takes the contiguous output-row band
@@ -3176,7 +3713,7 @@ fn tensor_parallel_binder<'a>(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_vulkan_tp(
     devices: &[usize],
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3186,6 +3723,7 @@ pub(crate) fn generate_dense_vulkan_tp(
     on_token: impl FnMut(u32),
 ) -> AResult<(Vec<u32>, GenStats)> {
     dense_multi_gpu_guard(cfg, "INFR_TENSOR_PARALLEL")?;
+    tp_bias_guard(cfg)?;
     let backends = open_vulkan_devices(devices, ec)?;
     let names = backends
         .iter()
@@ -3293,7 +3831,7 @@ fn expert_parallel_binder<'a>(
                     .map_err(|e| anyhow!("{e}"))?;
                 bufs.push(buf);
             }
-            Ok((infr_vulkan::EpBuffer::wrap(bufs), dt))
+            Ok((infr_vulkan::EpBuffer::shard(bufs), dt))
         } else {
             // Replicated: the full padded tensor on every rank. Mirror the resident binder's
             // per-expert-slice / chunk-covered / whole-tensor element-cap policy for non-bank
@@ -3321,24 +3859,9 @@ fn expert_parallel_binder<'a>(
     })
 }
 
-/// Multi-GPU EXPERT-PARALLEL (MoE) generation — the model's experts are split across the `devices`
-/// (rank `r` owns experts `[r·E/W, (r+1)·E/W)`), the router + attention + norms run replicated on
-/// every rank, each rank computes only its band's experts, and one P2P all-reduce per MoE layer
-/// combines the partial expert outputs. The output equals the single-device MoE to reduction-order
-/// tolerance (token-identical greedy). qwen3moe (split gate/up, softmax, no shared expert) in v1.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn generate_moe_vulkan_ep(
-    devices: &[usize],
-    g: &dyn WeightSource,
-    cfg: &Config,
-    ec: &EngineConfig,
-    token_embd: TokenEmbd<'_>,
-    ple: Option<&PerLayerEmbd>,
-    prompt: &[u32],
-    max_new: usize,
-    on_token: impl FnMut(u32),
-) -> AResult<(Vec<u32>, GenStats)> {
+/// The architectures expert parallelism refuses, checked before any device is opened. Returns the
+/// model's routed-expert config, which EP requires.
+fn expert_parallel_guard(cfg: &Config) -> AResult<&crate::MoeConfig> {
     let Some(moe) = cfg.moe.as_ref() else {
         return Err(anyhow!(
             "INFR_EXPERT_PARALLEL needs a routed-expert (MoE) model — this is a dense model (use \
@@ -3368,6 +3891,37 @@ pub(crate) fn generate_moe_vulkan_ep(
             "INFR_EXPERT_PARALLEL does not support diffusion-gemma"
         ));
     }
+    // The dual dense ∥ MoE FFN (gemma4 26B-A4B): its dense branch is computed before the MoE op
+    // and summed after it, across the cut EP makes there, and its per-expert down scale is
+    // indexed by the band-local expert id. Neither is carried by the EP lowering.
+    if cfg.dual_moe() {
+        return Err(anyhow!(
+            "INFR_EXPERT_PARALLEL does not support gemma4 MoE (the dual dense + MoE FFN with a \
+             per-expert down scale) — run it on one device"
+        ));
+    }
+    Ok(moe)
+}
+
+/// Multi-GPU EXPERT-PARALLEL (MoE) generation — the model's experts are split across the `devices`
+/// (rank `r` owns experts `[r·E/W, (r+1)·E/W)`), the router + attention + norms run replicated on
+/// every rank, each rank computes only its band's experts, and one P2P all-reduce per MoE layer
+/// combines the partial expert outputs. The output equals the single-device MoE to reduction-order
+/// tolerance (token-identical greedy). qwen3moe (split gate/up, softmax, no shared expert) in v1.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn generate_moe_vulkan_ep(
+    devices: &[usize],
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+) -> AResult<(Vec<u32>, GenStats)> {
+    let moe = expert_parallel_guard(cfg)?;
     let backends = open_vulkan_devices(devices, ec)?;
     let names = backends
         .iter()
@@ -3410,7 +3964,7 @@ pub(crate) fn generate_moe_vulkan_ep(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_metal(
     mtl: &infr_metal::MetalBackend,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3445,7 +3999,7 @@ pub(crate) fn generate_dense_metal(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_metal_session(
     mtl: &infr_metal::MetalBackend,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3491,7 +4045,7 @@ pub(crate) fn generate_dense_metal_session(
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_metal2(
     mtl: &infr_metal::MetalBackend,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3531,16 +4085,13 @@ pub(crate) fn verify_dense_metal2(
 /// token discarded) — MoE-compatible, unlike the batched `verify` path.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_cpu(
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &std::sync::Arc<EngineConfig>,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<Vec<f32>> {
-    if cfg.qwen4_exp.is_some() || g.as_any().is::<crate::qwen4_exp_source::Qwen4ExpSource>() {
-        return crate::qwen4_exp_cpu::verify(g, tokens, false).map(|(logits, _)| logits);
-    }
     let cpu_be = CpuBackend::new_with(ec.clone());
     let mut logits = Vec::new();
     let mut state = None;
@@ -3574,16 +4125,13 @@ pub(crate) fn verify_dense_cpu(
 /// Returns `(logits, h)`, both `[vocab]`/`[n_embd]` for the last prompt token.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_cpu_with_h(
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &std::sync::Arc<EngineConfig>,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<(Vec<f32>, Vec<f32>)> {
-    if cfg.qwen4_exp.is_some() || g.as_any().is::<crate::qwen4_exp_source::Qwen4ExpSource>() {
-        return crate::qwen4_exp_cpu::verify(g, tokens, false);
-    }
     let cpu_be = CpuBackend::new_with(ec.clone());
     let mut logits = Vec::new();
     let mut h = Vec::new();
@@ -3620,16 +4168,13 @@ pub(crate) fn verify_dense_cpu_with_h(
 /// `(logits [tokens.len()*vocab], h [tokens.len()*n_embd])`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_rows_cpu_with_h(
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &std::sync::Arc<EngineConfig>,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
 ) -> AResult<(Vec<f32>, Vec<f32>)> {
-    if cfg.qwen4_exp.is_some() || g.as_any().is::<crate::qwen4_exp_source::Qwen4ExpSource>() {
-        return crate::qwen4_exp_cpu::verify(g, tokens, true);
-    }
     let cpu_be = CpuBackend::new_with(ec.clone());
     let mut logits = Vec::new();
     let mut h = Vec::new();
@@ -3658,12 +4203,27 @@ pub(crate) fn verify_rows_cpu_with_h(
     Ok((logits, h))
 }
 
+/// The Vulkan binder the one-shot verify forwards share: pad each weight to a 4-byte multiple and
+/// upload it.
+fn vulkan_upload_bind(vk: &infr_vulkan::VulkanBackend) -> Box<BindWeight<'_>> {
+    Box::new(move |_name, tb, dt, _n| {
+        let bytes = tb.materialize();
+        let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
+        let buf = vk
+            .alloc(padded.len(), BufferUsage::Weights)
+            .map_err(|e| anyhow!("{e}"))?;
+        vk.upload(buf.as_ref(), &padded)
+            .map_err(|e| anyhow!("{e}"))?;
+        Ok((buf, dt))
+    })
+}
+
 /// [`verify_dense_cpu`]'s Vulkan twin — the same one-shot causal prefill through the production
 /// Vulkan seam, for the CPU/Vulkan cross-backend parity check.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn verify_dense_vulkan(
     vk: &infr_vulkan::VulkanBackend,
-    g: &dyn WeightSource,
+    g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
@@ -3674,16 +4234,7 @@ pub(crate) fn verify_dense_vulkan(
     let mut state = None;
     generate_dense_backend(
         vk,
-        &|_name, tb, dt, _n| {
-            let bytes = tb.materialize();
-            let padded = infr_vulkan::linear::pad_to_u32_align(&bytes);
-            let buf = vk
-                .alloc(padded.len(), BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            vk.upload(buf.as_ref(), &padded)
-                .map_err(|e| anyhow!("{e}"))?;
-            Ok((buf, dt))
-        },
+        &vulkan_upload_bind(vk),
         g,
         cfg,
         ec,
@@ -3705,27 +4256,25 @@ pub(crate) fn verify_dense_vulkan(
     Ok(logits)
 }
 
-/// Logits for rows `from..tokens.len()` of `tokens`, extending whatever `state` already holds as a
-/// prefix. Call with [`SeamKv::reset`] first for a fresh window, then with growing prefixes to walk
-/// it in bounded pieces.
-#[allow(clippy::too_many_arguments)]
+/// [`verify_rows_cpu_with_h`]'s Vulkan twin without the `h` rows: one batched forward of every
+/// token through the production Vulkan seam, returning `[tokens.len() * vocab]` logits — the
+/// all-positions shape a next-token accuracy comparison against the CPU reference needs. Dense
+/// non-MoE models only, as the VERIFY branch it rides.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn window_logits_rows(
-    be: &dyn Backend,
-    bind: &BindWeight<'_>,
-    g: &dyn WeightSource,
+pub(crate) fn verify_rows_vulkan(
+    vk: &infr_vulkan::VulkanBackend,
+    g: &Gguf,
     cfg: &Config,
     ec: &EngineConfig,
     token_embd: TokenEmbd<'_>,
     ple: Option<&PerLayerEmbd>,
     tokens: &[u32],
-    state: &mut Option<SeamKv>,
-    want_ctx: usize,
 ) -> AResult<Vec<f32>> {
     let mut logits = Vec::new();
+    let mut state = None;
     generate_dense_backend(
-        be,
-        bind,
+        vk,
+        &vulkan_upload_bind(vk),
         g,
         cfg,
         ec,
@@ -3734,8 +4283,8 @@ pub(crate) fn window_logits_rows(
         tokens,
         0,
         |_| {},
-        state,
-        want_ctx,
+        &mut state,
+        tokens.len() + 2,
         None,
         Some(&mut logits),
         None,
@@ -3792,16 +4341,6 @@ impl WBytes {
         }
     }
 
-    /// Drop the mapped components' host pages (see `TensorBytes::release_pages`); owned bytes are
-    /// untouched.
-    pub(crate) fn release_pages(&self) {
-        match self {
-            WBytes::Mmap(tb) => tb.release_pages(),
-            WBytes::Concat(parts) => parts.iter().for_each(|p| p.release_pages()),
-            WBytes::Owned(_) => {}
-        }
-    }
-
     /// The bytes themselves. Borrowed for a single mapped tensor or an owned buffer; a `Concat` is
     /// joined HERE, so the cost lands on the binders that genuinely need the bytes and on no one
     /// else.
@@ -3824,8 +4363,7 @@ impl WBytes {
 /// GPU binder may convert float weights to f16), so the graph declares the handle to match. The
 /// tensor NAME lets a binder place specific tensors differently (the Vulkan binder puts
 /// auto-fit-offloaded MoE expert banks in host-visible memory instead of VRAM).
-pub(crate) type BindWeight<'a> =
-    dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
+type BindWeight<'a> = dyn Fn(&str, WBytes, DType, usize) -> AResult<(Box<dyn Buffer>, DType)> + 'a;
 
 /// Persistent per-session seam state: the uploaded weights, the KV cache (sized to `max_ctx`
 /// once), the per-step IO buffers, and the token ids currently MATERIALIZED in the cache. A caller
@@ -3872,39 +4410,10 @@ pub(crate) use infr_core::budget::kv_fmt_bytes;
 /// Returns `pl_tok_scaled[r][l*npl+j] = per_layer_tok_embd[tok_r][l*npl+j] * √npl`, `[rows,
 /// n_layer*npl]` row-major — uploaded to `ipl_buf` and bound to the graph Input `pl_tok_in`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn e2b_ipl_rows(
-    g: &dyn WeightSource,
-    ple: &PerLayerEmbd,
-    tokens: &[u32],
-) -> AResult<Vec<f32>> {
+fn e2b_ipl_rows(g: &Gguf, ple: &PerLayerEmbd, tokens: &[u32]) -> AResult<Vec<f32>> {
     use rayon::prelude::*;
     let (npl, nl) = (ple.npl, ple.n_layer);
     let sqrt_npl = (npl as f32).sqrt();
-    // Both row-only EXL3 and ordinary GGUF embeddings use PAD (id 0) at image positions.
-    let tokens = if tokens.iter().any(|&tok| crate::media::is_media_id(tok)) {
-        std::borrow::Cow::Owned(
-            tokens
-                .iter()
-                .map(|&tok| {
-                    if crate::media::is_media_id(tok) {
-                        0
-                    } else {
-                        tok
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        std::borrow::Cow::Borrowed(tokens)
-    };
-    if let Some(mut rows) = g.tensor_rows("per_layer_token_embd.weight", &tokens)? {
-        anyhow::ensure!(
-            rows.len() == tokens.len() * nl * npl,
-            "per-layer lookup returned incorrect row length"
-        );
-        scale_embedding_rows(g, &mut rows, sqrt_npl, false)?;
-        return Ok(rows);
-    }
     let te_bytes = g
         .tensor_bytes("per_layer_token_embd.weight")
         .map_err(|e| anyhow!("{e}"))?;
@@ -3927,34 +4436,18 @@ pub(crate) fn e2b_ipl_rows(
     Ok(out)
 }
 
-/// Longest provably reusable KV prefix. Image ids are compact tags, not collision-proof
-/// identities: stop before any image row, even for equal tags. The vision encoder separately
-/// caches by exact image bytes; text-only prefix reuse is unchanged.
+/// Longest shared prefix of the cached tokens and the new prompt (the KV rows that stay valid).
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
-    a.iter()
-        .zip(b)
-        .take_while(|(x, y)| x == y && !crate::media::is_media_id(**x))
-        .count()
-}
-
-#[cfg(test)]
-mod media_prefix_tests {
-    #[test]
-    fn image_tags_never_authorize_kv_reuse() {
-        let tag = crate::media::MEDIA_ID_BASE | 17;
-        assert_eq!(
-            super::common_prefix_len(&[1, 2, tag, 3], &[1, 2, tag, 3]),
-            2
-        );
-        assert_eq!(super::common_prefix_len(&[tag], &[tag]), 0);
-        assert_eq!(super::common_prefix_len(&[1, 2, 3], &[1, 2, 4]), 2);
-    }
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
 }
 
 #[cfg(test)]
 mod bda_cap_tests {
-    use super::{check_bda_element_cap, chunk_covered_dense_tensor, BDA_ELEMENT_UNIT_MAX};
+    use super::{
+        check_bda_element_cap, chunk_covered_dense_tensor, expert_parallel_guard, tp_bias_guard,
+        tp_weight_role, Config, BDA_ELEMENT_UNIT_MAX,
+    };
 
     #[test]
     fn chunk_covered_names_are_exactly_lm_head_and_embed() {
@@ -4023,6 +4516,87 @@ mod bda_cap_tests {
         .expect("resident expert bank per-slice must pass");
     }
 
+    /// Tensor parallelism shards projection MATRICES only. qwen2's q/k/v biases share their
+    /// projection's name but are 1-D, so classifying them as column-parallel sent them to the
+    /// row slicer and failed with a slice-geometry error; they are replicated, and a model that
+    /// has them is refused up front by name.
+    #[test]
+    fn tp_shards_projection_weights_and_refuses_qkv_biases() {
+        let cfg = Config {
+            n_layer: 1,
+            n_head: 2,
+            head_dim: 4,
+            n_embd: 8,
+            n_ff: 16,
+            qkv_bias: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            tp_weight_role("blk.0.attn_q.weight", &cfg),
+            Some((infr_vulkan::TpRole::Column, 8))
+        ));
+        assert!(matches!(
+            tp_weight_role("blk.0.attn_output.weight", &cfg),
+            Some((infr_vulkan::TpRole::Row, 8))
+        ));
+        for bias in [
+            "blk.0.attn_q.bias",
+            "blk.0.attn_k.bias",
+            "blk.0.attn_v.bias",
+        ] {
+            assert!(
+                tp_weight_role(bias, &cfg).is_none(),
+                "{bias} must be replicated"
+            );
+        }
+        let err = tp_bias_guard(&cfg).expect_err("q/k/v biases must be refused under TP");
+        assert!(
+            err.to_string().starts_with(
+                "INFR_TENSOR_PARALLEL does not support attention q/k/v projection biases"
+            ),
+            "{err}"
+        );
+        tp_bias_guard(&Config {
+            qkv_bias: false,
+            ..cfg
+        })
+        .expect("a bias-free model is not refused");
+    }
+
+    /// gemma4 MoE's dense branch is computed before the MoE op and summed after it, across the cut
+    /// expert parallelism makes there, and its per-expert down scale is indexed by the band-local
+    /// expert id: both wrong under EP, so it is refused by name before any device is opened.
+    #[test]
+    fn expert_parallel_refuses_the_dual_moe_ffn() {
+        let moe = crate::MoeConfig {
+            n_expert: 4,
+            n_used: 1,
+            n_ff_exp: 16,
+            scale: 1.0,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+        };
+        let qwen3moe = Config {
+            n_layer: 1,
+            moe: Some(moe),
+            ..Default::default()
+        };
+        expert_parallel_guard(&qwen3moe).expect("routed-only MoE is EP's own case");
+        let gemma4_moe = Config {
+            gemma4_moe: true,
+            ..qwen3moe
+        };
+        let err = expert_parallel_guard(&gemma4_moe).expect_err("gemma4 MoE must be refused");
+        assert!(
+            err.to_string()
+                .starts_with("INFR_EXPERT_PARALLEL does not support gemma4 MoE"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn tp_pipeline_cap_exempts_chunk_covered_enforces_others() {
         // The TP and pipeline binders now gate the whole-tensor cap on `!chunk_covered_dense_tensor`
@@ -4049,7 +4623,30 @@ mod bda_cap_tests {
 
 #[cfg(test)]
 mod seam_helper_tests {
-    use super::{kv_pair_bytes, Config, DType, EngineConfig, PlacementPins, PlacementScope};
+    use super::{
+        cpu_repack_reserve, kv_pair_bytes, Config, DType, EngineConfig, PlacementPins,
+        PlacementScope,
+    };
+
+    /// Whether this process's default prefill chunk is the discrete one these tests assert. The
+    /// device class is process-global and published by the first Vulkan backend any test in this
+    /// binary opens, so a GPU run on an integrated device (`INFR_DEV` naming one) moves the
+    /// default for every test after it. Such a run skips them, saying why on the harness's own
+    /// stderr; a CPU-only or discrete run checks them.
+    fn default_chunk_is_discrete(test: &str) -> bool {
+        use std::io::Write;
+        match infr_vulkan::device_class() {
+            Some(d) if d.integrated => {
+                let _ = writeln!(
+                    std::io::stderr().lock(),
+                    "skip: {test} asserts the discrete default prefill chunk, and this process \
+                     opened an integrated GPU"
+                );
+                false
+            }
+            _ => true,
+        }
+    }
 
     // NB: `parse_device_spec`'s own cases moved to `infr_core::config::tests` with the function
     // (this crate's duplicate of that grammar was deleted).
@@ -4060,6 +4657,9 @@ mod seam_helper_tests {
     /// placement sweeps. Collapsing them onto `Option::is_some` would silently re-enable the sweep.
     #[test]
     fn ubatch_value_and_presence_are_separate_readers() {
+        if !default_chunk_is_discrete("ubatch_value_and_presence_are_separate_readers") {
+            return;
+        }
         // Own scope: the fallback pins are process-global, and this test asserts the UNPINNED
         // default. (That this is even possible per-scope is the point of `PlacementPins`.)
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
@@ -4108,7 +4708,7 @@ mod seam_helper_tests {
     fn kv_specified_beats_a_parsed_dtype() {
         let unset = EngineConfig::default();
         assert!(
-            super::kv_unset(&unset),
+            super::kv_unset(&Config::default(), &unset),
             "nothing supplied ⇒ auto-q8 may fill"
         );
 
@@ -4122,7 +4722,7 @@ mod seam_helper_tests {
             ..Default::default()
         };
         assert!(
-            !super::kv_unset(&nonsense),
+            !super::kv_unset(&Config::default(), &nonsense),
             "an unparseable name still counts as an explicit choice"
         );
 
@@ -4134,7 +4734,7 @@ mod seam_helper_tests {
             },
             ..Default::default()
         };
-        assert!(!super::kv_unset(&q8));
+        assert!(!super::kv_unset(&Config::default(), &q8));
     }
 
     #[test]
@@ -4219,6 +4819,32 @@ mod seam_helper_tests {
     /// under-reserving by exactly 1.5x, with the context clamp and the resident-fit sweep computing
     /// off that.
     #[test]
+    fn the_cpu_repack_cache_is_priced_only_where_it_can_fill() {
+        let t = |name: &str, dtype| infr_core::loader::TensorInfo {
+            name: name.to_string(),
+            shape: vec![1],
+            dtype,
+            offset: 0,
+            nbytes: 1,
+        };
+        let ec = EngineConfig::default();
+        let budget = (ec.kernels.cpu.repack_mb as u64) << 20;
+        let fused = [t("blk.0.ffn_gate_up_exps.weight", DType::Q4K)];
+        assert_eq!(cpu_repack_reserve(&ec, &fused, true), budget);
+        assert_eq!(cpu_repack_reserve(&ec, &fused, false), 0, "no VNNI path");
+        let split = [
+            t("blk.0.ffn_gate_exps.weight", DType::Q4K),
+            t("blk.0.ffn_up_exps.weight", DType::Q4K),
+        ];
+        assert_eq!(cpu_repack_reserve(&ec, &split, true), 0, "split banks");
+        let q6 = [t("blk.0.ffn_gate_up_exps.weight", DType::Q6K)];
+        assert_eq!(cpu_repack_reserve(&ec, &q6, true), 0, "not Q4_K");
+        let mut small = EngineConfig::default();
+        small.kernels.cpu.repack_mb = 7;
+        assert_eq!(cpu_repack_reserve(&small, &fused, true), 7 << 20);
+    }
+
+    #[test]
     fn kv_bytes_estimate_prices_the_mla_row_it_allocates() {
         let cfg = deepseek_v2_lite_kv();
         let ec = EngineConfig::default();
@@ -4231,6 +4857,220 @@ mod seam_helper_tests {
         // The pre-fix pricing, spelled out: K+V at the head-dim product.
         let old = (cfg.n_layer * rows * 2 * (cfg.n_kv * cfg.head_dim) * 2) as u64;
         assert_eq!(est, old * 3 / 2, "the estimate was 1.5x short");
+    }
+
+    /// deepseek4 stores its K=V row once (`build_attn_mha(q, k_all, k_all, …)`), so the footprint
+    /// is the K side alone and the V side is the bindable placeholder. Pinned at the V4-Flash
+    /// geometry (`deepseek-ai/DeepSeek-V4-Flash` `config.json`: 43 layers, head dim 512, MQA,
+    /// window 128) from hand-computed byte counts; a V side priced like K doubles every figure.
+    #[test]
+    fn kv_footprint_of_deepseek4_is_the_k_side_alone() {
+        let cfg = Config {
+            n_layer: 43,
+            n_embd: 4096,
+            n_head: 64,
+            n_kv: 1,
+            head_dim: 512,
+            swa_window: 128,
+            deepseek4: true,
+            ..Default::default()
+        };
+        assert_eq!(super::kv_row_elems(&cfg, 0), (512, 0));
+        // Full context 4096: (4096 + 64 slop) rows x 512 elements x 2 bytes (f16) x 43 layers.
+        let full = super::kv_bytes_estimate_fmt(&cfg, 4096, false, 512, DType::F16, DType::F16);
+        assert_eq!(full, 183_173_120);
+        // Ring: min(4096, (128 + 512) rounded up to 64) + 64 = 704 rows per layer.
+        let ring = super::kv_bytes_estimate_fmt(&cfg, 4096, true, 512, DType::F16, DType::F16);
+        assert_eq!(ring, 30_998_528);
+        // The allocation: 4096 x 512 x 2 bytes of K, and the placeholder V (4 f16 elements).
+        let alloc =
+            super::kv_layer_alloc_bytes(&cfg, 0, 4096, false, 512, 1, DType::F16, DType::F16);
+        assert_eq!(alloc, (4_194_304, 8));
+    }
+
+    /// The V4-Flash footprint with its compressed tiers, from hand-computed byte counts at the
+    /// real file's geometry (`compress_ratios` `[0, 0, 4, 128, 4, 128, …, 4]` over 43 layers: 21
+    /// CSA, 20 HCA, 2 ratio-0; head dim 512, indexer key width 128, window 128) at a 4096-token
+    /// f16 context with full-context raw caches. A compressed buffer left out of the estimate,
+    /// sized at another row count or ring height, or priced in another dtype changes the total.
+    #[test]
+    fn kv_footprint_of_deepseek4_flash_counts_its_compressed_tiers() {
+        let ratios: Vec<usize> = (0..43)
+            .map(|l| match l {
+                0 | 1 => 0,
+                l if l % 2 == 0 => 4,
+                _ => 128,
+            })
+            .collect();
+        let cfg = Config {
+            n_layer: 43,
+            n_embd: 4096,
+            n_head: 64,
+            n_kv: 1,
+            head_dim: 512,
+            swa_window: 128,
+            indexer_head_size: 128,
+            compress_ratios: ratios,
+            deepseek4: true,
+            ..Default::default()
+        };
+        // An HCA layer: 4096/128 = 32 rows x 512 x 2 bytes of cache, and a ring of 128 rows x 512
+        // f32, kv and score.
+        let hca: Vec<usize> = super::dsv4_comp_bufs(&cfg, 3, 4096, DType::F16)
+            .iter()
+            .map(super::Dsv4CompBuf::bytes)
+            .collect();
+        assert_eq!(hca, [32_768, 262_144, 262_144]);
+        // A CSA layer: 4096/4 = 1024 rows x 512 x 2 bytes, a ring of 8 rows x 1024 f32 (kv,
+        // score); then the indexer's 1024 rows x 128 x 2 bytes and its ring of 8 rows x 256 f32.
+        let csa: Vec<usize> = super::dsv4_comp_bufs(&cfg, 2, 4096, DType::F16)
+            .iter()
+            .map(super::Dsv4CompBuf::bytes)
+            .collect();
+        assert_eq!(csa, [1_048_576, 32_768, 32_768, 262_144, 8_192, 8_192]);
+        assert!(super::dsv4_comp_bufs(&cfg, 1, 4096, DType::F16).is_empty());
+        // The raw caches as before (`kv_footprint_of_deepseek4_is_the_k_side_alone`: 183_173_120),
+        // plus 20 HCA layers x 557_056 = 11_141_120 and 21 CSA layers x 1_392_640 = 29_245_440.
+        let full = super::kv_bytes_estimate_fmt(&cfg, 4096, false, 512, DType::F16, DType::F16);
+        assert_eq!(full, 223_559_680);
+        // The pre-load floor lists each compressed buffer as an allocation of its own beside the
+        // layer's K/V pair: 43 pairs, 20 x 3 HCA buffers and 21 x 6 CSA ones.
+        let floor = super::kv_floor_alloc_bytes(
+            &cfg,
+            &EngineConfig::default(),
+            4096,
+            1,
+            DType::F16,
+            DType::F16,
+        );
+        assert_eq!(floor.len(), 43 + 20 * 3 + 21 * 6);
+    }
+
+    /// TurboQuant's 128-element groups must tile every V4 cache row, the compressed ones too: a
+    /// V4-Flash geometry passes, and the same geometry with a 64-wide indexer (an LID row of half a
+    /// group) does not, though its raw head would.
+    #[test]
+    fn kv_turbo_layout_holds_deepseek4_compressed_rows() {
+        let cfg = |indexer_head_size| Config {
+            n_layer: 3,
+            head_dim: 512,
+            indexer_head_size,
+            compress_ratios: vec![0, 4, 128],
+            deepseek4: true,
+            ..Default::default()
+        };
+        assert!(super::kv_turbo_align_ok(&cfg(128)));
+        assert!(!super::kv_turbo_align_ok(&cfg(64)));
+        let ratio0 = Config {
+            compress_ratios: vec![0, 0, 0],
+            ..cfg(64)
+        };
+        assert!(super::kv_turbo_align_ok(&ratio0));
+    }
+
+    /// deepseek4 has no V cache, so a V format setting must not gate anything for it: not the SWA
+    /// ring (`kv_ring_wanted`, `placement_ring`), not auto-q8 (`kv_unset`). The same settings on a
+    /// model with a real V cache keep gating, which is what shows the predicate is doing the work.
+    #[test]
+    fn v_kv_type_gates_nothing_for_deepseek4() {
+        let dsv4 = Config {
+            n_layer: 2,
+            n_kv: 1,
+            head_dim: 128,
+            swa_window: 128,
+            deepseek4: true,
+            ..Default::default()
+        };
+        let swa = Config {
+            deepseek4: false,
+            ..dsv4.clone()
+        };
+        let v_only = |dt| EngineConfig {
+            kv: infr_core::config::KvCfg {
+                type_v: Some(dt),
+                type_v_specified: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        for dt in [DType::Turbo3, DType::Q4_0, DType::F32] {
+            let ec = v_only(dt);
+            assert!(super::kv_ring_wanted(&dsv4, &ec), "{dt:?}: ring gated");
+            assert!(
+                super::placement_ring(&dsv4, &ec, DType::F16, dt),
+                "{dt:?}: placement ring gated"
+            );
+            assert_eq!(super::kv_v_fmt(&dsv4, DType::F16, dt), DType::F16);
+            assert!(super::kv_unset(&dsv4, &ec), "{dt:?}: auto-q8 suppressed");
+            // The control: a V cache that exists is gated by its format.
+            assert!(!super::kv_ring_wanted(&swa, &ec), "{dt:?}: control ring");
+            assert!(!super::placement_ring(&swa, &ec, DType::F16, dt));
+            assert_eq!(super::kv_v_fmt(&swa, DType::F16, dt), dt);
+            assert!(!super::kv_unset(&swa, &ec));
+        }
+    }
+
+    /// A recurrent layer's state does not grow with the context, so the estimate prices it at the
+    /// fixed size the runner allocates (`Config::recurrent_state_elems`), while an attention layer
+    /// beside it still scales with the rows. The state is priced twice: the live copy and the one
+    /// snapshot a slot can hold beside it (`SeamKv::mtp_delta_ckpt`, shared by MTP rollback and the
+    /// prefill-boundary snapshot), whose allocation would otherwise reach past a context fitted
+    /// to fill VRAM.
+    #[test]
+    fn kv_bytes_estimate_prices_recurrent_state_at_its_fixed_size() {
+        let cfg = Config {
+            n_layer: 2,
+            n_embd: 64,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 16,
+            lfm3: true,
+            shortconv_layers: vec![true, false],
+            shortconv_l_cache: 4,
+            ..Default::default()
+        };
+        let est = |ctx| super::kv_bytes_estimate_fmt(&cfg, ctx, false, 512, DType::F16, DType::F16);
+        let state = ((cfg.shortconv_l_cache - 1) * cfg.n_embd + 1) * 4;
+        for ctx in [1024usize, 4096] {
+            let attn = (ctx + super::KV_SLOP_ROWS) * 2 * (cfg.n_kv * cfg.head_dim) * 2;
+            assert_eq!(est(ctx), (2 * state + attn) as u64, "ctx {ctx}");
+        }
+    }
+
+    /// qwen35's MTP rollback snapshots the DeltaNet state of every recurrent layer (conv history
+    /// and `S`) and fails the request when that allocation is refused, so the estimate must hold
+    /// room for the copy: two of each recurrent layer's state, one attention layer's rows.
+    #[test]
+    fn kv_bytes_estimate_prices_the_qwen35_snapshot_copy() {
+        let cfg = Config {
+            n_layer: 4,
+            n_embd: 64,
+            n_head: 4,
+            n_kv: 2,
+            head_dim: 16,
+            qwen35: true,
+            full_attn_interval: 4,
+            ssm_d_conv: 4,
+            ssm_d_inner: 64,
+            ssm_d_state: 16,
+            ssm_n_group: 2,
+            ssm_dt_rank: 4,
+            ..Default::default()
+        };
+        let recurrent: Vec<usize> = (0..cfg.n_layer)
+            .filter(|&l| cfg.is_recurrent_layer(l))
+            .collect();
+        assert_eq!(
+            recurrent,
+            [0, 1, 2],
+            "three DeltaNet layers, then attention"
+        );
+        let (k, v) = cfg.recurrent_state_elems(0).expect("a DeltaNet layer");
+        let ctx = 2048usize;
+        let attn = (ctx + super::KV_SLOP_ROWS) * 2 * (cfg.n_kv * cfg.head_dim) * 2;
+        let want = recurrent.len() * 2 * (k + v) * 4 + attn;
+        let est = super::kv_bytes_estimate_fmt(&cfg, ctx, false, 512, DType::F16, DType::F16);
+        assert_eq!(est, want as u64);
     }
 
     /// `kv_q8_layout_ok` is the "may this model use a q8 cache" gate the Vulkan auto-q8 placement
@@ -4488,6 +5328,9 @@ mod seam_helper_tests {
     /// 17.5 GiB of 24.0 GiB — GPU + 8 GiB of weights, so not something a unit test can host.)
     #[test]
     fn kv_fit_walks_the_placement_chunk_ladder_gemma3_12b() {
+        if !default_chunk_is_discrete("kv_fit_walks_the_placement_chunk_ladder_gemma3_12b") {
+            return;
+        }
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let ec = EngineConfig::default();
@@ -4570,6 +5413,9 @@ mod seam_helper_tests {
     /// `INFR_UBATCH` collapses the list to that one height.
     #[test]
     fn dense_ubatch_ladder_is_the_only_one() {
+        if !default_chunk_is_discrete("dense_ubatch_ladder_is_the_only_one") {
+            return;
+        }
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         assert_eq!(super::DENSE_UBATCH_LADDER, [512, 256, 128]);
         let unset = EngineConfig::default();
@@ -4694,6 +5540,111 @@ mod seam_helper_tests {
         );
     }
 
+    /// Segments are runs of whole consecutive chunks of at most `max_rows` rows, a chunk taller
+    /// than that alone, every chunk in exactly one, in order.
+    #[test]
+    fn layer_major_segments_take_whole_chunks_up_to_the_cap() {
+        let chunks = [(0, 37), (37, 74), (74, 111), (111, 148), (148, 150)];
+        assert_eq!(super::layer_major_segments(&chunks, usize::MAX), vec![0..5]);
+        assert_eq!(
+            super::layer_major_segments(&chunks, 80),
+            vec![0..2, 2..5],
+            "two 37-row chunks fit 80 rows, a third does not; 37 + 37 + 2 do"
+        );
+        assert_eq!(
+            super::layer_major_segments(&chunks, 74),
+            vec![0..2, 2..4, 4..5],
+            "a segment may fill the cap exactly"
+        );
+        assert_eq!(
+            super::layer_major_segments(&chunks, 10),
+            vec![0..1, 1..2, 2..3, 3..4, 4..5],
+            "a chunk taller than the cap is a segment alone"
+        );
+        assert!(super::layer_major_segments(&[], 10).is_empty());
+    }
+
+    /// The automatic segment holds what [`super::LAYER_MAJOR_CARRY_BYTES`] carries: at DeepSeek
+    /// V4-Flash's geometry (`n_embd` 4096, four hyper-connection streams) a row costs the four
+    /// streams and the embedded input row in f32 plus its id and position, 81 928 bytes, so a
+    /// GiB holds 13 105 rows. Every other family carries the whole prompt unless
+    /// `paging.layer_major_rows` says otherwise, and that setting wins on V4 too.
+    #[test]
+    fn layer_major_segments_carry_one_gib_at_v4_flash_geometry() {
+        let v4 = Config {
+            deepseek4: true,
+            hc_mult: 4,
+            n_embd: 4096,
+            ..Config::default()
+        };
+        assert_eq!(super::layer_major_row_bytes(&v4), 5 * 4096 * 4 + 8);
+        let ec = EngineConfig::default();
+        assert_eq!(super::layer_major_segment_rows(&ec, &v4), 13_105);
+        let dense = Config {
+            n_embd: 4096,
+            ..Config::default()
+        };
+        assert_eq!(super::layer_major_segment_rows(&ec, &dense), usize::MAX);
+        let mut capped = EngineConfig::default();
+        capped.paging.layer_major_rows = Some(512);
+        assert_eq!(super::layer_major_segment_rows(&capped, &v4), 512);
+        assert_eq!(super::layer_major_segment_rows(&capped, &dense), 512);
+        let min = super::HOST_LAYER_MAJOR_MIN_ROWS;
+        assert!(super::host_layer_major(&v4, min, false));
+        assert!(super::host_layer_major(&v4, 1024, false));
+        assert!(!super::host_layer_major(&v4, min - 1, false));
+        assert!(!super::host_layer_major(&v4, 32, false));
+        assert!(!super::host_layer_major(&dense, 1024, false));
+        // A request sharing the backend (`infr serve --parallel`) keeps chunk-major at any height,
+        // its own parallel chunk height included.
+        let parallel = super::ubatch_rows_parallel(&ec);
+        assert!(!super::host_layer_major(&v4, parallel, true));
+        assert!(!super::host_layer_major(&v4, 1024, true));
+    }
+
+    /// The per-prompt half of the layer-major gate: auto runs it only where it can save a read
+    /// (several chunks over a cache that cannot hold every block), and `true` forces it anyway.
+    #[test]
+    fn layer_major_runs_only_where_it_saves_a_read() {
+        let with = |lm: Option<bool>| EngineConfig {
+            paging: infr_core::config::PagingCfg {
+                layer_major: lm,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let auto = with(None);
+        // (wanted, chunks, holds every block) -> layer-major
+        let cases = [
+            ((true, 1, false), false),
+            ((true, 1, true), false),
+            ((true, 3, true), false),
+            ((true, 3, false), true),
+            ((false, 3, false), false),
+        ];
+        for ((wanted, n, holds), want) in cases {
+            assert_eq!(
+                super::layer_major_this_prompt(&auto, wanted, n, holds),
+                want,
+                "auto: wanted={wanted} chunks={n} holds_every_block={holds}"
+            );
+        }
+        let forced = with(Some(true));
+        for (n, holds) in [(1, true), (1, false), (3, true)] {
+            assert!(
+                super::layer_major_this_prompt(&forced, true, n, holds),
+                "paging.layer_major = true forces it (chunks={n}, holds={holds})"
+            );
+        }
+        // `false` reaches here as not wanted (`layer_major_prefill` refuses it first).
+        assert!(!super::layer_major_this_prompt(
+            &with(Some(false)),
+            false,
+            3,
+            false
+        ));
+    }
+
     /// **Drift guard (backlog B11), the rung half.** The shared `ubatch_candidates` ladder exists so
     /// the context-fit math and the placement sweep settle on the SAME prefill chunk. They only do
     /// while both budget against the same ceiling: with the sweep on `vram.available` and the fit
@@ -4702,6 +5653,9 @@ mod seam_helper_tests {
     /// reserve against `XTX_ROOM` — rather than from the function under test.
     #[test]
     fn fit_math_and_placement_pick_the_same_rung() {
+        if !default_chunk_is_discrete("fit_math_and_placement_pick_the_same_rung") {
+            return;
+        }
         let _scope = PlacementScope::enter(std::sync::Arc::new(PlacementPins::default()));
         let cfg = gemma3_12b();
         let ec = EngineConfig::default();
@@ -4875,7 +5829,7 @@ mod seam_helper_tests {
         let (k, v) = (DType::F16, DType::F16);
         let want = 32768;
         let call = |be: &dyn infr_core::backend::Backend, ec: &EngineConfig| {
-            super::reclamp_ctx_to_live_room(be, &cfg, ec, want, k, v)
+            super::reclamp_ctx_to_live_room(be, &cfg, ec, want, k, v).expect("reclamp")
         };
 
         // No budget to report: the caller's window survives untouched.
@@ -4909,6 +5863,23 @@ mod seam_helper_tests {
             ..Default::default()
         };
         assert_eq!(call(&RoomOnly(Some(tight)), &pinned), want);
+
+        // Not one token fits: refused with the measured room, not handed on as a context of 0
+        // for the request to overflow later ("exceeds the session KV capacity 0").
+        let err = super::reclamp_ctx_to_live_room(
+            &RoomOnly(Some(super::POST_KV_DEVICE_RESERVE)),
+            &cfg,
+            &ec,
+            want,
+            k,
+            v,
+        )
+        .expect_err("a room holding only the driver reserve must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("does not fit") && msg.contains("0.25 GiB allocatable"),
+            "{msg}"
+        );
     }
 
     /// The KV refuse rung fires only when the buffers the guard checks provably cannot land: past
@@ -4947,6 +5918,52 @@ mod seam_helper_tests {
         call(&sizes, Some(1), &unguarded).expect("INFR_NO_VRAM_GUARD must not refuse");
     }
 
+    /// A backend's KV row alignment pads every layer's capacity up to it — the global layers and
+    /// the SWA rings alike — and an alignment of 1 (CPU, Vulkan) leaves every size as it was. The
+    /// padding stays inside the fit estimate's per-layer slop.
+    #[test]
+    fn kv_row_align_pads_capacity_and_one_changes_nothing() {
+        let cfg = gemma3_12b();
+        for want in [1usize, 17, 100, 4097] {
+            for ring in [false, true] {
+                for l in 0..cfg.n_layer {
+                    let plain = super::kv_rows_at(&cfg, l, want, ring, 512, 1);
+                    let padded = super::kv_rows_at(&cfg, l, want, ring, 512, 16);
+                    assert_eq!(padded, plain.next_multiple_of(16), "layer {l}, ctx {want}");
+                    assert!(
+                        padded - plain <= super::KV_SLOP_ROWS,
+                        "padding exceeds the slop"
+                    );
+                    assert_eq!(
+                        super::kv_layer_alloc_bytes(
+                            &cfg,
+                            l,
+                            want,
+                            ring,
+                            512,
+                            1,
+                            DType::F16,
+                            DType::F16
+                        ),
+                        (
+                            super::kv_side_bytes(
+                                DType::F16,
+                                plain * super::kv_row_elems(&cfg, l).0
+                            ),
+                            super::kv_side_bytes(
+                                DType::F16,
+                                plain * super::kv_row_elems(&cfg, l).1
+                            ),
+                        ),
+                        "align 1 must allocate exactly the unpadded rows"
+                    );
+                }
+            }
+        }
+        // A one-shot context of prompt + reply + 1 that ends inside a block gets the block's rows.
+        assert_eq!(super::kv_rows_at(&cfg, 0, 101, false, 512, 16), 112);
+    }
+
     /// The pre-load floor must never price more than any cache the runner can still settle on —
     /// that is what lets the refuse rung read it before a weight is loaded.
     #[test]
@@ -4959,7 +5976,7 @@ mod seam_helper_tests {
         let exact = |ring: bool, ub: usize, dt: DType| {
             total(
                 (0..cfg.n_layer)
-                    .map(|l| super::kv_layer_alloc_bytes(&cfg, l, want, ring, ub, dt, dt))
+                    .map(|l| super::kv_layer_alloc_bytes(&cfg, l, want, ring, ub, 1, dt, dt))
                     .collect(),
             )
         };

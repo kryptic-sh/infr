@@ -6,9 +6,10 @@
 //! model file, in upload order, and a [`BlockIo`] that fills a caller's slot from them.
 //!
 //! Positioned reads, never a shared cursor: [`FileBlockIo`] reads at an explicit offset
-//! (`pread`/`seek_read`), so any number of reader threads share one open file with no seek race
-//! and no lock. This is the deliberate alternative to reaching through the GGUF mmap — the page
-//! cache evicts by recency, which is the pathological policy for the cyclic sweep a forward pass
+//! (`pread`/`seek_read`), so any number of reader threads share the open files with no seek race
+//! and no lock (on Windows each file is open several times over — see [`HANDLES_PER_FILE`]). This
+//! is the deliberate alternative to reaching through the GGUF mmap — the page cache evicts by
+//! recency, which is the pathological policy for the cyclic sweep a forward pass
 //! performs (measured: `docs/perf/results.md`, "Weights that do not fit memory").
 //!
 //! A `gguf-split` model is several files rather than one, and they are addressed end to end in
@@ -30,6 +31,7 @@ use crate::pager::BlockId;
 use infr_plat::fileio::read_exact_at;
 use std::fs::File;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// One contiguous byte range of the model file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,7 +108,12 @@ impl FileStamp {
 
 /// One file of the model, and where its bytes sit in the address space the extents are written in.
 struct ShardIo {
-    file: File,
+    /// [`HANDLES_PER_FILE`] handles to the same file, handed out in turn by [`Self::file`]. Each
+    /// is opened from the path separately — a duplicated handle shares the original's file object,
+    /// and with it the serialization that is the reason for more than one.
+    files: Vec<File>,
+    /// Which handle the next read takes.
+    next: AtomicUsize,
     stamp: FileStamp,
     /// Path kept for error messages only — every read and every re-stat goes through `file`.
     path: String,
@@ -153,6 +160,19 @@ impl FileBlockIo {
     fn open_one(path: &Path, expect_len: Option<u64>, base: u64) -> Result<ShardIo> {
         let file = File::open(path)?;
         let stamp = FileStamp::of(&file)?;
+        let mut files = vec![file];
+        while files.len() < HANDLES_PER_FILE {
+            let f = File::open(path)?;
+            // Opened by path, so a file replaced between two opens would give handles onto
+            // different contents; every handle must stamp the same as the first.
+            if FileStamp::of(&f)? != stamp {
+                return Err(Error::Loader(format!(
+                    "model file changed while it was being opened: {}",
+                    path.display()
+                )));
+            }
+            files.push(f);
+        }
         if let Some(expect) = expect_len {
             if stamp.len != expect {
                 return Err(Error::Loader(format!(
@@ -165,7 +185,8 @@ impl FileBlockIo {
             }
         }
         Ok(ShardIo {
-            file,
+            files,
+            next: AtomicUsize::new(0),
             stamp,
             path: path.display().to_string(),
             base,
@@ -185,20 +206,22 @@ impl FileBlockIo {
     /// Fail if any of the model's files changed since it was opened.
     ///
     /// Callers run this at a coarse boundary (once per forward pass), not per read: it is one
-    /// `fstat` per shard, and the failure it catches — the model being rewritten mid-generation —
+    /// `fstat` per handle, and the failure it catches — the model being rewritten mid-generation —
     /// turns what would be silently different weights into an error. The known blind spot is a
     /// same-length in-place write whose mtime is restored; catching that means hashing gigabytes
     /// per check (backlog B30 records the same limit for `WeightWatch`).
     pub fn verify_unchanged(&self) -> Result<()> {
         for s in &self.shards {
-            let now = FileStamp::of(&s.file)?;
-            if now != s.stamp {
-                return Err(Error::Loader(format!(
-                    "model file changed while it was being streamed: {} (was {} bytes, now {} \
-                     bytes) — weights read after this point would not match the ones already \
-                     loaded",
-                    s.path, s.stamp.len, now.len
-                )));
+            for f in &s.files {
+                let now = FileStamp::of(f)?;
+                if now != s.stamp {
+                    return Err(Error::Loader(format!(
+                        "model file changed while it was being streamed: {} (was {} bytes, now \
+                         {} bytes) — weights read after this point would not match the ones \
+                         already loaded",
+                        s.path, s.stamp.len, now.len
+                    )));
+                }
             }
         }
         Ok(())
@@ -232,6 +255,14 @@ impl FileBlockIo {
             )));
         }
         Ok((shard, local))
+    }
+}
+
+impl ShardIo {
+    /// The handle the next read goes through: each in turn, so that concurrent reads land on
+    /// different handles (see `files`).
+    fn file(&self) -> &File {
+        &self.files[self.next.fetch_add(1, Ordering::Relaxed) % self.files.len()]
     }
 }
 
@@ -278,12 +309,38 @@ impl BlockIo for FileBlockIo {
 /// loses to the mapping it replaces, whose faults the kernel issues in parallel for free.
 ///
 /// Those figures are from Linux on NVMe, which is also where the end-to-end gain was measured
-/// (`docs/perf/results.md`). The reads stay CORRECT everywhere — each carries its own offset — but
-/// the speedup is not portable-by-construction: on Windows `seek_read` issues `ReadFile` with an
-/// `OVERLAPPED` offset, and a handle not opened `FILE_FLAG_OVERLAPPED` has its concurrent
-/// operations serialized by the kernel, so the fanout may buy nothing there until the file is
-/// opened for overlapped I/O. Unverified on Windows and macOS; see backlog B35.
-const IO_FANOUT: usize = 4;
+/// (`docs/perf/results.md`). On Windows the same holds only with a handle per concurrent read:
+/// `seek_read` issues `ReadFile` on a handle opened for synchronous I/O, and Windows runs such a
+/// handle's requests one at a time. Measured on the Windows box's NVMe with random 2.75 MB reads
+/// of a 98 GB file: sixteen threads sharing one handle read at the speed of one (0.65 GB/s), while
+/// four threads with a handle each reached 1.05 GB/s and eight or sixteen no more. So on Windows
+/// every shard is opened this many times ([`HANDLES_PER_FILE`]). Unverified on macOS; see backlog
+/// B35.
+///
+/// Public because a caller that issues several block reads at once — the CPU backend pinning an
+/// op's routed experts — sizes its concurrency to it: past this many reads in flight there is no
+/// handle left to run them on.
+pub const IO_FANOUT: usize = 4;
+
+/// How many times each model file is opened, so that this many positioned reads can run on it at
+/// once.
+///
+/// - **Windows: [`IO_FANOUT`].** `seek_read` is `ReadFile` on a handle opened for synchronous
+///   I/O, and Windows runs one such handle's requests one at a time (measured: [`IO_FANOUT`]'s
+///   doc), so concurrent reads need a handle each.
+/// - **Linux and the other Unixes, macOS included: one.** `pread` carries its own offset and the
+///   kernel runs concurrent `pread`s on one descriptor in parallel; on Linux that is what the
+///   [`IO_FANOUT`] figures were measured with. On macOS the same is assumed and not measured
+///   (backlog B35). More descriptors there would cost one more `fstat` each in
+///   [`FileBlockIo::verify_unchanged`] and buy nothing.
+#[cfg(windows)]
+pub const HANDLES_PER_FILE: usize = IO_FANOUT;
+// Windows serializes one handle's reads, so one handle there would make every read serial.
+#[cfg(windows)]
+const _: () = assert!(HANDLES_PER_FILE > 1);
+/// How many times each model file is opened — see the Windows definition for why it differs.
+#[cfg(not(windows))]
+pub const HANDLES_PER_FILE: usize = 1;
 
 /// A piece below this is not worth its own thread — the fanout is for keeping the drive busy, and
 /// small blocks (the norm/bias tensors of a fused group) are latency-bound rather than
@@ -359,17 +416,17 @@ fn read_pieces<'a>(
             .into_iter()
             .map(|(shard, e, buf)| {
                 s.spawn(move || {
-                    read_exact_at(&shard.file, buf, e.offset).map_err(|err| (shard, e, err))
+                    read_exact_at(shard.file(), buf, e.offset).map_err(|err| (shard, e, err))
                 })
             })
             .collect();
-        first_err = read_exact_at(&last_shard.file, last_dst, last.offset)
+        first_err = read_exact_at(last_shard.file(), last_dst, last.offset)
             .map_err(|err| (last_shard, last, err))
             .err();
         for h in handles {
             // A panicking reader is a bug in this function, not an I/O condition: propagate it
-            // rather than reporting a block that was never filled as read.
-            if let Err(e) = h.join().expect("block reader thread panicked") {
+            // rather than reporting a block that was never filled as read, with its own message.
+            if let Err(e) = h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)) {
                 first_err.get_or_insert(e);
             }
         }
@@ -695,6 +752,27 @@ mod tests {
             pieces.iter().map(|p| p.len).sum::<usize>(),
             a.len + b.len,
             "pieces must cover both extents"
+        );
+    }
+
+    /// Concurrent reads of one shard go through different handles. On Windows a single handle runs
+    /// its reads one at a time, so a reader that kept one would be serial however many threads
+    /// called it — and still return the right bytes, which is why this checks the handles. Where
+    /// one descriptor serves concurrent reads (`HANDLES_PER_FILE` is 1) the check is that it is
+    /// the only one.
+    #[test]
+    fn each_shard_hands_out_its_handles_in_turn() {
+        let (f, _) = ramp_file(4096);
+        let io = FileBlockIo::open(f.path()).expect("open");
+        let shard = &io.shards[0];
+        assert_eq!(shard.files.len(), HANDLES_PER_FILE);
+        let picked: std::collections::HashSet<*const File> = (0..HANDLES_PER_FILE)
+            .map(|_| shard.file() as *const File)
+            .collect();
+        assert_eq!(
+            picked.len(),
+            HANDLES_PER_FILE,
+            "a read reused a handle another read held"
         );
     }
 

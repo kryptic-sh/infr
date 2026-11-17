@@ -7,7 +7,7 @@
 //! This module decides WHICH files a model is and how many are fetched at a time; one file's bytes
 //! are [`crate::download`]'s business.
 
-use crate::download::download_to_blob;
+use crate::download::{download_to_blob, present_blob, LfsOid};
 use crate::http::{api_client, head_client, token, ConnBudget};
 use crate::{model_ref::ModelRef, store::Store};
 use indicatif::MultiProgress;
@@ -15,13 +15,15 @@ use infr_core::config::Config;
 use infr_core::error::{Error, Result};
 use infr_core::progress;
 use infr_core::shutdown::shutdown_requested;
-use infr_plat::link::link_blob;
+use infr_plat::link::{link_blob, LinkKind};
+use reqwest::StatusCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{
     fs,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -79,37 +81,58 @@ fn pull_repo_latest(repo: &str, sel: Option<&str>, cfg: &Config) -> Result<PathB
         }
     };
 
-    let repo_dir = store.repo_dir(repo);
-    let blobs = repo_dir.join("blobs");
+    let repo_dir = store.repo_dir(repo)?;
     let snap = repo_dir.join("snapshots").join(&commit);
     // A sharded GGUF needs its WHOLE `-NNNNN-of-MMMMM` set — one shard fails at load.
     let shards = crate::store::shard_set(&filename);
-    let primary = snap.join(&shards[0]);
     let progress = progress::group();
     // Up to date when THIS commit's snapshot already links every present shard blob.
     if shards.iter().all(|f| snap.join(f).exists()) {
         info!("hf:{repo}:{filename} already up to date ({commit})");
-        // Still ensure companions — a snapshot pulled before this feature won't have them yet.
-        fetch_companions(HF_ORIGIN, repo, &blobs, &snap, &siblings, &progress);
-        return Ok(primary);
+    } else {
+        // `fetch_and_link` content-addresses each shard, so a commit that only moved a sibling
+        // (file bytes unchanged) relinks the cached blob — no re-download.
+        info!("Updating hf:{repo}:{filename} → {commit}");
     }
-
-    // Repoint refs/main + (re)build the snapshot. `fetch_and_link` content-addresses each shard, so a
-    // commit that only moved a sibling (file bytes unchanged) relinks the cached blob — no re-download.
-    info!("Updating hf:{repo}:{filename} → {commit}");
-    write_text(&repo_dir.join("refs").join("main"), &commit)?;
-    fs::create_dir_all(&snap).map_err(Error::from)?;
-    fetch_all(
+    // Run either way: an up-to-date snapshot still gets companions a pull from before they existed
+    // did not fetch, and a `refs/main` a crash kept from being written.
+    populate_snapshot(
         HF_ORIGIN,
-        &blobs,
-        &snap,
+        &repo_dir,
         repo,
+        &commit,
         &shards,
+        &siblings,
         cfg.hub.pull_jobs,
         &progress,
-    )?;
-    fetch_companions(HF_ORIGIN, repo, &blobs, &snap, &siblings, &progress);
-    Ok(primary)
+    )
+}
+
+/// Build `snapshots/<commit>/` in `repo_dir`: fetch and link every file in `shards`, then the
+/// [`COMPANIONS`], and only THEN point `refs/main` at the commit. Returns the first shard's link.
+///
+/// The order is the point. `refs/main` is what [`Store::resolve_repo`] tries first, so writing it
+/// before the snapshot is complete — as this used to — leaves an interrupted pull advertising a
+/// commit whose files are not there. It is written atomically for the same reason: a torn write
+/// would name a commit that does not exist at all.
+#[allow(clippy::too_many_arguments)]
+fn populate_snapshot(
+    origin: &str,
+    repo_dir: &Path,
+    repo: &str,
+    commit: &str,
+    shards: &[String],
+    siblings: &[String],
+    jobs: usize,
+    progress: &MultiProgress,
+) -> Result<PathBuf> {
+    let blobs = repo_dir.join("blobs");
+    let snap = repo_dir.join("snapshots").join(commit);
+    fs::create_dir_all(&snap).map_err(Error::from)?;
+    fetch_all(origin, &blobs, &snap, repo, shards, jobs, progress)?;
+    fetch_companions(origin, repo, &blobs, &snap, siblings, progress);
+    write_text_atomic(&repo_dir.join("refs").join("main"), commit)?;
+    Ok(snap.join(&shards[0]))
 }
 
 /// Download one file (or reuse its content-addressed blob) into `snap` as a symlink into `blobs`.
@@ -136,18 +159,41 @@ fn fetch_and_link(
 ) -> Result<PathBuf> {
     let filename = check_relative(filename)?;
     let url = resolve_url(origin, repo, filename);
-    let want = head_lfs_sha(origin, repo, filename).ok().flatten();
+    // A HEAD that fails is NOT "this file is not LFS": treating it so downloads a multi-GB blob
+    // with no sha256 gate at all. Retry it, and refuse the file if it never answers — unless the
+    // snapshot already links it to a blob in this cache (an up-to-date re-pull), which is all that
+    // can be checked without the hub: a hub hiccup must not fail a pull that has nothing to fetch.
+    // That is NOT a claim the blob was verified (a non-LFS file never is, and a blob short from a
+    // crash is not caught without the hub's size); an actual answer — an auth refusal, a `404`, a
+    // digest or size that disagrees — still counts.
+    let want = match head_lfs_sha_retrying(origin, repo, filename) {
+        Ok(want) => want,
+        Err(refusal) => {
+            let link = snap.join(filename);
+            if refusal.unanswered && links_a_blob(&link, filename, blobs) {
+                warn!(
+                    "{}; keeping the copy already in the cache unchecked",
+                    refusal.error
+                );
+                return Ok(link);
+            }
+            return Err(refusal.error);
+        }
+    };
     let hex = match &want {
-        Some(sha) if blobs.join(sha).exists() => {
-            debug!("hf:{repo}:{filename} blob already present; linking → {sha}");
-            sha.clone()
+        Some(w) if present_blob(blobs, w).is_some() => {
+            debug!(
+                "hf:{repo}:{filename} blob already present; linking → {}",
+                w.sha
+            );
+            w.sha.clone()
         }
         _ => {
             download_to_blob(
                 &url,
                 blobs,
                 filename,
-                want.as_deref(),
+                want.as_ref(),
                 None, // model blobs are legitimately multi-GB — never capped
                 budget,
                 progress,
@@ -155,15 +201,96 @@ fn fetch_and_link(
             .1
         }
     };
-    let link = snap.join(filename);
-    if let Some(parent) = link.parent() {
-        fs::create_dir_all(parent).map_err(Error::from)?; // subdirectory rfilename
+    link_into_snapshot(snap, filename, &hex)
+}
+
+/// Make `snap/<filename>` name the blob `hex`, and return that path.
+///
+/// Safe to run from several processes at once (two `infr run`s auto-pulling the same model): the
+/// blob download is serialised by its lock, but this step is not, so it must neither fail on nor
+/// tear down another process's finished link. An entry that already names the blob is success. Any
+/// other is replaced by building the new link under a unique temporary name beside it and
+/// `rename`-ing that over the old one, which is atomic — a reader sees the old entry or the new
+/// one, never a moment with neither.
+///
+/// The link itself comes from [`link_blob`], which falls back to a hard link and then a copy on a
+/// filesystem without symlinks; the first such fallback in a process is logged once.
+fn link_into_snapshot(snap: &Path, filename: &str, hex: &str) -> Result<PathBuf> {
+    static FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+
+    let link = snap.join(check_relative(filename)?);
+    let parent = link.parent().unwrap_or(snap);
+    fs::create_dir_all(parent).map_err(Error::from)?; // subdirectory rfilename
+    let target = blob_link_target(filename, hex);
+    if names_blob(&link, &target) {
+        return Ok(link);
     }
-    let _ = fs::remove_file(&link); // replace a stale/dangling link
-    let target = blob_link_target(filename, &hex);
-    link_blob(&target, &link).map_err(Error::from)?;
-    debug!("linked {link:?} -> {target}");
+    let temp = fresh_temp_beside(&link)?;
+    let kind = link_blob(&target, &temp).map_err(Error::from)?;
+    if let Err(e) = fs::rename(&temp, &link) {
+        let _ = fs::remove_file(&temp);
+        return Err(Error::Other(format!("linking {link:?} -> {target}: {e}")));
+    }
+    if kind != LinkKind::Symlink && !FALLBACK_LOGGED.swap(true, Ordering::Relaxed) {
+        match kind {
+            LinkKind::HardLink => warn!(
+                "the model cache at {} does not support symbolic links; snapshot files are hard \
+                 links to their blobs instead",
+                snap.display()
+            ),
+            _ => warn!(
+                "the model cache at {} supports neither symbolic nor hard links; snapshot files \
+                 are COPIES of their blobs, which doubles the disk space each model takes",
+                snap.display()
+            ),
+        }
+    }
+    debug!("linked {link:?} -> {target} ({kind:?})");
     Ok(link)
+}
+
+/// Does `link` name SOME blob in `blobs` — a symlink whose target is a `blobs/<sha256>` entry, or
+/// a hard link to one — as far as can be told without the hub? A copy (the last link fallback) is
+/// not recognised: nothing local says which blob it was copied from.
+fn links_a_blob(link: &Path, filename: &str, blobs: &Path) -> bool {
+    let symlinked = fs::read_link(link)
+        .ok()
+        .and_then(|t| t.file_name().and_then(|n| n.to_str()).map(str::to_owned))
+        .filter(|sha| is_sha256(sha));
+    if let Some(sha) = symlinked {
+        return names_blob(link, &blob_link_target(filename, &sha));
+    }
+    fs::symlink_metadata(link).is_ok_and(|m| m.is_file())
+        && fs::read_dir(blobs)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                e.file_name().to_str().is_some_and(is_sha256)
+                    && infr_plat::link::is_same_file(link, &e.path()).unwrap_or(false)
+            })
+}
+
+/// Does `link` already name the blob at the relative `target`?
+///
+/// - A symlink must point at exactly `target`, and resolve.
+/// - A hard link (the first fallback) is recognised by file identity: it IS the blob.
+/// - A copy (the last fallback) can only be judged by its size — the best check short of hashing
+///   the whole file, which this fast path deliberately does not do. It is not a half-written copy:
+///   copies are built under a temporary name and renamed into place whole.
+fn names_blob(link: &Path, target: &str) -> bool {
+    let Ok(meta) = fs::symlink_metadata(link) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return fs::read_link(link)
+            .is_ok_and(|t| t.components().eq(Path::new(target).components()))
+            && link.exists();
+    }
+    let blob = link.parent().unwrap_or(link).join(target);
+    meta.is_file()
+        && (infr_plat::link::is_same_file(link, &blob).unwrap_or(false)
+            || fs::metadata(&blob).is_ok_and(|b| b.len() == meta.len()))
 }
 
 /// Fetch and link every file in `files`, over at most `jobs` connections IN TOTAL.
@@ -318,29 +445,205 @@ fn check_relative(name: &str) -> Result<&str> {
     }
 }
 
-/// HEAD the resolve URL to read the file's LFS sha256 (HF's `X-Linked-Etag`) WITHOUT downloading the
-/// body — so a commit bump that left the file unchanged can relink the cached blob, and so the
-/// download can verify the body against it. Returns `Ok(Some(sha))` for an LFS file, `Ok(None)` for a
-/// non-LFS file (no `X-Linked-Etag`), and `Err` only on a transport failure. The plain `ETag` is a
-/// quoted md5, NOT the content sha256, so it is deliberately never used here — treating it as a sha
-/// would defeat both the relink fast-path and integrity verification. Redirects are disabled because
-/// the sha header is on huggingface.co's 302, not the CDN's final 200.
-fn head_lfs_sha(origin: &str, repo: &str, filename: &str) -> Result<Option<String>> {
-    let url = resolve_url(origin, repo, filename);
-    let mut req = head_client()?.head(&url);
-    if let Some(t) = token() {
-        req = req.bearer_auth(t);
+/// HEAD the resolve URL to read the file's LFS sha256 (HF's `X-Linked-Etag`) and size
+/// (`X-Linked-Size`) WITHOUT downloading the body — so a commit bump that left the file unchanged
+/// can relink the cached blob, and so the download can verify the body against it. Returns
+/// `Ok(Some(oid))` for an LFS file, `Ok(None)` for a non-LFS file (a `2xx` with no
+/// `X-Linked-Etag`), and `Err` on a transport failure, an error status, or a redirect it will not
+/// follow. The plain `ETag` is a quoted md5, NOT the content sha256, so it is deliberately never
+/// used here — treating it as a sha would defeat both the relink fast-path and integrity
+/// verification.
+///
+/// Redirects are handled by hand (the client follows none) because the sha header is on
+/// huggingface.co's own `302` to the CDN, not the CDN's final `200`: a redirect CARRYING the digest
+/// is that hop and is the answer. A redirect WITHOUT it is something else — HF answers `307` to the
+/// new path for a renamed or moved repo — and reading it as "not LFS" is what let such a pull
+/// download a multi-GB model with no sha256 gate. So a same-host one is followed (up to
+/// [`MAX_HEAD_REDIRECTS`]), keeping the token exactly as the download client's redirect policy
+/// does for a same-host hop, and an off-host one, which no HF file needs, is refused.
+fn head_lfs_sha(
+    origin: &str,
+    repo: &str,
+    filename: &str,
+) -> std::result::Result<Option<LfsOid>, HeadFailure> {
+    let client = head_client().map_err(|e| HeadFailure::definitive(e.to_string()))?;
+    let first = resolve_url(origin, repo, filename);
+    let mut url = reqwest::Url::parse(&first)
+        .map_err(|e| HeadFailure::definitive(format!("HEAD {first}: {e}")))?;
+    for _ in 0..=MAX_HEAD_REDIRECTS {
+        let mut req = client.head(url.clone());
+        if let Some(t) = token() {
+            req = req.bearer_auth(t);
+        }
+        // A request that never got an answer — refused, reset, timed out — can go through on a
+        // fresh connection, as a chunk does in `crate::ranged`.
+        let resp = req.send().map_err(|e| HeadFailure {
+            msg: format!("HEAD {url}: {e}"),
+            transient: true,
+            unanswered: true,
+        })?;
+        // Only an answer about the file itself says whether it has a digest. An error status
+        // carries no `X-Linked-Etag` either, and reading that as "not LFS" is what dropped the
+        // sha256 gate.
+        let status = resp.status();
+        if !(status.is_success() || status.is_redirection()) {
+            let transient = status.is_server_error()
+                || status == StatusCode::TOO_MANY_REQUESTS
+                || status == StatusCode::REQUEST_TIMEOUT;
+            let hint = match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                    " — the repo is gated or private: set HF_TOKEN to a token that has access"
+                }
+                StatusCode::NOT_FOUND => {
+                    " — no such repo or file (HF also answers 404 for a private repo without a \
+                     token)"
+                }
+                _ => "",
+            };
+            return Err(HeadFailure {
+                msg: format!("HEAD {url}: HTTP {status}{hint}"),
+                transient,
+                unanswered: transient,
+            });
+        }
+        if let Some(oid) = lfs_oid(resp.headers()) {
+            return Ok(Some(oid));
+        }
+        if status.is_success() {
+            return Ok(None);
+        }
+        let next = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|loc| url.join(loc).ok())
+            .ok_or_else(|| {
+                HeadFailure::unanswered(format!(
+                    "HEAD {url}: HTTP {status} with no usable Location and no LFS digest"
+                ))
+            })?;
+        if next.origin() != url.origin() {
+            return Err(HeadFailure::unanswered(format!(
+                "HEAD {url}: redirected off-host to {next} without an LFS sha256; refusing to \
+                 download it unverified"
+            )));
+        }
+        debug!("HEAD {url}: HTTP {status} → {next}");
+        url = next;
     }
-    let resp = req
-        .send()
-        .map_err(|e| Error::Other(format!("HEAD {url}: {e}")))?;
-    let sha = resp
-        .headers()
+    Err(HeadFailure::unanswered(format!(
+        "HEAD {first}: more than {MAX_HEAD_REDIRECTS} redirects without an LFS sha256"
+    )))
+}
+
+/// Same-host redirects [`head_lfs_sha`] follows before giving up. A renamed repo is one hop; the
+/// bound only exists so a redirect loop ends.
+const MAX_HEAD_REDIRECTS: usize = 5;
+
+/// The LFS identity a `HEAD` answer advertises, or `None` when it carries no well-formed
+/// `X-Linked-Etag`. A malformed `X-Linked-Size` is dropped rather than trusted: the sha256 alone
+/// still gates the body.
+fn lfs_oid(headers: &reqwest::header::HeaderMap) -> Option<LfsOid> {
+    let sha = headers
         .get("x-linked-etag")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim_matches('"').to_ascii_lowercase())
-        .filter(|s| is_sha256(s));
-    Ok(sha)
+        .filter(|s| is_sha256(s))?;
+    let size = headers
+        .get("x-linked-size")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse().ok());
+    Some(LfsOid { sha, size })
+}
+
+/// Why [`head_lfs_sha`] got no answer about the file, and whether asking again can change that.
+struct HeadFailure {
+    msg: String,
+    /// A transport failure, `408`, `429` or `5xx`. Anything else (an auth refusal, a `404`) is the
+    /// server's settled answer, and repeating the request only delays reporting it.
+    transient: bool,
+    /// No answer about the FILE was obtained: a transient failure, or a redirect this client will
+    /// not follow. Unlike an auth refusal or a `404`, that says nothing about the file, so a blob
+    /// already linked for it is kept rather than failing the pull (see [`fetch_and_link`]).
+    unanswered: bool,
+}
+
+impl HeadFailure {
+    fn definitive(msg: String) -> Self {
+        Self {
+            msg,
+            transient: false,
+            unanswered: false,
+        }
+    }
+
+    fn unanswered(msg: String) -> Self {
+        Self {
+            msg,
+            transient: false,
+            unanswered: true,
+        }
+    }
+}
+
+/// Why [`head_lfs_sha_retrying`] gave up: the error to report, and whether the file was never
+/// answered for at all ([`HeadFailure::unanswered`]).
+struct HeadRefusal {
+    error: Error,
+    unanswered: bool,
+}
+
+/// Tries [`head_lfs_sha`] gets for a model file before the file is refused. The HEAD is a few-KB
+/// request, so a transient failure (a dropped connection, a `5xx`) is cheap to repeat.
+const HEAD_ATTEMPTS: u32 = 3;
+
+/// Wait before retry `n` is `n` times this. Short under test, where the local origin is the only
+/// thing being waited on.
+const HEAD_RETRY_BACKOFF: Duration = if cfg!(test) {
+    Duration::from_millis(10)
+} else {
+    Duration::from_secs(1)
+};
+
+/// [`head_lfs_sha`] with a transient failure retried up to [`HEAD_ATTEMPTS`] times. A definitive
+/// one fails at once with its own status, so an auth or not-found answer is reported as what it
+/// is. Either way the caller gets an error rather than a file downloaded unverified.
+fn head_lfs_sha_retrying(
+    origin: &str,
+    repo: &str,
+    filename: &str,
+) -> std::result::Result<Option<LfsOid>, HeadRefusal> {
+    let mut attempt = 1;
+    loop {
+        match head_lfs_sha(origin, repo, filename) {
+            Ok(sha) => return Ok(sha),
+            Err(f) if !f.transient => {
+                return Err(HeadRefusal {
+                    error: Error::Other(format!("hf:{repo}:{filename}: {}", f.msg)),
+                    unanswered: f.unanswered,
+                });
+            }
+            Err(f) if attempt >= HEAD_ATTEMPTS || shutdown_requested() => {
+                return Err(HeadRefusal {
+                    error: Error::Other(format!(
+                        "hf:{repo}:{filename}: cannot read its LFS sha256, refusing to download \
+                         it unverified: {}",
+                        f.msg
+                    )),
+                    unanswered: true,
+                });
+            }
+            Err(f) => {
+                warn!(
+                    "{}; retrying (attempt {} of {HEAD_ATTEMPTS})",
+                    f.msg,
+                    attempt + 1
+                );
+                std::thread::sleep(HEAD_RETRY_BACKOFF * attempt);
+                attempt += 1;
+            }
+        }
+    }
 }
 
 /// True for a lowercase hex sha256 digest: exactly 64 hex digits.
@@ -364,27 +667,20 @@ fn pull_repo(repo: &str, sel: Option<&str>, cfg: &Config) -> Result<PathBuf> {
     let (commit, filename, siblings) = repo_info(HF_ORIGIN, repo, sel)?;
     info!("Pulling hf:{repo}:{filename}");
 
-    let repo_dir = store.repo_dir(repo);
-    let blobs = repo_dir.join("blobs");
-    // Write the HF Hub pointers: refs/main = commit, snapshots/<commit>/<file> -> ../../blobs/<sha>.
-    write_text(&repo_dir.join("refs").join("main"), &commit)?;
-    let snap = repo_dir.join("snapshots").join(&commit);
-    fs::create_dir_all(&snap).map_err(Error::from)?;
+    let repo_dir = store.repo_dir(repo)?;
     // A sharded GGUF (`-NNNNN-of-MMMMM`) needs its WHOLE set downloaded/linked — a lone shard 1 fails
     // at load. A non-sharded file is a singleton set.
     let shards = crate::store::shard_set(&filename);
-    let progress = progress::group();
-    fetch_all(
+    populate_snapshot(
         HF_ORIGIN,
-        &blobs,
-        &snap,
+        &repo_dir,
         repo,
+        &commit,
         &shards,
+        &siblings,
         cfg.hub.pull_jobs,
-        &progress,
-    )?;
-    fetch_companions(HF_ORIGIN, repo, &blobs, &snap, &siblings, &progress);
-    Ok(snap.join(&shards[0]))
+        &progress::group(),
+    )
 }
 
 /// Query the HF model API for `repo`: return `(commit_sha, gguf_filename, sibling_filenames)` for
@@ -501,28 +797,32 @@ fn fetch_companions(
         let url = resolve_url(origin, repo, name);
         // Same integrity path as the GGUF: HEAD for the LFS sha256 and hand it to the download so
         // the body is verified (and a present blob relinked without a transfer). `Ok(None)` = the
-        // file is not LFS, so no digest exists; a HEAD transport error degrades to the same
-        // unverified-but-capped path rather than skipping the companion.
-        let want = head_lfs_sha(origin, repo, name).ok().flatten();
+        // file is not LFS, so no digest exists; a HEAD error degrades to the same
+        // unverified-but-capped path rather than skipping the companion — a skipped companion is
+        // never fetched again once the model is cached — but says so where the user can see it.
+        let want = match head_lfs_sha(origin, repo, name) {
+            Ok(sha) => sha,
+            Err(f) => {
+                warn!(
+                    "hf:{repo}: companion {name} will not be integrity-checked ({})",
+                    f.msg
+                );
+                None
+            }
+        };
         // No connection budget: a companion is a sub-2-KB file and splitting it across ranges
         // would be more requests than bytes.
         let dl = download_to_blob(
             &url,
             blobs,
             name,
-            want.as_deref(),
+            want.as_ref(),
             Some(MAX_COMPANION_BYTES),
             &ConnBudget::new(0),
             progress,
         );
-        match dl {
-            Ok((_, hex, _)) => {
-                let _ = fs::remove_file(&link);
-                match link_blob(blob_link_target(name, &hex), &link) {
-                    Ok(()) => info!("hf:{repo}: cached companion {name}"),
-                    Err(e) => debug!("hf:{repo}: companion {name} symlink failed: {e}"),
-                }
-            }
+        match dl.and_then(|(_, hex, _)| link_into_snapshot(snap, name, &hex)) {
+            Ok(_) => info!("hf:{repo}: cached companion {name}"),
             Err(e) => debug!("hf:{repo}: companion {name} not cached ({e})"),
         }
     }
@@ -532,13 +832,64 @@ fn fetch_companions(
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Write `text` to `path`, creating parent directories.
-fn write_text(path: &Path, text: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(Error::from)?;
+/// A temporary name beside `path` to build its replacement under before renaming it into place:
+/// [`temp_name`] with this process's id, its random [`process_token`] and a per-process sequence.
+///
+/// The token is what makes the name this process's alone. A pid is unique only within one host
+/// and PID namespace, and an HF cache is often shared beyond that — two containers that are both
+/// pid 1 on one mounted cache, an NFS home — so a pid-only name could be another live process's
+/// in-flight temp. Anything found at a name carrying our own token can only be our own leftover,
+/// so it is removed first; other processes' stale temps are left alone.
+fn fresh_temp_beside(path: &Path) -> Result<PathBuf> {
+    static TEMP_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let temp = temp_name(
+        path,
+        std::process::id(),
+        process_token(),
+        TEMP_SEQ.fetch_add(1, Ordering::Relaxed),
+    );
+    clear_stale_temp(&temp)?;
+    Ok(temp)
+}
+
+/// `.<name>.<pid>-<token>-<seq>.tmp` beside `path`, the token in hex.
+fn temp_name(path: &Path, pid: u32, token: u64, seq: usize) -> PathBuf {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let base = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    parent.join(format!(".{base}.{pid}-{token:016x}-{seq}.tmp"))
+}
+
+/// A random value fixed for the life of this process, from std's randomly keyed `RandomState` —
+/// the same source `infr_core`'s kernel cache uses for its marker names.
+fn process_token() -> u64 {
+    static TOKEN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TOKEN.get_or_init(|| {
+        use std::hash::{BuildHasher, Hasher};
+        std::hash::RandomState::new().build_hasher().finish()
+    })
+}
+
+/// Remove a leftover at temporary name `temp` (see [`fresh_temp_beside`]); none there is fine.
+fn clear_stale_temp(temp: &Path) -> Result<()> {
+    match fs::remove_file(temp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(Error::from(e)),
+        _ => Ok(()),
     }
-    fs::write(path, text).map_err(Error::from)?;
-    Ok(())
+}
+
+/// Write `text` to `path` atomically, creating parent directories: the text goes to a unique
+/// temporary name beside it and is committed over `path` in one rename, so a reader — or a crash —
+/// sees the old contents or the new, never a torn or empty file.
+fn write_text_atomic(path: &Path, text: &str) -> Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(parent).map_err(Error::from)?;
+    let temp = fresh_temp_beside(path)?;
+    let written =
+        fs::write(&temp, text).and_then(|()| infr_plat::persist::commit_file(&temp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written.map_err(Error::from)
 }
 
 #[cfg(test)]
@@ -901,6 +1252,353 @@ mod tests {
             "{fetched} of {} shards were fetched anyway",
             files.len()
         );
+    }
+
+    /// A HEAD that never answers is not "this file has no digest". The file must be refused
+    /// rather than downloaded with no sha256 gate — and refused before a byte of its body is asked
+    /// for, so nothing unverified is left on disk either.
+    #[test]
+    fn a_failed_head_refuses_the_file() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-nohead", 1, 20_000);
+        hub.fail_heads(usize::MAX);
+        let cache = TempRepo::new();
+
+        let err = pull_one(&hub, &cache, &files, 1)
+            .expect_err("a file whose digest cannot be read must not be fetched")
+            .to_string();
+        assert!(err.contains("unverified"), "{err}");
+        assert!(
+            hub.served_bodies(&files[0]).is_empty(),
+            "the body was fetched"
+        );
+        assert!(!cache.snapshot().join(&files[0]).exists());
+    }
+
+    /// A re-pull of a snapshot that is already complete keeps its files when the HEAD cannot be
+    /// completed — every attempt `503`s, or the repo now redirects off-host — instead of failing a
+    /// pull that has nothing to fetch. A real answer (here a `404`) still fails it, and nothing is
+    /// downloaded either way.
+    #[test]
+    fn an_unanswered_head_keeps_an_already_linked_file() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-again", 2, 20_000);
+        let cache = TempRepo::new();
+        pull_one(&hub, &cache, &files, 1).expect("first pull");
+        let bodies =
+            |hub: &TestHub| -> usize { files.iter().map(|f| hub.served_bodies(f).len()).sum() };
+        let before = bodies(&hub);
+
+        hub.fail_heads(usize::MAX);
+        pull_one(&hub, &cache, &files, 1).expect("a 503 HEAD must not fail an up-to-date pull");
+        hub.fail_heads(0);
+
+        let elsewhere = hub.origin().replace("127.0.0.1", "localhost");
+        hub.move_repo("org/repo", &format!("{elsewhere}/x/y"));
+        pull_one(&hub, &cache, &files, 1).expect("an off-host redirect must not fail it either");
+        assert_eq!(bodies(&hub), before, "a kept file was downloaded again");
+        for f in &files {
+            assert_eq!(fs::read(cache.snapshot().join(f)).unwrap(), hub.body(f));
+        }
+
+        // An entry that resolves but is not a link to a blob in this cache is not kept: here a
+        // symlink to some other file, which `exists()` alone would have accepted.
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-stray", 1, 20_000);
+        let cache = TempRepo::new();
+        pull_one(&hub, &cache, &files, 1).expect("first pull");
+        let stray = cache.0.path().join("stray.gguf");
+        fs::write(&stray, b"not a blob").unwrap();
+        let link = cache.snapshot().join(&files[0]);
+        fs::remove_file(&link).unwrap();
+        link_blob(&stray, &link).unwrap();
+        hub.fail_heads(usize::MAX);
+        pull_one(&hub, &cache, &files, 1).expect_err("a link to a non-blob must not be kept");
+
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-gone", 1, 20_000);
+        let cache = TempRepo::new();
+        pull_one(&hub, &cache, &files, 1).expect("first pull");
+        hub.fail_heads_with(usize::MAX, 404);
+        pull_one(&hub, &cache, &files, 1).expect_err("a definitive answer still fails the pull");
+    }
+
+    /// A definitive refusal is not retried and is reported as itself: one HEAD, and an error that
+    /// names the status and what it usually means, not "refusing to download it unverified".
+    #[test]
+    fn a_definitive_head_status_fails_at_once() {
+        for (status, says) in [(401, "HF_TOKEN"), (404, "no such repo or file")] {
+            let hub = TestHub::start();
+            let files = hub.add_shards("m-denied", 1, 20_000);
+            hub.fail_heads_with(usize::MAX, status);
+            let cache = TempRepo::new();
+            let err = pull_one(&hub, &cache, &files, 1)
+                .expect_err("a refused HEAD must fail the pull")
+                .to_string();
+            assert!(
+                err.contains(&status.to_string()) && err.contains(says),
+                "{err}"
+            );
+            assert!(!err.contains("unverified"), "{err}");
+            assert_eq!(hub.heads_served(), 1, "a definitive status was retried");
+        }
+    }
+
+    /// One failed HEAD is retried, and the file then lands VERIFIED: the lie below is only caught
+    /// if the retried HEAD's digest reached the sha256 gate.
+    #[test]
+    fn a_transient_head_failure_is_retried() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-flaky-head", 1, 20_000);
+        hub.fail_heads(1);
+        let cache = TempRepo::new();
+        pull_one(&hub, &cache, &files, 1).expect("one failed HEAD is retried");
+        assert_eq!(
+            fs::read(cache.snapshot().join(&files[0])).unwrap(),
+            hub.body(&files[0])
+        );
+
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-flaky-lie", 1, 20_000);
+        hub.lie_about_sha(&files[0], SHA_A);
+        hub.fail_heads(1);
+        let cache = TempRepo::new();
+        let err = pull_one(&hub, &cache, &files, 1)
+            .expect_err("the retried HEAD's digest must gate the body")
+            .to_string();
+        assert!(err.contains("sha256 mismatch"), "{err}");
+    }
+
+    /// A renamed repo answers its old resolve URL with a same-host `307` and no `X-Linked-Etag`.
+    /// That redirect is followed by the HEAD, so the file is still verified: the lie below is only
+    /// caught if the digest from the NEW path reached the sha256 gate. Unfollowed, the HEAD read
+    /// the 307 as "not LFS" and the body was committed unchecked.
+    #[test]
+    fn a_moved_repo_is_followed_and_still_verified() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-moved", 1, 20_000);
+        hub.move_repo("old/repo", "/org/repo");
+        hub.lie_about_sha(&files[0], SHA_A);
+        let cache = TempRepo::new();
+        let err = fetch_all(
+            &hub.origin(),
+            &cache.blobs(),
+            &cache.snapshot(),
+            "old/repo",
+            &files,
+            1,
+            &progress::group(),
+        )
+        .expect_err("a lying digest behind a redirect must still fail the pull")
+        .to_string();
+        assert!(err.contains("sha256 mismatch"), "{err}");
+        assert!(!cache.snapshot().join(&files[0]).exists());
+
+        // …and an honest file behind the same redirect lands, stored under its digest.
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-moved-ok", 1, 20_000);
+        hub.move_repo("old/repo", "/org/repo");
+        let cache = TempRepo::new();
+        fetch_all(
+            &hub.origin(),
+            &cache.blobs(),
+            &cache.snapshot(),
+            "old/repo",
+            &files,
+            1,
+            &progress::group(),
+        )
+        .expect("a moved repo still pulls");
+        assert_eq!(
+            fs::read(cache.snapshot().join(&files[0])).unwrap(),
+            hub.body(&files[0])
+        );
+        assert!(cache.blobs().join(hub.sha(&files[0])).exists());
+    }
+
+    /// A redirect to ANOTHER host with no digest is refused before any body is requested: no HF
+    /// file needs one, and following it would either drop the token or the sha256 gate.
+    #[test]
+    fn an_off_host_redirect_without_a_digest_is_refused() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-offsite", 1, 20_000);
+        let elsewhere = hub.origin().replace("127.0.0.1", "localhost");
+        hub.move_repo("old/repo", &format!("{elsewhere}/org/repo"));
+        let cache = TempRepo::new();
+        let err = fetch_all(
+            &hub.origin(),
+            &cache.blobs(),
+            &cache.snapshot(),
+            "old/repo",
+            &files,
+            1,
+            &progress::group(),
+        )
+        .expect_err("an off-host redirect without a digest must be refused")
+        .to_string();
+        assert!(err.contains("off-host"), "{err}");
+        assert!(
+            hub.served_bodies(&files[0]).is_empty(),
+            "the body was fetched"
+        );
+    }
+
+    /// A blob whose size disagrees with the hub's `X-Linked-Size` — what a crash between rename and
+    /// writeback leaves — is not trusted because of its name: it is downloaded again and the
+    /// snapshot ends up with the real bytes.
+    #[test]
+    fn a_short_blob_is_downloaded_again() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-short", 1, 20_000);
+        let f = &files[0];
+        let cache = TempRepo::new();
+        fs::write(cache.blobs().join(hub.sha(f)), &hub.body(f)[..100]).unwrap();
+
+        pull_one(&hub, &cache, &files, 1).unwrap();
+
+        assert_eq!(fs::read(cache.snapshot().join(f)).unwrap(), hub.body(f));
+        assert_eq!(hub.served_bodies(f).len(), 1, "the blob was not re-fetched");
+    }
+
+    /// Two processes linking the same snapshot entry at once (two auto-pulls of one model) both
+    /// succeed and leave a link to the blob — the step used to remove-then-create, so the slower
+    /// one failed on the entry the faster one had just made.
+    #[test]
+    fn concurrent_links_of_one_file_all_succeed() {
+        let cache = TempRepo::new();
+        let (blobs, snap) = (cache.blobs(), cache.snapshot());
+        let name = "UD-Q4_K_XL/m.gguf";
+        fs::write(blobs.join(SHA_A), b"weights").unwrap();
+        let failures: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        (0..50)
+                            .filter_map(|_| link_into_snapshot(&snap, name, SHA_A).err())
+                            .map(|e| e.to_string())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+        assert!(
+            failures.is_empty(),
+            "{} failed: {:?}",
+            failures.len(),
+            &failures[..1]
+        );
+        assert_eq!(fs::read(snap.join(name)).unwrap(), b"weights");
+        // No temporary names are left behind beside it.
+        let leftovers: Vec<_> = fs::read_dir(snap.join("UD-Q4_K_XL"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![std::ffi::OsString::from("m.gguf")]);
+    }
+
+    /// Two processes with the same pid (two containers on one mounted cache) but their own tokens
+    /// never build under the same temp name, so neither can clear or rename the other's file; and
+    /// one process's names stay stable in its token and distinct in sequence.
+    #[test]
+    fn temp_names_are_per_process() {
+        let dest = Path::new("snap/m.gguf");
+        let (a, b) = (temp_name(dest, 1, 0xA, 0), temp_name(dest, 1, 0xB, 0));
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), dest.parent());
+        assert_ne!(temp_name(dest, 1, 0xA, 0), temp_name(dest, 1, 0xA, 1));
+        assert_eq!(process_token(), process_token());
+        let ours = fresh_temp_beside(dest).unwrap();
+        let name = ours.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.contains(&format!("{:016x}", process_token())),
+            "{name}"
+        );
+    }
+
+    /// A temp left at the name a new link is about to use — a crashed process that held this pid —
+    /// is cleared, so the link is made instead of failing on `AlreadyExists`.
+    #[test]
+    fn a_stale_temp_is_cleared_before_reuse() {
+        let cache = TempRepo::new();
+        let (blobs, snap) = (cache.blobs(), cache.snapshot());
+        fs::write(blobs.join(SHA_A), b"weights").unwrap();
+        let temp = snap.join(".m.gguf.1234-0.tmp");
+        fs::write(&temp, b"half of an old copy").unwrap();
+
+        clear_stale_temp(&temp).unwrap();
+        link_blob(blob_link_target("m.gguf", SHA_A), &temp).expect("the name is free again");
+        assert_eq!(fs::read(&temp).unwrap(), b"weights");
+        clear_stale_temp(&snap.join(".absent.tmp")).expect("nothing there is fine");
+    }
+
+    /// An entry pointing somewhere else (a stale link from another blob) is replaced, and one that
+    /// already names the blob is left exactly as it is.
+    #[test]
+    fn a_stale_link_is_replaced_and_a_right_one_kept() {
+        let cache = TempRepo::new();
+        let (blobs, snap) = (cache.blobs(), cache.snapshot());
+        let sha_b = "b".repeat(64);
+        fs::write(blobs.join(SHA_A), b"old").unwrap();
+        fs::write(blobs.join(&sha_b), b"new").unwrap();
+        link_into_snapshot(&snap, "m.gguf", SHA_A).unwrap();
+        link_into_snapshot(&snap, "m.gguf", &sha_b).unwrap();
+        assert_eq!(fs::read(snap.join("m.gguf")).unwrap(), b"new");
+        assert!(names_blob(
+            &snap.join("m.gguf"),
+            &blob_link_target("m.gguf", &sha_b)
+        ));
+        assert!(!names_blob(
+            &snap.join("m.gguf"),
+            &blob_link_target("m.gguf", SHA_A)
+        ));
+    }
+
+    /// `refs/main` is written only once the snapshot is complete: a pull that fails partway leaves
+    /// no ref advertising a commit whose files are missing, and a pull that succeeds leaves exactly
+    /// the commit.
+    #[test]
+    fn refs_main_is_written_only_after_the_snapshot() {
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-refs", 3, 20_000);
+        hub.remove(&files[2]);
+        let cache = TempRepo::new();
+        let repo_dir = cache.0.path().join("models--org--repo");
+        let refs = repo_dir.join("refs").join("main");
+        populate_snapshot(
+            &hub.origin(),
+            &repo_dir,
+            "org/repo",
+            "c1",
+            &files,
+            &[],
+            1,
+            &progress::group(),
+        )
+        .expect_err("a missing shard must fail the pull");
+        assert!(
+            !refs.exists(),
+            "refs/main names a commit whose snapshot is incomplete"
+        );
+
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-refs-ok", 2, 20_000);
+        let primary = populate_snapshot(
+            &hub.origin(),
+            &repo_dir,
+            "org/repo",
+            "c1",
+            &files,
+            &[],
+            1,
+            &progress::group(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&refs).unwrap(), "c1");
+        assert_eq!(fs::read(primary).unwrap(), hub.body(&files[0]));
     }
 
     // -----------------------------------------------------------------------
@@ -1299,6 +1997,30 @@ mod tests {
         assert_eq!(
             fs::read(cache.snapshot().join(&files[0])).unwrap(),
             hub.body(&files[0])
+        );
+    }
+
+    /// A ranged download prepares its partial for out-of-order writes. Only Windows has anything
+    /// to observe (the sparse attribute, which the committed blob keeps); `infr-plat`'s own test
+    /// covers what the preparation does to allocation on every OS.
+    #[cfg(windows)]
+    #[test]
+    fn a_ranged_partial_is_sparse_on_windows() {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
+
+        let hub = TestHub::start();
+        let files = hub.add_shards("m-sparse", 1, big());
+        let cache = TempRepo::new();
+
+        pull_one(&hub, &cache, &files, 4).unwrap();
+
+        let blob = cache.blobs().join(hub.sha(&files[0]));
+        let attrs = fs::metadata(&blob).unwrap().file_attributes();
+        assert_ne!(
+            attrs & FILE_ATTRIBUTE_SPARSE_FILE,
+            0,
+            "the ranged partial was never marked sparse (attributes {attrs:#x})"
         );
     }
 

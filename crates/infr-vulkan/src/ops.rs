@@ -44,49 +44,47 @@ fn hash_spv(spv: &[u32]) -> u64 {
 /// `constant_id` of `W64` in `shaders/wave64.glsl`.
 pub(crate) const WAVE64_SPEC_ID: u32 = 1000;
 
-/// Build a kernel, PANICKING on any failure — the surface every production dispatch path uses (see
-/// [`try_make_compute_kernel`] for the fallible one and for why the panics read the way they do).
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn make_compute_kernel(
-    device: &ash::Device,
-    pcache: vk::PipelineCache,
-    name: &'static str,
-    spv: &[u32],
-    n_buf: usize,
-    push_size: u32,
+/// The subgroup width the wave64 path pins every pipeline to.
+const WAVE64_WIDTH: u32 = 64;
+
+/// How a pipeline's subgroup is pinned: `requiredSubgroupSize`, and whether it is created with
+/// `REQUIRE_FULL_SUBGROUPS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SubgroupPin {
+    pub size: u32,
+    pub full: bool,
+}
+
+/// The [`SubgroupPin`] for a kernel that asked for `required_sg`, or `None` to leave the width to
+/// the driver.
+///
+/// On the wave64 path every pipeline pins [`WAVE64_WIDTH`], whatever it asked for, and asks for
+/// full subgroups wherever the spec allows it (a literal `local_size_x` that is a multiple of 64,
+/// VUID-02759): there every subgroup holds 64 invocations, which `wave64.glsl` splits into two
+/// 32-lane halves. A workgroup of at most 32 invocations cannot ask for it; `wave64.glsl` runs such
+/// a workgroup as one subgroup, which `VulkanBackend::new_with` checks once per device
+/// (`caps::check_wave64_layout`).
+pub(crate) fn subgroup_pin(
     required_sg: Option<u32>,
-    push_descriptor: bool,
-    max_push_constants: u32,
-    rte_f16: bool,
     wave64: bool,
-) -> ComputeKernel {
-    try_make_compute_kernel(
-        device,
-        pcache,
-        name,
-        spv,
-        n_buf,
-        push_size,
-        required_sg,
-        push_descriptor,
-        max_push_constants,
-        rte_f16,
-        wave64,
-    )
-    .unwrap_or_else(|e| {
-        panic!(
-            "{e} — kernel build does not yet thread Result to this call site (see docs/audit.md \
-             ops.rs finding 2)"
-        )
-    })
+    local_size: Option<[u32; 3]>,
+) -> Option<SubgroupPin> {
+    if wave64 {
+        return Some(SubgroupPin {
+            size: WAVE64_WIDTH,
+            full: local_size.is_some_and(|l| l[0] % WAVE64_WIDTH == 0),
+        });
+    }
+    required_sg.map(|size| SubgroupPin { size, full: true })
 }
 
 /// Build one kernel's Vulkan objects, returning an error instead of aborting the process.
 ///
-/// The fallible surface exists for capability PROBES: a probe dispatched to find out whether a
-/// device can honour a tier must be able to answer "no" (a driver that returns a null pipeline for
-/// an unsupported coopmat config is exactly the case being probed for), and a panic there would
-/// turn a refused tier into a crashed process.
+/// The kernel cache (`VulkanBackend::kernel_inner`) turns an error into a panic, after releasing
+/// its lock. The fallible surface exists for capability PROBES: a probe dispatched to find out
+/// whether a device can honour a tier must be able to answer "no" (a driver that returns a null
+/// pipeline for an unsupported coopmat config is exactly the case being probed for), and a panic
+/// there would turn a refused tier into a crashed process.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_make_compute_kernel(
@@ -98,14 +96,16 @@ pub(crate) fn try_make_compute_kernel(
     push_size: u32,
     required_sg: Option<u32>,
     push_descriptor: bool,
-    max_push_constants: u32,
+    limits: crate::caps::KernelLimits,
     rte_f16: bool,
     wave64: bool,
 ) -> Result<ComputeKernel> {
     // The device's real `maxPushConstantsSize` — Vulkan only GUARANTEES 128 bytes, and every push
     // block here was sized against that floor by inspection. Checked before the layout is built so
     // an oversize block names itself instead of surfacing as a driver-side VUID.
-    crate::caps::check_push_constant_size(name, push_size, max_push_constants).map_err(be)?;
+    crate::caps::check_push_constant_size(name, push_size, limits.push_constants).map_err(be)?;
+    // Same for the workgroup size baked into the module.
+    crate::caps::check_kernel_workgroup(name, spv, &limits).map_err(be)?;
     // `spv` itself stays the kernel's identity (`spv_hash` below): the patch is a function of the
     // module and the device, so the same `spv` always builds the same pipeline here.
     let rte_patched = rte_f16.then(|| crate::spirv::with_rte_f16(spv)).flatten();
@@ -186,14 +186,14 @@ pub(crate) fn try_make_compute_kernel(
         .map_entries(std::slice::from_ref(&w64_entry))
         .data(&w64_data);
     if wave64 {
-        // Pin every pipeline to 64 without REQUIRE_FULL_SUBGROUPS (local_size 32 kernels can't meet it).
-        req_sz = req_sz.required_subgroup_size(64);
-        stage = stage.specialization_info(&w64_spec).push_next(&mut req_sz);
-    } else if let Some(sz) = required_sg {
-        req_sz = req_sz.required_subgroup_size(sz);
-        stage = stage
-            .flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS)
-            .push_next(&mut req_sz);
+        stage = stage.specialization_info(&w64_spec);
+    }
+    if let Some(pin) = subgroup_pin(required_sg, wave64, crate::spirv::local_size(spv)) {
+        req_sz = req_sz.required_subgroup_size(pin.size);
+        if pin.full {
+            stage = stage.flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+        }
+        stage = stage.push_next(&mut req_sz);
     }
     // Everything built so far, for the error paths below (nothing else may return early past here
     // without releasing them).
@@ -357,7 +357,7 @@ impl VulkanBackend {
         n_buf: usize,
         push_size: u32,
     ) -> ComputeKernel {
-        self.kernel_inner(name, spv, n_buf, push_size, None, self.shared.wave64)
+        self.kernel_inner(name, spv, n_buf, push_size, None)
     }
 
     /// Like `kernel`, but pins the pipeline's subgroup size (coopmat needs wave32 on RDNA3).
@@ -377,30 +377,19 @@ impl VulkanBackend {
             n_buf,
             push_size,
             (sg_size > 0).then_some(sg_size),
-            self.shared.wave64,
         )
     }
 
-    /// Wave64-NATIVE subgroup kernel: pins 64 WITHOUT the W64 wave32-halves emulation, so the
-    /// `-DSG=64` SPIR-V runs as plain full-wave subgroup ops. Only valid where 64 is pinnable
-    /// (the caller gates on the backend's wave64 flag); anywhere else it would fail pipeline
-    /// creation exactly the way an unpinnable `kernel_sg` size does.
-    pub(crate) fn kernel_sg64_native(
-        &self,
-        name: &'static str,
-        spv: &[u32],
-        n_buf: usize,
-        push_size: u32,
-    ) -> ComputeKernel {
-        self.kernel_inner(name, spv, n_buf, push_size, Some(64), false)
-    }
-
-    /// Shared fetch-or-build for [`Self::kernel`]/[`Self::kernel_sg`]/[`Self::kernel_sg64_native`].
-    /// The build runs UNDER the
-    /// cache lock (via the `entry` API) so exactly one thread compiles a given `name` on
-    /// concurrent first use — the old lock→get→unlock→compile→lock→insert had two racing threads
-    /// both build the full shader+pipeline+pool and the second `insert` overwrite (and leak for
-    /// process life) the first's Vulkan objects.
+    /// Shared fetch-or-build for [`Self::kernel`]/[`Self::kernel_sg`]. The build runs UNDER the
+    /// cache lock so exactly one thread compiles a given `name` on concurrent first use — the old
+    /// lock→get→unlock→compile→lock→insert had two racing threads both build the full
+    /// shader+pipeline+pool and the second `insert` overwrite (and leak for process life) the
+    /// first's Vulkan objects.
+    ///
+    /// A build that fails still panics (this surface is infallible until B98 threads a `Result`
+    /// through), but only after the lock is released: a panic while holding it would poison the
+    /// cache, and every later kernel request in the process would panic on the poison instead of
+    /// building.
     fn kernel_inner(
         &self,
         name: &'static str,
@@ -408,13 +397,13 @@ impl VulkanBackend {
         n_buf: usize,
         push_size: u32,
         required_sg: Option<u32>,
-        wave64: bool,
     ) -> ComputeKernel {
         let mut map = self.shared.kernels.lock().unwrap();
-        let mut built = false;
-        let k = *map.entry(name).or_insert_with(|| {
-            built = true;
-            make_compute_kernel(
+        let cached = map.get(name).copied();
+        let built = cached.is_none();
+        let k = match cached {
+            Some(k) => k,
+            None => match try_make_compute_kernel(
                 &self.shared.device,
                 self.shared.pipeline_cache,
                 name,
@@ -423,15 +412,31 @@ impl VulkanBackend {
                 push_size,
                 required_sg,
                 self.shared.push_descriptor.is_some(),
-                self.shared.max_push_constants,
+                self.kernel_limits(),
                 self.shared
                     .rte_f16
                     .load(std::sync::atomic::Ordering::Relaxed),
-                wave64,
-            )
-        });
+                self.shared.wave64,
+            ) {
+                Ok(k) => *map.entry(name).or_insert(k),
+                Err(e) => {
+                    drop(map);
+                    panic!(
+                        "{e} — kernel build does not yet thread Result to this call site (see \
+                         docs/backlog.md B98)"
+                    )
+                }
+            },
+        };
         drop(map);
         if built {
+            // One line per pipeline this backend creates, with what it was created with, so two
+            // builds' kernel sets can be compared (`RUST_LOG=infr_vulkan::kernels=debug`).
+            tracing::debug!(
+                target: "infr_vulkan::kernels",
+                "kernel built: {name} sg={} n_buf={n_buf} push={push_size}",
+                required_sg.map_or_else(|| "-".to_string(), |s| s.to_string()),
+            );
             self.shared.persist_pipeline_cache(); // new pipeline -> debounced disk save
         } else {
             // Cache HIT: the cache is keyed on `name` alone, so a name reused with a different
@@ -643,6 +648,214 @@ impl VulkanBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave64_pins_every_pipeline_to_64_and_full_only_where_allowed() {
+        let wg = |x| Some([x, 1, 1]);
+        // Wave32 devices: exactly what the kernel asked for, always with full subgroups.
+        assert_eq!(subgroup_pin(None, false, wg(64)), None);
+        assert_eq!(
+            subgroup_pin(Some(32), false, wg(32)),
+            Some(SubgroupPin {
+                size: 32,
+                full: true
+            })
+        );
+        assert_eq!(
+            subgroup_pin(Some(16), false, wg(128)),
+            Some(SubgroupPin {
+                size: 16,
+                full: true
+            })
+        );
+        // Wave64: 64 whatever was asked, including nothing; full only for a multiple of 64.
+        for asked in [None, Some(16), Some(32)] {
+            for (x, full) in [(32, false), (64, true), (96, false), (256, true)] {
+                assert_eq!(
+                    subgroup_pin(asked, true, wg(x)),
+                    Some(SubgroupPin { size: 64, full }),
+                    "asked {asked:?}, local_size_x {x}"
+                );
+            }
+            assert_eq!(
+                subgroup_pin(asked, true, None),
+                Some(SubgroupPin {
+                    size: 64,
+                    full: false
+                }),
+                "an unreadable workgroup size must not claim full subgroups"
+            );
+        }
+    }
+
+    /// Every built module that touches subgroups is covered by `shaders/wave64.glsl` (it carries
+    /// the `W64` specialization constant), is a cooperative-matrix kernel (never dispatched on the
+    /// wave64 path), or is on the short list of kernels whose subgroup arithmetic holds at ANY
+    /// width. A covered module must also be one the header's two modes fit — a workgroup of at most
+    /// 32 invocations, or `local_size_x` a multiple of 64 so the host can ask for full subgroups —
+    /// and use only operations the header remaps. In a module with more than 32 invocations every
+    /// plain reduction must come with its cluster-32 twin of the same opcode (the macro emits both;
+    /// a lone plain one, say from a header included before `wave64.glsl`, spans both halves of a
+    /// 64-lane subgroup on a wave64 device).
+    #[test]
+    fn subgroup_kernels_are_wave64_safe() {
+        use std::collections::HashMap;
+        // SPIR-V enumerants (unified spec 1.6).
+        const OP_CAPABILITY: u32 = 17;
+        const CAPABILITY_COOPMAT: u32 = 6022; // CooperativeMatrixKHR
+        const OP_CONSTANT: u32 = 43;
+        const OP_DECORATE: u32 = 71;
+        const DECORATION_SPEC_ID: u32 = 1;
+        const DECORATION_BUILTIN: u32 = 11;
+        const OP_ELECT: u32 = 333;
+        const OP_FADD: u32 = 350;
+        const OP_UMIN: u32 = 354;
+        const OP_ARITH_FIRST: u32 = 349; // OpGroupNonUniformIAdd
+        const OP_ARITH_LAST: u32 = 364; // OpGroupNonUniformLogicalXor
+        const OP_QUAD_LAST: u32 = 366; // OpGroupNonUniformQuadSwap
+        const OP_ROTATE: u32 = 4431; // OpGroupNonUniformRotateKHR
+        const REDUCE: u32 = 0;
+        const INCLUSIVE_SCAN: u32 = 1;
+        const CLUSTERED_REDUCE: u32 = 3;
+        // SubgroupSize, NumSubgroups, SubgroupId, SubgroupLocalInvocationId.
+        const SUBGROUP_BUILTINS: [u32; 4] = [36, 38, 40, 41];
+        // SubgroupEq/Ge/Gt/Le/LtMask.
+        const LANE_MASKS: std::ops::RangeInclusive<u32> = 4416..=4420;
+        // The workgroup `wave64.glsl` runs as one subgroup rather than as 32-lane halves.
+        const WHOLE_MAX: u32 = 32;
+        const HOW_TO_ADD: &str = "remap it in shaders/wave64.glsl the way subgroupAdd is \
+                                  (a cluster-32 twin under VW_HALVES), then allow its opcode here";
+        // Kernels written for any subgroup width, read for it: `moe_topk.comp` reduces with
+        // subgroupMax/Min, picks a lane with subgroupElect and walks `gl_NumSubgroups` partials,
+        // none of which assumes 32 lanes; `wave64_probe.comp` reads the real subgroups on purpose.
+        const WIDTH_AGNOSTIC: &[&str] = &["moe_topk", "wave64_probe"];
+
+        let (mut covered, mut agnostic, mut coopmat) = (0, 0, 0);
+        for entry in std::fs::read_dir(env!("OUT_DIR")).expect("OUT_DIR") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().is_none_or(|e| e != "spv") {
+                continue;
+            }
+            let name = path.file_stem().unwrap().to_string_lossy().into_owned();
+            let spv = crate::gemm::spv_words(&std::fs::read(&path).expect("read spv"));
+            let mut consts = HashMap::new();
+            let (mut w64, mut uses, mut cm, mut bad) = (false, false, false, Vec::new());
+            let (mut elects, mut fadd_scans) = (0usize, 0usize);
+            // Per opcode: plain reductions, and cluster-size ids of the clustered ones.
+            let mut plain: HashMap<u32, usize> = HashMap::new();
+            let mut clustered: Vec<(u32, u32)> = Vec::new();
+            let mut at = 5usize;
+            while at < spv.len() {
+                let wc = (spv[at] >> 16) as usize;
+                assert!(wc > 0 && at + wc <= spv.len(), "{name}: malformed SPIR-V");
+                let (op, ins) = (spv[at] & 0xffff, &spv[at..at + wc]);
+                match op {
+                    OP_CAPABILITY => cm |= ins[1] == CAPABILITY_COOPMAT,
+                    OP_CONSTANT if wc == 4 => {
+                        consts.insert(ins[2], ins[3]);
+                    }
+                    OP_DECORATE if wc == 4 && ins[2] == DECORATION_SPEC_ID => {
+                        w64 |= ins[3] == WAVE64_SPEC_ID;
+                    }
+                    OP_DECORATE if wc == 4 && ins[2] == DECORATION_BUILTIN => {
+                        if SUBGROUP_BUILTINS.contains(&ins[3]) {
+                            uses = true;
+                        } else if LANE_MASKS.contains(&ins[3]) {
+                            uses = true;
+                            bad.push(format!("lane-mask builtin {}", ins[3]));
+                        }
+                    }
+                    OP_ELECT => {
+                        uses = true;
+                        elects += 1;
+                    }
+                    OP_ARITH_FIRST..=OP_ARITH_LAST => {
+                        uses = true;
+                        match ins[4] {
+                            REDUCE => *plain.entry(op).or_default() += 1,
+                            INCLUSIVE_SCAN if op == OP_FADD => fadd_scans += 1,
+                            CLUSTERED_REDUCE => clustered.push((op, ins[6])),
+                            g => bad.push(format!(
+                                "opcode {op} with group operation {g}: {HOW_TO_ADD}"
+                            )),
+                        }
+                    }
+                    o if (OP_ELECT..=OP_QUAD_LAST).contains(&o) || o == OP_ROTATE => {
+                        uses = true;
+                        bad.push(format!("opcode {o}: {HOW_TO_ADD}"));
+                    }
+                    _ => {}
+                }
+                at += wc;
+            }
+            if !uses {
+                continue;
+            }
+            if cm {
+                // Cooperative-matrix kernels never run on the wave64 path: the backend drops every
+                // coopmat tier there (`!wave64` on `coopmat_f16` in `VulkanBackend::new_with`),
+                // because a coopmat fragment spans the whole 64-lane subgroup.
+                coopmat += 1;
+                continue;
+            }
+            if !w64 {
+                assert!(
+                    WIDTH_AGNOSTIC.iter().any(|k| name.starts_with(k)),
+                    "{name}: uses subgroups without including wave64.glsl (and is not one of the \
+                     width-agnostic kernels) — on a wave64 device its subgroups are 64 lanes"
+                );
+                agnostic += 1;
+                continue;
+            }
+            let local = crate::spirv::local_size(&spv)
+                .unwrap_or_else(|| panic!("{name}: no readable LocalSize"));
+            let invocations: u32 = local.iter().product();
+            assert!(
+                invocations <= WHOLE_MAX || local[0].is_multiple_of(64),
+                "{name}: workgroup {local:?} is neither at most {WHOLE_MAX} invocations nor 64-aligned \
+                 in x, so wave64.glsl can neither run it as one subgroup nor ask for full ones"
+            );
+            let mut twins: HashMap<u32, usize> = HashMap::new();
+            for (op, id) in clustered {
+                match consts.get(&id) {
+                    Some(32) => *twins.entry(op).or_default() += 1,
+                    Some(&n) if n < 32 && 32 % n == 0 => {}
+                    n => bad.push(format!(
+                        "opcode {op} clustered at {n:?}, which does not divide 32"
+                    )),
+                }
+            }
+            if invocations > WHOLE_MAX {
+                // `vw_half_elect` is the elect's twin: a cluster-32 UMin.
+                *plain.entry(OP_UMIN).or_default() += elects;
+                for (op, &n) in &plain {
+                    let t = twins.get(op).copied().unwrap_or(0);
+                    if n > t {
+                        bad.push(format!(
+                            "opcode {op}: {n} plain reduction(s) (elects counted as UMin) but {t} \
+                             cluster-32 twin(s) — one spans both halves; {HOW_TO_ADD}"
+                        ));
+                    }
+                }
+                // `vw_half_inclusive_add` scans twice beside its plain twin.
+                if fadd_scans % 3 != 0 {
+                    bad.push(format!(
+                        "{fadd_scans} float inclusive scans, not three per subgroupInclusiveAdd"
+                    ));
+                }
+            }
+            assert!(
+                bad.is_empty(),
+                "{name}: includes wave64.glsl but is not wave64-safe: {bad:?}"
+            );
+            covered += 1;
+        }
+        assert!(
+            covered > 0 && agnostic > 0 && coopmat > 0,
+            "matched {covered} wave64.glsl modules, {agnostic} width-agnostic and {coopmat} \
+             coopmat ones — the check ran over nothing"
+        );
+    }
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]

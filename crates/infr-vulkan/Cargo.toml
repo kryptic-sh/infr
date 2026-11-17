@@ -16,7 +16,6 @@ parity = []
 
 [build-dependencies]
 infr-core.workspace = true
-spv-hoard.workspace = true
 
 [dependencies]
 infr-prof.workspace = true
@@ -35,6 +34,7 @@ libc.workspace = true
 # element-space expert strides to the per-expert BYTE stride the STREAMED shaders' pointer
 # arithmetic needs; single source of truth with the GGUF loader instead of a second hand-kept table.
 infr-gguf.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 memmap2.workspace = true
@@ -42,5 +42,3 @@ memmap2.workspace = true
 # `*_matches_host` unit tests in `adapter.rs`).
 infr-testkit.workspace = true
 infr-plat.workspace = true
-# CPU reference for the native EXL3 projection parity test.
-infr-cpu.workspace = true

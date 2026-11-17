@@ -4,7 +4,7 @@
 //! Split out from [`pcache`](crate::pcache) for one reason: this crate is `#![cfg(target_os =
 //! "macos")]`, so nothing in it is built — let alone tested — by the Linux CI jobs or on the dev
 //! box. A module that touches no Metal type can still be compiled and run standalone
-//! (`rustc --test crates/infr-metal/src/pcache_blob.rs`), which is how the logic below was
+//! (`tests/pcache_blob.rs` includes this file by path), which is how the logic below is
 //! exercised off-Mac. [`idcache`](crate::idcache) is the precedent; keep this file free of `metal`
 //! and of anything that pulls in the crate graph (that is also why the FNV of the MSL source
 //! arrives as a `u64` rather than being hashed here — the hash itself is
@@ -47,7 +47,17 @@ const MAX_NAME_LEN: usize = 256;
 /// `name_count ++ (name_len ++ name)* ++ archive`. `names` should be sorted+deduped by the caller
 /// so the same archive produces the same bytes (a stable payload means an unchanged run rewrites
 /// an identical file rather than churning the disk).
-pub(crate) fn encode(names: &[String], archive: &[u8]) -> Vec<u8> {
+///
+/// `None` for anything [`decode`] would reject — too many names, an empty or over-long name, no
+/// archive bytes. Stored anyway, such a payload would decode to a miss on every later launch, so
+/// the cache would silently never hit; refusing here lets the caller give up visibly instead.
+pub(crate) fn encode(names: &[String], archive: &[u8]) -> Option<Vec<u8>> {
+    if names.len() > MAX_NAMES
+        || names.iter().any(|n| n.is_empty() || n.len() > MAX_NAME_LEN)
+        || archive.is_empty()
+    {
+        return None;
+    }
     let mut out = Vec::with_capacity(4 + names.len() * 24 + archive.len());
     out.extend_from_slice(&(names.len() as u32).to_le_bytes());
     for n in names {
@@ -55,7 +65,7 @@ pub(crate) fn encode(names: &[String], archive: &[u8]) -> Vec<u8> {
         out.extend_from_slice(n.as_bytes());
     }
     out.extend_from_slice(archive);
-    out
+    Some(out)
 }
 
 /// Inverse of [`encode`]. `None` on anything malformed — a truncated header, a length that runs
@@ -138,11 +148,13 @@ impl KeyInputs<'_> {
 /// `MTLDevice.name` → a file-name token, so a Mac with two GPUs (an Intel Mac's iGPU + dGPU) never
 /// hands one device the other's compiled pipelines.
 ///
-/// The escape is INJECTIVE, not merely "safe": folding every non-alphanumeric to `_` would let two
-/// device names that differ only in punctuation (a trailing `+` vs `-`) collide onto ONE file —
-/// exactly the wrong-blob-for-the-device bug this token exists to prevent. Alphanumerics pass
-/// through lowercased; everything else
-/// (including `_` itself, so no input can forge another's escape) becomes `_<hex>`.
+/// The escape is injective up to ASCII case, not merely "safe": folding every non-alphanumeric to
+/// `_` would let two device names that differ only in punctuation (a trailing `+` vs `-`) collide
+/// onto ONE file. Alphanumerics pass through lowercased; everything else (including `_` itself, so
+/// no input can forge another's escape) becomes `_<hex>`. Case is folded on purpose: macOS volumes
+/// are case-insensitive by default, so names differing only in case would share a file however
+/// the token spelled them. Such a pair never loads each other's pipelines — the cache key carries
+/// the device name verbatim — it only rebuilds the shared file whenever the other device ran last.
 ///
 /// An empty result means "no usable device name" and the caller declines to cache rather than
 /// sharing one `metal-pipelines-.bin` between devices.
@@ -177,7 +189,7 @@ mod tests {
             names(&["rmsnorm"]),
             names(&["a", "linear_quik_q4k", "moe_down_routed_iq3s", "z"]),
         ] {
-            let payload = encode(&set, &archive);
+            let payload = encode(&set, &archive).expect("encodable");
             let (got_names, got_archive) = decode(&payload).expect("round-trip");
             assert_eq!(got_names, set);
             assert_eq!(got_archive, archive);
@@ -186,7 +198,47 @@ mod tests {
         // The archive is taken to the END of the payload, so its size is not stored twice and
         // cannot disagree with itself.
         let one = names(&["k"]);
-        assert_eq!(encode(&one, &archive).len(), 4 + 2 + 1 + archive.len());
+        assert_eq!(
+            encode(&one, &archive).unwrap().len(),
+            4 + 2 + 1 + archive.len()
+        );
+    }
+
+    /// `encode` must refuse exactly what `decode` rejects: a payload past the manifest limits
+    /// would be stored and then miss on every launch. Each limit round-trips at its edge and is
+    /// refused one past it.
+    #[test]
+    fn encode_refuses_what_decode_would_reject() {
+        let archive = vec![7u8; 16];
+        let at_count: Vec<String> = (0..MAX_NAMES).map(|i| format!("k{i}")).collect();
+        let (got, _) = decode(&encode(&at_count, &archive).expect("MAX_NAMES names"))
+            .expect("MAX_NAMES names decode");
+        assert_eq!(got, at_count);
+        let mut over_count = at_count.clone();
+        over_count.push("one_more".into());
+        assert!(
+            encode(&over_count, &archive).is_none(),
+            "MAX_NAMES + 1 names"
+        );
+
+        let at_len = vec!["n".repeat(MAX_NAME_LEN)];
+        let (got, _) = decode(&encode(&at_len, &archive).expect("MAX_NAME_LEN name"))
+            .expect("MAX_NAME_LEN name decodes");
+        assert_eq!(got, at_len);
+        assert!(
+            encode(&["n".repeat(MAX_NAME_LEN + 1)], &archive).is_none(),
+            "a name one past MAX_NAME_LEN"
+        );
+        // Past u16: the length field would have truncated, not just tripped the cap.
+        assert!(
+            encode(&["n".repeat(usize::from(u16::MAX) + 2)], &archive).is_none(),
+            "a name whose length does not fit the u16 field"
+        );
+        assert!(
+            encode(&[String::new()], &archive).is_none(),
+            "an empty name"
+        );
+        assert!(encode(&names(&["a"]), &[]).is_none(), "no archive");
     }
 
     /// Every way the framing can be damaged must be a clean MISS (rebuild), never a panic and never
@@ -196,7 +248,7 @@ mod tests {
     #[test]
     fn malformed_payloads_are_rejected_not_guessed() {
         let archive = vec![7u8; 512];
-        let good = encode(&names(&["alpha", "beta"]), &archive);
+        let good = encode(&names(&["alpha", "beta"]), &archive).unwrap();
         assert!(decode(&good).is_some(), "the fixture must be valid");
 
         // Truncated anywhere in the header/manifest.
@@ -231,7 +283,10 @@ mod tests {
         assert!(decode(&bad_utf8).is_none(), "non-utf8 name");
 
         // No archive bytes at all: Metal never wrote a zero-byte archive, so this is damage.
-        assert!(decode(&encode(&names(&["a"]), &[])).is_none(), "no archive");
+        assert!(
+            decode(&good[..good.len() - archive.len()]).is_none(),
+            "no archive"
+        );
     }
 
     /// `KernelCache` compares the key BYTE-FOR-BYTE, so a field that fell out of the composition
@@ -324,10 +379,12 @@ mod tests {
     }
 
     /// The blob file name is what keeps two GPUs in one Mac off each other's compiled pipelines,
-    /// so the device token must be INJECTIVE as well as file-name safe.
+    /// so the device token must be injective (up to ASCII case) as well as file-name safe.
     #[test]
-    fn the_device_token_is_filename_safe_and_injective() {
+    fn the_device_token_is_filename_safe_and_injective_up_to_case() {
         assert_eq!(device_token("AppleM2"), "applem2");
+        // Folded on purpose: a case-insensitive volume would put both on one file anyway.
+        assert_eq!(device_token("APPLEM2"), device_token("applem2"));
         assert_eq!(device_token("Apple M2 Max"), "apple_20m2_20max");
 
         let raw = [

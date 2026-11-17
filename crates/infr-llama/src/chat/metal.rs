@@ -49,7 +49,7 @@ impl MetalSeamChat {
             return Ok(false);
         }
         self.mtp_head = Some(crate::mtp::load_mtp_head(
-            self.model.weights(),
+            self.model.gguf(),
             self.model.config(),
         )?);
         Ok(true)
@@ -101,7 +101,7 @@ impl ChatModel for MetalSeamChat {
         // Metal trunk + head, instead of the plain session decode. The committed stream is the
         // target's greedy stream (the same invariant Vulkan MTP holds), so the two are
         // token-identical — pinned by the greedy-equivalence check in the CLI validation.
-        if !crate::sampling::adjusts_logits(req) && self.wants_mtp()? {
+        if self.wants_mtp()? {
             let head = self.mtp_head.as_ref().expect("wants_mtp loaded it");
             return crate::mtp::generate_mtp_spec_metal(&self.model, head, prompt, max_new, |p| {
                 on_piece(p)
@@ -202,9 +202,14 @@ impl ChatModel for SpecMetalChat {
         &mut self,
         prompt: &str,
         max_new: usize,
-        _req: Option<&crate::sampling::RequestCtx>,
+        req: Option<&crate::sampling::RequestCtx>,
         on_piece: &mut dyn FnMut(&str),
     ) -> Result<GenStats> {
+        // `generate_metal_spec` takes no request state: it decodes greedily on the process
+        // sampler, so a request's logit bias or min-p would be ignored.
+        if let Some(r) = req {
+            r.sampling().refuse_seam_only_fields("Metal speculative")?;
+        }
         self.ensure_sessions()?;
         // Split borrows: sessions come out of the options for the call.
         let mut ts = self.target_session.take().unwrap();

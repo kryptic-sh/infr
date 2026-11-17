@@ -42,7 +42,7 @@ const VK_TOL: f32 = 2e-2;
 #[test]
 #[ignore = "requires a Vulkan-capable GPU"]
 fn vulkan_linear_all_weight_quants_m1_match_the_host_oracle() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -57,7 +57,7 @@ fn vulkan_linear_all_weight_quants_m1_match_the_host_oracle() {
 #[test]
 #[ignore = "requires a Vulkan-capable GPU"]
 fn vulkan_linear_all_weight_quants_m4_match_the_host_oracle() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -70,7 +70,7 @@ fn vulkan_linear_all_weight_quants_m4_match_the_host_oracle() {
 #[test]
 #[ignore = "requires a Vulkan-capable GPU"]
 fn vulkan_linear_dense_dtypes_match_the_host_oracle() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

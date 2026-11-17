@@ -10,10 +10,6 @@ pub enum DType {
     Bf16,
     I32,
     U32,
-    /// Dense signed 16-bit integers (1 elem, 2 bytes, no scale). NOT a quant format — the only
-    /// producer is EXL3 checkpoints, whose `trellis` tensors are `I16` word arrays the trellis
-    /// decoder reads (see `infr_cpu::exl3`); no backend dequants or uploads it as weights.
-    I16,
     // legacy round quants
     Q4_0,
     Q4_1,
@@ -133,7 +129,7 @@ impl DType {
     pub fn dense_bytes(self, n: usize) -> Option<usize> {
         let sz = match self {
             DType::F32 | DType::I32 | DType::U32 => 4,
-            DType::F16 | DType::Bf16 | DType::I16 => 2,
+            DType::F16 | DType::Bf16 => 2,
             _ => return None,
         };
         Some(n * sz)
@@ -255,25 +251,11 @@ pub fn moe_paged_mmq_ok(dt: DType) -> bool {
 
 pub type Shape = Vec<usize>;
 
-/// Physical layout of a KV cache whose rows are scattered across a page pool: logical pages of
-/// `page_rows` keys are mapped through `table` (one u32 physical page id per entry, plus a repeat of
-/// the last page) to their rows. Only the attention kernels read this; a cache without one is linear.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PageMap {
-    pub table: TensorId,
-    pub page_rows: u32,
-    /// First row of this slot's private block inside the pool. Reads ignore it (the table carries
-    /// the mapping); stores bias into it, because new rows never land in a shared page.
-    pub row_base: usize,
-}
-
 /// Shape + dtype of a tensor value flowing through the graph.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TensorDesc {
     pub shape: Shape,
     pub dtype: DType,
-    /// `Some` only on a KV cache that is not stored contiguously. `None` is the linear layout.
-    pub pages: Option<PageMap>,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -282,7 +264,6 @@ impl TensorDesc {
         Self {
             shape: shape.into(),
             dtype,
-            pages: None,
         }
     }
 

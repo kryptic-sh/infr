@@ -85,7 +85,7 @@ fn bench(iters: usize, bytes: usize, mut f: impl FnMut()) -> f64 {
 #[test]
 #[ignore = "requires a Vulkan GPU + local Scout GGUF (or scratch fallback); perf probe, not a correctness test"]
 fn bandwidth_probe() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

@@ -229,9 +229,7 @@ impl DeviceOpts {
         // `--ctx` shares the size grammar (`8192`, `256k`, `50%`) with INFR_CTX; a typo fails fast
         // here (the check `cmd_serve` used to own).
         if let Some(c) = &self.ctx {
-            let spec = infr_core::parse_size(c)
-                .ok_or_else(|| anyhow!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)"))?;
-            layer.device.ctx = Some(Some(spec));
+            layer.device.ctx = Some(Some(parse_ctx_flag(c)?));
         }
         // `-u 0` stays "adaptive": the value is carried verbatim and the seam's `ubatch_rows`
         // filters `v > 0`, exactly as it did when this was published as INFR_UBATCH=0. Likewise
@@ -267,7 +265,8 @@ impl DeviceOpts {
 #[derive(clap::Args)]
 struct SamplingOpts {
     /// Sampling temperature (0 = greedy/argmax). Config `sampling.temp` / INFR_TEMP. Default: the
-    /// model's recommended value (arch-family table + any generation_config.json beside the model)
+    /// model's recommended value (arch-family table, then any generation_config.json beside the
+    /// model, then the GGUF's own `general.sampling.*` keys)
     /// — e.g. 0.6 for Qwen3, 1.0 for Gemma; 0.6 fallback. The startup banner prints the effective
     /// value.
     #[arg(long, value_name = "T")]
@@ -328,20 +327,45 @@ impl SamplingOpts {
     }
 }
 
+/// `infr tune` actions.
+#[derive(Subcommand)]
+enum TuneCmd {
+    /// The device, the key the tuning table matches it by, the rows that matched, then every
+    /// parameter's value and the level it came from (default, a table row, the tuning file, or a
+    /// config / environment / command-line setting).
+    Show {
+        /// Vulkan device (`Vulkan0`, `Vulkan1`, …). Unset = the default device.
+        #[arg(long)]
+        dev: Option<String>,
+        /// Print JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Every tunable parameter (of `family`, if given): kind, declared range, qualifier axis, the
+    /// default rule, and its value on the device.
+    List {
+        /// Only this family (`gemv_sg`, `attn_flash`, …).
+        family: Option<String>,
+        /// Vulkan device (`Vulkan0`, `Vulkan1`, …). Unset = the default device.
+        #[arg(long)]
+        dev: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Download + cache a model (`org/repo[:quant]` from HuggingFace, or a path to a `.gguf`).
     Pull { model: String },
-    /// List models in the local cache (what `infr pull` downloaded).
-    #[command(alias = "list")]
-    Ls,
-    /// Remove a cached model: `org/repo` deletes the whole repo, `org/repo:quant` just that quant.
-    #[command(alias = "remove")]
-    Rm { model: String },
     /// List the Vulkan physical devices infr can see — index, name, type, VRAM — marking the
     /// device the default (no `--dev`) path binds. The index is the `--dev VulkanN` / `INFR_DEV`
     /// handle. Reports each device's external-memory extensions (GPU↔GPU / dma-buf feasibility).
     Devices,
+    /// The per-device Vulkan kernel tuning parameters: which value each one has on a device and
+    /// where it came from (`show`), or every parameter with its range and default rule (`list`).
+    Tune {
+        #[command(subcommand)]
+        action: TuneCmd,
+    },
     /// Interactive terminal chat (auto-pulls if missing).
     Run {
         model: String,
@@ -460,26 +484,6 @@ enum Cmd {
         json: bool,
         /// Shared device/config flags: `--dev` (Vulkan/metal/cpu), `-u`/`--ubatch`, `-t`/`--threads`
         /// (`--ctx` is accepted too; it just sets INFR_CTX).
-        #[command(flatten)]
-        device: DeviceOpts,
-    },
-    /// Perplexity of a text file — same scheme as llama.cpp's `llama-perplexity` (`-f`/`-c`/
-    /// `--chunks`), so the two are directly comparable on the same model + text.
-    Perplexity {
-        model: String,
-        /// Text file to score.
-        #[arg(short = 'f', long = "file")]
-        file: PathBuf,
-        /// Window length in tokens (matches llama-perplexity -c).
-        #[arg(short = 'c', long = "ctx-size", default_value_t = 512)]
-        ctx_size: usize,
-        /// Score at most this many windows (matches llama-perplexity --chunks). Unset = all.
-        #[arg(long)]
-        chunks: Option<usize>,
-        /// GPU layers (matches llama-bench -ngl): 0 = CPU reference backend.
-        #[arg(long = "n-gpu-layers", visible_alias = "ngl", default_value_t = 999)]
-        ngl: usize,
-        /// Shared device/config flags (`--dev`, `-t`).
         #[command(flatten)]
         device: DeviceOpts,
     },
@@ -658,7 +662,6 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
             device.overrides(&mut layer)?;
             sampling.overrides(&mut layer);
         }
-        Cmd::Perplexity { device, .. } => device.overrides(&mut layer)?,
         Cmd::Bench { device, .. } => {
             device.overrides(&mut layer)?;
             // Benchmarks decode a FIXED token count (llama-bench semantics): never stop at EOS — a
@@ -667,14 +670,34 @@ fn cli_flag_layer(cmd: &Cmd) -> anyhow::Result<PartialConfig> {
             // override it wins over the file and the environment just as that overwrite did.
             layer.sampling.ignore_eos = Some(true);
         }
-        Cmd::Pull { .. }
-        | Cmd::Ls
-        | Cmd::Rm { .. }
-        | Cmd::Devices
-        | Cmd::Multi { .. }
-        | Cmd::Compare { .. } => {}
+        // `multi --ctx` is the same knob as `serve --ctx`: it lands on `device.ctx`, so `INFR_CTX`
+        // and a config file's `[device] ctx` reach `infr multi` exactly as they reach `serve`.
+        Cmd::Multi { ctx, .. } => {
+            if let Some(c) = ctx {
+                layer.device.ctx = Some(Some(parse_ctx_flag(c)?));
+            }
+        }
+        Cmd::Tune { action } => {
+            let (TuneCmd::Show { dev, .. } | TuneCmd::List { dev, .. }) = action;
+            if let Some(d) = dev.as_deref() {
+                match parse_dev_spec(d).with_context(|| format!("invalid --dev `{d}`"))? {
+                    backend @ Backend::Vulkan(_) => {
+                        layer.device.dev = Some(Some(dev_spec_of(&backend)));
+                    }
+                    _ => anyhow::bail!("`infr tune` tunes Vulkan devices; `--dev {d}` is not one"),
+                }
+            }
+        }
+        Cmd::Pull { .. } | Cmd::Devices | Cmd::Compare { .. } => {}
     }
     Ok(layer)
+}
+
+/// A `--ctx` value, in the size grammar (`8192`, `256k`, `50%`) `INFR_CTX` shares; a typo fails
+/// fast, before anything is downloaded or loaded.
+fn parse_ctx_flag(c: &str) -> anyhow::Result<infr_core::SizeSpec> {
+    infr_core::parse_size(c)
+        .ok_or_else(|| anyhow!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)"))
 }
 
 fn dispatch(
@@ -685,9 +708,8 @@ fn dispatch(
 ) -> anyhow::Result<()> {
     match cmd {
         Cmd::Pull { model } => cmd_pull(&model, cfg),
-        Cmd::Ls => cmd_ls(),
-        Cmd::Rm { model } => cmd_rm(&model),
         Cmd::Devices => cmd_devices(cfg),
+        Cmd::Tune { action } => cmd_tune(&action, cfg),
         Cmd::Run {
             model,
             message,
@@ -710,8 +732,8 @@ fn dispatch(
             models,
             addr,
             parallel,
-            ctx,
-        } => cmd_multi(&models, &addr, parallel, ctx.as_deref(), cfg, specified),
+            ..
+        } => cmd_multi(&models, &addr, parallel, cfg, specified),
         Cmd::Bench {
             model,
             n_prompt,
@@ -723,14 +745,6 @@ fn dispatch(
             json,
             ..
         } => cmd_bench(&model, n_prompt, n_gen, depth, pg, reps, ngl, json, cfg),
-        Cmd::Perplexity {
-            model,
-            file,
-            ctx_size,
-            chunks,
-            ngl,
-            ..
-        } => cmd_perplexity(&model, &file, ctx_size, chunks, ngl, cfg),
         Cmd::Compare {
             models,
             sweep,
@@ -745,17 +759,6 @@ fn dispatch(
             turns,
             llama_bench,
         } => {
-            if cfg
-                .prof
-                .out
-                .iter()
-                .chain(cfg.prof.trace.iter())
-                .any(|path| !path.as_os_str().is_empty())
-            {
-                tracing::warn!(
-                    "compare reuses profiling output paths; later processes may overwrite reports"
-                );
-            }
             if sweep {
                 cmd_compare_sweep(
                     &models,
@@ -767,7 +770,7 @@ fn dispatch(
                     ubatch,
                     &llama_bench,
                     cfg,
-                    overrides,
+                    &global_flag_args(overrides),
                 )
             } else {
                 if models.len() > 1 {
@@ -788,11 +791,31 @@ fn dispatch(
                     &turns,
                     &llama_bench,
                     cfg,
-                    overrides,
+                    &global_flag_args(overrides),
                 )
             }
         }
     }
+}
+
+/// The global `--config` / `--set` flags this invocation was given, spelled for a child `infr`.
+///
+/// `infr compare` measures infr by running `infr bench` as a child process, which resolves its own
+/// configuration: without these it would be measured under defaults while the diffusion arm, run
+/// in-process, used the full configuration — rows of one comparison under different settings. The
+/// environment (`INFR_*`) and the discovered config file are inherited already; only the flags are
+/// not.
+fn global_flag_args(overrides: &ConfigOverrides) -> Vec<std::ffi::OsString> {
+    let mut args = Vec::new();
+    if let Some(path) = &overrides.config_path {
+        args.push("--config".into());
+        args.push(path.clone().into_os_string());
+    }
+    for set in &overrides.sets {
+        args.push("--set".into());
+        args.push(set.into());
+    }
+    args
 }
 
 use anyhow::{anyhow, Context};
@@ -862,17 +885,16 @@ fn default_thread_count() -> Option<usize> {
     infr_plat::cpu::physical_cores().filter(|&cores| cores < logical)
 }
 
-/// `prof.out` and `prof.trace` → the profiler runtime's report and timeline destinations.
+/// `prof.out` → the profiler runtime's report destination.
 ///
 /// PERMANENT, like [`publish_thread_count`] and unlike the deleted transitional env bridge:
-/// `infr-prof-rt` writes from a C `atexit` hook that has no receiver and no config to
+/// `infr-prof-rt` writes its JSON from a C `atexit` hook that has no receiver and no config to
 /// borrow, and it cannot depend on `infr-core` to fetch one (the dependency runs the other way).
-/// So the resolved values are PUSHED into the reporter here, once, in `main` — a value handed
+/// So the resolved value is PUSHED into the reporter here, once, in `main` — a value handed
 /// across an API boundary, not laundered through the environment. `None` leaves the reporter on
-/// stderr only, exactly as unset `INFR_PROF_OUT` / `INFR_PROF_TRACE` did.
+/// stderr only, exactly as an unset `INFR_PROF_OUT` did.
 fn publish_profile_out(cfg: &Config) {
     infr_prof_rt::set_profile_out(cfg.prof.out.as_deref().and_then(|p| p.to_str()));
-    infr_prof_rt::set_trace_out(cfg.prof.trace.as_deref().and_then(|p| p.to_str()));
 }
 
 /// Is `path` a usable LOCAL model: an existing regular FILE whose extension is `.gguf`
@@ -880,12 +902,11 @@ fn publish_profile_out(cfg: &Config) {
 /// gate that keeps `resolve` from treating a cwd entry that merely collides with an `org/repo` ref
 /// as the model, and from sending a typo'd local path to a confusing network pull. Split out so the
 /// classification is unit-testable without the network.
-/// An existing local GGUF or EXL3 safetensors weight file.
 fn is_local_gguf(path: &Path) -> bool {
     path.is_file()
-        && path.extension().is_some_and(|e| {
-            e.eq_ignore_ascii_case("gguf") || e.eq_ignore_ascii_case("safetensors")
-        })
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
 }
 
 /// Resolve a model arg to (gguf_path, optional tokenizer_json_path).
@@ -905,13 +926,13 @@ fn resolve(model: &str, cfg: &Config) -> anyhow::Result<(PathBuf, Option<PathBuf
             Ok(r) => infr_hub::ensure(&r, cfg).map_err(|e| anyhow!("{e}"))?,
             Err(e) if p.exists() => {
                 anyhow::bail!(
-                    "`{model}` exists but is not a weight file — pass a path to a `.gguf` or an \
-                     EXL3 `.safetensors`, or an `org/repo[:quant]` HuggingFace ref ({e})"
+                    "`{model}` exists but is not a `.gguf` file — pass a path to a `.gguf`, or an \
+                     `org/repo[:quant]` HuggingFace ref ({e})"
                 );
             }
             Err(e) => {
                 anyhow::bail!(
-                    "`{model}` is not a weight file and not a valid `org/repo[:quant]` ref ({e})"
+                    "`{model}` is not a `.gguf` file and not a valid `org/repo[:quant]` ref ({e})"
                 );
             }
         }
@@ -973,6 +994,83 @@ fn cmd_devices(cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `infr tune show|list` — the tuning parameter set of one Vulkan device, resolved exactly as a
+/// run on it would resolve it (the same config, environment and command line), by creating the
+/// backend.
+fn cmd_tune(action: &TuneCmd, cfg: &Arc<Config>) -> anyhow::Result<()> {
+    let be = infr_vulkan::VulkanBackend::new_with(Arc::clone(cfg)).map_err(|e| anyhow!("{e}"))?;
+    let report = be.tuning_report();
+    match action {
+        TuneCmd::Show { json: false, .. } => {
+            // print-ok: program OUTPUT — the `infr tune show` listing users pipe and paste.
+            print!("{}", report.show());
+        }
+        TuneCmd::Show { json: true, .. } => {
+            // print-ok: program OUTPUT — the `infr tune show --json` document.
+            println!("{}", serde_json::to_string_pretty(&tune_json(report))?);
+        }
+        TuneCmd::List { family, .. } => {
+            if let Some(f) = family.as_deref() {
+                let known = report
+                    .params
+                    .iter()
+                    .any(|p| p.key.split('.').next() == Some(f));
+                if !known {
+                    let mut families: Vec<&str> = report
+                        .params
+                        .iter()
+                        .filter_map(|p| p.key.split('.').next())
+                        .collect();
+                    families.dedup();
+                    anyhow::bail!("no tuning family `{f}` (families: {})", families.join(", "));
+                }
+            }
+            // print-ok: program OUTPUT — the `infr tune list` listing.
+            print!("{}", report.list(family.as_deref()));
+        }
+    }
+    Ok(())
+}
+
+/// `infr tune show --json`'s document.
+fn tune_json(r: &infr_vulkan::tuning::TuningReport) -> serde_json::Value {
+    let d = &r.device;
+    serde_json::json!({
+        "device": {
+            "name": d.name,
+            "vendor": d.vendor(),
+            "vendor_id": format!("{:#06x}", d.vendor_id),
+            "device_id": format!("{:#06x}", d.device_id),
+            "driver": d.driver,
+            "driver_version": format!("{:#x}", d.driver_version),
+            "arch": d.arch,
+            "integrated": d.integrated,
+            "compute_units": d.compute_units,
+            "subgroup_min": d.subgroup_min,
+            "subgroup_max": d.subgroup_max,
+            "wave64": d.wave64,
+            "max_shared_memory": d.max_shared_memory,
+        },
+        "match": r.match_key(),
+        "hash": r.hash(),
+        "rows_off": r.rows_off,
+        "rows": r.rows.iter().map(|row| serde_json::json!({
+            "id": row.id,
+            "level": row.level,
+            "verified": row.verified,
+            "params": row.params,
+        })).collect::<Vec<_>>(),
+        "params": r.params.iter().map(|p| serde_json::json!({
+            "key": p.key,
+            "value": p.value,
+            "source": p.source,
+            "kind": p.kind,
+            "range": p.range,
+            "axis": p.axis,
+        })).collect::<Vec<_>>(),
+    })
+}
+
 fn cmd_pull(model: &str, cfg: &Config) -> anyhow::Result<()> {
     let r = infr_hub::ModelRef::parse(model).map_err(|e| anyhow!("{e}"))?;
     // `pull` checks HF for the repo's latest commit and updates a stale cache (run/serve stay
@@ -980,50 +1078,6 @@ fn cmd_pull(model: &str, cfg: &Config) -> anyhow::Result<()> {
     let path = infr_hub::ensure_latest(&r, cfg).map_err(|e| anyhow!("{e}"))?;
     // print-ok: program OUTPUT — the `infr devices` / `infr resolve` listing users pipe.
     println!("{}", path.display());
-    Ok(())
-}
-
-fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1000.0 && u < UNITS.len() - 1 {
-        v /= 1000.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
-}
-
-fn cmd_ls() -> anyhow::Result<()> {
-    let store = infr_hub::Store::discover().map_err(|e| anyhow!("{e}"))?;
-    let models = store.list();
-    let names: Vec<String> = models.iter().map(|m| store.model_tag(m)).collect();
-    let w = names.iter().map(String::len).max().unwrap_or(0).max(5);
-    // print-ok: program OUTPUT — the `infr ls` table users read and pipe.
-    println!("{:<w$}  {:<10} {:>6}", "MODEL", "SIZE", "SHARDS");
-    for (m, name) in models.iter().zip(&names) {
-        // print-ok: program OUTPUT — one `infr ls` table row.
-        println!("{name:<w$}  {:<10} {:>6}", human_size(m.bytes), m.shards);
-    }
-    Ok(())
-}
-
-fn cmd_rm(model: &str) -> anyhow::Result<()> {
-    let infr_hub::ModelRef::Repo { repo, sel } =
-        infr_hub::ModelRef::parse(model).map_err(|e| anyhow!("{e}"))?
-    else {
-        anyhow::bail!("'{model}' is not a cached model reference (expected org/repo[:quant])");
-    };
-    let store = infr_hub::Store::discover().map_err(|e| anyhow!("{e}"))?;
-    let r = store
-        .remove(&repo, sel.as_deref())
-        .map_err(|e| anyhow!("{e}"))?;
-    // print-ok: program OUTPUT — confirmation of what `infr rm` deleted.
-    println!("removed {model} ({} freed)", human_size(r.bytes));
     Ok(())
 }
 
@@ -1299,7 +1353,8 @@ fn cmd_run(
     // the ONE shared `Chat` (infr_llama::model) that owns history + `<think>`-stripping and drives
     // the single REPL below. Every backend does history-based multi-turn; qwen35 (Qwen3.5) rides
     // the SAME standard `ChatModel` structs (issue #30). Model-aware chat sampling first (arch-family
-    // table + generation_config sibling; a user `--temp`/`--top-k`/`--top-p` already in the env wins).
+    // table, generation_config sibling, then the GGUF's `general.sampling.*` keys; a user
+    // `--temp`/`--top-k`/`--top-p` already in the env wins).
     let cfg = apply_model_sampling_defaults(cfg, specified, &gguf);
     let mut model = build_chat_model(&gguf, tok.as_deref(), is_dg, &cfg)?;
     // Compile the lazily-built pipelines NOW (like `serve` does before its first request) so the
@@ -1772,19 +1827,26 @@ struct SeamGenerator {
     /// The backend label `/status` reports. Fixed at construction: reading anything off `model`
     /// would wait on its lock, which a generation holds for its whole run.
     backend: &'static str,
+    /// The model's logits row length (`Config::vocab`), read once at construction for the same
+    /// reason: the server's `logit_bias` id check asks for it on the request path.
+    vocab: usize,
 }
 
 impl SeamGenerator {
+    /// `tok` is the sidecar the model was loaded with, so the renderer encodes with the same
+    /// vocabulary.
     fn new(
         gguf_path: &Path,
+        tok: Option<&Path>,
         model: Box<dyn infr_llama::chat::ChatModel + Send>,
         backend: &'static str,
         cfg: Arc<Config>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             backend,
+            vocab: model.render_model().config().vocab,
             model: std::sync::Mutex::new(model),
-            renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
+            renderer: infr_llama::chat::OaiRenderer::open_with_tokenizer(gguf_path, tok, cfg)?,
             watch: infr_llama::WeightWatch::open_model(gguf_path)?,
         })
     }
@@ -1796,17 +1858,22 @@ struct ParallelGenerator {
     engine: infr_llama::parallel::ParallelSeam,
     renderer: infr_llama::chat::OaiRenderer,
     watch: infr_llama::WeightWatch,
+    /// The model's logits row length, as for [`SeamGenerator`].
+    vocab: usize,
 }
 
 impl ParallelGenerator {
+    /// `tok` is the sidecar the model was loaded with, as for [`SeamGenerator::new`].
     fn new(
         gguf_path: &Path,
+        tok: Option<&Path>,
         engine: infr_llama::parallel::ParallelSeam,
         cfg: Arc<Config>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
+            vocab: engine.model().config().vocab,
             engine,
-            renderer: infr_llama::chat::OaiRenderer::open(gguf_path, cfg)?,
+            renderer: infr_llama::chat::OaiRenderer::open_with_tokenizer(gguf_path, tok, cfg)?,
             watch: infr_llama::WeightWatch::open_model(gguf_path)?,
         })
     }
@@ -1875,12 +1942,34 @@ impl GenBackend for SeamGenerator {
         req: &infr_llama::sampling::RequestCtx,
         on_piece: &mut dyn FnMut(&str),
     ) -> anyhow::Result<infr_llama::GenStats> {
-        let mut model = self.model.lock().expect("serve generator poisoned");
+        let mut model = lock_recovered(&self.model);
         match constraint {
             Some(c) => model.generate_constrained(prompt, max_new, c, Some(req), on_piece),
             None => model.generate(prompt, max_new, Some(req), on_piece),
         }
     }
+}
+
+/// Take the serialised model even when a previous generation PANICKED while holding it.
+///
+/// The server survives a panicking generation (`spawn_blocking` turns it into a failed request),
+/// but the panic poisons this mutex, and an `expect` here would then fail every later request for
+/// the life of the process. A step that unwound half-way can leave the session's record of cached
+/// tokens describing work that never happened, so `reset_kv` drops that token/session state before
+/// reuse and the next request re-prefills from scratch. That is ALL it resets: state inside the
+/// backend that the panic broke (a lock it poisoned, a half-recorded submit) is not repaired, and
+/// requests that reach it will keep failing. Clearing the poison makes the reset happen once, not
+/// on every later request.
+fn lock_recovered(
+    m: &std::sync::Mutex<Box<dyn infr_llama::chat::ChatModel + Send>>,
+) -> std::sync::MutexGuard<'_, Box<dyn infr_llama::chat::ChatModel + Send>> {
+    m.lock().unwrap_or_else(|poisoned| {
+        let mut model = poisoned.into_inner();
+        tracing::warn!("a previous generation panicked; discarding its KV session");
+        model.reset_kv();
+        m.clear_poison();
+        model
+    })
 }
 
 impl GenBackend for ParallelGenerator {
@@ -1924,6 +2013,7 @@ fn request_sampling(p: &infr_server::GenParams) -> infr_llama::sampling::Request
         presence_penalty: p.presence_penalty.unwrap_or(0.0),
         frequency_penalty: p.frequency_penalty.unwrap_or(0.0),
         repeat_penalty: p.repeat_penalty.unwrap_or(1.0),
+        min_p: p.min_p,
         logit_bias: p.logit_bias.clone(),
         ..Default::default()
     }
@@ -1941,6 +2031,10 @@ impl infr_server::ChatGenerator for SeamGenerator {
         }
     }
 
+    fn vocab_size(&self) -> usize {
+        self.vocab
+    }
+
     fn chat(
         &self,
         messages: &[infr_engine::ChatMessage],
@@ -1952,23 +2046,9 @@ impl infr_server::ChatGenerator for SeamGenerator {
     ) -> anyhow::Result<infr_server::ChatOutcome> {
         run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
     }
-
-    fn complete(
-        &self,
-        prompt: &str,
-        params: &infr_server::GenParams,
-        cancel: &Arc<std::sync::atomic::AtomicBool>,
-        on_text: &mut dyn FnMut(&str),
-    ) -> anyhow::Result<infr_server::ChatOutcome> {
-        run_completion(self, prompt, params, cancel, on_text)
-    }
 }
 
 impl infr_server::ChatGenerator for ParallelGenerator {
-    fn validate_images(&self, images: &[std::sync::Arc<[u8]>]) -> anyhow::Result<()> {
-        self.engine.model().preflight_images(images)
-    }
-
     fn status(&self) -> infr_server::GeneratorStatus {
         let vram = self.engine.vram();
         infr_server::GeneratorStatus {
@@ -1984,6 +2064,10 @@ impl infr_server::ChatGenerator for ParallelGenerator {
         }
     }
 
+    fn vocab_size(&self) -> usize {
+        self.vocab
+    }
+
     fn chat(
         &self,
         messages: &[infr_engine::ChatMessage],
@@ -1995,60 +2079,6 @@ impl infr_server::ChatGenerator for ParallelGenerator {
     ) -> anyhow::Result<infr_server::ChatOutcome> {
         run_chat(self, messages, tools, tool_choice, params, cancel, on_delta)
     }
-
-    fn complete(
-        &self,
-        prompt: &str,
-        params: &infr_server::GenParams,
-        cancel: &Arc<std::sync::atomic::AtomicBool>,
-        on_text: &mut dyn FnMut(&str),
-    ) -> anyhow::Result<infr_server::ChatOutcome> {
-        run_completion(self, prompt, params, cancel, on_text)
-    }
-}
-
-/// The `/v1/completions` body shared by every serve backend: the raw prompt (plus BOS when the model
-/// wants one) is continued as plain text, with stop sequences applied to the decoded stream.
-fn run_completion(
-    be: &dyn GenBackend,
-    prompt: &str,
-    params: &infr_server::GenParams,
-    cancel: &Arc<std::sync::atomic::AtomicBool>,
-    on_text: &mut dyn FnMut(&str),
-) -> anyhow::Result<infr_server::ChatOutcome> {
-    be.weights().check()?;
-    let prompt = be.renderer().with_bos(prompt);
-    let max_new = params
-        .max_tokens
-        .map(|v| v as usize)
-        .unwrap_or_else(|| be.max_new_default());
-    let req = be
-        .request_ctx(request_sampling(params))
-        .with_cancel(cancel.clone());
-    let mut stops = infr_server::StopMatcher::new(params.stop.clone());
-    let stats = be.generate(&prompt, max_new, None, &req, &mut |piece: &str| {
-        let safe = stops.push(piece);
-        if !safe.is_empty() {
-            on_text(&safe);
-        }
-        if stops.hit() {
-            req.abort();
-        }
-    })?;
-    let tail = stops.flush();
-    if !tail.is_empty() {
-        on_text(&tail);
-    }
-    let finish = if !stops.hit() && stats.n_gen >= max_new {
-        infr_server::Finish::Length
-    } else {
-        infr_server::Finish::Stop
-    };
-    Ok(infr_server::ChatOutcome {
-        finish,
-        prompt_tokens: stats.n_prompt as u32,
-        completion_tokens: stats.n_gen as u32,
-    })
 }
 
 /// Tool-call parsing is enabled only when the request offers at least one tool and has not
@@ -2099,10 +2129,7 @@ fn run_chat(
         // `infr_gguf::watch` for what this can and cannot see.
         be.weights().check()?;
         // `tools` arrives already parsed (a borrowed Value) — no Value→string→Value round-trip.
-        let prompt = be.renderer().render(messages, tools, params.think)?;
-        // The request's images, in marker order, for the prompt encoder (`infr_llama::media`).
-        // Scoped to this call — every generate below runs on this thread.
-        let _media = infr_llama::media::MediaScope::enter(params.images.clone());
+        let prompt = be.renderer().render(messages, tools)?;
         // The request's `max_tokens`/`max_completion_tokens` wins; `sampling.max_new`
         // (INFR_MAX_NEW, default 2048) is the server-side default for requests that don't set one.
         let max_new = params
@@ -2133,7 +2160,11 @@ fn run_chat(
                     &req,
                     &mut |p: &str| body.push_str(p),
                 )
-                .map_err(|e| anyhow::anyhow!("forced tool call failed: {e}"))?;
+                .map_err(|e| {
+                    context_length_exceeded(&e, params.max_tokens.is_some())
+                        .or_else(|| unsupported_sampling(&e))
+                        .unwrap_or_else(|| anyhow::anyhow!("forced tool call failed: {e}"))
+                })?;
             let (name, arguments) = forced_tool_call(&body).ok_or_else(|| {
                 if gstats.n_gen >= max_new {
                     anyhow::anyhow!(
@@ -2144,11 +2175,7 @@ fn run_chat(
                 }
             })?;
             on_delta(infr_engine::Delta::ToolCall { name, arguments });
-            return Ok(infr_server::ChatOutcome {
-                finish: infr_server::Finish::ToolCalls,
-                prompt_tokens: gstats.n_prompt as u32,
-                completion_tokens: gstats.n_gen as u32,
-            });
+            return Ok(chat_outcome(infr_server::Finish::ToolCalls, &gstats));
         }
         let mut stream = infr_engine::ChatStream::new(tool_parsing_allowed(tools, tool_choice));
         // Stop sequences run on the RAW decoded text, BEFORE the reasoning/tool splitter — so a
@@ -2166,17 +2193,23 @@ fn run_chat(
             if infr_engine::prompt_prefills_think(&prompt) {
                 stream.push("<think>", &mut *od);
             }
-            let stats = be.generate(&prompt, max_new, None, &req, &mut |piece: &str| {
-                let safe = stops.push(piece);
-                if !safe.is_empty() {
-                    stream.push(&safe, &mut *od);
-                }
-                // A stop sequence hit aborts THIS sequence's decode at its next poll, freeing the
-                // GPU slot promptly (the server's `cancel` already reaches it through `req`).
-                if stops.hit() {
-                    req.abort();
-                }
-            })?;
+            let stats = be
+                .generate(&prompt, max_new, None, &req, &mut |piece: &str| {
+                    let safe = stops.push(piece);
+                    if !safe.is_empty() {
+                        stream.push(&safe, &mut *od);
+                    }
+                    // A stop sequence hit aborts THIS sequence's decode at its next poll, freeing
+                    // the GPU slot promptly (the server's `cancel` already reaches it through `req`).
+                    if stops.hit() {
+                        req.abort();
+                    }
+                })
+                .map_err(|e| {
+                    context_length_exceeded(&e, params.max_tokens.is_some())
+                        .or_else(|| unsupported_sampling(&e))
+                        .unwrap_or(e)
+                })?;
             // No stop fired: whatever the matcher was holding back was never a stop prefix.
             let tail = stops.flush();
             if !tail.is_empty() {
@@ -2185,57 +2218,97 @@ fn run_chat(
             stats
         };
         stream.finish(on_delta);
-        let finish = if stops.hit() {
-            infr_server::Finish::Stop
-        } else if stats.n_gen >= max_new {
-            // The budget was exhausted (EOS would have broken the loop earlier).
-            infr_server::Finish::Length
-        } else {
-            infr_server::Finish::Stop
-        };
-        Ok(infr_server::ChatOutcome {
-            finish,
-            prompt_tokens: stats.n_prompt as u32,
-            completion_tokens: stats.n_gen as u32,
-        })
+        Ok(chat_outcome(
+            finish_reason(stops.hit(), &stats, max_new),
+            &stats,
+        ))
     }
 }
 
-/// `infr perplexity`: score `file` in `ctx_size`-token windows and print `llama-perplexity`'s
-/// final line.
-fn cmd_perplexity(
-    model: &str,
-    file: &Path,
-    ctx_size: usize,
-    chunks: Option<usize>,
-    ngl: usize,
-    cfg: &Arc<Config>,
-) -> anyhow::Result<()> {
-    let text =
-        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-    let (gguf, tok) = resolve(model, cfg)?;
-    let watch = infr_llama::WeightWatch::open_model(&gguf)?;
-    let cpu = ngl == 0 || matches!(selected_backend(cfg)?, Backend::Cpu);
-    let model = infr_llama::SeamModel::load_with(&gguf, tok.as_deref(), cfg.clone())?;
-    let tokens = model.perplexity_tokens(&text)?;
-    tracing::info!(
-        tokens = tokens.len(),
-        ctx_size,
-        cpu,
-        "perplexity: tokenized {}",
-        file.display()
-    );
-    let report = model.perplexity(&tokens, ctx_size, chunks, cpu, |i, n, ppl| {
-        tracing::info!(chunk = i, of = n, ppl, "perplexity: running estimate");
-    })?;
-    watch.check()?;
-    match report.uncertainty() {
-        // print-ok: program OUTPUT — the `infr perplexity` result line users pipe.
-        Some(u) => println!("Final estimate: PPL = {:.4} +/- {u:.5}", report.ppl()),
-        // print-ok: program OUTPUT — the `infr perplexity` result line users pipe.
-        None => println!("Final estimate: PPL = {:.4}", report.ppl()),
+/// Why an unforced reply ended. A stop sequence is `stop`; a reply that used its whole budget is
+/// `length` — whether that budget was the request's `max_new` or the smaller room the engine found
+/// left in the context (`ctx_full`). Reporting the second as `stop` tells the client a truncated
+/// answer is complete. A reply that ended on EOS is `stop` even when the EOS was its last allowed
+/// token (`natural_stop`; backends that do not report it fall back to the count).
+fn finish_reason(
+    stop_hit: bool,
+    stats: &infr_llama::GenStats,
+    max_new: usize,
+) -> infr_server::Finish {
+    if stop_hit {
+        infr_server::Finish::Stop
+    } else if !stats.natural_stop && (stats.n_gen >= max_new || stats.ctx_full) {
+        infr_server::Finish::Length
+    } else {
+        infr_server::Finish::Stop
     }
-    Ok(())
+}
+
+/// The wire outcome of one generation. `prompt_tokens` is the WHOLE prompt (OpenAI's
+/// `usage.prompt_tokens`), not just the suffix a KV prefix-cache hit left to prefill.
+fn chat_outcome(
+    finish: infr_server::Finish,
+    stats: &infr_llama::GenStats,
+) -> infr_server::ChatOutcome {
+    infr_server::ChatOutcome {
+        finish,
+        prompt_tokens: (stats.n_prompt + stats.n_cached) as u32,
+        completion_tokens: stats.n_gen as u32,
+        cached_tokens: stats.n_cached as u32,
+    }
+}
+
+/// A backend's [`infr_llama::sampling::UnsupportedSampling`] as the server's
+/// [`infr_server::ParamError`], which it answers `400` naming the field; `None` for any other
+/// error.
+fn unsupported_sampling(e: &anyhow::Error) -> Option<anyhow::Error> {
+    let u = e.downcast_ref::<infr_llama::sampling::UnsupportedSampling>()?;
+    Some(
+        infr_server::ParamError {
+            param: u.param,
+            message: u.to_string(),
+        }
+        .into(),
+    )
+}
+
+/// The engine's [`infr_llama::ContextOverflow`] as the server's typed
+/// [`infr_server::ContextLengthExceeded`], which it answers `400 context_length_exceeded` instead
+/// of `500`; `None` for any other error.
+///
+/// The message opens with OpenAI's own wording, because client-side error mappers match on it.
+/// Lowering `max_tokens` is suggested only when the client set it and it is part of the overflow:
+/// a reply budget the client never chose, or one of zero, is nothing it can lower. The length
+/// quoted is the usable one: the engine keeps a row of the context in reserve, so a request the
+/// size of the whole context is refused too, and quoting the full size would read as "fits".
+fn context_length_exceeded(
+    e: &anyhow::Error,
+    client_set_max_tokens: bool,
+) -> Option<anyhow::Error> {
+    let o = e.downcast_ref::<infr_llama::ContextOverflow>()?;
+    let usable = o.max_ctx.saturating_sub(1);
+    let message = if o.gen == 0 {
+        format!(
+            "This model's maximum context length is {} tokens. However, your messages resulted in \
+             {} tokens. Please reduce the length of the messages.",
+            usable, o.prompt
+        )
+    } else {
+        let advice = if client_set_max_tokens {
+            "Please reduce the length of the messages or completion."
+        } else {
+            "Please reduce the length of the messages."
+        };
+        format!(
+            "This model's maximum context length is {} tokens. However, you requested {} tokens \
+             ({} in the messages, {} in the completion). {advice}",
+            usable,
+            o.prompt + o.gen,
+            o.prompt,
+            o.gen
+        )
+    };
+    Some(infr_server::ContextLengthExceeded { message }.into())
 }
 
 /// Benchmark prefill (pp) or decode (tg) tok/s with the same -p/-n/-d/-r interface as
@@ -2411,7 +2484,7 @@ fn bench_mtp_tg(
     reps: usize,
     cfg: &Config,
 ) -> anyhow::Result<MtpBenchStats> {
-    let head = infr_llama::mtp::load_mtp_head(model.weights(), model.config())?;
+    let head = infr_llama::mtp::load_mtp_head(model.gguf(), model.config())?;
     let want = (n_prompt + depth).max(1);
     let prompt = MTP_SENTENCE.repeat(want.div_ceil(10));
     let mut samples = Vec::with_capacity(reps.max(1));
@@ -2769,11 +2842,8 @@ fn cmd_bench_cpu(
     let watch = infr_llama::WeightWatch::open_model(gguf)?;
     let model = infr_llama::SeamModel::load_with(gguf, tok, cfg.clone())?;
     let measure_tg = pg.is_none() && n_gen > 0;
-    // One untimed warmup to build runtime caches before the timed reps.
-    let _ = model.bench(depth.max(1), if measure_tg || pg.is_some() { 1 } else { 0 });
-    let mut samples = Vec::with_capacity(reps);
-    for _ in 0..reps {
-        let ts = if let Some((p, g)) = pg {
+    let rep = || -> anyhow::Result<f64> {
+        Ok(if let Some((p, g)) = pg {
             let s = model.bench(p, g)?; // pg: prefill p + decode g, throughput (p+g)/total
             (p + g) as f64 / (s.prompt_secs + s.decode_secs)
         } else if measure_tg {
@@ -2782,8 +2852,18 @@ fn cmd_bench_cpu(
         } else {
             let s = model.bench(n_prompt, 0)?; // pp: prefill only
             n_prompt as f64 / s.prompt_secs
-        };
-        samples.push(ts);
+        })
+    };
+    // One untimed warmup that IS a timed rep, as llama-bench's warmup run: it builds the model's
+    // CPU resident (backend, bound weights, their caches and any paged arena) that every timed rep
+    // then reuses — each rep still builds its own spin pool — and faults in from the mapping every
+    // weight the reps read. Under greedy sampling (the
+    // default) its tokens are the reps' tokens, so a MoE model's decode routes through the same
+    // experts; a one-token warmup left the first tg rep paying for the experts it had not touched.
+    rep()?;
+    let mut samples = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        samples.push(rep()?);
     }
     let label = if let Some((p, g)) = pg {
         format!("pg{p}+{g}")
@@ -3099,7 +3179,7 @@ fn cmd_compare_sweep(
     ubatch: usize,
     llama_bench: &str,
     cfg: &Arc<Config>,
-    overrides: &ConfigOverrides,
+    globals: &[std::ffi::OsString],
 ) -> anyhow::Result<()> {
     const METRICS: [&str; 4] = ["pp512", "tg128", "tg64@d", "pp4@d"];
     // print-ok: program OUTPUT — an `infr compare` result table row; users pipe and diff it.
@@ -3128,7 +3208,7 @@ fn cmd_compare_sweep(
             ubatch,
             llama_bench,
             cfg.clone(),
-            overrides,
+            globals,
         ) {
             Ok(mb) => mb,
             Err(e) => {
@@ -3254,18 +3334,9 @@ fn compare_infr_dev(dev: &str) -> &str {
     }
 }
 
-fn compare_config_args(overrides: &ConfigOverrides) -> Vec<std::ffi::OsString> {
-    let mut args = Vec::new();
-    if let Some(path) = &overrides.config_path {
-        args.push("--config".into());
-        args.push(path.as_os_str().to_owned());
-    }
-    for value in &overrides.sets {
-        args.push("--set".into());
-        args.push(value.as_str().into());
-    }
-    args
-}
+/// How much of a failed `infr bench` child's stderr its compare cell reports: the end, where the
+/// error is, rather than every log line before it.
+const BENCH_STDERR_LINES: usize = 5;
 
 /// One model's infr-vs-llama.cpp bench harness: resolves the shared model ref once and shells
 /// out to `infr bench --json` / `llama-bench -o json` with MATCHED flags. Both the deep
@@ -3299,7 +3370,9 @@ struct ModelBench {
     /// its own), and that function takes `sampling.ignore_eos` / `sampling.seed` from a
     /// `Config` rather than from the environment.
     cfg: Arc<Config>,
-    infr_config_args: Vec<std::ffi::OsString>,
+    /// This invocation's `--config` / `--set` flags ([`global_flag_args`]), handed to every
+    /// `infr bench` child so it measures under the same configuration as the in-process arm.
+    globals: Vec<std::ffi::OsString>,
 }
 
 impl ModelBench {
@@ -3313,7 +3386,7 @@ impl ModelBench {
         ubatch: usize,
         llama_bench: &str,
         cfg: Arc<Config>,
-        overrides: &ConfigOverrides,
+        globals: &[std::ffi::OsString],
     ) -> anyhow::Result<Self> {
         let exe = std::env::current_exe().context("locating the infr binary")?;
         // infr and llama.cpp share the HF Hub cache and the same `org/repo:quant` ref grammar, so
@@ -3357,7 +3430,7 @@ impl ModelBench {
             reps,
             ubatch,
             cfg,
-            infr_config_args: compare_config_args(overrides),
+            globals: globals.to_vec(),
         })
     }
 
@@ -3368,8 +3441,43 @@ impl ModelBench {
         infr_llama::mtp::has_mtp_head(&self.gguf_path)
     }
 
-    fn infr_command(&self, args: &[&str]) -> std::process::Command {
+    /// Run `infr bench --json` and return the parsed row object (`[{"avg_ts": .., ..}]`'s first
+    /// element) — shared by [`infr`](Self::infr) (`avg_ts`) and [`infr_mtp`](Self::infr_mtp)
+    /// (`mtp_ts`), so both read one shelled-out call's worth of plumbing.
+    fn infr_json(&self, args: &[&str]) -> anyhow::Result<serde_json::Value> {
+        let out = self
+            .bench_command(args)
+            .output()
+            .context("running `infr bench`")?;
+        // A failed child is that cell's error, with what it said: reading its (empty) stdout as
+        // JSON instead reported only "parsing infr bench output" and threw the cause away.
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let tail: Vec<&str> = stderr
+                .trim_end()
+                .lines()
+                .rev()
+                .take(BENCH_STDERR_LINES)
+                .collect();
+            anyhow::bail!(
+                "`infr bench` failed ({}): {}",
+                out.status,
+                tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+            );
+        }
+        serde_json::from_slice(&out.stdout).with_context(|| {
+            format!(
+                "parsing infr bench output: {}",
+                String::from_utf8_lossy(&out.stdout)
+            )
+        })
+    }
+
+    /// The `infr bench --json` child [`infr_json`](Self::infr_json) runs: this invocation's global
+    /// flags, then the bench arguments matched to the llama.cpp arm.
+    fn bench_command(&self, args: &[&str]) -> std::process::Command {
         let mut c = std::process::Command::new(&self.exe);
+        c.args(&self.globals);
         c.arg("bench")
             .arg(&self.model)
             .args(["-r", &self.reps.to_string()]);
@@ -3385,36 +3493,8 @@ impl ModelBench {
         if self.ubatch > 0 {
             c.args(["-u", &self.ubatch.to_string()]);
         }
-        c.args(&self.infr_config_args).args(args).arg("--json");
+        c.args(args).arg("--json");
         c
-    }
-
-    /// Run `infr bench --json` with the invocation's configuration overrides.
-    fn infr_json(&self, args: &[&str]) -> anyhow::Result<serde_json::Value> {
-        let out = self
-            .infr_command(args)
-            .output()
-            .context("running `infr bench`")?;
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::ensure!(
-            out.status.success(),
-            "infr bench exited with {}: {}",
-            out.status,
-            stderr.trim()
-        );
-        for line in stderr.lines() {
-            if line.contains("ERROR") {
-                tracing::error!(model = %self.model, diagnostic = %line, "infr bench");
-            } else if line.contains("WARN") || line.starts_with("warning:") {
-                tracing::warn!(model = %self.model, diagnostic = %line, "infr bench");
-            }
-        }
-        serde_json::from_slice(&out.stdout).with_context(|| {
-            format!(
-                "parsing infr bench output: {}",
-                String::from_utf8_lossy(&out.stdout)
-            )
-        })
     }
 
     /// Run `infr bench` (this binary) and read its single-row [{"avg_ts":X}].
@@ -3890,7 +3970,7 @@ fn cmd_compare(
     turns: &[String],
     llama_bench: &str,
     cfg: &Arc<Config>,
-    overrides: &ConfigOverrides,
+    globals: &[std::ffi::OsString],
 ) -> anyhow::Result<()> {
     let mb = ModelBench::new(
         model,
@@ -3901,7 +3981,7 @@ fn cmd_compare(
         ubatch,
         llama_bench,
         cfg.clone(),
-        overrides,
+        globals,
     )?;
     let infr_b = |args: &[&str]| mb.infr(args);
     let llama_b = |np: usize, ng: usize, args: &[&str]| mb.llama(np, ng, args);
@@ -4076,21 +4156,28 @@ fn arch_sampling(arch: &str) -> (f32, usize, f32) {
         GEMMA3 | GEMMA4 | DIFFUSION_GEMMA => (1.0, 64, 0.95),
         // Meta Llama 3.x / 4 default generation_config: temp 0.6, top_p 0.9, top_k off.
         LLAMA | LLAMA4 => (0.6, 0, 0.9),
-        // DeepSeek: neutral chat default. None of the DeepSeek GGUF distributions ships a
-        // `generation_config.json` sibling for `generation_config_sampling` to override with, and
-        // the family publishes no per-arch recommendation, so all four arch strings stay on the
-        // same neutral values rather than on invented ones.
+        // SmolLM3 (Hugging Face): the model card and generation_config recommend temp 0.6 /
+        // top_p 0.95 and name no top_k, so top_k stays off as for Llama.
+        SMOLLM3 => (0.6, 0, 0.95),
+        // ERNIE 4.5 (Baidu): the checkpoint's generation_config.json sets temp 0.8 / top_p 0.8
+        // and names no top_k; the 21B-A3B MoE GGUF declares the same in `general.sampling.*`.
+        ERNIE4_5 | ERNIE4_5_MOE => (0.8, 0, 0.8),
+        // DeepSeek: neutral chat default. The family publishes no per-arch recommendation, so all
+        // four arch strings stay on the same neutral values rather than on invented ones; a file
+        // that declares its own (`general.sampling.*`, or a `generation_config.json` sibling)
+        // overrides them in `model_sampling_defaults`.
         DEEPSEEK | DEEPSEEK2 | DEEPSEEK32 | DEEPSEEK4 => (0.6, 20, 0.95),
         _ => (0.6, 20, 0.95),
     }
 }
 
-/// Per-field sampling override from a `generation_config.json` sitting BESIDE the model (the HF
-/// convention — the model's OWN recommended generation params). Present for full-repo checkouts,
-/// absent for the GGUF-only distributions `infr pull` fetches (then the [`arch_sampling`] table
-/// drives). Each field is independent — a config that sets only `temperature` overrides just that.
+/// Per-field sampling override from the model's `generation_config.json` (the HF convention — the
+/// model's OWN recommended generation params), found by [`generation_config_path`]. Present for
+/// full-repo checkouts and for repos `infr pull` fetched it from; absent otherwise (then the
+/// [`arch_sampling`] table drives). Each field is independent — a config that sets only
+/// `temperature` overrides just that.
 fn generation_config_sampling(gguf: &std::path::Path) -> (Option<f32>, Option<usize>, Option<f32>) {
-    let Some(path) = gguf.parent().map(|d| d.join("generation_config.json")) else {
+    let Some(path) = generation_config_path(gguf) else {
         return (None, None, None);
     };
     let Ok(text) = std::fs::read_to_string(&path) else {
@@ -4103,14 +4190,42 @@ fn generation_config_sampling(gguf: &std::path::Path) -> (Option<f32>, Option<us
         v.get("temperature")
             .and_then(|x| x.as_f64())
             .map(|x| x as f32),
-        v.get("top_k").and_then(|x| x.as_u64()).map(|x| x as usize),
+        // A negative top_k is "keep all", as in the GGUF layer.
+        v.get("top_k")
+            .and_then(|x| x.as_i64())
+            .map(|x| usize::try_from(x).unwrap_or(0)),
         v.get("top_p").and_then(|x| x.as_f64()).map(|x| x as f32),
     )
 }
 
-/// The model-aware sampling defaults for `gguf`: the [`arch_sampling`] family table, with any
-/// [`generation_config_sampling`] sibling override applied per field. Returns `(temp, top_k, top_p,
-/// source_label)` — the label is for the CLI banner so the effective sampler is never a mystery.
+/// The `generation_config.json` that belongs to `gguf`: the one beside it, else — for a GGUF inside
+/// a Hugging Face cache snapshot — the nearest one between it and the snapshot root.
+///
+/// `infr pull` caches the file at the snapshot ROOT, the repo's own top level, while unsloth-style
+/// repos keep their GGUFs a directory down (`snapshots/<commit>/UD-Q4_K_XL/<file>.gguf`), so
+/// looking only beside the model never found it there. The walk stops at the snapshot root (the
+/// directory directly inside `snapshots/`): above it is the cache, where nothing is this model's. A
+/// GGUF outside any snapshot gets only the file beside it.
+fn generation_config_path(gguf: &std::path::Path) -> Option<std::path::PathBuf> {
+    const NAME: &str = "generation_config.json";
+    let dir = gguf.parent()?;
+    let root = dir
+        .ancestors()
+        .find(|a| a.parent().and_then(|p| p.file_name()) == Some("snapshots".as_ref()))
+        .unwrap_or(dir);
+    dir.ancestors()
+        .take_while(|a| a.starts_with(root))
+        .map(|a| a.join(NAME))
+        .find(|p| p.is_file())
+}
+
+/// The model-aware sampling defaults for `gguf`: the [`arch_sampling`] family table, then any
+/// [`generation_config_sampling`] sibling, then the file's own `general.sampling.*` keys
+/// ([`infr_llama::arch::declared_sampling`]), each applied per field. The GGUF goes last because
+/// it is the artifact actually being run: the converter seeds the keys from the checkout's
+/// `generation_config.json`, but a `--metadata` override or a later edit can change them, and
+/// llama.cpp reads only the GGUF. Returns `(temp, top_k, top_p, source_label)` — the label is for
+/// the CLI banner so the effective sampler is never a mystery.
 fn model_sampling_defaults(gguf: &std::path::Path) -> (f32, usize, f32, String) {
     let arch = infr_llama::arch::arch_of(gguf);
     let (mut t, mut k, mut p) = arch
@@ -4118,18 +4233,22 @@ fn model_sampling_defaults(gguf: &std::path::Path) -> (f32, usize, f32, String) 
         .map(arch_sampling)
         .unwrap_or((0.6, 20, 0.95));
     let mut src = arch.clone().unwrap_or_else(|| "default".to_string());
-    let (gt, gk, gp) = generation_config_sampling(gguf);
-    if gt.is_some() || gk.is_some() || gp.is_some() {
-        src = format!("{}+generation_config", arch.as_deref().unwrap_or("default"));
-    }
-    if let Some(x) = gt {
-        t = x;
-    }
-    if let Some(x) = gk {
-        k = x;
-    }
-    if let Some(x) = gp {
-        p = x;
+    for (layer, (lt, lk, lp)) in [
+        ("generation_config", generation_config_sampling(gguf)),
+        ("gguf", infr_llama::arch::declared_sampling(gguf)),
+    ] {
+        if lt.is_some() || lk.is_some() || lp.is_some() {
+            src = format!("{src}+{layer}");
+        }
+        if let Some(x) = lt {
+            t = x;
+        }
+        if let Some(x) = lk {
+            k = x;
+        }
+        if let Some(x) = lp {
+            p = x;
+        }
     }
     (t, k, p, src)
 }
@@ -4162,6 +4281,14 @@ fn apply_model_sampling_defaults(
     gguf: &std::path::Path,
 ) -> Arc<Config> {
     let (t, k, p, src) = model_sampling_defaults(gguf);
+    let unapplied = infr_llama::arch::unapplied_sampling_keys(gguf);
+    if !unapplied.is_empty() {
+        tracing::warn!(
+            "the model declares sampling settings infr does not apply: {}; only {} are honoured",
+            unapplied.join(", "),
+            infr_llama::arch::APPLIED_SAMPLING_KEYS.join(", "),
+        );
+    }
     let mut out = (**cfg).clone();
     if !specified.is_path_set("sampling.temp") {
         out.sampling.temp = t;
@@ -4227,8 +4354,9 @@ fn cmd_serve(
         );
         let n_slots = engine.n_slots();
         let max_ctx = engine.max_ctx();
-        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine, cfg.clone())?);
+        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> = std::sync::Arc::new(
+            ParallelGenerator::new(&gguf, tok.as_deref(), engine, cfg.clone())?,
+        );
         let rt = tokio::runtime::Runtime::new()?;
         // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!(
@@ -4278,8 +4406,9 @@ fn cmd_serve(
             "warmup: pipelines compiled in {:.1}s",
             t0.elapsed().as_secs_f32()
         );
-        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(SeamGenerator::new(&gguf, m, backend, cfg.clone())?);
+        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> = std::sync::Arc::new(
+            SeamGenerator::new(&gguf, tok.as_deref(), m, backend, cfg.clone())?,
+        );
         let rt = tokio::runtime::Runtime::new()?;
         // print-ok: program OUTPUT — the serve/multi startup banner and routing listing.
         println!("infr serve: {model_id} on http://{sockaddr}  (OpenAI /v1, agnostic seam)");
@@ -4326,7 +4455,6 @@ fn cmd_multi(
     specs: &[String],
     addr: &str,
     parallel: usize,
-    ctx: Option<&str>,
     cfg: &Arc<Config>,
     specified: &PartialConfig,
 ) -> anyhow::Result<()> {
@@ -4343,15 +4471,9 @@ fn cmd_multi(
         );
     }
 
-    // `--ctx` shares the size grammar with the rest of the CLI; validate once, apply to every model.
-    let want_ctx = match ctx {
-        Some(c) => {
-            let spec = infr_core::parse_size(c)
-                .ok_or_else(|| anyhow!("invalid --ctx `{c}` (expected e.g. 8192, 256k, or 50%)"))?;
-            Some(spec)
-        }
-        None => None,
-    };
+    // The per-slot context for every hosted model, from `device.ctx` exactly as `serve` reads it:
+    // `--ctx` (validated into that field by `cli_flag_layer`), else `INFR_CTX` or `[device] ctx`.
+    let want_ctx = cfg.device.ctx;
 
     // Enumerate the device pool once: for validation, round-robin assignment of specs that omit a
     // device, and the routing table's device names.
@@ -4425,8 +4547,9 @@ fn cmd_multi(
             infr_llama::parallel::ParallelSeam::new_on(Some(dev), loaded, parallel, want_ctx)?;
         let n_slots = engine.n_slots();
         let dev_name = engine.device_name();
-        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> =
-            std::sync::Arc::new(ParallelGenerator::new(&gguf, engine, hosted_cfg.clone())?);
+        let generator: std::sync::Arc<dyn infr_server::ChatGenerator> = std::sync::Arc::new(
+            ParallelGenerator::new(&gguf, tok.as_deref(), engine, hosted_cfg.clone())?,
+        );
         routing.push((model_id.clone(), dev, dev_name));
         entries.push((model_id, generator, n_slots));
     }
@@ -4500,6 +4623,44 @@ mod tests {
         assert!(!tool_parsing_allowed(Some(&empty), None));
         assert!(tool_parsing_allowed(Some(&tools), None));
         assert!(!tool_parsing_allowed(Some(&tools), Some("none")));
+    }
+
+    /// A request's `min_p` and `logit_bias` reach the sequence's sampling scope; absent, they stay
+    /// off.
+    #[test]
+    fn request_sampling_carries_min_p_and_logit_bias() {
+        let p = infr_server::GenParams {
+            min_p: Some(0.1),
+            logit_bias: vec![(3, -100.0), (9, 2.0)],
+            ..Default::default()
+        };
+        let s = request_sampling(&p);
+        assert_eq!(s.min_p, Some(0.1));
+        assert_eq!(s.logit_bias, [(3, -100.0), (9, 2.0)]);
+        let s = request_sampling(&infr_server::GenParams::default());
+        assert_eq!(s.min_p, None);
+        assert!(!s.patches_logits());
+    }
+
+    /// A backend's refusal of a sampling field reaches the server as its `ParamError`, which it
+    /// answers 400 naming the field; other errors are left alone.
+    #[test]
+    fn unsupported_sampling_becomes_a_param_error() {
+        let e: anyhow::Error = infr_llama::sampling::UnsupportedSampling {
+            param: "logit_bias",
+            backend: "diffusion-gemma",
+        }
+        .into();
+        let mapped = unsupported_sampling(&e).expect("mapped");
+        let p = mapped
+            .downcast_ref::<infr_server::ParamError>()
+            .expect("a ParamError");
+        assert_eq!(p.param, "logit_bias");
+        assert_eq!(
+            p.message,
+            "logit_bias is not supported by the diffusion-gemma backend"
+        );
+        assert!(unsupported_sampling(&anyhow::anyhow!("boom")).is_none());
     }
 
     /// The forced-call parser accepts only a complete call. Every `None` here is now a failed
@@ -4641,90 +4802,6 @@ mod tests {
     }
 
     #[test]
-    fn compare_forwards_config_and_sets_to_infr() {
-        let cli = Cli::try_parse_from([
-            "infr",
-            "--config",
-            "config with spaces.toml",
-            "--set",
-            "kernels.vulkan.kq_fma_gemv=false",
-            "--set",
-            "kernels.vulkan.mrows_attn=true",
-            "compare",
-            "fixture.gguf",
-        ])
-        .unwrap();
-        let overrides = ConfigOverrides {
-            config_path: cli.config,
-            sets: cli.set,
-            flags: PartialConfig::default(),
-        };
-        let mut mb = ModelBench {
-            exe: PathBuf::from("infr"),
-            model: "fixture.gguf".into(),
-            gguf_path: PathBuf::from("fixture.gguf"),
-            tok_path: None,
-            is_dg: false,
-            llama_model_args: vec!["-m".into(), "fixture.gguf".into()],
-            llama_bench: "llama-bench".into(),
-            dev: "Vulkan0".into(),
-            ngl: 999,
-            threads: 0,
-            reps: 3,
-            ubatch: 0,
-            cfg: Arc::new(Config::default()),
-            infr_config_args: compare_config_args(&overrides),
-        };
-        let cmd = mb.infr_command(&["-p", "4", "-n", "0", "-d", "4096"]);
-        let got: Vec<_> = cmd.get_args().map(|a| a.to_os_string()).collect();
-        let want: Vec<std::ffi::OsString> = [
-            "bench",
-            "fixture.gguf",
-            "-r",
-            "3",
-            "--ngl",
-            "999",
-            "--dev",
-            "Vulkan0",
-            "--config",
-            "config with spaces.toml",
-            "--set",
-            "kernels.vulkan.kq_fma_gemv=false",
-            "--set",
-            "kernels.vulkan.mrows_attn=true",
-            "-p",
-            "4",
-            "-n",
-            "0",
-            "-d",
-            "4096",
-            "--json",
-        ]
-        .into_iter()
-        .map(Into::into)
-        .collect();
-        assert_eq!(got, want);
-        assert!(compare_config_args(&ConfigOverrides::default()).is_empty());
-
-        mb.threads = 4;
-        mb.ubatch = 512;
-        mb.infr_config_args = compare_config_args(&ConfigOverrides {
-            sets: vec!["device.threads=2".into(), "device.ubatch=256".into()],
-            ..Default::default()
-        });
-        let cmd = mb.infr_command(&["-p", "4", "-n", "0", "-d", "4096"]);
-        let child = Cli::try_parse_from(
-            std::iter::once(std::ffi::OsString::from("infr"))
-                .chain(cmd.get_args().map(std::ffi::OsStr::to_os_string)),
-        )
-        .unwrap();
-        let flags = cli_flag_layer(child.cmd.as_ref().unwrap()).unwrap();
-        let cfg = resolve_cfg(&[], flags, &["device.threads=2", "device.ubatch=256"]);
-        assert_eq!(cfg.device.threads, Some(4));
-        assert_eq!(cfg.device.ubatch, Some(512));
-    }
-
-    #[test]
     fn compare_translates_llama_metal_device_for_infr() {
         assert_eq!(compare_infr_dev("MTL0"), "metal");
         assert_eq!(compare_infr_dev("mtl0"), "metal");
@@ -4785,6 +4862,31 @@ mod tests {
         // …and with neither, the default pick.
         let cfg = resolve_cfg(&[], PartialConfig::default(), &[]);
         assert_eq!(selected_backend(&cfg).unwrap(), Backend::Vulkan(None));
+    }
+
+    /// `infr multi` reads its per-slot context from `device.ctx`, as `serve` does: its own `--ctx`
+    /// lands there (and wins over the environment), and without it `INFR_CTX` comes through.
+    /// It used to parse `--ctx` privately, so `INFR_CTX` and `[device] ctx` never reached it.
+    #[test]
+    fn multi_ctx_reaches_the_config_like_serve() {
+        let multi = |ctx: Option<&str>| Cmd::Multi {
+            models: vec!["org/repo".into()],
+            addr: "127.0.0.1:8080".into(),
+            parallel: 1,
+            ctx: ctx.map(str::to_string),
+        };
+        let flags = cli_flag_layer(&multi(Some("32k"))).unwrap();
+        let cfg = resolve_cfg(&[("INFR_CTX", "16k")], flags, &[]);
+        assert_eq!(cfg.device.ctx, Some(infr_core::SizeSpec::Bytes(32 * 1024)));
+
+        let flags = cli_flag_layer(&multi(None)).unwrap();
+        let cfg = resolve_cfg(&[("INFR_CTX", "16k")], flags, &[]);
+        assert_eq!(cfg.device.ctx, Some(infr_core::SizeSpec::Bytes(16 * 1024)));
+
+        assert!(
+            cli_flag_layer(&multi(Some("lots"))).is_err(),
+            "a bad --ctx fails fast"
+        );
     }
 
     #[test]
@@ -4978,7 +5080,7 @@ mod tests {
 
     // ── finding 3: local `.gguf` FILE vs HF ref classifier ──────────────────────────────────────
     #[test]
-    fn local_weights_require_an_existing_supported_file() {
+    fn is_local_gguf_requires_an_existing_gguf_file() {
         // Unique scratch dir (no tempfile dep); cleaned at the end.
         let dir = std::env::temp_dir().join(format!(
             "infr-cli-test-{}-{}",
@@ -4997,11 +5099,6 @@ mod tests {
         let gguf_up = dir.join("model.GGUF");
         std::fs::write(&gguf_up, b"x").unwrap();
         assert!(is_local_gguf(&gguf_up));
-        for filename in ["model.safetensors", "model.SAFETENSORS"] {
-            let path = dir.join(filename);
-            std::fs::write(&path, b"x").unwrap();
-            assert!(is_local_gguf(&path));
-        }
 
         // A directory (even named `*.gguf`) is NOT local → falls through to the HF ref path.
         let dir_gguf = dir.join("weights.gguf");
@@ -5046,6 +5143,229 @@ mod tests {
         assert_eq!(arch_sampling(GEMMA4), (1.0, 64, 0.95));
         // Llama: top_k off (0 = keep all), top_p 0.9.
         assert_eq!(arch_sampling(LLAMA), (0.6, 0, 0.9));
+        // SmolLM3: Llama's top_k off, with its own top_p.
+        assert_eq!(arch_sampling(SMOLLM3), (0.6, 0, 0.95));
+        // ERNIE 4.5: its generation_config.json's temp and top_p, top_k off.
+        assert_eq!(arch_sampling(ERNIE4_5), (0.8, 0, 0.8));
+        assert_eq!(arch_sampling(ERNIE4_5_MOE), (0.8, 0, 0.8));
+    }
+
+    /// A `deepseek4` GGUF carrying `extra` metadata, written to `dir/model.gguf` (a directory of
+    /// its own, so a `generation_config.json` sibling can sit beside it).
+    fn sampling_fixture(dir: &std::path::Path, extra: Vec<(&str, infr_testkit::gguf::Meta)>) {
+        use infr_testkit::gguf::{Meta, SyntheticModel};
+        let mut meta = vec![(
+            "general.architecture".to_string(),
+            Meta::Str(DEEPSEEK4.into()),
+        )];
+        meta.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v)));
+        let model = SyntheticModel {
+            meta,
+            tensors: Vec::new(),
+        };
+        std::fs::write(dir.join("model.gguf"), model.to_gguf_bytes()).expect("write gguf");
+    }
+
+    fn sampling_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("infr-cli-sampling-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    /// The model layers override the family table field by field, in the order sidecar
+    /// `generation_config.json`, then the GGUF's own `general.sampling.*` keys: the GGUF is what
+    /// actually runs. The first case is the shape of the real DeepSeek-V4 file: temp and top_p
+    /// declared, top_k left to the table.
+    #[test]
+    fn gguf_sampling_overrides_the_arch_table_and_the_sidecar() {
+        use infr_testkit::gguf::Meta;
+        let dir = sampling_dir("layers");
+        let gguf = dir.join("model.gguf");
+        let sidecar = dir.join("generation_config.json");
+        let (table_t, table_k, table_p) = arch_sampling(DEEPSEEK4);
+
+        sampling_fixture(&dir, Vec::new());
+        let bare = model_sampling_defaults(&gguf);
+
+        sampling_fixture(
+            &dir,
+            vec![
+                ("general.sampling.temp", Meta::F32(1.0)),
+                ("general.sampling.top_p", Meta::F32(1.0)),
+            ],
+        );
+        let v4 = model_sampling_defaults(&gguf);
+
+        // gguf-py writes top_k as an INT32, and llama.cpp reads a negative one as "keep all".
+        sampling_fixture(&dir, vec![("general.sampling.top_k", Meta::I32(-1))]);
+        let gguf_keep_all = model_sampling_defaults(&gguf).1;
+
+        sampling_fixture(&dir, vec![("general.sampling.temp", Meta::F32(0.8))]);
+        std::fs::write(&sidecar, r#"{"temperature": 0.3, "top_k": -1}"#).expect("write sidecar");
+        let both = model_sampling_defaults(&gguf);
+
+        std::fs::remove_file(&sidecar).expect("remove sidecar");
+        std::fs::remove_file(&gguf).expect("remove gguf");
+        std::fs::remove_dir(&dir).expect("remove temp dir");
+
+        assert_eq!(bare, (table_t, table_k, table_p, DEEPSEEK4.to_string()));
+        assert_eq!(v4, (1.0, table_k, 1.0, format!("{DEEPSEEK4}+gguf")));
+        assert_eq!(gguf_keep_all, 0);
+        assert_eq!(
+            both,
+            (0.8, 0, table_p, format!("{DEEPSEEK4}+generation_config+gguf")),
+            "the GGUF's temp must win over the sidecar's, and the sidecar's top_k -1 means keep all"
+        );
+    }
+
+    /// A bench harness whose `infr` is `exe`, for the compare tests below. No model is resolved:
+    /// these exercise only how the child is spawned and how its outcome is read.
+    fn bench_harness(exe: std::path::PathBuf, globals: Vec<std::ffi::OsString>) -> ModelBench {
+        ModelBench {
+            exe,
+            model: "org/repo:Q4_K_M".into(),
+            gguf_path: "m.gguf".into(),
+            tok_path: None,
+            is_dg: false,
+            llama_model_args: Vec::new(),
+            llama_bench: "llama-bench".into(),
+            dev: "vulkan0".into(),
+            ngl: 99,
+            threads: 0,
+            reps: 1,
+            ubatch: 0,
+            cfg: Arc::new(Config::default()),
+            globals,
+        }
+    }
+
+    /// The `infr bench` child of `infr compare` gets the parent's `--config` and every `--set`, so
+    /// it is measured under the same configuration as the in-process diffusion arm.
+    #[test]
+    fn compare_children_inherit_the_global_flags() {
+        let overrides = ConfigOverrides {
+            config_path: Some("bench.toml".into()),
+            sets: vec![
+                "kernels.vulkan.flash_splits=2".into(),
+                "debug.chat=true".into(),
+            ],
+            flags: PartialConfig::default(),
+        };
+        let mb = bench_harness("infr".into(), global_flag_args(&overrides));
+        let cmd = mb.bench_command(&["-p", "512"]);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args[..7],
+            [
+                "--config",
+                "bench.toml",
+                "--set",
+                "kernels.vulkan.flash_splits=2",
+                "--set",
+                "debug.chat=true",
+                "bench"
+            ],
+            "{args:?}"
+        );
+        assert_eq!(args.last().map(String::as_str), Some("--json"));
+        // No global flags given: none forwarded.
+        assert!(global_flag_args(&ConfigOverrides::default()).is_empty());
+    }
+
+    /// A child that fails is that cell's error and carries its stderr. The child here is this test
+    /// binary, which rejects the bench flags and exits non-zero — a real failing process on every
+    /// platform.
+    #[test]
+    fn a_failed_bench_child_reports_its_stderr() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let err = bench_harness(exe, Vec::new())
+            .infr_json(&[])
+            .expect_err("the child exits non-zero")
+            .to_string();
+        assert!(err.contains("`infr bench` failed"), "{err}");
+        assert!(err.to_lowercase().contains("unrecognized option"), "{err}");
+    }
+
+    /// `infr pull` caches `generation_config.json` at the snapshot root, and an unsloth-style repo
+    /// keeps its GGUF a directory below that: the walk finds it there, prefers one beside the GGUF,
+    /// and never reaches past the snapshot root into the cache.
+    #[test]
+    fn generation_config_is_found_up_to_the_snapshot_root() {
+        let base = sampling_dir("gencfg");
+        let snap = base.join("models--org--repo/snapshots/c1");
+        let gguf = snap.join("UD-Q4_K_XL/m.gguf");
+        std::fs::create_dir_all(gguf.parent().unwrap()).expect("snapshot dirs");
+        std::fs::write(&gguf, b"").expect("gguf");
+        let write = |dir: &std::path::Path, t: f32| {
+            std::fs::write(
+                dir.join("generation_config.json"),
+                format!(r#"{{"temperature": {t}}}"#),
+            )
+            .expect("write config")
+        };
+
+        // Above the snapshot root is the cache, not the model: never read.
+        write(&base.join("models--org--repo"), 0.1);
+        let above_root = generation_config_sampling(&gguf).0;
+        write(&snap, 0.2);
+        let at_root = generation_config_sampling(&gguf).0;
+        write(gguf.parent().unwrap(), 0.3);
+        let beside = generation_config_sampling(&gguf).0;
+
+        // Outside any snapshot only the file beside the GGUF counts.
+        let plain = base.join("plain/sub/m.gguf");
+        std::fs::create_dir_all(plain.parent().unwrap()).expect("plain dirs");
+        write(&base.join("plain"), 0.4);
+        let plain_parent = generation_config_path(&plain);
+
+        std::fs::remove_dir_all(&base).expect("remove temp dir");
+        assert_eq!(above_root, None);
+        assert_eq!(at_root, Some(0.2));
+        assert_eq!(beside, Some(0.3));
+        assert_eq!(plain_parent, None);
+    }
+
+    /// The load-time warning names every `general.sampling.*` key infr does not apply, and nothing
+    /// for a file that carries only the applied ones.
+    #[test]
+    fn unapplied_sampling_keys_are_the_ones_infr_ignores() {
+        use infr_testkit::gguf::Meta;
+        let dir = sampling_dir("unapplied");
+        let gguf = dir.join("model.gguf");
+
+        sampling_fixture(
+            &dir,
+            vec![
+                ("general.sampling.temp", Meta::F32(1.0)),
+                ("general.sampling.top_k", Meta::I32(40)),
+                ("general.sampling.top_p", Meta::F32(0.9)),
+            ],
+        );
+        let applied_only = infr_llama::arch::unapplied_sampling_keys(&gguf);
+
+        sampling_fixture(
+            &dir,
+            vec![
+                ("general.sampling.temp", Meta::F32(1.5)),
+                ("general.sampling.penalty_repeat", Meta::F32(1.1)),
+                ("general.sampling.min_p", Meta::F32(0.05)),
+                ("general.name", Meta::Str("not a sampling key".into())),
+            ],
+        );
+        let mixed = infr_llama::arch::unapplied_sampling_keys(&gguf);
+
+        std::fs::remove_file(&gguf).expect("remove gguf");
+        std::fs::remove_dir(&dir).expect("remove temp dir");
+
+        assert!(applied_only.is_empty(), "{applied_only:?}");
+        assert_eq!(
+            mixed,
+            ["general.sampling.min_p", "general.sampling.penalty_repeat"]
+        );
     }
 
     /// `infr bench --json` must emit PARSEABLE JSON whose first key is `avg_ts`, in every
@@ -5147,5 +5467,157 @@ mod tests {
             " [ubatch 256 pinned, kv q8_0, submit split/112]"
         );
         assert_eq!(placement_note(None), "");
+    }
+
+    fn gen_stats(
+        n_prompt: usize,
+        n_cached: usize,
+        n_gen: usize,
+        ctx_full: bool,
+    ) -> infr_llama::GenStats {
+        infr_llama::GenStats {
+            n_prompt,
+            n_cached,
+            n_gen,
+            ctx_full,
+            ..Default::default()
+        }
+    }
+
+    /// B82: a reply the engine cut short because the context filled up is `length`, even though
+    /// it generated fewer tokens than the request's budget. EOS before the budget is still `stop`,
+    /// and a stop sequence wins over both.
+    #[test]
+    fn a_reply_cut_by_the_context_finishes_as_length() {
+        use infr_server::Finish;
+        assert_eq!(
+            finish_reason(false, &gen_stats(4000, 0, 95, true), 2048),
+            Finish::Length
+        );
+        assert_eq!(
+            finish_reason(false, &gen_stats(10, 0, 95, false), 2048),
+            Finish::Stop
+        );
+        assert_eq!(
+            finish_reason(false, &gen_stats(10, 0, 2048, false), 2048),
+            Finish::Length
+        );
+        assert_eq!(
+            finish_reason(true, &gen_stats(4000, 0, 95, true), 2048),
+            Finish::Stop
+        );
+        // EOS as the last allowed token: the model finished, it was not cut off.
+        let eos_at_budget = infr_llama::GenStats {
+            natural_stop: true,
+            ..gen_stats(10, 0, 2048, false)
+        };
+        assert_eq!(finish_reason(false, &eos_at_budget, 2048), Finish::Stop);
+    }
+
+    /// B83: `prompt_tokens` is the whole prompt — the prefilled suffix plus the cached prefix — and
+    /// the cached part is reported on its own.
+    #[test]
+    fn the_outcome_counts_the_whole_prompt() {
+        let o = chat_outcome(infr_server::Finish::Stop, &gen_stats(1, 19_999, 7, false));
+        assert_eq!(
+            (o.prompt_tokens, o.cached_tokens, o.completion_tokens),
+            (20_000, 19_999, 7)
+        );
+    }
+
+    /// B86: the engine's context overflow reaches the server as its typed error (which it answers
+    /// `400 context_length_exceeded`), also through added context; any other error is left alone.
+    #[test]
+    fn a_context_overflow_becomes_the_servers_typed_error() {
+        let message = |prompt, gen, client_set_max_tokens| {
+            let overflow = anyhow::Error::new(infr_llama::ContextOverflow {
+                prompt,
+                gen,
+                max_ctx: 4096,
+            })
+            .context("generating");
+            context_length_exceeded(&overflow, client_set_max_tokens)
+                .expect("an overflow must map")
+                .downcast_ref::<infr_server::ContextLengthExceeded>()
+                .expect("the server's type")
+                .message
+                .clone()
+        };
+        assert_eq!(
+            message(5000, 0, true),
+            "This model's maximum context length is 4095 tokens. However, your messages resulted \
+             in 5000 tokens. Please reduce the length of the messages."
+        );
+        assert_eq!(
+            message(3000, 2000, true),
+            "This model's maximum context length is 4095 tokens. However, you requested 5000 \
+             tokens (3000 in the messages, 2000 in the completion). Please reduce the length of \
+             the messages or completion."
+        );
+        // A reply budget the client did not choose is not advice it can follow.
+        assert!(message(3000, 2048, false).ends_with("Please reduce the length of the messages."));
+        // A request the size of the whole context is refused, and must not read as fitting.
+        assert!(message(4096, 0, true)
+            .contains("is 4095 tokens. However, your messages resulted in 4096"));
+        assert!(context_length_exceeded(&anyhow::anyhow!("boom"), true).is_none());
+    }
+
+    /// Panics on its first generation, then generates normally; counts its KV resets.
+    struct PanicOnceChat {
+        calls: usize,
+        resets: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl infr_llama::chat::ChatModel for PanicOnceChat {
+        fn render(&self, _messages: &[(&str, &str)]) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        fn generate(
+            &mut self,
+            _prompt: &str,
+            _max_new: usize,
+            _req: Option<&infr_llama::sampling::RequestCtx>,
+            _on_piece: &mut dyn FnMut(&str),
+        ) -> anyhow::Result<infr_llama::GenStats> {
+            self.calls += 1;
+            if self.calls == 1 {
+                panic!("boom: generation panicked");
+            }
+            Ok(infr_llama::GenStats::default())
+        }
+
+        fn reset_kv(&mut self) {
+            self.resets
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// B84: one panicking generation must not take every later request down with it. The next
+    /// lock recovers the model, drops its KV session once, and generation works again.
+    #[test]
+    fn a_panicked_generation_does_not_poison_the_served_model() {
+        let resets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let model: std::sync::Mutex<Box<dyn infr_llama::chat::ChatModel + Send>> =
+            std::sync::Mutex::new(Box::new(PanicOnceChat {
+                calls: 0,
+                resets: resets.clone(),
+            }));
+        // The panic's message is expected in the captured output: no `set_hook` to hide it — it
+        // is process-global and would also swallow another test's genuine failure.
+        let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = lock_recovered(&model).generate("", 1, None, &mut |_| {});
+        }));
+        assert!(first.is_err(), "the first generation panics");
+        for _ in 0..2 {
+            assert!(lock_recovered(&model)
+                .generate("", 1, None, &mut |_| {})
+                .is_ok());
+        }
+        assert_eq!(
+            resets.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the KV session is dropped once, after the panic, not on every request"
+        );
     }
 }

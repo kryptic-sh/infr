@@ -1,0 +1,21 @@
+#version 460
+// Per-head sigmoid output gate (LFM3 attention, Op::HeadGate):
+//   y[r, h*hd + i] = x[r, h*hd + i] * sigmoid(g[r, h])
+// `g` is [rows, n_head]: one raw logit per head per token, broadcast over the head's hd lanes.
+// One thread per output element; in place when y aliases x.
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(push_constant) uniform PC { uint n; uint head_dim; } pc;
+layout(binding = 0) readonly buffer XB { float x[]; };
+layout(binding = 1) readonly buffer GB { float g[]; };
+layout(binding = 2) writeonly buffer YB { float y[]; };
+
+void main() {
+    // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
+    uint i = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x;
+    if (i >= pc.n) {
+        return;
+    }
+    y[i] = x[i] / (1.0 + exp(-g[i / pc.head_dim]));
+}

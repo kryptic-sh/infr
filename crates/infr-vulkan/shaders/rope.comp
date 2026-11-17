@@ -12,6 +12,8 @@
 // this kernel with `sin_sign = -1` (see `Op::Rope::backward`); deepseek4 de-ropes its attention
 // OUTPUT before the grouped output projection. Same static-f32-only rule as NEOX (`rope_back`,
 // `rope_ff_back`).
+// -DFREQ_FACTORS composes with every build here: the f16-out and record-once forms carry the
+// llama3 long-context factors (`rope_freqs.weight`) on the llama/llama4 q/k write.
 #ifdef OUT_F16
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
@@ -28,28 +30,42 @@ layout(push_constant) uniform PC {
 #endif
 } pc;
 layout(binding = 0) readonly buffer XB { float x[]; };
-#ifdef FREQ_FACTORS
-// YaRN per-pair frequency divisors (`rope_dim/2` floats): the rotation angle is DIVIDED by
-// ff[pair] (deepseek2 k_pe — see `rope_ff` build in build.rs). Binds at 1; y shifts to 2 —
-// the hazard tracker treats the TRAILING binding as the write, and the recorder binds
-// [x, ff, y], so the output must come last for the store→read barrier. (FREQ_FACTORS is only
-// built WITHOUT OUT_F16/USE_PARAMS — the adapter rejects ff on the f16/dyn paths.)
-layout(binding = 1) readonly buffer FB { float ff[]; };
-#endif
+// Per-pair frequency divisors (`rope_dim/2` floats): the rotation angle is DIVIDED by ff[pair]
+// (deepseek2's YaRN k_pe ramp, the llama3 `rope_freqs.weight`). They bind right after the inputs
+// (x, then params under USE_PARAMS) and shift y one slot later — the hazard tracker treats the
+// TRAILING binding as the write, and the recorder binds [x, (params,) ff, y], so the output must
+// come last for the store→read barrier. Under KV_BDA y is never declared, but the recorder still
+// binds the cache inert in that last slot.
 #ifdef USE_PARAMS
 layout(binding = 1) readonly buffer PB { uint p_pos; uint p_kvlen; };
+#ifdef FREQ_FACTORS
+layout(binding = 2) readonly buffer FB { float ff[]; };
+#ifndef KV_BDA
+layout(binding = 3) buffer YB { float16_t y[]; };
+#endif
+#else
 #ifndef KV_BDA
 layout(binding = 2) buffer YB { float16_t y[]; };
 #endif
-#elif defined(OUT_F16)
+#endif
+#else
+#ifdef FREQ_FACTORS
+layout(binding = 1) readonly buffer FB { float ff[]; };
+#endif
+#ifdef OUT_F16
 #ifndef KV_BDA
+#ifdef FREQ_FACTORS
+layout(binding = 2) buffer YB { float16_t y[]; };
+#else
 layout(binding = 1) buffer YB { float16_t y[]; };
+#endif
 #endif
 #else
 #ifdef FREQ_FACTORS
 layout(binding = 2) buffer YB { float y[]; };
 #else
 layout(binding = 1) buffer YB { float y[]; };
+#endif
 #endif
 #endif
 #if defined(OUT_F16) && defined(KV_BDA)
@@ -63,14 +79,11 @@ void main() {
 #if defined(OUT_F16) && defined(KV_BDA)
     k_addr = kv_base(pc.d_lo, pc.d_hi);
 #endif
-    // Grid-stride over (t, head, slot): slots [0, hf) rotate one pair, the rest copy two tail
-    // elements of [rope_dim, hd).
-    uint hf = pc.rope_dim / 2u;
-    uint hd2 = (pc.hd + 1u) / 2u;
-    uint total = pc.t * pc.nheads * hd2;
-    for (uint gi = gl_GlobalInvocationID.x; gi < total; gi += gl_NumWorkGroups.x * 64u) {
-    uint idx = gi / hd2;
-    uint i = gi - idx * hd2;
+    // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
+    uint idx = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x;
+    if (idx >= pc.t * pc.nheads) { return; }
 #ifdef USE_PARAMS
     uint pos = p_pos + idx / pc.nheads;
     uint out_base = pc.out_base * p_pos; // pc.out_base is the 0/1 multiplier in dyn mode
@@ -80,18 +93,16 @@ void main() {
 #endif
     uint base = idx * pc.hd;
     uint obase = out_base * pc.nheads * pc.hd + base;
-    if (i >= hf) {
-        uint e = pc.rope_dim + 2u * (i - hf);
-        for (uint k = e; k < min(e + 2u, pc.hd); k++) {
+    // Passthrough only the un-rotated tail [rope_dim, hd); the rotated loop below overwrites
+    // [0, rope_dim), so copying it here too just doubled the store traffic (into the KV cache
+    // under KV_BDA). Final bytes are identical (as in qk_norm_rope.comp's partial-RoPE tail).
 #ifdef OUT_F16
-            KVWH(obase + k, x[base + k]);
+    for (uint i = pc.rope_dim; i < pc.hd; i++) { KVWH(obase + i, x[base + i]); }
 #else
-            y[obase + k] = x[base + k];
+    for (uint i = pc.rope_dim; i < pc.hd; i++) { y[obase + i] = x[base + i]; }
 #endif
-        }
-        continue;
-    }
-    {
+    uint hf = pc.rope_dim / 2u;
+    for (uint i = 0u; i < hf; i++) {
         float freq = pow(pc.theta, -2.0 * float(i) / float(pc.rope_dim));
         float ang = float(pos) * freq;
 #ifdef FREQ_FACTORS
@@ -117,6 +128,5 @@ void main() {
         y[obase + i0] = a * co - b * s;
         y[obase + i1] = a * s + b * co;
 #endif
-    }
     }
 }

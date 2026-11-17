@@ -1,0 +1,86 @@
+<s><|start_header_id|>system<|end_header_id|>
+
+Environment: ipython
+Cutting Knowledge Date: December 2023
+Today Date: 13 Nov 2026
+
+You are a helpful assistant.<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Given the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.
+
+Respond in the format {"name": function name, "parameters": dictionary of argument name and its value}.Do not use variables.
+
+{
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Weather for a city — Zürich, 東京 <b>bold</b> & \"quoted\" 'single'",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "city": {
+                    "type": "string",
+                    "description": "City name"
+                },
+                "unit": {
+                    "type": "string",
+                    "enum": [
+                        "celsius",
+                        "fahrenheit"
+                    ]
+                },
+                "days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 7,
+                    "default": 1.0
+                },
+                "detail": {
+                    "type": "object",
+                    "properties": {
+                        "hourly": {
+                            "type": "boolean"
+                        },
+                        "threshold": {
+                            "type": "number"
+                        }
+                    }
+                }
+            },
+            "required": [
+                "city"
+            ]
+        }
+    }
+}
+
+{
+    "type": "function",
+    "function": {
+        "name": "search",
+        "description": "Search the web",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string"
+                },
+                "limit": {
+                    "type": "integer"
+                }
+            },
+            "required": [
+                "query"
+            ]
+        }
+    }
+}
+
+What's the weather in Zürich?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+
+{"name": "get_weather", "parameters": {"city": "Zürich", "unit": "celsius", "days": 3, "detail": {"hourly": true, "threshold": 0.5}, "tags": ["a", "b"]}}<|eot_id|><|start_header_id|>ipython<|end_header_id|>
+
+"{\"temp\": 21.5, \"sky\": \"clear\"}"<|eot_id|><|start_header_id|>user<|end_header_id|>
+
+Thanks<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+

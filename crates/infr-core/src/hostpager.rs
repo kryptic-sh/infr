@@ -15,7 +15,8 @@
 //!   happens under the lock, on a miss, for a block that thread has just pinned. A pinned block
 //!   cannot be evicted, so no other thread can be handed the same slot meanwhile.
 //! - **A slot is read only through a [`Pin`]**, which exists only for a block that is `Ready` and
-//!   pinned. Any thread asking for a `Loading` block waits instead of reading it.
+//!   pinned, **or under the lock** while its block is `Ready` ([`HostPager::read`]'s hit copy). Any
+//!   thread asking for a `Loading` block waits instead of reading it.
 //! - **The arena is never reallocated**, and no reference to the whole buffer is ever formed —
 //!   every access is a `from_raw_parts` over one slot's own range, so a reader of slot 3 and a
 //!   filler of slot 7 never hold overlapping references.
@@ -27,7 +28,7 @@ use crate::error::{Error, Result};
 use crate::pager::{BlockId, Insert, Pager, PagerStats, Resolution};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 /// Split an arena budget across uniform size classes, in slots per class.
 ///
@@ -166,6 +167,9 @@ struct Inner {
     /// the blocks that do keep coming back. Bounded by the pool's block count (one bit of interest
     /// per registered block), not by traffic.
     missed_once: HashSet<BlockId>,
+    /// Blocks [`HostPager::pin`] has read from the tier below at least once, so a later read of
+    /// one counts as a re-read ([`HostPagerStats::rereads`]).
+    read_once: HashSet<BlockId>,
 }
 
 /// What [`HostPager::fill`] did with one block.
@@ -192,6 +196,16 @@ pub struct HostPagerStats {
     /// Of those reads, how many went STRAIGHT to the caller because the arena was full
     /// ([`Fill::Streamed`]). `reads - streamed` is what the arena absorbed.
     pub streamed: u64,
+    /// Time spent inside those reads, summed over every reading thread, in nanoseconds. Reads that
+    /// overlap each count in full, so this over-states wall time; `bytes_read` over it is the rate
+    /// one read sees, not the device's.
+    pub read_ns: u64,
+    /// Of the reads [`HostPager::pin`] made, how many were of a block it had read before (evicted
+    /// since), and the time they took (part of `read_ns`). A file read the OS still caches costs a
+    /// copy, not a disk read, so the time per first read against the time per re-read says how
+    /// much of a run's re-reading the OS file cache absorbed.
+    pub rereads: u64,
+    pub reread_ns: u64,
 }
 
 /// A fixed-budget host cache of uniform `slot_bytes` blocks, read in place.
@@ -209,6 +223,9 @@ pub struct HostPager {
     reads: AtomicU64,
     bytes_read: AtomicU64,
     streamed: AtomicU64,
+    read_ns: AtomicU64,
+    rereads: AtomicU64,
+    reread_ns: AtomicU64,
 }
 
 impl HostPager {
@@ -216,8 +233,10 @@ impl HostPager {
     /// budget that does not fit fails here rather than part-way through a generation.
     ///
     /// `n_slots` must be at least the number of blocks one caller pins simultaneously, times the
-    /// number of concurrent callers (`infr serve`'s `--parallel`). Below that floor [`Self::pin`]
-    /// returns the exhaustion error rather than evicting a block someone is reading.
+    /// number of concurrent callers (`infr serve`'s `--parallel`) — a [`Self::fill`] in progress
+    /// counts as a caller pinning one block; a [`Self::read`] holds no pin and does not count.
+    /// Below that floor [`Self::pin`] returns the exhaustion error rather than evicting a block
+    /// someone is reading.
     pub fn new(n_slots: usize, slot_bytes: usize, io: Arc<dyn BlockIo>) -> Result<Self> {
         if n_slots == 0 || slot_bytes == 0 {
             return Err(Error::backend(format!(
@@ -230,6 +249,7 @@ impl HostPager {
                 state: HashMap::new(),
                 descs: HashMap::new(),
                 missed_once: HashSet::new(),
+                read_once: HashSet::new(),
             }),
             ready: Condvar::new(),
             arena: Arena::new(n_slots, slot_bytes),
@@ -239,6 +259,9 @@ impl HostPager {
             reads: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             streamed: AtomicU64::new(0),
+            read_ns: AtomicU64::new(0),
+            rereads: AtomicU64::new(0),
+            reread_ns: AtomicU64::new(0),
         })
     }
 
@@ -275,6 +298,7 @@ impl HostPager {
                 state: HashMap::new(),
                 descs: HashMap::new(),
                 missed_once: HashSet::new(),
+                read_once: HashSet::new(),
             }),
             ready: Condvar::new(),
             arena: Arena::new(0, slot_bytes),
@@ -284,6 +308,9 @@ impl HostPager {
             reads: AtomicU64::new(0),
             bytes_read: AtomicU64::new(0),
             streamed: AtomicU64::new(0),
+            read_ns: AtomicU64::new(0),
+            rereads: AtomicU64::new(0),
+            reread_ns: AtomicU64::new(0),
         })
     }
 
@@ -317,6 +344,32 @@ impl HostPager {
             .map(|d| d.nbytes())
     }
 
+    /// Record this tier's residency calls into `file` (`paging.trace`; see
+    /// [`crate::pager::trace`]), labelled `label` with `n_blocks` blocks. Call it before the first
+    /// pin or fill. An arena-less ([`Self::stream_only`]) tier records nothing: its pager is never
+    /// called.
+    pub fn trace_to(
+        &self,
+        file: &Arc<crate::pager::trace::TraceFile>,
+        label: String,
+        n_blocks: usize,
+    ) -> Result<()> {
+        if !self.caches() {
+            return Ok(());
+        }
+        let info = crate::pager::trace::PoolInfo {
+            tier: crate::pager::trace::Tier::Dram,
+            label,
+            n_blocks,
+        };
+        Ok(self.inner.lock().unwrap().pager.trace_to(file, info)?)
+    }
+
+    /// Flush this tier's trace, if it has one (see [`Pager::flush_trace`]).
+    pub fn flush_trace(&self) -> Result<()> {
+        Ok(self.inner.lock().unwrap().pager.flush_trace()?)
+    }
+
     /// Open a new touch batch — same meaning as [`Pager::begin_batch`].
     pub fn begin_batch(&self) {
         self.inner.lock().unwrap().pager.begin_batch();
@@ -328,7 +381,19 @@ impl HostPager {
             reads: self.reads.load(Ordering::Relaxed),
             bytes_read: self.bytes_read.load(Ordering::Relaxed),
             streamed: self.streamed.load(Ordering::Relaxed),
+            read_ns: self.read_ns.load(Ordering::Relaxed),
+            rereads: self.rereads.load(Ordering::Relaxed),
+            reread_ns: self.reread_ns.load(Ordering::Relaxed),
         }
+    }
+
+    /// Read `desc` from the tier below into `dst`, timing it into `read_ns`. Returns the time.
+    fn read_below(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<u64> {
+        let t = std::time::Instant::now();
+        let r = self.io.read_block(desc, dst);
+        let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.read_ns.fetch_add(ns, Ordering::Relaxed);
+        r.map(|()| ns)
     }
 
     /// Bytes this tier's arena occupies.
@@ -369,18 +434,20 @@ impl HostPager {
                     "host pager: block {id} was never registered"
                 )));
             }
-            // Resident and readable? Take the pin and go.
-            if inner.state.get(&id) == Some(&SlotState::Ready) {
-                if let Some(slot) = inner.pager.pin_if_resident(id) {
-                    return Ok(self.pinned(id, slot, &inner));
-                }
-            }
             // Being filled by someone else: wait for them rather than read a half-written slot.
             if inner.state.get(&id) == Some(&SlotState::Loading) {
                 let _unused = self.ready.wait(inner).unwrap();
                 continue;
             }
+            // A hit goes through `resolve_and_pin` too, not the hit-only probe: it is what applies
+            // `insert` to a hit, and without it the LRU order is admission order.
             match inner.pager.resolve_and_pin(id, insert) {
+                // Resident and readable: take the pin and go.
+                Some(Resolution::Hit { slot })
+                    if inner.state.get(&id) == Some(&SlotState::Ready) =>
+                {
+                    return Ok(self.pinned(id, slot, &inner));
+                }
                 Some(Resolution::Hit { slot }) => {
                     // Resident with no state entry cannot happen: state and residency are set
                     // together under this lock. Treat it as a fill to re-establish the invariant
@@ -407,6 +474,9 @@ impl HostPager {
             }
         };
 
+        // Taken first, so nothing between here and `Ready` — the slot arithmetic included — can
+        // unwind past a `Loading` block.
+        let claim = Claim { pager: self, id };
         // Fill outside the lock: this is disk I/O, and holding the residency lock across it would
         // stall every other block's hit. The claim on `slot` is exclusive per the module doc (the
         // block is `Loading` and pinned by this thread), which is what makes the write sound.
@@ -417,30 +487,20 @@ impl HostPager {
         // reading. That makes this `&mut` the only reference to these bytes for its whole life,
         // which ends before the state flips to `Ready` below. `len <= slot_bytes` per `register`.
         let dst = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, len), len) };
-        let read = self.io.read_block(&desc, dst);
+        let ns = self.read_below(&desc, dst)?;
+        std::mem::forget(claim);
         let mut inner = self.inner.lock().unwrap();
-        match read {
-            Ok(()) => {
-                inner.state.insert(id, SlotState::Ready);
-                self.reads.fetch_add(1, Ordering::Relaxed);
-                self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
-                let pin = self.pinned(id, slot, &inner);
-                drop(inner);
-                self.ready.notify_all();
-                Ok(pin)
-            }
-            Err(e) => {
-                // Drop the failed block entirely: leaving it resident would serve a partly-written
-                // slot to the next caller, and leaving it `Loading` would park every waiter for
-                // good. The pin taken by `resolve_and_pin` goes with it.
-                inner.state.remove(&id);
-                inner.pager.unpin(id);
-                inner.pager.evict(id);
-                drop(inner);
-                self.ready.notify_all();
-                Err(e)
-            }
+        inner.state.insert(id, SlotState::Ready);
+        if !inner.read_once.insert(id) {
+            self.rereads.fetch_add(1, Ordering::Relaxed);
+            self.reread_ns.fetch_add(ns, Ordering::Relaxed);
         }
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
+        let pin = self.pinned(id, slot, &inner);
+        drop(inner);
+        self.ready.notify_all();
+        Ok(pin)
     }
 
     /// Deliver `id`'s bytes into `dst`, admitting the block only while the arena has room.
@@ -467,8 +527,12 @@ impl HostPager {
     ///
     /// There is no insertion-policy argument because nothing would read it: the LRU order exists to
     /// choose a victim, and this never has one. A caller that mixed this with [`Self::pin`] on one
-    /// pager would make the order matter again — nothing does, and the cold-end insert below is the
-    /// conservative choice if one ever did.
+    /// pager would make the order matter again — nothing does (a background reader beside pinning
+    /// callers uses [`Self::read`] instead), and the cold-end insert below is the conservative
+    /// choice if one ever did.
+    ///
+    /// While it copies a hit out, or reads an admitted block, this call holds a pin on the block,
+    /// so it counts towards the floor [`Self::new`] states as one more concurrent caller.
     pub fn fill(&self, id: BlockId, dst: &mut [u8]) -> Result<Fill> {
         // `(admitted slot, descriptor)` — the slot is `None` when this call will stream.
         let (slot, desc) = loop {
@@ -514,43 +578,92 @@ impl HostPager {
         let Some(slot) = slot else {
             // Streamed: no arena involvement at all, so no lock and no residency change.
             let n = desc.nbytes();
-            self.io.read_block(&desc, &mut dst[..n])?;
+            self.read_below(&desc, &mut dst[..n])?;
             self.reads.fetch_add(1, Ordering::Relaxed);
             self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
             self.streamed.fetch_add(1, Ordering::Relaxed);
             return Ok(Fill::Streamed);
         };
+        // See `pin`: claimed before anything that can unwind.
+        let claim = Claim { pager: self, id };
 
         // Admitting: fill the slot outside the lock, exactly as `pin` does and under the same
         // exclusivity argument (this thread set `Loading` and holds the pin).
         let n = desc.nbytes();
         // SAFETY: see `pin`'s fill — identical claim, identical proof.
         let arena = unsafe { std::slice::from_raw_parts_mut(self.arena.slot_ptr(slot, n), n) };
-        let read = self.io.read_block(&desc, arena);
+        self.read_below(&desc, arena)?;
+        std::mem::forget(claim);
         let mut inner = self.inner.lock().unwrap();
-        match read {
-            Ok(()) => {
-                inner.state.insert(id, SlotState::Ready);
-                self.reads.fetch_add(1, Ordering::Relaxed);
-                self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
-                // The guard adopts the pin `resolve_and_pin` took and releases it on drop, so the
-                // copy below runs with the slot un-evictable and nothing is released twice.
-                let pin = self.pinned(id, slot, &inner);
-                drop(inner);
-                dst[..n].copy_from_slice(&pin);
-                drop(pin);
-                self.ready.notify_all();
-                Ok(Fill::Admitted)
+        inner.state.insert(id, SlotState::Ready);
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+        // The guard adopts the pin `resolve_and_pin` took and releases it on drop, so the copy
+        // below runs with the slot un-evictable and nothing is released twice.
+        let pin = self.pinned(id, slot, &inner);
+        drop(inner);
+        dst[..n].copy_from_slice(&pin);
+        drop(pin);
+        self.ready.notify_all();
+        Ok(Fill::Admitted)
+    }
+
+    /// Deliver `id`'s bytes into `dst` without taking a slot or a pin: a resident block is copied
+    /// out of the arena ([`Fill::Hit`], moving no counter), any other is read straight into `dst`
+    /// ([`Fill::Streamed`]) and stays unresident, whether or not it has missed before.
+    ///
+    /// For a caller running BESIDE this tier's pinning callers whose bytes are never asked for
+    /// here again — the VRAM pager's background fill reader, whose blocks the arena above keeps
+    /// for good. Because it holds no pin, it adds nothing to the floor [`Self::new`] states and
+    /// can never make a [`Self::pin`] find every slot pinned; because it admits nothing, it keeps
+    /// no copy here at all.
+    ///
+    /// The hit copy runs under the residency lock instead of under a pin, so a concurrent
+    /// [`Self::pin`] waits for it (one block's memcpy) rather than failing. `dst` must be at least
+    /// the block's length; only that prefix is written.
+    pub fn read(&self, id: BlockId, dst: &mut [u8]) -> Result<Fill> {
+        let desc = loop {
+            let inner = self.inner.lock().unwrap();
+            let Some(desc) = inner.descs.get(&id).cloned() else {
+                return Err(Error::backend(format!(
+                    "host pager: block {id} was never registered"
+                )));
+            };
+            let n = desc.nbytes();
+            if dst.len() < n {
+                return Err(Error::backend(format!(
+                    "host pager: block {id} is {n} bytes, its destination {}",
+                    dst.len()
+                )));
             }
-            Err(e) => {
-                inner.state.remove(&id);
-                inner.pager.unpin(id);
-                inner.pager.evict(id);
-                drop(inner);
-                self.ready.notify_all();
-                Err(e)
+            match inner.state.get(&id) {
+                Some(SlotState::Loading) => {
+                    let _unused = self.ready.wait(inner).unwrap();
+                    continue;
+                }
+                Some(SlotState::Ready) => {
+                    if let Some(slot) = inner.pager.slot_of(id) {
+                        // SAFETY: `id` is `Ready` in `slot`, and this thread holds the lock. A slot
+                        // is written only for a `Loading` block, and only after the lock assigned
+                        // it that slot — which needs `id` evicted first, an eviction that cannot
+                        // happen while the lock is held. So no writer is active on these bytes for
+                        // as long as this reference lives (it ends before the lock drops);
+                        // concurrent `Pin` readers only read. `n <= slot_bytes` per `register`.
+                        let src = unsafe { self.arena.slot_ref(slot, n) };
+                        dst[..n].copy_from_slice(src);
+                        return Ok(Fill::Hit);
+                    }
+                    break desc;
+                }
+                None => break desc,
             }
-        }
+        };
+        let n = desc.nbytes();
+        self.read_below(&desc, &mut dst[..n])?;
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+        self.streamed.fetch_add(1, Ordering::Relaxed);
+        Ok(Fill::Streamed)
     }
 
     /// Pin `id` only if it is already resident and readable — never reads from the tier below.
@@ -571,6 +684,16 @@ impl HostPager {
         Some(self.pinned(id, slot, &inner))
     }
 
+    /// Make `id`, if resident, the next block this tier evicts: its caller is done with it for a
+    /// long while ([`Pager::demote`]). Reads nothing and frees nothing; a pin held on it still
+    /// protects it, and a later pin finds it resident if nothing needed its slot first.
+    pub fn demote(&self, id: BlockId) {
+        if !self.caches() {
+            return; // nothing is ever resident on an arena-less tier
+        }
+        self.inner.lock().unwrap().pager.demote(id);
+    }
+
     /// Build the `Pin` for an already-pinned, `Ready` block. Takes the guard by reference to make
     /// the caller prove it holds the lock while reading the descriptor's length.
     fn pinned(&self, id: BlockId, slot: u32, inner: &Inner) -> Pin<'_> {
@@ -587,6 +710,32 @@ impl HostPager {
 
     fn unpin(&self, id: BlockId) {
         self.inner.lock().unwrap().pager.unpin(id);
+    }
+}
+
+/// A `Loading` claim on a slot whose fill has not completed. Forgotten once the read succeeds;
+/// dropped — on an `Err` from the read or a panic out of it alike — it drops the block entirely:
+/// leaving it resident would serve a partly-written slot to the next caller, and leaving it
+/// `Loading` would park every waiter on `ready` for good. The pin `resolve_and_pin` took goes with
+/// it.
+struct Claim<'a> {
+    pager: &'a HostPager,
+    id: BlockId,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        // Poison-tolerant: this also runs while unwinding, where a second panic would abort.
+        let mut inner = self
+            .pager
+            .inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        inner.state.remove(&self.id);
+        inner.pager.unpin(self.id);
+        inner.pager.evict(self.id);
+        drop(inner);
+        self.pager.ready.notify_all();
     }
 }
 
@@ -814,6 +963,153 @@ mod tests {
             before + 1,
             "a failed block must be re-read, not served from its slot"
         );
+    }
+
+    /// B134: a hit pinned with `Insert::Mru` must promote the block, so the eviction victim is
+    /// the least RECENTLY used block, not the earliest admitted one.
+    #[test]
+    fn an_mru_hit_protects_the_block_from_the_next_eviction() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(2, 16, io, &[1, 2, 3]);
+        drop(p.pin(1, Insert::Mru).expect("pin"));
+        drop(p.pin(2, Insert::Mru).expect("pin"));
+        drop(p.pin(1, Insert::Mru).expect("pin")); // hit: 1 is now the most recent
+        drop(p.pin(3, Insert::Mru).expect("pin")); // evicts the least recent
+        assert!(p.try_pin(1).is_some(), "the block just hit was evicted");
+        assert!(
+            p.try_pin(2).is_none(),
+            "the least recently used block survived"
+        );
+    }
+
+    /// A read of a block the pager read before, and evicted since, counts as a re-read; a first
+    /// read and a hit do not.
+    #[test]
+    fn a_block_read_again_after_eviction_is_a_reread() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(1, 16, io, &[1, 2]);
+        drop(p.pin(1, Insert::Mru).expect("pin"));
+        drop(p.pin(1, Insert::Mru).expect("pin")); // a hit
+        drop(p.pin(2, Insert::Mru).expect("pin")); // evicts 1
+        assert_eq!((p.stats().reads, p.stats().rereads), (2, 0));
+        drop(p.pin(1, Insert::Mru).expect("pin"));
+        let s = p.stats();
+        assert_eq!((s.reads, s.rereads), (3, 1));
+        assert!(s.reread_ns <= s.read_ns);
+    }
+
+    /// A demoted block is the next victim however recently it was used, and still a hit until
+    /// something needs its slot; a demoted block that is pinned stays put.
+    #[test]
+    fn a_demoted_block_is_evicted_first_and_kept_until_then() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(3, 16, io, &[1, 2, 3, 4, 5]);
+        for id in [1u32, 2, 3] {
+            drop(p.pin(id, Insert::Mru).expect("pin"));
+        }
+        p.demote(3); // the most recent, now the coldest
+        assert!(p.try_pin(3).is_some(), "a demotion evicted the block");
+        drop(p.pin(4, Insert::Mru).expect("pin"));
+        assert!(
+            p.try_pin(3).is_none(),
+            "the demoted block was not the victim"
+        );
+        assert!(p.try_pin(1).is_some() && p.try_pin(2).is_some());
+        // Pinned while demoted: the next eviction passes over it to the least recent other.
+        let held = p.pin(4, Insert::Mru).expect("pin");
+        p.demote(4);
+        drop(p.pin(5, Insert::Mru).expect("pin"));
+        assert!(p.try_pin(4).is_some(), "a pinned block was evicted");
+        assert!(
+            p.try_pin(1).is_none(),
+            "the least recent unpinned block survived"
+        );
+        drop(held);
+        p.demote(99); // never registered: nothing to do
+    }
+
+    /// B134: across several hits, eviction follows LAST use, not admission: each eviction takes
+    /// the block whose most recent pin is oldest.
+    #[test]
+    fn eviction_follows_the_order_of_last_use() {
+        let io = Arc::new(FakeIo::new());
+        let p = pager_with(3, 16, io, &[1, 2, 3, 4, 5, 6]);
+        for id in [1u32, 2, 3, 1, 3] {
+            drop(p.pin(id, Insert::Mru).expect("pin"));
+        }
+        // Last use, oldest first: 2, 1, 3. Each new block must evict exactly the next of those.
+        for (new, victim, kept) in [(4u32, 2u32, [1u32, 3]), (5, 1, [3, 4]), (6, 3, [4, 5])] {
+            drop(p.pin(new, Insert::Mru).expect("pin"));
+            assert!(
+                p.try_pin(victim).is_none(),
+                "pinning {new} should have evicted {victim}"
+            );
+            for id in kept {
+                assert!(
+                    p.try_pin(id).is_some(),
+                    "pinning {new} evicted {id} out of order"
+                );
+            }
+        }
+    }
+
+    /// A block read that panics once each time it is armed, and otherwise reads like [`FakeIo`].
+    struct PanicOnceIo {
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl BlockIo for PanicOnceIo {
+        fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+            if self.armed.swap(false, Ordering::SeqCst) {
+                panic!("injected panic reading block {}", desc.id);
+            }
+            dst[..desc.nbytes()].fill(desc.id as u8);
+            Ok(())
+        }
+    }
+
+    /// B135: a panic out of a block read must release the slot exactly as an `Err` does. Left
+    /// `Loading`, the block would park every later `pin` or `fill` of it on the condvar forever,
+    /// so the retry runs on its own thread and a timeout is the failure.
+    #[test]
+    fn a_panicking_read_strands_nothing() {
+        let retry = |p: Arc<HostPager>, use_fill: bool| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut dst = [0u8; 16];
+                if use_fill {
+                    p.fill(1, &mut dst).expect("fill");
+                } else {
+                    dst.copy_from_slice(&p.pin(1, Insert::Mru).expect("pin"));
+                }
+                tx.send(dst).unwrap();
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the block was stranded by the panicking read")
+        };
+
+        for use_fill in [false, true] {
+            let io = Arc::new(PanicOnceIo {
+                armed: std::sync::atomic::AtomicBool::new(false),
+            });
+            let p = Arc::new(HostPager::new(2, 16, io.clone()).expect("host pager"));
+            p.register(desc(1, 16)).expect("register");
+            if use_fill {
+                // `fill` claims a slot only from a block's second miss on; the first streams.
+                assert_eq!(p.fill(1, &mut [0u8; 16]).unwrap(), Fill::Streamed);
+            }
+            io.armed.store(true, Ordering::SeqCst);
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut dst = [0u8; 16];
+                if use_fill {
+                    p.fill(1, &mut dst).map(|_| ())
+                } else {
+                    p.pin(1, Insert::Mru).map(|_| ())
+                }
+            }));
+            assert!(caught.is_err(), "the injected read did not panic");
+            assert_eq!(retry(Arc::clone(&p), use_fill), [1u8; 16]);
+        }
     }
 
     /// `try_pin` never reads and never admits.
@@ -1071,6 +1367,111 @@ mod tests {
         // The slot is free again, so block 1 admits — once its own doorkeeper miss is spent.
         assert_eq!(p.fill(1, &mut dst).unwrap(), Fill::Streamed);
         assert_eq!(p.fill(1, &mut dst).unwrap(), Fill::Admitted);
+    }
+
+    /// Reads like [`FakeIo`], except that a read of `gated` while the gate is shut reports itself
+    /// and then waits for the gate to open — so a test can act while that read is in progress.
+    struct GateIo {
+        gated: BlockId,
+        /// `(shut, a gated read has started)`.
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl GateIo {
+        fn new(gated: BlockId) -> Self {
+            Self {
+                gated,
+                state: Mutex::new((false, false)),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn shut(&self) {
+            *self.state.lock().unwrap() = (true, false);
+        }
+
+        fn open(&self) {
+            self.state.lock().unwrap().0 = false;
+            self.changed.notify_all();
+        }
+
+        /// Wait until a gated read has started; `false` if none did within the timeout.
+        fn wait_started(&self) -> bool {
+            let s = self.state.lock().unwrap();
+            let (s, _) = self
+                .changed
+                .wait_timeout_while(s, std::time::Duration::from_secs(10), |s| !s.1)
+                .unwrap();
+            s.1
+        }
+    }
+
+    impl BlockIo for GateIo {
+        fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+            if desc.id == self.gated {
+                let mut s = self.state.lock().unwrap();
+                if s.0 {
+                    s.1 = true;
+                    self.changed.notify_all();
+                    while s.0 {
+                        s = self.changed.wait(s).unwrap();
+                    }
+                }
+            }
+            dst[..desc.nbytes()].fill(desc.id as u8);
+            Ok(())
+        }
+    }
+
+    /// `read` — the way a background reader beside pinning callers gets bytes — never pins and
+    /// never admits, so it runs safely on the smallest arena: while it reads a block, a `pin` of
+    /// another block still gets the only slot. (`fill` there would admit the block on its second
+    /// miss and hold the slot pinned across the read, and that `pin` would fail with every slot
+    /// pinned.) A hit is copied out, moves no counter and leaves no pin behind.
+    #[test]
+    fn read_never_takes_a_slot_or_a_pin() {
+        let io = Arc::new(GateIo::new(2));
+        let p = Arc::new(HostPager::new(1, 16, io.clone()).expect("host pager"));
+        for id in [1, 2, 3] {
+            p.register(desc(id, 16)).expect("register");
+        }
+        let mut dst = [0u8; 16];
+        assert_eq!(p.read(2, &mut dst).unwrap(), Fill::Streamed);
+        assert_eq!(dst, [2u8; 16]);
+
+        // The block's second miss, held mid-read.
+        io.shut();
+        let reader = {
+            let p = Arc::clone(&p);
+            std::thread::spawn(move || {
+                let mut dst = [0u8; 16];
+                p.read(2, &mut dst)
+                    .map(|f| (f, dst))
+                    .map_err(|e| e.to_string())
+            })
+        };
+        assert!(io.wait_started(), "the gated read never started");
+        let pin = p.pin(1, Insert::Mru);
+        io.open();
+        let pin = pin.expect("a read in progress kept the only slot from a pin");
+        assert_eq!(&pin[..], &[1u8; 16]);
+        drop(pin);
+        let (fill, bytes) = reader.join().unwrap().expect("read");
+        assert_eq!((fill, bytes), (Fill::Streamed, [2u8; 16]));
+        assert!(p.try_pin(2).is_none(), "read admitted the block");
+
+        // A hit on block 1: its bytes, nothing counted, no pin left — block 3 can still evict it.
+        let before = p.stats();
+        assert_eq!(p.read(1, &mut dst).unwrap(), Fill::Hit);
+        assert_eq!(dst, [1u8; 16]);
+        let after = p.stats();
+        assert_eq!(
+            (after.pager.hits, after.pager.misses, after.reads),
+            (before.pager.hits, before.pager.misses, before.reads),
+            "a hit copy moved the counters"
+        );
+        assert_eq!(&p.pin(3, Insert::Mru).expect("pin")[..], &[3u8; 16][..]);
     }
 
     #[test]

@@ -116,6 +116,12 @@ const DENSE_SMALL_TILE_MAX_M16: usize = 16;
 /// what keeps the two from drifting.
 const MOE_TOPK_MAX_EXPERTS: usize = 1024;
 
+/// Ceiling on `n_expert_groups` for the GPU router's group-limited routing: the host's copy of
+/// `moe_topk.comp`'s `MOE_TOPK_MAX_GROUPS`, the size of the private per-group arrays the shader
+/// indexes by group without a bound check. `moe_topk_group_bound_matches_host` keeps the two
+/// together.
+const MOE_TOPK_MAX_GROUPS: u32 = 64;
+
 /// Upper bound on the number of buffers any single recorded dispatch binds (the widest kernel
 /// binds ≤ ~9). Sizes the stack scratch arrays in `dispatch3`/`dispatch_indirect`/`bind_descriptors`
 /// so those hot recording paths never touch the heap; a `debug_assert` guards the bound.
@@ -126,30 +132,28 @@ const MAX_DISPATCH_BINDINGS: usize = 16;
 /// wave) to feed enough MLP at low `out_f`, where the RM=1 grid (out_f workgroups) is too shallow
 /// to hide DRAM latency — the big GEMVs (lm_head/gate+up, out_f ≥ ~16k) already saturate on RM=1
 /// so they stay there. Only Q4_K/Q6_K have RM builds ([`crate::gemm::native_rm_streamed_build_spv`]).
-/// Tunable for A/B: `INFR_NO_GEMV_RM` forces the RM=1 path; `INFR_GEMV_RM`=2|4 forces the factor;
-/// `INFR_GEMV_RM_MAXOUT` overrides the out_f gate.
+/// Tunable for A/B through the `gemv_rm.*` tuning parameters (`gemv_rm.enabled = false` forces
+/// the RM=1 path, `gemv_rm.rows` = 2|4 the factor, `gemv_rm.min_out`/`max_out` the out_f gate;
+/// `INFR_NO_GEMV_RM`, `INFR_GEMV_RM`, `INFR_GEMV_RM_MINOUT`/`_MAXOUT` are their aliases).
 ///
-/// `k` is [`GemvCfg`](infr_core::config::GemvCfg) off the backend's `Config` — borrowed from the
-/// recorder, never re-resolved. It replaced a `OnceLock<GemvKnobs>` that re-read ~10 env vars
-/// process-once: the memo is gone AND the value is now settable per backend, at the same per-GEMV
-/// cost (a field read off a reference).
+/// `t` is the backend's resolved tuning set, borrowed — a field read per GEMV, never a lookup.
 fn native_rm_choice(
     dtype: infr_core::DType,
     out_f: usize,
-    k: &infr_core::config::GemvCfg,
+    t: &crate::tuning::Tuning,
 ) -> Option<u32> {
     use infr_core::DType::*;
-    if !matches!(dtype, Q4K | Q6K) || k.no_rm {
+    if !matches!(dtype, Q4K | Q6K) || !t.gemv_rm_enabled {
         return None;
     }
-    let max_out = k.rm_maxout;
+    let max_out = t.gemv_rm_max_out;
     // Below ~2k outputs the RM=1 grid is already shallow; halving it starves the machine (k/v,
     // out_f=1024, regressed in the cold A/B), so those stay on RM=1.
-    let min_out = k.rm_minout;
+    let min_out = t.gemv_rm_min_out;
     if out_f > max_out || out_f < min_out {
         return None;
     }
-    let rm = k.rm;
+    let rm = t.gemv_rm_rows;
     (rm == 2 || rm == 4).then_some(rm)
 }
 
@@ -160,13 +164,14 @@ fn native_rm_choice(
 /// bit-identical), so it is gated to the latency-starved projection BAND ONLY: the big lm_head /
 /// gate+up GEMVs (out_f ≥ ~16k) already saturate on the tree kernel and subgroupAdd measured a ~20%
 /// occupancy regression there. Q6_K ONLY (see below) — no Q4_K SG build exists.
-/// Env: `INFR_NO_GEMV_SG` forces the tree/RM path; `INFR_GEMV_SG_NR`=2|4|8 overrides NR;
-/// `INFR_GEMV_SG_MINOUT`/`INFR_GEMV_SG_MAXOUT` override the band.
+/// Tuning: `gemv_sg.enabled = false` forces the tree/RM path; `gemv_sg.rows`=2|4|8 sets NR;
+/// `gemv_sg.min_out`/`max_out` set the band (aliases `INFR_NO_GEMV_SG`, `INFR_GEMV_SG_NR`,
+/// `INFR_GEMV_SG_MINOUT`/`_MAXOUT`).
 fn native_sg_choice(
     dtype: infr_core::DType,
     in_f: usize,
     out_f: usize,
-    k: &infr_core::config::GemvCfg,
+    t: &crate::tuning::Tuning,
 ) -> Option<u32> {
     use infr_core::DType::*;
     // Q6_K ONLY: the heavier Q6_K decode (210-byte super-blocks, more unpack ALU) is where wave32 +
@@ -175,19 +180,19 @@ fn native_sg_choice(
     // out_f≈2048 (attn_v, out_f=1024: grid too shallow) and above the band (lm_head, out_f=151936:
     // already peak on the tree kernel + subgroupAdd occupancy regression) — so the band is the
     // out_f≈4096 Q6_K projections (ffn_down / o). Default NR=2 (best at every winning shape).
-    if !matches!(dtype, Q6K) || k.no_sg {
+    if !matches!(dtype, Q6K) || !t.gemv_sg_enabled {
         return None;
     }
     // wave32 lanes stride 32-elem sub-blocks; in_f must be a multiple of 32 (all projections are).
     if !in_f.is_multiple_of(32) {
         return None;
     }
-    let min_out = k.sg_minout;
-    let max_out = k.sg_maxout;
+    let min_out = t.gemv_sg_min_out;
+    let max_out = t.gemv_sg_max_out;
     if out_f < min_out || out_f > max_out {
         return None;
     }
-    let nr = k.sg_nr;
+    let nr = t.gemv_sg_rows;
     matches!(nr, 2 | 4 | 8).then_some(nr)
 }
 
@@ -197,16 +202,17 @@ fn native_sg_choice(
 /// largest SG win of all decode shapes) AND Q5_K (Qwen3.6-A3B UD-quant stores most expert downs as
 /// Q5_K at the same out_f≈2048 shape; A/B-confirmed a win — Q4_K idm already saturates and stays on
 /// the tree). Kept independent of `native_sg_choice` so the byte-identical dense SG path is untouched.
-/// Env: `INFR_NO_GEMV_ID_SG` forces the tree id path (id-only escape); `INFR_NO_GEMV_SG` disables BOTH
-/// the dense and id SG routes; `INFR_GEMV_SG_MINOUT`/`MAXOUT`/`INFR_GEMV_SG_NR` are the shared knobs.
+/// Tuning: `gemv_id_sg.enabled = false` forces the tree id path (id-only escape, alias
+/// `INFR_NO_GEMV_ID_SG`); `gemv_sg.enabled = false` (`INFR_NO_GEMV_SG`) disables BOTH the dense and
+/// id SG routes; `gemv_sg.min_out`/`max_out`/`rows` are the shared knobs.
 fn native_id_sg_choice(
     dtype: infr_core::DType,
     in_f: usize,
     out_f: usize,
-    k: &infr_core::config::GemvCfg,
+    t: &crate::tuning::Tuning,
 ) -> Option<u32> {
     use infr_core::DType::*;
-    if k.no_id_sg || k.no_sg {
+    if !t.gemv_id_sg_enabled || !t.gemv_sg_enabled {
         return None;
     }
     // Heavy K-quant decodes only (Q6_K/Q5_K): the extra unpack ALU is where wave32 + subgroupAdd's
@@ -234,19 +240,13 @@ fn native_id_sg_choice(
     if !in_f.is_multiple_of(32) {
         return None;
     }
-    let min_out = k.sg_minout;
-    let max_out = k.sg_maxout;
+    let min_out = t.gemv_sg_min_out;
+    let max_out = t.gemv_sg_max_out;
     if out_f < min_out || out_f > max_out {
         return None;
     }
-    let nr = k.sg_nr;
+    let nr = t.gemv_sg_rows;
     matches!(nr, 2 | 4 | 8).then_some(nr)
-}
-
-/// Workgroups for `rope.comp`: one thread per (token, head, pair); the shader grid-strides past
-/// the 65535-group cap.
-fn rope_groups(t: usize, n_heads: usize, hd: usize) -> u32 {
-    (t * n_heads * hd.div_ceil(2)).div_ceil(64).clamp(1, 65535) as u32
 }
 
 /// Converts an element-space per-expert stride to the per-expert BYTE stride the STREAMED
@@ -274,16 +274,6 @@ fn expert_stride_bytes(dtype: infr_core::DType, stride: usize) -> u32 {
     bytes as u32
 }
 
-/// Outputs per 64-lane workgroup in `native_gemv.comp`; must match the shader's `per_wg`.
-pub(crate) fn native_gemv_outs_per_wg(in_f: usize) -> u32 {
-    let nsub = (in_f / 32).max(1);
-    if nsub >= 64 {
-        1
-    } else {
-        64 / nsub.next_power_of_two() as u32
-    }
-}
-
 /// Reject a native-block dispatch whose K axis is off the 32-element sub-block grid.
 ///
 /// Every `native_decode.glsl` consumer walks K as `nsub = in_f / 32` whole 32-element sub-blocks —
@@ -295,7 +285,9 @@ pub(crate) fn native_gemv_outs_per_wg(in_f: usize) -> u32 {
 /// overwrote a `-7.0` sentinel with zeros while the host reference was ~3.1. No driver error, no
 /// validation-layer message, no seam error, and no zero-init check can tell it from a real answer.
 /// (`embed_gather` differs in shape only — it writes inside the sub-block loop, so a short row
-/// leaves `dst` untouched instead — not in consequence.)
+/// leaves `dst` untouched instead — not in consequence.) The prefill MMQ GEMMs
+/// (`native_gemm_mmq_*`, `native_gemm_i8cm_q8_0`) floor K the same way (`nblk = k / BLK`, with
+/// every `BLK` dividing 32), so their `matmul_*` entry points assert it too.
 ///
 /// No GGUF reaches either case — quant block sizes are 32/64/256, and every float projection width
 /// in a real model is 32-aligned — so this guards the floor rather than lifting it with a masked
@@ -311,6 +303,10 @@ fn assert_native_k(kernel: &str, in_f: usize) {
          tail, and in_f < 32 silently yields all-zero output"
     );
 }
+
+/// 32-element blocks `quant_q8.comp` quantizes per workgroup, one subgroup each. MIRRORS the
+/// shader's `QUANT_Q8_BLOCKS_PER_WG`; `quant_q8_blocks_per_wg_matches_shader` fails on a drift.
+pub(crate) const QUANT_Q8_BLOCKS_PER_WG: usize = 8;
 
 /// A batched-MoE expert-GEMM kernel variant: `(kernel name, SPIR-V)`.
 type MmqKern = (&'static str, &'static [u32]);
@@ -682,6 +678,99 @@ fn moe_mmq_desc(dtype: infr_core::DType) -> Option<MoeMmqDesc> {
 /// reads the environment and nothing latches process-wide.
 const BDA_CHUNK_UNIT_MAX: u64 = 1 << 32;
 
+/// Does the int8 dp4a multi-row GEMV take its four-outputs-per-workgroup build (`-DOUTS4`) for
+/// activation rows of width `in_f`? A discrete GPU takes it below 2048 wide, where the
+/// two-output layout leaves lanes of the workgroup idle; an integrated GPU at every width, where
+/// it measured faster at every LFM3-1.7B decode shape on the RDNA2 iGPU (the per-op timings are
+/// in the CHANGELOG and backlog B188).
+fn mmv_o4(vk: &infr_core::config::VulkanCfg, in_f: usize, o4: MmvO4) -> bool {
+    vk.mmv_o4 && (in_f < o4.max_in_f || o4.all_widths)
+}
+
+/// When [`mmv_o4`] takes the four-outputs build: the `mmv_mrow.o4_max_in_f` and
+/// `mmv_mrow.o4_all_widths` tuning parameters (the latter on by default on an integrated GPU).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MmvO4 {
+    /// Below this input width.
+    pub max_in_f: usize,
+    /// At every width.
+    pub all_widths: bool,
+}
+
+impl MmvO4 {
+    pub(crate) fn of(t: &crate::tuning::Tuning) -> Self {
+        Self {
+            max_in_f: t.mmv_o4_max_in_f,
+            all_widths: t.mmv_o4_all_widths,
+        }
+    }
+}
+
+/// The int8 dp4a multi-row GEMV build [`Recorder::linear_mmv_mrow_at`] dispatches for `rows`
+/// activation rows of width `in_f` on an `integrated` GPU or not, under `vk`'s layout knobs
+/// (`mmv_o4`, `mmv_m4`; see [`mmv_o4`]), with or without the fused residual:
+/// `(kernel name, SPIR-V, outputs per workgroup)`. `None` when no
+/// such build exists, so a tier gate that asks this before choosing the kernel can never pick a
+/// variant the recorder would then fail to find — the variant tables are sparse (the residual
+/// builds exist only at `m4`, none at all for some dtypes, and rows past 8 have no residual twin).
+pub(crate) fn mmv_mrow_variant(
+    vk: &infr_core::config::VulkanCfg,
+    dtype: infr_core::DType,
+    rows: usize,
+    in_f: usize,
+    res: bool,
+    o4: MmvO4,
+) -> Option<(&'static str, &'static [u32], u32)> {
+    if rows > 8 {
+        if res {
+            return None;
+        }
+        return crate::gemm::native_mmv_mrow_m16_spv(dtype).map(|(n, s)| (n, s, 2));
+    }
+    let o4 = mmv_o4(vk, in_f, o4);
+    let m4 = rows <= 4 && vk.mmv_m4;
+    crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
+        .map(|(n, s)| (n, s, if o4 { 4 } else { 2 }))
+}
+
+/// The FUSE_QUANT (`INFR_MMV_FUSE_QUANT`) twin of [`mmv_mrow_variant`] for a single decode row —
+/// the build [`Recorder::linear_mmv_mrow_fuseq`] dispatches. Only a few dtypes have one; `None`
+/// sends the caller to the separate-`quant_q8` route.
+pub(crate) fn mmv_mrow_fuseq_variant(
+    vk: &infr_core::config::VulkanCfg,
+    dtype: infr_core::DType,
+    in_f: usize,
+    res: bool,
+    o4: MmvO4,
+) -> Option<(&'static str, &'static [u32], u32)> {
+    let o4 = mmv_o4(vk, in_f, o4);
+    crate::gemm::native_mmv_mrow_variant_fuseq_spv(dtype, o4, true, res)
+        .map(|(n, s)| (n, s, if o4 { 4 } else { 2 }))
+}
+
+/// Whether [`Recorder::embed_gather`] must fold each row into the table's 64-bit base instead of
+/// addressing the table by a u32 element offset: when the table's ELEMENT count reaches
+/// `elem_cap` (the `ids*ne` element base wraps) or its BYTE size reaches `byte_cap` (the byte and
+/// word offsets the decode computes from that element base, e.g. `wi << 2` in `arena_word`, wrap
+/// first for any format of more than a byte per element: f16/bf16 at half the element cap, Q8_0
+/// a little sooner than the element cap). Driving this off the caps — not
+/// a hardcoded 2^32 — lets `INFR_BDA_CHUNK_ELEMS` / `INFR_BDA_CHUNK_BYTES` force the fold path on a
+/// normal model, so the forced-chunking proof exercises BOTH the lm_head GEMV split and this embed
+/// fold in one run.
+fn embed_gather_folds(vocab: usize, ne: usize, row_stride: usize, caps: (u64, u64)) -> bool {
+    let (elem_cap, byte_cap) = caps;
+    (vocab as u64) * (ne as u64) >= elem_cap || (vocab as u64) * (row_stride as u64) >= byte_cap
+}
+
+/// The flat workgroup grid of the non-coopmat prefill GEMMs ([`Recorder::matmul_mmq_at`],
+/// [`Recorder::matmul_fma_at`]): one workgroup per square output tile of the kernels' BM = BN,
+/// indexed by `gl_WorkGroupID.x` alone. The adapter's grid-limit guard reads the same count.
+pub(crate) fn nc_gemm_groups(m: usize, n: usize) -> usize {
+    /// The kernels' output tile edge (`native_gemm_mmq*` / `native_gemm_fma.comp`).
+    const TILE: usize = 64;
+    m.div_ceil(TILE) * (n / TILE)
+}
+
 /// `(elem_cap, byte_cap)` from a backend's Vulkan config. `None` (unset, or a value below 2, which
 /// can never fit even one row) = the real u32 cap — exactly what `cap_from_env`'s
 /// `.filter(|&n| n >= 2).unwrap_or(BDA_CHUNK_UNIT_MAX)` did.
@@ -738,7 +827,7 @@ fn bda_gemv_needs_chunk(
 }
 
 /// Whether a `[out_f, in_f]` dense weight breaches a u32 addressing cap (at slice offset 0). The
-/// tiled-GEMM prefill tiers (coopmat / nc_mmq / nc_fma / streamed_prefill_gemm) cannot be
+/// tiled-GEMM prefill tiers (coopmat / nc_mmq / nc_fma) cannot be
 /// output-row chunked the way the GEMV can (their 64-row M-tile is not decomposable into single
 /// input rows), so a breaching weight on those paths — a multi-row lm_head, i.e. MTP speculative
 /// verify or an all-position-logits request on a big-vocab model — must fail LOUDLY rather than
@@ -843,12 +932,22 @@ fn bda_out_f_chunks(
     Ok(chunks)
 }
 
+/// Which causal depthwise conv a shared conv dispatch records: qwen35's conv + SiLU
+/// (`Op::Conv1dSilu`) or LFM's gated short convolution (`Op::ShortConv`, the `-DSHORTCONV` builds
+/// of the same shaders).
+#[derive(Clone, Copy)]
+enum ConvKind {
+    Silu,
+    Short,
+}
+
 pub struct Recorder<'a> {
     be: &'a VulkanBackend,
     cmd: vk::CommandBuffer,
     /// Descriptor pools, GROWN on exhaustion (a batched-MoE prefill chunk records ~50k dispatches
     /// — far beyond any fixed max_sets). The last entry is the active pool; `alloc_set` appends a
-    /// fresh one on ERROR_OUT_OF_POOL_MEMORY.
+    /// fresh one on ERROR_OUT_OF_POOL_MEMORY. Empty on the push-descriptor path, which never
+    /// allocates a set.
     pools: std::cell::RefCell<Vec<vk::DescriptorPool>>,
     /// Buffers written since the last barrier (for read-after-write / write-after-write detection).
     dirty_writes: RefCell<HashSet<vk::Buffer>>,
@@ -875,6 +974,11 @@ pub struct Recorder<'a> {
     /// (`kind:mM:KxN`) instead of the bare kernel name. Read once at construction.
     op_shapes: bool,
     query_pool: vk::QueryPool,
+    /// Two timestamps bracketing this command buffer's GPU execution (index 0 written first,
+    /// index 1 by `finish`/`finish_nowait`), for the submit splitter's GPU-time measurement
+    /// (`crate::ForwardClock`). Null on a persistent recorder or when the queue writes no
+    /// timestamps; the completed segment then counts as untimed.
+    seg_query_pool: vk::QueryPool,
     ts_labels: RefCell<Vec<&'static str>>,
     /// Dispatches past the query-pool capacity: counted (and reported) instead of stamped.
     ts_dropped: std::cell::Cell<usize>,
@@ -900,6 +1004,8 @@ pub struct Recorder<'a> {
     /// [`Self::chunk_caps`].
     bda_chunk_elem_cap: u64,
     bda_chunk_byte_cap: u64,
+    /// Process-unique id of this recording (see [`Self::serial`]).
+    serial: u64,
 }
 
 /// Intern a profiling shape label, leaking each DISTINCT string at most ONCE and handing back the
@@ -934,6 +1040,15 @@ fn intern_label(s: String) -> &'static str {
     set.insert(leaked);
     leaked
 }
+
+/// K/V rows per tile the flash prefill kernels load (their BN): they read up to `kv_len` rounded
+/// up to this.
+pub(crate) const FLASH_KV_TILE: usize = 64;
+/// K/V rows the non-FA prefill pads `kv_len` to (the 8-warp `attn_qk`'s BN).
+pub(crate) const NONFA_KV_TILE: usize = 256;
+
+/// Source of [`Recorder::serial`].
+static NEXT_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl<'a> Recorder<'a> {
@@ -976,8 +1091,13 @@ impl<'a> Recorder<'a> {
         }
         .map_err(|e| be(format!("begin cmd buffer: {e}")))?;
 
-        // Big pool: one descriptor set per recorded op.
-        let pool = Self::new_desc_pool(device)?;
+        // Big pool: one descriptor set per recorded op. Push descriptors record every binding into
+        // the command buffer and never allocate a set, so that path creates no pool at all.
+        let pools = if backend.shared.push_descriptor.is_some() {
+            Vec::new()
+        } else {
+            vec![Self::new_desc_pool(device)?]
+        };
 
         // Per-DISPATCH stamps (auto-labels): a batched prefill chunk can record tens of
         // thousands of dispatches; 64k × 8 B = 512 KiB of query pool, profiling runs only.
@@ -1008,11 +1128,43 @@ impl<'a> Recorder<'a> {
         } else {
             vk::QueryPool::null()
         };
+        // BOTTOM_OF_PIPE on both stamps: a timestamp is written once every PREVIOUSLY SUBMITTED
+        // command has finished that stage, so stamp 0 lands when this segment can actually start
+        // (after the segment queued ahead of it), not while that one is still running — the
+        // per-segment intervals then tile the queue instead of overlapping.
+        let seg_query_pool = if !persistent && backend.shared.segment_ts_period.is_some() {
+            match unsafe {
+                device.create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(2),
+                    None,
+                )
+            } {
+                Ok(qp) => {
+                    unsafe {
+                        device.cmd_reset_query_pool(cmd, qp, 0, 2);
+                        device.cmd_write_timestamp(
+                            cmd,
+                            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                            qp,
+                            0,
+                        );
+                    }
+                    qp
+                }
+                // Untimed is a supported state (the forward falls back to wall time), so a failed
+                // create degrades instead of failing the recording.
+                Err(_) => vk::QueryPool::null(),
+            }
+        } else {
+            vk::QueryPool::null()
+        };
 
         Ok(Self {
             be: backend,
             cmd,
-            pools: std::cell::RefCell::new(vec![pool]),
+            pools: std::cell::RefCell::new(pools),
             dirty_writes: RefCell::new(HashSet::new()),
             dirty_reads: RefCell::new(HashSet::new()),
             dirty_transfer: std::cell::Cell::new(false),
@@ -1024,6 +1176,7 @@ impl<'a> Recorder<'a> {
             prof_ops,
             op_shapes,
             query_pool,
+            seg_query_pool,
             ts_labels: RefCell::new(Vec::new()),
             ts_dropped: std::cell::Cell::new(0),
             next_label: std::cell::Cell::new(None),
@@ -1033,7 +1186,15 @@ impl<'a> Recorder<'a> {
             dispatches: std::cell::Cell::new(0),
             bda_chunk_elem_cap,
             bda_chunk_byte_cap,
+            serial: NEXT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         })
+    }
+
+    /// Process-unique id of this recording. Unlike the command buffer handle, never reused, so
+    /// state noted against a recording (the weight pagers' staged placements) can be matched to
+    /// the one that is later discarded rather than to an earlier, submitted one.
+    pub(crate) fn serial(&self) -> u64 {
+        self.serial
     }
 
     /// The Vulkan kernel-tier config this recorder steers on — BORROWED off the backend that
@@ -1044,10 +1205,10 @@ impl<'a> Recorder<'a> {
         &self.be.cfg().kernels.vulkan
     }
 
-    /// The native-GEMV routing sub-config (`INFR_GEMV_*` / `INFR_NO_GEMV_*`), borrowed.
+    /// The backend's resolved tuning set (the native-GEMV routing among it), borrowed.
     #[inline]
-    fn gemv(&self) -> &infr_core::config::GemvCfg {
-        &self.vk().gemv
+    fn tuning(&self) -> &crate::tuning::Tuning {
+        self.be.tuning()
     }
 
     /// The `(elem, byte)` u32 addressing caps for chunked dense GEMV dispatch — the two values
@@ -1288,16 +1449,18 @@ impl<'a> Recorder<'a> {
     /// Intel A770 (Mesa ANV) enforces exactly the guaranteed minimum, and a wide GEMV (a
     /// ~150k-vocab lm_head, or `rows * gate_up_intermediate` at multi-row prefill) can dispatch
     /// past it in one dimension — the segfault-adjacent bug this splits around.
-    const MAX_GROUP_COUNT_X: u32 = 65_535;
+    pub(crate) const MAX_GROUP_COUNT_X: u32 = 65_535;
 
     /// Dispatch a FLAT `n`-workgroup 1-D grid, splitting into a safe 2-D grid
     /// (`MAX_GROUP_COUNT_X` × `ceil(n / MAX_GROUP_COUNT_X)`) whenever `n` would otherwise exceed
     /// the guaranteed limit. Every paired shader recovers the flat index as
     /// `gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x` (identical to `gl_WorkGroupID.x`
-    /// when `gy == 1`, i.e. a total no-op for every dispatch that already fit in one dimension —
-    /// which is every dispatch on hardware/models exercised so far) and bounds-checks it against
-    /// the true element count, since `gx * gy` can overshoot `n` when `n` isn't a multiple of
-    /// `gx` — those padding workgroups must return immediately without touching any buffer.
+    /// when `gy == 1`, i.e. a total no-op for every dispatch that already fit in one dimension) and
+    /// bounds-checks it against the true element count, since `gx * gy` can overshoot `n` when
+    /// `n` isn't a multiple of `gx` — those padding workgroups must return immediately without
+    /// touching any buffer. The split is taken on every device, not only those that enforce the
+    /// guaranteed minimum, and real shapes reach it: a dense 4096-wide model's default prefill
+    /// chunk already gives `quant_q8` a wider grid.
     fn dispatch_wide(
         &self,
         k: ComputeKernel,
@@ -1306,19 +1469,34 @@ impl<'a> Recorder<'a> {
         push: &[u8],
         n: u32,
     ) {
-        if n <= Self::MAX_GROUP_COUNT_X {
+        let max_x = Self::split_point_x();
+        if n <= max_x {
             self.dispatch3(k, buffers, n_out, push, n, 1, 1);
         } else {
-            let gy = n.div_ceil(Self::MAX_GROUP_COUNT_X);
+            let gy = n.div_ceil(max_x);
             if self.be.cfg().debug.wide_dispatch {
                 eprintln!(
-                    "[infr] dispatch_wide SPLIT kernel={:?} n={n} -> gx={} gy={gy}",
+                    "[infr] dispatch_wide SPLIT kernel={:?} n={n} -> gx={max_x} gy={gy}",
                     k.name,
-                    Self::MAX_GROUP_COUNT_X
                 );
             }
-            self.dispatch3(k, buffers, n_out, push, Self::MAX_GROUP_COUNT_X, gy, 1);
+            #[cfg(test)]
+            tests::WIDE_SPLITS.with(|c| c.set(c.get() + 1));
+            self.dispatch3(k, buffers, n_out, push, max_x, gy, 1);
         }
+    }
+
+    /// Where [`dispatch_wide`](Self::dispatch_wide) splits: always
+    /// [`MAX_GROUP_COUNT_X`](Self::MAX_GROUP_COUNT_X) outside this crate's unit tests. Those can
+    /// lower it, because a device whose real limit is far above the guaranteed minimum (RADV)
+    /// never splits a grid small enough to test, so neither the split nor the paired shader's
+    /// index recovery would otherwise run.
+    pub(crate) fn split_point_x() -> u32 {
+        #[cfg(test)]
+        if let Some(x) = tests::WIDE_SPLIT_AT.with(std::cell::Cell::get) {
+            return x;
+        }
+        Self::MAX_GROUP_COUNT_X
     }
 
     /// Bind `k`'s pipeline and all of `buffers` to descriptor set 0. `VK_KHR_push_descriptor`
@@ -1534,6 +1712,12 @@ impl<'a> Recorder<'a> {
         // does with an out-of-range descriptor, and the old debug-only assert never ran in the
         // builds that ship. One compare on a path that already does two.
         let range_cap = crate::max_storage_buffer_range() as u64;
+        // This device's limit sits far above every tensor a test can allocate, so the unit tests
+        // lower it on their own thread to see the assert fire.
+        #[cfg(test)]
+        let range_cap = tests::VKB_RANGE_CAP
+            .with(std::cell::Cell::get)
+            .unwrap_or(range_cap);
         assert!(
             range <= range_cap,
             "resident-BDA sub-tensor range ({range} bytes) exceeds this device's \
@@ -1666,14 +1850,6 @@ impl<'a> Recorder<'a> {
         self.sgp() == 16
     }
 
-    /// Whether the decode GEMV family should use its `-DSG=64` NATIVE twins: wave64-only
-    /// devices (GCN) with `kernels.vulkan.wave64_native` on run one full wave64 per workgroup
-    /// with plain subgroup ops instead of 32-lane halves emulated through `subgroupClusteredAdd`.
-    /// False everywhere else (non-wave64 devices never select the SG=64 builds).
-    fn sg64(&self) -> bool {
-        self.be.shared.wave64 && self.vk().wave64_native
-    }
-
     /// `y[rows,out] = x[rows,in] · Wᵀ` (W stored `[out,in]`). Resident-BDA route: `w.device_addr()`
     /// `Some` means `w` is a sub-tensor of a `bufferDeviceAddress` arena block (see
     /// `Buffer::device_addr`'s doc) — always fork to the `-DSTREAMED` twin here rather than binding
@@ -1715,157 +1891,12 @@ impl<'a> Recorder<'a> {
         self.linear_f16_noext_at(arena_addr, x, y, rows, in_f, out_f);
     }
 
-    /// Apply a compressed EXL3 projection with input/output Hadamard transforms.
-    #[allow(clippy::too_many_arguments)]
-    pub fn linear_exl3(
-        &self,
-        trellis: &dyn Buffer,
-        suh: &dyn Buffer,
-        svh: &dyn Buffer,
-        x: &dyn Buffer,
-        xh: &dyn Buffer,
-        z: &dyn Buffer,
-        y: &dyn Buffer,
-        rows: u32,
-        spec: infr_core::Exl3Spec,
-    ) -> Result<()> {
-        let bytes = spec.trellis_bytes()?;
-        let k = spec.in_f as usize;
-        let n = spec.out_f as usize;
-        let m = rows as usize;
-        let input = m
-            .checked_mul(k)
-            .filter(|v| *v <= u32::MAX as usize)
-            .and_then(|v| v.checked_mul(4))
-            .ok_or_else(|| be("exl3: input address overflow"))?;
-        let output = m
-            .checked_mul(n)
-            .filter(|v| *v <= u32::MAX as usize)
-            .and_then(|v| v.checked_mul(4))
-            .ok_or_else(|| be("exl3: output address overflow"))?;
-        if bytes / 4 > u32::MAX as usize
-            || trellis.len_bytes() < bytes
-            || suh.len_bytes() < k * 2
-            || svh.len_bytes() < n * 2
-            || x.len_bytes() < input
-            || xh.len_bytes() < input
-            || z.len_bytes() < output
-            || y.len_bytes() < output
-        {
-            return Err(be("exl3: projection buffer size mismatch"));
-        }
-        if rows == 0 {
-            return Ok(());
-        }
-        let addr = |b: &dyn Buffer| {
-            b.device_addr()
-                .ok_or_else(|| be("exl3: weight requires buffer device address"))
-        };
-        let packed = addr(trellis)?;
-        let in_scale = addr(suh)?;
-        let out_scale = addr(svh)?;
-        let push = |words: &[u32]| {
-            words
-                .iter()
-                .flat_map(|v| v.to_ne_bytes())
-                .collect::<Vec<u8>>()
-        };
-        let layout_words = |layout: infr_core::Exl3Layout| match layout {
-            infr_core::Exl3Layout::Identity => [0, 0, 0, 0],
-            infr_core::Exl3Layout::RopeInterleaved {
-                head_dim,
-                rotary_dim,
-                ..
-            } => [1, head_dim, rotary_dim, 0],
-            infr_core::Exl3Layout::GroupedValueHeads {
-                prefix,
-                key_heads,
-                head_dim,
-                ..
-            } => [2, head_dim, key_heads, prefix],
-        };
-        let [layout, head_dim, param, prefix] = layout_words(spec.input_layout);
-        let kin = self
-            .be
-            .kernel("exl3_hadamard_in", crate::exl3::hadamard_in(), 2, 32);
-        let pin = push(&[
-            rows,
-            spec.in_f,
-            in_scale as u32,
-            (in_scale >> 32) as u32,
-            layout,
-            head_dim,
-            param,
-            prefix,
-        ]);
-        self.sync(&[Self::vk_of(suh).buffer], &[], false);
-        self.dispatch_wide(
-            kin,
-            &[Self::vkb(x), Self::vkb(xh)],
-            1,
-            &pin,
-            rows * (spec.in_f / 128),
-        );
-        let batch = if rows == 1 { 1 } else { 8 };
-        let caps = self.be.caps();
-        let shuffle = caps.subgroup_min >= 32;
-        let (name, spv) = if rows == 1 {
-            match (caps.f16, shuffle) {
-                (true, true) if spec.bits == 4 => {
-                    ("exl3_gemv_f16_sh_b4", crate::exl3::gemv_f16_sh_b4())
-                }
-                (false, true) if spec.bits == 4 => ("exl3_gemv_sh_b4", crate::exl3::gemv_sh_b4()),
-                (true, true) => ("exl3_gemv_f16_sh", crate::exl3::gemv_f16_sh()),
-                (true, false) => ("exl3_gemv_f16", crate::exl3::gemv_f16()),
-                (false, true) => ("exl3_gemv_sh", crate::exl3::gemv_sh()),
-                (false, false) => ("exl3_gemv", crate::exl3::gemv()),
-            }
-        } else {
-            ("exl3_prefill", crate::exl3::prefill())
-        };
-        let dot = self.be.kernel(name, spv, 2, 28);
-        let pdot = push(&[
-            rows,
-            spec.in_f,
-            spec.out_f,
-            spec.bits,
-            packed as u32,
-            (packed >> 32) as u32,
-            spec.codebook as u32,
-        ]);
-        self.sync(&[Self::vk_of(trellis).buffer], &[], false);
-        self.dispatch_wide(
-            dot,
-            &[Self::vkb(xh), Self::vkb(z)],
-            1,
-            &pdot,
-            rows.div_ceil(batch) * (spec.out_f / 16),
-        );
-        let [layout, head_dim, param, prefix] = layout_words(spec.output_layout);
-        let kout = self
-            .be
-            .kernel("exl3_hadamard_out", crate::exl3::hadamard_out(), 2, 32);
-        let pout = push(&[
-            rows,
-            spec.out_f,
-            out_scale as u32,
-            (out_scale >> 32) as u32,
-            layout,
-            head_dim,
-            param,
-            prefix,
-        ]);
-        self.sync(&[Self::vk_of(svh).buffer], &[], false);
-        self.dispatch_wide(
-            kout,
-            &[Self::vkb(z), Self::vkb(y)],
-            1,
-            &pout,
-            rows * (spec.out_f / 128),
-        );
-        Ok(())
-    }
-
+    /// f32-weight GEMV `y = x·Wᵀ` — full-precision projection weights (gemma4 E2B's per-layer
+    /// inp_gate/proj and qwen3moe's router ship as F32; reading them through the f16 kernel
+    /// produced garbage). Dispatches the `linear_f32r` family (see
+    /// [`Self::linear_f32_at`]'s mrow/vec4 tile pick) — these weights are small, so the
+    /// simple kernels are fine. (The old eager thread-per-output `linear_f32.comp` is deleted;
+    /// see build.rs's note where its entry used to live.)
     pub fn linear_f32(
         &self,
         w: &dyn Buffer,
@@ -1946,8 +1977,8 @@ impl<'a> Recorder<'a> {
 
     /// bf16-weight GEMV `y = x·Wᵀ` (`linear_bf16.comp`) — recorder-level twin of the eager
     /// `ops::linear_bf16` (which owns its host round-trip); exists so the streamed parity test can
-    /// drive the resident kernel in a recorded submit. Plain 1-D grid (the shader does no 2-D
-    /// index recovery).
+    /// drive the resident kernel in a recorded submit. One workgroup per `(row, output)`, split
+    /// into a 2-D grid past the guaranteed grid width.
     pub fn linear_bf16(
         &self,
         w: &dyn Buffer,
@@ -1983,9 +2014,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        // linear_bf16's grid is NOT dispatch_wide-recovered in the shader (plain gl_WorkGroupID.x)
-        // — mirror the resident call shape: rows*out_f 1-D groups.
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
             1,
@@ -1994,36 +2023,30 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Decode (m=1) f32 GEMV over `linear_f32_mo.comp` with `2^tpo_log2` threads per output
-    /// (1..=8). Requires `in_f % 4 == 0` and a 16-byte-aligned `arena_addr`.
-    pub fn linear_f32_mo_at(
-        &self,
-        arena_addr: u64,
-        x: &dyn Buffer,
-        y: &dyn Buffer,
-        in_f: usize,
-        out_f: usize,
-        tpo_log2: u32,
-    ) {
-        debug_assert!(in_f.is_multiple_of(4) && arena_addr.is_multiple_of(16) && tpo_log2 <= 8);
-        self.label_gemv("lin_f32_mo", 1, in_f, out_f);
-        let k = self
-            .be
-            .kernel("linear_f32_mo", crate::gemm::linear_f32_mo_spv(), 3, 20);
-        let mut push = [0u8; 20];
-        push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&tpo_log2.to_ne_bytes());
-        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let per_wg = 256usize >> tpo_log2;
-        self.dispatch(
-            k,
-            &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
-            1,
-            &push,
-            out_f.div_ceil(per_wg) as u32,
-        );
+    /// Which `linear_f32r` build [`Self::linear_f32_at`] dispatches for `rows` × `in_f` — public
+    /// so the parity test can assert the shape it meant to cover actually reached that kernel.
+    ///
+    /// The two escapes govern different things: `INFR_NO_F32_MROW` (`f32_mrow`) turns off the
+    /// ROW-TILED builds (several rows per workgroup, `rows > 1`), `INFR_NO_F32_V4` (`f32_v4`) the
+    /// vec4 K stream. The one-row vec4 build has no row tiling, so only the vec4 escape reaches it.
+    /// It exists because the MoE router GEMV sits on decode's critical path once per layer and
+    /// launches only out_f workgroups (64 on ERNIE-4.5-21B-A3B), so it is latency-bound like the
+    /// small-m prefill shapes the vec4 tiles were made for: measured 12.0 → 4.5 us per call on the
+    /// RX 7900 XTX with `INFR_PROF_OPS`.
+    pub fn linear_f32_kernel(&self, rows: usize, in_f: usize) -> &'static str {
+        let v4 = in_f.is_multiple_of(4) && self.vk().f32_v4;
+        let mrow = rows > 1 && self.vk().f32_mrow;
+        if rows == 1 && v4 {
+            "linear_f32r_v4"
+        } else if mrow && v4 && rows <= 4 {
+            "linear_f32r_mrow4_v4"
+        } else if mrow && v4 {
+            "linear_f32r_mrow8_v4"
+        } else if mrow {
+            "linear_f32r_mrow8"
+        } else {
+            "linear_f32r"
+        }
     }
 
     /// Arena-addressed body of [`Self::linear_f32`] — mirrors the eager dispatcher's mrow/vec4
@@ -2039,40 +2062,23 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
-        if rows == 1 && in_f.is_multiple_of(4) && arena_addr.is_multiple_of(16) && self.vk().f32_v4
-        {
-            // 64 threads per output, 32 when a row is too short to give each thread two vec4s.
-            let tpo_log2 = if in_f / 4 >= 128 { 6 } else { 5 };
-            self.linear_f32_mo_at(arena_addr, x, y, in_f, out_f, tpo_log2);
-            return;
-        }
         self.label_gemv("lin_f32_streamed", rows, in_f, out_f);
-        let use_mrow = rows > 1 && self.vk().f32_mrow;
-        let use_v4 = use_mrow && in_f.is_multiple_of(4) && self.vk().f32_v4;
-        let (name, spv, groups) = if use_v4 && rows <= 4 {
-            (
-                "linear_f32r_mrow4_v4",
+        let name = self.linear_f32_kernel(rows, in_f);
+        let (spv, groups) = match name {
+            "linear_f32r_v4" => (crate::gemm::linear_f32r_v4_spv(), out_f as u32),
+            "linear_f32r_mrow4_v4" => (
                 crate::gemm::linear_f32r_mrow4_v4_spv(),
                 (out_f * rows.div_ceil(4)) as u32,
-            )
-        } else if use_v4 {
-            (
-                "linear_f32r_mrow8_v4",
+            ),
+            "linear_f32r_mrow8_v4" => (
                 crate::gemm::linear_f32r_mrow8_v4_spv(),
                 (out_f * rows.div_ceil(8)) as u32,
-            )
-        } else if use_mrow {
-            (
-                "linear_f32r_mrow8",
+            ),
+            "linear_f32r_mrow8" => (
                 crate::gemm::linear_f32r_mrow8_spv(),
                 (out_f * rows.div_ceil(8)) as u32,
-            )
-        } else {
-            (
-                "linear_f32r",
-                crate::gemm::linear_f32r_spv(),
-                (rows * out_f) as u32,
-            )
+            ),
+            _ => (crate::gemm::linear_f32r_spv(), (rows * out_f) as u32),
         };
         let k = self.be.kernel(name, spv, 3, 20);
         let mut push = [0u8; 20];
@@ -2209,8 +2215,8 @@ impl<'a> Recorder<'a> {
     /// `-DSTREAMED` twin of [`Self::matmul_proj`] (the coopmat f16 projection GEMM: see
     /// `gemm_proj.comp`'s STREAMED doc). Same arena-by-address convention as
     /// [`Self::matmul_mmq_at`] — the resident build's weight-SSBO slot (binding 1) takes a
-    /// harmless FILLER (`a`) since the arena is never bound as a descriptor. Not wired into any
-    /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    /// harmless FILLER (`a`) since the arena is never bound as a descriptor. The adapter's
+    /// `float_linear` dispatches it for resident and streamed f16 weights alike.
     pub fn matmul_proj_at(
         &self,
         a: &dyn Buffer,
@@ -2274,7 +2280,7 @@ impl<'a> Recorder<'a> {
         a: &dyn Buffer,
         // The weight's 64-bit base address: a resident weight's own BDA address
         // (`w.device_addr()`), or a dense-pager streamed block's slot base in the pager arena (see
-        // adapter.rs `streamed_prefill_gemm`). The picked tile reads the weight by this address
+        // adapter.rs `quant_linear`). The picked tile reads the weight by this address
         // (native_weight_addr.glsl); it is never bound as a descriptor.
         w_addr: u64,
         w_base: usize,
@@ -2299,7 +2305,8 @@ impl<'a> Recorder<'a> {
         let warp = if k.is_multiple_of(32) && self.vk().gemm_warp {
             if use_wide {
                 crate::gemm::native_gemm_warp_kernel_name(dtype).map(|_| 256usize)
-            } else if n.is_multiple_of(128) {
+            } else if n.is_multiple_of(128) && k.is_multiple_of(64) {
+                // The narrow tile's k-stage is 64 wide with no tail guard.
                 crate::gemm::native_gemm_warp_n128_kernel_name(dtype).map(|_| 128usize)
             } else {
                 None
@@ -2407,7 +2414,8 @@ impl<'a> Recorder<'a> {
     /// [`matmul_native_off`](Self::matmul_native_off) with A already converted to f16 (padded to
     /// ceil(m/64)·64 rows) — the A_GLOBAL warptiles coopMatLoad A straight from global, dropping
     /// the As stage/LDS (occupancy 2→3 wgs/WGP: ~1.5x on the 8B shapes). Same tile pick as the
-    /// f32 path; caller guarantees k%32==0, n%128==0 and that the _ag SPIR-V exists for `dtype`
+    /// f32 path; caller guarantees k%64==0 for the narrow tile (k%32==0 for the wide one),
+    /// n%128==0 and that the _ag SPIR-V exists for `dtype`
     /// (`native_gemm_warp_ag_kernel_name(dtype).is_some()`). Numerics are bit-identical to the f32
     /// path: the staging loop rounded A to f16 anyway, and the MMA order is unchanged.
     #[allow(clippy::too_many_arguments)]
@@ -2463,6 +2471,10 @@ impl<'a> Recorder<'a> {
             .flatten();
         // Resident A_GLOBAL tile NAME the `_streamed` twin keys off — the weight is read by 64-bit
         // address, so nothing binds a resident SSBO; the getters report the tile name/availability.
+        assert!(
+            use_wide || k.is_multiple_of(64),
+            "matmul_native_f16a: the narrow tile stages k 64 at a time (got k={k})"
+        );
         let (name, bn, bm): (&str, usize, usize) = if use_wide {
             (
                 crate::gemm::native_gemm_warp_ag_kernel_name(dtype).expect("ag name"),
@@ -2506,7 +2518,7 @@ impl<'a> Recorder<'a> {
     /// [`matmul_native_f16a`](Self::matmul_native_f16a) with f32 activations read directly — no
     /// separate `store_f16` pass. The `_direct` kernel variants stage f32→f16 to As shared memory
     /// and coopMatLoad from there. Same tile shapes as the n128_ag family (BM=64/32/16, BN=128,
-    /// BK=64). Requires `n%128==0`, `k%32==0`, and that the `_direct` SPIR-V exists for `dtype`
+    /// BK=64). Requires `n%128==0`, `k%64==0`, and that the `_direct` SPIR-V exists for `dtype`
     /// (`native_gemm_warp_n128_direct_kernel_name(dtype).is_some()`). Numerics: the f32→f16 cast
     /// is the same rounding the old `store_f16` pass did, so the GEMM is bit-identical to the
     /// store_f16 + n128_ag path.
@@ -2535,6 +2547,10 @@ impl<'a> Recorder<'a> {
         let bm32 = small_bm
             .then(|| crate::gemm::native_gemm_warp_n128_direct_bm32_kernel_name(dtype))
             .flatten();
+        assert!(
+            k.is_multiple_of(64),
+            "matmul_native_f32a: the narrow tile stages k 64 at a time (got k={k})"
+        );
         let (name, bm): (&str, usize) = if let Some(name) = bm16 {
             (name, 16)
         } else if let Some(name) = bm32 {
@@ -2572,7 +2588,7 @@ impl<'a> Recorder<'a> {
     /// SPLIT-K narrow-warptile GEMM: `splits` k-partials into `partials` ([splits, mpad, n] f32),
     /// then the deterministic fixed-order reduce into `c`. The occupancy fix for narrow-n GEMMs
     /// with deep k (o/down projections: n = n_embd, k = 2-3·n_embd — 64 workgroups on a 96-wg
-    /// part with the plain tile). Requires n%128==0, k%32==0; caller sizes `partials` to
+    /// part with the plain tile). Requires n%128==0, k%64==0; caller sizes `partials` to
     /// `splits · ceil(m/64)·64 · n · 4` bytes. `a_is_f16`: A is the caller's f16 cast-copy
     /// (padded rows) and the A_GLOBAL tile is used — see [`matmul_native_f16a`](Self::matmul_native_f16a).
     #[allow(clippy::too_many_arguments)]
@@ -2601,6 +2617,10 @@ impl<'a> Recorder<'a> {
         // in `matmul_native_f16a` (the non-split-K n128_ag family), which had no such fill floor.
         // Resident split-K tile NAME the `_streamed` twin keys off — the weight is read by 64-bit
         // address, so nothing binds a resident SSBO; the getters report the tile name/availability.
+        assert!(
+            k.is_multiple_of(64),
+            "matmul_native_splitk: the narrow tile stages k 64 at a time (got k={k})"
+        );
         let name = if a_is_f16 {
             crate::gemm::native_gemm_warp_sk_ag_kernel_name(dtype).expect("split-k ag name")
         } else {
@@ -2640,7 +2660,7 @@ impl<'a> Recorder<'a> {
         rp[0..4].copy_from_slice(&(n_elems as u32).to_ne_bytes());
         rp[4..8].copy_from_slice(&(splits as u32).to_ne_bytes());
         rp[8..12].copy_from_slice(&(n_elems as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             rk,
             &[Self::vkb(partials), Self::vkb(c)],
             1,
@@ -2665,6 +2685,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert_native_k("matmul_mmq_q4k", k);
         self.label_gemm("native_gemm_mmq_q4k", m, k, n);
         let kern = self.be.kernel(
             "native_gemm_mmq_q4k",
@@ -2685,6 +2706,118 @@ impl<'a> Recorder<'a> {
                 Self::vkb(dact),
                 Self::vkb(sact),
                 Self::vkb(w),
+                Self::vkb(c),
+            ],
+            1,
+            &push,
+            groups,
+        );
+    }
+
+    /// Packed-int8-dot prefill GEMM for a K-quant weight (`native_gemm_dp4a_kq.comp`), the
+    /// non-coopmat tier's K-quant arm: `c[m, n] = qa·Wᵀ` with `qa`/`dact`/`sact` from
+    /// [`Self::quant_q8`] and the weight read by its 64-bit device address `w_addr` from element
+    /// `w_base`. Writes only the `m` real rows of `c`; the shape contract is asserted here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matmul_dp4a_kq(
+        &self,
+        dtype: infr_core::DType,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        w_addr: u64,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (name, spv) = crate::gemm::native_gemm_dp4a_kq_spv(dtype)
+            .unwrap_or_else(|| panic!("matmul_dp4a_kq: no dp4a K-quant build for {dtype:?}"));
+        let tile = crate::gemm::DP4A_KQ_TILE;
+        assert!(
+            k.is_multiple_of(256) && w_base.is_multiple_of(256),
+            "{name}: k ({k}) and w_base ({w_base}) must be whole K-quant superblocks"
+        );
+        assert!(
+            n.is_multiple_of(tile.rows) && (k / 32).is_multiple_of(tile.k_blocks),
+            "{name}: n ({n}) or k ({k}) is off the tile"
+        );
+        self.label_gemm(name, m, k, n);
+        self.be.note_linear_tier(crate::LinearTierEvent::Dp4aKq);
+        let kern = self.be.kernel(name, spv, 4, 24);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
+        let groups = (m.div_ceil(tile.tokens) * (n / tile.rows)) as u32;
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
+                Self::vkb(c),
+            ],
+            1,
+            &push,
+            groups,
+        );
+    }
+
+    /// int8 cooperative-matrix prefill GEMM for a K-quant weight (`native_gemm_i8cm_kq.comp`):
+    /// `c[m, n] = qa·Wᵀ` with `qa`/`dact`/`sact` from [`Self::quant_q8`] and the weight read by
+    /// its 64-bit device address `w_addr` from element `w_base`. Writes only the `m` real rows of
+    /// `c`. The adapter dispatches it only once the accumulator-layout probe has passed
+    /// (`VulkanBackend::i8cm_kq_ready`); the shape contract is asserted here.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn matmul_i8cm_kq(
+        &self,
+        dtype: infr_core::DType,
+        tile: crate::gemm::I8cmTile,
+        qa: &dyn Buffer,
+        dact: &dyn Buffer,
+        sact: &dyn Buffer,
+        w_addr: u64,
+        w_base: usize,
+        c: &dyn Buffer,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) {
+        let (name, spv) = crate::gemm::native_gemm_i8cm_kq_spv(dtype, tile)
+            .unwrap_or_else(|| panic!("matmul_i8cm_kq: no int8 coopmat build for {dtype:?}"));
+        assert!(
+            k.is_multiple_of(256) && w_base.is_multiple_of(256),
+            "{name}: k ({k}) and w_base ({w_base}) must be whole K-quant superblocks"
+        );
+        assert!(
+            n.is_multiple_of(tile.rows()) && (k / 32).is_multiple_of(tile.k_blocks()),
+            "{name}: n ({n}) or k ({k}) is off the {tile:?} tile"
+        );
+        self.label_gemm(name, m, k, n);
+        self.be.note_i8cm_kq(match tile {
+            crate::gemm::I8cmTile::L => crate::I8cmKqEvent::LargeTile,
+            crate::gemm::I8cmTile::M => crate::I8cmKqEvent::MediumTile,
+        });
+        let kern = self.be.kernel_sg(name, spv, 4, 24, 32);
+        let mut push = [0u8; 24];
+        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(w_addr as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&((w_addr >> 32) as u32).to_ne_bytes());
+        let groups = (m.div_ceil(tile.tokens()) * (n / tile.rows())) as u32;
+        self.dispatch(
+            kern,
+            &[
+                Self::vkb(qa),
+                Self::vkb(dact),
+                Self::vkb(sact),
                 Self::vkb(c),
             ],
             1,
@@ -2715,6 +2848,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert_native_k("matmul_i8cm_q8_0", k);
         self.label_gemm("native_gemm_i8cm_q8_0", m, k, n);
         let kern = self.be.kernel_sg(
             "native_gemm_i8cm_q8_0",
@@ -2761,6 +2895,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert_native_k("matmul_i8cm_q8_0_at", k);
         self.label_gemm("native_gemm_i8cm_q8_0_streamed", m, k, n);
         let kern = self.be.kernel_sg(
             "native_gemm_i8cm_q8_0_streamed",
@@ -2803,6 +2938,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert_native_k("matmul_i8cm_q8_0_rowscale", k);
         self.label_gemm("native_gemm_i8cm_q8_0_rowscale", m, k, n);
         let kern = self.be.kernel_sg(
             "native_gemm_i8cm_q8_0_rowscale",
@@ -3123,8 +3259,9 @@ impl<'a> Recorder<'a> {
     /// Tiled Q6_K dp4a (mmq) GEMM for a stacked expert (the MoE down projection): `c = qa·W[w_base]ᵀ`
     /// using hardware int8 dot-product (activations pre-quantized via `quant_q8`; the per-block sum is
     /// unused — Q6_K is symmetric, no min). `c` is `ceil(m/64)*64` rows. Faster than the coopmat-f16
-    /// `matmul_native` for u6 weights. Requires `n%64`, `k%32`; activations/scales must include
-    /// all `ceil(m/64)*64` padded rows, including when `m` is not a multiple of 64.
+    /// `matmul_native` for u6 weights. Requires `n%64`, and `k%256` so every weight row starts on a
+    /// Q6_K superblock (the shader addresses rows by whole 210-byte blocks); `assert_native_k`
+    /// enforces only `k%32`, which every Q6_K tensor's `k%256` satisfies.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_q6k(
         &self,
@@ -3137,10 +3274,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
-        assert!(
-            k.is_multiple_of(32) && n.is_multiple_of(64),
-            "Q6_K MMQ requires k%32 == 0 and n%64 == 0"
-        );
+        assert_native_k("matmul_mmq_q6k", k);
         self.label_gemm("native_gemm_mmq_q6k", m, k, n);
         let kern = self.be.kernel(
             "native_gemm_mmq_q6k",
@@ -3163,16 +3297,10 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Dtype-generic DENSE dp4a (mmq) tiled GEMM: `c = qa·W[w_base]ᵀ` for ANY
-    /// `infr_core::tensor::MOE_MMQ_DTYPES` member — the non-coopmat prefill tier's GEMM
-    /// (adapter.rs `nc_mmq`: no usable f16 coopmat, packed int8 dot present — Intel Arc/ANV).
-    /// Same kernels/conventions as [`Self::matmul_mmq_q4k`]/[`Self::matmul_mmq_q6k`] (which it
-    /// delegates to for those dtypes' names), extended to the full dense build set
-    /// (`native_gemm_mmq_dense_spv`): activations pre-quantized via `quant_q8`, `c` is
-    /// `ceil(m/64)*64` rows, requires `n%64`, `k%32`. `sact` (the per-32-block Σx term) is
-    /// always passed but bound ONLY for the min-carrying dtypes
-    /// (`infr_core::tensor::moe_mmq_needs_sact` — the same SSOT the `_xp` expert dispatch uses;
-    /// Q2_K self-computes its narrower Σx in-shader).
+    /// [`Self::matmul_mmq_at`] reading a bound weight buffer `w` at its own BDA address. No
+    /// production caller: the adapter's `nc_prefill_gemm` (the resident non-coopmat tier and the
+    /// streamed route alike) calls `matmul_mmq_at` with the address itself. Kept for the parity
+    /// tests that hold a weight buffer rather than an address.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq(
         &self,
@@ -3193,11 +3321,19 @@ impl<'a> Recorder<'a> {
         self.matmul_mmq_at(dtype, qa, dact, sact, arena_addr, w_base, c, m, k, n);
     }
 
-    /// `-DSTREAMED` twin of [`Self::matmul_mmq`] (slice A3 build-variant: see
-    /// `crate::gemm::native_gemm_mmq_dense_spv`). Same arena-by-address convention as
-    /// [`Self::linear_native_at`] — the resident build's weight SSBO slot takes a small
-    /// FILLER (`qa`) since the arena is never bound as a descriptor. Not wired into any production
-    /// dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    /// Dtype-generic DENSE dp4a (mmq) tiled GEMM: `c = qa·W[w_base]ᵀ` for ANY
+    /// `infr_core::tensor::MOE_MMQ_DTYPES` member, the weight read by 64-bit address `arena_addr`
+    /// (a resident weight's BDA or a streamed pool slot's arena base). The adapter's
+    /// `nc_prefill_gemm` dispatches it for the non-coopmat prefill tier (`NcGemm::Mmq`: no usable
+    /// f16 coopmat, packed int8 dot present — Intel Arc/ANV, integrated GPUs) and for a streamed
+    /// Q4_K Linear on a coopmat device that no warp tile covers. Builds come from
+    /// `crate::gemm::native_gemm_mmq_dense_spv`: activations pre-quantized via `quant_q8`, `c` is
+    /// `ceil(m/64)*64` rows, requires `n%64`, `k%32`. `sact` (the per-32-block Σx term) is
+    /// always passed but bound ONLY for the min-carrying dtypes
+    /// (`infr_core::tensor::moe_mmq_needs_sact` — the same SSOT the `_xp` expert dispatch uses;
+    /// Q2_K self-computes its narrower Σx in-shader). Same arena-by-address convention as
+    /// [`Self::linear_native_at`]: the weight SSBO slot takes a small FILLER (`qa`), since the
+    /// arena is never bound as a descriptor.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_mmq_at(
         &self,
@@ -3212,6 +3348,7 @@ impl<'a> Recorder<'a> {
         k: usize,
         n: usize,
     ) {
+        assert_native_k("matmul_mmq_at", k);
         let (name, spv) = crate::gemm::native_gemm_mmq_dense_spv(dtype)
             .expect("matmul_mmq_at: dtype gated by native_gemm_mmq_dense_spv");
         let needs_sact = infr_core::tensor::moe_mmq_needs_sact(dtype);
@@ -3225,7 +3362,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        let groups = nc_gemm_groups(m, n) as u32;
         let mut bufs = vec![Self::vkb(qa), Self::vkb(dact)];
         if needs_sact {
             bufs.push(Self::vkb(sact));
@@ -3234,10 +3371,11 @@ impl<'a> Recorder<'a> {
         self.dispatch(kern, &bufs, 1, &push, groups);
     }
 
-    /// Arena-addressed body of [`Self::matmul_fma`] (see `crate::gemm::native_gemm_fma_spv`).
-    /// The vacated binding-1 slot takes a FILLER (`a`). Production routes here through
-    /// [`Self::matmul_fma`] (the weight's own BDA address); parity tests call it directly with an
-    /// explicit arena address.
+    /// Arena-addressed body of [`Self::matmul_fma`] (see `crate::gemm::native_gemm_fma_spv`):
+    /// the weight read by 64-bit address `arena_addr` (a resident weight's BDA or a streamed pool
+    /// slot's arena base). The vacated binding-1 slot takes a FILLER (`a`). The production entry:
+    /// the adapter's `nc_prefill_gemm` calls it for the non-coopmat tier's `NcGemm::Fma` arm,
+    /// resident and streamed alike.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_fma_at(
         &self,
@@ -3261,7 +3399,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let groups = (m.div_ceil(64) * (n / 64)) as u32;
+        let groups = nc_gemm_groups(m, n) as u32;
         self.dispatch(
             kern,
             &[Self::vkb(a), Self::vkb(a), Self::vkb(c)],
@@ -3271,333 +3409,19 @@ impl<'a> Recorder<'a> {
         );
     }
 
-    /// Decode (m=1) K-quant GEMV on f32 activations (`native_gemv_kq_fma.comp`): `y = x·Wᵀ`, or
-    /// `y = residual + x·Wᵀ` with `residual`. Q4_K/Q6_K, `in_f % 256 == 0`, `w_base % 256 == 0`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn linear_kq_fma(
-        &self,
-        dtype: infr_core::DType,
-        w: &dyn Buffer,
-        w_base: usize,
-        x: &dyn Buffer,
-        residual: Option<&dyn Buffer>,
-        y: &dyn Buffer,
-        in_f: usize,
-        out_f: usize,
-    ) {
-        let nr = self.kq_fma_gemv_rows(in_f, out_f);
-        self.linear_kq_fma_nr(dtype, w, w_base, x, residual, y, in_f, out_f, nr);
-    }
-
-    /// The GQA-batched decode pass-1 build for this shape, when `kernels.vulkan.attn_decode_gqa`
-    /// enables it explicitly and a build covers `(hd, nh/nkv)`. Auto (None) is off: on the
-    /// only hardware it was tuned for (GFX8/Polaris, wave64-only) the batched pass 1 runs
-    /// ~1.6x slower per dispatch than `attn_decode` (43.8us vs ~27us at qwen d1024;
-    /// tg64@d4096 qwen -7.5%, e4b -5.5%), so it must be opted into per device, not by class.
-    fn gqa_pass1(
-        &self,
-        hd: usize,
-        nh: usize,
-        nkv: usize,
-        window: usize,
-        dynac: bool,
-    ) -> Option<(&'static str, &'static [u32])> {
-        let caps = self.be.caps();
-        let can_pin_64 = caps.subgroup_min <= 64 && caps.subgroup_max >= 64;
-        if !self.vk().attn_decode_gqa.unwrap_or(false) || !can_pin_64 {
-            return None;
-        }
-        if nkv == 0 || !nh.is_multiple_of(nkv) {
-            return None;
-        }
-        crate::gemm::attn_decode_gqa_kernel(hd, nh / nkv, window > 0, dynac)
-    }
-
-    /// Rows per workgroup for [`Self::linear_kq_fma`]. A workgroup runs `nr/4 * in_f/256` items over
-    /// 8 slots; 8 rows only when it fills the last pass clearly better than 4 and still leaves
-    /// 4 workgroups per CU.
-    pub fn kq_fma_gemv_rows(&self, in_f: usize, out_f: usize) -> usize {
-        let cu = (self.be.caps().compute_units as usize).max(1);
-        let fill = |nr: usize| {
-            let items = nr / 4 * (in_f / 256).max(1);
-            items as f64 / (items.div_ceil(8) * 8) as f64
-        };
-        let wgs8 = out_f.div_ceil(8);
-        if fill(8) >= fill(4) * 1.1 && wgs8 >= 4 * cu {
-            8
-        } else {
-            4
-        }
-    }
-
-    /// [`Self::linear_kq_fma`] at an explicit `nr` (4 or 8) rows per workgroup.
-    #[allow(clippy::too_many_arguments)]
-    pub fn linear_kq_fma_nr(
-        &self,
-        dtype: infr_core::DType,
-        w: &dyn Buffer,
-        w_base: usize,
-        x: &dyn Buffer,
-        residual: Option<&dyn Buffer>,
-        y: &dyn Buffer,
-        in_f: usize,
-        out_f: usize,
-        nr: usize,
-    ) {
-        let arena_addr = w
-            .device_addr()
-            .expect("resident-BDA weight: linear_kq_fma requires a u64 BDA device address");
-        let ssbo = self.be.cfg().kernels.vulkan.weights_as_ssbo
-            && (Self::vk_of(w).size as u64).next_multiple_of(256)
-                <= crate::max_storage_buffer_range() as u64;
-        let (name, spv) = crate::gemm::native_gemv_kq_fma_spv(dtype, residual.is_some(), nr, ssbo)
-            .expect("linear_kq_fma: dtype/nr gated by native_gemv_kq_fma_spv");
-        debug_assert!(in_f.is_multiple_of(256) && w_base.is_multiple_of(256));
-        self.label_gemv(name, 1, in_f, out_f);
-        let kern = self.be.kernel(name, spv, if ssbo { 4 } else { 3 }, 20);
-        let mut push = [0u8; 20];
-        push[0..4].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let r = residual.unwrap_or(x);
-        let mut binds = vec![Self::vkb(x), Self::vkb(r), Self::vkb(y)];
-        if ssbo {
-            binds.push(Self::vkb(w));
-        }
-        self.dispatch_wide(kern, &binds, 1, &push, out_f.div_ceil(nr) as u32);
-    }
-
-    /// Multi-row fp32 K-quant GEMV sharing weights with decode-identical per-row reductions.
-    #[allow(clippy::too_many_arguments)]
-    pub fn linear_kq_fma_mrow(
-        &self,
-        dtype: infr_core::DType,
-        w: &dyn Buffer,
-        w_base: usize,
-        x: &dyn Buffer,
-        y: &dyn Buffer,
-        rows: usize,
-        in_f: usize,
-        out_f: usize,
-    ) {
-        let nr = self.kq_fma_gemv_rows(in_f, out_f);
-        self.linear_kq_fma_mrow_nr(dtype, w, w_base, x, y, rows, in_f, out_f, nr);
-    }
-
-    /// [`Self::linear_kq_fma_mrow`] at an explicit `nr` (4 or 8) output columns per workgroup.
-    #[allow(clippy::too_many_arguments)]
-    pub fn linear_kq_fma_mrow_nr(
-        &self,
-        dtype: infr_core::DType,
-        w: &dyn Buffer,
-        w_base: usize,
-        x: &dyn Buffer,
-        y: &dyn Buffer,
-        rows: usize,
-        in_f: usize,
-        out_f: usize,
-        nr: usize,
-    ) {
-        let arena_addr = w
-            .device_addr()
-            .expect("resident-BDA weight: linear_kq_fma_mrow requires a u64 BDA device address");
-        let (name, spv) = crate::gemm::native_gemv_kq_fma_mrow_spv(dtype, nr)
-            .expect("linear_kq_fma_mrow: dtype/nr gated by native_gemv_kq_fma_mrow_spv");
-        debug_assert!(in_f.is_multiple_of(256) && w_base.is_multiple_of(256));
-        self.label_gemv(name, rows, in_f, out_f);
-        let kern = self.be.kernel(name, spv, 2, 24);
-        let mut push = [0u8; 24];
-        push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(out_f as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
-        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let tiles = out_f.div_ceil(nr) as u32;
-        let groups = rows.div_ceil(4) as u32;
-        self.dispatch_wide(
-            kern,
-            &[Self::vkb(x), Self::vkb(y)],
-            1,
-            &push,
-            tiles * groups,
-        );
-    }
-
-    /// Arena-addressed body of [`Self::matmul_kq_fma`] at column tile `bn` (64 or 128).
-    #[allow(clippy::too_many_arguments)]
-    pub fn matmul_kq_fma_at(
-        &self,
-        dtype: infr_core::DType,
-        bn: usize,
-        a: &dyn Buffer,
-        arena_addr: u64,
-        w_base: usize,
-        c: &dyn Buffer,
-        m: usize,
-        k: usize,
-        n: usize,
-    ) {
-        self.kq_fma_slices_at(dtype, bn, a, arena_addr, w_base, c, m, k, n, 1);
-    }
-
-    /// One dispatch per k slice of the fp32 K-quant tile, each writing the full
-    /// `ceil(m/64)*64 x n` tile into `dst` (the same buffer bound 3×; the shader reads the slice
-    /// bounds from its push constants). `splits == 1` is the direct tile: a single dispatch into
-    /// `c`, no partials.
-    #[allow(clippy::too_many_arguments)]
-    fn kq_fma_slices_at(
-        &self,
-        dtype: infr_core::DType,
-        bn: usize,
-        a: &dyn Buffer,
-        arena_addr: u64,
-        w_base: usize,
-        dst: &dyn Buffer,
-        m: usize,
-        k: usize,
-        n: usize,
-        splits: usize,
-    ) {
-        let (name, spv) = crate::gemm::native_gemm_kq_fma_spv(dtype, bn)
-            .expect("kq_fma_slices_at: dtype/tile gated by native_gemm_kq_fma_spv");
-        debug_assert!(n.is_multiple_of(bn) && k.is_multiple_of(256) && w_base.is_multiple_of(256));
-        debug_assert!(splits >= 1 && k.is_multiple_of(256 * splits));
-        self.label_gemm(name, m, k, n);
-        let kern = self.be.kernel(name, spv, 3, 32);
-        let groups = (m.div_ceil(128) * (n / bn) * splits) as u32;
-        let mut push = [0u8; 32];
-        push[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
-        push[4..8].copy_from_slice(&(n as u32).to_ne_bytes());
-        push[8..12].copy_from_slice(&(k as u32).to_ne_bytes());
-        push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
-        push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        push[28..32].copy_from_slice(&(splits as u32).to_ne_bytes());
-        self.dispatch(
-            kern,
-            &[Self::vkb(a), Self::vkb(a), Self::vkb(dst)],
-            1,
-            &push,
-            groups,
-        );
-    }
-
-    /// Probe-only: stream `n_vec4` vec4 words with `groups` workgroups of 256 threads and write one
-    /// partial per thread. Measures the sequential-read ceiling of the device; the only caller is
-    /// `tests/bw_scan.rs`.
-    pub fn bw_scan_at(&self, src: &dyn Buffer, dst: &dyn Buffer, n_vec4: usize, groups: usize) {
-        let kern = self.be.kernel("bw_scan", crate::gemm::bw_scan_spv(), 2, 4);
-        let mut push = [0u8; 4];
-        push[0..4].copy_from_slice(&(n_vec4 as u32).to_ne_bytes());
-        self.dispatch(
-            kern,
-            &[Self::vkb(src), Self::vkb(dst)],
-            1,
-            &push,
-            groups as u32,
-        );
-    }
-
-    /// Split-K twin of [`Self::matmul_kq_fma_at`]: `kq_fma_slices_at` over `splits` k
-    /// slices into `partials`, then one `splitk_reduce` pass summing the planes. All slices ride
-    /// one dispatch (the slice index is the top of the workgroup id), so they stay co-resident and
-    /// overlap; a grid that underfills the device therefore still fills it.
-    /// Requires `k % (256*splits)` so every slice stays K-block aligned, and `splits > 1`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn matmul_kq_fma_splitk_at(
-        &self,
-        dtype: infr_core::DType,
-        bn: usize,
-        a: &dyn Buffer,
-        arena_addr: u64,
-        w_base: usize,
-        partials: &dyn Buffer,
-        c: &dyn Buffer,
-        m: usize,
-        k: usize,
-        n: usize,
-        splits: usize,
-    ) {
-        debug_assert!(splits > 1);
-        self.kq_fma_slices_at(dtype, bn, a, arena_addr, w_base, partials, m, k, n, splits);
-        let mpad = m.div_ceil(64) * 64;
-        self.label_gemm("splitk_reduce", m, k, n);
-        let rk = self
-            .be
-            .kernel("splitk_reduce", crate::gemm::splitk_reduce_spv(), 2, 12);
-        let n_elems = mpad * n;
-        let mut rp = [0u8; 12];
-        rp[0..4].copy_from_slice(&(n_elems as u32).to_ne_bytes());
-        rp[4..8].copy_from_slice(&(splits as u32).to_ne_bytes());
-        rp[8..12].copy_from_slice(&(n_elems as u32).to_ne_bytes());
-        self.dispatch(
-            rk,
-            &[Self::vkb(partials), Self::vkb(c)],
-            1,
-            &rp,
-            (n_elems as u32).div_ceil(64),
-        );
-    }
-
-    /// fp32 K-quant prefill GEMM for GPUs without fast int8 dot (`native_gemm_kq_fma.comp`):
-    /// `c = a·W[w_base]ᵀ`, Q4_K/Q6_K weights dequantized in-shader, `c` padded to
-    /// `ceil(m/64)*64` rows. Requires `n % bn == 0` and `k % 256 == 0`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn matmul_kq_fma(
-        &self,
-        dtype: infr_core::DType,
-        bn: usize,
-        a: &dyn Buffer,
-        w: &dyn Buffer,
-        w_base: usize,
-        c: &dyn Buffer,
-        m: usize,
-        k: usize,
-        n: usize,
-    ) {
-        let arena_addr = w
-            .device_addr()
-            .expect("resident-BDA weight: matmul_kq_fma requires a u64 BDA device address");
-        self.matmul_kq_fma_at(dtype, bn, a, arena_addr, w_base, c, m, k, n);
-    }
-
-    /// [`Self::matmul_kq_fma`] over `splits` k slices with a reduce pass — see
-    /// [`Self::matmul_kq_fma_splitk_at`] for the shape requirements and the reason it exists.
-    #[allow(clippy::too_many_arguments)]
-    pub fn matmul_kq_fma_splitk(
-        &self,
-        dtype: infr_core::DType,
-        bn: usize,
-        a: &dyn Buffer,
-        w: &dyn Buffer,
-        w_base: usize,
-        partials: &dyn Buffer,
-        c: &dyn Buffer,
-        m: usize,
-        k: usize,
-        n: usize,
-        splits: usize,
-    ) {
-        let arena_addr = w
-            .device_addr()
-            .expect("resident-BDA weight: matmul_kq_fma_splitk requires a u64 BDA device address");
-        self.matmul_kq_fma_splitk_at(
-            dtype, bn, a, arena_addr, w_base, partials, c, m, k, n, splits,
-        );
-    }
-
     /// Non-coopmat float-weight prefill GEMM (the "fma-warp" tier): `c = a·W[w_base]ᵀ`, `a` f32
     /// activations, `w` raw f16/bf16/f32 words read NATIVELY (bf16 keeps its full exponent
     /// range — bits shifted `<<16` into f32 registers, no f16 clamp and no upconverted weight
     /// copy). Shared-memory fma warptile (BM=64×BN=64×BK=32, 256 threads, TM=TN=4 register
     /// block — see `native_gemm_fma.comp` for the Intel Arc design constraints: no subgroup
-    /// ops, no f16 extensions, 16.5 KB LDS, modest registers). Selected by the adapter's
-    /// non-coopmat tier (`nc_fma`, `!caps.f16_coopmat`); beats the per-row scalar GEMVs by
+    /// ops, no f16 extensions, 16.5 KB LDS, modest registers). Beats the per-row scalar GEMVs by
     /// amortizing each weight element across the 64-row tile, does NOT need to beat coopmat.
     /// `c` is `ceil(m/64)*64` rows (the usual padded-GEMM convention). Requires `n%64`, `k%32`.
+    ///
+    /// This wrapper reads a bound weight buffer `w` at its own BDA address and has no production
+    /// caller: the adapter's non-coopmat tier (`NcGemm::Fma`, `!caps.f16_coopmat`) calls
+    /// [`Self::matmul_fma_at`] with the address itself. Kept for the parity tests that hold a
+    /// weight buffer rather than an address.
     #[allow(clippy::too_many_arguments)]
     pub fn matmul_fma(
         &self,
@@ -3645,20 +3469,29 @@ impl<'a> Recorder<'a> {
         let arena_addr = w
             .device_addr()
             .expect("resident-BDA weight: linear_native requires a u64 BDA device address");
-        // bf16 decode: the dedicated reduction GEMV is ~5x the generic dequant GEMV's bandwidth.
-        if rows == 1
-            && dtype == infr_core::DType::Bf16
-            && w_base.is_multiple_of(2)
-            && out_f <= Self::MAX_GROUP_COUNT_X as usize
-        {
-            self.linear_bf16_at(arena_addr + 2 * w_base as u64, x, y, 1, in_f, out_f);
-            return;
-        }
+        self.linear_native_routed_at(dtype, arena_addr, w_base, x, y, rows, in_f, out_f);
+    }
+
+    /// [`Self::linear_native`] for a weight read by 64-bit address `arena_addr` alone (a resident
+    /// weight's BDA, or a streamed slot's arena base): the same SG → RM-v2 → RM → plain precedence,
+    /// so a streamed weight takes the GEMV its resident twin would.
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_native_routed_at(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
         // Replicate the resident SG → RM-v2 → RM → plain precedence, routing each branch to its own
-        // `_streamed` twin (the build tables are 1:1 mirrored — see this fn's doc). Every branch
-        // reachable here has a streamed kernel to route to.
+        // `_streamed` twin (the build tables are 1:1 mirrored — see `linear_native`'s doc). Every
+        // branch reachable here has a streamed kernel to route to.
         if rows == 1 {
-            if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
+            if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.tuning()) {
                 if crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
                     .is_some()
                 {
@@ -3666,13 +3499,13 @@ impl<'a> Recorder<'a> {
                     return;
                 }
             }
-            if let Some(v) = &self.gemv().variant {
+            if let Some(v) = &self.tuning().gemv_variant {
                 if crate::gemm::native_rm_v2_streamed_build_spv(v, dtype, false).is_some() {
                     self.linear_native_rm_v2_at(v, dtype, arena_addr, w_base, x, y, in_f, out_f);
                     return;
                 }
             }
-            if let Some(rm) = native_rm_choice(dtype, out_f, self.gemv()) {
+            if let Some(rm) = native_rm_choice(dtype, out_f, self.tuning()) {
                 if crate::gemm::native_rm_streamed_build_spv(dtype, false, rm).is_some() {
                     self.linear_native_rm_at(dtype, arena_addr, w_base, x, y, in_f, out_f, rm);
                     return;
@@ -3687,10 +3520,9 @@ impl<'a> Recorder<'a> {
     /// addressed by `arena_addr` — the resident slot's base BYTE address — NOT a bound SSBO. This
     /// lifts the ~4 GiB `maxStorageBufferRange` cap the resident/SSBO GEMV binding has. `w_base` is
     /// the op's own WITHIN-slot element offset (a fused-QKV slice, usually 0), added to the
-    /// per-output index exactly as the resident path does. All streamed dense Linears (any m) route
-    /// here — the rows loop handles m>1 (re-streaming the weight per row: correct, and streaming is
-    /// already a memory-bound fallback where kernel micro-optimization is dominated by PCIe/residency
-    /// cost).
+    /// per-output index exactly as the resident path does. The plain arm of
+    /// [`Self::linear_native_routed_at`], and the per-row fallback (the rows loop re-streams the
+    /// weight per row) a weight past the u32 addressing cap takes at m > 1, since it chunks.
     ///
     /// The arena is read purely by the `arena_addr` push constant — it is NEVER bound as a
     /// descriptor (a `WHOLE_SIZE` binding of this multi-GiB pager arena would re-impose
@@ -3701,8 +3533,8 @@ impl<'a> Recorder<'a> {
     /// descriptor set stays fully written — same convention as the MoE `-DPAGED` dispatch, which
     /// fills binding 0 with `lut`, not the giant arena (see [`Self::linear_native_id_paged`]). The
     /// ring→arena copy vs pointer-read hazard is ordered explicitly by
-    /// [`Self::arena_stream_barrier`] at the staging site (the pointer read is invisible to the
-    /// buffer hazard tracker).
+    /// [`Self::arena_stream_barrier`] around the copy at the staging site (the pointer read is
+    /// invisible to the buffer hazard tracker).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_at(
         &self,
@@ -3717,7 +3549,6 @@ impl<'a> Recorder<'a> {
     ) {
         assert_native_k("linear_native_at", in_f);
         self.label_gemv("gemv_streamed", rows, in_f, out_f);
-        let per_wg = native_gemv_outs_per_wg(in_f);
         let (name, spv) =
             crate::gemm::native_streamed_build_spv(dtype, false).expect("native streamed GEMV spv");
         let k = self.be.kernel(name, spv, 3, 24);
@@ -3746,7 +3577,7 @@ impl<'a> Recorder<'a> {
                 in_f,
                 out_f,
                 push,
-                |n| n.div_ceil(per_wg),
+                |n| n,
             );
             return;
         }
@@ -3757,7 +3588,7 @@ impl<'a> Recorder<'a> {
             &[Self::vkb(x), Self::vkb(x), Self::vkb(y)],
             1,
             &push,
-            ((rows * out_f) as u32).div_ceil(per_wg),
+            (rows * out_f) as u32,
         );
     }
 
@@ -3789,8 +3620,8 @@ impl<'a> Recorder<'a> {
     /// `-DSTREAMED` twin of [`Self::linear_native_mrow`] (slice A1 build-variant: see
     /// `crate::gemm::native_mrow_spv`). Same arena-by-address convention as
     /// [`Self::linear_native_at`] — binding 0 (the resident build's weight SSBO) takes a
-    /// small FILLER (`x`) since the arena is never bound as a descriptor. Not wired into any
-    /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    /// small FILLER (`x`) since the arena is never bound as a descriptor. The adapter's
+    /// `quant_linear` dispatches it for resident and streamed weights alike.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_mrow_at(
         &self,
@@ -3806,6 +3637,8 @@ impl<'a> Recorder<'a> {
         debug_assert!((2..=8).contains(&rows));
         assert_native_k("linear_native_mrow_at", in_f);
         self.label_gemv("mrow_streamed", rows, in_f, out_f);
+        self.be
+            .note_linear_tier(crate::LinearTierEvent::MrowDequant);
         let (name, spv) = crate::gemm::native_mrow_spv(dtype).expect("native mrow streamed spv");
         let k = self.be.kernel(name, spv, 3, 24);
         let mut push = [0u8; 24];
@@ -3826,9 +3659,8 @@ impl<'a> Recorder<'a> {
 
     /// `-DSTREAMED` twin of the reassociation-tolerant subgroup+NUM_ROWS decode GEMV
     /// (`native_gemv_sg.comp`, slice A1 build-variant: see `crate::gemm::native_sg_streamed_build_spv`).
-    /// `m=1` decode only (matches the resident SG route's own gate); `nr` ∈ {2,4,8}. Not wired into
-    /// any production dispatch yet; exists so a parity test can exercise the `_streamed` SPV
-    /// directly.
+    /// `m=1` decode only (matches the resident SG route's own gate); `nr` ∈ {2,4,8}. Dispatched
+    /// through [`Self::linear_native_routed_at`].
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_sg_at(
         &self,
@@ -3843,18 +3675,9 @@ impl<'a> Recorder<'a> {
     ) {
         assert_native_k("linear_native_sg_at", in_f);
         self.label_gemv("gemv_sg_streamed", 1, in_f, out_f);
-        let (name, spv) = if self.sg64() {
-            crate::gemm::native_sg64_streamed_build_spv(dtype, false, nr)
-                .expect("native sg64 streamed spv")
-        } else {
-            crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
-                .expect("native sg streamed spv")
-        };
-        let k = if self.sg64() {
-            self.be.kernel_sg64_native(name, spv, 3, 24)
-        } else {
-            self.be.kernel_sg(name, spv, 3, 24, self.sgp())
-        };
+        let (name, spv) = crate::gemm::native_sg_streamed_build_spv(dtype, false, nr, self.sg16())
+            .expect("native sg streamed spv");
+        let k = self.be.kernel_sg(name, spv, 3, 24, self.sgp());
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&1u32.to_ne_bytes()); // rows: SG serves m=1 decode only
         push[4..8].copy_from_slice(&(in_f as u32).to_ne_bytes());
@@ -3890,8 +3713,8 @@ impl<'a> Recorder<'a> {
 
     /// `-DSTREAMED` twin of the multi-output-row decode GEMV (`native_gemv_rm.comp`, slice A1
     /// build-variant: see `crate::gemm::native_rm_streamed_build_spv`). `m=1` decode only (matches
-    /// the resident RM route's own gate); `rm` ∈ {2,4}. Not wired into any production dispatch yet;
-    /// exists so a parity test can exercise the `_streamed` SPV directly.
+    /// the resident RM route's own gate); `rm` ∈ {2,4}. Dispatched through
+    /// [`Self::linear_native_routed_at`].
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_rm_at(
         &self,
@@ -3944,8 +3767,8 @@ impl<'a> Recorder<'a> {
 
     /// `-DSTREAMED` twin of an experimental RM kernel variant (`native_gemv_rm_v2.comp`, slice A1
     /// build-variant: see `crate::gemm::native_rm_v2_streamed_build_spv`). `m=1` decode only, `RM=2`
-    /// fixed (all current variant builds). Not wired into any production dispatch yet; exists so a
-    /// parity test can exercise the `_streamed` SPV directly.
+    /// fixed (all current variant builds). Dispatched through [`Self::linear_native_routed_at`]
+    /// when a GEMV variant is configured.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_native_rm_v2_at(
         &self,
@@ -3999,8 +3822,9 @@ impl<'a> Recorder<'a> {
     /// `-DSTREAMED` twin of [`Self::linear_mmv`] (slice A2 build-variant: see
     /// `crate::gemm::native_mmv_spv`). Same arena-by-address convention as
     /// [`Self::linear_native_at`] — binding 0 (the resident build's weight SSBO) takes a
-    /// small FILLER (`qa`) since the arena is never bound as a descriptor. Not wired into any
-    /// production dispatch yet; exists so a parity test can exercise the `_streamed` SPV directly.
+    /// small FILLER (`qa`) since the arena is never bound as a descriptor. The adapter's
+    /// `quant_linear` dispatches it (the opt-in m=1 int8 decode GEMV) for resident and streamed
+    /// weights alike.
     #[allow(clippy::too_many_arguments)]
     pub fn linear_mmv_at(
         &self,
@@ -4069,39 +3893,28 @@ impl<'a> Recorder<'a> {
             residual.is_none() || rows == 1,
             "fused residual is decode-only (rows=1)"
         );
-        // Explicit res-legality gate (AUDIT #2): not every mrow-eligible dtype has a fused-residual
-        // build (Iq4Xs has none). Assert on the predicate so an illegal residual decode is caught
-        // here with a clear message rather than in the SPV `expect()` below.
-        debug_assert!(
-            residual.is_none() || crate::gemm::native_mmv_mrow_res_supported(dtype),
-            "no fused-residual mrow build for {dtype:?} — dtype is decode-eligible but res-illegal"
-        );
         assert_native_k("linear_mmv_mrow_at", in_f);
         self.label_gemv("mmvr_streamed", rows, in_f, out_f);
-        // OUTS4 (4 outputs x 16 lanes, K-stride 16) exactly where the 2-output layout
-        // would idle lanes: nsub % 64 != 0 leaves a partial 64-wide K wave, while stride 16
-        // wastes no more than stride 64 anywhere (both exact, or OUTS4's tail is smaller) —
-        // E4B gate+up nsub=80 goes 37.5% lane-idle to fully packed. Where stride 64 is exact
-        // the 2-output subgroupAdd reduction wins, so it keeps those shapes. (The old
-        // `in_f < 2048` gate is the nsub < 64 subset of this rule.) The `mmv_o4` knob stays
-        // master; every (dtype, o4, m4, res) arm exists in `native_mmv_mrow_variant_spv`.
-        // An o0 early-out in the shader (not just the per-output `live` guard) keeps 2-D-split
-        // padding groups cheap, so ceil(out_f/4) landing just past 65535 can't regress lm_head.
-        let o4 = self.vk().mmv_o4 && !(in_f / 32).is_multiple_of(64);
-        let m4 = rows <= 4 && self.vk().mmv_m4;
+        if rows > 1 {
+            self.be.note_linear_tier(crate::LinearTierEvent::MrowInt8);
+        }
         let res = residual.is_some();
-        let (name, spv) =
-            if o4 && rows <= 8 && dtype == infr_core::DType::Q4K && self.vk().mmv_q4k_meta {
-                crate::gemm::native_mmv_mrow_q4k_meta_spv(m4, res)
-                    .expect("native mmv mrow q4k packed metadata streamed spv")
-            } else if rows > 8 {
-                crate::gemm::native_mmv_mrow_m16_spv(dtype)
-                    .expect("native mmv mrow m16 streamed spv")
-            } else {
-                crate::gemm::native_mmv_mrow_variant_spv(dtype, o4, m4, res)
-                    .expect("native mmv mrow streamed spv")
-            };
-        let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
+        // Callers gate on this same lookup (`mmv_mrow_variant`), so a miss is a caller bug.
+        let (name, spv, outs) = mmv_mrow_variant(
+            self.vk(),
+            dtype,
+            rows,
+            in_f,
+            res,
+            MmvO4::of(self.be.tuning()),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "linear_mmv_mrow_at: no int8 mrow build for {dtype:?} rows={rows} \
+                     in_f={in_f} residual={res} under the mmv_o4/mmv_m4 knobs"
+            )
+        });
+        let groups = (out_f as u32).div_ceil(outs);
         let nbind = if res { 6 } else { 5 };
         let k = self.be.kernel(name, spv, nbind, 24);
         let mut push = [0u8; 24];
@@ -4231,6 +4044,27 @@ impl<'a> Recorder<'a> {
         in_f: usize,
         out_f: usize,
     ) {
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: linear_mmv_mrow_fuseq requires a u64 BDA device address");
+        self.linear_mmv_mrow_fuseq_at(dtype, arena_addr, w_base, x, residual, y, rows, in_f, out_f);
+    }
+
+    /// [`Self::linear_mmv_mrow_fuseq`] for a weight read by 64-bit address `arena_addr` alone (a
+    /// resident weight's BDA, or a streamed slot's arena base).
+    #[allow(clippy::too_many_arguments)]
+    pub fn linear_mmv_mrow_fuseq_at(
+        &self,
+        dtype: infr_core::DType,
+        arena_addr: u64,
+        w_base: usize,
+        x: &dyn Buffer, // [rows, in_f] f32 activations
+        residual: Option<&dyn Buffer>,
+        y: &dyn Buffer,
+        rows: usize,
+        in_f: usize,
+        out_f: usize,
+    ) {
         debug_assert!(
             (1..=4).contains(&rows),
             "FUSE_QUANT is decode-only (rows<=4)"
@@ -4239,14 +4073,15 @@ impl<'a> Recorder<'a> {
             residual.is_none() || rows == 1,
             "fused residual is decode-only (rows=1)"
         );
-        let arena_addr = w
-            .device_addr()
-            .expect("resident-BDA weight: linear_mmv_mrow_fuseq requires a u64 BDA device address");
-        let o4 = in_f < 2048 && self.vk().mmv_o4;
-        let m4 = rows <= 4;
         let res = residual.is_some();
-        let (name, spv) = crate::gemm::native_mmv_mrow_variant_fuseq_spv(dtype, o4, m4, res)
-            .expect("FUSE_QUANT SPIR-V");
+        // Callers gate on this same lookup (`mmv_mrow_fuseq_variant`), so a miss is a caller bug.
+        let (name, spv, outs) =
+            mmv_mrow_fuseq_variant(self.vk(), dtype, in_f, res, MmvO4::of(self.be.tuning()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "linear_mmv_mrow_fuseq: no FUSE_QUANT build for {dtype:?} residual={res}"
+                    )
+                });
         let nbind: usize = if res { 3 } else { 2 };
         let k = self.be.kernel(name, spv, nbind, 24);
         let mut push = [0u8; 24];
@@ -4256,7 +4091,7 @@ impl<'a> Recorder<'a> {
         push[12..16].copy_from_slice(&(w_base as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let groups = (out_f as u32).div_ceil(if o4 && rows <= 8 { 4 } else { 2 });
+        let groups = (out_f as u32).div_ceil(outs);
         let mut bufs = vec![Self::vkb(x)];
         if let Some(r) = residual {
             bufs.push(Self::vkb(r));
@@ -4293,10 +4128,9 @@ impl<'a> Recorder<'a> {
     /// [`Self::linear_native_at`] — binding 0 (the resident build's weight SSBO) takes a small
     /// FILLER (`x`) since the arena is never bound as a descriptor; `arena_lo`/`arena_hi` are
     /// appended LAST to the push block, after the resident `w_base` slot (always 0 — the residual
-    /// native GEMV is not used for stacked experts). Not wired into any production dispatch yet
-    /// (today's fused-add peephole filters streamed weights out before this path is ever reached —
-    /// see adapter.rs's Linear+Add lowering); exists so a parity test can exercise the `_streamed`
-    /// SPV directly ahead of the resident-BDA endgame that will need it.
+    /// native GEMV is not used for stacked experts). Reached through [`Self::linear_add_native`]
+    /// for a resident weight; a streamed weight never takes the fused Linear+Add yet (adapter.rs's
+    /// `execute_static` unfuses it).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add_native_at(
         &self,
@@ -4325,18 +4159,11 @@ impl<'a> Recorder<'a> {
         ];
         // Reassociation-tolerant subgroup route — precedence over RM, mirrors linear_add_native.
         if rows == 1 {
-            if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.gemv()) {
-                let sg = if self.sg64() {
-                    crate::gemm::native_sg64_streamed_build_spv(dtype, true, nr)
-                } else {
+            if let Some(nr) = native_sg_choice(dtype, in_f, out_f, self.tuning()) {
+                if let Some((name, spv)) =
                     crate::gemm::native_sg_streamed_build_spv(dtype, true, nr, self.sg16())
-                };
-                if let Some((name, spv)) = sg {
-                    let k = if self.sg64() {
-                        self.be.kernel_sg64_native(name, spv, 4, 24)
-                    } else {
-                        self.be.kernel_sg(name, spv, 4, 24, self.sgp())
-                    };
+                {
+                    let k = self.be.kernel_sg(name, spv, 4, 24, self.sgp());
                     self.dispatch_wide(k, &bufs, 1, &push, (out_f as u32).div_ceil(nr));
                     return;
                 }
@@ -4344,7 +4171,7 @@ impl<'a> Recorder<'a> {
         }
         // Multi-output-row route — mirrors linear_add_native's variant-then-RM fallback.
         if rows == 1 {
-            if let Some(v) = &self.gemv().variant {
+            if let Some(v) = &self.tuning().gemv_variant {
                 if let Some((name, spv)) =
                     crate::gemm::native_rm_v2_streamed_build_spv(v, dtype, true)
                 {
@@ -4354,7 +4181,7 @@ impl<'a> Recorder<'a> {
                     return;
                 }
             }
-            if let Some(rm) = native_rm_choice(dtype, out_f, self.gemv()) {
+            if let Some(rm) = native_rm_choice(dtype, out_f, self.tuning()) {
                 if let Some((name, spv)) =
                     crate::gemm::native_rm_streamed_build_spv(dtype, true, rm)
                 {
@@ -4367,13 +4194,13 @@ impl<'a> Recorder<'a> {
         let (name, spv) = crate::gemm::native_streamed_build_spv(dtype, true)
             .expect("native streamed GEMV res spv");
         let k = self.be.kernel(name, spv, 4, 24);
-        let per_wg = native_gemv_outs_per_wg(in_f);
-        self.dispatch_wide(k, &bufs, 1, &push, ((rows * out_f) as u32).div_ceil(per_wg));
+        self.dispatch_wide(k, &bufs, 1, &push, (rows * out_f) as u32);
     }
 
     /// Gather + dequantize embedding rows (`Op::EmbedGather`): `dst[r,:] = table[ids[r],:] *
     /// scale`. One workgroup per row; per-format decode from native_decode.glsl. Caller gates on
-    /// `crate::gemm::embed_gather_kernel_name`.
+    /// `crate::gemm::embed_gather_kernel_name`. Refuses a table that needs the 64-bit row fold
+    /// (see `embed_gather_folds`) but whose row stride is not word-aligned.
     #[allow(clippy::too_many_arguments)]
     pub fn embed_gather(
         &self,
@@ -4384,16 +4211,17 @@ impl<'a> Recorder<'a> {
         rows: usize,
         ne: usize,
         scale: f32,
-    ) {
+    ) -> Result<()> {
         let arena_addr = table
             .device_addr()
             .expect("resident-BDA weight: embed_gather requires a u64 BDA embedding table address");
-        // A table whose element count `>= 2^32` (a 256k-vocab frontier model) would wrap the
-        // shader's u32 `ids*ne` row base — pass the row byte stride so it folds `ids` into the
-        // 64-bit table base instead (issue #77). Every current table fits u32 → `row_bytes = 0` →
-        // the shader keeps its original element-offset path, byte-identical (incl. gemma's
-        // non-word-aligned quant rows, which the 64-bit fold could not honor). The fold requires a
-        // word-aligned row stride, asserted loudly ONLY when it actually engages.
+        // A table past the u32 addressing caps (a 256k-vocab frontier model; see
+        // `embed_gather_folds`) would wrap the shader's u32 row base or its byte offsets — pass the
+        // row byte stride so it folds `ids` into the 64-bit table base instead (issue #77). Every
+        // current table fits u32 → `row_bytes = 0` → the shader keeps its original element-offset
+        // path, byte-identical (incl. gemma's non-word-aligned quant rows, which the 64-bit fold
+        // could not honor). The fold requires a word-aligned row stride; a table that needs the
+        // fold without one — or is forced onto it by lowered `INFR_BDA_CHUNK_*` caps — is refused.
         let (block_elems, block_bytes) = infr_gguf::block_layout(dtype);
         assert!(
             ne.is_multiple_of(block_elems),
@@ -4401,17 +4229,15 @@ impl<'a> Recorder<'a> {
         );
         let row_stride = (ne / block_elems) * block_bytes;
         let vocab = table.len_bytes() / row_stride.max(1);
-        // Fold when the table's element count reaches the addressing cap (the `ids*ne` u32 base
-        // would wrap). Driving this off `bda_chunk_elem_cap` — not a hardcoded 2^32 — lets
-        // `INFR_BDA_CHUNK_ELEMS` force the fold path on a normal model, so the forced-chunking proof
-        // exercises BOTH the lm_head GEMV split and this embed fold in one run.
-        let row_bytes = if (vocab as u64) * (ne as u64) >= self.chunk_caps().0 {
-            assert!(
-                row_stride.is_multiple_of(4),
-                "embed_gather: a >= 2^32-element {dtype:?} table (vocab={vocab}, ne={ne}) has a \
-                 non-word-aligned row stride ({row_stride} bytes) — the 64-bit-based gather it needs \
-                 would misalign the buffer_reference reads; this table is unsupported"
-            );
+        let row_bytes = if embed_gather_folds(vocab, ne, row_stride, self.chunk_caps()) {
+            if !row_stride.is_multiple_of(4) {
+                return Err(be(format!(
+                    "embed_gather: a {dtype:?} table past the u32 addressing caps (vocab={vocab}, \
+                     ne={ne}, or caps lowered by INFR_BDA_CHUNK_ELEMS / INFR_BDA_CHUNK_BYTES) has \
+                     a non-word-aligned row stride ({row_stride} bytes) — the 64-bit row fold it \
+                     needs would misalign the buffer_reference reads; this table is unsupported"
+                )));
+            }
             row_stride as u32
         } else {
             0 // fits u32: keep the original element-offset gather path
@@ -4425,6 +4251,7 @@ impl<'a> Recorder<'a> {
         self.embed_gather_at(
             dtype, arena_addr, ids, dst, rows, ne, scale, row_bytes, vocab,
         );
+        Ok(())
     }
 
     /// `-DSTREAMED` twin of [`Self::embed_gather`] (slice A5 build-variant: see
@@ -4432,7 +4259,8 @@ impl<'a> Recorder<'a> {
     /// resident `bufferDeviceAddress` arena instead of a bound SSBO — binding 0 (the resident
     /// build's weight SSBO) takes a harmless FILLER (`ids`) since the arena is never bound as a
     /// descriptor. `row_bytes` is the mode selector (0 = element-offset gather for a u32-fitting
-    /// table; nonzero = 64-bit row-base fold for a `>= 2^32`-element table — see the `.comp` PC doc).
+    /// table; nonzero = 64-bit row-base fold for a table past the u32 addressing caps — see the
+    /// `.comp` PC doc).
     /// `n_rows` is the table's row count: an id at or past it gathers a zero row instead of
     /// reading past the arena.
     #[allow(clippy::too_many_arguments)]
@@ -4499,7 +4327,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&u32::try_from(n_rows).unwrap_or(u32::MAX).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(table), Self::vkb(ids), Self::vkb(dst)],
             1,
@@ -4556,10 +4384,9 @@ impl<'a> Recorder<'a> {
     /// arena-by-address / FILLER convention as [`Self::linear_mmv_at`] — binding 0 (the
     /// resident build's weight SSBO) takes a small FILLER (`qa`) since the arena is never bound as a
     /// descriptor; `residual` is inserted right before the trailing `y` write (6 bindings total, vs
-    /// the plain arm's 5), and `arena_lo`/`arena_hi` are appended LAST to the push block. Not wired
-    /// into any production dispatch yet (today's fused-add peephole filters streamed weights out
-    /// before this path is ever reached — see adapter.rs's Linear+Add lowering); exists so a parity
-    /// test can exercise the `_streamed` SPV directly ahead of the resident-BDA endgame.
+    /// the plain arm's 5), and `arena_lo`/`arena_hi` are appended LAST to the push block. Reached
+    /// through [`Self::linear_add_mmv`] for a resident weight; a streamed weight never takes the
+    /// fused Linear+Add yet (adapter.rs's `execute_static` unfuses it).
     #[allow(clippy::too_many_arguments)]
     pub fn linear_add_mmv_at(
         &self,
@@ -4662,7 +4489,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&eps.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(dst)],
             1,
@@ -4843,7 +4670,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&hc.to_ne_bytes());
         push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
         push[8..12].copy_from_slice(&total.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(dst)],
             1,
@@ -4875,7 +4702,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&hc.to_ne_bytes());
         push[4..8].copy_from_slice(&n_embd.to_ne_bytes());
         push[8..12].copy_from_slice(&total.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(x),
@@ -4884,6 +4711,58 @@ impl<'a> Recorder<'a> {
                 Self::vkb(comb),
                 Self::vkb(dst),
             ],
+            1,
+            &push,
+            total.div_ceil(64),
+        );
+    }
+
+    /// DeepSeek V4 compressor source gather (`gather_rows.comp`, `Op::GatherRows`): f32 rows by
+    /// i32 index, `n` columns from `src_col`, into the grouped destination rows the op's doc
+    /// defines. One thread per output element. `n_src` is the source's logical row count; an index
+    /// at or past it, or a negative one, writes `fill`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_rows(
+        &self,
+        src: &dyn Buffer,
+        idx: &dyn Buffer,
+        dst: &dyn Buffer,
+        rows: u32,
+        idx_off: u32,
+        src_stride: u32,
+        src_col: u32,
+        n: u32,
+        group: u32,
+        dst_group_stride: u32,
+        dst_row_off: u32,
+        n_src: u32,
+        fill: f32,
+    ) {
+        let total = rows * n;
+        let k = self
+            .be
+            .kernel("gather_rows", crate::gemm::gather_rows_spv(), 3, 40);
+        let mut push = [0u8; 40];
+        for (i, v) in [
+            rows,
+            idx_off,
+            src_stride,
+            src_col,
+            n,
+            group,
+            dst_group_stride,
+            dst_row_off,
+            n_src,
+            fill.to_bits(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            push[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+        }
+        self.dispatch_wide(
+            k,
+            &[Self::vkb(src), Self::vkb(idx), Self::vkb(dst)],
             1,
             &push,
             total.div_ceil(64),
@@ -4945,14 +4824,15 @@ impl<'a> Recorder<'a> {
         top_k: u32,
         scale: f32,
         pos: u32,
+        block_ratio: u32,
     ) {
         let k = self.be.kernel(
             "lightning_indexer",
             crate::gemm::lightning_indexer_spv(),
             5,
-            28,
+            32,
         );
-        let mut push = [0u8; 28];
+        let mut push = [0u8; 32];
         push[0..4].copy_from_slice(&rows.to_ne_bytes());
         push[4..8].copy_from_slice(&kv_len.to_ne_bytes());
         push[8..12].copy_from_slice(&n_head.to_ne_bytes());
@@ -4960,6 +4840,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&top_k.to_ne_bytes());
         push[20..24].copy_from_slice(&scale.to_ne_bytes());
         push[24..28].copy_from_slice(&pos.to_ne_bytes());
+        push[28..32].copy_from_slice(&block_ratio.to_ne_bytes());
         self.dispatch_wide(
             k,
             &[
@@ -4996,8 +4877,17 @@ impl<'a> Recorder<'a> {
         // second dispatch) but runs it 1024-wide with vec4 loads: 4x the waves x 4x the bytes per
         // request. Gate is exactly the decode hidden-norm shape — prefill (rows>1) already fills
         // the GPU with row-workgroups, and the per-head Q/K/V norms (rows=n_head, small dim) would
-        // just idle 3/4 of the lanes, so both keep the 256-thread build.
-        let wide = rows == 1 && dim >= 2048 && dim.is_multiple_of(4);
+        // just idle 3/4 of the lanes, so both keep the 256-thread build. A device whose compute
+        // limits cannot hold the 1024-wide workgroup decodes on the 256-thread build too: same
+        // bindings, same push block, same result.
+        let wide = rows == 1
+            && self.be.tuning().rmsnorm_wide
+            && dim >= self.be.tuning().rmsnorm_wide_min_dim
+            && dim.is_multiple_of(4)
+            && self
+                .be
+                .kernel_limits()
+                .admits(crate::gemm::rmsnorm_wide_spv());
         let k = if wide {
             self.be
                 .kernel_sg("rmsnorm_wide", crate::gemm::rmsnorm_wide_spv(), 3, 12, 32)
@@ -5009,7 +4899,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&eps.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(y)],
             1,
@@ -5029,7 +4919,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&eps.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(y)],
             1,
@@ -5087,7 +4977,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(dim as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&eps.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(y)],
             1,
@@ -5122,7 +5012,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&eps.to_ne_bytes());
         // Binding order MUST be x, w, z, y (matches the shader's -DGATE layout) — `y` last so the
         // hazard tracker's `n_out=1` marks only the true output as written (see the shader's doc).
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(w), Self::vkb(z), Self::vkb(y)],
             1,
@@ -5218,7 +5108,7 @@ impl<'a> Recorder<'a> {
                 } else {
                     self.be.kernel("rope_ff", crate::gemm::rope_ff_spv(), 3, 28)
                 };
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     // ff BEFORE y: the trailing `n_out` bindings are the hazard-tracked writes,
                     // and `y` (index 2) must be that write — binding ff last would mark the
@@ -5226,7 +5116,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    rope_groups(t, n_heads, hd),
+                    (t * n_heads) as u32,
                 );
             }
             None => {
@@ -5239,12 +5129,12 @@ impl<'a> Recorder<'a> {
                 } else {
                     self.be.kernel("rope", crate::gemm::rope_spv(), 2, 28)
                 };
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    rope_groups(t, n_heads, hd),
+                    (t * n_heads) as u32,
                 );
             }
         }
@@ -5252,7 +5142,9 @@ impl<'a> Recorder<'a> {
 
     /// Interleaved (llama NORM) RoPE writing f16 — the llama q/k analogue of `qk_norm_rope`'s
     /// f16 output: `out_base` shifts the output row (0 for the Q scratch; `pos` for the fused
-    /// K cache write via the kv_write peephole).
+    /// K cache write via the kv_write peephole). `freq_factors` (`rope_dim/2` per-pair angle
+    /// divisors — the llama3 `rope_freqs.weight`) selects the `rope_f16_ff` build and binds
+    /// before `y`.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_f16(
         &self,
@@ -5265,10 +5157,8 @@ impl<'a> Recorder<'a> {
         theta: f32,
         pos_offset: usize,
         out_base: usize,
+        freq_factors: Option<&dyn Buffer>,
     ) {
-        let k = self
-            .be
-            .kernel("rope_f16", crate::gemm::rope_f16_spv(), 2, 28);
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -5277,17 +5167,37 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
         push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(x), Self::vkb(y)],
-            1,
-            &push,
-            rope_groups(t, n_heads, hd),
-        );
+        match freq_factors {
+            Some(ff) => {
+                let k = self
+                    .be
+                    .kernel("rope_f16_ff", crate::gemm::rope_f16_ff_spv(), 3, 28);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+            None => {
+                let k = self
+                    .be
+                    .kernel("rope_f16", crate::gemm::rope_f16_spv(), 2, 28);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+        }
     }
 
     /// Record-once variant of [`Self::rope_f16`]: pos from `params`; `out_base_mul` is the 0/1
     /// multiplier the shader scales by pos (1 -> write cache row pos, 0 -> row 0 of the Q scratch).
+    /// `freq_factors` binds after `params` (the `rope_f16_dyn_ff` build).
     #[allow(clippy::too_many_arguments)]
     pub fn rope_f16_dyn(
         &self,
@@ -5300,10 +5210,8 @@ impl<'a> Recorder<'a> {
         rope_dim: usize,
         theta: f32,
         out_base_mul: usize,
+        freq_factors: Option<&dyn Buffer>,
     ) {
-        let k = self
-            .be
-            .kernel("rope_f16_dyn", crate::gemm::rope_f16_dyn_spv(), 3, 28);
         let mut push = [0u8; 28];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -5312,18 +5220,36 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&theta.to_ne_bytes());
         // [20..24] pos_offset: unused (from params)
         push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
-            1,
-            &push,
-            rope_groups(t, n_heads, hd),
-        );
+        match freq_factors {
+            Some(ff) => {
+                let k =
+                    self.be
+                        .kernel("rope_f16_dyn_ff", crate::gemm::rope_f16_dyn_ff_spv(), 4, 28);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+            None => {
+                let k = self
+                    .be
+                    .kernel("rope_f16_dyn", crate::gemm::rope_f16_dyn_spv(), 3, 28);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+        }
     }
 
     /// Cached attention: q `[q_len,nh,hd]` (abs positions `pos_offset..`) over the K/V cache
     /// `[kv_len,nkv,hd]`.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     pub fn attention_kv(
         &self,
@@ -5365,7 +5291,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
         push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
             1,
@@ -5415,7 +5341,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
         push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             // `o` LAST: the trailing `n_out` bindings are the hazard-tracked writes, so the sinks
             // weight must bind before it (same rule as `rope_ff`'s divisors and `mla_bias`).
@@ -5470,7 +5396,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
         push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[
                 Self::vkb(q),
@@ -5524,7 +5450,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
         push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[
                 Self::vkb(q),
@@ -5538,6 +5464,73 @@ impl<'a> Recorder<'a> {
             &push,
             (q_len * nh) as u32,
         );
+    }
+
+    /// [`Self::attention_kv`] plus DeepSeek V4's COMPRESSED key segment (`attention_kv.comp`'s
+    /// `-DCOMP` builds, `Op::Attention::comp`): `comp[comp_len, nkv*hd]` f16 is attended after the
+    /// raw keys in the same online softmax, block `j` visible to the row at `p` iff
+    /// `j < (p + 1) / comp_ratio`, and serves as its own values. `sinks[nh]` (optional) binds at
+    /// slot 3, then `comp`, then the optional `comp_bias[q_len, comp_len]` f32, output last.
+    ///
+    /// Same f16-KV-only, static, bound restriction as [`Self::attention_kv_sinks`]; the raw-side
+    /// bias of [`Self::attention_kv_bias`] has no `-DCOMP` twin.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_kv_comp(
+        &self,
+        q: &dyn Buffer,
+        kc: &dyn Buffer,
+        vc: &dyn Buffer,
+        sinks: Option<&dyn Buffer>,
+        comp: &dyn Buffer,
+        comp_bias: Option<&dyn Buffer>,
+        o: &dyn Buffer,
+        q_len: usize,
+        kv_len: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        pos_offset: usize,
+        window: usize,
+        scale: f32,
+        cap: usize,
+        comp_len: u32,
+        comp_ratio: u32,
+    ) {
+        let (name, spv) = match (sinks.is_some(), comp_bias.is_some()) {
+            (false, false) => ("attention_kv_comp", crate::gemm::attention_kv_comp_spv()),
+            (false, true) => (
+                "attention_kv_comp_bias",
+                crate::gemm::attention_kv_comp_bias_spv(),
+            ),
+            (true, false) => (
+                "attention_kv_comp_sinks",
+                crate::gemm::attention_kv_comp_sinks_spv(),
+            ),
+            (true, true) => (
+                "attention_kv_comp_sinks_bias",
+                crate::gemm::attention_kv_comp_sinks_bias_spv(),
+            ),
+        };
+        let mut bufs = vec![Self::vkb(q), Self::vkb(kc), Self::vkb(vc)];
+        bufs.extend(sinks.map(Self::vkb));
+        bufs.push(Self::vkb(comp));
+        bufs.extend(comp_bias.map(Self::vkb));
+        // `o` LAST: the trailing binding is the hazard-tracked write.
+        bufs.push(Self::vkb(o));
+        let kern = self.be.kernel(name, spv, bufs.len(), 44);
+        let mut push = [0u8; 44];
+        push[0..4].copy_from_slice(&(q_len as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
+        push[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
+        push[12..16].copy_from_slice(&(nkv as u32).to_ne_bytes());
+        push[16..20].copy_from_slice(&(hd as u32).to_ne_bytes());
+        push[20..24].copy_from_slice(&(pos_offset as u32).to_ne_bytes());
+        push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
+        push[28..32].copy_from_slice(&scale.to_ne_bytes());
+        push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
+        push[36..40].copy_from_slice(&comp_len.to_ne_bytes());
+        push[40..44].copy_from_slice(&comp_ratio.to_ne_bytes());
+        self.dispatch_wide(kern, &bufs, 1, &push, (q_len * nh) as u32);
     }
 
     /// `-DKV_BDA` twin of [`Self::attention_kv`] (#74 slice 1): reads the K/V cache by 64-bit device
@@ -5606,7 +5599,7 @@ impl<'a> Recorder<'a> {
         push[40..44].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
         push[44..48].copy_from_slice(&(v_addr as u32).to_ne_bytes());
         push[48..52].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[Self::vkb(q), Self::vkb(kc), Self::vkb(vc), Self::vkb(o)],
             1,
@@ -5638,9 +5631,19 @@ impl<'a> Recorder<'a> {
         scale: f32,
     ) {
         let mpad = (n.div_ceil(64) * 64) as u32;
-        // kv padded to 256 (the 8-warp attn_qk's BN); extra cols are masked in softmax. Still %64 so
-        // the 4-warp fallback + softmax + attn_pv are unaffected.
-        let kv_pad = (kv_len.div_ceil(256) * 256) as u32;
+        // kv padded to NONFA_KV_TILE; extra cols are masked in softmax. Still %64 so the 4-warp
+        // fallback + softmax + attn_pv are unaffected.
+        let kv_pad = (kv_len.div_ceil(NONFA_KV_TILE) * NONFA_KV_TILE) as u32;
+        // attn_qk and attn_pv load every K/V row up to kv_pad unguarded. Past the buffer that is
+        // undefined, and inside it a non-finite V row still poisons the PV product (0 × NaN).
+        let kv_bytes = kv_pad as usize * nkv * hd * 2;
+        debug_assert!(
+            kc.len_bytes() >= kv_bytes && vc.len_bytes() >= kv_bytes,
+            "attention_prefill_nonfa: K/V ({} / {} B) must cover the {kv_pad}-row padded read \
+             ({kv_bytes} B)",
+            kc.len_bytes(),
+            vc.len_bytes()
+        );
         let hdu = hd as u32;
         // scale override: >0 uses the caller's value (gemma4 = 1.0, QK-norm controls magnitude);
         // 0 keeps the default 1/√hd (qwen3, gemma3).
@@ -5694,22 +5697,10 @@ impl<'a> Recorder<'a> {
         // capacity while each grinds a huge kv reduction → split the kv dim across gl_WorkGroupID.y
         // into partials, then sum them.
         let pv_base_wg = (mpad / 64) * (hdu / 64) * nh as u32;
-        // `pv_splits` is `Option<usize>` in the config; the dispatch count is a u32, so an
-        // out-of-range override falls back to the adaptive policy exactly as `.parse::<u32>().ok()`
-        // did at the old env read.
-        let n_splits = match self.vk().pv_splits.and_then(|v| u32::try_from(v).ok()) {
-            Some(v) => v,
-            None => {
-                if pv_base_wg >= 1024 || kv_pad < 4096 {
-                    1u32
-                } else {
-                    (2048 / pv_base_wg.max(1))
-                        .clamp(2, 8)
-                        .min(kv_pad / 2048)
-                        .max(1)
-                }
-            }
-        };
+        // The `attn_pv.*` tuning parameters: a fixed count (`attn_pv.splits`, alias
+        // `INFR_PV_SPLITS`, never 0 here — 0 selects the policy, and the `pv_splits` alias maps
+        // 0 and a value past u32 to it, as the old env read did), else the adaptive policy.
+        let n_splits = self.be.tuning().pv.count(pv_base_wg, kv_pad);
         let ksplit = kv_pad.div_ceil(n_splits).div_ceil(32) * 32;
         // 8-warp/256-thread PV warptile (BN=128=hd, matches ollama's mul_mm) when hd%128; else the
         // 4-warp/2×2 attn_pv (also handles hd<128, e.g. hd=64). INFR_NO_PV_WARP forces the 4-warp.
@@ -5755,7 +5746,7 @@ impl<'a> Recorder<'a> {
             let mut pr = [0u8; 8];
             pr[0..4].copy_from_slice(&total.to_ne_bytes());
             pr[4..8].copy_from_slice(&n_splits.to_ne_bytes());
-            self.dispatch(
+            self.dispatch_wide(
                 kr,
                 &[Self::vkb(pv_part), Self::vkb(attn)],
                 1,
@@ -5805,19 +5796,21 @@ impl<'a> Recorder<'a> {
         kv_addr: Option<(u64, u64)>,
     ) {
         let mpad = (n.div_ceil(64) * 64) as u32;
+        // The `Off` builds load whole K/V tiles straight from the bound buffers with no kv_len
+        // guard (the staged builds guard theirs), so those buffers must cover the padded rows.
+        if matches!(stage, FlashStage::Off) {
+            let kv_bytes = kv_len.div_ceil(FLASH_KV_TILE) * FLASH_KV_TILE * nkv * hd * 2;
+            debug_assert!(
+                kc.len_bytes() >= kv_bytes && vc.len_bytes() >= kv_bytes,
+                "attention_prefill_flash: K/V ({} / {} B) must cover the tile-padded read \
+                 ({kv_bytes} B)",
+                kc.len_bytes(),
+                vc.len_bytes()
+            );
+        }
         let base_wg = (mpad / 64) * nh as u32;
-        let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
-            Some(v) => v,
-            None => {
-                if base_wg >= 1024 || kv_len < 4096 {
-                    1u32
-                } else {
-                    (2048 / base_wg.max(1))
-                        .clamp(2, 8)
-                        .min((kv_len / 2048).max(1) as u32)
-                }
-            }
-        };
+        // `attn_flash.splits` (alias `INFR_FLASH_SPLITS`), else the `attn_flash.*` policy.
+        let n_splits = self.be.tuning().flash.count(base_wg, kv_len as u32);
         // hd=128 → register-blocked partial (always via partial+combine). Other hd → the
         // 4-subgroup path: single fused kernel for n_splits==1, else the scalar partial.
         //
@@ -5830,7 +5823,7 @@ impl<'a> Recorder<'a> {
                                                             // `INFR_FLASH_BM=32` (`kernels.vulkan.flash_bm32` — compared to the LITERAL "32")
                                                             // forces the small (29056 B) tile even on a 64 KB device, so the bm=32 shaders get
                                                             // numeric-parity coverage on any GPU (they otherwise only run on sub-64 KB ones).
-        let force_bm32 = self.vk().flash_bm32;
+        let force_bm32 = self.be.tuning().flash_force_bm32;
         // Partial tiles (rows < 64, the small-m deep-kv tier) take BM=32: half the padded-row
         // waste and half the shared scratch (2x resident workgroups). Measured @d16384 on a
         // 7900 XTX: pp24 1122 -> 1312 t/s, pp32 1510 -> 1734 (llama.cpp: 1313/1933). Full
@@ -5998,14 +5991,11 @@ impl<'a> Recorder<'a> {
         window: usize,
         scale: f32,
         cap: usize,
-        // `kv.paged`: Some((table_addr, page_rows)) reads K/V through the slot's page table, so the
-        // tile's rows come from wherever its block and shared pages live. None → contiguous.
-        pages: Option<(u64, u32)>,
     ) {
         let (name, spv, bm) =
             crate::gemm::attn_nc_fa_spv(hd).expect("attention_prefill_nc_fa: hd gated <= 512");
-        let k = self.be.kernel(name, spv, 4, 48);
-        let mut p = [0u8; 48];
+        let k = self.be.kernel(name, spv, 4, 36);
+        let mut p = [0u8; 36];
         p[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         p[4..8].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p[8..12].copy_from_slice(&(nh as u32).to_ne_bytes());
@@ -6015,11 +6005,6 @@ impl<'a> Recorder<'a> {
         p[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         p[28..32].copy_from_slice(&scale.to_ne_bytes());
         p[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        if let Some((addr, page_rows)) = pages {
-            p[36..40].copy_from_slice(&(addr as u32).to_ne_bytes());
-            p[40..44].copy_from_slice(&((addr >> 32) as u32).to_ne_bytes());
-            p[44..48].copy_from_slice(&page_rows.to_ne_bytes());
-        }
         let groups = (rows.div_ceil(bm) * nh) as u32;
         self.dispatch(
             k,
@@ -6064,18 +6049,8 @@ impl<'a> Recorder<'a> {
             64
         };
         let base_wg = (mpad / br) * nh as u32;
-        let n_splits = match self.vk().flash_splits.and_then(|v| u32::try_from(v).ok()) {
-            Some(v) => v,
-            None => {
-                if base_wg >= 1024 || kv_len < 4096 {
-                    1u32
-                } else {
-                    (2048 / base_wg.max(1))
-                        .clamp(2, 8)
-                        .min((kv_len / 2048).max(1) as u32)
-                }
-            }
-        };
+        // `attn_flash.splits` (alias `INFR_FLASH_SPLITS`), else the `attn_flash.*` policy.
+        let n_splits = self.be.tuning().flash.count(base_wg, kv_len as u32);
         let ksplit = (kv_len as u32).div_ceil(n_splits).div_ceil(64) * 64;
         let bda = kv_addr.is_some();
         let (rname, rspv): (&'static str, &[u32]) = match (br == 64, bda) {
@@ -6167,7 +6142,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(src_off as u32).to_ne_bytes());
         // [12..16] cap: dyn-only (ring row modulo), zero here.
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6209,7 +6184,7 @@ impl<'a> Recorder<'a> {
         // [12..16] cap: dyn-only, zero here.
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6228,21 +6203,19 @@ impl<'a> Recorder<'a> {
         dst_addr: u64,
         n: usize,
         cap_rows: usize,
-        row_base: usize,
     ) {
         let k = self.be.kernel(
             "store_f16_dyn_bda",
             crate::gemm::store_f16_dyn_bda_spv(),
             3,
-            28,
+            24,
         );
-        let mut push = [0u8; 28];
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(cap_rows as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        push[24..28].copy_from_slice(&(row_base as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
             1,
@@ -6252,7 +6225,7 @@ impl<'a> Recorder<'a> {
     }
 
     /// `-DKV_BDA` twin of [`Self::rope_f16`]: writes the f16 K cache at `y_addr`. `y` stays bound
-    /// at slot 1 (inert) for the store→read barrier.
+    /// at its (last) slot (inert) for the store→read barrier.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_f16_at(
         &self,
@@ -6266,10 +6239,8 @@ impl<'a> Recorder<'a> {
         theta: f32,
         pos_offset: usize,
         out_base: usize,
+        freq_factors: Option<&dyn Buffer>,
     ) {
-        let k = self
-            .be
-            .kernel("rope_f16_bda", crate::gemm::rope_f16_bda_spv(), 2, 36);
         let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -6280,17 +6251,36 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[32..36].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(x), Self::vkb(y)],
-            1,
-            &push,
-            rope_groups(t, n_heads, hd),
-        );
+        match freq_factors {
+            Some(ff) => {
+                let k =
+                    self.be
+                        .kernel("rope_f16_ff_bda", crate::gemm::rope_f16_ff_bda_spv(), 3, 36);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+            None => {
+                let k = self
+                    .be
+                    .kernel("rope_f16_bda", crate::gemm::rope_f16_bda_spv(), 2, 36);
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+        }
     }
 
     /// `-DKV_BDA` twin of [`Self::rope_f16_dyn`]: writes the f16 K cache at `y_addr` (pos from
-    /// `params`). `y` stays bound at slot 2 (inert) for the store→read barrier.
+    /// `params`). `y` stays bound at its (last) slot (inert) for the store→read barrier.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_f16_dyn_at(
         &self,
@@ -6304,13 +6294,8 @@ impl<'a> Recorder<'a> {
         rope_dim: usize,
         theta: f32,
         out_base_mul: usize,
+        freq_factors: Option<&dyn Buffer>,
     ) {
-        let k = self.be.kernel(
-            "rope_f16_dyn_bda",
-            crate::gemm::rope_f16_dyn_bda_spv(),
-            3,
-            36,
-        );
         let mut push = [0u8; 36];
         push[0..4].copy_from_slice(&(t as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(n_heads as u32).to_ne_bytes());
@@ -6321,13 +6306,38 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[32..36].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
-            k,
-            &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
-            1,
-            &push,
-            rope_groups(t, n_heads, hd),
-        );
+        match freq_factors {
+            Some(ff) => {
+                let k = self.be.kernel(
+                    "rope_f16_dyn_ff_bda",
+                    crate::gemm::rope_f16_dyn_ff_bda_spv(),
+                    4,
+                    36,
+                );
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+            None => {
+                let k = self.be.kernel(
+                    "rope_f16_dyn_bda",
+                    crate::gemm::rope_f16_dyn_bda_spv(),
+                    3,
+                    36,
+                );
+                self.dispatch_wide(
+                    k,
+                    &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
+                    1,
+                    &push,
+                    (t * n_heads) as u32,
+                );
+            }
+        }
     }
 
     /// `-DKV_BDA` twin of [`Self::qk_norm_rope`]: writes the fused K cache at `y_addr`. `y` stays
@@ -6369,7 +6379,7 @@ impl<'a> Recorder<'a> {
                     4,
                     44,
                 );
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(nw), Self::vkb(ff), Self::vkb(y)],
                     1,
@@ -6384,7 +6394,7 @@ impl<'a> Recorder<'a> {
                     3,
                     44,
                 );
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
                     1,
@@ -6432,7 +6442,7 @@ impl<'a> Recorder<'a> {
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
         push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
             1,
@@ -6488,7 +6498,7 @@ impl<'a> Recorder<'a> {
         push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
         match ff {
-            Some(f) => self.dispatch(
+            Some(f) => self.dispatch_wide(
                 k,
                 &[
                     Self::vkb(x),
@@ -6501,7 +6511,7 @@ impl<'a> Recorder<'a> {
                 &push,
                 (rows * nheads) as u32,
             ),
-            None => self.dispatch(
+            None => self.dispatch_wide(
                 k,
                 &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
                 1,
@@ -6548,7 +6558,7 @@ impl<'a> Recorder<'a> {
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
         push[36..40].copy_from_slice(&(y_addr as u32).to_ne_bytes());
         push[40..44].copy_from_slice(&((y_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(qg),
@@ -6588,7 +6598,8 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8", crate::gemm::store_q8_spv())
         };
-        let k = self.be.kernel(name, spv, 2, 24);
+        // Pinned like `quant_q8`: the block scale is one `subgroupMax` over the 32-lane workgroup.
+        let k = self.be.kernel_sg(name, spv, 2, 24, 32);
         let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
@@ -6597,7 +6608,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
         // One workgroup (32 lanes) per 32-element block.
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6608,7 +6619,6 @@ impl<'a> Recorder<'a> {
 
     /// Record-once decode variant of [`Recorder::store_q8`]: the write offset is `p_pos*n` (one KV
     /// row at the token's position), `p_pos` read from the `params` SSBO so the buffer replays.
-    /// `row_base` is a paged slot's block base (0 otherwise), pushed per op.
     pub fn store_q8_dyn(
         &self,
         src: &dyn Buffer,
@@ -6617,7 +6627,6 @@ impl<'a> Recorder<'a> {
         n: usize,
         cap: usize,
         src_f16: bool,
-        row_base: usize,
     ) {
         // #74 (slice 5): BDA-only. `dst` (the planar-Q8 KV cache) is written by device address; it
         // stays bound at slot 2 as an inert descriptor so Recorder::sync keeps the store→read barrier.
@@ -6629,16 +6638,15 @@ impl<'a> Recorder<'a> {
         } else {
             ("store_q8_dyn", crate::gemm::store_q8_dyn_spv())
         };
-        let k = self.be.kernel(name, spv, 3, 28);
-        let mut push = [0u8; 28];
+        let k = self.be.kernel_sg(name, spv, 3, 24, 32);
+        let mut push = [0u8; 24];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         // [4..8] off: unused (from params). [12..16] src_off: always 0 here (a single decode row
         // never crosses the ring wrap). The kernel derives the ring row capacity from cap/n.
         push[8..12].copy_from_slice(&(cap as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        push[24..28].copy_from_slice(&(row_base as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
             1,
@@ -6664,7 +6672,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(cap as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(src_addr as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&((src_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6696,7 +6704,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6721,7 +6729,7 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6743,7 +6751,7 @@ impl<'a> Recorder<'a> {
         let k = self.be.kernel(name, spv, 2, 4);
         let mut push = [0u8; 4];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6775,7 +6783,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(off as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(dst_addr as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&((dst_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6804,7 +6812,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(src_addr as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&((src_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -6849,7 +6857,7 @@ impl<'a> Recorder<'a> {
                 let k =
                     self.be
                         .kernel("qk_norm_rope_ff", crate::gemm::qk_norm_rope_ff_spv(), 4, 36);
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(nw), Self::vkb(ff), Self::vkb(y)],
                     1,
@@ -6861,7 +6869,7 @@ impl<'a> Recorder<'a> {
                 let k = self
                     .be
                     .kernel("qk_norm_rope", crate::gemm::qk_norm_rope_spv(), 3, 36);
-                self.dispatch(
+                self.dispatch_wide(
                     k,
                     &[Self::vkb(x), Self::vkb(nw), Self::vkb(y)],
                     1,
@@ -6906,7 +6914,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&eps.to_ne_bytes());
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(qg), Self::vkb(nw), Self::vkb(y)],
             1,
@@ -6949,7 +6957,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(out_base_mul as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&eps.to_ne_bytes());
         push[32..36].copy_from_slice(&(src_stride as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(qg),
@@ -6996,7 +7004,7 @@ impl<'a> Recorder<'a> {
     ) {
         self.attention_kv_split_impl(
             q, kc, vc, o, pm, pl, pacc, rows, pos, kv_len, nh, nkv, hd, chunk, n_chunks, scale,
-            window, canvas_lo, k_q8, v_q8, cap, batched, None, None, None,
+            window, canvas_lo, k_q8, v_q8, cap, batched, None, None,
         );
     }
 
@@ -7037,10 +7045,6 @@ impl<'a> Recorder<'a> {
         // low-bit block quant `dt` (K and V share the dtype) — the cache is read/dequanted in-kernel,
         // no dequant→f16 prepass. Requires the BDA base (this `_at` method); `None` keeps f16/Q8.
         kv_ml: Option<infr_core::DType>,
-        // Paged K/V: `Some((table_addr, page_rows))` reads the cache through a page table, so a slot
-        // can be assembled from a shared page pool instead of a contiguous buffer (`attn_decode`
-        // only; `page_rows == 0` on the wire is the identity, and pass 2 never touches KV).
-        pages: Option<(u64, u32)>,
     ) {
         self.attention_kv_split_impl(
             q,
@@ -7067,7 +7071,6 @@ impl<'a> Recorder<'a> {
             batched,
             Some((k_addr, v_addr)),
             kv_ml,
-            pages,
         );
     }
 
@@ -7120,9 +7123,6 @@ impl<'a> Recorder<'a> {
         // no dequant→f16 prepass). Only ever set with `kv_addr` Some (inline decode needs the BDA
         // base) and with `k_q8`/`v_q8`/`batched` false (mainline is a distinct read path).
         kv_ml: Option<infr_core::DType>,
-        // Paged K/V: `Some((table_addr, page_rows))` reads rows through a page table (attn_decode
-        // builds only), so a slot can point at a shared page pool instead of a contiguous buffer.
-        pages: Option<(u64, u32)>,
     ) {
         let bda = kv_addr.is_some();
         // pass 1: per-chunk partials (subgroup-reduction QK; needs requiredSubgroupSize=32). Each
@@ -7192,44 +7192,52 @@ impl<'a> Recorder<'a> {
         } else {
             (p1name, p1spv)
         };
-        // Full-context builds require every query row in bounds; SWA builds carry the ring map.
-        let ring_safe = window > 0 || cap == 0 || pos.saturating_add(rows) <= cap / (nkv * hd);
+        // B7 slice 3a — DECODE-ONLY pass 1 (`attn_decode.comp`). Same grid, same chunk policy, same
+        // pm/pl/pacc layout, same 60-byte BDA push, same 6 bindings, so this is a pure kernel swap;
+        // pass 2 below is untouched. It is `attn_partial_bda`'s hd=128 f16 inner loop with every
+        // other arm deleted, which is worth 120 → 96 VGPRs and 4.75 → 2.75 KB LDS (occupancy 12 →
+        // 16 waves/SIMD). The reduction is the same plain `subgroupAdd`, so the output is
+        // BIT-identical — `tests/attn_decode_parity.rs` asserts that on raw bits.
+        //
+        // Every condition below is an arm no member of the specialized family has. Two axes ARE
+        // covered (slice 3b): the head dim, via the `hd` argument to `attn_decode_kernel` (128 /
+        // 256 / 512 have their own builds, anything else falls back), and sliding-window, via the
+        // `-DSWA -DRING` builds.
+        //
+        // The ring-cache condition is the subtle one: `attn_partial` maps position j to cache row
+        // `j % (cap/(nkv*hd))` whenever `cap` is nonzero, and the NON-`SWA` builds assume the
+        // identity. `window == 0` already implies a full-context (non-ring) cache — only
+        // sliding-window layers are allocated as rings (`seam::mod`'s `window + ubatch` sizing) —
+        // but the row bound is checked rather than inferred, since a wrong answer here is silent
+        // garbage rather than a crash. `window > 0` needs no such check: those builds carry the
+        // modulo, which is the identity when the cache happens to be full-context.
+        let ring_safe = window > 0 || cap == 0 || pos < cap / (nkv * hd);
         let fast = if !batched
             && !crate::gemm::attn_decode_disabled(self.vk())
             && bda
             && kv_ml.is_none()
             && !k_q8
             && !v_q8
-            && (1..=8).contains(&rows)
+            && rows == 1
             && canvas_lo.is_none()
             && chunk <= 512
             && ring_safe
+            // INFR_NO_ATTN_HD=1 exists to A/B the hd 256/512 specialization against the general
+            // runtime-hd4 loops; the family's hd256/hd512 builds ARE that specialization, so honor
+            // the knob by falling back to `attn_partial_nohd_bda` for those dims. hd == 128 is
+            // unaffected by NO_HD_SPEC either way.
             && (hd == 128 || !crate::gemm::attn_hd_spec_disabled(self.vk()))
         {
-            if rows == 1 {
-                crate::gemm::attn_decode_kernel(hd, window > 0, false)
-            } else {
-                crate::gemm::attn_small_m_kernel(hd, window > 0)
-            }
+            crate::gemm::attn_decode_kernel(hd, window > 0, false)
         } else {
             None
         };
-        let gqa = fast
-            .filter(|_| rows == 1)
-            .and_then(|_| self.gqa_pass1(hd, nh, nkv, window, false));
-        let (p1name, p1spv) = gqa.or(fast).unwrap_or((p1name, p1spv));
-        // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes, plus the three
-        // paging words `attn_decode.comp` declares (page_lo/page_hi/page_rows) → 72; the bound push
-        // is the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under
-        // BDA. A kernel that declares a smaller block (attn_partial's 60) is fine on a larger range —
-        // only a range SHORTER than the declared block fails pipeline creation.
-        let plen: usize = if bda { 72 } else { 44 };
-        let k1 = if gqa.is_some() {
-            self.be.kernel_sg64_native(p1name, p1spv, 6, plen as u32)
-        } else {
-            self.be.kernel_sg(p1name, p1spv, 6, plen as u32, 32)
-        };
-        let mut p1 = [0u8; 72];
+        let (p1name, p1spv) = fast.unwrap_or((p1name, p1spv));
+        // The -DKV_BDA push grows by k_lo/k_hi/v_lo/v_hi (uvec2 splits) → 60 bytes; the bound push is
+        // the base 44. n_buf stays 6 (q, kc, vc, pm, pl, pacc): kc/vc are inert-but-bound under BDA.
+        let plen: usize = if bda { 60 } else { 44 };
+        let k1 = self.be.kernel_sg(p1name, p1spv, 6, plen as u32, 32);
+        let mut p1 = [0u8; 60];
         p1[0..4].copy_from_slice(&(kv_len as u32).to_ne_bytes());
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
@@ -7257,11 +7265,6 @@ impl<'a> Recorder<'a> {
             p1[48..52].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
             p1[52..56].copy_from_slice(&(v_addr as u32).to_ne_bytes());
             p1[56..60].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
-        }
-        if let Some((page_addr, page_rows)) = pages {
-            p1[60..64].copy_from_slice(&(page_addr as u32).to_ne_bytes());
-            p1[64..68].copy_from_slice(&((page_addr >> 32) as u32).to_ne_bytes());
-            p1[68..72].copy_from_slice(&page_rows.to_ne_bytes());
         }
         // Batched: workgroup y = 4-row group; per-row: y = row.
         let gy = if batched { rows.div_ceil(4) } else { rows };
@@ -7551,7 +7554,6 @@ impl<'a> Recorder<'a> {
     /// QK-norm + RoPE, pos from `params`. `out_base_mul` = 0 for Q (write to a temp), 1 for K (write
     /// to the cache at row pos).
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn qk_norm_rope_dyn(
         &self,
         x: &dyn Buffer,
@@ -7597,7 +7599,7 @@ impl<'a> Recorder<'a> {
         push[28..32].copy_from_slice(&eps.to_ne_bytes());
         push[32..36].copy_from_slice(&(kcap as u32).to_ne_bytes());
         match ff {
-            Some(f) => self.dispatch(
+            Some(f) => self.dispatch_wide(
                 k,
                 &[
                     Self::vkb(x),
@@ -7610,7 +7612,7 @@ impl<'a> Recorder<'a> {
                 &push,
                 (rows * nheads) as u32,
             ),
-            None => self.dispatch(
+            None => self.dispatch_wide(
                 k,
                 &[Self::vkb(x), Self::vkb(nw), Self::vkb(params), Self::vkb(y)],
                 1,
@@ -7622,7 +7624,7 @@ impl<'a> Recorder<'a> {
 
     /// Cast-copy f32 `src[0..n]` → f16 `dst[row*n..]` (one KV row at position pos from `params`;
     /// `cap_rows` = the cache's row capacity, so an SWA ring cache writes row `pos % cap_rows` —
-    /// identity on a full-context cache; `row_base` = a paged slot's block base, 0 otherwise).
+    /// identity on a full-context cache).
     pub fn store_f16_dyn(
         &self,
         src: &dyn Buffer,
@@ -7630,17 +7632,15 @@ impl<'a> Recorder<'a> {
         dst: &dyn Buffer,
         n: usize,
         cap_rows: usize,
-        row_base: usize,
     ) {
         let k = self
             .be
-            .kernel("store_f16_dyn", crate::gemm::store_f16_dyn_spv(), 3, 20);
-        let mut push = [0u8; 20];
+            .kernel("store_f16_dyn", crate::gemm::store_f16_dyn_spv(), 3, 16);
+        let mut push = [0u8; 16];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
-        // [4..8] off: unused (computed as (pos + rb) % cap from params). [8..12] src_off: 0.
+        // [4..8] off: unused (computed as (pos % cap)*n from params). [8..12] src_off: 0.
         push[12..16].copy_from_slice(&(cap_rows as u32).to_ne_bytes());
-        push[16..20].copy_from_slice(&(row_base as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(src), Self::vkb(params), Self::vkb(dst)],
             1,
@@ -7688,7 +7688,7 @@ impl<'a> Recorder<'a> {
         push[24..28].copy_from_slice(&(window as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&scale.to_ne_bytes());
         push[32..36].copy_from_slice(&(cap as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[
                 Self::vkb(q),
@@ -7753,7 +7753,7 @@ impl<'a> Recorder<'a> {
         push[40..44].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
         push[44..48].copy_from_slice(&(v_addr as u32).to_ne_bytes());
         push[48..52].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[
                 Self::vkb(q),
@@ -7891,7 +7891,7 @@ impl<'a> Recorder<'a> {
     ) {
         self.attention_kv_split_dynac_impl(
             q, kc, vc, o, pm, pl, pacc, params, args, nh, nkv, hd, chunk, n_chunks, scale, window,
-            q8, cap, None, 0,
+            q8, cap, None,
         );
     }
 
@@ -7923,9 +7923,6 @@ impl<'a> Recorder<'a> {
         window: usize,
         q8: bool,
         cap: usize,
-        // Paged K/V: rows per page of the table whose address rides `params` words 2-3 (0 = the
-        // linear cache). Pushed only; the address itself is a per-slot constant of the replay.
-        page_rows: usize,
     ) {
         self.attention_kv_split_dynac_impl(
             q,
@@ -7947,7 +7944,6 @@ impl<'a> Recorder<'a> {
             q8,
             cap,
             Some((k_addr, v_addr)),
-            page_rows,
         );
     }
 
@@ -7976,9 +7972,6 @@ impl<'a> Recorder<'a> {
         cap: usize,
         // #74 slice 2: Some((k_addr, v_addr)) selects the `-DKV_BDA` twins; None keeps bound SSBOs.
         kv_addr: Option<(u64, u64)>,
-        // Paged K/V: rows per page (0 = linear). The table ADDRESS is not pushed — it is a per-slot
-        // constant of the replay, so the adapter seeds it into `params` words 2-3 at record time.
-        page_rows: usize,
     ) {
         let bda = kv_addr.is_some();
         // pass 1: self-chunking partials, workgroup count from `args` (the caller records ONE
@@ -8034,14 +8027,7 @@ impl<'a> Recorder<'a> {
         } else {
             None
         };
-        let gqa = fast.and_then(|_| self.gqa_pass1(hd, nh, nkv, window, true));
-        let (p1name, p1spv) = gqa.or(fast).unwrap_or((p1name, p1spv));
-        tracing::debug!(
-            kernel = p1name,
-            gqa = gqa.is_some(),
-            page_rows,
-            "decode replay: split attention kernel"
-        );
+        let (p1name, p1spv) = fast.unwrap_or((p1name, p1spv));
         // attn_partial.comp's `layout(push_constant) uniform PC {...}` block is declared
         // UNCONDITIONALLY (11 x 4-byte members = 44 bytes) — `pos`/`rows` (offsets 36..44) are
         // dead code under `-DUSE_PARAMS` (never read in the compiled SPIR-V for this variant, see
@@ -8051,17 +8037,10 @@ impl<'a> Recorder<'a> {
         // 10069 — confirmed firing on the 7900 XTX under validation layers: "push constant buffer
         // Block with range [0, 44] which is outside the VkPushConstantRange of [0, 36]"). The
         // range must cover the full declared block; the trailing 8 bytes stay zero and unread.
-        // BDA push grows to 60 (k_lo/k_hi/v_lo/v_hi at 44..60), plus the three paging words the
-        // `attn_decode` replay build declares → 72; bound stays 44. n_buf stays 7. Only
-        // `page_rows` is pushed (60..68 stay zero): under -DUSE_PARAMS the table address comes from
-        // `params` words 2-3, which `params_advance` never touches.
-        let plen: usize = if bda { 72 } else { 44 };
-        let k1 = if gqa.is_some() {
-            self.be.kernel_sg64_native(p1name, p1spv, 7, plen as u32)
-        } else {
-            self.be.kernel_sg(p1name, p1spv, 7, plen as u32, 32)
-        };
-        let mut p1 = [0u8; 72];
+        // BDA push grows to 60 (k_lo/k_hi/v_lo/v_hi at 44..60); bound stays 44. n_buf stays 7.
+        let plen: usize = if bda { 60 } else { 44 };
+        let k1 = self.be.kernel_sg(p1name, p1spv, 7, plen as u32, 32);
+        let mut p1 = [0u8; 60];
         p1[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         p1[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
         p1[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
@@ -8075,7 +8054,6 @@ impl<'a> Recorder<'a> {
             p1[48..52].copy_from_slice(&((k_addr >> 32) as u32).to_ne_bytes());
             p1[52..56].copy_from_slice(&(v_addr as u32).to_ne_bytes());
             p1[56..60].copy_from_slice(&((v_addr >> 32) as u32).to_ne_bytes());
-            p1[68..72].copy_from_slice(&(page_rows as u32).to_ne_bytes());
         }
         self.dispatch_indirect(
             k1,
@@ -8285,7 +8263,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(nh as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(nkv as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(hd as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[Self::vkb(q), Self::vkb(k), Self::vkb(v), Self::vkb(o)],
             1,
@@ -8313,7 +8291,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
         push[12..16].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
         // Thread-per-element kernel (local_size 64) — dispatch element-count/64 workgroups.
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(gu), Self::vkb(y)],
             1,
@@ -8341,7 +8319,7 @@ impl<'a> Recorder<'a> {
         push[8..12].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
         push[12..16].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
         // Thread-per-element kernel (local_size 64) — dispatch element-count/64 workgroups.
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(gu), Self::vkb(y)],
             1,
@@ -8367,7 +8345,7 @@ impl<'a> Recorder<'a> {
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[28..32].copy_from_slice(&(u32::from(clamp.is_some())).to_ne_bytes());
         push[32..36].copy_from_slice(&clamp.unwrap_or(0.0).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
             1,
@@ -8737,7 +8715,7 @@ impl<'a> Recorder<'a> {
         p1[8..12].copy_from_slice(&(kd as u32).to_ne_bytes());
         p1[12..16].copy_from_slice(&eps.to_ne_bytes());
         p1[16..20].copy_from_slice(&(1.0f32 / (kd as f32).sqrt()).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kn_k,
             &[Self::vkb(q), Self::vkb(k), Self::vkb(kn), Self::vkb(qn)],
             2, // kn, qn
@@ -8754,7 +8732,7 @@ impl<'a> Recorder<'a> {
         let mut p2 = [0u8; 8];
         p2[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         p2[4..8].copy_from_slice(&(nv as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kg,
             &[
                 Self::vkb(blog),
@@ -8854,9 +8832,87 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
-        let kern = self
-            .be
-            .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 20);
+        self.conv_seq_at(ConvKind::Silu, qkv, arena_addr, state, out, rows, cc, kconv);
+    }
+
+    /// LFM's gated short convolution (`Op::ShortConv`), token-serial: `bcx` is the
+    /// `[rows, 3*cc]` B | C | X in-projection, `out` `[rows, cc]` is C ⊙ conv(B ⊙ X), and the
+    /// history `state` `[(kconv-1)*cc]` (of B ⊙ X) is updated in place. The `-DSHORTCONV` build of
+    /// `shaders/conv1d_silu.comp`, weight read through its BDA address like [`Self::conv1d_silu`].
+    pub fn shortconv(
+        &self,
+        bcx: &dyn Buffer,
+        w: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: shortconv requires a u64 BDA device address");
+        self.conv_seq_at(
+            ConvKind::Short,
+            bcx,
+            arena_addr,
+            state,
+            out,
+            rows,
+            cc,
+            kconv,
+        );
+    }
+
+    /// [`Self::shortconv`] for `rows ≥ kconv-1`: every output in parallel, then the history
+    /// rebuilt from the last `kconv-1` rows — the [`Self::conv1d_silu_batch`] two-pass shape.
+    pub fn shortconv_batch(
+        &self,
+        bcx: &dyn Buffer,
+        w: &dyn Buffer,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        let arena_addr = w
+            .device_addr()
+            .expect("resident-BDA weight: shortconv_batch requires a u64 BDA device address");
+        self.conv_batch_at(
+            ConvKind::Short,
+            bcx,
+            arena_addr,
+            state,
+            out,
+            rows,
+            cc,
+            kconv,
+        );
+    }
+
+    /// The token-serial conv dispatch [`Self::conv1d_silu_at`] and [`Self::shortconv`] share;
+    /// `kind` picks the shader build.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_seq_at(
+        &self,
+        kind: ConvKind,
+        qkv: &dyn Buffer,
+        arena_addr: u64,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        let kern = match kind {
+            ConvKind::Silu => self
+                .be
+                .kernel("conv1d_silu", crate::gemm::conv1d_silu_spv(), 4, 20),
+            ConvKind::Short => self
+                .be
+                .kernel("shortconv", crate::gemm::shortconv_spv(), 4, 20),
+        };
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
@@ -8893,20 +8949,41 @@ impl<'a> Recorder<'a> {
         cc: usize,
         kconv: usize,
     ) {
-        debug_assert!(
-            rows >= kconv - 1,
-            "conv1d_silu_batch_at needs rows ≥ kconv-1"
-        );
+        self.conv_batch_at(ConvKind::Silu, qkv, arena_addr, state, out, rows, cc, kconv);
+    }
+
+    /// The two-pass batch conv dispatch [`Self::conv1d_silu_batch_at`] and
+    /// [`Self::shortconv_batch`] share; `kind` picks the shader builds.
+    #[allow(clippy::too_many_arguments)]
+    fn conv_batch_at(
+        &self,
+        kind: ConvKind,
+        qkv: &dyn Buffer,
+        arena_addr: u64,
+        state: &dyn Buffer,
+        out: &dyn Buffer,
+        rows: usize,
+        cc: usize,
+        kconv: usize,
+    ) {
+        debug_assert!(rows >= kconv - 1, "the batch conv needs rows ≥ kconv-1");
         let mut push = [0u8; 20];
         push[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(arena_addr as u32).to_ne_bytes());
         push[16..20].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
-        let k1 = self
-            .be
-            .kernel("conv1d_silu_par", crate::gemm::conv1d_silu_par_spv(), 4, 20);
-        self.dispatch(
+        let k1 = match kind {
+            ConvKind::Silu => {
+                self.be
+                    .kernel("conv1d_silu_par", crate::gemm::conv1d_silu_par_spv(), 4, 20)
+            }
+            ConvKind::Short => {
+                self.be
+                    .kernel("shortconv_par", crate::gemm::shortconv_par_spv(), 4, 20)
+            }
+        };
+        self.dispatch_wide(
             k1,
             &[
                 Self::vkb(qkv),
@@ -8922,10 +8999,17 @@ impl<'a> Recorder<'a> {
         push2[0..4].copy_from_slice(&(rows as u32).to_ne_bytes());
         push2[4..8].copy_from_slice(&(cc as u32).to_ne_bytes());
         push2[8..12].copy_from_slice(&(kconv as u32).to_ne_bytes());
-        let k2 = self
-            .be
-            .kernel("conv1d_shift", crate::gemm::conv1d_shift_spv(), 2, 12);
-        self.dispatch(
+        let k2 = match kind {
+            ConvKind::Silu => {
+                self.be
+                    .kernel("conv1d_shift", crate::gemm::conv1d_shift_spv(), 2, 12)
+            }
+            ConvKind::Short => {
+                self.be
+                    .kernel("shortconv_shift", crate::gemm::shortconv_shift_spv(), 2, 12)
+            }
+        };
+        self.dispatch_wide(
             k2,
             &[Self::vkb(qkv), Self::vkb(state)],
             1, // state out
@@ -8960,7 +9044,7 @@ impl<'a> Recorder<'a> {
         {
             push[i * 4..i * 4 + 4].copy_from_slice(&(*v as u32).to_ne_bytes());
         }
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[Self::vkb(src), Self::vkb(dst)],
             1,
@@ -8990,12 +9074,37 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(gate_stride_el as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(gate_row_width as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(gate_block_width as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kern,
             &[Self::vkb(a), Self::vkb(b), Self::vkb(y)],
             1,
             &push,
             (n as u32).div_ceil(64),
+        );
+    }
+
+    /// Per-head sigmoid gate (`Op::HeadGate`): `y[i] = x[i] * sigmoid(g[i / head_dim])` over `n`
+    /// elements, `g` holding one logit per head per row. See shaders/head_gate.comp.
+    pub fn head_gate(
+        &self,
+        x: &dyn Buffer,
+        g: &dyn Buffer,
+        y: &dyn Buffer,
+        n: usize,
+        head_dim: usize,
+    ) {
+        let kern = self
+            .be
+            .kernel("head_gate", crate::gemm::head_gate_spv(), 3, 8);
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
+        push[4..8].copy_from_slice(&(head_dim as u32).to_ne_bytes());
+        self.dispatch_wide(
+            kern,
+            &[Self::vkb(x), Self::vkb(g), Self::vkb(y)],
+            1,
+            &push,
+            (n as u32).div_ceil(256),
         );
     }
 
@@ -9032,7 +9141,7 @@ impl<'a> Recorder<'a> {
         push[16..20].copy_from_slice(&((gate_stride_bytes / 4) as u32).to_ne_bytes());
         push[20..24].copy_from_slice(&(gate_row_width as u32).to_ne_bytes());
         push[24..28].copy_from_slice(&((gate_block_width / 4) as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(gate), Self::vkb(up), Self::vkb(y)],
             1,
@@ -9082,6 +9191,29 @@ impl<'a> Recorder<'a> {
                  MOE_TOPK_MAX_EXPERTS ({MOE_TOPK_MAX_EXPERTS}) — moe_topk.comp's ssel_adj scratch \
                  is sized for this many experts and would corrupt routing above it"
             )));
+        }
+        if n_used > n_expert {
+            return Err(be(format!(
+                "moe_topk: n_used ({n_used}) exceeds n_expert ({n_expert}) — moe_topk.comp's \
+                 per-slot selection scratch holds at most n_expert ids"
+            )));
+        }
+        // Group-limited routing engages at more than one group with at least one kept (the
+        // shader's own test). It splits the experts into equal runs of `n_expert / groups`, so a
+        // remainder would sit outside every group, and indexes per-group arrays of a fixed size.
+        if n_expert_groups > 1 && n_expert_groups_used > 0 {
+            if n_expert_groups > MOE_TOPK_MAX_GROUPS {
+                return Err(be(format!(
+                    "moe_topk: n_expert_groups ({n_expert_groups}) exceeds the GPU router's \
+                     ceiling of MOE_TOPK_MAX_GROUPS ({MOE_TOPK_MAX_GROUPS})"
+                )));
+            }
+            if !n_expert.is_multiple_of(n_expert_groups as usize) {
+                return Err(be(format!(
+                    "moe_topk: n_expert ({n_expert}) is not divisible by n_expert_groups \
+                     ({n_expert_groups}) — group-limited routing needs equal expert groups"
+                )));
+            }
         }
         let k = self
             .be
@@ -9159,7 +9291,7 @@ impl<'a> Recorder<'a> {
         // w first, y LAST: dispatch3 hazard-tracks the last n_out buffers as writes — y is the
         // read-modify-write target, so it must sit in the write slot or the downstream activation
         // kernel races the in-place scale (shader bindings match this order).
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(w), Self::vkb(y)],
             1,
@@ -9277,7 +9409,12 @@ impl<'a> Recorder<'a> {
     ///     (`SHADER_READ`) `TRANSFER`→`COMPUTE_SHADER`;
     ///   • WAR — a prior dispatch's arena read (`SHADER_READ`) completes before a later copy
     ///     overwrites that slot (`TRANSFER_WRITE`) `COMPUTE_SHADER`→`TRANSFER`.
-    /// Streaming is PCIe/residency-bound, so the extra barrier per staged block is noise.
+    /// It is a full compute/transfer barrier, so it also stops independent dispatches on either
+    /// side from overlapping. The dense pager records it only around a copy and never for a block
+    /// that is already resident (`pager::DensePagerSession::stage` argues why a hit needs none).
+    /// The paged MoE path (`adapter::execute_paged_moe`) still records one before and one after
+    /// each paged `MoeFfn`'s staging whether or not that staging copied anything, and
+    /// `MoePagerSession::stage_ready_fills` brackets the fills it admits.
     pub fn arena_stream_barrier(&self) {
         let mb = vk::MemoryBarrier::default()
             .src_access_mask(
@@ -9302,6 +9439,7 @@ impl<'a> Recorder<'a> {
             );
         }
         *self.barriers.borrow_mut() += 1;
+        self.be.note_arena_barrier();
     }
 
     /// Log the sampled token id into the chained-decode ring: `ring[params[0] & 63] = id[0]`.
@@ -9523,7 +9661,7 @@ impl<'a> Recorder<'a> {
             2,
             4,
         );
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(tok_ids), Self::vkb(counts)],
             1,
@@ -9591,7 +9729,7 @@ impl<'a> Recorder<'a> {
             Self::vkb(bucket_wts),
             Self::vkb(inv_pos),
         ]);
-        self.dispatch(k, &bufs, 4, &push, (n_pairs as u32).div_ceil(64));
+        self.dispatch_wide(k, &bufs, 4, &push, (n_pairs as u32).div_ceil(64));
     }
 
     /// Fused gather+quant for the batched MoE pipeline: quantize `n_slots` BUCKET rows (each
@@ -9619,7 +9757,7 @@ impl<'a> Recorder<'a> {
         p[0..4].copy_from_slice(&(n_slots as u32).to_ne_bytes());
         p[4..8].copy_from_slice(&(k_dim as u32).to_ne_bytes());
         p[8..12].copy_from_slice(&32u32.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kq,
             &[
                 Self::vkb(a),
@@ -9630,7 +9768,7 @@ impl<'a> Recorder<'a> {
             ],
             3,
             &p,
-            (n_slots * (k_dim / 32)) as u32,
+            (n_slots * (k_dim / 32)).div_ceil(QUANT_Q8_BLOCKS_PER_WG) as u32,
         );
     }
 
@@ -9688,6 +9826,7 @@ impl<'a> Recorder<'a> {
         n_expert: usize,
         n_used: usize,
     ) {
+        assert_native_k("matmul_mmq_experts", k);
         // The stacked expert bank is read from its resident-BDA arena address, never a bound SSBO.
         // `pc.m` is REPURPOSED as the per-expert BYTE stride applied on the pointer
         // (`w_addr += uint64_t(ex) * uint64_t(pc.m)`, see the shaders' STREAMED EXPERT_GRID arm) —
@@ -9732,6 +9871,13 @@ impl<'a> Recorder<'a> {
         } else {
             desc.xp
         };
+        // INFR_PROF_OP_SHAPES: itemize the stage label by tile kernel and shape
+        // (`expert_down:native_gemm_mmq_q6k_xp:1536x2560`) — a model mixing down dtypes across
+        // layers otherwise lands every layer in one `expert_down` bucket.
+        if self.op_shapes {
+            self.next_label
+                .set(Some(intern_label(format!("{stage}:{name}:{k}x{n}"))));
+        }
         let nb = desc.resident_nb;
         let kern = self.be.kernel(name, spv, nb, 24);
         let mut push = [0u8; 24];
@@ -9797,6 +9943,7 @@ impl<'a> Recorder<'a> {
         n_expert: usize,
         n_used: usize,
     ) {
+        assert_native_k("matmul_mmq_experts_paged", k);
         self.label_next(stage);
         let avg_rows = rows.saturating_mul(n_used) / n_expert.max(1);
         let small_tile = avg_rows <= MOE_EXPERT_SMALL_TILE_AVG_ROWS;
@@ -9872,7 +10019,7 @@ impl<'a> Recorder<'a> {
         push[4..8].copy_from_slice(&(ne as u32).to_ne_bytes());
         push[8..12].copy_from_slice(&(n_used as u32).to_ne_bytes());
         push[12..16].copy_from_slice(&(prescaled as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(y_all),
@@ -10039,7 +10186,7 @@ impl<'a> Recorder<'a> {
         push[28..32].copy_from_slice(&((arena_addr >> 32) as u32).to_ne_bytes());
         let bufs = [Self::vkb(x), Self::vkb(x), Self::vkb(ids), Self::vkb(y)];
         if rows == 1 {
-            if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f, self.gemv()) {
+            if let Some(nr) = native_id_sg_choice(dtype, in_f, out_f, self.tuning()) {
                 if let Some((name, spv)) =
                     crate::gemm::native_idm_sg_build_spv(dtype, nr, self.sg16())
                 {
@@ -10188,7 +10335,7 @@ impl<'a> Recorder<'a> {
         p[0..4].copy_from_slice(&(m as u32).to_ne_bytes());
         p[4..8].copy_from_slice(&(k as u32).to_ne_bytes());
         p[8..12].copy_from_slice(&32u32.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             kq,
             &[
                 Self::vkb(a),
@@ -10198,7 +10345,7 @@ impl<'a> Recorder<'a> {
             ],
             3,
             &p,
-            (m * (k / 32)) as u32,
+            (m * (k / 32)).div_ceil(QUANT_Q8_BLOCKS_PER_WG) as u32,
         );
     }
 
@@ -10338,7 +10485,7 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&(slot as u32).to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(wts), Self::vkb(acc)],
             1,
@@ -10355,7 +10502,7 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&scale.to_ne_bytes());
-        self.dispatch(k, &[Self::vkb(y)], 1, &push, (n as u32).div_ceil(64));
+        self.dispatch_wide(k, &[Self::vkb(y)], 1, &push, (n as u32).div_ceil(64));
     }
 
     /// Elementwise softcap `y[i] = cap·tanh(x[i]/cap)` (gemma final-logit / attn softcap). In-place
@@ -10365,7 +10512,7 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&cap.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(y)],
             1,
@@ -10381,7 +10528,7 @@ impl<'a> Recorder<'a> {
         let mut push = [0u8; 8];
         push[0..4].copy_from_slice(&(n as u32).to_ne_bytes());
         push[4..8].copy_from_slice(&scale.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(acc)],
             1,
@@ -10393,7 +10540,7 @@ impl<'a> Recorder<'a> {
     /// Elementwise add; in place allowed (`a` may equal `y`).
     pub fn add(&self, a: &dyn Buffer, b: &dyn Buffer, y: &dyn Buffer, n: usize) {
         let k = self.be.kernel("add", crate::gemm::add_spv(), 3, 4);
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(a), Self::vkb(b), Self::vkb(y)],
             1,
@@ -10417,7 +10564,7 @@ impl<'a> Recorder<'a> {
             .kernel("add_bias", crate::gemm::add_bias_spv(), 3, 8);
         let mut pc = (n as u32).to_ne_bytes().to_vec();
         pc.extend_from_slice(&total.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(bias), Self::vkb(y)],
             1,
@@ -10433,7 +10580,7 @@ impl<'a> Recorder<'a> {
         let k = self.be.kernel("mul_vec", crate::gemm::mul_vec_spv(), 3, 8);
         let mut pc = (n as u32).to_ne_bytes().to_vec();
         pc.extend_from_slice(&total.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[Self::vkb(x), Self::vkb(vec), Self::vkb(y)],
             1,
@@ -10465,7 +10612,7 @@ impl<'a> Recorder<'a> {
         );
         let mut pc = (n as u32).to_ne_bytes().to_vec();
         pc.extend_from_slice(&total.to_ne_bytes());
-        self.dispatch(
+        self.dispatch_wide(
             k,
             &[
                 Self::vkb(moe),
@@ -10526,15 +10673,19 @@ impl<'a> Recorder<'a> {
     /// Free the recorder's transient Vulkan objects — the query pool (if any), the command buffer,
     /// and every descriptor-pool tranche. `Recorder` has no `Drop` (by design — the arena pools
     /// would otherwise be reported live at `vkDestroyDevice`), so `finish`/`finish_nowait` must
-    /// call this on BOTH their success AND their `?`-error exits; a bare early return would leak
-    /// these — and it leaks precisely on device-lost, exactly when those live pools then trip
-    /// `vkDestroyDevice`. Call once per recorder. Mirrors `discard`'s cleanup block.
+    /// call this on BOTH their success AND their `?`-error exits (as `discard` and a failed
+    /// `end_segment` do); a bare early return would leak these — and it leaks precisely on
+    /// device-lost, exactly when those live pools then trip `vkDestroyDevice`. Call once per
+    /// recorder.
     fn free_transient(&self) {
         let device = &self.be.shared.device;
         unsafe {
             // query_pool is null unless prof_ops created one; the null check is equivalent to `prof_ops`.
             if self.query_pool != vk::QueryPool::null() {
                 device.destroy_query_pool(self.query_pool, None);
+            }
+            if self.seg_query_pool != vk::QueryPool::null() {
+                device.destroy_query_pool(self.seg_query_pool, None);
             }
             let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
             device.free_command_buffers(cmd_pool, &[self.cmd]);
@@ -10563,6 +10714,7 @@ impl<'a> Recorder<'a> {
                 );
             }
         }
+        self.stamp_segment_end();
         let queue = self.be.shared.queue;
         // Each fallible step frees the transient objects before propagating — see `free_transient`.
         if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
@@ -10584,6 +10736,7 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("queue_wait_idle: {e}")));
         }
+        account_segment(&self.be.shared, self.seg_query_pool);
         if self.stages {
             eprintln!(
                 "[prof] record={:.1}ms submit+gpu={:.1}ms",
@@ -10615,21 +10768,10 @@ impl<'a> Recorder<'a> {
     /// Only the NOT-yet-submitted buffer is abandoned. Anything already on the queue is still
     /// drained by the caller — a submitted command buffer cannot be cancelled, only waited on.
     pub fn discard(self) -> Result<()> {
-        let device = &self.be.shared.device;
-        unsafe {
-            device
-                .end_command_buffer(self.cmd)
-                .map_err(|e| be(format!("end cmd: {e}")))?;
-            if self.prof_ops {
-                device.destroy_query_pool(self.query_pool, None);
-            }
-            let cmd_pool = *self.be.shared.cmd_pool.lock().unwrap();
-            device.free_command_buffers(cmd_pool, &[self.cmd]);
-            for p in self.pools.borrow().iter() {
-                device.destroy_descriptor_pool(*p, None);
-            }
-        }
-        Ok(())
+        // Freed even when ending fails: an early return would leak the command buffer and pools.
+        let ended = unsafe { self.be.shared.device.end_command_buffer(self.cmd) };
+        self.free_transient();
+        ended.map_err(|e| be(format!("end cmd: {e}")))
     }
 
     /// [`Self::finish`]'s pipelined twin: end recording and submit WITHOUT waiting, returning a
@@ -10653,10 +10795,12 @@ impl<'a> Recorder<'a> {
                 fence: None,
                 cmd: vk::CommandBuffer::null(),
                 pools: Vec::new(),
+                seg_query_pool: vk::QueryPool::null(),
                 dispatches,
             });
         }
         let device = &self.be.shared.device;
+        self.stamp_segment_end();
         // On SUCCESS the cmd buffer + pools are handed to the returned `PendingSegment` (freed in
         // its `wait`); on every ERROR exit we own them still and must free them here (`Recorder`
         // has no `Drop`) — see `free_transient`.
@@ -10688,8 +10832,24 @@ impl<'a> Recorder<'a> {
             fence: Some(fence),
             cmd: self.cmd,
             pools: self.pools.borrow().clone(),
+            seg_query_pool: self.seg_query_pool,
             dispatches,
         })
+    }
+
+    /// Write the segment's closing GPU timestamp (index 1 of `seg_query_pool`), the last command
+    /// before the command buffer ends. No-op on an untimed recorder.
+    fn stamp_segment_end(&self) {
+        if self.seg_query_pool != vk::QueryPool::null() {
+            unsafe {
+                self.be.shared.device.cmd_write_timestamp(
+                    self.cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.seg_query_pool,
+                    1,
+                );
+            }
+        }
     }
 
     /// Unconditional global compute+transfer barrier — the mandatory FIRST command of a recorder
@@ -10734,8 +10894,10 @@ impl<'a> Recorder<'a> {
         if self.stages {
             eprintln!("[prof] barriers emitted = {}", self.barriers.borrow());
         }
-        unsafe { self.be.shared.device.end_command_buffer(self.cmd) }
-            .map_err(|e| be(format!("end cmd: {e}")))?;
+        if let Err(e) = unsafe { self.be.shared.device.end_command_buffer(self.cmd) } {
+            self.free_transient();
+            return Err(be(format!("end cmd: {e}")));
+        }
         Ok(RecordedSegment {
             cmd: self.cmd,
             pools: self.pools.borrow().clone(),
@@ -10887,11 +11049,7 @@ impl RecordedCmd {
             .shared
             .submit_dispatch_cap
             .load(std::sync::atomic::Ordering::Relaxed);
-        let prefill_only = self
-            .shared
-            .split_prefill_only
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if cap == 0 || prefill_only || self.dispatches == 0 {
+        if cap == 0 || self.dispatches == 0 {
             return usize::MAX;
         }
         // Always at least one: a single decode step is indivisible, and it is short enough on
@@ -10937,18 +11095,29 @@ impl RecordedCmd {
     /// cross-segment RAW/WAR memory dependency (a pipeline barrier's first scope spans everything
     /// submitted earlier on the same queue). A discrete GPU has exactly ONE segment, so this is a
     /// single submit + wait — byte-identical to the record-once fast path.
+    ///
+    /// A submit that fails part-way still waits for the segments submitted before it, so the
+    /// recording has stopped running when this returns either way: a caller holding a lock until
+    /// the replay is over (the dense streaming replay, `adapter::current_replay`) holds it that
+    /// long on the error path too. On a lost device the wait returns at once with its own error.
     pub fn replay(&self) -> Result<()> {
         let device = &self.shared.device;
         unsafe {
             for seg in &self.segments {
-                device
-                    .queue_submit(
-                        self.shared.queue,
-                        &[vk::SubmitInfo::default()
-                            .command_buffers(std::slice::from_ref(&seg.cmd))],
-                        vk::Fence::null(),
-                    )
-                    .map_err(|e| be(format!("replay submit: {e}")))?;
+                let submitted = device.queue_submit(
+                    self.shared.queue,
+                    &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&seg.cmd))],
+                    vk::Fence::null(),
+                );
+                if let Err(e) = submitted {
+                    return Err(match device.queue_wait_idle(self.shared.queue) {
+                        Ok(()) => be(format!("replay submit: {e}")),
+                        Err(w) => be(format!(
+                            "replay submit: {e} (and the wait for the segments submitted \
+                             before it: {w})"
+                        )),
+                    });
+                }
             }
             device
                 .queue_wait_idle(self.shared.queue)
@@ -10985,6 +11154,8 @@ pub struct PendingSegment {
     fence: Option<vk::Fence>,
     cmd: vk::CommandBuffer,
     pools: Vec<vk::DescriptorPool>,
+    /// The recorder's `seg_query_pool`, read and destroyed once the fence signals.
+    seg_query_pool: vk::QueryPool,
     /// Dispatches this segment carried — the submit splitter sums them across a forward to feed
     /// `VulkanBackend::observe_forward`.
     dispatches: usize,
@@ -11009,7 +11180,14 @@ impl PendingSegment {
         };
         let device = &self.shared.device;
         let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
+        if waited.is_ok() {
+            account_segment(&self.shared, self.seg_query_pool);
+        }
         unsafe {
+            if self.seg_query_pool != vk::QueryPool::null() {
+                device.destroy_query_pool(self.seg_query_pool, None);
+                self.seg_query_pool = vk::QueryPool::null();
+            }
             device.destroy_fence(fence, None);
             let cmd_pool = *self.shared.cmd_pool.lock().unwrap();
             device.free_command_buffers(cmd_pool, &[self.cmd]);
@@ -11018,6 +11196,38 @@ impl PendingSegment {
             }
         }
         waited.map_err(|e| be(format!("wait segment fence: {e}")))
+    }
+}
+
+/// Add one COMPLETED segment's GPU interval to the backend's running sum (or count it untimed) —
+/// the input `crate::ForwardClock` judges a forward by. `qp` is that segment's two-stamp pool,
+/// null when it was recorded untimed; it is only read here, never destroyed.
+fn account_segment(shared: &crate::VulkanShared, qp: vk::QueryPool) {
+    use std::sync::atomic::Ordering;
+    let Some(period) = shared
+        .segment_ts_period
+        .filter(|_| qp != vk::QueryPool::null())
+    else {
+        shared.untimed_segments.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let mut ticks = [0u64; 2];
+    let read = unsafe {
+        shared.device.get_query_pool_results(
+            qp,
+            0,
+            &mut ticks,
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+        )
+    };
+    match read {
+        Ok(()) => {
+            let ns = (ticks[1].wrapping_sub(ticks[0]) as f64 * period as f64) as u64;
+            shared.segment_gpu_ns.fetch_add(ns, Ordering::Relaxed);
+        }
+        Err(_) => {
+            shared.untimed_segments.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -11187,16 +11397,1009 @@ mod tests {
     use super::*;
     use infr_core::{backend::BufferUsage, Backend};
 
+    thread_local! {
+        /// Overrides `Recorder::split_point_x` on this test thread.
+        pub(super) static WIDE_SPLIT_AT: std::cell::Cell<Option<u32>> =
+            const { std::cell::Cell::new(None) };
+        /// How many `dispatch_wide` calls on this test thread took the 2-D split.
+        pub(super) static WIDE_SPLITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        /// Overrides the `maxStorageBufferRange` `Recorder::vkb` holds a sub-tensor bind to.
+        pub(super) static VKB_RANGE_CAP: std::cell::Cell<Option<u64>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// The grid `quant_q8`/`quant_q8_gather` are dispatched at is sized by
+    /// [`QUANT_Q8_BLOCKS_PER_WG`]; the shader indexes its blocks by its own copy of the number.
+    #[test]
+    fn quant_q8_blocks_per_wg_matches_shader() {
+        let src = include_str!("../shaders/quant_q8.comp");
+        let want = format!("#define QUANT_Q8_BLOCKS_PER_WG {QUANT_Q8_BLOCKS_PER_WG}u");
+        assert!(src.contains(&want), "quant_q8.comp lacks `{want}`");
+    }
+
     /// A backend built on an EXPLICIT Vulkan kernel-tier configuration.
     ///
     /// This is what replaced `EnvGuard::with([("INFR_FLASH_SPLITS", "4"), …])` in every test below:
     /// the tier knobs are a VALUE handed to `VulkanBackend::new_with`, so nothing is process-global,
     /// nothing has to be restored, and two backends with different tiers can be live at once (R7).
     /// The cost is one device per configuration — these tests already built one per case.
+    /// The device is still the one `INFR_DEV` names (see `crate::test_config`).
     fn be_with(f: impl FnOnce(&mut infr_core::config::VulkanCfg)) -> VulkanBackend {
-        let mut cfg = infr_core::config::Config::default();
+        let mut cfg = crate::test_config();
         f(&mut cfg.kernels.vulkan);
         VulkanBackend::new_with(std::sync::Arc::new(cfg)).unwrap()
+    }
+
+    /// `be_with` must bind the device `INFR_DEV` names, as `VulkanBackend::new` does. Only
+    /// observable with `INFR_DEV` naming a device other than the discrete default.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn be_with_honours_infr_dev() {
+        let want = VulkanBackend::new().unwrap().capabilities().name;
+        assert_eq!(be_with(|_| {}).capabilities().name, want);
+    }
+
+    /// `kernels.vulkan.force_wave64` puts a device that can pin 32 on the wave64 path a GCN part
+    /// takes: no cooperative-matrix tier, the subgroup range a wave64-only part reports, and a
+    /// subgroup reduction (rmsnorm: `subgroupAdd`, `subgroupElect`, `gl_SubgroupID`,
+    /// `gl_NumSubgroups`) still matching the host. Skips on a device that cannot pin 64.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn force_wave64_takes_the_wave64_path() {
+        let c = VulkanBackend::new().unwrap().capabilities();
+        if !(c.subgroup_min <= 64 && 64 <= c.subgroup_max) {
+            eprintln!(
+                "skipped: subgroup range [{}, {}]",
+                c.subgroup_min, c.subgroup_max
+            );
+            return;
+        }
+        let be = be_with(|v| v.force_wave64 = true);
+        assert!(be.shared.wave64);
+        let c = be.capabilities();
+        assert_eq!((c.subgroup_min, c.subgroup_max), (64, 64));
+        assert_eq!(
+            (c.coopmat_f16, c.coopmat_f8, c.coopmat_i8, c.coopmat_bf16),
+            (None, None, None, None),
+            "a coopmat fragment spans the whole 64-lane subgroup"
+        );
+        // 3 rows of 1000: every 256-lane workgroup reduces across all of its subgroups.
+        let (rows, dim, eps) = (3usize, 1000usize, 1e-5f32);
+        let x: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i * 37 % 101) as f32) * 0.02 - 1.0)
+            .collect();
+        let w: Vec<f32> = (0..dim).map(|i| 1.0 + (i % 7) as f32 * 0.05).collect();
+        let got = be.rmsnorm(&x, &w, rows, dim, eps).unwrap();
+        for r in 0..rows {
+            let row = &x[r * dim..(r + 1) * dim];
+            let ms = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
+            let scale = 1.0 / (ms + eps).sqrt();
+            for i in 0..dim {
+                let want = row[i] * scale * w[i];
+                let g = got[r * dim + i];
+                assert!((g - want).abs() < 1e-4, "row {r} col {i}: {g} vs {want}");
+            }
+        }
+    }
+
+    /// `Recorder::vkb` refuses to bind a resident-BDA sub-tensor whose range passes the device's
+    /// `maxStorageBufferRange` — a VUID violation whose consequence is whatever the driver does
+    /// with the descriptor — and binds the same tensor once the limit covers it.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn vkb_refuses_a_sub_tensor_past_the_storage_range() {
+        let be = be_with(|_| {});
+        let w = be.bda_weight_alloc_for_test(4096).unwrap();
+        let bind_at = |cap: u64| {
+            VKB_RANGE_CAP.with(|c| c.set(Some(cap)));
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                Recorder::vkb(w.as_ref()).range
+            }));
+            VKB_RANGE_CAP.with(|c| c.set(None));
+            r
+        };
+        assert_eq!(bind_at(4096).expect("a range within the limit binds"), 4096);
+        let err = bind_at(1024).expect_err("a range past the limit must be refused");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(msg.contains("maxStorageBufferRange (1024)"), "{msg}");
+    }
+
+    /// A device whose compute limits hold the 256-thread `rmsnorm` but not the 1024-wide
+    /// `rmsnorm_wide` decodes a wide hidden norm (`rows == 1`, `dim >= 2048`) on the narrow kernel
+    /// — the selection asks the same predicate the pipeline build enforces — and gets the right
+    /// answer, where choosing the wide kernel regardless would be refused at build.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn rmsnorm_falls_back_to_the_narrow_kernel_on_a_small_device() {
+        let be = be_with(|_| {});
+        let small = crate::caps::KernelLimits {
+            workgroup_invocations: 256,
+            workgroup_size: [256, 256, 64],
+            ..be.shared.kernel_limits
+        };
+        assert!(!small.admits(crate::gemm::rmsnorm_wide_spv()));
+        assert!(small.admits(crate::gemm::rmsnorm_spv()));
+        let (dim, eps) = (4096usize, 1e-6f32);
+        let x: Vec<f32> = (0..dim).map(|i| ((i % 23) as f32 - 11.0) * 0.07).collect();
+        let w: Vec<f32> = (0..dim).map(|i| 1.0 + (i % 7) as f32 * 0.01).collect();
+        let (bx, bw) = (upf32(&be, &x), upf32(&be, &w));
+        let by = be.alloc(dim * 4, BufferUsage::Readback).unwrap();
+        crate::TEST_KERNEL_LIMITS.with(|l| l.set(Some(small)));
+        let rec = be.recorder().unwrap();
+        rec.rmsnorm(bx.as_ref(), bw.as_ref(), by.as_ref(), 1, dim, eps);
+        rec.finish().unwrap();
+        crate::TEST_KERNEL_LIMITS.with(|l| l.set(None));
+        let mut got = vec![0f32; dim];
+        be.download(by.as_ref(), bytemuck::cast_slice_mut(&mut got))
+            .unwrap();
+        let ms = x.iter().map(|v| f64::from(*v) * f64::from(*v)).sum::<f64>() / dim as f64;
+        let inv = 1.0 / (ms + f64::from(eps)).sqrt();
+        let err = got
+            .iter()
+            .zip(x.iter().zip(&w))
+            .map(|(g, (xv, wv))| (f64::from(*g) - f64::from(*xv) * inv * f64::from(*wv)).abs())
+            .fold(0f64, infr_testkit::nan_max64);
+        assert!(err < 1e-5, "narrow rmsnorm at dim {dim}: max_err={err:e}");
+    }
+
+    /// A kernel refused at build panics (the infallible `kernel` surface, B98) WITHOUT poisoning
+    /// the kernel cache: the next kernel request still builds. A panic under the cache lock would
+    /// have turned every later request in the process into a `PoisonError` panic.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn a_refused_kernel_does_not_poison_the_kernel_cache() {
+        let be = be_with(|_| {});
+        let floor = crate::caps::KernelLimits {
+            workgroup_invocations: 128,
+            workgroup_size: [128, 128, 64],
+            ..be.shared.kernel_limits
+        };
+        crate::TEST_KERNEL_LIMITS.with(|l| l.set(Some(floor)));
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            be.kernel_sg("rmsnorm_wide", crate::gemm::rmsnorm_wide_spv(), 3, 12, 32)
+        }));
+        crate::TEST_KERNEL_LIMITS.with(|l| l.set(None));
+        assert!(
+            refused.is_err(),
+            "a 1024-wide kernel on a 128-wide device must be refused"
+        );
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            be.kernel_sg("rmsnorm", crate::gemm::rmsnorm_spv(), 3, 12, 32)
+        }));
+        assert!(
+            built.is_ok(),
+            "the kernel cache was left poisoned by the refused build"
+        );
+    }
+
+    /// A device whose compute limits sit at Vulkan's floor cannot run `rmsnorm_wide`'s workgroup;
+    /// the pipeline build refuses it by name, before any Vulkan object exists, rather than handing
+    /// the driver a module the spec forbids on that device.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn a_workgroup_past_the_device_limit_is_refused_by_name() {
+        let be = be_with(|_| {});
+        let floor = crate::caps::KernelLimits {
+            workgroup_invocations: 128,
+            workgroup_size: [128, 128, 64],
+            ..be.shared.kernel_limits
+        };
+        let err = crate::ops::try_make_compute_kernel(
+            &be.shared.device,
+            be.shared.pipeline_cache,
+            "rmsnorm_wide",
+            crate::gemm::rmsnorm_wide_spv(),
+            3,
+            12,
+            Some(32),
+            be.shared.push_descriptor.is_some(),
+            floor,
+            false,
+            be.shared.wave64,
+        )
+        .err()
+        .expect("a 1024-wide workgroup on a 128-wide device must be refused")
+        .to_string();
+        assert!(
+            err.contains("rmsnorm_wide") && err.contains("maxComputeWorkGroupSize[x]"),
+            "{err}"
+        );
+    }
+
+    /// The prefill MMQ / int8-coopmat GEMMs floor K to whole 32-element blocks in the shader, so
+    /// an off-grid K must be refused at the entry point rather than silently dropping its tail
+    /// (or, below one block, producing zeros). Each entry is called with an off-grid `k` and must
+    /// panic with `assert_native_k`'s message before anything is dispatched.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn mmq_gemm_entries_reject_off_grid_k() {
+        use infr_core::DType;
+        let be = be_with(|_| {});
+        let buf = || be.alloc(1 << 16, BufferUsage::KvCache).unwrap();
+        let (qa, dact, sact, w, c, aux) = (buf(), buf(), buf(), buf(), buf(), buf());
+        let (qa, dact, sact, w, c, aux) = (
+            qa.as_ref(),
+            dact.as_ref(),
+            sact.as_ref(),
+            w.as_ref(),
+            c.as_ref(),
+            aux.as_ref(),
+        );
+        let addr = w.device_addr().unwrap();
+        let (m, k, n) = (1, 16usize, 64);
+        assert!(
+            !k.is_multiple_of(32),
+            "k must be off the 32-element block grid"
+        );
+        let rec = be.recorder().unwrap();
+        type Call<'a> = Box<dyn Fn() + 'a>;
+        let entries: Vec<(&str, Call)> = vec![
+            (
+                "matmul_mmq_q4k",
+                Box::new(|| rec.matmul_mmq_q4k(qa, dact, sact, w, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_mmq_q6k",
+                Box::new(|| rec.matmul_mmq_q6k(qa, dact, w, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_mmq_at",
+                Box::new(|| rec.matmul_mmq_at(DType::Q8_0, qa, dact, sact, addr, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_i8cm_q8_0",
+                Box::new(|| rec.matmul_i8cm_q8_0(qa, dact, w, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_i8cm_q8_0_at",
+                Box::new(|| rec.matmul_i8cm_q8_0_at(qa, dact, addr, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_i8cm_q8_0_rowscale",
+                Box::new(|| rec.matmul_i8cm_q8_0_rowscale(qa, dact, w, 0, c, m, k, n)),
+            ),
+            (
+                "matmul_mmq_experts",
+                Box::new(|| {
+                    rec.matmul_mmq_experts(
+                        DType::Q8_0,
+                        "test",
+                        qa,
+                        dact,
+                        None,
+                        w,
+                        0,
+                        k * n,
+                        aux,
+                        aux,
+                        c,
+                        m,
+                        k,
+                        n,
+                        1,
+                        1,
+                    )
+                }),
+            ),
+            (
+                "matmul_mmq_experts_paged",
+                Box::new(|| {
+                    rec.matmul_mmq_experts_paged(
+                        DType::Q8_0,
+                        "test",
+                        qa,
+                        dact,
+                        None,
+                        addr,
+                        1 << 12,
+                        aux,
+                        0,
+                        aux,
+                        aux,
+                        c,
+                        m,
+                        k,
+                        n,
+                        1,
+                        1,
+                    )
+                }),
+            ),
+        ];
+        for (name, call) in &entries {
+            let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
+                .expect_err(&format!("{name}: K = {k} was dispatched"));
+            let msg = err
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .unwrap_or_default();
+            assert!(
+                msg.contains("native-block K must be a nonzero multiple of 32"),
+                "{name}: panicked for another reason: {msg}"
+            );
+        }
+        drop(entries);
+        rec.finish().unwrap();
+    }
+
+    /// Every flat elementwise dispatcher must go through `dispatch_wide`, and its shader must
+    /// recover the flat index from the 2-D grid: a grid past `maxComputeWorkGroupCount[0]` is
+    /// otherwise rejected or truncated by a driver that enforces the guaranteed minimum (ANV).
+    /// With the split point lowered so these small grids split, each op must take the split and
+    /// write exactly the bytes the unsplit grid writes. Every buffer carries `GUARD` sentinel bytes
+    /// past its declared size, which must come back unchanged from both runs: a padding workgroup
+    /// of the split grid that wrote past the logical end of an output sized to it lands there.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn elementwise_ops_split_wide_grids() {
+        use infr_core::DType;
+        use std::cell::Cell;
+        // Lowered split point. `n_split > 0` below proves each case's grid exceeded it.
+        const SPLIT_AT: u32 = 3;
+        // Not a multiple of the workgroup width or of `SPLIT_AT`, so the split grid has a ragged
+        // last workgroup and padding workgroups after it.
+        const N: usize = 64 * 10 + 5;
+        // Row-shaped cases.
+        const ROWS: usize = 5;
+        const W: usize = 129;
+        const _: () = assert!(ROWS * W == N);
+        // The 256-wide kernels need more elements for a grid of the same width.
+        const N256: usize = 256 * 10 + 5;
+        // Block-per-thread KV quantizers: one thread per 32- or 128-element block.
+        const NQ4: usize = 32 * N;
+        const NT: usize = 128 * N;
+        // One workgroup per 32-element block.
+        const NQ8: usize = 32 * 11;
+        // `quant_q8`: QUANT_Q8_BLOCKS_PER_WG blocks per workgroup, the last workgroup ragged.
+        const NQ8B: usize = 32 * (QUANT_Q8_BLOCKS_PER_WG * 4 + 3);
+        // Workgroup-per-unit kernels (rope family, attention, qk_norm_rope, linear_bf16).
+        const HD: usize = 64;
+        const UNITS: usize = 5;
+        // `deltanet_gates_seq` runs one thread per (row, value head) in 256-wide workgroups.
+        const DN_ROWS: usize = 3 * 256 / 4 + 1;
+        // Sentinel bytes after every buffer's declared size.
+        const GUARD: usize = 1024;
+        const SENTINEL: u32 = 0xDEAD_BEEF;
+
+        enum Fill {
+            Data,
+            Zero,
+            // `i` at word `i`: distinct expert ids and offsets for `moe_bucket_scatter`.
+            Iota,
+        }
+        use BufferUsage::{Activations as Act, KvCache as Kv};
+        type Op = Box<dyn Fn(&Recorder, &[&dyn Buffer])>;
+        type Bufs = Vec<(usize, Fill, BufferUsage)>;
+        let f = |n: usize| (n * 4, Fill::Data, Act);
+        let mut cases: Vec<(&str, Bufs, Op)> = vec![
+            (
+                "add",
+                vec![f(N), f(N), f(N)],
+                Box::new(|r, b| r.add(b[0], b[1], b[2], N)),
+            ),
+            (
+                "add_scaled",
+                vec![f(N), f(N)],
+                Box::new(|r, b| r.add_scaled(b[0], b[1], 0.5, N)),
+            ),
+            ("scale", vec![f(N)], Box::new(|r, b| r.scale(b[0], 1.5, N))),
+            (
+                "softcap",
+                vec![f(N), f(N)],
+                Box::new(|r, b| r.softcap(b[0], b[1], 2.0, N)),
+            ),
+            (
+                "add_bias",
+                vec![f(N), f(W), f(N)],
+                Box::new(|r, b| r.add_bias(b[0], b[1], b[2], ROWS, W)),
+            ),
+            (
+                "mul_vec",
+                vec![f(N), f(W), f(N)],
+                Box::new(|r, b| r.mul_vec(b[0], b[1], b[2], ROWS, W)),
+            ),
+            (
+                "moe_shared_expert_add",
+                vec![f(N), f(N), f(ROWS), f(N)],
+                Box::new(|r, b| r.moe_shared_expert_add(b[0], b[1], b[2], b[3], ROWS, W)),
+            ),
+            (
+                "add_scaled_id",
+                vec![f(N), f(4), f(N)],
+                Box::new(|r, b| r.add_scaled_id(b[0], b[1], 2, b[2], N)),
+            ),
+            (
+                "silu_mul",
+                vec![f(N), f(N), f(N)],
+                Box::new(|r, b| r.silu_mul(b[0], b[1], b[2], N, None)),
+            ),
+            (
+                "gelu_mul_off",
+                vec![f(N), f(N), f(N)],
+                Box::new(|r, b| r.gelu_mul_off(b[0], b[1], 0, 0, N, 0, 0, 0, b[2], N)),
+            ),
+            (
+                "silu_mul_fused",
+                vec![f(2 * N), f(N)],
+                Box::new(|r, b| r.silu_mul_fused(b[0], b[1], ROWS, W, None)),
+            ),
+            (
+                "gelu_mul_fused",
+                vec![f(2 * N), f(N)],
+                Box::new(|r, b| r.gelu_mul_fused(b[0], b[1], ROWS, W, None)),
+            ),
+            (
+                "mul_sigmoid",
+                vec![f(N), f(N), f(N)],
+                Box::new(|r, b| r.mul_sigmoid(b[0], b[1], b[2], N, 0, 0, 0)),
+            ),
+            (
+                "copy_strided",
+                vec![f(N256), f(N256)],
+                Box::new(|r, b| r.copy_strided(b[0], b[1], 5, 513, 0, 513, 0, 513)),
+            ),
+            (
+                "gather_i32",
+                vec![f(W), (ROWS * 4, Fill::Zero, Act), f(N)],
+                Box::new(|r, b| r.gather_i32(b[0], b[1], b[2], ROWS, W)),
+            ),
+            (
+                "hyper_pre",
+                vec![f(N * 2), f(ROWS * 2), f(N)],
+                Box::new(|r, b| r.hyper_pre(b[0], b[1], b[2], ROWS as u32, 2, W as u32)),
+            ),
+            (
+                "hyper_post",
+                vec![f(N), f(N * 2), f(ROWS * 2), f(ROWS * 4), f(N * 2)],
+                Box::new(|r, b| {
+                    r.hyper_post(b[0], b[1], b[2], b[3], b[4], ROWS as u32, 2, W as u32)
+                }),
+            ),
+            (
+                "moe_weight_scale",
+                vec![f(N), f(ROWS)],
+                Box::new(|r, b| r.moe_weight_scale(b[0], b[1], ROWS, W)),
+            ),
+            (
+                "moe_scatter_reduce",
+                vec![f(W), f(1), (ROWS * 2 * 4, Fill::Zero, Act), f(N)],
+                Box::new(|r, b| r.moe_scatter_reduce(b[0], b[1], b[2], b[3], ROWS, W, 2, false)),
+            ),
+            (
+                "moe_bucket_count",
+                vec![(N * 4, Fill::Zero, Act), (4, Fill::Zero, Act)],
+                Box::new(|r, b| r.moe_bucket_count(b[0], b[1], N)),
+            ),
+            (
+                "quant_q8",
+                vec![f(NQ8B), f(NQ8B), f(NQ8B), f(NQ8B)],
+                Box::new(|r, b| r.quant_q8(b[0], b[1], b[2], b[3], 1, NQ8B)),
+            ),
+            (
+                "quant_q8_gather",
+                vec![f(NQ8B), (4, Fill::Zero, Act), f(NQ8B), f(NQ8B), f(NQ8B)],
+                Box::new(|r, b| r.quant_q8_gather(b[0], b[1], b[2], b[3], b[4], 1, NQ8B)),
+            ),
+            (
+                "store_f16_off",
+                vec![f(N), f(N)],
+                Box::new(|r, b| r.store_f16_off(b[0], b[1], N, 0, 0)),
+            ),
+            (
+                "store_kv_dense",
+                vec![f(N), (N * 4, Fill::Data, Kv)],
+                Box::new(|r, b| r.store_kv_dense(DType::F32, b[0], b[1], N, 0, false)),
+            ),
+            (
+                "quant_kv",
+                vec![f(NQ4), (NQ4, Fill::Data, Kv)],
+                Box::new(|r, b| r.quant_kv(DType::Q4_0, b[0], b[1], NQ4, 0, false)),
+            ),
+            (
+                "dequant_kv_f16",
+                vec![(NQ4, Fill::Data, Kv), f(NQ4)],
+                Box::new(|r, b| r.dequant_kv_f16(DType::Q4_0, b[0], b[1], NQ4)),
+            ),
+            (
+                "dequant_q8_f16",
+                vec![(N * 8, Fill::Data, Kv), f(N)],
+                Box::new(|r, b| r.dequant_q8_f16(b[0], b[1], N, N * 4)),
+            ),
+            (
+                "quant_turbo",
+                vec![f(NT), (NT, Fill::Data, Kv)],
+                Box::new(|r, b| r.quant_turbo(DType::Turbo3, b[0], b[1], NT, 0, false)),
+            ),
+            (
+                "dequant_turbo_f16",
+                vec![(NT, Fill::Data, Kv), f(NT)],
+                Box::new(|r, b| r.dequant_turbo_f16(DType::Turbo3, b[0], b[1], NT)),
+            ),
+            (
+                "store_q8",
+                vec![f(NQ8), (NQ8 * 17 / 16, Fill::Data, Kv)],
+                Box::new(|r, b| r.store_q8(b[0], b[1], NQ8, 0, NQ8, false, 0)),
+            ),
+            (
+                "store_q8_dyn",
+                vec![
+                    f(NQ8),
+                    (8, Fill::Zero, Act),
+                    (NQ8 * 17 / 16, Fill::Data, Kv),
+                ],
+                Box::new(|r, b| r.store_q8_dyn(b[0], b[1], b[2], NQ8, NQ8, false)),
+            ),
+            (
+                "store_f16_off_at",
+                vec![f(N), (N * 2, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[1].device_addr().unwrap();
+                    r.store_f16_off_at(b[0], b[1], a, N, 0, 0)
+                }),
+            ),
+            (
+                "store_f16_dyn_at",
+                vec![f(N), (8, Fill::Zero, Act), (N * 2, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[2].device_addr().unwrap();
+                    r.store_f16_dyn_at(b[0], b[1], b[2], a, N, 1)
+                }),
+            ),
+            (
+                "store_f16_dyn",
+                vec![f(N), (8, Fill::Zero, Act), (N * 2, Fill::Data, Act)],
+                Box::new(|r, b| r.store_f16_dyn(b[0], b[1], b[2], N, 1)),
+            ),
+            (
+                "conv1d_silu_par+conv1d_shift",
+                // The batch form needs rows >= kconv - 1; both passes then span N256 channels.
+                vec![
+                    f(3 * N256),
+                    (4 * 4 * N256, Fill::Data, Kv),
+                    f(3 * N256),
+                    f(3 * N256),
+                ],
+                Box::new(|r, b| {
+                    let a = b[1].device_addr().unwrap();
+                    r.conv1d_silu_batch_at(b[0], a, b[2], b[3], 3, N256, 4)
+                }),
+            ),
+            (
+                "deltanet_norm+deltanet_gates_seq",
+                {
+                    // `deltanet_seq` needs kd = 128; the norm (one workgroup per row and key
+                    // head) and gates passes are the ones under test.
+                    let (rows, nv, kd, vd) = (DN_ROWS, 4, 128, DN_SEQ_NCOL);
+                    let rn = rows * nv;
+                    vec![
+                        f(rows * kd),
+                        f(rows * kd),
+                        f(rn * vd),
+                        f(rn),
+                        f(rn),
+                        f(nv),
+                        f(nv),
+                        f(nv * kd * vd),
+                        f(rn * vd),
+                        f(rows * kd),
+                        f(rows * kd),
+                        f(rn),
+                        f(rn),
+                    ]
+                },
+                Box::new(|r, b| {
+                    r.deltanet_seq_split(
+                        b[0],
+                        b[1],
+                        b[2],
+                        b[3],
+                        b[4],
+                        b[5],
+                        b[6],
+                        b[7],
+                        b[8],
+                        b[9],
+                        b[10],
+                        b[11],
+                        b[12],
+                        DN_ROWS,
+                        4,
+                        1,
+                        128,
+                        DN_SEQ_NCOL,
+                        1e-6,
+                    )
+                }),
+            ),
+            (
+                "moe_bucket_scatter",
+                vec![
+                    (N * 4, Fill::Iota, Act),
+                    f(N),
+                    (N * 4, Fill::Iota, Act),
+                    (N * 4, Fill::Zero, Act),
+                    f(N),
+                    f(N),
+                    f(N),
+                ],
+                Box::new(|r, b| {
+                    r.moe_bucket_scatter(b[0], b[1], b[2], b[3], b[4], b[5], b[6], None, N, 1)
+                }),
+            ),
+            (
+                "moe_bucket_scatter_scaled",
+                vec![
+                    (N * 4, Fill::Iota, Act),
+                    f(N),
+                    (N * 4, Fill::Iota, Act),
+                    (N * 4, Fill::Zero, Act),
+                    f(N),
+                    f(N),
+                    f(N),
+                    f(N),
+                ],
+                Box::new(|r, b| {
+                    r.moe_bucket_scatter(b[0], b[1], b[2], b[3], b[4], b[5], b[6], Some(b[7]), N, 1)
+                }),
+            ),
+            (
+                "rope",
+                vec![f(N * 16), f(N * 16)],
+                Box::new(|r, b| r.rope(b[0], b[1], ROWS, W, 16, 16, 1e4, 0, None, false, false)),
+            ),
+            (
+                "rope_f16",
+                vec![f(N * 16), f(N * 8)],
+                Box::new(|r, b| r.rope_f16(b[0], b[1], ROWS, W, 16, 16, 1e4, 0, 0, None)),
+            ),
+            (
+                "rope_f16_ff",
+                vec![f(N * 16), f(8), f(N * 8)],
+                Box::new(|r, b| r.rope_f16(b[0], b[2], ROWS, W, 16, 16, 1e4, 0, 0, Some(b[1]))),
+            ),
+            (
+                "rope_f16_dyn",
+                vec![f(N * 16), (8, Fill::Zero, Act), f(N * 8)],
+                Box::new(|r, b| r.rope_f16_dyn(b[0], b[1], b[2], ROWS, W, 16, 16, 1e4, 0, None)),
+            ),
+            (
+                "rope_f16_dyn_ff",
+                vec![f(N * 16), (8, Fill::Zero, Act), f(8), f(N * 8)],
+                Box::new(|r, b| {
+                    r.rope_f16_dyn(b[0], b[1], b[3], ROWS, W, 16, 16, 1e4, 0, Some(b[2]))
+                }),
+            ),
+            (
+                "rope_f16_at",
+                vec![f(N * 16), (N * 32, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[1].device_addr().unwrap();
+                    r.rope_f16_at(b[0], b[1], a, ROWS, W, 16, 16, 1e4, 0, 0, None)
+                }),
+            ),
+            (
+                "rope_f16_ff_at",
+                vec![f(N * 16), f(8), (N * 32, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[2].device_addr().unwrap();
+                    r.rope_f16_at(b[0], b[2], a, ROWS, W, 16, 16, 1e4, 0, 0, Some(b[1]))
+                }),
+            ),
+            (
+                "rope_f16_dyn_at",
+                vec![f(N * 16), (8, Fill::Zero, Act), (N * 32, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[2].device_addr().unwrap();
+                    r.rope_f16_dyn_at(b[0], b[1], b[2], a, ROWS, W, 16, 16, 1e4, 0, None)
+                }),
+            ),
+            (
+                "rope_f16_dyn_ff_at",
+                vec![
+                    f(N * 16),
+                    (8, Fill::Zero, Act),
+                    f(8),
+                    (N * 32, Fill::Data, Kv),
+                ],
+                Box::new(|r, b| {
+                    let a = b[3].device_addr().unwrap();
+                    r.rope_f16_dyn_at(b[0], b[1], b[3], a, ROWS, W, 16, 16, 1e4, 0, Some(b[2]))
+                }),
+            ),
+            (
+                "attention",
+                vec![f(N * 16), f(N * 16), f(N * 16), f(N * 16)],
+                Box::new(|r, b| r.attention(b[0], b[1], b[2], b[3], ROWS, W, W, 16)),
+            ),
+            (
+                "qk_norm_rope",
+                vec![f(UNITS * HD), f(HD), (UNITS * HD * 2, Fill::Data, Act)],
+                Box::new(|r, b| {
+                    r.qk_norm_rope(b[0], b[1], b[2], UNITS, 1, HD, HD, 1e4, 0, 0, 1e-6, None)
+                }),
+            ),
+            (
+                "qk_norm_rope_interleaved",
+                vec![f(2 * UNITS * HD), f(HD), (UNITS * HD * 2, Fill::Data, Act)],
+                Box::new(|r, b| {
+                    r.qk_norm_rope_interleaved(
+                        b[0],
+                        b[1],
+                        b[2],
+                        UNITS,
+                        1,
+                        HD,
+                        HD,
+                        1e4,
+                        0,
+                        0,
+                        1e-6,
+                        2 * HD,
+                    )
+                }),
+            ),
+            (
+                "qk_norm_rope_dyn",
+                vec![
+                    f(UNITS * HD),
+                    f(HD),
+                    (8, Fill::Zero, Act),
+                    (UNITS * HD * 2, Fill::Data, Act),
+                ],
+                Box::new(|r, b| {
+                    r.qk_norm_rope_dyn(
+                        b[0], b[1], b[2], None, b[3], UNITS, 1, HD, HD, 1e4, 0, 1e-6, 0,
+                    )
+                }),
+            ),
+            (
+                "qk_norm_rope_at",
+                vec![f(UNITS * HD), f(HD), (UNITS * HD * 2, Fill::Data, Kv)],
+                Box::new(|r, b| {
+                    let a = b[2].device_addr().unwrap();
+                    r.qk_norm_rope_at(b[0], b[1], b[2], a, UNITS, 1, HD, HD, 1e4, 0, 0, 1e-6, None)
+                }),
+            ),
+            (
+                "attention_kv",
+                vec![f(UNITS * HD), f(UNITS * HD), f(UNITS * HD), f(UNITS * HD)],
+                Box::new(|r, b| {
+                    r.attention_kv(
+                        b[0], b[1], b[2], b[3], UNITS, UNITS, 1, 1, HD, 0, 0, 0.0, false, false, 0,
+                    )
+                }),
+            ),
+            (
+                "attention_kv_at",
+                vec![
+                    f(UNITS * HD),
+                    (UNITS * HD * 2, Fill::Data, Kv),
+                    (UNITS * HD * 2, Fill::Data, Kv),
+                    f(UNITS * HD),
+                ],
+                Box::new(|r, b| {
+                    let (ka, va) = (b[1].device_addr().unwrap(), b[2].device_addr().unwrap());
+                    r.attention_kv_at(
+                        b[0], b[1], b[2], ka, va, b[3], UNITS, UNITS, 1, 1, HD, 0, 0, 0.0, false,
+                        false, 0,
+                    )
+                }),
+            ),
+            (
+                "linear_bf16_at",
+                vec![f(UNITS * HD), (HD * 2, Fill::Data, Kv), f(UNITS)],
+                Box::new(|r, b| {
+                    let a = b[1].device_addr().unwrap();
+                    r.linear_bf16_at(a, b[0], b[2], UNITS, HD, 1)
+                }),
+            ),
+            // One workgroup per row: the rmsnorm family.
+            (
+                "rmsnorm",
+                vec![f(N), f(W), f(N)],
+                Box::new(|r, b| r.rmsnorm(b[0], b[1], b[2], ROWS, W, 1e-6)),
+            ),
+            (
+                "rmsnorm_nw",
+                vec![f(N), f(N)],
+                Box::new(|r, b| r.rmsnorm_nw(b[0], b[1], ROWS, W, 1e-6)),
+            ),
+            (
+                "rmsnorm_f16",
+                vec![(N * 2, Fill::Data, Act), f(W), (N * 2, Fill::Data, Act)],
+                Box::new(|r, b| r.rmsnorm_f16(b[0], b[1], b[2], ROWS, W, 1e-6)),
+            ),
+            (
+                "rmsnorm_gate",
+                vec![f(N), f(W), f(N), f(N)],
+                Box::new(|r, b| r.rmsnorm_gate(b[0], b[1], b[2], b[3], ROWS, W, 1e-6)),
+            ),
+            (
+                "rmsnorm_add",
+                vec![f(N), f(W), f(N)],
+                Box::new(|r, b| r.rmsnorm_add(b[0], b[1], b[2], ROWS, W, 1e-6)),
+            ),
+        ];
+        // Pinned to two PV splits so the non-flash prefill attention reaches `attn_pv_reduce`.
+        let be = be_with(|v| v.pv_splits = Some(2));
+        // These two reach their reduce pass only through a GEMM tier the device may lack.
+        if be.caps().f16_coopmat() {
+            cases.extend::<Vec<(&str, Bufs, Op)>>(vec![
+                (
+                    "splitk_reduce",
+                    vec![
+                        f(64),
+                        (128 * 64 / 32 * 34, Fill::Data, Kv),
+                        f(2 * 64 * 128),
+                        f(64 * 128),
+                    ],
+                    Box::new(|r, b| {
+                        let a = b[1].device_addr().unwrap();
+                        r.matmul_native_splitk(
+                            DType::Q8_0,
+                            b[0],
+                            a,
+                            0,
+                            b[2],
+                            b[3],
+                            1,
+                            64,
+                            128,
+                            2,
+                            false,
+                        )
+                    }),
+                ),
+                (
+                    "attn_pv_reduce",
+                    {
+                        let (mpad, kv_rows) = (64, NONFA_KV_TILE + 64);
+                        vec![
+                            f(mpad * HD / 2),
+                            f(kv_rows * HD / 2),
+                            f(kv_rows * HD / 2),
+                            f(mpad * HD),
+                            f(mpad * NONFA_KV_TILE / 2),
+                            f(8 * mpad * HD),
+                        ]
+                    },
+                    Box::new(|r, b| {
+                        r.attention_prefill_nonfa(
+                            b[0], b[1], b[2], b[3], b[4], b[5], 64, 64, 1, 1, HD, 0, 0, 0.0,
+                        )
+                    }),
+                ),
+            ]);
+        } else {
+            eprintln!(
+                "skip: splitk_reduce and attn_pv_reduce need the f16 cooperative matrix tier"
+            );
+        }
+        let run = |bufs: &[(usize, Fill, BufferUsage)], op: &Op, split: Option<u32>| {
+            let live: Vec<_> = bufs
+                .iter()
+                .enumerate()
+                .map(|(j, (bytes, fill, usage))| {
+                    let b = be.alloc(bytes + GUARD, *usage).unwrap();
+                    let words: Vec<u32> = (0..bytes.div_ceil(4))
+                        .map(|i| match fill {
+                            Fill::Data => (((i * 37 + j * 11) % 97) as f32 * 0.02 - 0.9).to_bits(),
+                            Fill::Zero => 0,
+                            Fill::Iota => i as u32,
+                        })
+                        .collect();
+                    let mut init = bytemuck::cast_slice::<u32, u8>(&words)[..*bytes].to_vec();
+                    init.extend(SENTINEL.to_ne_bytes().iter().cycle().take(GUARD));
+                    be.upload(b.as_ref(), &init).unwrap();
+                    b
+                })
+                .collect();
+            WIDE_SPLIT_AT.with(|c| c.set(split));
+            WIDE_SPLITS.with(|c| c.set(0));
+            let rec = be.recorder().unwrap();
+            let refs: Vec<&dyn Buffer> = live.iter().map(|b| b.as_ref()).collect();
+            op(&rec, &refs);
+            rec.finish().unwrap();
+            WIDE_SPLIT_AT.with(|c| c.set(None));
+            let out: Vec<Vec<u8>> = live
+                .iter()
+                .zip(bufs)
+                .map(|(b, (bytes, ..))| {
+                    let mut v = vec![0u8; bytes + GUARD];
+                    be.download(b.as_ref(), &mut v).unwrap();
+                    v
+                })
+                .collect();
+            (out, WIDE_SPLITS.with(Cell::get))
+        };
+        let guard_intact = |name: &str, out: &[Vec<u8>], bufs: &Bufs| {
+            for (i, (v, (bytes, ..))) in out.iter().zip(bufs).enumerate() {
+                let (tail, _) = v[*bytes..].as_chunks::<4>();
+                assert!(
+                    tail.iter().all(|w| *w == SENTINEL.to_ne_bytes()),
+                    "{name}: buffer {i} was written past its declared size"
+                );
+            }
+        };
+        for (name, bufs, op) in &cases {
+            let (whole, _) = run(bufs, op, None);
+            let (split, n_split) = run(bufs, op, Some(SPLIT_AT));
+            assert!(n_split > 0, "{name}: the grid was never split");
+            guard_intact(name, &whole, bufs);
+            guard_intact(name, &split, bufs);
+            assert!(
+                whole == split,
+                "{name}: the split grid wrote different bytes"
+            );
+        }
+    }
+
+    /// The non-coopmat prefill GEMMs (`matmul_mmq_at`, `matmul_fma_at`) index their tile grid by
+    /// `gl_WorkGroupID.x` alone, so a tile count past the guaranteed x limit must be refused by
+    /// name, not dispatched. With the split point lowered, each nc arm the device offers must run
+    /// a GEMM whose grid sits exactly at the limit and refuse one a single tile past it.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn nc_gemm_grid_past_the_x_limit_is_refused() {
+        use infr_core::backend::Bindings;
+        use infr_core::graph::{Graph, Op};
+        use infr_core::tensor::TensorDesc;
+        use infr_core::DType;
+        // Lowered split point; the GEMM tile is 64x64.
+        const SPLIT_AT: u32 = 3;
+        const IN_F: usize = 64;
+        let be = be_with(|v| v.coopmat = false);
+        assert!(!be.caps().f16_coopmat(), "the nc tier needs coopmat off");
+        let run = |dt: DType, m: usize, out_f: usize| -> infr_core::error::Result<()> {
+            let mut g = Graph::new();
+            let x = g.input(TensorDesc::new(vec![m, IN_F], DType::F32));
+            let w = g.weight(TensorDesc::new(vec![out_f, IN_F], dt));
+            let y = g.output(TensorDesc::new(vec![m, out_f], DType::F32));
+            g.push(Op::Linear {
+                x,
+                weight: w,
+                dst: y,
+                m: m as u32,
+                in_f: IN_F as u32,
+                out_f: out_f as u32,
+                w_off: 0,
+            });
+            let (blk_elems, blk_bytes) = infr_core::decode_spec::block_layout(dt);
+            let xb = be.alloc(m * IN_F * 4, BufferUsage::Activations)?;
+            let wb = be.alloc(out_f * IN_F / blk_elems * blk_bytes, BufferUsage::Weights)?;
+            let yb = be.alloc(m.div_ceil(64) * 64 * out_f * 4, BufferUsage::Activations)?;
+            let mut bind = Bindings::new();
+            bind.bind(x, xb.as_ref())
+                .bind(w, wb.as_ref())
+                .bind(y, yb.as_ref());
+            WIDE_SPLIT_AT.with(|c| c.set(Some(SPLIT_AT)));
+            let res = be
+                .compile(&g)
+                .and_then(|plan| be.execute(plan.as_ref(), &bind));
+            WIDE_SPLIT_AT.with(|c| c.set(None));
+            res
+        };
+        let mut arms = vec![DType::F16];
+        if be.caps().i8_dot {
+            arms.push(DType::Q8_0);
+        } else {
+            eprintln!("skip: the dp4a mmq arm needs packed int8 dot");
+        }
+        for dt in arms {
+            let at_limit = SPLIT_AT as usize;
+            run(dt, 64 * at_limit, 64)
+                .unwrap_or_else(|e| panic!("{dt:?}: a grid at the limit must still run: {e}"));
+            let e = run(dt, 64 * (at_limit + 1), 64)
+                .expect_err(&format!("{dt:?}: a grid past the limit was dispatched"))
+                .to_string();
+            assert!(
+                e.contains("non-coopmat prefill GEMM") && e.contains("needs 4 workgroups"),
+                "{dt:?}: refused for another reason: {e}"
+            );
+        }
     }
 
     /// #1 drift guard: `kernels.vulkan.gemv` must resolve, for any env state, EXACTLY what the
@@ -11510,7 +12713,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!("attention_kv q_len={q_len} kv_len={kv_len} max_err={err:e}");
         assert!(err < 5e-3, "attention_kv mismatch: {err}");
     }
@@ -11575,7 +12778,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!("attn_kv_split kv_len={kv_len} n_chunks={n_chunks} win={win} max_err={err:e}");
         assert!(err < 5e-3, "split mismatch: {err}");
     }
@@ -11615,12 +12818,12 @@ mod tests {
         let pacc = be
             .alloc(nh * n_chunks * hd * 4, BufferUsage::Activations)
             .unwrap();
-        let params = be.alloc(24, BufferUsage::Activations).unwrap();
-        let mut pb = [0u32; 6];
-        pb[0] = pos_offset as u32;
-        pb[1] = kv_len as u32;
-        be.upload(params.as_ref(), bytemuck::cast_slice(&pb))
-            .unwrap();
+        let params = be.alloc(8, BufferUsage::Activations).unwrap();
+        be.upload(
+            params.as_ref(),
+            bytemuck::cast_slice(&[pos_offset as u32, kv_len as u32]),
+        )
+        .unwrap();
         let args = be.alloc(16, BufferUsage::Activations).unwrap();
         let rec = be.recorder().unwrap();
         rec.attn_live_prologue(params.as_ref(), args.as_ref(), nh, chunk, win);
@@ -11653,7 +12856,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!(
             "attn_kv_split_dynac kv={kv_len} cap={cap} n_chunks={n_chunks} win={win} max_err={err:e}"
         );
@@ -11827,7 +13030,7 @@ mod tests {
             for h in 0..nheads {
                 for i in 0..hd {
                     let idx = ((out_base + r) * nheads + h) * hd + i;
-                    err = err.max((got[idx] - want[idx]).abs());
+                    err = infr_testkit::nan_max(err, (got[idx] - want[idx]).abs());
                 }
             }
         }
@@ -11854,6 +13057,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_nonfa_matches_cpu() {
         let be = be_with(|_| {});
+        if !crate::test_has_f16_coopmat(&be, "attention_prefill_nonfa_matches_cpu") {
+            return;
+        }
         // hd=128 (qwen3), full causal, default scale — the pre-existing regression cases.
         run_attn_prefill_nonfa(&be, 64, 64, 2, 1, 128, 0, 0.0);
         run_attn_prefill_nonfa(&be, 128, 200, 4, 2, 128, 0, 0.0);
@@ -11873,6 +13079,45 @@ mod tests {
         run_attn_prefill_nonfa(&split, 128, 500, 2, 1, 128, 0, 0.0);
         run_attn_prefill_nonfa(&split, 128, 3000, 16, 8, 256, 200, 1.0); // SWA, long kv, split-K
         run_attn_prefill_nonfa(&split, 128, 3000, 16, 1, 512, 0, 1.0); // hd=512, long kv, split-K
+    }
+
+    /// A split override of zero falls back to the adaptive policy, like an out-of-range one,
+    /// instead of reaching the `ksplit` division.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn attention_zero_split_override_falls_back() {
+        let zero = be_with(|v| {
+            v.pv_splits = Some(0);
+            v.flash_splits = Some(0);
+        });
+        if !crate::test_has_f16_coopmat(&zero, "attention_zero_split_override_falls_back") {
+            return;
+        }
+        run_attn_prefill_nonfa(&zero, 70, 300, 4, 2, 128, 0, 0.0);
+        run_attn_prefill_flash(&zero, 128, 500, 2, 1, 128);
+        run_attn_flash_reg(&zero, 200, 600, 2, 1, 128);
+    }
+
+    /// With push descriptors every binding goes into the command buffer, so a recorder there
+    /// creates no descriptor pool.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn push_descriptor_recorder_creates_no_pool() {
+        let be = be_with(|_| {});
+        if be.shared.push_descriptor.is_none() {
+            eprintln!(
+                "skip: push_descriptor_recorder_creates_no_pool needs VK_KHR_push_descriptor"
+            );
+            return;
+        }
+        let y = be.alloc(64 * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        rec.scale(y.as_ref(), 2.0, 64);
+        assert!(
+            rec.pools.borrow().is_empty(),
+            "push-descriptor recorder created a pool"
+        );
+        rec.finish().unwrap();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -11940,7 +13185,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!("attn_prefill_nonfa q_len={q_len} kv_len={kv_len} max_err={err:e}");
         assert!(err < 5e-3, "attn_prefill_nonfa mismatch: {err}");
     }
@@ -11949,6 +13194,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_flash_matches_cpu() {
         let be = be_with(|_| {});
+        if !crate::test_has_f16_coopmat(&be, "attention_prefill_flash_matches_cpu") {
+            return;
+        }
         for &(q, kv, nh, nkv, hd) in &[
             (64usize, 64usize, 2usize, 1usize, 128usize),
             (128, 200, 4, 2, 128),
@@ -12042,7 +13290,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!("attn_prefill_flash q_len={q_len} kv_len={kv_len} max_err={err:e}");
         assert!(err < 5e-3, "attn_prefill_flash mismatch: {err}");
     }
@@ -12128,6 +13376,9 @@ mod tests {
             v.flash_warp = false;
             v.flash_splits = Some(2);
         });
+        if !crate::test_has_f16_coopmat(&be, "attn_flash_stage_dequant_parity") {
+            return;
+        }
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
@@ -12290,6 +13541,9 @@ mod tests {
         // reduce is covered in addition to the n_splits==1 warp path. Its own backend, so the knob
         // cannot collide with `attn_flash_stage_dequant_parity` running in parallel.
         let be = be_with(|v| v.flash_splits = Some(2));
+        if !crate::test_has_f16_coopmat(&be, "attn_flash_warp_dequant_parity") {
+            return;
+        }
         let gen = |n: usize, salt: usize| -> Vec<f32> {
             (0..n)
                 .map(|i| (((i * 13 + salt) % 29) as f32 - 14.0) * 0.05)
@@ -12497,6 +13751,9 @@ mod tests {
                 "bm=32 tile",
             ),
         ];
+        if !crate::test_has_f16_coopmat(&cases[0].0, "attn_flash_coopmat_bda_parity") {
+            return;
+        }
         for &(q_len, kv_len, nh, nkv) in &[
             (128usize, 512usize, 8usize, 2usize),
             (64, 256, 4, 4),
@@ -12641,6 +13898,12 @@ mod tests {
         run_attn_nc_fa(100, 300, 4, 2, 128, 64, 1.0, None);
         // hd=64 (BK tail guards: hd < the build's HD_MAX)
         run_attn_nc_fa(80, 300, 9, 3, 64, 0, 0.0, None);
+        // Head dims off the 64-dim V chunk, hd128 build: 96 leaves the second V chunk half
+        // full; 80 leaves a partial QK chunk as well, here windowed.
+        run_attn_nc_fa(100, 300, 4, 2, 96, 0, 0.0, None);
+        run_attn_nc_fa(100, 300, 4, 1, 80, 64, 0.0, None);
+        // hd256 build at 192: the build's last V chunk lies wholly past the head and is skipped.
+        run_attn_nc_fa(96, 288, 8, 4, 192, 0, 0.0, None);
         // hd256 build, windowed (gemma4 SWA shape)
         run_attn_nc_fa(96, 400, 8, 4, 256, 128, 1.0, None);
         // hd512 build (BM=16 tile)
@@ -12717,7 +13980,6 @@ mod tests {
                 window,
                 scale,
                 cap,
-                None,
             );
         }
         rec.finish().unwrap();
@@ -12746,7 +14008,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!(
             "attn_nc_fa q={q_len} kv={kv_len} nh={nh}/{nkv} hd={hd} win={window} \
              ring={ring_rows:?} max_err={err:e}"
@@ -12758,6 +14020,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn attention_prefill_flash_reg_matches_cpu() {
         let be = be_with(|_| {});
+        if !crate::test_has_f16_coopmat(&be, "attention_prefill_flash_reg_matches_cpu") {
+            return;
+        }
         for &(q, kv, nh, nkv) in &[
             (128usize, 128usize, 4usize, 2usize),
             (128, 300, 2, 1),
@@ -12835,7 +14100,7 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         println!("attn_flash_reg q_len={q_len} kv_len={kv_len} nh={nh} max_err={err:e}");
         assert!(err < 5e-3, "attn_flash_reg mismatch: {err}");
     }
@@ -12940,7 +14205,7 @@ mod tests {
         for r in 0..m {
             for col in 0..n {
                 let want: f32 = (0..k).map(|x| a[r * k + x] * dq(col * k + x)).sum();
-                e = e.max((got[r * n + col] - want).abs());
+                e = infr_testkit::nan_max(e, (got[r * n + col] - want).abs());
             }
         }
         println!("native_gemm_mmq_q6k max_err={e:e}");
@@ -12951,6 +14216,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn matmul_proj_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if !crate::test_has_f16_coopmat(&be, "matmul_proj_matches_cpu") {
+            return;
+        }
         let (m, k, n) = (800usize, 64usize, 256usize); // m≥768 & not %64 → warp path + padding; n%256
         let mpad = m.div_ceil(64) * 64;
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
@@ -12970,7 +14238,7 @@ mod tests {
             for r in 0..m {
                 for col in 0..n {
                     let want: f32 = (0..k).map(|x| a[r * k + x] * w[col * k + x]).sum();
-                    e = e.max((c[r * n + col] - want).abs());
+                    e = infr_testkit::nan_max(e, (c[r * n + col] - want).abs());
                 }
             }
             println!("matmul_proj {label} max_err={e:e}");
@@ -12999,6 +14267,9 @@ mod tests {
     #[ignore = "requires a Vulkan GPU"]
     fn matmul_native_splitk_f16_matches_cpu() {
         let be = VulkanBackend::new().unwrap();
+        if !crate::test_has_f16_coopmat(&be, "matmul_native_splitk_f16_matches_cpu") {
+            return;
+        }
         let (m, k, n, splits) = (70usize, 2048usize, 256usize, 4usize);
         let mpad = m.div_ceil(64) * 64;
         let a: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.05).collect();
@@ -13038,7 +14309,7 @@ mod tests {
         for r in 0..m {
             for col in 0..n {
                 let want: f32 = (0..k).map(|x| a[r * k + x] * w[col * k + x]).sum();
-                e = e.max((got[r * n + col] - want).abs());
+                e = infr_testkit::nan_max(e, (got[r * n + col] - want).abs());
             }
         }
         println!("matmul_native_splitk f16 max_err={e:e}");
@@ -13058,6 +14329,9 @@ mod tests {
         ];
         let be = VulkanBackend::new().unwrap();
         let (m, k, n_max) = (70usize, 1024usize, 16384usize);
+        if !crate::test_has_f16_coopmat(&be, "native_gemm_warp_iq4nl_matches_cpu") {
+            return;
+        }
         let mpad = m.div_ceil(64) * 64;
         let a: Vec<f32> = (0..m * k)
             .map(|i| half::f16::from_f32(((i % 23) as f32 - 11.0) * 0.04).to_f32())
@@ -13096,7 +14370,7 @@ mod tests {
             for r in 0..m {
                 for col in 0..n {
                     let want: f32 = (0..k).map(|x| a[r * k + x] * dq(col * k + x)).sum();
-                    e = e.max((got[r * n + col] - want).abs());
+                    e = infr_testkit::nan_max(e, (got[r * n + col] - want).abs());
                 }
             }
             println!("native_gemm_warp_iq4nl {label} max_err={e:e}");
@@ -13319,7 +14593,7 @@ mod tests {
     /// selection, not over the first pick.
     ///
     /// A router bias breaks the "first pick carries the largest logit" assumption — selection is by
-    /// `logit + bias`, weights come from the unbiased logits — so the first pick can be an expert
+    /// `prob + bias`, weights come from the unbiased logits — so the first pick can be an expert
     /// whose logit is far BELOW another selected one. Shifting by the first pick's logit then makes
     /// `exp(logit - shift)` overflow to `+inf`, and under `norm_w` the renormalization divides
     /// `inf/inf` = NaN. The gap here (0 vs 100) is synthetic: this is the hazard the shift protects
@@ -13373,7 +14647,7 @@ mod tests {
         let mut wb = vec![0u8; n_tokens * n_used * 4];
         be.download(bwts.as_ref(), &mut wb).unwrap();
         let wts: &[f32] = bytemuck::cast_slice(&wb);
-        // Selection is by `logit + bias`: 200 beats 100 beats the rest.
+        // Selection is by `prob + bias`: expert 0's ~0 + 200 beats expert 1's ~1, then the rest.
         assert_eq!(ids, &[0u32, 1], "selection order changed: {ids:?}");
         // Weights come from the UNBIASED logits, renormalized over the selection: expert 1's 100
         // dominates expert 0's 0, so the pair is ~[0, 1].
@@ -13392,6 +14666,96 @@ mod tests {
         );
     }
 
+    /// `moe_topk`'s workgroup arg-max must pick (highest score, then LOWEST expert id) in slot
+    /// order — the order the host router and the CPU interpreter use — whichever lane, chunk and
+    /// subgroup the candidates live in. 160 experts put each lane on two chunks (`t`, `t+128`),
+    /// and the tied maxima sit in different subgroups at every subgroup size the device may pick
+    /// (ids 3, 70, 130 tie; 40 and 100 tie one step lower), so a reduction that drops the id
+    /// tie-break, or keeps only one subgroup's candidate, picks a different id or order. A second
+    /// row runs the biased-softmax selection (ERNIE 4.5's `sel_by_prob` path) on well-separated
+    /// scores, with the weights checked against the renormalized softmax.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn moe_topk_selects_by_score_then_lowest_id() {
+        let be = be_with(|_| {});
+        let (n_expert, n_used) = (160usize, 6usize);
+        let run = |logits: &[f32], bias: &[f32], has_bias: bool| -> (Vec<u32>, Vec<f32>) {
+            let blog = upf32(&be, logits);
+            let bbias = upf32(&be, bias);
+            let bids = be.alloc(n_used * 4, BufferUsage::Readback).unwrap();
+            let bwts = be.alloc(n_used * 4, BufferUsage::Readback).unwrap();
+            let rec = be.recorder().unwrap();
+            rec.moe_topk(
+                blog.as_ref(),
+                bids.as_ref(),
+                bwts.as_ref(),
+                bbias.as_ref(),
+                1,
+                n_expert,
+                n_used,
+                1.0,
+                0, // softmax
+                true,
+                has_bias,
+                0,
+                0,
+                bbias.as_ref(),
+                false,
+            )
+            .unwrap();
+            rec.finish().unwrap();
+            let mut idb = vec![0u8; n_used * 4];
+            be.download(bids.as_ref(), &mut idb).unwrap();
+            let mut wb = vec![0u8; n_used * 4];
+            be.download(bwts.as_ref(), &mut wb).unwrap();
+            (
+                bytemuck::cast_slice::<u8, u32>(&idb).to_vec(),
+                bytemuck::cast_slice::<u8, f32>(&wb).to_vec(),
+            )
+        };
+
+        // Ties on raw logits (no bias: softmax selection ranks the logits themselves).
+        let mut logits: Vec<f32> = (0..n_expert).map(|e| (e as f32 * 0.37).sin()).collect();
+        for e in [3usize, 70, 130] {
+            logits[e] = 5.0;
+        }
+        for e in [100usize, 40] {
+            logits[e] = 4.0;
+        }
+        logits[159] = 3.0;
+        let (ids, wts) = run(&logits, &vec![0.0; n_expert], false);
+        assert_eq!(ids, [3, 70, 130, 40, 100, 159], "tie order: {ids:?}");
+        let ex: Vec<f32> = ids
+            .iter()
+            .map(|&e| (logits[e as usize] - 5.0).exp())
+            .collect();
+        let sum: f32 = ex.iter().sum();
+        for (w, e) in wts.iter().zip(&ex) {
+            assert!((w - e / sum).abs() < 1e-6, "weights {wts:?}");
+        }
+
+        // Biased softmax (ERNIE 4.5): the bias reorders the selection, the weights stay unbiased.
+        let logits: Vec<f32> = (0..n_expert).map(|e| (e as f32 * 0.21).cos()).collect();
+        let mut bias = vec![0.0f32; n_expert];
+        for (rank, e) in [150usize, 7, 128, 64, 1, 99].into_iter().enumerate() {
+            bias[e] = 10.0 - rank as f32;
+        }
+        let (ids, wts) = run(&logits, &bias, true);
+        assert_eq!(ids, [150, 7, 128, 64, 1, 99], "biased order: {ids:?}");
+        let mx = ids
+            .iter()
+            .map(|&e| logits[e as usize])
+            .fold(f32::MIN, f32::max);
+        let ex: Vec<f32> = ids
+            .iter()
+            .map(|&e| (logits[e as usize] - mx).exp())
+            .collect();
+        let sum: f32 = ex.iter().sum();
+        for (w, e) in wts.iter().zip(&ex) {
+            assert!((w - e / sum).abs() < 1e-6, "biased weights {wts:?}");
+        }
+    }
+
     /// First run of digits after `marker` — `128` from `layout(local_size_x = 128,`, `8` from
     /// `#define MAX_CHUNKS 8u`. (`adapter.rs`'s `glsl_define_u32` cannot read the latter: GLSL's
     /// `u` suffix is not part of a `u32`.)
@@ -13404,6 +14768,138 @@ mod tests {
         digits
             .parse()
             .unwrap_or_else(|e| panic!("no u32 after `{marker}`: {e}"))
+    }
+
+    /// The embed gather folds a table into its 64-bit base once either u32 addressing unit runs
+    /// out. A 16-bit table's BYTE offsets wrap at half its element cap (two bytes per element), so
+    /// the element count alone would keep a wrapping table on the u32 path.
+    #[test]
+    fn embed_gather_folds_on_either_addressing_cap() {
+        let caps = (BDA_CHUNK_UNIT_MAX, BDA_CHUNK_UNIT_MAX);
+        let ne = 4096usize;
+        let f16_rows = (BDA_CHUNK_UNIT_MAX / (ne as u64 * 2)) as usize;
+        assert!(
+            embed_gather_folds(f16_rows, ne, ne * 2, caps),
+            "f16 at the byte cap"
+        );
+        assert!(
+            !embed_gather_folds(f16_rows - 1, ne, ne * 2, caps),
+            "f16 under both caps"
+        );
+        // Q8_0 (34 bytes per 32 elements) reaches the byte cap first too.
+        let q8_stride = ne / 32 * 34;
+        let q8_rows = BDA_CHUNK_UNIT_MAX.div_ceil(q8_stride as u64) as usize;
+        assert!((q8_rows as u64) * (ne as u64) < BDA_CHUNK_UNIT_MAX);
+        assert!(embed_gather_folds(q8_rows, ne, q8_stride, caps), "Q8_0");
+        // A 4-bit table reaches the element cap long before the byte cap.
+        let q4_stride = ne / 32 * 18;
+        assert!(embed_gather_folds(
+            (BDA_CHUNK_UNIT_MAX / ne as u64) as usize,
+            ne,
+            q4_stride,
+            caps
+        ));
+        assert!(!embed_gather_folds(1000, ne, q4_stride, caps));
+    }
+
+    /// The 64-bit row fold an f16 table takes at the BYTE cap gathers the same rows as the u32
+    /// element path. The byte cap is lowered under the table's size (elements left at the real
+    /// cap), so the small table takes the fold `embed_gather_folds` now routes byte-capped tables
+    /// to.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn embed_gather_f16_byte_cap_fold_matches_the_element_path() {
+        use infr_core::backend::BufferUsage;
+        let be = be_with(|_| {});
+        let (n_rows, ne) = (16usize, 256usize);
+        let table: Vec<half::f16> = (0..n_rows * ne)
+            .map(|i| half::f16::from_f32((i as f32 * 0.37).sin()))
+            .collect();
+        let w = be.alloc(n_rows * ne * 2, BufferUsage::Weights).unwrap();
+        let bytes: Vec<u8> = table.iter().flat_map(|v| v.to_le_bytes()).collect();
+        be.upload(w.as_ref(), &bytes).unwrap();
+        let ids: [i32; 4] = [3, 0, 7, 12];
+        let id_buf = be.alloc(ids.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(id_buf.as_ref(), bytemuck::cast_slice(&ids))
+            .unwrap();
+        let byte_cap = (n_rows * ne * 2 / 2) as u64;
+        assert!(embed_gather_folds(
+            n_rows,
+            ne,
+            ne * 2,
+            (BDA_CHUNK_UNIT_MAX, byte_cap)
+        ));
+        let run = |fold: bool| -> Vec<f32> {
+            let y = be
+                .alloc(ids.len() * ne * 4, BufferUsage::Activations)
+                .unwrap();
+            let rec = be.recorder().unwrap();
+            let go = || {
+                rec.embed_gather(
+                    infr_core::DType::F16,
+                    w.as_ref(),
+                    id_buf.as_ref(),
+                    y.as_ref(),
+                    ids.len(),
+                    ne,
+                    1.0,
+                )
+                .unwrap()
+            };
+            if fold {
+                with_bda_chunk_caps(BDA_CHUNK_UNIT_MAX, byte_cap, go);
+            } else {
+                go();
+            }
+            rec.finish().unwrap();
+            let mut out = vec![0f32; ids.len() * ne];
+            be.download(y.as_ref(), bytemuck::cast_slice_mut(&mut out))
+                .unwrap();
+            out
+        };
+        let want: Vec<f32> = ids
+            .iter()
+            .flat_map(|&r| table[r as usize * ne..(r as usize + 1) * ne].iter())
+            .map(|v| v.to_f32())
+            .collect();
+        assert_eq!(run(false), want, "element-offset path");
+        assert_eq!(run(true), want, "64-bit row fold");
+    }
+
+    /// Lowered addressing caps (`INFR_BDA_CHUNK_BYTES`) can push any table onto the 64-bit row
+    /// fold; one whose row stride is not word-aligned (Q4_0 at ne=32: 18 bytes) is refused with an
+    /// error the caller can return, never a panic.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn embed_gather_refuses_a_forced_fold_on_an_unaligned_row() {
+        use infr_core::backend::BufferUsage;
+        let be = be_with(|_| {});
+        let (n_rows, ne) = (16usize, 32usize);
+        let (be_blk, bb) = infr_gguf::block_layout(infr_core::DType::Q4_0);
+        let stride = ne / be_blk * bb;
+        assert!(!stride.is_multiple_of(4));
+        let w = be.alloc(n_rows * stride, BufferUsage::Weights).unwrap();
+        be.upload(w.as_ref(), &vec![0u8; n_rows * stride]).unwrap();
+        let ids = be.alloc(4, BufferUsage::Activations).unwrap();
+        be.upload(ids.as_ref(), &0i32.to_le_bytes()).unwrap();
+        let y = be.alloc(ne * 4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        let err = with_bda_chunk_caps(BDA_CHUNK_UNIT_MAX, 64, || {
+            rec.embed_gather(
+                infr_core::DType::Q4_0,
+                w.as_ref(),
+                ids.as_ref(),
+                y.as_ref(),
+                1,
+                ne,
+                1.0,
+            )
+        })
+        .expect_err("a forced fold on an unaligned row must be refused");
+        assert!(
+            err.to_string().contains("non-word-aligned row stride"),
+            "{err}"
+        );
     }
 
     /// `MOE_TOPK_MAX_EXPERTS` is the host's copy of `moe_topk.comp`'s `ssel_adj` capacity, and
@@ -13426,6 +14922,68 @@ mod tests {
             src.contains("shared float ssel_adj[gl_WorkGroupSize.x * MAX_CHUNKS];"),
             "moe_topk.comp's ssel_adj is no longer sized by the scan's own headroom"
         );
+    }
+
+    /// `MOE_TOPK_MAX_GROUPS` is the host's copy of the shader's per-group array size; read it back
+    /// out of the shader text, and check both arrays are still declared through it.
+    #[test]
+    fn moe_topk_group_bound_matches_host() {
+        let src = include_str!("../shaders/moe_topk.comp");
+        assert_eq!(
+            glsl_u32_after(src, "#define MOE_TOPK_MAX_GROUPS "),
+            MOE_TOPK_MAX_GROUPS as usize,
+            "moe_topk.comp's MOE_TOPK_MAX_GROUPS drifted from the host guard"
+        );
+        for decl in [
+            "float gscore[MOE_TOPK_MAX_GROUPS];",
+            "bool chosen[MOE_TOPK_MAX_GROUPS];",
+        ] {
+            assert!(
+                src.contains(decl),
+                "moe_topk.comp no longer declares `{decl}`"
+            );
+        }
+    }
+
+    /// Group-limited routing past the shader's group arrays, or with a group count that leaves
+    /// experts outside every group, is refused at record time; a count that fits and divides is
+    /// not.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn moe_topk_refuses_groups_it_cannot_route() {
+        let be = be_with(|_| {});
+        let dummy = be.alloc(4, BufferUsage::Activations).unwrap();
+        let rec = be.recorder().unwrap();
+        let call = |n_expert: usize, groups: u32| {
+            rec.moe_topk(
+                dummy.as_ref(),
+                dummy.as_ref(),
+                dummy.as_ref(),
+                dummy.as_ref(),
+                1,
+                n_expert,
+                1,
+                1.0,
+                0,
+                false,
+                false,
+                groups,
+                1,
+                dummy.as_ref(),
+                false,
+            )
+        };
+        let over = MOE_TOPK_MAX_GROUPS + 1;
+        let err = call(over as usize * 2, over).unwrap_err().to_string();
+        assert!(err.contains("MOE_TOPK_MAX_GROUPS"), "{err}");
+        let err = call(12, 5).unwrap_err().to_string();
+        assert!(err.contains("not divisible by n_expert_groups"), "{err}");
+        if let Err(e) = call(MOE_TOPK_MAX_GROUPS as usize * 4, MOE_TOPK_MAX_GROUPS) {
+            assert!(
+                !e.to_string().contains("n_expert_groups"),
+                "the ceiling itself must not be refused: {e}"
+            );
+        }
     }
 
     /// The host guard refuses above the ceiling rather than dispatching a shader that would run
@@ -13472,9 +15030,10 @@ mod tests {
     }
 
     /// MLA (DeepSeek V2/V3 absorbed form) on the REAL Vulkan path, vs a CPU reference — the
-    /// smallest possible dispatch of `recorder.mla` (no model, no seam). Mirrors `mla_parity`'s
-    /// synthetic inputs in infr-llama/tests/seam_op_parity.rs. This is the regression test for the
-    /// "logical device has been lost" hang the kernel caused on RDNA3 (see the .comp's header).
+    /// smallest possible dispatch of `recorder.mla` (no model, no seam), on the DeepSeek-sized
+    /// shape `mla_parity` in infr-llama/tests/seam_op_parity.rs uses. This is the regression test
+    /// for the "logical device has been lost" hang the kernel caused on RDNA3 (see the .comp's
+    /// header).
     ///
     /// Run against BOTH tiers. They are separate SPIR-V with separate reductions and separate
     /// softmax structure (`mla.comp`'s `-DMLA_SG`), and the shipped default only ever dispatches
@@ -13519,22 +15078,24 @@ mod tests {
                 wv[off + a * vhd + a] = 1.0;
             }
         }
-        // Same synthetic inputs as the CPU mla_parity test (see seam_op_parity.rs).
-        let qi: Vec<f32> = (1..=((rows * nh * q_head_dim) as i32))
-            .map(|x| x as f32)
+        // Small, signed inputs, so the two keys' scores land within a few units of each other and
+        // the softmax actually weighs them. With inputs in the thousands the scores sit orders of
+        // magnitude apart, the softmax is a hard argmax, and the output is the winner's V whatever
+        // the scores are — a kernel that mis-scaled every score then passed at an error of 0.
+        let qi: Vec<f32> = (0..rows * nh * q_head_dim)
+            .map(|i| ((i % 17) as f32 - 8.0) / 2.0)
             .collect();
-        // Random-but-deterministic K rows (xorshift, values < 2048 so the f16 cache cast is exact):
-        // a fixed column pattern (10+col) makes every key row a constant shift of the others, and
-        // with a near-one-hot softmax the output then collapses to the winner's V regardless of q —
-        // which accidentally made the output invariant to a transposed wk_b. Random rows make the
-        // scores, and hence the output, genuinely depend on the absorbed query.
+        // Random-but-deterministic K rows (xorshift, multiples of 1/1024 below 1 in magnitude, so
+        // the f16 cache cast is exact): a fixed column pattern makes every key row a constant
+        // shift of the others, which once made the output invariant to a transposed wk_b. Random
+        // rows make the scores, and hence the output, genuinely depend on the absorbed query.
         let mut state = 0x1234_5678u32;
         let mut ki = Vec::with_capacity(cap_rows * key_len);
         for _ in 0..cap_rows * key_len {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            ki.push((state % 1999) as f32);
+            ki.push(((state % 1999) as f32 - 999.0) / 1024.0);
         }
         let bq = upf32(&be, &qi);
         let bwk = upf32(&be, &wk);
@@ -13639,10 +15200,10 @@ mod tests {
             .iter()
             .zip(&want)
             .map(|(a, b)| (a - b).abs())
-            .fold(0f32, f32::max);
+            .fold(0f32, infr_testkit::nan_max);
         let tier = if sg { "mla_sg" } else { "mla" };
         println!("mla vulkan {tier} max_err={err:e}");
-        assert!(err < 1e-3, "MLA vulkan {tier} diverges: max_err={err:e}");
+        assert!(err < 1e-4, "MLA vulkan {tier} diverges: max_err={err:e}");
     }
 
     /// One `mla_ring_and_mask_matches_cpu_reference` case.
@@ -13941,7 +15502,7 @@ mod tests {
                 .iter()
                 .zip(&want)
                 .map(|(a, b)| (a - b).abs())
-                .fold(0f32, f32::max);
+                .fold(0f32, infr_testkit::nan_max);
             let tier = if sg { "mla_sg" } else { "mla" };
             println!(
                 "mla vulkan {tier} {}: max_err={err:e}\n  got ={got:?}\n  want={want:?}",

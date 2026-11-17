@@ -15,7 +15,6 @@ infr-vulkan.workspace = true
 infr-metal.workspace = true
 infr-gguf.workspace = true
 infr-cpu.workspace = true
-infr-safetensors.workspace = true
 serde_json.workspace = true
 llguidance.workspace = true
 toktrie_hf_tokenizers.workspace = true
@@ -23,12 +22,9 @@ half.workspace = true
 bytemuck.workspace = true
 anyhow.workspace = true
 rayon.workspace = true
-gemm.workspace = true
-image.workspace = true
 tracing.workspace = true
 tokenizers = { workspace = true }
 
 [dev-dependencies]
 infr-hub.workspace = true
-tempfile = "3"
-tracing-subscriber.workspace = true
+infr-testkit.workspace = true

@@ -111,7 +111,6 @@ fn default_config_matches_documented_defaults() {
     // A per-request wall-clock deadline is OFF unless the operator asks for one: it truncates a
     // legitimate slow reply, so it cannot be a shipped default.
     assert_eq!(d.serve.request_timeout_secs, 0);
-    assert_eq!(d.serve.idle_timeout_secs, 0);
     // The periodic throughput line is ON by default (it is a log line, not a policy) and reports
     // every 5 s — but only for intervals in which something happened.
     assert_eq!(d.serve.stats_interval_secs, 5);
@@ -533,28 +532,6 @@ fn non_presence_grammars_are_preserved() {
         0,
         "an explicit 0 in the environment must switch off a stats line the file turned on"
     );
-}
-
-#[test]
-fn serve_idle_timeout_layers_and_zero_disables() {
-    for (value, want) in [("0", 0u64), ("300", 300)] {
-        let cfg = Config::load_from_layers(&[env_layer(&[("INFR_SERVE_IDLE_SECS", value)])]);
-        assert_eq!(cfg.serve.idle_timeout_secs, want);
-    }
-    let cfg = Config::load_from_layers(&[
-        file_layer("[serve]\nidle_timeout_secs = 120\n"),
-        env_layer(&[("INFR_SERVE_IDLE_SECS", "0")]),
-    ]);
-    assert_eq!(cfg.serve.idle_timeout_secs, 0);
-    let cfg = Config::load_from_layers(&[file_layer("[serve]\nidle_timeout_secs = 120\n")]);
-    assert_eq!(cfg.serve.idle_timeout_secs, 120);
-    for value in ["-1", "bad", "18446744073709551616"] {
-        let cfg = Config::load_from_layers(&[
-            file_layer("[serve]\nidle_timeout_secs = 120\n"),
-            env_layer(&[("INFR_SERVE_IDLE_SECS", value)]),
-        ]);
-        assert_eq!(cfg.serve.idle_timeout_secs, 120);
-    }
 }
 
 /// The asymmetric mrows-attn pair: `INFR_NO_MROWS_ATTN` WINS when both are set.
@@ -1092,11 +1069,12 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_PAGER_RING",
     ];
 
-    /// S3 — `infr-cpu`: the three `kernels.cpu` knobs plus the three diagnostics its interpreter
+    /// S3 — `infr-cpu`: the three `kernels.cpu` knobs plus the diagnostics its interpreter
     /// gates. (`kernels.cpu.reference` is on the same struct but has no env key — it was never a
     /// variable, so it is not in `KEYS`.)
     const S3: &[&str] = &[
         "INFR_CPU_NO_SPINPOOL",
+        "INFR_CPU_OP_HASH",
         "INFR_CPU_REPACK_MB",
         "INFR_CPU_SPIN",
         "INFR_MOE_COUNTS_DEBUG",
@@ -1123,8 +1101,6 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_EXPERT_PARALLEL",
         "INFR_KV_Q8",
         "INFR_KV_SLOTS",
-        "INFR_KV_STORE_MB",
-        "INFR_KV_PAGED",
         "INFR_KV_TYPE_K",
         "INFR_KV_TYPE_V",
         "INFR_MTP",
@@ -1163,6 +1139,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_CM_8X8",
         "INFR_DEBUG_COOPMAT",
         "INFR_DEV",
+        "INFR_FORCE_WAVE64",
         "INFR_NO_COOPMAT",
         "INFR_NO_F16",
         "INFR_NO_I8DOT",
@@ -1205,9 +1182,6 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_FLASH_SPLITS",
         "INFR_FLASH_STAGE",
         "INFR_FULLBARRIER",
-        "INFR_KQ_FMA_GEMV",
-        "INFR_KQ_FMA_SPLITK",
-        "INFR_KQ_FMA_TIER",
         "INFR_GEMM_DIRECT_A",
         "INFR_GEMM_WIDE_TILE",
         "INFR_GEMV_RM",
@@ -1217,7 +1191,6 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_GEMV_SG_MINOUT",
         "INFR_GEMV_SG_NR",
         "INFR_GEMV_VARIANT",
-        "INFR_GFX_QUEUE",
         "INFR_I8_COOPMAT",
         "INFR_I8_ROW_SCALE",
         "INFR_KV_COOPMAT_BDA",
@@ -1229,11 +1202,11 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_MROWS_ATTN",
         "INFR_NOBARRIER",
         "INFR_NO_ATTN_DECODE",
-        "INFR_ATTN_DECODE_GQA",
         "INFR_NO_ATTN_HD",
         "INFR_NO_BM16",
         "INFR_NO_DN_CHUNK",
         "INFR_NO_DN_SPLIT",
+        "INFR_NO_DP4A_KQ",
         "INFR_NO_F32_MROW",
         "INFR_NO_F32_V4",
         "INFR_NO_FLASH_WARP",
@@ -1243,12 +1216,12 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_NO_GEMV_RM",
         "INFR_NO_GEMV_SG",
         "INFR_NO_GPU_POS",
+        "INFR_NO_I8CM_KQ",
         "INFR_NO_MMQ",
         "INFR_NO_MMQ_FALLBACK",
         "INFR_NO_MMV",
         "INFR_NO_MMV_M4",
         "INFR_NO_MMV_O4",
-        "INFR_NO_MMV_Q4K_META",
         "INFR_NO_MOE_SM_POOL",
         "INFR_NO_MROW",
         "INFR_NO_MROW16",
@@ -1318,10 +1291,8 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_MAX_TOKENS_CAP",
         "INFR_NO_THINK",
         "INFR_PROF_OUT",
-        "INFR_PROF_TRACE",
         "INFR_REQUEST_TIMEOUT_SECS",
         "INFR_SERVE_STATS_SECS",
-        "INFR_SERVE_IDLE_SECS",
     ];
 
     /// S8 — the CLI's own transitional bridge, and with it the LAST unmigrated knob. The six
@@ -1348,14 +1319,14 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     const POST_MIGRATION: &[&str] = &[
         "INFR_DRAM_CACHE",
         "INFR_DRAM_BYPASS",
-        "INFR_RELEASE_UPLOADED_PAGES",
         "INFR_LAYER_MAJOR",
         "INFR_PULL_JOBS",
         "INFR_NO_MLA_SG",
-        "INFR_WAVE64_NATIVE",
-        "INFR_WEIGHTS_AS_SSBO",
-        "INFR_MMPROJ",
-        "INFR_IMAGE_MAX_TOKENS",
+        "INFR_PAGER_TRACE",
+        "INFR_TUNE",
+        "INFR_TUNE_DISABLE",
+        "INFR_TUNE_FILE",
+        "INFR_TUNE_NO_ROWS",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();
@@ -1377,5 +1348,184 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         got, want,
         "the manifest's `migrated` set drifted from the slices that landed — flip an entry and \
          list it here in the SAME commit"
+    );
+}
+
+// ── kernels.vulkan.tune / tuning ─────────────────────────────────────────────
+
+/// The tuning map is reachable three ways — a `[kernels.vulkan.tune]` table (flat quoted keys or
+/// nested tables), `INFR_TUNE`, and `--set kernels.vulkan.tune.<key>` — and each entry carries the
+/// layer it came from. Folding keeps every layer's entries, lowest layer first.
+#[test]
+fn tune_map_reaches_every_layer_with_its_level() {
+    use super::TuneLevel;
+    let file = file_layer(
+        "[kernels.vulkan.tune]\n\"gemv_sg.rows\" = 4\n\"mmv_mw.warps@q4_k\" = 2\n\
+         [kernels.vulkan.tune.moe]\nsmall_m = 16\n",
+    );
+    let env = env_layer(&[("INFR_TUNE", "attn_flash.splits=2, moe.small_m=4")]);
+    let cli = cli_layer(&["kernels.vulkan.tune.attn_canvas.chunks=5"]);
+    let cfg = Config::load_from_layers(&[file, env, cli]);
+    let got: Vec<(&str, &str, TuneLevel)> = cfg
+        .kernels
+        .vulkan
+        .tune
+        .entries
+        .iter()
+        .map(|e| (e.key.as_str(), e.value.as_str(), e.level))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            ("gemv_sg.rows", "4", TuneLevel::Config),
+            ("mmv_mw.warps@q4_k", "2", TuneLevel::Config),
+            ("moe.small_m", "16", TuneLevel::Config),
+            ("attn_flash.splits", "2", TuneLevel::Env),
+            ("moe.small_m", "4", TuneLevel::Env),
+            ("attn_canvas.chunks", "5", TuneLevel::Cli),
+        ]
+    );
+}
+
+/// A malformed key or value is refused at the layer: loudly from the environment and the command
+/// line, as a value error from the file. (Whether the parameter EXISTS is the Vulkan resolver's
+/// call — it owns the list.)
+#[test]
+fn tune_key_shape_is_checked() {
+    for bad in [
+        "nodot=1",
+        "Gemv.rows=1",
+        "gemv.rows@=1",
+        "gemv.rows=",
+        "gemv.rows",
+    ] {
+        let err = try_env_layer(&[("INFR_TUNE", bad)]).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Env {
+                    key: "INFR_TUNE",
+                    ..
+                }
+            ),
+            "{bad}: {err:?}"
+        );
+    }
+    let err = cli::parse_reporting(&ConfigOverrides {
+        sets: vec!["kernels.vulkan.tune.gemv=4".to_string()],
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(matches!(err, ConfigError::Value { .. }), "{err:?}");
+    assert!(file::parse_str(
+        "[kernels.vulkan.tune]\n\"Bad.key\" = 1\n",
+        Path::new("infr.toml")
+    )
+    .is_err());
+    // A well-formed key for a parameter that does not exist passes here.
+    assert!(try_env_layer(&[("INFR_TUNE", "no_such.param=1")]).is_ok());
+}
+
+/// Each layer records which alias knobs it set, at its own level, so the resolver can order an
+/// alias against a tuning key from another layer; a layer that set none records none.
+#[test]
+fn alias_knobs_record_their_layer() {
+    use super::TuneLevel;
+    let cfg = Config::load_from_layers(&[
+        file_layer("[kernels.vulkan]\nflash_splits = 2\n"),
+        env_layer(&[("INFR_FLASH_SPLITS", "4"), ("INFR_SG", "16")]),
+        cli_layer(&["kernels.vulkan.gemv.sg_nr=2"]),
+    ]);
+    let t = &cfg.kernels.vulkan.tune;
+    assert_eq!(
+        t.alias_level("kernels.vulkan.flash_splits"),
+        Some(TuneLevel::Env)
+    );
+    assert_eq!(t.alias_level("device.subgroup_pref"), Some(TuneLevel::Env));
+    assert_eq!(
+        t.alias_level("kernels.vulkan.gemv.sg_nr"),
+        Some(TuneLevel::Cli)
+    );
+    assert_eq!(t.alias_level("kernels.vulkan.pv_splits"), None);
+    // Knobs that are not aliases are not recorded, and an empty layer stays empty.
+    assert!(env_layer(&[("INFR_NO_MMV", "1")])
+        .kernels
+        .vulkan
+        .tune
+        .is_none());
+    assert!(env_layer(&[]).is_empty());
+}
+
+/// `kernels.vulkan.tuning.*`: the file path, the rows switch and the disable list, from the file
+/// and the environment.
+#[test]
+fn tuning_switches_parse() {
+    let d = Config::default();
+    assert!(d.kernels.vulkan.tuning.rows);
+    assert!(d.kernels.vulkan.tuning.disable.is_empty());
+    assert_eq!(d.kernels.vulkan.tuning.file, None);
+    let cfg = Config::load_from_layers(&[file_layer(
+        "[kernels.vulkan.tuning]\nfile = \"my.toml\"\nrows = false\ndisable = [\"a\", \"b\"]\n",
+    )]);
+    assert_eq!(
+        cfg.kernels.vulkan.tuning.file.as_deref(),
+        Some(Path::new("my.toml"))
+    );
+    assert!(!cfg.kernels.vulkan.tuning.rows);
+    assert_eq!(cfg.kernels.vulkan.tuning.disable, vec!["a", "b"]);
+    let cfg = Config::load_from_layers(&[env_layer(&[
+        ("INFR_TUNE_NO_ROWS", ""),
+        ("INFR_TUNE_DISABLE", "x, y"),
+        ("INFR_TUNE_FILE", "t.toml"),
+    ])]);
+    assert!(!cfg.kernels.vulkan.tuning.rows);
+    assert_eq!(cfg.kernels.vulkan.tuning.disable, vec!["x", "y"]);
+    assert_eq!(
+        cfg.kernels.vulkan.tuning.file.as_deref(),
+        Some(Path::new("t.toml"))
+    );
+}
+
+/// A relative `tuning.file` in a config file names a file beside that config file; an absolute
+/// one, and one from the environment or the command line, are left as given (the environment's
+/// and command line's stay relative to the working directory).
+#[test]
+fn a_relative_tuning_file_in_a_config_file_is_beside_it() {
+    let text = "[kernels.vulkan.tuning]\nfile = \"tune.toml\"\n";
+    let (p, _) = file::parse_str(text, Path::new("/etc/infr/config.toml")).unwrap();
+    let cfg = Config::load_from_layers(&[p]);
+    assert_eq!(
+        cfg.kernels.vulkan.tuning.file.as_deref(),
+        Some(Path::new("/etc/infr/tune.toml"))
+    );
+    // `./infr.toml` (no folder part) keeps the path as written.
+    let cfg = Config::load_from_layers(&[file_layer(text)]);
+    assert_eq!(
+        cfg.kernels.vulkan.tuning.file.as_deref(),
+        Some(Path::new("tune.toml"))
+    );
+    let abs = if cfg!(windows) {
+        "C:/t/tune.toml"
+    } else {
+        "/t/tune.toml"
+    };
+    let (p, _) = file::parse_str(
+        &format!("[kernels.vulkan.tuning]\nfile = \"{abs}\"\n"),
+        Path::new("/etc/infr/config.toml"),
+    )
+    .unwrap();
+    assert_eq!(
+        Config::load_from_layers(&[p])
+            .kernels
+            .vulkan
+            .tuning
+            .file
+            .as_deref(),
+        Some(Path::new(abs))
+    );
+    let cfg = Config::load_from_layers(&[env_layer(&[("INFR_TUNE_FILE", "tune.toml")])]);
+    assert_eq!(
+        cfg.kernels.vulkan.tuning.file.as_deref(),
+        Some(Path::new("tune.toml"))
     );
 }

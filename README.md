@@ -5,64 +5,9 @@
 Pure-Rust LLM inference engine. Vulkan-first, built to run on any mainstream
 GPU.
 
-> **This is the [KessokuNet](https://github.com/KessokuNet/infr) fork of
-> [kryptic-sh/infr](https://github.com/kryptic-sh/infr).** It focuses on
-> optimizing and backporting infr to older and lower-end Vulkan GPUs — AMD
-> GCN / Polaris (RX 470/480/570/580) is the baseline target: wave64-only
-> devices, no cooperative matrix, no hardware int8 dot. Fixes that are not
-> specific to those GPUs are meant to go upstream. See
-> [docs/legacy-gpus.md](docs/legacy-gpus.md) for what changed and the measured
-> results.
-
-> Early WIP. The only non-Rust parts are the GPU driver calls (Vulkan via `ash`)
-> and the compute shaders (SPIR-V).
-
-## What this fork adds
-
-Upstream `main` is merged in; this list is what it does not have yet. Work here
-that is not specific to older GPUs is meant to go upstream.
-
-**Both directions of KV paging**, neither of which upstream has:
-
-- **`kv.store_mb` (`INFR_KV_STORE_MB`) — reverse PagedAttention.** A prompt's
-  K/V rows are captured in 128-token blocks, chained by a hash of
-  `(parent id, tokens)`, and kept in host RAM under an LRU byte budget. The next
-  request walks the chain from token 0 as far as its prompt agrees, then uploads
-  the matched run in one contiguous copy instead of re-prefilling it. Gemma 4 E4B
-  on the RX 580: a 1068-token prompt took 3677 ms cold, 319 ms on a repeat,
-  705 ms for a different 1090-token tail — the shared 1053 tokens stored once,
-  111.8 MB for both conversations.
-- **`kv.paged` (`INFR_KV_PAGED`) — forward PagedAttention.** A session's slots
-  share one pool of 512-row pages; a fork points at its parent's complete pages
-  and copies a page before writing it. It costs the device bytes the linear slots
-  already cost (one block per slot the session may fork) and is built at the
-  first fork. Ring, recurrent, MLA and diffusion layers stay compact, so a
-  full-attention model gains most. Memory, not speed: reads pay one table lookup
-  per KV tile.
-
-The two compose — the pool shares pages between live slots, the store survives
-slot recycling. The DRAM KV spillover (`kv.overflow`, `kv.overflow_vram_mb`,
-`kv.overflow_reserve_mb`) is upstream's. Mechanism, limits and measurements:
-[`docs/perf/kv-prefix.md`](docs/perf/kv-prefix.md).
-
-**Older GPUs** ([`docs/legacy-gpus.md`](docs/legacy-gpus.md)) — wave64-only GCN
-support, an fp32 `kq_fma` prefill GEMM and decode/verify GEMV for devices without
-hardware int8 dot, the first prefill split on slow discrete parts, a compute-only
-queue family so a long forward does not hold up the compositor. RX 580 against
-llama.cpp: 1.13× at `pp512` and `tg128` on Qwen2.5-Coder-3B, level on Gemma 4
-E4B, 0.58–0.64× at `pp4@d4096` — the four-token turn where this fork is still
-behind.
-
-**Models and formats** — Gemma 4 image input (`serve.mmproj`,
-`serve.image_max_tokens`), EXL3 safetensors checkpoints (Qwen2, Qwen3.5 text,
-Gemma 4 dense; [`docs/exl3.md`](docs/exl3.md)), the Seed-Coder pre-tokenizer
-(`tokenizer.ggml.pre = seed-coder`) that Zeta 2/2.1 and Seed-Coder GGUFs need,
-and a dense Qwen4 reference path used for experiments
-([`docs/qwen4-exp.md`](docs/qwen4-exp.md)).
-
-**HTTP and CLI** — `/v1/completions` (see
-[FIM and edit prediction](#fim-and-edit-prediction)), `infr ls`, `infr rm`,
-`infr perplexity`, and a Chrome-trace timeline behind `INFR_PROF_TRACE`.
+> Early WIP. The engine is Rust; GPU work goes through Vulkan (`ash`, SPIR-V
+> shaders) or Metal (MSL shaders), with no CUDA and no llama.cpp underneath. A
+> source build also compiles the C and C++ code some dependencies carry.
 
 ## Goal
 
@@ -100,23 +45,33 @@ e.g. `infr run unsloth/Qwen3-14B-GGUF:Q4_K_M`). Models share the standard
 All run on the Vulkan GPU backend unless noted. The chat template (turn markers,
 system prompt) is read from the GGUF's own `tokenizer.chat_template`.
 
-| Family            | Arch (GGUF)       | Notes                                                   |
-| ----------------- | ----------------- | ------------------------------------------------------- |
-| Llama             | `llama`           | dense transformer                                       |
-| Llama 4           | `llama4`          | sigmoid top-1 MoE + shared expert, iRoPE, paged experts |
-| Qwen2 / Qwen2.5   | `qwen2`           | dense, QKV bias, NEOX rope                              |
-| Qwen3             | `qwen3`           | dense, QK-norm                                          |
-| Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts, paged experts          |
-| Gemma 3           | `gemma3`          | SWA + QK-norm + GeGLU, dual-RoPE                        |
-| Gemma 4 (dense)   | `gemma4`          | per-layer head dims, proportional RoPE, V-norm          |
-| Gemma 4 **E2B**   | `gemma4`          | + per-layer input embeddings / FFN, KV sharing          |
-| Gemma 4 **MoE**   | `gemma4`          | 26B-A4B: dual FFN (dense GeGLU ∥ 8-of-128 routed), AR   |
-| Qwen3.5 / Qwen3.6 | `qwen35`          | hybrid gated-DeltaNet + attention (NOT `qwen3next`)     |
-| Qwen3.6 MoE       | `qwen35moe`       | `qwen35` skeleton + routed experts + shared expert      |
-| DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode  |
-| BitNet b1.58      | `bitnet`          | llama skeleton + SubLN, ternary TQ2_0 weights           |
-| BitNet b1.58 (MS) | `bitnet-b1.58`    | same, for the `microsoft/bitnet-b1.58-*` GGUFs (i2_s)   |
-| Zeta 2 / 2.1      | `llama`           | Zed edit prediction; Seed-Coder-8B, FIM/rewrite         |
+| Family            | Arch (GGUF)       | Notes                                                                                                                                                                |
+| ----------------- | ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Llama             | `llama`           | dense transformer                                                                                                                                                    |
+| Llama 4           | `llama4`          | sigmoid top-1 MoE + shared expert, iRoPE, paged experts                                                                                                              |
+| SmolLM3           | `smollm3`         | llama block, rope skipped on every 4th layer (NoPE)                                                                                                                  |
+| ERNIE 4.5 (dense) | `ernie4_5`        | llama block, wide heads (`attention.key_length`)                                                                                                                     |
+| ERNIE 4.5 MoE     | `ernie4_5-moe`    | 21B-A3B: softmax router + selection bias, shared expert, paged experts                                                                                               |
+| Qwen2 / Qwen2.5   | `qwen2`           | dense, QKV bias, NEOX rope                                                                                                                                           |
+| Qwen3             | `qwen3`           | dense, QK-norm                                                                                                                                                       |
+| Qwen3 MoE         | `qwen3moe`        | softmax router, top-_k_ experts, paged experts                                                                                                                       |
+| Gemma 3           | `gemma3`          | SWA + QK-norm + GeGLU, dual-RoPE                                                                                                                                     |
+| Gemma 4 (dense)   | `gemma4`          | per-layer head dims, proportional RoPE, V-norm                                                                                                                       |
+| Gemma 4 **E2B**   | `gemma4`          | + per-layer input embeddings / FFN, KV sharing                                                                                                                       |
+| Gemma 4 **MoE**   | `gemma4`          | 26B-A4B: dual FFN (dense GeGLU ∥ 8-of-128 routed), AR                                                                                                                |
+| Qwen3.5 / Qwen3.6 | `qwen35`          | hybrid gated-DeltaNet + attention (NOT `qwen3next`)                                                                                                                  |
+| Qwen3.6 MoE       | `qwen35moe`       | `qwen35` skeleton + routed experts + shared expert                                                                                                                   |
+| LFM3              | `lfm3`            | gated short-convolution layers + head-gated SWA/full attention                                                                                                       |
+| DiffusionGemma    | `diffusion-gemma` | block text-diffusion MoE, entropy-bound denoise decode                                                                                                               |
+| BitNet b1.58      | `bitnet`          | llama skeleton + SubLN, ternary TQ2_0 weights                                                                                                                        |
+| BitNet b1.58 (MS) | `bitnet-b1.58`    | same, for the `microsoft/bitnet-b1.58-*` GGUFs (i2_s)                                                                                                                |
+| DeepSeek V1       | `deepseek`        | softmax MoE + shared expert; CPU-tested on MoE-16B only                                                                                                              |
+| DeepSeek V2 / V3  | `deepseek2`       | MLA + YaRN + group-limited MoE; validated on V2-Lite; V3.2 files run here                                                                                            |
+| DeepSeek V3.2     | `deepseek32`      | + lightning indexer; synthetic only, published files too big to test here                                                                                            |
+| DeepSeek V4       | `deepseek4`       | every tier runs on CPU; synthetic files match llama.cpp; V4-Flash Q2_K_S runs from disk on CPU: 1.28 s/token with a 12 GB cache on this NVMe, unchecked by an oracle |
+
+DeepSeek status and what each stage is verified against:
+[`docs/deepseek.md`](docs/deepseek.md).
 
 Fine-tunes on any of these backbones run unchanged. **Ornith-1.0**
 (DeepReinforce.AI agentic-coding) validated 2026-07-09 — the 9B rides `qwen35`
@@ -126,8 +81,8 @@ and the 35B rides `qwen35moe` with no code changes
 2026-07-12 — the 1.7B / 4B / 8B all ride `qwen3`, zero-code, both in the TQ2_0
 repack (`superkaiii/Ternary-Bonsai-4B-GGUF`) and in llama.cpp's new **Q2_0**
 weight dtype (2.25 bpw, GGML type 42 — native in-shader dequant + dp4a mmq, no
-fork needed). infr is the **only engine that runs Q2_0 on a GPU** (llama.cpp
-merged the dtype CPU-only) — numbers in
+fork needed). Q2_0 runs on the GPU here; llama.cpp merged the dtype CPU-only and
+added its GPU backends later — numbers in
 [`docs/perf/results.md`](docs/perf/results.md). Pull the `Q2_0_g64` files:
 `infr run prism-ml/Ternary-Bonsai-8B-gguf:Q2_0_g64 "..."`.
 
@@ -224,9 +179,9 @@ curl -s localhost:8080/v1/chat/completions -d '{
 }'
 ```
 
-Works as a drop-in backend for OpenAI-API clients (opencode, the Claude Code
-CLI, etc.). Tool calling renders the model's own `tokenizer.chat_template`
-(Qwen, Llama-3.x, Gemma tool dialects supported).
+Works as a drop-in backend for OpenAI-API clients (hrdr, opencode, etc.). Tool
+calling renders the model's own `tokenizer.chat_template` (Qwen, Llama-3.x,
+Gemma tool dialects supported).
 
 `GET /metrics` serves Prometheus counters and gauges (`infr_requests_total`,
 `infr_generation_tokens_total`, `infr_decode_seconds_total`,
@@ -235,95 +190,29 @@ CLI, etc.). Tool calling renders the model's own `tokenizer.chat_template`
 as JSON — each model's backend, device, context per slot, slots and device
 memory. Both sit behind the API key when one is set.
 
-On Linux, [systemd socket activation](docs/systemd.md) can start the server on
-request and release its model memory after an idle timeout. Set
-`serve.idle_timeout_secs` / `INFR_SERVE_IDLE_SECS` to enable idle exit; the default
-is `0` (disabled).
-
-**Images (Gemma 4).** OpenAI `image_url` parts with a base64 `data:` URI (PNG/JPEG/GIF/WebP/BMP)
-are accepted on the Vulkan backend when a Gemma 4 vision projector is available — the first
-`mmproj*.gguf` beside the model (`infr pull unsloth/gemma-4-E4B-it-GGUF:mmproj-F16.gguf` puts it
-there), or `serve.mmproj` / `INFR_MMPROJ`. The vision encoder runs on the CPU (~1–3 s per image on
-an 8-core desktop, cached per image so follow-up turns don't pay it again); `serve.image_max_tokens`
-/ `INFR_IMAGE_MAX_TOKENS` (default 280, range 70–1120) trades detail for encode time. Remote image
-URLs are not fetched.
-
 `--temp` / `--top-k` / `--top-p` set the SERVER defaults (`--temp 0` = greedy);
 a per-request OpenAI `temperature`/`top_p` still overrides them. See
 [Configuration](#configuration).
 
-### FIM and edit prediction
-
-`/v1/completions` tokenizes the prompt verbatim, with no chat template. FIM
-tokens in it (`<|fim_prefix|>`, `<|fim_suffix|>`, `<|fim_middle|>`, Seed-Coder's
-`<[fim-prefix]>` …) encode as their single special ids and the model continues
-the middle, so any FIM or next-edit model on a supported backbone works — the
-client builds the prompt. `suffix` returns an explicit error instead of being
-ignored; pass the model's own FIM tokens in `prompt`.
-
-Mellum-4b is the model for a plain FIM setup: JetBrains' completion model,
-2.6 GB at Q4_K_M, 249 tok/s prefill and 50 tok/s decode on an RX 580 while the
-desktop keeps rendering at 126–131 fps. It uses ASCII sentinels
-(`<fim_prefix>`, `<fim_suffix>`, `<fim_middle>`), which is Zed's `star_coder`
-layout.
-
-```bash
-infr serve mradermacher/Mellum-4b-base-GGUF:Q4_K_M --addr 127.0.0.1:8899 --ctx 8k --temp 0
-```
-
-Zed — `settings.json`, provider: OpenAI-compatible:
-
-```json
-{
-  "edit_predictions": {
-    "provider": "open_ai_compatible_api",
-    "open_ai_compatible_api": {
-      "api_url": "http://127.0.0.1:8899/v1/completions",
-      "model": "Mellum-4b-base.Q4_K_M",
-      "prompt_format": "star_coder",
-      "max_output_tokens": 512
-    }
-  }
-}
-```
-
-Zed puts the file's prefix after `<fim_prefix>`, the suffix after
-`<fim_suffix>`, and closes the prompt with `<fim_middle>`; the reply is plain
-text plugged into the gap. Requests are non-streaming, one per typing pause, and
-the prefix cache absorbs the context that repeats between them.
-
-Zeta 2.1 is the alternative for rewrite-style edits: an 8B Seed-Coder backbone,
-5.1 GB Q4_K_M, 166 tok/s prefill and 26–34 tok/s decode, `prompt_format`
-`zeta2_1`. Greedy, not sampled: at `--temp 0.2` this quant can loop on
-`<|marker_1|>`. Zed formats the context itself here — related files and edit
-history as `<[fim-suffix]>`/`<[fim-prefix]>` blocks, the editable region marked
-with `<|marker_N|>`, and `<[end▁of▁sentence]>` as the stop. The model's reply is
-the marker-tagged replacement span, which Zed splices into the buffer. The
-prompt budget is 4k tokens and generation is capped at `max_output_tokens * 4`,
-so `--ctx 8k` leaves headroom.
-
-`prompt_format` selects the layout: `zeta2_1` for Zeta 2/2.1, `zeta` for Zeta 1,
-`qwen` for Qwen2.5-Coder, or `code_llama` / `star_coder` / `deepseek_coder` /
-`codestral` / `glm` / `sweep` / `infer`.
+Per-request sampling fields: `temperature`, `top_p`, `top_k`, `min_p`, `seed`,
+`presence_penalty`, `frequency_penalty`, `repeat_penalty`, `logit_bias`, `stop`
+and `max_tokens` / `max_completion_tokens`. `n` above 1, `logprobs` and
+`top_logprobs` are not supported and answer `400`.
 
 ## Performance
 
 Measured against llama.cpp on an **AMD Radeon RX 7900 XTX** (RDNA3, Vulkan /
 RADV), every validated model × quant, both engines on matched flags. Headline:
 
-- **Decode** — the reproducible half — wins **29 of 35** rows at `tg128` and
-  **24 of 35** at `tg64@d4096`.
 - **`pp4@d4096`** (multi-turn ingest, the shape a coding agent actually runs) is
-  the strongest column, roughly **1.5–2×** on the small and mid models.
-- Losses concentrate on **Qwen3-14B and the larger MoEs**, mostly at depth.
+  the strongest column: **34 of 35** rows. `pp512` also wins **34 of 35**.
+- **Decode** is the narrower win: **31 of 35** rows at `tg128` and **26 of 35**
+  at `tg64@d4096`, the softest column.
 
 **The full table, the per-row footnotes, and an honest account of where infr
-loses are in [`docs/perf/results.md`](docs/perf/results.md).** Two caveats live
-there and both matter: ratios move with _both_ engines, so snapshots taken
-against different `llama-bench` builds are not comparable; and infr's
-**prefill** columns vary up to ~30% run-to-run on an identical binary (a known
-tier/chunk nondeterminism), so quote prefill to one significant figure and
-decode as written.
+loses are in [`docs/perf/results.md`](docs/perf/results.md)** (the 2026-08-03
+snapshot). One caveat lives there and matters: ratios move with _both_ engines,
+so snapshots taken against different `llama-bench` builds are not comparable.
 
 To reproduce or extend the numbers — `infr bench` / `infr compare --sweep`
 flag-for-flag against `llama-bench`, plus per-op GPU profiling — see
@@ -345,20 +234,23 @@ is indexed at [`docs/perf/`](docs/perf/README.md).
   GPU by default via the paged expert cache, 37 GB Q2_K on a 24 GB card; pure
   CPU under `--dev cpu`); BitNet b1.58 (`bitnet` and Microsoft's `bitnet-b1.58`,
   ternary weights, CPU + GPU)
-- **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul); Apple
-  via a native **Metal backend** (`--dev metal`) covering every op the CPU
-  reference does — dense, MoE (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is
-  optimized (simdgroup-matrix GEMM + flash attention, raw-block quant decode;
-  within ~1.3-1.5× of llama.cpp Metal on M3 Pro — architecture and numbers in
-  [`docs/metal.md`](docs/metal.md))
+- **GPU:** AMD / NVIDIA / Intel via Vulkan (cooperative-matrix matmul; older
+  wave64-only AMD GCN cards such as Polaris and Vega run the same kernels on
+  64-lane waves, without coopmat — verified here only by forcing that path on
+  RDNA; the fork it came from tested an earlier version on an RX 580, and this
+  version is untested on GCN); Apple via a native **Metal backend**
+  (`--dev metal`) covering every op the CPU reference does — dense, MoE
+  (`qwen3moe`) and Qwen3.5 (`qwen35`). Dense is optimized (simdgroup-matrix
+  GEMM + flash attention, raw-block quant decode; decode at parity with
+  llama.cpp Metal on M3 Pro, prefill 0.80–0.92× of it — architecture and numbers
+  in [`docs/metal.md`](docs/metal.md))
 - **Store:** the shared **HuggingFace Hub cache** — located via `$HF_HUB_CACHE`,
   else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`, in HF's own
   `models--<org>--<repo>/{blobs,snapshots,refs}` layout. A model pulled by
   `infr`, `llama.cpp`, or `huggingface_hub` is shared — downloaded once.
   `infr pull` fetches from `huggingface.co` over resumable HTTP Range with a
   progress bar; gated repos authenticate with `HF_TOKEN`.
-- **API:** OpenAI-compatible HTTP (streaming) — works with opencode / Claude
-  Code CLI / Zed edit prediction
+- **API:** OpenAI-compatible HTTP (streaming) — works with hrdr / opencode
 
 ## Architecture
 
@@ -392,9 +284,13 @@ cargo build --release -p infr-cli   # → target/release/infr
 ```
 
 Needs a stable Rust toolchain and `glslc` (shaderc; ships with the Vulkan SDK),
-which compiles the compute shaders at build time. At runtime only a GPU driver
-with Vulkan is required. Windows setup, step by step:
-[`docs/windows.md`](docs/windows.md).
+which compiles the compute shaders at build time. Use a current Vulkan SDK or
+shaderc 2026 or newer: shaderc 2026.1, 2026.3 and 2026.4 are known to build
+every shader, while 2023.8 (Ubuntu 24.04's package) is known not to. The build
+runs the `glslc` on `PATH`, else `$VULKAN_SDK/Bin`, and if a shader fails to
+compile it stops with one message naming the shader, the `glslc` and its
+version. At runtime only a GPU driver with Vulkan is required. Windows setup,
+step by step: [`docs/windows.md`](docs/windows.md).
 
 ## Documentation
 

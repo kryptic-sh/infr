@@ -3,12 +3,12 @@
 > **How to read this.** Two halves. Everything under
 > [What shipped](#what-shipped) down to
 > [Product surface](#product-surface-the-infr-cli) is a **description of the
-> tree as it stands on 2026-08-05** — kept here because no other doc carries the
+> tree, last checked 2026-11-11** — kept here because no other doc carries the
 > whole-system shape in one place. Everything from
 > [Adding a model architecture](#adding-a-model-architecture-the-recipe) on is
 > **forward-looking work**, written to be executable without re-deriving the
-> codebase. The [historical record](#historical-the-original-milestones) of the
-> original DiffusionGemma-era milestones is at the bottom.
+> codebase. The original MVP milestones all shipped; their table is in `git log`
+> (`git log -S'Historical: the original milestones' -- docs/plan.md`).
 >
 > Current state of anything performance-related is NOT here — it is
 > [`docs/perf/`](perf/README.md). The doc index is
@@ -37,7 +37,7 @@ one trait_, never refactoring the stack.
 The original MVP targeted DiffusionGemma over Vulkan. It shipped — but the
 autoregressive families landed first and are now the primary path.
 
-| Dimension    | Original MVP                       | As built (2026-08-05)                                                                                        |
+| Dimension    | Original MVP                       | As built (2026-11-11)                                                                                        |
 | ------------ | ---------------------------------- | ------------------------------------------------------------------------------------------------------------ |
 | Format       | GGUF                               | GGUF (safetensors still unbuilt)                                                                             |
 | Model source | HF + Ollama pull, or a local path  | **HF only** — `org/repo[:quant]`, or a local path. The Ollama registry client was dropped                    |
@@ -55,7 +55,11 @@ different:
 
 `llama`, `llama4`, `qwen2`, `qwen3`, `qwen3moe`, `gemma3`, `gemma4` (dense / E2B
 / 26B-A4B MoE on the one string), `qwen35`, `qwen35moe`, `diffusion-gemma`,
-`bitnet`, `bitnet-b1.58`.
+`bitnet`, `bitnet-b1.58`, `smollm3`, `ernie4_5`, `ernie4_5-moe`, `lfm3`, and the
+DeepSeek line — `deepseek`, `deepseek2`, `deepseek32`, `deepseek4` (status per
+stage in [`deepseek.md`](deepseek.md): `deepseek4` runs every layer tier on the
+CPU backend only; the shipped V4-Flash file runs there from disk at 1.28 s a
+token with a 12 GB cache, unchecked by any oracle).
 
 Fine-tunes on those backbones run with no code change (Ornith-1.0 and
 Ternary-Bonsai are the validated examples — see the root
@@ -71,7 +75,7 @@ Bottom-up. Each named trait is the seam where future variants plug in.
 ┌──────────────────────────────────────────────────────────────────────┐
 │ infr-cli      pull / devices / run / serve / multi / bench / compare  │
 ├──────────────────────────────────────────────────────────────────────┤
-│ infr-server   axum + SSE -> OpenAI /v1/chat/completions, /v1/models   │  knows NOTHING about the GPU
+│ infr-server   axum + SSE: OpenAI /v1/*, /health, /status, /metrics    │  knows NOTHING about the GPU
 ├──────────────────────────────────────────────────────────────────────┤
 │ infr-chat     chat templating (the GGUF's own jinja), tool-call bridge│
 ├──────────────────────────────────────────────────────────────────────┤
@@ -83,6 +87,8 @@ Bottom-up. Each named trait is the seam where future variants plug in.
 │ infr-core     Tensor, dtypes/quant, Graph, Op, trait Backend, pagers  │
 ├──────────────────────────────────────────────────────────────────────┤
 │ backends      infr-cpu (reference) / infr-vulkan / infr-metal         │  the ONLY GPU-aware layer
+├──────────────────────────────────────────────────────────────────────┤
+│ infr-plat     the OS seam (leaf): locks, memory probe, signals, paths │  the ONLY OS-specific code
 ├──────────────────────────────────────────────────────────────────────┤
 │ shaders       GLSL -> SPIR-V (Vulkan), MSL (Metal)                    │  not Rust
 └──────────────────────────────────────────────────────────────────────┘
@@ -111,6 +117,7 @@ The workspace members, from the root `Cargo.toml`:
 infr/
 ├── crates/
 │   ├── infr-core       # Tensor, dtypes/quant, Graph, Op, Backend trait, config, pagers, errors
+│   ├── infr-plat       # the platform seam: every OS-specific call (leaf crate — docs/infr-plat.md)
 │   ├── infr-cpu        # Backend impl: the reference backend (also the correctness oracle)
 │   ├── infr-vulkan     # Backend impl: ash + gpu-allocator + SPIR-V dispatch, VRAM/expert pagers
 │   ├── infr-metal      # Backend impl: native MSL (Apple GPUs)
@@ -309,19 +316,21 @@ Ranked by ROI against the architecture above. Step 0 of the recipe is the same
 for all of them and costs minutes; do that before believing any effort estimate
 here.
 
-1. **DeepSeek** (`deepseek` → `deepseek2` → `deepseek32` → `deepseek4`).
-   **Highest strategic value**, and the only candidate with a written plan:
-   [`deepseek.md`](deepseek.md). Adds **MLA (Multi-head Latent Attention)**, the
-   missing attention family behind the whole V2/V3/V4 line. Staged around the
-   constraint that only the first two stages have a model small enough to
-   develop against, so stages 1–2 must leave MLA and MoE-routing pieces behind
-   that are independently tested. Depends on the streaming work tracked as B36
-   in [`backlog.md`](backlog.md).
-2. **GLM-4.7-Flash** (~30B MoE) or **Ernie 4.5 21B-A3B** (MoE). Mostly standard
-   MoE FFN — infr's batched-expert path covers it — plus minor arch quirks (GLM
-   post-norm / partial RoPE). Expect recipe steps 3–4 only. Some GLM variants
-   ship native MTP heads, which infr currently parks ([`mtp.md`](mtp.md)) —
-   those tensors go unused rather than unsupported.
+1. **DeepSeek V4** (`deepseek4`) — the rest of the DeepSeek line has landed (MLA
+   for `deepseek2`, the lightning indexer for `deepseek32`; see
+   [`deepseek.md`](deepseek.md)), and V4's compressed-KV tiers (`compress_ratio`
+   4 and 128) now run on the CPU backend, matched to llama.cpp on synthetic
+   files. The shipped V4-Flash file runs on the CPU from disk (1.28 s a decode
+   token with a 12 GB arena). What is left is an oracle for its numbers
+   (llama.cpp cannot load it here), its decode speed and the GPU backends,
+   tracked as B-DSV4-WIRING and B-DSV4-REAL in [`backlog.md`](backlog.md) and
+   [`plan/09-deepseek-v4-compressed.md`](plan/09-deepseek-v4-compressed.md).
+2. **GLM-4.7-Flash** (~30B MoE). Mostly standard MoE FFN — infr's batched-expert
+   path covers it — plus minor arch quirks (post-norm / partial RoPE); expect
+   recipe steps 3–4 only. Some GLM variants ship native MTP heads, which infr
+   currently parks ([`mtp.md`](mtp.md)) — those tensors go unused rather than
+   unsupported. ERNIE 4.5 21B-A3B, the other MoE named here, has landed
+   ([`plan/02-ernie4-5.md`](plan/02-ernie4-5.md)).
 3. **Nemotron-Nano / Nemotron-H** (Mamba2-Transformer hybrid MoE). Adds **Mamba2
    SSM**, extending the existing `Conv1dSilu` + `DeltaNet` linear-attention
    machinery — a real differentiator, since llama.cpp's Mamba-hybrid GGUF path
@@ -386,30 +395,3 @@ defaults, the `<|turn>` / `<|channel>` / `<|tool_call>` wire format) is **not
 duplicated here** — it is in [`diffusion-gemma.md`](diffusion-gemma.md),
 alongside the denoise-graph design. Read those values from GGUF metadata at
 runtime; do not hardcode them.
-
----
-
-## Historical: the original milestones
-
-The MVP shipped against **autoregressive** decoders (Llama / Qwen2 / Qwen3 /
-Qwen3-MoE / Gemma 3 / Gemma 4) before DiffusionGemma. Kept for the record — the
-acceptance criteria are what each milestone was actually held to.
-
-| #   | Milestone        | Done when                                                            | Status |
-| --- | ---------------- | -------------------------------------------------------------------- | ------ |
-| 1   | compute smoke    | f16 coop-matrix matmul on the GPU matches CPU within tolerance       | ✅     |
-| 2   | core trait       | `Tensor`/`Graph`/`Op`/`Backend` compile; a 2-op graph runs on Vulkan | ✅     |
-| 3   | `infr pull`      | resolve + resumable download into the shared HF cache                | ✅     |
-| 4   | Vulkan backend   | matmul/dequant/rmsnorm/rope/softmax each validated vs CPU            | ✅     |
-| 5   | GGUF loader      | weights upload; tokenizer + embedded chat template exposed           | ✅     |
-| 6   | forward pass     | final logits match llama.cpp top-k on a fixed prompt                 | ✅     |
-| 7   | attention + MoE  | multi-layer forward matches reference (SWA + full + MoE)             | ✅     |
-| 8   | diffusion decode | fixed-seed generation matches the llama.cpp fork's text              | ✅     |
-| 9   | `infr run`       | interactive terminal chat streams a coherent answer                  | ✅     |
-| 10  | `infr serve`     | opencode / Claude Code CLI complete an agentic tool turn             | ✅     |
-| 11  | perf pass        | ongoing — [`perf/playbook.md`](perf/playbook.md)                     | 🔄     |
-| 12  | second backend   | the op-list seam runs on CPU, Vulkan **and** Metal                   | ✅     |
-
-The Metal backend and the CPU reference both arrived through milestone 12, which
-is the load-bearing evidence that the seam holds: neither required a change
-above `compute`.

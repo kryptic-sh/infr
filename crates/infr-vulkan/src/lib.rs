@@ -12,13 +12,14 @@
 mod adapter;
 mod caps;
 pub mod ep;
-mod exl3;
 mod gemm;
+#[cfg(test)]
+mod kq_gemm_tests;
 pub mod linear;
 mod matmul;
+mod multi;
 mod ops;
 pub mod p2p;
-pub mod paged;
 pub mod pager;
 mod pcache;
 pub mod pipeline;
@@ -27,6 +28,7 @@ mod spirv;
 pub mod tp;
 pub mod tp_allreduce;
 pub mod tp_sem;
+pub mod tuning;
 mod vkext;
 
 pub use ep::{EpBuffer, ExpertParallelBackend};
@@ -190,8 +192,10 @@ static DEVICE_CLASS: std::sync::OnceLock<DeviceClass> = std::sync::OnceLock::new
 /// A PROCESS-GLOBAL because its one consumer, the seam's `ubatch_rows`, is itself a process-global
 /// funnel: the prefill loop, the activation reserve, and the SWA ring sizing must all agree on ONE
 /// chunk height, and they are reached from call sites that hold no backend handle. Same shape and
-/// lifetime as the seam's existing `PINNED_UBATCH`. A multi-GPU process mixing an iGPU and a dGPU
-/// would pin whichever opened first; infr opens exactly one device per process today.
+/// lifetime as the seam's existing `PINNED_UBATCH`. It is the FIRST device's class, so it speaks
+/// for a single-device process only: the multi-device wrappers ([`TensorParallelBackend`],
+/// [`ExpertParallelBackend`], [`PipelineBackend`]) report their ranks' most conservative class from
+/// `capabilities()`, and the seam sizes their prefill chunk from that instead of from here.
 pub fn device_class() -> Option<DeviceClass> {
     DEVICE_CLASS.get().copied()
 }
@@ -211,6 +215,53 @@ static MAX_STORAGE_BUFFER_RANGE: AtomicU32 = AtomicU32::new(u32::MAX);
 /// it feeds is inert until a real limit has been reported.
 pub(crate) fn max_storage_buffer_range() -> u32 {
     MAX_STORAGE_BUFFER_RANGE.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread stand-in for [`max_storage_buffer_range`] at buffer creation, so a test can
+    /// reach [`check_bindable_size`] with buffers this machine can allocate without lowering the
+    /// process-wide limit under the tests running beside it.
+    static TEST_BIND_LIMIT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Activation and KV-cache buffers are bound `WHOLE_SIZE` (a KV cache as the store→read barrier's
+/// inert descriptor), and a whole binding's effective range is the buffer's size, which must fit
+/// `maxStorageBufferRange`. Refusing it here, where a `Result` exists, keeps the recorder's
+/// infallible bind helpers sound; arena sub-tensors check their own range in `Recorder::vkb`.
+/// Staging and readback buffers are not held to it: the large ones (the pager ring) are only ever
+/// copy sources.
+fn check_bindable_size(bytes: usize) -> Result<()> {
+    let limit = max_storage_buffer_range() as u64;
+    #[cfg(test)]
+    let limit = TEST_BIND_LIMIT.with(|l| l.get()).unwrap_or(limit);
+    let span = fill_span(bytes);
+    if span > limit {
+        return Err(be(format!(
+            "a {span}-byte buffer exceeds this device's maxStorageBufferRange ({limit} bytes), the \
+             most one descriptor binding may span"
+        )));
+    }
+    Ok(())
+}
+
+/// Device features the kernels rely on with no fallback: `shaderInt8` for the int8 arithmetic in
+/// the quantized kernels, and `computeFullSubgroups` for the `REQUIRE_FULL_SUBGROUPS` flag every
+/// subgroup-pinned pipeline is created with (`ops::try_make_compute_kernel`). A device without one
+/// is refused here, naming the feature, rather than failing `create_device` or pipeline creation.
+fn check_required_features(shader_int8: bool, compute_full_subgroups: bool) -> Result<()> {
+    for (have, name) in [
+        (shader_int8, "shaderInt8"),
+        (compute_full_subgroups, "computeFullSubgroups"),
+    ] {
+        if !have {
+            return Err(be(format!(
+                "infr's Vulkan backend requires the {name} device feature, which this device does \
+                 not report — falling back to another backend"
+            )));
+        }
+    }
+    Ok(())
 }
 
 // ── shared GPU state ──────────────────────────────────────────────────────────
@@ -260,7 +311,11 @@ struct VulkanShared {
     device: ash::Device,
     queue: vk::Queue,
     queue_family_index: u32,
-    /// Serialises all one-shot command-buffer submissions.
+    /// The command pool every recorder and one-shot submission allocates from. Every use copies
+    /// the handle out and drops the guard in the same statement, so this lock serialises nothing:
+    /// Vulkan's external synchronisation of the pool (allocate, record, free) rests on callers not
+    /// driving one backend from two threads at once — under `infr serve` that is the per-step GPU
+    /// baton (`StepGate`).
     cmd_pool: Mutex<vk::CommandPool>,
     /// Must be dropped before the device is destroyed.
     allocator: ManuallyDrop<Mutex<Allocator>>,
@@ -273,19 +328,20 @@ struct VulkanShared {
     /// single alloc of a whole multi-GiB model is impossible. Falls back to a conservative 1 GiB
     /// (the Vulkan-guaranteed floor) if the device reports 0.
     max_mem_alloc_size: u64,
-    /// `maxPushConstantsSize` — every kernel's push block is checked against THIS rather than
-    /// against the 128 bytes Vulkan merely guarantees (see `ops::try_make_compute_kernel`, which
-    /// refuses an oversize block by name instead of letting `vkCreatePipelineLayout` fail a VUID).
-    max_push_constants: u32,
+    /// `maxPushConstantsSize` and the compute workgroup limits — every kernel's push block and
+    /// `LocalSize` are checked against THESE rather than against the floors Vulkan merely
+    /// guarantees (see `ops::try_make_compute_kernel`, which refuses an oversize kernel by name
+    /// instead of building a pipeline the spec forbids).
+    kernel_limits: crate::caps::KernelLimits,
     /// Declare round-to-nearest-even for 16-bit floats on every kernel that has an f16 type (see
     /// [`spirv::with_rte_f16`]). Set once, during construction and before any such kernel is built,
     /// and only where the driver was OBSERVED to round an f32→f16 conversion some other way — see
     /// [`VulkanBackend::arm_f16_rounding`].
     rte_f16: AtomicBool,
-    /// Wave64-only device (GCN): pipelines pin 64 and `shaders/wave64.glsl` emulates wave32 halves.
+    /// The wave64 path ([`crate::caps::SubgroupMode::Wave64`]): a wave64-only device (GCN), or one
+    /// forced onto it by `kernels.vulkan.force_wave64`. Every pipeline pins subgroup 64 and sets
+    /// `shaders/wave64.glsl`'s `W64`, which gives the wave32 kernels 32-lane virtual subgroups.
     wave64: bool,
-    /// No matrix units and no fast int8 dot: seeds the submit splitter even on a discrete GPU.
-    slow_device: bool,
     /// Set once the int8 coopmat accumulator-layout known-answer probe has run on this device:
     /// `true` = this driver lays the fragment out the way `native_gemm_i8cm_q8_0.comp` reads it.
     /// UNSET when the probe was never run, which is every default run — the tier it guards is
@@ -340,6 +396,21 @@ struct VulkanShared {
     /// takes) and released in `VkBuffer::drop` via its `act_bytes`.
     act_live: AtomicU64,
     act_peak: AtomicU64,
+    /// Record-once decode recordings made since this backend was built
+    /// ([`VulkanBackend::decode_recordings`]).
+    decode_recordings: AtomicU64,
+    /// Countdown to a forced dense placement-epoch move
+    /// ([`VulkanBackend::force_dense_epoch_move_after`]); `0` = none pending.
+    dense_epoch_move_in: AtomicU64,
+    /// What the int8 coopmat K-quant prefill GEMM has recorded ([`VulkanBackend::i8cm_kq_counts`]).
+    i8cm_kq_counts: [AtomicU64; 3],
+    /// What the multi-row GEMVs and the dp4a K-quant GEMM have recorded
+    /// ([`VulkanBackend::linear_tier_counts`]).
+    linear_tier_counts: [AtomicU64; 3],
+    /// `adapter::execute_static` calls ([`VulkanBackend::static_executes`]).
+    static_executes: AtomicU64,
+    /// Arena barriers recorded around pager staging copies ([`VulkanBackend::arena_barriers`]).
+    arena_barriers: AtomicU64,
     /// SUBMIT SPLITTER: the most dispatches `execute_static` will record into one command buffer
     /// before submitting it and opening the next (`0` = unlimited, never split).
     ///
@@ -356,8 +427,29 @@ struct VulkanShared {
     /// from measurement after every forward (`infr_core::submit_cap_from_measurement`), so the
     /// bound tracks whatever the device actually is rather than a table of magic numbers.
     submit_dispatch_cap: AtomicUsize,
-    /// Cap is only a `slow_device` seed: decode ignores it until a measured forward tightens it.
-    split_prefill_only: AtomicBool,
+    /// `device.submit_dispatches = 0` (`INFR_SUBMIT_DISPATCHES=0`) was configured: the splitter
+    /// is OFF for the life of the backend, and `observe_forward` never arms it. The variable's
+    /// documented meaning ("0 = never split — the kill switch if this ever misjudges a device");
+    /// before this flag a configured 0 only seeded the cap and the first slow forward re-armed it.
+    submit_split_disabled: bool,
+    /// Nanoseconds per timestamp tick for the per-SEGMENT GPU timing every non-persistent
+    /// [`Recorder`] writes (a timestamp before its first command and after its last), or `None`
+    /// when the compute queue family reports no timestamp bits. See [`ForwardClock`].
+    segment_ts_period: Option<f32>,
+    /// Sum of every completed segment's GPU interval (ns), added by `Recorder::finish` and
+    /// `PendingSegment::wait`. [`ForwardClock`] diffs it around a forward.
+    segment_gpu_ns: AtomicU64,
+    /// Completed segments that carried no GPU interval (no timestamp support). A forward with any
+    /// such segment is judged by its wall time instead — see [`ForwardClock::observe`].
+    untimed_segments: AtomicU64,
+    /// Segments a forward closed and submitted before its recording ended, by cause — see
+    /// [`SegmentCuts`].
+    segment_cuts: [AtomicU64; SegmentCut::COUNT],
+    /// The per-device kernel parameters, resolved once at creation (`tuning::resolve`). Every
+    /// kernel choice reads its field here; nothing looks a parameter up by name.
+    tuning: tuning::Tuning,
+    /// Where each of [`Self::tuning`]'s values came from, for `infr tune show`.
+    tuning_report: tuning::TuningReport,
     /// UNIFIED-MEMORY parts only (`None` on every discrete GPU): the host-visible memory type on
     /// the non-device-local heap that `GpuOnly` allocations SPILL into once the device-local heap
     /// is full. See [`probe_uma_overflow_type`] for why counting that heap in the budget is not
@@ -954,20 +1046,12 @@ const RING_SLOT_BYTES: usize = 32 * 1024 * 1024;
 /// widest today is a 16-byte vec4 load) with headroom to spare for future wider kernels.
 const BDA_WEIGHT_ALIGN: u64 = 256;
 
-/// Arena block size for batching small resident weights.
+/// Minimum size for a resident-BDA arena block (see [`VulkanBackend::bda_weight_alloc`]). Blocks
+/// are opened ON DEMAND — one per call that outgrows the current block's remainder — so without a
+/// floor a run of small tensors would each pay for a separate dedicated `vkAllocateMemory`. Reuses
+/// [`ARENA_OVERFLOW_BLOCK`]'s size: the same "big enough to amortize, small enough not to waste"
+/// reasoning applies unchanged.
 const BDA_BLOCK_MIN: u64 = ARENA_OVERFLOW_BLOCK;
-
-fn bda_weight_block_size(want: u64, max_alloc: u64) -> u64 {
-    let size = if want >= BDA_BLOCK_MIN / 2 {
-        want
-    } else {
-        BDA_BLOCK_MIN
-    };
-    size.min(max_alloc)
-}
-
-#[cfg(test)]
-mod bda_weight_plan_tests;
 
 /// Upper bound on ONE resident-BDA addressing unit's byte size (see [`BdaWeightArena`]'s addressing
 /// invariant). The 64-bit promotion protects the arena/expert BASE, but a tensor's (or a per-expert
@@ -1067,6 +1151,8 @@ pub struct VulkanBackend {
     /// whole device for a paged-MoE session before `moe_pager` was moved off it — see
     /// `backend_drop_frees_device_after_moe_pager`.
     bda_weight_arena: Mutex<Option<BdaWeightArena>>,
+    /// Placeholder for kernel bindings an op leaves unused — see [`Self::unused_binding`].
+    unused_binding: OnceLock<Box<dyn Buffer>>,
     /// The engine configuration this backend reads its knobs from — one value, held for the
     /// backend's whole life, borrowed (never cloned) at every read site.
     ///
@@ -1194,8 +1280,26 @@ impl Drop for WeightProgress {
 
 impl infr_core::backend::ProgressScope for WeightProgress {}
 
+#[cfg(test)]
+thread_local! {
+    /// Per-test-thread stand-in for the device's [`caps::KernelLimits`], so a test can play a
+    /// device with smaller compute limits than this one without changing it for the tests beside
+    /// it. Read only through [`VulkanBackend::kernel_limits`].
+    pub(crate) static TEST_KERNEL_LIMITS: std::cell::Cell<Option<caps::KernelLimits>> =
+        const { std::cell::Cell::new(None) };
+}
+
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl VulkanBackend {
+    /// The limits every kernel is built against and every wide-vs-narrow kernel choice consults.
+    pub(crate) fn kernel_limits(&self) -> caps::KernelLimits {
+        #[cfg(test)]
+        if let Some(l) = TEST_KERNEL_LIMITS.with(std::cell::Cell::get) {
+            return l;
+        }
+        self.shared.kernel_limits
+    }
+
     /// `maxComputeSharedMemorySize` for the active device — the per-workgroup shared-memory budget
     /// the flash-attention tile height is sized against (cheap accessor; avoids cloning caps).
     pub fn max_shared_memory_bytes(&self) -> u32 {
@@ -1207,6 +1311,29 @@ impl VulkanBackend {
     /// copies the `name: String`) — safe to call per-op inside the adapter's hot lowering loop.
     pub(crate) fn caps(&self) -> &Capabilities {
         &self.shared.caps
+    }
+
+    /// A small zeroed buffer to bind where a kernel ignores the binding (`moe_topk`'s bias and
+    /// hash-ids slots when the model has neither). One per backend, so it outlives every
+    /// recording that binds it — replay tapes included — and costs no allocation per lowering.
+    pub(crate) fn unused_binding(&self) -> Result<&dyn Buffer> {
+        if let Some(b) = self.unused_binding.get() {
+            return Ok(b.as_ref());
+        }
+        let b = self.alloc(4, BufferUsage::Activations)?;
+        Ok(self.unused_binding.get_or_init(|| b).as_ref())
+    }
+
+    /// The resolved per-device kernel parameters (see the `tuning` module).
+    #[inline]
+    pub(crate) fn tuning(&self) -> &tuning::Tuning {
+        &self.shared.tuning
+    }
+
+    /// Every tuning parameter's value on this device and the level it came from — what `infr tune
+    /// show` prints. Its [`tuning::TuningReport::hash`] is in the device banner.
+    pub fn tuning_report(&self) -> &tuning::TuningReport {
+        &self.shared.tuning_report
     }
 
     /// Borrowed engine configuration — every knob this backend (and the seam code holding it)
@@ -1236,6 +1363,111 @@ impl VulkanBackend {
             .collect();
         v.sort_unstable();
         v
+    }
+
+    /// How many record-once decode recordings this backend has made. A caller that compiles one
+    /// decode plan and executes it for every token records it once (again only if a bound buffer
+    /// changes); one that compiles a plan per token records once per token on an eligible graph,
+    /// and never on an ineligible one. The first is the fast decode path, and the output alone
+    /// cannot tell it from the others, so this is how a test sees which one ran.
+    pub fn decode_recordings(&self) -> u64 {
+        self.shared.decode_recordings.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: move the dense streaming session's placement epoch
+    /// (`pager::DensePagerSession::placement_epoch`) just before the `n`th decode replay from now
+    /// checks it (`n >= 1`; `0` cancels a pending move). Nothing is re-placed, so a correct
+    /// replay re-records once and decodes the same tokens; [`Self::decode_recordings`] shows the
+    /// second recording. A backend that does not replay a streamed decode never counts down.
+    pub fn force_dense_epoch_move_after(&self, n: u64) {
+        self.shared.dense_epoch_move_in.store(n, Ordering::Relaxed);
+    }
+
+    /// Count one decode replay down toward [`Self::force_dense_epoch_move_after`]'s move: `true`
+    /// for the one that reaches it.
+    pub(crate) fn take_dense_epoch_move(&self) -> bool {
+        self.shared
+            .dense_epoch_move_in
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok_and(|was| was == 1)
+    }
+
+    /// How many `adapter::execute_static` calls this backend has made since it was built. The
+    /// record-once decode replay also records op by op and is not counted. A layer-major prefill
+    /// makes one per (layer, chunk) and a chunk-major one one per chunk, which the output cannot
+    /// show, so this is how a test sees which order ran.
+    pub fn static_executes(&self) -> u64 {
+        self.shared.static_executes.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_static_execute(&self) {
+        self.shared.static_executes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many arena barriers (`Recorder::arena_stream_barrier`) this backend has recorded since
+    /// it was built — the explicit ordering around a pager's staging copies into a pointer-read
+    /// arena, dense and MoE alike. A dense streaming forward records two per block it copies and
+    /// none for a block that is already resident.
+    pub fn arena_barriers(&self) -> u64 {
+        self.shared.arena_barriers.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn note_arena_barrier(&self) {
+        self.shared.arena_barriers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether prefill Linears on Q4_K/Q5_K/Q6_K weights take the int8 cooperative-matrix GEMM
+    /// on this backend (see `i8cm_kq_ready`): a test asks this to know which numerics it scores,
+    /// and to say so when it skips.
+    pub fn int8_coopmat_prefill(&self) -> bool {
+        self.i8cm_kq_ready()
+    }
+
+    /// How many int8 coopmat K-quant GEMMs this backend has recorded, per tile, and how many
+    /// activation quant passes their Linears recorded (one fewer per Linear that reused the
+    /// previous one's). The output cannot show which GEMM or how many quant passes ran, so this
+    /// is how a test sees it.
+    pub fn i8cm_kq_counts(&self) -> I8cmKqCounts {
+        let c = |i: usize| self.shared.i8cm_kq_counts[i].load(Ordering::Relaxed);
+        I8cmKqCounts {
+            large_tile: c(0),
+            medium_tile: c(1),
+            quant_passes: c(2),
+        }
+    }
+
+    /// Count one recorded int8 coopmat K-quant GEMM, or one activation quant pass of such a
+    /// Linear, for [`Self::i8cm_kq_counts`].
+    pub(crate) fn note_i8cm_kq(&self, what: I8cmKqEvent) {
+        let i = match what {
+            I8cmKqEvent::LargeTile => 0,
+            I8cmKqEvent::MediumTile => 1,
+            I8cmKqEvent::QuantPass => 2,
+        };
+        self.shared.i8cm_kq_counts[i].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many multi-row GEMVs (int8 and dequant, two or more rows) and packed-int8-dot K-quant
+    /// GEMMs this backend has recorded. Like [`Self::i8cm_kq_counts`], these are kernel choices
+    /// the output cannot show — the alternatives agree to within rounding — so a test reads them
+    /// here.
+    pub fn linear_tier_counts(&self) -> LinearTierCounts {
+        let c = |i: usize| self.shared.linear_tier_counts[i].load(Ordering::Relaxed);
+        LinearTierCounts {
+            mrow_int8: c(0),
+            mrow_dequant: c(1),
+            dp4a_kq: c(2),
+        }
+    }
+
+    /// Count one recorded Linear kernel for [`Self::linear_tier_counts`].
+    pub(crate) fn note_linear_tier(&self, what: LinearTierEvent) {
+        let i = match what {
+            LinearTierEvent::MrowInt8 => 0,
+            LinearTierEvent::MrowDequant => 1,
+            LinearTierEvent::Dp4aKq => 2,
+        };
+        self.shared.linear_tier_counts[i].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Initialize Vulkan: create instance, pick a GPU (prefer discrete), create a logical
@@ -1570,10 +1802,9 @@ impl VulkanBackend {
             None => Self::pick_default_device(&instance, &pdevices, cfg.device.dev.as_deref())?,
         };
 
-        let dev_props = unsafe { instance.get_physical_device_properties(physical_device) };
         // Selection log: which of the enumerated devices this backend actually bound.
         {
-            let p = &dev_props;
+            let p = unsafe { instance.get_physical_device_properties(physical_device) };
             let name = unsafe { CStr::from_ptr(p.device_name.as_ptr()) }.to_string_lossy();
             let idx = pdevices.iter().position(|&pd| pd == physical_device);
             tracing::info!(
@@ -1584,44 +1815,29 @@ impl VulkanBackend {
         }
 
         // ── compute queue family ───────────────────────────────────────────────
-        // A COMPUTE-only family runs on the `comp` rings, a separate engine from the `gfx` ring
-        // the compositor submits on, so a multi-second prefill delays KWin's frame instead of
-        // blocking it. Falls back to the universal family, which is the only one NVIDIA-class
-        // drivers offer. llama.cpp picks the same way (its `GGML_VK_ALLOW_GRAPHICS_QUEUE` is the
-        // escape hatch). Integrated parts keep the universal family: there the `comp` ring's hang
-        // budget measured tighter than `gfx`, and the submit splitter already bounds the job.
+        // The first COMPUTE-capable family. On amdgpu this is the universal (graphics) family, so
+        // the work lands on the `gfx` ring. Moving it to a compute-ONLY family (the `comp` rings)
+        // was tried and is strictly WORSE on the surveyed integrated part: the same ~2 s forward
+        // that is an intermittent device-lost on `gfx` is a DETERMINISTIC one on `comp` (measured
+        // 4/4 runs), i.e. the compute ring's effective hang budget there is TIGHTER, not the 60 s
+        // its module-parameter default advertises. The submit splitter is what actually bounds the
+        // job (see `VulkanShared::submit_dispatch_cap`); the ring choice is not a lever.
         let qf_props =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-        let is_compute =
-            |p: &vk::QueueFamilyProperties| p.queue_flags.contains(vk::QueueFlags::COMPUTE);
-        let compute_only = |p: &vk::QueueFamilyProperties| {
-            is_compute(p) && !p.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-        };
-        let want_compute_ring =
-            dev_props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU && !vkcfg.gfx_queue;
-        let queue_family_index = want_compute_ring
-            .then(|| qf_props.iter().position(compute_only))
-            .flatten()
-            .or_else(|| qf_props.iter().position(is_compute))
-            .ok_or_else(|| be("no compute queue family found"))?
-            as u32;
-        let on_graphics_ring = qf_props[queue_family_index as usize]
-            .queue_flags
-            .contains(vk::QueueFlags::GRAPHICS);
-        if on_graphics_ring {
-            tracing::warn!(
-                "[infr] vulkan: queue family {queue_family_index} shares the graphics ring with \
-                 the compositor; a long forward stalls the desktop's frames"
-            );
-        }
-        tracing::info!(
-            "[infr] vulkan: queue family {queue_family_index} ({})",
-            if on_graphics_ring {
-                "graphics ring, shared with the compositor"
-            } else {
-                "compute-only ring"
-            }
-        );
+        let queue_family_index = qf_props
+            .iter()
+            .position(|p| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            .map(|i| i as u32)
+            .ok_or_else(|| be("no compute queue family found"))?;
+        // Per-segment GPU timing for the submit splitter (`ForwardClock`): usable only when the
+        // chosen queue family writes timestamps at all.
+        let segment_ts_period = (qf_props[queue_family_index as usize].timestamp_valid_bits > 0)
+            .then(|| {
+                unsafe { instance.get_physical_device_properties(physical_device) }
+                    .limits
+                    .timestamp_period
+            })
+            .filter(|p| *p > 0.0);
 
         // ── probe device extensions ────────────────────────────────────────────
         let avail_exts = unsafe { instance.enumerate_device_extension_properties(physical_device) }
@@ -1778,6 +1994,33 @@ impl VulkanBackend {
         let has_memmodel_dev = memmodel_feat.vulkan_memory_model_device_scope != 0;
         let has_sgsize = sgsize_feat.subgroup_size_control != 0;
         let has_full_sg = sgsize_feat.compute_full_subgroups != 0;
+        // ── subgroup width ── decided before the coopmat tiers below, which wave64 turns off.
+        let sg_mode = {
+            let mut sg_props = vk::PhysicalDeviceSubgroupProperties::default();
+            let mut sgsize_props = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default()
+                .push_next(&mut sg_props)
+                .push_next(&mut sgsize_props);
+            unsafe { instance.get_physical_device_properties2(physical_device, &mut p2) };
+            let probe = crate::caps::SubgroupProbe {
+                size_control: has_sgsize,
+                min: if has_sgsize {
+                    sgsize_props.min_subgroup_size
+                } else {
+                    0
+                },
+                max: if has_sgsize {
+                    sgsize_props.max_subgroup_size
+                } else {
+                    0
+                },
+                operations: sg_props.supported_operations,
+                stages: sg_props.supported_stages,
+            };
+            crate::caps::subgroup_mode(&probe, vkcfg.force_wave64)
+                .map_err(|e| be(format!("{e} — falling back to another backend")))?
+        };
+        let wave64 = matches!(sg_mode, crate::caps::SubgroupMode::Wave64 { .. });
         // Packed i8 dot: ext advertised AND the feature bit set (same ext-AND-feature discipline as
         // coopmat). Detection-only — the current i8 mmv is DEFAULT-OFF at m=1 (scalar wins), and no
         // shader here uses the ext builtin yet, so we don't add it to the enabled feature chain; the
@@ -1992,6 +2235,10 @@ impl VulkanBackend {
         let has_f16 = has_f16 && vkcfg.f16;
         let coopmat_f16 = coopmat_f16
             .filter(|_| has_f16 && vkcfg.coopmat)
+            // A cooperative matrix spans the whole subgroup, so `wave64.glsl`'s 32-lane halves
+            // cannot hold the 32-lane fragment layout every coopmat kernel here is written for.
+            // Dropping f16 drops every coopmat sub-tier below with it.
+            .filter(|_| !wave64)
             .filter(|&s| {
                 // 8x8x16 additionally needs a pinnable subgroup size 16: the `_cm8` builds run
                 // 128 threads = 8 warps × 16 lanes (XMX/DPAS is SIMD16-native) and reuse the
@@ -2125,7 +2372,7 @@ impl VulkanBackend {
         //   (required by coopmat), cooperativeMatrix itself.
         let mut shader_f16_ci = vk::PhysicalDeviceShaderFloat16Int8Features::default()
             .shader_float16(has_f16)
-            .shader_int8(true);
+            .shader_int8(has_int8);
         let mut storage16_ci = vk::PhysicalDevice16BitStorageFeatures::default()
             .storage_buffer16_bit_access(has_16bit_storage);
         let mut storage8_ci = vk::PhysicalDevice8BitStorageFeatures::default()
@@ -2222,9 +2469,7 @@ impl VulkanBackend {
         let mut maint3_props = vk::PhysicalDeviceMaintenance3Properties::default();
         // Float controls (core in Vulkan 1.2) say whether a shader may declare its f16 rounding.
         let mut float_controls = vk::PhysicalDeviceFloatControlsProperties::default();
-        let mut subgroup_props = vk::PhysicalDeviceSubgroupProperties::default();
         let mut props2 = vk::PhysicalDeviceProperties2::default()
-            .push_next(&mut subgroup_props)
             .push_next(&mut sgsize_props)
             .push_next(&mut maint3_props)
             .push_next(&mut float_controls);
@@ -2242,87 +2487,29 @@ impl VulkanBackend {
             .into_owned();
         // (0,0) when subgroup-size-control is unsupported: can't pin any size — the adapter treats
         // that as "no 32-pin available" and uses the driver's default subgroup for the fallback.
-        let (subgroup_min, subgroup_max) = if has_sgsize {
-            (
+        // Under `kernels.vulkan.force_wave64` the range reads [64, 64], so every tier decision
+        // downstream sees what a wave64-only device would report.
+        let (subgroup_min, subgroup_max) = match sg_mode {
+            crate::caps::SubgroupMode::Wave64 { forced: true } => (64, 64),
+            _ if has_sgsize => (
                 sgsize_props.min_subgroup_size,
                 sgsize_props.max_subgroup_size,
-            )
-        } else {
-            (0, 0)
+            ),
+            _ => (0, 0),
         };
-
-        // Kernels are written for wave32; wave64-only devices run them as 32-lane halves (wave64.glsl).
-        let pin32 = has_sgsize && subgroup_min <= 32 && 32 <= subgroup_max;
-        let wave64 = !pin32 && has_sgsize && subgroup_min <= 64 && 64 <= subgroup_max;
-        if !pin32 && !wave64 {
-            return Err(be(format!(
-                "infr's Vulkan backend requires a pinnable subgroup size of 32 or 64; this \
-                 device's subgroup range is [{subgroup_min}, {subgroup_max}] and \
-                 subgroup_size_control={has_sgsize} — falling back to another backend"
-            )));
+        // The subgroup width itself was settled above (`sg_mode`), before the coopmat tiers.
+        check_required_features(has_int8, has_full_sg)?;
+        match sg_mode {
+            crate::caps::SubgroupMode::Native => {}
+            crate::caps::SubgroupMode::Wave64 { forced: false } => tracing::info!(
+                "[infr] wave64-only device: running the wave32 kernels on 32-lane virtual \
+                 subgroups; cooperative-matrix tiers off"
+            ),
+            crate::caps::SubgroupMode::Wave64 { forced: true } => tracing::warn!(
+                "[infr] kernels.vulkan.force_wave64: running the wave64 emulation on a device that \
+                 can pin 32 (testing only); cooperative-matrix tiers off"
+            ),
         }
-        // wave64.glsl puts clustered and shuffle ops in every module, live or not.
-        let need_ops = vk::SubgroupFeatureFlags::BASIC
-            | vk::SubgroupFeatureFlags::ARITHMETIC
-            | vk::SubgroupFeatureFlags::CLUSTERED
-            | vk::SubgroupFeatureFlags::SHUFFLE;
-        if !subgroup_props
-            .supported_stages
-            .contains(vk::ShaderStageFlags::COMPUTE)
-            || !subgroup_props.supported_operations.contains(need_ops)
-        {
-            return Err(be(format!(
-                "infr's Vulkan backend requires basic/arithmetic/clustered/shuffle subgroup ops in \
-                 compute; this device reports operations {:?} in stages {:?} — falling back to \
-                 another backend",
-                subgroup_props.supported_operations, subgroup_props.supported_stages
-            )));
-        }
-        if wave64 {
-            tracing::info!("[infr] wave64-only device: running wave32 kernels as 32-lane halves");
-        }
-
-        // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────
-        // Capability-driven: any device whose smallest pinnable subgroup is ≤16 likely has
-        // SIMD8/SIMD16 EUs (Intel Arc, future small-subgroup GPUs) where pinning the decode
-        // GEMV family at 32 starves per-lane registers (llama.cpp pins 16 for mul_mat_vec
-        // on Intel for exactly this). `max(16, subgroup_min)` keeps this Battlemage-proof
-        // (min=8 SKUs still get 16, never 8 — the kernels' lane math is only built for 16/32).
-        // Everything else (RADV 32-64, NVIDIA 32) keeps 32, so the default kernel/pipeline
-        // set there is byte-identical to before this field existed.
-        let sg_default = if subgroup_min <= 16 {
-            16u32.max(subgroup_min)
-        } else {
-            32
-        };
-        // `device.subgroup_pref` (`INFR_SG=16|32`): A/B override (Intel testers; inert on devices
-        // that can't pin the value). The env layer already rejects anything but "16"/"32", as it
-        // always has, but the field is now also reachable from the TOML file and `--set`, so
-        // the "only 16 and 32 have builds" POLICY stays here at the consumer (R5) and still refuses
-        // a value it has no kernels for.
-        let sg_pref = match cfg.device.subgroup_pref {
-            Some(16) => 16,
-            Some(32) => 32,
-            Some(other) => {
-                return Err(be(format!(
-                    "device.subgroup_pref (INFR_SG) must be 16 or 32 (got {other}) — the decode \
-                     GEMV family only has subgroup-16 and subgroup-32 builds"
-                )))
-            }
-            None => sg_default,
-        };
-        // A 16 request/default is only usable where 16 is pinnable; otherwise CLEANLY fall back
-        // to 32 (e.g. INFR_SG=16 on RADV wave32: subgroup_min == 32 → stays 32, path set
-        // unchanged). 32 is always pinnable here (hard-required above).
-        let sg_pref = if sg_pref == 16 && !(subgroup_min <= 16 && 16 <= subgroup_max) {
-            tracing::warn!(
-                "[infr] INFR_SG=16 requested but this device's subgroup range \
-                 [{subgroup_min}, {subgroup_max}] cannot pin 16 — keeping 32"
-            );
-            32
-        } else {
-            sg_pref
-        };
 
         // ── integrated GPU + compute-unit count ───────────────────────────────────────────────
         // An iGPU/APU is NOT just "a slow discrete card": it is forced onto the non-coopmat kernel
@@ -2337,6 +2524,40 @@ impl VulkanBackend {
         // queries the device again.
         let compute_units = crate::caps::shader_core_count(&device_probe);
 
+        // ── tuning: every per-device kernel parameter, resolved once ──────────────────────────
+        // The table's generic defaults, its matching rows, then the user's tuning file, config,
+        // environment and command line (`tuning::resolve`). A value the user wrote that fails
+        // validation refuses the device here, naming where it came from.
+        let facts = tuning::DeviceFacts {
+            name: device_name.clone(),
+            vendor_id: device_probe.vendor_id,
+            device_id: device_probe.device_id,
+            driver: device_probe
+                .driver_id_reported
+                .then(|| tuning::driver_name(device_probe.driver_id)),
+            driver_version: props.driver_version,
+            arch: tuning::arch_name(device_arch),
+            integrated,
+            compute_units,
+            subgroup_min,
+            subgroup_max,
+            wave64: matches!(sg_mode, crate::caps::SubgroupMode::Wave64 { .. }),
+            max_shared_memory: props.limits.max_compute_shared_memory_size,
+        };
+        let tuning::resolve::Resolved {
+            tuning: tuned,
+            report: tuning_report,
+        } = tuning::resolve::resolve(&facts, &cfg).map_err(be)?;
+
+        // ── sg_pref: pinned subgroup size for the decode GEMV/reduction family ────────────────
+        // `device.sg_pref`: its generic default is the capability rule in `tuning::families`, and
+        // `device.subgroup_pref` (`INFR_SG`) is its alias; a value other than 16 or 32 was refused
+        // by the resolver above, which names the setting. A 16 the device cannot pin (e.g.
+        // INFR_SG=16 on RADV wave32: subgroup_min == 32) already came back as 32, with a warning,
+        // so the report and its hash carry the width in use (`tuning::families::in_use`). 32 is
+        // always pinnable here (hard-required above).
+        let sg_pref = tuned.sg_pref;
+
         let caps = Capabilities {
             name: device_name,
             f16: has_f16,
@@ -2346,7 +2567,6 @@ impl VulkanBackend {
             coopmat_f8,
             i8: has_int8,
             i8_dot: has_i8_dot,
-            i8_dot_fast: has_i8_dot && device_probe.dot4x8_signed_accelerated,
             coopmat_i8,
             bf16: has_bf16_ext && post_ash.bf16_type,
             coopmat_bf16,
@@ -2381,7 +2601,6 @@ impl VulkanBackend {
             // Every KV write/read kernel maps position -> row modulo the cache's row capacity
             // (identity on full-context caches), so SWA layers may get window-sized ring caches.
             kv_swa_ring: true,
-            kv_paging: true,
             // `execute_static`/the replay tape dispatch straight against the bound buffers (only
             // `Internal` handles get backend scratch — see `alloc_scratch`), so an op writing a
             // bound `Input` writes the caller's memory and the next execute sees it.
@@ -2412,7 +2631,7 @@ impl VulkanBackend {
         let yn = |b: bool| if b { "y" } else { "n" };
         tracing::info!(
             "[infr] GPU: {} | {:?}/{} | f16:{} f16cm:{} bf16:{} bf16cm:{} f8:{} f8cm:{} i8:{} \
-             i8dot:{} i8cm:{} cm2:{} subgroup:{}-{} sgp:{} cores:{} shared:{}KB",
+             i8dot:{} i8cm:{} cm2:{} subgroup:{}-{} sgp:{} cores:{} shared:{}KB tune:{}",
             caps.name,
             device_arch,
             driver_label,
@@ -2437,19 +2656,33 @@ impl VulkanBackend {
                 "?".to_string()
             },
             caps.max_shared_memory_bytes / 1024,
+            tuning_report.hash(),
         );
+        // The fp8 tier is opt-in and unvalidated (see `native_gemm_f8cm_q8_0.comp`): say so where
+        // the flag is read, so its output is never mistaken for a supported path's.
+        if cfg.kernels.vulkan.f8_coopmat {
+            tracing::warn!(
+                "[infr] INFR_F8_COOPMAT: EXPERIMENTAL, not validated on hardware — the fp8 Q8_0 \
+                 prefill GEMM casts weights to E4M3 without a scale, losing most of their \
+                 precision ({} on this device)",
+                if caps.f8_coopmat() {
+                    "ENGAGED"
+                } else {
+                    "inert: no fp8 cooperative matrix"
+                }
+            );
+        }
         // Submit splitter (see `VulkanShared::submit_dispatch_cap`): the initial, pre-measurement
         // cap. `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides it (`0` = never
         // split) — the kill switch if this ever misjudges a device. A non-numeric value is still
         // rejected loudly, now by the env layer, with the SAME text
         // (`ConfigError::Env` renders as `INFR_SUBMIT_DISPATCHES: expected a dispatch count …`).
-        let slow_device =
-            wave64 || (!caps.f16_coopmat() && !device_probe.dot4x8_signed_accelerated);
-        let submit_dispatch_cap = cfg.device.submit_dispatches.unwrap_or_else(|| {
-            infr_core::initial_submit_dispatch_cap(caps.integrated, slow_device)
-        });
-        let split_prefill_only =
-            cfg.device.submit_dispatches.is_none() && !caps.integrated && slow_device;
+        // A configured 0 is the kill switch: never split, and never let a measurement arm it.
+        let submit_split_disabled = cfg.device.submit_dispatches == Some(0);
+        let submit_dispatch_cap = cfg
+            .device
+            .submit_dispatches
+            .unwrap_or_else(|| infr_core::initial_submit_dispatch_cap(caps.integrated));
         // Integrated GPUs run a DIFFERENT shape of forward (smaller prefill chunk, and the whole
         // pass split across several submits so no single command buffer can trip the GPU's hang
         // watchdog), so say so out loud: it is the first thing to check when an iGPU run hangs or
@@ -2475,13 +2708,10 @@ impl VulkanBackend {
         if caps.unified_memory {
             let mp = unsafe { instance.get_physical_device_memory_properties(physical_device) };
             let (mut all, mut dev_local) = (0u64, 0u64);
-            for i in 0..mp.memory_heap_count as usize {
-                all += mp.memory_heaps[i].size;
-                if mp.memory_heaps[i]
-                    .flags
-                    .contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
-                {
-                    dev_local += mp.memory_heaps[i].size;
+            for heap in &mp.memory_heaps[..mp.memory_heap_count as usize] {
+                all += heap.size;
+                if heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL) {
+                    dev_local += heap.size;
                 }
             }
             tracing::info!(
@@ -2555,6 +2785,7 @@ impl VulkanBackend {
             moe_pager: Mutex::new(None),
             dense_pager: Mutex::new(None),
             bda_weight_arena: Mutex::new(None),
+            unused_binding: OnceLock::new(),
             cfg,
             shared: Arc::new(VulkanShared {
                 _entry: entry,
@@ -2568,10 +2799,9 @@ impl VulkanBackend {
                 caps,
                 has_mem_budget,
                 max_mem_alloc_size,
-                max_push_constants: props.limits.max_push_constants_size,
+                kernel_limits: crate::caps::KernelLimits::of(&props.limits),
                 rte_f16: AtomicBool::new(false),
                 wave64,
-                slow_device,
                 i8cm_layout_ok: OnceLock::new(),
                 push_descriptor,
                 external_memory_fd,
@@ -2584,8 +2814,20 @@ impl VulkanBackend {
                 device_used: AtomicU64::new(0),
                 act_live: AtomicU64::new(0),
                 act_peak: AtomicU64::new(0),
+                decode_recordings: AtomicU64::new(0),
+                dense_epoch_move_in: AtomicU64::new(0),
+                i8cm_kq_counts: [const { AtomicU64::new(0) }; 3],
+                linear_tier_counts: [const { AtomicU64::new(0) }; 3],
+                static_executes: AtomicU64::new(0),
+                arena_barriers: AtomicU64::new(0),
                 submit_dispatch_cap: AtomicUsize::new(submit_dispatch_cap),
-                split_prefill_only: AtomicBool::new(split_prefill_only),
+                submit_split_disabled,
+                segment_ts_period,
+                tuning: tuned,
+                tuning_report,
+                segment_gpu_ns: AtomicU64::new(0),
+                untimed_segments: AtomicU64::new(0),
+                segment_cuts: [const { AtomicU64::new(0) }; SegmentCut::COUNT],
                 uma_overflow_type,
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
@@ -2599,8 +2841,60 @@ impl VulkanBackend {
         // The int8 coopmat tier's accumulator-layout check — a real dispatch, so it can only run
         // once the backend exists. No-op unless that tier is actually asked for.
         backend.verify_i8_coopmat_layout();
+        // The wave64 path's one assumption about the driver, measured before any kernel relies on
+        // it: a failure refuses the device (or the forced path) instead of computing wrong.
+        if backend.shared.wave64 {
+            let layout = backend
+                .run_wave64_probe()
+                .and_then(|out| crate::caps::check_wave64_layout(&out).map_err(be));
+            if let Err(e) = layout {
+                return Err(be(format!(
+                    "the wave64 path is unsafe on this driver ({e}) — falling back to another \
+                     backend"
+                )));
+            }
+        }
 
         Ok(backend)
+    }
+
+    /// Dispatch `wave64_probe.comp` once and return its readback (see
+    /// [`crate::caps::check_wave64_layout`] for what the words mean). Built through the fallible
+    /// kernel path, outside the kernel cache, and torn down immediately.
+    fn run_wave64_probe(&self) -> Result<Vec<u32>> {
+        let k = crate::ops::try_make_compute_kernel(
+            &self.shared.device,
+            self.shared.pipeline_cache,
+            "wave64_probe",
+            crate::gemm::wave64_probe_spv(),
+            1,
+            0,
+            None,
+            self.shared.push_descriptor.is_some(),
+            self.kernel_limits(),
+            false,
+            self.shared.wave64,
+        )?;
+        let words = crate::caps::WAVE64_PROBE_INVOCATIONS * 3;
+        let run = || -> Result<Vec<u32>> {
+            let dst = self.alloc(words * 4, BufferUsage::Readback)?;
+            let vk_bufs = [as_vk_buf(dst.as_ref())?.buffer];
+            let binding = self.eager_bind(&k, &vk_bufs)?;
+            let shared = &self.shared;
+            self.one_shot(|cmd| unsafe {
+                shared
+                    .device
+                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, k.pipeline);
+                binding.bind(shared, cmd, k.pipeline_layout);
+                shared.device.cmd_dispatch(cmd, 1, 1, 1);
+            })?;
+            let mut got = vec![0u8; words * 4];
+            self.download(dst.as_ref(), &mut got)?;
+            Ok(bytemuck::cast_slice(&got).to_vec())
+        };
+        let res = run();
+        crate::ops::destroy_compute_kernel(&self.shared.device, &k);
+        res
     }
 
     /// Declare round-to-nearest-even on f16 kernels only where the driver does not already do it.
@@ -2651,7 +2945,7 @@ impl VulkanBackend {
             16,
             None,
             self.shared.push_descriptor.is_some(),
-            self.shared.max_push_constants,
+            self.kernel_limits(),
             false,
             self.shared.wave64,
         )?;
@@ -2699,26 +2993,46 @@ impl VulkanBackend {
     /// to lay its accumulator fragment out the way the kernel reads it (see
     /// [`Self::verify_i8_coopmat_layout`]). The adapter's dispatch gate reads exactly this.
     pub(crate) fn i8_coopmat_ready(&self) -> bool {
-        self.shared.i8cm_layout_ok.get() == Some(&true)
+        self.cfg.kernels.vulkan.i8_coopmat && self.shared.i8cm_layout_ok.get() == Some(&true)
+    }
+
+    /// The int8 cooperative-matrix K-quant prefill GEMM (`native_gemm_i8cm_kq.comp`) may be
+    /// dispatched: the accumulator-layout probe passed (the kernel descales in-fragment exactly
+    /// like the Q8_0 one), and the `gemm_i8cm_kq.enabled` tuning parameter is on. Its generic
+    /// default is off; the built-in table's `amd-proprietary-i8cm-kq` row turns it on under the AMD
+    /// proprietary driver (`DriverId::AMD_PROPRIETARY`, which Linux AMDGPU-PRO reports as well as
+    /// the Windows driver; only the Windows driver was measured, CHANGELOG), and `INFR_NO_I8CM_KQ`
+    /// (`kernels.vulkan.i8cm_kq = false`) is its alias for off. RADV stays on the f16 coopmat GEMM
+    /// until someone measures it there: int8 coopmat hung an older Mesa (commit ad82a77), and the
+    /// earlier Q8_0 int8 coopmat kernel lost to f16 on RDNA4 RADV (docs/perf/playbook.md).
+    pub(crate) fn i8cm_kq_ready(&self) -> bool {
+        self.i8cm_kq_wanted() && self.shared.i8cm_layout_ok.get() == Some(&true)
+    }
+
+    /// Whether this run could dispatch the K-quant int8 coopmat GEMM, before the layout probe.
+    fn i8cm_kq_wanted(&self) -> bool {
+        self.tuning().i8cm_kq_enabled
     }
 
     /// Known-answer check of this driver's int8 coopmat accumulator fragment layout, run once at
-    /// init when the i8 coopmat tier is opted in — and the ONLY thing standing between a driver
-    /// that lays that fragment out differently and silently wrong GEMM results.
+    /// init when an int8 coopmat GEMM could be dispatched — and the ONLY thing standing between a
+    /// driver that lays that fragment out differently and silently wrong GEMM results.
     ///
-    /// `native_gemm_i8cm_q8_0.comp` applies its per-block descale IN-FRAGMENT, reading `csub[i]` as
-    /// matrix element `(2*i + (lane>>4), lane&15)`. `KHR_cooperative_matrix` fixes that mapping per
+    /// `native_gemm_i8cm_q8_0.comp` and `native_gemm_i8cm_kq.comp` apply their per-block descale
+    /// IN-FRAGMENT, reading `csub[i]` as matrix element `(2*i + (lane>>4), lane&15)`. `KHR_cooperative_matrix` fixes that mapping per
     /// IMPLEMENTATION, not across implementations: it was derived empirically on RADV/RDNA3 and no
     /// other device here has ever run it. So the tier is only armed once this device has multiplied
     /// two known matrices and read the product back through that same mapping — anything else
     /// leaves the tier OFF with a loud error, which is the one behaviour that cannot produce
     /// plausible wrong numbers on hardware nobody can test.
     ///
-    /// Does nothing (and costs nothing) unless the tier is both enumerated and opted into, so the
-    /// default run pays no init dispatch.
+    /// Does nothing (and costs nothing) unless a tier is both enumerated and wanted (the Q8_0
+    /// opt-in, or [`Self::i8cm_kq_wanted`]), so a run that could not use one pays no init
+    /// dispatch.
     fn verify_i8_coopmat_layout(&self) {
-        if !(self.shared.caps.i8_coopmat() && self.cfg.kernels.vulkan.i8_coopmat) {
-            return; // tier unreachable this run — nothing to arm, nothing to check
+        let wanted = self.cfg.kernels.vulkan.i8_coopmat || self.i8cm_kq_wanted();
+        if !(self.shared.caps.i8_coopmat() && wanted) {
+            return; // no int8 coopmat tier reachable this run — nothing to arm, nothing to check
         }
         match self.run_i8_coopmat_layout_probe() {
             Ok(out) => match crate::caps::check_i8_coopmat_layout(&out) {
@@ -2726,23 +3040,23 @@ impl VulkanBackend {
                     let _ = self.shared.i8cm_layout_ok.set(true);
                     tracing::info!(
                         "[infr] int8 coopmat: accumulator fragment layout verified on this driver \
-                         — INFR_I8_COOPMAT tier armed"
+                         — int8 coopmat GEMM tiers armed"
                     );
                 }
                 Err(why) => {
                     let _ = self.shared.i8cm_layout_ok.set(false);
                     tracing::error!(
-                        "[infr] int8 coopmat REFUSED (INFR_I8_COOPMAT=1 ignored): {why}. The GEMM \
-                         would return plausible wrong numbers on this driver, so the tier stays \
-                         off and the dp4a/coopmat-f16 tiers run instead."
+                        "[infr] int8 coopmat REFUSED: {why}. The int8 coopmat GEMMs would \
+                         return plausible wrong numbers on this driver, so they stay off and the \
+                         dp4a/coopmat-f16 tiers run instead."
                     );
                 }
             },
             Err(e) => {
                 let _ = self.shared.i8cm_layout_ok.set(false);
                 tracing::error!(
-                    "[infr] int8 coopmat REFUSED (INFR_I8_COOPMAT=1 ignored): the accumulator \
-                     layout probe could not run on this device ({e}) — the tier stays off."
+                    "[infr] int8 coopmat REFUSED: the accumulator layout probe could not run \
+                     on this device ({e}) — the int8 coopmat GEMMs stay off."
                 );
             }
         }
@@ -2764,7 +3078,7 @@ impl VulkanBackend {
             // arithmetic only holds there; pin the probe identically.
             Some(32),
             self.shared.push_descriptor.is_some(),
-            self.shared.max_push_constants,
+            self.kernel_limits(),
             self.shared.rte_f16.load(Ordering::Relaxed),
             self.shared.wave64,
         )?;
@@ -2806,65 +3120,65 @@ impl VulkanBackend {
         self.shared.submit_dispatch_cap.load(Ordering::Relaxed)
     }
 
-    /// The cap for decode recordings and chains: unlimited while the cap is only a slow-device seed.
-    pub(crate) fn decode_submit_cap(&self) -> usize {
-        if self.shared.split_prefill_only.load(Ordering::Relaxed) {
-            0
-        } else {
-            self.submit_dispatch_cap()
+    /// Start timing one forward for the submit splitter — see [`ForwardClock`].
+    pub(crate) fn forward_clock(&self) -> ForwardClock {
+        ForwardClock {
+            wall: std::time::Instant::now(),
+            gpu_ns: self.shared.segment_gpu_ns.load(Ordering::Relaxed),
+            untimed: self.shared.untimed_segments.load(Ordering::Relaxed),
         }
     }
 
-    /// Feed a completed forward's measurement back into the submit splitter: `elapsed` of wall
-    /// across `dispatches` dispatches, measured with the queue drained at both ends. Re-tunes the
-    /// cap so the NEXT forward's segments land inside `infr_core::SUBMIT_BUDGET_NS` on whatever
-    /// device this actually is — the loop that makes the splitter hardware-agnostic instead of a
-    /// table of per-GPU constants.
+    /// Feed a completed forward's measurement back into the submit splitter: `busy_ns` of GPU
+    /// time across `dispatches` dispatches (see [`ForwardClock::observe`] for where that number
+    /// comes from). Re-tunes the cap so the NEXT forward's segments land inside
+    /// `infr_core::SUBMIT_BUDGET_NS` on whatever device this actually is — the loop that makes the
+    /// splitter hardware-agnostic instead of a table of per-GPU constants.
     ///
-    /// The cap only ever RATCHETS DOWN within a process. A forward's wall time is a noisy sample
-    /// (a cold pipeline compile, a busy host, a first-touch page fault all inflate it), and the
+    /// The cap only ever RATCHETS DOWN within a process. A forward's time is a noisy sample (a
+    /// cold pipeline compile, a busy host, a first-touch page fault all inflate it), and the
     /// asymmetry of the two mistakes is total: too small a cap costs a few extra submits, too
     /// large a cap costs a device-lost. So a slow sample tightens the bound and a fast one is
     /// simply ignored.
-    pub(crate) fn observe_forward(&self, elapsed: std::time::Duration, dispatches: usize) {
-        let ns = elapsed.as_nanos() as u64;
+    pub(crate) fn observe_forward(&self, busy_ns: u64, dispatches: usize) {
         let cur = self.submit_dispatch_cap();
-        // A device that has never split (every discrete GPU) only starts splitting if a forward
-        // actually lands in watchdog territory — see `infr_core::SUBMIT_DANGER_NS`. Without this,
-        // the measured cap (finite, just very large) would eventually split a big enough graph on
-        // a perfectly healthy dGPU, which is a tuned path this has no business touching.
-        if cur == 0 && ns < infr_core::SUBMIT_DANGER_NS {
-            return;
-        }
-        let want = infr_core::submit_cap_from_measurement(ns, dispatches);
-        if want == 0 {
-            return; // measurement says "no split needed"; never loosen an existing cap on it
-        }
-        let next = if cur == 0 { want } else { cur.min(want) };
+        let next = next_submit_cap(cur, busy_ns, dispatches, self.shared.submit_split_disabled);
         if next != cur {
             self.shared
                 .submit_dispatch_cap
                 .store(next, Ordering::Relaxed);
-            self.shared
-                .split_prefill_only
-                .store(false, Ordering::Relaxed);
             // SAY IT OUT LOUD when a never-split device starts splitting. This transition is
-            // latched (the cap only ratchets down) and it is decided by ONE wall-clock sample, so
-            // a slow first forward — a cold pipeline build, a loaded host — permanently changes
-            // the submit structure of every later forward in the process. Two runs of the same
-            // command can therefore differ in submit count while dispatching byte-identical
-            // kernels, which is invisible in `INFR_PROF_OPS` and looks exactly like unexplained
-            // benchmark variance. `infr bench` reports the final cap for the same reason.
+            // latched (the cap only ratchets down) and it is decided by ONE sample, so a slow
+            // forward permanently changes the submit structure of every later forward in the
+            // process. Two runs of the same command can therefore differ in submit count while
+            // dispatching byte-identical kernels, which is invisible in `INFR_PROF_OPS` and looks
+            // exactly like unexplained benchmark variance. `infr bench` reports the final cap for
+            // the same reason.
             if cur == 0 {
                 tracing::warn!(
-                    "[infr] submit splitter ARMED: a forward took {:.0} ms over {dispatches} \
-                     dispatches (past the {} ms danger threshold), so forwards now split every \
-                     {next} dispatches for the rest of this process. Set \
-                     INFR_SUBMIT_DISPATCHES=0 to disable.",
-                    ns as f64 / 1e6,
+                    "[infr] submit splitter ARMED: a forward kept the GPU busy {:.0} ms over                      {dispatches} dispatches (past the {} ms danger threshold), so forwards now                      split every {next} dispatches for the rest of this process. Set                      INFR_SUBMIT_DISPATCHES=0 to disable.",
+                    busy_ns as f64 / 1e6,
                     infr_core::SUBMIT_DANGER_NS / 1_000_000,
                 );
             }
+        }
+    }
+
+    /// Count one segment a forward closed and submitted before its recording ended.
+    pub(crate) fn note_segment_cut(&self, cut: SegmentCut) {
+        self.shared.segment_cuts[cut as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Segments this backend's forwards have closed and submitted before their recording ended,
+    /// by cause, since the backend was created. The counters live on this backend's device state,
+    /// so two backends in one process count separately.
+    pub fn segment_cuts(&self) -> SegmentCuts {
+        let n = |c: SegmentCut| self.shared.segment_cuts[c as usize].load(Ordering::Relaxed);
+        SegmentCuts {
+            watchdog: n(SegmentCut::Watchdog),
+            early: n(SegmentCut::Early),
+            rotation: n(SegmentCut::Rotation),
+            drain: n(SegmentCut::Drain),
         }
     }
 
@@ -2927,11 +3241,49 @@ impl VulkanBackend {
             .register(role, buf_id, source, n_expert)
     }
 
-    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no paged model is loaded.
+    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no paged model is loaded. Also where
+    /// `paging.trace` is flushed, so the trace on disk covers what the printed counters cover.
     pub fn print_moe_pager_stats(&self) {
-        if let Some(s) = self.moe_pager.lock().unwrap().as_ref() {
+        if let Some(s) = self.moe_pager.lock().unwrap().as_mut() {
+            if let Err(e) = s.flush_trace() {
+                tracing::warn!("[moe pager] {e}");
+            }
             s.print_stats_if_enabled();
         }
+    }
+
+    /// The paged-MoE session's VRAM counters summed over every pool, and how many experts it
+    /// admitted as fills (`pager::MoePagerSession::fills`, also counted among the misses) — or
+    /// `None` when no paged model is loaded.
+    pub fn moe_pager_totals(&self) -> Option<(infr_core::pager::PagerStats, u64)> {
+        let guard = self.moe_pager.lock().unwrap();
+        let sess = guard.as_ref()?;
+        let mut total = infr_core::pager::PagerStats::default();
+        for (_, s, _) in sess.pool_stats() {
+            total.hits += s.hits;
+            total.misses += s.misses;
+            total.evictions += s.evictions;
+        }
+        Some((total, sess.fills()))
+    }
+
+    /// [`Self::moe_pager_totals`]'s dense twin: the dense layer-streaming session's counters summed
+    /// over every pool — or `None` when no weight of the loaded model streams. A replayed decode
+    /// step stages nothing and is not counted (see `pager::DensePagerSession::pool_stats`).
+    pub fn dense_pager_totals(&self) -> Option<crate::pager::DenseTotals> {
+        let guard = self.dense_pager.lock().unwrap();
+        let sess = guard.as_ref()?;
+        let mut t = crate::pager::DenseTotals {
+            groups: sess.n_streamed(),
+            ..Default::default()
+        };
+        for (s, host) in sess.pool_stats() {
+            t.vram.hits += s.hits;
+            t.vram.misses += s.misses;
+            t.vram.evictions += s.evictions;
+            t.file_reads += host.map_or(0, |h| h.reads);
+        }
+        Some(t)
     }
 
     /// Locked access to the paged-MoE session for the adapter's `execute_static` — `pub(crate)`
@@ -2967,9 +3319,13 @@ impl VulkanBackend {
             .register(pool, buf_id, source)
     }
 
-    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no dense-streamed model is loaded.
+    /// `INFR_PAGER_STATS=1` reporting hook — a no-op when no dense-streamed model is loaded. Also
+    /// flushes `paging.trace`, as [`Self::print_moe_pager_stats`] does.
     pub fn print_dense_pager_stats(&self) {
-        if let Some(s) = self.dense_pager.lock().unwrap().as_ref() {
+        if let Some(s) = self.dense_pager.lock().unwrap().as_mut() {
+            if let Err(e) = s.flush_trace() {
+                tracing::warn!("[dense pager] {e}");
+            }
             s.print_stats_if_enabled();
         }
     }
@@ -3298,7 +3654,11 @@ impl VulkanBackend {
         let mut guard = self.bda_weight_arena.lock().unwrap();
         let arena = guard.get_or_insert_with(BdaWeightArena::default);
 
-        // Reuse older tails after exact-sized blocks.
+        // First-fit over ALL open blocks, not just the last: a big tensor opens an exact-size
+        // (fully consumed) block, so last-block-only would strand every earlier block's tail and
+        // open a fresh `BDA_BLOCK_MIN` block for EACH tiny tensor that follows a big one — ~64 MiB
+        // stranded per norm gamma, GiBs across a model's layers (caught live: Qwen3-30B-A3B
+        // tripped the VRAM guard flag-on while fitting comfortably flag-off).
         for b in arena.blocks.iter_mut() {
             let off = b.cursor.div_ceil(BDA_WEIGHT_ALIGN) * BDA_WEIGHT_ALIGN;
             if off + want <= b.size {
@@ -3319,7 +3679,12 @@ impl VulkanBackend {
             }
         }
 
-        let block_bytes = bda_weight_block_size(want, self.shared.max_mem_alloc_size);
+        // The current block (if any) has no room: open a fresh dedicated block sized to the
+        // request, floored at `BDA_BLOCK_MIN` and capped at `max_mem_alloc_size` — a whole
+        // multi-GiB model can't be one `vkAllocateMemory`, same reasoning as `WeightArena`'s block
+        // cap. A single tensor bigger than the cap can't be placed at all; report it rather than
+        // silently truncating.
+        let block_bytes = want.max(BDA_BLOCK_MIN).min(self.shared.max_mem_alloc_size);
         if want > block_bytes {
             return Err(be(format!(
                 "resident-BDA weight tensor ({want} bytes) exceeds max_mem_alloc_size ({} bytes) \
@@ -3506,12 +3871,23 @@ impl VulkanBackend {
                 })?
         };
 
-        unsafe {
+        let bound = unsafe {
             self.shared
                 .device
                 .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
+        };
+        if let Err(e) = bound {
+            // Nothing owns the buffer or its memory yet, so release both here, as the allocation
+            // failure above does for the buffer.
+            unsafe { self.shared.device.destroy_buffer(buffer, None) };
+            let freed = self.shared.allocator.lock().unwrap().free(allocation);
+            return Err(be(match freed {
+                Ok(()) => format!("bind_buffer_memory: {e}"),
+                Err(fe) => {
+                    format!("bind_buffer_memory: {e} (freeing its allocation also failed: {fe})")
+                }
+            }));
         }
-        .map_err(|e| be(format!("bind_buffer_memory: {e}")))?;
 
         // Charge the budget guard's fallback accounting (balanced by `VkBuffer::drop`).
         if location == MemoryLocation::GpuOnly {
@@ -3614,6 +3990,9 @@ impl VulkanBackend {
         // Weights are addressed exclusively by 64-bit device address: every `BufferUsage::Weights`
         // alloc sub-allocates from the BDA arena (`bda_weight_alloc`), the ONE weight path. Every
         // other `BufferUsage` takes the gpu-allocator path in `make_buf` below.
+        if matches!(usage, BufferUsage::Activations | BufferUsage::KvCache) {
+            check_bindable_size(bytes)?;
+        }
         if usage == BufferUsage::Weights {
             let buf = self.bda_weight_alloc(bytes)?;
             if let Some(pb) = self.shared.weight_pb.lock().unwrap().as_ref() {
@@ -3823,8 +4202,8 @@ impl VulkanBackend {
     /// Record a single command into a one-shot command buffer, submit it to the
     /// compute queue, and block until idle.
     ///
-    /// The closure receives the command buffer handle to record into.
-    /// All operations are serialised through the `cmd_pool` mutex.
+    /// The closure receives the command buffer handle to record into. Not serialised against
+    /// other users of the pool — see `VulkanShared::cmd_pool`.
     fn one_shot(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
         let device = &self.shared.device;
         let pool = *self.shared.cmd_pool.lock().unwrap();
@@ -3863,6 +4242,52 @@ impl VulkanBackend {
 
         unsafe { device.free_command_buffers(pool, &cmds) };
         Ok(())
+    }
+
+    /// Device-side copy of byte ranges `(src_off, dst_off, bytes)` from `src` into `dst`, in one
+    /// `vkCmdCopyBuffer` — no host bounce. Every range is bounds-checked against both buffers;
+    /// empty ranges are dropped (Vulkan rejects a zero-size region).
+    fn copy_ranges(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        ranges: &[(usize, usize, usize)],
+    ) -> Result<()> {
+        let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
+        // BOTH sides, unlike `upload`/`download` which each have only one device buffer to police.
+        // An oversize range here is a `vkCmdCopyBuffer` region that runs off the end of the source
+        // and/or the destination — a VUID violation the driver is free to turn into a GPU fault or a
+        // silent clobber of whatever sub-tensor happens to sit next in the arena block.
+        for &(src_off, dst_off, bytes) in ranges {
+            check_extent(
+                "copy_buffer",
+                "out of",
+                src_off.saturating_add(bytes),
+                s.size,
+            )?;
+            check_extent("copy_buffer", "into", dst_off.saturating_add(bytes), d.size)?;
+        }
+        // `sub_offset` — 0 for every ordinary buffer (all of today's callers pass KV/state
+        // Activations buffers, whose handle IS the tensor), but a resident-BDA sub-tensor shares
+        // its block's `vk::Buffer` and lives at its offset within it (see `Backing::BdaSub`), so
+        // fold each side's `sub_offset` in the same way `upload`/`download`/`fill_buf` do.
+        let regions: Vec<vk::BufferCopy> = ranges
+            .iter()
+            .filter(|&&(_, _, bytes)| bytes > 0)
+            .map(|&(src_off, dst_off, bytes)| vk::BufferCopy {
+                src_offset: (s.sub_offset + src_off) as u64,
+                dst_offset: (d.sub_offset + dst_off) as u64,
+                size: bytes as u64,
+            })
+            .collect();
+        if regions.is_empty() {
+            return Ok(());
+        }
+        let (sb, db) = (s.buffer, d.buffer);
+        // one_shot's queue_wait_idle provides the ordering fence vs prior/following work.
+        self.one_shot(move |cmd| unsafe {
+            self.shared.device.cmd_copy_buffer(cmd, sb, db, &regions);
+        })
     }
 }
 
@@ -3921,137 +4346,32 @@ impl Backend for VulkanBackend {
     /// If `dst` is host-visible (`CpuToGpu`), writes directly through the
     /// Device-side prefix copy (`vkCmdCopyBuffer` region `[0, bytes)`) — no host bounce.
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
-        let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
-        // BOTH sides, unlike `upload`/`download` which each have only one device buffer to police.
-        // An oversize `bytes` here is a `vkCmdCopyBuffer` region that runs off the end of the source
-        // and/or the destination — a VUID violation the driver is free to turn into a GPU fault or a
-        // silent clobber of whatever sub-tensor happens to sit next in the arena block.
-        check_extent("copy_buffer", "out of", bytes, s.size)?;
-        check_extent("copy_buffer", "into", bytes, d.size)?;
-        let (sb, db) = (s.buffer, d.buffer);
-        // `sub_offset` — 0 for every ordinary buffer (all of today's callers pass KV/state
-        // Activations buffers, whose handle IS the tensor), but a resident-BDA sub-tensor shares
-        // its block's `vk::Buffer` and lives at its offset within it (see `Backing::BdaSub`), so
-        // fold each side's `sub_offset` in the same way `upload`/`download`/`fill_buf` do.
-        let (src_off, dst_off) = (s.sub_offset as u64, d.sub_offset as u64);
-        // one_shot's queue_wait_idle provides the ordering fence vs prior/following work.
-        self.one_shot(move |cmd| unsafe {
-            let region = vk::BufferCopy {
-                src_offset: src_off,
-                dst_offset: dst_off,
-                size: bytes as u64,
-            };
-            self.shared.device.cmd_copy_buffer(cmd, sb, db, &[region]);
-        })
+        self.copy_ranges(src, dst, &[(0, 0, bytes)])
+    }
+
+    /// The Q8_0 KV cache is PLANAR here (`store_q8.comp`): element `i`'s int8 code at byte `i`, its
+    /// block's f16 scale at byte `cap + (i / 32) * 2`. A prefix is therefore two ranges — the
+    /// codes and the scales — copied in one submit. Every other KV format is in element (or GGUF
+    /// block) order, where the default byte prefix is right.
+    fn copy_kv_prefix(
+        &self,
+        src: &dyn Buffer,
+        dst: &dyn Buffer,
+        dtype: infr_core::DType,
+        elems: usize,
+        cap: usize,
+    ) -> Result<()> {
+        if dtype != infr_core::DType::Q8_0 {
+            return self.copy_buffer(src, dst, infr_core::budget::kv_fmt_bytes(dtype, elems));
+        }
+        // Past `cap` the codes would land on the scales, and the two regions would overlap.
+        check_extent("copy_kv_prefix", "past the codes of", elems, cap)?;
+        let scales = elems.div_ceil(32) * 2;
+        self.copy_ranges(src, dst, &[(0, 0, elems), (cap, cap, scales)])
     }
 
     /// persistent mapped pointer.  Otherwise, creates a temporary staging buffer,
     /// writes there, then submits a `cmd_copy_buffer` to the compute queue.
-    fn upload_at(&self, dst: &dyn Buffer, offset: usize, src: &[u8]) -> Result<()> {
-        let vk_dst = as_vk_buf(dst)?;
-        let end = offset
-            .checked_add(src.len())
-            .ok_or_else(|| be("upload_at: range overflows"))?;
-        check_extent("upload_at", "into", end, vk_dst.size)?;
-        let base = vk_dst.sub_offset as u64 + offset as u64;
-        if let Some(ptr) = vk_dst.mapped_ptr() {
-            unsafe {
-                std::ptr::copy_nonoverlapping(src.as_ptr(), ptr.add(offset), src.len());
-            }
-            return Ok(());
-        }
-        let staging = self.make_buf(src.len(), MemoryLocation::CpuToGpu, "upload_at_staging")?;
-        let stg_ptr = staging
-            .mapped_ptr()
-            .ok_or_else(|| be("staging buffer is not mapped"))?;
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), stg_ptr, src.len()) };
-        let (stg_buf, dst_buf) = (staging.buffer, vk_dst.buffer);
-        let size = src.len() as u64;
-        let shared = Arc::clone(&self.shared);
-        self.one_shot(move |cmd| {
-            let region = vk::BufferCopy {
-                src_offset: 0,
-                dst_offset: base,
-                size,
-            };
-            unsafe {
-                shared
-                    .device
-                    .cmd_copy_buffer(cmd, stg_buf, dst_buf, &[region])
-            };
-        })
-    }
-
-    fn download_at(&self, src: &dyn Buffer, offset: usize, dst: &mut [u8]) -> Result<()> {
-        let vk_src = as_vk_buf(src)?;
-        let end = offset
-            .checked_add(dst.len())
-            .ok_or_else(|| be("download_at: range overflows"))?;
-        check_extent("download_at", "out of", end, vk_src.size)?;
-        let base = vk_src.sub_offset as u64 + offset as u64;
-        if let Some(ptr) = vk_src.mapped_ptr() {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    ptr.add(offset) as *const u8,
-                    dst.as_mut_ptr(),
-                    dst.len(),
-                )
-            };
-            return Ok(());
-        }
-        let staging = self.make_buf(dst.len(), MemoryLocation::GpuToCpu, "download_at_staging")?;
-        let (src_buf, stg_buf) = (vk_src.buffer, staging.buffer);
-        let size = dst.len() as u64;
-        let shared = Arc::clone(&self.shared);
-        self.one_shot(move |cmd| {
-            let region = vk::BufferCopy {
-                src_offset: base,
-                dst_offset: 0,
-                size,
-            };
-            unsafe {
-                shared
-                    .device
-                    .cmd_copy_buffer(cmd, src_buf, stg_buf, &[region])
-            };
-        })?;
-        let ptr = staging
-            .mapped_ptr()
-            .ok_or_else(|| be("readback staging is not mapped"))? as *const u8;
-        unsafe { std::ptr::copy_nonoverlapping(ptr, dst.as_mut_ptr(), dst.len()) };
-        Ok(())
-    }
-
-    fn copy_buffer_at(
-        &self,
-        src: &dyn Buffer,
-        src_offset: usize,
-        dst: &dyn Buffer,
-        dst_offset: usize,
-        bytes: usize,
-    ) -> Result<()> {
-        let (s, d) = (as_vk_buf(src)?, as_vk_buf(dst)?);
-        let s_end = src_offset
-            .checked_add(bytes)
-            .ok_or_else(|| be("copy_buffer_at: source range overflows"))?;
-        let d_end = dst_offset
-            .checked_add(bytes)
-            .ok_or_else(|| be("copy_buffer_at: destination range overflows"))?;
-        check_extent("copy_buffer_at", "out of", s_end, s.size)?;
-        check_extent("copy_buffer_at", "into", d_end, d.size)?;
-        let (sb, db) = (s.buffer, d.buffer);
-        let so = s.sub_offset as u64 + src_offset as u64;
-        let do_ = d.sub_offset as u64 + dst_offset as u64;
-        self.one_shot(move |cmd| unsafe {
-            let region = vk::BufferCopy {
-                src_offset: so,
-                dst_offset: do_,
-                size: bytes as u64,
-            };
-            self.shared.device.cmd_copy_buffer(cmd, sb, db, &[region]);
-        })
-    }
-
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
         let vk_dst = as_vk_buf(dst)?;
         // Same guard as `download`/`copy_buffer`, same wording — this one is the original, the
@@ -4213,7 +4533,7 @@ impl Backend for VulkanBackend {
     /// device that never splits (every discrete GPU) keeps the unbounded default, and the tuned
     /// chained-decode fast path is untouched.
     fn max_decode_chain(&self) -> usize {
-        if self.decode_submit_cap() == 0 {
+        if self.submit_dispatch_cap() == 0 {
             usize::MAX
         } else {
             1
@@ -4229,6 +4549,16 @@ impl Backend for VulkanBackend {
         adapter::execute_chain(self, plan, bindings, n)
     }
 
+    /// The same contract as every backend's (`Backend::decode_replay_ready`), and here it is
+    /// exactly "the adapter will replay this plan": the adapter's static path records every op
+    /// with the positions and lengths baked into the graph and patches none of them from live
+    /// state, so a plan it does not replay decodes every token at the baked position. The answer
+    /// is the plan's eligibility (`VkDecodePlan::eligible`) unless a pager forces the static path;
+    /// the bindings play no part in it.
+    fn decode_replay_ready(&self, plan: &dyn Plan, _bindings: &Bindings) -> bool {
+        adapter::decode_replay_ready(self, plan)
+    }
+
     fn sync(&self) -> Result<()> {
         unsafe { self.shared.device.device_wait_idle() }
             .map_err(|e| be(format!("device_wait_idle: {e}")))
@@ -4240,6 +4570,20 @@ impl Backend for VulkanBackend {
 
     fn dense_paged(&self) -> bool {
         self.dense_pager.lock().unwrap().is_some()
+    }
+
+    fn dense_holds_every_block(&self) -> bool {
+        self.dense_pager
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(crate::pager::DensePagerSession::holds_every_block)
+    }
+
+    /// Single-row DeltaNet has a strided build (`Recorder::deltanet_strided`); the adapter
+    /// refuses the stride on the multi-row paths, which the runner never strides.
+    fn deltanet_strided(&self) -> bool {
+        true
     }
 
     /// DiffusionGemma perf slice 3 (docs/diffusion-gemma.md): one eager dispatch of
@@ -4547,6 +4891,194 @@ fn probe_device_facts(
 
 // ── tests ─────────────────────────────────────────────────────────────────────
 
+/// Gate for unit tests that dispatch a cooperative-matrix kernel directly, bypassing the tiering
+/// in `adapter.rs` that would never pick one here: false (with a visible skip line) when `be` lacks
+/// the f16 coopmat tier. Without it such a test compiles the kernel anyway, and RADV on an RDNA2
+/// iGPU aborts inside ACO on the unsupported WMMA opcode, taking the whole test binary down.
+#[cfg(test)]
+pub(crate) fn test_has_f16_coopmat(be: &VulkanBackend, test: &str) -> bool {
+    let ok = be.caps().f16_coopmat();
+    if !ok {
+        eprintln!("skip: {test} needs the 16x16x16 f16 cooperative matrix tier");
+    }
+    ok
+}
+
+/// The default configuration on the device `INFR_DEV` names — and nothing else from the
+/// environment — for unit tests that build a backend from an explicit [`Config`]. Without the
+/// device, a run pinned to one GPU silently tests another.
+#[cfg(test)]
+pub(crate) fn test_config() -> Config {
+    let mut cfg = Config::default();
+    cfg.device.dev = VulkanBackend::cfg_from_env()
+        .expect("test environment config")
+        .device
+        .dev
+        .clone();
+    cfg
+}
+
+/// The submit splitter's cap after one forward: `cur` is the cap now, `busy_ns` the forward's
+/// GPU-busy time across `dispatches` dispatches, `disabled` the configured kill switch
+/// (`INFR_SUBMIT_DISPATCHES=0`). Pure, so the arming rule is testable without a GPU.
+///
+/// A never-split device (`cur == 0`, every discrete GPU) arms only on a forward that kept the GPU
+/// busy past `infr_core::SUBMIT_DANGER_NS`; a splitting device only ever tightens.
+fn next_submit_cap(cur: usize, busy_ns: u64, dispatches: usize, disabled: bool) -> usize {
+    if disabled {
+        return 0;
+    }
+    // A device that has never split (every discrete GPU) only starts splitting if a forward
+    // actually lands in watchdog territory — see `infr_core::SUBMIT_DANGER_NS`. Without this,
+    // the measured cap (finite, just very large) would eventually split a big enough graph on
+    // a perfectly healthy dGPU, which is a tuned path this has no business touching.
+    if cur == 0 && busy_ns < infr_core::SUBMIT_DANGER_NS {
+        return 0;
+    }
+    let want = infr_core::submit_cap_from_measurement(busy_ns, dispatches);
+    if want == 0 {
+        return cur; // measurement says "no split needed"; never loosen an existing cap on it
+    }
+    if cur == 0 {
+        want
+    } else {
+        cur.min(want)
+    }
+}
+
+/// Why a forward closed the open segment and submitted it before its recording ended — without
+/// waiting, except for [`SegmentCut::Drain`], which waits for the queue. The first two are
+/// `adapter::execute_static`'s cuts at an op boundary, checked in this order by [`segment_cut`]:
+/// the watchdog bound first, so the early cadence can only ever add cuts to the ones the splitter
+/// makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SegmentCut {
+    /// The submit splitter's dispatch cap (`VulkanShared::submit_dispatch_cap`) was reached.
+    Watchdog = 0,
+    /// The paged forwards' early-submit cadence (`paging.early_submit`) was reached.
+    Early = 1,
+    /// A paged forward's staging ring half was full (`adapter::rotate_stream`), mid-op.
+    Rotation = 2,
+    /// A paged MoE layer that was not wholly resident read its router ids back
+    /// (`adapter::sync_stream`), submitting the open segment and draining the queue.
+    Drain = 3,
+}
+
+impl SegmentCut {
+    /// How many causes there are: the size of `VulkanShared::segment_cuts`.
+    const COUNT: usize = SegmentCut::Drain as usize + 1;
+}
+
+/// Which cut, if any, a segment holding `dispatches` takes under the splitter's `watchdog_cap` and
+/// the paged `early` cadence (either `0` = off). Pure, so the precedence is testable without a GPU.
+pub(crate) fn segment_cut(
+    dispatches: usize,
+    watchdog_cap: usize,
+    early: usize,
+) -> Option<SegmentCut> {
+    if watchdog_cap > 0 && dispatches >= watchdog_cap {
+        Some(SegmentCut::Watchdog)
+    } else if early > 0 && dispatches >= early {
+        Some(SegmentCut::Early)
+    } else {
+        None
+    }
+}
+
+/// One backend's counts of the segments its forwards closed and submitted before their recording
+/// ended, by cause, from [`VulkanBackend::segment_cuts`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SegmentCuts {
+    /// Cuts made by the submit splitter (the GPU hang watchdog bound).
+    pub watchdog: u64,
+    /// Cuts made by the paged forwards' early-submit cadence.
+    pub early: u64,
+    /// Staging-ring rotations of a paged forward: the ring half being filled could not hold the
+    /// next miss, so the open segment was submitted and staging moved to the other half.
+    pub rotation: u64,
+    /// Router-id readbacks of paged MoE layers: a decode layer whose experts were not all resident
+    /// submitted the open segment and waited for the queue to drain before it could stage its
+    /// routed experts.
+    pub drain: u64,
+}
+
+/// One forward's timing for the submit splitter, started by [`VulkanBackend::forward_clock`] and
+/// fed back by [`Self::observe`].
+///
+/// WHAT IT JUDGES: GPU time, not wall time. The splitter exists to keep each SUBMIT under the
+/// driver's / OS's GPU hang timeout, which counts the time a command buffer runs on the GPU. A
+/// forward's wall time also holds host work the GPU never sees — on a paged model's cold first
+/// forward that is seconds of weight page-in (ERNIE-4.5-21B-A3B with `paging.cache=4g`: 8 s of
+/// wall over 75 dispatches on an RX 7900 XTX), which used to arm the splitter on a discrete GPU
+/// for the rest of the process and cut every later forward into 16-dispatch submits. Every
+/// non-persistent [`Recorder`] stamps its command buffer's start and end, the completed segments'
+/// intervals are summed on the backend, and this diffs that sum around the forward.
+///
+/// A segment without timestamps (a queue family that writes none) makes the whole forward fall
+/// back to its wall time: over-counting can only split more, which is the safe direction.
+pub(crate) struct ForwardClock {
+    wall: std::time::Instant,
+    gpu_ns: u64,
+    untimed: u64,
+}
+
+impl ForwardClock {
+    /// The time this forward is judged by: its summed GPU segment time, or its wall time when any
+    /// of its segments went untimed.
+    fn busy_ns(&self, be_: &VulkanBackend) -> u64 {
+        let untimed = be_.shared.untimed_segments.load(Ordering::Relaxed) - self.untimed;
+        if untimed > 0 {
+            self.wall.elapsed().as_nanos() as u64
+        } else {
+            be_.shared.segment_gpu_ns.load(Ordering::Relaxed) - self.gpu_ns
+        }
+    }
+
+    /// Feed this forward (`dispatches` across all its segments, every one of them completed) to
+    /// [`VulkanBackend::observe_forward`].
+    pub(crate) fn observe(self, be_: &VulkanBackend, dispatches: usize) {
+        be_.observe_forward(self.busy_ns(be_), dispatches);
+    }
+}
+
+/// [`VulkanBackend::i8cm_kq_counts`]: totals since the backend was built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct I8cmKqCounts {
+    /// GEMMs recorded at the 128x128 tile.
+    pub large_tile: u64,
+    /// GEMMs recorded at the 64x64 tile.
+    pub medium_tile: u64,
+    /// Activation quant passes recorded for those GEMMs.
+    pub quant_passes: u64,
+}
+
+/// What [`VulkanBackend::note_i8cm_kq`] counts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum I8cmKqEvent {
+    LargeTile,
+    MediumTile,
+    QuantPass,
+}
+
+/// [`VulkanBackend::linear_tier_counts`]: totals since the backend was built.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinearTierCounts {
+    /// int8 multi-row GEMVs (`Recorder::linear_mmv_mrow_at`) recorded at two or more rows.
+    pub mrow_int8: u64,
+    /// Dequant multi-row GEMVs (`Recorder::linear_native_mrow_at`).
+    pub mrow_dequant: u64,
+    /// Packed-int8-dot K-quant GEMMs (`Recorder::matmul_dp4a_kq`).
+    pub dp4a_kq: u64,
+}
+
+/// What [`VulkanBackend::note_linear_tier`] counts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum LinearTierEvent {
+    MrowInt8,
+    MrowDequant,
+    Dp4aKq,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4639,6 +5171,81 @@ mod tests {
                 "must not truncate the tail of size {size}"
             );
         }
+    }
+
+    /// A device missing a feature the kernels need without fallback is refused with the feature
+    /// named, and a device with both is accepted.
+    #[test]
+    fn required_features_are_named_when_missing() {
+        assert!(check_required_features(true, true).is_ok());
+        for (int8, full_sg, name) in [
+            (false, true, "shaderInt8"),
+            (true, false, "computeFullSubgroups"),
+        ] {
+            let msg = check_required_features(int8, full_sg)
+                .expect_err("a missing required feature must refuse the device")
+                .to_string();
+            assert!(msg.contains(name), "error does not name {name}: {msg}");
+        }
+    }
+
+    /// A buffer the recorder binds whole must fit `maxStorageBufferRange`, so creation refuses a
+    /// bigger one with an error rather than leaving the bind to exceed the limit. Weights live in
+    /// the arena and are bound by sub-range, and a staging buffer may be a copy-only ring larger
+    /// than any binding, so neither is held to it. The limit is lowered on this test's thread
+    /// only, since no device here reports one a buffer can exceed.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn buffers_bound_whole_are_refused_past_the_storage_range() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        const LIMIT: usize = 1 << 20;
+        TEST_BIND_LIMIT.with(|l| l.set(Some(LIMIT as u64)));
+        assert!(be_.alloc(LIMIT, BufferUsage::Activations).is_ok());
+        for usage in [BufferUsage::Activations, BufferUsage::KvCache] {
+            let err = match be_.alloc(LIMIT + 4, usage) {
+                Ok(_) => panic!("{usage:?}: a buffer past maxStorageBufferRange must be refused"),
+                Err(e) => e.to_string(),
+            };
+            assert!(err.contains("maxStorageBufferRange"), "{usage:?}: {err}");
+        }
+        for usage in [
+            BufferUsage::Weights,
+            BufferUsage::Staging,
+            BufferUsage::Readback,
+        ] {
+            assert!(be_.alloc(2 * LIMIT, usage).is_ok(), "{usage:?}");
+        }
+        TEST_BIND_LIMIT.with(|l| l.set(None));
+    }
+
+    /// `tp_record_copies` builds `vkCmdCopyBuffer` regions from caller byte counts; one that runs
+    /// past either buffer must be refused before anything is recorded or submitted.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn tp_copies_reject_out_of_bounds_extents() {
+        let Ok(be_) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let small = be_.alloc(256, BufferUsage::Activations).unwrap();
+        let big = be_.alloc(1024, BufferUsage::Activations).unwrap();
+        // Source too short first, so a missing check only over-reads on the red run.
+        let err = be_
+            .p2p_gather_copy(small.as_ref(), big.as_ref(), 512)
+            .expect_err("a copy reading past its source must be refused");
+        assert!(
+            err.to_string()
+                .contains("512 bytes out of a 256-byte buffer"),
+            "{err}"
+        );
+        let err = be_
+            .p2p_gather_copy(big.as_ref(), small.as_ref(), 512)
+            .expect_err("a copy writing past its destination must be refused");
+        assert!(
+            err.to_string().contains("512 bytes into a 256-byte buffer"),
+            "{err}"
+        );
     }
 
     /// The transfer bounds guard shared by `upload`/`download`/`copy_buffer` (no GPU needed — this
@@ -4762,7 +5369,7 @@ mod tests {
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_masks_the_capability_probe() {
         let build = |f: &dyn Fn(&mut Config)| {
-            let mut cfg = Config::default();
+            let mut cfg = test_config();
             f(&mut cfg);
             VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
         };
@@ -4811,7 +5418,7 @@ mod tests {
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_subgroup_pref_drives_sg_pref() {
         let build = |sg: Option<u32>| {
-            let mut cfg = Config::default();
+            let mut cfg = test_config();
             cfg.device.subgroup_pref = sg;
             VulkanBackend::new_with(Arc::new(cfg))
         };
@@ -4847,7 +5454,7 @@ mod tests {
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_push_desc_forces_the_pooled_fallback() {
         let build = |on: bool| {
-            let mut cfg = Config::default();
+            let mut cfg = test_config();
             cfg.kernels.vulkan.push_desc = on;
             VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
         };
@@ -4872,7 +5479,7 @@ mod tests {
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_no_vram_guard_disables_the_budget_check() {
         let build = |off: bool| {
-            let mut cfg = Config::default();
+            let mut cfg = test_config();
             cfg.kernels.vulkan.no_vram_guard = off;
             VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
         };
@@ -4895,12 +5502,122 @@ mod tests {
     }
 
     /// `device.submit_dispatches` (`INFR_SUBMIT_DISPATCHES`) overrides the measured initial submit
-    /// cap, `0` meaning "never split"; unset keeps `initial_submit_dispatch_cap(integrated, slow)`.
+    /// cap, `0` meaning "never split"; unset keeps `initial_submit_dispatch_cap(integrated)`.
+    /// A configured 0 is also a kill switch: a forward that would arm the splitter does not.
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn config_submit_dispatches_zero_is_never_armed() {
+        let mut cfg = test_config();
+        cfg.device.submit_dispatches = Some(0);
+        let be = VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with");
+        be.observe_forward(3 * infr_core::SUBMIT_DANGER_NS, 750);
+        assert_eq!(
+            be.submit_dispatch_cap(),
+            0,
+            "INFR_SUBMIT_DISPATCHES=0 re-armed"
+        );
+    }
+
+    /// A segment is cut by the splitter whenever its cap is reached, whatever the paged early
+    /// cadence says; the cadence only cuts below the cap, and either count at `0` is off.
+    #[test]
+    fn the_watchdog_cut_takes_precedence_over_early_submit() {
+        assert_eq!(segment_cut(64, 64, 16), Some(SegmentCut::Watchdog));
+        assert_eq!(segment_cut(64, 64, 64), Some(SegmentCut::Watchdog));
+        assert_eq!(segment_cut(20, 64, 16), Some(SegmentCut::Early));
+        assert_eq!(segment_cut(15, 64, 16), None);
+        assert_eq!(segment_cut(20, 0, 16), Some(SegmentCut::Early));
+        assert_eq!(segment_cut(20, 16, 0), Some(SegmentCut::Watchdog));
+        assert_eq!(segment_cut(1_000_000, 0, 0), None);
+    }
+
+    /// The arming rule over GPU-busy time: a never-split device arms only past the danger
+    /// threshold, a splitting device only tightens, and the kill switch wins over both.
+    #[test]
+    fn next_submit_cap_arms_only_on_long_gpu_forwards() {
+        let danger = infr_core::SUBMIT_DANGER_NS;
+        // A healthy discrete forward stays unsplit.
+        assert_eq!(next_submit_cap(0, 40_000_000, 750, false), 0);
+        // A forward that kept the GPU busy past the threshold arms, at the measured cap.
+        let armed = next_submit_cap(0, 3 * danger, 750, false);
+        assert_eq!(
+            armed,
+            infr_core::submit_cap_from_measurement(3 * danger, 750)
+        );
+        assert!(armed > 0 && armed < 750, "armed cap {armed}");
+        // An armed device never loosens on a fast sample, and tightens on a slower one.
+        assert_eq!(next_submit_cap(armed, 1_000_000, 750, false), armed);
+        assert!(next_submit_cap(armed, 30 * danger, 750, false) < armed);
+        // The kill switch.
+        assert_eq!(next_submit_cap(0, 3 * danger, 750, true), 0);
+    }
+
+    /// The splitter judges a forward by its GPU time: host time inside the forward — what a paged
+    /// model's cold page-in is — must not arm it. One "forward" of two segments with a host sleep
+    /// past the danger threshold between them, judged through the same `ForwardClock` that
+    /// `execute_static` uses; the cap must be exactly what it was (0 on a discrete GPU, the seeded
+    /// integrated cap otherwise). Judged by wall time instead, this arms (discrete) or tightens to
+    /// the 16-dispatch floor (integrated).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn host_time_in_a_forward_does_not_arm_the_splitter() {
+        let be = VulkanBackend::new_with(Arc::new(test_config())).expect("VulkanBackend::new_with");
+        let before = be.submit_dispatch_cap();
+        let buf = be.alloc(1 << 20, BufferUsage::Activations).unwrap();
+        let clock = be.forward_clock();
+        let rec = be.recorder().unwrap();
+        rec.zero(buf.as_ref(), 1 << 18);
+        let seg = rec.finish_nowait().unwrap();
+        std::thread::sleep(std::time::Duration::from_nanos(
+            infr_core::SUBMIT_DANGER_NS + 200_000_000,
+        ));
+        seg.wait().unwrap();
+        let rec = be.recorder().unwrap();
+        rec.seed_barrier();
+        rec.zero(buf.as_ref(), 1 << 18);
+        rec.finish().unwrap();
+        let busy = clock.busy_ns(&be);
+        assert!(
+            busy < infr_core::SUBMIT_DANGER_NS / 10,
+            "judged {busy} ns for two tiny segments"
+        );
+        clock.observe(&be, 2);
+        assert_eq!(
+            be.submit_dispatch_cap(),
+            before,
+            "host time in the forward moved the submit cap"
+        );
+    }
+
+    /// The segment clock measures GPU work: a forward of real dispatches reports a non-zero GPU
+    /// time no larger than its wall time (on a device whose queue writes timestamps — every device
+    /// this runs on; an untimed device would fall back to wall time, which this also bounds).
+    #[test]
+    #[ignore = "requires a Vulkan-capable GPU"]
+    fn forward_clock_measures_gpu_time() {
+        let be = VulkanBackend::new_with(Arc::new(test_config())).expect("VulkanBackend::new_with");
+        let buf = be.alloc(64 << 20, BufferUsage::Activations).unwrap();
+        let wall = std::time::Instant::now();
+        let clock = be.forward_clock();
+        let rec = be.recorder().unwrap();
+        for _ in 0..8 {
+            rec.zero(buf.as_ref(), 16 << 20);
+        }
+        rec.finish().unwrap();
+        let busy = clock.busy_ns(&be);
+        let wall_ns = wall.elapsed().as_nanos() as u64;
+        assert!(busy > 0, "no GPU time measured");
+        assert!(
+            busy <= wall_ns,
+            "GPU time {busy} ns exceeds wall {wall_ns} ns"
+        );
+    }
+
     #[test]
     #[ignore = "requires a Vulkan-capable GPU"]
     fn config_submit_dispatches_overrides_the_splitter_cap() {
         let build = |n: Option<usize>| {
-            let mut cfg = Config::default();
+            let mut cfg = test_config();
             cfg.device.submit_dispatches = n;
             VulkanBackend::new_with(Arc::new(cfg)).expect("VulkanBackend::new_with")
         };
@@ -4908,7 +5625,7 @@ mod tests {
         let integrated = dflt.caps().integrated;
         assert_eq!(
             dflt.submit_dispatch_cap(),
-            infr_core::initial_submit_dispatch_cap(integrated, dflt.shared.slow_device)
+            infr_core::initial_submit_dispatch_cap(integrated)
         );
         drop(dflt);
         assert_eq!(build(Some(7)).submit_dispatch_cap(), 7);
@@ -5102,7 +5819,8 @@ mod tests {
 
         let (m, k, n) = (32usize, 32usize, 32usize);
         let a: Vec<f32> = (0..m * k).map(|i| (i as f32) * 0.01).collect();
-        let b: Vec<f32> = (0..k * n).map(|i| (i as f32) * 0.01).collect();
+        // Different from `a`, so a kernel that read A in place of B cannot match the reference.
+        let b: Vec<f32> = (0..k * n).map(|i| 1.0 - (i % 37) as f32 * 0.03).collect();
 
         // CPU reference
         let mut c_ref = vec![0.0f32; m * n];
@@ -5124,8 +5842,11 @@ mod tests {
             .iter()
             .zip(c_ref.iter())
             .map(|(g, r)| (*g - r).abs())
-            .fold(0.0f32, f32::max);
-        let max_ref = c_ref.iter().map(|r| r.abs()).fold(0.0f32, f32::max);
+            .fold(0.0f32, infr_testkit::nan_max);
+        let max_ref = c_ref
+            .iter()
+            .map(|r| r.abs())
+            .fold(0.0f32, infr_testkit::nan_max);
         let rel_err = if max_ref > 1e-6 {
             max_abs / max_ref
         } else {
@@ -5178,7 +5899,8 @@ mod tests {
 }
 
 // qwen35 (Qwen3.5) SSM kernels: the GPU conv1d+SiLU and gated-DeltaNet recurrence must match the CPU
-// reference. Self-skip without a GPU (so CI passes, runs locally with a device).
+// reference. `#[ignore]`d like the rest of the GPU suite: a self-skip without a device would be
+// reported as a pass by CI, whose runners have none.
 #[cfg(test)]
 mod ssm_tests {
     use super::*;
@@ -5209,10 +5931,11 @@ mod ssm_tests {
         a.iter()
             .zip(b)
             .map(|(x, y)| (x - y).abs())
-            .fold(0.0, f32::max)
+            .fold(0.0, infr_testkit::nan_max)
     }
 
     #[test]
+    #[ignore = "requires a Vulkan GPU"]
     fn softcap_matches_cpu() {
         let be = match VulkanBackend::new() {
             Ok(b) => b,
@@ -5235,6 +5958,7 @@ mod ssm_tests {
     }
 
     #[test]
+    #[ignore = "requires a Vulkan GPU"]
     fn deltanet_matches_cpu() {
         let be = match VulkanBackend::new() {
             Ok(b) => b,
@@ -5330,6 +6054,7 @@ mod ssm_tests {
     }
 
     #[test]
+    #[ignore = "requires a Vulkan GPU"]
     fn conv1d_silu_matches_cpu() {
         let be = match VulkanBackend::new() {
             Ok(b) => b,

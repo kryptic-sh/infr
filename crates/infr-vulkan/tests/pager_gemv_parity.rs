@@ -51,7 +51,7 @@ fn host_gemv(w_dequant: &[f32], x: &[f32], in_f: usize, out_f: usize) -> Vec<f32
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn paged_gemv_matches_host_reference_under_eviction_churn() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

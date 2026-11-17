@@ -10,11 +10,12 @@
 //! [`GpuPager`] only knows about uniform `slot_bytes`-sized blocks keyed by an opaque
 //! `infr_core::pager::BlockId` — it has no idea a block is "an expert". The MoE integration
 //! (`infr-llama`'s seam / this crate's `adapter.rs`) packs a `BlockId` from `(layer, role,
-//! expert_id)` and calls [`GpuPager::ensure_resident`] with that block's mmap'd tensor bytes
-//! before dispatching the id-indexed GEMV/GEMM through the LUT hop (the `PAGED` branch in
-//! `shaders/native_gemv_id.comp` / `native_gemv_id_multi.comp`: `slot = lut[ids[slot]]`, scaled
-//! onto the arena's 64-bit device address as `arena_addr + slot * slot_bytes` — see the `lut_host`
-//! field's doc and `shaders/native_weight_addr.glsl`). A FUTURE dense layer-streaming policy
+//! expert_id)` and stages it through [`MoePagerSession::stage_role`] (a recorded ring→arena copy
+//! per miss, [`GpuPager::touch_staged`]) before dispatching the id-indexed GEMV/GEMM through the
+//! LUT hop (the `PAGED` branch in `shaders/native_gemv_id.comp` / `native_gemv_id_multi.comp`:
+//! `slot = lut[ids[slot]]`, scaled onto the arena's 64-bit device address as
+//! `arena_addr + slot * slot_bytes` — see the `lut_host` field's doc and
+//! `shaders/native_weight_addr.glsl`). A FUTURE dense layer-streaming policy
 //! (NOT implemented here — see the task doc) would reuse this exact struct with `BlockId =
 //! layer_idx`, `slot_bytes` = one layer's weight size, and a schedule-driven (not LRU) `touch`
 //! order (a dense decode visits layers in a fixed known order, so it can exact-prefetch layer
@@ -27,14 +28,21 @@
 //! session's append-only LUT tape ([`MoePagerSession::lut_window`]) at record time, so staging
 //! for later layers can keep mutating the mirror while earlier recorded-but-in-flight segments
 //! read a consistent view. The classic per-pager device LUT + [`GpuPager::flush_lut`] remain for
-//! the standalone [`GpuPager::ensure_resident`] surface (parity tests / future non-MoE users).
+//! the standalone [`GpuPager::ensure_resident`] surface, which no production path calls: it is
+//! how the paged-kernel parity tests (`tests/pager_*`, `tests/moe_mmq_*`, ...) fill an arena and
+//! LUT without a recorder.
 //!
 //! # Eviction policy
 //! Classic LRU for recency-driven touches (decode's routed-only path) plus the scan-resistant
 //! cold-end insertion (`infr_core::pager::Pager::touch_cold`) for the batched prefill's
-//! full-set sweeps — see that method's doc for why plain LRU is pathological there. llama.cpp
+//! full-set sweeps — see that method's doc for why plain LRU is pathological there. A decode layer
+//! whose experts are all resident is touched as one block group
+//! ([`MoePagerSession::touch_all_hits`]): the recency every expert's MRU touch would give it, at
+//! one call per layer and role. llama.cpp
 //! issue #20757's SLRU-with-admission remains the documented upgrade if these thrash on an
-//! adversarial pattern.
+//! adversarial pattern. A pool with a slot for every expert registered in it never evicts, and
+//! there experts no token routed to are filled into free slots
+//! ([`MoePagerSession::request_fills`]) so a decode layer becomes wholly resident.
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -43,6 +51,7 @@ use ash::vk;
 use infr_core::backend::{Buffer, BufferUsage};
 use infr_core::error::Result;
 use infr_core::hostpager::HostPager;
+use infr_core::pager::trace::{PoolInfo, Tier, TraceFile};
 use infr_core::pager::{BlockId, Insert, Pager, PagerStats, Resolution, NOT_RESIDENT};
 use infr_core::Backend;
 
@@ -106,6 +115,17 @@ pub struct GpuPager {
     lut_host: Vec<u32>,
     lut_dev: Box<dyn Buffer>,
     lut_dirty: bool,
+    /// Misses whose ring→arena copy went into the recording `staged_serial` names (a
+    /// `Recorder::serial`), which may not have been submitted yet. Their placement is already in
+    /// the pager and the LUT mirror, so if that recording is discarded instead,
+    /// [`Self::forget_unsubmitted`] must take them back out.
+    staged: Vec<BlockId>,
+    staged_serial: Option<u64>,
+    /// Blocks admitted by [`Self::fill_staged`] — into a free slot, with nothing routed to them —
+    /// since construction. Each is also one of the pager's misses.
+    fills: u64,
+    /// Placement changes since construction (see [`Self::placements`]).
+    placements: u64,
 }
 
 impl GpuPager {
@@ -145,6 +165,10 @@ impl GpuPager {
             lut_host,
             lut_dev,
             lut_dirty: false,
+            staged: Vec::new(),
+            staged_serial: None,
+            fills: 0,
+            placements: 0,
         })
     }
 
@@ -166,6 +190,31 @@ impl GpuPager {
         self.pager.stats()
     }
 
+    /// How many blocks [`Self::fill_staged`] has admitted.
+    pub fn fills(&self) -> u64 {
+        self.fills
+    }
+
+    /// How many times a block was placed in a slot or taken out of one since construction: every
+    /// miss that placed its block (and the eviction it made), every miss rolled back because its
+    /// bytes could not be produced, and every placement [`Self::forget_unsubmitted`] took back. A
+    /// hit changes nothing and does not count. Two equal readings mean every block resident at
+    /// the first is still resident in the same slot at the second.
+    pub fn placements(&self) -> u64 {
+        self.placements
+    }
+
+    /// Record this arena's residency calls into `file` (`paging.trace`). Call it before the first
+    /// touch — see [`Pager::trace_to`].
+    pub fn trace_to(&mut self, file: &Arc<TraceFile>, info: PoolInfo) -> Result<()> {
+        Ok(self.pager.trace_to(file, info)?)
+    }
+
+    /// Flush this arena's trace, if it has one.
+    pub fn flush_trace(&mut self) -> Result<()> {
+        Ok(self.pager.flush_trace()?)
+    }
+
     pub fn arena_buffer(&self) -> &dyn Buffer {
         self.arena.as_ref()
     }
@@ -174,36 +223,70 @@ impl GpuPager {
         self.lut_dev.as_ref()
     }
 
-    /// Already-resident check with NO mutation (for a caller that wants to decide whether it even
-    /// needs `bytes` in hand before calling `ensure_resident` — e.g. skip a host dequant/gather on
-    /// a hit).
+    /// Already-resident check with NO mutation and no stats — for a caller that must know whether
+    /// a touch WILL miss before making it (whether a ring half has room for the copy, whether a
+    /// whole layer is resident).
     pub fn is_resident(&self, id: BlockId) -> bool {
         self.pager.slot_of(id).is_some()
     }
 
-    /// [`Self::ensure_resident`]'s RECORDED twin: on a miss, memcpy `bytes` into the caller's
-    /// staging ring at `ring_off` (a host-mapped write) and record the ring→arena slot copy
-    /// through `rec` instead of submitting an immediate one-shot — the caller batches many
-    /// misses (and whole layers of compute) into one submission. Contract: the ring region
-    /// `[ring_off, ring_off + slot_bytes)` must stay untouched until that recording's submit
-    /// completes (the adapter's fenced ring-half rotation enforces this). The HOST LUT mirror is
-    /// updated exactly like `ensure_resident`; the device-visible copy is the caller's frozen
+    /// The slot `id` is resident in, with no mutation and no stats; `None` when it is absent.
+    pub fn resident_slot(&self, id: BlockId) -> Option<u32> {
+        self.pager.slot_of(id)
+    }
+
+    /// Group this arena's blocks into runs of `len` (an MoE pool: one layer's experts) — see
+    /// `infr_core::pager::Pager::group_by`. Errors instead of panicking when the arena is already
+    /// grouped by another length.
+    fn group_by(&mut self, len: u32) -> Result<()> {
+        match self.pager.group_len() {
+            Some(l) if l != len => Err(be(format!(
+                "pager: arena blocks are grouped by {l}, cannot also group them by {len}"
+            ))),
+            _ => {
+                self.pager.group_by(len);
+                Ok(())
+            }
+        }
+    }
+
+    /// Whether every block of the group starting at `first` is resident, in O(1). The arena must be
+    /// grouped (the MoE session groups each pool when it registers a layer).
+    pub fn is_group_resident(&self, first: BlockId) -> bool {
+        self.pager.group_is_resident(first)
+    }
+
+    /// Resolve `id` against the arena and, on a MISS only, stage its bytes: `fill` writes them
+    /// into the caller's staging ring at `ring_off`, and the ring→arena slot copy is recorded
+    /// through `rec` instead of submitting an immediate one-shot — the caller batches many misses
+    /// (and whole layers of compute) into one submission. Returns the ring bytes consumed (0 on a
+    /// hit).
+    ///
+    /// `fill` is the tier the bytes come from, and it runs exactly when the arena misses: a hit
+    /// never reaches it. That is what keeps a VRAM hit off the tier below entirely — no disk read
+    /// for an expert the host arena does not hold, no host lock, and no host recency or counter
+    /// moved by traffic VRAM already served — the same shape [`Self::schedule_staged`] has for
+    /// dense blocks. `fill` gets the slot's whole ring region (`slot_bytes`) and writes the block
+    /// into its front.
+    ///
+    /// A miss is all-or-nothing: if `fill` fails (or the region lies outside the ring), the miss
+    /// is rolled back before the error returns (the private `fill_or_roll_back`), so the caller
+    /// needs no cleanup for this block, whatever it then does with the recording.
+    ///
+    /// Contract: the ring region `[ring_off, ring_off + slot_bytes)` must stay untouched until
+    /// that recording's submit completes (the adapter's fenced ring-half rotation enforces this).
+    /// The HOST LUT mirror is updated on a miss; the device-visible copy is the caller's frozen
     /// tape window (see [`MoePagerSession::lut_window`]) — `flush_lut` is NOT required on this
-    /// path. Returns the ring bytes consumed (0 on a hit).
+    /// path.
     pub fn touch_staged(
         &mut self,
         rec: &crate::recorder::Recorder<'_>,
         ring: &dyn Buffer,
         ring_off: usize,
         id: BlockId,
-        bytes: &[u8],
         scan: bool,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
     ) -> Result<usize> {
-        debug_assert_eq!(
-            bytes.len(),
-            self.slot_bytes,
-            "block byte size must match the arena's slot size"
-        );
         // `scan`: full-set sweep (batched prefill's touch-all) → the scan-resistant cold-end
         // policy; otherwise classic LRU (decode's routed-only touches). See
         // `infr_core::pager::Pager::touch_cold`.
@@ -215,10 +298,27 @@ impl GpuPager {
         match resolution {
             Resolution::Hit { .. } => Ok(0),
             Resolution::Miss { slot, evicted } => {
-                let base = as_vk_buf(ring)?
-                    .mapped_ptr()
-                    .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
-                par_copy_to_mapped(bytes, unsafe { base.add(ring_off) });
+                let slot_bytes = self.slot_bytes;
+                self.fill_or_roll_back(id, evicted, || {
+                    if ring_off + slot_bytes > ring.len_bytes() {
+                        return Err(be(format!(
+                            "pager ring overrun: slot at {ring_off} + {slot_bytes} > {} bytes",
+                            ring.len_bytes()
+                        )));
+                    }
+                    let base = as_vk_buf(ring)?
+                        .mapped_ptr()
+                        .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
+                    // SAFETY: `[ring_off, ring_off + slot_bytes)` lies inside the ring (checked
+                    // above) and is this caller's own region of the persistently-mapped ring —
+                    // reserved by the cursor before this call and not reused until the recording
+                    // that reads it completes (the fn's ring contract). No other thread holds a
+                    // reference to it.
+                    let dst =
+                        unsafe { std::slice::from_raw_parts_mut(base.add(ring_off), slot_bytes) };
+                    fill(dst)
+                })?;
+                self.record_staged_placement(rec, id, slot, evicted);
                 rec.copy(
                     ring,
                     ring_off,
@@ -226,66 +326,56 @@ impl GpuPager {
                     slot as usize * self.slot_bytes,
                     self.slot_bytes,
                 );
-                self.record_placement(id, slot, evicted);
                 Ok(self.slot_bytes)
             }
         }
     }
 
-    /// [`Self::touch_staged`]'s twin for a block whose bytes are READ rather than copied — the
-    /// arena-less host tier a unified-memory device gets (`HostPager::stream_only`).
-    ///
-    /// Same residency decision and the same ring→arena copy; only the source differs, so the two
-    /// cannot drift on policy. Kept separate rather than folded behind a closure because the copy
-    /// they perform is genuinely different work: the mmap path memcpys a slice with
-    /// `par_copy_to_mapped` (many threads over one already-resident buffer), while this issues a
-    /// positioned read straight into the ring — one copy instead of the read-then-copy that going
-    /// through a host arena would cost.
-    pub fn touch_staged_read(
+    /// Admit `id`, which nothing has asked for yet, into a FREE slot: the copy of its bytes from
+    /// `src[src_off..]` (already written there) into the slot is recorded through `rec`, under the
+    /// placement bookkeeping [`Self::touch_staged`] keeps — so [`Self::forget_unsubmitted`] takes
+    /// it back if `rec` is discarded. It inserts at the cold end, like a prefill sweep's admission,
+    /// and never evicts: with no free slot the call is refused and nothing changes, so no caller
+    /// can make a fill displace a block. A resident `id` is left alone (`false`). Counted among the
+    /// pager's misses, and in [`Self::fills`].
+    pub fn fill_staged(
         &mut self,
         rec: &crate::recorder::Recorder<'_>,
-        ring: &dyn Buffer,
-        ring_off: usize,
+        src: &dyn Buffer,
+        src_off: usize,
         id: BlockId,
-        host: &HostPager,
-        scan: bool,
-    ) -> Result<usize> {
-        let resolution = if scan {
-            self.pager.touch_cold(id)
-        } else {
-            self.pager.touch(id)
-        };
-        match resolution {
-            Resolution::Hit { .. } => Ok(0),
-            Resolution::Miss { slot, evicted } => {
-                let n = host.block_bytes(id).ok_or_else(|| {
-                    be(format!("moe pager: block {id} is unknown to the host tier"))
-                })?;
-                debug_assert!(
-                    n <= self.slot_bytes,
-                    "block bytes ({n}) exceed the arena's slot stride ({})",
-                    self.slot_bytes
-                );
-                let base = as_vk_buf(ring)?
-                    .mapped_ptr()
-                    .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
-                // SAFETY: `[ring_off, ring_off + n)` is this caller's own region of the
-                // persistently-mapped ring — reserved by the cursor before this call and not
-                // reused until the recording that reads it completes (the caller's ring
-                // contract). No other thread holds a reference to it.
-                let dst = unsafe { std::slice::from_raw_parts_mut(base.add(ring_off), n) };
-                host.fill(id, dst)?;
-                rec.copy(
-                    ring,
-                    ring_off,
-                    self.arena.as_ref(),
-                    slot as usize * self.slot_bytes,
-                    self.slot_bytes,
-                );
-                self.record_placement(id, slot, evicted);
-                Ok(self.slot_bytes)
-            }
+    ) -> Result<bool> {
+        if self.is_resident(id) {
+            return Ok(false);
         }
+        if self.pager.resident_count() >= self.pager.n_slots() {
+            return Err(be(format!(
+                "pager: fill of block {id} refused — every slot is taken, and a fill never evicts"
+            )));
+        }
+        if src_off + self.slot_bytes > src.len_bytes() {
+            return Err(be(format!(
+                "pager: fill of block {id} reads past its {}-byte source",
+                src.len_bytes()
+            )));
+        }
+        // A free slot exists, and the pager hands out free slots before it evicts anything.
+        let Resolution::Miss { slot, evicted } = self.pager.touch_cold(id) else {
+            return Err(be(format!(
+                "pager: fill of block {id}, checked absent, resolved as a hit"
+            )));
+        };
+        debug_assert!(evicted.is_none(), "a free slot cannot have evicted");
+        self.record_staged_placement(rec, id, slot, evicted);
+        rec.copy(
+            src,
+            src_off,
+            self.arena.as_ref(),
+            slot as usize * self.slot_bytes,
+            self.slot_bytes,
+        );
+        self.fills += 1;
+        Ok(true)
     }
 
     /// `n` host-mirror LUT words starting at block id `base` — the source a frozen tape window
@@ -302,6 +392,74 @@ impl GpuPager {
     fn record_placement(&mut self, id: BlockId, slot: u32, evicted: Option<u32>) {
         apply_placement(&mut self.lut_host, id, slot, evicted);
         self.lut_dirty = true;
+        self.placements += 1;
+    }
+
+    /// Produce a miss's bytes with `fill`, or take the miss back if that fails.
+    ///
+    /// The pager has already placed `id` in a slot (displacing `evicted` when the arena was full)
+    /// by the time the bytes are produced, and the bytes can fail — a disk read, an exhausted host
+    /// tier, a ring overrun. Left as it is, that is a block "resident" in a slot holding somebody
+    /// else's bytes: a later touch hits it and the dispatch reads them as its weights. So on an
+    /// error `id` is evicted again (its slot goes back to the free list) and its LUT entry stays
+    /// absent. The displaced block stays displaced — its bytes are still in the slot, but the
+    /// pager no longer holds it — so its entry is cleared too; afterwards no entry names the slot.
+    /// Nothing reaches [`Self::record_staged_placement`] until `fill` succeeded, so the rolled-back
+    /// miss is on no recording's list either.
+    ///
+    /// The counters are not unwound: a failed fill still counts the miss it was, and the
+    /// eviction when it displaced a block, because both happened to the cache. `hits + misses` is
+    /// still the number of touches, and the next touch of `id` is another miss.
+    fn fill_or_roll_back<T>(
+        &mut self,
+        id: BlockId,
+        evicted: Option<u32>,
+        fill: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        fill().inspect_err(|_| {
+            self.pager.evict(id);
+            apply_placement(&mut self.lut_host, id, NOT_RESIDENT, evicted);
+            self.lut_dirty = true;
+            self.placements += 1;
+        })
+    }
+
+    /// [`Self::record_placement`] for a miss whose copy goes into `rec` rather than an immediate
+    /// submit, noted so [`Self::forget_unsubmitted`] can undo it if that recording is discarded.
+    /// Called only once the miss's bytes are in the ring (see [`Self::fill_or_roll_back`]).
+    fn record_staged_placement(
+        &mut self,
+        rec: &crate::recorder::Recorder<'_>,
+        id: BlockId,
+        slot: u32,
+        evicted: Option<u32>,
+    ) {
+        self.record_placement(id, slot, evicted);
+        // Recording is sequential and a recording is only replaced by submitting or discarding
+        // it, so a miss for a newer one means the older one's copies were submitted.
+        if self.staged_serial != Some(rec.serial()) {
+            self.staged.clear();
+            self.staged_serial = Some(rec.serial());
+        }
+        self.staged.push(id);
+    }
+
+    /// The recording `serial` is being discarded: its ring→arena copies will never run, so every
+    /// block it placed goes back to absent (pager and LUT mirror) instead of being served from a
+    /// slot that still holds its previous occupant. A block a later miss in the same recording
+    /// already displaced is gone from the pager and is skipped.
+    pub fn forget_unsubmitted(&mut self, serial: u64) {
+        if self.staged_serial != Some(serial) {
+            return;
+        }
+        for id in self.staged.drain(..) {
+            if self.pager.evict(id).is_some() {
+                apply_placement(&mut self.lut_host, id, NOT_RESIDENT, None);
+                self.lut_dirty = true;
+                self.placements += 1;
+            }
+        }
+        self.staged_serial = None;
     }
 
     /// [`Self::touch_staged`]'s DENSE-STREAMING twin: residency via the exact cyclic-sweep policy
@@ -343,48 +501,56 @@ impl GpuPager {
                         "dense block bytes ({total}) exceed the pool's slot stride ({slot_bytes})"
                     );
                 };
-                let base = as_vk_buf(ring)?
-                    .mapped_ptr()
-                    .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
-                let total = match bytes {
-                    DenseBytes::Mmap(segments) => {
-                        let total: usize = segments.iter().map(|s| expert_bytes(s).len()).sum();
-                        fits(total);
-                        let mut off = ring_off;
-                        for s in segments {
-                            let seg = expert_bytes(s);
-                            par_copy_to_mapped(seg, unsafe { base.add(off) });
-                            off += seg.len();
+                // All-or-nothing, as in `touch_staged`: a block whose bytes cannot be produced is
+                // taken back out rather than left resident over its slot's previous occupant.
+                let total = self.fill_or_roll_back(id, evicted, || {
+                    let base = as_vk_buf(ring)?
+                        .mapped_ptr()
+                        .ok_or_else(|| be("pager staging ring is not persistently mapped"))?;
+                    Ok(match bytes {
+                        DenseBytes::Mmap(segments) => {
+                            let total: usize = segments.iter().map(|s| expert_bytes(s).len()).sum();
+                            fits(total);
+                            let mut off = ring_off;
+                            for s in segments {
+                                let seg = expert_bytes(s);
+                                par_copy_to_mapped(seg, unsafe { base.add(off) });
+                                off += seg.len();
+                            }
+                            total
                         }
-                        total
-                    }
-                    DenseBytes::Host => {
-                        let host = host.ok_or_else(|| {
-                            be(format!(
-                                "dense pager: block {id} has no host tier to read from"
-                            ))
-                        })?;
-                        let n = host.block_bytes(id).ok_or_else(|| {
-                            be(format!(
-                                "dense pager: block {id} is unknown to the host tier"
-                            ))
-                        })?;
-                        fits(n);
-                        // Delivered STRAIGHT into the ring. `HostPager::fill` copies out of its
-                        // arena on a hit and reads into a free slot while one remains, but once the
-                        // arena is full it reads the block into this buffer directly — one copy on
-                        // the streaming majority instead of two, which is the cost
-                        // `docs/perf/results.md` measured the pin-then-memcpy shape paying.
-                        //
-                        // SAFETY: `[ring_off, ring_off + n)` is this caller's own region of the
-                        // persistently-mapped ring — reserved by the cursor before this call, and
-                        // not reused until the recording that reads it completes (the fn's ring
-                        // contract). No other thread can hold a reference to it.
-                        let dst = unsafe { std::slice::from_raw_parts_mut(base.add(ring_off), n) };
-                        host.fill(id, dst)?;
-                        n
-                    }
-                };
+                        DenseBytes::Host => {
+                            let host = host.ok_or_else(|| {
+                                be(format!(
+                                    "dense pager: block {id} has no host tier to read from"
+                                ))
+                            })?;
+                            let n = host.block_bytes(id).ok_or_else(|| {
+                                be(format!(
+                                    "dense pager: block {id} is unknown to the host tier"
+                                ))
+                            })?;
+                            fits(n);
+                            // Delivered STRAIGHT into the ring. `HostPager::fill` copies out of
+                            // its arena on a hit and reads into a free slot while one remains, but
+                            // once the arena is full it reads the block into this buffer directly
+                            // — one copy on the streaming majority instead of two, which is the
+                            // cost `docs/perf/results.md` measured the pin-then-memcpy shape
+                            // paying.
+                            //
+                            // SAFETY: `[ring_off, ring_off + n)` is this caller's own region of
+                            // the persistently-mapped ring — reserved by the cursor before this
+                            // call, and not reused until the recording that reads it completes
+                            // (the fn's ring contract). No other thread can hold a reference to
+                            // it.
+                            let dst =
+                                unsafe { std::slice::from_raw_parts_mut(base.add(ring_off), n) };
+                            host.fill(id, dst)?;
+                            n
+                        }
+                    })
+                })?;
+                self.record_staged_placement(rec, id, slot, evicted);
                 // Word-align the copy length (the ring pad bytes it may carry are never read —
                 // see the fn doc); `total <= slot_bytes` and `slot_bytes % 4 == 0` keep it in
                 // the slot.
@@ -395,7 +561,6 @@ impl GpuPager {
                     slot as usize * self.slot_bytes,
                     total.next_multiple_of(4),
                 );
-                self.record_placement(id, slot, evicted);
                 Ok((slot, self.slot_bytes))
             }
         }
@@ -409,7 +574,10 @@ impl GpuPager {
     }
 
     /// Ensure `id` is resident, uploading `bytes` (exactly `slot_bytes`) through `staging` if it's
-    /// a miss. Updates the HOST lut mirror immediately; the device copy is deferred to
+    /// a miss, with one synchronous submit per miss. No production path calls this — the
+    /// execution path stages through [`Self::touch_staged`]; it is the paged-kernel parity tests'
+    /// way to fill an arena and the device LUT without a recorder. Updates the HOST lut mirror
+    /// immediately; the device copy is deferred to
     /// [`flush_lut`](Self::flush_lut) so a caller resolving several ids for one batch (see
     /// `infr_core::pager`'s within-batch note, which applies here unchanged) pays for exactly one
     /// LUT upload per batch, not one per id.
@@ -469,6 +637,21 @@ fn par_copy_to_mapped(src: &[u8], dst: *mut u8) {
     });
 }
 
+/// Copy one block's bytes into the front of its ring region — the miss half of
+/// [`GpuPager::touch_staged`] for a source already in host memory (a mmap'd bank, a pinned host
+/// slot). Errors rather than overrunning the region if the block is larger than the slot.
+fn copy_block(src: &[u8], dst: &mut [u8]) -> Result<()> {
+    let room = dst.len();
+    let dst = dst.get_mut(..src.len()).ok_or_else(|| {
+        be(format!(
+            "pager: a {}-byte block does not fit its {room}-byte ring region",
+            src.len()
+        ))
+    })?;
+    par_copy_to_mapped(src, dst.as_mut_ptr());
+    Ok(())
+}
+
 /// Device-to-device copy of `len` bytes from `src[0..len]` into `dst[slot*len .. (slot+1)*len]` —
 /// the pager's slot placement, which the shared `Backend::copy_buffer` can't express (it always
 /// copies `[0, bytes)` on both sides). Internal to this crate: raw `ash` calls mirroring
@@ -498,8 +681,8 @@ fn copy_into_slot(
 //
 // The pieces above are the block-agnostic host<->VRAM cache; everything below is the MoE-specific
 // glue: one [`GpuPager`] POOL per (expert role, per-expert byte size) pair, a table mapping a
-// bound weight BUFFER's identity to where its layer's expert bytes live in the mmap'd GGUF, and
-// the one persistent staging buffer every pool's uploads share.
+// bound weight BUFFER's identity to where its layer's expert bytes live (the mmap'd GGUF or the
+// pool's host tier), and the one persistent staging ring every pool's uploads share.
 //
 // Why (role, slot_bytes) pools and not one pager per role: the arena/LUT design requires every
 // block sharing an arena to have the SAME byte size (fixed slot offsets + a word-base LUT), and
@@ -574,6 +757,34 @@ fn expert_bytes(arc: &Arc<dyn AsRef<[u8]> + Send + Sync>) -> &[u8] {
     inner.as_ref()
 }
 
+/// Flush every pool's trace and its host tier's — all of them, even after one fails — and return
+/// the first failure, but only the first time this session sees one (`reported`): a failed trace
+/// stays failed, and the stats points that flush run after every generation.
+fn flush_traces<'a>(
+    pools: impl Iterator<Item = (&'a mut GpuPager, Option<&'a Arc<HostPager>>)>,
+    reported: &mut bool,
+) -> Result<()> {
+    let mut first = None;
+    for (pager, host) in pools {
+        let results = [
+            pager.flush_trace(),
+            host.map_or(Ok(()), |h| h.flush_trace()),
+        ];
+        for r in results {
+            if let (Err(e), None) = (r, &first) {
+                first = Some(e);
+            }
+        }
+    }
+    match first {
+        Some(e) if !*reported => {
+            *reported = true;
+            Err(e)
+        }
+        _ => Ok(()),
+    }
+}
+
 /// The shared `hits/misses/evictions/hit_rate` fragment of both sessions' `paging.stats` lines
 /// (each session prepends its own label + slot size and appends its own slot-count suffix).
 fn stats_suffix(s: &PagerStats) -> String {
@@ -624,10 +835,22 @@ struct Pool {
     /// This pool's tier BELOW VRAM, holding one block per expert (see [`ExpertBytes::Host`]), or
     /// `None` to read every miss from the mmap.
     host: Option<Arc<HostPager>>,
+    /// Blocks registered into this pool: the experts of every layer [`MoePagerSession::register`]
+    /// placed here.
+    registered: usize,
+}
+
+impl Pool {
+    /// Whether the arena has a slot for every block registered into it, so that nothing it ever
+    /// admits displaces another block — the condition under which a fill is free of eviction, now
+    /// and later (see [`MoePagerSession::request_fills`]).
+    fn holds_every_block(&self) -> bool {
+        self.registered <= self.pager.n_slots()
+    }
 }
 
 /// One model's whole paged-MoE session: the `(role, slot_bytes)` arena pools + the shared
-/// persistent staging buffer their uploads reuse (the bandwidth probe's headline finding — see
+/// persistent staging ring their uploads reuse (the bandwidth probe's headline finding — see
 /// `pager.rs`'s module doc and `tests/bandwidth_probe.rs`). Lives on the `VulkanBackend` HANDLE
 /// (NOT `VulkanShared` — the session's buffers hold `Arc<VulkanShared>` clones, and parking it on
 /// the shared state made an Arc cycle that leaked the device's whole VRAM footprint until process
@@ -636,12 +859,11 @@ struct Pool {
 /// cost, zero behavior change on the common (fits-in-VRAM) path.
 pub struct MoePagerSession {
     pools: Vec<Pool>,
-    /// `buffer_identity(placeholder)` -> (role, pool index, this layer's expert source), for
-    /// every PAGED `_exps` tensor. A non-paged layer's gate/up/down buffer is never registered
-    /// here — the adapter's lookup simply misses and falls through to the ordinary
-    /// resident-weight path.
-    sources: HashMap<usize, (Role, usize, ExpertSource)>,
-    staging: Box<dyn Buffer>,
+    /// `buffer_identity(placeholder)` -> (role, pool index, this layer's expert source, its expert
+    /// count — what `stage_role` checks a routed id against), for every PAGED `_exps` tensor. A
+    /// non-paged layer's gate/up/down buffer is never registered here — the adapter's lookup
+    /// simply misses and falls through to the ordinary resident-weight path.
+    sources: HashMap<usize, (Role, usize, ExpertSource, u32)>,
     /// Pinned staging RING for the recorded-upload path ([`GpuPager::touch_staged`]): two
     /// fence-rotated halves of [`Self::ring_half_bytes`] each, so the CPU stages the next
     /// segment's misses while the GPU executes the previous one (see
@@ -658,9 +880,330 @@ pub struct MoePagerSession {
     tape: Box<dyn Buffer>,
     tape_words: usize,
     print_stats: bool,
-    /// Reusable output buffer for [`Self::touch_role`]'s global-id list — cleared and refilled per
-    /// call so the demand path allocates no per-touch `Vec`.
-    global_scratch: Vec<u32>,
+    /// Whether a `paging.trace` write failure was already reported (see [`flush_traces`]).
+    trace_failure_reported: bool,
+    /// Filling experts no token routed to ([`Self::request_fills`]).
+    fills: Fills,
+}
+
+/// The background fill reader's staging buffer, in bytes: as many experts read and not yet
+/// copied into the arena as fit in it, and never fewer than one. It bounds the memory filling
+/// uses and how far the reader runs ahead of the forwards that admit what it read.
+pub const FILL_AHEAD_BYTES: usize = 64 << 20;
+
+/// How many experts of `slot_bytes` the fill staging buffer holds: as many as fit in
+/// [`FILL_AHEAD_BYTES`], and never fewer than one, so that an expert larger than that is still
+/// filled rather than never requested.
+fn fill_slot_count(slot_bytes: usize) -> usize {
+    (FILL_AHEAD_BYTES / slot_bytes.max(1)).max(1)
+}
+
+/// Where the background reader takes one fill's bytes from (see [`ExpertBytes`]).
+enum FillFrom {
+    /// The layer's whole bank in memory or mapped; the expert starts at `offset`.
+    Bank {
+        bank: Arc<dyn AsRef<[u8]> + Send + Sync>,
+        offset: usize,
+    },
+    /// The pool's tier below, read through [`HostPager::read`].
+    Host(Arc<HostPager>),
+}
+
+/// One expert the reader is asked for: block `id` (of the layer whose experts start at block
+/// `layer`) in pool `pool`, `len` bytes.
+struct FillJob {
+    pool: usize,
+    layer: u32,
+    id: BlockId,
+    len: usize,
+    from: FillFrom,
+}
+
+/// One expert the reader has read into staging slot `slot`, or failed to.
+struct FillReady {
+    pool: usize,
+    layer: u32,
+    id: BlockId,
+    slot: usize,
+    read: Result<()>,
+}
+
+/// The queue between [`MoePagerSession`] and its reader thread.
+#[derive(Default)]
+struct FillQueue {
+    jobs: std::collections::VecDeque<FillJob>,
+    ready: Vec<FillReady>,
+    /// Staging slots that hold nothing anyone needs: neither a read in progress, nor a ready
+    /// expert, nor bytes a recorded copy has yet to read.
+    free: Vec<usize>,
+    stop: bool,
+    /// The reader last went to sleep with jobs queued and no free slot — waiting for a release.
+    /// Lets a unit test see that it waits for a held slot instead of guessing with a sleep.
+    #[cfg(test)]
+    starved: bool,
+}
+
+struct FillShared {
+    queue: Mutex<FillQueue>,
+    /// Signalled when a job is queued, a slot is freed, or the reader is told to stop.
+    wake: std::sync::Condvar,
+}
+
+/// The mapped memory [`FillReader`] reads experts into.
+enum FillMemory {
+    /// A host-visible buffer the arena copies read from ([`FillReader::buffer`]).
+    Gpu(Box<dyn Buffer>),
+    /// Plain host memory, for the reader's unit tests, which have no device.
+    #[cfg(test)]
+    Host(Vec<std::cell::UnsafeCell<u8>>),
+}
+
+impl FillMemory {
+    /// The first byte, and the whole extent in bytes.
+    fn extent(&self) -> Result<(*mut u8, usize)> {
+        match self {
+            FillMemory::Gpu(b) => {
+                let p = as_vk_buf(b.as_ref())?
+                    .mapped_ptr()
+                    .ok_or_else(|| be("moe pager: fill staging buffer is not mapped"))?;
+                Ok((p, b.len_bytes()))
+            }
+            #[cfg(test)]
+            FillMemory::Host(v) => Ok((std::cell::UnsafeCell::raw_get(v.as_ptr()), v.len())),
+        }
+    }
+}
+
+/// The fill staging memory's first byte, handed to the reader thread.
+struct SlotBase(*mut u8);
+
+// SAFETY: only the reader thread dereferences it, and only for a slot it holds exclusively (see
+// `FillReader::run`); the memory it points into is owned by the `FillReader`, which joins that
+// thread before freeing it.
+unsafe impl Send for SlotBase {}
+
+/// The background thread that reads fills' bytes straight into a mapped staging buffer, so that a
+/// forward neither reads nor copies them: it records one buffer-to-arena copy per expert. The
+/// reader holds the sources it reads from (bank `Arc`s, the tier below), never the session or the
+/// device; it owns the staging memory, and its `Drop` stops and joins the thread before that
+/// memory is freed.
+///
+/// Every call from the session side answers `None` (or `false`) once the thread has ended or
+/// poisoned the queue's lock: the caller then turns fills off, and nothing waits on a dead reader.
+struct FillReader {
+    shared: Arc<FillShared>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Freed after the thread is joined: `Drop` below runs before the fields drop.
+    memory: FillMemory,
+    slot_bytes: usize,
+    n_slots: usize,
+}
+
+impl FillReader {
+    /// Start a reader over `memory`, which must hold `n_slots` slots of `slot_bytes`.
+    fn spawn(memory: FillMemory, slot_bytes: usize, n_slots: usize) -> Result<Self> {
+        let (base, len) = memory.extent()?;
+        if n_slots == 0 || slot_bytes.checked_mul(n_slots).is_none_or(|n| n > len) {
+            return Err(be(format!(
+                "moe pager: a {len}-byte fill staging buffer cannot hold {n_slots} x {slot_bytes} B"
+            )));
+        }
+        let shared = Arc::new(FillShared {
+            queue: Mutex::new(FillQueue {
+                free: (0..n_slots).collect(),
+                ..FillQueue::default()
+            }),
+            wake: std::sync::Condvar::new(),
+        });
+        let worker = Arc::clone(&shared);
+        let base = SlotBase(base);
+        let thread = std::thread::Builder::new()
+            .name("infr-moe-fill".into())
+            .spawn(move || Self::run(&worker, base, slot_bytes))
+            .map_err(|e| be(format!("moe pager: fill reader thread not started: {e}")))?;
+        Ok(Self {
+            shared,
+            thread: Some(thread),
+            memory,
+            slot_bytes,
+            n_slots,
+        })
+    }
+
+    fn run(shared: &FillShared, base: SlotBase, slot_bytes: usize) {
+        loop {
+            let (job, slot) = {
+                let Ok(mut q) = shared.queue.lock() else {
+                    return;
+                };
+                loop {
+                    if q.stop {
+                        return;
+                    }
+                    if !q.jobs.is_empty() && !q.free.is_empty() {
+                        let job = q.jobs.pop_front().expect("checked non-empty");
+                        break (job, q.free.pop().expect("checked non-empty"));
+                    }
+                    #[cfg(test)]
+                    {
+                        q.starved = !q.jobs.is_empty();
+                    }
+                    q = match shared.wake.wait(q) {
+                        Ok(q) => q,
+                        Err(_) => return,
+                    };
+                    #[cfg(test)]
+                    {
+                        q.starved = false;
+                    }
+                }
+            };
+            let read = if job.len > slot_bytes {
+                Err(be(format!(
+                    "moe pager: a {}-byte expert does not fit a {slot_bytes}-byte fill slot",
+                    job.len
+                )))
+            } else {
+                // SAFETY: `slot` came off the free list under the lock, so this thread is its only
+                // holder: the session returns a slot to the list only once no recorded copy will
+                // read it again, and this thread hands it on (in `ready`) only after this write
+                // ends. The slot lies inside the memory `spawn` checked, which outlives this
+                // thread: the owning `FillReader` joins it before freeing the memory.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(base.0.add(slot * slot_bytes), job.len)
+                };
+                match &job.from {
+                    FillFrom::Bank { bank, offset } => expert_bytes(bank)
+                        .get(*offset..*offset + job.len)
+                        .map(|src| dst.copy_from_slice(src))
+                        .ok_or_else(|| be("moe pager: fill past the end of its layer's bank")),
+                    FillFrom::Host(host) => host.read(job.id, dst).map(|_| ()),
+                }
+            };
+            let Ok(mut q) = shared.queue.lock() else {
+                return;
+            };
+            q.ready.push(FillReady {
+                pool: job.pool,
+                layer: job.layer,
+                id: job.id,
+                slot,
+                read,
+            });
+        }
+    }
+
+    /// The queue, unless the reader has ended (a panic) or poisoned it.
+    fn queue(&self) -> Option<std::sync::MutexGuard<'_, FillQueue>> {
+        if self.thread.as_ref().is_none_or(|t| t.is_finished()) {
+            return None;
+        }
+        self.shared.queue.lock().ok()
+    }
+
+    /// The staging buffer the arena copies read from; `None` in the unit tests' host memory.
+    fn buffer(&self) -> Option<&dyn Buffer> {
+        match &self.memory {
+            FillMemory::Gpu(b) => Some(b.as_ref()),
+            #[cfg(test)]
+            FillMemory::Host(_) => None,
+        }
+    }
+
+    /// Queue `jobs` for reading.
+    fn post(&self, jobs: Vec<FillJob>) -> bool {
+        let Some(mut q) = self.queue() else {
+            return false;
+        };
+        q.jobs.extend(jobs);
+        drop(q);
+        self.shared.wake.notify_all();
+        true
+    }
+
+    /// Take back every queued job the reader has not started.
+    fn cancel_queued(&self) -> Option<Vec<FillJob>> {
+        Some(self.queue()?.jobs.drain(..).collect())
+    }
+
+    /// Take every read the reader has finished.
+    fn take_ready(&self) -> Option<Vec<FillReady>> {
+        Some(std::mem::take(&mut self.queue()?.ready))
+    }
+
+    /// Return staging slots whose bytes nothing will read again. Each must be held — taken by
+    /// the reader and not released since — which debug builds check.
+    fn release(&self, slots: impl IntoIterator<Item = usize>) -> bool {
+        let Some(mut q) = self.queue() else {
+            return false;
+        };
+        for slot in slots {
+            debug_assert!(
+                slot < self.n_slots && !q.free.contains(&slot),
+                "fill staging slot {slot} released while not held"
+            );
+            q.free.push(slot);
+        }
+        drop(q);
+        self.shared.wake.notify_all();
+        true
+    }
+}
+
+impl Drop for FillReader {
+    fn drop(&mut self) {
+        // Poison-tolerant: the reader may have died holding the lock, and stopping must not panic.
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop = true;
+        self.shared.wake.notify_all();
+        if let Some(t) = self.thread.take() {
+            // A reader that panicked was reported when the session found it gone
+            // (`MoePagerSession::fill_reader_died`); joining is all that is left to do with it.
+            let _panicked = t.join().is_err();
+        }
+    }
+}
+
+/// A background fill reader [`MoePagerSession::end_forward`] stopped using. Dropping it stops the
+/// reader thread, waiting for a read in progress, and then frees its staging memory — so drop it
+/// once the session's lock is released.
+#[must_use = "dropping it waits for the reader; drop it outside the session's lock"]
+pub struct StoppedFillReader(Option<FillReader>);
+
+/// [`MoePagerSession`]'s background filling — see [`MoePagerSession::request_fills`].
+#[derive(Default)]
+struct Fills {
+    /// Started by the first request; stopped by a forward that asked for nothing
+    /// ([`MoePagerSession::end_forward`]).
+    reader: Option<FillReader>,
+    /// Filling is off for the rest of the session — the reader died, or could not be started —
+    /// which was reported once.
+    off: bool,
+    /// `(pool, block)` of every job posted to the reader and not yet taken back.
+    in_flight: std::collections::HashSet<(usize, BlockId)>,
+    /// Per layer, keyed by its first block id (`ExpertSource::layer_base`).
+    layers: HashMap<u32, LayerFill>,
+    /// Staging slots whose arena copy went into recording `.0` (a `Recorder::serial`), held until
+    /// that recording is known to have completed ([`MoePagerSession::fills_copied`]) or never to
+    /// run ([`MoePagerSession::forget_unsubmitted`]).
+    staged: Vec<(u64, usize)>,
+    /// Whether a layer asked for fills since the last [`MoePagerSession::end_forward`].
+    asked: bool,
+}
+
+/// One layer's fill state.
+#[derive(Default)]
+struct LayerFill {
+    /// [`MoePagerSession::demand_misses`] at this layer's previous request — the demand gate.
+    quiet: Option<u64>,
+    /// The next local expert id a request looks at: every one before it was resident or asked
+    /// for when a request passed it, unless a cancel moved the cursor back.
+    cursor: u32,
+    /// This layer's jobs in [`Fills::in_flight`].
+    in_flight: usize,
 }
 
 /// One pool's spec in [`MoePagerLayout`]: slot counts are INDEPENDENT per pool. Each pool's arena
@@ -670,7 +1213,7 @@ pub struct MoePagerSession {
 /// shared slot count is dragged down to fit the LARGEST pool's per-slot bytes within the VRAM
 /// budget and strands budget the smaller pools could have used as real hit rate (Scout: uniform
 /// 238 slots everywhere left ~6 GB of a 19 GB budget unused; per-pool sizing gives gate/up 312
-/// each). Each pool has its own LRU/LUT and `touch_role` resolves pools independently, so unequal
+/// each). Each pool has its own LRU/LUT and `stage_role` resolves pools independently, so unequal
 /// counts are correctness-neutral — a pool with fewer slots just misses more often. Computed by
 /// the caller (budget-driven count, then per-pool split — see `seam::mod`'s placement policy).
 pub struct MoePoolSpec {
@@ -710,20 +1253,45 @@ pub struct MoePagerLayout {
 pub use infr_core::pager::ring_bytes;
 
 impl MoePagerSession {
+    /// [`GpuPager::forget_unsubmitted`] over every pool: recording `serial` is being discarded.
+    /// The fill staging slots its copies would have read are free again.
+    pub fn forget_unsubmitted(&mut self, serial: u64) {
+        for p in &mut self.pools {
+            p.pager.forget_unsubmitted(serial);
+        }
+        self.release_staged_fills(|s| s == serial);
+    }
+
     pub fn new(vk: &VulkanBackend, layout: MoePagerLayout) -> Result<Self> {
         let mut pools = Vec::with_capacity(layout.pools.len());
-        let mut staging_bytes = 4usize;
+        let mut max_slot = 4usize;
+        let trace = TraceFile::for_config(vk.cfg().paging.trace.as_deref())?;
         for spec in &layout.pools {
+            // MoE pools are pointer-addressed (`bufferDeviceAddress`) — no per-arena SSBO cap.
+            let mut pager = GpuPager::new(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes)?;
+            if let Some(t) = &trace {
+                let label = format!("moe {}/{}B", spec.role.name(), spec.slot_bytes);
+                if let Some(h) = &spec.host {
+                    h.trace_to(t, format!("{label} host"), layout.n_blocks)?;
+                }
+                pager.trace_to(
+                    t,
+                    PoolInfo {
+                        tier: Tier::Vram,
+                        label,
+                        n_blocks: layout.n_blocks,
+                    },
+                )?;
+            }
             pools.push(Pool {
                 role: spec.role,
                 slot_bytes: spec.slot_bytes,
-                // MoE pools are pointer-addressed (`bufferDeviceAddress`) — no per-arena SSBO cap.
-                pager: GpuPager::new(vk, layout.n_blocks, spec.n_slots, spec.slot_bytes)?,
+                pager,
                 host: spec.host.clone(),
+                registered: 0,
             });
-            staging_bytes = staging_bytes.max(spec.slot_bytes);
+            max_slot = max_slot.max(spec.slot_bytes);
         }
-        let staging = vk.alloc_uninit(staging_bytes, BufferUsage::Staging)?;
         // Each ring half must hold the largest slot, or `touch_staged` could never make progress
         // on that pool (the adapter rotates halves when one fills; a slot bigger than a half
         // would fit in neither).
@@ -733,7 +1301,7 @@ impl MoePagerSession {
             // 0 budget → the clamp floor; the configured `paging.ring` override still wins.
             ring_bytes(0, vk.cfg().paging.ring)
         };
-        let ring_half_bytes = (ring_total / 2).max(staging_bytes);
+        let ring_half_bytes = (ring_total / 2).max(max_slot);
         let ring = vk.alloc_uninit(2 * ring_half_bytes, BufferUsage::Staging)?;
         // One graph's windows = paged layers x roles x n_expert words (Scout: 48 x 3 x 16 = 2.3k)
         // — 64k words (256 KiB) leaves an order of magnitude of headroom; `lut_window` hard-errors
@@ -743,13 +1311,13 @@ impl MoePagerSession {
         Ok(Self {
             pools,
             sources: HashMap::new(),
-            staging,
             ring,
             ring_half_bytes,
             tape,
             tape_words,
             print_stats: vk.cfg().paging.stats,
-            global_scratch: Vec::new(),
+            trace_failure_reported: false,
+            fills: Fills::default(),
         })
     }
 
@@ -780,6 +1348,16 @@ impl MoePagerSession {
                     role, source.stride_bytes,
                 ))
             })?;
+        // The layer is one block group of its pool, which is what makes the decode fast path's
+        // residency check and recency upkeep one call per layer instead of one per expert
+        // (`all_resident`, `touch_all_hits`). Its experts must be exactly one group.
+        if n_expert == 0 || !source.layer_base.is_multiple_of(n_expert as u32) {
+            return Err(be(format!(
+                "moe pager: layer base {} is not a whole number of {n_expert}-expert layers",
+                source.layer_base
+            )));
+        }
+        self.pools[pool].pager.group_by(n_expert as u32)?;
         if matches!(source.bytes, ExpertBytes::Host) {
             let host = self.pools[pool].host.as_ref().ok_or_else(|| {
                 be(format!(
@@ -801,7 +1379,13 @@ impl MoePagerSession {
                 }
             }
         }
-        self.sources.insert(buf_id, (role, pool, source));
+        if let Some((_, old_pool, _, old_n)) = self
+            .sources
+            .insert(buf_id, (role, pool, source, n_expert as u32))
+        {
+            self.pools[old_pool].registered -= old_n as usize;
+        }
+        self.pools[pool].registered += n_expert;
         Ok(())
     }
 
@@ -809,66 +1393,6 @@ impl MoePagerSession {
     /// adapter's per-`MoeFfn` dispatch check.
     pub fn is_paged(&self, role: Role, buf_id: usize) -> bool {
         self.sources.get(&buf_id).is_some_and(|(r, ..)| *r == role)
-    }
-
-    /// Resolve residency for every id in `local_ids` (this token's routed experts, LOCAL to the
-    /// layer) against `buf_id`'s pool, uploading misses through the shared staging buffer and
-    /// flushing the LUT once. Returns the GLOBAL ids (`layer_base + local_id`) the paged GEMV
-    /// must read instead of `local_ids` — see [`ExpertSource::layer_base`].
-    pub fn touch_role(
-        &mut self,
-        vk: &VulkanBackend,
-        role: Role,
-        buf_id: usize,
-        local_ids: &[u32],
-    ) -> Result<&[u32]> {
-        let (r, pool, src) = self
-            .sources
-            .get(&buf_id)
-            .ok_or_else(|| be("moe pager: touch on an unregistered buffer"))?;
-        debug_assert_eq!(*r, role, "touch_role: role/buffer mismatch");
-        let stride = src.stride_bytes;
-        let layer_base = src.layer_base;
-        let bank = match &src.bytes {
-            ExpertBytes::Mmap(a) => Some(expert_bytes(a)),
-            ExpertBytes::Host => None,
-        };
-        // Destructure the pool: the pager is taken mutably while the tier below is read, and
-        // indexing twice would borrow the whole `pools` vector each time.
-        let Pool { pager, host, .. } = &mut self.pools[*pool];
-        // Reuse a scratch Vec across calls instead of allocating one per touch — this is the
-        // steady-state demand path (per layer per token). NOTE: each miss still does one
-        // synchronous `one_shot` submit (inside `ensure_resident`); batching those into a single
-        // recorded submission would materially change the recorded stream — the RING/`stage_role`
-        // path exists precisely for that — so the demand path keeps the per-miss copy and only the
-        // per-call allocation is removed here.
-        let global = &mut self.global_scratch;
-        global.clear();
-        global.reserve(local_ids.len());
-        for &lid in local_ids {
-            let id = layer_base + lid;
-            match bank {
-                Some(bytes) => {
-                    let off = lid as usize * stride;
-                    let slice = bytes.get(off..off + stride).ok_or_else(|| {
-                        be("moe pager: expert id out of range for this layer's bank")
-                    })?;
-                    pager.ensure_resident(vk, self.staging.as_ref(), id, slice)?;
-                }
-                // Tier below: routing is unpredictable, so this caches under recency like the
-                // arena above it does on the demand path (`docs/disk-streaming-plan.md` §3.6).
-                None => {
-                    let host = host
-                        .as_ref()
-                        .ok_or_else(|| be(format!("moe pager: expert {id} has no host tier")))?;
-                    let pin = host.pin(id, Insert::Mru)?;
-                    pager.ensure_resident(vk, self.staging.as_ref(), id, &pin)?;
-                }
-            }
-            global.push(id);
-        }
-        pager.flush_lut(vk)?;
-        Ok(&self.global_scratch)
     }
 
     /// The shared upload ring / its per-half capacity (see the `ring` field's doc). The CURSOR
@@ -888,34 +1412,50 @@ impl MoePagerSession {
 
     /// Whether ALL `n_expert` experts of `buf_id`'s layer are resident in its pool — the
     /// no-readback inline gate for a small-m (decode) layer: when true, any routing the GPU
-    /// picks is covered, so the host needs no routing knowledge at all.
+    /// picks is covered, so the host needs no routing knowledge at all. O(1): the layer is one
+    /// block group of its pool, whose resident count the pager keeps (`Pager::group_is_resident`).
+    /// `false` for an unregistered buffer, or an `n_expert` other than the layer registered with.
     pub fn all_resident(&self, buf_id: usize, n_expert: usize) -> bool {
-        let (_, pool, src) = match self.sources.get(&buf_id) {
-            Some(s) => s,
-            None => return false,
-        };
-        let pager = &self.pools[*pool].pager;
-        (0..n_expert as u32).all(|e| pager.is_resident(src.layer_base + e))
+        match self.sources.get(&buf_id) {
+            Some((_, pool, src, n)) if *n as usize == n_expert => {
+                self.pools[*pool].pager.is_group_resident(src.layer_base)
+            }
+            _ => false,
+        }
     }
 
-    /// LRU maintenance for an inline-recorded (no-readback) layer: mark all `n_expert` blocks
-    /// MRU. Callers gate on [`Self::all_resident`], so every touch is a hit — no uploads, no LUT
-    /// mutation (the property that makes inline recording safe while earlier segments are still
-    /// in flight).
+    /// Recency upkeep for an inline-recorded (no-readback) layer, in one call: the layer's
+    /// experts are touched as one group (`Pager::touch_group`), which leaves the pool exactly as
+    /// an MRU touch of every one of them in id order would — the same hits counted and the same
+    /// recency order — without the per-expert work. Callers gate on [`Self::all_resident`]; a
+    /// layer that is not wholly resident is an error, and touches nothing. No uploads and no LUT
+    /// mutation (the property that makes inline recording safe while earlier segments are still in
+    /// flight).
+    ///
+    /// The upkeep is what keeps a layer used every token wholly resident: a miss elsewhere evicts
+    /// the least recently used block, and without it a fully resident layer's experts would age
+    /// from the moment it last missed, become the victims, and send the layer down the split path
+    /// (a blocking readback) on its next token. It is not what makes the step safe to record —
+    /// the batch opened here is closed by the next `begin_batch` on the pool before any touch, and
+    /// the slots the window names are ordered against later copies by the adapter's barriers.
     pub fn touch_all_hits(&mut self, buf_id: usize, n_expert: usize) -> Result<()> {
-        let (_, pool, src) = self
+        let (_, pool, src, n) = self
             .sources
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: touch on an unregistered buffer"))?;
+        if *n as usize != n_expert {
+            return Err(be(format!(
+                "moe pager: touch of {n_expert} experts on a {n}-expert layer"
+            )));
+        }
         let layer_base = src.layer_base;
         let pager = &mut self.pools[*pool].pager;
         pager.begin_batch();
-        for e in 0..n_expert as u32 {
-            let r = pager.pager.touch(layer_base + e);
-            debug_assert!(
-                matches!(r, Resolution::Hit { .. }),
-                "touch_all_hits on a non-resident block (all_resident gate violated)"
-            );
+        if !pager.pager.touch_group(layer_base) {
+            return Err(be(format!(
+                "moe pager: touch_all_hits on layer base {layer_base}, which is not wholly \
+                 resident (the all_resident gate was not checked)"
+            )));
         }
         Ok(())
     }
@@ -924,7 +1464,7 @@ impl MoePagerSession {
     /// BEFORE the first [`Self::stage_role`] call of that batch (rotations re-call `stage_role`
     /// WITHIN the same batch; the epoch protection must span them).
     pub fn begin_batch(&mut self, buf_id: usize) -> Result<()> {
-        let (_, pool, _) = self
+        let (_, pool, ..) = self
             .sources
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: begin_batch on an unregistered buffer"))?;
@@ -957,10 +1497,18 @@ impl MoePagerSession {
         scan: bool,
     ) -> Result<usize> {
         let (pool_idx, stride, layer_base, bytes_arc) = {
-            let (_, pool, src) = self
+            let (_, pool, src, n_expert) = self
                 .sources
                 .get(&buf_id)
                 .ok_or_else(|| be("moe pager: stage on an unregistered buffer"))?;
+            // Refused before anything is touched. On the host-backed path nothing else would
+            // catch it: `layer_base + lid` past this layer's experts is a valid block of the NEXT
+            // layer, which would be read and cached as if this layer had asked for it.
+            if let Some(&lid) = local_ids.iter().find(|&&lid| lid >= *n_expert) {
+                return Err(be(format!(
+                    "moe pager: expert id {lid} out of range for a {n_expert}-expert layer"
+                )));
+            }
             let arc = match &src.bytes {
                 ExpertBytes::Mmap(a) => Some(Arc::clone(a)),
                 ExpertBytes::Host => None,
@@ -987,33 +1535,394 @@ impl MoePagerSession {
                 return Ok(i); // half full — caller rotates and continues from here
             }
             let ring_off = half_base + *cursor;
+            // Everything that can be checked without the tier below is checked before the touch
+            // (the id range above, the bank slice here); only producing the bytes goes into the
+            // miss-only `fill`.
             *cursor += match bank {
                 Some(bytes) => {
                     let off = lid as usize * stride;
                     let slice = bytes.get(off..off + stride).ok_or_else(|| {
                         be("moe pager: expert id out of range for this layer's bank")
                     })?;
-                    pager.touch_staged(rec, ring.as_ref(), ring_off, id, slice, scan)?
+                    pager.touch_staged(rec, ring.as_ref(), ring_off, id, scan, |dst| {
+                        copy_block(slice, dst)
+                    })?
                 }
-                // Tier below, under the SAME policy the arena above uses for this batch: a
-                // full-set prefill sweep inserts cold, a routed decode touch inserts MRU.
                 None => {
                     let host = host
                         .as_ref()
                         .ok_or_else(|| be(format!("moe pager: expert {id} has no host tier")))?;
                     if host.caches() {
+                        // Tier below, under the SAME insertion policy the arena above uses for this
+                        // batch: a full-set prefill sweep inserts cold, a routed decode touch MRU.
+                        // It sees only the arena's misses, as the dense path's tier below does.
                         let insert = if scan { Insert::Cold } else { Insert::Mru };
-                        let pin = host.pin(id, insert)?;
-                        pager.touch_staged(rec, ring.as_ref(), ring_off, id, &pin, scan)?
+                        pager.touch_staged(rec, ring.as_ref(), ring_off, id, scan, |dst| {
+                            copy_block(&host.pin(id, insert)?, dst)
+                        })?
                     } else {
                         // Unified memory: nothing is cached below, so read the expert straight
-                        // into the ring rather than through an arena that does not exist.
-                        pager.touch_staged_read(rec, ring.as_ref(), ring_off, id, host, scan)?
+                        // into the ring rather than through an arena that does not exist — one
+                        // copy instead of the read-then-copy a host arena would cost.
+                        pager.touch_staged(rec, ring.as_ref(), ring_off, id, scan, |dst| {
+                            host.fill(id, dst).map(|_| ())
+                        })?
                     }
                 }
             };
         }
         Ok(local_ids.len())
+    }
+
+    /// Whether `buf_id`'s pool has a slot for every expert registered into it (every layer's, not
+    /// only this one's) — the condition [`Self::request_fills`] requires. `false` for an
+    /// unregistered buffer.
+    pub fn holds_every_expert(&self, buf_id: usize) -> bool {
+        self.sources
+            .get(&buf_id)
+            .is_some_and(|(_, pool, ..)| self.pools[*pool].holds_every_block())
+    }
+
+    /// Whether the layer whose roles' tensors are `buf_ids` fills: every role's pool holds every
+    /// expert registered into it ([`Self::holds_every_expert`]), and filling has not been turned
+    /// off (the reader died or could not start).
+    pub fn fills_layer(&self, buf_ids: &[usize]) -> bool {
+        !self.fills.off && buf_ids.iter().all(|&b| self.holds_every_expert(b))
+    }
+
+    /// Ask the background reader for the absent experts of one layer — `buf_ids` are its roles'
+    /// tensors — so that a later [`Self::stage_ready_fills`] can admit them and the layer becomes
+    /// wholly resident without a token ever routing to them: the decode path with no router
+    /// readback ([`Self::all_resident`]). Experts are asked for in id order, every role of one id
+    /// before the next, so the layer completes as a unit; each layer keeps a cursor, so a request
+    /// looks only at experts it has not passed before. An expert is read from wherever a miss
+    /// would read it — the bank in memory or the mapping, or the tier below through
+    /// [`HostPager::read`], which neither pins nor keeps a copy there (its pool never evicts, so a
+    /// copy below would never be read again) — straight into the reader's staging buffer, on the
+    /// reader's thread. The buffer's slots ([`FILL_AHEAD_BYTES`]) bound what is asked for and not
+    /// yet admitted. `vk` allocates that buffer on the first request.
+    ///
+    /// Demand reads come first: a layer's call requests nothing unless no expert was missed, in
+    /// any pool, since that layer's previous call — a whole forward, every other layer's routing
+    /// included — and a call that finds a miss takes back every request the reader has not
+    /// started on. So the reader competes for the drive, and for the host's memory bandwidth, with
+    /// a decode that is still warming its routed set for at most the read in progress.
+    ///
+    /// Refused unless every role's pool has a slot for every expert registered into it
+    /// ([`Self::holds_every_expert`]): only then is a fill certain never to evict, nor to take a
+    /// slot a routed expert would later have to evict something else to get. Does nothing once
+    /// filling is off ([`Self::fills_layer`]); a reader that cannot be started turns it off with a
+    /// warning rather than failing the forward, which needs no fill.
+    pub fn request_fills(&mut self, vk: &VulkanBackend, buf_ids: &[usize]) -> Result<()> {
+        if !buf_ids.iter().all(|&b| self.holds_every_expert(b)) {
+            return Err(be(
+                "moe pager: fill requested for a pool that cannot hold all its registered experts",
+            ));
+        }
+        // (pool, layer base, expert count, source) per role; registered, per the check above.
+        let roles: Vec<(usize, u32, u32, &ExpertSource)> = buf_ids
+            .iter()
+            .filter_map(|b| self.sources.get(b))
+            .map(|(_, pool, src, n)| (*pool, src.layer_base, *n, src))
+            .collect();
+        let Some(&(_, layer, ..)) = roles.first() else {
+            return Ok(());
+        };
+        if roles.iter().any(|&(_, base, ..)| base != layer) {
+            return Err(be(
+                "moe pager: fill requested across tensors of different layers",
+            ));
+        }
+        self.fills.asked = true;
+        if self.fills.off {
+            return Ok(());
+        }
+        let demand = self.demand_misses();
+        let Self { pools, fills, .. } = self;
+        let st = fills.layers.entry(layer).or_default();
+        if st.quiet.replace(demand) != Some(demand) {
+            // A token missed since this layer last asked: take back what the reader has not
+            // started on, so it reads nothing more while routed experts are still being read.
+            let Some(reader) = &fills.reader else {
+                return Ok(());
+            };
+            let Some(jobs) = reader.cancel_queued() else {
+                Self::fill_reader_died(fills);
+                return Ok(());
+            };
+            for job in jobs {
+                fills.in_flight.remove(&(job.pool, job.id));
+                if let Some(l) = fills.layers.get_mut(&job.layer) {
+                    l.in_flight -= 1;
+                    l.cursor = l.cursor.min(job.id - job.layer);
+                }
+            }
+            return Ok(());
+        }
+        if fills.reader.is_none() {
+            let slot_bytes = pools.iter().map(|p| p.slot_bytes).max().unwrap_or(4);
+            let n_slots = fill_slot_count(slot_bytes);
+            // Host memory the GPU reads over the bus (`HostWeights`), not the ReBAR VRAM a
+            // `Staging` buffer gets: it stays out of the VRAM budget, and the reader's writes stay
+            // off the bus (measured no slower; `docs/plan/06-pager-eviction.md`).
+            let started = vk
+                .alloc_uninit(n_slots * slot_bytes, BufferUsage::HostWeights)
+                .and_then(|b| FillReader::spawn(FillMemory::Gpu(b), slot_bytes, n_slots));
+            match started {
+                Ok(r) => fills.reader = Some(r),
+                Err(e) => {
+                    // Fills only save readbacks; a decode without them is the decode as before.
+                    Self::fills_off(fills, e);
+                    return Ok(());
+                }
+            }
+        }
+        let reader = fills.reader.as_ref().expect("started above");
+        let mut room = reader
+            .n_slots
+            .saturating_sub(fills.in_flight.len() + fills.staged.len());
+        let st = fills.layers.get_mut(&layer).expect("inserted above");
+        let n_expert = roles.iter().map(|&(.., n, _)| n).min().unwrap_or(0);
+        if room == 0 {
+            return Ok(());
+        }
+        if st.cursor >= n_expert {
+            if st.in_flight > 0 {
+                return Ok(()); // every absent expert is asked for already
+            }
+            // Passed every expert with nothing in flight, yet the layer is not wholly resident
+            // (the caller is on the readback arm): something came back out — a fill whose
+            // recording was discarded — so look again from the start.
+            st.cursor = 0;
+        }
+        let mut jobs = Vec::new();
+        'scan: while st.cursor < n_expert {
+            let lid = st.cursor;
+            for &(pool_idx, base, _, src) in &roles {
+                let pool = &pools[pool_idx];
+                let id = base + lid;
+                if pool.pager.is_resident(id) || fills.in_flight.contains(&(pool_idx, id)) {
+                    continue;
+                }
+                if room == 0 {
+                    break 'scan;
+                }
+                let from = match &src.bytes {
+                    ExpertBytes::Mmap(bank) => FillFrom::Bank {
+                        bank: Arc::clone(bank),
+                        offset: lid as usize * src.stride_bytes,
+                    },
+                    ExpertBytes::Host => {
+                        FillFrom::Host(Arc::clone(pool.host.as_ref().ok_or_else(|| {
+                            be(format!("moe pager: expert {id} has no host tier"))
+                        })?))
+                    }
+                };
+                fills.in_flight.insert((pool_idx, id));
+                st.in_flight += 1;
+                room -= 1;
+                jobs.push(FillJob {
+                    pool: pool_idx,
+                    layer,
+                    id,
+                    len: src.stride_bytes,
+                    from,
+                });
+            }
+            st.cursor += 1;
+        }
+        if !jobs.is_empty() && !reader.post(jobs) {
+            Self::fill_reader_died(fills);
+        }
+        Ok(())
+    }
+
+    /// Admit every expert the background reader has finished reading ([`Self::request_fills`])
+    /// into a free slot of its pool ([`GpuPager::fill_staged`]): each one's copy from the reader's
+    /// staging buffer into its arena slot is recorded through `rec`, between two
+    /// `arena_stream_barrier`s — so it is ordered after every arena read recorded before this
+    /// call, and every dispatch recorded after it, in this recording or a later one, reads the
+    /// filled bytes. An expert some token routed to while it was being read is already resident
+    /// and is dropped. Returns how many were admitted.
+    ///
+    /// A fill that cannot be admitted — its read failed, or its pool refused it — never fails the
+    /// caller's forward, which needs no fill: its staging slot is released, the others are
+    /// admitted, and filling is turned off for the session with one warning. A token that does
+    /// route to an expert that cannot be read still fails, through the demand path.
+    ///
+    /// The staging slots stay held until [`Self::fills_copied`] reports `rec` complete or
+    /// [`Self::forget_unsubmitted`] reports it discarded — only then may the reader write them
+    /// again.
+    pub fn stage_ready_fills(&mut self, rec: &crate::recorder::Recorder<'_>) -> Result<usize> {
+        let Self { pools, fills, .. } = self;
+        let Some(reader) = fills.reader.as_ref().filter(|_| !fills.off) else {
+            return Ok(0);
+        };
+        // Checked before anything is taken off the queue, so an error here strands no read.
+        let Some(src) = reader.buffer() else {
+            return Err(be("moe pager: fill staging memory is not a device buffer"));
+        };
+        let Some(ready) = reader.take_ready() else {
+            Self::fill_reader_died(fills);
+            return Ok(0);
+        };
+        let (mut admitted, mut free, mut failed) = (0, Vec::new(), None);
+        for r in ready {
+            fills.in_flight.remove(&(r.pool, r.id));
+            if let Some(l) = fills.layers.get_mut(&r.layer) {
+                l.in_flight -= 1;
+            }
+            if let Err(e) = r.read {
+                free.push(r.slot);
+                failed.get_or_insert(e);
+                continue;
+            }
+            let pager = &mut pools[r.pool].pager;
+            if pager.is_resident(r.id) {
+                free.push(r.slot);
+                continue;
+            }
+            if admitted == 0 {
+                rec.arena_stream_barrier();
+            }
+            match pager.fill_staged(rec, src, r.slot * reader.slot_bytes, r.id) {
+                Ok(_) => {
+                    fills.staged.push((rec.serial(), r.slot));
+                    admitted += 1;
+                }
+                Err(e) => {
+                    free.push(r.slot);
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        if admitted > 0 {
+            rec.arena_stream_barrier();
+        }
+        if !free.is_empty() && !reader.release(free) {
+            Self::fill_reader_died(fills);
+        }
+        if let Some(e) = failed {
+            Self::fills_off(fills, format_args!("a fill could not be admitted: {e}"));
+        }
+        Ok(admitted)
+    }
+
+    /// Every recording up to `serial` (a `Recorder::serial`) has completed or been discarded: the
+    /// adapter calls this once it has waited the queue idle after submitting recording `serial`,
+    /// recordings being submitted in the order they were made. The fill staging slots their
+    /// copies read ([`Self::stage_ready_fills`]) are free for the reader again.
+    pub fn fills_copied(&mut self, serial: u64) {
+        self.release_staged_fills(|s| s <= serial);
+    }
+
+    /// Free the fill staging slots whose copies went into a recording `done` accepts — one that
+    /// has completed or will never run.
+    fn release_staged_fills(&mut self, done: impl Fn(u64) -> bool) {
+        let fills = &mut self.fills;
+        let mut free = Vec::new();
+        fills.staged.retain(|&(s, slot)| {
+            if done(s) {
+                free.push(slot);
+            }
+            !done(s)
+        });
+        if free.is_empty() {
+            return;
+        }
+        match &fills.reader {
+            Some(r) if !fills.off => {
+                if !r.release(free) {
+                    Self::fill_reader_died(fills);
+                }
+            }
+            // A dead reader's memory outlives it until no recorded copy reads it.
+            _ if fills.staged.is_empty() => fills.reader = None,
+            _ => {}
+        }
+    }
+
+    /// The forward that just ended asked for no fill ([`Self::request_fills`]) — every layer that
+    /// could fill was wholly resident, or a prefill sweep staged all its experts — so whatever the
+    /// reader still holds or is reading is for experts already resident: stop it and free its
+    /// memory. Called by the adapter after each forward. A later forward that finds a layer not
+    /// wholly resident again (a discarded recording took fills back) starts a new reader.
+    ///
+    /// The reader is handed back rather than stopped here: dropping the returned value stops it,
+    /// which waits for a read in progress, so the caller drops it after releasing the session's
+    /// lock and no other forward waits on that read.
+    pub fn end_forward(&mut self) -> StoppedFillReader {
+        let fills = &mut self.fills;
+        if std::mem::take(&mut fills.asked) || fills.reader.is_none() || !fills.staged.is_empty() {
+            return StoppedFillReader(None);
+        }
+        fills.in_flight.clear();
+        fills.layers.clear();
+        StoppedFillReader(fills.reader.take())
+    }
+
+    /// Staging slots of the background reader that are not free: a read in progress or finished
+    /// and not yet admitted, or admitted with its copy not yet known to have run. `0` once the
+    /// reader is stopped, its memory freed.
+    pub fn fill_slots_held(&self) -> usize {
+        match &self.fills.reader {
+            None => 0,
+            Some(r) => r
+                .queue()
+                .map_or(self.fills.staged.len(), |q| r.n_slots - q.free.len()),
+        }
+    }
+
+    /// Experts asked of the background reader and neither admitted nor taken back yet.
+    pub fn fills_pending(&self) -> usize {
+        self.fills.in_flight.len()
+    }
+
+    /// Whether the background fill reader is running ([`Self::request_fills`] starts it,
+    /// [`Self::end_forward`] stops it).
+    pub fn fill_reader_active(&self) -> bool {
+        self.fills.reader.is_some() && !self.fills.off
+    }
+
+    /// The reader thread ended or poisoned its queue — only a panic does either:
+    /// [`Self::fills_off`].
+    fn fill_reader_died(fills: &mut Fills) {
+        Self::fills_off(fills, "the background fill reader stopped unexpectedly");
+    }
+
+    /// Turn fills off for good, saying why once; the forwards go on reading router ids back where
+    /// a layer is not wholly resident, as they would with no fills. The reader is told to read
+    /// nothing more, and its memory is freed once no recorded copy reads it.
+    fn fills_off(fills: &mut Fills, why: impl std::fmt::Display) {
+        if !fills.off {
+            tracing::warn!("[moe pager] background filling is off for this session: {why}");
+        }
+        fills.off = true;
+        if let Some(r) = &fills.reader {
+            // What it has not started is dropped; a dead reader answers `None`, with nothing to
+            // take back.
+            drop(r.cancel_queued());
+        }
+        fills.in_flight.clear();
+        fills.layers.clear();
+        if fills.staged.is_empty() {
+            fills.reader = None;
+        }
+    }
+
+    /// Experts admitted by [`Self::stage_ready_fills`] across every pool, since the session was
+    /// created.
+    pub fn fills(&self) -> u64 {
+        self.pools.iter().map(|p| p.pager.fills()).sum()
+    }
+
+    /// Misses of every pool that were not fills: the experts tokens routed to and found absent.
+    fn demand_misses(&self) -> u64 {
+        self.pools
+            .iter()
+            .map(|p| p.pager.stats().misses)
+            .sum::<u64>()
+            - self.fills()
     }
 
     /// Freeze `buf_id`'s layer LUT window — `n_expert` slot indices starting at its `layer_base`,
@@ -1029,7 +1938,7 @@ impl MoePagerSession {
         buf_id: usize,
         n_expert: usize,
     ) -> Result<u32> {
-        let (_, pool, src) = self
+        let (_, pool, src, _) = self
             .sources
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: lut_window on an unregistered buffer"))?;
@@ -1061,7 +1970,7 @@ impl MoePagerSession {
     }
 
     fn pool_of(&self, buf_id: usize) -> Result<&Pool> {
-        let (_, pool, _) = self
+        let (_, pool, ..) = self
             .sources
             .get(&buf_id)
             .ok_or_else(|| be("moe pager: arena/lut lookup on an unregistered buffer"))?;
@@ -1104,6 +2013,18 @@ impl MoePagerSession {
         agg
     }
 
+    /// `paging.trace`: hand every pool's buffered trace events, and its host tier's, to the trace
+    /// file. Called where the stats are printed, so the trace on disk covers what the printed
+    /// counters cover. Every pool is flushed even after one fails; the first failure is returned
+    /// the first time only, since a failed trace stays failed and this runs after every generation.
+    pub fn flush_trace(&mut self) -> Result<()> {
+        let pools = self
+            .pools
+            .iter_mut()
+            .map(|p| (&mut p.pager, p.host.as_ref()));
+        flush_traces(pools, &mut self.trace_failure_reported)
+    }
+
     /// `paging.stats` (`INFR_PAGER_STATS=1`): print each pool's hit/miss/eviction counters. Called
     /// after generation finishes (see the CLI's bench/run/serve exit paths) — cheap enough to
     /// always compute, only printed when asked.
@@ -1114,10 +2035,11 @@ impl MoePagerSession {
         for p in &self.pools {
             let s = p.pager.stats();
             tracing::info!(
-                "[moe pager] {}/{:.1}MB: {} slots={}",
+                "[moe pager] {}/{:.1}MB: {} fills={} slots={}",
                 p.role.name(),
                 p.slot_bytes as f64 / 1e6,
                 stats_suffix(&s),
+                p.pager.fills(),
                 p.pager.n_slots(),
             );
             // The tier below, when there is one. Its READS are the line that matters: an arena miss
@@ -1153,7 +2075,7 @@ impl MoePagerSession {
     }
 }
 
-/// `VulkanBackend::moe_pager`'s field type — a `Mutex` since `touch_role` mutates the LRU/arena and
+/// `VulkanBackend::moe_pager`'s field type — a `Mutex` since `stage_role` mutates the LRU/arena and
 /// the adapter calls it from `execute_static` (`&VulkanBackend`, not `&mut`).
 pub type MoePagerCell = Mutex<Option<MoePagerSession>>;
 
@@ -1207,14 +2129,28 @@ pub struct DenseSource {
     pub block_id: u32,
 }
 
-/// One dense pool's fixed layout: every block in it shares `slot_bytes` (the PADDED stride —
-/// a multiple of 4 (u32 arena) AND of the pool dtype's block byte size, so a slot base is always
-/// a whole number of quant blocks). The arena is a `bufferDeviceAddress` buffer read by 64-bit
+/// A dense streaming session's counters summed over its pools
+/// ([`crate::VulkanBackend::dense_pager_totals`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DenseTotals {
+    /// The VRAM arenas' residency counters.
+    pub vram: PagerStats,
+    /// Blocks the host tiers read off the model file; 0 without a host tier.
+    pub file_reads: u64,
+    /// Weight groups registered to stream.
+    pub groups: usize,
+}
+
+/// One dense pool's fixed layout: every block in it is `dtype` and shares `slot_bytes` (the PADDED
+/// stride, [`crate::linear::dense_stream_slot_stride`]: whole quant blocks at the dtype's slot
+/// alignment, so every slot base is block- and kernel-aligned). The arena is a `bufferDeviceAddress` buffer read by 64-bit
 /// pointer (see [`DensePagerSession`]), so `n_slots` is bounded only by the VRAM budget share (and
 /// the seam's floor) — there is NO per-arena `maxStorageBufferRange` cap and NO u32 element-reach
 /// cap (a slot's base byte address is computed in 64-bit; the op's `w_off` element offset rides on
 /// top within the kernel). Contrast the resident/SSBO path, which those two caps DID bind.
 pub struct DensePoolSpec {
+    /// The weight dtype every block in the pool holds.
+    pub dtype: infr_core::DType,
     pub slot_bytes: usize,
     pub n_slots: usize,
     pub n_blocks: usize,
@@ -1229,6 +2165,15 @@ pub struct DensePoolSpec {
 struct DensePool {
     spec: DensePoolSpec,
     pager: GpuPager,
+}
+
+impl DensePool {
+    /// Slot `slot`'s base BYTE address: arena base + `slot * slot_bytes`, in 64-bit (the BDA
+    /// arena's `arena_addr()`; the streamed kernel dereferences this pointer). No cap: the multiply
+    /// and the address are 64-bit, so an arena of any size the VRAM budget allows is addressable.
+    fn slot_addr(&self, slot: u32) -> u64 {
+        self.pager.arena_addr() + slot as u64 * self.spec.slot_bytes as u64
+    }
 }
 
 /// Layout for [`DensePagerSession::new`] — like [`MoePagerLayout`], sized up front so the session
@@ -1254,9 +2199,20 @@ pub struct DensePagerSession {
     ring: Box<dyn Buffer>,
     ring_half_bytes: usize,
     print_stats: bool,
+    /// Whether a `paging.trace` write failure was already reported (see [`flush_traces`]).
+    trace_failure_reported: bool,
+    /// Epoch moves forced by [`Self::force_epoch_move`], added into [`Self::placement_epoch`].
+    forced_epoch_moves: u64,
 }
 
 impl DensePagerSession {
+    /// [`GpuPager::forget_unsubmitted`] over every pool: recording `serial` is being discarded.
+    pub fn forget_unsubmitted(&mut self, serial: u64) {
+        for p in &mut self.pools {
+            p.pager.forget_unsubmitted(serial);
+        }
+    }
+
     pub fn new(vk: &VulkanBackend, layout: DensePagerLayout) -> Result<Self> {
         // The streamed kernels read the arena by 64-bit device address (native_weight_addr.glsl), so
         // BDA is required. It is probed and hard-errored globally at init (lib.rs, `caps()
@@ -1268,16 +2224,47 @@ impl DensePagerSession {
         );
         let mut pools = Vec::with_capacity(layout.pools.len());
         let mut max_slot = 4usize;
-        for spec in layout.pools {
+        let trace = TraceFile::for_config(vk.cfg().paging.trace.as_deref())?;
+        for (i, spec) in layout.pools.into_iter().enumerate() {
             max_slot = max_slot.max(spec.slot_bytes);
-            pools.push(DensePool {
-                // Dense-streaming pool: the arena is a `bufferDeviceAddress` buffer the streamed
-                // kernels read through a 64-bit pointer, so it may span as much VRAM as the
-                // budget allows — no `maxStorageBufferRange` cap (the pre-BDA ~4 GiB-per-pool
-                // ceiling this lifts), no u32 element-reach cap.
-                pager: GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes)?,
-                spec,
-            });
+            // A slot sits at the arena base plus a multiple of `slot_bytes`, so it is aligned for
+            // the pool's kernels exactly when the stride and the base both are.
+            let align = crate::linear::dense_stream_slot_align(spec.dtype);
+            if crate::linear::dense_stream_slot_stride(spec.dtype, spec.slot_bytes)
+                != spec.slot_bytes
+            {
+                return Err(be(format!(
+                    "dense pool {i}: a {:?} slot stride of {} bytes is not whole blocks at {align}-                     byte alignment",
+                    spec.dtype, spec.slot_bytes
+                )));
+            }
+            // Dense-streaming pool: the arena is a `bufferDeviceAddress` buffer the streamed
+            // kernels read through a 64-bit pointer, so it may span as much VRAM as the budget
+            // allows — no `maxStorageBufferRange` cap (the pre-BDA ~4 GiB-per-pool ceiling this
+            // lifts), no u32 element-reach cap.
+            let mut pager = GpuPager::new(vk, spec.n_blocks, spec.n_slots, spec.slot_bytes)?;
+            if !pager.arena_addr().is_multiple_of(align as u64) {
+                return Err(be(format!(
+                    "dense pool {i}: arena address {:#x} is not {align}-byte aligned for {:?}",
+                    pager.arena_addr(),
+                    spec.dtype
+                )));
+            }
+            if let Some(t) = &trace {
+                let label = format!("dense pool{i}/{}B", spec.slot_bytes);
+                if let Some(h) = &spec.host {
+                    h.trace_to(t, format!("{label} host"), spec.n_blocks)?;
+                }
+                pager.trace_to(
+                    t,
+                    PoolInfo {
+                        tier: Tier::Vram,
+                        label,
+                        n_blocks: spec.n_blocks,
+                    },
+                )?;
+            }
+            pools.push(DensePool { pager, spec });
         }
         let ring_total = if layout.ring_bytes > 0 {
             layout.ring_bytes
@@ -1293,7 +2280,38 @@ impl DensePagerSession {
             ring,
             ring_half_bytes,
             print_stats: vk.cfg().paging.stats,
+            trace_failure_reported: false,
+            forced_epoch_moves: 0,
         })
+    }
+
+    /// The placement epoch: it moves whenever any pool places a block in a slot or takes one out
+    /// ([`GpuPager::placements`], summed over the pools), and on [`Self::force_epoch_move`]. A
+    /// recording that bakes slot addresses ([`Self::resident_addr`]) is valid exactly while this
+    /// reads what it read when the addresses were taken.
+    pub fn placement_epoch(&self) -> u64 {
+        self.pools.iter().map(|p| p.pager.placements()).sum::<u64>() + self.forced_epoch_moves
+    }
+
+    /// Move [`Self::placement_epoch`] without changing any placement — a test's way to make a
+    /// recording that baked slot addresses stale while every block stays where it was.
+    pub fn force_epoch_move(&mut self) {
+        self.forced_epoch_moves += 1;
+    }
+
+    /// The arena BYTE address `buf_id`'s block is resident at, or `None` when it is not resident.
+    /// No mutation: no recency, no counters, no trace (contrast [`Self::stage`]). An error for a
+    /// buffer that is not a registered streamed block.
+    pub fn resident_addr(&self, buf_id: usize) -> Result<Option<u64>> {
+        let (pool_idx, src) = self
+            .sources
+            .get(&buf_id)
+            .ok_or_else(|| be("dense pager: address of an unregistered buffer"))?;
+        let pool = &self.pools[*pool_idx];
+        Ok(pool
+            .pager
+            .resident_slot(src.block_id)
+            .map(|slot| pool.slot_addr(slot)))
     }
 
     /// Register one streamed block — called from the seam's weight-load closure (once per
@@ -1347,6 +2365,22 @@ impl DensePagerSession {
         self.sources.contains_key(&buf_id)
     }
 
+    /// Whether every pool has a slot for each of its blocks, so nothing is ever evicted: the
+    /// residency pager hands out a free slot before it picks a victim
+    /// (`infr_core::pager::Pager`'s `take_slot`), and a placement that is taken back (a failed
+    /// fill, a discarded recording) returns its slot to the free list. Each block is then staged
+    /// once and hit on every later pass.
+    pub fn holds_every_block(&self) -> bool {
+        self.pools
+            .iter()
+            .all(|p| p.pager.n_slots() >= p.spec.n_blocks)
+    }
+
+    /// How many weight groups are registered to stream.
+    pub fn n_streamed(&self) -> usize {
+        self.sources.len()
+    }
+
     /// Ensure `buf_id`'s block is resident, staging a miss through `rec`-recorded ring→arena
     /// copies at `half_base + *cursor`. Returns the resident slot's arena base BYTE address (the
     /// streamed dispatch sets `w_addr` to it and adds the op's own `w_off` element offset on top —
@@ -1356,6 +2390,67 @@ impl DensePagerSession {
     /// overflows it (the u32 element-reach the SSBO path needed is gone). Residency rides the exact
     /// cyclic-sweep policy (`infr_core::pager::Pager::schedule`); one block = one touch batch (the
     /// epoch guard protects it across the caller's rotations).
+    ///
+    /// # Ordering the arena
+    ///
+    /// A slot is written only by the ring→arena copies this records (`TRANSFER_WRITE`) and read
+    /// only by streamed dispatches through a 64-bit pointer (`SHADER_READ`), which the recorder's
+    /// buffer hazard tracker cannot see. So a COPY is bracketed by two
+    /// [`crate::recorder::Recorder::arena_stream_barrier`]s, and a hit records none:
+    ///
+    /// - A pipeline barrier orders every command before it in submission order against every
+    ///   command after it, across command buffers and submits on the backend's one queue. Arena
+    ///   commands reach the queue in two ways. A static forward (`adapter::execute_static`, and
+    ///   `adapter::stage_for_replay`, which records only copies) submits each segment before
+    ///   opening the next and ends with a blocking submit, so its recording order is its
+    ///   submission order. A decode replay (`adapter::current_replay`) records no copy, only
+    ///   reads, and is covered by the last item below. Other submits reach the same queue in
+    ///   between (scratch zero-fills, uploads, the positions readback fallback) but none of them
+    ///   reads or writes a dense arena; nothing outside this fn writes one. Two forwards never
+    ///   interleave their recordings, and that is the caller's to guarantee: the backend does not
+    ///   serialise executes itself, so a session does it by `&mut`, and `serve --parallel` by its
+    ///   step baton (`RequestCtx::gate_pass`), held across each whole execute (a prefill chunk, a
+    ///   decode step or a chained chunk). This session's mutex is no substitute: a static forward
+    ///   holds it only for one `stage` call, so another thread could see a block placed whose copy
+    ///   is recorded but not yet submitted. A replay holds it from its epoch check to its
+    ///   completion (last item), which keeps `stage` calls out of that window but cannot make an
+    ///   unsubmitted copy visible.
+    /// - RAW: the barrier after a copy is recorded into the same recorder before this returns, and
+    ///   segments are cut only between ops, so no cut can fall between a copy and its barrier.
+    ///   Every dispatch that reads the slot's current bytes is recorded after that barrier: the
+    ///   op this call stages for, the other Linears of a fused block that hit it later, any later
+    ///   forward, whether an early-submit cut, a ring rotation or a blocking submit separates them.
+    ///   A hit therefore needs no barrier of its own; its block's last write already has one.
+    /// - WAR: a miss may overwrite a slot that dispatches recorded earlier still read (an evicted
+    ///   block's, possibly in an earlier segment still executing). The barrier before the copy
+    ///   orders all of them before it. A hit writes nothing, so it has no WAR to order.
+    /// - WAW: a second copy into a slot is after the first copy's own trailing barrier.
+    /// - A copy in a recording that is discarded never runs; [`Self::forget_unsubmitted`] takes its
+    ///   placement back, so no later hit relies on it.
+    /// - A replayed decode recording is made only for a session that holds every block, and bakes
+    ///   the slot addresses [`Self::resident_addr`] gave it together with the
+    ///   [`Self::placement_epoch`] they were read at. RAW: each block it reads was resident when
+    ///   it was recorded, so that block's copy and its trailing barrier went into a static forward
+    ///   or the staging pass, and that forward had ended with its blocking submit before the
+    ///   recording was made (executes are serialised, above, and a copy whose recording was
+    ///   discarded or failed to submit is taken back, which moves the epoch). The barrier is
+    ///   therefore earlier in submission order than every replay, and its second scope
+    ///   (`COMPUTE_SHADER`, `SHADER_READ`) covers the replay's pointer reads, so a replay needs
+    ///   no barrier of its own for the arena: the leading global barrier a GPU-position recording
+    ///   opens with is not what orders it, and a recording made with `INFR_NO_GPU_POS`, which has
+    ///   none, is ordered the same way. WAR: holding every block, a miss copies only into a free
+    ///   slot, and a slot a recording reads is not free while its block stays placed. A block
+    ///   leaves its slot only through a placement change ([`Self::forget_unsubmitted`] or a
+    ///   rolled-back miss), which moves the epoch. The adapter reads the epoch under this
+    ///   session's lock immediately before every replay submit, re-records if it moved, and holds
+    ///   the lock until the replay has completed, so no `stage` can run between the check and the
+    ///   end of the replay, whichever sequence of `serve --parallel` it stages for. A replay whose
+    ///   submit fails part-way first waits for the segments it did submit
+    ///   (`RecordedCmd::replay`); one whose wait fails has lost the device, which runs nothing
+    ///   more.
+    ///
+    /// The barrier is a full compute/transfer one, so recording it on a hit as well would also
+    /// serialise independent dispatches the hazard tracker lets overlap, for no ordering gained.
     pub fn stage(
         &mut self,
         rec: &crate::recorder::Recorder<'_>,
@@ -1375,10 +2470,15 @@ impl DensePagerSession {
             .ok_or_else(|| be("dense pager: stage on an unregistered buffer"))?;
         let pool = &mut pools[*pool_idx];
         let id = src.block_id;
-        if !pool.pager.is_resident(id) && *cursor + pool.spec.slot_bytes > *ring_half_bytes {
+        let hit = pool.pager.is_resident(id);
+        if !hit && *cursor + pool.spec.slot_bytes > *ring_half_bytes {
             return Ok(None); // half full — caller rotates and re-calls
         }
         pool.pager.begin_batch();
+        if !hit {
+            // WAR: every arena read recorded so far before this miss's copy (see the fn doc).
+            rec.arena_stream_barrier();
+        }
         // Pass the source through by reference — `schedule_staged` derefs mmap segments via
         // `expert_bytes` and pins a host block in place, so neither tier materializes a copy here.
         let (slot, consumed) = pool.pager.schedule_staged(
@@ -1390,18 +2490,19 @@ impl DensePagerSession {
             pool.spec.host.as_deref(),
         )?;
         *cursor += consumed;
-        // Slot base BYTE address = arena base + slot * slot_bytes, in 64-bit (the BDA arena's
-        // `arena_addr()`; the streamed kernel dereferences this pointer). No cap: the multiply and
-        // the address are 64-bit, so an arena of any size the VRAM budget allows is addressable.
-        let addr = pool.pager.arena_addr() + slot as u64 * pool.spec.slot_bytes as u64;
-        Ok(Some(addr))
+        if consumed > 0 {
+            // RAW: the copy before every later dispatch that reads the slot (see the fn doc).
+            rec.arena_stream_barrier();
+        }
+        Ok(Some(pool.slot_addr(slot)))
     }
 
     pub fn ring_half_bytes(&self) -> usize {
         self.ring_half_bytes
     }
 
-    /// Per-pool `(VRAM residency, host tier)` counters, in pool order.
+    /// Per-pool `(VRAM residency, host tier)` counters, in pool order. Replayed decode steps are
+    /// not in them (see [`Self::print_stats_if_enabled`]).
     ///
     /// The host half is what separates a VRAM miss the DRAM tier absorbed from one that reached the
     /// disk — the two are indistinguishable in every other number this session reports, and a
@@ -1413,9 +2514,23 @@ impl DensePagerSession {
             .collect()
     }
 
+    /// [`MoePagerSession::flush_trace`]'s dense twin.
+    pub fn flush_trace(&mut self) -> Result<()> {
+        let pools = self
+            .pools
+            .iter_mut()
+            .map(|p| (&mut p.pager, p.spec.host.as_ref()));
+        flush_traces(pools, &mut self.trace_failure_reported)
+    }
+
     /// `paging.stats` (`INFR_PAGER_STATS=1`): per-pool hit/miss/eviction counters (cyclic-sweep
     /// hit rate = `(n_slots-1) / n_blocks` per pass at steady state — the honest expectation to
     /// check against).
+    ///
+    /// The counters count [`Self::stage`] calls, so they cover static forwards (prefill, and every
+    /// decode step of a session that cannot hold every block) and the staging pass before a decode
+    /// recording. A replayed decode step makes no `stage` call and counts nothing: on a session
+    /// that holds every block, decode adds no hits once it replays.
     pub fn print_stats_if_enabled(&self) {
         if !self.print_stats {
             return;
@@ -1454,6 +2569,214 @@ pub type DensePagerCell = Mutex<Option<DensePagerSession>>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A recording discarded after it staged a layer's last missing expert takes that placement
+    /// back (`forget_unsubmitted`), and with it the layer's "wholly resident": the decode fast path
+    /// must not record against a window naming a slot whose copy never ran. (The other ways an
+    /// expert leaves are tested on the public surface, in `tests/moe_tier_parity.rs`; this one
+    /// needs the recording's serial.)
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn a_discarded_recording_unmarks_a_resident_layer() {
+        let Ok(be) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (stride, n_expert, buf_id) = (256usize, 4usize, 1usize);
+        let mut sess = MoePagerSession::new(
+            &be,
+            MoePagerLayout {
+                n_blocks: n_expert,
+                pools: vec![MoePoolSpec {
+                    role: Role::Gate,
+                    slot_bytes: stride,
+                    n_slots: n_expert,
+                    host: None,
+                }],
+                // A half holds every expert, so no staging call has to rotate.
+                ring_bytes: 2 * n_expert * stride,
+            },
+        )
+        .unwrap();
+        let bank: Vec<u8> = (0..n_expert * stride).map(|i| i as u8).collect();
+        sess.register(
+            Role::Gate,
+            buf_id,
+            ExpertSource {
+                bytes: ExpertBytes::Mmap(Arc::new(bank)),
+                stride_bytes: stride,
+                layer_base: 0,
+            },
+            n_expert,
+        )
+        .unwrap();
+        let stage = |sess: &mut MoePagerSession, rec: &crate::recorder::Recorder<'_>, ids| {
+            sess.begin_batch(buf_id).unwrap();
+            let mut cursor = 0;
+            assert_eq!(
+                sess.stage_role(rec, 0, &mut cursor, buf_id, ids, false)
+                    .unwrap(),
+                ids.len()
+            );
+        };
+        let rec = be.recorder().unwrap();
+        stage(&mut sess, &rec, &[0, 1, 2]);
+        rec.finish().unwrap();
+        assert!(!sess.all_resident(buf_id, n_expert));
+        let rec = be.recorder().unwrap();
+        stage(&mut sess, &rec, &[3]);
+        assert!(sess.all_resident(buf_id, n_expert));
+        sess.forget_unsubmitted(rec.serial());
+        rec.discard().unwrap();
+        assert!(
+            !sess.all_resident(buf_id, n_expert),
+            "a discarded recording's placement left the layer resident"
+        );
+        assert!(sess.touch_all_hits(buf_id, n_expert).is_err());
+        // The submitted placements survive.
+        let rec = be.recorder().unwrap();
+        stage(&mut sess, &rec, &[3]);
+        rec.finish().unwrap();
+        assert!(sess.all_resident(buf_id, n_expert));
+        assert_eq!(sess.stats(Role::Gate).misses, 5, "0, 1, 2, then 3 twice");
+    }
+
+    /// Every placement change moves the dense placement epoch, and a hit does not: a miss into a
+    /// free slot, a miss that evicts, a miss whose bytes fail (rolled back, its victim staying
+    /// evicted) and a placement taken back from a discarded recording. A decode replay bakes slot
+    /// addresses and trusts them exactly while the epoch stands still, so each of these is a case
+    /// where a stale recording would read the wrong bytes.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn every_placement_change_moves_the_dense_epoch() {
+        use infr_core::blockio::{BlockDesc, BlockExtent, BlockIo};
+        let Ok(be) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        /// The tier below: every block's bytes are produced except the one it names.
+        struct FailOn(BlockId);
+        impl BlockIo for FailOn {
+            fn read_block(&self, desc: &BlockDesc, dst: &mut [u8]) -> Result<()> {
+                if desc.id == self.0 {
+                    return Err(infr_core::error::Error::backend(format!(
+                        "injected read failure on block {}",
+                        desc.id
+                    )));
+                }
+                dst[..desc.nbytes()].fill(desc.id as u8 + 1);
+                Ok(())
+            }
+        }
+        let stride = crate::linear::dense_stream_slot_stride(infr_core::DType::F32, 4096);
+        // Pool 0 holds its three blocks; pool 1 has two slots for four, read through a host tier
+        // that fails block 3.
+        let host = Arc::new(HostPager::new(4, stride, Arc::new(FailOn(3))).unwrap());
+        for id in 0..4 {
+            host.register(BlockDesc {
+                id,
+                extents: vec![BlockExtent {
+                    offset: id as u64 * stride as u64,
+                    len: stride,
+                }],
+            })
+            .unwrap();
+        }
+        let spec = |n_slots, n_blocks, host| DensePoolSpec {
+            dtype: infr_core::DType::F32,
+            slot_bytes: stride,
+            n_slots,
+            n_blocks,
+            host,
+        };
+        let mut sess = DensePagerSession::new(
+            &be,
+            DensePagerLayout {
+                pools: vec![spec(3, 3, None), spec(2, 4, Some(host))],
+                ring_bytes: 4 * stride,
+            },
+        )
+        .unwrap();
+        // Buffer identities are opaque keys to the session; small integers will do.
+        let held = |b: usize| 100 + b;
+        let evicting = |b: usize| 200 + b;
+        for b in 0..3u32 {
+            let bytes = DenseBytes::Mmap(vec![
+                Arc::new(vec![b as u8; stride]) as Arc<dyn AsRef<[u8]> + Send + Sync>
+            ]);
+            let source = DenseSource { bytes, block_id: b };
+            sess.register(0, held(b as usize), source).unwrap();
+        }
+        for b in 0..4u32 {
+            let source = DenseSource {
+                bytes: DenseBytes::Host,
+                block_id: b,
+            };
+            sess.register(1, evicting(b as usize), source).unwrap();
+        }
+        // Stage `buf_id` in a recording of its own and submit it.
+        let stage = |sess: &mut DensePagerSession, buf_id: usize| {
+            let rec = be.recorder().unwrap();
+            let mut cursor = 0;
+            let staged = sess.stage(&rec, 0, &mut cursor, buf_id);
+            rec.finish().unwrap();
+            staged.map(|addr| addr.expect("a ring half holds one slot"))
+        };
+
+        let e = sess.placement_epoch();
+        stage(&mut sess, held(0)).unwrap();
+        let after_miss = sess.placement_epoch();
+        assert_ne!(
+            after_miss, e,
+            "a miss into a free slot did not move the epoch"
+        );
+        stage(&mut sess, held(0)).unwrap();
+        assert_eq!(sess.placement_epoch(), after_miss, "a hit moved the epoch");
+
+        // A placement whose recording is discarded is taken back.
+        let rec = be.recorder().unwrap();
+        let mut cursor = 0;
+        sess.stage(&rec, 0, &mut cursor, held(1)).unwrap();
+        let before_forget = sess.placement_epoch();
+        sess.forget_unsubmitted(rec.serial());
+        rec.discard().unwrap();
+        assert_ne!(
+            sess.placement_epoch(),
+            before_forget,
+            "taking back an unsubmitted placement did not move the epoch"
+        );
+
+        // Pool 1 fills its two slots, then block 2 evicts one of them.
+        stage(&mut sess, evicting(0)).unwrap();
+        stage(&mut sess, evicting(1)).unwrap();
+        let before_evict = sess.placement_epoch();
+        stage(&mut sess, evicting(2)).unwrap();
+        assert_eq!(sess.pool_stats()[1].0.evictions, 1, "block 2 did not evict");
+        assert_ne!(
+            sess.placement_epoch(),
+            before_evict,
+            "an evicting miss did not move the epoch"
+        );
+        // Block 3's bytes fail: its miss evicts a block and is rolled back, so the victim is gone
+        // and nothing took its slot.
+        let resident = |sess: &DensePagerSession| {
+            (0..3)
+                .filter(|&b| sess.resident_addr(evicting(b)).unwrap().is_some())
+                .count()
+        };
+        assert_eq!(resident(&sess), 2);
+        let before_rollback = sess.placement_epoch();
+        assert!(stage(&mut sess, evicting(3)).is_err());
+        assert_eq!(
+            resident(&sess),
+            1,
+            "the failed miss did not evict its victim"
+        );
+        assert_eq!(sess.resident_addr(evicting(3)).unwrap(), None);
+        assert_ne!(
+            sess.placement_epoch(),
+            before_rollback,
+            "a rolled-back miss that evicted a block did not move the epoch"
+        );
+    }
 
     // ── #4: GpuPager::new dimension validation returns Err (not panic) on bad input ──────────────
     #[test]
@@ -1518,5 +2841,208 @@ mod tests {
         let mut lut = vec![NOT_RESIDENT; 2];
         apply_placement(&mut lut, 99, 3, Some(88));
         assert_eq!(lut, vec![NOT_RESIDENT; 2]);
+    }
+
+    /// An expert larger than the whole fill-ahead budget still gets a staging slot — one — so it
+    /// is filled like any other rather than never requested.
+    #[test]
+    fn an_expert_larger_than_the_fill_budget_gets_one_slot() {
+        assert_eq!(fill_slot_count(FILL_AHEAD_BYTES + 4), 1);
+        assert_eq!(fill_slot_count(FILL_AHEAD_BYTES), 1);
+        assert_eq!(fill_slot_count(FILL_AHEAD_BYTES / 4), 4);
+    }
+
+    /// Fill-reader memory with no device behind it: `n_slots` slots of `slot_bytes`, zeroed.
+    fn host_fill_memory(slot_bytes: usize, n_slots: usize) -> FillMemory {
+        FillMemory::Host(
+            (0..slot_bytes * n_slots)
+                .map(|_| std::cell::UnsafeCell::new(0))
+                .collect(),
+        )
+    }
+
+    /// Poll `reader` until `done` accepts what it has ready, or fail after a generous timeout.
+    /// `None` from the reader (it has died) is passed to `done` too.
+    fn poll_reader(reader: &FillReader, mut done: impl FnMut(Option<Vec<FillReady>>) -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !done(reader.take_ready()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fill reader never got there"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    fn bank_job(bank: Arc<dyn AsRef<[u8]> + Send + Sync>, id: BlockId, offset: usize) -> FillJob {
+        FillJob {
+            pool: 0,
+            layer: 0,
+            id,
+            len: 16,
+            from: FillFrom::Bank { bank, offset },
+        }
+    }
+
+    /// The reader puts each expert's own bytes into the staging slot it reports, and a slot is
+    /// handed out again only after it is released: with one slot and two jobs, the second waits.
+    #[test]
+    fn the_fill_reader_reads_each_expert_into_its_slot() {
+        let bank: Arc<dyn AsRef<[u8]> + Send + Sync> = Arc::new((0..64u8).collect::<Vec<u8>>());
+        let reader = FillReader::spawn(host_fill_memory(16, 1), 16, 1).unwrap();
+        let (base, _) = reader.memory.extent().unwrap();
+        let slot_bytes = |slot: usize| {
+            // SAFETY: the reader has handed this slot over (it is in `ready`) and holds no other
+            // job, so nothing writes it while it is read.
+            unsafe { std::slice::from_raw_parts(base.add(slot * 16), 16) }.to_vec()
+        };
+        assert!(reader.post(vec![bank_job(bank.clone(), 1, 16), bank_job(bank, 3, 48)]));
+        let mut ready = Vec::new();
+        poll_reader(&reader, |r| {
+            ready.extend(r.expect("reader alive"));
+            !ready.is_empty()
+        });
+        // The only slot is held until released, so the reader must go to sleep with the second
+        // job still queued — and never get there if it took the held slot for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let q = reader.queue().expect("reader alive");
+            if q.starved {
+                assert_eq!(q.jobs.len(), 1, "the second job was taken");
+                assert!(q.ready.is_empty() && q.free.is_empty());
+                break;
+            }
+            drop(q);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader never waited for the held slot: a second read went into it"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(ready.len(), 1);
+        let first = ready.pop().unwrap();
+        assert_eq!((first.id, first.slot), (1, 0));
+        first.read.unwrap();
+        assert_eq!(slot_bytes(0), (16..32u8).collect::<Vec<_>>());
+        assert!(reader.release([first.slot]));
+        let mut second = None;
+        poll_reader(&reader, |r| {
+            second = r.expect("reader alive").pop();
+            second.is_some()
+        });
+        assert_eq!(second.unwrap().id, 3);
+        assert_eq!(slot_bytes(0), (48..64u8).collect::<Vec<_>>());
+    }
+
+    /// A reader thread that panics is noticed: its calls answer `None`/`false` instead of an empty
+    /// queue forever, which is what lets the session turn fills off rather than wait on it.
+    #[test]
+    fn a_dead_fill_reader_is_noticed() {
+        struct Panics;
+        impl AsRef<[u8]> for Panics {
+            fn as_ref(&self) -> &[u8] {
+                panic!("injected fill read panic")
+            }
+        }
+        let reader = FillReader::spawn(host_fill_memory(16, 2), 16, 2).unwrap();
+        assert!(reader.post(vec![bank_job(Arc::new(Panics), 0, 0)]));
+        poll_reader(&reader, |r| r.is_none());
+        assert!(!reader.post(vec![bank_job(Arc::new(Panics), 1, 0)]));
+        assert!(!reader.release([0]));
+        assert!(reader.cancel_queued().is_none());
+    }
+
+    /// Releasing a staging slot the session does not hold — here one that is already free — is a
+    /// broken ownership protocol, which debug builds catch.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "released while not held")]
+    fn releasing_a_free_fill_slot_panics_in_debug() {
+        let reader = FillReader::spawn(host_fill_memory(16, 2), 16, 2).unwrap();
+        reader.release([1]);
+    }
+
+    /// A recording discarded after background fills were admitted into it takes them back
+    /// (`forget_unsubmitted`) and frees their staging slots, which the reader needs for anything
+    /// more; the layer then fills again and becomes wholly resident.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn a_discarded_recording_frees_its_fill_slots() {
+        let Ok(be) = VulkanBackend::new() else {
+            return; // no GPU — self-skip
+        };
+        let (stride, n_expert, buf_id) = (256usize, 4usize, 1usize);
+        let mut sess = MoePagerSession::new(
+            &be,
+            MoePagerLayout {
+                n_blocks: n_expert,
+                pools: vec![MoePoolSpec {
+                    role: Role::Gate,
+                    slot_bytes: stride,
+                    n_slots: n_expert,
+                    host: None,
+                }],
+                ring_bytes: 2 * n_expert * stride,
+            },
+        )
+        .unwrap();
+        let bank: Vec<u8> = (0..n_expert * stride).map(|i| i as u8).collect();
+        sess.register(
+            Role::Gate,
+            buf_id,
+            ExpertSource {
+                bytes: ExpertBytes::Mmap(Arc::new(bank)),
+                stride_bytes: stride,
+                layer_base: 0,
+            },
+            n_expert,
+        )
+        .unwrap();
+        sess.begin_batch(buf_id).unwrap();
+        let rec = be.recorder().unwrap();
+        let mut cursor = 0;
+        sess.stage_role(&rec, 0, &mut cursor, buf_id, &[0], false)
+            .unwrap();
+        rec.finish().unwrap();
+        // The first request only notes the demand count; the second asks for the rest.
+        sess.request_fills(&be, &[buf_id]).unwrap();
+        sess.request_fills(&be, &[buf_id]).unwrap();
+        let absent = n_expert - 1;
+        assert_eq!(sess.fills_pending(), absent);
+        let rec = be.recorder().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut admitted = 0;
+        while admitted < absent {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reader never got there"
+            );
+            admitted += sess.stage_ready_fills(&rec).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(sess.all_resident(buf_id, n_expert));
+        assert_eq!(sess.fill_slots_held(), absent);
+        sess.forget_unsubmitted(rec.serial());
+        rec.discard().unwrap();
+        assert!(!sess.all_resident(buf_id, n_expert));
+        assert_eq!(
+            sess.fill_slots_held(),
+            0,
+            "a discarded recording's fills kept their staging slots"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !sess.all_resident(buf_id, n_expert) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the layer never filled again"
+            );
+            let rec = be.recorder().unwrap();
+            sess.stage_ready_fills(&rec).unwrap();
+            rec.finish().unwrap();
+            sess.fills_copied(u64::MAX);
+            sess.request_fills(&be, &[buf_id]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(sess.fill_slots_held(), 0);
     }
 }

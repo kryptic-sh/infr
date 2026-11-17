@@ -92,6 +92,17 @@ pub fn parse_str(text: &str, label: &Path) -> Result<(PartialConfig, Vec<String>
     let mut partial = PartialConfig::default();
     let mut warnings = Vec::new();
     walk(&doc, "", &known, &mut partial, &mut warnings)?;
+    // A relative tuning-file path inside a config file names a file beside THAT file, the usual
+    // convention for a path in a config file; `INFR_TUNE_FILE` and `--set` stay relative to the
+    // working directory.
+    if let Some(Some(tf)) = &mut partial.kernels.vulkan.tuning.file {
+        if tf.is_relative() {
+            if let Some(dir) = label.parent().filter(|d| !d.as_os_str().is_empty()) {
+                *tf = dir.join(&*tf);
+            }
+        }
+    }
+    super::tune::stamp_layer(&mut partial, super::TuneLevel::Config);
     Ok((partial, warnings))
 }
 
@@ -106,10 +117,16 @@ fn walk(
     for (key, value) in table {
         let path = format!("{prefix}{key}");
         if let toml::Value::Table(sub) = value {
-            // A table is only a SECTION if some known path lives under it; otherwise the whole
-            // subtree is unknown and warning once beats warning per leaf.
+            // A table is only a SECTION if some known path lives under it, or if it IS a known
+            // leaf (an open map such as `kernels.vulkan.tune`, whose keys the schema does not fix
+            // and whose leaf type checks them); otherwise the whole subtree is unknown and
+            // warning once beats warning per leaf.
             let section_prefix = format!("{path}.");
-            if known.iter().any(|k| k.starts_with(&section_prefix)) {
+            if known
+                .iter()
+                .any(|k| k.starts_with(&section_prefix) || *k == path)
+                || is_below_open_map(&path, known)
+            {
                 walk(sub, &section_prefix, known, out, warnings)?;
             } else {
                 warnings.push(unknown_line(&path));
@@ -132,6 +149,15 @@ fn walk(
         }
     }
     Ok(())
+}
+
+/// Whether `path` lies strictly below a known leaf — a nested table inside an open map
+/// (`[kernels.vulkan.tune.gemv_sg]`).
+fn is_below_open_map(path: &str, known: &[String]) -> bool {
+    known.iter().any(|k| {
+        path.strip_prefix(k.as_str())
+            .is_some_and(|r| r.starts_with('.'))
+    })
 }
 
 /// The one line an unknown key prints. Shaped so a typo is obvious at a glance.

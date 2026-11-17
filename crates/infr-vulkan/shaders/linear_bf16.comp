@@ -21,7 +21,11 @@ layout(binding = 2) buffer YB { float y[]; };          // [rows, out]
 shared float red[64];
 
 void main() {
-    uint unit = gl_WorkGroupID.x;
+    // Flat workgroup index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_WorkGroupID.x` when unsplit. A padding
+    // workgroup returns whole, before any barrier or subgroup op, so control flow stays uniform.
+    uint unit = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (unit >= pc.rows * pc.out_f) { return; }
     uint o = unit % pc.out_f;
     uint r = unit / pc.out_f;
     uint t = gl_LocalInvocationID.x;

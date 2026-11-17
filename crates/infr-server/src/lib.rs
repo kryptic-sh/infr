@@ -9,7 +9,6 @@
 //!   GET  /metrics               -> Prometheus text exposition (see `metrics`)          (auth)
 //!   GET  /status                -> JSON: per-model backend, device, ctx, slots, memory (auth)
 //!   POST /v1/chat/completions   -> chat.completion | SSE chat.completion.chunk stream   (auth)
-//!   POST /v1/completions        -> text_completion | SSE text_completion stream (raw prompt, no template) (auth)
 //!
 //! Two process-level limits bound one request's hold on a `--parallel` slot: `serve.max_tokens_cap`
 //! (tokens — see `clamp_max_tokens`) and `serve.request_timeout_secs` (wall clock — see
@@ -31,14 +30,15 @@ use std::{
 };
 
 use axum::{
-    extract::State,
+    extract::{rejection::JsonRejection, Request, State},
     http::{HeaderMap, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
     },
     routing::{get, post},
-    Extension, Json, Router,
+    Json, Router,
 };
 use infr_core::config::Config;
 use infr_engine::{ChatMessage, Delta, ToolCall};
@@ -46,10 +46,6 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
-mod completions;
-mod idle;
-#[cfg(test)]
-mod idle_tests;
 mod metrics;
 mod status;
 
@@ -94,28 +90,23 @@ impl Finish {
 /// today) keeps an internal `Mutex` and is served with `--parallel 1`, which is honest rather than
 /// silently serialising a server the user asked to parallelise.
 pub trait ChatGenerator: Send + Sync {
-    /// Validate backend support, request budgets, and image payloads before HTTP response headers.
-    /// Called on a blocking thread; must not run the vision transformer or acquire a GPU slot.
-    fn validate_images(&self, images: &[Arc<[u8]>]) -> anyhow::Result<()> {
-        if !images.is_empty() {
-            anyhow::bail!("image input is not supported by this model/backend");
-        }
-        Ok(())
-    }
-
     /// Run one chat turn.
     ///
     /// * `tools` is the request's `tools` array as a borrowed [`serde_json::Value`] — passed by
     ///   reference so the generator parses the ONE it was already given instead of a
     ///   `Value`→string→`Value` round-trip (see audit finding 6).
-    /// * `cancel` is a PER-REQUEST abort latch. The server sets it when the client disconnects (an
-    ///   SSE `send` starts failing) or the request deadline fires; the generator must poll it in its
+    /// * `cancel` is a PER-REQUEST abort latch. The server sets it when the client hangs up
+    ///   (streaming or not) or the request deadline fires; the generator must poll it in its
     ///   prefill AND decode loops and stop promptly so the GPU slot is freed rather than held to
     ///   `max_tokens`. An `Arc` so the generator can keep it for the whole call — a deadline that
     ///   fires during prefill comes before any piece, so a copy made from a streaming callback is
     ///   too late. It is ORed with the process-wide shutdown latch, never a replacement for it.
     /// * Returns a [`ChatOutcome`] carrying the finish reason AND the real prompt/completion token
     ///   counts so the handler can populate `usage` truthfully.
+    /// * A request whose prompt does not fit the context should fail with a
+    ///   [`ContextLengthExceeded`] error. The server answers it as a `400` on a non-streaming
+    ///   request and as a terminal SSE error frame carrying the same typed error on a streaming one
+    ///   (the `200` is already sent by then), so the client can act on it rather than retry it.
     fn chat(
         &self,
         messages: &[ChatMessage],
@@ -126,24 +117,19 @@ pub trait ChatGenerator: Send + Sync {
         on_delta: &mut dyn FnMut(Delta),
     ) -> anyhow::Result<ChatOutcome>;
 
-    /// Continue `prompt` as raw text — no chat template, no reasoning/tool splitting — streaming the
-    /// decoded pieces to `on_text`. Backs `/v1/completions`; `cancel` and the return value behave as
-    /// in [`chat`](Self::chat).
-    fn complete(
-        &self,
-        _prompt: &str,
-        _params: &GenParams,
-        _cancel: &Arc<AtomicBool>,
-        _on_text: &mut dyn FnMut(&str),
-    ) -> anyhow::Result<ChatOutcome> {
-        anyhow::bail!("this backend does not support text completions")
-    }
-
     /// Where this generator runs and how much room it has, read fresh on each call, for
     /// `GET /status` and the device gauges in `/metrics`. Report `None` for what the backend
     /// cannot see rather than a placeholder. It must not wait on a generation: both routes call it
     /// while requests are running.
     fn status(&self) -> GeneratorStatus;
+
+    /// How many token ids this generator's model has — the length of the logits row a
+    /// `logit_bias` is applied to — so a request's `logit_bias` may name only ids below it. The
+    /// server asks only for a request that carries a bias, and before the request reaches
+    /// [`chat`](Self::chat), so a bad id is a `400` on a streaming request too, where the `200`
+    /// goes out before generation starts. It is read on the request path, so return a value
+    /// computed once rather than counting the vocabulary each time.
+    fn vocab_size(&self) -> usize;
 }
 
 /// What one [`ChatGenerator::chat`] call produced: why it ended, plus the real token counts the
@@ -152,9 +138,32 @@ pub trait ChatGenerator: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatOutcome {
     pub finish: Finish,
+    /// The WHOLE prompt, including any part served from a KV prefix cache — OpenAI's
+    /// `usage.prompt_tokens`, which clients budget context and cost from.
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// How many of `prompt_tokens` were reused from a KV prefix cache rather than prefilled
+    /// (`usage.prompt_tokens_details.cached_tokens`). `0` for a generator with no prefix cache.
+    pub cached_tokens: u32,
 }
+
+/// The request's prompt does not fit the model's context. A [`ChatGenerator`] returns it (as the
+/// `anyhow` error) so the server can answer `400` with OpenAI's `context_length_exceeded` code:
+/// OpenAI clients retry a `5xx` unchanged, but treat this code as final and shorten the
+/// conversation instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextLengthExceeded {
+    /// What the client is told: which counts did not fit.
+    pub message: String,
+}
+
+impl std::fmt::Display for ContextLengthExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ContextLengthExceeded {}
 
 // ---------------------------------------------------------------------------
 // Request DTOs
@@ -162,8 +171,10 @@ pub struct ChatOutcome {
 
 /// Top-level chat completion request (OpenAI wire format).
 ///
-/// Unknown fields are IGNORED (no `deny_unknown_fields`) — an OpenAI client sending `n`, `user`,
-/// `logit_bias`, … must not 400. Known-but-invalid VALUES do 400, via [`GenParams::from_request`].
+/// Unknown fields are IGNORED (no `deny_unknown_fields`) — an OpenAI client sending `user`,
+/// `response_format`, … must not 400. Known-but-invalid VALUES do 400, via
+/// [`GenParams::from_request`], and so do the known fields asking for a feature the server does
+/// not have (`n > 1`, `logprobs`), rather than being answered as if they had been honoured.
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub model: String,
@@ -176,10 +187,13 @@ pub struct ChatRequest {
     /// {"name":..}}`. Normalised to a string (the function name for a named choice) by `tool_choice_str`.
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
-    #[serde(default)]
+    /// `-1` means "not set": the server's default reply budget (`sampling.max_new`), NOT
+    /// llama.cpp's `n_predict: -1` "until the context is full" — an unbounded reply is what the
+    /// default budget exists to prevent.
+    #[serde(default, deserialize_with = "minus_one_is_unset")]
     pub max_tokens: Option<u32>,
     /// OpenAI's rename of `max_tokens`. Preferred when both are present.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "minus_one_is_unset")]
     pub max_completion_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
@@ -188,7 +202,7 @@ pub struct ChatRequest {
     /// Not in the OpenAI schema; llama.cpp/vLLM/Ollama all accept it and so do we.
     #[serde(default)]
     pub top_k: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "minus_one_is_unset")]
     pub seed: Option<u64>,
     /// `"\n"` or `["\n", "END"]` (OpenAI: up to 4).
     #[serde(default)]
@@ -200,18 +214,116 @@ pub struct ChatRequest {
     /// llama.cpp extension (1.0 = off).
     #[serde(default)]
     pub repeat_penalty: Option<f32>,
-    /// OpenAI `{"<token id>": bias}`, or llama.cpp `[[id, bias], ...]`; `false` as a bias bans the id.
+    /// llama.cpp/vLLM extension (0 = off): drop tokens less likely than `min_p` times the top one.
     #[serde(default)]
-    pub logit_bias: Option<serde_json::Value>,
-    /// OpenAI: `"none"` turns thinking off; `"minimal"`/`"low"`/`"medium"`/`"high"` turn it on.
+    pub min_p: Option<f32>,
+    /// OpenAI `logit_bias`: `{"<token id>": bias}`. Kept as the client sent it so a malformed
+    /// map is a `400` naming the parameter, not a body-parse failure.
     #[serde(default)]
-    pub reasoning_effort: Option<String>,
-    /// vLLM/llama.cpp: `{"enable_thinking": bool}`; other keys are ignored.
+    pub logit_bias: Option<LogitBiasArg>,
+    /// OpenAI `n`: how many choices to return. Only one is supported. A raw value for the same
+    /// reason as `logit_bias`; see [`GenParams::from_request`].
     #[serde(default)]
-    pub chat_template_kwargs: Option<serde_json::Value>,
-    /// Ollama: `true`/`false`, or an effort level string (thinking on).
+    pub n: Option<serde_json::Value>,
+    /// OpenAI `logprobs`. Not supported: `true` is a `400`.
     #[serde(default)]
-    pub think: Option<serde_json::Value>,
+    pub logprobs: Option<bool>,
+    /// OpenAI `top_logprobs`. Not supported: anything above zero is a `400`. A raw value, as `n`.
+    #[serde(default)]
+    pub top_logprobs: Option<serde_json::Value>,
+    /// OpenAI `stream_options`; only `include_usage` is read.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// A request's `logit_bias` as the client sent it: the object's entries in order with a repeated
+/// key kept (a JSON object map would silently merge it), or the JSON type sent instead of an
+/// object. `null` deserializes as an absent field.
+#[derive(Debug)]
+pub enum LogitBiasArg {
+    Entries(Vec<(String, serde_json::Value)>),
+    /// Not an object; the JSON type it was, for the `400`.
+    NotAnObject(&'static str),
+}
+
+impl<'de> Deserialize<'de> for LogitBiasArg {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = LogitBiasArg;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a JSON value")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut m: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = m.next_entry::<String, serde_json::Value>()? {
+                    entries.push(entry);
+                }
+                Ok(LogitBiasArg::Entries(entries))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut s: A,
+            ) -> Result<Self::Value, A::Error> {
+                while s.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(LogitBiasArg::NotAnObject("array"))
+            }
+
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(LogitBiasArg::NotAnObject("boolean"))
+            }
+
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(LogitBiasArg::NotAnObject("number"))
+            }
+
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(LogitBiasArg::NotAnObject("number"))
+            }
+
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(LogitBiasArg::NotAnObject("number"))
+            }
+
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(LogitBiasArg::NotAnObject("string"))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+/// OpenAI `stream_options`. With `include_usage`, a streamed reply ends with one extra chunk that
+/// carries `usage` and an empty `choices` array, just before `[DONE]`.
+#[derive(Debug, Default, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
+/// An optional integer field where `-1` means "not set". llama.cpp-style clients send `-1` for
+/// `seed` (random) and `max_tokens` (no explicit budget); refusing it as a negative number would
+/// turn those requests into a `400`. Any other negative value is still an error.
+fn minus_one_is_unset<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: TryFrom<u64>,
+{
+    use serde::de::Error;
+    match Option::<i128>::deserialize(d)? {
+        None | Some(-1) => Ok(None),
+        Some(v) => u64::try_from(v)
+            .ok()
+            .and_then(|v| T::try_from(v).ok())
+            .map(Some)
+            .ok_or_else(|| D::Error::custom(format!("{v} is out of range (use -1 for unset)"))),
+    }
 }
 
 /// The validated, per-request generation config handed to [`ChatGenerator::chat`]. `None` fields
@@ -227,30 +339,68 @@ pub struct GenParams {
     pub presence_penalty: Option<f32>,
     pub frequency_penalty: Option<f32>,
     pub repeat_penalty: Option<f32>,
-    /// `(token id, bias)` pairs, in request order; a banned id carries `-inf`.
+    pub min_p: Option<f32>,
+    /// `(token id, bias)` pairs in ascending id order. Ids are checked against the model's
+    /// vocabulary by [`check_vocab`](Self::check_vocab), which needs the routed generator.
     pub logit_bias: Vec<(u32, f32)>,
     /// Already normalised: empty strings dropped (an empty stop would fire on the first token).
     pub stop: Vec<String>,
-    /// The request's thinking switch; `None` keeps the server default (`--no-think`/`--think`).
-    pub think: Option<bool>,
-    /// The request's images (decoded `image_url` data URIs), in the order their
-    /// [`infr_engine::IMAGE_MARKER`]s appear in the flattened messages. Filled by the handler, not
-    /// by [`GenParams::from_request`] (the messages are flattened separately).
-    pub images: Vec<Arc<[u8]>>,
 }
 
 /// An OpenAI-shaped 400: `{"error":{"message":..,"type":"invalid_request_error","param":..}}`.
+///
+/// Also an error a [`ChatGenerator`] may return from [`chat`](ChatGenerator::chat) for a request
+/// it cannot honour: the server answers it as this `400` (a terminal error frame when streaming),
+/// not a `500`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParamError {
     pub param: &'static str,
     pub message: String,
 }
 
+impl std::fmt::Display for ParamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ParamError {}
+
 impl GenParams {
     /// Validate + normalise the request's sampling fields. Out-of-range values are a 400, NEVER a
     /// silent clamp and never a panic (OpenAI's own ranges: temperature 0..2, top_p 0..1,
-    /// presence/frequency -2..2, at most 4 stop sequences).
+    /// presence/frequency -2..2, logit_bias -100..100, at most 4 stop sequences; min_p 0..1).
+    /// `n > 1`, `logprobs: true` and `top_logprobs > 0` are a 400 too: the server returns one
+    /// choice and no log probabilities, and a reply shaped as if it had would be wrong.
     pub fn from_request(req: &ChatRequest) -> Result<Self, ParamError> {
+        let unsupported = |param: &'static str, what: &str| ParamError {
+            param,
+            message: format!("{param}: {what} is not supported by this server"),
+        };
+        match whole_number("n", req.n.as_ref())? {
+            None | Some(1) => {}
+            Some(n) if n < 1 => {
+                return Err(ParamError {
+                    param: "n",
+                    message: format!("n must be >= 1, got {n}"),
+                })
+            }
+            Some(n) => return Err(unsupported("n", &format!("returning {n} choices"))),
+        }
+        if req.logprobs == Some(true) {
+            return Err(unsupported("logprobs", "returning log probabilities"));
+        }
+        match whole_number("top_logprobs", req.top_logprobs.as_ref())? {
+            None | Some(0) => {}
+            Some(k) if k < 0 => {
+                return Err(ParamError {
+                    param: "top_logprobs",
+                    message: format!("top_logprobs must be >= 0, got {k}"),
+                })
+            }
+            Some(_) => return Err(unsupported("top_logprobs", "returning log probabilities")),
+        }
+
         let rng = |param: &'static str,
                    v: Option<f32>,
                    lo: f32,
@@ -320,7 +470,6 @@ impl GenParams {
             }
         }
 
-        let think = request_think(req)?;
         let logit_bias = parse_logit_bias(req.logit_bias.as_ref())?;
 
         Ok(Self {
@@ -333,118 +482,108 @@ impl GenParams {
             presence_penalty: rng("presence_penalty", req.presence_penalty, -2.0, 2.0)?,
             frequency_penalty: rng("frequency_penalty", req.frequency_penalty, -2.0, 2.0)?,
             repeat_penalty: req.repeat_penalty,
+            min_p: rng("min_p", req.min_p, 0.0, 1.0)?,
             logit_bias,
             stop,
-            think,
-            images: Vec::new(),
         })
+    }
+
+    /// The `logit_bias` ids against the routed model's vocabulary: an id at or past `vocab` names
+    /// no token, so the request is a 400 rather than a bias that silently does nothing.
+    pub fn check_vocab(&self, vocab: usize) -> Result<(), ParamError> {
+        match self.logit_bias.iter().find(|&&(t, _)| t as usize >= vocab) {
+            Some(&(t, _)) => Err(ParamError {
+                param: "logit_bias",
+                message: format!(
+                    "logit_bias names token {t}, but the model's vocabulary has {vocab} tokens"
+                ),
+            }),
+            None => Ok(()),
+        }
     }
 }
 
-/// Validate `logit_bias`: ids are non-negative integers, biases lie in OpenAI's -100..=100.
-fn parse_logit_bias(v: Option<&serde_json::Value>) -> Result<Vec<(u32, f32)>, ParamError> {
-    use serde_json::Value;
+/// An integer count field (`n`, `top_logprobs`): absent or `null` is `None`, and a whole number
+/// is that integer — `1.0` reads as `1`, as OpenAI's own validation reads it. Anything else is a
+/// 400 naming `param`, where typing the field as an integer made it a body-parse failure that
+/// named nothing.
+fn whole_number(
+    param: &'static str,
+    v: Option<&serde_json::Value>,
+) -> Result<Option<i64>, ParamError> {
+    let Some(v) = v.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    if let Some(i) = v.as_i64() {
+        return Ok(Some(i));
+    }
+    if let Some(u) = v.as_u64() {
+        // Past `i64`: still a count, and every caller rejects one this large.
+        return Ok(Some(i64::try_from(u).unwrap_or(i64::MAX)));
+    }
+    match v.as_f64() {
+        Some(f) if f.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&f) => {
+            Ok(Some(f as i64))
+        }
+        _ => Err(ParamError {
+            param,
+            message: format!("{param} must be an integer, got {v}"),
+        }),
+    }
+}
+
+/// OpenAI's bound on a `logit_bias` value, either sign.
+const LOGIT_BIAS_LIMIT: f64 = 100.0;
+
+/// OpenAI `logit_bias` (`{"<token id>": bias}`) as `(id, bias)` pairs sorted by id. Absent or
+/// `null` is no bias.
+///
+/// A key must be the id in canonical decimal (`"5"`, never `"+5"` or `"05"`), and an id may
+/// appear once: otherwise several spellings of one token would stack their biases past the
+/// validated range.
+fn parse_logit_bias(v: Option<&LogitBiasArg>) -> Result<Vec<(u32, f32)>, ParamError> {
     let err = |message: String| ParamError {
         param: "logit_bias",
         message,
     };
-    let id_of = |v: &Value| -> Result<u32, ParamError> {
-        let id = match v {
-            Value::String(s) => s.trim().parse::<u32>().ok(),
-            Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
-            _ => None,
-        };
-        id.ok_or_else(|| err(format!("logit_bias key {v} is not a token id")))
-    };
-    let bias_of = |id: u32, v: &Value| -> Result<f32, ParamError> {
-        match v {
-            Value::Bool(false) => Ok(f32::NEG_INFINITY),
-            Value::Number(n) => match n.as_f64() {
-                Some(b) if (-100.0..=100.0).contains(&b) => Ok(b as f32),
-                _ => Err(err(format!(
-                    "logit_bias for token {id} must be between -100 and 100, got {n}"
-                ))),
-            },
-            _ => Err(err(format!(
-                "logit_bias for token {id} must be a number or false, got {v}"
-            ))),
+    let entries = match v {
+        None => return Ok(Vec::new()),
+        Some(LogitBiasArg::Entries(e)) => e,
+        Some(LogitBiasArg::NotAnObject(t)) => {
+            return Err(err(format!(
+                "logit_bias must be an object mapping token ids to biases, got a {t}"
+            )))
         }
     };
-    let mut out = Vec::new();
-    match v {
-        None | Some(Value::Null) => {}
-        Some(Value::Object(m)) => {
-            for (k, b) in m {
-                let id = id_of(&Value::String(k.clone()))?;
-                out.push((id, bias_of(id, b)?));
-            }
+    let mut out = Vec::with_capacity(entries.len());
+    for (key, val) in entries {
+        let canonical = key.bytes().all(|b| b.is_ascii_digit())
+            && (key == "0" || (!key.is_empty() && !key.starts_with('0')));
+        let id: u32 = canonical
+            .then(|| key.parse().ok())
+            .flatten()
+            .ok_or_else(|| {
+                err(format!(
+                    "logit_bias key {key:?} is not a token id (a non-negative integer written \
+                     without sign or leading zeros)"
+                ))
+            })?;
+        let bias = val
+            .as_f64()
+            .ok_or_else(|| err(format!("logit_bias for token {id} must be a number")))?;
+        if !(-LOGIT_BIAS_LIMIT..=LOGIT_BIAS_LIMIT).contains(&bias) {
+            return Err(err(format!(
+                "logit_bias for token {id} must be between -{LOGIT_BIAS_LIMIT} and \
+                 {LOGIT_BIAS_LIMIT}, got {bias}"
+            )));
         }
-        Some(Value::Array(a)) => {
-            for pair in a {
-                match pair.as_array().map(Vec::as_slice) {
-                    Some([k, b]) => {
-                        let id = id_of(k)?;
-                        out.push((id, bias_of(id, b)?));
-                    }
-                    _ => return Err(err("logit_bias array entries must be [id, bias]".into())),
-                }
-            }
-        }
-        Some(_) => {
-            return Err(err(
-                "logit_bias must be an object of token id to bias, or an array of [id, bias]"
-                    .into(),
-            ))
-        }
+        out.push((id, bias as f32));
+    }
+    out.sort_by_key(|&(id, _)| id);
+    if let Some(w) = out.windows(2).find(|w| w[0].0 == w[1].0) {
+        return Err(err(format!("logit_bias names token {} twice", w[0].0)));
     }
     Ok(out)
-}
-
-/// The request's thinking switch. Precedence: `chat_template_kwargs.enable_thinking`, then
-/// `think`, then `reasoning_effort`.
-fn request_think(req: &ChatRequest) -> Result<Option<bool>, ParamError> {
-    let kw = req
-        .chat_template_kwargs
-        .as_ref()
-        .and_then(|v| v.get("enable_thinking"));
-    match kw {
-        None | Some(serde_json::Value::Null) => {}
-        Some(serde_json::Value::Bool(b)) => return Ok(Some(*b)),
-        Some(_) => {
-            return Err(ParamError {
-                param: "chat_template_kwargs",
-                message: "chat_template_kwargs.enable_thinking must be a boolean".into(),
-            })
-        }
-    }
-    match &req.think {
-        None | Some(serde_json::Value::Null) => {}
-        Some(serde_json::Value::Bool(b)) => return Ok(Some(*b)),
-        Some(serde_json::Value::String(s)) => return effort_think("think", s).map(Some),
-        Some(_) => {
-            return Err(ParamError {
-                param: "think",
-                message: "think must be a boolean or an effort level string".into(),
-            })
-        }
-    }
-    req.reasoning_effort
-        .as_deref()
-        .map(|s| effort_think("reasoning_effort", s))
-        .transpose()
-}
-
-fn effort_think(param: &'static str, effort: &str) -> Result<bool, ParamError> {
-    match effort {
-        "none" => Ok(false),
-        "minimal" | "low" | "medium" | "high" => Ok(true),
-        other => Err(ParamError {
-            param,
-            message: format!(
-                "{param} must be one of none, minimal, low, medium, high; got {other:?}"
-            ),
-        }),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -593,17 +732,18 @@ const TOOL_CHOICE_POLICIES: [&str; 3] = ["auto", "none", "required"];
 /// [`tool_choice_str`] cannot do on its own — it never sees `tools`.
 ///
 /// Two holes this closes, both of which used to produce ordinary unconstrained assistant text
-/// (backlog B22). `tool_constraint_for` returns `Ok(None)` the moment `tools` is absent, without
-/// ever looking at `tool_choice`, and `run_chat` reads that `None` as "no constraint wanted":
+/// (backlog B22). `OaiRenderer::tool_constraint` returns `Ok(None)` the moment `tools` is absent,
+/// without ever looking at `tool_choice`, and `run_chat` reads that `None` as "no constraint
+/// wanted":
 ///
 /// - **A forced choice with no `tools`.** `"tool_choice":"required"` and no tools is a request the
 ///   server cannot honour — there is nothing to call — so it is a 400 rather than a silent
 ///   downgrade to free text. `"none"` is exempt: it asks for no tool call, which is satisfiable
 ///   with no tools, and `"auto"` means "your discretion".
 /// - **A name that is not in `tools`.** A misspelled function name reached the generator as a
-///   forced choice and then vanished. With `tools` present it is worse than nothing: the filter in
-///   `tool_constraint_for` yields an empty array and `forced_tool_call_grammar` builds
-///   `{"anyOf": []}`, a grammar that matches no output at all.
+///   forced choice and then vanished. With `tools` present it is worse than nothing: the name
+///   filter behind `OaiRenderer::tool_constraint` yields an empty array and
+///   `forced_tool_call_grammar` builds `{"anyOf": []}`, a grammar that matches no output at all.
 ///
 /// Same policy as the existing malformed-object 400s: a forced tool call the server cannot deliver
 /// is an error, never a quiet fallback to "auto" (audit finding 6).
@@ -731,6 +871,29 @@ pub struct UsageInfo {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    pub prompt_tokens_details: PromptTokensDetails,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
+impl UsageInfo {
+    /// The `usage` block for one finished generation — shared by the non-streaming body and the
+    /// streamed `include_usage` chunk, so the two cannot report different numbers.
+    pub fn from_outcome(outcome: &ChatOutcome) -> Self {
+        Self {
+            prompt_tokens: outcome.prompt_tokens,
+            completion_tokens: outcome.completion_tokens,
+            total_tokens: outcome
+                .prompt_tokens
+                .saturating_add(outcome.completion_tokens),
+            prompt_tokens_details: PromptTokensDetails {
+                cached_tokens: outcome.cached_tokens,
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -744,6 +907,9 @@ pub struct ChatCompletionChunk {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    /// Only on the final `stream_options.include_usage` chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1056,7 +1222,9 @@ impl ReqTally {
             .first_delta
             .map_or(total, |t| t.saturating_duration_since(self.started));
         ReqRecord {
-            prompt_tokens: outcome.prompt_tokens,
+            // The tokens this request actually PREFILLED: what its prefill time was spent on, and
+            // what the throughput counters have always summed. A cached prefix cost nothing.
+            prompt_tokens: outcome.prompt_tokens.saturating_sub(outcome.cached_tokens),
             gen_tokens: outcome.completion_tokens,
             deltas: self.deltas,
             window: self.window,
@@ -1262,7 +1430,6 @@ pub struct AppState {
     /// [`stats_reporter`] that `serve_state` spawns; a state built for tests simply has no reporter
     /// draining it.
     stats: Arc<ServeStats>,
-    activity: Arc<idle::Activity>,
     /// When this state was built, for `/status`'s uptime.
     started: Instant,
 }
@@ -1285,7 +1452,6 @@ impl AppState {
             )]),
             cfg,
             stats: Arc::default(),
-            activity: Arc::default(),
             started: Instant::now(),
         }
     }
@@ -1310,7 +1476,6 @@ impl AppState {
             models: Arc::new(models),
             cfg,
             stats: Arc::default(),
-            activity: Arc::default(),
             started: Instant::now(),
         }
     }
@@ -1323,7 +1488,6 @@ impl AppState {
             models: Arc::new(vec![ModelEntry::new(&model_id.into(), None, 1)]),
             cfg,
             stats: Arc::default(),
-            activity: Arc::default(),
             started: Instant::now(),
         }
     }
@@ -1352,23 +1516,30 @@ impl AppState {
 // ---------------------------------------------------------------------------
 
 /// Build the axum [`Router`].  Extracted so tests can call it with a [`AppState::headless`] state.
-/// Request body ceiling (see the `DefaultBodyLimit` layer in [`build_router`]).
-const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
-
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/v1/models", get(models_handler))
         .route("/metrics", get(metrics::metrics_handler))
         .route("/status", get(status::status_handler))
-        .route("/v1/chat/completions", post(chat_completions_handler))
-        .route("/v1/completions", post(completions::completions_handler))
-        // Images arrive inline as base64 data URIs, so a chat request can be megabytes; axum's
-        // default 2 MB cap would turn one phone photo into a 413.
-        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .layer(axum::middleware::from_fn(idle::track))
-        .layer(Extension(state.activity.clone()))
+        .route(
+            "/v1/chat/completions",
+            post(chat_completions_handler)
+                .route_layer(middleware::from_fn_with_state(state.clone(), require_auth)),
+        )
         .with_state(state)
+}
+
+/// [`auth_gate`] as a layer, for the route that takes a body. A handler's extractors all run
+/// before its first statement, so a check inside the handler comes AFTER the JSON body has been
+/// buffered and parsed; an unauthenticated client could make the server do that work up to the
+/// body limit, or hold the request open by never finishing its body. As a layer it runs on the
+/// headers alone.
+async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if let Some(denied) = auth_gate(&state.cfg, req.headers()) {
+        return denied;
+    }
+    next.run(req).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1402,52 +1573,26 @@ pub async fn serve_multi(
     serve_state(AppState::multi(entries, cfg), addr).await
 }
 
-/// Serve an inherited TCP listener or bind `addr`, draining requests on shutdown.
+/// Bind + run the axum server over a fully-built [`AppState`] (single- or multi-model). The one
+/// place the listener, the graceful-shutdown latch, and `axum::serve` live.
 async fn serve_state(state: AppState, addr: SocketAddr) -> anyhow::Result<()> {
-    let listener = match infr_plat::socket::activated_tcp_listener()? {
-        Some(listener) => {
-            tracing::info!(addr = %listener.local_addr()?, "using systemd socket");
-            tokio::net::TcpListener::from_std(listener)?
-        }
-        None => tokio::net::TcpListener::bind(addr).await?,
-    };
-    serve_listener(state, listener).await
-}
-
-async fn serve_listener(state: AppState, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
-    let addr = listener.local_addr()?;
     let n_models = state.models.len();
-    let activity = state.activity.clone();
-    let idle_secs = state.cfg.serve.idle_timeout_secs;
-    activity.start_serving();
     // The periodic throughput reporter (B10), unless `serve.stats_interval_secs` is 0. It reads the
     // SAME shutdown latch the drain path does, and it is aborted here as well: whichever way the
     // server ends, no task is left ticking.
     let reporter = stats_interval(&state.cfg)
         .map(|period| tokio::spawn(stats_reporter(state.clone(), period)));
     let router = build_router(state);
-    tracing::info!(%addr, %n_models, %idle_secs, "infr-server listening");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!(%addr, %n_models, "infr-server listening");
     let served = axum::serve(listener, router)
-        .with_graceful_shutdown(server_shutdown(activity, idle_secs))
+        .with_graceful_shutdown(shutdown_latched())
         .await;
     if let Some(h) = reporter {
         h.abort();
     }
     served?;
     Ok(())
-}
-
-async fn server_shutdown(activity: Arc<idle::Activity>, idle_secs: u64) {
-    if idle_secs == 0 {
-        shutdown_latched().await;
-    } else {
-        tokio::select! {
-            _ = shutdown_latched() => {}
-            _ = activity.wait_idle(Duration::from_secs(idle_secs)) => {
-                tracing::info!(idle_secs, "idle timeout reached — shutting down");
-            }
-        }
-    }
 }
 
 /// Resolves once the process-wide shutdown latch is set (SIGINT/SIGTERM — see
@@ -1512,21 +1657,14 @@ async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Re
     .into_response()
 }
 
+/// Bearer auth for this route is [`require_auth`], layered in front of it by [`build_router`].
 async fn chat_completions_handler(
     State(state): State<AppState>,
-    Extension(activity): Extension<idle::Guard>,
-    headers: HeaderMap,
-    body: Result<Json<ChatRequest>, axum::extract::rejection::JsonRejection>,
+    body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> Response {
-    // Optional bearer auth, checked before any work, so an unauthenticated request cannot even
-    // reach model routing / slot admission.
-    if let Some(denied) = auth_gate(&state.cfg, &headers) {
-        return denied;
-    }
-    // Malformed JSON / wrong types: an OpenAI-shaped 400, not axum's default 422 text body.
     let Json(req) = match body {
         Ok(j) => j,
-        Err(e) => return param_error(None, e.body_text()),
+        Err(e) => return body_rejection(e),
     };
     let mut params = match GenParams::from_request(&req) {
         Ok(p) => p,
@@ -1534,17 +1672,7 @@ async fn chat_completions_handler(
     };
     // Cap an absurd explicit budget so one request can't pin a slot forever. Unset stays unset.
     params.max_tokens = clamp_max_tokens(params.max_tokens, max_tokens_cap(&state.cfg));
-    let mut images = Vec::new();
-    let messages: Vec<ChatMessage> = match req
-        .messages
-        .iter()
-        .map(|m| dto_to_engine(m, &mut images))
-        .collect::<Result<_, _>>()
-    {
-        Ok(m) => m,
-        Err(e) => return param_error(Some(e.param), e.message),
-    };
-    params.images = images;
+    let messages: Vec<ChatMessage> = req.messages.iter().map(dto_to_engine).collect();
     // Pass the request's `tools` array THROUGH as a Value (moved into the blocking task) — no
     // Value→string→Value round-trip (audit finding 6).
     let tools: Option<serde_json::Value> = req.tools.clone();
@@ -1567,43 +1695,11 @@ async fn chat_completions_handler(
     // The response `model` field echoes the entry ACTUALLY served, not the raw request string, so a
     // client that omitted/mis-named the model sees which one answered.
     let entry = state.route(&req.model);
-    if !params.images.is_empty() {
-        let Some(engine) = entry.engine.clone() else {
-            return param_error(
-                Some("messages"),
-                "image input is not supported by this model/backend".into(),
-            );
-        };
-        // Image decoding has its own process-wide admission limit, independent of GPU slots.
-        // Do not queue compressed payloads: reject overload before allocating decoder buffers.
-        // The closure owns the permit so disconnecting/aborting this handler cannot release it
-        // while an uncancellable blocking decoder is still running.
-        static IMAGE_PREFLIGHT_GATE: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> =
-            std::sync::OnceLock::new();
-        let gate = IMAGE_PREFLIGHT_GATE.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(1)));
-        let Ok(permit) = gate.clone().try_acquire_owned() else {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "image validation is busy; retry later".into(),
-            );
-        };
-        let images = params.images.clone();
-        let preflight_activity = activity.clone();
-        match tokio::task::spawn_blocking(move || {
-            let _activity = preflight_activity;
-            let _permit = permit;
-            engine.validate_images(&images)
-        })
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return param_error(Some("messages"), e.to_string()),
-            Err(e) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("image preflight failed: {e}"),
-                )
-            }
+    // `logit_bias` ids depend on the model, so they are checked only once it is known, and only
+    // when there are any. No engine (a headless state) answers 500 further on, whatever the ids.
+    if let (false, Some(engine)) = (params.logit_bias.is_empty(), &entry.engine) {
+        if let Err(e) = params.check_vocab(engine.vocab_size()) {
+            return param_error(Some(e.param), e.message);
         }
     }
     let model_id = entry.id.to_string();
@@ -1616,8 +1712,8 @@ async fn chat_completions_handler(
         // from inside a blocking task. `None` (the default) = no deadline, exactly as before.
         deadline: request_timeout(&state.cfg),
         stream: req.stream,
+        include_usage: req.stream_options.as_ref().is_some_and(|o| o.include_usage),
         stats: state.stats.clone(),
-        activity,
     };
     log_request_start(
         ctx.id,
@@ -1652,8 +1748,9 @@ struct ReqCtx {
     created: i64,
     deadline: Option<Duration>,
     stream: bool,
+    /// `stream_options.include_usage`: end the stream with a `usage` chunk.
+    include_usage: bool,
     stats: Arc<ServeStats>,
-    activity: idle::Guard,
 }
 
 // ---------------------------------------------------------------------------
@@ -1675,8 +1772,8 @@ async fn non_streaming(
         created,
         deadline,
         stream,
+        include_usage: _,
         stats,
-        activity,
     } = ctx;
     // Wait for a free slot ON THIS MODEL. With `--parallel N`, the (N+1)'th concurrent request to
     // this model queues HERE — in the async runtime, holding no thread — and is admitted FIFO as
@@ -1699,11 +1796,14 @@ async fn non_streaming(
 
     // Per-request abort latch. It lives OUT here, not inside the closure, so the deadline below can
     // reach it: the generator polls it in its decode loop, and that poll is the only way to stop a
-    // `spawn_blocking` task early. There is still no client-disconnect signal on this path (the
-    // whole reply is buffered, so no send can fail), which is precisely why the deadline matters
-    // most here — a client that hung up cannot be noticed, and burns its slot to completion.
+    // `spawn_blocking` task early.
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_blk = cancel.clone();
+    // A client that hangs up is noticed by hyper, which DROPS this handler future — and with it
+    // this guard, which latches the abort so the generation stops and frees its slot instead of
+    // running to `max_tokens` for nobody. On a normal return it latches a generation that has
+    // already ended, which nothing reads.
+    let _hangup = CancelOnDrop(cancel.clone());
 
     let mut handle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         // The permit is MOVED into the blocking task and dropped when it ends: a slot is held for
@@ -1711,7 +1811,6 @@ async fn non_streaming(
         // `active` gauge rides along with it, so the two can never disagree.
         let _permit = permit;
         let _active = active;
-        let _activity = activity;
         let Some(engine) = engine_arc else {
             anyhow::bail!("no engine loaded");
         };
@@ -1722,34 +1821,32 @@ async fn non_streaming(
         // Per-request tally: plain locals, folded into the shared counters once at the end.
         let mut tally = ReqTally::new();
 
-        let outcome = engine
-            .chat(
-                &messages,
-                tools.as_ref(),
-                tool_choice.as_deref(),
-                &params,
-                &cancel_blk,
-                &mut |delta| match delta {
-                    Delta::Reasoning(t) => {
-                        tally.on_text_delta(&stats_blk);
-                        reasoning.push_str(&t);
-                    }
-                    Delta::Content(t) => {
-                        tally.on_text_delta(&stats_blk);
-                        content.push_str(&t);
-                    }
-                    Delta::ToolCall { name, arguments } => {
-                        let idx = tool_calls.len();
-                        tool_calls.push(OAIToolCall {
-                            index: idx,
-                            id: format!("call_{cid_blk}_{idx}"),
-                            kind: "function",
-                            function: OAIFunction { name, arguments },
-                        });
-                    }
-                },
-            )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let outcome = engine.chat(
+            &messages,
+            tools.as_ref(),
+            tool_choice.as_deref(),
+            &params,
+            &cancel_blk,
+            &mut |delta| match delta {
+                Delta::Reasoning(t) => {
+                    tally.on_text_delta(&stats_blk);
+                    reasoning.push_str(&t);
+                }
+                Delta::Content(t) => {
+                    tally.on_text_delta(&stats_blk);
+                    content.push_str(&t);
+                }
+                Delta::ToolCall { name, arguments } => {
+                    let idx = tool_calls.len();
+                    tool_calls.push(OAIToolCall {
+                        index: idx,
+                        id: tool_call_id(&cid_blk, idx),
+                        kind: "function",
+                        function: OAIFunction { name, arguments },
+                    });
+                }
+            },
+        )?;
 
         Ok((reasoning, content, tool_calls, outcome, tally))
     });
@@ -1791,7 +1888,10 @@ async fn non_streaming(
         Err(e) => {
             stats.fold_failure();
             tracing::warn!(req = req_id, error = %e, "request failed");
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+            match request_error_body(&e) {
+                Some(body) => (StatusCode::BAD_REQUEST, Json(body)).into_response(),
+                None => json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            }
         }
         Ok((reasoning, content, tool_calls, outcome, tally)) => {
             // A deadline hit is a TRUNCATION, not a failure: the client keeps the partial reply
@@ -1843,13 +1943,7 @@ async fn non_streaming(
                     },
                     finish_reason: finish.as_str().into(),
                 }],
-                usage: UsageInfo {
-                    prompt_tokens: outcome.prompt_tokens,
-                    completion_tokens: outcome.completion_tokens,
-                    total_tokens: outcome
-                        .prompt_tokens
-                        .saturating_add(outcome.completion_tokens),
-                },
+                usage: UsageInfo::from_outcome(&outcome),
             })
             .into_response()
         }
@@ -1875,8 +1969,8 @@ async fn streaming(
         created,
         deadline,
         stream,
+        include_usage,
         stats,
-        activity,
     } = ctx;
     // UNBOUNDED on purpose. The generator's `on_delta` callback is invoked from inside the decode
     // loop — which, under `--parallel N`, is holding the GPU baton. A bounded channel would make a
@@ -1908,11 +2002,14 @@ async fn streaming(
     let model_cb = model_id.clone();
     let stats_cb = stats.clone();
 
-    // Per-request abort latch: set when the client disconnects (an SSE `send` starts failing) and
-    // polled by the generator's decode loop so it stops promptly and frees the GPU slot instead of
-    // running to `max_tokens` into a dead socket (audit finding 2).
+    // Per-request abort latch: set when the client disconnects and polled by the generator's
+    // decode loop so it stops promptly and frees the GPU slot instead of running to `max_tokens`
+    // into a dead socket (audit finding 2). A failed `send` below notices the hang-up only at the
+    // next delta; [`cancel_on_hangup`] notices it as it happens — during a long prefill, or while
+    // the stop matcher holds output back, no delta is being sent at all.
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_cb = cancel.clone();
+    let hangup_done = cancel_on_hangup(&tx, cancel.clone());
 
     // Wall-clock deadline. Unlike the non-streaming path, nothing here awaits the generation's join
     // — the SSE response is returned as soon as the stream exists — so the timer needs its own
@@ -1931,10 +2028,12 @@ async fn streaming(
         // `active` gauge is released by the same return (or unwind).
         let _permit = permit;
         let _active = active;
-        let _activity = activity;
         // Disarms the deadline watchdog when this task ends — see [`arm_deadline`]. `None` when no
         // deadline was configured, in which case there is no watchdog to disarm.
         let _done_tx = done_tx;
+        // Likewise ends the hang-up watcher, whose sender clone would otherwise hold the stream
+        // open.
+        let _hangup_done = hangup_done;
         // Closes the stream exactly once, however this closure ends. It emits `[DONE]` always, and
         // — unless `settled()` says a terminal frame already went out — reports the generation as a
         // failure. Both matter on an unwinding panic, which skips every arm below (B23).
@@ -1994,7 +2093,7 @@ async fn streaming(
                     Delta::ToolCall { name, arguments } => {
                         let tc = OAIToolCall {
                             index: tc_index,
-                            id: format!("call_{cid_cb}_{tc_index}"),
+                            id: tool_call_id(&cid_cb, tc_index),
                             kind: "function",
                             function: OAIFunction { name, arguments },
                         };
@@ -2037,6 +2136,9 @@ async fn streaming(
                     DeltaPayload::default(),
                     Some(finish.as_str().into()),
                 )));
+                if include_usage {
+                    let _ = tx.send(Ok(sse_usage_chunk(&cid, &model_id, created, &outcome)));
+                }
                 // Fold the request's tallies in ONCE, here, and log its completion line. The finish
                 // chunk above IS this stream's terminal frame, so the guard must not also report a
                 // failure when it drops.
@@ -2048,8 +2150,12 @@ async fn streaming(
             Err(e) => {
                 // A mid-stream failure is NOT a clean `stop` — the error frame lets the client tell
                 // this apart from success (matching the non-streaming 500). `[DONE]` still follows,
-                // via `DoneGuard` (audit finding 1).
-                done.fail(&e.to_string());
+                // via `DoneGuard` (audit finding 1). An over-long prompt carries the same typed error
+                // the non-streaming path answers with a 400, so a client can tell it from a crash.
+                match request_error_body(&e) {
+                    Some(body) => done.fail_with(body, &e.to_string()),
+                    None => done.fail(&e.to_string()),
+                }
             }
         }
         // `DoneGuard` drops here (or on an unwinding panic). It sends `[DONE]`, and if nothing
@@ -2111,13 +2217,19 @@ impl DoneGuard {
     /// line cannot drift apart or be emitted twice. Called explicitly by the paths that know why
     /// they failed, and by [`Drop`] for the paths that never got the chance.
     fn fail(&mut self, msg: &str) {
+        self.fail_with(error_body(msg, "server_error"), msg);
+    }
+
+    /// [`Self::fail`] with an error body other than the generic `server_error` one; `msg` is what
+    /// the log line says.
+    fn fail_with(&mut self, body: serde_json::Value, msg: &str) {
         if self.settled {
             return;
         }
         self.settled = true;
         // A failed send just means the client is already gone; the accounting still has to be
         // right, so the fold and the log are NOT conditional on it.
-        let _ = self.tx.send(Ok(sse_error_event(msg)));
+        let _ = self.tx.send(Ok(sse_error_event(&body)));
         self.stats.fold_failure();
         tracing::warn!(req = self.req_id, error = msg, "request failed");
     }
@@ -2145,8 +2257,8 @@ fn error_body(msg: &str, ty: &str) -> serde_json::Value {
 /// A terminal SSE error frame: `data: {"error":{...}}`. Distinguishable from a normal
 /// `chat.completion.chunk` and from `[DONE]`, so a client can tell a mid-stream failure apart from a
 /// clean completion (audit finding 1).
-fn sse_error_event(msg: &str) -> Event {
-    Event::default().data(error_body(msg, "server_error").to_string())
+fn sse_error_event(body: &serde_json::Value) -> Event {
+    Event::default().data(body.to_string())
 }
 
 /// Serialize a delta payload into an SSE event carrying a `chat.completion.chunk`.
@@ -2167,6 +2279,23 @@ fn sse_chunk(
             delta,
             finish_reason,
         }],
+        usage: None,
+    };
+    Event::default()
+        .json_data(chunk)
+        .expect("ChatCompletionChunk always serializes")
+}
+
+/// The `stream_options.include_usage` chunk: the whole request's `usage`, and an empty `choices`
+/// array, sent after the finish chunk and before `[DONE]`.
+fn sse_usage_chunk(cid: &str, model: &str, created: i64, outcome: &ChatOutcome) -> Event {
+    let chunk = ChatCompletionChunk {
+        id: cid.to_owned(),
+        object: "chat.completion.chunk",
+        created,
+        model: model.to_owned(),
+        choices: Vec::new(),
+        usage: Some(UsageInfo::from_outcome(outcome)),
     };
     Event::default()
         .json_data(chunk)
@@ -2177,25 +2306,72 @@ fn json_error(status: StatusCode, msg: String) -> Response {
     (status, Json(error_body(&msg, "server_error"))).into_response()
 }
 
-/// OpenAI-shaped 400 for a bad request parameter (`invalid_request_error`, with the offending
-/// `param` named). NOT a clamp and NOT a panic — see [`GenParams::from_request`].
+/// An `invalid_request_error` — the request is at fault and resending it unchanged will not help.
+/// `param` names the offending field and `code` is OpenAI's machine-readable reason, where there
+/// is one (`null` otherwise).
 ///
 /// Two fields on top of the shared [`error_body`], and they are deliberately absent from the
 /// server-error responses rather than emitted as nulls there: `param` only means something when a
-/// specific request field is at fault, and OpenAI's own 5xx bodies carry neither. `code` is always
-/// null — we mint no error codes — but it is present because SDKs read `error.code` on a 400.
-/// Appending them keeps the key order (`message`, `type`, `param`, `code`) the responses have
-/// always had; `serde_json`'s `preserve_order` makes that order observable on the wire.
-fn param_error(param: Option<&str>, msg: String) -> Response {
-    let mut body = error_body(&msg, "invalid_request_error");
+/// specific request field is at fault, and OpenAI's own 5xx bodies carry neither. `code` is
+/// present even when null because SDKs read `error.code` on a 4xx. Appending them keeps the key
+/// order (`message`, `type`, `param`, `code`) the responses have always had; `serde_json`'s
+/// `preserve_order` makes that order observable on the wire.
+fn invalid_request(
+    status: StatusCode,
+    param: Option<&str>,
+    code: Option<&str>,
+    msg: String,
+) -> Response {
+    (status, Json(invalid_request_body(param, code, &msg))).into_response()
+}
+
+/// The body of [`invalid_request`], for the SSE error frame as well as the HTTP response.
+fn invalid_request_body(param: Option<&str>, code: Option<&str>, msg: &str) -> serde_json::Value {
+    let mut body = error_body(msg, "invalid_request_error");
     body["error"]["param"] = serde_json::json!(param);
-    body["error"]["code"] = serde_json::Value::Null;
-    (StatusCode::BAD_REQUEST, Json(body)).into_response()
+    body["error"]["code"] = serde_json::json!(code);
+    body
+}
+
+/// The over-long-prompt error, identical on both paths: a `400` body, or a streamed error frame.
+fn context_length_body(c: &ContextLengthExceeded) -> serde_json::Value {
+    invalid_request_body(
+        Some("messages"),
+        Some("context_length_exceeded"),
+        &c.message,
+    )
+}
+
+/// The `400` body for a generator error that is the request's fault — an over-long prompt, or a
+/// [`ParamError`] the generator could not honour — or `None` for a failure of the server's own.
+fn request_error_body(e: &anyhow::Error) -> Option<serde_json::Value> {
+    if let Some(c) = e.downcast_ref::<ContextLengthExceeded>() {
+        return Some(context_length_body(c));
+    }
+    e.downcast_ref::<ParamError>()
+        .map(|p| invalid_request_body(Some(p.param), None, &p.message))
+}
+
+/// A body the JSON extractor refused. Malformed JSON and wrong field types are a `400` (not axum's
+/// default `422`, which no OpenAI client expects); a body over the size limit keeps its `413` and a
+/// missing JSON content type its `415`, because those say something a client can fix differently.
+fn body_rejection(e: JsonRejection) -> Response {
+    let status = match e.status() {
+        s @ (StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNSUPPORTED_MEDIA_TYPE) => s,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    invalid_request(status, None, None, e.body_text())
+}
+
+/// OpenAI-shaped 400 for a bad request parameter (`invalid_request_error`, with the offending
+/// `param` named). NOT a clamp and NOT a panic — see [`GenParams::from_request`].
+fn param_error(param: Option<&str>, msg: String) -> Response {
+    invalid_request(StatusCode::BAD_REQUEST, param, None, msg)
 }
 
 /// Process-monotonic tie-breaker so two requests in the SAME millisecond (routine under
-/// `--parallel N`) never mint the same completion `id` — which also keeps the derived
-/// `call_{cid}_{idx}` tool-call ids unique (audit finding 4).
+/// `--parallel N`) never mint the same completion `id` — which also keeps the tool-call ids
+/// [`tool_call_id`] derives from it distinct (audit finding 4).
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn make_id() -> String {
@@ -2205,6 +2381,32 @@ fn make_id() -> String {
         .as_millis();
     let seq = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("chatcmpl-{ms}-{seq}")
+}
+
+/// Length of a tool-call id, and its alphabet below: the shape Mistral's chat template demands of
+/// every replayed `tool_calls[].id` (it `raise_exception`s on anything else), which OpenAI clients
+/// treat as an opaque string. One shape for every model keeps a replayed id valid whichever
+/// template renders the next turn.
+const TOOL_CALL_ID_LEN: usize = 9;
+const TOOL_CALL_ID_ALPHABET: &[u8] =
+    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+/// The wire id of the `idx`-th tool call in completion `cid`: a hash of the pair, spelled in
+/// [`TOOL_CALL_ID_ALPHABET`]. Deterministic, so the streaming and non-streaming paths agree, and
+/// distinct across completions because `cid` is (see [`make_id`]).
+fn tool_call_id(cid: &str, idx: usize) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    (cid, idx).hash(&mut h);
+    let mut n = h.finish();
+    let base = TOOL_CALL_ID_ALPHABET.len() as u64;
+    (0..TOOL_CALL_ID_LEN)
+        .map(|_| {
+            let c = TOOL_CALL_ID_ALPHABET[(n % base) as usize] as char;
+            n /= base;
+            c
+        })
+        .collect()
 }
 
 /// Default ceiling for `max_tokens`/`max_completion_tokens` when `INFR_MAX_TOKENS_CAP` is unset —
@@ -2243,10 +2445,9 @@ fn clamp_max_tokens(requested: Option<u32>, cap: u32) -> Option<u32> {
 /// environment (see the env layer's note on why this knob is NOT `.filter(|v| v > 0)`).
 ///
 /// Why a deadline exists at all: nothing else bounds how long one request may occupy a `--parallel`
-/// slot. `max_tokens_cap` bounds TOKENS, and its 128k default is many hours on a slow model; on the
-/// non-streaming path a client that has already gone away cannot even be detected (there is no send
-/// to fail), so it burns its slot to completion. Why it is OFF by default: firing mid-generation
-/// truncates a legitimate long reply, and only the operator knows their model's token rate.
+/// slot. `max_tokens_cap` bounds TOKENS, and its 128k default is many hours on a slow model. Why it
+/// is OFF by default: firing mid-generation truncates a legitimate long reply, and only the operator
+/// knows their model's token rate.
 fn request_timeout(cfg: &Config) -> Option<Duration> {
     let secs = cfg.serve.request_timeout_secs;
     (secs > 0).then(|| Duration::from_secs(secs))
@@ -2294,6 +2495,37 @@ fn arm_deadline(
         }
     });
     done_tx
+}
+
+/// Latch `cancel` the moment the streaming client hangs up, i.e. when the SSE receiver `tx` feeds
+/// is dropped — not at the next delta, which may be a whole prefill away.
+///
+/// Same teardown shape as [`arm_deadline`]: the returned sender is the "generation finished"
+/// signal, moved into the blocking task and dropped there (also on unwind). The watcher holds a
+/// clone of `tx`, and the SSE stream only ends once every sender is gone, so it MUST end with the
+/// generation or a finished stream would never close.
+fn cancel_on_hangup(
+    tx: &tokio::sync::mpsc::UnboundedSender<Result<Event, Infallible>>,
+    cancel: Arc<AtomicBool>,
+) -> tokio::sync::oneshot::Sender<()> {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tx.closed() => cancel.store(true, Ordering::Relaxed),
+            _ = done_rx => {}
+        }
+    });
+    done_tx
+}
+
+/// Latches its flag when dropped — the non-streaming handler's hang-up signal (see [`non_streaming`]).
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Optional bearer-token gate. `expected` is the configured API key (`INFR_API_KEY`), or `None`
@@ -2348,9 +2580,12 @@ fn authorize(expected: Option<&str>, auth_header: Option<&str>) -> bool {
 fn auth_gate(cfg: &Config, headers: &HeaderMap) -> Option<Response> {
     let key = configured_api_key(cfg)?;
     let auth = headers.get("authorization").and_then(|v| v.to_str().ok());
+    // OpenAI's own 401: the request is at fault (`invalid_request_error`), not the server.
     (!authorize(Some(key), auth)).then(|| {
-        json_error(
+        invalid_request(
             StatusCode::UNAUTHORIZED,
+            None,
+            Some("invalid_api_key"),
             "missing or invalid Authorization bearer token".into(),
         )
     })
@@ -2400,84 +2635,14 @@ pub fn flatten_content(v: &Option<serde_json::Value>) -> String {
     }
 }
 
-/// [`flatten_content`], keeping images: each `image_url` part becomes an
-/// [`infr_engine::IMAGE_MARKER`] in the text and its decoded bytes are appended to `images`, so the
-/// two stay in the same order. Only `data:` URIs are accepted — the server never fetches URLs on a
-/// client's behalf. A marker typed into the text itself is removed, so a user cannot claim an image
-/// slot.
-pub fn flatten_content_media(
-    v: &Option<serde_json::Value>,
-    images: &mut Vec<Arc<[u8]>>,
-) -> Result<String, ParamError> {
-    use base64::Engine as _;
-    let marker = infr_engine::IMAGE_MARKER;
-    let strip = |t: &str| t.replace(marker, "");
-    let Some(serde_json::Value::Array(parts)) = v else {
-        return Ok(strip(&flatten_content(v)));
-    };
-    let mut out = String::new();
-    for p in parts {
-        match p.get("type").and_then(|t| t.as_str()) {
-            Some("text") => {
-                if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
-                    out.push_str(&strip(t));
-                }
-            }
-            Some("image_url") | Some("image") => {
-                let url = p
-                    .get("image_url")
-                    .and_then(|u| u.get("url").or(Some(u)))
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("");
-                let bad = |message: String| ParamError {
-                    param: "messages",
-                    message,
-                };
-                if images.len() >= infr_engine::MAX_REQUEST_IMAGES {
-                    return Err(bad("at most four images are allowed per request".into()));
-                }
-                let Some(rest) = url.strip_prefix("data:") else {
-                    return Err(bad(
-                        "image_url must be a base64 data: URI (remote image URLs are not fetched)"
-                            .into(),
-                    ));
-                };
-                let Some((meta, data)) = rest.split_once(',') else {
-                    return Err(bad("malformed image data: URI".into()));
-                };
-                if !meta.ends_with(";base64") {
-                    return Err(bad("image data: URI must be base64-encoded".into()));
-                }
-                let data = data.trim();
-                if data.len() > infr_engine::MAX_IMAGE_BYTES.div_ceil(3) * 4 {
-                    return Err(bad("image exceeds the 16 MiB encoded size limit".into()));
-                }
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(data)
-                    .map_err(|e| bad(format!("image data: URI is not valid base64: {e}")))?;
-                if bytes.len() > infr_engine::MAX_IMAGE_BYTES {
-                    return Err(bad("image exceeds the 16 MiB encoded size limit".into()));
-                }
-                images.push(Arc::from(bytes));
-                out.push_str(marker);
-            }
-            _ => {}
-        }
-    }
-    Ok(out)
-}
-
-fn dto_to_engine(
-    dto: &ChatMessageDto,
-    images: &mut Vec<Arc<[u8]>>,
-) -> Result<ChatMessage, ParamError> {
-    Ok(ChatMessage {
+fn dto_to_engine(dto: &ChatMessageDto) -> ChatMessage {
+    ChatMessage {
         role: dto.role.clone(),
-        content: flatten_content_media(&dto.content, images)?,
+        content: flatten_content(&dto.content),
         tool_calls: dto.tool_calls.as_ref().and_then(parse_oai_tool_calls),
         tool_call_id: dto.tool_call_id.clone(),
         name: dto.name.clone(),
-    })
+    }
 }
 
 /// Convert an inbound OpenAI `tool_calls` array (`[{function:{name, arguments}}]`, where `arguments`
@@ -2497,7 +2662,12 @@ fn parse_oai_tool_calls(v: &serde_json::Value) -> Option<Vec<ToolCall>> {
                 Some(other) => other.clone(),
                 None => serde_json::Value::Object(serde_json::Map::new()),
             };
-            Some(ToolCall { name, arguments })
+            let id = c.get("id").and_then(|v| v.as_str()).map(str::to_owned);
+            Some(ToolCall {
+                name,
+                arguments,
+                id,
+            })
         })
         .collect();
     (!calls.is_empty()).then_some(calls)
@@ -2562,6 +2732,9 @@ mod tests {
         assert_eq!(card["owned_by"], "local");
     }
 
+    /// The vocabulary every test generator reports, for the `logit_bias` id check.
+    const TEST_VOCAB: usize = 1000;
+
     /// What a test generator with nothing to say about its device reports.
     fn cpu_status() -> GeneratorStatus {
         GeneratorStatus {
@@ -2590,6 +2763,10 @@ mod tests {
             }
         }
 
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
         fn chat(
             &self,
             _messages: &[ChatMessage],
@@ -2604,6 +2781,7 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 3,
                 completion_tokens: 2,
+                cached_tokens: 0,
             })
         }
     }
@@ -2727,8 +2905,18 @@ mod tests {
             "max_tokens":512
         }"#;
         let req: ChatRequest = serde_json::from_str(raw).unwrap();
-        assert!(req.tools.is_some());
+        // The whole array arrives as sent: it is handed to the chat template verbatim, so a field
+        // lost or reshaped here is a tool the model is never told about.
+        assert_eq!(
+            req.tools,
+            Some(serde_json::json!([
+                {"type": "function", "function": {"name": "bash", "description": "run bash"}}
+            ]))
+        );
         assert_eq!(req.max_tokens, Some(512));
+        assert_eq!(req.max_completion_tokens, None);
+        assert_eq!(req.tool_choice, None);
+        assert!(req.messages.is_empty());
     }
 
     #[test]
@@ -2737,6 +2925,86 @@ mod tests {
         let msg: ChatMessageDto = serde_json::from_str(raw).unwrap();
         assert_eq!(msg.tool_call_id.as_deref(), Some("tc_1"));
         assert_eq!(msg.name.as_deref(), Some("bash"));
+    }
+
+    /// A replayed assistant `tool_calls[].id` survives into the engine message, so the chat
+    /// template can pair it with the `tool` result's `tool_call_id`.
+    #[test]
+    fn replayed_tool_call_keeps_its_id() {
+        let raw = r#"{"role":"assistant","content":null,"tool_calls":[
+            {"id":"a1B2c3D4e","type":"function",
+             "function":{"name":"bash","arguments":"{\"cmd\":\"ls\"}"}},
+            {"type":"function","function":{"name":"noid","arguments":"{}"}}]}"#;
+        let msg = dto_to_engine(&serde_json::from_str::<ChatMessageDto>(raw).unwrap());
+        let calls = msg.tool_calls.expect("two calls parse");
+        assert_eq!(calls[0].id.as_deref(), Some("a1B2c3D4e"));
+        assert_eq!(calls[0].arguments, serde_json::json!({"cmd": "ls"}));
+        assert_eq!(calls[1].id, None);
+    }
+
+    /// A float in a replayed tool call's arguments reaches the engine as the exact value the client
+    /// sent, so the chat template prints the same digits back: whether the arguments come as a
+    /// JSON string (the OpenAI shape) or as an object. Each of these lost its last digit when
+    /// serde_json parsed without `float_roundtrip` (`1e-25` became `9.999999999999999e-26`).
+    #[test]
+    fn replayed_tool_call_floats_survive_exactly() {
+        let floats = ["1e-25", "905046994.6356679", "2.5788702084023933e-304"];
+        let args = format!(
+            r#"{{"a":{},"b":{},"c":[{}]}}"#,
+            floats[0], floats[1], floats[2]
+        );
+        for arguments in [serde_json::to_string(&args).unwrap(), args.clone()] {
+            let raw = format!(
+                r#"{{"role":"assistant","content":null,"tool_calls":[
+                {{"type":"function","function":{{"name":"f","arguments":{arguments}}}}}]}}"#
+            );
+            let msg = dto_to_engine(&serde_json::from_str::<ChatMessageDto>(&raw).unwrap());
+            let a = &msg.tool_calls.expect("one call")[0].arguments;
+            let got = [&a["a"], &a["b"], &a["c"][0]].map(|v| v.as_f64().unwrap());
+            let want = floats.map(|f| f.parse::<f64>().unwrap());
+            assert_eq!(got.map(f64::to_bits), want.map(f64::to_bits), "{arguments}");
+            // …and the prompt prints them back: bare (Python's `repr`) and through `tojson`.
+            const PRINT: &str = "{% set a = messages[0].tool_calls[0].function.arguments %}\
+                {{ a.a }} {{ a.b }} {{ a.c[0] }}|{{ a | tojson }}";
+            let msgs = vec![serde_json::json!({"role": "assistant", "content": "",
+                "tool_calls": [{"type": "function",
+                                "function": {"name": "f", "arguments": a}}]})];
+            let prompt = infr_chat::render_template(
+                PRINT,
+                msgs,
+                serde_json::Value::Null,
+                "",
+                "",
+                false,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                prompt,
+                format!(
+                    r#"{0} {1} {2}|{{"a": {0}, "b": {1}, "c": [{2}]}}"#,
+                    floats[0], floats[1], floats[2]
+                )
+            );
+        }
+    }
+
+    /// The ids `serve` hands out are ones every supported template accepts when the client replays
+    /// them: Mistral's requires exactly nine alphanumerics. They are distinct per call and per
+    /// completion, and the same (cid, index) always yields the same id.
+    #[test]
+    fn minted_tool_call_ids_are_template_safe_and_distinct() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let cid = make_id();
+            for idx in 0..4 {
+                let id = tool_call_id(&cid, idx);
+                assert_eq!(id.len(), TOOL_CALL_ID_LEN, "{id}");
+                assert!(id.bytes().all(|b| b.is_ascii_alphanumeric()), "{id}");
+                assert!(seen.insert(id.clone()), "duplicate tool-call id {id}");
+                assert_eq!(id, tool_call_id(&cid, idx));
+            }
+        }
     }
 
     // --- Non-streaming response serialization tests ------------------------
@@ -2762,6 +3030,7 @@ mod tests {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -2795,6 +3064,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -2834,6 +3104,7 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                prompt_tokens_details: PromptTokensDetails { cached_tokens: 0 },
             },
         };
         let v: serde_json::Value = serde_json::to_value(&resp).unwrap();
@@ -2864,6 +3135,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["object"], "chat.completion.chunk");
@@ -2890,6 +3162,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["choices"][0]["delta"]["content"], "hello");
@@ -2911,6 +3184,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["choices"][0]["delta"]["reasoning_content"], "thinking...");
@@ -2940,6 +3214,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            usage: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         let tc = &v["choices"][0]["delta"]["tool_calls"][0];
@@ -2960,6 +3235,7 @@ mod tests {
                 delta: DeltaPayload::default(), // empty delta {}
                 finish_reason: Some("stop".into()),
             }],
+            usage: None,
         };
         let v: serde_json::Value = serde_json::to_value(&chunk).unwrap();
         assert_eq!(v["choices"][0]["finish_reason"], "stop");
@@ -3023,29 +3299,59 @@ mod tests {
     }
 
     #[test]
-    fn logit_bias_accepts_openai_and_llama_cpp_forms() {
-        let p = GenParams::from_request(&req(
-            r#"{"model":"m","messages":[],"logit_bias":{"15":-100,"42":2.5}}"#,
-        ))
-        .unwrap();
-        let mut b = p.logit_bias;
-        b.sort_by_key(|&(t, _)| t);
-        assert_eq!(b, vec![(15, -100.0), (42, 2.5)]);
-
-        let p = GenParams::from_request(&req(
-            r#"{"model":"m","messages":[],"logit_bias":[[7,1.5],["8",false]]}"#,
-        ))
-        .unwrap();
-        assert_eq!(p.logit_bias, vec![(7, 1.5), (8, f32::NEG_INFINITY)]);
-    }
-
-    #[test]
     fn unknown_fields_are_ignored_not_rejected() {
         let p = GenParams::from_request(&req(
-            r#"{"model":"m","messages":[],"n":1,"user":"bob","logit_bias":{},"logprobs":true}"#,
+            r#"{"model":"m","messages":[],"user":"bob","response_format":{"type":"text"}}"#,
         ))
         .unwrap();
         assert_eq!(p, GenParams::default());
+    }
+
+    /// The values of `n`, `logprobs`, `top_logprobs` and `logit_bias` that ask for nothing
+    /// unsupported — one choice, no log probabilities, no bias, or `null` — are accepted.
+    #[test]
+    fn neutral_choice_and_logprob_fields_are_accepted() {
+        for raw in [
+            r#"{"model":"m","messages":[],"n":1,"logprobs":false,"top_logprobs":0,"logit_bias":{}}"#,
+            r#"{"model":"m","messages":[],"n":null,"logprobs":null,"top_logprobs":null,
+                "logit_bias":null,"min_p":null}"#,
+        ] {
+            let p = GenParams::from_request(&req(raw)).unwrap();
+            assert_eq!(p, GenParams::default(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn min_p_and_logit_bias_parse() {
+        let p = GenParams::from_request(&req(r#"{"model":"m","messages":[],"min_p":0.05,
+                "logit_bias":{"50256":-100,"7":3.5,"12":100}}"#))
+        .unwrap();
+        assert_eq!(p.min_p, Some(0.05));
+        assert_eq!(p.logit_bias, vec![(7, 3.5), (12, 100.0), (50256, -100.0)]);
+    }
+
+    /// `0` is a canonical id, and a whole-number float `n` / `top_logprobs` reads as that integer
+    /// (as OpenAI's own validation does): `n: 1.0` is one choice.
+    #[test]
+    fn zero_ids_and_whole_number_counts_are_accepted() {
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"n":1.0,"top_logprobs":0.0,"logit_bias":{"0":-1}}"#,
+        ))
+        .unwrap();
+        assert_eq!(p.logit_bias, vec![(0, -1.0)]);
+    }
+
+    /// A `logit_bias` id is a token only below the routed model's vocabulary size.
+    #[test]
+    fn logit_bias_ids_are_checked_against_the_vocabulary() {
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"logit_bias":{"999":1,"3":-1}}"#,
+        ))
+        .unwrap();
+        assert_eq!(p.check_vocab(1000), Ok(()));
+        let e = p.check_vocab(999).unwrap_err();
+        assert_eq!(e.param, "logit_bias");
+        assert!(e.message.contains("999"), "{}", e.message);
     }
 
     #[test]
@@ -3064,52 +3370,6 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(p.max_tokens, Some(20));
-    }
-
-    #[test]
-    fn thinking_switch_parses_every_spelling() {
-        let think = |body: &str| {
-            GenParams::from_request(&req(&format!(r#"{{"model":"m","messages":[]{body}}}"#)))
-                .unwrap()
-                .think
-        };
-        assert_eq!(think(""), None);
-        assert_eq!(think(r#","reasoning_effort":"none""#), Some(false));
-        assert_eq!(think(r#","reasoning_effort":"high""#), Some(true));
-        assert_eq!(think(r#","think":false"#), Some(false));
-        assert_eq!(think(r#","think":"low""#), Some(true));
-        assert_eq!(
-            think(r#","chat_template_kwargs":{"enable_thinking":false}"#),
-            Some(false)
-        );
-        assert_eq!(think(r#","chat_template_kwargs":{"other":1}"#), None);
-        assert_eq!(
-            think(
-                r#","chat_template_kwargs":{"enable_thinking":true},"think":false,"reasoning_effort":"none""#
-            ),
-            Some(true)
-        );
-        assert_eq!(
-            think(r#","think":true,"reasoning_effort":"none""#),
-            Some(true)
-        );
-    }
-
-    #[test]
-    fn invalid_thinking_values_are_a_400() {
-        for (body, param) in [
-            (r#","reasoning_effort":"max""#, "reasoning_effort"),
-            (r#","think":3"#, "think"),
-            (
-                r#","chat_template_kwargs":{"enable_thinking":"no"}"#,
-                "chat_template_kwargs",
-            ),
-        ] {
-            let e =
-                GenParams::from_request(&req(&format!(r#"{{"model":"m","messages":[]{body}}}"#)))
-                    .unwrap_err();
-            assert_eq!(e.param, param);
-        }
     }
 
     #[test]
@@ -3152,12 +3412,19 @@ mod tests {
                 r#"{"model":"m","messages":[],"repeat_penalty":0}"#,
                 "repeat_penalty",
             ),
+            (r#"{"model":"m","messages":[],"stop":[1,2]}"#, "stop"),
             (
-                r#"{"model":"m","messages":[],"logit_bias":{"5":101}}"#,
+                r#"{"model":"m","messages":[],"stop":["a","b","c","d","e"]}"#,
+                "stop",
+            ),
+            (r#"{"model":"m","messages":[],"min_p":-0.1}"#, "min_p"),
+            (r#"{"model":"m","messages":[],"min_p":1.5}"#, "min_p"),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":[1]}"#,
                 "logit_bias",
             ),
             (
-                r#"{"model":"m","messages":[],"logit_bias":{"hello":1}}"#,
+                r#"{"model":"m","messages":[],"logit_bias":{"a":1}}"#,
                 "logit_bias",
             ),
             (
@@ -3165,21 +3432,60 @@ mod tests {
                 "logit_bias",
             ),
             (
-                r#"{"model":"m","messages":[],"logit_bias":[[1]]}"#,
+                r#"{"model":"m","messages":[],"logit_bias":{"5":"x"}}"#,
                 "logit_bias",
             ),
             (
-                r#"{"model":"m","messages":[],"logit_bias":{"1":true}}"#,
+                r#"{"model":"m","messages":[],"logit_bias":{"5":100.5}}"#,
                 "logit_bias",
             ),
             (
-                r#"{"model":"m","messages":[],"logit_bias":3}"#,
+                r#"{"model":"m","messages":[],"logit_bias":{"5":-101}}"#,
                 "logit_bias",
             ),
-            (r#"{"model":"m","messages":[],"stop":[1,2]}"#, "stop"),
+            (r#"{"model":"m","messages":[],"n":2}"#, "n"),
+            (r#"{"model":"m","messages":[],"n":0}"#, "n"),
+            (r#"{"model":"m","messages":[],"logprobs":true}"#, "logprobs"),
             (
-                r#"{"model":"m","messages":[],"stop":["a","b","c","d","e"]}"#,
-                "stop",
+                r#"{"model":"m","messages":[],"top_logprobs":3}"#,
+                "top_logprobs",
+            ),
+            (
+                r#"{"model":"m","messages":[],"top_logprobs":-1}"#,
+                "top_logprobs",
+            ),
+            // Only canonical decimal ids: each of these names token 5 a second way, and together
+            // they would stack past the bias range on one token.
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"+5":-100}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"05":-100}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{" 5":-100}}"#,
+                "logit_bias",
+            ),
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"":-100}}"#,
+                "logit_bias",
+            ),
+            // The same id twice, which a JSON object map would otherwise collapse to one.
+            (
+                r#"{"model":"m","messages":[],"logit_bias":{"5":-100,"5":-100}}"#,
+                "logit_bias",
+            ),
+            (r#"{"model":"m","messages":[],"n":1.5}"#, "n"),
+            (r#"{"model":"m","messages":[],"n":"1"}"#, "n"),
+            (
+                r#"{"model":"m","messages":[],"top_logprobs":0.5}"#,
+                "top_logprobs",
+            ),
+            (
+                r#"{"model":"m","messages":[],"top_logprobs":[]}"#,
+                "top_logprobs",
             ),
         ] {
             let e = GenParams::from_request(&req(raw)).unwrap_err();
@@ -3335,89 +3641,6 @@ mod tests {
     }
 
     #[test]
-    fn flatten_content_media_turns_data_uris_into_markers() {
-        let m = infr_engine::IMAGE_MARKER;
-        let uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgZGIGAAAOAAfXb+R4AAAAAElFTkSuQmCC";
-        let v = Some(serde_json::json!([
-            {"type": "text", "text": "look "},
-            {"type": "image_url", "image_url": {"url": uri}},
-            {"type": "text", "text": "and"},
-            {"type": "image_url", "image_url": {"url": uri}}
-        ]));
-        let mut images = Vec::new();
-        let text = flatten_content_media(&v, &mut images).unwrap();
-        assert_eq!(text, format!("look {m}and{m}"));
-        assert_eq!(images.len(), 2);
-        assert_eq!(&images[0][..8], b"\x89PNG\r\n\x1a\n");
-        assert_eq!(images[0], images[1]);
-    }
-
-    #[test]
-    fn flatten_content_media_rejects_remote_and_bad_uris() {
-        let mut images = Vec::new();
-        for url in [
-            "http://x/a.png",
-            "data:image/png,raw",
-            "data:image/png;base64,!!!",
-        ] {
-            let v = Some(serde_json::json!([{"type": "image_url", "image_url": {"url": url}}]));
-            assert!(flatten_content_media(&v, &mut images).is_err(), "{url}");
-        }
-        assert!(images.is_empty());
-    }
-
-    #[test]
-    fn flatten_content_media_enforces_count_and_encoded_size() {
-        let mut images = vec![Arc::<[u8]>::from([0u8]); infr_engine::MAX_REQUEST_IMAGES];
-        let v = Some(
-            serde_json::json!([{"type":"image_url", "image_url":{"url":"data:image/png;base64,AQID"}}]),
-        );
-        assert!(flatten_content_media(&v, &mut images)
-            .unwrap_err()
-            .message
-            .contains("four images"));
-        let v = Some(
-            serde_json::json!([{"type":"image_url", "image_url":{"url":format!("data:image/png;base64,{}", "A".repeat(infr_engine::MAX_IMAGE_BYTES.div_ceil(3)*4+1))}}]),
-        );
-        assert!(flatten_content_media(&v, &mut Vec::new())
-            .unwrap_err()
-            .message
-            .contains("16 MiB"));
-    }
-
-    #[tokio::test]
-    async fn unsupported_images_are_json_400_even_when_streaming() {
-        for stream in [false, true] {
-            let resp = multi_router().oneshot(Request::builder()
-                .method("POST").uri("/v1/chat/completions").header("content-type", "application/json")
-                .body(Body::from(serde_json::json!({"model":"alpha", "stream":stream, "messages":[{"role":"user", "content":[{"type":"image_url", "image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgZGIGAAAOAAfXb+R4AAAAAElFTkSuQmCC"}}]}]}).to_string())).unwrap()).await.unwrap();
-            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-            assert!(resp.headers()["content-type"]
-                .to_str()
-                .unwrap()
-                .starts_with("application/json"));
-            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-            assert!(body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("not supported"));
-        }
-    }
-
-    #[test]
-    fn flatten_content_media_strips_typed_markers() {
-        // A user cannot claim an image slot by typing the marker into plain text.
-        let m = infr_engine::IMAGE_MARKER;
-        let mut images = Vec::new();
-        let s = Some(serde_json::Value::String(format!("a{m}b")));
-        assert_eq!(flatten_content_media(&s, &mut images).unwrap(), "ab");
-        let arr = Some(serde_json::json!([{"type": "text", "text": format!("c{m}d")}]));
-        assert_eq!(flatten_content_media(&arr, &mut images).unwrap(), "cd");
-        assert!(images.is_empty());
-    }
-
-    #[test]
     fn flatten_content_none_gives_empty_string() {
         assert_eq!(flatten_content(&None), "");
     }
@@ -3479,14 +3702,9 @@ mod tests {
             finish: Finish::Stop,
             prompt_tokens: 17,
             completion_tokens: 5,
+            cached_tokens: 0,
         };
-        let usage = UsageInfo {
-            prompt_tokens: outcome.prompt_tokens,
-            completion_tokens: outcome.completion_tokens,
-            total_tokens: outcome
-                .prompt_tokens
-                .saturating_add(outcome.completion_tokens),
-        };
+        let usage = UsageInfo::from_outcome(&outcome);
         assert_eq!(usage.total_tokens, 22);
         assert_eq!(
             usage.total_tokens,
@@ -3534,7 +3752,7 @@ mod tests {
 
     /// B22: a forced `tool_choice` the server cannot honour is a 400, not free text.
     ///
-    /// `tool_constraint_for` returns `None` as soon as `tools` is absent — without reading
+    /// `OaiRenderer::tool_constraint` returns `None` as soon as `tools` is absent — without reading
     /// `tool_choice` at all — and `run_chat` treats that as "generate normally". So every case
     /// below used to produce ordinary assistant text while the client believed it had forced a
     /// call.
@@ -3777,7 +3995,8 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["error"]["type"], "server_error");
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "invalid_api_key");
         assert_eq!(
             v["error"]["message"],
             "missing or invalid Authorization bearer token"
@@ -3845,6 +4064,10 @@ mod tests {
             cpu_status()
         }
 
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
         fn chat(
             &self,
             _messages: &[ChatMessage],
@@ -3862,6 +4085,7 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 3,
                 completion_tokens: 1,
+                cached_tokens: 0,
             })
         }
     }
@@ -3884,8 +4108,8 @@ mod tests {
             created: 0,
             deadline,
             stream,
+            include_usage: false,
             stats: Arc::default(),
-            activity: Arc::new(idle::Activity::default()).enter().unwrap(),
         }
     }
 
@@ -4042,6 +4266,10 @@ mod tests {
             cpu_status()
         }
 
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
         fn chat(
             &self,
             _messages: &[ChatMessage],
@@ -4090,6 +4318,54 @@ mod tests {
         );
     }
 
+    /// A generator that refuses every request with a [`ParamError`], as a backend that cannot
+    /// apply a sampling field does.
+    struct RefusingGen;
+    impl ChatGenerator for RefusingGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            _on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            Err(ParamError {
+                param: "min_p",
+                message: "min_p is not supported by the test backend".into(),
+            }
+            .into())
+        }
+    }
+
+    /// A generator's [`ParamError`] is the request's fault: a 400 naming the field, and when
+    /// streaming a terminal error frame carrying the same, not a 500 or an anonymous failure.
+    #[tokio::test]
+    async fn a_generator_param_error_is_a_400_naming_the_field() {
+        let gen: Arc<dyn ChatGenerator> = Arc::new(RefusingGen);
+        let base = r#""model":"m","messages":[{"role":"user","content":"hi"}]"#;
+        let resp = post_chat(router_for(gen.clone()), &format!("{{{base}}}")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["param"], "min_p");
+        let resp = post_chat(router_for(gen), &format!(r#"{{{base},"stream":true}}"#)).await;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(text.contains(r#""param":"min_p""#), "{text}");
+        assert!(text.contains("invalid_request_error"), "{text}");
+    }
+
     /// A generator whose `chat` PANICS mid-stream, which is not the same as returning `Err`: the
     /// unwind skips every arm of the `match res` below it, so before B23 the only thing that ran
     /// was `DoneGuard`'s `[DONE]`.
@@ -4097,6 +4373,10 @@ mod tests {
     impl ChatGenerator for PanicGen {
         fn status(&self) -> GeneratorStatus {
             cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
         }
 
         fn chat(
@@ -4124,9 +4404,9 @@ mod tests {
         let state = AppState::new(g, "m", 1, Arc::new(Config::default()));
         let stats = state.stats.clone();
         let router = build_router(state);
-        // The panic itself is expected; keep the default hook from spraying the test log with it.
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
+        // The panic is expected and its message lands in this test's captured output. No
+        // `set_hook` to hide it: the hook is process-global and would also swallow the backtrace
+        // of any test panicking on another thread meanwhile.
         let resp = router
             .oneshot(
                 Request::builder()
@@ -4141,7 +4421,6 @@ mod tests {
             .await
             .unwrap();
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-        std::panic::set_hook(prev);
         let text = String::from_utf8(bytes.to_vec()).unwrap();
 
         assert!(
@@ -4314,6 +4593,7 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 1,
                 completion_tokens: 1,
+                cached_tokens: 0,
             },
             Finish::Stop,
         ));
@@ -4340,6 +4620,7 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 1,
                 completion_tokens: 2,
+                cached_tokens: 0,
             },
             Finish::Stop,
         ));
@@ -4358,6 +4639,7 @@ mod tests {
                 finish: Finish::Stop,
                 prompt_tokens: 0,
                 completion_tokens: 0,
+                cached_tokens: 0,
             },
             Finish::Stop,
         );
@@ -4518,5 +4800,482 @@ mod tests {
             w.has_activity(),
             "an interval of failures is not an idle one"
         );
+    }
+
+    // --- wire contract: usage, context length, body rejections, hang-ups ----
+
+    /// POST `body` to the chat route of `router` with a JSON content type.
+    async fn post_chat(router: Router, body: &str) -> Response {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A generator that counts how often the server asks for its vocabulary size.
+    struct VocabCountingGen(Arc<AtomicU64>);
+    impl ChatGenerator for VocabCountingGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            TEST_VOCAB
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_delta(Delta::Content("ok".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                cached_tokens: 0,
+            })
+        }
+    }
+
+    /// The vocabulary size is asked for only when a request carries a `logit_bias` to check: a
+    /// request without one must not pay for it.
+    #[tokio::test]
+    async fn the_vocab_size_is_read_only_for_a_logit_bias() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let gen: Arc<dyn ChatGenerator> = Arc::new(VocabCountingGen(calls.clone()));
+        let base = r#""model":"m","messages":[{"role":"user","content":"hi"}]"#;
+        for extra in ["", r#","logit_bias":{}"#, r#","logit_bias":null"#] {
+            let resp = post_chat(router_for(gen.clone()), &format!("{{{base}{extra}}}")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "asked without a bias");
+        let body = format!(r#"{{{base},"logit_bias":{{"3":-100}}}}"#);
+        let resp = post_chat(router_for(gen), &body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "the bias was not checked");
+    }
+
+    /// The new request checks answer an OpenAI-shaped 400 naming the parameter, on a streaming
+    /// request as well — the `logit_bias` vocabulary check included, which needs the routed
+    /// generator — and the neutral values still get a reply.
+    #[tokio::test]
+    async fn unsupported_and_invalid_sampling_fields_are_400s() {
+        let gen: Arc<dyn ChatGenerator> = Arc::new(EchoGen("a"));
+        let base = r#""model":"m","messages":[{"role":"user","content":"hi"}]"#;
+        let vocab = TEST_VOCAB;
+        for stream in [false, true] {
+            for (extra, param) in [
+                (r#""n":2"#.to_string(), "n"),
+                (r#""logprobs":true"#.to_string(), "logprobs"),
+                (r#""top_logprobs":2"#.to_string(), "top_logprobs"),
+                (r#""min_p":2"#.to_string(), "min_p"),
+                (r#""logit_bias":{"1":-150}"#.to_string(), "logit_bias"),
+                (format!(r#""logit_bias":{{"{vocab}":-100}}"#), "logit_bias"),
+                (
+                    r#""logit_bias":{"5":-100,"+5":-100}"#.to_string(),
+                    "logit_bias",
+                ),
+                (r#""n":"2""#.to_string(), "n"),
+                (r#""top_logprobs":1.5"#.to_string(), "top_logprobs"),
+            ] {
+                let body = format!(r#"{{{base},"stream":{stream},{extra}}}"#);
+                let resp = post_chat(router_for(gen.clone()), &body).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(v["error"]["type"], "invalid_request_error", "{body}");
+                assert_eq!(v["error"]["param"], param, "{body}");
+            }
+        }
+        let last = vocab - 1;
+        let body = format!(
+            r#"{{{base},"n":1.0,"logprobs":false,"top_logprobs":0,"min_p":0.1,
+                "logit_bias":{{"{last}":-100}}}}"#
+        );
+        let resp = post_chat(router_for(gen), &body).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{body}");
+    }
+
+    fn router_for(generator: Arc<dyn ChatGenerator>) -> Router {
+        build_router(AppState::new(
+            generator,
+            "m",
+            1,
+            Arc::new(Config::default()),
+        ))
+    }
+
+    /// A generator whose prompt was mostly served from the KV prefix cache: 20 prompt tokens, 19
+    /// of them cached, so only 1 was prefilled.
+    struct CachedPrefixGen;
+    impl ChatGenerator for CachedPrefixGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            on_delta(Delta::Content("ok".into()));
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 20,
+                completion_tokens: 1,
+                cached_tokens: 19,
+            })
+        }
+    }
+
+    /// B83: `usage.prompt_tokens` is the whole prompt and the cached part is reported under
+    /// `prompt_tokens_details.cached_tokens` — while the throughput counters still count only the
+    /// one token that was actually prefilled.
+    #[tokio::test]
+    async fn usage_counts_the_whole_prompt_and_reports_the_cached_part() {
+        let g: Arc<dyn ChatGenerator> = Arc::new(CachedPrefixGen);
+        let state = AppState::new(g, "m", 1, Arc::new(Config::default()));
+        let stats = state.stats.clone();
+        let resp = post_chat(
+            build_router(state),
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        let v = body_json(resp).await;
+        assert_eq!(v["usage"]["prompt_tokens"], 20);
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 19);
+        assert_eq!(v["usage"]["total_tokens"], 21);
+        let w = stats.drain(Duration::from_secs(1));
+        assert_eq!(w.prompt_tokens, 1, "only the prefilled token is throughput");
+    }
+
+    /// The SSE frames of a streamed response, `data:` payloads in order.
+    async fn sse_frames(resp: Response) -> Vec<String> {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: ").map(str::to_owned))
+            .collect()
+    }
+
+    /// B137: `stream_options.include_usage` ends the stream with one chunk carrying `usage` and an
+    /// empty `choices` array, after the finish chunk and before `[DONE]`. Without the option, no
+    /// chunk carries `usage`.
+    #[tokio::test]
+    async fn include_usage_ends_the_stream_with_a_usage_chunk() {
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true,
+                       "stream_options":{"include_usage":true}}"#;
+        let frames = sse_frames(post_chat(router_for(Arc::new(CachedPrefixGen)), body).await).await;
+        let n = frames.len();
+        assert!(n >= 3, "{frames:?}");
+        assert_eq!(frames[n - 1], "[DONE]");
+        let usage: serde_json::Value = serde_json::from_str(&frames[n - 2]).unwrap();
+        assert_eq!(usage["choices"], serde_json::json!([]), "{frames:?}");
+        assert_eq!(usage["usage"]["prompt_tokens"], 20);
+        assert_eq!(usage["usage"]["completion_tokens"], 1);
+        assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], 19);
+        let finish: serde_json::Value = serde_json::from_str(&frames[n - 3]).unwrap();
+        assert_eq!(finish["choices"][0]["finish_reason"], "stop", "{frames:?}");
+
+        let body = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+        let frames = sse_frames(post_chat(router_for(Arc::new(CachedPrefixGen)), body).await).await;
+        assert!(
+            frames.iter().all(|f| !f.contains("\"usage\"")),
+            "usage was not asked for: {frames:?}"
+        );
+    }
+
+    /// A generator whose prompt does not fit the context.
+    struct OverflowGen;
+    impl ChatGenerator for OverflowGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            _cancel: &Arc<AtomicBool>,
+            _on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            Err(ContextLengthExceeded {
+                message: "too long".into(),
+            }
+            .into())
+        }
+    }
+
+    /// B86: an over-long prompt is the client's to fix — `400 context_length_exceeded`, which
+    /// OpenAI clients act on, not the `500` they retry unchanged.
+    #[tokio::test]
+    async fn an_over_long_prompt_is_a_400_context_length_exceeded() {
+        let resp = post_chat(
+            router_for(Arc::new(OverflowGen)),
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let v = body_json(resp).await;
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["code"], "context_length_exceeded");
+        assert_eq!(v["error"]["param"], "messages");
+        assert_eq!(v["error"]["message"], "too long");
+    }
+
+    /// B86 on a stream: the `200` is already out, so the over-long prompt arrives as the terminal
+    /// error frame — carrying the same typed error as the non-streaming `400`, not a generic
+    /// `server_error` a client cannot tell from a crash — and `[DONE]` still closes the stream.
+    #[tokio::test]
+    async fn an_over_long_prompt_on_a_stream_is_a_typed_error_frame() {
+        let frames = sse_frames(
+            post_chat(
+                router_for(Arc::new(OverflowGen)),
+                r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            frames.last().map(String::as_str),
+            Some("[DONE]"),
+            "{frames:?}"
+        );
+        let err: serde_json::Value = frames
+            .iter()
+            .filter_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+            .find(|v| v.get("error").is_some())
+            .expect("an error frame");
+        assert_eq!(err["error"]["type"], "invalid_request_error");
+        assert_eq!(err["error"]["code"], "context_length_exceeded");
+        assert_eq!(err["error"]["param"], "messages");
+        assert_eq!(err["error"]["message"], "too long");
+    }
+
+    /// B86: a body over the size limit is `413` and a body without a JSON content type `415` — not
+    /// the `400` a malformed body gets — still in the OpenAI error envelope.
+    #[tokio::test]
+    async fn oversized_and_untyped_bodies_keep_their_status() {
+        let huge = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(3 << 20)
+        );
+        let resp = post_chat(router_for(Arc::new(EchoGen("a"))), &huge).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            body_json(resp).await["error"]["type"],
+            "invalid_request_error"
+        );
+
+        let resp = router_for(Arc::new(EchoGen("a")))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .body(Body::from(
+                        r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            body_json(resp).await["error"]["type"],
+            "invalid_request_error"
+        );
+
+        // Malformed JSON stays a 400.
+        let resp = post_chat(router_for(Arc::new(EchoGen("a"))), "{not json").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// B137: the bearer check runs on the headers, before the body is read. A client without a
+    /// token whose body never finishes arriving still gets its 401 at once.
+    #[tokio::test]
+    async fn the_bearer_check_does_not_wait_for_the_body() {
+        let mut cfg = Config::default();
+        cfg.serve.api_key = Some("s3cret".into());
+        let g: Arc<dyn ChatGenerator> = Arc::new(EchoGen("a"));
+        let router = build_router(AppState::new(g, "m", 1, Arc::new(cfg)));
+        let never = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();
+        let resp = tokio::time::timeout(
+            Duration::from_secs(2),
+            router.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from_stream(never))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("an unauthenticated request waited for its body")
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// B137: `-1` is the "unset" sentinel llama.cpp-style clients send for `seed` and `max_tokens`;
+    /// it is accepted as unset, and any other negative value is still refused.
+    #[tokio::test]
+    async fn minus_one_seed_and_max_tokens_mean_unset() {
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"seed":-1,"max_tokens":-1,"max_completion_tokens":-1}"#,
+        ))
+        .unwrap();
+        assert_eq!((p.seed, p.max_tokens), (None, None));
+        let p = GenParams::from_request(&req(
+            r#"{"model":"m","messages":[],"seed":18446744073709551615,"max_tokens":7}"#,
+        ))
+        .unwrap();
+        assert_eq!((p.seed, p.max_tokens), (Some(u64::MAX), Some(7)));
+        for bad in [
+            r#""seed":-2"#,
+            r#""max_tokens":-5"#,
+            r#""max_tokens":4294967296"#,
+        ] {
+            let raw = format!(r#"{{"model":"m","messages":[],{bad}}}"#);
+            assert!(serde_json::from_str::<ChatRequest>(&raw).is_err(), "{bad}");
+        }
+
+        let resp = post_chat(
+            router_for(Arc::new(EchoGen("a"))),
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"seed":-1,"max_tokens":-1}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Sits in a "prefill" that emits nothing, polling `cancel` the way a real prefill loop does,
+    /// and records whether the latch reached it. Bounded, so a broken hang-up path fails the test
+    /// instead of hanging it.
+    struct HangGen {
+        entered: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+    }
+    impl ChatGenerator for HangGen {
+        fn status(&self) -> GeneratorStatus {
+            cpu_status()
+        }
+
+        fn vocab_size(&self) -> usize {
+            TEST_VOCAB
+        }
+
+        fn chat(
+            &self,
+            _messages: &[ChatMessage],
+            _tools: Option<&serde_json::Value>,
+            _tool_choice: Option<&str>,
+            _params: &GenParams,
+            cancel: &Arc<AtomicBool>,
+            _on_delta: &mut dyn FnMut(Delta),
+        ) -> anyhow::Result<ChatOutcome> {
+            self.entered.store(true, Ordering::Relaxed);
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5) {
+                if cancel.load(Ordering::Relaxed) {
+                    self.cancelled.store(true, Ordering::Relaxed);
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Ok(ChatOutcome {
+                finish: Finish::Stop,
+                prompt_tokens: 1,
+                completion_tokens: 0,
+                cached_tokens: 0,
+            })
+        }
+    }
+
+    /// Wait (bounded) for `flag` to be set.
+    async fn eventually(flag: &AtomicBool, within: Duration) -> bool {
+        let started = Instant::now();
+        while !flag.load(Ordering::Relaxed) {
+            if started.elapsed() > within {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        true
+    }
+
+    /// Serve a [`HangGen`] on a real socket, send one chat request, hang up once the generation
+    /// is running, and report whether the hang-up reached the generator's `cancel` latch.
+    async fn hang_up_reaches_the_generator(stream: bool) -> bool {
+        use tokio::io::AsyncWriteExt;
+        let entered = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let g: Arc<dyn ChatGenerator> = Arc::new(HangGen {
+            entered: entered.clone(),
+            cancelled: cancelled.clone(),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = router_for(g);
+        let server = tokio::spawn(async move { axum::serve(listener, router).await });
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = format!(
+            r#"{{"model":"m","messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#
+        );
+        let head = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        sock.write_all(head.as_bytes()).await.unwrap();
+        sock.write_all(body.as_bytes()).await.unwrap();
+        assert!(
+            eventually(&entered, Duration::from_secs(2)).await,
+            "the generation never started"
+        );
+        drop(sock);
+        let reached = eventually(&cancelled, Duration::from_secs(2)).await;
+        server.abort();
+        reached
+    }
+
+    /// B85: a non-streaming client that hangs up mid-generation cancels it, so its slot is not
+    /// held to `max_tokens` for nobody.
+    #[tokio::test]
+    async fn a_non_streaming_hang_up_cancels_the_generation() {
+        assert!(hang_up_reaches_the_generator(false).await);
+    }
+
+    /// B85: a streaming client that hangs up while nothing is being sent — a long prefill — cancels
+    /// the generation at once, not at the next delta.
+    #[tokio::test]
+    async fn a_streaming_hang_up_during_prefill_cancels_the_generation() {
+        assert!(hang_up_reaches_the_generator(true).await);
     }
 }

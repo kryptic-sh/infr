@@ -6,8 +6,9 @@ use super::sc::{
     build_sc_embt, diffusion_self_cond, DenoiseCache, DenoiseReq, EbReduced, SelfCondWeights,
 };
 use super::weights::{
-    AttnW, DeltaW, Dsv4W, FfnW, HcTriple, IndexerW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW,
-    SeamKv, SeamWeights, SessionStable,
+    AttnW, BoundWeights, DeltaW, Dsv4CompW, Dsv4CompressorW, Dsv4IndexerW, Dsv4W, FfnW, HcTriple,
+    IndexerW, LayerHcW, LayerW, MixerW, MlaW, MoeSharedW, SeamKv, SeamWeights, SessionStable,
+    ShortConvW,
 };
 use super::{common_prefix_len, e2b_ipl_rows, kv_forces_static, BindWeight, WBytes};
 use crate::seam::TokenEmbd;
@@ -17,6 +18,7 @@ use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage};
 use infr_core::graph::{Activation, AttnMask, Graph, HyperGates, Op};
 use infr_core::tensor::{DType, TensorDesc, TensorId};
 use infr_core::WeightSource;
+use infr_gguf::Gguf;
 
 /// Combined gate+up FFN upload decision (one GEMV/GEMM + GatedActFused instead of two Linears +
 /// GatedAct). Requires the backend to opt in (`Capabilities::combined_gu` — Vulkan; the CPU keeps
@@ -28,12 +30,8 @@ use infr_core::WeightSource;
 /// `c.moe.is_none()`: a pure MoE arch has no `ffn_gate.weight` at all, so the `.all()` is false
 /// for it regardless; see the original comment block at the call site for the DiffusionGemma
 /// rationale.
-pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &dyn WeightSource, c: &Config) -> bool {
+pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &Gguf, c: &Config) -> bool {
     combined_gu
-        && !g
-            .as_any()
-            .downcast_ref::<crate::Exl3Source>()
-            .is_some_and(|source| source.is_native())
         && (0..c.n_layer).all(|l| {
             let dt = |s: &str| {
                 let name = format!("blk.{l}.{s}");
@@ -51,7 +49,7 @@ pub(crate) fn fuse_gu_decision(combined_gu: bool, g: &dyn WeightSource, c: &Conf
 /// for A/B. Shared with the seam's dense-streaming plan — see [`fuse_gu_decision`].
 pub(crate) fn fuse_qkv_decision(
     combined_gu: bool,
-    g: &dyn WeightSource,
+    g: &Gguf,
     c: &Config,
     ec: &EngineConfig,
 ) -> bool {
@@ -89,25 +87,6 @@ fn validate_token_ids(ids: &[u32], vocab: usize) -> AResult<()> {
     Ok(())
 }
 
-/// [`validate_token_ids`] for a prompt that may carry image placeholders: an id above the vocab is
-/// accepted ONLY where the current [`crate::media::EmbedOverride`] supplies that position's row
-/// (the runner never indexes the vocab there). Anything else is the same clean error.
-fn validate_prompt_ids(
-    ids: &[u32],
-    vocab: usize,
-    media: Option<&crate::media::EmbedOverride>,
-) -> AResult<()> {
-    let Some(media) = media else {
-        return validate_token_ids(ids, vocab);
-    };
-    for (pos, &t) in ids.iter().enumerate() {
-        if t as usize >= vocab && !(crate::media::is_media_id(t) && media.row(pos).is_some()) {
-            return Err(anyhow!("token id {t} out of range for vocab size {vocab}"));
-        }
-    }
-    Ok(())
-}
-
 /// Which prompt/generated tokens' KV rows are materialized (resident) after a generation turn —
 /// the token list recorded in `SeamKv::cached` for the next turn's prefix diff.
 ///
@@ -130,11 +109,12 @@ fn resident_after_gen(cur: &[u32], last_written: Option<usize>) -> Vec<u32> {
 }
 
 /// Bind the per-layer IO + weights shared by EVERY decode/prefill/verify/denoise execution: the
-/// gemma4 `rope_freqs` Input (when present), each layer's K/V cache pair, and the flat weight list
-/// (declaration == upload order). Extracted so the four bind sites (denoise, verify, record-once,
-/// per-token) can never drift — a forgotten bind here (e.g. `rope_freqs`) is a live unbound-Input
-/// panic at execute. The caller still binds the per-site pieces (hidden/tok_ids, positions,
-/// logits, sampling/h-tap/ipl/SC handles).
+/// `rope_freqs` Input (when present), each layer's K/V cache pair and V4 compressed-tier buffers,
+/// the graph's per-step i32 inputs (`step_bufs`, from [`upload_step_i32`]), and the flat weight
+/// list (declaration == upload order). Extracted so the bind sites (denoise, verify, record-once,
+/// per-token, prefill chunks) can never drift — a forgotten bind here (e.g. `rope_freqs`) is a live
+/// unbound-Input panic at execute. The caller still binds the per-site pieces (hidden/tok_ids,
+/// positions, logits, sampling/h-tap/ipl/SC handles).
 #[allow(clippy::type_complexity)]
 fn bind_layer_io<'a>(
     b: &mut Bindings<'a>,
@@ -142,14 +122,12 @@ fn bind_layer_io<'a>(
     n_layer: usize,
     rf_buf: &'a Option<(Box<dyn Buffer>, usize)>,
     yff_buf: &'a Option<(Box<dyn Buffer>, usize)>,
-    kbufs: &'a [std::sync::Arc<dyn Buffer>],
-    vbufs: &'a [std::sync::Arc<dyn Buffer>],
+    kbufs: &'a [Box<dyn Buffer>],
+    vbufs: &'a [Box<dyn Buffer>],
+    cbufs: &'a [Vec<Box<dyn Buffer>>],
+    step_bufs: &'a [Box<dyn Buffer>],
     wbufs: &'a [Box<dyn Buffer>],
-    page_table: Option<&'a dyn Buffer>,
 ) {
-    if let (Some(tid), Some(tb)) = (h.page_table, page_table) {
-        b.bind(tid, tb);
-    }
     if let (Some(rid), Some((rb, _))) = (h.rope_freqs, rf_buf) {
         b.bind(rid, rb.as_ref());
     }
@@ -158,7 +136,17 @@ fn bind_layer_io<'a>(
     }
     for l in 0..n_layer {
         b.bind(h.k_cache[l], kbufs[l].as_ref());
-        b.bind(h.v_cache[l], vbufs[l].as_ref());
+        // A layer whose V handle IS its K cache (deepseek4) has no V tensor to bind; binding the
+        // placeholder there would rebind the K cache to it.
+        if h.v_cache[l] != h.k_cache[l] {
+            b.bind(h.v_cache[l], vbufs[l].as_ref());
+        }
+        for (id, buf) in h.comp[l].iter().zip(&cbufs[l]) {
+            b.bind(*id, buf.as_ref());
+        }
+    }
+    for ((id, _), buf) in h.step_i32.iter().zip(step_bufs) {
+        b.bind(*id, buf.as_ref());
     }
     for (i, wid) in h.weights.iter().enumerate() {
         b.bind(*wid, wbufs[i].as_ref());
@@ -170,7 +158,7 @@ fn bind_layer_io<'a>(
 /// is stashed in `SeamKv` and reused via `Arc` on warm calls / forks) instead of every request.
 fn session_stable(
     be: &dyn Backend,
-    g: &dyn WeightSource,
+    g: &Gguf,
     c: &Config,
     ec: &EngineConfig,
 ) -> AResult<SessionStable> {
@@ -180,21 +168,13 @@ fn session_stable(
     let caps = be.capabilities();
     // Per-layer presence of an explicit V projection. gemma4 full-attention layers omit it (V = the
     // raw K projection); every layer of every other model has one.
-    let has = |suffix: &str| -> Vec<bool> {
-        (0..c.n_layer)
-            .map(|l| {
-                let name = format!("blk.{l}.{suffix}");
-                g.tensors().iter().any(|t| t.name == name)
-            })
-            .collect()
-    };
-    let has_wv = has("attn_v.weight");
-    let has_wk = has("attn_k.weight");
-    let has_k_norm = has("attn_k_norm.weight");
-    // NOTE: no hard error here for a KV-owning layer missing attn_k — MLA/DeltaNet
-    // layers legitimately lack it (compressed KV), and the per-layer loader below
-    // already skips the absent tensors. A file that is actually broken still fails
-    // loudly at graph build (the `aw.wk.expect(..)` on the K-projection Linear).
+    let has_wv: Vec<bool> = (0..c.n_layer)
+        .map(|l| {
+            g.tensors()
+                .iter()
+                .any(|t| t.name == format!("blk.{l}.attn_v.weight"))
+        })
+        .collect();
     // gemma4 per-layer output scale (`layer_output_scale.weight`, a single scalar multiplying the
     // layer output before the next layer). Read host-side; applied as an `Op::Scale`. diffusion-
     // gemma ships TWO per-layer scalars (encoder for the prompt, decoder for the canvas); Phase 1
@@ -234,11 +214,26 @@ fn session_stable(
             }
         })
         .collect();
-    // gemma4 proportional-RoPE frequency divisors (`rope_freqs.weight`, `[rope_dim/2]`): applied on
-    // full-attention layers only (SWA layers use plain RoPE). Bound as a per-step f32 Input.
+    // Per-pair rope frequency divisors (`rope_freqs.weight`, `[rope_dim/2]`) on the archs whose
+    // reference applies them (`Config::rope_freq_factors`): gemma4's proportional RoPE on its
+    // full-attention layers, and llama/llama4's llama3 long-context factors on every rope layer.
+    // Bound as a per-step f32 Input.
     let rope_freqs: Option<Vec<f32>> =
-        if c.gemma4 && g.tensors().iter().any(|t| t.name == "rope_freqs.weight") {
-            Some(crate::load_tensor_dequant(g, "rope_freqs.weight").map(|(v, _)| v)?)
+        if c.rope_freq_factors && g.tensors().iter().any(|t| t.name == "rope_freqs.weight") {
+            let (v, _) = crate::load_tensor_dequant(g, "rope_freqs.weight")?;
+            // Every rope kernel reads `ff[p]` for each of the `rope_dim/2` pairs, so a shorter
+            // tensor would be read past its end; llama.cpp's loader pins the same `{n_rot/2}`
+            // shape. gemma4 sizes its tensor by the full-attention head instead, which the
+            // QkNormRope path indexes on its own terms.
+            if !c.gemma4 && v.len() != c.rope_dim / 2 {
+                return Err(anyhow!(
+                    "rope_freqs.weight has {} elements; rope.dimension_count {} needs {}",
+                    v.len(),
+                    c.rope_dim,
+                    c.rope_dim / 2
+                ));
+            }
+            Some(v)
         } else {
             None
         };
@@ -251,27 +246,21 @@ fn session_stable(
     // this GGUF inflates to 163840. Bound as a per-step f32 Input exactly like `rope_freqs`.
     // `None` = plain rope (non-yarn models).
     let yarn_ff: Option<Vec<f32>> = if c.rope_scaling_yarn && c.qk_rope_dim > 0 {
-        let n_rot = c.qk_rope_dim as f32;
-        let n_ctx_orig = c.rope_scaling_orig_ctx as f32;
-        let freq_scale = 1.0 / c.rope_scaling_factor;
-        // corr_dim(n_rot): the dim below which the ramp is fully active — `ggml_rope_yarn_corr_dim`.
-        let corr = |nr: f32| {
-            n_rot * (n_ctx_orig / (nr * std::f32::consts::TAU)).ln() / (2.0 * c.rope_theta.ln())
-        };
-        // The two ramp corners are `beta_fast`/`beta_slow` (`ggml_rope_yarn_corr_dims`), read
-        // from the GGUF — V2-Lite happens to carry llama.cpp's own defaults.
-        let start = (corr(c.rope_yarn_beta_fast).floor() as i64).clamp(0, (n_rot as i64) - 1);
-        let end = (corr(c.rope_yarn_beta_slow).ceil() as i64).clamp(0, (n_rot as i64) - 1);
-        let span = ((end - start) as f32).max(0.001);
-        Some(
-            (0..(n_rot as usize / 2))
-                .map(|p| {
-                    let ramp = 1.0 - (((p as f32) - start as f32) / span).clamp(0.0, 1.0);
-                    let s = freq_scale + (1.0 - freq_scale) * ramp;
-                    1.0 / s
-                })
-                .collect(),
-        )
+        // The two ramp corners are `beta_fast`/`beta_slow` (`ggml_rope_yarn_corr_dims`), at
+        // llama.cpp's defaults whatever the GGUF declares (see `Config::rope_yarn_beta_fast`).
+        Some(crate::config::yarn_freq_divisors(
+            c.qk_rope_dim,
+            c.rope_theta,
+            c.rope_scaling_orig_ctx,
+            c.rope_scaling_factor,
+            c.rope_yarn_beta_fast,
+            c.rope_yarn_beta_slow,
+        ))
+    } else if c.deepseek4 && (0..c.n_layer).any(|l| c.layer_compress_ratio(l) != 0) {
+        // DeepSeek V4 has no `qk_rope_dim`; the same Input carries the divisors of every rope on
+        // its COMPRESSED layers (`Config::dsv4_compressed_rope_divisors`). Ratio-0 layers rope
+        // plain and never read it.
+        c.dsv4_compressed_rope_divisors()
     } else {
         None
     };
@@ -330,8 +319,6 @@ fn session_stable(
     };
     Ok(SessionStable {
         has_wv,
-        has_wk,
-        has_k_norm,
         out_scale,
         dec_out_scale,
         rope_freqs,
@@ -346,7 +333,7 @@ fn session_stable(
 pub(super) struct DecodeHandles {
     hidden: TensorId,
     positions: TensorId,
-    rope_freqs: Option<TensorId>, // gemma4 proportional-RoPE divisors (full-attention layers)
+    rope_freqs: Option<TensorId>, // rope frequency divisors (`Config::rope_freq_factors`)
     // DeepSeek V2+ YaRN per-pair frequency divisors (qk_rope_dim/2 floats): the graph Input the
     // driver binds `yff_buf` to (a per-step f32 Input like `rope_freqs`). `None` for non-yarn.
     yarn_ff: Option<TensorId>,
@@ -388,18 +375,143 @@ pub(super) struct DecodeHandles {
     tok_id: Option<TensorId>,
     k_cache: Vec<TensorId>,
     v_cache: Vec<TensorId>,
-    /// A paged session's page table (`kv.paged`): bound once per plan, read by every pooled
-    /// layer's replayed attention and store kernels.
-    page_table: Option<TensorId>,
+    // DeepSeek V4: each layer's compressed-tier buffer Inputs, bound to `SeamKv::cbufs[l]` in
+    // `crate::seam::dsv4_comp_bufs` order; empty for every other layer.
+    comp: Vec<Vec<TensorId>>,
+    // DeepSeek V4 built as a PARTIAL layer span (a layer-major prefill): the `[batch, hc_mult *
+    // n_embd]` widened residual stream, carried between spans in a caller-owned buffer the ops
+    // advance in place. `None` for every whole-model build, where it is graph scratch.
+    hc_resid: Option<TensorId>,
+    // Per-step i32 Inputs whose values the build computed from this graph's positions (V4's
+    // compressor plan: APE row ids, gather indices, block rope positions), with those values. The
+    // driver uploads each into a buffer of its own and binds it (`upload_step_i32`).
+    step_i32: Vec<(TensorId, Vec<i32>)>,
     weights: Vec<TensorId>, // flat, in declaration == upload order
 }
 
+/// Upload each of `h.step_i32`'s values into a buffer of its own, in the same order, for
+/// [`bind_layer_io`] to bind. Empty, and free, for every graph without such inputs.
+fn upload_step_i32(be: &dyn Backend, h: &DecodeHandles) -> AResult<Vec<Box<dyn Buffer>>> {
+    h.step_i32
+        .iter()
+        .map(|(_, v)| {
+            let b = be
+                .alloc(v.len() * 4, BufferUsage::Staging)
+                .map_err(|e| anyhow!("{e}"))?;
+            be.upload(b.as_ref(), bytemuck::cast_slice(v))
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(b)
+        })
+        .collect()
+}
+
+/// Zero every recurrent layer's state (`Config::recurrent_state_elems`) in `kbufs`/`vbufs` and
+/// every V4 compressor state ring in `cbufs`, the start a turn that cannot reuse the state
+/// prefills from (`Config::has_unrewindable_state`).
+///
+/// A V4 compressed cache is left as it is, because of the invariant the no-rewind rule keeps:
+/// every ring row and compressed row a graph reads was written since the last reset, by the one
+/// contiguous sequence `cached` describes (an extending turn reads the rows earlier turns of that
+/// sequence wrote; every other turn resets first). Within that sequence a compressed row is read
+/// only once its block is committed — the segment's `len` is the graph's widest visible count and
+/// the attention masks each query row to its own `(pos+1)/ratio` — and a block pools only the
+/// positions from its first to the one that completes it, every one written earlier in the
+/// sequence (through the ring) or by this graph (its own rows). A position below 0 is not read
+/// from any buffer: HCA reads none, and the overlapping CSA and LID compressors read block 0's
+/// previous window as the sentinel, which `Op::GatherRows` writes from its fill (value 0, score
+/// `-inf`) for a negative index, so no ring row stands in for it. Zeroing a cache would cost a
+/// context-sized upload for nothing; zeroing the rings is cheap and makes a reset session's state
+/// equal a fresh one's.
+fn zero_unrewindable_state(
+    be: &dyn Backend,
+    c: &Config,
+    max_ctx: usize,
+    k_fmt: DType,
+    kbufs: &[Box<dyn Buffer>],
+    vbufs: &[Box<dyn Buffer>],
+    cbufs: &[Vec<Box<dyn Buffer>>],
+) -> AResult<()> {
+    for l in 0..c.n_layer {
+        let geometry = crate::seam::dsv4_comp_bufs(c, l, max_ctx, k_fmt);
+        for (b, buf) in geometry.iter().zip(&cbufs[l]).filter(|(b, _)| b.ring) {
+            be.upload(buf.as_ref(), bytemuck::cast_slice(&vec![0f32; b.elems]))
+                .map_err(|e| anyhow!("{e}"))?;
+        }
+        if let Some((k_elems, v_elems)) = c.recurrent_state_elems(l) {
+            be.upload(
+                kbufs[l].as_ref(),
+                bytemuck::cast_slice(&vec![0f32; k_elems]),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+            be.upload(
+                vbufs[l].as_ref(),
+                bytemuck::cast_slice(&vec![0f32; v_elems]),
+            )
+            .map_err(|e| anyhow!("{e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// [`generate_dense_backend_bound`] with nothing bound yet: a cold `state` binds every weight
+/// through `bind_weight`.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 pub(crate) fn generate_dense_backend(
     be: &dyn Backend,
     bind_weight: &BindWeight,
-    g: &dyn WeightSource,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    max_new: usize,
+    on_token: impl FnMut(u32),
+    state: &mut Option<SeamKv>,
+    want_ctx: usize,
+    constraint: Option<&mut crate::grammar::Constraint>,
+    verify: Option<&mut Vec<f32>>,
+    verify_ids: Option<&mut Vec<u32>>,
+    logits_out: Option<&mut Vec<f32>>,
+    h_out: Option<&mut Vec<f32>>,
+    denoise_req: Option<DenoiseReq>,
+    req: Option<&crate::sampling::RequestCtx>,
+) -> AResult<(Vec<u32>, GenStats)> {
+    generate_dense_backend_bound(
+        None,
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        max_new,
+        on_token,
+        state,
+        want_ctx,
+        constraint,
+        verify,
+        verify_ids,
+        logits_out,
+        h_out,
+        denoise_req,
+        req,
+    )
+}
+
+/// The dense forward. `prebound`, when given, is what an earlier call on this same `be` bound (see
+/// [`BoundWeights`]): a cold `state` then takes those weights and session-stable derivations
+/// instead of binding and deriving its own, and allocates only its KV and IO buffers.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn generate_dense_backend_bound(
+    prebound: Option<&BoundWeights>,
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
     cfg: &Config,
     // The ENGINE configuration this whole forward reads its knobs from — `kv.*`, `spec.*`,
     // `sampling.*`, `device.ubatch*`, `kernels.{qkv_fuse,gated_rmsnorm}` and the `prof.*`
@@ -453,10 +565,6 @@ pub(crate) fn generate_dense_backend(
     req: Option<&crate::sampling::RequestCtx>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
-    // Qwen4-Exp must never silently take the qwen35 forward: that would ignore its HC
-    // residual streams, n-gram embeddings, indexed mask and different GDN output gate.
-    // Refuse before session derivation, binding weights, or allocating recurrent/KV state.
-    crate::qwen4_exp::ensure_forward_supported(c)?;
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
     // struct with a heap `String name`) and read fields off the cached copy below.
     let caps = be.capabilities();
@@ -496,15 +604,14 @@ pub(crate) fn generate_dense_backend(
     // on every warm call / fork instead of re-running the O(n_layer × n_tensors) scans + the
     // gemma4/diffusion `load_tensor_dequant`s per request. `has_wv`/`out_scale`/`dec_out_scale`/
     // `rope_freqs`/`fuse_gu`/`fuse_qkv`/`moe_batched_ok` all live here — see `SessionStable`.
-    let stable: std::sync::Arc<SessionStable> = match state.as_ref() {
-        Some(kv) => std::sync::Arc::clone(&kv.stable),
-        None => std::sync::Arc::new(session_stable(be, g, c, ec)?),
+    let stable: std::sync::Arc<SessionStable> = match (state.as_ref(), prebound) {
+        (Some(kv), _) => std::sync::Arc::clone(&kv.stable),
+        (None, Some(b)) => std::sync::Arc::clone(&b.stable),
+        (None, None) => std::sync::Arc::new(session_stable(be, g, c, ec)?),
     };
     // Local views into the session-stable derivations (the code below reads these under their
     // original names; `rope_freqs` is read directly as `stable.rope_freqs` at its two sites).
     let has_wv = &stable.has_wv;
-    let has_wk = &stable.has_wk;
-    let has_k_norm = &stable.has_k_norm;
     let out_scale = &stable.out_scale;
     let dec_out_scale = &stable.dec_out_scale;
     let fuse_gu = stable.fuse_gu;
@@ -518,6 +625,9 @@ pub(crate) fn generate_dense_backend(
     // store). `kernels.gated_rmsnorm` (`INFR_NO_GATED_RMSNORM`, inverted) forces the split form
     // for A/B (default = fuse).
     let fuse_gated_rmsnorm = caps.gated_rmsnorm && ec.kernels.gated_rmsnorm;
+    // `INFR_DELTA_STRIDED` (an experimental Vulkan decode knob) only where the backend reads the
+    // strided q/k/v it asks for.
+    let delta_strided_ok = ec.kernels.vulkan.delta_strided && be.deltanet_strided();
 
     // GPU embed gather (Op::EmbedGather, task #28): the host feeds token IDS (4 bytes each) and
     // the device gathers+dequantizes the embedding rows from the resident quantized table —
@@ -526,8 +636,7 @@ pub(crate) fn generate_dense_backend(
     // reuse the already-uploaded lm_head buffer (same tensor); untied models upload token_embd
     // once more (extra VRAM = its on-disk size). INFR_NO_GPU_EMBED forces the host path (A/B).
     let untied_lm = g.tensors().iter().any(|t| t.name == "output.weight");
-    let gpu_embed = g.tensor_rows("token_embd.weight", &[])?.is_none()
-        && caps.embed_gather
+    let gpu_embed = caps.embed_gather
         && c.n_embd.is_multiple_of(32)
         && g.tensors()
             .iter()
@@ -550,11 +659,6 @@ pub(crate) fn generate_dense_backend(
             .iter()
             .find(|t| t.name == "per_layer_token_embd.weight")
             .is_some_and(|t| infr_vulkan::linear::embed_gather_supported(t.dtype));
-    // Image soft tokens for this prompt (`crate::media`): rows that REPLACE the token embedding at
-    // the image's placeholder positions. Prefill chunks that contain any take the host-embed path
-    // (the in-graph gather has nothing to gather them from); every other chunk and the decode keep
-    // whatever embed path was chosen above.
-    let media = crate::media::current_override();
 
     // KV cache dtype, chosen PER-SIDE (K and V independent, like llama's --cache-type-k /
     // --cache-type-v). Q8_0 stores 34 bytes / 32 elems — half the f16 footprint and bandwidth.
@@ -576,13 +680,15 @@ pub(crate) fn generate_dense_backend(
     let kv_align_ok = crate::seam::kv_row_align_ok(c);
     let kv_q8_backend = matches!(be.name(), "metal" | "cpu" | "vulkan");
     // TurboQuant (turbo2/3/4): CPU + Vulkan + Metal (both GPUs use a dequant→f16 prepass); needs
-    // head_dim % 128 (a WHT group is a 128-elem head_dim slice).
-    let kv_turbo_ok = matches!(be.name(), "cpu" | "vulkan" | "metal")
-        && (0..c.n_layer).all(|l| c.layer_head_dim(l).is_multiple_of(128));
+    // whole 128-element WHT groups in every cache row (`crate::seam::kv_turbo_align_ok`).
+    let kv_turbo_ok =
+        matches!(be.name(), "cpu" | "vulkan" | "metal") && crate::seam::kv_turbo_align_ok(c);
     // Mainline low-bit block quants (q4_0/…/iq4_nl): CPU + Vulkan + Metal; need 32-block alignment.
     let blk_ok = matches!(be.name(), "cpu" | "vulkan" | "metal") && kv_align_ok;
-    // Dense f32/bf16 KV: CPU + Vulkan + Metal. Vulkan/Metal store dense; f32 reads natively (its
-    // own f32 attention), bf16 reads via a cast→f16 prepass.
+    // Dense f32/bf16 KV: CPU + Vulkan + Metal. Metal reads f32 natively (see the mixed-format clamp
+    // below). Vulkan reads both through a prepass into an f16 scratch for its f16 attention (f32
+    // via the `store_f16` cast, bf16 via `dequant_kv_f16`), so there an f32 cache yields the f16
+    // cache's numerics.
     let dense_ok = matches!(be.name(), "cpu" | "vulkan" | "metal");
     // The requested format's NAME is parsed by the shared grammar (`infr_core::budget`, the same
     // table the placement estimator prices with); only the per-format CAPABILITY gates below are
@@ -618,7 +724,9 @@ pub(crate) fn generate_dense_backend(
         }
     };
     let mut k_fmt = parse_kv_fmt(ec.kv.type_k);
-    let mut v_fmt = parse_kv_fmt(ec.kv.type_v);
+    // deepseek4 has no V cache, so its V format follows K before anything below reads it (the
+    // ring gate, Metal's clamp, the allocation): `crate::seam::kv_v_follows_k`.
+    let mut v_fmt = crate::seam::kv_v_fmt(c, k_fmt, parse_kv_fmt(ec.kv.type_v));
     // Metal's Q8 and F32 KV use native-read attention that reads BOTH sides as one dtype, so a
     // mixed request with q8/f32 on one side would misread the other — clamp those to coupled f16.
     // The prepass formats (block quants / bf16 / turbo) expand each side to its own f16 scratch, so
@@ -636,7 +744,7 @@ pub(crate) fn generate_dense_backend(
     (k_fmt, v_fmt) = crate::seam::mla_kv_fmt(c, be.name(), ec, k_fmt, v_fmt)?;
 
     // SWA ring KV: window layers allocate `min(want_ctx, window + ubatch)` rows and the backend
-    // writes/reads position p at row `p % rows` (see `crate::seam::kv_rows` for the sizing and
+    // writes/reads position p at row `p % rows` (see `crate::seam::kv_rows_at` for the sizing and
     // the correctness argument, and `kv_ring_wanted` for the model/env gates). Requires the
     // backend's ring semantics (Vulkan + CPU; Metal indexes rows by position) and f16/q8 caches
     // on BOTH sides (the prepass formats keep full-context caches — documented scope gate).
@@ -647,6 +755,25 @@ pub(crate) fn generate_dense_backend(
         && crate::seam::kv_ring_wanted(c, ec)
         && matches!(k_fmt, DType::F16 | DType::Q8_0)
         && matches!(v_fmt, DType::F16 | DType::Q8_0);
+
+    // DeepSeek V4's compressed tiers on a GPU backend. Their graph (`Op::GatherRows`,
+    // `Op::CompressPool`, the compressor ring persisted through `Op::Copy` into an f32 Input, the
+    // two-segment `Op::Attention`) is checked against llama.cpp on the CPU interpreter only; no GPU
+    // backend has run it (plan 09 slice S9). Refused before the weight upload and the cache
+    // allocation, unlike the tier refusals below, which sit after the upload on purpose so that
+    // every tensor of a V4 file is validated first; this one does not depend on the tensors.
+    if c.deepseek4 && be.name() != "cpu" {
+        if let Some(l) = (0..c.n_layer).find(|&l| c.layer_compress_ratio(l) != 0) {
+            return Err(anyhow!(
+                "arch=deepseek4 (DeepSeek V4) layer {l} has compress_ratio {}: the compressed \
+                 tiers run on the CPU backend only so far, and this is the {} backend. Select the \
+                 CPU backend with `--dev cpu`, `INFR_DEV=cpu`, or `dev = \"cpu\"` under \
+                 `[device]` in the config file. See docs/deepseek.md § Stage 4.",
+                c.layer_compress_ratio(l),
+                be.name()
+            ));
+        }
+    }
 
     // ── one-time session init: weights, KV cache, per-step IO (skipped when `state` is warm) ──
     if state.is_none() {
@@ -659,250 +786,176 @@ pub(crate) fn generate_dense_backend(
         // (CPU/Vulkan/Metal × one-shot/session/bench/serve) goes through — so no entry point can
         // load without it. The ticking lives in each backend's `alloc` (Weights/HostWeights);
         // backends without a display return a no-op scope. Guard drops when the init block ends.
-        let fp = crate::weights::weight_footprint(g);
-        let _weight_pb = be.weight_progress(Some(fp.dense + fp.expert));
-        // ── upload weights in their NATIVE GGUF dtype (no host pre-dequant — the backend dequants
-        //    lazily in `bytes_to_f32`, so a quant weight occupies ~quant size, not 8× f32). `wspecs`
-        //    records each (dtype, numel) so `build` can declare the handle with the matching dtype; its
-        //    order MUST equal the `g.weight()` order in `build` below. ──────────────────────────────────
-        let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
-        let mut wspecs: Vec<(DType, usize)> = Vec::new();
-        let mut exl3_specs = std::collections::HashMap::new();
-        let mut layer_has_epb = vec![false; c.n_layer];
-        // Load one weight (zero-copy mmap slice — no alloc, no memcpy) or CONCATENATE several into
-        // one owned buffer (the combined gate+up upload; same dtype, row-major concat of [nff, ne]
-        // tensors = a valid [k*nff, ne] tensor). Records the native dtype + element count so
-        // `build` declares the handle to match.
-        // NEOX→NORM row permute (qwen2, `Config::permute_qk_neox`): qwen2's GGUF keeps attn_q/attn_k
-        // in the HF rotate-half order (the converter only permutes llama-arch), but the no-qknorm
-        // path's `Op::Rope` is the INTERLEAVED rotation. Reordering each head's rows at load —
-        // new[2p] = old[p], new[2p+1] = old[p + rd/2], dims past rope_dim pass through — makes NORM
-        // rope over the permuted projections equal NEOX over the originals (llama.cpp's convert-time
-        // permute), with no kernel variant on any backend. Row reorder is quant-block-safe (blocks
-        // run along the input dim, whole rows move). Returns the head count for a q/k tensor, or
-        // None (no permute).
-        let qk_perm_heads = |name: &str| -> Option<usize> {
-            if !c.permute_qk_neox {
-                return None;
-            }
-            if name.ends_with("attn_q.weight") || name.ends_with("attn_q.bias") {
-                Some(c.n_head)
-            } else if name.ends_with("attn_k.weight") || name.ends_with("attn_k.bias") {
-                Some(c.n_kv)
-            } else {
-                None
-            }
-        };
-        let permute_rows = |src: &[u8], heads: usize, row_b: usize| -> Vec<u8> {
-            let (hd, rd) = (c.head_dim, c.rope_dim);
-            let mut out = vec![0u8; src.len()];
-            for h in 0..heads {
-                for j in 0..hd {
-                    let sj = if j < rd {
-                        if j % 2 == 0 {
-                            j / 2
+        let _weight_pb = prebound.is_none().then(|| {
+            let fp = crate::weights::weight_footprint(g);
+            be.weight_progress(Some(fp.dense + fp.expert))
+        });
+        // `None` when `prebound` carries this backend's weights from an earlier call: nothing is
+        // loaded or bound, and the `SeamWeights` below is that call's.
+        let fresh = if prebound.is_some() {
+            None
+        } else {
+            // ── upload weights in their NATIVE GGUF dtype (no host pre-dequant — the backend dequants
+            //    lazily in `bytes_to_f32`, so a quant weight occupies ~quant size, not 8× f32). `wspecs`
+            //    records each (dtype, numel) so `build` can declare the handle with the matching dtype; its
+            //    order MUST equal the `g.weight()` order in `build` below. ──────────────────────────────────
+            let mut wbufs: Vec<Box<dyn Buffer>> = Vec::new();
+            let mut wspecs: Vec<(DType, usize)> = Vec::new();
+            let mut layer_has_epb = vec![false; c.n_layer];
+            // Load one weight (zero-copy mmap slice — no alloc, no memcpy) or CONCATENATE several into
+            // one owned buffer (the combined gate+up upload; same dtype, row-major concat of [nff, ne]
+            // tensors = a valid [k*nff, ne] tensor). Records the native dtype + element count so
+            // `build` declares the handle to match.
+            // NEOX→NORM row permute (qwen2, `Config::permute_qk_neox`): qwen2's GGUF keeps attn_q/attn_k
+            // in the HF rotate-half order (the converter only permutes llama-arch), but the no-qknorm
+            // path's `Op::Rope` is the INTERLEAVED rotation. Reordering each head's rows at load —
+            // new[2p] = old[p], new[2p+1] = old[p + rd/2], dims past rope_dim pass through — makes NORM
+            // rope over the permuted projections equal NEOX over the originals (llama.cpp's convert-time
+            // permute), with no kernel variant on any backend. Row reorder is quant-block-safe (blocks
+            // run along the input dim, whole rows move). Returns the head count for a q/k tensor, or
+            // None (no permute).
+            let qk_perm_heads = |name: &str| -> Option<usize> {
+                if !c.permute_qk_neox {
+                    return None;
+                }
+                if name.ends_with("attn_q.weight") || name.ends_with("attn_q.bias") {
+                    Some(c.n_head)
+                } else if name.ends_with("attn_k.weight") || name.ends_with("attn_k.bias") {
+                    Some(c.n_kv)
+                } else {
+                    None
+                }
+            };
+            let permute_rows = |src: &[u8], heads: usize, row_b: usize| -> Vec<u8> {
+                let (hd, rd) = (c.head_dim, c.rope_dim);
+                let mut out = vec![0u8; src.len()];
+                for h in 0..heads {
+                    for j in 0..hd {
+                        let sj = if j < rd {
+                            if j % 2 == 0 {
+                                j / 2
+                            } else {
+                                j / 2 + rd / 2
+                            }
                         } else {
-                            j / 2 + rd / 2
-                        }
-                    } else {
-                        j
-                    };
-                    let (d, s) = ((h * hd + j) * row_b, (h * hd + sj) * row_b);
-                    out[d..d + row_b].copy_from_slice(&src[s..s + row_b]);
-                }
-            }
-            out
-        };
-        let mut wload = |names: &[&str]| -> AResult<()> {
-            anyhow::ensure!(!names.is_empty(), "weight load requires a tensor name");
-            if let Some(source) = g.as_any().downcast_ref::<crate::Exl3Source>() {
-                if names.iter().any(|name| source.native_spec(name).is_some()) {
-                    anyhow::ensure!(
-                        names.len() == 1,
-                        "exl3: compressed projections cannot be concatenated"
-                    );
-                    let mut spec = source
-                        .native_spec(names[0])
-                        .expect("native projection checked");
-                    if let Some(heads) = qk_perm_heads(names[0]) {
-                        spec.output_layout = infr_core::Exl3OutputLayout::RopeInterleaved {
-                            heads: u32::try_from(heads)?,
-                            head_dim: u32::try_from(c.head_dim)?,
-                            rotary_dim: u32::try_from(c.rope_dim)?,
+                            j
                         };
+                        let (d, s) = ((h * hd + j) * row_b, (h * hd + sj) * row_b);
+                        out[d..d + row_b].copy_from_slice(&src[s..s + row_b]);
                     }
-                    spec.trellis_bytes()?;
-                    exl3_specs.insert(wspecs.len(), spec);
-                    for name in [
-                        names[0].to_owned(),
-                        format!("{}.suh", names[0]),
-                        format!("{}.svh", names[0]),
-                    ] {
-                        let info = g
-                            .tensors()
-                            .iter()
-                            .find(|info| info.name == name)
-                            .ok_or_else(|| anyhow!("exl3: missing native component {name}"))?;
-                        let numel = info.shape.iter().product();
-                        let bytes = g.tensor_bytes(&name)?.to_vec();
-                        let (buf, dt) =
-                            bind_weight(&name, WBytes::Owned(bytes), info.dtype, numel)?;
-                        anyhow::ensure!(
-                            dt == info.dtype,
-                            "exl3: native component dtype was converted"
-                        );
-                        wbufs.push(buf);
-                        wspecs.push((dt, numel));
-                    }
-                    return Ok(());
                 }
-            }
-            let info = |name: &str| {
-                g.tensors()
-                    .iter()
-                    .find(|t| t.name == name)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("tensor not found: {name}"))
+                out
             };
-            // GGUF keeps its zero-copy views and file ranges through the shared loader trait.
-            let gguf: Option<&infr_gguf::Gguf> = g.as_any().downcast_ref::<infr_gguf::Gguf>();
-            // Bias permutation rows contain one scalar; weight rows contain n_embd scalars.
-            let row_bytes = |name: &str, dt: DType| -> usize {
-                if name.ends_with(".bias") {
-                    infr_gguf::nbytes(dt, 1)
-                } else {
-                    infr_gguf::nbytes(dt, c.n_embd)
-                }
-            };
-            // Fresh EXL3 folds bypass the borrow cache, avoiding a second full-model copy.
-            let get_arc = |name: &str| -> AResult<WBytes> {
-                match gguf {
-                    Some(g) => Ok(WBytes::Mmap(
-                        g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?,
-                    )),
-                    None => match g
-                        .as_any()
-                        .downcast_ref::<crate::Exl3Source>()
-                        .and_then(|ex| ex.take_fold(name).transpose())
-                    {
-                        Some(fold) => Ok(WBytes::Owned(fold?)),
-                        None => Ok(WBytes::Owned(
-                            g.tensor_bytes(name).map_err(|e| anyhow!("{e}"))?.to_vec(),
-                        )),
-                    },
-                }
-            };
-            let (bytes, dt, numel) = if info(names[0])?.dtype == DType::I2S {
-                // BitNet i2_s carries a per-TENSOR trailing f32 scale and an interleaved 128-group
-                // packing (see `DType::I2S`) — neither composes with the per-row weight streaming
-                // the seam does (permute_rows / row_bytes / the CPU Op::Linear all assume one quant
-                // block per weight row, and the GPU has no i2_s kernel). Host-dequant to f16 ONCE
-                // here; every downstream stage then treats it as a plain f16 weight. The f16
-                // footprint (numel*2) is exactly what `weights::tensor_resident_bytes` already
-                // prices for a non-`native_dense_supported` dtype, so the VRAM budget stays honest.
-                let mut cat: Vec<u8> = Vec::new();
-                let mut numel = 0usize;
-                for name in names {
-                    let i = info(name)?;
-                    if i.dtype != DType::I2S {
-                        return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
-                    }
-                    numel += i.shape.iter().product::<usize>();
-                    // I2S packing is a GGUF-only format.
-                    let gg = gguf.ok_or_else(|| anyhow!("I2S host-dequant needs GGUF"))?;
-                    let tb = gg.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-                    let f32v = crate::dequant_block(DType::I2S, &tb).map_err(|e| anyhow!("{e}"))?;
-                    let f16: Vec<u8> = f32v
+            let mut wload = |names: &[&str]| -> AResult<()> {
+                // Found AND the shape the graph will index it as: a mismatch is refused here, naming
+                // both shapes, rather than read out of bounds by the first forward pass.
+                let info = |name: &str| {
+                    let t = g
+                        .tensors()
                         .iter()
-                        .flat_map(|&x| infr_gguf::dequant::f32_to_f16_sat(x).to_le_bytes())
-                        .collect();
-                    match qk_perm_heads(name) {
-                        Some(heads) => cat.extend_from_slice(&permute_rows(
-                            &f16,
-                            heads,
-                            row_bytes(name, DType::F16),
-                        )),
-                        None => cat.extend_from_slice(&f16),
+                        .find(|t| t.name == name)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("tensor not found: {name}"))?;
+                    super::wshape::check_weight_shape(c, name, &t.shape)?;
+                    Ok::<_, anyhow::Error>(t)
+                };
+                // Bytes-per-row for the permute: a weight row is `n_embd` elements of the tensor's
+                // dtype (block-aligned); a bias "row" is one f32.
+                let row_bytes = |name: &str, dt: DType| -> usize {
+                    if name.ends_with(".bias") {
+                        4
+                    } else {
+                        infr_gguf::nbytes(dt, c.n_embd)
                     }
-                }
-                (WBytes::Owned(cat), DType::F16, numel)
-            } else if let [name] = names {
-                let i = info(name)?;
-                // MLA absorbed-form weights: the `mla` kernels (Vulkan/Metal) read wk_b/wv_b as
-                // PLAIN f32, but GGUFs carry them quantized (Q5_0/Q4K on V2-Lite). Host-dequant to
-                // f32 ONCE here — the same reason the I2S branch above dequants to f16 (no native
-                // dequant kernel). Without this the kernel indexes ~1M floats into a ~1/5-size
-                // quantized buffer → OOB GPU fault → device lost.
-                if c.deepseek2
-                    && (name.ends_with("attn_k_b.weight") || name.ends_with("attn_v_b.weight"))
-                {
-                    let gg = gguf.ok_or_else(|| anyhow!("absorbed MLA needs GGUF"))?;
-                    let tb = gg.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
-                    let numel = i.shape.iter().product();
-                    let f32v = crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
-                    let bytes: Vec<u8> = f32v.iter().flat_map(|&x| x.to_le_bytes()).collect();
-                    (WBytes::Owned(bytes), DType::F32, numel)
-                } else {
-                    let numel = i.shape.iter().product();
-                    match (get_arc(name)?, qk_perm_heads(name)) {
-                        (WBytes::Mmap(tb), None) => (WBytes::Mmap(tb), i.dtype, numel),
-                        (WBytes::Mmap(tb), Some(heads)) => {
-                            let rb = row_bytes(name, i.dtype);
-                            (WBytes::Owned(permute_rows(&tb, heads, rb)), i.dtype, numel)
-                        }
-                        (WBytes::Owned(b), None) => (WBytes::Owned(b), i.dtype, numel),
-                        (WBytes::Owned(b), Some(heads)) => {
-                            let rb = row_bytes(name, i.dtype);
-                            (WBytes::Owned(permute_rows(&b, heads, rb)), i.dtype, numel)
-                        }
-                        (WBytes::Concat(_), _) => {
-                            return Err(anyhow!("get_arc never returns Concat"));
-                        }
-                    }
-                }
-            } else {
-                // A fused group (qkv, gate+up). Its components are handed over as VIEWS, not as a
-                // concatenated buffer: a binder that pages or streams the group registers their
-                // file ranges and never wants the bytes, and materializing here would build — and
-                // fault in — a multi-MB copy per group only to drop it. `WBytes::materialize` joins
-                // them for the binders that do read bytes.
-                //
-                // A permuted component (qwen2 q/k) is a load-time REWRITE with no on-disk form, so
-                // any group containing one falls back to the owned concat.
-                let mut parts = Vec::with_capacity(names.len());
-                let mut numel = 0usize;
-                let mut permuted = false;
-                let dt = info(names[0])?.dtype;
-                // Sources without file ranges cannot page a fused group.
-                if gguf.is_none() {
-                    let mut cat = Vec::new();
+                };
+                let (bytes, dt, numel) = if info(names[0])?.dtype == DType::I2S {
+                    // BitNet i2_s carries a per-TENSOR trailing f32 scale and an interleaved 128-group
+                    // packing (see `DType::I2S`) — neither composes with the per-row weight streaming
+                    // the seam does (permute_rows / row_bytes / the CPU Op::Linear all assume one quant
+                    // block per weight row, and the GPU has no i2_s kernel). Host-dequant to f16 ONCE
+                    // here; every downstream stage then treats it as a plain f16 weight. The f16
+                    // footprint (numel*2) is exactly what `weights::tensor_resident_bytes` prices
+                    // for `I2S`, so the VRAM budget stays honest.
+                    let mut cat: Vec<u8> = Vec::new();
+                    let mut numel = 0usize;
                     for name in names {
                         let i = info(name)?;
-                        if i.dtype != dt {
+                        if i.dtype != DType::I2S {
                             return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
                         }
                         numel += i.shape.iter().product::<usize>();
-                        let bytes = get_arc(name)?;
-                        let b = bytes.materialize();
+                        let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                        let f32v =
+                            crate::dequant_block(DType::I2S, &tb).map_err(|e| anyhow!("{e}"))?;
+                        let f16: Vec<u8> = f32v
+                            .iter()
+                            .flat_map(|&x| infr_gguf::dequant::f32_to_f16_sat(x).to_le_bytes())
+                            .collect();
+                        match qk_perm_heads(name) {
+                            Some(heads) => cat.extend_from_slice(&permute_rows(
+                                &f16,
+                                heads,
+                                row_bytes(name, DType::F16),
+                            )),
+                            None => cat.extend_from_slice(&f16),
+                        }
+                    }
+                    (WBytes::Owned(cat), DType::F16, numel)
+                } else if let [name] = names {
+                    let i = info(name)?;
+                    // MLA absorbed-form weights: the `mla` kernels (Vulkan/Metal) read wk_b/wv_b as
+                    // PLAIN f32, but GGUFs carry them quantized (Q5_0/Q4K on V2-Lite). Host-dequant to
+                    // f32 ONCE here — the same reason the I2S branch above dequants to f16 (no native
+                    // dequant kernel). Without this the kernel indexes ~1M floats into a ~1/5-size
+                    // quantized buffer → OOB GPU fault → device lost.
+                    // The depthwise conv kernels (qwen35's `ssm_conv1d`, LFM's `shortconv.conv`) are
+                    // read as plain f32 by every GPU conv shader too, so a file that stores one in
+                    // f16 or bf16 is widened here the same way.
+                    let f32_conv = i.dtype != DType::F32
+                        && (name.ends_with("ssm_conv1d.weight")
+                            || name.ends_with("shortconv.conv.weight"));
+                    if f32_conv
+                        || c.deepseek2
+                            && (name.ends_with("attn_k_b.weight")
+                                || name.ends_with("attn_v_b.weight"))
+                    {
+                        let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                        let numel = i.shape.iter().product();
+                        let f32v =
+                            crate::dequant_block(i.dtype, &tb).map_err(|e| anyhow!("{e}"))?;
+                        let bytes: Vec<u8> = f32v.iter().flat_map(|&x| x.to_le_bytes()).collect();
+                        (WBytes::Owned(bytes), DType::F32, numel)
+                    } else {
+                        let tb = g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?;
+                        let numel = i.shape.iter().product();
                         match qk_perm_heads(name) {
                             Some(heads) => {
-                                cat.extend_from_slice(&permute_rows(&b, heads, row_bytes(name, dt)))
+                                let rb = row_bytes(name, i.dtype);
+                                (WBytes::Owned(permute_rows(&tb, heads, rb)), i.dtype, numel)
                             }
-                            None => cat.extend_from_slice(&b),
+                            None => (WBytes::Mmap(tb), i.dtype, numel),
                         }
                     }
-                    (WBytes::Owned(cat), dt, numel)
                 } else {
+                    // A fused group (qkv, gate+up). Its components are handed over as VIEWS, not as a
+                    // concatenated buffer: a binder that pages or streams the group registers their
+                    // file ranges and never wants the bytes, and materializing here would build — and
+                    // fault in — a multi-MB copy per group only to drop it. `WBytes::materialize` joins
+                    // them for the binders that do read bytes.
+                    //
+                    // A permuted component (qwen2 q/k) is a load-time REWRITE with no on-disk form, so
+                    // any group containing one falls back to the owned concat.
+                    let mut parts = Vec::with_capacity(names.len());
+                    let mut numel = 0usize;
+                    let mut permuted = false;
+                    let dt = info(names[0])?.dtype;
                     for name in names {
                         let i = info(name)?;
                         if i.dtype != dt {
                             return Err(anyhow!("wload concat dtype mismatch: {names:?}"));
                         }
                         numel += i.shape.iter().product::<usize>();
-                        let Some(gg) = gguf else {
-                            unreachable!("concat off-GGUF returns in the is_none branch above");
-                        };
-                        parts.push(gg.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?);
+                        parts.push(g.tensor_bytes_arc(name).map_err(|e| anyhow!("{e}"))?);
                         permuted |= qk_perm_heads(name).is_some();
                     }
                     if !permuted {
@@ -921,379 +974,388 @@ pub(crate) fn generate_dense_backend(
                         }
                         (WBytes::Owned(cat), dt, numel)
                     }
-                }
+                };
+                // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
+                // weights to f16), so the graph declares the handle to match what the backend will read.
+                let (buf, eff_dt) = bind_weight(names[0], bytes, dt, numel)?;
+                wbufs.push(buf);
+                wspecs.push((eff_dt, numel));
+                Ok(())
             };
-            // bind_weight returns the EFFECTIVE dtype the buffer holds (the GPU binder may convert float
-            // weights to f16), so the graph declares the handle to match what the backend will read.
-            let (buf, eff_dt) = bind_weight(names[0], bytes, dt, numel)?;
-            wbufs.push(buf);
-            wspecs.push((eff_dt, numel));
-            Ok(())
-        };
-        for l in 0..c.n_layer {
-            let p = |s: &str| format!("blk.{l}.{s}");
-            // qwen35 gated-DeltaNet linear-attention layer (see docs/qwen35.md): a wholly different
-            // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
-            let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
-            let is_mla = c.deepseek2;
-            // DeepSeek V4: neither MLA nor plain attention — single-head MQA KV, a low-rank grouped
-            // output projection, attention sinks, hyper-connections and up to two compressor blocks
-            // per layer. `false` for every other arch. See docs/deepseek.md § Stage 4.
-            let is_dsv4 = c.deepseek4;
-            wload(&[&p("attn_norm.weight")])?;
-            if is_mla {
-                // MLA: wq_a → q_a_norm → wq_b (or wq for lite), wkv_a_mqa, kv_a_norm, wk_b, wv_b, wo.
-                if !c.is_lite {
+            for l in 0..c.n_layer {
+                let p = |s: &str| format!("blk.{l}.{s}");
+                // qwen35 gated-DeltaNet linear-attention layer (see docs/qwen35.md): a wholly different
+                // mixer, no q/k/v/qk_norm/attn_output/bias at all. `false` for every non-qwen35 model.
+                let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
+                // LFM short-convolution layer: in_proj, conv, out_proj and no attention tensor at all.
+                let is_sc = c.is_shortconv_layer(l);
+                let is_mla = c.deepseek2;
+                // DeepSeek V4: neither MLA nor plain attention — single-head MQA KV, a low-rank grouped
+                // output projection, attention sinks, hyper-connections and up to two compressor blocks
+                // per layer. `false` for every other arch. See docs/deepseek.md § Stage 4.
+                let is_dsv4 = c.deepseek4;
+                wload(&[&p("attn_norm.weight")])?;
+                if is_mla {
+                    // MLA: wq_a → q_a_norm → wq_b (or wq for lite), wkv_a_mqa, kv_a_norm, wk_b, wv_b, wo.
+                    if !c.is_lite {
+                        wload(&[&p("attn_q_a.weight")])?;
+                        wload(&[&p("attn_q_a_norm.weight")])?;
+                    }
+                    wload(&[&p(if c.is_lite {
+                        "attn_q.weight"
+                    } else {
+                        "attn_q_b.weight"
+                    })])?;
+                    wload(&[&p("attn_kv_a_mqa.weight")])?;
+                    wload(&[&p("attn_kv_a_norm.weight")])?;
+                    wload(&[&p("attn_k_b.weight")])?;
+                    wload(&[&p("attn_v_b.weight")])?;
+                    wload(&[&p("attn_output.weight")])?;
+                    if c.deepseek32 {
+                        // DeepSeek V3.2 lightning indexer (docs/deepseek.md § Stage 3), on EVERY
+                        // layer — `deepseek32.cpp::load_arch_tensors` creates these five outside the
+                        // dense-lead/MoE branch, so a dense-lead layer carries them too. `k_norm` is a
+                        // mean-centred LayerNorm, hence a bias tensor alongside the weight under the
+                        // one GGUF name (open question 8's shape, and the reason both are listed).
+                        wload(&[&p("indexer.k_norm.weight")])?;
+                        wload(&[&p("indexer.k_norm.bias")])?;
+                        wload(&[&p("indexer.proj.weight")])?;
+                        wload(&[&p("indexer.attn_k.weight")])?;
+                        wload(&[&p("indexer.attn_q_b.weight")])?;
+                    }
+                } else if is_dsv4 {
+                    // `deepseek4.cpp::load_arch_tensors`, in its order. The Q path is deepseek2's LoRA
+                    // triple verbatim; everything after it is V4's own.
+                    wload(&[&p("attn_sinks.weight")])?;
                     wload(&[&p("attn_q_a.weight")])?;
                     wload(&[&p("attn_q_a_norm.weight")])?;
-                }
-                wload(&[&p(if c.is_lite {
-                    "attn_q.weight"
+                    wload(&[&p("attn_q_b.weight")])?;
+                    // ONE KV head for every query head (MQA): `attn_kv` is `[n_embd, head_dim]`, not a
+                    // per-head bank. `attn_kv_a_norm` is `LLM_TENSOR_ATTN_KV_NORM`, which shares its
+                    // on-disk name with deepseek2's `LLM_TENSOR_ATTN_KV_A_NORM` (docs/deepseek.md open
+                    // question 8) — two enum values, one string, and no way to tell them apart on disk.
+                    wload(&[&p("attn_kv.weight")])?;
+                    wload(&[&p("attn_kv_a_norm.weight")])?;
+                    // Low-rank GROUPED output projection: `wo_a` over `o_group_count` groups, then
+                    // `wo_b` back to n_embd. There is no single `attn_output` here.
+                    wload(&[&p("attn_output_a.weight")])?;
+                    wload(&[&p("attn_output_b.weight")])?;
+                    // Hyper-connections: one (fn, base, scale) triple wrapping the attention sublayer
+                    // and another wrapping the FFN. Both are per-layer and unconditional.
+                    for name in [
+                        "hc_attn_fn.weight",
+                        "hc_attn_base.weight",
+                        "hc_attn_scale.weight",
+                        "hc_ffn_fn.weight",
+                        "hc_ffn_base.weight",
+                        "hc_ffn_scale.weight",
+                    ] {
+                        wload(&[&p(name)])?;
+                    }
+                    // The per-layer compression ratio decides which tensors this layer HAS: 0 carries
+                    // no compressor at all, 4 and 128 carry the attention compressor, and 4 alone adds
+                    // the lightning indexer with its own compressor. `Config::from_gguf` has already
+                    // refused any other value, so these two comparisons cover every layer.
+                    let ratio = c.layer_compress_ratio(l);
+                    if ratio != 0 {
+                        for name in [
+                            "attn_compressor_kv.weight",
+                            "attn_compressor_gate.weight",
+                            "attn_compressor_ape.weight",
+                            "attn_compressor_norm.weight",
+                        ] {
+                            wload(&[&p(name)])?;
+                        }
+                    }
+                    if ratio == 4 {
+                        // V4's indexer has no `attn_k` and no `k_norm`, unlike V3.2's: its keys come out
+                        // of the compressor below, so `indexer_top_k` counts compressed BLOCKS.
+                        for name in [
+                            "indexer.proj.weight",
+                            "indexer.attn_q_b.weight",
+                            "indexer_compressor_kv.weight",
+                            "indexer_compressor_gate.weight",
+                            "indexer_compressor_ape.weight",
+                            "indexer_compressor_norm.weight",
+                        ] {
+                            wload(&[&p(name)])?;
+                        }
+                    }
+                } else if is_delta {
+                    wload(&[&p("attn_qkv.weight")])?;
+                    wload(&[&p("attn_gate.weight")])?;
+                    wload(&[&p("ssm_conv1d.weight")])?;
+                    wload(&[&p("ssm_alpha.weight")])?;
+                    wload(&[&p("ssm_beta.weight")])?;
+                    wload(&[&p("ssm_a")])?;
+                    wload(&[&p("ssm_dt.bias")])?;
+                    wload(&[&p("ssm_norm.weight")])?;
+                    wload(&[&p("ssm_out.weight")])?;
+                } else if is_sc {
+                    wload(&[&p("shortconv.in_proj.weight")])?;
+                    wload(&[&p("shortconv.conv.weight")])?;
+                    wload(&[&p("shortconv.out_proj.weight")])?;
+                } else if fuse_qkv {
+                    wload(&[
+                        &p("attn_q.weight"),
+                        &p("attn_k.weight"),
+                        &p("attn_v.weight"),
+                    ])?;
                 } else {
-                    "attn_q_b.weight"
-                })])?;
-                wload(&[&p("attn_kv_a_mqa.weight")])?;
-                wload(&[&p("attn_kv_a_norm.weight")])?;
-                wload(&[&p("attn_k_b.weight")])?;
-                wload(&[&p("attn_v_b.weight")])?;
-                wload(&[&p("attn_output.weight")])?;
-                if c.deepseek32 {
-                    // DeepSeek V3.2 lightning indexer (docs/deepseek.md § Stage 3), on EVERY
-                    // layer — `deepseek32.cpp::load_arch_tensors` creates these five outside the
-                    // dense-lead/MoE branch, so a dense-lead layer carries them too. `k_norm` is a
-                    // mean-centred LayerNorm, hence a bias tensor alongside the weight under the
-                    // one GGUF name (open question 8's shape, and the reason both are listed).
-                    wload(&[&p("indexer.k_norm.weight")])?;
-                    wload(&[&p("indexer.k_norm.bias")])?;
-                    wload(&[&p("indexer.proj.weight")])?;
-                    wload(&[&p("indexer.attn_k.weight")])?;
-                    wload(&[&p("indexer.attn_q_b.weight")])?;
-                }
-            } else if is_dsv4 {
-                // `deepseek4.cpp::load_arch_tensors`, in its order. The Q path is deepseek2's LoRA
-                // triple verbatim; everything after it is V4's own.
-                wload(&[&p("attn_sinks.weight")])?;
-                wload(&[&p("attn_q_a.weight")])?;
-                wload(&[&p("attn_q_a_norm.weight")])?;
-                wload(&[&p("attn_q_b.weight")])?;
-                // ONE KV head for every query head (MQA): `attn_kv` is `[n_embd, head_dim]`, not a
-                // per-head bank. `attn_kv_a_norm` is `LLM_TENSOR_ATTN_KV_NORM`, which shares its
-                // on-disk name with deepseek2's `LLM_TENSOR_ATTN_KV_A_NORM` (docs/deepseek.md open
-                // question 8) — two enum values, one string, and no way to tell them apart on disk.
-                wload(&[&p("attn_kv.weight")])?;
-                wload(&[&p("attn_kv_a_norm.weight")])?;
-                // Low-rank GROUPED output projection: `wo_a` over `o_group_count` groups, then
-                // `wo_b` back to n_embd. There is no single `attn_output` here.
-                wload(&[&p("attn_output_a.weight")])?;
-                wload(&[&p("attn_output_b.weight")])?;
-                // Hyper-connections: one (fn, base, scale) triple wrapping the attention sublayer
-                // and another wrapping the FFN. Both are per-layer and unconditional.
-                for name in [
-                    "hc_attn_fn.weight",
-                    "hc_attn_base.weight",
-                    "hc_attn_scale.weight",
-                    "hc_ffn_fn.weight",
-                    "hc_ffn_base.weight",
-                    "hc_ffn_scale.weight",
-                ] {
-                    wload(&[&p(name)])?;
-                }
-                // The per-layer compression ratio decides which tensors this layer HAS: 0 carries
-                // no compressor at all, 4 and 128 carry the attention compressor, and 4 alone adds
-                // the lightning indexer with its own compressor. `Config::from_gguf` has already
-                // refused any other value, so these two comparisons cover every layer.
-                let ratio = c.layer_compress_ratio(l);
-                if ratio != 0 {
-                    for name in [
-                        "attn_compressor_kv.weight",
-                        "attn_compressor_gate.weight",
-                        "attn_compressor_ape.weight",
-                        "attn_compressor_norm.weight",
-                    ] {
-                        wload(&[&p(name)])?;
-                    }
-                }
-                if ratio == 4 {
-                    // V4's indexer has no `attn_k` and no `k_norm`, unlike V3.2's: its keys come out
-                    // of the compressor below, so `indexer_top_k` counts compressed BLOCKS.
-                    for name in [
-                        "indexer.proj.weight",
-                        "indexer.attn_q_b.weight",
-                        "indexer_compressor_kv.weight",
-                        "indexer_compressor_gate.weight",
-                        "indexer_compressor_ape.weight",
-                        "indexer_compressor_norm.weight",
-                    ] {
-                        wload(&[&p(name)])?;
-                    }
-                }
-            } else if is_delta {
-                wload(&[&p("attn_qkv.weight")])?;
-                wload(&[&p("attn_gate.weight")])?;
-                wload(&[&p("ssm_conv1d.weight")])?;
-                wload(&[&p("ssm_alpha.weight")])?;
-                wload(&[&p("ssm_beta.weight")])?;
-                wload(&[&p("ssm_a")])?;
-                wload(&[&p("ssm_dt.bias")])?;
-                wload(&[&p("ssm_norm.weight")])?;
-                wload(&[&p("ssm_out.weight")])?;
-            } else if fuse_qkv {
-                wload(&[
-                    &p("attn_q.weight"),
-                    &p("attn_k.weight"),
-                    &p("attn_v.weight"),
-                ])?;
-            } else {
-                wload(&[&p("attn_q.weight")])?;
-                if has_wk[l] {
+                    wload(&[&p("attn_q.weight")])?;
                     wload(&[&p("attn_k.weight")])?;
+                    if has_wv[l] {
+                        wload(&[&p("attn_v.weight")])?;
+                    }
                 }
-                if has_wv[l] {
-                    wload(&[&p("attn_v.weight")])?;
+                // Qwen2/2.5 q/k/v projection biases (small f32 [out_f] vectors). Loaded AFTER the q/k/v
+                // weights so the upload order matches the `wpush` order below.
+                if c.qkv_bias {
+                    wload(&[&p("attn_q.bias")])?;
+                    wload(&[&p("attn_k.bias")])?;
+                    wload(&[&p("attn_v.bias")])?;
                 }
-            }
-            // Qwen2/2.5 q/k/v projection biases (small f32 [out_f] vectors). Loaded AFTER the q/k/v
-            // weights so the upload order matches the `wpush` order below.
-            if c.qkv_bias {
-                wload(&[&p("attn_q.bias")])?;
-                wload(&[&p("attn_k.bias")])?;
-                wload(&[&p("attn_v.bias")])?;
-            }
-            if qk_norm && !is_delta && !is_mla {
-                wload(&[&p("attn_q_norm.weight")])?;
-                if has_k_norm[l] {
+                if qk_norm && !is_delta && !is_sc && !is_mla {
+                    wload(&[&p("attn_q_norm.weight")])?;
                     wload(&[&p("attn_k_norm.weight")])?;
                 }
-            }
-            // V4's output projection is the low-rank `attn_output_a`/`_b` pair loaded above; it has
-            // no single `attn_output` tensor, so it is excluded here alongside MLA and DeltaNet.
-            if !is_delta && !is_mla && !is_dsv4 {
-                wload(&[&p("attn_output.weight")])?;
-            }
-            // bitnet SubLN: the attention-output RMSNorm sits BETWEEN the attention op and `wo` in
-            // the graph, but load order is arbitrary as long as `wpush` mirrors it — kept right
-            // after `attn_output` (its logical neighbor). `[n_embd]`, resident (small f32 norm).
-            if c.sub_norm && !is_delta {
-                wload(&[&p("attn_sub_norm.weight")])?;
-            }
-            if gemma {
-                wload(&[&p("post_attention_norm.weight")])?;
-            }
-            // qwen35 names its post-mixer/pre-FFN norm `post_attention_norm.weight` on BOTH layer
-            // kinds (not `ffn_norm.weight`) — same role (`lw.ffn_norm`), different tensor name.
-            let ffn_norm_name = if c.qwen35 {
-                "post_attention_norm.weight"
-            } else {
-                "ffn_norm.weight"
-            };
-            wload(&[&p(ffn_norm_name)])?;
-            if c.dual_moe() {
-                // Dual FFN: dense GeGLU (n_ff=2112) ∥ 128-expert MoE (fused gate_up_exps + a
-                // per-expert down scale), summed — see docs/diffusion-gemma.md's FFN wiring. Shared
-                // by diffusion-gemma and the autoregressive gemma4 MoE (26B-A4B); identical tensors.
-                // `fuse_gu`: one concatenated [2*nff,ne] gate+up tensor (see the comment at its
-                // definition) instead of two separate n_ff=2112 tensors.
-                if fuse_gu {
+                // V4's output projection is the low-rank `attn_output_a`/`_b` pair loaded above; it has
+                // no single `attn_output` tensor, so it is excluded here alongside MLA and DeltaNet.
+                if !is_delta && !is_sc && !is_mla && !is_dsv4 {
+                    wload(&[&p("attn_output.weight")])?;
+                }
+                // LFM3's per-head output gate on every attention layer.
+                if c.lfm3 && !is_sc {
+                    wload(&[&p("attn_gate.weight")])?;
+                }
+                // bitnet SubLN: the attention-output RMSNorm sits BETWEEN the attention op and `wo` in
+                // the graph, but load order is arbitrary as long as `wpush` mirrors it — kept right
+                // after `attn_output` (its logical neighbor). `[n_embd]`, resident (small f32 norm).
+                if c.sub_norm && !is_delta {
+                    wload(&[&p("attn_sub_norm.weight")])?;
+                }
+                if c.sandwich_norm {
+                    wload(&[&p("post_attention_norm.weight")])?;
+                }
+                // qwen35 names its post-mixer/pre-FFN norm `post_attention_norm.weight` on BOTH layer
+                // kinds (not `ffn_norm.weight`) — same role (`lw.ffn_norm`), different tensor name.
+                let ffn_norm_name = if c.qwen35 {
+                    "post_attention_norm.weight"
+                } else {
+                    "ffn_norm.weight"
+                };
+                wload(&[&p(ffn_norm_name)])?;
+                if c.dual_moe() {
+                    // Dual FFN: dense GeGLU (n_ff=2112) ∥ 128-expert MoE (fused gate_up_exps + a
+                    // per-expert down scale), summed — see docs/diffusion-gemma.md's FFN wiring. Shared
+                    // by diffusion-gemma and the autoregressive gemma4 MoE (26B-A4B); identical tensors.
+                    // `fuse_gu`: one concatenated [2*nff,ne] gate+up tensor (see the comment at its
+                    // definition) instead of two separate n_ff=2112 tensors.
+                    if fuse_gu {
+                        wload(&[&p("ffn_gate.weight"), &p("ffn_up.weight")])?;
+                    } else {
+                        wload(&[&p("ffn_gate.weight")])?;
+                        wload(&[&p("ffn_up.weight")])?;
+                    }
+                    wload(&[&p("ffn_down.weight")])?;
+                    wload(&[&p("post_ffw_norm_1.weight")])?;
+                    wload(&[&p("pre_ffw_norm_2.weight")])?;
+                    wload(&[&p("ffn_gate_inp.weight")])?;
+                    wload(&[&p("ffn_gate_inp.scale")])?;
+                    wload(&[&p("ffn_gate_up_exps.weight")])?;
+                    wload(&[&p("ffn_down_exps.weight")])?;
+                    wload(&[&p("ffn_down_exps.scale")])?;
+                    wload(&[&p("post_ffw_norm_2.weight")])?;
+                } else if c.moe.is_some() && c.is_moe_layer(l) {
+                    // qwen3moe / qwen35moe / llama4 / deepseek / ernie4_5-moe (MoE layer): router +
+                    // stacked per-expert gate/up/down banks. The dense layers `Config::is_moe_layer`
+                    // leaves out (a leading dense block, or off the interleave step) fall through to
+                    // the dense branches below.
+                    wload(&[&p("ffn_gate_inp.weight")])?;
+                    wload(&[&p("ffn_gate_exps.weight")])?;
+                    wload(&[&p("ffn_up_exps.weight")])?;
+                    wload(&[&p("ffn_down_exps.weight")])?;
+                    // Optional per layer where the reference loads it so (`Config::optional_router_bias`:
+                    // deepseek2, ernie4_5-moe).
+                    if c.optional_router_bias {
+                        let ep_name = p("exp_probs_b.bias");
+                        if g.tensors().iter().any(|t| t.name == ep_name) {
+                            wload(&[&ep_name])?;
+                            layer_has_epb[l] = true;
+                        }
+                    }
+                    if c.deepseek4 {
+                        // Hash-routed MoE: the first `hash_layer_count` layers pick their experts from
+                        // a token-id → expert-id table INSTEAD of scoring the router bias, so the two
+                        // tensors are mutually exclusive per layer — `deepseek4.cpp` creates exactly
+                        // one of them. A V4 file is not optional about either (unlike deepseek2's
+                        // `exp_probs_b`, which the pre-V3 GGUFs simply do not have).
+                        if c.is_hash_moe_layer(l) {
+                            wload(&[&p("ffn_gate_tid2eid.weight")])?;
+                        } else {
+                            wload(&[&p("exp_probs_b.bias")])?;
+                            layer_has_epb[l] = true;
+                        }
+                    }
+                    if c.shexp_ff > 0 {
+                        // Shared expert (qwen35moe / llama4): a dense SwiGLU FFN alongside the routed
+                        // bank. qwen35moe gates it by a per-token sigmoid (`ffn_gate_inp_shexp`); llama4
+                        // has no gate tensor and sums it in plain — see `FfnW::Moe`'s `shexp` field.
+                        if c.shexp_gated {
+                            wload(&[&p("ffn_gate_inp_shexp.weight")])?;
+                        }
+                        wload(&[&p("ffn_gate_shexp.weight")])?;
+                        wload(&[&p("ffn_up_shexp.weight")])?;
+                        wload(&[&p("ffn_down_shexp.weight")])?;
+                    }
+                } else if fuse_gu {
                     wload(&[&p("ffn_gate.weight"), &p("ffn_up.weight")])?;
+                    wload(&[&p("ffn_down.weight")])?;
                 } else {
                     wload(&[&p("ffn_gate.weight")])?;
                     wload(&[&p("ffn_up.weight")])?;
+                    wload(&[&p("ffn_down.weight")])?;
                 }
-                wload(&[&p("ffn_down.weight")])?;
-                wload(&[&p("post_ffw_norm_1.weight")])?;
-                wload(&[&p("pre_ffw_norm_2.weight")])?;
-                wload(&[&p("ffn_gate_inp.weight")])?;
-                wload(&[&p("ffn_gate_inp.scale")])?;
-                wload(&[&p("ffn_gate_up_exps.weight")])?;
-                wload(&[&p("ffn_down_exps.weight")])?;
-                wload(&[&p("ffn_down_exps.scale")])?;
-                wload(&[&p("post_ffw_norm_2.weight")])?;
-            } else if c.moe.is_some() && c.is_moe_layer(l) {
-                // qwen3moe / qwen35moe / llama4 (MoE layer): router + stacked per-expert gate/up/
-                // down banks. (llama4 interleaves dense layers on `moe_interleave_step`; those fall
-                // through to the dense branches below — Scout's step==1 makes every layer MoE.)
-                wload(&[&p("ffn_gate_inp.weight")])?;
-                wload(&[&p("ffn_gate_exps.weight")])?;
-                wload(&[&p("ffn_up_exps.weight")])?;
-                wload(&[&p("ffn_down_exps.weight")])?;
-                if c.deepseek2 {
-                    let ep_name = p("exp_probs_b.bias");
-                    if g.tensors().iter().any(|t| t.name == ep_name) {
-                        wload(&[&ep_name])?;
-                        layer_has_epb[l] = true;
-                    }
+                // bitnet SubLN: the FFN-intermediate RMSNorm (`[n_ff]`) applied BEFORE `ffn_down` in the
+                // graph; loaded here to mirror the `wpush` order below. Only bitnet is dense-gated AND
+                // `sub_norm`, so this never fires on a MoE/dual-FFN layer.
+                if c.sub_norm {
+                    wload(&[&p("ffn_sub_norm.weight")])?;
                 }
-                if c.deepseek4 {
-                    // Hash-routed MoE: the first `hash_layer_count` layers pick their experts from
-                    // a token-id → expert-id table INSTEAD of scoring the router bias, so the two
-                    // tensors are mutually exclusive per layer — `deepseek4.cpp` creates exactly
-                    // one of them. A V4 file is not optional about either (unlike deepseek2's
-                    // `exp_probs_b`, which the pre-V3 GGUFs simply do not have).
-                    if c.is_hash_moe_layer(l) {
-                        wload(&[&p("ffn_gate_tid2eid.weight")])?;
-                    } else {
-                        wload(&[&p("exp_probs_b.bias")])?;
-                        layer_has_epb[l] = true;
-                    }
+                if c.sandwich_norm {
+                    wload(&[&p("post_ffw_norm.weight")])?;
                 }
-                if c.shexp_ff > 0 {
-                    // Shared expert (qwen35moe / llama4): a dense SwiGLU FFN alongside the routed
-                    // bank. qwen35moe gates it by a per-token sigmoid (`ffn_gate_inp_shexp`); llama4
-                    // has no gate tensor and sums it in plain — see `FfnW::Moe`'s `shexp` field.
-                    if c.shexp_gated {
-                        wload(&[&p("ffn_gate_inp_shexp.weight")])?;
-                    }
-                    wload(&[&p("ffn_gate_shexp.weight")])?;
-                    wload(&[&p("ffn_up_shexp.weight")])?;
-                    wload(&[&p("ffn_down_shexp.weight")])?;
+                if e2b {
+                    // gemma4 E2B per-layer input-embedding application weights.
+                    wload(&[&p("inp_gate.weight")])?;
+                    wload(&[&p("proj.weight")])?;
+                    wload(&[&p("post_norm.weight")])?;
                 }
-            } else if fuse_gu {
-                wload(&[&p("ffn_gate.weight"), &p("ffn_up.weight")])?;
-                wload(&[&p("ffn_down.weight")])?;
+            }
+            // Globals: output_norm, lm_head. lm_head = `output.weight`, or (tied) the quantized
+            // `token_embd.weight` mapped from the mmap and dequantized per-row by `Op::Linear` — same f32
+            // values as the host `token_embd`, but zero-copy.
+            wload(&["output_norm.weight"])?;
+            if g.tensors().iter().any(|t| t.name == "output.weight") {
+                wload(&["output.weight"])?;
             } else {
-                wload(&[&p("ffn_gate.weight")])?;
-                wload(&[&p("ffn_up.weight")])?;
-                wload(&[&p("ffn_down.weight")])?;
+                wload(&["token_embd.weight"])?;
             }
-            // bitnet SubLN: the FFN-intermediate RMSNorm (`[n_ff]`) applied BEFORE `ffn_down` in the
-            // graph; loaded here to mirror the `wpush` order below. Only bitnet is dense-gated AND
-            // `sub_norm`, so this never fires on a MoE/dual-FFN layer.
-            if c.sub_norm {
-                wload(&[&p("ffn_sub_norm.weight")])?;
+            // DeepSeek V4's hyper-connection HEAD: the model-level triple that collapses the `hc_mult`
+            // parallel residual streams back to one vector before `output_norm`. Model-level, not
+            // per-layer (`output_hc_*`, no `blk.` prefix) — same standing as `output_norm`/`output`
+            // above, which is why they load here rather than in the layer loop.
+            if c.deepseek4 {
+                wload(&["output_hc_fn.weight"])?;
+                wload(&["output_hc_base.weight"])?;
+                wload(&["output_hc_scale.weight"])?;
             }
-            if gemma {
-                wload(&[&p("post_ffw_norm.weight")])?;
+            // GPU embed gather: untied models upload the quantized token_embd as one extra weight
+            // slot (tied models reuse the lm_head slot above — same tensor). Order-sensitive:
+            // mirrors `build`'s `w_embd` wpush, right after `w_lm`.
+            if gpu_embed && untied_lm {
+                wload(&["token_embd.weight"])?;
             }
+            // gemma4-E2B on-device per-layer gather: the (large, quantized) per-layer token
+            // embedding table. Mirrors `build`'s `w_ple` wpush.
+            if gpu_ple {
+                wload(&["per_layer_token_embd.weight"])?;
+            }
+            // diffusion-gemma: top-level self-conditioning gated MLP. LOADED (occupies a weight-buffer
+            // slot like any other tensor) but NOT READ by any Op this phase — Phase 1 is the
+            // encoder-only causal prefill, which runs with self-conditioning permanently off (see
+            // docs/diffusion-gemma.md); the canvas denoise graph (Phase 2+) is the first reader.
+            // Loaded BEFORE the e2b block (mutually exclusive with it — no model is both) so the
+            // `debug_assert_eq!` below, which indexes `wspecs` directly, isn't straddled by a later
+            // `wload` call (the closure's mutable borrow of `wspecs` would conflict with that read).
+            if c.diffusion_gemma {
+                wload(&["self_cond_pre_norm.weight"])?;
+                wload(&["self_cond_gate.weight"])?;
+                wload(&["self_cond_up.weight"])?;
+                wload(&["self_cond_down.weight"])?;
+            }
+            // gemma4 E2B: the per-layer input-embedding projection weights, native-uploaded like any
+            // other weight (model_proj stays bf16 — the seam's native bf16 GEMV/GEMM reads it directly;
+            // proj_norm is f32). The GPU graph prologue (in `build`, below) runs the GEMV + RMSNorm that
+            // used to be a host loop. Declared here (in upload order) — `build` pushes the matching
+            // handles right after `w_lm`/before `v_ones`.
             if e2b {
-                // gemma4 E2B per-layer input-embedding application weights.
-                wload(&[&p("inp_gate.weight")])?;
-                wload(&[&p("proj.weight")])?;
-                wload(&[&p("post_norm.weight")])?;
-            }
-        }
-        // Globals: output_norm, lm_head. lm_head = `output.weight`, or (tied) the quantized
-        // `token_embd.weight` mapped from the mmap and dequantized per-row by `Op::Linear` — same f32
-        // values as the host `token_embd`, but zero-copy.
-        wload(&["output_norm.weight"])?;
-        if g.tensors().iter().any(|t| t.name == "output.weight") {
-            wload(&["output.weight"])?;
-        } else {
-            wload(&["token_embd.weight"])?;
-        }
-        // DeepSeek V4's hyper-connection HEAD: the model-level triple that collapses the `hc_mult`
-        // parallel residual streams back to one vector before `output_norm`. Model-level, not
-        // per-layer (`output_hc_*`, no `blk.` prefix) — same standing as `output_norm`/`output`
-        // above, which is why they load here rather than in the layer loop.
-        if c.deepseek4 {
-            wload(&["output_hc_fn.weight"])?;
-            wload(&["output_hc_base.weight"])?;
-            wload(&["output_hc_scale.weight"])?;
-        }
-        // GPU embed gather: untied models upload the quantized token_embd as one extra weight
-        // slot (tied models reuse the lm_head slot above — same tensor). Order-sensitive:
-        // mirrors `build`'s `w_embd` wpush, right after `w_lm`.
-        if gpu_embed && untied_lm {
-            wload(&["token_embd.weight"])?;
-        }
-        // gemma4-E2B on-device per-layer gather: the (large, quantized) per-layer token
-        // embedding table. Mirrors `build`'s `w_ple` wpush.
-        if gpu_ple {
-            wload(&["per_layer_token_embd.weight"])?;
-        }
-        // diffusion-gemma: top-level self-conditioning gated MLP. LOADED (occupies a weight-buffer
-        // slot like any other tensor) but NOT READ by any Op this phase — Phase 1 is the
-        // encoder-only causal prefill, which runs with self-conditioning permanently off (see
-        // docs/diffusion-gemma.md); the canvas denoise graph (Phase 2+) is the first reader.
-        // Loaded BEFORE the e2b block (mutually exclusive with it — no model is both) so the
-        // `debug_assert_eq!` below, which indexes `wspecs` directly, isn't straddled by a later
-        // `wload` call (the closure's mutable borrow of `wspecs` would conflict with that read).
-        if c.diffusion_gemma {
-            wload(&["self_cond_pre_norm.weight"])?;
-            wload(&["self_cond_gate.weight"])?;
-            wload(&["self_cond_up.weight"])?;
-            wload(&["self_cond_down.weight"])?;
-        }
-        // gemma4 E2B: the per-layer input-embedding projection weights, native-uploaded like any
-        // other weight (model_proj stays bf16 — the seam's native bf16 GEMV/GEMM reads it directly;
-        // proj_norm is f32). The GPU graph prologue (in `build`, below) runs the GEMV + RMSNorm that
-        // used to be a host loop. Declared here (in upload order) — `build` pushes the matching
-        // handles right after `w_lm`/before `v_ones`.
-        if e2b {
-            wload(&["per_layer_model_proj.weight"])?;
-            wload(&["per_layer_proj_norm.weight"])?;
-            if let Some(spec) = g
-                .as_any()
-                .downcast_ref::<crate::Exl3Source>()
-                .and_then(|src| src.native_spec("per_layer_model_proj.weight"))
-            {
-                debug_assert_eq!(spec.in_f as usize, ne);
-                debug_assert_eq!(spec.out_f as usize, c.n_layer * npl);
-            } else {
+                wload(&["per_layer_model_proj.weight"])?;
+                wload(&["per_layer_proj_norm.weight"])?;
+                // Sanity-check the two uploads landed with the shapes the GPU prologue assumes
+                // (model_proj is `[n_layer*npl, n_embd]`, proj_norm is `[npl]`).
                 debug_assert_eq!(wspecs[wspecs.len() - 2].1, c.n_layer * npl * ne);
+                debug_assert_eq!(wspecs[wspecs.len() - 1].1, npl);
             }
-            debug_assert_eq!(wspecs[wspecs.len() - 1].1, npl);
-        }
-        // gemma4 weightless per-head V-norm = `QkNorm` with a unit weight (out = x/rms). One ones-vector
-        // of the max head dim serves every layer (a narrower layer reads its leading prefix).
-        if gemma4 {
-            let ones = vec![1.0f32; max_hd];
-            let b = be
-                .alloc(ones.len() * 4, BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
-                .map_err(|e| anyhow!("{e}"))?;
-            wbufs.push(b);
-            wspecs.push((DType::F32, max_hd));
-        }
-        // dual-FFN MoE (diffusion-gemma / gemma4 26B-A4B): weightless FULL-WIDTH (ne-wide) RMSNorm
-        // for the MoE router's own input (`rmsnorm_noscale(attn_out)`, see the graph-build wiring) —
-        // a SEPARATE ones-vector from `v_ones` above (that one's per-HEAD width `max_hd`; this is
-        // the whole residual width).
-        if c.dual_moe() {
-            let ones = vec![1.0f32; ne];
-            let b = be
-                .alloc(ones.len() * 4, BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
-                .map_err(|e| anyhow!("{e}"))?;
-            wbufs.push(b);
-            wspecs.push((DType::F32, ne));
-        }
-        // llama4 `Llama4TextL2Norm`: a WEIGHTLESS per-head RMS/L2-norm on Q and K after rope (rope
-        // layers only) = `QkNorm` with a unit weight. One `head_dim`-wide ones-vector serves every
-        // rope layer (see the matching `qk_ones` handle in `build`).
-        if c.kq_l2norm {
-            let ones = vec![1.0f32; c.head_dim];
-            let b = be
-                .alloc(ones.len() * 4, BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
-                .map_err(|e| anyhow!("{e}"))?;
-            wbufs.push(b);
-            wspecs.push((DType::F32, c.head_dim));
-        }
-        // DeepSeek V4: a weightless RMSNorm over the FLATTENED `hc_mult * n_embd` widened residual
-        // row is what feeds every hyper-connection mixing matmul (llama.cpp calls bare
-        // `ggml_rms_norm` there). `Op::RmsNorm` requires a weight, so — exactly like the three
-        // ones-vectors above — one `hc_mult*n_embd`-wide vector of 1.0 serves all of them
-        // (`x * s * 1.0 == x * s` in IEEE). See the matching `hc_ones` handle in `build`.
-        if c.deepseek4 {
-            let ones = vec![1.0f32; c.hc_mult * ne];
-            let b = be
-                .alloc(ones.len() * 4, BufferUsage::Weights)
-                .map_err(|e| anyhow!("{e}"))?;
-            be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
-                .map_err(|e| anyhow!("{e}"))?;
-            wbufs.push(b);
-            wspecs.push((DType::F32, c.hc_mult * ne));
-        }
+            // gemma4 weightless per-head V-norm = `QkNorm` with a unit weight (out = x/rms). One ones-vector
+            // of the max head dim serves every layer (a narrower layer reads its leading prefix).
+            if gemma4 {
+                let ones = vec![1.0f32; max_hd];
+                let b = be
+                    .alloc(ones.len() * 4, BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
+                    .map_err(|e| anyhow!("{e}"))?;
+                wbufs.push(b);
+                wspecs.push((DType::F32, max_hd));
+            }
+            // dual-FFN MoE (diffusion-gemma / gemma4 26B-A4B): weightless FULL-WIDTH (ne-wide) RMSNorm
+            // for the MoE router's own input (`rmsnorm_noscale(attn_out)`, see the graph-build wiring) —
+            // a SEPARATE ones-vector from `v_ones` above (that one's per-HEAD width `max_hd`; this is
+            // the whole residual width).
+            if c.dual_moe() {
+                let ones = vec![1.0f32; ne];
+                let b = be
+                    .alloc(ones.len() * 4, BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
+                    .map_err(|e| anyhow!("{e}"))?;
+                wbufs.push(b);
+                wspecs.push((DType::F32, ne));
+            }
+            // llama4 `Llama4TextL2Norm`: a WEIGHTLESS per-head RMS/L2-norm on Q and K after rope (rope
+            // layers only) = `QkNorm` with a unit weight. One `head_dim`-wide ones-vector serves every
+            // rope layer (see the matching `qk_ones` handle in `build`).
+            if c.kq_l2norm {
+                let ones = vec![1.0f32; c.head_dim];
+                let b = be
+                    .alloc(ones.len() * 4, BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
+                    .map_err(|e| anyhow!("{e}"))?;
+                wbufs.push(b);
+                wspecs.push((DType::F32, c.head_dim));
+            }
+            // DeepSeek V4: a weightless RMSNorm over the FLATTENED `hc_mult * n_embd` widened residual
+            // row is what feeds every hyper-connection mixing matmul (llama.cpp calls bare
+            // `ggml_rms_norm` there). `Op::RmsNorm` requires a weight, so — exactly like the three
+            // ones-vectors above — one `hc_mult*n_embd`-wide vector of 1.0 serves all of them
+            // (`x * s * 1.0 == x * s` in IEEE). See the matching `hc_ones` handle in `build`.
+            if c.deepseek4 {
+                let ones = vec![1.0f32; c.hc_mult * ne];
+                let b = be
+                    .alloc(ones.len() * 4, BufferUsage::Weights)
+                    .map_err(|e| anyhow!("{e}"))?;
+                be.upload(b.as_ref(), bytemuck::cast_slice(&ones))
+                    .map_err(|e| anyhow!("{e}"))?;
+                wbufs.push(b);
+                wspecs.push((DType::F32, c.hc_mult * ne));
+            }
+            Some((wbufs, wspecs, layer_has_epb))
+        };
 
         // ── re-decide the context against what the device says is LEFT ───────────────────────
         // Every weight this session will hold is resident by now — including the arena block tails
         // and the driver's own memory that no pre-load footprint prices — so the budget query here
         // is a MEASUREMENT where the clamp that sized `want_ctx` could only estimate. Shrinks only,
         // and never a context the user pinned. See `reclamp_ctx_to_live_room`.
-        let want_ctx = crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt);
+        let want_ctx = crate::seam::reclamp_ctx_to_live_room(be, c, ec, want_ctx, k_fmt, v_fmt)?;
+        // A model infr only matches the reference over a bounded context gets no larger cache.
+        // Sessions arrive already capped (`SeamModel::session_ctx`); this is the one-shot paths'
+        // cap (they size `prompt + max_new + 1`). The load already warned.
+        let want_ctx = c
+            .faithful_ctx_limit()
+            .map_or(want_ctx, |limit| want_ctx.min(limit));
 
         // ── persistent KV cache buffers, sized per-layer (gemma4 SWA layers are narrower) and
         //    per-side (K and V pick their dtype independently) ────────────────────────────────
@@ -1306,13 +1368,31 @@ pub(crate) fn generate_dense_backend(
         let ubatch = crate::seam::ubatch_rows(ec);
         let kv_sizes: Vec<(usize, usize)> = (0..c.n_layer)
             .map(|l| {
-                crate::seam::kv_layer_alloc_bytes(c, l, want_ctx, kv_ring, ubatch, k_fmt, v_fmt)
+                crate::seam::kv_layer_alloc_bytes(
+                    c,
+                    l,
+                    want_ctx,
+                    kv_ring,
+                    ubatch,
+                    be.kv_row_align(),
+                    k_fmt,
+                    v_fmt,
+                )
             })
             .collect();
         let room = be.device_alloc_room();
+        // The guard sees every KV-class allocation this init makes: the K/V pairs, then a V4
+        // compressed layer's block caches and rings, one entry each.
+        let guarded: Vec<(usize, usize)> = kv_sizes
+            .iter()
+            .copied()
+            .chain(
+                (0..c.n_layer).flat_map(|l| crate::seam::dsv4_comp_allocs(c, l, want_ctx, k_fmt)),
+            )
+            .collect();
         crate::seam::refuse_unallocatable_kv(
             ec,
-            &kv_sizes,
+            &guarded,
             room,
             want_ctx,
             k_fmt,
@@ -1323,18 +1403,19 @@ pub(crate) fn generate_dense_backend(
                 crate::seam::kv_fit_ctx_in_budget(c, ec, budget, None, &[ubatch], k_fmt, v_fmt)
             },
         )?;
-        let mut kbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
-        let mut vbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
+        let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
         for &(k_bytes, v_bytes) in &kv_sizes {
-            kbufs.push(std::sync::Arc::from(
+            kbufs.push(
                 be.alloc(k_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
-            ));
-            vbufs.push(std::sync::Arc::from(
+            );
+            vbufs.push(
                 be.alloc(v_bytes, BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
-            ));
+            );
         }
+        let cbufs = super::weights::alloc_dsv4_comp_bufs(be, c, want_ctx, k_fmt)?;
         // VRAM-first KV overflow (`INFR_KV_OVERFLOW`): now that every per-layer/per-side KV buffer
         // is placed, let the backend log the resident-vs-spilled split once. No-op with the flag off.
         be.kv_overflow_report();
@@ -1346,27 +1427,43 @@ pub(crate) fn generate_dense_backend(
         let pos_buf = be
             .alloc(4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
-        let rf_buf = match &stable.rope_freqs {
-            Some(rf) => {
-                let b = be
-                    .alloc(rf.len() * 4, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?;
-                be.upload(b.as_ref(), bytemuck::cast_slice(rf))
-                    .map_err(|e| anyhow!("{e}"))?;
-                Some((b, rf.len()))
+        let weights = match fresh {
+            Some((wbufs, wspecs, layer_has_epb)) => {
+                let rf_buf = match &stable.rope_freqs {
+                    Some(rf) => {
+                        let b = be
+                            .alloc(rf.len() * 4, BufferUsage::Staging)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        be.upload(b.as_ref(), bytemuck::cast_slice(rf))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        Some((b, rf.len()))
+                    }
+                    None => None,
+                };
+                let yff_buf = match &stable.yarn_ff {
+                    Some(yff) => {
+                        let b = be
+                            .alloc(yff.len() * 4, BufferUsage::Staging)
+                            .map_err(|e| anyhow!("{e}"))?;
+                        be.upload(b.as_ref(), bytemuck::cast_slice(yff))
+                            .map_err(|e| anyhow!("{e}"))?;
+                        Some((b, yff.len()))
+                    }
+                    None => None,
+                };
+                std::sync::Arc::new(SeamWeights {
+                    wbufs,
+                    wspecs,
+                    rf_buf,
+                    yff_buf,
+                    layer_has_epb,
+                })
             }
-            None => None,
-        };
-        let yff_buf = match &stable.yarn_ff {
-            Some(yff) => {
-                let b = be
-                    .alloc(yff.len() * 4, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?;
-                be.upload(b.as_ref(), bytemuck::cast_slice(yff))
-                    .map_err(|e| anyhow!("{e}"))?;
-                Some((b, yff.len()))
-            }
-            None => None,
+            None => std::sync::Arc::clone(
+                &prebound
+                    .expect("no fresh weights without prebound ones")
+                    .weights,
+            ),
         };
         // gemma4 E2B per-(token,layer) input vector `[n_layer*npl]`, recomputed + re-uploaded each step.
         // (Host path only — `gpu_ple` gathers it on-device from the resident table.)
@@ -1382,17 +1479,11 @@ pub(crate) fn generate_dense_backend(
             .alloc(c.vocab * 4, BufferUsage::Readback)
             .map_err(|e| anyhow!("{e}"))?;
         *state = Some(SeamKv {
-            weights: std::sync::Arc::new(SeamWeights {
-                wbufs,
-                wspecs,
-                exl3_specs,
-                rf_buf,
-                yff_buf,
-                layer_has_epb,
-            }),
+            weights,
             stable: std::sync::Arc::clone(&stable),
             kbufs,
             vbufs,
+            cbufs,
             k_fmt,
             v_fmt,
             hidden_buf,
@@ -1401,8 +1492,10 @@ pub(crate) fn generate_dense_backend(
             logits_buf,
             max_ctx: want_ctx,
             kv_ring,
+            ubatch,
             cached: Vec::new(),
-            paged: None,
+            written_end: 0,
+            delta_snapshot_refused: false,
             denoise_cache: None,
             self_cond_w: None,
             sc_embt: None,
@@ -1419,41 +1512,55 @@ pub(crate) fn generate_dense_backend(
         stable: _,
         kbufs,
         vbufs,
+        cbufs,
         k_fmt: _,
         v_fmt: _,
-        paged,
         hidden_buf,
         pos_buf,
         ipl_buf,
         logits_buf,
         max_ctx,
         cached,
+        written_end,
         denoise_cache,
         self_cond_w,
         sc_embt,
         sc_ping,
         sc_ping_write,
         sc_temp_inv_buf,
-        mtp_delta_ckpt: _,
+        mtp_delta_ckpt,
+        delta_snapshot_refused,
         // The env-derived local `kv_ring` above is this same value on every call (stable env),
         // so the struct field is only read by fork/seed (which have no backend caps at hand).
         kv_ring: _,
+        // The chunk height this slot's rings were sized with — the one source the cache
+        // declarations, the rewind guard and fork/seed all read.
+        ubatch: ring_ubatch,
     } = state.as_mut().expect("seam state just initialized");
+    let ring_ubatch = *ring_ubatch;
     let SeamWeights {
         wbufs,
         wspecs,
-        exl3_specs,
         rf_buf,
         yff_buf,
         layer_has_epb,
     } = weights.as_ref();
     let max_ctx = *max_ctx;
+    // At the context cap a reply is trimmed to the room left, exactly as a session's
+    // `reply_budget` trims it, rather than overflowing because a one-shot caller sized its
+    // context for the whole reply; a prompt that does not fit still overflows below.
+    let max_new = if c.faithful_ctx_limit() == Some(max_ctx) {
+        crate::seam::model::reply_budget(max_new, max_ctx, prompt.len())
+    } else {
+        max_new
+    };
     if prompt.len() + max_new + 1 > max_ctx {
-        return Err(anyhow!(
-            "prompt {} + gen {} exceeds the session KV capacity {max_ctx}",
-            prompt.len(),
-            max_new
-        ));
+        return Err(crate::ContextOverflow {
+            prompt: prompt.len(),
+            gen: max_new,
+            max_ctx,
+        }
+        .into());
     }
     // Ordinary (non-denoise) generation needs a non-empty prompt (the `.min(prompt.len()-1)`
     // prefix-diff below would underflow on empty, and there'd be nothing to sample the first
@@ -1464,7 +1571,7 @@ pub(crate) fn generate_dense_backend(
         if prompt.is_empty() {
             return Err(anyhow!("empty prompt: nothing to generate from"));
         }
-        validate_prompt_ids(prompt, c.vocab, media.as_deref())?;
+        validate_token_ids(prompt, c.vocab)?;
     }
     // Phase-2 DiffusionGemma denoise: capture the prompt length BEFORE the ordinary prefix-diff
     // logic below runs (a denoise call's `prompt`/`max_new` are empty/0 — see `DenoiseReq`'s
@@ -1475,44 +1582,90 @@ pub(crate) fn generate_dense_backend(
     // shared prefix — prefill only the suffix. Always leave ≥1 prompt token to process so the
     // first generated token samples from fresh logits.
     //
-    // qwen35's gated-DeltaNet recurrent state is an APPEND-ONLY summary, not a per-position cache —
-    // it can't rewind to an arbitrary shared prefix the way a real KV cache can. So a turn reuses it
-    // ONLY when `prompt` exactly EXTENDS `cached` (mirrors the old seam's `SeamState` rule); anything
-    // else (divergent prompt, identical resend, first-ever call) zero-resets every DeltaNet layer's
-    // conv/S state and re-prefills from scratch. Dense/attention models keep the generic
-    // longest-common-prefix diff.
+    // A recurrent layer's state (qwen35's gated DeltaNet, LFM's short convolution) is an
+    // APPEND-ONLY summary, not a per-position cache — it can't rewind to an arbitrary shared prefix
+    // the way a real KV cache can, and neither can a DeepSeek V4 compressor's ring and block cache
+    // (`Config::has_unrewindable_state` has why). So a turn reuses it ONLY when `prompt` exactly
+    // EXTENDS `cached` (mirrors the old seam's `SeamState` rule); anything else (divergent prompt,
+    // identical resend, first-ever call) zero-resets that state and re-prefills from scratch.
+    // Dense/attention models keep the generic longest-common-prefix diff.
+    //
+    // SWA ring rewind guard: a ring layer RETAINS only its last `rows_l` positions — rows for
+    // positions older than `high_water - rows_l` were recycled by newer writes. Re-prefilling from
+    // `start` attends positions `[start - window, start)` on window layers, so a rewind deeper than
+    // the ring's retained tail would read recycled rows. The high-water mark is `written_end`, not
+    // `cached.len()`: an aborted prefill, a chained decode that stopped early, or an earlier longer
+    // turn wrote positions `cached` no longer records.
+    let ring_keeps = |start: usize, high_water: usize| -> bool {
+        !kv_ring
+            || start == 0
+            || (0..c.n_layer)
+                .filter(|&l| c.is_swa_layer(l))
+                .map(|l| {
+                    crate::seam::kv_rows_at(c, l, max_ctx, true, ring_ubatch, be.kv_row_align())
+                })
+                .filter(|&rows_l| rows_l < max_ctx) // a never-wrapping layer can't lose positions
+                .all(|rows_l| {
+                    start.saturating_sub(c.swa_window) >= high_water.saturating_sub(rows_l)
+                })
+    };
     let start = if denoise_req.is_some() {
         // No-op: a denoise call never touches `cached` (it isn't part of the prompt/generation
         // token stream) — `cached.truncate(start)` below is then a truncate-to-current-length.
         cached.len()
-    } else if c.qwen35 {
+    } else if c.has_unrewindable_state() {
         let pfx = common_prefix_len(cached, prompt);
-        if pfx == cached.len() && pfx < prompt.len() {
+        // An EMPTY `cached` never reuses: the buffers can still hold a warmup generation's or a
+        // pre-`SeamKv::reset` conversation's state, which `cached` no longer describes. Nor does
+        // a state that has consumed more tokens than `cached` records (`written_end`): a chained
+        // decode that stopped early ran its remaining steps on the device anyway.
+        // Whenever plain reuse is out — a state that ran past `cached`, an identical resend, or a
+        // prompt that diverges after the snapshot point — the snapshot the decode loop took at a
+        // prefill boundary, `resume` tokens in, still applies if the new prompt starts with those
+        // tokens: restore it and prefill from there. It describes `cached[..resume]` for as long
+        // as it stays valid, since every turn that keeps it either extends `cached` or resumes
+        // from it, and a zeroed state invalidates it.
+        // The ring check runs here, against the high-water mark the restore below resets: once
+        // restored, `written_end` no longer says how far past the snapshot the ring was written.
+        let resume = super::weights::delta_snapshot_len(mtp_delta_ckpt)
+            .filter(|&p| p > 0 && p <= pfx && p < prompt.len())
+            .filter(|&p| ring_keeps(p, *written_end));
+        if !cached.is_empty()
+            && pfx == cached.len()
+            && pfx < prompt.len()
+            && *written_end == cached.len()
+        {
             pfx
-        } else {
-            // Non-extending prompt (divergent / identical resend / first-ever call): the append-only
-            // recurrent state can't rewind to an arbitrary prefix, so zero every DeltaNet layer's
-            // conv/S state and re-prefill from scratch. ALWAYS zero — a stateful backend's warmup
-            // generation (CPU is a no-op, but Vulkan/Metal run a throwaway "Hi") dirties these
-            // persistent buffers while leaving `cached` empty, so an `is_empty` guard here would
-            // wrongly skip the reset and the first real prompt would inherit the warmup's state.
-            let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
-            let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
-            for l in 0..c.n_layer {
-                if !c.is_qwen35_attn_layer(l) {
-                    be.upload(
-                        kbufs[l].as_ref(),
-                        bytemuck::cast_slice(&vec![0f32; conv_elems]),
-                    )
-                    .map_err(|e| anyhow!("{e}"))?;
-                    be.upload(
-                        vbufs[l].as_ref(),
-                        bytemuck::cast_slice(&vec![0f32; s_elems]),
-                    )
-                    .map_err(|e| anyhow!("{e}"))?;
-                }
+        } else if let Some(p) = resume {
+            let _gp = req.and_then(|r| r.gate_pass());
+            // The slot describes nothing while the copy runs: a copy that fails after some layers
+            // were restored leaves the state half snapshot, half live. With `cached` empty the next
+            // turn zeroes instead of reusing it, and the snapshot — which a failed copy may also
+            // have been read from mid-write — is dropped.
+            cached.truncate(p);
+            let kept = std::mem::take(cached);
+            *written_end = 0;
+            if let Err(e) =
+                super::weights::restore_delta(be, &kbufs[..], &vbufs[..], mtp_delta_ckpt)
+            {
+                super::weights::invalidate_delta(mtp_delta_ckpt);
+                return Err(e);
             }
+            *cached = kept;
+            *written_end = p;
+            p
+        } else {
+            // Non-extending prompt (divergent / identical resend / first-ever call / empty
+            // `cached`): the append-only recurrent state can't rewind to an arbitrary prefix, so
+            // zero every recurrent layer's state and re-prefill from scratch. ALWAYS zero — a
+            // stateful backend's warmup generation (CPU is a no-op, but Vulkan/Metal run a
+            // throwaway "Hi") and `SeamKv::reset` both leave `cached` empty over dirty buffers.
+            // `cached` is cleared first so a failed upload below cannot leave it claiming a
+            // half-zeroed state.
             cached.clear();
+            *written_end = 0;
+            super::weights::invalidate_delta(mtp_delta_ckpt);
+            zero_unrewindable_state(be, c, max_ctx, k_fmt, &kbufs[..], &vbufs[..], &cbufs[..])?;
             0
         }
     } else {
@@ -1521,48 +1674,42 @@ pub(crate) fn generate_dense_backend(
         // plain `prompt.len() - 1` (leave ≥1 prompt token to sample the first logits from).
         common_prefix_len(cached, prompt).min(prompt.len().saturating_sub(1))
     };
-    // SWA ring rewind guard: a ring layer RETAINS only its last `rows_l` positions — rows for
-    // positions older than `cached.len() - rows_l` were recycled by newer writes. Re-prefilling
-    // from `start` attends positions `[start - window, start)` on window layers, so a rewind
-    // deeper than the ring's retained tail would read recycled rows; fall back to a full
-    // re-prefill (start = 0 — correctness over reuse; the full cache never hits this). Extending
-    // turns (start == cached.len()) and the ≤1-token `.min(prompt.len()-1)` rewind stay safe:
-    // rows_l - window >= ubatch >= 1.
-    let start = if kv_ring && start > 0 && start < cached.len() {
-        let safe = (0..c.n_layer)
-            .filter(|&l| c.is_swa_layer(l))
-            .map(|l| crate::seam::kv_rows(c, l, max_ctx, true, ec))
-            .filter(|&rows_l| rows_l < max_ctx) // a never-wrapping layer can't lose positions
-            .all(|rows_l| {
-                let live_from = cached.len().saturating_sub(rows_l);
-                start.saturating_sub(c.swa_window) >= live_from
-            });
-        if safe {
-            start
-        } else {
-            0
-        }
-    } else {
+    // A rewind the SWA ring cannot serve (see `ring_keeps`) falls back to a full re-prefill
+    // (start = 0 — correctness over reuse; the full cache never hits this). Even a turn that
+    // extends `cached` is checked. The recurrent-state arm above should never get here: it only
+    // reuses a state whose `written_end` equals `cached.len()`, and then `ring_keeps` holds
+    // whenever `start` came from a ring that `cached` itself wrote. Should it ever, the state it
+    // kept has consumed `start` tokens, so it is zeroed with the rest rather than read from 0.
+    let start = if ring_keeps(start, *written_end) {
         start
+    } else {
+        debug_assert!(
+            !c.has_unrewindable_state(),
+            "the SWA ring refused a reuse the recurrent-state arm allowed"
+        );
+        if c.has_unrewindable_state() {
+            cached.clear();
+            *written_end = 0;
+            super::weights::invalidate_delta(mtp_delta_ckpt);
+            zero_unrewindable_state(be, c, max_ctx, k_fmt, &kbufs[..], &vbufs[..], &cbufs[..])?;
+        }
+        0
     };
     cached.truncate(start);
-
-    // Paged slot: this call writes rows [start, prompt.len()), so those are the rows it must stop
-    // sharing with the slot it forked from (page by page, device-to-device). Pages past the prefix
-    // are the slot's own already. `refresh` pushes a table a `reset` left behind.
-    if let Some(p) = paged.as_mut() {
-        p.refresh(be)?;
-        p.make_private(be, start, prompt.len())?;
+    // From position 0 every row is rewritten in order before anything reads it.
+    if start == 0 {
+        *written_end = 0;
     }
-    let pg_table = paged.as_ref().map(|p| p.table.as_ref() as &dyn Buffer);
-    let pg_desc = paged.as_ref().map(|p| {
-        let pool = p.map.pool();
-        (
-            pool.table_len(),
-            p.row_base(),
-            pool.slot_rows() * pool.blocks(),
-        )
-    });
+    // qwen35: every prefill step advances the DeltaNet state past `start`, and that cannot be
+    // undone. What keeps an error return in between (a cancelled prefill, a failed submit) from
+    // reusing that state is `written_end`: it is raised before each execute, so it ends up past
+    // `cached.len()` and the reuse arm above refuses. Emptying `cached` until this call records
+    // what it fed (the verify return and the teardown below) is a deliberate backstop to that.
+    // The one effect of its own: with `cached` empty, the next call cannot take the
+    // snapshot-resume arm either, so it re-prefills from zero rather than from the snapshot.
+    if c.has_unrewindable_state() && denoise_req.is_none() {
+        cached.clear();
+    }
 
     // Build a forward graph for `batch` tokens starting at absolute position `start_pos`.
     // `batch = 1` is the normal decode path; `batch > 1` is the batched-prefill path.
@@ -1601,10 +1748,11 @@ pub(crate) fn generate_dense_backend(
     // GPU-sampling ops bake the sampler config into the graph.
     let sampler = crate::sampling::Sampler::resolve(req, &ec.sampling);
     let mut rng = crate::sampling::resolve_seed(req, &ec.sampling);
-    // Repetition penalties (`infr serve`'s presence/frequency/repeat request fields). `None` for
-    // every non-serve caller AND for any request that leaves them at their neutral defaults — see
-    // `Penalties::resolve`. When active they must MUTATE the logits row, so they force the host
-    // sampling path below (exactly like a grammar constraint does).
+    // Repetition penalties and `logit_bias` (`infr serve`'s presence/frequency/repeat and
+    // logit_bias request fields). `None` for every non-serve caller AND for any request that leaves
+    // them at their neutral defaults — see `Penalties::resolve`. When active they must MUTATE the
+    // logits row, so they force the host sampling path below (exactly like a grammar constraint
+    // does).
     let mut penalties = crate::sampling::Penalties::resolve(req);
     let penalize = penalties.is_some();
     // GPU-resident greedy sampling (`Op::Argmax` appended to the decode graph): only the 4-byte
@@ -1619,43 +1767,40 @@ pub(crate) fn generate_dense_backend(
     // inverse-CDF'd with a host-drawn uniform uploaded as 4 bytes/token — the host consumes the
     // SAME xorshift stream as the host sampler (`next_uniform`), so the two paths are
     // distribution-identical. Gate mirrors the kernel bound (2..=SAMPLE_KMAX); top_k == 0
-    // (full-vocab) and grammar-constrained decodes keep the host path. INFR_NO_GPU_SAMPLE = A/B.
+    // (full-vocab), a `min_p` cut (the kernel has none) and grammar-constrained decodes keep the
+    // host path. `gpu_argmax` needs no such guard: min-p always keeps the top token.
+    // INFR_NO_GPU_SAMPLE = A/B.
     let gpu_sample = !gpu_argmax
         && sampler.temp > 0.0
         && (2..=infr_vulkan::Recorder::SAMPLE_KMAX).contains(&sampler.top_k)
+        && sampler.min_p <= 0.0
         && constraint.is_none()
         && !penalize
         && caps.gpu_sample
         && ec.spec.gpu_sample;
 
-    // DeepSeek V4: the `compress_ratio == 0` tier emits (hyper-connections, MQA attention with
-    // sinks and the grouped output projection, MoE with the per-layer SwiGLU clamp under EITHER
-    // routing — the router bias, or the `ffn_gate_tid2eid` hash table). What is left below is the
-    // compressed tiers, refused by name rather than approximated because they would otherwise run
-    // and produce plausible wrong numbers, plus the shape facts the emit assumes. Placed after the
-    // weight upload on purpose, exactly as the deepseek32 slice was: a `deepseek4` GGUF still gets
-    // every tensor it declares validated end to end. See docs/deepseek.md § Stage 4.
+    // DeepSeek V4: every tier emits (hyper-connections, MQA attention with sinks and the grouped
+    // output projection, the HCA and CSA compressors with the CSA tier's lightning indexer and the
+    // two-segment attention, MoE with the per-layer SwiGLU clamp under EITHER routing — the router
+    // bias, or the `ffn_gate_tid2eid` hash table); a compressed layer on a GPU is refused above.
+    // What is left below is the shape facts the emit assumes, refused by name rather than run into
+    // plausible wrong numbers. Placed after the weight upload on purpose, exactly as the deepseek32
+    // slice was: a `deepseek4` GGUF still gets every tensor it declares validated end to end. See
+    // docs/deepseek.md § Stage 4.
     if c.deepseek4 {
-        // Ratios 4 and 128. Their compressed caches, the three compressor states, the per-channel
-        // softmax pooling op and the block-counting lightning indexer are all still missing — see
-        // docs/backlog.md § B-DSV4-WIRING slice B. Naming the layer AND its ratio, because a real
-        // V4 file mixes tiers and "which layer" is the first thing to know.
-        if let Some((l, r)) = (0..c.n_layer)
-            .map(|l| (l, c.layer_compress_ratio(l)))
-            .find(|&(_, r)| r != 0)
-        {
-            return Err(anyhow!(
-                "arch=deepseek4 (DeepSeek V4) layer {l} has compress_ratio {r}: only the ratio-0 \
-                 tier (pure sliding window) generates. A compressed layer needs the {} compressor \
-                 over blocks of {r} tokens, its persistent compressor state, the CSA/HCA block \
-                 cache{} — none of which is implemented. See docs/deepseek.md § Stage 4.",
-                if r == 4 { "CSA" } else { "HCA" },
-                if r == 4 {
-                    " and the lightning indexer with its own compressor + LID cache"
-                } else {
-                    ""
-                },
-            ));
+        // The lightning indexer of a ratio-4 layer ropes the same `rope_dim` tail of its heads as
+        // every other head of the layer (`build_lid_top_k`'s `n_rot()`), so its key must be at
+        // least that wide. (`Config::from_gguf` refuses a zero head count, key width or top_k.)
+        if let Some(l) = (0..c.n_layer).find(|&l| c.layer_compress_ratio(l) == 4) {
+            if c.indexer_head_size < c.rope_dim {
+                return Err(anyhow!(
+                    "arch=deepseek4 (DeepSeek V4) layer {l} has compress_ratio 4, but the \
+                     lightning indexer's attention.indexer.key_length {} is narrower than \
+                     rope.dimension_count {}, the tail every head of a compressed layer ropes.",
+                    c.indexer_head_size,
+                    c.rope_dim,
+                ));
+            }
         }
         // Hash-routed layers: `Op::GatherI32` reads the token's row of `ffn_gate_tid2eid` and
         // `Op::MoeFfn::expert_ids` runs those experts. Two things the emit assumes and the file
@@ -1771,28 +1916,12 @@ pub(crate) fn generate_dense_backend(
             l_first == 0 || !e2b,
             "gemma4-E2B cannot start a layer span past layer 0 (per_layer_inp is prologue-built)"
         );
-        // Backstop for the `c.deepseek4` refusals above. `wpush` below declares V4's handles in
-        // lockstep with the upload loop, and a compressed (ratio 4/128) layer uploads FOUR to TEN
-        // more tensors than the ratio-0 arm declares — so reaching the builder with one would bind
-        // every later weight in the layer, and every weight of every later layer, one buffer off.
-        // Silently. Fail at the seam instead of somewhere inside a kernel.
-        assert!(
-            !c.deepseek4 || (0..c.n_layer).all(|l| c.layer_compress_ratio(l) == 0),
-            "deepseek4 reached the graph builder with a non-zero compress_ratio: `wpush`'s Dsv4 arm \
-             declares the ratio-0 tensor set only, so the refusal in `generate_dense_backend` must \
-             not be removed until the compressed tiers have handles of their own"
-        );
-        // The widened `[batch, hc_mult, n_embd]` residual stream lives in graph scratch and is
-        // collapsed back to `[batch, n_embd]` only by the model head. A partial layer span carries
-        // its residual in the caller's `hidden` buffer, which is `n_embd` wide — there is nowhere
-        // to hand the other `hc_mult - 1` streams over. `decode_start`'s batched-prefill gate keeps
-        // V4 off that path entirely (see it); this is the backstop.
-        assert!(
-            !c.deepseek4 || (l_first == 0 && l_end == c.n_layer),
-            "deepseek4 cannot be built as a partial layer span ({l_first}..{l_end} of {}): the \
-             hyper-connection residual is hc_mult streams wide and a span hands over one",
-            c.n_layer
-        );
+        // DeepSeek V4's residual is the widened `[batch, hc_mult, n_embd]` stream, which only the
+        // model head collapses back to `[batch, n_embd]`; `hidden` is just the embedding it is
+        // widened from. A PARTIAL layer span therefore carries the wide stream itself, in a
+        // caller-owned Input (`DecodeHandles::hc_resid`): the span that starts the stack widens
+        // `hidden` into it, every span advances it in place, and no partial span runs the head.
+        let hc_carry = c.deepseek4 && (l_first, l_end) != (0, c.n_layer);
         let mut g = Graph::new();
         g.mtp_verify = mtp_verify;
         // DiffusionGemma: force the per-execute STATIC path for every graph of this model (see
@@ -1819,15 +1948,9 @@ pub(crate) fn generate_dense_backend(
         // EMBEDDING is gathered on-device — `gpu_embed` gates on a `token_embd` dtype the gather
         // kernels cover, which a model can fail while still being hash-routed. The ids Input is
         // therefore declared for either reason; only `use_ids` also makes `hidden` an Internal.
+        // On a host-embedded span (`use_ids == false`) the chunked prefill binds these ids from a
+        // buffer of their own (`PfChunk::ids`), since its `input` then holds the f32 rows.
         let hash_gather = c.deepseek4 && (l_first..l_end).any(|l| c.is_hash_moe_layer(l));
-        // A chunked batched prefill uploads HOST-EMBEDDED f32 rows into the buffer it would
-        // otherwise bind to the ids (see the `PfChunk::input` bind), so there is nowhere to put
-        // them on a `use_ids == false` span. `batched_prefill_ok` excludes V4 outright; this names
-        // the reason at the point that depends on it.
-        assert!(
-            !hash_gather || use_ids || span.is_none(),
-            "a hash-routed deepseek4 layer span cannot be built without the token-id input"
-        );
         // GPU embed gather: `hidden` becomes an Internal computed by the Op::EmbedGather pushed
         // just before the first layer op (after the table weight handle is declared) — unless a
         // layer span asked for it in a caller-owned buffer, where the gather writes the Input.
@@ -1877,20 +2000,16 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
-        // qwen35 DeltaNet layers have no KV cache — `k_cache[l]`/`v_cache[l]` instead declare that
-        // layer's conv-state / DeltaNet-S-state Inputs (see the matching alloc in
-        // `generate_dense_backend` and `MixerW::DeltaNet`'s use of them below).
-        // Paged session: every pooled layer reads through this one table, so the graph declares it
-        // once and the adapter finds the same table on every pooled cache's `pages` map.
-        let page_table = pg_desc.map(|(len, _, _)| g.input(f32d(len)));
+        // Recurrent layers (qwen35 DeltaNet, LFM short convolution) have no KV cache —
+        // `k_cache[l]`/`v_cache[l]` instead declare that layer's state Inputs (see the matching
+        // alloc in `generate_dense_backend`, `Config::recurrent_state_elems`, and the
+        // `MixerW::DeltaNet` / `MixerW::ShortConv` emits below).
         let mut k_cache = Vec::new();
         let mut v_cache = Vec::new();
         for l in 0..c.n_layer {
-            if c.qwen35 && !c.is_qwen35_attn_layer(l) {
-                let conv_elems = (c.ssm_d_conv - 1) * c.q35_conv_channels();
-                let s_elems = c.q35_num_v_heads() * c.q35_head_k_dim() * c.q35_head_v_dim();
-                k_cache.push(g.input(f32d(conv_elems)));
-                v_cache.push(g.input(f32d(s_elems)));
+            if let Some((k_elems, v_elems)) = c.recurrent_state_elems(l) {
+                k_cache.push(g.input(f32d(k_elems)));
+                v_cache.push(g.input(f32d(v_elems)));
                 continue;
             }
             // Declared rows MUST equal the allocation above — same widths from the same helper
@@ -1898,51 +2017,54 @@ pub(crate) fn generate_dense_backend(
             // every backend derives the ring's row capacity from this declared element count
             // (row = pos % (numel / row_width)).
             let (k_row, v_row) = crate::seam::kv_row_elems(c, l);
-            let rows_l = crate::seam::kv_rows(c, l, max_ctx, kv_ring, ec);
-            let (mut kdesc, mut vdesc) = (
-                kd(crate::seam::kv_side_elems(rows_l * k_row)),
-                vd(crate::seam::kv_side_elems(rows_l * v_row)),
-            );
-            // A pooled layer declares the WHOLE pool: the kernels address rows by physical page,
-            // and the block bias keeps a slot's own writes inside its block.
-            if let (Some((_, row_base, pool_rows)), Some(table)) = (pg_desc, page_table) {
-                if crate::seam::paged_layer(c, l) {
-                    let pages = infr_core::tensor::PageMap {
-                        table,
-                        page_rows: infr_vulkan::paged::PAGE_ROWS as u32,
-                        row_base,
-                    };
-                    kdesc = kd(crate::seam::kv_side_elems(pool_rows * k_row));
-                    kdesc.pages = Some(pages);
-                    vdesc = vd(crate::seam::kv_side_elems(pool_rows * v_row));
-                    vdesc.pages = Some(pages);
-                }
-            }
-            k_cache.push(g.input(kdesc));
-            v_cache.push(g.input(vdesc));
+            let rows_l =
+                crate::seam::kv_rows_at(c, l, max_ctx, kv_ring, ring_ubatch, be.kv_row_align());
+            let k = g.input(kd(crate::seam::kv_side_elems(rows_l * k_row)));
+            k_cache.push(k);
+            // deepseek4 has no V cache: its V handle is the K cache, so no dead placeholder Input
+            // exists for an executor to load each step (`crate::seam::kv_row_elems`).
+            v_cache.push(if c.deepseek4 {
+                k
+            } else {
+                g.input(vd(crate::seam::kv_side_elems(rows_l * v_row)))
+            });
         }
+        // DeepSeek V4 compressed layers' block caches and state rings, declared at the geometry
+        // the session allocated them with (`crate::seam::dsv4_comp_bufs`).
+        let comp: Vec<Vec<TensorId>> = (0..c.n_layer)
+            .map(|l| {
+                crate::seam::dsv4_comp_bufs(c, l, max_ctx, k_fmt)
+                    .iter()
+                    .map(|b| g.input(TensorDesc::new(vec![b.elems], b.dtype)))
+                    .collect()
+            })
+            .collect();
+        // The compressor plan of this graph's positions, per tier, with the per-step inputs it
+        // declares (`super::dsv4_emit::Dsv4Tiers`).
+        let mut step_i32: Vec<(TensorId, Vec<i32>)> = Vec::new();
+        let dsv4_tiers = c.deepseek4.then(|| {
+            super::dsv4_emit::Dsv4Tiers::new(
+                &mut g,
+                c,
+                l_first..l_end,
+                start_pos,
+                batch,
+                max_ctx,
+                k_fmt,
+                &mut step_i32,
+            )
+        });
 
         // Weights — declared in the SAME order as the upload loop, pulling (dtype, numel) from
         // `wspecs` so each handle carries its native GGUF dtype (the backend dequants on read).
         // `wpush` records the handle in the flat `weights` list (for binding) and returns it.
         let mut weights: Vec<TensorId> = Vec::new();
         let mut wi = 0usize;
-        let mut exl3_handles = std::collections::HashMap::new();
         let mut wpush = |g: &mut Graph, weights: &mut Vec<TensorId>| -> TensorId {
-            let native = exl3_specs.get(&wi).copied();
             let (dt, n) = wspecs[wi];
             wi += 1;
             let id = g.weight(TensorDesc::new(vec![n], dt));
             weights.push(id);
-            if let Some(spec) = native {
-                let (dt, n) = wspecs[wi];
-                let suh = g.weight(TensorDesc::new(vec![n], dt));
-                let (dt, n) = wspecs[wi + 1];
-                let svh = g.weight(TensorDesc::new(vec![n], dt));
-                wi += 2;
-                weights.extend([suh, svh]);
-                exl3_handles.insert(id, (suh, svh, spec));
-            }
             id
         };
         let mut lw: Vec<LayerW> = Vec::new();
@@ -1951,8 +2073,9 @@ pub(crate) fn generate_dense_backend(
             // qwen35 gated-DeltaNet layer: 9 mixer weights, no q/k/v/qk_norm/bias/wo at all (mirrors
             // the `wload` skip above). `is_delta` is `false` for every non-qwen35 model.
             let is_delta = c.qwen35 && !c.is_qwen35_attn_layer(l);
+            let is_sc = c.is_shortconv_layer(l);
             let is_mla = c.deepseek2;
-            let mixer = if c.deepseek4 {
+            let mut mixer = if c.deepseek4 {
                 // EXACT order of `wload`'s `is_dsv4` arm — `wpush` consumes `wspecs` sequentially,
                 // so one handle out of place binds every later weight in the model one buffer off,
                 // silently. The two hyper-connection triples are pushed right after `wo_b` for the
@@ -1966,6 +2089,8 @@ pub(crate) fn generate_dense_backend(
                     wkv_norm: wpush(&mut g, &mut weights),
                     wo_a: wpush(&mut g, &mut weights),
                     wo_b: wpush(&mut g, &mut weights),
+                    // Declared after the hyper-connection triples below, in upload order.
+                    comp: None,
                 })
             } else if is_mla {
                 let (wq_a, q_a_norm) = if c.is_lite {
@@ -2025,15 +2150,22 @@ pub(crate) fn generate_dense_backend(
                     ssm_norm,
                     out,
                 })
+            } else if is_sc {
+                // `wload`'s `is_sc` arm: in_proj, conv, out_proj.
+                MixerW::ShortConv(ShortConvW {
+                    in_proj: wpush(&mut g, &mut weights),
+                    conv: wpush(&mut g, &mut weights),
+                    out_proj: wpush(&mut g, &mut weights),
+                })
             } else {
                 // Fused QKV: ONE concatenated weight handle serves q/k/v (the builder bakes each
                 // projection's `w_off` slice); split form declares three.
                 let (wq, wk, wv) = if fuse_qkv {
                     let wqkv = wpush(&mut g, &mut weights);
-                    (wqkv, Some(wqkv), Some(wqkv))
+                    (wqkv, wqkv, Some(wqkv))
                 } else {
                     let wq = wpush(&mut g, &mut weights);
-                    let wk = has_wk[l].then(|| wpush(&mut g, &mut weights));
+                    let wk = wpush(&mut g, &mut weights);
                     let wv = if has_wv[l] {
                         Some(wpush(&mut g, &mut weights))
                     } else {
@@ -2054,12 +2186,16 @@ pub(crate) fn generate_dense_backend(
                     (None, None, None)
                 };
                 let (q_norm, k_norm) = if qk_norm {
-                    let q_norm = Some(wpush(&mut g, &mut weights));
-                    (q_norm, has_k_norm[l].then(|| wpush(&mut g, &mut weights)))
+                    (
+                        Some(wpush(&mut g, &mut weights)),
+                        Some(wpush(&mut g, &mut weights)),
+                    )
                 } else {
                     (None, None)
                 };
                 let wo = wpush(&mut g, &mut weights);
+                // LFM3's `attn_gate`, loaded right after `attn_output`.
+                let head_gate = c.lfm3.then(|| wpush(&mut g, &mut weights));
                 MixerW::Attn(AttnW {
                     wq,
                     wk,
@@ -2070,6 +2206,7 @@ pub(crate) fn generate_dense_backend(
                     q_norm,
                     k_norm,
                     wo,
+                    head_gate,
                 })
             };
             // DeepSeek V4's two hyper-connection triples, in `wload`'s order: attn `(fn, base,
@@ -2086,6 +2223,30 @@ pub(crate) fn generate_dense_backend(
                     scale: wpush(&mut g, &mut weights),
                 },
             });
+            // A compressed V4 layer's compressor, then a ratio-4 layer's indexer: `wload`'s
+            // `ratio != 0` and `ratio == 4` blocks, which upload right after the two triples.
+            if let MixerW::Dsv4(d) = &mut mixer {
+                let ratio = c.layer_compress_ratio(l);
+                // One compressor's four handles, in `wload`'s `kv, gate, ape, norm` order (a
+                // struct expression evaluates its fields in the order written).
+                fn compressor(mut next: impl FnMut() -> TensorId) -> Dsv4CompressorW {
+                    Dsv4CompressorW {
+                        kv: next(),
+                        gate: next(),
+                        ape: next(),
+                        norm: next(),
+                    }
+                }
+                if ratio != 0 {
+                    let attn = compressor(|| wpush(&mut g, &mut weights));
+                    let indexer = (ratio == 4).then(|| Dsv4IndexerW {
+                        proj: wpush(&mut g, &mut weights),
+                        attn_q_b: wpush(&mut g, &mut weights),
+                        comp: compressor(|| wpush(&mut g, &mut weights)),
+                    });
+                    d.comp = Some(Dsv4CompW { attn, indexer });
+                }
+            }
             // bitnet SubLN attention-output norm — mirrors the `wload` push right after
             // `attn_output.weight` (loaded under the same `c.sub_norm && !is_delta` gate; bitnet
             // has no DeltaNet layers, so `is_delta` is always false there).
@@ -2094,7 +2255,7 @@ pub(crate) fn generate_dense_backend(
             } else {
                 None
             };
-            let post_attn = if gemma {
+            let post_attn = if c.sandwich_norm {
                 Some(wpush(&mut g, &mut weights))
             } else {
                 None
@@ -2180,7 +2341,7 @@ pub(crate) fn generate_dense_backend(
             } else {
                 None
             };
-            let post_ffw = if gemma {
+            let post_ffw = if c.sandwich_norm {
                 Some(wpush(&mut g, &mut weights))
             } else {
                 None
@@ -2358,8 +2519,14 @@ pub(crate) fn generate_dense_backend(
         //   hc_pre / hc_post   [batch, hc]      collapse weights / per-stream output gates
         //   hc_comb    [batch, hc, hc]          Sinkhorn-normalised mixing matrix
         let hcw = c.hc_mult * ne;
+        // `hcr[0]` is where the stream stands at every layer boundary, so it is the one a partial
+        // span carries (`hc_carry`).
         let hcr = [
-            g.internal(f32d(batch * hcw.max(1))),
+            if hc_carry {
+                g.input(f32d(batch * hcw))
+            } else {
+                g.internal(f32d(batch * hcw.max(1)))
+            },
             g.internal(f32d(batch * hcw.max(1))),
         ];
         let hc_normed = g.internal(f32d(batch * hcw.max(1)));
@@ -2472,6 +2639,15 @@ pub(crate) fn generate_dense_backend(
         let dn_bbuf = g.internal(f32d(batch * q35_nv.max(1)));
         let dn_abuf = g.internal(f32d(batch * q35_nv.max(1)));
         let dn_out = g.internal(f32d(batch * (q35_nv * q35_vd).max(1)));
+        // LFM3 scratch, declared only for LFM3: the short convolution's B | C | X in-projection and
+        // its output, and the attention layers' per-head gate logits.
+        let lfm_scratch = c.lfm3.then(|| {
+            (
+                g.internal(f32d(batch * 3 * ne)),
+                g.internal(f32d(batch * ne)),
+                g.internal(f32d(batch * nh)),
+            )
+        });
 
         let eps = c.rms_eps;
 
@@ -2750,8 +2926,9 @@ pub(crate) fn generate_dense_backend(
         // and neither it nor `docs/backlog.md` § B-DSV4-WIRING records how the reference seeds the
         // widened stream. Replicating the input across streams is what the hyper-connections
         // formulation calls for and what makes the head's collapse a partition of unity at depth 0;
-        // it is recorded as unverified in `docs/backlog.md` § B-DSV4-HC.
-        if c.deepseek4 {
+        // it is recorded as unverified in `docs/backlog.md` § B-DSV4-HC. Part of the prologue: a
+        // span past layer 0 reads the stream an earlier span left in `hcr[0]`.
+        if c.deepseek4 && prologue {
             for h in 0..c.hc_mult {
                 g.push(Op::CopyStrided {
                     src: hidden,
@@ -2776,10 +2953,11 @@ pub(crate) fn generate_dense_backend(
             let theta = c.layer_rope_theta(l); // gemma dual-rope (SWA 1e4 / full 1e6); uniform else
             let rope_dim = c.layer_rope_dim(l);
             // EVERY deepseek4 layer is sliding-window (`set_swa_pattern(0)`) — never `Causal`.
-            let swa = (gemma || c.deepseek4) && c.is_swa_layer(l);
-            // llama4 iRoPE: NoPE (global) layers skip rope entirely; rope (local) layers apply a
-            // weightless per-head L2-norm to Q/K AFTER rope (`Llama4TextL2Norm`). `l2norm` is the
-            // ones-vector handle on llama4 rope layers, `None` on NoPE layers and every other model.
+            let swa = (gemma || c.deepseek4 || c.lfm3) && c.is_swa_layer(l);
+            // NoPE layers (llama4 iRoPE's global layers, smollm3's) skip rope entirely; llama4's
+            // rope (local) layers apply a weightless per-head L2-norm to Q/K AFTER rope
+            // (`Llama4TextL2Norm`). `l2norm` is the ones-vector handle on llama4 rope layers,
+            // `None` on NoPE layers and every other model.
             let nope = c.is_nope_layer(l);
             let l2norm = if nope { None } else { qk_ones };
             // DiffusionGemma canvas denoise (docs/diffusion-gemma.md): every canvas query attends
@@ -2806,8 +2984,15 @@ pub(crate) fn generate_dense_backend(
             } else {
                 1.0 / (hd as f32).sqrt()
             };
-            // gemma4 proportional-RoPE applies only on full-attention layers.
-            let layer_ff = if gemma4 && !swa { rope_freqs } else { None };
+            // gemma4 proportional-RoPE and LFM3's `rope_freqs` apply only on full-attention layers
+            // (both loaders create the tensor for the non-window layers alone); llama/llama4's
+            // factors on every layer that ropes (a NoPE layer emits no rope at all).
+            // `rope_freqs` is `None` for every other arch (see `session_stable`).
+            let layer_ff = if (gemma4 || c.lfm3) && swa {
+                None
+            } else {
+                rope_freqs
+            };
             // DeepSeek V4's per-layer SwiGLU clamps: `swiglu_clamp_exp[il]` on the ROUTED experts
             // and `swiglu_clamp_shexp[il]` on the shared one — two different hparam arrays, so the
             // two can differ within a layer. `infr_core::graph::swiglu_clamp` owns the
@@ -2875,8 +3060,9 @@ pub(crate) fn generate_dense_backend(
                 });
                 // Strided DeltaNet: when INFR_DELTA_STRIDED=1 and batch==1 (decode only —
                 // the chunked prefill path doesn't support stride), q/k/v read from conv_out,
-                // skipping 3 CopyStrided dispatches per layer.
-                let delta_strided = batch == 1 && ec.kernels.vulkan.delta_strided;
+                // skipping 3 CopyStrided dispatches per layer. Only on a backend that honours
+                // the stride (`Backend::deltanet_strided`).
+                let delta_strided = batch == 1 && delta_strided_ok;
                 if !delta_strided {
                     g.push(Op::CopyStrided {
                         src: dn_convout,
@@ -2948,7 +3134,7 @@ pub(crate) fn generate_dense_backend(
                     head_k: q35_kd as u32,
                     head_v: q35_vd as u32,
                     eps: 1e-6,
-                    src_stride: 0,
+                    src_stride: if delta_strided { q35_cc as u32 } else { 0 },
                 });
                 // silu-gated RMSNorm per v-head: rmsnorm(out, ssm_norm) then * silu(z). Fused into
                 // ONE dispatch when the backend supports it (see `fuse_gated_rmsnorm`'s doc) — the
@@ -3001,13 +3187,47 @@ pub(crate) fn generate_dense_backend(
                 });
                 // DeltaNet's residual contribution is already in `sub` — skip the attention-only
                 // code below (query/key/value projections, RoPE, Attention, o-proj) entirely.
+            } else if let MixerW::ShortConv(sw) = &lw.mixer {
+                // LFM gated short convolution (`build_lfm_shortconv`): in_proj to B | C | X, then
+                // C ⊙ conv(B ⊙ X) with the history in `k_cache[l]`, then out_proj.
+                let (bcx, conv, _) =
+                    lfm_scratch.expect("an LFM short-convolution layer declares its scratch");
+                g.push(Op::Linear {
+                    x: hn,
+                    weight: sw.in_proj,
+                    dst: bcx,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: (3 * ne) as u32,
+                    w_off: 0,
+                });
+                g.push(Op::ShortConv {
+                    bcx,
+                    weight: sw.conv,
+                    state: k_cache[l],
+                    dst: conv,
+                    rows: batch as u32,
+                    channels: ne as u32,
+                    kernel: c.shortconv_l_cache as u32,
+                });
+                g.push(Op::Linear {
+                    x: conv,
+                    weight: sw.out_proj,
+                    dst: sub,
+                    m: batch as u32,
+                    in_f: ne as u32,
+                    out_f: ne as u32,
+                    w_off: 0,
+                });
             } else if let MixerW::Dsv4(mw) = &lw.mixer {
-                // ── DeepSeek V4 attention, `compress_ratio == 0` (pure sliding window) ─────────
-                // `docs/deepseek.md` § Stage 4. Every non-zero ratio was refused before the graph
-                // was built, so this arm is the WHOLE of V4's attention today.
+                // ── DeepSeek V4 attention ─────────────────────────────────────────────────────
+                // `docs/deepseek.md` § Stage 4. A ratio-0 layer is pure sliding window; a ratio-128
+                // (HCA) layer adds its compressor between the raw cache write and the attention,
+                // and attends its compressed cache beside the raw window; a ratio-4 (CSA) layer
+                // adds two compressors and the lightning indexer, and attends the CSA rows the
+                // indexer keeps.
                 let hd4 = c.head_dim as u32; // MQA: one KV head of this width serves every q head
                 let rd = c.rope_dim as u32;
-                let nope4 = hd4 - rd; // the head is [nope | rope]; the ROPED dims are LAST
                 let qrow4 = (nh as u32) * hd4;
                 let qlr = c.q_lora_rank as u32;
                 let ogc = c.o_group_count as u32;
@@ -3015,11 +3235,12 @@ pub(crate) fn generate_dense_backend(
                 let hdg = qrow4 / ogc;
                 // Ratio-0 layers rope PLAIN: `deepseek4.cpp` passes `freq_scale = 1`,
                 // `ext_factor = 0` and both betas 0 there, so there is no YaRN ramp and no mscale
-                // — only the compressed tiers use `compress_rope_theta` with YaRN. That is also
-                // what makes the `backward` de-rope below an exact inverse of the forward rope
-                // (`Op::Rope::backward`'s doc: ggml's forward-then-back scales by mscale², and V4
-                // cancels mscale to 1 at every one of its rope call sites).
-                let theta4 = c.rope_theta;
+                // — only the compressed tiers use `compress_rope_theta` with YaRN, on every rope
+                // of the layer (`Dsv4Rope::for_layer`). Either way the `backward` de-rope below is
+                // an exact inverse of the forward rope (`Op::Rope::backward`'s doc: ggml's
+                // forward-then-back scales by mscale², and V4 cancels mscale to 1 at every one of
+                // its rope call sites).
+                let rope4 = super::dsv4_emit::Dsv4Rope::for_layer(c, l, yarn_ff);
 
                 // Q: wq_a → q_a_norm → wq_b, then a WEIGHTLESS per-head RMS norm (bare
                 // `ggml_rms_norm` after the reshape to [head_dim, n_head, n_tokens] — there is no
@@ -3060,59 +3281,20 @@ pub(crate) fn generate_dense_backend(
                     eps,
                     x_stride: 0,
                 });
-                // Rope the head's TAIL. `Op::Rope` rotates `[0, rope_dim)` of each head and passes
-                // the rest through, so the roped slice is extracted, rotated and written back —
-                // the same dance the MLA arm does for `k_pe`, in ONE `CopyStrided` each way: with
-                // `rows = batch*n_head` and `src_stride = head_dim`, row `b*n_head+h` is exactly
-                // head `h` of token `b`, and `src_off = nope` lands on its rope tail. The packed
-                // `[batch, n_head, rope_dim]` result is then a plain `n_head`-head rope row.
+                // Rope the head's TAIL: `Dsv4Rope::tail` extracts each head's rope slice, rotates
+                // it and writes it back, the same dance the MLA arm does for `k_pe`.
                 let rope_tail = |g: &mut Graph, x: TensorId, pack: TensorId, heads: u32, back| {
-                    g.push(Op::CopyStrided {
-                        src: x,
-                        src_off: nope4,
-                        src_stride: hd4,
-                        dst: pack,
-                        dst_off: 0,
-                        dst_stride: rd,
-                        rows: (batch as u32) * heads,
-                        n: rd,
-                    });
-                    g.push(Op::Rope {
-                        x: pack,
-                        positions,
-                        dst: pack,
-                        rows: batch as u32,
-                        n_head: heads,
-                        head_dim: rd,
-                        rope_dim: rd,
-                        theta: theta4,
-                        freq_factors: None,
-                        x_stride: 0,
-                        // NORM (interleaved pairs) — `llama_model::rope_type` puts DEEPSEEK4 in
-                        // the NORM group, and V4's indexer does NOT inherit V3.2's NEOX override
-                        // (docs/deepseek.md § Stage 4, "Two corrections").
-                        neox: false,
-                        backward: back,
-                    });
-                    g.push(Op::CopyStrided {
-                        src: pack,
-                        src_off: 0,
-                        src_stride: rd,
-                        dst: x,
-                        dst_off: nope4,
-                        dst_stride: hd4,
-                        rows: (batch as u32) * heads,
-                        n: rd,
-                    });
+                    rope4.tail(g, x, pack, batch as u32, heads, positions, back);
                 };
                 if rd > 0 {
                     rope_tail(&mut g, q, d4_rq, nh as u32, false);
                 }
 
                 // KV: ONE head for the whole layer (`attn_kv` is `[n_embd, head_dim]`), RMS-normed
-                // over the full row, then roped on the same tail. Written to BOTH cache sides —
-                // V4's attention is `build_attn_mha(q, k_all, k_all, …)`, so V IS K; see
-                // `crate::seam::kv_row_elems` for why they are two buffers here rather than one.
+                // over the full row, then roped on the same tail. Written ONCE, to the K cache:
+                // V4's attention is `build_attn_mha(q, k_all, k_all, …)`, so V IS K and the
+                // attention below reads that one cache as both sides (`crate::seam::kv_row_elems`
+                // gives the V side no rows).
                 g.push(Op::Linear {
                     x: hn,
                     weight: mw.wkv,
@@ -3133,17 +3315,35 @@ pub(crate) fn generate_dense_backend(
                 if rd > 0 {
                     rope_tail(&mut g, d4_kv, d4_rkv, 1, false);
                 }
-                for cache in [k_cache[l], v_cache[l]] {
-                    g.push(Op::WriteKv {
-                        src: d4_kv,
-                        cache,
-                        rows: batch as u32,
-                        row_stride: hd4,
-                        pos: start_pos as u32,
-                    });
-                }
+                g.push(Op::WriteKv {
+                    src: d4_kv,
+                    cache: k_cache[l],
+                    rows: batch as u32,
+                    row_stride: hd4,
+                    pos: start_pos as u32,
+                });
+                // A compressed layer's compressors commit every block this graph completes BEFORE
+                // the attention below, so the token that completes a block attends it.
+                let comp_seg = mw.comp.as_ref().and_then(|cw| {
+                    dsv4_tiers
+                        .as_ref()
+                        .expect("a V4 graph declares its compressed tiers")
+                        .emit(
+                            &mut g,
+                            c,
+                            cw,
+                            super::dsv4_emit::Dsv4LayerIn {
+                                x: hn,
+                                qr: d4_qa,
+                                positions,
+                            },
+                            &comp[l],
+                            rope4,
+                            eps,
+                        )
+                });
                 // The attention kernels read an **f16** q (`q16`), so the normed+roped f32 query is
-                // cast into it exactly as llama4's NoPE layer casts its unroped one — `Op::Copy`,
+                // cast into it exactly as a NoPE layer casts its unroped one — `Op::Copy`,
                 // whose lowering does the f32→f16 conversion. The rope itself has to stay on the
                 // f32 buffer: Vulkan's `backward` rope build is f32-out only, and the de-rope reads
                 // the ATTENTION OUTPUT, not this.
@@ -3157,7 +3357,7 @@ pub(crate) fn generate_dense_backend(
                 g.push(Op::Attention {
                     q: q16,
                     k_cache: k_cache[l],
-                    v_cache: v_cache[l],
+                    v_cache: k_cache[l],
                     dst: attn,
                     rows: batch as u32,
                     kv_len: (start_pos + batch) as u32,
@@ -3170,9 +3370,10 @@ pub(crate) fn generate_dense_backend(
                     mask,
                     pos: start_pos as u32,
                     sinks: Some(mw.sinks),
-                    // CSA's top-k score bias is not wired into this builder yet (see
-                    // `docs/backlog.md`) — landed but unwired, same as `Op::CompressPool` was.
+                    // V4 has no raw-side score bias; CSA's top-k selection rides the compressed
+                    // segment's own `bias`.
                     key_bias: None,
+                    comp: comp_seg,
                 });
                 // DE-ROPE the attention output's rope slice, per head, by the QUERY position —
                 // `ggml_rope_ext_back` at the same theta and layout as the forward q rope. Nothing
@@ -3429,6 +3630,7 @@ pub(crate) fn generate_dense_backend(
                             top_k: ix_top_k as u32,
                             scale: 1.0 / ((ix_hd * ix_nh) as f32).sqrt(),
                             pos: start_pos as u32,
+                            block_ratio: 1,
                         });
                         // Expand the indices into the additive `-inf`-outside-top-k score mask the
                         // MLA kernels add. llama.cpp materialises the same mask and runs DENSE
@@ -3540,16 +3742,19 @@ pub(crate) fn generate_dense_backend(
                 // `mscale²` where `mscale = attn_factor_org * (1 + 0.1*log_mul*ln(1/freq_scale))`
                 // and `attn_factor_org = yarn_attn_factor * (1 + 0.1*ln(1/freq_scale))` with
                 // `yarn_attn_factor = 1/(1 + 0.1*ln(1/freq_scale))` when log_mul != 0 (so
-                // attn_factor_org = 1.0 for the GGUF's log_mul = 0.707). The rope vector mscale
-                // is folded in here (both q_pe and k_pe get the same vector scale → a score-level
-                // square); the kernels only need the frequency divisors. The GGUF's
-                // `rope.scaling.attn_factor` multiplies `attn_factor` BEFORE `attn_factor_org` is
-                // recovered from it, matching llama-context.cpp's
+                // attn_factor_org = 1.0 for the GGUF's log_mul = 0.707). ggml's rope ALSO scales
+                // the q_pe/k_pe vectors themselves by `attn_factor_org` (`rope_yarn`'s `mscale`);
+                // that reaches only the rotary half of the score, so it cannot be folded into this
+                // whole-score scale — the loader refuses a file where it is not 1
+                // (`config::mla_rope_mscale`), and the kernels need only the frequency divisors.
+                // The GGUF's `rope.scaling.attn_factor` multiplies `attn_factor` BEFORE
+                // `attn_factor_org` is recovered from it, matching llama-context.cpp's
                 // `cparams.yarn_attn_factor *= hparams.rope_attn_factor`. Plain (non-yarn) MLA has
                 // `freq_scale = 1`, so the same expression collapses to `attn_factor²/sqrt(...)`.
                 let mla_scale = if c.rope_scaling_yarn {
                     // fs_inv = ln(1/freq_scale) = ln(factor) — NOT ln(1/factor) (that is the
                     // negative; the GGUF's factor=40 gives +ln 40 = +3.6889).
+                    // libm-ok(S2): platform `ln`, moves to `infr_core::math` in S2
                     let fs_inv = c.rope_scaling_factor.ln();
                     let yarn_attn_factor = if c.rope_yarn_log_mul != 0.0 {
                         1.0 / (1.0 + 0.1 * fs_inv)
@@ -3605,7 +3810,7 @@ pub(crate) fn generate_dense_backend(
                 // Continue to FFN.
             } else {
                 let MixerW::Attn(aw) = &lw.mixer else {
-                    unreachable!("qwen35 DeltaNet handled above")
+                    unreachable!("every other mixer is handled above")
                 };
                 if let Some(qkv) = qkvbuf {
                     // Fused QKV (prefill): ONE wide GEMM over the concatenated weight — the separate
@@ -3697,7 +3902,7 @@ pub(crate) fn generate_dense_backend(
                     if !fuse_qkv {
                         g.push(Op::Linear {
                             x: hn,
-                            weight: aw.wk.expect("session_stable: KV-owning layers have attn_k"),
+                            weight: aw.wk,
                             dst: k,
                             m: batch as u32,
                             in_f: ne as u32,
@@ -3784,12 +3989,13 @@ pub(crate) fn generate_dense_backend(
                             k16
                         }
                         None if nope => {
-                            // llama4 NoPE (global) layer: NO rope, NO L2-norm — the reference
-                            // caches the RAW K projection. `Op::Copy` is a value-preserving cast
-                            // here (CPU stores every buffer as f32 regardless of declared dtype,
-                            // so this is a no-op there; Vulkan's WriteKv/attention kernels require
-                            // the f16 scratch, and the adapter's `Op::Copy` lowering casts f32→f16
-                            // instead of a raw byte copy when src/dst dtypes differ).
+                            // NoPE layer (llama4 global, smollm3): NO rope, NO L2-norm — the
+                            // reference caches the RAW K projection. `Op::Copy` is a
+                            // value-preserving cast here (CPU stores every buffer as f32
+                            // regardless of declared dtype, so this is a no-op there; Vulkan's
+                            // WriteKv/attention kernels require the f16 scratch, and the adapter's
+                            // `Op::Copy` lowering casts f32→f16 instead of a raw byte copy when
+                            // src/dst dtypes differ).
                             g.push(Op::Copy {
                                 src: k,
                                 src_off: 0,
@@ -3876,12 +4082,12 @@ pub(crate) fn generate_dense_backend(
                         q16
                     }
                     None if nope => {
-                        // llama4 NoPE (global) layer: Q is UNROPED — cast the raw f32 projection
-                        // into q16 the same way K does above (`Op::Copy`, value-preserving; see
-                        // its doc there). The reference multiplies Q by an attention-temperature
-                        // scale here; that scale is EXACTLY 1.0 below the 8192-token chunk size,
-                        // so it is a no-op in infr's CPU-testable regime — see the `llama4` arch
-                        // note for the long-context follow-up.
+                        // NoPE layer (llama4 global, smollm3): Q is UNROPED — cast the raw f32
+                        // projection into q16 the same way K does above (`Op::Copy`,
+                        // value-preserving; see its doc there). llama4's reference multiplies Q by
+                        // an attention-temperature scale here; it is exactly 1.0 only below
+                        // `Config::faithful_ctx_limit`, which is why the context is capped there.
+                        // smollm3's applies none.
                         g.push(Op::Copy {
                             src: q,
                             src_off: 0,
@@ -3938,7 +4144,31 @@ pub(crate) fn generate_dense_backend(
                     pos: start_pos as u32,
                     sinks: None,
                     key_bias: None,
+                    comp: None,
                 });
+                // LFM3: one sigmoid gate per head, projected from the attention input and applied
+                // to that head's output before the o-projection.
+                if let Some(hg) = aw.head_gate {
+                    let (_, _, gate) =
+                        lfm_scratch.expect("an LFM3 attention layer declares its scratch");
+                    g.push(Op::Linear {
+                        x: hn,
+                        weight: hg,
+                        dst: gate,
+                        m: batch as u32,
+                        in_f: ne as u32,
+                        out_f: nh as u32,
+                        w_off: 0,
+                    });
+                    g.push(Op::HeadGate {
+                        x: attn,
+                        gate,
+                        dst: attn,
+                        rows: batch as u32,
+                        n_head: nh as u32,
+                        head_dim: hd as u32,
+                    });
+                }
                 // qwen35: per-head SIGMOID output gate applied to the attention output BEFORE the
                 // o-projection (`gate_a` was split out of the interleaved `attn_q` projection above).
                 if c.attn_out_gate {
@@ -4552,8 +4782,9 @@ pub(crate) fn generate_dense_backend(
         // which the LM-head tail below then reads exactly as every other arch does. `build_hc_head`
         // is `Op::HyperConnectMix { gates: None }` + `Op::HyperConnectPre` — its `output_hc_fn` is
         // `{hc_dim, hc}`, so its `mixes` IS the `pre` chunk, read at the same `scale[0]` /
-        // `base[0..hc]` indices the wrapping form uses.
-        if let Some(t) = &hc_head {
+        // `base[0..hc]` indices the wrapping form uses. A partial span stops at a layer boundary
+        // with the stream left in `hcr[0]` for the next.
+        if let (Some(t), false) = (&hc_head, hc_carry) {
             let ones = hc_ones.expect("deepseek4 build always declares hc_ones");
             g.push(Op::RmsNorm {
                 x: hcr[0],
@@ -4689,35 +4920,6 @@ pub(crate) fn generate_dense_backend(
         } else {
             (None, None, None)
         };
-        for op in &mut g.ops {
-            if let Op::Linear {
-                x,
-                weight,
-                dst,
-                m,
-                in_f,
-                out_f,
-                w_off,
-            } = op
-            {
-                if let Some(&(suh, svh, spec)) = exl3_handles.get(weight) {
-                    assert_eq!(
-                        (*in_f, *out_f, *w_off),
-                        (spec.in_f, spec.out_f, 0),
-                        "exl3: graph projection geometry mismatch"
-                    );
-                    *op = Op::LinearExl3 {
-                        x: *x,
-                        trellis: *weight,
-                        suh,
-                        svh,
-                        dst: *dst,
-                        m: *m,
-                        spec,
-                    };
-                }
-            }
-        }
         (
             g,
             DecodeHandles {
@@ -4736,7 +4938,9 @@ pub(crate) fn generate_dense_backend(
                 tok_id,
                 k_cache,
                 v_cache,
-                page_table,
+                comp,
+                hc_resid: hc_carry.then_some(hcr[0]),
+                step_i32,
                 weights,
             },
         )
@@ -4791,18 +4995,27 @@ pub(crate) fn generate_dense_backend(
         // (unverified hardware, out of scope here); CPU never reaches `plan_sc` at all.
         let use_ping = be.name() == "vulkan";
         let dyn_sc = plan_sc && use_ping;
-        if use_ping && sc_ping.is_none() {
-            let bytes = cc * c.vocab * 4;
-            *sc_ping = Some([
-                be.alloc(bytes, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-                be.alloc(bytes, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-            ]);
-            *sc_temp_inv_buf = Some(
-                be.alloc(4, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?,
-            );
+        let ping_bytes = cc * c.vocab * 4;
+        // A canvas whose length changed has no previous step to self-condition on: the pair
+        // holds the old canvas's logits, in the old canvas's layout.
+        if use_ping
+            && plan_sc
+            && sc_ping
+                .as_ref()
+                .is_some_and(|p| p[0].len_bytes() != ping_bytes)
+        {
+            return Err(anyhow!(
+                "denoise: the canvas length changed to {cc} while self-conditioning reads the \
+                 previous step's logits"
+            ));
+        }
+        if use_ping && super::sc::ensure_sc_ping(be, sc_ping, ping_bytes)? {
+            if sc_temp_inv_buf.is_none() {
+                *sc_temp_inv_buf = Some(
+                    be.alloc(4, BufferUsage::Staging)
+                        .map_err(|e| anyhow!("{e}"))?,
+                );
+            }
             if plan_sc {
                 // Defensive seed: this is the FIRST denoise call ever on this slot and it ALREADY
                 // wants self-conditioning, so the ping slot we're about to read from is freshly
@@ -5005,6 +5218,7 @@ pub(crate) fn generate_dense_backend(
         .map_err(|e| anyhow!("{e}"))?;
         be.upload(dcache.pos_buf.as_ref(), bytemuck::cast_slice(&dn_positions))
             .map_err(|e| anyhow!("{e}"))?;
+        let step_bufs = upload_step_i32(be, &dcache.dh)?;
         let mut db = Bindings::new();
         db.bind(dcache.dh.hidden, dcache.hidden_buf.as_ref());
         db.bind(dcache.dh.positions, dcache.pos_buf.as_ref());
@@ -5016,8 +5230,9 @@ pub(crate) fn generate_dense_backend(
             yff_buf,
             &kbufs[..],
             &vbufs[..],
+            &cbufs[..],
+            &step_bufs[..],
             &wbufs[..],
-            pg_table,
         );
         if plan_sc {
             if dyn_sc {
@@ -5081,6 +5296,7 @@ pub(crate) fn generate_dense_backend(
             logits_out_buf,
         );
         let t_exec0 = std::time::Instant::now();
+        *written_end = (*written_end).max(p + cc);
         be.execute(dcache.plan.as_ref(), &db)
             .map_err(|e| anyhow!("{e}"))?;
         let exec_secs = t_exec0.elapsed().as_secs_f64();
@@ -5171,6 +5387,9 @@ pub(crate) fn generate_dense_backend(
                 prompt_secs: sc_secs + build_secs + exec_secs + dl_secs,
                 n_gen: 0,
                 decode_secs: 0.0,
+                n_cached: 0,
+                ctx_full: false,
+                natural_stop: false,
             },
         ));
     }
@@ -5182,18 +5401,17 @@ pub(crate) fn generate_dense_backend(
     // truncates its committed token list and the next call's prefix diff overwrites the
     // stale KV rows. Dense non-E2B models only (mirrors the batched-prefill guard).
     if let Some(out_logits) = verify {
-        if c.moe.is_some() {
-            return Err(anyhow!("speculative verify: dense models only"));
-        }
-        if prompt[start..]
-            .iter()
-            .any(|&t| crate::media::is_media_id(t))
-        {
-            return Err(anyhow!("speculative verify does not support image input"));
+        if c.moe.is_some() || ple.is_some() {
+            return Err(anyhow!("speculative verify: dense non-E2B models only"));
         }
         let vf_scale = if gemma { (ne as f32).sqrt() } else { 1.0 };
         let m = prompt.len() - start;
-        let vf_hidden = token_embd.rows(&prompt[start..], ne, vf_scale)?;
+        let mut vf_hidden: Vec<f32> = Vec::with_capacity(m * ne);
+        let token_embd = token_embd.get()?; // host embed gather → materialize the table
+        for &tok in &prompt[start..] {
+            let base = tok as usize * ne;
+            vf_hidden.extend(token_embd[base..base + ne].iter().map(|&x| x * vf_scale));
+        }
         let vf_positions: Vec<i32> = (start as i32..(start + m) as i32).collect();
         let vf_hidden_buf = be
             .alloc(m * ne * 4, BufferUsage::Staging)
@@ -5202,7 +5420,7 @@ pub(crate) fn generate_dense_backend(
             .alloc(m * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
         let vf_logits_buf = be
-            .alloc(m * c.vocab * 4, BufferUsage::Readback)
+            .alloc(m * c.vocab * 4, BufferUsage::Staging)
             .map_err(|e| anyhow!("{e}"))?;
         be.upload(vf_hidden_buf.as_ref(), bytemuck::cast_slice(&vf_hidden))
             .map_err(|e| anyhow!("{e}"))?;
@@ -5257,24 +5475,10 @@ pub(crate) fn generate_dense_backend(
         } else {
             None
         };
-        let vf_ipl_buf = match (ple, vh.pl_tok_in) {
-            (Some(ple), Some(_)) => {
-                let rows = e2b_ipl_rows(g, ple, &prompt[start..])?;
-                let b = be
-                    .alloc(rows.len() * 4, BufferUsage::Staging)
-                    .map_err(|e| anyhow!("{e}"))?;
-                be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
-                    .map_err(|e| anyhow!("{e}"))?;
-                Some(b)
-            }
-            _ => None,
-        };
+        let step_bufs = upload_step_i32(be, &vh)?;
         let mut vb = Bindings::new();
         vb.bind(vh.hidden, vf_hidden_buf.as_ref());
         vb.bind(vh.positions, vf_pos_buf.as_ref());
-        if let (Some(pid), Some(ib)) = (vh.pl_tok_in, &vf_ipl_buf) {
-            vb.bind(pid, ib.as_ref());
-        }
         bind_layer_io(
             &mut vb,
             &vh,
@@ -5283,8 +5487,9 @@ pub(crate) fn generate_dense_backend(
             yff_buf,
             &kbufs[..],
             &vbufs[..],
+            &cbufs[..],
+            &step_bufs[..],
             &wbufs[..],
-            pg_table,
         );
         vb.bind(
             vh.logits.expect("verify build has logits"),
@@ -5306,6 +5511,7 @@ pub(crate) fn generate_dense_backend(
             vb.bind(ho, hb.as_ref());
         }
         let t0 = std::time::Instant::now();
+        *written_end = (*written_end).max(start + m);
         be.execute(vplan.as_ref(), &vb)
             .map_err(|e| anyhow!("{e}"))?;
         let vexec_secs = t0.elapsed().as_secs_f64();
@@ -5338,7 +5544,10 @@ pub(crate) fn generate_dense_backend(
                 (vbuild_secs + vcompile_secs + vexec_secs + vdl_secs) * 1e3,
             );
         }
-        cached.extend_from_slice(&prompt[start..]);
+        // `cached` held `prompt[..start]` (or nothing, for qwen35 — see the clear after the
+        // truncate above); either way it now holds the whole prompt.
+        cached.clear();
+        cached.extend_from_slice(prompt);
         return Ok((
             Vec::new(),
             GenStats {
@@ -5346,6 +5555,9 @@ pub(crate) fn generate_dense_backend(
                 prompt_secs: t0.elapsed().as_secs_f64(),
                 n_gen: 0,
                 decode_secs: 0.0,
+                n_cached: 0,
+                ctx_full: false,
+                natural_stop: false,
             },
         ));
     }
@@ -5420,6 +5632,9 @@ pub(crate) fn generate_dense_backend(
     let mut prompt_t = std::time::Duration::ZERO;
     let mut decode_t = std::time::Duration::ZERO;
     let mut decode_n = 0usize;
+    // Set where the decode loop ends because the model finished (EOS, or a constrained span
+    // completing) rather than on the budget or an abort — see `GenStats::natural_stop`.
+    let mut natural_stop = false;
     // `prof.stages` (INFR_PROF_STAGES): split decode per-token wall time into host setup (build
     // graph + compile + bind) vs execute (record + submit + GPU + wait) to guide the
     // record-once-replay decision. Hoisted here, ABOVE the loop — the old read was a `getenv` on
@@ -5465,12 +5680,12 @@ pub(crate) fn generate_dense_backend(
     // re-reads than it saves in readbacks.)
     // `moe_batched_ok` (this `MOE_MMQ_DTYPES` eligibility scan) is a session-stable derivation —
     // computed once in `session_stable` and read here off `stable`.
-    // DeepSeek V4 is excluded from the batched path outright. Two reasons, both current: a
-    // layer-major span cannot carry its `hc_mult`-wide residual across spans (see the assert in
-    // `build`), and no `batch > 1` V4 graph has ever been EXECUTED — the only V4 fixture that
-    // exists writes f32 expert banks, so `moe_batched_ok` is false for it and nothing here could
-    // have exercised the chunked shape. Per-token prefill is slower and is what the tests run.
-    let batched_prefill_ok = (c.moe.is_none() || moe_batched_ok) && !c.deepseek4;
+    // DeepSeek V4 takes its own gate (`dsv4_emit::batched_prefill_ok`).
+    let batched_prefill_ok = if c.deepseek4 {
+        super::dsv4_emit::batched_prefill_ok(be.name())
+    } else {
+        c.moe.is_none() || moe_batched_ok
+    };
     let decode_start = if prompt.len() - start > 2 && batched_prefill_ok {
         // Batch-prefill the un-cached suffix, all but the last prompt token (positions
         // start..plen-1; rows 0..start are reused from the session cache) — in UBATCH CHUNKS.
@@ -5479,7 +5694,7 @@ pub(crate) fn generate_dense_backend(
         // tripped the amdgpu ring watchdog → device lost) and bakes a multi-second unpreemptible
         // submit; fixed-size chunks bound both, exactly like the bespoke path's ubatches.
         // Shared reader (`crate::seam::ubatch_rows`): the SWA ring sizing must cover exactly
-        // this chunk height — see `kv_rows`' correctness bound.
+        // this chunk height — see `kv_rows_at`' correctness bound.
         // Prefill vs in-flight decodes (`infr serve --parallel N`): the chunk is the unit of GPU
         // ownership, so a chunk is exactly how long a newly-admitted request's prefill can stall
         // everyone else's decode. The default ubatch (INFR_UBATCH, 1024 rows) is ~100ms+ of
@@ -5494,6 +5709,15 @@ pub(crate) fn generate_dense_backend(
         } else {
             crate::seam::ubatch_rows(ec)
         };
+        // A sliding-window layer's ring holds `window + ring_ubatch` rows (`kv_rows_at`), so a
+        // chunk taller than the height the session was sized with would overwrite rows its own
+        // earlier rows still attend. `ubatch_rows` answers for the placement scope current NOW,
+        // which need not be the one the slot was made in.
+        let ubatch = if kv_ring && (0..c.n_layer).any(|l| c.is_swa_layer(l)) {
+            ubatch.min(ring_ubatch)
+        } else {
+            ubatch
+        };
         let pf_end = prompt.len() - 1;
         // ── prefill work list: (layer span, chunk), in EXECUTION order ───────────────────────
         // Chunk-major is one whole-model span per chunk, so every chunk drags the entire weight
@@ -5502,223 +5726,299 @@ pub(crate) fn generate_dense_backend(
         // layer L before any chunk reaches L+1, so the model is swept ONCE per prompt at the same
         // chunk-sized dispatches (a taller chunk reaches the same I/O and bakes a submit long
         // enough to trip the GPU watchdog — see the chunk comment above). See
-        // `crate::seam::layer_major_prefill` for the gate and the measurement behind it.
+        // `crate::seam::layer_major_prefill` for the gate and the measurement behind it, and
+        // `crate::seam::layer_major_this_prompt` for why one chunk, or a cache that holds every
+        // block, keeps chunk-major.
         //
         // Correctness is the same causal argument either way: a chunk's attention reads its own
         // layer's KV rows for positions below its own, and chunks run in ASCENDING order inside
         // each layer, so every earlier position is already written when a chunk reaches it. The
         // SWA ring is untouched by the reorder — its bound is per layer and per dispatch
-        // ("window + one chunk", see `kv_rows`), and each layer's ring still sees exactly the same
+        // ("window + one chunk", see `kv_rows_at`), and each layer's ring still sees exactly the same
         // ascending sequence of writes it saw chunk-major.
-        let layer_major = crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b);
-        let spans: Vec<std::ops::Range<usize>> = if layer_major {
-            (0..c.n_layer).map(|l| l..l + 1).collect()
-        } else {
-            std::iter::once(0..c.n_layer).collect()
-        };
         let chunks: Vec<(usize, usize)> = {
             let mut v = Vec::new();
             let mut cs = start;
             while cs < pf_end {
-                let ce = (cs + ubatch).min(pf_end);
+                // DeepSeek V4 shortens its chunks as the context grows, to bound the CSA layers'
+                // `rows × blocks` buffers (`dsv4_emit::prefill_chunk_rows`).
+                let rows = if c.deepseek4 {
+                    super::dsv4_emit::prefill_chunk_rows(c, cs, ubatch)
+                } else {
+                    ubatch
+                };
+                let ce = (cs + rows).min(pf_end);
                 v.push((cs, ce));
                 cs = ce;
             }
             v
         };
+        // The weights stream either through a device pager (`dense_paged`) or, on the CPU, through
+        // a host arena that cannot hold them (`host_streams`, asked about this model's own
+        // weights). Layer-major over the host arena is DeepSeek V4's alone, for a sole request,
+        // at the chunk heights where it was measured to pay (`crate::seam::host_layer_major`).
+        let first_rows = chunks.first().map_or(0, |&(s, e)| e - s);
+        let shared = req.is_some_and(crate::sampling::RequestCtx::shares_gpu);
+        let host_stream = crate::seam::host_layer_major(c, first_rows, shared)
+            && be.host_streams(&mut wbufs.iter().map(|b| b.as_ref()));
+        let layer_major = crate::seam::layer_major_this_prompt(
+            ec,
+            crate::seam::layer_major_prefill(ec, &caps, be.dense_paged() || host_stream, !e2b),
+            chunks.len(),
+            // A streaming host arena cannot hold every block by `host_streams`' own definition.
+            !host_stream && be.dense_holds_every_block(),
+        );
+        let spans: Vec<std::ops::Range<usize>> = if layer_major {
+            (0..c.n_layer).map(|l| l..l + 1).collect()
+        } else {
+            std::iter::once(0..c.n_layer).collect()
+        };
+        // Layer-major holds every chunk's residual stream between layers, so a prompt longer than
+        // the rows `crate::seam::layer_major_segment_rows` allows runs as consecutive SEGMENTS of
+        // whole chunks, each layer-major in itself: each segment sweeps the weights once.
+        // Chunk-major is one segment, whose order is the plain chunk order.
+        let segments: Vec<std::ops::Range<usize>> = if layer_major {
+            crate::seam::layer_major_segments(&chunks, crate::seam::layer_major_segment_rows(ec, c))
+        } else {
+            std::iter::once(0..chunks.len()).collect()
+        };
         // A chunk's uploaded inputs and its residual stream, materialized on first use and
         // dropped after the chunk's LAST span. Chunk-major (one span) therefore holds exactly one
-        // chunk's buffers at a time, as it always did; layer-major holds every chunk's, which is
-        // the activation cost `crate::seam::layer_major_act_bytes` prices.
+        // chunk's buffers at a time, as it always did; layer-major holds every chunk's of the
+        // segment, which is the activation cost `crate::seam::layer_major_act_bytes` prices.
         struct PfChunk {
             m: usize,
             /// Token ids (gpu_embed) or the host-embedded f32 rows.
             input: Box<dyn Buffer>,
+            /// The token ids when `input` holds the f32 rows and the graph still reads ids: a
+            /// DeepSeek V4 hash-routed layer selects its experts by token id (`hash_ids`).
+            ids: Option<Box<dyn Buffer>>,
             /// The residual stream, when `input` holds ids and cannot serve as one.
             resid: Option<Box<dyn Buffer>>,
             pos: Box<dyn Buffer>,
             /// gemma4-E2B per-layer token rows.
             ipl: Option<Box<dyn Buffer>>,
+            /// DeepSeek V4 split into layer spans: the `[m, hc_mult * n_embd]` widened residual
+            /// stream the spans hand each other (`DecodeHandles::hc_resid`).
+            wide: Option<Box<dyn Buffer>>,
         }
         let mut live: Vec<Option<PfChunk>> = (0..chunks.len()).map(|_| None).collect();
-        for (si, span) in spans.iter().enumerate() {
-            for (ci, &(cstart, cend)) in chunks.iter().enumerate() {
-                // Shutdown (SIGINT/SIGTERM) or a per-request abort: do not START another chunk.
-                // The chunk that was already in flight is not cut off — the backend drains it and
-                // returns `Error::Aborted` from `be.execute` below, which lands here as the same
-                // bail. Nothing useful was produced (a half-filled KV cache is not a generation),
-                // so this is an error and not a partial success; the CLI turns the latched signal
-                // into the conventional 130/143 exit status regardless of what this call returns.
-                if crate::sampling::abort_requested(req) {
-                    if infr_core::shutdown::shutdown_requested() {
-                        anyhow::bail!("aborted: shutdown requested");
+        for seg in &segments {
+            for (si, span) in spans.iter().enumerate() {
+                for ci in seg.clone() {
+                    let (cstart, cend) = chunks[ci];
+                    // Shutdown (SIGINT/SIGTERM) or a per-request abort: do not START another chunk.
+                    // The chunk that was already in flight is not cut off — the backend drains it and
+                    // returns `Error::Aborted` from `be.execute` below, which lands here as the same
+                    // bail. Nothing useful was produced (a half-filled KV cache is not a generation),
+                    // so this is an error and not a partial success; the CLI turns the latched signal
+                    // into the conventional 130/143 exit status regardless of what this call returns.
+                    if crate::sampling::abort_requested(req) {
+                        if infr_core::shutdown::shutdown_requested() {
+                            anyhow::bail!("aborted: shutdown requested");
+                        }
+                        anyhow::bail!("aborted: request cancelled during prompt prefill");
                     }
-                    anyhow::bail!("aborted: request cancelled during prompt prefill");
-                }
-                // One dispatch = one turn on the GPU. Dropped at the end of the iteration, handing
-                // the baton to whichever sequence has been waiting longest.
-                let _gp = req.and_then(|r| r.gate_pass());
-                let pf_m = cend - cstart;
-                // Image rows in this chunk force the host-embed path for it (see `media`).
-                let chunk_media = media.as_deref().filter(|o| o.any_in(cstart..cend));
-                let chunk_gpu_embed = gpu_embed && chunk_media.is_none();
-                if live[ci].is_none() {
-                    // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
-                    // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
-                    // the old f32 rows upload (4*n_embd*pf_m bytes).
-                    let input = if chunk_gpu_embed {
-                        let ids: Vec<i32> =
-                            prompt[cstart..cend].iter().map(|&t| t as i32).collect();
-                        let b = be
+                    // One dispatch = one turn on the GPU. Dropped at the end of the iteration, handing
+                    // the baton to whichever sequence has been waiting longest.
+                    let _gp = req.and_then(|r| r.gate_pass());
+                    let pf_m = cend - cstart;
+                    if live[ci].is_none() {
+                        // GPU embed gather: upload the chunk's token IDS (4*pf_m bytes) — the graph's
+                        // Op::EmbedGather dequantizes the rows on-device. Host-embed fallback keeps
+                        // the old f32 rows upload (4*n_embd*pf_m bytes).
+                        let upload_ids = || -> AResult<Box<dyn Buffer>> {
+                            let ids: Vec<i32> =
+                                prompt[cstart..cend].iter().map(|&t| t as i32).collect();
+                            let b = be
+                                .alloc(pf_m * 4, BufferUsage::Staging)
+                                .map_err(|e| anyhow!("{e}"))?;
+                            be.upload(b.as_ref(), bytemuck::cast_slice(&ids))
+                                .map_err(|e| anyhow!("{e}"))?;
+                            Ok(b)
+                        };
+                        let ids = if hash_ids && !gpu_embed {
+                            Some(upload_ids()?)
+                        } else {
+                            None
+                        };
+                        let input = if gpu_embed {
+                            upload_ids()?
+                        } else {
+                            let mut pf_hidden: Vec<f32> = Vec::with_capacity(pf_m * ne);
+                            let token_embd = token_embd.get()?; // host embed gather → materialize
+                            for &tok in &prompt[cstart..cend] {
+                                let base = tok as usize * ne;
+                                pf_hidden.extend(
+                                    token_embd[base..base + ne].iter().map(|&x| x * embed_scale),
+                                );
+                            }
+                            let b = be
+                                .alloc(pf_m * ne * 4, BufferUsage::Staging)
+                                .map_err(|e| anyhow!("{e}"))?;
+                            be.upload(b.as_ref(), bytemuck::cast_slice(&pf_hidden))
+                                .map_err(|e| anyhow!("{e}"))?;
+                            b
+                        };
+                        // The residual stream. A layer-span build carries `hidden` in a CALLER-owned
+                        // buffer rather than graph scratch, so the chunk owns one: on the host-embed
+                        // path the uploaded rows already ARE the layer stack's input and `input`
+                        // serves, while the gpu_embed path uploads ids there and the in-graph gather
+                        // needs somewhere to write. Sized EXACTLY like the `[batch, n_embd]` handle it
+                        // binds — the interpreters' write-back is a length-checked `copy_from_slice`
+                        // against the declared numel, and the host-embed path has always bound this
+                        // shape, so nothing writes past it.
+                        let resid = if gpu_embed {
+                            Some(
+                                be.alloc(pf_m * ne * 4, BufferUsage::Activations)
+                                    .map_err(|e| anyhow!("{e}"))?,
+                            )
+                        } else {
+                            None
+                        };
+                        // Absolute positions [cstart, ..., cend-1].
+                        let pf_positions: Vec<i32> = (cstart as i32..cend as i32).collect();
+                        let pos = be
                             .alloc(pf_m * 4, BufferUsage::Staging)
                             .map_err(|e| anyhow!("{e}"))?;
-                        be.upload(b.as_ref(), bytemuck::cast_slice(&ids))
+                        be.upload(pos.as_ref(), bytemuck::cast_slice(&pf_positions))
                             .map_err(|e| anyhow!("{e}"))?;
-                        b
-                    } else {
-                        let pf_hidden = token_embd.prompt_rows(
-                            &prompt[cstart..cend],
-                            cstart,
-                            ne,
-                            embed_scale,
-                            chunk_media,
-                        )?;
-                        let b = be
-                            .alloc(pf_m * ne * 4, BufferUsage::Staging)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        be.upload(b.as_ref(), bytemuck::cast_slice(&pf_hidden))
-                            .map_err(|e| anyhow!("{e}"))?;
-                        b
-                    };
-                    // The residual stream. A layer-span build carries `hidden` in a CALLER-owned
-                    // buffer rather than graph scratch, so the chunk owns one: on the host-embed
-                    // path the uploaded rows already ARE the layer stack's input and `input`
-                    // serves, while the gpu_embed path uploads ids there and the in-graph gather
-                    // needs somewhere to write. Sized EXACTLY like the `[batch, n_embd]` handle it
-                    // binds — the interpreters' write-back is a length-checked `copy_from_slice`
-                    // against the declared numel, and the host-embed path has always bound this
-                    // shape, so nothing writes past it.
-                    let resid = if chunk_gpu_embed {
-                        Some(
-                            be.alloc(pf_m * ne * 4, BufferUsage::Activations)
-                                .map_err(|e| anyhow!("{e}"))?,
-                        )
-                    } else {
-                        None
-                    };
-                    // Absolute positions [cstart, ..., cend-1].
-                    let pf_positions: Vec<i32> = (cstart as i32..cend as i32).collect();
-                    let pos = be
-                        .alloc(pf_m * 4, BufferUsage::Staging)
-                        .map_err(|e| anyhow!("{e}"))?;
-                    be.upload(pos.as_ref(), bytemuck::cast_slice(&pf_positions))
-                        .map_err(|e| anyhow!("{e}"))?;
-                    // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only
-                    // — the model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build`
-                    // prologue).
-                    let ipl = if let (Some(ple), false) = (ple, gpu_ple && chunk_gpu_embed) {
-                        let rows = e2b_ipl_rows(g, ple, &prompt[cstart..cend])?;
-                        let b = be
-                            .alloc(rows.len() * 4, BufferUsage::Staging)
-                            .map_err(|e| anyhow!("{e}"))?;
-                        be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
-                            .map_err(|e| anyhow!("{e}"))?;
-                        Some(b)
-                    } else {
-                        None
-                    };
-                    live[ci] = Some(PfChunk {
-                        m: pf_m,
-                        input,
-                        resid,
-                        pos,
-                        ipl,
-                    });
-                }
-                let ch = live[ci]
-                    .as_ref()
-                    .expect("the chunk's buffers were just materialized");
-                let pf_t0 = std::time::Instant::now();
-                // HEADLESS build (`logits_rows == 0`, task #27): nothing ever consumes a prefill
-                // chunk's logits — the decode loop below feeds the LAST prompt token itself and
-                // samples from its own fresh logits — so the LM-head tail (whole-chunk
-                // output_norm, last-row Copy, vocab-wide Linear, Softcap) is skipped per chunk. On
-                // a 262k-vocab model that drops a vocab×n_embd GEMV + a [chunk, n_embd] RmsNorm
-                // per chunk.
-                // MTP h-tap gap (Phase 2 TODO, docs/mtp.md): the chunked BATCHED-PREFILL path
-                // never taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring
-                // that requires this path to carry `logits_rows == pf_m` on demand, which Phase 2
-                // will add alongside the actual head forward.
-                let (pf_g, pf_h) = build(
-                    ch.m,
-                    cstart,
-                    0,
-                    false,
-                    None,
-                    false,
-                    false,
-                    false,
-                    false,
-                    // The token-id input + in-graph gather belong to the span that STARTS the
-                    // stack; a later span reads the residual stream that one left behind.
-                    chunk_gpu_embed && span.start == 0,
-                    false, // mtp_verify: ordinary chunked prefill, not MTP verify
-                    Some(span.clone()),
-                );
-                let t_build = pf_t0.elapsed();
-                let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
-                let t_compile = pf_t0.elapsed();
-                let mut pf_b = Bindings::new();
-                if let Some(ids) = pf_h.tok_ids {
-                    pf_b.bind(ids, ch.input.as_ref());
-                }
-                pf_b.bind(
-                    pf_h.hidden,
-                    ch.resid.as_deref().unwrap_or(ch.input.as_ref()),
-                );
-                pf_b.bind(pf_h.positions, ch.pos.as_ref());
-                if let (Some(pid), Some(ib)) = (pf_h.pl_tok_in, &ch.ipl) {
-                    pf_b.bind(pid, ib.as_ref());
-                }
-                // gemma4's proportional-RoPE divisors + the K/V caches + the weights
-                // (`bind_layer_io`): without the `rope_freqs` bind the batched graph has a live
-                // unbound Input and panics.
-                bind_layer_io(
-                    &mut pf_b,
-                    &pf_h,
-                    c.n_layer,
-                    rf_buf,
-                    yff_buf,
-                    &kbufs[..],
-                    &vbufs[..],
-                    &wbufs[..],
-                    pg_table,
-                );
-                debug_assert!(
-                    pf_h.logits.is_none(),
-                    "headless prefill build has no logits"
-                );
-                be.execute(pf_plan.as_ref(), &pf_b)
-                    .map_err(|e| anyhow!("{e}"))?;
-                // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
-                // build, plan compile, and execute (record + submit + GPU) — where a small-batch
-                // chunk's fixed cost lives decides whether to attack recording or kernels. `l` is
-                // the layer span, the whole model unless this is a layer-major prefill.
-                if ec.prof.stages {
-                    tracing::info!(
-                        "[pf prof] m={} l={}..{} build={:.1}ms compile={:.1}ms execute={:.1}ms",
+                        // gemma4 E2B: the chunk's per-layer TOKEN embedding rows (gather+dequant only
+                        // — the model_proj GEMV/RMSNorm/combine run as GPU graph ops in the `build`
+                        // prologue).
+                        let ipl = if let (Some(ple), false) = (ple, gpu_ple) {
+                            let rows = e2b_ipl_rows(g, ple, &prompt[cstart..cend])?;
+                            let b = be
+                                .alloc(rows.len() * 4, BufferUsage::Staging)
+                                .map_err(|e| anyhow!("{e}"))?;
+                            be.upload(b.as_ref(), bytemuck::cast_slice(&rows))
+                                .map_err(|e| anyhow!("{e}"))?;
+                            Some(b)
+                        } else {
+                            None
+                        };
+                        // Every span of a split V4 stack reads and advances it; the first fills it.
+                        let wide = if c.deepseek4 && layer_major {
+                            Some(
+                                be.alloc(pf_m * c.hc_mult * ne * 4, BufferUsage::Activations)
+                                    .map_err(|e| anyhow!("{e}"))?,
+                            )
+                        } else {
+                            None
+                        };
+                        live[ci] = Some(PfChunk {
+                            m: pf_m,
+                            input,
+                            ids,
+                            resid,
+                            pos,
+                            ipl,
+                            wide,
+                        });
+                    }
+                    let ch = live[ci]
+                        .as_ref()
+                        .expect("the chunk's buffers were just materialized");
+                    let pf_t0 = std::time::Instant::now();
+                    // HEADLESS build (`logits_rows == 0`, task #27): nothing ever consumes a prefill
+                    // chunk's logits — the decode loop below feeds the LAST prompt token itself and
+                    // samples from its own fresh logits — so the LM-head tail (whole-chunk
+                    // output_norm, last-row Copy, vocab-wide Linear, Softcap) is skipped per chunk. On
+                    // a 262k-vocab model that drops a vocab×n_embd GEMV + a [chunk, n_embd] RmsNorm
+                    // per chunk.
+                    // MTP h-tap gap (Phase 2 TODO, docs/mtp.md): the chunked BATCHED-PREFILL path
+                    // never taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring
+                    // that requires this path to carry `logits_rows == pf_m` on demand, which Phase 2
+                    // will add alongside the actual head forward.
+                    let (mut pf_g, pf_h) = build(
                         ch.m,
-                        span.start,
-                        span.end,
-                        t_build.as_secs_f64() * 1e3,
-                        (t_compile - t_build).as_secs_f64() * 1e3,
-                        (pf_t0.elapsed() - t_compile).as_secs_f64() * 1e3,
+                        cstart,
+                        0,
+                        false,
+                        None,
+                        false,
+                        false,
+                        false,
+                        false,
+                        // The token-id input + in-graph gather belong to the span that STARTS the
+                        // stack; a later span reads the residual stream that one left behind.
+                        gpu_embed && span.start == 0,
+                        false, // mtp_verify: ordinary chunked prefill, not MTP verify
+                        Some(span.clone()),
                     );
-                }
-                prompt_t += pf_t0.elapsed();
-                // Last span for this chunk: its uploads and its residual stream are dead.
-                if si + 1 == spans.len() {
-                    live[ci] = None;
+                    // Layer-major: the next chunk of this segment reads this span's weights again, and
+                    // after the segment's last chunk nothing in this prefill does. A weight cache keeps
+                    // them for the one and lets them go first after the other (`WeightReuse`).
+                    pf_g.weight_reuse = match (layer_major, ci + 1 == seg.end) {
+                        (false, _) => infr_core::graph::WeightReuse::Sweep,
+                        (true, false) => infr_core::graph::WeightReuse::Again,
+                        (true, true) => infr_core::graph::WeightReuse::Done,
+                    };
+                    let t_build = pf_t0.elapsed();
+                    let pf_plan = be.compile(&pf_g).map_err(|e| anyhow!("{e}"))?;
+                    let t_compile = pf_t0.elapsed();
+                    let step_bufs = upload_step_i32(be, &pf_h)?;
+                    let mut pf_b = Bindings::new();
+                    if let Some(ids) = pf_h.tok_ids {
+                        pf_b.bind(ids, ch.ids.as_deref().unwrap_or(ch.input.as_ref()));
+                    }
+                    pf_b.bind(
+                        pf_h.hidden,
+                        ch.resid.as_deref().unwrap_or(ch.input.as_ref()),
+                    );
+                    pf_b.bind(pf_h.positions, ch.pos.as_ref());
+                    if let (Some(pid), Some(ib)) = (pf_h.pl_tok_in, &ch.ipl) {
+                        pf_b.bind(pid, ib.as_ref());
+                    }
+                    if let Some(hr) = pf_h.hc_resid {
+                        let wide = ch
+                            .wide
+                            .as_deref()
+                            .expect("a split V4 stack's chunk owns its wide residual");
+                        pf_b.bind(hr, wide);
+                    }
+                    // gemma4's proportional-RoPE divisors + the K/V caches + the weights
+                    // (`bind_layer_io`): without the `rope_freqs` bind the batched graph has a live
+                    // unbound Input and panics.
+                    bind_layer_io(
+                        &mut pf_b,
+                        &pf_h,
+                        c.n_layer,
+                        rf_buf,
+                        yff_buf,
+                        &kbufs[..],
+                        &vbufs[..],
+                        &cbufs[..],
+                        &step_bufs[..],
+                        &wbufs[..],
+                    );
+                    debug_assert!(
+                        pf_h.logits.is_none(),
+                        "headless prefill build has no logits"
+                    );
+                    *written_end = (*written_end).max(cstart + ch.m);
+                    be.execute(pf_plan.as_ref(), &pf_b)
+                        .map_err(|e| anyhow!("{e}"))?;
+                    // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
+                    // build, plan compile, and execute (record + submit + GPU) — where a small-batch
+                    // chunk's fixed cost lives decides whether to attack recording or kernels. `l` is
+                    // the layer span, the whole model unless this is a layer-major prefill.
+                    if ec.prof.stages {
+                        tracing::info!(
+                            "[pf prof] m={} l={}..{} build={:.1}ms compile={:.1}ms execute={:.1}ms",
+                            ch.m,
+                            span.start,
+                            span.end,
+                            t_build.as_secs_f64() * 1e3,
+                            (t_compile - t_build).as_secs_f64() * 1e3,
+                            (pf_t0.elapsed() - t_compile).as_secs_f64() * 1e3,
+                        );
+                    }
+                    prompt_t += pf_t0.elapsed();
+                    // Last span for this chunk: its uploads and its residual stream are dead.
+                    if si + 1 == spans.len() {
+                        live[ci] = None;
+                    }
                 }
             }
         }
@@ -5729,81 +6029,60 @@ pub(crate) fn generate_dense_backend(
     } else {
         start // fall through to per-token loop for MoE / E2B / short suffixes
     };
-    // The per-token loop below embeds by token id only. Image rows always land in the batched
-    // prefill (they never sit in the final two prompt tokens of a chat turn), but a model or
-    // suffix that skips batching must fail loudly here rather than index the vocab with a
-    // placeholder id.
-    if media
-        .as_deref()
-        .is_some_and(|o| o.any_in(decode_start..prompt.len()))
-    {
-        return Err(anyhow!(
-            "image input needs batched prefill, which this model/prompt did not take"
-        ));
-    }
 
-    // Record-once decode: for an eligible decode on a backend that supports replay (the Vulkan
-    // seam), build+compile+bind ONE plan here and reuse it across the whole decode loop. The
-    // adapter records the graph once and replays it per token, reading `pos` from the bound
-    // positions buffer + a params SSBO — so the baked pos=0 here is irrelevant, and the per-token
-    // host cost drops to just the emb/pos (+ E2B ipl) uploads. The gate mirrors the adapter's
-    // graph eligibility: every dense arch replays — qk-norm (qwen3), the gemma family (SWA
-    // windows + scale via push constants, freq_factors via qk_norm_rope_dyn_ff, V-norm/Softcap/
-    // Scale are pos-independent), llama (f16-out interleaved Rope via rope_f16_dyn), MoE. Backends
-    // without `decode_replay` (CPU interpreter, which reads the baked `pos`) and every ineligible
-    // model keep rebuilding + recompiling per token below.
-    // INFR_SEAM_NO_REPLAY=1 forces per-token rebuild (the adapter's static path) — slower, but
-    // INFR_PROF_OPS per-op GPU timestamps work there (the replay path can't report them).
-    // This gate MUST stay a strict subset of the adapter's `decode_eligible` — the plan below
-    // bakes pos=0/kv_len=1, which is only correct when the adapter replays it (dyn kernels read
-    // the live pos/kv_len); an ineligible graph would silently run the static path with the baked
-    // values. Hence the per-layer head-dim mirror of the adapter's Attention check.
-    // llama (no qk-norm) replays too — its f16-out Rope has a dyn kernel — but only without
-    // freq_factors (the standalone Rope kernel has no ff binding; gemma4's ff rides QkNormRope).
-    // A paged MoE model (see `Backend::moe_paged`'s doc) forces the static per-execute path: the
-    // adapter's own `execute`/`execute_chain` already refuse to replay one (belt-and-suspenders,
-    // the actual correctness guarantee), but skipping `dyn_replay` here too avoids building the
-    // (then-never-used) replay plan's persistent scratch/self-advancing params machinery at all.
-    // Dense layer streaming forces static per-execute decode for the same replay-can't-express-it
-    // reason (per-token ring staging + per-slot weight offsets — see `Backend::dense_paged`).
-    let dyn_replay = caps.decode_replay
-        && !be.moe_paged()
-        && !be.dense_paged()
+    // Record-once decode: on a backend that replays (the Vulkan and Metal seams), build, compile
+    // and bind ONE decode plan here and reuse it across the whole decode loop. The backend records
+    // the graph once and replays it per token, reading `pos` from the bound positions buffer (and,
+    // on Vulkan, a params SSBO), so the baked pos=0 is irrelevant and the per-token host cost
+    // drops to the emb/pos (+ E2B ipl) uploads. Backends without `decode_replay` (the CPU
+    // interpreter, which reads the baked `pos`) and every model whose plan will not replay keep
+    // rebuilding and recompiling per token below.
+    //
+    // Correctness does NOT rest on the gate below. The plan bakes pos=0/kv_len=1, which is right
+    // only when the backend replays it, so after compiling it the runner asks the backend
+    // (`Backend::decode_replay_ready`) and drops it for the per-token path on a "no"; the graph
+    // also carries `Graph::replay_only`, so a backend that is asked to run it without replaying
+    // returns an error instead of decoding every token at row 0. The gate's terms below copy
+    // Vulkan's refusals (`decode_eligible` and its pagers) only to skip building a replay plan
+    // that would be refused, and its scratch with it: a missing term costs that build, nothing
+    // more. They are not Metal's rules (Metal answers for itself, and also accepts plans its
+    // static walk decodes with live positions). INFR_SEAM_NO_REPLAY=1 forces the per-token path (INFR_PROF_OPS
+    // per-op GPU timestamps work there; the replay path can't report them).
+    let mirror_admits = !be.moe_paged()
+        // A dense streaming cache replays only while it holds every block: one that evicts
+        // re-stages blocks into recycled slots every token, which a recording cannot follow.
+        && (!be.dense_paged() || be.dense_holds_every_block())
         && !ec.kernels.vulkan.no_replay
         // DiffusionGemma graphs opt out of the replay tape entirely (`Graph::no_decode_replay`,
-        // set in `build` above — the adapter's `decode_eligible` rejects them, this mirror just
-        // skips building the then-unused replay plan). Keeps this gate a strict subset of the
-        // adapter's eligibility.
+        // set in `build` above).
         && !c.diffusion_gemma
-        // DeepSeek2 MLA: the adapter's `decode_eligible` rejects `Op::Mla` outright (its kernel has
-        // no record-once dyn twin), but this mirror gate has no Mla check — without this exclusion
-        // the replay tape is built with pos=0 baked into every WriteKv, and the adapter's
-        // eligible=false fallback then executes THAT tape statically for every decode token,
-        // writing each token's K to row 0 (rows 1.. never populated, attention sees a one-row
-        // cache). Keeps the "strict subset" promise the gate's doc states.
+        // DeepSeek2 MLA: `Op::Mla` has no record-once dyn twin. Before the backend was asked,
+        // missing this term ran the pos-0 tape statically: every token wrote its K to row 0 and
+        // attention saw a one-row cache.
         && !c.deepseek2
-        // DeepSeek V4: the same trap, from four ops at once. `Op::Attention { sinks }`,
-        // `Op::HyperConnectMix`/`Pre`/`Post`, `Op::Rope { backward }` and `Op::QkNorm { weight:
-        // None }` each have no record-once dyn twin, so the adapter's `decode_eligible` is false —
-        // and without this exclusion the tape is built with pos=0 baked into every `WriteKv` and
-        // every `Attention`, then run STATICALLY for every token. Measured: each token writes its
-        // KV to row 0 and attends only row 0 (itself), so a V4 prefill's CPU-vs-Vulkan cosine
-        // decayed with prompt length (1.0 at one token, 0.95 at two, 0.67 at three) while a
-        // `sliding_window = 1` model — where attending only your own row IS the right answer —
-        // stayed exact and hid it.
+        // DeepSeek V4: `Op::Attention { sinks }`, `Op::HyperConnectMix`/`Pre`/`Post`,
+        // `Op::Rope { backward }` and `Op::QkNorm { weight: None }` have no dyn twin. The same
+        // trap as deepseek2 once hid behind a `sliding_window = 1` test model, where attending
+        // only your own row IS the right answer.
         && !c.deepseek4
-        && (qk_norm || stable.rope_freqs.is_none())
-        // Quantized/dense-alt KV caches force the per-execute STATIC decode (see the adapter's
-        // `decode_eligible`: the low-bit block quants / bf16 / f32 / turbo ride a dequant→f16
-        // prepass with a standalone WriteKv that has no dyn kernel) — EXCEPT coupled Q8_0
-        // (K==V==Q8), which replays natively (store_q8_dyn write + the planar-Q8 dyn attention
-        // read). A DECOUPLED Q8 side still forces static (the dyn q8 kernels dequant both sides).
-        // Must mirror the adapter's rejection so this gate stays a strict subset — else the loop
-        // bakes pos=0 for a static run.
+        // A standalone f16 `WriteKv` has no dyn kernel: Vulkan replays an f16 K write only as
+        // the rope→WriteKv pair its peephole fuses into the cache. Two K writes here are not that
+        // pair: llama4's rope layers L2-norm the roped K before it is written —
+        && !c.llama4
+        // — and a NoPE layer (llama4's or smollm3's, `Config::is_nope_layer`) writes the raw K
+        // through an `Op::Copy` cast with no rope at all.
+        && c.no_rope_step == 0
+        // Quantized/dense-alt KV caches ride a dequant→f16 prepass with a standalone WriteKv that
+        // has no dyn kernel — EXCEPT coupled Q8_0 (K==V==Q8), which replays natively
+        // (store_q8_dyn write + the planar-Q8 dyn attention read). A DECOUPLED Q8 side does not
+        // (the dyn q8 kernels dequant both sides).
         && ((k_fmt == DType::Q8_0 && v_fmt == DType::Q8_0)
             || (!kv_forces_static(k_fmt) && !kv_forces_static(v_fmt)))
+        // Vulkan's replayable attention head widths.
         && (0..c.n_layer)
-            .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512)
+            .all(|l| c.layer_head_dim(l).is_multiple_of(4) && c.layer_head_dim(l) <= 512);
+    let dyn_replay = caps.decode_replay
+        && (mirror_admits || replay_mirror_bypassed())
         // MTP h-tap (Phase 1, issue #33): the replay tape binds a FIXED set of tensors once: an
         // h-tap request changes the graph shape (an extra Output + Copy) per-call based on
         // whether THIS position is the one being sampled, which the static replay tape can't
@@ -5811,14 +6090,18 @@ pub(crate) fn generate_dense_backend(
         // slower, but this is a validation-only hook (see `h_out`'s doc), never a hot path.
         && h_out.is_none();
     let ro = if dyn_replay {
-        // `compile` builds pipelines and records the replay tape into the shared command pool —
-        // GPU work, so it takes a turn like any step.
+        // Held across the build and compile like any step's turn. No tape is recorded here:
+        // Vulkan records on the plan's first execute, and Metal's `compile` drops any tape it
+        // holds and records on execute too.
         let _gp = req.and_then(|r| r.gate_pass());
-        let (g, h) = build(
+        let (mut g, h) = build(
             1, 0, 1, false, None, false, false, gpu_argmax, gpu_sample, gpu_embed,
             false, // mtp_verify: ordinary per-token decode, not MTP verify
             None,  // span: the whole model in one graph
         );
+        // Baked at position 0 and valid for no other unless replayed: the backend refuses to run
+        // it any other way (see `Graph::replay_only`).
+        g.replay_only = true;
         let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
         let mut b = Bindings::new();
         bind_step_input(
@@ -5840,8 +6123,9 @@ pub(crate) fn generate_dense_backend(
             yff_buf,
             &kbufs[..],
             &vbufs[..],
+            &cbufs[..],
+            &[],
             &wbufs[..],
-            pg_table,
         );
         b.bind(
             h.logits.expect("decode build has logits"),
@@ -5853,7 +6137,12 @@ pub(crate) fn generate_dense_backend(
         if let Some(uin) = h.u_in {
             b.bind(uin, u_buf.as_ref());
         }
-        Some((plan, b))
+        // The backend's own answer, not the gate's guess: a plan it will not replay is dropped
+        // here and every token takes the per-token path below, built at its true position. So is
+        // a graph with per-step inputs (V4's compressor plan, which the mirror above already
+        // excludes): a replay keeps one position's values for every step, and they are not bound
+        // here at all.
+        (h.step_i32.is_empty() && be.decode_replay_ready(plan.as_ref(), &b)).then_some((plan, b))
     } else {
         None
     };
@@ -5882,6 +6171,40 @@ pub(crate) fn generate_dense_backend(
         && chain_n >= 2
         && ipl_buf.is_none()
         && ec.kernels.vulkan.gpu_pos;
+    // A recurrent model (qwen35, LFM3): a chain runs every one of its steps on the device, so a turn
+    // that stops partway leaves the recurrent state past what `cached` will record. Snapshot it
+    // here, at the prefill boundary, where it has consumed exactly `decode_start` tokens, so the
+    // next turn can resume from this point instead of re-prefilling from zero (the `resume` arm of
+    // the `start` computation). One copy per generation, and only when a chain can run: the per-token path
+    // never runs past its stop. Best effort: the context fit prices this second copy of the state
+    // (`kv_bytes_estimate_fmt`), but the device can still refuse it (another process, a context
+    // the caller pinned). That must not fail a request whose prefill is already paid for; without
+    // the snapshot a turn after a mid-chain stop just re-prefills from zero. A refusal is
+    // remembered so it is neither retried nor logged per turn.
+    if c.has_recurrent_state()
+        && !*delta_snapshot_refused
+        && can_chain
+        && decode_start > 0
+        && max_new >= 2
+        && be.max_decode_chain() >= 2
+    {
+        let _gp = req.and_then(|r| r.gate_pass());
+        if let Err(e) = super::weights::snapshot_delta(
+            be,
+            c,
+            &kbufs[..],
+            &vbufs[..],
+            mtp_delta_ckpt,
+            decode_start,
+        ) {
+            super::weights::invalidate_delta(mtp_delta_ckpt);
+            *delta_snapshot_refused = true;
+            tracing::warn!(
+                "[infr] no snapshot of the recurrent state at the prefill boundary ({e}); \
+                 on this slot, a turn after a stop mid-chain re-prefills from zero"
+            );
+        }
+    }
     let end = prompt.len() + max_new;
     let mut pos = decode_start;
     // Highest absolute position whose KV row was actually WRITTEN by a kept token this call — the
@@ -5921,7 +6244,10 @@ pub(crate) fn generate_dense_backend(
             // Clamped by the backend's watchdog budget too: a chain is one submit of `n` decode
             // steps, and on a slow device that submit has to stay short (see
             // `Backend::max_decode_chain`). Clamped HERE, before the per-step sampling uniforms
-            // below are drawn, so the RNG stream advances by exactly the steps we run.
+            // below are drawn, so the RNG stream advances by no more than the steps asked for. A
+            // backend may return fewer ids than that (see `Backend::execute_chain`); the draws for
+            // the steps it did not run are then spent, and later tokens sample further along the
+            // stream than a per-token run would.
             let n = chain_n
                 .min(max_new - out.len())
                 .min(64)
@@ -5956,6 +6282,9 @@ pub(crate) fn generate_dense_backend(
                         .map_err(|e| anyhow!("{e}"))?;
                 }
                 let (plan, b) = ro.as_ref().expect("can_chain implies record-once");
+                // Every one of the `n` steps runs on the device, whatever the host keeps.
+                let written_before = *written_end;
+                *written_end = (*written_end).max(pos + n);
                 if let Some(ids) = be
                     .execute_chain(plan.as_ref(), b, n)
                     .map_err(|e| anyhow!("{e}"))?
@@ -5969,6 +6298,7 @@ pub(crate) fn generate_dense_backend(
                         let is_eos = !ignore_eos && (c.eos_ids.contains(&id) || id == c.eos);
                         if is_eos {
                             stop = true;
+                            natural_stop = true;
                             break;
                         }
                         on_token(id);
@@ -6000,6 +6330,9 @@ pub(crate) fn generate_dense_backend(
                     continue;
                 }
                 // Backend declined (e.g. adapter fell back to static) — per-token path below.
+                // A decline means no step ran (`Backend::execute_chain`), so the mark goes back
+                // to where it was; the per-token path raises it for `pos` itself.
+                *written_end = written_before;
             }
         }
         let step_t0 = std::time::Instant::now();
@@ -6013,9 +6346,18 @@ pub(crate) fn generate_dense_backend(
                 .map_err(|e| anyhow!("{e}"))?;
         }
         if !gpu_embed {
-            let row = token_embd.rows(&[tok as u32], ne, embed_scale)?;
-            be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&row))
-                .map_err(|e| anyhow!("{e}"))?;
+            // Host embed (gemma scales by √n_embd; qwen3/llama identity). At the identity scale the
+            // table slice is already the row to upload — hand it straight to the backend rather
+            // than allocating a throwaway `Vec<f32>` per token to copy it.
+            let row = &token_embd.get()?[tok * ne..tok * ne + ne];
+            if embed_scale == 1.0 {
+                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(row))
+                    .map_err(|e| anyhow!("{e}"))?;
+            } else {
+                let emb: Vec<f32> = row.iter().map(|&x| x * embed_scale).collect();
+                be.upload(hidden_buf.as_ref(), bytemuck::cast_slice(&emb))
+                    .map_err(|e| anyhow!("{e}"))?;
+            }
         }
         be.upload(pos_buf.as_ref(), bytemuck::cast_slice(&[pos as i32]))
             .map_err(|e| anyhow!("{e}"))?;
@@ -6031,17 +6373,14 @@ pub(crate) fn generate_dense_backend(
         // Only sample once we're past the prompt (decode position = last prompt token onward).
         let is_decode = pos + 1 >= prompt.len();
         // GPU stochastic sampling: draw this step's uniform from the SAME xorshift stream the
-        // host sampler would consume. Record-once (`ro.is_some()`, `RopeMode::Dynamic`) seeds the
-        // ring slot `pos & 63` — the in-graph `Op::Sample` reads `u_buf[params[0] & 63]`, matching
-        // the chained fast-path's geometry above, since this iteration's dispatch advances
-        // `params[0]` to `pos` whether it's replayed singly here or folded into an
-        // `execute_chain` chunk (see `Recorder::sample_topk_chain`). The classic per-execute
-        // rebuild (`ro` is `None`, `RopeMode::Static`) has no ring — its kernel always reads
-        // `u_buf[0]`, so pin the write there. Only frontier rows sample, matching the host path's
-        // rng consumption exactly.
+        // host sampler would consume, into both slots a sampler may read (`seed_step_uniform`).
+        // Only frontier rows sample, matching the host path's rng consumption exactly.
         if gpu_sample && is_decode && pos + 1 == cur.len() {
-            let slot = if ro.is_some() { pos & 63 } else { 0 };
-            u_ring_host[slot] = crate::sampling::next_uniform(&mut rng);
+            seed_step_uniform(
+                &mut u_ring_host,
+                pos,
+                crate::sampling::next_uniform(&mut rng),
+            );
             be.upload(u_buf.as_ref(), bytemuck::cast_slice(&u_ring_host))
                 .map_err(|e| anyhow!("{e}"))?;
         }
@@ -6063,6 +6402,7 @@ pub(crate) fn generate_dense_backend(
         };
         let t_setup = std::time::Instant::now();
         let (setup_el, exec_el);
+        *written_end = (*written_end).max(pos + 1);
         if let Some((plan, b)) = &ro {
             // Record-once path: reuse the single compiled plan + bindings (no per-token rebuild).
             setup_el = t_setup.elapsed();
@@ -6076,6 +6416,7 @@ pub(crate) fn generate_dense_backend(
                 None,  // span: the whole model in one graph
             );
             let plan = be.compile(&g).map_err(|e| anyhow!("{e}"))?;
+            let step_bufs = upload_step_i32(be, &h)?;
             let mut b = Bindings::new();
             bind_step_input(
                 &mut b,
@@ -6096,8 +6437,9 @@ pub(crate) fn generate_dense_backend(
                 yff_buf,
                 &kbufs[..],
                 &vbufs[..],
+                &cbufs[..],
+                &step_bufs[..],
                 &wbufs[..],
-                pg_table,
             );
             b.bind(
                 h.logits.expect("decode build has logits"),
@@ -6151,7 +6493,8 @@ pub(crate) fn generate_dense_backend(
             }
             if let Some(cst) = constraint.as_deref_mut() {
                 // Grammar-forced span (serve's tool_choice "required"/named): the shared
-                // llguidance step. Empty step ⇒ the constrained span ended.
+                // llguidance step, which also applies and records the request's penalties.
+                // Empty step ⇒ the constrained span ended.
                 let (step, done) = crate::grammar::constrained_step(
                     cst,
                     &mut logits,
@@ -6159,10 +6502,12 @@ pub(crate) fn generate_dense_backend(
                     sampler,
                     &mut rng,
                     max_new.saturating_sub(out.len()),
+                    penalties.as_mut(),
                 )
                 .map_err(|e| anyhow!("{e}"))?;
                 decode_t += step_t0.elapsed();
                 if step.is_empty() {
+                    natural_stop = true;
                     break;
                 }
                 for &t in &step {
@@ -6171,7 +6516,11 @@ pub(crate) fn generate_dense_backend(
                     cur.push(t);
                     decode_n += 1;
                 }
-                if done || out.len() >= max_new || crate::sampling::abort_requested(req) {
+                if done {
+                    natural_stop = true;
+                    break;
+                }
+                if out.len() >= max_new || crate::sampling::abort_requested(req) {
                     break;
                 }
             } else {
@@ -6181,8 +6530,9 @@ pub(crate) fn generate_dense_backend(
                     be.download(id_out, &mut idb).map_err(|e| anyhow!("{e}"))?;
                     u32::from_le_bytes(idb)
                 } else {
-                    // Serve-only: repetition penalties patch the row in place (no-op allocation-wise
-                    // — `penalties` is `None` on every other path, so this is one branch per token).
+                    // Serve-only: logit_bias and repetition penalties patch the row in place (no-op
+                    // allocation-wise — `penalties` is `None` on every other path, so this is one
+                    // branch per token).
                     if let Some(p) = penalties.as_ref() {
                         p.apply(&mut logits);
                     }
@@ -6201,7 +6551,11 @@ pub(crate) fn generate_dense_backend(
                 // `on_token` -> the server's stop-sequence matcher may have latched an abort (a stop
                 // string completed inside this token's text). One relaxed atomic load per token,
                 // and not even that when `req` is None.
-                if is_eos || out.len() >= max_new || crate::sampling::abort_requested(req) {
+                if is_eos {
+                    natural_stop = true;
+                    break;
+                }
+                if out.len() >= max_new || crate::sampling::abort_requested(req) {
                     break;
                 }
                 cur.push(next);
@@ -6272,8 +6626,10 @@ pub(crate) fn generate_dense_backend(
     if let Some(peak) = be.activation_peak() {
         let rows = crate::seam::ubatch_rows(ec);
         // Both halves of what a prefill holds live, so the comparison stays honest in either
-        // order: the per-chunk scratch, plus — layer-major only — the whole prompt's residual
-        // stream, which is exactly what the placement budgets were told to leave room for.
+        // order: the per-chunk scratch, plus — for a session that may prefill layer-major — the
+        // whole prompt's residual stream, which is exactly what the placement budgets were told
+        // to leave room for. A prompt that ran chunk-major anyway (one chunk, or a cache holding
+        // every block: `layer_major_this_prompt`) peaks below that, which is not an over-run.
         let reserved = crate::seam::dense_act_reserve_at(c, max_ctx, rows).saturating_add(
             if crate::seam::layer_major_prefill(ec, &caps, be.dense_paged(), !e2b) {
                 crate::seam::layer_major_act_bytes(c, max_ctx, rows)
@@ -6312,13 +6668,71 @@ pub(crate) fn generate_dense_backend(
         prompt_secs: prompt_t.as_secs_f64(),
         n_gen: decode_n,
         decode_secs: decode_t.as_secs_f64(),
+        n_cached: start,
+        // Only the callers that lower `max_new` to the context left know it was lowered.
+        ctx_full: false,
+        natural_stop,
     };
     Ok((out, stats))
 }
 
+/// Test hook: lets `generate_dense_backend` build a replay plan its mirror gate would skip
+/// (`mirror_admits`), so a test can show the backend's own `decode_replay_ready` is what keeps a
+/// plan the backend will not replay off the decode loop. Always `false` outside this crate's
+/// unit tests.
+#[cfg(test)]
+fn replay_mirror_bypassed() -> bool {
+    tests::REPLAY_MIRROR_BYPASS.with(std::cell::Cell::get)
+}
+
+/// See the `cfg(test)` twin: no build outside the unit tests can bypass the gate.
+#[cfg(not(test))]
+fn replay_mirror_bypassed() -> bool {
+    false
+}
+
+/// Seed one per-token decode step's sampling uniform `u` into the host mirror of the `Op::Sample`
+/// uniform ring, for the step at `pos`. It goes to both slots a sampler may read: `pos & 63`, which
+/// a recorded replay indexes by the live position, and slot 0, which a static walk reads. Which of
+/// the two runs is the backend's own decision, not this loop's `dyn_replay`: on Metal the plan built
+/// for replay is either replayed from its tape or walked statically with live positions
+/// (`Backend::decode_replay_ready` accepts both), and a plan built per token is recorded on its own
+/// execute when its shape allows, a run that samples through the dynamic-position kernel.
+fn seed_step_uniform(ring: &mut [f32; 64], pos: usize, u: f32) {
+    ring[pos & 63] = u;
+    ring[0] = u;
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{resident_after_gen, validate_token_ids};
+    use super::{
+        resident_after_gen, seed_step_uniform, validate_token_ids, Config, EngineConfig, Gguf,
+        SeamKv,
+    };
+    use crate::seam::TokenEmbd;
+    use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
+
+    thread_local! {
+        /// Read by `super::replay_mirror_bypassed`. Per thread, so a test that sets it cannot
+        /// reach a generation another test runs at the same time.
+        pub(super) static REPLAY_MIRROR_BYPASS: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// B125: the runner cannot tell whether the backend replays its plan (sampler reads slot
+    /// `pos & 63`) or walks it statically (slot 0) — Metal decides that per graph, and may walk
+    /// a plan built for replay statically. Each step's draw must reach both, or a
+    /// temperature > 0 decode samples with a stale or zero uniform.
+    #[test]
+    fn a_step_uniform_reaches_both_sampler_slots() {
+        let mut ring = [0f32; 64];
+        for pos in [1usize, 5, 63, 64, 70, 130] {
+            let u = 0.25 + pos as f32 / 1000.0;
+            seed_step_uniform(&mut ring, pos, u);
+            assert_eq!(ring[pos & 63], u, "replayed sampler's slot at pos {pos}");
+            assert_eq!(ring[0], u, "static sampler's slot at pos {pos}");
+        }
+    }
 
     // ── resident_after_gen: which tokens' KV rows are recorded as materialized ────────────────
     //
@@ -6402,5 +6816,2412 @@ mod tests {
     #[test]
     fn validate_token_ids_rejects_far_out_of_vocab() {
         assert!(validate_token_ids(&[u32::MAX], 100).is_err());
+    }
+
+    // ── what a slot reuses across turns ───────────────────────────────────────────────────────
+    //
+    // Tiny synthetic GGUFs with deterministic values, written to a temp file and run through the
+    // real loader and runner: a qwen35 whose layer 0 is DeltaNet (plus, for the Vulkan chain test,
+    // a full-attention layer 1), and a one-layer sliding-window gemma3 for the SWA ring.
+
+    const Q35_NE: usize = 32;
+    const Q35_VOCAB: usize = 16;
+    const Q35_NFF: usize = 32;
+    const Q35_D_CONV: usize = 4;
+    const Q35_D_STATE: usize = 16;
+    const Q35_N_GROUP: usize = 2;
+    const Q35_DT_RANK: usize = 2;
+    const Q35_D_INNER: usize = 16;
+
+    /// `n` values in `[base - 0.5, base + 0.5)` from a 64-bit LCG seeded by `seed`.
+    fn q35_values(n: usize, seed: u64, base: f32) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                base + ((x >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// A synthetic model: `u32_keys` under `general.architecture = arch`, and every tensor f32
+    /// (f16 when named in `f16`) with deterministic values around its centre. Shapes are ggml
+    /// order (innermost first).
+    fn synthetic_gguf(
+        arch: &str,
+        u32_keys: &[(String, usize)],
+        tensors: &[(String, Vec<usize>, f32)],
+        f16: &[&str],
+    ) -> SyntheticModel {
+        let mut meta = vec![("general.architecture".to_string(), Meta::Str(arch.into()))];
+        meta.extend(
+            u32_keys
+                .iter()
+                .map(|(k, v)| (k.clone(), Meta::U32(*v as u32))),
+        );
+        let tensors = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, (name, shape, base))| {
+                let v = q35_values(shape.iter().product(), i as u64 + 1, *base);
+                let fill = if f16.contains(&name.as_str()) {
+                    Fill::ExactF16(v)
+                } else {
+                    Fill::Exact(v)
+                };
+                TensorSpec::new(name.clone(), shape.clone(), fill)
+            })
+            .collect();
+        SyntheticModel { meta, tensors }
+    }
+
+    /// Write `model` to a temp GGUF, open it and parse its config.
+    fn open_synthetic(tag: &str, model: &SyntheticModel) -> (Gguf, Config) {
+        let tmp = TempGguf::write(tag, model);
+        let g = Gguf::open(tmp.path()).expect("open synthetic GGUF");
+        let cfg = Config::from_gguf(&g).expect("synthetic config");
+        (g, cfg)
+    }
+
+    /// The synthetic qwen35 model: DeltaNet layers only, or with `attn` a second, full-attention
+    /// layer and an f16 embedding — what Vulkan's record-once (chained) decode needs: an attention
+    /// op, and an embedding its on-device gather reads.
+    fn qwen35_gguf(attn: bool) -> SyntheticModel {
+        let cc = Q35_D_INNER + 2 * Q35_N_GROUP * Q35_D_STATE;
+        let head_v = Q35_D_INNER / Q35_DT_RANK;
+        // `attn` adds layer 1 at `full_attention_interval = 2`: two heads of NE / 2, the query
+        // projection carrying the output gate beside the query.
+        let hd = Q35_NE / 2;
+        let t = |name: &str, shape: Vec<usize>, base: f32| (name.to_string(), shape, base);
+        // (name, shape, centre value): norms sit near 1, `ssm_a` is negative (a decay).
+        let mut tensors = vec![
+            t("token_embd.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+            t("output_norm.weight", vec![Q35_NE], 1.0),
+            t("output.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+            t("blk.0.attn_norm.weight", vec![Q35_NE], 1.0),
+            t("blk.0.attn_qkv.weight", vec![Q35_NE, cc], 0.0),
+            t("blk.0.attn_gate.weight", vec![Q35_NE, Q35_D_INNER], 0.0),
+            t("blk.0.ssm_conv1d.weight", vec![Q35_D_CONV, cc], 0.0),
+            t("blk.0.ssm_alpha.weight", vec![Q35_NE, Q35_DT_RANK], 0.0),
+            t("blk.0.ssm_beta.weight", vec![Q35_NE, Q35_DT_RANK], 0.0),
+            t("blk.0.ssm_a", vec![Q35_DT_RANK], -1.0),
+            t("blk.0.ssm_dt.bias", vec![Q35_DT_RANK], 0.0),
+            t("blk.0.ssm_norm.weight", vec![head_v], 1.0),
+            t("blk.0.ssm_out.weight", vec![Q35_D_INNER, Q35_NE], 0.0),
+        ];
+        let ffn = |tensors: &mut Vec<(String, Vec<usize>, f32)>, l: usize| {
+            for (name, shape, base) in [
+                ("post_attention_norm", vec![Q35_NE], 1.0),
+                ("ffn_gate", vec![Q35_NE, Q35_NFF], 0.0),
+                ("ffn_up", vec![Q35_NE, Q35_NFF], 0.0),
+                ("ffn_down", vec![Q35_NFF, Q35_NE], 0.0),
+            ] {
+                tensors.push((format!("blk.{l}.{name}.weight"), shape, base));
+            }
+        };
+        ffn(&mut tensors, 0);
+        if attn {
+            for (name, shape, base) in [
+                ("attn_norm", vec![Q35_NE], 1.0),
+                ("attn_q", vec![Q35_NE, 2 * 2 * hd], 0.0),
+                ("attn_k", vec![Q35_NE, 2 * hd], 0.0),
+                ("attn_v", vec![Q35_NE, 2 * hd], 0.0),
+                ("attn_q_norm", vec![hd], 1.0),
+                ("attn_k_norm", vec![hd], 1.0),
+                ("attn_output", vec![2 * hd, Q35_NE], 0.0),
+            ] {
+                tensors.push((format!("blk.1.{name}.weight"), shape, base));
+            }
+            ffn(&mut tensors, 1);
+        }
+        let k = |key: &str, v: usize| (format!("qwen35.{key}"), v);
+        let mut u32_keys = vec![
+            k("block_count", if attn { 2 } else { 1 }),
+            k("context_length", 64),
+            k("embedding_length", Q35_NE),
+            k("feed_forward_length", Q35_NFF),
+            k("attention.head_count", 2),
+            k("attention.head_count_kv", 2),
+            k("ssm.conv_kernel", Q35_D_CONV),
+            k("ssm.state_size", Q35_D_STATE),
+            k("ssm.inner_size", Q35_D_INNER),
+            k("ssm.group_count", Q35_N_GROUP),
+            k("ssm.time_step_rank", Q35_DT_RANK),
+            ("tokenizer.ggml.eos_token_id".to_string(), Q35_VOCAB - 1),
+        ];
+        if attn {
+            u32_keys.push(k("full_attention_interval", 2));
+        }
+        let f16: &[&str] = if attn { &["token_embd.weight"] } else { &[] };
+        synthetic_gguf("qwen35", &u32_keys, &tensors, f16)
+    }
+
+    /// The weight-shape table accepts every tensor of a well-formed qwen35 model that has a rule,
+    /// the full-attention layer's projections, gated query and head norms among them, and refuses
+    /// each of those widened by one along its contiguous axis.
+    #[test]
+    fn qwen35_weight_shapes_are_checked() {
+        use crate::seam::wshape::{check_weight_shape, expected_weight_shape};
+        use infr_core::WeightSource;
+        let (g, cfg) = open_synthetic("q35-shapes", &qwen35_gguf(true));
+        for name in [
+            "blk.1.attn_q.weight",
+            "blk.1.attn_k.weight",
+            "blk.1.attn_v.weight",
+            "blk.1.attn_q_norm.weight",
+            "blk.1.attn_k_norm.weight",
+            "blk.1.attn_output.weight",
+            "blk.1.ffn_down.weight",
+        ] {
+            assert!(
+                expected_weight_shape(&cfg, name).is_some(),
+                "{name} has no rule"
+            );
+        }
+        for t in g.tensors() {
+            if expected_weight_shape(&cfg, &t.name).is_none() {
+                continue;
+            }
+            check_weight_shape(&cfg, &t.name, &t.shape).expect("a well-formed tensor");
+            let mut wide = t.shape.clone();
+            wide[0] += 1;
+            assert!(
+                check_weight_shape(&cfg, &t.name, &wide).is_err(),
+                "{} widened to {wide:?} was accepted",
+                t.name
+            );
+        }
+    }
+
+    /// The last prompt token's logits for `prompt`, run on `state` (`None` = a fresh slot).
+    fn q35_logits(
+        g: &Gguf,
+        cfg: &Config,
+        embd: &std::sync::OnceLock<Vec<f32>>,
+        prompt: &[u32],
+        state: &mut Option<SeamKv>,
+    ) -> Vec<f32> {
+        let ec = EngineConfig::default();
+        let be = infr_cpu::CpuBackend::new();
+        let mut logits = Vec::new();
+        super::generate_dense_backend(
+            &be,
+            &crate::seam::cpu_upload_bind(&be),
+            g,
+            cfg,
+            &ec,
+            TokenEmbd::new(embd, g),
+            None,
+            prompt,
+            1,
+            |_| {},
+            state,
+            32,
+            None,
+            None,
+            None,
+            Some(&mut logits),
+            None,
+            None,
+            None,
+        )
+        .expect("qwen35 synthetic generation");
+        logits
+    }
+
+    /// `INFR_DELTA_STRIDED` makes the decode read DeltaNet's q/k/v as slices of the conv output.
+    /// On a backend that honours `Op::DeltaNet::src_stride` (the CPU reference does) the logits
+    /// must not move; the emitter used to leave the stride at 0, so a non-Vulkan backend read k
+    /// and v from q's prefix.
+    #[test]
+    fn qwen35_strided_deltanet_matches_packed_on_cpu() {
+        let (g, cfg) = open_synthetic("qwen35-strided", &qwen35_gguf(false));
+        let be = infr_cpu::CpuBackend::new();
+        assert!(infr_core::backend::Backend::deltanet_strided(&be));
+        let prompt = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let packed = fresh_logits(
+            &be,
+            &crate::seam::cpu_upload_bind(&be),
+            &g,
+            &cfg,
+            &EngineConfig::default(),
+            &prompt,
+        );
+        let mut ec = EngineConfig::default();
+        ec.kernels.vulkan.delta_strided = true;
+        let strided = fresh_logits(
+            &be,
+            &crate::seam::cpu_upload_bind(&be),
+            &g,
+            &cfg,
+            &ec,
+            &prompt,
+        );
+        assert_eq!(packed.len(), Q35_VOCAB);
+        assert_eq!(strided, packed);
+    }
+
+    /// The Vulkan half of `qwen35_strided_deltanet_matches_packed_on_cpu`: the strided decode
+    /// kernel, now keyed on the op's own `src_stride`, scores like the CPU reference.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn qwen35_strided_deltanet_vulkan_matches_cpu() {
+        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
+            return;
+        };
+        let (g, cfg) = open_synthetic("qwen35-strided-vk", &qwen35_gguf(true));
+        let cpu = infr_cpu::CpuBackend::new();
+        let prompt = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let want = fresh_logits(
+            &cpu,
+            &crate::seam::cpu_upload_bind(&cpu),
+            &g,
+            &cfg,
+            &EngineConfig::default(),
+            &prompt,
+        );
+        let mut ec = EngineConfig::default();
+        ec.kernels.vulkan.delta_strided = true;
+        let bind = crate::seam::vulkan_moe_binder(&vk, &g, &cfg, &ec, true, 64)
+            .expect("vulkan weight binder");
+        let got = fresh_logits(&vk, &*bind, &g, &cfg, &ec, &prompt);
+        let err = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, |m, d| {
+                if m.is_nan() || d.is_nan() {
+                    f32::NAN
+                } else {
+                    m.max(d)
+                }
+            });
+        println!("strided DeltaNet vulkan-vs-cpu max err {err:e}");
+        assert!(
+            err < 2e-2,
+            "strided DeltaNet on Vulkan misses the CPU by {err}"
+        );
+    }
+
+    /// After `SeamKv::reset`, the next prompt must run from a zeroed DeltaNet state: its logits
+    /// equal a fresh slot's, not those of a state still carrying the first prompt.
+    #[test]
+    fn qwen35_reset_slot_matches_a_fresh_slot() {
+        let (g, cfg) = open_synthetic("qwen35-reset", &qwen35_gguf(false));
+        assert!(cfg.qwen35 && !cfg.is_qwen35_attn_layer(0));
+        let embd = std::sync::OnceLock::new();
+
+        let (first, second) = ([3u32, 1, 4, 1, 5, 9, 2, 6], [7u32, 2, 8, 1, 8, 2]);
+        let fresh = q35_logits(&g, &cfg, &embd, &second, &mut None);
+
+        let mut slot = None;
+        q35_logits(&g, &cfg, &embd, &first, &mut slot);
+        slot.as_mut().expect("slot initialized").reset();
+        let after_reset = q35_logits(&g, &cfg, &embd, &second, &mut slot);
+
+        // NaN-propagating: `f32::max` drops a NaN operand, and the reset check below is `== 0.0`.
+        let diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, |m, d| {
+                    if m.is_nan() || d.is_nan() {
+                        f32::NAN
+                    } else {
+                        m.max(d)
+                    }
+                })
+        };
+        assert_eq!(fresh.len(), Q35_VOCAB);
+        // What `second` reads off a state that skipped the zeroing: the first call fed all of
+        // `first` (its one sampled token is never fed), and this model has no positions, so that
+        // is the recurrence of `first ++ second` from zero. It must differ from `fresh`, or the
+        // equality below could not catch a reused state.
+        let dirty = q35_logits(
+            &g,
+            &cfg,
+            &embd,
+            &[&first[..], &second[..]].concat(),
+            &mut None,
+        );
+        assert!(
+            diff(&dirty, &fresh) > 1e-2,
+            "a carried-over state moves the logits by only {}: the fixture cannot tell states apart",
+            diff(&dirty, &fresh)
+        );
+        assert!(
+            diff(&fresh, &after_reset) == 0.0,
+            "logits after reset differ from a fresh slot by {}: the DeltaNet state was reused",
+            diff(&fresh, &after_reset)
+        );
+    }
+
+    /// The synthetic LFM3 model: a short-convolution layer, then a sliding-window attention layer
+    /// (LFM3 refuses a file without one), with a four-token window and a four-tap kernel.
+    fn lfm3_gguf() -> SyntheticModel {
+        const NE: usize = 32;
+        const HD: usize = 8;
+        let k = |key: &str| format!("lfm3.{key}");
+        let u = |key: &str, v: u32| (k(key), Meta::U32(v));
+        let meta = vec![
+            (
+                "general.architecture".to_string(),
+                Meta::Str("lfm3".to_string()),
+            ),
+            u("block_count", 2),
+            u("context_length", LFM3_RING_CTX as u32),
+            u("embedding_length", NE as u32),
+            u("feed_forward_length", 48),
+            u("attention.head_count", 4),
+            (k("attention.head_count_kv"), Meta::U32Arr(vec![0, 2])),
+            u("attention.key_length", HD as u32),
+            u("attention.value_length", HD as u32),
+            (k("rope.freq_base_swa"), Meta::F32(1.0e4)),
+            (k("attention.layer_norm_rms_epsilon"), Meta::F32(1.0e-5)),
+            u("attention.sliding_window", 4),
+            (
+                k("attention.sliding_window_pattern"),
+                Meta::BoolArr(vec![false, true]),
+            ),
+            u("shortconv.l_cache", 4),
+            (
+                "tokenizer.ggml.eos_token_id".to_string(),
+                Meta::U32(Q35_VOCAB as u32 - 1),
+            ),
+        ];
+        let t = |name: &str, shape: Vec<usize>, fill: Fill| TensorSpec::new(name, shape, fill);
+        let mut tensors = vec![
+            t("token_embd.weight", vec![NE, Q35_VOCAB], Fill::Rand(0.5)),
+            t("output_norm.weight", vec![NE], Fill::Gain),
+            t("blk.0.shortconv.conv.weight", vec![4, NE], Fill::Rand(0.5)),
+            t(
+                "blk.0.shortconv.in_proj.weight",
+                vec![NE, 3 * NE],
+                Fill::Rand(0.4),
+            ),
+            t(
+                "blk.0.shortconv.out_proj.weight",
+                vec![NE, NE],
+                Fill::Rand(0.3),
+            ),
+            t("blk.1.attn_q.weight", vec![NE, 4 * HD], Fill::Rand(0.3)),
+            t("blk.1.attn_k.weight", vec![NE, 2 * HD], Fill::Rand(0.3)),
+            t("blk.1.attn_v.weight", vec![NE, 2 * HD], Fill::Rand(0.3)),
+            t("blk.1.attn_q_norm.weight", vec![HD], Fill::Gain),
+            t("blk.1.attn_k_norm.weight", vec![HD], Fill::Gain),
+            t(
+                "blk.1.attn_output.weight",
+                vec![4 * HD, NE],
+                Fill::Rand(0.3),
+            ),
+            t("blk.1.attn_gate.weight", vec![NE, 4], Fill::Rand(1.0)),
+        ];
+        for l in 0..2 {
+            let w = |name: &str| format!("blk.{l}.{name}.weight");
+            tensors.push(t(&w("attn_norm"), vec![NE], Fill::Gain));
+            tensors.push(t(&w("ffn_norm"), vec![NE], Fill::Gain));
+            tensors.push(t(&w("ffn_gate"), vec![NE, 48], Fill::Rand(0.3)));
+            tensors.push(t(&w("ffn_up"), vec![NE, 48], Fill::Rand(0.3)));
+            tensors.push(t(&w("ffn_down"), vec![48, NE], Fill::Rand(0.3)));
+        }
+        SyntheticModel { meta, tensors }
+    }
+
+    /// A turn that does not extend the slot's tokens must start the short convolution from a
+    /// zeroed history: its logits equal a fresh slot's exactly. Its first token differs from the
+    /// previous turn's, so no prefix is reused and both runs prefill the same chunk from position 0.
+    #[test]
+    fn lfm3_divergent_turn_matches_a_fresh_slot() {
+        let (g, cfg) = open_synthetic("lfm3-diverge", &lfm3_gguf());
+        assert!(cfg.lfm3 && cfg.is_shortconv_layer(0) && cfg.is_swa_layer(1));
+        let embd = std::sync::OnceLock::new();
+        let (first, second) = ([3u32, 1, 4, 1, 5, 9, 2, 6], [7u32, 2, 8, 1, 8, 2]);
+        let fresh = q35_logits(&g, &cfg, &embd, &second, &mut None);
+        let mut slot = None;
+        q35_logits(&g, &cfg, &embd, &first, &mut slot);
+        let after = q35_logits(&g, &cfg, &embd, &second, &mut slot);
+        assert_eq!(fresh.len(), Q35_VOCAB);
+        assert_eq!(
+            after, fresh,
+            "a divergent turn reused the short convolution's history"
+        );
+    }
+
+    /// A turn that extends the slot's tokens continues from its history and KV rows, prefilling
+    /// only the new tokens, and lands on a fresh full prefill's logits. Past the four-token window,
+    /// so the window layer reads reused rows. Not bit-exact: the two runs batch the rows
+    /// differently.
+    #[test]
+    fn lfm3_extending_turn_matches_a_fresh_prefill() {
+        let (g, cfg) = open_synthetic("lfm3-extend", &lfm3_gguf());
+        let embd = std::sync::OnceLock::new();
+        let first = [3u32, 1, 4, 1, 5, 9, 2, 6];
+        let second = [&first[..], &[5, 3, 5, 8]].concat();
+        let fresh = q35_logits(&g, &cfg, &embd, &second, &mut None);
+        let mut slot = None;
+        q35_logits(&g, &cfg, &embd, &first, &mut slot);
+        let extended = q35_logits(&g, &cfg, &embd, &second, &mut slot);
+        let err = fresh
+            .iter()
+            .zip(&extended)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, |m, d| {
+                if m.is_nan() || d.is_nan() {
+                    f32::NAN
+                } else {
+                    m.max(d)
+                }
+            });
+        assert!(
+            err < 1e-4,
+            "an extending turn misses a fresh prefill by {err}"
+        );
+    }
+
+    /// A prefill cancelled between two chunks has advanced qwen35's recurrent state past the
+    /// prefix `cached` keeps, so the next call must not reuse that state: its logits equal a
+    /// fresh slot's.
+    #[test]
+    fn qwen35_aborted_prefill_matches_a_fresh_slot() {
+        let (g, cfg) = open_synthetic("qwen35-abort", &qwen35_gguf(false));
+        let embd = std::sync::OnceLock::new();
+        let mut ec = EngineConfig::default();
+        ec.device.ubatch = Some(2);
+        let be = infr_cpu::CpuBackend::new();
+        let run = |prompt: &[u32],
+                   state: &mut Option<SeamKv>,
+                   req: Option<&crate::sampling::RequestCtx>| {
+            let mut logits = Vec::new();
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                1,
+                |_| {},
+                state,
+                32,
+                None,
+                None,
+                None,
+                Some(&mut logits),
+                None,
+                None,
+                req,
+            )
+            .map(|_| logits)
+        };
+        let first = Q35_FIRST;
+        // Extends `first`, so its prefill starts at `first.len()`; cancelled after one chunk.
+        let cut = [&first[..], &[7, 2, 8, 1, 8, 2]].concat();
+        let then = [&first[..], &[5, 5, 3]].concat();
+
+        let fresh = run(&then, &mut None, None).expect("fresh slot");
+        let mut slot = None;
+        run(&first, &mut slot, None).expect("first turn");
+        let req = crate::sampling::RequestCtx::new(Default::default()).abort_at_poll(1);
+        let err = run(&cut, &mut slot, Some(&req)).expect_err("the prefill was not cancelled");
+        assert!(
+            err.to_string().contains("cancelled during prompt prefill"),
+            "{err}"
+        );
+        let after = run(&then, &mut slot, None).expect("turn after the cancel");
+        assert_eq!(fresh.len(), Q35_VOCAB);
+        assert_eq!(
+            after, fresh,
+            "the next call reused a recurrent state the cancelled prefill had advanced"
+        );
+    }
+
+    /// One Vulkan generation on the synthetic qwen35 (with its attention layer) through `be`:
+    /// `req`, when given, is aborted on the first kept token, so a chained decode stops there.
+    type Q35Run<'a> = dyn Fn(
+            &dyn infr_core::backend::Backend,
+            &[u32],
+            usize,
+            &mut Option<SeamKv>,
+            Option<&crate::sampling::RequestCtx>,
+            Option<&mut Vec<f32>>,
+        ) -> crate::GenStats
+        + 'a;
+
+    /// Build the Vulkan fixture for the qwen35 chain tests and hand `body` the device and a runner
+    /// ([`with_chain_vulkan`] on the synthetic qwen35 with its attention layer).
+    fn with_q35_vulkan(body: impl FnOnce(&infr_vulkan::VulkanBackend, &Q35Run<'_>)) {
+        with_chain_vulkan(
+            "qwen35-chain",
+            &qwen35_gguf(true),
+            EngineConfig::default(),
+            32,
+            |cfg| assert!(cfg.is_qwen35_attn_layer(1)),
+            body,
+        );
+    }
+
+    /// Open `model` on Vulkan with `ec` and a `ctx`-token slot, check its config with `check`, and
+    /// hand `body` the device and a runner — or skip without a device, or on one whose decode
+    /// chain is a single step (an integrated GPU caps it so), where no chain runs and the decode
+    /// loop takes no prefill-boundary snapshot, so the snapshot tests' mechanism cannot be
+    /// reached. The skip names the reason on the harness's own stderr, so it shows without
+    /// `--nocapture`.
+    fn with_chain_vulkan(
+        tag: &str,
+        model: &SyntheticModel,
+        ec: EngineConfig,
+        ctx: usize,
+        check: impl FnOnce(&Config),
+        body: impl FnOnce(&infr_vulkan::VulkanBackend, &Q35Run<'_>),
+    ) {
+        use std::io::Write;
+        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
+            eprintln!("skip: no Vulkan device");
+            return;
+        };
+        let name = infr_core::backend::Backend::capabilities(&vk).name;
+        let chain = infr_core::backend::Backend::max_decode_chain(&vk);
+        if chain < 2 {
+            let _ = writeln!(
+                std::io::stderr().lock(),
+                "skip: {name} runs a decode chain of {chain}, so no chain or prefill-boundary \
+                 snapshot happens and the snapshot tests cannot exercise it"
+            );
+            return;
+        }
+        eprintln!("vulkan device: {name}");
+        let (g, cfg) = open_synthetic(tag, model);
+        check(&cfg);
+        let embd = std::sync::OnceLock::new();
+        let bind = crate::seam::vulkan_moe_binder(&vk, &g, &cfg, &ec, true, ctx)
+            .expect("vulkan weight binder");
+        let run = |be: &dyn infr_core::backend::Backend,
+                   prompt: &[u32],
+                   max_new: usize,
+                   state: &mut Option<SeamKv>,
+                   req: Option<&crate::sampling::RequestCtx>,
+                   logits: Option<&mut Vec<f32>>| {
+            let (_, stats) = super::generate_dense_backend(
+                be,
+                &*bind,
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                max_new,
+                |_| {
+                    if let Some(r) = req {
+                        r.abort();
+                    }
+                },
+                state,
+                ctx,
+                None,
+                None,
+                None,
+                logits,
+                None,
+                None,
+                req,
+            )
+            .expect("synthetic generation on Vulkan");
+            stats
+        };
+        body(&vk, &run);
+    }
+
+    /// The logits for `then` on a fresh slot that first prefilled `first` minus its last token
+    /// (`max_new = 0`): the same split a turn resuming from `first`'s prefill boundary takes —
+    /// those rows, then the rest of `then` — so the two agree bit for bit.
+    fn q35_boundary_reference(
+        vk: &infr_vulkan::VulkanBackend,
+        run: &Q35Run<'_>,
+        first: &[u32],
+        then: &[u32],
+    ) -> Vec<f32> {
+        let mut slot = None;
+        run(vk, first, 0, &mut slot, None, None);
+        let mut logits = Vec::new();
+        run(vk, then, 1, &mut slot, None, Some(&mut logits));
+        logits
+    }
+
+    const Q35_FIRST: [u32; 8] = [3, 1, 4, 1, 5, 9, 2, 6];
+
+    /// A chained decode runs every step of its chain on the device, so a stop partway through
+    /// leaves qwen35's recurrent state past the tokens `cached` records. A next prompt that
+    /// extends `cached` must not reuse that state, and must not pay for it with a prefill from
+    /// zero either: it resumes from the snapshot the decode loop took at the first turn's prefill
+    /// boundary, and its logits equal a slot that ran the same rows without the overrun.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn qwen35_chain_stopped_early_is_not_reused_vulkan() {
+        with_q35_vulkan(|vk, run| {
+            let first = Q35_FIRST;
+            let second = [&first[..], &[7, 2]].concat();
+            let reference = q35_boundary_reference(vk, run, &first, &second);
+
+            // Stop after the first kept token of a chain several steps long.
+            let mut slot = None;
+            let req = crate::sampling::RequestCtx::new(Default::default());
+            run(vk, &first, 6, &mut slot, Some(&req), None);
+            let kv = slot.as_ref().expect("slot initialized");
+            assert_eq!(kv.cached, first, "only the prompt was fed");
+            assert!(
+                kv.written_end > kv.cached.len(),
+                "the chain did not run past the stop (written to {}), so this test checks nothing",
+                kv.written_end
+            );
+
+            let mut after = Vec::new();
+            let stats = run(vk, &second, 1, &mut slot, None, Some(&mut after));
+            // The first turn's prefill boundary: every prompt token but the last, which the
+            // decode loop feeds.
+            assert_eq!(
+                stats.n_cached,
+                first.len() - 1,
+                "the next turn did not resume from the prefill-boundary snapshot"
+            );
+            assert_eq!(reference.len(), Q35_VOCAB);
+            assert_eq!(
+                after, reference,
+                "the next turn reused a recurrent state the chain had advanced past the stop"
+            );
+        });
+    }
+
+    /// A turn that ended cleanly and is then sent again unchanged cannot reuse its state (that
+    /// would sample from the state after the whole prompt and the reply), but it can resume from
+    /// the snapshot at the prefill boundary instead of re-prefilling from zero.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn qwen35_identical_resend_resumes_from_the_boundary_vulkan() {
+        with_q35_vulkan(|vk, run| {
+            let first = Q35_FIRST;
+            let reference = q35_boundary_reference(vk, run, &first, &first);
+
+            let mut slot = None;
+            run(vk, &first, 2, &mut slot, None, None);
+            let kv = slot.as_ref().expect("slot initialized");
+            assert_eq!(kv.written_end, kv.cached.len(), "the turn ended cleanly");
+
+            let mut again = Vec::new();
+            let stats = run(vk, &first, 1, &mut slot, None, Some(&mut again));
+            assert_eq!(
+                stats.n_cached,
+                first.len() - 1,
+                "the resend did not resume from the prefill-boundary snapshot"
+            );
+            assert_eq!(again, reference);
+        });
+    }
+
+    /// Delegates to the Vulkan backend, refusing every `KvCache` allocation once `refuse` is set —
+    /// the VRAM guard turning down the snapshot's second copy of the recurrent state. There is no
+    /// knob that makes the real guard refuse a chosen allocation.
+    ///
+    /// It also fails the `fail_copy_at`-th `copy_buffer` (counted in `copies`, 0 = never), for a
+    /// device copy that dies partway through restoring a snapshot.
+    struct RefuseKv<'a> {
+        vk: &'a infr_vulkan::VulkanBackend,
+        refuse: std::sync::atomic::AtomicBool,
+        refused: std::sync::atomic::AtomicUsize,
+        fail_copy_at: std::sync::atomic::AtomicUsize,
+        copies: std::sync::atomic::AtomicUsize,
+    }
+
+    impl infr_core::backend::Backend for RefuseKv<'_> {
+        fn name(&self) -> &str {
+            self.vk.name()
+        }
+        fn capabilities(&self) -> infr_core::backend::Capabilities {
+            self.vk.capabilities()
+        }
+        fn alloc(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            use std::sync::atomic::Ordering::Relaxed;
+            if self.refuse.load(Relaxed) && usage == infr_core::backend::BufferUsage::KvCache {
+                self.refused.fetch_add(1, Relaxed);
+                return Err(infr_core::error::Error::Backend(
+                    "test: VRAM budget exceeded".into(),
+                ));
+            }
+            self.vk.alloc(bytes, usage)
+        }
+        fn alloc_uninit(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            self.vk.alloc_uninit(bytes, usage)
+        }
+        fn upload(
+            &self,
+            dst: &dyn infr_core::backend::Buffer,
+            src: &[u8],
+        ) -> infr_core::error::Result<()> {
+            self.vk.upload(dst, src)
+        }
+        fn download(
+            &self,
+            src: &dyn infr_core::backend::Buffer,
+            dst: &mut [u8],
+        ) -> infr_core::error::Result<()> {
+            self.vk.download(src, dst)
+        }
+        fn device_alloc_room(&self) -> Option<u64> {
+            self.vk.device_alloc_room()
+        }
+        fn activation_peak(&self) -> Option<u64> {
+            self.vk.activation_peak()
+        }
+        fn copy_buffer(
+            &self,
+            src: &dyn infr_core::backend::Buffer,
+            dst: &dyn infr_core::backend::Buffer,
+            bytes: usize,
+        ) -> infr_core::error::Result<()> {
+            use std::sync::atomic::Ordering::Relaxed;
+            let n = self.copies.fetch_add(1, Relaxed) + 1;
+            if n == self.fail_copy_at.load(Relaxed) {
+                return Err(infr_core::error::Error::Backend(
+                    "test: device copy failed".into(),
+                ));
+            }
+            self.vk.copy_buffer(src, dst, bytes)
+        }
+        fn compile(
+            &self,
+            graph: &infr_core::graph::Graph,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Plan>> {
+            self.vk.compile(graph)
+        }
+        fn execute(
+            &self,
+            plan: &dyn infr_core::backend::Plan,
+            bindings: &infr_core::backend::Bindings,
+        ) -> infr_core::error::Result<()> {
+            self.vk.execute(plan, bindings)
+        }
+        fn execute_chain(
+            &self,
+            plan: &dyn infr_core::backend::Plan,
+            bindings: &infr_core::backend::Bindings,
+            n: usize,
+        ) -> infr_core::error::Result<Option<Vec<u32>>> {
+            self.vk.execute_chain(plan, bindings, n)
+        }
+        fn max_decode_chain(&self) -> usize {
+            self.vk.max_decode_chain()
+        }
+        fn decode_replay_ready(
+            &self,
+            plan: &dyn infr_core::backend::Plan,
+            bindings: &infr_core::backend::Bindings,
+        ) -> bool {
+            self.vk.decode_replay_ready(plan, bindings)
+        }
+        fn sync(&self) -> infr_core::error::Result<()> {
+            self.vk.sync()
+        }
+        fn moe_paged(&self) -> bool {
+            self.vk.moe_paged()
+        }
+        fn dense_paged(&self) -> bool {
+            self.vk.dense_paged()
+        }
+        fn dense_holds_every_block(&self) -> bool {
+            self.vk.dense_holds_every_block()
+        }
+    }
+
+    /// The prefill-boundary snapshot is best effort: when its allocation is refused the turn
+    /// still succeeds, the refusal is remembered rather than retried every turn, and a turn after
+    /// a stop mid-chain re-prefills from zero and is still correct.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn qwen35_refused_snapshot_is_best_effort_vulkan() {
+        use std::sync::atomic::Ordering::Relaxed;
+        with_q35_vulkan(|vk, run| {
+            let first = Q35_FIRST;
+            let second = [&first[..], &[7, 2]].concat();
+            let mut fresh = Vec::new();
+            run(vk, &second, 1, &mut None, None, Some(&mut fresh));
+
+            let be = RefuseKv {
+                vk,
+                refuse: false.into(),
+                refused: 0.into(),
+                fail_copy_at: 0.into(),
+                copies: 0.into(),
+            };
+            // Allocate the slot's own state and cache first; refuse only what comes after.
+            let mut slot = None;
+            run(&be, &first, 1, &mut slot, None, None);
+            be.refuse.store(true, Relaxed);
+            let req = crate::sampling::RequestCtx::new(Default::default());
+            run(
+                &be,
+                &[&first[..], &[5]].concat(),
+                6,
+                &mut slot,
+                Some(&req),
+                None,
+            );
+            assert_eq!(
+                be.refused.load(Relaxed),
+                1,
+                "the snapshot was attempted once"
+            );
+            assert!(slot.as_ref().expect("slot").delta_snapshot_refused);
+
+            let mut after = Vec::new();
+            let stats = run(&be, &second, 1, &mut slot, None, Some(&mut after));
+            assert_eq!(
+                stats.n_cached, 0,
+                "no snapshot, so the state restarts from zero"
+            );
+            assert_eq!(after, fresh);
+
+            run(&be, &first, 6, &mut slot, None, None);
+            assert_eq!(
+                be.refused.load(Relaxed),
+                1,
+                "a refused snapshot is not retried"
+            );
+        });
+    }
+
+    /// A resume whose snapshot copy fails partway leaves the live state half restored. The slot
+    /// must not go on claiming the old `cached`: a next prompt that extends it would take plain
+    /// reuse and decode on that state. Instead the next turn zeroes, and matches a fresh slot.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn qwen35_failed_resume_is_not_reused_vulkan() {
+        use std::sync::atomic::Ordering::Relaxed;
+        with_q35_vulkan(|vk, run| {
+            let first = Q35_FIRST;
+            let be = RefuseKv {
+                vk,
+                refuse: false.into(),
+                refused: 0.into(),
+                fail_copy_at: 0.into(),
+                copies: 0.into(),
+            };
+            let mut slot = None;
+            run(&be, &first, 2, &mut slot, None, None);
+            let kv = slot.as_ref().expect("slot initialized");
+            assert_eq!(kv.written_end, kv.cached.len(), "the turn ended cleanly");
+            let then = [&kv.cached[..], &[5]].concat();
+            let mut fresh = Vec::new();
+            run(vk, &then, 1, &mut None, None, Some(&mut fresh));
+
+            // An identical resend resumes from the boundary snapshot; fail its SECOND copy, so
+            // the first layer buffer is already restored when the error comes back.
+            be.copies.store(0, Relaxed);
+            be.fail_copy_at.store(2, Relaxed);
+            let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run(&be, &first, 1, &mut slot, None, None)
+            }));
+            be.fail_copy_at.store(0, Relaxed);
+            let msg = failed
+                .expect_err("the resume did not fail")
+                .downcast::<String>()
+                .map(|m| *m)
+                .unwrap_or_default();
+            assert!(msg.contains("test: device copy failed"), "{msg}");
+
+            let mut after = Vec::new();
+            let stats = run(&be, &then, 1, &mut slot, None, Some(&mut after));
+            assert_eq!(
+                stats.n_cached, 0,
+                "the state after a failed resume was reused"
+            );
+            assert_eq!(after, fresh);
+        });
+    }
+
+    /// The slot the LFM3 ring tests open: a prefill chunk short enough that the window layer's
+    /// ring holds fewer rows than the slot, so a long turn wraps it.
+    const LFM3_RING_CTX: usize = 256;
+    const LFM3_RING_UBATCH: usize = 16;
+
+    /// [`with_chain_vulkan`] on the synthetic LFM3 with [`LFM3_RING_UBATCH`]-row chunks, EOS
+    /// ignored so a turn decodes all it is asked to; `body` also gets the config and the window
+    /// layer's ring rows. The embedding table is f16, a dtype the device-side gather reads: a
+    /// decode chain needs that gather, and the f32 table would leave the decode per token.
+    fn with_lfm3_ring_vulkan(
+        body: impl FnOnce(&infr_vulkan::VulkanBackend, &Q35Run<'_>, &Config, usize),
+    ) {
+        let mut ec = EngineConfig::default();
+        ec.device.ubatch = Some(LFM3_RING_UBATCH);
+        ec.sampling.ignore_eos = true;
+        let checked = std::cell::Cell::new(None);
+        let mut model = lfm3_gguf();
+        let embd = model
+            .tensors
+            .iter_mut()
+            .find(|t| t.name == "token_embd.weight")
+            .expect("the embedding table");
+        embd.fill = Fill::ExactF16(embd.values());
+        with_chain_vulkan(
+            "lfm3-ring-chain",
+            &model,
+            ec,
+            LFM3_RING_CTX,
+            |cfg| {
+                assert!(cfg.is_shortconv_layer(0) && cfg.is_swa_layer(1));
+                checked.set(Some(cfg.clone()));
+            },
+            |vk, run| {
+                let cfg = checked.take().expect("the config was checked");
+                let rows = crate::seam::kv_rows_at(
+                    &cfg,
+                    1,
+                    LFM3_RING_CTX,
+                    true,
+                    LFM3_RING_UBATCH,
+                    infr_core::backend::Backend::kv_row_align(vk),
+                );
+                assert!(
+                    rows < LFM3_RING_CTX,
+                    "the window ring must be shorter than the slot"
+                );
+                body(vk, run, &cfg, rows)
+            },
+        );
+    }
+
+    /// LFM3 resumes from the prefill-boundary snapshot with a window ring that has wrapped: the
+    /// short convolution's history comes back from the snapshot, the window layer reads ring rows
+    /// the stopped chain left intact, and the turn lands on a slot that ran the same rows without
+    /// the overrun.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn lfm3_chain_stopped_early_resumes_past_the_window_vulkan() {
+        with_lfm3_ring_vulkan(|vk, run, _, ring_rows| {
+            let first: Vec<u32> = (0..100u32)
+                .map(|i| (i * 7 + 3) % Q35_VOCAB as u32)
+                .collect();
+            let second = [&first[..], &[7, 2]].concat();
+            let reference = q35_boundary_reference(vk, run, &first, &second);
+
+            let mut slot = None;
+            let req = crate::sampling::RequestCtx::new(Default::default());
+            run(vk, &first, 6, &mut slot, Some(&req), None);
+            let kv = slot.as_ref().expect("slot initialized");
+            assert!(
+                kv.kv_ring && kv.written_end > ring_rows,
+                "the first turn must wrap the window ring (written to {}, {ring_rows} rows)",
+                kv.written_end
+            );
+            assert!(
+                kv.written_end > kv.cached.len(),
+                "the chain did not run past the stop, so this test checks nothing"
+            );
+
+            let mut after = Vec::new();
+            let stats = run(vk, &second, 1, &mut slot, None, Some(&mut after));
+            assert_eq!(
+                stats.n_cached,
+                first.len() - 1,
+                "the next turn did not resume from the prefill-boundary snapshot"
+            );
+            assert_eq!(reference.len(), Q35_VOCAB);
+            assert_eq!(
+                after, reference,
+                "resuming past the window diverged from a slot without the overrun"
+            );
+        });
+    }
+
+    /// A snapshot is not resumed from once a later turn has recycled the ring rows its next
+    /// token's window reads: a long reply wraps the ring past the snapshot point, and a prompt
+    /// that diverges inside that reply must prefill from zero, matching a fresh slot.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn lfm3_snapshot_behind_a_recycled_ring_is_not_resumed_vulkan() {
+        with_lfm3_ring_vulkan(|vk, run, cfg, ring_rows| {
+            let first: Vec<u32> = (0..100u32)
+                .map(|i| (i * 7 + 3) % Q35_VOCAB as u32)
+                .collect();
+            let mut slot = None;
+            run(vk, &first, 70, &mut slot, None, None);
+            let kv = slot.as_ref().expect("slot initialized");
+            assert_eq!(kv.written_end, kv.cached.len(), "the turn ended cleanly");
+            assert_eq!(
+                crate::seam::weights::delta_snapshot_len(&kv.mtp_delta_ckpt),
+                Some(first.len() - 1),
+                "no prefill-boundary snapshot was taken, so this test checks nothing"
+            );
+            // The snapshot sits at `first.len() - 1`; its next token's window reaches back
+            // `swa_window` positions, which the reply has overwritten once it ran a ring past them.
+            let resume = first.len() - 1;
+            assert!(
+                kv.written_end - ring_rows > resume - cfg.swa_window,
+                "the reply (to {}) did not recycle the snapshot's window rows ({ring_rows} rows)",
+                kv.written_end
+            );
+            let then = [&first[..], &[5]].concat();
+            assert_ne!(
+                kv.cached.get(first.len()),
+                Some(&5),
+                "`then` must diverge from the reply"
+            );
+            let mut fresh = Vec::new();
+            run(vk, &then, 1, &mut None, None, Some(&mut fresh));
+
+            let mut after = Vec::new();
+            let stats = run(vk, &then, 1, &mut slot, None, Some(&mut after));
+            assert_eq!(
+                stats.n_cached, 0,
+                "resumed from a snapshot whose window rows the ring had recycled"
+            );
+            assert_eq!(after, fresh);
+        });
+    }
+
+    /// A one-layer `llama` (or `llama4`) model, every tensor f32, with `rope_freqs.weight` set to
+    /// `rope_freqs` when given. The llama4 variant routes four experts but interleaves them every
+    /// second layer, so its only layer is a dense ROPE layer (`no_rope_layer_step` 4 makes layer 3
+    /// the first NoPE one) and needs no expert banks.
+    fn llama_gguf(arch: &str, rope_freqs: Option<Vec<f32>>) -> SyntheticModel {
+        let hd = Q35_NE / 2;
+        let t = |name: &str, shape: Vec<usize>, base: f32| (name.to_string(), shape, base);
+        let mut tensors = vec![
+            t("token_embd.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+            t("output_norm.weight", vec![Q35_NE], 1.0),
+            t("output.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+        ];
+        for (name, shape, base) in [
+            ("attn_norm", vec![Q35_NE], 1.0),
+            ("attn_q", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_k", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_v", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_output", vec![2 * hd, Q35_NE], 0.0),
+            ("ffn_norm", vec![Q35_NE], 1.0),
+            ("ffn_gate", vec![Q35_NE, Q35_NFF], 0.0),
+            ("ffn_up", vec![Q35_NE, Q35_NFF], 0.0),
+            ("ffn_down", vec![Q35_NFF, Q35_NE], 0.0),
+        ] {
+            tensors.push((format!("blk.0.{name}.weight"), shape, base));
+        }
+        let k = |key: &str, v: usize| (format!("{arch}.{key}"), v);
+        let mut u32_keys = vec![
+            k("block_count", 1),
+            k("context_length", 256),
+            k("embedding_length", Q35_NE),
+            k("feed_forward_length", Q35_NFF),
+            k("attention.head_count", 2),
+            k("attention.head_count_kv", 2),
+            k("rope.dimension_count", hd),
+            ("tokenizer.ggml.eos_token_id".to_string(), Q35_VOCAB - 1),
+        ];
+        if arch == "llama4" {
+            u32_keys.extend([
+                k("expert_count", 4),
+                k("expert_used_count", 1),
+                k("expert_feed_forward_length", Q35_NFF),
+                k("interleave_moe_layer_step", 2),
+            ]);
+        }
+        let mut model = synthetic_gguf(arch, &u32_keys, &tensors, &[]);
+        if let Some(ff) = rope_freqs {
+            model.tensors.push(TensorSpec::new(
+                "rope_freqs.weight".to_string(),
+                vec![ff.len()],
+                Fill::Exact(ff),
+            ));
+        }
+        model
+    }
+
+    /// The tokens a CPU generation of the one-layer synthetic llama emits for `prompt` under
+    /// `sampling` — the serve path's request scope, through the real decode loop and its
+    /// device-sampling gates (the CPU backend runs `Op::Argmax` and `Op::Sample` as a GPU does).
+    fn llama_tokens(
+        g: &Gguf,
+        cfg: &Config,
+        prompt: &[u32],
+        sampling: crate::sampling::RequestSampling,
+    ) -> Vec<u32> {
+        let cpu = infr_cpu::CpuBackend::new();
+        let embd = std::sync::OnceLock::new();
+        let req = crate::sampling::RequestCtx::new(sampling);
+        let mut ec = EngineConfig::default();
+        ec.sampling.ignore_eos = true;
+        let (out, _) = super::generate_dense_backend(
+            &cpu,
+            &crate::seam::cpu_upload_bind(&cpu),
+            g,
+            cfg,
+            &ec,
+            TokenEmbd::new(&embd, g),
+            None,
+            prompt,
+            LLAMA_GEN,
+            |_| {},
+            &mut None,
+            64,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&req),
+        )
+        .expect("synthetic generation");
+        out
+    }
+
+    /// Tokens [`llama_tokens`] generates.
+    const LLAMA_GEN: usize = 8;
+
+    /// **`logit_bias` takes the sequence off device sampling.** Greedy decode would otherwise run
+    /// `Op::Argmax` and never download the row the bias patches, so the bias would be silently
+    /// ignored: the banned greedy token would still come out, and a forced token would not. The
+    /// observable is the token stream itself.
+    #[test]
+    fn logit_bias_reaches_a_device_sampled_decode() {
+        let (g, cfg) = open_synthetic("logit-bias", &llama_gguf("llama", None));
+        let prompt = [3u32, 1, 4, 1, 5];
+        let greedy = || crate::sampling::RequestSampling {
+            temp: Some(0.0),
+            ..Default::default()
+        };
+        let plain = llama_tokens(&g, &cfg, &prompt, greedy());
+        assert_eq!(plain.len(), LLAMA_GEN);
+        let first = plain[0];
+        let banned = llama_tokens(
+            &g,
+            &cfg,
+            &prompt,
+            crate::sampling::RequestSampling {
+                logit_bias: vec![(first, -100.0)],
+                ..greedy()
+            },
+        );
+        assert!(
+            !banned.contains(&first),
+            "token {first} was banned and still generated: {banned:?}"
+        );
+        let target = (first + 1) % Q35_VOCAB as u32;
+        let forced = llama_tokens(
+            &g,
+            &cfg,
+            &prompt,
+            crate::sampling::RequestSampling {
+                logit_bias: vec![(target, 100.0)],
+                ..greedy()
+            },
+        );
+        assert_eq!(
+            forced, [target; LLAMA_GEN],
+            "+100 did not force token {target}"
+        );
+    }
+
+    /// **`min_p` takes the sequence off device sampling**, which has no min-p cut. At temperature
+    /// 1.5 with top-k 8 (inside `Op::Sample`'s bound) the seeded run draws something other than
+    /// greedy; `min_p` 1 leaves only the top token, so the same request with it must reproduce
+    /// greedy exactly — it cannot if the device sampler drew the tokens.
+    #[test]
+    fn min_p_reaches_a_device_sampled_decode() {
+        let (g, cfg) = open_synthetic("min-p", &llama_gguf("llama", None));
+        let prompt = [3u32, 1, 4, 1, 5];
+        let greedy = llama_tokens(
+            &g,
+            &cfg,
+            &prompt,
+            crate::sampling::RequestSampling {
+                temp: Some(0.0),
+                ..Default::default()
+            },
+        );
+        let sampled = |min_p| {
+            llama_tokens(
+                &g,
+                &cfg,
+                &prompt,
+                crate::sampling::RequestSampling {
+                    temp: Some(1.5),
+                    top_k: Some(8),
+                    top_p: Some(1.0),
+                    seed: Some(11),
+                    min_p,
+                    ..Default::default()
+                },
+            )
+        };
+        assert_ne!(
+            sampled(None),
+            greedy,
+            "this seed samples greedy anyway, so the test checks nothing"
+        );
+        assert_eq!(
+            sampled(Some(1.0)),
+            greedy,
+            "min_p 1 did not reach the sampler"
+        );
+    }
+
+    /// q/k/v projection biases are added on any arch whose reference builds through `build_qkv`,
+    /// not only on qwen2 (`config::qkv_projection_biases`). On the llama-shaped `ernie4_5` fixture:
+    /// zero biases must leave the logits exactly where the bias-free file puts them (the path is
+    /// on and adds nothing), and nonzero ones must move them (the path is on and adds them).
+    #[test]
+    fn qkv_biases_are_added_on_a_non_qwen2_arch() {
+        let prompt: Vec<u32> = (0..6u32).map(|i| (i * 5 + 3) % Q35_VOCAB as u32).collect();
+        let cpu = infr_cpu::CpuBackend::new();
+        let width = Q35_NE; // two heads of `Q35_NE / 2`, as `llama_gguf` builds q, k and v
+        let with_biases = |value: &dyn Fn(usize) -> f32| {
+            let mut m = llama_gguf("ernie4_5", None);
+            for proj in ["attn_q", "attn_k", "attn_v"] {
+                m.tensors.push(TensorSpec::new(
+                    format!("blk.0.{proj}.bias"),
+                    vec![width],
+                    Fill::Exact((0..width).map(value).collect()),
+                ));
+            }
+            m
+        };
+        let logits = |tag: &str, m: &SyntheticModel| {
+            let (g, cfg) = open_synthetic(tag, m);
+            let l = fresh_logits(
+                &cpu,
+                &crate::seam::cpu_upload_bind(&cpu),
+                &g,
+                &cfg,
+                &EngineConfig::default(),
+                &prompt,
+            );
+            (cfg.qkv_bias, l)
+        };
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0f32, f32::max)
+        };
+        let (on, plain) = logits("qkvb-none", &llama_gguf("ernie4_5", None));
+        assert!(!on, "a file without biases must not turn the bias path on");
+        let (on, zero) = logits("qkvb-zero", &with_biases(&|_| 0.0));
+        assert!(
+            on,
+            "a file carrying all three biases must turn the bias path on"
+        );
+        assert_eq!(max_diff(&zero, &plain), 0.0, "zero biases moved the logits");
+        let (_, biased) = logits("qkvb-set", &with_biases(&|i| ((i % 7) as f32 - 3.0) * 0.25));
+        let moved = max_diff(&biased, &plain);
+        assert!(
+            moved > 1e-3,
+            "nonzero biases left the logits in place ({moved})"
+        );
+    }
+
+    /// The last prompt token's logits for `prompt` on `be`, from a fresh slot.
+    fn fresh_logits(
+        be: &dyn infr_core::backend::Backend,
+        bind: &super::BindWeight<'_>,
+        g: &Gguf,
+        cfg: &Config,
+        ec: &EngineConfig,
+        prompt: &[u32],
+    ) -> Vec<f32> {
+        let embd = std::sync::OnceLock::new();
+        let mut logits = Vec::new();
+        super::generate_dense_backend(
+            be,
+            bind,
+            g,
+            cfg,
+            ec,
+            TokenEmbd::new(&embd, g),
+            None,
+            prompt,
+            1,
+            |_| {},
+            &mut None,
+            64,
+            None,
+            None,
+            None,
+            Some(&mut logits),
+            None,
+            None,
+            None,
+        )
+        .expect("synthetic generation");
+        logits
+    }
+
+    /// Llama 3.1's `rope_scaling.factor` — the divisor its converter gives the low-frequency pairs.
+    const LLAMA31_ROPE_FACTOR: f32 = 8.0;
+
+    /// One factor per rope pair of `llama_gguf`'s head: the high-frequency half unscaled, the
+    /// low-frequency half at [`LLAMA31_ROPE_FACTOR`] — llama3's profile in miniature.
+    fn llama3_style_rope_freqs() -> Vec<f32> {
+        let pairs = Q35_NE / 4;
+        (0..pairs)
+            .map(|p| {
+                if p < pairs / 2 {
+                    1.0
+                } else {
+                    LLAMA31_ROPE_FACTOR
+                }
+            })
+            .collect()
+    }
+
+    /// llama and llama4 divide their rope angles by `rope_freqs.weight` (llama.cpp's
+    /// `get_rope_factors` → `ggml_rope_ext`): a file carrying non-trivial factors must not score
+    /// like one without them, and all-ones factors must be the identity, bit for bit.
+    #[test]
+    fn llama_family_applies_rope_freqs() {
+        let prompt: Vec<u32> = (0..12u32).map(|i| (i * 5 + 3) % Q35_VOCAB as u32).collect();
+        let be = infr_cpu::CpuBackend::new();
+        let ec = EngineConfig::default();
+        for arch in ["llama", "llama4"] {
+            let run = |tag: &str, ff: Option<Vec<f32>>| {
+                let (g, cfg) = open_synthetic(&format!("{arch}-{tag}"), &llama_gguf(arch, ff));
+                assert!(cfg.rope_freq_factors, "{arch} must apply rope_freqs");
+                assert!(!cfg.is_nope_layer(0), "{arch}'s only layer must rope");
+                fresh_logits(
+                    &be,
+                    &crate::seam::cpu_upload_bind(&be),
+                    &g,
+                    &cfg,
+                    &ec,
+                    &prompt,
+                )
+            };
+            let none = run("none", None);
+            let ones = run("ones", Some(vec![1.0; Q35_NE / 4]));
+            let scaled = run("scaled", Some(llama3_style_rope_freqs()));
+            assert_eq!(none.len(), Q35_VOCAB);
+            assert_eq!(ones, none, "{arch}: all-ones rope_freqs moved the logits");
+            let moved = scaled
+                .iter()
+                .zip(&none)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                moved > 1e-3,
+                "{arch}: rope_freqs.weight was ignored (logits moved by {moved})"
+            );
+        }
+    }
+
+    /// How far the Vulkan logits may sit from the CPU's, as a fraction of the CPU logits' largest
+    /// magnitude, for the synthetic llama below.
+    const REPLAY_PARITY_TOL: f32 = 1e-2;
+
+    /// Tokens the synthetic Vulkan run decodes: several, so one recording for the whole decode
+    /// (replay) and one per decoded token (a plan compiled per token) cannot coincide.
+    const MIRROR_TEST_DECODE: usize = 6;
+
+    /// A Vulkan generation of [`MIRROR_TEST_DECODE`] tokens for `prompt` (EOS ignored), through a
+    /// fresh backend opened on the environment's device with record-once replay allowed and the
+    /// runner's replay mirror bypassed (`REPLAY_MIRROR_BYPASS`). Returns the last prompt token's
+    /// logits, how many record-once recordings the backend made, and how many tokens it decoded.
+    fn vulkan_logits_past_the_mirror(
+        g: &Gguf,
+        cfg: &Config,
+        prompt: &[u32],
+    ) -> Option<(Vec<f32>, u64, usize)> {
+        let mut ec = EngineConfig::load_from_layers(&[
+            infr_core::config::ConfigLayer::env().expect("environment config")
+        ]);
+        ec.kernels.vulkan.no_replay = false;
+        ec.sampling.ignore_eos = true;
+        let Ok(vk) = infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(ec.clone())) else {
+            eprintln!("skip: no Vulkan device");
+            return None;
+        };
+        eprintln!(
+            "vulkan device: {}",
+            infr_core::backend::Backend::capabilities(&vk).name
+        );
+        let bind = crate::seam::vulkan_moe_binder(&vk, g, cfg, &ec, true, 64)
+            .expect("vulkan weight binder");
+        // Cleared on the way out, panic included, so no later test on this thread inherits it.
+        struct Bypass;
+        impl Drop for Bypass {
+            fn drop(&mut self) {
+                REPLAY_MIRROR_BYPASS.with(|b| b.set(false));
+            }
+        }
+        REPLAY_MIRROR_BYPASS.with(|b| b.set(true));
+        let bypass = Bypass;
+        let embd = std::sync::OnceLock::new();
+        let mut logits = Vec::new();
+        let (_, stats) = super::generate_dense_backend(
+            &vk,
+            &*bind,
+            g,
+            cfg,
+            &ec,
+            TokenEmbd::new(&embd, g),
+            None,
+            prompt,
+            MIRROR_TEST_DECODE,
+            |_| {},
+            &mut None,
+            64,
+            None,
+            None,
+            None,
+            Some(&mut logits),
+            None,
+            None,
+            None,
+        )
+        .expect("synthetic generation on Vulkan");
+        drop(bypass);
+        Some((logits, vk.decode_recordings(), stats.n_gen))
+    }
+
+    /// B157: the runner builds its decode plan once, at position 0, only for a backend that will
+    /// replay it — and it is the BACKEND that says so, after compiling the plan, not the runner's
+    /// mirror of the backend's rules. A NoPE layer writes its K through a cast the Vulkan replay
+    /// has no kernel for; SmolLM3 shipped with a mirror that did not know that, and its decode ran
+    /// the position-0 plan statically: each token wrote its KV to row 0 and attended one row. Here
+    /// the mirror is bypassed outright, so only the backend's answer stands between the decode
+    /// loop and that plan: the NoPE model must record no replay and still match the CPU. The same
+    /// fixture with rope on its layer is the control: its whole decode must run from ONE
+    /// recording (a per-token plan would record once per token), and match the CPU too.
+    #[test]
+    #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+    fn a_plan_the_backend_will_not_replay_takes_the_per_token_path_vulkan() {
+        let prompt: Vec<u32> = (0..12u32).map(|i| (i * 5 + 3) % Q35_VOCAB as u32).collect();
+        let cpu = infr_cpu::CpuBackend::new();
+        for nope in [false, true] {
+            let (g, mut cfg) = open_synthetic(
+                &format!("smollm3-nope-{nope}"),
+                &llama_gguf("smollm3", None),
+            );
+            if nope {
+                // Every layer NoPE, so the one-layer fixture makes the K write SmolLM3's every
+                // fourth layer makes.
+                cfg.no_rope_step = 1;
+            }
+            assert_eq!(cfg.is_nope_layer(0), nope);
+            let want = fresh_logits(
+                &cpu,
+                &crate::seam::cpu_upload_bind(&cpu),
+                &g,
+                &cfg,
+                &EngineConfig::default(),
+                &prompt,
+            );
+            let Some((got, recordings, n_gen)) = vulkan_logits_past_the_mirror(&g, &cfg, &prompt)
+            else {
+                return;
+            };
+            assert_eq!(
+                n_gen, MIRROR_TEST_DECODE,
+                "nope={nope}: decoded {n_gen} tokens"
+            );
+            let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let diff = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            eprintln!("nope={nope}: recordings={recordings} max|vk-cpu|={diff} scale={scale}");
+            // One recording serves the whole decode when it is replayed; a plan compiled per
+            // token would record once per token, and the NoPE graph cannot be recorded at all.
+            assert_eq!(
+                recordings,
+                u64::from(!nope),
+                "nope={nope}: {recordings} record-once recording(s) for {n_gen} decoded tokens"
+            );
+            assert_eq!(got.len(), want.len());
+            assert!(
+                diff <= REPLAY_PARITY_TOL * scale,
+                "nope={nope}: Vulkan logits differ from the CPU's by {diff} (scale {scale})"
+            );
+        }
+    }
+
+    /// The CPU backend reporting another device class, counting its executes.
+    struct ClassedCpu {
+        cpu: infr_cpu::CpuBackend,
+        integrated: bool,
+        executes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl infr_core::backend::Backend for ClassedCpu {
+        fn name(&self) -> &str {
+            self.cpu.name()
+        }
+        fn capabilities(&self) -> infr_core::backend::Capabilities {
+            infr_core::backend::Capabilities {
+                integrated: self.integrated,
+                compute_units: 2,
+                ..self.cpu.capabilities()
+            }
+        }
+        fn alloc(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            self.cpu.alloc(bytes, usage)
+        }
+        fn alloc_uninit(
+            &self,
+            bytes: usize,
+            usage: infr_core::backend::BufferUsage,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Buffer>> {
+            self.cpu.alloc_uninit(bytes, usage)
+        }
+        fn upload(
+            &self,
+            dst: &dyn infr_core::backend::Buffer,
+            src: &[u8],
+        ) -> infr_core::error::Result<()> {
+            self.cpu.upload(dst, src)
+        }
+        fn download(
+            &self,
+            src: &dyn infr_core::backend::Buffer,
+            dst: &mut [u8],
+        ) -> infr_core::error::Result<()> {
+            self.cpu.download(src, dst)
+        }
+        fn copy_buffer(
+            &self,
+            src: &dyn infr_core::backend::Buffer,
+            dst: &dyn infr_core::backend::Buffer,
+            bytes: usize,
+        ) -> infr_core::error::Result<()> {
+            self.cpu.copy_buffer(src, dst, bytes)
+        }
+        fn compile(
+            &self,
+            graph: &infr_core::graph::Graph,
+        ) -> infr_core::error::Result<Box<dyn infr_core::backend::Plan>> {
+            self.cpu.compile(graph)
+        }
+        fn execute(
+            &self,
+            plan: &dyn infr_core::backend::Plan,
+            bindings: &infr_core::backend::Bindings,
+        ) -> infr_core::error::Result<()> {
+            self.executes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.cpu.execute(plan, bindings)
+        }
+        fn sync(&self) -> infr_core::error::Result<()> {
+            self.cpu.sync()
+        }
+    }
+
+    /// The multi-device one-shot sizes its prefill chunk from the backend it runs on, not from the
+    /// class of whichever device the process opened first: a backend reporting an integrated
+    /// device prefills a prompt longer than the integrated chunk in more steps than one reporting
+    /// a discrete device, on the same model and prompt.
+    #[test]
+    fn multi_device_oneshot_chunks_by_the_backends_class() {
+        let (g, cfg) = open_synthetic("llama-chunk-class", &llama_gguf("llama", None));
+        let rows = infr_core::integrated_ubatch_rows(2);
+        let prompt: Vec<u32> = (0..rows as u32 + 8)
+            .map(|i| (i * 5 + 3) % Q35_VOCAB as u32)
+            .collect();
+        let executes = |integrated: bool| {
+            let be = ClassedCpu {
+                cpu: infr_cpu::CpuBackend::new(),
+                integrated,
+                executes: 0.into(),
+            };
+            let embd = std::sync::OnceLock::new();
+            crate::seam::run_dense_oneshot(
+                &be,
+                &crate::seam::cpu_upload_bind(&be.cpu),
+                &g,
+                &cfg,
+                &EngineConfig::default(),
+                TokenEmbd::new(&embd, &g),
+                None,
+                &prompt,
+                1,
+                |_| {},
+            )
+            .expect("synthetic one-shot");
+            be.executes.into_inner()
+        };
+        let (discrete, igpu) = (executes(false), executes(true));
+        assert_eq!(
+            igpu,
+            discrete + 1,
+            "a {}-token prompt takes one more prefill step at the integrated chunk ({rows} rows)",
+            prompt.len()
+        );
+    }
+
+    /// A context larger than `Config::faithful_ctx_limit` — even one the caller pinned — gets a KV
+    /// cache of only the faithful length, so no position past it can be computed.
+    #[test]
+    fn llama4_context_is_capped_at_the_faithful_limit() {
+        let (g, cfg) = open_synthetic("llama4-ctx-cap", &llama_gguf("llama4", None));
+        let limit = cfg.faithful_ctx_limit().expect("chunked llama4 is capped");
+        let be = infr_cpu::CpuBackend::new();
+        let embd = std::sync::OnceLock::new();
+        let mut slot = None;
+        super::generate_dense_backend(
+            &be,
+            &crate::seam::cpu_upload_bind(&be),
+            &g,
+            &cfg,
+            &EngineConfig::default(),
+            TokenEmbd::new(&embd, &g),
+            None,
+            &[1, 2, 3],
+            1,
+            |_| {},
+            &mut slot,
+            limit + 1000,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("llama4 synthetic generation");
+        assert_eq!(slot.expect("slot initialized").max_ctx, limit);
+    }
+
+    /// A synthetic llama4 whose file claims a context far past the faithful cap, with a byte-level
+    /// vocabulary so `SeamModel::load_with` can build its tokenizer.
+    fn llama4_session_model() -> (TempGguf, crate::SeamModel) {
+        let mut m = llama_gguf("llama4", None);
+        for (k, v) in &mut m.meta {
+            if k == "llama4.context_length" {
+                *v = Meta::U32(1 << 20);
+            }
+        }
+        m.meta.extend([
+            ("tokenizer.ggml.model".to_string(), Meta::Str("gpt2".into())),
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                Meta::StrArr((0..Q35_VOCAB).map(|i| format!("t{i}")).collect()),
+            ),
+            (
+                "tokenizer.ggml.merges".to_string(),
+                Meta::StrArr(Vec::new()),
+            ),
+        ]);
+        let tmp = TempGguf::write("llama4-session-ctx", &m);
+        let model = crate::SeamModel::load_with(
+            tmp.path(),
+            None,
+            std::sync::Arc::new(EngineConfig::default()),
+        )
+        .expect("synthetic llama4 load");
+        (tmp, model)
+    }
+
+    /// Every way a session's context is asked for resolves through `SeamModel::session_ctx`, so
+    /// an explicit, a default (the file's trained context) and a huge fraction-of-VRAM request all
+    /// land on the cap; `n_ctx_train` itself stays the file's value.
+    #[test]
+    fn llama4_session_ctx_resolves_to_the_cap() {
+        let (_tmp, model) = llama4_session_model();
+        let limit = model
+            .config()
+            .faithful_ctx_limit()
+            .expect("chunked llama4 is capped");
+        assert_eq!(model.config().n_ctx_train, 1 << 20);
+        assert_eq!(model.session_ctx(1_000_000), limit, "explicit");
+        assert_eq!(
+            model.session_ctx(model.config().n_ctx_train),
+            limit,
+            "default"
+        );
+        assert_eq!(
+            model.session_ctx(limit - 1),
+            limit - 1,
+            "below the cap: untouched"
+        );
+    }
+
+    /// The vocabulary that makes [`llama_cpu_gguf`]'s `output.weight` exactly
+    /// `infr_cpu::paged::MIN_PAGED_BYTES` of f32, so a `paging.dram` budget pages it.
+    const PAGED_VOCAB: usize = infr_cpu::paged::MIN_PAGED_BYTES / 4 / Q35_NE;
+
+    /// [`llama_gguf`]'s `llama` with a `vocab`-token vocabulary (embedding, output and a byte-level
+    /// tokenizer, so `SeamModel::load_with` takes it), written to a temp file.
+    fn llama_cpu_gguf(tag: &str, vocab: usize) -> TempGguf {
+        let mut m = llama_gguf("llama", None);
+        for (i, t) in m.tensors.iter_mut().enumerate() {
+            if t.name == "token_embd.weight" || t.name == "output.weight" {
+                *t = TensorSpec::new(
+                    t.name.clone(),
+                    vec![Q35_NE, vocab],
+                    Fill::Exact(q35_values(Q35_NE * vocab, i as u64 + 1, 0.0)),
+                );
+            }
+        }
+        for (k, v) in &mut m.meta {
+            if k == "tokenizer.ggml.eos_token_id" {
+                *v = Meta::U32(vocab as u32 - 1);
+            }
+        }
+        m.meta.extend([
+            ("tokenizer.ggml.model".to_string(), Meta::Str("gpt2".into())),
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                Meta::StrArr((0..vocab).map(|i| format!("t{i}")).collect()),
+            ),
+            (
+                "tokenizer.ggml.merges".to_string(),
+                Meta::StrArr(Vec::new()),
+            ),
+        ]);
+        TempGguf::write(tag, &m)
+    }
+
+    fn load_cpu(tmp: &TempGguf, edit: impl FnOnce(&mut EngineConfig)) -> crate::SeamModel {
+        let mut cfg = EngineConfig::default();
+        edit(&mut cfg);
+        crate::SeamModel::load_with(tmp.path(), None, std::sync::Arc::new(cfg))
+            .expect("synthetic llama load")
+    }
+
+    /// The prompts the CPU-resident tests generate from: distinct, so a generation that answered
+    /// from another's state would show.
+    fn resident_prompts(vocab: usize) -> Vec<Vec<u32>> {
+        (0..4)
+            .map(|i| {
+                (0..6)
+                    .map(|j| ((i * 7 + j * 3 + 1) % vocab) as u32)
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// What a generation sees of its model's CPU slot at its first token: whether the slot was
+    /// empty (the resident is out) and how many residents the model had opened.
+    fn slot_at_first_token(model: &crate::SeamModel, seen: &mut Option<(bool, usize)>) {
+        if seen.is_none() {
+            *seen = Some(model.with_cpu_resident(|r, n| (r.is_none(), n)));
+        }
+    }
+
+    /// Run `a` and `b` on `model` with `b` wholly inside `a`: `a` stops at its first token until
+    /// `b` has finished. Returns both generations' tokens and what `b` saw of the slot at its
+    /// first token (see [`slot_at_first_token`]).
+    fn overlapped(
+        model: &crate::SeamModel,
+        a: &[u32],
+        b: &[u32],
+    ) -> (Vec<u32>, Vec<u32>, (bool, usize)) {
+        use std::sync::mpsc::channel;
+        use std::time::Duration;
+        let (a_in, a_in_rx) = channel();
+        let (b_done, b_done_rx) = channel();
+        std::thread::scope(|s| {
+            let ta = s.spawn(move || {
+                let mut first = true;
+                model
+                    .generate_cpu_ids(a, 8, |_| {
+                        if std::mem::take(&mut first) {
+                            a_in.send(()).unwrap();
+                            b_done_rx
+                                .recv_timeout(Duration::from_secs(60))
+                                .expect("the inner generation never finished");
+                        }
+                    })
+                    .expect("outer generation")
+            });
+            let tb = s.spawn(move || {
+                a_in_rx
+                    .recv_timeout(Duration::from_secs(60))
+                    .expect("the outer generation never reached its first token");
+                let mut seen = None;
+                let got = model
+                    .generate_cpu_ids(b, 8, |_| slot_at_first_token(model, &mut seen))
+                    .expect("inner generation");
+                b_done.send(()).unwrap();
+                (got, seen.expect("the inner generation produced no token"))
+            });
+            let (b_got, seen) = tb.join().unwrap();
+            (ta.join().unwrap(), b_got, seen)
+        })
+    }
+
+    /// A model's CPU generations share one backend and one set of bound weights: the second
+    /// generation runs on the resident the first left (the slot is empty while it runs, and no
+    /// new resident was opened), binds nothing, and produces exactly the first one's tokens (which
+    /// came off a fresh resident, as every generation did before).
+    #[test]
+    fn cpu_generations_reuse_the_models_bound_weights() {
+        let tmp = llama_cpu_gguf("cpu-resident-reuse", Q35_VOCAB);
+        let model = load_cpu(&tmp, |_| {});
+        let prompt = &resident_prompts(Q35_VOCAB)[0];
+        assert!(model.with_cpu_resident(|r, _| r.is_none()));
+        let first = model.generate_cpu_ids(prompt, 8, |_| {}).expect("first");
+        let (w1, opened) = model.with_cpu_resident(|r, n| {
+            (
+                r.and_then(|r| r.weights_ptr()).expect("a bound resident"),
+                n,
+            )
+        });
+        let mut seen = None;
+        let second = model
+            .generate_cpu_ids(prompt, 8, |_| slot_at_first_token(&model, &mut seen))
+            .expect("second");
+        assert_eq!(
+            seen,
+            Some((true, opened)),
+            "the second generation did not run on the model's resident"
+        );
+        let w2 = model.with_cpu_resident(|r, _| r.and_then(|r| r.weights_ptr()));
+        assert_eq!(w2, Some(w1), "the second generation bound its own weights");
+        assert_eq!(second, first);
+        assert_eq!(first.len(), 8, "a stop this early leaves little to compare");
+    }
+
+    /// The paged store (`paging.dram`) outlives a generation with the weights: the second
+    /// generation is served by the store the first filled (its hits rise while the bytes read
+    /// from the file stay where the first left them), and both match the mapped path token for
+    /// token.
+    #[test]
+    fn cpu_paged_store_outlives_a_generation() {
+        let tmp = llama_cpu_gguf("cpu-resident-paged", PAGED_VOCAB);
+        let mapped = load_cpu(&tmp, |_| {});
+        let paged = load_cpu(&tmp, |c| {
+            c.paging.dram = Some(infr_core::SizeSpec::Bytes(8 << 20));
+        });
+        let prompt = &resident_prompts(PAGED_VOCAB)[0];
+        let want = mapped.generate_cpu_ids(prompt, 8, |_| {}).expect("mapped");
+        let counts = || {
+            paged
+                .with_cpu_resident(|r, _| r.and_then(|r| r.paged_counts()))
+                .expect("a paged store on the resident")
+        };
+        let first = paged.generate_cpu_ids(prompt, 8, |_| {}).expect("first");
+        let (hits1, read1) = counts();
+        assert!(read1 > 0, "nothing was paged in, so nothing here is tested");
+        let second = paged.generate_cpu_ids(prompt, 8, |_| {}).expect("second");
+        let (hits2, read2) = counts();
+        assert!(
+            hits2 > hits1,
+            "the second generation was not served by the first one's store ({hits1} -> {hits2})"
+        );
+        assert_eq!(
+            read2, read1,
+            "the second generation re-read weights the store held"
+        );
+        assert_eq!(first, want);
+        assert_eq!(second, want);
+    }
+
+    /// A generation that starts while another has the model's resident out opens its own and
+    /// never puts it back, even when it finishes first: the model keeps its own resident (and its
+    /// paged store), not one sized while that resident was still allocated.
+    #[test]
+    fn an_overflow_cpu_resident_never_replaces_the_models_own() {
+        let tmp = llama_cpu_gguf("cpu-resident-overflow", PAGED_VOCAB);
+        let model = load_cpu(&tmp, |c| {
+            c.paging.dram = Some(infr_core::SizeSpec::Bytes(8 << 20));
+        });
+        let prompts = resident_prompts(PAGED_VOCAB);
+        let serial: Vec<Vec<u32>> = prompts[..2]
+            .iter()
+            .map(|p| model.generate_cpu_ids(p, 8, |_| {}).expect("serial"))
+            .collect();
+        let (own, opened) = model
+            .with_cpu_resident(|r, n| (r.and_then(|r| r.store_ptr()).expect("a paged store"), n));
+        let (a, b, seen) = overlapped(&model, &prompts[0], &prompts[1]);
+        assert_eq!(
+            seen,
+            (true, opened + 1),
+            "the inner generation did not run beside the outer one on a resident of its own"
+        );
+        assert_eq!(
+            model.with_cpu_resident(|r, _| r.and_then(|r| r.store_ptr())),
+            Some(own),
+            "the overflow generation's resident replaced the model's own"
+        );
+        assert_eq!([a, b], [serial[0].clone(), serial[1].clone()]);
+    }
+
+    /// Generations running at the same time on one model each get a resident to themselves (the
+    /// one the model keeps, or one opened for the call), so their tokens are the serial ones. The
+    /// overlap is forced: the inner generation runs wholly inside the outer one's first token,
+    /// and sees the model's resident out and one more resident opened.
+    #[test]
+    fn concurrent_cpu_generations_match_serial_ones() {
+        let tmp = llama_cpu_gguf("cpu-resident-concurrent", Q35_VOCAB);
+        let model = load_cpu(&tmp, |_| {});
+        let prompts = resident_prompts(Q35_VOCAB);
+        let serial: Vec<Vec<u32>> = prompts
+            .iter()
+            .map(|p| model.generate_cpu_ids(p, 8, |_| {}).expect("serial"))
+            .collect();
+        for (i, pair) in prompts.chunks(2).enumerate() {
+            let opened = model.with_cpu_resident(|_, n| n);
+            let (a, b, seen) = overlapped(&model, &pair[0], &pair[1]);
+            assert_eq!(
+                seen,
+                (true, opened + 1),
+                "the inner generation did not open a resident of its own"
+            );
+            assert_eq!([a, b], [serial[2 * i].clone(), serial[2 * i + 1].clone()]);
+        }
+        assert!(model.with_cpu_resident(|r, _| r.is_some_and(|r| r.is_bound())));
+    }
+
+    /// The Vulkan session constructors themselves — explicit (`--ctx`), default and fraction
+    /// (`INFR_CTX=N%`) — hand back the capped window, and `--ctx 1000000` on this tiny model is
+    /// neither refused nor pushed to a q8 cache (it is judged at the cap).
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn llama4_vulkan_sessions_open_at_the_cap() {
+        if infr_vulkan::VulkanBackend::new().is_err() {
+            return;
+        }
+        let (_tmp, model) = llama4_session_model();
+        let limit = model.config().faithful_ctx_limit().expect("capped");
+        let explicit = model
+            .vulkan_session(1_000_000)
+            .expect("explicit ctx session");
+        assert_eq!(explicit.max_ctx, limit, "explicit");
+        drop(explicit);
+        let default = model.vulkan_session_default().expect("default ctx session");
+        assert_eq!(default.max_ctx, limit, "default");
+        drop(default);
+        let frac = model
+            .vulkan_session_frac(0.5)
+            .expect("fraction ctx session");
+        assert_eq!(frac.max_ctx, limit, "fraction");
+    }
+
+    /// At the cap, a reply that would cross it is trimmed to the room left — the same budget a
+    /// session's `reply_budget` applies — instead of failing as a context overflow, while a
+    /// prompt that by itself fills the window still overflows.
+    #[test]
+    fn a_reply_at_the_context_cap_is_trimmed() {
+        let (g, mut cfg) = open_synthetic("llama-cap-trim", &llama_gguf("llama", None));
+        // A small cap stands in for llama4's, so the trim is reachable on a short prompt.
+        let cap = 24;
+        cfg.ctx_limit = Some(cap);
+        let be = infr_cpu::CpuBackend::new();
+        let embd = std::sync::OnceLock::new();
+        let run = |prompt: &[u32], max_new: usize| {
+            let mut n = 0usize;
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                &EngineConfig::default(),
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                max_new,
+                |_| n += 1,
+                &mut None,
+                prompt.len() + max_new + 1,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .map(|_| n)
+        };
+        let prompt: Vec<u32> = (0..10u32).map(|i| i % 4).collect();
+        let max_new = 3 * cap;
+        let n = run(&prompt, max_new).expect("a reply past the cap is trimmed, not refused");
+        assert!(n > 0, "the trimmed reply still generates");
+        assert!(
+            prompt.len() + n < cap,
+            "{n} tokens after a {}-token prompt overran the {cap}-token window",
+            prompt.len()
+        );
+        let long: Vec<u32> = (0..cap as u32).map(|i| i % 4).collect();
+        let err = run(&long, 1).expect_err("a prompt that fills the window must overflow");
+        assert!(
+            err.downcast_ref::<crate::ContextOverflow>().is_some(),
+            "{err}"
+        );
+    }
+
+    /// A `rope_freqs.weight` shorter than `rope.dimension_count / 2` would be read past its end
+    /// by every rope kernel; refuse it, as llama.cpp's loader does.
+    #[test]
+    fn llama_rope_freqs_of_the_wrong_length_are_refused() {
+        let (g, cfg) = open_synthetic("llama-short-ff", &llama_gguf("llama", Some(vec![1.0; 3])));
+        let be = infr_cpu::CpuBackend::new();
+        let embd = std::sync::OnceLock::new();
+        let err = super::generate_dense_backend(
+            &be,
+            &crate::seam::cpu_upload_bind(&be),
+            &g,
+            &cfg,
+            &EngineConfig::default(),
+            TokenEmbd::new(&embd, &g),
+            None,
+            &[1, 2, 3],
+            1,
+            |_| {},
+            &mut None,
+            64,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("a 3-element rope_freqs on a 16-wide rope must be refused");
+        assert_eq!(
+            err.to_string(),
+            "rope_freqs.weight has 3 elements; rope.dimension_count 16 needs 8"
+        );
+    }
+
+    /// The Vulkan forms of the llama rope with `rope_freqs.weight` — the f16 q/k write, the fused
+    /// K-cache write, and the record-once decode's `rope_f16_dyn_ff` — must score like the CPU
+    /// reference, at prompt lengths that put the last token through prefill and decode alike.
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
+    fn llama_rope_freqs_vulkan_matches_cpu() {
+        let Ok(vk) = infr_vulkan::VulkanBackend::new() else {
+            return;
+        };
+        println!(
+            "vulkan device: {}",
+            infr_core::backend::Backend::capabilities(&vk).name
+        );
+        let cpu = infr_cpu::CpuBackend::new();
+        let ec = EngineConfig::default();
+        for arch in ["llama", "llama4"] {
+            let (g, cfg) = open_synthetic(
+                &format!("{arch}-vk-ff"),
+                &llama_gguf(arch, Some(llama3_style_rope_freqs())),
+            );
+            for n in [1usize, 2, 9, 30] {
+                let prompt: Vec<u32> = (0..n as u32)
+                    .map(|i| (i * 5 + 3) % Q35_VOCAB as u32)
+                    .collect();
+                let want = fresh_logits(
+                    &cpu,
+                    &crate::seam::cpu_upload_bind(&cpu),
+                    &g,
+                    &cfg,
+                    &ec,
+                    &prompt,
+                );
+                let bind = crate::seam::vulkan_moe_binder(&vk, &g, &cfg, &ec, true, 64)
+                    .expect("vulkan weight binder");
+                let got = fresh_logits(&vk, &*bind, &g, &cfg, &ec, &prompt);
+                let err = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, |m, d| {
+                        if m.is_nan() || d.is_nan() {
+                            f32::NAN
+                        } else {
+                            m.max(d)
+                        }
+                    });
+                println!("{arch} n={n}: vulkan-vs-cpu max err {err:e}");
+                assert!(err < 2e-2, "{arch} n={n}: Vulkan misses the CPU by {err}");
+            }
+        }
+    }
+
+    /// A one-layer gemma3 whose only layer is sliding-window (`window` 8), every tensor f32.
+    fn gemma3_gguf() -> SyntheticModel {
+        let hd = Q35_NE / 2;
+        let t = |name: &str, shape: Vec<usize>, base: f32| (name.to_string(), shape, base);
+        let mut tensors = vec![
+            t("token_embd.weight", vec![Q35_NE, Q35_VOCAB], 0.0),
+            t("output_norm.weight", vec![Q35_NE], 0.0),
+        ];
+        for (name, shape, base) in [
+            ("attn_norm", vec![Q35_NE], 0.0),
+            ("attn_q", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_k", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_v", vec![Q35_NE, 2 * hd], 0.0),
+            ("attn_q_norm", vec![hd], 0.0),
+            ("attn_k_norm", vec![hd], 0.0),
+            ("attn_output", vec![2 * hd, Q35_NE], 0.0),
+            ("post_attention_norm", vec![Q35_NE], 0.0),
+            ("ffn_norm", vec![Q35_NE], 0.0),
+            ("ffn_gate", vec![Q35_NE, Q35_NFF], 0.0),
+            ("ffn_up", vec![Q35_NE, Q35_NFF], 0.0),
+            ("ffn_down", vec![Q35_NFF, Q35_NE], 0.0),
+            ("post_ffw_norm", vec![Q35_NE], 0.0),
+        ] {
+            tensors.push((format!("blk.0.{name}.weight"), shape, base));
+        }
+        let k = |key: &str, v: usize| (format!("gemma3.{key}"), v);
+        let u32_keys = [
+            k("block_count", 1),
+            k("context_length", 256),
+            k("embedding_length", Q35_NE),
+            k("feed_forward_length", Q35_NFF),
+            k("attention.head_count", 2),
+            k("attention.head_count_kv", 2),
+            k("attention.sliding_window", 8),
+        ];
+        synthetic_gguf("gemma3", &u32_keys, &tensors, &[])
+    }
+
+    /// The SWA ring keeps a position's row only until a position one ring length later is
+    /// written. A turn that rewinds and ends shorter than an earlier one leaves that earlier
+    /// turn's rows in the ring, so a later rewind judged against `cached.len()` would attend
+    /// rows that now hold other positions: its logits must still equal a fresh slot's.
+    #[test]
+    fn ring_rewind_after_a_shorter_turn_matches_a_fresh_slot() {
+        let (g, cfg) = open_synthetic("gemma3-ring", &gemma3_gguf());
+        assert!(cfg.is_swa_layer(0) && cfg.swa_window == 8);
+        let embd = std::sync::OnceLock::new();
+        let mut ec = EngineConfig::default();
+        // A ring of round64(window + ubatch) = 64 rows on the window layer.
+        ec.device.ubatch = Some(8);
+        const CTX: usize = 256;
+        let be = infr_cpu::CpuBackend::new();
+        let logits = |prompt: &[u32], state: &mut Option<SeamKv>| {
+            let mut out = Vec::new();
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                1,
+                |_| {},
+                state,
+                CTX,
+                None,
+                None,
+                None,
+                Some(&mut out),
+                None,
+                None,
+                None,
+            )
+            .expect("gemma3 synthetic generation");
+            out
+        };
+        let ids = |n: usize, salt: u32| -> Vec<u32> {
+            (0..n as u32)
+                .map(|i| (i * 7 + salt) % Q35_VOCAB as u32)
+                .collect()
+        };
+
+        // A writes positions 0..100, so rows 0..36 of the ring now hold positions 64..100.
+        let a = ids(100, 3);
+        // B rewinds to 50 (whose window rows A left intact) and ends at 60, shorter than A.
+        let b = [&a[..50], &ids(10, 5)[..]].concat();
+        // C is 42 tokens that all match B, so it rewinds to 41 (the last prompt token is always
+        // re-fed), and that token's window reaches back to positions 34..36, whose rows A
+        // recycled. (One layer, so only that token's own window matters.)
+        let c = [&a[..40], &ids(2, 11)[..]].concat();
+
+        let fresh = logits(&c, &mut None);
+        let mut slot = None;
+        logits(&a, &mut slot);
+        assert!(slot.as_ref().expect("slot initialized").kv_ring);
+        logits(&b, &mut slot);
+        let after = logits(&c, &mut slot);
+        assert_eq!(fresh.len(), Q35_VOCAB);
+        assert_eq!(
+            after, fresh,
+            "the rewind read ring rows an earlier, longer turn had recycled"
+        );
+    }
+
+    /// A session's placement may pin a shorter prefill chunk, and its SWA rings are sized with
+    /// that height. The conversation-slot pickers fork and seed BEFORE entering the session's
+    /// placement scope, so both must take the height from the slot rather than from
+    /// `ubatch_rows`, which answers with the process fallback out there: the fork must have the
+    /// source's geometry, a wrapped source must not seed, and the fork must then score like a
+    /// fresh slot.
+    #[test]
+    fn fork_and_seed_outside_the_placement_scope_keep_the_ring_height() {
+        let (g, cfg) = open_synthetic("gemma3-ring-pinned", &gemma3_gguf());
+        assert!(cfg.is_swa_layer(0) && cfg.swa_window == 8);
+        let embd = std::sync::OnceLock::new();
+        // No user-pinned chunk: the height comes from the placement pins.
+        let ec = EngineConfig::default();
+        const PINNED: usize = 16;
+        // Long enough that the fallback height's ring is a different size from the pinned one's.
+        const CTX: usize = 4096;
+        assert_ne!(
+            crate::seam::ubatch_rows(&ec),
+            PINNED,
+            "the fallback height must differ from the pinned one, or this test checks nothing"
+        );
+        let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
+        {
+            let _scope = crate::seam::PlacementScope::enter(pins.clone());
+            crate::seam::pin_ubatch(PINNED);
+        }
+        let be = infr_cpu::CpuBackend::new();
+        let logits = |prompt: &[u32], state: &mut Option<SeamKv>| {
+            let _scope = crate::seam::PlacementScope::enter(pins.clone());
+            let mut out = Vec::new();
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                1,
+                |_| {},
+                state,
+                CTX,
+                None,
+                None,
+                None,
+                Some(&mut out),
+                None,
+                None,
+                None,
+            )
+            .expect("gemma3 synthetic generation");
+            out
+        };
+        let ids = |n: usize, salt: u32| -> Vec<u32> {
+            (0..n as u32)
+                .map(|i| (i * 7 + salt) % Q35_VOCAB as u32)
+                .collect()
+        };
+
+        // More positions than the pinned height's ring holds, so the source wraps.
+        let a = ids(100, 3);
+        let mut src = None;
+        logits(&a, &mut src);
+        let src = src.expect("slot initialized");
+        let ring_rows = crate::seam::kv_rows_at(
+            &cfg,
+            0,
+            CTX,
+            true,
+            PINNED,
+            infr_core::backend::Backend::kv_row_align(&be),
+        );
+        assert!(
+            src.kv_ring && src.written_end > ring_rows,
+            "the source must wrap its ring"
+        );
+
+        let mut fork = src
+            .fork(&be, &cfg)
+            .expect("a fork must match its source's geometry");
+        fork.seed_from(&be, &cfg, &src, a.len() - 1)
+            .expect("seeding from a wrapped ring is skipped, not an error");
+        assert!(
+            fork.cached.is_empty(),
+            "a ring that wrapped seeded {} positions",
+            fork.cached.len()
+        );
+
+        let c = [&a[..40], &ids(2, 11)[..]].concat();
+        let fresh = logits(&c, &mut None);
+        let mut fork = Some(fork);
+        assert_eq!(logits(&c, &mut fork), fresh);
+    }
+
+    /// A prefill cancelled between two chunks has written ring rows for positions `cached` never
+    /// records. A later turn that rewinds into the recycled part of the ring must re-prefill: its
+    /// logits equal a fresh slot's.
+    #[test]
+    fn ring_after_an_aborted_prefill_matches_a_fresh_slot() {
+        let (g, cfg) = open_synthetic("gemma3-ring-abort", &gemma3_gguf());
+        assert!(cfg.is_swa_layer(0) && cfg.swa_window == 8);
+        let embd = std::sync::OnceLock::new();
+        let mut ec = EngineConfig::default();
+        // A ring of round64(window + ubatch) = 64 rows on the window layer.
+        ec.device.ubatch = Some(8);
+        const CTX: usize = 256;
+        let be = infr_cpu::CpuBackend::new();
+        let run = |prompt: &[u32],
+                   state: &mut Option<SeamKv>,
+                   req: Option<&crate::sampling::RequestCtx>| {
+            let mut out = Vec::new();
+            super::generate_dense_backend(
+                &be,
+                &crate::seam::cpu_upload_bind(&be),
+                &g,
+                &cfg,
+                &ec,
+                TokenEmbd::new(&embd, &g),
+                None,
+                prompt,
+                1,
+                |_| {},
+                state,
+                CTX,
+                None,
+                None,
+                None,
+                Some(&mut out),
+                None,
+                None,
+                req,
+            )
+            .map(|_| out)
+        };
+        let ids = |n: usize, salt: u32| -> Vec<u32> {
+            (0..n as u32)
+                .map(|i| (i * 7 + salt) % Q35_VOCAB as u32)
+                .collect()
+        };
+
+        let a = ids(20, 3);
+        // Extends A: its prefill runs from 20 in chunks of 8. Cancelled after nine of them, it
+        // has written positions up to 92, so rows 0..28 of the ring hold positions 64..92 while
+        // `cached` still ends at 20.
+        let b = [&a[..], &ids(80, 5)[..]].concat();
+        // Also extends A, so it would reuse `cached` from 20 on, attending positions 12..20 —
+        // rows the cancelled prefill recycled.
+        let c = [&a[..], &ids(5, 11)[..]].concat();
+
+        let fresh = run(&c, &mut None, None).expect("fresh slot");
+        let mut slot = None;
+        run(&a, &mut slot, None).expect("first turn");
+        let req = crate::sampling::RequestCtx::new(Default::default()).abort_at_poll(9);
+        let err = run(&b, &mut slot, Some(&req)).expect_err("the prefill was not cancelled");
+        assert!(
+            err.to_string().contains("cancelled during prompt prefill"),
+            "{err}"
+        );
+        assert_eq!(slot.as_ref().expect("slot").written_end, 92);
+        let after = run(&c, &mut slot, None).expect("turn after the cancel");
+        assert_eq!(fresh.len(), Q35_VOCAB);
+        assert_eq!(
+            after, fresh,
+            "the turn after a cancelled prefill read ring rows that prefill had recycled"
+        );
     }
 }

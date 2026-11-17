@@ -5,8 +5,9 @@ use infr_core::backend::{Backend, BufferUsage};
 use infr_vulkan::VulkanBackend;
 
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_store_dequant_roundtrip() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -53,8 +54,9 @@ fn planar_q8_store_dequant_roundtrip() {
 /// The record-once dynamic write (store_q8_dyn: off = p_pos*n) must land the same planar bytes as the
 /// static store. Writes a row at pos=3 via store_q8_dyn, dequants the prefix, checks that row.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_store_dyn_roundtrip() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -66,13 +68,12 @@ fn planar_q8_store_dyn_roundtrip() {
     let sbuf = be.alloc(rs * 4, BufferUsage::Activations).unwrap();
     be.upload(sbuf.as_ref(), bytemuck::cast_slice(&row))
         .unwrap();
-    // Six words: pos, kv_len, then the paged block's table/row-base words (all zero here).
-    let params = be.alloc(24, BufferUsage::Activations).unwrap();
-    let mut pb = [0u32; 6];
-    pb[0] = pos as u32;
-    pb[1] = pos as u32 + 1;
-    be.upload(params.as_ref(), bytemuck::cast_slice(&pb))
-        .unwrap();
+    let params = be.alloc(8, BufferUsage::Activations).unwrap();
+    be.upload(
+        params.as_ref(),
+        bytemuck::cast_slice(&[pos as u32, (pos + 1) as u32]),
+    )
+    .unwrap();
     let cache = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
     let ne = (pos + 1) * rs;
     let dst = be.alloc(ne * 2, BufferUsage::Activations).unwrap();
@@ -85,7 +86,6 @@ fn planar_q8_store_dyn_roundtrip() {
         rs,
         cap,
         false,
-        0,
     );
     rec.dequant_q8_f16(cache.as_ref(), dst.as_ref(), ne, cap);
     rec.finish().unwrap();
@@ -118,8 +118,9 @@ fn to_f16_bytes(v: &[f32]) -> Vec<u8> {
 /// The planar-Q8 split-K decode kernel (attn_partial_q8) must match the f16 attn_partial on the same
 /// logical KV within Q8 tolerance. Isolates the decode read from the full model path.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_attn_partial_matches_f16() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -240,8 +241,9 @@ fn planar_q8_attn_partial_matches_f16() {
 /// DECOUPLED K/V: mixed caches (K=q8 V=f16, and K=f16 V=q8) via the per-side attn_partial variants
 /// must match the all-f16 split within Q8 tolerance. Proves KQ8 and VQ8 are independent.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_attn_partial_mixed_kv() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -335,8 +337,9 @@ fn planar_q8_attn_partial_mixed_kv() {
 
 /// The record-once self-chunking planar-Q8 decode (attn_partial_dynac_q8) must match the f16 dynac.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_dynac_matches_f16() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -353,12 +356,12 @@ fn planar_q8_dynac_matches_f16() {
     let vf = be.alloc(n * 2, BufferUsage::Activations).unwrap();
     be.upload(kf.as_ref(), &to_f16_bytes(&kv)).unwrap();
     be.upload(vf.as_ref(), &to_f16_bytes(&kv)).unwrap();
-    let params = be.alloc(24, BufferUsage::Activations).unwrap();
-    let mut pb = [0u32; 6];
-    pb[0] = kv_len as u32 - 1;
-    pb[1] = kv_len as u32;
-    be.upload(params.as_ref(), bytemuck::cast_slice(&pb))
-        .unwrap();
+    let params = be.alloc(8, BufferUsage::Activations).unwrap();
+    be.upload(
+        params.as_ref(),
+        bytemuck::cast_slice(&[kv_len as u32 - 1, kv_len as u32]),
+    )
+    .unwrap();
 
     let chunk = 64usize;
     let n_chunks = kv_len.div_ceil(chunk).max(2);
@@ -458,8 +461,9 @@ fn planar_q8_dynac_matches_f16() {
 /// ROW capacity as the planar scales base (`cap`); this test pins the write path itself so a real
 /// regression can't hide behind that story again.
 #[test]
+#[ignore = "requires a Vulkan GPU"]
 fn planar_q8_store_replay_tape_matches_static() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };
@@ -478,25 +482,15 @@ fn planar_q8_store_replay_tape_matches_static() {
     // ── replay tape: params seeded [pos0-1, pos0] = [-1, 0]; advance lands row 0 first ──
     let kf = be.alloc(rs * 2, BufferUsage::Activations).unwrap(); // f16 K staging
     let vf = be.alloc(rs * 4, BufferUsage::Activations).unwrap(); // f32 V
-    let params = be.alloc(24, BufferUsage::Activations).unwrap();
-    let mut pb = [0u32; 6];
-    pb[0] = u32::MAX;
-    be.upload(params.as_ref(), bytemuck::cast_slice(&pb))
+    let params = be.alloc(8, BufferUsage::Activations).unwrap();
+    be.upload(params.as_ref(), bytemuck::cast_slice(&[u32::MAX, 0u32]))
         .unwrap();
     let kq_dyn = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
     let vq_dyn = be.alloc(cbytes, BufferUsage::KvCache).unwrap();
     let rec = be.recorder_persistent().unwrap();
     rec.global_barrier();
     rec.params_advance(params.as_ref());
-    rec.store_q8_dyn(
-        kf.as_ref(),
-        params.as_ref(),
-        kq_dyn.as_ref(),
-        rs,
-        cap,
-        true,
-        0,
-    );
+    rec.store_q8_dyn(kf.as_ref(), params.as_ref(), kq_dyn.as_ref(), rs, cap, true);
     rec.store_q8_dyn(
         vf.as_ref(),
         params.as_ref(),
@@ -504,7 +498,6 @@ fn planar_q8_store_replay_tape_matches_static() {
         rs,
         cap,
         false,
-        0,
     );
     let tape = rec.finish_record().unwrap();
     for t in 0..t_single {

@@ -5,8 +5,10 @@
 //! a different pattern — Qwen3-Next blocks them (`[k0_v0, k0_v1, k1_v2, k1_v3]`) while Qwen3.5
 //! interleaves (`[k0_v0, k1_v1, k0_v2, k1_v3]`, the `h % n_khead` tiling implemented here). A
 //! `qwen3next` GGUF through this code would produce silently wrong output — the arch gate below
-//! rejecting anything but `qwen35` is load-bearing, not cosmetic. (`qwen35moe` is likewise
-//! unsupported until its expert FFN lands.)
+//! rejecting anything but `qwen35` is load-bearing, not cosmetic. (`qwen35moe`, the
+//! routed-expert sibling, runs too — through `Config::from_gguf` and the shared seam, the same
+//! skeleton with an expert FFN; see `crate::arch::QWEN35_MOE`. Only this module's raw [`Cfg`]
+//! parse and [`is_qwen35`] stay dense-only.)
 //!
 //! This module holds what's specific to qwen35 outside the shared skeleton: the raw GGUF
 //! metadata parse ([`Cfg`], superseded in production by `Config::from_gguf`'s `qwen35` fields

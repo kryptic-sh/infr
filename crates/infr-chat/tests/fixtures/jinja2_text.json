@@ -1,0 +1,3419 @@
+{
+ "generated_by": "crates/infr-chat/tests/fixtures/jinja2_text.py",
+ "jinja2": "3.1.6",
+ "python": "3.15.2",
+ "vars": {
+  "t": true,
+  "f": false,
+  "n": null,
+  "i": 7,
+  "neg": -42,
+  "big": 18446744073709551615,
+  "min": -9223372036854775808,
+  "half": 2.5,
+  "two": 2.0,
+  "nz": -0.0,
+  "tiny": 1e-07,
+  "small": 0.0001,
+  "smaller": 1e-05,
+  "e15": 1000000000000000.0,
+  "e16": 1e+16,
+  "below16": 9999999999999998.0,
+  "e22": 1e+22,
+  "third": 0.3333333333333333,
+  "tie1": 1125899906842624.2,
+  "tie2": 1324350514534.9062,
+  "tie3": 73637923426838.62,
+  "s": "it's",
+  "dq": "say \"hi\"",
+  "both": "both ' and \"",
+  "esc": "back\\slash\nnew\ttab\r\u0001",
+  "uni": "café 日本 😀",
+  "unprintable": " 　­​﻿  ",
+  "empty_list": [],
+  "empty_obj": {},
+  "list": [
+   true,
+   null,
+   1e-07,
+   "q\"uote",
+   2.0,
+   [
+    1,
+    "x"
+   ]
+  ],
+  "obj": {
+   "b": {
+    "c": [
+     1,
+     "x",
+     true,
+     null,
+     2.5
+    ]
+   },
+   "a": "it's",
+   "z": {}
+  },
+  "ptype": [
+   "string",
+   "null"
+  ],
+  "schema": {
+   "type": "array",
+   "items": {
+    "type": "string"
+   },
+   "keys": 1,
+   "get": 2
+  },
+  "args": {
+   "city": "Paris",
+   "unit": null,
+   "days": 3,
+   "precise": true,
+   "ratio": 0.5,
+   "tiny": 1e-07,
+   "huge": 1e+16,
+   "filters": {
+    "min": 1.0,
+    "tags": [
+     "a",
+     "b"
+    ]
+   }
+  },
+  "nonprinting": "\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f  !~ ¡­¬®؀؁؂؃؄؅؆؜؛؝۝ۜ۞܏ܐ࢐࢏࢑࣢ࣣ࣡ ᙿᚁ᠎᠍᠏           ​‌‍‎‏‐ ‧ ‪‫‬‭‮ ‰ ⁞⁠⁡⁢⁣⁤⁦⁧⁨⁩⁪⁫⁬⁭⁮⁯⁰　⿿、豈﻿￹￺￻￼𑂽𑂼𑂾𑃍𓐰𓐯𓐱𓐲𓐳𓐴𓐵𓐶𓐷𓐸𓐹𓐺𓐻𓐼𓐽𓐾𓐿𓑀𛲠𛲟𛲡𛲢𛲣𝅳𝅲𝅴𝅵𝅶𝅷𝅸𝅹𝅺𝅻󠀁󠀠󠀡󠀢󠀣󠀤󠀥󠀦󠀧󠀨󠀩󠀪󠀫󠀬󠀭󠀮󠀯󠀰󠀱󠀲󠀳󠀴󠀵󠀶󠀷󠀸󠀹󠀺󠀻󠀼󠀽󠀾󠀿󠁀󠁁󠁂󠁃󠁄󠁅󠁆󠁇󠁈󠁉󠁊󠁋󠁌󠁍󠁎󠁏󠁐󠁑󠁒󠁓󠁔󠁕󠁖󠁗󠁘󠁙󠁚󠁛󠁜󠁝󠁞󠁟󠁠󠁡󠁢󠁣󠁤󠁥󠁦󠁧󠁨󠁩󠁪󠁫󠁬󠁭󠁮󠁯󠁰󠁱󠁲󠁳󠁴󠁵󠁶󠁷󠁸󠁹󠁺󠁻󠁼󠁽󠁾󠁿󰀀󿿽􀀀􏿽",
+  "unassigned": "͸",
+  "spaces": "\t\n\u000b\f\r\u001c\u001d\u001e\u001f                  　"
+ },
+ "rows": [
+  {
+   "template": "{{ true }}",
+   "python": "True"
+  },
+  {
+   "template": "{{ true | string }}",
+   "python": "True"
+  },
+  {
+   "template": "{{ 'p' ~ true }}",
+   "python": "pTrue"
+  },
+  {
+   "template": "{{ true ~ 'p' }}",
+   "python": "Truep"
+  },
+  {
+   "template": "{{ [true] | join(',') }}",
+   "python": "True"
+  },
+  {
+   "template": "{{ '{}'.format(true) }}",
+   "python": "True"
+  },
+  {
+   "template": "{{ '%s' | format(true) }}",
+   "python": "True"
+  },
+  {
+   "template": "{{ [true] }}",
+   "python": "[True]"
+  },
+  {
+   "template": "{{ {'k': true} }}",
+   "python": "{'k': True}"
+  },
+  {
+   "template": "{{ true | string | length }}",
+   "python": "4"
+  },
+  {
+   "template": "{{ true | tojson }}",
+   "python": "true"
+  },
+  {
+   "template": "{{ false }}",
+   "python": "False"
+  },
+  {
+   "template": "{{ false | string }}",
+   "python": "False"
+  },
+  {
+   "template": "{{ 'p' ~ false }}",
+   "python": "pFalse"
+  },
+  {
+   "template": "{{ false ~ 'p' }}",
+   "python": "Falsep"
+  },
+  {
+   "template": "{{ [false] | join(',') }}",
+   "python": "False"
+  },
+  {
+   "template": "{{ '{}'.format(false) }}",
+   "python": "False"
+  },
+  {
+   "template": "{{ '%s' | format(false) }}",
+   "python": "False"
+  },
+  {
+   "template": "{{ [false] }}",
+   "python": "[False]"
+  },
+  {
+   "template": "{{ {'k': false} }}",
+   "python": "{'k': False}"
+  },
+  {
+   "template": "{{ false | string | length }}",
+   "python": "5"
+  },
+  {
+   "template": "{{ false | tojson }}",
+   "python": "false"
+  },
+  {
+   "template": "{{ none }}",
+   "python": "None"
+  },
+  {
+   "template": "{{ none | string }}",
+   "python": "None"
+  },
+  {
+   "template": "{{ 'p' ~ none }}",
+   "python": "pNone"
+  },
+  {
+   "template": "{{ none ~ 'p' }}",
+   "python": "Nonep"
+  },
+  {
+   "template": "{{ [none] | join(',') }}",
+   "python": "None"
+  },
+  {
+   "template": "{{ '{}'.format(none) }}",
+   "python": "None"
+  },
+  {
+   "template": "{{ '%s' | format(none) }}",
+   "python": "None"
+  },
+  {
+   "template": "{{ [none] }}",
+   "python": "[None]"
+  },
+  {
+   "template": "{{ {'k': none} }}",
+   "python": "{'k': None}"
+  },
+  {
+   "template": "{{ none | string | length }}",
+   "python": "4"
+  },
+  {
+   "template": "{{ none | tojson }}",
+   "python": "null"
+  },
+  {
+   "template": "{{ 0 }}",
+   "python": "0"
+  },
+  {
+   "template": "{{ 0 | string }}",
+   "python": "0"
+  },
+  {
+   "template": "{{ 'p' ~ 0 }}",
+   "python": "p0"
+  },
+  {
+   "template": "{{ 0 ~ 'p' }}",
+   "python": "0p"
+  },
+  {
+   "template": "{{ [0] | join(',') }}",
+   "python": "0"
+  },
+  {
+   "template": "{{ '{}'.format(0) }}",
+   "python": "0"
+  },
+  {
+   "template": "{{ '%s' | format(0) }}",
+   "python": "0"
+  },
+  {
+   "template": "{{ [0] }}",
+   "python": "[0]"
+  },
+  {
+   "template": "{{ {'k': 0} }}",
+   "python": "{'k': 0}"
+  },
+  {
+   "template": "{{ 0 | string | length }}",
+   "python": "1"
+  },
+  {
+   "template": "{{ 0 | tojson }}",
+   "python": "0"
+  },
+  {
+   "template": "{{ -7 }}",
+   "python": "-7"
+  },
+  {
+   "template": "{{ -7 | string }}",
+   "python": "-7"
+  },
+  {
+   "template": "{{ 'p' ~ -7 }}",
+   "python": "p-7"
+  },
+  {
+   "template": "{{ -7 ~ 'p' }}",
+   "python": "-7p"
+  },
+  {
+   "template": "{{ [-7] | join(',') }}",
+   "python": "-7"
+  },
+  {
+   "template": "{{ '{}'.format(-7) }}",
+   "python": "-7"
+  },
+  {
+   "template": "{{ '%s' | format(-7) }}",
+   "python": "-7"
+  },
+  {
+   "template": "{{ [-7] }}",
+   "python": "[-7]"
+  },
+  {
+   "template": "{{ {'k': -7} }}",
+   "python": "{'k': -7}"
+  },
+  {
+   "template": "{{ -7 | string | length }}",
+   "python": "2"
+  },
+  {
+   "template": "{{ -7 | tojson }}",
+   "python": "-7"
+  },
+  {
+   "template": "{{ 2.0 }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{{ 2.0 | string }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{{ 'p' ~ 2.0 }}",
+   "python": "p2.0"
+  },
+  {
+   "template": "{{ 2.0 ~ 'p' }}",
+   "python": "2.0p"
+  },
+  {
+   "template": "{{ [2.0] | join(',') }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{{ '{}'.format(2.0) }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{{ '%s' | format(2.0) }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{{ [2.0] }}",
+   "python": "[2.0]"
+  },
+  {
+   "template": "{{ {'k': 2.0} }}",
+   "python": "{'k': 2.0}"
+  },
+  {
+   "template": "{{ 2.0 | string | length }}",
+   "python": "3"
+  },
+  {
+   "template": "{{ 2.0 | tojson }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{{ 2.5 }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{{ 2.5 | string }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{{ 'p' ~ 2.5 }}",
+   "python": "p2.5"
+  },
+  {
+   "template": "{{ 2.5 ~ 'p' }}",
+   "python": "2.5p"
+  },
+  {
+   "template": "{{ [2.5] | join(',') }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{{ '{}'.format(2.5) }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{{ '%s' | format(2.5) }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{{ [2.5] }}",
+   "python": "[2.5]"
+  },
+  {
+   "template": "{{ {'k': 2.5} }}",
+   "python": "{'k': 2.5}"
+  },
+  {
+   "template": "{{ 2.5 | string | length }}",
+   "python": "3"
+  },
+  {
+   "template": "{{ 2.5 | tojson }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{{ -0.0 }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{{ -0.0 | string }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{{ 'p' ~ -0.0 }}",
+   "python": "p-0.0"
+  },
+  {
+   "template": "{{ -0.0 ~ 'p' }}",
+   "python": "-0.0p"
+  },
+  {
+   "template": "{{ [-0.0] | join(',') }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{{ '{}'.format(-0.0) }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{{ '%s' | format(-0.0) }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{{ [-0.0] }}",
+   "python": "[-0.0]"
+  },
+  {
+   "template": "{{ {'k': -0.0} }}",
+   "python": "{'k': -0.0}"
+  },
+  {
+   "template": "{{ -0.0 | string | length }}",
+   "python": "4"
+  },
+  {
+   "template": "{{ -0.0 | tojson }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{{ 1e16 }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{{ 1e16 | string }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{{ 'p' ~ 1e16 }}",
+   "python": "p1e+16"
+  },
+  {
+   "template": "{{ 1e16 ~ 'p' }}",
+   "python": "1e+16p"
+  },
+  {
+   "template": "{{ [1e16] | join(',') }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{{ '{}'.format(1e16) }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{{ '%s' | format(1e16) }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{{ [1e16] }}",
+   "python": "[1e+16]"
+  },
+  {
+   "template": "{{ {'k': 1e16} }}",
+   "python": "{'k': 1e+16}"
+  },
+  {
+   "template": "{{ 1e16 | string | length }}",
+   "python": "5"
+  },
+  {
+   "template": "{{ 1e16 | tojson }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{{ 1.5e-7 }}",
+   "python": "1.5e-07"
+  },
+  {
+   "template": "{{ 1.5e-7 | string }}",
+   "python": "1.5e-07"
+  },
+  {
+   "template": "{{ 'p' ~ 1.5e-7 }}",
+   "python": "p1.5e-07"
+  },
+  {
+   "template": "{{ 1.5e-7 ~ 'p' }}",
+   "python": "1.5e-07p"
+  },
+  {
+   "template": "{{ [1.5e-7] | join(',') }}",
+   "python": "1.5e-07"
+  },
+  {
+   "template": "{{ '{}'.format(1.5e-7) }}",
+   "python": "1.5e-07"
+  },
+  {
+   "template": "{{ '%s' | format(1.5e-7) }}",
+   "python": "1.5e-07"
+  },
+  {
+   "template": "{{ [1.5e-7] }}",
+   "python": "[1.5e-07]"
+  },
+  {
+   "template": "{{ {'k': 1.5e-7} }}",
+   "python": "{'k': 1.5e-07}"
+  },
+  {
+   "template": "{{ 1.5e-7 | string | length }}",
+   "python": "7"
+  },
+  {
+   "template": "{{ 1.5e-7 | tojson }}",
+   "python": "1.5e-07"
+  },
+  {
+   "template": "{{ (0.1 + 0.2) }}",
+   "python": "0.30000000000000004"
+  },
+  {
+   "template": "{{ (0.1 + 0.2) | string }}",
+   "python": "0.30000000000000004"
+  },
+  {
+   "template": "{{ 'p' ~ (0.1 + 0.2) }}",
+   "python": "p0.30000000000000004"
+  },
+  {
+   "template": "{{ (0.1 + 0.2) ~ 'p' }}",
+   "python": "0.30000000000000004p"
+  },
+  {
+   "template": "{{ [(0.1 + 0.2)] | join(',') }}",
+   "python": "0.30000000000000004"
+  },
+  {
+   "template": "{{ '{}'.format((0.1 + 0.2)) }}",
+   "python": "0.30000000000000004"
+  },
+  {
+   "template": "{{ '%s' | format((0.1 + 0.2)) }}",
+   "python": "0.30000000000000004"
+  },
+  {
+   "template": "{{ [(0.1 + 0.2)] }}",
+   "python": "[0.30000000000000004]"
+  },
+  {
+   "template": "{{ {'k': (0.1 + 0.2)} }}",
+   "python": "{'k': 0.30000000000000004}"
+  },
+  {
+   "template": "{{ (0.1 + 0.2) | string | length }}",
+   "python": "19"
+  },
+  {
+   "template": "{{ (0.1 + 0.2) | tojson }}",
+   "python": "0.30000000000000004"
+  },
+  {
+   "template": "{{ (7 / 2) }}",
+   "python": "3.5"
+  },
+  {
+   "template": "{{ (7 / 2) | string }}",
+   "python": "3.5"
+  },
+  {
+   "template": "{{ 'p' ~ (7 / 2) }}",
+   "python": "p3.5"
+  },
+  {
+   "template": "{{ (7 / 2) ~ 'p' }}",
+   "python": "3.5p"
+  },
+  {
+   "template": "{{ [(7 / 2)] | join(',') }}",
+   "python": "3.5"
+  },
+  {
+   "template": "{{ '{}'.format((7 / 2)) }}",
+   "python": "3.5"
+  },
+  {
+   "template": "{{ '%s' | format((7 / 2)) }}",
+   "python": "3.5"
+  },
+  {
+   "template": "{{ [(7 / 2)] }}",
+   "python": "[3.5]"
+  },
+  {
+   "template": "{{ {'k': (7 / 2)} }}",
+   "python": "{'k': 3.5}"
+  },
+  {
+   "template": "{{ (7 / 2) | string | length }}",
+   "python": "3"
+  },
+  {
+   "template": "{{ (7 / 2) | tojson }}",
+   "python": "3.5"
+  },
+  {
+   "template": "{{ 'it\\'s' }}",
+   "python": "it's"
+  },
+  {
+   "template": "{{ 'it\\'s' | string }}",
+   "python": "it's"
+  },
+  {
+   "template": "{{ 'p' ~ 'it\\'s' }}",
+   "python": "pit's"
+  },
+  {
+   "template": "{{ 'it\\'s' ~ 'p' }}",
+   "python": "it'sp"
+  },
+  {
+   "template": "{{ ['it\\'s'] | join(',') }}",
+   "python": "it's"
+  },
+  {
+   "template": "{{ '{}'.format('it\\'s') }}",
+   "python": "it's"
+  },
+  {
+   "template": "{{ '%s' | format('it\\'s') }}",
+   "python": "it's"
+  },
+  {
+   "template": "{{ ['it\\'s'] }}",
+   "python": "[\"it's\"]"
+  },
+  {
+   "template": "{{ {'k': 'it\\'s'} }}",
+   "python": "{'k': \"it's\"}"
+  },
+  {
+   "template": "{{ 'it\\'s' | string | length }}",
+   "python": "4"
+  },
+  {
+   "template": "{{ 'it\\'s' | tojson }}",
+   "python": "\"it's\""
+  },
+  {
+   "template": "{{ [1, 'a', true, none] }}",
+   "python": "[1, 'a', True, None]"
+  },
+  {
+   "template": "{{ [1, 'a', true, none] | string }}",
+   "python": "[1, 'a', True, None]"
+  },
+  {
+   "template": "{{ 'p' ~ [1, 'a', true, none] }}",
+   "python": "p[1, 'a', True, None]"
+  },
+  {
+   "template": "{{ [1, 'a', true, none] ~ 'p' }}",
+   "python": "[1, 'a', True, None]p"
+  },
+  {
+   "template": "{{ [[1, 'a', true, none]] | join(',') }}",
+   "python": "[1, 'a', True, None]"
+  },
+  {
+   "template": "{{ '{}'.format([1, 'a', true, none]) }}",
+   "python": "[1, 'a', True, None]"
+  },
+  {
+   "template": "{{ '%s' | format([1, 'a', true, none]) }}",
+   "python": "[1, 'a', True, None]"
+  },
+  {
+   "template": "{{ [[1, 'a', true, none]] }}",
+   "python": "[[1, 'a', True, None]]"
+  },
+  {
+   "template": "{{ {'k': [1, 'a', true, none]} }}",
+   "python": "{'k': [1, 'a', True, None]}"
+  },
+  {
+   "template": "{{ [1, 'a', true, none] | string | length }}",
+   "python": "20"
+  },
+  {
+   "template": "{{ [1, 'a', true, none] | tojson }}",
+   "python": "[1, \"a\", true, null]"
+  },
+  {
+   "template": "{{ {'a': 1, 'b': [none]} }}",
+   "python": "{'a': 1, 'b': [None]}"
+  },
+  {
+   "template": "{{ {'a': 1, 'b': [none]} | string }}",
+   "python": "{'a': 1, 'b': [None]}"
+  },
+  {
+   "template": "{{ 'p' ~ {'a': 1, 'b': [none]} }}",
+   "python": "p{'a': 1, 'b': [None]}"
+  },
+  {
+   "template": "{{ {'a': 1, 'b': [none]} ~ 'p' }}",
+   "python": "{'a': 1, 'b': [None]}p"
+  },
+  {
+   "template": "{{ [{'a': 1, 'b': [none]}] | join(',') }}",
+   "python": "{'a': 1, 'b': [None]}"
+  },
+  {
+   "template": "{{ '{}'.format({'a': 1, 'b': [none]}) }}",
+   "python": "{'a': 1, 'b': [None]}"
+  },
+  {
+   "template": "{{ '%s' | format({'a': 1, 'b': [none]}) }}",
+   "python": "{'a': 1, 'b': [None]}"
+  },
+  {
+   "template": "{{ [{'a': 1, 'b': [none]}] }}",
+   "python": "[{'a': 1, 'b': [None]}]"
+  },
+  {
+   "template": "{{ {'k': {'a': 1, 'b': [none]}} }}",
+   "python": "{'k': {'a': 1, 'b': [None]}}"
+  },
+  {
+   "template": "{{ {'a': 1, 'b': [none]} | string | length }}",
+   "python": "21"
+  },
+  {
+   "template": "{{ {'a': 1, 'b': [none]} | tojson }}",
+   "python": "{\"a\": 1, \"b\": [null]}"
+  },
+  {
+   "template": "{{ [] }}",
+   "python": "[]"
+  },
+  {
+   "template": "{{ [] | string }}",
+   "python": "[]"
+  },
+  {
+   "template": "{{ 'p' ~ [] }}",
+   "python": "p[]"
+  },
+  {
+   "template": "{{ [] ~ 'p' }}",
+   "python": "[]p"
+  },
+  {
+   "template": "{{ [[]] | join(',') }}",
+   "python": "[]"
+  },
+  {
+   "template": "{{ '{}'.format([]) }}",
+   "python": "[]"
+  },
+  {
+   "template": "{{ '%s' | format([]) }}",
+   "python": "[]"
+  },
+  {
+   "template": "{{ [[]] }}",
+   "python": "[[]]"
+  },
+  {
+   "template": "{{ {'k': []} }}",
+   "python": "{'k': []}"
+  },
+  {
+   "template": "{{ [] | string | length }}",
+   "python": "2"
+  },
+  {
+   "template": "{{ [] | tojson }}",
+   "python": "[]"
+  },
+  {
+   "template": "{{ {} }}",
+   "python": "{}"
+  },
+  {
+   "template": "{{ {} | string }}",
+   "python": "{}"
+  },
+  {
+   "template": "{{ 'p' ~ {} }}",
+   "python": "p{}"
+  },
+  {
+   "template": "{{ {} ~ 'p' }}",
+   "python": "{}p"
+  },
+  {
+   "template": "{{ [{}] | join(',') }}",
+   "python": "{}"
+  },
+  {
+   "template": "{{ '{}'.format({}) }}",
+   "python": "{}"
+  },
+  {
+   "template": "{{ '%s' | format({}) }}",
+   "python": "{}"
+  },
+  {
+   "template": "{{ [{}] }}",
+   "python": "[{}]"
+  },
+  {
+   "template": "{{ {'k': {}} }}",
+   "python": "{'k': {}}"
+  },
+  {
+   "template": "{{ {} | string | length }}",
+   "python": "2"
+  },
+  {
+   "template": "{{ {} | tojson }}",
+   "python": "{}"
+  },
+  {
+   "template": "{{ undefined_name }}",
+   "python": ""
+  },
+  {
+   "template": "{{ undefined_name | string }}",
+   "python": ""
+  },
+  {
+   "template": "{{ 'p' ~ undefined_name }}",
+   "python": "p"
+  },
+  {
+   "template": "{{ undefined_name ~ 'p' }}",
+   "python": "p"
+  },
+  {
+   "template": "{{ [undefined_name] | join(',') }}",
+   "python": ""
+  },
+  {
+   "template": "{{ '{}'.format(undefined_name) }}",
+   "python": ""
+  },
+  {
+   "template": "{{ '%s' | format(undefined_name) }}",
+   "python": ""
+  },
+  {
+   "template": "{{ [undefined_name] }}",
+   "python": "[Undefined]"
+  },
+  {
+   "template": "{{ {'k': undefined_name} }}",
+   "python": "{'k': Undefined}"
+  },
+  {
+   "template": "{{ undefined_name | string | length }}",
+   "python": "0"
+  },
+  {
+   "template": "{{ undefined_name | tojson }}",
+   "python_error": "TypeError: Object of type Undefined is not JSON serializable"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.t }}",
+   "python": "True"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.t | string }}",
+   "python": "True"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.t }}",
+   "python": "pTrue"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.t ~ 'p' }}",
+   "python": "Truep"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.t] | join(',') }}",
+   "python": "True"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.t) }}",
+   "python": "True"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.t) }}",
+   "python": "True"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.t] }}",
+   "python": "[True]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.t} }}",
+   "python": "{'k': True}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.t | string | length }}",
+   "python": "4"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.t | tojson }}",
+   "python": "true"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.f }}",
+   "python": "False"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.f | string }}",
+   "python": "False"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.f }}",
+   "python": "pFalse"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.f ~ 'p' }}",
+   "python": "Falsep"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.f] | join(',') }}",
+   "python": "False"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.f) }}",
+   "python": "False"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.f) }}",
+   "python": "False"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.f] }}",
+   "python": "[False]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.f} }}",
+   "python": "{'k': False}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.f | string | length }}",
+   "python": "5"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.f | tojson }}",
+   "python": "false"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.n }}",
+   "python": "None"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.n | string }}",
+   "python": "None"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.n }}",
+   "python": "pNone"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.n ~ 'p' }}",
+   "python": "Nonep"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.n] | join(',') }}",
+   "python": "None"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.n) }}",
+   "python": "None"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.n) }}",
+   "python": "None"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.n] }}",
+   "python": "[None]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.n} }}",
+   "python": "{'k': None}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.n | string | length }}",
+   "python": "4"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.n | tojson }}",
+   "python": "null"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.i }}",
+   "python": "7"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.i | string }}",
+   "python": "7"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.i }}",
+   "python": "p7"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.i ~ 'p' }}",
+   "python": "7p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.i] | join(',') }}",
+   "python": "7"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.i) }}",
+   "python": "7"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.i) }}",
+   "python": "7"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.i] }}",
+   "python": "[7]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.i} }}",
+   "python": "{'k': 7}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.i | string | length }}",
+   "python": "1"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.i | tojson }}",
+   "python": "7"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.neg }}",
+   "python": "-42"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.neg | string }}",
+   "python": "-42"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.neg }}",
+   "python": "p-42"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.neg ~ 'p' }}",
+   "python": "-42p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.neg] | join(',') }}",
+   "python": "-42"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.neg) }}",
+   "python": "-42"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.neg) }}",
+   "python": "-42"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.neg] }}",
+   "python": "[-42]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.neg} }}",
+   "python": "{'k': -42}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.neg | string | length }}",
+   "python": "3"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.neg | tojson }}",
+   "python": "-42"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.big }}",
+   "python": "18446744073709551615"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.big | string }}",
+   "python": "18446744073709551615"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.big }}",
+   "python": "p18446744073709551615"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.big ~ 'p' }}",
+   "python": "18446744073709551615p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.big] | join(',') }}",
+   "python": "18446744073709551615"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.big) }}",
+   "python": "18446744073709551615"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.big) }}",
+   "python": "18446744073709551615"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.big] }}",
+   "python": "[18446744073709551615]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.big} }}",
+   "python": "{'k': 18446744073709551615}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.big | string | length }}",
+   "python": "20"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.big | tojson }}",
+   "python": "18446744073709551615"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.min }}",
+   "python": "-9223372036854775808"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.min | string }}",
+   "python": "-9223372036854775808"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.min }}",
+   "python": "p-9223372036854775808"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.min ~ 'p' }}",
+   "python": "-9223372036854775808p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.min] | join(',') }}",
+   "python": "-9223372036854775808"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.min) }}",
+   "python": "-9223372036854775808"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.min) }}",
+   "python": "-9223372036854775808"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.min] }}",
+   "python": "[-9223372036854775808]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.min} }}",
+   "python": "{'k': -9223372036854775808}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.min | string | length }}",
+   "python": "20"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.min | tojson }}",
+   "python": "-9223372036854775808"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.half }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.half | string }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.half }}",
+   "python": "p2.5"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.half ~ 'p' }}",
+   "python": "2.5p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.half] | join(',') }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.half) }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.half) }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.half] }}",
+   "python": "[2.5]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.half} }}",
+   "python": "{'k': 2.5}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.half | string | length }}",
+   "python": "3"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.half | tojson }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.two }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.two | string }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.two }}",
+   "python": "p2.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.two ~ 'p' }}",
+   "python": "2.0p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.two] | join(',') }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.two) }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.two) }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.two] }}",
+   "python": "[2.0]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.two} }}",
+   "python": "{'k': 2.0}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.two | string | length }}",
+   "python": "3"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.two | tojson }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.nz }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.nz | string }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.nz }}",
+   "python": "p-0.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.nz ~ 'p' }}",
+   "python": "-0.0p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.nz] | join(',') }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.nz) }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.nz) }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.nz] }}",
+   "python": "[-0.0]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.nz} }}",
+   "python": "{'k': -0.0}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.nz | string | length }}",
+   "python": "4"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.nz | tojson }}",
+   "python": "-0.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tiny }}",
+   "python": "1e-07"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tiny | string }}",
+   "python": "1e-07"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.tiny }}",
+   "python": "p1e-07"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tiny ~ 'p' }}",
+   "python": "1e-07p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.tiny] | join(',') }}",
+   "python": "1e-07"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.tiny) }}",
+   "python": "1e-07"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.tiny) }}",
+   "python": "1e-07"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.tiny] }}",
+   "python": "[1e-07]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.tiny} }}",
+   "python": "{'k': 1e-07}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tiny | string | length }}",
+   "python": "5"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tiny | tojson }}",
+   "python": "1e-07"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.small }}",
+   "python": "0.0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.small | string }}",
+   "python": "0.0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.small }}",
+   "python": "p0.0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.small ~ 'p' }}",
+   "python": "0.0001p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.small] | join(',') }}",
+   "python": "0.0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.small) }}",
+   "python": "0.0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.small) }}",
+   "python": "0.0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.small] }}",
+   "python": "[0.0001]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.small} }}",
+   "python": "{'k': 0.0001}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.small | string | length }}",
+   "python": "6"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.small | tojson }}",
+   "python": "0.0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.smaller }}",
+   "python": "1e-05"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.smaller | string }}",
+   "python": "1e-05"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.smaller }}",
+   "python": "p1e-05"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.smaller ~ 'p' }}",
+   "python": "1e-05p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.smaller] | join(',') }}",
+   "python": "1e-05"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.smaller) }}",
+   "python": "1e-05"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.smaller) }}",
+   "python": "1e-05"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.smaller] }}",
+   "python": "[1e-05]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.smaller} }}",
+   "python": "{'k': 1e-05}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.smaller | string | length }}",
+   "python": "5"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.smaller | tojson }}",
+   "python": "1e-05"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e15 }}",
+   "python": "1000000000000000.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e15 | string }}",
+   "python": "1000000000000000.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.e15 }}",
+   "python": "p1000000000000000.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e15 ~ 'p' }}",
+   "python": "1000000000000000.0p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.e15] | join(',') }}",
+   "python": "1000000000000000.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.e15) }}",
+   "python": "1000000000000000.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.e15) }}",
+   "python": "1000000000000000.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.e15] }}",
+   "python": "[1000000000000000.0]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.e15} }}",
+   "python": "{'k': 1000000000000000.0}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e15 | string | length }}",
+   "python": "18"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e15 | tojson }}",
+   "python": "1000000000000000.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e16 }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e16 | string }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.e16 }}",
+   "python": "p1e+16"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e16 ~ 'p' }}",
+   "python": "1e+16p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.e16] | join(',') }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.e16) }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.e16) }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.e16] }}",
+   "python": "[1e+16]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.e16} }}",
+   "python": "{'k': 1e+16}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e16 | string | length }}",
+   "python": "5"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e16 | tojson }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.below16 }}",
+   "python": "9999999999999998.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.below16 | string }}",
+   "python": "9999999999999998.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.below16 }}",
+   "python": "p9999999999999998.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.below16 ~ 'p' }}",
+   "python": "9999999999999998.0p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.below16] | join(',') }}",
+   "python": "9999999999999998.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.below16) }}",
+   "python": "9999999999999998.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.below16) }}",
+   "python": "9999999999999998.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.below16] }}",
+   "python": "[9999999999999998.0]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.below16} }}",
+   "python": "{'k': 9999999999999998.0}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.below16 | string | length }}",
+   "python": "18"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.below16 | tojson }}",
+   "python": "9999999999999998.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e22 }}",
+   "python": "1e+22"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e22 | string }}",
+   "python": "1e+22"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.e22 }}",
+   "python": "p1e+22"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e22 ~ 'p' }}",
+   "python": "1e+22p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.e22] | join(',') }}",
+   "python": "1e+22"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.e22) }}",
+   "python": "1e+22"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.e22) }}",
+   "python": "1e+22"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.e22] }}",
+   "python": "[1e+22]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.e22} }}",
+   "python": "{'k': 1e+22}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e22 | string | length }}",
+   "python": "5"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.e22 | tojson }}",
+   "python": "1e+22"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.third }}",
+   "python": "0.3333333333333333"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.third | string }}",
+   "python": "0.3333333333333333"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.third }}",
+   "python": "p0.3333333333333333"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.third ~ 'p' }}",
+   "python": "0.3333333333333333p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.third] | join(',') }}",
+   "python": "0.3333333333333333"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.third) }}",
+   "python": "0.3333333333333333"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.third) }}",
+   "python": "0.3333333333333333"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.third] }}",
+   "python": "[0.3333333333333333]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.third} }}",
+   "python": "{'k': 0.3333333333333333}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.third | string | length }}",
+   "python": "18"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.third | tojson }}",
+   "python": "0.3333333333333333"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie1 }}",
+   "python": "1125899906842624.2"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie1 | string }}",
+   "python": "1125899906842624.2"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.tie1 }}",
+   "python": "p1125899906842624.2"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie1 ~ 'p' }}",
+   "python": "1125899906842624.2p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.tie1] | join(',') }}",
+   "python": "1125899906842624.2"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.tie1) }}",
+   "python": "1125899906842624.2"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.tie1) }}",
+   "python": "1125899906842624.2"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.tie1] }}",
+   "python": "[1125899906842624.2]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.tie1} }}",
+   "python": "{'k': 1125899906842624.2}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie1 | string | length }}",
+   "python": "18"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie1 | tojson }}",
+   "python": "1125899906842624.2"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie2 }}",
+   "python": "1324350514534.9062"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie2 | string }}",
+   "python": "1324350514534.9062"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.tie2 }}",
+   "python": "p1324350514534.9062"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie2 ~ 'p' }}",
+   "python": "1324350514534.9062p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.tie2] | join(',') }}",
+   "python": "1324350514534.9062"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.tie2) }}",
+   "python": "1324350514534.9062"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.tie2) }}",
+   "python": "1324350514534.9062"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.tie2] }}",
+   "python": "[1324350514534.9062]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.tie2} }}",
+   "python": "{'k': 1324350514534.9062}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie2 | string | length }}",
+   "python": "18"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie2 | tojson }}",
+   "python": "1324350514534.9062"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie3 }}",
+   "python": "73637923426838.62"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie3 | string }}",
+   "python": "73637923426838.62"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.tie3 }}",
+   "python": "p73637923426838.62"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie3 ~ 'p' }}",
+   "python": "73637923426838.62p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.tie3] | join(',') }}",
+   "python": "73637923426838.62"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.tie3) }}",
+   "python": "73637923426838.62"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.tie3) }}",
+   "python": "73637923426838.62"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.tie3] }}",
+   "python": "[73637923426838.62]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.tie3} }}",
+   "python": "{'k': 73637923426838.62}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie3 | string | length }}",
+   "python": "17"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tie3 | tojson }}",
+   "python": "73637923426838.62"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.s }}",
+   "python": "it's"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.s | string }}",
+   "python": "it's"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.s }}",
+   "python": "pit's"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.s ~ 'p' }}",
+   "python": "it'sp"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.s] | join(',') }}",
+   "python": "it's"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.s) }}",
+   "python": "it's"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.s) }}",
+   "python": "it's"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.s] }}",
+   "python": "[\"it's\"]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.s} }}",
+   "python": "{'k': \"it's\"}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.s | string | length }}",
+   "python": "4"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.s | tojson }}",
+   "python": "\"it's\""
+  },
+  {
+   "template": "{% set v = tools %}{{ v.dq }}",
+   "python": "say \"hi\""
+  },
+  {
+   "template": "{% set v = tools %}{{ v.dq | string }}",
+   "python": "say \"hi\""
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.dq }}",
+   "python": "psay \"hi\""
+  },
+  {
+   "template": "{% set v = tools %}{{ v.dq ~ 'p' }}",
+   "python": "say \"hi\"p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.dq] | join(',') }}",
+   "python": "say \"hi\""
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.dq) }}",
+   "python": "say \"hi\""
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.dq) }}",
+   "python": "say \"hi\""
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.dq] }}",
+   "python": "['say \"hi\"']"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.dq} }}",
+   "python": "{'k': 'say \"hi\"'}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.dq | string | length }}",
+   "python": "8"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.dq | tojson }}",
+   "python": "\"say \\\"hi\\\"\""
+  },
+  {
+   "template": "{% set v = tools %}{{ v.both }}",
+   "python": "both ' and \""
+  },
+  {
+   "template": "{% set v = tools %}{{ v.both | string }}",
+   "python": "both ' and \""
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.both }}",
+   "python": "pboth ' and \""
+  },
+  {
+   "template": "{% set v = tools %}{{ v.both ~ 'p' }}",
+   "python": "both ' and \"p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.both] | join(',') }}",
+   "python": "both ' and \""
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.both) }}",
+   "python": "both ' and \""
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.both) }}",
+   "python": "both ' and \""
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.both] }}",
+   "python": "['both \\' and \"']"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.both} }}",
+   "python": "{'k': 'both \\' and \"'}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.both | string | length }}",
+   "python": "12"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.both | tojson }}",
+   "python": "\"both ' and \\\"\""
+  },
+  {
+   "template": "{% set v = tools %}{{ v.esc }}",
+   "python": "back\\slash\nnew\ttab\r\u0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.esc | string }}",
+   "python": "back\\slash\nnew\ttab\r\u0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.esc }}",
+   "python": "pback\\slash\nnew\ttab\r\u0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.esc ~ 'p' }}",
+   "python": "back\\slash\nnew\ttab\r\u0001p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.esc] | join(',') }}",
+   "python": "back\\slash\nnew\ttab\r\u0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.esc) }}",
+   "python": "back\\slash\nnew\ttab\r\u0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.esc) }}",
+   "python": "back\\slash\nnew\ttab\r\u0001"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.esc] }}",
+   "python": "['back\\\\slash\\nnew\\ttab\\r\\x01\\x7f']"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.esc} }}",
+   "python": "{'k': 'back\\\\slash\\nnew\\ttab\\r\\x01\\x7f'}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.esc | string | length }}",
+   "python": "21"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.esc | tojson }}",
+   "python": "\"back\\\\slash\\nnew\\ttab\\r\\u0001\""
+  },
+  {
+   "template": "{% set v = tools %}{{ v.uni }}",
+   "python": "café 日本 😀"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.uni | string }}",
+   "python": "café 日本 😀"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.uni }}",
+   "python": "pcafé 日本 😀"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.uni ~ 'p' }}",
+   "python": "café 日本 😀p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.uni] | join(',') }}",
+   "python": "café 日本 😀"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.uni) }}",
+   "python": "café 日本 😀"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.uni) }}",
+   "python": "café 日本 😀"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.uni] }}",
+   "python": "['café 日本 😀']"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.uni} }}",
+   "python": "{'k': 'café 日本 😀'}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.uni | string | length }}",
+   "python": "9"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.uni | tojson }}",
+   "python": "\"café 日本 😀\""
+  },
+  {
+   "template": "{% set v = tools %}{{ v.unprintable }}",
+   "python": " 　­​﻿  "
+  },
+  {
+   "template": "{% set v = tools %}{{ v.unprintable | string }}",
+   "python": " 　­​﻿  "
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.unprintable }}",
+   "python": "p 　­​﻿  "
+  },
+  {
+   "template": "{% set v = tools %}{{ v.unprintable ~ 'p' }}",
+   "python": " 　­​﻿  p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.unprintable] | join(',') }}",
+   "python": " 　­​﻿  "
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.unprintable) }}",
+   "python": " 　­​﻿  "
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.unprintable) }}",
+   "python": " 　­​﻿  "
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.unprintable] }}",
+   "python": "['\\xa0\\u3000\\xad\\u200b\\ufeff\\u2028\\u2029\\ue000\\x85']"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.unprintable} }}",
+   "python": "{'k': '\\xa0\\u3000\\xad\\u200b\\ufeff\\u2028\\u2029\\ue000\\x85'}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.unprintable | string | length }}",
+   "python": "9"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.unprintable | tojson }}",
+   "python": "\" 　­​﻿  \""
+  },
+  {
+   "template": "{% set v = tools %}{{ v.empty_list }}",
+   "python": "[]"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.empty_list | string }}",
+   "python": "[]"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.empty_list }}",
+   "python": "p[]"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.empty_list ~ 'p' }}",
+   "python": "[]p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.empty_list] | join(',') }}",
+   "python": "[]"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.empty_list) }}",
+   "python": "[]"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.empty_list) }}",
+   "python": "[]"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.empty_list] }}",
+   "python": "[[]]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.empty_list} }}",
+   "python": "{'k': []}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.empty_list | string | length }}",
+   "python": "2"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.empty_list | tojson }}",
+   "python": "[]"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.empty_obj }}",
+   "python": "{}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.empty_obj | string }}",
+   "python": "{}"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.empty_obj }}",
+   "python": "p{}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.empty_obj ~ 'p' }}",
+   "python": "{}p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.empty_obj] | join(',') }}",
+   "python": "{}"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.empty_obj) }}",
+   "python": "{}"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.empty_obj) }}",
+   "python": "{}"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.empty_obj] }}",
+   "python": "[{}]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.empty_obj} }}",
+   "python": "{'k': {}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.empty_obj | string | length }}",
+   "python": "2"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.empty_obj | tojson }}",
+   "python": "{}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.list }}",
+   "python": "[True, None, 1e-07, 'q\"uote', 2.0, [1, 'x']]"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.list | string }}",
+   "python": "[True, None, 1e-07, 'q\"uote', 2.0, [1, 'x']]"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.list }}",
+   "python": "p[True, None, 1e-07, 'q\"uote', 2.0, [1, 'x']]"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.list ~ 'p' }}",
+   "python": "[True, None, 1e-07, 'q\"uote', 2.0, [1, 'x']]p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.list] | join(',') }}",
+   "python": "[True, None, 1e-07, 'q\"uote', 2.0, [1, 'x']]"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.list) }}",
+   "python": "[True, None, 1e-07, 'q\"uote', 2.0, [1, 'x']]"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.list) }}",
+   "python": "[True, None, 1e-07, 'q\"uote', 2.0, [1, 'x']]"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.list] }}",
+   "python": "[[True, None, 1e-07, 'q\"uote', 2.0, [1, 'x']]]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.list} }}",
+   "python": "{'k': [True, None, 1e-07, 'q\"uote', 2.0, [1, 'x']]}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.list | string | length }}",
+   "python": "44"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.list | tojson }}",
+   "python": "[true, null, 1e-07, \"q\\\"uote\", 2.0, [1, \"x\"]]"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.obj }}",
+   "python": "{'b': {'c': [1, 'x', True, None, 2.5]}, 'a': \"it's\", 'z': {}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.obj | string }}",
+   "python": "{'b': {'c': [1, 'x', True, None, 2.5]}, 'a': \"it's\", 'z': {}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.obj }}",
+   "python": "p{'b': {'c': [1, 'x', True, None, 2.5]}, 'a': \"it's\", 'z': {}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.obj ~ 'p' }}",
+   "python": "{'b': {'c': [1, 'x', True, None, 2.5]}, 'a': \"it's\", 'z': {}}p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.obj] | join(',') }}",
+   "python": "{'b': {'c': [1, 'x', True, None, 2.5]}, 'a': \"it's\", 'z': {}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.obj) }}",
+   "python": "{'b': {'c': [1, 'x', True, None, 2.5]}, 'a': \"it's\", 'z': {}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.obj) }}",
+   "python": "{'b': {'c': [1, 'x', True, None, 2.5]}, 'a': \"it's\", 'z': {}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.obj] }}",
+   "python": "[{'b': {'c': [1, 'x', True, None, 2.5]}, 'a': \"it's\", 'z': {}}]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.obj} }}",
+   "python": "{'k': {'b': {'c': [1, 'x', True, None, 2.5]}, 'a': \"it's\", 'z': {}}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.obj | string | length }}",
+   "python": "61"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.obj | tojson }}",
+   "python": "{\"b\": {\"c\": [1, \"x\", true, null, 2.5]}, \"a\": \"it's\", \"z\": {}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype }}",
+   "python": "['string', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype | string }}",
+   "python": "['string', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.ptype }}",
+   "python": "p['string', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype ~ 'p' }}",
+   "python": "['string', 'null']p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.ptype] | join(',') }}",
+   "python": "['string', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.ptype) }}",
+   "python": "['string', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.ptype) }}",
+   "python": "['string', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.ptype] }}",
+   "python": "[['string', 'null']]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.ptype} }}",
+   "python": "{'k': ['string', 'null']}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype | string | length }}",
+   "python": "18"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype | tojson }}",
+   "python": "[\"string\", \"null\"]"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.schema }}",
+   "python": "{'type': 'array', 'items': {'type': 'string'}, 'keys': 1, 'get': 2}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.schema | string }}",
+   "python": "{'type': 'array', 'items': {'type': 'string'}, 'keys': 1, 'get': 2}"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.schema }}",
+   "python": "p{'type': 'array', 'items': {'type': 'string'}, 'keys': 1, 'get': 2}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.schema ~ 'p' }}",
+   "python": "{'type': 'array', 'items': {'type': 'string'}, 'keys': 1, 'get': 2}p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.schema] | join(',') }}",
+   "python": "{'type': 'array', 'items': {'type': 'string'}, 'keys': 1, 'get': 2}"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.schema) }}",
+   "python": "{'type': 'array', 'items': {'type': 'string'}, 'keys': 1, 'get': 2}"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.schema) }}",
+   "python": "{'type': 'array', 'items': {'type': 'string'}, 'keys': 1, 'get': 2}"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.schema] }}",
+   "python": "[{'type': 'array', 'items': {'type': 'string'}, 'keys': 1, 'get': 2}]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.schema} }}",
+   "python": "{'k': {'type': 'array', 'items': {'type': 'string'}, 'keys': 1, 'get': 2}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.schema | string | length }}",
+   "python": "67"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.schema | tojson }}",
+   "python": "{\"type\": \"array\", \"items\": {\"type\": \"string\"}, \"keys\": 1, \"get\": 2}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.args }}",
+   "python": "{'city': 'Paris', 'unit': None, 'days': 3, 'precise': True, 'ratio': 0.5, 'tiny': 1e-07, 'huge': 1e+16, 'filters': {'min': 1.0, 'tags': ['a', 'b']}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.args | string }}",
+   "python": "{'city': 'Paris', 'unit': None, 'days': 3, 'precise': True, 'ratio': 0.5, 'tiny': 1e-07, 'huge': 1e+16, 'filters': {'min': 1.0, 'tags': ['a', 'b']}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.args }}",
+   "python": "p{'city': 'Paris', 'unit': None, 'days': 3, 'precise': True, 'ratio': 0.5, 'tiny': 1e-07, 'huge': 1e+16, 'filters': {'min': 1.0, 'tags': ['a', 'b']}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.args ~ 'p' }}",
+   "python": "{'city': 'Paris', 'unit': None, 'days': 3, 'precise': True, 'ratio': 0.5, 'tiny': 1e-07, 'huge': 1e+16, 'filters': {'min': 1.0, 'tags': ['a', 'b']}}p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.args] | join(',') }}",
+   "python": "{'city': 'Paris', 'unit': None, 'days': 3, 'precise': True, 'ratio': 0.5, 'tiny': 1e-07, 'huge': 1e+16, 'filters': {'min': 1.0, 'tags': ['a', 'b']}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{}'.format(v.args) }}",
+   "python": "{'city': 'Paris', 'unit': None, 'days': 3, 'precise': True, 'ratio': 0.5, 'tiny': 1e-07, 'huge': 1e+16, 'filters': {'min': 1.0, 'tags': ['a', 'b']}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ '%s' | format(v.args) }}",
+   "python": "{'city': 'Paris', 'unit': None, 'days': 3, 'precise': True, 'ratio': 0.5, 'tiny': 1e-07, 'huge': 1e+16, 'filters': {'min': 1.0, 'tags': ['a', 'b']}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.args] }}",
+   "python": "[{'city': 'Paris', 'unit': None, 'days': 3, 'precise': True, 'ratio': 0.5, 'tiny': 1e-07, 'huge': 1e+16, 'filters': {'min': 1.0, 'tags': ['a', 'b']}}]"
+  },
+  {
+   "template": "{% set v = tools %}{{ {'k': v.args} }}",
+   "python": "{'k': {'city': 'Paris', 'unit': None, 'days': 3, 'precise': True, 'ratio': 0.5, 'tiny': 1e-07, 'huge': 1e+16, 'filters': {'min': 1.0, 'tags': ['a', 'b']}}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.args | string | length }}",
+   "python": "148"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.args | tojson }}",
+   "python": "{\"city\": \"Paris\", \"unit\": null, \"days\": 3, \"precise\": true, \"ratio\": 0.5, \"tiny\": 1e-07, \"huge\": 1e+16, \"filters\": {\"min\": 1.0, \"tags\": [\"a\", \"b\"]}}"
+  },
+  {
+   "template": "{{ 1 == 1 }}",
+   "python": "True"
+  },
+  {
+   "template": "{{ 1 > 2 }}",
+   "python": "False"
+  },
+  {
+   "template": "{{ 'a' in 'abc' }}",
+   "python": "True"
+  },
+  {
+   "template": "{{ none is none }}",
+   "python": "True"
+  },
+  {
+   "template": "{{ 7 / 2 }}",
+   "python": "3.5"
+  },
+  {
+   "template": "{{ 6 / 3 }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{{ 7 // 2 }}",
+   "python": "3"
+  },
+  {
+   "template": "{{ -7 // 2 }}",
+   "python": "-4"
+  },
+  {
+   "template": "{{ 7.5 // 2 }}",
+   "python": "3.0"
+  },
+  {
+   "template": "{{ 7 % 3 }}",
+   "python": "1"
+  },
+  {
+   "template": "{{ -7 % 3 }}",
+   "python": "2"
+  },
+  {
+   "template": "{{ 7 % 2.5 }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{{ 2 ** 0.5 }}",
+   "python": "1.4142135623730951"
+  },
+  {
+   "template": "{{ 2 ** 10 }}",
+   "python": "1024"
+  },
+  {
+   "template": "{{ 2 ** -1 }}",
+   "python": "0.5"
+  },
+  {
+   "template": "{{ 2 ** 64 }}",
+   "python": "18446744073709551616"
+  },
+  {
+   "template": "{{ 3 * 1.0 }}",
+   "python": "3.0"
+  },
+  {
+   "template": "{{ 1 / 3 }}",
+   "python": "0.3333333333333333"
+  },
+  {
+   "template": "{{ 1e16 + 1 }}",
+   "python": "1e+16"
+  },
+  {
+   "template": "{{ 1e300 * 1e10 }}",
+   "python": "inf"
+  },
+  {
+   "template": "{{ -1e300 * 1e10 }}",
+   "python": "-inf"
+  },
+  {
+   "template": "{{ 0.1 * 3 }}",
+   "python": "0.30000000000000004"
+  },
+  {
+   "template": "{{ 123456789.123456789 }}",
+   "python": "123456789.12345679"
+  },
+  {
+   "template": "{{ 5e-324 }}",
+   "python": "5e-324"
+  },
+  {
+   "template": "{{ 1.7976931348623157e308 }}",
+   "python": "1.7976931348623157e+308"
+  },
+  {
+   "template": "{{ 1e-4 }}",
+   "python": "0.0001"
+  },
+  {
+   "template": "{{ 9.999999999999999e-05 }}",
+   "python": "9.999999999999999e-05"
+  },
+  {
+   "template": "{{ 1e100 }}",
+   "python": "1e+100"
+  },
+  {
+   "template": "{{ 1e-100 }}",
+   "python": "1e-100"
+  },
+  {
+   "template": "{{ -1.5e-7 }}",
+   "python": "-1.5e-07"
+  },
+  {
+   "template": "{{ 1000000.0 }}",
+   "python": "1000000.0"
+  },
+  {
+   "template": "{{ 12345678901234567890 }}",
+   "python": "12345678901234567890"
+  },
+  {
+   "template": "{{ true + 1 }}",
+   "python": "2"
+  },
+  {
+   "template": "{% set v = tools %}{{ -v.e16 }}",
+   "python": "-1e+16"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.half * 2 }}",
+   "python": "5.0"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tiny * 10 }}",
+   "python": "1e-06"
+  },
+  {
+   "template": "{{ 3 | float }}",
+   "python": "3.0"
+  },
+  {
+   "template": "{{ '3.5' | float }}",
+   "python": "3.5"
+  },
+  {
+   "template": "{{ 'abc' | float }}",
+   "python": "0.0"
+  },
+  {
+   "template": "{{ 'nan' | float }}",
+   "python": "nan"
+  },
+  {
+   "template": "{{ 'inf' | float }}",
+   "python": "inf"
+  },
+  {
+   "template": "{{ '-inf' | float }}",
+   "python": "-inf"
+  },
+  {
+   "template": "{{ ['nan' | float] }}",
+   "python": "[nan]"
+  },
+  {
+   "template": "{{ 'p' ~ ('nan' | float) }}",
+   "python": "pnan"
+  },
+  {
+   "template": "{{ 2.7 | int }}",
+   "python": "2"
+  },
+  {
+   "template": "{{ '12' | int + 1 }}",
+   "python": "13"
+  },
+  {
+   "template": "{{ 'abc' | int }}",
+   "python": "0"
+  },
+  {
+   "template": "{{ true | int }}",
+   "python": "1"
+  },
+  {
+   "template": "{{ 1e16 | int }}",
+   "python": "10000000000000000"
+  },
+  {
+   "template": "{{ 2.5 | round }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{{ 3.5 | round }}",
+   "python": "4.0"
+  },
+  {
+   "template": "{{ 2.567 | round(2) }}",
+   "python": "2.57"
+  },
+  {
+   "template": "{{ 3 | round }}",
+   "python": "3"
+  },
+  {
+   "template": "{{ 2.5 | round(0, 'floor') }}",
+   "python": "2.0"
+  },
+  {
+   "template": "{{ -0.0 | abs }}",
+   "python": "0.0"
+  },
+  {
+   "template": "{{ -3 | abs }}",
+   "python": "3"
+  },
+  {
+   "template": "{{ [0.1, 0.2] | sum }}",
+   "python": "0.30000000000000004"
+  },
+  {
+   "template": "{{ [1, 2] | sum }}",
+   "python": "3"
+  },
+  {
+   "template": "{{ [1, 2.5] | max }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{{ true | upper }}",
+   "python": "TRUE"
+  },
+  {
+   "template": "{{ none | upper }}",
+   "python": "NONE"
+  },
+  {
+   "template": "{{ 5 | trim }}",
+   "python": "5"
+  },
+  {
+   "template": "{{ 2.5 | trim }}",
+   "python": "2.5"
+  },
+  {
+   "template": "{{ [1] | trim }}",
+   "python": "[1]"
+  },
+  {
+   "template": "{{ true | lower }}",
+   "python": "true"
+  },
+  {
+   "template": "{{ none | capitalize }}",
+   "python": "None"
+  },
+  {
+   "template": "{{ true | replace('T', 'X') }}",
+   "python": "Xrue"
+  },
+  {
+   "template": "{{ 1e-7 | replace('e', 'E') }}",
+   "python": "1E-07"
+  },
+  {
+   "template": "{{ none | length }}",
+   "python_error": "TypeError: object of type 'NoneType' has no len()"
+  },
+  {
+   "template": "{{ 'abc' | length }}",
+   "python": "3"
+  },
+  {
+   "template": "{{ true | center(8) }}",
+   "python": "  True  "
+  },
+  {
+   "template": "{{ none | wordcount }}",
+   "python": "1"
+  },
+  {
+   "template": "{{ true | indent(2) }}",
+   "python_error": "TypeError: unsupported operand type(s) for +=: 'bool' and 'str'"
+  },
+  {
+   "template": "{{ undefined_name | default('d') }}",
+   "python": "d"
+  },
+  {
+   "template": "{{ none | default('d') }}",
+   "python": "None"
+  },
+  {
+   "template": "{{ none | default('d', true) }}",
+   "python": "d"
+  },
+  {
+   "template": "{{ false | default('d', true) }}",
+   "python": "d"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.n | default('d') }}",
+   "python": "None"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.missing | default(none) }}",
+   "python": "None"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.missing }}",
+   "python": ""
+  },
+  {
+   "template": "{% set v = tools %}{{ v.missing | string }}",
+   "python": ""
+  },
+  {
+   "template": "{% set v = tools %}{{ 'p' ~ v.missing }}",
+   "python": "p"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.missing] | join(',') }}",
+   "python": ""
+  },
+  {
+   "template": "{{ [1, 2, 3][1:] }}",
+   "python": "[2, 3]"
+  },
+  {
+   "template": "{{ 'abc'[1:] }}",
+   "python": "bc"
+  },
+  {
+   "template": "{{ [1, 2, 3][::-1] }}",
+   "python": "[3, 2, 1]"
+  },
+  {
+   "template": "{{ 'ab' | list }}",
+   "python": "['a', 'b']"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.obj | list }}",
+   "python": "['b', 'a', 'z']"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.obj | first }}",
+   "python": "b"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.args.filters | items | list }}",
+   "python": "[('min', 1.0), ('tags', ['a', 'b'])]"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.obj | dictsort }}",
+   "python": "[('a', \"it's\"), ('b', {'c': [1, 'x', True, None, 2.5]}), ('z', {})]"
+  },
+  {
+   "template": "{{ {'b': 1, 'a': 2} | dictsort }}",
+   "python": "[('a', 2), ('b', 1)]"
+  },
+  {
+   "template": "{{ [3, 1, 2] | sort }}",
+   "python": "[1, 2, 3]"
+  },
+  {
+   "template": "{{ [1, 1, 2] | unique | list }}",
+   "python": "[1, 2]"
+  },
+  {
+   "template": "{{ [3, 1, 2] | reverse | list }}",
+   "python": "[2, 1, 3]"
+  },
+  {
+   "template": "{{ ['a', 'b'] | map('upper') | list }}",
+   "python": "['A', 'B']"
+  },
+  {
+   "template": "{{ [1, 2, 3] | batch(2) | list }}",
+   "python": "[[1, 2], [3]]"
+  },
+  {
+   "template": "{{ range(3) | list }}",
+   "python": "[0, 1, 2]"
+  },
+  {
+   "template": "{{ (1, 2) }}",
+   "python": "(1, 2)"
+  },
+  {
+   "template": "{{ (1,) }}",
+   "python": "(1,)"
+  },
+  {
+   "template": "{{ ('a', none) | join('-') }}",
+   "python": "a-None"
+  },
+  {
+   "template": "{{ {1: 'a', 2.5: none} }}",
+   "python": "{1: 'a', 2.5: None}"
+  },
+  {
+   "template": "{{ 'a,b'.split(',') }}",
+   "python": "['a', 'b']"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.s, v.dq, v.both] }}",
+   "python": "[\"it's\", 'say \"hi\"', 'both \\' and \"']"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.nonprinting] }}",
+   "python": "['\\x00\\x01\\x02\\x03\\x04\\x05\\x06\\x07\\x08\\t\\n\\x0b\\x0c\\r\\x0e\\x0f\\x10\\x11\\x12\\x13\\x14\\x15\\x16\\x17\\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f  !\\x7f~\\x80\\x81\\x82\\x83\\x84\\x85\\x86\\x87\\x88\\x89\\x8a\\x8b\\x8c\\x8d\\x8e\\x8f\\x90\\x91\\x92\\x93\\x94\\x95\\x96\\x97\\x98\\x99\\x9a\\x9b\\x9c\\x9d\\x9e\\x9f\\xa0¡\\xad¬®\\u0600\\u0601\\u0602\\u0603\\u0604\\u0605؆\\u061c؛؝\\u06ddۜ۞\\u070fܐ\\u0890࢏\\u0891\\u08e2ࣣ࣡\\u1680ᙿᚁ\\u180e᠍᠏\\u2000\\u2001\\u2002\\u2003\\u2004\\u2005\\u2006\\u2007\\u2008\\u2009\\u200a\\u200b\\u200c\\u200d\\u200e\\u200f‐\\u2028‧\\u2029\\u202a\\u202b\\u202c\\u202d\\u202e\\u202f‰\\u205f⁞\\u2060\\u2061\\u2062\\u2063\\u2064\\u2066\\u2067\\u2068\\u2069\\u206a\\u206b\\u206c\\u206d\\u206e\\u206f⁰\\u3000⿿、\\ue000\\uf8ff豈\\ufeff\\ufff9\\ufffa\\ufffb￼\\U000110bd𑂼𑂾\\U000110cd\\U00013430𓐯\\U00013431\\U00013432\\U00013433\\U00013434\\U00013435\\U00013436\\U00013437\\U00013438\\U00013439\\U0001343a\\U0001343b\\U0001343c\\U0001343d\\U0001343e\\U0001343f𓑀\\U0001bca0𛲟\\U0001bca1\\U0001bca2\\U0001bca3\\U0001d173𝅲\\U0001d174\\U0001d175\\U0001d176\\U0001d177\\U0001d178\\U0001d179\\U0001d17a𝅻\\U000e0001\\U000e0020\\U000e0021\\U000e0022\\U000e0023\\U000e0024\\U000e0025\\U000e0026\\U000e0027\\U000e0028\\U000e0029\\U000e002a\\U000e002b\\U000e002c\\U000e002d\\U000e002e\\U000e002f\\U000e0030\\U000e0031\\U000e0032\\U000e0033\\U000e0034\\U000e0035\\U000e0036\\U000e0037\\U000e0038\\U000e0039\\U000e003a\\U000e003b\\U000e003c\\U000e003d\\U000e003e\\U000e003f\\U000e0040\\U000e0041\\U000e0042\\U000e0043\\U000e0044\\U000e0045\\U000e0046\\U000e0047\\U000e0048\\U000e0049\\U000e004a\\U000e004b\\U000e004c\\U000e004d\\U000e004e\\U000e004f\\U000e0050\\U000e0051\\U000e0052\\U000e0053\\U000e0054\\U000e0055\\U000e0056\\U000e0057\\U000e0058\\U000e0059\\U000e005a\\U000e005b\\U000e005c\\U000e005d\\U000e005e\\U000e005f\\U000e0060\\U000e0061\\U000e0062\\U000e0063\\U000e0064\\U000e0065\\U000e0066\\U000e0067\\U000e0068\\U000e0069\\U000e006a\\U000e006b\\U000e006c\\U000e006d\\U000e006e\\U000e006f\\U000e0070\\U000e0071\\U000e0072\\U000e0073\\U000e0074\\U000e0075\\U000e0076\\U000e0077\\U000e0078\\U000e0079\\U000e007a\\U000e007b\\U000e007c\\U000e007d\\U000e007e\\U000e007f\\U000f0000\\U000ffffd\\U00100000\\U0010fffd']"
+  },
+  {
+   "template": "{% set v = tools %}{{ [v.unassigned] }}",
+   "python": "['\\u0378']"
+  },
+  {
+   "template": "{% set v = tools %}{{ {v.s: v.dq} }}",
+   "python": "{\"it's\": 'say \"hi\"'}"
+  },
+  {
+   "template": "{{ [1, 2] | join }}",
+   "python": "12"
+  },
+  {
+   "template": "{{ [true, none, 2.5] | join(',') }}",
+   "python": "True,None,2.5"
+  },
+  {
+   "template": "{{ [1.0, 1e-7, 1e16] | join(' ') }}",
+   "python": "1.0 1e-07 1e+16"
+  },
+  {
+   "template": "{{ [[1, 'a'], {'b': true}] | join(';') }}",
+   "python": "[1, 'a'];{'b': True}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.list | join('|') }}",
+   "python": "True|None|1e-07|q\"uote|2.0|[1, 'x']"
+  },
+  {
+   "template": "{{ 'abc' | join('-') }}",
+   "python": "a-b-c"
+  },
+  {
+   "template": "{{ '%s %s' | format(true, none) }}",
+   "python": "True None"
+  },
+  {
+   "template": "{{ '{} {}'.format(true, none) }}",
+   "python": "True None"
+  },
+  {
+   "template": "{{ '%d' | format(true) }}",
+   "python": "1"
+  },
+  {
+   "template": "{{ '%.2f' | format(1) }}",
+   "python": "1.00"
+  },
+  {
+   "template": "{{ '%s' | format(0.0) }}",
+   "python": "0.0"
+  },
+  {
+   "template": "{{ '{}'.format(0.0) }}",
+   "python": "0.0"
+  },
+  {
+   "template": "{{ '%s|%s' | format(1e-7, 1e16) }}",
+   "python": "1e-07|1e+16"
+  },
+  {
+   "template": "{{ '{}|{}'.format(1e-7, 1e16) }}",
+   "python": "1e-07|1e+16"
+  },
+  {
+   "template": "{{ '%s' | format([1, 'a']) }}",
+   "python": "[1, 'a']"
+  },
+  {
+   "template": "{{ '{}'.format({'a': none}) }}",
+   "python": "{'a': None}"
+  },
+  {
+   "template": "{{ '%r' | format('x') }}",
+   "python": "'x'"
+  },
+  {
+   "template": "{{ '{!r}'.format('x') }}",
+   "python": "'x'"
+  },
+  {
+   "template": "{{ '{!s}'.format(none) }}",
+   "python": "None"
+  },
+  {
+   "template": "{{ '{:>6}'.format(true) }}",
+   "python": "     1"
+  },
+  {
+   "template": "{{ '{:.3}'.format(1e-7) }}",
+   "python": "1e-07"
+  },
+  {
+   "template": "{{ '{:>12}'.format(1e-7) }}",
+   "python": "       1e-07"
+  },
+  {
+   "template": "{{ '{:>20}'.format(0.1 + 0.2) }}",
+   "python": " 0.30000000000000004"
+  },
+  {
+   "template": "{{ '%5s' | format(true) }}",
+   "python": " True"
+  },
+  {
+   "template": "{{ '%-8s|' | format(none) }}",
+   "python": "None    |"
+  },
+  {
+   "template": "{{ '{0}-{0}'.format(2.0) }}",
+   "python": "2.0-2.0"
+  },
+  {
+   "template": "{{ '{a}'.format(a=none) }}",
+   "python": "None"
+  },
+  {
+   "template": "{{ '{a}'.format(a=[true]) }}",
+   "python": "[True]"
+  },
+  {
+   "template": "{{ '%(a)s' | format(a=none) }}",
+   "python": "None"
+  },
+  {
+   "template": "{% for x in [true, none] %}{{ loop.index }}:{{ x }};{% endfor %}",
+   "python": "1:True;2:None;"
+  },
+  {
+   "template": "{% set v = tools %}{% for k, val in v.args | items %}{{ k }}={{ val | string }};{% endfor %}",
+   "python": "city=Paris;unit=None;days=3;precise=True;ratio=0.5;tiny=1e-07;huge=1e+16;filters={'min': 1.0, 'tags': ['a', 'b']};"
+  },
+  {
+   "template": "{% set v = tools %}{% for k, val in v.args.items() %}{{ k }}={{ val }};{% endfor %}",
+   "python": "city=Paris;unit=None;days=3;precise=True;ratio=0.5;tiny=1e-07;huge=1e+16;filters={'min': 1.0, 'tags': ['a', 'b']};"
+  },
+  {
+   "template": "{% for x in [1, 2, 3] %}{% if x == 2 %}{% break %}{% endif %}{{ x }}{% endfor %}",
+   "python": "1"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'args: ' ~ v.args }}",
+   "python": "args: {'city': 'Paris', 'unit': None, 'days': 3, 'precise': True, 'ratio': 0.5, 'tiny': 1e-07, 'huge': 1e+16, 'filters': {'min': 1.0, 'tags': ['a', 'b']}}"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.obj | tojson(indent=2) }}",
+   "python": "{\n  \"b\": {\n    \"c\": [\n      1,\n      \"x\",\n      true,\n      null,\n      2.5\n    ]\n  },\n  \"a\": \"it's\",\n  \"z\": {}\n}"
+  },
+  {
+   "template": "{{ '{a.b}'.format(a={'b': true}) }}",
+   "python": "True"
+  },
+  {
+   "template": "{{ '{0.b}'.format({'b': 1}) }}",
+   "python": "1"
+  },
+  {
+   "template": "{{ '{0[k]}'.format({'k': none}) }}",
+   "python": "None"
+  },
+  {
+   "template": "{{ '{a[0]}'.format(a=[2.5e-7]) }}",
+   "python": "2.5e-07"
+  },
+  {
+   "template": "{{ '{0.b}-{1}'.format({'b': 1e16}, none) }}",
+   "python": "1e+16-None"
+  },
+  {
+   "template": "{% set v = tools %}{{ '{0[1]}'.format(v.list) }}",
+   "python": "None"
+  },
+  {
+   "template": "{{ 1125899906842624.25 }}",
+   "python": "1125899906842624.2"
+  },
+  {
+   "template": "{{ [1324350514534.90625, 73637923426838.62] }}",
+   "python": "[1324350514534.9062, 73637923426838.62]"
+  },
+  {
+   "template": "{{ 1125899906842624.25 | tojson }}",
+   "python": "1125899906842624.2"
+  },
+  {
+   "template": "{% for x in [1, 2, 3] %}{% if x == 2 %}{% continue %}{% endif %}{{ x }}{% endfor %}",
+   "python": "13"
+  },
+  {
+   "template": "{% for x in range(5) %}{% if x > 2 %}{% break %}{% endif %}{{ loop.index }}{% endfor %}",
+   "python": "123"
+  },
+  {
+   "template": "{% for a in [1, 2] %}{% for b in [1, 2, 3] %}{% if b == 2 %}{% break %}{% endif %}{{ a }}{{ b }};{% endfor %}{% endfor %}",
+   "python": "11;21;"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype | upper }}",
+   "python": "['STRING', 'NULL']"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype | lower }}",
+   "python": "['string', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype | capitalize }}",
+   "python": "['string', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype | title }}",
+   "python": "['string', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype | trim }}",
+   "python": "['string', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype | replace('string', 'str') }}",
+   "python": "['str', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype | trim('[]') }}",
+   "python": "'string', 'null'"
+  },
+  {
+   "template": "{{ '\\x1c x \\x1f' | trim }}",
+   "python": "x"
+  },
+  {
+   "template": "{% set v = tools %}{{ (v.spaces ~ 'x y' ~ v.spaces) | trim | length }}",
+   "python": "3"
+  },
+  {
+   "template": "{{ ('\\u200b x \\u180e') | trim | length }}",
+   "python": "5"
+  },
+  {
+   "template": "{{ \"it's o'neil's\" | title }}",
+   "python": "It's O'neil's"
+  },
+  {
+   "template": "{{ 'well-known co-op' | title }}",
+   "python": "Well-Known Co-Op"
+  },
+  {
+   "template": "{{ '3rd 1st x2y 42abc' | title }}",
+   "python": "3rd 1st X2y 42abc"
+  },
+  {
+   "template": "{{ 'a\\tb\\nc\\u3000d\\x1ce' | title }}",
+   "python": "A\tB\nC　D\u001cE"
+  },
+  {
+   "template": "{{ 'e.g. mr.smith a.b.c' | title }}",
+   "python": "E.g. Mr.smith A.b.c"
+  },
+  {
+   "template": "{{ 'ΟΔΟΣ ΣΑΣ' | title }}",
+   "python": "Οδος Σας"
+  },
+  {
+   "template": "{{ 'straße ǆungla' | title }}",
+   "python": "Straße Ǆungla"
+  },
+  {
+   "template": "{{ 'ß' | capitalize }}",
+   "python": "Ss"
+  },
+  {
+   "template": "{{ 'ǆ' | capitalize }}",
+   "python": "ǅ"
+  },
+  {
+   "template": "{{ 'aΣ.' | capitalize }}",
+   "python": "Aς."
+  },
+  {
+   "template": "{{ 'ΟΔΟΣ' | capitalize }}",
+   "python": "Οδος"
+  },
+  {
+   "template": "{{ 'İx' | capitalize }}",
+   "python": "İx"
+  },
+  {
+   "template": "{{ \"it's a-b (c) [d] <e> {f} x_y o'neil\tTAB\" | title }}",
+   "python": "It's A-B (C) [D] <E> {F} X_y O'neil\tTab"
+  },
+  {
+   "template": "{{ 'ÉCOLE straße' | title }}",
+   "python": "École Straße"
+  },
+  {
+   "template": "{{ 1e-7 | upper }}",
+   "python": "1E-07"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.tiny | title }}",
+   "python": "1e-07"
+  },
+  {
+   "template": "{{ {'a': true} | capitalize }}",
+   "python": "{'a': true}"
+  },
+  {
+   "template": "{{ none | lower }}",
+   "python": "none"
+  },
+  {
+   "template": "{{ [none] | trim }}",
+   "python": "[None]"
+  },
+  {
+   "template": "{{ 'aTrue' | replace(true, 'x') }}",
+   "python": "ax"
+  },
+  {
+   "template": "{{ 'a1.0' | replace(1.0, 2) }}",
+   "python": "a2"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.args | replace('None', 'null') }}",
+   "python": "{'city': 'Paris', 'unit': null, 'days': 3, 'precise': True, 'ratio': 0.5, 'tiny': 1e-07, 'huge': 1e+16, 'filters': {'min': 1.0, 'tags': ['a', 'b']}}"
+  },
+  {
+   "template": "{% set v = tools %}{% for k, p in v.args.items() %}{{ k }}:{{ p | upper }};{% endfor %}",
+   "python": "city:PARIS;unit:NONE;days:3;precise:TRUE;ratio:0.5;tiny:1E-07;huge:1E+16;filters:{'MIN': 1.0, 'TAGS': ['A', 'B']};"
+  },
+  {
+   "template": "{{ '%s %d' | format([1, 'a'], 1) }}",
+   "python": "[1, 'a'] 1"
+  },
+  {
+   "template": "{{ '%.3s' | format(true) }}",
+   "python": "Tru"
+  },
+  {
+   "template": "{{ '%5s|%-6s|%.2s' | format(none, [1], 'abc') }}",
+   "python": " None|[1]   |ab"
+  },
+  {
+   "template": "{{ '%s and %d and %.1f' | format({'k': 1e-7}, 3, 2.25) }}",
+   "python": "{'k': 1e-07} and 3 and 2.2"
+  },
+  {
+   "template": "{{ '{:>8}'.format(none) }}",
+   "python_error": "TypeError: unsupported format string passed to NoneType.__format__"
+  },
+  {
+   "template": "{{ '{:5}'.format(true) }}",
+   "python": "    1"
+  },
+  {
+   "template": "{{ '%s' | format(1, 2) }}",
+   "python_error": "TypeError: not all arguments converted during string formatting (required 1, got 2)"
+  },
+  {
+   "template": "{{ '%s %s' | format(1) }}",
+   "python_error": "TypeError: not enough arguments for format string (got 1)"
+  },
+  {
+   "template": "{{ '{} {}'.format(1) }}",
+   "python_error": "IndexError: tuple index out of range"
+  },
+  {
+   "template": "{{ '{}'.format(1, 2) }}",
+   "python": "1"
+  },
+  {
+   "template": "{{ '{0}/{0}'.format([1.5e-7]) }}",
+   "python": "[1.5e-07]/[1.5e-07]"
+  },
+  {
+   "template": "{% for x in [1, 2] %}{% if x == 1 %}{% set y = 'one' %}{% endif %}{{ y }};{% endfor %}",
+   "python": "one;;"
+  },
+  {
+   "template": "{% for k, val in {'items': 1, 'b': 2}.items() %}{{ k }}={{ val }};{% endfor %}",
+   "python": "items=1;b=2;"
+  },
+  {
+   "template": "{% set v = tools %}{% for k, val in v.schema.items() %}{{ k }};{% endfor %}",
+   "python": "type;items;keys;get;"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.schema.get('type') }}|{{ v.schema.keys() | list }}",
+   "python": "array|['type', 'items', 'keys', 'get']"
+  },
+  {
+   "template": "{{ {'get': 1}.get('get') }}",
+   "python": "1"
+  },
+  {
+   "template": "{{ {'a': 1} | tojson(indent=2 if true else none) }}",
+   "python": "{\n  \"a\": 1\n}"
+  },
+  {
+   "template": "{{ 'a b'.split() }}",
+   "python": "['a', 'b']"
+  },
+  {
+   "template": "{{ 'a,b'.split(',') | length }}",
+   "python": "2"
+  },
+  {
+   "template": "{{ ('a b c'.split())[1:] }}",
+   "python": "['b', 'c']"
+  },
+  {
+   "template": "{{ ['a', 'b', 'c'][::-1] }}",
+   "python": "['c', 'b', 'a']"
+  },
+  {
+   "template": "{{ (['a', 1e-7] + [none])[1:] }}",
+   "python": "[1e-07, None]"
+  },
+  {
+   "template": "{{ range(3) }}",
+   "python": "range(0, 3)"
+  },
+  {
+   "template": "{{ ('ab' * 3) }}",
+   "python": "ababab"
+  },
+  {
+   "template": "{{ ('x' * 100000000) | length }}",
+   "python": "100000000"
+  },
+  {
+   "template": "{{ ('x' * 100000001) | length }}",
+   "python": "100000001"
+  },
+  {
+   "template": "{{ ('nan' | float) == ('nan' | float) }}",
+   "python": "False"
+  },
+  {
+   "template": "{{ ('nan' | float) < 1 }}",
+   "python": "False"
+  },
+  {
+   "template": "{{ 1 < ('nan' | float) }}",
+   "python": "False"
+  },
+  {
+   "template": "{% set v = tools %}{{ none is iterable }}|{{ v.n is iterable }}|{{ undefined_name is iterable }}",
+   "python": "False|False|True"
+  },
+  {
+   "template": "{% set v = tools %}{{ 'ab' is iterable }}|{{ 1 is iterable }}|{{ true is iterable }}|{{ v.args is iterable }}",
+   "python": "True|False|False|True"
+  },
+  {
+   "template": "{% set v = tools %}{% if v.n is iterable and v.n | length > 0 %}x{% else %}y{% endif %}",
+   "python": "y"
+  },
+  {
+   "template": "{% set v = tools %}{{ none is sequence }}|{{ 'a' is sequence }}|{{ v.args is sequence }}|{{ v.list is sequence }}",
+   "python": "False|True|True|True"
+  },
+  {
+   "template": "{% set v = tools %}{{ none is mapping }}|{{ v.args is mapping }}|{{ v.list is mapping }}",
+   "python": "False|True|False"
+  },
+  {
+   "template": "{% set v = tools %}{{ (v.list | reverse) is sequence }}|{{ (v.list | map('string')) is sequence }}",
+   "python": "False|False"
+  },
+  {
+   "template": "{% set v = tools %}{{ (v.list | reverse | list) is sequence }}|{{ (v.list | map('string') | list) is sequence }}",
+   "python": "True|True"
+  },
+  {
+   "template": "{{ undefined_name is sequence }}|{{ ('a b'.split())[1:] is sequence }}|{{ range(2) is iterable }}",
+   "python": "True|True|True"
+  },
+  {
+   "template": "{% set v = tools %}{{ (v.ptype | list) ~ '' }}",
+   "python": "['string', 'null']"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.ptype[0:1] ~ '' }}",
+   "python": "['string']"
+  },
+  {
+   "template": "{% set v = tools %}{{ (v.ptype + ['x']) ~ '' }}",
+   "python": "['string', 'null', 'x']"
+  },
+  {
+   "template": "{{ dict(a=none) ~ '' }}",
+   "python": "{'a': None}"
+  },
+  {
+   "template": "{{ '%s' | format(a=0) }}",
+   "python": "{'a': 0}"
+  },
+  {
+   "template": "{{ '%s' | format(1, a=none) }}",
+   "python_error": "FilterArgumentError: can't handle positional and keyword arguments at the same time"
+  },
+  {
+   "template": "{{ 'x' | format(a=0) }}",
+   "python": "x"
+  },
+  {
+   "template": "{{ '%s %s' | format(a=0) }}",
+   "python_error": "TypeError: not enough arguments for format string (got 1)"
+  },
+  {
+   "template": "{{ '{:,}'.format(false) }}",
+   "python": "0"
+  },
+  {
+   "template": "{{ '{:.3}'.format(5) }}",
+   "python_error": "ValueError: Precision not allowed in integer format specifier"
+  },
+  {
+   "template": "{% set x = 1 %}{% generation %}{% set x = 2 %}in={{ x }}{% endgeneration %} out={{ x }}",
+   "python": "in=2 out=1"
+  },
+  {
+   "template": "{% set ns = namespace(x=[]) %}{% for i in range(200) %}{% set ns.x = [ns.x] %}{% endfor %}{{ ns.x | string | length }}",
+   "python": "402"
+  },
+  {
+   "template": "{{ 'a' + 1 }}",
+   "python_error": "TypeError: can only concatenate str (not \"int\") to str"
+  },
+  {
+   "template": "{{ 1 / 0 }}",
+   "python_error": "ZeroDivisionError: division by zero"
+  },
+  {
+   "template": "{% set v = tools %}{{ v.missing.x }}",
+   "python_error": "UndefinedError: 'dict object' has no attribute 'missing'"
+  }
+ ],
+ "renders": [
+  {
+   "template": "qwen35_chat_template.jinja",
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": {
+         "city": "Paris",
+         "unit": null,
+         "precise": true,
+         "late": false,
+         "days": 3,
+         "ratio": 0.5,
+         "tiny": 1e-07,
+         "huge": 1e+16,
+         "tie": 1125899906842624.2,
+         "two": 2.0,
+         "tags": [
+          "a",
+          "it's"
+         ],
+         "filters": {
+          "min": 1.0,
+          "on": null
+         }
+        }
+       },
+       "id": "call00001"
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "content": "sunny",
+     "tool_call_id": "call00001",
+     "name": "get_weather"
+    },
+    {
+     "role": "user",
+     "content": "Thanks"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Weather",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        },
+        "unit": {
+         "type": [
+          "string",
+          "null"
+         ],
+         "default": null
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "python": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"type\": [\"string\", \"null\"], \"default\": null}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=unit>\nNone\n</parameter>\n<parameter=precise>\nTrue\n</parameter>\n<parameter=late>\nFalse\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=ratio>\n0.5\n</parameter>\n<parameter=tiny>\n1e-07\n</parameter>\n<parameter=huge>\n1e+16\n</parameter>\n<parameter=tie>\n1125899906842624.2\n</parameter>\n<parameter=two>\n2.0\n</parameter>\n<parameter=tags>\n[\"a\", \"it's\"]\n</parameter>\n<parameter=filters>\n{\"min\": 1.0, \"on\": null}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response><|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ ]
+}

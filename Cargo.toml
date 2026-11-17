@@ -7,7 +7,6 @@ members = [
     "crates/infr-metal",
     "crates/infr-hub",
     "crates/infr-gguf",
-    "crates/infr-safetensors",
     "crates/infr-cpu",
     "crates/infr-chat",
     "crates/infr-engine",
@@ -17,38 +16,34 @@ members = [
     "crates/infr-prof",
     "crates/infr-prof-rt",
     "crates/infr-testkit",
-    "crates/spv-hoard",
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/kryptic-sh/infr"
 
 [workspace.dependencies]
 # internal
-infr-core = { path = "crates/infr-core", version = "0.2.0" }
+infr-core = { path = "crates/infr-core", version = "0.3.0" }
 # The platform seam: every `cfg(unix)` / `cfg(windows)` / `cfg(target_os)` arm in
 # the workspace lives here, so the OS-specific surface is one reviewable crate.
 # A LEAF — it must not depend on any other infr crate (see docs/infr-plat.md).
-infr-plat = { path = "crates/infr-plat", version = "0.2.0" }
-infr-vulkan = { path = "crates/infr-vulkan", version = "0.2.0" }
-infr-metal = { path = "crates/infr-metal", version = "0.2.0" }
-infr-hub = { path = "crates/infr-hub", version = "0.2.0" }
-infr-gguf = { path = "crates/infr-gguf", version = "0.2.0" }
-infr-safetensors = { path = "crates/infr-safetensors", version = "0.2.0" }
-infr-cpu = { path = "crates/infr-cpu", version = "0.2.0" }
-infr-chat = { path = "crates/infr-chat", version = "0.2.0" }
-infr-engine = { path = "crates/infr-engine", version = "0.2.0" }
-infr-server = { path = "crates/infr-server", version = "0.2.0" }
-infr-llama = { path = "crates/infr-llama", version = "0.2.0" }
-infr-prof = { path = "crates/infr-prof", version = "0.2.0" }
-infr-prof-rt = { path = "crates/infr-prof-rt", version = "0.2.0" }
+infr-plat = { path = "crates/infr-plat", version = "0.3.0" }
+infr-vulkan = { path = "crates/infr-vulkan", version = "0.3.0" }
+infr-metal = { path = "crates/infr-metal", version = "0.3.0" }
+infr-hub = { path = "crates/infr-hub", version = "0.3.0" }
+infr-gguf = { path = "crates/infr-gguf", version = "0.3.0" }
+infr-cpu = { path = "crates/infr-cpu", version = "0.3.0" }
+infr-chat = { path = "crates/infr-chat", version = "0.3.0" }
+infr-engine = { path = "crates/infr-engine", version = "0.3.0" }
+infr-server = { path = "crates/infr-server", version = "0.3.0" }
+infr-llama = { path = "crates/infr-llama", version = "0.3.0" }
+infr-prof = { path = "crates/infr-prof", version = "0.3.0" }
+infr-prof-rt = { path = "crates/infr-prof-rt", version = "0.3.0" }
 # Test-support only — a `[dev-dependencies]` entry in the backends, never a production dep.
 infr-testkit = { path = "crates/infr-testkit" }
-# Build-script helper: caches glslc output by content so a shader edit only recompiles what changed.
-spv-hoard = { path = "crates/spv-hoard", version = "0.2.0" }
 
 # shared third-party
 thiserror = "2"
@@ -59,19 +54,16 @@ serde = { version = "1", features = ["derive"] }
 # preserve_order: chat templates `tojson` the request's tool definitions into the prompt — HF
 # transformers and llama.cpp-minja both keep the author's key order, so infr must too (BTreeMap
 # would alphabetize the JSON the model sees).
-serde_json = { version = "1", features = ["preserve_order"] }
+# float_roundtrip: a float in a request (a replayed tool call's argument) reaches the chat template
+# as the exact value the client sent; the default parser can land one ulp off, and the prompt then
+# prints different digits (`1e-25` came out `9.999999999999999e-26`).
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 # The config-file layer (`infr_core::config::file`). Parsed as a `toml::Value` tree rather than a
 # serde-derived struct, because an unknown key must WARN and be skipped (docs/config-plan.md §11
 # [DECIDE-5]) and `deny_unknown_fields` can only fail.
 toml = "0.8"
 memmap2 = "0.9"
 rayon = "1"
-# Gemma 4 vision (`infr_llama::vision`): the CPU image encoder's f32 GEMMs, and decoding the
-# images `infr serve` receives as OpenAI `image_url` data URIs. `image` is trimmed to the formats a
-# chat client actually sends.
-gemm = "0.19"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
-base64 = "0.22"
 # SIGINT/SIGTERM via `sigaction` in the CLI (see `infr_core::shutdown`). Already in the lockfile
 # under tokio and indicatif/console — a direct dep here costs nothing new.
 libc = "0.2"
@@ -95,7 +87,9 @@ clap_mangen = "0.3"
 # fuel: the chat template is attacker-supplied (it ships inside the DOWNLOADED model's GGUF), so
 # `infr_chat::template` bounds every render with `Environment::set_fuel` — without this feature the
 # setter does not exist and a template with a nested loop renders forever. See CHAT_TEMPLATE_FUEL.
-minijinja = { version = "2", features = ["preserve_order", "fuel"] }
+# loop_controls: `{% break %}` / `{% continue %}`, which Hugging Face's chat-template environment
+# loads (`jinja2.ext.loopcontrols`) and real templates use (Kimi-K3, Cohere's command-r7b).
+minijinja = { version = "2", features = ["preserve_order", "fuel", "loop_controls"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 # `strftime_now` in HF chat templates (Llama-3.x stamps "Today Date:") — llama.cpp-minja parity.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

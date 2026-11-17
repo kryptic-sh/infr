@@ -3,10 +3,13 @@
 //! run the backend-agnostic compute Graph on the CPU reference backend (no GPU); the GPU goldens run
 //! the production Vulkan path. Both are captured with `INFR_BLESS=1` and read for coherence.
 //!
-//! These are NOT `#[ignore]`d — each self-skips at runtime when its GGUF isn't in the HF cache (and
-//! the GPU goldens additionally skip when no Vulkan device is present), so they RUN automatically
-//! wherever the models + hardware exist, and quietly no-op elsewhere:
-//!   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend -- --nocapture
+//! A test whose model the `cpu-goldens` CI job downloads runs by default and self-skips (printing a
+//! `skip:` line, via `need_model!`) where that GGUF is absent. Every other model-gated test is
+//! `#[ignore = "needs <model> …"]`: no CI job has its model, so running it by default would only
+//! ever count an early `return` as a pass. Run those with `--include-ignored` where the models are
+//! cached — each still self-skips if its own GGUF is missing:
+//!   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend -- \
+//!     --include-ignored --nocapture
 
 use infr_core::WeightSource;
 use std::path::PathBuf;
@@ -27,6 +30,101 @@ macro_rules! need_model {
                 eprintln!("skip: {} not in the HF cache", $what);
                 return;
             }
+        }
+    };
+}
+
+/// Host memory a model resident on a unified-memory device must still leave free. The gate runs
+/// on a box other sessions share, and a gate run on the integrated GPU that took the host down to
+/// its last few GB was killed for low memory and took other sessions' runs with it, so the floor
+/// is the headroom those sessions are owed, not what this run needs to finish.
+const UNIFIED_HOST_MARGIN: u64 = 12 << 30;
+
+/// Host bytes a resident load takes on a unified-memory device per byte of GGUF: the device copy,
+/// which is system RAM there, plus the mapped file pages the upload read through, which stay in the
+/// process's working set while the model is up. Measured on Windows on 2026-11-15 with the
+/// integrated GPU, each test run alone: Qwen3-30B-A3B Q4_K_M's 18.56 GB file took available memory
+/// from 38058 MiB to 3596 MiB (1.95 bytes per file byte), and ERNIE-4.5-21B-A3B Q4_K_M's 13.33 GB
+/// file from 35444 MiB to 11135 MiB (1.91), rounded up here.
+const UNIFIED_RESIDENT_FACTOR: u64 = 2;
+
+/// Whether a test may load a `model_bytes` model, given whether the device's memory is the host's
+/// (`unified`) and the host memory `available` now. `Err` carries why not.
+///
+/// A discrete device always runs: its VRAM is its own pool and the host only maps the file. A
+/// unified device runs when the load, priced at [`UNIFIED_RESIDENT_FACTOR`] per file byte, leaves
+/// [`UNIFIED_HOST_MARGIN`] free, and skips when it would not — or when the platform cannot say how
+/// much is free, since that is no evidence it fits.
+fn resident_verdict(unified: bool, available: Option<u64>, model_bytes: u64) -> Result<(), String> {
+    if !unified {
+        return Ok(());
+    }
+    let gb = |b: u64| b as f64 / 1e9;
+    let need = model_bytes
+        .saturating_mul(UNIFIED_RESIDENT_FACTOR)
+        .saturating_add(UNIFIED_HOST_MARGIN);
+    match available {
+        None => Err(format!(
+            "({:.1} GB) on a unified-memory device: no host-memory probe on this platform, so \
+             nothing shows it fits",
+            gb(model_bytes)
+        )),
+        Some(avail) if avail < need => Err(format!(
+            "({:.1} GB) on a unified-memory device needs {:.1} GB of host memory \
+             ({UNIFIED_RESIDENT_FACTOR} x the model + a {:.1} GB margin); {:.1} GB available",
+            gb(model_bytes),
+            gb(need),
+            gb(UNIFIED_HOST_MARGIN),
+            gb(avail)
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The model at `path`'s size on disk, summed over every shard of a split GGUF (opening any one
+/// shard opens the whole set).
+fn model_file_bytes(path: &std::path::Path) -> u64 {
+    infr_gguf::Gguf::open(path)
+        .expect("open gguf")
+        .shards()
+        .iter()
+        .map(|&(_, len)| len)
+        .sum()
+}
+
+/// [`resident_verdict`] for a `model_bytes` model on `dev`, with the reason naming the device. The
+/// unified flag is the device listing's `integrated`, the same device-type test the Vulkan backend
+/// sets `Capabilities::unified_memory` from, so nothing is allocated before the decision.
+fn device_room(dev: &infr_vulkan::DeviceInfo, model_bytes: u64) -> Result<(), String> {
+    resident_verdict(
+        dev.integrated,
+        infr_core::hostmem::available_bytes(),
+        model_bytes,
+    )
+    .map_err(|why| format!("{why}, on Vulkan{} ({})", dev.index, dev.name))
+}
+
+/// [`device_room`] for the model at `path` on the device these tests load on (`INFR_DEV`, else the
+/// default pick). A device listing that fails decides nothing: the load reports that failure
+/// itself, as it did before this check.
+fn resident_room(path: &std::path::Path) -> Result<(), String> {
+    let cfg = env_cfg();
+    let Some(dev) = infr_vulkan::VulkanBackend::enumerate_devices(&cfg)
+        .ok()
+        .and_then(|devs| devs.into_iter().find(|d| d.is_default_pick))
+    else {
+        return Ok(());
+    };
+    device_room(&dev, model_file_bytes(path))
+}
+
+/// Self-skip a test that needs the model at `$path` loaded when [`resident_room`] says the device
+/// cannot hold it without starving the host, printing the reason as a `skip:` line.
+macro_rules! need_resident_room {
+    ($path:expr, $what:expr) => {
+        if let Err(why) = resident_room(&$path) {
+            eprintln!("skip: {} {why}", $what);
+            return;
         }
     };
 }
@@ -64,12 +162,22 @@ fn model_cfg(
     path: &std::path::Path,
     f: impl FnOnce(&mut infr_llama::EngineConfig),
 ) -> infr_llama::SeamModel {
-    let mut cfg = infr_llama::EngineConfig::default();
-    // The one environment knob these tests honour: WHICH GPU they run on, so a box with more than
-    // one (a dGPU beside an iGPU) can test either. Unset keeps the first-discrete default.
-    cfg.device.dev = std::env::var("INFR_DEV").ok();
+    let mut cfg = env_cfg();
     f(&mut cfg);
     infr_llama::SeamModel::load_with(path, None, std::sync::Arc::new(cfg)).expect("model load")
+}
+
+/// The shipped defaults plus the environment knobs these tests honour: WHICH GPU they run on
+/// (`INFR_DEV`), so a box with more than one (a dGPU beside an iGPU) can test either (unset keeps
+/// the first-discrete default); `INFR_FORCE_WAVE64`, so the wave64 path AMD GCN takes can be
+/// scored on an RDNA card; and `INFR_CPU_OP_HASH`, so a CPU golden that differs between two
+/// systems can be diffed op by op (`debug.cpu_op_hash`).
+fn env_cfg() -> infr_llama::EngineConfig {
+    let mut cfg = infr_llama::EngineConfig::default();
+    cfg.device.dev = std::env::var("INFR_DEV").ok();
+    cfg.debug.cpu_op_hash = std::env::var_os("INFR_CPU_OP_HASH").map(PathBuf::from);
+    infr_testkit::honour_env(&mut cfg);
+    cfg
 }
 
 /// [`model_cfg`] on the shipped defaults — greedy sampling (`SamplingCfg::default()`), f16 KV, no
@@ -84,6 +192,28 @@ fn kv_types(cfg: &mut infr_llama::EngineConfig, k: &str, v: &str) {
     cfg.kv.type_k_specified = true;
     cfg.kv.type_v = infr_core::budget::parse_kv_dtype(v);
     cfg.kv.type_v_specified = true;
+}
+
+/// The residency rule decides without a GPU: discrete always runs, unified runs only with room for
+/// the load and the margin, and an unknown amount of free memory never counts as room.
+#[test]
+fn resident_verdict_skips_only_what_starves_a_unified_host() {
+    let model: u64 = 16 << 30;
+    let need = model * UNIFIED_RESIDENT_FACTOR + UNIFIED_HOST_MARGIN;
+
+    // A discrete device runs whatever the host has, even nothing or an unknown amount.
+    assert!(resident_verdict(false, Some(0), model).is_ok());
+    assert!(resident_verdict(false, None, model).is_ok());
+    // A unified device runs exactly at the boundary and skips a byte short of it.
+    assert!(resident_verdict(true, Some(need), model).is_ok());
+    let why = resident_verdict(true, Some(need - 1), model).expect_err("a byte short must skip");
+    assert!(why.contains("available"), "reason names the memory: {why}");
+    // Room for the model alone, without the margin, is not room.
+    assert!(resident_verdict(true, Some(model * UNIFIED_RESIDENT_FACTOR), model).is_err());
+    // A model a quarter the size runs on what was a byte short for the larger one.
+    assert!(resident_verdict(true, Some(need - 1), model / 4).is_ok());
+    // No probe on a unified device is a skip, not a pass.
+    assert!(resident_verdict(true, None, model / 4).is_err());
 }
 
 // ─── CPU-only correctness (no GPU) ───────────────────────────────────────────────
@@ -126,9 +256,23 @@ fn cpu_gen(model: &infr_llama::SeamModel, prompt: &str, n: usize) -> String {
 
 /// Assert (or, with `INFR_BLESS=1`, print) the golden hash for each case.
 fn check_golden(model: &infr_llama::SeamModel, cases: &[(&str, usize, u64)]) {
+    check_golden_with(model, |p| model.render_chat(p).expect("render chat"), cases);
+}
+
+/// [`check_golden`] with the prompt turned into the model's input by `render` instead of
+/// [`infr_llama::SeamModel::render_chat`] — for a template whose default render is not stable
+/// from one day to the next.
+fn check_golden_with(
+    model: &infr_llama::SeamModel,
+    render: impl Fn(&str) -> String,
+    cases: &[(&str, usize, u64)],
+) {
     let bless = std::env::var("INFR_BLESS").is_ok();
     for (prompt, n, want) in cases {
-        let out = cpu_gen(model, prompt, *n);
+        let mut out = String::new();
+        model
+            .generate_cpu(&render(prompt), *n, None, |p| out.push_str(p))
+            .expect("cpu generate");
         let h = fnv1a(&out);
         if bless {
             // Print the text too so a human can verify it's coherent before locking the hash.
@@ -302,6 +446,311 @@ fn is_degenerate(s: &str) -> bool {
     t.chars().count() >= 8 && t.chars().collect::<std::collections::HashSet<char>>().len() <= 2
 }
 
+/// The prompt the KV-format numeric check scores: short, because every format costs a full
+/// prefill of it, and repeated, so most rows after the first repetition are copies — an induction
+/// task, which is the one a broken quantizer, dequant or K/V mix-up fails first.
+fn kv_check_prompt() -> String {
+    "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6)
+}
+
+/// Fewest rows of [`kv_check_prompt`] on which the f32 cache's greedy token must be among a
+/// quantized cache's [`KV_TOP_K`] best. Scored per row, so the vocabulary bias every row shares
+/// cannot carry it the way it carries a whole-vocab logit cosine: pairing each row with the next
+/// one agrees almost never. Counting a pick anywhere in the top few, rather than only as the top
+/// one, absorbs the near-tie flips that move with a build's float rounding (an exact-pick count
+/// put the lossiest format a handful of rows above this floor), and leaves the floor above the
+/// share of rows that are not copies — a cache wrong on the whole first repetition fails it.
+const KV_ROW_AGREEMENT_MIN: f64 = 0.8;
+
+/// How many of a quantized cache's best tokens a row's f32 pick may be among (see
+/// [`KV_ROW_AGREEMENT_MIN`]).
+const KV_TOP_K: usize = 3;
+
+/// What every KV-format check compares against, computed once per test binary: the prompt's
+/// tokens, the f32 cache's greedy pick per row, and a digest of the f32 and f16 caches' logits.
+/// Digests rather than the logits themselves: a row is a whole vocabulary of floats, and the
+/// checks only ask whether two runs produced the same ones.
+struct KvReference {
+    ids: Vec<u32>,
+    picks: Vec<Option<usize>>,
+    f32: u64,
+    f16: u64,
+}
+
+/// A digest of `logits` over each value's bit pattern, so "equal" means bit-for-bit equal.
+fn logits_digest(logits: &[f32]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for v in logits {
+        v.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+
+/// [`kv_check_prompt`] rendered through the model's chat template and tokenized.
+fn kv_check_ids(model: &infr_llama::SeamModel) -> Vec<u32> {
+    model
+        .encode(&model.render_chat(&kv_check_prompt()).expect("render chat"))
+        .expect("encode")
+}
+
+fn kv_rows(path: &std::path::Path, k: &str, v: &str, ids: &[u32]) -> Vec<f32> {
+    model_cfg(path, |c| kv_types(c, k, v))
+        .verify_logits_and_h_cpu(ids)
+        .expect("all-rows logits")
+        .0
+}
+
+fn kv_picks(logits: &[f32], rows: usize) -> Vec<Option<usize>> {
+    logits
+        .chunks(logits.len() / rows)
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i)
+        })
+        .collect()
+}
+
+/// Each row's [`KV_TOP_K`] highest-scoring token ids.
+fn kv_tops(logits: &[f32], rows: usize) -> Vec<Vec<usize>> {
+    logits
+        .chunks(logits.len() / rows)
+        .map(|row| {
+            let mut ids: Vec<usize> = (0..row.len()).collect();
+            ids.select_nth_unstable_by(KV_TOP_K - 1, |&a, &b| row[b].total_cmp(&row[a]));
+            ids.truncate(KV_TOP_K);
+            ids
+        })
+        .collect()
+}
+
+fn kv_reference(path: &std::path::Path) -> &'static KvReference {
+    static REFERENCE: std::sync::OnceLock<KvReference> = std::sync::OnceLock::new();
+    REFERENCE.get_or_init(|| {
+        let ids = kv_check_ids(&model_cfg(path, |c| kv_types(c, "f32", "f32")));
+        let f32 = kv_rows(path, "f32", "f32", &ids);
+        let picks = kv_picks(&f32, ids.len());
+        let f32 = logits_digest(&f32);
+        let f16 = logits_digest(&kv_rows(path, "f16", "f16", &ids));
+        KvReference {
+            ids,
+            picks,
+            f32,
+            f16,
+        }
+    })
+}
+
+/// Every `(K, V)` cache format must (a) actually reach the cache — its logits differ from both the
+/// f16 cache's and the f32 cache's, so neither default nor a silent fall-back to f32 passes — and
+/// (b) rank the f32 cache's greedy token in its top [`KV_TOP_K`] on at least
+/// [`KV_ROW_AGREEMENT_MIN`] of [`kv_check_prompt`]'s rows, every one of which writes the cache and
+/// then attends over it.
+fn assert_kv_formats_track_the_f32_cache(path: &std::path::Path, formats: &[(&str, &str)]) {
+    let reference = kv_reference(path);
+    let rows = reference.ids.len();
+    for &(k, v) in formats {
+        let got = kv_rows(path, k, v, &reference.ids);
+        let digest = logits_digest(&got);
+        assert!(
+            digest != reference.f16,
+            "K={k} V={v} produced the f16 cache's logits bit for bit — the dtype never reached the cache"
+        );
+        assert!(
+            digest != reference.f32,
+            "K={k} V={v} produced the f32 cache's logits bit for bit — the dtype fell back to f32"
+        );
+        let tops = kv_tops(&got, rows);
+        let agree = tops
+            .iter()
+            .zip(&reference.picks)
+            .filter(|(top, pick)| pick.is_some_and(|p| top.contains(&p)))
+            .count();
+        eprintln!("KV K={k} V={v}: {agree} of {rows} rows agree with the f32 cache");
+        assert!(
+            agree as f64 >= KV_ROW_AGREEMENT_MIN * rows as f64,
+            "K={k} V={v} agrees with the f32 cache on {agree} of {rows} rows (floor {KV_ROW_AGREEMENT_MIN})"
+        );
+    }
+}
+
+/// How many prefixes of [`kv_check_prompt`] the Vulkan KV-format check scores. The Vulkan seam
+/// hands back only the last row's logits, so each prefix is a whole forward: a batched prefill that
+/// writes the cache and attends over it, then the prefix's final token through the decode
+/// attention, which reads the cache back again. Spread from a quarter of the prompt to its end, so
+/// most of them sit inside a repetition the cache has to supply.
+const KV_VULKAN_PREFIXES: usize = 8;
+
+/// Lowest logit cosine, on any scored prefix, between the Vulkan seam and the CPU reference running
+/// the SAME cache format, for formats of eight bits or more per element. Measured worst on
+/// Qwen3-0.6B (2026-11-13, both the 7900 XTX and the integrated RDNA2 GPU): 0.9963, for K=f16
+/// V=q8_0 on the integrated GPU. A GPU row scored against the CPU's PREVIOUS row — a cache that
+/// served the wrong position — measured about 0.5 for every format, so the floor sits far from
+/// both. A uniform error of a few percent in a stored block scale stays above every floor; the
+/// measurements are in `docs/backlog.md` § B141.
+const KV_VULKAN_COSINE_MIN: f64 = 0.98;
+
+/// [`KV_VULKAN_COSINE_MIN`] for the 3- to 5-bit formats (the 4- and 5-bit block quants, iq4_nl,
+/// turbo3, turbo4). Their GPU and CPU runs round differently into a coarse grid, and on a 0.6B model
+/// that moves the logits further: measured worst 0.9722 (K=f16 V=turbo3, 7900 XTX), with iq4_nl at
+/// 0.9749 next (integrated GPU).
+const KV_VULKAN_COSINE_MIN_LOW_BIT: f64 = 0.95;
+
+/// [`KV_VULKAN_COSINE_MIN`] for turbo2, the one 2-bit format: measured worst 0.9581 (K=f16
+/// V=turbo2, integrated GPU).
+const KV_VULKAN_COSINE_MIN_2BIT: f64 = 0.93;
+
+/// The cosine floor for one `(K, V)` format: the floor of its less precise side. A format with no
+/// tier here panics rather than borrowing another format's floor.
+fn kv_vulkan_cosine_floor(k: &str, v: &str) -> f64 {
+    let floor = |dt: &str| match dt {
+        "f32" | "f16" | "bf16" | "q8_0" => KV_VULKAN_COSINE_MIN,
+        "q4_0" | "q4_1" | "q5_0" | "q5_1" | "iq4_nl" | "turbo3" | "turbo4" => {
+            KV_VULKAN_COSINE_MIN_LOW_BIT
+        }
+        "turbo2" => KV_VULKAN_COSINE_MIN_2BIT,
+        other => panic!("no Vulkan KV cosine floor for format {other:?}"),
+    };
+    floor(k).min(floor(v))
+}
+
+/// How many of the [`KV_VULKAN_PREFIXES`] scored prefixes may have the CPU's greedy token outside
+/// the Vulkan seam's top [`KV_TOP_K`]. One, so a single near-tie flip between backends passes and a
+/// second does not; every format measured none (2026-11-13, both GPUs).
+const KV_VULKAN_PICK_MISSES_MAX: usize = 1;
+
+/// What every Vulkan KV-format check compares against, computed once per test binary: the
+/// prompt's tokens, the prefixes scored, and the Vulkan seam's own f16-cache logits on them.
+struct VulkanKvReference {
+    ids: Vec<u32>,
+    prefixes: Vec<usize>,
+    f16: Vec<Vec<f32>>,
+}
+
+/// The Vulkan seam's last-row logits for each prefix, on a `(K, V)` cache.
+///
+/// The prefill GEMMs are pinned to f16 activations (`kernels.vulkan.i8cm_kq = false`): these
+/// checks score the cache format, and the int8 coopmat GEMM's activation rounding would be a
+/// second error source under the same floors. `gpu_seam_int8_prefill_tracks_cpu` scores the
+/// shipped default instead.
+fn kv_vulkan_rows(
+    path: &std::path::Path,
+    k: &str,
+    v: &str,
+    r: &VulkanKvReference,
+) -> Vec<Vec<f32>> {
+    let model = model_cfg(path, |c| {
+        kv_types(c, k, v);
+        c.kernels.vulkan.i8cm_kq = false;
+    });
+    r.prefixes
+        .iter()
+        .map(|&p| {
+            model
+                .prefill_logits_vulkan(&r.ids[..p])
+                .expect("vulkan logits")
+        })
+        .collect()
+}
+
+fn kv_vulkan_reference(path: &std::path::Path) -> &'static VulkanKvReference {
+    static REFERENCE: std::sync::OnceLock<VulkanKvReference> = std::sync::OnceLock::new();
+    REFERENCE.get_or_init(|| {
+        let ids = kv_check_ids(&model_default(path));
+        let first = ids.len() / 4;
+        let prefixes = (0..KV_VULKAN_PREFIXES)
+            .map(|i| first + i * (ids.len() - first) / (KV_VULKAN_PREFIXES - 1))
+            .collect();
+        let mut r = VulkanKvReference {
+            ids,
+            prefixes,
+            f16: Vec::new(),
+        };
+        r.f16 = kv_vulkan_rows(path, "f16", "f16", &r);
+        let floor = kv_vulkan_cosine_floor("f16", "f16");
+        assert_vulkan_kv_rows_track_the_cpu(path, "f16", "f16", &r, &r.f16, floor);
+        r
+    })
+}
+
+/// Score Vulkan last-row logits on a `(K, V)` cache against the CPU REFERENCE backend (f32
+/// weights, f32 dot — the oracle `seam_vulkan_matches_cpu` uses) running the same format: on every
+/// prefix the two must reach the cosine `floor`, and the CPU's greedy token may fall outside the
+/// GPU's top [`KV_TOP_K`] on at most [`KV_VULKAN_PICK_MISSES_MAX`] of the prefixes.
+fn assert_vulkan_kv_rows_track_the_cpu(
+    path: &std::path::Path,
+    k: &str,
+    v: &str,
+    r: &VulkanKvReference,
+    gpu: &[Vec<f32>],
+    floor: f64,
+) {
+    let cpu = model_cfg(path, |c| {
+        kv_types(c, k, v);
+        c.kernels.cpu.reference = true;
+    })
+    .verify_logits_and_h_cpu(&r.ids)
+    .expect("all-rows logits")
+    .0;
+    let vocab = cpu.len() / r.ids.len();
+    let mut agree = 0;
+    let mut worst = f64::INFINITY;
+    assert_eq!(gpu.len(), r.prefixes.len(), "one GPU row per prefix");
+    for (&p, got) in r.prefixes.iter().zip(gpu) {
+        let want = &cpu[(p - 1) * vocab..p * vocab];
+        let cos = cosine(got, want);
+        worst = worst.min(cos);
+        assert!(
+            cos >= floor,
+            "Vulkan K={k} V={v}: logit cosine {cos:.4} against the CPU on the {p}-token prefix (floor {floor})"
+        );
+        let pick = kv_picks(want, 1)[0];
+        if pick.is_some_and(|p| kv_tops(got, 1)[0].contains(&p)) {
+            agree += 1;
+        }
+    }
+    let rows = r.prefixes.len();
+    eprintln!(
+        "Vulkan KV K={k} V={v}: worst cosine {worst:.4} against the CPU, {agree} of {rows} picks agree"
+    );
+    assert!(
+        rows - agree <= KV_VULKAN_PICK_MISSES_MAX,
+        "Vulkan K={k} V={v} misses the CPU's pick on {} of {rows} prefixes (at most {KV_VULKAN_PICK_MISSES_MAX})",
+        rows - agree
+    );
+}
+
+/// The Vulkan twin of [`assert_kv_formats_track_the_f32_cache`]: every `(K, V)` cache format must
+/// (a) actually reach the cache — its logits differ from the Vulkan f16 cache's — and (b) track the
+/// CPU reference running the same format (see [`assert_vulkan_kv_rows_track_the_cpu`]).
+///
+/// The f32 cache is exempt from (a), by design: Vulkan's attention is f16, so it writes K from the
+/// f16 rope output and casts the f32 cache back to an f16 scratch before reading it (see
+/// `store_kv_dense.comp`). The only rounding an f32 cache would remove — V's cast to f16 — happens
+/// at the read instead of the write, so its logits equal the f16 cache's bit for bit. It is still
+/// scored on (b).
+fn assert_vulkan_kv_formats_track_the_cpu(path: &std::path::Path, formats: &[(&str, &str)]) {
+    let r = kv_vulkan_reference(path);
+    let f16 = r
+        .f16
+        .iter()
+        .map(|row| logits_digest(row))
+        .collect::<Vec<_>>();
+    for &(k, v) in formats {
+        let got = kv_vulkan_rows(path, k, v, r);
+        if (k, v) != ("f32", "f32") {
+            let digests = got.iter().map(|row| logits_digest(row)).collect::<Vec<_>>();
+            assert!(
+                digests != f16,
+                "Vulkan K={k} V={v} produced the f16 cache's logits bit for bit — the dtype never reached the cache"
+            );
+        }
+        assert_vulkan_kv_rows_track_the_cpu(path, k, v, r, &got, kv_vulkan_cosine_floor(k, v));
+    }
+}
+
 /// REGRESSION (CPU reference backend): the same repeated-forward invariant on the no-GPU
 /// compute-graph path. The CPU backend uses host buffers (no recycled-VRAM hazard), so this guards
 /// CPU coherence + determinism across repeated big-prompt forwards.
@@ -339,7 +788,8 @@ fn cpu_kv_q8_coherent() {
     let prompt = repeat_prompt();
     // Each K/V quant mix on its own model: the KV dtype is read at graph build, off the config the
     // model was loaded with.
-    for (k, v) in [("q8_0", "q8_0"), ("q8_0", "f16"), ("f16", "q8_0")] {
+    let formats = [("q8_0", "q8_0"), ("q8_0", "f16"), ("f16", "q8_0")];
+    for (k, v) in formats {
         let model = model_cfg(&path, |c| kv_types(c, k, v));
         let out = cpu_gen(&model, &prompt, 24);
         assert!(
@@ -348,6 +798,7 @@ fn cpu_kv_q8_coherent() {
             out.chars().take(48).collect::<String>()
         );
     }
+    assert_kv_formats_track_the_f32_cache(&path, &formats);
 }
 
 /// TurboQuant KV cache (CPU reference): WHT-rotated 2/3/4-bit PolarQuant, 128-elem blocks. The
@@ -359,7 +810,8 @@ fn cpu_kv_q8_coherent() {
 fn cpu_kv_turbo_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let mut _tlk = test_serial_lock();
-    for v in ["turbo2", "turbo3", "turbo4"] {
+    let widths = ["turbo2", "turbo3", "turbo4"];
+    for v in widths {
         let model = model_cfg(&path, |c| kv_types(c, "f16", v));
         let out = cpu_gen(&model, &repeat_prompt(), 24);
         assert!(
@@ -368,6 +820,8 @@ fn cpu_kv_turbo_coherent() {
             out.chars().take(48).collect::<String>()
         );
     }
+    let formats = widths.map(|v| ("f16", v));
+    assert_kv_formats_track_the_f32_cache(&path, &formats);
 }
 
 /// Mainline llama.cpp KV cache types (CPU reference): f32/bf16 (dense) + the low-bit round quants
@@ -379,7 +833,7 @@ fn cpu_kv_mainline_quants_coherent() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let mut _tlk = test_serial_lock();
     let prompt = repeat_prompt();
-    for (k, v) in [
+    let formats = [
         ("f32", "f32"),
         ("bf16", "bf16"),
         ("f16", "q4_0"),
@@ -387,7 +841,8 @@ fn cpu_kv_mainline_quants_coherent() {
         ("f16", "q5_0"),
         ("f16", "q5_1"),
         ("f16", "iq4_nl"),
-    ] {
+    ];
+    for (k, v) in formats {
         let model = model_cfg(&path, |c| kv_types(c, k, v));
         let out = cpu_gen(&model, &prompt, 24);
         assert!(
@@ -396,6 +851,8 @@ fn cpu_kv_mainline_quants_coherent() {
             out.chars().take(48).collect::<String>()
         );
     }
+    // The f32 cache is the reference itself.
+    assert_kv_formats_track_the_f32_cache(&path, &formats[1..]);
 }
 
 // Captured + verified coherent on the Vulkan backend via the agnostic compute seam (the SAME dense
@@ -565,9 +1022,11 @@ fn gpu_seam_flash_matches_cpu() {
 ///
 /// The oracle is the REFERENCE CPU backend (`CpuBackend::reference`: weights decoded to f32, f32
 /// dot), NOT the production int8-activation kernels. Those carry ~4e-3 relative error on every
-/// quant dtype — measured against the host decode: CPU 3.4e-3..4.7e-3 vs Vulkan ~1e-7 — which is
-/// invisible at Q4_K+ but flips a greedy token at Q2_K. Scoring the GPU against the int8 CPU leg
-/// therefore failed the more accurate implementation; the reference mode is the honest oracle.
+/// quant dtype — measured against the host decode: CPU 3.4e-3..4.7e-3 vs Vulkan ~1e-7 — which
+/// flips a greedy token at Q2_K. Scoring the GPU against the int8 CPU leg therefore failed the
+/// more accurate implementation; the reference mode is the honest oracle. At Q4_K the error can
+/// still flip a near tie (ERNIE 4.5 0.3B Q4_K_M on the ocean prompt, B167), so a prompt run here
+/// must have clear top-1 margins along its output.
 fn seam_vulkan_matches_cpu(path: &std::path::Path, prompt: &str, n: usize) {
     seam_vulkan_matches_cpu_cfg(path, prompt, n, |_| {});
 }
@@ -637,93 +1096,122 @@ fn gpu_seam_kv_reuse_matches_fresh() {
     );
 }
 
-/// Q8_0 KV cache on the Vulkan seam. COUPLED K==V==q8 (INFR_KV_Q8) decode now rides the
-/// record-once replay (store_q8_dyn planar write + attn_partial_dynac_q8 / attention_kv_dyn_q8
-/// planar read, pos/kv_len from the self-advancing params SSBO), so (a)/(b) exercise the replayed
-/// tape end to end plus the static prefill (store_q8 + flash dequant). DECOUPLED sides (c) still
-/// force per-execute static decode (per-side attn_partial_{k,v}q8 kernels). All must produce
-/// coherent (non-degenerate) greedy output. Q8 KV shifts the numerics (no exact match with the
-/// f16 golden), but the near-lossless quant must stay sensible; a broken quantize/dequant, a
-/// mis-gated kernel, or a wrong planar scales base (`cap`) would collapse or garble the output.
+/// Q8_0 KV cache on the Vulkan seam, scored numerically by
+/// [`assert_vulkan_kv_formats_track_the_cpu`]. COUPLED K==V==q8 decode rides the record-once replay
+/// (store_q8_dyn planar write + attn_partial_dynac_q8 / attention_kv_dyn_q8 planar read), the
+/// prefill the static store_q8 + flash dequant; each DECOUPLED side forces per-execute static
+/// decode (per-side attn_partial_{k,v}q8 kernels reading one Q8 side and one f16 side). Every
+/// scored prefix ends in a decode step, so each of those kernels reads the cache the prefill wrote.
+/// A broken quantize/dequant, a mis-gated kernel or a wrong planar scales base (`cap`) moves the
+/// logits off the CPU's.
+///
+/// The session path (`kv.force_q8`, the `INFR_KV_Q8` alias, through `generate_vulkan_session`)
+/// keeps a text check: q8 tracks the CPU closely enough that a collapsed generation there is a
+/// bug, not a near-tie.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_kv_q8_coherent() {
+fn gpu_seam_kv_q8_tracks_cpu() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let mut _tlk = test_serial_lock();
-    let head = |s: &str| s.chars().take(64).collect::<String>();
-    // A prompt long enough (>64 tokens) to take the prefill path, then a deep-cache decode.
-    let long =
-        "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6);
+    assert_vulkan_kv_formats_track_the_cpu(
+        &path,
+        &[("q8_0", "q8_0"), ("q8_0", "f16"), ("f16", "q8_0")],
+    );
 
     let model = model_cfg(&path, |c| c.kv.force_q8 = true);
-    // (a) one-shot static path.
-    let g_static = model
-        .generate_dense_vulkan(&long, 24)
-        .expect("q8 static gen");
-    assert!(
-        !is_degenerate(&g_static),
-        "Q8 static Vulkan output degenerate: {:?}",
-        head(&g_static)
-    );
-    // (b) session path (record-once: the whole decode loop replays ONE recorded Q8 tape).
     let mut sess = model.vulkan_session(512).expect("q8 session");
-    let mut g_sess = String::new();
+    let mut out = String::new();
     model
-        .generate_vulkan_session(&mut sess, &long, 24, None, |p| g_sess.push_str(p))
+        .generate_vulkan_session(&mut sess, &kv_check_prompt(), 24, None, |p| out.push_str(p))
         .expect("q8 session gen");
     assert!(
-        !is_degenerate(&g_sess),
+        !is_degenerate(&out),
         "Q8 session Vulkan output degenerate: {:?}",
-        head(&g_sess)
+        out.chars().take(64).collect::<String>()
     );
-
-    // (c) DECOUPLED K/V: each mixed side (K=q8/V=f16 and K=f16/V=q8) must also stay coherent — the
-    // per-side attn_partial_{k,v}q8 / attention_kv_{k,v}q8 variants read one Q8 side + one f16 side.
-    for (k, v) in [("q8_0", "f16"), ("f16", "q8_0")] {
-        let m = model_cfg(&path, |c| kv_types(c, k, v));
-        let out = m.generate_dense_vulkan(&long, 20).expect("mixed gen");
-        assert!(
-            !is_degenerate(&out),
-            "mixed K={k} V={v} Vulkan output degenerate: {:?}",
-            head(&out)
-        );
-    }
 }
 
-/// Mainline low-bit KV quants on the Vulkan seam: q4_0/q4_1/q5_0/q5_1/iq4_nl run via a quantizing
-/// WriteKv (quant_kv) + a dequant→f16 prefix prepass (dequant_kv_f16, reusing native_decode) feeding
-/// the standard f16 flash/split/scalar attention. K=f16 with each quantized V must stay coherent
-/// (K needs higher precision). A broken GPU quantize or dequant would garble even a V-only cache.
+/// The other KV cache formats on the Vulkan seam, scored numerically by
+/// [`assert_vulkan_kv_formats_track_the_cpu`]: the low-bit block quants q4_0/q4_1/q5_0/q5_1/iq4_nl
+/// (a quantizing WriteKv, quant_kv, plus a dequant→f16 prepass, dequant_kv_f16, feeding the f16
+/// attention), the dense f32/bf16 caches (coupled), and the TurboQuant widths (quant_turbo plus
+/// dequant_turbo_f16). The quantized ones run on V with K=f16, since K needs higher precision.
+///
+/// No text assertion: greedy text on a 0.6B model with a 2-bit V cache sits close enough to a tie
+/// that it degenerated on the 7900 XTX and not on an integrated GPU (2026-11-13) while the logits
+/// tracked the CPU equally well on both.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
-fn gpu_seam_kv_mainline_quants_coherent() {
+fn gpu_seam_kv_formats_track_cpu() {
     let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
     let mut _tlk = test_serial_lock();
-    let head = |s: &str| s.chars().take(64).collect::<String>();
-    // Long enough (>64 tokens) to take the flash prefill on the dequanted scratch, then deep decode.
-    let long =
-        "Explain how a CPU instruction pipeline works and list its common hazards. ".repeat(6);
-    // K=f16 with each quantized V, plus the dense f32/bf16 caches (coupled).
-    for (k, v) in [
-        ("f16", "q4_0"),
-        ("f16", "q4_1"),
-        ("f16", "q5_0"),
-        ("f16", "q5_1"),
-        ("f16", "iq4_nl"),
-        ("f32", "f32"),
-        ("bf16", "bf16"),
-        ("f16", "turbo2"),
-        ("f16", "turbo3"),
-        ("f16", "turbo4"),
-    ] {
-        let model = model_cfg(&path, |c| kv_types(c, k, v));
-        let out = model.generate_dense_vulkan(&long, 24).expect("gpu kv gen");
-        assert!(
-            !is_degenerate(&out),
-            "GPU K={k} V={v} degenerate: {:?}",
-            head(&out)
+    assert_vulkan_kv_formats_track_the_cpu(
+        &path,
+        &[
+            ("f16", "q4_0"),
+            ("f16", "q4_1"),
+            ("f16", "q5_0"),
+            ("f16", "q5_1"),
+            ("f16", "iq4_nl"),
+            ("f32", "f32"),
+            ("bf16", "bf16"),
+            ("f16", "turbo2"),
+            ("f16", "turbo3"),
+            ("f16", "turbo4"),
+        ],
+    );
+}
+
+/// [`gpu_seam_int8_prefill_tracks_cpu`]'s floor: the shipped prefill (the int8 coopmat GEMM, f16
+/// KV) against the CPU reference on the KV-format test's prompt and prefixes. Measured worst
+/// 0.9984 on the 7900 XTX (2026-11-15; 0.9996 with the GEMM pinned to f16 activations); a
+/// prefill whose GEMM misreads its weights measures far below.
+const VULKAN_INT8_PREFILL_COSINE_MIN: f64 = 0.995;
+
+/// The shipped Vulkan prefill — the int8 coopmat K-quant GEMM where the device runs it, f16 KV —
+/// scored against the CPU reference on the KV-format test's prompt and prefixes, which pin the
+/// GEMM to f16 activations to isolate the cache. Its logits must differ from that pinned path's
+/// (or the int8 GEMM never ran) and stay above [`VULKAN_INT8_PREFILL_COSINE_MIN`].
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_int8_prefill_tracks_cpu() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let mut _tlk = test_serial_lock();
+    // The same config the model below loads with, so a forced wave64 run (no coopmat) skips here.
+    let armed = infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new_with(
+        std::sync::Arc::new(env_cfg()),
+    ))
+    .is_some_and(|vk| vk.int8_coopmat_prefill());
+    if !armed {
+        eprintln!(
+            "gpu_seam_int8_prefill_tracks_cpu: no int8 coopmat prefill GEMM on this device — skipped"
         );
+        return;
     }
+    let r = kv_vulkan_reference(&path);
+    let model = model_cfg(&path, |c| kv_types(c, "f16", "f16"));
+    let rows: Vec<Vec<f32>> = r
+        .prefixes
+        .iter()
+        .map(|&p| {
+            model
+                .prefill_logits_vulkan(&r.ids[..p])
+                .expect("vulkan logits")
+        })
+        .collect();
+    let digests = |rs: &[Vec<f32>]| rs.iter().map(|row| logits_digest(row)).collect::<Vec<_>>();
+    assert!(
+        digests(&rows) != digests(&r.f16),
+        "the default prefill produced the f16-activation GEMM's logits bit for bit — the int8 coopmat GEMM never ran"
+    );
+    assert_vulkan_kv_rows_track_the_cpu(
+        &path,
+        "f16",
+        "f16",
+        r,
+        &rows,
+        VULKAN_INT8_PREFILL_COSINE_MIN,
+    );
 }
 
 /// Multi-slot KV prefix sharing: two INTERLEAVED conversations with a common long prefix (a
@@ -1092,6 +1580,7 @@ fn metal_kv_scratch_paths_are_coherent() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_gemma4() {
     let path = need_model!(gemma4_12b(), "gemma-4-12b");
+    need_resident_room!(path, "gemma-4-12b");
     let mut _tlk = test_serial_lock();
     seam_vulkan_matches_cpu(&path, "What is 2+2? Answer briefly.", 12);
 }
@@ -1182,6 +1671,7 @@ fn gpu_seam_streamed_e2b_stays_chunk_major() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
+    need_resident_room!(path, "Qwen3-30B-A3B");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let rendered = model
@@ -1299,17 +1789,25 @@ fn llama32_1b() -> Option<PathBuf> {
 }
 
 // Captured + verified coherent: "The capital of France is Paris. 😊", a brave-knight short story
-// ("The rain in Silverwood always tasted of regret"). Re-blessed THREE times: dense Q5_0 Linear
+// ("The rain in Silverwood always tasted of regret"). Re-blessed: dense Q5_0 Linear
 // onto the int8 kernel, then the attention-SIMD reassociation, then the Q8_0 sub-256-in_f fix
 // (gemma3-1b's 1152-dim projections are Q8_0, whose CPU dot previously TRUNCATED to 1024 elems —
 // see vec_dot_q8_0 routing). The corrected output is token-identical to the Vulkan backend
 // (independent int8 impl), so this bless fixes a wrong golden, not a precision drift.
+//
+// Re-blessed 2026-11-17 when one-row Q5_0 Linear (gemma3-1b's attn_q/attn_k/ffn_gate/ffn_up)
+// moved from an f32 dot onto the int8 kernel prefill already ran (docs/backlog.md B201): every
+// decode step and the prompt's last token changed rounding, and the knight story's text with
+// them; the France case kept its hash. Both halves were computed on the same Ryzen 9 9950X3D,
+// natively on Windows and under WSL (Ubuntu 26.04) for the other half, and came out equal. The
+// Ubuntu CI runner is the final word on that half: an exact-token golden may not reproduce
+// across CPU microarchitectures.
 const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0xe5a37ab078db3a2c),
     (
         "Tell me a short story about a brave knight.",
         48,
-        per_os(0x47634670c5e2ac70, 0x28e39d5dd5b5f858),
+        per_os(0x5147de9a0ddfae50, 0x5147de9a0ddfae50),
     ),
 ];
 
@@ -1320,6 +1818,588 @@ fn cpu_golden_gemma3() {
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     check_golden(&model, GEMMA3_GOLDEN);
+}
+
+// ─── SmolLM3 (the llama block, rope skipped on every 4th layer) ──────────────────
+
+fn smollm3_3b() -> Option<PathBuf> {
+    find_gguf("unsloth--SmolLM3-3B-GGUF", "SmolLM3-3B-Q4_K_M.gguf")
+}
+
+/// `prompt` as a SmolLM3 chat turn that renders the same on every day. The template's default
+/// system block stamps `strftime_now`'s date into the prompt, so a golden over `render_chat`
+/// would change at midnight; its `/system_override` system message replaces that block with the
+/// message's own text, and `/no_think` picks the non-reasoning generation prompt.
+fn smollm3_render(model: &infr_llama::SeamModel, prompt: &str) -> String {
+    model
+        .render_chat_messages(&[
+            (
+                "system",
+                "You are a helpful AI assistant named SmolLM, trained by Hugging Face.                  /system_override /no_think",
+            ),
+            ("user", prompt),
+        ])
+        .expect("render chat")
+}
+
+// Captured + verified coherent: "The capital of France is Paris." (infr ends the turn there), and
+// an ocean paragraph ("The ocean is a vast and mysterious world, teeming with life …"). Both cases
+// are the short length that stays OS-stable for the other models here; captured on Windows only.
+//
+// Against llama.cpp on the same prompt ids: the ocean case matches for all 32 tokens. The France
+// case matches for 7 and then sits on a near tie between end-of-turn and " Paris": both engines'
+// prefill of that prefix rank end-of-turn first, while llama.cpp's token-by-token decode ranks
+// " Paris" first, which is what `llama-completion` prints ("Paris. Paris is a city …"). The
+// measured margins are in docs/backlog.md (B161).
+const SMOLLM3_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0x8bfd779284f134df),
+    (
+        "Write a short paragraph about the ocean.",
+        32,
+        0x44563169e114b778,
+    ),
+];
+
+/// CPU-only: SmolLM3 golden-hash lock — the llama graph with rope skipped on the NoPE layers
+/// (`Config::is_nope_layer`). How its greedy output compares with llama.cpp's is on
+/// [`SMOLLM3_GOLDEN`].
+#[test]
+#[ignore = "needs SmolLM3-3B in the HF cache"]
+fn cpu_golden_smollm3() {
+    let path = need_model!(smollm3_3b(), "SmolLM3-3B");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    let rendered = smollm3_render(&model, "");
+    assert!(
+        !rendered.contains("Today Date"),
+        "the override must drop the dated system block:
+{rendered}"
+    );
+    check_golden_with(&model, |p| smollm3_render(&model, p), SMOLLM3_GOLDEN);
+}
+
+/// SmolLM3's NoPE layers write their K unroped, through the same `Op::Copy` path as llama4's;
+/// the Vulkan seam must still match the CPU oracle token-for-token.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_smollm3() {
+    let path = need_model!(smollm3_3b(), "SmolLM3-3B");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "Write a short paragraph about the ocean.", 32);
+}
+
+/// How many record-once decode recordings a short Vulkan session generation on `path` made, and
+/// how many tokens it decoded. One recording for the whole decode is the replay path; one per
+/// decoded token is a plan compiled per token on a graph the backend could have replayed; none is
+/// a decode the backend never replays.
+fn vulkan_decode_recordings(path: &std::path::Path) -> (u64, usize) {
+    let model = model_default(path);
+    let mut sess = model.vulkan_session(256).expect("session");
+    eprintln!("vulkan device: {}", sess.device_name());
+    let mut out = String::new();
+    let stats = model
+        .generate_vulkan_session(&mut sess, "The capital of France is", 8, None, |p| {
+            out.push_str(p)
+        })
+        .expect("generation");
+    let recordings = sess.decode_recordings();
+    eprintln!(
+        "{}: {recordings} decode recording(s) for {} decoded token(s): {out:?}",
+        path.display(),
+        stats.n_gen
+    );
+    (recordings, stats.n_gen)
+}
+
+/// The record-once decode replay is the fast decode path, and nothing about the output shows
+/// whether it was taken: since the runner asks the backend after compiling (B157) rather than
+/// trusting its own gate, a backend answer that turned "no" for a model that replays would cost a
+/// several-fold decode slowdown with every parity test still green. Qwen3 replays: one recording
+/// serves its whole decode, where a plan compiled per token would record once per token.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_qwen3_decode_replays_from_one_recording() {
+    let path = need_model!(qwen3_06b(), "Qwen3-0.6B");
+    let mut _tlk = test_serial_lock();
+    let (recordings, n_gen) = vulkan_decode_recordings(&path);
+    assert!(n_gen > 1, "too few tokens decoded to tell the paths apart");
+    assert_eq!(
+        recordings, 1,
+        "Qwen3-0.6B decoded {n_gen} tokens without the one record-once replay"
+    );
+}
+
+/// SmolLM3's NoPE layers write their K through a cast the Vulkan replay has no kernel for, so its
+/// decode records nothing (see B157 for what replaying it would take).
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_smollm3_decode_records_no_replay() {
+    let path = need_model!(smollm3_3b(), "SmolLM3-3B");
+    let mut _tlk = test_serial_lock();
+    let (recordings, _) = vulkan_decode_recordings(&path);
+    assert_eq!(
+        recordings, 0,
+        "SmolLM3-3B recorded a replay its NoPE layers cannot be decoded by"
+    );
+}
+
+// ─── ERNIE 4.5 dense (the llama block, SentencePiece vocabulary) ─────────────────
+
+fn ernie4_5_03b() -> Option<PathBuf> {
+    find_gguf(
+        "unsloth--ERNIE-4.5-0.3B-PT-GGUF",
+        "ERNIE-4.5-0.3B-PT-Q4_K_M.gguf",
+    )
+}
+
+fn ernie4_5_03b_f16() -> Option<PathBuf> {
+    find_gguf(
+        "unsloth--ERNIE-4.5-0.3B-PT-GGUF",
+        "ERNIE-4.5-0.3B-PT-F16.gguf",
+    )
+}
+
+/// infr's SentencePiece tokenizer on the ERNIE 4.5 vocabulary gives the ids llama.cpp gives:
+/// `llama-tokenize -f <file> --ids --no-bos --no-escape` (special tokens parsed, its default) on
+/// each string, with llama.cpp `5676dfbe0`. Covers the space prefix and whitespace runs, CJK,
+/// accented Latin, Japanese, Korean, an emoji the vocabulary holds whole (`▁🙂`), byte fallback
+/// (the skin-tone modifier after `👍` and the ZWJ family `👨‍👩‍👧` have no piece, so they encode
+/// as `<0x..>` byte tokens around the ZWJ piece), and the CONTROL tokens the chat template and the
+/// multimodal vocabulary use, which must encode atomically.
+#[test]
+#[ignore = "needs ERNIE-4.5-0.3B-PT in the HF cache"]
+fn ernie4_5_tokenizes_as_llama_cpp() {
+    let path = need_model!(ernie4_5_03b(), "ERNIE-4.5-0.3B-PT");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    let cases: &[(&str, &[u32])] = &[
+        ("Hello world", &[30802, 3135]),
+        (
+            "  leading spaces,   inner   runs\tand\ttabs\n\nnewlines\n",
+            &[
+                269, 8143, 15075, 93938, 269, 10411, 269, 11105, 22, 417, 22, 10066, 23, 23, 1158,
+                6219, 23,
+            ],
+        ),
+        (
+            "北京是中国的首都，它的历史悠久。",
+            &[42854, 93986, 14740, 37102, 93956, 6806, 3731, 57960, 93977],
+        ),
+        (
+            "Ünïcödé café naïve — 日本語のテキスト 한국어 🙂",
+            &[
+                72245, 95964, 93930, 13299, 94039, 89043, 1013, 95964, 698, 2020, 63795, 97290,
+                94867, 68598, 67026, 96553, 80529,
+            ],
+        ),
+        (
+            "ok 👍🏽 family 👨\u{200d}👩\u{200d}👧!",
+            &[
+                3098, 93919, 99877, 253, 172, 156, 202, 3982, 93919, 253, 172, 158, 181, 96395,
+                253, 172, 158, 182, 96395, 253, 172, 158, 180, 94018,
+            ],
+        ),
+        (
+            "<|begin_of_sentence|>User: hi there\nAssistant: ok<|end_of_sentence|></s>",
+            &[
+                100273, 8933, 93963, 6956, 883, 23, 92267, 93963, 3098, 100272, 2,
+            ],
+        ),
+        (
+            "x<mask:1>y <|LOC_5|> 2024-11-13 3.14159",
+            &[
+                843, 100274, 398, 93919, 100302, 269, 5, 3, 5, 7, 93942, 4, 4, 93942, 4, 6, 93919,
+                6, 93937, 4, 7, 4, 8, 12,
+            ],
+        ),
+    ];
+    for (text, want) in cases {
+        assert_eq!(
+            model.encode(text).expect("encode"),
+            *want,
+            "infr and llama.cpp tokenize {text:?} differently"
+        );
+    }
+}
+
+// Captured + verified coherent on Windows: "The capital of France is **Paris**." (the model ends
+// the turn there) and an ocean paragraph ("The ocean is a vast, dynamic body of water …"). How
+// infr's greedy output compares with llama.cpp's is in docs/plan/02-ernie4-5.md. The rendered
+// prompt opens with the template's `<|begin_of_sentence|>` and no `<s>`, as the reference's
+// input does; llama.cpp adds an `<s>` for this file and answers differently (B166).
+const ERNIE4_5_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0xfd644a0cebde4e73),
+    (
+        "Write a short paragraph about the ocean.",
+        32,
+        0x1a643a859ae6ff58,
+    ),
+];
+
+/// CPU-only: ERNIE 4.5 0.3B golden-hash lock — the llama graph with `attention.key_length` heads
+/// wider than `n_embd / n_head`.
+#[test]
+#[ignore = "needs ERNIE-4.5-0.3B-PT in the HF cache"]
+fn cpu_golden_ernie4_5() {
+    let path = need_model!(ernie4_5_03b(), "ERNIE-4.5-0.3B-PT");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    check_golden(&model, ERNIE4_5_GOLDEN);
+}
+
+fn ernie4_5_21b_a3b() -> Option<PathBuf> {
+    find_gguf(
+        "unsloth--ERNIE-4.5-21B-A3B-PT-GGUF",
+        "ERNIE-4.5-21B-A3B-PT-Q4_K_M.gguf",
+    )
+}
+
+// Captured + verified coherent: a one-paragraph answer that Paris is the capital, and the numbers
+// one to twenty spelled out. The same hashes came out on Windows and on Linux (WSL), so neither is
+// `per_os`. On both prompts infr's CPU greedy ids equal llama.cpp's (CPU, same chat-rendered ids)
+// for 48 tokens; see docs/plan/02-ernie4-5.md.
+const ERNIE4_5_MOE_GOLDEN: &[(&str, usize, u64)] = &[
+    (
+        "What is the capital of France? Answer in one paragraph.",
+        32,
+        0x2bdcaa6640a6c155,
+    ),
+    ("Count from one to twenty in words.", 32, 0x181422562a27a9dd),
+];
+
+/// CPU-only: ERNIE 4.5 21B-A3B golden-hash lock — the routed FFN behind one leading dense layer,
+/// the softmax router with its `exp_probs_b` selection bias, and the ungated shared expert.
+#[test]
+#[ignore = "needs ERNIE-4.5-21B-A3B-PT in the HF cache"]
+fn cpu_golden_ernie4_5_moe() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    check_golden(&model, ERNIE4_5_MOE_GOLDEN);
+}
+
+/// ERNIE 4.5 21B-A3B's prompt prefill through the Vulkan seam against the CPU, in the loose MoE
+/// form (`gpu_seam_matches_cpu_qwen35moe`'s doc): six of 64 experts per token is a discrete
+/// selection a near tie can flip between the two backends, so the bar is mutual top-5 containment
+/// and a cosine floor on the last-row logits rather than equality. The cosine floor sits well
+/// under what this pair measures and far above what unrelated rows give
+/// (`cpu_prefill_matches_llama_debug_dump`'s table).
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_ernie4_5_moe() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    need_resident_room!(path, "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    let rendered = model
+        .render_chat("Write a short paragraph about the ocean.")
+        .expect("render chat");
+    let tokens = model.encode(&rendered).expect("encode");
+    let cpu_last = model.prefill_logits_cpu(&tokens).expect("cpu prefill");
+    let gpu_last = model
+        .prefill_logits_vulkan(&tokens)
+        .expect("vulkan prefill");
+    assert_eq!(cpu_last.len(), gpu_last.len(), "logits shape");
+    assert!(
+        gpu_last.iter().all(|v| v.is_finite()),
+        "non-finite logit in the Vulkan prefill output"
+    );
+    let (cpu_top, gpu_top) = (top_k(&cpu_last, 5), top_k(&gpu_last, 5));
+    let max_abs = cpu_last
+        .iter()
+        .zip(&gpu_last)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let cos = cosine(&cpu_last, &gpu_last);
+    println!("cpu    top-5: {cpu_top:?}");
+    println!("vulkan top-5: {gpu_top:?}");
+    println!("cpu/vulkan max |logit diff| {max_abs}, whole-vocab cosine {cos}");
+    assert!(
+        cpu_top.iter().any(|&(id, _)| id == gpu_top[0].0)
+            && gpu_top.iter().any(|&(id, _)| id == cpu_top[0].0),
+        "CPU/Vulkan top tokens are not in each other's top-5: cpu={:?} vulkan={:?}",
+        cpu_top[0],
+        gpu_top[0]
+    );
+    assert!(
+        cos > 0.99,
+        "CPU/Vulkan last-row logits diverged: cosine={cos}"
+    );
+}
+
+/// Token identity between the Vulkan seam and the CPU oracle on ERNIE 4.5 21B-A3B, on a prompt
+/// picked for its margins. Along the 32-token answer ("1. One\n2. Two\n…"), measured on the two
+/// paths this test compares (2026-11-14): on the f32 reference CPU backend the oracle uses, the
+/// top-1 logit leads the runner-up by 0.5467 at the first token, 0.9894 at the third and at
+/// least 4.88 everywhere else; on Vulkan0's prefill by 0.5191 at the first token. At that first
+/// token the two paths' logits for the leading pair differ by 0.032 and 0.059, so the smallest
+/// lead is about nine times the larger gap. Thinner leads exist elsewhere — infr's production
+/// int8-activation CPU path leads by only 0.2335 there — which is why this compares against the
+/// reference backend.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_ernie4_5_moe_tokens() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    need_resident_room!(path, "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "Count from one to twenty in words.", 32);
+}
+
+/// The paged MoE expert cache on ERNIE 4.5 21B-A3B: VRAM and DRAM budgets forced below the
+/// model, so routed experts stream from the host tier and from the file, must decode the same
+/// ids as the all-resident run (`gpu_seam_paged_moe_matches_resident_and_cpu` is the Qwen3-30B
+/// twin). The routed experts total 12309626880 bytes over the 27 MoE layers; one layer's banks are
+/// 489553920 bytes where its down projection is Q6_K and 424673280 where it is Q4_K. Two budgets,
+/// as the pager resolves them (`paging.stats`, Vulkan0): 4 GiB of VRAM holds 1581 of the 5184
+/// expert blocks while the 12 GiB DRAM tier holds them all; at 256 MiB / 512 MiB the VRAM arena
+/// is floored to 64 slots per pool (one layer's experts per role, above the budget) and the DRAM
+/// tier splits into 36 / 75 / 75 / 39 slots across the down-Q6_K / gate / up / down-Q4_K pools,
+/// so both down pools hold less than one layer and experts are re-read from the file every layer.
+/// Prefill is pinned to one row per chunk on every run so all of them take the same small-m
+/// expert kernels and a divergence can only be the pager's.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_paged_ernie4_5_moe_matches_resident() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    need_resident_room!(path, "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    let n = 16usize;
+    let pin_ubatch = |c: &mut infr_llama::EngineConfig| {
+        c.device.ubatch = Some(1);
+        c.device.ubatch_specified = true;
+    };
+    let model = model_cfg(&path, pin_ubatch);
+    let rendered = model
+        .render_chat("Count from one to twenty in words.")
+        .expect("render chat");
+    let prompt_ids = model.encode(&rendered).expect("encode");
+
+    let mut resident_ids = Vec::new();
+    model
+        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+        .expect("resident gpu gen");
+    eprintln!(
+        "resident: {:?}",
+        model.decode(&resident_ids).expect("decode")
+    );
+
+    const GIB: u64 = 1 << 30;
+    const MIB: u64 = 1 << 20;
+    for (what, cache, dram) in [
+        ("4 GiB VRAM / 12 GiB DRAM", 4 * GIB, 12 * GIB),
+        ("256 MiB VRAM / 512 MiB DRAM", 256 * MIB, 512 * MIB),
+    ] {
+        let paged = model_cfg(&path, |c| {
+            pin_ubatch(c);
+            c.paging.cache = Some(infr_core::SizeSpec::Bytes(cache));
+            c.paging.dram = Some(infr_core::SizeSpec::Bytes(dram));
+            c.paging.stats = true;
+        });
+        let mut paged_ids = Vec::new();
+        paged
+            .generate_vulkan_ids(&prompt_ids, n, |id| paged_ids.push(id))
+            .expect("paged gpu gen");
+        assert_eq!(
+            paged_ids, resident_ids,
+            "paged MoE ({what}) diverged from the all-resident GPU run"
+        );
+    }
+}
+
+/// One generation on `sess`, and how many router-id readbacks (`SegmentCuts::drain`) its forwards
+/// made.
+fn paged_generation(
+    model: &infr_llama::SeamModel,
+    sess: &mut infr_llama::seam::model::DenseVulkanSession,
+    prompt: &str,
+    n: usize,
+) -> (String, u64) {
+    let before = sess.segment_cuts().drain;
+    let mut out = String::new();
+    model
+        .generate_vulkan_session(sess, prompt, n, None, |p| out.push_str(p))
+        .expect("paged generation");
+    (out, sess.segment_cuts().drain - before)
+}
+
+/// The paged MoE cache fills experts no token routed to (`MoePagerSession::request_fills`) when
+/// every pool can hold every expert of the model: decode from a short prompt then reaches wholly
+/// resident layers, which take the inline path and read no router ids back. With 20 GiB the
+/// cache holds every ERNIE-4.5-21B-A3B expert; generations of the same prompt repeat on one
+/// session until one makes no readback at all, every expert being resident. The reads behind the
+/// fills run on a background thread at the drive's rate, so the bound is on progress, not on the
+/// drive: the test fails when several generations in a row fill nothing while readbacks remain
+/// (or, as a backstop, after a very generous number of generations). Every generation must decode
+/// what the all-resident run decodes, and nothing may be evicted. A filled expert is one this
+/// prompt never routes to, so a second prompt follows once the cache is full: whatever it routes
+/// to beyond the first prompt's experts it reads from slots only a fill wrote, and it too must
+/// decode what the all-resident run decodes.
+///
+/// At 4 GiB and at 10 GiB of VRAM the pools cannot hold the model, so nothing is filled, and the
+/// output is still the resident one.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_paged_moe_fills_until_wholly_resident() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    need_resident_room!(path, "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    const N: usize = 32;
+    // Generations in a row with no new fill before the fills count as stuck, and the backstop.
+    const STALL_ROUNDS: usize = 8;
+    const MAX_ROUNDS: usize = 1024;
+    const GIB: u64 = 1 << 30;
+    let prompt = "Count from one to twenty in words.";
+    let other = "Name three rivers in Europe and the seas they flow into.";
+    // One row per prefill chunk, so every run takes the same small-m expert kernels and a
+    // divergence can only be the pager's (as in `gpu_seam_paged_ernie4_5_moe_matches_resident`).
+    let pin_ubatch = |c: &mut infr_llama::EngineConfig| {
+        c.device.ubatch = Some(1);
+        c.device.ubatch_specified = true;
+    };
+
+    let (want, want_other) = {
+        let model = model_cfg(&path, pin_ubatch);
+        let mut sess = model.vulkan_session(512).expect("resident session");
+        assert!(sess.moe_pager_totals().is_none(), "the resident run paged");
+        (
+            paged_generation(&model, &mut sess, prompt, N).0,
+            paged_generation(&model, &mut sess, other, N).0,
+        )
+    };
+    eprintln!("resident: {want:?} / {want_other:?}");
+
+    let ample = model_cfg(&path, |c| {
+        pin_ubatch(c);
+        c.paging.cache = Some(infr_core::SizeSpec::Bytes(20 * GIB));
+    });
+    let mut sess = ample.vulkan_session(512).expect("paged session");
+    let (mut rounds, mut stalled, mut filled) = (0, 0, 0);
+    loop {
+        let (out, drains) = paged_generation(&ample, &mut sess, prompt, N);
+        rounds += 1;
+        let (stats, fills) = sess.moe_pager_totals().expect("the ample run paged");
+        if fills > filled {
+            (filled, stalled) = (fills, 0);
+        } else {
+            stalled += 1;
+        }
+        eprintln!("round {rounds}: {drains} readbacks, {fills} fills, {stats:?}");
+        assert_eq!(
+            out, want,
+            "round {rounds} diverged from the all-resident run"
+        );
+        assert_eq!(stats.evictions, 0, "a cache that holds the model evicted");
+        if drains == 0 {
+            assert!(fills > 0, "no readbacks without a single fill");
+            break;
+        }
+        assert!(
+            stalled < STALL_ROUNDS && rounds < MAX_ROUNDS,
+            "still {drains} readbacks after {rounds} generations of {N} tokens ({fills} fills, \
+             none in the last {stalled})"
+        );
+    }
+    let (out, drains) = paged_generation(&ample, &mut sess, other, N);
+    assert_eq!(
+        out, want_other,
+        "the second prompt diverged once the cache was full"
+    );
+    assert_eq!(
+        drains, 0,
+        "the second prompt read router ids back from a full cache"
+    );
+
+    drop(sess);
+    drop(ample);
+
+    // Two budgets that cannot hold the model: one that evicts every generation (with a DRAM
+    // tier), and one that holds this prompt's routed experts, so that its later generations
+    // miss nothing and the demand-first gate in `request_fills` would let fills through. Neither
+    // may fill: its pools cannot hold every expert, so a fill could take a slot a routed expert
+    // later has to evict for.
+    for (what, cache, dram, rounds) in [
+        ("4 GiB VRAM / 12 GiB DRAM", 4 * GIB, Some(12 * GIB), 2),
+        ("10 GiB VRAM", 10 * GIB, None, 4),
+    ] {
+        let tight = model_cfg(&path, |c| {
+            pin_ubatch(c);
+            c.paging.cache = Some(infr_core::SizeSpec::Bytes(cache));
+            c.paging.dram = dram.map(infr_core::SizeSpec::Bytes);
+        });
+        let mut sess = tight.vulkan_session(512).expect("paged session");
+        let mut drains = 0;
+        for round in 1..=rounds {
+            let (out, d) = paged_generation(&tight, &mut sess, prompt, N);
+            drains = d;
+            assert_eq!(out, want, "{what}, round {round}: diverged");
+        }
+        let (stats, fills) = sess.moe_pager_totals().expect("the tight run paged");
+        eprintln!("{what}: {fills} fills, {drains} readbacks in the last round, {stats:?}");
+        assert_eq!(
+            fills, 0,
+            "{what}: a cache that cannot hold the model filled"
+        );
+        assert!(drains > 0, "{what}: wholly resident layers without fills");
+    }
+}
+
+/// ERNIE 4.5 MoE decodes from one record-once recording on Vulkan: the routed FFN is replay-safe
+/// (GPU-side top-k feeding id-indexed expert kernels), so the router bias and shared expert must
+/// not knock it off that path (see [`gpu_seam_qwen3_decode_replays_from_one_recording`]).
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_ernie4_5_moe_decode_replays_from_one_recording() {
+    let path = need_model!(ernie4_5_21b_a3b(), "ERNIE-4.5-21B-A3B-PT");
+    need_resident_room!(path, "ERNIE-4.5-21B-A3B-PT");
+    let mut _tlk = test_serial_lock();
+    let (recordings, n_gen) = vulkan_decode_recordings(&path);
+    assert!(n_gen > 1, "too few tokens decoded to tell the paths apart");
+    assert_eq!(
+        recordings, 1,
+        "ERNIE-4.5-21B-A3B decoded {n_gen} tokens without the one record-once replay"
+    );
+}
+
+/// The Vulkan seam must match the CPU oracle token-for-token on ERNIE 4.5 0.3B. Run on the F16
+/// file: at Q4_K_M, after "The ocean is a vast,", the f32-activation oracle picks " vast" where
+/// the Vulkan seam, infr's production CPU path and llama.cpp's CPU all pick " dynamic" and then
+/// agree for the rest of the 32 tokens, so the Q4_K_M weights put this prompt on a near tie
+/// between the two activation regimes rather than on an arch difference.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_ernie4_5() {
+    let path = need_model!(ernie4_5_03b_f16(), "ERNIE-4.5-0.3B-PT F16");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "Write a short paragraph about the ocean.", 32);
+}
+
+/// The Vulkan quantized kernels on ERNIE's shapes (Q4_K/Q6_K projections, 128-wide heads over a
+/// 1024-wide residual) against the CPU oracle, on the Q4_K_M file. The prompt was picked for its
+/// margins: along the whole 9-token answer ("The chemical symbol for gold is **Au**.") the top-1
+/// logit leads the runner-up by at least 1.46 on infr's production CPU prefill and on both GPUs'
+/// prefill (measured 2026-11-13, docs/plan/02-ernie4-5.md), far above the int8-activation error
+/// that splits the ocean prompt above. Past the ninth token the answer reaches a near tie.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_ernie4_5_q4_k_m() {
+    let path = need_model!(ernie4_5_03b(), "ERNIE-4.5-0.3B-PT");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is the chemical symbol for gold?", 9);
+}
+
+/// ERNIE 4.5 writes every K through the rope→WriteKv pair the replay fuses, so its decode is one
+/// record-once replay, as Qwen3's is (see [`gpu_seam_qwen3_decode_replays_from_one_recording`]).
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_ernie4_5_decode_replays_from_one_recording() {
+    let path = need_model!(ernie4_5_03b(), "ERNIE-4.5-0.3B-PT");
+    let mut _tlk = test_serial_lock();
+    let (recordings, n_gen) = vulkan_decode_recordings(&path);
+    assert!(n_gen > 1, "too few tokens decoded to tell the paths apart");
+    assert_eq!(
+        recordings, 1,
+        "ERNIE-4.5-0.3B decoded {n_gen} tokens without the one record-once replay"
+    );
 }
 
 // ─── Qwen3.5 / Qwen3-Next (gated DeltaNet) ──────────────────────────────────────
@@ -1351,6 +2431,7 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
 /// seam that lived in `qwen35.rs`; that seam was proven token-identical to this unified path
 /// during the cutover and has since been deleted — issue #30.)
 #[test]
+#[ignore = "needs Qwen3.5-0.8B in the HF cache"]
 fn cpu_golden_qwen35() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     let mut _tlk = test_serial_lock();
@@ -1463,6 +2544,7 @@ fn qwen35_4b_mtp() -> Option<PathBuf> {
 /// optional `nextn.*` fallback tensors ABSENT — this shipped GGUF's live path is 100% fallback to
 /// the main model's `token_embd`/`output`/`output_norm` (see `docs/mtp.md`'s confirmed dump).
 #[test]
+#[ignore = "needs Qwen3.5-4B-MTP in the HF cache"]
 fn mtp_gguf_loads() {
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
@@ -1525,6 +2607,7 @@ fn mtp_gguf_loads() {
 /// `timeout 600 cargo test --release -p infr-llama --test cpu_backend unified_qwen35 -- --nocapture`
 /// proves the TRUNK FORWARD itself (not just `Config` parsing) is byte-for-byte untouched.
 #[test]
+#[ignore = "needs Qwen3.5-0.8B in the HF cache"]
 fn qwen35_trunk_unaffected() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
@@ -1542,6 +2625,7 @@ fn qwen35_trunk_unaffected() {
 /// is 0 for every qwen35 model, unlike gemma). Host-recomputes the GEMV from the same dequantized
 /// weight the graph used, in the same f32 precision, so this should match near bit-exactly.
 #[test]
+#[ignore = "needs Qwen3.5-0.8B in the HF cache"]
 fn h_tap_matches_lm_head() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     let model = model_default(&path);
@@ -1583,7 +2667,15 @@ fn h_tap_matches_lm_head() {
     let max_abs = logits
         .iter()
         .zip(&host_logits)
-        .fold(0f32, |m, (&a, &b)| m.max((a - b).abs()));
+        // NaN-propagating: `f32::max` would drop a NaN logit and report agreement.
+        .fold(0f32, |m, (&a, &b)| {
+            let d = (a - b).abs();
+            if m.is_nan() || d.is_nan() {
+                f32::NAN
+            } else {
+                m.max(d)
+            }
+        });
     let max_val = logits.iter().fold(1e-6f32, |m, &v| m.max(v.abs()));
     let rel = max_abs / max_val;
     // token_embd here is Q6_K: the graph's `Op::Linear` runs a quantized-activation integer dot
@@ -1660,6 +2752,7 @@ fn prime_head<'a>(
 /// finite (no NaN/Inf — the eh_proj concat layout is exactly the kind of bug that would show up as
 /// garbage here) and prints the drafted ids + top-1 probabilities.
 #[test]
+#[ignore = "needs Qwen3.5-4B-MTP in the HF cache"]
 fn mtp_head_forward_finite() {
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
@@ -1853,6 +2946,7 @@ fn mtp_draft_chain_matches_per_step() {
 /// a couple of short prompts to dilute single-prompt noise) against that ~0.5 reference rather than
 /// hard-gating on a specific number (still a coarse sanity check, not a benchmark).
 #[test]
+#[ignore = "needs Qwen3.5-4B-MTP in the HF cache"]
 fn mtp_head_trunk_acceptance_rate() {
     let path = need_model!(qwen35_4b_mtp(), "Qwen3.5-4B-MTP");
     let g = infr_gguf::Gguf::open(&path).expect("open gguf");
@@ -2028,6 +3122,155 @@ fn mtp_spec_acceptance_stats() {
     }
 }
 
+// ─── LFM3 (short-convolution layers between gated, windowed attention layers) ────────
+
+fn lfm3_17b() -> Option<PathBuf> {
+    find_gguf("LiquidAI--LFM3-1.7B-GGUF", "LFM3-1.7B-Q4_K_M.gguf")
+}
+
+fn lfm3_17b_f16() -> Option<PathBuf> {
+    find_gguf("LiquidAI--LFM3-1.7B-GGUF", "LFM3-1.7B-F16.gguf")
+}
+
+// Captured + verified coherent; both render with thinking on (the template's default), so the
+// text is the model's reasoning. How infr's output compares with llama.cpp's is in
+// docs/plan/03-lfm3.md.
+const LFM3_GOLDEN: &[(&str, usize, u64)] = &[
+    ("The capital of France is", 32, 0x8d3a3dd9844d239f),
+    (
+        "Tell me a short story about a lighthouse keeper.",
+        32,
+        0x6e5098d3a5bec173,
+    ),
+];
+
+/// CPU-only: LFM3 1.7B golden-hash lock — the gated short convolution with its carried history,
+/// the head-gated attention on window and full layers, and the sandwich norms.
+#[test]
+#[ignore = "needs LFM3-1.7B in the HF cache"]
+fn cpu_golden_lfm3() {
+    let path = need_model!(lfm3_17b(), "LFM3-1.7B");
+    let mut _tlk = test_serial_lock();
+    let model = model_default(&path);
+    check_golden(&model, LFM3_GOLDEN);
+}
+
+/// The Vulkan seam against the CPU oracle on the LFM3 F16 file, token for token: prefill and then
+/// decode one token at a time, so the short convolution's history is carried through both the
+/// batch and the token-serial kernels.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_lfm3() {
+    let path = need_model!(lfm3_17b_f16(), "LFM3-1.7B F16");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "Write a short paragraph about the ocean.", 32);
+}
+
+/// The same on the Q4_K_M file, whose quantized kernels the F16 run does not reach.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_matches_cpu_lfm3_q4_k_m() {
+    let path = need_model!(lfm3_17b(), "LFM3-1.7B");
+    let mut _tlk = test_serial_lock();
+    seam_vulkan_matches_cpu(&path, "What is the chemical symbol for gold?", 16);
+}
+
+/// LFM3's decode is one record-once replay: the short convolution and the head gate carry no
+/// position, so nothing in its graph forces a per-token plan.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_lfm3_decode_replays_from_one_recording() {
+    let path = need_model!(lfm3_17b(), "LFM3-1.7B");
+    let mut _tlk = test_serial_lock();
+    let (recordings, n_gen) = vulkan_decode_recordings(&path);
+    assert!(n_gen > 1, "too few tokens decoded to tell the paths apart");
+    assert_eq!(
+        recordings, 1,
+        "LFM3 decoded {n_gen} tokens without the one record-once replay"
+    );
+}
+
+/// An LFM3 session whose first turn is longer than the sliding-window ring (`window + ubatch`
+/// rows), so the window layers' ring has wrapped when the second turn extends it: the extension
+/// reuses the short-convolution history and the ring together, prefills only the suffix, and
+/// generates what a fresh full prefill generates. On the F16 file: at Q4_K_M the integrated GPU's
+/// fresh prefill picks " does" over " marbles" at the third token where its own session, the
+/// 7900 XTX and both CPU paths pick " marbles" — a near tie, not a reuse fault (the same device's
+/// F16 prefill is within 0.0054 of llama.cpp's on a 1092-token prompt; docs/plan/03-lfm3.md).
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_lfm3_session_extends_past_the_window() {
+    let path = need_model!(lfm3_17b_f16(), "LFM3-1.7B F16");
+    let mut _tlk = test_serial_lock();
+    // The chunk is pinned so the ring the session allocates (`window + chunk` rows) is known here,
+    // at the integrated-GPU floor: a pinned chunk overrides that device's smaller default, and a
+    // 1024-row chunk there hung this test past an hour.
+    const UBATCH: usize = 128;
+    const CTX: usize = 4096;
+    let model = model_cfg(&path, |c| {
+        c.sampling.ignore_eos = true;
+        c.device.ubatch = Some(UBATCH);
+    });
+    let colours = ["red", "green", "blue", "yellow", "white", "black", "orange"];
+    let facts: String = (0..180)
+        .map(|i| {
+            format!(
+                "Box {i} is {} and holds {} marbles. ",
+                colours[i % 7],
+                i * 7 % 50
+            )
+        })
+        .collect();
+    let p1 = format!("{facts}How many marbles does box 3 hold?");
+    let mut sess = model.vulkan_session(CTX).expect("session");
+    let mut t1 = String::new();
+    let s1 = model
+        .generate_vulkan_session(&mut sess, &p1, 8, None, |p| t1.push_str(p))
+        .expect("turn 1");
+    let vk = infr_vulkan::VulkanBackend::new().expect("vulkan init");
+    let ring_rows = infr_llama::seam::window_ring_rows(
+        model.config(),
+        CTX,
+        UBATCH,
+        infr_core::backend::Backend::kv_row_align(&vk),
+    )
+    .expect("LFM3 has window layers");
+    assert!(
+        ring_rows < CTX,
+        "the window layers must ring at this context"
+    );
+    assert!(
+        s1.n_prompt > ring_rows,
+        "turn 1 prefilled {} tokens, too few to wrap the {ring_rows}-row window ring",
+        s1.n_prompt
+    );
+    let p2 = format!("{p1}{t1} And how many does box 10 hold?");
+    let mut t2 = String::new();
+    let s2 = model
+        .generate_vulkan_session(&mut sess, &p2, 8, None, |p| t2.push_str(p))
+        .expect("turn 2");
+    assert!(
+        s2.n_prompt < 64,
+        "turn 2 prefilled {} tokens: the session did not extend turn 1",
+        s2.n_prompt
+    );
+    // A snapshot resume also prefills only a short suffix, but it restarts at turn 1's prefill
+    // boundary or before it; only the extend path keeps the tokens turn 1 generated.
+    let boundary = s1.n_cached + s1.n_prompt;
+    assert!(
+        s2.n_cached > boundary,
+        "turn 2 reused {} tokens, not past turn 1's {boundary}-token prefill boundary: it resumed \
+         from the snapshot instead of extending",
+        s2.n_cached
+    );
+    let fresh = model.generate_dense_vulkan(&p2, 8).expect("fresh turn 2");
+    assert_eq!(
+        t2.trim(),
+        fresh.trim(),
+        "extending past the window ring diverged from a fresh full prefill"
+    );
+}
+
 // ─── Qwen3-MoE (routed experts) ─────────────────────────────────────────────────
 
 fn qwen3moe_30b() -> Option<PathBuf> {
@@ -2040,12 +3283,18 @@ fn qwen3moe_30b() -> Option<PathBuf> {
 // the staged-MoE `int8_ok` doc). Verified coherent ("<think>\nOkay, the user is asking, \"The
 // capital of France is\". I need to provide the correct answer.") — re-blessed for the
 // attention-SIMD reassociation (numerics policy: match-or-beat llama.cpp CPU precision).
-const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 24, 0xbc4f22b22d3e3c1d)];
+// The Windows hash was captured 2026-11-13, the day the Linux one was re-run and held.
+const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] = &[(
+    "The capital of France is",
+    24,
+    per_os(0xe1a4ed6cecc5eb14, 0xbc4f22b22d3e3c1d),
+)];
 
 /// Whole-vector cosine similarity (f64 accumulation) — used by the CPU/Vulkan cross-backend
 /// logits check below.
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    // `zip` would stop at the shorter slice and score a partial row as a whole one.
+    assert_eq!(a.len(), b.len(), "cosine over slices of different lengths");
     let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
     for (&x, &y) in a.iter().zip(b.iter()) {
         dot += (x as f64) * (y as f64);
@@ -2058,6 +3307,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 /// CPU-only: qwen3moe golden-hash lock (the Op::MoeFfn routed-expert path). 30B but only `n_used`
 /// experts run per token; still slow on CPU, so a single short case.
 #[test]
+#[ignore = "needs Qwen3-30B-A3B in the HF cache"]
 fn cpu_golden_qwen3moe() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
     let mut _tlk = test_serial_lock();
@@ -2110,10 +3360,25 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
         .generate_cpu_ids(&prompt_ids, n, |id| cpu_ids.push(id))
         .expect("cpu gen");
 
-    let mut resident_ids = Vec::new();
-    model
-        .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
-        .expect("resident gpu gen");
+    // Where a resident copy would starve a unified-memory host (`resident_room`), the paged run
+    // is held to the CPU reference alone: it needs no device copy, and it is independent of the
+    // pager, so the paged leg keeps a real bar.
+    let resident_ids = match resident_room(&path) {
+        Ok(()) => {
+            let mut ids = Vec::new();
+            model
+                .generate_vulkan_ids(&prompt_ids, n, |id| ids.push(id))
+                .expect("resident gpu gen");
+            Some(ids)
+        }
+        Err(why) => {
+            eprintln!(
+                "skip: the all-resident leg (the paged run is compared with the CPU reference \
+                 only, which can split from the GPU on a near tie), Qwen3-30B-A3B {why}"
+            );
+            None
+        }
+    };
 
     // 0.05 GB is far below what even ONE Q4_K_M expert layer's gate+up+down banks need — guarantees
     // real eviction pressure across the model's 48 MoE layers.
@@ -2130,13 +3395,22 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
         .generate_vulkan_ids(&prompt_ids, n, |id| paged_ids.push(id))
         .expect("paged gpu gen");
 
+    let resident_ok = resident_ids.is_some();
+    if let Some(resident_ids) = resident_ids {
+        assert_eq!(
+            paged_ids, resident_ids,
+            "paged MoE diverged from the all-resident GPU run"
+        );
+    }
     assert_eq!(
-        paged_ids, resident_ids,
-        "paged MoE diverged from the all-resident GPU run"
-    );
-    assert_eq!(
-        paged_ids, cpu_ids,
-        "paged MoE diverged from the CPU reference"
+        paged_ids,
+        cpu_ids,
+        "paged MoE diverged from the CPU reference{}",
+        if resident_ok {
+            ""
+        } else {
+            " (no resident run to compare: it was skipped)"
+        }
     );
 }
 
@@ -2154,6 +3428,7 @@ fn gpu_seam_paged_moe_matches_resident_and_cpu() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_moe_host_tier_matches_resident() {
     let path = need_model!(qwen3moe_30b(), "Qwen3-30B-A3B");
+    need_resident_room!(path, "Qwen3-30B-A3B");
     let mut _tlk = test_serial_lock();
     let n = 8usize;
 
@@ -2189,10 +3464,11 @@ fn gpu_seam_paged_moe_host_tier_matches_resident() {
     );
 
     // The UNIFIED-memory shape: no host cache at all, every expert read from disk straight into
-    // the staging ring (`GpuPager::touch_staged_read`). A unified device takes this automatically
-    // because its streaming arena is already GPU-accessible RAM; `paging.dram_bypass` is what lets
-    // it be exercised HERE, on a discrete GPU, which is the only hardware available to test it on.
-    // Without this leg that path would ship with no coverage whatsoever.
+    // the staging ring (`HostPager::fill` from `MoePagerSession::stage_role`'s arena-less arm, on a
+    // VRAM miss only). A unified device takes this automatically because its streaming arena is
+    // already GPU-accessible RAM; `paging.dram_bypass` is what lets it be exercised HERE, on a
+    // discrete GPU, which is the only hardware available to test it on. Without this leg that path
+    // would ship with no coverage whatsoever.
     let bypass = model_cfg(&path, |c| {
         pin_ubatch(c);
         c.paging.cache = Some(infr_core::SizeSpec::Bytes(50 * 1024 * 1024));
@@ -2244,23 +3520,31 @@ fn gpu_seam_dense_stream_matches_resident_and_cpu() {
 
     // 0.2 GB is far below the model's ~1.4 GB of streamable projections — every pool runs at its
     // floor slot count, so (nearly) every layer re-uploads every pass: real eviction pressure.
-    let streamed = model_cfg(&path, |c| {
-        c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
-        c.paging.stats = true; // see `gpu_seam_paged_moe_matches_resident_and_cpu`
-    });
-    let mut streamed_ids = Vec::new();
-    streamed
-        .generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id))
-        .expect("streamed gpu gen");
+    // `paging.early_submit`: the default cadence, then one that cuts the forward after its first
+    // dispatch and at every doubling after it — the most early cuts a streamed forward takes. This
+    // shows the output survives them; it does not show that `seed_barrier` is what orders the
+    // segments (the AMD Windows driver stays bit-identical without it, B185), and the cut counts
+    // themselves are asserted in infr-vulkan's `paged_early_submit`.
+    for early_submit in [infr_llama::EngineConfig::default().paging.early_submit, 1] {
+        let streamed = model_cfg(&path, |c| {
+            c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
+            c.paging.stats = true; // see `gpu_seam_paged_moe_matches_resident_and_cpu`
+            c.paging.early_submit = early_submit;
+        });
+        let mut streamed_ids = Vec::new();
+        streamed
+            .generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id))
+            .expect("streamed gpu gen");
 
-    assert_eq!(
-        streamed_ids, resident_ids,
-        "dense streaming diverged from the all-resident GPU run"
-    );
-    assert_eq!(
-        streamed_ids, cpu_ids,
-        "dense streaming diverged from the CPU reference"
-    );
+        assert_eq!(
+            streamed_ids, resident_ids,
+            "dense streaming (early_submit={early_submit}) diverged from the all-resident GPU run"
+        );
+        assert_eq!(
+            streamed_ids, cpu_ids,
+            "dense streaming (early_submit={early_submit}) diverged from the CPU reference"
+        );
+    }
 }
 
 /// The same dense streaming path with its THIRD tier engaged (`paging.dram`): every streamed weight
@@ -2308,6 +3592,156 @@ fn gpu_seam_dense_stream_host_tier_matches_resident() {
     );
 }
 
+/// Dense streaming of a real F16 checkpoint: a capped cache streams its per-layer projections
+/// through the arena (they used to stay resident, the cap ignored), and greedy output — a long
+/// prompt for the tiled prefill GEMMs, then decode — is token-identical to the all-resident run,
+/// since a streamed float weight runs the resident float kernels at the slot's address.
+///
+/// ERNIE-4.5-0.3B is the plain llama-shaped case; LFM3-1.7B adds the short-convolution layers,
+/// whose `in_proj`/`out_proj` are not among the streamed groups and stay resident.
+#[test]
+#[ignore = "requires a Vulkan GPU and the F16 ERNIE-4.5-0.3B / LFM3-1.7B files"]
+fn gpu_seam_dense_stream_f16_matches_resident() {
+    let mut _tlk = test_serial_lock();
+    let models = [
+        ("ERNIE-4.5-0.3B F16", ernie4_5_03b_f16()),
+        ("LFM3-1.7B F16", lfm3_17b_f16()),
+    ];
+    let mut ran = 0;
+    for (name, path) in models {
+        let Some(path) = path else {
+            eprintln!("skip {name}: not in the HF cache");
+            continue;
+        };
+        let n = 8usize;
+        let model = model_default(&path);
+        let long = "Explain, step by step and in thorough detail, how a transformer language \
+            model processes a sequence of tokens through its embedding, attention, and \
+            feed-forward layers. "
+            .repeat(4);
+        let rendered = model.render_chat(&long).expect("render chat");
+        let prompt_ids = model.encode(&rendered).expect("encode");
+        assert!(prompt_ids.len() > 64, "{name}: prompt too short for a GEMM");
+
+        let mut resident_ids = Vec::new();
+        model
+            .generate_vulkan_ids(&prompt_ids, n, |id| resident_ids.push(id))
+            .expect("resident gpu gen");
+
+        // Far below either model's streamable projections: every pool at its floor.
+        let streamed = model_cfg(&path, |c| {
+            c.paging.cache = Some(infr_core::SizeSpec::Bytes(200 * 1024 * 1024));
+            c.paging.stats = true;
+        });
+        // A session, for its counters: did the cap make the projections stream?
+        let mut session = streamed.vulkan_session(4096).expect("streamed session");
+        streamed
+            .generate_vulkan_session(&mut session, &rendered, n, None, |_| {})
+            .expect("streamed session gen");
+        let totals = session
+            .dense_pager_totals()
+            .unwrap_or_else(|| panic!("{name}: nothing streamed under a 200 MiB cache"));
+        println!("{name}: {totals:?}");
+        assert!(totals.vram.evictions > 0, "{name}: the cap did not bite");
+        // Free its device context and weights before the id-level run opens its own backend.
+        drop(session);
+
+        let mut streamed_ids = Vec::new();
+        streamed
+            .generate_vulkan_ids(&prompt_ids, n, |id| streamed_ids.push(id))
+            .expect("streamed gpu gen");
+        assert_eq!(
+            streamed_ids, resident_ids,
+            "{name}: dense streaming diverged from the all-resident GPU run"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither F16 model is in the HF cache");
+}
+
+/// One greedy generation on a fresh session of `model`: its text, the decode recordings it made
+/// and the dense streaming cache's counters after it (`None` when nothing streams).
+fn stream_session_run(
+    model: &infr_llama::SeamModel,
+    prompt: &str,
+    n: usize,
+) -> (String, u64, Option<infr_vulkan::pager::DenseTotals>) {
+    let mut session = model.vulkan_session(1024).expect("session");
+    let r0 = session.decode_recordings();
+    let mut text = String::new();
+    model
+        .generate_vulkan_session(&mut session, prompt, n, None, |p| text.push_str(p))
+        .expect("generation");
+    (
+        text,
+        session.decode_recordings() - r0,
+        session.dense_pager_totals(),
+    )
+}
+
+/// A real model streamed through a cache that holds every block decodes from one record-once
+/// recording, with the decode chain on and off, and generates the resident run's tokens and the
+/// streamed run's with the replay switched off. Qwen3-1.7B Q4_K_M takes the quantised kernels at
+/// the slot address, ERNIE-4.5-0.3B F16 the float ones.
+#[test]
+#[ignore = "requires a Vulkan GPU and the Qwen3-1.7B / F16 ERNIE-4.5-0.3B files"]
+fn gpu_seam_dense_stream_holding_every_block_replays() {
+    let mut _tlk = test_serial_lock();
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let models = [
+        ("Qwen3-1.7B Q4_K_M", qwen3_17b(), 2 * GIB),
+        ("ERNIE-4.5-0.3B F16", ernie4_5_03b_f16(), GIB),
+    ];
+    let n = 16usize;
+    let mut ran = 0;
+    for (name, path, cache) in models {
+        let Some(path) = path else {
+            eprintln!("skip {name}: not in the HF cache");
+            continue;
+        };
+        let rendered = model_default(&path)
+            .render_chat("What is 2+2? Answer briefly.")
+            .expect("render chat");
+        for chain in [8usize, 0] {
+            let cfg = |cache: Option<u64>, no_replay: bool| {
+                model_cfg(&path, |c| {
+                    c.spec.decode_chain = chain;
+                    c.kernels.vulkan.no_replay = no_replay;
+                    if let Some(b) = cache {
+                        c.paging.cache = Some(infr_core::SizeSpec::Bytes(b));
+                    }
+                })
+            };
+            let (resident, r_rec, none) = stream_session_run(&cfg(None, false), &rendered, n);
+            assert!(none.is_none(), "{name}: the resident run streamed");
+            assert_eq!(
+                r_rec, 1,
+                "{name}, chain {chain}: resident decode recordings"
+            );
+            for (no_replay, want) in [(false, 1), (true, 0)] {
+                let (text, rec, totals) =
+                    stream_session_run(&cfg(Some(cache), no_replay), &rendered, n);
+                let t = totals.unwrap_or_else(|| panic!("{name}: nothing streamed"));
+                println!("{name}, chain {chain}, no_replay {no_replay}: {rec} recordings, {t:?}");
+                assert_eq!(
+                    t.vram.evictions, 0,
+                    "{name}: the cache did not hold every block"
+                );
+                assert_eq!(
+                    rec, want,
+                    "{name}, chain {chain}, no_replay {no_replay}: decode recordings"
+                );
+                assert_eq!(
+                    text, resident,
+                    "{name}, chain {chain}, no_replay {no_replay}: diverged from the resident run"
+                );
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither model is in the HF cache");
+}
+
 fn qwen3_17b() -> Option<PathBuf> {
     find_gguf("unsloth--Qwen3-1.7B-GGUF", "Qwen3-1.7B-Q4_K_M.gguf")
 }
@@ -2324,6 +3758,9 @@ fn qwen3_14b_q8() -> Option<PathBuf> {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
     let path = need_model!(qwen3_14b_q8(), "Qwen3-14B-Q8_0");
+    // The streamed leg's `paging.cache` budget is system RAM on a unified device too, so the whole
+    // test needs the room a resident load does.
+    need_resident_room!(path, "Qwen3-14B-Q8_0");
     let mut _tlk = test_serial_lock();
     let n = 8usize;
 
@@ -2363,14 +3800,15 @@ fn gpu_seam_dense_stream_matches_resident_qwen3_14b() {
 }
 
 /// Streamed dense PREFILL parity — the perf-critical path this change adds. A LONG prompt forces a
-/// prefill chunk of m ≫ 16 tokens, which `streamed_gemm_applies` routes through the arena-addressed
-/// coopmat-warp GEMM twins (`native_gemm_warp_*_streamed`: the n128_ag / sk_ag tiles) instead of the
-/// per-row GEMV. Those are the SAME kernels the resident prefill picks, with the weight bytes merely
-/// relocated to an arena slot, so the streamed run must be token-identical to the all-resident run.
-/// (The tests above cover decode's small-m GEMV; a short prompt would never leave it — hence the
-/// length assertion.) Two streamed reps guard the barrier-drop class: the ring→arena copy vs the
-/// 64-bit pointer read is ordered by an explicit barrier the buffer hazard tracker can't see, so a
-/// dropped barrier surfaces as run-to-run nondeterminism.
+/// prefill chunk of m ≫ 16 tokens, which the shared quantised routing (`quant_linear` in the Vulkan
+/// adapter) sends to the tiled prefill GEMMs, arena-addressed (on the AMD proprietary driver the
+/// int8 K-quant coopmat GEMM, on other coopmat devices the warp tiles; without coopmat the dp4a
+/// GEMMs when the device has int8 dot). Those are the SAME kernels the resident prefill picks, with
+/// the weight bytes merely relocated to an arena slot, so the streamed run must be token-identical
+/// to the all-resident run. (The tests above cover decode's small-m GEMV; a short prompt would
+/// never leave it — hence the length assertion.) Two streamed reps guard the barrier-drop class:
+/// the ring→arena copy vs the 64-bit pointer read is ordered by an explicit barrier the buffer
+/// hazard tracker can't see, so a dropped barrier surfaces as run-to-run nondeterminism.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_dense_stream_prefill_matches_resident() {
@@ -2493,6 +3931,7 @@ fn gpu_seam_dense_stream_prefill_layer_major_matches_chunk_major() {
 
 /// CPU-only: Gemma 4 E2B golden-hash lock.
 #[test]
+#[ignore = "needs gemma-4-E2B in the HF cache"]
 fn cpu_golden_gemma4_e2b() {
     let path = need_model!(gemma4_e2b(), "gemma-4-E2B");
     let mut _tlk = test_serial_lock();
@@ -2525,6 +3964,7 @@ fn qwen35moe_35b_a3b() -> Option<PathBuf> {
 /// shared-expert width present, still gated through the `qwen35` DeltaNet/rope/attn-out-gate
 /// fields dense qwen35 uses).
 #[test]
+#[ignore = "needs Qwen3.6-35B-A3B in the HF cache"]
 fn cpu_qwen35moe_prefill_finite() {
     let path = need_model!(qwen35moe_35b_a3b(), "Qwen3.6-35B-A3B");
     let mut _tlk = test_serial_lock();
@@ -2569,6 +4009,7 @@ fn cpu_qwen35moe_prefill_finite() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_qwen35moe() {
     let path = need_model!(qwen35moe_35b_a3b(), "Qwen3.6-35B-A3B");
+    need_resident_room!(path, "Qwen3.6-35B-A3B");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let tokens = model
@@ -2606,6 +4047,7 @@ fn gpu_seam_matches_cpu_qwen35moe() {
 /// Dense qwen35 (no expert tensors) must still take the plain dense-FFN path — the `Config::moe`/
 /// `shexp_ff` additions for qwen35moe must NOT leak onto its dense sibling.
 #[test]
+#[ignore = "needs Qwen3.5-0.8B in the HF cache"]
 fn cpu_qwen35_dense_unaffected_by_moe_fields() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     let mut _tlk = test_serial_lock();
@@ -2636,6 +4078,7 @@ fn llama4_scout() -> Option<PathBuf> {
 
 /// llama4 config parses as expected (MoE present, top-1, plain shared expert, iRoPE + L2-norm on).
 #[test]
+#[ignore = "needs Llama-4-Scout in the HF cache"]
 fn cpu_llama4_config() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");
     let model = model_default(&path);
@@ -2683,6 +4126,7 @@ fn cpu_llama4_config() {
 /// sigmoid-top-1-weight-before-FFN MoE + plain shared expert on every step. `INFR_L4_PROMPT`/
 /// `INFR_L4_N`/`INFR_L4_NOBOS` override the defaults. Slow (109B on CPU) — few tokens.
 #[test]
+#[ignore = "needs Llama-4-Scout in the HF cache"]
 fn cpu_llama4_scout_greedy() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");
     let mut _tlk = test_serial_lock();
@@ -2735,6 +4179,10 @@ fn cpu_llama4_scout_greedy() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_paged_moe_matches_scout_oracle() {
     let path = need_model!(llama4_scout(), "Llama-4-Scout");
+    // Paged, not resident, but on a unified device the automatic placement fills the device heap
+    // from the same RAM, and the decode reads through the mapping of the whole file. Nothing has
+    // measured that cost, so it is held to the resident price rather than assumed cheaper.
+    need_resident_room!(path, "Llama-4-Scout (paged by automatic placement)");
     let mut _tlk = test_serial_lock();
     let model = model_cfg(&path, |c| c.paging.stats = true);
     let mut ids = model.encode("The capital of France is").expect("encode");
@@ -2797,6 +4245,7 @@ fn top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
 /// prompt. Prints the top-5 last-row (next-token) logits — no golden hash (Phase 1 doesn't claim
 /// coherent generation; that's the oracle-parity check in Phase 3).
 #[test]
+#[ignore = "needs diffusiongemma-26B-A4B in the HF cache"]
 fn cpu_diffusion_gemma_prefill_finite() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     let mut _tlk = test_serial_lock();
@@ -2837,6 +4286,7 @@ fn cpu_diffusion_gemma_prefill_finite() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_diffusion_gemma() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    need_resident_room!(path, "diffusiongemma-26B-A4B");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let tokens = model
@@ -2909,6 +4359,7 @@ fn gpu_seam_matches_cpu_diffusion_gemma() {
 /// logits — the next denoise step re-overwrites the same KV rows) and a self-conditioning smoke
 /// test (feeding the first call's raw logits back in must differ from the no-SC call).
 #[test]
+#[ignore = "needs diffusiongemma-26B-A4B in the HF cache"]
 fn cpu_diffusion_gemma_denoise_step() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
     let mut _tlk = test_serial_lock();
@@ -3020,6 +4471,7 @@ fn cpu_diffusion_gemma_denoise_step() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    need_resident_room!(path, "diffusiongemma-26B-A4B");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let vocab = model.config().vocab;
@@ -3135,6 +4587,7 @@ fn gpu_seam_matches_cpu_diffusion_gemma_denoise() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_diffusion_gemma_denoise_replay_matches_static() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    need_resident_room!(path, "diffusiongemma-26B-A4B");
     // The guard now only serializes this GPU test against the others: BOTH halves of
     // `INFR_SEAM_NO_REPLAY` (the seam's replay gate and the Vulkan adapter's
     // `decode_eligible`) read the per-model `kernels.vulkan.no_replay`, so the mode is
@@ -3216,6 +4669,7 @@ fn gpu_diffusion_gemma_denoise_replay_matches_static() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn diffusion_gemma_decode_matches_oracle() {
     let path = need_model!(diffusion_gemma_model(), "diffusiongemma-26B-A4B");
+    need_resident_room!(path, "diffusiongemma-26B-A4B");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     assert!(
@@ -3607,6 +5061,15 @@ fn expert_parallel_matches_single_device() {
         );
         return;
     }
+    // The single-rank reference holds the whole model on the first device, so each device the run
+    // uses is priced at the whole model, not its share of the split.
+    let model_bytes = model_file_bytes(&path);
+    for dev in &devs[..2] {
+        if let Err(why) = device_room(dev, model_bytes) {
+            eprintln!("skip: expert_parallel_matches_single_device: Qwen3-30B-A3B {why}");
+            return;
+        }
+    }
     let _tlk = test_serial_lock();
     // Force the id-indexed small-m expert path for both prefill and decode (light + deterministic),
     // and drop the <think> span so the answer settles within `n` tokens.
@@ -3684,6 +5147,7 @@ fn bitnet_b1_58_large() -> Option<PathBuf> {
 /// set the SubLN flag (`sub_norm`) and the NEOX row-permute (`permute_qk_neox`), and NOT enable any
 /// of the qk-norm / qkv-bias / gemma / moe / qwen35 gates. The FFN stays dense-gated (`moe` None).
 #[test]
+#[ignore = "needs bitnet_b1_58-large in the HF cache"]
 fn cpu_bitnet_config() {
     let path = need_model!(bitnet_b1_58_large(), "bitnet_b1_58-large");
     let g = infr_gguf::Gguf::open(&path).expect("open bitnet gguf");
@@ -3717,6 +5181,7 @@ fn cpu_bitnet_config() {
 /// is prepended (the GGUF sets `add_bos_token=true`; base-model completion needs it or the tiny 0.7B
 /// model degenerates). A real correctness gate on the two sub-norm placements + the NEOX permute.
 #[test]
+#[ignore = "needs bitnet_b1_58-large in the HF cache"]
 fn cpu_bitnet_prefill_paris() {
     let path = need_model!(bitnet_b1_58_large(), "bitnet_b1_58-large");
     let mut _tlk = test_serial_lock();
@@ -3805,6 +5270,7 @@ fn deepseek_v1_7b() -> Option<PathBuf> {
 /// Config-only: open the GGUF and assert every deepseek gate boolean, plus that
 /// other arches' gates are false. No model load needed.
 #[test]
+#[ignore = "needs DeepSeek-LLM-7B-Chat in the HF cache"]
 fn cpu_deepseek_config() {
     let path = need_model!(deepseek_v1_7b(), "DeepSeek-LLM-7B-Chat");
     let g = infr_gguf::Gguf::open(&path).expect("open GGUF");
@@ -3846,6 +5312,7 @@ fn cpu_deepseek_config() {
 /// Greedy top-1 token after "The capital of France is" — validates the full
 /// forward pass (attention + MoE + output) produces a non-empty response.
 #[test]
+#[ignore = "needs DeepSeek-LLM-7B-Chat in the HF cache"]
 fn cpu_deepseek_prefill_paris() {
     let path = need_model!(deepseek_v1_7b(), "DeepSeek-LLM-7B-Chat");
     let mut _tlk = test_serial_lock();
@@ -3880,6 +5347,7 @@ fn deepseek_v2_lite() -> Option<PathBuf> {
 /// Config-only: open the GGUF and assert every deepseek2 gate boolean, plus
 /// that other arches' gates are false. No model load needed.
 #[test]
+#[ignore = "needs DeepSeek-V2-Lite-Chat in the HF cache"]
 fn cpu_deepseek2_config() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
     let g = infr_gguf::Gguf::open(&path).expect("open GGUF");
@@ -3942,6 +5410,7 @@ fn cpu_deepseek2_config() {
 /// removed it prints `" Paris."` — llama.cpp's own greedy continuation of the
 /// same prompt at pin 030ebb5, token for token, EOS included.
 #[test]
+#[ignore = "needs DeepSeek-V2-Lite-Chat in the HF cache"]
 fn cpu_deepseek2_prefill_paris() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
     let mut _tlk = test_serial_lock();
@@ -3958,6 +5427,7 @@ fn cpu_deepseek2_prefill_paris() {
 /// qwen3moe precedent). Blessed from the coherent post-fix output — `INFR_BLESS=1` prints the
 /// text for a human coherence check before locking; the hash pins the exact generated stream.
 #[test]
+#[ignore = "needs DeepSeek-V2-Lite-Chat in the HF cache"]
 fn cpu_deepseek2_golden() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
     let mut _tlk = test_serial_lock();
@@ -3977,6 +5447,7 @@ fn cpu_deepseek2_golden() {
 /// Full CPU prefill on V2-Lite: all logits must be finite. Faster than a
 /// generation test and catches NaN/Inf in MLA attention or MoE routing.
 #[test]
+#[ignore = "needs DeepSeek-V2-Lite-Chat in the HF cache"]
 fn cpu_deepseek2_prefill_finite() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
     let mut _tlk = test_serial_lock();
@@ -4016,6 +5487,7 @@ fn cpu_deepseek2_prefill_finite() {
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_matches_cpu_deepseek2() {
     let path = need_model!(deepseek_v2_lite(), "DeepSeek-V2-Lite-Chat");
+    need_resident_room!(path, "DeepSeek-V2-Lite-Chat");
     let mut _tlk = test_serial_lock();
     let model = model_default(&path);
     let tokens = model
@@ -4055,8 +5527,9 @@ fn gpu_seam_matches_cpu_deepseek2() {
 // ── DeepSeek V3.2, at real V3 scale ────────────────────────────────────────────
 //
 // `unsloth/DeepSeek-V3.2-GGUF` declares `general.architecture = "deepseek2"`, not `deepseek32`:
-// every public V3.2 GGUF does, because the converters emit the model as dense MLA and drop the
-// lightning indexer. So these tests exercise the `deepseek2` path at 671B/61-layer/256-expert
+// its converter emitted the model as dense MLA and dropped the lightning indexer. (Public files
+// that declare `deepseek32` exist, but none small enough for this box — `docs/backlog.md` B102.)
+// So these tests exercise the `deepseek2` path at 671B/61-layer/256-expert
 // scale, and they are the FIRST time group-limited routing (`n_expert_groups`) and the
 // `exp_probs_b` router bias run on a real file rather than the synthetic GGUFs of
 // `tests/synthetic_deepseek2.rs`.
@@ -4084,6 +5557,7 @@ fn deepseek_v32() -> Option<PathBuf> {
 /// gate, the router-bias normalisation and the 2.5 routed-weight scale are all V3-only, and until
 /// this file existed they were asserted only on a synthetic GGUF this repo wrote itself.
 #[test]
+#[ignore = "needs DeepSeek-V3.2 in the HF cache"]
 fn cpu_deepseek_v32_config() {
     let path = need_model!(deepseek_v32(), "DeepSeek-V3.2");
     let g = infr_gguf::Gguf::open(&path).expect("open GGUF");
@@ -4091,7 +5565,7 @@ fn cpu_deepseek_v32_config() {
     assert_eq!(
         g.metadata().str("general.architecture"),
         Some(infr_llama::arch::DEEPSEEK2),
-        "every public V3.2 GGUF declares deepseek2, not deepseek32"
+        "this V3.2 GGUF declares deepseek2, not deepseek32"
     );
     assert!(cfg.deepseek2, "deepseek2 gate");
     assert!(
@@ -4214,10 +5688,11 @@ fn read_llama_debug_dump(bin: &std::path::Path) -> (Vec<u32>, Vec<f32>) {
 /// token ids llama.cpp itself produced — the only check in this file that scores infr against
 /// another implementation instead of against its own past output.
 ///
-/// Self-skips unless BOTH `INFR_LLAMA_DUMP` (the `llamacpp-<model>.bin` from
-/// `llama-debug -m <gguf> -p <prompt> --save-logits`) and `INFR_LLAMA_DUMP_MODEL` (that same
-/// `<gguf>`) are set, so it is model-agnostic: it was exercised on Qwen3-0.6B, where the two
-/// engines agree to within f32 noise, before being pointed at DeepSeek-V3.2.
+/// Ignored by default, and self-skips even under `--include-ignored` unless BOTH
+/// `INFR_LLAMA_DUMP` (the `llamacpp-<model>.bin` from `llama-debug -m <gguf> -p <prompt>
+/// --save-logits`) and `INFR_LLAMA_DUMP_MODEL` (that same `<gguf>`) are set, so it is
+/// model-agnostic: it was exercised on Qwen3-0.6B, where the two engines agree to within f32
+/// noise, before being pointed at DeepSeek-V3.2.
 ///
 /// Scored on mutual top-5 containment plus a cosine over the SOFTMAX PROBABILITIES — not on token
 /// equality (a quantized near-tie flips the argmax), and above all not on the raw logits. The raw
@@ -4248,6 +5723,7 @@ fn read_llama_debug_dump(bin: &std::path::Path) -> (Vec<u32>, Vec<f32>) {
 /// can hold: it is the other engine's output, and it belongs in docs/deepseek.md next to the run
 /// that produced it.
 #[test]
+#[ignore = "needs INFR_LLAMA_DUMP and INFR_LLAMA_DUMP_MODEL (a llama.cpp logits dump and its GGUF)"]
 fn cpu_prefill_matches_llama_debug_dump() {
     prefill_matches_llama_debug_dump(false);
 }
@@ -4261,13 +5737,58 @@ fn gpu_prefill_matches_llama_debug_dump() {
     prefill_matches_llama_debug_dump(true);
 }
 
-fn prefill_matches_llama_debug_dump(vulkan: bool) {
+/// The oracle on an LFM3 F16 file, held to the logits themselves: max |Δlogit| below
+/// [`LFM3_F16_MAX_ABS`]. The probability-cosine and top-5 floors above are loose enough to pass
+/// with the head gate dropped (5.780733, 3/5) or the window pattern ignored (5.19669 on a
+/// 1092-token prompt, 4/5), which this bound is not. The dump must reach past the 256-token
+/// window, or ignoring the window would not show.
+///
+/// ```text
+/// llama-debug -m LFM3-1.7B-F16.gguf -p "<a prompt of more than 256 tokens>" --save-logits
+/// INFR_LLAMA_DUMP=data/llamacpp-LFM3-1.7B-F16.bin INFR_LLAMA_DUMP_MODEL=LFM3-1.7B-F16.gguf \n///   cargo test -p infr-llama --release --test cpu_backend -- --ignored cpu_prefill_matches_llama_debug_dump_lfm3
+/// ```
+#[test]
+#[ignore = "needs INFR_LLAMA_DUMP and INFR_LLAMA_DUMP_MODEL for an LFM3 F16 file"]
+fn cpu_prefill_matches_llama_debug_dump_lfm3() {
+    let Some(score) = prefill_matches_llama_debug_dump(false) else {
+        return;
+    };
+    assert!(
+        score.config.lfm3,
+        "INFR_LLAMA_DUMP_MODEL is not an LFM3 file"
+    );
+    assert!(
+        score.n_tokens > score.config.swa_window,
+        "the dump's {} tokens do not reach past the {}-token window",
+        score.n_tokens,
+        score.config.swa_window
+    );
+    assert!(
+        score.max_abs < LFM3_F16_MAX_ABS,
+        "infr's CPU misses llama.cpp by {} on the LFM3 F16 file",
+        score.max_abs
+    );
+}
+
+/// The bound [`cpu_prefill_matches_llama_debug_dump_lfm3`] holds infr's CPU to on the F16 file:
+/// a few times the largest correct gap measured (docs/plan/03-lfm3.md), three orders of magnitude
+/// under the gaps of a dropped head gate or an ignored window pattern.
+const LFM3_F16_MAX_ABS: f32 = 0.02;
+
+/// What [`prefill_matches_llama_debug_dump`] measured, for a caller that holds a model to more.
+struct LlamaDumpScore {
+    max_abs: f32,
+    n_tokens: usize,
+    config: infr_llama::Config,
+}
+
+fn prefill_matches_llama_debug_dump(vulkan: bool) -> Option<LlamaDumpScore> {
     let (Ok(dump), Ok(model_path)) = (
         std::env::var("INFR_LLAMA_DUMP"),
         std::env::var("INFR_LLAMA_DUMP_MODEL"),
     ) else {
         eprintln!("skip: INFR_LLAMA_DUMP / INFR_LLAMA_DUMP_MODEL not set");
-        return;
+        return None;
     };
     let mut _tlk = test_serial_lock();
     let (tokens, llama_logits) = read_llama_debug_dump(std::path::Path::new(&dump));
@@ -4308,6 +5829,16 @@ fn prefill_matches_llama_debug_dump(vulkan: bool) {
     let cos = cosine(&ours, &llama_logits);
     let cos_p = cosine(&softmax(&ours), &softmax(&llama_logits));
     eprintln!("infr/llama.cpp whole-vocab cosine: logits {cos}, probabilities {cos_p}");
+    let max_abs = ours
+        .iter()
+        .zip(&llama_logits)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    let shared_top5 = ours_top[..5]
+        .iter()
+        .filter(|(id, _)| theirs_top[..5].iter().any(|(t, _)| t == id))
+        .count();
+    eprintln!("infr/llama.cpp max |logit diff| {max_abs}, shared top-5 ids {shared_top5}/5");
     assert!(
         ours_top[..5].iter().any(|&(id, _)| id == theirs_top[0].0)
             && theirs_top[..5].iter().any(|&(id, _)| id == ours_top[0].0),
@@ -4334,4 +5865,9 @@ fn prefill_matches_llama_debug_dump(vulkan: bool) {
             model.decode(&ids).expect("decode"),
         );
     }
+    Some(LlamaDumpScore {
+        max_abs,
+        n_tokens: tokens.len(),
+        config: model.config().clone(),
+    })
 }

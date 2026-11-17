@@ -1912,36 +1912,42 @@ fn linear_q6k_matches_dequant_reference() {
     check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 27), m, in_f, out_f);
 }
 
-// m = 2..8 K-quants route to the MULTI-ROW mul_mv GEMV (weight registers reused across 4
-// token rows); m=5 exercises the partial token block, out_f=94 the partial row pair.
+// m = 2..8 K-quants route to the token-parallel multi-row GEMV (`linear_q4k_mrv` /
+// `linear_q6k_mrv`: one simdgroup per (row pair, token) running the single-row mul_mv body, so
+// the m tokens sharing a row pair read its weight blocks together). An odd out_f leaves the last
+// row pair with one live row, whose body re-reads that row rather than the one past the bank end.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_q4k_multirow_matches_dequant_reference() {
-    let (m, in_f, out_f) = (5usize, 512usize, 94usize);
-    check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 110), m, in_f, out_f);
+    for (m, in_f, out_f) in [(5usize, 512usize, 94usize), (5, 512, 95)] {
+        check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 110), m, in_f, out_f);
+    }
 }
 
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_q6k_multirow_matches_dequant_reference() {
-    let (m, in_f, out_f) = (3usize, 512usize, 96usize);
-    check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 111), m, in_f, out_f);
+    for (m, in_f, out_f) in [(3usize, 512usize, 96usize), (3, 512, 95)] {
+        check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 111), m, in_f, out_f);
+    }
 }
 
 // m=1 routes to the GEMV kernels — decode's path, distinct from the m=2 row-tiled and m>=16 GEMM
-// routes the tests above/below take.
+// routes the tests above/below take. The odd out_f covers the one-live-row tail pair.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_q4k_gemv_matches_dequant_reference() {
-    let (m, in_f, out_f) = (1usize, 256usize, 96usize);
-    check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 30), m, in_f, out_f);
+    for (m, in_f, out_f) in [(1usize, 256usize, 96usize), (1, 256, 95)] {
+        check_quant_linear_parity(DType::Q4K, synth_q4k(out_f * in_f, 30), m, in_f, out_f);
+    }
 }
 
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn linear_q6k_gemv_matches_dequant_reference() {
-    let (m, in_f, out_f) = (1usize, 256usize, 96usize);
-    check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 31), m, in_f, out_f);
+    for (m, in_f, out_f) in [(1usize, 256usize, 96usize), (1, 256, 95)] {
+        check_quant_linear_parity(DType::Q6K, synth_q6k(out_f * in_f, 31), m, in_f, out_f);
+    }
 }
 
 // m >= 16 routes to the simdgroup_matrix GEMM kernels (`linear_quik*_mm`); m=18 also covers the
@@ -2498,6 +2504,7 @@ fn q8_attention_test(rows: usize, kv_len: usize, hd: usize, pos: usize, tol: f32
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let nkv_elems = kv_len * nkv * hd;
     let bound = vec![
@@ -2552,37 +2559,46 @@ fn attention_q8_vec_hd256_parity() {
 /// already lost the Q8_0 arm).
 use infr_core::budget::kv_fmt_bytes as kv_bytes;
 
+/// Heads in the quant-KV attention cases: `KVQ_NKV` KV heads, each shared by a group of query heads.
+const KVQ_NH: usize = 8;
+const KVQ_NKV: usize = 2;
+
+/// A quant-KV attention graph over `q` (`[rows, KVQ_NH, hd]`) and `k`/`v` (`[cache_rows, KVQ_NKV,
+/// hd]` f32, quantized into the caches by `WriteKv`), attending the first `kv_len` cache rows.
+/// Returns the graph, its bound inputs and the output id.
 #[allow(clippy::too_many_arguments)]
-fn kvquant_attention_test(
+fn kvquant_attention_graph(
     kdt: DType,
     vdt: DType,
     rows: usize,
+    cache_rows: usize,
     kv_len: usize,
     hd: usize,
     pos: usize,
-    tol: f32,
-    seed: u64,
-) {
-    let (nh, nkv) = (8usize, 2usize);
+    q_data: &[f32],
+    k_data: &[f32],
+    v_data: &[f32],
+) -> (Graph, Vec<(TensorId, Vec<u8>)>, TensorId) {
+    let (nh, nkv) = (KVQ_NH, KVQ_NKV);
     let mut g = Graph::new();
     let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
-    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], kdt));
-    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], vdt));
-    let ksrc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
-    let vsrc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F32));
+    let kc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], kdt));
+    let vc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], vdt));
+    let ksrc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], DType::F32));
+    let vsrc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], DType::F32));
     let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
     let row = (nkv * hd) as u32;
     g.push(Op::WriteKv {
         src: ksrc,
         cache: kc,
-        rows: kv_len as u32,
+        rows: cache_rows as u32,
         row_stride: row,
         pos: 0,
     });
     g.push(Op::WriteKv {
         src: vsrc,
         cache: vc,
-        rows: kv_len as u32,
+        rows: cache_rows as u32,
         row_stride: row,
         pos: 0,
     });
@@ -2601,16 +2617,95 @@ fn kvquant_attention_test(
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
-    let nkv_elems = kv_len * nkv * hd;
+    let nkv_elems = cache_rows * nkv * hd;
     let bound = vec![
-        (q, f32_bytes(&rand_f32(rows * nh * hd, seed))),
+        (q, f32_bytes(q_data)),
         (kc, vec![0u8; kv_bytes(kdt, nkv_elems)]),
         (vc, vec![0u8; kv_bytes(vdt, nkv_elems)]),
-        (ksrc, f32_bytes(&rand_f32(nkv_elems, seed + 1))),
-        (vsrc, f32_bytes(&rand_f32(nkv_elems, seed + 2))),
+        (ksrc, f32_bytes(k_data)),
+        (vsrc, f32_bytes(v_data)),
     ];
-    assert_parity(&g, &bound, dst, rows * nh * hd, tol);
+    (g, bound, dst)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn kvquant_attention_test(
+    kdt: DType,
+    vdt: DType,
+    rows: usize,
+    kv_len: usize,
+    hd: usize,
+    pos: usize,
+    tol: f32,
+    seed: u64,
+) {
+    let nkv_elems = kv_len * KVQ_NKV * hd;
+    let (g, bound, dst) = kvquant_attention_graph(
+        kdt,
+        vdt,
+        rows,
+        kv_len,
+        kv_len,
+        hd,
+        pos,
+        &rand_f32(rows * KVQ_NH * hd, seed),
+        &rand_f32(nkv_elems, seed + 1),
+        &rand_f32(nkv_elems, seed + 2),
+    );
+    assert_parity(&g, &bound, dst, rows * KVQ_NH * hd, tol);
+}
+
+/// V magnitude of the dominant newest key in [`kvquant_newest_key_is_attended`]; every other V
+/// lies in `rand_f32`'s [-1, 1].
+const DOMINANT_V: f32 = 4.0;
+
+/// Mask check for the rows == 1 decode shape that the parity cases above cannot make: at kv_len 200
+/// their output is a ~0.04 average over 200 random V rows, so one key more or less moves it by
+/// about 0.01, inside their quantization tolerances. Here the newest key (row `kv_len - 1`) is
+/// built to take almost all the softmax weight (K = a multiple of the shared query, V = random
+/// signs times `DOMINANT_V`, spread so the WHT-rotated turbo formats store it as well as any row),
+/// and the same cache is attended at `kv_len` and at `kv_len - 1`. Correct masking puts the first
+/// output near ±`DOMINANT_V` and the second inside [-1, 1], so their mean absolute difference is
+/// around `DOMINANT_V`. A kernel that drops the newest key leaves both near the random average,
+/// and one that reads a key past the newest puts the dominant key into both; either way that mean
+/// falls to about the 0.01 one ordinary key moves it, far below the `DOMINANT_V / 4` asserted,
+/// which leaves room for any quantization error without a measured tolerance.
+fn kvquant_newest_key_is_attended(kdt: DType, vdt: DType, kv_len: usize, hd: usize, seed: u64) {
+    let (nh, nkv) = (KVQ_NH, KVQ_NKV);
+    let u = rand_f32(hd, seed);
+    let q: Vec<f32> = u.iter().copied().cycle().take(nh * hd).collect();
+    let mut k = rand_f32(kv_len * nkv * hd, seed + 1);
+    let mut v = rand_f32(kv_len * nkv * hd, seed + 2);
+    let signs = rand_f32(hd, seed + 3);
+    let last = (kv_len - 1) * nkv * hd;
+    for h in 0..nkv {
+        for d in 0..hd {
+            k[last + h * hd + d] = 4.0 * u[d];
+            v[last + h * hd + d] = DOMINANT_V.copysign(signs[d]);
+        }
+    }
+    let be = MetalBackend::new().expect("metal backend");
+    let attend = |len: usize| {
+        let (g, bound, dst) =
+            kvquant_attention_graph(kdt, vdt, 1, kv_len, len, hd, len - 1, &q, &k, &v);
+        run(&be, &g, &bound, dst, nh * hd)
+    };
+    let full = attend(kv_len);
+    let short = attend(kv_len - 1);
+    let mean_diff = full
+        .iter()
+        .zip(&short)
+        .map(|(f, s)| (f - s).abs())
+        .sum::<f32>()
+        / full.len() as f32;
+    assert!(
+        mean_diff > DOMINANT_V / 4.0,
+        "{kdt:?}/{vdt:?}: attending kv_len {kv_len} vs {} moved the output by {mean_diff} on \
+         average — the newest key is not attended exactly once",
+        kv_len - 1
+    );
 }
 
 // Block quants, decoupled (K=f16 native, V=quant prepassed) at the rows==1 vector-flash decode
@@ -2619,6 +2714,7 @@ fn kvquant_attention_test(
 #[ignore = "requires a Metal GPU"]
 fn attention_kv_q4_0_parity() {
     kvquant_attention_test(DType::F16, DType::Q4_0, 1, 200, 128, 199, 6e-3, 300);
+    kvquant_newest_key_is_attended(DType::F16, DType::Q4_0, 200, 128, 301);
     kvquant_attention_test(DType::Q4_0, DType::Q4_0, 3, 6, 64, 3, 6e-3, 305);
 }
 
@@ -2633,6 +2729,7 @@ fn attention_kv_q4_1_parity() {
 #[ignore = "requires a Metal GPU"]
 fn attention_kv_q5_0_parity() {
     kvquant_attention_test(DType::F16, DType::Q5_0, 1, 200, 128, 199, 6e-3, 320);
+    kvquant_newest_key_is_attended(DType::F16, DType::Q5_0, 200, 128, 321);
     kvquant_attention_test(DType::Q5_0, DType::Q5_0, 3, 6, 64, 3, 6e-3, 325);
 }
 
@@ -2695,6 +2792,7 @@ fn attention_kv_f32_parity() {
 #[ignore = "requires a Metal GPU"]
 fn attention_kv_turbo2_parity() {
     kvquant_attention_test(DType::Turbo2, DType::Turbo2, 1, 200, 128, 199, 1.2e-2, 370);
+    kvquant_newest_key_is_attended(DType::Turbo2, DType::Turbo2, 200, 128, 371);
     kvquant_attention_test(DType::F16, DType::Turbo2, 3, 6, 128, 3, 1.2e-2, 375);
 }
 
@@ -2702,6 +2800,7 @@ fn attention_kv_turbo2_parity() {
 #[ignore = "requires a Metal GPU"]
 fn attention_kv_turbo3_parity() {
     kvquant_attention_test(DType::Turbo3, DType::Turbo3, 1, 200, 128, 199, 1.2e-2, 380);
+    kvquant_newest_key_is_attended(DType::Turbo3, DType::Turbo3, 200, 128, 381);
     kvquant_attention_test(DType::F16, DType::Turbo3, 3, 6, 128, 3, 1.2e-2, 385);
 }
 
@@ -2709,6 +2808,7 @@ fn attention_kv_turbo3_parity() {
 #[ignore = "requires a Metal GPU"]
 fn attention_kv_turbo4_parity() {
     kvquant_attention_test(DType::Turbo4, DType::Turbo4, 1, 200, 128, 199, 1.2e-2, 390);
+    kvquant_newest_key_is_attended(DType::Turbo4, DType::Turbo4, 200, 128, 391);
     kvquant_attention_test(DType::F16, DType::Turbo4, 3, 6, 128, 3, 1.2e-2, 395);
 }
 
@@ -2736,6 +2836,7 @@ fn attention_gqa_causal_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 41))),
@@ -2777,6 +2878,7 @@ fn attention_decode_hd256_short_kv_parity() {
             pos: pos as u32,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
         let bound = vec![
             (q, f32_bytes(&rand_f32(rows * nh * hd, 71 + kv_len as u64))),
@@ -2819,6 +2921,7 @@ fn attention_prefill_wide_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 61))),
@@ -2828,10 +2931,10 @@ fn attention_prefill_wide_parity() {
     assert_parity(&g, &bound, dst, rows * nh * hd, 1e-4);
 }
 
-// Wide launch, long f16 context: routes to the half-fragment flash kernel (`attnflash_f16kv`).
+// Wide launch, long f16 context: routes to the cooperative flash kernel (`attnflash2_f16kv`).
 // Q and P round to f16 in that path (accumulation stays f32), hence the wider tolerance than the
-// exact-f32 attention kernels. kv_len is a multiple of 8 so the kernel's tail-block reads stay
-// inside these exact-sized test buffers (the runtime cache is sized for the full context).
+// exact-f32 attention kernels. kv_len is a multiple of its 8-row KV block, so its tail-block reads
+// stay inside these exact-sized test buffers and the host's read-fit gate lets it run.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_flash_matches_reference() {
@@ -2856,6 +2959,7 @@ fn attention_flash_matches_reference() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 71))),
@@ -2867,15 +2971,18 @@ fn attention_flash_matches_reference() {
 
 // Same flash shape at hd = 72 (% 8 but not % 32): routes to the single-simdgroup flash kernel
 // (`attnflash_f16kv`), which the hd % 32 == 0 tests above no longer reach (those take the
-// cooperative `attnflash2_f16kv`).
+// cooperative `attnflash2_f16kv`). That kernel loads 16-row KV blocks, so at kv_len 136 it reads
+// to row 143: the cache holds those rows (as a runtime cache sized for a longer context does),
+// or the host's read-fit gate would route this shape to a clamped kernel instead.
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn attention_flash_hd72_matches_reference() {
     let (rows, kv_len, nh, nkv, hd, pos) = (17usize, 136usize, 8usize, 2usize, 72usize, 119usize);
+    let cache_rows = kv_len.next_multiple_of(16);
     let mut g = Graph::new();
     let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
-    let kc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
-    let vc = g.input(TensorDesc::new(vec![kv_len, nkv, hd], DType::F16));
+    let kc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![cache_rows, nkv, hd], DType::F16));
     let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
     g.push(Op::Attention {
         q,
@@ -2892,11 +2999,12 @@ fn attention_flash_hd72_matches_reference() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 171))),
-        (kc, f16_bytes(&rand_f32(kv_len * nkv * hd, 172))),
-        (vc, f16_bytes(&rand_f32(kv_len * nkv * hd, 173))),
+        (kc, f16_bytes(&rand_f32(cache_rows * nkv * hd, 172))),
+        (vc, f16_bytes(&rand_f32(cache_rows * nkv * hd, 173))),
     ];
     assert_parity(&g, &bound, dst, rows * nh * hd, 5e-3);
 }
@@ -2928,6 +3036,7 @@ fn attention_flash2_hd128_matches_reference() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 181))),
@@ -2964,6 +3073,7 @@ fn attention_flash2_four_row_prefill_match(
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, seed))),
@@ -3021,6 +3131,7 @@ fn attention_flash2_hd256_matches_reference() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 401))),
@@ -3056,6 +3167,7 @@ fn attention_vec_hd256_sliding_window_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 404))),
@@ -3092,6 +3204,7 @@ fn attention_flash2_sliding_window_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 191))),
@@ -3128,6 +3241,7 @@ fn attention_long_context_split32_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 51))),
@@ -3163,6 +3277,7 @@ fn attention_long_context_split32_hd96_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 201))),
@@ -3200,6 +3315,7 @@ fn attention_vec_sliding_window_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 211))),
@@ -3234,6 +3350,7 @@ fn attention_sliding_window_parity() {
         pos: pos as u32,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 44))),
@@ -3414,6 +3531,108 @@ fn moe_ffn_q6k_device_parity() {
     moe_quant_test(DType::Q6K, synth_q6k, 90);
 }
 
+// Softmax gating with a router bias (ERNIE 4.5 MoE's router): the bias is added to the softmax
+// PROBABILITY for selection, the weights come from the unbiased probabilities. `x` is one-hot, so
+// router row `e` scores `LEAD[e]`: probabilities 0.375 … 0.038, and a +0.45 / +0.40 bias on
+// experts 4 and 5 makes the reference select {4, 5}, where both the bias-free router and one that
+// added the bias to the logits would select {0, 1}. The CPU run without the bias is asserted to
+// differ from the CPU run with it, so a Metal router that drops the bias, or adds it to the
+// logits, cannot pass. `dtype` picks the path: F32 experts take the host fallback, Q4_K the
+// device path's `moe_topk` kernel (the same data as `moe_softmax_bias_parity` in infr-llama).
+fn moe_softmax_bias_test(dtype: DType, synth: fn(usize, u32) -> Vec<u8>, seed: u32) {
+    const LEAD: [f32; 8] = [3.0, 2.5, 2.0, 1.5, 1.0, 0.9, 0.8, 0.7];
+    const BIAS: [f32; 8] = [0.0, 0.0, 0.0, 0.0, 0.45, 0.40, 0.0, 0.0];
+    let (ne, n_expert, n_used, nff) = (256usize, LEAD.len(), 2usize, 256usize);
+    let build = |with_bias: bool| {
+        let mut g = Graph::new();
+        let x = g.input(TensorDesc::new(vec![ne], DType::F32));
+        let router = g.weight(TensorDesc::new(vec![n_expert, ne], DType::F32));
+        let gate = g.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype));
+        let up = g.weight(TensorDesc::new(vec![n_expert, nff, ne], dtype));
+        let down = g.weight(TensorDesc::new(vec![n_expert, ne, nff], dtype));
+        let bias = g.weight(TensorDesc::new(vec![n_expert], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![ne], DType::F32));
+        g.push(Op::MoeFfn {
+            x,
+            router_x: x,
+            router,
+            gate_exps: gate,
+            up_exps: up,
+            down_exps: down,
+            down_scale: None,
+            fused_gate_up: false,
+            dst,
+            ne: ne as u32,
+            n_expert: n_expert as u32,
+            n_used: n_used as u32,
+            n_ff_exp: nff as u32,
+            scale: 1.0,
+            act: infr_core::graph::Activation::Silu,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            ep_band: None,
+            exp_probs_b: with_bias.then_some(bias),
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            swiglu_clamp: None,
+            expert_ids: None,
+        });
+        let mut xi = vec![0f32; ne];
+        xi[0] = 1.0;
+        let ri: Vec<f32> = (0..n_expert * ne)
+            .map(|i| if i % ne == 0 { LEAD[i / ne] } else { 0.0 })
+            .collect();
+        let mut bound = vec![
+            (x, f32_bytes(&xi)),
+            (router, f32_bytes(&ri)),
+            (gate, synth(n_expert * nff * ne, seed)),
+            (up, synth(n_expert * nff * ne, seed + 1)),
+            (down, synth(n_expert * ne * nff, seed + 2)),
+        ];
+        if with_bias {
+            bound.push((bias, f32_bytes(&BIAS)));
+        }
+        (g, bound, dst)
+    };
+    let (g, bound, dst) = build(true);
+    let (g0, bound0, dst0) = build(false);
+    let cpu = run(&CpuBackend::new(), &g, &bound, dst, ne);
+    let cpu0 = run(&CpuBackend::new(), &g0, &bound0, dst0, ne);
+    // In `assert_parity`'s own metric (relative to `max(|cpu|, 1)`): a Metal output equal to the
+    // bias-free one must miss the tolerance by a wide factor, not by a rounding.
+    const TOL: f32 = 1e-3;
+    let moved = cpu
+        .iter()
+        .zip(&cpu0)
+        .map(|(a, b)| (a - b).abs() / a.abs().max(1.0))
+        .fold(0f32, f32::max);
+    assert!(
+        moved > 10.0 * TOL,
+        "the bias does not change the CPU output ({moved}), so this case cannot tell a router \
+         that ignores it"
+    );
+    assert_parity(&g, &bound, dst, ne, TOL);
+}
+
+/// F32 experts: the host fallback's router (`sel_probs`-style sort on probabilities plus bias).
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_softmax_bias_host_parity() {
+    moe_softmax_bias_test(
+        DType::F32,
+        |n, seed| f32_bytes(&rand_f32(n, seed as u64)),
+        110,
+    );
+}
+
+/// Q4_K experts: the device path's `moe_topk` kernel ranks probability plus bias.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn moe_ffn_softmax_bias_device_parity() {
+    moe_softmax_bias_test(DType::Q4K, synth_q4k, 120);
+}
+
 // Batched rows through the device MoE path (rows spanning two 256-row chunks): every row routes
 // independently; parity vs the CPU reference's per-row loop.
 #[test]
@@ -3559,6 +3778,75 @@ fn conv1d_silu_parity() {
     assert_close(&cpu[1], &mtl[1], 0.0, "conv1d state"); // shift is exact
 }
 
+/// LFM's gated short convolution at its kernel width (7): one token and three (the token-serial
+/// kernel) and a prefill-sized batch (the two-pass kernel), from a nonzero history, scored on the
+/// output and on the history left behind.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn shortconv_parity() {
+    let (cc, kk) = (96usize, 7usize);
+    for rows in [1usize, 3, 37] {
+        let mut g = Graph::new();
+        let bcx = g.input(TensorDesc::new(vec![rows, 3 * cc], DType::F32));
+        let w = g.weight(TensorDesc::new(vec![cc, kk], DType::F32));
+        let state = g.input(TensorDesc::new(vec![kk - 1, cc], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![rows, cc], DType::F32));
+        g.push(Op::ShortConv {
+            bcx,
+            weight: w,
+            state,
+            dst,
+            rows: rows as u32,
+            channels: cc as u32,
+            kernel: kk as u32,
+        });
+        let bound = vec![
+            (bcx, f32_bytes(&rand_f32(rows * 3 * cc, 90))),
+            (w, f32_bytes(&rand_f32(cc * kk, 91))),
+            (state, f32_bytes(&rand_f32((kk - 1) * cc, 92))),
+        ];
+        let reads = [(dst, rows * cc), (state, (kk - 1) * cc)];
+        let cpu = run_multi(&CpuBackend::new(), &g, &bound, &reads);
+        let mtl = run_multi(&MetalBackend::new().expect("metal"), &g, &bound, &reads);
+        assert_close(
+            &cpu[0],
+            &mtl[0],
+            1e-5,
+            &format!("shortconv rows={rows} dst"),
+        );
+        assert_close(
+            &cpu[1],
+            &mtl[1],
+            1e-6,
+            &format!("shortconv rows={rows} state"),
+        );
+    }
+}
+
+/// LFM3's per-head sigmoid output gate at the 1.7B model's head shape.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn head_gate_parity() {
+    let (rows, nh, hd) = (5usize, 16usize, 128usize);
+    let mut g = Graph::new();
+    let x = g.input(TensorDesc::new(vec![rows * nh * hd], DType::F32));
+    let gate = g.input(TensorDesc::new(vec![rows * nh], DType::F32));
+    let dst = g.output(TensorDesc::new(vec![rows * nh * hd], DType::F32));
+    g.push(Op::HeadGate {
+        x,
+        gate,
+        dst,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+    });
+    let bound = vec![
+        (x, f32_bytes(&rand_f32(rows * nh * hd, 93))),
+        (gate, f32_bytes(&rand_f32(rows * nh, 94))),
+    ];
+    assert_parity(&g, &bound, dst, rows * nh * hd, 1e-5);
+}
+
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn deltanet_parity() {
@@ -3618,17 +3906,28 @@ fn deltanet_parity() {
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn deltanet_multirow_parity_inline_norm() {
-    deltanet_multirow_case(5); // below the gate: inline normalization, no scratch
+    deltanet_multirow_case(5, 128); // below the gate: inline normalization, no scratch
 }
 
 #[test]
 #[ignore = "requires a Metal GPU"]
 fn deltanet_multirow_parity_prepared_norm() {
-    deltanet_multirow_case(8); // at the gate: the hoisted q/k norm pass feeds the scan
+    deltanet_multirow_case(8, 128); // at the gate: the hoisted q/k norm pass feeds the scan
 }
 
-fn deltanet_multirow_case(rows: usize) {
-    let (nv, nk, kd, vd) = (4usize, 2usize, 128usize, 128usize);
+// B127: a key head 96 wide is a multiple of 32 with no kernel instantiation of its own. The
+// device kernels used to run it on the 8-per-lane instantiation, whose lanes index 256 keys and so
+// read and write the next head's state (and past the last head's); it must take the host path and
+// match the reference. Both sides of the norm-prep gate, since each picks its kernel separately.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn deltanet_unfitted_head_k_matches_reference() {
+    deltanet_multirow_case(1, 96);
+    deltanet_multirow_case(8, 96);
+}
+
+fn deltanet_multirow_case(rows: usize, kd: usize) {
+    let (nv, nk, vd) = (4usize, 2usize, 128usize);
     let mut g = Graph::new();
     let q = g.input(TensorDesc::new(vec![rows, nk * kd], DType::F32));
     let k = g.input(TensorDesc::new(vec![rows, nk * kd], DType::F32));
@@ -3674,13 +3973,13 @@ fn deltanet_multirow_case(rows: usize) {
         &cpu[0],
         &mtl[0],
         1e-4,
-        &format!("deltanet multirow dst (rows={rows})"),
+        &format!("deltanet multirow dst (rows={rows}, head_k={kd})"),
     );
     assert_close(
         &cpu[1],
         &mtl[1],
         1e-4,
-        &format!("deltanet multirow state (rows={rows})"),
+        &format!("deltanet multirow state (rows={rows}, head_k={kd})"),
     );
 }
 
@@ -3771,6 +4070,7 @@ fn attention_canvas_split32_matches_reference() {
         pos: 0,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 501))),
@@ -3806,6 +4106,7 @@ fn attention_canvas_split8_hd256_matches_reference() {
         pos: 0,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let bound = vec![
         (q, f32_bytes(&rand_f32(rows * nh * hd, 511))),
@@ -3917,6 +4218,35 @@ fn argmax_f32_matches_cpu() {
         1,
     );
     assert_eq!(got[0].to_bits(), 17, "argmax must keep the lowest tie");
+
+    // The same tie on the single-threadgroup kernel (n within one 256-lane scan): index 256 lands
+    // on lane 0 and index 1 on lane 1, so a reduce that breaks ties by lane rather than by index
+    // returns 256.
+    let small = 4099usize;
+    let mut gs = Graph::new();
+    let xs_id = gs.input(TensorDesc::new(vec![small], DType::F32));
+    let dst_s = gs.output(TensorDesc::new(vec![1], DType::F32));
+    gs.push(Op::Argmax {
+        x: xs_id,
+        dst: dst_s,
+        n: small as u32,
+        rows: 1,
+    });
+    let mut tied = vec![-1.0f32; small];
+    tied[256] = 10.0;
+    tied[1] = 10.0;
+    let got = run(
+        &MetalBackend::new().unwrap(),
+        &gs,
+        &[(xs_id, f32_bytes(&tied))],
+        dst_s,
+        1,
+    );
+    assert_eq!(
+        got[0].to_bits(),
+        1,
+        "argmax_f32 must keep the lowest tied index"
+    );
 
     xs.fill(f32::NEG_INFINITY);
     xs[90_210] = -1e35;
@@ -4598,6 +4928,7 @@ fn lightning_indexer_parity() {
             top_k: c.top_k as u32,
             scale,
             pos: c.pos as u32,
+            block_ratio: 1,
         });
         let bound = vec![
             (q, f32_bytes(&qi)),
@@ -4779,6 +5110,7 @@ fn attention_sinks_parity() {
             pos: 0,
             sinks: with_sinks.then_some(sk),
             key_bias: None,
+            comp: None,
         });
         (g, q, kc, vc, sk, dst)
     };
@@ -4818,7 +5150,7 @@ fn attention_sinks_parity() {
         .iter()
         .zip(&without)
         .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+        .fold(0.0f32, infr_testkit::nan_max);
     assert!(
         gap > 0.05,
         "metal: a sink 18 above every score changed nothing (gap={gap:e}) — it never reached the \
@@ -4873,6 +5205,7 @@ fn attention_key_bias_parity() {
             pos: 0,
             sinks: with_sinks.then_some(sk),
             key_bias: kb,
+            comp: None,
         });
         (g, q, kc, vc, kb, sk, dst)
     };
@@ -4907,7 +5240,7 @@ fn attention_key_bias_parity() {
         .iter()
         .zip(&without_bias)
         .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+        .fold(0.0f32, infr_testkit::nan_max);
     assert!(
         gap > 0.05,
         "metal: key_bias changed nothing (gap={gap:e}) — it never reached the score"
@@ -4966,6 +5299,7 @@ fn attention_key_bias_removes_the_masked_keys_parity() {
             pos: (kv_len - 1) as u32,
             sinks: None,
             key_bias: kb,
+            comp: None,
         });
         let mut b = vec![
             (q, f32_bytes(&qv)),
@@ -5014,7 +5348,7 @@ fn attention_key_bias_removes_the_masked_keys_parity() {
             .iter()
             .zip(&unmasked)
             .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+            .fold(0.0f32, infr_testkit::nan_max);
         assert!(
             gap > 0.05,
             "metal: masking key {masked_j} changed nothing — key_bias is not reaching the kernel \
@@ -5528,4 +5862,175 @@ fn compress_pool_all_neg_inf_window_is_zero() {
         );
     }
     assert_parity(&g, &bound, dst, blocks * ne, 1e-5);
+}
+
+/// `Op::Attention` with ONE cache bound to both `k_cache` and `v_cache` — how deepseek4 stores its
+/// K=V row (`build_attn_mha(q, k_all, k_all, …)`). The Metal run must match the CPU oracle on the
+/// same aliased graph, and must equal its own two-cache run bit for bit, since the bytes read are
+/// the same. The sinks build is the family V4 takes; `infr-llama`'s
+/// `attention_one_cache_as_k_and_v` covers the other tiers on CPU and Vulkan.
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn attention_one_cache_as_k_and_v_parity() {
+    let (rows, nh, hd) = (3usize, 2usize, 64usize);
+    let kv_len = rows;
+    let n_out = rows * nh * hd;
+    let qi = rand_f32(n_out, 4301);
+    let kvi = rand_f32(kv_len * hd, 4302);
+    let sinks = vec![0.5f32, 1.5];
+    let build = |alias: bool| {
+        let mut g = Graph::new();
+        let q = g.input(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        let kc = g.input(TensorDesc::new(vec![kv_len, 1, hd], DType::F32));
+        let vc = if alias {
+            kc
+        } else {
+            g.input(TensorDesc::new(vec![kv_len, 1, hd], DType::F32))
+        };
+        let sk = g.weight(TensorDesc::new(vec![nh], DType::F32));
+        let dst = g.output(TensorDesc::new(vec![rows, nh, hd], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: nh as u32,
+            n_kv: 1,
+            head_dim: hd as u32,
+            scale: 1.0 / (hd as f32).sqrt(),
+            mask: infr_core::graph::AttnMask::Causal,
+            pos: 0,
+            sinks: Some(sk),
+            key_bias: None,
+            comp: None,
+        });
+        let mut bound = vec![
+            (q, f32_bytes(&qi)),
+            (kc, f32_bytes(&kvi)),
+            (sk, f32_bytes(&sinks)),
+        ];
+        if !alias {
+            bound.push((vc, f32_bytes(&kvi)));
+        }
+        (g, bound, dst)
+    };
+    let (g, bound, dst) = build(true);
+    assert_parity(&g, &bound, dst, n_out, 1e-4);
+    let mtl_be = MetalBackend::new().expect("metal backend");
+    let one = run(&mtl_be, &g, &bound, dst, n_out);
+    let (g2, bound2, dst2) = build(false);
+    let two = run(&mtl_be, &g2, &bound2, dst2, n_out);
+    assert_eq!(
+        one.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        two.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        "metal: one cache bound to both sides differs from two equal caches"
+    );
+}
+
+// ---- DeepSeek V4 compressor source gather: `Op::GatherRows` (`gather_rows_f32`).
+//
+// `infr-llama`'s `gather_rows_*` tests pin the layout against a from-definition reference; this
+// one asks whether the Metal kernel reproduces the CPU oracle BIT for bit (a gather computes
+// nothing, and its `-inf` fill would defeat a tolerance), on the HCA shape, a column window, and
+// the CSA overlap's two halves into one destination with the sentinel fill, and that an index past
+// the source writes the fill.
+
+/// One `Op::GatherRows`: `(rows, idx_off, src_stride, src_col, n, group, dst_group_stride,
+/// dst_row_off, fill)`.
+type GrOp = (u32, u32, u32, u32, u32, u32, u32, u32, f32);
+
+/// A parity case: `(name, source elements, indices, destination elements, gathers)`.
+type GrCase = (&'static str, usize, Vec<i32>, usize, Vec<GrOp>);
+
+fn gr_graph(src_n: usize, idx_n: usize, dst_n: usize, ops: &[GrOp]) -> (Graph, [TensorId; 3]) {
+    let mut g = Graph::new();
+    let src = g.input(TensorDesc::new(vec![src_n], DType::F32));
+    let idx = g.input(TensorDesc::new(vec![idx_n], DType::I32));
+    let dst = g.output(TensorDesc::new(vec![dst_n], DType::F32));
+    for &(rows, idx_off, src_stride, src_col, n, group, dst_group_stride, dst_row_off, fill) in ops
+    {
+        g.push(Op::GatherRows {
+            src,
+            idx,
+            dst,
+            rows,
+            idx_off,
+            src_stride,
+            src_col,
+            n,
+            group,
+            dst_group_stride,
+            dst_row_off,
+            fill,
+        });
+    }
+    (g, [src, idx, dst])
+}
+
+#[test]
+#[ignore = "requires a Metal GPU"]
+fn gather_rows_parity() {
+    let (blocks, ratio, d) = (3u32, 4u32, 6u32);
+    let overlap = |fill| -> [GrOp; 2] {
+        let rb = ratio * blocks;
+        [
+            (rb, 0, 2 * d, 0, d, ratio, 2 * ratio, 0, fill),
+            (rb, rb, 2 * d, d, d, ratio, 2 * ratio, ratio, fill),
+        ]
+    };
+    let ov_idx: Vec<i32> = vec![
+        -1, -1, -1, -1, 8, 9, 10, 11, 1, 2, 3, 4, 8, 9, 10, 11, 12, 0, 7, 6, 5, 4, 12, 3,
+    ];
+    let hca_idx: Vec<i32> = (0..256).map(|r| (r * 37 + 11) % 168).collect();
+    let cases: Vec<GrCase> = vec![
+        (
+            "overlap fill -inf",
+            13 * 12,
+            ov_idx.clone(),
+            (blocks * 2 * ratio * d) as usize,
+            overlap(f32::NEG_INFINITY).to_vec(),
+        ),
+        (
+            "overlap fill 0",
+            13 * 12,
+            ov_idx,
+            (blocks * 2 * ratio * d) as usize,
+            overlap(0.0).to_vec(),
+        ),
+        (
+            "hca window 128",
+            168 * 5,
+            hca_idx,
+            256 * 5,
+            vec![(256, 0, 5, 0, 5, 1, 1, 0, 0.0)],
+        ),
+        (
+            "column window",
+            5 * 10,
+            vec![2, 4, 0, 3],
+            16,
+            vec![(4, 0, 10, 3, 4, 1, 1, 0, 0.0)],
+        ),
+    ];
+    let mtl_be = MetalBackend::new().expect("metal backend");
+    for (name, src_n, idx, dst_n, ops) in cases {
+        let src: Vec<f32> = (0..src_n).map(|i| i as f32 + 0.25).collect();
+        let (g, [s, i, dst]) = gr_graph(src_n, idx.len(), dst_n, &ops);
+        let bound = vec![(s, f32_bytes(&src)), (i, i32_bytes(&idx))];
+        let cpu = run(&CpuBackend::new(), &g, &bound, dst, dst_n);
+        let mtl = run(&mtl_be, &g, &bound, dst, dst_n);
+        assert_eq!(
+            cpu.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            mtl.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "GatherRows {name}: metal differs from the CPU oracle"
+        );
+    }
+    // An index past the source's three rows writes the fill rather than reading past the buffer.
+    let src = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    let (g, [s, i, dst]) = gr_graph(6, 2, 4, &[(2, 0, 2, 0, 2, 1, 1, 0, -7.0)]);
+    let bound = vec![(s, f32_bytes(&src)), (i, i32_bytes(&[0, 3]))];
+    let mtl = run(&mtl_be, &g, &bound, dst, 4);
+    assert_eq!(mtl, vec![1.0, 2.0, -7.0, -7.0]);
 }

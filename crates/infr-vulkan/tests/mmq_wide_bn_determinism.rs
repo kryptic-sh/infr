@@ -188,7 +188,7 @@ fn run_config(be: &VulkanBackend, dtype: DType, label: &str) {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn mmq_wide_bn_expert_gemm_deterministic() {
-    let Ok(be) = VulkanBackend::new() else {
+    let Some(be) = infr_testkit::gpu_or_skip(VulkanBackend::new()) else {
         eprintln!("skip: no Vulkan device");
         return;
     };

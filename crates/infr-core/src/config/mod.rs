@@ -41,12 +41,14 @@ pub mod env;
 pub mod file;
 pub mod manifest;
 pub mod partial;
+pub mod tune;
 
 #[cfg(test)]
 mod tests;
 
 pub use cli::ConfigOverrides;
 pub use partial::{ConfigValue, SetPathError};
+pub use tune::{TuneEntry, TuneLevel, TuneMap};
 
 use partial::cfg_struct;
 
@@ -76,7 +78,7 @@ cfg_struct! {
         /// `INFR_UBATCH_PARALLEL`: prefill chunk for a sequence sharing the GPU (`serve -np N`).
         ubatch_parallel: usize = 256,
         /// `INFR_SUBMIT_DISPATCHES`: submit-splitter cap (`0` = never split). `None` = the
-        /// measured `initial_submit_dispatch_cap(integrated, slow)` default.
+        /// measured `initial_submit_dispatch_cap(integrated)` default.
         submit_dispatches: Option<usize> = None,
         /// `INFR_SG`: subgroup-size preference, exactly 16 or 32. `None` = vendor-derived.
         subgroup_pref: Option<u32> = None,
@@ -140,14 +142,6 @@ cfg_struct! {
         overflow_vram_mb: Option<u64> = None,
         /// `INFR_KV_OVERFLOW_RESERVE_MB`, in MiB. `None` = `max(12% of VRAM, 2 GiB)`.
         overflow_reserve_mb: Option<u64> = None,
-        /// `INFR_KV_STORE_MB`: host-RAM budget for the cross-conversation KV prefix store, in MiB.
-        /// `None` = off, and the store is never built.
-        store_mb: Option<u64> = None,
-        /// `INFR_KV_PAGED`: forward PagedAttention — one page pool shared by the slots, with
-        /// copy-on-write for a shared prefix. `None`/`false` = every slot owns a contiguous cache.
-        /// The pool is built at the session's first fork (see `docs/perf/kv-prefix.md`), so a
-        /// single-conversation run never allocates one.
-        paged: Option<bool> = None,
     }
 }
 
@@ -160,13 +154,29 @@ cfg_struct! {
         ring: Option<SizeSpec> = None,
         /// `INFR_PAGER_STATS`.
         stats: bool = false,
+        /// `INFR_PAGER_TRACE`: write every pager pool's touch trace to this file (the format is
+        /// `infr_core::pager::trace`'s). One file holds every pool of the run; it is replayable to
+        /// the exact hit, miss and eviction counts `stats` prints. `None` = no trace, and no cost.
+        trace: Option<PathBuf> = None,
         /// `INFR_DRAM_CACHE`: the HOST weight-cache budget — the DRAM tier
         /// (`infr_core::hostpager`), which reads weights from the model file itself instead of
         /// leaving residency to the OS page cache.
         ///
-        /// `None` (the default) keeps the zero-copy mmap path, which costs nothing and is right
-        /// whenever the weights fit. This budget is anonymous, non-evictable memory, so it is only
-        /// ever what the user asked for — never a fraction picked on their behalf.
+        /// What a value does is decided by `infr_core::hostmem::streaming_arena_plan` (the GPU
+        /// tiers, reached only once the weights do not fit VRAM) and `cpu_arena_plan` (the CPU
+        /// backend); read those for the arithmetic.
+        ///
+        /// - `None` (the default) is automatic. The CPU backend keeps the zero-copy mmap path when
+        ///   the weights fit host memory. Otherwise an arena is sized from what the host can spare,
+        ///   or the mmap path stays when nothing can be measured or too little is free. On a
+        ///   unified-memory GPU the automatic answer is no arena at all: blocks are read from the
+        ///   file straight into the GPU-visible arena above, as with `dram_bypass`.
+        /// - `Some(0)` keeps the mmap path.
+        /// - Any other size is the arena's budget, on unified memory too (a budget too small to
+        ///   seat one block keeps the mmap path).
+        ///
+        /// `dram_bypass` outranks every value here: the GPU tiers then read through with no
+        /// arena, and the CPU backend keeps the mmap path.
         dram: Option<SizeSpec> = None,
         /// `INFR_DRAM_BYPASS`: read paged blocks straight from disk into GPU memory, with NO host
         /// cache in between — the shape a unified-memory device takes automatically, because there
@@ -177,10 +187,6 @@ cfg_struct! {
         /// only hardware most of this is developed and tested on. Also the honest choice on a
         /// machine whose RAM is better spent elsewhere.
         dram_bypass: bool = false,
-        /// `INFR_RELEASE_UPLOADED_PAGES`: after a mapped weight is copied into resident GPU
-        /// memory, drop its host pages from the process's mapping (`MADV_DONTNEED`). Lowers RSS
-        /// once a model is loaded; anything that reads those bytes later re-faults them from disk.
-        release_uploaded_pages: bool = false,
         /// `INFR_LAYER_MAJOR`, TRI-state: `None` = decide from the placement (layer-major whenever
         /// the model's weights STREAM, chunk-major when they are resident), `Some(true)` = force it
         /// on, `Some(false)` = force it off.
@@ -191,11 +197,47 @@ cfg_struct! {
         /// would only add activation residency — hence the auto rule. Both overrides exist for A/B:
         /// forcing it ON is how a resident model can be diffed against the chunk-major order.
         layer_major: Option<bool> = None,
+        /// The most prompt rows one layer-major prefill SEGMENT carries between layers. Config
+        /// only, no `INFR_*` key. A longer prompt runs as consecutive segments of whole chunks,
+        /// each layer-major, so the residual streams it holds stay bounded and the weights are
+        /// swept once per segment. `None` = automatic: on DeepSeek V4, as many rows as one GiB of
+        /// carried activations holds; every other family carries the whole prompt.
+        layer_major_rows: Option<usize> = None,
+        /// Early-submit cadence for PAGED Vulkan forwards, in dispatches (`0` = off). Config
+        /// only, no `INFR_*` key.
+        ///
+        /// A paged forward is re-recorded every token (its staging decisions change, so it cannot
+        /// replay one recording as a resident decode does). Recorded as one command buffer, the
+        /// GPU idles until the host has recorded all of it; closing the open segment and
+        /// submitting it once it holds this many dispatches lets the GPU run those while the host
+        /// records the rest. The count doubles after every cut, and starts over each time the
+        /// forward drains the queue (a paged MoE layer reading its router ids back) or rotates its
+        /// staging ring, so a forward takes a logarithmic number of cuts between two of those,
+        /// and those can come once per layer (`adapter::EarlySubmit` in `infr-vulkan`). A
+        /// throughput mechanism, separate from the submit splitter (`device.submit_dispatches`),
+        /// which bounds a submit against the GPU hang watchdog: a segment is closed when EITHER
+        /// count is reached, so this never lengthens a submit the splitter would have cut.
+        early_submit: usize = 8,
+        /// Hand a resident weight's mapped pages back to the OS file cache once its bytes are in
+        /// a DISCRETE GPU's memory (`infr_gguf::TensorBytes::release_resident`). Config only, no
+        /// `INFR_*` key; `false` is the A/B switch.
+        ///
+        /// Without it, every page the upload read stays in the process's resident set for as long
+        /// as the model is loaded. On Windows those pages count as in use, not as standby cache,
+        /// so the host keeps about the model's size of memory unavailable beside the copy in VRAM.
+        /// The mapping stays valid either way: a later host read of a released weight faults its
+        /// pages back in once. Never applied on a unified-memory device, on the CPU backend, or
+        /// to paged and streamed weights, which are read through the mapping again; see
+        /// `vulkan_moe_binder` in `infr-llama`.
+        release_uploaded: bool = true,
     }
 }
 
 cfg_struct! {
-    /// The native GEMV knob family (`recorder.rs`'s `GemvKnobs`, today `OnceLock`-memoized).
+    /// The native GEMV knob family. Every field is an ALIAS of a Vulkan tuning parameter
+    /// (`gemv.*`, `gemv_rm.*`, `gemv_sg.*`, `gemv_id_sg.*`; `infr tune list` names them): the
+    /// backend's tuning resolver reads these fields and writes the parameter at the level that set
+    /// them ([`tune::TUNE_ALIASES`]), and the kernels read the parameter.
     GemvCfg / PartialGemvCfg {
         /// `INFR_NO_GEMV_RM`: force the RM=1 path.
         no_rm: bool = false,
@@ -223,16 +265,49 @@ cfg_struct! {
 }
 
 cfg_struct! {
+    /// How the Vulkan backend resolves its per-device tuning parameters (`infr-vulkan`'s `tuning`
+    /// module; `infr tune show` prints the result). The values themselves are set under
+    /// [`VulkanCfg::tune`].
+    TuningCfg / PartialTuningCfg {
+        /// `INFR_TUNE_FILE`: a tuning file of rows in the built-in table's schema, applied above
+        /// the built-in rows and below every config, environment and command-line setting. A
+        /// value in it that fails validation is a hard error. Relative to the config file's folder
+        /// when set in a config file, to the working directory from the environment or `--set`.
+        file: Option<PathBuf> = None,
+        /// `INFR_TUNE_NO_ROWS` (inverted): apply the built-in table's device-class and device
+        /// rows. `false` resolves every parameter from its generic default (and the user's
+        /// settings) alone — on AMD's proprietary driver that includes turning off the int8
+        /// coopmat K-quant prefill GEMM and the CU-scaled split-K window, which are rows.
+        rows: bool = true,
+        /// `INFR_TUNE_DISABLE`: ids of table rows to ignore (built-in or tuning-file rows), so one
+        /// suspect row can be switched off without losing the rest.
+        disable: Vec<String> = Vec::new(),
+    }
+}
+
+cfg_struct! {
     /// Vulkan kernel-tier selection. Every field is named for the thing being ENABLED and is
     /// `true` when the feature is on; the env layer inverts the `INFR_NO_*` spellings. The four
     /// `no_*` fields are the sanctioned exceptions — their EFFECT is negative, so a positive
     /// name would be a lie.
+    ///
+    /// The fields listed in [`tune::TUNE_ALIASES`] (`flash_splits`, `pv_splits`,
+    /// `flash_min_rows`, `flash_bm32`, `mmv_mw_warps`, `moe_small_m`, `canvas_chunk_n`,
+    /// `i8cm_kq`, the `gemv` group) are aliases of Vulkan tuning parameters: they keep their
+    /// spelling and meaning, and the backend's tuning resolver turns them into the parameter.
     VulkanCfg / PartialVulkanCfg {
         subs {
             /// The GEMV family.
             gemv: GemvCfg => PartialGemvCfg,
+            /// How the per-device tuning parameters are resolved.
+            tuning: TuningCfg => PartialTuningCfg,
         }
         leaves {
+        /// `INFR_TUNE` / `[kernels.vulkan.tune]` / `--set kernels.vulkan.tune.<key>=<value>`: the
+        /// user's per-device tuning settings, `family.param[@qualifier] = value` (`infr tune list`
+        /// names every parameter). An open map: its keys are checked for shape here and resolved
+        /// by the Vulkan backend, where an unknown key or an out-of-range value is a hard error.
+        tune: TuneMap = TuneMap::default(),
         /// `INFR_NO_COOPMAT` (inverted). ANDed with [`VulkanCfg::f16`] at the probe: with
         /// `INFR_NO_F16` set, coopmat is off regardless — preserve that AND.
         coopmat: bool = true,
@@ -248,10 +323,22 @@ cfg_struct! {
         i8_coopmat: bool = false,
         /// `INFR_I8_ROW_SCALE`.
         i8_row_scale: bool = false,
+        /// `INFR_NO_I8CM_KQ` (inverted): the int8 cooperative-matrix K-quant prefill GEMM
+        /// (`native_gemm_i8cm_kq.comp`) on the devices it was measured faster on.
+        i8cm_kq: bool = true,
+        /// `INFR_NO_DP4A_KQ` (inverted): the packed-int8-dot K-quant prefill GEMM
+        /// (`native_gemm_dp4a_kq.comp`) as the non-coopmat tier's K-quant GEMM; off, those
+        /// shapes take the per-dtype `native_gemm_mmq_*` tile.
+        dp4a_kq: bool = true,
         /// `INFR_NO_F16` (inverted).
         f16: bool = true,
         /// `INFR_NO_I8DOT` (inverted).
         i8_dot: bool = true,
+        /// `INFR_FORCE_WAVE64`: a TESTING knob. Run the wave64 emulation (every pipeline pinned to
+        /// subgroup 64, `shaders/wave64.glsl`'s 32-lane virtual subgroups, cooperative matrix off) on a device
+        /// that could pin 32, so the path wave64-only GPUs (AMD GCN) take can be exercised on RDNA.
+        /// Refuses the device if it cannot pin 64. Never faster: leave it off.
+        force_wave64: bool = false,
 
         /// `INFR_NO_GEMM_WARP` (inverted).
         gemm_warp: bool = true,
@@ -268,36 +355,11 @@ cfg_struct! {
         mmq: bool = true,
         /// `INFR_NO_MMQ_FALLBACK` (inverted).
         mmq_fallback: bool = true,
-        /// `INFR_KQ_FMA_TIER`, TRI-state: the fp32 K-quant/Q4_0 prefill GEMM tier
-        /// (`native_gemm_kq_fma`) for older Vulkan GPUs without fast int8 dot
-        /// (GCN4/Polaris and other pre-coopmat parts). `None` = auto (on when
-        /// int8 dot is emulated).
-        kq_fma_tier: Option<bool> = None,
-        kq_fma_splitk: Option<usize> = None,
-        /// `INFR_KQ_FMA_GEMV`: fp32 K-quant decode/small-row GEMV; auto-on without fast int8 dot.
-        kq_fma_gemv: Option<bool> = None,
-        /// `INFR_WAVE64_NATIVE`, `=0|1`: on wave64-only devices (GCN), run the subgroup
-        /// decode GEMV family at its native 64-lane width (`-DSG=64` twins, plain full-wave
-        /// subgroup ops) instead of the default 32-lane halves emulated through
-        /// `subgroupClusteredAdd` (`shaders/wave64.glsl`). Default on; inert everywhere else
-        /// (only wave64 devices select the SG=64 builds). A/B knob for the wave64 data point.
-        wave64_native: bool = true,
-        /// `INFR_WEIGHTS_AS_SSBO`, `=0|1` — EXPERIMENTAL, default off: bind decode-GEMV
-        /// weights as storage buffers instead of reading them by 64-bit device address
-        /// (`native_gemv_kq_fma` today). May help GPUs without a scalar-base global load,
-        /// e.g. GFX8/Polaris, where every device-address load builds its own 64-bit address.
-        /// KNOWN-BAD in production (2026-11-02): parity-clean at test shapes but produces
-        /// nondeterministic garbage in-model on RX 580 Polaris — do not enable without a
-        /// greedy value-probe. Tensors past `maxStorageBufferRange` keep the device-address path.
-        weights_as_ssbo: bool = false,
         /// `INFR_NO_MMV` (inverted). NOT a presence knob — both sites are `is_err()`. Getting
         /// this backwards disables the mmv tier for everyone.
         mmv: bool = true,
         /// `INFR_MMV_DECODE`. The site is `mmv_decode && mmv`.
         mmv_decode: bool = false,
-        /// `INFR_NO_MMV_Q4K_META` (inverted): packed 16-byte Q4_K header loads
-        /// in the four-output int8 decode/verify kernel; disable for scalar metadata loads.
-        mmv_q4k_meta: bool = true,
         /// `INFR_NO_MMV_M4` (inverted).
         mmv_m4: bool = true,
         /// `INFR_NO_MMV_O4` (inverted).
@@ -347,14 +409,10 @@ cfg_struct! {
         /// `INFR_NO_ATTN_HD`: a `presence` knob despite the `NO_` spelling — sanctioned negative
         /// field.
         no_attn_hd_spec: bool = false,
-        /// `INFR_NO_ATTN_DECODE` (inverted): fixed-head split-K pass 1 for decode and small batches.
+        /// `INFR_NO_ATTN_DECODE` (inverted) — the decode-only split-K pass-1 specialization
+        /// (`attn_decode.comp`). Setting the env var keeps the general `attn_partial` builds on
+        /// the decode fast path; the output is bit-identical either way, so this is an A/B knob.
         attn_decode: bool = true,
-        /// `INFR_ATTN_DECODE_GQA`, TRI-state: the GQA-batched decode pass 1
-        /// (`attn_decode_gqa.comp`), which reads each K/V row once for all query heads sharing a
-        /// KV head instead of once per head. Not bit-identical to `attn_decode` (float summation
-        /// order). `None` = auto = off (measured slower than `attn_decode` on GFX8/Polaris,
-        /// the only hardware it has been tuned for; opt in per device with `=1`).
-        attn_decode_gqa: Option<bool> = None,
         /// `INFR_NO_MROWS_ATTN` / `INFR_MROWS_ATTN`, an ASYMMETRIC tri-state: `Some(false)` (the
         /// `NO_` key) wins unconditionally; `Some(true)` bypasses the rows/kv_len heuristic;
         /// `None` lets the heuristic decide.
@@ -373,14 +431,11 @@ cfg_struct! {
         dn_chunk: bool = true,
         /// `INFR_NO_DN_SPLIT` (inverted).
         dn_split: bool = true,
-        /// `INFR_DELTA_STRIDED`. Also read in `infr-llama`'s runner.
+        /// `INFR_DELTA_STRIDED`. Read by `infr-llama`'s runner, which emits the strided
+        /// `Op::DeltaNet` only on a backend reporting `Backend::deltanet_strided`.
         delta_strided: bool = false,
         /// `INFR_NO_PUSH_DESC` (inverted).
         push_desc: bool = true,
-        /// `INFR_GFX_QUEUE` — submit on the universal (graphics) family instead of a COMPUTE-only
-        /// one. The compositor renders on that same ring, so inference then competes with the
-        /// desktop's frames; kept for devices whose compute ring is unusable.
-        gfx_queue: bool = false,
         /// `INFR_NO_PIPELINE_CACHE` (inverted).
         pipeline_cache_disk: bool = true,
         /// `INFR_NO_VRAM_GUARD` — sanctioned negative field.
@@ -483,6 +538,14 @@ cfg_struct! {
         /// had one — it is the model the rest of the campaign follows: a typed field on the
         /// owning struct, chosen by the caller.
         reference: bool = false,
+        /// Keep the spin pool's threads (and the thread running the graph, for the walk) on one
+        /// logical processor per allowed core, the OS still placing them among those, so no two
+        /// of them share a core's SMT siblings. Only when the pool's threads fit one per allowed
+        /// core; with more, the OS keeps every allowed logical processor. Never wider than the
+        /// process's or the pool-building thread's affinity, read once when the pool is built. Where the platform has no placement (`infr_plat::cpu::spread_placement`,
+        /// Windows only today) the OS places the threads whatever this says. No env key, like
+        /// [`CpuCfg::reference`]: `--set kernels.cpu.core_spread=false` or the TOML file.
+        core_spread: bool = true,
     }
 }
 
@@ -642,12 +705,6 @@ cfg_struct! {
         /// (`INFR_PROFILE` — the BUILD-time host-instrumentation input read by `build.rs` — is
         /// deliberately NOT config; see [`manifest::NOT_MIGRATED`].)
         out: Option<PathBuf> = None,
-        /// `INFR_PROF_TRACE`: write the span TIMELINE as Chrome Trace Event JSON to this path —
-        /// one `"ph":"X"` slice per instrumented span on per-thread tracks, loadable in
-        /// `ui.perfetto.dev`. When a span is costlier than the slice you want, this is the answer
-        /// where [`out`](Self::out) is a process-wide aggregate. Host spans exist only in an
-        /// `INFR_PROFILE=1` build; an empty path means off.
-        trace: Option<PathBuf> = None,
         /// `INFR_PROF_METAL_DEVICE_TIME`: how Metal obtains per-op DEVICE time. See
         /// [`MetalDeviceTime`].
         metal_device_time: MetalDeviceTime = MetalDeviceTime::Off,
@@ -728,6 +785,12 @@ cfg_struct! {
         no_barrier: bool = false,
         /// `INFR_FULLBARRIER`.
         full_barrier: bool = false,
+        /// `INFR_CPU_OP_HASH`: the CPU interpreter appends one line per tensor each op reads and
+        /// writes to this file (backend, graph and op ordinals, the op's profiler label, the
+        /// tensor's element count and an FNV-1a hash of its bits), so two runs that should agree
+        /// can be diffed to the first op that does not. A bisecting aid; unset costs one branch
+        /// per op. Backends in one process may share the file; separate processes must not.
+        cpu_op_hash: Option<PathBuf> = None,
     }
 }
 
@@ -751,8 +814,6 @@ cfg_struct! {
         /// decision, made once they know their model's token rate and what a `--parallel` slot is
         /// worth to them.
         request_timeout_secs: u64 = 0,
-        /// `INFR_SERVE_IDLE_SECS`: exit after this many idle seconds; `0` disables idle exit.
-        idle_timeout_secs: u64 = 0,
         /// `INFR_SERVE_STATS_SECS`: how often `infr serve` logs its throughput line, in seconds.
         /// `0` switches the line off entirely.
         ///
@@ -762,13 +823,6 @@ cfg_struct! {
         /// happened emits nothing, so an idle server's log stays clean and the knob is only worth
         /// reaching for when the log itself is expensive.
         stats_interval_secs: u64 = 5,
-        /// `INFR_MMPROJ`: the vision projector (`mmproj-*.gguf`) for image input. Unset = the first
-        /// `mmproj*.gguf` beside the model file, if any.
-        mmproj: Option<PathBuf> = None,
-        /// `INFR_IMAGE_MAX_TOKENS`: soft-token ceiling per image (clamped to Gemma 4's 70..=1120).
-        /// More tokens = more detail, but the CPU vision encoder's attention grows with the square
-        /// of the image's patch count. 280 is Gemma 4's default budget.
-        image_max_tokens: usize = 280,
     }
 }
 
@@ -857,9 +911,10 @@ pub enum ConfigError {
         /// The repeated path.
         path: String,
     },
-    /// An environment variable held a value the engine rejects LOUDLY today (`INFR_SG`,
-    /// `INFR_SUBMIT_DISPATCHES`, the three multi-GPU device lists). Those keep erroring — that is
-    /// the behaviour being preserved, not an `unwrap_or` (R1).
+    /// An environment variable held a value the engine rejects LOUDLY (`INFR_SG`,
+    /// `INFR_SUBMIT_DISPATCHES`, the three multi-GPU device lists, and `INFR_TUNE`, which was born
+    /// strict). Those keep erroring — that is the behaviour being preserved, not an
+    /// `unwrap_or` (R1).
     #[error("{key}: {message}")]
     Env {
         /// The `INFR_*` variable.
@@ -918,9 +973,9 @@ impl Config {
     /// `Config::default()`.
     ///
     /// That infallibility is exactly why `VulkanBackend::new` and
-    /// `MetalBackend::new` do NOT use this: all five loud keys are `Config`-sourced now, so
+    /// `MetalBackend::new` do NOT use this: all six loud keys are `Config`-sourced, so
     /// swallowing the layer error there would silently drop an `INFR_SG` /
-    /// `INFR_SUBMIT_DISPATCHES` / device-list rejection a caller gets today. They build the same
+    /// `INFR_SUBMIT_DISPATCHES` / device-list / `INFR_TUNE` rejection a caller gets today. They build the same
     /// fold with `ConfigLayer::env()?` instead.
     pub fn load_from_env() -> Config {
         let layer = ConfigLayer::env().unwrap_or_default();

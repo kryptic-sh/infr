@@ -15,10 +15,6 @@ the `infr` inference engine. The top-level project overview lives in the root
   TOML file format and lookup order, `--set`, and a per-section walkthrough of
   what is tunable. Start here before reaching for an `INFR_*` variable.
 
-- [legacy-gpus.md](legacy-gpus.md) — this fork's focus: older and lower-end
-  Vulkan GPUs (AMD GCN / Polaris as the baseline). What changes on them, the
-  switches, serving tips for 8 GB cards, and measured results.
-
 ## Performance
 
 Everything performance-related lives under **[perf/](perf/README.md)** — start
@@ -35,7 +31,7 @@ at that index. It holds:
   recorded dead ends. Read before starting a perf slice.
 - [perf/kernels.md](perf/kernels.md) — cross-backend fast-kernel coverage (24/24
   quant formats on CPU / Vulkan / Metal) and each backend's decode strategy.
-- [perf/cpu.md](perf/cpu.md) — the CPU backend's own roadmap.
+- [perf/cpu.md](perf/cpu.md) — the CPU backend's perf notes and results.
 - [perf/vulkan-review.md](perf/vulkan-review.md) — multi-vendor review: what is
   RDNA3-tuned versus portable, and the per-vendor gaps.
 
@@ -46,7 +42,8 @@ at that index. It holds:
   KV, MTP, and the replay-tape correctness fix.
 - [igpu.md](igpu.md) — integrated-GPU correctness campaign (AMD APU / Intel iGPU
   / Strix Halo class): the UMA heap-table insight, the per-submit watchdog
-  root-cause + submit-splitter fix, and the model survey. Phase 1 complete.
+  root-cause + submit-splitter fix, and the model survey. Correctness done; iGPU
+  perf is `backlog.md` B99.
 
 ## Models & architectures
 
@@ -60,17 +57,25 @@ at that index. It holds:
   unified seam: block text-diffusion, the canvas denoise graph, and
   self-conditioning.
 - [mtp.md](mtp.md) — multi-token prediction (MTP) speculative decoding for
-  qwen35's single NextN head (issue #33).
+  qwen35's single NextN head (issue #33). Built, then **parked**: `INFR_MTP=1`
+  is ignored; the doc says why and keeps the design record.
 - [deepseek.md](deepseek.md) — the DeepSeek family port plan (V1 → V2/V3 → V3.2
   → V4), staged around the fact that only the first two stages have a model
-  small enough to develop against. Nothing implemented yet.
+  small enough to develop against. V2/V3 (`deepseek2`, which is also what
+  published V3.2 files declare) and the V3.2 indexer path (`deepseek32`,
+  synthetic fixtures only) generate; V4 (`deepseek4`) loads, but its
+  compressed-KV tiers are unbuilt.
 
 ## Roadmaps & history
 
+- [plan/](plan/00-index.md) — the phase plans: new model families, streaming for
+  any model size, pager eviction. One file per phase, indexed in `00-index.md`.
 - [plan.md](plan.md) — the whole-system shape in one place: what shipped against
   the original MVP, the crate layout and backend seam, the step-by-step recipe
-  for **adding a model architecture**, the ranked candidate families, and the
-  original milestones as history.
+  for **adding a model architecture**, and the ranked candidate families.
+- [disk-streaming-plan.md](disk-streaming-plan.md) — tiered weight paging (VRAM
+  → DRAM → disk): phases 0–3 landed and engage automatically when a model does
+  not fit; phase 4 (Metal) unbuilt; open items in `backlog.md` B35/B36.
 - [train.md](train.md) — LLM training support plan (not yet built).
 
 ## Testing & CI
@@ -91,11 +96,11 @@ at that index. It holds:
 
 ## Audit
 
-- [audit.md](audit.md) — module-by-module codebase audit for bugs, correctness,
-  perf, DRY, and YAGNI.
 - [backlog.md](backlog.md) — triaged work that is deliberately not done, with
   why (blocked on hardware, scoped out, or declined), plus withdrawn findings
   recorded so they are not rediscovered. The whole-tree correctness reviews that
   used to live in `code-review.md` were folded into it on 2026-08-03 and that
   file deleted: the re-verified findings are B19–B26, and the reviews' cleared /
-  hardening / coverage lists are B27–B29.
+  hardening / coverage lists are B27–B29. The 2026-07-21 module audit
+  (`audit.md`) was retired the same way on 2026-11-10: its four deferred
+  findings are B98.

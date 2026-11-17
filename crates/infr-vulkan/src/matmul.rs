@@ -158,6 +158,9 @@ impl VulkanBackend {
 
         let device = &self.shared.device;
         let spv = matmul_spv();
+        // Built outside the kernel cache, so it takes the cache's workgroup check here.
+        crate::caps::check_kernel_workgroup("matmul_f32", spv, &self.kernel_limits())
+            .map_err(be)?;
 
         // Every transient handle below is registered here as it is created, so all of them are
         // destroyed however this function leaves — including the dozen `?` early returns and the
@@ -272,8 +275,11 @@ impl VulkanBackend {
         let a_bytes: &[u8] = bytemuck::cast_slice(a);
         let b_bytes: &[u8] = bytemuck::cast_slice(b);
 
-        let buf_a = self.alloc(a_bytes.len(), BufferUsage::Weights)?;
-        let buf_b = self.alloc(b_bytes.len(), BufferUsage::Weights)?;
+        // Ordinary buffers, not `Weights`: those are arena sub-tensors that share one VkBuffer at
+        // an offset, and the descriptors below bind each handle whole from byte 0. Creation also
+        // holds an ordinary buffer to the range a whole binding may span.
+        let buf_a = self.alloc(a_bytes.len(), BufferUsage::Activations)?;
+        let buf_b = self.alloc(b_bytes.len(), BufferUsage::Activations)?;
         let buf_c = self.alloc(mn4, BufferUsage::Activations)?;
 
         self.upload(buf_a.as_ref(), a_bytes)?;

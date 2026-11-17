@@ -100,7 +100,7 @@ fn opt_kv_dtype(get: Get, key: &str) -> Option<Option<DType>> {
     get(key).map(|v| crate::budget::parse_kv_dtype(&v))
 }
 
-/// A multi-GPU device list. This is one of the five knobs that ERROR on a bad value today, so the
+/// A multi-GPU device list. This is one of the six knobs that ERROR on a bad value today, so the
 /// error propagates out of the layer instead of falling back. The per-knob minimum device counts
 /// differ (2 / 2 / 1) and are passed straight through to the shared parser.
 ///
@@ -189,16 +189,14 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kv.overflow = flag(get, "INFR_KV_OVERFLOW");
     p.kv.overflow_vram_mb = opt_mib(get, "INFR_KV_OVERFLOW_VRAM_MB");
     p.kv.overflow_reserve_mb = opt_mib(get, "INFR_KV_OVERFLOW_RESERVE_MB");
-    p.kv.store_mb = opt_mib(get, "INFR_KV_STORE_MB");
-    p.kv.paged = flag(get, "INFR_KV_PAGED").map(Some);
 
     // ── paging ───────────────────────────────────────────────────────────────
     p.paging.cache = opt_size(get, "INFR_CACHE");
     p.paging.ring = opt_size(get, "INFR_PAGER_RING");
     p.paging.dram = opt_size(get, "INFR_DRAM_CACHE");
     p.paging.dram_bypass = presence(get, "INFR_DRAM_BYPASS");
-    p.paging.release_uploaded_pages = flag(get, "INFR_RELEASE_UPLOADED_PAGES");
     p.paging.stats = presence(get, "INFR_PAGER_STATS");
+    p.paging.trace = opt_path(get, "INFR_PAGER_TRACE");
     // Tri-state: "0" ⇒ force chunk-major, any other value ⇒ force layer-major, unset ⇒ decide
     // from the placement (see `PagingCfg::layer_major`).
     p.paging.layer_major = get("INFR_LAYER_MAJOR").map(|s| Some(s != "0"));
@@ -212,8 +210,11 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.f8_prepack = presence(get, "INFR_F8_PREPACK");
     v.i8_coopmat = presence(get, "INFR_I8_COOPMAT");
     v.i8_row_scale = presence(get, "INFR_I8_ROW_SCALE");
+    v.i8cm_kq = presence_inv(get, "INFR_NO_I8CM_KQ");
+    v.dp4a_kq = presence_inv(get, "INFR_NO_DP4A_KQ");
     v.f16 = presence_inv(get, "INFR_NO_F16");
     v.i8_dot = presence_inv(get, "INFR_NO_I8DOT");
+    v.force_wave64 = presence(get, "INFR_FORCE_WAVE64");
 
     v.gemm_warp = presence_inv(get, "INFR_NO_GEMM_WARP");
     v.gemm_wide_tile = presence(get, "INFR_GEMM_WIDE_TILE");
@@ -222,15 +223,8 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.bm16 = presence_inv(get, "INFR_NO_BM16");
     v.mmq = presence_inv(get, "INFR_NO_MMQ");
     v.mmq_fallback = presence_inv(get, "INFR_NO_MMQ_FALLBACK");
-    // Tri-state: "0" ⇒ force off, any other value ⇒ force on, unset ⇒ auto.
-    v.kq_fma_tier = get("INFR_KQ_FMA_TIER").map(|s| Some(s != "0"));
-    v.kq_fma_splitk = opt_num(get, "INFR_KQ_FMA_SPLITK");
-    v.kq_fma_gemv = get("INFR_KQ_FMA_GEMV").map(|s| Some(s != "0"));
-    v.wave64_native = get("INFR_WAVE64_NATIVE").map(|s| s != "0");
-    v.weights_as_ssbo = get("INFR_WEIGHTS_AS_SSBO").map(|s| s != "0");
     v.mmv = presence_inv(get, "INFR_NO_MMV");
     v.mmv_decode = presence(get, "INFR_MMV_DECODE");
-    v.mmv_q4k_meta = presence_inv(get, "INFR_NO_MMV_Q4K_META");
     v.mmv_m4 = presence_inv(get, "INFR_NO_MMV_M4");
     v.mmv_o4 = presence_inv(get, "INFR_NO_MMV_O4");
     // Tri-state: "0" ⇒ force off, any other value ⇒ force on, unset ⇒ the vendor default.
@@ -259,7 +253,6 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.pv_splits = opt_num(get, "INFR_PV_SPLITS");
     v.no_attn_hd_spec = presence(get, "INFR_NO_ATTN_HD");
     v.attn_decode = presence_inv(get, "INFR_NO_ATTN_DECODE");
-    v.attn_decode_gqa = get("INFR_ATTN_DECODE_GQA").map(|s| Some(s != "0"));
     v.mla_sg = presence_inv(get, "INFR_NO_MLA_SG");
     // Asymmetric pair: the `NO_` key wins over the opt-in when BOTH are set.
     v.mrows_attn = if get("INFR_NO_MROWS_ATTN").is_some() {
@@ -276,7 +269,6 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     v.dn_split = presence_inv(get, "INFR_NO_DN_SPLIT");
     v.delta_strided = presence(get, "INFR_DELTA_STRIDED");
     v.push_desc = presence_inv(get, "INFR_NO_PUSH_DESC");
-    v.gfx_queue = presence(get, "INFR_GFX_QUEUE");
     v.pipeline_cache_disk = presence_inv(get, "INFR_NO_PIPELINE_CACHE");
     v.no_vram_guard = presence(get, "INFR_NO_VRAM_GUARD");
     v.no_moe_sm_pool = presence(get, "INFR_NO_MOE_SM_POOL");
@@ -293,6 +285,24 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|&n| n >= 2)
         .map(Some);
+
+    // ── kernels.vulkan.tuning / tune ─────────────────────────────────────────
+    v.tuning.file = opt_path(get, "INFR_TUNE_FILE");
+    v.tuning.rows = presence_inv(get, "INFR_TUNE_NO_ROWS");
+    v.tuning.disable = get("INFR_TUNE_DISABLE")
+        .map(|s| <Vec<String> as super::ConfigValue>::parse_set(&s).unwrap_or_default());
+    // A tuning setting is a typed user value: a malformed one is refused loudly, like every
+    // tuning value the backend later finds out of range.
+    if let Some(raw) = get("INFR_TUNE") {
+        let entries = super::tune::parse_list(&raw).map_err(|message| ConfigError::Env {
+            key: "INFR_TUNE",
+            message,
+        })?;
+        v.tune = Some(super::TuneMap {
+            entries,
+            aliases: Vec::new(),
+        });
+    }
 
     // `GemvKnobs::resolve`, verbatim — this whole group is already a pure resolver today.
     let g = &mut v.gemv;
@@ -377,7 +387,6 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.prof.vram = presence(get, "INFR_PROF_VRAM");
     p.prof.diffusion_trace = presence(get, "INFR_PROF_DIFFUSION_TRACE");
     p.prof.out = opt_path(get, "INFR_PROF_OUT");
-    p.prof.trace = opt_path(get, "INFR_PROF_TRACE");
     // Unlike its predecessor's exact-literal `"2"`/`"3"` compare, an unrecognized mode here falls
     // back to the default rather than silently meaning "on, level unrecognized".
     p.prof.metal_device_time = opt_text(get, "INFR_PROF_METAL_DEVICE_TIME")
@@ -392,6 +401,7 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.debug.chat = presence(get, "INFR_DEBUG_CHAT");
     p.debug.moe_counts = presence(get, "INFR_MOE_COUNTS_DEBUG");
     p.debug.moe_counts_dump = presence(get, "INFR_MOE_COUNTS_DUMP");
+    p.debug.cpu_op_hash = opt_path(get, "INFR_CPU_OP_HASH");
     p.debug.poison_uninit = presence(get, "INFR_POISON_UNINIT");
     p.debug.no_barrier = presence(get, "INFR_NOBARRIER");
     p.debug.full_barrier = presence(get, "INFR_FULLBARRIER");
@@ -404,17 +414,15 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // deadline"), not a bad one. Dropping it would make `INFR_REQUEST_TIMEOUT_SECS=0` mean "the
     // layer said nothing", so it could not turn a deadline back OFF over a config file that set one.
     p.serve.request_timeout_secs = num::<u64>(get, "INFR_REQUEST_TIMEOUT_SECS");
-    p.serve.idle_timeout_secs = num::<u64>(get, "INFR_SERVE_IDLE_SECS");
     // Ditto: `0` means "no periodic throughput line", a value the operator may need to set OVER a
     // config file that enabled it, so it must survive this layer rather than be filtered as junk.
     p.serve.stats_interval_secs = num::<u64>(get, "INFR_SERVE_STATS_SECS");
-    p.serve.mmproj = opt_path(get, "INFR_MMPROJ");
-    p.serve.image_max_tokens = num::<usize>(get, "INFR_IMAGE_MAX_TOKENS").filter(|&v| v > 0);
 
     // ── hub ──────────────────────────────────────────────────────────────────
     // NO `> 0` filter: `0` is a MEANINGFUL value ("fetch strictly one file at a time"), so it must
     // survive this layer to be able to turn concurrency back off over a config file that raised it.
     p.hub.pull_jobs = num::<usize>(get, "INFR_PULL_JOBS");
 
+    super::tune::stamp_layer(&mut p, super::TuneLevel::Env);
     Ok(p)
 }

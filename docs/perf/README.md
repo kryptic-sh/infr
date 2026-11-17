@@ -17,22 +17,12 @@ headline.
 - **[playbook.md](playbook.md)** — the optimization method: measure → profile →
   one lever at a time, the bottleneck taxonomy, and a long tail of dead ends
   recorded so they are not re-tried. Read before starting a perf slice.
-- **[vulkan-kq-fma-splitk.md](vulkan-kq-fma-splitk.md)** — why the prefill
-  GEMM's narrow grid is worth a split-k, and why it only pays when the slices
-  share one dispatch.
-- **[vulkan-decode-attn-chunk.md](vulkan-decode-attn-chunk.md)** — the decode
-  attention split-K chunk floor: why 64 keys per chunk was the wrong floor at
-  rows==1, and what it cost at shallow depths.
-- **[kv-prefix.md](kv-prefix.md)** — KV reuse across requests (the host block
-  store, a.k.a. reverse PagedAttention) and why long-context runs need the
-  inversion: page tables, copy-on-write, and the host store demoted to a cold
-  tier.
 - **[kernels.md](kernels.md)** — cross-backend fast-kernel coverage: which
   weight-quant formats have a native kernel on CPU / Vulkan / Metal, and each
   backend's decode strategy.
-- **[cpu.md](cpu.md)** — the CPU backend's own roadmap: the two-regime model
-  (decode DRAM-bound, prefill cache-bound), the native int8-quant landing
-  history, and what is left.
+- **[cpu.md](cpu.md)** — the CPU backend's perf notes: the two-regime model
+  (decode DRAM-bound, prefill cache-bound) and the native int8-quant landing
+  history. Open items are in `backlog.md` § B101.
 - **[vulkan-review.md](vulkan-review.md)** — multi-vendor review of the Vulkan
   backend: what is RDNA3-tuned versus genuinely portable, and the per-vendor
   gaps (Intel Arc, NVIDIA) that follow from it.

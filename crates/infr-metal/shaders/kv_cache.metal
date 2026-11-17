@@ -525,9 +525,8 @@ kernel void writekv_q4_0(device const float* src [[buffer(0)]],
                          uint gid [[thread_position_in_grid]]) {
     if (gid >= p.n / 32u) return;
     device const float* s = src + gid * 32u;
-    float vmax = -1e30f, vmin = 1e30f;
-    for (uint j = 0; j < 32u; j++) { vmax = max(vmax, s[j]); vmin = min(vmin, s[j]); }
-    float mx = (fabs(vmax) >= fabs(vmin)) ? vmax : vmin;
+    float amax = 0.0f, mx = 0.0f;
+    for (uint j = 0; j < 32u; j++) { float a = fabs(s[j]); if (a > amax) { amax = a; mx = s[j]; } }
     float d = mx / -8.0f;
     float id = d != 0.0f ? 1.0f / d : 0.0f;
     uint bo = (p.base / 32u + gid) * 18u;
@@ -587,9 +586,8 @@ kernel void writekv_q5_0(device const float* src [[buffer(0)]],
                          uint gid [[thread_position_in_grid]]) {
     if (gid >= p.n / 32u) return;
     device const float* s = src + gid * 32u;
-    float vmax = -1e30f, vmin = 1e30f;
-    for (uint j = 0; j < 32u; j++) { vmax = max(vmax, s[j]); vmin = min(vmin, s[j]); }
-    float mx = (fabs(vmax) >= fabs(vmin)) ? vmax : vmin;
+    float amax = 0.0f, mx = 0.0f;
+    for (uint j = 0; j < 32u; j++) { float a = fabs(s[j]); if (a > amax) { amax = a; mx = s[j]; } }
     float d = mx / -16.0f;
     float id = d != 0.0f ? 1.0f / d : 0.0f;
     uint bo = (p.base / 32u + gid) * 22u;
@@ -727,9 +725,8 @@ kernel void writekv_dyn_q4_0(device const float* src   [[buffer(0)]],
                              uint gid [[thread_position_in_grid]]) {
     if (gid >= p.n / 32u) return;
     device const float* s = src + gid * 32u;
-    float vmax = -1e30f, vmin = 1e30f;
-    for (uint j = 0; j < 32u; j++) { vmax = max(vmax, s[j]); vmin = min(vmin, s[j]); }
-    float mx = (fabs(vmax) >= fabs(vmin)) ? vmax : vmin;
+    float amax = 0.0f, mx = 0.0f;
+    for (uint j = 0; j < 32u; j++) { float a = fabs(s[j]); if (a > amax) { amax = a; mx = s[j]; } }
     float d = mx / -8.0f;
     float id = d != 0.0f ? 1.0f / d : 0.0f;
     ulong base_blk = (ulong)(uint)posb[0] * (p.row_stride >> 5);

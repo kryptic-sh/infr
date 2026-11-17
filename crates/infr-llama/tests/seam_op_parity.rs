@@ -3,7 +3,7 @@
 //! seam garbles; this pinpoints the culprit). Run with:
 //!   cargo test -p infr-llama --release --test seam_op_parity -- --include-ignored --nocapture
 use infr_core::backend::{Backend, Bindings, BufferUsage};
-use infr_core::graph::{Activation, AttnMask, Graph, MoeGating, Op};
+use infr_core::graph::{check_attention, Activation, AttnMask, CompSegment, Graph, MoeGating, Op};
 use infr_core::tensor::TensorDesc;
 use infr_core::{DType, TensorId};
 
@@ -21,6 +21,20 @@ fn run(
     out: TensorId,
     out_len: usize,
 ) -> Vec<f32> {
+    run_and_read(be, g, inputs, weights, out, out_len, &[]).0
+}
+
+/// [`run`], also downloading the inputs named in `read` after the execute — the recurrent ops'
+/// state, which they rewrite in place.
+fn run_and_read(
+    be: &dyn Backend,
+    g: &Graph,
+    inputs: &[(TensorId, &[f32])],
+    weights: &[(TensorId, &[f32])],
+    out: TensorId,
+    out_len: usize,
+    read: &[TensorId],
+) -> (Vec<f32>, Vec<Vec<f32>>) {
     let plan = be.compile(g).expect("compile");
     // Alloc + upload all inputs/weights first (owned), then bind from the Vec so the bound refs
     // outlive `execute`.
@@ -51,11 +65,21 @@ fn run(
     let mut o = vec![0f32; out_len];
     be.download(obuf.as_ref(), bytemuck::cast_slice_mut(&mut o))
         .unwrap();
-    o
+    let read = read
+        .iter()
+        .map(|id| {
+            let (_, buf) = keep.iter().find(|(k, _)| k == id).expect("read an input");
+            let mut v = vec![0f32; buf.len_bytes() / 4];
+            be.download(buf.as_ref(), bytemuck::cast_slice_mut(&mut v))
+                .unwrap();
+            v
+        })
+        .collect();
+    (o, read)
 }
 
 fn gpu() -> Option<infr_vulkan::VulkanBackend> {
-    infr_vulkan::VulkanBackend::new().ok()
+    infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new())
 }
 
 /// Does an in-place-mutated recurrent state Input PERSIST across `execute` calls? (Decode runs one
@@ -126,11 +150,43 @@ fn state_persists_across_executes() {
     );
 }
 
+/// The larger of `a` and `b`, or NaN if either is NaN — `f32::max` returns its non-NaN operand,
+/// so folding it over the errors of an all-NaN backend output scores it as exact. This crate does
+/// not depend on `infr-testkit`, whose `nan_max` this mirrors.
+fn nan_max(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        f32::NAN
+    } else {
+        a.max(b)
+    }
+}
+
+/// [`nan_max`] for `f64`.
+fn nan_max64(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
+    }
+}
+
+/// Max |a - b|, NaN if any difference is NaN.
 fn maxerr(a: &[f32], b: &[f32]) -> f32 {
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f32::max)
+        .fold(0.0, nan_max)
+}
+
+/// The comparison helpers must fail a NaN output, not score it as exact.
+#[test]
+fn maxerr_helpers_propagate_nan() {
+    assert!(maxerr(&[1.0, 2.0], &[f32::NAN, f32::NAN]).is_nan());
+    assert!(maxerr(&[1.0, 2.0], &[f32::NAN, 2.0]).is_nan());
+    assert!(maxerr64(&[f32::NAN, 2.0], &[1.0, 2.0]).is_nan());
+    assert!(maxdiff64(&[1.0, 2.0], &[1.0, f64::NAN]).is_nan());
+    assert!(nan_max64(nan_max64(0.0, f64::NAN), 1.0).is_nan());
+    assert_eq!(maxerr(&[1.0, 2.0], &[1.5, 2.0]), 0.5);
 }
 
 fn gen(n: usize, salt: usize) -> Vec<f32> {
@@ -403,6 +459,7 @@ fn qknormrope_attn_chain() {
         pos: 0,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let xi = gen(rows * nh * hd, 4);
     let wi = gen(hd, 5).iter().map(|v| v + 1.0).collect::<Vec<_>>();
@@ -526,6 +583,7 @@ fn qwen35_attn_core_writekv() {
         pos: 0,
         sinks: None,
         key_bias: None,
+        comp: None,
     });
     let qi = gen(rows * nh * hd, 4);
     let ki = gen(rows * nkv * hd, 8);
@@ -625,6 +683,128 @@ fn conv1d_silu_parity() {
     );
     println!("Conv1dSilu max_err={:e}", maxerr(&c, &v));
     assert!(maxerr(&c, &v) < 1e-3, "Conv1dSilu diverges");
+}
+
+/// LFM's gated short convolution on Vulkan against the CPU: one token and three tokens (the
+/// token-serial kernel) and a prefill-sized batch (the two-pass kernel), each from a NONZERO
+/// history so the carried state is read, and each scored on the output AND the history the op
+/// leaves behind for the next call.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn shortconv_parity() {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (cc, kernel) = (96usize, 7usize);
+    for rows in [1usize, 3, 37] {
+        let mut g = Graph::new();
+        let bcx = g.input(f32d(rows * 3 * cc));
+        let w = g.weight(f32d(cc * kernel));
+        let state = g.input(f32d((kernel - 1) * cc));
+        let dst = g.output(f32d(rows * cc));
+        g.push(Op::ShortConv {
+            bcx,
+            weight: w,
+            state,
+            dst,
+            rows: rows as u32,
+            channels: cc as u32,
+            kernel: kernel as u32,
+        });
+        let xi = gen(rows * 3 * cc, 21);
+        let wi = gen(cc * kernel, 22);
+        let st = gen((kernel - 1) * cc, 23);
+        let go = |be: &dyn Backend| {
+            run_and_read(
+                be,
+                &g,
+                &[(bcx, &xi), (state, &st)],
+                &[(w, &wi)],
+                dst,
+                rows * cc,
+                &[state],
+            )
+        };
+        let (c, cs) = go(&cpu);
+        let (v, vs) = go(&vk);
+        let (out_err, state_err) = (maxerr(&c, &v), maxerr(&cs[0], &vs[0]));
+        println!("ShortConv rows={rows} out max_err={out_err:e} state max_err={state_err:e}");
+        assert!(out_err < 1e-4, "ShortConv rows={rows}: output diverges");
+        assert!(state_err < 1e-5, "ShortConv rows={rows}: history diverges");
+    }
+}
+
+/// LFM3's per-head sigmoid gate on Vulkan against the CPU, at the 1.7B model's head shape.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn head_gate_parity() {
+    let Some(vk) = gpu() else {
+        return;
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let (rows, nh, hd) = (5usize, 16usize, 128usize);
+    let mut g = Graph::new();
+    let x = g.input(f32d(rows * nh * hd));
+    let gate = g.input(f32d(rows * nh));
+    let dst = g.output(f32d(rows * nh * hd));
+    g.push(Op::HeadGate {
+        x,
+        gate,
+        dst,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+    });
+    let xi = gen(rows * nh * hd, 31);
+    let gi = gen(rows * nh, 32);
+    let go = |be: &dyn Backend| run(be, &g, &[(x, &xi), (gate, &gi)], &[], dst, rows * nh * hd);
+    let (c, v) = (go(&cpu), go(&vk));
+    println!("HeadGate max_err={:e}", maxerr(&c, &v));
+    assert!(maxerr(&c, &v) < 1e-5, "HeadGate diverges");
+
+    // In place, as the runner applies it: on an internal activation that an earlier op wrote and a
+    // later op reads, with `dst == x`.
+    let n = rows * nh * hd;
+    let mut g = Graph::new();
+    let x = g.input(f32d(n));
+    let gate = g.input(f32d(rows * nh));
+    let attn = g.internal(f32d(n));
+    let dst = g.output(f32d(n));
+    g.push(Op::Copy {
+        src: x,
+        src_off: 0,
+        dst: attn,
+        dst_off: 0,
+        n: n as u32,
+    });
+    g.push(Op::HeadGate {
+        x: attn,
+        gate,
+        dst: attn,
+        rows: rows as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+    });
+    g.push(Op::Copy {
+        src: attn,
+        src_off: 0,
+        dst,
+        dst_off: 0,
+        n: n as u32,
+    });
+    let go = |be: &dyn Backend| run(be, &g, &[(x, &xi), (gate, &gi)], &[], dst, n);
+    let (ci, vi) = (go(&cpu), go(&vk));
+    println!(
+        "HeadGate in place max_err={:e} (cpu vs its out-of-place {:e})",
+        maxerr(&c, &vi),
+        maxerr(&c, &ci)
+    );
+    assert!(maxerr(&c, &ci) < 1e-6, "HeadGate in place moves the CPU");
+    assert!(
+        maxerr(&c, &vi) < 1e-5,
+        "HeadGate in place diverges on Vulkan"
+    );
 }
 
 #[test]
@@ -806,23 +986,18 @@ fn mla_parity() {
         key_bias: None,
     });
 
-    // Synthetic inputs — small integers for traceability.
-    // Q: row 0 head 0 = [1,2,3,4] (nope=[1,2], pe_raw=[3,4]), head 1 = [5,6,7,8]
-    //    row 1 head 0 = [9,10,11,12], head 1 = [13,14,15,16]
+    // Synthetic inputs — small tenths, so the scores stay within a few units of each other and
+    // the softmax weights every key: a one-hot softmax would hide a wrong scale.
+    // Q: row 0 head 0 = [.1,.2,.3,.4] (nope=[.1,.2], pe_raw=[.3,.4]), head 1 = [.5,.6,.7,.8]
+    //    row 1 head 0 = [.9,1.0,1.1,1.2], head 1 = [1.3,1.4,1.5,1.6]
     let qi: Vec<f32> = (1..=((rows * nh * q_head_dim) as i32))
-        .map(|x| x as f32)
+        .map(|x| x as f32 * 0.1)
         .collect();
-    // K cache: each row = [10,11,12, 1,2] (latent=[10,11,12], k_pe_raw=[1,2])
-    let ki: Vec<f32> = (0..rows * key_len)
-        .map(|i| {
-            let col = i % key_len;
-            if col < kv_lora {
-                (10 + col) as f32
-            } else {
-                (1 + (col - kv_lora)) as f32
-            }
-        })
-        .collect();
+    // K cache rows DIFFER, so the output depends on the attention weights (identical rows make
+    // V the same for every key, and any weights at all average to it):
+    //   row 0 = [1.0,1.1,1.2, 0.1,0.2] (latent, k_pe_raw), row 1 = [-0.5,0.3,0.9, -0.4,0.6]
+    let ki: Vec<f32> = vec![1.0, 1.1, 1.2, 0.1, 0.2, -0.5, 0.3, 0.9, -0.4, 0.6];
+    assert_eq!(ki.len(), rows * key_len);
     // wk_b[h][a_idx][nope_idx]: lay out as [nh][kv_lora][qk_nope] row-major within each head.
     // wk_b[h=0] = [[1,0], [0,1], [0,0]]  — maps nope[0]→latent[0], nope[1]→latent[1]
     // wk_b[h=1] = [[0,0], [1,0], [0,1]]  — maps nope[0]→latent[1], nope[1]→latent[2]
@@ -1244,13 +1419,7 @@ fn moe_ref(
         .map(|e| dot(&router[e * ne..(e + 1) * ne], x))
         .collect();
     let probs: Vec<f32> = match gating {
-        MoeGating::Softmax => {
-            let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut p: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
-            let psum: f32 = p.iter().sum();
-            p.iter_mut().for_each(|v| *v /= psum);
-            p
-        }
+        MoeGating::Softmax => softmax_ref(&logits),
         MoeGating::Sigmoid => logits.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect(),
         MoeGating::SqrtSoftplus => logits
             .iter()
@@ -1265,12 +1434,46 @@ fn moe_ref(
             .collect(),
     };
     // Selection-only copy: `bias` shifts top-k selection; the UNBIASED `probs` still drive weights.
-    let mut sel: Vec<f32> = match bias {
+    let sel: Vec<f32> = match bias {
         Some(b) => probs.iter().zip(b).map(|(&p, &bi)| p + bi).collect(),
         None => probs.clone(),
     };
-    // Group-limited routing: per-group score = sum of the top-2 sel values; keep the top
-    // `n_expert_groups_used` groups, mask the rest to -inf (llama.cpp `build_moe_ffn`).
+    let idx = select_experts(sel, n_expert_groups, n_expert_groups_used, n_used);
+    // norm_w: renormalize the selected (UNBIASED) probs to sum to 1, then scale.
+    let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
+    let mut out = vec![0f32; ne];
+    for &e in &idx {
+        // gate/up are [n_expert, n_ff_exp, ne], down is [n_expert, ne, n_ff_exp] (row-major).
+        let gs = e * n_ff_exp * ne;
+        let ds = e * ne * n_ff_exp;
+        let actv: Vec<f32> = (0..n_ff_exp)
+            .map(|j| {
+                let g = dot(&gate[gs + j * ne..gs + (j + 1) * ne], x);
+                let u = dot(&up[gs + j * ne..gs + (j + 1) * ne], x);
+                let silu = |z: f32| z / (1.0 + (-z).exp());
+                silu(g) * u
+            })
+            .collect();
+        let w_e = probs[e] / wsum * scale;
+        for i in 0..ne {
+            out[i] += w_e * dot(&down[ds + i * n_ff_exp..ds + (i + 1) * n_ff_exp], &actv);
+        }
+    }
+    out
+}
+
+/// The top-`n_used` experts by `scores` (descending), after group-limited routing when
+/// `n_expert_groups > 1`: a group scores the sum of its top-2 `scores`, the top
+/// `n_expert_groups_used` groups are kept and the rest masked to -inf (llama.cpp
+/// `build_moe_ffn`). [`moe_ref`] passes the gated probabilities plus the bias; a test passes other
+/// scores to show what a different selection rule would pick.
+fn select_experts(
+    mut sel: Vec<f32>,
+    n_expert_groups: usize,
+    n_expert_groups_used: usize,
+    n_used: usize,
+) -> Vec<usize> {
+    let n_expert = sel.len();
     if n_expert_groups > 1 && n_expert_groups_used > 0 {
         let per = n_expert / n_expert_groups;
         let mut gscore = Vec::with_capacity(n_expert_groups);
@@ -1300,27 +1503,141 @@ fn moe_ref(
     let mut idx: Vec<usize> = (0..n_expert).collect();
     idx.sort_by(|&a, &b| sel[b].partial_cmp(&sel[a]).unwrap());
     idx.truncate(n_used);
-    // norm_w: renormalize the selected (UNBIASED) probs to sum to 1, then scale.
-    let wsum: f32 = idx.iter().map(|&e| probs[e]).sum::<f32>().max(1e-20);
-    let mut out = vec![0f32; ne];
-    for &e in &idx {
-        // gate/up are [n_expert, n_ff_exp, ne], down is [n_expert, ne, n_ff_exp] (row-major).
-        let gs = e * n_ff_exp * ne;
-        let ds = e * ne * n_ff_exp;
-        let actv: Vec<f32> = (0..n_ff_exp)
-            .map(|j| {
-                let g = dot(&gate[gs + j * ne..gs + (j + 1) * ne], x);
-                let u = dot(&up[gs + j * ne..gs + (j + 1) * ne], x);
-                let silu = |z: f32| z / (1.0 + (-z).exp());
-                silu(g) * u
-            })
-            .collect();
-        let w_e = probs[e] / wsum * scale;
-        for i in 0..ne {
-            out[i] += w_e * dot(&down[ds + i * n_ff_exp..ds + (i + 1) * n_ff_exp], &actv);
-        }
+    idx
+}
+
+/// The softmax probabilities of `logits` (shift by the max, divide by the sum), as [`moe_ref`]
+/// and the CPU backend compute them.
+fn softmax_ref(logits: &[f32]) -> Vec<f32> {
+    let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let p: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+    let psum: f32 = p.iter().sum();
+    p.iter().map(|v| v / psum).collect()
+}
+
+/// One renormalized, SiLU, split gate/up `Op::MoeFfn` routing case at rows = 1 and
+/// ne = n_ff_exp = 32 (the Vulkan expert id-GEMV's floor; see `moe_sqrt_softplus_parity`), whose
+/// router logits are `lead` (router row `e` is `lead[e]` on its first input and 0 elsewhere, the
+/// input all ones): the CPU backend against [`moe_ref`], then Vulkan against the CPU when a GPU is
+/// present.
+fn moe_routing_parity(
+    name: &str,
+    gating: MoeGating,
+    lead: &[f32],
+    bias: Option<&[f32]>,
+    groups: (usize, usize),
+    n_used: usize,
+) {
+    let cpu = infr_cpu::CpuBackend::new();
+    let (ne, n_expert, n_ff_exp) = (32usize, lead.len(), 32usize);
+    let mut g = Graph::new();
+    let x = g.input(f32d(ne));
+    let router_x = g.input(f32d(ne));
+    let router = g.weight(f32d(n_expert * ne));
+    let gate_exps = g.weight(f32d(n_expert * n_ff_exp * ne));
+    let up_exps = g.weight(f32d(n_expert * n_ff_exp * ne));
+    let down_exps = g.weight(f32d(n_expert * ne * n_ff_exp));
+    let exp_probs_b = bias.map(|_| g.weight(f32d(n_expert)));
+    let dst = g.output(f32d(ne));
+    g.push(Op::MoeFfn {
+        x,
+        router_x,
+        router,
+        gate_exps,
+        up_exps,
+        down_exps,
+        down_scale: None,
+        fused_gate_up: false,
+        dst,
+        ne: ne as u32,
+        n_expert: n_expert as u32,
+        n_used: n_used as u32,
+        n_ff_exp: n_ff_exp as u32,
+        scale: 1.0,
+        act: Activation::Silu,
+        gating,
+        norm_w: true,
+        weight_before: false,
+        ep_band: None,
+        exp_probs_b,
+        n_expert_groups: groups.0 as u32,
+        n_expert_groups_used: groups.1 as u32,
+        swiglu_clamp: None,
+        expert_ids: None,
+    });
+    let xi = [1.0f32; 32];
+    let ri: Vec<f32> = (0..n_expert * ne)
+        .map(|i| if i % ne == 0 { lead[i / ne] } else { 0.0 })
+        .collect();
+    let gi = gen(n_expert * n_ff_exp * ne, 21);
+    let ui = gen(n_expert * n_ff_exp * ne, 22);
+    let di = gen(n_expert * ne * n_ff_exp, 23);
+    let ins = [(x, &xi[..]), (router_x, &xi[..])];
+    let mut ws = vec![
+        (router, &ri[..]),
+        (gate_exps, &gi[..]),
+        (up_exps, &ui[..]),
+        (down_exps, &di[..]),
+    ];
+    if let (Some(id), Some(b)) = (exp_probs_b, bias) {
+        ws.push((id, b));
     }
-    out
+    let c = run(&cpu, &g, &ins, &ws, dst, ne);
+    let reference = moe_ref(
+        &xi, &ri, &gi, &ui, &di, ne, n_expert, n_used, n_ff_exp, 1.0, gating, bias, groups.0,
+        groups.1,
+    );
+    let e = maxerr(&c, &reference);
+    println!("MoeFfn({name}) cpu-vs-ref max_err={e:e}");
+    assert!(
+        e < 1e-4,
+        "MoeFfn {name} diverges from reference: max_err={e:e}"
+    );
+    if let Some(vk) = gpu() {
+        let v = run(&vk, &g, &ins, &ws, dst, ne);
+        let e = maxerr(&c, &v);
+        println!("MoeFfn({name}) cpu-vs-vulkan max_err={e:e}");
+        assert!(e < 1e-3, "MoeFfn {name} diverges on Vulkan: max_err={e:e}");
+    }
+}
+
+/// Softmax gating with a router bias (ERNIE 4.5 MoE's router): the bias is added to the softmax
+/// PROBABILITY for selection (llama.cpp `selection_probs = ggml_add(probs, exp_probs_b)`), whose
+/// scale the whole row sets, not to the logit. Logits 3.0 … 0.7 give probabilities 0.375 … 0.038;
+/// a +0.45 / +0.40 bias on experts 4 and 5 lifts their selection scores to 0.501 / 0.446, past
+/// expert 0's 0.375, so the reference selects {4, 5}, while adding the same bias to the logits
+/// (1.45, 1.30 against 3.0 and 2.5) would select {0, 1}. Both selections are asserted on the
+/// reference's own arithmetic, so the data cannot drift into a case the rule does not decide. The
+/// weights still come from the unbiased probabilities of 4 and 5, renormalized.
+#[test]
+fn moe_softmax_bias_parity() {
+    let lead = [3.0f32, 2.5, 2.0, 1.5, 1.0, 0.9, 0.8, 0.7];
+    let bias = [0.0f32, 0.0, 0.0, 0.0, 0.45, 0.40, 0.0, 0.0];
+    let biased = |s: Vec<f32>| -> Vec<f32> { s.iter().zip(&bias).map(|(a, b)| a + b).collect() };
+    assert_eq!(select_experts(biased(softmax_ref(&lead)), 0, 0, 2), [4, 5]);
+    assert_eq!(select_experts(biased(lead.to_vec()), 0, 0, 2), [0, 1]);
+    moe_routing_parity(
+        "softmax+bias",
+        MoeGating::Softmax,
+        &lead,
+        Some(&bias),
+        (0, 0),
+        2,
+    );
+}
+
+/// Softmax gating with group-limited routing and no bias: a group scores the sum of its top-2
+/// selection PROBABILITIES (llama.cpp `build_moe_ffn` sums `selection_probs`). Group 0 holds
+/// logits 3.0 and 0.0, group 1 holds 2.0 and 1.9: by probability group 0 wins (20.1 + 1.0 against
+/// 7.4 + 6.7, in units of the shared denominator), by logit sum group 1 would (3.0 against 3.9).
+/// With one group kept and two experts used, the reference selects {0, 1} and the logit rule
+/// {2, 3}; both are asserted on the reference's arithmetic.
+#[test]
+fn moe_softmax_groups_parity() {
+    let lead = [3.0f32, 0.0, 2.0, 1.9];
+    assert_eq!(select_experts(softmax_ref(&lead), 2, 1, 2), [0, 1]);
+    assert_eq!(select_experts(lead.to_vec(), 2, 1, 2), [2, 3]);
+    moe_routing_parity("softmax+groups", MoeGating::Softmax, &lead, None, (2, 1), 2);
 }
 
 /// `Op::MoeFfn` with DeepSeek V4 gating — `MoeGating::SqrtSoftplus` (`sqrt(softplus(logit))`,
@@ -1678,13 +1995,15 @@ fn lightning_indexer_ref(
     top_k: usize,
     scale: f32,
     pos: usize,
+    block_ratio: usize,
 ) -> (Vec<u32>, Vec<Vec<f64>>) {
     let mut idx_out = Vec::with_capacity(rows * top_k);
     let mut score_out = Vec::with_capacity(rows);
     for t in 0..rows {
-        // Causal: a key at an absolute position past the query's is not eligible; the cache only
-        // holds `kv_len` positions.
-        let hi = (pos + t + 1).min(kv_len);
+        // Causal: a key is eligible once the query has completed its block of `block_ratio`
+        // positions (with one position per key: not past the query's own); the cache only holds
+        // `kv_len` keys.
+        let hi = ((pos + t + 1) / block_ratio).min(kv_len);
         let mut sc = vec![0f64; kv_len];
         for (j, s) in sc.iter_mut().enumerate().take(hi) {
             let mut acc = 0f64;
@@ -1888,6 +2207,7 @@ fn lightning_indexer_parity() {
             top_k: top_k as u32,
             scale,
             pos: pos as u32,
+            block_ratio: 1,
         });
 
         // The cache is f16 (what `WriteKv` produces and what both GPU kernels read), so the shared
@@ -1917,7 +2237,7 @@ fn lightning_indexer_parity() {
         };
 
         let (want, scores) = lightning_indexer_ref(
-            &qi, &keys, &wi, rows, n_head, head_dim, kv_len, top_k, scale, pos,
+            &qi, &keys, &wi, rows, n_head, head_dim, kv_len, top_k, scale, pos, 1,
         );
         for (t, sc) in scores.iter().enumerate() {
             assert_scores_separated(sc, (pos + t + 1).min(kv_len), &format!("{name} row {t}"));
@@ -1984,6 +2304,7 @@ fn lightning_indexer_head_sum_is_a_sum_not_a_max() {
         top_k: top_k as u32,
         scale: 1.0,
         pos: (kv_len - 1) as u32, // every key eligible
+        block_ratio: 1,
     });
 
     let kf: Vec<u8> = cache
@@ -2074,6 +2395,7 @@ fn lightning_indexer_scale_cannot_change_the_selection() {
             top_k: top_k as u32,
             scale,
             pos: pos as u32,
+            block_ratio: 1,
         });
         let be: &dyn Backend = &cpu;
         let plan = be.compile(&g).unwrap();
@@ -2099,6 +2421,182 @@ fn lightning_indexer_scale_cannot_change_the_selection() {
     println!("LightningIndexer scale invariance: {normalised:?}");
     assert_eq!(normalised, select(1.0), "scale 1 changed the selection");
     assert_eq!(normalised, select(64.0), "scale 64 changed the selection");
+}
+
+// ── Op::Rope with the llama3 `rope_freqs.weight` divisors (llama / llama4) ──────────────────
+
+/// llama.cpp's `ggml_compute_forward_rope_f32` for a NORM rope at `ext_factor = 0`,
+/// `freq_scale = 1`, `attn_factor = 1` (what `llama.cpp`'s llama/llama4 builders pass for a llama3
+/// checkpoint), transcribed in f64: `ggml_rope_cache_init` walks `theta` from the position and
+/// multiplies it by `theta_scale = base^(-2/n_dims)` after every pair; pair `i0/2` divides its
+/// `theta` by `freq_factors[i0/2]` (`theta_extrap = theta / ff`) before `rope_yarn` takes the
+/// cosine and sine; `rotate_pairs` with `n_offset = 1` rotates `(i0, i0 + 1)`.
+fn ggml_rope_norm_f64(
+    x: &[f32],
+    pos: i64,
+    n_head: usize,
+    head_dim: usize,
+    n_dims: usize,
+    freq_base: f64,
+    freq_factors: &[f32],
+) -> Vec<f64> {
+    let mut out: Vec<f64> = x.iter().map(|&v| v as f64).collect();
+    let theta_scale = freq_base.powf(-2.0 / n_dims as f64);
+    for h in 0..n_head {
+        let b = h * head_dim;
+        let mut theta = pos as f64;
+        for i0 in (0..n_dims).step_by(2) {
+            let theta_extrap = theta / freq_factors[i0 / 2] as f64;
+            let (s, c) = theta_extrap.sin_cos();
+            let (x0, x1) = (x[b + i0] as f64, x[b + i0 + 1] as f64);
+            out[b + i0] = x0 * c - x1 * s;
+            out[b + i0 + 1] = x0 * s + x1 * c;
+            theta *= theta_scale;
+        }
+    }
+    out
+}
+
+/// The `rope_freqs.weight` a llama3 checkpoint carries: `conversion/llama.py`'s
+/// `generate_extra_tensors` at Llama 3.1's `rope_scaling` (factor 8, low/high frequency factors 1
+/// and 4, original context 8192).
+fn llama3_rope_freqs(n_dims: usize, base: f64) -> Vec<f32> {
+    let (factor, low, high, old_ctx) = (8.0f64, 1.0f64, 4.0f64, 8192.0f64);
+    let (low_wavelen, high_wavelen) = (old_ctx / low, old_ctx / high);
+    (0..n_dims / 2)
+        .map(|p| {
+            let freq = 1.0 / base.powf((2 * p) as f64 / n_dims as f64);
+            let wavelen = std::f64::consts::TAU / freq;
+            if wavelen < high_wavelen {
+                1.0
+            } else if wavelen > low_wavelen {
+                factor as f32
+            } else {
+                let smooth = (old_ctx / wavelen - low) / (high - low);
+                (1.0 / ((1.0 - smooth) / factor + smooth)) as f32
+            }
+        })
+        .collect()
+}
+
+/// `Op::Rope` with `freq_factors` writing the f16 q/k scratch — the shape the llama/llama4 seam
+/// emits — against the f64 transcription of ggml's rope above, at positions from 0 to past
+/// Llama 3.1's 128k window, on CPU and Vulkan.
+///
+/// The tolerance is the f32 angle's own rounding (an angle of `θ` radians is only known to
+/// `θ·ε`, which at the largest position here dwarfs every other error) plus the f16 store. The
+/// factors move the low-frequency pairs' angles by up to 7/8 of themselves, so the same rotation
+/// WITHOUT them must miss the reference by far more than that tolerance — asserted too, so the
+/// test cannot pass on a backend that drops the divisors.
+#[test]
+fn rope_freq_factors_match_ggml_at_long_positions() {
+    let (n_head, head_dim, rope_dim) = (2usize, 64usize, 64usize);
+    let base = 500000.0f64;
+    let ff = llama3_rope_freqs(rope_dim, base);
+    assert!(
+        ff.iter().any(|&f| f > 1.0) && ff.contains(&1.0),
+        "the factor profile must mix scaled and unscaled pairs: {ff:?}"
+    );
+    let rows = 2usize;
+    let row = n_head * head_dim;
+    let xi = gen(rows * row, 29);
+    let mut backends: Vec<Box<dyn Backend>> = vec![Box::new(infr_cpu::CpuBackend::new())];
+    if let Some(vk) = gpu() {
+        backends.push(Box::new(vk));
+    }
+    for be in &backends {
+        let f16_store = be.name() != "cpu";
+        for p0 in [0i32, 1, 7, 4095, 8191, 65535, 131070] {
+            let positions = [p0, p0 + 1];
+            let run_one = |with_ff: bool| -> Vec<f32> {
+                let mut g = Graph::new();
+                let x = g.input(f32d(rows * row));
+                let pos = g.input(TensorDesc::new(vec![rows], DType::I32));
+                let ffid = g.input(f32d(ff.len()));
+                let dst = g.output(TensorDesc::new(vec![rows * row], DType::F16));
+                g.push(Op::Rope {
+                    x,
+                    positions: pos,
+                    dst,
+                    rows: rows as u32,
+                    n_head: n_head as u32,
+                    head_dim: head_dim as u32,
+                    rope_dim: rope_dim as u32,
+                    theta: base as f32,
+                    freq_factors: with_ff.then_some(ffid),
+                    x_stride: 0,
+                    neox: false,
+                    backward: false,
+                });
+                let plan = be.compile(&g).unwrap();
+                let up = |data: &[u8]| {
+                    let b = be.alloc(data.len(), BufferUsage::Activations).unwrap();
+                    be.upload(b.as_ref(), data).unwrap();
+                    b
+                };
+                let xb = up(bytemuck::cast_slice(&xi));
+                let pb = up(bytemuck::cast_slice(&positions));
+                let fb = up(bytemuck::cast_slice(&ff));
+                // The CPU reference keeps every buffer as f32; Vulkan stores the declared f16.
+                let elem = if f16_store { 2 } else { 4 };
+                let ob = be.alloc(rows * row * elem, BufferUsage::Readback).unwrap();
+                let mut b = Bindings::new();
+                b.bind(x, xb.as_ref());
+                b.bind(pos, pb.as_ref());
+                b.bind(ffid, fb.as_ref());
+                b.bind(dst, ob.as_ref());
+                be.execute(plan.as_ref(), &b).unwrap();
+                let mut bytes = vec![0u8; rows * row * elem];
+                be.download(ob.as_ref(), &mut bytes).unwrap();
+                if f16_store {
+                    bytemuck::cast_slice::<u8, u16>(&bytes)
+                        .iter()
+                        .map(|&h| half::f16::from_bits(h).to_f32())
+                        .collect()
+                } else {
+                    bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+                }
+            };
+            let (got, plain) = (run_one(true), run_one(false));
+            let (mut worst, mut plain_miss) = (0f64, 0f64);
+            for (r, &p) in positions.iter().enumerate() {
+                let xr = &xi[r * row..(r + 1) * row];
+                let want = ggml_rope_norm_f64(xr, p as i64, n_head, head_dim, rope_dim, base, &ff);
+                for h in 0..n_head {
+                    for i0 in (0..rope_dim).step_by(2) {
+                        let ang = p as f64 * base.powf(-(i0 as f64) / rope_dim as f64)
+                            / ff[i0 / 2] as f64;
+                        let b = h * head_dim + i0;
+                        let mag = (xr[b] as f64).abs() + (xr[b + 1] as f64).abs();
+                        let tol = mag * (16.0 * ang * f32::EPSILON as f64 + 1e-3) + 1e-6;
+                        for i in [b, b + 1] {
+                            let e = (got[r * row + i] as f64 - want[i]).abs();
+                            worst = nan_max64(worst, e / tol);
+                            let miss = (plain[r * row + i] as f64 - want[i]).abs();
+                            plain_miss = plain_miss.max(miss / tol);
+                        }
+                    }
+                }
+            }
+            println!(
+                "Rope+ff {} pos {p0}: worst err/tol {worst:.3}, without ff {plain_miss:.1}",
+                be.name()
+            );
+            assert!(
+                worst <= 1.0,
+                "{} rope with freq_factors at position {p0} misses ggml by {worst:.3}x tolerance",
+                be.name()
+            );
+            if p0 >= 4095 {
+                assert!(
+                    plain_miss > 10.0,
+                    "{} at position {p0}: dropping the factors stays within {plain_miss:.1}x \
+                     tolerance, so this comparison cannot see them",
+                    be.name()
+                );
+            }
+        }
+    }
 }
 
 // ── Op::Rope's NEOX pairing (deepseek32's lightning indexer) ─────────────────────────────────
@@ -2228,7 +2726,7 @@ fn rope_neox_and_norm_parity() {
         for h in 0..n_head {
             let b = (r * n_head + h) * head_dim;
             for i in 0..rope_dim {
-                worst = worst.max((got[0][b + i] - got[1][b + i]).abs());
+                worst = nan_max(worst, (got[0][b + i] - got[1][b + i]).abs());
             }
             for i in rope_dim..head_dim {
                 assert_eq!(
@@ -2295,6 +2793,7 @@ fn topk_mask_parity() {
         top_k: top_k as u32,
         scale,
         pos: pos as u32,
+        block_ratio: 1,
     });
     g.push(Op::TopkMask {
         idx,
@@ -2331,7 +2830,7 @@ fn topk_mask_parity() {
     // Expected mask, from the indexer's own from-formula reference: 0.0 at each selected key,
     // -inf everywhere else.
     let (sel, _) = lightning_indexer_ref(
-        &qi, &keys, &wi, rows, n_head, head_dim, kv_len, top_k, scale, pos,
+        &qi, &keys, &wi, rows, n_head, head_dim, kv_len, top_k, scale, pos, 1,
     );
     let mut want = vec![f32::NEG_INFINITY; rows * kv_len];
     for r in 0..rows {
@@ -2771,6 +3270,7 @@ fn attention_sinks_are_denominator_only() {
             pos: 0,
             sinks: with_sinks.then_some(sk),
             key_bias: None,
+            comp: None,
         });
         (g, q, kc, vc, sk, dst)
     };
@@ -2987,6 +3487,7 @@ fn attention_key_bias_matches_f64_reference_and_combines_with_sinks() {
             pos: 0,
             sinks: with_sinks.then_some(sk),
             key_bias: kb,
+            comp: None,
         });
         (g, q, kc, vc, kb, sk, dst)
     };
@@ -3171,6 +3672,7 @@ fn attention_key_bias_removes_the_masked_keys() {
             pos: (kv_len - 1) as u32,
             sinks: None,
             key_bias: kb,
+            comp: None,
         });
         let to_f16 = |rows: &[Vec<f32>]| -> Vec<u8> {
             rows.iter()
@@ -3317,6 +3819,7 @@ fn attention_key_bias_joins_before_the_max() {
             pos: 0,
             sinks: None,
             key_bias: with_bias.then_some(kb),
+            comp: None,
         });
         (g, q, kc, vc, kb, dst)
     };
@@ -3456,6 +3959,7 @@ fn attention_key_bias_indexed_by_key_position_not_ring_row() {
             pos: pos as u32,
             sinks: None,
             key_bias: Some(kb),
+            comp: None,
         });
         (g, q, kc, vc, kb, dst)
     };
@@ -3526,6 +4030,1482 @@ fn attention_key_bias_indexed_by_key_position_not_ring_row() {
     check(&cpu, "cpu");
     if let Some(vk) = gpu() {
         check(&vk, "vulkan");
+    }
+}
+
+// ── One cache as both K and V (deepseek4's `build_attn_mha(q, k_all, k_all, …)`) ──────────────
+
+/// One `Op::Attention` shape for [`attention_one_cache_as_k_and_v`]: the caches are written by
+/// `Op::WriteKv` inside the graph, so each backend quantizes them in its own layout (Vulkan's Q8_0
+/// is planar), and the query rows are the last `rows` of `kv_len`.
+struct AliasCase {
+    name: &'static str,
+    dtype: DType,
+    rows: usize,
+    kv_len: usize,
+    n_head: usize,
+    hd: usize,
+    sinks: bool,
+}
+
+/// How [`attention_alias_run`] binds the caches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AliasMode {
+    /// One cache, holding the K rows, bound to both sides.
+    OneCache,
+    /// Two caches, both written from the K rows.
+    TwoEqual,
+    /// Two caches: K rows in one, DIFFERENT V rows in the other.
+    TwoDistinct,
+}
+
+/// The f16-rounded query of a case.
+fn alias_q(case: &AliasCase) -> Vec<f32> {
+    gen(case.rows * case.n_head * case.hd, 41)
+        .iter()
+        .map(|&x| half::f16::from_f32(x).to_f32())
+        .collect()
+}
+
+/// Cache rows of a case: distinct per position and channel, `salt` picking the K or the V set.
+fn alias_rows(case: &AliasCase, salt: usize) -> Vec<f32> {
+    (0..case.kv_len * case.hd)
+        .map(|i| ((i * 37 + 11 + salt * 23) % 61) as f32 / 30.0 - 1.0)
+        .collect()
+}
+
+fn alias_sinks(case: &AliasCase) -> Vec<f32> {
+    (0..case.n_head).map(|h| 0.5 + h as f32).collect()
+}
+
+/// Run `case` with its caches bound as `mode` says. Returns the attention output.
+fn attention_alias_run(be: &dyn Backend, case: &AliasCase, mode: AliasMode) -> Vec<f32> {
+    let (rows, kv_len, nh, hd) = (case.rows, case.kv_len, case.n_head, case.hd);
+    let n_out = rows * nh * hd;
+    let cache_elems = kv_len * hd;
+    let alias = mode == AliasMode::OneCache;
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![rows * nh * hd], DType::F16));
+    let ksrc = g.input(f32d(cache_elems));
+    let vsrc = g.input(f32d(cache_elems));
+    let kc = g.input(TensorDesc::new(vec![cache_elems], case.dtype));
+    let vc = if alias {
+        kc
+    } else {
+        g.input(TensorDesc::new(vec![cache_elems], case.dtype))
+    };
+    let sk = g.weight(f32d(nh));
+    let dst = g.output(f32d(n_out));
+    let writes = match mode {
+        AliasMode::OneCache => vec![(ksrc, kc)],
+        AliasMode::TwoEqual => vec![(ksrc, kc), (ksrc, vc)],
+        AliasMode::TwoDistinct => vec![(ksrc, kc), (vsrc, vc)],
+    };
+    for (src, cache) in writes {
+        g.push(Op::WriteKv {
+            src,
+            cache,
+            rows: kv_len as u32,
+            row_stride: hd as u32,
+            pos: 0,
+        });
+    }
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: 1,
+        head_dim: hd as u32,
+        scale: 1.0 / (hd as f32).sqrt(),
+        mask: AttnMask::Causal,
+        pos: (kv_len - rows) as u32,
+        sinks: case.sinks.then_some(sk),
+        key_bias: None,
+        comp: None,
+    });
+    let plan = be.compile(&g).expect("compile");
+    let up = |bytes: &[u8], usage| {
+        let b = be.alloc(bytes.len(), usage).unwrap();
+        be.upload(b.as_ref(), bytes).unwrap();
+        b
+    };
+    let qf: Vec<u8> = alias_q(case)
+        .iter()
+        .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+        .collect();
+    let qb = up(&qf, BufferUsage::Activations);
+    let kb_src = up(
+        bytemuck::cast_slice(&alias_rows(case, 0)),
+        BufferUsage::Activations,
+    );
+    let vb_src = up(
+        bytemuck::cast_slice(&alias_rows(case, 1)),
+        BufferUsage::Activations,
+    );
+    let cache_bytes = match case.dtype {
+        DType::Q8_0 => cache_elems / 32 * 34,
+        DType::F16 => cache_elems * 2,
+        _ => cache_elems * 4,
+    };
+    let kb = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
+    let vb = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
+    let skb = up(
+        bytemuck::cast_slice(&alias_sinks(case)),
+        BufferUsage::Weights,
+    );
+    let ob = be.alloc(n_out * 4, BufferUsage::Readback).unwrap();
+    let mut b = Bindings::new();
+    b.bind(q, qb.as_ref());
+    b.bind(ksrc, kb_src.as_ref());
+    b.bind(vsrc, vb_src.as_ref());
+    b.bind(kc, kb.as_ref());
+    if !alias {
+        b.bind(vc, vb.as_ref());
+    }
+    b.bind(sk, skb.as_ref());
+    b.bind(dst, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let mut o = vec![0f32; n_out];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// **`Op::Attention` with `k_cache == v_cache`**, which is how deepseek4 stores its K=V row once.
+/// Each case runs three ways on every backend:
+///
+/// * one cache bound to both sides, and two caches written from the same rows — BIT-identical,
+///   since the values read are the same and only the binding differs;
+/// * two caches holding DIFFERENT K and V rows — compared with an f64 reference over the f32
+///   rows written (`attention_sinks_ref`), and required to differ from the aliased output. This
+///   is the arm that catches a backend that reads its K cache as V whenever it can (the CPU
+///   reusing K's values, the Vulkan prepass reusing K's scratch) without checking the two are
+///   the same tensor.
+///
+/// The cases cover the shapes that take different paths: the sinks family (V4's own), a decode
+/// row and a prefill block without sinks, and a Q8_0 prefill, which the Vulkan adapter expands
+/// through its dequant prepass. The reference tolerance covers the f16 and Q8_0 rounding of the
+/// cache; reading the wrong rows as V moves the output far past it.
+///
+/// A CPU arm that took a second guard on the aliased buffer deadlocks here instead of failing; the
+/// timeout is the signal.
+#[test]
+fn attention_one_cache_as_k_and_v() {
+    let cases = [
+        AliasCase {
+            name: "f16 sinks prefill (deepseek4)",
+            dtype: DType::F16,
+            rows: 3,
+            kv_len: 7,
+            n_head: 2,
+            hd: 48,
+            sinks: true,
+        },
+        AliasCase {
+            name: "f16 decode",
+            dtype: DType::F16,
+            rows: 1,
+            kv_len: 40,
+            n_head: 4,
+            hd: 64,
+            sinks: false,
+        },
+        AliasCase {
+            name: "f16 prefill",
+            dtype: DType::F16,
+            rows: 9,
+            kv_len: 24,
+            n_head: 2,
+            hd: 64,
+            sinks: false,
+        },
+        AliasCase {
+            name: "q8_0 prefill (dequant prepass)",
+            dtype: DType::Q8_0,
+            rows: 6,
+            kv_len: 20,
+            n_head: 2,
+            hd: 64,
+            sinks: false,
+        },
+    ];
+    let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let cpu = infr_cpu::CpuBackend::new();
+    let vk = gpu();
+    let mut backends: Vec<(&str, &dyn Backend)> = vec![("cpu", &cpu)];
+    if let Some(vk) = &vk {
+        backends.push(("vulkan", vk));
+    }
+    for case in &cases {
+        let sinks = alias_sinks(case);
+        let want = attention_sinks_ref(
+            &alias_q(case),
+            &alias_rows(case, 0),
+            &alias_rows(case, 1),
+            case.rows,
+            case.kv_len,
+            case.n_head,
+            1,
+            case.hd,
+            1.0 / (case.hd as f32).sqrt(),
+            case.kv_len - case.rows,
+            case.sinks.then_some((sinks.as_slice(), None)),
+        );
+        for &(be_name, be) in &backends {
+            let name = format!("{be_name} {}", case.name);
+            let one = attention_alias_run(be, case, AliasMode::OneCache);
+            let two = attention_alias_run(be, case, AliasMode::TwoEqual);
+            let distinct = attention_alias_run(be, case, AliasMode::TwoDistinct);
+            assert!(
+                one.iter().all(|v| v.is_finite()) && one.iter().any(|&v| v != 0.0),
+                "{name}: degenerate output {one:?}"
+            );
+            assert_eq!(
+                bits(&one),
+                bits(&two),
+                "{name}: one cache bound to both sides differs from two equal caches"
+            );
+            let e = maxerr(&distinct, &want);
+            let gap = maxerr(&distinct, &one);
+            println!("Attention K!=V ({name}) vs reference max_err={e:e}, vs K=V gap={gap:e}");
+            assert!(
+                e < 5e-3,
+                "{name}: distinct K and V caches diverge from the reference ({e:e})"
+            );
+            assert!(
+                gap > 0.1,
+                "{name}: distinct V rows gave the K=V output (gap {gap:e}) — V was read from K"
+            );
+        }
+        if let Some(vk) = &vk {
+            let e = maxerr(
+                &attention_alias_run(vk, case, AliasMode::OneCache),
+                &attention_alias_run(&cpu, case, AliasMode::OneCache),
+            );
+            println!("Attention K=V ({}) cpu-vs-vulkan max_err={e:e}", case.name);
+            assert!(e < 2e-3, "{}: cpu vs vulkan max_err={e:e}", case.name);
+        }
+    }
+}
+
+// ── Op::Attention's compressed segment (DeepSeek V4's CSA/HCA keys) ────────────────────────────
+
+/// One two-segment attention case. The raw cache is a ring of `cap` rows (position `j` at row
+/// `j % cap`) holding positions `0..pos + rows`; the compressed cache holds `len` committed rows
+/// and [`COMP_SPARE_ROWS`] more that no visible key may read.
+#[derive(Clone, Copy)]
+struct CompCase {
+    name: &'static str,
+    rows: usize,
+    pos: usize,
+    cap: usize,
+    /// Sliding window over the raw keys; 0 is causal.
+    window: usize,
+    nh: usize,
+    nkv: usize,
+    hd: usize,
+    ratio: usize,
+    len: usize,
+    sinks: bool,
+    bias: bool,
+    /// The raw cache serves as both K and V, as on V4.
+    alias: bool,
+}
+
+impl CompCase {
+    /// A causal case with a full-context raw cache and `len` at the ubatch's widest visible count,
+    /// which is what the V4 emit passes.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        name: &'static str,
+        rows: usize,
+        pos: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        ratio: usize,
+    ) -> Self {
+        Self {
+            name,
+            rows,
+            pos,
+            cap: pos + rows,
+            window: 0,
+            nh,
+            nkv,
+            hd,
+            ratio,
+            len: (pos + rows) / ratio,
+            sinks: false,
+            bias: false,
+            alias: false,
+        }
+    }
+
+    fn kv_len(&self) -> usize {
+        self.pos + self.rows
+    }
+
+    fn mask(&self) -> AttnMask {
+        if self.window > 0 {
+            AttnMask::SlidingWindow(self.window)
+        } else {
+            AttnMask::Causal
+        }
+    }
+
+    /// The first raw key row `t` attends.
+    fn lo(&self, t: usize) -> usize {
+        let abs = self.pos + t;
+        if self.window > 0 && abs + 1 > self.window {
+            abs + 1 - self.window
+        } else {
+            0
+        }
+    }
+
+    fn scale(&self) -> f32 {
+        1.0 / (self.hd as f32).sqrt()
+    }
+}
+
+/// Compressed rows past `len` in every case's cache. They hold [`COMP_SPARE_VALUE`], far from
+/// every real row, so a kernel that reads past `len` moves the output well past tolerance.
+const COMP_SPARE_ROWS: usize = 3;
+const COMP_SPARE_VALUE: f32 = 4.0;
+
+/// The inputs of one [`CompCase`], every value already rounded through f16 where the op reads
+/// f16 so the references see exactly what the kernels read.
+struct CompData {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    /// `(len + COMP_SPARE_ROWS) * nkv * hd`.
+    c: Vec<f32>,
+    sinks: Vec<f32>,
+    /// `[rows, len]`.
+    bias: Vec<f32>,
+}
+
+/// Mixed-sign values in `[-1, 1)` from a multiplicative hash, rounded through f16. A hash rather
+/// than [`gen`]'s short period, so no two cache rows of a wide head repeat each other.
+fn comp_gen(n: usize, salt: u64) -> Vec<f32> {
+    (0..n as u64)
+        .map(|i| {
+            let x = (i ^ (salt << 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let u = ((x >> 40) as f32) / (1u64 << 24) as f32;
+            half::f16::from_f32(2.0 * u - 1.0).to_f32()
+        })
+        .collect()
+}
+
+fn comp_data(c: &CompCase) -> CompData {
+    let row = c.nkv * c.hd;
+    let mut comp = comp_gen(c.len * row, 4);
+    comp.resize((c.len + COMP_SPARE_ROWS) * row, COMP_SPARE_VALUE);
+    let k = comp_gen(c.cap * row, 2);
+    CompData {
+        q: comp_gen(c.rows * c.nh * c.hd, 1),
+        v: if c.alias {
+            k.clone()
+        } else {
+            comp_gen(c.cap * row, 3)
+        },
+        k,
+        c: comp,
+        sinks: (0..c.nh).map(|h| [1.5, -0.5, 0.8, 2.5][h % 4]).collect(),
+        // Finite offsets of both signs, and -inf (an unselected key) on a third of the keys.
+        bias: (0..c.rows * c.len)
+            .map(|i| {
+                let (t, j) = (i / c.len.max(1), i % c.len.max(1));
+                if (t + 2 * j) % 3 == 0 {
+                    f32::NEG_INFINITY
+                } else {
+                    ((t * 7 + j * 3) % 5) as f32 * 0.25 - 0.5
+                }
+            })
+            .collect(),
+    }
+}
+
+/// The ways a two-segment attention can be wrong while still producing a plausible softmax, each
+/// one clause of [`comp_ref`] changed. A case is only evidence against a variant when the
+/// variant's output differs from the faithful one, which the tests assert before trusting it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CompVariant {
+    Faithful,
+    /// `ceil((abs + 1) / ratio)` blocks visible: a partial block shown early.
+    Ceil,
+    /// `abs / ratio`: the block a token completes hidden from that token.
+    Early,
+    /// The segment's bias ignored.
+    NoBias,
+    /// The sink in the max but not the denominator.
+    NoSinkInDenominator,
+    /// A compressed key's value read from the raw V cache instead of its own row.
+    RawV,
+    /// The visible count not clamped to `len`: rows past it read (the spare rows), unbiased.
+    NoLenClamp,
+}
+
+fn dot64(a: &[f32], b: &[f32]) -> f64 {
+    a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum()
+}
+
+/// `Op::Attention` with a compressed segment, from its definition, in f64: one softmax over the
+/// raw keys `[lo, abs]`, the compressed keys `j < min(len, (abs + 1) / ratio)` scored
+/// `q·c[j]*scale + bias[t, j]` with `c[j]` as their own value, and the per-head sink in the max
+/// and the denominator only.
+fn comp_ref(c: &CompCase, d: &CompData, var: CompVariant) -> Vec<f64> {
+    let (nh, nkv, hd) = (c.nh, c.nkv, c.hd);
+    let group = nh / nkv;
+    let scale = c.scale() as f64;
+    let mut out = vec![0f64; c.rows * nh * hd];
+    for t in 0..c.rows {
+        let abs = c.pos + t;
+        let n_vis = match var {
+            CompVariant::Ceil => (abs + 1).div_ceil(c.ratio).min(c.len),
+            CompVariant::Early => (abs / c.ratio).min(c.len),
+            CompVariant::NoLenClamp => (abs + 1) / c.ratio,
+            _ => ((abs + 1) / c.ratio).min(c.len),
+        };
+        for h in 0..nh {
+            let kvh = h / group;
+            let qr = &d.q[(t * nh + h) * hd..][..hd];
+            let mut keys: Vec<(f64, &[f32])> = Vec::new();
+            for j in c.lo(t)..=abs {
+                let r = ((j % c.cap) * nkv + kvh) * hd;
+                keys.push((dot64(qr, &d.k[r..r + hd]) * scale, &d.v[r..r + hd]));
+            }
+            for j in 0..n_vis {
+                let r = (j * nkv + kvh) * hd;
+                let mut s = dot64(qr, &d.c[r..r + hd]) * scale;
+                if c.bias && var != CompVariant::NoBias && j < c.len {
+                    s += d.bias[t * c.len + j] as f64;
+                }
+                let val = if var == CompVariant::RawV {
+                    let rr = ((j % c.cap) * nkv + kvh) * hd;
+                    &d.v[rr..rr + hd]
+                } else {
+                    &d.c[r..r + hd]
+                };
+                keys.push((s, val));
+            }
+            let sink = c.sinks.then(|| d.sinks[h] as f64);
+            let mut m = keys.iter().map(|k| k.0).fold(f64::NEG_INFINITY, f64::max);
+            if let Some(sv) = sink {
+                m = m.max(sv);
+            }
+            let mut l: f64 = keys.iter().map(|k| (k.0 - m).exp()).sum();
+            if let Some(sv) = sink {
+                if var != CompVariant::NoSinkInDenominator {
+                    l += (sv - m).exp();
+                }
+            }
+            let o = &mut out[(t * nh + h) * hd..][..hd];
+            for (s, val) in keys {
+                let p = (s - m).exp() / l;
+                for (o, &v) in o.iter_mut().zip(val) {
+                    *o += p * v as f64;
+                }
+            }
+        }
+    }
+    out
+}
+
+fn f16_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter()
+        .flat_map(|&x| half::f16::from_f32(x).to_le_bytes())
+        .collect()
+}
+
+/// Upload each binding's bytes with its usage, execute `g` and download `n` f32 from `out`.
+fn exec_bytes(
+    be: &dyn Backend,
+    g: &Graph,
+    binds: &[(TensorId, Vec<u8>, BufferUsage)],
+    out: TensorId,
+    n: usize,
+) -> Vec<f32> {
+    let plan = be.compile(g).expect("compile");
+    let keep: Vec<_> = binds
+        .iter()
+        .map(|(id, bytes, usage)| {
+            let b = be.alloc(bytes.len(), *usage).expect("alloc");
+            be.upload(b.as_ref(), bytes).unwrap();
+            (*id, b)
+        })
+        .collect();
+    let ob = be.alloc(n * 4, BufferUsage::Readback).unwrap();
+    let mut b = Bindings::new();
+    for (id, buf) in &keep {
+        b.bind(*id, buf.as_ref());
+    }
+    b.bind(out, ob.as_ref());
+    be.execute(plan.as_ref(), &b).expect("execute");
+    let mut o = vec![0f32; n];
+    be.download(ob.as_ref(), bytemuck::cast_slice_mut(&mut o))
+        .unwrap();
+    o
+}
+
+/// `v` stored at a KV cache dtype the two-segment tests use.
+fn cache_bytes(dt: DType, v: &[f32]) -> Vec<u8> {
+    match dt {
+        DType::F16 => f16_bytes(v),
+        DType::F32 => bytemuck::cast_slice(v).to_vec(),
+        DType::Bf16 => v
+            .iter()
+            .flat_map(|&x| half::bf16::from_f32(x).to_le_bytes())
+            .collect(),
+        other => panic!("no {other:?} cache in these tests"),
+    }
+}
+
+/// Run the case's two-segment op on `be`; with `comp_on` false, the same op with `comp: None`
+/// (the compressed cache then not even declared).
+fn comp_run(be: &dyn Backend, c: &CompCase, d: &CompData, comp_on: bool) -> Vec<f32> {
+    comp_run_at(be, c, d, comp_on, DType::F16)
+}
+
+/// [`comp_run`] with every cache at `dt`.
+fn comp_run_at(be: &dyn Backend, c: &CompCase, d: &CompData, comp_on: bool, dt: DType) -> Vec<f32> {
+    let n_out = c.rows * c.nh * c.hd;
+    let row = c.nkv * c.hd;
+    let mut g = Graph::new();
+    let mut binds = Vec::new();
+    let q = g.input(TensorDesc::new(vec![n_out], DType::F16));
+    binds.push((q, f16_bytes(&d.q), BufferUsage::Activations));
+    let kc = g.input(TensorDesc::new(vec![c.cap * row], dt));
+    binds.push((kc, cache_bytes(dt, &d.k), BufferUsage::KvCache));
+    let vc = if c.alias {
+        kc
+    } else {
+        let vc = g.input(TensorDesc::new(vec![c.cap * row], dt));
+        binds.push((vc, cache_bytes(dt, &d.v), BufferUsage::KvCache));
+        vc
+    };
+    let sinks = c.sinks.then(|| {
+        let sk = g.weight(f32d(c.nh));
+        binds.push((
+            sk,
+            bytemuck::cast_slice(&d.sinks).to_vec(),
+            BufferUsage::Weights,
+        ));
+        sk
+    });
+    let comp = comp_on.then(|| {
+        let cache = g.input(TensorDesc::new(vec![d.c.len()], dt));
+        binds.push((cache, cache_bytes(dt, &d.c), BufferUsage::KvCache));
+        let bias = c.bias.then(|| {
+            let cb = g.input(f32d(c.rows * c.len));
+            binds.push((
+                cb,
+                bytemuck::cast_slice(&d.bias).to_vec(),
+                BufferUsage::Activations,
+            ));
+            cb
+        });
+        CompSegment {
+            cache,
+            len: c.len as u32,
+            ratio: c.ratio as u32,
+            bias,
+        }
+    });
+    let dst = g.output(f32d(n_out));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: c.rows as u32,
+        kv_len: c.kv_len() as u32,
+        n_head: c.nh as u32,
+        n_kv: c.nkv as u32,
+        head_dim: c.hd as u32,
+        scale: c.scale(),
+        mask: c.mask(),
+        pos: c.pos as u32,
+        sinks,
+        key_bias: None,
+        comp,
+    });
+    exec_bytes(be, &g, &binds, dst, n_out)
+}
+
+/// The same attention as ONE segment, the way the reference builds it: one cache holding raw
+/// positions `0..kv_len` then the `len` compressed rows, and an explicit `key_bias` carrying all
+/// of the visibility (the raw window, the causal cut, the block rule and the segment's own bias).
+/// A canvas over the whole cache makes the bias the only mask. CPU only: the Vulkan bias kernel
+/// refuses a canvas.
+fn comp_concat_run(be: &dyn Backend, c: &CompCase, d: &CompData) -> Vec<f32> {
+    comp_concat_run_at(be, c, d, DType::F16)
+}
+
+/// [`comp_concat_run`] with both caches at `dt`.
+fn comp_concat_run_at(be: &dyn Backend, c: &CompCase, d: &CompData, dt: DType) -> Vec<f32> {
+    let (n_out, row, kv_len) = (c.rows * c.nh * c.hd, c.nkv * c.hd, c.kv_len());
+    let total = kv_len + c.len;
+    let gather = |src: &[f32]| -> Vec<f32> {
+        let mut cat: Vec<f32> = (0..kv_len)
+            .flat_map(|j| src[(j % c.cap) * row..][..row].iter().copied())
+            .collect();
+        cat.extend_from_slice(&d.c[..c.len * row]);
+        cat
+    };
+    let mut kb = vec![f32::NEG_INFINITY; c.rows * total];
+    for t in 0..c.rows {
+        let abs = c.pos + t;
+        kb[t * total + c.lo(t)..t * total + abs + 1].fill(0.0);
+        for j in 0..((abs + 1) / c.ratio).min(c.len) {
+            kb[t * total + kv_len + j] = if c.bias { d.bias[t * c.len + j] } else { 0.0 };
+        }
+    }
+    let mut g = Graph::new();
+    let q = g.input(TensorDesc::new(vec![n_out], DType::F16));
+    let kc = g.input(TensorDesc::new(vec![total * row], dt));
+    let vc = g.input(TensorDesc::new(vec![total * row], dt));
+    let bias = g.input(f32d(c.rows * total));
+    let mut binds = vec![
+        (q, f16_bytes(&d.q), BufferUsage::Activations),
+        (kc, cache_bytes(dt, &gather(&d.k)), BufferUsage::KvCache),
+        (vc, cache_bytes(dt, &gather(&d.v)), BufferUsage::KvCache),
+        (
+            bias,
+            bytemuck::cast_slice(&kb).to_vec(),
+            BufferUsage::Activations,
+        ),
+    ];
+    let sinks = c.sinks.then(|| {
+        let sk = g.weight(f32d(c.nh));
+        binds.push((
+            sk,
+            bytemuck::cast_slice(&d.sinks).to_vec(),
+            BufferUsage::Weights,
+        ));
+        sk
+    });
+    let dst = g.output(f32d(n_out));
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: c.rows as u32,
+        kv_len: total as u32,
+        n_head: c.nh as u32,
+        n_kv: c.nkv as u32,
+        head_dim: c.hd as u32,
+        scale: c.scale(),
+        mask: AttnMask::Canvas { lo: 0 },
+        pos: c.pos as u32,
+        sinks,
+        key_bias: Some(bias),
+        comp: None,
+    });
+    exec_bytes(be, &g, &binds, dst, n_out)
+}
+
+fn comp_cases() -> Vec<CompCase> {
+    let mut v = Vec::new();
+    // Prefill from position 0: rows 0-2 see no block, row 3 completes block 0 and row 7 block 1.
+    let mut c = CompCase::new("csa prefill from 0, hd 48", 9, 0, 4, 2, 48, 4);
+    (c.window, c.sinks, c.bias) = (4, true, true);
+    v.push(c);
+    // A raw ring shorter than the context, V4's one-cache K=V, block 15 completed at row 2.
+    let mut c = CompCase::new("csa prefill on a raw ring, hd 48", 6, 61, 4, 2, 48, 4);
+    (c.window, c.cap, c.sinks, c.alias) = (8, 13, true, true);
+    v.push(c);
+    let mut c = CompCase::new("csa prefill hd 512, no sinks, no bias", 4, 6, 4, 1, 512, 4);
+    c.cap = 10;
+    v.push(c);
+    let mut c = CompCase::new("csa prefill hd 512, bias only", 3, 10, 4, 1, 512, 4);
+    (c.window, c.bias) = (6, true);
+    v.push(c);
+    let mut c = CompCase::new("csa decode hd 48, bias only", 1, 40, 4, 2, 48, 4);
+    (c.window, c.cap, c.bias) = (16, 16, true);
+    v.push(c);
+    let mut c = CompCase::new("csa decode hd 512, sinks and bias", 1, 202, 4, 1, 512, 4);
+    (c.window, c.cap, c.sinks, c.bias) = (128, 128, true, true);
+    v.push(c);
+    // Row 2 (position 255) completes block 1.
+    let mut c = CompCase::new("hca prefill across a block, hd 48", 5, 253, 4, 2, 48, 128);
+    (c.window, c.cap, c.sinks) = (16, 20, true);
+    v.push(c);
+    let mut c = CompCase::new("hca decode hd 512", 1, 383, 4, 1, 512, 128);
+    (c.window, c.cap, c.sinks, c.alias) = (128, 128, true, true);
+    v.push(c);
+    // Fewer committed rows than the last row could see: `len` cuts block 15 from rows 2-5, which
+    // would otherwise read a spare row.
+    let mut c = CompCase::new("len below the widest visible count", 6, 61, 4, 2, 48, 4);
+    (c.window, c.cap, c.sinks) = (8, 13, true);
+    c.len -= 1;
+    v.push(c);
+    // No block committed yet: the segment is empty.
+    let mut c = CompCase::new("len 0", 3, 0, 4, 2, 48, 4);
+    c.sinks = true;
+    assert_eq!(c.len, 0);
+    v.push(c);
+    v
+}
+
+/// Smallest move a broken variant must make on a case before that case counts as evidence
+/// against it.
+const COMP_GAP: f64 = 1e-3;
+/// CPU against the f64 definition.
+const COMP_TOL: f64 = 1e-5;
+/// Vulkan against the f64 definition (its scalar kernel sums in a different order).
+const COMP_VK_TOL: f64 = 1e-4;
+
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|x| x.to_bits()).collect()
+}
+
+/// `Op::Attention`'s compressed segment equals the reference's construction — ONE attention
+/// over the concatenated `[raw | compressed]` cache with the visibility in an explicit
+/// `key_bias` — bit for bit on the CPU, and the f64 definition on CPU and Vulkan.
+///
+/// The case table covers prefill crossing block boundaries (so visibility differs per row),
+/// decode, rows that see no block, an empty segment, a `len` below what the last rows could see,
+/// a raw window shorter than the context (and a ring), with and without sinks and the segment
+/// bias, head dims 48 and 512, and ratios 4 and 128. Every broken variant in [`CompVariant`] is asserted to move at least one case's output,
+/// so passing here means the backends are not running any of them.
+#[test]
+fn attention_comp_segment_matches_concatenation_and_definition() {
+    let cpu = infr_cpu::CpuBackend::new();
+    let vk = gpu();
+    let variants = [
+        CompVariant::Ceil,
+        CompVariant::Early,
+        CompVariant::NoBias,
+        CompVariant::NoSinkInDenominator,
+        CompVariant::RawV,
+        CompVariant::NoLenClamp,
+    ];
+    let mut exercised = vec![0usize; variants.len()];
+    for c in comp_cases() {
+        let name = c.name;
+        let d = comp_data(&c);
+        let want = comp_ref(&c, &d, CompVariant::Faithful);
+        for (n, &var) in exercised.iter_mut().zip(&variants) {
+            let gap = maxdiff64(&want, &comp_ref(&c, &d, var));
+            if gap > COMP_GAP {
+                *n += 1;
+            }
+            println!("comp {name}: {var:?} moves the output by {gap:e}");
+        }
+
+        let two = comp_run(&cpu, &c, &d, true);
+        let cat = comp_concat_run(&cpu, &c, &d);
+        assert_eq!(
+            bits(&two),
+            bits(&cat),
+            "{name}: CPU two-segment attention is not the concatenated single segment, bit for bit"
+        );
+        let e = maxerr64(&two, &want);
+        println!("comp {name}: cpu vs definition {e:e}");
+        assert!(e < COMP_TOL, "{name}: CPU vs definition {e:e}");
+        if c.len == 0 {
+            assert_eq!(
+                bits(&two),
+                bits(&comp_run(&cpu, &c, &d, false)),
+                "{name}: an empty segment changed the CPU output"
+            );
+        }
+
+        if let Some(vk) = &vk {
+            let got = comp_run(vk, &c, &d, true);
+            let e = maxerr64(&got, &want);
+            println!("comp {name}: vulkan vs definition {e:e}");
+            assert!(e < COMP_VK_TOL, "{name}: Vulkan vs definition {e:e}");
+            if c.len == 0 {
+                let e = maxerr(&got, &comp_run(vk, &c, &d, false));
+                assert!(
+                    e < 1e-6,
+                    "{name}: an empty segment moved the Vulkan output by {e:e}"
+                );
+            }
+        }
+    }
+    for (n, var) in exercised.iter().zip(variants) {
+        assert!(*n > 0, "no case distinguishes {var:?} from the definition");
+    }
+}
+
+/// Execute `g` with every declared input and weight bound to a zeroed buffer of its own size, and
+/// return the refusal: the CPU backend refuses by panicking (its message is the error), every GPU
+/// backend by returning `Err`. `Ok(())` when the op ran.
+fn exec_zeroed(be: &dyn Backend, g: &Graph, out: TensorId) -> Result<(), String> {
+    let run = || -> Result<(), String> {
+        let plan = be.compile(g).map_err(|e| e.to_string())?;
+        let bytes = |id: TensorId| {
+            let d = g.desc(id);
+            d.dtype.dense_bytes(d.numel()).unwrap().max(4)
+        };
+        let bufs: Vec<_> = g
+            .inputs
+            .iter()
+            .chain(&g.weights)
+            .chain([&out])
+            .map(|&id| {
+                let usage = if id == out {
+                    BufferUsage::Readback
+                } else {
+                    BufferUsage::Activations
+                };
+                let b = be.alloc(bytes(id), usage).unwrap();
+                be.upload(b.as_ref(), &vec![0u8; bytes(id)]).unwrap();
+                (id, b)
+            })
+            .collect();
+        let mut b = Bindings::new();
+        for (id, buf) in &bufs {
+            b.bind(*id, buf.as_ref());
+        }
+        be.execute(plan.as_ref(), &b).map_err(|e| e.to_string())
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(r) => r,
+        Err(p) => Err(p
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default()),
+    }
+}
+
+/// The host refuses the attention shapes no kernel can serve: [`check_attention`]'s rules, one
+/// case per rule, each otherwise valid. Every refusal must name its own rule — checked on the
+/// function itself and through execution on CPU and Vulkan — so deleting any one guard turns
+/// exactly its case red, and an unrelated error cannot pass for it. The accepted op runs on both
+/// backends as the control.
+#[test]
+fn attention_comp_segment_refusals() {
+    let c = CompCase::new("refusal", 2, 6, 2, 1, 8, 4);
+    let (rows, kv_len) = (c.rows as u32, c.kv_len() as u32);
+    // Declares the graph's tensors (all used by some case) and pushes `op(..)`.
+    let build = |mk: &dyn Fn(&mut Graph) -> (Op, TensorId)| {
+        let mut g = Graph::new();
+        let (op, out) = mk(&mut g);
+        g.push(op);
+        (g, out)
+    };
+    struct Ids {
+        q: TensorId,
+        kc: TensorId,
+        cache: TensorId,
+        dst: TensorId,
+    }
+    let base = |g: &mut Graph, cache_desc: TensorDesc| Ids {
+        q: g.input(TensorDesc::new(vec![2 * 2 * 8], DType::F16)),
+        kc: g.input(TensorDesc::new(vec![c.cap * 8], DType::F16)),
+        cache: g.input(cache_desc),
+        dst: g.output(f32d(2 * 2 * 8)),
+    };
+    let attn = |ids: &Ids, mask, key_bias, comp| Op::Attention {
+        q: ids.q,
+        k_cache: ids.kc,
+        v_cache: ids.kc,
+        dst: ids.dst,
+        rows,
+        kv_len,
+        n_head: 2,
+        n_kv: 1,
+        head_dim: 8,
+        scale: c.scale(),
+        mask,
+        pos: 6,
+        sinks: None,
+        key_bias,
+        comp,
+    };
+    let f16_rows = |n: usize| TensorDesc::new(vec![n * 8], DType::F16);
+    let seg = |cache, bias| CompSegment {
+        cache,
+        len: 2,
+        ratio: 4,
+        bias,
+    };
+    // (rule, the text its refusal must contain, graph builder)
+    type Mk<'a> = Box<dyn Fn(&mut Graph) -> (Op, TensorId) + 'a>;
+    let accepted: Mk = Box::new(|g| {
+        let ids = base(g, f16_rows(2));
+        let b = g.input(f32d(2 * 2));
+        let op = attn(&ids, AttnMask::Causal, None, Some(seg(ids.cache, Some(b))));
+        (op, ids.dst)
+    });
+    let cases: Vec<(&str, &str, Mk)> = vec![
+        (
+            "ratio 0",
+            "comp: ratio 0",
+            Box::new(|g| {
+                let ids = base(g, f16_rows(2));
+                let s = CompSegment {
+                    ratio: 0,
+                    ..seg(ids.cache, None)
+                };
+                (attn(&ids, AttnMask::Causal, None, Some(s)), ids.dst)
+            }),
+        ),
+        (
+            "len past the cache rows",
+            "rows but len is",
+            Box::new(|g| {
+                let ids = base(g, f16_rows(1));
+                (
+                    attn(&ids, AttnMask::Causal, None, Some(seg(ids.cache, None))),
+                    ids.dst,
+                )
+            }),
+        ),
+        (
+            "cache not whole rows",
+            "not whole rows",
+            Box::new(|g| {
+                let ids = base(g, TensorDesc::new(vec![2 * 8 + 3], DType::F16));
+                (
+                    attn(&ids, AttnMask::Causal, None, Some(seg(ids.cache, None))),
+                    ids.dst,
+                )
+            }),
+        ),
+        (
+            "cache dtype differs from the raw cache",
+            "every tier shares one cache dtype",
+            Box::new(|g| {
+                let ids = base(g, TensorDesc::new(vec![2 * 8], DType::F32));
+                (
+                    attn(&ids, AttnMask::Causal, None, Some(seg(ids.cache, None))),
+                    ids.dst,
+                )
+            }),
+        ),
+        (
+            "bias shorter than rows x len",
+            "comp: the bias holds 3 elements",
+            Box::new(|g| {
+                let ids = base(g, f16_rows(2));
+                let b = g.input(f32d(3));
+                let op = attn(&ids, AttnMask::Causal, None, Some(seg(ids.cache, Some(b))));
+                (op, ids.dst)
+            }),
+        ),
+        (
+            // A TopkMask run at a wider kv_len than the segment's len.
+            "bias longer than rows x len",
+            "comp: the bias holds 6 elements",
+            Box::new(|g| {
+                let ids = base(g, f16_rows(2));
+                let b = g.input(f32d(2 * 3));
+                let op = attn(&ids, AttnMask::Causal, None, Some(seg(ids.cache, Some(b))));
+                (op, ids.dst)
+            }),
+        ),
+        (
+            "bias not f32",
+            "comp: the bias must be F32",
+            Box::new(|g| {
+                let ids = base(g, f16_rows(2));
+                let b = g.input(TensorDesc::new(vec![2 * 2], DType::F16));
+                let op = attn(&ids, AttnMask::Causal, None, Some(seg(ids.cache, Some(b))));
+                (op, ids.dst)
+            }),
+        ),
+        (
+            "a raw key_bias beside the segment",
+            "key_bias is set too",
+            Box::new(|g| {
+                let ids = base(g, f16_rows(2));
+                let kb = g.input(f32d(2 * kv_len as usize));
+                let op = attn(&ids, AttnMask::Causal, Some(kb), Some(seg(ids.cache, None)));
+                (op, ids.dst)
+            }),
+        ),
+        (
+            "a canvas mask",
+            "AttnMask::Canvas",
+            Box::new(|g| {
+                let ids = base(g, f16_rows(2));
+                let op = attn(
+                    &ids,
+                    AttnMask::Canvas { lo: 0 },
+                    None,
+                    Some(seg(ids.cache, None)),
+                );
+                (op, ids.dst)
+            }),
+        ),
+        (
+            "a raw key_bias longer than rows x kv_len",
+            "key_bias: the bias holds",
+            Box::new(|g| {
+                let ids = base(g, f16_rows(2));
+                let kb = g.input(f32d(2 * kv_len as usize + 1));
+                (attn(&ids, AttnMask::Causal, Some(kb), None), ids.dst)
+            }),
+        ),
+        (
+            "a raw key_bias not f32",
+            "key_bias: the bias must be F32",
+            Box::new(|g| {
+                let ids = base(g, f16_rows(2));
+                let kb = g.input(TensorDesc::new(vec![2 * kv_len as usize], DType::F16));
+                (attn(&ids, AttnMask::Causal, Some(kb), None), ids.dst)
+            }),
+        ),
+    ];
+    let cpu = infr_cpu::CpuBackend::new();
+    let vk = gpu();
+    let (g, out) = build(&*accepted);
+    assert_eq!(check_attention(&g, &g.ops[0]), Ok(()));
+    assert_eq!(exec_zeroed(&cpu, &g, out), Ok(()), "cpu: the control op");
+    if let Some(vk) = &vk {
+        assert_eq!(exec_zeroed(vk, &g, out), Ok(()), "vulkan: the control op");
+    }
+    for (what, rule, mk) in &cases {
+        let (g, out) = build(&**mk);
+        let err = check_attention(&g, &g.ops[0]).expect_err(what);
+        println!("refusal ({what}): {err}");
+        assert!(
+            err.contains(rule),
+            "{what}: refused for another reason: {err}"
+        );
+        let mut backends: Vec<(&str, &dyn Backend)> = vec![("cpu", &cpu)];
+        if let Some(vk) = &vk {
+            backends.push(("vulkan", vk));
+        }
+        for (name, be) in backends {
+            let err = exec_zeroed(be, &g, out).expect_err(what);
+            assert!(
+                err.contains(rule),
+                "{name}: {what}: refused for another reason: {err}"
+            );
+        }
+    }
+}
+
+/// An indexer or top-k mask over no keys is refused on the host rather than run: before the first
+/// block completes, V4's LID cache has nothing to score, and the emit skips both ops (and passes
+/// the CSA segment no bias). The control (one key, `top_k` 1) runs on both backends.
+#[test]
+fn lightning_indexer_and_topk_mask_refuse_zero_keys() {
+    let lidx = |kv_len: u32, top_k: u32| {
+        let mut g = Graph::new();
+        let q = g.input(f32d(2 * 8));
+        let k_cache = g.input(TensorDesc::new(vec![8], DType::F16));
+        let w = g.input(f32d(2));
+        let dst = g.output(TensorDesc::new(vec![1], DType::I32));
+        g.push(Op::LightningIndexer {
+            q,
+            k_cache,
+            weights: w,
+            dst,
+            rows: 1,
+            kv_len,
+            n_head: 2,
+            head_dim: 8,
+            top_k,
+            scale: 0.25,
+            pos: 3,
+            block_ratio: 4,
+        });
+        (g, dst)
+    };
+    let mask = |kv_len: u32, top_k: u32| {
+        let mut g = Graph::new();
+        let idx = g.input(TensorDesc::new(vec![1], DType::I32));
+        let dst = g.output(f32d(1));
+        g.push(Op::TopkMask {
+            idx,
+            dst,
+            rows: 1,
+            kv_len,
+            top_k,
+        });
+        (g, dst)
+    };
+    let cpu = infr_cpu::CpuBackend::new();
+    let vk = gpu();
+    let mut backends: Vec<(&str, &dyn Backend)> = vec![("cpu", &cpu)];
+    if let Some(vk) = &vk {
+        backends.push(("vulkan", vk));
+    }
+    for (name, be) in backends {
+        for (what, (g, out)) in [("indexer", lidx(1, 1)), ("mask", mask(1, 1))] {
+            assert_eq!(exec_zeroed(be, &g, out), Ok(()), "{name}: {what} control");
+        }
+        for (what, (g, out)) in [
+            ("indexer kv_len 0", lidx(0, 0)),
+            ("indexer top_k 0", lidx(1, 0)),
+            ("mask kv_len 0", mask(0, 0)),
+            ("mask top_k 0", mask(1, 0)),
+        ] {
+            let err = exec_zeroed(be, &g, out).expect_err(what);
+            println!("{name}: {what}: {err}");
+            assert!(
+                err.contains("selects nothing"),
+                "{name}: {what} refused for another reason: {err}"
+            );
+        }
+    }
+}
+
+/// The paths V4's compressed attention takes at real lengths, on Vulkan (and CPU) against the f64
+/// definition: more visible compressed keys than one kernel tile holds, so the online softmax
+/// folds several compressed tiles; compressed values growing to several times the raw ones along
+/// the cache, so each later tile raises the running max and must rescale the accumulator; a row
+/// whose whole middle tile the bias masks to `-inf`; and a row whose EVERY compressed key is
+/// masked (with no sink, the raw keys alone carry it). Head dims 64 and 512, with and without
+/// sinks.
+#[test]
+fn attention_comp_segment_multi_tile() {
+    // Rows at positions 9002 and 9003 see 2250 and 2251 blocks: three tiles of the kernel.
+    const POS: usize = 9002;
+    // The kernel's compressed tile; the masked tile of row 0 is the second one.
+    const TILE: usize = 1024;
+    let cpu = infr_cpu::CpuBackend::new();
+    let vk = gpu();
+    for hd in [64, 512] {
+        for sinks in [false, true] {
+            let mut c = CompCase::new("multi-tile", 2, POS, 2, 1, hd, 4);
+            (c.window, c.cap, c.sinks, c.bias) = (128, 130, sinks, true);
+            assert!(c.len > 2 * TILE, "the case must span three tiles");
+            let mut d = comp_data(&c);
+            // Grow the compressed rows to four times the raw scale toward the end of the cache.
+            let row = c.nkv * c.hd;
+            for (j, r) in d.c.chunks_mut(row).take(c.len).enumerate() {
+                let grow = 1.0 + 3.0 * j as f32 / c.len as f32;
+                for v in r {
+                    *v = half::f16::from_f32(*v * grow).to_f32();
+                }
+            }
+            for j in 0..c.len {
+                d.bias[j] = if (TILE..2 * TILE).contains(&j) || j % 7 == 0 {
+                    f32::NEG_INFINITY
+                } else {
+                    (j % 5) as f32 * 0.25 - 0.5
+                };
+                d.bias[c.len + j] = f32::NEG_INFINITY;
+            }
+            let name = format!("hd {hd}, sinks {sinks}");
+            let want = comp_ref(&c, &d, CompVariant::Faithful);
+            let gap = maxdiff64(&want, &comp_ref(&c, &d, CompVariant::NoBias));
+            assert!(gap > COMP_GAP, "{name}: the bias does not bite ({gap:e})");
+            let e = maxerr64(&comp_run(&cpu, &c, &d, true), &want);
+            println!("multi-tile {name}: cpu vs definition {e:e}");
+            assert!(e < COMP_TOL, "multi-tile {name}: CPU vs definition {e:e}");
+            if let Some(vk) = &vk {
+                let t = std::time::Instant::now();
+                let got = comp_run(vk, &c, &d, true);
+                let e = maxerr64(&got, &want);
+                println!(
+                    "multi-tile {name}: vulkan vs definition {e:e} ({:?})",
+                    t.elapsed()
+                );
+                assert!(
+                    e < COMP_VK_TOL,
+                    "multi-tile {name}: Vulkan vs definition {e:e}"
+                );
+            }
+        }
+    }
+}
+
+/// The CPU attends only the compressed keys whose bias is finite, and converts only the cache
+/// rows some query keeps: with most of a long segment masked it must give, bit for bit, what the
+/// concatenated single segment gives (whose raw path scores and weighs every key, the masked ones
+/// at exactly 0), and the f64 definition. Each query row keeps a different set — a sparse one
+/// spread from the first block to the last visible one, kept keys interleaved one for one with
+/// masked ones, one whose kept count leaves a partial group of keys, and one with every key
+/// masked — so the rows the op converts are a union no single row's set describes. Two kv heads,
+/// so a converted row holds both heads' halves. Caches at f16 and f32 (converted row by row) and
+/// bf16 (converted as a prefix).
+#[test]
+fn attention_comp_segment_skips_masked_keys() {
+    let cpu = infr_cpu::CpuBackend::new();
+    for sinks in [false, true] {
+        let mut c = CompCase::new("masked keys", 4, 4093, 4, 2, 64, 4);
+        (c.window, c.cap, c.sinks, c.bias) = (64, 70, sinks, true);
+        let mut d = comp_data(&c);
+        let mut kept = [0usize; 4];
+        for t in 0..c.rows {
+            let n_vis = (c.pos + t + 1) / c.ratio;
+            for j in 0..c.len {
+                let keep = match t {
+                    0 => j % 97 == 0 || j + 1 == n_vis,
+                    1 => j % 2 == 1,
+                    2 => (500..507).contains(&j),
+                    _ => false,
+                };
+                let b = &mut d.bias[t * c.len + j];
+                if !keep {
+                    *b = f32::NEG_INFINITY;
+                } else if !b.is_finite() {
+                    *b = 0.25;
+                }
+                kept[t] += usize::from(keep && j < n_vis);
+            }
+        }
+        assert!(
+            kept[0] > 4 && kept[0] * 20 < c.len,
+            "row 0 keeps few: {kept:?}"
+        );
+        assert_eq!(kept[2] % 4, 3, "row 2 leaves a partial group");
+        assert_eq!(kept[3], 0);
+        let want = comp_ref(&c, &d, CompVariant::Faithful);
+        let gap = maxdiff64(&want, &comp_ref(&c, &d, CompVariant::NoBias));
+        assert!(
+            gap > COMP_GAP,
+            "sinks {sinks}: the bias does not bite ({gap:e})"
+        );
+        for dt in [DType::F16, DType::F32, DType::Bf16] {
+            let name = format!("sinks {sinks}, {dt:?}");
+            let two = comp_run_at(&cpu, &c, &d, true, dt);
+            assert_eq!(
+                bits(&two),
+                bits(&comp_concat_run_at(&cpu, &c, &d, dt)),
+                "{name}: skipping masked keys changed the output"
+            );
+            // The data is f16-exact, which bf16 is not.
+            if dt != DType::Bf16 {
+                let e = maxerr64(&two, &want);
+                println!("masked keys {name}: cpu vs definition {e:e}");
+                assert!(e < COMP_TOL, "masked keys {name}: CPU vs definition {e:e}");
+            }
+        }
+    }
+}
+
+/// `Op::LightningIndexer`'s `block_ratio`: key `j` is eligible for the row at `abs` iff
+/// `j < (abs + 1) / block_ratio`, against the f64 definition (exact, indices are discrete) on
+/// CPU and Vulkan. The cases put a query on each side of a block boundary, cover `top_k`
+/// smaller than the eligible count and equal to every key (the short rows then fill the tail),
+/// a row that sees no key at all, and ratio 128. Ratio 1 is `lightning_indexer_parity` above.
+#[test]
+fn lightning_indexer_block_ratio_parity() {
+    let cpu = infr_cpu::CpuBackend::new();
+    // (name, rows, pos, kv_len, n_head, head_dim, top_k, ratio)
+    let cases = [
+        // Rows at positions 37..42: 9, 9, 10, 10, 10, 10 eligible — row 2 completes block 9.
+        ("prefill across a block, top_k bites", 6, 37, 10, 3, 8, 4, 4),
+        ("prefill, top_k every key", 6, 37, 10, 3, 8, 10, 4),
+        ("decode completing a block", 1, 39, 10, 4, 8, 3, 4),
+        ("decode one short of a block", 1, 38, 10, 4, 8, 9, 4),
+        ("no key eligible yet", 3, 0, 1, 2, 8, 1, 4),
+        ("ratio 128", 3, 254, 2, 3, 8, 2, 128),
+    ];
+    let mut ratio_matters = 0;
+    for (name, rows, pos, kv_len, n_head, head_dim, top_k, ratio) in cases {
+        let scale = 1.0 / ((head_dim * n_head) as f32).sqrt();
+        let keys: Vec<Vec<f32>> = (0..kv_len).map(|j| lidx_key_at(j, head_dim)).collect();
+        let cache: Vec<f32> = keys.concat();
+        let qi: Vec<f32> = (0..rows * n_head * head_dim)
+            .map(|i| (((i * 7 + 3) % 13) as f32 - 6.0) / 8.0)
+            .collect();
+        let wi: Vec<f32> = (0..rows * n_head)
+            .map(|i| (((i * 5 + 1) % 9) as f32 - 4.0) / 4.0)
+            .collect();
+        let (want, scores) = lightning_indexer_ref(
+            &qi, &keys, &wi, rows, n_head, head_dim, kv_len, top_k, scale, pos, ratio,
+        );
+        for (t, sc) in scores.iter().enumerate() {
+            let hi = ((pos + t + 1) / ratio).min(kv_len);
+            assert_scores_separated(sc, hi, &format!("{name} row {t}"));
+        }
+        let (per_token, _) = lightning_indexer_ref(
+            &qi, &keys, &wi, rows, n_head, head_dim, kv_len, top_k, scale, pos, 1,
+        );
+        if per_token != want {
+            ratio_matters += 1;
+        }
+
+        let mut g = Graph::new();
+        let q = g.input(f32d(rows * n_head * head_dim));
+        let k_cache = g.input(TensorDesc::new(vec![kv_len * head_dim], DType::F16));
+        let w = g.input(f32d(rows * n_head));
+        let dst = g.output(TensorDesc::new(vec![rows * top_k], DType::I32));
+        g.push(Op::LightningIndexer {
+            q,
+            k_cache,
+            weights: w,
+            dst,
+            rows: rows as u32,
+            kv_len: kv_len as u32,
+            n_head: n_head as u32,
+            head_dim: head_dim as u32,
+            top_k: top_k as u32,
+            scale,
+            pos: pos as u32,
+            block_ratio: ratio as u32,
+        });
+        let binds = [
+            (
+                q,
+                bytemuck::cast_slice(&qi).to_vec(),
+                BufferUsage::Activations,
+            ),
+            (
+                w,
+                bytemuck::cast_slice(&wi).to_vec(),
+                BufferUsage::Activations,
+            ),
+            (k_cache, f16_bytes(&cache), BufferUsage::Activations),
+        ];
+        let idx =
+            |be: &dyn Backend| -> Vec<u32> { bits(&exec_bytes(be, &g, &binds, dst, rows * top_k)) };
+        let c = idx(&cpu);
+        println!("LightningIndexer ratio {ratio} {name}: cpu={c:?} ref={want:?}");
+        assert_eq!(
+            c, want,
+            "LightningIndexer ratio {ratio} {name}: CPU vs definition"
+        );
+        if let Some(vk) = gpu() {
+            assert_eq!(
+                idx(&vk),
+                c,
+                "LightningIndexer ratio {ratio} {name}: Vulkan vs CPU"
+            );
+        }
+    }
+    assert!(
+        ratio_matters >= 3,
+        "only {ratio_matters} cases select differently with the ratio ignored"
+    );
+}
+
+/// The V4 CSA chain end to end: `Op::LightningIndexer` (ratio 4) over the LID cache, its indices
+/// expanded by `Op::TopkMask` into the segment's bias, then the two-segment `Op::Attention` —
+/// against the same chain from the definitions (the indexer's f64 selection, a 0/-inf mask,
+/// [`comp_ref`]). `top_k` is below every row's visible count, so the mask removes keys the
+/// causal rule alone would show, which the test asserts moves the output.
+#[test]
+fn indexer_topk_mask_two_segment_chain() {
+    let cpu = infr_cpu::CpuBackend::new();
+    // Positions 37..40 see 9, 9, 10, 10 blocks.
+    let mut c = CompCase::new("chain", 4, 37, 4, 1, 48, 4);
+    (c.window, c.sinks, c.bias) = (8, true, true);
+    let (i_heads, i_hd, top_k) = (4usize, 8usize, 4usize);
+    let i_scale = 1.0 / ((i_hd * i_heads) as f32).sqrt();
+    let keys: Vec<Vec<f32>> = (0..c.len).map(|j| lidx_key_at(j, i_hd)).collect();
+    let iq: Vec<f32> = (0..c.rows * i_heads * i_hd)
+        .map(|i| (((i * 7 + 3) % 13) as f32 - 6.0) / 8.0)
+        .collect();
+    let iw: Vec<f32> = (0..c.rows * i_heads)
+        .map(|i| (((i * 5 + 1) % 9) as f32 - 4.0) / 4.0)
+        .collect();
+    let (sel, scores) = lightning_indexer_ref(
+        &iq, &keys, &iw, c.rows, i_heads, i_hd, c.len, top_k, i_scale, c.pos, c.ratio,
+    );
+    for (t, sc) in scores.iter().enumerate() {
+        let hi = ((c.pos + t + 1) / c.ratio).min(c.len);
+        assert!(top_k < hi, "row {t}: top_k must be below the visible count");
+        assert_scores_separated(sc, hi, &format!("chain row {t}"));
+    }
+    let mut d = comp_data(&c);
+    d.bias = vec![f32::NEG_INFINITY; c.rows * c.len];
+    for t in 0..c.rows {
+        for &j in &sel[t * top_k..][..top_k] {
+            d.bias[t * c.len + j as usize] = 0.0;
+        }
+    }
+    let want = comp_ref(&c, &d, CompVariant::Faithful);
+    let gap = maxdiff64(&want, &comp_ref(&c, &d, CompVariant::NoBias));
+    println!("chain: the top-k mask moves the output by {gap:e}");
+    assert!(gap > COMP_GAP, "the top-k mask does not bite ({gap:e})");
+
+    let n_out = c.rows * c.nh * c.hd;
+    let mut g = Graph::new();
+    let q_idx = g.input(f32d(iq.len()));
+    let w_idx = g.input(f32d(iw.len()));
+    let lid = g.input(TensorDesc::new(vec![c.len * i_hd], DType::F16));
+    let idx = g.internal(TensorDesc::new(vec![c.rows * top_k], DType::I32));
+    let bias = g.internal(f32d(c.rows * c.len));
+    let q = g.input(TensorDesc::new(vec![n_out], DType::F16));
+    let kc = g.input(TensorDesc::new(vec![d.k.len()], DType::F16));
+    let vc = g.input(TensorDesc::new(vec![d.v.len()], DType::F16));
+    let sk = g.weight(f32d(c.nh));
+    let cache = g.input(TensorDesc::new(vec![d.c.len()], DType::F16));
+    let dst = g.output(f32d(n_out));
+    g.push(Op::LightningIndexer {
+        q: q_idx,
+        k_cache: lid,
+        weights: w_idx,
+        dst: idx,
+        rows: c.rows as u32,
+        kv_len: c.len as u32,
+        n_head: i_heads as u32,
+        head_dim: i_hd as u32,
+        top_k: top_k as u32,
+        scale: i_scale,
+        pos: c.pos as u32,
+        block_ratio: c.ratio as u32,
+    });
+    g.push(Op::TopkMask {
+        idx,
+        dst: bias,
+        rows: c.rows as u32,
+        kv_len: c.len as u32,
+        top_k: top_k as u32,
+    });
+    g.push(Op::Attention {
+        q,
+        k_cache: kc,
+        v_cache: vc,
+        dst,
+        rows: c.rows as u32,
+        kv_len: c.kv_len() as u32,
+        n_head: c.nh as u32,
+        n_kv: c.nkv as u32,
+        head_dim: c.hd as u32,
+        scale: c.scale(),
+        mask: c.mask(),
+        pos: c.pos as u32,
+        sinks: Some(sk),
+        key_bias: None,
+        comp: Some(CompSegment {
+            cache,
+            len: c.len as u32,
+            ratio: c.ratio as u32,
+            bias: Some(bias),
+        }),
+    });
+    let binds = [
+        (
+            q_idx,
+            bytemuck::cast_slice(&iq).to_vec(),
+            BufferUsage::Activations,
+        ),
+        (
+            w_idx,
+            bytemuck::cast_slice(&iw).to_vec(),
+            BufferUsage::Activations,
+        ),
+        (lid, f16_bytes(&keys.concat()), BufferUsage::KvCache),
+        (q, f16_bytes(&d.q), BufferUsage::Activations),
+        (kc, f16_bytes(&d.k), BufferUsage::KvCache),
+        (vc, f16_bytes(&d.v), BufferUsage::KvCache),
+        (
+            sk,
+            bytemuck::cast_slice(&d.sinks).to_vec(),
+            BufferUsage::Weights,
+        ),
+        (cache, f16_bytes(&d.c), BufferUsage::KvCache),
+    ];
+    let got = exec_bytes(&cpu, &g, &binds, dst, n_out);
+    let e = maxerr64(&got, &want);
+    println!("chain: cpu vs definition {e:e}");
+    assert!(e < COMP_TOL, "chain: CPU vs definition {e:e}");
+    if let Some(vk) = gpu() {
+        let got = exec_bytes(&vk, &g, &binds, dst, n_out);
+        let e = maxerr64(&got, &want);
+        println!("chain: vulkan vs definition {e:e}");
+        assert!(e < COMP_VK_TOL, "chain: Vulkan vs definition {e:e}");
     }
 }
 
@@ -4126,19 +6106,20 @@ fn hc_ref_post(x: &[f32], residual: &[f32], post: &[f32], comb: &[f32], d: HcDim
     out
 }
 
+/// [`maxerr`] against an f64 reference, with the same NaN propagation.
 fn maxerr64(a: &[f32], b: &[f64]) -> f64 {
     assert_eq!(a.len(), b.len(), "reference/backend length mismatch");
     a.iter()
         .zip(b)
         .map(|(x, y)| (*x as f64 - y).abs())
-        .fold(0.0, f64::max)
+        .fold(0.0, nan_max64)
 }
 
 fn maxdiff64(a: &[f64], b: &[f64]) -> f64 {
     a.iter()
         .zip(b)
         .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f64::max)
+        .fold(0.0, nan_max64)
 }
 
 /// `mixes` values for a case: mixed-sign, no symmetry between the `dst`/`src` axes of the `comb`
@@ -4470,11 +6451,11 @@ fn hyper_connect_comb_is_doubly_stochastic() {
                 let b = t * hc * hc;
                 for dst in 0..hc {
                     let s: f64 = (0..hc).map(|src| m[b + dst + hc * src]).sum();
-                    esrc = esrc.max((s - 1.0).abs());
+                    esrc = nan_max64(esrc, (s - 1.0).abs());
                 }
                 for src in 0..hc {
                     let s: f64 = (0..hc).map(|dst| m[b + dst + hc * src]).sum();
-                    edst = edst.max((s - 1.0).abs());
+                    edst = nan_max64(edst, (s - 1.0).abs());
                 }
             }
             (esrc, edst)
@@ -4560,9 +6541,13 @@ fn hyper_connect_details_are_load_bearing() {
         // How far this variant moves the faithful answer, over all three outputs.
         let moved = |what: &str, v: HcVariant| -> f64 {
             let (pre, post, comb) = hc_ref_mix(&mixes, &scale, &base, d, v);
-            let e = maxdiff64(&pre0, &pre)
-                .max(maxdiff64(&post0, &post))
-                .max(maxdiff64(&comb0, &comb));
+            let e = [
+                maxdiff64(&pre0, &pre),
+                maxdiff64(&post0, &post),
+                maxdiff64(&comb0, &comb),
+            ]
+            .into_iter()
+            .fold(0.0, nan_max64);
             println!("HyperConnect {name}: {what} moves the answer by {e:e}");
             e
         };
@@ -5154,11 +7139,11 @@ fn swiglu_clamp_orders_are_distinguishable() {
             for &uz in CLAMP_UPS.iter() {
                 let (gz, uz) = (gz as f64, uz as f64);
                 let want = swiglu_clamp_ref(gz, uz, Some(limit));
-                d_post = d_post.max((want - post(gz, uz)).abs());
-                d_sym = d_sym.max((want - sym(gz, uz)).abs());
-                d_up = d_up.max((want - one_up(gz, uz)).abs());
+                d_post = nan_max64(d_post, (want - post(gz, uz)).abs());
+                d_sym = nan_max64(d_sym, (want - sym(gz, uz)).abs());
+                d_up = nan_max64(d_up, (want - one_up(gz, uz)).abs());
                 if gz < 0.0 {
-                    neg_lobe = neg_lobe.max((want - post(gz, uz)).abs());
+                    neg_lobe = nan_max64(neg_lobe, (want - post(gz, uz)).abs());
                 }
             }
         }
@@ -6086,6 +8071,973 @@ fn compress_pool_all_neg_inf_window_is_zero() {
         assert!(
             e < CP_TOL,
             "{be}: the sentinel blocks disturbed the neighbouring block's average ({e:e})"
+        );
+    }
+}
+
+// ── DeepSeek V4 compressor source gather (`Op::GatherRows`) ──────────────────────────────────
+
+/// The scalar fields of one `Op::GatherRows`.
+#[derive(Clone, Copy)]
+struct GrParams {
+    rows: usize,
+    idx_off: usize,
+    src_stride: usize,
+    src_col: usize,
+    n: usize,
+    group: usize,
+    dst_group_stride: usize,
+    dst_row_off: usize,
+    fill: f32,
+}
+
+impl GrParams {
+    /// Entry `r` to destination row `r`, `n` columns from column 0: the HCA shape.
+    fn plain(rows: usize, n: usize) -> Self {
+        GrParams {
+            rows,
+            idx_off: 0,
+            src_stride: n,
+            src_col: 0,
+            n,
+            group: 1,
+            dst_group_stride: 1,
+            dst_row_off: 0,
+            fill: 0.0,
+        }
+    }
+
+    /// The two CSA/LID overlap halves for `blocks` blocks of ratio `ratio` over `2*d`-wide state
+    /// rows, as `Op::GatherRows`' doc spells them: previous windows from columns `[0, d)` into
+    /// each block's first `ratio` slots, current windows from `[d, 2d)` into its last `ratio`.
+    fn overlap(blocks: usize, ratio: usize, d: usize, fill: f32) -> [Self; 2] {
+        let half = |idx_off, src_col, dst_row_off| GrParams {
+            rows: ratio * blocks,
+            idx_off,
+            src_stride: 2 * d,
+            src_col,
+            n: d,
+            group: ratio,
+            dst_group_stride: 2 * ratio,
+            dst_row_off,
+            fill,
+        };
+        [half(0, 0, 0), half(ratio * blocks, d, ratio)]
+    }
+
+    fn op(&self, src: TensorId, idx: TensorId, dst: TensorId) -> Op {
+        Op::GatherRows {
+            src,
+            idx,
+            dst,
+            rows: self.rows as u32,
+            idx_off: self.idx_off as u32,
+            src_stride: self.src_stride as u32,
+            src_col: self.src_col as u32,
+            n: self.n as u32,
+            group: self.group as u32,
+            dst_group_stride: self.dst_group_stride as u32,
+            dst_row_off: self.dst_row_off as u32,
+            fill: self.fill,
+        }
+    }
+}
+
+/// From-definition reference for a sequence of gathers into one destination of `dst_len`
+/// elements, starting from zeros (what both backends allocate an output as). Written from the
+/// op's formula, in f64, without anything the kernels call.
+fn gr_ref(src: &[f32], idx: &[i32], dst_len: usize, gathers: &[GrParams]) -> Vec<f64> {
+    let mut dst = vec![0f64; dst_len];
+    for p in gathers {
+        for r in 0..p.rows {
+            let i = idx[p.idx_off + r];
+            let row = (r / p.group) * p.dst_group_stride + p.dst_row_off + r % p.group;
+            for c in 0..p.n {
+                dst[row * p.n + c] = if i < 0 {
+                    p.fill as f64
+                } else {
+                    src[i as usize * p.src_stride + p.src_col + c] as f64
+                };
+            }
+        }
+    }
+    dst
+}
+
+/// The i32 index handle rides `run`'s f32 wire type as its bit pattern.
+fn gr_wire(idx: &[i32]) -> Vec<f32> {
+    idx.iter().map(|&e| f32::from_bits(e as u32)).collect()
+}
+
+/// One graph running `gathers` in order into one `dst_len`-element output.
+fn gr_run(
+    be: &dyn Backend,
+    src: &[f32],
+    idx: &[i32],
+    dst_len: usize,
+    gathers: &[GrParams],
+) -> Vec<f32> {
+    let mut g = Graph::new();
+    let si = g.input(f32d(src.len()));
+    let ii = g.input(TensorDesc::new(vec![idx.len()], DType::I32));
+    let dst = g.output(f32d(dst_len));
+    for p in gathers {
+        g.push(p.op(si, ii, dst));
+    }
+    run(be, &g, &[(si, src), (ii, &gr_wire(idx))], &[], dst, dst_len)
+}
+
+/// A gather moves bits; it never computes. So the backends must equal the reference BIT for bit,
+/// `-inf` fills included (where an absolute difference would be NaN and pass a tolerance).
+fn gr_assert_exact(what: &str, got: &[f32], want: &[f64]) {
+    assert_eq!(got.len(), want.len(), "{what}: length");
+    for (k, (&g, &w)) in got.iter().zip(want).enumerate() {
+        assert_eq!(
+            g.to_bits(),
+            (w as f32).to_bits(),
+            "{what}: element {k} is {g}, the definition gives {w}"
+        );
+    }
+}
+
+/// Distinct values per (row, column), so a wrong row or a wrong column offset is a wrong value.
+fn gr_src(rows: usize, stride: usize) -> Vec<f32> {
+    (0..rows * stride)
+        .map(|i| (i / stride) as f32 * 100.0 + (i % stride) as f32 + 0.25)
+        .collect()
+}
+
+/// Each case on CPU and, when present, Vulkan, against [`gr_ref`].
+fn gr_check(name: &str, src: &[f32], idx: &[i32], dst_len: usize, gathers: &[GrParams]) {
+    let want = gr_ref(src, idx, dst_len, gathers);
+    let cpu = infr_cpu::CpuBackend::new();
+    gr_assert_exact(
+        &format!("{name} (cpu)"),
+        &gr_run(&cpu, src, idx, dst_len, gathers),
+        &want,
+    );
+    if let Some(vk) = gpu() {
+        gr_assert_exact(
+            &format!("{name} (vulkan)"),
+            &gr_run(&vk, src, idx, dst_len, gathers),
+            &want,
+        );
+        println!("GatherRows {name}: cpu and vulkan exact");
+    } else {
+        println!("GatherRows {name}: cpu exact (no Vulkan device)");
+    }
+}
+
+/// The identity gather returns its source, and a permutation permutes it — the identity checked
+/// against the source directly as well as against the reference.
+#[test]
+fn gather_rows_identity_and_permutation() {
+    let (rows, n) = (6usize, 5usize);
+    let src = gr_src(rows, n);
+    let ident: Vec<i32> = (0..rows as i32).collect();
+    let p = GrParams::plain(rows, n);
+    let src64: Vec<f64> = src.iter().map(|&v| v as f64).collect();
+    assert_eq!(gr_ref(&src, &ident, rows * n, &[p]), src64);
+    gr_check("identity", &src, &ident, rows * n, &[p]);
+    gr_check("permutation", &src, &[4, 0, 5, 5, 2, 1], rows * n, &[p]);
+}
+
+/// A negative index writes `fill` across the row: `0.0` (the sentinel's values) and `-inf` (its
+/// scores). Mixed with real rows, so a fill that leaked into a neighbour shows.
+#[test]
+fn gather_rows_negative_index_fills() {
+    let src = gr_src(4, 3);
+    let idx = [-1, 3, -1, 0, 2];
+    for fill in [0.0, f32::NEG_INFINITY] {
+        let p = GrParams {
+            fill,
+            ..GrParams::plain(idx.len(), 3)
+        };
+        gr_check(&format!("fill {fill}"), &src, &idx, idx.len() * 3, &[p]);
+    }
+}
+
+/// A column window of a wider source row: `n` columns from `src_col`.
+#[test]
+fn gather_rows_source_column_offset() {
+    let src = gr_src(5, 10);
+    let p = GrParams {
+        src_stride: 10,
+        src_col: 3,
+        ..GrParams::plain(4, 4)
+    };
+    gr_check("column offset", &src, &[2, 4, 0, 3], 16, &[p]);
+}
+
+/// The plan's overlap index vector for [`gather_rows_overlap_halves_into_one_destination`] and
+/// [`gather_rows_feeds_compress_pool`]: three blocks of ratio 4 over a `[ring of 8 | 5 step
+/// rows]` source, every block's previous window then every block's current window, block 0's
+/// previous window the sentinel.
+const GR_PREV: [i32; 12] = [-1, -1, -1, -1, 8, 9, 10, 11, 1, 2, 3, 4];
+const GR_CUR: [i32; 12] = [8, 9, 10, 11, 12, 0, 7, 6, 5, 4, 12, 3];
+
+/// The CSA overlap layout: two gathers into one destination, block `b`'s window holding its
+/// previous-window rows (columns `[0, d)`) in slots `[0, ratio)` and its current-window rows
+/// (columns `[d, 2d)`) in `[ratio, 2*ratio)`, for both the value fill and the score fill.
+#[test]
+fn gather_rows_overlap_halves_into_one_destination() {
+    let (blocks, ratio, d) = (3usize, 4usize, 6usize);
+    let src = gr_src(2 * ratio + 5, 2 * d);
+    let idx: Vec<i32> = GR_PREV.iter().chain(&GR_CUR).copied().collect();
+    let dst_len = blocks * 2 * ratio * d;
+    for fill in [0.0, f32::NEG_INFINITY] {
+        let halves = GrParams::overlap(blocks, ratio, d, fill);
+        gr_check(
+            &format!("overlap fill {fill}"),
+            &src,
+            &idx,
+            dst_len,
+            &halves,
+        );
+    }
+    // The layout spelled out for one slot of each half, independently of `gr_ref`: block 1, slot
+    // 1 is the previous half's entry 5 (row 9, columns [0, d)); block 1, slot ratio + 2 is the
+    // current half's entry 6 (row 7, columns [d, 2d)); block 0's previous slots are the fill.
+    let out = gr_run(
+        &infr_cpu::CpuBackend::new(),
+        &src,
+        &idx,
+        dst_len,
+        &GrParams::overlap(blocks, ratio, d, 0.0),
+    );
+    let slot = |b: usize, w: usize| &out[(b * 2 * ratio + w) * d..][..d];
+    assert_eq!(slot(1, 1), &src[9 * 2 * d..][..d]);
+    assert_eq!(slot(1, ratio + 2), &src[7 * 2 * d + d..][..d]);
+    assert!(slot(0, 0).iter().all(|&v| v == 0.0));
+}
+
+/// The HCA layout at its real window: every block reads its own `DSV4_HCA_RATIO` rows in index
+/// order, enough output elements that the Vulkan dispatch spans many workgroups.
+#[test]
+fn gather_rows_hca_layout() {
+    let (blocks, window, d) = (2usize, 128usize, 5usize);
+    let src_rows = window + 40;
+    let src = gr_src(src_rows, d);
+    let idx: Vec<i32> = (0..blocks * window)
+        .map(|r| ((r * 37 + 11) % src_rows) as i32)
+        .collect();
+    gr_check(
+        "hca",
+        &src,
+        &idx,
+        blocks * window * d,
+        &[GrParams::plain(blocks * window, d)],
+    );
+}
+
+/// An index past the source's rows: the CPU refuses it, and the Vulkan kernel, which cannot see
+/// index values when the host records it, writes the fill instead of reading past the buffer.
+#[test]
+fn gather_rows_out_of_range_index() {
+    let src = gr_src(3, 2);
+    let idx = [0, 3];
+    let p = GrParams {
+        fill: -7.0,
+        ..GrParams::plain(2, 2)
+    };
+    let cpu = std::panic::catch_unwind(|| {
+        gr_run(&infr_cpu::CpuBackend::new(), &src, &idx, 4, &[p]);
+    });
+    assert!(cpu.is_err(), "cpu gathered an index past the source rows");
+    if let Some(vk) = gpu() {
+        let out = gr_run(&vk, &src, &idx, 4, &[p]);
+        assert_eq!(out, vec![src[0], src[1], -7.0, -7.0]);
+    }
+}
+
+/// What the host check refuses, one guard per case: wrong dtypes, `src == dst`, `n` or `group` 0,
+/// a column window past the row, groups that overlap, an index shorter than the entries read, a
+/// destination too small. Every case is valid in every OTHER respect, and each must be refused by
+/// its own guard (the message names it), so deleting any one guard turns exactly its case red.
+#[test]
+fn gather_rows_geometry_is_checked() {
+    /// One graph for the check: dtypes of src/idx/dst, and whether dst is the src tensor itself.
+    struct Shape {
+        idx_len: usize,
+        dst_len: usize,
+        dtypes: [DType; 3],
+        dst_is_src: bool,
+    }
+    let check = |p: GrParams, s: &Shape| {
+        let mut g = Graph::new();
+        let src = g.input(TensorDesc::new(vec![40], s.dtypes[0]));
+        let idx = g.input(TensorDesc::new(vec![s.idx_len], s.dtypes[1]));
+        let dst = if s.dst_is_src {
+            src
+        } else {
+            g.output(TensorDesc::new(vec![s.dst_len], s.dtypes[2]))
+        };
+        infr_core::graph::check_gather_rows(&g, &p.op(src, idx, dst))
+    };
+    let shape = Shape {
+        idx_len: 8,
+        dst_len: 32,
+        dtypes: [DType::F32, DType::I32, DType::F32],
+        dst_is_src: false,
+    };
+    // The current half of two ratio-2 blocks over 8-wide rows: entries [4, 8), destination rows
+    // 2, 3, 6, 7 of 4 columns.
+    let ok = GrParams::overlap(2, 2, 4, 0.0)[1];
+    assert_eq!(check(ok, &shape), Ok(5));
+    let with = |f: fn(&mut Shape)| {
+        let mut s = Shape { ..shape };
+        f(&mut s);
+        s
+    };
+    // Groups of 2 rows one group apart, the first entry at row 1: group 0 covers rows 1-2 and
+    // group 1 rows 3-4, inside a 40-element destination, so only the overlap guard sees that
+    // each group spills into the next one's first row.
+    let overlap = GrParams {
+        idx_off: 0,
+        src_col: 0,
+        group: 2,
+        dst_group_stride: 2,
+        dst_row_off: 1,
+        ..ok
+    };
+    let cases: [(&str, GrParams, Shape, &str); 10] = [
+        (
+            "f16 src",
+            ok,
+            with(|s| s.dtypes[0] = DType::F16),
+            "src must be",
+        ),
+        (
+            "f32 idx",
+            ok,
+            with(|s| s.dtypes[1] = DType::F32),
+            "idx must be",
+        ),
+        (
+            "f16 dst",
+            ok,
+            with(|s| s.dtypes[2] = DType::F16),
+            "dst must be",
+        ),
+        (
+            "src == dst",
+            ok,
+            with(|s| s.dst_is_src = true),
+            "same tensor",
+        ),
+        (
+            "n 0",
+            GrParams { n: 0, ..ok },
+            with(|_| {}),
+            "at least one column",
+        ),
+        (
+            "group 0",
+            GrParams { group: 0, ..ok },
+            with(|_| {}),
+            "at least one column",
+        ),
+        (
+            "column window",
+            GrParams { src_col: 5, ..ok },
+            with(|_| {}),
+            "source row",
+        ),
+        (
+            "overlapping groups",
+            overlap,
+            with(|s| s.dst_len = 40),
+            "into the next group",
+        ),
+        ("short index", ok, with(|s| s.idx_len = 7), "index"),
+        (
+            "short destination",
+            ok,
+            with(|s| s.dst_len = 31),
+            "-element dst",
+        ),
+    ];
+    for (what, p, s, guard) in cases {
+        match check(p, &s) {
+            Ok(_) => panic!("{what} was accepted"),
+            Err(e) => assert!(
+                e.contains(guard),
+                "{what} was refused by another guard: {e}"
+            ),
+        }
+    }
+}
+
+/// **Gather into `Op::CompressPool`, end to end.** The CSA overlap's value and score gathers feed
+/// the pool in one graph, and the pooled rows are compared with a from-definition row computed
+/// straight from the state rows and the plan's index vector: block `b`, channel `c` softmaxes over
+/// its previous-window scores at column `c` and current-window scores at column `d + c` (the
+/// sentinel contributing a zero value at `-inf`), and averages the values at the same places.
+#[test]
+fn gather_rows_feeds_compress_pool() {
+    let (blocks, ratio, d) = (3usize, 4usize, 6usize);
+    let n_src = 2 * ratio + 5;
+    let kv: Vec<f32> = gr_src(n_src, 2 * d)
+        .iter()
+        .map(|v| (v * 0.37).sin())
+        .collect();
+    let sc: Vec<f32> = (0..n_src * 2 * d)
+        .map(|i| (((i * 23 + 5) % 37) as f32 - 18.0) * 0.21)
+        .collect();
+    let idx: Vec<i32> = GR_PREV.iter().chain(&GR_CUR).copied().collect();
+    let window = 2 * ratio;
+
+    let mut want = vec![0f64; blocks * d];
+    for b in 0..blocks {
+        for c in 0..d {
+            // (value, score) of each window slot, previous half then current half.
+            let slot = |w: usize| -> (f64, f64) {
+                let (i, col) = if w < ratio {
+                    (GR_PREV[b * ratio + w], c)
+                } else {
+                    (GR_CUR[b * ratio + w - ratio], d + c)
+                };
+                if i < 0 {
+                    (0.0, f64::NEG_INFINITY)
+                } else {
+                    let at = i as usize * 2 * d + col;
+                    (kv[at] as f64, sc[at] as f64)
+                }
+            };
+            let m = (0..window)
+                .map(|w| slot(w).1)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let (mut num, mut den) = (0f64, 0f64);
+            for w in 0..window {
+                let (v, s) = slot(w);
+                let e = (s - m).exp();
+                num += v * e;
+                den += e;
+            }
+            want[b * d + c] = num / den;
+        }
+    }
+
+    let go = |be: &dyn Backend| -> Vec<f32> {
+        let mut g = Graph::new();
+        let kvi = g.input(f32d(kv.len()));
+        let sci = g.input(f32d(sc.len()));
+        let ii = g.input(TensorDesc::new(vec![idx.len()], DType::I32));
+        let values = g.internal(f32d(blocks * window * d));
+        let scores = g.internal(f32d(blocks * window * d));
+        let dst = g.output(f32d(blocks * d));
+        for (src, gathered, fill) in [(kvi, values, 0.0), (sci, scores, f32::NEG_INFINITY)] {
+            for p in GrParams::overlap(blocks, ratio, d, fill) {
+                g.push(p.op(src, ii, gathered));
+            }
+        }
+        g.push(Op::CompressPool {
+            values,
+            scores,
+            dst,
+            blocks: blocks as u32,
+            window: window as u32,
+            n_embd: d as u32,
+        });
+        run(
+            be,
+            &g,
+            &[(kvi, &kv), (sci, &sc), (ii, &gr_wire(&idx))],
+            &[],
+            dst,
+            blocks * d,
+        )
+    };
+    let cpu = go(&infr_cpu::CpuBackend::new());
+    let e = maxerr64(&cpu, &want);
+    println!("GatherRows -> CompressPool: cpu vs definition max_err={e:e}");
+    assert!(
+        e < 1e-5,
+        "cpu gathered pool diverges from the definition ({e:e})"
+    );
+    if let Some(vk) = gpu() {
+        let v = go(&vk);
+        let e = maxerr64(&v, &want);
+        println!("GatherRows -> CompressPool: vulkan vs definition max_err={e:e}");
+        assert!(
+            e < 1e-5,
+            "vulkan gathered pool diverges from the definition ({e:e})"
+        );
+    }
+}
+
+// ---- K-quant prefill `Op::Linear`: what int8 activations may cost.
+//
+// The Vulkan prefill GEMMs for Q4_K/Q5_K/Q6_K quantize the activations to int8 per 32-element
+// block (`quant_q8`: d = amax/127 in f32, codes round(x/d), d and s = Σd·q stored as f16) before
+// an integer dot — the int8 cooperative-matrix GEMM on devices that run it, the dp4a mmq GEMM on
+// devices without f16 coopmat. Against the exact product of the f32 activations and the
+// dequantized weight, with each block's weight written w = s_w·q + min (min = 0 for Q6_K), the
+// error per 32-block is at most
+//   Σ|s_w·q|·e + |min|·(16·d·(1+2⁻²⁰) + max((|Σx| + 16·d)·2⁻¹¹, 2⁻²⁵))
+//   e = ½·d·(1+2⁻²⁰) + 127·max(d·2⁻¹¹, 2⁻²⁵)
+// The scaled part: half a code step (the 2⁻²⁰ covers the f32 rounding of x/d), plus the f16
+// rounding of d — relative 2⁻¹¹ while d is a normal f16, half the subnormal spacing (2⁻²⁵)
+// below that — over at most 127 codes. The min part: s differs from Σx by at most the 32 codes'
+// half steps (16·d), and its f16 rounding is relative to s itself, |s| ≤ |Σx| + 16·d, again with
+// the subnormal floor. The inputs below hit both edges: blocks whose sum is near zero and blocks
+// whose scale is an f16 subnormal (amax under 127·2⁻¹⁴ ≈ 0.0078).
+//
+// This is a worst-case bound, and loose: the codes' errors add with random signs, and the
+// measured worst sits near a tenth of it. It is the contract the activation quantization is held
+// to, not the test with teeth for a decode slip — that is `infr-vulkan`'s
+// `i8cm_kq_matches_its_decomposition`, which holds the kernel to its own decomposition within
+// 1e-5 of the term sum.
+
+/// A valid K-quant bank of `n_elems` weights: random quant and scale bits, small super-scales.
+fn kq_bank(dt: DType, n_elems: usize, seed: u64) -> Vec<u8> {
+    let (epb, bpb) = infr_gguf::block_layout(dt);
+    let mut s = seed;
+    let mut byte = || {
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (s >> 33) as u8
+    };
+    let mut out = Vec::with_capacity(n_elems / epb * bpb);
+    for _ in 0..n_elems / epb {
+        let mut b: Vec<u8> = (0..bpb).map(|_| byte()).collect();
+        let d = half::f16::from_f32(0.004 + byte() as f32 * 1e-5).to_le_bytes();
+        let dmin = half::f16::from_f32(0.01 + byte() as f32 * 1e-5).to_le_bytes();
+        match dt {
+            DType::Q4K | DType::Q5K => {
+                b[0..2].copy_from_slice(&d);
+                b[2..4].copy_from_slice(&dmin);
+            }
+            DType::Q6K => b[208..210].copy_from_slice(&d),
+            other => panic!("no synth for {other:?}"),
+        }
+        out.extend_from_slice(&b);
+    }
+    out
+}
+
+/// Each 32-block's `min` (`−dmin·mn`; 0 for Q6_K): the dequant of the bank with its quant bits
+/// cleared.
+fn kq_block_mins(dt: DType, bank: &[u8]) -> Vec<f32> {
+    let (epb, bpb) = infr_gguf::block_layout(dt);
+    let quant_bytes = match dt {
+        DType::Q4K => 16..144,
+        DType::Q5K => 16..176,
+        DType::Q6K => return vec![0.0; bank.len() / bpb * epb / 32],
+        other => panic!("no mins for {other:?}"),
+    };
+    let mut zeroed = bank.to_vec();
+    for block in zeroed.chunks_mut(bpb) {
+        block[quant_bytes.clone()].fill(0);
+    }
+    let w = infr_gguf::dequant::dequant_block(dt, &zeroed).unwrap();
+    w.chunks(32).map(|c| c[0]).collect()
+}
+
+/// Upload `inputs` (f32) and `weights` (raw bytes), execute `g` on `be`, and download `outs`.
+fn run_bytes(
+    be: &dyn Backend,
+    g: &Graph,
+    inputs: &[(TensorId, &[f32])],
+    weights: &[(TensorId, &[u8])],
+    outs: &[(TensorId, usize)],
+) -> Vec<Vec<f32>> {
+    let plan = be.compile(g).expect("compile");
+    let mut keep = Vec::new();
+    for (id, data) in inputs {
+        let b = be.alloc(data.len() * 4, BufferUsage::Activations).unwrap();
+        be.upload(b.as_ref(), bytemuck::cast_slice(data)).unwrap();
+        keep.push((*id, b));
+    }
+    for (id, bytes) in weights {
+        let b = be.alloc(bytes.len(), BufferUsage::Weights).unwrap();
+        be.upload(b.as_ref(), bytes).unwrap();
+        keep.push((*id, b));
+    }
+    for (id, n) in outs {
+        keep.push((*id, be.alloc(n * 4, BufferUsage::Readback).unwrap()));
+    }
+    let mut b = Bindings::new();
+    for (id, buf) in &keep {
+        b.bind(*id, buf.as_ref());
+    }
+    be.execute(plan.as_ref(), &b).expect("execute");
+    outs.iter()
+        .map(|(id, n)| {
+            let (_, buf) = keep.iter().find(|(k, _)| k == id).unwrap();
+            let mut o = vec![0f32; *n];
+            be.download(buf.as_ref(), bytemuck::cast_slice_mut(&mut o))
+                .unwrap();
+            o
+        })
+        .collect()
+}
+
+/// A one-Linear graph: `[m, in_f]` input through `out_f` rows of `bank` from element `w_off`.
+fn kq_linear_run(
+    be: &dyn Backend,
+    dt: DType,
+    bank: &[u8],
+    x: &[f32],
+    (m, in_f, out_f, w_off): (usize, usize, usize, usize),
+) -> Vec<f32> {
+    let (epb, bpb) = infr_gguf::block_layout(dt);
+    let mut g = Graph::new();
+    let xi = g.input(f32d(m * in_f));
+    let w = g.weight(TensorDesc::new(vec![bank.len() / bpb * epb], dt));
+    let dst = g.output(f32d(m * out_f));
+    g.push(Op::Linear {
+        x: xi,
+        weight: w,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: w_off as u32,
+    });
+    run_bytes(be, &g, &[(xi, x)], &[(w, bank)], &[(dst, m * out_f)]).remove(0)
+}
+
+/// Which int8 coopmat tile a Linear should take through the adapter, when the device runs it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum KqTile {
+    Large,
+    Medium,
+}
+
+/// Activations whose blocks cycle through four kinds: two with a mean of either sign (a block
+/// summing to zero would hide the min term), one near zero mean, one whose amax puts its scale in
+/// the f16 subnormal range.
+fn kq_activations(m: usize, in_f: usize) -> Vec<f32> {
+    (0..m * in_f)
+        .map(|i| {
+            let b = i / 32;
+            let wave = (i as f32 * 0.37).sin();
+            match b % 4 {
+                0 | 1 => (wave + ((b % 7) as f32 - 3.0) * 0.2) * (0.5 + (b % 13) as f32 * 0.25),
+                2 => wave * (0.5 + (b % 13) as f32 * 0.25),
+                _ => wave * 0.003,
+            }
+        })
+        .collect()
+}
+
+/// One prefill-shaped K-quant Linear on Vulkan, held to the int8-activation bound above. On a
+/// device that runs the int8 coopmat GEMM the Linear must have taken it, at `tile`; elsewhere the
+/// bound is checked on the device's own GEMM and the test says so.
+fn kquant_linear_within_int8_bound(
+    dt: DType,
+    (m, in_f, out_f, w_off): (usize, usize, usize, usize),
+    tile: KqTile,
+) {
+    let Some(vk) = gpu() else {
+        eprintln!("kquant_linear_{dt:?}: no Vulkan device — skipped");
+        return;
+    };
+    let bank = kq_bank(dt, w_off + out_f * in_f, 0x5eed ^ dt as u64);
+    let w = infr_gguf::dequant::dequant_block(dt, &bank).unwrap();
+    let mins = kq_block_mins(dt, &bank);
+    let x = kq_activations(m, in_f);
+    let before = vk.i8cm_kq_counts();
+    let got = kq_linear_run(&vk, dt, &bank, &x, (m, in_f, out_f, w_off));
+    let after = vk.i8cm_kq_counts();
+    if vk.int8_coopmat_prefill() {
+        let ran = (
+            after.large_tile - before.large_tile,
+            after.medium_tile - before.medium_tile,
+        );
+        let want = match tile {
+            KqTile::Large => (1, 0),
+            KqTile::Medium => (0, 1),
+        };
+        assert_eq!(
+            ran, want,
+            "{dt:?}: the Linear did not take the int8 coopmat GEMM at the {tile:?} tile"
+        );
+    } else {
+        eprintln!(
+            "kquant_linear_{dt:?}: no int8 coopmat GEMM on this device — bound checked on its own \
+             prefill GEMM"
+        );
+    }
+
+    let nblk = in_f / 32;
+    let p11 = 2f64.powi(-11);
+    let sub = 2f64.powi(-25);
+    let slop = 1.0 + 2f64.powi(-20);
+    // Per activation block: its scale d and Σx.
+    let act: Vec<(f64, f64)> = x
+        .chunks(32)
+        .map(|xs| {
+            let d = xs.iter().fold(0f32, |a, v| a.max(v.abs())) as f64 / 127.0;
+            (d, xs.iter().map(|v| *v as f64).sum())
+        })
+        .collect();
+    // Per weight block: Σ|w − min| and min.
+    let wts: Vec<(f64, f64)> = (0..out_f * nblk)
+        .map(|ob| {
+            let min = mins[w_off / 32 + ob] as f64;
+            let ws = &w[w_off + ob * 32..][..32];
+            (ws.iter().map(|v| (*v as f64 - min).abs()).sum(), min)
+        })
+        .collect();
+    use rayon::prelude::*;
+    let rows: Vec<(f64, f64)> = (0..m)
+        .into_par_iter()
+        .map(|r| {
+            let xr = &x[r * in_f..][..in_f];
+            let (mut worst_bound, mut worst_rel) = (0f64, 0f64);
+            for o in 0..out_f {
+                let wr = &w[w_off + o * in_f..][..in_f];
+                let (mut exact, mut abs) = (0f64, 0f64);
+                for (xv, wv) in xr.iter().zip(wr) {
+                    let t = *xv as f64 * *wv as f64;
+                    exact += t;
+                    abs += t.abs();
+                }
+                let mut bound = 0f64;
+                for b in 0..nblk {
+                    let (d, sx) = act[r * nblk + b];
+                    let (scaled, min) = wts[o * nblk + b];
+                    let e = 0.5 * d * slop + 127.0 * (d * p11).max(sub);
+                    let s_err = 16.0 * d * slop + ((sx.abs() + 16.0 * d) * p11).max(sub);
+                    bound += scaled * e + min.abs() * s_err;
+                }
+                // f32 accumulation over the row, on whichever side: far below the terms above.
+                let noise = 1e-5 * abs;
+                let g = got[r * out_f + o] as f64;
+                let err = (g - exact).abs();
+                assert!(
+                    err <= bound + noise,
+                    "{dt:?}: row {r} col {o}: got {g} want {exact}, error {err:e} over the int8 \
+                     bound {bound:e}"
+                );
+                worst_bound = worst_bound.max(err / (bound + noise));
+                worst_rel = worst_rel.max(err / abs);
+            }
+            (worst_bound, worst_rel)
+        })
+        .collect();
+    let worst_bound = rows.iter().fold(0f64, |a, r| a.max(r.0));
+    let worst_rel = rows.iter().fold(0f64, |a, r| a.max(r.1));
+    println!(
+        "K-quant Linear {dt:?} m={m} {in_f}x{out_f} on vulkan: worst error / bound = \
+         {worst_bound:.3}, worst error / Σ|x·w| = {worst_rel:e}"
+    );
+}
+
+/// The medium tile: a token count off every tile, a weight 64 rows into its tensor, a grid well
+/// under twice any GPU's compute units.
+const KQ_MEDIUM: (usize, usize, usize, usize) = (200, 1024, 512, 64 * 1024);
+/// The large tile: a grid of 384 large tiles, past twice the compute units of any GPU up to 192.
+const KQ_LARGE: (usize, usize, usize, usize) = (512, 512, 12288, 0);
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q4k_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q4K, KQ_MEDIUM, KqTile::Medium);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q4k_large_tile_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q4K, KQ_LARGE, KqTile::Large);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q5k_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q5K, KQ_MEDIUM, KqTile::Medium);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q5k_large_tile_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q5K, KQ_LARGE, KqTile::Large);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q6k_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q6K, KQ_MEDIUM, KqTile::Medium);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_linear_q6k_large_tile_within_int8_bound() {
+    kquant_linear_within_int8_bound(DType::Q6K, KQ_LARGE, KqTile::Large);
+}
+
+// ---- The quantized-activation memo (`lower_op`'s `mmv_memo`).
+//
+// Consecutive Linears reading the same activations reuse one `quant_q8` of them. Each case runs a
+// graph whose Linears could reuse a stale copy if the memo were wrong, and compares every output
+// bitwise with the same Linear run alone in its own graph (which quantizes for itself).
+
+/// `src` copied into the internal `dst` (`rows` x `n`), the way a layer's norm fills the scratch
+/// the next projections read.
+fn kq_copy(g: &mut Graph, src: TensorId, dst: TensorId, rows: usize, n: usize) {
+    g.push(Op::CopyStrided {
+        src,
+        src_off: 0,
+        src_stride: n as u32,
+        dst,
+        dst_off: 0,
+        dst_stride: n as u32,
+        rows: rows as u32,
+        n: n as u32,
+    });
+}
+
+fn kq_lin(
+    g: &mut Graph,
+    x: TensorId,
+    w: TensorId,
+    dst: TensorId,
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+) {
+    g.push(Op::Linear {
+        x,
+        weight: w,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    });
+}
+
+/// Three Linears on one input quantize it once and match three Linears that each quantize; a
+/// Linear after the input was rewritten quantizes again; a Linear after a multi-row GEMV on the
+/// same input (whose memo names the GEMV's own scratch) does not trust it.
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn kquant_quant_memo_matches_per_projection_quantization() {
+    let Some(vk) = gpu() else {
+        eprintln!("kquant_quant_memo: no Vulkan device — skipped");
+        return;
+    };
+    if !vk.int8_coopmat_prefill() {
+        eprintln!("kquant_quant_memo: no int8 coopmat GEMM on this device — skipped");
+        return;
+    }
+    let dt = DType::Q4K;
+    let (epb, bpb) = infr_gguf::block_layout(dt);
+    let wdesc = |n: usize| TensorDesc::new(vec![n / bpb * epb], dt);
+    let alone = |bank: &[u8], x: &[f32], m: usize, in_f: usize, out_f: usize| {
+        kq_linear_run(&vk, dt, bank, x, (m, in_f, out_f, 0))
+    };
+    let same = |a: &[f32], b: &[f32]| a.iter().zip(b).all(|(p, q)| p.to_bits() == q.to_bits());
+
+    // Shared input: q, k and v from one copy.
+    let (m, in_f) = (200usize, 1024usize);
+    let outs = [1024usize, 256, 256];
+    let banks: Vec<Vec<u8>> = outs
+        .iter()
+        .enumerate()
+        .map(|(i, o)| kq_bank(dt, o * in_f, 0x7a11 + i as u64))
+        .collect();
+    let x0 = kq_activations(m, in_f);
+    let x1: Vec<f32> = x0.iter().map(|v| -0.5 * v + 0.1).collect();
+    {
+        let mut g = Graph::new();
+        let src = g.input(f32d(m * in_f));
+        let x = g.internal(f32d(m * in_f));
+        kq_copy(&mut g, src, x, m, in_f);
+        let ws: Vec<TensorId> = banks.iter().map(|b| g.weight(wdesc(b.len()))).collect();
+        let ds: Vec<TensorId> = outs.iter().map(|o| g.output(f32d(m * o))).collect();
+        for i in 0..3 {
+            kq_lin(&mut g, x, ws[i], ds[i], m, in_f, outs[i]);
+        }
+        let before = vk.i8cm_kq_counts();
+        let got = run_bytes(
+            &vk,
+            &g,
+            &[(src, &x0)],
+            &ws.iter()
+                .zip(&banks)
+                .map(|(w, b)| (*w, b.as_slice()))
+                .collect::<Vec<_>>(),
+            &ds.iter()
+                .zip(&outs)
+                .map(|(d, o)| (*d, m * o))
+                .collect::<Vec<_>>(),
+        );
+        let quants = vk.i8cm_kq_counts().quant_passes - before.quant_passes;
+        assert_eq!(quants, 1, "q, k and v on one input should quantize it once");
+        for i in 0..3 {
+            assert!(
+                same(&got[i], &alone(&banks[i], &x0, m, in_f, outs[i])),
+                "projection {i} on the shared quantization differs from quantizing alone"
+            );
+        }
+    }
+
+    // The input rewritten between two Linears: the second must quantize the new contents.
+    {
+        let mut g = Graph::new();
+        let s0 = g.input(f32d(m * in_f));
+        let s1 = g.input(f32d(m * in_f));
+        let x = g.internal(f32d(m * in_f));
+        let wq = g.weight(wdesc(banks[0].len()));
+        let wk = g.weight(wdesc(banks[1].len()));
+        let dq = g.output(f32d(m * outs[0]));
+        let dk = g.output(f32d(m * outs[1]));
+        kq_copy(&mut g, s0, x, m, in_f);
+        kq_lin(&mut g, x, wq, dq, m, in_f, outs[0]);
+        kq_copy(&mut g, s1, x, m, in_f);
+        kq_lin(&mut g, x, wk, dk, m, in_f, outs[1]);
+        let got = run_bytes(
+            &vk,
+            &g,
+            &[(s0, &x0), (s1, &x1)],
+            &[(wq, &banks[0]), (wk, &banks[1])],
+            &[(dq, m * outs[0]), (dk, m * outs[1])],
+        );
+        assert!(
+            same(&got[1], &alone(&banks[1], &x1, m, in_f, outs[1])),
+            "a Linear after its input was rewritten reused the stale quantization"
+        );
+    }
+
+    // A multi-row GEMV (8 rows, an 8M-element weight) and then a GEMM (a width past the GEMV
+    // band) on the same input: the GEMV's memo names its own scratch, which the GEMM must not
+    // read as its own.
+    {
+        let (m, in_f, o_a, o_b) = (8usize, 4096usize, 2048usize, 12288usize);
+        let ba = kq_bank(dt, o_a * in_f, 0xa1);
+        let bb = kq_bank(dt, o_b * in_f, 0xb2);
+        let xs = kq_activations(m, in_f);
+        let mut g = Graph::new();
+        let src = g.input(f32d(m * in_f));
+        let x = g.internal(f32d(m * in_f));
+        let wa = g.weight(wdesc(ba.len()));
+        let wb = g.weight(wdesc(bb.len()));
+        let da = g.output(f32d(m * o_a));
+        let db = g.output(f32d(m * o_b));
+        kq_copy(&mut g, src, x, m, in_f);
+        kq_lin(&mut g, x, wa, da, m, in_f, o_a);
+        kq_lin(&mut g, x, wb, db, m, in_f, o_b);
+        let before = vk.i8cm_kq_counts();
+        let got = run_bytes(
+            &vk,
+            &g,
+            &[(src, &xs)],
+            &[(wa, &ba), (wb, &bb)],
+            &[(da, m * o_a), (db, m * o_b)],
+        );
+        let after = vk.i8cm_kq_counts();
+        assert_eq!(
+            after.medium_tile + after.large_tile - before.medium_tile - before.large_tile,
+            1,
+            "only the wide Linear should take the int8 coopmat GEMM"
+        );
+        assert!(
+            same(&got[1], &alone(&bb, &xs, m, in_f, o_b)),
+            "the GEMM read the multi-row GEMV's quantization as its own"
         );
     }
 }

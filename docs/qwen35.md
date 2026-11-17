@@ -4,16 +4,16 @@ Both `unsloth/Qwen3.5-*` and `unsloth/Qwen3.6-*` GGUFs declare
 `general.architecture = qwen35`: a hybrid of **gated DeltaNet linear-attention**
 layers and **gated full-attention** layers, with SwiGLU (dense for ≤1B; MoE for
 larger) and sectioned RoPE. Our engine is a pure transformer, so this is a
-net-new architecture family. (Qwen3.6 has no ≤1B variant; smallest is 27B. Start
-with `unsloth/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q4_K_M.gguf` — already pulled.)
+net-new architecture family. (Qwen3.6 has no ≤1B variant; smallest is 27B. The
+development model is `unsloth/Qwen3.5-0.8B-GGUF:Qwen3.5-0.8B-Q4_K_M.gguf`.)
 
 > **Not Qwen3-Next.** llama.cpp's `qwen3next` is a _sibling_ arch in the same
 > DeltaNet family, but its V heads broadcast differently — Qwen3-Next in blocks
 > (`[k0_v0, k0_v1, k1_v2, k1_v3]`), Qwen3.5 interleaved
 > (`[k0_v0, k1_v1, k0_v2, k1_v3]`, the `h % n_khead` tiling infr implements). A
 > `qwen3next` GGUF through this code would be silently wrong; the arch gate
-> rejects it on purpose. `qwen35moe` is likewise its own arch, unsupported until
-> the expert FFN lands.
+> rejects it on purpose. `qwen35moe` is its own arch string: the same skeleton
+> with routed experts and a shared expert, supported on the same path.
 
 ## 0.8B config (metadata)
 
@@ -86,61 +86,20 @@ attn_output.
   head_v_dim=128] f32.
 - KV cache: only for the 6 attention layers (head_dim 256).
 
-## Status
+## How it runs
 
-- **UNIFIED (phases 1–4 of the seam merge, done): qwen35 runs on the SHARED
-  transformer runner** (`seam::generate_dense_backend`) via `MixerW::DeltaNet` —
-  same run/serve/bench paths, SlotPool multi-slot serve, and every shared-path
-  optimization (mrow GEMV, small-m attention tiers). FASTER than the old bespoke
-  seam it replaced: pp512 12.2k→14.7k t/s, tg64@d4096 228→243 on the 0.8B.
-  DeltaNet layers keep conv/S state in the session's per-layer buffers (fixed
-  f32, no KV); the session reuses state only on EXACT prompt extension
-  (recurrent state can't rewind — anything else zero-resets and re-prefills).
-  Record-once decode replay is gated off for qwen35 (the tape isn't audited for
-  recurrent-state bindings; static per-token decode matches the unified CPU
-  oracle).
-- Phase 4 (issue #30): the old hand-written qwen35-only seam that used to live
-  in `qwen35.rs` (proven token-identical to the unified path during the cutover,
-  then reachable only via a temporary escape hatch for one release) has been
-  DELETED — the unified path is the only one now. `qwen35.rs` today holds just
-  the raw metadata parse (`Cfg`), arch detection (`is_qwen35`), and the
-  chat-template renderer.
-- **CPU reference: DONE & correct** (`Config::from_gguf`'s qwen35 fields +
-  `MixerW::DeltaNet` in `crates/infr-llama/src/seam/`). The one real bug was the
-  attention q/gate split: `attn_q` packs query+gate INTERLEAVED PER HEAD
-  `[h0 q | h0 gate | h1 q | h1 gate | …]`, not two contiguous blocks.
-
-## GPU situation (corrected)
-
-ggml's **Vulkan** backend does NOT implement the SSM ops (gated*delta_net,
-ssm_conv), but ggml's scheduler **falls back to CPU per-unsupported-op**, so
-`llama-cli -ngl 99 -dev Vulkan0` RUNS qwen35 as a CPU+GPU **hybrid** (not an
-error). (ggml's CUDA backend \_does* implement them → full GPU on NVIDIA.)
-Benchmark (Qwen3.5-0.8B-Q4, 7900 XTX, llama.cpp):
-
-| test  | pure CPU `-ngl 0` | Vulkan hybrid `-ngl 99` | speedup |
-| ----- | ----------------- | ----------------------- | ------- |
-| pp512 | 4208 t/s          | 18054 t/s               | 4.3×    |
-| tg64  | 33.5 t/s          | 387 t/s                 | 11.5×   |
-
-The SSM recurrence on CPU is NOT the bottleneck once matmuls are on GPU.
-
-## Build plan (revised)
-
-1. ✅ CPU reference forward (correct vs llama.cpp / HF) — locks all math above.
-2. ✅ GGUF loader (arch=qwen35, both layer types, dequant) + `infr run`
-   dispatch.
-3. **Hybrid GPU path (recommended next):** SSM recurrence + causal conv on CPU;
-   run all matmuls/FFN/ gated-attention through our Vulkan backend (head_dim=256
-   attention needs the non-flash path or a hd-generalized kernel). Per the
-   benchmark this captures ~most of the GPU win with NO SSM Vulkan kernels.
-   Needs: keep weights on GPU (quantized), CPU↔GPU handoff per linear layer for
-   the SSM step.
-4. (Optional, large) Full-GPU SSM Vulkan kernels: gated-delta scan + ssm_conv +
-   silu-gated rmsnorm, to remove the CPU handoff. Bigger effort; only worth it
-   if the hybrid handoff dominates.
-5. CPU-reference speedups regardless: rayon-parallel `matvec`, then quantized
-   matvec.
+- **On the shared transformer runner** (`seam::generate_dense_backend`) via
+  `MixerW::DeltaNet`, on CPU, Vulkan and Metal — the same run / serve / bench
+  paths, multi-slot serve, and shared-path optimizations as every other arch.
+  `qwen35.rs` holds only the raw metadata parse (`Cfg`), arch detection
+  (`is_qwen35`) and the chat-template renderer.
+- **The no-rewind rule.** DeltaNet layers keep conv/S state in the session's
+  per-layer buffers (fixed f32, no KV). The session reuses that state only on an
+  EXACT prompt extension: recurrent state cannot rewind, so anything else
+  zero-resets and re-prefills.
+- **The interleaved q+gate trap.** `attn_q` packs query and gate INTERLEAVED PER
+  HEAD — `[h0 q | h0 gate | h1 q | h1 gate | …]` — not as two contiguous blocks.
+  Splitting it as two blocks was the one real bug of the CPU reference bring-up.
 
 ## References (read for math, reimplement — both MIT)
 

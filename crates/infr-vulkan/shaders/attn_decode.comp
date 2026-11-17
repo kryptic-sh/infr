@@ -1,5 +1,5 @@
 #version 460
-// Fixed-head f16 split-K pass 1; MULTI_ROWS adds static query-row addressing.
+// DECODE-ONLY specialization of `attn_partial.comp`'s split-K pass 1 (docs/backlog.md B7, slices 3a/3b).
 //
 // WHY THIS FILE EXISTS: `attn_partial.comp` is one shader serving eight jobs — decode and prefill,
 // hd 128/256/512, full-causal and sliding-window, ring and full-context caches, canvas denoise, f16
@@ -36,7 +36,7 @@
 //
 // SPECIALIZED HARD in every build (the host gate in `Recorder::attention_kv_split_impl` /
 // `attention_kv_split_dynac_impl` falls back to `attn_partial` for anything else):
-//   rows == 1 unless MULTI_ROWS · f16 K/V by device address (KV_BDA) · no canvas ·
+//   rows == 1 (decode) · f16 K and V read by device address (KV_BDA, always on here) · no canvas ·
 //   no planar-Q8 · no mainline-inline quant KV · chunk <= 512 (the `sc[]` score slab) ·
 //   hd exactly 4*DHD4.
 //
@@ -57,13 +57,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #if DHD4 != 32 && DHD4 != 64 && DHD4 != 128
 #error "DHD4 must be 32 (hd=128), 64 (hd=256) or 128 (hd=512)"
 #endif
-#if defined(MULTI_ROWS) && defined(USE_PARAMS)
-#error "MULTI_ROWS requires static positions"
-#endif
 
-// `attn_partial.comp`'s `-DKV_BDA` push block (15 words = 60 B) plus three paging words (18 words =
-// 72 B, see the page table below) so the recorder's packing is reused verbatim and the two kernels
-// stay interchangeable at the dispatch site.
+// EXACTLY `attn_partial.comp`'s `-DKV_BDA` push block (15 words = 60 B) so the recorder's existing
+// packing is reused verbatim and the two kernels are interchangeable at the dispatch site.
 // `rows` is the specialization's zero; `pos` is dead under USE_PARAMS, `window` outside -DSWA and
 // `cap` outside -DRING. The block is declared unconditionally: vkCreateComputePipelines validates
 // the range against the declared Block SIZE, not per-member static use
@@ -73,24 +69,17 @@ layout(push_constant) uniform PC {
     uint cap;
     uint pos; uint rows;
     uint k_lo; uint k_hi; uint v_lo; uint v_hi;
-    // Paged K/V: `page_rows` == 0 means the cache is contiguous (the identity mapping). Otherwise
-    // `(page_lo, page_hi)` addresses a table of u32 physical page ids, indexed by logical page.
-    uint page_lo; uint page_hi; uint page_rows;
 } pc;
 #include "kv_addr.glsl"
 
-layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [rows, nh, hd] as vec4
+layout(binding = 0) readonly buffer QB { f16vec4 q4[]; };    // [1, nh, hd] as vec4
 layout(binding = 1) readonly buffer KB { uint ku_inert[]; }; // INERT (hazard edge only, never read)
 layout(binding = 2) readonly buffer VB { uint vu_inert[]; }; // INERT
 #ifdef USE_PARAMS
 // Record-once decode replay: kv_len comes from the host-updated params SSBO so the command buffer
 // replays across tokens. Outputs shift to 4/5/6 (params takes 3) to stay output-last — the same
-// binding shuffle `attn_partial.comp` does under -DUSE_PARAMS. Words 2-3 are the paged K/V table's
-// device address (0 = linear cache): the tape is recorded ONCE, so a per-token page table cannot
-// ride the push constant — but the table BUFFER is per slot and never reallocated, so its address
-// written at record time stays right for the replay's whole life. `params_advance` only touches
-// words 0-1, leaving these alone.
-layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; uint p_pagelo; uint p_pagehi; };
+// binding shuffle `attn_partial.comp` does under -DUSE_PARAMS.
+layout(binding = 3) readonly buffer PB { uint p_pos; uint p_kvlen; };
 layout(binding = 4) buffer PM { float pm[]; };
 layout(binding = 5) buffer PL { float pl[]; };
 layout(binding = 6) buffer PACC { float pacc[]; };
@@ -123,11 +112,6 @@ vec4 vread4(uint i4) {
 
 void main() {
     uint t = gl_LocalInvocationIndex;
-#ifdef MULTI_ROWS
-    uint row = gl_WorkGroupID.y;
-#else
-    const uint row = 0u;
-#endif
     // Wave-uniform K/V cache base pointers, set ONCE (kv_addr.glsl) → saddr scalar-base loads.
     k_addr = kv_base(pc.k_lo, pc.k_hi);
     v_addr = kv_base(pc.v_lo, pc.v_hi);
@@ -140,7 +124,7 @@ void main() {
 #ifdef SELF_CHUNK
     // Record-once replay with a growing kv_len: chunk/n_chunks are baked at record, so derive the
     // SAME adaptive policy the `attn_live` prologue and `attn_partial`'s SELF_CHUNK arm use (~32
-    // chunks/head, floored by the baked minimum pc.chunk, capped at 512) from the LIVE kv_len. The
+    // chunks/head, 64..512, floored by the baked minimum pc.chunk) from the LIVE kv_len. The
     // prologue dispatches EXACTLY nh·live workgroups (indirect), so the workgroup → (head, chunk)
     // decomposition must use the live count, NOT pc.n_chunks (only the pm/pl/pacc scratch stride).
     uint kv_len = p_kvlen;
@@ -153,7 +137,7 @@ void main() {
     uint lo = 0u;
 #endif
     uint span = kv_len - lo;
-    uint chunkv = min(max(span / 32u, pc.chunk), 512u);
+    uint chunkv = max(pc.chunk, min(max(span / 32u, 64u), 512u));
     uint live = (span + chunkv - 1u) / chunkv;
     uint hh = gl_WorkGroupID.x % g;
     uint rest = gl_WorkGroupID.x / g;
@@ -163,30 +147,23 @@ void main() {
     uint j0 = lo + c * chunkv;
     uint j1 = min(j0 + chunkv, kv_len);
 #else
-    // Static rows share a chunk grid but keep separate causal ends and window floors.
+    // Static path: rows == 1, so the single query row is at absolute position `pos` and its causal
+    // end is pos+1. No canvas → `attn_partial`'s chunk-grid `base` and its mask floor `lo` are the
+    // SAME expression at rows == 1 (both `pos+1-window`, or both 0 without a window), so one `lo`
+    // serves for both and `max(base + c*chunk, lo)` folds to `lo + c*chunk`.
     uint hh = gl_WorkGroupID.x % g;
     uint rest = gl_WorkGroupID.x / g;
     uint c = rest % pc.n_chunks;
     uint kvh = rest / pc.n_chunks;
     uint h = kvh * g + hh;
-    uint qpos1 = pc.pos + row + 1u;
+    uint qpos1 = pc.pos + 1u;
 #ifdef SWA
     uint lo = (pc.window > 0u && qpos1 > pc.window) ? qpos1 - pc.window : 0u;
 #else
     uint lo = 0u;
 #endif
-#ifdef MULTI_ROWS
-#ifdef SWA
-    uint base = (pc.window > 0u && pc.pos + 1u > pc.window) ? pc.pos + 1u - pc.window : 0u;
-#else
-    const uint base = 0u;
-#endif
-    uint j0 = max(base + c * pc.chunk, lo);
-    uint j1 = min(base + c * pc.chunk + pc.chunk, qpos1);
-#else
     uint j0 = lo + c * pc.chunk;
     uint j1 = min(j0 + pc.chunk, qpos1);
-#endif
 #endif
 
 #ifdef RING
@@ -198,26 +175,7 @@ void main() {
     uint rcap = (pc.cap > 0u) ? pc.cap / (pc.nkv * hd) : 0u;
 #define RROW(j) ((rcap > 0u) ? ((j) % rcap) : (j))
 #else
-    // Paged K/V (opt-in, contiguous caches leave `page_rows` at 0). The table maps a logical page of
-    // `page_rows` keys to a physical page id; a chunk is at most 512 keys, so it spans at most two
-    // pages and two wave-uniform table reads cover it: `off` turns a logical row into its physical
-    // one with one compare and one add per key. The table carries one entry per page PLUS a repeat of
-    // the last page, because the tail chunk looks one page ahead.
-    uint pg0 = 0u, pg1 = 0u, pgcut = 0xFFFFFFFFu;
-    if (pc.page_rows > 0u) {
-#ifdef USE_PARAMS
-        uint64_t pt = kv_base(p_pagelo, p_pagehi);
-#else
-        uint64_t pt = kv_base(pc.page_lo, pc.page_hi);
-#endif
-        uint p0 = j0 / pc.page_rows;
-        uint t0 = kv_word(pt, p0);
-        uint t1 = kv_word(pt, p0 + 1u);
-        pg0 = (t0 - p0) * pc.page_rows;
-        pg1 = (t1 - (p0 + 1u)) * pc.page_rows;
-        pgcut = (p0 + 1u) * pc.page_rows;
-    }
-#define RROW(j) ((j) < pgcut ? ((j) + pg0) : ((j) + pg1))
+#define RROW(j) (j)
 #endif
 
     // ── QK via subgroup reduction ────────────────────────────────────────────────────────────────
@@ -227,16 +185,15 @@ void main() {
     uint sg = gl_SubgroupID;             // 0..1
     uint lane = gl_SubgroupInvocationID;  // 0..31
     uint nsg = gl_NumSubgroups;           // 2 (local_size 64, requiredSubgroupSize 32)
-    uint qhead = row * pc.nh + h;
 #if DHD4 == 32
     // hd4 == 32 means ONE loop-invariant q vec4 per lane, held in a register.
-    vec4 qreg = vec4(q4[qhead * 32u + lane]);
+    vec4 qreg = vec4(q4[h * 32u + lane]);
 #else
     // hd4 == 64/128: DHD4/32 loop-invariant q vec4s per lane. The trip count is a compile-time
     // constant, so `qreg[]` stays in registers (attn_partial's dynamic `qreg[nq++]` index is what
     // forced a scratch spill re-read on every key for these shapes).
     vec4 qreg[DHD4 / 32];
-    uint qbase = qhead * uint(DHD4);
+    uint qbase = h * uint(DHD4);
     for (uint i = 0u; i < uint(DHD4 / 32); i++) {
         qreg[i] = vec4(q4[qbase + lane + 32u * i]);
     }
@@ -362,7 +319,7 @@ void main() {
     float l = red[0];
 
     // ── P·V ──────────────────────────────────────────────────────────────────────────────────────
-    uint pbase = (qhead * pc.n_chunks + c) * uint(DHD4 * 4);
+    uint pbase = (h * pc.n_chunks + c) * uint(DHD4 * 4);
 #if DHD4 == 32
     // Each lane owns dim-vec4 `lane` and the TWO subgroups split the key range (one wide coalesced
     // load per key, 2-key software pipeline); the partials meet through `vsh`.
@@ -430,7 +387,7 @@ void main() {
     pacc[pbase + 4u * (t + 64u) + 3u] = acc1.w;
 #endif
     if (t == 0u) {
-        pm[qhead * pc.n_chunks + c] = m;
-        pl[qhead * pc.n_chunks + c] = l;
+        pm[h * pc.n_chunks + c] = m;
+        pl[h * pc.n_chunks + c] = l;
     }
 }

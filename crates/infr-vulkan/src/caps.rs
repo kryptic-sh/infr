@@ -127,10 +127,9 @@ pub(crate) enum DeviceArch {
     /// Not identified — every vendor this has no probe for, and any device whose probe extensions
     /// are missing. The neutral bucket: no rule may treat it as evidence of anything.
     Other,
-    /// Wave64-only AMD (GCN/CDNA). infr REFUSES such a device earlier than this — the whole kernel
-    /// set pins subgroup 32 — so it cannot reach a dispatch; it is classified anyway because the
-    /// AMD coopmat trust rule is stated over architectures and a wave64 part misfiled as `Other`
-    /// would read as "unknown" instead of "known-unsupported".
+    /// Wave64-only AMD (GCN/CDNA). Runs on the wave64 path ([`SubgroupMode::Wave64`], decided from
+    /// the subgroup range, not from this bucket), which has no cooperative matrix; classified for
+    /// the AMD coopmat trust rule, which is stated over architectures.
     AmdGcn,
     AmdRdna1,
     AmdRdna2,
@@ -227,7 +226,8 @@ pub(crate) fn device_architecture(p: &DeviceProbe) -> DeviceArch {
 /// counts the physical array.
 ///
 /// UNVALIDATED per vendor: only the AMD steps run on hardware here (an RX 7900 XTX and a Raphael
-/// iGPU, both RADV, both advertising v1 and v2). The NVIDIA and Intel steps have never executed —
+/// iGPU, both advertising v1 and v2; observed under the AMD Windows driver, and the 7900 XTX
+/// under RADV per the 2026-08-11 audit — no record says which driver the iGPU was read on there). The NVIDIA and Intel steps have never executed —
 /// there is no such part on this machine — and their correctness rests on the transcription and the
 /// tests below, nothing more.
 pub(crate) fn shader_core_count(p: &DeviceProbe) -> u32 {
@@ -621,6 +621,80 @@ pub(crate) fn check_i8_coopmat_layout(out: &[i32]) -> Result<(), String> {
 
 // ── device limits ────────────────────────────────────────────────────────────────────────────────
 
+/// The device limits every kernel is checked against before its pipeline is built
+/// (`ops::try_make_compute_kernel`). Vulkan guarantees only a floor for each, so the number the
+/// device reports is the one that decides.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KernelLimits {
+    /// `maxPushConstantsSize`.
+    pub(crate) push_constants: u32,
+    /// `maxComputeWorkGroupInvocations`.
+    pub(crate) workgroup_invocations: u32,
+    /// `maxComputeWorkGroupSize`.
+    pub(crate) workgroup_size: [u32; 3],
+}
+
+impl KernelLimits {
+    pub(crate) fn of(limits: &ash::vk::PhysicalDeviceLimits) -> Self {
+        Self {
+            push_constants: limits.max_push_constants_size,
+            workgroup_invocations: limits.max_compute_work_group_invocations,
+            workgroup_size: limits.max_compute_work_group_size,
+        }
+    }
+
+    /// Whether a kernel built from `spv` passes [`check_kernel_workgroup`] on this device. A caller
+    /// choosing between a wide kernel and a narrower drop-in asks THIS, so the choice and the
+    /// pipeline-build refusal cannot disagree.
+    pub(crate) fn admits(&self, spv: &[u32]) -> bool {
+        check_kernel_workgroup("", spv, self).is_ok()
+    }
+}
+
+/// [`check_workgroup_size`] over the workgroup `spv` declares. A module with no literal `LocalSize`
+/// passes (no shader here lacks one — `spirv::tests` asserts it — so this skips nothing real).
+pub(crate) fn check_kernel_workgroup(
+    name: &str,
+    spv: &[u32],
+    limits: &KernelLimits,
+) -> Result<(), String> {
+    match crate::spirv::local_size(spv) {
+        Some(local) => check_workgroup_size(name, local, limits),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a kernel whose workgroup (its SPIR-V `LocalSize`) exceeds this device's
+/// `maxComputeWorkGroupSize` in any dimension or `maxComputeWorkGroupInvocations` in total. The
+/// sizes are baked into the SPIR-V at build time, so a device below them cannot run that kernel at
+/// all; this names the kernel and the limit instead of building a pipeline the spec forbids.
+pub(crate) fn check_workgroup_size(
+    name: &str,
+    local: [u32; 3],
+    limits: &KernelLimits,
+) -> Result<(), String> {
+    for (axis, (have, max)) in ["x", "y", "z"]
+        .iter()
+        .zip(local.iter().zip(limits.workgroup_size))
+    {
+        if *have > max {
+            return Err(format!(
+                "kernel {name:?} has local_size_{axis} = {have}, but this device's \
+                 maxComputeWorkGroupSize[{axis}] is {max}"
+            ));
+        }
+    }
+    let total: u64 = local.iter().map(|&d| u64::from(d)).product();
+    if total > u64::from(limits.workgroup_invocations) {
+        return Err(format!(
+            "kernel {name:?} has {total} invocations per workgroup, but this device's \
+             maxComputeWorkGroupInvocations is {}",
+            limits.workgroup_invocations
+        ));
+    }
+    Ok(())
+}
+
 /// Refuse a kernel whose push-constant block does not fit this device's `maxPushConstantsSize`.
 ///
 /// Vulkan only guarantees 128 bytes and nothing here queried the real number before, so every
@@ -637,6 +711,111 @@ pub(crate) fn check_push_constant_size(
             "kernel {name:?} pushes {push_size} bytes of push constants, but this device's \
              maxPushConstantsSize is {limit}"
         ));
+    }
+    Ok(())
+}
+
+// ── subgroup width ───────────────────────────────────────────────────────────────────────────────
+
+/// What a device reports about its subgroups, as [`subgroup_mode`] needs it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SubgroupProbe {
+    /// `subgroupSizeControl` is enabled: a pipeline can pin `requiredSubgroupSize`.
+    pub size_control: bool,
+    /// `minSubgroupSize` (0 without size control).
+    pub min: u32,
+    /// `maxSubgroupSize` (0 without size control).
+    pub max: u32,
+    /// `VkPhysicalDeviceSubgroupProperties::supportedOperations`.
+    pub operations: vk::SubgroupFeatureFlags,
+    /// `VkPhysicalDeviceSubgroupProperties::supportedStages`.
+    pub stages: vk::ShaderStageFlags,
+}
+
+/// How the kernels' 32-lane subgroup arithmetic is met on a device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SubgroupMode {
+    /// Kernels that ask for a pinned width get it (32, or 16 for the Intel builds), and
+    /// `shaders/wave64.glsl`'s `W64` stays false.
+    Native,
+    /// Every pipeline pins 64 and sets `W64`, so `wave64.glsl` gives each kernel 32-lane virtual
+    /// subgroups (see the header's own notes). `forced` = the device could pin 32, and `kernels.vulkan.force_wave64` (a
+    /// testing knob) asked for this path anyway.
+    Wave64 { forced: bool },
+}
+
+/// Subgroup operations every kernel module needs: `wave64.glsl` is included by every kernel that
+/// uses subgroups, and declares its clustered operations whether or not `W64` is live.
+pub(crate) const REQUIRED_SUBGROUP_OPS: vk::SubgroupFeatureFlags =
+    vk::SubgroupFeatureFlags::from_raw(
+        vk::SubgroupFeatureFlags::BASIC.as_raw()
+            | vk::SubgroupFeatureFlags::ARITHMETIC.as_raw()
+            | vk::SubgroupFeatureFlags::CLUSTERED.as_raw(),
+    );
+
+/// Decide the [`SubgroupMode`], or refuse the device with the reason.
+///
+/// A device that can pin 32 runs natively; one that can pin only 64 (AMD GCN: Polaris, Vega) runs
+/// the wave64 emulation; anything else (no size control, or a range holding neither) is refused,
+/// as is a device whose compute stage lacks [`REQUIRED_SUBGROUP_OPS`]. `force_wave64` takes the
+/// wave64 path on a device that can pin both widths, and is an error on one that cannot pin 64.
+pub(crate) fn subgroup_mode(p: &SubgroupProbe, force_wave64: bool) -> Result<SubgroupMode, String> {
+    let can_pin = |w: u32| p.size_control && p.min <= w && w <= p.max;
+    let mode = if can_pin(64) && (force_wave64 || !can_pin(32)) {
+        SubgroupMode::Wave64 {
+            forced: can_pin(32),
+        }
+    } else if force_wave64 {
+        return Err(format!(
+            "kernels.vulkan.force_wave64 is set, but this device cannot pin a subgroup size of 64 \
+             (range [{}, {}], subgroup_size_control={})",
+            p.min, p.max, p.size_control
+        ));
+    } else if can_pin(32) {
+        SubgroupMode::Native
+    } else {
+        return Err(format!(
+            "infr's Vulkan backend requires a pinnable subgroup size of 32 or 64; this device's \
+             subgroup range is [{}, {}] and subgroup_size_control={}",
+            p.min, p.max, p.size_control
+        ));
+    };
+    if !p.stages.contains(vk::ShaderStageFlags::COMPUTE)
+        || !p.operations.contains(REQUIRED_SUBGROUP_OPS)
+    {
+        return Err(format!(
+            "infr's Vulkan backend requires the basic, arithmetic and clustered subgroup \
+             operations in compute shaders; this device reports operations {:?} in stages {:?}",
+            p.operations, p.stages
+        ));
+    }
+    Ok(mode)
+}
+
+/// Invocations in `wave64_probe.comp`'s one workgroup (its `local_size_x`).
+pub(crate) const WAVE64_PROBE_INVOCATIONS: usize = 32;
+
+/// Judge `wave64_probe.comp`'s readback: three words per invocation — the number of subgroups, the
+/// lanes in its subgroup, its inclusive-scan rank — which must read `(1, 32, index + 1)` for the
+/// wave64 path's assumptions to hold on this driver: a workgroup of at most 32 invocations is one
+/// subgroup (so `wave64.glsl` may use the plain subgroup operations for it, wherever its lanes sit
+/// in the wave), and the scan runs in invocation order (which `deltanet_gates.comp` reads).
+pub(crate) fn check_wave64_layout(out: &[u32]) -> Result<(), String> {
+    if out.len() != WAVE64_PROBE_INVOCATIONS * 3 {
+        return Err(format!(
+            "the wave64 probe returned {} words, expected {}",
+            out.len(),
+            WAVE64_PROBE_INVOCATIONS * 3
+        ));
+    }
+    for (i, w) in out.as_chunks::<3>().0.iter().enumerate() {
+        let want = [1, WAVE64_PROBE_INVOCATIONS as u32, i as u32 + 1];
+        if *w != want {
+            return Err(format!(
+                "a {WAVE64_PROBE_INVOCATIONS}-wide workgroup at subgroup 64: invocation {i} saw \
+                 (subgroups, lanes in its subgroup, scan rank) = {w:?}, expected {want:?}"
+            ));
+        }
     }
     Ok(())
 }
@@ -1263,6 +1442,33 @@ mod tests {
 
     // ── limits ──────────────────────────────────────────────────────────────────────────────────
 
+    /// The Vulkan floors (128 invocations, 128 wide in x and y, 64 in z), against the widest
+    /// workgroup here: a device at the floor must refuse it by name, one with room must not.
+    #[test]
+    fn workgroup_size_is_checked_per_axis_and_in_total() {
+        let floor = KernelLimits {
+            push_constants: 128,
+            workgroup_invocations: 128,
+            workgroup_size: [128, 128, 64],
+        };
+        let desktop = KernelLimits {
+            workgroup_invocations: 1024,
+            workgroup_size: [1024, 1024, 1024],
+            ..floor
+        };
+        assert_eq!(check_workgroup_size("k", [128, 1, 1], &floor), Ok(()));
+        assert_eq!(check_workgroup_size("k", [1024, 1, 1], &desktop), Ok(()));
+        let err = check_workgroup_size("rmsnorm_wide", [1024, 1, 1], &floor).unwrap_err();
+        assert!(
+            err.contains("rmsnorm_wide") && err.contains("maxComputeWorkGroupSize[x]"),
+            "{err}"
+        );
+        let err = check_workgroup_size("k", [64, 4, 1], &floor).unwrap_err();
+        assert!(err.contains("maxComputeWorkGroupInvocations"), "{err}");
+        let err = check_workgroup_size("k", [1, 1, 128], &floor).unwrap_err();
+        assert!(err.contains("maxComputeWorkGroupSize[z]"), "{err}");
+    }
+
     #[test]
     fn push_constant_check_refuses_only_an_oversize_block() {
         // The Vulkan-guaranteed floor, which is what every kernel here was sized against.
@@ -1273,5 +1479,117 @@ mod tests {
             err.contains("native_gemv") && err.contains("132") && err.contains("128"),
             "{err}"
         );
+    }
+
+    fn sg(min: u32, max: u32) -> SubgroupProbe {
+        SubgroupProbe {
+            size_control: true,
+            min,
+            max,
+            // What RADV and AMD's Windows driver report on RDNA3 (vulkaninfo).
+            operations: vk::SubgroupFeatureFlags::BASIC
+                | vk::SubgroupFeatureFlags::VOTE
+                | vk::SubgroupFeatureFlags::ARITHMETIC
+                | vk::SubgroupFeatureFlags::BALLOT
+                | vk::SubgroupFeatureFlags::SHUFFLE
+                | vk::SubgroupFeatureFlags::SHUFFLE_RELATIVE
+                | vk::SubgroupFeatureFlags::CLUSTERED
+                | vk::SubgroupFeatureFlags::QUAD,
+            stages: vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::FRAGMENT,
+        }
+    }
+
+    #[test]
+    fn subgroup_mode_takes_wave64_only_where_32_cannot_be_pinned() {
+        use SubgroupMode::*;
+        // RDNA [32, 64], NVIDIA [32, 32], Intel Arc [8, 32], Xe2 [16, 32]: native.
+        for (lo, hi) in [(32, 64), (32, 32), (8, 32), (16, 32)] {
+            assert_eq!(
+                subgroup_mode(&sg(lo, hi), false),
+                Ok(Native),
+                "[{lo}, {hi}]"
+            );
+        }
+        // GCN (Polaris, Vega): wave64-only.
+        assert_eq!(
+            subgroup_mode(&sg(64, 64), false),
+            Ok(Wave64 { forced: false })
+        );
+        // Neither width, or no size control at all: refused, naming the range.
+        for p in [
+            sg(8, 16),
+            sg(128, 128),
+            SubgroupProbe {
+                size_control: false,
+                min: 0,
+                max: 0,
+                ..sg(0, 0)
+            },
+        ] {
+            let err = subgroup_mode(&p, false).unwrap_err();
+            assert!(err.contains("32 or 64"), "{err}");
+        }
+    }
+
+    #[test]
+    fn force_wave64_needs_a_pinnable_64() {
+        use SubgroupMode::*;
+        assert_eq!(
+            subgroup_mode(&sg(32, 64), true),
+            Ok(Wave64 { forced: true })
+        );
+        // A wave64-only device is not "forced": it would take this path anyway.
+        assert_eq!(
+            subgroup_mode(&sg(64, 64), true),
+            Ok(Wave64 { forced: false })
+        );
+        for (lo, hi) in [(32, 32), (8, 32)] {
+            let err = subgroup_mode(&sg(lo, hi), true).unwrap_err();
+            assert!(err.contains("force_wave64"), "[{lo}, {hi}]: {err}");
+        }
+    }
+
+    #[test]
+    fn subgroup_mode_refuses_a_device_missing_an_operation_or_the_compute_stage() {
+        for missing in [
+            vk::SubgroupFeatureFlags::BASIC,
+            vk::SubgroupFeatureFlags::ARITHMETIC,
+            vk::SubgroupFeatureFlags::CLUSTERED,
+        ] {
+            for (lo, hi) in [(32, 64), (64, 64)] {
+                let mut p = sg(lo, hi);
+                p.operations &= !missing;
+                let err = subgroup_mode(&p, false).unwrap_err();
+                assert!(err.contains("clustered subgroup"), "{missing:?}: {err}");
+            }
+        }
+        let mut p = sg(64, 64);
+        p.stages = vk::ShaderStageFlags::FRAGMENT;
+        assert!(subgroup_mode(&p, false).is_err(), "no subgroups in compute");
+        // Shuffle, ballot, vote and quad are not required: no kernel uses them.
+        let mut p = sg(64, 64);
+        p.operations = REQUIRED_SUBGROUP_OPS;
+        assert_eq!(
+            subgroup_mode(&p, false),
+            Ok(SubgroupMode::Wave64 { forced: false })
+        );
+    }
+
+    #[test]
+    fn wave64_layout_check_accepts_only_one_ordered_subgroup() {
+        let good: Vec<u32> = (0..WAVE64_PROBE_INVOCATIONS as u32)
+            .flat_map(|i| [1, WAVE64_PROBE_INVOCATIONS as u32, i + 1])
+            .collect();
+        assert_eq!(check_wave64_layout(&good), Ok(()));
+        // Split into two subgroups of 16, scanned out of order, or truncated: each refused.
+        let mut split = good.clone();
+        for (i, w) in split.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            *w = [2, 16, (i % 16) as u32 + 1];
+        }
+        let mut reordered = good.clone();
+        reordered.swap(2, 5);
+        for bad in [split, reordered, good[..3].to_vec()] {
+            assert!(check_wave64_layout(&bad).is_err(), "{bad:?}");
+        }
     }
 }

@@ -95,5 +95,6 @@ pub fn parse_reporting(
 
     // The bespoke flags go on LAST, so they win over any `--set` for the same field.
     layer.merge(overrides.flags.clone());
+    super::tune::stamp_layer(&mut layer, super::TuneLevel::Cli);
     Ok((layer, warnings))
 }

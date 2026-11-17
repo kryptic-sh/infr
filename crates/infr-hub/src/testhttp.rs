@@ -80,6 +80,16 @@ struct State {
     unavailable_at: AtomicUsize,
     /// How an honoured range is misdescribed, if at all.
     range_fault: Mutex<RangeFault>,
+    /// HEADs still to be answered with `head_status` before they are served normally again.
+    failing_heads: AtomicUsize,
+    head_status: AtomicUsize,
+    /// HEAD requests received.
+    heads: AtomicUsize,
+    /// Repos that moved: a request under the key's `/<repo>/` is answered `307` to the value's
+    /// `Location` prefix, WITHOUT an `X-Linked-Etag` — what HF sends for a renamed repo.
+    moved: Mutex<HashMap<String, String>>,
+    /// Per file, a `Content-Length` HEAD advertises in place of the real one.
+    head_length: Mutex<HashMap<String, u64>>,
 }
 
 /// A `206` that does not describe the bytes that were asked for — what a broken proxy or mirror
@@ -247,6 +257,45 @@ impl TestHub {
         );
     }
 
+    /// Answer the next `n` HEADs `503 Service Unavailable`, then serve them normally — the
+    /// metadata request failing while the file itself is still there to be fetched.
+    pub(crate) fn fail_heads(&self, n: usize) {
+        self.fail_heads_with(n, 503);
+    }
+
+    /// Answer the next `n` HEADs with `status` (an empty body), then serve them normally.
+    pub(crate) fn fail_heads_with(&self, n: usize, status: u16) {
+        self.state
+            .head_status
+            .store(status as usize, Ordering::SeqCst);
+        self.state.failing_heads.store(n, Ordering::SeqCst);
+    }
+
+    /// Answer every request under `/<from>/` with a `307` to `location` + the rest of the path,
+    /// carrying no LFS headers — a renamed repo. `location` is either a path on this hub
+    /// (`/org/repo`) or a full URL elsewhere.
+    pub(crate) fn move_repo(&self, from: &str, location: &str) {
+        self.state
+            .moved
+            .lock()
+            .unwrap()
+            .insert(format!("/{from}/"), location.to_string());
+    }
+
+    /// Advertise `len` as `name`'s `Content-Length` on HEAD — a broken or hostile server's size.
+    pub(crate) fn lie_about_length(&self, name: &str, len: u64) {
+        self.state
+            .head_length
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), len);
+    }
+
+    /// HEAD requests this hub has received.
+    pub(crate) fn heads_served(&self) -> usize {
+        self.state.heads.load(Ordering::SeqCst)
+    }
+
     /// Misdescribe every honoured range from now on (see [`RangeFault`]).
     pub(crate) fn fault_ranges(&self, fault: RangeFault) {
         *self.state.range_fault.lock().unwrap() = fault;
@@ -333,6 +382,20 @@ fn hex_sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// Decrements `counter` unless it is already zero, and says whether it did. A compare-exchange
+/// loop rather than the std helper, whose name differs between the toolchains CI and a
+/// developer may have.
+fn take_one(counter: &AtomicUsize) -> bool {
+    let mut n = counter.load(Ordering::SeqCst);
+    while n > 0 {
+        match counter.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(seen) => n = seen,
+        }
+    }
+    false
+}
+
 /// One request/response, then close (`Connection: close`) — keep-alive would add nothing here.
 fn serve(state: &State, stream: TcpStream) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone test hub stream"));
@@ -365,6 +428,22 @@ fn serve(state: &State, stream: TcpStream) {
         }
     }
 
+    let moved = state.moved.lock().unwrap().iter().find_map(|(from, to)| {
+        path.strip_prefix(from.as_str())
+            .map(|rest| format!("{to}/{rest}"))
+    });
+    if let Some(location) = moved {
+        if method == "HEAD" {
+            state.heads.fetch_add(1, Ordering::SeqCst);
+        }
+        let _ = write!(
+            &stream,
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: {location}\r\nContent-Length: 0\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
     let file = path
         .rsplit("/resolve/main/")
         .next()
@@ -379,6 +458,19 @@ fn serve(state: &State, stream: TcpStream) {
             _ => None,
         }
     };
+    if method == "HEAD" {
+        state.heads.fetch_add(1, Ordering::SeqCst);
+    }
+    let head_fails = method == "HEAD" && take_one(&state.failing_heads);
+    if head_fails {
+        let _ = write!(
+            &stream,
+            "HTTP/1.1 {} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            state.head_status.load(Ordering::SeqCst)
+        );
+        let _ = stream.shutdown(Shutdown::Both);
+        return;
+    }
     let Some((body, advertised_sha, etag)) = entry else {
         let _ = write!(
             &stream,
@@ -465,9 +557,14 @@ fn serve(state: &State, stream: TcpStream) {
             head.push_str(&format!("Content-Range: bytes {first}-{last}/{total}\r\n"));
         }
     }
-    head.push_str(&format!("Content-Length: {}\r\n", slice.len()));
+    let length = match state.head_length.lock().unwrap().get(&file) {
+        Some(lie) if method == "HEAD" => *lie,
+        _ => slice.len() as u64,
+    };
+    head.push_str(&format!("Content-Length: {length}\r\n"));
     head.push_str(&format!("ETag: {etag}\r\n"));
     head.push_str(&format!("X-Linked-Etag: \"{advertised_sha}\"\r\n"));
+    head.push_str(&format!("X-Linked-Size: {}\r\n", body.len()));
     if advertise {
         head.push_str("Accept-Ranges: bytes\r\n");
     }

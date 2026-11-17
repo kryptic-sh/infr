@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use ash::vk;
 
-use crate::{as_vk_buf, be, VulkanBackend, VulkanShared};
+use crate::{as_vk_buf, be, check_extent, VulkanBackend, VulkanShared};
 use infr_core::backend::Buffer;
 use infr_core::error::Result;
 
@@ -292,6 +292,12 @@ impl VulkanBackend {
         acquire_external: &[&dyn Buffer],
         release_external: &[&dyn Buffer],
     ) -> Result<vk::CommandBuffer> {
+        // Same guard as `Backend::copy_buffer`, before anything is allocated or recorded: a region
+        // past either end is a VUID violation, not an error the driver reports.
+        for &(src, dst, bytes) in copies {
+            check_extent("tp_record_copies", "out of", bytes, as_vk_buf(src)?.size)?;
+            check_extent("tp_record_copies", "into", bytes, as_vk_buf(dst)?.size)?;
+        }
         let device = &self.shared.device;
         let qf = self.shared.queue_family_index;
         let pool = *self.shared.cmd_pool.lock().unwrap();

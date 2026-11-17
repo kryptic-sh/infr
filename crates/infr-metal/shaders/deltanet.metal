@@ -74,6 +74,73 @@ kernel void conv1d_shift_f32(device const float* x [[buffer(0)]],
     state[gid] = x[(p.rows - km1 + k) * p.channels + ch];
 }
 
+// LFM's gated short convolution (Op::ShortConv): the three conv1d kernels above with the conv
+// input read as B * X from the [rows, 3*channels] B | C | X in-projection and the output written
+// as C * conv, with no SiLU. The history holds B * X.
+inline float shortconv_in(device const float* bcx, uint t, uint ch, uint cc) {
+    ulong r = (ulong)t * 3u * cc;
+    return bcx[r + ch] * bcx[r + 2u * cc + ch];
+}
+
+kernel void shortconv_f32(device const float* bcx   [[buffer(0)]],
+                          device const float* w     [[buffer(1)]],
+                          device float*       state [[buffer(2)]],
+                          device float*       dst   [[buffer(3)]],
+                          constant ConvSiluParams& p [[buffer(4)]],
+                          uint gid [[thread_position_in_grid]]) {
+    uint ch = gid;
+    if (ch >= p.channels) return;
+    uint kk = p.kwidth;             // host gates kwidth <= 8
+    float st[7];
+    float wv[8];
+    for (uint j = 0; j + 1 < kk; j++) st[j] = state[j * p.channels + ch];
+    for (uint j = 0; j < kk; j++) wv[j] = w[ch * kk + j];
+    for (uint t = 0; t < p.rows; t++) {
+        float xt = shortconv_in(bcx, t, ch, p.channels);
+        float acc = xt * wv[kk - 1u];
+        for (uint j = 0; j + 1 < kk; j++) acc += st[j] * wv[j];
+        dst[t * p.channels + ch] = bcx[(ulong)t * 3u * p.channels + p.channels + ch] * acc;
+        for (uint j = 0; j + 2 < kk; j++) st[j] = st[j + 1];
+        if (kk >= 2u) st[kk - 2u] = xt;
+    }
+    for (uint j = 0; j + 1 < kk; j++) state[j * p.channels + ch] = st[j];
+}
+
+kernel void shortconv_par_f32(device const float* bcx   [[buffer(0)]],
+                              device const float* w     [[buffer(1)]],
+                              device const float* state [[buffer(2)]],
+                              device float*       dst   [[buffer(3)]],
+                              constant ConvSiluParams& p [[buffer(4)]],
+                              uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.rows * p.channels) return;
+    uint t = gid / p.channels;
+    uint ch = gid % p.channels;
+    uint km1 = p.kwidth - 1u;
+    float acc = 0.0f;
+    for (uint k = 0; k < p.kwidth; k++) {
+        uint i = t + k;
+        float xv;
+        if (i < km1) {
+            xv = state[i * p.channels + ch];
+        } else {
+            xv = shortconv_in(bcx, i - km1, ch, p.channels);
+        }
+        acc += xv * w[ch * p.kwidth + k];
+    }
+    dst[gid] = bcx[(ulong)t * 3u * p.channels + p.channels + ch] * acc;
+}
+
+kernel void shortconv_shift_f32(device const float* bcx [[buffer(0)]],
+                                device float* state     [[buffer(1)]],
+                                constant ConvSiluParams& p [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    uint km1 = p.kwidth - 1u;
+    if (gid >= km1 * p.channels) return;
+    uint k = gid / p.channels;
+    uint ch = gid % p.channels;
+    state[gid] = shortconv_in(bcx, p.rows - km1 + k, ch, p.channels);
+}
+
 // One SIMDGROUP per (value-dim d, value-head h) — the llama.cpp kernel_gated_delta_net
 // parallelization. The simdgroup's 32 lanes split the k-dim (KPL = kd/32 state entries per
 // lane, register-resident ls[] for the WHOLE chunk — the old shape re-read the state column

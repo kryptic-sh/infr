@@ -10,32 +10,6 @@ use infr_gguf::Gguf;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
-/// Accumulated negative log-likelihoods from [`SeamModel::perplexity`].
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct PplReport {
-    pub nll_sum: f64,
-    pub nll_sq: f64,
-    pub count: usize,
-    pub chunks: usize,
-}
-
-impl PplReport {
-    pub fn ppl(&self) -> f64 {
-        (self.nll_sum / self.count.max(1) as f64).exp()
-    }
-
-    /// `llama-perplexity`'s `+/-` figure.
-    pub fn uncertainty(&self) -> Option<f64> {
-        if self.count < 2 {
-            return None;
-        }
-        let n = self.count as f64;
-        let mean = self.nll_sum / n;
-        let var = self.nll_sq / n - mean * mean;
-        (var > 0.0).then(|| self.ppl() * (var / (n - 1.0)).sqrt())
-    }
-}
-
 /// The placement/dispatch choices a Vulkan bench run actually settled on — reported next to the
 /// throughput figure by [`SeamModel::bench_vulkan`]'s caller.
 ///
@@ -64,13 +38,11 @@ pub struct BenchPlacement {
 /// A **GPU-free** model for the CPU reference backend. Holds only what the agnostic CPU compute
 /// graph needs — the parsed [`Config`], the host f32 token embeddings (for the gather + tied lm
 /// head), the tokenizer, and the gemma4 E2B per-layer-embd tensors. No `VulkanBackend`, no VRAM,
-/// no weight upload: the projection weights are streamed straight from the kept-open weight
-/// source at forward time (a GGUF mmap, or an EXL3 safetensors with folded-F16 linears).
-/// Dense Qwen3/Llama, Gemma 3, Gemma 4 (dense + E2B), qwen3moe, and qwen35
+/// no weight upload: the projection weights are streamed straight from the kept-open GGUF mmap at
+/// forward time. Dense Qwen3/Llama, Gemma 3, Gemma 4 (dense + E2B), qwen3moe, and qwen35
 /// (`MixerW::DeltaNet`) all drive this same struct.
 pub struct SeamModel {
-    weights: std::boxed::Box<dyn infr_core::WeightSource>,
-    path: std::path::PathBuf,
+    gguf: Gguf,
     cfg: Config,
     /// The ENGINE configuration every seam path this model drives reads its knobs from —
     /// `kv.*`, `spec.*`, `sampling.*`, `multi.*`, `device.ubatch*`, `paging.cache`, the seam's
@@ -97,13 +69,25 @@ pub struct SeamModel {
     /// path recomputes this 2-3× (`kv_fit_ctx` → `kv_fit_ctx_fmt`, the auto-q8 re-probe, then the
     /// clamp log line) — cache it so the scan runs once per model. See [`SeamModel::footprint`].
     footprint: std::sync::OnceLock<crate::weights::WeightFootprint>,
-    /// The vision tower (`mmproj-*.gguf`), opened on the FIRST image a prompt carries — text-only
-    /// use never touches the file. The `Err` arm caches why there is none, so a model without a
-    /// projector answers every image request with the same clear message instead of re-probing.
-    #[allow(clippy::type_complexity)]
-    vision: std::sync::OnceLock<
-        std::result::Result<std::sync::Arc<crate::vision::Gemma4Vision>, String>,
-    >,
+    /// The CPU backend and the weights bound for it, kept between CPU generations (see
+    /// [`crate::seam::CpuResident`] and [`SeamModel::with_cpu`]).
+    cpu: std::sync::Mutex<CpuSlot>,
+}
+
+/// Where a [`SeamModel`] keeps its CPU resident between generations.
+#[derive(Default)]
+struct CpuSlot {
+    /// The model's resident, when no generation has it out. `None` before the first generation,
+    /// while one runs, and after one whose cold init did not get as far as binding.
+    resident: Option<crate::seam::CpuResident>,
+    /// A generation has the model's own resident out (taken from `resident`, or opened because
+    /// there was none and nobody else had one out). A generation that starts meanwhile opens a
+    /// resident of its own, which is never put back: it was sized while the model's own was
+    /// still allocated, so its paged arena may be smaller or absent.
+    out: bool,
+    /// Residents opened for this model, the model's own and every overflow one.
+    #[cfg(test)]
+    opened: usize,
 }
 
 /// The conversation SLOTS a persistent GPU seam session owns: up to `INFR_KV_SLOTS` (default 4)
@@ -253,6 +237,51 @@ impl DenseVulkanSession {
     pub fn vram(&self) -> infr_vulkan::VramInfo {
         self.be.vram()
     }
+
+    /// How many record-once decode recordings this session's backend has made
+    /// ([`infr_vulkan::VulkanBackend::decode_recordings`]): the way to see from outside whether a
+    /// generation's decode was recorded once and replayed, or recorded per token.
+    pub fn decode_recordings(&self) -> u64 {
+        self.be.decode_recordings()
+    }
+
+    /// Test hook: move the dense streaming cache's placement epoch before the `n`th decode replay
+    /// from now ([`infr_vulkan::VulkanBackend::force_dense_epoch_move_after`]), so that replay
+    /// records again with nothing re-placed.
+    pub fn force_dense_epoch_move_after(&self, n: u64) {
+        self.be.force_dense_epoch_move_after(n);
+    }
+
+    /// The segments this session's forwards submitted before their recording ended, by cause
+    /// ([`infr_vulkan::VulkanBackend::segment_cuts`]) — among them the router-id readbacks of
+    /// paged MoE layers that were not wholly resident.
+    pub fn segment_cuts(&self) -> infr_vulkan::SegmentCuts {
+        self.be.segment_cuts()
+    }
+
+    /// The paged-MoE expert cache's counters and fills
+    /// ([`infr_vulkan::VulkanBackend::moe_pager_totals`]); `None` when no layer is paged.
+    pub fn moe_pager_totals(&self) -> Option<(infr_core::pager::PagerStats, u64)> {
+        self.be.moe_pager_totals()
+    }
+
+    /// The dense layer-streaming cache's counters
+    /// ([`infr_vulkan::VulkanBackend::dense_pager_totals`]); `None` when nothing streams.
+    pub fn dense_pager_totals(&self) -> Option<infr_vulkan::pager::DenseTotals> {
+        self.be.dense_pager_totals()
+    }
+
+    /// Static (not replayed) executes this session's backend made
+    /// ([`infr_vulkan::VulkanBackend::static_executes`]) — how a test counts a prefill's spans.
+    pub fn static_executes(&self) -> u64 {
+        self.be.static_executes()
+    }
+
+    /// Arena barriers this session's backend recorded around staging copies
+    /// ([`infr_vulkan::VulkanBackend::arena_barriers`]).
+    pub fn arena_barriers(&self) -> u64 {
+        self.be.arena_barriers()
+    }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -348,20 +377,13 @@ impl SlotPool {
             // slot can own most of free VRAM) degrades to recycling the LRU slot instead of
             // failing the request: correctness is identical (the slot re-prefills from scratch),
             // only cross-conversation KV reuse is lost.
-            let src_i = self
+            let src = self
                 .slots
                 .iter()
-                .position(|s| s.is_some())
+                .flatten()
+                .next()
                 .expect("pick_slot: no initialized slot to fork from");
-            start_paging(
-                self.slots[src_i].as_mut().expect("checked above"),
-                be,
-                cfg,
-                ec,
-                max_slots,
-            );
-            let src = self.slots[src_i].as_ref().expect("checked above");
-            match src.fork(be, cfg, ec) {
+            match src.fork(be, cfg) {
                 Ok(fresh) => {
                     self.slots.push(Some(fresh));
                     self.last_used.push(self.tick);
@@ -390,46 +412,13 @@ impl SlotPool {
             if best_s > score(&self.slots[target]) {
                 let src = self.slots[best_i].take().expect("scored slot is Some");
                 if let Some(dst) = self.slots[target].as_mut() {
-                    dst.seed_from(be, cfg, ec, &src, best_s)?;
+                    dst.seed_from(be, cfg, &src, best_s)?;
                 }
                 self.slots[best_i] = Some(src);
             }
         }
         self.last_used[target] = self.tick;
         Ok(target)
-    }
-}
-
-/// `kv.paged`: put the session's KV in one page pool at the first fork, so this slot and every
-/// later one start from the parent's SHARED prefix pages instead of a copy. The pool holds one
-/// block per slot the session may fork — the same device bytes `max_slots` linear slots cost — and
-/// a pool it cannot build (VRAM, or a model with no pageable layer) degrades to linear slots with a
-/// warning rather than failing the request.
-fn start_paging(
-    src: &mut crate::seam::SeamKv,
-    be: &dyn infr_core::backend::Backend,
-    cfg: &crate::Config,
-    ec: &crate::EngineConfig,
-    max_slots: usize,
-) {
-    if ec.kv.paged != Some(true) || src.is_paged() {
-        return;
-    }
-    let caps = be.capabilities();
-    if !caps.kv_paging {
-        tracing::warn!(
-            "kv.paged: backend {} reads KV by position and has no page-table path; slots stay \
-             linear",
-            caps.name,
-        );
-        return;
-    }
-    let (k_fmt, v_fmt) = src.kv_fmts();
-    let blocks = max_slots.max(crate::seam::POOL_BLOCKS);
-    let built = crate::seam::KvPool::new(be, cfg, src.max_ctx(), k_fmt, v_fmt, blocks)
-        .and_then(|pool| src.attach_paged(be, cfg, &pool));
-    if let Err(e) = built {
-        tracing::warn!("kv.paged: could not page this session's KV ({e}); slots stay linear");
     }
 }
 
@@ -465,74 +454,95 @@ impl SeamModel {
         tokenizer_path: Option<&Path>,
         ecfg: std::sync::Arc<crate::EngineConfig>,
     ) -> Result<Self> {
-        let is_safetensors = gguf_path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"));
-        let g: std::boxed::Box<dyn infr_core::WeightSource> = if is_safetensors {
-            let config_path = gguf_path
-                .parent()
-                .unwrap_or(Path::new("."))
-                .join("config.json");
-            let config: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(&config_path)
-                    .map_err(|e| anyhow!("read adjacent {}: {e}", config_path.display()))?,
-            )
-            .map_err(|e| anyhow!("parse adjacent config.json: {e}"))?;
-            if matches!(
-                config["model_type"].as_str(),
-                Some("qwen4_exp" | "qwen4_exp_text")
-            ) {
-                std::boxed::Box::new(crate::qwen4_exp_source::Qwen4ExpSource::open(gguf_path)?)
-            } else {
-                // Preserve EXL3's model/quantizer checks and native trellis route.
-                std::boxed::Box::new(crate::Exl3Source::open_native(gguf_path)?)
-            }
-        } else {
-            std::boxed::Box::new(Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?)
-        };
-        Self::from_source(g, is_safetensors, gguf_path, tokenizer_path, ecfg)
-    }
-
-    pub(crate) fn from_source(
-        g: std::boxed::Box<dyn infr_core::WeightSource>,
-        is_safetensors: bool,
-        gguf_path: &Path,
-        tokenizer_path: Option<&Path>,
-        ecfg: std::sync::Arc<crate::EngineConfig>,
-    ) -> Result<Self> {
-        let mut cfg = Config::from_gguf(&*g)?;
-        let tokenizer = match tokenizer_path {
-            Some(p) => Tokenizer::from_file(p).map_err(|e| anyhow!("load tokenizer: {e}"))?,
-            None if is_safetensors => Tokenizer::from_file(
-                gguf_path
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join("tokenizer.json"),
-            )
-            .map_err(|e| anyhow!("load adjacent HF tokenizer.json: {e}"))?,
-            None => build_tokenizer(&*g)?,
-        };
-        add_chat_eos(&mut cfg, &tokenizer);
+        let g = Gguf::open(gguf_path).map_err(|e| anyhow!("open gguf: {e}"))?;
+        let mut cfg = Config::from_gguf(&g)?;
+        let tokenizer = crate::tokenizer::load_tokenizer(&g, tokenizer_path)?;
+        add_chat_eos(&mut cfg, &tokenizer, infr_core::WeightSource::metadata(&g));
         // `token_embd.weight` is NOT dequantized here — see the field's doc. `Config::from_gguf`
         // above already read its shape, so a model missing the tensor still fails at load, not on
         // the lazy path below.
-        let per_layer_embd = build_per_layer_embd(&*g, &cfg)?;
+        let per_layer_embd = build_per_layer_embd(&g, &cfg)?;
+        warn_ctx_cap(&cfg, &ecfg);
         Ok(Self {
-            weights: g,
-            path: gguf_path.to_path_buf(),
+            gguf: g,
             cfg,
             ecfg,
             token_embd: std::sync::OnceLock::new(),
             per_layer_embd,
             tokenizer,
             footprint: std::sync::OnceLock::new(),
-            vision: std::sync::OnceLock::new(),
+            cpu: std::sync::Mutex::new(CpuSlot::default()),
         })
     }
 
-    /// The GGUF or HF safetensors file this model was loaded from.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// Run `f` on this model's CPU resident, on a backend built from the model's configuration
+    /// (reference mode when `kernels.cpu.reference` is set). The resident is taken out of the
+    /// model for the call, and only the model's own goes back (see [`CpuSlot`]): a generation
+    /// that starts while another has it out opens a resident of its own (the behaviour every CPU
+    /// generation had before residents existed), shares no backend or paged store with it, and
+    /// drops it at the end. The model's own goes back if it got as far as binding the weights;
+    /// otherwise it is dropped, and the next generation opens a new one.
+    fn with_cpu<T>(&self, f: impl FnOnce(&mut crate::seam::CpuResident) -> Result<T>) -> Result<T> {
+        // The lock is never held across `f`, so a panic in a generation cannot poison it.
+        let (taken, own) = {
+            let mut slot = self
+                .cpu
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let own = !slot.out;
+            slot.out = true;
+            #[cfg(test)]
+            if slot.resident.is_none() {
+                slot.opened += 1;
+            }
+            (slot.resident.take(), own)
+        };
+        // The model's own resident goes back, and `out` clears, under one lock when this call ends
+        // however it ends (a failed open and a panic in `f` included): a generation starting in
+        // between must never see the model's resident in the slot while `out` still says it is
+        // away, or it would take it as an overflow one and drop it. A resident a panic unwound
+        // through is not kept: a lock inside its backend may be poisoned.
+        struct Lease<'a> {
+            slot: Option<&'a std::sync::Mutex<CpuSlot>>,
+            res: Option<crate::seam::CpuResident>,
+        }
+        impl Drop for Lease<'_> {
+            fn drop(&mut self) {
+                if let Some(m) = self.slot {
+                    let mut slot = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    slot.resident = self
+                        .res
+                        .take()
+                        .filter(|r| r.is_bound() && !std::thread::panicking());
+                    slot.out = false;
+                }
+            }
+        }
+        let mut lease = Lease {
+            slot: own.then_some(&self.cpu),
+            res: None,
+        };
+        let res = lease.res.insert(match taken {
+            Some(res) => res,
+            None => crate::seam::CpuResident::open(
+                CpuBackend::new_with(self.ecfg.clone()),
+                &self.ecfg,
+                &self.gguf,
+                &self.cfg,
+            )?,
+        });
+        f(res)
+    }
+
+    /// Look at the CPU resident this model holds between generations (`None` before the first, and
+    /// while one is running), and how many residents it has opened.
+    #[cfg(test)]
+    pub(crate) fn with_cpu_resident<T>(
+        &self,
+        f: impl FnOnce(Option<&crate::seam::CpuResident>, usize) -> T,
+    ) -> T {
+        let slot = self.cpu.lock().unwrap();
+        f(slot.resident.as_ref(), slot.opened)
     }
 
     /// The ENGINE configuration this model was loaded with (see the `ecfg` field). Every seam path
@@ -542,12 +552,23 @@ impl SeamModel {
         &self.ecfg
     }
 
+    /// The context a session asked for `want` opens at: `want` capped at
+    /// [`Config::faithful_ctx_limit`]. Every session entry point resolves its context through
+    /// this BEFORE anything sizes, prices or admits against it, so the KV fit, the auto-q8 and
+    /// refusal rungs and every reply budget see the capped window. Silent: the load already said
+    /// so once (`warn_ctx_cap`).
+    pub(crate) fn session_ctx(&self, want: usize) -> usize {
+        self.cfg
+            .faithful_ctx_limit()
+            .map_or(want, |limit| want.min(limit))
+    }
+
     /// The model's resident weight footprint, computed once and memoized (see the `footprint`
     /// field). `WeightFootprint` is `Copy`, so callers get it by value.
     fn footprint(&self) -> crate::weights::WeightFootprint {
         *self
             .footprint
-            .get_or_init(|| crate::weights::weight_footprint(&*self.weights))
+            .get_or_init(|| crate::weights::weight_footprint(&self.gguf))
     }
 
     /// Open a persistent Vulkan seam session: weights uploaded ONCE, the KV cache sized to
@@ -568,7 +589,7 @@ impl SeamModel {
         dev: Option<usize>,
         max_ctx: usize,
     ) -> Result<DenseVulkanSession> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
+        let max_ctx = self.session_ctx(max_ctx);
         let vk = open_backend(dev, self.ecfg.clone())?;
         // The auto-q8 rung may pin this session's KV format, so it runs under THIS session's
         // placement scope, as in `vulkan_session_default_on`.
@@ -603,13 +624,12 @@ impl SeamModel {
     /// VRAM budget clamps its own default context — a session on the weak iGPU gets a window sized
     /// to the iGPU's memory, independent of the discrete card's.
     pub fn vulkan_session_default_on(&self, dev: Option<usize>) -> Result<DenseVulkanSession> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = open_backend(dev, self.ecfg.clone())?;
         // The clamp's auto-q8 rung may pin this session's KV format — do it under THIS session's
         // placement scope so the decision lands on its own pins, not a process-global cell.
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
-        let max_ctx = self.clamp_default_ctx(&vk, self.cfg.n_ctx_train);
+        let max_ctx = self.clamp_default_ctx(&vk, self.session_ctx(self.cfg.n_ctx_train));
         drop(scope);
         let max_ctx = max_ctx?;
         Ok(DenseVulkanSession {
@@ -638,7 +658,6 @@ impl SeamModel {
         dev: Option<usize>,
         frac: f64,
     ) -> Result<DenseVulkanSession> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = open_backend(dev, self.ecfg.clone())?;
         let pins = std::sync::Arc::new(crate::seam::PlacementPins::default());
         let scope = crate::seam::PlacementScope::enter(pins.clone());
@@ -646,7 +665,7 @@ impl SeamModel {
         // the trained context (same shape as the default path's `kv_per_tok == 0` escape).
         let fit = self.kv_fit_ctx(&vk).unwrap_or(self.cfg.n_ctx_train);
         drop(scope);
-        let max_ctx = ((fit as f64 * frac) as usize).max(1024);
+        let max_ctx = self.session_ctx(((fit as f64 * frac) as usize).max(1024));
         Ok(DenseVulkanSession {
             be: vk,
             pool: SlotPool::new(),
@@ -797,7 +816,7 @@ impl SeamModel {
     fn may_auto_q8(&self) -> bool {
         self.cfg.moe.is_none()
             && !crate::seam::kv_auto_q8()
-            && crate::seam::kv_unset(&self.ecfg)
+            && crate::seam::kv_unset(&self.cfg, &self.ecfg)
             && crate::seam::kv_q8_layout_ok(&self.cfg)
     }
 
@@ -910,7 +929,11 @@ impl SeamModel {
             None if self.ecfg.kv.force_q8 || auto_q8 => DType::Q8_0,
             None => DType::F16,
         };
-        (side(self.ecfg.kv.type_k), side(self.ecfg.kv.type_v))
+        let k = side(self.ecfg.kv.type_k);
+        (
+            k,
+            crate::seam::kv_v_fmt(&self.cfg, k, side(self.ecfg.kv.type_v)),
+        )
     }
 
     /// Greedy generation on the Vulkan seam through a persistent session (see
@@ -938,34 +961,26 @@ impl SeamModel {
         req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        // Images (if any) become placeholder ids + an embedding override the runner reads; the
-        // guard keeps that override published for exactly this generation.
-        let (prompt_tokens, _media) = self.encode_prompt(prompt, session.max_ctx, req)?;
+        let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let slot = session
             .pool
             .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
         let max_ctx = session.max_ctx;
-        // Cap the reply to the context that's actually left ("a turn also caps to remaining
-        // context" — the CLI's generation ceiling is a default, not a demand): a VRAM-clamped
-        // default session (e.g. a 21.9 GB model on a 24 GB card clamps 262k -> ~1.7k) would
-        // otherwise hard-error on `infr run`'s default max_new=2048 before generating a single
-        // token. EOS ends almost every reply long before this cap; an over-long PROMPT still
-        // errors cleanly in the runner (its `prompt + gen + 1 > max_ctx` guard stays).
-        let max_new = max_new.min(max_ctx.saturating_sub(prompt_tokens.len() + 1));
+        let budget = reply_budget(max_new, max_ctx, prompt_tokens.len());
         // Resolve `ubatch_rows`/`kv_auto_q8` against THIS session's pins (warm calls must agree
         // with the buffers placement sized) — never a process-global cell shared across models.
         let _scope = crate::seam::PlacementScope::enter(session.pins().clone());
-        let (_generated, stats) = crate::seam::generate_dense_vulkan_session(
+        let (_generated, mut stats) = crate::seam::generate_dense_vulkan_session(
             &session.be,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &session.cfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
-            max_new,
+            budget,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
             &mut session.pool.slots[slot],
             max_ctx,
@@ -979,6 +994,7 @@ impl SeamModel {
         if let Some(kv) = session.pool.slots[slot].as_ref() {
             session.max_ctx = kv.max_ctx();
         }
+        stats.ctx_full = crate::ran_out_of_context(max_new, budget, &stats);
         Ok(stats)
     }
 
@@ -986,11 +1002,10 @@ impl SeamModel {
         &self.cfg
     }
 
-    /// The open weight source — GGUF for converted models, folded-F16 EXL3 for safetensors.
-    /// MTP Phase 2 (issue #33) needs it to resolve/upload the head's own tensors
-    /// (`crate::mtp::load_mtp_head` / `MtpHeadSession::new_cpu`/`new_vulkan`).
-    pub fn weights(&self) -> &dyn infr_core::WeightSource {
-        &*self.weights
+    /// The open GGUF handle — MTP Phase 2 (issue #33) needs it to resolve/upload the head's own
+    /// tensors (`crate::mtp::load_mtp_head` / `MtpHeadSession::new_cpu`/`new_vulkan`).
+    pub fn gguf(&self) -> &Gguf {
+        &self.gguf
     }
 
     /// The host f32 token-embedding table (`token_embd.weight`), dequantized ONCE on first call
@@ -1010,195 +1025,19 @@ impl SeamModel {
     /// table on: the GPU/Metal dense runners never read it, so handing them the handle (rather
     /// than a materialized slice) keeps the ~4s / ~3.1 GiB dequant off the GPU load path.
     pub(crate) fn embd(&self) -> crate::seam::TokenEmbd<'_> {
-        crate::seam::TokenEmbd::new(&self.token_embd, &*self.weights)
+        crate::seam::TokenEmbd::new(&self.token_embd, &self.gguf)
     }
 
     /// Tokenize raw text with the model's own tokenizer (no chat template) — for callers that
     /// need token ids directly (e.g. a raw-forward validation harness), as opposed to
     /// [`render_chat`](Self::render_chat) + the generation loop.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        // A marker reaching here means a multimodal prompt took a path that cannot splice images
-        // (CPU/Metal/MTP): fail loudly rather than feed the model the marker as literal text.
-        if text.contains(crate::media::IMAGE_MARKER) {
-            return Err(anyhow!(
-                "image input is only supported on the Vulkan backend without MTP"
-            ));
-        }
-        self.encode_text(text)
-    }
-
-    fn encode_text(&self, text: &str) -> Result<Vec<u32>> {
         Ok(self
             .tokenizer
             .encode(text, false)
             .map_err(|e| anyhow!("encode: {e}"))?
             .get_ids()
             .to_vec())
-    }
-
-    /// The vision tower for this model, loaded on first use: `serve.mmproj` when set, else the
-    /// first `mmproj*.gguf` beside the model file.
-    pub fn vision(&self) -> Result<std::sync::Arc<crate::vision::Gemma4Vision>> {
-        self.vision
-            .get_or_init(|| {
-                let path = match self.ecfg.serve.mmproj.clone() {
-                    Some(p) => p,
-                    None => crate::vision::Gemma4Vision::sibling_of(&self.path).ok_or_else(|| {
-                        format!(
-                            "this model has no vision projector: no mmproj*.gguf beside {} \
-                             (pull one, e.g. `infr pull <repo>:mmproj-F16.gguf`, or set serve.mmproj)",
-                            self.path.display()
-                        )
-                    })?,
-                };
-                let v = crate::vision::Gemma4Vision::open(&path).map_err(|e| format!("{e:#}"))?;
-                if v.n_embd_out != self.cfg.n_embd {
-                    return Err(format!(
-                        "mmproj {} projects to {} but the model is {} wide — wrong projector for this model",
-                        path.display(),
-                        v.n_embd_out,
-                        self.cfg.n_embd
-                    ));
-                }
-                Ok(std::sync::Arc::new(v))
-            })
-            .clone()
-            .map_err(|e| anyhow!("{e}"))
-    }
-
-    fn image_token_counts(&self, images: &[std::sync::Arc<[u8]>]) -> Result<Vec<usize>> {
-        if images.is_empty() {
-            return Ok(Vec::new());
-        }
-        if !self.cfg.gemma4 {
-            anyhow::bail!("image input is only supported for Gemma 4 models");
-        }
-        if images.len() > crate::vision::MAX_REQUEST_IMAGES {
-            anyhow::bail!("at most four images are allowed per request");
-        }
-        let vision = self.vision()?;
-        let mut pixels = 0u64;
-        let mut tokens = 0usize;
-        let mut counts = Vec::with_capacity(images.len());
-        for bytes in images {
-            let (w, h) = crate::vision::image_dimensions(bytes)?;
-            pixels += u64::from(w) * u64::from(h);
-            if pixels > crate::vision::MAX_REQUEST_PIXELS {
-                anyhow::bail!("request images exceed the aggregate pixel limit");
-            }
-            let count = vision.image_tokens(bytes, self.ecfg.serve.image_max_tokens)?;
-            tokens += count;
-            if tokens > crate::vision::MAX_IMAGE_TOKENS {
-                anyhow::bail!("request images exceed the aggregate soft-token limit");
-            }
-            counts.push(count);
-        }
-        Ok(counts)
-    }
-
-    /// Validate image support, aggregate budgets, and complete image payloads before a server
-    /// commits response headers. This performs no vision transformer work.
-    pub fn preflight_images(&self, images: &[std::sync::Arc<[u8]>]) -> Result<()> {
-        self.image_token_counts(images)?;
-        for bytes in images {
-            crate::vision::validate_image(bytes)?;
-        }
-        Ok(())
-    }
-
-    /// Tokenize a rendered prompt that may carry [`crate::media::IMAGE_MARKER`]s: each marker
-    /// becomes `<|image>` + one placeholder id per soft token + `<image|>` (the layout llama.cpp's
-    /// mtmd and HF's Gemma 4 processor both produce), and the returned guard publishes the encoded
-    /// image rows for the runner until it drops. A prompt without markers is plain [`encode`].
-    ///
-    /// [`encode`]: Self::encode
-    pub(crate) fn encode_prompt(
-        &self,
-        prompt: &str,
-        max_ctx: usize,
-        req: Option<&crate::sampling::RequestCtx>,
-    ) -> Result<(Vec<u32>, Option<crate::media::OverrideScope>)> {
-        use crate::media::{
-            current_media, EmbedOverride, OverrideScope, IMAGE_MARKER, MEDIA_ID_BASE,
-        };
-        if !prompt.contains(IMAGE_MARKER) {
-            return Ok((self.encode(prompt)?, None));
-        }
-        if !self.cfg.gemma4 {
-            return Err(anyhow!("image input is only supported for Gemma 4 models"));
-        }
-        let parts: Vec<&str> = prompt.split(IMAGE_MARKER).collect();
-        let n_img = parts.len() - 1;
-        let media = current_media().unwrap_or_default();
-        if media.len() != n_img {
-            return Err(anyhow!(
-                "the prompt has {n_img} image placeholder(s) but {} image(s) were attached",
-                media.len()
-            ));
-        }
-        let counts = self.image_token_counts(&media)?;
-        let text: Vec<Vec<u32>> = parts
-            .iter()
-            .map(|part| self.encode_text(part))
-            .collect::<Result<_>>()?;
-        let text_len = text
-            .iter()
-            .try_fold(0usize, |n, p| n.checked_add(p.len()))
-            .ok_or_else(|| anyhow!("image prompt length overflow"))?;
-        let total = counts
-            .iter()
-            .try_fold(text_len, |n, &count| n.checked_add(count + 2))
-            .ok_or_else(|| anyhow!("image prompt length overflow"))?;
-        if total >= max_ctx {
-            return Err(anyhow!(
-                "image prompt ({total} tokens) does not fit context {max_ctx}"
-            ));
-        }
-        let vision = self.vision()?;
-        let special = |s: &str| -> Result<u32> {
-            match self.encode_text(s)?.as_slice() {
-                [id] => Ok(*id),
-                other => Err(anyhow!(
-                    "tokenizer: {s:?} is not a single special token ({other:?})"
-                )),
-            }
-        };
-        let (boi, eoi) = (special("<|image>")?, special("<image|>")?);
-        let max_tokens = self.ecfg.serve.image_max_tokens;
-        let mut ids = Vec::new();
-        let mut spans = Vec::with_capacity(n_img);
-        for (i, part) in text.iter().enumerate() {
-            if req.is_some_and(crate::sampling::RequestCtx::aborted) {
-                return Err(anyhow!("image encoding cancelled"));
-            }
-            ids.extend_from_slice(part);
-            if i == n_img {
-                break;
-            }
-            let bytes = &media[i];
-            let rows = vision.encode_with_request(bytes, max_tokens, req)?;
-            let n = rows.len() / self.cfg.n_embd;
-            if n != counts[i] {
-                return Err(anyhow!("vision output token count differs from preflight"));
-            }
-            // Compact content-derived tags are not identity proofs: KV reuse stops before image
-            // rows. The encoder's cache compares complete bytes, so hash collisions are harmless.
-            let tag = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                bytes.hash(&mut h);
-                (h.finish() as u32) & !MEDIA_ID_BASE
-            };
-            ids.push(boi);
-            spans.push((ids.len(), rows));
-            ids.extend(std::iter::repeat_n(MEDIA_ID_BASE | tag, n));
-            ids.push(eoi);
-        }
-        let scope = OverrideScope::enter(EmbedOverride {
-            n_embd: self.cfg.n_embd,
-            spans,
-        });
-        Ok((ids, Some(scope)))
     }
 
     /// Raw tokenizer accessor for callers outside this module that need incremental detok (the
@@ -1245,15 +1084,15 @@ impl SeamModel {
         // An explicit token count is the user's demand — honour it verbatim, at any N, quantizing
         // the cache to q8_0 when that is what it takes to fit.
         if let Some(infr_core::SizeSpec::Bytes(c)) = want {
-            let ctx = (c as usize).max(1);
+            let ctx = self.session_ctx((c as usize).max(1));
             self.auto_q8_for_explicit_ctx(vk, ctx, n_slots);
             self.refuse_explicit_ctx(vk, ctx, n_slots)?;
             return Ok(ctx);
         }
+        let trained = self.session_ctx(self.cfg.n_ctx_train);
         if n_slots == 1 && want.is_none() {
-            return self.clamp_default_ctx(vk, self.cfg.n_ctx_train);
+            return self.clamp_default_ctx(vk, trained);
         }
-        let trained = self.cfg.n_ctx_train;
         let Some(fit) = self.kv_fit_ctx(vk) else {
             return Ok(trained); // pure recurrent-state arch: no per-token KV to divide.
         };
@@ -1292,7 +1131,7 @@ impl SeamModel {
     /// caller today (see `docs/diffusion-gemma.md`).
     pub fn prefill_logits_cpu(&self, tokens: &[u32]) -> Result<Vec<f32>> {
         crate::seam::verify_dense_cpu(
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1307,7 +1146,7 @@ impl SeamModel {
     /// needs, validated here via `lm_head(h) == logits`. Returns `(logits, h)`.
     pub fn prefill_logits_and_h_cpu(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
         crate::seam::verify_dense_cpu_with_h(
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1323,7 +1162,7 @@ impl SeamModel {
     /// Dense non-MoE models only. Returns `(logits [tokens.len()*vocab], h [tokens.len()*n_embd])`.
     pub fn verify_logits_and_h_cpu(&self, tokens: &[u32]) -> Result<(Vec<f32>, Vec<f32>)> {
         crate::seam::verify_rows_cpu_with_h(
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1332,135 +1171,31 @@ impl SeamModel {
         )
     }
 
-    /// Tokenize `text` for perplexity scoring the way `llama-perplexity` does: the model's BOS is
-    /// prepended when the GGUF asks for one (`tokenizer.ggml.add_bos_token`).
-    pub fn perplexity_tokens(&self, text: &str) -> Result<Vec<u32>> {
-        let mut ids = Vec::new();
-        if let Some(bos) = perplexity_bos(self.weights.metadata()) {
-            ids.push(bos);
-        }
-        ids.extend(self.encode(text)?);
-        Ok(ids)
-    }
-
-    /// Score consecutive windows' second halves, replacing the first token only for BOS models.
-    pub fn perplexity(
-        &self,
-        tokens: &[u32],
-        n_ctx: usize,
-        max_chunks: Option<usize>,
-        cpu: bool,
-        mut on_chunk: impl FnMut(usize, usize, f64),
-    ) -> Result<PplReport> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
-        use rayon::prelude::*;
-        if n_ctx < 4 {
-            return Err(anyhow!("perplexity: context must be at least 4 tokens"));
-        }
-        let mut n_chunks = tokens.len() / n_ctx;
-        if let Some(cap) = max_chunks {
-            n_chunks = n_chunks.min(cap);
-        }
-        if n_chunks == 0 {
-            return Err(anyhow!(
-                "perplexity: {} tokens is fewer than one {n_ctx}-token window",
-                tokens.len()
-            ));
-        }
-        const PIECE_ROWS: usize = 128;
-        let vocab = self.cfg.vocab;
-        let first = n_ctx / 2;
-        let want_ctx = n_ctx + 1;
-        let vk = if cpu {
-            None
-        } else {
-            Some(
-                infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
-                    .map_err(|e| anyhow!("vulkan init: {e}"))?,
-            )
-        };
-        let cpu_be = CpuBackend::new_with(self.ecfg.clone());
-        let cpu_bind = crate::seam::cpu_upload_bind(&cpu_be);
-        let vk_bind = match &vk {
-            Some(vk) => Some(crate::seam::vulkan_moe_binder(
-                vk,
-                &*self.weights,
-                &self.cfg,
-                &self.ecfg,
-                true,
-                want_ctx,
-            )?),
-            None => None,
-        };
-        let (be, bind): (&dyn Backend, &crate::seam::BindWeight<'_>) = match (&vk, &vk_bind) {
-            (Some(vk), Some(b)) => (vk, &**b),
-            _ => (&cpu_be, &*cpu_bind),
-        };
-        let mut state: Option<crate::seam::SeamKv> = None;
-        let mut report = PplReport::default();
-        let bos = perplexity_bos(self.weights.metadata()).filter(|&bos| tokens[0] == bos);
-        for chunk in 0..n_chunks {
-            let window = perplexity_window(tokens, chunk, n_ctx, bos);
-            if let Some(st) = state.as_mut() {
-                st.reset();
-            }
-            let mut end = 0;
-            while end < n_ctx - 1 {
-                let start = end;
-                end = (end + PIECE_ROWS).min(n_ctx - 1);
-                let logits = crate::seam::window_logits_rows(
-                    be,
-                    bind,
-                    &*self.weights,
-                    &self.cfg,
-                    &self.ecfg,
-                    self.embd(),
-                    self.per_layer_embd.as_ref(),
-                    &window[..end],
-                    &mut state,
-                    want_ctx,
-                )?;
-                let rows = end - start;
-                if logits.len() != rows * vocab {
-                    return Err(anyhow!(
-                        "perplexity: expected {rows}x{vocab} logits, got {}",
-                        logits.len()
-                    ));
-                }
-                let scored: Vec<f64> = (start.max(first)..end)
-                    .into_par_iter()
-                    .map(|j| {
-                        let row = &logits[(j - start) * vocab..(j - start + 1) * vocab];
-                        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-                        let lse = row
-                            .iter()
-                            .map(|&x| (x as f64 - max).exp())
-                            .sum::<f64>()
-                            .ln();
-                        lse + max - row[window[j + 1] as usize] as f64
-                    })
-                    .collect();
-                for nll in scored {
-                    report.nll_sum += nll;
-                    report.nll_sq += nll * nll;
-                    report.count += 1;
-                }
-            }
-            report.chunks = chunk + 1;
-            on_chunk(chunk + 1, n_chunks, report.ppl());
-        }
-        Ok(report)
-    }
-
     /// [`prefill_logits_cpu`](Self::prefill_logits_cpu)'s Vulkan twin, for the CPU/Vulkan
     /// cross-backend parity check.
     pub fn prefill_logits_vulkan(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         crate::seam::verify_dense_vulkan(
             &vk,
-            &*self.weights,
+            &self.gguf,
+            &self.cfg,
+            &self.ecfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+            tokens,
+        )
+    }
+
+    /// [`verify_logits_and_h_cpu`](Self::verify_logits_and_h_cpu)'s Vulkan twin, logits only:
+    /// every position's next-token logits (`[tokens.len() * vocab]`) from one batched prefill
+    /// forward. Dense non-MoE models only.
+    pub fn verify_logits_vulkan(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
+            .map_err(|e| anyhow!("vulkan init: {e}"))?;
+        crate::seam::verify_rows_vulkan(
+            &vk,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1491,7 +1226,6 @@ impl SeamModel {
         &self,
         max_ctx: usize,
     ) -> Result<DiffusionGemmaVulkanSession> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         Ok(DiffusionGemmaVulkanSession {
@@ -1511,7 +1245,6 @@ impl SeamModel {
         &self,
         max_ctx: usize,
     ) -> Result<DiffusionGemmaMetalSession> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let mtl = infr_metal::MetalBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("metal init: {e}"))?;
         Ok(DiffusionGemmaMetalSession {
@@ -1527,17 +1260,20 @@ impl SeamModel {
     /// directly comparable to `llama-bench -ngl 0`. Dummy tokens — timing is data-independent.
     pub fn bench(&self, n_prompt: usize, n_gen: usize) -> Result<crate::GenStats> {
         let prompt: Vec<u32> = (0..n_prompt.max(1)).map(|i| (i % 100) as u32).collect();
-        let (_, stats) = crate::seam::generate_dense_cpu(
-            &*self.weights,
-            &self.cfg,
-            &self.ecfg,
-            self.embd(),
-            self.per_layer_embd.as_ref(),
-            &prompt,
-            n_gen,
-            None, // req: bench is a sole sequence — env sampling, no abort latch, no gate
-            |_| {},
-        )?;
+        let (_, stats) = self.with_cpu(|res| {
+            crate::seam::generate_dense_cpu(
+                res,
+                &self.gguf,
+                &self.cfg,
+                &self.ecfg,
+                self.embd(),
+                self.per_layer_embd.as_ref(),
+                &prompt,
+                n_gen,
+                None, // req: bench is a sole sequence — env sampling, no abort latch, no gate
+                |_| {},
+            )
+        })?;
         Ok(stats)
     }
 
@@ -1547,13 +1283,12 @@ impl SeamModel {
     /// compiled + executed by `VulkanBackend`; greedy tokens are detokenized. Same graph, two
     /// backends — this is the end-to-end dense CPU↔GPU parity path.
     pub fn generate_dense_vulkan(&self, prompt: &str, max_new: usize) -> Result<String> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan(
             &vk,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1581,12 +1316,11 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan(
             &vk,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1608,11 +1342,10 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
     ) -> Result<String> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_pipeline(
             devices,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1635,10 +1368,9 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_pipeline(
             devices,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1661,11 +1393,10 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
     ) -> Result<String> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_tp(
             devices,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1688,10 +1419,9 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let (generated, _stats) = crate::seam::generate_dense_vulkan_tp(
             devices,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1714,11 +1444,10 @@ impl SeamModel {
         prompt: &str,
         max_new: usize,
     ) -> Result<String> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let (generated, _stats) = crate::seam::generate_moe_vulkan_ep(
             devices,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1741,10 +1470,9 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let (generated, _stats) = crate::seam::generate_moe_vulkan_ep(
             devices,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -1770,7 +1498,6 @@ impl SeamModel {
         pg: Option<(usize, usize)>,
         reps: usize,
     ) -> Result<(Vec<f64>, BenchPlacement)> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let vk = infr_vulkan::VulkanBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("vulkan init: {e}"))?;
         let (p_eff, g_eff) = pg.unwrap_or((n_prompt, n_gen));
@@ -1786,7 +1513,7 @@ impl SeamModel {
          -> Result<crate::GenStats> {
             let (_, stats) = crate::seam::generate_dense_vulkan_session(
                 &vk,
-                &*self.weights,
+                &self.gguf,
                 &self.cfg,
                 &self.ecfg,
                 self.embd(),
@@ -1903,13 +1630,12 @@ impl SeamModel {
     /// later calls prefill only the un-cached suffix.
     #[cfg(target_os = "macos")]
     pub fn metal_session(&self, max_ctx: usize) -> Result<DenseMetalSession> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let mtl = infr_metal::MetalBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("metal init: {e}"))?;
         Ok(DenseMetalSession {
             be: mtl,
             pool: SlotPool::new(),
-            max_ctx,
+            max_ctx: self.session_ctx(max_ctx),
             cfg: self.ecfg.clone(),
             ext: (),
         })
@@ -1944,25 +1670,27 @@ impl SeamModel {
     ) -> Result<crate::GenStats> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let slot = session
             .pool
             .pick(&session.be, &self.cfg, &session.cfg, &prompt_tokens)?;
-        let (_generated, stats) = crate::seam::generate_dense_metal_session(
+        let budget = reply_budget(max_new, session.max_ctx, prompt_tokens.len());
+        let (_generated, mut stats) = crate::seam::generate_dense_metal_session(
             &session.be,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &session.cfg,
             self.embd(),
             self.per_layer_embd.as_ref(),
             &prompt_tokens,
-            max_new,
+            budget,
             |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
             &mut session.pool.slots[slot],
             session.max_ctx,
             constraint,
             req,
         )?;
+        stats.ctx_full = crate::ran_out_of_context(max_new, budget, &stats);
         Ok(stats)
     }
 
@@ -1978,15 +1706,14 @@ impl SeamModel {
         req: Option<&crate::sampling::RequestCtx>,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mtl = infr_metal::MetalBackend::new_with(self.ecfg.clone())
             .map_err(|e| anyhow!("metal init: {e}"))?;
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let (_generated, stats) = crate::seam::generate_dense_metal(
             &mtl,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -2021,8 +1748,6 @@ impl SeamModel {
         k: usize,
         mut on_piece: impl FnMut(&str),
     ) -> Result<crate::GenStats> {
-        crate::qwen4_exp::ensure_forward_supported(&self.cfg)?;
-        crate::qwen4_exp::ensure_forward_supported(&draft.cfg)?;
         let sampler = crate::sampling::Sampler::from_cfg(&self.ecfg.sampling);
         if sampler.temp > 0.0 {
             return Err(anyhow!(
@@ -2063,10 +1788,10 @@ impl SeamModel {
         // verify forwards are only for the small k+1 suffixes.
         let t0 = std::time::Instant::now();
         let mut acc_buf: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
+        let mut printed = crate::StreamOffsets::default();
         let (first, _stats) = crate::seam::generate_dense_metal_session(
             &session.be,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &session.cfg,
             self.embd(),
@@ -2121,7 +1846,7 @@ impl SeamModel {
             let td = std::time::Instant::now();
             let (cand, _) = crate::seam::generate_dense_metal_session(
                 &draft_session.be,
-                draft.weights(),
+                &draft.gguf,
                 &draft.cfg,
                 &draft_session.cfg,
                 draft.embd(),
@@ -2149,7 +1874,7 @@ impl SeamModel {
             let tv = std::time::Instant::now();
             let (logits, vstats) = crate::seam::verify_dense_metal2(
                 &session.be,
-                &*self.weights,
+                &self.gguf,
                 &self.cfg,
                 &session.cfg,
                 self.embd(),
@@ -2207,6 +1932,9 @@ impl SeamModel {
             prompt_secs,
             n_gen: out.len(),
             decode_secs: t1.elapsed().as_secs_f64(),
+            n_cached: 0,
+            ctx_full: false,
+            natural_stop: false,
         })
     }
 
@@ -2238,7 +1966,7 @@ impl SeamModel {
         let _profile_guard = (!profile).then(|| session.be.suppress_profiling());
         let (_, stats) = crate::seam::generate_dense_metal_session(
             &session.be,
-            &*self.weights,
+            &self.gguf,
             &self.cfg,
             &session.cfg,
             self.embd(),
@@ -2258,14 +1986,8 @@ impl SeamModel {
     /// Qwen, … — answers coherently). Errors if the GGUF has no `tokenizer.chat_template` or it fails
     /// to render — infr only supports models that ship one (no fabricated-ChatML fallback).
     pub fn render_chat(&self, user: &str) -> Result<String> {
-        render_chat_user(
-            &*self.weights,
-            &self.tokenizer,
-            self.cfg.eos,
-            user,
-            &self.ecfg,
-        )
-        .ok_or_else(no_template_err)
+        render_chat_user(&self.gguf, &self.tokenizer, self.cfg.eos, user, &self.ecfg)
+            .ok_or_else(no_template_err)
     }
 
     /// Render a multi-turn conversation `(role, content)` through the model's OWN embedded chat
@@ -2274,7 +1996,7 @@ impl SeamModel {
     /// [`render_chat`](Self::render_chat), generalized past a single user turn.
     pub fn render_chat_messages(&self, messages: &[(&str, &str)]) -> Result<String> {
         render_chat_jinja(
-            &*self.weights,
+            &self.gguf,
             &self.tokenizer,
             self.cfg.eos,
             messages,
@@ -2311,29 +2033,32 @@ impl SeamModel {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         // Stream each generated token: incrementally detokenize and emit the new suffix.
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
-        let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
-            infr_cpu::CpuBackend::new_with(self.ecfg.clone()),
-            &*self.weights,
-            &self.cfg,
-            &self.ecfg,
-            self.embd(),
-            self.per_layer_embd.as_ref(),
-            &prompt_tokens,
-            max_new,
-            constraint,
-            req,
-            |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
-        )?;
+        let mut printed = crate::StreamOffsets::default();
+        let (_generated, stats) = self.with_cpu(|res| {
+            crate::seam::generate_dense_cpu_mode(
+                res,
+                &self.gguf,
+                &self.cfg,
+                &self.ecfg,
+                self.embd(),
+                self.per_layer_embd.as_ref(),
+                &prompt_tokens,
+                max_new,
+                constraint,
+                req,
+                |id| stream_token(&self.tokenizer, &mut acc, &mut printed, id, &mut on_piece),
+            )
+        })?;
         Ok(stats)
     }
 
     /// [`Self::generate_cpu`] on the REFERENCE CPU backend ([`infr_cpu::CpuBackend::reference`]):
     /// quantized weights are decoded to f32 and dotted in f32, so the run carries the weight's own
     /// quantization error and nothing else. The production path quantizes ACTIVATIONS to int8
-    /// (llama.cpp's `vec_dot_*_q8_K` regime) at ~4e-3 relative error, which is invisible at Q4_K+
-    /// but flips greedy tokens at Q2_K — so this, not `generate_cpu`, is the oracle a GPU-vs-CPU
-    /// token comparison must be scored against. Slower; not what the CPU goldens pin.
+    /// (llama.cpp's `vec_dot_*_q8_K` regime) at ~4e-3 relative error. That flips greedy tokens at
+    /// Q2_K, and at Q4_K it can still flip a near tie (ERNIE 4.5 0.3B Q4_K_M, B167) — so this, not
+    /// `generate_cpu`, is the oracle a GPU-vs-CPU token comparison must be scored against, on a
+    /// prompt whose margins clear that error. Slower; not what the CPU goldens pin.
     pub fn generate_cpu_reference(
         &self,
         prompt: &str,
@@ -2343,10 +2068,18 @@ impl SeamModel {
     ) -> Result<crate::GenStats> {
         let prompt_tokens: Vec<u32> = self.encode(prompt)?;
         let mut acc: Vec<u32> = Vec::new();
-        let mut printed = 0usize;
-        let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
+        let mut printed = crate::StreamOffsets::default();
+        // Its own resident, dropped with the call: the oracle is not a serving path, and its
+        // backend runs a different mode from the model's kept one.
+        let mut res = crate::seam::CpuResident::open(
             infr_cpu::CpuBackend::reference_with(self.ecfg.clone()),
-            &*self.weights,
+            &self.ecfg,
+            &self.gguf,
+            &self.cfg,
+        )?;
+        let (_generated, stats) = crate::seam::generate_dense_cpu_mode(
+            &mut res,
+            &self.gguf,
             &self.cfg,
             &self.ecfg,
             self.embd(),
@@ -2370,17 +2103,20 @@ impl SeamModel {
         max_new: usize,
         on_id: impl FnMut(u32),
     ) -> Result<Vec<u32>> {
-        let (generated, _stats) = crate::seam::generate_dense_cpu(
-            &*self.weights,
-            &self.cfg,
-            &self.ecfg,
-            self.embd(),
-            self.per_layer_embd.as_ref(),
-            prompt_tokens,
-            max_new,
-            None, // req: token-identity checks are a sole sequence — env sampling, no gate
-            on_id,
-        )?;
+        let (generated, _stats) = self.with_cpu(|res| {
+            crate::seam::generate_dense_cpu(
+                res,
+                &self.gguf,
+                &self.cfg,
+                &self.ecfg,
+                self.embd(),
+                self.per_layer_embd.as_ref(),
+                prompt_tokens,
+                max_new,
+                None, // req: token-identity checks are a sole sequence — env sampling, no gate
+                on_id,
+            )
+        })?;
         Ok(generated)
     }
 }
@@ -2427,7 +2163,7 @@ impl DiffusionGemmaCpuSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &*model.weights,
+            &model.gguf,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2468,7 +2204,7 @@ impl DiffusionGemmaCpuSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &*model.weights,
+            &model.gguf,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2509,7 +2245,7 @@ impl DiffusionGemmaVulkanSession {
         let _scope = crate::seam::PlacementScope::enter(self.pins.clone());
         let bind = crate::seam::vulkan_moe_binder(
             &self.be,
-            &*model.weights,
+            &model.gguf,
             &model.cfg,
             &model.ecfg,
             self.state.is_none(),
@@ -2518,7 +2254,7 @@ impl DiffusionGemmaVulkanSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &*model.weights,
+            &model.gguf,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2569,7 +2305,7 @@ impl DiffusionGemmaVulkanSession {
         // make the same placement decision prefill would have.
         let bind = crate::seam::vulkan_moe_binder(
             &self.be,
-            &*model.weights,
+            &model.gguf,
             &model.cfg,
             &model.ecfg,
             self.state.is_none(),
@@ -2578,7 +2314,7 @@ impl DiffusionGemmaVulkanSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &*model.weights,
+            &model.gguf,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2627,7 +2363,7 @@ impl DiffusionGemmaMetalSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &*model.weights,
+            &model.gguf,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2662,7 +2398,7 @@ impl DiffusionGemmaMetalSession {
         crate::seam::generate_dense_backend(
             &self.be,
             &*bind,
-            &*model.weights,
+            &model.gguf,
             &model.cfg,
             &model.ecfg,
             model.embd(),
@@ -2815,57 +2551,57 @@ pub(crate) fn spec_accept_stochastic(
     (cand.len(), bonus)
 }
 
-fn perplexity_bos(md: &infr_core::loader::Metadata) -> Option<u32> {
-    use infr_core::loader::MetaValue;
-    let add = match md.get("tokenizer.ggml.add_bos_token") {
-        Some(MetaValue::Bool(b)) => *b,
-        _ => md.str("tokenizer.ggml.model") == Some("llama"),
+/// Say once, at load, that [`Config::faithful_ctx_limit`] lowers the context this model would
+/// otherwise get: an explicit `--ctx`/`INFR_CTX` token count above the cap, or — with none — the
+/// file's trained context, which is what the default asks for before the VRAM fit. A percentage
+/// is sized against free VRAM at session open, so it is only named, not compared.
+fn warn_ctx_cap(cfg: &Config, ecfg: &crate::EngineConfig) {
+    let Some(limit) = cfg.faithful_ctx_limit() else {
+        return;
     };
-    add.then(|| {
-        md.u64("tokenizer.ggml.bos_token_id")
-            .and_then(|n| u32::try_from(n).ok())
-    })
-    .flatten()
+    let asked = match crate::chat::cfg_ctx_spec(ecfg) {
+        Some(infr_core::SizeSpec::Bytes(c)) => Some((c as usize, "the requested context")),
+        Some(infr_core::SizeSpec::Percent(_)) => None,
+        None => Some((cfg.n_ctx_train, "the trained context")),
+    };
+    let lowered = asked.filter(|&(ctx, _)| ctx > limit);
+    if asked.is_none() || lowered.is_some() {
+        let what = lowered.map_or("a VRAM-fraction context".to_string(), |(ctx, w)| {
+            format!("{w} {ctx}")
+        });
+        tracing::warn!(
+            "ctx cap: {what} -> at most {limit} tokens: past that this model's reference changes \
+             its attention (a position-dependent temperature; on llama4 also chunking) in a way \
+             infr does not implement"
+        );
+    }
 }
 
-fn perplexity_window(tokens: &[u32], chunk: usize, n_ctx: usize, bos: Option<u32>) -> Vec<u32> {
-    let mut window = tokens[chunk * n_ctx..(chunk + 1) * n_ctx].to_vec();
-    if let Some(bos) = bos {
-        window[0] = bos;
-    }
-    window
+/// Cap a reply of up to `max_new` tokens to the context a `prompt_len`-token prompt leaves in a
+/// `max_ctx` window ("a turn also caps to remaining context" — a generation ceiling is a default,
+/// not a demand): a VRAM-clamped default session (e.g. a 21.9 GB model on a 24 GB card clamps
+/// 262k -> ~1.7k) would otherwise hard-error on `infr run`'s default `max_new` before generating
+/// a single token. EOS ends almost every reply long before this cap; an over-long PROMPT still
+/// errors cleanly in the runner (its `prompt + gen + 1 > max_ctx` guard stays).
+pub(crate) fn reply_budget(max_new: usize, max_ctx: usize, prompt_len: usize) -> usize {
+    max_new.min(max_ctx.saturating_sub(prompt_len + 1))
 }
 
 #[cfg(test)]
-mod perplexity_window_tests {
-    use super::*;
+mod reply_budget_tests {
+    use super::reply_budget;
 
+    /// B87: the cap the session paths share — a reply that fits is untouched, one that does not
+    /// is cut to what the runner's `prompt + gen + 1 <= max_ctx` guard accepts, and a prompt that
+    /// fills the window leaves nothing (one past it is the runner's overflow error to report).
     #[test]
-    fn no_bos_preserves_later_windows_first_tokens() {
-        let tokens = [11, 12, 13, 14, 21, 22, 23, 24];
-        assert_eq!(perplexity_window(&tokens, 1, 4, None), [21, 22, 23, 24]);
-        assert_eq!(perplexity_window(&tokens, 0, 4, None), [11, 12, 13, 14]);
-    }
-
-    #[test]
-    fn bos_models_replace_only_the_windows_prefix() {
-        let tokens = [1, 12, 13, 14, 21, 22, 23, 24];
-        assert_eq!(perplexity_window(&tokens, 1, 4, Some(1)), [1, 22, 23, 24]);
-        let mut md = infr_core::loader::Metadata::default();
-        md.kv.insert(
-            "tokenizer.ggml.bos_token_id".into(),
-            infr_core::loader::MetaValue::U64(1),
-        );
-        md.kv.insert(
-            "tokenizer.ggml.add_bos_token".into(),
-            infr_core::loader::MetaValue::Bool(false),
-        );
-        assert_eq!(perplexity_bos(&md), None);
-        md.kv.insert(
-            "tokenizer.ggml.add_bos_token".into(),
-            infr_core::loader::MetaValue::Bool(true),
-        );
-        assert_eq!(perplexity_bos(&md), Some(1));
+    fn a_reply_is_capped_to_the_context_left() {
+        assert_eq!(reply_budget(16, 4096, 100), 16);
+        let capped = reply_budget(2048, 512, 100);
+        assert_eq!(capped, 411);
+        assert!(100 + capped < 512);
+        assert_eq!(reply_budget(2048, 512, 511), 0);
+        assert_eq!(reply_budget(2048, 512, 600), 0);
     }
 }
 

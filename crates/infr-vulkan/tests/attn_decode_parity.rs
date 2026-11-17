@@ -428,7 +428,7 @@ struct Legs {
     replay: Vec<u32>,
 }
 
-fn run_shape(be: &VulkanBackend, s: &Shape, decode: bool) -> Legs {
+fn run_shape(be: &VulkanBackend, s: &Shape) -> Legs {
     let (kv_len, nh, nkv, hd, chunk) = (s.kv_len, s.nh, s.nkv, s.hd, s.chunk);
     let pos = kv_len - 1; // rows == 1: the decode query is position kv_len-1
     let cache_elems = s.rows_alloc() * nkv * hd;
@@ -495,111 +495,17 @@ fn run_shape(be: &VulkanBackend, s: &Shape, decode: bool) -> Legs {
         cap,
         false, // batched
         None,  // kv_ml
-        None,  // pages
     );
     rec.finish().unwrap();
     let stat = bits(o_stat.as_ref());
 
-    // ── paged leg ────────────────────────────────────────────────────────────────────────────
-    // The same KV, physically shuffled at page granularity and read back through a page table. The
-    // table must be transparent: one compare per key, same bits. Only a linear cache carries the
-    // mapping (the `-DRING` builds keep `j % rcap` and never read the words), AND only the
-    // `attn_decode` pass-1 declares the paging words — the bound-SSBO reference kernel is a 15-word
-    // push, so it must not be exercised here.
-    if decode && s.cap() == 0 {
-        let page_rows = 512usize.max(chunk.next_power_of_two());
-        let rows = s.rows_alloc();
-        let full = rows / page_rows;
-        if full > 1 {
-            let row_bytes = nkv * hd * 2;
-            let mut kbuf = vec![0u8; cache_elems * 2];
-            let mut vbuf = vec![0u8; cache_elems * 2];
-            be.download(kb.as_ref(), &mut kbuf).unwrap();
-            be.download(vb.as_ref(), &mut vbuf).unwrap();
-            // The partial tail page keeps its own slot, so every permuted page is exactly
-            // `page_rows` long. Three legs: the identity proves the plumbing (push words, BDA base,
-            // lookahead entry), the reversal proves the mapping, and the zero-table leg proves the
-            // words are LIVE — a contiguous buffer with a table that says "every page is page 0"
-            // must not reproduce the contiguous result.
-            let identity: Vec<usize> = (0..=full).collect();
-            let mut reversed: Vec<usize> = (0..full).rev().collect();
-            reversed.push(full);
-            let legs = [
-                ("identity", identity.clone(), identity.clone(), false),
-                ("reversed", reversed.clone(), reversed.clone(), false),
-                ("zero-table", identity, vec![0usize; full + 1], true),
-            ];
-            for (tag, perm, table_seed, expect_differs) in legs {
-                let mut kp = vec![0u8; cache_elems * 2];
-                let mut vp = vec![0u8; cache_elems * 2];
-                for (p, &q) in perm.iter().enumerate() {
-                    let n = page_rows.min(rows - p * page_rows) * row_bytes;
-                    let src = p * page_rows * row_bytes;
-                    let dst = q * page_rows * row_bytes;
-                    kp[dst..dst + n].copy_from_slice(&kbuf[src..src + n]);
-                    vp[dst..dst + n].copy_from_slice(&vbuf[src..src + n]);
-                }
-                let kpb = be.alloc(cache_elems * 2, BufferUsage::KvCache).unwrap();
-                let vpb = be.alloc(cache_elems * 2, BufferUsage::KvCache).unwrap();
-                be.upload(kpb.as_ref(), &kp).unwrap();
-                be.upload(vpb.as_ref(), &vp).unwrap();
-                let mut table: Vec<u32> = table_seed.iter().map(|&p| p as u32).collect();
-                let last = *table.last().unwrap();
-                table.push(last);
-                let tb = be.alloc(table.len() * 4, BufferUsage::KvCache).unwrap();
-                be.upload(tb.as_ref(), bytemuck::cast_slice(&table))
-                    .unwrap();
-                let ta = tb.device_addr().expect("page table device address");
-                let o_page = be.alloc(o_bytes, BufferUsage::Activations).unwrap();
-                let rec = be.recorder().unwrap();
-                rec.attention_kv_split_at(
-                    qb.as_ref(),
-                    kpb.as_ref(),
-                    vpb.as_ref(),
-                    kpb.device_addr().unwrap(),
-                    vpb.device_addr().unwrap(),
-                    o_page.as_ref(),
-                    pm.as_ref(),
-                    pl.as_ref(),
-                    pacc.as_ref(),
-                    1, // rows
-                    pos,
-                    kv_len,
-                    nh,
-                    nkv,
-                    hd,
-                    chunk,
-                    n_chunks,
-                    s.scale,
-                    s.window,
-                    None,  // canvas_lo
-                    false, // k f16
-                    false, // v f16
-                    cap,
-                    false, // batched
-                    None,  // kv_ml
-                    Some((ta, page_rows as u32)),
-                );
-                rec.finish().unwrap();
-                let same = stat == bits(o_page.as_ref());
-                assert_eq!(
-                    same, !expect_differs,
-                    "{}: the {tag} page table leg disagrees (same = {same})",
-                    s.label
-                );
-            }
-        }
-    }
-
     // ── record-once replay path ──────────────────────────────────────────────────────────────
-    // `[pos, kv_len, table_lo, table_hi, row_base, _]` — words 2-3 are the paged K/V table
-    // address and word 4 the row base (0 = linear).
-    let params = be.alloc(24, BufferUsage::Activations).unwrap();
-    let mut pb = [0u32; 6];
-    pb[0] = pos as u32;
-    pb[1] = kv_len as u32;
-    be.upload(params.as_ref(), bytemuck::cast_slice(&pb))
-        .unwrap();
+    let params = be.alloc(8, BufferUsage::Activations).unwrap();
+    be.upload(
+        params.as_ref(),
+        bytemuck::cast_slice(&[pos as u32, kv_len as u32]),
+    )
+    .unwrap();
     let args = be.alloc(16, BufferUsage::Activations).unwrap();
     let o_rep = be.alloc(o_bytes, BufferUsage::Activations).unwrap();
     let rec = be.recorder().unwrap();
@@ -625,7 +531,6 @@ fn run_shape(be: &VulkanBackend, s: &Shape, decode: bool) -> Legs {
         s.window,
         false, // q8
         cap,
-        0, // page_rows: linear cache
     );
     rec.finish().unwrap();
     let replay = bits(o_rep.as_ref());
@@ -633,30 +538,20 @@ fn run_shape(be: &VulkanBackend, s: &Shape, decode: bool) -> Legs {
 }
 
 /// A backend whose config differs from the default in nothing but the fast-path knob, so the two
-/// legs go through the production selector rather than a test-only entry point.
+/// legs go through the production selector rather than a test-only entry point. The device is
+/// still the one `INFR_DEV` names.
 fn backend(attn_decode: bool) -> Option<VulkanBackend> {
-    backend_with(attn_decode, Some(false))
-}
-
-fn backend_with(attn_decode: bool, gqa: Option<bool>) -> Option<VulkanBackend> {
     let mut cfg = Config::default();
+    let env = infr_core::config::ConfigLayer::env().expect("test environment config");
+    cfg.device.dev = Config::load_from_layers(&[env]).device.dev;
     cfg.kernels.vulkan.attn_decode = attn_decode;
-    cfg.kernels.vulkan.attn_decode_gqa = gqa;
-    VulkanBackend::new_with(Arc::new(cfg)).ok()
+    infr_testkit::honour_env(&mut cfg);
+    infr_testkit::gpu_or_skip(VulkanBackend::new_with(Arc::new(cfg)))
 }
 
 fn run_all(attn_decode: bool) -> Option<(Vec<Legs>, Vec<&'static str>)> {
     let be = backend(attn_decode)?;
-    let out = SHAPES
-        .iter()
-        .map(|s| run_shape(&be, s, attn_decode))
-        .collect();
-    Some((out, be.built_kernel_names()))
-}
-
-fn run_all_gqa(gqa: bool) -> Option<(Vec<Legs>, Vec<&'static str>)> {
-    let be = backend_with(true, Some(gqa))?;
-    let out = SHAPES.iter().map(|s| run_shape(&be, s, true)).collect();
+    let out = SHAPES.iter().map(|s| run_shape(&be, s)).collect();
     Some((out, be.built_kernel_names()))
 }
 
@@ -701,198 +596,10 @@ fn compare(want: &[u32], got: &[u32], hd: usize, what: &str) {
     }
 }
 
-struct SmallShape {
-    hd: usize,
-    rows: usize,
-    pos: usize,
-    window: usize,
-    ring_rows: usize,
-    chunk: usize,
-    paged: bool,
-}
-
-fn small_bits(be: &VulkanBackend, s: &SmallShape, specialized: bool) -> Vec<u32> {
-    let (nh, nkv) = (8usize, 2usize);
-    let kv_len = s.pos + s.rows;
-    let row_bytes = nkv * s.hd * 2;
-    let cache_rows = if s.ring_rows > 0 {
-        s.ring_rows
-    } else if s.paged {
-        kv_len.div_ceil(512) * 512
-    } else {
-        kv_len
-    };
-    let cache_bytes = cache_rows * row_bytes;
-    let q = be
-        .alloc(s.rows * nh * s.hd * 2, BufferUsage::Activations)
-        .unwrap();
-    let k = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
-    let v = be.alloc(cache_bytes, BufferUsage::KvCache).unwrap();
-    be.upload(q.as_ref(), &f16_data(s.rows * nh * s.hd, 0x93a))
-        .unwrap();
-    let mut kd = f16_data(cache_rows * nkv * s.hd, 0x13b);
-    let mut vd = f16_data(cache_rows * nkv * s.hd, 0x71d);
-    let table = if s.paged {
-        let pages = cache_rows / 512;
-        let page_bytes = 512 * row_bytes;
-        let ks = kd.clone();
-        let vs = vd.clone();
-        let mut ids = Vec::with_capacity(pages + 1);
-        for logical in 0..pages {
-            let physical = pages - 1 - logical;
-            let src = logical * page_bytes;
-            let dst = physical * page_bytes;
-            kd[dst..dst + page_bytes].copy_from_slice(&ks[src..src + page_bytes]);
-            vd[dst..dst + page_bytes].copy_from_slice(&vs[src..src + page_bytes]);
-            ids.push(physical as u32);
-        }
-        ids.push(*ids.last().unwrap());
-        let t = be.alloc(ids.len() * 4, BufferUsage::KvCache).unwrap();
-        be.upload(t.as_ref(), bytemuck::cast_slice(&ids)).unwrap();
-        Some(t)
-    } else {
-        None
-    };
-    be.upload(k.as_ref(), &kd).unwrap();
-    be.upload(v.as_ref(), &vd).unwrap();
-    let base = if s.window > 0 {
-        (s.pos + 1).saturating_sub(s.window)
-    } else {
-        0
-    };
-    let n_chunks = (kv_len - base).div_ceil(s.chunk);
-    let parts = s.rows * nh * n_chunks;
-    let pm = be.alloc(parts * 4, BufferUsage::Activations).unwrap();
-    let pl = be.alloc(parts * 4, BufferUsage::Activations).unwrap();
-    let pa = be
-        .alloc(parts * s.hd * 4, BufferUsage::Activations)
-        .unwrap();
-    let o = be
-        .alloc(s.rows * nh * s.hd * 4, BufferUsage::Activations)
-        .unwrap();
-    let rec = be.recorder().unwrap();
-    rec.attention_kv_split_at(
-        q.as_ref(),
-        k.as_ref(),
-        v.as_ref(),
-        k.device_addr().unwrap(),
-        v.device_addr().unwrap(),
-        o.as_ref(),
-        pm.as_ref(),
-        pl.as_ref(),
-        pa.as_ref(),
-        s.rows,
-        s.pos,
-        kv_len,
-        nh,
-        nkv,
-        s.hd,
-        s.chunk,
-        n_chunks,
-        0.0,
-        s.window,
-        None,
-        false,
-        false,
-        cache_rows * nkv * s.hd,
-        false,
-        None,
-        table.as_ref().map(|t| (t.device_addr().unwrap(), 512u32)),
-    );
-    let suffix = if s.window > 0 { "_swa" } else { "" };
-    let name = format!("attn_small_m_hd{}{suffix}", s.hd);
-    assert_eq!(
-        be.built_kernel_names().contains(&name.as_str()),
-        specialized,
-        "{name}: unexpected selector result"
-    );
-    rec.finish().unwrap();
-    let mut out = vec![0u8; s.rows * nh * s.hd * 4];
-    be.download(o.as_ref(), &mut out).unwrap();
-    bytemuck::cast_slice(&out).to_vec()
-}
-
+/// The host-only half of [`attn_decode_is_bit_identical_to_attn_partial`], split out so it runs
+/// on runners with no device.
 #[test]
-fn attn_small_prefill_is_bit_identical_to_attn_partial() {
-    let Some(fast) = backend(true) else { return };
-    let Some(reference) = backend(false) else {
-        return;
-    };
-    for hd in [128, 256, 512] {
-        for (rows, pos, window, ring_rows, chunk, paged) in [
-            (2, 0, 0, 0, 1, false),
-            (4, 4096, 0, 0, 128, false),
-            (7, 509, 0, 0, 256, true),
-            (4, 1534, 512, 1536, 128, false),
-            (4, 4096, 512, 1536, 128, false),
-            (8, 4096, 1, 1536, 1, false),
-            (4, 4096, 700, 1536, 256, false),
-        ] {
-            let s = SmallShape {
-                hd,
-                rows,
-                pos,
-                window,
-                ring_rows,
-                chunk,
-                paged,
-            };
-            let want = small_bits(&reference, &s, false);
-            let got = small_bits(&fast, &s, true);
-            let label =
-                format!("small hd={hd} rows={rows} pos={pos} window={window} paged={paged}");
-            assert_real_signal(&want, &label);
-            compare(&want, &got, hd, &label);
-        }
-    }
-    let names = fast.built_kernel_names();
-    for name in [
-        "attn_small_m_hd128",
-        "attn_small_m_hd128_swa",
-        "attn_small_m_hd256",
-        "attn_small_m_hd256_swa",
-        "attn_small_m_hd512",
-        "attn_small_m_hd512_swa",
-    ] {
-        assert!(names.contains(&name), "missing small-row kernel {name}");
-    }
-    assert!(names.iter().all(|n| !n.starts_with("attn_partial")));
-    assert!(reference
-        .built_kernel_names()
-        .iter()
-        .all(|n| !n.starts_with("attn_small_m")));
-}
-
-#[test]
-fn attn_small_prefill_specialization_limits() {
-    for (rows, pos, ring_rows, specialized) in [
-        (4, 1020, 1024, true),
-        (4, 1021, 1024, false),
-        (9, 4096, 0, false),
-    ] {
-        let Some(fast) = backend(true) else { return };
-        let Some(reference) = backend(false) else {
-            return;
-        };
-        let s = SmallShape {
-            hd: 128,
-            rows,
-            pos,
-            window: 0,
-            ring_rows,
-            chunk: 128,
-            paged: false,
-        };
-        let want = small_bits(&reference, &s, false);
-        let got = small_bits(&fast, &s, specialized);
-        let label = format!("selector rows={rows} pos={pos} cap={ring_rows}");
-        assert_real_signal(&want, &label);
-        compare(&want, &got, s.hd, &label);
-    }
-}
-
-#[test]
-fn attn_decode_is_bit_identical_to_attn_partial() {
+fn attn_decode_shape_table_exercises_wrapped_rings() {
     // Shape-table sanity, so a typo cannot make a case silently weaker than it reads: every ring
     // shape must actually have WRAPPED, and its row count must cover the window (a ring shorter
     // than its window would be recycling live positions, which is a broken configuration rather
@@ -926,7 +633,11 @@ fn attn_decode_is_bit_identical_to_attn_partial() {
             "no wrapped-ring shape at hd {hd} — that build's row map would go unverified"
         );
     }
+}
 
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn attn_decode_is_bit_identical_to_attn_partial() {
     // Reference FIRST, then drop its backend: each leg allocates a 32768-row f16 KV cache, and
     // holding two devices' worth at once is pure waste when the outputs are plain host Vecs.
     let Some((want, ref_kernels)) = run_all(false) else {
@@ -995,51 +706,4 @@ fn attn_decode_is_bit_identical_to_attn_partial() {
         SHAPES.len(),
         want_fast.len()
     );
-}
-
-/// The GQA-batched pass 1 (`attn_decode_gqa.comp`) is not bit-identical to `attn_decode` (it sums
-/// in a different order), so it is held to an absolute tolerance on outputs bounded by 1.
-#[test]
-#[ignore = "requires a wave64 Vulkan GPU"]
-fn attn_decode_gqa_matches_attn_decode() {
-    let Some((want, ref_kernels)) = run_all_gqa(false) else {
-        eprintln!("skip: no Vulkan device");
-        return;
-    };
-    let (got, gqa_kernels) = run_all_gqa(true).expect("second backend");
-    if !gqa_kernels.iter().any(|k| k.starts_with("attn_decode_gqa")) {
-        eprintln!("skip: device cannot run the GQA kernel (needs a pinnable 64-wide subgroup)");
-        return;
-    }
-    assert!(
-        !ref_kernels.iter().any(|k| k.starts_with("attn_decode_gqa")),
-        "attn_decode_gqa=false still built a GQA kernel: {ref_kernels:?}"
-    );
-    let mut covered = 0usize;
-    for (i, s) in SHAPES.iter().enumerate() {
-        let g = s.nh / s.nkv;
-        let batched = s.nh % s.nkv == 0 && (g == 4 || g == 8);
-        for (leg, w, o) in [
-            ("static", &want[i].stat, &got[i].stat),
-            ("replay", &want[i].replay, &got[i].replay),
-        ] {
-            assert_real_signal(w, s.label);
-            let mut worst = 0f32;
-            for (a, b) in w.iter().zip(o) {
-                let (a, b) = (f32::from_bits(*a), f32::from_bits(*b));
-                worst = worst.max((a - b).abs());
-            }
-            assert!(
-                worst <= 1e-4,
-                "{} [{leg}]: GQA vs attn_decode max abs diff {worst}",
-                s.label
-            );
-            if !batched {
-                assert!(worst == 0.0, "{} [{leg}]: unbatched shape changed", s.label);
-            }
-        }
-        covered += batched as usize;
-    }
-    assert!(covered > 0, "no shape reached the GQA kernel");
-    eprintln!("attn_decode_gqa within 1e-4 of attn_decode on {covered} batched shapes");
 }

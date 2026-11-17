@@ -73,8 +73,8 @@ pub enum Grammar {
 
 /// What a BAD value does in the ENVIRONMENT layer today — which R1 freezes.
 ///
-/// Most keys swallow it (`.and_then(parse).ok().unwrap_or(default)`); five reject it loudly and
-/// must keep doing so. The FILE layer is stricter for everyone: a value that does not parse into
+/// Most keys swallow it (`.and_then(parse).ok().unwrap_or(default)`); six reject it loudly and
+/// must keep doing so (`INFR_TUNE` among them, strict from the day it was added). The FILE layer is stricter for everyone: a value that does not parse into
 /// a known key's type is always a hard error there, which is why `ctx = "banana"` fails to load
 /// from a file while `INFR_CTX=banana` is still silently ignored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,16 +152,14 @@ knobs! {
     "INFR_KV_OVERFLOW"          => "kv.overflow",            Flag,        Ignored, "1",    migrated;
     "INFR_KV_OVERFLOW_VRAM_MB"  => "kv.overflow_vram_mb",    Mib,         Ignored, "512",  migrated;
     "INFR_KV_OVERFLOW_RESERVE_MB" => "kv.overflow_reserve_mb", Mib,       Ignored, "128",  migrated;
-    "INFR_KV_STORE_MB"          => "kv.store_mb",           Mib,         Ignored, "1024", migrated;
-    "INFR_KV_PAGED"             => "kv.paged",              Flag,        Ignored, "1",    migrated;
 
     // ── paging ───────────────────────────────────────────────────────────────
     "INFR_CACHE"                => "paging.cache",                     Size,     Ignored, "8g",  migrated;
     "INFR_PAGER_RING"           => "paging.ring",                      Size,     Ignored, "1g",  migrated;
     "INFR_PAGER_STATS"          => "paging.stats",                     Presence, Ignored, "1",   migrated;
+    "INFR_PAGER_TRACE"          => "paging.trace",                     Path,     Ignored, "/tmp/p.trace", migrated;
     "INFR_DRAM_CACHE"           => "paging.dram",                      Size,     Ignored, "8g",  migrated;
     "INFR_DRAM_BYPASS"          => "paging.dram_bypass",               Flag,     Ignored, "1",   migrated;
-    "INFR_RELEASE_UPLOADED_PAGES" => "paging.release_uploaded_pages",  Flag,     Ignored, "1",   migrated;
     "INFR_LAYER_MAJOR"          => "paging.layer_major",               TriState, Ignored, "1",   migrated;
 
     // ── kernels.vulkan — coopmat / capability masking ────────────────────────
@@ -172,8 +170,11 @@ knobs! {
     "INFR_F8_PREPACK"   => "kernels.vulkan.f8_prepack",   Presence,    Ignored, "1", migrated;
     "INFR_I8_COOPMAT"   => "kernels.vulkan.i8_coopmat",   Presence,    Ignored, "1", migrated;
     "INFR_I8_ROW_SCALE" => "kernels.vulkan.i8_row_scale", Presence,    Ignored, "1", migrated;
+    "INFR_NO_I8CM_KQ"   => "kernels.vulkan.i8cm_kq",      PresenceInv, Ignored, "1", migrated;
+    "INFR_NO_DP4A_KQ"   => "kernels.vulkan.dp4a_kq",      PresenceInv, Ignored, "1", migrated;
     "INFR_NO_F16"       => "kernels.vulkan.f16",          PresenceInv, Ignored, "1", migrated;
     "INFR_NO_I8DOT"     => "kernels.vulkan.i8_dot",       PresenceInv, Ignored, "1", migrated;
+    "INFR_FORCE_WAVE64" => "kernels.vulkan.force_wave64", Presence,    Ignored, "1", migrated;
 
     // ── kernels.vulkan — GEMM / GEMV tiers ───────────────────────────────────
     "INFR_NO_GEMM_WARP"     => "kernels.vulkan.gemm_warp",      PresenceInv, Ignored, "1",  migrated;
@@ -183,14 +184,8 @@ knobs! {
     "INFR_NO_BM16"          => "kernels.vulkan.bm16",           PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MMQ"           => "kernels.vulkan.mmq",            PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MMQ_FALLBACK"  => "kernels.vulkan.mmq_fallback",   PresenceInv, Ignored, "1",  migrated;
-    "INFR_KQ_FMA_TIER"      => "kernels.vulkan.kq_fma_tier",    TriState,    Ignored, "1",  migrated;
-    "INFR_KQ_FMA_SPLITK"    => "kernels.vulkan.kq_fma_splitk",  Int,         Ignored, "4",  migrated;
-    "INFR_KQ_FMA_GEMV"      => "kernels.vulkan.kq_fma_gemv",    TriState,    Ignored, "1",  migrated;
-    "INFR_WAVE64_NATIVE"    => "kernels.vulkan.wave64_native",  SetNotZero,  Ignored, "1",  migrated;
-    "INFR_WEIGHTS_AS_SSBO"  => "kernels.vulkan.weights_as_ssbo", SetNotZero, Ignored, "1",  migrated;
     "INFR_NO_MMV"           => "kernels.vulkan.mmv",            PresenceInv, Ignored, "1",  migrated;
     "INFR_MMV_DECODE"       => "kernels.vulkan.mmv_decode",     Presence,    Ignored, "1",  migrated;
-    "INFR_NO_MMV_Q4K_META"  => "kernels.vulkan.mmv_q4k_meta",   PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MMV_M4"        => "kernels.vulkan.mmv_m4",         PresenceInv, Ignored, "1",  migrated;
     "INFR_NO_MMV_O4"        => "kernels.vulkan.mmv_o4",         PresenceInv, Ignored, "1",  migrated;
     "INFR_MMV_MW"           => "kernels.vulkan.mmv_mw",         TriState,    Ignored, "0",  migrated;
@@ -216,7 +211,6 @@ knobs! {
     "INFR_PV_SPLITS"      => "kernels.vulkan.pv_splits",        Int,              Ignored, "2",  migrated;
     "INFR_NO_ATTN_HD"     => "kernels.vulkan.no_attn_hd_spec",  Presence,         Ignored, "1",  migrated;
     "INFR_NO_ATTN_DECODE" => "kernels.vulkan.attn_decode",      PresenceInv,      Ignored, "1",  migrated;
-    "INFR_ATTN_DECODE_GQA" => "kernels.vulkan.attn_decode_gqa", TriState,         Ignored, "1",  migrated;
     "INFR_NO_MROWS_ATTN"  => "kernels.vulkan.mrows_attn",       PresenceOptFalse, Ignored, "1",  migrated;
     "INFR_MROWS_ATTN"     => "kernels.vulkan.mrows_attn",       PresenceOptTrue,  Ignored, "1",  migrated;
     "INFR_NO_MLA_SG"      => "kernels.vulkan.mla_sg",           PresenceInv,      Ignored, "1",  migrated;
@@ -227,7 +221,6 @@ knobs! {
     "INFR_NO_DN_SPLIT"        => "kernels.vulkan.dn_split",           PresenceInv, Ignored, "1", migrated;
     "INFR_DELTA_STRIDED"      => "kernels.vulkan.delta_strided",      Presence,    Ignored, "1", migrated;
     "INFR_NO_PUSH_DESC"       => "kernels.vulkan.push_desc",          PresenceInv, Ignored, "1", migrated;
-    "INFR_GFX_QUEUE"          => "kernels.vulkan.gfx_queue",          Presence,    Ignored, "1", migrated;
     "INFR_NO_PIPELINE_CACHE"  => "kernels.vulkan.pipeline_cache_disk", PresenceInv, Ignored, "1", migrated;
     "INFR_NO_VRAM_GUARD"      => "kernels.vulkan.no_vram_guard",      Presence,    Ignored, "1", migrated;
     "INFR_NO_MOE_SM_POOL"     => "kernels.vulkan.no_moe_sm_pool",     Presence,    Ignored, "1", migrated;
@@ -251,6 +244,14 @@ knobs! {
     "INFR_GEMV_SG_NR"     => "kernels.vulkan.gemv.sg_nr",     Int,            Ignored, "4",     migrated;
     "INFR_NO_GEMV_REG"    => "kernels.vulkan.gemv.variant",   PresenceClears, Ignored, "1",     migrated;
     "INFR_GEMV_VARIANT"   => "kernels.vulkan.gemv.variant",   Text,           Ignored, "rm",    migrated;
+
+    // ── kernels.vulkan.tuning / tune ─────────────────────────────────────────
+    // The per-device tuning table's user layer (`infr-vulkan`'s `tuning` module). `INFR_TUNE` is
+    // a typed user value, so a malformed one is refused loudly.
+    "INFR_TUNE"           => "kernels.vulkan.tune",           Text,        Error,   "gemv_sg.rows=4", migrated;
+    "INFR_TUNE_FILE"      => "kernels.vulkan.tuning.file",    Path,        Ignored, "/tmp/tune.toml", migrated;
+    "INFR_TUNE_NO_ROWS"   => "kernels.vulkan.tuning.rows",    PresenceInv, Ignored, "1",              migrated;
+    "INFR_TUNE_DISABLE"   => "kernels.vulkan.tuning.disable", Text,        Ignored, "amd-proprietary-split-k", migrated;
 
     // ── kernels.metal ────────────────────────────────────────────────────────
     "INFR_METAL_NO_F16_NATIVE"    => "kernels.metal.f16_native",    PresenceInv, Ignored, "1", migrated;
@@ -315,7 +316,6 @@ knobs! {
     "INFR_PROF_VRAM"               => "prof.vram",              Presence, Ignored, "1",           migrated;
     "INFR_PROF_DIFFUSION_TRACE"    => "prof.diffusion_trace",   Presence, Ignored, "1",           migrated;
     "INFR_PROF_OUT"                => "prof.out",               Path,     Ignored, "/tmp/p.json", migrated;
-    "INFR_PROF_TRACE"              => "prof.trace",             Path,     Ignored, "/tmp/t.json", migrated;
     "INFR_PROF_METAL_DEVICE_TIME"  => "prof.metal_device_time", Text,     Ignored, "counters",    migrated;
     "INFR_PROF_METAL_DEBUG"        => "prof.metal_debug",       Presence, Ignored, "1",           migrated;
 
@@ -329,6 +329,7 @@ knobs! {
     "INFR_POISON_UNINIT"       => "debug.poison_uninit",   Presence, Ignored, "1", migrated;
     "INFR_NOBARRIER"           => "debug.no_barrier",      Presence, Ignored, "1", migrated;
     "INFR_FULLBARRIER"         => "debug.full_barrier",    Presence, Ignored, "1", migrated;
+    "INFR_CPU_OP_HASH"         => "debug.cpu_op_hash",     Path,     Ignored, "/tmp/h.txt", migrated;
 
     // ── serve ────────────────────────────────────────────────────────────────
     "INFR_API_KEY"        => "serve.api_key",        Text, Ignored, "hunter2", migrated;
@@ -336,12 +337,9 @@ knobs! {
     // `0`/unset = no deadline, so the env layer does NOT filter non-positive values the way
     // `INFR_MAX_TOKENS_CAP` does — see `ServeCfg::request_timeout_secs`.
     "INFR_REQUEST_TIMEOUT_SECS" => "serve.request_timeout_secs", Int, Ignored, "300", migrated;
-    "INFR_SERVE_IDLE_SECS" => "serve.idle_timeout_secs", Int, Ignored, "300", migrated;
     // Same "`0` is a VALUE, not a bad one" grammar as the deadline above: `0` disables the periodic
     // throughput line, so the env layer must not filter it out.
     "INFR_SERVE_STATS_SECS" => "serve.stats_interval_secs", Int, Ignored, "10", migrated;
-    "INFR_MMPROJ" => "serve.mmproj", Path, Ignored, "/tmp/mmproj.gguf", migrated;
-    "INFR_IMAGE_MAX_TOKENS" => "serve.image_max_tokens", Int, Ignored, "560", migrated;
 
     // ── hub ──────────────────────────────────────────────────────────────────
     // Same "`0` is a VALUE" grammar as the two `serve` knobs above: `0` means "one connection",
@@ -361,6 +359,11 @@ pub const NOT_MIGRATED: &[(&str, &str)] = &[
     (
         "INFR_LLAMA_DIFFUSION_CLI",
         "test/dev fixture: points at a llama.cpp binary on disk (cli/main.rs).",
+    ),
+    (
+        "INFR_LLAMA_FIXTURE_OUT",
+        "test/dev fixture: the directory the llama.cpp fixture regenerators write into \
+         (infr-testkit/src/llama_cpp.rs); unset, they only compare.",
     ),
     (
         "INFR_DIFFUSION_VISUAL",

@@ -25,7 +25,10 @@ layout(binding = 5) writeonly buffer WB { float bucket_wts[]; };
 layout(binding = 6) writeonly buffer IB { uint inv_pos[]; };
 #endif
 void main() {
-    uint p = gl_GlobalInvocationID.x;
+    // Flat index across `Recorder::dispatch_wide`'s 2-D split of a grid wider than
+    // `maxComputeWorkGroupCount[0]`; equal to `gl_GlobalInvocationID.x` when unsplit.
+    uint p = (gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x) * gl_WorkGroupSize.x
+        + gl_LocalInvocationID.x;
     if (p >= pc.n_pairs) { return; }
     uint e = tok_ids[p];
     uint pos = offsets[e] + atomicAdd(fill[e], 1u);

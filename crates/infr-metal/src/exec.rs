@@ -1,7 +1,7 @@
 //! Graph execution: host-side staging (identical to the CPU interpreter) with each op's arithmetic
 //! dispatched to a Metal compute kernel. See the crate docs for why this is host-orchestrated.
 
-use crate::{metal_buf, MetalBackend};
+use crate::{metal_buf, new_shared_buffer, policy, MetalBackend};
 use infr_core::backend::{Bindings, Plan};
 use infr_core::config::MetalCfg;
 use infr_core::error::Error;
@@ -12,8 +12,7 @@ use infr_core::Result;
 use infr_gguf::dequant::dequant_block;
 use metal::foreign_types::ForeignType;
 use metal::{
-    Buffer as MtlBuffer, CommandBuffer, ComputeCommandEncoder, ComputePipelineState,
-    MTLResourceOptions, MTLSize,
+    Buffer as MtlBuffer, CommandBuffer, ComputeCommandEncoder, ComputePipelineState, MTLSize,
 };
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -440,56 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn attention_flash128_policy_is_exact() {
-        assert_eq!(
-            select_attention_flash2_kern(
-                true,
-                4,
-                16,
-                4096,
-                128,
-                || true,
-                || Some("attnflash2_f16kv_hd128"),
-            ),
-            Some("attnflash2_c128_f16kv_hd128"),
-        );
-        assert_eq!(
-            select_attention_flash2_kern(
-                true,
-                4,
-                16,
-                4096,
-                128,
-                || false,
-                || Some("attnflash2_f16kv_hd128"),
-            ),
-            Some("attnflash2_f16kv_hd128"),
-        );
-        assert_eq!(
-            select_attention_flash2_kern(true, 4, 16, 4096, 128, || false, || None),
-            None,
-        );
-
-        let mut probed = false;
-        assert_eq!(
-            select_attention_flash2_kern(
-                true,
-                8,
-                16,
-                4096,
-                128,
-                || {
-                    probed = true;
-                    true
-                },
-                || Some("attnflash2_f16kv_hd128"),
-            ),
-            Some("attnflash2_f16kv_hd128"),
-        );
-        assert!(!probed, "non-four-row shapes must not build the C128 PSO");
-    }
-
-    #[test]
     fn q5k_row_tile_policy_is_limited_to_four_rows() {
         for m in [1usize, 2, 3, 5] {
             assert!(!prefer_q5k_rt("linear_q5k", m, true));
@@ -508,15 +457,176 @@ mod tests {
         assert_eq!(counter_linear_label(false, "linear_q5k_cmm"), None);
     }
 
+    /// The smallest graph `replay_shape` admits: a `QkNormRope` and a one-row f16 attention. Every
+    /// tensor is Internal or a Weight, so an empty `Bindings` passes its binding check.
+    fn replay_base_graph() -> Graph {
+        let mut g = Graph::new();
+        let x = g.internal(TensorDesc::new(vec![1, 64], DType::F32));
+        let w = g.weight(TensorDesc::new(vec![64], DType::F32));
+        let positions = g.internal(TensorDesc::new(vec![1], DType::I32));
+        let q = g.internal(TensorDesc::new(vec![1, 64], DType::F16));
+        g.push(Op::QkNormRope {
+            x,
+            weight: w,
+            positions,
+            dst: q,
+            rows: 1,
+            n_head: 1,
+            head_dim: 64,
+            rope_dim: 64,
+            theta: 1e4,
+            eps: 1e-6,
+            freq_factors: None,
+            x_stride: 0,
+        });
+        let k_cache = g.internal(TensorDesc::new(vec![8, 64], DType::F16));
+        let v_cache = g.internal(TensorDesc::new(vec![8, 64], DType::F16));
+        let dst = g.internal(TensorDesc::new(vec![1, 64], DType::F32));
+        g.push(Op::Attention {
+            q,
+            k_cache,
+            v_cache,
+            dst,
+            rows: 1,
+            kv_len: 1,
+            n_head: 1,
+            n_kv: 1,
+            head_dim: 64,
+            scale: 0.125,
+            mask: AttnMask::Causal,
+            pos: 0,
+            sinks: None,
+            key_bias: None,
+            comp: None,
+        });
+        g
+    }
+
+    /// Append a single-row Q4_K `MoeFfn` the device arm runs, unless `fused_gate_up`,
+    /// `down_scale` or a separate router input (`own_router_x`) send it to the host.
+    fn push_moe(g: &mut Graph, fused_gate_up: bool, down_scale: bool, own_router_x: bool) {
+        let x = g.internal(TensorDesc::new(vec![1, 256], DType::F32));
+        let router_x = if own_router_x {
+            g.internal(TensorDesc::new(vec![1, 256], DType::F32))
+        } else {
+            x
+        };
+        let router = g.weight(TensorDesc::new(vec![2, 256], DType::F32));
+        let exps = g.weight(TensorDesc::new(vec![2, 256, 256], DType::Q4K));
+        let scale = g.weight(TensorDesc::new(vec![2], DType::F32));
+        let dst = g.internal(TensorDesc::new(vec![1, 256], DType::F32));
+        g.push(Op::MoeFfn {
+            x,
+            router_x,
+            router,
+            gate_exps: exps,
+            up_exps: exps,
+            down_exps: exps,
+            down_scale: down_scale.then_some(scale),
+            dst,
+            ne: 256,
+            n_expert: 2,
+            n_used: 2,
+            n_ff_exp: 256,
+            scale: 1.0,
+            act: infr_core::graph::Activation::Silu,
+            gating: infr_core::graph::MoeGating::Softmax,
+            norm_w: true,
+            weight_before: false,
+            fused_gate_up,
+            ep_band: None,
+            exp_probs_b: None,
+            n_expert_groups: 0,
+            n_expert_groups_used: 0,
+            expert_ids: None,
+            swiglu_clamp: None,
+        });
+    }
+
+    /// B128: replay admission must refuse every graph holding an op whose arm computes on the
+    /// host, since the tape records only device dispatches and would replay without the op. The
+    /// old checks admitted `RmsNormAdd` (host-only), a `MoeFfn` the arm sends to the host for a
+    /// fused gate/up bank or a down scale, and a graph that opted out of replay.
     #[test]
-    fn attention_flash_policy_reuses_kv_at_four_rows() {
-        assert!(prefer_attention_flash(true, 4, 16, 4096, 128, true));
-        assert!(!prefer_attention_flash(true, 3, 16, 4096, 128, true));
-        assert!(!prefer_attention_flash(true, 1, 64, 4096, 128, true));
-        assert!(!prefer_attention_flash(true, 4, 16, 63, 128, true));
-        assert!(!prefer_attention_flash(false, 4, 16, 4096, 128, true));
-        assert!(!prefer_attention_flash(true, 4, 16, 4096, 128, false));
-        assert!(!prefer_attention_flash(true, 4, 16, 4096, 256, false));
+    fn replay_refuses_graphs_with_host_computed_ops() {
+        let mut cfg = infr_core::config::Config::default();
+        cfg.kernels.metal.moe = true;
+        let m = &cfg.kernels.metal;
+        let b = Bindings::new();
+        assert!(
+            replay_shape(&replay_base_graph(), &b, m),
+            "the base graph replays"
+        );
+        let mut g = replay_base_graph();
+        push_moe(&mut g, false, false, false);
+        assert!(replay_shape(&g, &b, m), "a device-path MoE replays");
+
+        let mut g = replay_base_graph();
+        let x = g.internal(TensorDesc::new(vec![1, 64], DType::F32));
+        let w = g.weight(TensorDesc::new(vec![64], DType::F32));
+        let dst = g.internal(TensorDesc::new(vec![1, 64], DType::F32));
+        g.push(Op::RmsNormAdd {
+            x,
+            weight: w,
+            dst,
+            rows: 1,
+            dim: 64,
+            eps: 1e-6,
+        });
+        assert!(!replay_shape(&g, &b, m), "RmsNormAdd runs on the host");
+
+        for (fused, scaled, own_router_x) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut g = replay_base_graph();
+            push_moe(&mut g, fused, scaled, own_router_x);
+            assert!(
+                !replay_shape(&g, &b, m),
+                "MoeFfn fused_gate_up={fused} down_scale={scaled} router_x!=x={own_router_x} \
+                 runs on the host"
+            );
+        }
+
+        let mut g = replay_base_graph();
+        g.no_decode_replay = true;
+        assert!(!replay_shape(&g, &b, m), "the graph opted out of replay");
+    }
+
+    /// B126: the scratch pool holds one buffer per tag, reused for any request it fits and grown
+    /// geometrically. The KV dequant prepass asks for a size that grows by a row per decode token;
+    /// the old pool, keyed on (size, tag), kept one buffer per size for the backend's life.
+    #[test]
+    #[ignore = "requires a Metal GPU"]
+    fn scratch_pool_keeps_one_buffer_per_tag() {
+        let be = MetalBackend::new().expect("Metal backend");
+        let row = 64;
+        // Every distinct buffer handed out, held so none is freed and its address reused.
+        let mut distinct: Vec<Arc<MtlBuffer>> = Vec::new();
+        for kv_len in 1..=512 {
+            let buf = be.scratch_buf(kv_len * row, 18).unwrap();
+            assert!(buf.length() as usize >= kv_len * row * 4);
+            if !distinct.iter().any(|b| Arc::ptr_eq(b, &buf)) {
+                distinct.push(buf);
+            }
+        }
+        assert_eq!(
+            be.scratch.lock().unwrap().len(),
+            1,
+            "one entry for the tag, not one per size"
+        );
+        assert_eq!(
+            distinct.len(),
+            512usize.ilog2() as usize + 1,
+            "growth reallocations"
+        );
+        let last = be.scratch_buf(512 * row, 18).unwrap();
+        let small = be.scratch_buf(row, 18).unwrap();
+        assert!(
+            Arc::ptr_eq(&last, &small),
+            "a smaller request reuses the pooled buffer"
+        );
     }
 
     #[test]
@@ -575,6 +685,7 @@ mod tests {
             pos: 0,
             sinks: None,
             key_bias: None,
+            comp: None,
         });
 
         let ids = g.input(TensorDesc::new(vec![1], DType::I32));
@@ -878,10 +989,6 @@ fn fusion_cfg() -> infr_core::fusion::FusionCfg<'static> {
             // No escape hatch on this backend (Vulkan has one); always planned.
             enabled: true,
         }),
-        rmsnorm_linear: None,
-        // F1c's `MoeFfn → Add` fold needs a residual epilogue on the expert accumulate, which this
-        // backend's MoE arm does not have; un-planned, so the standalone `Add` still dispatches.
-        moe_add: None,
         kv_write: false,
     }
 }
@@ -971,17 +1078,18 @@ pub(crate) struct TapeEntry {
 /// DYNAMIC-POS kernels that read the bound positions buffer (`attnvec_dyn_*`, `writekv_dyn_f16`;
 /// RoPE already reads it), so the recorded params stay valid for every token.
 pub(crate) struct Tape {
-    /// Fingerprint of (op discriminants, tensor count, bound buffer addresses): a tape is replayed
-    /// only for a graph with the identical op sequence over the identical bindings. Baked pos /
+    /// Fingerprint of (op discriminants, tensor count, bound buffers): a tape is replayed only for
+    /// a graph with the identical op sequence over the identical bindings. Baked pos /
     /// kv_len MAY differ across tokens — the dynamic-pos kernels ignore them by construction.
     fp: u64,
     entries: Vec<TapeEntry>,
 }
 
 /// Fingerprint the (graph shape, bindings) pair for tape matching. Op kind + tensor count pins the
-/// graph structure; the bound buffer addresses pin the weights/caches/IO. Two graphs that agree on
-/// all of that and pass [`replay_shape`] differ at most in baked positions, which replay reads
-/// dynamically.
+/// graph structure; the bound buffers' allocation uids pin the weights/caches/IO. Two graphs that
+/// agree on all of that and pass [`replay_shape`] differ at most in baked positions, which replay
+/// reads dynamically. Uids, not addresses: a freed buffer's address is handed to the next
+/// allocation, which would match a tape that still binds the old buffer (see `idcache`).
 fn replay_fp(g: &infr_core::graph::Graph, bindings: &Bindings) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     let mut mix = |v: u64| {
@@ -994,7 +1102,7 @@ fn replay_fp(g: &infr_core::graph::Graph, bindings: &Bindings) -> u64 {
     }
     for i in 0..g.tensors.len() {
         if let Some(b) = bindings.get(TensorId(i as u32)) {
-            mix(metal_buf(b) as *const _ as u64);
+            mix(metal_buf(b).uid);
         }
     }
     h
@@ -1161,38 +1269,6 @@ fn prefer_conv1d_parallel(rows: usize, kernel: usize) -> bool {
     rows >= kernel.saturating_sub(1).max(2)
 }
 
-fn prefer_attention_flash(
-    f16: bool,
-    rows: usize,
-    n_head: usize,
-    kv_len: usize,
-    head_dim: usize,
-    flash2_ok: bool,
-) -> bool {
-    let launch_wide = rows * n_head >= 128;
-    let launch_four = rows == 4 && rows * n_head >= 64 && flash2_ok;
-    f16 && (launch_wide || launch_four)
-        && kv_len >= 64
-        && head_dim.is_multiple_of(8)
-        && (head_dim <= 128 || flash2_ok)
-}
-
-fn select_attention_flash2_kern(
-    f16: bool,
-    rows: usize,
-    n_head: usize,
-    kv_len: usize,
-    head_dim: usize,
-    c128_pipeline_ok: impl FnOnce() -> bool,
-    standard_pipeline: impl FnOnce() -> Option<&'static str>,
-) -> Option<&'static str> {
-    if f16 && rows == 4 && n_head >= 16 && kv_len >= 64 && head_dim == 128 && c128_pipeline_ok() {
-        Some("attnflash2_c128_f16kv_hd128")
-    } else {
-        standard_pipeline()
-    }
-}
-
 fn counter_linear_label(enabled: bool, kern: &'static str) -> Option<&'static str> {
     enabled.then_some(kern)
 }
@@ -1210,6 +1286,52 @@ fn replay_gpu_decode_op_supported(op: &Op, g: &infr_core::graph::Graph) -> Optio
     }
 }
 
+/// Expert GEMV kernels `(write, accumulate)` for an expert bank's dtype; `None` sends the
+/// `Op::MoeFfn` arm to its host path.
+fn moe_expert_kerns(dt: DType) -> Option<(&'static str, &'static str)> {
+    match dt {
+        DType::Q4K => Some(("linear_q4k_moe", "linear_q4k_moe_acc")),
+        DType::Q6K => Some(("linear_q6k_moe", "linear_q6k_moe_acc")),
+        _ => None,
+    }
+}
+
+/// Does the `Op::MoeFfn` arm take its fully on-device path for `op`? The arm and [`replay_shape`]
+/// both ask, so a graph whose MoE falls back to the host, which a tape cannot record, is never
+/// admitted for replay. The device path assumes SEPARATE full-width gate/up expert banks and no
+/// per-expert down scale (qwen3moe's shape); diffusion-gemma's fused `gate_up_exps` +
+/// `ffn_down_exps.scale` always falls to the host path instead of teaching the device kernels a
+/// layout they don't expect. The device router GEMV reads `x`, so a router fed from a different
+/// activation (`router_x != x`) takes the host path too.
+fn moe_ffn_on_device(op: &Op, g: &infr_core::graph::Graph, m: &MetalCfg) -> bool {
+    let Op::MoeFfn {
+        x,
+        router_x,
+        gate_exps,
+        up_exps,
+        down_exps,
+        down_scale,
+        fused_gate_up,
+        ne,
+        n_used,
+        n_ff_exp,
+        ..
+    } = *op
+    else {
+        return false;
+    };
+    n_used <= 16
+        && router_x == x
+        && ne % 256 == 0
+        && n_ff_exp % 256 == 0
+        && !fused_gate_up
+        && down_scale.is_none()
+        && m.moe
+        && [gate_exps, up_exps, down_exps]
+            .iter()
+            .all(|&t| moe_expert_kerns(g.desc(t).dtype).is_some())
+}
+
 /// Is this graph the decode shape the replay tape supports? Every op must be one the recorder
 /// handles fully on-device, attention must be the rows=1 f16 shape with a dynamic-pos kernel
 /// instantiation (hd 64/128), and a QkNormRope must exist to name the positions buffer.
@@ -1219,6 +1341,10 @@ fn replay_gpu_decode_op_supported(op: &Op, g: &infr_core::graph::Graph) -> Optio
 /// (`INFR_METAL_NOMOE`) — each key is read BOTH ways with one meaning.
 fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) -> bool {
     use infr_core::graph::TensorKind;
+    // The graph's own opt-out (DiffusionGemma), which the Vulkan adapter honours too.
+    if g.no_decode_replay {
+        return false;
+    }
     let mut has_rope = false;
     let mut has_attn = false;
     for op in &g.ops {
@@ -1230,7 +1356,6 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) 
         }
         match op {
             Op::RmsNorm { .. }
-            | Op::RmsNormAdd { .. }
             | Op::Linear { .. }
             | Op::GatedAct { .. }
             | Op::GatedActFused { .. }
@@ -1247,15 +1372,21 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) 
             // new, GPU-unverifiable shader). So exclude Rope from replay and keep such graphs
             // (llama-family plain Rope + f16 KV) on the correct per-token walk.
             Op::Rope { .. } => return false,
+            // The arm computes on the host, which a tape cannot record: a recorded graph would
+            // replay without the op.
+            Op::RmsNormAdd { .. } => return false,
             // qwen35 (Qwen3-Next) decode ops: all pos-independent, on-device, recurrent state
             // updated in the BOUND buffer — tape-safe when the arm's device gate holds (the
             // host fallbacks can't tape, so the gates mirror the arms').
+            // HeadGate (LFM3) is pos-independent elementwise and always on the device.
             Op::QkNorm { .. }
             | Op::GatedRmsNorm { .. }
             | Op::Scale { .. }
             | Op::Copy { .. }
-            | Op::CopyStrided { .. } => {}
-            Op::Conv1dSilu { state, kernel, .. } => {
+            | Op::CopyStrided { .. }
+            | Op::HeadGate { .. } => {}
+            // LFM's ShortConv takes the same device gate as Conv1dSilu.
+            Op::Conv1dSilu { state, kernel, .. } | Op::ShortConv { state, kernel, .. } => {
                 if *kernel > 8
                     || !m.deltanet
                     || bindings.get(*state).is_none()
@@ -1269,8 +1400,7 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) 
                 head_v,
                 ..
             } => {
-                if *head_k > 256
-                    || !head_k.is_multiple_of(32)
+                if policy::deltanet_kpl_index(*head_k as usize).is_none()
                     || !(head_v.is_multiple_of(4) && *head_v <= 1024)
                     || !m.deltanet
                     || bindings.get(*state).is_none()
@@ -1278,26 +1408,12 @@ fn replay_shape(g: &infr_core::graph::Graph, bindings: &Bindings, m: &MetalCfg) 
                     return false;
                 }
             }
-            // MoE decode tapes only when the arm takes the fully-on-device path (the same gate
-            // as the MoeFfn arm's `device_ok`): dtypes with expert kernels, in-bounds shapes,
-            // escape hatch off. The host fallback computes on the CPU per token — a tape can't
+            // MoE decode tapes only when the arm takes the fully-on-device path (the gate the
+            // MoeFfn arm asks too, `moe_ffn_on_device`): dtypes with expert kernels, in-bounds
+            // shapes, separate gate/up banks, no down scale, escape hatch off. The host fallback computes on the CPU per token — a tape can't
             // represent it.
-            Op::MoeFfn {
-                gate_exps,
-                up_exps,
-                down_exps,
-                ne,
-                n_ff_exp,
-                n_used,
-                ..
-            } => {
-                let kq = |t: &TensorId| matches!(g.desc(*t).dtype, DType::Q4K | DType::Q6K);
-                if !(kq(gate_exps) && kq(up_exps) && kq(down_exps))
-                    || *n_used > 16
-                    || *ne % 256 != 0
-                    || *n_ff_exp % 256 != 0
-                    || !m.moe
-                {
+            Op::MoeFfn { .. } => {
+                if !moe_ffn_on_device(op, g, m) {
                     return false;
                 }
             }
@@ -1372,16 +1488,22 @@ fn dyn_attnvec_kern(dt: DType, hd: usize) -> &'static str {
 /// Reinterpret raw buffer bytes as `f32` per `dtype` (dequantizing quant/f16/bf16, widening integer
 /// tensors). The host-side "read a tensor's value", matching `infr-cpu`'s `bytes_to_f32`.
 fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
+    // Decoded per element, never cast: a weight slice of the GGUF mapping is only as aligned as the
+    // file's `general.alignment`, which may be below 4.
     match dtype {
-        DType::F32 => bytemuck::cast_slice::<u8, f32>(bytes).to_vec(),
-        DType::I32 => bytemuck::cast_slice::<u8, i32>(bytes)
+        DType::I32 => bytes
+            .as_chunks::<4>()
+            .0
             .iter()
-            .map(|&v| v as f32)
+            .map(|&c| i32::from_le_bytes(c) as f32)
             .collect(),
-        DType::U32 => bytemuck::cast_slice::<u8, u32>(bytes)
+        DType::U32 => bytes
+            .as_chunks::<4>()
+            .0
             .iter()
-            .map(|&v| v as f32)
+            .map(|&c| u32::from_le_bytes(c) as f32)
             .collect(),
+        // F32 / F16 / Bf16 / quants: the shared host dequant.
         other => dequant_block(other, bytes).expect("metal backend: host dequant"),
     }
 }
@@ -1394,7 +1516,6 @@ fn op_name(op: &Op) -> &'static str {
         Op::LayerNorm { .. } => "LayerNorm",
         Op::Softmax { .. } => "Softmax",
         Op::Linear { .. } => "Linear",
-        Op::LinearExl3 { .. } => "LinearExl3",
         Op::QkNorm { .. } => "QkNorm",
         Op::GatedRmsNorm { .. } => "GatedRmsNorm",
         Op::Rope { .. } => "Rope",
@@ -1420,10 +1541,13 @@ fn op_name(op: &Op) -> &'static str {
         Op::Sample { .. } => "Sample",
         Op::EmbedGather { .. } => "EmbedGather",
         Op::GatherI32 { .. } => "GatherI32",
+        Op::GatherRows { .. } => "GatherRows",
         Op::Copy { .. } => "Copy",
         Op::CopyStrided { .. } => "CopyStrided",
         Op::MoeFfn { .. } => "MoeFfn",
         Op::Conv1dSilu { .. } => "Conv1dSilu",
+        Op::ShortConv { .. } => "ShortConv",
+        Op::HeadGate { .. } => "HeadGate",
         Op::DeltaNet { .. } => "DeltaNet",
         Op::MoeSharedExpertAdd { .. } => "MoeSharedExpertAdd",
     }
@@ -1443,12 +1567,55 @@ fn hyper_check_hc(hc: u32, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// The host fallback of the causal depthwise convs (`Op::Conv1dSilu` with `silu`, `Op::ShortConv`
+/// without): `rr` tokens in order over the `[(kk-1), cc]` history `st`, oldest row first, which it
+/// leaves holding the trailing inputs. Mirrors the CPU reference's serial loop.
+fn host_causal_conv(
+    xs: &[f32],
+    ws: &[f32],
+    st: &mut [f32],
+    rr: usize,
+    cc: usize,
+    kk: usize,
+    silu: bool,
+) -> Vec<f32> {
+    let mut out = vec![0f32; rr * cc];
+    for t in 0..rr {
+        let xt = &xs[t * cc..t * cc + cc];
+        for ch in 0..cc {
+            let mut acc = 0f32;
+            for j in 0..kk - 1 {
+                acc += st[j * cc + ch] * ws[ch * kk + j];
+            }
+            acc += xt[ch] * ws[ch * kk + (kk - 1)];
+            out[t * cc + ch] = if silu {
+                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
+                acc / (1.0 + (-acc).exp())
+            } else {
+                acc
+            };
+        }
+        for j in 0..kk.saturating_sub(2) {
+            for ch in 0..cc {
+                st[j * cc + ch] = st[(j + 1) * cc + ch];
+            }
+        }
+        if kk >= 2 {
+            st[(kk - 2) * cc..(kk - 1) * cc].copy_from_slice(xt);
+        }
+    }
+    out
+}
+
 /// Gated-FFN activation applied to the gate value (matches `infr-cpu`'s `act_fn`).
 fn act_fn(act: infr_core::graph::Activation, g: f32) -> f32 {
     use infr_core::graph::Activation;
     match act {
+        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
         Activation::Silu => g / (1.0 + (-g).exp()),
+        // libm-ok(S2): platform `tanh`, moves to `infr_core::math` in S2
         Activation::Gelu => 0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh()),
+        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
         Activation::Sigmoid => 1.0 / (1.0 + (-g).exp()),
     }
 }
@@ -1457,32 +1624,32 @@ impl MetalBackend {
     // ---- small device-buffer helpers (StorageModeShared = CPU-visible on Apple Silicon) ----
 
     /// A device buffer initialized from an f32 host slice.
-    fn f32_buf(&self, data: &[f32]) -> MtlBuffer {
-        let len = (data.len().max(1) * 4) as u64;
-        let buf = self
-            .device
-            .new_buffer(len, MTLResourceOptions::StorageModeShared);
+    fn f32_buf(&self, data: &[f32]) -> Result<MtlBuffer> {
+        let buf = new_shared_buffer(&self.device, data.len().max(1) * 4)?;
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut f32, data.len());
         }
-        buf
+        Ok(buf)
     }
 
     /// A zeroed device buffer of `n` f32s.
-    fn zeros_buf(&self, n: usize) -> MtlBuffer {
-        self.device
-            .new_buffer((n.max(1) * 4) as u64, MTLResourceOptions::StorageModeShared)
+    fn zeros_buf(&self, n: usize) -> Result<MtlBuffer> {
+        new_shared_buffer(&self.device, n.max(1) * 4)
     }
 
-    /// A reusable op-scratch buffer (see `MetalBackend::scratch`): get-or-create by
-    /// (f32 count, tag).
-    fn scratch_buf(&self, n: usize, tag: u8) -> Arc<MtlBuffer> {
-        self.scratch
-            .lock()
-            .unwrap()
-            .entry((n, tag))
-            .or_insert_with(|| Arc::new(self.zeros_buf(n)))
-            .clone()
+    /// A reusable op-scratch buffer of at least `n` f32s (see `MetalBackend::scratch`): the tag's
+    /// pooled buffer, replaced by a larger one when it is too small. Keyed on the tag alone, not
+    /// the size, so a size that changes per call (the KV dequant prepass grows with `kv_len`)
+    /// reuses one buffer instead of pooling one per size for the backend's life. Contents are
+    /// whatever the last user left: every caller overwrites the elements it reads.
+    fn scratch_buf(&self, n: usize, tag: u8) -> Result<Arc<MtlBuffer>> {
+        let mut pool = self.scratch.lock().unwrap();
+        let have = pool.get(&tag).map(|(cap, _)| *cap);
+        let max = self.device.max_buffer_length() as usize / 4;
+        if let Some(cap) = policy::scratch_capacity(have, n, max) {
+            pool.insert(tag, (cap, Arc::new(self.zeros_buf(cap)?)));
+        }
+        Ok(pool[&tag].1.clone())
     }
 
     /// Read `n` f32s out of a device buffer.
@@ -1834,23 +2001,23 @@ impl MetalBackend {
 
     /// Ensure a tensor's value is a device buffer (uploading from the host mirror if needed), and
     /// return it. Tensors already produced on-device are returned as-is — no round-trip.
-    fn ensure_device(&self, r: &mut Resident, id: TensorId) -> Arc<MtlBuffer> {
+    fn ensure_device(&self, r: &mut Resident, id: TensorId) -> Result<Arc<MtlBuffer>> {
         let i = id.0 as usize;
         if r.dev[i].is_none() || r.loc[i] == Loc::Host {
-            r.dev[i] = Some(Arc::new(self.f32_buf(&r.vals[i])));
+            r.dev[i] = Some(Arc::new(self.f32_buf(&r.vals[i])?));
             r.loc[i] = Loc::Device;
         }
-        r.dev[i].clone().unwrap()
+        Ok(r.dev[i].clone().unwrap())
     }
 
     /// Get (or allocate) the persistent device output buffer for a tensor, sized for `n` f32s.
-    fn dev_dst(&self, r: &mut Resident, id: TensorId, n: usize) -> Arc<MtlBuffer> {
+    fn dev_dst(&self, r: &mut Resident, id: TensorId, n: usize) -> Result<Arc<MtlBuffer>> {
         let i = id.0 as usize;
         let big_enough = matches!(&r.dev[i], Some(b) if b.length() as usize >= n * 4);
         if !big_enough {
-            r.dev[i] = Some(Arc::new(self.zeros_buf(n)));
+            r.dev[i] = Some(Arc::new(self.zeros_buf(n)?));
         }
-        r.dev[i].clone().unwrap()
+        Ok(r.dev[i].clone().unwrap())
     }
 
     /// Ensure a tensor's value is in the host mirror `vals`, flushing the batch and downloading from
@@ -1866,8 +2033,21 @@ impl MetalBackend {
     }
 
     fn replay_capable(&self, g: &infr_core::graph::Graph, bindings: &Bindings) -> bool {
-        if self.active_counter_set().is_some() || !replay_shape(g, bindings, self.metal()) {
-            return false;
+        self.replay_blocker(g, bindings).is_none()
+    }
+
+    /// Why [`Self::replay_capable`] refuses `g` over `bindings`, or `None` when the executor
+    /// records and replays the tape for it.
+    fn replay_blocker(
+        &self,
+        g: &infr_core::graph::Graph,
+        bindings: &Bindings,
+    ) -> Option<&'static str> {
+        if self.active_counter_set().is_some() {
+            return Some("GPU-counter profiling is on, which disables the tape");
+        }
+        if !replay_shape(g, bindings, self.metal()) {
+            return Some("the graph is not a shape the replay tape records (see `replay_shape`)");
         }
         let Some((kern, need)) = g.ops.iter().find_map(|op| match op {
             Op::Attention {
@@ -1880,12 +2060,67 @@ impl MetalBackend {
             )),
             _ => None,
         }) else {
-            return false;
+            return Some("no attention with a dynamic-position kernel instantiation");
         };
-        self.pipelines
+        let fits = self
+            .pipelines
             .get(kern)
             .map(|pl| pl.max_total_threads_per_threadgroup() >= need)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        (!fits).then_some(
+            "this device's dynamic-position attention pipeline allows fewer threads per \
+             threadgroup than the kernel needs",
+        )
+    }
+
+    /// Does the STATIC walk of `g` over `bindings` decode the position the bound positions
+    /// buffer names? The graph-only half is `policy::static_walk_live_positions`; the walk also
+    /// needs the positions buffer it reads the live position from to be bound (`run_graph`'s
+    /// `dynpos`).
+    fn static_walk_live(
+        &self,
+        g: &infr_core::graph::Graph,
+        bindings: &Bindings,
+    ) -> std::result::Result<(), &'static str> {
+        let positions = policy::static_walk_live_positions(g)?;
+        match bindings.get(positions) {
+            Some(b) if metal_buf(b).len >= 4 => Ok(()),
+            _ => Err("the positions buffer the walk reads the live position from is not bound"),
+        }
+    }
+
+    /// `Backend::decode_replay_ready`: `plan`, executed once per token over `bindings` with the
+    /// bound positions advanced, decodes each position correctly — by the tape
+    /// ([`Self::replay_capable`]) or by a static walk that takes every position from live state
+    /// ([`Self::static_walk_live`]).
+    pub(crate) fn plan_replays(&self, plan: &dyn Plan, bindings: &Bindings) -> bool {
+        plan.as_any()
+            .downcast_ref::<infr_core::backend::GraphPlan>()
+            .is_some_and(|p| {
+                self.replay_capable(&p.graph, bindings)
+                    || self.static_walk_live(&p.graph, bindings).is_ok()
+            })
+    }
+
+    /// The error for a graph built for record-once decode replay (`Graph::replay_only`) that
+    /// neither the tape nor a live-position static walk decodes correctly: walking it would
+    /// decode at the positions baked into it. `Ok` for every other graph. The same predicate as
+    /// [`Self::plan_replays`], so a caller that asked never gets here.
+    fn refuse_replay_only(&self, g: &infr_core::graph::Graph, bindings: &Bindings) -> Result<()> {
+        if !g.replay_only {
+            return Ok(());
+        }
+        let Err(walk) = self.static_walk_live(g, bindings) else {
+            return Ok(());
+        };
+        let tape = self
+            .replay_blocker(g, bindings)
+            .unwrap_or("the tape was not recorded");
+        Err(Error::Backend(format!(
+            "metal backend: refusing to walk a graph built for record-once decode replay \
+             (Graph::replay_only), which would decode at its baked positions: the tape does not \
+             apply ({tape}) and the static walk does not take every position live ({walk})"
+        )))
     }
 
     pub(crate) fn execute_graph(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
@@ -1918,6 +2153,7 @@ impl MetalBackend {
             }
             return Ok(());
         }
+        self.refuse_replay_only(g, bindings)?;
 
         // Wrap the whole forward in one autorelease pool: the batched command buffers/encoders are
         // retained owned handles, so we drain the pool once per forward instead of once per op.
@@ -1941,6 +2177,9 @@ impl MetalBackend {
             return Ok(None);
         };
         if !self.replay_capable(g, bindings) {
+            // Declining would hand the caller back to `execute_graph`, which refuses the same
+            // graph; say why here, where the caller asked for the replay.
+            self.refuse_replay_only(g, bindings)?;
             return Ok(None);
         }
         let positions = g.ops.iter().find_map(|op| match op {
@@ -1981,6 +2220,8 @@ impl MetalBackend {
             return Ok(None);
         }
 
+        // Allocated before any step runs, so the only way out after one has run is with its id.
+        let result = new_shared_buffer(&self.device, n * std::mem::size_of::<u32>())?;
         let fp = replay_fp(g, bindings);
         let mut ids = Vec::with_capacity(n);
         let tape_ready = self
@@ -1990,7 +2231,11 @@ impl MetalBackend {
             .as_ref()
             .is_some_and(|t| t.fp == fp);
         if !tape_ready {
+            // This runs a step. From here on a decline would make the caller feed the same
+            // position again, advancing a recurrent state twice, so a missing tape returns the
+            // one id instead (see `Backend::execute_chain`).
             self.execute_graph(plan, bindings)?;
+            ids.push(unsafe { *(sampled_buf.raw.contents() as *const u32) });
             let recorded = self
                 .replay
                 .lock()
@@ -1998,20 +2243,14 @@ impl MetalBackend {
                 .as_ref()
                 .is_some_and(|t| t.fp == fp);
             if !recorded {
-                return Ok(None);
+                return Ok(Some(ids));
             }
-            let id = unsafe { *(sampled_buf.raw.contents() as *const u32) };
-            ids.push(id);
         }
 
         let remaining = n - ids.len();
         if remaining == 0 {
             return Ok(Some(ids));
         }
-        let result = self.device.new_buffer(
-            (remaining * std::mem::size_of::<u32>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
         let advance = self.pipelines.get("advance_position_i32")?;
         let guard = self.replay.lock().unwrap();
         let tape = guard.as_ref().expect("chain checked recorded tape");
@@ -2262,18 +2501,18 @@ impl MetalBackend {
         }
         let bytes = Self::read_bytes(buf);
         let f = bytes_to_f32(&bytes, dt);
-        let w = Arc::new(self.f32_buf(&f));
+        let w = Arc::new(self.f32_buf(&f)?);
         self.weight_cache.lock().unwrap().insert(key, w.clone());
         Ok(w)
     }
 
     /// A device buffer initialized from a raw byte slice.
-    fn bytes_buf(&self, data: &[u8]) -> MtlBuffer {
-        self.device.new_buffer_with_data(
-            data.as_ptr() as *const c_void,
-            data.len().max(1) as u64,
-            MTLResourceOptions::StorageModeShared,
-        )
+    fn bytes_buf(&self, data: &[u8]) -> Result<MtlBuffer> {
+        let buf = new_shared_buffer(&self.device, data.len().max(1))?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.contents() as *mut u8, data.len());
+        }
+        Ok(buf)
     }
 
     /// Build (or fetch from cache) a quantized weight in on-device form. Q4_K and Q6_K — the
@@ -2288,7 +2527,7 @@ impl MetalBackend {
         id: TensorId,
         g: &infr_core::graph::Graph,
         bindings: &Bindings,
-    ) -> Arc<QuiWeight> {
+    ) -> Result<Arc<QuiWeight>> {
         let buf = metal_buf(bindings.get(id).expect("metal backend: unbound Weight"));
         // Identity of the underlying buffer — see `weight_buf` for why neither the wrapper address
         // nor the MTLBuffer's `contents()` pointer will do. (The native-kernel arm below happens to
@@ -2297,7 +2536,7 @@ impl MetalBackend {
         // nothing, so that arm has the same exposure as `weight_buf`.)
         let key = buf.id();
         if let Some(w) = self.qui_cache.lock().unwrap().get(key) {
-            return w.clone();
+            return Ok(w.clone());
         }
         // INFR_METAL_NO_KQUANT_NATIVE routes the non-Q4_K/Q6_K K-quants (Q5_K/Q2_K/Q3_K) back
         // through the factored quik path (A/B + escape hatch). Q5_K reuses Q4_K's cheap 6-bit scale
@@ -2336,13 +2575,13 @@ impl MetalBackend {
             // The kernel never reads scm/dd for native formats; bind tiny dummies.
             let w = Arc::new(QuiWeight {
                 codes: buf.raw.clone(),
-                scm: self.zeros_buf(1),
-                dd: self.zeros_buf(1),
+                scm: self.zeros_buf(1)?,
+                dd: self.zeros_buf(1)?,
                 kern,
                 dshift: 0,
             });
             self.qui_cache.lock().unwrap().insert(key, w.clone());
-            return w;
+            return Ok(w);
         }
         let bytes = Self::read_bytes(buf);
         let f = infr_gguf::dequant::dequant_factored(g.desc(id).dtype, &bytes)
@@ -2380,16 +2619,16 @@ impl MetalBackend {
             ("linear_quik8", f.codes)
         };
         let w = Arc::new(QuiWeight {
-            codes: self.bytes_buf(&codes_bytes),
-            scm: self.bytes_buf(bytemuck::cast_slice(&f.scm)),
+            codes: self.bytes_buf(&codes_bytes)?,
+            scm: self.bytes_buf(bytemuck::cast_slice(&f.scm))?,
             dd: self.bytes_buf(bytemuck::cast_slice(
                 &f.dd.iter().map(|h| h.to_bits()).collect::<Vec<u16>>(),
-            )),
+            ))?,
             kern,
             dshift: f.dblk.trailing_zeros(),
         });
         self.qui_cache.lock().unwrap().insert(key, w.clone());
-        w
+        Ok(w)
     }
 
     fn read_bytes(buf: &crate::MetalBuffer) -> Vec<u8> {
@@ -2450,9 +2689,9 @@ impl MetalBackend {
 
     /// Single-row matmul on the GPU: `out[out_f] = x[in_f] · Wᵀ`, W row-major [out_f, in_f] f32.
     fn gpu_matvec(&self, x: &[f32], w: &[f32], in_f: usize, out_f: usize) -> Result<Vec<f32>> {
-        let bx = self.f32_buf(x);
-        let bw = self.f32_buf(w);
-        let bd = self.zeros_buf(out_f);
+        let bx = self.f32_buf(x)?;
+        let bw = self.f32_buf(w)?;
+        let bd = self.zeros_buf(out_f)?;
         let pso = self.pipelines.get("linear_f32")?;
         let mut p = 1u32.to_ne_bytes().to_vec(); // m = 1
         p.extend_from_slice(&(in_f as u32).to_ne_bytes());
@@ -2479,9 +2718,9 @@ impl MetalBackend {
                 eps,
             } => {
                 let (rows, dim) = (rows as usize, dim as usize);
-                let bx = self.ensure_device(r, x);
+                let bx = self.ensure_device(r, x)?;
                 let bw = self.weight_buf(weight, g, bindings)?;
-                let bd = self.dev_dst(r, dst, rows * dim);
+                let bd = self.dev_dst(r, dst, rows * dim)?;
                 // Decode (few rows): the WIDE kernel — 8 simdgroups per row; the 32-lane form
                 // is latency-bound on dim/32 serial loads (~20 us/launch at dim 1152). Prefill
                 // keeps one simdgroup per row (the rows themselves fill the GPU).
@@ -2562,10 +2801,10 @@ impl MetalBackend {
                 eps,
             } => {
                 let (rows, dim) = (rows as usize, dim as usize);
-                let bx = self.ensure_device(r, x);
+                let bx = self.ensure_device(r, x)?;
                 let bw = self.weight_buf(weight, g, bindings)?;
                 let bb = self.weight_buf(bias, g, bindings)?;
-                let bd = self.dev_dst(r, dst, rows * dim);
+                let bd = self.dev_dst(r, dst, rows * dim)?;
                 let pso = self.pipelines.get("layernorm_f32")?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(dim as u32).to_ne_bytes());
@@ -2611,8 +2850,8 @@ impl MetalBackend {
                     .map(|pl| pl.max_total_threads_per_threadgroup() as usize)
                     .unwrap_or(0);
                 if let (SoftmaxTier::Wide, Some(pso)) = (softmax_tier(cap), &wide_pso) {
-                    let bx = self.ensure_device(r, x);
-                    let bd = self.dev_dst(r, dst, rows * dim);
+                    let bx = self.ensure_device(r, x)?;
+                    let bd = self.dev_dst(r, dst, rows * dim)?;
                     let mut p = (rows as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(dim as u32).to_ne_bytes());
                     p.extend_from_slice(&scale.to_ne_bytes());
@@ -2638,6 +2877,7 @@ impl MetalBackend {
                         }
                         let mut sum = 0.0f32;
                         for i in 0..dim {
+                            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                             let e = (xrow[i] * scale - m0).exp();
                             ds[ri * dim + i] = e;
                             sum += e;
@@ -2669,8 +2909,8 @@ impl MetalBackend {
                     "Metal QkNorm: strided x not supported (runner emits packed)"
                 );
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
-                let bx = self.ensure_device(r, x);
-                let bd = self.dev_dst(r, dst, rows * nh * hd);
+                let bx = self.ensure_device(r, x)?;
+                let bd = self.dev_dst(r, dst, rows * nh * hd)?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
                 p.extend_from_slice(&(hd as u32).to_ne_bytes());
@@ -2718,10 +2958,10 @@ impl MetalBackend {
                 eps,
             } => {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
-                let bx = self.ensure_device(r, x);
+                let bx = self.ensure_device(r, x)?;
                 let bw = self.weight_buf(weight, g, bindings)?;
-                let bg = self.ensure_device(r, gate);
-                let bd = self.dev_dst(r, dst, rows * nh * hd);
+                let bg = self.ensure_device(r, gate)?;
+                let bd = self.dev_dst(r, dst, rows * nh * hd)?;
                 let pso = self.pipelines.get("gated_rmsnorm_f32")?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
@@ -2738,11 +2978,6 @@ impl MetalBackend {
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }
-            Op::LinearExl3 { .. } => {
-                return Err(Error::Unsupported(
-                    "native EXL3 projections are not implemented on Metal".into(),
-                ));
-            }
             Op::Linear {
                 x,
                 weight,
@@ -2753,7 +2988,7 @@ impl MetalBackend {
                 w_off,
             } => {
                 let (m, in_f, out_f) = (m as usize, in_f as usize, out_f as usize);
-                let bx = self.ensure_device(r, x);
+                let bx = self.ensure_device(r, x)?;
                 // `dev_dst` is deferred into each dispatch branch below: the fused-residual
                 // peephole writes the absorbed Add's dst via its OWN `dev_dst` and never touches
                 // this one, so allocating it up front left a dead per-op buffer on that path.
@@ -2786,7 +3021,7 @@ impl MetalBackend {
                     // takes the row-tiled variant: one simdgroup per (8-row tile, output), each
                     // weight block decoded once for all 8 rows, instead of the GEMV kernel
                     // re-streaming the whole weight matrix once per row.
-                    let qw = self.weight_qui(weight, g, bindings);
+                    let qw = self.weight_qui(weight, g, bindings)?;
                     // Fused-QKV slice: `w_off` is a whole-row element offset into the shared
                     // concatenated weight (the runner bakes it as `row0 * in_f`), so it lands on
                     // a block boundary in every stream — bind each stream at the corresponding
@@ -2925,7 +3160,7 @@ impl MetalBackend {
                         (mrv_tier, mr_kern, w_off)
                     {
                         let pso = self.pipelines.get(kn)?;
-                        let bd = self.dev_dst(r, dst, m * out_f);
+                        let bd = self.dev_dst(r, dst, m * out_f)?;
                         let sgs = out_f.div_ceil(2) * m;
                         if let Some(label) = counter_linear_label(self.counter_set.is_some(), kn) {
                             r.cur_op = label;
@@ -2970,7 +3205,7 @@ impl MetalBackend {
                             } else {
                                 kchunk
                             };
-                            let parts = self.scratch_buf(ks_split * m * out_f, 8);
+                            let parts = self.scratch_buf(ks_split * m * out_f, 8)?;
                             let mut kp = p.clone();
                             kp.extend_from_slice(&(ks_split as u32).to_ne_bytes());
                             kp.extend_from_slice(&(kchunk as u32).to_ne_bytes());
@@ -2996,7 +3231,7 @@ impl MetalBackend {
                                 128,
                             );
                             let rp_pso = self.pipelines.get("cmm_ks_reduce")?;
-                            let bd = self.dev_dst(r, dst, m * out_f);
+                            let bd = self.dev_dst(r, dst, m * out_f)?;
                             let mut rp = ((m * out_f) as u32).to_ne_bytes().to_vec();
                             rp.extend_from_slice(&(ks_split as u32).to_ne_bytes());
                             if let Some(label) =
@@ -3018,7 +3253,7 @@ impl MetalBackend {
                         // Reads f32 x directly (casts to f16 while staging) — no cast pass.
                         // `cmm_ok` implies `cmm_pso` is `Some` (both come from the same fetch).
                         let pso = cmm_pso.expect("cmm_ok implies a fetched cmm PSO");
-                        let bd = self.dev_dst(r, dst, m * out_f);
+                        let bd = self.dev_dst(r, dst, m * out_f)?;
                         if let Some(label) =
                             counter_linear_label(self.counter_set.is_some(), cmm_kern)
                         {
@@ -3041,10 +3276,10 @@ impl MetalBackend {
                         );
                     } else if hmm_ok {
                         // Prefill GEMM runs on half fragments (see `HGEMM_KERNEL`): cast x to an
-                        // f16 scratch first, then one GEMM dispatch reads it. Pooled by (size,tag)
-                        // — the cast fully overwrites it, so zero-init is irrelevant.
-                        let xh = self.scratch_buf((m * in_f * 2).max(4).div_ceil(4), 21);
-                        let bd = self.dev_dst(r, dst, m * out_f);
+                        // f16 scratch first, then one GEMM dispatch reads it. Pooled per tag —
+                        // the cast fully overwrites it, so zero-init is irrelevant.
+                        let xh = self.scratch_buf((m * in_f * 2).max(4).div_ceil(4), 21)?;
+                        let bd = self.dev_dst(r, dst, m * out_f)?;
                         let cast = self.pipelines.get("cast_f32_f16")?;
                         let n = (m * in_f) as u32;
                         if let Some(label) =
@@ -3147,8 +3382,8 @@ impl MetalBackend {
                                 "linear_q4_1_ks" => "linear_q4_1_ks_add",
                                 _ => "linear_q6k_add",
                             };
-                            let bres = self.ensure_device(r, res);
-                            let bfd = self.dev_dst(r, fdst, out_f);
+                            let bres = self.ensure_device(r, res)?;
+                            let bfd = self.dev_dst(r, fdst, out_f)?;
                             let pso = self.pipelines.get(fk)?;
                             if let Some(label) =
                                 counter_linear_label(self.counter_set.is_some(), fk)
@@ -3175,7 +3410,7 @@ impl MetalBackend {
                             return Ok(());
                         }
                         // Deferred past the fused check above (which returns early via `bfd`).
-                        let bd = self.dev_dst(r, dst, m * out_f);
+                        let bd = self.dev_dst(r, dst, m * out_f)?;
                         let pso = self.pipelines.get(kern)?;
                         if let Some(label) = counter_linear_label(self.counter_set.is_some(), kern)
                         {
@@ -3200,7 +3435,7 @@ impl MetalBackend {
                 } else {
                     // dev_dst deferred here (see the quant branch): every native-float sub-path
                     // below writes it, none returns before it.
-                    let bd = self.dev_dst(r, dst, m * out_f);
+                    let bd = self.dev_dst(r, dst, m * out_f)?;
                     let mcfg = self.metal();
                     let f16_native = wdt == DType::F16 && mcfg.f16_native;
                     let f32_native = wdt == DType::F32 && mcfg.f32_native;
@@ -3265,7 +3500,7 @@ impl MetalBackend {
                         }
                         let bw =
                             metal_buf(bindings.get(weight).expect("metal backend: unbound Weight"));
-                        let dummy = self.scratch_buf(1, 14);
+                        let dummy = self.scratch_buf(1, 14)?;
                         let mut cp = p.clone();
                         cp.extend_from_slice(&0u32.to_ne_bytes());
                         self.encode_tg_off(
@@ -3292,7 +3527,7 @@ impl MetalBackend {
                         }
                         let bw =
                             metal_buf(bindings.get(weight).expect("metal backend: unbound Weight"));
-                        let dummy = self.scratch_buf(1, 14);
+                        let dummy = self.scratch_buf(1, 14)?;
                         let mut rp = p.clone();
                         rp.extend_from_slice(&0u32.to_ne_bytes());
                         self.encode_tg_off(
@@ -3379,13 +3614,13 @@ impl MetalBackend {
                     "Metal Rope: strided x not supported (runner emits packed)"
                 );
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
-                let bx = self.ensure_device(r, x);
-                let bpos = self.ensure_device(r, positions);
+                let bx = self.ensure_device(r, x)?;
+                let bpos = self.ensure_device(r, positions)?;
                 let bff = match freq_factors {
-                    Some(f) => self.ensure_device(r, f),
-                    None => Arc::new(self.zeros_buf(1)),
+                    Some(f) => self.ensure_device(r, f)?,
+                    None => Arc::new(self.zeros_buf(1)?),
                 };
-                let bd = self.dev_dst(r, dst, rows * nh * hd);
+                let bd = self.dev_dst(r, dst, rows * nh * hd)?;
                 let pso = self.pipelines.get("rope_f32")?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(nh as u32).to_ne_bytes());
@@ -3422,7 +3657,7 @@ impl MetalBackend {
                 x_stride,
             } => {
                 let (rows, nh, hd) = (rows as usize, n_head as usize, head_dim as usize);
-                let bx = self.ensure_device(r, x);
+                let bx = self.ensure_device(r, x)?;
                 let bw = self.weight_buf(weight, g, bindings)?;
                 // The kernel reads the bound i32 positions buffer directly (exact widening in
                 // the shader) — no host round-trip, and the decode-replay tape stays valid when
@@ -3437,10 +3672,10 @@ impl MetalBackend {
                     .clone(),
                 );
                 let bff = match freq_factors {
-                    Some(f) => self.ensure_device(r, f),
-                    None => Arc::new(self.zeros_buf(1)),
+                    Some(f) => self.ensure_device(r, f)?,
+                    None => Arc::new(self.zeros_buf(1)?),
                 };
-                let bd = self.dev_dst(r, dst, rows * nh * hd);
+                let bd = self.dev_dst(r, dst, rows * nh * hd)?;
                 // Decode: the WIDE kernel — see `rmsnorm_wide_f32` (a decode row launches only
                 // n_head simdgroups on the 32-lane form and serializes head_dim/32 loads).
                 // Fetch the wide PSO once (cap read + dispatch shared two lookups before).
@@ -3482,9 +3717,9 @@ impl MetalBackend {
             }
             Op::Add { a, b, dst, n } => {
                 let n = n as usize;
-                let ba = self.ensure_device(r, a);
-                let bb = self.ensure_device(r, b);
-                let bd = self.dev_dst(r, dst, n);
+                let ba = self.ensure_device(r, a)?;
+                let bb = self.ensure_device(r, b)?;
+                let bd = self.dev_dst(r, dst, n)?;
                 let pso = self.pipelines.get("add_f32")?;
                 self.encode_w(
                     r,
@@ -3507,9 +3742,9 @@ impl MetalBackend {
             } => {
                 let (rows, n) = (rows as usize, n as usize);
                 let total = rows * n;
-                let bx = self.ensure_device(r, x);
+                let bx = self.ensure_device(r, x)?;
                 let bb = self.weight_buf(bias, g, bindings)?;
-                let bd = self.dev_dst(r, dst, total);
+                let bd = self.dev_dst(r, dst, total)?;
                 let pso = self.pipelines.get("add_bias_f32")?;
                 let mut p = (n as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(total as u32).to_ne_bytes());
@@ -3525,8 +3760,8 @@ impl MetalBackend {
             }
             Op::Scale { x, dst, s, n } => {
                 let n = n as usize;
-                let bx = self.ensure_device(r, x);
-                let bd = self.dev_dst(r, dst, n);
+                let bx = self.ensure_device(r, x)?;
+                let bd = self.dev_dst(r, dst, n)?;
                 let pso = self.pipelines.get("scale_f32")?;
                 let mut p = s.to_ne_bytes().to_vec();
                 p.extend_from_slice(&(n as u32).to_ne_bytes());
@@ -3544,9 +3779,9 @@ impl MetalBackend {
             } => {
                 let (rows, n) = (rows as usize, n as usize);
                 let total = rows * n;
-                let bx = self.ensure_device(r, x);
+                let bx = self.ensure_device(r, x)?;
                 let bv = self.weight_buf(vec, g, bindings)?;
-                let bd = self.dev_dst(r, dst, total);
+                let bd = self.dev_dst(r, dst, total)?;
                 let pso = self.pipelines.get("mul_vec_f32")?;
                 let mut p = (n as u32).to_ne_bytes().to_vec();
                 p.extend_from_slice(&(total as u32).to_ne_bytes());
@@ -3562,8 +3797,8 @@ impl MetalBackend {
             }
             Op::Softcap { x, dst, cap, n } => {
                 let n = n as usize;
-                let bx = self.ensure_device(r, x);
-                let bd = self.dev_dst(r, dst, n);
+                let bx = self.ensure_device(r, x)?;
+                let bd = self.dev_dst(r, dst, n)?;
                 let pso = self.pipelines.get("softcap_f32")?;
                 let mut p = cap.to_ne_bytes().to_vec();
                 p.extend_from_slice(&(n as u32).to_ne_bytes());
@@ -3582,12 +3817,12 @@ impl MetalBackend {
                 // Device-side stochastic sampling: only the 4-byte token id reads back, not the
                 // `[vocab]` logits. See `sample_f32` in elementwise_norms.metal for the algorithm
                 // (mirrors the host `sample_logits` order of operations exactly).
-                let bx = self.ensure_device(r, x);
-                let bu = self.ensure_device(r, u);
-                let bd = self.dev_dst(r, dst, 1);
+                let bx = self.ensure_device(r, x)?;
+                let bu = self.ensure_device(r, u)?;
+                let bd = self.dev_dst(r, dst, 1)?;
                 if let Some((groups, candidates)) = sample_split_shape(n as usize, top_k as usize) {
-                    let values = self.scratch_buf(candidates, 11);
-                    let indices = self.scratch_buf(candidates, 12);
+                    let values = self.scratch_buf(candidates, 11)?;
+                    let indices = self.scratch_buf(candidates, 12)?;
                     let mut p1 = n.to_ne_bytes().to_vec();
                     // Clamp to match the scratch sizing (`sample_split_shape`) — stage-1 writes
                     // `k` candidates per group into a `k`-per-group buffer; passing the raw
@@ -3699,7 +3934,7 @@ impl MetalBackend {
                 let (rows_u, ne_u) = (rows as usize, ne as usize);
                 let bt = metal_buf(bindings.get(table).expect("metal backend: unbound Weight"));
                 let bi = metal_buf(bindings.get(ids).expect("metal backend: unbound token IDs"));
-                let bd = self.dev_dst(r, dst, rows_u * ne_u);
+                let bd = self.dev_dst(r, dst, rows_u * ne_u)?;
                 let pso = self.pipelines.get(kern)?;
                 let mut p = rows.to_ne_bytes().to_vec();
                 p.extend_from_slice(&ne.to_ne_bytes());
@@ -3727,11 +3962,11 @@ impl MetalBackend {
                             .into(),
                     ));
                 }
-                let bx = self.ensure_device(r, x);
-                let bd = self.dev_dst(r, dst, 1);
+                let bx = self.ensure_device(r, x)?;
+                let bd = self.dev_dst(r, dst, 1)?;
                 if let Some(groups) = argmax_split_groups(n as usize) {
-                    let values = self.scratch_buf(groups, 9);
-                    let indices = self.scratch_buf(groups, 10);
+                    let values = self.scratch_buf(groups, 9)?;
+                    let indices = self.scratch_buf(groups, 10)?;
                     let mut p = n.to_ne_bytes().to_vec();
                     p.extend_from_slice(&(ARGMAX_SPLIT_CHUNK as u32).to_ne_bytes());
                     let stage1 = self.pipelines.get("argmax_f32_stage1")?;
@@ -3792,9 +4027,9 @@ impl MetalBackend {
                     ));
                 }
                 let (rows, nff) = (rows as usize, nff as usize);
-                let bg = self.ensure_device(r, gate);
-                let bu = self.ensure_device(r, up);
-                let bd = self.dev_dst(r, dst, rows * nff);
+                let bg = self.ensure_device(r, gate)?;
+                let bu = self.ensure_device(r, up)?;
+                let bd = self.dev_dst(r, dst, rows * nff)?;
                 let pso = self.pipelines.get("gatedact_f32")?;
                 let act_code: u32 = match act {
                     infr_core::graph::Activation::Silu => 0,
@@ -3837,8 +4072,8 @@ impl MetalBackend {
                     ));
                 }
                 let (rows, nff) = (rows as usize, nff as usize);
-                let bg = self.ensure_device(r, gu);
-                let bd = self.dev_dst(r, dst, rows * nff);
+                let bg = self.ensure_device(r, gu)?;
+                let bd = self.dev_dst(r, dst, rows * nff)?;
                 let pso = self.pipelines.get("gatedactfused_f32")?;
                 let act_code: u32 = match act {
                     infr_core::graph::Activation::Silu => 0,
@@ -3868,7 +4103,7 @@ impl MetalBackend {
                 if let (Some(dp), 1) = (r.dynpos, rows) {
                     pos = dp as usize;
                 }
-                let bsrc = self.ensure_device(r, src);
+                let bsrc = self.ensure_device(r, src)?;
                 let cbuf = metal_buf(
                     bindings
                         .get(cache)
@@ -3958,7 +4193,20 @@ impl MetalBackend {
                 pos,
                 sinks,
                 key_bias,
+                comp,
             } => {
+                // DeepSeek V4's compressed key segment (`Op::Attention::comp`) has no Metal kernel:
+                // its only consumer has a head wider than this backend's attention bound below,
+                // so a kernel here would serve no model. Refuse it rather than attend the raw
+                // keys alone.
+                infr_core::graph::check_attention(g, op).map_err(Error::Unsupported)?;
+                if comp.is_some() {
+                    return Err(Error::Unsupported(
+                        "metal attention: Op::Attention::comp (DeepSeek V4's compressed keys) has \
+                         no Metal kernel"
+                            .into(),
+                    ));
+                }
                 let (rows, kv_len, nh, nkv, hd) = (
                     rows as usize,
                     kv_len as usize,
@@ -3982,8 +4230,8 @@ impl MetalBackend {
                 // wrote this same buffer earlier in the batch; hazard tracking makes it visible here.
                 let kbuf = metal_buf(bindings.get(k_cache).expect("metal: unbound k_cache"));
                 let vbuf = metal_buf(bindings.get(v_cache).expect("metal: unbound v_cache"));
-                let bq = self.ensure_device(r, q);
-                let bd = self.dev_dst(r, dst, rows * nh * hd);
+                let bq = self.ensure_device(r, q)?;
+                let bd = self.dev_dst(r, dst, rows * nh * hd)?;
                 // DiffusionGemma canvas denoise (docs/diffusion-gemma.md, `AttnMask::Canvas`):
                 // EVERY row attends the SAME fixed bidirectional `[lo, kv_len)`, ignoring its own
                 // causal position entirely. `window` stays meaningless for it (the dedicated
@@ -4057,7 +4305,7 @@ impl MetalBackend {
                     match (sinks, key_bias) {
                         (Some(sk), Some(kb)) => {
                             let bsk = self.weight_buf(sk, g, bindings)?;
-                            let bkb = self.ensure_device(r, kb);
+                            let bkb = self.ensure_device(r, kb)?;
                             let kern = if f16kv {
                                 "attention_sinks_bias_f16kv"
                             } else {
@@ -4100,7 +4348,7 @@ impl MetalBackend {
                             );
                         }
                         (None, Some(kb)) => {
-                            let bkb = self.ensure_device(r, kb);
+                            let bkb = self.ensure_device(r, kb)?;
                             let kern = if f16kv {
                                 "attention_bias_f16kv"
                             } else {
@@ -4233,20 +4481,26 @@ impl MetalBackend {
                     }
                 }
                 let ne = kv_len * nkv * hd;
-                // f16 dequant scratch, pooled by (size, tag) rather than freshly allocated per
-                // layer per token (the pool amortizes across every layer at a given depth; the
-                // dequant fully overwrites `ne` elements, so zero-init is irrelevant). Distinct
-                // K/V tags so both sides stay live simultaneously. This static-decode path never
-                // tapes, and the serial walk's automatic hazard tracking serializes reuse.
+                // f16 dequant scratch, pooled per tag rather than freshly allocated per layer per
+                // token (one buffer serves every layer and, grown as `kv_len` does, every depth;
+                // the dequant overwrites `ne` elements). Distinct K/V tags so both sides stay live
+                // simultaneously. This static-decode path never tapes, and the serial walk's
+                // automatic hazard tracking serializes reuse. Padded like the cache itself
+                // (`policy::KV_ROW_ALIGN`), so a prefill over the scratch keeps the flash path;
+                // the tail rows are zero or an earlier dequant, so finite.
+                let scratch_rows = kv_len
+                    .max(pos as usize + rows)
+                    .next_multiple_of(policy::KV_ROW_ALIGN);
+                let scratch_n = (scratch_rows * nkv * hd * 2).max(4).div_ceil(4);
                 let ks: Option<Arc<MtlBuffer>> = if prep(kdt) {
-                    let s = self.scratch_buf((ne * 2).max(4).div_ceil(4), 18);
+                    let s = self.scratch_buf(scratch_n, 18)?;
                     self.dequant_kv_f16(r, kdt, &kbuf.raw, &s, ne)?;
                     Some(s)
                 } else {
                     None
                 };
                 let vs: Option<Arc<MtlBuffer>> = if prep(vdt) {
-                    let s = self.scratch_buf((ne * 2).max(4).div_ceil(4), 19);
+                    let s = self.scratch_buf(scratch_n, 19)?;
                     self.dequant_kv_f16(r, vdt, &vbuf.raw, &s, ne)?;
                     Some(s)
                 } else {
@@ -4297,7 +4551,7 @@ impl MetalBackend {
                         p.extend_from_slice(&pos.to_ne_bytes());
                         let n = rows * nh * hd;
                         // Pooled q-cast scratch (cast overwrites all `n`); tag 20 for the q8 path.
-                        let qh = self.scratch_buf((n * 2).max(4).div_ceil(4), 20);
+                        let qh = self.scratch_buf((n * 2).max(4).div_ceil(4), 20)?;
                         let cast = self.pipelines.get("cast_f32_f16")?;
                         self.encode(
                             r,
@@ -4455,33 +4709,23 @@ impl MetalBackend {
                     256 => Some("attnflash2_f16kv_hd256"),
                     _ => None,
                 };
-                let flash2_kern = select_attention_flash2_kern(
-                    f16,
-                    rows,
-                    nh,
-                    kv_len,
-                    hd,
-                    || {
-                        self.pipelines
-                            .get("attnflash2_c128_f16kv_hd128")
-                            .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
-                            .unwrap_or(false)
-                    },
-                    || {
-                        standard_flash2_kern.filter(|kn| {
-                            self.pipelines
-                                .get(kn)
-                                .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
-                                .unwrap_or(false)
-                        })
-                    },
-                );
-                let flash2_ok = flash2_kern.is_some();
-                // hd > 128 has no single-simdgroup flash fallback (its register accumulator
-                // tops out at 128), so the wide gate only opens there when flash2 itself can run.
-                let flash = prefer_attention_flash(f16, rows, nh, kv_len, hd, flash2_ok);
-                let split = !flash && (rows * nh < 128 || kv_len >= 128);
-                let flash2 = flash && flash2_ok;
+                // The vector flash kernel (llama.cpp flash_attn_ext_vec structure) covers the
+                // long-context decode shape split32 serves, at 32 KV positions per simdgroup
+                // step instead of 1 — same head-size instantiations and cap gating as flash2.
+                let vec_kern = match hd {
+                    64 => Some("attnvec_f16kv_hd64"),
+                    128 => Some("attnvec_f16kv_hd128"),
+                    256 => Some("attnvec_f16kv_hd256"),
+                    _ => None,
+                };
+                // hd=256 instantiates at NSG=16 (threadgroup budget) — 512 threads.
+                let vec_nsg: usize = if hd == 256 { 16 } else { 32 };
+                let pipe_ok = |name: &'static str, threads: u64| {
+                    self.pipelines
+                        .get(name)
+                        .map(|pl| pl.max_total_threads_per_threadgroup() >= threads)
+                        .unwrap_or(false)
+                };
                 // The split kernels REQUIRE their full NSG*32-thread threadgroup: every simdgroup
                 // owns a strided KV slice, so a smaller launch would silently skip positions and
                 // merge uninitialized partials. maxTotalThreadsPerThreadgroup is per-PIPELINE
@@ -4495,60 +4739,61 @@ impl MetalBackend {
                         .max_total_threads_per_threadgroup()
                         >= threads)
                 };
-                // The vector flash kernel (llama.cpp flash_attn_ext_vec structure) covers the
-                // long-context decode shape split32 serves, at 32 KV positions per simdgroup
-                // step instead of 1 — same head-size instantiations and cap gating as flash2.
-                let vec_kern = match hd {
-                    64 => Some("attnvec_f16kv_hd64"),
-                    128 => Some("attnvec_f16kv_hd128"),
-                    256 => Some("attnvec_f16kv_hd256"),
-                    _ => None,
+                // The flash kernels load whole KV blocks, reading past the newest key to the next
+                // block boundary, so the rows the bound buffers (the cache, or the dequant scratch
+                // above) hold decide whether they may run; see `policy::select_attention`.
+                let shape = policy::AttnShape {
+                    f16,
+                    rows,
+                    n_head: nh,
+                    kv_len,
+                    head_dim: hd,
+                    pos: pos as usize,
+                    kv_cap_rows: (k_raw.length().min(v_raw.length()) / (nkv * hd * 2) as u64)
+                        as usize,
                 };
-                // hd=256 instantiates at NSG=16 (threadgroup budget) — 512 threads.
-                let vec_nsg: usize = if hd == 256 { 16 } else { 32 };
-                let vec = !flash
-                    && f16
-                    && split
-                    && kv_len >= 128
-                    && vec_kern.is_some_and(|kn| {
-                        self.pipelines
-                            .get(kn)
-                            .map(|pl| pl.max_total_threads_per_threadgroup() >= vec_nsg as u64 * 32)
-                            .unwrap_or(false)
-                    });
-                let split32 = split
-                    && !vec
-                    && kv_len >= 128
-                    && hd <= 128
-                    && fits(
-                        if f16 {
-                            "attnsplit32_f16kv"
-                        } else {
-                            "attnsplit32_f32"
-                        },
-                        1024,
-                    )?;
-                let split = split
-                    && (vec
-                        || split32
-                        || fits(
+                let choice = policy::select_attention(&shape, |pipe| -> Result<bool> {
+                    use policy::AttnPipe as P;
+                    Ok(match pipe {
+                        P::Flash2C128 => pipe_ok("attnflash2_c128_f16kv_hd128", 128),
+                        P::Flash2 => standard_flash2_kern.is_some_and(|kn| pipe_ok(kn, 128)),
+                        P::Vec => vec_kern.is_some_and(|kn| pipe_ok(kn, vec_nsg as u64 * 32)),
+                        P::Split32 => fits(
+                            if f16 {
+                                "attnsplit32_f16kv"
+                            } else {
+                                "attnsplit32_f32"
+                            },
+                            1024,
+                        )?,
+                        P::Split => fits(
                             if f16 {
                                 "attnsplit_f16kv"
                             } else {
                                 "attnsplit_f32"
                             },
                             256,
-                        )?);
-                let kern = match (flash, f16, split, split32) {
-                    (true, ..) if flash2 => flash2_kern.unwrap(),
-                    (true, ..) => "attnflash_f16kv",
-                    (_, true, true, _) if vec => vec_kern.unwrap(),
-                    (_, true, false, _) => "attention_f16kv",
-                    (_, true, _, true) => "attnsplit32_f16kv",
-                    (_, true, true, false) => "attnsplit_f16kv",
-                    (_, false, false, _) => "attention_f32",
-                    (_, false, _, true) => "attnsplit32_f32",
-                    (_, false, true, false) => "attnsplit_f32",
+                        )?,
+                    })
+                })?;
+                use policy::AttnKernel as K;
+                let flash = matches!(choice, K::Flash2C128 | K::Flash2 | K::Flash);
+                let flash2 = matches!(choice, K::Flash2C128 | K::Flash2);
+                let vec = choice == K::Vec;
+                let split32 = choice == K::Split32;
+                let split = choice == K::Split;
+                let kern = match (choice, f16) {
+                    (K::Flash2C128, _) => "attnflash2_c128_f16kv_hd128",
+                    // The selection only names these where the head size has an instantiation.
+                    (K::Flash2, _) => standard_flash2_kern.unwrap(),
+                    (K::Flash, _) => "attnflash_f16kv",
+                    (K::Vec, _) => vec_kern.unwrap(),
+                    (K::Split32, true) => "attnsplit32_f16kv",
+                    (K::Split, true) => "attnsplit_f16kv",
+                    (K::Plain, true) => "attention_f16kv",
+                    (K::Split32, false) => "attnsplit32_f32",
+                    (K::Split, false) => "attnsplit_f32",
+                    (K::Plain, false) => "attention_f32",
                 };
                 let pso = self.pipelines.get(kern)?;
                 let mut p = (rows as u32).to_ne_bytes().to_vec();
@@ -4564,7 +4809,7 @@ impl MetalBackend {
                     // one simdgroup per (8-query tile, head).
                     let n = rows * nh * hd;
                     // Pooled q-cast scratch (cast overwrites all `n`); tag 22 for the f16 flash.
-                    let qh = self.scratch_buf((n * 2).max(4).div_ceil(4), 22);
+                    let qh = self.scratch_buf((n * 2).max(4).div_ceil(4), 22)?;
                     let cast = self.pipelines.get("cast_f32_f16")?;
                     self.encode(
                         r,
@@ -4636,11 +4881,11 @@ impl MetalBackend {
                 // weighting; llama4's sigmoid/no-renorm/weight-before-FFN routing is CPU-only (see
                 // the `llama4` arch note) and never reaches a GPU backend in-tree.
                 //
-                // DeepSeek V2+ adds two routing inputs this path does not read: the `exp_probs_b`
-                // selection bias and group-limited routing. Sigmoid-gated V3 already fails the
-                // gating check above, but softmax + renorm + `expert_group_count > 1` is a legal
-                // deepseek2 config that would otherwise pass it and then route with neither the
-                // bias nor the group mask applied — the wrong experts, silently. Refuse instead.
+                // The `exp_probs_b` selection bias is added to the softmax probabilities on both
+                // paths below (ERNIE 4.5 MoE's router). Group-limited routing is not implemented:
+                // sigmoid-gated V3 already fails the gating check above, but softmax + renorm +
+                // `expert_group_count > 1` is a legal deepseek2 config that would otherwise pass it
+                // and then route without the group mask — the wrong experts, silently. Refuse it.
                 assert!(
                     matches!(gating, infr_core::graph::MoeGating::Softmax)
                         && norm_w
@@ -4648,15 +4893,18 @@ impl MetalBackend {
                     "Metal MoeFfn: only softmax + renorm + output-weighting supported (llama4 is CPU-only)"
                 );
                 assert!(
-                    exp_probs_b.is_none() && n_expert_groups <= 1,
-                    "Metal MoeFfn: DeepSeek V2+ router extensions are unimplemented here \
-                     (exp_probs_b bias: {}, expert groups: {n_expert_groups}, used: \
-                     {n_expert_groups_used}) — run this model on the CPU or Vulkan backend",
-                    exp_probs_b.is_some(),
+                    n_expert_groups <= 1,
+                    "Metal MoeFfn: group-limited routing is unimplemented here (expert groups: \
+                     {n_expert_groups}, used: {n_expert_groups_used}) — run this model on the CPU \
+                     or Vulkan backend",
                 );
-                // DeepSeek V4 hash routing supplies the selection outright, so the two
-                // SELECTION-only inputs above have nothing left to act on — the assert already
-                // rules them out here, which is the same exclusion the CPU reference enforces.
+                // DeepSeek V4 hash routing supplies the selection outright, so the SELECTION-only
+                // bias has nothing left to act on — the same exclusion the CPU reference enforces.
+                assert!(
+                    expert_ids.is_none() || exp_probs_b.is_none(),
+                    "Metal MoeFfn: expert_ids (hash routing) supplies the selection — exp_probs_b \
+                     has nothing to select"
+                );
                 let (ne, n_expert, n_used, nffx) = (
                     ne as usize,
                     n_expert as usize,
@@ -4670,40 +4918,20 @@ impl MetalBackend {
                 // GEMV -> on-device top-k -> expert-BATCHED GEMV stages picking their weight
                 // slices from the device expert table, weighted sum via a final reduce. Seven
                 // dispatches, no expert bytes or activations on the host. Falls back to the host
-                // path below for other dtypes (INFR_METAL_NOMOE forces it).
-                let moe_kern = |dt: DType| -> Option<(&'static str, &'static str)> {
-                    match dt {
-                        DType::Q4K => Some(("linear_q4k_moe", "linear_q4k_moe_acc")),
-                        DType::Q6K => Some(("linear_q6k_moe", "linear_q6k_moe_acc")),
-                        _ => None,
-                    }
-                };
+                // path below for other dtypes (INFR_METAL_NOMOE forces it); see `moe_ffn_on_device`.
                 let (gdt2, udt2, ddt2) = (
                     g.desc(gate_exps).dtype,
                     g.desc(up_exps).dtype,
                     g.desc(down_exps).dtype,
                 );
-                // The device path assumes SEPARATE full-width gate/up expert banks and no per-
-                // expert down scale (qwen3moe's shape); diffusion-gemma's fused `gate_up_exps` +
-                // `ffn_down_exps.scale` always falls to the host path below instead of teaching
-                // the device kernels a layout they don't expect.
-                let device_ok = n_used <= 16
-                    && ne % 256 == 0
-                    && nffx % 256 == 0
-                    && !fused_gate_up
-                    && down_scale.is_none()
-                    && self.metal().moe
-                    && moe_kern(gdt2).is_some()
-                    && moe_kern(udt2).is_some()
-                    && moe_kern(ddt2).is_some();
-                if device_ok {
-                    let bx = self.ensure_device(r, x);
-                    let bd = self.dev_dst(r, dst, rows * ne);
+                if moe_ffn_on_device(op, g, self.metal()) {
+                    let bx = self.ensure_device(r, x)?;
+                    let bd = self.dev_dst(r, dst, rows * ne)?;
                     // Router logits for ALL rows (one GEMV-per-(row, expert) dispatch over the
                     // dequant-cached router weight), then per-row top-k into the [rows, 32]
                     // expert table (idx in slots 0..16, f32 weights in 16..32).
                     let rw = self.weight_buf(router, g, bindings)?;
-                    let logits = self.scratch_buf(rows * n_expert, 0);
+                    let logits = self.scratch_buf(rows * n_expert, 0)?;
                     let pso = self.pipelines.get("linear_f32")?;
                     let mut p = (rows as u32).to_ne_bytes().to_vec();
                     p.extend_from_slice(&(ne as u32).to_ne_bytes());
@@ -4717,12 +4945,17 @@ impl MetalBackend {
                         rows * n_expert * 32,
                         32,
                     );
-                    let tbl = self.scratch_buf(rows * 32, 1);
+                    let tbl = self.scratch_buf(rows * 32, 1)?;
                     // Hash routing: the pre-gathered `[rows, n_used]` ids replace the kernel's
                     // top-k. Absent, `logits` is rebound as a harmless placeholder the kernel
                     // never reads (`hash == 0`) — Metal needs every declared buffer bound.
                     let hb = match expert_ids {
-                        Some(hid) => self.ensure_device(r, hid),
+                        Some(hid) => self.ensure_device(r, hid)?,
+                        None => logits.clone(),
+                    };
+                    // The router bias, or the same harmless placeholder (`has_bias == 0`).
+                    let bb = match exp_probs_b {
+                        Some(epb) => self.weight_buf(epb, g, bindings)?,
                         None => logits.clone(),
                     };
                     let pso = self.pipelines.get("moe_topk")?;
@@ -4730,11 +4963,12 @@ impl MetalBackend {
                     p.extend_from_slice(&(n_used as u32).to_ne_bytes());
                     p.extend_from_slice(&scale.to_ne_bytes());
                     p.extend_from_slice(&u32::from(expert_ids.is_some()).to_ne_bytes());
+                    p.extend_from_slice(&u32::from(exp_probs_b.is_some()).to_ne_bytes());
                     self.encode_tg_w(
                         r,
                         &pso,
-                        &[logits.as_ref(), hb.as_ref(), tbl.as_ref()],
-                        1 << 2,
+                        &[logits.as_ref(), hb.as_ref(), bb.as_ref(), tbl.as_ref()],
+                        1 << 3,
                         &p,
                         rows * 32,
                         32,
@@ -4742,15 +4976,15 @@ impl MetalBackend {
                     // Expert FFN, batched over (chunk rows x selected experts) — one dispatch per
                     // stage per chunk; chunking bounds the expert scratch (a full 8k-row prefill
                     // would need ~0.5 GB of it).
-                    let gq = self.weight_qui(gate_exps, g, bindings);
-                    let uq = self.weight_qui(up_exps, g, bindings);
-                    let dq = self.weight_qui(down_exps, g, bindings);
+                    let gq = self.weight_qui(gate_exps, g, bindings)?;
+                    let uq = self.weight_qui(up_exps, g, bindings)?;
+                    let dq = self.weight_qui(down_exps, g, bindings)?;
                     const CHUNK: usize = 256;
                     let chunk = rows.min(CHUNK);
-                    let gate_t = self.scratch_buf(chunk * n_used * nffx, 2);
-                    let up_t = self.scratch_buf(chunk * n_used * nffx, 3);
-                    let act_t = self.scratch_buf(chunk * n_used * nffx, 4);
-                    let ydown = self.scratch_buf(chunk * n_used * ne, 5);
+                    let gate_t = self.scratch_buf(chunk * n_used * nffx, 2)?;
+                    let up_t = self.scratch_buf(chunk * n_used * nffx, 3)?;
+                    let act_t = self.scratch_buf(chunk * n_used * nffx, 4)?;
+                    let ydown = self.scratch_buf(chunk * n_used * ne, 5)?;
                     let act_code: u32 = match act {
                         infr_core::graph::Activation::Silu => 0,
                         infr_core::graph::Activation::Gelu => 1,
@@ -4782,8 +5016,8 @@ impl MetalBackend {
                                 .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
                                 .unwrap_or(false)
                         };
-                    let ids = self.scratch_buf(n_expert * rows.min(CHUNK), 6);
-                    let tpe = self.scratch_buf(n_expert, 7);
+                    let ids = self.scratch_buf(n_expert * rows.min(CHUNK), 6)?;
+                    let tpe = self.scratch_buf(n_expert, 7)?;
                     let cmm_id = |dt: DType, scale: bool| -> &'static str {
                         match (dt, scale) {
                             (DType::Q4K, false) => "linear_q4k_cmm_id",
@@ -4905,7 +5139,7 @@ impl MetalBackend {
                             self.encode(r, &pso, &[ydown.as_ref(), bd.as_ref()], &p, cr * ne);
                             continue;
                         }
-                        let pso = self.pipelines.get(moe_kern(gdt2).unwrap().0)?;
+                        let pso = self.pipelines.get(moe_expert_kerns(gdt2).unwrap().0)?;
                         self.encode_tg_w(
                             r,
                             &pso,
@@ -4922,7 +5156,7 @@ impl MetalBackend {
                             cr * n_used * (nffx / 2) * 32,
                             32,
                         );
-                        let pso = self.pipelines.get(moe_kern(udt2).unwrap().0)?;
+                        let pso = self.pipelines.get(moe_expert_kerns(udt2).unwrap().0)?;
                         self.encode_tg_w(
                             r,
                             &pso,
@@ -4957,7 +5191,7 @@ impl MetalBackend {
                             &p,
                             cr * n_used * nffx,
                         );
-                        let pso = self.pipelines.get(moe_kern(ddt2).unwrap().1)?;
+                        let pso = self.pipelines.get(moe_expert_kerns(ddt2).unwrap().1)?;
                         self.encode_tg_w(
                             r,
                             &pso,
@@ -5019,6 +5253,7 @@ impl MetalBackend {
                     self.ensure_host(r, g, id);
                     r.vals[id.0 as usize].clone()
                 });
+                let bias = exp_probs_b.map(|id| self.weight_host(id, g, bindings));
                 let mut out = vec![0f32; rows * ne];
                 for (row, orow) in out.chunks_mut(ne).enumerate() {
                     let xr = &xs[row * ne..row * ne + ne];
@@ -5027,6 +5262,7 @@ impl MetalBackend {
                         .map(|e| (0..ne).map(|i| rw[e * ne + i] * xrr[i]).sum::<f32>())
                         .collect();
                     let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                     let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
                     let psum: f32 = probs.iter().sum();
                     for p in probs.iter_mut() {
@@ -5048,10 +5284,16 @@ impl MetalBackend {
                             })
                             .collect(),
                         None => {
+                            // The router bias shifts the SELECTION only (the CPU reference's
+                            // `sel_probs`); the weights below use the unbiased `probs`.
+                            let sel: Vec<f32> = match &bias {
+                                Some(b) => probs.iter().zip(b).map(|(p, b)| p + b).collect(),
+                                None => probs.clone(),
+                            };
                             let mut idx: Vec<usize> = (0..n_expert).collect();
                             idx.sort_by(|&a, &b| {
-                                probs[b]
-                                    .partial_cmp(&probs[a])
+                                sel[b]
+                                    .partial_cmp(&sel[a])
                                     .unwrap_or(std::cmp::Ordering::Equal)
                             });
                             idx.truncate(n_used);
@@ -5117,9 +5359,9 @@ impl MetalBackend {
                 // kernel's register window; no real conv ships that (qwen3-next uses 4).
                 if kk <= 8 && self.metal().deltanet {
                     if let Some(sb) = bindings.get(state) {
-                        let bx = self.ensure_device(r, x);
+                        let bx = self.ensure_device(r, x)?;
                         let bw = self.weight_buf(weight, g, bindings)?;
-                        let bd = self.dev_dst(r, dst, rr * cc);
+                        let bd = self.dev_dst(r, dst, rr * cc)?;
                         let sbuf = metal_buf(sb);
                         let i = state.0 as usize;
                         r.dev[i] = Some(Arc::new(sbuf.raw.clone()));
@@ -5167,30 +5409,111 @@ impl MetalBackend {
                 let xs = r.vals[x.0 as usize].clone(); // [rows, channels]
                 let ws = self.weight_host(weight, g, bindings); // [channels, kernel]
                 let st = &mut r.vals[state.0 as usize]; // [(kernel-1), channels], oldest first
-                let mut out = vec![0f32; rr * cc];
-                for t in 0..rr {
-                    let xt = &xs[t * cc..t * cc + cc];
-                    for ch in 0..cc {
-                        let mut acc = 0f32;
-                        for j in 0..kk - 1 {
-                            acc += st[j * cc + ch] * ws[ch * kk + j];
+                let out = host_causal_conv(&xs, &ws, st, rr, cc, kk, true);
+                r.vals[dst.0 as usize] = out;
+                r.loc[dst.0 as usize] = Loc::Host;
+            }
+            // LFM gated short convolution: Conv1dSilu's kernels and gates, on the B ⊙ X input
+            // with a C ⊙ output and no SiLU (see `Op::ShortConv`).
+            Op::ShortConv {
+                bcx,
+                weight,
+                state,
+                dst,
+                rows,
+                channels,
+                kernel,
+            } => {
+                let (rr, cc, kk) = (rows as usize, channels as usize, kernel as usize);
+                if kk <= 8 && self.metal().deltanet {
+                    if let Some(sb) = bindings.get(state) {
+                        let bx = self.ensure_device(r, bcx)?;
+                        let bw = self.weight_buf(weight, g, bindings)?;
+                        let bd = self.dev_dst(r, dst, rr * cc)?;
+                        let sbuf = metal_buf(sb);
+                        let i = state.0 as usize;
+                        r.dev[i] = Some(Arc::new(sbuf.raw.clone()));
+                        r.loc[i] = Loc::Device;
+                        let mut p = (rr as u32).to_ne_bytes().to_vec();
+                        p.extend_from_slice(&(cc as u32).to_ne_bytes());
+                        p.extend_from_slice(&(kk as u32).to_ne_bytes());
+                        if prefer_conv1d_parallel(rr, kk) && self.metal().conv1d_par {
+                            let pso = self.pipelines.get("shortconv_par_f32")?;
+                            self.encode_w(
+                                r,
+                                &pso,
+                                &[bx.as_ref(), bw.as_ref(), &sbuf.raw, bd.as_ref()],
+                                1 << 3,
+                                &p,
+                                rr * cc,
+                            );
+                            let shift = self.pipelines.get("shortconv_shift_f32")?;
+                            self.encode_w(
+                                r,
+                                &shift,
+                                &[bx.as_ref(), &sbuf.raw],
+                                1 << 1,
+                                &p,
+                                (kk - 1) * cc,
+                            );
+                        } else {
+                            let pso = self.pipelines.get("shortconv_f32")?;
+                            self.encode_w(
+                                r,
+                                &pso,
+                                &[bx.as_ref(), bw.as_ref(), &sbuf.raw, bd.as_ref()],
+                                (1 << 2) | (1 << 3),
+                                &p,
+                                cc,
+                            );
                         }
-                        acc += xt[ch] * ws[ch * kk + (kk - 1)];
-                        out[t * cc + ch] = acc / (1.0 + (-acc).exp()); // silu
+                        r.loc[dst.0 as usize] = Loc::Device;
+                        return Ok(());
                     }
-                    for j in 0..kk.saturating_sub(2) {
-                        for ch in 0..cc {
-                            st[j * cc + ch] = st[(j + 1) * cc + ch];
-                        }
-                    }
-                    if kk >= 2 {
-                        for ch in 0..cc {
-                            st[(kk - 2) * cc + ch] = xt[ch];
-                        }
-                    }
+                }
+                self.ensure_host(r, g, bcx);
+                self.ensure_host(r, g, state);
+                let bv = r.vals[bcx.0 as usize].clone(); // [rows, 3*channels]: B | C | X
+                let bxs: Vec<f32> = (0..rr * cc)
+                    .map(|i| {
+                        let row = &bv[(i / cc) * 3 * cc..];
+                        row[i % cc] * row[2 * cc + i % cc]
+                    })
+                    .collect();
+                let ws = self.weight_host(weight, g, bindings);
+                let st = &mut r.vals[state.0 as usize];
+                let mut out = host_causal_conv(&bxs, &ws, st, rr, cc, kk, false);
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o *= bv[(i / cc) * 3 * cc + cc + i % cc];
                 }
                 r.vals[dst.0 as usize] = out;
                 r.loc[dst.0 as usize] = Loc::Host;
+            }
+            // LFM3 attention output gate, one sigmoid per (row, head).
+            Op::HeadGate {
+                x,
+                gate,
+                dst,
+                rows,
+                n_head,
+                head_dim,
+            } => {
+                let total = (rows * n_head * head_dim) as usize;
+                let bx = self.ensure_device(r, x)?;
+                let bg = self.ensure_device(r, gate)?;
+                let bd = self.dev_dst(r, dst, total)?;
+                let pso = self.pipelines.get("head_gate_f32")?;
+                let mut p = (total as u32).to_ne_bytes().to_vec();
+                p.extend_from_slice(&head_dim.to_ne_bytes());
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[bx.as_ref(), bg.as_ref(), bd.as_ref()],
+                    1 << 2,
+                    &p,
+                    total,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
             }
             Op::DeltaNet {
                 q,
@@ -5228,34 +5551,38 @@ impl MetalBackend {
                 // (kd/32 state entries per lane, register-resident for the whole chunk), so the
                 // row scan needs only simd_sums; 4 simdgroups share a threadgroup for occupancy
                 // (grid = nv * vd/4 threadgroups vs the old nv). State updates the BOUND buffer
-                // in place. Gates match the kernel's register/split budgets (kd % 32 for the
-                // per-lane split, kd <= 256 for the ls[] register cap, vd % 4 for the
+                // in place. Gates match the kernel's register/split budgets (a compiled lane
+                // width that is exactly kd/32, see `policy::deltanet_kpl_index`; vd % 4 for the
                 // simdgroup packing).
-                if kd <= 256
-                    && kd.is_multiple_of(32)
-                    && vd.is_multiple_of(4)
-                    && vd <= 1024
-                    && self.metal().deltanet
-                {
+                let kpl = policy::deltanet_kpl_index(kd)
+                    .filter(|_| vd.is_multiple_of(4) && vd <= 1024 && self.metal().deltanet);
+                if let Some(kpl) = kpl {
                     if let Some(sb) = bindings.get(state) {
                         // KPL = kd/32 is a compile-time template parameter (register
-                        // promotion needs the fixed bound) — pick the instantiation.
+                        // promotion needs the fixed bound) — pick the instantiation. Each list is
+                        // in `policy::DELTANET_KPL` order.
                         let gate_prep = prefer_deltanet_gate_prep(rr) && self.metal().dn_gate_prep;
                         let norm_prep =
                             gate_prep && prefer_deltanet_norm_prep(rr) && self.metal().dn_norm_prep;
-                        let dn_kern: &'static str = match (gate_prep, norm_prep, kd / 32) {
-                            (false, _, 1) => "deltanet_f32_k1",
-                            (false, _, 2) => "deltanet_f32_k2",
-                            (false, _, 4) => "deltanet_f32_k4",
-                            (false, _, _) => "deltanet_f32_k8",
-                            (true, false, 1) => "deltanet_gates_k1",
-                            (true, false, 2) => "deltanet_gates_k2",
-                            (true, false, 4) => "deltanet_gates_k4",
-                            (true, false, _) => "deltanet_gates_k8",
-                            (true, true, 1) => "deltanet_prepared_k1",
-                            (true, true, 2) => "deltanet_prepared_k2",
-                            (true, true, 4) => "deltanet_prepared_k4",
-                            (true, true, _) => "deltanet_prepared_k8",
+                        let dn_kern: &'static str = match (gate_prep, norm_prep) {
+                            (false, _) => [
+                                "deltanet_f32_k1",
+                                "deltanet_f32_k2",
+                                "deltanet_f32_k4",
+                                "deltanet_f32_k8",
+                            ][kpl],
+                            (true, false) => [
+                                "deltanet_gates_k1",
+                                "deltanet_gates_k2",
+                                "deltanet_gates_k4",
+                                "deltanet_gates_k8",
+                            ][kpl],
+                            (true, true) => [
+                                "deltanet_prepared_k1",
+                                "deltanet_prepared_k2",
+                                "deltanet_prepared_k4",
+                                "deltanet_prepared_k8",
+                            ][kpl],
                         };
                         let fits = self
                             .pipelines
@@ -5263,27 +5590,27 @@ impl MetalBackend {
                             .map(|pl| pl.max_total_threads_per_threadgroup() >= 128)
                             .unwrap_or(false);
                         if fits {
-                            let bq = self.ensure_device(r, q);
-                            let bk = self.ensure_device(r, k);
-                            let bv = self.ensure_device(r, v);
-                            let bb = self.ensure_device(r, b);
-                            let ba = self.ensure_device(r, a);
+                            let bq = self.ensure_device(r, q)?;
+                            let bk = self.ensure_device(r, k)?;
+                            let bv = self.ensure_device(r, v)?;
+                            let bb = self.ensure_device(r, b)?;
+                            let ba = self.ensure_device(r, a)?;
                             let bac = self.weight_buf(a_coef, g, bindings)?;
                             let bdt = self.weight_buf(dt_bias, g, bindings)?;
                             let gates = if gate_prep {
-                                self.scratch_buf(rr * nv * 2, 15)
+                                self.scratch_buf(rr * nv * 2, 15)?
                             } else {
                                 bb.clone()
                             };
                             let (scan_q, scan_k) = if norm_prep {
                                 (
-                                    self.scratch_buf(rr * nk * kd, 16),
-                                    self.scratch_buf(rr * nk * kd, 17),
+                                    self.scratch_buf(rr * nk * kd, 16)?,
+                                    self.scratch_buf(rr * nk * kd, 17)?,
                                 )
                             } else {
                                 (bq.clone(), bk.clone())
                             };
-                            let bd = self.dev_dst(r, dst, rr * nv * vd);
+                            let bd = self.dev_dst(r, dst, rr * nv * vd)?;
                             let sbuf = metal_buf(sb);
                             let i = state.0 as usize;
                             r.dev[i] = Some(Arc::new(sbuf.raw.clone()));
@@ -5315,12 +5642,12 @@ impl MetalBackend {
                                 );
                             }
                             if norm_prep {
-                                let norm_kern = match kd / 32 {
-                                    1 => "deltanet_norm_k1",
-                                    2 => "deltanet_norm_k2",
-                                    4 => "deltanet_norm_k4",
-                                    _ => "deltanet_norm_k8",
-                                };
+                                let norm_kern = [
+                                    "deltanet_norm_k1",
+                                    "deltanet_norm_k2",
+                                    "deltanet_norm_k4",
+                                    "deltanet_norm_k8",
+                                ][kpl];
                                 let npso = self.pipelines.get(norm_kern)?;
                                 let mut np = (rr as u32).to_ne_bytes().to_vec();
                                 np.extend_from_slice(&(nk as u32).to_ne_bytes());
@@ -5393,11 +5720,14 @@ impl MetalBackend {
                         for x in kh.iter_mut() {
                             *x /= kn;
                         }
+                        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                         let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
                         let sp = {
                             let z = af[bb + h] + dtb[h];
+                            // libm-ok(S2) x2: platform `exp`, `ln_1p`, moves to `infr_core::math` in S2
                             z.max(0.0) + (-z.abs()).exp().ln_1p()
                         };
+                        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
                         let decay = (acoef[h] * sp).exp();
                         let sh = &mut st[h * kd * vd..(h + 1) * kd * vd]; // [kd, vd]
                         for x in sh.iter_mut() {
@@ -5442,8 +5772,8 @@ impl MetalBackend {
                 dst_off,
                 n,
             } => {
-                let bs = self.ensure_device(r, src);
-                let bd = self.ensure_device(r, dst);
+                let bs = self.ensure_device(r, src)?;
+                let bd = self.ensure_device(r, dst)?;
                 let mut p = src_off.to_ne_bytes().to_vec();
                 p.extend_from_slice(&0u32.to_ne_bytes()); // src_stride (unused at rows=1)
                 p.extend_from_slice(&dst_off.to_ne_bytes());
@@ -5466,9 +5796,9 @@ impl MetalBackend {
                 rows,
                 n,
             } => {
-                let bs = self.ensure_device(r, src);
+                let bs = self.ensure_device(r, src)?;
                 // The strided write may cover only part of dst — bring the rest along.
-                let bd = self.ensure_device(r, dst);
+                let bd = self.ensure_device(r, dst)?;
                 let mut p = src_off.to_ne_bytes().to_vec();
                 p.extend_from_slice(&src_stride.to_ne_bytes());
                 p.extend_from_slice(&dst_off.to_ne_bytes());
@@ -5506,6 +5836,10 @@ impl MetalBackend {
                 freq_factors,
                 key_bias,
             } => {
+                if let Some(b) = key_bias {
+                    infr_core::graph::check_score_bias(g, b, rows, kv_len, "Op::Mla key_bias")
+                        .map_err(Error::Unsupported)?;
+                }
                 // MLA attention (DeepSeek V2/V3 absorbed form), ported from the Vulkan mla.comp:
                 // the kernel reads the K cache in its native f16 (`device const half*`, one half per
                 // element — the Metal layout, not Vulkan's u32-packed-pair), so an f16 cache is
@@ -5544,7 +5878,7 @@ impl MetalBackend {
                     infr_core::graph::AttnMask::SlidingWindow(w) => (1u32, w as u32, 0u32),
                     infr_core::graph::AttnMask::Canvas { lo } => (2u32, 0u32, lo as u32),
                 };
-                let bq = self.ensure_device(r, q);
+                let bq = self.ensure_device(r, q)?;
                 let bcache = metal_buf(
                     bindings
                         .get(k_cache)
@@ -5552,15 +5886,15 @@ impl MetalBackend {
                 );
                 let bwk = self.weight_buf(wk_b, g, bindings)?;
                 let bwv = self.weight_buf(wv_b, g, bindings)?;
-                let bff = freq_factors.map(|f| self.ensure_device(r, f));
+                let bff = freq_factors.map(|f| self.ensure_device(r, f)).transpose()?;
                 // deepseek32's `[rows, kv_len]` additive top-k score mask (`Op::TopkMask`'s
                 // output); `None` on deepseek2, which keeps the exact kernel it always took.
-                let bkb = key_bias.map(|b| self.ensure_device(r, b));
+                let bkb = key_bias.map(|b| self.ensure_device(r, b)).transpose()?;
                 let bd = self.dev_dst(
                     r,
                     dst,
                     (rows as usize) * (n_head as usize) * (v_head_dim as usize),
-                );
+                )?;
                 // MlaParams, byte layout mirrored from recorder.mla's 60-byte push constant.
                 let mut p = rows.to_ne_bytes().to_vec();
                 p.extend_from_slice(&kv_len.to_ne_bytes());
@@ -5614,7 +5948,15 @@ impl MetalBackend {
                 top_k,
                 scale,
                 pos,
+                block_ratio,
             } => {
+                if block_ratio == 0 {
+                    return Err(Error::Unsupported(
+                        "metal Op::LightningIndexer: block_ratio 0 — a key covers at least one \
+                         position"
+                            .into(),
+                    ));
+                }
                 // DeepSeek V3.2's top-k key selector, ported from the Vulkan
                 // `lightning_indexer.comp`: one threadgroup of 256 threads per query row scores
                 // every cached key and then runs `top_k` argmax rounds over those scores. Like
@@ -5629,6 +5971,13 @@ impl MetalBackend {
                 // Every output slot must name a key that exists. llama.cpp clamps at graph-build
                 // time (`n_top_k = min(indexer_score->ne[0], n_indexer_top_k)`); the kernel cannot
                 // refuse the work, so refuse it here rather than emit a duplicated index.
+                if kv_len == 0 || top_k == 0 {
+                    return Err(Error::Unsupported(format!(
+                        "metal Op::LightningIndexer: kv_len {kv_len} / top_k {top_k} — an \
+                         indexer over no keys selects nothing; the caller skips it (and its \
+                         TopkMask)"
+                    )));
+                }
                 if top_k > kv_len {
                     return Err(Error::Unsupported(format!(
                         "metal Op::LightningIndexer: top_k {top_k} exceeds kv_len {kv_len} — \
@@ -5647,8 +5996,8 @@ impl MetalBackend {
                          op must score"
                     )));
                 }
-                let bq = self.ensure_device(r, q);
-                let bw = self.ensure_device(r, weights);
+                let bq = self.ensure_device(r, q)?;
+                let bw = self.ensure_device(r, weights)?;
                 let bcache = metal_buf(
                     bindings
                         .get(k_cache)
@@ -5656,8 +6005,8 @@ impl MetalBackend {
                 );
                 // Score scratch — the `[n_kv, n_tokens]` tensor llama.cpp materializes too. Phase 1
                 // fills every slot the row reads before phase 2 reads any of them.
-                let bs = self.scratch_buf((rows as usize) * (kv_len as usize), 23);
-                let bd = self.dev_dst(r, dst, (rows as usize) * (top_k as usize));
+                let bs = self.scratch_buf((rows as usize) * (kv_len as usize), 23)?;
+                let bd = self.dev_dst(r, dst, (rows as usize) * (top_k as usize))?;
                 // LidxParams, byte layout mirrored from recorder.lightning_indexer's push constant.
                 let mut p = rows.to_ne_bytes().to_vec();
                 p.extend_from_slice(&kv_len.to_ne_bytes());
@@ -5666,6 +6015,7 @@ impl MetalBackend {
                 p.extend_from_slice(&top_k.to_ne_bytes());
                 p.extend_from_slice(&scale.to_ne_bytes());
                 p.extend_from_slice(&pos.to_ne_bytes());
+                p.extend_from_slice(&block_ratio.to_ne_bytes());
                 let pso = self.pipelines.get("lightning_indexer_f16kv")?;
                 let bufs: Vec<&MtlBuffer> = vec![
                     bq.as_ref(),
@@ -5704,14 +6054,20 @@ impl MetalBackend {
                 // Every index the scatter writes must land inside the mask row; the kernel cannot
                 // refuse the dispatch and an out-of-range device write is undefined. Same bound
                 // `Op::LightningIndexer` enforces on the indices it produces.
+                if kv_len == 0 || top_k == 0 {
+                    return Err(Error::Unsupported(format!(
+                        "metal Op::TopkMask: kv_len {kv_len} / top_k {top_k} — a mask over no \
+                         keys selects nothing; the caller skips it"
+                    )));
+                }
                 if top_k > kv_len {
                     return Err(Error::Unsupported(format!(
                         "metal Op::TopkMask: top_k {top_k} exceeds kv_len {kv_len} — the indices \
                          cannot all name keys inside the mask row"
                     )));
                 }
-                let bi = self.ensure_device(r, idx);
-                let bd = self.dev_dst(r, dst, (rows as usize) * (kv_len as usize));
+                let bi = self.ensure_device(r, idx)?;
+                let bd = self.dev_dst(r, dst, (rows as usize) * (kv_len as usize))?;
                 let mut p = rows.to_ne_bytes().to_vec();
                 p.extend_from_slice(&kv_len.to_ne_bytes());
                 p.extend_from_slice(&top_k.to_ne_bytes());
@@ -5745,10 +6101,10 @@ impl MetalBackend {
                     )));
                 }
                 let (rows_u, hc_u) = (rows as usize, hc as usize);
-                let bm = self.ensure_device(r, mixes);
+                let bm = self.ensure_device(r, mixes)?;
                 let bs = self.weight_buf(scale, g, bindings)?;
                 let bb = self.weight_buf(base, g, bindings)?;
-                let bp = self.dev_dst(r, pre, rows_u * hc_u);
+                let bp = self.dev_dst(r, pre, rows_u * hc_u)?;
                 // (2 + hc)*hc for the wrapping form, hc for `build_hc_head`'s narrower `mixes`.
                 let mix_dim = if gates.is_some() { (2 + hc) * hc } else { hc };
                 let mut p = rows.to_ne_bytes().to_vec();
@@ -5758,14 +6114,16 @@ impl MetalBackend {
                 p.extend_from_slice(&n_iter.to_ne_bytes());
                 let mut bufs: Vec<&MtlBuffer> =
                     vec![bm.as_ref(), bs.as_ref(), bb.as_ref(), bp.as_ref()];
-                let gb = gates.map(|infr_core::graph::HyperGates { post, comb }| {
-                    (
-                        post,
-                        self.dev_dst(r, post, rows_u * hc_u),
-                        comb,
-                        self.dev_dst(r, comb, rows_u * hc_u * hc_u),
-                    )
-                });
+                let gb = gates
+                    .map(|infr_core::graph::HyperGates { post, comb }| {
+                        Ok::<_, Error>((
+                            post,
+                            self.dev_dst(r, post, rows_u * hc_u)?,
+                            comb,
+                            self.dev_dst(r, comb, rows_u * hc_u * hc_u)?,
+                        ))
+                    })
+                    .transpose()?;
                 if let Some((_, ob, _, cb)) = &gb {
                     bufs.push(ob.as_ref());
                     bufs.push(cb.as_ref());
@@ -5794,9 +6152,9 @@ impl MetalBackend {
             } => {
                 hyper_check_hc(hc, "metal Op::HyperConnectPre")?;
                 let total = (rows as usize) * (n_embd as usize);
-                let bx = self.ensure_device(r, x);
-                let bw = self.ensure_device(r, weights);
-                let bd = self.dev_dst(r, dst, total);
+                let bx = self.ensure_device(r, x)?;
+                let bw = self.ensure_device(r, weights)?;
+                let bd = self.dev_dst(r, dst, total)?;
                 let mut p = hc.to_ne_bytes().to_vec();
                 p.extend_from_slice(&n_embd.to_ne_bytes());
                 p.extend_from_slice(&(total as u32).to_ne_bytes());
@@ -5823,11 +6181,11 @@ impl MetalBackend {
             } => {
                 hyper_check_hc(hc, "metal Op::HyperConnectPost")?;
                 let total = (rows as usize) * (hc as usize) * (n_embd as usize);
-                let bx = self.ensure_device(r, x);
-                let br = self.ensure_device(r, residual);
-                let bo = self.ensure_device(r, post);
-                let bc = self.ensure_device(r, comb);
-                let bd = self.dev_dst(r, dst, total);
+                let bx = self.ensure_device(r, x)?;
+                let br = self.ensure_device(r, residual)?;
+                let bo = self.ensure_device(r, post)?;
+                let bc = self.ensure_device(r, comb)?;
+                let bd = self.dev_dst(r, dst, total)?;
                 let mut p = hc.to_ne_bytes().to_vec();
                 p.extend_from_slice(&n_embd.to_ne_bytes());
                 p.extend_from_slice(&(total as u32).to_ne_bytes());
@@ -5863,9 +6221,9 @@ impl MetalBackend {
                     )));
                 }
                 let total = (blocks as usize) * (n_embd as usize);
-                let bv = self.ensure_device(r, values);
-                let bs = self.ensure_device(r, scores);
-                let bd = self.dev_dst(r, dst, total);
+                let bv = self.ensure_device(r, values)?;
+                let bs = self.ensure_device(r, scores)?;
+                let bd = self.dev_dst(r, dst, total)?;
                 let mut p = window.to_ne_bytes().to_vec();
                 p.extend_from_slice(&n_embd.to_ne_bytes());
                 p.extend_from_slice(&(total as u32).to_ne_bytes());
@@ -5877,6 +6235,62 @@ impl MetalBackend {
                     1 << 2,
                     &p,
                     total,
+                );
+                r.loc[dst.0 as usize] = Loc::Device;
+            }
+            Op::GatherRows {
+                src,
+                idx,
+                dst,
+                rows,
+                idx_off,
+                src_stride,
+                src_col,
+                n,
+                group,
+                dst_group_stride,
+                dst_row_off,
+                fill,
+            } => {
+                let n_src = infr_core::graph::check_gather_rows(g, op)
+                    .map_err(|e| Error::Unsupported(format!("metal {e}")))?;
+                let total = rows.checked_mul(n).ok_or_else(|| {
+                    Error::Unsupported(format!(
+                        "metal Op::GatherRows: {rows} rows of {n} overflow the kernel's u32 index"
+                    ))
+                })?;
+                let bs = self.ensure_device(r, src)?;
+                // The indices are read as the raw i32 the caller bound, as `Op::EmbedGather`
+                // reads its ids: the host mirror holds them widened to f32.
+                let bi = metal_buf(bindings.get(idx).ok_or_else(|| {
+                    Error::Unsupported("metal Op::GatherRows: idx must be a bound i32 input".into())
+                })?);
+                // `ensure_device`, not `dev_dst`: rows no index maps to keep what an earlier
+                // gather wrote there.
+                let bd = self.ensure_device(r, dst)?;
+                let mut p = Vec::with_capacity(40);
+                for v in [
+                    rows,
+                    idx_off,
+                    src_stride,
+                    src_col,
+                    n,
+                    group,
+                    dst_group_stride,
+                    dst_row_off,
+                    u32::try_from(n_src).unwrap_or(u32::MAX),
+                    fill.to_bits(),
+                ] {
+                    p.extend_from_slice(&v.to_ne_bytes());
+                }
+                let pso = self.pipelines.get("gather_rows_f32")?;
+                self.encode_w(
+                    r,
+                    &pso,
+                    &[bs.as_ref(), &bi.raw, bd.as_ref()],
+                    1 << 2,
+                    &p,
+                    total as usize,
                 );
                 r.loc[dst.0 as usize] = Loc::Device;
             }

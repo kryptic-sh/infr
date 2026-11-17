@@ -285,6 +285,10 @@ contexts).
 
 ## MTP (multi-token prediction, `INFR_MTP=1`)
 
+> **Parked.** MTP is disabled on every backend (`mtp_enabled()` returns `false`,
+> `INFR_MTP=1` is ignored); see [`mtp.md`](mtp.md#mtp-is-parked-2026-07-31).
+> This section records what the Metal path measured before that.
+
 A qwen35 GGUF that ships a trained MTP head (`nextn.*` at `blk.{n_layer}`,
 `Config::n_layer_nextn`) can draft with the head instead of a separate draft
 model: `MtpHeadSession` runs the head's one-layer forward per draft step, the
@@ -408,7 +412,8 @@ cold, floor 25 ms) — a gate that fails on runner noise gets ignored, and the
 structural assertions would go with it. It holds exactly ONE test because it
 repoints `XDG_CACHE_HOME`; a second test in that binary would race it. The
 device-free halves are unit tests: `src/pcache_blob.rs` (payload framing, key
-composition, device token — runnable off a Mac with `rustc --test`) and
+composition, device token — run on any OS by `tests/pcache_blob.rs`, which
+includes the module by path, as `tests/policy.rs` does for `src/policy.rs`) and
 `src/pcache.rs` (save debounce, temp-path shapes).
 
 ## Negative results (measured — don't re-try without new evidence)

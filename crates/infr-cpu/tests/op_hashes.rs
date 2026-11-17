@@ -451,6 +451,159 @@ fn kv_bytes(dt: DType, cap: usize, width: usize, filled: usize, seed: u64) -> Ve
     }
 }
 
+/// Bytes of a KV cache of `n` elements at `dt`.
+fn kv_cache_len(dt: DType, n: usize) -> usize {
+    match dt {
+        DType::Turbo2 | DType::Turbo3 | DType::Turbo4 => {
+            n / infr_cpu::turbo::QK * infr_cpu::turbo::block_bytes(dt)
+        }
+        _ => infr_gguf::nbytes(dt, n),
+    }
+}
+
+/// Every KV format the CPU backend writes and reads: a prompt's K and V rows written into an
+/// empty cache (`Op::WriteKv`, which quantizes them), then attended (`Op::Attention`, which
+/// dequantizes the prefix). Row 0 of each source is zeros of both signs, row 1 one value
+/// throughout (a block whose least and greatest values tie), so the quantizers' `min`/`max` meet
+/// equal values; the cache bytes are hashed with the output.
+fn kv_format_cases() -> Vec<Case> {
+    let (rows, nh, nkv, hd, cap) = (5usize, 4usize, 2usize, 64usize, 8usize);
+    let width = nkv * hd;
+    let src = |seed: u64| -> Vec<f32> {
+        (0..rows * width)
+            .map(|i| match i / width {
+                0 => {
+                    if i % 3 == 0 {
+                        -0.0
+                    } else {
+                        0.0
+                    }
+                }
+                1 => 0.75,
+                _ => val(seed, i),
+            })
+            .collect()
+    };
+    let mut v = Vec::new();
+    for dt in [
+        DType::F32,
+        DType::F16,
+        DType::Bf16,
+        DType::Q8_0,
+        DType::Q4_0,
+        DType::Q4_1,
+        DType::Q5_0,
+        DType::Q5_1,
+        DType::Iq4Nl,
+        DType::Turbo2,
+        DType::Turbo3,
+        DType::Turbo4,
+    ] {
+        let mut c = Case::new(format!("KV {dt:?} write and attend"));
+        let ks = c.input(vec![rows, width], DType::F32, f32_bytes(&src(130)));
+        let vs = c.input(vec![rows, width], DType::F32, f32_bytes(&src(131)));
+        let bytes = vec![0u8; kv_cache_len(dt, cap * width)];
+        let kc = c.state(vec![cap * width], dt, bytes.clone());
+        let vc = c.state(vec![cap * width], dt, bytes);
+        let q = c.input_f32(vec![rows, nh * hd], 132);
+        let dst = c.output(vec![rows, nh * hd], DType::F32);
+        let w = width as u32;
+        let c = c
+            .push(Op::WriteKv {
+                src: ks,
+                cache: kc,
+                rows: rows as u32,
+                row_stride: w,
+                pos: 0,
+            })
+            .push(Op::WriteKv {
+                src: vs,
+                cache: vc,
+                rows: rows as u32,
+                row_stride: w,
+                pos: 0,
+            });
+        v.push(c.push(Op::Attention {
+            q,
+            k_cache: kc,
+            v_cache: vc,
+            dst,
+            rows: rows as u32,
+            kv_len: rows as u32,
+            n_head: nh as u32,
+            n_kv: nkv as u32,
+            head_dim: hd as u32,
+            scale: 0.125,
+            mask: AttnMask::Causal,
+            pos: 0,
+            sinks: None,
+            key_bias: None,
+            comp: None,
+        }));
+    }
+    v
+}
+
+/// Shapes past the pool's size thresholds, where the work splits differently with the thread
+/// count: a decode `Op::Linear` whose rows per task range over `DECODE_ROWS_MIN..=MAX`, a decode
+/// attention whose f16 prefix widens in several `KV_WIDEN_CHUNK` pieces, and a lightning indexer
+/// with several score tasks (`SCORE_TASK_MACS_MIN`).
+fn threshold_cases() -> Vec<Case> {
+    let mut v = vec![linear(DType::Q4K, 1, 512, 1024, false)];
+    let (nkv, hd, kv_len, nh) = (2usize, 128usize, 160usize, 4usize);
+    let mut c = Case::new("Attention decode f16, prefix in several widen chunks");
+    let q = c.input_f32(vec![1, nh * hd], 140);
+    let k = c.input(
+        vec![kv_len * nkv * hd],
+        DType::F16,
+        kv_bytes(DType::F16, kv_len, nkv * hd, kv_len, 141),
+    );
+    let vv = c.input(
+        vec![kv_len * nkv * hd],
+        DType::F16,
+        kv_bytes(DType::F16, kv_len, nkv * hd, kv_len, 142),
+    );
+    let dst = c.output(vec![1, nh * hd], DType::F32);
+    v.push(c.push(Op::Attention {
+        q,
+        k_cache: k,
+        v_cache: vv,
+        dst,
+        rows: 1,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        n_kv: nkv as u32,
+        head_dim: hd as u32,
+        scale: 0.0884,
+        mask: AttnMask::Causal,
+        pos: (kv_len - 1) as u32,
+        sinks: None,
+        key_bias: None,
+        comp: None,
+    }));
+    let (rows, kv_len, nh, hd, top_k, pos) = (8usize, 256usize, 4usize, 64usize, 16usize, 248usize);
+    let mut c = Case::new("LightningIndexer, several score tasks");
+    let q = c.input_f32(vec![rows, nh * hd], 143);
+    let k = c.input_f32(vec![kv_len, hd], 144);
+    let w = c.input_f32(vec![rows, nh], 145);
+    let idx = c.output(vec![rows, top_k], DType::I32);
+    v.push(c.push(Op::LightningIndexer {
+        q,
+        k_cache: k,
+        weights: w,
+        dst: idx,
+        rows: rows as u32,
+        kv_len: kv_len as u32,
+        n_head: nh as u32,
+        head_dim: hd as u32,
+        top_k: top_k as u32,
+        scale: 1.0 / ((hd * nh) as f32).sqrt(),
+        pos: pos as u32,
+        block_ratio: 1,
+    }));
+    v
+}
+
 fn attention_cases() -> Vec<Case> {
     let mut v = Vec::new();
     let (nh, nkv, hd, cap) = (4usize, 2usize, 32usize, 64usize);
@@ -1112,6 +1265,8 @@ fn cases() -> Vec<Case> {
     v.extend(norm_cases());
     v.extend(rope_cases());
     v.extend(attention_cases());
+    v.extend(kv_format_cases());
+    v.extend(threshold_cases());
     v.extend(hyper_cases());
     v.extend(elementwise_cases());
     v.extend(recurrent_cases());
@@ -1292,6 +1447,24 @@ const EXPECTED: &[(&str, u64)] = &[
     ("WriteKv Q4_0", 0x4f536590c43efedc),
     ("Mla", 0x555b78feb583f984),
     ("LightningIndexer TopkMask", 0x0ec80ae09928fb74),
+    ("KV F32 write and attend", 0x094d8912d2db3f8d),
+    ("KV F16 write and attend", 0xa5b6c5eb76c83ff5),
+    ("KV Bf16 write and attend", 0x0b8b1483b43a97c6),
+    ("KV Q8_0 write and attend", 0x93ad98142cd777ee),
+    ("KV Q4_0 write and attend", 0xc65665a1b22b10fa),
+    ("KV Q4_1 write and attend", 0x3af6531a77ec0857),
+    ("KV Q5_0 write and attend", 0x74825214e6d58771),
+    ("KV Q5_1 write and attend", 0x20053a0dd59b5f6c),
+    ("KV Iq4Nl write and attend", 0x358daa018bdbe1c5),
+    ("KV Turbo2 write and attend", 0xacec32ac5e7e7c93),
+    ("KV Turbo3 write and attend", 0xc3c637601e8e40d1),
+    ("KV Turbo4 write and attend", 0xd50dc492f7158232),
+    ("Linear Q4K m1 512x1024", 0x6574d4b7dcc95f0a),
+    (
+        "Attention decode f16, prefix in several widen chunks",
+        0x86f55bcb60383105,
+    ),
+    ("LightningIndexer, several score tasks", 0x187bcf7e94afe7b1),
     ("HyperConnectMix", 0xffbe691ade250168),
     ("HyperConnectMix head", 0xebc31bdf6121f4a3),
     ("HyperConnectPre", 0x408fe1ed03183ef2),

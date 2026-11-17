@@ -25,6 +25,7 @@
 #[path = "support/row_identity.rs"]
 mod row_identity;
 
+use infr_core::tensor::DType;
 use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
 use infr_testkit::llama_cpp::{llama_cpp_version, llama_debug_logits, write_or_compare_fixture};
 
@@ -62,6 +63,15 @@ fn token_text(id: u32) -> char {
 }
 
 fn lfm3_model() -> SyntheticModel {
+    lfm3_model_with(NE, false)
+}
+
+/// The synthetic model at width `ne` with f32 weights (`quant` false: the model every other test
+/// here uses, at [`ne`]), or with its projections block-quantized (`quant` true; `ne` a multiple
+/// of 256): Q4_K for the FFN gate and up (rows `ne` wide), Q5_0 for the FFN down (rows
+/// [`NFF`] wide), Q8_0 for attention and the short convolution's projections, so the graph runs
+/// the int8-activation `Op::Linear` kernels of both block sizes.
+fn lfm3_model_with(ne: usize, quant: bool) -> SyntheticModel {
     let k = |key: &str| format!("lfm3.{key}");
     let u = |key: &str, v: usize| (k(key), Meta::U32(v as u32));
     let meta = vec![
@@ -71,7 +81,7 @@ fn lfm3_model() -> SyntheticModel {
         ),
         u("block_count", N_LAYER),
         u("context_length", 64),
-        u("embedding_length", NE),
+        u("embedding_length", ne),
         u("feed_forward_length", NFF),
         u("attention.head_count", N_HEAD),
         (
@@ -118,8 +128,8 @@ fn lfm3_model() -> SyntheticModel {
         .map(|p| if p < HD / 4 { 1.0 } else { 1.0e30 })
         .collect();
     let mut tensors = vec![
-        TensorSpec::new("token_embd.weight", vec![NE, VOCAB], Fill::Rand(0.5)),
-        TensorSpec::new("output_norm.weight", vec![NE], Fill::Gain),
+        TensorSpec::new("token_embd.weight", vec![ne, VOCAB], Fill::Rand(0.5)),
+        TensorSpec::new("output_norm.weight", vec![ne], Fill::Gain),
         TensorSpec::new("rope_freqs.weight", vec![HD / 2], Fill::Exact(rope_freqs)),
     ];
     let w = |l: usize, name: &str, shape: Vec<usize>, fill: Fill| {
@@ -132,23 +142,104 @@ fn lfm3_model() -> SyntheticModel {
             "post_attention_norm",
             "post_ffw_norm",
         ] {
-            tensors.push(w(l, norm, vec![NE], Fill::Gain));
+            tensors.push(w(l, norm, vec![ne], Fill::Gain));
         }
-        tensors.push(w(l, "ffn_gate", vec![NE, NFF], Fill::Rand(0.2)));
-        tensors.push(w(l, "ffn_up", vec![NE, NFF], Fill::Rand(0.2)));
-        tensors.push(w(l, "ffn_down", vec![NFF, NE], Fill::Rand(0.2)));
+        tensors.push(w(
+            l,
+            "ffn_gate",
+            vec![ne, NFF],
+            if quant {
+                Fill::Quant(DType::Q4K)
+            } else {
+                Fill::Rand(0.2)
+            },
+        ));
+        tensors.push(w(
+            l,
+            "ffn_up",
+            vec![ne, NFF],
+            if quant {
+                Fill::Quant(DType::Q4K)
+            } else {
+                Fill::Rand(0.2)
+            },
+        ));
+        tensors.push(w(
+            l,
+            "ffn_down",
+            vec![NFF, ne],
+            if quant {
+                Fill::Quant(DType::Q5_0)
+            } else {
+                Fill::Rand(0.2)
+            },
+        ));
         if kv == 0 {
-            tensors.push(w(l, "shortconv.conv", vec![L_CACHE, NE], Fill::Rand(0.5)));
-            tensors.push(w(l, "shortconv.in_proj", vec![NE, 3 * NE], Fill::Rand(0.3)));
-            tensors.push(w(l, "shortconv.out_proj", vec![NE, NE], Fill::Rand(0.2)));
+            tensors.push(w(l, "shortconv.conv", vec![L_CACHE, ne], Fill::Rand(0.5)));
+            tensors.push(w(
+                l,
+                "shortconv.in_proj",
+                vec![ne, 3 * ne],
+                if quant {
+                    Fill::Quant(DType::Q8_0)
+                } else {
+                    Fill::Rand(0.3)
+                },
+            ));
+            tensors.push(w(
+                l,
+                "shortconv.out_proj",
+                vec![ne, ne],
+                if quant {
+                    Fill::Quant(DType::Q8_0)
+                } else {
+                    Fill::Rand(0.2)
+                },
+            ));
         } else {
-            tensors.push(w(l, "attn_q", vec![NE, N_HEAD * HD], Fill::Rand(0.3)));
-            tensors.push(w(l, "attn_k", vec![NE, N_KV * HD], Fill::Rand(0.3)));
-            tensors.push(w(l, "attn_v", vec![NE, N_KV * HD], Fill::Rand(0.3)));
+            tensors.push(w(
+                l,
+                "attn_q",
+                vec![ne, N_HEAD * HD],
+                if quant {
+                    Fill::Quant(DType::Q8_0)
+                } else {
+                    Fill::Rand(0.3)
+                },
+            ));
+            tensors.push(w(
+                l,
+                "attn_k",
+                vec![ne, N_KV * HD],
+                if quant {
+                    Fill::Quant(DType::Q8_0)
+                } else {
+                    Fill::Rand(0.3)
+                },
+            ));
+            tensors.push(w(
+                l,
+                "attn_v",
+                vec![ne, N_KV * HD],
+                if quant {
+                    Fill::Quant(DType::Q8_0)
+                } else {
+                    Fill::Rand(0.3)
+                },
+            ));
             tensors.push(w(l, "attn_q_norm", vec![HD], Fill::Gain));
             tensors.push(w(l, "attn_k_norm", vec![HD], Fill::Gain));
-            tensors.push(w(l, "attn_output", vec![N_HEAD * HD, NE], Fill::Rand(0.2)));
-            tensors.push(w(l, "attn_gate", vec![NE, N_HEAD], Fill::Rand(1.0)));
+            tensors.push(w(
+                l,
+                "attn_output",
+                vec![N_HEAD * HD, ne],
+                if quant {
+                    Fill::Quant(DType::Q8_0)
+                } else {
+                    Fill::Rand(0.2)
+                },
+            ));
+            tensors.push(w(l, "attn_gate", vec![ne, N_HEAD], Fill::Rand(1.0)));
         }
     }
     SyntheticModel { meta, tensors }
@@ -292,6 +383,20 @@ fn synthetic_lfm3_cpu_rows_give_the_same_bits_in_any_chunks() {
     };
     row_identity::assert_row_count_identity(
         "synthetic lfm3",
+        &load,
+        &infr_llama::EngineConfig::default(),
+        ORACLE_PROMPT,
+        6,
+        &[64, 5, 3, 1],
+    );
+    // Quantized weights: the int8-activation Linear kernels (Q4_K's 256-element super-blocks,
+    // Q5_0 and Q8_0 on 32-element blocks) at graph level, one row and several.
+    let tmp = TempGguf::write("lfm3-rows-quant", &lfm3_model_with(256, true));
+    let load = |cfg| {
+        infr_llama::SeamModel::load_with(tmp.path(), None, cfg).expect("synthetic model load")
+    };
+    row_identity::assert_row_count_identity(
+        "synthetic lfm3, quantized weights",
         &load,
         &infr_llama::EngineConfig::default(),
         ORACLE_PROMPT,

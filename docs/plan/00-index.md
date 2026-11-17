@@ -37,9 +37,9 @@ The standing goal: any model size on any hardware, disk to DRAM to VRAM.
 Priority: phase 11 goes ahead of the rest of phase 10, which needs the fixed CPU
 reference to judge tuned values against.
 
-| Phase | What                                                                                               | Status |
-| ----- | -------------------------------------------------------------------------------------------------- | ------ |
-| 11    | [CPU output bit-identical on every platform, GPUs within tolerance of it](11-cpu-bit-identical.md) | scoped |
+| Phase | What                                                                                               | Status                                        |
+| ----- | -------------------------------------------------------------------------------------------------- | --------------------------------------------- |
+| 11    | [CPU output bit-identical on every platform, GPUs within tolerance of it](11-cpu-bit-identical.md) | S0-S2 done (S5 in S2); S3, S4, S6, G1-G4 left |
 
 ## Vulkan backend
 

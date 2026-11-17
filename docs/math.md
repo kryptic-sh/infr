@@ -4,17 +4,17 @@
 runtime, and the C runtimes disagree in the last bit: UCRT on Windows against
 glibc on Linux, one glibc version against another, and so on. Every CPU output
 computed through one of them inherits the disagreement, which is why some CPU
-goldens carry one hash per operating system. `infr_core::math` replaces them
-with functions that return the **correctly rounded** binary32 result — the one
-nearest the exact mathematical value, ties to even — so there is exactly one
+goldens used to carry one hash per operating system. `infr_core::math` replaces
+them with functions that return the **correctly rounded** binary32 result — the
+one nearest the exact mathematical value, ties to even — so there is exactly one
 right answer, the same everywhere, and tests can take it from a multi-precision
 library instead of from the code under test. The plan this serves is
 [`plan/11-cpu-bit-identical.md`](plan/11-cpu-bit-identical.md).
 
-As of this writing the module exists and is tested; **no call site uses it yet**
-(that is slice S2, which changes every CPU output once). The lint
-`crates/infr-core/tests/no_platform_libm.rs` counts the call sites still on the
-platform functions, per file.
+Every call site in the workspace uses it (slice S2, which changed every CPU
+output once), and the lint `crates/infr-core/tests/no_platform_libm.rs` fails on
+any platform math call in production code outside the module: there is no
+allowlist.
 
 ## What it guarantees
 
@@ -97,11 +97,10 @@ same branch-free function the scalar version IS: only `+ - * /`, conversions,
 comparisons used as selects and table lookups by integer index, no intrinsics
 and no `std::simd`. So a slice equals its scalar function element for element on
 every target, whatever the compiler vectorizes it into; the identity is tested
-on all 2^32 inputs, at `target-cpu=native` and baseline `x86-64` on both
-systems, and every CI system hashes the slices' output on the grid. A call site
-whose expression is not one of these forms (`(v * scale - max).exp()`, say)
-computes the argument into a buffer first: the binary32 operations are the same,
-so the bits are too.
+on all 2^32 inputs at every SIMD tier (below), and every CI system hashes the
+slices' output on the grid. A call site whose expression is not one of these
+forms (`(v * scale - max).exp()`, say) computes the argument into a buffer
+first: the binary32 operations are the same, so the bits are too.
 
 What makes them vectorize: no data-dependent control flow. Out-of-range inputs
 are clamped before the arithmetic and the clamped ends produce the special
@@ -109,16 +108,80 @@ results by themselves (`e^89` rounds to `inf`, `e^-104` to 0, `tanh(9.1)` to 1);
 only NaN is selected afterwards. An earlier version that selected `inf` and 0
 after the fact compiled to a branch around the arithmetic and did not vectorize
 at baseline at all. `ln`, `ln_1p`, `sin`/`cos` and `powf` have no slice form:
-none is on a per-element hot path.
+none is on a per-element hot path. RoPE's frequencies depend only on an op's
+shape: `rope_freqs` computes them once per op and `rope_sin_cos` turns each
+angle into its sine and cosine with one reduction, for every RoPE variant on the
+CPU.
+
+### Tiers, chosen at run time
+
+The slice loops are compiled once per SIMD tier (`math::Tier`): `baseline` (the
+build's own target: SSE2 for a baseline x86-64 build, NEON on aarch64), and on
+x86-64 `avx2` and `avx512` (F, DQ, VL, BW), each the same loop inside a
+`#[target_feature]` function (`src/math/slices.rs`). The first call picks the
+widest tier the CPU has (`is_x86_feature_detected!`), so a binary built for
+baseline x86-64 — the released binaries and CI — still runs four or eight
+binary64 lanes where the CPU has them. FMA is not among the enabled features, so
+no tier could contract `a*b + c` even if Rust did (it does not: it never fuses
+or reassociates floating-point operations, with or without a target feature).
+The tiers are the same source performing the same operations per element in the
+same order, so they give the same bits by construction; the tests below prove it
+on every input.
+
+**Forcing a tier.** `kernels.cpu.math_tier` (`INFR_CPU_MATH_TIER`: `baseline`,
+`avx2`, `avx512`) makes every slice run at that tier, process-wide, from the
+moment a CPU backend is built. A tier the CPU lacks is refused (the backend
+panics with the reason; a misspelt `INFR_CPU_MATH_TIER` is a configuration
+error). It changes only speed; it exists so the two-lane path every aarch64
+machine and every pre-AVX2 x86 CPU runs can be measured and tested on a machine
+with wider ones. In a `target-cpu=native` build `baseline` is the native code,
+so a baseline measurement needs a baseline build
+(`RUSTFLAGS="-C target-cpu=x86-64"`).
+
+**The two-lane path.** With two binary64 lanes and no gather, the loop the
+compiler vectorized was slower than the C runtime's scalar `expf` (1.77 against
+1.09 ns per element). Three things closed most of it, each checked to leave
+every result bit unchanged (correct rounding makes that the natural check: any
+correctly rounded variant has the same bits) by the exhaustive tests:
+
+- `exp`'s binary64 value takes a 256-entry table and a degree-4 polynomial by
+  Estrin's scheme instead of 64 entries and degree 6 by Horner (a shorter
+  dependency chain), and builds `2^(k>>8) * T` by one integer addition to the
+  table entry's bits (`exp.rs` has the error bound). The tables stay literals
+  from the generator; two derived arrays are computed at compile time by exact
+  bit arithmetic and one rounded division per entry.
+- The baseline tier writes its loop in blocks of four elements, which the SLP
+  vectorizer packs into two-lane vectors where the loop vectorizer judged the
+  `exp` loop unprofitable and left it scalar (`NARROW` in `slices.rs`; two and
+  eight were slower).
+- `sigmoid`, `silu` and `gelu_tanh` take two passes per 64 elements, at every
+  tier: the `exp`/`tanh` lanes into a buffer, then the binary32 division and
+  products in a plain loop at twice the lanes the binary64 part has. The
+  operations are the helpers' own (`sigmoid_finish` and the like), so the bits
+  are the same; it was faster at every tier than one fused loop.
+- Scalar `ln_1p` on a baseline build took 16.5 ns per call against 6.7 natively,
+  on inputs that never reach its `x >= 2^24` branch; with that branch out of
+  line (`ln_1p_big`) it takes 6.4. Presumably the compiler had been computing
+  the branch's division speculatively.
+
+The division in `sigmoid`/`silu` stays: the result must be the correctly rounded
+binary32 quotient of `x` and `1 + e` (the call sites' own expression). A
+reciprocal times `x` rounds twice and differs from it on some inputs; the
+binary64 quotient rounded to binary32 is identical (double rounding is innocuous
+for a binary32 division done in binary64) but a binary64 division has half the
+lanes of a binary32 one (not measured here). No cheaper form with the same bits
+was found; the two-pass loop instead runs the binary32 division four lanes wide.
 
 ## The determinism rule
 
 Inside the module only binary64/binary32 `+ - * /`, `sqrt`, comparisons,
 conversions, and integer and bit operations. No `mul_add`, no standard-library
-or C-runtime math, nothing that depends on target features, no table computed at
-run time. IEEE 754 specifies each of those operations exactly and Rust never
-contracts or reassociates them, so baseline x86-64, AVX-512 and aarch64 builds
-give identical bits.
+or C-runtime math, no table computed at run time (two are derived at compile
+time from generated ones, by the same operations), and no arithmetic that
+depends on target features (the tiers above change how many elements run at
+once, not what each one computes). IEEE 754 specifies each of those operations
+exactly and Rust never contracts or reassociates them, so baseline x86-64,
+AVX-512 and aarch64 builds give identical bits.
 
 ## How it works
 
@@ -147,7 +210,7 @@ Each source file states its algorithm, its sources and its error bounds:
 
 | File        | Functions             | Reduction                                                   |
 | ----------- | --------------------- | ----------------------------------------------------------- |
-| `exp.rs`    | `exp`, `tanh`         | `x = k ln2/64 + r`, table of `2^(j/64)`                     |
+| `exp.rs`    | `exp`, `tanh`         | `x = k ln2/N + r`, table of `2^(j/N)`, `N` 256 (`exp`), 64  |
 | `log.rs`    | `ln`, `ln_1p`         | 128-entry reciprocal table on the significand               |
 | `trig.rs`   | `sin`, `cos`          | Cody–Waite below `2^22`, Payne–Hanek (bits of `2/pi`) above |
 | `pow.rs`    | `powf`                | `exp(y ln x)` in double-double, exact cases by integers     |
@@ -176,7 +239,11 @@ All in `crates/infr-core/tests/math.rs`:
 - `every_nan_result_is_the_one_nan`, `helper_special_values`: the NaN rule and
   the helpers' special values against the call sites' own expressions.
 - `slices_equal_scalars` (a dense grid at awkward lengths and unaligned starts)
-  and `exhaustive_slices_equal_scalars` (ignored, every binary32 input).
+  and `exhaustive_slices_equal_scalars` (ignored, every binary32 input), each at
+  every tier the CPU supports (and the active one): they find the supported
+  tiers independently of the module, assert they ran each one, and print the
+  tiers they skipped. `tier_switch` checks the names and that an unsupported
+  tier is refused.
 - `platform_libm_differences`, `bench_against_std` (ignored): information only.
 
 Run them:
@@ -186,6 +253,12 @@ cargo test -p infr-core --release --test math                         # KAT, gri
 cargo test -p infr-core --release --test math -- --ignored exhaustive  # minutes each
 cargo test -p infr-core --release --test math -- --ignored --nocapture platform_libm bench
 ```
+
+`bench_against_std` prints, per slice function, ns per element for the
+platform's scalar function written as the call sites wrote it and for every tier
+the CPU has. On a Mac (or any aarch64 machine), where nothing has been measured
+yet, run it as is: the build has no `target-cpu` flags there, so `baseline` is
+the NEON path.
 
 ## Regenerating the tables
 
@@ -222,9 +295,13 @@ zero result with the reference's sign.
 | `cos`    | 543 s |
 
 (`sin`/`cos` are slow because the reference reduces by big-integer long
-division.) The slice identity test found no element differing from the scalar
-function on any of the 2^32 inputs, for every slice function, on Windows and
-WSL, native and baseline builds.
+division.) After S2's changes to `exp`'s binary64 value and `ln_1p`'s branch,
+`exp` and `ln_1p` were re-run: all 2^32 correctly rounded again (108.5 and 106.9
+s, at a higher load), and the fast-path test still finds `exp`'s binary64 value
+alone right on every input. The slice identity test found no element differing
+from the scalar function on any of the 2^32 inputs, for every slice function at
+every tier (baseline, AVX2, AVX-512), on Windows native and baseline builds and
+under WSL (native and baseline builds, every tier).
 
 **The grid hash**, now over the real result bits with NaN inputs of every kind
 in the grid, and over the slices too, is the same on Windows (MSVC,
@@ -248,63 +325,86 @@ call sites migrate:
 
 out of 300,000 inputs per unary function and 200,000 `powf` pairs.
 
-**Speed** (`bench_against_std`): one thread, release, median ns per call (or per
-element, for slices) over interleaved rounds, against the C runtime's `f32`
-function (for slices: a plain loop applying it in the call sites' expression).
-Windows CPU load 0-5% around the runs; the WSL runs started at a load average of
-10.5 inside the VM, just after their compile.
+**Speed** (`bench_against_std`, after S2): one thread, release, median ns per
+call (or per element, for slices) over interleaved rounds, against the C
+runtime's `f32` function (for slices: a plain loop applying it in the call
+sites' expression). "Native" is a `target-cpu=native` build, "base" a baseline
+`x86-64` build; the slice columns are the tiers, and a base build at `avx512` is
+what a released binary runs on this CPU. Windows CPU load 1-3% around the runs;
+WSL load average 0.00 at the start.
 
 Per call:
 
 | Function (inputs)       | Win native | UCRT | Win base | UCRT | WSL native | glibc | WSL base | glibc |
 | ----------------------- | ---------: | ---: | -------: | ---: | ---------: | ----: | -------: | ----: |
-| `exp` (softmax, -20..0) |       3.37 | 1.60 |     3.65 | 1.37 |       3.47 |  1.67 |     3.79 |  1.66 |
-| `ln` (1e-6..4)          |       6.11 | 1.77 |     5.79 | 1.76 |       6.36 |  1.70 |     6.00 |  1.67 |
-| `ln_1p` (-0.9..4)       |       6.74 | 2.76 |    16.62 | 2.69 |       6.91 |  2.46 |    17.40 |  2.40 |
-| `tanh` (-6..6)          |       4.51 | 4.86 |     4.84 | 4.77 |       4.60 |  2.80 |     5.04 |  2.76 |
-| `sin` (RoPE angles)     |       7.62 | 3.60 |     7.88 | 3.46 |       7.89 |  2.38 |     7.64 |  2.34 |
-| `cos` (RoPE angles)     |       7.71 | 3.55 |     8.12 | 3.35 |       7.77 |  2.59 |     7.96 |  2.53 |
-| `silu` (-6..6)          |       4.42 | 2.39 |     5.44 | 1.92 |       4.62 |  1.94 |     5.61 |  2.00 |
-| `powf` (RoPE `theta^e`) |      22.15 | 4.11 |    22.73 | 4.08 |      22.91 |  2.86 |    23.54 |  2.80 |
+| `exp` (softmax, -20..0) |       2.34 | 1.40 |     2.62 | 1.38 |       2.39 |  1.13 |     2.77 |  1.15 |
+| `ln` (1e-6..4)          |       6.14 | 1.78 |     5.80 | 1.79 |       6.24 |  1.39 |     6.15 |  1.32 |
+| `ln_1p` (-0.9..4)       |       6.81 | 2.73 |     6.41 | 2.75 |       6.91 |  2.42 |     6.53 |  2.43 |
+| `tanh` (-6..6)          |       4.53 | 4.86 |     4.93 | 4.88 |       4.52 |  2.79 |     5.06 |  2.79 |
+| `sin` (RoPE angles)     |       7.67 | 3.49 |     8.03 | 3.47 |       7.66 |  2.12 |     7.66 |  2.19 |
+| `cos` (RoPE angles)     |       7.69 | 3.46 |     8.29 | 3.33 |       7.59 |  2.26 |     7.96 |  2.37 |
+| `silu` (-6..6)          |       3.30 | 2.22 |     4.37 | 2.23 |       3.33 |  1.71 |     4.38 |  1.92 |
+| `powf` (RoPE `theta^e`) |      21.78 | 4.08 |    22.87 | 4.14 |      22.34 |  2.88 |    22.98 |  2.80 |
 
-Per slice element:
+Per slice element, by tier:
 
-| Slice             | Win native | UCRT | Win base | UCRT | WSL native | glibc | WSL base | glibc |
-| ----------------- | ---------: | ---: | -------: | ---: | ---------: | ----: | -------: | ----: |
-| `exp_slice`       |       0.75 | 1.10 |     1.77 | 1.09 |       0.76 |  1.03 |     1.80 |  1.03 |
-| `exp_sub_slice`   |       0.77 | 1.11 |     1.87 | 1.10 |       0.81 |  1.14 |     1.93 |  1.06 |
-| `tanh_slice`      |       0.86 | 4.30 |     2.34 | 4.28 |       0.91 |  2.37 |     2.43 |  2.32 |
-| `sigmoid_slice`   |       0.89 | 1.17 |     2.56 | 1.20 |       0.94 |  1.23 |     2.66 |  1.17 |
-| `silu_slice`      |       0.88 | 1.16 |     2.55 | 1.21 |       0.95 |  1.24 |     2.65 |  1.19 |
-| `gelu_tanh_slice` |       1.21 | 4.72 |     3.62 | 4.72 |       1.28 |  3.58 |     3.77 |  3.49 |
+| Slice             | Win base: UCRT | baseline | avx2 | avx512 | WSL base: glibc | baseline | avx2 | avx512 |
+| ----------------- | -------------: | -------: | ---: | -----: | --------------: | -------: | ---: | -----: |
+| `exp_slice`       |           1.10 |     1.13 | 0.77 |   0.62 |            1.05 |     1.17 | 0.80 |   0.64 |
+| `exp_sub_slice`   |           1.10 |     1.20 | 0.83 |   0.65 |            1.06 |     1.26 | 0.87 |   0.67 |
+| `tanh_slice`      |           4.25 |     2.38 | 1.28 |   0.87 |            2.32 |     2.48 | 1.33 |   0.90 |
+| `sigmoid_slice`   |           1.15 |     1.43 | 0.91 |   0.70 |            1.17 |     1.50 | 0.94 |   0.73 |
+| `silu_slice`      |           1.15 |     1.43 | 0.91 |   0.70 |            1.19 |     1.49 | 0.95 |   0.73 |
+| `gelu_tanh_slice` |           4.74 |     2.63 | 1.41 |   0.97 |            3.50 |     2.76 | 1.47 |   1.13 |
 
-Vectorization is confirmed by these numbers: a slice element costs a fifth to a
-quarter of a scalar call natively (AVX-512: 8 binary64 lanes) and about half at
-baseline (SSE2: 2 binary64 lanes, and no gather, so the table lookups stay
-scalar). Natively every slice beats the C runtime; at baseline only `tanh` and
-`gelu_tanh` do, and `exp`/`sigmoid`/`silu` are 1.6-2.2 times the C runtime's
-`expf`. The scalar functions are 2-4 times the C runtimes (8 for `powf`, called
-once per RoPE frequency, not per element). `ln_1p`'s baseline scalar time (16.6
-and 17.4 ns, against 6.7-6.9 natively, on both systems) is unexplained and not
-investigated; `ln_1p` is not on a hot path.
+In a native build every tier is the native code (the build's own features are
+already wide; the columns differ only in loop shape): Windows `exp_slice`
+0.63-0.65, `silu_slice` 0.70-0.73, `gelu_tanh_slice` 1.04-1.16 per element; WSL
+0.65-0.67, 0.73-0.77, 1.03-1.11.
 
-**Expected effect of the migration (an estimate, not a measurement).** From
-B173's profile of one Qwen3-1.7B pp512 forward at `target-cpu=native` on this
-machine (435.4 ms, 16 threads): `GatedAct` 18.17 ms, and `exp` about 5% of
-`Attention`'s 77.63 ms (taking `exp` out of a single-threaded layer saved 1.87
-of 34.49 ms), about 4 ms. If both are exp-bound and scale with the per-element
-times above:
+**The two-lane path against the C runtime.** How the tuning moved the baseline
+tier (Windows, baseline build, ns per element; the C runtime's loop 1.09-1.11
+for `exp`, 1.15-1.18 for `sigmoid`/`silu`; each row's bits identical to the row
+above, by the exhaustive tests where the row was kept):
 
-- Scalar functions at the call sites: `GatedAct` about +85% (4.42 against 2.39
-  ns per SiLU), attention's `exp` about +110%: up to about +20 ms, +4.6% per
-  forward.
-- Slices where the shape allows: `GatedAct` about -24% (0.88 against 1.16),
-  attention's `exp` about -30% (0.77 against 1.11): roughly -6 ms, -1.4%.
-- At baseline (the build CI and a portable release use), slices: `GatedAct`
-  about +110% and attention's `exp` about +70%: roughly +23 ms, +5%.
+| Variant                                                                | `exp_slice` | `sigmoid_slice` | `gelu_tanh_slice` |
+| ---------------------------------------------------------------------- | ----------: | --------------: | ----------------: |
+| S1: 64 entries, degree 6 by Horner, `2^k` by a multiply                |        1.76 |            2.55 |              3.60 |
+| 64 entries, degree 6 by Estrin, `2^k` built in the table's bits        |        1.48 |            2.17 |              3.65 |
+| 256 entries, degree 4 by Estrin (the loop vectorizer leaves it scalar) |        2.20 |            1.94 |              3.58 |
+| the same, blocks of 2 for the SLP vectorizer                           |        1.27 |            1.91 |              3.49 |
+| the same, blocks of 4 (kept)                                           |        1.14 |            1.97 |              3.54 |
+| blocks of 8                                                            |        2.22 |            1.98 |              3.62 |
+| blocks of 4, helpers in two passes (kept)                              |        1.15 |            1.46 |              2.69 |
 
-So the migration should use the slice forms for SiLU/GELU and the softmaxes; a
-baseline build will still be slower than today until a wider vector path or the
-runtime-dispatched native build (plan slice S6) covers it. Attention's exp is
-not a plain loop today (it runs inside the blocked q·k loop), so whether it can
-take `exp_sub_slice` is for S2 to see.
+(Single runs at 1-5% load; the kept numbers are re-measured in the table above.)
+So at baseline `exp` is at the C runtime's speed (1.13-1.17 against 1.05-1.10,
+3-11% slower), and `sigmoid`/`silu` are 24-28% slower than the C runtime's loop,
+which needs half the accuracy; `gelu_tanh` is faster than both C runtimes,
+`tanh` faster than UCRT and 7% slower than glibc 2.43. The remaining gap is the
+two-lane binary64 arithmetic that correct rounding needs (about twice the
+polynomial work of `expf`'s) and the table lookups, which stay scalar without a
+gather. On x86-64 this tier only runs on a CPU without AVX2; on aarch64 it is
+the NEON path, not measured.
+
+**What it costs a forward** (per-op profile, `INFR_PROF_OPS=1`, one pp512
+forward of each warm rep, two per build, 16 threads, Windows at 1-3% load; the
+same binaries interleaved; "forced" is the baseline build with
+`INFR_CPU_MATH_TIER=baseline`, the no-wide-path case), in ms:
+
+| Model, build                | `GatedAct` before |       after | `QkNormRope` before |     after | forward before |         after |
+| --------------------------- | ----------------: | ----------: | ------------------: | --------: | -------------: | ------------: |
+| Qwen3-1.7B Q4_K_M, native   |       17.37-18.14 | 16.28-16.57 |           9.14-9.35 | 7.89-8.62 |    450.1-455.3 |   443.1-448.1 |
+| Qwen3-1.7B, baseline build  |       17.90-18.73 | 15.23-15.94 |           8.96-9.43 | 8.53-8.88 |  1515.2-1558.2 | 1490.2-1569.5 |
+| Qwen3-1.7B, forced baseline |       17.90-18.73 | 17.91-18.64 |           8.96-9.43 | 8.56-8.84 |  1515.2-1558.2 | 1498.6-1550.6 |
+| gemma-3-1b Q4_K_M, native   |       46.52-47.77 | 18.53-18.99 |           7.05-7.17 | 3.95-4.15 |    844.8-866.6 |   831.5-846.8 |
+| gemma-3-1b, baseline build  |       47.87-48.44 | 18.36-18.83 |           5.73-6.30 | 4.33-4.85 |  1352.7-1392.8 | 1311.5-1374.5 |
+| gemma-3-1b, forced baseline |       47.87-48.44 | 25.25-25.35 |           5.73-6.30 | 4.29-4.59 |  1352.7-1392.8 | 1338.7-1366.0 |
+
+`Attention` did not move measurably (Qwen3 80.8-85.9 ms native before and after;
+its `exp` was about 5% of it). The baseline build is three times slower than
+native for reasons outside this module (attention's dots and the other
+autovectorized loops). `infr bench` pp512 on Qwen3-1.7B native, six interleaved
+rounds of three reps with no other build or test running: 976-1143 t/s before,
+1124-1159 after. Decode (tg128) moved within its noise on both models:
+gemma-3-1b native 37.9-39.4 before, 37.2-39.4 after, six interleaved rounds.

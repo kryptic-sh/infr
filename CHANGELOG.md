@@ -105,12 +105,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   not depend on the C library, unlike the `f32` methods, which differ in the
   last bit between UCRT and glibc: the grid hashes are identical on Windows
   (native and baseline x86-64 builds) and Linux under WSL; aarch64 has been
-  compiled, and CI's macOS job is the first run there. See `docs/math.md`.
-  Nothing uses the module yet, so no output changes: moving the call sites (and
-  the one-time re-bless of the CPU goldens) is the next slice of
-  `docs/plan/11-cpu-bit-identical.md`. A new lint,
-  `crates/infr-core/tests/no_platform_libm.rs`, counts the call sites still on
-  the platform functions.
+  compiled, and CI's macOS job is the first run there. See `docs/math.md`. The
+  slice functions run at the widest SIMD tier the CPU has, chosen at run time
+  (baseline, AVX2 or AVX-512 on x86-64), so a baseline x86-64 build still runs
+  them four or eight binary64 lanes wide; `math::Tier`, `math::slice_fns`,
+  `math::force_tier` and the new `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER`
+  setting force one (a debug switch: every tier gives the same bits). Also
+  `rope_freqs` and `rope_sin_cos`, the RoPE angles every CPU RoPE variant now
+  shares. A new lint, `crates/infr-core/tests/no_platform_libm.rs`, fails on any
+  platform math call in production code.
 
 - **Wave64-only AMD GPUs (GCN: Polaris, Vega) run on the Vulkan backend** (issue
   #94), ported from korewaChino's KessokuNet fork. A device that cannot pin a
@@ -298,6 +301,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the slot alignment each needs.
 
 ### Changed
+
+- **CPU outputs are identical on every operating system, and change once.**
+  Every transcendental function the CPU backend uses (`exp`, `ln`, `ln_1p`,
+  `tanh`, `powf`, `sin`, `cos`: softmaxes, SiLU/GELU/sigmoid, RoPE, the MoE
+  router, DeltaNet, sampling, YaRN scales) now comes from `infr_core::math`,
+  correctly rounded, instead of the C runtime, whose last bit differs between
+  Windows (UCRT), Linux (glibc, by version) and macOS. So CPU logits are the
+  same bits on Windows and Linux (checked on one machine, natively and under
+  WSL), and the CPU golden hashes have one value per case on every platform.
+  Upgrading, expect CPU results to differ from earlier releases in the last bit
+  of these functions, and greedy text to fork where two tokens were nearly tied:
+  five of the 17 cached golden cases changed text, each still coherent (for
+  example Qwen3-0.6B's ocean paragraph now says "brainstorming key elements"
+  where it said "brainstorming the key elements"). Distances to llama.cpp are
+  unchanged (the synthetic DeepSeek V4 and LFM3 oracles, a Qwen3-0.6B logits
+  dump). The GPU kernels are unchanged; values the host computes for a GPU (YaRN
+  divisors and scales, host-side sampling) move by the same last bits. The MXFP4
+  E8M0 scale exponent is now computed exactly from the float's bits rather than
+  from `log2`.
+
+- **Faster activations and RoPE on the CPU.** SiLU, GELU and the softmaxes run
+  as vectorized slices, picked per CPU at run time. Measured on a Ryzen 9
+  9950X3D, 16 threads, one warm pp512 forward (`INFR_PROF_OPS=1`, two forwards
+  each): gemma-3-1b's `GatedAct` from 46.5-47.8 to 18.5-19.0 ms and `QkNormRope`
+  from 7.1 to 4.0-4.2 ms; Qwen3-1.7B's `GatedAct` from 17.4-18.1 to 16.3-16.6 ms
+  and `QkNormRope` from 9.1-9.4 to 7.9-8.6 ms; whole forwards 845-867 to 832-847
+  ms and 450-455 to 443-448 ms. Qwen3-1.7B pp512 over six interleaved rounds:
+  976-1143 t/s before, 1124-1159 after. A build for baseline x86-64 gets the
+  same: its gemma `GatedAct` went from 47.9-48.4 to 18.4-18.8 ms.
 
 - **A GPU session with no room left for any context fails with the numbers.**
   When the device's free memory after the weights cannot hold even a one-token

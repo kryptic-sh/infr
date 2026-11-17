@@ -237,9 +237,9 @@ and these exist to force one off when bisecting a correctness or perf problem.
   the thread running the graph, on one logical processor per allowed core so no
   two share a core's SMT siblings; only when the threads fit one per allowed
   core; Windows only, no `INFR_*` twin), and `math_tier` (`INFR_CPU_MATH_TIER`:
-  force the SIMD tier of `infr_core::math`'s slice functions, `baseline`,
-  `avx2` or `avx512`, instead of the widest the CPU has; every tier gives the
-  same bits, so it changes only speed, and a tier the CPU lacks is refused; see
+  force the SIMD tier of `infr_core::math`'s slice functions, `baseline`, `avx2`
+  or `avx512`, instead of the widest the CPU has; every tier gives the same
+  bits, so it changes only speed, and a tier the CPU lacks is refused; see
   [`math.md`](math.md)).
 
 ### Vulkan kernel tuning

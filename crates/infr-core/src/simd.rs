@@ -117,14 +117,31 @@ fn decode(n: u8) -> SimdTier {
 }
 
 /// The tier code runs at: the one [`set_max`] last chose, else [`SimdTier::best`], installed on
-/// first use. One relaxed load once resolved, the cost of the `is_x86_feature_detected!` it
-/// replaces.
+/// first use.
 #[inline]
 pub fn active() -> SimdTier {
     match ACTIVE.load(Ordering::Relaxed) {
         0 => install_first(SimdTier::best()),
         n => decode(n),
     }
+}
+
+/// Whether code of tier `t` may run: `active() >= t`, as one relaxed load and one integer
+/// comparison. Every SIMD dispatch in the CPU backend asks this per call (per weight row, for the
+/// batch kernels), so it is kept to that.
+#[inline(always)]
+pub fn allows(t: SimdTier) -> bool {
+    match ACTIVE.load(Ordering::Relaxed) {
+        0 => allows_first(t),
+        // `encode(a) = a + 1`, so `a >= t` is `encode(a) > t`.
+        n => n > t as u8,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn allows_first(t: SimdTier) -> bool {
+    active() >= t
 }
 
 /// Install `auto` as the active tier only if nothing is active yet, and return the active tier:
@@ -178,11 +195,15 @@ mod tests {
         assert_eq!(set_max(Some(SimdTier::Avx512Vnni)), SimdTier::best());
         assert_eq!(active(), SimdTier::best());
         assert_eq!(set_max(Some(SimdTier::Scalar)), SimdTier::Scalar);
+        assert!(allows(SimdTier::Scalar) && !allows(SimdTier::Avx2));
         assert_eq!(install_first(SimdTier::best()), SimdTier::Scalar);
         assert_eq!(active(), SimdTier::Scalar);
         assert_eq!(math::tier(), math::Tier::Baseline);
         assert_eq!(set_max(None), SimdTier::best());
         assert_eq!(active(), SimdTier::best());
+        for t in SimdTier::ALL {
+            assert_eq!(allows(t), t <= SimdTier::best(), "{t:?}");
+        }
         assert_eq!(math::tier(), SimdTier::best().math());
     }
 }

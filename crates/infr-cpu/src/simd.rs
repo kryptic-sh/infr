@@ -26,11 +26,11 @@ pub(crate) use infr_core::simd::SimdTier;
 /// Whether the active tier is at least `t`. (Off x86-64 every tier above scalar is absent, so
 /// nothing asks.)
 #[cfg(target_arch = "x86_64")]
-#[inline]
+#[inline(always)]
 fn at_least(t: SimdTier) -> bool {
     #[cfg(not(test))]
     {
-        infr_core::simd::active() >= t
+        infr_core::simd::allows(t)
     }
     #[cfg(test)]
     {
@@ -44,21 +44,21 @@ fn at_least(t: SimdTier) -> bool {
 
 /// May this call run AVX2 code?
 #[cfg(target_arch = "x86_64")]
-#[inline]
+#[inline(always)]
 pub(crate) fn avx2() -> bool {
     at_least(SimdTier::Avx2)
 }
 
 /// May this call run AVX-512 (F, DQ, VL, BW) code?
 #[cfg(target_arch = "x86_64")]
-#[inline]
+#[inline(always)]
 pub(crate) fn avx512() -> bool {
     at_least(SimdTier::Avx512)
 }
 
 /// May this call run AVX-512 VNNI code (with AVX-512 F, DQ, VL, BW)?
 #[cfg(target_arch = "x86_64")]
-#[inline]
+#[inline(always)]
 pub(crate) fn vnni() -> bool {
     at_least(SimdTier::Avx512Vnni)
 }

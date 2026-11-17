@@ -2411,12 +2411,12 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "The capital of France is",
         32,
-        0x542a9dd055c58884, // prefilled-think reasoning ("Thinking Process… capital of France")
+        0x01829861302f0b8a, // prefilled-think reasoning ("Thinking Process… capital of France")
     ),
     (
         "Tell me a short story about a brave knight.",
         48,
-        0xbe06c5580ea33d78, // prefilled-think reasoning (story planning process)
+        0x0a0d2a6554ca9f21, // prefilled-think reasoning (story planning process)
     ),
 ];
 

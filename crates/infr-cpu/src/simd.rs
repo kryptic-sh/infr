@@ -20,9 +20,12 @@
 //! process-wide ceiling other tests run under, and each check records the widest tier it allowed
 //! on that thread, so a test can tell which tier's code a dispatcher actually ran.
 
+#[cfg(any(test, target_arch = "x86_64"))]
 pub(crate) use infr_core::simd::SimdTier;
 
-/// Whether the active tier is at least `t`.
+/// Whether the active tier is at least `t`. (Off x86-64 every tier above scalar is absent, so
+/// nothing asks.)
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn at_least(t: SimdTier) -> bool {
     #[cfg(not(test))]
@@ -75,10 +78,12 @@ mod testing {
         static WIDEST: Cell<Option<SimdTier>> = const { Cell::new(None) };
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) fn current() -> SimdTier {
         OVERRIDE.get().unwrap_or_else(infr_core::simd::active)
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) fn record(t: SimdTier) {
         WIDEST.set(WIDEST.get().max(Some(t)));
     }

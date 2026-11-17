@@ -6572,10 +6572,6 @@ every other dtype. The options as weighed:
 - **aarch64 is compiled, never run or measured.** CI's macOS job runs the grid
   hashes; the speed of the two-lane NEON path (the baseline tier there) against
   Apple's libm is unknown: run `bench_against_std` on a Mac (`docs/math.md`).
-- **The matmul kernels' tiers have no force switch.** `kernels.cpu.math_tier`
-  forces only the math slices; the quantized dot kernels choose by
-  `is_x86_feature_detected!` per call, so a baseline build on this machine runs
-  their AVX-512 code. The tier-against-scalar proof for them is plan 11's S4.
 - **Not migrated to slices (scalar `math` calls, not hot):** the MoE router's
   sqrt-softplus, the hyper-connection sigmoids, DeltaNet's per-head gates,
   `Op::HeadGate` and `MoeSharedExpertAdd` (one sigmoid per head or row), the MLA

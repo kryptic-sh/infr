@@ -318,6 +318,24 @@ coherent.
 | `cpu_golden_lfm3`, lighthouse keeper                  | `0x6e5098d3a5bec173`                      | unchanged            |
 | `cpu_golden_qwen3moe` (Qwen3-30B-A3B), France         | `0xe1a4ed6cecc5eb14 / 0xbc4f22b22d3e3c1d` | `0xe1a4ed6cecc5eb14` |
 
+Plan 11's S4 then changed one case once more: the AVX-512 Q8_0 kernels
+associated their block sums differently from the scalar and AVX2 ones (see
+`docs/plan/11-cpu-bit-identical.md`), and making them compute the scalar
+expression changed Qwen3.5-0.8B's output on AVX-512 machines, the same natively
+on Windows and under WSL. Both texts stay coherent; each forks at its first near
+tie:
+
+| Test, case                  | Before               | After                |
+| --------------------------- | -------------------- | -------------------- |
+| `cpu_golden_qwen35`, France | `0x542a9dd055c58884` | `0x01829861302f0b8a` |
+| `cpu_golden_qwen35`, knight | `0xbe06c5580ea33d78` | `0x0a0d2a6554ca9f21` |
+
+France: "**Analyze the Request:** The user is asking for the capital of France."
+became "**Analyze the Request:**\n \* Question: …"; knight: "**Topic:** A short
+story about a brave knight." became "**Topic:** A brave knight.". The new knight
+hash is the one CI's (AVX2) runner computed when the golden was dropped from CI
+as not portable (`docs/synthetic-models.md`).
+
 How the changed texts fork, for example: Qwen3-0.6B's ocean paragraph went from
 "brainstorming the key elements … Maybe use words like" to "brainstorming key
 elements … Maybe compare it to"; gemma's knight story keeps its opening line;

@@ -2136,7 +2136,20 @@ fn lower_op(
                         return Err(be("vulkan adapter: dynamic decode f16 WriteKv unexpected"))
                     }
                     _ => match c_addr {
-                        Some(a) => rec.store_f16_dyn_at(s, *params, c, a, n, cap_rows),
+                        Some(a) => {
+                            // A pooled slot's rows start at `row_base`. The record-once store reads
+                            // its position from params (no host bias possible), so the block offset
+                            // rides the base address instead; `row_base + max_ctx <= cap_rows`, so
+                            // the in-kernel ring modulo never wraps past the block.
+                            rec.store_f16_dyn_at(
+                                s,
+                                *params,
+                                c,
+                                a + (rb * rs * 2) as u64,
+                                n,
+                                cap_rows,
+                            )
+                        }
                         None => rec.store_f16_dyn(s, *params, c, n, cap_rows),
                     },
                 },
@@ -2408,8 +2421,18 @@ fn lower_op(
             };
             // #74: fork to the BDA path when the fused K write lands in the KV cache (device address
             // present); the un-fused Q-scratch write stays bound. `out_buf` stays bound at its write
-            // slot in the `_at` method for the store→read barrier.
-            let y_addr = out_buf.device_addr();
+            // slot in the `_at` method for the store→read barrier. A pooled slot's rows start at its
+            // block, so the fused write's base address carries the same row-base bias the
+            // `QkNormRope` arm applies.
+            let k_bias = fused_kv_write.get(&op_idx).map_or(0, |&(cache, _)| {
+                kv_row_base(graph, cache)
+                    * graph
+                        .desc(cache)
+                        .dtype
+                        .dense_bytes((*n_head as usize) * (*head_dim as usize))
+                        .unwrap_or(0)
+            });
+            let y_addr = out_buf.device_addr().map(|a| a + k_bias as u64);
             match mode {
                 RopeMode::Static(rope_pos) => {
                     if f16_out {

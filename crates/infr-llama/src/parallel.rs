@@ -298,6 +298,25 @@ impl ParallelSeam {
         // Drop the warmup tokens so the first real prompt prefills a clean slot from row 0 instead
         // of forking off a garbage prefix.
         slot0.reset();
+        // `kv.paged`: with a fixed slot count known at boot, the pool is built here — every slot
+        // below is then a BLOCK of it instead of its own contiguous cache.
+        if self.model.engine_cfg().kv.paged == Some(true)
+            && infr_core::backend::Backend::capabilities(&self.vk).kv_paging
+        {
+            let (k_fmt, v_fmt) = slot0.kv_fmts();
+            let built = crate::seam::KvPool::new(
+                &self.vk,
+                self.model.config(),
+                slot0.max_ctx(),
+                k_fmt,
+                v_fmt,
+                n_slots.max(crate::seam::POOL_BLOCKS),
+            )
+            .and_then(|pool| slot0.attach_paged(&self.vk, self.model.config(), &pool));
+            if let Err(e) = built {
+                tracing::warn!("kv.paged: could not page this session's KV ({e}); slots stay linear");
+            }
+        }
 
         let mut slots = Vec::with_capacity(n_slots);
         for i in 1..n_slots {

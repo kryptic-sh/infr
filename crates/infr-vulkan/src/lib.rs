@@ -2612,6 +2612,9 @@ impl VulkanBackend {
             // Every KV write/read kernel maps position -> row modulo the cache's row capacity
             // (identity on full-context caches), so SWA layers may get window-sized ring caches.
             kv_swa_ring: true,
+            // The KV kernels resolve a row through `TensorDesc::pages` when a cache carries a page
+            // map (see the adapter's paged read and store paths).
+            kv_paging: true,
             // `execute_static`/the replay tape dispatch straight against the bound buffers (only
             // `Internal` handles get backend scratch — see `alloc_scratch`), so an op writing a
             // bound `Input` writes the caller's memory and the next execute sees it.

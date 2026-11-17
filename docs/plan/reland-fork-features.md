@@ -30,8 +30,11 @@ enums, `Recorder` kernel tables, the BDA-only KV stores):
   `exl3_*` shaders with the fp16 decode GEMV.
 - **Vulkan** — `linear_f32_mo` + `float_gemv_bw`, `native_gemv_kq_fma` decode
   and its multi-row verify twin, wave64-native `SG=64` subgroup decode GEMV,
+  the fp32 K-quant prefill GEMM (`NcGemm::KqFma`, split-K included),
   `weights_as_ssbo`, the spv-hoard build cache, the `bw_scan` bandwidth test,
-  Chrome-trace timeline, GQA decode pass 1, KV paged reads (`kv.store_mb`).
+  Chrome-trace timeline, GQA decode pass 1, KV paged reads (`kv.store_mb`),
+  forward paged attention in the seam (`kv.paged`: `KvPool`/`PagedSlot`, a
+  pool at the first fork or at boot, page-mapped caches in every graph).
 - **Models** — Gemma 4 MTP draft, Gemma 4 text + row embeddings, Gemma 4
   vision (`serve.mmproj`, `serve.image_max_tokens`), Qwen4 reference path,
   Seed-Coder pre-tokenizer.
@@ -54,17 +57,11 @@ enums, `Recorder` kernel tables, the BDA-only KV stores):
 
 See `docs/backlog.md` (B-RELAND) for what each one needs:
 
-- the forward paged-attention seam (`kv.paged`): the page pool and the
-  page-table read path exist, but slots still allocate contiguous KV, so
-  `SeamRunner` refuses `INFR_KV_PAGED=1` rather than measure the wrong thing.
-- the fp32 K-quant prefill GEMM (`native_gemm_kq_fma.comp`) — the
-  `native_gemm_kq_fma_supported` gate is in the tree, the kernel is not.
 - the store kernels' params-based row base (`p_rb`).
 - split-K prefill attention (`22a2c948`), small-turn attention + K-quant
-  linears (`05eb5b55`), rope grid-stride sizing (`53adff6e`), mmv OUTS4
-  K-tail (`eea45032`), compare benchmark overrides (`c79c4034`), fused
-  RmsNorm consumers (the `plan_rmsnorm_linear` planner no longer exists in
-  core).
+  linears (`05eb5b55`), mmv OUTS4 K-tail (`eea45032`), compare benchmark
+  overrides (`c79c4034`), fused RmsNorm consumers (the `plan_rmsnorm_linear`
+  planner no longer exists in core).
 
 ## Landed in this pass but not yet exercised on hardware
 

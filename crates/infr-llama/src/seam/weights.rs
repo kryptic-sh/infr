@@ -344,8 +344,11 @@ pub(crate) struct SeamKv {
     pub(super) weights: std::sync::Arc<SeamWeights>,
     /// Session-stable pure derivations (see [`SessionStable`]) — shared across warm calls + forks.
     pub(super) stable: std::sync::Arc<SessionStable>,
-    pub(super) kbufs: Vec<Box<dyn Buffer>>,
-    pub(super) vbufs: Vec<Box<dyn Buffer>>,
+    pub(super) kbufs: Vec<std::sync::Arc<dyn Buffer>>,
+    pub(super) vbufs: Vec<std::sync::Arc<dyn Buffer>>,
+    /// This slot's pages, when the session runs `kv.paged`: its block in the pool plus the table
+    /// every attention read of a pooled layer goes through. `None` for a linear slot.
+    pub(super) paged: Option<crate::seam::PagedSlot>,
     /// Per layer, a DeepSeek V4 compressed layer's block caches and compressor state rings, in
     /// `crate::seam::dsv4_comp_bufs` order; empty for every other layer and arch. The rings are
     /// session state like a recurrent layer's (`Config::has_unrewindable_state`).
@@ -435,8 +438,8 @@ pub(crate) struct SeamKv {
 /// Allocated once (lazily) and reused every cycle. Its size is the live recurrent state's
 /// (`Config::recurrent_state_elems`).
 pub(super) struct MtpDeltaCkpt {
-    kbufs: Vec<Box<dyn Buffer>>,
-    vbufs: Vec<Box<dyn Buffer>>,
+    kbufs: Vec<std::sync::Arc<dyn Buffer>>,
+    vbufs: Vec<std::sync::Arc<dyn Buffer>>,
     /// The layer indices (into `SeamKv::kbufs`/`vbufs`) that are recurrent.
     layers: Vec<usize>,
     cached_len: usize,
@@ -452,8 +455,8 @@ pub(super) struct MtpDeltaCkpt {
 pub(super) fn snapshot_delta(
     be: &dyn Backend,
     cfg: &Config,
-    kbufs: &[Box<dyn Buffer>],
-    vbufs: &[Box<dyn Buffer>],
+    kbufs: &[std::sync::Arc<dyn Buffer>],
+    vbufs: &[std::sync::Arc<dyn Buffer>],
     ckpt: &mut Option<MtpDeltaCkpt>,
     cached_len: usize,
 ) -> AResult<()> {
@@ -467,14 +470,14 @@ pub(super) fn snapshot_delta(
         let mut ck_k = Vec::with_capacity(layers.len());
         let mut ck_v = Vec::with_capacity(layers.len());
         for &l in &layers {
-            ck_k.push(
+            ck_k.push(std::sync::Arc::from(
                 be.alloc(kbufs[l].len_bytes().max(1), BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
-            );
-            ck_v.push(
+            ));
+            ck_v.push(std::sync::Arc::from(
                 be.alloc(vbufs[l].len_bytes().max(1), BufferUsage::KvCache)
                     .map_err(|e| anyhow!("{e}"))?,
-            );
+            ));
         }
         *ckpt = Some(MtpDeltaCkpt {
             kbufs: ck_k,
@@ -511,8 +514,8 @@ pub(super) fn snapshot_delta(
 /// or `None` (nothing copied) when there is no valid snapshot.
 pub(super) fn restore_delta(
     be: &dyn Backend,
-    kbufs: &[Box<dyn Buffer>],
-    vbufs: &[Box<dyn Buffer>],
+    kbufs: &[std::sync::Arc<dyn Buffer>],
+    vbufs: &[std::sync::Arc<dyn Buffer>],
     ckpt: &Option<MtpDeltaCkpt>,
 ) -> AResult<Option<usize>> {
     let Some(ck) = ckpt.as_ref().filter(|ck| ck.valid) else {
@@ -681,7 +684,71 @@ impl SeamKv {
     /// row 0). Used to discard a warmup generation without dropping the slot's buffers.
     pub(crate) fn reset(&mut self) {
         self.cached.clear();
+        if let Some(p) = &mut self.paged {
+            p.release_pages();
+        }
         invalidate_delta(&mut self.mtp_delta_ckpt);
+    }
+
+    /// The (K, V) dtypes this slot's cache uses — what a session pool must be built with.
+    pub(crate) fn kv_fmts(&self) -> (DType, DType) {
+        (self.k_fmt, self.v_fmt)
+    }
+
+    /// Whether this slot serves its pooled layers out of a page pool.
+    pub(crate) fn is_paged(&self) -> bool {
+        self.paged.is_some()
+    }
+
+    /// The store bias for ONE layer: its block's first row when that layer is pooled, else 0 — a
+    /// slot's sliding-window, recurrent and compressed layers keep private buffers that still start
+    /// at row 0.
+    pub(crate) fn paged_row_base_at(&self, cfg: &Config, l: usize) -> usize {
+        match &self.paged {
+            Some(p) if crate::seam::paged_layer(cfg, l) => p.row_base(),
+            _ => 0,
+        }
+    }
+
+    /// Turn this slot's pooled layers into blocks of `pool`: move the rows it already holds into
+    /// its block, point the layer buffers at the pool, and materialize the table. Linear layers
+    /// keep their private buffers.
+    pub(crate) fn attach_paged(
+        &mut self,
+        be: &dyn Backend,
+        cfg: &Config,
+        pool: &std::sync::Arc<crate::seam::KvPool>,
+    ) -> AResult<()> {
+        let slot = crate::seam::PagedSlot::new(pool, be)?;
+        let block = slot.map.block();
+        let rows = self.cached.len().min(pool.slot_rows());
+        for l in 0..cfg.n_layer {
+            let Some(dst) = pool.k(l) else { continue };
+            if rows > 0 {
+                pool.import_rows(
+                    be,
+                    l,
+                    block,
+                    rows,
+                    self.kbufs[l].as_ref(),
+                    self.vbufs[l].as_ref(),
+                )?;
+            }
+            self.kbufs[l] = std::sync::Arc::clone(dst);
+            self.vbufs[l] = std::sync::Arc::clone(pool.v(l).expect("pooled layer has both sides"));
+        }
+        self.paged = Some(slot);
+        let layers = (0..cfg.n_layer).filter(|&l| pool.k(l).is_some()).count();
+        tracing::info!(
+            "kv.paged: {} of {} layers in {} pool blocks of {} rows; this slot's block starts at \
+             row {}",
+            layers,
+            cfg.n_layer,
+            pool.blocks(),
+            pool.slot_rows(),
+            self.paged.as_ref().expect("just set").row_base(),
+        );
+        Ok(())
     }
 
     /// Snapshot the recurrent state (both state buffers of every recurrent layer:
@@ -721,21 +788,32 @@ impl SeamKv {
     pub(crate) fn fork(&self, be: &dyn Backend, cfg: &Config) -> AResult<SeamKv> {
         let e2b = self.ipl_buf.is_some();
         let npl = cfg.n_embd_per_layer.max(1);
-        let mut kbufs: Vec<Box<dyn Buffer>> = Vec::new();
-        let mut vbufs: Vec<Box<dyn Buffer>> = Vec::new();
+        let mut kbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
+        let mut vbufs: Vec<std::sync::Arc<dyn Buffer>> = Vec::new();
+        let pool = self
+            .paged
+            .as_ref()
+            .map(|p| std::sync::Arc::clone(p.map.pool()));
         for l in 0..cfg.n_layer {
+            // Pooled layers belong to the session's page pool: the child shares the SAME buffers
+            // (its own block is a row bias), so there is nothing to allocate.
+            if pool.is_some() && crate::seam::paged_layer(cfg, l) {
+                kbufs.push(std::sync::Arc::clone(&self.kbufs[l]));
+                vbufs.push(std::sync::Arc::clone(&self.vbufs[l]));
+                continue;
+            }
             // Recurrent layers (qwen35 DeltaNet, LFM short convolution): fixed-size state, NOT a
             // `max_ctx`-scaled KV cache (see the matching alloc in `generate_dense_backend`'s state
             // init and `Config::recurrent_state_elems`).
             if let Some((k_elems, v_elems)) = cfg.recurrent_state_elems(l) {
-                kbufs.push(
+                kbufs.push(std::sync::Arc::from(
                     be.alloc(k_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
-                );
-                vbufs.push(
+                ));
+                vbufs.push(std::sync::Arc::from(
                     be.alloc(v_elems * 4, BufferUsage::KvCache)
                         .map_err(|e| anyhow!("{e}"))?,
-                );
+                ));
                 continue;
             }
             // Same per-layer geometry as the original allocation — same widths from the same
@@ -751,20 +829,20 @@ impl SeamKv {
                 self.ubatch,
                 be.kv_row_align(),
             );
-            kbufs.push(
+            kbufs.push(std::sync::Arc::from(
                 be.alloc(
                     crate::seam::kv_side_bytes(self.k_fmt, rows_l * k_row),
                     BufferUsage::KvCache,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
-            );
-            vbufs.push(
+            ));
+            vbufs.push(std::sync::Arc::from(
                 be.alloc(
                     crate::seam::kv_side_bytes(self.v_fmt, rows_l * v_row),
                     BufferUsage::KvCache,
                 )
                 .map_err(|e| anyhow!("{e}"))?,
-            );
+            ));
         }
         let cbufs = alloc_dsv4_comp_bufs(be, cfg, self.max_ctx, self.k_fmt)?;
         // A fork is only usable if its buffers have the SAME geometry as the slot it forked from,
@@ -796,7 +874,7 @@ impl SeamKv {
                 }
             }
         }
-        Ok(SeamKv {
+        let child = SeamKv {
             weights: std::sync::Arc::clone(&self.weights),
             stable: std::sync::Arc::clone(&self.stable),
             kbufs,
@@ -825,6 +903,10 @@ impl SeamKv {
             kv_ring: self.kv_ring,
             ubatch: self.ubatch,
             cached: Vec::new(),
+            paged: match (&pool, self.paged.as_ref()) {
+                (Some(p), Some(src)) => Some(crate::seam::PagedSlot::fork(p, be, &src.map, 0)?),
+                _ => None,
+            },
             written_end: 0,
             // The forked slot's KV/weight buffers are new objects, so a cached plan's bindings
             // (which point at the OLD slot's buffers) don't carry over — rebuild lazily on this
@@ -842,7 +924,15 @@ impl SeamKv {
             sc_temp_inv_buf: None,
             mtp_delta_ckpt: None,
             delta_snapshot_refused: false,
-        })
+        };
+        if let Some(p) = &child.paged {
+            tracing::info!(
+                "kv.paged: forked slot in block {} (its rows start at {})",
+                p.map.block(),
+                p.row_base(),
+            );
+        }
+        Ok(child)
     }
 
     /// Seed this slot's KV cache with the first `p` rows of `src`'s (the shared conversation
@@ -882,6 +972,35 @@ impl SeamKv {
             .window_ring_rows(be, cfg)
             .is_some_and(|rows| src.written_end > rows)
         {
+            return Ok(());
+        }
+        // Paged slots share whole pages: the prefix's pages become the same physical pages in both
+        // slots, and only the partial page at the end is copied.
+        if self.paged.is_some() && src.paged.is_none() {
+            // Only reachable if a paged slot forked a source the session never attached (see
+            // `start_paging`); the linear copy below would write at row 0 of a pooled block, which
+            // is NOT this slot's rows. Re-prefill instead.
+            return Ok(());
+        }
+        if let (Some(dst), Some(src_paged)) = (self.paged.as_mut(), src.paged.as_ref()) {
+            let page_rows = infr_vulkan::paged::PAGE_ROWS;
+            let pages = p / page_rows;
+            if pages > 0 {
+                dst.map.share_prefix(&src_paged.map, pages);
+                dst.upload_table(be)?;
+                tracing::info!(
+                    "kv.paged: forked slot shares {} pages ({} rows) of the prefix",
+                    pages,
+                    pages * page_rows,
+                );
+            }
+            // The prefix ends inside a page more often than not; the linear path copies those rows,
+            // so a fork that shared nothing (a prefix under one page) must not be worse than it.
+            let tail = p - pages * page_rows;
+            if tail > 0 {
+                dst.copy_tail(be, &src_paged.map, pages, tail)?;
+            }
+            self.cached = src.cached[..p].to_vec();
             return Ok(());
         }
         for l in 0..cfg.n_layer {

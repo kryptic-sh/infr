@@ -30,38 +30,36 @@ Provenance tags point at the finding that opened the item:
 
 **Tag:** re-land · **Needs:** work, per item
 
-`docs/plan/reland-fork-features.md` records the whole replay. Five items did
+`docs/plan/reland-fork-features.md` records the whole replay. These items did
 not come back, each for its own reason:
 
-1. **Forward paged attention in the seam (`kv.paged`).** The page pool, the
-   page-table read path and the paged attention kernels exist; slots still
-   allocate contiguous KV, so `seam::runner` refuses `INFR_KV_PAGED=1` with an
-   error instead of quietly running the linear path (a "paged" benchmark would
-   then measure the wrong thing). Wiring it means teaching `SeamKv` (upstream's
-   `cbufs`/`written_end`) a `paged: Option<PagedSlot>` and giving the page pool a
-   home in the runner. Original commits: `b7626c9a`, `e65f1601`, `f9534310`,
-   `d17b073a`, `fe3199ce`, `dacc0b94`, `f610fd85`.
+1. ~~Forward paged attention in the seam (`kv.paged`)~~ — **landed**: `KvPool`
+   + `PagedSlot` live in `seam/pool.rs`, the pool is built at the first fork
+   (`SlotPool`) or at boot (`--parallel`), and every pooled cache carries a
+   `PageMap` into its graph. Two bugs the port exposed are fixed with it: the
+   `Op::Rope` peephole wrote a pooled slot's K rows at row 0 (it applied no
+   row-base bias, unlike the `QkNormRope` arm), and the record-once V store
+   baked an unbiased address. `tests/kv_paged_session.rs` pins a two-conversation
+   session byte-for-byte against a contiguous one.
 2. **Store kernels' params-based row base (`p_rb`).** `store_f16.comp` and
    `quant_q8.comp` derive the write row from `p_pos` alone; a paged slot's row
    base travels in the destination device address instead
    (`adapter::kv_row_base * row_bytes`). The test that pinned `p_pos + p_rb`
    (`a_store_row_base_puts_the_row_in_that_block`) is `#[ignore]`d with that
    reason, because the params word never landed in any store kernel.
-3. **fp32 K-quant prefill GEMM.** `native_gemm_kq_fma_supported` is in
-   `infr-vulkan/src/gemm.rs`, the kernel (`native_gemm_kq_fma.comp`) is not, so
-   the gate names a build that does not exist. Port the fork's prefill GEMM onto
-   upstream's `quant_linear`, and bring `22a2c948` (split-K prefill grid) with
-   it.
-4. **Small per-kernel tuning the replay dropped**: rope grid sizing in
-   workgroups (`53adff6e`), mmv OUTS4 K-tail (`eea45032`), small-turn attention
-   + K-quant linears (`05eb5b55`), compare benchmark overrides (`c79c4034`).
+3. ~~fp32 K-quant prefill GEMM~~ — **landed** (`native_gemm_kq_fma.comp` + the
+   split-K twin, `NcGemm::KqFma`).
+4. **Small per-kernel tuning the replay dropped**: mmv OUTS4 K-tail
+   (`eea45032`), small-turn attention + K-quant linears (`05eb5b55`), compare
+   benchmark overrides (`c79c4034`).
 5. **Fused RmsNorm consumers.** `infr-core/src/fusion.rs` now plans only
    `Op`-level fusions; `plan_rmsnorm_linear` / `FusionPlan::rmsnorm_linear` (and
    `446eb403`'s input-unchanged fix) are gone with upstream's pattern. Restoring
    it needs a Vulkan (and Metal) planner again.
 
-The GCN tiers that did land (`kq_fma_gemv`, `wave64_native`) still owe the
-RX 580 run `docs/legacy-gpus.md` describes.
+The GCN tiers that landed (`kq_fma_gemv`, `wave64_native`, `kq_fma` prefill)
+still owe the RX 580 run `docs/legacy-gpus.md` describes — the first two have
+been spot-checked there, the prefill GEMM has not.
 
 ### B-DSV2-NONYARN-SCALE — deepseek2 ignores a non-YaRN `rope.scaling.factor` (2026-11-16)
 

@@ -101,6 +101,7 @@ mod tests {
             max_shared_memory_bytes: shared,
             unified_memory: integrated,
             kv_swa_ring: true,
+            kv_paging: true,
             ..Default::default()
         }
     }

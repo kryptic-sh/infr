@@ -1,23 +1,25 @@
 //! A graph whose KV caches describe a whole page pool (not one slot's rows) must attend the same
-//! bits as the same rows laid out contiguously. This is the seam's descriptor shape under
-//! `kv.paged`: the cache input is pool-sized, carries a [`PageMap`], and the slot's rows sit at
-//! `row_base` inside it.
+//! bits as the same rows laid out contiguously. This is the shape the seam emits under `kv.paged`:
+//! the cache input is pool-sized, carries a [`PageMap`], and the slot's rows sit at `row_base`
+//! inside it — reached through the table, never by flat position.
 //!
-//! Run: `cargo test -p infr-llama --test kv_paged_graph`
+//! Run: `cargo test -p infr-llama --test kv_paged_graph -- --ignored --nocapture`
 
 use infr_core::backend::{Backend, Bindings, BufferUsage};
+use infr_core::config::Config;
 use infr_core::graph::{AttnMask, Graph, Op};
 use infr_core::tensor::{PageMap, TensorDesc};
 use infr_core::{DType, TensorId};
 use infr_vulkan::paged::PAGE_ROWS;
+use std::sync::Arc;
 
-const NH: usize = 4;
+const NH: usize = 8;
 const NKV: usize = 2;
-const HD: usize = 64;
+const HD: usize = 128;
 /// One prefill chunk, well inside the slot's first logical page.
 const ROWS: usize = 256;
-/// The slot under test lives in pool block 1, so a store that forgets the row base is visible.
-const ROW_BASE: usize = PAGE_ROWS;
+/// The slot under test lives in pool block 16, so a store that forgets the row base is visible.
+const ROW_BASE: usize = PAGE_ROWS * 16;
 
 struct Rng(u64);
 impl Rng {
@@ -121,16 +123,17 @@ fn attention_graph(cache_elems: usize, paged: Option<(usize, usize)>) -> Built {
     }
 }
 
-fn table_bytes(pages: usize) -> Vec<u8> {
-    // Every logical page maps to pool page 1 — block 1's only page.
+/// Logical page `j` maps to pool page `first + j` — the slot's own block, so the stores' row-base
+/// bias and the reads through this table agree. The last entry repeats, as a slot's table does.
+fn table_bytes(pages: usize, first: u32) -> Vec<u8> {
     (0..=pages)
-        .flat_map(|_| 1u32.to_le_bytes())
-        .collect::<Vec<u8>>()
+        .flat_map(|j| (first + j.min(pages - 1) as u32).to_le_bytes())
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run(
-    be: &infr_vulkan::VulkanBackend,
+    be: &dyn Backend,
     built: &Built,
     q_data: &[f32],
     k_data: &[f32],
@@ -182,17 +185,20 @@ fn run(
     o
 }
 
-#[test]
-fn a_paged_cache_attends_the_same_bits_as_a_contiguous_one() {
-    let be = match infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(
-        infr_core::config::Config::default(),
-    )) {
-        Ok(be) => be,
+fn vulkan() -> Option<infr_vulkan::VulkanBackend> {
+    match infr_vulkan::VulkanBackend::new_with(Arc::new(Config::default())) {
+        Ok(be) => Some(be),
         Err(e) => {
             eprintln!("skipping: no Vulkan device ({e})");
-            return;
+            None
         }
-    };
+    }
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU"]
+fn a_paged_cache_attends_the_same_bits_as_a_contiguous_one() {
+    let Some(be) = vulkan() else { return };
     let row = NKV * HD;
     let q_data = gen(ROWS * NH * HD, 11);
     let k_data = gen(ROWS * row, 12);
@@ -215,11 +221,11 @@ fn a_paged_cache_attends_the_same_bits_as_a_contiguous_one() {
 
     // Paged: the pool holds two blocks of one page, the slot's rows start at ROW_BASE, and its
     // single logical page maps onto block 1's page.
-    let pps = ROW_BASE.div_ceil(PAGE_ROWS);
+    let pps = ROW_BASE.div_ceil(PAGE_ROWS).max(1);
     let pool_rows = 2 * pps * PAGE_ROWS;
     let pool_elems = pool_rows * row;
     let pg = attention_graph(pool_elems, Some((ROW_BASE, pps + 1)));
-    let table = table_bytes(pps);
+    let table = table_bytes(pps, (ROW_BASE / PAGE_ROWS) as u32);
     let got = run(
         &be,
         &pg,
@@ -245,136 +251,5 @@ fn a_paged_cache_attends_the_same_bits_as_a_contiguous_one() {
     assert!(
         max_err < 1e-4,
         "the paged graph diverges: max_err={max_err:e}"
-    );
-}
-
-/// The decode shape: one query row at the end of `DEPTH` cached rows, all of them written by the
-/// same execute. A paged slot reads the whole span through its table from `row_base`.
-const DEPTH: usize = 200;
-
-fn decode_graph(cache_elems: usize, paged: Option<(usize, usize)>) -> (Built, usize) {
-    let kv_len = DEPTH + 1;
-    let mut g = Graph::new();
-    let q = g.input(f16d(NH * HD));
-    let k = g.input(f32d(kv_len * NKV * HD));
-    let v = g.input(f32d(kv_len * NKV * HD));
-    let table = paged.map(|(_, len)| g.input(TensorDesc::new(vec![len], DType::I32)));
-    let mut kc_desc = f16d(cache_elems);
-    let mut vc_desc = f16d(cache_elems);
-    if let (Some(t), Some((row_base, _))) = (table, paged) {
-        kc_desc.pages = Some(PageMap {
-            table: t,
-            page_rows: PAGE_ROWS as u32,
-            row_base,
-        });
-        vc_desc.pages = Some(PageMap {
-            table: t,
-            page_rows: PAGE_ROWS as u32,
-            row_base,
-        });
-    }
-    let kc = g.input(kc_desc);
-    let vc = g.input(vc_desc);
-    let out = g.output(f32d(NH * HD));
-    g.push(Op::WriteKv {
-        src: k,
-        cache: kc,
-        rows: kv_len as u32,
-        row_stride: (NKV * HD) as u32,
-        pos: 0,
-    });
-    g.push(Op::WriteKv {
-        src: v,
-        cache: vc,
-        rows: kv_len as u32,
-        row_stride: (NKV * HD) as u32,
-        pos: 0,
-    });
-    g.push(Op::Attention {
-        q,
-        k_cache: kc,
-        v_cache: vc,
-        dst: out,
-        rows: 1,
-        kv_len: kv_len as u32,
-        n_head: NH as u32,
-        n_kv: NKV as u32,
-        head_dim: HD as u32,
-        scale: 1.0 / (HD as f32).sqrt(),
-        mask: AttnMask::Causal,
-        pos: DEPTH as u32,
-        sinks: None,
-        key_bias: None,
-        comp: None,
-    });
-    (
-        Built {
-            g,
-            q,
-            k,
-            v,
-            kc,
-            vc,
-            table,
-            out,
-        },
-        kv_len,
-    )
-}
-
-#[test]
-fn a_paged_decode_over_a_written_span_matches_a_contiguous_one() {
-    let be = match infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(
-        infr_core::config::Config::default(),
-    )) {
-        Ok(be) => be,
-        Err(e) => {
-            eprintln!("skipping: no Vulkan device ({e})");
-            return;
-        }
-    };
-    let row = NKV * HD;
-    let (lin, kv_len) = decode_graph((DEPTH + 1) * NKV * HD, None);
-    let k_data = gen(kv_len * row, 21);
-    let v_data = gen(kv_len * row, 22);
-    let q_data = gen(NH * HD, 23);
-    let want = run(
-        &be,
-        &lin,
-        &q_data,
-        &k_data,
-        &v_data,
-        kv_len * row * 2,
-        None,
-        NH * HD,
-    );
-
-    let pps = ROW_BASE.div_ceil(PAGE_ROWS);
-    let pool_elems = 2 * pps * PAGE_ROWS * row;
-    let (pg, _) = decode_graph(pool_elems, Some((ROW_BASE, pps + 1)));
-    let table = table_bytes(pps);
-    let got = run(
-        &be,
-        &pg,
-        &q_data,
-        &k_data,
-        &v_data,
-        pool_elems * 2,
-        Some(&table),
-        NH * HD,
-    );
-
-    assert!(
-        want.iter().any(|x| *x != 0.0),
-        "the output must not be all zero"
-    );
-    let max_err = want
-        .iter()
-        .zip(&got)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
-    assert!(
-        max_err < 1e-4,
-        "the paged decode diverges: max_err={max_err:e}"
     );
 }

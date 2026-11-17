@@ -980,7 +980,10 @@ pub(crate) fn sample_token(logits: &[f32], uu: f32, top_k: usize, temp: f32, top
     // NaN is present, and `select_nth_unstable_by` / `sort_unstable_by` panic on one. On NaN-free
     // logits the two agree on every pair but `-0.0` / `+0.0`, which `total_cmp` orders. A NaN
     // logit no longer panics but ranks first, so the probabilities come out NaN as before.
-    let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]);
+    // Ties go to the lower index: both sorts are unstable, so without it two equal logits could
+    // come back in either order, and which one a given `u` picks would depend on the standard
+    // library's sort rather than on the input.
+    let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then_with(|| a.cmp(b));
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     if k < logits.len() {
         idx.select_nth_unstable_by(k - 1, cmp);
@@ -5237,6 +5240,24 @@ mod tests {
             bind.bind(yi, yb.as_ref());
             let plan = be.compile(&g).unwrap();
             be.execute(plan.as_ref(), &bind).unwrap();
+        }
+    }
+
+    /// Equal logits are taken in index order: a uniform draw walking the CDF of a flat row picks
+    /// the token whose index it lands on, with or without a top-k cut. Turns red if the order of
+    /// ties is left to the unstable sorts.
+    #[test]
+    fn sample_token_breaks_ties_by_index() {
+        let logits = vec![0.5f32; 300];
+        for (top_k, n) in [(0usize, 300usize), (40, 40)] {
+            for j in 0..n {
+                let u = (j as f32 + 0.5) / n as f32;
+                assert_eq!(
+                    sample_token(&logits, u, top_k, 1.0, 1.0),
+                    j as u32,
+                    "top_k {top_k}"
+                );
+            }
         }
     }
 

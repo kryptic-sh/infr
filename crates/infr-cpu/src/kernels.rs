@@ -1,6 +1,10 @@
 //! Per-format vec-dot kernels (scalar/AVX2/AVX-512 + dispatchers): Q4_K, Q6_K, Q8_0, Q5_K
 //! single-row and batch families, the Q8_0_32/Q5_0_32 native-block family, and the plain
 //! f32/f16/bf16 dots + gated-FFN activation.
+//!
+//! Every tier of a family computes the scalar kernel's value bit for bit (the rule is in
+//! `crate::simd`, and `kernels/tier_tests.rs` enforces it at every tier the host has). aarch64
+//! runs the scalar kernels today; a NEON kernel added later is one more tier under the same rule.
 #[cfg(target_arch = "x86_64")]
 use crate::quant::{hadd_i32_xmm, hadd_i32_ymm};
 use crate::quant::{Q8x32, Q8};

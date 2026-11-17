@@ -807,6 +807,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Equal logits sample the same token on every toolchain.** The CPU backend's
+  `Op::Sample` and the host sampler's top-k path ordered equal logits by
+  unstable sorts with no tie-break, so which of two equal tokens a draw picked
+  depended on the standard library's sort; ties now go to the lower token id, as
+  the nucleus path already did. The q4_1 and q5_1 KV cache quantizers took a
+  block's least value with `f32::min`, which may return either zero when a block
+  holds both `+0` and `-0` (x86 and AArch64 lowerings differ), so the stored
+  minimum's sign bit could differ by architecture; they now take the first of
+  equal values. The decoded values were the same either way.
+
 - **Q8_0 weights give the same CPU result on an AVX-512 machine as on any
   other.** The AVX-512 one-row and batch Q8_0 kernels (a whole number of
   256-element super-blocks) summed each pair of blocks before scaling them,

@@ -16,6 +16,23 @@ fn h(x: f32) -> [u8; 2] {
     f16::from_f32(x).to_bits().to_le_bytes()
 }
 
+/// The least and greatest of `x` (NaNs skipped), by comparisons: among equal values the first
+/// wins, so a block whose least value is a zero of both signs stores the same `min` bits on every
+/// architecture. (`f32::min`/`max` may return either zero there, and do differ between x86 and
+/// AArch64 lowerings; the decoded values would agree, the cache bytes would not.)
+fn min_max(x: &[f32]) -> (f32, f32) {
+    let (mut min, mut max) = (f32::MAX, f32::MIN);
+    for &v in x {
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    (min, max)
+}
+
 /// q4_0 (18 B): `d = max/-8`, `q = clamp(x/d + 8.5, .., 15)`, 4-bit, low/high halves interleaved.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn q4_0_block(x: &[f32], dst: &mut [u8]) {
@@ -40,11 +57,7 @@ fn q4_0_block(x: &[f32], dst: &mut [u8]) {
 /// q4_1 (20 B): asymmetric — `d = (max-min)/15`, `q = clamp((x-min)/d + 0.5, 0, 15)`, stores `min`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn q4_1_block(x: &[f32], dst: &mut [u8]) {
-    let (mut min, mut max) = (f32::MAX, f32::MIN);
-    for &v in x {
-        min = min.min(v);
-        max = max.max(v);
-    }
+    let (min, max) = min_max(x);
     let d = (max - min) / 15.0;
     let id = if d != 0.0 { 1.0 / d } else { 0.0 };
     dst[0..2].copy_from_slice(&h(d));
@@ -84,11 +97,7 @@ fn q5_0_block(x: &[f32], dst: &mut [u8]) {
 /// q5_1 (24 B): asymmetric 5-bit — `d = (max-min)/31`, low nibble in `qs`, 5th bit in `qh`, `min`.
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 fn q5_1_block(x: &[f32], dst: &mut [u8]) {
-    let (mut min, mut max) = (f32::MAX, f32::MIN);
-    for &v in x {
-        min = min.min(v);
-        max = max.max(v);
-    }
+    let (min, max) = min_max(x);
     let d = (max - min) / 31.0;
     let id = if d != 0.0 { 1.0 / d } else { 0.0 };
     dst[0..2].copy_from_slice(&h(d));
@@ -202,6 +211,27 @@ pub fn supported(dt: DType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block whose least value is zero of both signs stores the first one's `min` bits, and NaNs
+    /// are skipped as `f32::min` skips them. Turns red if `min_max` returns the other zero (as
+    /// `f32::min` may, depending on the architecture's lowering) or takes a NaN.
+    #[test]
+    fn min_max_keeps_the_first_of_equal_zeros() {
+        let tail: Vec<f32> = (0..30).map(|i| i as f32 / 8.0 + 0.5).collect();
+        for (first, second) in [(-0.0f32, 0.0f32), (0.0, -0.0)] {
+            let mut x = vec![first, second];
+            x.extend(&tail);
+            x[7] = f32::NAN;
+            let (min, max) = min_max(&x);
+            assert_eq!(min.to_bits(), first.to_bits(), "first {first:?}");
+            assert_eq!(max, tail[29]);
+            for dt in [DType::Q4_1, DType::Q5_1] {
+                let mut blk = vec![0u8; infr_gguf::nbytes(dt, QK)];
+                quantize_row(dt, &x, &mut blk);
+                assert_eq!(blk[2..4], h(first), "{dt:?}, first {first:?}: stored min");
+            }
+        }
+    }
 
     // Each format quantize→dequant recovers a Gaussian block within its bit-width tolerance, and the
     // higher-bit formats are more accurate.

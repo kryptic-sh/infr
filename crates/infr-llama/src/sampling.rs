@@ -646,8 +646,9 @@ fn truncated_softmax(
         // `partial_cmp` with an `Equal` fallback: that is not a total order once a NaN is present,
         // and `select_nth_unstable_by` / `sort_unstable_by` panic on one. On NaN-free logits the
         // two agree on every pair but `-0.0` / `+0.0`, which `total_cmp` orders. A NaN logit no
-        // longer panics but ranks first, so the probabilities come out NaN as before.
-        let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]);
+        // longer panics but ranks first, so the probabilities come out NaN as before. Ties go
+        // to the lower index, as in the nucleus path below: the sorts are unstable.
+        let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then_with(|| a.cmp(b));
         let mut idx: Vec<usize> = (0..n).collect();
         idx.select_nth_unstable_by(k - 1, cmp); // top-k at the front (unordered)
         idx.truncate(k);

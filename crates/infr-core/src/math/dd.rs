@@ -137,6 +137,15 @@ pub(super) fn round_if_clear(y: f64, err: f64) -> Option<f32> {
     (a.to_bits() == b.to_bits()).then_some(a)
 }
 
+/// `2^128 - 2^103`: halfway between `f32::MAX` and `2^128`; a binary64 at or beyond it rounds to
+/// infinity as a binary32.
+const OVERFLOW_EDGE: f64 = 33_554_431.0 * exp2i(103);
+
+/// `|v|` by clearing the sign bit.
+fn abs_f64(v: f64) -> f64 {
+    f64::from_bits(v.to_bits() & !(1u64 << 63))
+}
+
 /// The binary32 nearest to `d.hi + d.lo` (ties to even), for a normalized `d`.
 ///
 /// Converting `d.hi` alone is right except when `d.hi` is exactly a binary32 rounding boundary
@@ -145,6 +154,16 @@ pub(super) fn round_if_clear(y: f64, err: f64) -> Option<f32> {
 /// a midpoint the sign of `d.lo` says which neighbour the sum is nearer to.
 pub(super) fn dd_to_f32(d: Dd) -> f32 {
     let r = d.hi as f32;
+    if r.is_infinite() && d.hi.is_finite() {
+        // `d.hi` is at or beyond the overflow boundary, halfway between `f32::MAX` and `2^128`
+        // (a midpoint like any other, with infinity on its far side). Exactly on it, a low part
+        // pointing back toward zero puts the sum below it.
+        let toward_zero = (d.lo < 0.0) == (d.hi > 0.0) && d.lo != 0.0;
+        if abs_f64(d.hi) == OVERFLOW_EDGE && toward_zero {
+            return if d.hi > 0.0 { f32::MAX } else { -f32::MAX };
+        }
+        return r;
+    }
     let rf = r as f64;
     if d.lo == 0.0 || rf == d.hi || !r.is_finite() {
         return r;
@@ -186,11 +205,14 @@ pub(super) fn next_down(x: f32) -> f32 {
     -next_up(-x)
 }
 
-/// Horner's rule in binary64 over `c[lo..]` (constant term first): `c[lo] + x*(c[lo+1] + ...)`.
-#[inline]
+/// Horner's rule in binary64 over `c` (constant term first): `c[0] + x*(c[1] + ...)`, for a
+/// non-empty `c` and finite `x`. It starts from the last coefficient itself, which is the value
+/// `0*x + c_last` the first step would give for finite `x`, one multiply and add sooner.
+#[inline(always)]
 pub(super) fn horner(x: f64, c: &[(f64, f64)]) -> f64 {
-    let mut acc = 0.0;
-    for &(hi, _) in c.iter().rev() {
+    let (&(last, _), rest) = c.split_last().expect("horner: no coefficients");
+    let mut acc = last;
+    for &(hi, _) in rest.iter().rev() {
         acc = acc * x + hi;
     }
     acc
@@ -243,6 +265,13 @@ mod tests {
         let mid = 1.0 - f64::powi(2.0, -25);
         assert_eq!(dd_to_f32(Dd::new(mid, 1e-30)), 1.0);
         assert_eq!(dd_to_f32(Dd::new(mid, -1e-30)), next_down(1.0));
+        // The overflow boundary: below it is f32::MAX, at or above it infinity.
+        let edge = OVERFLOW_EDGE;
+        assert_eq!(dd_to_f32(Dd::new(edge, -1e10)), f32::MAX);
+        assert_eq!(dd_to_f32(Dd::new(-edge, 1e10)), -f32::MAX);
+        assert_eq!(dd_to_f32(Dd::new(edge, 1e10)), f32::INFINITY);
+        assert_eq!(dd_to_f32(Dd::new(edge, 0.0)), f32::INFINITY);
+        assert_eq!(dd_to_f32(Dd::new(edge * 1.5, -1e10)), f32::INFINITY);
         // Subnormal range: halfway between 0 and the least subnormal.
         let mid = f64::powi(2.0, -150);
         assert_eq!(dd_to_f32(Dd::new(mid, 1e-60)), f32::from_bits(1));

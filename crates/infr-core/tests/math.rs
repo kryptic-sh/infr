@@ -45,16 +45,6 @@ fn fnv(mut h: u64, v: u32) -> u64 {
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 
-/// Result bits for hashing and comparing: every NaN counts as the one canonical quiet NaN, since
-/// the functions' contract is "NaN", not a payload.
-fn canon(v: f32) -> u32 {
-    if v.is_nan() {
-        0x7fc0_0000
-    } else {
-        v.to_bits()
-    }
-}
-
 // ── known answers ────────────────────────────────────────────────────────────────────────────
 
 /// Every row of the mpmath-generated table, bit for bit; at least a few thousand per function
@@ -93,7 +83,7 @@ fn known_answers() {
         let e = rows.entry(name).or_default();
         e.0 += 1;
         e.1 += hard as usize;
-        if canon(got) != canon(f32::from_bits(want)) {
+        if got.to_bits() != want {
             bad.push(format!("{line}  -> got {:08x}", got.to_bits()));
         }
     }
@@ -131,8 +121,32 @@ fn grid(name: &str) -> Vec<f32> {
     };
     let step = (hi - lo) / GRID_DENSE as f32;
     v.extend((0..GRID_DENSE).map(|i| lo + step * i as f32));
+    v.extend(SPECIAL_BITS.iter().map(|&b| f32::from_bits(b)));
     v
 }
+
+/// Special inputs every grid ends with: zeros, infinities, the largest and least values, and
+/// NaNs of every kind (signalling, quiet with a payload, negative), whose results must all be
+/// the one `math::NAN`.
+const SPECIAL_BITS: &[u32] = &[
+    0x0000_0000,
+    0x8000_0000,
+    0x7f80_0000,
+    0xff80_0000,
+    0x7f7f_ffff,
+    0xff7f_ffff,
+    0x0000_0001,
+    0x8000_0001,
+    0x7fc0_0000,
+    0xffc0_0000,
+    0x7f80_0001,
+    0xff80_0001,
+    0x7fa0_0000,
+    0x7fc1_2345,
+    0xffc1_2345,
+    0x7fff_ffff,
+    0xffff_ffff,
+];
 
 /// `(x, y)` pairs for `powf`: RoPE's `theta^(-2p/d)` and a spread of positive bases and
 /// exponents.
@@ -155,6 +169,11 @@ fn pow_grid() -> Vec<(f32, f32)> {
             f32::from_bits((s >> 32) as u32 % 0x4200_0000) * if s & 1 == 1 { -1.0 } else { 1.0 };
         v.push((x, y));
     }
+    for &a in SPECIAL_BITS {
+        for &b in SPECIAL_BITS {
+            v.push((f32::from_bits(a), f32::from_bits(b)));
+        }
+    }
     v
 }
 
@@ -165,30 +184,59 @@ fn grid_hash_values() -> Vec<(&'static str, u64)> {
     for &(name, f) in UNARY.iter().chain(HELPERS) {
         let h = grid(name)
             .iter()
-            .fold(FNV_OFFSET, |h, &x| fnv(h, canon(f(x))));
+            .fold(FNV_OFFSET, |h, &x| fnv(h, f(x).to_bits()));
         out.push((name, h));
     }
     let h = pow_grid()
         .iter()
-        .fold(FNV_OFFSET, |h, &(x, y)| fnv(h, canon(math::powf(x, y))));
+        .fold(FNV_OFFSET, |h, &(x, y)| fnv(h, math::powf(x, y).to_bits()));
     out.push(("powf", h));
+    // The slices over their scalar's grid, so each CI system also checks its own vectorized
+    // build of them (the hashes equal the scalar ones by construction; "exp_sub" subtracts 3).
+    for &(name, slice) in SLICES {
+        let scalar = match name {
+            "exp_sub" | "exp_to" => "exp",
+            n => n,
+        };
+        let mut v = grid(scalar);
+        slice(&mut v);
+        let h = v.iter().fold(FNV_OFFSET, |h, &y| fnv(h, y.to_bits()));
+        let label = match name {
+            "exp" => "exp_slice",
+            "tanh" => "tanh_slice",
+            "sigmoid" => "sigmoid_slice",
+            "silu" => "silu_slice",
+            "gelu_tanh" => "gelu_tanh_slice",
+            "exp_sub" => "exp_sub_slice",
+            "exp_to" => "exp_slice_to",
+            other => panic!("no label for slice {other}"),
+        };
+        out.push((label, h));
+    }
     out
 }
 
 /// Blessed on Windows (native, MSVC) and Linux (WSL, glibc) on the same machine, with identical
 /// values; see docs/math.md. A change here is a change of output on every platform.
 const GRID_HASHES: &[(&str, u64)] = &[
-    ("exp", 0x559579a55697771d),
-    ("ln", 0x9a12f3ebd655c138),
-    ("ln_1p", 0x638e0b455a0e8a19),
-    ("tanh", 0x9334f05c92d53c38),
-    ("sin", 0x6436c98ddf90985a),
-    ("cos", 0x6d3b8510b33dfb0d),
-    ("sigmoid", 0x4ce1a43c35f8cdcf),
-    ("silu", 0x1a840808f75a854a),
-    ("gelu_tanh", 0xf980f6822473e7bf),
-    ("softplus", 0x6de00307efff0383),
-    ("powf", 0x6c13df1c0c25ca9d),
+    ("exp", 0x8fc37c799a944ea0),
+    ("ln", 0x93698f349a096b42),
+    ("ln_1p", 0x574bfff88c4eba9c),
+    ("tanh", 0x35e3f212d08b7ba5),
+    ("sin", 0xfb917aae8a144423),
+    ("cos", 0x889935410ece5c00),
+    ("sigmoid", 0x9b5cee3d99d3bbce),
+    ("silu", 0x5bfa7f5a91133597),
+    ("gelu_tanh", 0xf61a3c240b1e5252),
+    ("softplus", 0x88f0dd9f14dbba0f),
+    ("powf", 0xd0d63c90972412a0),
+    ("exp_slice", 0x8fc37c799a944ea0),
+    ("tanh_slice", 0x35e3f212d08b7ba5),
+    ("sigmoid_slice", 0x9b5cee3d99d3bbce),
+    ("silu_slice", 0x5bfa7f5a91133597),
+    ("gelu_tanh_slice", 0xf61a3c240b1e5252),
+    ("exp_sub_slice", 0x977733369fe5f6b7),
+    ("exp_slice_to", 0x8fc37c799a944ea0),
 ];
 
 #[test]
@@ -214,7 +262,7 @@ fn grid_hashes() {
 /// Distance in binary32 units between two finite same-signed values (or 0/u32::MAX for
 /// equal/incomparable).
 fn ulps(a: f32, b: f32) -> u32 {
-    if canon(a) == canon(b) {
+    if a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()) {
         return 0;
     }
     if a.is_nan() || b.is_nan() || a.is_sign_negative() != b.is_sign_negative() {
@@ -305,7 +353,7 @@ fn exhaustive(name: &str, f: Unary, reference: fn(f32) -> Expect) {
                         let got = f(x);
                         let v = match reference(x) {
                             Expect::Bits(want) => {
-                                if canon(got) == canon(want) {
+                                if got.to_bits() == want.to_bits() {
                                     ok += 1;
                                 } else {
                                     wrong += 1;
@@ -321,7 +369,16 @@ fn exhaustive(name: &str, f: Unary, reference: fn(f32) -> Expect) {
                             }
                             Expect::Value(v) => v,
                         };
-                        match oracle::verdict(got, v) {
+                        // A zero result must carry the reference's sign (the special cases are
+                        // checked as exact bits above; this is every other zero).
+                        let zero_sign_wrong =
+                            got == 0.0 && got.is_sign_negative() != v.hi.is_sign_negative();
+                        let verdict = if zero_sign_wrong {
+                            Verdict::Wrong
+                        } else {
+                            oracle::verdict(got, v)
+                        };
+                        match verdict {
                             Verdict::Ok(dist) => {
                                 ok += 1;
                                 if hardest.len() < KEEP || dist < hardest[KEEP - 1].0 {
@@ -404,7 +461,7 @@ fn exhaustive(name: &str, f: Unary, reference: fn(f32) -> Expect) {
 
 fn ref_exp(x: f32) -> Expect {
     if x.is_nan() {
-        return Expect::Bits(f32::NAN);
+        return Expect::Bits(math::NAN);
     }
     // Beyond these the result is inf/0: e^89 > 2^128 and e^-104 < 2^-150, both checked by
     // `exp_limits_are_where_the_reference_says`.
@@ -419,7 +476,7 @@ fn ref_exp(x: f32) -> Expect {
 
 fn ref_ln(x: f32) -> Expect {
     if x.is_nan() || x < 0.0 {
-        return Expect::Bits(f32::NAN);
+        return Expect::Bits(math::NAN);
     }
     if x == 0.0 {
         return Expect::Bits(f32::NEG_INFINITY);
@@ -432,7 +489,7 @@ fn ref_ln(x: f32) -> Expect {
 
 fn ref_ln_1p(x: f32) -> Expect {
     if x.is_nan() || x < -1.0 {
-        return Expect::Bits(f32::NAN);
+        return Expect::Bits(math::NAN);
     }
     if x == -1.0 {
         return Expect::Bits(f32::NEG_INFINITY);
@@ -444,7 +501,10 @@ fn ref_ln_1p(x: f32) -> Expect {
 }
 
 fn ref_tanh(x: f32) -> Expect {
-    if x.is_nan() || x == 0.0 {
+    if x.is_nan() {
+        return Expect::Bits(math::NAN);
+    }
+    if x == 0.0 {
         return Expect::Bits(x);
     }
     // Past 20, 1 - tanh(x) < 2^-56: the result is +-1 beyond doubt.
@@ -457,7 +517,7 @@ fn ref_tanh(x: f32) -> Expect {
 
 fn ref_sin(x: f32) -> Expect {
     if !x.is_finite() {
-        return Expect::Bits(f32::NAN);
+        return Expect::Bits(math::NAN);
     }
     if x == 0.0 {
         return Expect::Bits(x);
@@ -467,7 +527,7 @@ fn ref_sin(x: f32) -> Expect {
 
 fn ref_cos(x: f32) -> Expect {
     if !x.is_finite() {
-        return Expect::Bits(f32::NAN);
+        return Expect::Bits(math::NAN);
     }
     if x == 0.0 {
         return Expect::Bits(1.0);
@@ -587,6 +647,245 @@ fn exhaustive_cos() {
     exhaustive("cos", math::cos, ref_cos);
 }
 
+// ── NaN ──────────────────────────────────────────────────────────────────────────────────────
+
+/// Every function returns exactly `math::NAN` for every kind of NaN input, and for the invalid
+/// operations that make a NaN, on every platform (the hardware's own NaNs differ in sign).
+#[test]
+fn every_nan_result_is_the_one_nan() {
+    let nans: Vec<f32> = [
+        0x7fc0_0000u32,
+        0xffc0_0000,
+        0x7f80_0001,
+        0xff80_0001,
+        0x7fa0_0000,
+        0x7fc1_2345,
+        0xffc1_2345,
+        0x7fff_ffff,
+        0xffff_ffff,
+    ]
+    .iter()
+    .map(|&b| f32::from_bits(b))
+    .collect();
+    let want = math::NAN.to_bits();
+    for &(name, f) in UNARY.iter().chain(HELPERS) {
+        for &x in &nans {
+            assert_eq!(f(x).to_bits(), want, "{name}({:08x})", x.to_bits());
+        }
+    }
+    for &x in &nans {
+        for &y in &[2.0f32, 0.5, -1.0, f32::INFINITY] {
+            assert_eq!(
+                math::powf(x, y).to_bits(),
+                want,
+                "powf({:08x}, {y})",
+                x.to_bits()
+            );
+            assert_eq!(
+                math::powf(y, x).to_bits(),
+                want,
+                "powf({y}, {:08x})",
+                x.to_bits()
+            );
+        }
+        let (s, c) = math::sin_cos(x);
+        assert_eq!((s.to_bits(), c.to_bits()), (want, want));
+    }
+    // Invalid operations.
+    let inf = f32::INFINITY;
+    for (what, v) in [
+        ("ln(-1)", math::ln(-1.0)),
+        ("ln(-inf)", math::ln(-inf)),
+        ("ln_1p(-2)", math::ln_1p(-2.0)),
+        ("sin(inf)", math::sin(inf)),
+        ("cos(-inf)", math::cos(-inf)),
+        ("powf(-2, 0.5)", math::powf(-2.0, 0.5)),
+        ("silu(-inf)", math::silu(-inf)),
+        ("gelu_tanh(-inf)", math::gelu_tanh(-inf)),
+    ] {
+        assert_eq!(v.to_bits(), want, "{what}");
+    }
+    // The slices agree.
+    let mut xs = nans.clone();
+    xs.push(-inf);
+    for (name, slice) in SLICES {
+        let mut v = xs.clone();
+        slice(&mut v);
+        let scalar = SLICE_SCALAR.iter().find(|(n, _)| n == name).unwrap().1;
+        for (x, y) in xs.iter().zip(&v) {
+            assert_eq!(
+                y.to_bits(),
+                scalar(*x).to_bits(),
+                "{name}({:08x})",
+                x.to_bits()
+            );
+        }
+    }
+}
+
+/// The special values the helpers give, which are what today's call-site expressions give.
+#[test]
+fn helper_special_values() {
+    let inf = f32::INFINITY;
+    let cases: [(&str, f32, f32); 12] = [
+        ("silu(+inf)", math::silu(inf), inf),
+        ("silu(-0)", math::silu(-0.0), -0.0),
+        ("sigmoid(+inf)", math::sigmoid(inf), 1.0),
+        ("sigmoid(-inf)", math::sigmoid(-inf), 0.0),
+        ("gelu_tanh(+inf)", math::gelu_tanh(inf), inf),
+        ("gelu_tanh(-0)", math::gelu_tanh(-0.0), -0.0),
+        ("gelu_tanh(-1e20)", math::gelu_tanh(-1e20), -0.0),
+        ("softplus(+inf)", math::softplus(inf), inf),
+        ("softplus(-inf)", math::softplus(-inf), 0.0),
+        ("tanh(-0)", math::tanh(-0.0), -0.0),
+        ("exp(-inf)", math::exp(-inf), 0.0),
+        ("exp(+inf)", math::exp(inf), inf),
+    ];
+    for (what, got, want) in cases {
+        assert_eq!(got.to_bits(), want.to_bits(), "{what}: got {got:e}");
+    }
+    // And they are what the expressions the call sites write give, with the platform functions,
+    // wherever the result is not a NaN (whose bits the platform chooses).
+    for x in [inf, -inf, 0.0, -0.0, 1e20, -1e20, 100.0, -100.0] {
+        let silu = x / (1.0 + (-x).exp());
+        let sigmoid = 1.0 / (1.0 + (-x).exp());
+        let gelu = 0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044715 * x * x * x)).tanh());
+        for (name, got, want) in [
+            ("silu", math::silu(x), silu),
+            ("sigmoid", math::sigmoid(x), sigmoid),
+            ("gelu_tanh", math::gelu_tanh(x), gelu),
+        ] {
+            if want.is_nan() {
+                assert!(got.is_nan(), "{name}({x})");
+            } else {
+                assert_eq!(got.to_bits(), want.to_bits(), "{name}({x})");
+            }
+        }
+    }
+}
+
+// ── slices ───────────────────────────────────────────────────────────────────────────────────
+
+type Slice = fn(&mut [f32]);
+
+/// Every in-place slice function, by the name of its scalar function.
+const SLICES: &[(&str, Slice)] = &[
+    ("exp", math::exp_slice),
+    ("tanh", math::tanh_slice),
+    ("sigmoid", math::sigmoid_slice),
+    ("silu", math::silu_slice),
+    ("gelu_tanh", math::gelu_tanh_slice),
+    ("exp_sub", exp_sub_3),
+    ("exp_to", exp_to_copy),
+];
+
+/// `exp_sub_slice` with a fixed subtrahend, as an in-place `Slice`.
+fn exp_sub_3(xs: &mut [f32]) {
+    math::exp_sub_slice(xs, 3.0);
+}
+
+/// `exp_slice_to` through a copy, as an in-place `Slice`.
+fn exp_to_copy(xs: &mut [f32]) {
+    let src = xs.to_vec();
+    math::exp_slice_to(&src, xs);
+}
+
+const SLICE_SCALAR: &[(&str, Unary)] = &[
+    ("exp", math::exp),
+    ("tanh", math::tanh),
+    ("sigmoid", math::sigmoid),
+    ("silu", math::silu),
+    ("gelu_tanh", math::gelu_tanh),
+    ("exp_sub", |x| math::exp(x - 3.0)),
+    ("exp_to", math::exp),
+];
+
+/// Each slice function equals its scalar function element for element on a dense grid, for
+/// awkward lengths and unaligned starts (the vectorized loop's head, body and tail).
+#[test]
+fn slices_equal_scalars() {
+    let mut xs = grid("silu");
+    xs.extend(grid("exp"));
+    let lens = [0usize, 1, 7, 8, 9, 15, 16, 17, 31, 33, 63, 64, 65, 1000];
+    for (name, slice) in SLICES {
+        let scalar = SLICE_SCALAR.iter().find(|(n, _)| n == name).unwrap().1;
+        // The whole grid in one call.
+        let mut v = xs.clone();
+        slice(&mut v);
+        for (x, y) in xs.iter().zip(&v) {
+            assert_eq!(
+                y.to_bits(),
+                scalar(*x).to_bits(),
+                "{name}({:08x})",
+                x.to_bits()
+            );
+        }
+        // Short slices at every start offset 0..4 (alignment) into a buffer.
+        for &n in &lens {
+            for start in 0..4 {
+                let src = &xs[1000 + start..1000 + start + n];
+                let mut buf = vec![0f32; n + 4];
+                buf[start..start + n].copy_from_slice(src);
+                slice(&mut buf[start..start + n]);
+                for (x, y) in src.iter().zip(&buf[start..start + n]) {
+                    assert_eq!(
+                        y.to_bits(),
+                        scalar(*x).to_bits(),
+                        "{name} len {n} at {start}"
+                    );
+                }
+            }
+        }
+    }
+    // A mismatched destination is refused.
+    let r = std::panic::catch_unwind(|| math::exp_slice_to(&[1.0, 2.0], &mut [0.0]));
+    assert!(r.is_err());
+}
+
+/// Each slice function equals its scalar function on every binary32 input, in batches.
+#[test]
+#[ignore = "exhaustive: all 2^32 inputs per slice function; run in release"]
+fn exhaustive_slices_equal_scalars() {
+    for (name, slice) in SLICES {
+        let scalar = SLICE_SCALAR.iter().find(|(n, _)| n == name).unwrap().1;
+        let t0 = Instant::now();
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get()) as u64;
+        let chunk = (1u64 << 32).div_ceil(threads);
+        let bad: u64 = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..threads)
+                .map(|t| {
+                    s.spawn(move || {
+                        const BATCH: u64 = 1 << 16;
+                        let mut buf = vec![0f32; BATCH as usize];
+                        let mut bad = 0u64;
+                        let end = ((t + 1) * chunk).min(1 << 32);
+                        let mut b = t * chunk;
+                        while b < end {
+                            let n = BATCH.min(end - b) as usize;
+                            for (i, v) in buf[..n].iter_mut().enumerate() {
+                                *v = f32::from_bits((b + i as u64) as u32);
+                            }
+                            slice(&mut buf[..n]);
+                            for (i, y) in buf[..n].iter().enumerate() {
+                                let x = f32::from_bits((b + i as u64) as u32);
+                                bad += (y.to_bits() != scalar(x).to_bits()) as u64;
+                            }
+                            b += n as u64;
+                        }
+                        bad
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).sum()
+        });
+        println!(
+            "{name}_slice: {bad} of 2^32 inputs differ from the scalar function, {:.1} s",
+            t0.elapsed().as_secs_f64()
+        );
+        assert_eq!(bad, 0, "{name}");
+    }
+}
+
 // ── speed, for information ───────────────────────────────────────────────────────────────────
 
 /// Median ns per call of each function against the platform's, single thread, interleaved
@@ -642,6 +941,56 @@ fn bench_against_std() {
         for _ in 0..ROUNDS {
             a.push(time(xs, *ours));
             b.push(time(xs, *theirs));
+        }
+        let (a, b) = (median(a), median(b));
+        println!("{name:<24} {a:>10.2} {b:>10.2} {:>7.2}", a / b);
+    }
+    // Slices, per element, against a plain loop of the platform's scalar function writing the
+    // same expression (which is what today's call sites do).
+    let slice_cases: Vec<(&str, Vec<f32>, Slice, Slice)> = vec![
+        ("exp_slice", lin(-20.0, 0.0), math::exp_slice, |v| {
+            v.iter_mut().for_each(|x| *x = x.exp())
+        }),
+        ("exp_sub_slice", lin(-10.0, 10.0), exp_sub_3, |v| {
+            v.iter_mut().for_each(|x| *x = (*x - 3.0).exp())
+        }),
+        ("tanh_slice", lin(-6.0, 6.0), math::tanh_slice, |v| {
+            v.iter_mut().for_each(|x| *x = x.tanh())
+        }),
+        ("sigmoid_slice", lin(-6.0, 6.0), math::sigmoid_slice, |v| {
+            v.iter_mut().for_each(|x| *x = 1.0 / (1.0 + (-*x).exp()))
+        }),
+        ("silu_slice", lin(-6.0, 6.0), math::silu_slice, |v| {
+            v.iter_mut().for_each(|x| *x = *x / (1.0 + (-*x).exp()))
+        }),
+        (
+            "gelu_tanh_slice",
+            lin(-6.0, 6.0),
+            math::gelu_tanh_slice,
+            |v| {
+                v.iter_mut().for_each(|x| {
+                    let g = *x;
+                    *x = 0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh())
+                })
+            },
+        ),
+    ];
+    let time_slice = |xs: &[f32], f: Slice| -> f64 {
+        let mut v = xs.to_vec();
+        let t = Instant::now();
+        f(std::hint::black_box(&mut v));
+        std::hint::black_box(&v);
+        t.elapsed().as_nanos() as f64 / xs.len() as f64
+    };
+    println!(
+        "{:<24} {:>10} {:>10} {:>7}",
+        "slice (per element)", "math ns", "std ns", "ratio"
+    );
+    for (name, xs, ours, theirs) in &slice_cases {
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for _ in 0..ROUNDS {
+            a.push(time_slice(xs, *ours));
+            b.push(time_slice(xs, *theirs));
         }
         let (a, b) = (median(a), median(b));
         println!("{name:<24} {a:>10.2} {b:>10.2} {:>7.2}", a / b);

@@ -31,13 +31,14 @@ use super::log::abs;
 use super::tables::{
     COS_C, COS_J32, INV_PI_32, PI_32, PI_32_1, PI_32_2, PI_32_3, SIN_C, SIN_J32, TWO_OVER_PI,
 };
+use super::NAN;
 
 /// The fast reduction's domain: `k < 2^26` for every `|x|` below it.
 const CW_LIMIT: f32 = exp2i(22) as f32;
 /// The fast reduction's absolute error allowance, above its `2^-83.6` bound.
 const CW_ABS: f64 = exp2i(-78);
 /// The fast paths' relative error allowance.
-const TRIG_EPS: f64 = exp2i(-49);
+pub(super) const TRIG_EPS: f64 = exp2i(-49);
 
 /// `sin(x)` for binary32 `x`, correctly rounded (ties to even); NaN for NaN and `±inf`, `±0`
 /// at `±0`. See the module doc.
@@ -57,17 +58,36 @@ pub fn cos(x: f32) -> f32 {
 #[inline]
 pub fn sin_cos(x: f32) -> (f32, f32) {
     if !x.is_finite() {
-        return (f32::NAN, f32::NAN);
+        return (NAN, NAN);
     }
     if x == 0.0 {
         return (x, 1.0);
     }
     let neg = x < 0.0;
     let a = abs(x as f64);
+    let (sv, cv, abs_err) = sin_cos_fast(a);
+    let fast = (
+        round_if_clear(sv, abs(sv) * TRIG_EPS + abs_err),
+        round_if_clear(cv, abs(cv) * TRIG_EPS + abs_err),
+    );
+    let (s, c) = match fast {
+        (Some(s), Some(c)) => (s, c),
+        _ => sin_cos_accurate(a as f32),
+    };
+    (if neg { -s } else { s }, c)
+}
+
+/// The binary64 values of `sin a` and `cos a` for finite positive `a` (a binary32), and the
+/// absolute error allowance of the reduction they came from.
+#[inline]
+pub(super) fn sin_cos_fast(a: f64) -> (f64, f64, f64) {
     let (j, r, abs_err) = if (a as f32) < CW_LIMIT {
         let kf = (a * INV_PI_32 + SHIFT) - SHIFT;
         let r = ((a - kf * PI_32_1) - kf * PI_32_2) - kf * PI_32_3;
-        ((kf as i64 & 63) as usize, r, CW_ABS)
+        // At k = 0 the reduction is `r = a` exactly: no absolute error to allow for, which
+        // matters for tiny `a`, where `CW_ABS` would dwarf `sin a` itself.
+        let abs_err = if kf == 0.0 { 0.0 } else { CW_ABS };
+        ((kf as i64 & 63) as usize, r, abs_err)
     } else {
         let (j, r) = payne_hanek_cold(a as f32);
         (j, r.hi, 0.0)
@@ -79,15 +99,7 @@ pub fn sin_cos(x: f32) -> (f32, f32) {
     let (ch, cl) = COS_J32[j];
     let sv = sh + (((sl + sh * c) + ch * s) + cl * s);
     let cv = ch + (((cl + ch * c) - sh * s) - sl * s);
-    let fast = (
-        round_if_clear(sv, abs(sv) * TRIG_EPS + abs_err),
-        round_if_clear(cv, abs(cv) * TRIG_EPS + abs_err),
-    );
-    let (s, c) = match fast {
-        (Some(s), Some(c)) => (s, c),
-        _ => sin_cos_accurate(a as f32),
-    };
-    (if neg { -s } else { s }, c)
+    (sv, cv, abs_err)
 }
 
 /// `(sin a, cos a)` for finite positive binary32 `a`, through the Payne–Hanek reduction and

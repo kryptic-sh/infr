@@ -23,9 +23,10 @@
 
 use super::dd::{dd_to_f32, exp2i, horner, horner_dd, round_if_clear, two_prod, two_sum, Dd};
 use super::tables::{LN2_1, LN2_2, LN2_3, LOG1P_C, LOG_L, LOG_R};
+use super::NAN;
 
 /// The fast paths' relative error allowance.
-const LN_EPS: f64 = exp2i(-49);
+pub(super) const LN_EPS: f64 = exp2i(-49);
 
 /// Below this magnitude `ln_1p` evaluates `ln(1 + x)` as the polynomial in `x` directly; at or
 /// above it `1 + x` is exact in binary64 with at most 33 significant bits (up to
@@ -58,7 +59,7 @@ fn log1p_poly(z: f64) -> f64 {
 /// `ln(u) + c` in binary64 for a positive normal binary64 `u` with at most 33 significant bits
 /// and a tiny correction `c` (`|c| < 2^-23`).
 #[inline]
-fn ln_fast(u: f64, c: f64) -> f64 {
+pub(super) fn ln_fast(u: f64, c: f64) -> f64 {
     let (e, i, z) = decompose(u);
     let ef = e as f64;
     let (lh, ll) = LOG_L[i];
@@ -98,10 +99,10 @@ pub(super) fn ln_pow_fast(u: f64) -> Dd {
 #[inline]
 pub fn ln(x: f32) -> f32 {
     if x.is_nan() {
-        return x;
+        return NAN;
     }
     if x < 0.0 {
-        return f32::NAN;
+        return NAN;
     }
     if x == 0.0 {
         return f32::NEG_INFINITY;
@@ -128,11 +129,14 @@ pub fn ln(x: f32) -> f32 {
 /// `ln(1 + x)` is irrational for binary32 `x != 0`.
 #[inline]
 pub fn ln_1p(x: f32) -> f32 {
-    if x.is_nan() || x == 0.0 {
+    if x.is_nan() {
+        return NAN;
+    }
+    if x == 0.0 {
         return x;
     }
     if x < -1.0 {
-        return f32::NAN;
+        return NAN;
     }
     if x == -1.0 {
         return f32::NEG_INFINITY;
@@ -140,18 +144,24 @@ pub fn ln_1p(x: f32) -> f32 {
     if x == f32::INFINITY {
         return x;
     }
+    let y = ln_1p_fast(x);
+    match round_if_clear(y, abs(y) * LN_EPS) {
+        Some(v) => v,
+        None => ln_1p_accurate(x),
+    }
+}
+
+/// [`ln_1p`]'s binary64 value for finite `x > -1`, `x != 0`.
+#[inline]
+pub(super) fn ln_1p_fast(x: f32) -> f64 {
     let xd = x as f64;
-    let y = if abs(xd) < LN1P_SMALL as f64 {
+    if abs(xd) < LN1P_SMALL as f64 {
         log1p_poly(xd)
     } else if x < LN1P_BIG {
         ln_fast(1.0 + xd, 0.0)
     } else {
         let c = 1.0 / xd;
         ln_fast(xd, c - 0.5 * c * c)
-    };
-    match round_if_clear(y, abs(y) * LN_EPS) {
-        Some(v) => v,
-        None => ln_1p_accurate(x),
     }
 }
 

@@ -20,10 +20,12 @@ diff means the script or mpmath changed, and is a bug to explain before committi
 """
 
 import argparse
+import math
 import os
 import random
 import struct
 import sys
+from fractions import Fraction
 
 import mpmath
 from mpmath import mp, mpf
@@ -311,31 +313,103 @@ def unary_special(fn, xb):
     raise ValueError(fn)
 
 
+def round_exact(q):
+    """(bits of the binary32 nearest to the rational `q`, distance in ulps), ties to even, decided
+    exactly with integer arithmetic."""
+    if q == 0:
+        return 0, mpf(0.5)
+    sign = 0x80000000 if q < 0 else 0
+    a = abs(q)
+    e = a.numerator.bit_length() - a.denominator.bit_length()
+    if Fraction(2) ** e > a:
+        e -= 1
+    if Fraction(2) ** (e + 1) <= a:
+        e += 1
+    quantum = Fraction(2) ** (max(e, -126) - 23)
+    t = a / quantum
+    n = t.numerator // t.denominator
+    frac = t - n
+    half = Fraction(1, 2)
+    if frac > half or (frac == half and n % 2 == 1):
+        n += 1
+    dist = mpf(abs(frac - half).numerator) / abs(frac - half).denominator
+    r = n * quantum
+    if r >= Fraction(2) ** 128:
+        return sign | INF, dist
+    return sign | f32_bits(float(r)), dist
+
+
+def iroot2k(v, k):
+    """The integer r with r^(2^k) = v, or None."""
+    for _ in range(k):
+        r = math.isqrt(v)
+        if r * r != v:
+            return None
+        v = r
+    return v
+
+
+def exact_power(xb, yb):
+    """x^y as an exact Fraction when it is rational (an integer exponent of moderate size, or
+    n/2^k with an exact 2^k-th root), else None. Exact results are where a rounding boundary can
+    be hit exactly, which no finite precision can decide."""
+    x = Fraction(f32_from_bits(xb))
+    y = Fraction(f32_from_bits(yb))
+    if x <= 0:
+        return None
+    k = y.denominator.bit_length() - 1  # y's denominator is 2^k
+    n = y.numerator
+    if abs(n) > 4096 or k > 12:
+        return None
+    xn = x ** n
+    rn, rd = iroot2k(xn.numerator, k), iroot2k(xn.denominator, k)
+    if rn is None or rd is None:
+        return None
+    return Fraction(rn, rd)
+
+
+def evaluate(fn, x, y):
+    """`fn` at the inputs, at the current mpmath precision."""
+    if fn == "exp":
+        return mpmath.exp(x)
+    if fn == "ln":
+        return mpmath.log(x)
+    if fn == "ln_1p":
+        return mpmath.log1p(x)
+    if fn == "tanh":
+        return mpmath.tanh(x)
+    if fn == "sin":
+        return mpmath.sin(x)
+    if fn == "cos":
+        return mpmath.cos(x)
+    if fn == "powf":
+        return mpmath.power(x, y)
+    raise ValueError(fn)
+
+
 def ref(fn, xb, yb=None):
-    """(expected binary32 bits, distance to a rounding boundary in ulps) of `fn` at the inputs."""
+    """(expected binary32 bits, distance to a rounding boundary in ulps) of `fn` at the inputs.
+
+    An exact rational result (only `powf` has them) is rounded with integer arithmetic. Any
+    other value is evaluated with mpmath at rising precision until it lies clearly on one side
+    of every rounding boundary: accepted only when its distance from the nearest boundary
+    exceeds the evaluation's own error by a wide margin, so noise cannot decide a near-tie."""
     if yb is None:
         sp = unary_special(fn, xb)
         if sp is not None:
             return sp, mpf(0.5)
-    x = x_of(xb)
-    if fn == "exp":
-        v = mpmath.exp(x)
-    elif fn == "ln":
-        v = mpmath.log(x)
-    elif fn == "ln_1p":
-        v = mpmath.log1p(x)
-    elif fn == "tanh":
-        v = mpmath.tanh(x)
-    elif fn == "sin":
-        v = mpmath.sin(x)
-    elif fn == "cos":
-        v = mpmath.cos(x)
-    elif fn == "powf":
-        v = mpmath.power(x, x_of(yb))
-    else:
-        raise ValueError(fn)
-    r, dist = f32_round(v)
-    return f32_bits(r), dist
+    if fn == "powf":
+        ex = exact_power(xb, yb)
+        if ex is not None:
+            return round_exact(ex)
+    for prec in (600, 1200, 2400, 4800):
+        with mp.workprec(prec):
+            x = x_of(xb)
+            y = x_of(yb) if yb is not None else None
+            r, dist = f32_round(evaluate(fn, x, y))
+            if dist > mpf(2) ** -(prec - 100):
+                return f32_bits(r), +dist
+    raise RuntimeError(f"{fn} {xb:08x} {yb}: undecided at 4800 bits")
 
 
 def spread(rng, lo, hi, n, both_signs=False):

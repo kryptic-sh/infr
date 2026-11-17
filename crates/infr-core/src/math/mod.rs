@@ -26,7 +26,10 @@
 //! CORE-MATH's design for binary32 (Sibidanov, Zimmermann and Glondu, "The CORE-MATH project",
 //! ARITH 2022): evaluate in binary64 with a known error bound, accept the result when every
 //! real number within that bound rounds to the same binary32, and otherwise take an accurate
-//! path in double-double arithmetic (about 100 bits) whose result rounds correctly. The code is
+//! path in double-double arithmetic (about 100 bits) whose result rounds correctly. For `exp`
+//! and `tanh` an exhaustive test showed the check never changes a result, so those two round
+//! their binary64 value directly (see `exp.rs`); `ln`, `ln_1p`, `sin` and `cos` need it on a
+//! handful of inputs each and keep it. The code is
 //! written for this module; each function's file states its algorithm, its sources and its
 //! error bounds. Correct rounding of the unary functions is verified by an exhaustive test over
 //! all `2^32` inputs against an independent reference (`tests/math.rs`, ignored by default);
@@ -39,6 +42,27 @@
 //! function swapped for this module's. Their bits are as deterministic as the functions they
 //! call, and a call site moving to one of them changes only where the platform function was
 //! wrong.
+//!
+//! # NaN
+//!
+//! Every function here, scalar and slice, returns exactly [`NAN`] whenever its result is NaN:
+//! for a NaN input (signalling, quiet, any payload, either sign) and for an invalid operation
+//! (`ln(-1)`, `sin(inf)`, `silu(-inf)`'s `-inf/inf`). This is enforced explicitly, never left to
+//! the hardware: x86 and AArch64 propagate payloads and choose the sign of a generated NaN
+//! differently (x86 makes `0xffc00000`, AArch64's default NaN is `0x7fc00000`), so leaving it
+//! to them would make NaN results differ in their bits across architectures.
+//!
+//! # Slices
+//!
+//! [`exp_slice`], [`exp_slice_to`], [`exp_sub_slice`], [`tanh_slice`], [`sigmoid_slice`],
+//! [`silu_slice`] and [`gelu_tanh_slice`] apply the scalar functions to every element. Each
+//! element goes through the SAME branch-free lane function the scalar version is (only
+//! `+ - * /`, conversions, comparisons used as selects and table lookups by integer index), in
+//! a plain loop the compiler vectorizes for whatever SIMD the build targets; there are no
+//! intrinsics and no `std::simd`. So each slice function equals its scalar function element
+//! for element by construction, on every target; the tests check it on every binary32 input.
+//! `ln`, `ln_1p`, `sin`/`cos` and `powf` have no slice form: they are not per-element hot paths
+//! (RoPE's `powf(theta, -2p/d)` depends only on the op's shape and the caller can hoist it).
 
 mod dd;
 mod exp;
@@ -47,28 +71,49 @@ mod pow;
 mod tables;
 mod trig;
 
+#[cfg(test)]
+mod fast_path_tests;
+
 pub use exp::{exp, tanh};
 pub use log::{ln, ln_1p};
 pub use pow::powf;
 pub use trig::{cos, sin, sin_cos};
 
+use exp::{exp_lane, tanh_lane};
+
+/// The one NaN every function here returns: the positive quiet NaN with an empty payload.
+pub const NAN: f32 = f32::from_bits(0x7fc0_0000);
+
+/// `v`, or [`NAN`] if `v` is any NaN.
+#[inline(always)]
+fn canon(v: f32) -> f32 {
+    if v.is_nan() {
+        NAN
+    } else {
+        v
+    }
+}
+
 /// `1 / (1 + e^-x)`, as `kernels.rs`'s `act_fn` and the gating call sites write it.
 #[inline]
 pub fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + exp(-x))
+    canon(1.0 / (1.0 + exp_lane(-x)))
 }
 
-/// `x / (1 + e^-x)`, as `act_fn`'s SiLU and the gated norms write it.
+/// `x / (1 + e^-x)`, as `act_fn`'s SiLU and the gated norms write it. At `-inf` that
+/// expression is `-inf/inf`, NaN, which is what today's call sites compute too (see
+/// `docs/math.md`); it is returned as [`NAN`].
 #[inline]
 pub fn silu(x: f32) -> f32 {
-    x / (1.0 + exp(-x))
+    canon(x / (1.0 + exp_lane(-x)))
 }
 
 /// GELU's tanh approximation, `0.5 * x * (1 + tanh(0.7978846 * (x + 0.044715 * x^3)))`, with
-/// `x^3` as `x * x * x` evaluated left to right, as `act_fn` writes it.
+/// `x^3` as `x * x * x` evaluated left to right, as `act_fn` writes it. At `-inf` the expression
+/// is `-inf * 0`, NaN, as at today's call sites; it is returned as [`NAN`].
 #[inline]
 pub fn gelu_tanh(x: f32) -> f32 {
-    0.5 * x * (1.0 + tanh(GELU_SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x)))
+    canon(0.5 * x * (1.0 + tanh_lane(GELU_SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x))))
 }
 
 /// The constant `act_fn` writes for `sqrt(2/pi)`, kept as written there (`0.797_884_6`).
@@ -77,9 +122,65 @@ const GELU_SQRT_2_OVER_PI: f32 = 0.797_884_6;
 const GELU_CUBIC: f32 = 0.044715;
 
 /// `softplus(x) = ln(1 + e^x)` in the overflow-free form the DeltaNet scan writes:
-/// `max(x, 0) + ln_1p(e^-|x|)`.
+/// `max(x, 0) + ln_1p(e^-|x|)`. The `max` is a comparison and a select (`f32::max` leaves the
+/// sign of a zero result unspecified); the two agree wherever the sum can tell them apart.
 #[inline]
 pub fn softplus(x: f32) -> f32 {
     let ax = f32::from_bits(x.to_bits() & 0x7fff_ffff);
-    x.max(0.0) + ln_1p(exp(-ax))
+    let pos = if x > 0.0 { x } else { 0.0 };
+    canon(pos + ln_1p(exp_lane(-ax)))
+}
+
+/// `xs[i] = exp(xs[i])` for every element.
+pub fn exp_slice(xs: &mut [f32]) {
+    for x in xs {
+        *x = exp_lane(*x);
+    }
+}
+
+/// `dst[i] = exp(src[i])`.
+///
+/// # Panics
+/// If the two slices differ in length.
+pub fn exp_slice_to(src: &[f32], dst: &mut [f32]) {
+    assert_eq!(src.len(), dst.len(), "exp_slice_to: length mismatch");
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = exp_lane(s);
+    }
+}
+
+/// `xs[i] = exp(xs[i] - m)`, the subtraction rounded to binary32 first, as a softmax over a
+/// row writes `(x - max).exp()`.
+pub fn exp_sub_slice(xs: &mut [f32], m: f32) {
+    for x in xs {
+        *x = exp_lane(*x - m);
+    }
+}
+
+/// `xs[i] = tanh(xs[i])`.
+pub fn tanh_slice(xs: &mut [f32]) {
+    for x in xs {
+        *x = tanh_lane(*x);
+    }
+}
+
+/// `xs[i] = sigmoid(xs[i])`.
+pub fn sigmoid_slice(xs: &mut [f32]) {
+    for x in xs {
+        *x = sigmoid(*x);
+    }
+}
+
+/// `xs[i] = silu(xs[i])`.
+pub fn silu_slice(xs: &mut [f32]) {
+    for x in xs {
+        *x = silu(*x);
+    }
+}
+
+/// `xs[i] = gelu_tanh(xs[i])`.
+pub fn gelu_tanh_slice(xs: &mut [f32]) {
+    for x in xs {
+        *x = gelu_tanh(*x);
+    }
 }

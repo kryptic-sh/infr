@@ -28,6 +28,7 @@
 use super::dd::{dd_to_f32, exp2i, next_down, next_up, round_if_clear};
 use super::exp::{exp_dd_fast, exp_from_parts, exp_parts_dd};
 use super::log::{abs, ln_dd, ln_pow_fast};
+use super::NAN;
 
 /// The fast path's relative error allowance.
 const POW_EPS: f64 = exp2i(-50);
@@ -47,7 +48,7 @@ pub fn powf(x: f32, y: f32) -> f32 {
         return 1.0;
     }
     if x.is_nan() || y.is_nan() {
-        return f32::NAN;
+        return NAN;
     }
     let y_odd = is_odd_integer(y);
     let x_neg = x.is_sign_negative();
@@ -75,7 +76,7 @@ pub fn powf(x: f32, y: f32) -> f32 {
         return if x_neg && y_odd { -big } else { big };
     }
     if x_neg && !is_integer(y) {
-        return f32::NAN;
+        return NAN;
     }
     let ax = if x_neg { -x } else { x };
     let v = pow_pos(ax, y);

@@ -146,7 +146,20 @@ fn assert_close(cpu: &[f32], mtl: &[f32], tol: f32, what: &str) {
 
 /// Run on both backends and assert close.
 fn assert_parity(g: &Graph, bound: &[(TensorId, Vec<u8>)], out: TensorId, out_n: usize, tol: f32) {
-    let cpu = run(&CpuBackend::new(), g, bound, out, out_n);
+    assert_parity_against(&CpuBackend::new(), g, bound, out, out_n, tol);
+}
+
+/// [`assert_parity`] against a given CPU backend: `CpuBackend::reference()` where the production
+/// CPU quantizes activations to int8 and the Metal path under test does not.
+fn assert_parity_against(
+    cpu_be: &CpuBackend,
+    g: &Graph,
+    bound: &[(TensorId, Vec<u8>)],
+    out: TensorId,
+    out_n: usize,
+    tol: f32,
+) {
+    let cpu = run(cpu_be, g, bound, out, out_n);
     let mtl = run(
         &MetalBackend::new().expect("metal backend"),
         g,
@@ -3516,7 +3529,9 @@ fn moe_quant_test(dtype: DType, synth: fn(usize, u32) -> Vec<u8>, seed: u32) {
         (up, synth(n_expert * nff * ne, seed + 3)),
         (down, synth(n_expert * ne * nff, seed + 4)),
     ];
-    assert_parity(&g, &bound, dst, ne, 1e-3);
+    // The f32 reference: the production CPU feeds quantized expert banks int8 activations at
+    // every row count, the device path does not.
+    assert_parity_against(&CpuBackend::reference(), &g, &bound, dst, ne, 1e-3);
 }
 
 #[test]
@@ -3597,8 +3612,10 @@ fn moe_softmax_bias_test(dtype: DType, synth: fn(usize, u32) -> Vec<u8>, seed: u
     };
     let (g, bound, dst) = build(true);
     let (g0, bound0, dst0) = build(false);
-    let cpu = run(&CpuBackend::new(), &g, &bound, dst, ne);
-    let cpu0 = run(&CpuBackend::new(), &g0, &bound0, dst0, ne);
+    // The f32 reference, as in `moe_quant_test`: the production CPU's int8 expert activations
+    // are not what the device path computes.
+    let cpu = run(&CpuBackend::reference(), &g, &bound, dst, ne);
+    let cpu0 = run(&CpuBackend::reference(), &g0, &bound0, dst0, ne);
     // In `assert_parity`'s own metric (relative to `max(|cpu|, 1)`): a Metal output equal to the
     // bias-free one must miss the tolerance by a wide factor, not by a rounding.
     const TOL: f32 = 1e-3;
@@ -3612,7 +3629,7 @@ fn moe_softmax_bias_test(dtype: DType, synth: fn(usize, u32) -> Vec<u8>, seed: u
         "the bias does not change the CPU output ({moved}), so this case cannot tell a router \
          that ignores it"
     );
-    assert_parity(&g, &bound, dst, ne, TOL);
+    assert_parity_against(&CpuBackend::reference(), &g, &bound, dst, ne, TOL);
 }
 
 /// F32 experts: the host fallback's router (`sel_probs`-style sort on probabilities plus bias).

@@ -2424,18 +2424,15 @@ fn gpu_seam_ernie4_5_decode_replays_from_one_recording() {
     );
 }
 
-/// Row-count identity on the cached dense models (`support/row_identity.rs`): a chat prompt
-/// prefilled in one chunk, in chunks of 7 and 3, and one row at a time gives the same 8 ids and
-/// the same bits in every tensor the prompt's last position and the decode steps write. The
-/// families: Qwen3 (Q4_K/Q6_K, QK-norm RoPE), gemma-3 (sliding window, Q5_0 on int8), Qwen3.5
-/// (gated DeltaNet and its convolution, gated attention), LFM3 (short convolution, head gates),
-/// ERNIE-4.5 and SmolLM3.
-///
-/// The MoE models are left out on purpose: `Op::MoeFfn` takes f32 activations for one row and
-/// int8 ones for several (`moe::expert_acts_kind`, `int8_ok = rows >= 2`), so a prompt prefilled
-/// in chunks and one prefilled a row at a time differ by design there (docs/backlog.md, B203).
+/// Row-count identity on the cached models (`support/row_identity.rs`): a chat prompt prefilled
+/// in one chunk, in chunks of 7 and 3, and one row at a time gives the same 8 ids and the same
+/// bits in every tensor the prompt's last position and the decode steps write. The families:
+/// Qwen3 (Q4_K/Q6_K, QK-norm RoPE), gemma-3 (sliding window, Q5_0 on int8), Qwen3.5 (gated
+/// DeltaNet and its convolution, gated attention), LFM3 (short convolution, head gates),
+/// ERNIE-4.5 and SmolLM3, and the MoE models ERNIE-4.5-21B-A3B and Qwen3-30B-A3B, whose
+/// `Op::MoeFfn` quantizes expert activations to int8 at every row count, each row on its own.
 #[test]
-#[ignore = "needs the dense CPU golden models in the HF cache"]
+#[ignore = "needs the CPU golden models in the HF cache"]
 fn cpu_rows_give_the_same_bits_in_any_chunks() {
     let mut _tlk = test_serial_lock();
     let mut ran = 0;
@@ -2446,6 +2443,8 @@ fn cpu_rows_give_the_same_bits_in_any_chunks() {
         ("LFM3-1.7B", lfm3_17b()),
         ("ERNIE-4.5-0.3B", ernie4_5_03b()),
         ("SmolLM3-3B", smollm3_3b()),
+        ("ERNIE-4.5-21B-A3B", ernie4_5_21b_a3b()),
+        ("Qwen3-30B-A3B", qwen3moe_30b()),
     ] {
         let Some(path) = path else {
             println!("skip: {what} is not cached");
@@ -2465,7 +2464,7 @@ fn cpu_rows_give_the_same_bits_in_any_chunks() {
         row_identity::assert_row_count_identity(what, &load, &base, &prompt, 8, &[512, 7, 3, 1]);
         ran += 1;
     }
-    assert!(ran > 0, "no dense model is cached; nothing was checked");
+    assert!(ran > 0, "no model is cached; nothing was checked");
 }
 
 // ─── Qwen3.5 / Qwen3-Next (gated DeltaNet) ──────────────────────────────────────
@@ -3358,9 +3357,11 @@ fn qwen3moe_30b() -> Option<PathBuf> {
 // Since `infr_core::math` (2026-11-17) Windows and Linux give the same text, the one Windows
 // gave before. Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`):
 // the quoted question now ends in "is..." where it ended in "is"; identical natively on Windows
-// and under WSL.
+// and under WSL. Re-blessed the same day when one-row `Op::MoeFfn` (every decode step) moved
+// onto the int8 expert kernels: the text forks after "is...\"", which is now followed by "and then
+// it cuts off. I need", and stays coherent. Blessed on Windows; not yet run under WSL.
 const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 24, 0xdac3e0eea1da12ed)];
+    &[("The capital of France is", 24, 0xa68ab7f4d15ad931)];
 
 /// Whole-vector cosine similarity (f64 accumulation) — used by the CPU/Vulkan cross-backend
 /// logits check below.
@@ -3401,8 +3402,9 @@ fn cpu_golden_qwen3moe() {
 /// exercises REAL mixed-dtype paged execution (the down role resolves through two pools), on top
 /// of what `gpu_seam_paged_moe_matches_scout_oracle` proves for the uniform split-bank shape.
 ///
-/// `INFR_UBATCH=1`: pins every prefill chunk to rows=1, so EVERY MoeFfn call — CPU, resident GPU
-/// alike — takes the small-m id-indexed dequant GEMV path (exact f32-equivalent math). Without it
+/// `INFR_UBATCH=1`: pins every prefill chunk to rows=1, so EVERY MoeFfn call on the GPU — resident
+/// and paged alike — takes the small-m id-indexed dequant GEMV path (exact f32-equivalent math;
+/// the production CPU quantizes expert activations to int8 at every row count). Without it
 /// the resident run would default to the BATCHED int8-dp4a prefill path (Q4_K_M is mmq-eligible) —
 /// a coarser-precision route that `gpu_seam_golden_qwen3moe`'s own doc notes CAN diverge from the
 /// f32 CPU oracle on a near-tie greedy pick, which would make any divergence here ambiguous

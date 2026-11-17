@@ -1,8 +1,9 @@
 //! f32 dot of a quantized weight row against f32 activations, bit-identical to
 //! `dot(&bytes_to_f32(row, dt), x)` but without materializing the dequantized row.
 //!
-//! The f32-activation expert GEMM (`ExpertActs::Raw`, which every single-row MoE call takes)
-//! used to dequantize each weight row through `bytes_to_f32`: a decode into the factored form
+//! The f32-activation expert GEMM (`ExpertActs::Raw`: banks with no int8 kernel, such as Q2_K
+//! and Q3_K, and every bank in reference mode; single-row MoE calls took it for every format
+//! until one row moved onto the int8 kernels) used to dequantize each weight row through `bytes_to_f32`: a decode into the factored form
 //! (three allocations) and a second expansion pass into a fourth, per row, per routed expert, per
 //! token — the dominant cost of a CPU MoE decode. Every affine quant (the formats with a
 //! factored form) now decodes here a span at a time on the stack to the same bits (see

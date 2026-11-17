@@ -3239,11 +3239,13 @@ impl CpuBackend {
                     // — so this alone replaces what used to be `rows` separate re-dequants of it),
                     // then a per-row softmax + top-`n_used` selection (independent per row, so
                     // parallel over rows is safe).
-                    // Whole-call gate — see expert_matvec_batch's param doc. REFERENCE mode
-                    // (`CpuBackend::reference`) forces every bank onto `ActsKind::Raw`, i.e. the
-                    // f32-activation path decode (rows == 1) already takes, so an oracle run has
-                    // no int8-activation error anywhere.
-                    let int8_ok = rows >= 2 && !reference;
+                    // Quantized banks take int8 activations at EVERY row count, one row (decode)
+                    // included: each row is quantized on its own and the expert kernels give a
+                    // row the same bits in a bucket of any size, so a row's result does not
+                    // depend on how many rows the op has (`tests/moe_batch_identity.rs`).
+                    // REFERENCE mode (`CpuBackend::reference`) forces every bank onto
+                    // `ActsKind::Raw`, so an oracle run has no int8-activation error anywhere.
+                    let int8_ok = !reference;
                     let pool = self.pool();
                     // Router GEMM on the pool: serial it was 12-20ms/layer at 512 rows (134M MAC)
                     // — long enough that spinning pool workers SMT-throttled it, which is where

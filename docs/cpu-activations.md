@@ -192,6 +192,21 @@ its steady state: that row's own outliers stand 8 to 16 times above the rest of
 their blocks (at ratio 8 it reaches 0.029). It is the place the ratio trade
 shows (B210).
 
+### MoE models, one row
+
+One-row `Op::MoeFfn` takes the int8 expert kernels since this change's companion
+commit. With the prefill chunk height at 1 (`INFR_AQ_UBATCH=1`), so every
+position, position 0 included, is a one-row graph, production against reference
+on the first chat prompt and the raw prompt:
+
+| Model             | old quantizer: position 0 | position 1     | split: position 0 | position 1     | positions 2.. median, split |
+| ----------------- | ------------------------- | -------------- | ----------------- | -------------- | --------------------------- |
+| Qwen3-30B-A3B     | 0.16 / 1.21               | 0.025 / 0.018  | 9.1e-4 / 9.1e-3   | 0.020 / 7.7e-3 | 2.0e-3 / 2.3e-3             |
+| ERNIE-4.5-21B-A3B | 9.8e-3 / 0.016            | 0.041 / 6.6e-3 | 1.6e-3 / 3.3e-3   | 0.032 / 5.2e-3 | 6.5e-3 / 3.0e-4             |
+
+The first is the defect the earlier review found when one-row MoE first moved to
+int8 (1.21 on the raw prompt); with the split, position 0 is ordinary on both.
+
 ### Speed
 
 `infr bench --dev cpu`, Windows, native builds, three reps per run, eight rounds

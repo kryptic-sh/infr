@@ -25,8 +25,8 @@ pub(crate) enum ExpertActs<'a> {
     /// 32-block int8 (`quantize_q8_32`): Q8_0/Q5_0 weights at misaligned `in_f % 32 == 0`
     /// (e.g. DiffusionGemma's down `in_f = 704`).
     Blk32(&'a [Q8x32]),
-    /// Row-major f32 `[count, in_f]`: f16/bf16/f32 weights, the dequant fallback, and ALL
-    /// single-row (`int8_ok == false`) calls, which stay byte-for-byte exact (Metal parity).
+    /// Row-major f32 `[count, in_f]`: f16/bf16/f32 weights, the dequant fallback, and every bank
+    /// in reference mode (`int8_ok == false`).
     Raw(&'a [f32]),
 }
 

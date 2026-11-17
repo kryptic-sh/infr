@@ -339,6 +339,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **One-row `Op::MoeFfn` takes int8 activations.** Quantized expert banks got
+  f32 activations at one row (every decode step) and int8 at two or more, so MoE
+  models were the one exception to the CPU's row-count identity. One row now
+  takes the int8 expert kernels too (reference mode keeps f32), and a prompt
+  prefilled in any chunk height gives the same bits. With the activation split
+  (Fixed, below) Qwen3-30B-A3B's first token, run as a one-row graph, is at KL
+  9e-4 and 9e-3 from the reference on two prompts; with the old quantizer it was
+  0.16 and 1.21. **Upgrade note:** MoE models' CPU decode output changes once
+  (`cpu_golden_qwen3moe` re-blessed).
+
 - **Baseline x86-64 builds (the released binaries) run the f32 dots on FMA.**
   `mul_add` compiled to a call to the C runtime's `fmaf` per element on a build
   without the `fma` target feature, so attention's scores and value sums, MLA's

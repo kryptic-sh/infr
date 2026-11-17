@@ -97,18 +97,9 @@ fn prompts(model: &SeamModel) -> Vec<Vec<u32>> {
         .map(|p| model.render_chat(p).expect("chat template"))
         .collect();
     texts.push(PROMPTS[0].to_string());
-    // `INFR_AQ_ONE_TOKEN`: each prompt cut to its first token, so the driver runs every position,
-    // position 0 included, as a one-row decode step.
-    let one = std::env::var_os("INFR_AQ_ONE_TOKEN").is_some();
     texts
         .iter()
-        .map(|t| {
-            let mut ids = model.encode(t).expect("encode");
-            if one {
-                ids.truncate(1);
-            }
-            ids
-        })
+        .map(|t| model.encode(t).expect("encode"))
         .collect()
 }
 
@@ -117,13 +108,22 @@ fn argmax(row: &[f32]) -> u32 {
     (0..row.len()).fold(0, |b, i| if row[i] > row[b] { i } else { b }) as u32
 }
 
+/// The run's engine configuration: `INFR_AQ_UBATCH` sets the prefill chunk height (`1` runs every
+/// prompt row, position 0 included, as a one-row graph).
+fn edit_cfg(c: &mut EngineConfig) {
+    if let Ok(v) = std::env::var("INFR_AQ_UBATCH") {
+        c.device.ubatch = Some(v.parse().expect("INFR_AQ_UBATCH"));
+        c.device.ubatch_specified = true;
+    }
+}
+
 /// The CPU reference's greedy run on `prompt` through the teacher-forced driver
 /// (`SeamModel::forced_logits`): `n` decoded tokens, the logits at every position.
 fn reference_run(model: &SeamModel, prompt: &[u32], n: usize) -> ForcedLogits {
     model
         .forced_logits(
             ForcedOn::CpuReference,
-            |_| {},
+            edit_cfg,
             prompt,
             n,
             PrefillHead::All,
@@ -139,7 +139,7 @@ fn forced(model: &SeamModel, on: ForcedOn, reference: &ForcedLogits) -> ForcedLo
     let got = model
         .forced_logits(
             on,
-            |_| {},
+            edit_cfg,
             &reference.seq[..p],
             steps,
             PrefillHead::All,

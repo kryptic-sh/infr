@@ -209,9 +209,8 @@ backend. What is proven, and how:
   (`crates/infr-llama/tests/support/row_identity.rs`): the same ids and the same
   bits in everything the last position and the decode steps write, at heights
   512, 7, 3 and 1, on Qwen3, gemma-3, Qwen3.5, LFM3, ERNIE-4.5 and SmolLM3 and
-  on the synthetic LFM3 file in CI. **Exception, by design:** `Op::MoeFfn`
-  quantizes expert activations to int8 for two rows or more and not for one
-  (docs/backlog.md, B203).
+  on the synthetic LFM3 file in CI, and since one-row `Op::MoeFfn` takes int8
+  activations (2026-11-18) on ERNIE-4.5-21B-A3B and Qwen3-30B-A3B (Windows).
 - **Windows and Linux** reproduce all of the above with the same values. aarch64
   runs the scalar kernels and is the first thing CI's macOS jobs check.
 

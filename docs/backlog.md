@@ -6630,62 +6630,6 @@ every other dtype. The options as weighed:
   distribution-level metrics, not by logit differences, which move this much
   from a last-bit change on the CPU alone.
 
-### B203 — `Op::MoeFfn` is not row-count identical: one row f32, several int8 (2026-11-17)
-
-**Tag:** cpu · determinism · **Kind:** approved, not started
-
-**2026-11-18: implemented on branch `perf/cpu-moe-fma` (commit `daa53774`), and
-held.** One-row `Op::MoeFfn` on the int8 expert kernels, with the identity
-tests, re-blessed op hashes and `cpu_golden_qwen3moe`, works as specified, but
-it exposes a problem in the int8 activation quantizer at sequence position 0.
-Comparing the production CPU with `kernels.cpu.reference` per position on
-Qwen3-30B-A3B (the orchestrator's review), position 0's KL went from 0.0137 and
-0.0020 (two prompts) to 1.21 and 0.67, max |logit difference| 10.55 and 9.03,
-while positions 1-7 stayed ordinary (about 0.0045 → 0.0063); ERNIE-4.5-21B-A3B's
-position 0 is ordinary. A dense model shows the same without this change:
-SmolLM3-3B's production CPU against reference has KL 4.88 at position 0 (top-1
-`"system"` p=0.996 becomes `"bdb"` p=0.169) and about 2e-2 elsewhere. The
-suspected cause, inferred and not proven: `quantize_q8`'s 256-element blocks,
-where the first token's very large activations set `amax/127` and leave almost
-no resolution for the rest of the block. Multi-row prefill already quantizes
-position 0 that way; the change makes a one-token prompt, whose logits are read,
-take it too. It lands after the quantizer is fixed (its own slice).
-
-**Decided 2026-11-18: the owner approved the first option below, int8
-activations at one row too.** To do: route one-row `Op::MoeFfn` through the int8
-expert kernels, drop the MoE exclusion from the row-count tests, re-bless the
-MoE goldens once (Windows and Linux agreeing before a value is committed, with
-the old and new text compared), and measure MoE decode before and after, since
-the speed gain is expected and not yet measured for the expert tiles.
-
-Plan 11's row-count identity (`tests/support/row_identity.rs`) holds every dense
-family bit for bit at prefill chunk heights 512, 7, 3 and 1. The MoE layer
-cannot, by design: `Op::MoeFfn` feeds Q4_K, Q5_K, Q6_K and Q8_0 expert banks
-int8 activations when the op has two rows or more and f32 activations at one row
-(`int8_ok = rows >= 2 && !reference` in `crates/infr-cpu/src/lib.rs`, then
-`moe::expert_acts_kind`). So a prompt prefilled in chunks and one prefilled a
-row at a time differ from the first MoE layer on, and a chunk that happens to
-hold one row (a prompt length one past a multiple of the height) switches path
-in the middle of a prefill. `docs/deepseek.md` ("Quantized expert banks: chunked
-prefill is close, not equal") measured it on the synthetic V4 file: 1.71e-4 max
-|logit difference| at the prompt's last position. Every height of two rows or
-more is identical to every other, and reference mode (`kernels.cpu.reference`)
-is identical at every height. The row-count tests leave the MoE models out and
-say why.
-
-Options:
-
-- **int8 at one row too** (what B201 chose for `Op::Linear`): row-count identity
-  everywhere, likely faster decode (the int8 one-row `Linear` measured 2.2-8.8x
-  faster than the f32 dot it replaced), slightly further from llama.cpp, and
-  every MoE model's CPU decode output changes once (re-bless
-  `cpu_golden_ernie4_5_moe`, `cpu_golden_qwen3moe` and the synthetic V4
-  fixtures' CPU-side values). Not measured for the MoE expert tiles.
-- **f32 at every row count**: identity, closest to exact, but MoE prefill loses
-  the int8 kernels and the packed VNNI tiles (several times slower prefill on
-  the expert GEMMs, by B201's measurements of the same trade on `Linear`).
-- **Leave it** (today): documented, tested as an exception.
-
 ### B206 — CPU speed from narrower datatypes: what is not int8 yet (2026-11-18)
 
 **Tag:** cpu · perf · **Kind:** queued work, in this order
@@ -6700,7 +6644,8 @@ S3/S4 work and not re-read for this entry:
    the scalar expression, which `kernels/tier_tests.rs` enforces once the tier
    is one `crate::simd` dispatches. Correctness can run on CI's macOS runner;
    speed needs a Mac owner (issue 100 collects a baseline first).
-2. **One-row MoE** (B203, approved; implemented and held, see there).
+2. **One-row MoE**: done; one-row `Op::MoeFfn` takes the int8 expert kernels
+   (CHANGELOG). Its decode speed against the f32 path was not measured.
 
 ### B204 — what plan 11's S3/S4 (tier, thread and row identity) left (2026-11-17)
 

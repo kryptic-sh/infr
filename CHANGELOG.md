@@ -53,7 +53,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   set the compiler may use, so on a `target-cpu=native` build the scalar kernels
   are still compiled for, and auto-vectorized with, the machine's features. A
   debug and testing switch: every tier gives the same bits, so it changes only
-  speed. With no ceiling set it costs nothing: the CPU backend's graph
+  speed. With no ceiling set it has no measurable cost: the CPU backend's graph
   interpreter is compiled twice and picks once per graph, and the uncapped copy
   dispatches exactly as before (a compile-time constant on a native build). It
   is process-wide: each CPU backend applies its value when built, unset meaning

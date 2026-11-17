@@ -289,15 +289,21 @@ job running (`tasklist`), desktop apps idle:
 | Qwen3-1.7B, pp512    | 1112.7, 1106.5, 1102.6, 1098.2, 1110.1, 1114.1, 1114.2, 1110.6 | 1100.5, 1108.6, 1139.5, 1097.2, 1129.3, 1126.4, 1079.6, 1076.5 | 1142.1, 1142.2, 1099.1, 1052.8, 1131.6, 1126.9, 1115.1, 1112.8 |
 | Qwen3-1.7B, tg64     | 55.8, 55.9, 57.4, 53.6, 56.6, 53.7, 54.3, 55.2                 | 54.3, 56.4, 56.4, 56.9, 56.0, 55.6, 50.5, 55.5                 | 55.0, 57.2, 57.3, 54.9, 57.8, 55.0, 54.2, 54.5                 |
 
-The criterion for "indistinguishable from `main`": the after-fix build's middle
-value (the mean of the 4th and 5th of the 8 per-round values) within `main`'s
-round-to-round range, and its difference from `main`'s middle value smaller than
-that range's width. gemma-3-1b pp512: above main in 3 of 8 rounds (head in 1 of
-8), the middle values (the mean of the 4th and 5th of 8) 566.8 against 566.4;
-Qwen3-1.7B pp512 above in 6 of 8; decode the same on Qwen3 and faster on gemma
-in every round (from an earlier change on the branch; not traced). The baseline
-builds (`-C target-cpu=x86-64`, where `main`'s check was a run-time load
-already), main against after, same protocol:
+Read the rounds in pairs (each round ran the three builds back to back), because
+a criterion on middle values and ranges does not separate these builds: `head`'s
+gemma-3-1b pp512 middle value sits inside `main`'s range too. Paired against
+`main` on gemma-3-1b pp512, `head` is below in 7 of 8 rounds, a mean difference
+of -12.1 t/s (-2.1%); `after5` is below in 5 of 8, a mean difference of +1.6 t/s
+(+0.3%), with middle values (the mean of the 4th and 5th of 8) 566.8 against
+566.4. On Qwen3-1.7B pp512 `after5` is below in 2 of 8, mean +6.7 t/s (+0.6%).
+So the fix shows no measurable cost at this protocol's resolution, which is
+about ±2%; a smaller cost would not be seen. Decode is the same on Qwen3 and
+faster on gemma in every round. That gemma decode gain is not traced: it shows
+only on the native builds (the baseline pair below is level), which points at
+code generation or layout under `target-cpu=native` and not at a change in
+sampling or the KV quantizer, which would show on both. The baseline builds
+(`-C target-cpu=x86-64`, where `main`'s check was a run-time load already), main
+against after, same protocol:
 
 | Model, run           | `mainbase`                                             | `afterbase`                                            |
 | -------------------- | ------------------------------------------------------ | ------------------------------------------------------ |
@@ -306,9 +312,11 @@ already), main against after, same protocol:
 | Qwen3-1.7B, pp512    | 330.3, 335.0, 335.8, 333.1, 329.6, 328.5, 317.7, 322.1 | 329.8, 327.0, 334.3, 331.1, 330.3, 327.9, 318.5, 321.4 |
 | Qwen3-1.7B, tg64     | 47.3, 49.6, 50.9, 51.0, 49.7, 51.1, 49.2, 50.0         | 50.4, 46.7, 47.2, 50.4, 50.1, 51.0, 50.1, 46.7         |
 
-Within the spread there too: the middle values 372.9 against 377.3 on gemma-3-1b
-pp512 (below main in 5 of 8 rounds, at most 3.4% in one; main's own rounds span
-4.6%) and 328.9 against 329.9 on Qwen3-1.7B pp512; decode level.
+Paired the same way: gemma-3-1b pp512 is below main in 5 of 8 rounds, a mean
+difference of -4.0 t/s (-1.1%), middle values 372.9 against 377.3; Qwen3-1.7B
+pp512 is below in 6 of 8, mean -1.5 t/s (-0.4%), middle values 328.9 against
+329.9; decode level. Both lean toward `main` by less than the protocol resolves,
+so a cost of about 1% on baseline builds is neither shown nor ruled out.
 
 ## The determinism rule
 

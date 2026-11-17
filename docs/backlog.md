@@ -6666,21 +6666,45 @@ Options:
 
 **Tag:** cpu · tests · ci · **Kind:** coverage gaps and open items
 
-- **Not yet run anywhere but this machine:** the `cpu-goldens-os` CI job
-  (Windows and macOS goldens of Qwen3-0.6B, gemma-3-1b, Qwen3.5-0.8B), Qwen3.5
-  in the Linux goldens job, and the op-hash suite on macOS (aarch64, the first
-  run of any CPU op there). The Windows leg's model download (`pipx`, `hf` under
-  `shell: bash` on `windows-2025`) and its cache size are unverified. The macOS
-  leg is `continue-on-error` until it has passed once; drop that then. The
-  repository cache is near its limit (B197), and each leg caches about 1.7 GB.
-- **Thread counts were tested on small shapes.** `op_hashes.rs` runs every op at
-  1, 2, 3, 7, 33 and the machine's thread count, but its tensors are small, so
-  pool chunk thresholds that only split large work (`KV_WIDEN_CHUNK`,
-  `DECODE_ROWS_MIN`..`MAX`, the attention query blocks past a few) are reached
-  only by the real-model tests at the machine's own count. By reading, every
-  parallel op partitions outputs and never splits one reduction across tasks
-  (`Argmax`, `ArgmaxProb` and the samplers run serially); not proven for large
-  shapes.
+- **The CI cache will exceed its limit.** The repository's Actions cache was at
+  10.52 GB before this work (`gh api`, 2026-11-17), with the old `-v2` Linux
+  models entry still live; the golden steps add about 2.3 GB once `-v2` is
+  evicted. Eviction is least-recently-used, so rust-cache entries will churn.
+  The Windows models entry also stores Qwen3-0.6B a second time, beside the
+  smoke job's `hf-windows-smoke-qwen3-06b-q4km-v1`; sharing one entry would save
+  about 370 MB (see B197).
+- **No test stops `CpuBackend::execute` from always taking the uncapped copy.**
+  Every tier gives the same bits, so `op_hashes` and the capped goldens would
+  still pass. A review confirmed the routing by planting a bit flip in an
+  AVX-512 kernel (seen at `avx512` and uncapped, not at `avx2` or `scalar`). The
+  missing test: run `execute` under a per-thread tier on a one-thread pool and
+  assert the recorded tier. Likewise the uncapped half of `tier_tests` records
+  no tier, so an uncapped copy that fell to scalar would be a slowdown no test
+  sees.
+- **The two interpreter copies decide "AVX-512 is present" differently.** The
+  uncapped dispatch checks only `avx512bw`, as before; `SimdTier::Avx512` and
+  `capped()` require F, DQ, VL and BW. On a machine that hides DQ or VL (some
+  VMs) a ceiling of `avx2` would leave `capped()` false and the uncapped copy
+  would still run AVX-512 kernels. Bits are unaffected; using one feature set in
+  both costs nothing on a native build.
+- **Thread counts: one threshold case does not vary its split.** `op_hashes.rs`
+  now has a case past each pool threshold, but the lightning-indexer case splits
+  into the same tasks at every thread count (its comment says otherwise). By
+  reading, every parallel op partitions outputs and never splits one reduction
+  across tasks (`Argmax`, `ArgmaxProb` and the samplers run serially).
+- **`mul_add_exact` tests double rounding only in its constructed cases.** A
+  random input lands on a halfway trap with probability around 2^-28, so the
+  random cases do not test it; infinity and NaN inputs are not tested.
+- **The goldens are weak detectors on their own.** A one-bit error planted in a
+  Q8_0 batch kernel left the Qwen3 and Qwen3.5 golden tokens unchanged; the
+  op-hash suite and the row-identity test caught it.
+- **`docs/math.md` groups the synthetic LFM3 row test with heights 512/7/3/1;**
+  that test uses 64/5/3/1.
+- **Not traced: gemma-3-1b decodes faster on native builds** (tg64 about 41 on
+  `main` against 45-46 on this work), level on baseline builds. See
+  `docs/math.md`.
+- **The interpreter is compiled twice.** infr-cpu's release `.text` grew from
+  952 KB to 1160 KB with the two copies (833 KB on `main` before the ceiling).
 - **The ±0/NaN audit's harmless sites** (`docs/math.md`, "Identity across tiers,
   threads, row counts and architectures"): softmax and attention row maxima, the
   lightning indexer's `d.max(0.0)` ReLU, the SwiGLU clamp's `gate.min(limit)`,

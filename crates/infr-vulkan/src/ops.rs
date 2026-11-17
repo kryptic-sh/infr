@@ -932,6 +932,34 @@ mod tests {
 
     #[test]
     #[ignore = "requires a Vulkan GPU"]
+    fn rope_partial_matches_host() {
+        let be = VulkanBackend::new().unwrap();
+        // A partial rope leaves [rd, hd) unrotated; those elements are copied by the tail slots.
+        let (t, nh, hd, rd, theta) = (3usize, 2usize, 8usize, 6usize, 10000.0f32);
+        let x: Vec<f32> = (0..t * nh * hd).map(|i| (i as f32) * 0.07 - 1.0).collect();
+        let got = be.rope(&x, t, nh, hd, rd, theta).unwrap();
+        let mut want = x.clone();
+        for pos in 0..t {
+            for h in 0..nh {
+                let base = (pos * nh + h) * hd;
+                for i in 0..rd / 2 {
+                    let freq = (theta as f64).powf(-2.0 * i as f64 / rd as f64) as f32;
+                    let ang = pos as f32 * freq;
+                    let (s, co) = ang.sin_cos();
+                    let a = x[base + 2 * i];
+                    let b = x[base + 2 * i + 1];
+                    want[base + 2 * i] = a * co - b * s;
+                    want[base + 2 * i + 1] = a * s + b * co;
+                }
+            }
+        }
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-4, "element {i}: {g} vs {w}");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a Vulkan GPU"]
     fn silu_mul_matches_host() {
         let be = VulkanBackend::new().unwrap();
         let n = 100usize;

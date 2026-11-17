@@ -205,6 +205,13 @@ fn native_sg_choice(
 /// Tuning: `gemv_id_sg.enabled = false` forces the tree id path (id-only escape, alias
 /// `INFR_NO_GEMV_ID_SG`); `gemv_sg.enabled = false` (`INFR_NO_GEMV_SG`) disables BOTH the dense and
 /// id SG routes; `gemv_sg.min_out`/`max_out`/`rows` are the shared knobs.
+/// Workgroups for `rope.comp`: one thread per (token, head, slot), where a slot is one rotated
+/// pair or two tail elements. The shader grid-strides, so this is a parallelism choice and not a
+/// coverage bound; it clamps to the guaranteed group-count limit.
+fn rope_groups(t: usize, n_heads: usize, hd: usize) -> u32 {
+    (t * n_heads * hd.div_ceil(2)).div_ceil(64).clamp(1, 65535) as u32
+}
+
 fn native_id_sg_choice(
     dtype: infr_core::DType,
     in_f: usize,
@@ -5685,7 +5692,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
             None => {
@@ -5703,7 +5710,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
         }
@@ -5746,7 +5753,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
             None => {
@@ -5758,7 +5765,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
         }
@@ -5799,7 +5806,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
             None => {
@@ -5811,7 +5818,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
         }
@@ -6830,7 +6837,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
             None => {
@@ -6842,7 +6849,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
         }
@@ -6888,7 +6895,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(ff), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
             None => {
@@ -6903,7 +6910,7 @@ impl<'a> Recorder<'a> {
                     &[Self::vkb(x), Self::vkb(params), Self::vkb(y)],
                     1,
                     &push,
-                    (t * n_heads).div_ceil(64) as u32,
+                    rope_groups(t, n_heads, hd),
                 );
             }
         }

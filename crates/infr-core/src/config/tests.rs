@@ -1329,7 +1329,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
         "INFR_TUNE",
         "INFR_TUNE_DISABLE",
         "INFR_TUNE_FILE",
-        "INFR_TUNE_NO_ROWS",)
+        "INFR_TUNE_NO_ROWS",
     ];
 
     let mut got: Vec<&str> = KEYS.iter().filter(|k| k.migrated).map(|k| k.env).collect();

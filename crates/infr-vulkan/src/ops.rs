@@ -404,7 +404,7 @@ impl VulkanBackend {
     /// A build that fails still panics (this surface is infallible until B98 threads a `Result`
     /// through), but only after the lock is released: a panic while holding it would poison the
     /// cache, and every later kernel request in the process would panic on the poison instead of
-    /// building.)
+    /// building.
     fn kernel_inner(
         &self,
         name: &'static str,
@@ -432,7 +432,7 @@ impl VulkanBackend {
                 self.shared
                     .rte_f16
                     .load(std::sync::atomic::Ordering::Relaxed),
-                self.shared.wave64,
+                wave64,
             ) {
                 Ok(k) => *map.entry(name).or_insert(k),
                 Err(e) => {

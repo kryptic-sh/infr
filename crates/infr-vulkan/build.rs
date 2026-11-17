@@ -812,6 +812,37 @@ fn main() {
             "native_gemv_kq_fma_mrow_q6k_nr4",
             &["-DFMT_Q6K", "-DNR=4"],
         ),
+        // fp32 K-quant prefill GEMM for GPUs without fast int8 dot, see native_gemm_kq_fma.comp.
+        (
+            "native_gemm_kq_fma",
+            "native_gemm_kq_fma_q4_0_t64",
+            &["-DFMT_Q4_0", "-DBN=64"],
+        ),
+        (
+            "native_gemm_kq_fma",
+            "native_gemm_kq_fma_q4_0_t128",
+            &["-DFMT_Q4_0", "-DBN=128"],
+        ),
+        (
+            "native_gemm_kq_fma",
+            "native_gemm_kq_fma_q4k_t64",
+            &["-DFMT_Q4K", "-DBN=64"],
+        ),
+        (
+            "native_gemm_kq_fma",
+            "native_gemm_kq_fma_q4k_t128",
+            &["-DFMT_Q4K", "-DBN=128"],
+        ),
+        (
+            "native_gemm_kq_fma",
+            "native_gemm_kq_fma_q6k_t64",
+            &["-DFMT_Q6K", "-DBN=64"],
+        ),
+        (
+            "native_gemm_kq_fma",
+            "native_gemm_kq_fma_q6k_t128",
+            &["-DFMT_Q6K", "-DBN=128"],
+        ),
         (
             "native_gemv_kq_fma",
             "native_gemv_kq_fma_q6k_res_nr4",

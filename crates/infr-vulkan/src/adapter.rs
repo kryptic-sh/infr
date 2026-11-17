@@ -6178,16 +6178,38 @@ fn sync_stream<'a>(
 enum NcGemm {
     Mmq,
     Fma,
+    /// The fp32 K-quant tile (`native_gemm_kq_fma.comp`): Q4_0/Q4_K/Q6_K weights dequantized
+    /// in-shader, for parts without fast int8 dot (GCN) where the dp4a mmq emulation is slow.
+    KqFma,
 }
 
 /// Which non-coopmat tiled GEMM serves a `dt` Linear whose shape passed `gemm_ok`, or `None` when
 /// the device has f16 coopmat (the coopmat tier owns it), `INFR_NO_MMQ_FALLBACK` disabled the tier,
 /// or no build covers `dt`. Shared by `quant_linear` and `float_linear`.
-fn nc_gemm_choice(be_: &VulkanBackend, dt: infr_core::DType, gemm_ok: bool) -> Option<NcGemm> {
+fn nc_gemm_choice(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    gemm_ok: bool,
+    in_f: usize,
+    w_off: usize,
+) -> Option<NcGemm> {
     if !gemm_ok || be_.caps().f16_coopmat() || !be_.cfg().kernels.vulkan.mmq_fallback {
         return None;
     }
-    if be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt) {
+    // A K-quant tile needs whole superblocks along k and an aligned weight base; anything else
+    // falls through to the generic arms below.
+    let kq_fma = be_
+        .cfg()
+        .kernels
+        .vulkan
+        .kq_fma_tier
+        .unwrap_or(!be_.caps().i8_dot_fast)
+        && crate::gemm::native_gemm_kq_fma_supported(dt)
+        && in_f.is_multiple_of(256)
+        && w_off.is_multiple_of(256);
+    if kq_fma {
+        Some(NcGemm::KqFma)
+    } else if be_.caps().i8_dot && infr_core::tensor::moe_mmq_ok(dt) {
         Some(NcGemm::Mmq)
     } else if crate::gemm::native_gemm_fma_kernel_name(dt).is_some() {
         Some(NcGemm::Fma)
@@ -6447,7 +6469,7 @@ fn quant_linear(
     // Exercisable on coopmat hardware via INFR_NO_COOPMAT=1 (lib.rs's force-disable test
     // knob — drops the device feature itself, a faithful simulation). INFR_NO_MMQ_FALLBACK=1
     // disables the WHOLE tier (both arms) for A/B against the scalar floor.
-    let nc = nc_gemm_choice(be_, dt, gemm_ok);
+    let nc = nc_gemm_choice(be_, dt, gemm_ok, in_f, w_off);
     // A `>= 2^32`-element weight (a big-vocab lm_head/embed) can only take the CHUNKED GEMV
     // (decode m=1, or the per-input-row GEMV) — the tiled coopmat/nc GEMMs below decode a
     // 64-row weight tile that can't be split into single input rows, so a breach on this
@@ -7009,9 +7031,60 @@ fn nc_prefill_gemm(
                 }
             }
             NcGemm::Fma => rec.matmul_fma_at(dt, xb, w_addr, w_off, out, m, in_f, out_f),
+            NcGemm::KqFma => {
+                // BN=128 only when it still gives every CU a workgroup.
+                let cu = be_.caps().compute_units.max(1) as usize;
+                let bn = if out_f.is_multiple_of(128) && m.div_ceil(128) * (out_f / 128) >= cu {
+                    128
+                } else {
+                    64
+                };
+                let splits = kq_fma_split_plan(m, in_f, out_f, bn, cu, None);
+                if splits > 1 {
+                    let mpad = m.div_ceil(64) * 64;
+                    let pk = pooled(pool, be_, "kq_splitk_part", splits * mpad * out_f * 4)?;
+                    rec.matmul_kq_fma_splitk_at(
+                        dt,
+                        bn,
+                        xb,
+                        w_addr,
+                        w_off,
+                        pool[&pk].as_ref(),
+                        out,
+                        m,
+                        in_f,
+                        out_f,
+                        splits,
+                    );
+                } else {
+                    rec.matmul_kq_fma_at(dt, bn, xb, w_addr, w_off, out, m, in_f, out_f);
+                }
+            }
         }
         Ok(())
     })
+}
+
+/// Split-K count for the fp32 K-quant prefill GEMM (`native_gemm_kq_fma.comp`): enough k slices to
+/// fill the device's compute units at the chosen tile, subject to `in_f % (256 * splits) == 0` so
+/// every slice stays K-block aligned. `force` pins it (a benchmark's knob).
+fn kq_fma_split_plan(
+    m: usize,
+    in_f: usize,
+    out_f: usize,
+    bn: usize,
+    cu: usize,
+    force: Option<usize>,
+) -> usize {
+    let grid = (m.div_ceil(128) * (out_f / bn).max(1)).max(1);
+    let mut splits = match force {
+        Some(n) => n.clamp(1, 8),
+        None => (cu * 8).div_ceil(grid).next_power_of_two().clamp(1, 8),
+    };
+    while splits > 1 && !in_f.is_multiple_of(256 * splits) {
+        splits /= 2;
+    }
+    splits
 }
 
 /// Does the non-coopmat tier's dp4a GEMM for `(dt, m, in_f, out_f, w_off)` take the K-quant
@@ -7106,7 +7179,7 @@ fn float_linear(
     // Only f16 has a coopmat GEMM (`gemm_proj` stages the weight as f16 for the matrix cores);
     // an f32 prefill on a coopmat device keeps the row-tiled f32 GEMV.
     let is_gemm = is_f16 && gemm_ok && be_.caps().f16_coopmat();
-    let nc = nc_gemm_choice(be_, dt, gemm_ok);
+    let nc = nc_gemm_choice(be_, dt, gemm_ok, in_f, w_off);
     if nc.is_some() {
         check_nc_gemm_grid(dt, m, out_f)?;
     }

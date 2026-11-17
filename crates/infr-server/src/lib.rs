@@ -2828,7 +2828,7 @@ pub fn flatten_content(v: &Option<serde_json::Value>) -> String {
 }
 
 /// [`flatten_content`], keeping images: each `image_url` part becomes an
-/// [`infr_llama::media::IMAGE_MARKER`] in the text and its decoded bytes are appended to `images`,
+/// [`infr_engine::IMAGE_MARKER`] in the text and its decoded bytes are appended to `images`,
 /// so the two stay in the same order. Only `data:` URIs are accepted — the server never fetches
 /// URLs on a client's behalf. A marker typed into the text itself is removed, so a user cannot
 /// claim an image slot.

@@ -139,6 +139,7 @@ pub(crate) static SHADER_CLASSES: &[(&str, ShaderClass)] = &[
     ("native_gemv_id_multi_sg", C1),
     ("native_gemv_kq_fma", C1),
     ("native_gemv_kq_fma_mrow", C1),
+    ("native_gemm_kq_fma", C1),
     ("native_gemv_mrow", C2),
     ("native_gemv_rm", C5b),
     ("native_gemv_rm_v2", C2),

@@ -8,8 +8,8 @@ phase comes before the rest of the kernel-tuning phase (10), which needs the
 fixed reference to judge tuned values.
 
 Audited and scoped on 2026-11-17. Tags: **[read]** verified by reading,
-**[ran]** verified by running, **[I]** inferred, **[U]** unknown. Nothing is
-built yet.
+**[ran]** verified by running, **[I]** inferred, **[U]** unknown. S0 and S1 are
+built (see section 5); the rest is not.
 
 ## 0. The cause, measured
 
@@ -65,6 +65,14 @@ C runtime; `sqrt`, `round`, `floor`, `ceil`, `trunc` are exact everywhere
   `diffusion.rs`.
 - `infr-core/src/pager/shapes.rs` uses an f64 `powf` for a pager workload shape,
   not inference.
+- `infr-core/src/decode_spec.rs`: `e8m0_from_f32` takes an E8M0 exponent from
+  `f32::log2` (MXFP4 quantization); it can come from the float's bits instead.
+- `infr-metal/src/exec.rs`: ten host-side calls in the Metal backend's CPU paths
+  (`act_fn`, the short convolution's SiLU, softmaxes, the MoE router's softmax,
+  the DeltaNet gate's sigmoid, softplus and decay).
+
+The lint `crates/infr-core/tests/no_platform_libm.rs` lists every site with its
+count and is the authoritative list.
 
 `infr-gguf` has none, and tokenization has no float arithmetic that reaches
 output.
@@ -163,15 +171,15 @@ rounded `sin`/`cos` for RoPE at long context.
 
 ## 5. Slices
 
-| #   | Slice                                                                                                                                                                         | Evidence                                                                      |
-| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| S0  | An env-gated per-op output hash in the CPU executor (`INFR_CPU_OP_HASH`), kept as a debug aid; the cross-OS bisect on the cached Qwen3-0.6B case whose `per_os` hashes differ | the first op that differs on Windows against WSL (expected: layer 0's RoPE)   |
-| S1  | `infr_core::math`, the known-answer table and its generator, the exhaustive test, the grid hash on every system, the lint with today's sites allowlisted                      | known answers on every system; the exhaustive test finds none wrongly rounded |
-| S2  | Migrate every call site, empty the allowlist, re-bless the CPU goldens once (Windows natively, Linux under WSL and in CI), delete `per_os`                                    | one hash per case on both systems; per-op timings; llama.cpp distances        |
-| S3  | A Windows leg for the goldens subset; the op-level hash suite in the test matrix                                                                                              | the same hash on every CI system                                              |
-| S4  | `kernels.cpu.max_tier`, the tier-against-scalar test for every family, thread-count hashes, row-count identity for the MoE layer and attention                                | one AVX-512 machine proves every x86 tier                                     |
-| S5  | A vectorized `exp` (and `tanh`) identical to the scalar one                                                                                                                   | per-op time; exhaustive identity                                              |
-| S6  | Optional: runtime-dispatched FMA dots for baseline x86 builds, bits unchanged                                                                                                 | speed of the released build                                                   |
+| #   | Slice                                                                                                                                                                                                                            | Evidence                                                                                                                                                                                                                                                                                                                                                                                                 |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| S0  | **Done.** An env-gated per-op output hash in the CPU executor (`INFR_CPU_OP_HASH`), kept as a debug aid; the cross-OS bisect on the cached Qwen3-0.6B case whose `per_os` hashes differ                                          | **[ran]** First difference: graph 0, op 5, layer 0's `QkNormRope`, its inputs identical on both systems; 470 of graph 0's 477 ops differ after it. Ops that are a SOURCE of difference (inputs equal, output not): `QkNormRope` (96), `GatedAct`/SiLU (37), `Attention`'s softmax (7); never Linear, RmsNorm, Add, WriteKv, EmbedGather or Argmax. First differing token in graph 41 (the second prompt) |
+| S1  | **Done.** `infr_core::math`, the known-answer table and its generator, the exhaustive test, the grid hash on every system, the lint with today's sites allowlisted; slice forms of `exp`, `tanh`, `sigmoid`, `silu`, `gelu_tanh` | **[ran]** Every unary function correctly rounded on all 2^32 inputs; `powf` correctly rounded on every input tested (not proven); grid hashes identical on Windows (native, baseline) and WSL; slices identical to the scalars on all 2^32 inputs. Details and speed: [`docs/math.md`](../math.md)                                                                                                       |
+| S2  | Migrate every call site, empty the allowlist, re-bless the CPU goldens once (Windows natively, Linux under WSL and in CI), delete `per_os`                                                                                       | one hash per case on both systems; per-op timings; llama.cpp distances                                                                                                                                                                                                                                                                                                                                   |
+| S3  | A Windows leg for the goldens subset; the op-level hash suite in the test matrix                                                                                                                                                 | the same hash on every CI system                                                                                                                                                                                                                                                                                                                                                                         |
+| S4  | `kernels.cpu.max_tier`, the tier-against-scalar test for every family, thread-count hashes, row-count identity for the MoE layer and attention                                                                                   | one AVX-512 machine proves every x86 tier                                                                                                                                                                                                                                                                                                                                                                |
+| S5  | A vectorized `exp` (and `tanh`) identical to the scalar one                                                                                                                                                                      | per-op time; exhaustive identity                                                                                                                                                                                                                                                                                                                                                                         |
+| S6  | Optional: runtime-dispatched FMA dots for baseline x86 builds, bits unchanged                                                                                                                                                    | speed of the released build                                                                                                                                                                                                                                                                                                                                                                              |
 
 ## 6. GPUs against the one CPU reference
 

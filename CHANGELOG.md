@@ -43,11 +43,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - **`INFR_CPU_OP_HASH=<path>`** (`debug.cpu_op_hash`), a debugging aid: the CPU
-  backend appends one line per tensor each op reads and writes (graph and op
-  number, the op's profiler label, element count, an FNV-1a hash of the bits),
-  so two runs that should agree, such as one model on two operating systems, can
-  be diffed to the first op that does not. The CPU golden tests in
-  `infr-llama/tests/cpu_backend.rs` honour it.
+  backend appends one line per tensor each op reads and writes (backend, graph
+  and op number, the op's profiler label, element count, an FNV-1a hash of the
+  bits), so two runs that should agree, such as one model on two operating
+  systems, can be diffed to the first op that does not. Each execute's lines are
+  appended in one write under a process-wide lock, so backends sharing a file
+  never splice lines; separate processes must not share one. The CPU golden
+  tests in `infr-llama/tests/cpu_backend.rs` honour it.
 
 - **DeepSeek V4 prefills layer-major on the CPU when its experts stream from
   disk.** A sole request's prompt of more than one chunk, the first at least 256
@@ -90,17 +92,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `INFR_GEMV_*` group with their config paths — keep working as aliases with
   their old meanings.
 
-- **`infr_core::math`**: correctly rounded binary32 `exp`, `ln`, `ln_1p`,
-  `tanh`, `sin`, `cos`, `sin_cos` and `powf`, plus `sigmoid`, `silu`,
-  `gelu_tanh` and `softplus` written as the CPU backend's call sites write them.
-  Built from IEEE basic operations only (no FMA, no C runtime), so they give the
-  same bits on every operating system, CPU tier and architecture, unlike the
-  `f32` methods, which lower to the C runtime and differ in the last bit between
-  UCRT and glibc. The unary functions are verified on all 2^32 inputs against an
-  independent reference; see `docs/math.md`. Nothing uses them yet, so no output
-  changes: moving the call sites (and the one-time re-bless of the CPU goldens)
-  is the next slice of `docs/plan/11-cpu-bit-identical.md`. A new lint,
-  `crates/infr-core/tests/no_platform_libm.rs`, lists the call sites still on
+- **`infr_core::math`**: binary32 `exp`, `ln`, `ln_1p`, `tanh`, `sin`, `cos` and
+  `sin_cos`, correctly rounded on every input (each checked on all 2^32 against
+  an independent reference), and `powf`, correctly rounded on every input tested
+  (the known-answer table, a grid, and in review the whole RoPE domain and three
+  sets of 2^32 random pairs) but not proven so; plus `sigmoid`, `silu`,
+  `gelu_tanh` and `softplus` written as the CPU backend's call sites write them,
+  and slice forms (`exp_slice`, `exp_slice_to`, `exp_sub_slice`, `tanh_slice`,
+  `sigmoid_slice`, `silu_slice`, `gelu_tanh_slice`) that vectorize and equal the
+  scalar functions element for element. Every NaN result is the one `math::NAN`.
+  Built from IEEE basic operations only (no FMA, no C runtime), so the bits do
+  not depend on the C library, unlike the `f32` methods, which differ in the
+  last bit between UCRT and glibc: the grid hashes are identical on Windows
+  (native and baseline x86-64 builds) and Linux under WSL; aarch64 has been
+  compiled, and CI's macOS job is the first run there. See `docs/math.md`.
+  Nothing uses the module yet, so no output changes: moving the call sites (and
+  the one-time re-bless of the CPU goldens) is the next slice of
+  `docs/plan/11-cpu-bit-identical.md`. A new lint,
+  `crates/infr-core/tests/no_platform_libm.rs`, counts the call sites still on
   the platform functions.
 
 - **Wave64-only AMD GPUs (GCN: Polaris, Vega) run on the Vulkan backend** (issue

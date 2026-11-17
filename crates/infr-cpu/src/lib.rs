@@ -323,9 +323,9 @@ pub struct CpuBackend {
     /// Query rows one `Op::Attention` task runs for one head: [`ATTN_QUERY_BLOCK`]. A field so a
     /// test can set 1, the one-pair-per-task decomposition the blocking replaced.
     attn_query_block: usize,
-    /// How many graphs the per-op hash tap (`debug.cpu_op_hash`, [`op_hash`]) has numbered, so
-    /// each `execute` it records gets the next graph ordinal.
-    op_hash_graphs: std::sync::atomic::AtomicU64,
+    /// This backend's identity for the per-op hash tap (`debug.cpu_op_hash`, [`op_hash`]): its
+    /// backend ordinal and the number of the next graph it records.
+    op_hash: op_hash::TapCounter,
     /// A test's deliberate fault: `Op::MoeFfn` reads a bank held whole at twice its expert
     /// stride, so its upper experts slice past the bank's end inside the pool's tasks.
     #[cfg(test)]
@@ -359,7 +359,7 @@ impl CpuBackend {
             pool: std::sync::OnceLock::new(),
             cfg,
             attn_query_block: ATTN_QUERY_BLOCK,
-            op_hash_graphs: std::sync::atomic::AtomicU64::new(0),
+            op_hash: op_hash::TapCounter::default(),
             #[cfg(test)]
             double_whole_bank_stride: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1160,14 +1160,12 @@ impl Backend for CpuBackend {
         // The per-op hash tap: `None` unless `debug.cpu_op_hash` is set. An op's writes are
         // recorded at the top of the NEXT iteration (and after the loop for the last op), so an
         // arm that `continue`s out of the match is still covered.
-        let mut hash_tap = match &self.cfg.debug.cpu_op_hash {
-            Some(path) => Some(op_hash::OpHashTap::open(
-                path,
-                self.op_hash_graphs
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            )?),
-            None => None,
-        };
+        let mut hash_tap = self
+            .cfg
+            .debug
+            .cpu_op_hash
+            .as_deref()
+            .map(|path| op_hash::OpHashTap::new(path, &self.op_hash));
         let tap_hash = |vals: &[Vec<f32>], id: TensorId| -> (usize, u64) {
             if g.in_place_inputs().contains(&id) {
                 match bindings.get(id) {
@@ -1184,9 +1182,9 @@ impl Backend for CpuBackend {
         for (op_idx, op) in g.ops.iter().enumerate() {
             if let Some(tap) = hash_tap.as_mut() {
                 if let Some(prev) = op_idx.checked_sub(1) {
-                    tap.record(g, prev, &g.ops[prev], true, |id| tap_hash(&vals, id))?;
+                    tap.record(g, prev, &g.ops[prev], true, |id| tap_hash(&vals, id));
                 }
-                tap.record(g, op_idx, op, false, |id| tap_hash(&vals, id))?;
+                tap.record(g, op_idx, op, false, |id| tap_hash(&vals, id));
             }
             // Make every PAGED weight this op reads resident, and hold it resident for the op's
             // whole body. This is the one fallible point in the interpreter, which is exactly why
@@ -1945,7 +1943,7 @@ impl Backend for CpuBackend {
                                     if let Some(ff) = &ff {
                                         ang /= ff[p];
                                     }
-                                    // libm-ok(S2): platform `cos`, `sin`, moves to `infr_core::math` in S2
+                                    // libm-ok(S2) x2: platform `cos`, `sin`, moves to `infr_core::math` in S2
                                     (ang.sin() * sin_sign, ang.cos())
                                 })
                                 .collect();
@@ -2025,7 +2023,7 @@ impl Backend for CpuBackend {
                                     if let Some(ff) = &ff {
                                         ang /= ff[p];
                                     }
-                                    // libm-ok(S2): platform `cos`, `sin`, moves to `infr_core::math` in S2
+                                    // libm-ok(S2) x2: platform `cos`, `sin`, moves to `infr_core::math` in S2
                                     (ang.cos(), ang.sin())
                                 })
                                 .collect();
@@ -3099,7 +3097,7 @@ impl Backend for CpuBackend {
                                         let sp = if v > 20.0 {
                                             v
                                         } else {
-                                            // libm-ok(S2): platform `exp`, `ln`, moves to `infr_core::math` in S2
+                                            // libm-ok(S2) x2: platform `exp`, `ln`, moves to `infr_core::math` in S2
                                             (1.0_f32 + v.exp()).ln()
                                         };
                                         sp.sqrt()
@@ -3900,7 +3898,7 @@ impl Backend for CpuBackend {
                                 if let Some(ff) = &ff {
                                     ang /= ff[p];
                                 }
-                                // libm-ok(S2): platform `cos`, `sin`, moves to `infr_core::math` in S2
+                                // libm-ok(S2) x2: platform `cos`, `sin`, moves to `infr_core::math` in S2
                                 let (s, c) = (ang.sin(), ang.cos());
                                 let a = q_pe_raw[i0];
                                 let b = q_pe_raw[i1];
@@ -4307,7 +4305,7 @@ impl Backend for CpuBackend {
         }
         if let Some(mut tap) = hash_tap {
             if let Some(last) = g.ops.len().checked_sub(1) {
-                tap.record(g, last, &g.ops[last], true, |id| tap_hash(&vals, id))?;
+                tap.record(g, last, &g.ops[last], true, |id| tap_hash(&vals, id));
             }
             tap.finish()?;
         }
@@ -4629,7 +4627,7 @@ fn deltanet_scan(
             // softplus(a + dt_bias), then g = a_coef * softplus (≤ 0); decay = exp(g).
             let sp = {
                 let z = af[bb + h] + dtb[h];
-                // libm-ok(S2): platform `exp`, `ln_1p`, moves to `infr_core::math` in S2
+                // libm-ok(S2) x2: platform `exp`, `ln_1p`, moves to `infr_core::math` in S2
                 z.max(0.0) + (-z.abs()).exp().ln_1p()
             };
             // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
@@ -5838,9 +5836,9 @@ mod tests {
         run_graph(&g, &bound, dst);
     }
 
-    /// Run RmsNorm → Linear → WriteKv (into a bound f32 cache) twice under the per-op hash tap,
-    /// with the Linear weight's first element set to `w0`, and return the tap's lines.
-    fn op_hash_lines(path: &std::path::Path, w0: f32) -> Vec<String> {
+    /// Run RmsNorm → Linear → WriteKv (into a bound f32 cache) twice on a new backend under the
+    /// per-op hash tap writing to `path`, with the Linear weight's first element set to `w0`.
+    fn op_hash_run(path: &std::path::Path, w0: f32) {
         let (dim, out_f, ctx) = (8usize, 4usize, 3usize);
         let mut g = Graph::new();
         let x = g.input(TensorDesc::new(vec![dim], DType::F32));
@@ -5902,9 +5900,55 @@ mod tests {
         // first one wrote.
         be.execute(plan.as_ref(), &b).unwrap();
         be.execute(plan.as_ref(), &b).unwrap();
+    }
+
+    /// [`op_hash_run`]'s lines with the backend field (`b<n>`, which differs between backends)
+    /// dropped after checking it is the same on every line; the file is removed.
+    fn op_hash_lines(path: &std::path::Path, w0: f32) -> Vec<String> {
+        op_hash_run(path, w0);
         let text = std::fs::read_to_string(path).unwrap();
         std::fs::remove_file(path).unwrap();
-        text.lines().map(str::to_owned).collect()
+        let backends: std::collections::BTreeSet<&str> =
+            text.lines().map(|l| l.split(' ').next().unwrap()).collect();
+        assert_eq!(backends.len(), 1, "{backends:?}");
+        text.lines()
+            .map(|l| l.split_once(' ').unwrap().1.to_owned())
+            .collect()
+    }
+
+    /// Two backends tapping into one file get their own `b<n>` ordinals, and each execute's
+    /// lines arrive whole and together.
+    #[test]
+    fn op_hash_tap_tells_backends_apart() {
+        let path =
+            std::env::temp_dir().join(format!("infr-op-hash-{}-two.txt", std::process::id()));
+        if path.exists() {
+            std::fs::remove_file(&path).unwrap();
+        }
+        std::thread::scope(|s| {
+            s.spawn(|| op_hash_run(&path, -1.5));
+            s.spawn(|| op_hash_run(&path, -1.25));
+        });
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        // Two backends, two graphs each, seven lines per graph.
+        assert_eq!(lines.len(), 28, "{text}");
+        let mut blocks: Vec<(&str, &str)> = Vec::new();
+        for l in &lines {
+            let f: Vec<&str> = l.split(' ').collect();
+            assert!(
+                f.len() >= 8 && f[0].starts_with('b') && f[1].starts_with('g'),
+                "{l}"
+            );
+            let key = (f[0], f[1]);
+            if blocks.last() != Some(&key) {
+                assert!(!blocks.contains(&key), "execute {key:?} was split:\n{text}");
+                blocks.push(key);
+            }
+        }
+        let backends: std::collections::BTreeSet<&str> = blocks.iter().map(|k| k.0).collect();
+        assert_eq!((backends.len(), blocks.len()), (2, 4), "{blocks:?}");
     }
 
     /// The per-op hash tap (`debug.cpu_op_hash`) is reproducible run to run, records every op's

@@ -329,7 +329,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and `QkNormRope` from 9.1-9.4 to 7.9-8.6 ms; whole forwards 845-867 to 832-847
   ms and 450-455 to 443-448 ms. Qwen3-1.7B pp512 over six interleaved rounds:
   976-1143 t/s before, 1124-1159 after. A build for baseline x86-64 gets the
-  same: its gemma `GatedAct` went from 47.9-48.4 to 18.4-18.8 ms.
+  same: its gemma `GatedAct` went from 47.9-48.4 to 18.4-18.8 ms. RoPE frequency
+  tables are built once per backend, so a decode `QkNormRope` call went from
+  4.0-4.1 to 2.3-2.4 µs on gemma-3-1b and from 3.3 to 2.5 µs on Qwen3-0.6B.
+
+- **Qwen3.5 decodes about 15% faster on the CPU.** The DeltaNet scan updates
+  each head's recurrent state in place instead of scanning a copy and copying
+  every head back, so a decode `DeltaNet` call on Qwen3.5-0.8B went from 113-118
+  to 40-41 µs and tg64 from 56.2-56.9 to 64.7-65.3 t/s (four interleaved rounds
+  against the code before this change).
 
 - **A GPU session with no room left for any context fails with the numbers.**
   When the device's free memory after the weights cannot hold even a one-token

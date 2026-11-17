@@ -408,3 +408,35 @@ autovectorized loops). `infr bench` pp512 on Qwen3-1.7B native, six interleaved
 rounds of three reps with no other build or test running: 976-1143 t/s before,
 1124-1159 after. Decode (tg128) moved within its noise on both models:
 gemma-3-1b native 37.9-39.4 before, 37.2-39.4 after, six interleaved rounds.
+
+**Decode RoPE, and the RoPE frequency cache.** S2 first computed the RoPE
+frequencies (one correctly rounded `powf` per pair, about 22 ns against the C
+runtime's 4) once per op, which a one-row decode op never amortizes: per-call
+`QkNormRope` time went up. The CPU backend now keeps one table per distinct
+`(theta, rope_dim)` for its whole life (`CpuBackend::rope_freqs`), so decode
+pays no `powf` at all. Per-call decode time (`INFR_PROF_OPS=1`,
+`infr bench -p 0 -n 64 -r 2`, native builds, four interleaved rounds, no other
+build or test process running; total CPU 33% on average including the bench's
+own threads), in µs:
+
+| Model, op                  | `origin/main` | S2 before the cache | with the cache |
+| -------------------------- | ------------: | ------------------: | -------------: |
+| gemma-3-1b, `QkNormRope`   |       4.0-4.1 |             5.6-5.7 |        2.3-2.4 |
+| Qwen3-0.6B, `QkNormRope`   |           3.3 |             4.0-4.1 |            2.5 |
+| Qwen3.5-0.8B, `QkNormRope` |       3.3-3.5 |             3.6-3.9 |        2.7-2.9 |
+| Qwen3.5-0.8B, `DeltaNet`   |   112.9-117.5 |         121.3-124.8 |      40.3-41.4 |
+
+`DeltaNet` was 5-10% slower per decode call on the S2 branch than on
+`origin/main` (reproduced over 6 and 5 interleaved rounds at tg128). Moving the
+three gate functions out of the per-head task changed nothing (128.7-133.7 µs
+against 129.6-133.1 without the move, same rounds), so the gate math was not the
+cause, and no codegen cause was found. The call was dominated by copying the
+recurrent state, not by arithmetic: each head scanned a copy of its state and a
+serial gather copied every head back, two copies of the whole state per call.
+`deltanet_scan` now scans each head's state slice where it lies, the same
+operations in the same order (its bit-identity test against the serial reference
+passes), and a decode call takes about a third of the time. Qwen3.5-0.8B tg64
+went from 56.2-56.9 t/s (`origin/main`) and 57.2-58.2 (S2 before) to 64.7-65.3.
+gemma-3-1b tg64 in the same rounds: 35.5-36.6, 39.2-39.7 and 37.4-38.0; the last
+build's `Linear m=1 1152x6912 Q5_0` took 280-282 µs per call against 249-259 in
+the other two, a kernel no change here touches (see `docs/backlog.md`).

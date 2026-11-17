@@ -63,6 +63,10 @@ use repack::{Q4kPack, RepackCacheState};
 /// Dequantized-weight cache: `(buffer address, byte-len, dtype) -> Arc<f32>`. See `weight_cache`.
 type WeightCache = HashMap<(u64, DType), Arc<Vec<f32>>>;
 
+/// RoPE frequency tables ([`math::rope_freqs`]) keyed by `(theta.to_bits(), rope_dim)`, the only
+/// inputs a table depends on (a per-pair divisor is applied per angle, not baked in).
+type RopeFreqCache = HashMap<(u32, usize), Arc<[f32]>>;
+
 // ─── Q8_0 integer dot kernels ─────────────────────────────────────────────────
 //
 // Q8_0 weight layout: 34 bytes / 32 elements.  Bytes 0..2 = f16 scale `d`; bytes 2..34 = i8 qs.
@@ -296,6 +300,11 @@ pub struct CpuBackend {
     /// a different weight, and an address key would then return the previous model's f32 (see
     /// [`CpuBuffer::uid`]).
     weight_cache: Mutex<WeightCache>,
+    /// RoPE frequency tables, built once per distinct `(theta, rope_dim)` for the backend's life:
+    /// each entry costs one correctly rounded `powf` per pair, which a one-row decode op would
+    /// otherwise pay on every call. A model has a table per distinct base (gemma-3: the local
+    /// and the global one), so this stays a handful of entries.
+    rope_freq_cache: Mutex<RopeFreqCache>,
     /// (layer, expert)-granular repack cache for the interleaved-x8 Q4_K GEMM ([`Q4kPack`]):
     /// keyed by the expert weight slice's [`repack::PackKey`] (same identity argument as
     /// `weight_cache`, extended to a slice WITHIN a buffer). ggml pays
@@ -368,6 +377,7 @@ impl CpuBackend {
         }
         Self {
             weight_cache: Mutex::default(),
+            rope_freq_cache: Mutex::default(),
             repack_cache: Mutex::default(),
             pool: std::sync::OnceLock::new(),
             cfg,
@@ -702,6 +712,16 @@ impl CpuBackend {
         let w = Arc::new(bytes_to_f32(bytes, key.1));
         self.weight_cache.lock().unwrap().insert(key, w.clone());
         w
+    }
+
+    /// [`math::rope_freqs`]`(theta, rope_dim)` from `rope_freq_cache`, built on the first use.
+    fn rope_freqs(&self, theta: f32, rope_dim: usize) -> Arc<[f32]> {
+        self.rope_freq_cache
+            .lock()
+            .unwrap()
+            .entry((theta.to_bits(), rope_dim))
+            .or_insert_with(|| math::rope_freqs(theta, rope_dim).into())
+            .clone()
     }
 }
 
@@ -1941,7 +1961,7 @@ impl Backend for CpuBackend {
                     // it is computed once per op; its angle depends on the row's position and the
                     // pair index, never the head, so each row computes its (sin, cos) table once
                     // and every head reuses it — the same values the per-head form computed.
-                    let freqs = math::rope_freqs(theta, rd);
+                    let freqs = self.rope_freqs(theta, rd);
                     self.pool().for_chunks_mut(
                         &mut out[..rows * nh * hd],
                         nh * hd,
@@ -2022,7 +2042,7 @@ impl Backend for CpuBackend {
                     // (computed once per op); within a row the RoPE angles depend only on the
                     // position (not the head), so precompute (cos,sin) per rope index ONCE per row
                     // and reuse across all heads — the sin/cos were the bulk and were redone nh×.
-                    let freqs = math::rope_freqs(theta, rd);
+                    let freqs = self.rope_freqs(theta, rd);
                     self.pool()
                         .for_chunks_mut(&mut out, nh * hd, 1, &|r, orow| {
                             let p0 = pos[r];
@@ -3857,7 +3877,7 @@ impl Backend for CpuBackend {
                         AttnMask::Canvas { lo } => (0usize, Some(lo)),
                     };
                     let hf = qkr / 2; // rope pair count
-                    let mla_freqs = math::rope_freqs(theta, qkr);
+                    let mla_freqs = self.rope_freqs(theta, qkr);
                     let ff = freq_factors.map(|f| vals[f.0 as usize].clone());
                     // deepseek32's top-k score mask `[rows, kv_len]` (0 on the selected keys,
                     // -inf elsewhere) — indexed by KEY POSITION, not by the ring row. `None` on
@@ -4577,7 +4597,11 @@ fn causal_conv<R: ConvRows>(
 /// one task. Returns `out` [rows, nv*vd]; mutates `st` [nv, kd, vd] in place. Bit-identical to the
 /// old serial nest: per head the float ops (l2 norm, normalize, beta, softplus/decay, S*=decay,
 /// kv=kᵀS, delta, S+=k⊗delta, out=qᵀS) run in the SAME order — heads never interacted, so
-/// cross-head order never mattered, and `pool.collect` is order-preserving pure scheduling.
+/// cross-head order never mattered, and `pool.for_chunks_mut` is pure scheduling.
+///
+/// Each task scans its head's state slice where it lies. (It used to scan a copy and a serial
+/// gather copied every head back: two copies of the whole state per call, which dominated a
+/// one-row decode call.)
 #[allow(clippy::too_many_arguments)]
 fn deltanet_scan(
     pool: &pool::SpinPool,
@@ -4598,14 +4622,16 @@ fn deltanet_scan(
 ) -> Vec<f32> {
     let qscale = 1.0 / (kd as f32).sqrt();
     let l2 = |slice: &[f32]| -> f32 { (slice.iter().map(|x| x * x).sum::<f32>() + eps).sqrt() };
-    // Read the incoming state immutably inside the closure; `st` is only touched mutably AFTER
-    // `collect` returns (NLL ends this shared borrow there), so two tasks never `&mut` the state.
-    let st_ro: &[f32] = st;
-    // One task per value head: snapshot the head's state, run its full sequential t-scan into a
-    // local output buffer, and return both for the serial gather below.
-    let per_head: Vec<(Vec<f32>, Vec<f32>)> = pool.collect(nv, &|h| {
-        let mut sh = st_ro[h * kd * vd..(h + 1) * kd * vd].to_vec(); // [kd, vd]
-        let mut oh_all = vec![0f32; rr * vd];
+    // Per-head outputs, [nv, rows, vd]: each head's rows contiguous, so a task owns one run.
+    let mut out_h = vec![0f32; nv * rr * vd];
+    // One work item per value head: its state slice [kd, vd] and its output run [rows, vd],
+    // disjoint from every other head's, so the pool hands each task exactly one.
+    let mut work: Vec<(&mut [f32], &mut [f32])> = st[..nv * kd * vd]
+        .chunks_mut(kd * vd)
+        .zip(out_h.chunks_mut(rr * vd))
+        .collect();
+    pool.for_chunks_mut(&mut work, 1, 1, &|h, item| {
+        let (sh, oh_all) = &mut item[0];
         // GQA: q/k heads TILED to nv value heads → v-head h uses q/k head h % nk.
         let kh_idx = h % nk;
         // Sequential scan over the rows, carrying this head's state S across tokens.
@@ -4657,15 +4683,19 @@ fn deltanet_scan(
                 }
             }
         }
-        (oh_all, sh)
     });
-    // Serial gather: copy each head's final state back, and scatter its per-row output columns.
+    drop(work);
+    if rr == 1 {
+        // [nv, 1, vd] is already [1, nv*vd].
+        return out_h;
+    }
+    // Scatter each head's rows into the [rows, nv*vd] layout.
     let mut out = vec![0f32; rr * nv * vd];
-    for (h, (oh_all, sh)) in per_head.into_iter().enumerate() {
-        st[h * kd * vd..(h + 1) * kd * vd].copy_from_slice(&sh);
+    for h in 0..nv {
         for t in 0..rr {
             let dst = t * nv * vd + h * vd;
-            out[dst..dst + vd].copy_from_slice(&oh_all[t * vd..t * vd + vd]);
+            let src = (h * rr + t) * vd;
+            out[dst..dst + vd].copy_from_slice(&out_h[src..src + vd]);
         }
     }
     out
@@ -5340,6 +5370,21 @@ mod tests {
         assert_eq!(small.repack_budget_bytes(), 3 * 1024 * 1024);
         // Independent values, live at the same time — the thing a process-wide env read could not do.
         assert_eq!(dflt.repack_budget_bytes(), 4096 * 1024 * 1024);
+    }
+
+    /// One RoPE frequency table per `(theta, rope_dim)` for the backend's life, holding exactly
+    /// [`math::rope_freqs`]' values. Turns red if `rope_freqs` builds a fresh table per call (the
+    /// per-op `powf` cost a one-row decode never amortizes).
+    #[test]
+    fn rope_freqs_are_built_once_per_shape() {
+        let be = CpuBackend::new_with(Arc::new(Config::default()));
+        let a = be.rope_freqs(10_000.0, 128);
+        assert_eq!(&a[..], &math::rope_freqs(10_000.0, 128)[..]);
+        assert!(Arc::ptr_eq(&a, &be.rope_freqs(10_000.0, 128)));
+        let other_theta = be.rope_freqs(1_000_000.0, 128);
+        assert_eq!(&other_theta[..], &math::rope_freqs(1_000_000.0, 128)[..]);
+        assert!(!Arc::ptr_eq(&a, &other_theta));
+        assert_eq!(be.rope_freqs(10_000.0, 64).len(), 32);
     }
 
     /// The packed prefill Linear writes the row-major output directly, with an `out_f % 8` tail

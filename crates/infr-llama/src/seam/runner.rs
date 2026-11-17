@@ -499,6 +499,7 @@ pub(crate) fn generate_dense_backend(
         h_out,
         denoise_req,
         req,
+        None, // prefill_logits
     )
 }
 
@@ -563,6 +564,14 @@ pub(crate) fn generate_dense_backend_bound(
     // resolves purely from the env, no abort latch is polled, and no gate is taken — byte-for-byte
     // the pre-existing behavior.
     req: Option<&crate::sampling::RequestCtx>,
+    // Teacher-forced scoring (`crate::tolerance`): when `Some`, every ORDINARY batched-prefill
+    // chunk also runs the LM head over all of its rows and appends their logits here, in position
+    // order: `[(prompt.len() - 1 - start) * vocab]`, positions `start..prompt.len() - 1`, `start`
+    // being the reused prefix (0 on a cold state). The layer ops are the production prefill's
+    // unchanged; only the head is added. Left empty when the prompt takes no batched prefill (a
+    // suffix of two tokens or fewer, or a model without one). `None` everywhere but that harness:
+    // no head, no buffer, no download.
+    mut prefill_logits: Option<&mut Vec<f32>>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
@@ -5929,10 +5938,17 @@ pub(crate) fn generate_dense_backend_bound(
                     // never taps `h`. The MTP catch-up driver needs `h` for EVERY prefill row; wiring
                     // that requires this path to carry `logits_rows == pf_m` on demand, which Phase 2
                     // will add alongside the actual head forward.
+                    // The teacher-forced harness's head (see `prefill_logits`), on the span that
+                    // ends the stack: a partial span has no finished residual to run it on.
+                    let head_rows = if prefill_logits.is_some() && span.end == c.n_layer {
+                        ch.m
+                    } else {
+                        0
+                    };
                     let (mut pf_g, pf_h) = build(
                         ch.m,
                         cstart,
-                        0,
+                        head_rows,
                         false,
                         None,
                         false,
@@ -5991,13 +6007,34 @@ pub(crate) fn generate_dense_backend_bound(
                         &step_bufs[..],
                         &wbufs[..],
                     );
-                    debug_assert!(
-                        pf_h.logits.is_none(),
-                        "headless prefill build has no logits"
+                    debug_assert_eq!(
+                        pf_h.logits.is_some(),
+                        head_rows > 0,
+                        "a prefill build has logits exactly when the harness asked for them"
                     );
+                    let pf_logits_buf = match pf_h.logits {
+                        Some(lg) => {
+                            let buf = be
+                                .alloc(head_rows * c.vocab * 4, BufferUsage::Staging)
+                                .map_err(|e| anyhow!("{e}"))?;
+                            Some((lg, buf))
+                        }
+                        None => None,
+                    };
+                    if let Some((lg, buf)) = &pf_logits_buf {
+                        pf_b.bind(*lg, buf.as_ref());
+                    }
                     *written_end = (*written_end).max(cstart + ch.m);
                     be.execute(pf_plan.as_ref(), &pf_b)
                         .map_err(|e| anyhow!("{e}"))?;
+                    if let (Some(out), Some((_, buf))) =
+                        (prefill_logits.as_deref_mut(), &pf_logits_buf)
+                    {
+                        let at = out.len();
+                        out.resize(at + head_rows * c.vocab, 0.0);
+                        be.download(buf.as_ref(), bytemuck::cast_slice_mut(&mut out[at..]))
+                            .map_err(|e| anyhow!("{e}"))?;
+                    }
                     // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
                     // build, plan compile, and execute (record + submit + GPU) — where a small-batch
                     // chunk's fixed cost lives decides whether to attack recording or kernels. `l` is

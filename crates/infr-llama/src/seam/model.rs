@@ -1206,6 +1206,49 @@ impl SeamModel {
         )
     }
 
+    /// Teacher-forced logits (see `crate::tolerance`): `prompt` through a fresh backend `on`,
+    /// then `n_steps` decode steps, each feeding the token `next(step, row)` picks from the row
+    /// just produced, with the logits captured at every position — the batched prefill's rows
+    /// and each decode step's. `edit` adjusts a copy of this model's engine configuration for the
+    /// run (a prefill chunk height, a tuning switch, a KV format), so one loaded model serves
+    /// every configuration a comparison needs.
+    pub fn forced_logits(
+        &self,
+        on: crate::seam::ForcedOn,
+        edit: impl FnOnce(&mut crate::EngineConfig),
+        prompt: &[u32],
+        n_steps: usize,
+        next: impl FnMut(usize, &[f32]) -> u32,
+    ) -> Result<crate::seam::ForcedLogits> {
+        let mut ec = (*self.ecfg).clone();
+        edit(&mut ec);
+        let ec = std::sync::Arc::new(ec);
+        let (g, c, embd, ple) = (
+            &self.gguf,
+            &self.cfg,
+            self.embd(),
+            self.per_layer_embd.as_ref(),
+        );
+        match on {
+            crate::seam::ForcedOn::CpuReference | crate::seam::ForcedOn::Cpu => {
+                crate::seam::forced_run_cpu(
+                    on == crate::seam::ForcedOn::CpuReference,
+                    g,
+                    c,
+                    &ec,
+                    embd,
+                    ple,
+                    prompt,
+                    n_steps,
+                    next,
+                )
+            }
+            crate::seam::ForcedOn::Vulkan => {
+                crate::seam::forced_run_vulkan(g, c, &ec, embd, ple, prompt, n_steps, next)
+            }
+        }
+    }
+
     /// Open a Phase-2 DiffusionGemma denoise session on the CPU reference backend (see
     /// `docs/diffusion-gemma.md`): [`prefill`](DiffusionGemmaCpuSession::prefill) causally
     /// prefills the prompt ONCE (encoder scalars, KV rows `0..P`), then repeated

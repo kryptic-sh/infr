@@ -18,9 +18,14 @@ pub fn force_wave64() -> bool {
     Config::load_from_layers(&[env]).kernels.vulkan.force_wave64
 }
 
-/// Apply the GPU-path knobs of the test environment to a config a helper built by hand.
+/// Apply the GPU-path knobs of the test environment to a config a helper built by hand: the forced
+/// wave64 path, and `INFR_TUNE_NO_ROWS` (`kernels.vulkan.tuning.rows`), which runs every tuning
+/// parameter at its generic default, so a run with it set tests the kernels a device with no table
+/// row gets.
 pub fn honour_env(cfg: &mut Config) {
-    cfg.kernels.vulkan.force_wave64 = force_wave64();
+    let env = Config::load_from_layers(&[ConfigLayer::env().expect("test environment config")]);
+    cfg.kernels.vulkan.force_wave64 = env.kernels.vulkan.force_wave64;
+    cfg.kernels.vulkan.tuning.rows = env.kernels.vulkan.tuning.rows;
 }
 
 /// A backend for a test that skips when there is none: `Some` on success; on failure, `None` (the

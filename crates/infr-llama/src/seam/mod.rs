@@ -672,6 +672,7 @@ pub(crate) fn generate_dense_cpu_mode(
             None, // h_out
             None, // denoise_req
             req,
+            None, // prefill_logits
         )
     };
     // A cold init that got as far as building `state` left the bound weights in it, whole, even
@@ -4294,6 +4295,205 @@ pub(crate) fn verify_rows_vulkan(
         None,
     )?;
     Ok(logits)
+}
+
+/// The backend a teacher-forced run drives ([`crate::SeamModel::forced_logits`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForcedOn {
+    /// The CPU backend in reference mode (`kernels.cpu.reference`: quantized weights decoded to
+    /// f32 and dotted in f32, no int8 activations).
+    CpuReference,
+    /// The production CPU backend.
+    Cpu,
+    /// The Vulkan backend on the engine configuration's device.
+    Vulkan,
+}
+
+/// What a teacher-forced run produced: the logits at every position it scored, in position
+/// order. See [`crate::SeamModel::forced_logits`].
+#[derive(Clone, Debug)]
+pub struct ForcedLogits {
+    /// The scored positions; row `r` of `logits` is the next-token distribution after
+    /// `seq[..=positions[r]]`.
+    pub positions: Vec<usize>,
+    /// `[positions.len() * vocab]` raw logits (post-softcap, pre-softmax).
+    pub logits: Vec<f32>,
+    pub vocab: usize,
+    /// How many of the leading rows came from the batched prefill; the rest came from one decode
+    /// step each.
+    pub prefill_rows: usize,
+    /// The whole sequence the run fed: the prompt, then each forced token.
+    pub seq: Vec<u32>,
+}
+
+/// Drive `prompt` and then `n_steps` forced tokens through `be`, capturing the logits at every
+/// position, on the production paths: one ORDINARY batched prefill of `prompt[..len-1]` (chunked
+/// at the engine's `device.ubatch`; the LM head is added over its rows through
+/// `generate_dense_backend_bound`'s `prefill_logits`, nothing else changes), then one per-token
+/// decode step per position from `len-1` on, each a warm call on the same session that feeds
+/// exactly the one new token, so it reads KV written by the prefill and by every earlier decode
+/// step. `next(step, row)` picks the token fed after each decode row: the reference's greedy
+/// argmax, or the reference's recorded token when the backend under test is forced along it.
+///
+/// The decode step is the per-token path (the record-once replay where the backend has one); a
+/// chained decode runs the same graph several steps per submit and is not exercised, since
+/// reading every step's logits back is what forcing needs.
+///
+/// A model whose prompt takes no batched prefill (MoE without the batched kernels, gemma-4 E2B)
+/// returns no prefill rows; its prompt positions are not scored.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forced_run(
+    be: &dyn Backend,
+    bind_weight: &BindWeight,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &EngineConfig,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    n_steps: usize,
+    mut next: impl FnMut(usize, &[f32]) -> u32,
+) -> AResult<ForcedLogits> {
+    if prompt.len() < 4 {
+        return Err(anyhow!(
+            "a forced run needs a prompt of at least 4 tokens for a batched prefill, got {}",
+            prompt.len()
+        ));
+    }
+    let want_ctx = prompt.len() + n_steps + 2;
+    let mut state = None;
+    let mut pf = Vec::new();
+    runner::generate_dense_backend_bound(
+        None,
+        be,
+        bind_weight,
+        g,
+        cfg,
+        ec,
+        token_embd,
+        ple,
+        prompt,
+        0,
+        |_| {},
+        &mut state,
+        want_ctx,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(&mut pf),
+    )?;
+    let vocab = cfg.vocab;
+    if !pf.len().is_multiple_of(vocab) {
+        return Err(anyhow!("prefill logits are not whole rows of {vocab}"));
+    }
+    let prefill_rows = pf.len() / vocab;
+    if prefill_rows != 0 && prefill_rows != prompt.len() - 1 {
+        return Err(anyhow!(
+            "the batched prefill returned {prefill_rows} rows for a {}-token prompt",
+            prompt.len()
+        ));
+    }
+    let mut positions: Vec<usize> = (0..prefill_rows).collect();
+    let mut logits = pf;
+    let mut seq = prompt.to_vec();
+    for step in 0..n_steps {
+        let mut row = Vec::new();
+        let (_, stats) = runner::generate_dense_backend(
+            be,
+            bind_weight,
+            g,
+            cfg,
+            ec,
+            token_embd,
+            ple,
+            &seq,
+            1,
+            |_| {},
+            &mut state,
+            want_ctx,
+            None,
+            None,
+            None,
+            Some(&mut row),
+            None,
+            None,
+            None,
+        )?;
+        if row.len() != vocab {
+            return Err(anyhow!(
+                "decode step {step} returned {} logits, not {vocab}",
+                row.len()
+            ));
+        }
+        // A step that re-prefilled the sequence would score the prefill again, not the decode
+        // path reading the session's KV.
+        if (stats.n_cached, stats.n_prompt) != (seq.len() - 1, 1) {
+            return Err(anyhow!(
+                "decode step {step} reused {} of {} tokens and fed {}, not exactly the new one",
+                stats.n_cached,
+                seq.len(),
+                stats.n_prompt
+            ));
+        }
+        positions.push(seq.len() - 1);
+        seq.push(next(step, &row));
+        logits.extend_from_slice(&row);
+    }
+    Ok(ForcedLogits {
+        positions,
+        logits,
+        vocab,
+        prefill_rows,
+        seq,
+    })
+}
+
+/// [`forced_run`] on a fresh CPU backend (`reference` picks `kernels.cpu.reference`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forced_run_cpu(
+    reference: bool,
+    g: &Gguf,
+    cfg: &Config,
+    ec: &std::sync::Arc<EngineConfig>,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    n_steps: usize,
+    next: impl FnMut(usize, &[f32]) -> u32,
+) -> AResult<ForcedLogits> {
+    let be = if reference {
+        CpuBackend::reference_with(ec.clone())
+    } else {
+        CpuBackend::new_with(ec.clone())
+    };
+    let bind = cpu_upload_bind(&be);
+    forced_run(
+        &be, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, next,
+    )
+}
+
+/// [`forced_run`] on a fresh Vulkan backend for `ec`'s device.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forced_run_vulkan(
+    g: &Gguf,
+    cfg: &Config,
+    ec: &std::sync::Arc<EngineConfig>,
+    token_embd: TokenEmbd<'_>,
+    ple: Option<&PerLayerEmbd>,
+    prompt: &[u32],
+    n_steps: usize,
+    next: impl FnMut(usize, &[f32]) -> u32,
+) -> AResult<ForcedLogits> {
+    let vk = infr_vulkan::VulkanBackend::new_with(ec.clone())
+        .map_err(|e| anyhow!("vulkan init: {e}"))?;
+    let bind = vulkan_upload_bind(&vk);
+    forced_run(
+        &vk, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, next,
+    )
 }
 
 /// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it

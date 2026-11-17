@@ -5,9 +5,10 @@
 //! build's own target ([`Tier::Baseline`]) and, on x86-64, again inside functions carrying
 //! `#[target_feature(enable = ...)]` for AVX2 and AVX-512, so a binary built for baseline x86-64
 //! (the released binaries, CI) still runs four or eight binary64 lanes on a CPU that has them.
-//! The first call picks the widest tier the CPU supports; [`set_tier`] chooses one instead (the
-//! `kernels.cpu.math_tier` setting, which every CPU backend applies when it is built). The
-//! active tier is process-wide: one setting for every thread and every backend.
+//! They run at [`crate::simd::active`]'s tier: the widest the CPU supports, or a narrower one
+//! under the `kernels.cpu.max_tier` ceiling, which every CPU backend applies when it is built
+//! ([`crate::simd::set_max`]). The active tier is process-wide: one setting for every thread and
+//! every backend.
 //!
 //! **Why every tier gives the same bits.** The tiers are the SAME Rust source, so they perform
 //! the same IEEE 754 operations in the same order on each element; vectorizing only changes how
@@ -19,8 +20,6 @@
 //! `mul_add`, which `infr_core::math` never calls. `tests/math.rs` checks every tier the CPU
 //! supports against the scalar functions on a dense grid in every test run, and on all `2^32`
 //! inputs in an ignored test; a contraction would make them fail.
-
-use std::sync::atomic::{AtomicU8, Ordering};
 
 use super::exp::{exp_lane, tanh_lane};
 use super::{gelu_tanh_arg, gelu_tanh_finish, sigmoid_finish, silu_finish};
@@ -43,7 +42,7 @@ impl Tier {
     /// Every tier, narrowest first.
     pub const ALL: [Tier; 3] = [Tier::Baseline, Tier::Avx2, Tier::Avx512];
 
-    /// The tier's name as `kernels.cpu.math_tier` spells it.
+    /// The tier's name.
     pub fn name(self) -> &'static str {
         match self {
             Tier::Baseline => "baseline",
@@ -318,56 +317,10 @@ pub fn slice_fns(tier: Tier) -> Option<&'static SliceFns> {
     }
 }
 
-/// The active tier, as `index + 1` into [`Tier::ALL`]; 0 until the first call resolves it.
-static ACTIVE: AtomicU8 = AtomicU8::new(0);
-
-fn encode(t: Tier) -> u8 {
-    Tier::ALL.iter().position(|&a| a == t).expect("a tier") as u8 + 1
-}
-
-fn decode(n: u8) -> Tier {
-    Tier::ALL[n as usize - 1]
-}
-
-/// The tier the slice functions run: the one [`set_tier`] last chose, else [`Tier::best`],
-/// installed on first use.
+/// The tier the slice functions run: [`crate::simd::active`]'s ([`crate::simd::SimdTier::math`]),
+/// so `kernels.cpu.max_tier` caps them along with the CPU backend's kernels.
 pub fn tier() -> Tier {
-    match ACTIVE.load(Ordering::Relaxed) {
-        0 => install_first(Tier::best()),
-        n => decode(n),
-    }
-}
-
-/// Install `auto` as the active tier only if nothing is active yet, and return the active tier:
-/// a first use racing a [`set_tier`] must not overwrite the tier that call chose.
-fn install_first(auto: Tier) -> Tier {
-    match ACTIVE.compare_exchange(0, encode(auto), Ordering::Relaxed, Ordering::Relaxed) {
-        Ok(_) => auto,
-        Err(n) => decode(n),
-    }
-}
-
-/// Run every slice function at `tier` from now on, or at [`Tier::best`] for `None`. This is
-/// the `kernels.cpu.math_tier` debug setting, and it is process-wide: the last call wins for
-/// every thread and every backend. Only speed is at stake; the result bits are the same at
-/// every tier.
-///
-/// # Errors
-/// If this CPU cannot run `tier`; the active tier is then unchanged.
-pub fn set_tier(tier: Option<Tier>) -> Result<(), String> {
-    let tier = match tier {
-        None => Tier::best(),
-        Some(t) if t.supported() => t,
-        Some(t) => {
-            return Err(format!(
-                "math tier `{}` is not supported by this CPU (best: `{}`)",
-                t.name(),
-                Tier::best().name()
-            ))
-        }
-    };
-    ACTIVE.store(encode(tier), Ordering::Relaxed);
-    Ok(())
+    crate::simd::active().math()
 }
 
 #[inline]
@@ -413,22 +366,4 @@ pub fn silu_slice(xs: &mut [f32]) {
 /// `xs[i] = gelu_tanh(xs[i])`.
 pub fn gelu_tanh_slice(xs: &mut [f32]) {
     (active().gelu_tanh)(xs)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A first use that lost the race to [`set_tier`] keeps the tier `set_tier` chose. Turns red
-    /// if `install_first` stores unconditionally (the race the compare-exchange closes).
-    #[test]
-    fn first_use_never_overwrites_a_chosen_tier() {
-        set_tier(Some(Tier::Baseline)).unwrap();
-        // A first use that read 0 before `set_tier` ran, now installing the auto tier.
-        let auto = Tier::ALL[Tier::ALL.len() - 1];
-        assert_eq!(install_first(auto), Tier::Baseline);
-        assert_eq!(tier(), Tier::Baseline);
-        set_tier(None).unwrap();
-        assert_eq!(tier(), Tier::best());
-    }
 }

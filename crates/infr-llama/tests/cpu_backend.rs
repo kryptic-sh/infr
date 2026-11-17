@@ -171,15 +171,15 @@ fn model_cfg(
 /// (`INFR_DEV`), so a box with more than one (a dGPU beside an iGPU) can test either (unset keeps
 /// the first-discrete default); `INFR_FORCE_WAVE64`, so the wave64 path AMD GCN takes can be
 /// scored on an RDNA card; `INFR_CPU_OP_HASH`, so a CPU golden that differs between two
-/// systems can be diffed op by op (`debug.cpu_op_hash`); and `INFR_CPU_MATH_TIER`, so the goldens
-/// can be run with the math slices at each SIMD tier (`kernels.cpu.math_tier`).
+/// systems can be diffed op by op (`debug.cpu_op_hash`); and `INFR_CPU_MAX_TIER`, so the goldens
+/// can be run with the kernels and math slices capped at each SIMD tier (`kernels.cpu.max_tier`).
 fn env_cfg() -> infr_llama::EngineConfig {
     let mut cfg = infr_llama::EngineConfig::default();
     cfg.device.dev = std::env::var("INFR_DEV").ok();
     cfg.debug.cpu_op_hash = std::env::var_os("INFR_CPU_OP_HASH").map(PathBuf::from);
-    cfg.kernels.cpu.math_tier = std::env::var("INFR_CPU_MATH_TIER")
+    cfg.kernels.cpu.max_tier = std::env::var("INFR_CPU_MAX_TIER")
         .ok()
-        .map(|t| infr_core::math::Tier::parse(&t).expect("INFR_CPU_MATH_TIER: a tier name"));
+        .map(|t| infr_core::simd::SimdTier::parse(&t).expect("INFR_CPU_MAX_TIER: a tier name"));
     infr_testkit::honour_env(&mut cfg);
     cfg
 }

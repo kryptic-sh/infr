@@ -131,19 +131,21 @@ operations per element in the same order, so they give the same bits by
 construction; the exhaustive tier-identity tests below would fail if a tier
 contracted or reordered anything.
 
-**Forcing a tier.** `kernels.cpu.math_tier` (`INFR_CPU_MATH_TIER`: `baseline`,
-`avx2`, `avx512`) makes every slice run at that tier. It is a process-wide debug
-switch: every CPU backend applies its value when it is built (`math::set_tier`;
-unset means the widest tier), so the backend built last decides for every
-backend in the process, and a backend built without the setting puts the process
-back on the widest tier rather than inheriting an earlier one's debug setting. A
-misspelt name is a configuration error at load, from the file, `--set` or the
-environment alike; a tier the CPU lacks makes the backend panic with the reason
-when it is built. It changes only speed; it exists so the two-lane path every
-aarch64 machine and every pre-AVX2 x86 CPU runs can be measured and tested on a
-machine with wider ones. In a `target-cpu=native` build `baseline` is the native
-code, so a baseline measurement needs a baseline build
-(`RUSTFLAGS="-C target-cpu=x86-64"`).
+**Capping the tier.** The slices run at `infr_core::simd::active`'s tier, the
+one every SIMD dispatch in the CPU backend asks too: the widest the CPU has,
+under the ceiling `kernels.cpu.max_tier` (`INFR_CPU_MAX_TIER`: `scalar`, `avx2`,
+`avx512`, `avx512vnni`). The slices have no VNNI form, so `avx512vnni` runs
+their AVX-512 loops, and `scalar` their baseline ones. It is a process-wide
+debug switch: every CPU backend applies its value when it is built
+(`simd::set_max`; unset means no ceiling), so the backend built last decides for
+every backend in the process, and a backend built without the setting lifts an
+earlier one's ceiling rather than inheriting it. A ceiling above what the CPU
+has runs the CPU's widest tier. A misspelt name is a configuration error at
+load, from the file, `--set` or the environment alike. It changes only speed; it
+exists so the narrow paths every aarch64 machine and every pre-AVX2 x86 CPU runs
+can be measured and tested on a machine with wider ones. In a
+`target-cpu=native` build `baseline` is the native code, so a baseline
+measurement needs a baseline build (`RUSTFLAGS="-C target-cpu=x86-64"`).
 
 **The two-lane path.** With two binary64 lanes and no gather, the loop the
 compiler vectorized was slower than the C runtime's scalar `expf` (1.77 against
@@ -249,8 +251,9 @@ All in `crates/infr-core/tests/math.rs`:
   and `exhaustive_slices_equal_scalars` (ignored, every binary32 input), each at
   every tier the CPU supports (and the active one): they find the supported
   tiers independently of the module, assert they ran each one, and print the
-  tiers they skipped. `tier_switch` checks the names and that an unsupported
-  tier is refused.
+  tiers they skipped. `tier_switch` checks the names and that under each
+  `kernels.cpu.max_tier` ceiling the slices run the narrower of it and the CPU's
+  widest tier.
 - `platform_libm_differences`, `bench_against_std` (ignored): information only.
 
 Run them:
@@ -431,8 +434,9 @@ the NEON path, not measured.
 
 **What it costs a forward** (per-op profile, `INFR_PROF_OPS=1`, one pp512
 forward of each warm rep, two per build, 16 threads, Windows at 1-3% load; the
-same binaries interleaved; "forced" is the baseline build with
-`INFR_CPU_MATH_TIER=baseline`, the no-wide-path case), in ms:
+same binaries interleaved; "forced" is the baseline build with the math slices
+forced to their baseline tier, the no-wide-path case, by the switch
+`kernels.cpu.max_tier` has since replaced), in ms:
 
 | Model, build                | `GatedAct` before |       after | `QkNormRope` before |     after | forward before |         after |
 | --------------------------- | ----------------: | ----------: | ------------------: | --------: | -------------: | ------------: |

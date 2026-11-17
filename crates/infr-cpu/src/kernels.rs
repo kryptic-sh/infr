@@ -19,7 +19,7 @@ use std::arch::x86_64::{
 /// WHY THIS EXISTS. Every wide load in this file used to be written inline as
 /// `_mm256_loadu_si256(s[off..].as_ptr() as *const __m256i)`, and the runtime dispatchers above
 /// them carry the comment "pointer bounds checked by slice indexing". Only half of that is true.
-/// The feature half is real — `is_x86_feature_detected!` gates the call. The bounds half is FALSE:
+/// The feature half is real — the `crate::simd` tier check gates the call. The bounds half is FALSE:
 /// `s[off..]` is a `RangeFrom` index, so it panics only when the START of the load is out of
 /// bounds. It says nothing whatsoever about the 32 bytes the intrinsic then reads past that point.
 /// The slice type is erased into a raw pointer one token later, and from there the load width is
@@ -136,11 +136,11 @@ pub(crate) fn vec_dot_q4k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(in_f % 256, 0, "vec_dot_q4k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q4k_avx512bw(row, q8, in_f) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q4k_avx2(row, q8, in_f) };
         }
     }
@@ -326,11 +326,11 @@ pub(crate) fn vec_dot_q2k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(in_f % 256, 0, "vec_dot_q2k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q2k_avx512bw(row, q8, in_f) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q2k_avx2(row, q8, in_f) };
         }
     }
@@ -500,11 +500,11 @@ pub(crate) fn vec_dot_q6k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(in_f % 256, 0, "vec_dot_q6k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q6k_avx512bw(row, q8, in_f) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q6k_avx2(row, q8, in_f) };
         }
     }
@@ -806,11 +806,11 @@ pub(crate) fn vec_dot_q3k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(in_f % 256, 0, "vec_dot_q3k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q3k_avx512bw(row, q8, in_f) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q3k_avx2(row, q8, in_f) };
         }
     }
@@ -996,11 +996,11 @@ pub(crate) fn vec_dot_iq4xs(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_iq4xs_avx512bw(row, q8, in_f) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_iq4xs_avx2(row, q8, in_f) };
         }
     }
@@ -1171,10 +1171,10 @@ pub(crate) fn vec_dot_q8_0(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             return unsafe { vec_dot_q8_0_avx512bw(row, q8, in_f) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q8_0_avx2(row, q8, in_f) };
         }
     }
@@ -1287,10 +1287,10 @@ pub(crate) fn vec_dot_q5k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
     debug_assert_eq!(in_f % 256, 0, "vec_dot_q5k: in_f must be a multiple of 256");
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             return unsafe { vec_dot_q5k_avx512bw(row, q8, in_f) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q5k_avx2(row, q8, in_f) };
         }
     }
@@ -1744,13 +1744,13 @@ pub(crate) fn vec_dot_q4k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+        if crate::simd::vnni() {
             return unsafe { vec_dot_q4k_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             return unsafe { vec_dot_q4k_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q4k_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -2013,10 +2013,10 @@ pub(crate) fn vec_dot_q4k_batch2(
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+        if crate::simd::vnni() {
             return unsafe { vec_dot_q4k_batch2_vnni(row_a, row_b, q8s, in_f, out_a, out_b) };
         }
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             return unsafe { vec_dot_q4k_batch2_avx512bw(row_a, row_b, q8s, in_f, out_a, out_b) };
         }
     }
@@ -2159,7 +2159,7 @@ pub(crate) fn vec_dot_q4k_batch8(rows: [&[u8]; 8], q8s: &[Q8], in_f: usize, outs
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             return unsafe { vec_dot_q4k_batch8_avx512bw(rows, q8s, in_f, outs) };
         }
     }
@@ -2526,10 +2526,10 @@ pub(crate) fn vec_dot_q6k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+        if crate::simd::vnni() {
             return unsafe { vec_dot_q6k_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q6k_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -2549,7 +2549,7 @@ pub(crate) fn vec_dot_iq4xs_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_iq4xs_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -3926,10 +3926,10 @@ pub(crate) fn vec_dot_q8_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             return unsafe { vec_dot_q8_0_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q8_0_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -4184,10 +4184,10 @@ pub(crate) fn vec_dot_q5k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             return unsafe { vec_dot_q5k_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q5k_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -4440,13 +4440,13 @@ pub(crate) fn vec_dot_q2k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+        if crate::simd::vnni() {
             return unsafe { vec_dot_q2k_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             return unsafe { vec_dot_q2k_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q2k_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -4694,13 +4694,13 @@ pub(crate) fn vec_dot_q3k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+        if crate::simd::vnni() {
             return unsafe { vec_dot_q3k_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             return unsafe { vec_dot_q3k_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q3k_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -4781,18 +4781,15 @@ pub(crate) fn vec_dot_q8_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512vl")
-        {
+        if crate::simd::vnni() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q8_0_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx512bw") {
+        if crate::simd::avx512() {
             // SAFETY: avx512bw detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q8_0_32_batch_avx512bw(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q8_0_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -4927,14 +4924,11 @@ pub(crate) fn vec_dot_q5_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512vl")
-        {
+        if crate::simd::vnni() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q5_0_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q5_0_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -5065,7 +5059,7 @@ pub(crate) fn vec_dot_q32_batch8(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
+        if crate::simd::vnni() {
             return unsafe { vec_dot_q32_batch8_ilv_vnni(rows, q8s, in_f, outs, q5) };
         }
     }
@@ -5222,14 +5216,11 @@ pub(crate) fn vec_dot_q4_0_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512vl")
-        {
+        if crate::simd::vnni() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q4_0_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q4_0_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -5370,14 +5361,11 @@ pub(crate) fn vec_dot_q2_0_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &m
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512vl")
-        {
+        if crate::simd::vnni() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q2_0_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q2_0_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -5517,14 +5505,11 @@ pub(crate) fn vec_dot_q4_1_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512vl")
-        {
+        if crate::simd::vnni() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q4_1_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q4_1_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -5668,14 +5653,11 @@ pub(crate) fn vec_dot_q5_1_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out:
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512vl")
-        {
+        if crate::simd::vnni() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_q5_1_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_q5_1_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -5825,14 +5807,11 @@ pub(crate) fn vec_dot_iq4nl_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512vl")
-        {
+        if crate::simd::vnni() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_iq4nl_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_iq4nl_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -6002,14 +5981,11 @@ pub(crate) fn vec_dot_mxfp4_32_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512vl")
-        {
+        if crate::simd::vnni() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_mxfp4_32_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_mxfp4_32_batch_avx2(row, q8s, in_f, out) };
         }
     }
@@ -6183,14 +6159,11 @@ pub(crate) fn vec_dot_nvfp4_batch(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &
     );
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512vl")
-        {
+        if crate::simd::vnni() {
             // SAFETY: features detected at runtime; pointer bounds checked by slice indexing.
             return unsafe { vec_dot_nvfp4_batch_vnni(row, q8s, in_f, out) };
         }
-        if is_x86_feature_detected!("avx2") {
+        if crate::simd::avx2() {
             return unsafe { vec_dot_nvfp4_batch_avx2(row, q8s, in_f, out) };
         }
     }

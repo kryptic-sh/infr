@@ -42,6 +42,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`kernels.cpu.max_tier` (`INFR_CPU_MAX_TIER`): a ceiling on the CPU's SIMD
+  tier**, `scalar`, `avx2`, `avx512` or `avx512vnni`. Every run-time dispatch in
+  the CPU backend (each quantized dot kernel, the packed VNNI GEMMs, the MoE
+  expert tiles, the int8 path's routes) and `infr_core::math`'s slice functions
+  ask one process-wide tier, `infr_core::simd::active`: the widest the CPU has,
+  or the ceiling when it is lower; a ceiling above what the CPU has runs the
+  CPU's widest. So a capped run executes the code an older x86 CPU, or an
+  aarch64 machine at `scalar`, would. A debug and testing switch: every tier
+  gives the same bits, so it changes only speed. It is process-wide: each CPU
+  backend applies its value when built, unset meaning no ceiling, so the last
+  backend built decides. A misspelt tier is a config error at load in the file,
+  `--set` and the environment alike. It replaces the unreleased
+  `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER` (and `math::set_tier`), which
+  forced only the math slices: one ceiling covers both, and the old key is no
+  longer read. New: `infr_core::simd` (`SimdTier`, `active`, `set_max`).
+
 - **`INFR_CPU_OP_HASH=<path>`** (`debug.cpu_op_hash`), a debugging aid: the CPU
   backend appends one line per tensor each op reads and writes (backend, graph
   and op number, the op's profiler label, element count, an FNV-1a hash of the
@@ -108,15 +124,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   compiled, and CI's macOS job is the first run there. See `docs/math.md`. The
   slice functions run at the widest SIMD tier the CPU has, chosen at run time
   (baseline, AVX2 or AVX-512 on x86-64), so a baseline x86-64 build still runs
-  them four or eight binary64 lanes wide; `math::Tier`, `math::slice_fns`,
-  `math::set_tier` and the new `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER`
-  setting force one. It is a process-wide debug switch (every tier gives the
-  same bits): each CPU backend applies its value when built, unset meaning the
-  widest tier, so the last backend built decides; a misspelt tier is a config
-  error at load in the file, `--set` and the environment alike. Also
-  `rope_freqs` and `rope_sin_cos`, the RoPE angles every CPU RoPE variant now
-  shares. A new lint, `crates/infr-core/tests/no_platform_libm.rs`, fails on any
-  platform math call in production code.
+  them four or eight binary64 lanes wide (`math::Tier`, `math::slice_fns`;
+  `kernels.cpu.max_tier` caps them, below). Also `rope_freqs` and
+  `rope_sin_cos`, the RoPE angles every CPU RoPE variant now shares. A new lint,
+  `crates/infr-core/tests/no_platform_libm.rs`, fails on any platform math call
+  in production code.
 
 - **Wave64-only AMD GPUs (GCN: Polaris, Vega) run on the Vulkan backend** (issue
   #94), ported from korewaChino's KessokuNet fork. A device that cannot pin a

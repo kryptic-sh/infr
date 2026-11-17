@@ -349,14 +349,13 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kernels.cpu.repack_mb = num(get, "INFR_CPU_REPACK_MB");
     // A debug switch whose whole point is the tier it names: a misspelt one is refused rather
     // than silently running the default.
-    if let Some(raw) = get("INFR_CPU_MATH_TIER") {
-        let tier = <crate::math::Tier as super::partial::ConfigValue>::parse_set(&raw).map_err(
-            |message| ConfigError::Env {
-                key: "INFR_CPU_MATH_TIER",
+    if let Some(raw) = get("INFR_CPU_MAX_TIER") {
+        let tier = <crate::simd::SimdTier as super::partial::ConfigValue>::parse_set(&raw)
+            .map_err(|message| ConfigError::Env {
+                key: "INFR_CPU_MAX_TIER",
                 message,
-            },
-        )?;
-        p.kernels.cpu.math_tier = Some(Some(tier));
+            })?;
+        p.kernels.cpu.max_tier = Some(Some(tier));
     }
 
     // ── kernels (graph shape, `infr-llama`) ──────────────────────────────────

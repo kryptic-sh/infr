@@ -113,8 +113,7 @@ pub(crate) fn expert_gemm_range(
             // per-call pack or `vec_dot_q4k_batch8`), Q5_K and Q6_K on the packed VNNI GEMM.
             // Q8_0 runs per-row.
             #[cfg(target_arch = "x86_64")]
-            let vnni =
-                is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni");
+            let vnni = crate::simd::vnni();
             #[cfg(not(target_arch = "x86_64"))]
             let vnni = false;
             let tiled_end = match dt {

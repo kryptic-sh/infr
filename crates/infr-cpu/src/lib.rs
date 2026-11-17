@@ -28,6 +28,7 @@ mod moe;
 mod quant;
 mod recycle;
 mod repack;
+mod simd;
 
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
 use infr_core::config::Config;
@@ -361,19 +362,13 @@ impl CpuBackend {
 
     /// A backend that reads its knobs from `cfg`. This is the constructor the campaign is heading
     /// for: no environment, and two backends with different configurations can coexist in one
-    /// test, with ONE exception: `kernels.cpu.math_tier` is a process-wide debug switch. Every
-    /// construction applies it ([`math::set_tier`]; unset = the widest tier the CPU has), so
-    /// the backend built last decides the math slices' tier for every backend in the process.
-    /// Only speed is at stake: every tier gives the same bits.
-    ///
-    /// # Panics
-    /// If `kernels.cpu.math_tier` names a tier this CPU cannot run: a debug switch that silently
-    /// ran another tier would measure the wrong thing. (A misspelt name never gets here; it is
-    /// a config error when the configuration is loaded.)
+    /// test, with ONE exception: `kernels.cpu.max_tier` is a process-wide debug switch. Every
+    /// construction applies it ([`infr_core::simd::set_max`]; unset = no ceiling, the widest
+    /// tier the CPU has; a ceiling above the CPU's widest runs the widest), so the backend built
+    /// last decides the SIMD tier of every kernel and math slice for every backend in the
+    /// process. Only speed is at stake: every tier gives the same bits.
     pub fn new_with(cfg: Arc<Config>) -> Self {
-        if let Err(e) = math::set_tier(cfg.kernels.cpu.math_tier) {
-            panic!("kernels.cpu.math_tier: {e}");
-        }
+        infr_core::simd::set_max(cfg.kernels.cpu.max_tier);
         Self {
             weight_cache: Mutex::default(),
             rope_freq_cache: Mutex::default(),
@@ -762,15 +757,14 @@ const ATTN_QUERY_BLOCK: usize = 16;
 
 /// Whether a prefill `Op::Linear` of `m` tokens over this weight runs on
 /// [`CpuBackend::linear_packed`]: Q4_K, Q5_K or Q6_K with at least one full 8-row group, at
-/// least [`repack::packed_min_tokens`] tokens, on a CPU with AVX-512BW and AVX-512 VNNI.
+/// least [`repack::packed_min_tokens`] tokens, at the AVX-512 VNNI tier.
 #[cfg(target_arch = "x86_64")]
 fn linear_packed_ok(dt: DType, in_f: usize, out_f: usize, m: usize) -> bool {
     matches!(dt, DType::Q4K | DType::Q5K | DType::Q6K)
         && out_f >= 8
         && in_f.is_multiple_of(256)
         && m >= repack::packed_min_tokens(dt)
-        && is_x86_feature_detected!("avx512bw")
-        && is_x86_feature_detected!("avx512vnni")
+        && simd::vnni()
 }
 
 /// The packed GEMM is x86_64-only, so off it no Linear takes that route.
@@ -805,13 +799,14 @@ fn borrow_two_mut<T>(v: &mut [T], a: usize, b: usize) -> (&T, &mut T) {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 /// Whether this CPU takes the fused Q4_K expert path whose packs fill the repack cache
-/// (`kernels.cpu.repack_mb`): the VNNI GEMM, which needs AVX-512 BW and VNNI. A model with a fused
-/// Q4_K gate_up bank can then hold up to that budget in packs on top of its weights, which the
-/// seam prices when it sizes a host weight arena.
+/// (`kernels.cpu.repack_mb`): the VNNI GEMM, which needs the AVX-512 VNNI tier (under the
+/// `kernels.cpu.max_tier` ceiling the backends built so far set). A model with a fused Q4_K
+/// gate_up bank can then hold up to that budget in packs on top of its weights, which the seam
+/// prices when it sizes a host weight arena.
 pub fn q4k_expert_repack_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni")
+        simd::vnni()
     }
     #[cfg(not(target_arch = "x86_64"))]
     {

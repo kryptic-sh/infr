@@ -277,7 +277,7 @@ knobs! {
     "INFR_CPU_SPIN"        => "kernels.cpu.spin",      Int,           Ignored, "4096", migrated;
     "INFR_CPU_NO_SPINPOOL" => "kernels.cpu.spinpool",  SetNotZeroInv, Ignored, "1",    migrated;
     "INFR_CPU_REPACK_MB"   => "kernels.cpu.repack_mb", Int,           Ignored, "1024", migrated;
-    "INFR_CPU_MATH_TIER"   => "kernels.cpu.math_tier", Text,          Error,   "baseline", migrated;
+    "INFR_CPU_MAX_TIER"    => "kernels.cpu.max_tier",  Text,          Error,   "scalar", migrated;
 
     // ── kernels — graph shape, `infr-llama` ──────────────────────────────────
     "INFR_NO_QKV_FUSE"      => "kernels.qkv_fuse",      PresenceInv, Ignored, "1", migrated;

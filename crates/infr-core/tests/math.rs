@@ -930,11 +930,12 @@ fn slices_equal_scalars() {
     assert!(r.is_err());
 }
 
-/// The tier switch: names round-trip, an unsupported tier is refused, and a forced tier is the
-/// one the slice functions then run. (Process-wide: the other tests take each tier's table
-/// directly and do not depend on which tier is active.)
+/// The tier switch: names round-trip, and under each `kernels.cpu.max_tier` ceiling the slice
+/// functions run the narrower of the ceiling's tier and the CPU's widest. (Process-wide: the
+/// other tests take each tier's table directly and do not depend on which tier is active.)
 #[test]
 fn tier_switch() {
+    use infr_core::simd::{self, SimdTier};
     for t in math::Tier::ALL {
         assert_eq!(math::Tier::parse(t.name()), Some(t));
         assert_eq!(math::Tier::parse(&t.name().to_uppercase()), Some(t));
@@ -942,14 +943,14 @@ fn tier_switch() {
     assert_eq!(math::Tier::parse("sse9"), None);
     let host = host_tiers();
     assert_eq!(math::Tier::best(), *host.last().unwrap());
-    for t in math::Tier::ALL {
-        let r = math::set_tier(Some(t));
-        assert_eq!(r.is_ok(), host.contains(&t), "{t:?}: {r:?}");
-        if r.is_ok() {
-            assert_eq!(math::tier(), t);
-        }
+    for t in SimdTier::ALL {
+        simd::set_max(Some(t));
+        let want = if t.supported() { t } else { SimdTier::best() };
+        assert_eq!(simd::active(), want, "{t:?}");
+        assert_eq!(math::tier(), want.math(), "{t:?}");
+        assert!(host.contains(&math::tier()));
     }
-    math::set_tier(None).unwrap();
+    simd::set_max(None);
     assert_eq!(math::tier(), math::Tier::best());
 }
 

@@ -31,14 +31,11 @@
 //! `core::intrinsics`, and anything in a dependency's source. None exists in the tree today;
 //! review has to catch them.
 //!
-//! **The allowlist.** A call that has not moved yet is marked by a comment on its line or in
-//! the comment block directly above it: `// libm-ok(S2): <reason>` for one call on the line, or
-//! `// libm-ok(S2) x2: <reason>` for two. The marker must match the line's count exactly; a
-//! marker with no call under it fails; and [`ALLOWLIST`] records, per file, how many marked
-//! calls it holds. The scan fails if a count differs in either direction, so the list can only
-//! shrink, by an edit to this file, and slice S2 of the plan empties it.
+//! **No exceptions.** Every call site moved to `infr_core::math` in slice S2 of the plan, and
+//! there is no allowlist or marker: a platform call anywhere in production code outside the
+//! math module fails the scan. A new use needs a function in `infr_core::math` instead.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// The platform math functions (`f32`/`f64` methods that lower to the C runtime).
@@ -53,15 +50,8 @@ const FORBIDDEN: &[&str] = &[
 /// doc) is stricter than this lint.
 const MATH_MODULE: &str = "infr-core/src/math/";
 
-/// The marker's tag; see the module doc for its two forms.
-const MARKER: &str = "libm-ok(S2)";
-
-/// Files allowed to carry markers, crate-relative, with the number of marked calls each holds.
-/// Every entry is a file whose platform-math calls have not been migrated yet; S2 removes them.
-const ALLOWLIST: &[(&str, usize)] = &[];
-
 #[test]
-fn no_platform_libm_outside_the_allowlist() {
+fn no_platform_libm_in_production_code() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("crates/")
@@ -73,12 +63,6 @@ fn no_platform_libm_outside_the_allowlist() {
         "scanned only {} production files; the scanner matches nothing",
         report.scanned
     );
-    let summary: Vec<String> = report
-        .marked
-        .iter()
-        .map(|(f, n)| format!("    (\"{f}\", {n}),"))
-        .collect();
-    println!("marked calls:\n{}", summary.join("\n"));
     assert!(
         report.offenders.is_empty(),
         "use `infr_core::math` instead of the platform's math functions (see docs/math.md):\n{}",
@@ -89,11 +73,10 @@ fn no_platform_libm_outside_the_allowlist() {
 /// What a scan of a `crates/` directory found.
 struct Report {
     scanned: usize,
-    marked: BTreeMap<String, usize>,
     offenders: Vec<String>,
 }
 
-/// Scan `crates/<crate>/src/**` under `crates` against [`ALLOWLIST`].
+/// Scan `crates/<crate>/src/**` under `crates`.
 fn scan(crates: &Path) -> Report {
     let mut files = Vec::new();
     for entry in std::fs::read_dir(crates).expect("read crates/").flatten() {
@@ -131,9 +114,7 @@ fn scan(crates: &Path) -> Report {
             }
         })
         .collect();
-    let allow: HashMap<&str, usize> = ALLOWLIST.iter().copied().collect();
     let mut offenders = Vec::new();
-    let mut marked = BTreeMap::new();
     let mut scanned = 0usize;
     for (path, src) in &parsed {
         if test_files.contains(path) || test_dirs.iter().any(|d| path.starts_with(d)) {
@@ -148,35 +129,10 @@ fn scan(crates: &Path) -> Report {
         if rel.starts_with(MATH_MODULE) {
             continue;
         }
-        let (n, mut errs) = src.check(&rel);
-        if n > 0 {
-            marked.insert(rel.clone(), n);
-        }
-        offenders.append(&mut errs);
-        match allow.get(rel.as_str()) {
-            None if n > 0 => offenders.push(format!(
-                "{rel}: {n} marked call(s), but {rel} is not in ALLOWLIST"
-            )),
-            Some(&want) if want != n => offenders.push(format!(
-                "{rel}: ALLOWLIST says {want} marked call(s), the file has {n}: update the list \
-                 (it may only shrink)"
-            )),
-            _ => {}
-        }
-    }
-    for (f, _) in ALLOWLIST {
-        if !marked.contains_key(*f) && !offenders.iter().any(|o| o.starts_with(f)) {
-            offenders.push(format!(
-                "{f} is in ALLOWLIST but has no marked call left: remove it"
-            ));
-        }
+        offenders.append(&mut src.check(&rel));
     }
     offenders.sort();
-    Report {
-        scanned,
-        marked,
-        offenders,
-    }
+    Report { scanned, offenders }
 }
 
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -209,10 +165,9 @@ fn module_files(decl: &Path, name: &str) -> Vec<PathBuf> {
 }
 
 /// A source file split into its code (comments and literals blanked, `#[cfg(test)]` code
-/// removed, line structure kept) and its original lines (for markers).
+/// removed, line structure kept).
 struct Source {
     code: Vec<String>,
-    original: Vec<String>,
     /// Names of `#[cfg(test)] mod name;` declarations.
     test_mods: Vec<String>,
 }
@@ -223,7 +178,6 @@ impl Source {
         let (code, test_mods) = remove_cfg_test_items(&blank);
         Source {
             code: code.lines().map(str::to_owned).collect(),
-            original: text.lines().map(str::to_owned).collect(),
             test_mods,
         }
     }
@@ -244,99 +198,12 @@ impl Source {
         out
     }
 
-    /// The markers: `(marker line, the code line it covers, the calls it declares)`.
-    fn markers(&self) -> Vec<(usize, Option<usize>, Result<usize, String>)> {
-        let mut out = Vec::new();
-        for (i, line) in self.original.iter().enumerate() {
-            let Some(at) = line.find(MARKER) else {
-                continue;
-            };
-            let declared = parse_declared(&line[at + MARKER.len()..]);
-            let has_code = |j: usize| self.code.get(j).is_some_and(|l| !l.trim().is_empty());
-            let target = if has_code(i) {
-                Some(i)
-            } else {
-                // The first code line below, through comment lines only.
-                let mut j = i + 1;
-                loop {
-                    match self.original.get(j) {
-                        Some(_) if has_code(j) => break Some(j),
-                        Some(l) if l.trim_start().starts_with("//") => j += 1,
-                        _ => break None,
-                    }
-                }
-            };
-            out.push((i, target, declared));
-        }
-        out
-    }
-
-    /// The number of marked calls, and every error: an unmarked call, a marker whose count does
-    /// not match its line, a marker with no call under it, two markers on one line.
-    fn check(&self, rel: &str) -> (usize, Vec<String>) {
-        let mut per_line: BTreeMap<usize, Vec<&str>> = BTreeMap::new();
-        for (line, name) in self.calls() {
-            per_line.entry(line).or_default().push(name);
-        }
-        let mut errs = Vec::new();
-        let mut covered: HashMap<usize, usize> = HashMap::new();
-        let mut marked = 0;
-        for (m, target, declared) in self.markers() {
-            let declared = match declared {
-                Ok(n) => n,
-                Err(e) => {
-                    errs.push(format!("{rel}:{}: malformed marker: {e}", m + 1));
-                    continue;
-                }
-            };
-            let Some(t) = target else {
-                errs.push(format!(
-                    "{rel}:{}: marker with no code line under it",
-                    m + 1
-                ));
-                continue;
-            };
-            if let Some(prev) = covered.insert(t, m) {
-                errs.push(format!(
-                    "{rel}:{}: a second marker for line {} (the first is on line {})",
-                    m + 1,
-                    t + 1,
-                    prev + 1
-                ));
-                continue;
-            }
-            let found = per_line.get(&t).map_or(0, Vec::len);
-            if found != declared {
-                errs.push(format!(
-                    "{rel}:{}: marker declares {declared} call(s), line {} has {found}",
-                    m + 1,
-                    t + 1
-                ));
-                continue;
-            }
-            marked += found;
-        }
-        for (line, names) in &per_line {
-            if !covered.contains_key(line) {
-                for name in names {
-                    errs.push(format!("{rel}:{}: platform `{name}`", line + 1));
-                }
-            }
-        }
-        (marked, errs)
-    }
-}
-
-/// The count a marker declares, from the text after the tag: `:` is one call, ` xN:` is N.
-fn parse_declared(rest: &str) -> Result<usize, String> {
-    if rest.starts_with(':') {
-        return Ok(1);
-    }
-    let rest = rest.strip_prefix(" x").ok_or("expected `:` or ` xN:`")?;
-    let (n, tail) = rest.split_once(':').ok_or("expected `:` after the count")?;
-    match n.parse::<usize>() {
-        Ok(n) if n >= 2 && !tail.is_empty() => Ok(n),
-        _ => Err(format!("bad count `{n}`")),
+    /// One error per platform call.
+    fn check(&self, rel: &str) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .map(|(line, name)| format!("{rel}:{}: platform `{name}`", line + 1))
+            .collect()
     }
 }
 
@@ -768,7 +635,7 @@ fn match_cfg_test(b: &[u8], i: usize) -> Option<usize> {
 // ── the scanner's own tests ──────────────────────────────────────────────────────────────────
 
 /// The detector on a sample: every form of call is found, nothing in a comment, a string, a
-/// `#[cfg(test)]` item or an exact function, and a marker covers its call.
+/// `#[cfg(test)]` item or an exact function.
 #[test]
 fn the_detector_finds_each_form_and_nothing_else() {
     let text = r##"
@@ -780,7 +647,7 @@ fn c() -> &'static str { "x.ln_1p()" }
 fn d() -> &'static str { r#"x.sin()"# }
 fn e(x: f32, c: char) -> f32 { let _ = '"'; x.sqrt().powi(2).mul_add(x, x).abs() + x.expensive() }
 fn f(x: f32) -> f32 {
-    // libm-ok(S2): kept for the sample
+    // A comment does not excuse the call under it.
     x.powf(0.5)
 }
 #[cfg(test)]
@@ -797,9 +664,8 @@ fn g(x: f64) -> f64 { x.log2() + x.ln_1p() }
         names,
         ["exp", "ln", "tanh", "sin", "cos", "powf", "log2", "ln_1p"]
     );
-    let (marked, errs) = src.check("sample.rs");
-    assert_eq!(marked, 1);
-    assert_eq!(errs.len(), 7, "{errs:#?}");
+    let errs = src.check("sample.rs");
+    assert_eq!(errs.len(), 8, "{errs:#?}");
     assert_eq!(src.test_mods, ["more_tests"]);
 }
 
@@ -891,34 +757,6 @@ fn qualified_spaced_and_value_forms_are_found() {
     // This module's own functions are the replacement, not a platform call.
     let text = "fn p(x: f32) -> f32 { math::exp(x) + infr_core::math::tanh(x) }";
     assert!(Source::parse(text).calls().is_empty());
-}
-
-/// A marker covers exactly the calls it declares on its line: too few, too many, none at all,
-/// and two markers for one line are each an error.
-#[test]
-fn markers_must_match_their_line_exactly() {
-    let errs = |text: &str| Source::parse(text).check("t.rs");
-    // One marker, two calls: the second call is not excused.
-    let (n, e) = errs("// libm-ok(S2): one\nfn p(x: f32) -> f32 { x.exp() + x.ln() }\n");
-    assert_eq!((n, e.len()), (0, 1), "{e:?}");
-    // Declared two, two calls: fine.
-    let (n, e) = errs("// libm-ok(S2) x2: two\nfn p(x: f32) -> f32 { x.exp() + x.ln() }\n");
-    assert_eq!((n, e.len()), (2, 0), "{e:?}");
-    // Declared two, one call: the marker is wrong, and nothing on the line counts as marked.
-    let (n, e) = errs("fn p(x: f32) -> f32 { x.exp() } // libm-ok(S2) x2: two\n");
-    assert_eq!((n, e.len()), (0, 1), "{e:?}");
-    // A stale marker with no call under it.
-    let (n, e) = errs("// libm-ok(S2): stale\nfn p(x: f32) -> f32 { x }\n");
-    assert_eq!((n, e.len()), (0, 1), "{e:?}");
-    // A marker with no code line under it at all.
-    let (_, e) = errs("fn p() {}\n// libm-ok(S2): dangling\n\nfn q() {}\n");
-    assert_eq!(e.len(), 1, "{e:?}");
-    // Two markers for one line.
-    let (_, e) = errs("// libm-ok(S2): a\n// libm-ok(S2): b\nfn p(x: f32) -> f32 { x.exp() }\n");
-    assert_eq!(e.len(), 1, "{e:?}");
-    // A malformed count.
-    let (_, e) = errs("// libm-ok(S2) x1: a\nfn p(x: f32) -> f32 { x.exp() }\n");
-    assert_eq!(e.len(), 2, "{e:?}");
 }
 
 /// Only `crates/<crate>/src` is scanned, even when the checkout itself sits under a directory

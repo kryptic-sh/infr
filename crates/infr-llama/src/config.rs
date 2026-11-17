@@ -2088,8 +2088,7 @@ fn mla_rope_mscale(yarn: bool, factor: f32, log_mul: f32, attn_factor: f32) -> f
         1.0
     } else if factor > 1.0 {
         // `get_mscale(f, 1)`.
-        // libm-ok(S2): platform `ln`, moves to `infr_core::math` in S2
-        0.1 * factor.ln() + 1.0
+        0.1 * infr_core::math::ln(factor) + 1.0
     } else {
         1.0
     };
@@ -2124,9 +2123,8 @@ pub(crate) fn yarn_freq_divisors(
     let n_ctx_orig = n_ctx_orig as f32;
     let freq_scale = 1.0 / factor;
     // corr_dim(n_rot): the dim below which the ramp is fully active — `ggml_rope_yarn_corr_dim`.
-    let corr =
-        // libm-ok(S2) x2: platform `ln` twice, moves to `infr_core::math` in S2
-        |nr: f32| n_rot * (n_ctx_orig / (nr * std::f32::consts::TAU)).ln() / (2.0 * base.ln());
+    let ln = infr_core::math::ln;
+    let corr = |nr: f32| n_rot * ln(n_ctx_orig / (nr * std::f32::consts::TAU)) / (2.0 * ln(base));
     let start = (corr(beta_fast).floor() as i64).clamp(0, (n_rot as i64) - 1);
     let end = (corr(beta_slow).ceil() as i64).clamp(0, (n_rot as i64) - 1);
     let span = ((end - start) as f32).max(0.001);
@@ -2822,7 +2820,7 @@ mod tests {
         let Err(err) = yarn("ds2-yarn-nolm", None) else {
             panic!("YaRN without yarn_log_multiplier must fail");
         };
-        let want = 1.0 + 0.1 * 40f32.ln();
+        let want = 1.0 + 0.1 * infr_core::math::ln(40.0);
         assert!(
             err.to_string()
                 .starts_with(&format!("deepseek2 MLA rope: ggml_rope_ext would scale the rotary halves of Q and K by {want}")),

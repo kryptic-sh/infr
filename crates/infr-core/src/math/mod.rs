@@ -63,13 +63,14 @@
 //! `slices.rs`), so a baseline build still runs AVX2 or AVX-512 where the CPU has it. Each slice
 //! function equals its scalar function element for element by construction, at every tier and
 //! on every target; the tests check it on every binary32 input. `ln`, `ln_1p`, `sin`/`cos` and
-//! `powf` have no slice form: they are not per-element hot paths (RoPE's `powf(theta, -2p/d)`
-//! depends only on the op's shape and the caller can hoist it).
+//! `powf` have no slice form: they are not per-element hot paths (RoPE's frequencies depend only
+//! on the op's shape: [`rope_freqs`]).
 
 mod dd;
 mod exp;
 mod log;
 mod pow;
+mod rope;
 mod slices;
 mod tables;
 mod trig;
@@ -80,6 +81,7 @@ mod fast_path_tests;
 pub use exp::{exp, tanh};
 pub use log::{ln, ln_1p};
 pub use pow::powf;
+pub use rope::{rope_freqs, rope_sin_cos};
 pub use slices::{
     exp_slice, exp_slice_to, exp_sub_slice, force_tier, gelu_tanh_slice, sigmoid_slice, silu_slice,
     slice_fns, tanh_slice, tier, SliceFns, Tier,

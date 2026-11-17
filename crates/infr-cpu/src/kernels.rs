@@ -5,6 +5,7 @@
 use crate::quant::{hadd_i32_xmm, hadd_i32_ymm};
 use crate::quant::{Q8x32, Q8};
 use infr_core::graph::Activation;
+use infr_core::math;
 use infr_gguf::dequant::{
     e8m0_to_fp32_half, k4, rdf16, ue4m3_to_fp32, KVALUES_IQ4NL, KVALUES_MXFP4,
 };
@@ -6478,30 +6479,50 @@ pub(crate) fn dot_mn<const M: usize, const N: usize>(
     })
 }
 
-/// Gated-FFN activation applied to the gate value.
-// per-call leaf, too small to probe (see docs/perf/playbook.md)
-#[cfg_attr(infr_profile, infr_prof::skip)]
-pub(crate) fn act_fn(act: Activation, g: f32) -> f32 {
+/// The gated-FFN activation, applied in place to every gate value of `xs`: SiLU, GELU's tanh
+/// form (`gelu_pytorch_tanh`: `0.5 g (1 + tanh(√(2/π)·(g + 0.044715 g³)))`) or sigmoid, through
+/// `infr_core::math`'s slice functions.
+pub(crate) fn act_slice(act: Activation, xs: &mut [f32]) {
     match act {
-        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-        Activation::Silu => g / (1.0 + (-g).exp()),
-        // gelu_pytorch_tanh: 0.5 g (1 + tanh(√(2/π)·(g + 0.044715 g³)))
-        // libm-ok(S2): platform `tanh`, moves to `infr_core::math` in S2
-        Activation::Gelu => 0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh()),
-        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-        Activation::Sigmoid => 1.0 / (1.0 + (-g).exp()),
+        Activation::Silu => math::silu_slice(xs),
+        Activation::Gelu => math::gelu_tanh_slice(xs),
+        Activation::Sigmoid => math::sigmoid_slice(xs),
     }
 }
 
-/// One gated-FFN output element, `act(gate) * up`, with DeepSeek V4's optional per-layer SwiGLU
-/// clamp: `Some(limit)` gives `act(min(gate, limit)) * clamp(up, -limit, limit)` — `up` clamped
-/// symmetrically, the gate one-sided and BEFORE the activation (see `Op::GatedAct::swiglu_clamp`).
-/// `None` compiles to exactly the un-clamped expression this replaced.
+/// One gated-FFN output row, `out[i] = act(gate(i)) * up(i)`, with DeepSeek V4's optional
+/// per-layer SwiGLU clamp: `Some(limit)` gives `act(min(gate, limit)) * clamp(up, -limit, limit)`
+/// — `up` clamped symmetrically, the gate one-sided and BEFORE the activation (see
+/// `Op::GatedAct::swiglu_clamp`). The (clamped) gates go into `out`, [`act_slice`] runs over the
+/// whole row, and each result is multiplied by its (clamped) up: per element the same binary32
+/// operations as the scalar expression, so the same bits.
 #[inline]
-pub(crate) fn gated_act_fn(act: Activation, clamp: Option<f32>, gate: f32, up: f32) -> f32 {
+pub(crate) fn gated_act_row(
+    act: Activation,
+    clamp: Option<f32>,
+    out: &mut [f32],
+    gate: impl Fn(usize) -> f32,
+    up: impl Fn(usize) -> f32,
+) {
     match clamp {
-        None => act_fn(act, gate) * up,
-        Some(l) => act_fn(act, gate.min(l)) * up.clamp(-l, l),
+        None => {
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = gate(i);
+            }
+            act_slice(act, out);
+            for (i, o) in out.iter_mut().enumerate() {
+                *o *= up(i);
+            }
+        }
+        Some(l) => {
+            for (i, o) in out.iter_mut().enumerate() {
+                *o = gate(i).min(l);
+            }
+            act_slice(act, out);
+            for (i, o) in out.iter_mut().enumerate() {
+                *o *= up(i).clamp(-l, l);
+            }
+        }
     }
 }
 

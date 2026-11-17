@@ -7,6 +7,7 @@ use infr_core::config::MetalCfg;
 use infr_core::error::Error;
 use infr_core::exec::Provision;
 use infr_core::graph::{Op, TensorKind};
+use infr_core::math;
 use infr_core::tensor::{DType, TensorId};
 use infr_core::Result;
 use infr_gguf::dequant::dequant_block;
@@ -1588,12 +1589,7 @@ fn host_causal_conv(
                 acc += st[j * cc + ch] * ws[ch * kk + j];
             }
             acc += xt[ch] * ws[ch * kk + (kk - 1)];
-            out[t * cc + ch] = if silu {
-                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                acc / (1.0 + (-acc).exp())
-            } else {
-                acc
-            };
+            out[t * cc + ch] = if silu { math::silu(acc) } else { acc };
         }
         for j in 0..kk.saturating_sub(2) {
             for ch in 0..cc {
@@ -1607,16 +1603,14 @@ fn host_causal_conv(
     out
 }
 
-/// Gated-FFN activation applied to the gate value (matches `infr-cpu`'s `act_fn`).
+/// Gated-FFN activation applied to the gate value (the CPU backend's, element by element).
 fn act_fn(act: infr_core::graph::Activation, g: f32) -> f32 {
     use infr_core::graph::Activation;
     match act {
-        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-        Activation::Silu => g / (1.0 + (-g).exp()),
-        // libm-ok(S2): platform `tanh`, moves to `infr_core::math` in S2
-        Activation::Gelu => 0.5 * g * (1.0 + (0.797_884_6 * (g + 0.044715 * g * g * g)).tanh()),
-        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-        Activation::Sigmoid => 1.0 / (1.0 + (-g).exp()),
+        Activation::Silu => math::silu(g),
+        // gelu_pytorch_tanh: 0.5 g (1 + tanh(√(2/π)·(g + 0.044715 g³)))
+        Activation::Gelu => math::gelu_tanh(g),
+        Activation::Sigmoid => math::sigmoid(g),
     }
 }
 
@@ -2877,8 +2871,7 @@ impl MetalBackend {
                         }
                         let mut sum = 0.0f32;
                         for i in 0..dim {
-                            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                            let e = (xrow[i] * scale - m0).exp();
+                            let e = math::exp(xrow[i] * scale - m0);
                             ds[ri * dim + i] = e;
                             sum += e;
                         }
@@ -5262,8 +5255,8 @@ impl MetalBackend {
                         .map(|e| (0..ne).map(|i| rw[e * ne + i] * xrr[i]).sum::<f32>())
                         .collect();
                     let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                    // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                    let mut probs: Vec<f32> = logits.iter().map(|&v| (v - maxl).exp()).collect();
+                    let mut probs = logits.clone();
+                    math::exp_sub_slice(&mut probs, maxl);
                     let psum: f32 = probs.iter().sum();
                     for p in probs.iter_mut() {
                         *p /= psum;
@@ -5720,15 +5713,9 @@ impl MetalBackend {
                         for x in kh.iter_mut() {
                             *x /= kn;
                         }
-                        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                        let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
-                        let sp = {
-                            let z = af[bb + h] + dtb[h];
-                            // libm-ok(S2) x2: platform `exp`, `ln_1p`, moves to `infr_core::math` in S2
-                            z.max(0.0) + (-z.abs()).exp().ln_1p()
-                        };
-                        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                        let decay = (acoef[h] * sp).exp();
+                        let beta = math::sigmoid(bf[bb + h]);
+                        let sp = math::softplus(af[bb + h] + dtb[h]);
+                        let decay = math::exp(acoef[h] * sp);
                         let sh = &mut st[h * kd * vd..(h + 1) * kd * vd]; // [kd, vd]
                         for x in sh.iter_mut() {
                             *x *= decay;

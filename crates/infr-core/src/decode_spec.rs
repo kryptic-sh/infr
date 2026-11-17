@@ -212,12 +212,23 @@ impl BlockSpec {
 }
 
 /// Nearest E8M0 byte for a positive `v`: the exponent `e` such that `2^(e-127)` is closest to `v`
-/// in log space, clamped to the finite band. (MXFP4's shared exponent.)
+/// in log space, clamped to the finite band. (MXFP4's shared exponent.) `|v|` below the least
+/// normal binary32 (zero, subnormals, NaN) counts as that least normal, `2^-126`.
+///
+/// Exact, from the bits: `|v| = m * 2^E` with `m` in `[1, 2)`, and `log2|v| = E + log2 m` is
+/// nearer `E + 1` than `E` exactly when `m > sqrt 2` (never equal: `sqrt 2` is irrational), that
+/// is when the fraction bits are at least those of the least binary32 above `sqrt 2`. The
+/// biased exponent field is `E + 127` already.
 fn e8m0_from_f32(v: f32) -> u8 {
-    // libm-ok(S2): an E8M0 exponent from `log2`; S2 takes it from the bits
-    let e = (v.abs().max(f32::MIN_POSITIVE).log2().round() as i32) + 127;
-    e.clamp(1, 254) as u8
+    let bits = v.abs().max(f32::MIN_POSITIVE).to_bits();
+    let biased = (bits >> 23) as i32;
+    let up = ((bits & 0x7f_ffff) >= SQRT2_ABOVE_FRAC) as i32;
+    (biased + up).clamp(1, 254) as u8
 }
+
+/// The fraction bits of the least binary32 above `sqrt 2` (`0x3fb504f4`, 1.41421366):
+/// `0x3fb504f3` is the greatest below it.
+const SQRT2_ABOVE_FRAC: u32 = 0x35_04f4;
 
 /// Nearest UE4M3 byte for a positive `v` (unsigned 4-bit exponent, 3-bit mantissa, bias 7 — the
 /// NVFP4 sub-block scale). Value = `2^(e-7) · (1 + mant/8)` for `e > 0`.
@@ -384,6 +395,47 @@ pub const fn block_layout(dtype: DType) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `e8m0_from_f32` against an exact reference: `|v| = m 2^E` rounds up to `E + 1` exactly
+    /// when `m^2 > 2`, which binary64 decides without rounding (`m` has 24 bits). Every E8M0
+    /// value the format holds round-trips from its own power of two; around every boundary
+    /// `sqrt(2) 2^E` the two binary32 neighbours land on either side; and every fraction at one
+    /// exponent agrees with the reference.
+    #[test]
+    fn e8m0_from_f32_is_the_nearest_exponent_in_log_space() {
+        let reference = |v: f32| -> u8 {
+            let a = v.abs().max(f32::MIN_POSITIVE);
+            let biased = (a.to_bits() >> 23) as i32;
+            let m = f32::from_bits((a.to_bits() & 0x7f_ffff) | 0x3f80_0000) as f64;
+            ((biased + (m * m > 2.0) as i32).clamp(1, 254)) as u8
+        };
+        // Every finite E8M0 code (1..=254) from its own power of two, both signs.
+        for e in 1..=254u32 {
+            let v = f32::from_bits(e << 23);
+            assert_eq!(e8m0_from_f32(v), e as u8, "2^{}", e as i32 - 127);
+            assert_eq!(e8m0_from_f32(-v), e as u8, "-2^{}", e as i32 - 127);
+        }
+        // The boundary at every exponent: below sqrt(2) 2^E stays at E, above goes to E + 1.
+        for biased in 1..=254u32 {
+            let below = f32::from_bits((biased << 23) | 0x35_04f3);
+            let above = f32::from_bits((biased << 23) | 0x35_04f4);
+            assert_eq!(e8m0_from_f32(below), biased as u8);
+            assert_eq!(e8m0_from_f32(above), (biased + 1).min(254) as u8);
+            assert_eq!(e8m0_from_f32(below), reference(below));
+            assert_eq!(e8m0_from_f32(above), reference(above));
+        }
+        // Every fraction at one exponent.
+        for frac in 0..1u32 << 23 {
+            let v = f32::from_bits((127 << 23) | frac);
+            assert_eq!(e8m0_from_f32(v), reference(v), "{v}");
+        }
+        // Below the normal range, the ends and non-numbers.
+        assert_eq!(e8m0_from_f32(0.0), 1);
+        assert_eq!(e8m0_from_f32(f32::from_bits(1)), 1);
+        assert_eq!(e8m0_from_f32(f32::NAN), 1);
+        assert_eq!(e8m0_from_f32(f32::MAX), 254);
+        assert_eq!(e8m0_from_f32(f32::INFINITY), 254);
+    }
 
     /// The roster and the predicate must not drift: a new quant added to `DType::is_quant` without
     /// a `WEIGHT_QUANTS` entry would silently miss every harness sweep.

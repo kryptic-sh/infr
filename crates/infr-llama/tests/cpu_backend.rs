@@ -170,12 +170,14 @@ fn model_cfg(
 /// The shipped defaults plus the environment knobs these tests honour: WHICH GPU they run on
 /// (`INFR_DEV`), so a box with more than one (a dGPU beside an iGPU) can test either (unset keeps
 /// the first-discrete default); `INFR_FORCE_WAVE64`, so the wave64 path AMD GCN takes can be
-/// scored on an RDNA card; and `INFR_CPU_OP_HASH`, so a CPU golden that differs between two
-/// systems can be diffed op by op (`debug.cpu_op_hash`).
+/// scored on an RDNA card; `INFR_CPU_OP_HASH`, so a CPU golden that differs between two
+/// systems can be diffed op by op (`debug.cpu_op_hash`); and `INFR_CPU_MATH_TIER`, so the goldens
+/// can be run with the math slices at each SIMD tier (`kernels.cpu.math_tier`).
 fn env_cfg() -> infr_llama::EngineConfig {
     let mut cfg = infr_llama::EngineConfig::default();
     cfg.device.dev = std::env::var("INFR_DEV").ok();
     cfg.debug.cpu_op_hash = std::env::var_os("INFR_CPU_OP_HASH").map(PathBuf::from);
+    cfg.kernels.cpu.math_tier = std::env::var("INFR_CPU_MATH_TIER").ok();
     infr_testkit::honour_env(&mut cfg);
     cfg
 }
@@ -347,34 +349,22 @@ fn gpu_seam_matches_cpu_qwen2() {
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
 }
 
-/// A golden hash that differs between Windows and every other platform.
-///
-/// Windows builds produce different greedy tokens from Linux ones on the same CPU with the same
-/// `target-cpu` — deterministically, run after run, and only once a generation is long enough for
-/// accumulated float drift to flip an argmax (every short case still matches bit-for-bit). The
-/// likeliest cause is the C runtime's transcendental functions (MSVC's UCRT versus glibc), not
-/// confirmed. Both outputs were read and are coherent; they are simply different arithmetic.
-const fn per_os(windows: u64, elsewhere: u64) -> u64 {
-    if cfg!(windows) {
-        windows
-    } else {
-        elsewhere
-    }
-}
-
 // Captured + verified coherent (chat-templated, Qwen3 thinks then answers): "…France's capital is
-// Paris", a simple-terms computer explanation, an ocean paragraph.
+// Paris", a simple-terms computer explanation, an ocean paragraph. One hash per case on every
+// platform: the CPU's transcendental functions are `infr_core::math`'s, not the C runtime's, so
+// Windows and Linux compute the same bits (re-blessed 2026-11-17, identical natively on Windows
+// and under WSL; before that the last two cases had a Windows and a Linux hash).
 const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0xfd63781ea3bfa785),
     (
         "Explain how a computer works in simple terms.",
         48,
-        per_os(0xec2b171ab4126f09, 0xcf56ba8c4bb5c455),
+        0xcf56ba8c4bb5c455,
     ),
     (
         "Write a short paragraph about the ocean.",
         48,
-        per_os(0xfb31f388412112f1, 0x29f45fb169b84b9a),
+        0x92ef4b86905d27dc,
     ),
 ];
 
@@ -1802,12 +1792,16 @@ fn llama32_1b() -> Option<PathBuf> {
 // natively on Windows and under WSL (Ubuntu 26.04) for the other half, and came out equal. The
 // Ubuntu CI runner is the final word on that half: an exact-token golden may not reproduce
 // across CPU microarchitectures.
+//
+// Re-blessed the same day for `infr_core::math` (correctly rounded transcendentals in place of
+// the C runtime's): the knight story's text changed, the France case kept its hash; identical
+// natively on Windows and under WSL.
 const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0xe5a37ab078db3a2c),
     (
         "Tell me a short story about a brave knight.",
         48,
-        per_os(0x5147de9a0ddfae50, 0x5147de9a0ddfae50),
+        0x4f1efdec82f477e5,
     ),
 ];
 
@@ -2032,7 +2026,7 @@ const ERNIE4_5_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Write a short paragraph about the ocean.",
         32,
-        0x1a643a859ae6ff58,
+        0x055f6196af273214,
     ),
 ];
 
@@ -2055,9 +2049,9 @@ fn ernie4_5_21b_a3b() -> Option<PathBuf> {
 }
 
 // Captured + verified coherent: a one-paragraph answer that Paris is the capital, and the numbers
-// one to twenty spelled out. The same hashes came out on Windows and on Linux (WSL), so neither is
-// `per_os`. On both prompts infr's CPU greedy ids equal llama.cpp's (CPU, same chat-rendered ids)
-// for 48 tokens; see docs/plan/02-ernie4-5.md.
+// one to twenty spelled out. The same hashes came out on Windows and on Linux (WSL). On both
+// prompts infr's CPU greedy ids equal llama.cpp's (CPU, same chat-rendered ids) for 48 tokens;
+// see docs/plan/02-ernie4-5.md.
 const ERNIE4_5_MOE_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "What is the capital of France? Answer in one paragraph.",
@@ -3136,7 +3130,7 @@ fn lfm3_17b_f16() -> Option<PathBuf> {
 // text is the model's reasoning. How infr's output compares with llama.cpp's is in
 // docs/plan/03-lfm3.md.
 const LFM3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0x8d3a3dd9844d239f),
+    ("The capital of France is", 32, 0xcaeef40f04920074),
     (
         "Tell me a short story about a lighthouse keeper.",
         32,
@@ -3283,12 +3277,10 @@ fn qwen3moe_30b() -> Option<PathBuf> {
 // the staged-MoE `int8_ok` doc). Verified coherent ("<think>\nOkay, the user is asking, \"The
 // capital of France is\". I need to provide the correct answer.") — re-blessed for the
 // attention-SIMD reassociation (numerics policy: match-or-beat llama.cpp CPU precision).
-// The Windows hash was captured 2026-11-13, the day the Linux one was re-run and held.
-const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] = &[(
-    "The capital of France is",
-    24,
-    per_os(0xe1a4ed6cecc5eb14, 0xbc4f22b22d3e3c1d),
-)];
+// Since `infr_core::math` (2026-11-17) Windows and Linux give the same text, the one Windows
+// gave before.
+const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
+    &[("The capital of France is", 24, 0xe1a4ed6cecc5eb14)];
 
 /// Whole-vector cosine similarity (f64 accumulation) — used by the CPU/Vulkan cross-backend
 /// logits check below.

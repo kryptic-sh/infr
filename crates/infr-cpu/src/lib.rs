@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    dot, dot_bf16, dot_f16, dot_n, gated_act_fn, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
+    dot, dot_bf16, dot_f16, dot_n, gated_act_row, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
     vec_dot_iq1s_batch, vec_dot_iq2s, vec_dot_iq2s_batch, vec_dot_iq2xs, vec_dot_iq2xs_batch,
     vec_dot_iq2xxs, vec_dot_iq2xxs_batch, vec_dot_iq3s, vec_dot_iq3s_batch, vec_dot_iq3xxs,
     vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch, vec_dot_iq4xs, vec_dot_iq4xs_batch,
@@ -904,9 +904,8 @@ pub(crate) fn hyper_sinkhorn(m: &mut [f32], hc: usize, eps: f32, n_iter: u32) {
         let col = &mut m[src * hc..][..hc];
         let mx = col.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0f32;
-        for v in col.iter_mut() {
-            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-            *v = (*v - mx).exp();
+        math::exp_sub_slice(col, mx);
+        for v in col.iter() {
             sum += *v;
         }
         for v in col.iter_mut() {
@@ -968,11 +967,8 @@ pub(crate) fn sample_token(logits: &[f32], uu: f32, top_k: usize, temp: f32, top
     }
     idx.sort_unstable_by(cmp);
     let maxl = logits[idx[0]];
-    let mut probs: Vec<f32> = idx
-        .iter()
-        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-        .map(|&i| ((logits[i] - maxl) / temp).exp())
-        .collect();
+    let mut probs: Vec<f32> = idx.iter().map(|&i| (logits[i] - maxl) / temp).collect();
+    math::exp_slice(&mut probs);
     let sum: f32 = probs.iter().sum();
     for p in probs.iter_mut() {
         *p /= sum;
@@ -1309,11 +1305,12 @@ impl Backend for CpuBackend {
                     self.pool().for_chunks_mut(&mut out, dim, 1, &|r, o| {
                         let row = &xs[r * dim..r * dim + dim];
                         let mx = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v * scale));
-                        let mut denom = 0f32;
                         for (dst_v, &v) in o.iter_mut().zip(row) {
-                            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                            let e = (v * scale - mx).exp();
-                            *dst_v = e;
+                            *dst_v = v * scale - mx;
+                        }
+                        math::exp_slice(o);
+                        let mut denom = 0f32;
+                        for &e in o.iter() {
                             denom += e;
                         }
                         let inv = 1.0 / denom;
@@ -1383,18 +1380,18 @@ impl Backend for CpuBackend {
                     let zs = &vals[gate.0 as usize];
                     let ws = weight(w);
                     let mut out = rc.zeroed(rows * nh * hd);
+                    let mut silu = vec![0f32; hd];
                     for r in 0..rows {
                         for h in 0..nh {
                             let b = (r * nh + h) * hd;
                             let ss: f32 =
                                 (0..hd).map(|i| xs[b + i] * xs[b + i]).sum::<f32>() / hd as f32;
                             let s = 1.0 / (ss + eps).sqrt();
+                            silu.copy_from_slice(&zs[b..b + hd]);
+                            math::silu_slice(&mut silu);
                             for i in 0..hd {
                                 let normed = xs[b + i] * s * ws[i];
-                                let zv = zs[b + i];
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                let silu = zv / (1.0 + (-zv).exp());
-                                out[b + i] = normed * silu;
+                                out[b + i] = normed * silu[i];
                             }
                         }
                     }
@@ -1940,9 +1937,11 @@ impl Backend for CpuBackend {
                     // which is the inverse because nothing scales the magnitude here. See
                     // `Op::Rope::backward`.
                     let sin_sign = if backward { -1.0 } else { 1.0 };
-                    // Parallel over rows. A pair's angle depends on the row's position and the
+                    // Parallel over rows. A pair's frequency depends only on the op's shape, so
+                    // it is computed once per op; its angle depends on the row's position and the
                     // pair index, never the head, so each row computes its (sin, cos) table once
                     // and every head reuses it — the same values the per-head form computed.
+                    let freqs = math::rope_freqs(theta, rd);
                     self.pool().for_chunks_mut(
                         &mut out[..rows * nh * hd],
                         nh * hd,
@@ -1951,13 +1950,9 @@ impl Backend for CpuBackend {
                             let p0 = pos[r];
                             let sc: Vec<(f32, f32)> = (0..hf)
                                 .map(|p| {
-                                    // libm-ok(S2): platform `powf`, moves to `infr_core::math` in S2
-                                    let mut ang = p0 * theta.powf(-2.0 * p as f32 / rd as f32);
-                                    if let Some(ff) = &ff {
-                                        ang /= ff[p];
-                                    }
-                                    // libm-ok(S2) x2: platform `cos`, `sin`, moves to `infr_core::math` in S2
-                                    (ang.sin() * sin_sign, ang.cos())
+                                    let (s, c) =
+                                        math::rope_sin_cos(p0, freqs[p], ff.map(|ff| ff[p]));
+                                    (s * sin_sign, c)
                                 })
                                 .collect();
                             let xr = &xs[r * nh * hd..(r + 1) * nh * hd];
@@ -2023,21 +2018,19 @@ impl Backend for CpuBackend {
                     let ff = freq_factors.map(|f| &vals[f.0 as usize]);
                     let mut out = rc.for_overwrite(rows * nh * hd);
                     let hf = rd / 2;
-                    // Parallel over the m rows. Within a row the RoPE angles depend only on the
-                    // position (not the head), so precompute (cos,sin) per rope index ONCE per row and
-                    // reuse across all heads — the powf/sin/cos were the bulk and were redone nh×.
+                    // Parallel over the m rows. The frequencies depend only on the op's shape
+                    // (computed once per op); within a row the RoPE angles depend only on the
+                    // position (not the head), so precompute (cos,sin) per rope index ONCE per row
+                    // and reuse across all heads — the sin/cos were the bulk and were redone nh×.
+                    let freqs = math::rope_freqs(theta, rd);
                     self.pool()
                         .for_chunks_mut(&mut out, nh * hd, 1, &|r, orow| {
                             let p0 = pos[r];
                             let cs: Vec<(f32, f32)> = (0..hf)
                                 .map(|p| {
-                                    // libm-ok(S2): platform `powf`, moves to `infr_core::math` in S2
-                                    let mut ang = p0 * theta.powf(-2.0 * p as f32 / rd as f32);
-                                    if let Some(ff) = &ff {
-                                        ang /= ff[p];
-                                    }
-                                    // libm-ok(S2) x2: platform `cos`, `sin`, moves to `infr_core::math` in S2
-                                    (ang.cos(), ang.sin())
+                                    let (s, c) =
+                                        math::rope_sin_cos(p0, freqs[p], ff.map(|ff| ff[p]));
+                                    (c, s)
                                 })
                                 .collect();
                             let xr = &xs[r * nh * hd..r * nh * hd + nh * hd];
@@ -2381,15 +2374,13 @@ impl Backend for CpuBackend {
                         // Each score becomes its exponential in place: the denominator sums
                         // them in key order and the weights below divide the same values, so
                         // every exp is taken once.
+                        math::exp_sub_slice(&mut sc, mx);
                         let mut l = 0f32;
-                        for s in sc.iter_mut() {
-                            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                            *s = (*s - mx).exp();
-                            l += *s;
+                        for &s in sc.iter() {
+                            l += s;
                         }
                         if let Some(sv) = sink {
-                            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                            l += (sv - mx).exp();
+                            l += math::exp(sv - mx);
                         }
                         let (e_raw, e_comp) = sc.split_at(n_keys);
                         for (&e, jr) in e_raw.iter().zip(ring_rows(lo)) {
@@ -2486,7 +2477,7 @@ impl Backend for CpuBackend {
                         } else {
                             r * up_stride + up_off
                         };
-                        for i in 0..nff {
+                        let gate_at = |i: usize| {
                             let gi = if gate_block_width > 0 {
                                 let headw = gate_block_width / 2;
                                 let head = i / headw;
@@ -2495,8 +2486,9 @@ impl Backend for CpuBackend {
                             } else {
                                 gb + i
                             };
-                            orow[i] = gated_act_fn(act, swiglu_clamp, gs[gi], us[ub + i]);
-                        }
+                            gs[gi]
+                        };
+                        gated_act_row(act, swiglu_clamp, &mut orow[..nff], gate_at, |i| us[ub + i]);
                     });
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
@@ -2520,10 +2512,13 @@ impl Backend for CpuBackend {
                     let mut out = rc.for_overwrite(rows * nff);
                     self.pool().for_chunks_mut(&mut out, nff, 1, &|r, orow| {
                         let gb = r * 2 * nff;
-                        for i in 0..nff {
-                            orow[i] =
-                                gated_act_fn(act, swiglu_clamp, gus[gb + i], gus[gb + nff + i]);
-                        }
+                        gated_act_row(
+                            act,
+                            swiglu_clamp,
+                            &mut orow[..nff],
+                            |i| gus[gb + i],
+                            |i| gus[gb + nff + i],
+                        );
                     });
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
@@ -2615,8 +2610,7 @@ impl Backend for CpuBackend {
                     let gv = &vals[gate.0 as usize]; // [rows] raw pre-sigmoid logits
                     let mut out = rc.zeroed(rows * n);
                     self.pool().for_chunks_mut(&mut out, n, 1, &|r, orow| {
-                        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                        let g = 1.0 / (1.0 + (-gv[r]).exp());
+                        let g = math::sigmoid(gv[r]);
                         for (c, o) in orow.iter_mut().enumerate() {
                             *o = mv[r * n + c] + g * sv[r * n + c];
                         }
@@ -2638,8 +2632,7 @@ impl Backend for CpuBackend {
                     let gv = &vals[gate.0 as usize]; // [rows, n_head] raw logits
                     let mut out = rc.zeroed(rows as usize * nh * hd);
                     self.pool().for_chunks_mut(&mut out, hd, 16, &|rh, orow| {
-                        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                        let g = 1.0 / (1.0 + (-gv[rh]).exp());
+                        let g = math::sigmoid(gv[rh]);
                         for (i, o) in orow.iter_mut().enumerate() {
                             *o = xs[rh * hd + i] * g;
                         }
@@ -2658,8 +2651,11 @@ impl Backend for CpuBackend {
                     self.pool().for_chunks_mut(&mut out, 4096, 4, &|c, oc| {
                         let base = c * 4096;
                         for (i, o) in oc.iter_mut().enumerate() {
-                            // libm-ok(S2): platform `tanh`, moves to `infr_core::math` in S2
-                            *o = cap * (xs[base + i] / cap).tanh();
+                            *o = xs[base + i] / cap;
+                        }
+                        math::tanh_slice(oc);
+                        for o in oc.iter_mut() {
+                            *o *= cap;
                         }
                     });
                     rc.set(&mut vals, dst.0 as usize, out);
@@ -2844,8 +2840,9 @@ impl Backend for CpuBackend {
                             bi = i as u32;
                         }
                     }
-                    // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                    let z: f32 = xs.iter().map(|&v| (v - best).exp()).sum();
+                    let mut e = xs.to_vec();
+                    math::exp_sub_slice(&mut e, best);
+                    let z: f32 = e.iter().sum();
                     rc.set(&mut vals, dst_id.0 as usize, vec![f32::from_bits(bi)]);
                     rc.set(&mut vals, dst_prob.0 as usize, vec![1.0 / z]);
                 }
@@ -3088,9 +3085,8 @@ impl Backend for CpuBackend {
                         let probs: Vec<f32> = match gating {
                             MoeGating::Softmax => {
                                 let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                                let mut p: Vec<f32> =
-                                    // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                    logits.iter().map(|&v| (v - maxl).exp()).collect();
+                                let mut p = logits.to_vec();
+                                math::exp_sub_slice(&mut p, maxl);
                                 let psum: f32 = p.iter().sum();
                                 for v in p.iter_mut() {
                                     *v /= psum;
@@ -3098,8 +3094,9 @@ impl Backend for CpuBackend {
                                 p
                             }
                             MoeGating::Sigmoid => {
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                logits.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect()
+                                let mut p = logits.to_vec();
+                                math::sigmoid_slice(&mut p);
+                                p
                             }
                             MoeGating::SqrtSoftplus => {
                                 // sqrt(softplus(x)) = sqrt(ln(1 + exp(x))). Monotone like sigmoid;
@@ -3110,8 +3107,7 @@ impl Backend for CpuBackend {
                                         let sp = if v > 20.0 {
                                             v
                                         } else {
-                                            // libm-ok(S2) x2: platform `exp`, `ln`, moves to `infr_core::math` in S2
-                                            (1.0_f32 + v.exp()).ln()
+                                            math::ln(1.0_f32 + math::exp(v))
                                         };
                                         sp.sqrt()
                                     })
@@ -3526,25 +3522,23 @@ impl Backend for CpuBackend {
                         let mut row = vec![0f32; nffx];
                         if fused_gate_up {
                             let gu = &gu_all[gu_off[b]..gu_off[b] + 2 * nffx * count];
-                            for (f, v) in row.iter_mut().enumerate() {
-                                *v = gated_act_fn(
-                                    act,
-                                    swiglu_clamp,
-                                    wp * gu[f * count + i],
-                                    wp * gu[(nffx + f) * count + i],
-                                );
-                            }
+                            gated_act_row(
+                                act,
+                                swiglu_clamp,
+                                &mut row,
+                                |f| wp * gu[f * count + i],
+                                |f| wp * gu[(nffx + f) * count + i],
+                            );
                         } else {
                             let gt = &gu_all[gu_off[b]..gu_off[b] + nffx * count];
                             let ut = &up_all[gu_off[b]..gu_off[b] + nffx * count];
-                            for (f, v) in row.iter_mut().enumerate() {
-                                *v = gated_act_fn(
-                                    act,
-                                    swiglu_clamp,
-                                    wp * gt[f * count + i],
-                                    wp * ut[f * count + i],
-                                );
-                            }
+                            gated_act_row(
+                                act,
+                                swiglu_clamp,
+                                &mut row,
+                                |f| wp * gt[f * count + i],
+                                |f| wp * ut[f * count + i],
+                            );
                         }
                         row
                     };
@@ -3863,6 +3857,7 @@ impl Backend for CpuBackend {
                         AttnMask::Canvas { lo } => (0usize, Some(lo)),
                     };
                     let hf = qkr / 2; // rope pair count
+                    let mla_freqs = math::rope_freqs(theta, qkr);
                     let ff = freq_factors.map(|f| vals[f.0 as usize].clone());
                     // deepseek32's top-k score mask `[rows, kv_len]` (0 on the selected keys,
                     // -inf elsewhere) — indexed by KEY POSITION, not by the ring row. `None` on
@@ -3906,13 +3901,11 @@ impl Backend for CpuBackend {
                             // Rope q_pe into q_full[kv_lora..]
                             for p in 0..hf {
                                 let (i0, i1) = (2 * p, 2 * p + 1);
-                                // libm-ok(S2): platform `powf`, moves to `infr_core::math` in S2
-                                let mut ang = abs as f32 * theta.powf(-2.0 * p as f32 / qkr as f32);
-                                if let Some(ff) = &ff {
-                                    ang /= ff[p];
-                                }
-                                // libm-ok(S2) x2: platform `cos`, `sin`, moves to `infr_core::math` in S2
-                                let (s, c) = (ang.sin(), ang.cos());
+                                let (s, c) = math::rope_sin_cos(
+                                    abs as f32,
+                                    mla_freqs[p],
+                                    ff.as_ref().map(|ff| ff[p]),
+                                );
                                 let a = q_pe_raw[i0];
                                 let b = q_pe_raw[i1];
                                 q_full[kv_lora + i0] = a * c - b * s;
@@ -3933,17 +3926,18 @@ impl Backend for CpuBackend {
                                 }
                                 mx = mx.max(*scj);
                             }
+                            // Each score becomes its exponential once; the sum and the
+                            // weights read the same values.
+                            math::exp_sub_slice(&mut sc, mx);
                             let mut l = 0f32;
-                            for &s in &sc {
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                l += (s - mx).exp();
+                            for &e in &sc {
+                                l += e;
                             }
                             // Accumulate: V is first kv_lora columns of K.
-                            for (jj, &s) in sc.iter().enumerate() {
+                            for (jj, &e) in sc.iter().enumerate() {
                                 let j = lo + jj;
                                 let jr = if cap_rows > 0 { j % cap_rows } else { j };
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                let p = (s - mx).exp() / l;
+                                let p = e / l;
                                 let krow = jr * key_len;
                                 // attn_out[jj] += p * V[jj] where V[jj] = ks[krow..krow+kv_lora]
                                 // Apply wv_b[h] to the accumulated output directly:
@@ -4149,8 +4143,7 @@ impl Backend for CpuBackend {
                             let z = mx[t * mix_dim + h] * sc[0] + bs[h];
                             // sigmoid, then + eps — the FOURTH eps site (`ggml_scale_bias(pre,
                             // 1.0f, eps)`), distinct from the three inside Sinkhorn.
-                            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                            *o = 1.0 / (1.0 + (-z).exp()) + eps;
+                            *o = math::sigmoid(z) + eps;
                         }
                     }
                     // Every output is built before any is stored: `mx`/`sc`/`bs` borrow `vals`.
@@ -4160,8 +4153,7 @@ impl Backend for CpuBackend {
                             for (h, o) in p.iter_mut().enumerate() {
                                 let z = mx[t * mix_dim + hc + h] * sc[1] + bs[hc + h];
                                 // sigmoid, then × 2 — NOT + eps. Adjacent chunk, different tail.
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                *o = 2.0 / (1.0 + (-z).exp());
+                                *o = 2.0 / (1.0 + math::exp(-z));
                             }
                         }
                         let mut comb_out = vec![0f32; rows * hc * hc];
@@ -4286,15 +4278,15 @@ impl Backend for CpuBackend {
                             }
                         }
                         let mut den = vec![0f32; ne];
+                        let mut es = vec![0f32; ne];
                         for (vr, sr) in vb.chunks_exact(ne).zip(sb.chunks_exact(ne)) {
-                            for (((o, d), (&m, &s)), &v) in o
-                                .iter_mut()
-                                .zip(den.iter_mut())
-                                .zip(m.iter().zip(sr))
-                                .zip(vr)
+                            for ((e, &m), &s) in es.iter_mut().zip(m.iter()).zip(sr) {
+                                *e = s - m;
+                            }
+                            math::exp_slice(&mut es);
+                            for (((o, d), &e), &v) in
+                                o.iter_mut().zip(den.iter_mut()).zip(es.iter()).zip(vr)
                             {
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                let e = (s - m).exp();
                                 *d += e;
                                 *o = v.mul_add(e, *o);
                             }
@@ -4421,12 +4413,7 @@ fn conv1d_silu(
         rr,
         cc,
         kk,
-        &|_, orow| {
-            for o in orow {
-                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                *o /= 1.0 + (-*o).exp();
-            }
-        },
+        &|_, orow| math::silu_slice(orow),
     );
 }
 
@@ -4635,16 +4622,10 @@ fn deltanet_scan(
             for x in kh.iter_mut() {
                 *x /= kn;
             }
-            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-            let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
+            let beta = math::sigmoid(bf[bb + h]);
             // softplus(a + dt_bias), then g = a_coef * softplus (≤ 0); decay = exp(g).
-            let sp = {
-                let z = af[bb + h] + dtb[h];
-                // libm-ok(S2) x2: platform `exp`, `ln_1p`, moves to `infr_core::math` in S2
-                z.max(0.0) + (-z.abs()).exp().ln_1p()
-            };
-            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-            let decay = (acoef[h] * sp).exp();
+            let sp = math::softplus(af[bb + h] + dtb[h]);
+            let decay = math::exp(acoef[h] * sp);
             for x in sh.iter_mut() {
                 *x *= decay;
             }
@@ -4863,7 +4844,7 @@ mod tests {
                 }
                 acc += xt[ch] * ws[ch * kk + (kk - 1)];
                 out[t * cc + ch] = if silu {
-                    acc / (1.0 + (-acc).exp())
+                    acc / (1.0 + math::exp(-acc))
                 } else {
                     acc
                 };
@@ -5017,12 +4998,12 @@ mod tests {
                 for x in kh.iter_mut() {
                     *x /= kn;
                 }
-                let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
+                let beta = 1.0 / (1.0 + math::exp(-bf[bb + h]));
                 let sp = {
                     let z = af[bb + h] + dtb[h];
-                    z.max(0.0) + (-z.abs()).exp().ln_1p()
+                    z.max(0.0) + math::ln_1p(math::exp(-z.abs()))
                 };
-                let decay = (acoef[h] * sp).exp();
+                let decay = math::exp(acoef[h] * sp);
                 let sh = &mut st[h * kd * vd..(h + 1) * kd * vd];
                 for x in sh.iter_mut() {
                     *x *= decay;

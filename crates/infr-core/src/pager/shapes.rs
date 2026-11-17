@@ -13,6 +13,7 @@
 
 use super::trace::{Call, PoolTrace};
 use super::{BlockId, Insert};
+use crate::math;
 
 /// xorshift64 (G. Marsaglia, "Xorshift RNGs", 2003, the `<<13 >>7 <<17` triple).
 #[derive(Debug, Clone)]
@@ -59,8 +60,9 @@ impl Zipf {
         let mut acc = 0.0;
         let mut cdf: Vec<f64> = (0..n)
             .map(|k| {
-                // libm-ok(S2): an f64 pager workload shape, not inference output; S2 decides
-                acc += 1.0 / ((k + 1) as f64).powf(s);
+                // The correctly rounded binary32 power: the same shape on every platform, and
+                // exact (`(k+1)^1 = k+1`) at the `s = 1` every shape uses today.
+                acc += 1.0 / math::powf((k + 1) as f32, s as f32) as f64;
                 acc
             })
             .collect();

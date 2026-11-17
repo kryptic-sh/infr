@@ -58,19 +58,7 @@ const MARKER: &str = "libm-ok(S2)";
 
 /// Files allowed to carry markers, crate-relative, with the number of marked calls each holds.
 /// Every entry is a file whose platform-math calls have not been migrated yet; S2 removes them.
-const ALLOWLIST: &[(&str, usize)] = &[
-    ("infr-core/src/decode_spec.rs", 1),
-    ("infr-core/src/pager/shapes.rs", 1),
-    ("infr-cpu/src/kernels.rs", 3),
-    ("infr-cpu/src/lib.rs", 33),
-    ("infr-llama/src/config.rs", 3),
-    ("infr-llama/src/diffusion.rs", 2),
-    ("infr-llama/src/mtp/mod.rs", 1),
-    ("infr-llama/src/sampling.rs", 5),
-    ("infr-llama/src/seam/runner.rs", 1),
-    ("infr-llama/src/seam/sc.rs", 2),
-    ("infr-metal/src/exec.rs", 10),
-];
+const ALLOWLIST: &[(&str, usize)] = &[];
 
 #[test]
 fn no_platform_libm_outside_the_allowlist() {

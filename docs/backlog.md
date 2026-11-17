@@ -6595,12 +6595,23 @@ every other dtype. The options as weighed:
 - **A decode `Linear` kernel's per-call time moves between builds that do not
   touch it.** gemma-3-1b's `Linear m=1 1152x6912 Q5_0` took 249-259 µs per call
   in two builds and 280-282 µs in a third (`INFR_PROF_OPS=1`, tg64, two
-  interleaved rounds each, 2026-11-17), whose source differed from the second
-  only in the math tier switch and its config type, `deltanet_scan` and the
-  pager's Zipf shape: enough to move gemma's whole decode about 5%. Presumed to
-  be code placement (alignment of the hot loop), not confirmed. It means a
-  decode A/B on this machine can show a few percent that belongs to neither
-  side; a per-op profile shows where it lands.
+  interleaved rounds each, 2026-11-17), whose source differed from the second in
+  the RoPE frequency cache (the one change on gemma's decode path), the math
+  tier switch and its config type, `deltanet_scan` and the pager's Zipf shape:
+  enough to move gemma's whole decode about 5%. A review found nothing in those
+  changes on the one-row Linear path itself. Two guesses, neither confirmed:
+  code placement (alignment of the hot loop), or the cache removing one
+  allocation and free per RoPE op, which changes the allocator state and with it
+  the address and alignment of the recycled activation buffer the Q5_0 Linear
+  reads. Comparing that input's address mod 64 and mod 4096 in the two builds
+  would settle the second. It means a decode A/B on this machine can show a few
+  percent that belongs to neither side; a per-op profile shows where it lands.
+- **`deltanet_scan` gaps a review found, neither reachable today.** Every shape
+  in `deltanet_scan_bit_identical_to_serial` has `kd == vd`, so a transposed
+  key/value dimension in the indexing would pass (real Qwen3.5 is square too).
+  And `rows == 0` or a zero head dimension now panics in `chunks_mut` where the
+  old form returned an empty result; the only producer (`runner.rs`) passes the
+  batch size, and no zero-batch path was found.
 - **Worth understanding: the int8 path amplifies last-bit differences.** Old
   against new decode logits on Qwen3-0.6B differ by up to about 1.2 absolute (KL
   up to 6e-2), from RoPE values that changed only in the last bit. The presumed

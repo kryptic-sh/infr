@@ -343,7 +343,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   each head's recurrent state in place instead of scanning a copy and copying
   every head back, so a decode `DeltaNet` call on Qwen3.5-0.8B went from 113-118
   to 40-41 µs and tg64 from 56.2-56.9 to 64.7-65.3 t/s (four interleaved rounds
-  against the code before this change).
+  against `main` before the math migration).
 
 - **A GPU session with no room left for any context fails with the numbers.**
   When the device's free memory after the weights cannot hold even a one-token

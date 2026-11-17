@@ -5,17 +5,20 @@
 //! build's own target ([`Tier::Baseline`]) and, on x86-64, again inside functions carrying
 //! `#[target_feature(enable = ...)]` for AVX2 and AVX-512, so a binary built for baseline x86-64
 //! (the released binaries, CI) still runs four or eight binary64 lanes on a CPU that has them.
-//! The first call picks the widest tier the CPU supports; [`force_tier`] overrides that (the
-//! `kernels.cpu.math_tier` setting).
+//! The first call picks the widest tier the CPU supports; [`set_tier`] chooses one instead (the
+//! `kernels.cpu.math_tier` setting, which every CPU backend applies when it is built). The
+//! active tier is process-wide: one setting for every thread and every backend.
 //!
 //! **Why every tier gives the same bits.** The tiers are the SAME Rust source, so they perform
 //! the same IEEE 754 operations in the same order on each element; vectorizing only changes how
 //! many elements run at once. Rust never contracts `a*b + c` into a fused multiply-add or
 //! reassociates floating-point operations, with or without a target feature, so a wider tier
-//! cannot round differently. FMA is deliberately NOT among the enabled features all the same, so
-//! the question cannot arise. `tests/math.rs` checks every tier the CPU supports against the
-//! scalar functions on a dense grid in every test run, and on all `2^32` inputs in an ignored
-//! test.
+//! cannot round differently. FMA instructions may well be available to the compiler in the wide
+//! tiers (enabling `avx512f` implies the `fma` target feature, and a `target-cpu=native` build
+//! has it in every tier); the bits rest on the language never contracting without an explicit
+//! `mul_add`, which `infr_core::math` never calls. `tests/math.rs` checks every tier the CPU
+//! supports against the scalar functions on a dense grid in every test run, and on all `2^32`
+//! inputs in an ignored test; a contraction would make them fail.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -28,9 +31,11 @@ pub enum Tier {
     /// The build's own target features: SSE2 on a baseline x86-64 build, NEON on aarch64, and
     /// whatever `-C target-cpu` enables otherwise.
     Baseline,
-    /// AVX2 (x86-64 only; FMA not enabled).
+    /// AVX2 (x86-64 only). FMA may be available to the compiler here; see the module doc for
+    /// why it cannot change a result.
     Avx2,
-    /// AVX-512 F, DQ, VL and BW (x86-64 only; FMA not enabled).
+    /// AVX-512 F, DQ, VL and BW (x86-64 only). These imply the `fma` target feature; see the
+    /// module doc for why it cannot change a result.
     Avx512,
 }
 
@@ -320,33 +325,47 @@ fn encode(t: Tier) -> u8 {
     Tier::ALL.iter().position(|&a| a == t).expect("a tier") as u8 + 1
 }
 
-/// The tier the slice functions run: [`Tier::best`] on first use unless [`force_tier`] chose
-/// one.
+fn decode(n: u8) -> Tier {
+    Tier::ALL[n as usize - 1]
+}
+
+/// The tier the slice functions run: the one [`set_tier`] last chose, else [`Tier::best`],
+/// installed on first use.
 pub fn tier() -> Tier {
     match ACTIVE.load(Ordering::Relaxed) {
-        0 => {
-            let t = Tier::best();
-            // Racing first calls all store the same value.
-            ACTIVE.store(encode(t), Ordering::Relaxed);
-            t
-        }
-        n => Tier::ALL[n as usize - 1],
+        0 => install_first(Tier::best()),
+        n => decode(n),
     }
 }
 
-/// Run every slice function at `tier` from now on, process-wide (the `kernels.cpu.math_tier`
-/// debug setting; the result bits are the same at every tier, only the speed differs).
+/// Install `auto` as the active tier only if nothing is active yet, and return the active tier:
+/// a first use racing a [`set_tier`] must not overwrite the tier that call chose.
+fn install_first(auto: Tier) -> Tier {
+    match ACTIVE.compare_exchange(0, encode(auto), Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => auto,
+        Err(n) => decode(n),
+    }
+}
+
+/// Run every slice function at `tier` from now on, or at [`Tier::best`] for `None`. This is
+/// the `kernels.cpu.math_tier` debug setting, and it is process-wide: the last call wins for
+/// every thread and every backend. Only speed is at stake; the result bits are the same at
+/// every tier.
 ///
 /// # Errors
 /// If this CPU cannot run `tier`; the active tier is then unchanged.
-pub fn force_tier(tier: Tier) -> Result<(), String> {
-    if !tier.supported() {
-        return Err(format!(
-            "math tier `{}` is not supported by this CPU (best: `{}`)",
-            tier.name(),
-            Tier::best().name()
-        ));
-    }
+pub fn set_tier(tier: Option<Tier>) -> Result<(), String> {
+    let tier = match tier {
+        None => Tier::best(),
+        Some(t) if t.supported() => t,
+        Some(t) => {
+            return Err(format!(
+                "math tier `{}` is not supported by this CPU (best: `{}`)",
+                t.name(),
+                Tier::best().name()
+            ))
+        }
+    };
     ACTIVE.store(encode(tier), Ordering::Relaxed);
     Ok(())
 }
@@ -394,4 +413,22 @@ pub fn silu_slice(xs: &mut [f32]) {
 /// `xs[i] = gelu_tanh(xs[i])`.
 pub fn gelu_tanh_slice(xs: &mut [f32]) {
     (active().gelu_tanh)(xs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A first use that lost the race to [`set_tier`] keeps the tier `set_tier` chose. Turns red
+    /// if `install_first` stores unconditionally (the race the compare-exchange closes).
+    #[test]
+    fn first_use_never_overwrites_a_chosen_tier() {
+        set_tier(Some(Tier::Baseline)).unwrap();
+        // A first use that read 0 before `set_tier` ran, now installing the auto tier.
+        let auto = Tier::ALL[Tier::ALL.len() - 1];
+        assert_eq!(install_first(auto), Tier::Baseline);
+        assert_eq!(tier(), Tier::Baseline);
+        set_tier(None).unwrap();
+        assert_eq!(tier(), Tier::best());
+    }
 }

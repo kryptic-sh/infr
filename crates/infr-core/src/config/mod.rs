@@ -535,12 +535,13 @@ cfg_struct! {
         /// `INFR_CPU_REPACK_MB`: repack-cache byte budget, in MiB.
         repack_mb: usize = 4096,
         /// `INFR_CPU_MATH_TIER`: force the SIMD tier of `infr_core::math`'s slice functions
-        /// (`baseline`, `avx2` or `avx512`, a [`crate::math::Tier`] name) instead of the widest
-        /// one the CPU supports. A debug switch: every tier gives the same bits, so this changes
-        /// only speed; it exists to run the narrow (baseline) path on a machine that has wider
-        /// ones. Process-wide, applied when a CPU backend is built, which refuses a tier the CPU
-        /// lacks.
-        math_tier: Option<String> = None,
+        /// (`baseline`, `avx2` or `avx512`, a [`crate::math::Tier`] name; any other value is a
+        /// config error) instead of the widest one the CPU supports. A debug switch: every tier
+        /// gives the same bits, so this changes only speed; it exists to run the narrow
+        /// (baseline) path on a machine that has wider ones. PROCESS-WIDE: every CPU backend
+        /// applies its value when it is built (unset = the widest tier), so the last backend
+        /// built decides the tier for all of them. A tier the CPU lacks panics there.
+        math_tier: Option<crate::math::Tier> = None,
         /// The bit-reference kernel path (`CpuBackend::reference()`). Has NO env key and never
         /// had one — it is the model the rest of the campaign follows: a typed field on the
         /// owning struct, chosen by the caller.

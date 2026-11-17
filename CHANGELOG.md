@@ -109,8 +109,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   slice functions run at the widest SIMD tier the CPU has, chosen at run time
   (baseline, AVX2 or AVX-512 on x86-64), so a baseline x86-64 build still runs
   them four or eight binary64 lanes wide; `math::Tier`, `math::slice_fns`,
-  `math::force_tier` and the new `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER`
-  setting force one (a debug switch: every tier gives the same bits). Also
+  `math::set_tier` and the new `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER`
+  setting force one. It is a process-wide debug switch (every tier gives the
+  same bits): each CPU backend applies its value when built, unset meaning the
+  widest tier, so the last backend built decides; a misspelt tier is a config
+  error at load in the file, `--set` and the environment alike. Also
   `rope_freqs` and `rope_sin_cos`, the RoPE angles every CPU RoPE variant now
   shares. A new lint, `crates/infr-core/tests/no_platform_libm.rs`, fails on any
   platform math call in production code.

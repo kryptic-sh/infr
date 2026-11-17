@@ -1388,6 +1388,64 @@ fn tune_map_reaches_every_layer_with_its_level() {
     );
 }
 
+/// `kernels.cpu.math_tier` takes a tier name in every layer and refuses anything else at load
+/// time, as a config error naming the key, rather than letting a CPU backend panic on it later.
+/// Turns red if the `Tier` value grammar accepts an unknown name.
+#[test]
+fn math_tier_is_checked_at_load() {
+    use crate::math::Tier;
+    let ok = file::parse_str(
+        "[kernels.cpu]
+math_tier = \"AVX2\"
+",
+        Path::new("infr.toml"),
+    )
+    .expect("a tier name")
+    .0;
+    assert_eq!(ok.kernels.cpu.math_tier, Some(Some(Tier::Avx2)));
+    let err = file::parse_str(
+        "[kernels.cpu]
+math_tier = \"avx3\"
+",
+        Path::new("infr.toml"),
+    )
+    .unwrap_err();
+    match err {
+        ConfigError::Value { path, message } => {
+            assert_eq!(path, "kernels.cpu.math_tier");
+            assert!(message.contains("baseline, avx2 or avx512"), "{message}");
+        }
+        other => panic!("expected a value error, got {other:?}"),
+    }
+    let err = cli::parse_reporting(&ConfigOverrides {
+        sets: vec!["kernels.cpu.math_tier=sse9".to_string()],
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(
+        matches!(&err, ConfigError::Value { path, .. } if path == "kernels.cpu.math_tier"),
+        "{err:?}"
+    );
+    let err = try_env_layer(&[("INFR_CPU_MATH_TIER", "avx3")]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Env {
+                key: "INFR_CPU_MATH_TIER",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        env_layer(&[("INFR_CPU_MATH_TIER", "baseline")])
+            .kernels
+            .cpu
+            .math_tier,
+        Some(Some(Tier::Baseline))
+    );
+}
+
 /// A malformed key or value is refused at the layer: loudly from the environment and the command
 /// line, as a value error from the file. (Whether the parameter EXISTS is the Vulkan resolver's
 /// call — it owns the list.)

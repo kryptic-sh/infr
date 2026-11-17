@@ -177,7 +177,9 @@ fn env_cfg() -> infr_llama::EngineConfig {
     let mut cfg = infr_llama::EngineConfig::default();
     cfg.device.dev = std::env::var("INFR_DEV").ok();
     cfg.debug.cpu_op_hash = std::env::var_os("INFR_CPU_OP_HASH").map(PathBuf::from);
-    cfg.kernels.cpu.math_tier = std::env::var("INFR_CPU_MATH_TIER").ok();
+    cfg.kernels.cpu.math_tier = std::env::var("INFR_CPU_MATH_TIER")
+        .ok()
+        .map(|t| infr_core::math::Tier::parse(&t).expect("INFR_CPU_MATH_TIER: a tier name"));
     infr_testkit::honour_env(&mut cfg);
     cfg
 }

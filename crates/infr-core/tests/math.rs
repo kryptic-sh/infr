@@ -943,13 +943,14 @@ fn tier_switch() {
     let host = host_tiers();
     assert_eq!(math::Tier::best(), *host.last().unwrap());
     for t in math::Tier::ALL {
-        let r = math::force_tier(t);
+        let r = math::set_tier(Some(t));
         assert_eq!(r.is_ok(), host.contains(&t), "{t:?}: {r:?}");
         if r.is_ok() {
             assert_eq!(math::tier(), t);
         }
     }
-    math::force_tier(math::Tier::best()).unwrap();
+    math::set_tier(None).unwrap();
+    assert_eq!(math::tier(), math::Tier::best());
 }
 
 /// Each slice function equals its scalar function on every binary32 input, in batches, at

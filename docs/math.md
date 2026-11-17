@@ -121,21 +121,28 @@ x86-64 `avx2` and `avx512` (F, DQ, VL, BW), each the same loop inside a
 `#[target_feature]` function (`src/math/slices.rs`). The first call picks the
 widest tier the CPU has (`is_x86_feature_detected!`), so a binary built for
 baseline x86-64 — the released binaries and CI — still runs four or eight
-binary64 lanes where the CPU has them. FMA is not among the enabled features, so
-no tier could contract `a*b + c` even if Rust did (it does not: it never fuses
-or reassociates floating-point operations, with or without a target feature).
-The tiers are the same source performing the same operations per element in the
-same order, so they give the same bits by construction; the tests below prove it
-on every input.
+binary64 lanes where the CPU has them. FMA instructions may be available to the
+compiler in the wide tiers (enabling `avx512f` implies the `fma` target feature,
+and a `target-cpu=native` build has FMA in every tier). The bits do not depend
+on that: Rust never contracts `a*b + c` into a fused operation without an
+explicit `mul_add`, which this module never calls, and never reassociates
+floating-point operations. The tiers are the same source performing the same
+operations per element in the same order, so they give the same bits by
+construction; the exhaustive tier-identity tests below would fail if a tier
+contracted or reordered anything.
 
 **Forcing a tier.** `kernels.cpu.math_tier` (`INFR_CPU_MATH_TIER`: `baseline`,
-`avx2`, `avx512`) makes every slice run at that tier, process-wide, from the
-moment a CPU backend is built. A tier the CPU lacks is refused (the backend
-panics with the reason; a misspelt `INFR_CPU_MATH_TIER` is a configuration
-error). It changes only speed; it exists so the two-lane path every aarch64
-machine and every pre-AVX2 x86 CPU runs can be measured and tested on a machine
-with wider ones. In a `target-cpu=native` build `baseline` is the native code,
-so a baseline measurement needs a baseline build
+`avx2`, `avx512`) makes every slice run at that tier. It is a process-wide debug
+switch: every CPU backend applies its value when it is built (`math::set_tier`;
+unset means the widest tier), so the backend built last decides for every
+backend in the process, and a backend built without the setting puts the process
+back on the widest tier rather than inheriting an earlier one's debug setting. A
+misspelt name is a configuration error at load, from the file, `--set` or the
+environment alike; a tier the CPU lacks makes the backend panic with the reason
+when it is built. It changes only speed; it exists so the two-lane path every
+aarch64 machine and every pre-AVX2 x86 CPU runs can be measured and tested on a
+machine with wider ones. In a `target-cpu=native` build `baseline` is the native
+code, so a baseline measurement needs a baseline build
 (`RUSTFLAGS="-C target-cpu=x86-64"`).
 
 **The two-lane path.** With two binary64 lanes and no gather, the loop the

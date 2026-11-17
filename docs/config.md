@@ -239,7 +239,10 @@ and these exist to force one off when bisecting a correctness or perf problem.
   core; Windows only, no `INFR_*` twin), and `math_tier` (`INFR_CPU_MATH_TIER`:
   force the SIMD tier of `infr_core::math`'s slice functions, `baseline`, `avx2`
   or `avx512`, instead of the widest the CPU has; every tier gives the same
-  bits, so it changes only speed, and a tier the CPU lacks is refused; see
+  bits, so it changes only speed. It is a process-wide debug switch: every CPU
+  backend applies it when built, unset meaning the widest tier, so the last
+  backend built decides for the whole process. A misspelt name is a config error
+  at load, and a tier the CPU lacks panics when the backend is built; see
   [`math.md`](math.md)).
 
 ### Vulkan kernel tuning

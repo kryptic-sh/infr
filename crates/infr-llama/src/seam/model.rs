@@ -444,8 +444,10 @@ impl SeamModel {
     /// Load a model on a caller-supplied engine configuration. `tokenizer_path` overrides the
     /// GGUF's embedded vocab when given.
     ///
-    /// THE constructor: no environment, no globals, no process-wide ordering hazard, and two
-    /// models with different configurations can coexist in one process. `infr-cli` resolves ONE
+    /// THE constructor: no environment, and two models with different configurations can
+    /// coexist in one process, with one exception: `kernels.cpu.math_tier` is a process-wide
+    /// debug switch that every CPU backend applies when built (see `CpuBackend::new_with`),
+    /// which changes only speed. `infr-cli` resolves ONE
     /// `Arc<Config>` in `main()` and hands the same handle to every model it loads. The old
     /// `load(gguf, tok)` — which built a config from the environment for callers that had none —
     /// was deleted once every caller had one to give.

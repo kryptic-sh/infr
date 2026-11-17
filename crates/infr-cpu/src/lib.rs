@@ -360,20 +360,19 @@ impl CpuBackend {
     }
 
     /// A backend that reads its knobs from `cfg`. This is the constructor the campaign is heading
-    /// for: no environment, no globals, no process-wide ordering hazard — two backends with
-    /// different configurations can coexist in one test.
+    /// for: no environment, and two backends with different configurations can coexist in one
+    /// test, with ONE exception: `kernels.cpu.math_tier` is a process-wide debug switch. Every
+    /// construction applies it ([`math::set_tier`]; unset = the widest tier the CPU has), so
+    /// the backend built last decides the math slices' tier for every backend in the process.
+    /// Only speed is at stake: every tier gives the same bits.
     ///
     /// # Panics
-    /// If `kernels.cpu.math_tier` names a tier that does not exist or that this CPU cannot run:
-    /// a debug switch that silently ran another tier would measure the wrong thing.
+    /// If `kernels.cpu.math_tier` names a tier this CPU cannot run: a debug switch that silently
+    /// ran another tier would measure the wrong thing. (A misspelt name never gets here; it is
+    /// a config error when the configuration is loaded.)
     pub fn new_with(cfg: Arc<Config>) -> Self {
-        if let Some(name) = &cfg.kernels.cpu.math_tier {
-            let tier = math::Tier::parse(name).unwrap_or_else(|| {
-                panic!("kernels.cpu.math_tier: unknown tier `{name}` (baseline, avx2 or avx512)")
-            });
-            if let Err(e) = math::force_tier(tier) {
-                panic!("kernels.cpu.math_tier: {e}");
-            }
+        if let Err(e) = math::set_tier(cfg.kernels.cpu.math_tier) {
+            panic!("kernels.cpu.math_tier: {e}");
         }
         Self {
             weight_cache: Mutex::default(),

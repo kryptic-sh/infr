@@ -350,13 +350,13 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     // A debug switch whose whole point is the tier it names: a misspelt one is refused rather
     // than silently running the default.
     if let Some(raw) = get("INFR_CPU_MATH_TIER") {
-        if crate::math::Tier::parse(&raw).is_none() {
-            return Err(ConfigError::Env {
+        let tier = <crate::math::Tier as super::partial::ConfigValue>::parse_set(&raw).map_err(
+            |message| ConfigError::Env {
                 key: "INFR_CPU_MATH_TIER",
-                message: format!("unknown math tier `{raw}` (baseline, avx2 or avx512)"),
-            });
-        }
-        p.kernels.cpu.math_tier = Some(Some(raw));
+                message,
+            },
+        )?;
+        p.kernels.cpu.math_tier = Some(Some(tier));
     }
 
     // ── kernels (graph shape, `infr-llama`) ──────────────────────────────────

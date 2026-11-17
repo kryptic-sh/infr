@@ -6577,10 +6577,13 @@ every other dtype. The options as weighed:
   `Op::HeadGate` and `MoeSharedExpertAdd` (one sigmoid per head or row), the MLA
   rope's sines and cosines (per query, head and pair) and the Metal backend's
   host fallbacks. (Sinkhorn's softmax does use `exp_sub_slice`.)
-- **`docs/synthetic-models.md` still says exact-token goldens are not
-  portable**, which remains true across CPU microarchitectures (and for the
-  matmul tiers until S4) but no longer across operating systems; its Qwen3.5 row
-  ("not CI-portable") predates the migration and was not re-checked on CI.
+- **`docs/synthetic-models.md` still argues that exact-token goldens are not
+  portable** (its "Failure mode 2"). Plan 11 found the cause of the case it
+  cites (the AVX-512 Q8_0 kernels, fixed in S4) and the CPU output is now the
+  same on every OS, tier, thread count and chunk height tested; the section's
+  advice (logits with tolerance, wide-margin weights) still holds for synthetic
+  models, but its premise should be rewritten once CI's three systems have run
+  the goldens.
 - **What the S2 review checked only by reading.** The reviewer compared the
   branch op hash for op hash against a control (`origin/main` with every
   platform call rewritten one for one to scalar `infr_core::math`) across seven
@@ -6618,3 +6621,78 @@ every other dtype. The options as weighed:
   `CpuBackend::reference()`, and a test that measures the amplification (one
   last-bit perturbation, logits distance on both paths) would put a number on
   it.
+
+### B203 — `Op::MoeFfn` is not row-count identical: one row f32, several int8 (2026-11-17)
+
+**Tag:** cpu · determinism · **Kind:** decision for the owner
+
+Plan 11's row-count identity (`tests/support/row_identity.rs`) holds every dense
+family bit for bit at prefill chunk heights 512, 7, 3 and 1. The MoE layer
+cannot, by design: `Op::MoeFfn` feeds Q4_K, Q5_K, Q6_K and Q8_0 expert banks
+int8 activations when the op has two rows or more and f32 activations at one row
+(`int8_ok = rows >= 2 && !reference` in `crates/infr-cpu/src/lib.rs`, then
+`moe::expert_acts_kind`). So a prompt prefilled in chunks and one prefilled a
+row at a time differ from the first MoE layer on, and a chunk that happens to
+hold one row (a prompt length one past a multiple of the height) switches path
+in the middle of a prefill. `docs/deepseek.md` ("Quantized expert banks: chunked
+prefill is close, not equal") measured it on the synthetic V4 file: 1.71e-4 max
+|logit difference| at the prompt's last position. Every height of two rows or
+more is identical to every other, and reference mode (`kernels.cpu.reference`)
+is identical at every height. The row-count tests leave the MoE models out and
+say why.
+
+Options:
+
+- **int8 at one row too** (what B201 chose for `Op::Linear`): row-count identity
+  everywhere, likely faster decode (the int8 one-row `Linear` measured 2.2-8.8x
+  faster than the f32 dot it replaced), slightly further from llama.cpp, and
+  every MoE model's CPU decode output changes once (re-bless
+  `cpu_golden_ernie4_5_moe`, `cpu_golden_qwen3moe` and the synthetic V4
+  fixtures' CPU-side values). Not measured for the MoE expert tiles.
+- **f32 at every row count**: identity, closest to exact, but MoE prefill loses
+  the int8 kernels and the packed VNNI tiles (several times slower prefill on
+  the expert GEMMs, by B201's measurements of the same trade on `Linear`).
+- **Leave it** (today): documented, tested as an exception.
+
+### B204 — what plan 11's S3/S4 (tier, thread and row identity) left (2026-11-17)
+
+**Tag:** cpu · tests · ci · **Kind:** coverage gaps and open items
+
+- **Not yet run anywhere but this machine:** the `cpu-goldens-os` CI job
+  (Windows and macOS goldens of Qwen3-0.6B, gemma-3-1b, Qwen3.5-0.8B), Qwen3.5
+  in the Linux goldens job, and the op-hash suite on macOS (aarch64, the first
+  run of any CPU op there). The Windows leg's model download (`pipx`, `hf` under
+  `shell: bash` on `windows-2025`) and its cache size are unverified. The macOS
+  leg is `continue-on-error` until it has passed once; drop that then. The
+  repository cache is near its limit (B197), and each leg caches about 1.7 GB.
+- **Thread counts were tested on small shapes.** `op_hashes.rs` runs every op at
+  1, 2, 3, 7, 33 and the machine's thread count, but its tensors are small, so
+  pool chunk thresholds that only split large work (`KV_WIDEN_CHUNK`,
+  `DECODE_ROWS_MIN`..`MAX`, the attention query blocks past a few) are reached
+  only by the real-model tests at the machine's own count. By reading, every
+  parallel op partitions outputs and never splits one reduction across tasks
+  (`Argmax`, `ArgmaxProb` and the samplers run serially); not proven for large
+  shapes.
+- **The ±0/NaN audit's harmless sites** (`docs/math.md`, "Identity across tiers,
+  threads, row counts and architectures"): softmax and attention row maxima, the
+  lightning indexer's `d.max(0.0)` ReLU, the SwiGLU clamp's `gate.min(limit)`,
+  the int8 quantizers' `|x|` maxima. If one of them is ever used for more than
+  an `exp(x - max)` offset or a sum term, revisit it.
+- **S6 is open:** on a baseline x86-64 build (the release binaries, CI) every
+  `mul_add` in the f32 dots (`kernels::dot`, `dot_n`, `dot_mn`, `dot_f16`,
+  `dot_bf16`, attention's value accumulation, `dequant_row`) is a call to the C
+  runtime's `fma`: exact, so the bits match a native build, but slow. A run-time
+  FMA tier behind `crate::simd` would keep the bits and the speed.
+- **gemma-3-1b's Q5_0 kernels move with code placement.** Plan 11's branch
+  measured gemma-3-1b pp512 3-5% slower and tg64 10-15% faster than
+  `origin/main`, all in `Linear ... Q5_0`, a kernel it did not change; a control
+  build that differed only in the tier check matched main's prefill, while the
+  same-binary microbenchmark of dispatcher against direct call showed no cost
+  (`docs/math.md`, "Identity across tiers …", for the numbers). The same kernel
+  moved 249-282 µs per decode call between unrelated builds before (B202). What
+  in the layout decides it was not found; aligning or splitting the Q5_0 batch
+  kernels' hot loop, or `#[inline(never)]` on the per-tier kernels, are the
+  obvious experiments.
+- **No NEON kernels.** aarch64 runs every family's scalar kernel. A NEON tier
+  must compute the scalar expression; `kernels/tier_tests.rs` will hold it to
+  that once it is a tier `crate::simd` dispatches.

@@ -181,6 +181,86 @@ for a binary32 division done in binary64) but a binary64 division has half the
 lanes of a binary32 one (not measured here). No cheaper form with the same bits
 was found; the two-pass loop instead runs the binary32 division four lanes wide.
 
+## Identity across tiers, threads, row counts and architectures
+
+Plan 11's S3 and S4 extend the guarantee from this module to the whole CPU
+backend. What is proven, and how:
+
+- **Every SIMD tier.** `kernels.cpu.max_tier` (`scalar`, `avx2`, `avx512`,
+  `avx512vnni`; `infr_core::simd`) caps every run-time dispatch in the CPU
+  backend and the slices above. `crates/infr-cpu/src/kernels/tier_tests.rs` runs
+  every quantized kernel family (one-row and batch, Q2_K to Q8_0, the IQ and
+  ternary formats, the native-32-block family, MXFP4, NVFP4, Q4_K's 2- and 8-row
+  tiles, the 8-row Q8_0/Q5_0 tile) through its dispatcher at each tier the host
+  has and holds it to the scalar tier's bits, on inputs that reach the int8
+  extremes, both zero signs, subnormals and every code pattern, and checks which
+  tier each dispatcher took. One family differed (AVX-512 Q8_0, fixed in S4; see
+  the golden table below). The f32/f16/bf16 dots have no run-time dispatch: one
+  source fixes the order of every `mul_add` and of the lane sum.
+- **Every op, tier and thread count.** `crates/infr-cpu/tests/op_hashes.rs`:
+  every `Op` variant, one checked-in hash per case at every tier and at 1, 2, 3,
+  7, 33 and the machine's threads. The packed VNNI GEMMs and the MoE expert
+  tiles are covered there (they have no scalar form of their own to compare
+  with).
+- **Every prefill chunk height** for the dense families
+  (`crates/infr-llama/tests/support/row_identity.rs`): the same ids and the same
+  bits in everything the last position and the decode steps write, at heights
+  512, 7, 3 and 1, on Qwen3, gemma-3, Qwen3.5, LFM3, ERNIE-4.5 and SmolLM3 and
+  on the synthetic LFM3 file in CI. **Exception, by design:** `Op::MoeFfn`
+  quantizes expert activations to int8 for two rows or more and not for one
+  (docs/backlog.md, B203).
+- **Windows and Linux** reproduce all of the above with the same values. aarch64
+  runs the scalar kernels and is the first thing CI's macOS jobs check.
+
+**The architecture audit (L3).** Float `min`/`max` return either zero when given
+`+0` and `-0`, and x86 and AArch64 lower them differently; NaN handling is
+specified (the other operand). Every production use in the CPU backend and
+`infr_core` was read:
+
+| Site                                                                    | Can a zero sign reach an output bit?                                   |
+| ----------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| q4_1/q5_1 KV quantizers' block minimum (`kvquant.rs`)                   | **yes**: the stored `min`'s sign bit. Fixed: `min_max` keeps the first |
+| softmax, attention, MLA, router, sinkhorn and `CompressPool` row maxima | no: the max only offsets `exp(x - max)`, and `exp(±0)` is 1            |
+| lightning indexer `d.max(0.0)`                                          | no: the term is added to a sum that starts at `+0`                     |
+| SwiGLU clamp `gate.min(limit)`, `up.clamp(-l, l)`                       | no: `limit` is never zero; `clamp` is comparisons                      |
+| int8 quantizers' `max(abs(x))`                                          | no: `abs` makes every zero `+0`                                        |
+| `softplus`, ReLU-like `if x > 0.0 { x } else { 0.0 }`                   | no: written as comparisons already                                     |
+
+Also checked: float-to-int casts saturate (defined), `f64 as f32` rounds to
+nearest, `sqrt`/`round`/`floor`/`ceil`/`trunc` are exact (where `round` is a C
+runtime call, the result is still the exact one), integer accumulators wrap the
+same everywhere, and the hashes never depend on `usize` width or byte order
+(FNV-1a over little-endian bytes). Two more sites gave results that depended on
+the standard library's unstable sort rather than on the input: `Op::Sample` and
+the host sampler's top-k path ordered equal logits arbitrarily. Both now break
+ties by token id.
+
+**Speed** (2026-11-17, Windows, native release builds of `origin/main` and the
+branch, `infr bench --dev cpu`, three interleaved rounds of three reps each, no
+other build or test running; t/s, the per-round medians):
+
+| Model, run                 | `origin/main`          | branch                 |
+| -------------------------- | ---------------------- | ---------------------- |
+| Qwen3-1.7B Q4_K_M, pp512   | 1125.9, 1128.1, 1137.0 | 1123.5, 1153.4, 1142.2 |
+| Qwen3-1.7B Q4_K_M, tg64    | 58.6, 56.2, 59.3       | 58.5, 56.7, 57.2       |
+| Qwen3.5-0.8B Q4_K_M, pp512 | 1116.7, 1094.2, 978.4  | 1123.2, 1079.1, 1060.3 |
+| Qwen3.5-0.8B Q4_K_M, tg64  | 72.6, 71.6, 72.3       | 69.2, 71.0, 72.1       |
+| gemma-3-1b Q4_K_M, pp512   | 607.7, 618.2, 595.3    | 591.5, 588.8, 567.2    |
+| gemma-3-1b Q4_K_M, tg64    | 42.2, 41.9, 42.2       | 47.8, 48.4, 46.4       |
+
+Qwen3 and Qwen3.5 are unchanged within the spread of the rounds. gemma-3-1b's
+prefill is 3-5% slower and its decode 10-15% faster, all of it in its Q5_0
+`Linear` kernels (`INFR_PROF_OPS`: `Linear m=511 1152x6912 Q5_0` 11.3-11.8 ms
+per call against 12.0-12.2), whose code did not change. A control build of the
+branch with the tier check put back to `is_x86_feature_detected!` gave main's
+prefill (607-617 t/s) and the branch's decode (47.6-47.9), and a build with the
+leaner check (`simd::allows`, committed) 590-596 against main's 614-622 in the
+same rounds; in one binary, the Q5_0 batch dispatcher and a direct call to its
+VNNI kernel take the same 19.0 µs per row (gemma's shape, 511 rows, one thread).
+So the check costs nothing measurable, and the gap follows where the kernels
+land in the binary, as gemma's Q5_0 decode time already did between builds that
+did not touch it (docs/backlog.md, B202 and B204).
+
 ## The determinism rule
 
 Inside the module only binary64/binary32 `+ - * /`, `sqrt`, comparisons,

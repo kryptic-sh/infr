@@ -822,8 +822,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   256-element super-blocks) summed each pair of blocks before scaling them,
   `d8 * (d0 * i0 + d1 * i1)`, where the scalar and AVX2 kernels add `d8 * d * i`
   block by block, so their results differed in the last bits and greedy text
-  could fork on near ties. They now compute the scalar expression, with no
-  measurable speed change. Upgrade note: CPU output on AVX-512 machines changes
+  could fork on near ties. They now compute the scalar expression; Qwen3.5-0.8B,
+  whose Q8_0 tensors take it, prefills and decodes on the CPU at the same speed
+  within run-to-run noise. Upgrade note: CPU output on AVX-512 machines changes
   wherever a model has such Q8_0 tensors; of the cached CPU goldens only
   Qwen3.5-0.8B Q4_K_M changed (both cases, re-blessed; the old knight hash was
   the one CI's AVX2 runner produced, which is why that golden was "not portable"

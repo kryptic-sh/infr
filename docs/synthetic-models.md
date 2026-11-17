@@ -201,7 +201,7 @@ Per-architecture, from `crates/infr-llama/src/arch.rs`'s 16 constants:
 | `qwen3`           | CPU golden + GPU golden + Metal + quant sweep | strongest; keep a real fixture         |
 | `gemma3`          | CPU golden + 2 GPU seam                       | in CI today                            |
 | `gemma4`          | CPU golden (E2B only) + 3 GPU seam            | dense 12B has no CPU golden            |
-| `qwen35`          | CPU golden + GPU seam + 8 MTP tests           | golden **not CI-portable**             |
+| `qwen35`          | CPU golden + GPU seam + 8 MTP tests           | in CI again since plan 11 S4           |
 | `deepseek2`       | CPU golden + config + 4 dequant-parity        | strong                                 |
 | `deepseek`        | config + weak "non-empty output" prefill      | weakest assertion of any arch          |
 | `bitnet`          | config + exact top-1 token + GPU seam         | good                                   |

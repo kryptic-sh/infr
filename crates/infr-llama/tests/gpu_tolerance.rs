@@ -33,3 +33,63 @@ fn measure_gpu_tolerance() {
         forced::measure(key);
     }
 }
+
+use infr_llama::tolerance::PathClass::{self, Float, Int8, KvQ8};
+
+/// A quantized model: the production kernels at both prefill chunk heights, and the same with
+/// every int8-activation kernel off.
+const QUANT_RUNS: &[(&str, PathClass)] = &[
+    ("gpu", Int8),
+    ("gpu-ub32", Int8),
+    ("gpu-float", Float),
+    ("gpu-float-ub32", Float),
+];
+
+/// A float-weight model: the production kernels at both prefill chunk heights.
+const FLOAT_RUNS: &[(&str, PathClass)] = &[("gpu", Float), ("gpu-ub32", Float)];
+
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_tolerance_synthetic_f32() {
+    forced::gate("synthetic-f32", FLOAT_RUNS);
+}
+
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_tolerance_synthetic_f16() {
+    forced::gate("synthetic-f16", FLOAT_RUNS);
+}
+
+#[test]
+#[ignore = "needs Qwen3-0.6B Q4_K_M and a Vulkan GPU"]
+fn gpu_seam_tolerance_qwen3() {
+    let mut runs = QUANT_RUNS.to_vec();
+    runs.push(("gpu-kv-q8-float", KvQ8));
+    forced::gate("qwen3-0.6b", &runs);
+}
+
+#[test]
+#[ignore = "needs gemma-3-1b-it Q4_K_M and a Vulkan GPU"]
+fn gpu_seam_tolerance_gemma3() {
+    forced::gate("gemma3-1b", QUANT_RUNS);
+}
+
+#[test]
+#[ignore = "needs Qwen3.5-0.8B Q4_K_M and a Vulkan GPU"]
+fn gpu_seam_tolerance_qwen35() {
+    forced::gate("qwen35-0.8b", QUANT_RUNS);
+}
+
+#[test]
+#[ignore = "needs LFM3-1.7B Q4_K_M and F16 and a Vulkan GPU"]
+fn gpu_seam_tolerance_lfm3() {
+    forced::gate("lfm3-q4", QUANT_RUNS);
+    forced::gate("lfm3-f16", FLOAT_RUNS);
+}
+
+#[test]
+#[ignore = "needs ERNIE-4.5-0.3B Q4_K_M and F16 and a Vulkan GPU"]
+fn gpu_seam_tolerance_ernie() {
+    forced::gate("ernie-0.3b-q4", QUANT_RUNS);
+    forced::gate("ernie-0.3b-f16", FLOAT_RUNS);
+}

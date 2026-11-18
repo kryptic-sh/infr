@@ -8,5 +8,7 @@
 //! [`metrics::score_row`]. See `docs/gpu-tolerance.md`.
 
 pub mod metrics;
+pub mod table;
 
 pub use metrics::{score_row, RowError, RowScore, RunScore};
+pub use table::{tolerance, Entry, PathClass, Tolerance, MIN_TOP1_SCORED, TABLE};

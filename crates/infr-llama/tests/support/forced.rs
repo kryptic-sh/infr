@@ -2,7 +2,7 @@
 //! another backend, and the two scored with `infr_llama::tolerance`.
 
 use infr_llama::seam::{ForcedLogits, ForcedOn};
-use infr_llama::tolerance::RunScore;
+use infr_llama::tolerance::{tolerance, PathClass, RunScore, MIN_TOP1_SCORED};
 use infr_llama::{EngineConfig, SeamModel};
 use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
 
@@ -139,6 +139,22 @@ pub fn open_case(key: &str) -> Option<Case> {
         prompts,
         _file: None,
     })
+}
+
+/// The name the tolerance table knows a [`MODELS`] key (or a synthetic model) by: the GGUF file
+/// name, which is what a command scoring a user's model has in hand.
+pub fn table_name(key: &str) -> &'static str {
+    match key {
+        "synthetic-f32" => "synthetic-f32",
+        "synthetic-f16" => "synthetic-f16",
+        _ => {
+            MODELS
+                .iter()
+                .find(|m| m.0 == key)
+                .unwrap_or_else(|| panic!("no model {key:?} in the catalogue"))
+                .2
+        }
+    }
 }
 
 /// The cached GGUF for a [`MODELS`] key, or `None` when it is not downloaded.
@@ -408,6 +424,90 @@ pub fn measure(key: &str) {
             t_prod.as_secs_f64()
         );
     }
+}
+
+/// The gate: on every prompt of the `key` model, each named [`GPU_CONFIGS`] entry must be within
+/// the tolerance table's entry for (`key`, its class) of the CPU reference, on the prefill rows
+/// and on the decode rows alike; over the whole case, at least
+/// [`infr_llama::tolerance::MIN_TOP1_SCORED`] positions must clear the near-tie margin. Skips
+/// without the model (failing instead under `INFR_TEST_REQUIRE_MODELS`) or without a Vulkan
+/// device. Prints every measured value, so a new device's numbers can be read off the log.
+pub fn gate(key: &str, runs: &[(&str, PathClass)]) {
+    let Some(case) = open_case(key) else {
+        assert!(
+            std::env::var_os("INFR_TEST_REQUIRE_MODELS").is_none(),
+            "{key} is not in the HF cache, and INFR_TEST_REQUIRE_MODELS requires it"
+        );
+        eprintln!("skip: {key} not in the HF cache");
+        return;
+    };
+    if infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(
+        env_cfg(),
+    )))
+    .is_none()
+    {
+        eprintln!("skip: no Vulkan device");
+        return;
+    }
+    let t_case = std::time::Instant::now();
+    let mut failures = Vec::new();
+    let mut merged: Vec<Option<RunScore>> = vec![None; runs.len()];
+    for (pi, ids) in case.prompts.iter().enumerate() {
+        let r = reference(&case.model, ids, N_DECODE);
+        for (ri, &(name, class)) in runs.iter().enumerate() {
+            let &(_, edit, kv) = GPU_CONFIGS
+                .iter()
+                .find(|c| c.0 == name)
+                .unwrap_or_else(|| panic!("no configuration {name:?}"));
+            let tol = tolerance(table_name(key), class);
+            let reference = match kv {
+                None => r.clone(),
+                Some((k, v)) => forced(
+                    &case.model,
+                    ForcedOn::CpuReference,
+                    |c| kv_types(c, k, v),
+                    &r,
+                ),
+            };
+            let g = forced(&case.model, ForcedOn::Vulkan, edit, &r);
+            let s = score(&reference, &g, tol.near_tie);
+            for (phase, ps) in [("prefill", &s.prefill), ("decode", &s.decode)] {
+                println!(
+                    "{key} {name} ({class:?}) prompt {pi} ({} tokens), {phase}:\n{}",
+                    ids.len(),
+                    ps.report()
+                );
+                for v in tol.violations(ps) {
+                    failures.push(format!("{name} prompt {pi} {phase}: {v}"));
+                }
+            }
+            let all = s.all();
+            match &mut merged[ri] {
+                Some(m) => m.merge(&all),
+                slot => *slot = Some(all),
+            }
+        }
+    }
+    for (&(name, _), m) in runs.iter().zip(&merged) {
+        let m = m.as_ref().expect("every run scored");
+        if m.top1_scored < MIN_TOP1_SCORED {
+            failures.push(format!(
+                "{name}: only {} of {} positions clear the {}-nat near-tie margin (at least \
+                 {MIN_TOP1_SCORED} needed, or the top-1 check is vacuous)",
+                m.top1_scored, m.positions, m.near_tie
+            ));
+        }
+    }
+    eprintln!(
+        "time {key}: {:.1}s on {}",
+        t_case.elapsed().as_secs_f64(),
+        std::env::var("INFR_DEV").unwrap_or_else(|_| "the default device".into())
+    );
+    assert!(
+        failures.is_empty(),
+        "{key} is outside the GPU tolerance of the CPU reference:\n  {}",
+        failures.join("\n  ")
+    );
 }
 
 // ─── the driver's own check ──────────────────────────────────────────────────────

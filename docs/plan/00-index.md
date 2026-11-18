@@ -43,9 +43,10 @@ reference to judge tuned values against.
 
 ## Vulkan backend
 
-| Phase | What                                                                                  | Status  |
-| ----- | ------------------------------------------------------------------------------------- | ------- |
-| 10    | [Kernels with per-device tunable parameters](10-tunable-kernels.md), one tuning table | S1 done |
+| Phase | What                                                                                            | Status                                         |
+| ----- | ----------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| 10    | [Kernels with per-device tunable parameters](10-tunable-kernels.md), one tuning table           | S1 done                                        |
+| 12    | [Vulkan devices without matrix units or fast int8 dot (GCN class)](12-low-capability-vulkan.md) | not started; S0 waits on the issue 94 reporter |
 
 ## Notes on the model phases
 

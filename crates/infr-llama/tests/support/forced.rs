@@ -587,18 +587,19 @@ pub fn watchdog(what: &str, limit: std::time::Duration) -> Watchdog {
 /// chunk's last row only ([`PrefillHead::LastOfChunk`]) and a submit-splitter cap of this many
 /// dispatches (`device.submit_dispatches`). Keyed on the device being integrated and on the
 /// configuration having every int8 kernel off ([`int8_off`]); a slow DISCRETE device, issue 94's
-/// class, gets no workaround and would meet the same stall, which the [`GATE_TIMEOUT`] watchdog
-/// then reports, and float-weight models' shipped `gpu` runs keep the full head.
+/// class, gets no workaround and would meet the same failure, which the backend now reports as an
+/// error (`device.gpu_wait_timeout_ms`, the lost device or the dropped segment), and float-weight
+/// models' shipped `gpu` runs keep the full head.
 ///
-/// A HARNESS WORKAROUND for a production weakness, not a fix. The harness's prefill head is a
-/// vocabulary-wide float GEMM over every chunk row; with the int8 kernels off, a submit holding it
-/// stalled or lost the integrated GPU (Qwen3.5-0.8B, 180-token prompt: stalled at caps 128 and
-/// 16, a lost device at 8, completion at 4 in four runs of seven, with the head on the last row
-/// only, or with no head; gemma-3-1b still stalled at cap 4). Whether the limit is one dispatch or
-/// a submit's total, and whether it is the driver's watchdog, is not established:
-/// `docs/plan/12-low-capability-vulkan.md` section 0b and B207. The prefill phase of those runs
-/// then scores one row per chunk, too few for [`MIN_TOP1_SCORED`], which is not asked of it, and
-/// their first two positions are not scored at all unless one ends a chunk.
+/// A HARNESS WORKAROUND for a production weakness, not a fix. The harness's prefill head is ONE
+/// vocabulary-wide float GEMM dispatch over every chunk row (`native_q6k` on Qwen3.5-0.8B), about
+/// 25 ms per row on the integrated GPU: 0.83 s at 32 rows and 1.63 s at 64 completed, 2.44 s at
+/// 96 and 3.26 s at the default 128 lost the device even alone in its submit, the Windows
+/// display-driver watchdog (TDR, 2 s) resetting the engine (`docs/plan/12-low-capability-vulkan.md`
+/// section 0b). No submit cap splits one dispatch, and the head on each chunk's last row is one
+/// row's work; the cap of 4 is kept from before the cause was known. The prefill phase of those
+/// runs then scores one row per chunk, too few for [`MIN_TOP1_SCORED`], which is not asked of it,
+/// and their first two positions are not scored at all unless one ends a chunk.
 pub const INTEGRATED_FLOAT_SUBMIT_CAP: usize = 4;
 
 /// Whether the [`GPU_CONFIGS`] entry `name` turns every int8-activation kernel knob off (see

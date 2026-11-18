@@ -27,9 +27,13 @@ pub struct RowScore {
     /// its row's mass outside that union. 1 exactly when the two rows give the same probability to
     /// every token of the union and the same mass to the rest; mass the test row moves out of the
     /// reference's top set, or onto tokens the reference ranks low, lowers it, also when the
-    /// reference's top set is a single token. A secondary metric: KL sees everything it sees, and
-    /// it is reported so a distance concentrated in the top tokens can be told from one in the
-    /// tail.
+    /// reference's top set is a single token. It means something only when the union holds most
+    /// of both rows' mass: on a high-entropy row the single rest-of-mass component dominates the
+    /// vector, so two rows flat over different thousand-token sets of a 32000-token vocabulary
+    /// score about 0.9999 at a KL of 30, and `1 - cos` grows with the SQUARE of the mass that
+    /// leaks out of the top set. A secondary metric, never the sole detector of any class of bug:
+    /// KL sees everything it sees, and it is reported so a distance concentrated in the top
+    /// tokens can be told from one in the tail.
     pub topk_cos: f64,
     /// The largest absolute difference between the two rows after each is centred on its own
     /// mean, divided by the reference row's range (max − min). Centring makes it shift-invariant;
@@ -138,32 +142,30 @@ fn expm1(x: f64) -> f64 {
 /// for any constant `c`, `KL = ln(1 + E_p[e^{e-c} - 1]) - E_p[e - c]`. Taking `c` near `E_p[e]`
 /// leaves only the small deviations `e - c`, whose `e^x - 1` [`expm1`] gets to full relative
 /// precision, so two rows a rounding apart score a KL of their real size rather than of the
-/// sum's rounding. A reference token whose probability underflowed in [`softmax`] still counts in
-/// the normalizer: its term `p_i e^{e_i - c}` is `e^{t_i - lse_r - c}`, taken directly, so a test
-/// row that promotes such a token is charged for it. A term whose exponent reaches the f32
-/// exponential's overflow is far beyond any tolerance; the row is scored as infinite.
+/// sum's rounding. Token `i`'s term `p_i e^{e_i - c}` is also `e^{t_i - lse_r - c}`; where
+/// `e_i - c` is too large to exponentiate (a reference token far down the row that the test row
+/// promotes, including one whose probability underflowed in [`softmax`]) the term is taken in
+/// that form, so such a token is charged for exactly what it costs. Only a term that is itself beyond the
+/// f32 exponential's range, `t_i - lse_r - c` above [`OVERFLOW_ARG`] (a test token more than
+/// that many nats above the reference's whole mass, far beyond any tolerance), scores the row as
+/// infinite.
 fn kl_divergence(p: &[f64], lse_r: f64, r: &[f32], t: &[f32]) -> f64 {
     let e = |i: usize| t[i] as f64 - r[i] as f64;
     let mass: f64 = p.iter().sum();
     let c = (0..p.len()).map(|i| p[i] * e(i)).sum::<f64>() / mass;
-    // The exponent of token `i`'s term `p_i e^{e_i - c}`, relative to 0.
-    let exponent = |i: usize| {
-        if p[i] > 0.0 {
-            e(i) - c
-        } else {
-            t[i] as f64 - lse_r - c
-        }
-    };
-    if (0..p.len()).any(|i| exponent(i) > OVERFLOW_ARG) {
+    // The natural log of token `i`'s term `p_i e^{e_i - c}`.
+    let log_term = |i: usize| t[i] as f64 - lse_r - c;
+    if (0..p.len()).any(|i| log_term(i) > OVERFLOW_ARG) {
         return f64::INFINITY;
     }
     let a: f64 = (0..p.len())
         .map(|i| {
-            if p[i] > 0.0 {
+            if p[i] > 0.0 && e(i) - c <= OVERFLOW_ARG {
                 p[i] * expm1(e(i) - c)
             } else {
-                // `p_i (e^{e_i - c} - 1)` with `p_i` below f32's range: the `- p_i` is nothing.
-                math::exp(exponent(i) as f32) as f64
+                // `p_i (e^{e_i - c} - 1)` with the exponential taken whole: here the term is more
+                // than e^80 times `p_i` (or `p_i` underflowed to 0), so the `- p_i` is noise.
+                math::exp(log_term(i) as f32) as f64 - p[i]
             }
         })
         .sum();
@@ -174,7 +176,7 @@ fn kl_divergence(p: &[f64], lse_r: f64, r: &[f32], t: &[f32]) -> f64 {
 }
 
 /// The largest argument [`kl_divergence`] takes an exponential of: below the f32 exponential's
-/// overflow, so `e^x` stays finite.
+/// overflow (about 88.7), so `e^x` stays finite.
 const OVERFLOW_ARG: f64 = 80.0;
 
 /// The argmax of `row`, the lowest index on an exact tie.
@@ -675,20 +677,6 @@ mod tests {
         assert!(s.kl > 0.0);
     }
 
-    /// KL in f64 from the logits, for the probes below: the closed form with the platform's f64
-    /// exponential (test code), which underflows nowhere these rows reach.
-    fn kl_exact(r: &[f32], t: &[f32]) -> f64 {
-        let lse = |v: &[f32]| {
-            let m = v.iter().fold(f64::NEG_INFINITY, |a, &x| a.max(x as f64));
-            m + v.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln()
-        };
-        let (lr, lt) = (lse(r), lse(t));
-        r.iter()
-            .zip(t)
-            .map(|(&a, &b)| (a as f64 - lr).exp() * ((a as f64 - lr) - (b as f64 - lt)))
-            .sum()
-    }
-
     /// A reference whose top-1 holds nearly all the mass has a one-token top set; the cosine must
     /// still see a test row that moves that mass elsewhere (SmolLM3's position-0 row: KL 4.88).
     #[test]
@@ -717,16 +705,37 @@ mod tests {
         assert!(s.topk_cos < 0.9, "{}", s.topk_cos);
     }
 
-    /// A test row that promotes a token the reference's f32 softmax underflows (more than 104
-    /// below its maximum) is charged for it.
+    /// KL of `[0, -d, -5, -6]` against `[0, 5, -5, -6]`, in nats, computed independently (mpmath at
+    /// 50 digits): the same to these digits for every `d` from 80 on, the reference's own mass on
+    /// token 1 being negligible there.
+    const PROMOTED_KL: f64 = 4.997_602_547_988_48;
+
+    /// A test row that promotes a token far down the reference row is charged for exactly what it
+    /// costs: from 80 to 103 below the maximum (nonzero probability, but `e_i - c` too large to
+    /// exponentiate) and from 104 (probability underflowed to 0 in the f32 softmax).
     #[test]
-    fn a_promoted_underflowing_token_is_charged() {
-        let r = [0.0f32, -110.0, -5.0, -6.0];
-        let t = [0.0f32, 5.0, -5.0, -6.0];
-        let want = kl_exact(&r, &t);
-        assert!(want > 4.0, "{want}");
+    fn a_promoted_deep_token_is_charged() {
+        for d in [80.0f32, 90.0, 103.0, 104.0, 110.0] {
+            let r = [0.0f32, -d, -5.0, -6.0];
+            let t = [0.0f32, 5.0, -5.0, -6.0];
+            let s = score_row(&r, &t).unwrap();
+            assert!(
+                close(s.kl, PROMOTED_KL, PROMOTED_KL * 1e-6),
+                "d {d}: {} vs {PROMOTED_KL}",
+                s.kl
+            );
+        }
+    }
+
+    /// A token 100 below the reference's maximum that the test row moves to 15 below costs a
+    /// small, finite KL (mpmath at 50 digits), not infinity.
+    #[test]
+    fn a_deep_token_moved_up_a_little_costs_a_little() {
+        let r = [0.0f32, -100.0, -5.0, -6.0];
+        let t = [0.0f32, -15.0, -5.0, -6.0];
+        let want = 3.031_086_132_352_45e-7;
         let s = score_row(&r, &t).unwrap();
-        assert!(close(s.kl, want, want * 1e-6), "{} vs {want}", s.kl);
+        assert!(close(s.kl, want, want * 1e-5), "{} vs {want}", s.kl);
     }
 
     #[test]

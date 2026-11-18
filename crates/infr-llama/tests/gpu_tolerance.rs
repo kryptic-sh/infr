@@ -58,6 +58,11 @@ const FLOAT_RUNS: &[(&str, PathClass)] = &[
 /// by [`RED_SCALE`], driven on the CPU reference against the unmodified model's CPU reference, must
 /// fail the gate's evaluation, naming the limits it crossed; the unmodified model against itself
 /// must pass it. CI runs this on every system, so a gate that cannot go red fails here.
+///
+/// How sensitive that is: on the CPU a 1.01 scale of the same tensor trips the gate and 1.008 and
+/// below pass (measured in review), so [`RED_SCALE`] sits about twice the threshold above 1. The
+/// green control is the reference against itself, a distance of exactly 0; it shows the
+/// evaluation accepts a match, not that it tolerates legitimate noise (the GPU cases do that).
 #[test]
 fn tolerance_gate_goes_red_on_a_scaled_weight_cpu() {
     let clean = forced::open_case("synthetic-f32").expect("synthetic model");
@@ -107,7 +112,9 @@ fn gpu_seam_tolerance_goes_red_on_a_scaled_weight() {
 
 /// The prefill head the harness adds is a vocabulary-wide GEMM production never runs; it must not
 /// change anything else: the decode rows, which read the KV the prefill wrote, are bit-identical
-/// with and without it.
+/// with the head on every row, on each chunk's last row (the integrated-GPU workaround) and off.
+/// The chunk height is forced to [`forced::SMALL_UBATCH`] so the prompt spans several chunks and
+/// the first decode row follows a multi-chunk prefill.
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
 fn gpu_seam_tolerance_prefill_head_leaves_decode_unchanged() {
@@ -124,29 +131,57 @@ fn gpu_seam_tolerance_prefill_head_leaves_decode_unchanged() {
     }
     let ids = &case.prompts[2];
     let r = forced::forced_reference(&case.model, ids, forced::N_DECODE);
+    assert!(
+        ids.len() > 2 * forced::SMALL_UBATCH,
+        "the prompt must span several chunks"
+    );
+    let small_chunks =
+        |c: &mut infr_llama::EngineConfig| c.device.ubatch = Some(forced::SMALL_UBATCH);
     let decode = |head| {
-        let g = forced::forced_with(&case.model, ForcedOn::Vulkan, |_| {}, head, &r);
+        let g = forced::forced_with(&case.model, ForcedOn::Vulkan, small_chunks, head, &r);
         let v = g.vocab;
         g.logits[g.prefill_rows * v..]
             .iter()
             .map(|x| x.to_bits())
             .collect::<Vec<_>>()
     };
-    let (with, without) = (decode(PrefillHead::All), decode(PrefillHead::Off));
-    assert_eq!(with.len(), forced::N_DECODE * r.vocab);
+    let without = decode(PrefillHead::Off);
+    assert_eq!(without.len(), forced::N_DECODE * r.vocab);
+    // Where two decodes first differ: (decode row, token), or None when bit-identical.
+    let first_diff = |a: &[u32]| {
+        (0..a.len())
+            .find(|&i| a[i] != without[i])
+            .map(|i| (i / r.vocab, i % r.vocab))
+    };
+    // A second run without the head first: if the decode itself is not run-to-run
+    // deterministic on this device, that is what failed, not the head.
+    let again = first_diff(&decode(PrefillHead::Off));
     assert!(
-        with == without,
-        "the prefill head changed the decode rows' bits"
+        again.is_none(),
+        "two runs WITHOUT the prefill head differ (first at decode row, token {again:?}): the \
+         GPU decode is not deterministic here"
     );
+    for head in [PrefillHead::All, PrefillHead::LastOfChunk] {
+        let d = first_diff(&decode(head));
+        assert!(
+            d.is_none(),
+            "the prefill head {head:?} changed the decode rows' bits (first at decode row, \
+             token {d:?})"
+        );
+    }
 }
 
 /// What makes a kernel an int8-activation one, by its name: the dp4a `mmq` GEMMs, the int8
 /// coopmat GEMMs (`i8cm`), the dp4a K-quant GEMMs, the activation quantizer, and the int8
-/// GEMVs (`native_mmv_*`; the float GEMVs are `native_gemv_*` and `native_<dtype>*`).
+/// GEMVs (`native_mmv_*`; the float GEMVs are `native_gemv_*` and `native_<dtype>*`). Typed by
+/// hand from the kernel names: the Vulkan crate has no central list of int8-activation kernels,
+/// so a new one named otherwise would pass unseen (B207).
 const INT8_KERNEL_MARKERS: &[&str] = &["mmq", "i8", "dp4a", "quant_q8", "native_mmv"];
 
 /// The Float class is int8-free: a Float run of a quantized model builds no int8-activation
 /// kernel, while the shipped configuration on the same model does (so the check can fail).
+/// Kernels are built lazily, when first recorded, so the built set is a superset of what ran and
+/// the negative check is the conservative one.
 #[test]
 #[ignore = "needs Qwen3-0.6B Q4_K_M and a Vulkan GPU"]
 fn gpu_seam_tolerance_float_runs_build_no_int8_kernel() {

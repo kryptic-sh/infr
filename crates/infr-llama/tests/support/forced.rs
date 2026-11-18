@@ -541,9 +541,12 @@ pub fn measure(key: &str) {
     }
 }
 
-/// The longest one tolerance test may run. A forced run that stops making progress (the
-/// integrated GPU's long Float runs did, B207) fails the test with a message saying so, rather
-/// than holding the gate until someone notices.
+/// The longest one [`gate`] call may run. A forced run that stops making progress (the integrated
+/// GPU's long Float runs did, B207) fails the test with a message saying so, rather than holding
+/// the gate until someone notices. About 4.5 times the slowest test measured (LFM3, both files, on
+/// the integrated GPU), so a slower device has room. The bound is per call: a test that calls
+/// `gate` twice can run twice as long, and with the test process ended the tests after it in the
+/// same process do not run (each nextest test is its own process; plain `cargo test` is one).
 pub const GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 /// Fails the whole test process with a message if it is still alive when the deadline passes;
@@ -564,11 +567,16 @@ pub fn watchdog(what: &str, limit: std::time::Duration) -> Watchdog {
     let what = what.to_string();
     std::thread::spawn(move || {
         if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(limit) {
-            eprintln!(
+            // Straight to the process's stderr: this thread inherits libtest's output capture,
+            // which `eprintln!` would write into and `exit` would then discard.
+            use std::io::Write;
+            let msg = format!(
                 "FAIL: {what} still running after {} s: a hang, not a tolerance result; \
-                 stopping the test process (docs/backlog.md B207)",
+                 stopping the test process (docs/backlog.md B207)\n",
                 limit.as_secs()
             );
+            // A failed write leaves the exit status as the only report; nothing else can carry it.
+            let _ = std::io::stderr().write_all(msg.as_bytes());
             std::process::exit(1);
         }
     });
@@ -577,21 +585,37 @@ pub fn watchdog(what: &str, limit: std::time::Duration) -> Watchdog {
 
 /// What the harness changes for its int8-off runs on an integrated GPU: the prefill head on each
 /// chunk's last row only ([`PrefillHead::LastOfChunk`]) and a submit-splitter cap of this many
-/// dispatches (`device.submit_dispatches`). A HARNESS WORKAROUND for a production weakness, not a
-/// fix. The harness's prefill head is a vocabulary-wide float GEMM over every chunk row, the
-/// heaviest dispatch any of these runs makes; with the int8 kernels off, a submit holding it
-/// outlasted the integrated GPU's watchdog (Qwen3.5-0.8B, 180-token prompt: stuck at caps 128 and
-/// 16, a lost device at 8, completion at 4, with the head on the last row only, or with no head;
-/// gemma-3-1b stayed stuck even at cap 4, its head over 128 rows being one dispatch). The splitter
-/// bounds dispatches per submit, not work per submit: `docs/plan/12-low-capability-vulkan.md`
-/// section 0b and B207. The prefill phase of those runs then scores one row per chunk, too few for
-/// [`MIN_TOP1_SCORED`], which is not asked of it.
+/// dispatches (`device.submit_dispatches`). Keyed on the device being integrated and on the
+/// configuration having every int8 kernel off ([`int8_off`]); a slow DISCRETE device, issue 94's
+/// class, gets no workaround and would meet the same stall, which the [`GATE_TIMEOUT`] watchdog
+/// then reports, and float-weight models' shipped `gpu` runs keep the full head.
+///
+/// A HARNESS WORKAROUND for a production weakness, not a fix. The harness's prefill head is a
+/// vocabulary-wide float GEMM over every chunk row; with the int8 kernels off, a submit holding it
+/// stalled or lost the integrated GPU (Qwen3.5-0.8B, 180-token prompt: stalled at caps 128 and
+/// 16, a lost device at 8, completion at 4 in four runs of seven, with the head on the last row
+/// only, or with no head; gemma-3-1b still stalled at cap 4). Whether the limit is one dispatch or
+/// a submit's total, and whether it is the driver's watchdog, is not established:
+/// `docs/plan/12-low-capability-vulkan.md` section 0b and B207. The prefill phase of those runs
+/// then scores one row per chunk, too few for [`MIN_TOP1_SCORED`], which is not asked of it, and
+/// their first two positions are not scored at all unless one ends a chunk.
 pub const INTEGRATED_FLOAT_SUBMIT_CAP: usize = 4;
 
-/// Whether a configuration runs with every int8-activation kernel off (see
-/// [`INTEGRATED_FLOAT_SUBMIT_CAP`]).
-fn int8_off(config: &str) -> bool {
-    config.contains("float")
+/// Whether the [`GPU_CONFIGS`] entry `name` turns every int8-activation kernel knob off (see
+/// [`INTEGRATED_FLOAT_SUBMIT_CAP`]): read from the configuration its edit produces, not its name.
+fn int8_off(name: &str) -> bool {
+    let mut c = EngineConfig::default();
+    (gpu_config(name).1)(&mut c);
+    let v = &c.kernels.vulkan;
+    !(v.i8cm_kq || v.dp4a_kq || v.mmq || v.mrow || v.i8_dot) && v.mmv_mw == Some(false)
+}
+
+/// The [`GPU_CONFIGS`] entry named `name`.
+fn gpu_config(name: &str) -> &'static GpuConfig {
+    GPU_CONFIGS
+        .iter()
+        .find(|c| c.0 == name)
+        .unwrap_or_else(|| panic!("no configuration {name:?}"))
 }
 
 /// Host bytes a model resident on a unified-memory device takes per byte of its file, and the
@@ -706,10 +730,7 @@ fn evaluate_on(
     for (pi, ids) in reference.prompts.iter().enumerate() {
         let r = forced_reference(&reference.model, ids, N_DECODE);
         for (ri, &(name, class)) in runs.iter().enumerate() {
-            let &(_, edit, kv) = GPU_CONFIGS
-                .iter()
-                .find(|c| c.0 == name)
-                .unwrap_or_else(|| panic!("no configuration {name:?}"));
+            let &(_, edit, kv) = gpu_config(name);
             let entry = tolerance(table_name(key), class);
             let reference_run = match kv {
                 None => r.clone(),

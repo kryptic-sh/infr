@@ -145,8 +145,10 @@ pub const TABLE: &[Entry] = &[
         t(6.4e-3, 1.6e-3, 0.9950, 2.6e-2, 0.25, 3),
     ),
     // A SMOKE CHECK, not a fine one: gemma-3's legitimate int8 distance (worst KL 0.26 from
-    // position 2 on, 0.87 in the first two) is as large as a gross bug's on Qwen3-0.6B, so this
-    // row admits bugs its Float row is there to catch.
+    // position 2 on, 0.87 in the first two; both on the integrated GPU, native lanes, config
+    // `gpu`, prompt 2, positions 115 and 1) is as large as a gross bug's on Qwen3-0.6B, so this
+    // row admits bugs its Float row is there to catch. The RX 7900 XTX measures 2.6e-2 and 0.33
+    // natively: ten times apart, unexplained (B207).
     row(
         "gemma-3-1b-it-Q4_K_M.gguf",
         Int8,

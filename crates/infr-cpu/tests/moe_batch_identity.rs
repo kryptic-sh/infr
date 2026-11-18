@@ -17,6 +17,12 @@
 //!
 //! The ceiling is process-wide, so every case runs inside one test.
 //!
+//! What it cannot see: a wrong sparse-part add (`Q8::hi`, `kernels::vec_dot_hi`) in the expert
+//! GEMM. Both sides of each comparison take the same `moe::expert_gemm_range` route, so a fault
+//! there moves both alike. `moe::tests::expert_gemm_range_matches_the_single_token_kernels_bitwise`
+//! catches it (its rows split, and it holds the GEMM to the one-row kernel plus `vec_dot_hi`), and
+//! `op_hashes`' spiky `MoeFfn` cases pin the value across tiers, thread counts and systems.
+//!
 //! Run: `cargo nextest run -p infr-cpu --test moe_batch_identity`
 
 use std::sync::Arc;

@@ -265,6 +265,112 @@ fn linear(dt: DType, m: usize, in_f: usize, out_f: usize, reference: bool) -> Ca
     })
 }
 
+/// Row `r` of an activation whose 256-element blocks carry outliers, for the production
+/// quantizer's split (`quant::quantize_q8`: of a block's two largest magnitudes, those above 16
+/// times the next largest move to a sparse part). The rest of each block is `val / 2`, in
+/// [-1, 1); block `b` of row `r` takes pattern `(r + b) % 9`: no spike; one spike; two of
+/// opposite signs; three (the two-element cap: nothing splits); a spike exactly 16 times the
+/// next largest (no split) and one just over it (a split); two spikes of equal magnitude; a
+/// spike over an all-zero rest; and two spikes far apart, whose second needs a second part.
+/// Every value is an integer or a short binary fraction: the same bits on every machine.
+fn spiky_row(r: usize, in_f: usize) -> Vec<f32> {
+    let mut x: Vec<f32> = (0..in_f).map(|i| val(130 + r as u64, i) / 2.0).collect();
+    for (b, blk) in x.chunks_mut(256).enumerate() {
+        let p = (r * 37 + b * 11) % 190;
+        match (r + b) % 9 {
+            0 => {}
+            1 => blk[p] = 48.0,
+            2 => {
+                blk[p] = 48.0;
+                blk[p + 17] = -40.0;
+            }
+            3 => {
+                blk[p] = 48.0;
+                blk[p + 17] = 44.0;
+                blk[p + 40] = -40.0;
+            }
+            4 => {
+                blk[p] = 24.0;
+                blk[p + 40] = 1.5;
+                blk[p + 60] = -1.5;
+            }
+            5 => {
+                blk[p] = 24.0 + 1.0 / 64.0;
+                blk[p + 40] = 1.5;
+                blk[p + 60] = -1.5;
+            }
+            6 => {
+                blk[p] = 32.0;
+                blk[p + 17] = -32.0;
+            }
+            7 => {
+                blk.fill(0.0);
+                blk[p] = 37.0;
+            }
+            _ => {
+                blk[p] = 3000.0;
+                blk[p + 17] = 941.0625;
+            }
+        }
+    }
+    x
+}
+
+/// [`linear`] on [`spiky_row`] activations, 2048 wide (eight blocks a row).
+fn linear_spiky(dt: DType, m: usize) -> Case {
+    let (in_f, out_f) = (2048usize, 20usize);
+    let mut c = Case::new(format!("Linear spiky {dt:?} m{m} {in_f}x{out_f}"));
+    let xs: Vec<f32> = (0..m).flat_map(|r| spiky_row(r, in_f)).collect();
+    let x = c.input(vec![m, in_f], DType::F32, f32_bytes(&xs));
+    let w = c.weight_q(dt, out_f, in_f, 0x5eed ^ in_f as u32);
+    let dst = c.output(vec![m, out_f], DType::F32);
+    c.push(Op::Linear {
+        x,
+        weight: w,
+        dst,
+        m: m as u32,
+        in_f: in_f as u32,
+        out_f: out_f as u32,
+        w_off: 0,
+    })
+}
+
+/// The formats whose activations take the 256-element quantizer at width 2048.
+const SPLIT_FORMATS: [DType; 16] = [
+    DType::Q8_0,
+    DType::Q2K,
+    DType::Q3K,
+    DType::Q4K,
+    DType::Q5K,
+    DType::Q6K,
+    DType::Iq1S,
+    DType::Iq1M,
+    DType::Iq2Xxs,
+    DType::Iq2Xs,
+    DType::Iq2S,
+    DType::Iq3Xxs,
+    DType::Iq3S,
+    DType::Iq4Xs,
+    DType::Tq1_0,
+    DType::Tq2_0,
+];
+
+/// Outlier rows through every route that dots a `Q8`: one row, a small batch, and 19 rows (the
+/// tiles and, at AVX-512 VNNI, the packed GEMM). The 32-element quantizer (`Q4_0`, `Q5_0` here)
+/// does not split; its cases pin how it meets the same rows.
+fn spiky_linear_cases() -> Vec<Case> {
+    let mut v = Vec::new();
+    for dt in SPLIT_FORMATS {
+        for m in [1usize, 5, 19] {
+            v.push(linear_spiky(dt, m));
+        }
+    }
+    for dt in [DType::Q4_0, DType::Q5_0] {
+        v.push(linear_spiky(dt, 5));
+    }
+    v
+}
+
 fn linear_cases() -> Vec<Case> {
     let mut v = Vec::new();
     let mut dts = vec![DType::F32, DType::F16, DType::Bf16];
@@ -1270,6 +1376,16 @@ fn moe(name: &str, dt: DType, rows: usize, gating: MoeGating, variant: u8) -> Ca
     })
 }
 
+/// [`moe`] on [`spiky_row`] activations (one block a row, row `r` taking pattern `r + 1`, so the
+/// one-row case has a spike), through the expert banks' `Q8` route.
+fn moe_spiky(dt: DType, rows: usize) -> Case {
+    let mut c = moe("spiky", dt, rows, MoeGating::Softmax, 0);
+    let xs: Vec<f32> = (0..rows).flat_map(|r| spiky_row(r + 1, 256)).collect();
+    // The layer's input is the case's first bound tensor (`moe` binds it first).
+    c.bound[0].1 = f32_bytes(&xs);
+    c
+}
+
 fn moe_cases() -> Vec<Case> {
     let mut v = Vec::new();
     for dt in [DType::Q4K, DType::Q6K, DType::Q8_0, DType::Q5_0, DType::F16] {
@@ -1286,12 +1402,16 @@ fn moe_cases() -> Vec<Case> {
         2,
     ));
     v.push(moe("weight before", DType::Q4K, 5, MoeGating::Sigmoid, 3));
+    v.push(moe_spiky(DType::Q4K, 1));
+    v.push(moe_spiky(DType::Q4K, 9));
+    v.push(moe_spiky(DType::Q6K, 9));
     v
 }
 
 fn cases() -> Vec<Case> {
     let mut v = Vec::new();
     v.extend(linear_cases());
+    v.extend(spiky_linear_cases());
     v.extend(norm_cases());
     v.extend(rope_cases());
     v.extend(attention_cases());
@@ -1533,6 +1653,59 @@ const EXPECTED: &[(&str, u64)] = &[
     ("MoeFfn grouped biased Q4K rows 5", 0x10423bc2d8e420c5),
     ("MoeFfn hash routed Q4K rows 5", 0x187b3a67fc5c9f74),
     ("MoeFfn weight before Q4K rows 5", 0x900aebc15c5f130a),
+    ("Linear spiky Q8_0 m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q8_0 m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q8_0 m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q2K m1 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q2K m5 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q2K m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q3K m1 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q3K m5 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q3K m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q4K m1 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q4K m5 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q4K m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q5K m1 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q5K m5 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q5K m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q6K m1 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q6K m5 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q6K m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq1S m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq1S m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq1S m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq1M m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq1M m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq1M m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq2Xxs m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq2Xxs m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq2Xxs m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq2Xs m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq2Xs m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq2Xs m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq2S m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq2S m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq2S m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq3Xxs m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq3Xxs m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq3Xxs m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq3S m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq3S m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq3S m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq4Xs m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq4Xs m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Iq4Xs m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Tq1_0 m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Tq1_0 m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Tq1_0 m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Tq2_0 m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Tq2_0 m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Tq2_0 m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q4_0 m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q5_0 m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
+    ("MoeFfn spiky Q4K rows 1", 0x0),      // PLACEHOLDER: blessed from CI
+    ("MoeFfn spiky Q4K rows 9", 0x0),      // PLACEHOLDER: blessed from CI
+    ("MoeFfn spiky Q6K rows 9", 0x0),      // PLACEHOLDER: blessed from CI
 ];
 
 /// Every case gives its one checked-in hash at every tier this CPU has and at every thread

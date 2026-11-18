@@ -6823,25 +6823,74 @@ values. What it leaves:
   goldens and exact-token tests cover them today, and G4 must not drop those
   without a replacement. A forced chain would need the chain to read back every
   step's logits. The static per-token path is gated (`gpu-float-static`).
-- **The int8-off runs lose the integrated GPU, a harness-triggered case of plan
-  12's failure class.** On `Vulkan1` (RDNA2, 2 CUs), with every int8 kernel off,
-  a submit holding the harness's prefill head (a vocabulary-wide float GEMM over
-  every chunk row, which production never runs) outlasted the GPU's watchdog.
-  Qwen3.5-0.8B Q4_K_M, 180-token prompt: stuck with one CPU core busy at submit
-  caps 128 (3 of 3 runs) and 16, a lost device at 8, completion at 4 (3 of 3),
-  with the head on each chunk's last row only, with no head, and at 32- or
-  64-row chunks. gemma-3-1b stayed stuck even at cap 4 (its head over a 128-row
-  chunk is one dispatch) and completed with the head on the last row.
-  Reproduction steps are in `docs/plan/12-low-capability-vulkan.md` section 0b.
-  The tolerance tests work around it on integrated devices (head on each chunk's
-  last row and a cap of 4 for the int8-off runs, `INTEGRATED_FLOAT_SUBMIT_CAP`);
-  with that, every int8-off configuration of Qwen3, Qwen3.5 and gemma-3
-  completed on `Vulkan1` (7 of 7 runs). The production weakness — a
-  dispatch-count cap does not bound a submit's time when one dispatch is far
-  heavier than the ones it was calibrated on — is plan 12's S2. The `Vulkan1`
-  table data is partial: native lanes with the tuning rows on only, and
-  gemma-3's and Qwen3.5's full-head int8-off runs there did not complete (their
-  int8-off rows there come from the workaround runs).
+- **The int8-off runs stall or lose the integrated GPU.** On `Vulkan1` (RDNA2, 2
+  CUs), with every int8 kernel off, a submit containing the harness's prefill
+  head (a vocabulary-wide float GEMM over every chunk row, which production
+  never runs) stalled or lost the device at the default submit cap. Qwen3.5-0.8B
+  Q4_K_M, 180-token prompt: stalled with one CPU core busy at caps 128 (3 of 3
+  runs) and 16, a lost device at 8, completion at 4 (3 of 3) WITH the full head,
+  and also with the head on each chunk's last row, with no head, and at 32- or
+  64-row chunks. gemma-3-1b still stalled at cap 4 and completed with the head
+  on each chunk's last row. Neither the limit (one dispatch, or a submit's total
+  work) nor the mechanism (the driver's watchdog, or a host-side wait) is
+  established: Qwen3.5 completing at cap 4 with the full head fits a per-submit
+  total, gemma stalling at cap 4 fits a single dispatch, and a stall of minutes
+  with a busy CPU core is not what a watchdog reset looks like (that is a lost
+  device), while 8 lost the device and 16 and 128 stalled. Sampling the GPU
+  engine showed the 3D engine busy for 3-4 s and then idle while the host spun a
+  core on its fence wait, once ending in a lost device at the next submit: the
+  GPU's work is cut off after a few seconds, the host's wait has no timeout
+  (`PendingSegment::drain`). A watchdog reset fits, but no display-driver
+  recovery event was logged and a completing run kept the engine busy 12 s
+  without a gap, so a fault in the head's dispatch fits as well **[I]**. Cap 4
+  with the full head stalled Qwen3.5 in three runs of seven (the last three in a
+  row); gemma with the head on each chunk's last row completed at caps 128
+  and 4. Plan 12 section 0b has the tables and the reproduction. A bounded fence
+  wait that reports the lost device, instead of hanging, is worth doing on its
+  own. The tolerance tests work around it on integrated devices for
+  configurations with every int8 knob off (head on each chunk's last row, cap 4,
+  `INTEGRATED_FLOAT_SUBMIT_CAP`); with that, every gate case passed on
+  `Vulkan1`. A slow discrete card gets no workaround and would meet the
+  `GATE_TIMEOUT` watchdog. The `Vulkan1` table data is partial: native lanes
+  with the tuning rows on only, and gemma-3's and Qwen3.5's full-head int8-off
+  runs there did not complete (their int8-off rows there come from the
+  workaround runs).
+- **gemma-3-1b's int8 distance is ten times larger on the integrated GPU than on
+  the RX 7900 XTX, unexplained.** Worst KL from position 2 on, configuration
+  `gpu`: 0.26 on `Vulkan1` (prompt 2, position 115; 0.87 at position 1), 2.6e-2
+  on the 7900 natively (0.33 at position 0), 0.11 with wave64 forced, 1.2e-2
+  with the generic tuning (rows off). The other models' int8 rows stay within
+  about 3x across the same paths, apart from LFM3 Q4_K_M (9x, its rows-off run
+  the low one). The 7900 natively runs the int8 coopmat GEMM
+  (`native_gemm_i8cm_*`); with wave64 forced, and on the integrated GPU, the
+  dp4a `native_gemm_mmq_*` runs instead (the int8-free check's kernel lists, on
+  Qwen3 **[ran]**; on gemma **[I]**). Those are the two far paths, so the mmq
+  GEMM on gemma's large activations is the first guess. Not looked into; it is
+  what makes gemma's Int8 row a smoke check.
+- **The int8-free check's marker list is typed by hand** (`INT8_KERNEL_MARKERS`
+  in `tests/gpu_tolerance.rs`): the Vulkan crate has no central list of
+  int8-activation kernels, so an int8 kernel named outside the markers would
+  pass it unseen. A per-kernel "reads int8 activations" fact beside
+  `tuning/classes.rs`'s classification would close it.
+- **The top-set cosine is nearly blind on high-entropy rows.** Its single
+  rest-of-mass component dominates when the union holds little mass (two rows
+  flat over different 1000-token sets of a 32000 vocabulary: 0.99993 at KL 30),
+  and `1 - cos` grows with the square of the leaked mass. KL gates the same
+  rows, so nothing passes on the cosine alone. A Bhattacharyya coefficient
+  (`Σ √(p q)`) would have the right shape; not changed now, because it means
+  re-deriving the table.
+- **One unreproduced failure of
+  `gpu_seam_tolerance_prefill_head_leaves_decode_unchanged` on `Vulkan1`**, in a
+  full GPU gate run (2026-11-18, the tree at `ad3b4458`, after about 170 other
+  GPU tests, failed after 7.8 s; the assertion message was not captured here).
+  The same binary then passed five times alone and three times after a
+  neighbouring test (`goes_red`, `lfm3`), and the reworked test (two hook-off
+  runs compared first, then `All` and `LastOfChunk`, small chunks) passed six
+  times. That gate overlapped this round's stall experiments on the same GPU
+  (section 0b of plan 12: hung and lost-device runs), the likeliest cause, but
+  not shown. If it recurs, the reworked test's message says whether two hook-off
+  decodes already differ (nondeterminism) or the head changed them, with the
+  first differing row and token.
 - **One run starved the host.** A full-configuration measurement of LFM3-1.7B
   F16 on `Vulkan1` took available memory from 32.5 GB to 2.4 GB before the
   memory guard stopped it; a repeat with one configuration peaked near 11 GB

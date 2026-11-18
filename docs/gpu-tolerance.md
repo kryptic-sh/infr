@@ -55,13 +55,13 @@ order fails it.
 from the two f32 rows, on `infr_core::math` (the workspace takes no math from
 the platform library):
 
-| Metric         | Definition                                                                                                                                                         | Why                                                                                                                                                                                                                                                                                                                                                    |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| KL             | KL(reference ‖ test) over the full vocabulary                                                                                                                      | The primary metric: the expected extra log-loss, shift-invariant. Computed as `ln(1 + E_p[expm1(e - c)]) - E_p[e - c]` with `e = t - r`, so two rows a rounding apart score their real distance; a reference token whose f32 probability underflows (more than about 104 below the row's top) still enters the normalizer, so promoting one is charged |
-| top-k cosine   | cosine of the two rows' probability vectors over the union of both rows' top sets (0.99 of the mass or 64 tokens each), plus one component for the mass outside it | Secondary: sees mass moved within or out of the top tokens even when the reference's top set is one token. A whole-vocabulary logit cosine cannot separate a match from a mismatch (B60)                                                                                                                                                               |
-| logit dev      | the largest difference after centring each row on its mean, over the reference row's range (max − min)                                                             | Shift-invariant; the mean does not move with the top logits, so one wrong top logit counts once                                                                                                                                                                                                                                                        |
-| top-1          | the argmax agrees, counted only where the reference's top-2 margin exceeds the row's near-tie threshold                                                            | A greedy flip that is not a tie. Near ties left out are reported, and each of the prefill and decode phases must score at least `MIN_TOP1_SCORED` positions over a case                                                                                                                                                                                |
-| ref top-1 rank | how many tokens the test row ranks above the reference's choice                                                                                                    | Separates "second by a hair" from "lost"                                                                                                                                                                                                                                                                                                               |
+| Metric         | Definition                                                                                                                                                         | Why                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| KL             | KL(reference ‖ test) over the full vocabulary                                                                                                                      | The primary metric: the expected extra log-loss, shift-invariant. Computed as `ln(1 + E_p[expm1(e - c)]) - E_p[e - c]` with `e = t - r`, so two rows a rounding apart score their real distance; a reference token far down the row (its `e - c` too large to exponentiate, or its f32 probability underflowed) enters the normalizer as `e^(t - lse_r - c)`, so promoting one is charged what it costs; only a term itself beyond f32's range scores infinite |
+| top-k cosine   | cosine of the two rows' probability vectors over the union of both rows' top sets (0.99 of the mass or 64 tokens each), plus one component for the mass outside it | Secondary, never the sole detector of a class of bug: sees mass moved within or out of the top tokens even when the reference's top set is one token, but only means something when the union holds most of the mass (on a high-entropy row the rest component dominates: two rows flat over different 1000-token sets of 32000 score 0.99993 at KL 30). A whole-vocabulary logit cosine cannot separate a match from a mismatch (B60)                         |
+| logit dev      | the largest difference after centring each row on its mean, over the reference row's range (max − min)                                                             | Shift-invariant; the mean does not move with the top logits, so one wrong top logit counts once                                                                                                                                                                                                                                                                                                                                                                |
+| top-1          | the argmax agrees, counted only where the reference's top-2 margin exceeds the row's near-tie threshold                                                            | A greedy flip that is not a tie. Near ties left out are reported, and each of the prefill and decode phases must score at least `MIN_TOP1_SCORED` positions over a case                                                                                                                                                                                                                                                                                        |
+| ref top-1 rank | how many tokens the test row ranks above the reference's choice                                                                                                    | Separates "second by a hair" from "lost"                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 Each is aggregated per run (one prompt, one configuration, one phase) as the
 worst position, with where it was, and the mean. A NaN or infinite logit is an
@@ -79,8 +79,11 @@ token held 0.99 of the mass, whatever the test row did (SmolLM3's production-CPU
 position-0 row: KL 4.88, cosine 1.000000); the new one gives 0.016 on that row
 and below 0.5 on the constructed probe. A tail that takes half the mass from a
 one-token top set now gives a cosine under 0.9 (was 1). A test row promoting a
-token the reference's f32 softmax underflowed scored KL 0 against a true 4.96;
-it now scores the exact value.
+reference token from far down the row (`[0, -d, -5, -6]` against
+`[0, 5, -5, -6]`) scored KL 0 for `d` from 104 on and infinity for `d` from 80
+to 103, against a true 4.9976 (mpmath); it now scores that value to six digits
+across the range, and a token at -100 moved to -15 scores its true 3.03e-7
+instead of infinity.
 
 ## The three-way comparison: which CPU mode is the reference
 
@@ -197,11 +200,16 @@ and mean times 2, the cosine's distance from 1 times 2, the logit deviation
 times 1.5, the rank at twice the worst plus one, the near-tie margin at 1.5
 times the widest legitimate top-1 miss (at least 0.25 nats in Float, 1 nat in
 Int8 and KvQ8), each from the worst legitimate value over every device and
-configuration measured. The worst legitimate KL of a row moves by up to about 4x
-between the RX 7900 XTX native, its wave64 path and the integrated GPU, and the
-margin of 2 on top is headroom for a device or driver not measured here, kept
-small because the planted bugs sit only 3 to 5 times above the legitimate worst
-in Float.
+configuration measured. The worst legitimate KL of a row (from position 2 on)
+moves a long way between the paths measured — the RX 7900 XTX native, its wave64
+path, its generic tuning (rows off) and the integrated GPU: within about 4x for
+most rows, but 9x to 22x for gemma-3's Float and Int8 rows and LFM3's Float and
+Int8 rows, and 83x for Qwen3.5's Float row (whose integrated-GPU figure scores
+one prefill row per chunk). A row's bound is its worst path's, so it is loose
+for the paths far below that. The margin of 2 on top is headroom for a device or
+driver not measured here, kept small because the planted bugs sit only 3 to 4.5
+times above the Float tolerance (6.4x on KL and 9.2x on mean KL above the
+legitimate worst).
 
 **Both sides of each gap, on Qwen3-0.6B** (the only model the bugs were planted
 in), from position 2 on, worst legitimate value / tolerance / smallest planted
@@ -215,9 +223,13 @@ bug that crossed it:
 
 **No usable gap: gemma-3-1b in Int8**, labelled a smoke check in the code. Its
 legitimate worst KL is 0.26 from position 2 on (0.87 in the first rows) and its
-cosine falls to 0.86, so its bounds admit a bug the size of (f) on Qwen3; its
-Float row is the real check for gemma. For every row but Qwen3-0.6B's, the gap
-is unmeasured: the tolerances are set from legitimate runs only.
+cosine falls to 0.86, all on the integrated GPU (native lanes, configuration
+`gpu`, prompt 2, positions 115 and 1). The same runs on the RX 7900 XTX give
+2.6e-2 and 0.33 natively, 0.11 and 0.57 with wave64 forced, and 1.2e-2 with the
+generic tuning: ten times apart between the two GPUs, unexplained (B207), so its
+bounds admit a bug the size of (f) on Qwen3; its Float row is the real check for
+gemma. For every row but Qwen3-0.6B's, the gap is unmeasured: the tolerances are
+set from legitimate runs only.
 
 **No ratchet.** A row may be loosened only by its owner, with the measurement
 that needs it (device, driver, configuration, the run's printed values) and the
@@ -241,16 +253,24 @@ Every test ends as a pass, a fail or a printed `skip:` line, never a hang:
 - it skips without its model (and fails instead under
   `INFR_TEST_REQUIRE_MODELS`) or without a Vulkan device, and on an integrated
   GPU when free host memory is under twice the model plus a 12 GB margin;
-- a watchdog (`GATE_TIMEOUT`) fails a case that runs too long, saying it is a
-  hang;
-- on an integrated GPU the int8-off runs score the prefill on each chunk's last
-  row only and run with a submit cap of 4 (`INTEGRATED_FLOAT_SUBMIT_CAP`), said
-  in the log. This is a **harness workaround for a production weakness**, not a
-  fix: with every int8 kernel off, a submit holding the harness's prefill head
-  outlasted that GPU's watchdog (hangs and a lost device), which
-  [plan 12](plan/12-low-capability-vulkan.md) section 0b records as a local
-  reproduction of issue 94's failure class. The prefill phase of those runs
-  scores one row per chunk and is not held to `MIN_TOP1_SCORED`.
+- a watchdog (`GATE_TIMEOUT`, 20 minutes: about 4.5 times the slowest test
+  measured, LFM3's 266 s on the integrated GPU) fails a case that runs too long,
+  saying it is a hang. The bound is per `gate()` call, and some tests call it
+  twice, so the worst case for the whole set is several hours, not 20 minutes;
+  the watchdog ends the test process, so under plain `cargo test` (one process)
+  the tests after it do not run;
+- on an integrated GPU the runs whose configuration turns every int8 kernel off
+  score the prefill on each chunk's last row only and run with a submit cap of 4
+  (`INTEGRATED_FLOAT_SUBMIT_CAP`), said in the log. This is a **harness
+  workaround for a production weakness**, not a fix: with every int8 kernel off,
+  a submit holding the harness's prefill head stalled or lost that GPU, which
+  [plan 12](plan/12-low-capability-vulkan.md) section 0b records. The prefill
+  phase of those runs scores one row per chunk, is not held to
+  `MIN_TOP1_SCORED`, and does not score positions 0 and 1 at all unless one ends
+  a chunk. It is keyed on the device being integrated: a slow discrete card
+  (issue 94's class) gets no workaround and would only meet the watchdog; the
+  float-weight models' shipped `gpu` runs and the int8-free check keep the full
+  head there too, and completed.
 
 `INFR_FORCE_WAVE64=1` runs the wave64 path and `INFR_TUNE_NO_ROWS=1` the generic
 tuning defaults (both reach these tests through `infr_testkit::honour_env`).
@@ -267,7 +287,16 @@ about 6.5 minutes a run (natively: Qwen3 61 s, Qwen3.5 73 s, gemma-3 77 s, LFM3
 (both files) 112 s, ERNIE (both files) 54 s, the rest under 5 s each). On the
 integrated GPU, native lanes, all ten passed with the workaround above in 637 s
 (Qwen3 80 s, Qwen3.5 82 s, gemma-3 133 s, LFM3 266 s, ERNIE 67 s); wave64 and
-rows off were not gate-run there.
+rows off were not gate-run there. These GPU results predate the rebase onto the
+CPU's FMA-tier commits on `main`.
+
+The red-path tests scale `blk.1.ffn_down.weight` of the synthetic model by 1.02.
+On the CPU a 1.01 scale already trips the gate and 1.008 and below pass
+(measured in review), so 1.02 is about twice the threshold; the green control is
+the reference against itself, at a distance of exactly 0. The int8-free check
+reads the kernels a run BUILT, which are built lazily when first recorded: a
+superset of what ran, so its negative check is the conservative one; its marker
+list is typed by hand (B207).
 
 ## The existing exact GPU tests across the matrix
 

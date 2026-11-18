@@ -20,7 +20,8 @@
 use half::f16;
 use infr_core::tensor::DType;
 
-const QK: usize = 128; // elements per block / WHT group
+/// Elements per block, and per Walsh-Hadamard group.
+pub const QK: usize = 128;
 
 /// 1/sqrt(128) — the WHT normalization for a 128-element group.
 const INV_SQRT: f32 = 0.088_388_35;

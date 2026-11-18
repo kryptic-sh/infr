@@ -160,6 +160,23 @@ def gen_tables():
     w(f"pub(super) const LN2_64_3: f64 = {hx(c3)};")
     w(f"/// `64/ln(2)`, rounded.")
     w(f"pub(super) const INV_LN2_64: f64 = {hx(to_f64(64 / ln2))};")
+
+    # exp's binary64 lane: 2^(j/256) and ln2/256 in two pieces. `|k| < 2^16` for every input
+    # the lane accepts, so the 37-bit first piece makes k*C1 exact.
+    w("/// `2^(j/256)` for `j` in `0..256`, as `(hi, lo)`.")
+    w("pub(super) const EXP2_J256: [(f64, f64); 256] = [")
+    for j in range(256):
+        hi, lo = dd(mpf(2) ** (mpf(j) / 256))
+        w(f"    ({hx(hi)}, {hx(lo)}),")
+    w("];")
+    c = ln2 / 256
+    c1 = round_bits(c, 37)
+    c2 = to_f64(c - mpf(c1))
+    w("/// `ln(2)/256 = LN2_256_1 + LN2_256_2` to about 90 bits; the first has 37 significant bits.")
+    w(f"pub(super) const LN2_256_1: f64 = {hx(c1)};")
+    w(f"pub(super) const LN2_256_2: f64 = {hx(c2)};")
+    w(f"/// `256/ln(2)`, rounded.")
+    w(f"pub(super) const INV_LN2_256: f64 = {hx(to_f64(256 / ln2))};")
     w("/// `1/n!` for `n` in `0..=13`, as `(hi, lo)`.")
     w("pub(super) const INV_FACT: [(f64, f64); 14] = [")
     for n in range(14):

@@ -356,6 +356,16 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
     p.kernels.cpu.spin = num(get, "INFR_CPU_SPIN");
     p.kernels.cpu.spinpool = set_not_zero_inv(get, "INFR_CPU_NO_SPINPOOL");
     p.kernels.cpu.repack_mb = num(get, "INFR_CPU_REPACK_MB");
+    // A debug switch whose whole point is the tier it names: a misspelt one is refused rather
+    // than silently running the default.
+    if let Some(raw) = get("INFR_CPU_MAX_TIER") {
+        let tier = <crate::simd::SimdTier as super::partial::ConfigValue>::parse_set(&raw)
+            .map_err(|message| ConfigError::Env {
+                key: "INFR_CPU_MAX_TIER",
+                message,
+            })?;
+        p.kernels.cpu.max_tier = Some(Some(tier));
+    }
 
     // ── kernels (graph shape, `infr-llama`) ──────────────────────────────────
     p.kernels.qkv_fuse = presence_inv(get, "INFR_NO_QKV_FUSE");

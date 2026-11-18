@@ -77,7 +77,7 @@ impl Dd {
 }
 
 /// `2^e` for `-1022 <= e <= 1023`, built from its bits.
-#[inline]
+#[inline(always)]
 pub(super) fn pow2(e: i32) -> f64 {
     debug_assert!((-1022..=1023).contains(&e), "{e}");
     exp2i(e)

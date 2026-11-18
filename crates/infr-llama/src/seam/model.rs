@@ -21,8 +21,9 @@ pub struct PplReport {
 
 impl PplReport {
     pub fn ppl(&self) -> f64 {
-        // libm-ok(S2): f64 `exp` (perplexity is accumulated in f64; `infr_core::math` is f32)
-        (self.nll_sum / self.count.max(1) as f64).exp()
+        // f64 accumulation, f32 exponential: perplexity is accumulated in f64 while every
+        // exponential in the tree goes through `infr_core::math` (see docs/math.md).
+        infr_core::math::exp((self.nll_sum / self.count.max(1) as f64) as f32) as f64
     }
 
     /// `llama-perplexity`'s `+/-` figure.
@@ -525,8 +526,10 @@ impl SeamModel {
     /// Load a model on a caller-supplied engine configuration. `tokenizer_path` overrides the
     /// GGUF's embedded vocab when given.
     ///
-    /// THE constructor: no environment, no globals, no process-wide ordering hazard, and two
-    /// models with different configurations can coexist in one process. `infr-cli` resolves ONE
+    /// THE constructor: no environment, and two models with different configurations can
+    /// coexist in one process, with one exception: `kernels.cpu.max_tier` is a process-wide
+    /// debug switch that every CPU backend applies when built (see `CpuBackend::new_with`),
+    /// which changes only speed. `infr-cli` resolves ONE
     /// `Arc<Config>` in `main()` and hands the same handle to every model it loads. The old
     /// `load(gguf, tok)` — which built a config from the environment for callers that had none —
     /// was deleted once every caller had one to give.
@@ -1595,11 +1598,9 @@ impl SeamModel {
                         let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
                         let lse = row
                             .iter()
-                            // libm-ok(S2): f64 `exp` on the log-sum-exp row
-                            .map(|&x| (x as f64 - max).exp())
-                            .sum::<f64>()
-                            // libm-ok(S2): f64 `ln` of that sum
-                            .ln();
+                            .map(|&x| infr_core::math::exp((x as f64 - max) as f32) as f64)
+                            .sum::<f64>();
+                        let lse = infr_core::math::ln(lse as f32) as f64;
                         lse + max - row[window[j + 1] as usize] as f64
                     })
                     .collect();

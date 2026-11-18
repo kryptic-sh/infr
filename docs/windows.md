@@ -212,11 +212,11 @@ file.
   workers share a core's hyperthreads (about half the decode speed on the
   9950X3D). `-t N` or `RAYON_NUM_THREADS` overrides it. Other platforms still
   default to every logical processor (backlog B76).
-- **CPU golden hashes.** The long `cpu_golden_*` cases produce different (still
-  coherent) text on Windows than on Linux on the same CPU, deterministically, so
-  those cases carry a Windows hash (`per_os` in
-  `infr-llama/tests/cpu_backend.rs`). Re-bless with `INFR_BLESS=1` on both
-  platforms when a golden legitimately moves.
+- **CPU golden hashes.** Every `cpu_golden_*` case has one hash for every
+  platform: the CPU backend's transcendental functions are `infr_core::math`'s
+  (correctly rounded), not the C runtime's, so Windows and Linux compute the
+  same bits ([`math.md`](math.md)). Re-bless with `INFR_BLESS=1` on both
+  platforms when a golden legitimately moves, and expect the same value.
 
 ## Small-model iGPU baseline (2026-10-08)
 

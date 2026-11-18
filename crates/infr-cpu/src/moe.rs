@@ -83,7 +83,7 @@ pub(crate) fn with_block_scratch<R>(n: usize, f: impl FnOnce(&mut [f32]) -> R) -
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
 #[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn expert_gemm_range(
+pub(crate) fn expert_gemm_range<const CAP: bool>(
     wbytes: &[u8],
     dt: DType,
     in_f: usize,
@@ -102,10 +102,10 @@ pub(crate) fn expert_gemm_range(
             let dot_col = |o: usize, col: &mut [f32]| {
                 let row = &wbytes[o * bpr..o * bpr + bpr];
                 match dt {
-                    DType::Q4K => vec_dot_q4k_batch(row, q8s, in_f, col),
-                    DType::Q6K => vec_dot_q6k_batch(row, q8s, in_f, col),
-                    DType::Q8_0 => vec_dot_q8_0_batch(row, q8s, in_f, col),
-                    DType::Q5K => vec_dot_q5k_batch(row, q8s, in_f, col),
+                    DType::Q4K => vec_dot_q4k_batch::<CAP>(row, q8s, in_f, col),
+                    DType::Q6K => vec_dot_q6k_batch::<CAP>(row, q8s, in_f, col),
+                    DType::Q8_0 => vec_dot_q8_0_batch::<CAP>(row, q8s, in_f, col),
+                    DType::Q5K => vec_dot_q5k_batch::<CAP>(row, q8s, in_f, col),
                     _ => unreachable!("Super acts imply a 256-super-block quant dtype"),
                 }
             };
@@ -113,8 +113,7 @@ pub(crate) fn expert_gemm_range(
             // per-call pack or `vec_dot_q4k_batch8`), Q5_K and Q6_K on the packed VNNI GEMM.
             // Q8_0 runs per-row.
             #[cfg(target_arch = "x86_64")]
-            let vnni =
-                is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni");
+            let vnni = crate::simd::vnni::<CAP>();
             #[cfg(not(target_arch = "x86_64"))]
             let vnni = false;
             let tiled_end = match dt {
@@ -147,7 +146,7 @@ pub(crate) fn expert_gemm_range(
                 }
                 let mut it = cols.chunks_mut(count);
                 let outs: [&mut [f32]; 8] = std::array::from_fn(|_| it.next().unwrap());
-                vec_dot_q4k_batch8(rows, q8s, in_f, outs);
+                vec_dot_q4k_batch8::<CAP>(rows, q8s, in_f, outs);
                 o += 8;
             }
             while o < o1 {
@@ -160,8 +159,8 @@ pub(crate) fn expert_gemm_range(
             let dot_col = |o: usize, col: &mut [f32]| {
                 let row = &wbytes[o * bpr..o * bpr + bpr];
                 match dt {
-                    DType::Q8_0 => vec_dot_q8_0_32_batch(row, q8s, in_f, col),
-                    DType::Q5_0 => vec_dot_q5_0_32_batch(row, q8s, in_f, col),
+                    DType::Q8_0 => vec_dot_q8_0_32_batch::<CAP>(row, q8s, in_f, col),
+                    DType::Q5_0 => vec_dot_q5_0_32_batch::<CAP>(row, q8s, in_f, col),
                     _ => unreachable!("Blk32 acts imply Q8_0/Q5_0"),
                 }
             };
@@ -174,7 +173,7 @@ pub(crate) fn expert_gemm_range(
                     std::array::from_fn(|i| &wbytes[(o + i) * bpr..(o + i) * bpr + bpr]);
                 let mut it = cols.chunks_mut(count);
                 let outs: [&mut [f32]; 8] = std::array::from_fn(|_| it.next().unwrap());
-                vec_dot_q32_batch8(rows, q8s, in_f, outs, q5);
+                vec_dot_q32_batch8::<CAP>(rows, q8s, in_f, outs, q5);
                 o += 8;
             }
             while o < o1 {
@@ -262,7 +261,7 @@ mod tests {
                     .collect();
                 let (o0, o1) = (8, out_f);
                 let mut out_t = vec![f32::NAN; (o1 - o0) * count];
-                expert_gemm_range(
+                expert_gemm_range::<false>(
                     &w,
                     dt,
                     in_f,
@@ -277,9 +276,9 @@ mod tests {
                     let row = &w[o * bpr..(o + 1) * bpr];
                     for (r, q8) in q8s.iter().enumerate() {
                         let want = match dt {
-                            DType::Q4K => vec_dot_q4k(row, q8, in_f),
-                            DType::Q5K => vec_dot_q5k(row, q8, in_f),
-                            _ => vec_dot_q6k(row, q8, in_f),
+                            DType::Q4K => vec_dot_q4k::<false>(row, q8, in_f),
+                            DType::Q5K => vec_dot_q5k::<false>(row, q8, in_f),
+                            _ => vec_dot_q6k::<false>(row, q8, in_f),
                         };
                         let got = out_t[(o - o0) * count + r];
                         assert_eq!(

@@ -141,6 +141,18 @@ impl ConfigValue for super::MetalDeviceTime {
     }
 }
 
+impl ConfigValue for crate::simd::SimdTier {
+    /// A tier name as [`crate::simd::SimdTier::name`] spells it; anything else is refused, since
+    /// a debug switch that silently ran the default tier would measure the wrong thing.
+    fn parse_set(raw: &str) -> Result<Self, String> {
+        Self::parse(raw)
+            .ok_or_else(|| format!("expected scalar, avx2, avx512 or avx512vnni (got {raw:?})"))
+    }
+    fn to_display(&self) -> String {
+        self.name().to_string()
+    }
+}
+
 impl ConfigValue for Vec<String> {
     /// A comma-separated list of names (a TOML array arrives joined with commas). Empty items are
     /// skipped, so `""` is the empty list.

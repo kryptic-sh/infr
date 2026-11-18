@@ -772,7 +772,8 @@ fn scan_file_for_keys(path: &Path, out: &mut Vec<String>) {
 /// * `INFR_PROFILE` in the five `build.rs` — a BUILD-time input; a runtime `Config` cannot exist
 ///   when it is read.
 /// * `INFR_TEST_GGUF` / `INFR_TEST_MODEL` / `INFR_LLAMA_DIFFUSION_CLI` — test/dev fixtures that
-///   point at files on disk, deliberately left on the environment.
+///   point at files on disk, deliberately left on the environment; `INFR_TEST_REQUIRE_MODELS`,
+///   which makes a test whose model is missing fail instead of skip (CI's golden jobs).
 ///
 /// `RAYON_NUM_THREADS` is not an `INFR_*` knob and is not in scope: `infr-cli` still PUBLISHES it,
 /// because rayon's global pool has no other input.
@@ -782,6 +783,7 @@ fn no_infr_env_reads_outside_the_config_layer() {
     const FIXTURE_KEYS: &[&str] = &[
         "INFR_TEST_GGUF",
         "INFR_TEST_MODEL",
+        "INFR_TEST_REQUIRE_MODELS",
         "INFR_LLAMA_DIFFUSION_CLI",
     ];
 
@@ -1096,6 +1098,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     /// gates. (`kernels.cpu.reference` is on the same struct but has no env key — it was never a
     /// variable, so it is not in `KEYS`.)
     const S3: &[&str] = &[
+        "INFR_CPU_MAX_TIER",
         "INFR_CPU_NO_SPINPOOL",
         "INFR_CPU_OP_HASH",
         "INFR_CPU_REPACK_MB",
@@ -1419,6 +1422,80 @@ fn tune_map_reaches_every_layer_with_its_level() {
             ("moe.small_m", "4", TuneLevel::Env),
             ("attn_canvas.chunks", "5", TuneLevel::Cli),
         ]
+    );
+}
+
+/// The removed `INFR_CPU_MATH_TIER` (never released; `kernels.cpu.max_tier` replaced it) is not
+/// read, as no removed `INFR_*` key is (the env policy: no aliases, no warnings): setting it,
+/// even to a valid tier, specifies nothing. Turns red if an alias for it reappears.
+#[test]
+fn removed_math_tier_env_is_not_read() {
+    for v in ["baseline", "avx2", "nonsense"] {
+        assert!(
+            env_layer(&[("INFR_CPU_MATH_TIER", v)]).is_empty(),
+            "INFR_CPU_MATH_TIER={v} was read"
+        );
+    }
+}
+
+/// `kernels.cpu.max_tier` takes a tier name in every layer and refuses anything else at load
+/// time, as a config error naming the key, rather than letting a typo silently run the widest
+/// tier. Turns red if the `SimdTier` value grammar accepts an unknown name.
+#[test]
+fn max_tier_is_checked_at_load() {
+    use crate::simd::SimdTier;
+    let ok = file::parse_str(
+        "[kernels.cpu]
+max_tier = \"AVX2\"
+",
+        Path::new("infr.toml"),
+    )
+    .expect("a tier name")
+    .0;
+    assert_eq!(ok.kernels.cpu.max_tier, Some(Some(SimdTier::Avx2)));
+    let err = file::parse_str(
+        "[kernels.cpu]
+max_tier = \"avx3\"
+",
+        Path::new("infr.toml"),
+    )
+    .unwrap_err();
+    match err {
+        ConfigError::Value { path, message } => {
+            assert_eq!(path, "kernels.cpu.max_tier");
+            assert!(
+                message.contains("scalar, avx2, avx512 or avx512vnni"),
+                "{message}"
+            );
+        }
+        other => panic!("expected a value error, got {other:?}"),
+    }
+    let err = cli::parse_reporting(&ConfigOverrides {
+        sets: vec!["kernels.cpu.max_tier=sse9".to_string()],
+        ..Default::default()
+    })
+    .unwrap_err();
+    assert!(
+        matches!(&err, ConfigError::Value { path, .. } if path == "kernels.cpu.max_tier"),
+        "{err:?}"
+    );
+    let err = try_env_layer(&[("INFR_CPU_MAX_TIER", "avx3")]).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ConfigError::Env {
+                key: "INFR_CPU_MAX_TIER",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        env_layer(&[("INFR_CPU_MAX_TIER", "scalar")])
+            .kernels
+            .cpu
+            .max_tier,
+        Some(Some(SimdTier::Scalar))
     );
 }
 

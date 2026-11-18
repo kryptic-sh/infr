@@ -386,11 +386,12 @@ fn denoise_block(
                                     amax = v as u32;
                                 }
                             }
-                            let mut z_sum = 0f32;
                             for (v, &raw) in row.iter().enumerate() {
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                let e = (raw * temp_inv - m).exp();
-                                escratch[v] = e;
+                                escratch[v] = raw * temp_inv - m;
+                            }
+                            infr_core::math::exp_slice(escratch);
+                            let mut z_sum = 0f32;
+                            for &e in escratch.iter() {
                                 z_sum += e;
                             }
                             let target = u[pos] * z_sum;
@@ -401,8 +402,7 @@ fn denoise_block(
                             for (v, &e) in escratch.iter().enumerate() {
                                 let p = e / z_sum;
                                 if p > 0.0 {
-                                    // libm-ok(S2): platform `ln`, moves to `infr_core::math` in S2
-                                    h -= p * p.ln();
+                                    h -= p * infr_core::math::ln(p);
                                 }
                                 cum += e;
                                 if !picked && cum >= target {

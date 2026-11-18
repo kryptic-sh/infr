@@ -2870,14 +2870,6 @@ a hot path
   2026-11-13 beside a release build, and passed five times alone). The whole
   workspace passed with `--test-threads=1`; no assertions or system memory
   settings were changed. Revisit parallel resource scheduling separately.
-- **Why Windows CPU goldens diverge is unconfirmed.** `cpu_golden_qwen3` and
-  `cpu_golden_gemma3`'s 48-token cases produce different, coherent text on
-  Windows than on Linux on the same Ryzen, with and without `target-cpu=native`,
-  identically run after run; the short cases match bit-for-bit. They carry a
-  Windows hash via `per_os`. The C runtime's `f32` transcendentals (UCRT vs
-  glibc) are the suspect — confirming it means diffing per-op outputs between
-  the two builds. Nothing in CI runs these on Windows (no model cache in the
-  `test` job), so the Windows hashes are checked on dev boxes only.
 
 ### B76 — the physical-core thread default is Windows-only until Linux is measured (2026-09-23)
 
@@ -4024,11 +4016,10 @@ the Apple target but were not run.
   downloads nothing (confirmed in `ci.yml`). Metal's runner, session, slot pool
   and sampling integration therefore never executes anywhere — no one on the
   project has a Metal device. `docs/ci-matrix.md` was corrected on this point.
-- **Windows golden hashes** (`per_os(windows, …)` in `QWEN3_GOLDEN` and
-  `GEMMA3_GOLDEN`) are never asserted in CI: `cpu-goldens` is Ubuntu-only. On
-  the Windows dev box they still match as of 2026-11-13 (`cpu_golden_qwen3`,
-  `cpu_golden_gemma3` and `cpu_golden_qwen3_quants` pass, after the 2026-11-12
-  tokenizer fixes).
+- **CPU goldens on Windows** are never asserted in CI: `cpu-goldens` is
+  Ubuntu-only. Since `infr_core::math` (plan 11, S2) every case has one hash for
+  every platform, identical natively on Windows and under WSL on the dev box; a
+  Windows leg for the goldens is plan 11's S3.
 - **Tests that skip on an integrated GPU, and pass.** The qwen35 snapshot tests
   in `seam/runner.rs` (`with_q35_vulkan`) skip where `max_decode_chain` is 1,
   because no chain runs and no snapshot is taken. Four prefill-chunk helper
@@ -4977,8 +4968,8 @@ because the `cpu-goldens` CI job downloads only Gemma 3 1B and Qwen3 0.6B. Its
 two 32-token hashes were captured on Windows only; 32 is the length the other
 goldens keep OS-stable, but no Linux run has confirmed it for this model. To run
 it in CI: add `unsloth/SmolLM3-3B-GGUF` `SmolLM3-3B-Q4_K_M.gguf` (about 1.9 GB)
-to that job's download list, bump its cache key, drop the `#[ignore]`, and wrap
-a hash in `per_os` if the Linux run differs.
+to that job's download list, bump its cache key and drop the `#[ignore]`; one
+hash serves every platform (plan 11).
 
 Against llama.cpp, measured 2026-11-13 on this Windows box, CPU, on identical
 prompt ids (llama.cpp's own 39-token render, which infr's now matches byte for
@@ -5125,7 +5116,7 @@ as B161: the `cpu-goldens` CI job downloads only Gemma 3 1B and Qwen3 0.6B. The
 golden's two 32-token hashes were captured on Windows only; no Linux run has
 confirmed them. To run them in CI: add `unsloth/ERNIE-4.5-0.3B-PT-GGUF`
 `ERNIE-4.5-0.3B-PT-Q4_K_M.gguf` (240645600 bytes) to that job, drop the
-`#[ignore]`s, and wrap a hash in `per_os` if Linux differs.
+`#[ignore]`s; one hash serves every platform (plan 11).
 
 `cpu_golden_ernie4_5_moe` (the 21B-A3B MoE) is `#[ignore]`d too. Its two hashes
 are the same on Windows and Linux (WSL, 2026-11-14), but its file is 13331015456
@@ -5260,11 +5251,6 @@ final build, 16 threads:
   each dot keeping `dot`'s eight-lane FMA order so the result stays
   bit-identical) is the untried next step; see "considered and declined" for
   what did not help.
-- **GatedAct** (scalar `expf`, about 4% of the forward): a vectorized SiLU
-  changes the bits of every FFN, so every CPU golden on every CI platform would
-  need re-blessing, and the Windows/Linux/macOS hashes cannot all be produced on
-  this box. Needs the user's call: a default-off switch buys nobody anything, a
-  default-on one is a golden re-bless on three platforms.
 - **Decode** (Qwen3-1.7B tg128 56.72-56.83 against llama.cpp's 59.88-60.24;
   single-threaded it is level: 31.66 against 31.82 tg32). The gap is in scaling
   past 8 threads; not profiled further. Candidates: the per-op handoff (about
@@ -5939,7 +5925,7 @@ Vulkan1 126.3 against 186.83; CPU tg128 49.6 against 56.64).
   test are model-gated; the `cpu-goldens` CI job downloads Gemma 3 1B and Qwen3
   0.6B only. The Q4_K_M file is 1099627808 bytes. Hashes captured on Windows
   only. To run it in CI: add `LiquidAI/LFM3-1.7B-GGUF` `LFM3-1.7B-Q4_K_M.gguf`
-  to that job, drop the `#[ignore]`, wrap a hash in `per_os` if Linux differs.
+  to that job, drop the `#[ignore]`; one hash serves every platform (plan 11).
   The synthetic tests (`synthetic_lfm3.rs`, `seam::runner`'s
   `lfm3_divergent_turn_matches_a_fresh_slot` /
   `lfm3_extending_turn_matches_a_fresh_prefill`) do run in CI.
@@ -6599,3 +6585,196 @@ every other dtype. The options as weighed:
   (`int8_ok = rows >= 2 && !reference`, `crates/infr-cpu/src/moe.rs`); this
   decision is about `Op::Linear` only.
 - What int8 activations cost in accuracy in general is B192.
+
+### B202 — what the `infr_core::math` migration (plan 11, S2) left (2026-11-17)
+
+**Tag:** cpu · determinism · math
+
+- **Decision for the owner: `silu(-inf)` and `gelu_tanh(-inf)` are NaN.** The
+  helpers reproduce the expressions the call sites always wrote,
+  `x / (1 + e^-x)` (`-inf/inf`) and `0.5 x (1 + tanh(...))` (`-inf * 0`), so the
+  migration changed no special value. The mathematical limits are 0 and `-0`.
+  Returning them would touch every SiLU/GELU activation (`act_slice`, the gated
+  norms, the short convolution, Metal's `act_fn`, the Diffusion-Gemma
+  self-conditioning GELU) and needs the special-value tables in `docs/math.md`
+  and `helper_special_values` changed; an `-inf` activation input is already a
+  broken forward, so the gain is only that it would not turn into NaN there. The
+  GPU shaders compute their own and were not checked.
+- **`powf` is correctly rounded on every input tested, not proven** (see
+  `docs/math.md`). Its production uses are RoPE's frequencies (`rope_freqs`,
+  once per op) and the pager's Zipf shape; a proof needs a worst-case search
+  over the pairs RoPE uses at least.
+- **aarch64 is compiled, never run or measured.** CI's macOS job runs the grid
+  hashes; the speed of the two-lane NEON path (the baseline tier there) against
+  Apple's libm is unknown: run `bench_against_std` on a Mac (`docs/math.md`).
+- **Not migrated to slices (scalar `math` calls, not hot):** the MoE router's
+  sqrt-softplus, the hyper-connection sigmoids, DeltaNet's per-head gates,
+  `Op::HeadGate` and `MoeSharedExpertAdd` (one sigmoid per head or row), the MLA
+  rope's sines and cosines (per query, head and pair) and the Metal backend's
+  host fallbacks. (Sinkhorn's softmax does use `exp_sub_slice`.)
+- **`docs/synthetic-models.md` still argues that exact-token goldens are not
+  portable** (its "Failure mode 2"). Plan 11 found the cause of the case it
+  cites (the AVX-512 Q8_0 kernels, fixed in S4) and the CPU output is now the
+  same on every OS, tier, thread count and chunk height tested; the section's
+  advice (logits with tolerance, wide-margin weights) still holds for synthetic
+  models, but its premise should be rewritten once CI's three systems have run
+  the goldens.
+- **What the S2 review checked only by reading.** The reviewer compared the
+  branch op hash for op hash against a control (`origin/main` with every
+  platform call rewritten one for one to scalar `infr_core::math`) across seven
+  model families and the synthetic oracles. These paths were read but no run
+  exercised them: `Op::Softcap`, the `Op::Softmax` op, `ArgmaxProb` and MTP,
+  `MoeSharedExpertAdd`, diffusion and self-conditioning. The Metal backend's
+  host math was compiled for aarch64, never run.
+- **A decode `Linear` kernel's per-call time moves between builds that do not
+  touch it.** gemma-3-1b's `Linear m=1 1152x6912 Q5_0` took 249-259 µs per call
+  in two builds and 280-282 µs in a third (`INFR_PROF_OPS=1`, tg64, two
+  interleaved rounds each, 2026-11-17), whose source differed from the second in
+  the RoPE frequency cache (the one change on gemma's decode path), the math
+  tier switch and its config type, `deltanet_scan` and the pager's Zipf shape:
+  enough to move gemma's whole decode about 5%. A review found nothing in those
+  changes on the one-row Linear path itself. Two guesses, neither confirmed:
+  code placement (alignment of the hot loop), or the cache removing one
+  allocation and free per RoPE op, which changes the allocator state and with it
+  the address and alignment of the recycled activation buffer the Q5_0 Linear
+  reads. Comparing that input's address mod 64 and mod 4096 in the two builds
+  would settle the second. It means a decode A/B on this machine can show a few
+  percent that belongs to neither side; a per-op profile shows where it lands.
+- **`deltanet_scan` gaps a review found, neither reachable today.** Every shape
+  in `deltanet_scan_bit_identical_to_serial` has `kd == vd`, so a transposed
+  key/value dimension in the indexing would pass (real Qwen3.5 is square too).
+  And `rows == 0` or a zero head dimension now panics in `chunks_mut` where the
+  old form returned an empty result; the only producer (`runner.rs`) passes the
+  batch size, and no zero-batch path was found.
+- **Worth understanding: the int8 path amplifies last-bit differences.** Old
+  against new decode logits on Qwen3-0.6B differ by up to about 1.2 absolute (KL
+  up to 6e-2), from RoPE values that changed only in the last bit. The presumed
+  mechanism is the int8 re-quantization of activations before each `Op::Linear`
+  (a last-bit change moves a value across a rounding boundary of the int8 grid,
+  a jump of one int8 step), but that is not confirmed. If it is the mechanism,
+  it says how numerically sensitive the production int8 path is compared with
+  `CpuBackend::reference()`, and a test that measures the amplification (one
+  last-bit perturbation, logits distance on both paths) would put a number on
+  it. Plan 11's Q8_0 fix (a last-bit change in one kernel's summation order)
+  gave the same picture on Qwen3.5-0.8B (measured by the S3/S4 review,
+  2026-11-17): before either golden forks, the top logit already differs by 0.07
+  to 0.79 between `origin/main` and the branch; France forks at step 13 with
+  top-two margins 0.62 and 0.22 on the two sides, the knight story at step 31
+  with 0.034 and 0.099. This bears directly on plan 11's section 6: a GPU scored
+  against the CPU reference must be teacher-forced and judged by
+  distribution-level metrics, not by logit differences, which move this much
+  from a last-bit change on the CPU alone.
+
+### B203 — `Op::MoeFfn` is not row-count identical: one row f32, several int8 (2026-11-17)
+
+**Tag:** cpu · determinism · **Kind:** approved, not started
+
+**Decided 2026-11-18: the owner approved the first option below, int8
+activations at one row too.** To do: route one-row `Op::MoeFfn` through the int8
+expert kernels, drop the MoE exclusion from the row-count tests, re-bless the
+MoE goldens once (Windows and Linux agreeing before a value is committed, with
+the old and new text compared), and measure MoE decode before and after, since
+the speed gain is expected and not yet measured for the expert tiles.
+
+Plan 11's row-count identity (`tests/support/row_identity.rs`) holds every dense
+family bit for bit at prefill chunk heights 512, 7, 3 and 1. The MoE layer
+cannot, by design: `Op::MoeFfn` feeds Q4_K, Q5_K, Q6_K and Q8_0 expert banks
+int8 activations when the op has two rows or more and f32 activations at one row
+(`int8_ok = rows >= 2 && !reference` in `crates/infr-cpu/src/lib.rs`, then
+`moe::expert_acts_kind`). So a prompt prefilled in chunks and one prefilled a
+row at a time differ from the first MoE layer on, and a chunk that happens to
+hold one row (a prompt length one past a multiple of the height) switches path
+in the middle of a prefill. `docs/deepseek.md` ("Quantized expert banks: chunked
+prefill is close, not equal") measured it on the synthetic V4 file: 1.71e-4 max
+|logit difference| at the prompt's last position. Every height of two rows or
+more is identical to every other, and reference mode (`kernels.cpu.reference`)
+is identical at every height. The row-count tests leave the MoE models out and
+say why.
+
+Options:
+
+- **int8 at one row too** (what B201 chose for `Op::Linear`): row-count identity
+  everywhere, likely faster decode (the int8 one-row `Linear` measured 2.2-8.8x
+  faster than the f32 dot it replaced), slightly further from llama.cpp, and
+  every MoE model's CPU decode output changes once (re-bless
+  `cpu_golden_ernie4_5_moe`, `cpu_golden_qwen3moe` and the synthetic V4
+  fixtures' CPU-side values). Not measured for the MoE expert tiles.
+- **f32 at every row count**: identity, closest to exact, but MoE prefill loses
+  the int8 kernels and the packed VNNI tiles (several times slower prefill on
+  the expert GEMMs, by B201's measurements of the same trade on `Linear`).
+- **Leave it** (today): documented, tested as an exception.
+
+### B206 — CPU speed from narrower datatypes: what is not int8 yet (2026-11-18)
+
+**Tag:** cpu · perf · **Kind:** queued work, in this order
+
+Quantized weights already run through int8 kernels on x86 (AVX2, AVX-512, VNNI)
+with 8-bit activations. Where that is not yet the case, as reported by plan 11's
+S3/S4 work and not re-read for this entry:
+
+1. **aarch64 has no hand-written kernels.** Every family runs its scalar kernel
+   on Apple Silicon and ARM Linux. NEON int8 dot-product kernels (`dotprod`,
+   `i8mm` where present) are likely the largest CPU gain left. Each must compute
+   the scalar expression, which `kernels/tier_tests.rs` enforces once the tier
+   is one `crate::simd` dispatches. Correctness can run on CI's macOS runner;
+   speed needs a Mac owner (issue 100 collects a baseline first).
+2. **S6 of plan 11:** on baseline x86-64 builds the f32 dots' `mul_add` is a
+   C-runtime call, exact but slow; a run-time FMA tier keeps the bits.
+3. **One-row MoE** (B203, approved).
+
+### B204 — what plan 11's S3/S4 (tier, thread and row identity) left (2026-11-17)
+
+**Tag:** cpu · tests · ci · **Kind:** coverage gaps and open items
+
+- **The CI cache will exceed its limit.** The repository's Actions cache was at
+  10.52 GB before this work (`gh api`, 2026-11-17), with the old `-v2` Linux
+  models entry still live; the golden steps add about 2.3 GB once `-v2` is
+  evicted. Eviction is least-recently-used, so rust-cache entries will churn.
+  The Windows models entry also stores Qwen3-0.6B a second time, beside the
+  smoke job's `hf-windows-smoke-qwen3-06b-q4km-v1`; sharing one entry would save
+  about 370 MB (see B197).
+- **No test stops `CpuBackend::execute` from always taking the uncapped copy.**
+  Every tier gives the same bits, so `op_hashes` and the capped goldens would
+  still pass. A review confirmed the routing by planting a bit flip in an
+  AVX-512 kernel (seen at `avx512` and uncapped, not at `avx2` or `scalar`). The
+  missing test: run `execute` under a per-thread tier on a one-thread pool and
+  assert the recorded tier. Likewise the uncapped half of `tier_tests` records
+  no tier, so an uncapped copy that fell to scalar would be a slowdown no test
+  sees.
+- **The two interpreter copies decide "AVX-512 is present" differently.** The
+  uncapped dispatch checks only `avx512bw`, as before; `SimdTier::Avx512` and
+  `capped()` require F, DQ, VL and BW. On a machine that hides DQ or VL (some
+  VMs) a ceiling of `avx2` would leave `capped()` false and the uncapped copy
+  would still run AVX-512 kernels. Bits are unaffected; using one feature set in
+  both costs nothing on a native build.
+- **Thread counts: one threshold case does not vary its split.** `op_hashes.rs`
+  now has a case past each pool threshold, but the lightning-indexer case splits
+  into the same tasks at every thread count (its comment says otherwise). By
+  reading, every parallel op partitions outputs and never splits one reduction
+  across tasks (`Argmax`, `ArgmaxProb` and the samplers run serially).
+- **`mul_add_exact` tests double rounding only in its constructed cases.** A
+  random input lands on a halfway trap with probability around 2^-28, so the
+  random cases do not test it; infinity and NaN inputs are not tested.
+- **The goldens are weak detectors on their own.** A one-bit error planted in a
+  Q8_0 batch kernel left the Qwen3 and Qwen3.5 golden tokens unchanged; the
+  op-hash suite and the row-identity test caught it.
+- **`docs/math.md` groups the synthetic LFM3 row test with heights 512/7/3/1;**
+  that test uses 64/5/3/1.
+- **Not traced: gemma-3-1b decodes faster on native builds** (tg64 about 41 on
+  `main` against 45-46 on this work), level on baseline builds. See
+  `docs/math.md`.
+- **The interpreter is compiled twice.** infr-cpu's release `.text` grew from
+  952 KB to 1160 KB with the two copies (833 KB on `main` before the ceiling).
+- **The ±0/NaN audit's harmless sites** (`docs/math.md`, "Identity across tiers,
+  threads, row counts and architectures"): softmax and attention row maxima, the
+  lightning indexer's `d.max(0.0)` ReLU, the SwiGLU clamp's `gate.min(limit)`,
+  the int8 quantizers' `|x|` maxima. If one of them is ever used for more than
+  an `exp(x - max)` offset or a sum term, revisit it.
+- **S6 is open:** on a baseline x86-64 build (the release binaries, CI) every
+  `mul_add` in the f32 dots (`kernels::dot`, `dot_n`, `dot_mn`, `dot_f16`,
+  `dot_bf16`, attention's value accumulation, `dequant_row`) is a call to the C
+  runtime's `fma`: exact, so the bits match a native build, but slow. A run-time
+  FMA tier behind `crate::simd` would keep the bits and the speed.
+- **No NEON kernels.** aarch64 runs every family's scalar kernel. A NEON tier
+  must compute the scalar expression; `kernels/tier_tests.rs` will hold it to
+  that once it is a tier `crate::simd` dispatches.

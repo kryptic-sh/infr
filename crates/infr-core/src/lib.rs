@@ -32,6 +32,7 @@ pub mod pager;
 pub mod prof;
 pub mod progress;
 pub mod shutdown;
+pub mod simd;
 pub mod tensor;
 pub mod tier;
 

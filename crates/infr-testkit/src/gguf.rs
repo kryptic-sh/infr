@@ -232,6 +232,7 @@ impl TensorSpec {
             Fill::ExactBf16(_) => 30,
             // ggml's `GGML_TYPE_*` numbering.
             Fill::Quant(dt) => match dt {
+                DType::Q5_0 => 6,
                 DType::Q8_0 => 8,
                 DType::Q2K => 10,
                 DType::Q3K => 11,

@@ -26,10 +26,13 @@ env:
 # libvulkan is needed to BUILD, and the GPU integration tests are `#[ignore]`d
 # (they need a real device) — CI runs the CPU suite.
 #
-# What stays single-platform, and why: `cpu-goldens` asserts exact-token hashes
-# that are not reproducible across CPU microarchitectures (commit 273f8d4), so
-# fanning it out would multiply a known-flaky check; `build` is a release-profile
-# smoke test the matrix already covers in debug; `test-macos` runs the Metal
+# The CPU output is the same bits on every OS, SIMD tier and thread count
+# (`docs/plan/11-cpu-bit-identical.md`), so the exact-token goldens run on all
+# three: `cpu-goldens` runs the whole golden file on Linux, and the `test`
+# matrix's Windows and macOS legs run two of its goldens after their own suite
+# (macOS's is aarch64, and informational until it has passed once: B205). What
+# stays single-platform, and why: `build` is a release-profile smoke test the matrix already covers in
+# debug; `test-macos` runs the Metal
 # parity suite, which needs a real Metal device and `--include-ignored`;
 # `windows-smoke` is a Windows-only gap-filler, since Linux and macOS already
 # download and run models in other jobs.
@@ -114,6 +117,68 @@ jobs:
           tool: nextest
       - run: cargo nextest run --workspace --locked
       - run: cargo test --doc --workspace --locked
+      # Two CPU goldens on Windows and macOS: the checked-in hashes are the
+      # Linux ones, and one CPU output on every system is plan 11's point. They
+      # reuse the debug build above (`infr-cpu` is built at opt-level 3 in dev)
+      # rather than a release build with a rust-cache entry of its own. The
+      # models (Qwen3-0.6B 379 MB, Qwen3.5-0.8B 508 MB: the smallest pair that
+      # holds a Q4_K/Q6_K dense model and the gated DeltaNet one, whose golden
+      # the Q8_0 tier fix changed) live in their own hub cache, which only this
+      # step reads, and the cache is saved from `main` only (pull requests
+      # restore it). macOS is the first whole-model run on aarch64; until it has
+      # passed once the step cannot fail the job (B205 says when to flip it).
+      # Cache cost: one models entry per OS, 379 + 508 MB, about 0.9 GB each, and
+      # no rust-cache entry of its own. With the Linux models entry's change to
+      # `-v3` (1.66 GB, replacing the 1.1 GB `-v2`, which is no longer written and
+      # ages out), these steps add about 2.3 GB to the repository's cache.
+      - name: Restore the golden models
+        if: runner.os != 'Linux'
+        id: os-models
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/hf-goldens
+          key: hf-goldens-os-qwen3-06b_qwen35-08b-q4km-v1-${{ runner.os }}
+      - name: Download the golden models
+        if: runner.os != 'Linux' && steps.os-models.outputs.cache-hit != 'true'
+        shell: bash
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/hf-goldens
+        run: |
+          fetch() {
+            local attempt
+            for attempt in 1 2 3; do
+              if "$@"; then return 0; fi
+              if [ "$attempt" -lt 3 ]; then
+                echo "::warning::'$*' failed (attempt $attempt); retrying in 30s"
+                sleep 30
+              fi
+            done
+            return 1
+          }
+          fetch pipx install huggingface_hub
+          fetch hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-Q4_K_M.gguf
+          fetch hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf
+      - name: Save the golden models
+        if: >-
+          runner.os != 'Linux' && steps.os-models.outputs.cache-hit != 'true'
+          && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/hf-goldens
+          key: hf-goldens-os-qwen3-06b_qwen35-08b-q4km-v1-${{ runner.os }}
+      # `INFR_TEST_REQUIRE_MODELS` turns a missing model into a failure, and the
+      # summary must say both ran: a skip, or a filter that matches nothing,
+      # would otherwise pass.
+      - name: CPU goldens (Qwen3-0.6B, Qwen3.5-0.8B)
+        if: runner.os != 'Linux'
+        shell: bash
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/hf-goldens
+          INFR_TEST_REQUIRE_MODELS: "1"
+        run: |
+          cargo nextest run -p infr-llama --test cpu_backend --locked --color never \
+            -E 'test(=cpu_golden_qwen3) | test(=cpu_golden_qwen35)' 2>&1 | tee goldens.log
+          grep -E "Summary .* 2 tests run: 2 passed" goldens.log
 
   # CPU generation goldens against REAL models. The `cpu_golden_*` /
   # `cpu_kv_*` tests in `infr-llama/tests/cpu_backend.rs` self-skip when the
@@ -126,17 +191,22 @@ jobs:
   # caches them across runs, and runs the CPU suite so those goldens actually
   # execute and their hashes are asserted. Runs in parallel with the other jobs.
   #
+  # `INFR_TEST_REQUIRE_MODELS` makes a test whose model is missing fail instead
+  # of skip, and the step checks the three goldens' names in the output, so a
+  # wrong cache path or a failed download cannot report green. The models cache
+  # is saved from `main` only; pull requests restore it.
+  #
   # Model set (Q4_K_M, ~1.7 GB total) — one per distinct architecture family
   # with a CPU golden, deliberately excluding the multi-GB MoE / big models:
   #   unsloth/gemma-3-1b-it-GGUF  (769 MB) — dense SWA/GeGLU, hd=256; the
   #                                          non-256-in_f arch that caught Q8_0
   #   unsloth/Qwen3-0.6B-GGUF     (379 MB) — dense; also drives the cpu_kv_*
   #                                          coherence + quant-sweep tests
-  # Qwen3.5-0.8B (gated-DeltaNet) is intentionally NOT downloaded: its longer
-  # greedy generation is FP-sensitive, so the exact-token golden hash is not
-  # portable across CPU microarchitectures (coherent but different tokens on the
-  # runner vs the dev box). gemma3/qwen3 are short + stable enough to reproduce
-  # bit-for-bit; with the model absent, cpu_golden_qwen35 self-skips (need_model!).
+  #   unsloth/Qwen3.5-0.8B-GGUF   (508 MB) — gated DeltaNet. It was left out as
+  #                                          "not portable" (273f8d4). Plan 11 S4
+  #                                          made the AVX-512 Q8_0 kernels round
+  #                                          as the others do; whether that was
+  #                                          July's cause, this job will say.
   cpu-goldens:
     name: cargo test (CPU goldens, real models)
     runs-on: ubuntu-26.04
@@ -151,13 +221,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Cache the downloaded GGUFs across runs. The key encodes the exact model
       # set + quant, so it only re-downloads when that list changes (bump the
-      # `-v1` suffix if you change the models below).
-      - name: Cache golden model GGUFs
+      # suffix if you change the models below; the old key is then never
+      # written again and ages out). Saved from `main` only.
+      - name: Restore golden model GGUFs
         id: models
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/huggingface
-          key: hf-cpu-goldens-gemma3-1b_qwen3-06b-q4km-v2
+          key: hf-cpu-goldens-gemma3-1b_qwen3-06b_qwen35-08b-q4km-v3
       # Skipped on a cache hit: the cache is only saved by a job that passed,
       # so a hit holds both files, and `hf download` would still ask the hub
       # about them — which turns a hub outage into a failed run for nothing.
@@ -178,14 +249,32 @@ jobs:
           fetch pipx install huggingface_hub
           fetch hf download unsloth/gemma-3-1b-it-GGUF gemma-3-1b-it-Q4_K_M.gguf
           fetch hf download unsloth/Qwen3-0.6B-GGUF Qwen3-0.6B-Q4_K_M.gguf
+          fetch hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf
+      - name: Save golden model GGUFs
+        if: steps.models.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-cpu-goldens-gemma3-1b_qwen3-06b_qwen35-08b-q4km-v3
       # Release build: these run real CPU inference (the f32 reference backend),
       # which is far too slow to time out in debug. Single-threaded because the
       # goldens mutate process-global generation env under a shared lock.
-      - run: cargo test --release -p infr-llama --test cpu_backend --locked -- --test-threads=1
+      # `shell: bash` for `pipefail`: a failing `cargo test` must not hide behind `tee`.
+      - name: CPU goldens and the other model tests
+        shell: bash
+        env:
+          INFR_TEST_REQUIRE_MODELS: "1"
+        run: |
+          cargo test --release -p infr-llama --test cpu_backend --locked -- --test-threads=1 --color never 2>&1 | tee goldens.log
+          for t in cpu_golden_qwen3 cpu_golden_gemma3 cpu_golden_qwen35; do
+            grep -E "^test $t \.\.\. ok$" goldens.log
+          done
       # The library's model-gated tests (forced-tool grammar masking, special-token
       # handling in user text) return early without a model, so the model-less
-      # matrix reports them as passed; this job has the models.
+      # matrix reports them as passed; this job has the models, and requires them.
       - run: cargo test --release -p infr-llama --lib --locked
+        env:
+          INFR_TEST_REQUIRE_MODELS: "1"
 
   build:
     name: cargo build --release

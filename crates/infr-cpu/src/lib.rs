@@ -31,12 +31,14 @@ mod moe;
 mod quant;
 mod recycle;
 mod repack;
+mod simd;
 
 use infr_core::backend::{Backend, Bindings, Buffer, BufferUsage, Capabilities, GraphPlan, Plan};
 use infr_core::config::Config;
 use infr_core::error::Result;
 use infr_core::exec::Provision;
 use infr_core::graph::{Activation, AttnMask, Graph, MoeGating, Op};
+use infr_core::math;
 use infr_core::tensor::{DType, TensorId};
 use infr_gguf::dequant::dequant_block;
 use infr_gguf::TensorBytes;
@@ -45,7 +47,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use kernels::{
-    dot, dot_bf16, dot_f16, dot_n, gated_act_fn, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
+    dot, dot_bf16, dot_f16, dot_n, gated_act_row, vec_dot_iq1m, vec_dot_iq1m_batch, vec_dot_iq1s,
     vec_dot_iq1s_batch, vec_dot_iq2s, vec_dot_iq2s_batch, vec_dot_iq2xs, vec_dot_iq2xs_batch,
     vec_dot_iq2xxs, vec_dot_iq2xxs_batch, vec_dot_iq3s, vec_dot_iq3s_batch, vec_dot_iq3xxs,
     vec_dot_iq3xxs_batch, vec_dot_iq4nl_32_batch, vec_dot_iq4xs, vec_dot_iq4xs_batch,
@@ -64,6 +66,10 @@ use repack::{Q4kPack, RepackCacheState};
 
 /// Dequantized-weight cache: `(buffer address, byte-len, dtype) -> Arc<f32>`. See `weight_cache`.
 type WeightCache = HashMap<(u64, DType), Arc<Vec<f32>>>;
+
+/// RoPE frequency tables ([`math::rope_freqs`]) keyed by `(theta.to_bits(), rope_dim)`, the only
+/// inputs a table depends on (a per-pair divisor is applied per angle, not baked in).
+type RopeFreqCache = HashMap<(u32, usize), Arc<[f32]>>;
 
 // ─── Q8_0 integer dot kernels ─────────────────────────────────────────────────
 //
@@ -298,6 +304,11 @@ pub struct CpuBackend {
     /// a different weight, and an address key would then return the previous model's f32 (see
     /// [`CpuBuffer::uid`]).
     weight_cache: Mutex<WeightCache>,
+    /// RoPE frequency tables, built once per distinct `(theta, rope_dim)` for the backend's life:
+    /// each entry costs one correctly rounded `powf` per pair, which a one-row decode op would
+    /// otherwise pay on every call. A model has a table per distinct base (gemma-3: the local
+    /// and the global one), so this stays a handful of entries.
+    rope_freq_cache: Mutex<RopeFreqCache>,
     /// (layer, expert)-granular repack cache for the interleaved-x8 Q4_K GEMM ([`Q4kPack`]):
     /// keyed by the expert weight slice's [`repack::PackKey`] (same identity argument as
     /// `weight_cache`, extended to a slice WITHIN a buffer). ggml pays
@@ -353,11 +364,17 @@ impl CpuBackend {
     }
 
     /// A backend that reads its knobs from `cfg`. This is the constructor the campaign is heading
-    /// for: no environment, no globals, no process-wide ordering hazard — two backends with
-    /// different configurations can coexist in one test.
+    /// for: no environment, and two backends with different configurations can coexist in one
+    /// test, with ONE exception: `kernels.cpu.max_tier` is a process-wide debug switch. Every
+    /// construction applies it ([`infr_core::simd::set_max`]; unset = no ceiling, the widest
+    /// tier the CPU has; a ceiling above the CPU's widest runs the widest), so the backend built
+    /// last decides the SIMD tier of every kernel and math slice for every backend in the
+    /// process. Only speed is at stake: every tier gives the same bits.
     pub fn new_with(cfg: Arc<Config>) -> Self {
+        infr_core::simd::set_max(cfg.kernels.cpu.max_tier);
         Self {
             weight_cache: Mutex::default(),
+            rope_freq_cache: Mutex::default(),
             repack_cache: Mutex::default(),
             pool: std::sync::OnceLock::new(),
             cfg,
@@ -409,6 +426,13 @@ impl CpuBackend {
         self.pool = std::sync::OnceLock::new();
     }
 
+    /// The number of threads a job on this backend's pool runs on (the caller and the workers),
+    /// once an [`Backend::execute`] has built it: the rayon pool size of the thread that built
+    /// it. `None` before. Lets a test confirm the thread count it asked for is the one it got.
+    pub fn pool_threads(&self) -> Option<usize> {
+        self.pool.get().map(pool::SpinPool::threads)
+    }
+
     fn pool(&self) -> &pool::SpinPool {
         self.pool
             .get_or_init(|| pool::SpinPool::new(&self.cfg.kernels.cpu))
@@ -450,7 +474,7 @@ impl CpuBackend {
     /// `out_f % 8` tail rows take the per-row batch kernels. Every kernel here is bit-identical
     /// to the single-token one, so the result does not depend on the route.
     #[cfg(target_arch = "x86_64")]
-    fn linear_packed(
+    fn linear_packed<const CAP: bool>(
         &self,
         dt: DType,
         wbytes: &[u8],
@@ -485,9 +509,9 @@ impl CpuBackend {
                 let o = 8 * groups + i;
                 let row = &wbytes[o * bpr..(o + 1) * bpr];
                 match dt {
-                    DType::Q4K => vec_dot_q4k_batch(row, q8s, in_f, col),
-                    DType::Q5K => vec_dot_q5k_batch(row, q8s, in_f, col),
-                    _ => vec_dot_q6k_batch(row, q8s, in_f, col),
+                    DType::Q4K => vec_dot_q4k_batch::<CAP>(row, q8s, in_f, col),
+                    DType::Q5K => vec_dot_q5k_batch::<CAP>(row, q8s, in_f, col),
+                    _ => vec_dot_q6k_batch::<CAP>(row, q8s, in_f, col),
                 }
             });
             for (i, col) in cols.chunks(m).enumerate() {
@@ -701,6 +725,16 @@ impl CpuBackend {
         self.weight_cache.lock().unwrap().insert(key, w.clone());
         w
     }
+
+    /// [`math::rope_freqs`]`(theta, rope_dim)` from `rope_freq_cache`, built on the first use.
+    fn rope_freqs(&self, theta: f32, rope_dim: usize) -> Arc<[f32]> {
+        self.rope_freq_cache
+            .lock()
+            .unwrap()
+            .entry((theta.to_bits(), rope_dim))
+            .or_insert_with(|| math::rope_freqs(theta, rope_dim).into())
+            .clone()
+    }
 }
 
 /// Reinterpret raw buffer bytes as `f32` values per `dtype` (dequantizing quant/f16/bf16, widening
@@ -741,20 +775,24 @@ const ATTN_QUERY_BLOCK: usize = 16;
 
 /// Whether a prefill `Op::Linear` of `m` tokens over this weight runs on
 /// [`CpuBackend::linear_packed`]: Q4_K, Q5_K or Q6_K with at least one full 8-row group, at
-/// least [`repack::packed_min_tokens`] tokens, on a CPU with AVX-512BW and AVX-512 VNNI.
+/// least [`repack::packed_min_tokens`] tokens, at the AVX-512 VNNI tier.
 #[cfg(target_arch = "x86_64")]
-fn linear_packed_ok(dt: DType, in_f: usize, out_f: usize, m: usize) -> bool {
+fn linear_packed_ok<const CAP: bool>(dt: DType, in_f: usize, out_f: usize, m: usize) -> bool {
     matches!(dt, DType::Q4K | DType::Q5K | DType::Q6K)
         && out_f >= 8
         && in_f.is_multiple_of(256)
         && m >= repack::packed_min_tokens(dt)
-        && is_x86_feature_detected!("avx512bw")
-        && is_x86_feature_detected!("avx512vnni")
+        && simd::vnni::<CAP>()
 }
 
 /// The packed GEMM is x86_64-only, so off it no Linear takes that route.
 #[cfg(not(target_arch = "x86_64"))]
-const fn linear_packed_ok(_dt: DType, _in_f: usize, _out_f: usize, _m: usize) -> bool {
+const fn linear_packed_ok<const CAP: bool>(
+    _dt: DType,
+    _in_f: usize,
+    _out_f: usize,
+    _m: usize,
+) -> bool {
     false
 }
 
@@ -784,13 +822,14 @@ fn borrow_two_mut<T>(v: &mut [T], a: usize, b: usize) -> (&T, &mut T) {
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 /// Whether this CPU takes the fused Q4_K expert path whose packs fill the repack cache
-/// (`kernels.cpu.repack_mb`): the VNNI GEMM, which needs AVX-512 BW and VNNI. A model with a fused
-/// Q4_K gate_up bank can then hold up to that budget in packs on top of its weights, which the
-/// seam prices when it sizes a host weight arena.
+/// (`kernels.cpu.repack_mb`): the VNNI GEMM, which needs the AVX-512 VNNI tier (under the
+/// `kernels.cpu.max_tier` ceiling the backends built so far set). A model with a fused Q4_K
+/// gate_up bank can then hold up to that budget in packs on top of its weights, which the seam
+/// prices when it sizes a host weight arena.
 pub fn q4k_expert_repack_available() -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni")
+        simd::vnni::<true>()
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
@@ -902,9 +941,8 @@ pub(crate) fn hyper_sinkhorn(m: &mut [f32], hc: usize, eps: f32, n_iter: u32) {
         let col = &mut m[src * hc..][..hc];
         let mx = col.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut sum = 0f32;
-        for v in col.iter_mut() {
-            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-            *v = (*v - mx).exp();
+        math::exp_sub_slice(col, mx);
+        for v in col.iter() {
             sum += *v;
         }
         for v in col.iter_mut() {
@@ -958,7 +996,10 @@ pub(crate) fn sample_token(logits: &[f32], uu: f32, top_k: usize, temp: f32, top
     // NaN is present, and `select_nth_unstable_by` / `sort_unstable_by` panic on one. On NaN-free
     // logits the two agree on every pair but `-0.0` / `+0.0`, which `total_cmp` orders. A NaN
     // logit no longer panics but ranks first, so the probabilities come out NaN as before.
-    let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]);
+    // Ties go to the lower index: both sorts are unstable, so without it two equal logits could
+    // come back in either order, and which one a given `u` picks would depend on the standard
+    // library's sort rather than on the input.
+    let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then_with(|| a.cmp(b));
     let mut idx: Vec<usize> = (0..logits.len()).collect();
     if k < logits.len() {
         idx.select_nth_unstable_by(k - 1, cmp);
@@ -966,11 +1007,8 @@ pub(crate) fn sample_token(logits: &[f32], uu: f32, top_k: usize, temp: f32, top
     }
     idx.sort_unstable_by(cmp);
     let maxl = logits[idx[0]];
-    let mut probs: Vec<f32> = idx
-        .iter()
-        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-        .map(|&i| ((logits[i] - maxl) / temp).exp())
-        .collect();
+    let mut probs: Vec<f32> = idx.iter().map(|&i| (logits[i] - maxl) / temp).collect();
+    math::exp_slice(&mut probs);
     let sum: f32 = probs.iter().sum();
     for p in probs.iter_mut() {
         *p /= sum;
@@ -1089,7 +1127,46 @@ impl Backend for CpuBackend {
         Ok(GraphPlan::boxed(graph))
     }
 
+    /// Runs the graph through `CpuBackend::execute_with`'s uncapped compilation unless a
+    /// `kernels.cpu.max_tier` ceiling is in force (`crate::simd`): the one place the ceiling is
+    /// consulted for a whole graph.
     fn execute(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
+        if simd::capped() {
+            self.execute_with::<true>(plan, bindings)
+        } else {
+            self.execute_with::<false>(plan, bindings)
+        }
+    }
+
+    fn sync(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// The arena the first paged buffer among `weights` reads from: a model's paged weights all
+    /// share one ([`paged::PagedWeights::streams`] says whether it streams).
+    fn host_streams(&self, weights: &mut dyn Iterator<Item = &dyn Buffer>) -> bool {
+        for b in weights {
+            let Some(cb) = b.as_any().downcast_ref::<CpuBuffer>() else {
+                continue;
+            };
+            match &cb.store {
+                CpuStore::Paged { store, .. } | CpuStore::PagedExperts { store, .. } => {
+                    return store.streams();
+                }
+                CpuStore::Owned(_) | CpuStore::Mapped(_) => {}
+            }
+        }
+        false
+    }
+}
+
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+impl CpuBackend {
+    /// The graph interpreter, compiled once per `CAP` (`crate::simd`): every SIMD dispatch in it
+    /// takes `::<CAP>`, so the uncapped compilation decides the kernel tier from the CPU's
+    /// features alone (a constant on a build that has them) and the capped one asks the
+    /// `kernels.cpu.max_tier` ceiling at every dispatch, on every thread.
+    fn execute_with<const CAP: bool>(&self, plan: &dyn Plan, bindings: &Bindings) -> Result<()> {
         let g = &plan
             .as_any()
             .downcast_ref::<GraphPlan>()
@@ -1311,11 +1388,12 @@ impl Backend for CpuBackend {
                     self.pool().for_chunks_mut(&mut out, dim, 1, &|r, o| {
                         let row = &xs[r * dim..r * dim + dim];
                         let mx = row.iter().fold(f32::NEG_INFINITY, |m, &v| m.max(v * scale));
-                        let mut denom = 0f32;
                         for (dst_v, &v) in o.iter_mut().zip(row) {
-                            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                            let e = (v * scale - mx).exp();
-                            *dst_v = e;
+                            *dst_v = v * scale - mx;
+                        }
+                        math::exp_slice(o);
+                        let mut denom = 0f32;
+                        for &e in o.iter() {
                             denom += e;
                         }
                         let inv = 1.0 / denom;
@@ -1385,18 +1463,18 @@ impl Backend for CpuBackend {
                     let zs = &vals[gate.0 as usize];
                     let ws = weight(w);
                     let mut out = rc.zeroed(rows * nh * hd);
+                    let mut silu = vec![0f32; hd];
                     for r in 0..rows {
                         for h in 0..nh {
                             let b = (r * nh + h) * hd;
                             let ss: f32 =
                                 (0..hd).map(|i| xs[b + i] * xs[b + i]).sum::<f32>() / hd as f32;
                             let s = 1.0 / (ss + eps).sqrt();
+                            silu.copy_from_slice(&zs[b..b + hd]);
+                            math::silu_slice(&mut silu);
                             for i in 0..hd {
                                 let normed = xs[b + i] * s * ws[i];
-                                let zv = zs[b + i];
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                let silu = zv / (1.0 + (-zv).exp());
-                                out[b + i] = normed * silu;
+                                out[b + i] = normed * silu[i];
                             }
                         }
                     }
@@ -1530,11 +1608,11 @@ impl Backend for CpuBackend {
                         self.pool().for_chunks_mut(&mut out, 1, grain, &|o, dst_o| {
                             let row = &wbytes[o * bpr..o * bpr + bpr];
                             dst_o[0] = match dt {
-                                DType::Q4K => vec_dot_q4k(row, q8.as_ref().unwrap(), in_f),
-                                DType::Q6K => vec_dot_q6k(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q4K => vec_dot_q4k::<CAP>(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q6K => vec_dot_q6k::<CAP>(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q8_0 => {
                                     if q8_0_blk32 {
-                                        vec_dot_q8_0_32_batch(
+                                        vec_dot_q8_0_32_batch::<CAP>(
                                             row,
                                             q8_32.as_ref().unwrap(),
                                             in_f,
@@ -1542,12 +1620,14 @@ impl Backend for CpuBackend {
                                         );
                                         return;
                                     }
-                                    vec_dot_q8_0(row, q8.as_ref().unwrap(), in_f)
+                                    vec_dot_q8_0::<CAP>(row, q8.as_ref().unwrap(), in_f)
                                 }
-                                DType::Q5K => vec_dot_q5k(row, q8.as_ref().unwrap(), in_f),
-                                DType::Q2K => vec_dot_q2k(row, q8.as_ref().unwrap(), in_f),
-                                DType::Q3K => vec_dot_q3k(row, q8.as_ref().unwrap(), in_f),
-                                DType::Iq4Xs => vec_dot_iq4xs(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q5K => vec_dot_q5k::<CAP>(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q2K => vec_dot_q2k::<CAP>(row, q8.as_ref().unwrap(), in_f),
+                                DType::Q3K => vec_dot_q3k::<CAP>(row, q8.as_ref().unwrap(), in_f),
+                                DType::Iq4Xs => {
+                                    vec_dot_iq4xs::<CAP>(row, q8.as_ref().unwrap(), in_f)
+                                }
                                 DType::Iq2S => vec_dot_iq2s(row, q8.as_ref().unwrap(), in_f),
                                 DType::Iq2Xs => vec_dot_iq2xs(row, q8.as_ref().unwrap(), in_f),
                                 DType::Iq2Xxs => vec_dot_iq2xxs(row, q8.as_ref().unwrap(), in_f),
@@ -1558,7 +1638,7 @@ impl Backend for CpuBackend {
                                 DType::Tq2_0 => vec_dot_tq2_0(row, q8.as_ref().unwrap(), in_f),
                                 DType::Tq1_0 => vec_dot_tq1_0(row, q8.as_ref().unwrap(), in_f),
                                 DType::Q4_0 => {
-                                    vec_dot_q4_0_32_batch(
+                                    vec_dot_q4_0_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1567,7 +1647,7 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Q4_1 => {
-                                    vec_dot_q4_1_32_batch(
+                                    vec_dot_q4_1_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1576,7 +1656,7 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Q5_0 => {
-                                    vec_dot_q5_0_32_batch(
+                                    vec_dot_q5_0_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1585,7 +1665,7 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Q5_1 => {
-                                    vec_dot_q5_1_32_batch(
+                                    vec_dot_q5_1_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1594,7 +1674,7 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Iq4Nl => {
-                                    vec_dot_iq4nl_32_batch(
+                                    vec_dot_iq4nl_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1603,7 +1683,7 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Mxfp4 => {
-                                    vec_dot_mxfp4_32_batch(
+                                    vec_dot_mxfp4_32_batch::<CAP>(
                                         row,
                                         q8_32.as_ref().unwrap(),
                                         in_f,
@@ -1612,11 +1692,21 @@ impl Backend for CpuBackend {
                                     return;
                                 }
                                 DType::Q2_0 => {
-                                    vec_dot_q2_0_batch(row, q8_32.as_ref().unwrap(), in_f, dst_o);
+                                    vec_dot_q2_0_batch::<CAP>(
+                                        row,
+                                        q8_32.as_ref().unwrap(),
+                                        in_f,
+                                        dst_o,
+                                    );
                                     return;
                                 }
                                 DType::Nvfp4 => {
-                                    vec_dot_nvfp4_batch(row, q8_32.as_ref().unwrap(), in_f, dst_o);
+                                    vec_dot_nvfp4_batch::<CAP>(
+                                        row,
+                                        q8_32.as_ref().unwrap(),
+                                        in_f,
+                                        dst_o,
+                                    );
                                     return;
                                 }
                                 DType::F32 => dot(&f32_row(row), xrow),
@@ -1670,9 +1760,9 @@ impl Backend for CpuBackend {
                         };
                         // AVX-512 VNNI: Q4_K, Q5_K and Q6_K run the packed 8-row GEMM straight
                         // into the row-major output, with no o-major temp to transpose after.
-                        if linear_packed_ok(dt, in_f, out_f, m) {
+                        if linear_packed_ok::<CAP>(dt, in_f, out_f, m) {
                             #[cfg(target_arch = "x86_64")]
-                            self.linear_packed(dt, wbytes, in_f, out_f, &q8s, &mut out);
+                            self.linear_packed::<CAP>(dt, wbytes, in_f, out_f, &q8s, &mut out);
                             #[cfg(not(target_arch = "x86_64"))]
                             unreachable!("linear_packed_ok is false off x86_64");
                         } else {
@@ -1696,7 +1786,7 @@ impl Backend for CpuBackend {
                                     let (r4, rest) = rest.split_at_mut(m);
                                     let (r5, rest) = rest.split_at_mut(m);
                                     let (r6, r7) = rest.split_at_mut(m);
-                                    vec_dot_q4k_batch8(
+                                    vec_dot_q4k_batch8::<CAP>(
                                         [
                                             &wbytes[o * bpr..o * bpr + bpr],
                                             &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr],
@@ -1721,7 +1811,7 @@ impl Backend for CpuBackend {
                                         let (chunk_a, chunk_b) = dc.split_at_mut(m);
                                         let row_a = &wbytes[o * bpr..o * bpr + bpr];
                                         let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
-                                        vec_dot_q4k_batch2(
+                                        vec_dot_q4k_batch2::<CAP>(
                                             row_a, row_b, &q8s, in_f, chunk_a, chunk_b,
                                         );
                                     });
@@ -1729,7 +1819,7 @@ impl Backend for CpuBackend {
                                 if rem % 2 != 0 {
                                     let o = out_f - 1;
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
+                                    vec_dot_q4k_batch::<CAP>(row, &q8s, in_f, odd_t);
                                 }
                             } else if dt == DType::Q4K && out_f >= 2 {
                                 // Small out_f < 8: fall back to 2-row tile.
@@ -1740,12 +1830,14 @@ impl Backend for CpuBackend {
                                     let (chunk_a, chunk_b) = dc.split_at_mut(m);
                                     let row_a = &wbytes[o * bpr..o * bpr + bpr];
                                     let row_b = &wbytes[(o + 1) * bpr..(o + 1) * bpr + bpr];
-                                    vec_dot_q4k_batch2(row_a, row_b, &q8s, in_f, chunk_a, chunk_b);
+                                    vec_dot_q4k_batch2::<CAP>(
+                                        row_a, row_b, &q8s, in_f, chunk_a, chunk_b,
+                                    );
                                 });
                                 if out_f % 2 != 0 {
                                     let o = out_f - 1;
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q4k_batch(row, &q8s, in_f, odd_t);
+                                    vec_dot_q4k_batch::<CAP>(row, &q8s, in_f, odd_t);
                                 }
                             } else if q8_0_blk32 {
                                 // Q8_0 weight with a sub-256 `in_f` (multiple of 32 but not 256): the
@@ -1757,7 +1849,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q8_0_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q8_0_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Q5_0 && in_f.is_multiple_of(32) {
                                 // Dense-layer Q5_0 (DG stores 16 of its 30 dense ffn_down weights as
@@ -1771,7 +1863,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q5_0_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q5_0_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Q5_1 && in_f.is_multiple_of(32) {
                                 // Q5_1 (affine sibling of Q5_0: `y = d·q5 + m`, 5-bit code + f16 `m`
@@ -1783,7 +1875,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q5_1_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q5_1_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Q4_0 && in_f.is_multiple_of(32) {
                                 // Q4_0 (same 32-block int8-activation regime as Q5_0, minus the 5th
@@ -1794,7 +1886,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q4_0_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q4_0_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Q4_1 && in_f.is_multiple_of(32) {
                                 // Q4_1 (affine sibling of Q4_0: `y = d·q4 + m`, block stride 20):
@@ -1805,7 +1897,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q4_1_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q4_1_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Iq4Nl && in_f.is_multiple_of(32) {
                                 // IQ4_NL (flat 32-block codebook cousin of IQ4_XS: ONE f16 `d` per
@@ -1817,7 +1909,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_iq4nl_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_iq4nl_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Mxfp4 && in_f.is_multiple_of(32) {
                                 // MXFP4 (flat 32-block codebook, structurally identical to IQ4_NL but
@@ -1829,7 +1921,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_mxfp4_32_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_mxfp4_32_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Q2_0 && in_f.is_multiple_of(64) {
                                 // Q2_0 ("Bonsai ternary", 2-bit linear-offset quant on a 64-weight
@@ -1842,7 +1934,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_q2_0_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_q2_0_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else if dt == DType::Nvfp4 && in_f.is_multiple_of(64) {
                                 // NVFP4 (E2M1 codebook + four per-16-element UE4M3 sub-block scales on a
@@ -1856,7 +1948,7 @@ impl Backend for CpuBackend {
                                 });
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
-                                    vec_dot_nvfp4_batch(row, &q8s32, in_f, chunk);
+                                    vec_dot_nvfp4_batch::<CAP>(row, &q8s32, in_f, chunk);
                                 });
                             } else {
                                 // Grain 8: at lm_head shape this loop is 262k one-row chunks; per-row
@@ -1864,13 +1956,27 @@ impl Backend for CpuBackend {
                                 self.pool().for_chunks_mut(&mut out_t, m, 8, &|o, chunk| {
                                     let row = &wbytes[o * bpr..o * bpr + bpr];
                                     match dt {
-                                        DType::Q4K => vec_dot_q4k_batch(row, &q8s, in_f, chunk),
-                                        DType::Q6K => vec_dot_q6k_batch(row, &q8s, in_f, chunk),
-                                        DType::Q8_0 => vec_dot_q8_0_batch(row, &q8s, in_f, chunk),
-                                        DType::Q5K => vec_dot_q5k_batch(row, &q8s, in_f, chunk),
-                                        DType::Q2K => vec_dot_q2k_batch(row, &q8s, in_f, chunk),
-                                        DType::Q3K => vec_dot_q3k_batch(row, &q8s, in_f, chunk),
-                                        DType::Iq4Xs => vec_dot_iq4xs_batch(row, &q8s, in_f, chunk),
+                                        DType::Q4K => {
+                                            vec_dot_q4k_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Q6K => {
+                                            vec_dot_q6k_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Q8_0 => {
+                                            vec_dot_q8_0_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Q5K => {
+                                            vec_dot_q5k_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Q2K => {
+                                            vec_dot_q2k_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Q3K => {
+                                            vec_dot_q3k_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
+                                        DType::Iq4Xs => {
+                                            vec_dot_iq4xs_batch::<CAP>(row, &q8s, in_f, chunk)
+                                        }
                                         DType::Iq2S => vec_dot_iq2s_batch(row, &q8s, in_f, chunk),
                                         DType::Iq2Xs => vec_dot_iq2xs_batch(row, &q8s, in_f, chunk),
                                         DType::Iq2Xxs => {
@@ -1966,9 +2072,11 @@ impl Backend for CpuBackend {
                     // which is the inverse because nothing scales the magnitude here. See
                     // `Op::Rope::backward`.
                     let sin_sign = if backward { -1.0 } else { 1.0 };
-                    // Parallel over rows. A pair's angle depends on the row's position and the
+                    // Parallel over rows. A pair's frequency depends only on the op's shape, so
+                    // it is computed once per op; its angle depends on the row's position and the
                     // pair index, never the head, so each row computes its (sin, cos) table once
                     // and every head reuses it — the same values the per-head form computed.
+                    let freqs = self.rope_freqs(theta, rd);
                     self.pool().for_chunks_mut(
                         &mut out[..rows * nh * hd],
                         nh * hd,
@@ -1977,13 +2085,9 @@ impl Backend for CpuBackend {
                             let p0 = pos[r];
                             let sc: Vec<(f32, f32)> = (0..hf)
                                 .map(|p| {
-                                    // libm-ok(S2): platform `powf`, moves to `infr_core::math` in S2
-                                    let mut ang = p0 * theta.powf(-2.0 * p as f32 / rd as f32);
-                                    if let Some(ff) = &ff {
-                                        ang /= ff[p];
-                                    }
-                                    // libm-ok(S2) x2: platform `cos`, `sin`, moves to `infr_core::math` in S2
-                                    (ang.sin() * sin_sign, ang.cos())
+                                    let (s, c) =
+                                        math::rope_sin_cos(p0, freqs[p], ff.map(|ff| ff[p]));
+                                    (s * sin_sign, c)
                                 })
                                 .collect();
                             let xr = &xs[r * nh * hd..(r + 1) * nh * hd];
@@ -2049,21 +2153,19 @@ impl Backend for CpuBackend {
                     let ff = freq_factors.map(|f| &vals[f.0 as usize]);
                     let mut out = rc.for_overwrite(rows * nh * hd);
                     let hf = rd / 2;
-                    // Parallel over the m rows. Within a row the RoPE angles depend only on the
-                    // position (not the head), so precompute (cos,sin) per rope index ONCE per row and
-                    // reuse across all heads — the powf/sin/cos were the bulk and were redone nh×.
+                    // Parallel over the m rows. The frequencies depend only on the op's shape
+                    // (computed once per op); within a row the RoPE angles depend only on the
+                    // position (not the head), so precompute (cos,sin) per rope index ONCE per row
+                    // and reuse across all heads — the sin/cos were the bulk and were redone nh×.
+                    let freqs = self.rope_freqs(theta, rd);
                     self.pool()
                         .for_chunks_mut(&mut out, nh * hd, 1, &|r, orow| {
                             let p0 = pos[r];
                             let cs: Vec<(f32, f32)> = (0..hf)
                                 .map(|p| {
-                                    // libm-ok(S2): platform `powf`, moves to `infr_core::math` in S2
-                                    let mut ang = p0 * theta.powf(-2.0 * p as f32 / rd as f32);
-                                    if let Some(ff) = &ff {
-                                        ang /= ff[p];
-                                    }
-                                    // libm-ok(S2) x2: platform `cos`, `sin`, moves to `infr_core::math` in S2
-                                    (ang.cos(), ang.sin())
+                                    let (s, c) =
+                                        math::rope_sin_cos(p0, freqs[p], ff.map(|ff| ff[p]));
+                                    (c, s)
                                 })
                                 .collect();
                             let xr = &xs[r * nh * hd..r * nh * hd + nh * hd];
@@ -2407,15 +2509,13 @@ impl Backend for CpuBackend {
                         // Each score becomes its exponential in place: the denominator sums
                         // them in key order and the weights below divide the same values, so
                         // every exp is taken once.
+                        math::exp_sub_slice(&mut sc, mx);
                         let mut l = 0f32;
-                        for s in sc.iter_mut() {
-                            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                            *s = (*s - mx).exp();
-                            l += *s;
+                        for &s in sc.iter() {
+                            l += s;
                         }
                         if let Some(sv) = sink {
-                            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                            l += (sv - mx).exp();
+                            l += math::exp(sv - mx);
                         }
                         let (e_raw, e_comp) = sc.split_at(n_keys);
                         for (&e, jr) in e_raw.iter().zip(ring_rows(lo)) {
@@ -2512,7 +2612,7 @@ impl Backend for CpuBackend {
                         } else {
                             r * up_stride + up_off
                         };
-                        for i in 0..nff {
+                        let gate_at = |i: usize| {
                             let gi = if gate_block_width > 0 {
                                 let headw = gate_block_width / 2;
                                 let head = i / headw;
@@ -2521,8 +2621,9 @@ impl Backend for CpuBackend {
                             } else {
                                 gb + i
                             };
-                            orow[i] = gated_act_fn(act, swiglu_clamp, gs[gi], us[ub + i]);
-                        }
+                            gs[gi]
+                        };
+                        gated_act_row(act, swiglu_clamp, &mut orow[..nff], gate_at, |i| us[ub + i]);
                     });
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
@@ -2546,10 +2647,13 @@ impl Backend for CpuBackend {
                     let mut out = rc.for_overwrite(rows * nff);
                     self.pool().for_chunks_mut(&mut out, nff, 1, &|r, orow| {
                         let gb = r * 2 * nff;
-                        for i in 0..nff {
-                            orow[i] =
-                                gated_act_fn(act, swiglu_clamp, gus[gb + i], gus[gb + nff + i]);
-                        }
+                        gated_act_row(
+                            act,
+                            swiglu_clamp,
+                            &mut orow[..nff],
+                            |i| gus[gb + i],
+                            |i| gus[gb + nff + i],
+                        );
                     });
                     rc.set(&mut vals, dst.0 as usize, out);
                 }
@@ -2641,8 +2745,7 @@ impl Backend for CpuBackend {
                     let gv = &vals[gate.0 as usize]; // [rows] raw pre-sigmoid logits
                     let mut out = rc.zeroed(rows * n);
                     self.pool().for_chunks_mut(&mut out, n, 1, &|r, orow| {
-                        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                        let g = 1.0 / (1.0 + (-gv[r]).exp());
+                        let g = math::sigmoid(gv[r]);
                         for (c, o) in orow.iter_mut().enumerate() {
                             *o = mv[r * n + c] + g * sv[r * n + c];
                         }
@@ -2664,8 +2767,7 @@ impl Backend for CpuBackend {
                     let gv = &vals[gate.0 as usize]; // [rows, n_head] raw logits
                     let mut out = rc.zeroed(rows as usize * nh * hd);
                     self.pool().for_chunks_mut(&mut out, hd, 16, &|rh, orow| {
-                        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                        let g = 1.0 / (1.0 + (-gv[rh]).exp());
+                        let g = math::sigmoid(gv[rh]);
                         for (i, o) in orow.iter_mut().enumerate() {
                             *o = xs[rh * hd + i] * g;
                         }
@@ -2684,8 +2786,11 @@ impl Backend for CpuBackend {
                     self.pool().for_chunks_mut(&mut out, 4096, 4, &|c, oc| {
                         let base = c * 4096;
                         for (i, o) in oc.iter_mut().enumerate() {
-                            // libm-ok(S2): platform `tanh`, moves to `infr_core::math` in S2
-                            *o = cap * (xs[base + i] / cap).tanh();
+                            *o = xs[base + i] / cap;
+                        }
+                        math::tanh_slice(oc);
+                        for o in oc.iter_mut() {
+                            *o *= cap;
                         }
                     });
                     rc.set(&mut vals, dst.0 as usize, out);
@@ -2870,8 +2975,9 @@ impl Backend for CpuBackend {
                             bi = i as u32;
                         }
                     }
-                    // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                    let z: f32 = xs.iter().map(|&v| (v - best).exp()).sum();
+                    let mut e = xs.to_vec();
+                    math::exp_sub_slice(&mut e, best);
+                    let z: f32 = e.iter().sum();
                     rc.set(&mut vals, dst_id.0 as usize, vec![f32::from_bits(bi)]);
                     rc.set(&mut vals, dst_prob.0 as usize, vec![1.0 / z]);
                 }
@@ -3070,7 +3176,7 @@ impl Backend for CpuBackend {
                         pool.for_chunks_mut(&mut lt, 8 * rows, 1, &|c, dst| {
                             let o0 = c * 8;
                             let o1 = (o0 + 8).min(n_expert);
-                            expert_gemm_range(
+                            expert_gemm_range::<CAP>(
                                 &rbytes, rdt, ne, n_expert, &racts, None, o0, o1, dst,
                             );
                         });
@@ -3114,9 +3220,8 @@ impl Backend for CpuBackend {
                         let probs: Vec<f32> = match gating {
                             MoeGating::Softmax => {
                                 let maxl = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                                let mut p: Vec<f32> =
-                                    // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                    logits.iter().map(|&v| (v - maxl).exp()).collect();
+                                let mut p = logits.to_vec();
+                                math::exp_sub_slice(&mut p, maxl);
                                 let psum: f32 = p.iter().sum();
                                 for v in p.iter_mut() {
                                     *v /= psum;
@@ -3124,8 +3229,9 @@ impl Backend for CpuBackend {
                                 p
                             }
                             MoeGating::Sigmoid => {
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                logits.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect()
+                                let mut p = logits.to_vec();
+                                math::sigmoid_slice(&mut p);
+                                p
                             }
                             MoeGating::SqrtSoftplus => {
                                 // sqrt(softplus(x)) = sqrt(ln(1 + exp(x))). Monotone like sigmoid;
@@ -3136,8 +3242,7 @@ impl Backend for CpuBackend {
                                         let sp = if v > 20.0 {
                                             v
                                         } else {
-                                            // libm-ok(S2) x2: platform `exp`, `ln`, moves to `infr_core::math` in S2
-                                            (1.0_f32 + v.exp()).ln()
+                                            math::ln(1.0_f32 + math::exp(v))
                                         };
                                         sp.sqrt()
                                     })
@@ -3494,7 +3599,7 @@ impl Backend for CpuBackend {
                                     (o1 - o0) * count,
                                 )
                             };
-                            expert_gemm_range(
+                            expert_gemm_range::<CAP>(
                                 gb.expert(e),
                                 gdt,
                                 ne,
@@ -3520,7 +3625,7 @@ impl Backend for CpuBackend {
                                         (o1 - o0) * count,
                                     )
                                 };
-                                expert_gemm_range(
+                                expert_gemm_range::<CAP>(
                                     ub.expert(e),
                                     udt,
                                     ne,
@@ -3552,25 +3657,23 @@ impl Backend for CpuBackend {
                         let mut row = vec![0f32; nffx];
                         if fused_gate_up {
                             let gu = &gu_all[gu_off[b]..gu_off[b] + 2 * nffx * count];
-                            for (f, v) in row.iter_mut().enumerate() {
-                                *v = gated_act_fn(
-                                    act,
-                                    swiglu_clamp,
-                                    wp * gu[f * count + i],
-                                    wp * gu[(nffx + f) * count + i],
-                                );
-                            }
+                            gated_act_row(
+                                act,
+                                swiglu_clamp,
+                                &mut row,
+                                |f| wp * gu[f * count + i],
+                                |f| wp * gu[(nffx + f) * count + i],
+                            );
                         } else {
                             let gt = &gu_all[gu_off[b]..gu_off[b] + nffx * count];
                             let ut = &up_all[gu_off[b]..gu_off[b] + nffx * count];
-                            for (f, v) in row.iter_mut().enumerate() {
-                                *v = gated_act_fn(
-                                    act,
-                                    swiglu_clamp,
-                                    wp * gt[f * count + i],
-                                    wp * ut[f * count + i],
-                                );
-                            }
+                            gated_act_row(
+                                act,
+                                swiglu_clamp,
+                                &mut row,
+                                |f| wp * gt[f * count + i],
+                                |f| wp * ut[f * count + i],
+                            );
                         }
                         row
                     };
@@ -3623,7 +3726,7 @@ impl Backend for CpuBackend {
                             let (e, p0, count) = buckets[b];
                             let s_e = dscale.as_ref().map(|ds| ds[e]);
                             moe::with_block_scratch((o1 - o0) * count, |blk| {
-                                expert_gemm_range(
+                                expert_gemm_range::<CAP>(
                                     db.expert(e),
                                     ddt,
                                     nffx,
@@ -3889,6 +3992,7 @@ impl Backend for CpuBackend {
                         AttnMask::Canvas { lo } => (0usize, Some(lo)),
                     };
                     let hf = qkr / 2; // rope pair count
+                    let mla_freqs = self.rope_freqs(theta, qkr);
                     let ff = freq_factors.map(|f| vals[f.0 as usize].clone());
                     // deepseek32's top-k score mask `[rows, kv_len]` (0 on the selected keys,
                     // -inf elsewhere) — indexed by KEY POSITION, not by the ring row. `None` on
@@ -3932,13 +4036,11 @@ impl Backend for CpuBackend {
                             // Rope q_pe into q_full[kv_lora..]
                             for p in 0..hf {
                                 let (i0, i1) = (2 * p, 2 * p + 1);
-                                // libm-ok(S2): platform `powf`, moves to `infr_core::math` in S2
-                                let mut ang = abs as f32 * theta.powf(-2.0 * p as f32 / qkr as f32);
-                                if let Some(ff) = &ff {
-                                    ang /= ff[p];
-                                }
-                                // libm-ok(S2) x2: platform `cos`, `sin`, moves to `infr_core::math` in S2
-                                let (s, c) = (ang.sin(), ang.cos());
+                                let (s, c) = math::rope_sin_cos(
+                                    abs as f32,
+                                    mla_freqs[p],
+                                    ff.as_ref().map(|ff| ff[p]),
+                                );
                                 let a = q_pe_raw[i0];
                                 let b = q_pe_raw[i1];
                                 q_full[kv_lora + i0] = a * c - b * s;
@@ -3959,17 +4061,18 @@ impl Backend for CpuBackend {
                                 }
                                 mx = mx.max(*scj);
                             }
+                            // Each score becomes its exponential once; the sum and the
+                            // weights read the same values.
+                            math::exp_sub_slice(&mut sc, mx);
                             let mut l = 0f32;
-                            for &s in &sc {
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                l += (s - mx).exp();
+                            for &e in &sc {
+                                l += e;
                             }
                             // Accumulate: V is first kv_lora columns of K.
-                            for (jj, &s) in sc.iter().enumerate() {
+                            for (jj, &e) in sc.iter().enumerate() {
                                 let j = lo + jj;
                                 let jr = if cap_rows > 0 { j % cap_rows } else { j };
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                let p = (s - mx).exp() / l;
+                                let p = e / l;
                                 let krow = jr * key_len;
                                 // attn_out[jj] += p * V[jj] where V[jj] = ks[krow..krow+kv_lora]
                                 // Apply wv_b[h] to the accumulated output directly:
@@ -4175,8 +4278,7 @@ impl Backend for CpuBackend {
                             let z = mx[t * mix_dim + h] * sc[0] + bs[h];
                             // sigmoid, then + eps — the FOURTH eps site (`ggml_scale_bias(pre,
                             // 1.0f, eps)`), distinct from the three inside Sinkhorn.
-                            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                            *o = 1.0 / (1.0 + (-z).exp()) + eps;
+                            *o = math::sigmoid(z) + eps;
                         }
                     }
                     // Every output is built before any is stored: `mx`/`sc`/`bs` borrow `vals`.
@@ -4186,8 +4288,7 @@ impl Backend for CpuBackend {
                             for (h, o) in p.iter_mut().enumerate() {
                                 let z = mx[t * mix_dim + hc + h] * sc[1] + bs[hc + h];
                                 // sigmoid, then × 2 — NOT + eps. Adjacent chunk, different tail.
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                *o = 2.0 / (1.0 + (-z).exp());
+                                *o = 2.0 / (1.0 + math::exp(-z));
                             }
                         }
                         let mut comb_out = vec![0f32; rows * hc * hc];
@@ -4312,15 +4413,15 @@ impl Backend for CpuBackend {
                             }
                         }
                         let mut den = vec![0f32; ne];
+                        let mut es = vec![0f32; ne];
                         for (vr, sr) in vb.chunks_exact(ne).zip(sb.chunks_exact(ne)) {
-                            for (((o, d), (&m, &s)), &v) in o
-                                .iter_mut()
-                                .zip(den.iter_mut())
-                                .zip(m.iter().zip(sr))
-                                .zip(vr)
+                            for ((e, &m), &s) in es.iter_mut().zip(m.iter()).zip(sr) {
+                                *e = s - m;
+                            }
+                            math::exp_slice(&mut es);
+                            for (((o, d), &e), &v) in
+                                o.iter_mut().zip(den.iter_mut()).zip(es.iter()).zip(vr)
                             {
-                                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                                let e = (s - m).exp();
                                 *d += e;
                                 *o = v.mul_add(e, *o);
                             }
@@ -4374,27 +4475,6 @@ impl Backend for CpuBackend {
         }
         Ok(())
     }
-
-    fn sync(&self) -> Result<()> {
-        Ok(())
-    }
-
-    /// The arena the first paged buffer among `weights` reads from: a model's paged weights all
-    /// share one ([`paged::PagedWeights::streams`] says whether it streams).
-    fn host_streams(&self, weights: &mut dyn Iterator<Item = &dyn Buffer>) -> bool {
-        for b in weights {
-            let Some(cb) = b.as_any().downcast_ref::<CpuBuffer>() else {
-                continue;
-            };
-            match &cb.store {
-                CpuStore::Paged { store, .. } | CpuStore::PagedExperts { store, .. } => {
-                    return store.streams();
-                }
-                CpuStore::Owned(_) | CpuStore::Mapped(_) => {}
-            }
-        }
-        false
-    }
 }
 
 /// [`infr_core::graph::WeightReuse::Done`]: make every paged weight some op of `g` read the next
@@ -4447,12 +4527,7 @@ fn conv1d_silu(
         rr,
         cc,
         kk,
-        &|_, orow| {
-            for o in orow {
-                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                *o /= 1.0 + (-*o).exp();
-            }
-        },
+        &|_, orow| math::silu_slice(orow),
     );
 }
 
@@ -4616,7 +4691,11 @@ fn causal_conv<R: ConvRows>(
 /// one task. Returns `out` [rows, nv*vd]; mutates `st` [nv, kd, vd] in place. Bit-identical to the
 /// old serial nest: per head the float ops (l2 norm, normalize, beta, softplus/decay, S*=decay,
 /// kv=kᵀS, delta, S+=k⊗delta, out=qᵀS) run in the SAME order — heads never interacted, so
-/// cross-head order never mattered, and `pool.collect` is order-preserving pure scheduling.
+/// cross-head order never mattered, and `pool.for_chunks_mut` is pure scheduling.
+///
+/// Each task scans its head's state slice where it lies. (It used to scan a copy and a serial
+/// gather copied every head back: two copies of the whole state per call, which dominated a
+/// one-row decode call.)
 #[allow(clippy::too_many_arguments)]
 fn deltanet_scan(
     pool: &pool::SpinPool,
@@ -4637,14 +4716,16 @@ fn deltanet_scan(
 ) -> Vec<f32> {
     let qscale = 1.0 / (kd as f32).sqrt();
     let l2 = |slice: &[f32]| -> f32 { (slice.iter().map(|x| x * x).sum::<f32>() + eps).sqrt() };
-    // Read the incoming state immutably inside the closure; `st` is only touched mutably AFTER
-    // `collect` returns (NLL ends this shared borrow there), so two tasks never `&mut` the state.
-    let st_ro: &[f32] = st;
-    // One task per value head: snapshot the head's state, run its full sequential t-scan into a
-    // local output buffer, and return both for the serial gather below.
-    let per_head: Vec<(Vec<f32>, Vec<f32>)> = pool.collect(nv, &|h| {
-        let mut sh = st_ro[h * kd * vd..(h + 1) * kd * vd].to_vec(); // [kd, vd]
-        let mut oh_all = vec![0f32; rr * vd];
+    // Per-head outputs, [nv, rows, vd]: each head's rows contiguous, so a task owns one run.
+    let mut out_h = vec![0f32; nv * rr * vd];
+    // One work item per value head: its state slice [kd, vd] and its output run [rows, vd],
+    // disjoint from every other head's, so the pool hands each task exactly one.
+    let mut work: Vec<(&mut [f32], &mut [f32])> = st[..nv * kd * vd]
+        .chunks_mut(kd * vd)
+        .zip(out_h.chunks_mut(rr * vd))
+        .collect();
+    pool.for_chunks_mut(&mut work, 1, 1, &|h, item| {
+        let (sh, oh_all) = &mut item[0];
         // GQA: q/k heads TILED to nv value heads → v-head h uses q/k head h % nk.
         let kh_idx = h % nk;
         // Sequential scan over the rows, carrying this head's state S across tokens.
@@ -4661,16 +4742,10 @@ fn deltanet_scan(
             for x in kh.iter_mut() {
                 *x /= kn;
             }
-            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-            let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
+            let beta = math::sigmoid(bf[bb + h]);
             // softplus(a + dt_bias), then g = a_coef * softplus (≤ 0); decay = exp(g).
-            let sp = {
-                let z = af[bb + h] + dtb[h];
-                // libm-ok(S2) x2: platform `exp`, `ln_1p`, moves to `infr_core::math` in S2
-                z.max(0.0) + (-z.abs()).exp().ln_1p()
-            };
-            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-            let decay = (acoef[h] * sp).exp();
+            let sp = math::softplus(af[bb + h] + dtb[h]);
+            let decay = math::exp(acoef[h] * sp);
             for x in sh.iter_mut() {
                 *x *= decay;
             }
@@ -4702,15 +4777,19 @@ fn deltanet_scan(
                 }
             }
         }
-        (oh_all, sh)
     });
-    // Serial gather: copy each head's final state back, and scatter its per-row output columns.
+    drop(work);
+    if rr == 1 {
+        // [nv, 1, vd] is already [1, nv*vd].
+        return out_h;
+    }
+    // Scatter each head's rows into the [rows, nv*vd] layout.
     let mut out = vec![0f32; rr * nv * vd];
-    for (h, (oh_all, sh)) in per_head.into_iter().enumerate() {
-        st[h * kd * vd..(h + 1) * kd * vd].copy_from_slice(&sh);
+    for h in 0..nv {
         for t in 0..rr {
             let dst = t * nv * vd + h * vd;
-            out[dst..dst + vd].copy_from_slice(&oh_all[t * vd..t * vd + vd]);
+            let src = (h * rr + t) * vd;
+            out[dst..dst + vd].copy_from_slice(&out_h[src..src + vd]);
         }
     }
     out
@@ -4889,7 +4968,7 @@ mod tests {
                 }
                 acc += xt[ch] * ws[ch * kk + (kk - 1)];
                 out[t * cc + ch] = if silu {
-                    acc / (1.0 + (-acc).exp())
+                    acc / (1.0 + math::exp(-acc))
                 } else {
                     acc
                 };
@@ -5043,12 +5122,12 @@ mod tests {
                 for x in kh.iter_mut() {
                     *x /= kn;
                 }
-                let beta = 1.0 / (1.0 + (-bf[bb + h]).exp());
+                let beta = 1.0 / (1.0 + math::exp(-bf[bb + h]));
                 let sp = {
                     let z = af[bb + h] + dtb[h];
-                    z.max(0.0) + (-z.abs()).exp().ln_1p()
+                    z.max(0.0) + math::ln_1p(math::exp(-z.abs()))
                 };
-                let decay = (acoef[h] * sp).exp();
+                let decay = math::exp(acoef[h] * sp);
                 let sh = &mut st[h * kd * vd..(h + 1) * kd * vd];
                 for x in sh.iter_mut() {
                     *x *= decay;
@@ -5254,6 +5333,24 @@ mod tests {
         }
     }
 
+    /// Equal logits are taken in index order: a uniform draw walking the CDF of a flat row picks
+    /// the token whose index it lands on, with or without a top-k cut. Turns red if the order of
+    /// ties is left to the unstable sorts.
+    #[test]
+    fn sample_token_breaks_ties_by_index() {
+        let logits = vec![0.5f32; 300];
+        for (top_k, n) in [(0usize, 300usize), (40, 40)] {
+            for j in 0..n {
+                let u = (j as f32 + 0.5) / n as f32;
+                assert_eq!(
+                    sample_token(&logits, u, top_k, 1.0, 1.0),
+                    j as u32,
+                    "top_k {top_k}"
+                );
+            }
+        }
+    }
+
     /// A NaN logit must not panic the sampler: its comparator once called NaN "equal" to
     /// everything, which is not a total order, and the selection then panicked.
     #[test]
@@ -5387,6 +5484,21 @@ mod tests {
         assert_eq!(dflt.repack_budget_bytes(), 4096 * 1024 * 1024);
     }
 
+    /// One RoPE frequency table per `(theta, rope_dim)` for the backend's life, holding exactly
+    /// [`math::rope_freqs`]' values. Turns red if `rope_freqs` builds a fresh table per call (the
+    /// per-op `powf` cost a one-row decode never amortizes).
+    #[test]
+    fn rope_freqs_are_built_once_per_shape() {
+        let be = CpuBackend::new_with(Arc::new(Config::default()));
+        let a = be.rope_freqs(10_000.0, 128);
+        assert_eq!(&a[..], &math::rope_freqs(10_000.0, 128)[..]);
+        assert!(Arc::ptr_eq(&a, &be.rope_freqs(10_000.0, 128)));
+        let other_theta = be.rope_freqs(1_000_000.0, 128);
+        assert_eq!(&other_theta[..], &math::rope_freqs(1_000_000.0, 128)[..]);
+        assert!(!Arc::ptr_eq(&a, &other_theta));
+        assert_eq!(be.rope_freqs(10_000.0, 64).len(), 32);
+    }
+
     /// The packed prefill Linear writes the row-major output directly, with an `out_f % 8` tail
     /// on the per-row kernels: every element must be the single-token kernel's bits, for every
     /// dtype it takes, a token count that is not a whole number of GEMM tiles, and a scratch
@@ -5405,7 +5517,7 @@ mod tests {
             (DType::Q5K, 256),
             (DType::Q6K, 512),
         ] {
-            if !linear_packed_ok(dt, in_f, out_f, m) {
+            if !linear_packed_ok::<false>(dt, in_f, out_f, m) {
                 // Only AVX-512 VNNI hosts take this route; others run the per-row kernels,
                 // which `linear_prefill_matches_the_single_token_kernels_bitwise` covers.
                 eprintln!("SKIP linear_packed: this CPU lacks AVX-512BW + AVX-512 VNNI");
@@ -5422,15 +5534,15 @@ mod tests {
                 .collect();
             let q8s: Vec<Q8> = x.chunks(in_f).map(quantize_q8).collect();
             let mut out = vec![f32::NAN; m * out_f];
-            be.linear_packed(dt, &w, in_f, out_f, &q8s, &mut out);
+            be.linear_packed::<false>(dt, &w, in_f, out_f, &q8s, &mut out);
             let bpr = w.len() / out_f;
             for o in 0..out_f {
                 let row = &w[o * bpr..(o + 1) * bpr];
                 for (r, q8) in q8s.iter().enumerate() {
                     let want = match dt {
-                        DType::Q4K => vec_dot_q4k(row, q8, in_f),
-                        DType::Q5K => vec_dot_q5k(row, q8, in_f),
-                        _ => vec_dot_q6k(row, q8, in_f),
+                        DType::Q4K => vec_dot_q4k::<false>(row, q8, in_f),
+                        DType::Q5K => vec_dot_q5k::<false>(row, q8, in_f),
+                        _ => vec_dot_q6k::<false>(row, q8, in_f),
                     };
                     let got = out[r * out_f + o];
                     assert_eq!(
@@ -5745,7 +5857,7 @@ mod tests {
                 counts.push(min - 1);
             }
             for m in counts {
-                let packed = linear_packed_ok(dt, in_f, out_f, m);
+                let packed = linear_packed_ok::<false>(dt, in_f, out_f, m);
                 #[cfg(target_arch = "x86_64")]
                 if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vnni") {
                     assert_eq!(packed, m >= min, "{dt:?} m={m}: wrong route");
@@ -5762,9 +5874,9 @@ mod tests {
                     for o in 0..out_f {
                         let row = &w[o * bpr..(o + 1) * bpr];
                         let want = match dt {
-                            DType::Q4K => vec_dot_q4k(row, &q8, in_f),
-                            DType::Q5K => vec_dot_q5k(row, &q8, in_f),
-                            _ => vec_dot_q6k(row, &q8, in_f),
+                            DType::Q4K => vec_dot_q4k::<false>(row, &q8, in_f),
+                            DType::Q5K => vec_dot_q5k::<false>(row, &q8, in_f),
+                            _ => vec_dot_q6k::<false>(row, &q8, in_f),
                         };
                         let g = got[r * out_f + o];
                         assert_eq!(

@@ -42,6 +42,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **`kernels.cpu.max_tier` (`INFR_CPU_MAX_TIER`): a ceiling on the CPU's SIMD
+  tier**, `scalar`, `avx2`, `avx512` or `avx512vnni`. Every run-time dispatch in
+  the CPU backend (each quantized dot kernel, the packed VNNI GEMMs, the MoE
+  expert tiles, the int8 path's routes) and `infr_core::math`'s slice functions
+  ask one process-wide tier, `infr_core::simd::active`: the widest the CPU has,
+  or the ceiling when it is lower; a ceiling above what the CPU has runs the
+  CPU's widest. The ceiling selects which hand-written kernel of a family runs
+  (the scalar, AVX2, AVX-512 or VNNI one); it does not change the instruction
+  set the compiler may use, so on a `target-cpu=native` build the scalar kernels
+  are still compiled for, and auto-vectorized with, the machine's features. A
+  debug and testing switch: every tier gives the same bits, so it changes only
+  speed. With no ceiling set it has no measurable cost: the CPU backend's graph
+  interpreter is compiled twice and picks once per graph, and the uncapped copy
+  dispatches exactly as before (a compile-time constant on a native build). It
+  is process-wide: each CPU backend applies its value when built, unset meaning
+  no ceiling, so the last backend built decides. A misspelt tier is a config
+  error at load in the file, `--set` and the environment alike. It replaces the
+  unreleased `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER` (and
+  `math::set_tier`), which forced only the math slices: one ceiling covers both,
+  and the old key is no longer read. New: `infr_core::simd` (`SimdTier`,
+  `active`, `allows`, `capped`, `set_max`); `infr_cpu::turbo::QK` is public.
+
+- **`CpuBackend::pool_threads`**: the size of the backend's thread pool once a
+  graph has built it. `crates/infr-cpu/tests/op_hashes.rs` uses it: every `Op`
+  variant's CPU result is hashed against one checked-in value at every SIMD tier
+  the host has and at 1, 2, 3, 7, 33 and the machine's thread count, in the
+  normal test job on Linux, Windows and macOS.
+
 - **`INFR_CPU_OP_HASH=<path>`** (`debug.cpu_op_hash`), a debugging aid: the CPU
   backend appends one line per tensor each op reads and writes (backend, graph
   and op number, the op's profiler label, element count, an FNV-1a hash of the
@@ -105,12 +133,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   not depend on the C library, unlike the `f32` methods, which differ in the
   last bit between UCRT and glibc: the grid hashes are identical on Windows
   (native and baseline x86-64 builds) and Linux under WSL; aarch64 has been
-  compiled, and CI's macOS job is the first run there. See `docs/math.md`.
-  Nothing uses the module yet, so no output changes: moving the call sites (and
-  the one-time re-bless of the CPU goldens) is the next slice of
-  `docs/plan/11-cpu-bit-identical.md`. A new lint,
-  `crates/infr-core/tests/no_platform_libm.rs`, counts the call sites still on
-  the platform functions.
+  compiled, and CI's macOS job is the first run there. See `docs/math.md`. The
+  slice functions run at the widest SIMD tier the CPU has, chosen at run time
+  (baseline, AVX2 or AVX-512 on x86-64), so a baseline x86-64 build still runs
+  them four or eight binary64 lanes wide (`math::Tier`, `math::slice_fns`;
+  `kernels.cpu.max_tier` caps them, below). Also `rope_freqs` and
+  `rope_sin_cos`, the RoPE angles every CPU RoPE variant now shares. A new lint,
+  `crates/infr-core/tests/no_platform_libm.rs`, fails on any platform math call
+  in production code.
 
 - **Wave64-only AMD GPUs (GCN: Polaris, Vega) run on the Vulkan backend** (issue
   #94), ported from korewaChino's KessokuNet fork. A device that cannot pin a
@@ -298,6 +328,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the slot alignment each needs.
 
 ### Changed
+
+- **CPU outputs are identical on every operating system, and change once.**
+  Every transcendental function the CPU backend uses (`exp`, `ln`, `ln_1p`,
+  `tanh`, `powf`, `sin`, `cos`: softmaxes, SiLU/GELU/sigmoid, RoPE, the MoE
+  router, DeltaNet, sampling, YaRN scales) now comes from `infr_core::math`,
+  correctly rounded, instead of the C runtime, whose last bit differs between
+  Windows (UCRT), Linux (glibc, by version) and macOS. So CPU logits are the
+  same bits on Windows and Linux (checked on one machine, natively and under
+  WSL), and the CPU golden hashes have one value per case on every platform.
+  Upgrading, expect CPU results to differ from earlier releases in the last bit
+  of these functions, and greedy text to fork where two tokens were nearly tied:
+  five of the 17 cached golden cases changed text, each still coherent (for
+  example Qwen3-0.6B's ocean paragraph now says "brainstorming key elements"
+  where it said "brainstorming the key elements"). Distances to llama.cpp are
+  unchanged (the synthetic DeepSeek V4 and LFM3 oracles, a Qwen3-0.6B logits
+  dump). The GPU kernels are unchanged; values the host computes for a GPU (YaRN
+  divisors and scales, host-side sampling) move by the same last bits. The MXFP4
+  E8M0 scale exponent is now computed exactly from the float's bits rather than
+  from `log2`.
+
+- **Faster activations and RoPE on the CPU.** SiLU, GELU and the softmaxes run
+  as vectorized slices, picked per CPU at run time. Measured on a Ryzen 9
+  9950X3D, 16 threads, one warm pp512 forward (`INFR_PROF_OPS=1`, two forwards
+  each): gemma-3-1b's `GatedAct` from 46.5-47.8 to 18.5-19.0 ms and `QkNormRope`
+  from 7.1 to 4.0-4.2 ms; Qwen3-1.7B's `GatedAct` from 17.4-18.1 to 16.3-16.6 ms
+  and `QkNormRope` from 9.1-9.4 to 7.9-8.6 ms; whole forwards 845-867 to 832-847
+  ms and 450-455 to 443-448 ms. Whole-prefill throughput (pp512) on Qwen3-1.7B
+  did not change measurably. A second, independent measurement saw gemma-3-1b
+  decode go from 39.4-40.8 to 43.5-44.7 t/s, with `GatedAct` at about 1.8 to
+  0.73 ms per call in prefill and 52 to 11.7 µs in decode. A build for baseline
+  x86-64 gets the same: its gemma `GatedAct` went from 47.9-48.4 to 18.4-18.8
+  ms. RoPE frequency tables are built once per backend, so a decode `QkNormRope`
+  call went from 4.0-4.1 to 2.3-2.4 µs on gemma-3-1b and from 3.3 to 2.5 µs on
+  Qwen3-0.6B.
+
+- **Qwen3.5 decodes about 15% faster on the CPU.** The DeltaNet scan updates
+  each head's recurrent state in place instead of scanning a copy and copying
+  every head back, so a decode `DeltaNet` call on Qwen3.5-0.8B went from 113-118
+  to 40-41 µs and tg64 from 56.2-56.9 to 64.7-65.3 t/s (four interleaved rounds
+  against `main` before the math migration).
 
 - **A GPU session with no room left for any context fails with the numbers.**
   When the device's free memory after the weights cannot hold even a one-token
@@ -742,6 +812,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   conversation with tools, and every conversation, respectively, and now render.
 
 ### Fixed
+
+- **Equal logits sample the same token on every toolchain.** The CPU backend's
+  `Op::Sample` and the host sampler's top-k path ordered equal logits by
+  unstable sorts with no tie-break, so which of two equal tokens a draw picked
+  depended on the standard library's sort; ties now go to the lower token id, as
+  the nucleus path already did. The q4_1 and q5_1 KV cache quantizers took a
+  block's least value with `f32::min`, which may return either zero when a block
+  holds both `+0` and `-0` (x86 and AArch64 lowerings differ), so the stored
+  minimum's sign bit could differ by architecture; they now take the first of
+  equal values. The decoded values were the same either way.
+
+- **Q8_0 weights give the same CPU result on an AVX-512 machine as on any
+  other.** The AVX-512 one-row and batch Q8_0 kernels (a whole number of
+  256-element super-blocks) summed each pair of blocks before scaling them,
+  `d8 * (d0 * i0 + d1 * i1)`, where the scalar and AVX2 kernels add `d8 * d * i`
+  block by block, so their results differed in the last bits and greedy text
+  could fork on near ties. They now compute the scalar expression; Qwen3.5-0.8B,
+  whose Q8_0 tensors take it, prefills and decodes on the CPU at the same speed
+  within run-to-run noise. Upgrade note: CPU output on AVX-512 machines changes
+  wherever a model has such Q8_0 tensors; of the cached CPU goldens only
+  Qwen3.5-0.8B Q4_K_M changed (both cases, re-blessed). Its new knight hash is
+  the value a CI runner printed in July when that golden was dropped from CI as
+  "not portable"; its new France hash is not (that run passed France with the
+  old value), so the cause of the July difference is not settled, and the
+  golden's first Linux CI run after this change is the real test. Every kernel
+  family is now held to its scalar kernel's bits at every tier the host has
+  (`kernels/tier_tests.rs`).
 
 - **`INFR_FLASH_SPLITS` / `INFR_PV_SPLITS` above 8 are refused** instead of
   dispatched: the coopmat attention prefill sizes its split partials for 8

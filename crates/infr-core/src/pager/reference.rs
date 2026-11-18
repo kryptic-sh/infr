@@ -1114,7 +1114,7 @@ mod tests {
             n_layers: 6,
             n_expert: 32,
             top_k: 4,
-            zipf_s: 1.0,
+            zipf_s: 1,
         };
         let n = moe.n_blocks();
         let mut traces = vec![cyclic_sweep(40, 8, 6), cyclic_sweep(40, 32, 6)];

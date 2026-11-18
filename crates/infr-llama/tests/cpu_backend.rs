@@ -11,6 +11,9 @@
 //!   INFR_TEMP=0 cargo test --release -p infr-llama --test cpu_backend -- \
 //!     --include-ignored --nocapture
 
+#[path = "support/row_identity.rs"]
+mod row_identity;
+
 use infr_core::WeightSource;
 use std::path::PathBuf;
 
@@ -21,12 +24,20 @@ fn find_gguf(repo: &str, file: &str) -> Option<PathBuf> {
     infr_hub::Store::discover().ok()?.snapshot_file(repo, file)
 }
 
-/// Resolve a model path or self-skip the test (it runs only when the GGUF is present).
+/// Resolve a model path or self-skip the test (it runs only when the GGUF is present). With
+/// `INFR_TEST_REQUIRE_MODELS` set (the CI golden jobs set it), a missing model FAILS the test
+/// instead, naming it: a skip passes, so a wrong cache path or a failed download would otherwise
+/// report green without running anything.
 macro_rules! need_model {
     ($opt:expr, $what:expr) => {
         match $opt {
             Some(p) => p,
             None => {
+                assert!(
+                    std::env::var_os("INFR_TEST_REQUIRE_MODELS").is_none(),
+                    "{} is not in the HF cache, and INFR_TEST_REQUIRE_MODELS requires it",
+                    $what
+                );
                 eprintln!("skip: {} not in the HF cache", $what);
                 return;
             }
@@ -170,12 +181,16 @@ fn model_cfg(
 /// The shipped defaults plus the environment knobs these tests honour: WHICH GPU they run on
 /// (`INFR_DEV`), so a box with more than one (a dGPU beside an iGPU) can test either (unset keeps
 /// the first-discrete default); `INFR_FORCE_WAVE64`, so the wave64 path AMD GCN takes can be
-/// scored on an RDNA card; and `INFR_CPU_OP_HASH`, so a CPU golden that differs between two
-/// systems can be diffed op by op (`debug.cpu_op_hash`).
+/// scored on an RDNA card; `INFR_CPU_OP_HASH`, so a CPU golden that differs between two
+/// systems can be diffed op by op (`debug.cpu_op_hash`); and `INFR_CPU_MAX_TIER`, so the goldens
+/// can be run with the kernels and math slices capped at each SIMD tier (`kernels.cpu.max_tier`).
 fn env_cfg() -> infr_llama::EngineConfig {
     let mut cfg = infr_llama::EngineConfig::default();
     cfg.device.dev = std::env::var("INFR_DEV").ok();
     cfg.debug.cpu_op_hash = std::env::var_os("INFR_CPU_OP_HASH").map(PathBuf::from);
+    cfg.kernels.cpu.max_tier = std::env::var("INFR_CPU_MAX_TIER")
+        .ok()
+        .map(|t| infr_core::simd::SimdTier::parse(&t).expect("INFR_CPU_MAX_TIER: a tier name"));
     infr_testkit::honour_env(&mut cfg);
     cfg
 }
@@ -347,34 +362,22 @@ fn gpu_seam_matches_cpu_qwen2() {
     seam_vulkan_matches_cpu(&path, "What is the capital of France? Answer briefly.", 16);
 }
 
-/// A golden hash that differs between Windows and every other platform.
-///
-/// Windows builds produce different greedy tokens from Linux ones on the same CPU with the same
-/// `target-cpu` — deterministically, run after run, and only once a generation is long enough for
-/// accumulated float drift to flip an argmax (every short case still matches bit-for-bit). The
-/// likeliest cause is the C runtime's transcendental functions (MSVC's UCRT versus glibc), not
-/// confirmed. Both outputs were read and are coherent; they are simply different arithmetic.
-const fn per_os(windows: u64, elsewhere: u64) -> u64 {
-    if cfg!(windows) {
-        windows
-    } else {
-        elsewhere
-    }
-}
-
 // Captured + verified coherent (chat-templated, Qwen3 thinks then answers): "…France's capital is
-// Paris", a simple-terms computer explanation, an ocean paragraph.
+// Paris", a simple-terms computer explanation, an ocean paragraph. One hash per case on every
+// platform: the CPU's transcendental functions are `infr_core::math`'s, not the C runtime's, so
+// Windows and Linux compute the same bits (re-blessed 2026-11-17, identical natively on Windows
+// and under WSL; before that the last two cases had a Windows and a Linux hash).
 const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0xfd63781ea3bfa785),
     (
         "Explain how a computer works in simple terms.",
         48,
-        per_os(0xec2b171ab4126f09, 0xcf56ba8c4bb5c455),
+        0xcf56ba8c4bb5c455,
     ),
     (
         "Write a short paragraph about the ocean.",
         48,
-        per_os(0xfb31f388412112f1, 0x29f45fb169b84b9a),
+        0x92ef4b86905d27dc,
     ),
 ];
 
@@ -1802,12 +1805,16 @@ fn llama32_1b() -> Option<PathBuf> {
 // natively on Windows and under WSL (Ubuntu 26.04) for the other half, and came out equal. The
 // Ubuntu CI runner is the final word on that half: an exact-token golden may not reproduce
 // across CPU microarchitectures.
+//
+// Re-blessed the same day for `infr_core::math` (correctly rounded transcendentals in place of
+// the C runtime's): the knight story's text changed, the France case kept its hash; identical
+// natively on Windows and under WSL.
 const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0xe5a37ab078db3a2c),
     (
         "Tell me a short story about a brave knight.",
         48,
-        per_os(0x5147de9a0ddfae50, 0x5147de9a0ddfae50),
+        0x4f1efdec82f477e5,
     ),
 ];
 
@@ -2032,7 +2039,7 @@ const ERNIE4_5_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Write a short paragraph about the ocean.",
         32,
-        0x1a643a859ae6ff58,
+        0x055f6196af273214,
     ),
 ];
 
@@ -2055,9 +2062,9 @@ fn ernie4_5_21b_a3b() -> Option<PathBuf> {
 }
 
 // Captured + verified coherent: a one-paragraph answer that Paris is the capital, and the numbers
-// one to twenty spelled out. The same hashes came out on Windows and on Linux (WSL), so neither is
-// `per_os`. On both prompts infr's CPU greedy ids equal llama.cpp's (CPU, same chat-rendered ids)
-// for 48 tokens; see docs/plan/02-ernie4-5.md.
+// one to twenty spelled out. The same hashes came out on Windows and on Linux (WSL). On both
+// prompts infr's CPU greedy ids equal llama.cpp's (CPU, same chat-rendered ids) for 48 tokens;
+// see docs/plan/02-ernie4-5.md.
 const ERNIE4_5_MOE_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "What is the capital of France? Answer in one paragraph.",
@@ -2402,6 +2409,50 @@ fn gpu_seam_ernie4_5_decode_replays_from_one_recording() {
     );
 }
 
+/// Row-count identity on the cached dense models (`support/row_identity.rs`): a chat prompt
+/// prefilled in one chunk, in chunks of 7 and 3, and one row at a time gives the same 8 ids and
+/// the same bits in every tensor the prompt's last position and the decode steps write. The
+/// families: Qwen3 (Q4_K/Q6_K, QK-norm RoPE), gemma-3 (sliding window, Q5_0 on int8), Qwen3.5
+/// (gated DeltaNet and its convolution, gated attention), LFM3 (short convolution, head gates),
+/// ERNIE-4.5 and SmolLM3.
+///
+/// The MoE models are left out on purpose: `Op::MoeFfn` takes f32 activations for one row and
+/// int8 ones for several (`moe::expert_acts_kind`, `int8_ok = rows >= 2`), so a prompt prefilled
+/// in chunks and one prefilled a row at a time differ by design there (docs/backlog.md, B203).
+#[test]
+#[ignore = "needs the dense CPU golden models in the HF cache"]
+fn cpu_rows_give_the_same_bits_in_any_chunks() {
+    let mut _tlk = test_serial_lock();
+    let mut ran = 0;
+    for (what, path) in [
+        ("Qwen3-0.6B", qwen3_06b()),
+        ("gemma-3-1b", gemma3_1b()),
+        ("Qwen3.5-0.8B", qwen35_08b()),
+        ("LFM3-1.7B", lfm3_17b()),
+        ("ERNIE-4.5-0.3B", ernie4_5_03b()),
+        ("SmolLM3-3B", smollm3_3b()),
+    ] {
+        let Some(path) = path else {
+            println!("skip: {what} is not cached");
+            continue;
+        };
+        let load = |cfg| infr_llama::SeamModel::load_with(&path, None, cfg).expect("model load");
+        let base = env_cfg();
+        let model = load(std::sync::Arc::new(base.clone()));
+        let prompt = model
+            .encode(
+                &model
+                    .render_chat("Name three rivers in Europe and one fact about each.")
+                    .expect("render chat"),
+            )
+            .expect("encode");
+        drop(model);
+        row_identity::assert_row_count_identity(what, &load, &base, &prompt, 8, &[512, 7, 3, 1]);
+        ran += 1;
+    }
+    assert!(ran > 0, "no dense model is cached; nothing was checked");
+}
+
 // ─── Qwen3.5 / Qwen3-Next (gated DeltaNet) ──────────────────────────────────────
 
 fn qwen35_08b() -> Option<PathBuf> {
@@ -2415,12 +2466,12 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "The capital of France is",
         32,
-        0x542a9dd055c58884, // prefilled-think reasoning ("Thinking Process… capital of France")
+        0x01829861302f0b8a, // prefilled-think reasoning ("Thinking Process… capital of France")
     ),
     (
         "Tell me a short story about a brave knight.",
         48,
-        0xbe06c5580ea33d78, // prefilled-think reasoning (story planning process)
+        0x0a0d2a6554ca9f21, // prefilled-think reasoning (story planning process)
     ),
 ];
 
@@ -2429,9 +2480,9 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
 /// `seam::generate_dense_cpu` with the `MixerW::DeltaNet` branch) — the same runner every other
 /// arch's `cpu_golden_*` test above locks. (Historically this ran through a bespoke qwen35-only
 /// seam that lived in `qwen35.rs`; that seam was proven token-identical to this unified path
-/// during the cutover and has since been deleted — issue #30.)
+/// during the cutover and has since been deleted — issue #30.) The `cpu-goldens` CI jobs download
+/// the model, so it runs by default and self-skips where the GGUF is absent.
 #[test]
-#[ignore = "needs Qwen3.5-0.8B in the HF cache"]
 fn cpu_golden_qwen35() {
     let path = need_model!(qwen35_08b(), "Qwen3.5-0.8B");
     let mut _tlk = test_serial_lock();
@@ -3136,7 +3187,7 @@ fn lfm3_17b_f16() -> Option<PathBuf> {
 // text is the model's reasoning. How infr's output compares with llama.cpp's is in
 // docs/plan/03-lfm3.md.
 const LFM3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0x8d3a3dd9844d239f),
+    ("The capital of France is", 32, 0xcaeef40f04920074),
     (
         "Tell me a short story about a lighthouse keeper.",
         32,
@@ -3283,12 +3334,10 @@ fn qwen3moe_30b() -> Option<PathBuf> {
 // the staged-MoE `int8_ok` doc). Verified coherent ("<think>\nOkay, the user is asking, \"The
 // capital of France is\". I need to provide the correct answer.") — re-blessed for the
 // attention-SIMD reassociation (numerics policy: match-or-beat llama.cpp CPU precision).
-// The Windows hash was captured 2026-11-13, the day the Linux one was re-run and held.
-const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] = &[(
-    "The capital of France is",
-    24,
-    per_os(0xe1a4ed6cecc5eb14, 0xbc4f22b22d3e3c1d),
-)];
+// Since `infr_core::math` (2026-11-17) Windows and Linux give the same text, the one Windows
+// gave before.
+const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
+    &[("The capital of France is", 24, 0xe1a4ed6cecc5eb14)];
 
 /// Whole-vector cosine similarity (f64 accumulation) — used by the CPU/Vulkan cross-backend
 /// logits check below.

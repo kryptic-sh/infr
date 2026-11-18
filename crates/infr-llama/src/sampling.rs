@@ -1,6 +1,8 @@
 //! Token sampling (greedy / temperature + top-k + top-p) and incremental UTF-8-safe
 //! detokenization. Mechanically split out of `lib.rs` (no logic change).
 
+use infr_core::math;
+
 /// Token sampling: greedy when `temp <= 0`, else temperature + top-k + top-p (nucleus). Qwen3
 /// recommends temp 0.6 / top_k 20 / top_p 0.95 — pure greedy makes thinking models degenerate
 /// (fail to close `</think>`, repeat, or stop without answering).
@@ -643,26 +645,23 @@ fn truncated_softmax(
 ) -> (Vec<usize>, Vec<f32>) {
     let n = logits.len();
     let temp = if temp > 0.0 { temp } else { 1.0 };
-    // libm-ok(S2): platform `ln`, moves to `infr_core::math` in S2
-    let min_logit = |maxl: f32| (min_p > 0.0).then(|| maxl + min_p.ln());
+    let min_logit = |maxl: f32| (min_p > 0.0).then(|| maxl + math::ln(min_p));
     let k = if top_k == 0 { n } else { top_k.min(n) };
     if k < n {
         // Bounded top-k: partition to the top k, then sort only those k (cheap). `total_cmp`, not
         // `partial_cmp` with an `Equal` fallback: that is not a total order once a NaN is present,
         // and `select_nth_unstable_by` / `sort_unstable_by` panic on one. On NaN-free logits the
         // two agree on every pair but `-0.0` / `+0.0`, which `total_cmp` orders. A NaN logit no
-        // longer panics but ranks first, so the probabilities come out NaN as before.
-        let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]);
+        // longer panics but ranks first, so the probabilities come out NaN as before. Ties go
+        // to the lower index, as in the nucleus path below: the sorts are unstable.
+        let cmp = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then_with(|| a.cmp(b));
         let mut idx: Vec<usize> = (0..n).collect();
         idx.select_nth_unstable_by(k - 1, cmp); // top-k at the front (unordered)
         idx.truncate(k);
         idx.sort_unstable_by(cmp); // descending by logit
         let maxl = logits[idx[0]];
-        let mut probs: Vec<f32> = idx
-            .iter()
-            // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-            .map(|&i| ((logits[i] - maxl) / temp).exp())
-            .collect();
+        let mut probs: Vec<f32> = idx.iter().map(|&i| (logits[i] - maxl) / temp).collect();
+        math::exp_slice(&mut probs);
         let sum: f32 = probs.iter().sum();
         for p in probs.iter_mut() {
             *p /= sum;
@@ -700,8 +699,11 @@ fn truncated_softmax(
         // sampled token, and `truncated_dist`'s MTP accept ratios). Note the index-order summation
         // is also what makes this arm bit-identical to what shipped before.
         let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-        let sum: f32 = logits.iter().map(|&l| ((l - maxl) / temp).exp()).sum();
+        // Every token's `exp((l - maxl) / temp)`, once: the sum and every probability below
+        // read the same values.
+        let mut e: Vec<f32> = logits.iter().map(|&l| (l - maxl) / temp).collect();
+        math::exp_slice(&mut e);
+        let sum: f32 = e.iter().sum();
         let min_logit = min_logit(maxl);
 
         // `top_p >= 1` with no top-k cut (`top_k` 0, or at least `n`) keeps every token that has
@@ -720,8 +722,7 @@ fn truncated_softmax(
             let mut idx = Vec::with_capacity(n);
             let mut probs = Vec::with_capacity(n);
             for (i, &l) in logits.iter().enumerate() {
-                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                let p = ((l - maxl) / temp).exp() / sum;
+                let p = e[i] / sum;
                 if p > 0.0 && min_logit.is_none_or(|m| l >= m) {
                     idx.push(i);
                     probs.push(p);
@@ -762,8 +763,7 @@ fn truncated_softmax(
                     reached = true;
                     break;
                 }
-                // libm-ok(S2): platform `exp`, moves to `infr_core::math` in S2
-                let p = ((logits[i] - maxl) / temp).exp() / sum;
+                let p = e[i] / sum;
                 probs.push(p);
                 cum += p;
                 if cum >= top_p {
@@ -1632,7 +1632,7 @@ mod tests {
         let maxl = logits[idx[0]];
         let mut probs: Vec<f32> = idx
             .iter()
-            .map(|&i| ((logits[i] - maxl) / s.temp).exp())
+            .map(|&i| math::exp((logits[i] - maxl) / s.temp))
             .collect();
         let sum: f32 = probs.iter().sum();
         for p in probs.iter_mut() {
@@ -1811,12 +1811,12 @@ mod tests {
     /// comparison below can be an exact `assert_eq!` on both `idx` AND `probs`, not a tolerance.
     fn reference_support(logits: &[f32], temp: f32, top_p: f32) -> (Vec<usize>, Vec<f32>) {
         let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f32 = logits.iter().map(|&l| ((l - maxl) / temp).exp()).sum();
+        let sum: f32 = logits.iter().map(|&l| math::exp((l - maxl) / temp)).sum();
         let mut order: Vec<usize> = (0..logits.len()).collect();
         order.sort_by(|a, b| logits[*b].total_cmp(&logits[*a]).then_with(|| a.cmp(b)));
         let (mut idx, mut probs, mut cum) = (Vec::new(), Vec::new(), 0.0f32);
         for &i in &order {
-            let p = ((logits[i] - maxl) / temp).exp() / sum;
+            let p = math::exp((logits[i] - maxl) / temp) / sum;
             idx.push(i);
             probs.push(p);
             cum += p;
@@ -1852,9 +1852,9 @@ mod tests {
         assert_eq!(got.len(), idx.len(), "{what}: a token appears twice");
 
         let maxl = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let sum: f32 = logits.iter().map(|&l| ((l - maxl) / temp).exp()).sum();
+        let sum: f32 = logits.iter().map(|&l| math::exp((l - maxl) / temp)).sum();
         for (i, &l) in logits.iter().enumerate() {
-            let p = ((l - maxl) / temp).exp() / sum;
+            let p = math::exp((l - maxl) / temp) / sum;
             if p > 0.0 {
                 assert_eq!(
                     got.get(&i),

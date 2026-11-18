@@ -1218,6 +1218,7 @@ impl SeamModel {
         edit: impl FnOnce(&mut crate::EngineConfig),
         prompt: &[u32],
         n_steps: usize,
+        head: crate::seam::PrefillHead,
         next: impl FnMut(usize, &[f32]) -> u32,
     ) -> Result<crate::seam::ForcedLogits> {
         let mut ec = (*self.ecfg).clone();
@@ -1240,11 +1241,12 @@ impl SeamModel {
                     ple,
                     prompt,
                     n_steps,
+                    head,
                     next,
                 )
             }
             crate::seam::ForcedOn::Vulkan => {
-                crate::seam::forced_run_vulkan(g, c, &ec, embd, ple, prompt, n_steps, next)
+                crate::seam::forced_run_vulkan(g, c, &ec, embd, ple, prompt, n_steps, head, next)
             }
         }
     }

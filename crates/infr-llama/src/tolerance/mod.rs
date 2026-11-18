@@ -11,4 +11,4 @@ pub mod metrics;
 pub mod table;
 
 pub use metrics::{score_row, RowError, RowScore, RunScore};
-pub use table::{tolerance, Entry, PathClass, Tolerance, MIN_TOP1_SCORED, TABLE};
+pub use table::{tolerance, Entry, PathClass, Tolerance, FIRST_ROWS, MIN_TOP1_SCORED, TABLE};

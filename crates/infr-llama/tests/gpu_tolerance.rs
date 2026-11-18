@@ -37,16 +37,145 @@ fn measure_gpu_tolerance() {
 use infr_llama::tolerance::PathClass::{self, Float, Int8, KvQ8};
 
 /// A quantized model: the production kernels at both prefill chunk heights, and the same with
-/// every int8-activation kernel off.
+/// every int8-activation kernel off, once more on the static per-token decode path.
 const QUANT_RUNS: &[(&str, PathClass)] = &[
     ("gpu", Int8),
     ("gpu-ub32", Int8),
     ("gpu-float", Float),
     ("gpu-float-ub32", Float),
+    ("gpu-float-static", Float),
 ];
 
-/// A float-weight model: the production kernels at both prefill chunk heights.
-const FLOAT_RUNS: &[(&str, PathClass)] = &[("gpu", Float), ("gpu-ub32", Float)];
+/// A float-weight model: the production kernels at both prefill chunk heights, and the static
+/// per-token decode path.
+const FLOAT_RUNS: &[(&str, PathClass)] = &[
+    ("gpu", Float),
+    ("gpu-ub32", Float),
+    ("gpu-float-static", Float),
+];
+
+/// The red path, in the normal test job: a synthetic model with one projection's weights scaled
+/// by [`RED_SCALE`], driven on the CPU reference against the unmodified model's CPU reference, must
+/// fail the gate's evaluation, naming the limits it crossed; the unmodified model against itself
+/// must pass it. CI runs this on every system, so a gate that cannot go red fails here.
+#[test]
+fn tolerance_gate_goes_red_on_a_scaled_weight_cpu() {
+    let clean = forced::open_case("synthetic-f32").expect("synthetic model");
+    let scaled = forced::open_case_scaled("synthetic-f32", Some((RED_TENSOR, RED_SCALE)))
+        .expect("synthetic model");
+    let runs = [("gpu", Float)];
+    let on = infr_llama::seam::ForcedOn::CpuReference;
+    let green = forced::evaluate("synthetic-f32", &clean, &clean, on, &runs);
+    assert!(green.is_empty(), "the clean model failed: {green:?}");
+    let red = forced::evaluate("synthetic-f32", &clean, &scaled, on, &runs);
+    eprintln!("the scaled model's failures:\n  {}", red.join("\n  "));
+    assert!(
+        red.iter().any(|f| f.contains("KL")),
+        "a {RED_SCALE}x {RED_TENSOR} passed the gate: {red:?}"
+    );
+}
+
+/// The tensor the red-path tests scale, and by how much: one layer's FFN down projection, by 2%.
+const RED_TENSOR: &str = "blk.1.ffn_down.weight";
+const RED_SCALE: f32 = 1.02;
+
+/// The red path on the GPU: the scaled synthetic model on the Vulkan seam, against the unmodified
+/// model's CPU reference, must fail the gate.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_tolerance_goes_red_on_a_scaled_weight() {
+    let _guard = forced::watchdog("the red-path case", forced::GATE_TIMEOUT);
+    let clean = forced::open_case("synthetic-f32").expect("synthetic model");
+    let scaled = forced::open_case_scaled("synthetic-f32", Some((RED_TENSOR, RED_SCALE)))
+        .expect("synthetic model");
+    if infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(
+        forced::env_cfg(),
+    )))
+    .is_none()
+    {
+        eprintln!("skip: no Vulkan device");
+        return;
+    }
+    let on = infr_llama::seam::ForcedOn::Vulkan;
+    let red = forced::evaluate("synthetic-f32", &clean, &scaled, on, &[("gpu", Float)]);
+    eprintln!("the scaled model's failures:\n  {}", red.join("\n  "));
+    assert!(
+        red.iter().any(|f| f.contains("KL")),
+        "a {RED_SCALE}x {RED_TENSOR} passed the gate on the GPU: {red:?}"
+    );
+}
+
+/// The prefill head the harness adds is a vocabulary-wide GEMM production never runs; it must not
+/// change anything else: the decode rows, which read the KV the prefill wrote, are bit-identical
+/// with and without it.
+#[test]
+#[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]
+fn gpu_seam_tolerance_prefill_head_leaves_decode_unchanged() {
+    use infr_llama::seam::{ForcedOn, PrefillHead};
+    let _guard = forced::watchdog("the prefill-head check", forced::GATE_TIMEOUT);
+    let case = forced::open_case("synthetic-f32").expect("synthetic model");
+    if infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(
+        forced::env_cfg(),
+    )))
+    .is_none()
+    {
+        eprintln!("skip: no Vulkan device");
+        return;
+    }
+    let ids = &case.prompts[2];
+    let r = forced::forced_reference(&case.model, ids, forced::N_DECODE);
+    let decode = |head| {
+        let g = forced::forced_with(&case.model, ForcedOn::Vulkan, |_| {}, head, &r);
+        let v = g.vocab;
+        g.logits[g.prefill_rows * v..]
+            .iter()
+            .map(|x| x.to_bits())
+            .collect::<Vec<_>>()
+    };
+    let (with, without) = (decode(PrefillHead::All), decode(PrefillHead::Off));
+    assert_eq!(with.len(), forced::N_DECODE * r.vocab);
+    assert!(
+        with == without,
+        "the prefill head changed the decode rows' bits"
+    );
+}
+
+/// What makes a kernel an int8-activation one, by its name: the dp4a `mmq` GEMMs, the int8
+/// coopmat GEMMs (`i8cm`), the dp4a K-quant GEMMs, the activation quantizer, and the int8
+/// GEMVs (`native_mmv_*`; the float GEMVs are `native_gemv_*` and `native_<dtype>*`).
+const INT8_KERNEL_MARKERS: &[&str] = &["mmq", "i8", "dp4a", "quant_q8", "native_mmv"];
+
+/// The Float class is int8-free: a Float run of a quantized model builds no int8-activation
+/// kernel, while the shipped configuration on the same model does (so the check can fail).
+#[test]
+#[ignore = "needs Qwen3-0.6B Q4_K_M and a Vulkan GPU"]
+fn gpu_seam_tolerance_float_runs_build_no_int8_kernel() {
+    use infr_llama::seam::ForcedOn;
+    let _guard = forced::watchdog("the int8-free check", forced::GATE_TIMEOUT);
+    let Some(case) = forced::open_case("qwen3-0.6b") else {
+        eprintln!("skip: qwen3-0.6b not in the HF cache");
+        return;
+    };
+    if infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(
+        forced::env_cfg(),
+    )))
+    .is_none()
+    {
+        eprintln!("skip: no Vulkan device");
+        return;
+    }
+    let r = forced::forced_reference(&case.model, &case.prompts[1], 4);
+    let int8 = |k: &str| INT8_KERNEL_MARKERS.iter().any(|m| k.contains(m));
+    let shipped = forced::forced(&case.model, ForcedOn::Vulkan, |_| {}, &r).kernels;
+    let float = forced::forced(&case.model, ForcedOn::Vulkan, forced::vulkan_float, &r).kernels;
+    eprintln!("shipped: {shipped:?}\nfloat: {float:?}");
+    assert!(
+        shipped.iter().any(|k| int8(k)),
+        "the shipped run built no int8 kernel, so this check cannot fail: {shipped:?}"
+    );
+    let bad: Vec<_> = float.iter().filter(|k| int8(k)).collect();
+    assert!(bad.is_empty(), "the Float run built int8 kernels: {bad:?}");
+}
 
 #[test]
 #[ignore = "requires a Vulkan GPU: run with --include-ignored on a GPU box"]

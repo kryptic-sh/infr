@@ -42,6 +42,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **GPU logits held to the CPU reference within a tolerance.** New public module
+  `infr_llama::tolerance`: `score_row` and `RunScore` (KL divergence, top-set
+  probability cosine, centred logit deviation, top-1 agreement above a near-tie
+  margin, the reference's top-1 rank) and the per-model tolerance `TABLE` with
+  its `PathClass`es. New `SeamModel::forced_logits` with
+  `seam::{ForcedOn, ForcedLogits, PrefillHead}`: drive a prompt and forced
+  tokens through the CPU reference, CPU or Vulkan backend and read the logits at
+  every position. The ignored `gpu_seam_tolerance_*` tests use them; see
+  `docs/gpu-tolerance.md`. Nothing on the inference path changes.
+
 - **`kernels.cpu.max_tier` (`INFR_CPU_MAX_TIER`): a ceiling on the CPU's SIMD
   tier**, `scalar`, `avx2`, `avx512` or `avx512vnni`. Every run-time dispatch in
   the CPU backend (each quantized dot kernel, the packed VNNI GEMMs, the MoE

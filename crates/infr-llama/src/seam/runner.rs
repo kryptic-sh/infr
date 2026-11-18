@@ -503,6 +503,18 @@ pub(crate) fn generate_dense_backend(
     )
 }
 
+/// What the teacher-forced harness asks the batched prefill for (see
+/// `generate_dense_backend_bound`'s `prefill_logits`), and what it got back.
+#[derive(Default)]
+pub(crate) struct PrefillTap {
+    /// Run the head over each chunk's last row only, rather than over every row.
+    pub(crate) last_only: bool,
+    /// `[positions.len() * vocab]` logits.
+    pub(crate) logits: Vec<f32>,
+    /// The position each row of `logits` is the next-token distribution after.
+    pub(crate) positions: Vec<usize>,
+}
+
 /// The dense forward. `prebound`, when given, is what an earlier call on this same `be` bound (see
 /// [`BoundWeights`]): a cold `state` then takes those weights and session-stable derivations
 /// instead of binding and deriving its own, and allocates only its KV and IO buffers.
@@ -565,13 +577,12 @@ pub(crate) fn generate_dense_backend_bound(
     // the pre-existing behavior.
     req: Option<&crate::sampling::RequestCtx>,
     // Teacher-forced scoring (`crate::tolerance`): when `Some`, every ORDINARY batched-prefill
-    // chunk also runs the LM head over all of its rows and appends their logits here, in position
-    // order: `[(prompt.len() - 1 - start) * vocab]`, positions `start..prompt.len() - 1`, `start`
-    // being the reused prefix (0 on a cold state). The layer ops are the production prefill's
-    // unchanged; only the head is added. Left empty when the prompt takes no batched prefill (a
-    // suffix of two tokens or fewer, or a model without one). `None` everywhere but that harness:
-    // no head, no buffer, no download.
-    mut prefill_logits: Option<&mut Vec<f32>>,
+    // chunk also runs the LM head over all of its rows, or over its last row only
+    // (`PrefillTap::last_only`), and appends their logits and positions to the tap, in position
+    // order. The layer ops are the production prefill's unchanged; only the head is added. Left
+    // empty when the prompt takes no batched prefill (a suffix of two tokens or fewer, or a model
+    // without one). `None` everywhere but that harness: no head, no buffer, no download.
+    mut prefill_logits: Option<&mut PrefillTap>,
 ) -> AResult<(Vec<u32>, GenStats)> {
     let c = cfg;
     // Backend capabilities are a per-backend invariant; query ONCE (each call clones an owned
@@ -5940,10 +5951,15 @@ pub(crate) fn generate_dense_backend_bound(
                     // will add alongside the actual head forward.
                     // The teacher-forced harness's head (see `prefill_logits`), on the span that
                     // ends the stack: a partial span has no finished residual to run it on.
-                    let head_rows = if prefill_logits.is_some() && span.end == c.n_layer {
-                        ch.m
-                    } else {
-                        0
+                    let head_rows = match &prefill_logits {
+                        Some(tap) if span.end == c.n_layer => {
+                            if tap.last_only {
+                                1
+                            } else {
+                                ch.m
+                            }
+                        }
+                        _ => 0,
                     };
                     let (mut pf_g, pf_h) = build(
                         ch.m,
@@ -6027,13 +6043,18 @@ pub(crate) fn generate_dense_backend_bound(
                     *written_end = (*written_end).max(cstart + ch.m);
                     be.execute(pf_plan.as_ref(), &pf_b)
                         .map_err(|e| anyhow!("{e}"))?;
-                    if let (Some(out), Some((_, buf))) =
+                    if let (Some(tap), Some((_, buf))) =
                         (prefill_logits.as_deref_mut(), &pf_logits_buf)
                     {
-                        let at = out.len();
-                        out.resize(at + head_rows * c.vocab, 0.0);
-                        be.download(buf.as_ref(), bytemuck::cast_slice_mut(&mut out[at..]))
-                            .map_err(|e| anyhow!("{e}"))?;
+                        let at = tap.logits.len();
+                        tap.logits.resize(at + head_rows * c.vocab, 0.0);
+                        be.download(
+                            buf.as_ref(),
+                            bytemuck::cast_slice_mut(&mut tap.logits[at..]),
+                        )
+                        .map_err(|e| anyhow!("{e}"))?;
+                        tap.positions
+                            .extend(cstart + ch.m - head_rows..cstart + ch.m);
                     }
                     // INFR_PROF_STAGES: split the per-dispatch prefill wall time into host graph
                     // build, plan compile, and execute (record + submit + GPU) — where a small-batch

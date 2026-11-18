@@ -39,43 +39,58 @@ pub struct Tolerance {
     pub rank_max: usize,
 }
 
-/// Fewest positions of a whole case (every prompt, both phases) whose reference margin clears
-/// [`Tolerance::near_tie`]: a case where (almost) every position is a near tie would leave the
-/// top-1 check vacuous.
+/// How many leading positions of a sequence are scored as their own phase with their own bound
+/// ([`Entry::first`]). Position 0's hidden state carries a model's largest activations, the
+/// quantized paths miss it by far the most (Qwen3's, gemma-3's and LFM3's worst int8 KL is at
+/// position 0 or 1), and a bound set over every position together would be that row's bound.
+pub const FIRST_ROWS: usize = 2;
+
+/// Fewest positions per phase (prefill or decode, every prompt of a case together) whose
+/// reference margin clears [`Tolerance::near_tie`]: a phase where (almost) every position is a
+/// near tie would leave its top-1 check vacuous. The first-rows phase has too few rows to be held
+/// to it.
 pub const MIN_TOP1_SCORED: usize = 16;
 
 /// One row of the tolerance table: a model (its GGUF file name, or a synthetic model's name in
-/// the GPU tolerance tests) and a path class.
+/// the GPU tolerance tests) and a path class, with the bound for the first [`FIRST_ROWS`]
+/// positions and the bound for every other position.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Entry {
     pub model: &'static str,
     pub class: PathClass,
-    pub tol: Tolerance,
+    /// Every position from [`FIRST_ROWS`] on, prefill and decode.
+    pub steady: Tolerance,
+    /// The first [`FIRST_ROWS`] positions.
+    pub first: Tolerance,
 }
 
-/// One [`TABLE`] row.
-#[allow(clippy::too_many_arguments)]
-const fn row(
-    model: &'static str,
-    class: PathClass,
+/// A [`Tolerance`], positionally: KL max, KL mean, top-k cosine min, logit deviation max, near-tie
+/// margin, rank max.
+const fn t(
     kl_max: f64,
     kl_mean: f64,
     topk_cos_min: f64,
     logit_dev_max: f64,
     near_tie: f64,
     rank_max: usize,
-) -> Entry {
+) -> Tolerance {
+    Tolerance {
+        kl_max,
+        kl_mean,
+        topk_cos_min,
+        logit_dev_max,
+        near_tie,
+        rank_max,
+    }
+}
+
+/// One [`TABLE`] row.
+const fn row(model: &'static str, class: PathClass, steady: Tolerance, first: Tolerance) -> Entry {
     Entry {
         model,
         class,
-        tol: Tolerance {
-            kl_max,
-            kl_mean,
-            topk_cos_min,
-            logit_dev_max,
-            near_tie,
-            rank_max,
-        },
+        steady,
+        first,
     }
 }
 
@@ -86,180 +101,125 @@ use PathClass::{Float, Int8, KvQ8};
 /// sensitive than Qwen3-0.6B in both classes), so one value per class would have to admit the most
 /// sensitive model's noise everywhere.
 ///
-/// **Provenance.** Measured 2026-11-18 by `measure_gpu_tolerance` (`tests/gpu_tolerance.rs`) on
-/// branch `feat/gpu-tolerance` from `main` at `8c58ad4e`, Windows 11, AMD proprietary driver
-/// (`driver_version=0x800161` in `infr tune show`) on both devices: `Vulkan0` RX 7900 XTX (RDNA3,
-/// 96 CUs) and `Vulkan1` the Ryzen 9950X3D's integrated GPU (RDNA2, 2 CUs), each native and with
-/// `INFR_FORCE_WAVE64`, tuning rows on and off (on `Vulkan1` a subset: `docs/gpu-tolerance.md`).
-/// Three prompts of 12 to 185 tokens, 32 forced decode steps, prefill at the default chunk and at
-/// 32 rows.
+/// **Provenance.** Measured by `measure_gpu_tolerance` (`tests/gpu_tolerance.rs`, its `PROMPTS`,
+/// `N_DECODE` forced decode steps, prefill at the default chunk and at `SMALL_UBATCH` rows) on
+/// branch `feat/gpu-tolerance`, Windows 11, AMD proprietary driver (`driver_version=0x800161` in
+/// `infr tune show`): `Vulkan0` RX 7900 XTX (RDNA3), native and forced wave64, tuning rows on and
+/// off; `Vulkan1` the Ryzen 9950X3D's integrated GPU (RDNA2), only what `docs/gpu-tolerance.md`
+/// lists. Re-derived 2026-11-18 with the first rows split out.
 ///
-/// **How each value was set**, from the worst legitimate value over every device, configuration,
-/// prompt and phase: KL max and mean times 2; the top-k cosine's distance from 1 times 2 (floored
-/// at 0.01, where the class has no usable cosine at all); the logit deviation times 1.5; the rank
-/// at twice the worst plus one; the near-tie margin at 1.5 times the widest legitimate top-1 miss,
-/// and at least 0.25 nats (float) or 1 nat (int8, q8 KV). Each margin is about the spread between
-/// the two devices for that row, and small enough that the planted bugs the doc lists still fail;
-/// the doc gives both sides of each gap, and the rows where there is none.
+/// **How each value was set**, separately for the first rows and for the rest, from the worst
+/// legitimate value over every device, configuration, prompt and phase: KL max and mean times 2;
+/// the top-k cosine's distance from 1 times 2 (floored at 0.01 where a row has no usable cosine);
+/// the logit deviation times 1.5; the rank at twice the worst plus one; the near-tie margin at 1.5
+/// times the widest legitimate top-1 miss, and at least 0.25 nats (float) or 1 nat (int8, q8 KV).
+/// `docs/gpu-tolerance.md` gives both sides of each gap, and the rows where there is none.
+///
+/// **No ratchet.** A row may be loosened only by its owner, with the measurement that needs it
+/// (device, driver, configuration, the run's printed values) and with the planted bugs of
+/// `docs/gpu-tolerance.md` re-run against the new value, keeping the gap stated there; never to make
+/// a failing run pass without that evidence. A device that lands outside a row is a finding first.
 pub const TABLE: &[Entry] = &[
     row(
         "ERNIE-4.5-0.3B-PT-F16.gguf",
         Float,
-        1.9e-4,
-        7.6e-6,
-        0.9996,
-        3.7e-3,
-        0.25,
-        1,
+        t(1.2e-4, 7.5e-6, 0.9999, 1.4e-3, 0.25, 1),
+        t(1.9e-4, 9.5e-5, 0.9999, 3.7e-3, 0.25, 1),
     ),
     row(
         "ERNIE-4.5-0.3B-PT-Q4_K_M.gguf",
         Float,
-        1.2e-4,
-        1.5e-5,
-        0.9998,
-        3.7e-3,
-        0.25,
-        1,
+        t(1.1e-4, 8.4e-6, 0.9999, 1.7e-3, 0.25, 1),
+        t(1.2e-4, 6.5e-5, 0.9999, 3.7e-3, 0.25, 1),
     ),
     row(
         "ERNIE-4.5-0.3B-PT-Q4_K_M.gguf",
         Int8,
-        4.9e-2,
-        6.8e-3,
-        0.9399,
-        5.7e-2,
-        1.00,
-        5,
+        t(4.9e-2, 6.7e-3, 0.9455, 5.7e-2, 1.00, 5),
+        t(4.9e-2, 8.9e-3, 0.9455, 5.7e-2, 1.00, 5),
     ),
     row(
         "gemma-3-1b-it-Q4_K_M.gguf",
         Float,
-        6.4e-3,
-        4.9e-4,
-        0.9927,
-        2.6e-2,
-        0.25,
-        3,
+        t(6.4e-3, 4.9e-4, 0.9950, 2.6e-2, 0.25, 3),
+        t(6.4e-3, 1.6e-3, 0.9950, 2.6e-2, 0.25, 3),
     ),
+    // A SMOKE CHECK, not a fine one: gemma-3's legitimate int8 distance (worst KL 0.26 from
+    // position 2 on, 0.87 in the first two) is as large as a gross bug's on Qwen3-0.6B, so this
+    // row admits bugs its Float row is there to catch.
     row(
         "gemma-3-1b-it-Q4_K_M.gguf",
         Int8,
-        1.8e0,
-        3.2e-2,
-        0.0100,
-        1.9e-1,
-        2.00,
-        9,
+        t(5.2e-1, 2.7e-2, 0.7106, 1.5e-1, 1.00, 5),
+        t(1.8e0, 1.2e0, 0.0100, 1.9e-1, 2.00, 9),
     ),
     row(
         "LFM3-1.7B-F16.gguf",
         Float,
-        4.2e-4,
-        3.5e-5,
-        0.9997,
-        5.1e-3,
-        0.25,
-        1,
+        t(1.3e-4, 1.3e-5, 0.9999, 2.7e-3, 0.25, 1),
+        t(4.2e-4, 2.3e-4, 0.9997, 5.1e-3, 0.25, 1),
     ),
     row(
         "LFM3-1.7B-Q4_K_M.gguf",
         Float,
-        6.9e-4,
-        3.1e-5,
-        0.9996,
-        7.2e-3,
-        0.25,
-        1,
+        t(5.7e-5, 1.1e-5, 0.9999, 2.9e-3, 0.25, 1),
+        t(6.9e-4, 3.7e-4, 0.9999, 7.2e-3, 0.25, 1),
     ),
     row(
         "LFM3-1.7B-Q4_K_M.gguf",
         Int8,
-        5.8e-2,
-        8.9e-3,
-        0.9518,
-        1.4e-1,
-        1.00,
-        3,
+        t(4.9e-2, 3.8e-3, 0.9591, 6.5e-2, 1.00, 3),
+        t(5.8e-2, 3.3e-2, 0.9591, 1.4e-1, 1.00, 3),
     ),
     row(
         "Qwen3-0.6B-Q4_K_M.gguf",
         Float,
-        8.5e-5,
-        7.3e-6,
-        0.9999,
-        1.9e-3,
-        0.25,
-        1,
+        t(8.5e-5, 7.3e-6, 0.9999, 1.9e-3, 0.25, 1),
+        t(8.5e-5, 8.7e-6, 0.9999, 1.9e-3, 0.25, 1),
     ),
     row(
         "Qwen3-0.6B-Q4_K_M.gguf",
         Int8,
-        7.0e-2,
-        9.2e-3,
-        0.9314,
-        5.2e-2,
-        1.00,
-        5,
+        t(4.5e-2, 4.1e-3, 0.9687, 4.9e-2, 1.00, 5),
+        t(7.0e-2, 3.9e-2, 0.9687, 5.2e-2, 1.00, 5),
     ),
     row(
         "Qwen3-0.6B-Q4_K_M.gguf",
         KvQ8,
-        3.9e-2,
-        2.5e-3,
-        0.9464,
-        3.1e-2,
-        1.00,
-        3,
+        t(3.9e-2, 2.5e-3, 0.9479, 3.1e-2, 1.00, 3),
+        t(3.9e-2, 2.5e-3, 0.9479, 3.1e-2, 1.00, 3),
     ),
     row(
         "Qwen3.5-0.8B-Q4_K_M.gguf",
         Float,
-        2.2e-5,
-        4.2e-6,
-        0.9999,
-        2.1e-3,
-        0.25,
-        1,
+        t(1.8e-5, 2.5e-6, 0.9999, 1.1e-3, 0.25, 1),
+        t(2.2e-5, 1.2e-5, 0.9999, 2.1e-3, 0.25, 1),
     ),
     row(
         "Qwen3.5-0.8B-Q4_K_M.gguf",
         Int8,
-        2.0e-2,
-        2.0e-3,
-        0.9831,
-        5.4e-2,
-        1.00,
-        3,
+        t(2.0e-2, 1.9e-3, 0.9836, 2.7e-2, 1.00, 3),
+        t(2.0e-2, 9.1e-3, 0.9836, 5.4e-2, 1.00, 3),
     ),
     row(
         "synthetic-f16",
         Float,
-        3.5e-3,
-        2.1e-4,
-        0.9963,
-        1.6e-2,
-        0.25,
-        3,
+        t(3.5e-3, 2.1e-4, 0.9963, 1.6e-2, 0.25, 3),
+        t(3.5e-3, 2.1e-4, 0.9963, 1.6e-2, 0.25, 3),
     ),
     row(
         "synthetic-f32",
         Float,
-        6.7e-4,
-        5.9e-5,
-        0.9992,
-        3.9e-3,
-        0.25,
-        1,
+        t(6.7e-4, 5.9e-5, 0.9992, 3.9e-3, 0.25, 1),
+        t(6.7e-4, 5.9e-5, 0.9992, 3.9e-3, 0.25, 1),
     ),
 ];
 
 /// The [`TABLE`] entry for `model` and `class`.
-pub fn tolerance(model: &str, class: PathClass) -> &'static Tolerance {
+pub fn tolerance(model: &str, class: PathClass) -> &'static Entry {
     TABLE
         .iter()
         .find(|e| e.model == model && e.class == class)
-        .map(|e| &e.tol)
         .unwrap_or_else(|| panic!("no tolerance for {model} {class:?}"))
 }
 
@@ -417,21 +377,29 @@ mod tests {
     fn the_table_is_well_formed() {
         assert!(!TABLE.is_empty());
         for (i, e) in TABLE.iter().enumerate() {
-            let t = &e.tol;
+            for t in [&e.steady, &e.first] {
+                assert!(
+                    t.kl_mean > 0.0 && t.kl_mean <= t.kl_max,
+                    "{} {:?}: mean above max",
+                    e.model,
+                    e.class
+                );
+                assert!(
+                    t.topk_cos_min > 0.0 && t.topk_cos_min < 1.0,
+                    "{} {:?}",
+                    e.model,
+                    e.class
+                );
+                assert!(
+                    t.logit_dev_max > 0.0 && t.near_tie > 0.0,
+                    "{} {:?}",
+                    e.model,
+                    e.class
+                );
+            }
+            // The first rows are never held tighter than the rest.
             assert!(
-                t.kl_mean > 0.0 && t.kl_mean <= t.kl_max,
-                "{} {:?}: mean above max",
-                e.model,
-                e.class
-            );
-            assert!(
-                t.topk_cos_min > 0.0 && t.topk_cos_min < 1.0,
-                "{} {:?}",
-                e.model,
-                e.class
-            );
-            assert!(
-                t.logit_dev_max > 0.0 && t.near_tie > 0.0,
+                e.first.kl_max >= e.steady.kl_max,
                 "{} {:?}",
                 e.model,
                 e.class
@@ -444,7 +412,7 @@ mod tests {
                 e.model,
                 e.class
             );
-            assert_eq!(tolerance(e.model, e.class), t);
+            assert_eq!(tolerance(e.model, e.class), e);
         }
     }
 }

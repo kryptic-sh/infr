@@ -1,8 +1,8 @@
 //! The teacher-forced comparison: the CPU reference's greedy run, the same tokens forced through
 //! another backend, and the two scored with `infr_llama::tolerance`.
 
-use infr_llama::seam::{ForcedLogits, ForcedOn};
-use infr_llama::tolerance::{tolerance, PathClass, RunScore, MIN_TOP1_SCORED};
+use infr_llama::seam::{ForcedLogits, ForcedOn, PrefillHead};
+use infr_llama::tolerance::{tolerance, PathClass, RunScore, FIRST_ROWS, MIN_TOP1_SCORED};
 use infr_llama::{EngineConfig, SeamModel};
 use infr_testkit::gguf::{Fill, Meta, SyntheticModel, TempGguf, TensorSpec};
 
@@ -97,6 +97,8 @@ pub const MODELS: &[(&str, &str, &str)] = &[
 pub struct Case {
     pub model: SeamModel,
     pub prompts: Vec<Vec<u32>>,
+    /// The model file's size, for the host-memory check on unified-memory devices.
+    pub bytes: u64,
     /// The synthetic model's file, kept for as long as the model maps it.
     _file: Option<TempGguf>,
 }
@@ -105,13 +107,36 @@ pub struct Case {
 /// `synthetic-f16` ([`synthetic_llama`] with f32 or f16 projections; prompts of the same three
 /// lengths, as ids); `None` when a cached model is not downloaded.
 pub fn open_case(key: &str) -> Option<Case> {
+    open_case_scaled(key, None)
+}
+
+/// [`open_case`], for a synthetic model with one tensor's values multiplied by a factor
+/// (`(tensor name, factor)`): the planted bug of the red-path tests, made in the model file rather
+/// than in any backend, so the backend under test runs its production code on wrong weights.
+pub fn open_case_scaled(key: &str, scaled: Option<(&str, f32)>) -> Option<Case> {
     let weights = match key {
         "synthetic-f32" => Some(Fill::Rand(0.0)),
         "synthetic-f16" => Some(Fill::ExactF16(Vec::new())),
         _ => None,
     };
     if let Some(w) = weights {
-        let file = TempGguf::write(&format!("tolerance-{key}"), &synthetic_llama(w));
+        let mut m = synthetic_llama(w);
+        let mut tag = format!("tolerance-{key}");
+        if let Some((name, factor)) = scaled {
+            let t = m
+                .tensors
+                .iter_mut()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("no tensor {name}"));
+            let v: Vec<f32> = t.values().iter().map(|x| x * factor).collect();
+            t.fill = match t.fill {
+                Fill::ExactF16(_) => Fill::ExactF16(v),
+                _ => Fill::Exact(v),
+            };
+            tag = format!("{tag}-{name}-x{factor}");
+        }
+        let file = TempGguf::write(&tag, &m);
+        let bytes = std::fs::metadata(file.path()).map_or(0, |md| md.len());
         let model = SeamModel::load_with(file.path(), None, std::sync::Arc::new(env_cfg()))
             .expect("synthetic model load");
         let prompts = [12usize, 34, 180]
@@ -126,10 +151,14 @@ pub fn open_case(key: &str) -> Option<Case> {
         return Some(Case {
             model,
             prompts,
+            bytes,
             _file: Some(file),
         });
     }
-    let model = load(&find_model(key)?);
+    assert!(scaled.is_none(), "only a synthetic model can be scaled");
+    let path = find_model(key)?;
+    let bytes = std::fs::metadata(&path).map_or(0, |md| md.len());
+    let model = load(&path);
     let prompts = PROMPTS
         .iter()
         .map(|t| model.encode(t).expect("encode"))
@@ -137,6 +166,7 @@ pub fn open_case(key: &str) -> Option<Case> {
     Some(Case {
         model,
         prompts,
+        bytes,
         _file: None,
     })
 }
@@ -186,13 +216,14 @@ pub fn argmax(row: &[f32]) -> u32 {
 
 /// The CPU reference's greedy run on `prompt`: [`N_DECODE`] tokens, the logits at every
 /// position.
-pub fn reference(model: &SeamModel, prompt: &[u32], n: usize) -> ForcedLogits {
+pub fn forced_reference(model: &SeamModel, prompt: &[u32], n: usize) -> ForcedLogits {
     model
         .forced_logits(
             ForcedOn::CpuReference,
             |_| {},
             prompt,
             n,
+            PrefillHead::All,
             |_, row| argmax(row),
         )
         .expect("cpu reference run")
@@ -205,13 +236,33 @@ pub fn forced(
     edit: impl FnOnce(&mut EngineConfig),
     reference: &ForcedLogits,
 ) -> ForcedLogits {
-    let p = reference.seq.len() - (reference.positions.len() - reference.prefill_rows);
+    forced_with(model, on, edit, PrefillHead::All, reference)
+}
+
+/// [`forced`] scoring the prefill rows `head` names.
+pub fn forced_with(
+    model: &SeamModel,
+    on: ForcedOn,
+    edit: impl FnOnce(&mut EngineConfig),
+    head: PrefillHead,
+    reference: &ForcedLogits,
+) -> ForcedLogits {
     let steps = reference.positions.len() - reference.prefill_rows;
+    let p = reference.seq.len() - steps;
     let got = model
-        .forced_logits(on, edit, &reference.seq[..p], steps, |s, _| {
+        .forced_logits(on, edit, &reference.seq[..p], steps, head, |s, _| {
             reference.seq[p + s]
         })
         .unwrap_or_else(|e| panic!("forced run on {on:?}: {e:#}"));
+    if head != PrefillHead::All {
+        assert!(
+            got.positions
+                .iter()
+                .all(|q| reference.positions.contains(q)),
+            "{on:?} scored positions the reference has no row for"
+        );
+        return got;
+    }
     assert_eq!(
         got.seq, reference.seq,
         "{on:?} was not fed the reference's tokens"
@@ -223,44 +274,71 @@ pub fn forced(
     got
 }
 
-/// One comparison, split by the path the rows came from.
+/// One comparison, split by where the rows came from: the first [`FIRST_ROWS`] positions (whose
+/// hidden states carry a model's largest activations, and which every quantized path misses by
+/// the most), the rest of the batched prefill's rows, and the decode steps' rows.
 pub struct Scored {
+    pub first: RunScore,
     pub prefill: RunScore,
     pub decode: RunScore,
 }
 
 impl Scored {
-    pub fn all(&self) -> RunScore {
-        let mut a = self.prefill.clone();
-        a.merge(&self.decode);
-        a
+    /// The three phases with their names, first rows first.
+    pub fn phases(&self) -> [(&'static str, &RunScore); 3] {
+        [
+            ("first", &self.first),
+            ("prefill", &self.prefill),
+            ("decode", &self.decode),
+        ]
     }
 }
 
-/// Score `test` against `reference`, prefill rows and decode rows separately.
-pub fn score(reference: &ForcedLogits, test: &ForcedLogits, near_tie: f64) -> Scored {
-    assert_eq!(reference.positions, test.positions);
-    assert_eq!(reference.prefill_rows, test.prefill_rows);
-    let (v, pr) = (reference.vocab, reference.prefill_rows);
-    let mut prefill = RunScore::new(near_tie);
-    prefill
-        .add_rows(
-            &reference.logits[..pr * v],
-            &test.logits[..pr * v],
-            v,
-            &reference.positions[..pr],
-        )
-        .unwrap_or_else(|e| panic!("prefill: {e}"));
-    let mut decode = RunScore::new(near_tie);
-    decode
-        .add_rows(
-            &reference.logits[pr * v..],
-            &test.logits[pr * v..],
-            v,
-            &reference.positions[pr..],
-        )
-        .unwrap_or_else(|e| panic!("decode: {e}"));
-    Scored { prefill, decode }
+/// Score every row of `test` against the reference's row at the same position: the first rows at
+/// the `near_first` near-tie margin, the rest at `near_steady`. `test` may score a subset of the
+/// reference's prefill positions ([`PrefillHead::LastOfChunk`]); its decode rows are the
+/// reference's.
+pub fn score(
+    reference: &ForcedLogits,
+    test: &ForcedLogits,
+    near_steady: f64,
+    near_first: f64,
+) -> Scored {
+    let v = reference.vocab;
+    let ref_decode = &reference.positions[reference.prefill_rows..];
+    assert_eq!(
+        &test.positions[test.prefill_rows..],
+        ref_decode,
+        "decode positions differ"
+    );
+    let mut s = Scored {
+        first: RunScore::new(near_first),
+        prefill: RunScore::new(near_steady),
+        decode: RunScore::new(near_steady),
+    };
+    for (r, &pos) in test.positions.iter().enumerate() {
+        let k = reference
+            .positions
+            .iter()
+            .position(|&q| q == pos)
+            .unwrap_or_else(|| panic!("the reference has no row at position {pos}"));
+        let phase = if pos < FIRST_ROWS {
+            &mut s.first
+        } else if r < test.prefill_rows {
+            &mut s.prefill
+        } else {
+            &mut s.decode
+        };
+        phase
+            .add_rows(
+                &reference.logits[k * v..(k + 1) * v],
+                &test.logits[r * v..(r + 1) * v],
+                v,
+                &[pos],
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+    s
 }
 
 /// One machine-readable line per phase, for the measurement log.
@@ -285,11 +363,12 @@ pub fn line(tag: &str, s: &Scored) -> String {
             r.kl.worst.pos,
         )
     };
-    format!(
-        "{}\n{}",
-        one("prefill", &s.prefill),
-        one("decode", &s.decode)
-    )
+    s.phases()
+        .iter()
+        .filter(|(_, r)| r.positions > 0)
+        .map(|(p, r)| one(p, r))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Turn every int8-activation Vulkan kernel off: the int8 coopmat and dp4a K-quant prefill GEMMs,
@@ -336,6 +415,14 @@ pub const GPU_CONFIGS: &[GpuConfig] = &[
         None,
     ),
     (
+        "gpu-float-static",
+        |c| {
+            vulkan_float(c);
+            c.kernels.vulkan.no_replay = true;
+        },
+        None,
+    ),
+    (
         "gpu-kv-q8",
         |c| kv_types(c, "q8_0", "q8_0"),
         Some(("q8_0", "q8_0")),
@@ -373,16 +460,37 @@ pub fn measure(key: &str) {
         .ok()
         .map(|v| v.split(',').map(str::to_string).collect());
     let no_replay = std::env::var_os("INFR_TOL_NO_REPLAY").is_some();
+    // Diagnosis knobs: the submit-splitter cap, the prefill chunk height, which prefill rows get
+    // the harness's head, and which prompts run.
+    let env_usize = |k: &str| std::env::var(k).ok().map(|v| v.parse::<usize>().expect(k));
+    let submit = env_usize("INFR_TOL_SUBMIT");
+    let ubatch = env_usize("INFR_TOL_UBATCH");
+    let head = match std::env::var("INFR_TOL_HEAD").as_deref() {
+        Ok("last") => PrefillHead::LastOfChunk,
+        Ok("off") => PrefillHead::Off,
+        _ => PrefillHead::All,
+    };
+    let prompts: Option<Vec<usize>> = std::env::var("INFR_TOL_PROMPTS").ok().map(|v| {
+        v.split(',')
+            .map(|i| i.parse().expect("prompt index"))
+            .collect()
+    });
     let model = &case.model;
     for (pi, ids) in case.prompts.iter().enumerate() {
+        if prompts.as_ref().is_some_and(|p| !p.contains(&pi)) {
+            continue;
+        }
         let t0 = std::time::Instant::now();
-        let r = reference(model, ids, N_DECODE);
+        let r = forced_reference(model, ids, N_DECODE);
         let t_ref = t0.elapsed();
         let t0 = std::time::Instant::now();
         let prod = forced(model, ForcedOn::Cpu, |_| {}, &r);
         let t_prod = t0.elapsed();
         let tag = |what: &str| format!("model={key} prompt={pi} len={} {what}", ids.len());
-        println!("{}", line(&tag("pair=cpuprod-ref"), &score(&r, &prod, 0.0)));
+        println!(
+            "{}",
+            line(&tag("pair=cpuprod-ref"), &score(&r, &prod, 0.0, 0.0))
+        );
         for &(name, edit, kv) in GPU_CONFIGS {
             if only.as_ref().is_some_and(|o| !o.iter().any(|n| n == name)) {
                 continue;
@@ -392,13 +500,20 @@ pub fn measure(key: &str) {
                 Some((k, v)) => forced(model, ForcedOn::CpuReference, |c| kv_types(c, k, v), &r),
             };
             let t0 = std::time::Instant::now();
-            let g = forced(
+            let g = forced_with(
                 model,
                 ForcedOn::Vulkan,
                 |c| {
                     edit(c);
                     c.kernels.vulkan.no_replay |= no_replay;
+                    if submit.is_some() {
+                        c.device.submit_dispatches = submit;
+                    }
+                    if ubatch.is_some() {
+                        c.device.ubatch = ubatch;
+                    }
                 },
+                head,
                 &r,
             );
             let t_gpu = t0.elapsed();
@@ -406,14 +521,14 @@ pub fn measure(key: &str) {
                 "{}",
                 line(
                     &tag(&format!("pair={name}-ref")),
-                    &score(&reference, &g, 0.0)
+                    &score(&reference, &g, 0.0, 0.0)
                 )
             );
             println!(
                 "{}",
                 line(
                     &tag(&format!("pair={name}-cpuprod")),
-                    &score(&prod, &g, 0.0)
+                    &score(&prod, &g, 0.0, 0.0)
                 )
             );
             eprintln!("time {key} prompt {pi} {name}: {:.1}s", t_gpu.as_secs_f64());
@@ -426,13 +541,93 @@ pub fn measure(key: &str) {
     }
 }
 
+/// The longest one tolerance test may run. A forced run that stops making progress (the
+/// integrated GPU's long Float runs did, B207) fails the test with a message saying so, rather
+/// than holding the gate until someone notices.
+pub const GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Fails the whole test process with a message if it is still alive when the deadline passes;
+/// dropping it disarms it. Each nextest test is its own process, so this ends only the test it
+/// guards.
+pub struct Watchdog(Option<std::sync::mpsc::Sender<()>>);
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        // Closing the channel wakes the watcher, which then exits quietly.
+        self.0.take();
+    }
+}
+
+/// Arm a [`Watchdog`] for `what` with the deadline `limit`.
+pub fn watchdog(what: &str, limit: std::time::Duration) -> Watchdog {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let what = what.to_string();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(limit) {
+            eprintln!(
+                "FAIL: {what} still running after {} s: a hang, not a tolerance result; \
+                 stopping the test process (docs/backlog.md B207)",
+                limit.as_secs()
+            );
+            std::process::exit(1);
+        }
+    });
+    Watchdog(Some(tx))
+}
+
+/// What the harness changes for its int8-off runs on an integrated GPU: the prefill head on each
+/// chunk's last row only ([`PrefillHead::LastOfChunk`]) and a submit-splitter cap of this many
+/// dispatches (`device.submit_dispatches`). A HARNESS WORKAROUND for a production weakness, not a
+/// fix. The harness's prefill head is a vocabulary-wide float GEMM over every chunk row, the
+/// heaviest dispatch any of these runs makes; with the int8 kernels off, a submit holding it
+/// outlasted the integrated GPU's watchdog (Qwen3.5-0.8B, 180-token prompt: stuck at caps 128 and
+/// 16, a lost device at 8, completion at 4, with the head on the last row only, or with no head;
+/// gemma-3-1b stayed stuck even at cap 4, its head over 128 rows being one dispatch). The splitter
+/// bounds dispatches per submit, not work per submit: `docs/plan/12-low-capability-vulkan.md`
+/// section 0b and B207. The prefill phase of those runs then scores one row per chunk, too few for
+/// [`MIN_TOP1_SCORED`], which is not asked of it.
+pub const INTEGRATED_FLOAT_SUBMIT_CAP: usize = 4;
+
+/// Whether a configuration runs with every int8-activation kernel off (see
+/// [`INTEGRATED_FLOAT_SUBMIT_CAP`]).
+fn int8_off(config: &str) -> bool {
+    config.contains("float")
+}
+
+/// Host bytes a model resident on a unified-memory device takes per byte of its file, and the
+/// headroom left for everything else on the machine: `cpu_backend`'s `UNIFIED_RESIDENT_FACTOR` and
+/// `UNIFIED_HOST_MARGIN`, the measured figures for a resident load. A run that cannot have both
+/// is skipped rather than left to starve the host.
+const UNIFIED_RESIDENT_FACTOR: u64 = 2;
+const UNIFIED_HOST_MARGIN: u64 = 12 << 30;
+
+/// The device the tests load on, if a Vulkan backend opens: `(integrated, name)`.
+fn test_device() -> Option<(bool, String)> {
+    infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(
+        env_cfg(),
+    )))?;
+    let dev = infr_vulkan::VulkanBackend::enumerate_devices(&env_cfg())
+        .ok()?
+        .into_iter()
+        .find(|d| d.is_default_pick)?;
+    Some((
+        dev.integrated,
+        format!("Vulkan{} ({})", dev.index, dev.name),
+    ))
+}
+
 /// The gate: on every prompt of the `key` model, each named [`GPU_CONFIGS`] entry must be within
-/// the tolerance table's entry for (`key`, its class) of the CPU reference, on the prefill rows
-/// and on the decode rows alike; over the whole case, at least
-/// [`infr_llama::tolerance::MIN_TOP1_SCORED`] positions must clear the near-tie margin. Skips
-/// without the model (failing instead under `INFR_TEST_REQUIRE_MODELS`) or without a Vulkan
-/// device. Prints every measured value, so a new device's numbers can be read off the log.
+/// the tolerance table's entry for (`key`, its class) of the CPU reference: the first
+/// [`FIRST_ROWS`] positions within its `first` bound, the batched prefill's other rows and the
+/// decode rows each within its `steady` bound, and each of those two phases must score at least
+/// [`MIN_TOP1_SCORED`] positions above the near-tie margin. Skips, with a printed line, without
+/// the model (failing instead under `INFR_TEST_REQUIRE_MODELS`), without a Vulkan device, and on
+/// an integrated device without the host memory for the model. On an integrated device the int8-off
+/// runs take the [`INTEGRATED_FLOAT_SUBMIT_CAP`] workaround, said in the log. Fails a run that outlives
+/// [`GATE_TIMEOUT`]. Prints every measured value, so a new device's numbers can be read off the
+/// log.
 pub fn gate(key: &str, runs: &[(&str, PathClass)]) {
+    let _guard = watchdog(&format!("the {key} tolerance case"), GATE_TIMEOUT);
     let Some(case) = open_case(key) else {
         assert!(
             std::env::var_os("INFR_TEST_REQUIRE_MODELS").is_none(),
@@ -441,73 +636,153 @@ pub fn gate(key: &str, runs: &[(&str, PathClass)]) {
         eprintln!("skip: {key} not in the HF cache");
         return;
     };
-    if infr_testkit::gpu_or_skip(infr_vulkan::VulkanBackend::new_with(std::sync::Arc::new(
-        env_cfg(),
-    )))
-    .is_none()
-    {
+    let Some((integrated, device)) = test_device() else {
         eprintln!("skip: no Vulkan device");
         return;
+    };
+    if integrated {
+        let need = case.bytes * UNIFIED_RESIDENT_FACTOR + UNIFIED_HOST_MARGIN;
+        match infr_core::hostmem::available_bytes() {
+            Some(avail) if avail >= need => {}
+            avail => {
+                eprintln!(
+                    "skip: {key} on {device}, a unified-memory device, needs {:.1} GB of free host \
+                     memory ({UNIFIED_RESIDENT_FACTOR} x the model + a {:.1} GB margin); {} free",
+                    need as f64 / 1e9,
+                    UNIFIED_HOST_MARGIN as f64 / 1e9,
+                    avail.map_or("unknown".to_string(), |a| format!("{:.1} GB", a as f64 / 1e9)),
+                );
+                return;
+            }
+        }
+    }
+    if integrated && runs.iter().any(|&(name, _)| int8_off(name)) {
+        eprintln!(
+            "note: {key} on {device}: the int8-off runs score the prefill on each chunk's last \
+             row only and take a submit cap of {INTEGRATED_FLOAT_SUBMIT_CAP} dispatches, a \
+             harness workaround (docs/backlog.md B207)"
+        );
     }
     let t_case = std::time::Instant::now();
-    let mut failures = Vec::new();
-    let mut merged: Vec<Option<RunScore>> = vec![None; runs.len()];
-    for (pi, ids) in case.prompts.iter().enumerate() {
-        let r = reference(&case.model, ids, N_DECODE);
-        for (ri, &(name, class)) in runs.iter().enumerate() {
-            let &(_, edit, kv) = GPU_CONFIGS
-                .iter()
-                .find(|c| c.0 == name)
-                .unwrap_or_else(|| panic!("no configuration {name:?}"));
-            let tol = tolerance(table_name(key), class);
-            let reference = match kv {
-                None => r.clone(),
-                Some((k, v)) => forced(
-                    &case.model,
-                    ForcedOn::CpuReference,
-                    |c| kv_types(c, k, v),
-                    &r,
-                ),
-            };
-            let g = forced(&case.model, ForcedOn::Vulkan, edit, &r);
-            let s = score(&reference, &g, tol.near_tie);
-            for (phase, ps) in [("prefill", &s.prefill), ("decode", &s.decode)] {
-                println!(
-                    "{key} {name} ({class:?}) prompt {pi} ({} tokens), {phase}:\n{}",
-                    ids.len(),
-                    ps.report()
-                );
-                for v in tol.violations(ps) {
-                    failures.push(format!("{name} prompt {pi} {phase}: {v}"));
-                }
-            }
-            let all = s.all();
-            match &mut merged[ri] {
-                Some(m) => m.merge(&all),
-                slot => *slot = Some(all),
-            }
-        }
-    }
-    for (&(name, _), m) in runs.iter().zip(&merged) {
-        let m = m.as_ref().expect("every run scored");
-        if m.top1_scored < MIN_TOP1_SCORED {
-            failures.push(format!(
-                "{name}: only {} of {} positions clear the {}-nat near-tie margin (at least \
-                 {MIN_TOP1_SCORED} needed, or the top-1 check is vacuous)",
-                m.top1_scored, m.positions, m.near_tie
-            ));
-        }
-    }
+    let failures = evaluate_on(key, &case, &case, ForcedOn::Vulkan, runs, integrated);
     eprintln!(
-        "time {key}: {:.1}s on {}",
-        t_case.elapsed().as_secs_f64(),
-        std::env::var("INFR_DEV").unwrap_or_else(|_| "the default device".into())
+        "time {key}: {:.1}s on {device}",
+        t_case.elapsed().as_secs_f64()
     );
     assert!(
         failures.is_empty(),
         "{key} is outside the GPU tolerance of the CPU reference:\n  {}",
         failures.join("\n  ")
     );
+}
+
+/// Score each run of `test` (driven on `on`) against the CPU reference's run of `reference` along
+/// the reference's own greedy tokens, against the table's entry for `key`; return every limit
+/// that was crossed, described. The two cases differ only in the red-path tests, where `test`
+/// carries a planted bug.
+pub fn evaluate(
+    key: &str,
+    reference: &Case,
+    test: &Case,
+    on: ForcedOn,
+    runs: &[(&str, PathClass)],
+) -> Vec<String> {
+    evaluate_on(key, reference, test, on, runs, false)
+}
+
+/// [`evaluate`], with the int8-off runs on the [`INTEGRATED_FLOAT_SUBMIT_CAP`] workaround when
+/// `integrated`.
+fn evaluate_on(
+    key: &str,
+    reference: &Case,
+    test: &Case,
+    on: ForcedOn,
+    runs: &[(&str, PathClass)],
+    integrated: bool,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    // Per run, the steady phases merged over every prompt, for the top-1 count.
+    let mut merged: Vec<[Option<RunScore>; 2]> = vec![[None, None]; runs.len()];
+    for (pi, ids) in reference.prompts.iter().enumerate() {
+        let r = forced_reference(&reference.model, ids, N_DECODE);
+        for (ri, &(name, class)) in runs.iter().enumerate() {
+            let &(_, edit, kv) = GPU_CONFIGS
+                .iter()
+                .find(|c| c.0 == name)
+                .unwrap_or_else(|| panic!("no configuration {name:?}"));
+            let entry = tolerance(table_name(key), class);
+            let reference_run = match kv {
+                None => r.clone(),
+                Some((k, v)) => forced(
+                    &reference.model,
+                    ForcedOn::CpuReference,
+                    |c| kv_types(c, k, v),
+                    &r,
+                ),
+            };
+            let capped = integrated && int8_off(name);
+            let g = forced_with(
+                &test.model,
+                on,
+                |c| {
+                    edit(c);
+                    if capped {
+                        c.device.submit_dispatches = Some(INTEGRATED_FLOAT_SUBMIT_CAP);
+                    }
+                },
+                if capped {
+                    PrefillHead::LastOfChunk
+                } else {
+                    PrefillHead::All
+                },
+                &r,
+            );
+            let s = score(
+                &reference_run,
+                &g,
+                entry.steady.near_tie,
+                entry.first.near_tie,
+            );
+            for (phase, ps) in s.phases() {
+                if ps.positions == 0 {
+                    continue;
+                }
+                println!(
+                    "{key} {name} ({class:?}) prompt {pi} ({} tokens), {phase}:\n{}",
+                    ids.len(),
+                    ps.report()
+                );
+                let tol = if phase == "first" {
+                    &entry.first
+                } else {
+                    &entry.steady
+                };
+                for v in tol.violations(ps) {
+                    failures.push(format!("{name} prompt {pi} {phase}: {v}"));
+                }
+            }
+            for (slot, ps) in merged[ri].iter_mut().zip([&s.prefill, &s.decode]) {
+                match slot {
+                    Some(m) => m.merge(ps),
+                    None => *slot = Some(ps.clone()),
+                }
+            }
+        }
+    }
+    for (&(name, _), m) in runs.iter().zip(&merged) {
+        for (phase, ps) in ["prefill", "decode"].iter().zip(m) {
+            let ps = ps.as_ref().expect("every run scored");
+            let one_row_per_chunk = *phase == "prefill" && integrated && int8_off(name);
+            if ps.top1_scored < MIN_TOP1_SCORED && !one_row_per_chunk {
+                failures.push(format!(
+                    "{name} {phase}: only {} of {} positions clear the {}-nat near-tie margin \
+                     (at least {MIN_TOP1_SCORED} needed, or the top-1 check is vacuous)",
+                    ps.top1_scored, ps.positions, ps.near_tie
+                ));
+            }
+        }
+    }
+    failures
 }
 
 // ─── the driver's own check ──────────────────────────────────────────────────────
@@ -620,7 +895,7 @@ pub fn self_check_on_a_synthetic_llama() {
     .expect("synthetic model load");
     let prompt: Vec<u32> = (0..24).map(|i| (i * 7 + 3) % 64).collect();
     let n = 10;
-    let r = reference(&model, &prompt, n);
+    let r = forced_reference(&model, &prompt, n);
     assert_eq!(r.prefill_rows, prompt.len() - 1);
     assert_eq!(r.positions, (0..prompt.len() - 1 + n).collect::<Vec<_>>());
     assert_eq!(r.seq.len(), prompt.len() + n);
@@ -642,6 +917,7 @@ pub fn self_check_on_a_synthetic_llama() {
             |_| {},
             &r.seq[..prompt.len() + 4],
             n - 4,
+            PrefillHead::All,
             |s, _| r.seq[prompt.len() + 4 + s],
         )
         .expect("longer prompt");
@@ -657,9 +933,9 @@ pub fn self_check_on_a_synthetic_llama() {
     // The production CPU, forced along the same tokens, quantizes its activations to int8: the
     // metrics must see a distance, or the run never reached the backend it names.
     let prod = forced(&model, ForcedOn::Cpu, |_| {}, &r);
-    let s = score(&r, &prod, 0.0).all();
+    let s = score(&r, &prod, 0.0, 0.0);
     assert!(
-        s.kl.worst.value > 0.0,
+        s.phases().iter().any(|(_, p)| p.kl.worst.value > 0.0),
         "production CPU matched the reference bit for bit"
     );
 }

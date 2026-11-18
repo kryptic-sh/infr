@@ -4309,6 +4309,19 @@ pub enum ForcedOn {
     Vulkan,
 }
 
+/// Which prefill rows a teacher-forced run scores ([`crate::SeamModel::forced_logits`]). Each
+/// scored row costs a vocabulary-wide head the production prefill never runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillHead {
+    /// Every prompt row before the frontier.
+    All,
+    /// The last row of each prefill chunk.
+    LastOfChunk,
+    /// No prefill row: the batched prefill runs exactly as in production, and only the decode
+    /// rows are scored.
+    Off,
+}
+
 /// What a teacher-forced run produced: the logits at every position it scored, in position
 /// order. See [`crate::SeamModel::forced_logits`].
 #[derive(Clone, Debug)]
@@ -4324,6 +4337,9 @@ pub struct ForcedLogits {
     pub prefill_rows: usize,
     /// The whole sequence the run fed: the prompt, then each forced token.
     pub seq: Vec<u32>,
+    /// The compute kernels the backend built for the run (Vulkan; empty on the CPU), so a test
+    /// can assert which kernel families a configuration actually reached.
+    pub kernels: Vec<&'static str>,
 }
 
 /// Drive `prompt` and then `n_steps` forced tokens through `be`, capturing the logits at every
@@ -4335,9 +4351,12 @@ pub struct ForcedLogits {
 /// step. `next(step, row)` picks the token fed after each decode row: the reference's greedy
 /// argmax, or the reference's recorded token when the backend under test is forced along it.
 ///
-/// The decode step is the per-token path (the record-once replay where the backend has one); a
-/// chained decode runs the same graph several steps per submit and is not exercised, since
-/// reading every step's logits back is what forcing needs.
+/// The decode step is the per-token path: where the backend replays, each step is a warm call that
+/// builds, records and executes a fresh replay plan once, so the record-once-replay-many mechanism
+/// (parameters advancing across replays of one recording) and the chained decode (several steps
+/// per submit, the production greedy path) are NOT exercised; the static per-token path runs when
+/// the configuration sets `kernels.vulkan.no_replay`. Forcing needs every step's logits, which the
+/// chain does not read back.
 ///
 /// A model whose prompt takes no batched prefill (MoE without the batched kernels, gemma-4 E2B)
 /// returns no prefill rows; its prompt positions are not scored.
@@ -4352,6 +4371,7 @@ pub(crate) fn forced_run(
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     n_steps: usize,
+    head: PrefillHead,
     mut next: impl FnMut(usize, &[f32]) -> u32,
 ) -> AResult<ForcedLogits> {
     if prompt.len() < 4 {
@@ -4362,7 +4382,10 @@ pub(crate) fn forced_run(
     }
     let want_ctx = prompt.len() + n_steps + 2;
     let mut state = None;
-    let mut pf = Vec::new();
+    let mut tap = runner::PrefillTap {
+        last_only: head == PrefillHead::LastOfChunk,
+        ..Default::default()
+    };
     runner::generate_dense_backend_bound(
         None,
         be,
@@ -4384,21 +4407,30 @@ pub(crate) fn forced_run(
         None,
         None,
         None,
-        Some(&mut pf),
+        (head != PrefillHead::Off).then_some(&mut tap),
     )?;
     let vocab = cfg.vocab;
-    if !pf.len().is_multiple_of(vocab) {
-        return Err(anyhow!("prefill logits are not whole rows of {vocab}"));
-    }
-    let prefill_rows = pf.len() / vocab;
-    if prefill_rows != 0 && prefill_rows != prompt.len() - 1 {
+    let prefill_rows = tap.positions.len();
+    if tap.logits.len() != prefill_rows * vocab {
         return Err(anyhow!(
-            "the batched prefill returned {prefill_rows} rows for a {}-token prompt",
+            "prefill logits are not one row of {vocab} per position"
+        ));
+    }
+    // Every row the head ran must be a prompt position before the frontier, in order, and an
+    // every-row head must have covered all of them.
+    let in_order = tap.positions.windows(2).all(|w| w[0] < w[1])
+        && tap.positions.last().is_none_or(|&p| p + 2 == prompt.len());
+    if !in_order
+        || (head == PrefillHead::All && prefill_rows != 0 && prefill_rows != prompt.len() - 1)
+    {
+        return Err(anyhow!(
+            "the batched prefill returned rows at {:?} for a {}-token prompt",
+            tap.positions,
             prompt.len()
         ));
     }
-    let mut positions: Vec<usize> = (0..prefill_rows).collect();
-    let mut logits = pf;
+    let mut positions = tap.positions;
+    let mut logits = tap.logits;
     let mut seq = prompt.to_vec();
     for step in 0..n_steps {
         let mut row = Vec::new();
@@ -4449,6 +4481,7 @@ pub(crate) fn forced_run(
         vocab,
         prefill_rows,
         seq,
+        kernels: Vec::new(),
     })
 }
 
@@ -4463,6 +4496,7 @@ pub(crate) fn forced_run_cpu(
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     n_steps: usize,
+    head: PrefillHead,
     next: impl FnMut(usize, &[f32]) -> u32,
 ) -> AResult<ForcedLogits> {
     let be = if reference {
@@ -4472,7 +4506,7 @@ pub(crate) fn forced_run_cpu(
     };
     let bind = cpu_upload_bind(&be);
     forced_run(
-        &be, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, next,
+        &be, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, head, next,
     )
 }
 
@@ -4486,14 +4520,17 @@ pub(crate) fn forced_run_vulkan(
     ple: Option<&PerLayerEmbd>,
     prompt: &[u32],
     n_steps: usize,
+    head: PrefillHead,
     next: impl FnMut(usize, &[f32]) -> u32,
 ) -> AResult<ForcedLogits> {
     let vk = infr_vulkan::VulkanBackend::new_with(ec.clone())
         .map_err(|e| anyhow!("vulkan init: {e}"))?;
     let bind = vulkan_upload_bind(&vk);
-    forced_run(
-        &vk, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, next,
-    )
+    let mut out = forced_run(
+        &vk, &bind, g, cfg, ec, token_embd, ple, prompt, n_steps, head, next,
+    )?;
+    out.kernels = vk.built_kernel_names();
+    Ok(out)
 }
 
 /// Backend-generic dense decode runner. Builds the agnostic decode [`Graph`] per token and runs it

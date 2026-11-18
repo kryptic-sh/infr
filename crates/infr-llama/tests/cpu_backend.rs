@@ -367,8 +367,11 @@ fn gpu_seam_matches_cpu_qwen2() {
 // platform: the CPU's transcendental functions are `infr_core::math`'s, not the C runtime's, so
 // Windows and Linux compute the same bits (re-blessed 2026-11-17, identical natively on Windows
 // and under WSL; before that the last two cases had a Windows and a Linux hash).
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): the France and ocean
+// cases changed wording ("I need to make sure I recall" became "Let me think. I know that"); identical
+// natively on Windows and under WSL.
 const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xfd63781ea3bfa785),
+    ("The capital of France is", 32, 0x9e2c6fdd3c0e685c),
     (
         "Explain how a computer works in simple terms.",
         48,
@@ -377,7 +380,7 @@ const QWEN3_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Write a short paragraph about the ocean.",
         48,
-        0x92ef4b86905d27dc,
+        0x4633cde866aac685,
     ),
 ];
 
@@ -1737,11 +1740,14 @@ fn gpu_seam_bf16_matches_cpu() {
 // verified coherent at capture). Missing quants are skipped. Refresh with `INFR_BLESS=1`.
 // All verified coherent at capture — every quant recalls "France's capital is Paris" (Q2_K is a
 // touch repetitive, as expected for 2-bit; the float-ish quants still converge: Q5_K==Q8_0==BF16).
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): Q4_K_M changed with
+// `QWEN3_GOLDEN`'s France case; the other quants are not cached here and were not re-run; identical
+// natively on Windows and under WSL.
 const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
     ("IQ4_XS", 32, 0xd028ff03b524cb28),
     ("Q2_K", 32, 0x6442c2818c12ca56),
     ("Q4_0", 32, 0x88221dcfca820246),
-    ("Q4_K_M", 32, 0xfd63781ea3bfa785),
+    ("Q4_K_M", 32, 0x9e2c6fdd3c0e685c),
     ("Q5_K_M", 32, 0x4e510646d603bc03),
     ("Q6_K", 32, 0xb68f96c3aa8d22fe),
     ("Q8_0", 32, 0xb68f96c3aa8d22fe),
@@ -1809,12 +1815,15 @@ fn llama32_1b() -> Option<PathBuf> {
 // Re-blessed the same day for `infr_core::math` (correctly rounded transcendentals in place of
 // the C runtime's): the knight story's text changed, the France case kept its hash; identical
 // natively on Windows and under WSL.
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): the knight story's
+// stated tone changed ("melancholic and thoughtful" became "melancholic but ultimately hopeful"); identical
+// natively on Windows and under WSL.
 const GEMMA3_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0xe5a37ab078db3a2c),
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x4f1efdec82f477e5,
+        0x46bc4897f81235db,
     ),
 ];
 
@@ -1849,17 +1858,20 @@ fn smollm3_render(model: &infr_llama::SeamModel, prompt: &str) -> String {
         .expect("render chat")
 }
 
-// Captured + verified coherent: "The capital of France is Paris." (infr ends the turn there), and
-// an ocean paragraph ("The ocean is a vast and mysterious world, teeming with life …"). Both cases
-// are the short length that stays OS-stable for the other models here; captured on Windows only.
+// Captured + verified coherent: "The capital of France is Paris. Paris is a city known for its rich
+// history, art, fashion, and cuisine. …", and an ocean paragraph ("The ocean is a vast and
+// mysterious world, teeming with life …"). Re-blessed 2026-11-18 for the int8 activation split
+// (`docs/cpu-activations.md`): the France case used to end the turn after "Paris."; the ocean case
+// kept its hash. Identical natively on Windows and under WSL.
 //
 // Against llama.cpp on the same prompt ids: the ocean case matches for all 32 tokens. The France
 // case matches for 7 and then sits on a near tie between end-of-turn and " Paris": both engines'
 // prefill of that prefix rank end-of-turn first, while llama.cpp's token-by-token decode ranks
 // " Paris" first, which is what `llama-completion` prints ("Paris. Paris is a city …"). The
-// measured margins are in docs/backlog.md (B161).
+// measured margins are in docs/backlog.md (B161). Since the activation split infr's text starts
+// the same way.
 const SMOLLM3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0x8bfd779284f134df),
+    ("The capital of France is", 32, 0x96c3bb546e0336bf),
     (
         "Write a short paragraph about the ocean.",
         32,
@@ -2034,12 +2046,15 @@ fn ernie4_5_tokenizes_as_llama_cpp() {
 // infr's greedy output compares with llama.cpp's is in docs/plan/02-ernie4-5.md. The rendered
 // prompt opens with the template's `<|begin_of_sentence|>` and no `<s>`, as the reference's
 // input does; llama.cpp adds an `<s>` for this file and answers differently (B166).
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): the ocean case's
+// second line changed ("a vast, dynamic body of water" became "a vast, vast body of saltwater"); identical
+// natively on Windows and under WSL.
 const ERNIE4_5_GOLDEN: &[(&str, usize, u64)] = &[
     ("The capital of France is", 32, 0xfd644a0cebde4e73),
     (
         "Write a short paragraph about the ocean.",
         32,
-        0x055f6196af273214,
+        0xc89d65e468805b5b,
     ),
 ];
 
@@ -2462,6 +2477,9 @@ fn qwen35_08b() -> Option<PathBuf> {
 // Captured + verified coherent (qwen35 / Qwen3-Next: gated-DeltaNet + gated full-attention): "The
 // capital of France is **Paris**. It is the largest city …", a knight story ("Elara … Aethelgard").
 // Renders with thinking ON (the infr-wide default; INFR_NO_THINK turns it off).
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): the knight
+// case's first line changed ("that could lead to" became "that leads to"); identical natively on
+// Windows and under WSL.
 const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "The capital of France is",
@@ -2471,7 +2489,7 @@ const QWEN35_GOLDEN: &[(&str, usize, u64)] = &[
     (
         "Tell me a short story about a brave knight.",
         48,
-        0x0a0d2a6554ca9f21, // prefilled-think reasoning (story planning process)
+        0x18a492d3e79d00a9, // prefilled-think reasoning (story planning process)
     ),
 ];
 
@@ -3186,12 +3204,15 @@ fn lfm3_17b_f16() -> Option<PathBuf> {
 // Captured + verified coherent; both render with thinking on (the template's default), so the
 // text is the model's reasoning. How infr's output compares with llama.cpp's is in
 // docs/plan/03-lfm3.md.
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): both cases' reasoning
+// changed wording from the first clause, same answers; identical
+// natively on Windows and under WSL.
 const LFM3_GOLDEN: &[(&str, usize, u64)] = &[
-    ("The capital of France is", 32, 0xcaeef40f04920074),
+    ("The capital of France is", 32, 0x8d3a3dd9844d239f),
     (
         "Tell me a short story about a lighthouse keeper.",
         32,
-        0x6e5098d3a5bec173,
+        0x5fd5b5d01bc889bf,
     ),
 ];
 
@@ -3335,9 +3356,11 @@ fn qwen3moe_30b() -> Option<PathBuf> {
 // capital of France is\". I need to provide the correct answer.") — re-blessed for the
 // attention-SIMD reassociation (numerics policy: match-or-beat llama.cpp CPU precision).
 // Since `infr_core::math` (2026-11-17) Windows and Linux give the same text, the one Windows
-// gave before.
+// gave before. Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`):
+// the quoted question now ends in "is..." where it ended in "is"; identical natively on Windows
+// and under WSL.
 const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
-    &[("The capital of France is", 24, 0xe1a4ed6cecc5eb14)];
+    &[("The capital of France is", 24, 0xdac3e0eea1da12ed)];
 
 /// Whole-vector cosine similarity (f64 accumulation) — used by the CPU/Vulkan cross-backend
 /// logits check below.

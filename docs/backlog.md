@@ -7045,3 +7045,71 @@ Delete this entry as each item lands or is dropped. Worktrees are under
 - **Measurements owed on a quiet machine:** the FMA tier's baseline and native
   tables in `docs/math.md` (every round there had one core busy); the quantizer
   fix's prefill cost.
+### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
+
+**Tag:** cpu · accuracy · **Kind:** finding, needs a decision
+
+Found while fixing the first-token defect (`docs/cpu-activations.md`). Against
+the CPU reference, teacher-forced, gemma-3-1b Q4_K_M's production CPU has single
+positions at KL 0.40 to 0.67 well past position 0 (its prompts' last positions;
+the GPU-tolerance review saw 1.35 at position 13 and 0.97 on another prompt),
+while its position 0 is ordinary. Those rows are not outlier rows: they split
+the fewest activation blocks of any (`cpu_act_quant`'s
+`localise_the_position_0_error` with `INFR_AQ_ROWS`), every op's own error on
+them is ordinary, and the distance builds up through the layers (final hidden
+state 0.09 to 0.17 relative distance against 0.04 at a quieter row). Simulated
+in the reference (`linear_tap::simulate`): int16 activations on the 256-block
+weights alone take the worst row from 0.52 to 0.09, on the 32-block weights
+alone (gemma's Q5_0 and Q8_0 projections at width 1152) to 0.32, on both to
+1e-5. So it is the int8 activations' ordinary rounding on a model that amplifies
+it, on both activation paths. Options: 16-element activation scales (simulated
+0.14 worst on that prompt, a rewrite of every kernel's epilogue), int16 for the
+32-block path only, or accept it as gemma's sensitivity and score gemma's CPU
+with a looser tolerance. Not measured: what llama.cpp's CPU gives on the same
+rows.
+
+### B210 — the activation split's ratio: speed against margin (2026-11-18)
+
+**Tag:** cpu · accuracy · perf · **Kind:** decision taken, alternatives recorded
+
+`quant::HI_RATIO` is 16 (`docs/cpu-activations.md`). Each block split past
+position 0 costs a one-block kernel call per weight row, an estimated five times
+a block of the packed GEMM. At 8 the split is somewhat better (ERNIE-4.5-0.3B's
+position 1, which attends to position 0's value row, reaches 0.029 against 0.13
+at 16 and 0.19 before), but it splits 0.4 to 5.5% of the blocks past position 0
+on `infr bench`'s prompt, and Qwen3-1.7B pp512 measured 14 to 17% slower (three
+disturbed pairs). At 16 it splits 0 to 1.1% and Qwen3-1.7B pp512 measured about
+3% slower (median of seven paired rounds, another agent's suite running); at 32
+(0 to 0.3%) Qwen3-1.7B was level, but 32 is the last ratio that still fixes
+ERNIE's and SmolLM3's first tokens (64 leaves them at 0.61 and 0.30), so it has
+no margin. gemma-3-1b pp512 measured about 4% slower at both 16 and 32, which
+the split blocks do not explain; a quiet-window measurement is owed. Two things
+would let the ratio come down at no cost: a sparse-part dot that costs what its
+one or two nonzero codes cost (a per-element weight decoder for each format), or
+an allocation-free batch kernel for the parts that share a weight block (the
+existing batch kernels allocate scratch per call; tried, and slower than the
+one-row calls). A baseline build was measured only against an earlier form.
+
+### B211 — the 32-element activation path is not split (2026-11-18)
+
+**Tag:** cpu · accuracy · **Kind:** open
+
+`quantize_q8_32` (Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, MXFP4, NVFP4, Q2_0, and Q8_0
+at a width that is not a multiple of 256) has one scale per 32 elements and no
+split. Its blocks are small enough that the first token's outliers cost less
+(gemma-3-1b's position 0 is at KL 2e-4 to 7e-4), but its row-0 local error is
+still about twice the other rows' (gemma's Q5_0 projections: 1.6e-2 against
+8e-3). The same split would apply (a one-block `Q8x32` part per split block).
+Not measured on a model whose 32-block weights meet a large first-token outlier.
+
+### B212 — llama.cpp parity at position 0 now differs by design (2026-11-18)
+
+**Tag:** cpu · parity · **Kind:** behaviour to know
+
+llama.cpp's CPU quantizes K-quant activations to `Q8_K` (256 elements, one
+scale), the scheme infr used before the split, and has the same first-token
+error: SmolLM3-3B's position 0 is at KL 1.85 from infr's reference in llama.cpp
+and was 1.92 in infr. After the split infr's position 0 is close to its
+reference and therefore 9.2 from llama.cpp's (Qwen3-0.6B 0.073, ERNIE BOS
+0.085). A parity test against a llama.cpp dump that reads position 0 (a
+one-token prompt) will now see that distance; later positions agree as before.

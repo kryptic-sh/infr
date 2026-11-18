@@ -131,6 +131,53 @@ unsafe fn load128<T>(s: &[T], off: usize) -> __m128i {
     _mm_loadu_si128(s[off..].as_ptr() as *const __m128i)
 }
 
+/// The one-row kernel of every weight dtype whose activations production quantizes to [`Q8`]:
+/// `Σ weight·x` over the dense codes alone. [`vec_dot_hi`] is the sparse part's share.
+pub(crate) fn vec_dot_q8_any<const CAP: bool>(
+    dt: infr_core::tensor::DType,
+    row: &[u8],
+    q8: &Q8,
+    in_f: usize,
+) -> f32 {
+    use infr_core::tensor::DType;
+    match dt {
+        DType::Q4K => vec_dot_q4k::<CAP>(row, q8, in_f),
+        DType::Q6K => vec_dot_q6k::<CAP>(row, q8, in_f),
+        DType::Q8_0 => vec_dot_q8_0::<CAP>(row, q8, in_f),
+        DType::Q5K => vec_dot_q5k::<CAP>(row, q8, in_f),
+        DType::Q2K => vec_dot_q2k::<CAP>(row, q8, in_f),
+        DType::Q3K => vec_dot_q3k::<CAP>(row, q8, in_f),
+        DType::Iq4Xs => vec_dot_iq4xs::<CAP>(row, q8, in_f),
+        DType::Iq2S => vec_dot_iq2s(row, q8, in_f),
+        DType::Iq2Xs => vec_dot_iq2xs(row, q8, in_f),
+        DType::Iq2Xxs => vec_dot_iq2xxs(row, q8, in_f),
+        DType::Iq1S => vec_dot_iq1s(row, q8, in_f),
+        DType::Iq1M => vec_dot_iq1m(row, q8, in_f),
+        DType::Iq3S => vec_dot_iq3s(row, q8, in_f),
+        DType::Iq3Xxs => vec_dot_iq3xxs(row, q8, in_f),
+        DType::Tq2_0 => vec_dot_tq2_0(row, q8, in_f),
+        DType::Tq1_0 => vec_dot_tq1_0(row, q8, in_f),
+        other => unreachable!("{other:?} does not take Q8 activations"),
+    }
+}
+
+/// The sparse part of `q8` ([`Q8::hi`]) dotted with a weight row of `dt` over `in_f` inputs:
+/// each part's one-block kernel ([`vec_dot_q8_any`]) against the weight's matching 256-element
+/// block, summed from zero in the parts' order. Every route that dots a `Q8` adds this to the
+/// dense result (`dense + vec_dot_hi(..)`) for a row whose `hi` is not empty, so the sum is one
+/// expression however the dense part was computed; a row with no sparse part adds nothing.
+pub(crate) fn vec_dot_hi<const CAP: bool>(
+    dt: infr_core::tensor::DType,
+    row: &[u8],
+    q8: &Q8,
+    in_f: usize,
+) -> f32 {
+    let bpb = row.len() / (in_f / 256);
+    q8.hi.iter().fold(0f32, |s, (b, part)| {
+        s + vec_dot_q8_any::<CAP>(dt, &row[b * bpb..b * bpb + bpb], part, 256)
+    })
+}
+
 /// `Σ weight·x` for one Q4_K row (144 bytes / 256 elems) against the Q8 activation. Weight value is
 /// `d·sc_s·q4 − dmin·m_s` over 8 sub-blocks of 32; dispatches to the best SIMD path available at
 /// runtime (avx512bw → avx2 → scalar). The `sm` term uses `q8.bsums` (precomputed in `quantize_q8`)

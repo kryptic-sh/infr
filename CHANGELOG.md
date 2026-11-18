@@ -842,6 +842,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The production CPU's first token is no longer far from its reference.** The
+  int8 activation quantizer for K-quant, IQ, TQ and 256-wide Q8_0 weights
+  (`quantize_q8`) took one scale per 256 activations from the block's largest
+  magnitude, and the first token's massive-activation dimensions set that scale
+  and rounded the rest of their blocks to 0 or ±1. Against the CPU reference
+  (`kernels.cpu.reference`), position 0's KL was 5.58 and 1.92 on SmolLM3-3B
+  (top-1 changed on a chat prompt), 0.60 on ERNIE-4.5-0.3B and 0.086 on
+  Qwen3-0.6B; llama.cpp's CPU, whose `Q8_K` activations are the same scheme,
+  measures 1.85 on SmolLM3-3B's. A block whose one or two largest magnitudes
+  stand sixteen times above the rest now carries them in a sparse part on their
+  own scale, and its dense codes take the scale of what is left: position 0 is
+  at 4e-5 to 1.3e-2 on the same models, the steady state is level, and blocks
+  without such outliers quantize to the same bits as before. Prefill measured
+  about 3% slower on Qwen3-1.7B (pp512, disturbed rounds), decode level.
+  Measurements and the options weighed are in `docs/cpu-activations.md`.
+  **Upgrade note:** the production CPU's output changes once for every model
+  whose prompts carry such outliers (the CPU goldens were re-blessed); one-token
+  llama.cpp parity dumps now differ at position 0 by design (backlog B212).
+
 - **Equal logits sample the same token on every toolchain.** The CPU backend's
   `Op::Sample` and the host sampler's top-k path ordered equal logits by
   unstable sorts with no tie-break, so which of two equal tokens a draw picked

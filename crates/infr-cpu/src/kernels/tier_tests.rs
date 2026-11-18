@@ -529,6 +529,95 @@ fn every_quantized_format_has_a_family() {
     }
 }
 
+/// The sparse part of a split activation (`Q8::hi`, dotted by `vec_dot_hi`) gives the scalar
+/// tier's bits at every tier, and so does the dense dot beside it, for every weight dtype that
+/// takes `Q8` activations, on rows that split: two spikes in the first block, and at the longer
+/// length one more in the last.
+#[test]
+fn the_sparse_activation_part_gives_the_scalar_bits_at_every_tier() {
+    let dts = [
+        DType::Q4K,
+        DType::Q6K,
+        DType::Q8_0,
+        DType::Q5K,
+        DType::Q2K,
+        DType::Q3K,
+        DType::Iq4Xs,
+        DType::Iq2S,
+        DType::Iq2Xs,
+        DType::Iq2Xxs,
+        DType::Iq1S,
+        DType::Iq1M,
+        DType::Iq3S,
+        DType::Iq3Xxs,
+        DType::Tq2_0,
+        DType::Tq1_0,
+    ];
+    let host: Vec<SimdTier> = SimdTier::ALL
+        .into_iter()
+        .filter(|t| t.supported())
+        .collect();
+    let mut checked = 0usize;
+    for dt in dts {
+        for in_f in [256usize, 768] {
+            let w = weights(dt, in_f, 0x51 ^ in_f as u32);
+            let bpr = w.len() / ROWS;
+            let x: Vec<f32> = (0..in_f)
+                .map(|i| match i {
+                    3 => 412.5,
+                    7 => -129.3,
+                    i if i == in_f - 9 => -3.0e4,
+                    _ => ((i * 29 % 97) as f32 - 48.0) / 31.0,
+                })
+                .collect();
+            let q8 = quantize_q8(&x);
+            assert!(
+                !q8.hi.is_empty(),
+                "{dt:?} in_f {in_f}: the row did not split"
+            );
+            let both = |cap: bool| -> Vec<(f32, f32)> {
+                (0..ROWS)
+                    .map(|o| {
+                        let row = &w[o * bpr..(o + 1) * bpr];
+                        if cap {
+                            (
+                                vec_dot_q8_any::<true>(dt, row, &q8, in_f),
+                                vec_dot_hi::<true>(dt, row, &q8, in_f),
+                            )
+                        } else {
+                            (
+                                vec_dot_q8_any::<false>(dt, row, &q8, in_f),
+                                vec_dot_hi::<false>(dt, row, &q8, in_f),
+                            )
+                        }
+                    })
+                    .collect()
+            };
+            let (want, _) = with_tier(SimdTier::Scalar, || both(true));
+            assert!(
+                want.iter().any(|&(_, h)| h != 0.0),
+                "{dt:?} in_f {in_f}: the sparse part dotted to zero on every row"
+            );
+            let bits = |v: &[(f32, f32)]| -> Vec<(u32, u32)> {
+                v.iter().map(|&(a, b)| (a.to_bits(), b.to_bits())).collect()
+            };
+            for &t in &host {
+                let (got, _) = with_tier(t, || both(true));
+                assert_eq!(
+                    bits(&got),
+                    bits(&want),
+                    "{dt:?} in_f {in_f} at {}",
+                    t.name()
+                );
+                checked += 1;
+            }
+            let (got, _) = with_tier(SimdTier::Scalar, || both(false));
+            assert_eq!(bits(&got), bits(&want), "{dt:?} in_f {in_f} uncapped");
+        }
+    }
+    assert_eq!(checked, dts.len() * 2 * host.len());
+}
+
 // ─── the f32 dots ──────────────────────────────────────────────────────────────────────────────
 
 /// The tier the f32 dots' dispatchers take under a ceiling: their FMA code (an AVX2-tier path)

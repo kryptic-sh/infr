@@ -50,6 +50,18 @@ fn vals(seed: u64, n: usize) -> Vec<f32> {
     (0..n).map(|i| val(seed, i)).collect()
 }
 
+/// [`val`] made inexact in every reduced-precision format: scaled by `1 + 2^-10 + 2^-20` and
+/// offset by a second stream's `val / 4096`, so most elements need all 24 bits of an f32 and a
+/// conversion to f16 or bf16 must round (a `val` alone, a multiple of 2^-9 in [-2, 2), fits f16
+/// exactly and hides how the KV write rounds). Plain binary32 arithmetic on integer-generated
+/// values: the same bits on every machine.
+fn inexact_vals(seed: u64, n: usize) -> Vec<f32> {
+    const SCALE: f32 = 1.0 + 1.0 / 1024.0 + 1.0 / 1_048_576.0;
+    (0..n)
+        .map(|i| val(seed, i) * SCALE + val(seed + 1000, i) / 4096.0)
+        .collect()
+}
+
 fn f32_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -469,7 +481,14 @@ fn kv_cache_len(dt: DType, n: usize) -> usize {
 fn kv_format_cases() -> Vec<Case> {
     let (rows, nh, nkv, hd, cap) = (5usize, 4usize, 2usize, 64usize, 8usize);
     let width = nkv * hd;
-    let src = |seed: u64| -> Vec<f32> {
+    // The float formats get values they cannot hold exactly, so the write's rounding shows; the
+    // quantized ones round every value anyway.
+    let src = |seed: u64, dt: DType| -> Vec<f32> {
+        let body = if matches!(dt, DType::F16 | DType::Bf16) {
+            inexact_vals(seed, rows * width)
+        } else {
+            vals(seed, rows * width)
+        };
         (0..rows * width)
             .map(|i| match i / width {
                 0 => {
@@ -480,7 +499,7 @@ fn kv_format_cases() -> Vec<Case> {
                     }
                 }
                 1 => 0.75,
-                _ => val(seed, i),
+                _ => body[i],
             })
             .collect()
     };
@@ -500,8 +519,8 @@ fn kv_format_cases() -> Vec<Case> {
         DType::Turbo4,
     ] {
         let mut c = Case::new(format!("KV {dt:?} write and attend"));
-        let ks = c.input(vec![rows, width], DType::F32, f32_bytes(&src(130)));
-        let vs = c.input(vec![rows, width], DType::F32, f32_bytes(&src(131)));
+        let ks = c.input(vec![rows, width], DType::F32, f32_bytes(&src(130, dt)));
+        let vs = c.input(vec![rows, width], DType::F32, f32_bytes(&src(131, dt)));
         let bytes = vec![0u8; kv_cache_len(dt, cap * width)];
         let kc = c.state(vec![cap * width], dt, bytes.clone());
         let vc = c.state(vec![cap * width], dt, bytes);
@@ -726,10 +745,21 @@ fn attention_cases() -> Vec<Case> {
         }),
     }));
 
-    for dt in [DType::F16, DType::Q4_0] {
-        let (rows, cap, w, pos) = (3usize, 16usize, 64usize, 5usize);
-        let mut c = Case::new(format!("WriteKv {dt:?}"));
-        let src = c.input_f32(vec![rows, w], 38);
+    // F16 on inexact values, at a width of 64 and at 61, where the 8-wide narrowing leaves a
+    // tail in every row.
+    for (dt, w, name) in [
+        (DType::F16, 64usize, "WriteKv F16"),
+        (DType::F16, 61, "WriteKv F16 width 61"),
+        (DType::Q4_0, 64, "WriteKv Q4_0"),
+    ] {
+        let (rows, cap, pos) = (3usize, 16usize, 5usize);
+        let mut c = Case::new(name);
+        let x = if dt == DType::F16 {
+            inexact_vals(38, rows * w)
+        } else {
+            vals(38, rows * w)
+        };
+        let src = c.input(vec![rows, w], DType::F32, f32_bytes(&x));
         let cache = c.state(vec![cap * w], dt, kv_bytes(dt, cap, w, pos, 39));
         v.push(c.push(Op::WriteKv {
             src,
@@ -1443,13 +1473,14 @@ const EXPECTED: &[(&str, u64)] = &[
     ("Attention window q4_0 kv", 0x573a8ad55fac6f70),
     ("Attention sinks key_bias", 0x99db266e7d4a5969),
     ("Attention comp segment", 0xd06093c9b9126d06),
-    ("WriteKv F16", 0x28d40a2f25abc3be),
+    ("WriteKv F16", 0x9251f37837f52d3f),
+    ("WriteKv F16 width 61", 0xdc0f7d67cec92a2d),
     ("WriteKv Q4_0", 0x4f536590c43efedc),
     ("Mla", 0x555b78feb583f984),
     ("LightningIndexer TopkMask", 0x0ec80ae09928fb74),
     ("KV F32 write and attend", 0x094d8912d2db3f8d),
-    ("KV F16 write and attend", 0xa5b6c5eb76c83ff5),
-    ("KV Bf16 write and attend", 0x0b8b1483b43a97c6),
+    ("KV F16 write and attend", 0xea88366b6189a0a9),
+    ("KV Bf16 write and attend", 0x880d37e4101d5a1b),
     ("KV Q8_0 write and attend", 0x93ad98142cd777ee),
     ("KV Q4_0 write and attend", 0xc65665a1b22b10fa),
     ("KV Q4_1 write and attend", 0x3af6531a77ec0857),

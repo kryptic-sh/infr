@@ -1104,11 +1104,21 @@ fn f16_store_matches_half_on_awkward_values() {
     }
     let (n, nan_diff) = f16_store_check(&xs);
     eprintln!("f16 store: {n} conversions, {nan_diff} NaN results with other bits");
-    assert!(n > 0);
+    assert_eq!(n, xs.len() * f16_store_runs());
+    assert_eq!(
+        nan_diff, 0,
+        "NaN inputs narrowed to other bits than half's software path"
+    );
 }
 
-/// [`f16_store_matches_half_on_awkward_values`] over every one of the 2^32 f32 inputs. Prints how
-/// many NaN inputs gave other bits than the software conversion (any non-NaN difference fails).
+/// How many paths [`f16_store_check`] runs: each tier this CPU has, and the uncapped one.
+fn f16_store_runs() -> usize {
+    SimdTier::ALL.into_iter().filter(|t| t.supported()).count() + 1
+}
+
+/// [`f16_store_matches_half_on_awkward_values`] over every one of the 2^32 f32 inputs, NaNs
+/// included: every result must have the software conversion's bits, and every input must have
+/// been converted on every path.
 #[test]
 #[ignore = "exhaustive: 2^32 inputs at every tier, minutes"]
 fn f16_store_matches_half_on_every_f32() {
@@ -1132,9 +1142,13 @@ fn f16_store_matches_half_on_every_f32() {
             });
         }
     });
+    let (total, nans) = (total.into_inner(), nans.into_inner());
     eprintln!(
-        "f16 store: {} conversions over all 2^32 inputs, {} NaN results with other bits",
-        total.into_inner(),
-        nans.into_inner()
+        "f16 store: {total} conversions over all 2^32 inputs, {nans} NaN results with other bits"
+    );
+    assert_eq!(total, (1usize << 32) * f16_store_runs());
+    assert_eq!(
+        nans, 0,
+        "NaN inputs narrowed to other bits than half's software path"
     );
 }

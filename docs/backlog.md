@@ -6769,22 +6769,25 @@ values. What it leaves:
   step's logits. The static per-token path is gated (`gpu-float-static`).
 - **The int8-off runs lose the integrated GPU; the workaround stays.** On
   `Vulkan1` with every int8 kernel off, the harness's prefill head is one
-  vocabulary-wide `native_q6k` dispatch of about 25 ms per chunk row: at the
-  default 128-row chunk it runs 3.26 s, and Windows' display-driver watchdog
-  (TDR, 2 s here) resets the engine, even with that dispatch alone in its submit
-  (plan 12 section 0c has the sweep, the registry and event-log readings).
-  Before the bounded waits that ended in a hang (a timestamp read waiting
-  forever after the driver signalled the discarded work's fence) or a lost
-  device; now it is an error within seconds. The tolerance tests keep their
-  workaround on integrated devices for configurations with every int8 knob off
-  (head on each chunk's last row, cap 4, `INTEGRATED_FLOAT_SUBMIT_CAP`), because
-  nothing in production splits one dispatch (B221). Scoring every prefill row
-  there needs either that split or 32-row chunks for those runs (0.83 s per head
-  dispatch measured), and the second changes the measured graph, so its rows
-  would be re-derived under the no-ratchet rule; not done. The `Vulkan1` table
-  data is partial: native lanes with the tuning rows on only, and gemma-3's and
-  Qwen3.5's full-head int8-off runs there did not complete (their int8-off rows
-  there come from the workaround runs).
+  vocabulary-wide `native_q6k` dispatch of about 25 ms per chunk row (3.26 s at
+  the default 128-row chunk). With it in flight Windows resets the engine (TDR
+  engine-timeout entries in the event log) in some runs and not others: one run
+  each was reset at 96 and 128 rows with the dispatch alone in its submit, and
+  other runs at 128 completed. Whether the rule is a fixed per-dispatch limit or
+  a preemption timeout is not established (plan 12 section 0c has both models,
+  the run counts, the registry and event-log readings). Before the bounded waits
+  a reset ended in a hang (a timestamp read waiting forever after the driver
+  signalled the dropped work's fence) or a lost device; now it is an error
+  within seconds. The tolerance tests keep their workaround on integrated
+  devices for configurations with every int8 knob off (head on each chunk's last
+  row, cap 4, `INTEGRATED_FLOAT_SUBMIT_CAP`), because nothing in production
+  splits one dispatch (B221). Scoring every prefill row there needs either that
+  split or 32-row chunks for those runs (0.83 s per head dispatch measured), and
+  the second changes the measured graph, so its rows would be re-derived under
+  the no-ratchet rule; not done. The `Vulkan1` table data is partial: native
+  lanes with the tuning rows on only, and gemma-3's and Qwen3.5's full-head
+  int8-off runs there did not complete (their int8-off rows there come from the
+  workaround runs).
 - **gemma-3-1b's int8 distance is ten times larger on the integrated GPU than on
   the RX 7900 XTX, unexplained.** Worst KL from position 2 on, configuration
   `gpu`: 0.26 on `Vulkan1` (prompt 2, position 115; 0.87 at position 1), 2.6e-2
@@ -7080,16 +7083,18 @@ the machine is free:
 
 **Tag:** vulkan · submit · watchdog · **Kind:** deferred work, measured
 
-A GPU job that runs past a driver watchdog is reset; the backend now reports it
-(`gpu_wait`: a bounded wait, a lost device, or a segment whose fence signalled
-without its closing timestamp) instead of hanging, but does not avoid it. What
-still trips it, measured on the Ryzen integrated GPU (`Vulkan1`, AMD Windows
-driver, TDR 2 s; plan 12 section 0c):
+A GPU engine reset by the driver's watchdog now ends in an error (`gpu_wait`: a
+bounded wait, a lost device, or a segment whose fence signalled without its
+closing timestamp) instead of a hang, but nothing avoids it. What met it,
+measured on the Ryzen integrated GPU (`Vulkan1`, AMD Windows driver, default TDR
+settings; plan 12 section 0c, where the exact rule, a fixed per-dispatch limit
+or a preemption timeout, is left open):
 
-- **One dispatch over about 2 s**, whatever submit it is in: the tolerance
-  harness's vocabulary-wide head at 96 or more rows with int8 kernels off. No
-  submit boundary shortens it; the op itself must be split into row ranges (or
-  refused with a message before it is submitted).
+- **A dispatch of more than about 2 s in flight**, whatever submit it is in: the
+  tolerance harness's vocabulary-wide head at 96 or more rows with int8 kernels
+  off (reset in some runs, not all). No submit boundary shortens it; the op
+  itself must be split into row ranges (or refused with a message before it is
+  submitted).
 - **Submits of many heavy dispatches**: `infr bench` SmolLM3-3B Q4_K_M with
   `-u 2048` submitted 128-dispatch segments of 4.9 and 5.2 s with the default
   int8 kernels, and `-u 512` with `INFR_NO_I8DOT=1` failed too. The dispatch cap
@@ -7112,14 +7117,38 @@ measurements per family first, and splitting ops touches every GEMM lowering.
 
 **Tag:** vulkan · tests · **Kind:** coverage gaps
 
-- **The missing-closing-timestamp check has no automated test.** It fired in
-  production runs (`infr bench -u 2048` on `Vulkan1`, plan 12 section 0c), but
-  nothing forces a fence to signal without its work; the timeout path has a
-  forced test
-  (`gpu_wait::tests::gpu_wait_timeout_poisons_the_backend_and_drops_cleanly`,
-  red with the bound removed), the lost-device path only the real reproduction.
-  Untimed segments (a queue without timestamps, persistent decode replays) have
-  no such check.
+- **Dropped work is detected on one kind of submit only.** After a watchdog
+  reset AMD's Windows driver signals the fence of work it threw away (plan 12
+  section 0c). The backend catches that by the segment's closing timestamp
+  (`recorder::account_segment`), which exists only on a forward segment from a
+  non-persistent recorder (`Recorder::finish`, `PendingSegment::wait`) on a
+  queue that writes timestamps (`segment_ts_period`). NOT checked:
+  `RecordedCmd::replay` and `replay_n` (every replayed decode token and the
+  chained decode: persistent recorders carry no timestamps), `one_shot`
+  (uploads, downloads through staging, fills, probes), the weight staging ring,
+  the tensor-parallel copies, and every submit on a queue without timestamps.
+  After such a wait returns, the decode reads its logits from mapped memory, so
+  a reset during a replay can hand back wrong logits; the lost device is
+  reported only by the next submit (in every harness run of section 0c the next
+  submit did report it). A general detector was considered and not built: a
+  completion marker the last command of every submit writes (the host clears a
+  mapped word before the submit and checks it after the fence) would cover every
+  path, at a transfer write and a barrier per submit, and on the persistent
+  replays the value must change per replay, which the recorded command buffer
+  cannot do without re-recording or a host-side reset per token. Worth doing
+  with a decode A/B to show its cost; until then this is the gap.
+- **The missing-closing-timestamp check has no automated test.** It fired on
+  real hardware in the three production runs of plan 12 section 0c (`infr bench`
+  on `Vulkan1`), never in the harness runs, where the next submit reported the
+  lost device first; nothing forces a fence to signal without its work. The
+  queries are reset from the host at creation (`hostQueryReset`, enabled where
+  offered: both GPUs here), so a dropped command buffer leaves them reliably
+  unavailable; without that feature they are reset inside the command buffer,
+  and a dropped buffer leaves them undefined. The timeout path has a forced test
+  (`gpu_wait::tests::gpu_wait_timeout_poisons_the_backend_and_drops_cleanly`; on
+  2026-11-18 it failed with the bound replaced by `u64::MAX`, "a 1 ms bound must
+  time out", and passed with it restored); the lost-device path only the real
+  reproduction.
 - **`infr serve` with a poisoned backend was read, not run.** A request fails
   with the error (500, or the stream's error frame) and so does every later one
   on that model, as a lost device already did; the server keeps running, so
@@ -7135,8 +7164,3 @@ measurements per family first, and splitting ops touches every GEMM lowering.
   submit of many short dispatches is also reset at 2 s on the integrated GPU
   (`infr_core::SUBMIT_BUDGET_NS`'s comment says a 2.06 s submit was), see plan
   12 section 0c.
-- **`cpu_golden_qwen3_quants` fails on `origin/main` too** since
-  `Qwen3-0.6B-Q8_0.gguf` appeared in the HF cache on 2026-11-18 (the test
-  skipped that quant before): the Q8_0 golden in `QWEN3_QUANT_GOLDEN` does not
-  match the file now cached. Not looked into; CPU-only, unrelated to the GPU
-  waits.

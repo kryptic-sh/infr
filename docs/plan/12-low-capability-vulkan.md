@@ -117,76 +117,100 @@ chunk's last row has not done so in any run. Not established: whether one
 dispatch or a submit's total is what crosses the limit. And whatever the limit,
 a host wait without a timeout turns the loss into a hang that only a watchdog
 outside the process ends; a bounded fence wait reporting a lost device would be
-a fix of its own.
+a fix of its own. _(Superseded by section 0c: the "no 4101 event" reading looked
+in the wrong log, an engine reset (0x141) is recorded for these runs, and the
+spinning core was a timestamp read after the reset had signalled the fence.)_
 
 For this phase: S1's initial cap alone would not have prevented this case, which
 already had one, and whether S2 would is open until the limit is known. The
 tolerance tests work around it on an integrated GPU, for configurations with
 every int8 knob off, with both the head on each chunk's last row and a cap of 4
 (B207); with that the whole `gpu_seam_tolerance_*` set passed on `Vulkan1` in
-637 s. Production never runs that head.
+637 s. Production never runs that head. _(Superseded by section 0c: the reset
+and the hang are now explained, and a production path without the harness hits
+the same reset with a large `-u`.)_
 
 ## 0c. What cuts the work off on the integrated GPU (2026-11-18, later)
 
 With bounded waits in place (`device.gpu_wait_timeout_ms`, see `gpu_wait.rs`)
 the reproduction of section 0b ends in an error instead of a hang, which made
-the rest measurable. All runs on `Vulkan1`, Qwen3.5-0.8B, prompt 2, `gpu-float`.
+more of it measurable. All runs on `Vulkan1`; the harness runs are Qwen3.5-0.8B,
+prompt 2, `gpu-float`; each is listed with its run count.
+
 **Established [ran]:**
 
-- **The limit is time, and one dispatch crosses it.** The harness head is one
-  `native_q6k` dispatch (a scalar-dequant float GEMM, vocabulary-wide) whose GPU
-  time grows with the chunk's rows, about 25 ms per row. One dispatch per submit
-  (`INFR_TOL_SUBMIT=1`), its own timestamps:
+- **An engine reset happens.** The Application log has `LiveKernelEvent` Windows
+  Error Reporting entries within seconds of each failing run whose time was
+  compared (the first, at 21:42, and every one from 21:53 to 22:22 local time)
+  and none near the five that completed; the seven of those 21:53-22:22 entries
+  that carry a bucket so far are all `LKD_0x141_Tdr:6_IMAGE_amdkmdag.sys`
+  (0x141: a GPU engine timed out and was reset; the rest had not been bucketed
+  when read). The same entries run through the afternoon of section 0b's
+  experiments: 0b looked for event 4101 in the System log, which an engine reset
+  does not write. No `TdrDelay`, `TdrDdiDelay` or `TdrLevel` is set under
+  `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` (read only), so
+  Windows' defaults apply: a 2 s `TdrDelay`.
+- **After the reset the fence reports signalled and the work is dropped.** With
+  a trace of every wait (2 runs at the default cap): the wait on the forward
+  holding the head returned success after 6.2 and 5.8 s, and the read of that
+  segment's timestamps with `WAIT` then never returned: that read is the core
+  spinning forever. A third traced run completed. With the timestamps read
+  without waiting, every harness run that met the reset since (3 of 3 at the
+  default cap, 2 of 2 at one dispatch per submit) ended in under 30 s with
+  `the GPU device was lost: submitting a one-shot command buffer failed; VK_EXT_device_fault: "No fault detected"`,
+  the process exited, and `infr devices` listed both GPUs afterwards.
+- **It happens only with a long dispatch in flight.** The harness head is one
+  `native_q6k` dispatch (a scalar-dequant float GEMM, vocabulary-wide) of about
+  25 ms per chunk row. One dispatch per submit (`INFR_TOL_SUBMIT=1`), each
+  dispatch timed by its own segment timestamps:
 
-  | Chunk rows (`INFR_TOL_UBATCH`) | Head dispatch | Result                         |
-  | ------------------------------ | ------------- | ------------------------------ |
-  | 32                             | 0.82-0.83 s   | completed                      |
-  | 64                             | 1.63 s        | completed                      |
-  | 96                             | 2.44 s        | device lost at the next submit |
-  | 128 (default)                  | 3.26 s        | device lost at the next submit |
-  | 128, head on the last row      | under 0.064 s | completed                      |
+  | Chunk rows (`INFR_TOL_UBATCH`) | Runs | Head dispatch | Result                         |
+  | ------------------------------ | ---- | ------------- | ------------------------------ |
+  | 32                             | 1    | 0.82-0.83 s   | completed                      |
+  | 64                             | 1    | 1.63 s        | completed                      |
+  | 96                             | 1    | 2.44 s        | device lost at the next submit |
+  | 128 (default)                  | 1    | 3.26 s        | device lost at the next submit |
+  | 128, head on the last row      | 1    | under 0.064 s | completed                      |
 
-  Windows' display-driver watchdog defaults apply on this box (no `TdrDelay`,
-  `TdrDdiDelay` or `TdrLevel` under
-  `HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers`, so `TdrDelay` is 2
-  s), and the threshold sits between 1.63 and 2.44 s. Every failing run, and
-  none of the completed ones, left `LiveKernelEvent` Windows Error Reporting
-  entries in the Application log within seconds of it, bucketed
-  `LKD_0x141_Tdr:6_IMAGE_amdkmdag.sys` (0x141: an engine timeout, recovered by
-  resetting the engine). Section 0b looked for event 4101 in the System log,
-  which an engine reset does not write; the Application log has 0x141 entries
-  throughout the earlier stall experiments too.
+  The head on each chunk's last row has never been reset in any run (sections 0b
+  and 0c together).
 
-- **What the host saw.** After the reset the driver signalled the fence of the
-  forward holding the head about 6 s after it was submitted, although the work
-  was discarded; the segment's timestamp read (`vkGetQueryPoolResults` with
-  `WAIT`) then never returned, which is the core spinning forever (traced in 2
-  of 3 runs; the third completed). With the timestamps read without waiting, all
-  runs since end in under 30 s with
-  `the GPU device was lost: submitting a one-shot command buffer failed; VK_EXT_device_fault: "No fault detected"`
-  (3 of 3 at the default cap and 2 of 2 at cap 1), and `infr devices` lists both
-  GPUs afterwards. `VK_EXT_device_fault` is offered by both GPUs and enabled; on
-  this reset it reports no fault, consistent with a timeout rather than a page
-  fault.
+- **A production path without the harness hits it.** `infr bench` of SmolLM3-3B
+  Q4_K_M on `Vulkan1`, one run each: `-u 512` with the default int8 kernels
+  completed (99.1 t/s, segments of about 0.97 s); `-u 512` with
+  `INFR_NO_I8DOT=1`, and `-u 2048` with and without it, met the reset (each with
+  `LiveKernelEvent` entries at its time). The `-u 2048` int8 run had submitted
+  128-dispatch segments that ran 4.9 and 5.2 s. All three now end with the
+  missing-timestamp error, for example
+  `the GPU signalled a forward segment of 129 dispatches (first rope_f16_bda, last native_gemm_dp4a_q4k) complete but never wrote its closing timestamp`:
+  the check fired on real hardware there, three times. In the harness runs it
+  never did; there the next submit reported the lost device first. The default
+  integrated chunk (`integrated_ubatch_rows`, 128 rows) with the int8 kernels on
+  has not met it.
 
-- **Production can hit it, without the harness.** `infr bench` of SmolLM3-3B
-  Q4_K_M on `Vulkan1`: `-u 512` with the default int8 kernels completed (99.1
-  t/s, segments of about 0.97 s); `-u 512` with `INFR_NO_I8DOT=1`, and `-u 2048`
-  with or without it, failed. The `-u 2048` int8 run submitted segments of 128
-  dispatches that ran 4.9 and 5.2 s before the reset. Each now fails with the
-  segment named:
-  `the GPU signalled a forward segment of 129 dispatches (first rope_f16_bda, last native_gemm_dp4a_q4k) complete but never wrote its closing timestamp`.
-  The integrated default chunk (`integrated_ubatch_rows`, 128 rows) stays clear
-  of it with the int8 kernels on.
+**Not established [I]: the rule.** Two models fit parts of the data:
 
-**Still inference [I]:** whether a submit of many short dispatches is also
-killed at 2 s (an earlier comment in `infr_core::SUBMIT_BUDGET_NS` says a 2-CU
-submit was reset at 2.06 s; in this gate run a single 126-dispatch LFM3 forward
-waited 2.75 s and completed, and the wait may include segments queued before it)
-— that is, whether Windows preempts this engine at dispatch or at command-buffer
-boundaries. And the RX 580's limit under Linux is amdgpu's per-job
-`lockup_timeout`, a different watchdog: what it counts is the reporter's to
-measure (S0).
+- **A fixed limit on how long one dispatch may run (about 2 s).** Explains the
+  sweep above (completed at 1.63 s, reset at 2.44 and 3.26 s) and the production
+  runs. Does not explain the completions: in section 0b the same 3.26 s head
+  completed at cap 4 in four runs of seven, a third traced run here completed
+  with it at the default cap, a gemma-3 run kept the engine busy 12 s without a
+  gap, and cap 8 lost the device while caps 16 and 128 stalled.
+- **A preemption timeout.** Windows asks the engine to preempt when another
+  context needs it (on this box the desktop shares the integrated GPU), and
+  resets it when the running work does not yield within `TdrDelay`; if this
+  engine preempts only between dispatches, a long dispatch is reset only when a
+  preemption request lands during it. Explains the nondeterminism and the
+  completions. Not tested: nothing here controlled or observed the preemption
+  requests, and the dispatch-versus-command-buffer granularity is not known
+  (`infr_core::SUBMIT_BUDGET_NS`'s comment records a 2-CU submit reset at 2.06
+  s; in the GPU gate a single 126-dispatch LFM3 forward waited 2.75 s and
+  completed).
+
+Either way, keeping every dispatch well under 2 s on this GPU avoids it, and no
+submit boundary shortens a dispatch. The RX 580's limit under Linux is amdgpu's
+per-job `lockup_timeout`, a different watchdog: what it counts is the reporter's
+to measure (S0).
 
 ## 1. Slices
 
@@ -201,31 +225,40 @@ measure (S0).
 | S6  | Q4_K packed metadata in the row-tiled decode MMV (`ea3008ca`, `7a6147b3`), re-measured against current `main`                                                                                                                                                                                                                                                                                                                                                          | the fork's exact-match test; tg128 on both GPUs                                                                                                                                                                                                     | optional                                     |
 | S7  | Decision, not code: submitting on a compute-only queue (`a9c50bce`); it changes which amdgpu ring and timeout apply                                                                                                                                                                                                                                                                                                                                                    | A/B desktop responsiveness and throughput on both GPUs                                                                                                                                                                                              | yes                                          |
 
-**Status (branch `fix/vulkan-submit-bounds`, 2026-11-18).** Done beside the
+**Status (branch `fix/vulkan-submit-bounds`, 2026-11-19).** Done beside the
 slices: every host wait is bounded and a failure poisons the backend with an
-error naming the submit (`device.gpu_wait_timeout_ms`), and a fence signalled
-for discarded work is caught by its missing closing timestamp (section 0c). **S1
-done:** the fork's `a35dac2f` is cherry-picked with its message as written; on
-top of it the tuning `DeviceFacts` carry `matrix_units` and `dot_accelerated`,
-`DeviceFacts::slow_class` is the fork's rule, and the initial cap is the tuning
-parameter `submit.initial_dispatches` (`infr tune show`: 64 on the
-`rx580-gcn-radv` fixture, 128 integrated, 0 elsewhere; every snapshot gains that
-one line and a new hash, no other value moves). Verified: the unit test goes red
-on the old rule; `first_forward_split` cuts the first prefill forward with
-`INFR_FORCE_WAVE64` on both GPUs, output bit-identical to the unsplit forced
-run, and cuts nothing natively on the RX 7900 XTX. **S2 not done:** section 0c
-shows the per-submit budget it describes is not enough on its own, because one
-dispatch past about 2 s is reset whatever submit it sits in. What it needs, from
-the measurements: a per-op cost estimate (FLOPs from the op's shape) over a
-throughput that is per device AND per kernel family (on the integrated GPU the
-dp4a GEMMs and the scalar-dequant ones differ by about an order of magnitude,
-estimated from the segment times above, not measured per op [I]), refined from
-measured segment times; cutting submits on the estimate; and SPLITTING an op
-whose own estimate passes the budget into row ranges (or refusing it with a
-message), since no submit boundary can shorten one dispatch. Until then a large
-`-u` on a slow device fails with an error instead of a hang (section 0c). The RX
-580 still needs the reporter: S1 is the fork's measured fix for that card,
-untested here on GCN.
+error naming the submit (`device.gpu_wait_timeout_ms`). A fence signalled for
+dropped work is caught ONLY on a forward segment from a non-persistent recorder
+on a queue that writes timestamps, by its missing closing timestamp (section
+0c); decode replays, chained decode, one-shot copies, staging copies and any
+queue without timestamps are not checked, so a reset during a decode replay can
+still hand back wrong logits until the next submit reports the lost device
+(B222). **S1 done:** the fork's `a35dac2f` is cherry-picked with its message as
+written; on top of it the tuning `DeviceFacts` carry `matrix_units` and
+`dot_accelerated`, `DeviceFacts::slow_class` is the fork's rule, and the initial
+cap is the tuning parameter `submit.initial_dispatches` (`infr tune show`: 64 on
+the `rx580-gcn-radv` and `unknown` fixtures, 128 integrated, 0 elsewhere). The
+brief expected only the GCN snapshot to change; adding a parameter changes all
+seven (each gains that one line and a new hash, so the banner hash changes on
+every device), and no other value moves in any of them. Verified on 2026-11-18
+(runs re-done once the GPUs are free):
+`initial_submit_cap_follows_the_device_facts` failed with the slow class removed
+from the default (`left: 0, right: 64` for the GCN fixture) and passes with it;
+`first_forward_split` on the RX 7900 XTX cut the first prefill forward twice
+with `INFR_FORCE_WAVE64` (cap 64), bit-identical to the unsplit forced run, and
+0 times natively; on the integrated GPU, whose own cap of 128 applies either
+way, once forced and once native. **S2 not done:** section 0c shows a per-submit
+budget is not enough on its own, because a long dispatch is what is reset, and
+no submit boundary shortens it. What it needs, from the measurements: a per-op
+cost estimate (FLOPs from the op's shape) over a throughput that is per device
+AND per kernel family (on the integrated GPU the dp4a GEMMs and the
+scalar-dequant ones differ by about an order of magnitude, estimated from
+segment times, not measured per op [I]), refined from measured segment times;
+cutting submits on the estimate; and SPLITTING an op whose own estimate passes
+the budget into row ranges, or refusing it with a message (B221). Until then a
+large `-u` on a slow device fails with an error instead of a hang. The RX 580
+still needs the reporter: S1 is the fork's measured fix for that card, untested
+here on GCN.
 
 Declined: the fork's opt-in SSBO weight binding, which its own config doc marks
 as producing wrong output in a model on the RX 580, and its GQA decode pass,

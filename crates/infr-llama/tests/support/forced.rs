@@ -593,11 +593,13 @@ pub fn watchdog(what: &str, limit: std::time::Duration) -> Watchdog {
 ///
 /// A HARNESS WORKAROUND for a production weakness, not a fix. The harness's prefill head is ONE
 /// vocabulary-wide float GEMM dispatch over every chunk row (`native_q6k` on Qwen3.5-0.8B), about
-/// 25 ms per row on the integrated GPU: 0.83 s at 32 rows and 1.63 s at 64 completed, 2.44 s at
-/// 96 and 3.26 s at the default 128 lost the device even alone in its submit, the Windows
-/// display-driver watchdog (TDR, 2 s) resetting the engine (`docs/plan/12-low-capability-vulkan.md`
-/// section 0b). No submit cap splits one dispatch, and the head on each chunk's last row is one
-/// row's work; the cap of 4 is kept from before the cause was known. The prefill phase of those
+/// 25 ms per row on the integrated GPU. With that dispatch in flight Windows resets the engine
+/// (a TDR engine timeout, in the event log), though not on every run: one run each lost the
+/// device at 96 and 128 rows with the dispatch alone in its submit, and completed at 32 and 64,
+/// while other runs at 128 completed. Whether the rule is a fixed limit on one dispatch or a
+/// preemption timeout is not established (`docs/plan/12-low-capability-vulkan.md` section 0c).
+/// No submit cap shortens one dispatch, and the head on each chunk's last row is one row's work
+/// and has never been reset; the cap of 4 is kept from before. The prefill phase of those
 /// runs then scores one row per chunk, too few for [`MIN_TOP1_SCORED`], which is not asked of it,
 /// and their first two positions are not scored at all unless one ends a chunk.
 pub const INTEGRATED_FLOAT_SUBMIT_CAP: usize = 4;

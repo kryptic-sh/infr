@@ -192,12 +192,16 @@ driver's fault report. The backend is then unusable: every later call returns
 the same error without touching the device, and teardown leaks rather than frees
 what the GPU may still be using. `infr run` prints it and exits non-zero;
 `infr serve` fails that request and every later one on that model with the same
-error, so restart the server. `0` waits forever (for debugging). The default
-sits more than ten times above the longest legitimate wait measured in the full
-GPU gate on 2026-11-18: 2.75 s on the Ryzen integrated GPU (one LFM3 forward
-submitted as one command buffer), and no wait over 100 ms on the RX 7900 XTX.
-Before this bound a submit whose work the GPU dropped hung the process forever
-with one core spinning (`docs/plan/12-low-capability-vulkan.md`).
+error, so restart the server. `0` waits forever (for debugging); any other value
+below 5000 is refused when the backend is created, since it would fail healthy
+work. The default sits more than ten times above the longest legitimate wait
+measured: in one full GPU gate run per device on 2026-11-18, with a temporary
+log (not in the tree) of every successful wait over 100 ms, the longest was 2.75
+s on the Ryzen integrated GPU (one LFM3 forward submitted as one command buffer,
+1258 waits logged) and none was logged on the RX 7900 XTX. Before this bound a
+submit whose work the GPU dropped hung the process forever with one core
+spinning (`docs/plan/12-low-capability-vulkan.md`). What the backend can and
+cannot detect about dropped work is in `docs/backlog.md` B222.
 
 **`[sampling]`** — `temp` (0 = greedy), `top_k`, `top_p`, `seed`, `max_new`,
 `ignore_eos`, `no_think`. **Provenance matters here**: `infr run` / `infr serve`
@@ -279,7 +283,7 @@ each value with the level it came from:
 $ infr tune show --dev Vulkan0
 device:  AMD Radeon RX 7900 XTX (AmdRdna3, AMD_PROPRIETARY)
 match:   vendor=amd arch=AmdRdna3 driver=AMD_PROPRIETARY integrated=false device_id=0x744c cu=96 subgroup=32-64 driver_version=0x800161
-hash:    5715f12d
+hash:    7751091e
 rows:
   amd-proprietary-split-k [class row, maintainer] sets split_k.scale_by_cu
   amd-proprietary-i8cm-kq [class row, maintainer] sets gemm_i8cm_kq.enabled
@@ -290,7 +294,18 @@ gemv_sg.rows                2      default
 ```
 
 `--json` prints the same as a document. The `hash` is also in the device banner
-(`tune:5715f12d`), so a log says whether two runs tuned alike.
+(`tune:7751091e`), so a log says whether two runs tuned alike.
+
+One parameter is not a kernel choice: `submit.initial_dispatches`, the submit
+splitter's cap before any forward has been measured (`0` = one command buffer
+per forward). Its default is 128 on an integrated GPU, 64 on a discrete device
+that is wave64-only or has neither 16x16x16 f16 cooperative matrices nor an
+accelerated int8 dot (the device facts `matrix_units` and `dot_accelerated` in
+`infr tune show --json`), and 0 otherwise. A device that reports neither fact,
+an unknown card included, starts at 64: splitting a fast card's first forward
+costs a few submits, while not splitting a slow one's lost the device (issue
+94). The default spares single-token forwards on a discrete card; a value set at
+any other level, or `device.submit_dispatches`, applies to every forward.
 
 Each value is resolved once, when the backend is created, from these levels —
 the last one that sets a parameter wins, per parameter:

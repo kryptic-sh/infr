@@ -1740,9 +1740,12 @@ fn gpu_seam_bf16_matches_cpu() {
 // verified coherent at capture). Missing quants are skipped. Refresh with `INFR_BLESS=1`.
 // All verified coherent at capture — every quant recalls "France's capital is Paris" (Q2_K is a
 // touch repetitive, as expected for 2-bit; the float-ish quants still converge: Q5_K==Q8_0==BF16).
-// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): Q4_K_M changed with
-// `QWEN3_GOLDEN`'s France case; the other quants are not cached here and were not re-run; identical
-// natively on Windows and under WSL.
+// Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): Q4_K_M changed
+// with `QWEN3_GOLDEN`'s France case, identical natively on Windows and under WSL.
+// Not verified under the activation split: every case but Q4_K_M. Q8_0 was already stale on
+// `main` (its file was not cached when the goldens were last re-blessed) and is cached now, so
+// this test fails on it until it is re-blessed; IQ4_XS, Q2_K, Q4_0, Q5_K_M, Q6_K and BF16 are not
+// cached here and still carry their older values (docs/backlog.md, B214).
 const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
     ("IQ4_XS", 32, 0xd028ff03b524cb28),
     ("Q2_K", 32, 0x6442c2818c12ca56),
@@ -3359,7 +3362,8 @@ fn qwen3moe_30b() -> Option<PathBuf> {
 // the quoted question now ends in "is..." where it ended in "is"; identical natively on Windows
 // and under WSL. Re-blessed the same day when one-row `Op::MoeFfn` (every decode step) moved
 // onto the int8 expert kernels: the text forks after "is...\"", which is now followed by "and then
-// it cuts off. I need", and stays coherent. Blessed on Windows; not yet run under WSL.
+// it cuts off. I need", and stays coherent. Blessed on Windows only: unconfirmed on Linux, and
+// CI does not run the MoE goldens.
 const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
     &[("The capital of France is", 24, 0xa68ab7f4d15ad931)];
 

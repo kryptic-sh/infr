@@ -66,14 +66,16 @@ const PROMPTS: [&str; 3] = [
 const N_DECODE: usize = 8;
 
 fn find_model(key: &str) -> PathBuf {
+    cached_model(key).unwrap_or_else(|| panic!("{key} is not in the HF cache"))
+}
+
+/// The cached GGUF for a catalogue key, or `None` when it is not downloaded.
+fn cached_model(key: &str) -> Option<PathBuf> {
     let &(_, repo, file) = MODELS
         .iter()
         .find(|m| m.0 == key)
         .unwrap_or_else(|| panic!("no model {key:?} in the catalogue"));
-    infr_hub::Store::discover()
-        .ok()
-        .and_then(|s| s.snapshot_file(repo, file))
-        .unwrap_or_else(|| panic!("{file} is not in the HF cache"))
+    infr_hub::Store::discover().ok()?.snapshot_file(repo, file)
 }
 
 fn load(path: &std::path::Path, reference: bool) -> SeamModel {
@@ -544,11 +546,21 @@ const POSITION_0_BOUNDS: &[(&str, f64)] = &[("smollm3-3b", 1e-2), ("qwen3-0.6b",
 /// The production CPU's first-token row against the CPU reference on real models whose first
 /// token carries massive-activation dimensions: the regression the int8 activation split fixes.
 #[test]
-#[ignore = "needs SmolLM3-3B and Qwen3-0.6B Q4_K_M in the HF cache"]
+#[ignore = "needs SmolLM3-3B or Qwen3-0.6B Q4_K_M in the HF cache"]
 fn position_0_matches_the_reference() {
     let mut ran = 0;
     for &(key, bound) in POSITION_0_BOUNDS {
-        let model = load(&find_model(key), false);
+        // A model that is not cached is skipped, unless `INFR_TEST_REQUIRE_MODELS` is set (the
+        // golden jobs set it), where a skip would pass without checking anything.
+        let Some(path) = cached_model(key) else {
+            assert!(
+                std::env::var_os("INFR_TEST_REQUIRE_MODELS").is_none(),
+                "{key} is not in the HF cache, and INFR_TEST_REQUIRE_MODELS requires it"
+            );
+            eprintln!("skip: {key} not in the HF cache");
+            continue;
+        };
+        let model = load(&path, false);
         let toks = model.encode(PROMPTS[0]).expect("encode");
         let r = reference_run(&model, &toks, 1);
         let s = score_rows(&r, &forced(&model, ForcedOn::Cpu, &r));
@@ -563,7 +575,9 @@ fn position_0_matches_the_reference() {
         );
         ran += 1;
     }
-    assert_eq!(ran, POSITION_0_BOUNDS.len());
+    if ran == 0 {
+        eprintln!("skip: none of the models is cached; nothing was checked");
+    }
 }
 
 /// llama.cpp's CPU, infr's production CPU and infr's reference against each other on the last

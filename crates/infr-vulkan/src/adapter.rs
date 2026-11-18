@@ -4988,7 +4988,7 @@ pub(crate) fn execute(be_: &VulkanBackend, plan: &dyn Plan, bindings: &Bindings)
         pbytes[4..8].copy_from_slice(&kv_len.to_le_bytes());
         be_.upload(replay.params.as_ref(), &pbytes)?;
     }
-    replay.recorded.replay().map_err(|e| be(e.to_string()))?;
+    replay.recorded.replay()?;
     Ok(())
 }
 
@@ -5050,7 +5050,7 @@ pub(crate) fn execute_chain(
     }
     // The chunk decodes positions p0+1 ..= p0+n (params[0] = the last decoded position).
     let p0 = read_pos0(be_, replay.params.as_ref())?;
-    replay.recorded.replay_n(n).map_err(|e| be(e.to_string()))?;
+    replay.recorded.replay_n(n)?;
     let mut rbytes = vec![0u8; 64 * 4];
     be_.download(ring.as_ref(), &mut rbytes)?;
     let ring_u32: &[u32] = bytemuck::cast_slice(&rbytes);
@@ -5659,7 +5659,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             let partial = rec.take().expect("segment always Some between ops");
             discard_segment(be_, partial).map_err(|e| be(e.to_string()))?;
             for seg in segments {
-                seg.wait().map_err(|e| be(e.to_string()))?;
+                seg.wait()?;
             }
             pstream.drain()?;
             // `transient`, `pool`, `dyn_args` and the scratch arena drop AFTER these waits (they
@@ -5683,7 +5683,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
             // finished N — in steady state this fence is already signaled and the wait is free.
             while segments.len() > MAX_INFLIGHT {
                 let old = segments.pop_front().expect("len > MAX_INFLIGHT >= 0");
-                old.wait().map_err(|e| be(e.to_string()))?;
+                old.wait()?;
             }
             let fresh = be_.recorder()?;
             // Hazard tracking is per-recorder and starts empty, so cross-segment RAW/WAR ordering
@@ -5803,7 +5803,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     // pipelined segments' command buffers/fences (every buffer they referenced outlives this
     // call: pooled scratch in `transient`, ring/tape/arenas on the session).
     for seg in segments {
-        seg.wait().map_err(|e| be(e.to_string()))?;
+        seg.wait()?;
     }
     pstream.drain()?;
     if be_.moe_paged() {
@@ -5919,7 +5919,7 @@ impl PagedStream {
     fn drain(&mut self) -> Result<()> {
         for p in &mut self.pending {
             if let Some(s) = p.take() {
-                s.wait().map_err(|e| be(e.to_string()))?;
+                s.wait()?;
             }
         }
         Ok(())
@@ -5941,7 +5941,7 @@ fn rotate_stream<'a>(
     ps.half ^= 1;
     ps.cursor = 0;
     if let Some(prev) = ps.pending[ps.half].take() {
-        prev.wait().map_err(|e| be(e.to_string()))?;
+        prev.wait()?;
     }
     let fresh = be_.recorder()?;
     fresh.seed_barrier();

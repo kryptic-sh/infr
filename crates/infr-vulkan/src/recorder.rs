@@ -10767,7 +10767,9 @@ impl<'a> Recorder<'a> {
         self.be
             .shared
             .wait_queue_idle(&|| format!("a forward submitted as one command buffer of {desc}"))?;
-        account_segment(&self.be.shared, self.seg_query_pool);
+        // A missing closing stamp poisons the backend (see `account_segment`); what the reset
+        // discarded is leaked like any other failed wait.
+        account_segment(&self.be.shared, self.seg_query_pool, desc)?;
         if self.stages {
             eprintln!(
                 "[prof] record={:.1}ms submit+gpu={:.1}ms",
@@ -10971,19 +10973,28 @@ impl<'a> Recorder<'a> {
                 Self::MAX_TS,
             );
         }
-        let mut ticks = vec![0u64; n + 1];
-        unsafe {
-            self.be
-                .shared
-                .device
-                .get_query_pool_results(
-                    self.query_pool,
-                    0,
-                    &mut ticks,
-                    vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-                )
-                .expect("get_query_pool_results");
+        // Read without waiting, with availability: after a hang-watchdog reset the fence signals
+        // although stamps were never written, and a `WAIT` read of those never returns (see
+        // `account_segment`).
+        let mut stamps = vec![[0u64; 2]; n + 1];
+        let read = unsafe {
+            self.be.shared.device.get_query_pool_results(
+                self.query_pool,
+                0,
+                &mut stamps,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
+            )
+        };
+        let missing = stamps.iter().filter(|s| s[1] == 0).count();
+        if !matches!(read, Ok(()) | Err(vk::Result::NOT_READY)) || missing > 0 {
+            eprintln!(
+                "[prof_ops] WARNING: no per-op report for this submit: {missing} of {} timestamps \
+                 were never written ({read:?})",
+                n + 1
+            );
+            return;
         }
+        let ticks: Vec<u64> = stamps.iter().map(|s| s[0]).collect();
         let period = unsafe {
             self.be
                 .shared
@@ -11245,7 +11256,7 @@ impl PendingSegment {
         // Only reached once the segment completed: a failed wait (above, or a backend already
         // poisoned) returns first and leaks the command buffer, pools and fence the GPU may still
         // be using (see `gpu_wait`).
-        account_segment(&self.shared, self.seg_query_pool);
+        account_segment(&self.shared, self.seg_query_pool, desc)?;
         let device = &self.shared.device;
         unsafe {
             if self.seg_query_pool != vk::QueryPool::null() {
@@ -11263,34 +11274,57 @@ impl PendingSegment {
     }
 }
 
-/// Add one COMPLETED segment's GPU interval to the backend's running sum (or count it untimed) —
-/// the input `crate::ForwardClock` judges a forward by. `qp` is that segment's two-stamp pool,
-/// null when it was recorded untimed; it is only read here, never destroyed.
-fn account_segment(shared: &crate::VulkanShared, qp: vk::QueryPool) {
+/// Add one segment's GPU interval to the backend's running sum (or count it untimed) — the input
+/// `crate::ForwardClock` judges a forward by — once its fence has signalled. `qp` is that
+/// segment's two-stamp pool, null when it was recorded untimed; it is only read here, never
+/// destroyed.
+///
+/// The stamps double as a completion check. A signalled fence does not prove the work ran: after
+/// a hang-watchdog reset (Windows TDR, an engine timeout) AMD's Windows driver signalled the
+/// fence of a forward on the integrated GPU after about 6 s, and a `WAIT` read of its stamps then
+/// never returned, spinning a core (plan 12 section 0b). So the stamps are read WITHOUT waiting,
+/// and a closing stamp (the segment's last command) missing after the fence signalled poisons
+/// the backend: whatever that segment should have written cannot be trusted. A lost device met
+/// by the read poisons it too. An untimed segment has no such check.
+fn account_segment(
+    shared: &crate::VulkanShared,
+    qp: vk::QueryPool,
+    desc: SubmitDesc,
+) -> Result<()> {
     use std::sync::atomic::Ordering;
     let Some(period) = shared
         .segment_ts_period
         .filter(|_| qp != vk::QueryPool::null())
     else {
         shared.untimed_segments.fetch_add(1, Ordering::Relaxed);
-        return;
+        return Ok(());
     };
-    let mut ticks = [0u64; 2];
+    // (value, availability) per stamp.
+    let mut ticks = [[0u64; 2]; 2];
     let read = unsafe {
         shared.device.get_query_pool_results(
             qp,
             0,
             &mut ticks,
-            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WITH_AVAILABILITY,
         )
     };
     match read {
-        Ok(()) => {
-            let ns = (ticks[1].wrapping_sub(ticks[0]) as f64 * period as f64) as u64;
+        Ok(()) | Err(vk::Result::NOT_READY) if ticks[0][1] != 0 && ticks[1][1] != 0 => {
+            let ns = (ticks[1][0].wrapping_sub(ticks[0][0]) as f64 * period as f64) as u64;
             shared.segment_gpu_ns.fetch_add(ns, Ordering::Relaxed);
+            Ok(())
         }
+        Ok(()) | Err(vk::Result::NOT_READY) => {
+            Err(shared.work_dropped(&format!("a forward segment of {desc}")))
+        }
+        Err(vk::Result::ERROR_DEVICE_LOST) => Err(shared.device_lost(&format!(
+            "reading the closing timestamp of a forward segment of {desc}"
+        ))),
+        // Any other failure only costs this segment its timing, as before.
         Err(_) => {
             shared.untimed_segments.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
 }

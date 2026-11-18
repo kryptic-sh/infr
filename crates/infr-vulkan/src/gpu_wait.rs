@@ -113,9 +113,23 @@ impl std::fmt::Display for SubmitDesc {
     }
 }
 
-/// How a failed wait reads in the error, from what the wait returned. Pure, so the wording of
-/// each case is testable without a GPU.
-fn failure_headline(result: vk::Result, waited: Duration, bound_ns: u64, what: &str) -> String {
+/// How a failure reads in the error: a wait on `what` that returned `result` after `waited`, or with
+/// `None` the action `what` itself (a submit) returning it. Pure, so the wording of each case is
+/// testable without a GPU.
+fn failure_headline(
+    result: vk::Result,
+    waited: Option<Duration>,
+    bound_ns: u64,
+    what: &str,
+) -> String {
+    let Some(waited) = waited else {
+        return match result {
+            vk::Result::ERROR_DEVICE_LOST => {
+                format!("the GPU device was lost: {what} failed")
+            }
+            other => format!("{what} failed: {other}"),
+        };
+    };
     let waited = fmt_duration(waited);
     match result {
         vk::Result::TIMEOUT => format!(
@@ -181,7 +195,7 @@ impl VulkanShared {
         let waited = unsafe { self.device.wait_for_fences(fences, true, bound) };
         match waited {
             Ok(()) => Ok(()),
-            Err(e) => Err(self.poison(e, t0.elapsed(), fences.first().copied(), &what())),
+            Err(e) => Err(self.poison(e, Some(t0.elapsed()), fences.first().copied(), &what())),
         }
     }
 
@@ -209,21 +223,46 @@ impl VulkanShared {
     /// backend like a failed wait; any other failure is an ordinary error (nothing was queued).
     pub(crate) fn submit_failed(&self, e: vk::Result, what: &str) -> Error {
         if e == vk::Result::ERROR_DEVICE_LOST {
-            return self.poison(e, Duration::ZERO, None, what);
+            return self.poison(e, None, None, &format!("submitting {what}"));
         }
         be(format!("queue_submit ({what}): {e}"))
+    }
+
+    /// The error for a lost device met by `what` (an action, not a wait). Poisons the backend.
+    pub(crate) fn device_lost(&self, what: &str) -> Error {
+        self.poison(vk::Result::ERROR_DEVICE_LOST, None, None, what)
+    }
+
+    /// The error for `what` whose fence signalled although its work never ran to its end — its
+    /// closing timestamp is missing (`recorder::account_segment`). Poisons the backend.
+    pub(crate) fn work_dropped(&self, what: &str) -> Error {
+        self.poison_with(
+            format!(
+                "the GPU signalled {what} complete but never wrote its closing timestamp: the \
+                 driver reset the GPU (a hang watchdog such as Windows TDR) and signalled the \
+                 fence of work it discarded, so its results are missing"
+            ),
+            None,
+            false,
+        )
     }
 
     /// Record the first fatal failure and return the error every later call will see.
     fn poison(
         &self,
         result: vk::Result,
-        waited: Duration,
+        waited: Option<Duration>,
         fence: Option<vk::Fence>,
         what: &str,
     ) -> Error {
         let bound = self.gpu_wait.timeout_ns.load(Ordering::Relaxed);
-        let mut msg = failure_headline(result, waited, bound, what);
+        let headline = failure_headline(result, waited, bound, what);
+        self.poison_with(headline, fence, result == vk::Result::ERROR_DEVICE_LOST)
+    }
+
+    /// [`Self::poison`] with the headline written: adds the fence's state, the device-fault
+    /// report and the closing sentence, and records the first failure.
+    fn poison_with(&self, mut msg: String, fence: Option<vk::Fence>, lost: bool) -> Error {
         if let Some(f) = fence {
             let state = match unsafe { self.device.get_fence_status(f) } {
                 Ok(true) => "signalled".to_string(),
@@ -232,7 +271,7 @@ impl VulkanShared {
             };
             msg.push_str(&format!("; fence status now: {state}"));
         }
-        let lost = result == vk::Result::ERROR_DEVICE_LOST
+        let lost = lost
             || matches!(
                 fence.map(|f| unsafe { self.device.get_fence_status(f) }),
                 Some(Err(vk::Result::ERROR_DEVICE_LOST))
@@ -423,7 +462,7 @@ mod tests {
         let what = "a forward segment of 7 dispatches";
         let t = failure_headline(
             vk::Result::TIMEOUT,
-            Duration::from_millis(2500),
+            Some(Duration::from_millis(2500)),
             2_000_000_000,
             what,
         );
@@ -437,7 +476,7 @@ mod tests {
         );
         let l = failure_headline(
             vk::Result::ERROR_DEVICE_LOST,
-            Duration::from_micros(1500),
+            Some(Duration::from_micros(1500)),
             1,
             what,
         );
@@ -447,11 +486,18 @@ mod tests {
         );
         let o = failure_headline(
             vk::Result::ERROR_OUT_OF_HOST_MEMORY,
-            Duration::ZERO,
+            Some(Duration::ZERO),
             1,
             what,
         );
         assert!(o.contains("failed") && o.contains(what), "{o}");
+        // A lost device met at submit time says so, not "waited 0.0 ms".
+        let submit = format!("submitting {what}");
+        let s = failure_headline(vk::Result::ERROR_DEVICE_LOST, None, 1, &submit);
+        assert_eq!(
+            s,
+            format!("the GPU device was lost: submitting {what} failed")
+        );
     }
 
     #[test]

@@ -6767,6 +6767,15 @@ S3/S4 work and not re-read for this entry:
   Q4_K 2.63-2.65 ms per call against 2.47-2.53 natively), whose surrounding code
   the compiler autovectorizes with the build's own features. Not investigated
   further.
+- **Native reference mode has a slow spot of its own, not traced.** On
+  reference-mode decode (Qwen3-0.6B tg64, `kernels.cpu.reference`) the baseline
+  build with the FMA tier ran faster than the native builds: 26.6-27.3 tok/s
+  against 24.7-25.6 for both `origin/main`'s and this branch's native builds, in
+  all eight rounds in `docs/math.md` against the branch's and in seven against
+  `main`'s (round 3 had a low run: baseline 23.1, the branch's native 17.9,
+  `main`'s native 24.7). `main`'s native build is as slow, so it is not
+  introduced here. The f32 dot microbench is at parity, so the cost is elsewhere
+  in that path.
 - **f32 multiply-adds not on the tier.** `seam/sc.rs` (Diffusion-Gemma's host
   self-conditioning: the soft embedding's f16 `mul_add` and the down phase's) is
   in `infr-llama`, which has no SIMD dispatch; putting it on the tier means

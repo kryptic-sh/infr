@@ -447,7 +447,7 @@ up to two thirds) and are not shown:
 
 **The native build is level.** Paired, `fma` minus `main` on Qwen3-1.7B pp512:
 +57.3, -0.3, -2.9, +360.2 (a low `main` run), -8.4, -3.9, -5.2, +6.8; without
-the outlier the mean is +6.2 t/s and five of seven differences are under 1%
+the outlier the mean is +6.2 t/s and six of seven differences are under 1%
 either way. gemma-3-1b pp512: -4.1, -8.2, +7.8, +13.5, -1.1, +0.3, -5.0, -7.8
 (mean -0.6). Decode: Qwen3-1.7B +1.3, +2.5, +1.9, 0, -0.6, -1.1, +0.3, +0.1;
 reference mode within ±0.2 except one low `fma` run. The 2% the review measured

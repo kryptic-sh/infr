@@ -6962,3 +6962,54 @@ values. What it leaves:
   one); the f16 KV write's NaNs are, exhaustively, and match.
 - **Not run: a whole f16-weight model.** No F16 GGUF is cached here; the f16
   dot's gain (native 0.321 to 0.084 ns per element) is from the microbench.
+
+### B220 — work in flight when the 2026-11-18 session paused
+
+**Tag:** handoff · **Kind:** unmerged branches, local only (nothing here is on
+`origin`)
+
+Delete this entry as each item lands or is dropped. Worktrees are under
+`.claude/worktrees/` in the main checkout.
+
+- **`fix/cpu-act-quant`** (worktree `agent-a5f74ac20efa5ad6f`, commits
+  `653fef45` and `b7521454`): the production CPU's int8 activation quantizer
+  lost the rest of a 256-element block when a few first-token activations were
+  very large (SmolLM3-3B: KL up to 4.88 against the CPU float reference at
+  sequence position 0, top-1 flipped; llama.cpp quantizes the same way and
+  shares it). The branch moves up to two elements standing more than 16 times
+  above the rest of their block into a sparse part with its own scale; the coder
+  measured position-0 KL at 1.4e-4 on SmolLM3 afterwards, steady state level,
+  ten CPU goldens re-blessed. On top of it sits the one-row MoE int8 change the
+  owner approved (formerly B203). **Not landed because:** the coder measured
+  about 3 to 4% slower prefill (pp512, Qwen3-1.7B and gemma-3-1b, eight paired
+  rounds taken while a GPU test suite was running, so not yet trusted), and a
+  review was still running when the session paused. Open questions put to that
+  review: is the cost real and where is it (the outlier scan on ordinary rows,
+  or many rows splitting); do the identity tests' generated inputs contain
+  outlier blocks at all. The `qwen3moe` golden's new value was blessed on
+  Windows only. **Owner decision pending:** take the cost, make the outlier path
+  cheaper first, or use a ratio of 32 (level in speed on Qwen3, no margin left
+  on ERNIE's first token). The branch's own write-up is
+  `docs/cpu-activations.md` on the branch; its backlog entries B209 to B212
+  arrive with it.
+- **`fix/vulkan-submit-bounds`** (worktree `agent-a8062689012d7ef4b`,
+  UNCOMMITTED edits only when the session paused): bounded GPU waits that report
+  an error instead of spinning a core forever (`PendingSegment::drain`'s fence
+  wait has no timeout today), a diagnosis of what cuts GPU work off on the
+  integrated GPU (see plan 12, section 0b), and work-bounded submits from the
+  first forward (plan 12, S1 and S2). The coder was running its GPU gates. Not
+  reviewed.
+- **`perf/cpu-moe-fma`** (worktree `agent-a3dcdc590e9cddeff`): superseded. Its
+  FMA-tier commit landed through `perf/cpu-fma`; its MoE commit `daa53774` is
+  cherry-picked onto `fix/cpu-act-quant`. Delete the branch once that lands.
+- **Waiting on other people:** issue 94 (the RX 580 owner was asked for
+  diagnostic runs on `main`), issue 100 (Apple Silicon numbers for the CPU
+  math), issue 101 (the reporter was invited to open a PR for an incremental
+  shader cache), llama.cpp issue 32424.
+- **Next in the queues, not started:** NEON kernels for aarch64 with a CI step
+  that prints the scalar-to-NEON ratio (B206); plan 11's G3 and G4 (commit the
+  planted-bug tests; convert the exact GPU goldens and wire `infr tune check`);
+  plan 10's tuning slices S2 onward; plan 12's kernel ports from the fork.
+- **Measurements owed on a quiet machine:** the FMA tier's baseline and native
+  tables in `docs/math.md` (every round there had one core busy); the quantizer
+  fix's prefill cost.

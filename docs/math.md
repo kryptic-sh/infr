@@ -430,36 +430,50 @@ other agent's GPU test spinning one core): `Attention` per call, baseline build
 2.93-3.14 (this branch); `WriteKv` baseline 744-794 µs before and 128-142 after,
 native 202-224 before and 134-139 after.
 
-`infr bench --dev cpu`, Windows, four binaries interleaved per round (`main` =
-`origin/main`, `fma` = this branch; baseline builds `-C target-cpu=x86-64`),
-three reps per round, tok/s. No quiet window came in the hours available: in
-rounds 1-8 the other agent's GPU test spun one core throughout (`gt7.exe`, 10 s
-of CPU per 10 s), and rounds 9-12 were disturbed further (their figures drop by
-up to two thirds) and are not shown:
+`infr bench --dev cpu` (three reps a run, tok/s), Windows, re-measured on a
+quiet machine on 2026-11-19: no other build, test or model run, the process list
+read before every round (only an idle, hung `cargo test` of another project was
+present, at no CPU). "Before" is `f8b70055` (the parent of `65c99e45`, which
+added the tier), "after" is `1b16e66b` (the tier and its follow-ups, before the
+activation split; `docs/cpu-activations.md` measures the split from the same
+rounds). Release builds, native (`target-cpu=native`) and baseline
+(`-C target-cpu=x86-64`); six binaries in each of twelve rounds, their order
+reversed every other round:
 
-| Model, run                  | baseline `main`                                        | baseline `fma`                                               | native `main`                                                 | native `fma`                                                   |
-| --------------------------- | ------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------- | -------------------------------------------------------------- |
-| Qwen3-1.7B, pp512           | 320.2, 317.9, 316.0, 313.6, 324.7, 322.6, 321.1, 319.2 | 1027.4, 1015.6, 1020.5, 985.7, 1017.6, 1027.0, 1016.9, 993.7 | 1098.1, 1095.6, 1123.0, 676.1, 1100.6, 1121.4, 1099.0, 1097.4 | 1155.4, 1095.3, 1120.1, 1036.3, 1092.2, 1117.5, 1093.8, 1104.2 |
-| gemma-3-1b-it, pp512        | 370.3, 366.3, 369.4, 355.4, 361.2, 350.9, 357.3, 362.0 | 571.7, 567.8, 562.0, 553.9, 562.3, 570.3, 555.2, 556.4       | 576.2, 574.3, 570.7, 557.3, 576.4, 576.4, 575.0, 576.3        | 572.1, 566.1, 578.5, 570.8, 575.3, 576.7, 570.0, 568.5         |
-| Qwen3-1.7B, tg64            | 50.2, 50.0, 50.3, 50.7, 48.1, 48.6, 50.4, 48.9         | 49.6, 51.6, 45.9, 49.2, 50.2, 49.5, 46.9, 49.4               | 55.9, 54.1, 54.8, 56.8, 57.2, 57.1, 56.5, 56.7                | 57.2, 56.6, 56.7, 56.8, 56.6, 56.0, 56.8, 56.8                 |
-| Qwen3-0.6B, tg64, reference | 14.1, 14.1, 14.0, 14.2, 14.2, 14.3, 14.2, 11.5         | 27.2, 27.2, 23.1, 27.3, 27.3, 26.7, 27.1, 26.6               | 25.1, 25.0, 24.7, 25.5, 25.6, 25.4, 25.4, 25.2                | 25.3, 25.2, 17.9, 25.6, 25.4, 25.2, 25.5, 25.1                 |
+| Model, run                | baseline before                                                                    | baseline after                                                                                 | native before                                                                                  | native after                                                                                   |
+| ------------------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Qwen3-1.7B pp512          | 334.2, 333.2, 334.1, 334.2, 332.5, 333.7, 335.2, 331.7, 332.2, 333.6, 332.5, 334.8 | 1028.5, 1025.8, 1042.2, 1023.9, 1030.8, 1027.3, 1032.0, 1041.0, 1044.8, 1021.7, 1032.5, 1025.2 | 1141.6, 1105.5, 1152.5, 1140.3, 1114.8, 1136.4, 1112.8, 1151.6, 1113.2, 1112.2, 1100.2, 1160.6 | 1125.5, 1158.2, 1149.8, 1147.5, 1151.7, 1140.4, 1146.9, 1145.5, 1145.9, 1144.0, 1114.2, 1121.7 |
+| gemma-3-1b-it pp512       | 369.3, 378.5, 380.2, 380.9, 383.2, 374.3, 378.4, 381.4, 380.5, 383.9, 381.9, 380.8 | 580.7, 590.1, 592.5, 592.7, 592.4, 578.8, 586.3, 581.6, 589.3, 588.4, 592.2, 587.8             | 591.8, 586.2, 595.9, 587.7, 583.9, 596.0, 592.1, 590.8, 601.5, 592.9, 597.8, 598.0             | 595.6, 596.6, 596.6, 590.9, 590.0, 596.6, 588.7, 597.5, 594.8, 590.9, 601.0, 601.7             |
+| Qwen3-1.7B tg64           | 52.2, 52.1, 51.9, 52.2, 52.2, 52.2, 52.5, 52.3, 51.8, 52.7, 52.0, 51.9             | 53.7, 52.5, 52.6, 53.2, 53.6, 53.2, 52.7, 52.0, 52.2, 52.9, 52.6, 52.6                         | 57.5, 58.7, 58.0, 57.8, 57.6, 57.9, 58.1, 58.1, 58.1, 57.4, 58.0, 58.1                         | 57.8, 57.4, 57.2, 57.9, 57.0, 58.0, 57.4, 57.4, 57.8, 58.3, 57.6, 57.7                         |
+| Qwen3-0.6B tg64 reference | 14.8, 15.0, 14.8, 14.9, 14.8, 14.8, 14.8, 14.8, 14.8, 14.8, 14.7, 14.9             | 28.3, 28.4, 28.3, 27.9, 28.2, 28.2, 28.2, 28.4, 28.2, 28.1, 27.8, 28.1                         | 26.0, 26.2, 26.3, 25.8, 26.1, 25.6, 25.8, 26.1, 25.9, 26.1, 25.9, 26.0                         | 25.9, 26.2, 26.2, 25.9, 26.2, 26.1, 25.7, 26.0, 26.1, 25.7, 25.8, 26.0                         |
 
-**The native build is level.** Paired, `fma` minus `main` on Qwen3-1.7B pp512:
-+57.3, -0.3, -2.9, +360.2 (a low `main` run), -8.4, -3.9, -5.2, +6.8; without
-the outlier the mean is +6.2 t/s and six of seven differences are under 1%
-either way. gemma-3-1b pp512: -4.1, -8.2, +7.8, +13.5, -1.1, +0.3, -5.0, -7.8
-(mean -0.6). Decode: Qwen3-1.7B +1.3, +2.5, +1.9, 0, -0.6, -1.1, +0.3, +0.1;
-reference mode within ±0.2 except one low `fma` run. The 2% the review measured
-on `main` against the first version of this work is not reproduced; its
-`WriteKv` difference is gone with the wide f16 write, which is now faster than
-`main`'s on both builds.
+**The noise.** The same native binary against a copy of itself, five paired
+rounds of the same protocol: paired differences of -1.8 to +3.1% on single
+rounds, medians -0.9% (Qwen3-1.7B pp512), +0.2% (gemma-3-1b pp512), +1.1%
+(Qwen3-1.7B tg64), +0.2% (gemma-3-1b tg64), +0.2% (reference tg64). So a median
+under about 1% is no measurable change here.
 
-**The baseline build** gains 3.2x on Qwen3-1.7B prefill (314-325 to 986-1027),
-1.55x on gemma-3-1b prefill (351-370 to 554-572) and 1.9x on reference-mode
-decode (which now runs faster than the native build; not traced); production
-decode is level. Against the native build it is now at about 92% on Qwen3-1.7B
-prefill, 98% on gemma-3-1b and 88% on decode; what is left is outside the f32
-dots (backlog B208).
+**The native build is level.** Paired after against before, median of the
+twelve: Qwen3-1.7B pp512 +1.0% (after lower in 4 of 12), gemma-3-1b pp512 +0.5%
+(3 of 12), Qwen3-1.7B tg64 -0.8% (8 of 12), reference tg64 -0.2% (7 of 12).
+
+**The baseline build** gains 3.1x on Qwen3-1.7B prefill (median paired +207.9%),
+1.55x on gemma-3-1b prefill (+54.9%) and 1.9x on reference-mode decode (+90.6%);
+production decode is level (+1.2%). Against the native build of the same commit
+it is at 90% on Qwen3-1.7B prefill (median paired -9.6%, 12 of 12), 99% on
+gemma-3-1b prefill (-1.0%), 92% on Qwen3-1.7B decode (-8.4%) and 90% on
+gemma-3-1b decode (-9.7%); what is left is outside the f32 dots (backlog B208).
+
+**Reference mode runs faster on the baseline build**, 8.1% (median paired, 12 of
+12), and the native build was as slow before the tier (median 26.0 on both), so
+the tier did not introduce it. The cause is the weight decode, not the dot: with
+each reference-mode `Linear`'s two halves timed separately (a scratch build; the
+per-op profile does not time that branch at all, it `continue`s past the timer),
+the f32 dots take the same time on both builds and `bytes_to_f32` (the per-row
+Q4_K and Q6_K dequantization to f32) takes 8 to 17% more on the native one:
+summed over threads per decode call, the 1024x3072 Q4_K rows 2.0-2.1 ms native
+against 1.8 ms baseline, the Q6_K output head 115-117 ms against 106-107 (four
+rounds each, Qwen3-0.6B tg64).
 
 ## The determinism rule
 

@@ -346,9 +346,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefilled in any chunk height gives the same bits. With the activation split
   (Fixed, below) Qwen3-30B-A3B's first token, run as a one-row graph, is at KL
   9e-4 and 9e-3 from the reference on two prompts; with the old quantizer it was
-  0.16 and 1.21. **Upgrade note:** MoE models' CPU decode output changes once
-  (`cpu_golden_qwen3moe` re-blessed on Windows only: its Linux value is
-  unconfirmed, and CI does not run the MoE goldens).
+  0.16 and 1.21. Decode is about 2% faster (tg64 medians +2.1% on Qwen3-30B-A3B,
+  +2.0% on ERNIE-4.5-21B-A3B, ten paired rounds on a quiet machine). **Upgrade
+  note:** MoE models' CPU decode output changes once (`cpu_golden_qwen3moe`
+  re-blessed on Windows only: its Linux value is unconfirmed, and CI does not
+  run the MoE goldens).
 
 - **A slow discrete GPU splits its first forward (issue 94).** A device that is
   wave64-only, or has neither 16x16x16 f16 cooperative matrices nor an
@@ -375,15 +377,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   bits. The f16 KV cache write and the f16 dot convert eight values at a time on
   every build (the same bits as `half`'s conversion, checked on all 2^32
   inputs), and the bf16 dot reads its weights in chunks. Measured on a Ryzen 9
-  9950X3D, 16 threads, eight interleaved rounds with another agent's test
-  spinning one core throughout, the few runs that fell far below their own
-  rounds' values left out (every run is in `docs/math.md`), baseline build
-  before against after: Qwen3-1.7B Q4_K_M pp512 314-325 to 986-1027 tok/s (a
-  native build: 1036-1155), gemma-3-1b-it pp512 351-370 to 554-572 (native
-  566-579), Qwen3-0.6B tg64 in reference mode 14.0-14.3 to 26.6-27.3 (native
-  25.1-25.6); `WriteKv` into an f16 cache 744-794 to 128-142 µs per call.
-  Production decode is level, and so is a native build, whose f16 dot is about
-  four times faster and whose f16 KV write is faster.
+  9950X3D, 16 threads, twelve interleaved rounds on a quiet machine (every run
+  is in `docs/math.md`), baseline build before against after: Qwen3-1.7B Q4_K_M
+  pp512 331.7-335.2 to 1021.7-1044.8 tok/s (a native build: 1114.2-1158.2),
+  gemma-3-1b-it pp512 369.3-383.9 to 578.8-592.7 (native 588.7-601.7),
+  Qwen3-0.6B tg64 in reference mode 14.7-15.0 to 27.8-28.4 (native 25.7-26.2);
+  `WriteKv` into an f16 cache 744-794 to 128-142 µs per call (a profile taken
+  with another agent's test running). Production decode is level, and so is a
+  native build, whose f16 dot is about four times faster and whose f16 KV write
+  is faster.
 
 - **CPU outputs are identical on every operating system, and change once.**
   Every transcendental function the CPU backend uses (`exp`, `ln`, `ln_1p`,
@@ -885,15 +887,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   KL ratio 0.70 to 0.98 per model), with single positions moving both ways. The
   split is not only a first-token event: on the inputs of the FFN down
   projections it fires all through a sequence (1.6 to 38% of rows, by model and
-  weight format), and that is where its cost is: about 2% of prefill in two
-  measurements on a shared machine (pp512 medians -1.7% and -3.2% on Qwen3-1.7B,
-  -1.2% and -3.8% on gemma-3-1b), decode level. The owner accepted it; a cheaper
-  sparse dot is queued (backlog B213). Blocks without such outliers quantize to
-  the same bits as before. Measurements and the options weighed are in
-  `docs/cpu-activations.md`. **Upgrade note:** the production CPU's output
-  changes once for every model whose activations carry such outliers (the CPU
-  goldens were re-blessed, Windows and Linux agreeing, except as B214 lists);
-  one-token llama.cpp parity dumps now differ at position 0 by design (B212).
+  weight format), and that is where its cost is: on a quiet machine, twelve
+  paired rounds of pp512, 3.5% on Qwen3-1.7B and 1.9% on gemma-3-1b with a
+  native build, 1.7% and 1.5% with a baseline build; decode level. The owner
+  accepted it; a cheaper sparse dot is queued (backlog B213). Blocks without
+  such outliers quantize to the same bits as before. Measurements and the
+  options weighed are in `docs/cpu-activations.md`. **Upgrade note:** the
+  production CPU's output changes once for every model whose activations carry
+  such outliers (the CPU goldens were re-blessed, Windows and Linux agreeing,
+  except as B214 lists); one-token llama.cpp parity dumps now differ at position
+  0 by design (B212).
 
 - **A GPU submit that never completes is an error, not a hang.** Every Vulkan
   host wait (segment fences, replays, one-shot copies, `Backend::sync`,

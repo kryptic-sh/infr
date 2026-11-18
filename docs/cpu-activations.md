@@ -247,51 +247,82 @@ on the first chat prompt and the raw prompt:
 The first is the defect the earlier review found when one-row MoE first moved to
 int8 (1.21 on the raw prompt); with the split, position 0 is ordinary on both.
 
+**Speed.** `infr bench --dev cpu`, native release builds of `1b16e66b` (before:
+the f32 one-row path and no split) and `afbb3b14` (after: one-row int8 and the
+split), ten interleaved rounds per model on the quiet machine of the Speed
+section below, tok/s:
+
+| Model, run              | before                                                               | after                                                                |
+| ----------------------- | -------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| Qwen3-30B-A3B tg64      | 27.6, 27.5, 27.6, 28.0, 27.2, 27.6, 27.7, 27.7, 27.6, 27.5           | 28.2, 27.8, 28.1, 28.4, 28.4, 28.0, 27.6, 28.4, 28.4, 28.5           |
+| Qwen3-30B-A3B pp512     | 419.9, 417.7, 417.9, 422.3, 411.4, 416.2, 417.6, 415.5, 415.7, 418.7 | 413.5, 414.3, 413.7, 407.6, 415.9, 413.2, 415.6, 414.1, 417.4, 416.1 |
+| ERNIE-4.5-21B-A3B tg64  | 26.2, 26.8, 26.5, 26.5, 26.5, 26.7, 26.4, 26.3, 26.7, 26.6           | 27.4, 27.2, 27.0, 27.2, 27.5, 27.0, 26.6, 27.4, 27.1, 27.1           |
+| ERNIE-4.5-21B-A3B pp512 | 469.9, 470.2, 468.0, 471.8, 471.8, 473.7, 474.5, 469.3, 471.4, 472.2 | 455.9, 460.4, 460.1, 456.2, 457.6, 455.5, 459.5, 460.3, 458.4, 459.7 |
+
+Decode is faster with int8 one-row experts: median paired +2.1% on Qwen3-30B-A3B
+(faster in 9 of 10 rounds) and +2.0% on ERNIE-4.5-21B-A3B (10 of 10). Prefill,
+which the one-row change does not touch, pays the split: -2.9% on ERNIE (10 of
+10), and -0.7% on Qwen3-30B-A3B (8 of 10, inside the noise).
+
 ### Speed
 
-The split costs about 2% of prefill, all of it in the FFN-down layers, and
-decode is level. That rests on two measurements on a shared machine, neither in
-a quiet window; the owner accepted the cost, and making the sparse dot cheaper
-is queued (backlog B213).
+The split costs 3.5% of Qwen3-1.7B's prefill and 1.9% of gemma-3-1b's on a
+native build (1.7% and 1.5% on a baseline build), all of it in the FFN-down
+layers, and decode is level. The owner accepted the cost; making the sparse dot
+cheaper is queued (backlog B213).
 
-**The review's** (2026-11-18): eight paired rounds of `infr bench` pp512,
-native, `origin/main` against the split. Qwen3-1.7B -10.0, -0.9, -6.1, -2.0,
--0.2, -0.7, -2.3, -1.4% (median -1.7%, lower in 8 of 8); gemma-3-1b +9.6, -10.1,
--0.2, +0.4, -2.7, -4.4, -2.2, +0.2% (median -1.2%); decode level. Its per-op
-profile puts all of it in the down projections: Qwen3-1.7B +10.3 ms per pass on
-about 447 ms (the Q6_K and Q4_K down ops +13% and +12%), gemma-3-1b +22.8 ms of
-about 1,120 ms (+32% and +38% on the down ops). The quantizer's extra scan is
-negligible.
+Measured on a quiet machine on 2026-11-19 (no other build, test or model run;
+the process list read before every round showed only an idle, hung `cargo test`
+of another project): `infr bench --dev cpu` (three reps a run, tok/s), Windows,
+release builds of `1b16e66b` (`before`, the parent of the split's commit
+`18d5f2bf`) and `afbb3b14` (`split`, `main` with the split and the later
+commits, none of which touches a dense model's CPU path), native and baseline
+(`-C target-cpu=x86-64`). Twelve rounds, the binaries' order reversed every
+other round; the same rounds also measured the FMA tier (`docs/math.md`):
 
-**This branch's**: `infr bench --dev cpu`, Windows, native builds, three reps
-per run, eight rounds with `origin/main` (`old`), the split at 16 (`16`, as
-committed) and at 32 (`32`) interleaved in each, tok/s. Another agent's test
-suite ran through all eight rounds (`cargo-nextest` in the process list at every
-round's start); single runs drop by up to two thirds.
+| Model, run          | native `before`                                                                                | native `split`                                                                                 | baseline `before`                                                                              | baseline `split`                                                                             |
+| ------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
+| Qwen3-1.7B pp512    | 1125.5, 1158.2, 1149.8, 1147.5, 1151.7, 1140.4, 1146.9, 1145.5, 1145.9, 1144.0, 1114.2, 1121.7 | 1113.7, 1129.3, 1124.4, 1106.7, 1105.8, 1092.0, 1101.1, 1127.3, 1097.3, 1104.5, 1047.9, 1106.8 | 1028.5, 1025.8, 1042.2, 1023.9, 1030.8, 1027.3, 1032.0, 1041.0, 1044.8, 1021.7, 1032.5, 1025.2 | 990.9, 1014.8, 1014.6, 1014.6, 1007.8, 1016.5, 1025.4, 1019.8, 993.9, 1010.7, 1019.5, 1002.5 |
+| gemma-3-1b-it pp512 | 595.6, 596.6, 596.6, 590.9, 590.0, 596.6, 588.7, 597.5, 594.8, 590.9, 601.0, 601.7             | 578.0, 584.5, 588.0, 585.1, 588.1, 585.6, 592.3, 580.3, 582.9, 582.8, 581.7, 583.5             | 580.7, 590.1, 592.5, 592.7, 592.4, 578.8, 586.3, 581.6, 589.3, 588.4, 592.2, 587.8             | 582.1, 580.8, 583.5, 571.1, 586.5, 573.5, 578.5, 573.0, 580.0, 576.9, 582.4, 581.6           |
+| Qwen3-1.7B tg64     | 57.8, 57.4, 57.2, 57.9, 57.0, 58.0, 57.4, 57.4, 57.8, 58.3, 57.6, 57.7                         | 56.7, 57.7, 57.8, 57.3, 57.9, 57.8, 58.1, 57.1, 57.7, 57.6, 57.9, 57.9                         | 53.7, 52.5, 52.6, 53.2, 53.6, 53.2, 52.7, 52.0, 52.2, 52.9, 52.6, 52.6                         | 52.4, 50.6, 51.0, 52.0, 50.9, 52.3, 52.2, 52.3, 51.7, 52.9, 52.9, 52.4                       |
+| gemma-3-1b-it tg64  | 47.0, 47.4, 46.7, 46.8, 46.9, 47.0, 46.5, 47.2, 47.4, 45.3, 46.9, 47.0                         | 46.7, 47.7, 46.9, 46.0, 47.4, 45.5, 46.8, 46.8, 47.1, 46.6, 47.0, 46.8                         | 42.4, 42.3, 42.3, 42.4, 42.4, 42.4, 42.1, 42.9, 41.9, 42.9, 41.5, 41.9                         | 41.9, 42.2, 41.0, 42.2, 42.2, 42.9, 42.3, 42.2, 42.9, 42.0, 42.4, 41.0                       |
 
-| Run, model        | old                                                            | 16                                                            | 32                                                             |
-| ----------------- | -------------------------------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------- |
-| pp512, Qwen3-1.7B | 1038.5, 1099.6, 1039.1, 1080.3, 1015.0, 1129.8, 1106.3, 1128.4 | 1030.4, 1078.4, 377.5, 1045.7, 1073.3, 1066.3, 1045.2, 1031.4 | 1113.6, 1091.2, 1133.9, 1082.6, 1099.6, 1119.1, 1130.2, 1070.8 |
-| pp512, gemma-3-1b | 569.1, 560.9, 557.5, 536.9, 579.8, 568.7, 560.6, 544.4         | 539.8, 538.2, 564.8, 540.8, 546.2, 566.1, 540.9, 493.3        | 545.1, 555.9, 566.1, 558.8, 538.6, 541.9, 526.4, 501.9         |
-| tg64, Qwen3-1.7B  | 51.6, 53.1, 50.2, 16.5, 51.6, 54.5, 54.5, 47.5                 | 55.7, 40.0, 52.8, 49.7, 53.5, 55.8, 54.8, 53.3                | 56.3, 53.6, 55.2, 54.6, 54.8, 55.7, 52.6, 51.0                 |
-| tg64, gemma-3-1b  | 44.2, 45.0, 45.8, 42.5, 41.3, 45.2, 45.2, 41.2                 | 43.3, 27.7, 43.6, 45.6, 44.1, 45.3, 40.4, 41.3                | 45.0, 43.7, 42.2, 43.5, 45.1, 43.2, 45.5, 19.7                 |
+Paired, `split` against `before`, per round:
 
-Paired, `16` against `old`: Qwen3-1.7B pp512 -0.8, -1.9, (round 3 disturbed),
--3.2, +5.7, -5.6, -5.5, -8.6% (median of the seven -3.2%); gemma-3-1b pp512
--5.1, -4.0, +1.3, +0.7, -5.8, -0.4, -3.5, -9.4% (median -3.8%). `32` against
-`old`: Qwen3-1.7B pp512 +7.2, -0.8, +9.1, +0.2, +8.3, -0.9, +2.2, -5.1% (median
-+1.2%); gemma-3-1b pp512 -4.2, -0.9, +1.5, +4.1, -7.1, -4.7, -6.1, -7.8% (median
--4.5%). Decode is level within the noise. These medians are larger than the
-review's and noisier; neither set settles the figure better than "about 2%". The
-quantizer itself: 1.41 against 1.35 µs per 2048-wide ordinary row
-(`quant::tests::microbench`); a first-token row with two parts, 7.4 µs, and its
-64 Q4_K rows 2.73 against 1.92 µs.
+- Qwen3-1.7B pp512, native: -1.0, -2.5, -2.2, -3.6, -4.0, -4.2, -4.0, -1.6,
+  -4.2, -3.4, -5.9, -1.3% (median -3.5%, lower in 12 of 12); baseline: -3.7,
+  -1.1, -2.6, -0.9, -2.2, -1.1, -0.6, -2.0, -4.9, -1.1, -1.3, -2.2% (median
+  -1.7%, 12 of 12).
+- gemma-3-1b pp512, native: -2.9, -2.0, -1.4, -1.0, -0.3, -1.9, +0.6, -2.9,
+  -2.0, -1.4, -3.2, -3.0% (median -1.9%, 11 of 12); baseline: +0.2, -1.6, -1.5,
+  -3.6, -1.0, -0.9, -1.3, -1.5, -1.6, -2.0, -1.7, -1.1% (median -1.5%, 11 of
+  12).
+- Decode, medians: Qwen3-1.7B native +0.1% (lower in 6 of 12), baseline -1.3% (9
+  of 12); gemma-3-1b native -0.1% (6 of 12), baseline -0.4% (8 of 12).
 
-A baseline build (`-C target-cpu=x86-64`) was measured only against an earlier
-form of the split whose quantizer made four passes over every block where it now
-makes three: Qwen3-1.7B pp512 +0.7, -1.9, -2.4, -2.6% in the four rounds with no
-other build or test running, and -5.1 to -36.7% in four that had one; decode
-level. Not re-measured since.
+The noise, from the same protocol with one native binary against a copy of
+itself (five rounds): single-round differences of -1.8 to +3.1%, medians within
+±1.1% (`docs/math.md` lists them). So the prefill costs are real (every or all
+but one of the rounds, medians above the noise) and decode is level; the
+baseline Qwen3-1.7B decode median of -1.3% is at the edge of the noise.
+
+**Per op** (`INFR_PROF_OPS=1`, the last of two reps of pp512, native builds,
+four alternating rounds, ms per forward over every call of the op): Qwen3-1.7B's
+FFN-down `Linear m=511 6144x2048` went from 41.5-45.2 to 49.3-55.8 ms (Q6_K, 14
+calls) and from 35.5-39.3 to 37.9-42.9 ms (Q4_K, 14 calls), the whole forward
+from 432.7-445.0 to 445.0-464.0 ms; gemma-3-1b's `Linear m=511 6912x1152` from
+30.3-31.5 to 39.9-42.0 ms (Q6_K, 13 calls) and from 25.4-26.2 to 34.2-35.0 ms
+(Q4_K, 13 calls), the forward from 863.0-869.4 to 871.1-892.6 ms. Every other op
+moved by under 2 ms per forward (midpoints of its ranges). The quantizer itself:
+1.41 against 1.35 µs per 2048-wide ordinary row (`quant::tests::microbench`); a
+first-token row with two parts, 7.4 µs, and its 64 Q4_K rows 2.73 against 1.92
+µs.
+
+Before this measurement the figure rested on rounds taken with another agent's
+tests running (medians of -1.7% and -3.2% on Qwen3-1.7B, -1.2% and -3.8% on
+gemma-3-1b, and "about 2%"); the quiet rounds put Qwen3-1.7B's native cost at
+the high end of that and settle the baseline build's, which had been measured
+only against an earlier form of the split.
 
 ### What it does not fix
 

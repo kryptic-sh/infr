@@ -6645,7 +6645,8 @@ S3/S4 work and not re-read for this entry:
    is one `crate::simd` dispatches. Correctness can run on CI's macOS runner;
    speed needs a Mac owner (issue 100 collects a baseline first).
 2. **One-row MoE**: done; one-row `Op::MoeFfn` takes the int8 expert kernels
-   (CHANGELOG). Its decode speed against the f32 path was not measured.
+   (CHANGELOG), and decodes about 2% faster than the f32 path did on
+   Qwen3-30B-A3B and ERNIE-4.5-21B-A3B (`docs/cpu-activations.md`, MoE models).
 
 ### B204 — what plan 11's S3/S4 (tier, thread and row identity) left (2026-11-17)
 
@@ -6856,24 +6857,32 @@ values. What it leaves:
 
 **Tag:** cpu · perf · tests · **Kind:** coverage gaps and open items
 
-- **A baseline build still trails a native one, outside the f32 dots.** After
-  S6, on this Ryzen with the other agent's GPU test spinning one core,
-  Qwen3-1.7B Q4_K_M pp512 ran at 986-1027 tok/s on a baseline build against
-  1036-1155 natively, and decode at 45.9-51.6 against 56.0-57.2 (`docs/math.md`,
-  the FMA tier section); `origin/main` had the same decode gap. The per-op
-  profile puts the prefill gap mostly in the int8 `Linear` kernels (2048x6144
-  Q4_K 2.63-2.65 ms per call against 2.47-2.53 natively), whose surrounding code
-  the compiler autovectorizes with the build's own features. Not investigated
-  further.
-- **Native reference mode has a slow spot of its own, not traced.** On
-  reference-mode decode (Qwen3-0.6B tg64, `kernels.cpu.reference`) the baseline
-  build with the FMA tier ran faster than the native builds: 26.6-27.3 tok/s
-  against 24.7-25.6 for both `origin/main`'s and this branch's native builds, in
-  all eight rounds in `docs/math.md` against the branch's and in seven against
-  `main`'s (round 3 had a low run: baseline 23.1, the branch's native 17.9,
-  `main`'s native 24.7). `main`'s native build is as slow, so it is not
-  introduced here. The f32 dot microbench is at parity, so the cost is elsewhere
-  in that path.
+- **A baseline build still trails a native one, outside the f32 dots.** On a
+  quiet machine (2026-11-19, twelve paired rounds, `docs/math.md`, the FMA tier
+  section) a baseline build of the tier ran Qwen3-1.7B Q4_K_M pp512 at 90% of
+  the native build (1021.7-1044.8 against 1114.2-1158.2 tok/s), gemma-3-1b pp512
+  at 99%, and decode at 92% (Qwen3-1.7B) and 90% (gemma-3-1b). An earlier per-op
+  profile, taken with another agent's test spinning one core, put the prefill
+  gap mostly in the int8 `Linear` kernels (2048x6144 Q4_K 2.63-2.65 ms per call
+  against 2.47-2.53 natively), whose surrounding code the compiler
+  autovectorizes with the build's own features. Not investigated further.
+- **Native reference mode is slower than baseline in the weight decode.**
+  Confirmed on the quiet machine: Qwen3-0.6B tg64 in reference mode ran 8.1%
+  faster on the baseline build (median paired, 12 of 12 rounds), and the native
+  build was as slow before the FMA tier. With reference-mode `Linear` timed in
+  two halves (a scratch build), the f32 dot takes the same time on both builds
+  and `bytes_to_f32` (the Q4_K / Q6_K row dequantization to f32 it runs per
+  weight row, allocating each row) takes 8 to 17% longer natively: the 1024x3072
+  Q4_K rows 2.0-2.1 ms against 1.8 ms per call summed over threads, the Q6_K
+  output head 115-117 against 106-107 ms. Why the native code generation of
+  those decoders is slower is not traced (`dequant_dot_rows`' decoders, below,
+  go the other way). Reference mode is the test oracle, so this costs test time,
+  not users.
+- **The per-op profile does not time reference-mode `Linear`.** Its branch in
+  `CpuBackend::execute_with` ends in `continue`, which skips the per-op timer
+  (`__t0`) at the end of the loop body, so `INFR_PROF_OPS=1` on a reference run
+  shows a device total of a few percent of the wall time and no `Linear` row.
+  Recording the time before the `continue` fixes it; not done here.
 - **f32 multiply-adds not on the tier.** `seam/sc.rs` (Diffusion-Gemma's host
   self-conditioning: the soft embedding's f16 `mul_add` and the down phase's) is
   in `infr-llama`, which has no SIMD dispatch; putting it on the tier means
@@ -6896,13 +6905,13 @@ values. What it leaves:
 - **Not run: a whole f16-weight model.** No F16 GGUF is cached here; the f16
   dot's gain (native 0.321 to 0.084 ns per element) is from the microbench.
 
-### B220 — work in flight when the 2026-11-18 session paused
+### B220 — waiting on others, and next in the queues (2026-11-18)
 
-**Tag:** handoff · **Kind:** unmerged branches, local only (nothing here is on
-`origin`)
+**Tag:** handoff · **Kind:** queue
 
-Delete this entry as each item lands or is dropped. Worktrees are under
-`.claude/worktrees/` in the main checkout.
+Both branches this entry tracked have landed (`fix/cpu-act-quant`,
+`fix/vulkan-submit-bounds`), and the quiet-machine measurements it listed were
+taken on 2026-11-19 (`docs/math.md`, `docs/cpu-activations.md`). What is left:
 
 - **Waiting on other people:** issue 94 (the RX 580 owner was asked for
   diagnostic runs on `main`), issue 100 (Apple Silicon numbers for the CPU
@@ -6912,9 +6921,6 @@ Delete this entry as each item lands or is dropped. Worktrees are under
   that prints the scalar-to-NEON ratio (B206); plan 11's G3 and G4 (commit the
   planted-bug tests; convert the exact GPU goldens and wire `infr tune check`);
   plan 10's tuning slices S2 onward; plan 12's kernel ports from the fork.
-- **Measurements owed on a quiet machine:** the FMA tier's baseline and native
-  tables in `docs/math.md` (every round there had one core busy); the quantizer
-  fix's prefill cost.
 
 ### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
 
@@ -6950,11 +6956,12 @@ Q6_K down inputs on the bench prompt, 32% / 38% on gemma-3-1b; about 1,930 and
 7,100 split blocks per forward), not the per-block rate this entry first quoted
 (0 to 1.1% of all projection-input blocks past position 0 on the bench prompt).
 Each split block costs a one-block kernel call per weight row, about 70 to 90
-ns, 15 to 20 times a block of the packed GEMM: about 2% of prefill in two
-measurements on a shared machine (`docs/cpu-activations.md`, Speed), decode
-level, accepted by the owner. At 8 the split is somewhat better
-(ERNIE-4.5-0.3B's position 1, which attends to position 0's value row, reaches
-0.029 against 0.13 at 16 and 0.19 before) but measured 14 to 17% slower
+ns, 15 to 20 times a block of the packed GEMM. On a quiet machine (2026-11-19,
+twelve paired rounds, `docs/cpu-activations.md`, Speed) that is 3.5% of
+Qwen3-1.7B pp512 and 1.9% of gemma-3-1b's on a native build, 1.7% and 1.5% on a
+baseline build, decode level; accepted by the owner. At 8 the split is somewhat
+better (ERNIE-4.5-0.3B's position 1, which attends to position 0's value row,
+reaches 0.029 against 0.13 at 16 and 0.19 before) but measured 14 to 17% slower
 Qwen3-1.7B pp512 in three disturbed pairs. At 32 Qwen3-1.7B pp512 was level in
 this branch's rounds, but 32 is the last ratio that still fixes ERNIE's and
 SmolLM3's first tokens (64 leaves them at 0.61 and 0.30), so it has no margin.
@@ -6990,7 +6997,8 @@ positions agree as before.
 
 **Tag:** cpu · perf · **Kind:** approved follow-up, not started
 
-The split (`docs/cpu-activations.md`, B210) costs about 2% of prefill, all in
+The split (`docs/cpu-activations.md`, B210) costs 3.5% of Qwen3-1.7B's prefill
+and 1.9% of gemma-3-1b's on a native build (quiet machine, 2026-11-19), all in
 the FFN-down layers, because each split block is a whole one-block kernel call
 (`kernels::vec_dot_hi`) per weight row for a part with one or two nonzero codes.
 The review's two ideas, for a slice of its own:
@@ -7018,7 +7026,9 @@ The review's two ideas, for a slice of its own:
    or above `amax/16` already decides most blocks in one pass; the bound would
    let the max pass decide them with no second pass.
 
-Measure either against `origin/main` in a quiet window, native and baseline.
+Measure either against `origin/main` in a quiet window, native and baseline,
+with the protocol and the A-against-A noise figures in `docs/math.md` (the FMA
+tier section): a median under about 1% is not resolved.
 
 ### B214 — CPU goldens the activation split could not re-bless or confirm (2026-11-18)
 

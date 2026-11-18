@@ -130,6 +130,7 @@ knobs! {
     "INFR_UBATCH"               => "device.ubatch",            Int,  Ignored, "512",     migrated;
     "INFR_UBATCH_PARALLEL"      => "device.ubatch_parallel",   Int,  Ignored, "128",     migrated;
     "INFR_SUBMIT_DISPATCHES"    => "device.submit_dispatches", Int,  Error,   "64",      migrated;
+    "INFR_GPU_WAIT_TIMEOUT_MS"  => "device.gpu_wait_timeout_ms", Int, Error,  "30000",   migrated;
     "INFR_SG"                   => "device.subgroup_pref",     Literal, Error, "16",     migrated;
 
     // ── sampling ─────────────────────────────────────────────────────────────

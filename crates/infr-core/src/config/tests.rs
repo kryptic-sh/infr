@@ -236,8 +236,9 @@ fn malformed_toml_is_an_error() {
 /// A bad value fails where it fails TODAY, and is swallowed where it is swallowed today (R1).
 ///
 /// Two classes, both taken from `manifest::KnobKey::bad_value`:
-/// - [`BadValue::Error`] — `INFR_SG`, `INFR_SUBMIT_DISPATCHES` and the three multi-GPU device
-///   lists reject garbage LOUDLY today. The env layer must keep erroring, not `unwrap_or`.
+/// - [`BadValue::Error`] — `INFR_SG`, `INFR_SUBMIT_DISPATCHES`, `INFR_GPU_WAIT_TIMEOUT_MS` and
+///   the three multi-GPU device lists reject garbage LOUDLY today. The env layer must keep
+///   erroring, not `unwrap_or`.
 /// - [`BadValue::Ignored`] — everything else does `.and_then(parse).ok().unwrap_or(default)`, so
 ///   garbage falls back to the default and the layer reports "not specified".
 ///
@@ -1322,6 +1323,7 @@ fn migrated_keys_are_exactly_the_landed_slices() {
     const POST_MIGRATION: &[&str] = &[
         "INFR_DRAM_CACHE",
         "INFR_DRAM_BYPASS",
+        "INFR_GPU_WAIT_TIMEOUT_MS",
         "INFR_LAYER_MAJOR",
         "INFR_PULL_JOBS",
         "INFR_NO_MLA_SG",

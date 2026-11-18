@@ -147,6 +147,14 @@ pub fn parse(get: Get) -> Result<PartialConfig, ConfigError> {
         })?;
         p.device.submit_dispatches = Some(Some(n));
     }
+    // A safety bound: a typo meant to change it must not silently leave the default in place.
+    if let Some(v) = get("INFR_GPU_WAIT_TIMEOUT_MS") {
+        let ms = v.parse::<u64>().map_err(|e| ConfigError::Env {
+            key: "INFR_GPU_WAIT_TIMEOUT_MS",
+            message: format!("expected milliseconds (0 = wait forever): {e}"),
+        })?;
+        p.device.gpu_wait_timeout_ms = Some(Some(ms));
+    }
     // Exactly "16" or "32"; anything else is an error, not a silent fallback.
     if let Some(v) = get("INFR_SG") {
         let sg = match v.as_str() {

@@ -100,10 +100,11 @@ Error: config `device.ctx`: expected a size/count like 8192, 256k or 50% (got "b
 
 Note the asymmetry with the environment, which is frozen at today's behaviour:
 `ctx = "banana"` in a file fails to load, while `INFR_CTX=banana` is silently
-ignored and falls back. Six environment keys do reject a bad value loudly, at
+ignored and falls back. Seven environment keys do reject a bad value loudly, at
 startup, on every subcommand: `INFR_SG`, `INFR_SUBMIT_DISPATCHES`,
-`INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`, `INFR_EXPERT_PARALLEL`, and `INFR_TUNE`
-(see [Vulkan kernel tuning](#vulkan-kernel-tuning)).
+`INFR_GPU_WAIT_TIMEOUT_MS`, `INFR_PIPELINE`, `INFR_TENSOR_PARALLEL`,
+`INFR_EXPERT_PARALLEL`, and `INFR_TUNE` (see
+[Vulkan kernel tuning](#vulkan-kernel-tuning)).
 
 ### Diagnostics announce themselves
 
@@ -178,9 +179,25 @@ table that the tests check against the tree. `Config::all_paths()` is the full
 path list. What follows is the shape plus the knobs people actually reach for.
 
 **`[device]`** — which GPU (`dev`), how much context (`ctx`), the prefill
-micro-batch (`ubatch`, `ubatch_parallel`), CPU `threads`, and two low-level
+micro-batch (`ubatch`, `ubatch_parallel`), CPU `threads`, and three low-level
 device knobs (`submit_dispatches` for the iGPU submit splitter, `subgroup_pref`
-to force subgroup 16 or 32).
+to force subgroup 16 or 32, and `gpu_wait_timeout_ms`, below).
+
+**`device.gpu_wait_timeout_ms`** (`INFR_GPU_WAIT_TIMEOUT_MS`, default 30000) is
+the longest the Vulkan backend waits for one piece of submitted GPU work. A wait
+that runs past it, or meets a lost device, is an error naming the submit it
+waited on (its dispatch count and first and last kernel), how long it waited,
+the fence's state and, on a lost device that offers `VK_EXT_device_fault`, the
+driver's fault report. The backend is then unusable: every later call returns
+the same error without touching the device, and teardown leaks rather than frees
+what the GPU may still be using. `infr run` prints it and exits non-zero;
+`infr serve` fails that request and every later one on that model with the same
+error, so restart the server. `0` waits forever (for debugging). The default
+sits more than ten times above the longest legitimate wait measured in the full
+GPU gate on 2026-11-18: 2.75 s on the Ryzen integrated GPU (one LFM3 forward
+submitted as one command buffer), and no wait over 100 ms on the RX 7900 XTX.
+Before this bound a submit whose work the GPU dropped hung the process forever
+with one core spinning (`docs/plan/12-low-capability-vulkan.md`).
 
 **`[sampling]`** — `temp` (0 = greedy), `top_k`, `top_p`, `seed`, `max_new`,
 `ignore_eos`, `no_think`. **Provenance matters here**: `infr run` / `infr serve`

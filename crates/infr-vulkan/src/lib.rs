@@ -13,6 +13,7 @@ mod adapter;
 mod caps;
 pub mod ep;
 mod gemm;
+mod gpu_wait;
 #[cfg(test)]
 mod kq_gemm_tests;
 pub mod linear;
@@ -32,6 +33,7 @@ pub mod tuning;
 mod vkext;
 
 pub use ep::{EpBuffer, ExpertParallelBackend};
+pub use gpu_wait::DEFAULT_GPU_WAIT_TIMEOUT_MS;
 pub use p2p::{P2pExport, P2pHandleType};
 pub use pipeline::{PipelineBackend, PipelineBuffer};
 pub use recorder::{FlashStage, RecordedCmd, Recorder};
@@ -471,6 +473,9 @@ struct VulkanShared {
     /// Reused staging ring for weight uploads (see [`StagingRing`]). Built lazily on
     /// the first staged weight upload of a load and torn down with the weight scope.
     staging_ring: Mutex<Option<StagingRing>>,
+    /// The bound on every host wait for GPU work, and the poisoned state a failed wait leaves
+    /// (see `gpu_wait`).
+    gpu_wait: gpu_wait::GpuWait,
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
@@ -486,10 +491,19 @@ impl VulkanShared {
             .filter(|&i| ring.busy[i])
             .map(|i| ring.fences[i])
             .collect();
+        // A failed wait poisons the backend, which the next call reports; the copies may still
+        // be running, so the ring is leaked rather than freed under them.
+        let drained = pending.is_empty()
+            || self
+                .wait_fences(&pending, &|| {
+                    format!("{} weight-upload staging copies", pending.len())
+                })
+                .is_ok();
+        if !drained {
+            std::mem::forget(ring);
+            return;
+        }
         unsafe {
-            if !pending.is_empty() {
-                let _ = self.device.wait_for_fences(&pending, true, u64::MAX);
-            }
             let pool = *self.cmd_pool.lock().unwrap();
             self.device.free_command_buffers(pool, &ring.cmds);
             for f in ring.fences.drain(..) {
@@ -519,14 +533,25 @@ impl VulkanShared {
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for VulkanShared {
     fn drop(&mut self) {
+        // Also the pipeline cache's TRIPWIRE verdict (see `pcache.rs`): a lost device, or work
+        // that never completed, poisons the backend (`gpu_wait`), and that is sticky — so this
+        // one bounded drain doubles as "did this run hang the GPU?", with no flag to thread
+        // through every submit site.
+        let hung = self
+            .wait_queue_idle(&|| "the device's outstanding work at teardown".to_string())
+            .is_err();
+        if hung {
+            // Something the GPU may still be running references the device's objects, and
+            // destroying an object in use is undefined behaviour unless the device is lost. Only
+            // the pipeline-cache verdict runs (it touches no device object when it discards);
+            // the device, its allocator and everything else are leaked to the process exit.
+            if let Some(pc) = &self.pcache {
+                pc.finish(&self.device, self.pipeline_cache, true);
+            }
+            return;
+        }
         unsafe {
-            // Also the pipeline cache's TRIPWIRE verdict (see `pcache.rs`): VK_ERROR_DEVICE_LOST is
-            // STICKY — once the device is lost every call returns it — so this one drain doubles as
-            // "did this run hang the GPU?", with no flag to thread through every submit site.
-            let device_lost = matches!(
-                self.device.device_wait_idle(),
-                Err(vk::Result::ERROR_DEVICE_LOST)
-            );
+            self.gpu_wait.destroy(&self.device);
             if let Ok(map) = self.kernels.lock() {
                 for k in map.values() {
                     crate::ops::destroy_compute_kernel(&self.device, k);
@@ -536,7 +561,7 @@ impl Drop for VulkanShared {
             // missed the tail) and destroy it. On a LOST device this discards the file instead of
             // saving it, and either way it disarms this process's tripwire marker.
             if let Some(pc) = &self.pcache {
-                pc.finish(&self.device, self.pipeline_cache, device_lost);
+                pc.finish(&self.device, self.pipeline_cache, false);
             }
             self.device
                 .destroy_pipeline_cache(self.pipeline_cache, None);
@@ -671,6 +696,11 @@ impl Drop for VkBuffer {
             self.shared
                 .act_live
                 .fetch_sub(self.act_bytes, Ordering::Relaxed);
+        }
+        // Work that never completed may still be reading or writing this memory: leak it rather
+        // than free it under the GPU (see `gpu_wait`).
+        if self.shared.poisoned() {
+            return;
         }
         unsafe {
             match &mut self.backing {
@@ -2360,6 +2390,13 @@ impl VulkanBackend {
         if has_ext(c"VK_KHR_portability_subset") {
             ext_ptrs.push(c"VK_KHR_portability_subset".as_ptr());
         }
+        // Diagnostics only: lets a lost device say what faulted (`gpu_wait::fault_report`).
+        // Enabled wherever offered; nothing reads it until the device is lost.
+        let has_device_fault =
+            gpu_wait::device_fault_supported(&instance, physical_device, &has_ext);
+        if has_device_fault {
+            ext_ptrs.push(ash::ext::device_fault::NAME.as_ptr());
+        }
 
         // ── logical device ─────────────────────────────────────────────────────
         let priorities = [1.0f32];
@@ -2426,6 +2463,10 @@ impl VulkanBackend {
         }
         if has_ext_sem {
             device_ci = device_ci.push_next(&mut timeline_sem_ci);
+        }
+        let mut fault_ci = vk::PhysicalDeviceFaultFeaturesEXT::default().device_fault(true);
+        if has_device_fault {
+            device_ci = device_ci.push_next(&mut fault_ci);
         }
         // The two post-ash feature structs (see `vkext`): chained by hand, asking for exactly the
         // bits the device reported, and only when their tier is live. Both must outlive
@@ -2777,6 +2818,14 @@ impl VulkanBackend {
         // host-visible type (system RAM over PCIe). Only the opt-in KV-overflow path uses it.
         let host_overflow_type = probe_uma_overflow_type(&mem_props);
 
+        let gpu_wait = gpu_wait::GpuWait::new(
+            &device,
+            cfg.device
+                .gpu_wait_timeout_ms
+                .unwrap_or(DEFAULT_GPU_WAIT_TIMEOUT_MS),
+            has_device_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
+        )?;
+
         // Success: the instance/device/pool now move into `VulkanShared` (which owns their
         // destruction). Disarm so `cleanup`'s Drop is a no-op and never double-frees them.
         cleanup.armed = false;
@@ -2832,6 +2881,7 @@ impl VulkanBackend {
                 host_overflow_type,
                 kv_spill: SpillTally::default(),
                 staging_ring: Mutex::new(None),
+                gpu_wait,
             }),
         };
 
@@ -2893,7 +2943,10 @@ impl VulkanBackend {
             Ok(bytemuck::cast_slice(&got).to_vec())
         };
         let res = run();
-        crate::ops::destroy_compute_kernel(&self.shared.device, &k);
+        // A probe whose wait failed may still be running this pipeline (see `gpu_wait`).
+        if !self.shared.poisoned() {
+            crate::ops::destroy_compute_kernel(&self.shared.device, &k);
+        }
         res
     }
 
@@ -2984,7 +3037,10 @@ impl VulkanBackend {
             Ok(got[..] == want[..])
         };
         let res = run();
-        crate::ops::destroy_compute_kernel(&self.shared.device, &k);
+        // A probe whose wait failed may still be running this pipeline (see `gpu_wait`).
+        if !self.shared.poisoned() {
+            crate::ops::destroy_compute_kernel(&self.shared.device, &k);
+        }
         res
     }
 
@@ -3110,7 +3166,10 @@ impl VulkanBackend {
             Ok(bytemuck::cast_slice(&bytes).to_vec())
         };
         let res = run();
-        crate::ops::destroy_compute_kernel(&self.shared.device, &k);
+        // A probe whose wait failed may still be running this pipeline (see `gpu_wait`).
+        if !self.shared.poisoned() {
+            crate::ops::destroy_compute_kernel(&self.shared.device, &k);
+        }
         res
     }
 
@@ -4113,8 +4172,9 @@ impl VulkanBackend {
 
             // Reuse of a slot is the ONLY place we block: wait for its previous copy to land.
             if ring.busy[i] {
-                unsafe { device.wait_for_fences(&[ring.fences[i]], true, u64::MAX) }
-                    .map_err(|e| be(format!("staging ring wait_for_fences: {e}")))?;
+                self.shared.wait_fences(&[ring.fences[i]], &|| {
+                    "a weight-upload staging copy".to_string()
+                })?;
                 ring.busy[i] = false;
             }
             unsafe { device.reset_fences(&[ring.fences[i]]) }
@@ -4153,9 +4213,10 @@ impl VulkanBackend {
 
                 let cmds = [cmd];
                 let submit = vk::SubmitInfo::default().command_buffers(&cmds);
+                self.shared.live()?;
                 device
                     .queue_submit(self.shared.queue, &[submit], ring.fences[i])
-                    .map_err(|e| be(format!("staging ring queue_submit: {e}")))?;
+                    .map_err(|e| self.shared.submit_failed(e, "a staging-ring copy"))?;
             }
             ring.busy[i] = true;
             off += n;
@@ -4205,6 +4266,7 @@ impl VulkanBackend {
     /// The closure receives the command buffer handle to record into. Not serialised against
     /// other users of the pool — see `VulkanShared::cmd_pool`.
     fn one_shot(&self, f: impl FnOnce(vk::CommandBuffer)) -> Result<()> {
+        self.shared.live()?;
         let device = &self.shared.device;
         let pool = *self.shared.cmd_pool.lock().unwrap();
 
@@ -4235,10 +4297,11 @@ impl VulkanBackend {
         let cmds = [cmd];
         let submit = vk::SubmitInfo::default().command_buffers(&cmds);
         unsafe { device.queue_submit(self.shared.queue, &[submit], vk::Fence::null()) }
-            .map_err(|e| be(format!("queue_submit: {e}")))?;
+            .map_err(|e| self.shared.submit_failed(e, "a one-shot command buffer"))?;
 
-        unsafe { device.queue_wait_idle(self.shared.queue) }
-            .map_err(|e| be(format!("queue_wait_idle: {e}")))?;
+        // On a failed wait the command buffer may still be executing: it is leaked, not freed.
+        self.shared
+            .wait_queue_idle(&|| "a one-shot command buffer (copy, fill or probe)".to_string())?;
 
         unsafe { device.free_command_buffers(pool, &cmds) };
         Ok(())
@@ -4559,9 +4622,10 @@ impl Backend for VulkanBackend {
         adapter::decode_replay_ready(self, plan)
     }
 
+    /// Every submit goes to the one queue this backend owns, so its idle is the device's idle.
     fn sync(&self) -> Result<()> {
-        unsafe { self.shared.device.device_wait_idle() }
-            .map_err(|e| be(format!("device_wait_idle: {e}")))
+        self.shared
+            .wait_queue_idle(&|| "the backend's outstanding work (`sync`)".to_string())
     }
 
     fn moe_paged(&self) -> bool {

@@ -45,6 +45,12 @@ ubatch_parallel = 256
 # error, not a fallback.
 # submit_dispatches = 64
 
+# Longest one host wait for GPU work, in milliseconds, before the Vulkan
+# backend reports the submit it was waiting on and refuses further work (the
+# process should then exit). 0 = wait forever, for debugging. Default: unset =
+# 30000. A bad value is a HARD error, not a fallback.
+# gpu_wait_timeout_ms = 30000
+
 # Subgroup-size preference — exactly 16 or 32; anything else is a HARD error.
 # Default: unset = vendor-derived.
 # subgroup_pref = 32

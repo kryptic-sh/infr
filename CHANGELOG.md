@@ -879,6 +879,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   goldens were re-blessed, Windows and Linux agreeing, except as B214 lists);
   one-token llama.cpp parity dumps now differ at position 0 by design (B212).
 
+- **A GPU submit that never completes is an error, not a hang.** Every Vulkan
+  host wait (segment fences, replays, one-shot copies, `Backend::sync`,
+  teardown) now waits at most `device.gpu_wait_timeout_ms`
+  (`INFR_GPU_WAIT_TIMEOUT_MS`, default 30 s; `0` waits forever). Before, a
+  submit whose work the GPU dropped left the process spinning one core on a
+  fence forever. A wait past the bound, or a lost device, now returns an error
+  naming the submit (dispatch count, first and last kernel), the time waited,
+  the fence state and, where the device offers `VK_EXT_device_fault` (now
+  enabled when offered), the driver's fault report; the backend then fails every
+  later call with that error and leaks, rather than frees, what the GPU may
+  still be using, so teardown cannot hang either.
+
 - **Equal logits sample the same token on every toolchain.** The CPU backend's
   `Op::Sample` and the host sampler's top-k path ordered equal logits by
   unstable sorts with no tie-break, so which of two equal tokens a draw picked

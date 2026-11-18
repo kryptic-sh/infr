@@ -13,6 +13,7 @@ use ash::vk;
 
 use infr_core::{backend::Buffer, error::Result};
 
+use super::gpu_wait::SubmitDesc;
 use super::ops::ComputeKernel;
 use super::{as_vk_buf, be, Backing, VkBuffer, VulkanBackend};
 
@@ -999,6 +1000,10 @@ pub struct Recorder<'a> {
     /// The submit splitter reads it to decide when the segment has grown to the device's cap —
     /// see `VulkanShared::submit_dispatch_cap` and `adapter::execute_static`.
     dispatches: std::cell::Cell<usize>,
+    /// The first and last kernel recorded into this command buffer, so a submit that never
+    /// completes can be named (`gpu_wait::SubmitDesc`).
+    first_op: std::cell::Cell<Option<&'static str>>,
+    last_op: std::cell::Cell<Option<&'static str>>,
     /// `kernels.vulkan.bda_chunk_elems` / `_bytes`, HOISTED here at construction (they used
     /// to be two env-seeded `AtomicU64` memos). Read on the decode GEMV path via
     /// [`Self::chunk_caps`].
@@ -1064,6 +1069,8 @@ impl<'a> Recorder<'a> {
     }
 
     fn new_inner(backend: &'a VulkanBackend, persistent: bool) -> Result<Self> {
+        // A poisoned backend records nothing (see `gpu_wait`).
+        backend.shared.live()?;
         let device = &backend.shared.device;
         let cmd_pool = *backend.shared.cmd_pool.lock().unwrap();
         let cmd = unsafe {
@@ -1184,6 +1191,8 @@ impl<'a> Recorder<'a> {
             t0: std::time::Instant::now(),
             suppress: std::cell::Cell::new(false),
             dispatches: std::cell::Cell::new(0),
+            first_op: std::cell::Cell::new(None),
+            last_op: std::cell::Cell::new(None),
             bda_chunk_elem_cap,
             bda_chunk_byte_cap,
             serial: NEXT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -1226,6 +1235,15 @@ impl<'a> Recorder<'a> {
     /// Dispatches recorded into this command buffer so far — the submit splitter's trigger.
     pub fn dispatches(&self) -> usize {
         self.dispatches.get()
+    }
+
+    /// This command buffer as a failed wait names it.
+    fn submit_desc(&self) -> SubmitDesc {
+        SubmitDesc {
+            dispatches: self.dispatches.get(),
+            first: self.first_op.get(),
+            last: self.last_op.get(),
+        }
     }
 
     /// Disjoint-batch barrier suppression: while ON, recorded dispatches accumulate hazard state
@@ -1332,6 +1350,10 @@ impl<'a> Recorder<'a> {
         // the submit splitter (`Recorder::dispatches`) needs the count whether or not INFR_PROF_OPS
         // is on.
         self.dispatches.set(self.dispatches.get() + 1);
+        if self.first_op.get().is_none() {
+            self.first_op.set(Some(label));
+        }
+        self.last_op.set(Some(label));
         if !self.prof_ops {
             return;
         }
@@ -10721,6 +10743,11 @@ impl<'a> Recorder<'a> {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
+        let desc = self.submit_desc();
+        if let Err(e) = self.be.shared.live() {
+            self.free_transient();
+            return Err(e);
+        }
         let submit = unsafe {
             device.queue_submit(
                 queue,
@@ -10730,12 +10757,16 @@ impl<'a> Recorder<'a> {
         };
         if let Err(e) = submit {
             self.free_transient();
-            return Err(be(format!("queue_submit: {e}")));
+            return Err(self
+                .be
+                .shared
+                .submit_failed(e, &format!("a forward of {desc}")));
         }
-        if let Err(e) = unsafe { device.queue_wait_idle(queue) } {
-            self.free_transient();
-            return Err(be(format!("queue_wait_idle: {e}")));
-        }
+        // A failed wait leaves the command buffer, its pools and query pools to the GPU that may
+        // still be running them: leaked, never freed (see `gpu_wait`).
+        self.be
+            .shared
+            .wait_queue_idle(&|| format!("a forward submitted as one command buffer of {desc}"))?;
         account_segment(&self.be.shared, self.seg_query_pool);
         if self.stages {
             eprintln!(
@@ -10786,7 +10817,7 @@ impl<'a> Recorder<'a> {
     /// per-recorder, so cross-submission RAW/WAR ordering (scratch reuse, arena-slot rewrites vs
     /// a prior segment's reads) is otherwise invisible to it.
     pub fn finish_nowait(self) -> Result<PendingSegment> {
-        let dispatches = self.dispatches.get();
+        let desc = self.submit_desc();
         if self.stages || self.prof_ops {
             let shared = std::sync::Arc::clone(&self.be.shared);
             self.finish()?;
@@ -10796,7 +10827,7 @@ impl<'a> Recorder<'a> {
                 cmd: vk::CommandBuffer::null(),
                 pools: Vec::new(),
                 seg_query_pool: vk::QueryPool::null(),
-                dispatches,
+                desc,
             });
         }
         let device = &self.be.shared.device;
@@ -10807,6 +10838,10 @@ impl<'a> Recorder<'a> {
         if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
+        }
+        if let Err(e) = self.be.shared.live() {
+            self.free_transient();
+            return Err(e);
         }
         let fence = match unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) } {
             Ok(f) => f,
@@ -10825,7 +10860,10 @@ impl<'a> Recorder<'a> {
         if let Err(e) = submit {
             unsafe { device.destroy_fence(fence, None) };
             self.free_transient();
-            return Err(be(format!("queue_submit: {e}")));
+            return Err(self
+                .be
+                .shared
+                .submit_failed(e, &format!("a forward segment of {desc}")));
         }
         Ok(PendingSegment {
             shared: std::sync::Arc::clone(&self.be.shared),
@@ -10833,7 +10871,7 @@ impl<'a> Recorder<'a> {
             cmd: self.cmd,
             pools: self.pools.borrow().clone(),
             seg_query_pool: self.seg_query_pool,
-            dispatches,
+            desc,
         })
     }
 
@@ -10901,7 +10939,7 @@ impl<'a> Recorder<'a> {
         Ok(RecordedSegment {
             cmd: self.cmd,
             pools: self.pools.borrow().clone(),
-            dispatches: self.dispatches.get(),
+            desc: self.submit_desc(),
         })
     }
 
@@ -10986,8 +11024,8 @@ impl VulkanBackend {
 pub(crate) struct RecordedSegment {
     cmd: vk::CommandBuffer,
     pools: Vec<vk::DescriptorPool>,
-    /// Dispatches recorded into this one segment.
-    dispatches: usize,
+    /// Dispatches recorded into this one segment, and its first and last kernel.
+    desc: SubmitDesc,
 }
 
 /// A pre-recorded, resubmittable decode step (from [`Recorder::finish_record`], or accumulated from
@@ -11017,12 +11055,25 @@ impl RecordedCmd {
         shared: std::sync::Arc<crate::VulkanShared>,
         segments: Vec<RecordedSegment>,
     ) -> Self {
-        let dispatches = segments.iter().map(|s| s.dispatches).sum();
+        let dispatches = segments.iter().map(|s| s.desc.dispatches).sum();
         Self {
             shared,
             segments,
             dispatches,
         }
+    }
+
+    /// `n` replays of this recording as a failed wait names them.
+    fn replay_desc(&self, n: usize) -> String {
+        let desc = SubmitDesc {
+            dispatches: self.dispatches * n,
+            first: self.segments.first().and_then(|s| s.desc.first),
+            last: self.segments.last().and_then(|s| s.desc.last),
+        };
+        format!(
+            "{n} decode replay(s) of {} segment(s), {desc}",
+            self.segments.len()
+        )
     }
 
     /// Assemble a (possibly multi-segment) recording — the watchdog-split decode path.
@@ -11071,21 +11122,18 @@ impl RecordedCmd {
             }
             return Ok(());
         };
+        self.shared.live()?;
         let device = &self.shared.device;
         let cmds = vec![seg.cmd; n];
         unsafe {
-            device
-                .queue_submit(
-                    self.shared.queue,
-                    &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                    vk::Fence::null(),
-                )
-                .map_err(|e| be(format!("replay_n submit: {e}")))?;
-            device
-                .queue_wait_idle(self.shared.queue)
-                .map_err(|e| be(format!("replay_n wait: {e}")))?;
+            device.queue_submit(
+                self.shared.queue,
+                &[vk::SubmitInfo::default().command_buffers(&cmds)],
+                vk::Fence::null(),
+            )
         }
-        Ok(())
+        .map_err(|e| self.shared.submit_failed(e, &self.replay_desc(n)))?;
+        self.shared.wait_queue_idle(&|| self.replay_desc(n))
     }
 
     /// Resubmit the recording and wait for completion. Each segment is a SEPARATE `vkQueueSubmit`,
@@ -11099,40 +11147,53 @@ impl RecordedCmd {
     /// A submit that fails part-way still waits for the segments submitted before it, so the
     /// recording has stopped running when this returns either way: a caller holding a lock until
     /// the replay is over (the dense streaming replay, `adapter::current_replay`) holds it that
-    /// long on the error path too. On a lost device the wait returns at once with its own error.
+    /// long on the error path too. On a lost device the wait returns at once with its own error,
+    /// and every wait is bounded (`gpu_wait`), so the lock is never held forever.
     pub fn replay(&self) -> Result<()> {
+        self.shared.live()?;
         let device = &self.shared.device;
-        unsafe {
-            for seg in &self.segments {
-                let submitted = device.queue_submit(
+        for seg in &self.segments {
+            let submitted = unsafe {
+                device.queue_submit(
                     self.shared.queue,
                     &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&seg.cmd))],
                     vk::Fence::null(),
-                );
-                if let Err(e) = submitted {
-                    return Err(match device.queue_wait_idle(self.shared.queue) {
-                        Ok(()) => be(format!("replay submit: {e}")),
+                )
+            };
+            if let Err(e) = submitted {
+                let err = self.shared.submit_failed(e, &self.replay_desc(1));
+                return Err(
+                    match self.shared.wait_queue_idle(&|| {
+                        format!(
+                            "the segments submitted before a failed {}",
+                            self.replay_desc(1)
+                        )
+                    }) {
+                        Ok(()) => err,
                         Err(w) => be(format!(
-                            "replay submit: {e} (and the wait for the segments submitted \
-                             before it: {w})"
+                            "{err} (and the wait for the segments submitted before it: {w})"
                         )),
-                    });
-                }
+                    },
+                );
             }
-            device
-                .queue_wait_idle(self.shared.queue)
-                .map_err(|e| be(format!("replay wait: {e}")))?;
         }
-        Ok(())
+        self.shared.wait_queue_idle(&|| self.replay_desc(1))
     }
 }
 
 #[cfg_attr(infr_profile, infr_prof::instrument)]
 impl Drop for RecordedCmd {
     fn drop(&mut self) {
+        // A replay that never completed may still be executing these command buffers: on a
+        // failed wait they are leaked, not freed (see `gpu_wait`).
+        let idle = self
+            .shared
+            .wait_queue_idle(&|| format!("{} before freeing it", self.replay_desc(1)));
+        if idle.is_err() {
+            return;
+        }
         let device = &self.shared.device;
         unsafe {
-            let _ = device.queue_wait_idle(self.shared.queue);
             let cmd_pool = *self.shared.cmd_pool.lock().unwrap();
             for seg in &self.segments {
                 device.free_command_buffers(cmd_pool, &[seg.cmd]);
@@ -11157,14 +11218,14 @@ pub struct PendingSegment {
     /// The recorder's `seg_query_pool`, read and destroyed once the fence signals.
     seg_query_pool: vk::QueryPool,
     /// Dispatches this segment carried — the submit splitter sums them across a forward to feed
-    /// `VulkanBackend::observe_forward`.
-    dispatches: usize,
+    /// `VulkanBackend::observe_forward` — and its first and last kernel, for a failed wait.
+    desc: SubmitDesc,
 }
 
 impl PendingSegment {
     /// Dispatches recorded into this segment's command buffer.
     pub fn dispatches(&self) -> usize {
-        self.dispatches
+        self.desc.dispatches
     }
 }
 
@@ -11178,11 +11239,14 @@ impl PendingSegment {
         let Some(fence) = self.fence.take() else {
             return Ok(()); // already drained
         };
+        let desc = self.desc;
+        self.shared
+            .wait_fences(&[fence], &|| format!("a forward segment of {desc}"))?;
+        // Only reached once the segment completed: a failed wait (above, or a backend already
+        // poisoned) returns first and leaks the command buffer, pools and fence the GPU may still
+        // be using (see `gpu_wait`).
+        account_segment(&self.shared, self.seg_query_pool);
         let device = &self.shared.device;
-        let waited = unsafe { device.wait_for_fences(&[fence], true, u64::MAX) };
-        if waited.is_ok() {
-            account_segment(&self.shared, self.seg_query_pool);
-        }
         unsafe {
             if self.seg_query_pool != vk::QueryPool::null() {
                 device.destroy_query_pool(self.seg_query_pool, None);
@@ -11195,7 +11259,7 @@ impl PendingSegment {
                 device.destroy_descriptor_pool(p, None);
             }
         }
-        waited.map_err(|e| be(format!("wait segment fence: {e}")))
+        Ok(())
     }
 }
 

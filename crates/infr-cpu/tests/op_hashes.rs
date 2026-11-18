@@ -273,6 +273,12 @@ fn linear(dt: DType, m: usize, in_f: usize, out_f: usize, reference: bool) -> Ca
 /// next largest (no split) and one just over it (a split); two spikes of equal magnitude; a
 /// spike over an all-zero rest; and two spikes far apart, whose second needs a second part.
 /// Every value is an integer or a short binary fraction: the same bits on every machine.
+///
+/// Planted faults these rows are known to catch (2026-11-19): a split ratio one below the
+/// committed one at the scalar tier only (every 256-block `Linear spiky` case and both rows-9 MoE
+/// cases), a tier-dependent sparse dot, and a changed sparse sum in each prefill route and in the
+/// MoE expert GEMM. A reversed tie-break among equal outliers moves nothing, as it cannot: equal
+/// magnitudes are both kept, or neither stands the split ratio above the other.
 fn spiky_row(r: usize, in_f: usize) -> Vec<f32> {
     let mut x: Vec<f32> = (0..in_f).map(|i| val(130 + r as u64, i) / 2.0).collect();
     for (b, blk) in x.chunks_mut(256).enumerate() {

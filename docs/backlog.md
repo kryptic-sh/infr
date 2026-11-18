@@ -7041,40 +7041,6 @@ Measure either against `origin/main` in a quiet window, native and baseline.
   (`cpu_rows_give_the_same_bits_in_any_chunks` with ERNIE-4.5-21B-A3B and
   Qwen3-30B-A3B; Windows passed).
 
-### B215 — the outlier-selection faults the new op hashes must be shown to catch (2026-11-18)
-
-**Tag:** cpu · tests · determinism · **Kind:** owed check (needs the machine)
-
-`op_hashes` gained spiky cases (`Linear spiky <format> m1|m5|m19 2048x20` for
-the sixteen 256-block formats, `Linear spiky Q4_0|Q5_0 m5 2048x20`,
-`MoeFfn spiky Q4K rows 1|9`, `MoeFfn spiky Q6K rows 9`), checked in as `0x0`
-placeholders to be blessed from CI's Linux, Windows and macOS prints. Owed once
-the machine is free:
-
-- **Plant a tier-dependent ratio** in `quant::split_off` (for example
-  `let r = if infr_core::simd::active() < SimdTier::Avx2 { 15.0 } else { 16.0 }`,
-  a scalar-versus-capped difference the test sees on any x86 host) and confirm
-  the suite goes red: the `Linear spiky` cases whose rows have pattern 5 (a
-  spike `24 + 1/64` over a next magnitude of 1.5, which splits at 16 and also
-  at 15) do NOT move, but pattern 4 (`24` over 1.5: no split at 16, a split
-  at 15) does. Every `Linear spiky` case of a 256-block format has a pattern-4
-  block (row 0's block 4), so all 48 must fail with a tier-mismatch line, as
-  must the two `MoeFfn spiky` rows-9 cases (row 3 carries pattern 4);
-  `MoeFfn spiky Q4K rows 1` and the two 32-block cases must not.
-- **Reversed tie-break.** By reading, a reversed index tie-break in `split_off`
-  cannot change any result: an element is kept only if it exceeds 16 times the
-  next magnitude, so equal magnitudes are either both among the two largest
-  (both kept or both not, order irrelevant: the kept elements' codes are
-  computed independently) or one of them is the next magnitude itself (then
-  neither can exceed 16 times it). Plant it anyway and confirm the hashes do not
-  move; if one does, this reasoning is wrong and the fault is real.
-- Re-confirm the four faults the review already saw caught (by
-  `the_sparse_activation_part_gives_the_scalar_bits_at_every_tier`,
-  `split_round_trip_matches_the_production_quantizer`,
-  `expert_gemm_range_matches_the_single_token_kernels_bitwise` and
-  `first_token_spikes_keep_the_rest_of_their_block`) still turn red with the new
-  cases in place.
-
 ### B221 — work-bounded submits and split heavy ops (plan 12 S2), not done (2026-11-18)
 
 **Tag:** vulkan · submit · watchdog · **Kind:** deferred work, measured

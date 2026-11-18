@@ -6767,38 +6767,24 @@ values. What it leaves:
   goldens and exact-token tests cover them today, and G4 must not drop those
   without a replacement. A forced chain would need the chain to read back every
   step's logits. The static per-token path is gated (`gpu-float-static`).
-- **The int8-off runs stall or lose the integrated GPU.** On `Vulkan1` (RDNA2, 2
-  CUs), with every int8 kernel off, a submit containing the harness's prefill
-  head (a vocabulary-wide float GEMM over every chunk row, which production
-  never runs) stalled or lost the device at the default submit cap. Qwen3.5-0.8B
-  Q4_K_M, 180-token prompt: stalled with one CPU core busy at caps 128 (3 of 3
-  runs) and 16, a lost device at 8, completion at 4 (3 of 3) WITH the full head,
-  and also with the head on each chunk's last row, with no head, and at 32- or
-  64-row chunks. gemma-3-1b still stalled at cap 4 and completed with the head
-  on each chunk's last row. Neither the limit (one dispatch, or a submit's total
-  work) nor the mechanism (the driver's watchdog, or a host-side wait) is
-  established: Qwen3.5 completing at cap 4 with the full head fits a per-submit
-  total, gemma stalling at cap 4 fits a single dispatch, and a stall of minutes
-  with a busy CPU core is not what a watchdog reset looks like (that is a lost
-  device), while 8 lost the device and 16 and 128 stalled. Sampling the GPU
-  engine showed the 3D engine busy for 3-4 s and then idle while the host spun a
-  core on its fence wait, once ending in a lost device at the next submit: the
-  GPU's work is cut off after a few seconds, the host's wait has no timeout
-  (`PendingSegment::drain`). A watchdog reset fits, but no display-driver
-  recovery event was logged and a completing run kept the engine busy 12 s
-  without a gap, so a fault in the head's dispatch fits as well **[I]**. Cap 4
-  with the full head stalled Qwen3.5 in three runs of seven (the last three in a
-  row); gemma with the head on each chunk's last row completed at caps 128
-  and 4. Plan 12 section 0b has the tables and the reproduction. A bounded fence
-  wait that reports the lost device, instead of hanging, is worth doing on its
-  own. The tolerance tests work around it on integrated devices for
-  configurations with every int8 knob off (head on each chunk's last row, cap 4,
-  `INTEGRATED_FLOAT_SUBMIT_CAP`); with that, every gate case passed on
-  `Vulkan1`. A slow discrete card gets no workaround and would meet the
-  `GATE_TIMEOUT` watchdog. The `Vulkan1` table data is partial: native lanes
-  with the tuning rows on only, and gemma-3's and Qwen3.5's full-head int8-off
-  runs there did not complete (their int8-off rows there come from the
-  workaround runs).
+- **The int8-off runs lose the integrated GPU; the workaround stays.** On
+  `Vulkan1` with every int8 kernel off, the harness's prefill head is one
+  vocabulary-wide `native_q6k` dispatch of about 25 ms per chunk row: at the
+  default 128-row chunk it runs 3.26 s, and Windows' display-driver watchdog
+  (TDR, 2 s here) resets the engine, even with that dispatch alone in its submit
+  (plan 12 section 0c has the sweep, the registry and event-log readings).
+  Before the bounded waits that ended in a hang (a timestamp read waiting
+  forever after the driver signalled the discarded work's fence) or a lost
+  device; now it is an error within seconds. The tolerance tests keep their
+  workaround on integrated devices for configurations with every int8 knob off
+  (head on each chunk's last row, cap 4, `INTEGRATED_FLOAT_SUBMIT_CAP`), because
+  nothing in production splits one dispatch (B221). Scoring every prefill row
+  there needs either that split or 32-row chunks for those runs (0.83 s per head
+  dispatch measured), and the second changes the measured graph, so its rows
+  would be re-derived under the no-ratchet rule; not done. The `Vulkan1` table
+  data is partial: native lanes with the tuning rows on only, and gemma-3's and
+  Qwen3.5's full-head int8-off runs there did not complete (their int8-off rows
+  there come from the workaround runs).
 - **gemma-3-1b's int8 distance is ten times larger on the integrated GPU than on
   the RX 7900 XTX, unexplained.** Worst KL from position 2 on, configuration
   `gpu`: 0.26 on `Vulkan1` (prompt 2, position 115; 0.87 at position 1), 2.6e-2
@@ -6915,13 +6901,6 @@ values. What it leaves:
 Delete this entry as each item lands or is dropped. Worktrees are under
 `.claude/worktrees/` in the main checkout.
 
-- **`fix/vulkan-submit-bounds`** (worktree `agent-a8062689012d7ef4b`,
-  UNCOMMITTED edits only when the session paused): bounded GPU waits that report
-  an error instead of spinning a core forever (`PendingSegment::drain`'s fence
-  wait has no timeout today), a diagnosis of what cuts GPU work off on the
-  integrated GPU (see plan 12, section 0b), and work-bounded submits from the
-  first forward (plan 12, S1 and S2). The coder was running its GPU gates. Not
-  reviewed.
 - **Waiting on other people:** issue 94 (the RX 580 owner was asked for
   diagnostic runs on `main`), issue 100 (Apple Silicon numbers for the CPU
   math), issue 101 (the reporter was invited to open a PR for an incremental
@@ -7096,3 +7075,68 @@ the machine is free:
   `expert_gemm_range_matches_the_single_token_kernels_bitwise` and
   `first_token_spikes_keep_the_rest_of_their_block`) still turn red with the new
   cases in place.
+
+### B221 — work-bounded submits and split heavy ops (plan 12 S2), not done (2026-11-18)
+
+**Tag:** vulkan · submit · watchdog · **Kind:** deferred work, measured
+
+A GPU job that runs past a driver watchdog is reset; the backend now reports it
+(`gpu_wait`: a bounded wait, a lost device, or a segment whose fence signalled
+without its closing timestamp) instead of hanging, but does not avoid it. What
+still trips it, measured on the Ryzen integrated GPU (`Vulkan1`, AMD Windows
+driver, TDR 2 s; plan 12 section 0c):
+
+- **One dispatch over about 2 s**, whatever submit it is in: the tolerance
+  harness's vocabulary-wide head at 96 or more rows with int8 kernels off. No
+  submit boundary shortens it; the op itself must be split into row ranges (or
+  refused with a message before it is submitted).
+- **Submits of many heavy dispatches**: `infr bench` SmolLM3-3B Q4_K_M with
+  `-u 2048` submitted 128-dispatch segments of 4.9 and 5.2 s with the default
+  int8 kernels, and `-u 512` with `INFR_NO_I8DOT=1` failed too. The dispatch cap
+  (`submit.initial_dispatches`, then the measured loop) counts dispatches, not
+  work, so a larger chunk makes each one heavier at the same count.
+
+What it would take: a cost estimate per op from its shape (FLOPs for
+`Op::Linear`, attention by its key count), divided by a throughput that is per
+device AND per kernel family (on the integrated GPU the dp4a GEMMs and the
+scalar-dequant float GEMMs differ by about an order of magnitude, estimated from
+segment times, not measured per op), refined from measured segment times; a cut
+whenever the next op would push the open segment past the budget
+(`SUBMIT_BUDGET_NS`); and row-range splitting of an op whose own estimate passes
+it. llama.cpp's form is a per-submit FLOP cap scaled by CU count for small AMD
+parts (`ggml-vulkan.cpp`, `flops_per_submit`), which caps submits but not single
+dispatches. Not started because the estimate's per-kernel throughput needs
+measurements per family first, and splitting ops touches every GEMM lowering.
+
+### B222 — what the bounded GPU waits did not verify (2026-11-18)
+
+**Tag:** vulkan · tests · **Kind:** coverage gaps
+
+- **The missing-closing-timestamp check has no automated test.** It fired in
+  production runs (`infr bench -u 2048` on `Vulkan1`, plan 12 section 0c), but
+  nothing forces a fence to signal without its work; the timeout path has a
+  forced test
+  (`gpu_wait::tests::gpu_wait_timeout_poisons_the_backend_and_drops_cleanly`,
+  red with the bound removed), the lost-device path only the real reproduction.
+  Untimed segments (a queue without timestamps, persistent decode replays) have
+  no such check.
+- **`infr serve` with a poisoned backend was read, not run.** A request fails
+  with the error (500, or the stream's error frame) and so does every later one
+  on that model, as a lost device already did; the server keeps running, so
+  other models it hosts stay usable and an operator restarts it. `/health` does
+  not report the poisoned backend.
+- **Teardown after a timeout leaks the device** (`VulkanShared::drop` skips
+  every destroy once poisoned). Process exit was checked on Windows (the
+  reproduction exits and `infr devices` lists both GPUs afterwards); a
+  long-lived embedder that recreates backends after a failure would keep the
+  leaked one.
+- **Metal's waits were not reviewed** for the same unbounded-wait pattern.
+- **Windows dispatch versus command-buffer preemption is open:** whether a
+  submit of many short dispatches is also reset at 2 s on the integrated GPU
+  (`infr_core::SUBMIT_BUDGET_NS`'s comment says a 2.06 s submit was), see plan
+  12 section 0c.
+- **`cpu_golden_qwen3_quants` fails on `origin/main` too** since
+  `Qwen3-0.6B-Q8_0.gguf` appeared in the HF cache on 2026-11-18 (the test
+  skipped that quant before): the Q8_0 golden in `QWEN3_QUANT_GOLDEN` does not
+  match the file now cached. Not looked into; CPU-only, unrelated to the GPU
+  waits.

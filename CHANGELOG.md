@@ -350,6 +350,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (`cpu_golden_qwen3moe` re-blessed on Windows only: its Linux value is
   unconfirmed, and CI does not run the MoE goldens).
 
+- **A slow discrete GPU splits its first forward (issue 94).** A device that is
+  wave64-only, or has neither 16x16x16 f16 cooperative matrices nor an
+  accelerated int8 dot (GCN such as the RX 580), now starts the submit splitter
+  at 64 dispatches per submit instead of sending its first prefill forward as
+  one command buffer; single-token forwards stay whole until a measured forward
+  tightens the cap (from the KessokuNet fork's `a35dac2f`). The initial cap is
+  the tuning parameter `submit.initial_dispatches` (`infr tune show`), derived
+  from the new device facts `matrix_units` and `dot_accelerated` (also in
+  `infr tune show --json`). Default devices are unchanged: 0 on the RX 7900 XTX,
+  128 on the integrated GPU. This does not bound the work per submit, only the
+  dispatch count (plan 12, S2).
+
 - **Baseline x86-64 builds (the released binaries) run the f32 dots on FMA.**
   `mul_add` compiled to a call to the C runtime's `fmaf` per element on a build
   without the `fma` target feature, so attention's scores and value sums, MLA's
@@ -889,7 +901,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the fence state and, where the device offers `VK_EXT_device_fault` (now
   enabled when offered), the driver's fault report; the backend then fails every
   later call with that error and leaks, rather than frees, what the GPU may
-  still be using, so teardown cannot hang either.
+  still be using, so teardown cannot hang either. A forward segment whose fence
+  signals without its closing GPU timestamp (what AMD's Windows driver did after
+  a watchdog reset discarded the work) is the same error, where before a
+  timestamp read waited on it forever: on the Ryzen integrated GPU, `infr bench`
+  of SmolLM3-3B with `-u 2048`, or `-u 512` with `INFR_NO_I8DOT=1`, now fails
+  with it instead of hanging. Avoiding the reset is not done yet (plan 12, S2).
 
 - **Equal logits sample the same token on every toolchain.** The CPU backend's
   `Op::Sample` and the host sampler's top-k path ordered equal logits by

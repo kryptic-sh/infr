@@ -263,14 +263,19 @@ Every test ends as a pass, a fail or a printed `skip:` line, never a hang:
   score the prefill on each chunk's last row only and run with a submit cap of 4
   (`INTEGRATED_FLOAT_SUBMIT_CAP`), said in the log. This is a **harness
   workaround for a production weakness**, not a fix: with every int8 kernel off,
-  a submit holding the harness's prefill head stalled or lost that GPU, which
-  [plan 12](plan/12-low-capability-vulkan.md) section 0b records. The prefill
-  phase of those runs scores one row per chunk, is not held to
-  `MIN_TOP1_SCORED`, and does not score positions 0 and 1 at all unless one ends
-  a chunk. It is keyed on the device being integrated: a slow discrete card
-  (issue 94's class) gets no workaround and would only meet the watchdog; the
-  float-weight models' shipped `gpu` runs and the int8-free check keep the full
-  head there too, and completed.
+  the harness's prefill head is one vocabulary-wide dispatch of about 25 ms per
+  chunk row there, and at the default 128-row chunk (3.26 s) Windows' 2 s
+  display-driver watchdog resets the engine even with that dispatch alone in its
+  submit ([plan 12](plan/12-low-capability-vulkan.md) sections 0b and 0c). It
+  was kept when the cause was established (2026-11-18): no submit cap splits one
+  dispatch, so it stays until the backend splits heavy ops (backlog B221). Such
+  a run now ends in a backend error instead of a hang. The prefill phase of
+  those runs scores one row per chunk, is not held to `MIN_TOP1_SCORED`, and
+  does not score positions 0 and 1 at all unless one ends a chunk. It is keyed
+  on the device being integrated: a slow discrete card (issue 94's class) gets
+  no workaround and would meet the same error; the float-weight models' shipped
+  `gpu` runs and the int8-free check keep the full head there too, and
+  completed.
 
 `INFR_FORCE_WAVE64=1` runs the wave64 path and `INFR_TUNE_NO_ROWS=1` the generic
 tuning defaults (both reach these tests through `infr_testkit::honour_env`).

@@ -6728,15 +6728,14 @@ values. What it leaves:
   | Qwen3.5-0.8B     | 2.6e-2, 8.7e-3, 6.8e-2             | at most 3.4e-2                  |
 
   On the same rows the shipped int8 GPU stays within 0.33 (gemma-3 position 0)
-  and 8e-3 (SmolLM3). It matters beyond those rows' logits: position 0's hidden
-  states fill the KV cache every later token attends to. Suspected cause,
-  inferred and unproven: `infr-cpu/src/quant.rs` `quantize_q8` quantizes
-  activations per 256-element superblock, so the first token's very large
-  activations leave little resolution for the rest of each block, where the
-  GPU's 32-element blocks do not. gemma-3's and ERNIE's large distances away
-  from position 0 say the first-row explanation is not the whole story for them.
-  The orchestrator is taking the investigation and the fix as a CPU slice of its
-  own; nothing here changes the CPU.
+  and 8e-3 (SmolLM3). **Cause proven and fixed (2026-11-18):** `quantize_q8`
+  took one scale per 256 activations, so the first token's massive-activation
+  dimensions rounded the rest of their blocks to 0 or ±1; it now splits such
+  outliers into a sparse part, and position 0 is at its steady-state order on
+  every model above that was measured (`docs/cpu-activations.md` has the
+  evidence, the options and the before/after tables). gemma-3's large distances
+  away from position 0 are not outliers: B209 owns them. The table above was
+  taken before the fix; the tolerance table's CPU-side rows were not re-run.
 
 - **The int8 class only catches gross bugs.** With the int8-activation kernels
   on (the shipped default for every quantized model) the GPU's own activation
@@ -6916,54 +6915,6 @@ values. What it leaves:
 Delete this entry as each item lands or is dropped. Worktrees are under
 `.claude/worktrees/` in the main checkout.
 
-- **`fix/cpu-act-quant`** (worktree `agent-a5f74ac20efa5ad6f`, commits
-  `653fef45` and `b7521454`, one commit behind `origin/main`): the production
-  CPU's int8 activation quantizer lost the rest of a 256-element block when a
-  few activations were very large (SmolLM3-3B: KL up to 5.58 against the CPU
-  float reference at sequence position 0, top-1 flipped; llama.cpp quantizes the
-  same way and shares it). The branch moves up to two elements standing more
-  than 16 times above the rest of their block into a sparse part with its own
-  scale. On top of it sits the one-row MoE int8 change the owner approved
-  (formerly B203). **Reviewed 2026-11-18; not landed.** What the review
-  established, by running it:
-  - The fix is correct and the position-0 numbers reproduce (SmolLM3 5.58 to
-    1.4e-4, ERNIE-0.3B 0.60 to 0.013, Qwen3-0.6B 0.086 to 0.0040); every
-    identity suite passes on native and baseline builds.
-  - **To fix before landing:** the identity tests never exercise outlier
-    selection. `op_hashes`' generated inputs lie in [-2, 2), so no block ever
-    splits; two planted tier-dependent faults in the outlier choice (a different
-    ratio at AVX-512, a reversed tie-break) were caught by nothing. The
-    quantizer is scalar and exact today, so nothing is wrong yet, but a SIMD
-    quantizer would go unguarded. Add `op_hashes` cases with spiky rows (Linear
-    for the 256-block formats at 1, 5 and 19 rows, and one MoeFfn).
-  - **The cost is smaller than first reported and comes from somewhere else.**
-    Paired pp512 on a shared machine: Qwen3-1.7B median -1.7% (lower in 8 of 8),
-    gemma-3-1b median -1.2% (mostly noise), decode level. The per-op profile
-    puts all of it in the FFN-down Linears (+12 to 13% on those ops on
-    Qwen3-1.7B, +32 to 38% on gemma-3-1b). The split is NOT mainly a first-token
-    event there: on FFN-down inputs 5 to 16% of rows split on Qwen3-1.7B and 16
-    to 38% on gemma-3-1b, all through the sequence, while on attention and
-    FFN-in inputs it is mostly row 0. Each sparse part costs about 70 to 90 ns
-    per weight row. The branch's docs (the `HI_RATIO` comment, its B210,
-    `docs/cpu-activations.md`, the CHANGELOG entry) describe it as a first-token
-    fix that costs nothing on ordinary rows and need correcting.
-  - Quality away from position 0 is level to slightly better overall
-    (geometric-mean KL ratio after/before 0.70 to 0.98 per model), with single
-    positions moving both ways (worst seen: Qwen3-0.6B position 18, 0.109 to
-    0.402).
-  - Do not change the ratio: 32 leaves no margin on ERNIE and SmolLM3, 8 costs
-    far more.
-  - Ideas for removing the cost: outlier channels repeat across rows, so group
-    an op's sparse parts by block, decode each needed weight block once per
-    weight row and add the outliers as exact f32 in a fixed order; and a
-    sum-of-magnitudes bound in the quantizer's existing max pass to make
-    ordinary blocks free.
-  - Not checked by anyone: the GPU tests that compare against the production CPU
-    (`gpu_seam_paged_moe_matches_resident_and_cpu` asserts exact ids and is
-    expected to change), MoE decode speed, the `qwen3moe` golden on Linux
-    (blessed on Windows only). **Owner decision pending:** land it with the test
-    fix and the docs corrected at a prefill cost of about 1.5 to 2.5%, or first
-    make the sparse dot cheaper.
 - **`fix/vulkan-submit-bounds`** (worktree `agent-a8062689012d7ef4b`,
   UNCOMMITTED edits only when the session paused): bounded GPU waits that report
   an error instead of spinning a core forever (`PendingSegment::drain`'s fence
@@ -6971,9 +6922,6 @@ Delete this entry as each item lands or is dropped. Worktrees are under
   integrated GPU (see plan 12, section 0b), and work-bounded submits from the
   first forward (plan 12, S1 and S2). The coder was running its GPU gates. Not
   reviewed.
-- **`perf/cpu-moe-fma`** (worktree `agent-a3dcdc590e9cddeff`): superseded. Its
-  FMA-tier commit landed through `perf/cpu-fma`; its MoE commit `daa53774` is
-  cherry-picked onto `fix/cpu-act-quant`. Delete the branch once that lands.
 - **Waiting on other people:** issue 94 (the RX 580 owner was asked for
   diagnostic runs on `main`), issue 100 (Apple Silicon numbers for the CPU
   math), issue 101 (the reporter was invited to open a PR for an incremental
@@ -6990,6 +6938,7 @@ Delete this entry as each item lands or is dropped. Worktrees are under
 - **Measurements owed on a quiet machine:** the FMA tier's baseline and native
   tables in `docs/math.md` (every round there had one core busy); the quantizer
   fix's prefill cost.
+
 ### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
 
 **Tag:** cpu · accuracy · **Kind:** finding, needs a decision
@@ -7017,23 +6966,22 @@ rows.
 
 **Tag:** cpu · accuracy · perf · **Kind:** decision taken, alternatives recorded
 
-`quant::HI_RATIO` is 16 (`docs/cpu-activations.md`). Each block split past
-position 0 costs a one-block kernel call per weight row, an estimated five times
-a block of the packed GEMM. At 8 the split is somewhat better (ERNIE-4.5-0.3B's
-position 1, which attends to position 0's value row, reaches 0.029 against 0.13
-at 16 and 0.19 before), but it splits 0.4 to 5.5% of the blocks past position 0
-on `infr bench`'s prompt, and Qwen3-1.7B pp512 measured 14 to 17% slower (three
-disturbed pairs). At 16 it splits 0 to 1.1% and Qwen3-1.7B pp512 measured about
-3% slower (median of seven paired rounds, another agent's suite running); at 32
-(0 to 0.3%) Qwen3-1.7B was level, but 32 is the last ratio that still fixes
-ERNIE's and SmolLM3's first tokens (64 leaves them at 0.61 and 0.30), so it has
-no margin. gemma-3-1b pp512 measured about 4% slower at both 16 and 32, which
-the split blocks do not explain; a quiet-window measurement is owed. Two things
-would let the ratio come down at no cost: a sparse-part dot that costs what its
-one or two nonzero codes cost (a per-element weight decoder for each format), or
-an allocation-free batch kernel for the parts that share a weight block (the
-existing batch kernels allocate scratch per call; tried, and slower than the
-one-row calls). A baseline build was measured only against an earlier form.
+`quant::HI_RATIO` is 16 (`docs/cpu-activations.md`). The figure that costs is
+the per-row one on the FFN-down inputs, where the split fires all through a
+sequence (measured by the review: 5.4% / 16.1% of rows on Qwen3-1.7B's Q4_K /
+Q6_K down inputs on the bench prompt, 32% / 38% on gemma-3-1b; about 1,930 and
+7,100 split blocks per forward), not the per-block rate this entry first quoted
+(0 to 1.1% of all projection-input blocks past position 0 on the bench prompt).
+Each split block costs a one-block kernel call per weight row, about 70 to 90
+ns, 15 to 20 times a block of the packed GEMM: about 2% of prefill in two
+measurements on a shared machine (`docs/cpu-activations.md`, Speed), decode
+level, accepted by the owner. At 8 the split is somewhat better
+(ERNIE-4.5-0.3B's position 1, which attends to position 0's value row, reaches
+0.029 against 0.13 at 16 and 0.19 before) but measured 14 to 17% slower
+Qwen3-1.7B pp512 in three disturbed pairs. At 32 Qwen3-1.7B pp512 was level in
+this branch's rounds, but 32 is the last ratio that still fixes ERNIE's and
+SmolLM3's first tokens (64 leaves them at 0.61 and 0.30), so it has no margin.
+Do not change the ratio; make the sparse dot cheaper instead (B213).
 
 ### B211 — the 32-element activation path is not split (2026-11-18)
 
@@ -7055,6 +7003,96 @@ llama.cpp's CPU quantizes K-quant activations to `Q8_K` (256 elements, one
 scale), the scheme infr used before the split, and has the same first-token
 error: SmolLM3-3B's position 0 is at KL 1.85 from infr's reference in llama.cpp
 and was 1.92 in infr. After the split infr's position 0 is close to its
-reference and therefore 9.2 from llama.cpp's (Qwen3-0.6B 0.073, ERNIE BOS
-0.085). A parity test against a llama.cpp dump that reads position 0 (a
-one-token prompt) will now see that distance; later positions agree as before.
+reference and therefore 9.5 from llama.cpp's (Qwen3-0.6B 0.075, ERNIE BOS 0.094;
+the first draft of this entry quoted 9.2, 0.073 and 0.085, measured at ratio 8,
+before the committed ratio of 16). A parity test against a llama.cpp dump that
+reads position 0 (a one-token prompt) will now see that distance; later
+positions agree as before.
+
+### B213 — make the activation split's sparse dot cheap (2026-11-18)
+
+**Tag:** cpu · perf · **Kind:** approved follow-up, not started
+
+The split (`docs/cpu-activations.md`, B210) costs about 2% of prefill, all in
+the FFN-down layers, because each split block is a whole one-block kernel call
+(`kernels::vec_dot_hi`) per weight row for a part with one or two nonzero codes.
+The review's two ideas, for a slice of its own:
+
+1. **Outlier channels repeat across rows.** Group an op's sparse parts by block;
+   for each weight row decode each needed weight block once, and add the
+   outliers as exact f32 (`w_i · x_i`) in a fixed scalar order. That is tier-
+   and row-identical by construction and more accurate than the int8 part (the
+   outlier enters exactly). Or a batch kernel over all parts that share a block,
+   using the existing thread-local scratch (`moe::with_block_scratch`): the
+   batch kernels as they are allocate per call, and a first try with them was
+   slower than the one-row calls.
+2. **Make ordinary blocks free with a bound from the max pass.** With `amax` the
+   block maximum and `Σ` its sum of magnitudes, a split needs a kept element
+   above 16 times the third largest magnitude `a3`, so `amax > 16·a3`, i.e.
+   `a3 < amax/16`. The two largest magnitudes are at most `amax` each and the
+   other 254 at most `a3`, so
+   `Σ - 2·amax <= Σ - a1 - a2 <= 254·a3 < 254·amax/16`. Hence **if
+   `16·(Σ - 2·amax)/254 >= amax`, no element of the block can split** (checked
+   by hand algebra, 2026-11-18; not run). The bound holds in exact arithmetic:
+   the f32 sum must not round below the true `Σ` for the test to stay one-sided,
+   so either accumulate in f64, or demand a margin (say
+   `16·(Σ - 2·amax) >= 254·amax·(1 + 2^-10)` with `Σ` from a 256-term f32 sum,
+   whose relative error is below `255·2^-24`). The existing count of elements at
+   or above `amax/16` already decides most blocks in one pass; the bound would
+   let the max pass decide them with no second pass.
+
+Measure either against `origin/main` in a quiet window, native and baseline.
+
+### B214 — CPU goldens the activation split could not re-bless or confirm (2026-11-18)
+
+**Tag:** cpu · tests · goldens · **Kind:** verification gaps
+
+- **`QWEN3_QUANT_GOLDEN`** (`cpu_golden_qwen3_quants`): only Q4_K_M was
+  re-blessed under the split. Q8_0 is stale on `main` already (its file was not
+  cached when the goldens were last re-blessed; it is cached on the dev box now,
+  so the test fails there until it is re-blessed). IQ4_XS, Q2_K, Q4_0, Q5_K_M,
+  Q6_K and BF16 are not cached and keep their older values, unverified. CI does
+  not run them.
+- **`QWEN3MOE_GOLDEN`** (`cpu_golden_qwen3moe`): blessed on Windows only, under
+  the split and the one-row MoE change; unconfirmed on Linux (a WSL run of the
+  18 GB file took Windows free memory to 6 GB earlier the same day), and CI does
+  not run the MoE goldens.
+- Confirmed under the split on Windows (release) and WSL: `ernie4_5`, `smollm3`,
+  `qwen3`, `gemma3`, `qwen35`, `lfm3`, `ernie4_5_moe` (unchanged).
+- Not run under WSL: the MoE models' chunk-height identity
+  (`cpu_rows_give_the_same_bits_in_any_chunks` with ERNIE-4.5-21B-A3B and
+  Qwen3-30B-A3B; Windows passed).
+
+### B215 — the outlier-selection faults the new op hashes must be shown to catch (2026-11-18)
+
+**Tag:** cpu · tests · determinism · **Kind:** owed check (needs the machine)
+
+`op_hashes` gained spiky cases (`Linear spiky <format> m1|m5|m19 2048x20` for
+the sixteen 256-block formats, `Linear spiky Q4_0|Q5_0 m5 2048x20`,
+`MoeFfn spiky Q4K rows 1|9`, `MoeFfn spiky Q6K rows 9`), checked in as `0x0`
+placeholders to be blessed from CI's Linux, Windows and macOS prints. Owed once
+the machine is free:
+
+- **Plant a tier-dependent ratio** in `quant::split_off` (for example
+  `let r = if infr_core::simd::active() < SimdTier::Avx2 { 15.0 } else { 16.0 }`,
+  a scalar-versus-capped difference the test sees on any x86 host) and confirm
+  the suite goes red: the `Linear spiky` cases whose rows have pattern 5 (a
+  spike `24 + 1/64` over a next magnitude of 1.5, which splits at 16 and also
+  at 15) do NOT move, but pattern 4 (`24` over 1.5: no split at 16, a split
+  at 15) does. Every `Linear spiky` case of a 256-block format has a pattern-4
+  block (row 0's block 4), so all 48 must fail with a tier-mismatch line, as
+  must the two `MoeFfn spiky` rows-9 cases (row 3 carries pattern 4);
+  `MoeFfn spiky Q4K rows 1` and the two 32-block cases must not.
+- **Reversed tie-break.** By reading, a reversed index tie-break in `split_off`
+  cannot change any result: an element is kept only if it exceeds 16 times the
+  next magnitude, so equal magnitudes are either both among the two largest
+  (both kept or both not, order irrelevant: the kept elements' codes are
+  computed independently) or one of them is the next magnitude itself (then
+  neither can exceed 16 times it). Plant it anyway and confirm the hashes do not
+  move; if one does, this reasoning is wrong and the fault is real.
+- Re-confirm the four faults the review already saw caught (by
+  `the_sparse_activation_part_gives_the_scalar_bits_at_every_tier`,
+  `split_round_trip_matches_the_production_quantizer`,
+  `expert_gemm_range_matches_the_single_token_kernels_bitwise` and
+  `first_token_spikes_keep_the_rest_of_their_block`) still turn red with the new
+  cases in place.

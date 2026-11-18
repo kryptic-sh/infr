@@ -8,9 +8,11 @@
 /// A block whose largest one or two magnitudes stand far above the rest ([`HI_KEEP`],
 /// [`HI_RATIO`]) is split in two: those elements move to a sparse part ([`Self::hi`]), and the
 /// dense codes take the scale of what is left. Without the split such a block's scale is set by
-/// its outliers and every other element rounds to 0 or ±1; the first token of a sequence carries
-/// exactly such rows (its massive-activation dimensions), and its keys and values feed every
-/// later token. A block with nothing to split is quantized as it always was, to the same bits.
+/// its outliers and every other element rounds to 0 or ±1. The first token of a sequence carries
+/// such rows into every projection (its massive-activation dimensions, whose keys and values feed
+/// every later token); the inputs of the FFN down projections carry them all through a sequence,
+/// so there the split works as a general two-scale quantizer (`docs/cpu-activations.md`). A
+/// block with nothing to split is quantized as it always was, to the same bits.
 #[derive(Clone)]
 pub(crate) struct Q8 {
     pub(crate) qs: Vec<i8>,
@@ -41,9 +43,11 @@ pub(crate) const HI_KEEP: usize = 2;
 
 /// An element moves to the sparse part only when its magnitude exceeds this many times the
 /// largest magnitude outside the block's top [`HI_KEEP`]. A power of two, so the test multiplies
-/// exactly. Measured in `docs/cpu-activations.md`: here the first token's rows split and later
-/// rows seldom do; half of it splits enough later rows to slow prefill (each split block is a
-/// second one-block dot), and four times it misses ERNIE-4.5's first token.
+/// exactly. Measured in `docs/cpu-activations.md`: at this ratio the first token's rows split in
+/// every projection, and FFN-down inputs split all through a sequence (a few to a few tens of
+/// percent of their rows, by model), which is where the split's prefill cost is (each split
+/// block is a second one-block dot per weight row); half of it costs far more, and four times it
+/// misses ERNIE-4.5's first token.
 pub(crate) const HI_RATIO: f32 = 16.0;
 
 /// The most sparse parts one block can take. Each part takes its largest element to within f32

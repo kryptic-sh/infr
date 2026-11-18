@@ -114,6 +114,25 @@ kernels and tiles, the packed VNNI GEMM, the MoE expert banks — so the value
 does not depend on the route. The parts use the existing one-row kernels, so no
 kernel changed and every format and tier is covered as it was.
 
+### Where it fires
+
+Measured by the review on 2026-11-18 with an instrumented build (not reproduced
+here): on the inputs of the attention and FFN-in (gate/up) projections the split
+is mostly a row-0 event, but on the inputs of the FFN down projections it fires
+all through the sequence. Rows of the down-projection input with at least one
+split block, Q4_K / Q6_K down weights:
+
+| Prompt               | Qwen3-1.7B   | gemma-3-1b | SmolLM3-3B  |
+| -------------------- | ------------ | ---------- | ----------- |
+| `infr bench`'s pp512 | 5.4% / 16.1% | 32% / 38%  | not counted |
+| a real chat prompt   | 6.6% / 13.5% | 16% / 23%  | 1.6% / 3.9% |
+
+That is about 1,930 split blocks per forward on Qwen3-1.7B and about 7,100 on
+gemma-3-1b (bench prompt). No block anywhere had three spikes, and about six
+times as many unsplit blocks sit at 8 to 16 times their next magnitude as split.
+So on FFN-down inputs the split acts as a general two-scale quantizer, and that
+is where all of its cost is (below).
+
 ### Identity
 
 - **Tiers.** The dense dot and each part's dot are the existing one-row kernels,
@@ -125,8 +144,16 @@ kernel changed and every format and tier is covered as it was.
   `linear_batch_identity`'s sweep includes a split row (its spike pattern), and
   `first_token_spikes_keep_the_rest_of_their_block` checks row 0 of a prefill
   against the same row alone.
-- **The rule is per block and platform-independent**: integer comparisons of f32
-  magnitudes times a power of two, no fast-math, no data-dependent order.
+- **Across systems.** `op_hashes`' spiky cases (`Linear spiky …` for every
+  256-block format at 1, 5 and 19 rows, two 32-block formats, three
+  `MoeFfn spiky …`) feed rows whose blocks hold no spike, one, two of opposite
+  signs, three (the two-element cap), a spike exactly 16 times the next
+  magnitude and one just over, two equal spikes, a spike over an all-zero rest,
+  and two far apart that need a second part. Their hashes are checked in from
+  CI's Linux, Windows and macOS runs.
+- **The rule is per block and platform-independent**: float comparisons of f32
+  magnitudes, one side multiplied by a power of two (exact), no fast-math, no
+  data-dependent order.
 
 ### Options measured
 
@@ -159,16 +186,18 @@ raw prompt (one figure where only the chat prompt was run):
   every format; ungated, every block pays for two.
 - **int16 activations** are exact for practical purposes but halve the integer
   throughput of every kernel.
-- **The split** needs no kernel change and costs nothing on a row that does not
-  split; a split block costs a second one-block kernel call per weight row,
-  several times a block of the packed GEMM. The ratio is the trade: on
-  `infr bench`'s prompt at 8 it splits 0.4 to 5.5% of the blocks entering the
-  projections at positions past 0 (one special token aside; 16: 0 to 1.1%, 32: 0
-  to 0.3%), which measured 14 to 17% slower Qwen3-1.7B pp512 in three pairs with
-  the other agent compiling, so 8 was dropped. At 64 ERNIE's and SmolLM3's first
-  tokens are not fixed; 32 is the last ratio that fixes them both, with no
-  margin. 16 is committed (backlog B210). What the ratio does not reach at 16 is
-  ERNIE's position 1 on its chat template (below).
+- **The split** needs no kernel change. A row with no split block costs one
+  extra pass of the quantizer and nothing in the dots; each split block costs a
+  second one-block kernel call per weight row, about 70 to 90 ns, roughly 15 to
+  20 times a block of the packed GEMM (the review's per-op profile). Because the
+  FFN-down inputs split all through a sequence (above), that is a steady prefill
+  cost in those layers, not a first-token one. The ratio is the trade: at 8 the
+  split fires on several times as many blocks and measured 14 to 17% slower
+  Qwen3-1.7B pp512 in three pairs with the other agent compiling, so 8 was
+  dropped. At 64 ERNIE's and SmolLM3's first tokens are not fixed; 32 is the
+  last ratio that fixes them both, with no margin. 16 is committed (backlog
+  B210). What the ratio does not reach at 16 is ERNIE's position 1 on its chat
+  template (below).
 
 ### After the fix
 
@@ -180,12 +209,23 @@ raw prompt (one figure where only the chat prompt was run):
 | ERNIE-4.5-0.3B          | 7.7e-3 / 0.013  | 0.13 / 0.020    | 5.0e-3 to 9.9e-3     | 0.055 |
 | gemma-3-1b              | 3.0e-4 / 8.5e-4 | 3.8e-3 / 0.016  | 2.9e-3 to 7.0e-3     | 0.26  |
 
-Every position 0 is now at its model's steady-state order. The medians are
-level: of the 17 per-prompt medians that are not zero, 8 are lower and 9 higher,
-the ratios after/before running from 0.57 to 2.4 (gemma-3-1b's second prompt,
-3.0e-3 to 7.0e-3), the spread two runs of either quantizer show. The worst
-positions are single rows near a tie in the reference, and they move both ways
-(gemma 0.67 to 0.21, Qwen3-0.6B's 0.11 to 0.40 at the same position 18).
+Every position 0 is now at its model's steady-state order. Away from position 0,
+as the review measured it (geometric mean over positions 1 on of the KL ratio
+after/before; the same prompts as the tables):
+
+| Model          | KL after/before, positions 1 on |
+| -------------- | ------------------------------- |
+| SmolLM3-3B     | 0.74                            |
+| Qwen3-1.7B     | 0.85                            |
+| gemma-3-1b     | 0.98                            |
+| Qwen3-0.6B     | 0.87                            |
+| ERNIE-4.5-0.3B | 0.70                            |
+
+So level to slightly better overall, with single positions moving both ways,
+mostly rows near a tie in the reference: worse at Qwen3-0.6B position 18 (0.109
+to 0.402) and 23 (0.033 to 0.203), SmolLM3's chat positions 229 and 240 and
+gemma-3-1b position 22 (0.049 to 0.245); better at gemma-3-1b position 24 (0.667
+to 0.148).
 
 ERNIE-4.5-0.3B's position 1 on its chat template went from 0.19 to 0.13, not to
 its steady state: that row's own outliers stand 8 to 16 times above the rest of
@@ -209,11 +249,25 @@ int8 (1.21 on the raw prompt); with the split, position 0 is ordinary on both.
 
 ### Speed
 
-`infr bench --dev cpu`, Windows, native builds, three reps per run, eight rounds
-with `origin/main` (`old`), the split at 16 (`16`, as committed) and at 32
-(`32`) interleaved in each, tok/s. Another agent's test suite ran through all
-eight rounds (`cargo-nextest` in the process list at every round's start), which
-this box's noise floor shows: single runs drop by up to two thirds.
+The split costs about 2% of prefill, all of it in the FFN-down layers, and
+decode is level. That rests on two measurements on a shared machine, neither in
+a quiet window; the owner accepted the cost, and making the sparse dot cheaper
+is queued (backlog B213).
+
+**The review's** (2026-11-18): eight paired rounds of `infr bench` pp512,
+native, `origin/main` against the split. Qwen3-1.7B -10.0, -0.9, -6.1, -2.0,
+-0.2, -0.7, -2.3, -1.4% (median -1.7%, lower in 8 of 8); gemma-3-1b +9.6, -10.1,
+-0.2, +0.4, -2.7, -4.4, -2.2, +0.2% (median -1.2%); decode level. Its per-op
+profile puts all of it in the down projections: Qwen3-1.7B +10.3 ms per pass on
+about 447 ms (the Q6_K and Q4_K down ops +13% and +12%), gemma-3-1b +22.8 ms of
+about 1,120 ms (+32% and +38% on the down ops). The quantizer's extra scan is
+negligible.
+
+**This branch's**: `infr bench --dev cpu`, Windows, native builds, three reps
+per run, eight rounds with `origin/main` (`old`), the split at 16 (`16`, as
+committed) and at 32 (`32`) interleaved in each, tok/s. Another agent's test
+suite ran through all eight rounds (`cargo-nextest` in the process list at every
+round's start); single runs drop by up to two thirds.
 
 | Run, model        | old                                                            | 16                                                            | 32                                                             |
 | ----------------- | -------------------------------------------------------------- | ------------------------------------------------------------- | -------------------------------------------------------------- |
@@ -225,17 +279,13 @@ this box's noise floor shows: single runs drop by up to two thirds.
 Paired, `16` against `old`: Qwen3-1.7B pp512 -0.8, -1.9, (round 3 disturbed),
 -3.2, +5.7, -5.6, -5.5, -8.6% (median of the seven -3.2%); gemma-3-1b pp512
 -5.1, -4.0, +1.3, +0.7, -5.8, -0.4, -3.5, -9.4% (median -3.8%). `32` against
-`old` on Qwen3-1.7B pp512: +7.2, -0.8, +9.1, +0.2, +8.3, -0.9, +2.2, -5.1%
-(median +1.2%); on gemma-3-1b pp512 -4.2, -0.9, +1.5, +4.1, -7.1, -4.7, -6.1,
--7.8% (median -4.5%). Decode is level within the noise on both models at both
-ratios. So on Qwen3-1.7B the split at 16 costs prefill about 3%, which 32, with
-far fewer blocks split past position 0, does not; gemma-3-1b is about 4% slower
-at both ratios, which the split blocks do not explain (at 32 they are under
-0.3%) and which these disturbed rounds cannot tell from noise. Not resolved: a
-quiet window would settle both (backlog B210). The quantizer itself: 1.41
-against 1.35 µs per 2048-wide ordinary row (`quant::tests::microbench`); a
-first-token row with two parts, 7.4 µs, and its 64 Q4_K rows 2.73 against 1.92
-µs.
+`old`: Qwen3-1.7B pp512 +7.2, -0.8, +9.1, +0.2, +8.3, -0.9, +2.2, -5.1% (median
++1.2%); gemma-3-1b pp512 -4.2, -0.9, +1.5, +4.1, -7.1, -4.7, -6.1, -7.8% (median
+-4.5%). Decode is level within the noise. These medians are larger than the
+review's and noisier; neither set settles the figure better than "about 2%". The
+quantizer itself: 1.41 against 1.35 µs per 2048-wide ordinary row
+(`quant::tests::microbench`); a first-token row with two parts, 7.4 µs, and its
+64 Q4_K rows 2.73 against 1.92 µs.
 
 A baseline build (`-C target-cpu=x86-64`) was measured only against an earlier
 form of the split whose quantizer made four passes over every block where it now

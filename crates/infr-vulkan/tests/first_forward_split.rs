@@ -148,6 +148,12 @@ fn gpu_seam_first_forward_split_on_a_slow_device() {
 #[test]
 #[ignore = "requires a Vulkan GPU"]
 fn gpu_seam_first_forward_unsplit_on_a_fast_discrete_device() {
+    // Under `INFR_FORCE_WAVE64` every backend here is in the slow class, which the other test
+    // covers; there is no fast device to check.
+    if infr_testkit::gpu_env::force_wave64() {
+        eprintln!("skip: INFR_FORCE_WAVE64 makes every device slow-class");
+        return;
+    }
     let be = backend(false, None);
     let integrated = be.capabilities().integrated;
     let (_, cuts) = run(&be, ROWS);

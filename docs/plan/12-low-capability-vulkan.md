@@ -186,7 +186,13 @@ prompt 2, `gpu-float`; each is listed with its run count.
   the check fired on real hardware there, three times. In the harness runs it
   never did; there the next submit reported the lost device first. The default
   integrated chunk (`integrated_ubatch_rows`, 128 rows) with the int8 kernels on
-  has not met it.
+  has not met it. Re-run on 2026-11-19 with the branch build and no other
+  session on the machine, three runs each: `-u 512` with `INFR_NO_I8DOT=1` met
+  the reset every time and ended in 10 to 15 s with the same error (segments of
+  107 and 108 dispatches, first `embed_gather_q6k`), the process exiting and
+  `infr devices` listing both GPUs after each; `-u 2048 -p 2048` with the
+  default kernels COMPLETED all three times (71.8, 75.3 and 73.3 t/s), where it
+  had been reset on 2026-11-18 while another session was using the machine.
 
 **Not established [I]: the rule.** Two models fit parts of the data:
 
@@ -201,8 +207,10 @@ prompt 2, `gpu-float`; each is listed with its run count.
   resets it when the running work does not yield within `TdrDelay`; if this
   engine preempts only between dispatches, a long dispatch is reset only when a
   preemption request lands during it. Explains the nondeterminism and the
-  completions. Not tested: nothing here controlled or observed the preemption
-  requests, and the dispatch-versus-command-buffer granularity is not known
+  completions, and fits the `-u 2048` runs completing on a quiet machine and
+  being reset on a busy one (one busy run, three quiet). Not tested: nothing
+  here controlled or observed the preemption requests, and the
+  dispatch-versus-command-buffer granularity is not known
   (`infr_core::SUBMIT_BUDGET_NS`'s comment records a 2-CU submit reset at 2.06
   s; in the GPU gate a single 126-dispatch LFM3 forward waited 2.75 s and
   completed).
@@ -240,25 +248,32 @@ cap is the tuning parameter `submit.initial_dispatches` (`infr tune show`: 64 on
 the `rx580-gcn-radv` and `unknown` fixtures, 128 integrated, 0 elsewhere). The
 brief expected only the GCN snapshot to change; adding a parameter changes all
 seven (each gains that one line and a new hash, so the banner hash changes on
-every device), and no other value moves in any of them. Verified on 2026-11-18
-(runs re-done once the GPUs are free):
+every device), and no other value moves in any of them; `infr tune show` on both
+real GPUs against a `main` build differs only by that line (0 on the RX 7900
+XTX, 128 on the integrated GPU) and the hash. Verified:
 `initial_submit_cap_follows_the_device_facts` failed with the slow class removed
-from the default (`left: 0, right: 64` for the GCN fixture) and passes with it;
-`first_forward_split` on the RX 7900 XTX cut the first prefill forward twice
-with `INFR_FORCE_WAVE64` (cap 64), bit-identical to the unsplit forced run, and
-0 times natively; on the integrated GPU, whose own cap of 128 applies either
-way, once forced and once native. **S2 not done:** section 0c shows a per-submit
-budget is not enough on its own, because a long dispatch is what is reset, and
-no submit boundary shortens it. What it needs, from the measurements: a per-op
-cost estimate (FLOPs from the op's shape) over a throughput that is per device
-AND per kernel family (on the integrated GPU the dp4a GEMMs and the
-scalar-dequant ones differ by about an order of magnitude, estimated from
-segment times, not measured per op [I]), refined from measured segment times;
-cutting submits on the estimate; and SPLITTING an op whose own estimate passes
-the budget into row ranges, or refusing it with a message (B221). Until then a
-large `-u` on a slow device fails with an error instead of a hang. The RX 580
-still needs the reporter: S1 is the fork's measured fix for that card, untested
-here on GCN.
+from the default (`left: 0, right: 64` for the GCN fixture, 2026-11-18) and
+passes with it; `first_forward_split` (re-run 2026-11-19 on the final branch) on
+the RX 7900 XTX cut the first prefill forward twice with `INFR_FORCE_WAVE64`
+(cap 64), bit-identical to the unsplit forced run, left a single-token forward
+whole, and cut nothing natively; on the integrated GPU, whose own cap of 128
+applies either way, it cut once forced and once native. The GPU gate on the
+branch (2026-11-19, the filter of `docs/gpu-tolerance.md` plus
+`mtp_head_cpu_vulkan_parity`): 652 passed on the RX 7900 XTX and 591 on the
+integrated GPU (`main` at `086ebff0`: 643 and 582); with `INFR_FORCE_WAVE64=1`
+on the XTX 590 passed and 1 failed, the native-device half of
+`first_forward_split`, which forcing makes slow-class and which now skips under
+it (re-run: both pass). **S2 not done:** section 0c shows a per-submit budget is
+not enough on its own, because a long dispatch is what is reset, and no submit
+boundary shortens it. What it needs, from the measurements: a per-op cost
+estimate (FLOPs from the op's shape) over a throughput that is per device AND
+per kernel family (on the integrated GPU the dp4a GEMMs and the scalar-dequant
+ones differ by about an order of magnitude, estimated from segment times, not
+measured per op [I]), refined from measured segment times; cutting submits on
+the estimate; and SPLITTING an op whose own estimate passes the budget into row
+ranges, or refusing it with a message (B221). Until then a large `-u` on a slow
+device fails with an error instead of a hang. The RX 580 still needs the
+reporter: S1 is the fork's measured fix for that card, untested here on GCN.
 
 Declined: the fork's opt-in SSBO weight binding, which its own config doc marks
 as producing wrong output in a model on the RX 580, and its GQA decode pass,

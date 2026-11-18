@@ -907,16 +907,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with that error without touching the device, and leaks rather than frees what
   the GPU may still be using, so teardown cannot hang either. Waiting no longer
   needs a submit of its own: the fence rides on the submit that carries the
-  work. **Dropped work is detected on forward segments only:** after a watchdog
-  reset AMD's Windows driver signals the fence of work it threw away, and a
-  forward segment (prefill chunks, the static decode path) whose fence signals
-  without its closing GPU timestamp is the same error, where before a timestamp
-  read waited on it forever. On the Ryzen integrated GPU `infr bench` of
-  SmolLM3-3B with `-u 2048`, or `-u 512` with `INFR_NO_I8DOT=1`, now fails with
-  it instead of hanging. Replayed and chained decode tokens, one-shot copies,
-  staging copies and queues without timestamps have no such check: a reset there
-  is reported by the next submit, and the step it hit may return wrong output
-  first (backlog B222). Avoiding the reset is not done yet (plan 12, S2).
+  work. On AMD's Windows driver a fence wait still costs decode about 0.4%
+  against the old unbounded queue wait (Qwen3-1.7B tg128, both GPUs here;
+  backlog B222). **Dropped work is detected on forward segments only:** after a
+  watchdog reset AMD's Windows driver signals the fence of work it threw away,
+  and a forward segment (prefill chunks, the static decode path) whose fence
+  signals without its closing GPU timestamp is the same error, where before a
+  timestamp read waited on it forever. On the Ryzen integrated GPU `infr bench`
+  of SmolLM3-3B with `-u 2048`, or `-u 512` with `INFR_NO_I8DOT=1`, now fails
+  with it instead of hanging. Replayed and chained decode tokens, one-shot
+  copies, staging copies and queues without timestamps have no such check: a
+  reset there is reported by the next submit, and the step it hit may return
+  wrong output first (backlog B222). Avoiding the reset is not done yet (plan
+  12, S2).
 
 - **Equal logits sample the same token on every toolchain.** The CPU backend's
   `Op::Sample` and the host sampler's top-k path ordered equal logits by

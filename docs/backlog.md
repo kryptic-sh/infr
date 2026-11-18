@@ -7137,6 +7137,25 @@ measurements per family first, and splitting ops touches every GEMM lowering.
   replays the value must change per replay, which the recorded command buffer
   cannot do without re-recording or a host-side reset per token. Worth doing
   with a decode A/B to show its cost; until then this is the gap.
+- **The bounded wait costs decode about 0.4%; decision needed.** Interleaved A/B
+  against `main` (`086ebff0`), Qwen3-1.7B Q4_K_M, six rounds each, 2026-11-19,
+  no other session on the machine: tg128 476.87 against 478.59 t/s on the RX
+  7900 XTX (branch lower in all six rounds) and 27.20 against 27.31 on the
+  integrated GPU (lower in five of six); pp512 11910 against 11970 and 231.38
+  against 231.66 (lower in four and six of six). About 7.5 µs per decode token
+  on the XTX. The cost is `vkWaitForFences` itself on AMD's Windows driver: with
+  the fence attached to the work's own submit (no extra submit) and waited by
+  `vkQueueWaitIdle` instead, decode matched `main` (478.52 against 478.28, five
+  rounds); waiting on the fence with no timeout, spinning on `vkGetFenceStatus`
+  for up to 5 ms first, or waiting on a timeline semaphore (`vkWaitSemaphores`,
+  no fence reset) all cost the same as the bounded fence wait (476.45, 475.64
+  and 475.90), so it is how soon the driver reports a fence or semaphore
+  signalled, not the timeout, the reset or a wake-up. The device-fault extension
+  made no difference (475.76 without it). Options: keep the cost; or use
+  `vkQueueWaitIdle` for the decode replay only, which has no timeout, and bound
+  it from outside (a watchdog thread that, past the bound, reports the stuck
+  submit and ends the process, since the waiting thread cannot be released). The
+  experiment code is not in the tree.
 - **The missing-closing-timestamp check has no automated test.** It fired on
   real hardware in the three production runs of plan 12 section 0c (`infr bench`
   on `Vulkan1`), never in the harness runs, where the next submit reported the

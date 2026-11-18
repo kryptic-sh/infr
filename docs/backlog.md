@@ -6972,26 +6972,53 @@ Delete this entry as each item lands or is dropped. Worktrees are under
 `.claude/worktrees/` in the main checkout.
 
 - **`fix/cpu-act-quant`** (worktree `agent-a5f74ac20efa5ad6f`, commits
-  `653fef45` and `b7521454`): the production CPU's int8 activation quantizer
-  lost the rest of a 256-element block when a few first-token activations were
-  very large (SmolLM3-3B: KL up to 4.88 against the CPU float reference at
-  sequence position 0, top-1 flipped; llama.cpp quantizes the same way and
-  shares it). The branch moves up to two elements standing more than 16 times
-  above the rest of their block into a sparse part with its own scale; the coder
-  measured position-0 KL at 1.4e-4 on SmolLM3 afterwards, steady state level,
-  ten CPU goldens re-blessed. On top of it sits the one-row MoE int8 change the
-  owner approved (formerly B203). **Not landed because:** the coder measured
-  about 3 to 4% slower prefill (pp512, Qwen3-1.7B and gemma-3-1b, eight paired
-  rounds taken while a GPU test suite was running, so not yet trusted), and a
-  review was still running when the session paused. Open questions put to that
-  review: is the cost real and where is it (the outlier scan on ordinary rows,
-  or many rows splitting); do the identity tests' generated inputs contain
-  outlier blocks at all. The `qwen3moe` golden's new value was blessed on
-  Windows only. **Owner decision pending:** take the cost, make the outlier path
-  cheaper first, or use a ratio of 32 (level in speed on Qwen3, no margin left
-  on ERNIE's first token). The branch's own write-up is
-  `docs/cpu-activations.md` on the branch; its backlog entries B209 to B212
-  arrive with it.
+  `653fef45` and `b7521454`, one commit behind `origin/main`): the production
+  CPU's int8 activation quantizer lost the rest of a 256-element block when a
+  few activations were very large (SmolLM3-3B: KL up to 5.58 against the CPU
+  float reference at sequence position 0, top-1 flipped; llama.cpp quantizes the
+  same way and shares it). The branch moves up to two elements standing more
+  than 16 times above the rest of their block into a sparse part with its own
+  scale. On top of it sits the one-row MoE int8 change the owner approved
+  (formerly B203). **Reviewed 2026-11-18; not landed.** What the review
+  established, by running it:
+  - The fix is correct and the position-0 numbers reproduce (SmolLM3 5.58 to
+    1.4e-4, ERNIE-0.3B 0.60 to 0.013, Qwen3-0.6B 0.086 to 0.0040); every
+    identity suite passes on native and baseline builds.
+  - **To fix before landing:** the identity tests never exercise outlier
+    selection. `op_hashes`' generated inputs lie in [-2, 2), so no block ever
+    splits; two planted tier-dependent faults in the outlier choice (a different
+    ratio at AVX-512, a reversed tie-break) were caught by nothing. The
+    quantizer is scalar and exact today, so nothing is wrong yet, but a SIMD
+    quantizer would go unguarded. Add `op_hashes` cases with spiky rows (Linear
+    for the 256-block formats at 1, 5 and 19 rows, and one MoeFfn).
+  - **The cost is smaller than first reported and comes from somewhere else.**
+    Paired pp512 on a shared machine: Qwen3-1.7B median -1.7% (lower in 8 of 8),
+    gemma-3-1b median -1.2% (mostly noise), decode level. The per-op profile
+    puts all of it in the FFN-down Linears (+12 to 13% on those ops on
+    Qwen3-1.7B, +32 to 38% on gemma-3-1b). The split is NOT mainly a first-token
+    event there: on FFN-down inputs 5 to 16% of rows split on Qwen3-1.7B and 16
+    to 38% on gemma-3-1b, all through the sequence, while on attention and
+    FFN-in inputs it is mostly row 0. Each sparse part costs about 70 to 90 ns
+    per weight row. The branch's docs (the `HI_RATIO` comment, its B210,
+    `docs/cpu-activations.md`, the CHANGELOG entry) describe it as a first-token
+    fix that costs nothing on ordinary rows and need correcting.
+  - Quality away from position 0 is level to slightly better overall
+    (geometric-mean KL ratio after/before 0.70 to 0.98 per model), with single
+    positions moving both ways (worst seen: Qwen3-0.6B position 18, 0.109 to
+    0.402).
+  - Do not change the ratio: 32 leaves no margin on ERNIE and SmolLM3, 8 costs
+    far more.
+  - Ideas for removing the cost: outlier channels repeat across rows, so group
+    an op's sparse parts by block, decode each needed weight block once per
+    weight row and add the outliers as exact f32 in a fixed order; and a
+    sum-of-magnitudes bound in the quantizer's existing max pass to make
+    ordinary blocks free.
+  - Not checked by anyone: the GPU tests that compare against the production CPU
+    (`gpu_seam_paged_moe_matches_resident_and_cpu` asserts exact ids and is
+    expected to change), MoE decode speed, the `qwen3moe` golden on Linux
+    (blessed on Windows only). **Owner decision pending:** land it with the test
+    fix and the docs corrected at a prefill cost of about 1.5 to 2.5%, or first
+    make the sparse dot cheaper.
 - **`fix/vulkan-submit-bounds`** (worktree `agent-a8062689012d7ef4b`,
   UNCOMMITTED edits only when the session paused): bounded GPU waits that report
   an error instead of spinning a core forever (`PendingSegment::drain`'s fence
@@ -7010,6 +7037,11 @@ Delete this entry as each item lands or is dropped. Worktrees are under
   that prints the scalar-to-NEON ratio (B206); plan 11's G3 and G4 (commit the
   planted-bug tests; convert the exact GPU goldens and wire `infr tune check`);
   plan 10's tuning slices S2 onward; plan 12's kernel ports from the fork.
+- **Stale on `main`, found in passing:** `QWEN3_QUANT_GOLDEN`'s Q8_0 case fails
+  on `main` (the model was not cached when the goldens were last re-blessed; a
+  reviewer downloaded it on 2026-11-18). The other quants that were not cached
+  are probably stale too. CI does not run them. Re-bless with every quant
+  cached, Windows and Linux agreeing.
 - **Measurements owed on a quiet machine:** the FMA tier's baseline and native
   tables in `docs/math.md` (every round there had one core busy); the quantizer
   fix's prefill cost.

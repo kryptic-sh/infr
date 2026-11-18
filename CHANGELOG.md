@@ -329,6 +329,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Baseline x86-64 builds (the released binaries) run the f32 dots on FMA.**
+  `mul_add` compiled to a call to the C runtime's `fmaf` per element on a build
+  without the `fma` target feature, so attention's scores and value sums, MLA's
+  value sum, f16/bf16/f32 weights and reference mode ran several times slower
+  than on a native build. The dots now run an AVX2+FMA+F16C compilation of the
+  same source where the CPU has those, chosen once per graph, with the same
+  bits. The f16 KV cache write and the f16 dot convert eight values at a time on
+  every build (the same bits as `half`'s conversion, checked on all 2^32
+  inputs), and the bf16 dot reads its weights in chunks. Measured on a Ryzen 9
+  9950X3D, 16 threads, with another agent's test spinning one core, baseline
+  build before against after: Qwen3-1.7B Q4_K_M pp512 314-325 to 986-1027 tok/s
+  (a native build: 1036-1155), gemma-3-1b-it pp512 351-370 to 554-572 (native
+  566-579), Qwen3-0.6B tg64 in reference mode 11.5-14.3 to 23.1-27.3 (native
+  17.9-25.6); `WriteKv` into an f16 cache 744-794 to 128-142 µs per call.
+  Production decode is level, and so is a native build (eight paired rounds),
+  whose f16 dot is about four times faster and whose f16 KV write is faster.
+
 - **CPU outputs are identical on every operating system, and change once.**
   Every transcendental function the CPU backend uses (`exp`, `ln`, `ln_1p`,
   `tanh`, `powf`, `sin`, `cos`: softmaxes, SiLU/GELU/sigmoid, RoPE, the MoE

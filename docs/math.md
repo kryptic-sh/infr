@@ -195,8 +195,11 @@ backend. What is proven, and how:
   has and holds it to the scalar tier's bits, on inputs that reach the int8
   extremes, both zero signs, subnormals and every code pattern, and checks which
   tier each dispatcher took. One family differed (AVX-512 Q8_0, fixed in S4; see
-  the golden table below). The f32/f16/bf16 dots have no run-time dispatch: one
-  source fixes the order of every `mul_add` and of the lane sum.
+  the golden table below). The f32 dots (`dot`, `dot_n`, `dot_mn`, `dot_f16`,
+  `dot_bf16`, `axpy`, `mul_add_into`, `dequant_dot_rows`) have one source that
+  fixes the order of every `mul_add` and of the lane sum; on a build without FMA
+  they run an FMA compilation of it (below), held to the scalar bits the same
+  way and checked to be fused at every tier.
 - **Every op, tier and thread count.** `crates/infr-cpu/tests/op_hashes.rs`:
   every `Op` variant, one checked-in hash per case at every tier and at 1, 2, 3,
   7, 33 and the machine's threads. The packed VNNI GEMMs and the MoE expert
@@ -228,7 +231,8 @@ backend. What is proven, and how:
   the synthetic LFM3 with f32 weights and with Q4_K, Q5_0 and Q8_0 weights;
 - `f32::mul_add` correctly rounded on native and baseline builds
   (`tests/mul_add_exact.rs`), which the f32 dots' identity across builds rests
-  on.
+  on, and the f32 dots' FMA tier equal to the C runtime's `fmaf` path and fused
+  on a baseline build (`tier_tests`).
 
 **By reading only:** that no parallel split reduces across tasks for shapes
 larger than the suite's (the threshold cases cross each threshold once, not
@@ -317,6 +321,146 @@ difference of -4.0 t/s (-1.1%), middle values 372.9 against 377.3; Qwen3-1.7B
 pp512 is below in 6 of 8, mean -1.5 t/s (-0.4%), middle values 328.9 against
 329.9; decode level. Both lean toward `main` by less than the protocol resolves,
 so a cost of about 1% on baseline builds is neither shown nor ruled out.
+
+## The f32 dots on baseline builds: the FMA tier (plan 11 S6)
+
+The f32 dots (`kernels::Dots`: `dot`, `dot_n`, `dot_mn`, `dot_f16`, `dot_bf16`,
+the value sums `axpy` and `mul_add_into`, and `dequant_dot_rows`, the
+f32-activation expert GEMM) are `mul_add` chains in one fixed order: 8 lanes,
+lane `i % 8` taking element `i`, the lanes folded by `iter().sum()`, an `n % 8`
+tail done serially. On a build whose target has FMA (`target-cpu=native` here,
+and aarch64) `mul_add` is the instruction. On a baseline x86-64 build (the
+released binaries and CI) it is a call to the C runtime's `fmaf` per element:
+exact, so the bits are the same, but attention's scores and value sums,
+reference mode, MLA's value sum and every f16/bf16/f32 weight ran several times
+slower than a native build on the same CPU.
+
+**What changed.** Each dot's body is written out twice (`fma_twin!` in
+`kernels.rs`): once as the scalar function, once inside
+`#[target_feature(enable = "avx2,fma,f16c")]`. Same operations in the same
+order, all fused, so the same bits. Which one runs is chosen once per graph, not
+per call: the interpreter resolves a `Dots` token at its start
+(`Dots::resolve::<CAP>()`, which reads one cached CPU flag and, under a
+`kernels.cpu.max_tier` ceiling, asks the ceiling) and every op's loops call its
+methods, a branch on a register. A kernel task that runs outside the interpreter
+(the MoE expert GEMM, the lightning indexer) resolves its own. Only `resolve`
+can make a `Dots` that selects the FMA code, after checking the CPU, so the
+`unsafe` call behind it cannot be reached on a CPU without AVX2, FMA and F16C. A
+build with FMA compiles no dispatch at all: `Dots` is empty there and every
+method is the scalar function.
+
+The first version tested three CPU features inside every call, in attention's
+per-key and per-value loops and `Linear`'s per-row loop; the token removes that.
+
+**Tier placement.** The FMA code belongs to the `avx2` tier: it runs at a
+ceiling of `avx2` or above and not at `scalar`. Rather than adding FMA and F16C
+to what the `avx2` tier requires (which would push a CPU that reports AVX2
+without them, a VM that hides FMA say, down to the scalar kernels for every
+family), the flag tests AVX2, FMA and F16C together: such a CPU keeps its AVX2
+int8 kernels and runs the dots' scalar code. No shipped Intel or AMD CPU with
+AVX2 lacks either.
+
+**Why not wider.** The 8 accumulators fill one ymm register; a 16-lane AVX-512
+form would be a different association and different bits, so there is none.
+
+**f16 in both directions.** `dot_f16` widens each chunk of eight weights with
+one `vcvtph2ps` on any build that has F16C, native included: `half`'s
+per-element `to_f32` is not merged into one wide conversion by the compiler, and
+the native f16 dot had been three times slower than the baseline FMA tier. The
+f16 KV write (`Op::WriteKv` into an f16 cache) narrows eight values with one
+`vcvtps2ph` (round to nearest even) instead of `half::f16::from_f32` per
+element, which on a baseline build also tested for F16C per element. Both
+conversions give `half`'s bits: the widening is exact, and the narrowing was
+compared with `half`'s software conversion (`from_f32_const`, which never uses
+F16C) on all 2^32 f32 inputs at every tier and uncapped, on Windows native and
+baseline and WSL native and baseline: 21,474,836,480 conversions per run, every
+result equal, NaNs included (the hardware quiets a signalling NaN and keeps the
+top of the payload, as the software path does).
+
+**Two codegen traps, measured.** Writing each body once as an
+`#[inline(always)]` function behind both entry points made rustc inline the
+whole body into every call site on the native build, and `Op::Attention`'s time
+in a Qwen3-1.7B pp512 doubled (3.0 to 6.0 ms per call) while every other op
+stayed level; the scalar functions keep the inlining attribute the dots always
+had. And the bf16 dot indexed its weight bytes and activations one at a time,
+with a bounds check each; reading them in eight-element chunks (same operations,
+same bits) made it four times faster on both builds (below).
+
+**Tests.** `kernels/tier_tests.rs` runs every dot (and the f16 narrowing) at
+every tier this CPU has and uncapped, against the scalar tier's bits, on lengths
+that leave every remainder of 8, with both zeros, subnormals, values that
+cancel, and pairs where `a·b + c` rounded twice differs from the fused result;
+it also asserts each dot returns the fused value on those pairs at every tier.
+On a baseline build that holds the FMA code to the C runtime's `fmaf`. Planted:
+an unfused lane loop in the FMA `dot` failed both tests at `avx2` and above; an
+unfused `axpy`, and an unfused tail in `dot`, failed the fused test at every
+tier. A bit flipped in the FMA `dot`'s result was seen by `op_hashes` in 23
+cases (attention, every KV format, the f32 `Linear`s, reference mode, MLA) and
+one in `dot_n`'s in 24 (attention, the KV formats, the MoE router), each at
+`avx2`, `avx512` and `avx512vnni` (uncapped) and at 1, 2, 3, 7, 33 and 32
+threads, never at `scalar`. No op hash and no golden changed.
+
+**Speed of the dots** (`bench_float_dots` in `tier_tests.rs`, one thread, median
+ns per element of 15 interleaved rounds, 2026-11-18, with the other agent's GPU
+test spinning one core; "C runtime" is the scalar code on a baseline build,
+which calls `fmaf` or tests for F16C per element; on the native build both
+columns are the same code):
+
+| Kernel, length                | baseline, C runtime | baseline, FMA tier | native |
+| ----------------------------- | ------------------: | -----------------: | -----: |
+| `dot`, 128                    |                1.07 |              0.252 |  0.243 |
+| `dot_n::<4>`, 128             |                1.01 |             0.0620 | 0.0574 |
+| `dot_f16`, 4096               |                2.00 |             0.0869 | 0.0837 |
+| `dot_bf16`, 4096              |               0.959 |             0.0867 | 0.0839 |
+| `axpy`, 128                   |                1.08 |              0.127 | 0.0355 |
+| `dequant_dot_rows` Q4_K, 4096 |                1.09 |              0.179 |  0.115 |
+| f16 KV narrowing, 4096        |                1.64 |             0.0867 | 0.0540 |
+
+Before the token and the f16 changes (an earlier quiet window): the FMA tier's
+lone `dot` cost 0.243 against the native 0.226 (7% more, from the three feature
+tests per call; now 4%, the call the baseline caller cannot inline), the native
+`dot_f16` 0.321 and `dot_bf16` 0.362, and the f16 narrowing on the native build
+0.155 (the C-runtime column above is the baseline build before). The short
+`axpy` and `dequant_dot_rows` still trail the native build: their FMA copies are
+separate calls, and `dequant_dot_rows` decodes its spans in baseline code.
+
+**What it buys a forward.** Per-op profile of one Qwen3-1.7B Q4_K_M pp512
+(`INFR_PROF_OPS=1`, the last of two reps, 16 threads, three alternations, the
+other agent's GPU test spinning one core): `Attention` per call, baseline build
+39.0-40.3 ms before and 3.09-3.19 ms after, native 2.90-3.10 (`origin/main`) and
+2.93-3.14 (this branch); `WriteKv` baseline 744-794 µs before and 128-142 after,
+native 202-224 before and 134-139 after.
+
+`infr bench --dev cpu`, Windows, four binaries interleaved per round (`main` =
+`origin/main`, `fma` = this branch; baseline builds `-C target-cpu=x86-64`),
+three reps per round, tok/s. No quiet window came in the hours available: in
+rounds 1-8 the other agent's GPU test spun one core throughout (`gt7.exe`, 10 s
+of CPU per 10 s), and rounds 9-12 were disturbed further (their figures drop by
+up to two thirds) and are not shown:
+
+| Model, run                  | baseline `main`                                        | baseline `fma`                                               | native `main`                                                 | native `fma`                                                   |
+| --------------------------- | ------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------- | -------------------------------------------------------------- |
+| Qwen3-1.7B, pp512           | 320.2, 317.9, 316.0, 313.6, 324.7, 322.6, 321.1, 319.2 | 1027.4, 1015.6, 1020.5, 985.7, 1017.6, 1027.0, 1016.9, 993.7 | 1098.1, 1095.6, 1123.0, 676.1, 1100.6, 1121.4, 1099.0, 1097.4 | 1155.4, 1095.3, 1120.1, 1036.3, 1092.2, 1117.5, 1093.8, 1104.2 |
+| gemma-3-1b-it, pp512        | 370.3, 366.3, 369.4, 355.4, 361.2, 350.9, 357.3, 362.0 | 571.7, 567.8, 562.0, 553.9, 562.3, 570.3, 555.2, 556.4       | 576.2, 574.3, 570.7, 557.3, 576.4, 576.4, 575.0, 576.3        | 572.1, 566.1, 578.5, 570.8, 575.3, 576.7, 570.0, 568.5         |
+| Qwen3-1.7B, tg64            | 50.2, 50.0, 50.3, 50.7, 48.1, 48.6, 50.4, 48.9         | 49.6, 51.6, 45.9, 49.2, 50.2, 49.5, 46.9, 49.4               | 55.9, 54.1, 54.8, 56.8, 57.2, 57.1, 56.5, 56.7                | 57.2, 56.6, 56.7, 56.8, 56.6, 56.0, 56.8, 56.8                 |
+| Qwen3-0.6B, tg64, reference | 14.1, 14.1, 14.0, 14.2, 14.2, 14.3, 14.2, 11.5         | 27.2, 27.2, 23.1, 27.3, 27.3, 26.7, 27.1, 26.6               | 25.1, 25.0, 24.7, 25.5, 25.6, 25.4, 25.4, 25.2                | 25.3, 25.2, 17.9, 25.6, 25.4, 25.2, 25.5, 25.1                 |
+
+**The native build is level.** Paired, `fma` minus `main` on Qwen3-1.7B pp512:
++57.3, -0.3, -2.9, +360.2 (a low `main` run), -8.4, -3.9, -5.2, +6.8; without
+the outlier the mean is +6.2 t/s and five of seven differences are under 1%
+either way. gemma-3-1b pp512: -4.1, -8.2, +7.8, +13.5, -1.1, +0.3, -5.0, -7.8
+(mean -0.6). Decode: Qwen3-1.7B +1.3, +2.5, +1.9, 0, -0.6, -1.1, +0.3, +0.1;
+reference mode within ±0.2 except one low `fma` run. The 2% the review measured
+on `main` against the first version of this work is not reproduced; its
+`WriteKv` difference is gone with the wide f16 write, which is now faster than
+`main`'s on both builds.
+
+**The baseline build** gains 3.2x on Qwen3-1.7B prefill (314-325 to 986-1027),
+1.55x on gemma-3-1b prefill (351-370 to 554-572) and 1.9x on reference-mode
+decode (which now runs faster than the native build; not traced); production
+decode is level. Against the native build it is now at about 92% on Qwen3-1.7B
+prefill, 98% on gemma-3-1b and 88% on decode; what is left is outside the f32
+dots (backlog B208).
 
 ## The determinism rule
 

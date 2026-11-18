@@ -6634,6 +6634,23 @@ every other dtype. The options as weighed:
 
 **Tag:** cpu · determinism · **Kind:** approved, not started
 
+**2026-11-18: implemented on branch `perf/cpu-moe-fma` (commit `daa53774`), and
+held.** One-row `Op::MoeFfn` on the int8 expert kernels, with the identity
+tests, re-blessed op hashes and `cpu_golden_qwen3moe`, works as specified, but
+it exposes a problem in the int8 activation quantizer at sequence position 0.
+Comparing the production CPU with `kernels.cpu.reference` per position on
+Qwen3-30B-A3B (the orchestrator's review), position 0's KL went from 0.0137 and
+0.0020 (two prompts) to 1.21 and 0.67, max |logit difference| 10.55 and 9.03,
+while positions 1-7 stayed ordinary (about 0.0045 → 0.0063); ERNIE-4.5-21B-A3B's
+position 0 is ordinary. A dense model shows the same without this change:
+SmolLM3-3B's production CPU against reference has KL 4.88 at position 0 (top-1
+`"system"` p=0.996 becomes `"bdb"` p=0.169) and about 2e-2 elsewhere. The
+suspected cause, inferred and not proven: `quantize_q8`'s 256-element blocks,
+where the first token's very large activations set `amax/127` and leave almost
+no resolution for the rest of the block. Multi-row prefill already quantizes
+position 0 that way; the change makes a one-token prompt, whose logits are read,
+take it too. It lands after the quantizer is fixed (its own slice).
+
 **Decided 2026-11-18: the owner approved the first option below, int8
 activations at one row too.** To do: route one-row `Op::MoeFfn` through the int8
 expert kernels, drop the MoE exclusion from the row-count tests, re-bless the
@@ -6683,9 +6700,7 @@ S3/S4 work and not re-read for this entry:
    the scalar expression, which `kernels/tier_tests.rs` enforces once the tier
    is one `crate::simd` dispatches. Correctness can run on CI's macOS runner;
    speed needs a Mac owner (issue 100 collects a baseline first).
-2. **S6 of plan 11:** on baseline x86-64 builds the f32 dots' `mul_add` is a
-   C-runtime call, exact but slow; a run-time FMA tier keeps the bits.
-3. **One-row MoE** (B203, approved).
+2. **One-row MoE** (B203, approved; implemented and held, see there).
 
 ### B204 — what plan 11's S3/S4 (tier, thread and row identity) left (2026-11-17)
 
@@ -6735,11 +6750,41 @@ S3/S4 work and not re-read for this entry:
   lightning indexer's `d.max(0.0)` ReLU, the SwiGLU clamp's `gate.min(limit)`,
   the int8 quantizers' `|x|` maxima. If one of them is ever used for more than
   an `exp(x - max)` offset or a sum term, revisit it.
-- **S6 is open:** on a baseline x86-64 build (the release binaries, CI) every
-  `mul_add` in the f32 dots (`kernels::dot`, `dot_n`, `dot_mn`, `dot_f16`,
-  `dot_bf16`, attention's value accumulation, `dequant_row`) is a call to the C
-  runtime's `fma`: exact, so the bits match a native build, but slow. A run-time
-  FMA tier behind `crate::simd` would keep the bits and the speed.
 - **No NEON kernels.** aarch64 runs every family's scalar kernel. A NEON tier
   must compute the scalar expression; `kernels/tier_tests.rs` will hold it to
   that once it is a tier `crate::simd` dispatches.
+
+### B208 — what the FMA tier (plan 11 S6) left (2026-11-18)
+
+**Tag:** cpu · perf · tests · **Kind:** coverage gaps and open items
+
+- **A baseline build still trails a native one, outside the f32 dots.** After
+  S6, on this Ryzen with the other agent's GPU test spinning one core,
+  Qwen3-1.7B Q4_K_M pp512 ran at 986-1027 tok/s on a baseline build against
+  1036-1155 natively, and decode at 45.9-51.6 against 56.0-57.2 (`docs/math.md`,
+  the FMA tier section); `origin/main` had the same decode gap. The per-op
+  profile puts the prefill gap mostly in the int8 `Linear` kernels (2048x6144
+  Q4_K 2.63-2.65 ms per call against 2.47-2.53 natively), whose surrounding code
+  the compiler autovectorizes with the build's own features. Not investigated
+  further.
+- **f32 multiply-adds not on the tier.** `seam/sc.rs` (Diffusion-Gemma's host
+  self-conditioning: the soft embedding's f16 `mul_add` and the down phase's) is
+  in `infr-llama`, which has no SIMD dispatch; putting it on the tier means
+  making `kernels::Dots` public from `infr-cpu`. Not measured.
+- **`dequant_dot_rows`' FMA copy decodes at baseline.** Its span decoders are
+  separate functions, compiled for the build's own target: the Q4_K row took
+  0.179 ns per element on the baseline build's FMA tier against 0.115 natively
+  (`bench_float_dots`). It serves expert banks without an int8 kernel (Q2_K,
+  Q3_K, the codebook formats: the shipped V4-Flash file's banks) and reference
+  mode.
+- **Short calls still pay a call.** The FMA copies cannot inline into the
+  baseline-compiled interpreter: a lone 128-element `dot` took 0.252 ns per
+  element against 0.243 natively, `axpy` 0.127 against 0.036. Moving a whole
+  op's loop into the FMA compilation would remove it; nothing measured it at the
+  op level.
+- **Verified only on this AVX-512 Ryzen.** The "AVX2 without FMA or F16C" branch
+  (the dots then run the C runtime's `fmaf`) is checked by reading only. The f32
+  dots' NaN payloads are not compared (`tier_tests` folds NaN; no input makes
+  one); the f16 KV write's NaNs are, exhaustively, and match.
+- **Not run: a whole f16-weight model.** No F16 GGUF is cached here; the f16
+  dot's gain (native 0.321 to 0.084 ns per element) is from the microbench.

@@ -240,10 +240,13 @@ and these exist to force one off when bisecting a correctness or perf problem.
   the widest SIMD tier the CPU backend's kernels and `infr_core::math`'s slice
   functions may run, `scalar`, `avx2`, `avx512` or `avx512vnni`, instead of the
   widest the CPU has; every tier gives the same bits, so it changes only speed.
-  A ceiling, not a demand: one above what the CPU has runs the CPU's widest. It
-  is a process-wide debug switch: every CPU backend applies it when built, unset
-  meaning no ceiling, so the last backend built decides for the whole process. A
-  misspelt name is a config error at load; see [`math.md`](math.md)).
+  On a build without FMA (the released binaries), `avx2` and up also let the f32
+  dots run their FMA code where the CPU has FMA and F16C; `scalar` runs them
+  through the C runtime's `fmaf`. A ceiling, not a demand: one above what the
+  CPU has runs the CPU's widest. It is a process-wide debug switch: every CPU
+  backend applies it when built, unset meaning no ceiling, so the last backend
+  built decides for the whole process. A misspelt name is a config error at
+  load; see [`math.md`](math.md)).
 
 ### Vulkan kernel tuning
 

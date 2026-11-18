@@ -349,8 +349,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   0.16 and 1.21. Decode is about 2% faster (tg64 medians +2.1% on Qwen3-30B-A3B,
   +2.0% on ERNIE-4.5-21B-A3B, ten paired rounds on a quiet machine). **Upgrade
   note:** MoE models' CPU decode output changes once (`cpu_golden_qwen3moe`
-  re-blessed on Windows only: its Linux value is unconfirmed, and CI does not
-  run the MoE goldens).
+  re-blessed, the same on Windows and Linux under WSL; CI does not run the MoE
+  goldens).
 
 - **A slow discrete GPU splits its first forward (issue 94).** A device that is
   wave64-only, or has neither 16x16x16 f16 cooperative matrices nor an

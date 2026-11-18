@@ -3369,8 +3369,8 @@ fn qwen3moe_30b() -> Option<PathBuf> {
 // the quoted question now ends in "is..." where it ended in "is"; identical natively on Windows
 // and under WSL. Re-blessed the same day when one-row `Op::MoeFfn` (every decode step) moved
 // onto the int8 expert kernels: the text forks after "is...\"", which is now followed by "and then
-// it cuts off. I need", and stays coherent. Blessed on Windows only: unconfirmed on Linux, and
-// CI does not run the MoE goldens.
+// it cuts off. I need", and stays coherent. The same hash under WSL (checked 2026-11-19), but CI
+// does not run the MoE goldens.
 const QWEN3MOE_GOLDEN: &[(&str, usize, u64)] =
     &[("The capital of France is", 24, 0xa68ab7f4d15ad931)];
 

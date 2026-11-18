@@ -6967,6 +6967,37 @@ this branch's rounds, but 32 is the last ratio that still fixes ERNIE's and
 SmolLM3's first tokens (64 leaves them at 0.61 and 0.30), so it has no margin.
 Do not change the ratio; make the sparse dot cheaper instead (B213).
 
+**One position the split made worse, looked at (2026-11-19).** Qwen3-0.6B
+position 18 of `cpu_act_quant`'s first prompt (KL 0.109 before the split, 0.402
+after) is the `assistant` token after `<|im_start|>`; the same token is the
+worst row of the two other chat prompts (position 23: 0.033 to 0.203, and 0.097
+to 0.087, better). "Before" here is a scratch build with `HI_RATIO` infinite,
+which never splits and so quantizes exactly as before; it reproduced the
+review's 0.109 and 0.033. `localise_the_position_0_error` on rows 17 and 18,
+before against after, per `Op::Linear`:
+
+- Row 18's own blocks barely split: 0.1% of its blocks over all ops at ratio 16,
+  0.6 to 0.7% at ratio 8 (so about six times as many sit at 8 to 16 times their
+  next magnitude as split, the review's proportion, but on a tiny base). Each
+  op's own error on the row (`local`) is the same before and after to within
+  ±10% all the way down (ratios 0.85 to 1.15, apart from one op that is smaller
+  after: layer 7's FFN down, 0.56), and identical through the first two layers.
+- The first difference is at op 17, layer 2's attention output projection (its
+  input mixes earlier positions' values), and there the row's drift from the
+  reference is smaller after (0.038 against 0.043). Drift moves both ways (0.66
+  to 1.34 times its old value) until layer 24, then grows through the last four
+  layers: the attention output inputs 0.118 to 0.170 (layer 24) and 0.116 to
+  0.167 (layer 27), the output head's input 0.093 to 0.127.
+- Row 17 (control) ends lower after (output head input 0.082 to 0.079).
+
+So the worse KL is not this row's own quantization near the 16x threshold; it
+arrives through attention from other positions whose keys and values the split
+changed (position 0 above all), and grows in the last layers on a row the model
+is very sensitive on: the reference with the old 256-block quantizer simulated
+(`linear_tap::simulate`, `256:0:0:127`) scores the same position at 0.484, four
+times the real old production's 0.109, from an equivalent-quality perturbation.
+Input for B213's speed/quality work, not a defect to fix.
+
 ### B211 — the 32-element activation path is not split (2026-11-18)
 
 **Tag:** cpu · accuracy · **Kind:** open
@@ -7041,15 +7072,15 @@ tier section): a median under about 1% is not resolved.
   that has their files (3.8 GB in all). The test now prints which rows ran and
   which were skipped. Closing the gap means caching the seven files in CI (cache
   cost, B204) or accepting a local-only check.
-- **`QWEN3MOE_GOLDEN`** (`cpu_golden_qwen3moe`): blessed on Windows only, under
-  the split and the one-row MoE change; unconfirmed on Linux (a WSL run of the
-  18 GB file took Windows free memory to 6 GB earlier the same day), and CI does
-  not run the MoE goldens.
-- Confirmed under the split on Windows (release) and WSL: `ernie4_5`, `smollm3`,
-  `qwen3`, `gemma3`, `qwen35`, `lfm3`, `ernie4_5_moe` (unchanged).
+- CI does not run the MoE goldens (`cpu_golden_qwen3moe`,
+  `cpu_golden_ernie4_5_moe`); both give the same hash on Windows and under WSL
+  (`qwen3moe` checked 2026-11-19).
 - Not run under WSL: the MoE models' chunk-height identity
-  (`cpu_rows_give_the_same_bits_in_any_chunks` with ERNIE-4.5-21B-A3B and
-  Qwen3-30B-A3B; Windows passed).
+  (`cpu_rows_give_the_same_bits_in_any_chunks`, which loads ERNIE-4.5-21B-A3B
+  and Qwen3-30B-A3B one after the other; Windows passed). WSL here has a 30 GB
+  limit, and the one 18.6 GB `qwen3moe` run took Windows free memory from 31 GB
+  to 14 GB through the VM's file reads; the two in one process were not
+  attempted.
 
 ### B221 — work-bounded submits and split heavy ops (plan 12 S2), not done (2026-11-18)
 

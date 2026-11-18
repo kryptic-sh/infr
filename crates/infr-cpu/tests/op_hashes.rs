@@ -1653,59 +1653,59 @@ const EXPECTED: &[(&str, u64)] = &[
     ("MoeFfn grouped biased Q4K rows 5", 0x10423bc2d8e420c5),
     ("MoeFfn hash routed Q4K rows 5", 0x187b3a67fc5c9f74),
     ("MoeFfn weight before Q4K rows 5", 0x900aebc15c5f130a),
-    ("Linear spiky Q8_0 m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q8_0 m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q8_0 m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q2K m1 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q2K m5 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q2K m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q3K m1 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q3K m5 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q3K m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q4K m1 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q4K m5 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q4K m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q5K m1 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q5K m5 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q5K m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q6K m1 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q6K m5 2048x20", 0x0),  // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q6K m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq1S m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq1S m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq1S m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq1M m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq1M m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq1M m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq2Xxs m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq2Xxs m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq2Xxs m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq2Xs m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq2Xs m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq2Xs m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq2S m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq2S m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq2S m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq3Xxs m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq3Xxs m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq3Xxs m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq3S m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq3S m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq3S m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq4Xs m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq4Xs m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Iq4Xs m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Tq1_0 m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Tq1_0 m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Tq1_0 m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Tq2_0 m1 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Tq2_0 m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Tq2_0 m19 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q4_0 m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("Linear spiky Q5_0 m5 2048x20", 0x0), // PLACEHOLDER: blessed from CI
-    ("MoeFfn spiky Q4K rows 1", 0x0),      // PLACEHOLDER: blessed from CI
-    ("MoeFfn spiky Q4K rows 9", 0x0),      // PLACEHOLDER: blessed from CI
-    ("MoeFfn spiky Q6K rows 9", 0x0),      // PLACEHOLDER: blessed from CI
+    ("Linear spiky Q8_0 m1 2048x20", 0x40f8b4137666ffa0),
+    ("Linear spiky Q8_0 m5 2048x20", 0x2cd687dc906069cd),
+    ("Linear spiky Q8_0 m19 2048x20", 0x7bd1efa8a4761e11),
+    ("Linear spiky Q2K m1 2048x20", 0xf6a57637771b38fd),
+    ("Linear spiky Q2K m5 2048x20", 0xe1aba5d8f30dfa02),
+    ("Linear spiky Q2K m19 2048x20", 0x029bcd428eee348d),
+    ("Linear spiky Q3K m1 2048x20", 0xfd4ea2d127dba5e1),
+    ("Linear spiky Q3K m5 2048x20", 0xa19b7e08a0105a61),
+    ("Linear spiky Q3K m19 2048x20", 0x4c01e6beb4501263),
+    ("Linear spiky Q4K m1 2048x20", 0xf70c14002b9cb703),
+    ("Linear spiky Q4K m5 2048x20", 0x43ed01d564835580),
+    ("Linear spiky Q4K m19 2048x20", 0xc2bec0e54bcb7017),
+    ("Linear spiky Q5K m1 2048x20", 0x7e1a7ef2e5a582df),
+    ("Linear spiky Q5K m5 2048x20", 0x2f0491aad9181277),
+    ("Linear spiky Q5K m19 2048x20", 0xb22b4e8b02a2ae6a),
+    ("Linear spiky Q6K m1 2048x20", 0x417e374fdaa356f6),
+    ("Linear spiky Q6K m5 2048x20", 0x1c07fb95f87f85a1),
+    ("Linear spiky Q6K m19 2048x20", 0xfcac95ccc0a55536),
+    ("Linear spiky Iq1S m1 2048x20", 0xe5bbd9ca8de1bf3f),
+    ("Linear spiky Iq1S m5 2048x20", 0x304c03d16cb34269),
+    ("Linear spiky Iq1S m19 2048x20", 0xec4da9138e935cde),
+    ("Linear spiky Iq1M m1 2048x20", 0x5821199a71e8fcb0),
+    ("Linear spiky Iq1M m5 2048x20", 0x58ea59c623ec61e8),
+    ("Linear spiky Iq1M m19 2048x20", 0x941c47e9bc2df9a1),
+    ("Linear spiky Iq2Xxs m1 2048x20", 0x8d168bedc22f9a30),
+    ("Linear spiky Iq2Xxs m5 2048x20", 0xbfb0a7f3c796773c),
+    ("Linear spiky Iq2Xxs m19 2048x20", 0x90ce408837e1396e),
+    ("Linear spiky Iq2Xs m1 2048x20", 0x8ca9c6bb8a1edbba),
+    ("Linear spiky Iq2Xs m5 2048x20", 0xc4d777fa3f234846),
+    ("Linear spiky Iq2Xs m19 2048x20", 0x8feb44204f4d0c19),
+    ("Linear spiky Iq2S m1 2048x20", 0x17fd468283b0fcbc),
+    ("Linear spiky Iq2S m5 2048x20", 0xa8f89a402432f477),
+    ("Linear spiky Iq2S m19 2048x20", 0xb296454308c0c894),
+    ("Linear spiky Iq3Xxs m1 2048x20", 0x85558358df003261),
+    ("Linear spiky Iq3Xxs m5 2048x20", 0xc54d2656b8ec3b1a),
+    ("Linear spiky Iq3Xxs m19 2048x20", 0x7a0ab86fbdcaa96e),
+    ("Linear spiky Iq3S m1 2048x20", 0x932f4a6fcbebb571),
+    ("Linear spiky Iq3S m5 2048x20", 0x0b48f2ddc5802f5a),
+    ("Linear spiky Iq3S m19 2048x20", 0x3d6644a122ac789d),
+    ("Linear spiky Iq4Xs m1 2048x20", 0xaaf4758a5ee8edf1),
+    ("Linear spiky Iq4Xs m5 2048x20", 0x35409e9c3dfaa5dc),
+    ("Linear spiky Iq4Xs m19 2048x20", 0xa8ef0a52333b3848),
+    ("Linear spiky Tq1_0 m1 2048x20", 0x042c500c0185e8e6),
+    ("Linear spiky Tq1_0 m5 2048x20", 0x1873b7fec8495ff0),
+    ("Linear spiky Tq1_0 m19 2048x20", 0xe032ca3b24e2cccb),
+    ("Linear spiky Tq2_0 m1 2048x20", 0x4e80f8113381b3e2),
+    ("Linear spiky Tq2_0 m5 2048x20", 0xcf6b12c6b8bff7e4),
+    ("Linear spiky Tq2_0 m19 2048x20", 0x852341c157b979ff),
+    ("Linear spiky Q4_0 m5 2048x20", 0x0d7f967eecaa70d3),
+    ("Linear spiky Q5_0 m5 2048x20", 0x135f583fad126509),
+    ("MoeFfn spiky Q4K rows 1", 0x4af77004ed01ec62),
+    ("MoeFfn spiky Q4K rows 9", 0x3ebab35b901e370a),
+    ("MoeFfn spiky Q6K rows 9", 0x1cc32f28e1efc6e5),
 ];
 
 /// Every case gives its one checked-in hash at every tier this CPU has and at every thread

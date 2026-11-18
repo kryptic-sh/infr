@@ -9,7 +9,8 @@ fixed reference to judge tuned values.
 
 Audited and scoped on 2026-11-17. Tags: **[read]** verified by reading,
 **[ran]** verified by running, **[I]** inferred, **[U]** unknown. S0 to S4 (with
-S5 folded into S2) and S6 are built (see section 5); the GPU slices are not.
+S5 folded into S2) and S6 are built (see section 5), and the GPU slices G1 and
+G2 (section 6); G3 and G4 are not.
 
 ## 0. The cause, measured
 
@@ -231,12 +232,12 @@ command for hardware nobody has seen: `infr tune check --against cpu-reference`,
 which runs the op-level families and the teacher-forced comparison on a small
 model and prints the distances with pass or fail.
 
-| #   | Slice                                                                 |
-| --- | --------------------------------------------------------------------- |
-| G1  | The teacher-forced harness and metrics                                |
-| G2  | Measure both GPUs at both lane widths; set the tolerance table        |
-| G3  | The mutation demonstrations                                           |
-| G4  | Convert the cosine tests and the golden tests; wire `infr tune check` |
+| #   | Slice                                                                 | Status                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| --- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| G1  | The teacher-forced harness and metrics                                | **Done.** `infr_llama::tolerance::metrics`; `SeamModel::forced_logits` (ordinary chunked prefill rows through a `prefill_logits` hook, then per-token decode steps on one session); its row-identity self-check in the normal test job. See [`gpu-tolerance.md`](../gpu-tolerance.md)                                                                                                                                                  |
+| G2  | Measure both GPUs at both lane widths; set the tolerance table        | **Done** for nine models (two synthetic, seven real, Float/Int8/KvQ8) on both GPUs, native and forced wave64, tuning rows on and off: `tolerance::table::TABLE`, tests `gpu_seam_tolerance_*`. **[ran]** The CPU reference, not production, is the right reference; the int8 class sees only gross bugs, so every quantized model is also gated with its int8 kernels off. MoE and KV formats below 8 bits are not in the table (B207) |
+| G3  | The mutation demonstrations                                           | Part done: six planted bugs measured by hand on Qwen3-0.6B (the doc's table); still to do: commit them as feature-gated tests, run them on the integrated GPU and a float model, add the router-bias and nibble-map bugs                                                                                                                                                                                                               |
+| G4  | Convert the cosine tests and the golden tests; wire `infr tune check` | Open. The CLI calls `SeamModel::forced_logits` and the table; the existing exact goldens' state across the matrix is in the doc                                                                                                                                                                                                                                                                                                        |
 
 G1 to G4 follow L1. The weak assertions B60, B174 and B141 name can be tightened
 before that.

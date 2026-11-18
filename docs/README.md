@@ -45,6 +45,10 @@ at that index. It holds:
   root-cause + submit-splitter fix, and the model survey. Correctness done; iGPU
   perf is `backlog.md` B99.
 
+- [gpu-tolerance.md](gpu-tolerance.md) — how a GPU is held to the CPU reference:
+  the teacher-forced comparison, its metrics, the per-model tolerance table, the
+  bugs it catches and the ones it cannot see.
+
 ## Models & architectures
 
 - [qwen35.md](qwen35.md) — Qwen3.5 / Qwen3.6 (`qwen35`): the gated-DeltaNet

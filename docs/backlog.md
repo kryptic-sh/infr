@@ -6754,6 +6754,98 @@ S3/S4 work and not re-read for this entry:
   must compute the scalar expression; `kernels/tier_tests.rs` will hold it to
   that once it is a tier `crate::simd` dispatches.
 
+### B207 — what the GPU tolerance gate (plan 11, G1/G2) cannot see, and left (2026-11-18)
+
+**Tag:** gpu · tests · tolerance · **Kind:** coverage gaps, findings, decisions
+
+`docs/gpu-tolerance.md` describes the gate; `tolerance::table::TABLE` holds its
+values. What it leaves:
+
+- **The int8 class only catches gross bugs.** With the int8-activation kernels
+  on (the shipped default for every quantized model), the GPU's own activation
+  quantization is 2-3 orders of magnitude larger than its float rounding, so the
+  int8 tolerances admit any bug smaller than that. On Qwen3-0.6B (RX 7900 XTX,
+  per-token decode) an RMSNorm epsilon ten times too large and a 1% scale error
+  on every block of one `ffn_down` tensor both stayed inside the int8 rows; the
+  float configuration (`vulkan_float`, every int8 kernel off) caught both. The
+  gate therefore runs every quantized model both ways, and a bug that lives only
+  in an int8 kernel is the float run's blind spot: it is left to the op-level
+  bounds (`seam_op_parity`'s `*_within_int8_bound`,
+  `i8cm_kq_matches_its_decomposition`). An op-level check for each int8 kernel
+  against its own decomposition, for every family the tuning table can switch,
+  is what would close it.
+- **A single mis-scaled block is invisible.** One Q4_K block's scale times 1.01
+  in one tensor moved no metric past even the float rows. Sub-percent, local
+  weight errors are below what any end-to-end logit comparison can see on a
+  short prompt; only a weight-level check (the dequant parity tests) covers
+  them.
+- **Mutations measured on one model, one device.** The six planted bugs ran on
+  Qwen3-0.6B on the RX 7900 XTX with the per-token decode replay off
+  (`kernels.vulkan.no_replay`, so a graph-level edit reaches decode). G3 should
+  turn them into feature-gated tests and run them on the integrated GPU and on a
+  float-weight model too; two not tried at all: a router that ignores its bias
+  (B174's case; needs ERNIE-4.5-21B and a `moe_topk.comp` edit) and a wrong
+  quant nibble map.
+- **The q8_0 KV class sits two orders above the float class** (Qwen3-0.6B worst
+  KL about 1e-2 against 4e-5): the GPU quantizes the f16 RoPE output into the
+  cache, the CPU reference its f32 one, so the two caches round to different
+  codes. It catches what the int8 class catches, nothing finer. Below 8 bits it
+  is worse: K=f16 V=turbo3 measured KL 0.34-0.37 against the CPU reference
+  running turbo3, with top-1 flips at 1.3-1.6-nat margins (Qwen3 0.6B and 1.7B),
+  against 0.12-0.17 for V=q4_0. That is large enough to be worth checking that
+  the GPU and CPU turbo3 codecs agree; not looked into, and no low-bit KV row is
+  in the table.
+- **The CPU production backend is far from the reference on some models**
+  (Vulkan0 three-way table in the doc): SmolLM3-3B prefill KL 4.88 with a top-1
+  flip at an 8.8-nat margin, ERNIE-4.5-0.3B with the reference's top-1 ranked
+  245th at one position, gemma-3-1b KL 1.88. The int8 GPU was within 0.33 on the
+  same rows. Either the production CPU's int8 activations are that lossy on
+  these models, or something in them is wrong; nobody has looked.
+- **Qwen2.5-0.5B's float prefill is twenty times further than the other Qwens'**
+  (worst KL 8.1e-4, one top-1 flip; decode is normal). It carries q/k/v biases,
+  which the others do not. Not looked into; Qwen2.5 has no gate row.
+- **The Float configuration kills the test process on the integrated GPU.** With
+  every int8 kernel off (`vulkan_float`), runs on `Vulkan1` (RDNA2, 2 CUs)
+  exited with status 1 and no message, or stopped making progress for over 13
+  minutes, during the 180-token prompt: Qwen3.5-0.8B native and wave64
+  (repeatedly, once already on the 34-token prompt at a 32-row chunk), LFM3 and
+  gemma-3 under wave64 or rows off, and the `q8_0` KV + Float runs of gemma-3
+  and LFM3 natively; the same models' production (int8) runs and Qwen3-0.6B's
+  and ERNIE's Float runs completed. Never seen on the 7900 XTX. Without int8 or
+  cooperative matrices the prefill falls to slow kernels, so a GPU watchdog
+  reset on a long submit is the first guess. Most runs died with no message; one
+  gate run of `gpu_seam_tolerance_qwen3` reported it:
+  `queue_submit: The logical device has been lost`, on the `q8_0` KV + Float run
+  of the 180-token prompt (the same run had passed in the measurement). Not
+  diagnosed further. Until it is, the gate's Float rows for those models fail on
+  that device for a reason that is not a tolerance, and the table's `Vulkan1`
+  coverage is partial (the doc's table section lists which runs completed).
+- **One run starved the host.** A full-configuration measurement of LFM3-1.7B
+  F16 on `Vulkan1` took available memory from 32.5 GB to 2.4 GB before the
+  memory guard stopped it; a repeat with one configuration peaked near 11 GB
+  used and returned it between runs. Another session's WSL VM was also growing
+  at the time, so the cause is not settled. `gpu_seam_tolerance_lfm3` loads that
+  file, and the tolerance tests have no unified-memory room check like
+  `cpu_backend`'s `need_resident_room` (sharing it means moving those helpers
+  into `tests/support`); that check prices one resident load, so it would not
+  have stopped this run if the growth was the harness's own.
+- **gemma-3's Float distance on the 7900 XTX at native lanes is ten to twenty
+  times its wave64 and integrated-GPU distance** (worst KL 3.2e-3 against 3.0e-4
+  and 1.6e-3). The f16 coopmat GEMM rounds activations to f16, and gemma's
+  residual stream is large; not looked into. It is why gemma's Float row is
+  loose.
+- **The tuning rows changed nothing measured off the 7900 XTX's native lanes**
+  (wave64 and the integrated GPU gave the same values rows on and off), so the
+  rows-off half of the matrix was run on `Vulkan1` only for Qwen3-0.6B and
+  gemma-3.
+- **Not covered by the gate:** MoE (ERNIE-4.5-21B-A3B, Qwen3-30B-A3B: not run,
+  for time), the chained decode (forcing needs every step's logits, so only the
+  per-token step runs), KV formats other than f16 and q8_0, models not cached
+  here (B60's Qwen3.5-MoE and DiffusionGemma), Metal (no Apple hardware: the doc
+  says how a Mac owner would add it), and every device but these two.
+- **The existing exact GPU goldens and cosine tests are untouched** (G4): their
+  state across the matrix is in `docs/gpu-tolerance.md`.
+
 ### B208 — what the FMA tier (plan 11 S6) left (2026-11-18)
 
 **Tag:** cpu · perf · tests · **Kind:** coverage gaps and open items

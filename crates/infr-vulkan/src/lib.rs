@@ -1973,7 +1973,10 @@ impl VulkanBackend {
         // Host query reset (core 1.2): a forward segment's timestamps are reset from the host
         // when the pool is created, so a command buffer a watchdog reset discarded leaves them
         // reliably unavailable (`recorder::account_segment`). Without it they are reset in the
-        // command buffer, as before.
+        // command buffer, as before. Probed through the core-1.2 struct, like
+        // `bufferDeviceAddress` below: a 1.1 device offering only `VK_EXT_host_query_reset` would
+        // read as not supporting it, which is theoretical (this backend targets 1.3) and falls
+        // back to the in-buffer reset.
         let mut host_reset_feat = vk::PhysicalDeviceHostQueryResetFeatures::default();
         let mut feat2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut host_reset_feat)
@@ -3329,6 +3332,8 @@ impl VulkanBackend {
     /// already read true by the time that closure's placeholder buffers are bound). Replaces any
     /// previous session (there is only ever one loaded model per process today).
     pub fn init_moe_pager(&self, layout: crate::pager::MoePagerLayout) -> Result<()> {
+        // A poisoned backend allocates nothing (see `gpu_wait`).
+        self.shared.live()?;
         let session = crate::pager::MoePagerSession::new(self, layout)?;
         *self.moe_pager.lock().unwrap() = Some(session);
         Ok(())
@@ -3409,6 +3414,8 @@ impl VulkanBackend {
     /// `init_moe_pager`'s dense twin, same call-order contract (BEFORE the seam's weight-load
     /// closure binds the first placeholder, so `Backend::dense_paged` already reads true).
     pub fn init_dense_pager(&self, layout: crate::pager::DensePagerLayout) -> Result<()> {
+        // A poisoned backend allocates nothing (see `gpu_wait`).
+        self.shared.live()?;
         let session = crate::pager::DensePagerSession::new(self, layout)?;
         *self.dense_pager.lock().unwrap() = Some(session);
         Ok(())
@@ -3730,6 +3737,8 @@ impl VulkanBackend {
     /// the `SHADER_DEVICE_ADDRESS` usage + the allocator's DEVICE_ADDRESS memory flag are what let
     /// `get_buffer_device_address` succeed.
     pub fn alloc_arena_bda(&self, bytes: usize) -> Result<(Box<dyn Buffer>, u64)> {
+        // A poisoned backend allocates nothing (see `gpu_wait`).
+        self.shared.live()?;
         let buf = self.make_buf_ex(bytes, MemoryLocation::GpuOnly, "moe-arena", true, true)?;
         // `make_buf_ex(device_address=true)` already queried + stored this handle's address in
         // `own_addr` — reuse it rather than issuing a second identical `get_buffer_device_address`.
@@ -4067,6 +4076,8 @@ impl VulkanBackend {
         sizes: &[usize],
         usage: BufferUsage,
     ) -> Result<Vec<Box<dyn Buffer>>> {
+        // A poisoned backend allocates nothing (see `gpu_wait`).
+        self.shared.live()?;
         let bufs: Vec<VkBuffer> = sizes
             .iter()
             .map(|&b| self.make_alloc(b, usage))
@@ -4313,8 +4324,9 @@ impl VulkanBackend {
         })
     }
 
-    /// Record a single command into a one-shot command buffer, submit it to the
-    /// compute queue, and block until idle.
+    /// Record a single command into a one-shot command buffer, submit it to the compute queue,
+    /// and block until it and everything submitted before it have completed (its leading global
+    /// barrier, then a bounded wait on its own fence).
     ///
     /// The closure receives the command buffer handle to record into. Not serialised against
     /// other users of the pool — see `VulkanShared::cmd_pool`.
@@ -4427,7 +4439,7 @@ impl VulkanBackend {
             return Ok(());
         }
         let (sb, db) = (s.buffer, d.buffer);
-        // one_shot's queue_wait_idle provides the ordering fence vs prior/following work.
+        // one_shot's leading barrier and its wait order this copy against prior and later work.
         self.one_shot(move |cmd| unsafe {
             self.shared.device.cmd_copy_buffer(cmd, sb, db, &regions);
         })
@@ -4591,7 +4603,8 @@ impl Backend for VulkanBackend {
     /// one_shot copy + `queue_wait_idle` PER TOKEN — the exact per-token full-sync cost `read_pos0`
     /// already dodges for `positions`. The mapped read carries the same contract the `GpuToCpu`
     /// path always had: the caller must have completed the GPU work that wrote `src` (every decode
-    /// site does — `execute`/`replay` end in `queue_wait_idle`; the buffers are HOST_COHERENT so
+    /// site does — `execute`/`replay` end in a wait on their last submit's fence; the buffers are
+    /// HOST_COHERENT so
     /// the write is visible with no explicit invalidate).
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()> {
         // Poisoned: the memory may be what dropped work never wrote (see `gpu_wait`).
@@ -4632,7 +4645,7 @@ impl Backend for VulkanBackend {
                 };
             })?;
 
-            // GPU→staging transfer is complete (queue_wait_idle returned).
+            // GPU→staging transfer is complete (`one_shot` waited for it).
             let ptr = staging
                 .mapped_ptr()
                 .ok_or_else(|| be("readback staging is not mapped"))?

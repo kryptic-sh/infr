@@ -36,13 +36,16 @@ use crate::VulkanShared;
 /// The default bound on one host wait for GPU work, in milliseconds (`device.gpu_wait_timeout_ms`).
 ///
 /// It must sit far above the longest LEGITIMATE wait and still end a stuck one in human time. The
-/// longest waits measured on this box's two GPUs across the GPU gate's models are recorded in
-/// `docs/config.md` beside the key; this is more than ten times the worst of them.
-pub const DEFAULT_GPU_WAIT_TIMEOUT_MS: u64 = 30_000;
+/// two mistakes are not alike: too low a bound poisons the backend on work that would have
+/// completed, too high a one only delays an error in a rare case. One wait can cover several
+/// segments (the pipelined window of `adapter::execute_static`), and a heavy chunk on a slow
+/// device can run seconds per segment, so the bound is set well above the longest waits
+/// measured, which `docs/config.md` records beside the key with their workloads.
+pub const DEFAULT_GPU_WAIT_TIMEOUT_MS: u64 = 120_000;
 
-/// The smallest bound `device.gpu_wait_timeout_ms` accepts (`0`, wait forever, aside): above the
-/// longest legitimate wait measured (see [`DEFAULT_GPU_WAIT_TIMEOUT_MS`]), so a bound that would
-/// poison healthy work is refused at creation instead of failing the first long forward.
+/// The smallest bound `device.gpu_wait_timeout_ms` accepts (`0`, wait forever, aside). A guard
+/// against a typo such as a value meant in seconds, NOT a safe value: legitimate waits longer than
+/// this have been measured (see [`DEFAULT_GPU_WAIT_TIMEOUT_MS`]).
 pub const MIN_GPU_WAIT_TIMEOUT_MS: u64 = 5_000;
 
 /// The configured bound, checked: unset is [`DEFAULT_GPU_WAIT_TIMEOUT_MS`], `0` waits forever,
@@ -235,11 +238,21 @@ impl VulkanShared {
     /// bound: the work's own submit signals the fence, so waiting costs no extra submit. With no
     /// batches it is a queue-idle wait ([`Self::wait_queue_idle`]).
     ///
-    /// The fence signals when THESE batches complete. Work submitted earlier is covered only
-    /// through ordering: every forward segment and replay opens with a global barrier
-    /// (`Recorder::seed_barrier`, a recording's leading barrier) whose first scope is everything
-    /// submitted before it, and anything earlier whose results the host reads is waited on by
-    /// its own fence (`PendingSegment::wait`).
+    /// The fence signals when THESE batches complete, unlike `vkQueueWaitIdle`, which also
+    /// covered everything submitted earlier. What makes that equivalent here, case by case:
+    ///
+    /// - a submit that opens with a global barrier, whose first scope is everything submitted
+    ///   before it: a forward's continuation segment (`Recorder::seed_barrier` after a cut, a
+    ///   staging-ring rotation or a split decode recording's later segments), a self-advancing
+    ///   decode recording (its leading barrier), and every `one_shot`;
+    /// - any other submit — a forward's FIRST segment, a single-segment replay — goes out only
+    ///   after everything submitted before it has been waited: the weight staging ring is drained
+    ///   when the load scope ends (`WeightProgress::drop`), a forward's pipelined segments are
+    ///   waited before `execute_static` returns and in `sync_stream`, the tensor-parallel copies
+    ///   are followed by a full queue-idle wait, and one-shots are synchronous.
+    ///
+    /// Nothing enforces the second rule; a new path that submits work without waiting for it must
+    /// open the next submit with a barrier or wait for it itself.
     ///
     /// The fence's lock is held from the submit to the reset, so two callers never share it.
     pub(crate) fn submit_wait(
@@ -248,20 +261,36 @@ impl VulkanShared {
         what: &dyn Fn() -> String,
     ) -> Result<()> {
         self.live()?;
-        let guard = self
-            .gpu_wait
-            .idle_fence
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = match self.gpu_wait.idle_fence.lock() {
+            Ok(g) => g,
+            // A panic between a submit and the fence's reset (in a wait, say) poisoned the lock:
+            // the fence may still be in flight or signalled, so it cannot be reused.
+            Err(_) => {
+                return Err(self.poison_with(
+                    "a panic interrupted an earlier GPU wait and left its fence in an unknown \
+                     state"
+                        .to_string(),
+                    None,
+                    false,
+                ))
+            }
+        };
         let fence = *guard;
         if let Err(e) = unsafe { self.device.queue_submit(self.queue, submits, fence) } {
             return Err(self.submit_failed(e, &what()));
         }
         self.wait_fences(&[fence], what)?;
-        let reset = unsafe { self.device.reset_fences(&[fence]) }
-            .map_err(|e| be(format!("reset the wait fence: {e}")));
+        // A fence that cannot be reset stays signalled, and the next submit with it would be a
+        // usage error whose wait returns at once, before its work: poison instead.
+        if let Err(e) = unsafe { self.device.reset_fences(&[fence]) } {
+            return Err(self.poison_with(
+                format!("resetting the GPU wait fence after {} failed: {e}", what()),
+                None,
+                e == vk::Result::ERROR_DEVICE_LOST,
+            ));
+        }
         drop(guard);
-        reset
+        Ok(())
     }
 
     /// The error for a `vkQueueSubmit` that failed submitting `what`. A lost device poisons the

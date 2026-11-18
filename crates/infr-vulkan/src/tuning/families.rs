@@ -676,6 +676,24 @@ pub(crate) static PARAMS: &[Param] = &[
         get: |t, _| Value::Uint(t.moe_small_m as u64),
         set: |t, _, v| t.moe_small_m = v.usize(),
     },
+    // ── submit splitter ──────────────────────────────────────────────────────
+    Param {
+        family: "submit",
+        name: "initial_dispatches",
+        kind: Kind::Host,
+        ty: uint(0, USIZE),
+        axis: Axis::None,
+        doc: "dispatches per submit before any forward has been measured (0 = never split); \
+              protects the first forward from a driver's job timeout until the measured \
+              splitter takes over. `device.submit_dispatches` overrides it",
+        rule: "128 integrated; 64 on a discrete device without matrix units and accelerated \
+               int8 dot, or wave64-only; else 0",
+        default: |f, _| {
+            Value::Uint(infr_core::initial_submit_dispatch_cap(f.integrated, f.slow_class()) as u64)
+        },
+        get: |t, _| Value::Uint(t.submit_initial_dispatches as u64),
+        set: |t, _, v| t.submit_initial_dispatches = v.usize(),
+    },
     // ── prefill GEMM ─────────────────────────────────────────────────────────
     Param {
         family: "split_k",

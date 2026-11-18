@@ -1050,6 +1050,8 @@ fn tune_json(r: &infr_vulkan::tuning::TuningReport) -> serde_json::Value {
             "subgroup_max": d.subgroup_max,
             "wave64": d.wave64,
             "max_shared_memory": d.max_shared_memory,
+            "matrix_units": d.matrix_units,
+            "dot_accelerated": d.dot_accelerated,
         },
         "match": r.match_key(),
         "hash": r.hash(),

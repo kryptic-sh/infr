@@ -2588,6 +2588,8 @@ impl VulkanBackend {
             subgroup_max,
             wave64: matches!(sg_mode, crate::caps::SubgroupMode::Wave64 { .. }),
             max_shared_memory: props.limits.max_compute_shared_memory_size,
+            matrix_units: coopmat_f16 == Some(infr_core::COOPMAT_TILE_16),
+            dot_accelerated: device_probe.dot4x8_signed_accelerated,
         };
         let tuning::resolve::Resolved {
             tuning: tuned,
@@ -2724,13 +2726,20 @@ impl VulkanBackend {
         // (`ConfigError::Env` renders as `INFR_SUBMIT_DISPATCHES: expected a dispatch count …`).
         // A configured 0 is the kill switch: never split, and never let a measurement arm it.
         let submit_split_disabled = cfg.device.submit_dispatches == Some(0);
-        let slow_device =
-            wave64 || (!caps.f16_coopmat() && !device_probe.dot4x8_signed_accelerated);
-        let submit_dispatch_cap = cfg.device.submit_dispatches.unwrap_or_else(|| {
-            infr_core::initial_submit_dispatch_cap(caps.integrated, slow_device)
-        });
-        let split_prefill_only =
-            cfg.device.submit_dispatches.is_none() && !caps.integrated && slow_device;
+        // The unset value is the tuning parameter `submit.initial_dispatches` (its default is
+        // `infr_core::initial_submit_dispatch_cap` over the device facts, so `infr tune show`
+        // says what the first forward runs with and why).
+        let slow_device = facts.slow_class();
+        let submit_dispatch_cap = cfg
+            .device
+            .submit_dispatches
+            .unwrap_or(tuned.submit_initial_dispatches);
+        // The slow-class seed protects prefill only (see `decode_submit_cap`); a cap a tuning row
+        // or the user set applies everywhere, as on an integrated device.
+        let split_prefill_only = cfg.device.submit_dispatches.is_none()
+            && !caps.integrated
+            && slow_device
+            && submit_dispatch_cap > 0;
         // Integrated GPUs run a DIFFERENT shape of forward (smaller prefill chunk, and the whole
         // pass split across several submits so no single command buffer can trip the GPU's hang
         // watchdog), so say so out loud: it is the first thing to check when an iGPU run hangs or

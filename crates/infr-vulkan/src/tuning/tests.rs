@@ -54,6 +54,8 @@ pub(crate) fn fixtures() -> Vec<(String, DeviceFacts)> {
                     subgroup_max: n("subgroup_max"),
                     wave64: b("wave64"),
                     max_shared_memory: n("max_shared_memory"),
+                    matrix_units: b("matrix_units"),
+                    dot_accelerated: b("dot_accelerated"),
                 },
             )
         })
@@ -1559,4 +1561,34 @@ fn rows_off_drops_the_driver_rows_and_says_so() {
         "{text}"
     );
     assert!(r.report.list(None).contains("INFR_TUNE_NO_ROWS"));
+}
+
+/// The first forward's submit cap follows the device facts (issue 94): the GCN fixture, a
+/// discrete card with neither matrix units nor an accelerated int8 dot, starts split at 64
+/// dispatches; the integrated GPU keeps its 128 and the RX 7900 XTX stays unsplit. Before the
+/// facts existed every discrete device started unsplit, the GCN card included.
+#[test]
+fn initial_submit_cap_follows_the_device_facts() {
+    let cap = |id: &str| fixture_tuning(id).submit_initial_dispatches;
+    assert_eq!(cap("rx580-gcn-radv"), 64);
+    assert_eq!(cap("raphael-igpu-amdwin"), 128);
+    assert_eq!(cap("rx7900xtx-amdwin"), 0);
+    assert_eq!(cap("rx7900xtx-radv"), 0);
+    assert!(fixture("rx580-gcn-radv").slow_class());
+    assert!(!fixture("rx7900xtx-amdwin").slow_class());
+    // Either fact alone keeps a discrete device out of the slow class; wave64 alone puts it in.
+    let mut f = fixture("rx7900xtx-amdwin");
+    f.matrix_units = false;
+    assert!(!f.slow_class(), "an accelerated dot is enough");
+    f.dot_accelerated = false;
+    assert!(f.slow_class());
+    let mut w = fixture("rx7900xtx-amdwin");
+    w.wave64 = true;
+    assert!(w.slow_class());
+    // A user value wins over the derived default.
+    let r = resolve_fixture(
+        "rx580-gcn-radv",
+        &env_cfg(&[("INFR_TUNE", "submit.initial_dispatches=16")]),
+    );
+    assert_eq!(r.tuning.submit_initial_dispatches, 16);
 }

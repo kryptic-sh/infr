@@ -59,9 +59,23 @@ pub struct DeviceFacts {
     pub wave64: bool,
     /// `maxComputeSharedMemorySize`, bytes.
     pub max_shared_memory: u32,
+    /// The 16x16x16 f16 cooperative-matrix kernels are live (`Capabilities::f16_coopmat`, after
+    /// any forced mask such as `INFR_NO_COOPMAT` and the wave64 path's coopmat-off rule).
+    pub matrix_units: bool,
+    /// The driver reports packed signed 4x8-bit dot products as accelerated
+    /// (`integerDotProduct4x8BitPackedSignedAccelerated`): `false` where the int8 dot the
+    /// kernels use is emulated in ALU, as on GCN under RADV.
+    pub dot_accelerated: bool,
 }
 
 impl DeviceFacts {
+    /// A device whose work per dispatch is slow enough that a whole first forward in one submit
+    /// can outlast a driver's job timeout (issue 94's RX 580): a wave64-only part, or one with
+    /// neither matrix units nor an accelerated int8 dot.
+    pub fn slow_class(&self) -> bool {
+        self.wave64 || (!self.matrix_units && !self.dot_accelerated)
+    }
+
     /// The vendor's short name, as a row's `match.vendor` spells it.
     pub fn vendor(&self) -> &'static str {
         vendor_name(self.vendor_id)
@@ -230,6 +244,9 @@ pub(crate) struct Tuning {
     /// `rmsnorm.*`: the 1024-wide decode RMSNorm build.
     pub rmsnorm_wide: bool,
     pub rmsnorm_wide_min_dim: usize,
+    /// `submit.initial_dispatches`: the submit splitter's cap before any forward has been
+    /// measured (`0` = never split).
+    pub submit_initial_dispatches: usize,
 }
 
 impl Tuning {

@@ -5,6 +5,11 @@
 # --json` (its `device` object) and cross-checked against `vulkaninfoSDK --summary`. The others
 # are BUILT from what the code's vendor rules and docs/backlog.md record about that hardware —
 # nobody here has run them — and say where each number came from.
+#
+# `matrix_units` and `dot_accelerated` were added on 2026-11-18 from what each source records:
+# the RX 7900 XTX and RTX 2080 Ti run the 16x16x16 f16 coopmat tier; the RDNA2 iGPU and the A770
+# do not (the A770's XMX tile is 8x8, a separate tier); the RX 580 owner's probe line and
+# llama.cpp's `int dot: 0` on that card (issue 94) say its int8 dot is emulated.
 
 [[device]]
 id = "rx7900xtx-amdwin"
@@ -22,6 +27,8 @@ subgroup_min = 32
 subgroup_max = 64
 wave64 = false
 max_shared_memory = 32768
+matrix_units = true
+dot_accelerated = true
 
 [[device]]
 id = "rx7900xtx-radv"
@@ -39,6 +46,8 @@ subgroup_min = 32
 subgroup_max = 64
 wave64 = false
 max_shared_memory = 65536
+matrix_units = true
+dot_accelerated = true
 
 [[device]]
 id = "raphael-igpu-amdwin"
@@ -56,6 +65,8 @@ subgroup_min = 32
 subgroup_max = 64
 wave64 = false
 max_shared_memory = 32768
+matrix_units = false
+dot_accelerated = true
 
 [[device]]
 id = "rx580-gcn-radv"
@@ -73,6 +84,8 @@ subgroup_min = 64
 subgroup_max = 64
 wave64 = true
 max_shared_memory = 65536
+matrix_units = false
+dot_accelerated = false
 
 [[device]]
 id = "intel-arc-a770-anv"
@@ -90,6 +103,8 @@ subgroup_min = 8
 subgroup_max = 32
 wave64 = false
 max_shared_memory = 65536
+matrix_units = false
+dot_accelerated = true
 
 [[device]]
 id = "nvidia-rtx2080ti"
@@ -107,6 +122,8 @@ subgroup_min = 32
 subgroup_max = 32
 wave64 = false
 max_shared_memory = 49152
+matrix_units = true
+dot_accelerated = true
 
 [[device]]
 id = "unknown"
@@ -123,3 +140,5 @@ subgroup_min = 32
 subgroup_max = 32
 wave64 = false
 max_shared_memory = 32768
+matrix_units = false
+dot_accelerated = false

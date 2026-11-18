@@ -898,7 +898,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **A GPU submit that never completes is an error, not a hang.** Every Vulkan
   host wait (segment fences, replays, one-shot copies, `Backend::sync`,
   teardown) now waits at most `device.gpu_wait_timeout_ms`
-  (`INFR_GPU_WAIT_TIMEOUT_MS`, default 30 s, at least 5 s; `0` waits forever).
+  (`INFR_GPU_WAIT_TIMEOUT_MS`, default 120 s, at least 5 s; `0` waits forever).
   Before, a submit whose work the GPU dropped left the process spinning one core
   forever. A wait past the bound, or a lost device, now returns an error naming
   the submit (dispatch count, first and last kernel), the time waited, the fence
@@ -907,19 +907,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with that error without touching the device, and leaks rather than frees what
   the GPU may still be using, so teardown cannot hang either. Waiting no longer
   needs a submit of its own: the fence rides on the submit that carries the
-  work. On AMD's Windows driver a fence wait still costs decode about 0.4%
-  against the old unbounded queue wait (Qwen3-1.7B tg128, both GPUs here;
-  backlog B222). **Dropped work is detected on forward segments only:** after a
-  watchdog reset AMD's Windows driver signals the fence of work it threw away,
-  and a forward segment (prefill chunks, the static decode path) whose fence
-  signals without its closing GPU timestamp is the same error, where before a
-  timestamp read waited on it forever. On the Ryzen integrated GPU `infr bench`
-  of SmolLM3-3B with `-u 2048`, or `-u 512` with `INFR_NO_I8DOT=1`, now fails
-  with it instead of hanging. Replayed and chained decode tokens, one-shot
-  copies, staging copies and queues without timestamps have no such check: a
-  reset there is reported by the next submit, and the step it hit may return
-  wrong output first (backlog B222). Avoiding the reset is not done yet (plan
-  12, S2).
+  work. **Known cost:** on AMD's Windows driver this costs decode about 0.4%
+  (Qwen3-1.7B tg128: 476.87 against 478.59 t/s on an RX 7900 XTX, 27.20 against
+  27.31 on a Ryzen integrated GPU) and prefill up to 0.5%, because the driver
+  reports a fence signalled later than the old unbounded `vkQueueWaitIdle` sees
+  the work complete: waiting with `vkQueueWaitIdle` recovers it on both GPUs.
+  Accepted for now, since an error beats a hang; backlog B222 has the
+  measurements and the alternatives. **Dropped work is detected on forward
+  segments only:** after a watchdog reset AMD's Windows driver signals the fence
+  of work it threw away, and a forward segment (prefill chunks, the static
+  decode path) whose fence signals without its closing GPU timestamp is the same
+  error, where before a timestamp read waited on it forever. On the Ryzen
+  integrated GPU `infr bench` of SmolLM3-3B with `-u 2048`, or `-u 512` with
+  `INFR_NO_I8DOT=1`, now fails with it instead of hanging. Replayed and chained
+  decode tokens, one-shot copies, staging copies and queues without timestamps
+  have no such check: a reset there is reported by the next submit, and the step
+  it hit may return wrong output first (backlog B222). Avoiding the reset is not
+  done yet (plan 12, S2).
 
 - **Equal logits sample the same token on every toolchain.** The CPU backend's
   `Op::Sample` and the host sampler's top-k path ordered equal logits by

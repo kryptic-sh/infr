@@ -183,7 +183,7 @@ micro-batch (`ubatch`, `ubatch_parallel`), CPU `threads`, and three low-level
 device knobs (`submit_dispatches` for the iGPU submit splitter, `subgroup_pref`
 to force subgroup 16 or 32, and `gpu_wait_timeout_ms`, below).
 
-**`device.gpu_wait_timeout_ms`** (`INFR_GPU_WAIT_TIMEOUT_MS`, default 30000) is
+**`device.gpu_wait_timeout_ms`** (`INFR_GPU_WAIT_TIMEOUT_MS`, default 120000) is
 the longest the Vulkan backend waits for one piece of submitted GPU work. A wait
 that runs past it, or meets a lost device, is an error naming the submit it
 waited on (its dispatch count and first and last kernel), how long it waited,
@@ -192,16 +192,29 @@ driver's fault report. The backend is then unusable: every later call returns
 the same error without touching the device, and teardown leaks rather than frees
 what the GPU may still be using. `infr run` prints it and exits non-zero;
 `infr serve` fails that request and every later one on that model with the same
-error, so restart the server. `0` waits forever (for debugging); any other value
-below 5000 is refused when the backend is created, since it would fail healthy
-work. The default sits more than ten times above the longest legitimate wait
-measured: in one full GPU gate run per device on 2026-11-18, with a temporary
-log (not in the tree) of every successful wait over 100 ms, the longest was 2.75
-s on the Ryzen integrated GPU (one LFM3 forward submitted as one command buffer,
-1258 waits logged) and none was logged on the RX 7900 XTX. Before this bound a
-submit whose work the GPU dropped hung the process forever with one core
-spinning (`docs/plan/12-low-capability-vulkan.md`). What the backend can and
-cannot detect about dropped work is in `docs/backlog.md` B222.
+error, so restart the server. `0` waits forever (for debugging). Any other value
+below 5000 is refused when the backend is created: that floor is a guard against
+a typo (a value meant in seconds), NOT a safe setting, since legitimate waits
+far longer than 5 s have been measured. One wait can cover several pipelined
+forward segments, so heavy chunks on a slow device make long waits. Measured
+with a temporary log (not in the tree) of every successful wait:
+
+| Device               | Workload                                                               | Longest wait         |
+| -------------------- | ---------------------------------------------------------------------- | -------------------- |
+| Ryzen integrated GPU | `infr bench` SmolLM3-3B Q4_K_M `-p 2048 -u 2048`, 2 runs               | 12.6 s (next 10.5 s) |
+| Ryzen integrated GPU | the full GPU gate (light workloads), 1 run                             | 2.75 s               |
+| RX 7900 XTX          | `infr bench` SmolLM3-3B Q4_K_M `-p 2048 -u 2048`, 2 runs               | 0.35 s               |
+| RX 7900 XTX          | the gate's paged tests (`test(paged)`, 44 tests, paged MoE among them) | under 0.2 s          |
+| RX 7900 XTX          | the full GPU gate, 1 run                                               | under 0.1 s          |
+
+The integrated GPU's 12.6 s (2026-11-19) leaves the 120 s default about 9.5
+times headroom; a larger model or chunk on that GPU waits longer in proportion,
+so raise the bound for such runs rather than lower it (a bound too low fails
+work that would complete; one too high only delays the error of a rare hang).
+The gate figures are from 2026-11-18. Before this bound a submit whose work the
+GPU dropped hung the process forever with one core spinning
+(`docs/plan/12-low-capability-vulkan.md`). What the backend can and cannot
+detect about dropped work is in `docs/backlog.md` B222.
 
 **`[sampling]`** — `temp` (0 = greedy), `top_k`, `top_p`, `seed`, `max_new`,
 `ignore_eos`, `no_think`. **Provenance matters here**: `infr run` / `infr serve`

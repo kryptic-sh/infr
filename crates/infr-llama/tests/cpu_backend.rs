@@ -1739,21 +1739,23 @@ fn gpu_seam_bf16_matches_cpu() {
 // (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked (each
 // verified coherent at capture). Missing quants are skipped. Refresh with `INFR_BLESS=1`.
 // All verified coherent at capture — every quant recalls "France's capital is Paris" (Q2_K is a
-// touch repetitive, as expected for 2-bit; the float-ish quants still converge: Q5_K==Q8_0==BF16).
+// touch repetitive, as expected for 2-bit; at capture Q5_K, Q8_0 and BF16 gave the same text,
+// and since the 2026-11-19 re-check Q5_K and BF16 do).
 // Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): Q4_K_M changed
 // with `QWEN3_GOLDEN`'s France case, identical natively on Windows and under WSL.
-// Not verified under the activation split: every case but Q4_K_M. Q8_0 was already stale on
-// `main` (its file was not cached when the goldens were last re-blessed) and is cached now, so
-// this test fails on it until it is re-blessed; IQ4_XS, Q2_K, Q4_0, Q5_K_M, Q6_K and BF16 are not
-// cached here and still carry their older values (docs/backlog.md, B214).
+// Every row re-checked 2026-11-19 with all eight files cached, identical natively on Windows and
+// under WSL: Q5_K_M, Q6_K and Q8_0 were stale (their files had not been cached at the earlier
+// re-blesses) and changed; the other five kept their values. Each text still answers Paris
+// (Q2_K opens with a doubled `<think>` and repeats itself, as it did before).
+// CI's golden job caches only Q4_K_M, so the other rows run only where someone caches them.
 const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
     ("IQ4_XS", 32, 0xd028ff03b524cb28),
     ("Q2_K", 32, 0x6442c2818c12ca56),
     ("Q4_0", 32, 0x88221dcfca820246),
     ("Q4_K_M", 32, 0x9e2c6fdd3c0e685c),
-    ("Q5_K_M", 32, 0x4e510646d603bc03),
-    ("Q6_K", 32, 0xb68f96c3aa8d22fe),
-    ("Q8_0", 32, 0xb68f96c3aa8d22fe),
+    ("Q5_K_M", 32, 0xb68f96c3aa8d22fe),
+    ("Q6_K", 32, 0x48871156fbdd0a4c),
+    ("Q8_0", 32, 0x925b523a6f67356b),
     ("BF16", 32, 0xb68f96c3aa8d22fe),
 ];
 
@@ -1762,9 +1764,12 @@ fn cpu_golden_qwen3_quants() {
     let mut _tlk = test_serial_lock();
     let bless = std::env::var("INFR_BLESS").is_ok();
     let prompt = "The capital of France is";
+    // A row whose file is not cached is skipped, not failed (CI's golden job caches only
+    // Q4_K_M), so say which rows ran: a stale value hides behind a skip until someone caches it.
+    let (mut ran, mut skipped) = (Vec::new(), Vec::new());
     for (quant, n, want) in QWEN3_QUANT_GOLDEN {
         let Some(path) = qwen3_quant(quant) else {
-            eprintln!("skip {quant}: not downloaded");
+            skipped.push(*quant);
             continue;
         };
         let model = model_default(&path);
@@ -1775,7 +1780,9 @@ fn cpu_golden_qwen3_quants() {
         } else {
             assert_eq!(h, *want, "quant {quant} golden changed\n  out: {out:?}");
         }
+        ran.push(*quant);
     }
+    eprintln!("qwen3 quant goldens: ran {ran:?}, skipped (not in the HF cache) {skipped:?}");
 }
 
 // ─── Gemma 3 (dense) ────────────────────────────────────────────────────────────

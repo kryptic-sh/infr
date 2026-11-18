@@ -6912,11 +6912,6 @@ Delete this entry as each item lands or is dropped. Worktrees are under
   that prints the scalar-to-NEON ratio (B206); plan 11's G3 and G4 (commit the
   planted-bug tests; convert the exact GPU goldens and wire `infr tune check`);
   plan 10's tuning slices S2 onward; plan 12's kernel ports from the fork.
-- **Stale on `main`, found in passing:** `QWEN3_QUANT_GOLDEN`'s Q8_0 case fails
-  on `main` (the model was not cached when the goldens were last re-blessed; a
-  reviewer downloaded it on 2026-11-18). The other quants that were not cached
-  are probably stale too. CI does not run them. Re-bless with every quant
-  cached, Windows and Linux agreeing.
 - **Measurements owed on a quiet machine:** the FMA tier's baseline and native
   tables in `docs/math.md` (every round there had one core busy); the quantizer
   fix's prefill cost.
@@ -7029,12 +7024,13 @@ Measure either against `origin/main` in a quiet window, native and baseline.
 
 **Tag:** cpu · tests · goldens · **Kind:** verification gaps
 
-- **`QWEN3_QUANT_GOLDEN`** (`cpu_golden_qwen3_quants`): only Q4_K_M was
-  re-blessed under the split. Q8_0 is stale on `main` already (its file was not
-  cached when the goldens were last re-blessed; it is cached on the dev box now,
-  so the test fails there until it is re-blessed). IQ4_XS, Q2_K, Q4_0, Q5_K_M,
-  Q6_K and BF16 are not cached and keep their older values, unverified. CI does
-  not run them.
+- **`QWEN3_QUANT_GOLDEN`** (`cpu_golden_qwen3_quants`) skips a row whose file is
+  not cached, and that is how three rows went stale unseen (all eight were
+  re-checked on 2026-11-19, Windows and WSL agreeing). CI's golden job caches
+  only Q4_K_M, so CI runs that one row; the other seven run only on a machine
+  that has their files (3.8 GB in all). The test now prints which rows ran and
+  which were skipped. Closing the gap means caching the seven files in CI (cache
+  cost, B204) or accepting a local-only check.
 - **`QWEN3MOE_GOLDEN`** (`cpu_golden_qwen3moe`): blessed on Windows only, under
   the split and the one-row MoE change; unconfirmed on Linux (a WSL run of the
   18 GB file took Windows free memory to 6 GB earlier the same day), and CI does

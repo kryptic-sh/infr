@@ -82,7 +82,8 @@ cfg_struct! {
         submit_dispatches: Option<usize> = None,
         /// `INFR_GPU_WAIT_TIMEOUT_MS`: how long one host wait on GPU work may take before the
         /// backend gives up, reports the submit it was waiting on and refuses further work
-        /// (`0` = wait forever, for debugging). `None` = the backend's default.
+        /// (`0` = wait forever, for debugging). `None` = the backend's default; the Vulkan backend
+        /// refuses any other value under its minimum at creation.
         gpu_wait_timeout_ms: Option<u64> = None,
         /// `INFR_SG`: subgroup-size preference, exactly 16 or 32. `None` = vendor-derived.
         subgroup_pref: Option<u32> = None,

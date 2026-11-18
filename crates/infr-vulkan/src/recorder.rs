@@ -1130,7 +1130,7 @@ impl<'a> Recorder<'a> {
                 )
             }
             .map_err(|e| be(format!("create query pool: {e}")))?;
-            unsafe { device.cmd_reset_query_pool(cmd, qp, 0, MAX_TS) };
+            Self::reset_queries(backend, cmd, qp, MAX_TS);
             qp
         } else {
             vk::QueryPool::null()
@@ -1149,8 +1149,8 @@ impl<'a> Recorder<'a> {
                 )
             } {
                 Ok(qp) => {
+                    Self::reset_queries(backend, cmd, qp, 2);
                     unsafe {
-                        device.cmd_reset_query_pool(cmd, qp, 0, 2);
                         device.cmd_write_timestamp(
                             cmd,
                             vk::PipelineStageFlags::BOTTOM_OF_PIPE,
@@ -1230,6 +1230,21 @@ impl<'a> Recorder<'a> {
             return caps;
         }
         (self.bda_chunk_elem_cap, self.bda_chunk_byte_cap)
+    }
+
+    /// Reset a new query pool's first `n` queries: from the host when `hostQueryReset` is enabled,
+    /// so a timestamp the GPU never writes (its command buffer discarded by a watchdog reset)
+    /// reads as reliably unavailable — a query never reset is in an undefined state, and the
+    /// in-command-buffer reset would be discarded with the rest. In the command buffer otherwise.
+    fn reset_queries(backend: &VulkanBackend, cmd: vk::CommandBuffer, qp: vk::QueryPool, n: u32) {
+        let device = &backend.shared.device;
+        unsafe {
+            if backend.shared.host_query_reset {
+                device.reset_query_pool(qp, 0, n);
+            } else {
+                device.cmd_reset_query_pool(cmd, qp, 0, n);
+            }
+        }
     }
 
     /// Dispatches recorded into this command buffer so far — the submit splitter's trigger.
@@ -10737,36 +10752,26 @@ impl<'a> Recorder<'a> {
             }
         }
         self.stamp_segment_end();
-        let queue = self.be.shared.queue;
         // Each fallible step frees the transient objects before propagating — see `free_transient`.
         if let Err(e) = unsafe { device.end_command_buffer(self.cmd) } {
             self.free_transient();
             return Err(be(format!("end cmd: {e}")));
         }
         let desc = self.submit_desc();
-        if let Err(e) = self.be.shared.live() {
-            self.free_transient();
+        // The wait fence rides on this submit, so waiting adds no submit. A submit that failed
+        // with an ordinary error queued nothing and its objects are freed; any failure that
+        // poisons the backend (a failed wait, a lost device) leaves them to the GPU that may
+        // still be running them: leaked, never freed (see `gpu_wait`).
+        let waited = self.be.shared.submit_wait(
+            &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
+            &|| format!("a forward submitted as one command buffer of {desc}"),
+        );
+        if let Err(e) = waited {
+            if !self.be.shared.poisoned() {
+                self.free_transient();
+            }
             return Err(e);
         }
-        let submit = unsafe {
-            device.queue_submit(
-                queue,
-                &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.cmd))],
-                vk::Fence::null(),
-            )
-        };
-        if let Err(e) = submit {
-            self.free_transient();
-            return Err(self
-                .be
-                .shared
-                .submit_failed(e, &format!("a forward of {desc}")));
-        }
-        // A failed wait leaves the command buffer, its pools and query pools to the GPU that may
-        // still be running them: leaked, never freed (see `gpu_wait`).
-        self.be
-            .shared
-            .wait_queue_idle(&|| format!("a forward submitted as one command buffer of {desc}"))?;
         // A missing closing stamp poisons the backend (see `account_segment`); what the reset
         // discarded is leaked like any other failed wait.
         account_segment(&self.be.shared, self.seg_query_pool, desc)?;
@@ -11137,18 +11142,12 @@ impl RecordedCmd {
             }
             return Ok(());
         };
-        self.shared.live()?;
-        let device = &self.shared.device;
         let cmds = vec![seg.cmd; n];
-        unsafe {
-            device.queue_submit(
-                self.shared.queue,
-                &[vk::SubmitInfo::default().command_buffers(&cmds)],
-                vk::Fence::null(),
-            )
-        }
-        .map_err(|e| self.shared.submit_failed(e, &self.replay_desc(n)))?;
-        self.shared.wait_queue_idle(&|| self.replay_desc(n))
+        // The wait fence rides on the replay's own submit: no extra submit per token.
+        self.shared
+            .submit_wait(&[vk::SubmitInfo::default().command_buffers(&cmds)], &|| {
+                self.replay_desc(n)
+            })
     }
 
     /// Resubmit the recording and wait for completion. Each segment is a SEPARATE `vkQueueSubmit`,
@@ -11167,7 +11166,11 @@ impl RecordedCmd {
     pub fn replay(&self) -> Result<()> {
         self.shared.live()?;
         let device = &self.shared.device;
-        for seg in &self.segments {
+        let (last, head) = self
+            .segments
+            .split_last()
+            .expect("a recording has at least one segment");
+        for seg in head {
             let submitted = unsafe {
                 device.queue_submit(
                     self.shared.queue,
@@ -11192,7 +11195,13 @@ impl RecordedCmd {
                 );
             }
         }
-        self.shared.wait_queue_idle(&|| self.replay_desc(1))
+        // The wait fence rides on the last segment's own submit: no extra submit per token. That
+        // segment opens with a global barrier over the ones before it (`seed_barrier`), so its
+        // completion is the whole recording's.
+        self.shared.submit_wait(
+            &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&last.cmd))],
+            &|| self.replay_desc(1),
+        )
     }
 }
 
@@ -11289,7 +11298,10 @@ impl PendingSegment {
 /// never returned, spinning a core (plan 12 section 0b). So the stamps are read WITHOUT waiting,
 /// and a closing stamp (the segment's last command) missing after the fence signalled poisons
 /// the backend: whatever that segment should have written cannot be trusted. A lost device met
-/// by the read poisons it too. An untimed segment has no such check.
+/// by the read poisons it too. Nothing else has this check: an untimed segment (a queue without
+/// timestamps), a decode replay (`RecordedCmd`: persistent recorders carry no stamps), a one-shot
+/// or staging copy. Dropped work there is reported only by the next submit (`docs/backlog.md`
+/// B222).
 fn account_segment(
     shared: &crate::VulkanShared,
     qp: vk::QueryPool,

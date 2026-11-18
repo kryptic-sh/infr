@@ -8,19 +8,22 @@
 //! instead of touching the device.
 //!
 //! Why a timeout is fatal rather than retried: a fence that has not signalled after tens of
-//! seconds belongs to work that will not finish (a GPU whose work was cut off leaves its fences
-//! unsignalled; plan 12 section 0b measured exactly that on an integrated GPU, where the old
-//! unbounded `vkWaitForFences` then spun a core forever). Whatever that submit was doing to its
+//! seconds belongs to work that will not finish, whether the GPU hung or a driver reset left it
+//! unsignalled. (On the integrated GPU of plan 12 section 0c the reset DID signal the fence, and
+//! the host then spun forever on a timestamp read instead; `recorder::account_segment` covers
+//! that case, for forward segments only.) Whatever that submit was doing to its
 //! buffers is unknown, so nothing it touched can be trusted, and nothing it USES may be destroyed
 //! either: destroying a command buffer, a descriptor pool or memory still in use by a device that
 //! is merely slow is undefined behaviour. So a poisoned backend LEAKS instead of freeing — every
 //! drop path asks [`VulkanShared::poisoned`] first — and the process is expected to report the
 //! error and exit, which hands the whole context back to the driver.
 //!
-//! [`vk::Queue`] waits (`vkQueueWaitIdle`, `vkDeviceWaitIdle`) take no timeout at all, so
-//! [`VulkanShared::wait_queue_idle`] replaces them with an empty submit that signals a fence once
-//! everything submitted before it has completed (the Vulkan rule for a submit with no batches),
-//! and a bounded wait on that fence.
+//! [`vk::Queue`] waits (`vkQueueWaitIdle`, `vkDeviceWaitIdle`) take no timeout at all. A path
+//! that submits work and waits for it ([`VulkanShared::submit_wait`]: a forward's last command
+//! buffer, a decode replay, a one-shot copy) attaches a fence to that submit and waits on it; the
+//! few that only need the queue drained ([`VulkanShared::wait_queue_idle`]: teardown,
+//! `Backend::sync`, freeing a recording) submit no batches with that fence, which signals once
+//! everything submitted before it has completed.
 
 use ash::vk;
 use infr_core::error::{backend as be, Error, Result};
@@ -37,6 +40,25 @@ use crate::VulkanShared;
 /// `docs/config.md` beside the key; this is more than ten times the worst of them.
 pub const DEFAULT_GPU_WAIT_TIMEOUT_MS: u64 = 30_000;
 
+/// The smallest bound `device.gpu_wait_timeout_ms` accepts (`0`, wait forever, aside): above the
+/// longest legitimate wait measured (see [`DEFAULT_GPU_WAIT_TIMEOUT_MS`]), so a bound that would
+/// poison healthy work is refused at creation instead of failing the first long forward.
+pub const MIN_GPU_WAIT_TIMEOUT_MS: u64 = 5_000;
+
+/// The configured bound, checked: unset is [`DEFAULT_GPU_WAIT_TIMEOUT_MS`], `0` waits forever,
+/// and anything else must be at least [`MIN_GPU_WAIT_TIMEOUT_MS`].
+pub(crate) fn checked_timeout_ms(configured: Option<u64>) -> std::result::Result<u64, String> {
+    match configured {
+        None => Ok(DEFAULT_GPU_WAIT_TIMEOUT_MS),
+        Some(ms) if ms == 0 || ms >= MIN_GPU_WAIT_TIMEOUT_MS => Ok(ms),
+        Some(ms) => Err(format!(
+            "device.gpu_wait_timeout_ms (INFR_GPU_WAIT_TIMEOUT_MS) = {ms} is below the {} ms \
+             minimum; 0 waits forever",
+            MIN_GPU_WAIT_TIMEOUT_MS
+        )),
+    }
+}
+
 /// The wait state one device owns: its bound, its poison, the fence queue-idle waits reuse, and
 /// the `VK_EXT_device_fault` loader when the device offers it.
 pub(crate) struct GpuWait {
@@ -45,8 +67,8 @@ pub(crate) struct GpuWait {
     timeout_ns: AtomicU64,
     /// The first fatal wait's message. Set once; every later wait and submit returns it.
     poison: OnceLock<String>,
-    /// Signalled by [`VulkanShared::wait_queue_idle`]'s empty submit. The lock also keeps two
-    /// queue-idle waits from sharing it.
+    /// The fence [`VulkanShared::submit_wait`] attaches to a submit and waits on. Its lock is held
+    /// from that submit to the fence's reset, so two waits never share it.
     idle_fence: Mutex<vk::Fence>,
     /// `vkGetDeviceFaultInfoEXT`, when the device offers `VK_EXT_device_fault` and the feature
     /// was enabled at creation. Only meaningful after the device has been lost.
@@ -201,22 +223,45 @@ impl VulkanShared {
 
     /// Wait until everything submitted to the queue so far has completed, at most the configured
     /// bound — the bounded replacement for `vkQueueWaitIdle` / `vkDeviceWaitIdle` (this backend
-    /// owns one queue). See [`Self::wait_fences`] for the failure contract.
+    /// owns one queue), for the paths that have no submit of their own to wait on (teardown,
+    /// `Backend::sync`, freeing a recording). A submit with no batches still signals its fence,
+    /// once all work submitted earlier to the queue has completed. See [`Self::wait_fences`] for
+    /// the failure contract.
     pub(crate) fn wait_queue_idle(&self, what: &dyn Fn() -> String) -> Result<()> {
+        self.submit_wait(&[], what)
+    }
+
+    /// Submit `submits` with the backend's wait fence and wait for it, at most the configured
+    /// bound: the work's own submit signals the fence, so waiting costs no extra submit. With no
+    /// batches it is a queue-idle wait ([`Self::wait_queue_idle`]).
+    ///
+    /// The fence signals when THESE batches complete. Work submitted earlier is covered only
+    /// through ordering: every forward segment and replay opens with a global barrier
+    /// (`Recorder::seed_barrier`, a recording's leading barrier) whose first scope is everything
+    /// submitted before it, and anything earlier whose results the host reads is waited on by
+    /// its own fence (`PendingSegment::wait`).
+    ///
+    /// The fence's lock is held from the submit to the reset, so two callers never share it.
+    pub(crate) fn submit_wait(
+        &self,
+        submits: &[vk::SubmitInfo],
+        what: &dyn Fn() -> String,
+    ) -> Result<()> {
         self.live()?;
-        let fence = *self
+        let guard = self
             .gpu_wait
             .idle_fence
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A submit with no batches still signals its fence, once all work submitted earlier to
-        // the queue has completed.
-        if let Err(e) = unsafe { self.device.queue_submit(self.queue, &[], fence) } {
+        let fence = *guard;
+        if let Err(e) = unsafe { self.device.queue_submit(self.queue, submits, fence) } {
             return Err(self.submit_failed(e, &what()));
         }
         self.wait_fences(&[fence], what)?;
-        unsafe { self.device.reset_fences(&[fence]) }
-            .map_err(|e| be(format!("reset the queue-idle fence: {e}")))
+        let reset = unsafe { self.device.reset_fences(&[fence]) }
+            .map_err(|e| be(format!("reset the wait fence: {e}")));
+        drop(guard);
+        reset
     }
 
     /// The error for a `vkQueueSubmit` that failed submitting `what`. A lost device poisons the
@@ -455,6 +500,21 @@ mod tests {
             DEFAULT_GPU_WAIT_TIMEOUT_MS * 1_000_000
         );
         assert_eq!(timeout_ns(u64::MAX), u64::MAX, "saturates, never wraps");
+    }
+
+    #[test]
+    fn a_bound_below_the_minimum_is_refused() {
+        assert_eq!(checked_timeout_ms(None), Ok(DEFAULT_GPU_WAIT_TIMEOUT_MS));
+        assert_eq!(checked_timeout_ms(Some(0)), Ok(0), "0 waits forever");
+        assert_eq!(
+            checked_timeout_ms(Some(MIN_GPU_WAIT_TIMEOUT_MS)),
+            Ok(MIN_GPU_WAIT_TIMEOUT_MS)
+        );
+        let err = checked_timeout_ms(Some(1)).unwrap_err();
+        assert!(
+            err.contains("below") && err.contains("INFR_GPU_WAIT_TIMEOUT_MS"),
+            "{err}"
+        );
     }
 
     #[test]

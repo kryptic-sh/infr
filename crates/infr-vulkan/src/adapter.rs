@@ -5807,9 +5807,9 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     submitted_dispatches += last.dispatches();
     let last_serial = last.serial();
     submit_wait(be_, last)?;
-    // The blocking finish above already waited the queue idle — draining just releases the
-    // pipelined segments' command buffers/fences (every buffer they referenced outlives this
-    // call: pooled scratch in `transient`, ring/tape/arenas on the session).
+    // The blocking finish above waited for the last segment's own fence; waiting each pipelined
+    // segment's fence here completes the forward and releases their command buffers (every buffer
+    // they referenced outlives this call: pooled scratch in `transient`, ring/tape/arenas on the session).
     for seg in segments {
         seg.wait()?;
     }
@@ -5817,7 +5817,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
     if be_.moe_paged() {
         // The session's lock is released at the end of this statement.
         let stopped = be_.moe_pager().lock().unwrap().as_mut().map(|sess| {
-            // The queue is idle, so every recording up to `last` has completed.
+            // Every segment up to `last` has been waited above, so every recording has completed.
             sess.fills_copied(last_serial);
             sess.end_forward()
         });
@@ -5825,7 +5825,7 @@ fn execute_static(be_: &VulkanBackend, graph: &Graph, bindings: &Bindings) -> Re
         // forward waits too.
         drop(stopped);
     }
-    // Feed this forward back into the splitter: `finish` waited the queue idle and every segment
+    // Feed this forward back into the splitter: `finish` waited the last segment and every segment
     // has been waited, so each one's GPU interval is in the clock's sum. See `ForwardClock` for
     // why that, and not this forward's wall time, is what the watchdog bound is judged by.
     clock.observe(be_, submitted_dispatches);
@@ -5957,7 +5957,7 @@ fn rotate_stream<'a>(
     Ok(())
 }
 
-/// Blocking submit of the ambient segment (queue idle on return) + full stream drain — the ONE
+/// Blocking submit of the ambient segment + full stream drain — the ONE
 /// remaining host sync on the paged path, paid only by a small-m layer whose expert set is not
 /// fully resident (its router ids must be read back before its GEMVs can be staged). Both ring
 /// halves and the whole tape are reusable afterwards, and so are the background fills' staging
@@ -5971,11 +5971,14 @@ fn sync_stream<'a>(
     let serial = last.serial();
     submit_wait(be_, last)?;
     be_.note_segment_cut(crate::SegmentCut::Drain);
-    ps.drain()?; // fences already signaled (queue idle) — releases their transient objects
+    ps.drain()?; // fences already signaled (see below) — releases their transient objects
     ps.cursor = 0;
     ps.tape_cursor = 0;
     if let Some(sess) = be_.moe_pager().lock().unwrap().as_mut() {
-        sess.fills_copied(serial); // the queue is idle: every recording up to `last` completed
+        // The waited segment opens with a global barrier over everything submitted before it
+        // (a continuation segment) or is the forward's first (everything earlier was waited), so
+        // its completion means every recording up to `last` completed.
+        sess.fills_copied(serial);
     }
     *rec = Some(be_.recorder()?);
     Ok(())

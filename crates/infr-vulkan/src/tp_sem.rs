@@ -199,7 +199,7 @@ impl VulkanBackend {
         } {
             // Submit failed → the cmd never runs; free it so it does not leak the shared pool.
             self.tp_free_cmds(&[cmd]);
-            return Err(be(format!("tp_submit_copy_signal queue_submit: {e}")));
+            return Err(self.shared.submit_failed(e, "tp_submit_copy_signal"));
         }
         Ok(cmd)
     }
@@ -236,7 +236,7 @@ impl VulkanBackend {
                 .queue_submit(self.shared.queue, &[submit], vk::Fence::null())
         } {
             self.tp_free_cmds(&[cmd]);
-            return Err(be(format!("tp_submit_copies_wait queue_submit: {e}")));
+            return Err(self.shared.submit_failed(e, "tp_submit_copies_wait"));
         }
         Ok(cmd)
     }
@@ -279,7 +279,7 @@ impl VulkanBackend {
         };
         if let Err(e) = r {
             self.tp_free_cmds(&[cmd]);
-            return Err(be(format!("{what} queue_submit: {e}")));
+            return Err(self.shared.submit_failed(e, what));
         }
         // A failed wait leaves `cmd` to the GPU that may still be running it: leaked, not freed.
         self.tp_queue_wait_idle()?;
@@ -299,6 +299,9 @@ impl VulkanBackend {
         acquire_external: &[&dyn Buffer],
         release_external: &[&dyn Buffer],
     ) -> Result<vk::CommandBuffer> {
+        // Every submit here records through this first: a poisoned backend records and submits
+        // nothing (see `gpu_wait`).
+        self.shared.live()?;
         // Same guard as `Backend::copy_buffer`, before anything is allocated or recorded: a region
         // past either end is a VUID violation, not an error the driver reports.
         for &(src, dst, bytes) in copies {

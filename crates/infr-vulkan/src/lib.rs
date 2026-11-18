@@ -442,6 +442,9 @@ struct VulkanShared {
     /// [`Recorder`] writes (a timestamp before its first command and after its last), or `None`
     /// when the compute queue family reports no timestamp bits. See [`ForwardClock`].
     segment_ts_period: Option<f32>,
+    /// `hostQueryReset` is enabled: query pools are reset from the host at creation, so a
+    /// timestamp whose command buffer never ran reads as unavailable rather than undefined.
+    host_query_reset: bool,
     /// Sum of every completed segment's GPU interval (ns), added by `Recorder::finish` and
     /// `PendingSegment::wait`. [`ForwardClock`] diffs it around a forward.
     segment_gpu_ns: AtomicU64,
@@ -1967,7 +1970,13 @@ impl VulkanBackend {
         // all-reduce (a shared timeline signalled on one device, waited on another). Probed so we
         // never try to enable it where absent (which would fail create_device).
         let mut timeline_feat = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        // Host query reset (core 1.2): a forward segment's timestamps are reset from the host
+        // when the pool is created, so a command buffer a watchdog reset discarded leaves them
+        // reliably unavailable (`recorder::account_segment`). Without it they are reset in the
+        // command buffer, as before.
+        let mut host_reset_feat = vk::PhysicalDeviceHostQueryResetFeatures::default();
         let mut feat2 = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut host_reset_feat)
             .push_next(&mut f16_feat)
             .push_next(&mut memmodel_feat)
             .push_next(&mut sgsize_feat)
@@ -2001,6 +2010,7 @@ impl VulkanBackend {
         // The external-semaphore all-reduce needs BOTH the fd extension and the timeline feature
         // (read here, after `feat2`'s last use, for the same borrow reason as `has_bda`).
         let has_ext_sem = has_ext_sem_fd && timeline_feat.timeline_semaphore != 0;
+        let host_query_reset = host_reset_feat.host_query_reset != 0;
         // Hard requirement, not a fallback: the paged-MoE arena is addressed by a 64-bit device
         // pointer, so a device that cannot hand out one has no 64-bit address space for infr to
         // use. bufferDeviceAddress is core in Vulkan 1.2 and this backend targets 1.3, so on any
@@ -2468,6 +2478,11 @@ impl VulkanBackend {
         if has_ext_sem {
             device_ci = device_ci.push_next(&mut timeline_sem_ci);
         }
+        let mut host_reset_ci =
+            vk::PhysicalDeviceHostQueryResetFeatures::default().host_query_reset(true);
+        if host_query_reset {
+            device_ci = device_ci.push_next(&mut host_reset_ci);
+        }
         let mut fault_ci = vk::PhysicalDeviceFaultFeaturesEXT::default().device_fault(true);
         if has_device_fault {
             device_ci = device_ci.push_next(&mut fault_ci);
@@ -2734,12 +2749,21 @@ impl VulkanBackend {
             .device
             .submit_dispatches
             .unwrap_or(tuned.submit_initial_dispatches);
-        // The slow-class seed protects prefill only (see `decode_submit_cap`); a cap a tuning row
-        // or the user set applies everywhere, as on an integrated device.
-        let split_prefill_only = cfg.device.submit_dispatches.is_none()
-            && !caps.integrated
-            && slow_device
-            && submit_dispatch_cap > 0;
+        // The slow-class seed (the parameter's derived default) protects prefill only (see
+        // `decode_submit_cap`); a cap set anywhere else — `device.submit_dispatches`, or
+        // `submit.initial_dispatches` from a tuning row, a tuning file or the user — applies to
+        // every forward, as on an integrated device.
+        let initial_cap_is_derived = tuning_report
+            .params
+            .iter()
+            .any(|p| p.key == "submit.initial_dispatches" && p.source == "default");
+        let split_prefill_only = prefill_only_seed(
+            cfg.device.submit_dispatches,
+            initial_cap_is_derived,
+            caps.integrated,
+            slow_device,
+            submit_dispatch_cap,
+        );
         // Integrated GPUs run a DIFFERENT shape of forward (smaller prefill chunk, and the whole
         // pass split across several submits so no single command buffer can trip the GPU's hang
         // watchdog), so say so out loud: it is the first thing to check when an iGPU run hangs or
@@ -2836,9 +2860,7 @@ impl VulkanBackend {
 
         let gpu_wait = gpu_wait::GpuWait::new(
             &device,
-            cfg.device
-                .gpu_wait_timeout_ms
-                .unwrap_or(DEFAULT_GPU_WAIT_TIMEOUT_MS),
+            gpu_wait::checked_timeout_ms(cfg.device.gpu_wait_timeout_ms).map_err(be)?,
             has_device_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
         )?;
 
@@ -2890,6 +2912,7 @@ impl VulkanBackend {
                 split_prefill_only: AtomicBool::new(split_prefill_only),
                 submit_split_disabled,
                 segment_ts_period,
+                host_query_reset,
                 tuning: tuned,
                 tuning_report,
                 segment_gpu_ns: AtomicU64::new(0),
@@ -4319,22 +4342,49 @@ impl VulkanBackend {
         }
         .map_err(|e| be(format!("begin_command_buffer: {e}")))?;
 
+        // A global barrier first, over everything submitted before: the wait below is on THIS
+        // submit's fence, not the queue's idle, so this is what still makes its completion imply
+        // all earlier compute and transfer work's (the ordering `vkQueueWaitIdle` used to give).
+        let mb = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::SHADER_READ
+                    | vk::AccessFlags::SHADER_WRITE
+                    | vk::AccessFlags::TRANSFER_READ
+                    | vk::AccessFlags::TRANSFER_WRITE,
+            );
+        let stages = vk::PipelineStageFlags::COMPUTE_SHADER | vk::PipelineStageFlags::TRANSFER;
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                stages,
+                stages,
+                vk::DependencyFlags::empty(),
+                &[mb],
+                &[],
+                &[],
+            );
+        }
+
         f(cmd);
 
         unsafe { device.end_command_buffer(cmd) }
             .map_err(|e| be(format!("end_command_buffer: {e}")))?;
 
         let cmds = [cmd];
-        let submit = vk::SubmitInfo::default().command_buffers(&cmds);
-        unsafe { device.queue_submit(self.shared.queue, &[submit], vk::Fence::null()) }
-            .map_err(|e| self.shared.submit_failed(e, "a one-shot command buffer"))?;
-
-        // On a failed wait the command buffer may still be executing: it is leaked, not freed.
-        self.shared
-            .wait_queue_idle(&|| "a one-shot command buffer (copy, fill or probe)".to_string())?;
-
+        // The wait fence rides on this submit. A submit that failed with an ordinary error queued
+        // nothing and the buffer is freed; a failure that poisons the backend leaves it to the GPU
+        // that may still be executing it: leaked, not freed.
+        let waited = self
+            .shared
+            .submit_wait(&[vk::SubmitInfo::default().command_buffers(&cmds)], &|| {
+                "a one-shot command buffer (copy, fill or probe)".to_string()
+            });
+        if waited.is_err() && self.shared.poisoned() {
+            return waited;
+        }
         unsafe { device.free_command_buffers(pool, &cmds) };
-        Ok(())
+        waited
     }
 
     /// Device-side copy of byte ranges `(src_off, dst_off, bytes)` from `src` into `dst`, in one
@@ -4404,6 +4454,8 @@ impl Backend for VulkanBackend {
     }
 
     fn alloc(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        // A poisoned backend allocates nothing (see `gpu_wait`).
+        self.shared.live()?;
         // calloc contract: zero-init so recycled/uninitialized VRAM can't leak into a read-before-write.
         let buf = self.make_alloc(bytes, usage)?;
         self.fill_buf(&buf, 0x00)?;
@@ -4411,6 +4463,8 @@ impl Backend for VulkanBackend {
     }
 
     fn alloc_uninit(&self, bytes: usize, usage: BufferUsage) -> Result<Box<dyn Buffer>> {
+        // A poisoned backend allocates nothing (see `gpu_wait`).
+        self.shared.live()?;
         // Opt-out: skip the zero-fill (caller guarantees the full extent is written before any read).
         // Debug builds poison with 0xFF (= NaN as f32) so a misuse surfaces loudly in tests;
         // `debug.poison_uninit` (`INFR_POISON_UNINIT=1`) forces the poison in release too — for
@@ -4439,6 +4493,8 @@ impl Backend for VulkanBackend {
     /// If `dst` is host-visible (`CpuToGpu`), writes directly through the
     /// Device-side prefix copy (`vkCmdCopyBuffer` region `[0, bytes)`) — no host bounce.
     fn copy_buffer(&self, src: &dyn Buffer, dst: &dyn Buffer, bytes: usize) -> Result<()> {
+        // A poisoned backend touches no device memory (see `gpu_wait`).
+        self.shared.live()?;
         self.copy_ranges(src, dst, &[(0, 0, bytes)])
     }
 
@@ -4466,6 +4522,8 @@ impl Backend for VulkanBackend {
     /// persistent mapped pointer.  Otherwise, creates a temporary staging buffer,
     /// writes there, then submits a `cmd_copy_buffer` to the compute queue.
     fn upload(&self, dst: &dyn Buffer, src: &[u8]) -> Result<()> {
+        // Poisoned: the GPU may still be using that memory (see `gpu_wait`).
+        self.shared.live()?;
         let vk_dst = as_vk_buf(dst)?;
         // Same guard as `download`/`copy_buffer`, same wording — this one is the original, the
         // helper just stops the three from drifting apart again.
@@ -4536,6 +4594,8 @@ impl Backend for VulkanBackend {
     /// site does — `execute`/`replay` end in `queue_wait_idle`; the buffers are HOST_COHERENT so
     /// the write is visible with no explicit invalidate).
     fn download(&self, src: &dyn Buffer, dst: &mut [u8]) -> Result<()> {
+        // Poisoned: the memory may be what dropped work never wrote (see `gpu_wait`).
+        self.shared.live()?;
         let vk_src = as_vk_buf(src)?;
         // The mirror of `upload`'s guard, and it is the one with TEETH: the mapped fast path below
         // is a raw `copy_nonoverlapping` of `dst.len()` bytes out of the mapping, so an oversize
@@ -4612,6 +4672,8 @@ impl Backend for VulkanBackend {
     }
 
     fn compile(&self, graph: &Graph) -> Result<Box<dyn Plan>> {
+        // A poisoned backend builds no pipeline (see `gpu_wait`).
+        self.shared.live()?;
         adapter::compile(self, graph)
     }
 
@@ -5010,6 +5072,21 @@ pub(crate) fn test_config() -> Config {
         .dev
         .clone();
     cfg
+}
+
+/// Whether the initial submit cap protects prefill only (`VulkanShared::split_prefill_only`): only
+/// when it is the slow-class seed — the derived default of `submit.initial_dispatches` on a
+/// discrete slow-class device, with `device.submit_dispatches` unset — and splits at all. Any cap
+/// a person or a tuning row chose applies to every forward. Pure, so the rule is testable without
+/// a GPU.
+fn prefill_only_seed(
+    submit_dispatches: Option<usize>,
+    initial_cap_is_derived: bool,
+    integrated: bool,
+    slow_class: bool,
+    cap: usize,
+) -> bool {
+    submit_dispatches.is_none() && initial_cap_is_derived && !integrated && slow_class && cap > 0
 }
 
 /// The submit splitter's cap after one forward: `cur` is the cap now, `busy_ns` the forward's
@@ -5627,6 +5704,19 @@ mod tests {
 
     /// The arming rule over GPU-busy time: a never-split device arms only past the danger
     /// threshold, a splitting device only tightens, and the kill switch wins over both.
+    #[test]
+    fn only_the_derived_slow_class_seed_spares_decode() {
+        // The slow-class seed: prefill only.
+        assert!(prefill_only_seed(None, true, false, true, 64));
+        // A cap set by tuning (row, file, user) or `device.submit_dispatches` applies everywhere.
+        assert!(!prefill_only_seed(None, false, false, true, 16));
+        assert!(!prefill_only_seed(Some(64), true, false, true, 64));
+        // Integrated devices, fast devices and a cap of 0 (no split) never take the exemption.
+        assert!(!prefill_only_seed(None, true, true, true, 128));
+        assert!(!prefill_only_seed(None, true, false, false, 64));
+        assert!(!prefill_only_seed(None, true, false, true, 0));
+    }
+
     #[test]
     fn next_submit_cap_arms_only_on_long_gpu_forwards() {
         let danger = infr_core::SUBMIT_DANGER_NS;

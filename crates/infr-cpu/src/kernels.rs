@@ -6404,12 +6404,12 @@ fn vec_dot_nvfp4_batch_scalar(row: &[u8], q8s: &[Q8x32], in_f: usize, out: &mut 
 //
 // Every f32 dot below is defined by its `*_scalar` function: 8 lanes, lane `i % 8` accumulating
 // element `i` by `mul_add` in increasing `i`, the lanes folded by `iter().sum()`, an `n % 8` tail
-// finished serially by `mul_add`. Each dispatcher runs exactly that expression. On a build whose
-// target has FMA (`target-cpu=native` here, aarch64 everywhere) `mul_add` is the fused
-// instruction and the dispatcher is the scalar function. On one without it (the baseline x86-64
+// finished serially by `mul_add`. Each [`Dots`] method runs exactly that expression. On a build
+// whose target has FMA (`target-cpu=native` here, aarch64 everywhere) `mul_add` is the fused
+// instruction and the method is the scalar function. On one without it (the baseline x86-64
 // builds CI and the release ship) `mul_add` compiles to a call to the C runtime's `fmaf`: exact,
-// but a call per element. There the dispatcher takes the FMA tier when the CPU has it
-// (`crate::simd::fma`): the same source compiled inside a `#[target_feature]` function, where
+// but a call per element. There a `Dots` resolved where the CPU has it (`crate::simd::fma`) runs
+// the FMA tier: the same source compiled inside a `#[target_feature]` function, where
 // each `mul_add` is the instruction and the 8 lanes vectorize to one `vfmadd` per chunk. Same
 // operations in the same order, and both fused, so the same bits (`tier_tests` holds every dot to
 // that, with inputs where a fused and an unfused multiply-add differ). Eight lanes fill one ymm
@@ -6441,97 +6441,285 @@ macro_rules! fma_twin {
 }
 pub(crate) use fma_twin;
 
-/// `Σ f16_weight·x` (weight is 2 bytes/elem), with [`dot`]'s lane order. Dispatches the FMA tier
-/// on builds without FMA (see the section comment).
-#[inline]
-pub(crate) fn dot_f16<const CAP: bool>(w: &[u8], x: &[f32]) -> f32 {
+/// Which compilation of the f32 dots a graph runs: resolved ONCE ([`Dots::resolve`], at the top
+/// of the interpreter or of a kernel task) and handed to every call in the op loops, so a
+/// per-key or per-row call is a branch on a register, not a feature test. On a build whose target
+/// has FMA it is empty and every method is the scalar function: no dispatch is compiled at all.
+/// Its one field is private and only [`Dots::resolve`] sets it, after checking the CPU, so a
+/// `Dots` that selects the FMA code proves the CPU can run it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Dots {
     #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
-    if crate::simd::fma::<CAP>() {
-        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
-        return unsafe { dot_f16_fma(w, x) };
-    }
-    dot_f16_scalar(w, x)
+    fma: bool,
 }
 
-/// [`dot_f16`]'s definition. `target-cpu=native` lowers the f16→f32 to F16C.
-#[cfg_attr(infr_profile, infr_prof::instrument)]
-pub(crate) fn dot_f16_scalar(w: &[u8], x: &[f32]) -> f32 {
-    let mut acc = [0f32; 8];
-    let n = x.len();
-    let chunks = n / 8;
-    for c in 0..chunks {
-        for (j, ac) in acc.iter_mut().enumerate() {
-            let i = c * 8 + j;
-            let wv = half::f16::from_le_bytes([w[i * 2], w[i * 2 + 1]]).to_f32();
-            *ac = wv.mul_add(x[i], *ac);
+impl Dots {
+    /// The compilation this thread may run, under the `kernels.cpu.max_tier` ceiling when `CAP`.
+    #[inline(always)]
+    pub(crate) fn resolve<const CAP: bool>() -> Self {
+        Self {
+            #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+            fma: crate::simd::fma::<CAP>(),
         }
     }
-    let mut s: f32 = acc.iter().sum();
-    for i in chunks * 8..n {
-        s = half::f16::from_le_bytes([w[i * 2], w[i * 2 + 1]])
-            .to_f32()
-            .mul_add(x[i], s);
+
+    /// Whether this selects the FMA compilation (a build with FMA has none to select).
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+    #[inline(always)]
+    pub(crate) fn fma(self) -> bool {
+        self.fma
     }
-    s
+
+    /// Dot product with 8 independent accumulators so the reduction isn't latency-bound.
+    /// `mul_add` fuses each lane's multiply+add into one FMA (numerics policy: llama.cpp's f32
+    /// dots are FMA too): attention's QK score and the F32-weight GEMM fallbacks.
+    #[inline(always)]
+    pub(crate) fn dot(self, a: &[f32], b: &[f32]) -> f32 {
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+        if self.fma {
+            // SAFETY: `resolve` set `fma` only after `simd::fma` found AVX2, FMA and F16C.
+            return unsafe { dot_fma(a, b) };
+        }
+        dot_scalar(a, b)
+    }
+
+    /// `[dot(a, bs[0]), dot(a, bs[1]), …]`, each bit-identical to [`Dots::dot`]; computing `N`
+    /// together gives the core `N` independent FMA chains to overlap.
+    #[inline(always)]
+    pub(crate) fn dot_n<const N: usize>(self, a: &[f32], bs: [&[f32]; N]) -> [f32; N] {
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+        if self.fma {
+            // SAFETY: as in `dot`.
+            return unsafe { dot_n_fma(a, bs) };
+        }
+        dot_n_scalar(a, bs)
+    }
+
+    /// `[[dot(as[m], bs[n]) for n] for m]`, each bit-identical to [`Dots::dot`], sharing each
+    /// `bs` chunk across the `M` rows of `as`.
+    #[inline(always)]
+    pub(crate) fn dot_mn<const M: usize, const N: usize>(
+        self,
+        a_s: [&[f32]; M],
+        bs: [&[f32]; N],
+    ) -> [[f32; N]; M] {
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+        if self.fma {
+            // SAFETY: as in `dot`.
+            return unsafe { dot_mn_fma(a_s, bs) };
+        }
+        dot_mn_scalar(a_s, bs)
+    }
+
+    /// `Σ f16_weight·x` (weight is 2 bytes/elem), with [`Dots::dot`]'s lane order.
+    #[inline(always)]
+    pub(crate) fn dot_f16(self, w: &[u8], x: &[f32]) -> f32 {
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+        if self.fma {
+            // SAFETY: as in `dot`.
+            return unsafe { dot_f16_fma(w, x) };
+        }
+        dot_f16_scalar(w, x)
+    }
+
+    /// `Σ bf16_weight·x` (bf16 = top 16 bits of f32), with [`Dots::dot`]'s lane order, so it
+    /// equals `dot` bit for bit on the same bf16-rounded weights.
+    #[inline(always)]
+    pub(crate) fn dot_bf16(self, w: &[u8], x: &[f32]) -> f32 {
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+        if self.fma {
+            // SAFETY: as in `dot`.
+            return unsafe { dot_bf16_fma(w, x) };
+        }
+        dot_bf16_scalar(w, x)
+    }
+
+    /// `o[i] = v[i].mul_add(s, o[i])` for every `i`: a weighted row added into an accumulator,
+    /// as attention's value sum and the hyper-connections write it. Each element is one fused
+    /// multiply-add of its own, so any vector width gives the same bits.
+    #[inline(always)]
+    pub(crate) fn axpy(self, o: &mut [f32], v: &[f32], s: f32) {
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+        if self.fma {
+            // SAFETY: as in `dot`.
+            return unsafe { axpy_fma(o, v, s) };
+        }
+        axpy_scalar(o, v, s)
+    }
+
+    /// `o[i] = v[i].mul_add(e[i], o[i])` for every `i` (all three of one length): an element-wise
+    /// weighted sum, as `Op::CompressPool` accumulates its window. Independent lanes, like `axpy`.
+    #[inline(always)]
+    pub(crate) fn mul_add_into(self, o: &mut [f32], v: &[f32], e: &[f32]) {
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+        if self.fma {
+            // SAFETY: as in `dot`.
+            return unsafe { mul_add_into_fma(o, v, e) };
+        }
+        mul_add_into_scalar(o, v, e)
+    }
+
+    /// `dst[i]` = the f16 bits of `src[i]`, as `half::f16::from_f32` gives them (the f16 KV cache
+    /// write): eight at a time with F16C, on either kind of build.
+    #[inline(always)]
+    pub(crate) fn f16_from_f32(self, dst: &mut [u16], src: &[f32]) {
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+        if self.fma {
+            // SAFETY: as in `dot`.
+            return unsafe { f16_from_f32_fma(dst, src) };
+        }
+        f16_from_f32_scalar(dst, src)
+    }
 }
 
-/// [`dot_f16_scalar`] with each chunk's 8 weights widened by one F16C conversion. The widening is
-/// exact (every f16 is an f32), so `wv` holds the values `half`'s `to_f32` gives; `half` itself
-/// would test for F16C per element on a build without it, which is most of what this avoids.
+/// `Σ f16_weight·x` (weight is 2 bytes/elem) with [`Dots::dot`]'s lane order, each chunk's eight
+/// weights widened by `$widen` (exact, so every widening gives the same values).
+macro_rules! dot_f16_body {
+    ($w:ident, $x:ident, $widen:ident) => {{
+        let n = $x.len();
+        let chunks = n / 8;
+        assert!(
+            $w.len() >= 2 * n,
+            "dot_f16: {} weight bytes for {n} elements",
+            $w.len()
+        );
+        let mut acc = [0f32; 8];
+        let (wc, _) = $w[..chunks * 16].as_chunks::<16>();
+        let (xc, _) = $x[..chunks * 8].as_chunks::<8>();
+        for (wb, xv) in wc.iter().zip(xc) {
+            let wv = $widen(wb);
+            for j in 0..8 {
+                acc[j] = wv[j].mul_add(xv[j], acc[j]);
+            }
+        }
+        let mut s: f32 = acc.iter().sum();
+        for i in chunks * 8..n {
+            s = half::f16::from_le_bytes([$w[i * 2], $w[i * 2 + 1]])
+                .to_f32()
+                .mul_add($x[i], s);
+        }
+        s
+    }};
+}
+
+/// Eight little-endian f16 values widened to f32. With F16C in the build's target features one
+/// `vcvtph2ps` does all eight; otherwise `half` converts them one at a time (testing for F16C
+/// at run time each time, on a build without it). The widening is exact either way.
+#[inline(always)]
+fn widen8_f16(b: &[u8; 16]) -> [f32; 8] {
+    #[cfg(all(target_arch = "x86_64", target_feature = "f16c"))]
+    {
+        use std::arch::x86_64::*;
+        let mut out = [0f32; 8];
+        // SAFETY: F16C is a target feature of this build, and `b` holds the 16 bytes read.
+        unsafe {
+            _mm256_storeu_ps(
+                out.as_mut_ptr(),
+                _mm256_cvtph_ps(_mm_loadu_si128(b.as_ptr().cast())),
+            )
+        };
+        out
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "f16c")))]
+    std::array::from_fn(|j| half::f16::from_le_bytes([b[2 * j], b[2 * j + 1]]).to_f32())
+}
+
+/// [`widen8_f16`]'s F16C form, for the FMA compilation of a build without F16C.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+#[target_feature(enable = "avx2,fma,f16c")]
+#[inline]
+unsafe fn widen8_f16c(b: &[u8; 16]) -> [f32; 8] {
+    use std::arch::x86_64::*;
+    let mut out = [0f32; 8];
+    _mm256_storeu_ps(
+        out.as_mut_ptr(),
+        _mm256_cvtph_ps(_mm_loadu_si128(b.as_ptr().cast())),
+    );
+    out
+}
+
+/// [`Dots::dot_f16`]'s definition. A build with F16C (`target-cpu=native` here) widens each chunk
+/// with one conversion; `half`'s per-element `to_f32` is not merged into one by the compiler, and
+/// made the native dot three times slower than the baseline build's FMA tier.
+#[cfg_attr(infr_profile, infr_prof::instrument)]
+pub(crate) fn dot_f16_scalar(w: &[u8], x: &[f32]) -> f32 {
+    dot_f16_body!(w, x, widen8_f16)
+}
+
+/// [`dot_f16_scalar`] compiled with FMA and F16C.
 #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
 #[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn dot_f16_fma(w: &[u8], x: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-    let n = x.len();
-    let chunks = n / 8;
-    assert!(
-        w.len() >= 2 * n,
-        "dot_f16: {} weight bytes for {n} elements",
-        w.len()
-    );
-    let mut acc = [0f32; 8];
-    for c in 0..chunks {
-        let i0 = c * 8;
-        let mut wv = [0f32; 8];
-        _mm256_storeu_ps(wv.as_mut_ptr(), _mm256_cvtph_ps(load128(w, i0 * 2)));
-        for (j, ac) in acc.iter_mut().enumerate() {
-            *ac = wv[j].mul_add(x[i0 + j], *ac);
-        }
-    }
-    let mut s: f32 = acc.iter().sum();
-    for i in chunks * 8..n {
-        s = half::f16::from_le_bytes([w[i * 2], w[i * 2 + 1]])
-            .to_f32()
-            .mul_add(x[i], s);
-    }
-    s
+    dot_f16_body!(w, x, widen8_f16c)
 }
 
-/// `Σ bf16_weight·x` (bf16 = top 16 bits of f32), with [`dot`]'s lane order, so it equals `dot`
-/// bit for bit on the same bf16-rounded weights. Dispatches the FMA tier on builds without FMA.
+/// `dst[i] = f16(src[i])` (the bits, round to nearest even, as `half::f16::from_f32`), eight at a
+/// time where the build has F16C. Exhaustively equal to `half`'s software conversion on every
+/// finite and infinite input; for a NaN see `f16_store_tests`.
 #[inline]
-pub(crate) fn dot_bf16<const CAP: bool>(w: &[u8], x: &[f32]) -> f32 {
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
-    if crate::simd::fma::<CAP>() {
-        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
-        return unsafe { dot_bf16_fma(w, x) };
+pub(crate) fn f16_from_f32_scalar(dst: &mut [u16], src: &[f32]) {
+    assert_eq!(dst.len(), src.len(), "f16_from_f32: lengths differ");
+    #[cfg(all(target_arch = "x86_64", target_feature = "f16c"))]
+    {
+        let (dc, dt) = dst.as_chunks_mut::<8>();
+        let (sc, st) = src.as_chunks::<8>();
+        for (d, s) in dc.iter_mut().zip(sc) {
+            *d = narrow8_f16(s);
+        }
+        for (d, &s) in dt.iter_mut().zip(st) {
+            *d = half::f16::from_f32(s).to_bits();
+        }
     }
-    dot_bf16_scalar(w, x)
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "f16c")))]
+    for (d, &s) in dst.iter_mut().zip(src) {
+        *d = half::f16::from_f32(s).to_bits();
+    }
+}
+
+/// Eight f32 values narrowed to f16 bits by one `vcvtps2ph` (round to nearest even).
+#[cfg(all(target_arch = "x86_64", target_feature = "f16c"))]
+#[inline(always)]
+fn narrow8_f16(s: &[f32; 8]) -> [u16; 8] {
+    use std::arch::x86_64::*;
+    let mut out = [0u16; 8];
+    // SAFETY: F16C is a target feature of this build; `s` and `out` are 8 lanes each.
+    unsafe {
+        let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm256_loadu_ps(s.as_ptr()));
+        _mm_storeu_si128(out.as_mut_ptr().cast(), h);
+    }
+    out
+}
+
+/// [`f16_from_f32_scalar`] for a build without F16C, on a CPU with it.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn f16_from_f32_fma(dst: &mut [u16], src: &[f32]) {
+    use std::arch::x86_64::*;
+    assert_eq!(dst.len(), src.len(), "f16_from_f32: lengths differ");
+    let (dc, dt) = dst.as_chunks_mut::<8>();
+    let (sc, st) = src.as_chunks::<8>();
+    for (d, s) in dc.iter_mut().zip(sc) {
+        let h = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm256_loadu_ps(s.as_ptr()));
+        _mm_storeu_si128(d.as_mut_ptr().cast(), h);
+    }
+    for (d, &s) in dt.iter_mut().zip(st) {
+        *d = half::f16::from_f32(s).to_bits();
+    }
 }
 
 fma_twin! {
-    /// [`dot_bf16`]'s definition.
+    /// [`Dots::dot_bf16`]'s definition.
     #[cfg_attr(infr_profile, infr_prof::instrument)]
     fn dot_bf16_scalar / dot_bf16_fma (w: &[u8], x: &[f32]) -> f32 {
         let mut acc = [0f32; 8];
         let n = x.len();
         let chunks = n / 8;
-        for c in 0..chunks {
-            for (j, ac) in acc.iter_mut().enumerate() {
-                let i = c * 8 + j;
-                let wv =
-                    f32::from_bits((u16::from_le_bytes([w[i * 2], w[i * 2 + 1]]) as u32) << 16);
-                *ac = wv.mul_add(x[i], *ac);
+        let (wc, _) = w[..chunks * 16].as_chunks::<16>();
+        let (xc, _) = x[..chunks * 8].as_chunks::<8>();
+        for (wb, xv) in wc.iter().zip(xc) {
+            for j in 0..8 {
+                let wv = f32::from_bits((u16::from_le_bytes([wb[2 * j], wb[2 * j + 1]]) as u32) << 16);
+                acc[j] = wv.mul_add(xv[j], acc[j]);
             }
         }
         let mut s: f32 = acc.iter().sum();
@@ -6543,22 +6731,8 @@ fma_twin! {
     }
 }
 
-/// Dot product with 8 independent accumulators so the reduction isn't latency-bound — lets the
-/// compiler keep several FMA lanes in flight. `mul_add` fuses each lane's multiply+add into one
-/// FMA (numerics policy: llama.cpp's f32 dots are FMA too) — this fn is attention's QK score and
-/// the F32-weight GEMM fallbacks (e.g. DG's router). Dispatches the FMA tier on builds without FMA.
-#[inline]
-pub(crate) fn dot<const CAP: bool>(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
-    if crate::simd::fma::<CAP>() {
-        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
-        return unsafe { dot_fma(a, b) };
-    }
-    dot_scalar(a, b)
-}
-
 fma_twin! {
-    /// [`dot`]'s definition.
+    /// [`Dots::dot`]'s definition.
     #[inline]
     #[cfg_attr(infr_profile, infr_prof::instrument)]
     fn dot_scalar / dot_fma (a: &[f32], b: &[f32]) -> f32 {
@@ -6580,22 +6754,8 @@ fma_twin! {
     }
 }
 
-/// `[dot(a, bs[0]), dot(a, bs[1]), …]`, each bit-identical to [`dot`]: the same per-lane FMA
-/// order and the same lane sum. One `dot` is a chain of dependent FMAs, so a loop of them waits on
-/// FMA latency; computing `N` together gives the core `N` independent chains to overlap.
-/// Dispatches the FMA tier on builds without FMA.
-#[inline]
-pub(crate) fn dot_n<const CAP: bool, const N: usize>(a: &[f32], bs: [&[f32]; N]) -> [f32; N] {
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
-    if crate::simd::fma::<CAP>() {
-        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
-        return unsafe { dot_n_fma(a, bs) };
-    }
-    dot_n_scalar(a, bs)
-}
-
 fma_twin! {
-    /// [`dot_n`]'s definition.
+    /// [`Dots::dot_n`]'s definition.
     // per-call leaf, too small to probe (see docs/perf/playbook.md)
     #[cfg_attr(infr_profile, infr_prof::skip)]
     #[inline]
@@ -6626,25 +6786,8 @@ fma_twin! {
     }
 }
 
-/// `[[dot(as[m], bs[n]) for n] for m]`, each bit-identical to [`dot`]. Against [`dot_n`] it also
-/// shares each `bs` chunk across the `M` rows of `as`, so a block of `M × N` products costs
-/// `M + N` loads instead of `M × (1 + N)` — the shape of many queries scored against the same
-/// keys. Dispatches the FMA tier on builds without FMA.
-#[inline]
-pub(crate) fn dot_mn<const CAP: bool, const M: usize, const N: usize>(
-    a_s: [&[f32]; M],
-    bs: [&[f32]; N],
-) -> [[f32; N]; M] {
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
-    if crate::simd::fma::<CAP>() {
-        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
-        return unsafe { dot_mn_fma(a_s, bs) };
-    }
-    dot_mn_scalar(a_s, bs)
-}
-
 fma_twin! {
-    /// [`dot_mn`]'s definition.
+    /// [`Dots::dot_mn`]'s definition.
     // per-call leaf, too small to probe (see docs/perf/playbook.md)
     #[cfg_attr(infr_profile, infr_prof::skip)]
     #[inline]
@@ -6683,27 +6826,24 @@ fma_twin! {
     }
 }
 
-/// `o[i] = v[i].mul_add(s, o[i])` for every `i` (`o` and `v` of one length): a weighted row added
-/// into an accumulator, as attention's value sum and the hyper-connections write it. Each element
-/// is one fused multiply-add of its own, so any vector width gives the same bits. Dispatches the
-/// FMA tier on builds without FMA.
-#[inline]
-pub(crate) fn axpy<const CAP: bool>(o: &mut [f32], v: &[f32], s: f32) {
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
-    if crate::simd::fma::<CAP>() {
-        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
-        return unsafe { axpy_fma(o, v, s) };
-    }
-    axpy_scalar(o, v, s)
-}
-
 fma_twin! {
-    /// [`axpy`]'s definition: the loop its call sites used to write in place.
+    /// [`Dots::axpy`]'s definition: the loop its call sites used to write in place.
     #[inline]
     fn axpy_scalar / axpy_fma (o: &mut [f32], v: &[f32], s: f32) {
         debug_assert_eq!(o.len(), v.len(), "axpy: o and v must have one length");
         for (o, &v) in o.iter_mut().zip(v) {
             *o = v.mul_add(s, *o);
+        }
+    }
+}
+
+fma_twin! {
+    /// [`Dots::mul_add_into`]'s definition.
+    #[inline]
+    fn mul_add_into_scalar / mul_add_into_fma (o: &mut [f32], v: &[f32], e: &[f32]) {
+        assert!(o.len() == v.len() && o.len() == e.len(), "mul_add_into: lengths differ");
+        for ((o, &v), &e) in o.iter_mut().zip(v).zip(e) {
+            *o = v.mul_add(e, *o);
         }
     }
 }
@@ -6799,7 +6939,8 @@ mod kernel_tests {
         for n in [0usize, 1, 7, 8, 9, 64, 128, 133] {
             let a = det_x(n, 5 + n as u64);
             let bs: Vec<Vec<f32>> = (0..4).map(|k| det_x(n, 100 * k + n as u64)).collect();
-            let got = dot_n::<false, 4>(&a, [&bs[0][..], &bs[1][..], &bs[2][..], &bs[3][..]]);
+            let got = Dots::resolve::<false>()
+                .dot_n(&a, [&bs[0][..], &bs[1][..], &bs[2][..], &bs[3][..]]);
             for (k, b) in bs.iter().enumerate() {
                 let want = dot_scalar(&a, b);
                 assert_eq!(
@@ -6819,7 +6960,7 @@ mod kernel_tests {
         for n in [0usize, 1, 7, 8, 9, 64, 128, 133] {
             let a_s: Vec<Vec<f32>> = (0..3).map(|m| det_x(n, 7 * m + n as u64)).collect();
             let bs: Vec<Vec<f32>> = (0..4).map(|k| det_x(n, 100 * k + n as u64)).collect();
-            let got = dot_mn::<false, _, _>(
+            let got = Dots::resolve::<false>().dot_mn(
                 [&a_s[0][..], &a_s[1][..], &a_s[2][..]],
                 [&bs[0][..], &bs[1][..], &bs[2][..], &bs[3][..]],
             );
@@ -9373,7 +9514,12 @@ mod kernel_tests {
             .iter()
             .map(|&v| half::f16::from_f32(v).to_f32())
             .collect();
-        assert!(rel_err(dot_f16::<false>(&wbytes, &x), dot_scalar(&wref, &x)) < 1e-4);
+        assert!(
+            rel_err(
+                Dots::resolve::<false>().dot_f16(&wbytes, &x),
+                dot_scalar(&wref, &x)
+            ) < 1e-4
+        );
     }
 
     #[test]
@@ -9392,7 +9538,7 @@ mod kernel_tests {
         // dot_bf16 now uses the same 8-accumulator chunked structure as `dot`, so on the same
         // bf16-rounded weights it is bit-identical to `dot` — not merely close.
         assert_eq!(
-            dot_bf16::<false>(&wbytes, &x).to_bits(),
+            Dots::resolve::<false>().dot_bf16(&wbytes, &x).to_bits(),
             dot_scalar(&wref, &x).to_bits(),
             "dot_bf16 must match dot's 8-accumulator reduction bit-for-bit",
         );
@@ -9436,7 +9582,7 @@ mod kernel_tests {
         }
 
         assert_eq!(
-            dot_bf16::<false>(&wbytes, &x).to_bits(),
+            Dots::resolve::<false>().dot_bf16(&wbytes, &x).to_bits(),
             want.to_bits(),
             "dot_bf16 must equal the 8-accumulator reference bit-for-bit",
         );

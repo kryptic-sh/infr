@@ -583,7 +583,7 @@ fn bits(v: &[f32]) -> Vec<u32> {
         .collect()
 }
 
-/// Every f32 dot's results on one input set, through the dispatchers' `CAP` compilation.
+/// Every f32 dot's results on one input set, through a `Dots` resolved in the `CAP` compilation.
 fn float_dots<const CAP: bool>(n: usize, seed: usize) -> Vec<f32> {
     let a = float_vec(seed, n);
     let bs: [Vec<f32>; 4] = std::array::from_fn(|k| float_vec(seed + 1 + k, n));
@@ -595,14 +595,26 @@ fn float_dots<const CAP: bool>(n: usize, seed: usize) -> Vec<f32> {
     let bf16: Vec<u8> = (bs[1].iter())
         .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
         .collect();
-    let mut out = vec![dot::<CAP>(&a, &bs[0])];
-    out.extend(dot_n::<CAP, 4>(&a, br));
-    out.extend(dot_mn::<CAP, 2, 4>([&a, &a2], br).into_iter().flatten());
-    out.push(dot_f16::<CAP>(&f16, &a));
-    out.push(dot_bf16::<CAP>(&bf16, &a));
+    let mut out = vec![Dots::resolve::<CAP>().dot(&a, &bs[0])];
+    out.extend(Dots::resolve::<CAP>().dot_n(&a, br));
+    out.extend(
+        Dots::resolve::<CAP>()
+            .dot_mn([&a, &a2], br)
+            .into_iter()
+            .flatten(),
+    );
+    out.push(Dots::resolve::<CAP>().dot_f16(&f16, &a));
+    out.push(Dots::resolve::<CAP>().dot_bf16(&bf16, &a));
     let mut o = a2.clone();
-    axpy::<CAP>(&mut o, &bs[2], X);
+    Dots::resolve::<CAP>().axpy(&mut o, &bs[2], X);
     out.extend(o);
+    let mut o = a2.clone();
+    Dots::resolve::<CAP>().mul_add_into(&mut o, &bs[3], &a);
+    out.extend(o);
+    // The f16 KV write's narrowing, its bits carried as small f32 values.
+    let mut h = vec![0u16; n];
+    Dots::resolve::<CAP>().f16_from_f32(&mut h, &bs[3]);
+    out.extend(h.iter().map(|&b| b as f32));
     out
 }
 
@@ -630,7 +642,15 @@ fn dequant_dots<const CAP: bool>(in_f: usize) -> Vec<f32> {
         for row in w.chunks(w.len() / ROWS) {
             let mut col = [0f32; 3];
             let mut accs = Vec::new();
-            crate::dequant_row::dequant_dot_rows::<CAP>(row, dt, &x, in_f, &mut col, &mut accs);
+            crate::dequant_row::dequant_dot_rows(
+                Dots::resolve::<CAP>(),
+                row,
+                dt,
+                &x,
+                in_f,
+                &mut col,
+                &mut accs,
+            );
             out.extend(col);
         }
     }
@@ -746,48 +766,58 @@ fn float_dots_are_fused_at_every_tier() {
             .collect();
         check(&format!("dot n {n}"), &|cap| {
             vec![if cap {
-                dot::<true>(&a, &b)
+                Dots::resolve::<true>().dot(&a, &b)
             } else {
-                dot::<false>(&a, &b)
+                Dots::resolve::<false>().dot(&a, &b)
             }]
         });
         check(&format!("dot_n n {n}"), &|cap| {
             if cap {
-                dot_n::<true, 2>(&a, [&b, &b]).to_vec()
+                Dots::resolve::<true>().dot_n(&a, [&b, &b]).to_vec()
             } else {
-                dot_n::<false, 2>(&a, [&b, &b]).to_vec()
+                Dots::resolve::<false>().dot_n(&a, [&b, &b]).to_vec()
             }
         });
         check(&format!("dot_mn n {n}"), &|cap| {
             let r = if cap {
-                dot_mn::<true, 2, 3>([&a, &a], [&b, &b, &b])
+                Dots::resolve::<true>().dot_mn([&a, &a], [&b, &b, &b])
             } else {
-                dot_mn::<false, 2, 3>([&a, &a], [&b, &b, &b])
+                Dots::resolve::<false>().dot_mn([&a, &a], [&b, &b, &b])
             };
             r.into_iter().flatten().collect()
         });
         check(&format!("dot_f16 n {n}"), &|cap| {
             vec![if cap {
-                dot_f16::<true>(&wf16, &b)
+                Dots::resolve::<true>().dot_f16(&wf16, &b)
             } else {
-                dot_f16::<false>(&wf16, &b)
+                Dots::resolve::<false>().dot_f16(&wf16, &b)
             }]
         });
         check(&format!("dot_bf16 n {n}"), &|cap| {
             vec![if cap {
-                dot_bf16::<true>(&wbf16, &b)
+                Dots::resolve::<true>().dot_bf16(&wbf16, &b)
             } else {
-                dot_bf16::<false>(&wbf16, &b)
+                Dots::resolve::<false>().dot_bf16(&wbf16, &b)
             }]
         });
     }
+    check("mul_add_into", &|cap| {
+        let mut o = vec![-1f32; 19];
+        let (v, e) = (vec![W; 19], vec![X; 19]);
+        if cap {
+            Dots::resolve::<true>().mul_add_into(&mut o, &v, &e);
+        } else {
+            Dots::resolve::<false>().mul_add_into(&mut o, &v, &e);
+        }
+        o
+    });
     check("axpy", &|cap| {
         let mut o = vec![-1f32; 19];
         let v = vec![W; 19];
         if cap {
-            axpy::<true>(&mut o, &v, X);
+            Dots::resolve::<true>().axpy(&mut o, &v, X);
         } else {
-            axpy::<false>(&mut o, &v, X);
+            Dots::resolve::<false>().axpy(&mut o, &v, X);
         }
         o
     });
@@ -800,7 +830,8 @@ fn float_dots_are_fused_at_every_tier() {
     check("dequant_dot_rows Q8_0", &|cap| {
         let (mut col, mut accs) = ([0f32; 1], Vec::new());
         if cap {
-            crate::dequant_row::dequant_dot_rows::<true>(
+            crate::dequant_row::dequant_dot_rows(
+                Dots::resolve::<true>(),
                 &blk,
                 DType::Q8_0,
                 &x,
@@ -809,7 +840,8 @@ fn float_dots_are_fused_at_every_tier() {
                 &mut accs,
             );
         } else {
-            crate::dequant_row::dequant_dot_rows::<false>(
+            crate::dequant_row::dequant_dot_rows(
+                Dots::resolve::<false>(),
                 &blk,
                 DType::Q8_0,
                 &x,
@@ -820,9 +852,12 @@ fn float_dots_are_fused_at_every_tier() {
         }
         col.to_vec()
     });
-    // 5 dots at 2 lengths (dot_n gives 2 values, dot_mn 6), axpy's 19, one dequant: per tier
-    // and compilation.
-    assert_eq!(checked, host.len() * 2 * (2 * (1 + 2 + 6 + 1 + 1) + 19 + 1));
+    // 5 dots at 2 lengths (dot_n gives 2 values, dot_mn 6), mul_add_into's and axpy's 19, one
+    // dequant: per tier and compilation.
+    assert_eq!(
+        checked,
+        host.len() * 2 * (2 * (1 + 2 + 6 + 1 + 1) + 19 + 19 + 1)
+    );
 }
 
 /// Median ns per element of each f32 dot, single thread, interleaved rounds: its scalar definition
@@ -851,14 +886,33 @@ fn bench_float_dots() {
     let q4k = weights(DType::Q4K, 4096, 3);
     let q4k_row = &q4k[..q4k.len() / ROWS];
     type Case<'a> = (&'a str, usize, Box<dyn Fn(bool) -> f32 + 'a>);
+    // Resolved once, as the interpreter does per graph.
+    let dots = Dots::resolve::<false>();
+    let src = &b[..];
     let cases: Vec<Case> = vec![
+        (
+            "f16_from_f32, 4096",
+            4096,
+            Box::new(|fast| {
+                let mut h = [0u16; 4096];
+                let x = black_box(src);
+                if fast {
+                    dots.f16_from_f32(&mut h, x)
+                } else {
+                    for (o, &v) in h.iter_mut().zip(x) {
+                        *o = half::f16::from_f32(v).to_bits();
+                    }
+                }
+                black_box(&h)[7] as f32
+            }),
+        ),
         (
             "dot, 128",
             128,
             Box::new(|d| {
                 let (x, y) = (black_box(&a[..128]), black_box(&b[..128]));
                 if d {
-                    dot::<false>(x, y)
+                    dots.dot(x, y)
                 } else {
                     dot_scalar(x, y)
                 }
@@ -870,7 +924,7 @@ fn bench_float_dots() {
             Box::new(|d| {
                 let x = black_box(&a[..128]);
                 let r = if d {
-                    dot_n::<false, 4>(x, bs)
+                    dots.dot_n(x, bs)
                 } else {
                     dot_n_scalar(x, bs)
                 };
@@ -883,7 +937,7 @@ fn bench_float_dots() {
             Box::new(|d| {
                 let (w, x) = (black_box(&wf16[..]), black_box(&a[..]));
                 if d {
-                    dot_f16::<false>(w, x)
+                    dots.dot_f16(w, x)
                 } else {
                     dot_f16_scalar(w, x)
                 }
@@ -895,7 +949,7 @@ fn bench_float_dots() {
             Box::new(|d| {
                 let (w, x) = (black_box(&wbf16[..]), black_box(&a[..]));
                 if d {
-                    dot_bf16::<false>(w, x)
+                    dots.dot_bf16(w, x)
                 } else {
                     dot_bf16_scalar(w, x)
                 }
@@ -908,7 +962,7 @@ fn bench_float_dots() {
                 let mut o = [0f32; 128];
                 let v = black_box(&b[..128]);
                 if d {
-                    axpy::<false>(&mut o, v, 0.5)
+                    dots.axpy(&mut o, v, 0.5)
                 } else {
                     axpy_scalar(&mut o, v, 0.5)
                 }
@@ -922,7 +976,8 @@ fn bench_float_dots() {
                 let (mut col, mut accs) = ([0f32; 1], Vec::new());
                 let x = black_box(&a[..]);
                 if d {
-                    crate::dequant_row::dequant_dot_rows::<false>(
+                    crate::dequant_row::dequant_dot_rows(
+                        Dots::resolve::<false>(),
                         q4k_row,
                         DType::Q4K,
                         x,
@@ -964,4 +1019,122 @@ fn bench_float_dots() {
         };
         println!("{name:30} {:8.4} | {:8.4}", med(&mut t[0]), med(&mut t[1]));
     }
+}
+
+// ─── the f16 KV write ──────────────────────────────────────────────────────────────────────────
+
+/// `Dots::f16_from_f32` against `half`'s software conversion (`from_f32_const`, which never uses
+/// F16C) on the inputs `xs`, at every tier and uncapped, in slices of awkward lengths. Returns
+/// `(compared, NaN inputs whose bits differ)` and panics on any non-NaN difference.
+fn f16_store_check(xs: &[f32]) -> (usize, usize) {
+    let want: Vec<u16> = xs
+        .iter()
+        .map(|&x| half::f16::from_f32_const(x).to_bits())
+        .collect();
+    let mut nan_diff = 0;
+    let host: Vec<SimdTier> = SimdTier::ALL
+        .into_iter()
+        .filter(|t| t.supported())
+        .collect();
+    // Each tier this CPU has, capped, then `None`: the uncapped compilation.
+    let mut runs: Vec<Option<SimdTier>> = host.into_iter().map(Some).collect();
+    runs.push(None);
+    let run = |t: Option<SimdTier>, d: &mut [u16], x: &[f32]| match t {
+        Some(t) => {
+            with_tier(t, || Dots::resolve::<true>().f16_from_f32(d, x));
+        }
+        None => Dots::resolve::<false>().f16_from_f32(d, x),
+    };
+    let mut got = vec![0u16; xs.len()];
+    for &t in &runs {
+        // Lengths 13 and 8 leave a tail every way the 8-wide loop can.
+        let (mut at, mut k) = (0, 0);
+        while at < xs.len() {
+            let hi = (at + if k % 2 == 0 { 13 } else { 8 }).min(xs.len());
+            run(t, &mut got[at..hi], &xs[at..hi]);
+            (at, k) = (hi, k + 1);
+        }
+        for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+            if g != w {
+                assert!(
+                    xs[i].is_nan(),
+                    "f16 of {:#010x}: {g:#06x}, software {w:#06x}",
+                    xs[i].to_bits()
+                );
+                nan_diff += 1;
+            }
+        }
+    }
+    (xs.len() * runs.len(), nan_diff)
+}
+
+/// The f16 KV write gives `half`'s software bits on every awkward input: both zeros, the f16
+/// subnormal range and its rounding boundary, overflow to infinity and the largest finite value,
+/// exact halfway cases, infinities, and NaNs of several payloads. Turns red if the wide path
+/// rounds differently (another rounding mode, flushing subnormals) from the scalar one.
+#[test]
+fn f16_store_matches_half_on_awkward_values() {
+    let mut xs: Vec<f32> = vec![
+        0.0,
+        -0.0,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        65504.0,
+        65519.99,
+        65520.0,
+        -65520.0,
+    ];
+    for e in -26i32..=16 {
+        let b = 2f32.powi(e);
+        // The value, and the two halfway points around it at f16's 11-bit precision.
+        for m in [1.0f32, 1.0 + 1.0 / 2048.0, 1.0 + 3.0 / 2048.0, 1.5, 1.999] {
+            xs.push(b * m);
+            xs.push(-b * m);
+        }
+    }
+    for bits in [
+        0x7fc0_0000u32,
+        0x7f80_0001,
+        0x7fbf_ffff,
+        0xffc0_1234,
+        0x7fff_ffff,
+        0x7f80_2000,
+    ] {
+        xs.push(f32::from_bits(bits));
+    }
+    let (n, nan_diff) = f16_store_check(&xs);
+    eprintln!("f16 store: {n} conversions, {nan_diff} NaN results with other bits");
+    assert!(n > 0);
+}
+
+/// [`f16_store_matches_half_on_awkward_values`] over every one of the 2^32 f32 inputs. Prints how
+/// many NaN inputs gave other bits than the software conversion (any non-NaN difference fails).
+#[test]
+#[ignore = "exhaustive: 2^32 inputs at every tier, minutes"]
+fn f16_store_matches_half_on_every_f32() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (total, nans) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    const SPAN: u64 = 1 << 24;
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|sc| {
+        for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
+            sc.spawn(|| loop {
+                let k = next.fetch_add(1, Ordering::Relaxed) as u64;
+                if k * SPAN >= 1 << 32 {
+                    break;
+                }
+                let xs: Vec<f32> = (k * SPAN..(k + 1) * SPAN)
+                    .map(|b| f32::from_bits(b as u32))
+                    .collect();
+                let (n, d) = f16_store_check(&xs);
+                total.fetch_add(n, Ordering::Relaxed);
+                nans.fetch_add(d, Ordering::Relaxed);
+            });
+        }
+    });
+    eprintln!(
+        "f16 store: {} conversions over all 2^32 inputs, {} NaN results with other bits",
+        total.into_inner(),
+        nans.into_inner()
+    );
 }

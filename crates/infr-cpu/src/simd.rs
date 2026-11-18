@@ -105,10 +105,34 @@ pub(crate) fn vnni<const CAPPED: bool>() -> bool {
 /// VM) that reports AVX2 without them keeps every other AVX2 kernel and runs the dots' scalar
 /// code. Only a build whose target lacks FMA asks: where the target has it (`target-cpu=native`
 /// here), `mul_add` is already the instruction and the dots have no dispatch at all.
+///
+/// The CPU half of the answer is one cached flag ([`fma_cpu`]); callers ask once per graph or
+/// kernel task (`kernels::Dots::resolve`), never per dot.
 #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
 #[inline(always)]
 pub(crate) fn fma<const CAPPED: bool>() -> bool {
-    is_x86_feature_detected!("fma") && is_x86_feature_detected!("f16c") && avx2::<CAPPED>()
+    // `fma_cpu` includes AVX2, so the uncapped answer is the flag alone; under a ceiling the
+    // AVX2 tier must also be allowed (and is recorded, in test builds).
+    fma_cpu() && (!CAPPED || at_least(SimdTier::Avx2))
+}
+
+/// Whether the CPU has AVX2, FMA and F16C: detected once, then one relaxed load.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
+#[inline(always)]
+fn fma_cpu() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    /// 0 until detected, then 1 (absent) or 2 (present).
+    static FMA_CPU: AtomicU8 = AtomicU8::new(0);
+    match FMA_CPU.load(Ordering::Relaxed) {
+        0 => {
+            let ok = is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+                && is_x86_feature_detected!("f16c");
+            FMA_CPU.store(1 + ok as u8, Ordering::Relaxed);
+            ok
+        }
+        n => n == 2,
+    }
 }
 
 #[cfg(test)]

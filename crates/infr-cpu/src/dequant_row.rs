@@ -7,11 +7,9 @@
 //! token — the dominant cost of a CPU MoE decode. Every affine quant (the formats with a
 //! factored form) now decodes here a span at a time on the stack to the same bits (see
 //! [`decode_span`] for which formats share `bytes_to_f32`'s own decode and which have
-//! hand-written copies), and the dot keeps [`dot`]'s lane order.
+//! hand-written copies), and the dot keeps [`Dots::dot`]'s lane order.
 use crate::bytes_to_f32;
-#[cfg(doc)]
-use crate::kernels::dot;
-use crate::kernels::{dot_scalar, fma_twin};
+use crate::kernels::{dot_scalar, fma_twin, Dots};
 use infr_core::tensor::DType;
 use infr_gguf::dequant::{expand_factored, factor_block, has_factored_form, k4, rdf16};
 
@@ -25,15 +23,16 @@ const SPAN: usize = 256;
 /// formats) takes exactly that reference expression. `accs` is caller-owned scratch, reused
 /// across calls so a range of output rows allocates it once.
 ///
-/// Why it is the same sum: [`dot`] keeps 8 lanes, lane `i % 8` accumulating element `i` by FMA in
+/// Why it is the same sum: [`Dots::dot`] keeps 8 lanes, lane `i % 8` accumulating element `i` by FMA in
 /// increasing `i`, then folds the lanes with `iter().sum()` and finishes an `n % 8` tail serially.
 /// Every span here is a whole number of quant blocks (each a multiple of 16 elements), so walking
 /// the spans in order hands each lane the same FMAs in the same order, the lanes are folded by the
 /// same expression, and there is no tail.
 ///
-/// Like [`dot`] it dispatches to an FMA compilation on builds without FMA
-/// (`crate::simd::fma`): the same expression, so the same bits.
-pub(crate) fn dequant_dot_rows<const CAP: bool>(
+/// Like [`Dots::dot`] it runs the FMA compilation `dots` selects: the same expression, so the
+/// same bits.
+pub(crate) fn dequant_dot_rows(
+    dots: Dots,
     row: &[u8],
     dt: DType,
     xin: &[f32],
@@ -42,10 +41,11 @@ pub(crate) fn dequant_dot_rows<const CAP: bool>(
     accs: &mut Vec<[f32; 8]>,
 ) {
     #[cfg(all(target_arch = "x86_64", not(target_feature = "fma")))]
-    if crate::simd::fma::<CAP>() {
-        // SAFETY: AVX2, FMA and F16C detected (`simd::fma`).
+    if dots.fma() {
+        // SAFETY: `Dots` selects FMA only after `simd::fma` found AVX2, FMA and F16C.
         return unsafe { dequant_dot_rows_fma(row, dt, xin, in_f, col, accs) };
     }
+    let _ = dots;
     dequant_dot_rows_scalar(row, dt, xin, in_f, col, accs)
 }
 
@@ -371,7 +371,15 @@ mod tests {
         let x = xs(count * in_f, seed);
         let mut got = vec![0f32; count];
         let mut accs = Vec::new();
-        dequant_dot_rows::<false>(row, dt, &x, in_f, &mut got, &mut accs);
+        dequant_dot_rows(
+            Dots::resolve::<false>(),
+            row,
+            dt,
+            &x,
+            in_f,
+            &mut got,
+            &mut accs,
+        );
         let mut finite = 0;
         for (r, g) in got.iter().enumerate() {
             let want = dot_scalar(&wf, &x[r * in_f..r * in_f + in_f]);
@@ -458,7 +466,15 @@ mod tests {
     #[test]
     fn dequant_dot_rows_with_no_rows_is_a_no_op() {
         let mut accs = vec![[1f32; 8]; 3];
-        dequant_dot_rows::<false>(&[0u8; 3], DType::Q4K, &[], 256, &mut [], &mut accs);
+        dequant_dot_rows(
+            Dots::resolve::<false>(),
+            &[0u8; 3],
+            DType::Q4K,
+            &[],
+            256,
+            &mut [],
+            &mut accs,
+        );
         assert_eq!(accs.len(), 3, "scratch untouched");
     }
 }

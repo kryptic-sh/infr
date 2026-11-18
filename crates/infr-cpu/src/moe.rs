@@ -4,9 +4,8 @@
 use crate::dequant_row::dequant_dot_rows;
 use crate::f32_row;
 use crate::kernels::{
-    dot, dot_bf16, dot_f16, dot_n, vec_dot_q32_batch8, vec_dot_q4k_batch, vec_dot_q4k_batch8,
-    vec_dot_q5_0_32_batch, vec_dot_q5k_batch, vec_dot_q6k_batch, vec_dot_q8_0_32_batch,
-    vec_dot_q8_0_batch,
+    vec_dot_q32_batch8, vec_dot_q4k_batch, vec_dot_q4k_batch8, vec_dot_q5_0_32_batch,
+    vec_dot_q5k_batch, vec_dot_q6k_batch, vec_dot_q8_0_32_batch, vec_dot_q8_0_batch, Dots,
 };
 use crate::quant::{Q8x32, Q8};
 use crate::repack::{packed_min_tokens, Q4kPack};
@@ -182,6 +181,7 @@ pub(crate) fn expert_gemm_range<const CAP: bool>(
             }
         }
         ExpertActs::Raw(xin) => {
+            let dots = Dots::resolve::<CAP>();
             // f32 dots against raw activation rows: identical math to the old fallback (the
             // weight row is dequantized ONCE, reused across all rows), o-major placement. The
             // quant arm is `dequant_dot_rows`: the same bits without materializing the row.
@@ -198,24 +198,24 @@ pub(crate) fn expert_gemm_range<const CAP: bool>(
                         let (quads, tail) = col.as_chunks_mut::<4>();
                         for (q, dst) in quads.iter_mut().enumerate() {
                             let xs: [&[f32]; 4] = std::array::from_fn(|k| x_row(4 * q + k));
-                            *dst = dot_n::<CAP, 4>(&w32, xs);
+                            *dst = dots.dot_n(&w32, xs);
                         }
                         let done = count / 4 * 4;
                         for (k, dst) in tail.iter_mut().enumerate() {
-                            *dst = dot::<CAP>(&w32, x_row(done + k));
+                            *dst = dots.dot(&w32, x_row(done + k));
                         }
                     }
                     DType::F16 => {
                         for (r, dst) in col.iter_mut().enumerate() {
-                            *dst = dot_f16::<CAP>(row, &xin[r * in_f..r * in_f + in_f]);
+                            *dst = dots.dot_f16(row, &xin[r * in_f..r * in_f + in_f]);
                         }
                     }
                     DType::Bf16 => {
                         for (r, dst) in col.iter_mut().enumerate() {
-                            *dst = dot_bf16::<CAP>(row, &xin[r * in_f..r * in_f + in_f]);
+                            *dst = dots.dot_bf16(row, &xin[r * in_f..r * in_f + in_f]);
                         }
                     }
-                    _ => dequant_dot_rows::<CAP>(row, dt, xin, in_f, col, &mut accs),
+                    _ => dequant_dot_rows(dots, row, dt, xin, in_f, col, &mut accs),
                 }
             }
         }

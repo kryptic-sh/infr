@@ -6,7 +6,7 @@
 //! sequence of floating-point operations (the head sum in ascending head order over `dot`'s
 //! value), and the selection keeps the same keys in the same order, ties to the lower index.
 
-use crate::kernels::{dot, dot_mn, dot_n};
+use crate::kernels::Dots;
 use crate::pool::SpinPool;
 
 /// The indexer's key rows, one `head_dim`-wide row per key, read in place when they are f16 and
@@ -17,11 +17,11 @@ pub(crate) enum Keys<'a> {
     F32(&'a [f32]),
 }
 
-/// Keys a scoring task scores together through [`dot_n`], so the core has that many independent
+/// Keys a scoring task scores together through [`Dots::dot_n`], so the core has that many independent
 /// FMA chains in flight.
 const KEYS: usize = 4;
 
-/// Query heads a scoring task dots against the same keys together through [`dot_mn`].
+/// Query heads a scoring task dots against the same keys together through [`Dots::dot_mn`].
 const HEADS: usize = 4;
 
 /// Fewest multiply-adds one scoring task does. A task that does less costs more to hand to a
@@ -67,6 +67,7 @@ pub(crate) fn score<const CAP: bool>(
     sc.clear();
     sc.resize(n * rows, 0.0);
     let per = task_keys(pool.threads(), n, rows, nh, hd);
+    let dots = Dots::resolve::<CAP>();
     pool.for_chunks_mut(&mut sc, per * rows, 1, &|c, piece| {
         let (j0, nk) = (c * per, piece.len() / rows);
         // Keys are widened one group at a time, so the group and every query head stay in L1
@@ -98,7 +99,7 @@ pub(crate) fn score<const CAP: bool>(
                     let blocked = nh - nh % HEADS;
                     for h0 in (0..blocked).step_by(HEADS) {
                         let d: [[f32; KEYS]; HEADS] =
-                            dot_mn::<CAP, HEADS, KEYS>(std::array::from_fn(|m| qh(h0 + m)), ks);
+                            dots.dot_mn(std::array::from_fn(|m| qh(h0 + m)), ks);
                         for (m, d) in d.iter().enumerate() {
                             for (a, &d) in acc.iter_mut().zip(d) {
                                 *a += (w[h0 + m] * scale) * d.max(0.0);
@@ -106,7 +107,7 @@ pub(crate) fn score<const CAP: bool>(
                         }
                     }
                     for h in blocked..nh {
-                        let d: [f32; KEYS] = dot_n::<CAP, KEYS>(qh(h), ks);
+                        let d: [f32; KEYS] = dots.dot_n(qh(h), ks);
                         for (a, d) in acc.iter_mut().zip(d) {
                             *a += (w[h] * scale) * d.max(0.0);
                         }
@@ -118,7 +119,7 @@ pub(crate) fn score<const CAP: bool>(
                     for i in 0..m {
                         let mut a = 0f32;
                         for h in 0..nh {
-                            a += (w[h] * scale) * dot::<CAP>(qh(h), key(i)).max(0.0);
+                            a += (w[h] * scale) * dots.dot(qh(h), key(i)).max(0.0);
                         }
                         piece[out(i)] = a;
                     }

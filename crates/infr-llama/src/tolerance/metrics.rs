@@ -5,12 +5,12 @@
 
 use infr_core::math;
 
-/// The share of the reference's probability mass [`RowScore::topk_cos`] covers: the smallest set
-/// of the reference's most probable tokens whose probabilities sum to at least this.
+/// The share of a row's probability mass its top set holds, for [`RowScore::topk_cos`]: the
+/// smallest set of the row's most probable tokens whose probabilities sum to at least this.
 pub const TOPK_MASS: f64 = 0.99;
 
-/// The most tokens [`RowScore::topk_cos`] covers, whatever mass they hold: a near-flat row (a
-/// synthetic model's, or a position the model has no idea about) would otherwise take most of the
+/// The most tokens one row's top set takes, whatever mass they hold: a near-flat row (a synthetic
+/// model's, or a position the model has no idea about) would otherwise take most of the
 /// vocabulary, which is the whole-vocabulary cosine B60 showed cannot separate a match from a
 /// mismatch.
 pub const TOPK_MAX: usize = 64;
@@ -22,9 +22,14 @@ pub struct RowScore {
     /// sampling from the test row where the reference was meant. Zero for identical rows and for
     /// rows that differ by a constant (softmax is shift-invariant).
     pub kl: f64,
-    /// The cosine between the two rows' PROBABILITIES over the reference's top tokens (see
-    /// [`TOPK_MASS`] and [`TOPK_MAX`]): 1 when the test row puts its mass where the reference does,
-    /// in the same proportions.
+    /// The cosine between the two rows' PROBABILITY vectors over the union of both rows' top sets
+    /// (see [`TOPK_MASS`] and [`TOPK_MAX`]), each vector extended by one component holding all of
+    /// its row's mass outside that union. 1 exactly when the two rows give the same probability to
+    /// every token of the union and the same mass to the rest; mass the test row moves out of the
+    /// reference's top set, or onto tokens the reference ranks low, lowers it, also when the
+    /// reference's top set is a single token. A secondary metric: KL sees everything it sees, and
+    /// it is reported so a distance concentrated in the top tokens can be told from one in the
+    /// tail.
     pub topk_cos: f64,
     /// The largest absolute difference between the two rows after each is centred on its own
     /// mean, divided by the reference row's range (max − min). Centring makes it shift-invariant;
@@ -85,18 +90,23 @@ fn check_finite(row: &[f32], which: &'static str) -> Result<(), RowError> {
     }
 }
 
-/// The row's probabilities, in f64. Each exponential is `infr_core::math::exp`'s (the workspace
-/// takes no math from the platform library, `docs/plan/11-cpu-bit-identical.md`), of the f32
-/// nearest `x - max`: a relative error near 2^-23 per probability, far below any distance a
-/// tolerance is set at, and normalized away from the sum.
-fn softmax(row: &[f32]) -> Vec<f64> {
+/// The row's probabilities in f64, and its log-sum-exp. Each exponential is
+/// `infr_core::math::exp`'s (the workspace takes no math from the platform library,
+/// `docs/plan/11-cpu-bit-identical.md`), of the f32 nearest `x - max`: a relative error near 2^-23
+/// per probability, far below any distance a tolerance is set at, and normalized away from the
+/// sum. A token more than about 104 below the row's maximum underflows to probability 0 here;
+/// [`kl_divergence`] does not rely on these probabilities for such tokens.
+fn softmax(row: &[f32]) -> (Vec<f64>, f64) {
     let max = row.iter().fold(f64::NEG_INFINITY, |a, &v| a.max(v as f64));
     let w: Vec<f64> = row
         .iter()
         .map(|&v| math::exp((v as f64 - max) as f32) as f64)
         .collect();
     let s: f64 = w.iter().sum();
-    w.iter().map(|x| x / s).collect()
+    // `s` is at least 1 (the maximum's own term) and at most the vocabulary size, so its f32
+    // logarithm loses nothing a tolerance can see.
+    let lse = max + math::ln(s as f32) as f64;
+    (w.iter().map(|x| x / s).collect(), lse)
 }
 
 /// Below this magnitude [`expm1`] sums its Taylor series.
@@ -121,24 +131,41 @@ fn expm1(x: f64) -> f64 {
     }
 }
 
-/// KL(p ‖ q) for two logit rows `r` and `t` whose probabilities under the reference are `p`.
+/// KL(p ‖ q) for two logit rows `r` and `t` whose probabilities under the reference are `p`, the
+/// reference row's log-sum-exp being `lse_r`.
 ///
 /// With `e = t - r`, `q_i = p_i e^{e_i} / Σ_j p_j e^{e_j}`, so `KL = ln E_p[e^e] - E_p[e]`, and
 /// for any constant `c`, `KL = ln(1 + E_p[e^{e-c} - 1]) - E_p[e - c]`. Taking `c` near `E_p[e]`
 /// leaves only the small deviations `e - c`, whose `e^x - 1` [`expm1`] gets to full relative
 /// precision, so two rows a rounding apart score a KL of their real size rather than of the
-/// sum's rounding. A row whose deviations reach the f32 exponential's overflow is far beyond any
-/// tolerance; it is scored as infinite.
-fn kl_divergence(p: &[f64], r: &[f32], t: &[f32]) -> f64 {
+/// sum's rounding. A reference token whose probability underflowed in [`softmax`] still counts in
+/// the normalizer: its term `p_i e^{e_i - c}` is `e^{t_i - lse_r - c}`, taken directly, so a test
+/// row that promotes such a token is charged for it. A term whose exponent reaches the f32
+/// exponential's overflow is far beyond any tolerance; the row is scored as infinite.
+fn kl_divergence(p: &[f64], lse_r: f64, r: &[f32], t: &[f32]) -> f64 {
     let e = |i: usize| t[i] as f64 - r[i] as f64;
     let mass: f64 = p.iter().sum();
     let c = (0..p.len()).map(|i| p[i] * e(i)).sum::<f64>() / mass;
-    if (0..p.len()).any(|i| p[i] > 0.0 && e(i) - c > OVERFLOW_ARG) {
+    // The exponent of token `i`'s term `p_i e^{e_i - c}`, relative to 0.
+    let exponent = |i: usize| {
+        if p[i] > 0.0 {
+            e(i) - c
+        } else {
+            t[i] as f64 - lse_r - c
+        }
+    };
+    if (0..p.len()).any(|i| exponent(i) > OVERFLOW_ARG) {
         return f64::INFINITY;
     }
     let a: f64 = (0..p.len())
-        .filter(|&i| p[i] > 0.0)
-        .map(|i| p[i] * expm1(e(i) - c))
+        .map(|i| {
+            if p[i] > 0.0 {
+                p[i] * expm1(e(i) - c)
+            } else {
+                // `p_i (e^{e_i - c} - 1)` with `p_i` below f32's range: the `- p_i` is nothing.
+                math::exp(exponent(i) as f32) as f64
+            }
+        })
         .sum();
     let b: f64 = (0..p.len()).map(|i| p[i] * (e(i) - c)).sum();
     // Non-negative in exact arithmetic (Jensen); rounding can leave a tiny negative for rows
@@ -155,6 +182,30 @@ fn argmax(row: &[f32]) -> usize {
     (0..row.len()).fold(0, |b, i| if row[i] > row[b] { i } else { b })
 }
 
+/// A row's top set: its most probable tokens, most probable first (index order on ties, so it is
+/// deterministic), until they hold [`TOPK_MASS`] or [`TOPK_MAX`] is reached. Only the first
+/// `TOPK_MAX` of that order can be read, so they are selected (linear in the vocabulary) and only
+/// they are sorted.
+fn top_set(row: &[f32], probs: &[f64]) -> Vec<usize> {
+    let by_rank = |&a: &usize, &b: &usize| row[b].total_cmp(&row[a]).then(a.cmp(&b));
+    let mut order: Vec<usize> = (0..row.len()).collect();
+    if row.len() > TOPK_MAX {
+        order.select_nth_unstable_by(TOPK_MAX - 1, by_rank);
+        order.truncate(TOPK_MAX);
+    }
+    order.sort_by(by_rank);
+    let mut mass = 0.0;
+    let take = order
+        .iter()
+        .position(|&i| {
+            mass += probs[i];
+            mass >= TOPK_MASS
+        })
+        .map_or(order.len(), |k| k + 1);
+    order.truncate(take);
+    order
+}
+
 /// Score `test` against `reference`, two logit rows over the same vocabulary.
 pub fn score_row(reference: &[f32], test: &[f32]) -> Result<RowScore, RowError> {
     if reference.len() != test.len() {
@@ -169,38 +220,28 @@ pub fn score_row(reference: &[f32], test: &[f32]) -> Result<RowScore, RowError> 
     check_finite(reference, "reference")?;
     check_finite(test, "test")?;
     let n = reference.len();
-    let (pr, pt) = (softmax(reference), softmax(test));
-    let kl = kl_divergence(&pr, reference, test);
+    let ((pr, lse_r), (pt, _)) = (softmax(reference), softmax(test));
+    let kl = kl_divergence(&pr, lse_r, reference, test);
 
-    // The reference's top tokens, most probable first (index order on ties, so it is
-    // deterministic), until they hold `TOPK_MASS` or `TOPK_MAX` is reached.
-    // Only the first `TOPK_MAX` of that order are ever read, so select them (linear in the
-    // vocabulary) and sort only those.
-    let by_rank = |&a: &usize, &b: &usize| reference[b].total_cmp(&reference[a]).then(a.cmp(&b));
-    let mut order: Vec<usize> = (0..n).collect();
-    if n > TOPK_MAX {
-        order.select_nth_unstable_by(TOPK_MAX - 1, by_rank);
-        order.truncate(TOPK_MAX);
-    }
-    order.sort_by(by_rank);
-    let (mut dot, mut nr, mut nt, mut mass) = (0f64, 0f64, 0f64, 0f64);
-    for &i in order.iter().take(TOPK_MAX) {
+    let mut union = top_set(reference, &pr);
+    union.extend(top_set(test, &pt));
+    union.sort_unstable();
+    union.dedup();
+    let (mut dot, mut nr, mut nt, mut mr, mut mt) = (0f64, 0f64, 0f64, 0f64, 0f64);
+    for &i in &union {
         let (p, q) = (pr[i], pt[i]);
         dot += p * q;
         nr += p * p;
         nt += q * q;
-        mass += p;
-        if mass >= TOPK_MASS {
-            break;
-        }
+        mr += p;
+        mt += q;
     }
-    // The test row can put no mass at all on the reference's top tokens (every probability
-    // underflowing): that is as far apart as two rows get.
-    let topk_cos = if nt > 0.0 {
-        dot / (nr.sqrt() * nt.sqrt())
-    } else {
-        0.0
-    };
+    // The rest of each row's mass, as one more component.
+    let (rr, rt) = ((1.0 - mr).max(0.0), (1.0 - mt).max(0.0));
+    dot += rr * rt;
+    nr += rr * rr;
+    nt += rt * rt;
+    let topk_cos = dot / (nr.sqrt() * nt.sqrt());
 
     let mean = |row: &[f32]| row.iter().map(|&v| v as f64).sum::<f64>() / n as f64;
     let (mr, mt) = (mean(reference), mean(test));
@@ -632,6 +673,60 @@ mod tests {
         assert!(close(s.topk_cos, 1.0, 1e-9), "{}", s.topk_cos);
         assert!(s.logit_dev > 0.4, "{}", s.logit_dev);
         assert!(s.kl > 0.0);
+    }
+
+    /// KL in f64 from the logits, for the probes below: the closed form with the platform's f64
+    /// exponential (test code), which underflows nowhere these rows reach.
+    fn kl_exact(r: &[f32], t: &[f32]) -> f64 {
+        let lse = |v: &[f32]| {
+            let m = v.iter().fold(f64::NEG_INFINITY, |a, &x| a.max(x as f64));
+            m + v.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln()
+        };
+        let (lr, lt) = (lse(r), lse(t));
+        r.iter()
+            .zip(t)
+            .map(|(&a, &b)| (a as f64 - lr).exp() * ((a as f64 - lr) - (b as f64 - lt)))
+            .sum()
+    }
+
+    /// A reference whose top-1 holds nearly all the mass has a one-token top set; the cosine must
+    /// still see a test row that moves that mass elsewhere (SmolLM3's position-0 row: KL 4.88).
+    #[test]
+    fn topk_cosine_sees_a_one_token_reference_overturned() {
+        let mut r = vec![0.0f32; 100];
+        r[0] = 8.0;
+        let mut t = r.clone();
+        t[0] = 0.0;
+        t[7] = 1.5;
+        let s = score_row(&r, &t).unwrap();
+        assert!(s.kl > 1.0, "{}", s.kl);
+        assert!(s.topk_cos < 0.5, "{}", s.topk_cos);
+    }
+
+    /// Mass that leaves the reference's top set for the tail lowers the cosine through the rest
+    /// component, even though the top set's own proportions are unchanged.
+    #[test]
+    fn topk_cosine_sees_mass_leaving_the_top_set() {
+        let mut r = vec![-30.0f32; 1000];
+        r[0] = 10.0;
+        let mut t = vec![0.0f32; 1000];
+        t[0] = 6.9;
+        let s = score_row(&r, &t).unwrap();
+        // About half the test row's mass is on the 999 tail tokens.
+        assert!(s.kl > 0.5, "{}", s.kl);
+        assert!(s.topk_cos < 0.9, "{}", s.topk_cos);
+    }
+
+    /// A test row that promotes a token the reference's f32 softmax underflows (more than 104
+    /// below its maximum) is charged for it.
+    #[test]
+    fn a_promoted_underflowing_token_is_charged() {
+        let r = [0.0f32, -110.0, -5.0, -6.0];
+        let t = [0.0f32, 5.0, -5.0, -6.0];
+        let want = kl_exact(&r, &t);
+        assert!(want > 4.0, "{want}");
+        let s = score_row(&r, &t).unwrap();
+        assert!(close(s.kl, want, want * 1e-6), "{} vs {want}", s.kl);
     }
 
     #[test]

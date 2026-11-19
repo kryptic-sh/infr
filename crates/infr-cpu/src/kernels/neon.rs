@@ -160,18 +160,40 @@ fn q4k_codes(qs: &[u8], out: &mut [i8]) {
     }
 }
 
+/// A Q4_K super-block's scales, unpacked once per weight row: `d`, `dmin`, and the eight
+/// 6-bit sub-block scales and mins (`k4`, `0..=63`).
+#[derive(Clone, Copy)]
+struct Q4kScales {
+    d: f32,
+    dmin: f32,
+    sc: [i32; 8],
+    m: [i32; 8],
+}
+
+impl Q4kScales {
+    /// The scales of the Q4_K block `blk` (its first 16 bytes are read).
+    #[inline]
+    fn of(blk: &[u8]) -> Self {
+        let scales = &blk[4..16];
+        Q4kScales {
+            d: rdf16(&blk[0..2]),
+            dmin: rdf16(&blk[2..4]),
+            sc: std::array::from_fn(|s| k4(s, scales).0 as i32),
+            m: std::array::from_fn(|s| k4(s, scales).1 as i32),
+        }
+    }
+}
+
 /// A Q4_K super-block's term, the scalar kernel's lines on its eight sub-block dots `iprod`
 /// (each within ±32·15·128 < 2^16, so `sd` and `sm` stay within ±8·63·2^16 < 2^25).
 #[inline]
-fn q4k_block(blk: &[u8], q8: &Q8, b: usize, iprod: &[i32; 8]) -> f32 {
-    let (d, dmin, scales) = (rdf16(&blk[0..2]), rdf16(&blk[2..4]), &blk[4..16]);
+fn q4k_block(k: &Q4kScales, q8: &Q8, b: usize, iprod: &[i32; 8]) -> f32 {
     let (mut sd, mut sm) = (0i32, 0i32);
     for s in 0..8usize {
-        let (sc, m) = k4(s, scales);
-        sd += sc as i32 * iprod[s];
-        sm += m as i32 * q8.bsums[b * 8 + s];
+        sd += k.sc[s] * iprod[s];
+        sm += k.m[s] * q8.bsums[b * 8 + s];
     }
-    q8.d[b] * (d * sd as f32 - dmin * sm as f32)
+    q8.d[b] * (k.d * sd as f32 - k.dmin * sm as f32)
 }
 
 /// `vec_dot_q4k` at the `dotprod` tier.
@@ -183,20 +205,21 @@ pub(super) fn vec_dot_q4k(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let blk = &row[b * 144..b * 144 + 144];
         q4k_codes(&blk[16..144], &mut w);
         let [iprod] = dots32::<1>(&w, [act(q8, b)]);
-        sumf += q4k_block(blk, q8, b, &iprod);
+        sumf += q4k_block(&Q4kScales::of(blk), q8, b, &iprod);
     }
     sumf
 }
 
-/// `N` activation rows against a Q4_K row whose codes are decoded in `w`.
+/// `N` activation rows against a Q4_K row whose codes are decoded in `w` and whose blocks'
+/// scales are `ks`.
 #[inline]
 #[target_feature(enable = "neon,dotprod")]
-fn q4k_tile<const N: usize>(row: &[u8], w: &[i8], q: [&Q8; N]) -> [f32; N] {
+fn q4k_tile<const N: usize>(ks: &[Q4kScales], w: &[i8], q: [&Q8; N]) -> [f32; N] {
     let mut sumf = [0f32; N];
-    for b in 0..w.len() / 256 {
+    for (b, k) in ks.iter().enumerate() {
         let iprod = dots32::<N>(&w[b * 256..b * 256 + 256], q.map(|q| act(q, b)));
         for t in 0..N {
-            sumf[t] += q4k_block(&row[b * 144..b * 144 + 16], q[t], b, &iprod[t]);
+            sumf[t] += q4k_block(k, q[t], b, &iprod[t]);
         }
     }
     sumf
@@ -207,13 +230,13 @@ fn q4k_tile<const N: usize>(row: &[u8], w: &[i8], q: [&Q8; N]) -> [f32; N] {
 pub(super) fn vec_dot_q4k_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut [f32]) {
     let nb = in_f / 256;
     let mut w = vec![0i8; nb * 256];
+    let mut ks = Vec::with_capacity(nb);
     for b in 0..nb {
-        q4k_codes(
-            &row[b * 144 + 16..b * 144 + 144],
-            &mut w[b * 256..b * 256 + 256],
-        );
+        let blk = &row[b * 144..b * 144 + 144];
+        q4k_codes(&blk[16..144], &mut w[b * 256..b * 256 + 256]);
+        ks.push(Q4kScales::of(blk));
     }
-    tiled!(q8s, out, q4k_tile(row, &w));
+    tiled!(q8s, out, q4k_tile(&ks, &w));
 }
 
 // ─── Q6_K ──────────────────────────────────────────────────────────────────────────────────────
@@ -312,13 +335,18 @@ fn q8_0_blocks(row: &[u8], b: usize) -> &[u8] {
     &row[b * 8 * Q8_0_BYTES..(b + 1) * 8 * Q8_0_BYTES]
 }
 
-/// Super-block `b`'s term of a Q8_0 dot, the scalar kernel's lines: `sumf += d8·d_w·iprod` for
+/// The weight scales `d_w` of super-block `blocks`' eight Q8_0 blocks, as f32 (exact).
+#[inline]
+fn q8_0_scales(blocks: &[u8]) -> [f32; 8] {
+    std::array::from_fn(|s| rdf16(&blocks[s * Q8_0_BYTES..s * Q8_0_BYTES + 2]))
+}
+
+/// A super-block's term of a Q8_0 dot, the scalar kernel's lines: `sumf += d8·d_w·iprod` for
 /// each of its eight blocks in order (`iprod[s]` within ±32·2^14 = 2^19).
 #[inline]
-fn q8_0_block(blocks: &[u8], d8: f32, iprod: &[i32; 8], mut sumf: f32) -> f32 {
+fn q8_0_block(d_w: &[f32; 8], d8: f32, iprod: &[i32; 8], mut sumf: f32) -> f32 {
     for s in 0..8 {
-        let d_w = rdf16(&blocks[s * Q8_0_BYTES..s * Q8_0_BYTES + 2]);
-        sumf += d8 * d_w * iprod[s] as f32;
+        sumf += d8 * d_w[s] * iprod[s] as f32;
     }
     sumf
 }
@@ -341,20 +369,21 @@ pub(super) fn vec_dot_q8_0(row: &[u8], q8: &Q8, in_f: usize) -> f32 {
         let mut iprod = [0i32; 8];
         iprod[..4].copy_from_slice(&hsum4([acc[0], acc[1], acc[2], acc[3]]));
         iprod[4..].copy_from_slice(&hsum4([acc[4], acc[5], acc[6], acc[7]]));
-        sumf = q8_0_block(blocks, q8.d[b], &iprod, sumf);
+        sumf = q8_0_block(&q8_0_scales(blocks), q8.d[b], &iprod, sumf);
     }
     sumf
 }
 
-/// `N` activation rows against a Q8_0 row whose codes are gathered in `w`.
+/// `N` activation rows against a Q8_0 row whose codes are gathered in `w` and whose
+/// super-blocks' weight scales are `dw`.
 #[inline]
 #[target_feature(enable = "neon,dotprod")]
-fn q8_0_tile<const N: usize>(row: &[u8], w: &[i8], q: [&Q8; N]) -> [f32; N] {
+fn q8_0_tile<const N: usize>(dw: &[[f32; 8]], w: &[i8], q: [&Q8; N]) -> [f32; N] {
     let mut sumf = [0f32; N];
-    for b in 0..w.len() / 256 {
+    for (b, d_w) in dw.iter().enumerate() {
         let iprod = dots32::<N>(&w[b * 256..b * 256 + 256], q.map(|q| act(q, b)));
         for t in 0..N {
-            sumf[t] = q8_0_block(q8_0_blocks(row, b), q[t].d[b], &iprod[t], sumf[t]);
+            sumf[t] = q8_0_block(d_w, q[t].d[b], &iprod[t], sumf[t]);
         }
     }
     sumf
@@ -371,5 +400,6 @@ pub(super) fn vec_dot_q8_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut 
             *c = x as i8;
         }
     }
-    tiled!(q8s, out, q8_0_tile(row, &w));
+    let dw: Vec<[f32; 8]> = (0..nb).map(|b| q8_0_scales(q8_0_blocks(row, b))).collect();
+    tiled!(q8s, out, q8_0_tile(&dw, &w));
 }

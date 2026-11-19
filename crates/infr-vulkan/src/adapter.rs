@@ -6691,10 +6691,7 @@ fn quant_linear(
                     out_f,
                 );
             }
-        } else if m == 1
-            && w.buffer.is_some()
-            && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off)
-        {
+        } else if m == 1 && w.buffer.is_some() && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off) {
             rec.linear_kq_fma(
                 dt,
                 w.buffer.expect("resident kq_fma weight"),

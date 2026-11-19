@@ -353,10 +353,12 @@ there (the packed layout is the VNNI kernels'); `docs/backlog.md` B206 lists
 them.
 
 **Speed**, scalar against `dotprod` on one machine. CI prints both figures on
-every run: the kernels as `kbench:` lines in the macOS test leg's "Kernel
-timings by SIMD tier" step, the whole model as `mbench:` lines in the separate
-`infr bench (macOS arm64 CPU, scalar vs NEON)` job, which never fails the
-workflow. On a Mac, from a checkout:
+every run, each line with a fixed prefix to `grep` for: the kernels as `kbench:`
+lines in the macOS test job (`cargo test (macos-15)`, step "Kernel timings by
+SIMD tier"), the whole model as `mbench:` lines in the separate
+`infr bench (macOS arm64 CPU, scalar vs NEON)` job. Both only report: a slow run
+fails neither, and the bench job never fails the workflow. On a Mac, from a
+checkout:
 
 ```sh
 # The kernels, every tier in one process.
@@ -376,28 +378,56 @@ in one process: 256 weight rows of 2048 elements against one activation row
 reporting each tier's median. For a batch kernel `ns/row` is per weight row and
 activation row pair, so the two kinds' absolute figures are comparable.
 
-The first run, CI's `macos-15` (GitHub-hosted Apple Silicon) runner on
-2026-11-19, release, commit `a9bbc3ed` (before the batch tiles' scale unpacking
-was hoisted out of the per-activation loop):
+Two runs so far, both on CI's `macos-15` (GitHub-hosted Apple Silicon) runner on
+2026-11-19, release. The first at commit `a9bbc3ed`, the second at `bd599f6a`
+(after the batch tiles' scale unpacking was hoisted out of the per-activation
+loop):
 
-| Kernel     | `scalar` ns/row | `dotprod` ns/row | `dotprod` / `scalar` speed |
-| ---------- | --------------: | ---------------: | -------------------------: |
-| q4k        |           450.9 |             81.3 |                      5.54x |
-| q6k        |          1546.8 |             86.5 |                     17.88x |
-| q8_0       |            74.8 |             61.4 |                      1.22x |
-| q4k_batch  |           196.5 |             76.6 |                      2.57x |
-| q6k_batch  |           237.5 |             51.5 |                      4.61x |
-| q8_0_batch |            85.6 |             50.8 |                      1.68x |
+| Kernel     | run 1 `scalar` ns/row | run 1 `dotprod` ns/row | run 1 speed | run 2 `scalar` ns/row | run 2 `dotprod` ns/row | run 2 speed |
+| ---------- | --------------------: | ---------------------: | ----------: | --------------------: | ---------------------: | ----------: |
+| q4k        |                 450.9 |                   81.3 |       5.54x |                 551.6 |                   72.3 |       7.63x |
+| q6k        |                1546.8 |                   86.5 |      17.88x |                2112.0 |                   91.8 |      23.00x |
+| q8_0       |                  74.8 |                   61.4 |       1.22x |                 127.9 |                   87.4 |       1.46x |
+| q4k_batch  |                 196.5 |                   76.6 |       2.57x |                 312.8 |                  103.0 |       3.04x |
+| q6k_batch  |                 237.5 |                   51.5 |       4.61x |                 284.6 |                   56.0 |       5.08x |
+| q8_0_batch |                  85.6 |                   50.8 |       1.68x |                  95.2 |                   74.8 |       1.27x |
 
-One run on a shared runner: the ratios are the result; the nanoseconds are not
-comparable across runs or machines. Q6_K gains most (17.9x one-row, 4.6x batch)
-because its scalar one-row kernel decodes the 6-bit codes slowly, element by
-element; Q4_K gains 5.5x and 2.6x; Q8_0 only 1.2x and 1.7x, its scalar kernel
-being a plain byte product the compiler already vectorizes well. The batch
-kernels are the ones prefill runs, so a model's prefill gain will be nearer the
-batch ratios, weighted by where its time goes (Q4_K_M is mostly Q4_K, with Q6_K
-for some tensors); decode runs the one-row kernels. The whole-model figure is
-the `mbench:` job's, not yet recorded here.
+Shared runners: the ratio within a run is the result; the nanoseconds are not
+comparable across runs or machines. The two runs show why: they ran on different
+runner sessions whose scalar baselines differ by 20 to 70% (450.9 against 551.6,
+1546.8 against 2112.0, 74.8 against 127.9 ns/row). Q6_K gains most (18 to 23x
+one-row, about 5x batch) because its scalar one-row kernel decodes the 6-bit
+codes slowly, element by element; Q4_K gains 5.5 to 7.6x one-row and 2.6 to 3.0x
+batch; Q8_0 gains little either way (1.2 to 1.5x one-row, 1.3 to 1.7x batch),
+its scalar kernel being a plain byte product the compiler already vectorizes
+well. Between the runs the Q4_K and Q6_K batch ratios rose (2.57 to 3.04, 4.61
+to 5.08), Q8_0's batch ratio fell (1.68 to 1.27) and its one-row ratio rose
+(1.22 to 1.46). With baselines moving this much from run to run, two runs cannot
+attribute those moves to the hoist: its own effect is unresolved by this data
+(`docs/backlog.md` B206 records the controlled comparison that would settle it).
+
+**Whole model**, the bench job of the second run: `unsloth/Qwen3-0.6B-GGUF`
+Q4_K_M, `infr bench --dev cpu`, release, three interleaved rounds of `-r 2`,
+`scalar` = `INFR_CPU_MAX_TIER=scalar`, `uncapped` = the `dotprod` tier, in
+tokens per second:
+
+| Test  | `scalar` rounds     | `uncapped` rounds     | Medians        | Ratio |
+| ----- | ------------------- | --------------------- | -------------- | ----: |
+| pp512 | 51.39, 54.07, 61.94 | 88.26, 101.80, 105.04 | 54.07 → 101.80 | 1.88x |
+| tg64  | 5.88, 8.45, 10.58   | 63.76, 78.30, 72.10   | 8.45 → 72.10   | 8.53x |
+
+On a shared GitHub Apple Silicon runner, one model, three rounds: decode about
+8.5x and prefill about 1.9x faster than with the scalar kernels. The scalar
+decode figures range from 5.88 to 10.58 t/s between rounds, so the decode ratio
+is roughly 7 to 11x, not a precise number. Decode runs the one-row kernels,
+where the ratios are largest. Prefill gains less, presumably (an inference, not
+measured: no per-op profile was taken) because aarch64 has no packed or tiled
+GEMM yet, so its batch kernels are the weaker ones, and the families still
+scalar and the work outside the int8 kernels take a larger share; about 100 t/s
+of pp512 on Qwen3-0.6B is low next to x86, which also points at the GEMM as
+where prefill time still is. B206 lists what is left. The job took about 11
+minutes, most of it the cold release build. A real Mac's numbers are requested
+on issue 100, with the commands above.
 
 ## The f32 dots on baseline builds: the FMA tier (plan 11 S6)
 

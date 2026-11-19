@@ -598,6 +598,8 @@ impl CpuBackend {
         match &hb {
             Some(hb) => self.pool().run(groups, &|g| {
                 gemm(g);
+                // One allocation per group task (`chunk_len` i32s: 16 per distinct element and block);
+                // the thread-local scratch (`moe::with_block_scratch`) holds f32s, so is not reused.
                 let mut tab = vec![0i32; hb.chunk_len()];
                 hb.for_group(wbytes, bpr, 8 * g, 8, &mut tab, |r, acc| {
                     // SAFETY: as the GEMM's stores: this task's group, rows `8g..8g + 8`.

@@ -219,6 +219,8 @@ impl<'a> HiBatch<'a> {
                 .expect("a whole chunk")
         };
         let e2 = 2 * self.elems.len();
+        // Every lane is computed, so the loop below runs whole vectors; lanes `n..` read whatever
+        // an earlier fill left in the chunk (or zeros), and their values are never used.
         acc.fill(0.0);
         for p in &self.parts[k] {
             let [(u1, c1), (u2, c2)] = p.codes;

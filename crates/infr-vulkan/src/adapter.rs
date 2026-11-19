@@ -6691,17 +6691,11 @@ fn quant_linear(
                     out_f,
                 );
             }
-        } else if m == 1 && w.buffer.is_some() && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off) {
-            rec.linear_kq_fma(
-                dt,
-                w.buffer.expect("resident kq_fma weight"),
-                w_off,
-                xb,
-                None,
-                y,
-                in_f,
-                out_f,
-            );
+        } else if let Some(wb) = w
+            .buffer
+            .filter(|_| m == 1 && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off))
+        {
+            rec.linear_kq_fma(dt, wb, w_off, xb, None, y, in_f, out_f);
         } else if m == 1
             && mmv_decode_enabled(&be_.cfg().kernels.vulkan)
             && be_.caps().i8_dot

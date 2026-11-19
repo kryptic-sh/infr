@@ -277,8 +277,15 @@ fn linear(dt: DType, m: usize, in_f: usize, out_f: usize, reference: bool) -> Ca
 /// Planted faults these rows are known to catch (2026-11-19): a split ratio one below the
 /// committed one at the scalar tier only (every 256-block `Linear spiky` case and both rows-9 MoE
 /// cases), a tier-dependent sparse dot, and a changed sparse sum in each prefill route and in the
-/// MoE expert GEMM. A reversed tie-break among equal outliers moves nothing, as it cannot: equal
-/// magnitudes are both kept, or neither stands the split ratio above the other.
+/// MoE expert GEMM. Other tests caught the same plants: a tier-dependent sparse dot,
+/// `the_sparse_activation_part_gives_the_scalar_bits_at_every_tier` (each format's sparse part
+/// against the scalar tier's bits); a changed sparse sum in either prefill route,
+/// `prefill_linear_matches_one_row_linear_bitwise_for_every_dtype` and
+/// `first_token_spikes_keep_the_rest_of_their_block` (a prefill row against the same row alone);
+/// a changed MoE sparse add, `expert_gemm_range_matches_the_single_token_kernels_bitwise`.
+/// The index tie-break cannot change a result, so no case is owed for it: equal magnitudes are
+/// either both kept or neither exceeds the ratio over the other, and the kept indices are used
+/// only as a set (a reversed tie-break, planted, moved nothing).
 fn spiky_row(r: usize, in_f: usize) -> Vec<f32> {
     let mut x: Vec<f32> = (0..in_f).map(|i| val(130 + r as u64, i) / 2.0).collect();
     for (b, blk) in x.chunks_mut(256).enumerate() {

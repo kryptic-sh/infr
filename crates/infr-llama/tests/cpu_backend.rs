@@ -1736,39 +1736,47 @@ fn gpu_seam_bf16_matches_cpu() {
 
 // CPU quant coverage: the SAME prompt through every available quantization of Qwen3-0.6B — legacy
 // round (Q4_0), k-quants (Q2_K/Q4_K/Q5_K/Q6_K), high-bit (Q8_0), i-quant codebook (IQ4_XS), and float
-// (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked (each
-// verified coherent at capture). Missing quants are skipped. Refresh with `INFR_BLESS=1`.
-// All verified coherent at capture — every quant recalls "France's capital is Paris" (Q2_K is a
-// touch repetitive, as expected for 2-bit; at capture Q5_K, Q8_0 and BF16 gave the same text,
-// and since the 2026-11-19 re-check Q5_K and BF16 do).
+// (BF16). Each exercises a different dequant/dot path; the per-quant golden hash is locked.
+// Missing quants are skipped, except a row marked required (below). Refresh with `INFR_BLESS=1`.
 // Re-blessed 2026-11-18 for the int8 activation split (`docs/cpu-activations.md`): Q4_K_M changed
 // with `QWEN3_GOLDEN`'s France case, identical natively on Windows and under WSL.
 // Every row re-checked 2026-11-19 with all eight files cached, identical natively on Windows and
 // under WSL: Q5_K_M, Q6_K and Q8_0 were stale (their files had not been cached at the earlier
-// re-blesses) and changed; the other five kept their values. Each text still answers Paris
-// (Q2_K opens with a doubled `<think>` and repeats itself, as it did before).
-// CI's golden job caches only Q4_K_M, so the other rows run only where someone caches them.
-const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64)] = &[
-    ("IQ4_XS", 32, 0xd028ff03b524cb28),
-    ("Q2_K", 32, 0x6442c2818c12ca56),
-    ("Q4_0", 32, 0x88221dcfca820246),
-    ("Q4_K_M", 32, 0x9e2c6fdd3c0e685c),
-    ("Q5_K_M", 32, 0xb68f96c3aa8d22fe),
-    ("Q6_K", 32, 0x48871156fbdd0a4c),
-    ("Q8_0", 32, 0x925b523a6f67356b),
-    ("BF16", 32, 0xb68f96c3aa8d22fe),
+// re-blesses) and changed; the other five kept their values. Six of the eight name Paris within
+// their 32 tokens; Q6_K stops at "...Let me think. France's capital", and Q2_K opens with a
+// doubled `<think>`, repeats the question and never answers. Q5_K_M and BF16 give the same text.
+//
+// The last field marks a row CI must run: CI's golden job (`INFR_TEST_REQUIRE_MODELS`) downloads
+// only `Qwen3-0.6B-Q4_K_M.gguf`, so with that variable set a skipped Q4_K_M row fails, and the
+// others may skip.
+const QWEN3_QUANT_GOLDEN: &[(&str, usize, u64, bool)] = &[
+    ("IQ4_XS", 32, 0xd028ff03b524cb28, false),
+    ("Q2_K", 32, 0x6442c2818c12ca56, false),
+    ("Q4_0", 32, 0x88221dcfca820246, false),
+    ("Q4_K_M", 32, 0x9e2c6fdd3c0e685c, true),
+    ("Q5_K_M", 32, 0xb68f96c3aa8d22fe, false),
+    ("Q6_K", 32, 0x48871156fbdd0a4c, false),
+    ("Q8_0", 32, 0x925b523a6f67356b, false),
+    ("BF16", 32, 0xb68f96c3aa8d22fe, false),
 ];
 
 #[test]
 fn cpu_golden_qwen3_quants() {
     let mut _tlk = test_serial_lock();
     let bless = std::env::var("INFR_BLESS").is_ok();
+    let require = std::env::var_os("INFR_TEST_REQUIRE_MODELS").is_some();
     let prompt = "The capital of France is";
-    // A row whose file is not cached is skipped, not failed (CI's golden job caches only
-    // Q4_K_M), so say which rows ran: a stale value hides behind a skip until someone caches it.
+    // A row whose file is not cached is skipped, not failed, unless it is required and
+    // `INFR_TEST_REQUIRE_MODELS` is set. The ran/skipped line below shows only with
+    // `--nocapture` (a passing test's output is hidden), so it is for a person running the
+    // test by hand; the required row is what CI enforces.
     let (mut ran, mut skipped) = (Vec::new(), Vec::new());
-    for (quant, n, want) in QWEN3_QUANT_GOLDEN {
+    for (quant, n, want, required) in QWEN3_QUANT_GOLDEN {
         let Some(path) = qwen3_quant(quant) else {
+            assert!(
+                !(require && *required),
+                "Qwen3-0.6B {quant} is not in the HF cache, and INFR_TEST_REQUIRE_MODELS requires it"
+            );
             skipped.push(*quant);
             continue;
         };
@@ -1776,7 +1784,7 @@ fn cpu_golden_qwen3_quants() {
         let out = cpu_gen(&model, prompt, *n);
         let h = fnv1a(&out);
         if bless {
-            println!("    ({quant:?}, {n}, 0x{h:016x}),  // {out:?}");
+            println!("    ({quant:?}, {n}, 0x{h:016x}, {required}),  // {out:?}");
         } else {
             assert_eq!(h, *want, "quant {quant} golden changed\n  out: {out:?}");
         }

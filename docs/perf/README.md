@@ -17,6 +17,9 @@ headline.
 - **[playbook.md](playbook.md)** — the optimization method: measure → profile →
   one lever at a time, the bottleneck taxonomy, and a long tail of dead ends
   recorded so they are not re-tried. Read before starting a perf slice.
+- **[vulkan-decode-attn-chunk.md](vulkan-decode-attn-chunk.md)** — the decode
+  attention split-K chunk floor: why 64 keys per chunk was the wrong floor at
+  rows==1, and what it cost at shallow depths.
 - **[kernels.md](kernels.md)** — cross-backend fast-kernel coverage: which
   weight-quant formats have a native kernel on CPU / Vulkan / Metal, and each
   backend's decode strategy.

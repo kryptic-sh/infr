@@ -66,14 +66,51 @@ enum Form {
     Eight32(bool),
 }
 
-/// A kernel family: its name, its weight format, the tiers its dispatcher has besides scalar,
-/// and how to run it.
+/// A kernel family: its name, its weight format, the tiers its dispatcher has besides scalar on
+/// this architecture, and how to run it.
 type Family = (&'static str, DType, &'static [SimdTier], Form);
+
+/// The families with a NEON kernel at the aarch64 `dotprod` tier (`kernels/neon.rs`; the Q4_K
+/// 2- and 8-row tiles run its batch kernel row by row there).
+const NEON: [&str; 8] = [
+    "q4k",
+    "q6k",
+    "q8_0",
+    "q4k_batch",
+    "q4k_batch2",
+    "q4k_batch8",
+    "q6k_batch",
+    "q8_0_batch",
+];
+
+/// A family's tiers besides scalar on this architecture: [`families`]' table lists the x86-64
+/// ones; on aarch64 a family in [`NEON`] has `dotprod` and every other has none.
+fn here(name: &str, x86: &'static [SimdTier]) -> &'static [SimdTier] {
+    if cfg!(target_arch = "x86_64") {
+        x86
+    } else if cfg!(target_arch = "aarch64") && NEON.contains(&name) {
+        &[SimdTier::Dotprod]
+    } else {
+        &[]
+    }
+}
 
 /// Weight rows per case: one full 8-row tile.
 const ROWS: usize = 8;
 
+/// Every family, with its tiers on this architecture ([`here`]).
 fn families() -> Vec<Family> {
+    let all = x86_families();
+    for name in NEON {
+        assert!(all.iter().any(|f| f.0 == name), "no family {name}");
+    }
+    all.into_iter()
+        .map(|(name, dt, x86, form)| (name, dt, here(name, x86), form))
+        .collect()
+}
+
+/// Every family, with its tiers on x86-64.
+fn x86_families() -> Vec<Family> {
     use Form::*;
     let k: &[SimdTier] = &[Avx2, Avx512];
     let kv: &[SimdTier] = &[Avx2, Avx512, Vnni];
@@ -426,6 +463,10 @@ fn every_kernel_family_gives_the_scalar_bits_at_every_tier() {
     if !lacking.is_empty() {
         eprintln!("tier_tests: this CPU lacks {lacking:?}; those tiers are not checked here");
     }
+    // Every Apple target has the dot-product extension, so on one the NEON kernels must run
+    // here, not be skipped as a tier the host lacks.
+    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    assert!(host.contains(&SimdTier::Dotprod), "{host:?}");
     let mut ran = std::collections::BTreeMap::<SimdTier, usize>::new();
     let mut checked = 0usize;
     let mut uncapped = 0usize;

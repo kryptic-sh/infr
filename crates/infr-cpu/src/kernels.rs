@@ -3,8 +3,9 @@
 //! f32/f16/bf16 dots + gated-FFN activation.
 //!
 //! Every tier of a family computes the scalar kernel's value bit for bit (the rule is in
-//! `crate::simd`, and `kernels/tier_tests.rs` enforces it at every tier the host has). aarch64
-//! runs the scalar kernels today; a NEON kernel added later is one more tier under the same rule.
+//! `crate::simd`, and `kernels/tier_tests.rs` enforces it at every tier the host has). On aarch64
+//! the `dotprod` tier's NEON kernels (`kernels/neon.rs`) cover Q4_K, Q6_K and Q8_0, one-row and
+//! batch; every other family runs its scalar kernel there.
 #[cfg(target_arch = "x86_64")]
 use crate::quant::{hadd_i32_xmm, hadd_i32_ymm};
 use crate::quant::{Q8x32, Q8};
@@ -177,6 +178,11 @@ pub(crate) fn vec_dot_q4k<const CAP: bool>(row: &[u8], q8: &Q8, in_f: usize) -> 
         if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q4k_avx2(row, q8, in_f) };
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::dotprod::<CAP>() {
+        // SAFETY: the check licenses NEON and the dot-product extension on this CPU.
+        return unsafe { neon::vec_dot_q4k(row, q8, in_f) };
     }
     vec_dot_q4k_scalar(row, q8, in_f)
 }
@@ -541,6 +547,11 @@ pub(crate) fn vec_dot_q6k<const CAP: bool>(row: &[u8], q8: &Q8, in_f: usize) -> 
         if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q6k_avx2(row, q8, in_f) };
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::dotprod::<CAP>() {
+        // SAFETY: the check licenses NEON and the dot-product extension on this CPU.
+        return unsafe { neon::vec_dot_q6k(row, q8, in_f) };
     }
     vec_dot_q6k_scalar(row, q8, in_f)
 }
@@ -1212,6 +1223,11 @@ pub(crate) fn vec_dot_q8_0<const CAP: bool>(row: &[u8], q8: &Q8, in_f: usize) ->
             return unsafe { vec_dot_q8_0_avx2(row, q8, in_f) };
         }
     }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::dotprod::<CAP>() {
+        // SAFETY: the check licenses NEON and the dot-product extension on this CPU.
+        return unsafe { neon::vec_dot_q8_0(row, q8, in_f) };
+    }
     vec_dot_q8_0_scalar(row, q8, in_f)
 }
 
@@ -1795,6 +1811,11 @@ pub(crate) fn vec_dot_q4k_batch<const CAP: bool>(
         if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q4k_batch_avx2(row, q8s, in_f, out) };
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::dotprod::<CAP>() {
+        // SAFETY: the check licenses NEON and the dot-product extension on this CPU.
+        return unsafe { neon::vec_dot_q4k_batch(row, q8s, in_f, out) };
     }
     vec_dot_q4k_batch_scalar(row, q8s, in_f, out);
 }
@@ -2584,6 +2605,11 @@ pub(crate) fn vec_dot_q6k_batch<const CAP: bool>(
         if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q6k_batch_avx2(row, q8s, in_f, out) };
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::dotprod::<CAP>() {
+        // SAFETY: the check licenses NEON and the dot-product extension on this CPU.
+        return unsafe { neon::vec_dot_q6k_batch(row, q8s, in_f, out) };
     }
     vec_dot_q6k_batch_scalar(row, q8s, in_f, out);
 }
@@ -3997,6 +4023,11 @@ pub(crate) fn vec_dot_q8_0_batch<const CAP: bool>(
         if crate::simd::avx2::<CAP>() {
             return unsafe { vec_dot_q8_0_batch_avx2(row, q8s, in_f, out) };
         }
+    }
+    #[cfg(target_arch = "aarch64")]
+    if crate::simd::dotprod::<CAP>() {
+        // SAFETY: the check licenses NEON and the dot-product extension on this CPU.
+        return unsafe { neon::vec_dot_q8_0_batch(row, q8s, in_f, out) };
     }
     vec_dot_q8_0_batch_scalar(row, q8s, in_f, out);
 }
@@ -6928,6 +6959,8 @@ pub(crate) fn gated_act_row(
 }
 
 mod hi;
+#[cfg(target_arch = "aarch64")]
+mod neon;
 #[cfg(test)]
 pub(crate) use hi::vec_dot_hi_reference;
 pub(crate) use hi::{vec_dot_hi, HiBatch};

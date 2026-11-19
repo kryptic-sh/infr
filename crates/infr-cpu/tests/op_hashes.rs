@@ -12,10 +12,10 @@
 //!
 //! So a case passes only if its result does not depend on the SIMD tier, the thread count or the
 //! way the pool chunks the work, and is the value Windows and Linux computed when it was blessed;
-//! CI runs it on Linux, Windows and macOS (aarch64, the scalar tier only), which makes the macOS
-//! run the architecture check. Print fresh values with `INFR_OP_HASH_BLESS=1 cargo test -p
-//! infr-cpu --test op_hashes -- --nocapture`, and bless them only when every system prints the
-//! same ones.
+//! CI runs it on Linux, Windows and macOS (aarch64: the scalar tier and the NEON `dotprod` one),
+//! which makes the macOS run the architecture check. Print fresh values with
+//! `INFR_OP_HASH_BLESS=1 cargo test -p infr-cpu --test op_hashes -- --nocapture`, and bless them
+//! only when every system prints the same ones.
 //!
 //! The ceiling is process-wide, so the cases run one after another in one test.
 

@@ -683,6 +683,68 @@ fn the_fast_sparse_dot_gives_the_one_row_kernels_bits() {
     assert_eq!(checked, Q8_DTYPES.len() * 2 * rows.len() * ROWS);
 }
 
+/// The fast sparse dot against its reference at EVERY element position of a block, for every
+/// format that takes `Q8` activations and every tier: a one-code part at each of the 256
+/// positions, and two-code parts at the pairs that meet each 8-element boundary (the last
+/// element of one group, sub-block or half with the first of the next) and at the pair just
+/// after it. [`the_fast_sparse_dot_gives_the_one_row_kernels_bits`]'s spike patterns reach a
+/// few dozen positions; a decode error confined to some positions of a block (one nibble lane,
+/// one quarter of a Q6_K half) passes them and fails here.
+#[test]
+fn the_fast_sparse_dot_is_exact_at_every_position_of_a_block() {
+    use crate::test_util::Q8_DTYPES;
+    let host: Vec<SimdTier> = SimdTier::ALL
+        .into_iter()
+        .filter(|t| t.supported())
+        .collect();
+    let in_f = 256usize;
+    let base = |i: usize| ((i * 29 % 97) as f32 - 48.0) / 31.0;
+    let row = |spikes: &[(usize, f32)]| -> Q8 {
+        let mut x: Vec<f32> = (0..in_f).map(base).collect();
+        for &(i, v) in spikes {
+            x[i] = v;
+        }
+        let q8 = quantize_q8(&x);
+        let codes: Vec<usize> = q8
+            .hi
+            .iter()
+            .flat_map(|p| p.codes().iter().map(|c| c.0 as usize))
+            .collect();
+        for &(i, _) in spikes {
+            assert!(codes.contains(&i), "no code at {i}: {codes:?}");
+        }
+        q8
+    };
+    let mut rows: Vec<Q8> = (0..in_f).map(|i| row(&[(i, 300.0)])).collect();
+    for b in (8..in_f).step_by(8) {
+        rows.push(row(&[(b - 1, 300.0), (b, -170.0)]));
+        rows.push(row(&[(b, -260.0), (b + 1, 190.0)]));
+    }
+    let mut checked = 0usize;
+    for dt in Q8_DTYPES {
+        let w = crate::test_util::synth_weights(dt, ROWS, in_f, 0x7e, &SCALES);
+        let bpr = w.len() / ROWS;
+        for (r, q8) in rows.iter().enumerate() {
+            for o in 0..ROWS {
+                let wr = &w[o * bpr..(o + 1) * bpr];
+                let got = vec_dot_hi(dt, wr, q8, in_f).to_bits();
+                for &t in &host {
+                    let (want, _) = with_tier(t, || vec_dot_hi_reference::<true>(dt, wr, q8, in_f));
+                    assert_eq!(
+                        got,
+                        want.to_bits(),
+                        "{dt:?} row {r} (codes {:?}) weight row {o} at {}",
+                        q8.hi.iter().map(|p| p.codes().to_vec()).collect::<Vec<_>>(),
+                        t.name()
+                    );
+                }
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, Q8_DTYPES.len() * rows.len() * ROWS);
+}
+
 // ─── the f32 dots ──────────────────────────────────────────────────────────────────────────────
 
 /// The tier the f32 dots' dispatchers take under a ceiling: their FMA code (an AVX2-tier path)

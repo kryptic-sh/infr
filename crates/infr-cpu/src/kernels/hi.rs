@@ -520,15 +520,14 @@ mod tests {
     use crate::quant::quantize_q8;
     use crate::test_util::{synth_weights, Q8_DTYPES};
 
-    /// Microbenchmark: ns per weight row for the sparse part of one activation row, the fast dot
-    /// against the one-row kernels it replaced (`vec_dot_hi_reference`, uncapped), per format, on
-    /// a 2048-wide row with one split block holding one code and on one with four split blocks
-    /// (two codes each). Prints; asserts only that both agree and that it timed.
+    /// Microbenchmark: ns per weight row of a [`HiBatch`] table chunk's fill and of one hot row's
+    /// evaluation from it, single-threaded, Q6_K weights 6144 wide, one activation row with two
+    /// split blocks of one code each. Prints three repeats; asserts only that it timed.
     ///
-    /// `cargo test --release -p infr-cpu --lib kernels::hi::tests::microbench -- --ignored
-    /// --nocapture`
+    /// `cargo test --release -p infr-cpu --lib kernels::hi::tests::batch_microbench --
+    /// --ignored --nocapture`
     #[test]
-    #[ignore = "measurement"]
+    #[ignore = "measurement: run in release with --nocapture"]
     fn batch_microbench() {
         let (in_f, out_f) = (6144usize, 2048usize);
         let dt = DType::Q6K;
@@ -578,9 +577,17 @@ mod tests {
                 hb.elems.len(),
                 hb.blocks.len()
             );
+            assert!(tf > 0.0 && te > 0.0);
         }
     }
 
+    /// Microbenchmark: ns per weight row for the sparse part of one activation row, the fast dot
+    /// against the one-row kernels it replaced (`vec_dot_hi_reference`, uncapped), per format, on
+    /// a 2048-wide row with one split block holding one code and on one with nine codes in five
+    /// split blocks. Prints; asserts only that both agree and that it timed.
+    ///
+    /// `cargo test --release -p infr-cpu --lib kernels::hi::tests::microbench -- --ignored
+    /// --nocapture`
     #[test]
     #[ignore = "measurement: run in release with --nocapture"]
     fn microbench() {
@@ -604,7 +611,7 @@ mod tests {
         for dt in Q8_DTYPES {
             let w = synth_weights(dt, rows, in_f, 5, &[(1.0, 1.0), (-0.5, 2.0)]);
             let bpr = w.len() / rows;
-            for (name, x) in [("one code", &one), ("eight codes", &four)] {
+            for (name, x) in [("one code", &one), ("nine codes", &four)] {
                 let q8 = quantize_q8(x);
                 let time = |f: &dyn Fn(&[u8]) -> f32| {
                     let reps = 200usize;

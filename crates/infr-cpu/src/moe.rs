@@ -4,8 +4,8 @@
 use crate::dequant_row::dequant_dot_rows;
 use crate::f32_row;
 use crate::kernels::{
-    vec_dot_hi, vec_dot_q32_batch8, vec_dot_q4k_batch, vec_dot_q4k_batch8, vec_dot_q5_0_32_batch,
-    vec_dot_q5k_batch, vec_dot_q6k_batch, vec_dot_q8_0_32_batch, vec_dot_q8_0_batch, Dots,
+    vec_dot_q32_batch8, vec_dot_q4k_batch, vec_dot_q4k_batch8, vec_dot_q5_0_32_batch,
+    vec_dot_q5k_batch, vec_dot_q6k_batch, vec_dot_q8_0_32_batch, vec_dot_q8_0_batch, Dots, HiBatch,
 };
 use crate::quant::{Q8x32, Q8};
 use crate::repack::{packed_min_tokens, Q4kPack};
@@ -152,13 +152,9 @@ pub(crate) fn expert_gemm_range<const CAP: bool>(
                 dot_col(o, &mut out_t[(o - o0) * count..(o - o0 + 1) * count]);
                 o += 1;
             }
-            // The sparse activation parts, as every `Q8` route adds them (`vec_dot_hi`).
-            let hot: Vec<usize> = (0..count).filter(|&r| !q8s[r].hi.is_empty()).collect();
-            for o in o0..o1 {
-                let row = &wbytes[o * bpr..o * bpr + bpr];
-                for &r in &hot {
-                    out_t[(o - o0) * count + r] += vec_dot_hi::<CAP>(dt, row, &q8s[r], in_f);
-                }
+            // The sparse activation parts, as every `Q8` route adds them (`vec_dot_hi`'s bits).
+            if let Some(hb) = HiBatch::new(dt, in_f, q8s) {
+                hb.add_o_major(wbytes, bpr, o0, o1 - o0, out_t, count);
             }
         }
         ExpertActs::Blk32(q8s) => {
@@ -238,6 +234,60 @@ mod tests {
     use crate::repack::TILE_TOKENS;
     use crate::test_util::det_quant_rows;
 
+    /// An expert bank's GEMM on `Q8` activations (Q4_K, Q5_K, Q6_K, Q8_0) gives, on every
+    /// element, the one-row dense kernel plus the sparse part dotted the way it was before the
+    /// fast sparse dot (`vec_dot_hi_reference`), at bucket sizes 1, 2, 5 and 19 (both sides of
+    /// the packed thresholds) and an o-range that starts past the first 8-row tile and ends in a
+    /// partial one, on rows of every spike pattern (`test_util::spike_patterns`).
+    #[test]
+    fn expert_gemm_range_adds_the_reference_sparse_dot_bitwise() {
+        use crate::kernels::{vec_dot_hi_reference, vec_dot_q8_any};
+        use crate::test_util::{spiky_row, synth_weights};
+        let (in_f, out_f) = (768usize, 28usize);
+        let mut split = 0usize;
+        for dt in [DType::Q4K, DType::Q5K, DType::Q6K, DType::Q8_0] {
+            let w = synth_weights(dt, out_f, in_f, 0x3c, &[(1.0, 1.0), (-0.5, 2.0)]);
+            let bpr = w.len() / out_f;
+            for count in [1usize, 2, 5, 19] {
+                let q8s: Vec<Q8> = (0..count)
+                    .map(|r| quantize_q8(&spiky_row(r, in_f)))
+                    .collect();
+                let (o0, o1) = (8, out_f);
+                let mut out_t = vec![f32::NAN; (o1 - o0) * count];
+                expert_gemm_range::<false>(
+                    &w,
+                    dt,
+                    in_f,
+                    out_f,
+                    &ExpertActs::Super(&q8s),
+                    None,
+                    o0,
+                    o1,
+                    &mut out_t,
+                );
+                for o in o0..o1 {
+                    let row = &w[o * bpr..(o + 1) * bpr];
+                    for (r, q8) in q8s.iter().enumerate() {
+                        let dense = vec_dot_q8_any::<false>(dt, row, q8, in_f);
+                        let want = if q8.hi.is_empty() {
+                            dense
+                        } else {
+                            split += 1;
+                            dense + vec_dot_hi_reference::<false>(dt, row, q8, in_f)
+                        };
+                        let got = out_t[(o - o0) * count + r];
+                        assert_eq!(
+                            got.to_bits(),
+                            want.to_bits(),
+                            "{dt:?} count={count} o={o} r={r}: got {got}, want {want}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(split > 0, "no row split");
+    }
+
     /// An expert bank's K-quant GEMM gives the single-token kernel's bits for every bucket size,
     /// on both sides of each dtype's packed threshold (`packed_min_tokens`) — a bucket of one
     /// routed token is common — and for an o-range that starts past the first 8-row tile and
@@ -299,7 +349,7 @@ mod tests {
                             dense
                         } else {
                             split += 1;
-                            dense + vec_dot_hi::<false>(dt, row, q8, in_f)
+                            dense + vec_dot_hi(dt, row, q8, in_f)
                         };
                         let got = out_t[(o - o0) * count + r];
                         assert_eq!(

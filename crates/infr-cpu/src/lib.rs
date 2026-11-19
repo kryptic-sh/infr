@@ -52,7 +52,7 @@ use kernels::{
     vec_dot_q4_1_32_batch, vec_dot_q4k_batch, vec_dot_q4k_batch2, vec_dot_q4k_batch8,
     vec_dot_q5_0_32_batch, vec_dot_q5_1_32_batch, vec_dot_q5k_batch, vec_dot_q6k_batch,
     vec_dot_q8_0_32_batch, vec_dot_q8_0_batch, vec_dot_q8_any, vec_dot_tq1_0_batch,
-    vec_dot_tq2_0_batch, Dots,
+    vec_dot_tq2_0_batch, Dots, HiBatch,
 };
 use moe::{expert_acts_kind, expert_gemm_range, ActsKind, ExpertActs};
 use quant::{quantize_q8, quantize_q8_32, Q8x32, Q8};
@@ -435,12 +435,12 @@ impl CpuBackend {
     }
 
     /// Add each activation row's sparse part ([`Q8::hi`], [`vec_dot_hi`]) into a prefill
-    /// `Op::Linear`'s output over the weight rows `wbytes` (`bpr` bytes each): `out` is o-major
-    /// (`out[o * m + r]`) when `o_major`, else row-major (`out[r * out_f + o]`). Each value
-    /// becomes `dense + vec_dot_hi(..)`, the one-row route's expression; rows with no sparse part
-    /// are not touched, and when no row has one nothing runs.
-    #[allow(clippy::too_many_arguments)]
-    fn add_hi<const CAP: bool>(
+    /// `Op::Linear`'s o-major output `out` (`out[o * m + r]`) over the weight rows `wbytes`
+    /// (`bpr` bytes each). Each value becomes `dense + vec_dot_hi(..)`, the one-row route's
+    /// expression ([`HiBatch`] computes the same bits for many weight rows at once); rows with
+    /// no sparse part are not touched, and when no row has one nothing runs. (The packed GEMM's
+    /// row-major output takes its parts in [`Self::linear_packed`].)
+    fn add_hi(
         &self,
         dt: DType,
         wbytes: &[u8],
@@ -448,43 +448,16 @@ impl CpuBackend {
         in_f: usize,
         q8s: &[Q8],
         out: &mut [f32],
-        o_major: bool,
     ) {
-        let hot: Vec<usize> = (0..q8s.len()).filter(|&r| !q8s[r].hi.is_empty()).collect();
-        if hot.is_empty() {
+        let Some(hb) = HiBatch::new(dt, in_f, q8s) else {
             return;
-        }
-        let (m, out_f) = (q8s.len(), wbytes.len() / bpr);
-        let hi =
-            |o: usize, r: usize| vec_dot_hi::<CAP>(dt, &wbytes[o * bpr..][..bpr], &q8s[r], in_f);
-        if o_major {
-            // Each task owns whole weight rows' columns.
-            self.pool().for_chunks_mut(out, m, 8, &|o, col| {
-                for &r in &hot {
-                    col[r] += hi(o, r);
-                }
+        };
+        // Each task owns a run of whole weight rows' columns.
+        let m = q8s.len();
+        self.pool()
+            .for_chunks_mut(out, HI_ROWS * m, 1, &|c, block| {
+                hb.add_o_major(wbytes, bpr, c * HI_ROWS, block.len() / m, block, m);
             });
-            return;
-        }
-        // Row-major: weight-row-major again into an o-major temp, a group of hot rows at a time
-        // (so the temp stays bounded), each weight row read once for every row it serves; then
-        // added in by row.
-        for group in hot.chunks(HI_GROUP) {
-            let g = group.len();
-            let mut part = vec![0f32; out_f * g];
-            self.pool().for_chunks_mut(&mut part, g, 16, &|o, p| {
-                for (dst, &r) in p.iter_mut().zip(group) {
-                    *dst = hi(o, r);
-                }
-            });
-            self.pool().for_chunks_mut(out, out_f, 1, &|r, orow| {
-                if let Some(k) = group.iter().position(|&h| h == r) {
-                    for (o, v) in orow.iter_mut().enumerate() {
-                        *v += part[o * g + k];
-                    }
-                }
-            });
-        }
     }
 
     /// Record one `Op::Linear` for the test tap (`linear_tap`): the `rows` of its activation
@@ -590,7 +563,9 @@ impl CpuBackend {
     /// thread's scratch group and runs the GEMM over every token: the pack costs one pass over
     /// the group's weights, which the `m` tokens share, and nothing is held past the call. The
     /// `out_f % 8` tail rows take the per-row batch kernels. Every kernel here is bit-identical
-    /// to the single-token one, so the result does not depend on the route.
+    /// to the single-token one, so the result does not depend on the route. Rows with a sparse
+    /// activation part ([`Q8::hi`]) get it added as every route adds it (`dense +
+    /// vec_dot_hi(..)`, through [`HiBatch`]).
     #[cfg(target_arch = "x86_64")]
     fn linear_packed<const CAP: bool>(
         &self,
@@ -605,20 +580,31 @@ impl CpuBackend {
         assert_eq!(out.len(), m * out_f);
         let (nb, bpr, groups) = (in_f / 256, wbytes.len() / out_f, out_f / 8);
         let gout = repack::GemmOut::row_major(out, out_f);
-        // SAFETY (both arms): `linear_packed_ok` checked AVX-512BW + VNNI; each task writes only
-        // its own group's rows `8g..8g + 8` of `out`, which outlives the `run`.
-        match dt {
-            DType::Q4K | DType::Q5K => self.pool().run(groups, &|g| unsafe {
-                let rows =
-                    std::array::from_fn(|i| &wbytes[(8 * g + i) * bpr..(8 * g + i + 1) * bpr]);
-                repack::q4k_pack_and_gemm_group(dt, rows, nb, q8s, gout, 8 * g);
+        // SAFETY: `linear_packed_ok` checked AVX-512BW + VNNI; each task writes only its own
+        // group's rows `8g..8g + 8` of `out`, which outlives the `run`.
+        let gemm = |g: usize| unsafe {
+            let rows = std::array::from_fn(|i| &wbytes[(8 * g + i) * bpr..(8 * g + i + 1) * bpr]);
+            match dt {
+                DType::Q4K | DType::Q5K => {
+                    repack::q4k_pack_and_gemm_group(dt, rows, nb, q8s, gout, 8 * g)
+                }
+                DType::Q6K => repack::q6k_pack_and_gemm_group(rows, nb, q8s, gout, 8 * g),
+                _ => unreachable!("linear_packed_ok admits Q4_K, Q5_K and Q6_K only"),
+            }
+        };
+        // The sparse activation parts ([`HiBatch`]): each GEMM task adds them to its own group's
+        // results while it holds those weight rows, so they read no weight memory again.
+        let hb = HiBatch::new(dt, in_f, q8s);
+        match &hb {
+            Some(hb) => self.pool().run(groups, &|g| {
+                gemm(g);
+                let mut tab = vec![0i32; hb.chunk_len()];
+                hb.for_group(wbytes, bpr, 8 * g, 8, &mut tab, |r, acc| {
+                    // SAFETY: as the GEMM's stores: this task's group, rows `8g..8g + 8`.
+                    unsafe { gout.add8(8 * g, r, acc) }
+                });
             }),
-            DType::Q6K => self.pool().run(groups, &|g| unsafe {
-                let rows =
-                    std::array::from_fn(|i| &wbytes[(8 * g + i) * bpr..(8 * g + i + 1) * bpr]);
-                repack::q6k_pack_and_gemm_group(rows, nb, q8s, gout, 8 * g);
-            }),
-            _ => unreachable!("linear_packed_ok admits Q4_K, Q5_K and Q6_K only"),
+            None => self.pool().run(groups, &|g| gemm(g)),
         }
         let tail = out_f - 8 * groups;
         if tail > 0 {
@@ -632,6 +618,9 @@ impl CpuBackend {
                     _ => vec_dot_q6k_batch::<CAP>(row, q8s, in_f, col),
                 }
             });
+            if let Some(hb) = &hb {
+                hb.add_o_major(wbytes, bpr, 8 * groups, tail, &mut cols, m);
+            }
             for (i, col) in cols.chunks(m).enumerate() {
                 for (r, &v) in col.iter().enumerate() {
                     out[r * out_f + 8 * groups + i] = v;
@@ -871,9 +860,8 @@ pub(crate) fn bytes_to_f32(bytes: &[u8], dtype: DType) -> Vec<f32> {
     }
 }
 
-/// Hot rows (rows with a sparse activation part) [`CpuBackend::add_hi`] takes at a time on a
-/// row-major output: bounds its o-major temp at this many floats per weight row.
-const HI_GROUP: usize = 64;
+/// Weight rows one task of [`CpuBackend::add_hi`] takes on an o-major output.
+const HI_ROWS: usize = 64;
 
 /// Fewest weight rows a single-token `Op::Linear` task claims: a row's dot is well under a
 /// microsecond, so fewer would make the shared task cursor the bottleneck.
@@ -1715,7 +1703,7 @@ impl CpuBackend {
                                 dst_o[0] = if q.hi.is_empty() {
                                     dense
                                 } else {
-                                    dense + vec_dot_hi::<CAP>(dt, row, q, in_f)
+                                    dense + vec_dot_hi(dt, row, q, in_f)
                                 };
                                 return;
                             }
@@ -1855,8 +1843,6 @@ impl CpuBackend {
                         if linear_packed_ok::<CAP>(dt, in_f, out_f, m) {
                             #[cfg(target_arch = "x86_64")]
                             self.linear_packed::<CAP>(dt, wbytes, in_f, out_f, &q8s, &mut out);
-                            #[cfg(target_arch = "x86_64")]
-                            self.add_hi::<CAP>(dt, wbytes, bpr, in_f, &q8s, &mut out, false);
                             #[cfg(not(target_arch = "x86_64"))]
                             unreachable!("linear_packed_ok is false off x86_64");
                         } else {
@@ -2116,7 +2102,7 @@ impl CpuBackend {
                             }
                             // The sparse activation parts (empty `q8s` on the 32-block and float
                             // routes, so nothing runs there).
-                            self.add_hi::<CAP>(dt, wbytes, bpr, in_f, &q8s, &mut out_t, true);
+                            self.add_hi(dt, wbytes, bpr, in_f, &q8s, &mut out_t);
                             // Transpose out_t[o * m + r] → out[r * out_f + o], parallel over the m output
                             // rows (each gathers its out_f values from the o-major temp). The serial
                             // version was ~20% of the matvec at large out_f × m.
@@ -4891,6 +4877,94 @@ fn deltanet_scan(
 /// Fixtures shared by the crate's unit tests.
 #[cfg(test)]
 pub(crate) mod test_util {
+    use infr_core::tensor::DType;
+
+    /// Every weight format whose activations take the 256-element quantizer (`quantize_q8`), and
+    /// so can meet a sparse part (`Q8::hi`).
+    pub(crate) const Q8_DTYPES: [DType; 16] = [
+        DType::Q4K,
+        DType::Q6K,
+        DType::Q8_0,
+        DType::Q5K,
+        DType::Q2K,
+        DType::Q3K,
+        DType::Iq4Xs,
+        DType::Iq2S,
+        DType::Iq2Xs,
+        DType::Iq2Xxs,
+        DType::Iq1S,
+        DType::Iq1M,
+        DType::Iq3S,
+        DType::Iq3Xxs,
+        DType::Tq2_0,
+        DType::Tq1_0,
+    ];
+
+    /// `rows` weight rows of `in_f` in format `dt`: LCG payloads (every code pattern), each
+    /// block's scales the format's own magnitudes times `scales[k]`, `k` cycling through the
+    /// list block by block (`(b * 5 + b / 7) % len`) so neighbouring blocks differ.
+    pub(crate) fn synth_weights(
+        dt: DType,
+        rows: usize,
+        in_f: usize,
+        seed: u32,
+        scales: &[(f32, f32)],
+    ) -> Vec<u8> {
+        let spec = infr_core::decode_spec::block_spec(dt);
+        let (d, min) = infr_testkit::synth_scales(dt);
+        let nblk = rows * in_f / spec.block_elems;
+        let mut w = Vec::with_capacity(nblk * spec.block_bytes);
+        for b in 0..nblk {
+            let mut blk =
+                infr_testkit::lcg_bytes(seed ^ (b as u32).wrapping_mul(0x9e37), spec.block_bytes);
+            let (fd, fm) = scales[(b * 5 + b / 7) % scales.len()];
+            spec.write_scales(&mut blk, d * fd, min * fm);
+            w.extend_from_slice(&blk);
+        }
+        w
+    }
+
+    /// The spike patterns the sparse part's tests feed (`(index, value)` over a rest of
+    /// magnitude under 1.6, so a spike of 30 or more splits its block): one spike; two in a
+    /// block; spikes in several blocks; at the first and last index of a block; at the first and
+    /// last index of 8-, 16- and 32-element sub-blocks; in the last block; two equal; two equal
+    /// and opposite in one 8-element group; two far apart, whose second needs a second part; one
+    /// so large that its scale times an f16 maximum overflows. `in_f` is a multiple of 256 of
+    /// at least 512.
+    pub(crate) fn spike_patterns(in_f: usize) -> Vec<Vec<(usize, f32)>> {
+        let last = in_f - 256;
+        vec![
+            vec![(5, 400.0)],
+            vec![(3, 412.5), (7, -129.3)],
+            vec![(10, 300.0), (300, -250.0), (last + 77, 500.0)],
+            vec![(0, 350.0), (255, -280.0)],
+            vec![(256, 200.0), (511, -330.0)],
+            vec![(8, 300.0), (15, -200.0)],
+            vec![(16, 310.0), (31, -90.0)],
+            vec![(32, 250.0), (63, 260.0)],
+            vec![(127, -300.0), (128, 300.0)],
+            vec![(in_f - 1, -3.0e4)],
+            vec![(last, 500.0), (last + 129, 400.0)],
+            vec![(40, 300.0), (41, 300.0)],
+            vec![(70, 300.0), (71, -300.0)],
+            vec![(40, 300.0), (200, -300.0)],
+            vec![(3, 3000.0), (20, 941.0625)],
+            vec![(9, 1.0e37)],
+        ]
+    }
+
+    /// Activation row `r` of `in_f`: ordinary values of magnitude under 1.6 with
+    /// [`spike_patterns`]' pattern `r % len` placed over them.
+    pub(crate) fn spiky_row(r: usize, in_f: usize) -> Vec<f32> {
+        let pats = spike_patterns(in_f);
+        let mut x: Vec<f32> = (0..in_f)
+            .map(|i| (((i * 29 + r * 13) % 97) as f32 - 48.0) / 31.0)
+            .collect();
+        for &(i, v) in &pats[r % pats.len()] {
+            x[i] = v;
+        }
+        x
+    }
     /// Deterministic quant weight bytes with every block's f16 scale(s) at `d_offs` set to small
     /// finite values (random bits there would be NaN/inf half the time).
     pub(crate) fn det_quant_rows(
@@ -5925,6 +5999,62 @@ mod tests {
             .chunks(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect()
+    }
+
+    /// Every `Op::Linear` route that adds a sparse activation part (one row; the batch kernels,
+    /// tiles and packed GEMM with their row-major and o-major adds) gives, on every element, the
+    /// one-row dense kernel plus the sparse part dotted the way it was before the fast sparse dot
+    /// (`vec_dot_hi_reference`), for every format that takes `Q8` activations, at 1, 2, 5 and 19
+    /// rows, on rows of every spike pattern (`test_util::spike_patterns`) and some with none.
+    #[test]
+    fn linear_routes_add_the_reference_sparse_dot_bitwise() {
+        use crate::kernels::{vec_dot_hi_reference, vec_dot_q8_any};
+        use crate::test_util::{spiky_row, synth_weights, Q8_DTYPES};
+        let (in_f, out_f) = (768usize, 19usize);
+        let row = |r: usize| -> Vec<f32> {
+            if r % 4 == 3 {
+                (0..in_f)
+                    .map(|i| ((i * 7 + r) % 23) as f32 / 9.0 - 1.2)
+                    .collect()
+            } else {
+                spiky_row(r, in_f)
+            }
+        };
+        let mut split = 0usize;
+        for dt in Q8_DTYPES {
+            let w = synth_weights(
+                dt,
+                out_f,
+                in_f,
+                0x7a,
+                &[(1.0, 1.0), (-0.5, 2.0), (3.0, 0.0)],
+            );
+            let bpr = w.len() / out_f;
+            for m in [1usize, 2, 5, 19] {
+                let xs: Vec<Vec<f32>> = (0..m).map(row).collect();
+                let got = run_linear(dt, &w, &xs.concat(), m, in_f, out_f);
+                for (r, x) in xs.iter().enumerate() {
+                    let q8 = quantize_q8(x);
+                    for o in 0..out_f {
+                        let wr = &w[o * bpr..(o + 1) * bpr];
+                        let dense = vec_dot_q8_any::<false>(dt, wr, &q8, in_f);
+                        let want = if q8.hi.is_empty() {
+                            dense
+                        } else {
+                            split += 1;
+                            dense + vec_dot_hi_reference::<false>(dt, wr, &q8, in_f)
+                        };
+                        let g = got[r * out_f + o];
+                        assert_eq!(
+                            g.to_bits(),
+                            want.to_bits(),
+                            "{dt:?} m={m} row {r} o={o}: got {g}, want {want}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(split > 0, "no row split");
     }
 
     /// Prefill `Op::Linear` on K-quant weights gives the single-token kernel's bits on every

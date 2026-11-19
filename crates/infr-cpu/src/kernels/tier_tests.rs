@@ -300,18 +300,7 @@ const SCALES: [(f32, f32); 7] = [
 /// `ROWS` weight rows of `in_f`: LCG payloads (every code pattern), the scales cycling through
 /// [`SCALES`] so neighbouring blocks differ.
 fn weights(dt: DType, in_f: usize, seed: u32) -> Vec<u8> {
-    let spec = block_spec(dt);
-    let (d, min) = infr_testkit::synth_scales(dt);
-    let nblk = ROWS * in_f / spec.block_elems;
-    let mut w = Vec::with_capacity(nblk * spec.block_bytes);
-    for b in 0..nblk {
-        let mut blk =
-            infr_testkit::lcg_bytes(seed ^ (b as u32).wrapping_mul(0x9e37), spec.block_bytes);
-        let (fd, fm) = SCALES[(b * 5 + b / 7) % SCALES.len()];
-        spec.write_scales(&mut blk, d * fd, min * fm);
-        w.extend_from_slice(&blk);
-    }
-    w
+    crate::test_util::synth_weights(dt, ROWS, in_f, seed, &SCALES)
 }
 
 /// Activation row `r` of `in_f`, from integers: ordinary values, zero, one spike, every element
@@ -582,12 +571,12 @@ fn the_sparse_activation_part_gives_the_scalar_bits_at_every_tier() {
                         if cap {
                             (
                                 vec_dot_q8_any::<true>(dt, row, &q8, in_f),
-                                vec_dot_hi::<true>(dt, row, &q8, in_f),
+                                vec_dot_hi(dt, row, &q8, in_f),
                             )
                         } else {
                             (
                                 vec_dot_q8_any::<false>(dt, row, &q8, in_f),
-                                vec_dot_hi::<false>(dt, row, &q8, in_f),
+                                vec_dot_hi(dt, row, &q8, in_f),
                             )
                         }
                     })
@@ -616,6 +605,82 @@ fn the_sparse_activation_part_gives_the_scalar_bits_at_every_tier() {
         }
     }
     assert_eq!(checked, dts.len() * 2 * host.len());
+}
+
+/// Scales for [`the_fast_sparse_dot_gives_the_one_row_kernels_bits`]: [`SCALES`]' finite set,
+/// then one where some blocks' scales are infinite or NaN, so a sparse dot that skipped such a
+/// block's term (whose `NaN` the one-row kernel keeps) would differ.
+const HI_SCALES: [&[(f32, f32)]; 2] = [
+    &SCALES,
+    &[
+        (1.0, 1.0),
+        (f32::INFINITY, 1.0),
+        (1.0, f32::NEG_INFINITY),
+        (f32::NAN, 0.5),
+        (-1.0, 0.5),
+    ],
+];
+
+/// The sparse part's fast dot (`vec_dot_hi`, which reads only the weight elements at the part's
+/// codes) gives the bits of the one-row kernels it replaced (`vec_dot_hi_reference`: each part
+/// made whole and dotted by `vec_dot_q8_any`) at every tier the host has, for every format that
+/// takes `Q8` activations: on every pattern of `test_util::spike_patterns` (one spike, two,
+/// several blocks, the first and last index of a block and of each sub-block size, the last
+/// block, equal and opposite spikes, a second part, a scale that overflows against an f16
+/// maximum), on weights with finite scales and with infinite and NaN ones.
+#[test]
+fn the_fast_sparse_dot_gives_the_one_row_kernels_bits() {
+    use crate::test_util::{spike_patterns, spiky_row, Q8_DTYPES};
+    let host: Vec<SimdTier> = SimdTier::ALL
+        .into_iter()
+        .filter(|t| t.supported())
+        .collect();
+    let in_f = 768usize;
+    let rows: Vec<Q8> = (0..spike_patterns(in_f).len())
+        .map(|r| quantize_q8(&spiky_row(r, in_f)))
+        .collect();
+    // The patterns reach what they are meant to: a part with two codes, a part in the last
+    // block, a block with two parts, a code at the last index of a block.
+    let parts = || rows.iter().flat_map(|q| &q.hi);
+    assert!(
+        rows.iter().all(|q| !q.hi.is_empty()),
+        "a pattern did not split"
+    );
+    assert!(parts().any(|p| p.codes().len() == 2));
+    assert!(parts().any(|p| p.b == in_f / 256 - 1));
+    assert!(parts().any(|p| p.codes().iter().any(|c| c.0 == 255)));
+    assert!(rows
+        .iter()
+        .any(|q| q.hi.windows(2).any(|w| w[0].b == w[1].b)));
+    let mut checked = 0usize;
+    for dt in Q8_DTYPES {
+        for (k, scales) in HI_SCALES.iter().enumerate() {
+            let w = crate::test_util::synth_weights(dt, ROWS, in_f, 0x61 + k as u32, scales);
+            let bpr = w.len() / ROWS;
+            for (r, q8) in rows.iter().enumerate() {
+                for o in 0..ROWS {
+                    let row = &w[o * bpr..(o + 1) * bpr];
+                    let got = vec_dot_hi(dt, row, q8, in_f).to_bits();
+                    for &t in &host {
+                        let (want, _) =
+                            with_tier(t, || vec_dot_hi_reference::<true>(dt, row, q8, in_f));
+                        assert_eq!(
+                            got,
+                            want.to_bits(),
+                            "{dt:?} scales {k} pattern {r} weight row {o} at {}: fast {} \
+                             reference {want}",
+                            t.name(),
+                            f32::from_bits(got)
+                        );
+                    }
+                    let want = vec_dot_hi_reference::<false>(dt, row, q8, in_f);
+                    assert_eq!(got, want.to_bits(), "{dt:?} {k} {r} {o} uncapped");
+                    checked += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(checked, Q8_DTYPES.len() * 2 * rows.len() * ROWS);
 }
 
 // ─── the f32 dots ──────────────────────────────────────────────────────────────────────────────

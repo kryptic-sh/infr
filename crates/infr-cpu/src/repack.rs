@@ -282,6 +282,28 @@ impl<'a> GemmOut<'a> {
                 .add((o0 + row) * self.o_stride + r * self.r_stride) = lanes[j];
         }
     }
+
+    /// Add `vals[j]` to the result at row `o0 + j` of token `r`, for every `j` (in natural row
+    /// order, unlike [`Self::store8`]'s lanes): the sparse activation parts' share
+    /// (`crate::kernels::HiBatch`), added after the group's results are stored.
+    ///
+    /// # Safety
+    /// As [`Self::store8`]: no other copy of this `GemmOut` may touch the same `(o, r)` elements
+    /// concurrently. The bounds are checked here.
+    #[inline]
+    pub(crate) unsafe fn add8(&self, o0: usize, r: usize, vals: &[f32; 8]) {
+        let last = (o0 + 7) * self.o_stride + r * self.r_stride;
+        assert!(
+            last < self.len,
+            "GemmOut: rows {o0}..+8 of token {r} are out of bounds"
+        );
+        for (j, &v) in vals.iter().enumerate() {
+            *self
+                .ptr
+                .get()
+                .add((o0 + j) * self.o_stride + r * self.r_stride) += v;
+        }
+    }
 }
 
 /// Fewest tokens for which the packed GEMM beats the per-row batch kernels, per dtype: below

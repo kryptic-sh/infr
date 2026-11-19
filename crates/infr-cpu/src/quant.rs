@@ -30,12 +30,44 @@ pub(crate) struct Q8 {
     /// Only the x86 SIMD kernel reads it — dead code on aarch64 (macOS CI builds with -D warnings).
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) bsums16: Vec<i32>,
-    /// The sparse part, in block order: `(b, part)` adds `part` — a one-block `Q8` whose codes are
-    /// zero outside the split-off elements — to block `b`. A block can have up to [`HI_LEVELS`]
-    /// parts, each holding what the ones before it left of those elements. The activation this
-    /// `Q8` stands for is the dense codes plus every part; a dot over it is the dense dot plus each
-    /// part's one-block dot against the weight's block `b` ([`crate::kernels::vec_dot_hi`]).
-    pub(crate) hi: Vec<(usize, Q8)>,
+    /// The sparse part, in block order: each [`HiPart`] adds a few codes on a scale of their own
+    /// to one block. A block can have up to [`HI_LEVELS`] parts, each holding what the ones before
+    /// it left of those elements. The activation this `Q8` stands for is the dense codes plus every
+    /// part; a dot over it is the dense dot plus each part's one-block dot against the weight's
+    /// matching block ([`crate::kernels::vec_dot_hi`]).
+    pub(crate) hi: Vec<HiPart>,
+}
+
+/// One sparse part of a split block ([`Q8::hi`]): the one-block activation whose codes are
+/// [`Self::codes`] at their indices and zero everywhere else, on the scale [`Self::d`].
+#[derive(Clone, Debug)]
+pub(crate) struct HiPart {
+    /// The 256-element block it adds to.
+    pub(crate) b: usize,
+    /// Its scale.
+    pub(crate) d: f32,
+    /// Its nonzero codes as `(index in the block, code)`, the first `len` of them used.
+    at: [(u8, i8); HI_KEEP],
+    len: u8,
+}
+
+impl HiPart {
+    /// The part's nonzero codes, `(index in the block, code)`, in index order.
+    pub(crate) fn codes(&self) -> &[(u8, i8)] {
+        &self.at[..self.len as usize]
+    }
+
+    /// The part as the one-block `Q8` it stands for (256 codes, its scale, its sub-block sums):
+    /// what the sparse part was before it was stored compactly, which the one-row kernels dot
+    /// in the reference the fast sparse dot is tested against.
+    #[cfg(test)]
+    pub(crate) fn to_q8(&self) -> Q8 {
+        let mut qs = vec![0i8; 256];
+        for &(i, q) in self.codes() {
+            qs[i as usize] = q;
+        }
+        from_codes(qs, vec![self.d])
+    }
 }
 
 /// The most elements of a 256-element block that can move to the sparse part ([`Q8::hi`]).
@@ -134,7 +166,7 @@ pub(crate) fn quantize_q8(x: &[f32]) -> Q8 {
         }
         // The split-off elements, quantized on their own scale level by level; what the last
         // level leaves of them stays in the dense block with the rest.
-        let mut dense = blk.to_vec();
+        let mut dense: [f32; 256] = blk.try_into().expect("a 256-element block");
         let rest = (0..256)
             .filter(|i| !kept.contains(i))
             .fold(0f32, |m, i| m.max(blk[i].abs()));
@@ -145,12 +177,22 @@ pub(crate) fn quantize_q8(x: &[f32]) -> Q8 {
             }
             let dh = a / 127.0;
             let id = 1.0 / dh;
-            let mut hq = vec![0i8; 256];
+            let mut part = HiPart {
+                b,
+                d: dh,
+                at: [(0, 0); HI_KEEP],
+                len: 0,
+            };
             for &i in &kept {
-                hq[i] = (dense[i] * id).round().clamp(-127.0, 127.0) as i8;
-                dense[i] -= hq[i] as f32 * dh;
+                let q = (dense[i] * id).round().clamp(-127.0, 127.0) as i8;
+                dense[i] -= q as f32 * dh;
+                if q != 0 {
+                    part.at[part.len as usize] = (i as u8, q);
+                    part.len += 1;
+                }
             }
-            hi.push((b, from_codes(hq, vec![dh])));
+            part.at[..part.len as usize].sort_unstable_by_key(|&(i, _)| i);
+            hi.push(part);
         }
         d[b] = quantize_block(&dense, block_max(&dense), q);
     }
@@ -169,9 +211,12 @@ pub(crate) fn dequantize_q8(q8: &Q8) -> Vec<f32> {
         .enumerate()
         .map(|(i, &q)| q as f32 * q8.d[i / 256])
         .collect();
-    for (b, part) in &q8.hi {
-        for (i, &q) in part.qs.iter().enumerate() {
-            x[b * 256 + i] += q as f32 * part.d[0];
+    // A zero code would add `+0.0`, which changes no element: none is `-0.0` (each starts as a
+    // code times a non-negative scale, and a sum that cancels rounds to `+0.0`). So only the
+    // part's nonzero codes are added.
+    for part in &q8.hi {
+        for &(i, q) in part.codes() {
+            x[part.b * 256 + i as usize] += q as f32 * part.d;
         }
     }
     x
@@ -329,7 +374,7 @@ mod tests {
                         let y = if q8.hi.is_empty() {
                             dense
                         } else {
-                            dense + vec_dot_hi::<false>(DType::Q4K, row, &q8, n)
+                            dense + vec_dot_hi(DType::Q4K, row, &q8, n)
                         };
                         std::hint::black_box(y);
                     }

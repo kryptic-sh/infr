@@ -161,23 +161,6 @@ pub(crate) fn vec_dot_q8_any<const CAP: bool>(
     }
 }
 
-/// The sparse part of `q8` ([`Q8::hi`]) dotted with a weight row of `dt` over `in_f` inputs:
-/// each part's one-block kernel ([`vec_dot_q8_any`]) against the weight's matching 256-element
-/// block, summed from zero in the parts' order. Every route that dots a `Q8` adds this to the
-/// dense result (`dense + vec_dot_hi(..)`) for a row whose `hi` is not empty, so the sum is one
-/// expression however the dense part was computed; a row with no sparse part adds nothing.
-pub(crate) fn vec_dot_hi<const CAP: bool>(
-    dt: infr_core::tensor::DType,
-    row: &[u8],
-    q8: &Q8,
-    in_f: usize,
-) -> f32 {
-    let bpb = row.len() / (in_f / 256);
-    q8.hi.iter().fold(0f32, |s, (b, part)| {
-        s + vec_dot_q8_any::<CAP>(dt, &row[b * bpb..b * bpb + bpb], part, 256)
-    })
-}
-
 /// `Σ weight·x` for one Q4_K row (144 bytes / 256 elems) against the Q8 activation. Weight value is
 /// `d·sc_s·q4 − dmin·m_s` over 8 sub-blocks of 32; dispatches to the best SIMD path available at
 /// runtime (avx512bw → avx2 → scalar). The `sm` term uses `q8.bsums` (precomputed in `quantize_q8`)
@@ -3063,6 +3046,9 @@ pub(crate) fn vec_dot_tq2_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut
     }
 }
 
+/// TQ1_0's digit multipliers: digit `n` of a byte `b` is `((b·TQ1_POW3[n]) as u16 · 3) >> 8`.
+const TQ1_POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
+
 /// Expand a whole TQ1_0 weight row (54 bytes / 256 elems per super-block) to signed `i8` ternary
 /// weights ONCE, alongside the per-256 `d` scale — mirrors `dequant_block(DType::Tq1_0)` (dequant.rs)
 /// EXACTLY. TQ1_0 (BitNet/TriLM 1.6-bit ternary) is the base-3-PACKED sibling of TQ2_0: ONE f16 scale
@@ -3076,7 +3062,6 @@ pub(crate) fn vec_dot_tq2_0_batch(row: &[u8], q8s: &[Q8], in_f: usize, out: &mut
 /// digit passes → 16 elems (`240 + n*4 + j`). Block = 54 bytes: `[u8 qs[48]]`, `[u8 qh[4]]`,
 /// `[f16 d]`. `in_f` must be a multiple of 256; `ds[b]` is the block's `d`.
 fn tq1_0_expand_row(row: &[u8], in_f: usize) -> (Vec<i8>, Vec<f32>) {
-    const POW3: [u8; 6] = [1, 3, 9, 27, 81, 243];
     let nb = in_f / 256;
     let mut weights = vec![0i8; nb * 256];
     let mut ds = vec![0f32; nb];
@@ -3088,7 +3073,7 @@ fn tq1_0_expand_row(row: &[u8], in_f: usize) -> (Vec<i8>, Vec<f32>) {
         let base = b * 256;
         // Segment 1: qs[0..32], 5 digit passes → 160 elems (outoff 0..160).
         for n in 0..5usize {
-            let p3 = POW3[n];
+            let p3 = TQ1_POW3[n];
             for m in 0..32usize {
                 let q = qs[m].wrapping_mul(p3);
                 let digit = (((q as u16) * 3) >> 8) as i8; // ∈ 0..2
@@ -3097,7 +3082,7 @@ fn tq1_0_expand_row(row: &[u8], in_f: usize) -> (Vec<i8>, Vec<f32>) {
         }
         // Segment 2: qs[32..48], 5 digit passes → 80 elems (outoff 160..240).
         for n in 0..5usize {
-            let p3 = POW3[n];
+            let p3 = TQ1_POW3[n];
             for m in 0..16usize {
                 let q = qs[32 + m].wrapping_mul(p3);
                 let digit = (((q as u16) * 3) >> 8) as i8; // ∈ 0..2
@@ -3106,7 +3091,7 @@ fn tq1_0_expand_row(row: &[u8], in_f: usize) -> (Vec<i8>, Vec<f32>) {
         }
         // Segment 3: qh[0..4], 4 digit passes → 16 elems (outoff 240..256).
         for n in 0..4usize {
-            let p3 = POW3[n];
+            let p3 = TQ1_POW3[n];
             for j in 0..4usize {
                 let q = qh[j].wrapping_mul(p3);
                 let digit = (((q as u16) * 3) >> 8) as i8; // ∈ 0..2
@@ -6941,6 +6926,11 @@ pub(crate) fn gated_act_row(
         }
     }
 }
+
+mod hi;
+#[cfg(test)]
+pub(crate) use hi::vec_dot_hi_reference;
+pub(crate) use hi::{vec_dot_hi, HiBatch};
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod batch_tier_tests;

@@ -111,8 +111,47 @@ against the weight's matching 256-element block (`kernels::vec_dot_hi`), summed
 from zero in the parts' order and added once: `dense + vec_dot_hi(..)`. Every
 route that dots a `Q8` adds it — the one-row `Op::Linear`, the prefill batch
 kernels and tiles, the packed VNNI GEMM, the MoE expert banks — so the value
-does not depend on the route. The parts use the existing one-row kernels, so no
-kernel changed and every format and tier is covered as it was.
+does not depend on the route.
+
+### How a part is dotted
+
+A part's dot is defined as the one-row kernel's value on a one-block activation
+holding the part's codes (`vec_dot_q8_any` over 256 inputs, which gives the
+scalar kernel's bits at every tier). The split's first form computed exactly
+that: a whole 256-element kernel call per part and weight row, for one or two
+nonzero codes. `kernels/hi.rs` now evaluates the scalar kernel's own expression
+from the weight elements at the codes alone, so every value keeps its bits:
+
+- **Integer sums.** Every kernel sums `weight · code` (and the codes, for a min
+  or offset term) in integers per sub-block. Those sums are exact, so the
+  nonzero codes alone give the same integers in any order.
+- **One float epilogue per block** (Q4_K, Q5_K, Q2_K: `0 + dh·(d·sd − dmin·sm)`;
+  Q6_K, Q3_K, IQ4_XS, TQ2_0, TQ1_0: `0 + d·dh·isum`): evaluated as written, from
+  the same integers and the same decoded scales.
+- **A float term per sub-block** (Q8_0's 32-element blocks, the grid formats'
+  8-element groups), added in order to a sum from `+0.0`. A sub-block with no
+  code adds `scale · 0`, which is `±0.0` when the scale is finite; such a sum is
+  never `-0.0` and `x + ±0.0 == x` for any other `x`, so that term is skipped. A
+  sub-block whose scale is not finite (or whose product with the part's scale
+  could overflow) is added as the kernel adds it, so its `NaN` reaches the
+  result. The grid formats still expand their one block (`*_expand_row`) per
+  part and weight row, and so stay slower than the rest (backlog B223).
+
+In a prefill (`kernels::HiBatch`) the element factors every part needs are
+decoded once per weight row into a small table: outlier channels repeat across
+rows, so an FFN-down op of Qwen3-1.7B's bench prompt needs about 30 distinct
+elements in about 18 blocks for over 500 parts. Each part is then two integer
+multiply-adds and the epilogue, run across eight weight rows at once. The packed
+VNNI GEMM adds the parts inside each 8-row group's task, right after the group's
+results are stored and while its weight rows are in cache. The o-major routes
+(the other formats, and every format without VNNI) add them in a pass of their
+own, 64 weight rows a task; an MoE bank's task adds them over its own weight
+rows after its dense dot. The first form (each part made whole and dotted by
+`vec_dot_q8_any`) stays in the tests as `vec_dot_hi_reference`, and
+`the_fast_sparse_dot_gives_the_one_row_kernels_bits`,
+`linear_routes_add_the_reference_sparse_dot_bitwise` and
+`expert_gemm_range_adds_the_reference_sparse_dot_bitwise` hold the new path to
+it bit for bit (every format, tier, spike pattern, row count and route).
 
 ### Where it fires
 
@@ -154,6 +193,22 @@ is where all of its cost is (below).
 - **The rule is per block and platform-independent**: float comparisons of f32
   magnitudes, one side multiplied by a power of two (exact), no fast-math, no
   data-dependent order.
+- **The exact sparse dot against its reference.** Planted one at a time
+  (2026-11-19), each of these turned the new tests red: a Q4_K sub-block's scale
+  taken from the next sub-block, a Q6_K element index off by one, a Q6_K scale
+  from the next 16-element sub-block, Q2_K's traversal with `j` and `half`
+  swapped, the one-epilogue product reassociated (`dh·(d·s)`), the parts summed
+  in reverse (one row, and in the batch table), Q8_0's sub-blocks summed in
+  reverse, the code-less sub-block or group skipped whatever its scale (Q8_0,
+  the grid formats: only the NaN-scale weights catch it), a part's second code
+  dropped in the batch table, and the packed GEMM's parts (or its tail rows'
+  parts) not added. One plant changed nothing: dropping the leading `0 +` of the
+  Q4_K-family epilogue, whose `-0.0` the sum over parts, which also starts at
+  `+0.0`, turns to `+0.0` anyway.
+- **The quantizer's no-split bound** (`quant::cannot_split`, below) clears a
+  block from the max pass only when no element can split; its test drives blocks
+  a few ulps either side of the bound, and with the bound's rounding margin
+  removed (254 in place of 254.25) it clears a block that splits.
 
 ### Options measured
 
@@ -187,15 +242,16 @@ raw prompt (one figure where only the chat prompt was run):
 - **int16 activations** are exact for practical purposes but halve the integer
   throughput of every kernel.
 - **The split** needs no kernel change. A row with no split block costs one
-  extra pass of the quantizer and nothing in the dots; each split block costs a
-  second one-block kernel call per weight row, about 70 to 90 ns, roughly 15 to
-  20 times a block of the packed GEMM (the review's per-op profile). Because the
-  FFN-down inputs split all through a sequence (above), that is a steady prefill
-  cost in those layers, not a first-token one. The ratio is the trade: at 8 the
-  split fires on several times as many blocks and measured 14 to 17% slower
-  Qwen3-1.7B pp512 in three pairs with the other agent compiling, so 8 was
-  dropped. At 64 ERNIE's and SmolLM3's first tokens are not fixed; 32 is the
-  last ratio that fixes them both, with no margin. 16 is committed (backlog
+  extra pass of the quantizer and nothing in the dots. As first landed, each
+  split block cost a second one-block kernel call per weight row, about 70 to 90
+  ns, roughly 15 to 20 times a block of the packed GEMM (the review's per-op
+  profile), and because the FFN-down inputs split all through a sequence
+  (above), that was a steady prefill cost in those layers; the exact sparse dot
+  ("How a part is dotted") brought it within the noise (Speed). The ratio is the
+  trade: at 8 the split fires on several times as many blocks and measured 14 to
+  17% slower Qwen3-1.7B pp512 in three pairs with the other agent compiling, so
+  8 was dropped. At 64 ERNIE's and SmolLM3's first tokens are not fixed; 32 is
+  the last ratio that fixes them both, with no margin. 16 is committed (backlog
   B210). What the ratio does not reach at 16 is ERNIE's position 1 on its chat
   template (below).
 
@@ -267,13 +323,12 @@ Prefill, which the one-row change does not touch, pays the split: -2.9% on ERNIE
 
 ### Speed
 
-The split costs 3.5% of Qwen3-1.7B's prefill and 1.9% of gemma-3-1b's on a
-native build (1.65% and 1.5% on a baseline build), all of it in the FFN-down
-layers, and 2.9% of ERNIE-4.5-21B-A3B's MoE prefill (above). Decode is level,
-except a baseline Qwen3-1.7B median of -1.3% at the edge of the noise. The owner
-approved landing the split at the earlier, busy-machine figure of about 2% and
-has been told the corrected one; making the sparse dot cheaper is queued
-(backlog B213).
+The split as it first landed cost 3.5% of Qwen3-1.7B's prefill and 1.9% of
+gemma-3-1b's on a native build (1.65% and 1.5% on a baseline build), all of it
+in the FFN-down layers, and 2.9% of ERNIE-4.5-21B-A3B's MoE prefill (above).
+Dotting the parts exactly and cheaply ("How a part is dotted") removes that cost
+to within the protocol's noise, with no output bit changed: see "Speed with the
+exact sparse dot" below. The rounds that follow here measured the first form.
 
 Measured on a quiet machine on 2026-11-19 (no other build, test or model run;
 the process list read before every round showed only an idle, hung `cargo test`
@@ -328,6 +383,118 @@ tests running (medians of -1.7% and -3.2% on Qwen3-1.7B, -1.2% and -3.8% on
 gemma-3-1b, and "about 2%"); the quiet rounds put Qwen3-1.7B's native cost at
 the high end of that and settle the baseline build's, which had been measured
 only against an earlier form of the split.
+
+### Speed with the exact sparse dot
+
+Measured on a quiet machine on 2026-11-19 (no other build, test or model run;
+the process list read before every round showed only an idle `cargo` of another
+session, started the day before, and the idle WSL service),
+`infr bench --dev cpu` (three reps a run, tok/s), Windows, release builds of
+`1b16e66b` (`before`: no split), `origin/main` at `579fec0a` (`main`: the split
+with the one-block kernel calls) and this change (`this`), native and baseline
+(`-C target-cpu=x86-64`), and a second copy of the native `this` binary for the
+noise. Twelve rounds for the dense models, eight for the MoE models, the
+binaries' order reversed every other round. Paired medians are computed from the
+values as the tables show them.
+
+| Model, run          | native `before`                                                                                | native `main`                                                                                  | native `this`                                                                                  | native `this` (copy)                                                                           |
+| ------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Qwen3-1.7B pp512    | 1135.1, 1142.4, 1134.6, 1145.8, 1158.7, 1153.6, 1146.7, 1120.8, 1145.7, 1129.8, 1155.4, 1143.9 | 1123.7, 1133.2, 1110.7, 1112.7, 1108.4, 1096.9, 1105.3, 1111.0, 1124.4, 1131.0, 1100.1, 1129.3 | 1146.9, 1141.7, 1137.2, 1135.3, 1124.0, 1134.6, 1131.2, 1130.6, 1140.5, 1140.1, 1138.0, 1133.1 | 1156.0, 1149.5, 1153.7, 1138.1, 1144.6, 1148.0, 1145.5, 1157.3, 1146.3, 1150.7, 1154.9, 1149.0 |
+| gemma-3-1b-it pp512 | 595.5, 591.9, 589.3, 594.4, 583.3, 591.4, 587.9, 576.7, 591.7, 576.9, 586.7, 586.7             | 588.5, 584.1, 584.1, 573.0, 580.3, 579.8, 579.8, 581.9, 575.2, 581.2, 579.5, 572.7             | 598.5, 588.5, 581.3, 587.2, 587.3, 584.8, 587.1, 580.6, 591.1, 596.8, 589.1, 587.0             | 593.4, 585.8, 584.0, 567.5, 582.8, 576.2, 586.0, 581.5, 575.7, 575.4, 591.4, 586.2             |
+| Qwen3-1.7B tg64     | 57.7, 58.3, 58.5, 58.5, 57.4, 57.9, 57.1, 57.4, 58.1, 57.6, 57.5, 58.5                         | 55.9, 57.5, 57.1, 57.5, 56.7, 57.3, 56.5, 57.6, 56.6, 54.4, 58.0, 57.1                         | 58.0, 56.9, 58.0, 57.0, 57.9, 56.5, 57.2, 57.8, 57.9, 57.0, 56.5, 57.6                         | 57.1, 57.4, 56.6, 57.9, 57.5, 57.2, 57.7, 56.2, 58.1, 57.4, 56.9, 57.8                         |
+| gemma-3-1b-it tg64  | 47.2, 46.8, 47.3, 47.1, 46.5, 46.3, 47.6, 47.0, 45.2, 46.1, 46.1, 45.3                         | 46.3, 46.5, 46.7, 47.3, 46.2, 46.5, 46.2, 46.8, 46.3, 47.0, 44.2, 47.4                         | 46.5, 46.6, 46.6, 46.2, 46.1, 46.7, 46.5, 45.5, 46.0, 46.5, 47.3, 44.3                         | 46.5, 46.9, 46.7, 45.7, 46.3, 46.2, 46.7, 46.4, 47.4, 46.2, 46.2, 46.4                         |
+
+| Model, run          | baseline `before`                                                                              | baseline `main`                                                                                | baseline `this`                                                                                |
+| ------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Qwen3-1.7B pp512    | 1042.2, 1038.4, 1034.2, 1057.2, 1053.6, 1028.2, 1017.5, 1035.4, 1035.6, 1047.2, 1036.3, 1029.8 | 1024.9, 1026.5, 1009.7, 1010.5, 1000.5, 1021.8, 1007.1, 1022.7, 1010.5, 1009.3, 1016.8, 1021.8 | 1065.3, 1029.0, 1055.3, 1033.9, 1051.0, 1057.2, 1039.6, 1026.3, 1054.2, 1029.4, 1047.4, 1051.9 |
+| gemma-3-1b-it pp512 | 581.1, 593.9, 582.1, 589.8, 588.3, 580.0, 576.0, 571.9, 579.8, 578.6, 582.5, 584.4             | 574.0, 572.1, 565.1, 575.3, 570.4, 573.8, 567.6, 569.6, 579.3, 575.0, 576.4, 577.3             | 589.9, 578.8, 582.0, 570.1, 582.1, 579.4, 575.9, 580.2, 570.7, 580.9, 582.7, 582.5             |
+| Qwen3-1.7B tg64     | 52.6, 51.6, 51.7, 51.9, 51.5, 51.3, 50.7, 51.8, 51.6, 51.2, 50.2, 51.2                         | 52.9, 50.4, 52.3, 51.7, 52.2, 50.7, 51.4, 51.7, 52.6, 52.0, 50.2, 52.9                         | 51.2, 52.5, 52.3, 52.1, 51.2, 49.7, 52.7, 52.7, 52.2, 51.9, 52.7, 52.7                         |
+| gemma-3-1b-it tg64  | 42.5, 43.1, 41.8, 40.3, 42.6, 41.4, 41.3, 41.9, 42.0, 41.7, 42.5, 41.7                         | 42.3, 41.4, 42.0, 42.4, 42.5, 40.2, 41.4, 40.6, 41.0, 41.8, 41.5, 41.5                         | 42.4, 41.8, 41.8, 42.0, 42.0, 40.5, 41.5, 41.8, 42.4, 40.4, 40.4, 41.2                         |
+
+| Model, run              | native `before`                                        | native `main`                                          | native `this`                                          | baseline `before`                                      | baseline `main`                                        | baseline `this`                                        |
+| ----------------------- | ------------------------------------------------------ | ------------------------------------------------------ | ------------------------------------------------------ | ------------------------------------------------------ | ------------------------------------------------------ | ------------------------------------------------------ |
+| ERNIE-4.5-21B-A3B pp512 | 471.3, 444.6, 472.1, 470.2, 441.7, 457.6, 453.9, 462.0 | 458.9, 458.0, 460.2, 457.8, 454.3, 460.9, 459.1, 458.9 | 467.2, 467.1, 466.6, 468.0, 465.3, 467.4, 464.8, 464.1 | 438.0, 443.8, 446.6, 440.1, 433.8, 419.4, 441.8, 432.7 | 433.4, 431.4, 433.3, 432.7, 431.4, 433.1, 429.7, 433.2 | 442.4, 440.3, 439.4, 441.6, 437.9, 441.1, 437.8, 441.1 |
+| ERNIE-4.5-21B-A3B tg64  | 25.9, 26.1, 25.9, 26.4, 26.5, 26.0, 26.2, 26.1         | 26.7, 27.1, 27.4, 27.1, 27.0, 26.9, 26.6, 26.7         | 26.6, 26.9, 26.9, 27.0, 27.0, 27.2, 26.7, 27.5         | 20.0, 20.4, 20.9, 20.1, 20.0, 20.8, 19.9, 20.2         | 25.9, 25.9, 25.7, 25.7, 25.7, 25.4, 26.5, 25.7         | 25.8, 26.2, 25.4, 26.1, 26.6, 26.6, 25.9, 25.8         |
+| Qwen3-30B-A3B pp512     | 418.5, 417.3, 420.4, 417.3, 418.6, 418.1, 419.2, 418.5 | 418.4, 416.4, 416.7, 416.4, 415.1, 415.6, 398.4, 416.6 | 418.0, 416.4, 412.0, 417.7, 415.7, 416.5, 414.4, 417.6 | 389.9, 389.7, 391.6, 386.7, 380.1, 388.4, 382.3, 391.8 | 391.2, 385.2, 386.8, 384.9, 379.4, 390.4, 386.1, 386.0 | 389.7, 388.5, 392.2, 390.8, 387.0, 392.2, 391.0, 391.0 |
+| Qwen3-30B-A3B tg64      | 27.1, 27.1, 27.4, 27.3, 27.1, 27.3, 27.1, 27.4         | 28.1, 28.4, 28.7, 28.2, 28.0, 28.4, 28.3, 28.1         | 28.3, 27.9, 28.0, 28.3, 28.4, 28.6, 28.4, 28.5         | 21.8, 21.4, 21.8, 21.7, 21.4, 21.6, 21.6, 21.6         | 26.7, 26.7, 27.3, 26.9, 26.5, 27.1, 27.2, 27.0         | 27.2, 27.2, 27.0, 26.9, 27.4, 26.9, 26.9, 27.1         |
+
+Paired medians, with the rounds in which the first build was the lower:
+
+| Run                     | build    | `this` vs `before` | `this` vs `main` | `main` vs `before` |
+| ----------------------- | -------- | ------------------ | ---------------- | ------------------ |
+| Qwen3-1.7B pp512        | native   | -0.69% (8 of 12)   | +1.90% (0 of 12) | -1.98% (11 of 12)  |
+| Qwen3-1.7B pp512        | baseline | +1.43% (5 of 12)   | +3.12% (0 of 12) | -1.77% (12 of 12)  |
+| gemma-3-1b pp512        | native   | -0.03% (6 of 12)   | +1.46% (2 of 12) | -1.27% (10 of 12)  |
+| gemma-3-1b pp512        | baseline | -0.06% (8 of 12)   | +1.13% (2 of 12) | -1.22% (12 of 12)  |
+| ERNIE-4.5-21B-A3B pp512 | native   | +1.30% (3 of 8)    | +1.61% (0 of 8)  | +0.03% (4 of 8)    |
+| ERNIE-4.5-21B-A3B pp512 | baseline | +0.64% (3 of 8)    | +1.87% (0 of 8)  | -1.37% (6 of 8)    |
+| Qwen3-30B-A3B pp512     | native   | -0.30% (7 of 8)    | +0.18% (2 of 8)  | -0.53% (8 of 8)    |
+| Qwen3-30B-A3B pp512     | baseline | +0.57% (3 of 8)    | +1.28% (1 of 8)  | -0.32% (5 of 8)    |
+| Qwen3-1.7B tg64         | native   | -0.95% (8 of 12)   | +1.06% (4 of 12) | -1.54% (10 of 12)  |
+| Qwen3-1.7B tg64         | baseline | +1.26% (3 of 12)   | -0.10% (6 of 12) | +0.87% (4 of 12)   |
+| gemma-3-1b tg64         | native   | -1.17% (8 of 12)   | -0.22% (7 of 12) | -0.53% (7 of 12)   |
+| gemma-3-1b tg64         | baseline | -0.72% (8 of 12)   | -0.12% (6 of 12) | -0.48% (8 of 12)   |
+| ERNIE-4.5-21B-A3B tg64  | native   | +2.88% (0 of 8)    | -0.18% (4 of 8)  | +2.87% (0 of 8)    |
+| ERNIE-4.5-21B-A3B tg64  | baseline | +28.72% (0 of 8)   | +0.77% (3 of 8)  | +27.54% (0 of 8)   |
+| Qwen3-30B-A3B tg64      | native   | +4.22% (0 of 8)    | +0.53% (2 of 8)  | +3.86% (0 of 8)    |
+| Qwen3-30B-A3B tg64      | baseline | +24.65% (0 of 8)   | +0.19% (3 of 8)  | +24.88% (0 of 8)   |
+
+The noise, from the native `this` binary against its copy in the same rounds:
++1.22% (Qwen3-1.7B pp512, the copy lower in 0 of 12), -0.61% (gemma-3-1b pp512,
+9 of 12), +0.52% and +0.32% on the decodes; single rounds -3.6 to +4.7%. So a
+median under about 1.2% is not resolved, and a fixed offset of that size between
+two copies of one binary is possible (the copy's lead held in all twelve
+Qwen3-1.7B prefill rounds).
+
+So the split's prefill cost is gone to within the noise on every workload,
+native and baseline: `this` is within ±1.43% of `before` on every prefill
+(medians), where `main` was 1.2 to 2.0% below it on the dense models in 10 to 12
+of 12 rounds, and `this` is above `main` in 44 of the 48 dense prefill rounds
+(native and baseline) and in all 16 ERNIE ones. Decode does not move against
+`main` (medians -0.22 to +1.06%); the MoE decode gains against `before` are the
+one-row int8 expert path's (above). `before`'s ERNIE prefill was noisy in this
+window (two rounds near 442 and 445), so its `main` against `before` reads level
+here where the ten earlier rounds read -2.9%; against `main`, `this` is faster
+in 8 of 8 on both builds.
+
+**Per op** (`INFR_PROF_OPS=1`, the last of two reps of pp512, native builds,
+four alternating rounds, ms per forward over every call of the op), `before` /
+`main` / `this`: Qwen3-1.7B's FFN-down `Linear m=511 6144x2048` Q6_K 44.2-46.9 /
+50.5-53.8 / 44.0-44.4 ms and Q4_K 36.7-40.0 / 39.9-42.2 / 35.9-36.6 ms, the
+whole forward 441.2-449.5 / 449.1-458.7 / 435.3-437.5 ms; gemma-3-1b's
+`Linear m=511 6912x1152` Q6_K 30.0-30.9 / 39.0-40.0 / 33.1-34.0 ms and Q4_K
+25.3-26.0 / 33.8-34.1 / 27.3-28.5 ms, the forward 842.0-860.6 / 854.0-863.5 /
+847.7-854.1 ms. What is left is gemma-3-1b's FFN-down, about 5 ms per forward
+(0.6% of it; it has about 7,100 split blocks a forward against Qwen3-1.7B's
+1,930), below what the bench rounds resolve.
+
+**Per weight row** (`kernels::hi::tests::microbench`, single-threaded, a
+2048-wide row, ns per weight row for one code, then for nine codes in five split
+blocks), the new dot against the one-block kernel calls it replaced: Q4_K 5.8 /
+115.4 and 22.7 / 581.9, Q6_K 6.0 / 116.5 and 23.5 / 580.6, Q5_K 6.2 / 122.0,
+Q2_K 5.6 / 119.4, Q3_K 7.9 / 121.8, IQ4_XS 5.9 / 119.6, Q8_0 8.4 / 121.2, TQ2_0
+4.9 / 217.5, TQ1_0 5.2 / 233.1; the grid formats 97.1 to 181.3 against 251.8 to
+292.1 (they still expand the block, backlog B223). A prefill's table
+(`batch_microbench`, Q6_K 6144 wide, two parts' elements): 8.3 ns per weight row
+to fill, 0.5 ns per weight row to evaluate one row's parts from it.
+
+**The quantizer** (`quant::tests::microbench`, three runs each): an ordinary
+2048-wide row took 1343 to 1369 ns with the split's count pass against 1296 to
+1301 ns for the unsplit quantizer; with the bound in the max pass
+(`quant::cannot_split`), 1327 to 1345 ns against 1318 to 1330 (11008 wide: 6779
+to 6874 against 6694 to 6758, where it was 6841 to 6874 against 6589 to 6605). A
+row whose blocks split pays `split_off`'s sort as before (6.9 µs for a 2048-wide
+row with two split blocks).
+
+**Quality** does not move: every value is the bits it was (the op hashes, the
+CPU goldens and the identity suites pass unchanged). `cpu_act_quant`'s
+`per_position_against_the_reference` on SmolLM3-3B, run on this change and on
+`origin/main` the same day, printed the same 44 score lines (production and
+every simulated scheme, four prompts): position 0 at 1.4e-4 on the chat prompts
+and 4e-5 on the raw one, position 1 at 1e-5 and 1.42e-3, the raw prompt's median
+1.3e-3, as "After the fix" lists. The chat prompts' worst position (240) scored
+0.691 on both builds, where that table lists 0.33 from the split's own
+measurement; what moved it in between is not traced here.
 
 ### What it does not fix
 

@@ -6921,8 +6921,8 @@ taken on 2026-11-19 (`docs/math.md`, `docs/cpu-activations.md`). What is left:
   that prints the scalar-to-NEON ratio (B206); plan 11's G3 and G4 (commit the
   planted-bug tests; convert the exact GPU goldens and wire `infr tune check`);
   plan 10's tuning slices S2 onward; plan 12's kernel ports from the fork; plan
-  12 S2, work-bounded submits and split heavy ops (B221); a cheaper sparse dot
-  for the activation split (B213).
+  12 S2, work-bounded submits and split heavy ops (B221); the activation split's
+  sparse dot on the grid formats (B223).
 
 ### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
 
@@ -6957,21 +6957,26 @@ sequence (measured by the review: 5.4% / 16.1% of rows on Qwen3-1.7B's Q4_K /
 Q6_K down inputs on the bench prompt, 32% / 38% on gemma-3-1b; about 1,930 and
 7,100 split blocks per forward), not the per-block rate this entry first quoted
 (0 to 1.1% of all projection-input blocks past position 0 on the bench prompt).
-Each split block costs a one-block kernel call per weight row, about 70 to 90
-ns, 15 to 20 times a block of the packed GEMM. The first figure, about 2% of
-prefill, was taken on a busy machine and understated it. On a quiet machine
-(2026-11-19, twelve paired rounds, `docs/cpu-activations.md`, Speed) the split
-costs 3.5% of Qwen3-1.7B pp512 and 1.9% of gemma-3-1b's on a native build, 1.65%
-and 1.5% on a baseline build, and 2.9% of ERNIE-4.5-21B-A3B's MoE prefill;
-decode is level except a baseline Qwen3-1.7B -1.3%, at the edge of the noise.
-The owner approved landing it at the earlier figure and has been told the
-corrected one. At 8 the split is somewhat better (ERNIE-4.5-0.3B's position 1,
-which attends to position 0's value row, reaches 0.029 against 0.13 at 16 and
-0.19 before) but measured 14 to 17% slower Qwen3-1.7B pp512 in three disturbed
-pairs. At 32 Qwen3-1.7B pp512 was level in this branch's rounds, but 32 is the
-last ratio that still fixes ERNIE's and SmolLM3's first tokens (64 leaves them
-at 0.61 and 0.30), so it has no margin. Do not change the ratio; make the sparse
-dot cheaper instead (B213).
+As first landed, each split block cost a one-block kernel call per weight row
+(about 70 to 90 ns, 15 to 20 times a block of the packed GEMM): 3.5% of
+Qwen3-1.7B pp512 and 1.9% of gemma-3-1b's on a native build, 1.65% and 1.5% on a
+baseline build, and 2.9% of ERNIE-4.5-21B-A3B's MoE prefill (quiet machine,
+2026-11-19). The exact sparse dot (`kernels/hi.rs`, 2026-11-19) evaluates the
+same expression from the codes' weight elements alone, with no output bit
+changed, and brought every prefill back to within the noise of the build before
+the split, native and baseline (`docs/cpu-activations.md`, "Speed with the exact
+sparse dot": medians -0.69% to +1.43% against `1b16e66b`, against an A-against-A
+noise of up to 1.22%). What is left: gemma-3-1b's FFN-down layers at about 5 ms
+of an 850 ms forward in the per-op profile, and the grid formats (B223). At 8
+the split is somewhat better (ERNIE-4.5-0.3B's position 1, which attends to
+position 0's value row, reaches 0.029 against 0.13 at 16 and 0.19 before) but
+measured 14 to 17% slower Qwen3-1.7B pp512 in three disturbed pairs with the
+one-block kernel calls; it fires on several times as many blocks, and what that
+costs with the exact sparse dot is not measured. At 32 Qwen3-1.7B pp512 was
+level in this branch's rounds, but 32 is the last ratio that still fixes ERNIE's
+and SmolLM3's first tokens (64 leaves them at 0.61 and 0.30), so it has no
+margin. Do not raise the ratio; whether 8 is now affordable is open (a
+measurement, then the owner's call: it changes output bits).
 
 **One position the split made worse, looked at (2026-11-19).** Qwen3-0.6B
 position 18 of `cpu_act_quant`'s first prompt (KL 0.109 before the split, 0.402
@@ -7010,7 +7015,7 @@ the gap may be that difference rather than the row's sensitivity alone.
 Controlled here: the same prompt, tokens and teacher forcing, and the same
 production code with only the split switched off. Not controlled: which of the
 other positions' changes reach row 18 (no per-position ablation was run). Input
-for B213's speed/quality work, not a defect to fix.
+for the ratio question above, not a defect to fix.
 
 ### B211 — the 32-element activation path is not split (2026-11-18)
 
@@ -7038,42 +7043,41 @@ before the committed ratio of 16). A parity test against a llama.cpp dump that
 reads position 0 (a one-token prompt) will now see that distance; later
 positions agree as before.
 
-### B213 — make the activation split's sparse dot cheap (2026-11-18)
+### B223 — the activation split's sparse dot on the grid formats (2026-11-19)
 
-**Tag:** cpu · perf · **Kind:** approved follow-up, not started
+**Tag:** cpu · perf · **Kind:** open, small
 
-The split (`docs/cpu-activations.md`, B210) costs 3.5% of Qwen3-1.7B's prefill
-and 1.9% of gemma-3-1b's on a native build (quiet machine, 2026-11-19), all in
-the FFN-down layers, because each split block is a whole one-block kernel call
-(`kernels::vec_dot_hi`) per weight row for a part with one or two nonzero codes.
-The review's two ideas, for a slice of its own:
+The sparse part's dot (`kernels/hi.rs`, `docs/cpu-activations.md`, "How a part
+is dotted") reads only the weight elements at a part's codes for the K-quants,
+IQ4_XS, the TQ formats and Q8_0, about 6 ns per part and weight row against 115
+ns for the old one-block kernel call (`kernels::hi::tests::microbench`,
+single-threaded). The grid formats (IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS,
+IQ1_S, IQ1_M) still expand the part's whole 256-element block
+(`*_expand_row(blk, 256)`, two allocations and 32 grid lookups) for each part
+and weight row, then sum only the codes' groups: 97 to 181 ns against 252 to 292
+ns for the old call, so 1.6 to 2.7 times faster, not 20. A per-group decoder for
+each grid format (the grid index, signs and scale of the one 8-element group a
+code sits in) would bring them in line; it duplicates each `*_expand_row`'s
+per-group logic unless those are refactored to call it, which touches the IQ
+batch kernels' hot path. Not measured on a model: no grid-format model is in the
+bench set.
 
-1. **Outlier channels repeat across rows.** Group an op's sparse parts by block;
-   for each weight row decode each needed weight block once, and add the
-   outliers as exact f32 (`w_i · x_i`) in a fixed scalar order. That is tier-
-   and row-identical by construction and more accurate than the int8 part (the
-   outlier enters exactly). Or a batch kernel over all parts that share a block,
-   using the existing thread-local scratch (`moe::with_block_scratch`): the
-   batch kernels as they are allocate per call, and a first try with them was
-   slower than the one-row calls.
-2. **Make ordinary blocks free with a bound from the max pass.** With `amax` the
-   block maximum and `Σ` its sum of magnitudes, a split needs a kept element
-   above 16 times the third largest magnitude `a3`, so `amax > 16·a3`, i.e.
-   `a3 < amax/16`. The two largest magnitudes are at most `amax` each and the
-   other 254 at most `a3`, so
-   `Σ - 2·amax <= Σ - a1 - a2 <= 254·a3 < 254·amax/16`. Hence **if
-   `16·(Σ - 2·amax)/254 >= amax`, no element of the block can split** (checked
-   by hand algebra, 2026-11-18; not run). The bound holds in exact arithmetic:
-   the f32 sum must not round below the true `Σ` for the test to stay one-sided,
-   so either accumulate in f64, or demand a margin (say
-   `16·(Σ - 2·amax) >= 254·amax·(1 + 2^-10)` with `Σ` from a 256-term f32 sum,
-   whose relative error is below `255·2^-24`). The existing count of elements at
-   or above `amax/16` already decides most blocks in one pass; the bound would
-   let the max pass decide them with no second pass.
+Also left as it was: a split block still costs `quant::split_off`'s sort of 256
+indices in the quantizer (a first-token row with two split blocks, 2048 wide,
+6.9 µs against 1.3 for an ordinary row), and the first-token row's parts in the
+attention and FFN-in projections each read their weight elements in a pass of
+their own on the o-major routes (the packed VNNI GEMM adds them in its group
+tasks).
 
-Measure either against `origin/main` in a quiet window, native and baseline,
-with the protocol and the A-against-A noise figures in `docs/math.md` (the FMA
-tier section): a median under about 1% is not resolved.
+Found while checking quality, not traced: `cpu_act_quant`'s
+`per_position_against_the_reference` on SmolLM3-3B scores the chat prompts'
+worst position (240) at KL 0.691, on `origin/main` (`579fec0a`) and on the exact
+sparse dot alike (all 44 score lines identical), where
+`docs/cpu-activations.md`'s "After the fix" table, from the split's own
+measurement, lists 0.33. Position 0, position 1 and the raw prompt match the
+table. Something between that measurement and `579fec0a` moved it (a later CPU
+change, or the test's switch to `infr_llama::tolerance`'s KL); bisecting the
+commits in between would say which.
 
 ### B214 — CPU goldens the activation split could not re-bless or confirm (2026-11-18)
 

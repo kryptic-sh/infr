@@ -887,20 +887,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   KL ratio 0.70 to 0.98 per model), with single positions moving both ways. The
   split is not only a first-token event: on the inputs of the FFN down
   projections it fires all through a sequence (1.6 to 38% of rows, by model and
-  weight format), and that is where its cost is. The first figure, about 2% of
-  prefill, was taken on a busy machine and understated it. Measured on a quiet
-  machine (twelve paired rounds of pp512), the split costs 3.5% of Qwen3-1.7B's
-  prefill on a native build (lower in 12 of 12 rounds), 1.9% of gemma-3-1b's,
-  1.65% and 1.5% on baseline builds, and 2.9% of ERNIE-4.5-21B-A3B's MoE prefill
-  (10 of 10; Qwen3-30B-A3B's -0.7% is inside the noise). Decode is level, except
-  a baseline Qwen3-1.7B at -1.3% (9 of 12), at the edge of the noise. The owner
-  approved landing it at the earlier figure and has been told the corrected one;
-  a cheaper sparse dot is queued (backlog B213). Blocks without such outliers
-  quantize to the same bits as before. Measurements and the options weighed are
-  in `docs/cpu-activations.md`. **Upgrade note:** the production CPU's output
-  changes once for every model whose activations carry such outliers (the CPU
-  goldens were re-blessed, Windows and Linux under WSL agreeing); one-token
-  llama.cpp parity dumps now differ at position 0 by design (B212).
+  weight format). As first landed it dotted each split block with a whole
+  one-block kernel call per weight row, which cost 3.5% of Qwen3-1.7B's prefill
+  on a native build, 1.9% of gemma-3-1b's, 1.65% and 1.5% on baseline builds and
+  2.9% of ERNIE-4.5-21B-A3B's MoE prefill (quiet machine, twelve and ten paired
+  rounds). The sparse part is now dotted from the weight elements at its codes
+  alone, the one-row kernel's own expression, so no output bit changed: per
+  weight row about 6 ns against 115 for a K-quant part, and in a prefill the
+  elements are decoded once per weight row for every row's parts, inside the
+  packed GEMM's group tasks. Against the build before the split, prefill medians
+  are now -0.69% / +1.43% (Qwen3-1.7B native / baseline), -0.03% / -0.06%
+  (gemma-3-1b), +1.30% / +0.64% (ERNIE-4.5-21B-A3B) and -0.30% / +0.57%
+  (Qwen3-30B-A3B), inside the protocol's noise of about 1.2%; against the split
+  as first landed, +1.90% / +3.12%, +1.46% / +1.13%, +1.61% / +1.87% and +0.18%
+  / +1.28%. Decode is level. The quantizer also clears an ordinary block from
+  its max pass (a bound on the sum of magnitudes) instead of a second pass. The
+  grid formats (IQ1/IQ2/IQ3) gain less (backlog B223). Blocks without such
+  outliers quantize to the same bits as before. Measurements and the options
+  weighed are in `docs/cpu-activations.md`. **Upgrade note:** the production
+  CPU's output changes once for every model whose activations carry such
+  outliers (the CPU goldens were re-blessed, Windows and Linux under WSL
+  agreeing); one-token llama.cpp parity dumps now differ at position 0 by design
+  (B212).
 
 - **A GPU submit that never completes is an error, not a hang.** Every Vulkan
   host wait (segment fences, replays, one-shot copies, `Backend::sync`,

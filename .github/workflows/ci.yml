@@ -179,6 +179,23 @@ jobs:
           cargo nextest run -p infr-llama --test cpu_backend --locked --color never \
             -E 'test(=cpu_golden_qwen3) | test(=cpu_golden_qwen35)' 2>&1 | tee goldens.log
           grep -E "Summary .* 2 tests run: 2 passed" goldens.log
+      # The int8 kernels' speed at each SIMD tier this runner has, scalar
+      # against the NEON `dotprod` kernels (`infr-cpu`'s `kernels/bench.rs`):
+      # one release test binary, the tiers interleaved round by round, medians
+      # printed as `kbench:` lines (`grep '^kbench:'` pulls the table from the
+      # log). A shared runner's absolute figures vary, the ratio to scalar is
+      # the number to read, and a slow run is not a failure, so this step only
+      # reports; that every tier gives the scalar bits is the suite above
+      # (`tier_tests`, `op_hashes`). It runs even when a step above failed:
+      # the timings are wanted either way.
+      - name: Kernel timings by SIMD tier (scalar vs NEON)
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          cargo test --release -p infr-cpu --lib --locked --color never kernels::bench \
+            -- --ignored --nocapture --test-threads=1 2>&1 | tee kbench.log
+          grep '^kbench:' kbench.log
 
   # CPU generation goldens against REAL models. The `cpu_golden_*` /
   # `cpu_kv_*` tests in `infr-llama/tests/cpu_backend.rs` self-skip when the

@@ -6972,6 +6972,9 @@ mod batch_tier_tests;
 mod tier_tests;
 
 #[cfg(test)]
+mod bench;
+
+#[cfg(test)]
 mod kernel_tests {
     use super::*;
     use crate::quant::{quantize_q8, quantize_q8_32};

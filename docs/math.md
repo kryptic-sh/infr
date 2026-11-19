@@ -330,13 +330,14 @@ so a cost of about 1% on baseline builds is neither shown nor ruled out.
 
 aarch64 has two tiers: `scalar` and `dotprod`, NEON with Armv8.2's dot-product
 extension (`sdot`), which every Apple M-series core and recent Arm server cores
-have. On Apple targets `dotprod` is part of the target's baseline features, so
-the uncapped dispatch is a compile-time constant there, as on an x86-64
-`target-cpu=native` build; on other aarch64 targets it is the standard library's
-cached run-time test. There is no separate `neon` tier because no kernel needs
-NEON without `sdot`, and no `i8mm` tier: its intrinsics (`vusdotq_s32`,
-`vmmlaq_s32`) are not stable Rust yet, and `sdot` already takes Q4_K's and
-Q6_K's unsigned codes as signed bytes.
+have. On macOS (`aarch64-apple-darwin`) `dotprod` is part of the target's
+baseline features, so the uncapped dispatch is a compile-time constant there, as
+on an x86-64 `target-cpu=native` build; on other aarch64 targets (Linux, and
+iOS, whose target has only `neon`) it is the standard library's cached run-time
+test. There is no separate `neon` tier because no kernel needs NEON without
+`sdot`, and no `i8mm` tier: its intrinsics (`vusdotq_s32`, `vmmlaq_s32`) are not
+stable Rust yet, and `sdot` already takes Q4_K's and Q6_K's unsigned codes as
+signed bytes.
 
 The NEON kernels (`crates/infr-cpu/src/kernels/neon.rs`) cover Q4_K, Q6_K and
 Q8_0, one-row and batch; the Q4_K 2- and 8-row tiles run the batch kernel row by
@@ -351,27 +352,52 @@ f32 dots still run their scalar kernels on aarch64, and there is no packed GEMM
 there (the packed layout is the VNNI kernels'); `docs/backlog.md` B206 lists
 them.
 
-**Speed**, scalar against `dotprod` on one machine: CI's macOS leg prints it
-(`kbench:` lines in the "Kernel timings by SIMD tier" step), and on a Mac:
+**Speed**, scalar against `dotprod` on one machine. CI prints both figures on
+every run: the kernels as `kbench:` lines in the macOS test leg's "Kernel
+timings by SIMD tier" step, the whole model as `mbench:` lines in the separate
+`infr bench (macOS arm64 CPU, scalar vs NEON)` job, which never fails the
+workflow. On a Mac, from a checkout:
 
 ```sh
+# The kernels, every tier in one process.
 cargo test --release -p infr-cpu --lib kernels::bench -- --ignored --nocapture
+# The whole model: the scalar kernels, then the NEON ones (no ceiling).
+cargo build --release -p infr-cli
+INFR_CPU_MAX_TIER=scalar ./target/release/infr bench unsloth/Qwen3-0.6B-GGUF:Q4_K_M --dev cpu -p 512 -n 0 -r 3
+./target/release/infr bench unsloth/Qwen3-0.6B-GGUF:Q4_K_M --dev cpu -p 512 -n 0 -r 3
 ```
 
-`kernel_speed_by_tier` times each kernel's dispatcher at every tier the CPU has
-in one process, 256 rows of 2048 against one activation row or a batch of 16,
-interleaved rounds, and prints the median time per row and the ratio to scalar.
-The whole-model figure is `infr bench --dev cpu` with `INFR_CPU_MAX_TIER=scalar`
-against the same run uncapped.
+(and the same pair with `-p 0 -n 64` for decode; alternate the two runs a few
+times rather than taking one of each.)
 
-| Kernel     | `dotprod` / `scalar` speed (macOS arm64 CI) |
-| ---------- | ------------------------------------------- |
-| q4k        | to be filled from CI                        |
-| q6k        | to be filled from CI                        |
-| q8_0       | to be filled from CI                        |
-| q4k_batch  | to be filled from CI                        |
-| q6k_batch  | to be filled from CI                        |
-| q8_0_batch | to be filled from CI                        |
+`kernel_speed_by_tier` times each kernel's dispatcher at every tier the CPU has
+in one process: 256 weight rows of 2048 elements against one activation row
+(one-row kernels) or a batch of 16 (batch kernels), nine interleaved rounds,
+reporting each tier's median. For a batch kernel `ns/row` is per weight row and
+activation row pair, so the two kinds' absolute figures are comparable.
+
+The first run, CI's `macos-15` (GitHub-hosted Apple Silicon) runner on
+2026-11-19, release, commit `a9bbc3ed` (before the batch tiles' scale unpacking
+was hoisted out of the per-activation loop):
+
+| Kernel     | `scalar` ns/row | `dotprod` ns/row | `dotprod` / `scalar` speed |
+| ---------- | --------------: | ---------------: | -------------------------: |
+| q4k        |           450.9 |             81.3 |                      5.54x |
+| q6k        |          1546.8 |             86.5 |                     17.88x |
+| q8_0       |            74.8 |             61.4 |                      1.22x |
+| q4k_batch  |           196.5 |             76.6 |                      2.57x |
+| q6k_batch  |           237.5 |             51.5 |                      4.61x |
+| q8_0_batch |            85.6 |             50.8 |                      1.68x |
+
+One run on a shared runner: the ratios are the result; the nanoseconds are not
+comparable across runs or machines. Q6_K gains most (17.9x one-row, 4.6x batch)
+because its scalar one-row kernel decodes the 6-bit codes slowly, element by
+element; Q4_K gains 5.5x and 2.6x; Q8_0 only 1.2x and 1.7x, its scalar kernel
+being a plain byte product the compiler already vectorizes well. The batch
+kernels are the ones prefill runs, so a model's prefill gain will be nearer the
+batch ratios, weighted by where its time goes (Q4_K_M is mostly Q4_K, with Q6_K
+for some tensors); decode runs the one-row kernels. The whole-model figure is
+the `mbench:` job's, not yet recorded here.
 
 ## The f32 dots on baseline builds: the FMA tier (plan 11 S6)
 

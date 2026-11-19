@@ -347,9 +347,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Q8_0 weights, one-row and batch (the default `Q4_K_M` quantization is Q4_K and
   Q6_K), run NEON kernels with the dot-product extension (`sdot`) instead of
   their scalar kernels, where the CPU has it (every Apple M-series core). Same
-  bits as the scalar kernels, so outputs do not change. Speed-ups to follow from
-  CI's macOS timing step (`docs/math.md`, aarch64); every other quantized format
-  still runs its scalar kernel there.
+  bits as the scalar kernels, so outputs do not change. Kernel speed against
+  scalar, one run on a GitHub-hosted Apple Silicon runner (2026-11-19; the
+  ratios are the result, not the absolute times): Q4_K 5.5x one-row and 2.6x
+  batch, Q6_K 17.9x and 4.6x, Q8_0 1.2x and 1.7x. Prefill runs the batch
+  kernels, decode the one-row ones; the whole-model figure is still to come
+  (`docs/math.md`, aarch64). Every other quantized format still runs its scalar
+  kernel there.
 
 - **One-row `Op::MoeFfn` takes int8 activations.** Quantized expert banks got
   f32 activations at one row (every decode step) and int8 at two or more, so MoE

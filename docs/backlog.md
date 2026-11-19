@@ -6641,20 +6641,22 @@ S3/S4 work and not re-read for this entry:
 1. **aarch64: most families have no NEON kernel yet.** The `dotprod` tier
    (`kernels/neon.rs`) covers Q4_K, Q6_K and Q8_0, one-row and batch; CI's macOS
    leg holds them to the scalar bits (`tier_tests`, `op_hashes`) and prints
-   their speed against scalar (`kbench:` lines; `docs/math.md`, aarch64, has the
-   table, to be filled from the first green run). Still scalar on aarch64, in
-   rough order of use: Q5_K (`Q5_K_M`), the native-32-block batch family (Q4_0,
-   Q4_1, Q5_0, Q5_1, Q8_0 below 256 wide, IQ4_NL, MXFP4, NVFP4), Q3_K, Q2_K,
-   IQ4_XS, the grid and ternary formats, and the f32/f16/bf16 dots. Also left: a
-   NEON form of the Q4_K 2- and 8-row tiles (they run the batch kernel row by
-   row, so each activation load serves one weight row where the AVX-512 tile's
-   serves eight) and of the packed GEMM; an `i8mm` tier (`smmla` multiplies 2x8
-   by 8x2 bytes, a natural fit for the batch tiles, but its intrinsics are not
-   stable Rust as of 1.100); and a whole-model scalar-against-`dotprod` figure
-   (`infr bench --dev cpu`, `INFR_CPU_MAX_TIER=scalar` against uncapped), which
-   needs a release `infr` binary the macOS CI leg does not build. Issue 100's
-   Mac owner can give both: the bench command in `docs/math.md` and the two
-   `infr bench` runs.
+   their speed against scalar (`kbench:` lines). The first run (2026-11-19, a
+   shared runner; `docs/math.md`, aarch64, has the table): Q4_K 5.5x one-row and
+   2.6x batch, Q6_K 17.9x and 4.6x, Q8_0 1.2x and 1.7x. Still scalar on aarch64,
+   in rough order of use: Q5_K (`Q5_K_M`), the native-32-block batch family
+   (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 below 256 wide, IQ4_NL, MXFP4, NVFP4), Q3_K,
+   Q2_K, IQ4_XS, the grid and ternary formats, and the f32/f16/bf16 dots. Also
+   left: a NEON form of the Q4_K 2- and 8-row tiles (they run the batch kernel
+   row by row, so each activation load serves one weight row where the AVX-512
+   tile's serves eight) and of the packed GEMM; an `i8mm` tier (`smmla`
+   multiplies 2x8 by 8x2 bytes, a natural fit for the batch tiles, but its
+   intrinsics are not stable Rust as of 1.100). The whole-model
+   scalar-against-`dotprod` figure comes from the non-required `cpu-bench-macos`
+   CI job (`mbench:` lines), not yet recorded in `docs/math.md`; the batch
+   ratios after the batch tiles' scale unpacking was hoisted (after `a9bbc3ed`)
+   are to be read from the next `kbench:` run. Issue 100's Mac owner can give
+   both on a quiet machine: the commands in `docs/math.md`, aarch64.
 2. **One-row MoE**: done; one-row `Op::MoeFfn` takes the int8 expert kernels
    (CHANGELOG), and decodes about 2% faster than the f32 path did on
    Qwen3-30B-A3B and ERNIE-4.5-21B-A3B (`docs/cpu-activations.md`, MoE models).

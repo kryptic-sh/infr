@@ -134,16 +134,18 @@ contracted or reordered anything.
 **Capping the tier.** The slices run at `infr_core::simd::active`'s tier, the
 one every SIMD dispatch in the CPU backend asks too: the widest the CPU has,
 under the ceiling `kernels.cpu.max_tier` (`INFR_CPU_MAX_TIER`: `scalar`, `avx2`,
-`avx512`, `avx512vnni`). The slices have no VNNI form, so `avx512vnni` runs
-their AVX-512 loops, and `scalar` their baseline ones. It is a process-wide
-debug switch: every CPU backend applies its value when it is built
-(`simd::set_max`; unset means no ceiling), so the backend built last decides for
-every backend in the process, and a backend built without the setting lifts an
-earlier one's ceiling rather than inheriting it. A ceiling above what the CPU
-has runs the CPU's widest tier. A misspelt name is a configuration error at
-load, from the file, `--set` or the environment alike. It changes only speed; it
-exists so the narrow paths every aarch64 machine and every pre-AVX2 x86 CPU runs
-can be measured and tested on a machine with wider ones. In a
+`avx512`, `avx512vnni`, and on aarch64 `dotprod`). The slices have no VNNI form,
+so `avx512vnni` runs their AVX-512 loops, and `scalar` and `dotprod` their
+baseline ones. It is a process-wide debug switch: every CPU backend applies its
+value when it is built (`simd::set_max`; unset means no ceiling), so the backend
+built last decides for every backend in the process, and a backend built without
+the setting lifts an earlier one's ceiling rather than inheriting it. A ceiling
+above what the CPU has runs the CPU's widest tier, and so does another
+architecture's tier: every name loads on every architecture, and a foreign tier
+ranks above all of this architecture's. A misspelt name is a configuration error
+at load, from the file, `--set` or the environment alike. It changes only speed;
+it exists so the narrow paths every aarch64 machine and every pre-AVX2 x86 CPU
+runs can be measured and tested on a machine with wider ones. In a
 `target-cpu=native` build `baseline` is the native code, so a baseline
 measurement needs a baseline build (`RUSTFLAGS="-C target-cpu=x86-64"`).
 
@@ -187,15 +189,16 @@ Plan 11's S3 and S4 extend the guarantee from this module to the whole CPU
 backend. What is proven, and how:
 
 - **Every SIMD tier.** `kernels.cpu.max_tier` (`scalar`, `avx2`, `avx512`,
-  `avx512vnni`; `infr_core::simd`) caps every run-time dispatch in the CPU
-  backend and the slices above. `crates/infr-cpu/src/kernels/tier_tests.rs` runs
-  every quantized kernel family (one-row and batch, Q2_K to Q8_0, the IQ and
-  ternary formats, the native-32-block family, MXFP4, NVFP4, Q4_K's 2- and 8-row
-  tiles, the 8-row Q8_0/Q5_0 tile) through its dispatcher at each tier the host
-  has and holds it to the scalar tier's bits, on inputs that reach the int8
-  extremes, both zero signs, subnormals and every code pattern, and checks which
-  tier each dispatcher took. One family differed (AVX-512 Q8_0, fixed in S4; see
-  the golden table below). The f32 dots (`dot`, `dot_n`, `dot_mn`, `dot_f16`,
+  `avx512vnni`, `dotprod`; `infr_core::simd`) caps every run-time dispatch in
+  the CPU backend and the slices above.
+  `crates/infr-cpu/src/kernels/tier_tests.rs` runs every quantized kernel family
+  (one-row and batch, Q2_K to Q8_0, the IQ and ternary formats, the
+  native-32-block family, MXFP4, NVFP4, Q4_K's 2- and 8-row tiles, the 8-row
+  Q8_0/Q5_0 tile) through its dispatcher at each tier the host has and holds it
+  to the scalar tier's bits, on inputs that reach the int8 extremes, both zero
+  signs, subnormals and every code pattern, and checks which tier each
+  dispatcher took. One family differed (AVX-512 Q8_0, fixed in S4; see the
+  golden table below). The f32 dots (`dot`, `dot_n`, `dot_mn`, `dot_f16`,
   `dot_bf16`, `axpy`, `mul_add_into`, `dequant_dot_rows`) have one source that
   fixes the order of every `mul_add` and of the lane sum; on a build without FMA
   they run an FMA compilation of it (below), held to the scalar bits the same
@@ -212,7 +215,9 @@ backend. What is proven, and how:
   on the synthetic LFM3 file in CI, and since one-row `Op::MoeFfn` takes int8
   activations (2026-11-18) on ERNIE-4.5-21B-A3B and Qwen3-30B-A3B (Windows).
 - **Windows and Linux** reproduce all of the above with the same values. aarch64
-  runs the scalar kernels and is the first thing CI's macOS jobs check.
+  runs the scalar kernels and, for Q4_K, Q6_K and Q8_0, the NEON `dotprod`
+  kernels (below); CI's macOS jobs run `tier_tests` and `op_hashes` at both
+  tiers there.
 
 **What "L2 proven" covers, exactly.** Run on one AVX-512 VNNI machine (Ryzen 9
 9950X3D), Windows and Linux under WSL:
@@ -320,6 +325,53 @@ difference of -4.0 t/s (-1.1%), middle values 372.9 against 377.3; Qwen3-1.7B
 pp512 is below in 6 of 8, mean -1.5 t/s (-0.4%), middle values 328.9 against
 329.9; decode level. Both lean toward `main` by less than the protocol resolves,
 so a cost of about 1% on baseline builds is neither shown nor ruled out.
+
+### aarch64: the `dotprod` tier
+
+aarch64 has two tiers: `scalar` and `dotprod`, NEON with Armv8.2's dot-product
+extension (`sdot`), which every Apple M-series core and recent Arm server cores
+have. On Apple targets `dotprod` is part of the target's baseline features, so
+the uncapped dispatch is a compile-time constant there, as on an x86-64
+`target-cpu=native` build; on other aarch64 targets it is the standard library's
+cached run-time test. There is no separate `neon` tier because no kernel needs
+NEON without `sdot`, and no `i8mm` tier: its intrinsics (`vusdotq_s32`,
+`vmmlaq_s32`) are not stable Rust yet, and `sdot` already takes Q4_K's and
+Q6_K's unsigned codes as signed bytes.
+
+The NEON kernels (`crates/infr-cpu/src/kernels/neon.rs`) cover Q4_K, Q6_K and
+Q8_0, one-row and batch; the Q4_K 2- and 8-row tiles run the batch kernel row by
+row. Each turns the weight codes into signed bytes (Q4_K nibbles as they are,
+Q6_K codes less 32, Q8_0 bytes as they are), takes each sub-block's integer dot
+with `sdot`, and finishes with the scalar kernel's own integer and float lines,
+so the bits are the scalar kernel's (each helper states its integer bound;
+nothing wraps). The batch kernels decode the weight row once and dot four
+activation rows per weight load. Every other family (Q2_K, Q3_K, Q5_K, IQ4_XS,
+the grid and ternary formats, the native-32-block family, MXFP4, NVFP4) and the
+f32 dots still run their scalar kernels on aarch64, and there is no packed GEMM
+there (the packed layout is the VNNI kernels'); `docs/backlog.md` B206 lists
+them.
+
+**Speed**, scalar against `dotprod` on one machine: CI's macOS leg prints it
+(`kbench:` lines in the "Kernel timings by SIMD tier" step), and on a Mac:
+
+```sh
+cargo test --release -p infr-cpu --lib kernels::bench -- --ignored --nocapture
+```
+
+`kernel_speed_by_tier` times each kernel's dispatcher at every tier the CPU has
+in one process, 256 rows of 2048 against one activation row or a batch of 16,
+interleaved rounds, and prints the median time per row and the ratio to scalar.
+The whole-model figure is `infr bench --dev cpu` with `INFR_CPU_MAX_TIER=scalar`
+against the same run uncapped.
+
+| Kernel     | `dotprod` / `scalar` speed (macOS arm64 CI) |
+| ---------- | ------------------------------------------- |
+| q4k        | to be filled from CI                        |
+| q6k        | to be filled from CI                        |
+| q8_0       | to be filled from CI                        |
+| q4k_batch  | to be filled from CI                        |
+| q6k_batch  | to be filled from CI                        |
+| q8_0_batch | to be filled from CI                        |
 
 ## The f32 dots on baseline builds: the FMA tier (plan 11 S6)
 

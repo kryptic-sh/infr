@@ -53,26 +53,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `docs/gpu-tolerance.md`. Nothing on the inference path changes.
 
 - **`kernels.cpu.max_tier` (`INFR_CPU_MAX_TIER`): a ceiling on the CPU's SIMD
-  tier**, `scalar`, `avx2`, `avx512` or `avx512vnni`. Every run-time dispatch in
-  the CPU backend (each quantized dot kernel, the packed VNNI GEMMs, the MoE
-  expert tiles, the int8 path's routes) and `infr_core::math`'s slice functions
-  ask one process-wide tier, `infr_core::simd::active`: the widest the CPU has,
-  or the ceiling when it is lower; a ceiling above what the CPU has runs the
-  CPU's widest. The ceiling selects which hand-written kernel of a family runs
-  (the scalar, AVX2, AVX-512 or VNNI one); it does not change the instruction
-  set the compiler may use, so on a `target-cpu=native` build the scalar kernels
-  are still compiled for, and auto-vectorized with, the machine's features. A
-  debug and testing switch: every tier gives the same bits, so it changes only
-  speed. With no ceiling set it has no measurable cost: the CPU backend's graph
-  interpreter is compiled twice and picks once per graph, and the uncapped copy
-  dispatches exactly as before (a compile-time constant on a native build). It
-  is process-wide: each CPU backend applies its value when built, unset meaning
-  no ceiling, so the last backend built decides. A misspelt tier is a config
-  error at load in the file, `--set` and the environment alike. It replaces the
-  unreleased `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER` (and
-  `math::set_tier`), which forced only the math slices: one ceiling covers both,
-  and the old key is no longer read. New: `infr_core::simd` (`SimdTier`,
-  `active`, `allows`, `capped`, `set_max`); `infr_cpu::turbo::QK` is public.
+  tier**, `scalar`, `avx2`, `avx512` or `avx512vnni`, and on aarch64 `dotprod`
+  (`infr_core::simd::SimdTier::Dotprod`; `SimdTier::ALL` lists the running
+  architecture's tiers and `SimdTier::NAMED` every name, which loads on every
+  architecture; another architecture's tier runs the CPU's widest, with a
+  warning). Every run-time dispatch in the CPU backend (each quantized dot
+  kernel, the packed VNNI GEMMs, the MoE expert tiles, the int8 path's routes)
+  and `infr_core::math`'s slice functions ask one process-wide tier,
+  `infr_core::simd::active`: the widest the CPU has, or the ceiling when it is
+  lower; a ceiling above what the CPU has runs the CPU's widest. The ceiling
+  selects which hand-written kernel of a family runs (the scalar, AVX2, AVX-512
+  or VNNI one); it does not change the instruction set the compiler may use, so
+  on a `target-cpu=native` build the scalar kernels are still compiled for, and
+  auto-vectorized with, the machine's features. A debug and testing switch:
+  every tier gives the same bits, so it changes only speed. With no ceiling set
+  it has no measurable cost: the CPU backend's graph interpreter is compiled
+  twice and picks once per graph, and the uncapped copy dispatches exactly as
+  before (a compile-time constant on a native build). It is process-wide: each
+  CPU backend applies its value when built, unset meaning no ceiling, so the
+  last backend built decides. A misspelt tier is a config error at load in the
+  file, `--set` and the environment alike. It replaces the unreleased
+  `kernels.cpu.math_tier` / `INFR_CPU_MATH_TIER` (and `math::set_tier`), which
+  forced only the math slices: one ceiling covers both, and the old key is no
+  longer read. New: `infr_core::simd` (`SimdTier`, `active`, `allows`, `capped`,
+  `set_max`); `infr_cpu::turbo::QK` is public.
 
 - **`CpuBackend::pool_threads`**: the size of the backend's thread pool once a
   graph has built it. `crates/infr-cpu/tests/op_hashes.rs` uses it: every `Op`
@@ -338,6 +342,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the slot alignment each needs.
 
 ### Changed
+
+- **NEON int8 kernels on aarch64 (Apple Silicon, Arm Linux).** Q4_K, Q6_K and
+  Q8_0 weights, one-row and batch (the default `Q4_K_M` quantization is Q4_K and
+  Q6_K), run NEON kernels with the dot-product extension (`sdot`) instead of
+  their scalar kernels, where the CPU has it (every Apple M-series core). Same
+  bits as the scalar kernels, so outputs do not change. Speed-ups to follow from
+  CI's macOS timing step (`docs/math.md`, aarch64); every other quantized format
+  still runs its scalar kernel there.
 
 - **One-row `Op::MoeFfn` takes int8 activations.** Quantized expert banks got
   f32 activations at one row (every decode step) and int8 at two or more, so MoE

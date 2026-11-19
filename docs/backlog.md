@@ -6638,12 +6638,23 @@ Quantized weights already run through int8 kernels on x86 (AVX2, AVX-512, VNNI)
 with 8-bit activations. Where that is not yet the case, as reported by plan 11's
 S3/S4 work and not re-read for this entry:
 
-1. **aarch64 has no hand-written kernels.** Every family runs its scalar kernel
-   on Apple Silicon and ARM Linux. NEON int8 dot-product kernels (`dotprod`,
-   `i8mm` where present) are likely the largest CPU gain left. Each must compute
-   the scalar expression, which `kernels/tier_tests.rs` enforces once the tier
-   is one `crate::simd` dispatches. Correctness can run on CI's macOS runner;
-   speed needs a Mac owner (issue 100 collects a baseline first).
+1. **aarch64: most families have no NEON kernel yet.** The `dotprod` tier
+   (`kernels/neon.rs`) covers Q4_K, Q6_K and Q8_0, one-row and batch; CI's macOS
+   leg holds them to the scalar bits (`tier_tests`, `op_hashes`) and prints
+   their speed against scalar (`kbench:` lines; `docs/math.md`, aarch64, has the
+   table, to be filled from the first green run). Still scalar on aarch64, in
+   rough order of use: Q5_K (`Q5_K_M`), the native-32-block batch family (Q4_0,
+   Q4_1, Q5_0, Q5_1, Q8_0 below 256 wide, IQ4_NL, MXFP4, NVFP4), Q3_K, Q2_K,
+   IQ4_XS, the grid and ternary formats, and the f32/f16/bf16 dots. Also left: a
+   NEON form of the Q4_K 2- and 8-row tiles (they run the batch kernel row by
+   row, so each activation load serves one weight row where the AVX-512 tile's
+   serves eight) and of the packed GEMM; an `i8mm` tier (`smmla` multiplies 2x8
+   by 8x2 bytes, a natural fit for the batch tiles, but its intrinsics are not
+   stable Rust as of 1.100); and a whole-model scalar-against-`dotprod` figure
+   (`infr bench --dev cpu`, `INFR_CPU_MAX_TIER=scalar` against uncapped), which
+   needs a release `infr` binary the macOS CI leg does not build. Issue 100's
+   Mac owner can give both: the bench command in `docs/math.md` and the two
+   `infr bench` runs.
 2. **One-row MoE**: done; one-row `Op::MoeFfn` takes the int8 expert kernels
    (CHANGELOG), and decodes about 2% faster than the f32 path did on
    Qwen3-30B-A3B and ERNIE-4.5-21B-A3B (`docs/cpu-activations.md`, MoE models).
@@ -6917,12 +6928,12 @@ taken on 2026-11-19 (`docs/math.md`, `docs/cpu-activations.md`). What is left:
   diagnostic runs on `main`), issue 100 (Apple Silicon numbers for the CPU
   math), issue 101 (the reporter was invited to open a PR for an incremental
   shader cache), llama.cpp issue 32424.
-- **Next in the queues, not started:** NEON kernels for aarch64 with a CI step
-  that prints the scalar-to-NEON ratio (B206); plan 11's G3 and G4 (commit the
-  planted-bug tests; convert the exact GPU goldens and wire `infr tune check`);
-  plan 10's tuning slices S2 onward; plan 12's kernel ports from the fork; plan
-  12 S2, work-bounded submits and split heavy ops (B221); the activation split's
-  sparse dot on the grid formats (B223).
+- **Next in the queues, not started:** the NEON kernels' measured ratios from CI
+  into `docs/math.md`, and the families still scalar on aarch64 (B206); plan
+  11's G3 and G4 (commit the planted-bug tests; convert the exact GPU goldens
+  and wire `infr tune check`); plan 10's tuning slices S2 onward; plan 12's
+  kernel ports from the fork; plan 12 S2, work-bounded submits and split heavy
+  ops (B221); the activation split's sparse dot on the grid formats (B223).
 
 ### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
 

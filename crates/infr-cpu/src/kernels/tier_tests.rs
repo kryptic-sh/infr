@@ -463,9 +463,10 @@ fn every_kernel_family_gives_the_scalar_bits_at_every_tier() {
     if !lacking.is_empty() {
         eprintln!("tier_tests: this CPU lacks {lacking:?}; those tiers are not checked here");
     }
-    // Every Apple target has the dot-product extension, so on one the NEON kernels must run
-    // here, not be skipped as a tier the host lacks.
-    #[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+    // A target whose baseline features include the dot-product extension (macOS on Apple
+    // Silicon, CI's macOS leg) must run the NEON kernels here, not skip them as a tier the host
+    // lacks.
+    #[cfg(all(target_arch = "aarch64", target_feature = "dotprod"))]
     assert!(host.contains(&SimdTier::Dotprod), "{host:?}");
     let mut ran = std::collections::BTreeMap::<SimdTier, usize>::new();
     let mut checked = 0usize;

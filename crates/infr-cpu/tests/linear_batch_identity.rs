@@ -11,10 +11,11 @@
 //! same bytes, then `Σ w·x` in f64) under an error bound derived from the arithmetic the kernels
 //! do, so a mistake both routes share cannot pass as "identical".
 //!
-//! What the routes cannot be forced to here: the scalar and AVX2-only kernel tiers (chosen by
-//! runtime CPU feature detection, with no config switch) and aarch64 (no SIMD kernels there; the
-//! scalar ones run). This file runs on whatever tier the host has; `kernels::batch_tier_tests`
-//! checks each x86_64 one-row/batch tier pairing directly.
+//! What the routes are not forced to here: the narrower kernel tiers. This file runs on whatever
+//! tier the host has (on aarch64 with the dot-product extension, the NEON kernels for Q4_K, Q6_K
+//! and Q8_0 and the scalar ones for the rest); `kernels::batch_tier_tests` checks each x86_64
+//! one-row/batch tier pairing directly, and `kernels::tier_tests` holds every tier's one-row and
+//! batch kernels, aarch64's included, to the scalar bits.
 //!
 //! Run: `cargo nextest run -p infr-cpu --test linear_batch_identity`
 

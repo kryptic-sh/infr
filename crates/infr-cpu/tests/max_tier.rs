@@ -22,8 +22,8 @@ fn backend(tier: Option<SimdTier>) -> CpuBackend {
 
 /// Turns red if a backend built without the setting leaves the process tier alone, if a ceiling
 /// is not applied, or if one above the CPU's widest is not clamped. On a CPU whose widest tier IS
-/// the scalar one (aarch64, a pre-AVX2 x86) the tiers coincide and the reset cannot be observed;
-/// the test says so rather than passing silently.
+/// the scalar one (a pre-AVX2 x86, an aarch64 core without the dot-product extension) the tiers
+/// coincide and the reset cannot be observed; the test says so rather than passing silently.
 #[test]
 fn every_backend_sets_the_ceiling_and_the_last_one_wins() {
     let best = SimdTier::best();

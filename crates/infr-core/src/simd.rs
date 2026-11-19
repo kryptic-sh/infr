@@ -131,8 +131,9 @@ impl SimdTier {
             }
             #[cfg(not(target_arch = "x86_64"))]
             SimdTier::Avx2 | SimdTier::Avx512 | SimdTier::Avx512Vnni => false,
-            // NEON is part of every aarch64 target; `dotprod` is part of the Apple ones (a
-            // constant there) and a run-time feature on the others.
+            // NEON is part of every aarch64 target; `dotprod` is part of macOS's
+            // (`aarch64-apple-darwin`: a constant there) and a run-time feature on the others,
+            // iOS's and Linux's included.
             #[cfg(target_arch = "aarch64")]
             SimdTier::Dotprod => {
                 cfg!(target_feature = "dotprod")
@@ -222,7 +223,7 @@ static CAPPED: AtomicBool = AtomicBool::new(false);
 /// Whether [`set_max`] put a ceiling below [`SimdTier::best`] in force. The CPU backend reads it
 /// once per graph to choose between its two compilations of the interpreter: with no ceiling, the
 /// dispatch it compiles from the CPU feature checks alone, which a build that already has the
-/// features (`target-cpu=native`, or `dotprod` on an Apple target) folds to a constant; under
+/// features (`target-cpu=native`, or `dotprod` on `aarch64-apple-darwin`) folds to a constant; under
 /// one, the dispatch that asks [`allows`] at every call.
 #[inline]
 pub fn capped() -> bool {

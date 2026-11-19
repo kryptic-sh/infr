@@ -13,7 +13,7 @@
 //! the bits are `tier_tests`' business.
 //!
 //! Every output line starts with [`PREFIX`], so the table can be pulled from a CI log with
-//! `grep`.
+//! `grep`. A batch kernel's `ns/row` is per weight row and activation row pair.
 
 // Test-only (`kernels.rs` declares it under `cfg(test)`); the attribute also tells
 // `infr-core/tests/no_bare_print.rs`, which scans a file down to its first one.
@@ -80,6 +80,9 @@ fn kernel_speed_by_tier() {
         .into_iter()
         .filter(|t| t.supported())
         .collect();
+    // libtest prints `test <name> ... ` without a newline when output is not captured: end
+    // that line first, so the header starts one of its own and `grep '^kbench:'` finds it.
+    println!();
     println!(
         "{PREFIX} in_f {IN_F}, {ROWS} weight rows, batch {BATCH} activations, median of \
          {ROUNDS} interleaved rounds; tiers {:?}",

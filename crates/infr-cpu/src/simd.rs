@@ -5,7 +5,7 @@
 //! (`CpuBackend::execute_with`), which `execute` picks once per graph from [`capped`]. With
 //! `CAPPED = false` a check is the CPU feature test alone (`is_x86_feature_detected!`,
 //! `is_aarch64_feature_detected!`): a build whose target features already include the tier
-//! (`target-cpu=native` on x86-64, `dotprod` on every Apple target) folds it to a constant, so
+//! (`target-cpu=native` on x86-64, `dotprod` on `aarch64-apple-darwin`) folds it to a constant, so
 //! the interpreter is exactly the code it was before the ceiling existed. Any run-time test there,
 //! even one load and a well-predicted branch per dispatch, measurably slowed prefill on such a
 //! build (docs/math.md has the numbers). With `CAPPED = true` a check asks
@@ -104,7 +104,8 @@ pub(crate) fn vnni<const CAPPED: bool>() -> bool {
 
 /// May this call run NEON code that uses the dot-product extension (`sdot`)? NEON itself is part
 /// of every aarch64 target. Uncapped, the `cfg!` makes it a constant on the targets that include
-/// `dotprod` (every Apple one); elsewhere it is the standard library's cached feature test.
+/// `dotprod` (`aarch64-apple-darwin`; not iOS, whose target has only `neon`); elsewhere it is the
+/// standard library's cached feature test.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) fn dotprod<const CAPPED: bool>() -> bool {

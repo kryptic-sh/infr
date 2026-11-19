@@ -414,6 +414,88 @@ jobs:
       - run: cargo build --workspace --locked
       - run: cargo test -p infr-metal --locked -- --include-ignored --nocapture
 
+  # Whole-model CPU speed on Apple Silicon, scalar kernels against the NEON
+  # `dotprod` ones: the figure the `kbench:` kernel table in the macOS test leg
+  # cannot give. One release `infr` binary, Qwen3-0.6B Q4_K_M from the macOS
+  # golden models cache (restored, never saved: the repository's cache is over
+  # its limit), `infr bench --dev cpu` at `INFR_CPU_MAX_TIER=scalar` and
+  # uncapped, interleaved for three rounds, printed as `mbench:` lines.
+  #
+  # Its own job because a release `infr-cli` build is too long for the required
+  # test leg (2 min on the Linux `build` job with a warm cache, more here
+  # cold), and informational: shared-runner timings vary, so `continue-on-error`
+  # keeps it from ever failing the workflow. rust-cache restores but does not
+  # save, for the same cache limit, so the build is usually cold. A cache miss
+  # on the model skips the bench rather than downloading it.
+  cpu-bench-macos:
+    name: infr bench (macOS arm64 CPU, scalar vs NEON)
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: macos-15
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/install-glslc
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: false
+      - run: rustup update --no-self-update stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - name: Restore the golden models
+        id: os-models
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/hf-goldens
+          key: hf-goldens-os-qwen3-06b_qwen35-08b-q4km-v1-${{ runner.os }}
+      - run: cargo build --release -p infr-cli --locked
+      - name: Whole-model CPU speed by SIMD tier
+        shell: bash
+        env:
+          HF_HUB_CACHE: ${{ runner.temp }}/hf-goldens
+          CACHE_HIT: ${{ steps.os-models.outputs.cache-hit }}
+        run: |
+          if [ "$CACHE_HIT" != "true" ]; then
+            echo "mbench: the golden models cache missed; nothing measured"
+            exit 0
+          fi
+          model=unsloth/Qwen3-0.6B-GGUF:Q4_K_M
+          # `--json` prints `[{"avg_ts": X, ...}]`: the mean tokens/s of the reps.
+          # One `infr bench`: `$1` is `scalar` (ceiling) or `uncapped` (none,
+          # the CPU's widest tier: `dotprod` here), `$2` the test's name.
+          run() {
+            local tier=$1 test=$2 ts
+            shift 2
+            if [ "$tier" = scalar ]; then
+              ts=$(INFR_CPU_MAX_TIER=scalar ./target/release/infr bench "$model" \
+                --dev cpu -r 2 --json "$@")
+            else
+              ts=$(env -u INFR_CPU_MAX_TIER ./target/release/infr bench "$model" \
+                --dev cpu -r 2 --json "$@")
+            fi
+            ts=$(echo "$ts" | grep -o '"avg_ts": *[0-9.]*' | grep -o '[0-9.]*$' || true)
+            echo "mbench: round $round $test $tier ${ts:-none} t/s" | tee -a mbench.log
+          }
+          for round in 1 2 3; do
+            for tier in scalar uncapped; do
+              run "$tier" pp512 -p 512 -n 0
+              run "$tier" tg64 -p 0 -n 64
+            done
+          done
+          # The median of the three rounds per test and tier, and uncapped over
+          # scalar. Fields: mbench: round N test tier t/s-value "t/s".
+          med() {
+            awk -v t="$1" -v k="$2" '$4 == t && $5 == k { print $6 }' mbench.log \
+              | sort -n | sed -n 2p
+          }
+          for test in pp512 tg64; do
+            s=$(med "$test" scalar)
+            u=$(med "$test" uncapped)
+            r=$(awk -v a="$u" -v b="$s" 'BEGIN { if (b > 0) printf "%.2f", a / b }')
+            echo "mbench: $test median scalar $s t/s, uncapped $u t/s, uncapped/scalar $r"
+          done
+
   # Windows end to end: the matrix compiles and unit-tests on Windows, but until
   # this job nothing there had ever downloaded a model or run a generation — and
   # downloading is where Windows actually differs. It exercises, on a real

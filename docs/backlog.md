@@ -6920,7 +6920,9 @@ taken on 2026-11-19 (`docs/math.md`, `docs/cpu-activations.md`). What is left:
 - **Next in the queues, not started:** NEON kernels for aarch64 with a CI step
   that prints the scalar-to-NEON ratio (B206); plan 11's G3 and G4 (commit the
   planted-bug tests; convert the exact GPU goldens and wire `infr tune check`);
-  plan 10's tuning slices S2 onward; plan 12's kernel ports from the fork.
+  plan 10's tuning slices S2 onward; plan 12's kernel ports from the fork; plan
+  12 S2, work-bounded submits and split heavy ops (B221); a cheaper sparse dot
+  for the activation split (B213).
 
 ### B209 — gemma-3-1b's mid-sequence CPU distance is int8 noise, not outliers (2026-11-18)
 
@@ -6956,25 +6958,30 @@ Q6_K down inputs on the bench prompt, 32% / 38% on gemma-3-1b; about 1,930 and
 7,100 split blocks per forward), not the per-block rate this entry first quoted
 (0 to 1.1% of all projection-input blocks past position 0 on the bench prompt).
 Each split block costs a one-block kernel call per weight row, about 70 to 90
-ns, 15 to 20 times a block of the packed GEMM. On a quiet machine (2026-11-19,
-twelve paired rounds, `docs/cpu-activations.md`, Speed) that is 3.5% of
-Qwen3-1.7B pp512 and 1.9% of gemma-3-1b's on a native build, 1.7% and 1.5% on a
-baseline build, decode level; accepted by the owner. At 8 the split is somewhat
-better (ERNIE-4.5-0.3B's position 1, which attends to position 0's value row,
-reaches 0.029 against 0.13 at 16 and 0.19 before) but measured 14 to 17% slower
-Qwen3-1.7B pp512 in three disturbed pairs. At 32 Qwen3-1.7B pp512 was level in
-this branch's rounds, but 32 is the last ratio that still fixes ERNIE's and
-SmolLM3's first tokens (64 leaves them at 0.61 and 0.30), so it has no margin.
-Do not change the ratio; make the sparse dot cheaper instead (B213).
+ns, 15 to 20 times a block of the packed GEMM. The first figure, about 2% of
+prefill, was taken on a busy machine and understated it. On a quiet machine
+(2026-11-19, twelve paired rounds, `docs/cpu-activations.md`, Speed) the split
+costs 3.5% of Qwen3-1.7B pp512 and 1.9% of gemma-3-1b's on a native build, 1.65%
+and 1.5% on a baseline build, and 2.9% of ERNIE-4.5-21B-A3B's MoE prefill;
+decode is level except a baseline Qwen3-1.7B -1.3%, at the edge of the noise.
+The owner approved landing it at the earlier figure and has been told the
+corrected one. At 8 the split is somewhat better (ERNIE-4.5-0.3B's position 1,
+which attends to position 0's value row, reaches 0.029 against 0.13 at 16 and
+0.19 before) but measured 14 to 17% slower Qwen3-1.7B pp512 in three disturbed
+pairs. At 32 Qwen3-1.7B pp512 was level in this branch's rounds, but 32 is the
+last ratio that still fixes ERNIE's and SmolLM3's first tokens (64 leaves them
+at 0.61 and 0.30), so it has no margin. Do not change the ratio; make the sparse
+dot cheaper instead (B213).
 
 **One position the split made worse, looked at (2026-11-19).** Qwen3-0.6B
 position 18 of `cpu_act_quant`'s first prompt (KL 0.109 before the split, 0.402
 after) is the `assistant` token after `<|im_start|>`; the same token is the
-worst row of the two other chat prompts (position 23: 0.033 to 0.203, and 0.097
-to 0.087, better). "Before" here is a scratch build with `HI_RATIO` infinite,
-which never splits and so quantizes exactly as before; it reproduced the
-review's 0.109 and 0.033. `localise_the_position_0_error` on rows 17 and 18,
-before against after, per `Op::Linear`:
+worst row of the two other chat prompts (prompt 1's position 23: 0.033 to 0.203;
+prompt 2's position 23: 0.097 to 0.087, better). "Before" here is a scratch
+build with `HI_RATIO` infinite, which never splits and so quantizes exactly as
+before; it reproduced the review's 0.109 and 0.033.
+`localise_the_position_0_error` on rows 17 and 18, before against after, per
+`Op::Linear`:
 
 - Row 18's own blocks barely split: 0.1% of its blocks over all ops at ratio 16,
   0.6 to 0.7% at ratio 8 (so about six times as many sit at 8 to 16 times their
@@ -6992,11 +6999,18 @@ before against after, per `Op::Linear`:
 
 So the worse KL is not this row's own quantization near the 16x threshold; it
 arrives through attention from other positions whose keys and values the split
-changed (position 0 above all), and grows in the last layers on a row the model
-is very sensitive on: the reference with the old 256-block quantizer simulated
+changed (position 0 the likeliest; no per-position ablation was run), and grows
+in the last layers on a row the model is likely very sensitive on. A hint, not a
+proof: the reference with the old 256-block quantizer simulated
 (`linear_tap::simulate`, `256:0:0:127`) scores the same position at 0.484, four
-times the real old production's 0.109, from an equivalent-quality perturbation.
-Input for B213's speed/quality work, not a defect to fix.
+times the real old production's 0.109. That simulation runs in reference mode
+(weights decoded to f32, f32 dots, the simulated quantizer applied to `Linear`
+inputs only), so the two differ in more than activation rounding, and part of
+the gap may be that difference rather than the row's sensitivity alone.
+Controlled here: the same prompt, tokens and teacher forcing, and the same
+production code with only the split switched off. Not controlled: which of the
+other positions' changes reach row 18 (no per-position ablation was run). Input
+for B213's speed/quality work, not a defect to fix.
 
 ### B211 — the 32-element activation path is not split (2026-11-18)
 

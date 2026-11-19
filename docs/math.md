@@ -448,18 +448,20 @@ reversed every other round:
 | Qwen3-0.6B tg64 reference | 14.8, 15.0, 14.8, 14.9, 14.8, 14.8, 14.8, 14.8, 14.8, 14.8, 14.7, 14.9             | 28.3, 28.4, 28.3, 27.9, 28.2, 28.2, 28.2, 28.4, 28.2, 28.1, 27.8, 28.1                         | 26.0, 26.2, 26.3, 25.8, 26.1, 25.6, 25.8, 26.1, 25.9, 26.1, 25.9, 26.0                         | 25.9, 26.2, 26.2, 25.9, 26.2, 26.1, 25.7, 26.0, 26.1, 25.7, 25.8, 26.0                         |
 
 **The noise.** The same native binary against a copy of itself, five paired
-rounds of the same protocol: paired differences of -1.8 to +3.1% on single
-rounds, medians -0.9% (Qwen3-1.7B pp512), +0.2% (gemma-3-1b pp512), +1.1%
-(Qwen3-1.7B tg64), +0.2% (gemma-3-1b tg64), +0.2% (reference tg64). So a median
-under about 1% is no measurable change here.
+rounds of the same protocol: paired differences of -1.8 to +3.2% on single
+rounds, medians -0.9% (Qwen3-1.7B pp512), +0.2% (gemma-3-1b pp512), +1.05%
+(Qwen3-1.7B tg64), +0.2% (gemma-3-1b tg64), +0.4% (reference tg64). Here and
+below, differences and medians are computed from the values as the table shows
+them. So a median under about 1% is no measurable change here.
 
 **The native build is level.** Paired after against before, median of the
-twelve: Qwen3-1.7B pp512 +1.0% (after lower in 4 of 12), gemma-3-1b pp512 +0.5%
-(3 of 12), Qwen3-1.7B tg64 -0.8% (8 of 12), reference tg64 -0.2% (7 of 12).
+twelve: Qwen3-1.7B pp512 +0.95% (after lower in 4 of 12), gemma-3-1b pp512 +0.5%
+(3 of 12), Qwen3-1.7B tg64 -0.7% (8 of 12), reference tg64 -0.2% (6 of 12 lower,
+2 tied).
 
 **The baseline build** gains 3.1x on Qwen3-1.7B prefill (median paired +207.9%),
-1.55x on gemma-3-1b prefill (+54.9%) and 1.9x on reference-mode decode (+90.6%);
-production decode is level (+1.2%). Against the native build of the same commit
+1.55x on gemma-3-1b prefill (+54.9%) and 1.9x on reference-mode decode (+90.5%);
+production decode is level (+1.25%). Against the native build of the same commit
 it is at 90% on Qwen3-1.7B prefill (median paired -9.6%, 12 of 12), 99% on
 gemma-3-1b prefill (-1.0%), 92% on Qwen3-1.7B decode (-8.4%) and 90% on
 gemma-3-1b decode (-9.7%); what is left is outside the f32 dots (backlog B208).

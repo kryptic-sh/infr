@@ -259,17 +259,21 @@ section below, tok/s:
 | ERNIE-4.5-21B-A3B tg64  | 26.2, 26.8, 26.5, 26.5, 26.5, 26.7, 26.4, 26.3, 26.7, 26.6           | 27.4, 27.2, 27.0, 27.2, 27.5, 27.0, 26.6, 27.4, 27.1, 27.1           |
 | ERNIE-4.5-21B-A3B pp512 | 469.9, 470.2, 468.0, 471.8, 471.8, 473.7, 474.5, 469.3, 471.4, 472.2 | 455.9, 460.4, 460.1, 456.2, 457.6, 455.5, 459.5, 460.3, 458.4, 459.7 |
 
-Decode is faster with int8 one-row experts: median paired +2.1% on Qwen3-30B-A3B
-(faster in 9 of 10 rounds) and +2.0% on ERNIE-4.5-21B-A3B (10 of 10). Prefill,
-which the one-row change does not touch, pays the split: -2.9% on ERNIE (10 of
-10), and -0.7% on Qwen3-30B-A3B (8 of 10, inside the noise).
+Decode is faster: median paired +2.0% on Qwen3-30B-A3B (faster in 9 of 10
+rounds) and +1.9% on ERNIE-4.5-21B-A3B (10 of 10). The two builds differ in both
+the one-row int8 expert path and the split, so this is the two together.
+Prefill, which the one-row change does not touch, pays the split: -2.9% on ERNIE
+(10 of 10), and -0.7% on Qwen3-30B-A3B (8 of 10, inside the noise).
 
 ### Speed
 
 The split costs 3.5% of Qwen3-1.7B's prefill and 1.9% of gemma-3-1b's on a
-native build (1.7% and 1.5% on a baseline build), all of it in the FFN-down
-layers, and decode is level. The owner accepted the cost; making the sparse dot
-cheaper is queued (backlog B213).
+native build (1.65% and 1.5% on a baseline build), all of it in the FFN-down
+layers, and 2.9% of ERNIE-4.5-21B-A3B's MoE prefill (above). Decode is level,
+except a baseline Qwen3-1.7B median of -1.3% at the edge of the noise. The owner
+approved landing the split at the earlier, busy-machine figure of about 2% and
+has been told the corrected one; making the sparse dot cheaper is queued
+(backlog B213).
 
 Measured on a quiet machine on 2026-11-19 (no other build, test or model run;
 the process list read before every round showed only an idle, hung `cargo test`
@@ -287,21 +291,22 @@ other round; the same rounds also measured the FMA tier (`docs/math.md`):
 | Qwen3-1.7B tg64     | 57.8, 57.4, 57.2, 57.9, 57.0, 58.0, 57.4, 57.4, 57.8, 58.3, 57.6, 57.7                         | 56.7, 57.7, 57.8, 57.3, 57.9, 57.8, 58.1, 57.1, 57.7, 57.6, 57.9, 57.9                         | 53.7, 52.5, 52.6, 53.2, 53.6, 53.2, 52.7, 52.0, 52.2, 52.9, 52.6, 52.6                         | 52.4, 50.6, 51.0, 52.0, 50.9, 52.3, 52.2, 52.3, 51.7, 52.9, 52.9, 52.4                       |
 | gemma-3-1b-it tg64  | 47.0, 47.4, 46.7, 46.8, 46.9, 47.0, 46.5, 47.2, 47.4, 45.3, 46.9, 47.0                         | 46.7, 47.7, 46.9, 46.0, 47.4, 45.5, 46.8, 46.8, 47.1, 46.6, 47.0, 46.8                         | 42.4, 42.3, 42.3, 42.4, 42.4, 42.4, 42.1, 42.9, 41.9, 42.9, 41.5, 41.9                         | 41.9, 42.2, 41.0, 42.2, 42.2, 42.9, 42.3, 42.2, 42.9, 42.0, 42.4, 41.0                       |
 
-Paired, `split` against `before`, per round:
+Paired, `split` against `before`, per round, computed from the values as the
+table shows them:
 
 - Qwen3-1.7B pp512, native: -1.0, -2.5, -2.2, -3.6, -4.0, -4.2, -4.0, -1.6,
-  -4.2, -3.4, -5.9, -1.3% (median -3.5%, lower in 12 of 12); baseline: -3.7,
+  -4.2, -3.5, -6.0, -1.3% (median -3.5%, lower in 12 of 12); baseline: -3.7,
   -1.1, -2.6, -0.9, -2.2, -1.1, -0.6, -2.0, -4.9, -1.1, -1.3, -2.2% (median
-  -1.7%, 12 of 12).
-- gemma-3-1b pp512, native: -2.9, -2.0, -1.4, -1.0, -0.3, -1.9, +0.6, -2.9,
+  -1.65%, 12 of 12).
+- gemma-3-1b pp512, native: -3.0, -2.0, -1.4, -1.0, -0.3, -1.8, +0.6, -2.9,
   -2.0, -1.4, -3.2, -3.0% (median -1.9%, 11 of 12); baseline: +0.2, -1.6, -1.5,
   -3.6, -1.0, -0.9, -1.3, -1.5, -1.6, -2.0, -1.7, -1.1% (median -1.5%, 11 of
   12).
 - Decode, medians: Qwen3-1.7B native +0.1% (lower in 6 of 12), baseline -1.3% (9
-  of 12); gemma-3-1b native -0.1% (6 of 12), baseline -0.4% (8 of 12).
+  of 12); gemma-3-1b native -0.1% (6 of 12), baseline -0.5% (8 of 12).
 
 The noise, from the same protocol with one native binary against a copy of
-itself (five rounds): single-round differences of -1.8 to +3.1%, medians within
+itself (five rounds): single-round differences of -1.8 to +3.2%, medians within
 ±1.1% (`docs/math.md` lists them). So the prefill costs are real (every or all
 but one of the rounds, medians above the noise) and decode is level; the
 baseline Qwen3-1.7B decode median of -1.3% is at the edge of the noise.

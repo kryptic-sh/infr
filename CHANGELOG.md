@@ -346,11 +346,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   prefilled in any chunk height gives the same bits. With the activation split
   (Fixed, below) Qwen3-30B-A3B's first token, run as a one-row graph, is at KL
   9e-4 and 9e-3 from the reference on two prompts; with the old quantizer it was
-  0.16 and 1.21. Decode is about 2% faster (tg64 medians +2.1% on Qwen3-30B-A3B,
-  +2.0% on ERNIE-4.5-21B-A3B, ten paired rounds on a quiet machine). **Upgrade
-  note:** MoE models' CPU decode output changes once (`cpu_golden_qwen3moe`
-  re-blessed, the same on Windows and Linux under WSL; CI does not run the MoE
-  goldens).
+  0.16 and 1.21. Decode is about 2% faster (tg64 medians +2.0% on Qwen3-30B-A3B,
+  +1.9% on ERNIE-4.5-21B-A3B, ten paired rounds on a quiet machine, measured
+  across this change and the activation split together). **Upgrade note:** MoE
+  models' CPU decode output changes once (`cpu_golden_qwen3moe` re-blessed, the
+  same on Windows and Linux under WSL; CI does not run the MoE goldens).
 
 - **A slow discrete GPU splits its first forward (issue 94).** A device that is
   wave64-only, or has neither 16x16x16 f16 cooperative matrices nor an
@@ -887,16 +887,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   KL ratio 0.70 to 0.98 per model), with single positions moving both ways. The
   split is not only a first-token event: on the inputs of the FFN down
   projections it fires all through a sequence (1.6 to 38% of rows, by model and
-  weight format), and that is where its cost is: on a quiet machine, twelve
-  paired rounds of pp512, 3.5% on Qwen3-1.7B and 1.9% on gemma-3-1b with a
-  native build, 1.7% and 1.5% with a baseline build; decode level. The owner
-  accepted it; a cheaper sparse dot is queued (backlog B213). Blocks without
-  such outliers quantize to the same bits as before. Measurements and the
-  options weighed are in `docs/cpu-activations.md`. **Upgrade note:** the
-  production CPU's output changes once for every model whose activations carry
-  such outliers (the CPU goldens were re-blessed, Windows and Linux agreeing,
-  except as B214 lists); one-token llama.cpp parity dumps now differ at position
-  0 by design (B212).
+  weight format), and that is where its cost is. The first figure, about 2% of
+  prefill, was taken on a busy machine and understated it. Measured on a quiet
+  machine (twelve paired rounds of pp512), the split costs 3.5% of Qwen3-1.7B's
+  prefill on a native build (lower in 12 of 12 rounds), 1.9% of gemma-3-1b's,
+  1.65% and 1.5% on baseline builds, and 2.9% of ERNIE-4.5-21B-A3B's MoE prefill
+  (10 of 10; Qwen3-30B-A3B's -0.7% is inside the noise). Decode is level, except
+  a baseline Qwen3-1.7B at -1.3% (9 of 12), at the edge of the noise. The owner
+  approved landing it at the earlier figure and has been told the corrected one;
+  a cheaper sparse dot is queued (backlog B213). Blocks without such outliers
+  quantize to the same bits as before. Measurements and the options weighed are
+  in `docs/cpu-activations.md`. **Upgrade note:** the production CPU's output
+  changes once for every model whose activations carry such outliers (the CPU
+  goldens were re-blessed, Windows and Linux under WSL agreeing); one-token
+  llama.cpp parity dumps now differ at position 0 by design (B212).
 
 - **A GPU submit that never completes is an error, not a hang.** Every Vulkan
   host wait (segment fences, replays, one-shot copies, `Backend::sync`,

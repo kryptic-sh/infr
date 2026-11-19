@@ -444,7 +444,13 @@ The noise, from the native `this` binary against its copy in the same rounds:
 9 of 12), +0.52% and +0.32% on the decodes; single rounds -3.6 to +4.7%. So a
 median under about 1.2% is not resolved, and a fixed offset of that size between
 two copies of one binary is possible (the copy's lead held in all twelve
-Qwen3-1.7B prefill rounds).
+Qwen3-1.7B prefill rounds). Since the order was reversed every other round, that
+offset follows the file (its path, its placement on disk, antivirus scanning),
+not its place in the round, so a difference of up to about 1.2% between two
+binaries is unresolved even when it holds in N of N rounds: "within the noise of
+`1b16e66b`" stands, while "+1.90% against `main`" means somewhere between about
+0.7% and 3.1%. Rotating the physical copies between rounds would remove the
+offset (backlog B224).
 
 So the split's prefill cost is gone to within the noise on every workload,
 native and baseline: `this` is within ±1.43% of `before` on every prefill
@@ -489,12 +495,17 @@ row with two split blocks).
 **Quality** does not move: every value is the bits it was (the op hashes, the
 CPU goldens and the identity suites pass unchanged). `cpu_act_quant`'s
 `per_position_against_the_reference` on SmolLM3-3B, run on this change and on
-`origin/main` the same day, printed the same 44 score lines (production and
+`origin/main` on 2026-11-19, printed the same 44 score lines (production and
 every simulated scheme, four prompts): position 0 at 1.4e-4 on the chat prompts
 and 4e-5 on the raw one, position 1 at 1e-5 and 1.42e-3, the raw prompt's median
-1.3e-3, as "After the fix" lists. The chat prompts' worst position (240) scored
-0.691 on both builds, where that table lists 0.33 from the split's own
-measurement; what moved it in between is not traced here.
+1.3e-3, as "After the fix" lists, and the chat prompts' worst position 240 at
+0.691. That table's later chat positions are not comparable with these:
+SmolLM3's template stamps the day into its system block
+(`Today Date: {{ strftime_now(..) }}`, filled from the local clock by
+`infr-chat`), so the chat prompts' tokens, and every position after the date,
+change from one day to the next. The table was measured on 2026-11-18, when the
+worst position was 229 (0.33; position 240 was 0.22 that day). Per-position
+numbers on a date-stamping template compare only within one day (backlog B224).
 
 ### What it does not fix
 

@@ -7069,15 +7069,36 @@ attention and FFN-in projections each read their weight elements in a pass of
 their own on the o-major routes (the packed VNNI GEMM adds them in its group
 tasks).
 
-Found while checking quality, not traced: `cpu_act_quant`'s
-`per_position_against_the_reference` on SmolLM3-3B scores the chat prompts'
-worst position (240) at KL 0.691, on `origin/main` (`579fec0a`) and on the exact
-sparse dot alike (all 44 score lines identical), where
-`docs/cpu-activations.md`'s "After the fix" table, from the split's own
-measurement, lists 0.33. Position 0, position 1 and the raw prompt match the
-table. Something between that measurement and `579fec0a` moved it (a later CPU
-change, or the test's switch to `infr_llama::tolerance`'s KL); bisecting the
-commits in between would say which.
+### B224 — measurements that drift with the date or the binary's file (2026-11-19)
+
+**Tag:** cpu · tests · perf · **Kind:** open, protocol
+
+- **Date-stamped chat templates.** SmolLM3's template writes
+  `Today Date: {{ strftime_now("%d %B %Y") }}` into its default system block,
+  and `infr-chat`'s `strftime_now` (`template.rs`) formats
+  `chrono::Local::now()` with no way to fix the clock: no parameter, environment
+  variable or test hook. So `cpu_act_quant`'s chat prompts on SmolLM3 tokenize
+  differently every day, and its per-position KL after the date (positions 0 to
+  240 of those prompts are the shared system preamble that follows it) is
+  comparable only within one day: on 2026-11-18 the worst chat position was 229
+  at 0.33 (240 at 0.22); on 2026-11-19, on `origin/main` and the exact sparse
+  dot alike, 240 at 0.691 (229 at 0.027, the review's run). Nothing regressed.
+  Fix: a way to pin the date for tests and measurements (a render option or a
+  test-only clock in `infr-chat`), then use it in `cpu_act_quant`; not done
+  here, to add no production surface in a CPU slice. Goldens checked
+  (2026-11-19): `cpu_golden_smollm3` renders through `smollm3_render`, whose
+  `/system_override` system message replaces the dated block, and asserts the
+  render has no `Today Date`; of the cached GGUFs the CPU goldens use (Qwen3,
+  Qwen3.5, gemma-3-1b, ERNIE, LFM3, Qwen3-30B-A3B, ERNIE-21B), only SmolLM3's
+  template contains `strftime_now`. gemma-4-E2B's template was not checked (not
+  cached here; its golden skips).
+- **The binary's file.** In the 2026-11-19 rounds (`docs/cpu-activations.md`,
+  "Speed with the exact sparse dot") a copy of the native binary ran 1.22% ahead
+  of the original in 12 of 12 Qwen3-1.7B prefill rounds although the order was
+  reversed every other round: an offset tied to the file, not its position. Next
+  time, rotate the physical copies between rounds (each build as several copies,
+  a different one each round) or take an A-against-A pair per build; until then
+  a paired difference under about 1.2% is unresolved however many rounds agree.
 
 ### B214 — CPU goldens the activation split could not re-bless or confirm (2026-11-18)
 

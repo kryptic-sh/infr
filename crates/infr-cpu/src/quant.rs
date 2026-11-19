@@ -94,6 +94,37 @@ fn block_max(blk: &[f32]) -> f32 {
     blk.iter().fold(0f32, |m, &v| m.max(v.abs()))
 }
 
+/// The largest magnitude in `blk` (NaN passed over, as [`block_max`] does) and the f32 sum of all
+/// magnitudes (NaN when an element is NaN), from one pass in 16 lanes.
+#[inline]
+fn block_max_sum(blk: &[f32]) -> (f32, f32) {
+    let (mut m, mut s) = ([0f32; 16], [0f32; 16]);
+    for c in blk.as_chunks::<16>().0 {
+        for k in 0..16 {
+            let a = c[k].abs();
+            m[k] = m[k].max(a);
+            s[k] += a;
+        }
+    }
+    (m.iter().fold(0f32, |x, &v| x.max(v)), s.iter().sum())
+}
+
+/// Whether no element of a 256-element block can split ([`split_off`]), from its largest
+/// magnitude `amax` and the f32 sum `sum` of its magnitudes ([`block_max_sum`]). A split needs
+/// `a1 = amax` above [`HI_RATIO`] times the third largest magnitude `a3`. The 254 magnitudes
+/// after the top two are at most `a3` each, so `Σ − 2·a1 ≤ Σ − a1 − a2 ≤ 254·a3`, and
+/// `HI_RATIO·(Σ − 2·a1) ≥ 254·a1` gives `HI_RATIO·a3 ≥ a1`: no split. `sum` is a 256-term f32 sum
+/// of non-negative terms, so in any order it is at most `γ = 255·2^-24/(1 − 255·2^-24)` (under
+/// 1.6e-5) above the exact `Σ ≤ 256·a1`, which overstates `HI_RATIO·Σ` by under `0.07·a1` at a
+/// ratio of 16. The test asks for `254.25·a1`, a margin of `0.25·a1`, evaluated in f64, where
+/// both products are exact and the subtraction's rounding is far below the margin. So `true` is
+/// never wrong, and `false` only sends the block to [`split_off`]. A NaN or infinite `sum` (an
+/// element NaN or infinite, or the sum overflowing) gives `false`.
+#[inline]
+fn cannot_split(amax: f32, sum: f32) -> bool {
+    sum.is_finite() && HI_RATIO as f64 * (sum as f64 - 2.0 * amax as f64) >= 254.25 * amax as f64
+}
+
 /// Quantize `blk` to codes in `q` on the scale `amax/127` (`amax` its [`block_max`]), returning
 /// the scale.
 #[inline]
@@ -158,7 +189,11 @@ pub(crate) fn quantize_q8(x: &[f32]) -> Q8 {
     for b in 0..nb {
         let blk = &x[b * 256..b * 256 + 256];
         let q = &mut qs[b * 256..b * 256 + 256];
-        let amax = block_max(blk);
+        let (amax, sum) = block_max_sum(blk);
+        if cannot_split(amax, sum) {
+            d[b] = quantize_block(blk, amax, q);
+            continue;
+        }
         let kept = split_off(blk, amax);
         if kept.is_empty() {
             d[b] = quantize_block(blk, amax, q);
@@ -295,6 +330,55 @@ mod tests {
             d[b] = quantize_block(blk, block_max(blk), &mut qs[b * 256..b * 256 + 256]);
         }
         from_codes(qs, d)
+    }
+
+    /// [`cannot_split`] never clears a block that splits: blocks at the edge of the bound (two
+    /// magnitudes a few ulps either side of `HI_RATIO` times the other 254, which are all equal,
+    /// where `HI_RATIO·(Σ − 2·a1)` is within a few ulps of `254·a1`), at magnitudes from
+    /// subnormal to near overflow and with the large pair placed anywhere, and blocks with NaN or
+    /// infinite elements. The edge blocks above the ratio do split, so the check has teeth, and an
+    /// ordinary block is cleared, so the bound is used.
+    #[test]
+    fn the_no_split_bound_never_clears_a_block_that_splits() {
+        let mut split = 0usize;
+        for a3 in [1e-42f32, 1e-30, 0.37, 1.0, 3.0e3, 1.0e35] {
+            for k in -6i32..=6 {
+                let a1 = HI_RATIO * a3 * (1.0 + k as f32 * f32::EPSILON);
+                for (i, j) in [(0usize, 1usize), (17, 255), (128, 129)] {
+                    for second in [a1, -a1, a3] {
+                        let mut blk = [a3; 256];
+                        for (n, v) in blk.iter_mut().enumerate() {
+                            if n % 3 == 1 {
+                                *v = -*v;
+                            }
+                        }
+                        blk[i] = a1;
+                        blk[j] = second;
+                        let amax = block_max(&blk);
+                        let (m, s) = block_max_sum(&blk);
+                        assert_eq!(m.to_bits(), amax.to_bits());
+                        let splits = !split_off(&blk, amax).is_empty();
+                        split += usize::from(splits);
+                        if cannot_split(m, s) {
+                            assert!(!splits, "a3 {a3:e} k {k} at {i},{j}: cleared a split");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(split > 0, "no edge block split");
+        let mut odd = [0.5f32; 256];
+        odd[3] = f32::NAN;
+        let (m, s) = block_max_sum(&odd);
+        assert!(!cannot_split(m, s), "a NaN element was cleared");
+        odd[3] = f32::INFINITY;
+        let (m, s) = block_max_sum(&odd);
+        assert!(!cannot_split(m, s), "an infinite element was cleared");
+        let ordinary: Vec<f32> = (0..256)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0)
+            .collect();
+        let (m, s) = block_max_sum(&ordinary);
+        assert!(cannot_split(m, s), "an ordinary block was not cleared");
     }
 
     /// An ordinary row: no block splits, and the quantizer gives the codes it gave before the

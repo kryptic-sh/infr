@@ -363,10 +363,17 @@ impl CpuBackend {
     /// for: no environment, and two backends with different configurations can coexist in one
     /// test, with ONE exception: `kernels.cpu.max_tier` is a process-wide debug switch. Every
     /// construction applies it ([`infr_core::simd::set_max`]; unset = no ceiling, the widest
-    /// tier the CPU has; a ceiling above the CPU's widest runs the widest), so the backend built
-    /// last decides the SIMD tier of every kernel and math slice for every backend in the
-    /// process. Only speed is at stake: every tier gives the same bits.
+    /// tier the CPU has; a ceiling above the CPU's widest runs the widest, and so does another
+    /// architecture's tier, with a warning), so the backend built last decides the SIMD tier of
+    /// every kernel and math slice for every backend in the process. Only speed is at stake:
+    /// every tier gives the same bits.
     pub fn new_with(cfg: Arc<Config>) -> Self {
+        if let Some(t) = cfg.kernels.cpu.max_tier.filter(|t| !t.native()) {
+            tracing::warn!(
+                "kernels.cpu.max_tier = {:?} is not a tier of this CPU's architecture: no ceiling",
+                t.name()
+            );
+        }
         infr_core::simd::set_max(cfg.kernels.cpu.max_tier);
         Self {
             weight_cache: Mutex::default(),

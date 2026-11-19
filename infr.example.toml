@@ -188,9 +188,10 @@ spinpool = true
 repack_mb = 4096 # repack-cache budget, MiB
 reference = false # bit-reference kernels (no env twin)
 core_spread = true # pool threads off each other's SMT siblings (Windows; no env twin)
-# max_tier = "scalar" # SIMD ceiling for the kernels and math slices (scalar/avx2/avx512/
-#                     # avx512vnni); debug only, same bits at every tier; process-wide: the
-#                     # last CPU backend built sets it (unset = the CPU's widest)
+# max_tier = "scalar" # SIMD ceiling for the kernels and math slices (scalar; x86-64: avx2/
+#                     # avx512/avx512vnni; aarch64: dotprod; another arch's tier = no ceiling);
+#                     # debug only, same bits at every tier; process-wide: the last CPU
+#                     # backend built sets it (unset = the CPU's widest)
 
 # ── Profiling ──────────────────────────────────────────────────────────────────
 # wmma_tile = "2x2"   # exactly 1x1 / 2x1 / 2x2; default: unset = shape-driven

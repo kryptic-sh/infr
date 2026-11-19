@@ -540,12 +540,13 @@ cfg_struct! {
         /// `INFR_CPU_REPACK_MB`: repack-cache byte budget, in MiB.
         repack_mb: usize = 4096,
         /// `INFR_CPU_MAX_TIER`: the widest SIMD tier the CPU backend's kernels and
-        /// `infr_core::math`'s slice functions may run (`scalar`, `avx2`, `avx512` or
-        /// `avx512vnni`, a [`crate::simd::SimdTier`] name; any other value is a config error)
-        /// instead of the widest the CPU supports. A ceiling, not a demand: one above what the
-        /// CPU has runs the CPU's widest. A debug switch: every tier gives the same bits, so this
-        /// changes only speed; it exists to run and test the narrow paths (an aarch64 machine
-        /// runs `scalar`) on a machine that has wider ones. PROCESS-WIDE: every CPU backend
+        /// `infr_core::math`'s slice functions may run (`scalar`; `avx2`, `avx512` or
+        /// `avx512vnni` on x86-64; `dotprod` on aarch64: a [`crate::simd::SimdTier`] name; any
+        /// other value is a config error) instead of the widest the CPU supports. A ceiling, not
+        /// a demand: one above what the CPU has runs the CPU's widest, and so does another
+        /// architecture's tier. A debug switch: every tier gives the same bits, so this changes
+        /// only speed; it exists to run and test the narrow paths on a machine that has wider
+        /// ones. PROCESS-WIDE: every CPU backend
         /// applies its value when it is built (unset = no ceiling), so the last backend built
         /// decides the tier for all of them.
         max_tier: Option<crate::simd::SimdTier> = None,

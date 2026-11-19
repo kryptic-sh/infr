@@ -142,11 +142,14 @@ impl ConfigValue for super::MetalDeviceTime {
 }
 
 impl ConfigValue for crate::simd::SimdTier {
-    /// A tier name as [`crate::simd::SimdTier::name`] spells it; anything else is refused, since
-    /// a debug switch that silently ran the default tier would measure the wrong thing.
+    /// A tier name as [`crate::simd::SimdTier::name`] spells it, of any architecture; anything
+    /// else is refused, since a debug switch that silently ran the default tier would measure
+    /// the wrong thing.
     fn parse_set(raw: &str) -> Result<Self, String> {
-        Self::parse(raw)
-            .ok_or_else(|| format!("expected scalar, avx2, avx512 or avx512vnni (got {raw:?})"))
+        Self::parse(raw).ok_or_else(|| {
+            let names: Vec<&str> = Self::NAMED.iter().map(|t| t.name()).collect();
+            format!("expected one of {} (got {raw:?})", names.join(", "))
+        })
     }
     fn to_display(&self) -> String {
         self.name().to_string()

@@ -1420,6 +1420,16 @@ max_tier = \"AVX2\"
     .expect("a tier name")
     .0;
     assert_eq!(ok.kernels.cpu.max_tier, Some(Some(SimdTier::Avx2)));
+    // Every architecture's names load on every architecture: one file serves both.
+    let arm = file::parse_str(
+        "[kernels.cpu]
+max_tier = \"dotprod\"
+",
+        Path::new("infr.toml"),
+    )
+    .expect("a tier name")
+    .0;
+    assert_eq!(arm.kernels.cpu.max_tier, Some(Some(SimdTier::Dotprod)));
     let err = file::parse_str(
         "[kernels.cpu]
 max_tier = \"avx3\"
@@ -1431,7 +1441,7 @@ max_tier = \"avx3\"
         ConfigError::Value { path, message } => {
             assert_eq!(path, "kernels.cpu.max_tier");
             assert!(
-                message.contains("scalar, avx2, avx512 or avx512vnni"),
+                message.contains("scalar, avx2, avx512, avx512vnni, dotprod"),
                 "{message}"
             );
         }

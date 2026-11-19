@@ -1418,6 +1418,8 @@ fn moe_cases() -> Vec<Case> {
     v.push(moe_spiky(DType::Q4K, 1));
     v.push(moe_spiky(DType::Q4K, 9));
     v.push(moe_spiky(DType::Q6K, 9));
+    v.push(moe_spiky(DType::Q5K, 9));
+    v.push(moe_spiky(DType::Q8_0, 9));
     v
 }
 
@@ -1719,6 +1721,8 @@ const EXPECTED: &[(&str, u64)] = &[
     ("MoeFfn spiky Q4K rows 1", 0x4af77004ed01ec62),
     ("MoeFfn spiky Q4K rows 9", 0x3ebab35b901e370a),
     ("MoeFfn spiky Q6K rows 9", 0x1cc32f28e1efc6e5),
+    ("MoeFfn spiky Q5K rows 9", 0x5c65cc5affb55a8d),
+    ("MoeFfn spiky Q8_0 rows 9", 0xfe1f98233dede073),
 ];
 
 /// Every case gives its one checked-in hash at every tier this CPU has and at every thread

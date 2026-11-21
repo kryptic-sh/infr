@@ -727,6 +727,71 @@ fn main() {
         // `linear_f32`'s builds were dead — same as `e2b_proj` below, just not called out in the
         // audit by name.
         ("linear_f32r", "linear_f32r", &[]),
+        ("linear_f32_mo", "linear_f32_mo", &[]),
+        // Decode K-quant GEMV on f32 activations for GPUs without fast int8 dot (GCN).
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k",
+            &["-DFMT_Q4K"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_res",
+            &["-DFMT_Q4K", "-DUSE_RES"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k",
+            &["-DFMT_Q6K"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_res",
+            &["-DFMT_Q6K", "-DUSE_RES"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_nr4",
+            &["-DFMT_Q4K", "-DNR=4"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q4k_res_nr4",
+            &["-DFMT_Q4K", "-DUSE_RES", "-DNR=4"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_nr4",
+            &["-DFMT_Q6K", "-DNR=4"],
+        ),
+        // Multi-row (verify) twin of the kq_fma decode GEMV above (MR=4 rows per workgroup
+        // sharing each superblock's weight-word load — see native_gemv_kq_fma_mrow.comp). No
+        // USE_RES builds: the fused residual is a decode-only (m=1) shape.
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q4k",
+            &["-DFMT_Q4K"],
+        ),
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q6k",
+            &["-DFMT_Q6K"],
+        ),
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q4k_nr4",
+            &["-DFMT_Q4K", "-DNR=4"],
+        ),
+        (
+            "native_gemv_kq_fma_mrow",
+            "native_gemv_kq_fma_mrow_q6k_nr4",
+            &["-DFMT_Q6K", "-DNR=4"],
+        ),
+        (
+            "native_gemv_kq_fma",
+            "native_gemv_kq_fma_q6k_res_nr4",
+            &["-DFMT_Q6K", "-DUSE_RES", "-DNR=4"],
+        ),
         ("linear_f32r", "linear_f32r_mrow8", &["-DMROW=8"]),
         // One row, vec4 K stream: the decode-hot router GEMV (ERNIE-4.5 2560→64, qwen3moe
         // 2048→128) — see `Recorder::linear_f32_at`.
@@ -3560,8 +3625,8 @@ fn main() {
             // eager thread-per-output f32 GEMV) is NOT here — see the base builds list above for why
             // it's gone entirely. linear_res IS the fused-residual f16 GEMV file, included since
             // the resident-BDA endgame deletes every bound-SSBO weight path.
-            "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32r" | "linear_res"
-            | "native_gemm_fma" => true,
+            "linear_f16" | "linear_f16_noext" | "linear_bf16" | "linear_f32r" | "linear_f32_mo"
+            | "native_gemv_kq_fma" | "linear_res" | "native_gemm_fma" => true,
             // Model-specific float-weight kernels: qwen35's SSM depthwise conv1d+SiLU (both the
             // sequential and batch-pass-1 variants — conv1d_shift never reads the weight) and
             // gemma4 E2B's per-layer fused inp_gate GEMV. Same typed buffer_reference seam as the

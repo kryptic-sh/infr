@@ -829,6 +829,23 @@ fn unified_mmv_row1(_caps: &infr_core::backend::Capabilities) -> bool {
     true
 }
 
+/// Does an m=1 Linear take the fp32 K-quant decode GEMV (`Recorder::linear_kq_fma`) instead of
+/// quant_q8 + the dp4a GEMV? Auto-on where int8 dot is emulated (`kernels.vulkan.kq_fma_gemv`).
+fn kq_fma_gemv_ok(
+    be_: &VulkanBackend,
+    dt: infr_core::DType,
+    in_f: usize,
+    out_f: usize,
+    w_off: usize,
+) -> bool {
+    let vk = &be_.cfg().kernels.vulkan;
+    vk.kq_fma_gemv.unwrap_or(!be_.caps().i8_dot_fast)
+        && crate::gemm::native_gemv_kq_fma_spv(dt, false, 8).is_some()
+        && in_f.is_multiple_of(256)
+        && w_off.is_multiple_of(256)
+        && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, vk)
+}
+
 fn mmv_mw_choice(
     caps: &infr_core::backend::Capabilities,
     vk: &infr_core::config::VulkanCfg,
@@ -1543,6 +1560,10 @@ fn lower_op(
                 }
                 let (rr, yf) = (r(*residual)?, r(*final_dst)?);
                 if native_dense_supported(dt) {
+                    if kq_fma_gemv_ok(be_, dt, in_f, out_f, 0) {
+                        rec.linear_kq_fma(dt, w, 0, xb, Some(rr), yf, in_f, out_f);
+                        return Ok(());
+                    }
                     // Multi-warp dp4a decode GEMV (wave32-native GPUs) takes precedence — see
                     // `mmv_mw_choice`. AMD returns None here and falls to the scalar/old-mmv path.
                     if let Some(warps) = mmv_mw_choice(
@@ -6153,6 +6174,21 @@ fn quant_linear(
         && be_.cfg().kernels.vulkan.mrow
         && !crate::recorder::bda_weight_breaches(dt, in_f, out_f, &be_.cfg().kernels.vulkan)
     {
+        // fp32 K-quant multi-row GEMV for an MTP-VERIFY batch on the emulated-dot tier (GCN4):
+        // decode runs fp32 here (`linear_kq_fma`), and the int8 mrow would both run ALU-bound on
+        // emulated dp4a and score differently from the fp32 decode stream. Same per-row math as
+        // decode, bit-identical row-for-row, keyed off the DECODE knob.
+        if graph.mtp_verify
+            && w.buffer.is_some()
+            && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off)
+            && crate::gemm::native_gemv_kq_fma_mrow_spv(dt, 8).is_some()
+        {
+            let Some(wb) = w.buffer else {
+                unreachable!("kq_fma_gemv_ok implies a resident weight buffer")
+            };
+            rec.linear_kq_fma_mrow(dt, wb, w_off, xb, y, m, in_f, out_f);
+            return Ok(());
+        }
         // Int8 dp4a multi-row GEMV: quantize the m activation rows once (`quant_q8`), then
         // integer-dot the raw weight blocks against ALL rows — the dequant mrow's
         // per-sub-block scalar byte-extract dequant is the m-batch GEMV cost on ALU-bound
@@ -6672,6 +6708,11 @@ fn quant_linear(
                     out_f,
                 );
             }
+        } else if let Some(wb) = w
+            .buffer
+            .filter(|_| m == 1 && kq_fma_gemv_ok(be_, dt, in_f, out_f, w_off))
+        {
+            rec.linear_kq_fma(dt, wb, w_off, xb, None, y, in_f, out_f);
         } else if m == 1
             && mmv_decode_enabled(&be_.cfg().kernels.vulkan)
             && be_.caps().i8_dot

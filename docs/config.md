@@ -254,7 +254,8 @@ and these exist to force one off when bisecting a correctness or perf problem.
   `[kernels.vulkan.gemv]` sub-table), attention (`flash_warp`, `flash_splits`,
   `flash_min_rows`, `pv_splits`), DeltaNet (`dn_chunk_scan`, `dn_chunk`,
   `dn_split`), and the plumbing switches (`push_desc`, `pipeline_cache_disk`,
-  `no_replay`, `no_vram_guard`, the BDA chunk caps). Note `f16 = false` also
+  `no_replay`, `no_vram_guard`, `gfx_queue` — stay on the compositor's graphics
+  ring instead of a compute-only one — the BDA chunk caps). Note `f16 = false` also
   disables coopmat regardless of `coopmat`, matching `INFR_NO_F16`'s effect
   today. The hardware-shaped numbers (split counts, thresholds, rows per
   workgroup, subgroup pins) are per-device tuning parameters, set under

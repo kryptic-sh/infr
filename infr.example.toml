@@ -162,6 +162,10 @@ flash_min_rows = 24
 # Misc.
 push_desc = true
 pipeline_cache_disk = true
+# Submit on the compositor's graphics ring instead of a compute-only one. A
+# discrete GPU defaults to the compute ring so a long prefill does not stall the
+# desktop; set this when that ring misbehaves on the device.
+gfx_queue = false
 gpu_pos = true
 fuse_add = true
 no_replay = false # sanctioned negative: true DISABLES the decode replay tape
